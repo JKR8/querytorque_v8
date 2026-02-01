@@ -1,0 +1,7 @@
+-- ERROR: Parser Error: syntax error at end of input
+
+WITH ss_aggregates AS (
+SELECT count(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 ELSE NULL END) AS b1_cnt, avg(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_ext_sales_price ELSE NULL END) AS b1_avg_sales, avg(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_net_profit ELSE NULL END) AS b1_avg_profit, count(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN 1 ELSE NULL END) AS b2_cnt, avg(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_ext_sales_price ELSE NULL END) AS b2_avg_sales, avg(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_net_profit ELSE NULL END) AS b2_avg_profit, count(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN 1 ELSE NULL END) AS b3_cnt, avg(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_ext_sales_price ELSE NULL END) AS b3_avg_sales, avg(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_net_profit ELSE NULL END) AS b3_avg_profit, count(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN 1 ELSE NULL END) AS b4_cnt, avg(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_ext_sales_price ELSE NULL END) AS b4_avg_sales, avg(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_net_profit ELSE NULL END) AS b4_avg_profit, count(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN 1 ELSE NULL END) AS b5_cnt, avg(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_ext_sales_price ELSE NULL END) AS b5_avg_sales, avg(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_net_profit ELSE NULL END) AS b5_avg_profit FROM store_sales
+)
+SELECT case when (select count(*)
+FROM reason, ss_aggregates

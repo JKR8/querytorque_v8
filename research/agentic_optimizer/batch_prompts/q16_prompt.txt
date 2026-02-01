@@ -1,0 +1,137 @@
+Optimize this SQL query.
+
+## Execution Plan
+
+**Operators by cost:**
+- SEQ_SCAN (customer_address): 79.0% cost, 17,229 rows
+- SEQ_SCAN (catalog_sales): 6.3% cost, 20,077 rows
+- SEQ_SCAN (date_dim): 4.0% cost, 61 rows
+- SEQ_SCAN (call_center): 3.7% cost, 30 rows
+- HASH_JOIN: 3.0% cost, 292 rows
+
+**Table scans:**
+- catalog_sales: 20,077 rows (NO FILTER)
+- customer_address: 17,229 rows ← FILTERED by ca_state='WV'
+- date_dim: 61 rows ← FILTERED by (CAST(d_date AS TIMESTAMP) BETWEEN '2002-04-01 00:
+- call_center: 30 rows ← FILTERED by optional: cc_county IN ('Ziebach County', 'Luce Co
+- catalog_sales: 64,237 rows (NO FILTER)
+- catalog_returns: 4,952 rows (NO FILTER)
+
+---
+
+## Block Map
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ BLOCK                  │ CLAUSE   │ CONTENT SUMMARY                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ main_query             │ .select  │ order count, total shipping cost, total ne... │
+│                        │ .from    │ catalog_sales                                 │
+│                        │ .where   │ d_date BETWEEN '2002-4-01' AND (CAST('2002... │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+```
+
+---
+
+## Optimization Patterns
+
+These patterns have produced >2x speedups:
+
+1. **Dimension filter hoisting**: If a filtered dimension is in main_query but the CTE aggregates fact data that COULD be filtered by it (via FK), move the dimension join+filter INTO the CTE to filter early.
+
+2. **Correlated subquery to window function**: A correlated subquery computes an aggregate per group. Fix: Replace with a window function in the CTE (e.g., `AVG(...) OVER (PARTITION BY group_col)`).
+
+3. **Join elimination**: A table is joined only to validate a foreign key exists, but no columns from it are used. Fix: Remove the join, add `WHERE fk_column IS NOT NULL`.
+
+4. **UNION ALL decomposition**: Complex OR conditions cause full scans. Fix: Split into separate queries with simple filters, UNION ALL results.
+
+5. **Scan consolidation**: Same table scanned multiple times with different filters. Fix: Single scan with CASE WHEN expressions to compute multiple aggregates conditionally.
+
+**Verify**: Optimized query must return identical results.
+
+---
+
+## SQL
+```sql
+-- start query 16 in stream 0 using template query16.tpl
+select 
+   count(distinct cs_order_number) as "order count"
+  ,sum(cs_ext_ship_cost) as "total shipping cost"
+  ,sum(cs_net_profit) as "total net profit"
+from
+   catalog_sales cs1
+  ,date_dim
+  ,customer_address
+  ,call_center
+where
+    d_date between '2002-4-01' and 
+           (cast('2002-4-01' as date) + INTERVAL 60 DAY)
+and cs1.cs_ship_date_sk = d_date_sk
+and cs1.cs_ship_addr_sk = ca_address_sk
+and ca_state = 'WV'
+and cs1.cs_call_center_sk = cc_call_center_sk
+and cc_county in ('Ziebach County','Luce County','Richland County','Daviess County',
+                  'Barrow County'
+)
+and exists (select *
+            from catalog_sales cs2
+            where cs1.cs_order_number = cs2.cs_order_number
+              and cs1.cs_warehouse_sk <> cs2.cs_warehouse_sk)
+and not exists(select *
+               from catalog_returns cr1
+               where cs1.cs_order_number = cr1.cr_order_number)
+order by count(distinct cs_order_number)
+ LIMIT 100;
+
+-- end query 16 in stream 0 using template query16.tpl
+```
+
+---
+
+## Output
+
+Return JSON:
+```json
+{
+  "operations": [...],
+  "semantic_warnings": [],
+  "explanation": "..."
+}
+```
+
+### Operations
+
+| Op | Fields | Description |
+|----|--------|-------------|
+| `add_cte` | `after`, `name`, `sql` | Insert new CTE |
+| `delete_cte` | `name` | Remove CTE |
+| `replace_cte` | `name`, `sql` | Replace entire CTE body |
+| `replace_clause` | `target`, `sql` | Replace clause (`""` to remove) |
+| `patch` | `target`, `patches[]` | Snippet search/replace |
+
+### Example
+```json
+{
+  "operations": [
+    {"op": "replace_cte", "name": "my_cte", "sql": "SELECT sk, SUM(val) FROM t WHERE sk IS NOT NULL GROUP BY sk"}
+  ],
+  "semantic_warnings": ["Removed join - added IS NOT NULL to preserve filtering"],
+  "explanation": "Removed unnecessary dimension join, using FK directly"
+}
+```
+
+### Block ID Syntax
+```
+{cte}.select    {cte}.from    {cte}.where    {cte}.group_by    {cte}.having
+main_query.union[N].select    main_query.union[N].from    ...
+```
+
+### Rules
+1. **Return 1-5 operations maximum** - focus on highest-impact changes first
+2. Operations apply sequentially
+3. `patch.search` must be unique within target clause
+4. `add_cte.sql` = query body only (no CTE name)
+5. All CTE refs must resolve after ops
+6. When removing a join, update column references (e.g., `c_customer_sk` → `ss_customer_sk AS c_customer_sk`)
+
+The system will iterate if more optimization is possible. You don't need to fix everything at once.

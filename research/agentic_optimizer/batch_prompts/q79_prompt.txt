@@ -1,0 +1,129 @@
+Optimize this SQL query.
+
+## Execution Plan
+
+**Operators by cost:**
+- SEQ_SCAN (store_sales): 77.5% cost, 1,333,691 rows
+- SEQ_SCAN (customer): 17.2% cost, 1,999,870 rows
+- HASH_JOIN: 2.0% cost, 19,631 rows
+- HASH_GROUP_BY: 0.8% cost, 19,758 rows
+- HASH_JOIN: 0.7% cost, 189,368 rows
+
+**Table scans:**
+- customer: 1,999,870 rows ← FILTERED by optional: Dynamic Filter (c_last_name)
+- store_sales: 1,333,691 rows (NO FILTER)
+- date_dim: 156 rows ← FILTERED by ['d_dow=1', 'd_year>=1998 AND d_year<=2000']
+- store: 378 rows ← FILTERED by s_number_employees>=200 AND s_number_employees<=29
+- household_demographics: 7,200 rows (NO FILTER)
+
+---
+
+## Block Map
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ BLOCK                  │ CLAUSE   │ CONTENT SUMMARY                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ main_query             │ .select  │ c_last_name, c_first_name, SUBSTRING(s_cit... │
+│                        │ .from    │ (subquery: store_sales, date_dim, store) +1   │
+│                        │ .where   │ ss_customer_sk = c_customer_sk                │
+│                        │ .group_by │ ss_ticket_number, ss_customer_sk, ss_addr_sk  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+```
+
+---
+
+## Optimization Patterns
+
+These patterns have produced >2x speedups:
+
+1. **Dimension filter hoisting**: If a filtered dimension is in main_query but the CTE aggregates fact data that COULD be filtered by it (via FK), move the dimension join+filter INTO the CTE to filter early.
+
+2. **Correlated subquery to window function**: A correlated subquery computes an aggregate per group. Fix: Replace with a window function in the CTE (e.g., `AVG(...) OVER (PARTITION BY group_col)`).
+
+3. **Join elimination**: A table is joined only to validate a foreign key exists, but no columns from it are used. Fix: Remove the join, add `WHERE fk_column IS NOT NULL`.
+
+4. **UNION ALL decomposition**: Complex OR conditions cause full scans. Fix: Split into separate queries with simple filters, UNION ALL results.
+
+5. **Scan consolidation**: Same table scanned multiple times with different filters. Fix: Single scan with CASE WHEN expressions to compute multiple aggregates conditionally.
+
+**Verify**: Optimized query must return identical results.
+
+---
+
+## SQL
+```sql
+-- start query 79 in stream 0 using template query79.tpl
+select
+  c_last_name,c_first_name,substr(s_city,1,30),ss_ticket_number,amt,profit
+  from
+   (select ss_ticket_number
+          ,ss_customer_sk
+          ,store.s_city
+          ,sum(ss_coupon_amt) amt
+          ,sum(ss_net_profit) profit
+    from store_sales,date_dim,store,household_demographics
+    where store_sales.ss_sold_date_sk = date_dim.d_date_sk
+    and store_sales.ss_store_sk = store.s_store_sk  
+    and store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk
+    and (household_demographics.hd_dep_count = 5 or household_demographics.hd_vehicle_count > 4)
+    and date_dim.d_dow = 1
+    and date_dim.d_year in (1998,1998+1,1998+2) 
+    and store.s_number_employees between 200 and 295
+    group by ss_ticket_number,ss_customer_sk,ss_addr_sk,store.s_city) ms,customer
+    where ss_customer_sk = c_customer_sk
+ order by c_last_name,c_first_name,substr(s_city,1,30), profit
+ LIMIT 100;
+
+-- end query 79 in stream 0 using template query79.tpl
+```
+
+---
+
+## Output
+
+Return JSON:
+```json
+{
+  "operations": [...],
+  "semantic_warnings": [],
+  "explanation": "..."
+}
+```
+
+### Operations
+
+| Op | Fields | Description |
+|----|--------|-------------|
+| `add_cte` | `after`, `name`, `sql` | Insert new CTE |
+| `delete_cte` | `name` | Remove CTE |
+| `replace_cte` | `name`, `sql` | Replace entire CTE body |
+| `replace_clause` | `target`, `sql` | Replace clause (`""` to remove) |
+| `patch` | `target`, `patches[]` | Snippet search/replace |
+
+### Example
+```json
+{
+  "operations": [
+    {"op": "replace_cte", "name": "my_cte", "sql": "SELECT sk, SUM(val) FROM t WHERE sk IS NOT NULL GROUP BY sk"}
+  ],
+  "semantic_warnings": ["Removed join - added IS NOT NULL to preserve filtering"],
+  "explanation": "Removed unnecessary dimension join, using FK directly"
+}
+```
+
+### Block ID Syntax
+```
+{cte}.select    {cte}.from    {cte}.where    {cte}.group_by    {cte}.having
+main_query.union[N].select    main_query.union[N].from    ...
+```
+
+### Rules
+1. **Return 1-5 operations maximum** - focus on highest-impact changes first
+2. Operations apply sequentially
+3. `patch.search` must be unique within target clause
+4. `add_cte.sql` = query body only (no CTE name)
+5. All CTE refs must resolve after ops
+6. When removing a join, update column references (e.g., `c_customer_sk` → `ss_customer_sk AS c_customer_sk`)
+
+The system will iterate if more optimization is possible. You don't need to fix everything at once.

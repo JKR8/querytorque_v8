@@ -1,0 +1,150 @@
+Optimize this SQL query.
+
+## Execution Plan
+
+**Operators by cost:**
+- SEQ_SCAN (store_sales): 71.4% cost, 1,193,803 rows
+- SEQ_SCAN (customer): 20.2% cost, 1,998,739 rows
+- SEQ_SCAN (customer_address): 4.1% cost, 998,992 rows
+- HASH_JOIN: 1.0% cost, 2,390 rows
+- HASH_JOIN: 0.6% cost, 129,559 rows
+
+**Table scans:**
+- customer_address: 999,288 rows (NO FILTER)
+- customer: 1,998,739 rows ← FILTERED by c_customer_sk<=1999999
+- customer_address: 998,992 rows (NO FILTER)
+- store_sales: 1,193,803 rows (NO FILTER)
+- store: 402 rows ← FILTERED by optional: s_city IN ('Pleasant Hill', 'Five Points
+- date_dim: 72 rows ← FILTERED by ['d_dom>=1 AND d_dom<=2', 'd_year>=1998 AND d_year<=2000']
+- household_demographics: 7,200 rows (NO FILTER)
+
+---
+
+## Block Map
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ BLOCK                  │ CLAUSE   │ CONTENT SUMMARY                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ main_query             │ .select  │ c_last_name, c_first_name, ca_city, bought... │
+│                        │ .from    │ (subquery: store_sales, date_dim, store) +2   │
+│                        │ .where   │ ss_customer_sk = c_customer_sk AND custome... │
+│                        │ .group_by │ ss_ticket_number, ss_customer_sk, ss_addr_sk  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+```
+
+---
+
+## Optimization Patterns
+
+These patterns have produced >2x speedups:
+
+1. **Dimension filter hoisting**: If a filtered dimension is in main_query but the CTE aggregates fact data that COULD be filtered by it (via FK), move the dimension join+filter INTO the CTE to filter early.
+
+2. **Correlated subquery to window function**: A correlated subquery computes an aggregate per group. Fix: Replace with a window function in the CTE (e.g., `AVG(...) OVER (PARTITION BY group_col)`).
+
+3. **Join elimination**: A table is joined only to validate a foreign key exists, but no columns from it are used. Fix: Remove the join, add `WHERE fk_column IS NOT NULL`.
+
+4. **UNION ALL decomposition**: Complex OR conditions cause full scans. Fix: Split into separate queries with simple filters, UNION ALL results.
+
+5. **Scan consolidation**: Same table scanned multiple times with different filters. Fix: Single scan with CASE WHEN expressions to compute multiple aggregates conditionally.
+
+**Verify**: Optimized query must return identical results.
+
+---
+
+## SQL
+```sql
+-- start query 68 in stream 0 using template query68.tpl
+select c_last_name
+       ,c_first_name
+       ,ca_city
+       ,bought_city
+       ,ss_ticket_number
+       ,extended_price
+       ,extended_tax
+       ,list_price
+ from (select ss_ticket_number
+             ,ss_customer_sk
+             ,ca_city bought_city
+             ,sum(ss_ext_sales_price) extended_price 
+             ,sum(ss_ext_list_price) list_price
+             ,sum(ss_ext_tax) extended_tax 
+       from store_sales
+           ,date_dim
+           ,store
+           ,household_demographics
+           ,customer_address 
+       where store_sales.ss_sold_date_sk = date_dim.d_date_sk
+         and store_sales.ss_store_sk = store.s_store_sk  
+        and store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk
+        and store_sales.ss_addr_sk = customer_address.ca_address_sk
+        and date_dim.d_dom between 1 and 2 
+        and (household_demographics.hd_dep_count = 8 or
+             household_demographics.hd_vehicle_count= -1)
+        and date_dim.d_year in (1998,1998+1,1998+2)
+        and store.s_city in ('Pleasant Hill','Five Points')
+       group by ss_ticket_number
+               ,ss_customer_sk
+               ,ss_addr_sk,ca_city) dn
+      ,customer
+      ,customer_address current_addr
+ where ss_customer_sk = c_customer_sk
+   and customer.c_current_addr_sk = current_addr.ca_address_sk
+   and current_addr.ca_city <> bought_city
+ order by c_last_name
+         ,ss_ticket_number
+ LIMIT 100;
+
+-- end query 68 in stream 0 using template query68.tpl
+```
+
+---
+
+## Output
+
+Return JSON:
+```json
+{
+  "operations": [...],
+  "semantic_warnings": [],
+  "explanation": "..."
+}
+```
+
+### Operations
+
+| Op | Fields | Description |
+|----|--------|-------------|
+| `add_cte` | `after`, `name`, `sql` | Insert new CTE |
+| `delete_cte` | `name` | Remove CTE |
+| `replace_cte` | `name`, `sql` | Replace entire CTE body |
+| `replace_clause` | `target`, `sql` | Replace clause (`""` to remove) |
+| `patch` | `target`, `patches[]` | Snippet search/replace |
+
+### Example
+```json
+{
+  "operations": [
+    {"op": "replace_cte", "name": "my_cte", "sql": "SELECT sk, SUM(val) FROM t WHERE sk IS NOT NULL GROUP BY sk"}
+  ],
+  "semantic_warnings": ["Removed join - added IS NOT NULL to preserve filtering"],
+  "explanation": "Removed unnecessary dimension join, using FK directly"
+}
+```
+
+### Block ID Syntax
+```
+{cte}.select    {cte}.from    {cte}.where    {cte}.group_by    {cte}.having
+main_query.union[N].select    main_query.union[N].from    ...
+```
+
+### Rules
+1. **Return 1-5 operations maximum** - focus on highest-impact changes first
+2. Operations apply sequentially
+3. `patch.search` must be unique within target clause
+4. `add_cte.sql` = query body only (no CTE name)
+5. All CTE refs must resolve after ops
+6. When removing a join, update column references (e.g., `c_customer_sk` → `ss_customer_sk AS c_customer_sk`)
+
+The system will iterate if more optimization is possible. You don't need to fix everything at once.

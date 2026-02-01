@@ -1,0 +1,246 @@
+Optimize this SQL query.
+
+## Execution Plan
+
+**Operators by cost:**
+- SEQ_SCAN (store_sales): 62.9% cost, 59,415 rows
+- SEQ_SCAN (web_sales): 18.1% cost, 15,744 rows
+- SEQ_SCAN (store_returns): 2.7% cost, 288,581 rows
+- HASH_JOIN: 2.4% cost, 59,415 rows
+- SEQ_SCAN (catalog_sales): 2.3% cost, 31,569 rows
+
+**Table scans:**
+- store_sales: 59,415 rows (NO FILTER)
+- store_returns: 288,581 rows (NO FILTER)
+- promotion: 986 rows ← FILTERED by p_channel_tv='N'
+- date_dim: 31 rows ← FILTERED by (CAST(d_date AS TIMESTAMP) BETWEEN '1998-08-28 00:
+- item: 11,429 rows ← FILTERED by i_current_price>50.00
+- store: 400 rows ← FILTERED by s_store_sk<=400
+- catalog_page: 1,504 rows ← FILTERED by cp_catalog_page_sk<=17108
+- catalog_sales: 31,569 rows (NO FILTER)
+- catalog_returns: 144,001 rows (NO FILTER)
+- promotion: 986 rows ← FILTERED by p_channel_tv='N'
+- date_dim: 31 rows ← FILTERED by (CAST(d_date AS TIMESTAMP) BETWEEN '1998-08-28 00:
+- item: 11,429 rows ← FILTERED by i_current_price>50.00
+- item: 11,428 rows ← FILTERED by i_current_price>50.00
+- web_sales: 15,744 rows (NO FILTER)
+- web_returns: 71,681 rows (NO FILTER)
+- promotion: 986 rows ← FILTERED by p_channel_tv='N'
+- date_dim: 31 rows ← FILTERED by (CAST(d_date AS TIMESTAMP) BETWEEN '1998-08-28 00:
+- web_site: 24 rows (NO FILTER)
+
+---
+
+## Block Map
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ BLOCK                  │ CLAUSE   │ CONTENT SUMMARY                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ ssr                    │ .select  │ store_id, sales, returns, profit              │
+│                        │ .from    │ store_sales                                   │
+│                        │ .where   │ ss_sold_date_sk = d_date_sk AND d_date BET... │
+│                        │ .group_by │ s_store_id                                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ csr                    │ .select  │ catalog_page_id, sales, returns, profit       │
+│                        │ .from    │ catalog_sales                                 │
+│                        │ .where   │ cs_sold_date_sk = d_date_sk AND d_date BET... │
+│                        │ .group_by │ cp_catalog_page_id                            │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ wsr                    │ .select  │ web_site_id, sales, returns, profit           │
+│                        │ .from    │ web_sales                                     │
+│                        │ .where   │ ws_sold_date_sk = d_date_sk AND d_date BET... │
+│                        │ .group_by │ web_site_id                                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ main_query             │ .select  │ channel, id, sales, returns                   │
+│                        │ .from    │ (subquery: )                                  │
+│                        │ .where   │ ss_sold_date_sk = d_date_sk AND d_date BET... │
+│                        │ .group_by │                                               │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+Refs:
+  main_query.from → wsr
+  main_query.from → ssr
+  main_query.from → csr
+
+Repeated Scans:
+  date_dim: 4× (ssr.from, csr.from, wsr.from)
+  item: 4× (ssr.from, csr.from, wsr.from)
+  promotion: 4× (ssr.from, csr.from, wsr.from)
+  store_returns: 2× (ssr.from, main_query.from)
+  store: 2× (ssr.from, main_query.from)
+  catalog_returns: 2× (csr.from, main_query.from)
+  catalog_page: 2× (csr.from, main_query.from)
+  web_returns: 2× (wsr.from, main_query.from)
+  web_site: 2× (wsr.from, main_query.from)
+
+```
+
+---
+
+## Optimization Patterns
+
+These patterns have produced >2x speedups:
+
+1. **Dimension filter hoisting**: If a filtered dimension is in main_query but the CTE aggregates fact data that COULD be filtered by it (via FK), move the dimension join+filter INTO the CTE to filter early.
+
+2. **Correlated subquery to window function**: A correlated subquery computes an aggregate per group. Fix: Replace with a window function in the CTE (e.g., `AVG(...) OVER (PARTITION BY group_col)`).
+
+3. **Join elimination**: A table is joined only to validate a foreign key exists, but no columns from it are used. Fix: Remove the join, add `WHERE fk_column IS NOT NULL`.
+
+4. **UNION ALL decomposition**: Complex OR conditions cause full scans. Fix: Split into separate queries with simple filters, UNION ALL results.
+
+5. **Scan consolidation**: Same table scanned multiple times with different filters. Fix: Single scan with CASE WHEN expressions to compute multiple aggregates conditionally.
+
+**Verify**: Optimized query must return identical results.
+
+---
+
+## SQL
+```sql
+-- start query 80 in stream 0 using template query80.tpl
+with ssr as
+ (select  s_store_id as store_id,
+          sum(ss_ext_sales_price) as sales,
+          sum(coalesce(sr_return_amt, 0)) as "returns",
+          sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit
+  from store_sales left outer join store_returns on
+         (ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number),
+     date_dim,
+     store,
+     item,
+     promotion
+ where ss_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-28' as date) 
+                  and (cast('1998-08-28' as date) + INTERVAL 30 DAY)
+       and ss_store_sk = s_store_sk
+       and ss_item_sk = i_item_sk
+       and i_current_price > 50
+       and ss_promo_sk = p_promo_sk
+       and p_channel_tv = 'N'
+ group by s_store_id)
+ ,
+ csr as
+ (select  cp_catalog_page_id as catalog_page_id,
+          sum(cs_ext_sales_price) as sales,
+          sum(coalesce(cr_return_amount, 0)) as "returns",
+          sum(cs_net_profit - coalesce(cr_net_loss, 0)) as profit
+  from catalog_sales left outer join catalog_returns on
+         (cs_item_sk = cr_item_sk and cs_order_number = cr_order_number),
+     date_dim,
+     catalog_page,
+     item,
+     promotion
+ where cs_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-28' as date)
+                  and (cast('1998-08-28' as date) + INTERVAL 30 DAY)
+        and cs_catalog_page_sk = cp_catalog_page_sk
+       and cs_item_sk = i_item_sk
+       and i_current_price > 50
+       and cs_promo_sk = p_promo_sk
+       and p_channel_tv = 'N'
+group by cp_catalog_page_id)
+ ,
+ wsr as
+ (select  web_site_id,
+          sum(ws_ext_sales_price) as sales,
+          sum(coalesce(wr_return_amt, 0)) as "returns",
+          sum(ws_net_profit - coalesce(wr_net_loss, 0)) as profit
+  from web_sales left outer join web_returns on
+         (ws_item_sk = wr_item_sk and ws_order_number = wr_order_number),
+     date_dim,
+     web_site,
+     item,
+     promotion
+ where ws_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-28' as date)
+                  and (cast('1998-08-28' as date) + INTERVAL 30 DAY)
+        and ws_web_site_sk = web_site_sk
+       and ws_item_sk = i_item_sk
+       and i_current_price > 50
+       and ws_promo_sk = p_promo_sk
+       and p_channel_tv = 'N'
+group by web_site_id)
+  select channel
+        , id
+        , sum(sales) as sales
+        , sum("returns") as "returns"
+        , sum(profit) as profit
+ from 
+ (select 'store channel' as channel
+        , 'store' || store_id as id
+        , sales
+        , "returns"
+        , profit
+ from   ssr
+ union all
+ select 'catalog channel' as channel
+        , 'catalog_page' || catalog_page_id as id
+        , sales
+        , "returns"
+        , profit
+ from  csr
+ union all
+ select 'web channel' as channel
+        , 'web_site' || web_site_id as id
+        , sales
+        , "returns"
+        , profit
+ from   wsr
+ ) x
+ group by rollup (channel, id)
+ order by channel
+         ,id
+ LIMIT 100;
+
+-- end query 80 in stream 0 using template query80.tpl
+```
+
+---
+
+## Output
+
+Return JSON:
+```json
+{
+  "operations": [...],
+  "semantic_warnings": [],
+  "explanation": "..."
+}
+```
+
+### Operations
+
+| Op | Fields | Description |
+|----|--------|-------------|
+| `add_cte` | `after`, `name`, `sql` | Insert new CTE |
+| `delete_cte` | `name` | Remove CTE |
+| `replace_cte` | `name`, `sql` | Replace entire CTE body |
+| `replace_clause` | `target`, `sql` | Replace clause (`""` to remove) |
+| `patch` | `target`, `patches[]` | Snippet search/replace |
+
+### Example
+```json
+{
+  "operations": [
+    {"op": "replace_cte", "name": "my_cte", "sql": "SELECT sk, SUM(val) FROM t WHERE sk IS NOT NULL GROUP BY sk"}
+  ],
+  "semantic_warnings": ["Removed join - added IS NOT NULL to preserve filtering"],
+  "explanation": "Removed unnecessary dimension join, using FK directly"
+}
+```
+
+### Block ID Syntax
+```
+{cte}.select    {cte}.from    {cte}.where    {cte}.group_by    {cte}.having
+main_query.union[N].select    main_query.union[N].from    ...
+```
+
+### Rules
+1. **Return 1-5 operations maximum** - focus on highest-impact changes first
+2. Operations apply sequentially
+3. `patch.search` must be unique within target clause
+4. `add_cte.sql` = query body only (no CTE name)
+5. All CTE refs must resolve after ops
+6. When removing a join, update column references (e.g., `c_customer_sk` → `ss_customer_sk AS c_customer_sk`)
+
+The system will iterate if more optimization is possible. You don't need to fix everything at once.

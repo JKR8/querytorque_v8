@@ -1,0 +1,203 @@
+Optimize this SQL query.
+
+## Execution Plan
+
+**Operators by cost:**
+- SEQ_SCAN (store_sales): 74.9% cost, 6,141 rows
+- SEQ_SCAN (web_sales): 12.4% cost, 1,559 rows
+- SEQ_SCAN (item): 2.7% cost, 204,000 rows
+- SEQ_SCAN (catalog_sales): 1.8% cost, 3,083 rows
+- HASH_JOIN: 1.4% cost, 6,141 rows
+
+**Table scans:**
+- store_sales: 6,141 rows (NO FILTER)
+- date_dim: 7 rows ← FILTERED by d_date_sk>=2450816 AND d_date_sk<=2452642
+- date_dim: 7 rows (NO FILTER)
+- date_dim: 1 rows ← FILTERED by d_date='2001-03-24'::DATE
+- item: 204,000 rows (NO FILTER)
+- item: 203,471 rows (NO FILTER)
+- web_sales: 1,559 rows (NO FILTER)
+- date_dim: 7 rows ← FILTERED by d_date_sk>=2450816 AND d_date_sk<=2452642
+- date_dim: 7 rows (NO FILTER)
+- date_dim: 1 rows ← FILTERED by d_date='2001-03-24'::DATE
+- item: 203,845 rows ← FILTERED by i_item_sk<=203999
+- catalog_sales: 3,083 rows (NO FILTER)
+- date_dim: 7 rows ← FILTERED by d_date_sk>=2450815 AND d_date_sk<=2452654
+- date_dim: 7 rows (NO FILTER)
+- date_dim: 1 rows ← FILTERED by d_date='2001-03-24'::DATE
+
+---
+
+## Block Map
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ BLOCK                  │ CLAUSE   │ CONTENT SUMMARY                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ ss_items               │ .select  │ item_id, ss_item_rev                          │
+│                        │ .from    │ store_sales                                   │
+│                        │ .where   │ ss_item_sk = i_item_sk AND d_date IN (SELE... │
+│                        │ .group_by │ i_item_id                                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ cs_items               │ .select  │ item_id, cs_item_rev                          │
+│                        │ .from    │ catalog_sales                                 │
+│                        │ .where   │ cs_item_sk = i_item_sk AND d_date IN (SELE... │
+│                        │ .group_by │ i_item_id                                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ ws_items               │ .select  │ item_id, ws_item_rev                          │
+│                        │ .from    │ web_sales                                     │
+│                        │ .where   │ ws_item_sk = i_item_sk AND d_date IN (SELE... │
+│                        │ .group_by │ i_item_id                                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│ main_query             │ .select  │ ss_items.item_id, ss_item_rev, ss_dev, cs_... │
+│                        │ .from    │                                               │
+│                        │ .where   │ ss_items.item_id = cs_items.item_id AND ss... │
+│                        │ .group_by │ i_item_id                                     │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+Refs:
+  main_query.from → ss_items
+
+Repeated Scans:
+  item: 4× (ss_items.from, cs_items.from, ws_items.from)
+  date_dim: 4× (ss_items.from, cs_items.from, ws_items.from)
+
+```
+
+---
+
+## Optimization Patterns
+
+These patterns have produced >2x speedups:
+
+1. **Dimension filter hoisting**: If a filtered dimension is in main_query but the CTE aggregates fact data that COULD be filtered by it (via FK), move the dimension join+filter INTO the CTE to filter early.
+
+2. **Correlated subquery to window function**: A correlated subquery computes an aggregate per group. Fix: Replace with a window function in the CTE (e.g., `AVG(...) OVER (PARTITION BY group_col)`).
+
+3. **Join elimination**: A table is joined only to validate a foreign key exists, but no columns from it are used. Fix: Remove the join, add `WHERE fk_column IS NOT NULL`.
+
+4. **UNION ALL decomposition**: Complex OR conditions cause full scans. Fix: Split into separate queries with simple filters, UNION ALL results.
+
+5. **Scan consolidation**: Same table scanned multiple times with different filters. Fix: Single scan with CASE WHEN expressions to compute multiple aggregates conditionally.
+
+**Verify**: Optimized query must return identical results.
+
+---
+
+## SQL
+```sql
+-- start query 58 in stream 0 using template query58.tpl
+with ss_items as
+ (select i_item_id item_id
+        ,sum(ss_ext_sales_price) ss_item_rev 
+ from store_sales
+     ,item
+     ,date_dim
+ where ss_item_sk = i_item_sk
+   and d_date in (select d_date
+                  from date_dim
+                  where d_week_seq = (select d_week_seq 
+                                      from date_dim
+                                      where d_date = '2001-03-24'))
+   and ss_sold_date_sk   = d_date_sk
+ group by i_item_id),
+ cs_items as
+ (select i_item_id item_id
+        ,sum(cs_ext_sales_price) cs_item_rev
+  from catalog_sales
+      ,item
+      ,date_dim
+ where cs_item_sk = i_item_sk
+  and  d_date in (select d_date
+                  from date_dim
+                  where d_week_seq = (select d_week_seq 
+                                      from date_dim
+                                      where d_date = '2001-03-24'))
+  and  cs_sold_date_sk = d_date_sk
+ group by i_item_id),
+ ws_items as
+ (select i_item_id item_id
+        ,sum(ws_ext_sales_price) ws_item_rev
+  from web_sales
+      ,item
+      ,date_dim
+ where ws_item_sk = i_item_sk
+  and  d_date in (select d_date
+                  from date_dim
+                  where d_week_seq =(select d_week_seq 
+                                     from date_dim
+                                     where d_date = '2001-03-24'))
+  and ws_sold_date_sk   = d_date_sk
+ group by i_item_id)
+  select ss_items.item_id
+       ,ss_item_rev
+       ,ss_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 ss_dev
+       ,cs_item_rev
+       ,cs_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 cs_dev
+       ,ws_item_rev
+       ,ws_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 ws_dev
+       ,(ss_item_rev+cs_item_rev+ws_item_rev)/3 average
+ from ss_items,cs_items,ws_items
+ where ss_items.item_id=cs_items.item_id
+   and ss_items.item_id=ws_items.item_id 
+   and ss_item_rev between 0.9 * cs_item_rev and 1.1 * cs_item_rev
+   and ss_item_rev between 0.9 * ws_item_rev and 1.1 * ws_item_rev
+   and cs_item_rev between 0.9 * ss_item_rev and 1.1 * ss_item_rev
+   and cs_item_rev between 0.9 * ws_item_rev and 1.1 * ws_item_rev
+   and ws_item_rev between 0.9 * ss_item_rev and 1.1 * ss_item_rev
+   and ws_item_rev between 0.9 * cs_item_rev and 1.1 * cs_item_rev
+ order by ss_items.item_id
+         ,ss_item_rev
+ LIMIT 100;
+
+-- end query 58 in stream 0 using template query58.tpl
+```
+
+---
+
+## Output
+
+Return JSON:
+```json
+{
+  "operations": [...],
+  "semantic_warnings": [],
+  "explanation": "..."
+}
+```
+
+### Operations
+
+| Op | Fields | Description |
+|----|--------|-------------|
+| `add_cte` | `after`, `name`, `sql` | Insert new CTE |
+| `delete_cte` | `name` | Remove CTE |
+| `replace_cte` | `name`, `sql` | Replace entire CTE body |
+| `replace_clause` | `target`, `sql` | Replace clause (`""` to remove) |
+| `patch` | `target`, `patches[]` | Snippet search/replace |
+
+### Example
+```json
+{
+  "operations": [
+    {"op": "replace_cte", "name": "my_cte", "sql": "SELECT sk, SUM(val) FROM t WHERE sk IS NOT NULL GROUP BY sk"}
+  ],
+  "semantic_warnings": ["Removed join - added IS NOT NULL to preserve filtering"],
+  "explanation": "Removed unnecessary dimension join, using FK directly"
+}
+```
+
+### Block ID Syntax
+```
+{cte}.select    {cte}.from    {cte}.where    {cte}.group_by    {cte}.having
+main_query.union[N].select    main_query.union[N].from    ...
+```
+
+### Rules
+1. **Return 1-5 operations maximum** - focus on highest-impact changes first
+2. Operations apply sequentially
+3. `patch.search` must be unique within target clause
+4. `add_cte.sql` = query body only (no CTE name)
+5. All CTE refs must resolve after ops
+6. When removing a join, update column references (e.g., `c_customer_sk` → `ss_customer_sk AS c_customer_sk`)
+
+The system will iterate if more optimization is possible. You don't need to fix everything at once.

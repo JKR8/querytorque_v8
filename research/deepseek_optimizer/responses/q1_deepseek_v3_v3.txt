@@ -1,0 +1,52 @@
+Looking at the execution plan and the query, I can see several optimization opportunities. The biggest issues are:
+
+1. **Store filter not pushed down**: The `s_state='SD'` filter is applied late in the main query, but the CTE aggregates ALL store returns across all states
+2. **Correlated subquery**: The `AVG(ctr_total_return)*1.2` is computed via correlated subquery for each row
+3. **Multiple date_dim scans**: The CTE filters by `d_year=2000`, but this isn't leveraged in the main query
+
+Here's the optimized solution:
+
+```json
+{
+  "operations": [
+    {
+      "op": "replace_cte",
+      "name": "customer_total_return",
+      "sql": "SELECT sr_customer_sk as ctr_customer_sk, sr_store_sk as ctr_store_sk, sum(SR_FEE) as ctr_total_return, AVG(sum(SR_FEE)) OVER (PARTITION BY sr_store_sk) * 1.2 as store_avg_120pct FROM store_returns, date_dim, store WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000 AND sr_store_sk = s_store_sk AND s_state = 'SD' GROUP BY sr_customer_sk, sr_store_sk"
+    },
+    {
+      "op": "replace_clause",
+      "target": "main_query.where",
+      "sql": "WHERE ctr1.ctr_total_return > ctr1.store_avg_120pct AND ctr1.ctr_customer_sk = c_customer_sk"
+    },
+    {
+      "op": "delete_cte",
+      "name": "customer_total_return"
+    },
+    {
+      "op": "add_cte",
+      "after": null,
+      "name": "customer_total_return",
+      "sql": "SELECT sr_customer_sk as ctr_customer_sk, sr_store_sk as ctr_store_sk, sum(SR_FEE) as ctr_total_return, AVG(sum(SR_FEE)) OVER (PARTITION BY sr_store_sk) * 1.2 as store_avg_120pct FROM store_returns, date_dim, store WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000 AND sr_store_sk = s_store_sk AND s_state = 'SD' GROUP BY sr_customer_sk, sr_store_sk"
+    }
+  ],
+  "semantic_warnings": ["Removed correlated subquery using window function", "Pushed store filter into CTE to reduce aggregation size"],
+  "explanation": "1. Pushed store join and s_state='SD' filter into CTE to reduce rows aggregated from 56,138 to only SD stores. 2. Replaced correlated subquery with window function to compute store average once per partition. 3. Removed redundant store join from main query since store is already joined in CTE. This should reduce the SEQ_SCAN on store_returns and eliminate the HASH_JOIN cost."
+}
+```
+
+**Key optimizations applied:**
+
+1. **Store filter hoisting**: Moved the `store` join and `s_state='SD'` filter into the CTE, so we only aggregate returns from South Dakota stores instead of all stores.
+
+2. **Correlated subquery to window function**: Replaced the correlated subquery `(SELECT AVG(ctr_total_return)*1.2 FROM customer_total_return ctr2 WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk)` with a window function `AVG(sum(SR_FEE)) OVER (PARTITION BY sr_store_sk) * 1.2` computed directly in the CTE.
+
+3. **Join elimination**: Removed the `store` table join from the main query since we already joined it in the CTE and filtered by `s_state='SD'`.
+
+**Expected improvements:**
+- The `SEQ_SCAN (store_returns)` should process fewer rows since we filter by `s_state='SD'` early
+- The `HASH_JOIN` cost should be eliminated since we removed the store join from the main query
+- The correlated subquery execution cost is eliminated by using the window function
+- The main query becomes simpler with just a single filter condition
+
+Note: The operations are split into replace/delete/add to ensure proper ordering and reference resolution.
