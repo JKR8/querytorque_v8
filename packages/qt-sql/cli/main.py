@@ -210,6 +210,8 @@ def audit(
 @click.option("--output", "-o", type=click.Path(), help="Output file for optimized SQL")
 @click.option("--dry-run", is_flag=True, help="Show prompt without calling LLM")
 @click.option("--show-prompt", is_flag=True, help="Display the full prompt sent to LLM")
+@click.option("--mcts", is_flag=True, help="Use MCTS-guided optimization with validation")
+@click.option("--mcts-iterations", default=30, help="Maximum MCTS iterations (default: 30)")
 def optimize(
     file: str,
     dialect: str,
@@ -219,17 +221,23 @@ def optimize(
     output: Optional[str],
     dry_run: bool,
     show_prompt: bool,
+    mcts: bool,
+    mcts_iterations: int,
 ):
     """Optimize SQL using LLM-powered analysis.
 
     When a --database is provided, includes schema context and execution plan
     in the prompt for better optimization recommendations.
 
+    Use --mcts for MCTS-guided optimization that systematically explores
+    transformation sequences with validation feedback.
+
     Examples:
         qt-sql optimize query.sql
         qt-sql optimize query.sql --database /path/to/data.duckdb
         qt-sql optimize query.sql -d mydata.duckdb --provider deepseek
         qt-sql optimize query.sql -o optimized.sql
+        qt-sql optimize query.sql -d data.duckdb --mcts --mcts-iterations 30
     """
     try:
         sql = read_sql_file(file)
@@ -338,6 +346,69 @@ Return your response as JSON:
         console.print("\n[yellow]Dry run mode - LLM call skipped.[/yellow]")
         if not show_prompt:
             console.print("[dim]Use --show-prompt to see the full prompt.[/dim]")
+        return
+
+    # MCTS optimization mode
+    if mcts:
+        if not database:
+            console.print("[red]MCTS optimization requires --database for validation.[/red]")
+            sys.exit(1)
+
+        try:
+            from qt_sql.optimization import MCTS_AVAILABLE, MCTSSQLOptimizer
+
+            if not MCTS_AVAILABLE:
+                console.print("[red]MCTS optimizer not available. Check dependencies.[/red]")
+                sys.exit(1)
+
+            console.print(f"\n[bold]Running MCTS optimization (max {mcts_iterations} iterations)...[/bold]")
+
+            with MCTSSQLOptimizer(
+                database=database,
+                provider=provider,
+                model=model,
+            ) as optimizer:
+                mcts_result = optimizer.optimize(
+                    query=sql,
+                    max_iterations=mcts_iterations,
+                )
+
+            # Display results
+            if mcts_result.valid:
+                status_color = "green" if mcts_result.speedup > 1.0 else "yellow"
+                console.print(Panel(
+                    f"[bold {status_color}]Speedup: {mcts_result.speedup:.2f}x[/bold {status_color}]\n"
+                    f"Method: {mcts_result.method}\n"
+                    f"Iterations: {mcts_result.iterations}\n"
+                    f"Time: {mcts_result.elapsed_time:.1f}s",
+                    title="MCTS Optimization Result",
+                    border_style=status_color,
+                ))
+
+                if mcts_result.transforms_applied:
+                    console.print(f"\n[dim]Transforms: {' -> '.join(mcts_result.transforms_applied)}[/dim]")
+
+                console.print("\n[bold]Optimized SQL:[/bold]")
+                console.print(Syntax(mcts_result.optimized_sql, "sql", theme="monokai", line_numbers=True))
+
+                if output:
+                    Path(output).write_text(mcts_result.optimized_sql, encoding="utf-8")
+                    console.print(f"\n[green]Optimized SQL saved to: {output}[/green]")
+            else:
+                console.print("[yellow]No valid optimization found.[/yellow]")
+
+            # Show tree stats
+            stats = mcts_result.tree_stats
+            console.print(f"\n[dim]Tree stats: {stats.get('tree_size', 0)} nodes, "
+                         f"{stats.get('successful_expansions', 0)} successful transforms, "
+                         f"{stats.get('validation_calls', 0)} validations[/dim]")
+
+        except Exception as e:
+            console.print(f"[red]MCTS optimization failed: {e}[/red]")
+            import traceback
+            console.print(f"[dim]{traceback.format_exc()}[/dim]")
+            sys.exit(1)
+
         return
 
     if not issues and not database:

@@ -31,6 +31,12 @@ from .block_map import (
     Block,
     Clause,
 )
+from .sql_dag import (
+    SQLDag,
+    DagNode,
+    DagEdge,
+    build_dag_prompt,
+)
 from .iterative_optimizer import (
     test_optimization,
     format_test_feedback,
@@ -49,6 +55,11 @@ try:
         SQLOptimizer,
         OptimizationValidator,
         speedup_metric,
+        # DAG-based optimizer
+        DagOptimizationPipeline,
+        DagOptimizationResult,
+        SQLDagOptimizer,
+        optimize_with_dag,
     )
     DSPY_AVAILABLE = True
 except ImportError:
@@ -59,6 +70,36 @@ except ImportError:
     SQLOptimizer = None
     OptimizationValidator = None
     speedup_metric = None
+    DagOptimizationPipeline = None
+    DagOptimizationResult = None
+    SQLDagOptimizer = None
+    optimize_with_dag = None
+
+# MCTS-based optimizer
+try:
+    from .mcts import (
+        MCTSSQLOptimizer,
+        MCTSOptimizationResult,
+        MCTSNode,
+        MCTSTree,
+        TRANSFORMATION_LIBRARY,
+        TransformationType,
+        apply_transformation,
+        compute_reward,
+        RewardConfig,
+    )
+    MCTS_AVAILABLE = True
+except ImportError:
+    MCTS_AVAILABLE = False
+    MCTSSQLOptimizer = None
+    MCTSOptimizationResult = None
+    MCTSNode = None
+    MCTSTree = None
+    TRANSFORMATION_LIBRARY = None
+    TransformationType = None
+    apply_transformation = None
+    compute_reward = None
+    RewardConfig = None
 
 __all__ = [
     # Legacy v2 payload builder
@@ -85,6 +126,11 @@ __all__ = [
     "BlockMapResult",
     "Block",
     "Clause",
+    # SQL DAG (proper graph structure)
+    "SQLDag",
+    "DagNode",
+    "DagEdge",
+    "build_dag_prompt",
     # Iterative optimizer
     "test_optimization",
     "format_test_feedback",
@@ -95,7 +141,7 @@ __all__ = [
     # Schemas for structured output
     "OPTIMIZATION_PATCH_SCHEMA",
     "OPTIMIZATION_SQL_SCHEMA",
-    # DSPy optimizer
+    # DSPy optimizer (legacy - full SQL output)
     "DSPY_AVAILABLE",
     "optimize_query",
     "configure_lm",
@@ -103,4 +149,20 @@ __all__ = [
     "SQLOptimizer",
     "OptimizationValidator",
     "speedup_metric",
+    # DSPy DAG optimizer (node-level rewrites)
+    "DagOptimizationPipeline",
+    "DagOptimizationResult",
+    "SQLDagOptimizer",
+    "optimize_with_dag",
+    # MCTS optimizer
+    "MCTS_AVAILABLE",
+    "MCTSSQLOptimizer",
+    "MCTSOptimizationResult",
+    "MCTSNode",
+    "MCTSTree",
+    "TRANSFORMATION_LIBRARY",
+    "TransformationType",
+    "apply_transformation",
+    "compute_reward",
+    "RewardConfig",
 ]
