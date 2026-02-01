@@ -10,7 +10,7 @@
 |--------|-------|
 | Queries Optimized | 82/99 |
 | Average Speedup | 1.14x |
-| Big Wins (≥1.5x) | 10 |
+| Wins (≥1.2x) | 20 |
 | Regressions (<1.0x) | 29 |
 
 ## Full Results
@@ -117,6 +117,31 @@
 | q98 | ✓ | 168.8ms | 152.0ms | 1.11x | `PRED` |
 | q99 | ✓ | 48.5ms | 51.8ms | 0.94x ↓ | `PRED` |
 
+## Wins Detail (≥1.2x)
+
+| Query | Speedup | Pattern | Notes |
+|-------|---------|---------|-------|
+| q15 | 2.98x | `UNION` | OR conditions split into 3 UNION ALL branches for ca_zip/ca_state/cs_sales_price |
+| q39 | 2.44x | `CTE_DATE` | Split month-specific inventory into separate CTEs (Jan/Feb) |
+| q23 | 2.33x | `UNION` | Early date filtering reduces catalog_sales scan before aggregation |
+| q45 | 2.26x | `UNION` | Materialized subquery for customer filtering |
+| q95 | 2.25x | `MAT_CTE` | Web sales with early date filtering and EXISTS optimization |
+| q24 | 2.16x | `UNION` | Scan consolidation for store returns |
+| q92 | 2.06x | `CTE_DATE` | Early date + item filtering with CTE |
+| q41 | 1.69x | `PRED` | Simplified item filtering logic |
+| q74 | 1.64x | `UNION` | Customer year-over-year comparison with early filtering |
+| q88 | 1.56x | `PRED` | Time-based store sales aggregation with predicate pushdown |
+| q1 | 1.35x | `CTE` | Store returns aggregation with CTE restructuring |
+| q90 | 1.32x | `PRED` | Morning/afternoon sales ratio with early filtering |
+| q29 | 1.26x | `CTE_DATE` | Store sales/returns with item filtering |
+| q4 | 1.25x | `UNION` | Customer lifetime value with early date filtering |
+| q47 | 1.24x | `CTE_DATE` | Monthly sales comparison with window functions |
+| q61 | 1.24x | `PRED` | Promotion analysis with predicate pushdown |
+| q62 | 1.24x | `CTE_DATE` | Shipping mode analysis with CTE |
+| q17 | 1.23x | `CTE_DATE` | Store/catalog sales correlation with date CTEs |
+| q82 | 1.23x | `PRED` | Inventory analysis with date pushdown |
+| q69 | 1.22x | `CTE_DATE` | Customer demographics with early filtering |
+
 ## Pattern Codes
 
 | Code | Pattern | Description | Typical Speedup |
@@ -132,21 +157,6 @@
 | `SCAN` | Scan Consolidation | Combine multiple scans into single pass | 1.2-1.5x |
 | `ORIG` | Keep Original | Original already optimal or optimization regressed | 1.0x |
 | `OTHER` | Other | Mixed or unclassified optimization | varies |
-
-## Big Wins Detail
-
-| Query | Speedup | Pattern | Notes |
-|-------|---------|---------|-------|
-| q15 | 2.98x | `UNION` | OR conditions split into 3 UNION ALL branches for ca_zip/ca_state/cs_sales_price |
-| q39 | 2.44x | `CTE_DATE` | Split month-specific inventory into separate CTEs (Jan/Feb) |
-| q23 | 2.33x | `UNION` | Early date filtering reduces catalog_sales scan before aggregation |
-| q45 | 2.26x | `UNION` | Materialized subquery for customer filtering |
-| q95 | 2.25x | `MAT_CTE` | Web sales with EXISTS optimization |
-| q24 | 2.16x | `UNION` | Scan consolidation for store returns |
-| q92 | 2.06x | `CTE_DATE` | Early date + item filtering |
-| q41 | 1.69x | `PRED` | Simplified item filtering logic |
-| q74 | 1.64x | `UNION` | Customer year-over-year with early filtering |
-| q88 | 1.56x | `PRED` | Time-based store sales aggregation |
 
 ## Legend
 
