@@ -227,6 +227,43 @@ Instead of telling DeepSeek about ALL detected patterns, we should:
 
 ---
 
+---
+
+## VALIDATION BUG DISCOVERED (Q83)
+
+**Problem:** DeepSeek's Q83 optimization passed validation but is **semantically wrong**.
+
+### What happened:
+```
+Original query: Gets dates in same WEEKS as ('2001-06-06','2001-09-02','2001-11-11')
+DeepSeek query: Gets ONLY those 3 specific dates
+
+Original: 21 dates, 36,094 matching items
+DeepSeek: 3 dates, 532 matching items
+```
+
+### Why validation passed:
+Both queries have `LIMIT 100`, so both return exactly 100 rows.
+Validation only checked:
+- Query runs without error ✓
+- Row count matches (100 = 100) ✓
+
+But it didn't check:
+- Actual data values ✗
+- Row count WITHOUT limit ✗
+
+### Fix required:
+1. Remove LIMIT before validation comparison
+2. OR compare actual row values/hashes
+3. OR compare total row count without LIMIT
+
+### Impact:
+- Q83 marked as ✓ (passed) with 0.77x speedup
+- Actually should be ✗ (failed validation)
+- May affect other "passed" queries too
+
+---
+
 ## Files
 
 - Opportunity rules: `packages/qt-sql/qt_sql/analyzers/ast_detector/rules/opportunity_rules.py`
