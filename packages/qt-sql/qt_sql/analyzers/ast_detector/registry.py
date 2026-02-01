@@ -121,6 +121,30 @@ from .rules import (
     LargePivotWithoutFilterRule,
     CountDistinctOnOrderedDataRule,
     NestedLoopJoinRiskRule,
+    # Optimization rules (from POC rulebook)
+    SingleUseCTEInlineRule,
+    UnusedCTERule,
+    ExistsToSemiJoinRule,
+    LeftJoinAntiPatternRule,
+    LeftJoinFilterRule,
+    NonSargablePredicateRule,
+    NotInNullTrapRule,
+    HavingNonAggregateRule,
+    DistinctGroupByRedundancyRule,
+    OptimizationOffsetRule,
+    TopNPerGroupRule,
+    UnnecessaryDistinctRule,
+    OrToUnionRule,
+    WindowPushdownRule,
+    PreAggregateRule,
+    GroupByFunctionalDependencyRule,
+    # Optimization opportunity rules (empirical - from TPC-DS wins)
+    OrToUnionOpportunity,
+    LateDateFilterOpportunity,
+    RepeatedSubqueryOpportunity,
+    CorrelatedSubqueryOpportunity,
+    ImplicitCrossJoinOpportunity,
+    CountToExistsOpportunity,
     # Snowflake
     CopyIntoWithoutFileFormatRule,
     SelectWithoutLimitOrSampleRule,
@@ -301,6 +325,32 @@ _ALL_RULES: list[ASTRule] = [
     LargePivotWithoutFilterRule(),
     CountDistinctOnOrderedDataRule(),
     NestedLoopJoinRiskRule(),
+
+    # Optimization rules from POC rulebook (16)
+    SingleUseCTEInlineRule(),
+    UnusedCTERule(),
+    ExistsToSemiJoinRule(),
+    LeftJoinAntiPatternRule(),
+    LeftJoinFilterRule(),
+    NonSargablePredicateRule(),
+    NotInNullTrapRule(),
+    HavingNonAggregateRule(),
+    DistinctGroupByRedundancyRule(),
+    OptimizationOffsetRule(),
+    TopNPerGroupRule(),
+    UnnecessaryDistinctRule(),
+    OrToUnionRule(),
+    WindowPushdownRule(),
+    PreAggregateRule(),
+    GroupByFunctionalDependencyRule(),
+
+    # Optimization opportunity rules - empirical from TPC-DS wins (6)
+    OrToUnionOpportunity(),
+    LateDateFilterOpportunity(),
+    RepeatedSubqueryOpportunity(),
+    CorrelatedSubqueryOpportunity(),
+    ImplicitCrossJoinOpportunity(),
+    CountToExistsOpportunity(),
 ]
 
 # Rule lookup by ID
@@ -337,3 +387,12 @@ def get_categories() -> list[str]:
 def get_rule_count() -> int:
     """Get total number of registered rules."""
     return len(_ALL_RULES)
+
+
+def get_opportunity_rules() -> list[ASTRule]:
+    """Get optimization opportunity rules (empirical patterns from TPC-DS).
+
+    These rules detect patterns that are likely to benefit from rewrites,
+    based on measured speedups from TPC-DS SF100 benchmarks.
+    """
+    return get_rules_by_category("optimization_opportunity")

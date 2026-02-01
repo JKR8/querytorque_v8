@@ -153,6 +153,36 @@ from .duckdb_rules import (
     NestedLoopJoinRiskRule,
 )
 
+# Optimization opportunity rules (from POC rulebook)
+from .optimization_rules import (
+    SingleUseCTEInlineRule,
+    UnusedCTERule,
+    ExistsToSemiJoinRule,
+    LeftJoinAntiPatternRule,
+    LeftJoinFilterRule,
+    NonSargablePredicateRule,
+    NotInNullTrapRule,
+    HavingNonAggregateRule,
+    DistinctGroupByRedundancyRule,
+    OffsetPaginationRule as OptimizationOffsetRule,
+    TopNPerGroupRule,
+    UnnecessaryDistinctRule,
+    OrToUnionRule,
+    WindowPushdownRule,
+    PreAggregateRule,
+    GroupByFunctionalDependencyRule,
+)
+
+# Optimization opportunity rules (empirical - from TPC-DS wins)
+from .opportunity_rules import (
+    OrToUnionOpportunity,
+    LateDateFilterOpportunity,
+    RepeatedSubqueryOpportunity,
+    CorrelatedSubqueryOpportunity,
+    ImplicitCrossJoinOpportunity,
+    CountToExistsOpportunity,
+)
+
 # Snowflake-specific rules
 from .snowflake_rules import (
     CopyIntoWithoutFileFormatRule,
@@ -313,4 +343,28 @@ __all__ = [
     "CrossPartitionScanRule",
     "MissingMaterializedViewCandidateRule",
     "StaleMaterializedViewCheckRule",
+    # Optimization rules (from POC rulebook)
+    "SingleUseCTEInlineRule",
+    "UnusedCTERule",
+    "ExistsToSemiJoinRule",
+    "LeftJoinAntiPatternRule",
+    "LeftJoinFilterRule",
+    "NonSargablePredicateRule",
+    "NotInNullTrapRule",
+    "HavingNonAggregateRule",
+    "DistinctGroupByRedundancyRule",
+    "OptimizationOffsetRule",
+    "TopNPerGroupRule",
+    "UnnecessaryDistinctRule",
+    "OrToUnionRule",
+    "WindowPushdownRule",
+    "PreAggregateRule",
+    "GroupByFunctionalDependencyRule",
+    # Optimization opportunities (empirical - from TPC-DS wins)
+    "OrToUnionOpportunity",
+    "LateDateFilterOpportunity",
+    "RepeatedSubqueryOpportunity",
+    "CorrelatedSubqueryOpportunity",
+    "ImplicitCrossJoinOpportunity",
+    "CountToExistsOpportunity",
 ]
