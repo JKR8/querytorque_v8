@@ -1,0 +1,16 @@
+WITH q1_sales AS (
+    SELECT cs_bill_customer_sk, cs_sales_price
+    FROM catalog_sales
+    JOIN date_dim ON cs_sold_date_sk = d_date_sk AND d_qoy = 1 AND d_year = 2001
+)
+SELECT ca.ca_zip, SUM(q1.cs_sales_price)
+FROM q1_sales q1
+JOIN customer c ON q1.cs_bill_customer_sk = c.c_customer_sk
+JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+WHERE substr(ca.ca_zip,1,5) IN ('85669', '86197','88274','83405','86475',
+                                '85392', '85460', '80348', '81792')
+   OR ca.ca_state IN ('CA','WA','GA')
+   OR q1.cs_sales_price > 500
+GROUP BY ca.ca_zip
+ORDER BY ca.ca_zip
+LIMIT 100;
