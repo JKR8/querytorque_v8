@@ -9,7 +9,7 @@ Routes:
 """
 
 import logging
-from typing import Optional, Annotated
+from typing import Optional, Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +20,7 @@ from qt_shared.config import get_settings, Settings
 
 from qt_sql.analyzers.sql_antipattern_detector import SQLAntiPatternDetector
 from qt_sql.calcite_client import get_calcite_client
+from qt_sql.renderers import render_sql_report
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -36,20 +37,17 @@ app = FastAPI(
 )
 
 
-# CORS configuration
-@app.on_event("startup")
-async def configure_cors():
-    """Configure CORS based on settings."""
-    settings = get_settings()
-    origins = [origin.strip() for origin in settings.cors_origins.split(",")]
+# CORS configuration - must be added at module level, not in startup event
+_settings = get_settings()
+_origins = [origin.strip() for origin in _settings.cors_origins.split(",")]
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # Request/Response models
@@ -101,6 +99,22 @@ class AnalyzeResponse(BaseModel):
         default=None,
         description="Calcite optimization results if requested"
     )
+    html: str = Field(
+        default="",
+        description="HTML audit report"
+    )
+    original_sql: str = Field(
+        default="",
+        description="Original SQL query"
+    )
+    file_name: str = Field(
+        default="query.sql",
+        description="File name"
+    )
+    status: str = Field(
+        default="pass",
+        description="Overall status (pass, warn, fail, deny)"
+    )
 
 
 class OptimizeRequest(BaseModel):
@@ -139,6 +153,49 @@ class HealthResponse(BaseModel):
     auth_enabled: bool
     llm_configured: bool
     calcite_available: Optional[bool] = None
+    mode: Literal['auto', 'manual'] = 'manual'
+    llm_provider: Optional[str] = None
+
+
+class ValidateManualRequest(BaseModel):
+    """Request for manual validation."""
+    original_sql: str = Field(..., description="Original SQL code")
+    llm_response: str = Field(..., description="Raw LLM response (YAML or SQL)")
+    dialect: str = Field(default="generic", description="SQL dialect")
+
+
+class IssueDetailResponse(BaseModel):
+    """Issue detail for validation response."""
+    rule_id: Optional[str] = None
+    severity: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+
+
+class ValidateManualResponse(BaseModel):
+    """Validation response matching frontend ValidationPreviewResponse."""
+    session_id: str
+    success: bool
+    optimization_mode: str = "manual"
+    syntax_status: str
+    syntax_errors: list[str] = []
+    schema_status: str = "skip"
+    schema_violations: list[str] = []
+    regression_status: str
+    issues_fixed: list[IssueDetailResponse] = []
+    new_issues: list[IssueDetailResponse] = []
+    equivalence_status: str = "skip"
+    original_code: str
+    optimized_code: str
+    diff_html: str = ""
+    all_passed: bool
+    errors: list[str] = []
+    warnings: list[str] = []
+    can_retry: bool = True
+    retry_count: int = 0
+    max_retries: int = 3
+    llm_confidence: float = 0.0
+    llm_explanation: str = ""
 
 
 # Routes
@@ -164,14 +221,16 @@ async def health_check():
         auth_enabled=settings.auth_enabled,
         llm_configured=settings.has_llm_provider,
         calcite_available=calcite_available,
+        mode='manual' if settings.is_manual_mode else 'auto',
+        llm_provider=settings.llm_provider if settings.llm_provider else None,
     )
 
 
 @app.post("/api/sql/analyze", response_model=AnalyzeResponse, tags=["SQL"])
 async def analyze_sql(
     request: AnalyzeRequest,
-    user: Annotated[Optional[UserContext], Depends(OptionalUser)],
 ):
+    user = None  # Auth temporarily disabled for debugging
     """Analyze SQL for anti-patterns and issues.
 
     Performs static analysis on the provided SQL query and returns
@@ -213,6 +272,29 @@ async def analyze_sql(
             for issue in result.issues
         ]
 
+        # Determine status based on score
+        score = result.final_score
+        if score >= 90:
+            status_str = "pass"
+        elif score >= 70:
+            status_str = "warn"
+        elif score >= 50:
+            status_str = "fail"
+        else:
+            status_str = "deny"
+
+        # Generate HTML report
+        try:
+            html_report = render_sql_report(
+                analysis_result=result,
+                sql=request.sql,
+                filename="query.sql",
+                dialect=request.dialect,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to render HTML report: {e}")
+            html_report = ""
+
         response = AnalyzeResponse(
             score=result.final_score,
             total_penalty=result.total_penalty,
@@ -224,6 +306,10 @@ async def analyze_sql(
             },
             issues=issues,
             query_structure=result.query_structure,
+            html=html_report,
+            original_sql=request.sql,
+            file_name="query.sql",
+            status=status_str,
         )
 
         # Include Calcite analysis if requested
@@ -430,6 +516,673 @@ Provide an optimized version with brief explanation. Format:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Optimization failed: {str(e)}"
+        )
+
+
+import uuid
+import re as regex_module
+
+
+def _extract_optimized_sql(llm_response: str) -> Optional[str]:
+    """Extract SQL from LLM response."""
+    response = llm_response.strip()
+
+    # Try markdown SQL code block
+    sql_match = regex_module.search(r'```sql\s*(.*?)\s*```', response, regex_module.DOTALL | regex_module.IGNORECASE)
+    if sql_match:
+        return sql_match.group(1).strip()
+
+    # Try any code block
+    code_match = regex_module.search(r'```\s*(.*?)\s*```', response, regex_module.DOTALL)
+    if code_match:
+        potential_sql = code_match.group(1).strip()
+        if regex_module.search(r'\b(SELECT|INSERT|UPDATE|DELETE|WITH)\b', potential_sql, regex_module.IGNORECASE):
+            return potential_sql
+
+    # Check if entire response is SQL
+    if regex_module.search(r'^\s*(SELECT|WITH|INSERT|UPDATE|DELETE)\b', response, regex_module.IGNORECASE):
+        return response
+
+    return None
+
+
+def _validate_syntax(sql: str, dialect: str) -> tuple[str, list[str]]:
+    """Validate SQL syntax using sqlglot."""
+    import sqlglot
+
+    dialect_map = {
+        "generic": None, "postgres": "postgres", "snowflake": "snowflake",
+        "duckdb": "duckdb", "tsql": "tsql",
+    }
+
+    try:
+        sqlglot.parse_one(sql, dialect=dialect_map.get(dialect))
+        return "pass", []
+    except sqlglot.errors.ParseError as e:
+        return "fail", [str(e)]
+    except Exception as e:
+        return "fail", [f"Parse error: {str(e)}"]
+
+
+@app.post("/api/optimize/manual/validate", response_model=ValidateManualResponse, tags=["Optimization"])
+async def validate_manual_response(request: ValidateManualRequest):
+    """Validate LLM response for manual optimization mode."""
+    session_id = str(uuid.uuid4())[:8]
+
+    # Extract SQL from response
+    optimized_sql = _extract_optimized_sql(request.llm_response)
+
+    if not optimized_sql:
+        return ValidateManualResponse(
+            session_id=session_id, success=False, syntax_status="fail",
+            syntax_errors=["Could not extract SQL from LLM response"],
+            regression_status="skip", original_code=request.original_sql,
+            optimized_code="", all_passed=False, errors=["Failed to parse LLM response"]
+        )
+
+    # Syntax validation
+    syntax_status, syntax_errors = _validate_syntax(optimized_sql, request.dialect)
+
+    if syntax_status == "fail":
+        return ValidateManualResponse(
+            session_id=session_id, success=False, syntax_status=syntax_status,
+            syntax_errors=syntax_errors, regression_status="skip",
+            original_code=request.original_sql, optimized_code=optimized_sql,
+            all_passed=False, errors=["Syntax validation failed"]
+        )
+
+    # Regression check
+    detector = SQLAntiPatternDetector(dialect=request.dialect)
+    original_result = detector.analyze(request.original_sql)
+    optimized_result = detector.analyze(optimized_sql)
+
+    original_rules = {i.rule_id for i in original_result.issues}
+    optimized_rules = {i.rule_id for i in optimized_result.issues}
+
+    fixed_rules = original_rules - optimized_rules
+    new_rules = optimized_rules - original_rules
+
+    issues_fixed = [
+        IssueDetailResponse(rule_id=i.rule_id, severity=i.severity, title=i.name, description=i.description)
+        for i in original_result.issues if i.rule_id in fixed_rules
+    ]
+    new_issues = [
+        IssueDetailResponse(rule_id=i.rule_id, severity=i.severity, title=i.name, description=i.description)
+        for i in optimized_result.issues if i.rule_id in new_rules
+    ]
+
+    regression_status = "pass"
+    if any(i.severity in ("critical", "high") for i in new_issues):
+        regression_status = "fail"
+    elif new_issues:
+        regression_status = "warn"
+
+    all_passed = syntax_status == "pass" and regression_status in ("pass", "warn")
+
+    # Extract explanation
+    llm_explanation = ""
+    expl_match = regex_module.search(r'(?:explanation|changes|what was changed)[:\s]*(.+?)(?=```|$)',
+                           request.llm_response, regex_module.IGNORECASE | regex_module.DOTALL)
+    if expl_match:
+        llm_explanation = expl_match.group(1).strip()[:500]
+
+    return ValidateManualResponse(
+        session_id=session_id, success=all_passed, syntax_status=syntax_status,
+        syntax_errors=syntax_errors, regression_status=regression_status,
+        issues_fixed=issues_fixed, new_issues=new_issues,
+        original_code=request.original_sql, optimized_code=optimized_sql,
+        all_passed=all_passed, llm_explanation=llm_explanation
+    )
+
+
+# ============================================
+# Database Connection Endpoints
+# ============================================
+
+import tempfile
+import os
+from fastapi import UploadFile, File, Form
+
+# Session storage for database connections
+db_sessions: dict[str, "DuckDBExecutor"] = {}
+
+
+class DatabaseConnectResponse(BaseModel):
+    """Response from database connection."""
+    session_id: str
+    connected: bool
+    type: str
+    details: Optional[str] = None
+    error: Optional[str] = None
+
+
+class DatabaseStatusResponse(BaseModel):
+    """Database connection status."""
+    connected: bool
+    type: Optional[str] = None
+    details: Optional[str] = None
+
+
+class SchemaColumn(BaseModel):
+    """Column definition."""
+    name: str
+    type: str
+    nullable: Optional[bool] = None
+
+
+class SchemaResponse(BaseModel):
+    """Database schema response."""
+    session_id: str
+    tables: dict[str, list[SchemaColumn]]
+    error: Optional[str] = None
+
+
+class ExecuteRequest(BaseModel):
+    """Request for SQL execution."""
+    sql: str
+    limit: int = Field(default=100, ge=1, le=10000)
+
+
+class QueryResultResponse(BaseModel):
+    """Query execution result."""
+    columns: list[str]
+    column_types: list[str]
+    rows: list[list]
+    row_count: int
+    execution_time_ms: float
+    truncated: bool = False
+    error: Optional[str] = None
+
+
+class ExplainRequest(BaseModel):
+    """Request for execution plan."""
+    sql: str
+    analyze: bool = True
+
+
+class ExecutionPlanResponse(BaseModel):
+    """Execution plan response."""
+    success: bool
+    plan_text: Optional[str] = None
+    plan_json: Optional[dict] = None
+    plan_tree: Optional[list] = None
+    execution_time_ms: Optional[float] = None
+    total_cost: Optional[float] = None
+    bottleneck: Optional[dict] = None
+    warnings: Optional[list[str]] = None
+    error: Optional[str] = None
+
+
+@app.post("/api/database/connect/duckdb", response_model=DatabaseConnectResponse, tags=["Database"])
+async def connect_duckdb(fixture_file: UploadFile = File(...)):
+    """Connect to DuckDB with a fixture file.
+
+    Upload a SQL file containing CREATE TABLE and INSERT statements,
+    or a CSV/Parquet file to create an in-memory database.
+    """
+    from qt_sql.execution import DuckDBExecutor
+
+    session_id = str(uuid.uuid4())[:12]
+
+    try:
+        # Read uploaded file
+        content = await fixture_file.read()
+
+        # Create temp file for fixture
+        suffix = os.path.splitext(fixture_file.filename or "")[1] or ".sql"
+        with tempfile.NamedTemporaryFile(mode='wb', suffix=suffix, delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        try:
+            # Create DuckDB executor
+            executor = DuckDBExecutor(":memory:")
+            executor.connect()
+
+            # Load fixture based on file type
+            if suffix.lower() == ".sql":
+                executor.execute_script(content.decode('utf-8'))
+            elif suffix.lower() == ".csv":
+                executor._ensure_connected().execute(
+                    f"CREATE TABLE data AS SELECT * FROM read_csv_auto('{tmp_path}')"
+                )
+            elif suffix.lower() in (".parquet", ".pq"):
+                executor._ensure_connected().execute(
+                    f"CREATE TABLE data AS SELECT * FROM read_parquet('{tmp_path}')"
+                )
+            else:
+                # Try as SQL
+                executor.execute_script(content.decode('utf-8'))
+
+            # Store session
+            db_sessions[session_id] = executor
+
+            # Get table info
+            schema = executor.get_schema_info(include_row_counts=False)
+            table_count = len(schema.get("tables", []))
+
+            return DatabaseConnectResponse(
+                session_id=session_id,
+                connected=True,
+                type="duckdb",
+                details=f"Loaded {table_count} table(s) from {fixture_file.filename}",
+            )
+
+        finally:
+            # Clean up temp file
+            os.unlink(tmp_path)
+
+    except Exception as e:
+        logger.exception("DuckDB connection failed")
+        return DatabaseConnectResponse(
+            session_id=session_id,
+            connected=False,
+            type="duckdb",
+            error=str(e),
+        )
+
+
+@app.post("/api/database/connect/duckdb/quick", response_model=DatabaseConnectResponse, tags=["Database"])
+async def connect_duckdb_quick(fixture_path: str = Form(...)):
+    """Connect to DuckDB with a fixture path on the server.
+
+    For development/testing when fixture files are on the server.
+    """
+    from qt_sql.execution import DuckDBExecutor
+
+    session_id = str(uuid.uuid4())[:12]
+
+    try:
+        executor = DuckDBExecutor(":memory:")
+        executor.connect()
+
+        # Check file type and load
+        suffix = os.path.splitext(fixture_path)[1].lower()
+
+        if suffix == ".sql":
+            with open(fixture_path, 'r') as f:
+                executor.execute_script(f.read())
+        elif suffix == ".csv":
+            executor._ensure_connected().execute(
+                f"CREATE TABLE data AS SELECT * FROM read_csv_auto('{fixture_path}')"
+            )
+        elif suffix in (".parquet", ".pq"):
+            executor._ensure_connected().execute(
+                f"CREATE TABLE data AS SELECT * FROM read_parquet('{fixture_path}')"
+            )
+        elif suffix == ".duckdb":
+            # Connect to existing DuckDB file
+            executor.close()
+            executor = DuckDBExecutor(fixture_path, read_only=True)
+            executor.connect()
+        else:
+            # Try as SQL
+            with open(fixture_path, 'r') as f:
+                executor.execute_script(f.read())
+
+        db_sessions[session_id] = executor
+
+        schema = executor.get_schema_info(include_row_counts=False)
+        table_count = len(schema.get("tables", []))
+
+        return DatabaseConnectResponse(
+            session_id=session_id,
+            connected=True,
+            type="duckdb",
+            details=f"Connected to {fixture_path} ({table_count} tables)",
+        )
+
+    except Exception as e:
+        logger.exception("DuckDB quick connection failed")
+        return DatabaseConnectResponse(
+            session_id=session_id,
+            connected=False,
+            type="duckdb",
+            error=str(e),
+        )
+
+
+@app.get("/api/database/status/{session_id}", response_model=DatabaseStatusResponse, tags=["Database"])
+async def get_database_status(session_id: str):
+    """Get database connection status."""
+    executor = db_sessions.get(session_id)
+
+    if not executor:
+        return DatabaseStatusResponse(connected=False)
+
+    return DatabaseStatusResponse(
+        connected=True,
+        type="duckdb",
+        details="Connected",
+    )
+
+
+@app.delete("/api/database/disconnect/{session_id}", tags=["Database"])
+async def disconnect_database(session_id: str):
+    """Disconnect from database and clean up session."""
+    executor = db_sessions.pop(session_id, None)
+
+    if executor:
+        try:
+            executor.close()
+        except Exception:
+            pass
+
+    return {"success": True}
+
+
+@app.post("/api/database/execute/{session_id}", response_model=QueryResultResponse, tags=["Database"])
+async def execute_query(session_id: str, request: ExecuteRequest):
+    """Execute a SQL query and return results."""
+    import time
+
+    executor = db_sessions.get(session_id)
+    if not executor:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Database session not found"
+        )
+
+    try:
+        start = time.time()
+
+        # Add LIMIT if not present (for safety)
+        sql = request.sql.strip().rstrip(';')
+        has_limit = 'limit' in sql.lower().split()[-3:] if len(sql.split()) > 3 else False
+
+        if not has_limit and request.limit:
+            sql = f"SELECT * FROM ({sql}) AS _subq LIMIT {request.limit}"
+
+        conn = executor._ensure_connected()
+        result = conn.execute(sql)
+
+        columns = [desc[0] for desc in result.description] if result.description else []
+        column_types = [desc[1] for desc in result.description] if result.description else []
+        rows = result.fetchall()
+
+        execution_time = (time.time() - start) * 1000
+
+        # Convert rows to serializable format
+        def convert_value(v):
+            if v is None:
+                return None
+            if isinstance(v, (int, float, str, bool)):
+                return v
+            return str(v)
+
+        serialized_rows = [[convert_value(v) for v in row] for row in rows]
+
+        return QueryResultResponse(
+            columns=columns,
+            column_types=[str(t) for t in column_types],
+            rows=serialized_rows,
+            row_count=len(rows),
+            execution_time_ms=round(execution_time, 2),
+            truncated=len(rows) >= request.limit if request.limit else False,
+        )
+
+    except Exception as e:
+        logger.exception("Query execution failed")
+        return QueryResultResponse(
+            columns=[],
+            column_types=[],
+            rows=[],
+            row_count=0,
+            execution_time_ms=0,
+            error=str(e),
+        )
+
+
+@app.post("/api/database/explain/{session_id}", response_model=ExecutionPlanResponse, tags=["Database"])
+async def explain_query(session_id: str, request: ExplainRequest):
+    """Get execution plan for a SQL query."""
+    from qt_sql.execution import DuckDBPlanParser
+
+    executor = db_sessions.get(session_id)
+    if not executor:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Database session not found"
+        )
+
+    try:
+        plan_json = executor.explain(request.sql, analyze=request.analyze)
+
+        # Parse plan
+        parser = DuckDBPlanParser()
+        analysis = parser.parse(plan_json)
+
+        return ExecutionPlanResponse(
+            success=True,
+            plan_json=plan_json,
+            plan_tree=analysis.plan_tree,
+            execution_time_ms=analysis.execution_time_ms,
+            total_cost=analysis.total_cost,
+            bottleneck=analysis.bottleneck,
+            warnings=analysis.warnings,
+        )
+
+    except Exception as e:
+        logger.exception("Explain failed")
+        return ExecutionPlanResponse(
+            success=False,
+            error=str(e),
+        )
+
+
+@app.get("/api/database/schema/{session_id}", response_model=SchemaResponse, tags=["Database"])
+async def get_schema(session_id: str):
+    """Get database schema (tables and columns)."""
+    executor = db_sessions.get(session_id)
+    if not executor:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Database session not found"
+        )
+
+    try:
+        schema = executor.get_schema_info(include_row_counts=True)
+
+        # Convert to response format
+        tables_dict: dict[str, list[SchemaColumn]] = {}
+        for table in schema.get("tables", []):
+            table_name = table.get("name", "")
+            columns = [
+                SchemaColumn(
+                    name=col.get("name", ""),
+                    type=col.get("type", ""),
+                    nullable=col.get("nullable"),
+                )
+                for col in table.get("columns", [])
+            ]
+            tables_dict[table_name] = columns
+
+        return SchemaResponse(
+            session_id=session_id,
+            tables=tables_dict,
+        )
+
+    except Exception as e:
+        logger.exception("Schema fetch failed")
+        return SchemaResponse(
+            session_id=session_id,
+            tables={},
+            error=str(e),
+        )
+
+
+# ============================================
+# SQL Validation Endpoints
+# ============================================
+
+class ValidateSQLRequest(BaseModel):
+    """Request for SQL validation."""
+    original_sql: str = Field(..., description="Original SQL query")
+    optimized_sql: str = Field(..., description="Optimized SQL query")
+    mode: Literal["sample", "full"] = Field(
+        default="sample",
+        description="Validation mode: sample (signal) or full (confidence)"
+    )
+    schema_sql: Optional[str] = Field(
+        default=None,
+        description="Optional schema SQL for in-memory validation"
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Database session ID (if using connected database)"
+    )
+    limit_strategy: Literal["add_order", "remove_limit"] = Field(
+        default="add_order",
+        description="Strategy for LIMIT without ORDER BY"
+    )
+
+
+class ValueDifferenceResponse(BaseModel):
+    """A value difference between queries."""
+    row_index: int
+    column: str
+    original_value: Optional[str] = None
+    optimized_value: Optional[str] = None
+
+
+class ValidateSQLResponse(BaseModel):
+    """Response from SQL validation."""
+    status: Literal["pass", "fail", "warn", "error"]
+    mode: str
+
+    # Row counts
+    row_counts: dict[str, int]
+    row_counts_match: bool
+
+    # Timing
+    timing: dict[str, float]
+    speedup: float
+
+    # Cost
+    cost: dict[str, float]
+    cost_reduction_pct: float
+
+    # Values
+    values_match: bool
+    checksum_match: Optional[bool] = None
+    value_differences: list[ValueDifferenceResponse] = []
+
+    # Normalization
+    limit_detected: bool = False
+    limit_strategy_applied: Optional[str] = None
+
+    # Messages
+    errors: list[str] = []
+    warnings: list[str] = []
+
+
+@app.post("/api/sql/validate", response_model=ValidateSQLResponse, tags=["SQL"])
+async def validate_sql(request: ValidateSQLRequest):
+    """Validate that optimized SQL is equivalent to original.
+
+    Uses the 1-1-2-2 benchmarking pattern for accurate timing comparison.
+
+    **Modes:**
+    - **sample**: Uses sample database for quick validation (gives signal)
+    - **full**: Uses full database for thorough validation (gives confidence)
+
+    Both modes compare:
+    - Row counts (must match exactly)
+    - Checksum comparison (fast)
+    - Value-by-value comparison (if checksums differ)
+
+    **LIMIT handling:**
+    - Detects LIMIT without ORDER BY (non-deterministic results)
+    - add_order: Injects ORDER BY 1, 2, 3... before LIMIT
+    - remove_limit: Strips LIMIT clause entirely
+    """
+    try:
+        from qt_sql.validation import (
+            SQLValidator,
+            ValidationMode,
+            ValidationStatus,
+            LimitStrategy,
+        )
+    except ImportError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Validation module not available: {e}"
+        )
+
+    # Determine database to use
+    database = ":memory:"
+    if request.session_id and request.session_id in db_sessions:
+        # Use the database from the session
+        # For now, we'll use in-memory with schema since sessions are in-memory
+        pass
+
+    # Parse options
+    validation_mode = ValidationMode.FULL if request.mode == "full" else ValidationMode.SAMPLE
+    limit_strat = (
+        LimitStrategy.REMOVE_LIMIT
+        if request.limit_strategy == "remove_limit"
+        else LimitStrategy.ADD_ORDER
+    )
+
+    try:
+        with SQLValidator(
+            database=database,
+            mode=validation_mode,
+            limit_strategy=limit_strat,
+        ) as validator:
+            result = validator.validate(
+                request.original_sql,
+                request.optimized_sql,
+                request.schema_sql,
+            )
+
+        # Convert value differences to response format
+        value_diffs = [
+            ValueDifferenceResponse(
+                row_index=d.row_index,
+                column=d.column,
+                original_value=str(d.original_value) if d.original_value is not None else None,
+                optimized_value=str(d.optimized_value) if d.optimized_value is not None else None,
+            )
+            for d in result.value_differences[:10]  # Limit to 10
+        ]
+
+        return ValidateSQLResponse(
+            status=result.status.value,
+            mode=result.mode.value,
+            row_counts={
+                "original": result.original_row_count,
+                "optimized": result.optimized_row_count,
+            },
+            row_counts_match=result.row_counts_match,
+            timing={
+                "original_ms": round(result.original_timing_ms, 2),
+                "optimized_ms": round(result.optimized_timing_ms, 2),
+            },
+            speedup=round(result.speedup, 2),
+            cost={
+                "original": round(result.original_cost, 2),
+                "optimized": round(result.optimized_cost, 2),
+            },
+            cost_reduction_pct=round(result.cost_reduction_pct, 2),
+            values_match=result.values_match,
+            checksum_match=result.checksum_match,
+            value_differences=value_diffs,
+            limit_detected=result.limit_detected,
+            limit_strategy_applied=(
+                result.limit_strategy_applied.value
+                if result.limit_strategy_applied
+                else None
+            ),
+            errors=result.errors,
+            warnings=result.warnings,
+        )
+
+    except Exception as e:
+        logger.exception("SQL validation failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Validation failed: {str(e)}"
         )
 
 

@@ -203,27 +203,32 @@ def audit(
 
 @cli.command()
 @click.argument("file", type=click.Path(exists=True))
-@click.option("--dialect", default="generic", help="SQL dialect")
+@click.option("--dialect", default="duckdb", help="SQL dialect (duckdb, postgres, snowflake, generic)")
+@click.option("--database", "-d", type=click.Path(), help="DuckDB database path for schema/execution plan context")
 @click.option("--provider", default=None, help="LLM provider (anthropic, deepseek, openai, groq, gemini)")
 @click.option("--model", default=None, help="LLM model name")
 @click.option("--output", "-o", type=click.Path(), help="Output file for optimized SQL")
-@click.option("--dry-run", is_flag=True, help="Show what would be optimized without calling LLM")
+@click.option("--dry-run", is_flag=True, help="Show prompt without calling LLM")
+@click.option("--show-prompt", is_flag=True, help="Display the full prompt sent to LLM")
 def optimize(
     file: str,
     dialect: str,
+    database: Optional[str],
     provider: Optional[str],
     model: Optional[str],
     output: Optional[str],
-    dry_run: bool
+    dry_run: bool,
+    show_prompt: bool,
 ):
     """Optimize SQL using LLM-powered analysis.
 
-    Analyzes the SQL file and uses an LLM to suggest optimizations
-    based on detected anti-patterns and best practices.
+    When a --database is provided, includes schema context and execution plan
+    in the prompt for better optimization recommendations.
 
     Examples:
         qt-sql optimize query.sql
-        qt-sql optimize query.sql --provider anthropic
+        qt-sql optimize query.sql --database /path/to/data.duckdb
+        qt-sql optimize query.sql -d mydata.duckdb --provider deepseek
         qt-sql optimize query.sql -o optimized.sql
     """
     try:
@@ -232,32 +237,117 @@ def optimize(
         console.print(f"[red]Error: {e.message}[/red]")
         sys.exit(1)
 
-    # First, run analysis
+    # Run static analysis
     detector = SQLAntiPatternDetector(dialect=dialect)
     result = detector.analyze(sql, include_structure=True)
 
     console.print(f"\n[bold]Analyzing:[/bold] {file}")
-    console.print(f"[dim]Dialect: {dialect}[/dim]\n")
+    console.print(f"[dim]Dialect: {dialect}[/dim]")
+    if database:
+        console.print(f"[dim]Database: {database}[/dim]")
+    console.print()
 
     display_analysis_result(result, verbose=False)
 
-    if not result.issues:
-        console.print("\n[green]No issues found - query already looks optimal.[/green]")
-        return
+    # Convert issues to dict format for payload builder
+    issues = [
+        {
+            "rule_id": issue.rule_id,
+            "severity": issue.severity,
+            "title": issue.name,
+            "description": issue.description,
+            "suggestion": issue.suggestion,
+            "location": issue.location,
+        }
+        for issue in result.issues
+    ]
+
+    # Fetch schema and execution plan if database provided
+    schema_context = None
+    execution_plan = None
+    engine_info = None
+
+    if database:
+        console.print("[dim]Fetching schema and execution plan...[/dim]")
+        try:
+            from qt_sql.execution.database_utils import (
+                fetch_schema_with_stats,
+                run_explain_text,
+                get_duckdb_engine_info,
+            )
+
+            schema_context = fetch_schema_with_stats(database, sql)
+            if schema_context:
+                table_count = len(schema_context.get("tables", []))
+                console.print(f"  [green]Schema loaded:[/green] {table_count} tables")
+
+            explain_text = run_explain_text(database, sql)
+            if explain_text:
+                execution_plan = {"explain_analyze_text": explain_text}
+                console.print(f"  [green]Execution plan captured[/green]")
+
+            engine_info = get_duckdb_engine_info(database)
+
+        except Exception as e:
+            console.print(f"  [yellow]Warning: Could not fetch context: {e}[/yellow]")
+
+    # Build optimization payload
+    try:
+        from qt_sql.optimization.payload_builder import build_optimization_payload_v2
+
+        payload_result = build_optimization_payload_v2(
+            code=sql,
+            query_type="sql",
+            file_name=Path(file).name,
+            issues=issues,
+            schema_context=schema_context,
+            explain_analyze_text=execution_plan.get("explain_analyze_text") if execution_plan else None,
+            engine_info=engine_info,
+        )
+        prompt = payload_result.payload_yaml
+        console.print(f"[dim]Prompt size: ~{payload_result.estimated_tokens} tokens[/dim]\n")
+
+    except ImportError:
+        # Fallback to simple prompt if payload builder not available
+        console.print("[yellow]Using simple prompt (payload builder not available)[/yellow]\n")
+        issues_text = "\n".join(
+            f"- {issue['title']} ({issue['severity']}): {issue['description']}"
+            for issue in issues
+        )
+        prompt = f"""You are a SQL optimization expert. Optimize the following query.
+
+## SQL
+```sql
+{sql}
+```
+
+## Detected Issues
+{issues_text}
+
+## Instructions
+Provide an optimized SQL query that fixes the issues while preserving semantics.
+Return your response as JSON:
+{{"optimized_sql": "<your optimized query>", "explanation": "<what you changed>"}}
+"""
+
+    if show_prompt:
+        console.print("[bold]Full Prompt:[/bold]")
+        console.print(Panel(prompt, title="LLM Prompt", border_style="dim"))
 
     if dry_run:
-        console.print("\n[yellow]Dry run mode - LLM optimization skipped.[/yellow]")
-        console.print("Issues that would be addressed:")
-        for issue in result.issues:
-            console.print(f"  - {issue.name}: {issue.suggestion or issue.description}")
+        console.print("\n[yellow]Dry run mode - LLM call skipped.[/yellow]")
+        if not show_prompt:
+            console.print("[dim]Use --show-prompt to see the full prompt.[/dim]")
+        return
+
+    if not issues and not database:
+        console.print("\n[green]No issues found - query already looks optimal.[/green]")
         return
 
     # Create LLM client
     try:
         from qt_shared.llm import create_llm_client
-        from qt_shared.config import get_settings
 
-        settings = get_settings()
         llm_client = create_llm_client(provider=provider, model=model)
 
         if llm_client is None:
@@ -271,41 +361,7 @@ def optimize(
         console.print("[red]qt_shared package not installed. Cannot use LLM optimization.[/red]")
         sys.exit(1)
 
-    # Build optimization prompt
-    issues_text = "\n".join(
-        f"- {issue.name} ({issue.severity}): {issue.description}"
-        for issue in result.issues
-    )
-
-    prompt = f"""You are a SQL optimization expert. Analyze the following SQL query and optimize it.
-
-Original SQL:
-```sql
-{sql}
-```
-
-Detected issues:
-{issues_text}
-
-Please provide:
-1. An optimized version of the SQL query
-2. Explanation of the changes made
-3. Expected performance improvements
-
-Format your response as:
-## Optimized SQL
-```sql
-<optimized query>
-```
-
-## Changes Made
-<bullet list of changes>
-
-## Expected Improvements
-<description of performance benefits>
-"""
-
-    console.print("\n[bold]Requesting LLM optimization...[/bold]")
+    console.print("[bold]Requesting LLM optimization...[/bold]")
 
     try:
         response = llm_client.analyze(prompt)
@@ -316,6 +372,22 @@ Format your response as:
         # Extract optimized SQL if output file requested
         if output:
             import re
+            # Try JSON format first
+            import json
+            try:
+                # Find JSON in response
+                json_match = re.search(r'\{[^{}]*"optimized_sql"[^{}]*\}', response, re.DOTALL)
+                if json_match:
+                    parsed = json.loads(json_match.group())
+                    optimized_sql = parsed.get("optimized_sql", "").strip()
+                    if optimized_sql:
+                        Path(output).write_text(optimized_sql, encoding="utf-8")
+                        console.print(f"\n[green]Optimized SQL saved to: {output}[/green]")
+                        return
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+            # Fallback to markdown code block
             sql_match = re.search(r"```sql\s*(.*?)\s*```", response, re.DOTALL)
             if sql_match:
                 optimized_sql = sql_match.group(1).strip()
@@ -332,145 +404,217 @@ Format your response as:
 @cli.command()
 @click.argument("original", type=click.Path(exists=True))
 @click.argument("optimized", type=click.Path(exists=True))
-@click.option("--dialect", default="generic", help="SQL dialect")
-@click.option("--database", default=":memory:", help="DuckDB database path for validation")
+@click.option("--database", "-d", default=":memory:", help="DuckDB database path for validation")
 @click.option("--schema", type=click.Path(exists=True), help="SQL file with schema creation statements")
+@click.option(
+    "--mode",
+    type=click.Choice(["sample", "full"]),
+    default="sample",
+    help="Validation mode: sample (1%% DB, signal) or full (full DB, confidence)"
+)
+@click.option("--sample-pct", type=float, default=1.0, help="Sample percentage for sample mode (default: 1.0)")
+@click.option(
+    "--limit-strategy",
+    type=click.Choice(["add_order", "remove_limit"]),
+    default="add_order",
+    help="Strategy for LIMIT without ORDER BY"
+)
+@click.option("--verbose", "-v", is_flag=True, help="Show detailed output")
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 def validate(
     original: str,
     optimized: str,
-    dialect: str,
     database: str,
-    schema: Optional[str]
+    schema: Optional[str],
+    mode: str,
+    sample_pct: float,
+    limit_strategy: str,
+    verbose: bool,
+    output_json: bool,
 ):
     """Validate that optimized SQL is equivalent to original.
 
-    Compares execution plans and optionally runs both queries
-    to verify result equivalence.
+    Uses the 1-1-2-2 benchmarking pattern:
+    - Run original (warmup), run original (measure)
+    - Run optimized (warmup), run optimized (measure)
+
+    Two modes:
+    - sample (default): Uses sample DB for signal (fast but approximate)
+    - full: Uses full DB for confidence (slower but accurate)
+
+    Both modes validate row counts AND values (checksum comparison).
 
     Examples:
-        qt-sql validate original.sql optimized.sql
+        qt-sql validate original.sql optimized.sql --database tpcds.duckdb
+        qt-sql validate original.sql optimized.sql -d data.duckdb --mode full
         qt-sql validate original.sql optimized.sql --schema schema.sql
+        qt-sql validate original.sql optimized.sql -d data.duckdb --verbose
     """
     try:
         original_sql = read_sql_file(original)
         optimized_sql = read_sql_file(optimized)
+        schema_sql = read_sql_file(schema) if schema else None
     except click.ClickException as e:
         console.print(f"[red]Error: {e.message}[/red]")
         sys.exit(1)
 
-    console.print(f"\n[bold]Validating optimization equivalence[/bold]")
-    console.print(f"Original: {original}")
-    console.print(f"Optimized: {optimized}")
-    console.print()
-
+    # Import validation module
     try:
-        from qt_sql.execution.duckdb_executor import DuckDBExecutor
-    except ImportError:
-        console.print("[red]DuckDB not installed. Install with: pip install duckdb[/red]")
+        from qt_sql.validation import (
+            SQLValidator,
+            ValidationMode,
+            ValidationStatus,
+            LimitStrategy,
+        )
+    except ImportError as e:
+        console.print(f"[red]Validation module not available: {e}[/red]")
         sys.exit(1)
 
-    validation_results = {
-        "syntax_valid": {"original": False, "optimized": False},
-        "plans_obtained": {"original": False, "optimized": False},
-        "cost_comparison": None,
-        "results_match": None,
-    }
+    # Parse options
+    validation_mode = ValidationMode.FULL if mode == "full" else ValidationMode.SAMPLE
+    limit_strat = LimitStrategy.REMOVE_LIMIT if limit_strategy == "remove_limit" else LimitStrategy.ADD_ORDER
 
+    if not output_json:
+        console.print(f"\n[bold]Validating optimization equivalence[/bold]")
+        console.print(f"Original: {original}")
+        console.print(f"Optimized: {optimized}")
+        console.print(f"Database: {database}")
+        console.print(f"Mode: {mode}")
+        console.print()
+
+    # Run validation
     try:
-        with DuckDBExecutor(database) as db:
-            # Load schema if provided
-            if schema:
-                schema_sql = read_sql_file(schema)
-                console.print("[dim]Loading schema...[/dim]")
-                db.execute_script(schema_sql)
-
-            # Validate syntax by getting execution plans
-            console.print("[bold]Checking syntax and execution plans...[/bold]")
-
-            try:
-                original_plan = db.explain(original_sql, analyze=False)
-                validation_results["syntax_valid"]["original"] = True
-                validation_results["plans_obtained"]["original"] = True
-                console.print("  Original: [green]Valid[/green]")
-            except Exception as e:
-                console.print(f"  Original: [red]Invalid - {e}[/red]")
-
-            try:
-                optimized_plan = db.explain(optimized_sql, analyze=False)
-                validation_results["syntax_valid"]["optimized"] = True
-                validation_results["plans_obtained"]["optimized"] = True
-                console.print("  Optimized: [green]Valid[/green]")
-            except Exception as e:
-                console.print(f"  Optimized: [red]Invalid - {e}[/red]")
-
-            # Compare costs if both plans obtained
-            if (
-                validation_results["plans_obtained"]["original"] and
-                validation_results["plans_obtained"]["optimized"]
-            ):
-                console.print("\n[bold]Comparing execution costs...[/bold]")
-                cost_comparison = db.compare_cost(original_sql, optimized_sql)
-                validation_results["cost_comparison"] = cost_comparison
-
-                original_cost = cost_comparison["original_cost"]
-                optimized_cost = cost_comparison["optimized_cost"]
-                reduction = cost_comparison["reduction_ratio"] * 100
-
-                if cost_comparison["improved"]:
-                    console.print(
-                        f"  [green]Cost reduced by {reduction:.1f}%[/green] "
-                        f"({original_cost:.0f} -> {optimized_cost:.0f})"
-                    )
-                elif reduction < 0:
-                    console.print(
-                        f"  [yellow]Cost increased by {abs(reduction):.1f}%[/yellow] "
-                        f"({original_cost:.0f} -> {optimized_cost:.0f})"
-                    )
-                else:
-                    console.print(f"  Cost unchanged ({original_cost:.0f})")
-
-            # Try to compare actual results if schema is provided
-            if schema:
-                console.print("\n[bold]Comparing query results...[/bold]")
-                try:
-                    original_results = db.execute(original_sql)
-                    optimized_results = db.execute(optimized_sql)
-
-                    if original_results == optimized_results:
-                        validation_results["results_match"] = True
-                        console.print("  [green]Results match exactly[/green]")
-                    else:
-                        validation_results["results_match"] = False
-                        console.print("  [red]Results differ[/red]")
-                        console.print(f"  Original rows: {len(original_results)}")
-                        console.print(f"  Optimized rows: {len(optimized_results)}")
-
-                except Exception as e:
-                    console.print(f"  [yellow]Could not compare results: {e}[/yellow]")
-
+        with SQLValidator(
+            database=database,
+            mode=validation_mode,
+            sample_pct=sample_pct,
+            limit_strategy=limit_strat,
+        ) as validator:
+            result = validator.validate(original_sql, optimized_sql, schema_sql)
     except Exception as e:
-        console.print(f"[red]Validation failed: {e}[/red]")
+        if output_json:
+            import json
+            console.print_json(json.dumps({"status": "error", "error": str(e)}))
+        else:
+            console.print(f"[red]Validation failed: {e}[/red]")
         sys.exit(1)
 
-    # Summary
-    console.print("\n[bold]Validation Summary:[/bold]")
+    # Output results
+    if output_json:
+        import json
+        console.print_json(json.dumps(result.to_dict()))
+        sys.exit(0 if result.status == ValidationStatus.PASS else 1)
 
-    all_valid = (
-        validation_results["syntax_valid"]["original"] and
-        validation_results["syntax_valid"]["optimized"]
+    # Rich console output
+    status_color = {
+        ValidationStatus.PASS: "green",
+        ValidationStatus.FAIL: "red",
+        ValidationStatus.WARN: "yellow",
+        ValidationStatus.ERROR: "red",
+    }.get(result.status, "white")
+
+    # Status panel
+    console.print(Panel(
+        f"[bold {status_color}]{result.status.value.upper()}[/bold {status_color}]",
+        title="Validation Result",
+        border_style=status_color,
+    ))
+
+    # Results table
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Metric", width=20)
+    table.add_column("Original", justify="right", width=15)
+    table.add_column("Optimized", justify="right", width=15)
+    table.add_column("Status", width=20)
+
+    # Row counts
+    row_status = "[green]match[/green]" if result.row_counts_match else "[red]MISMATCH[/red]"
+    table.add_row(
+        "Row Count",
+        str(result.original_row_count),
+        str(result.optimized_row_count),
+        row_status,
     )
 
-    if all_valid:
-        console.print("[green]Both queries are syntactically valid.[/green]")
-        if validation_results["cost_comparison"] and validation_results["cost_comparison"]["improved"]:
-            console.print("[green]Optimization shows cost improvement.[/green]")
-        if validation_results["results_match"]:
-            console.print("[green]Query results are equivalent.[/green]")
-        elif validation_results["results_match"] is False:
-            console.print("[red]WARNING: Query results differ![/red]")
-            sys.exit(1)
+    # Timing
+    speedup_str = f"{result.speedup:.2f}x"
+    if result.speedup > 1:
+        timing_status = f"[green]{speedup_str} faster[/green]"
+    elif result.speedup < 1:
+        timing_status = f"[yellow]{speedup_str} slower[/yellow]"
     else:
-        console.print("[red]Validation failed - one or both queries are invalid.[/red]")
+        timing_status = "unchanged"
+    table.add_row(
+        "Timing",
+        f"{result.original_timing_ms:.1f}ms",
+        f"{result.optimized_timing_ms:.1f}ms",
+        timing_status,
+    )
+
+    # Cost
+    if result.cost_reduction_pct > 0:
+        cost_status = f"[green]-{result.cost_reduction_pct:.1f}%[/green]"
+    elif result.cost_reduction_pct < 0:
+        cost_status = f"[yellow]+{abs(result.cost_reduction_pct):.1f}%[/yellow]"
+    else:
+        cost_status = "unchanged"
+    table.add_row(
+        "Cost",
+        f"{result.original_cost:.0f}",
+        f"{result.optimized_cost:.0f}",
+        cost_status,
+    )
+
+    # Values
+    if result.checksum_match:
+        values_status = "[green]checksum match[/green]"
+    elif result.values_match:
+        values_status = "[green]values match[/green]"
+    else:
+        values_status = f"[red]MISMATCH ({len(result.value_differences)} diffs)[/red]"
+    table.add_row("Values", "-", "-", values_status)
+
+    console.print(table)
+
+    # LIMIT normalization warning
+    if result.limit_detected:
+        console.print(
+            f"\n[yellow]Note: LIMIT without ORDER BY detected. "
+            f"Applied '{result.limit_strategy_applied.value if result.limit_strategy_applied else 'none'}' strategy.[/yellow]"
+        )
+
+    # Verbose output
+    if verbose:
+        if result.normalized_original_sql:
+            console.print("\n[bold]Normalized Original SQL:[/bold]")
+            console.print(Syntax(result.normalized_original_sql, "sql", theme="monokai"))
+
+        if result.normalized_optimized_sql:
+            console.print("\n[bold]Normalized Optimized SQL:[/bold]")
+            console.print(Syntax(result.normalized_optimized_sql, "sql", theme="monokai"))
+
+        if result.value_differences:
+            console.print(f"\n[bold]Value Differences (first {len(result.value_differences)}):[/bold]")
+            for diff in result.value_differences[:5]:
+                console.print(
+                    f"  Row {diff.row_index}, Column '{diff.column}': "
+                    f"{diff.original_value!r} vs {diff.optimized_value!r}"
+                )
+
+    # Warnings
+    for warning in result.warnings:
+        console.print(f"[yellow]Warning: {warning}[/yellow]")
+
+    # Errors
+    for error in result.errors:
+        console.print(f"[red]Error: {error}[/red]")
+
+    # Exit code
+    if result.status == ValidationStatus.PASS:
+        console.print("\n[green]Validation passed.[/green]")
+        sys.exit(0)
+    else:
+        console.print("\n[red]Validation failed.[/red]")
         sys.exit(1)
 
 
