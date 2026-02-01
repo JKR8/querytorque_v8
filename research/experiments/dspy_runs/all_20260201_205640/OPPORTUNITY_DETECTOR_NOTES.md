@@ -156,6 +156,56 @@ def get_optimization_guidance(sql: str) -> str:
 
 ---
 
+## DeepSeek Missed Opportunities Analysis
+
+Cases where we detected an opportunity but DeepSeek did something else:
+
+### Q28 (1.00x) - DeepSeek was RIGHT to skip
+- **Detected:** OR→UNION on `ss_list_price | ss_coupon_amt | ss_wholesale_cost` (6 times!)
+- **DeepSeek did:** Kept original
+- **Result:** Correct decision - OR on price columns doesn't benefit from UNION
+- **Learning:** Our detector has false positives, DeepSeek's judgment was better here
+
+### Q83 (0.77x) - DeepSeek chose WRONG pattern
+- **Detected:** Repeated subquery (date_dim), Date CTE
+- **DeepSeek did:** Date CTE only
+- **Result:** REGRESSED - should have used Materialized CTE for repeated date_dim subqueries
+- **Learning:** When multiple patterns detected, need to guide which to prioritize
+
+### Q57 (0.54x) - DeepSeek OVERCOMPLICATED
+- **Detected:** Date CTE
+- **DeepSeek did:** Date CTE + replaced self-joins with LAG/LEAD window functions
+- **Result:** HUGE regression (almost 2x slower)
+- **Learning:** Combining multiple transformations can backfire badly
+
+### Q54, Q60, Q5, Q80 (all regressed) - DeepSeek chose UNION when Date CTE was available
+- **Detected:** Date CTE opportunities
+- **DeepSeek did:** UNION decomposition
+- **Result:** All regressed (0.91x-0.97x)
+- **Learning:** UNION isn't always the answer even when OR is present
+
+### Q46, Q68 (0.71x-0.79x) - Detector warned correctly
+- **Detected:** OR→UNION on `hd_dep_count | hd_vehicle_count`
+- **DeepSeek did:** Predicate pushdown instead
+- **Result:** Still regressed with PRED
+- **Learning:** These household_demographics queries are hard to optimize
+
+### Key Insights
+
+1. **DeepSeek sometimes knows better than our rules** (Q28)
+2. **When multiple opportunities exist, priority matters** (Q83)
+3. **Combining transformations is risky** (Q57)
+4. **UNION is overused** - DeepSeek defaults to it but Date CTE often works better
+
+### Recommendation for Prompting
+
+Instead of telling DeepSeek about ALL detected patterns, we should:
+1. Rank patterns by confidence
+2. Tell it which patterns to AVOID for this specific query
+3. Include negative examples: "Don't use UNION on price columns like Q28"
+
+---
+
 ## Next Steps
 
 1. **Add missing patterns:**
