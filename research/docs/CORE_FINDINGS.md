@@ -285,7 +285,7 @@ Rules: search must match EXACTLY (including whitespace), patches apply in order,
 | Model | Speedup | Correct? | Approach |
 |-------|---------|----------|----------|
 | OSS | 3.48x | ❌ Wrong (52 vs 2513 rows) | Restructured query, broke semantics |
-| **Gemini** | **6.79x** | ✅ Exact match | Added filter, preserved structure |
+| **Gemini** | **2.09x** | ✅ Exact match | Added filter, preserved structure |
 
 **Key Lesson:** Conservative optimizations (add filter, don't restructure) are safer AND often faster.
 
@@ -466,7 +466,7 @@ with wscs as
 
 ---
 
-## Appendix: Q2 Optimized Query (6.79x - Gemini)
+## Appendix: Q2 Optimized Query (2.09x - Gemini)
 
 ```sql
 with wscs as

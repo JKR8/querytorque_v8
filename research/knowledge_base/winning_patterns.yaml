@@ -1,0 +1,200 @@
+# Winning SQL Optimization Patterns
+# Verified patterns that produce measurable speedups on TPC-DS SF100
+# Use this file as the single source of truth for agents/modules
+
+patterns:
+  - id: predicate_pushdown
+    name: Predicate Pushdown
+    speedup: "2.1x - 2.5x"
+    description: >
+      Move selective dimension filters INTO CTE before GROUP BY.
+      When a small dimension table with a highly selective filter is joined
+      AFTER a large fact table aggregation, push the filter inside the CTE.
+    detection:
+      - Filter applied after aggregation
+      - Highly selective filter on dimension table (e.g., state = 'SD' → 41 rows)
+      - Large fact table scan before filter is applied
+    fix: >
+      Join the dimension table INSIDE the CTE, before GROUP BY.
+      This filters the fact table rows before aggregation instead of after.
+    example_query: q1
+    example_before: |
+      WITH agg AS (
+        SELECT key, sum(value) FROM fact_table, date_dim
+        WHERE fact.date_sk = date_dim.date_sk AND year = 2000
+        GROUP BY key
+      )
+      SELECT * FROM agg, dimension
+      WHERE agg.key = dimension.key AND dimension.filter = 'X'
+    example_after: |
+      WITH agg AS (
+        SELECT key, sum(value) FROM fact_table, date_dim, dimension
+        WHERE fact.date_sk = date_dim.date_sk AND year = 2000
+          AND fact.key = dimension.key AND dimension.filter = 'X'
+        GROUP BY key
+      )
+      SELECT * FROM agg
+    verified_on: TPC-DS SF100
+    verified_queries: [Q1, Q2]
+
+  - id: filter_pushdown
+    name: Filter Pushdown
+    speedup: "2.09x"
+    description: >
+      Add highly selective filters early in pipeline before aggregation.
+      When a filter exists in the outer query but the CTE scans the full table,
+      push the filter into the CTE to reduce rows before GROUP BY.
+    detection:
+      - Aggregation over full table scan
+      - Filter applied to aggregated results
+      - Large row reduction possible (e.g., 2 years out of 20+ years of data)
+    fix: >
+      Add the filter condition inside the CTE's WHERE clause.
+      Use subquery if the filter requires a lookup (e.g., year → week_seq).
+    example_query: q2
+    example_before: |
+      WITH wswscs AS (
+        SELECT d_week_seq, sum(sales)
+        FROM sales, date_dim
+        WHERE d_date_sk = sold_date_sk
+        GROUP BY d_week_seq
+      )
+      SELECT * FROM wswscs, date_dim
+      WHERE date_dim.d_week_seq = wswscs.d_week_seq AND d_year = 1998
+    example_after: |
+      WITH wswscs AS (
+        SELECT d_week_seq, sum(sales)
+        FROM sales, date_dim
+        WHERE d_date_sk = sold_date_sk
+          AND d_week_seq IN (SELECT d_week_seq FROM date_dim WHERE d_year IN (1998, 1999))
+        GROUP BY d_week_seq
+      )
+      SELECT * FROM wswscs, date_dim
+      WHERE date_dim.d_week_seq = wswscs.d_week_seq AND d_year = 1998
+    verified_on: TPC-DS SF100
+    verified_queries: [Q2]
+
+  - id: join_elimination
+    name: Join Elimination
+    speedup: "2.18x"
+    description: >
+      Remove FK-only joins, replace with WHERE fk IS NOT NULL.
+      When a table is joined only to validate that a foreign key exists
+      (no columns from the dimension table are used), the join can be
+      replaced with IS NOT NULL.
+    detection:
+      - Join to dimension table
+      - Only FK column used (no other columns selected from dimension)
+      - FK column used in GROUP BY but dimension columns not needed
+    fix: >
+      Remove the join to the dimension table.
+      Add WHERE fk_column IS NOT NULL to preserve NULL filtering.
+      Update GROUP BY to use the FK column instead of the dimension PK.
+    example_query: q23
+    example_before: |
+      SELECT c_customer_sk, sum(ss_quantity * ss_sales_price)
+      FROM store_sales, customer
+      WHERE ss_customer_sk = c_customer_sk
+      GROUP BY c_customer_sk
+    example_after: |
+      SELECT ss_customer_sk, sum(ss_quantity * ss_sales_price)
+      FROM store_sales
+      WHERE ss_customer_sk IS NOT NULL
+      GROUP BY ss_customer_sk
+    critical_note: >
+      The join implicitly filters NULL foreign keys. You MUST add IS NOT NULL
+      to preserve identical semantics. Without it, NULLs will be included.
+    verified_on: TPC-DS SF100
+    verified_queries: [Q23]
+
+  - id: scan_consolidation
+    name: Scan Consolidation
+    speedup: "1.25x"
+    description: >
+      Combine multiple table scans with CASE WHEN expressions.
+      When the same table is scanned multiple times with different filter
+      conditions, consolidate into a single scan with conditional aggregates.
+    detection:
+      - Same table scanned multiple times
+      - Different filter conditions per scan
+      - Results combined later via join or union
+    fix: >
+      Single scan with CASE WHEN expressions to compute conditional aggregates.
+      Use COALESCE or ELSE 0 to handle NULL values correctly.
+    example_query: q23
+    example_before: |
+      cte_filtered AS (
+        SELECT key, sum(val) FROM t WHERE year = 2000 GROUP BY key
+      ),
+      cte_all AS (
+        SELECT key, sum(val) FROM t GROUP BY key
+      )
+    example_after: |
+      cte_combined AS (
+        SELECT key,
+               sum(CASE WHEN year = 2000 THEN val ELSE 0 END) AS filtered_sum,
+               sum(val) AS total_sum
+        FROM t
+        GROUP BY key
+      )
+    verified_on: TPC-DS SF100
+    verified_queries: [Q23]
+
+  - id: correlated_subquery_to_window
+    name: Correlated Subquery to Window Function
+    speedup: "2.5x"
+    description: >
+      Replace correlated subquery with window function.
+      When a correlated subquery computes an aggregate per group
+      (e.g., average per store), convert to a window function.
+    detection:
+      - Correlated subquery in WHERE or SELECT
+      - Subquery computes aggregate (avg, sum, max, min)
+      - Correlation is on a grouping column
+    fix: >
+      Add a window function in the CTE that computes the aggregate.
+      Reference the window function result in the outer query.
+    example_query: q1
+    example_before: |
+      SELECT * FROM t
+      WHERE t.value > (
+        SELECT avg(value) FROM t t2 WHERE t.group = t2.group
+      )
+    example_after: |
+      WITH t_with_avg AS (
+        SELECT *, avg(value) OVER (PARTITION BY group) AS group_avg
+        FROM t
+      )
+      SELECT * FROM t_with_avg WHERE value > group_avg
+    verified_on: TPC-DS SF100
+    verified_queries: [Q1]
+
+anti_patterns:
+  - id: add_filter_to_alltime
+    name: Add Filter to "All-Time" CTE
+    description: >
+      Don't add year filters to CTEs that intentionally aggregate all-time data.
+      Some queries compare filtered data to all-time totals; adding a filter
+      would change the semantics.
+    why_it_fails: May be intentional (comparing periods)
+
+  - id: remove_join_without_null_check
+    name: Remove Join Without IS NOT NULL
+    description: >
+      Don't remove a join without adding IS NOT NULL.
+      The join implicitly filters NULL foreign keys.
+    why_it_fails: Changes results (NULLs included)
+
+  - id: add_redundant_in_subquery
+    name: Add Redundant IN Subquery
+    description: >
+      Don't add an IN subquery filter if the filter already exists via join.
+      This adds overhead without benefit.
+    why_it_fails: Filter already exists via join
+
+metadata:
+  version: "1.0"
+  last_updated: "2025-02-01"
+  benchmark: TPC-DS SF100
+  benchmark_db: DuckDB
+  benchmark_size: "~28GB"
