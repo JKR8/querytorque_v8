@@ -478,6 +478,89 @@ def create_duckdb_validator(db_path: str):
     return validator
 
 
+def create_duckdb_validator_with_regression_guard(
+    db_path: str,
+    min_speedup: float = 1.0,
+    benchmark_runs: int = 3
+):
+    """Create a validator that checks semantic equivalence AND rejects regressions.
+
+    Args:
+        db_path: Path to DuckDB database
+        min_speedup: Minimum acceptable speedup (default 1.0 = no regression)
+        benchmark_runs: Number of benchmark runs (first discarded as warmup)
+
+    Returns:
+        Validator function: (original_sql, optimized_sql) -> (correct, error)
+    """
+    import duckdb
+    import time
+
+    def validator(original_sql: str, optimized_sql: str) -> Tuple[bool, Optional[str]]:
+        try:
+            conn = duckdb.connect(db_path, read_only=True)
+
+            # Run original (correctness check)
+            try:
+                orig_result = conn.execute(original_sql).fetchall()
+            except Exception as e:
+                conn.close()
+                return False, f"Original query error: {e}"
+
+            # Run optimized (correctness check)
+            try:
+                opt_result = conn.execute(optimized_sql).fetchall()
+            except Exception as e:
+                conn.close()
+                return False, f"SYNTAX ERROR in optimized query: {e}. Fix the SQL syntax."
+
+            # Check semantic equivalence
+            orig_set = set(tuple(r) for r in orig_result)
+            opt_set = set(tuple(r) for r in opt_result)
+
+            if orig_set != opt_set:
+                conn.close()
+                missing = orig_set - opt_set
+                extra = opt_set - orig_set
+                error_parts = [f"WRONG: {len(orig_result)} rows expected, got {len(opt_result)}."]
+                if missing:
+                    error_parts.append(f"Missing {len(missing)} rows.")
+                if extra:
+                    error_parts.append(f"Extra {len(extra)} rows.")
+                return False, " ".join(error_parts)
+
+            # Benchmark for regression check
+            orig_times = []
+            opt_times = []
+
+            for _ in range(benchmark_runs):
+                start = time.time()
+                conn.execute(original_sql).fetchall()
+                orig_times.append(time.time() - start)
+
+                start = time.time()
+                conn.execute(optimized_sql).fetchall()
+                opt_times.append(time.time() - start)
+
+            conn.close()
+
+            # Average excluding first run (warmup)
+            orig_avg = sum(orig_times[1:]) / (benchmark_runs - 1) if benchmark_runs > 1 else orig_times[0]
+            opt_avg = sum(opt_times[1:]) / (benchmark_runs - 1) if benchmark_runs > 1 else opt_times[0]
+
+            speedup = orig_avg / opt_avg if opt_avg > 0 else 1.0
+
+            if speedup < min_speedup:
+                return False, f"REGRESSION: {speedup:.2f}x speedup < {min_speedup}x minimum. Keep original query."
+
+            return True, None
+
+        except Exception as e:
+            return False, f"Validation error: {e}"
+
+    return validator
+
+
 def configure_lm(
     provider: str = "deepseek",
     model: Optional[str] = None,
