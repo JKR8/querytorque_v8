@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
-from query_torque.execution.base import ExecutionPlanAnalysis, PlanNode
+from .base import ExecutionPlanAnalysis, PlanNode
 
 
 @dataclass
@@ -940,17 +940,17 @@ def build_plan_summary(plan_json: dict[str, Any]) -> dict[str, Any]:
                 spill_type = "hash" if is_hash else "sort"
                 spills.append({"op": name, "type": spill_type, "rows": cardinality})
 
-            # Check for scans on large tables
-            is_scan = "SCAN" in name.upper()
+            # Check for table scans - include ALL scans (small filtered tables are important signals)
+            is_scan = "SCAN" in name.upper() and "CTE" not in name.upper() and "COLUMN_DATA" not in name.upper()
             scan_rows = rows_scanned if rows_scanned > 0 else cardinality
-            if is_scan and scan_rows >= 10_000:
-                has_filter = bool(
-                    isinstance(extra_info, dict) and extra_info.get("Filters")
-                )
+            if is_scan and table:
+                filters = extra_info.get("Filters", "") if isinstance(extra_info, dict) else ""
+                has_filter = bool(filters)
                 scans.append({
-                    "table": table or name,
+                    "table": table,
                     "rows": scan_rows,
                     "has_filter": has_filter,
+                    "filter_expr": filters if has_filter else None,
                 })
 
             # Check for cardinality misestimates
@@ -997,11 +997,79 @@ def build_plan_summary(plan_json: dict[str, Any]) -> dict[str, Any]:
             cost_pct = round(op["time_ms"] / total_time * 100, 0) if total_time > 0 else 0
             top_operators.append({**op, "cost_pct": cost_pct})
 
+    # Calculate total rows scanned and efficiency ratio
+    total_rows_scanned = sum(s["rows"] for s in scans)
+    rows_returned = plan_json.get("rows_returned", 0)
+
+    # Efficiency ratio: what fraction of scanned rows made it to results
+    # Lower is worse (scanning way more than returning)
+    efficiency_ratio = None
+    if total_rows_scanned > 0:
+        efficiency_ratio = rows_returned / total_rows_scanned
+
+    # Identify bottleneck (operator with highest cost %)
+    bottleneck = None
+    if top_operators:
+        top_op = top_operators[0]
+        if top_op.get("cost_pct", 0) >= 10:  # Only flag if >= 10% of cost
+            bottleneck = {
+                "op": top_op["op"],
+                "cost_pct": top_op["cost_pct"],
+                "rows": top_op.get("rows_out", 0),
+                "table": top_op.get("table"),
+                "details": f"{top_op['op']} processing {top_op.get('rows_out', 0):,} rows",
+            }
+
     return {
         "total_time_ms": round(total_time, 1),
+        "rows_returned": rows_returned,
+        "rows_scanned": total_rows_scanned,
+        "efficiency_ratio": efficiency_ratio,
         "top_operators": top_operators,
+        "bottleneck": bottleneck,
         "spills": spills,
         "scans": scans,
         "misestimates": misestimates,
         "plan_hash": plan_hash,
     }
+
+
+def get_execution_summary(plan_json: dict[str, Any]) -> dict[str, Any]:
+    """Get a compact execution summary for display.
+
+    This is a higher-level helper that combines plan parsing with
+    human-readable formatting for CLI output.
+
+    Args:
+        plan_json: DuckDB EXPLAIN (ANALYZE, FORMAT JSON) output
+
+    Returns:
+        Dict with execution_time_ms, rows_scanned, rows_returned,
+        efficiency_ratio, bottleneck, and efficiency_description
+    """
+    summary = build_plan_summary(plan_json)
+
+    result = {
+        "execution_time_ms": summary.get("total_time_ms", 0),
+        "rows_scanned": summary.get("rows_scanned", 0),
+        "rows_returned": summary.get("rows_returned", 0),
+        "efficiency_ratio": summary.get("efficiency_ratio"),
+        "bottleneck": summary.get("bottleneck"),
+        "top_operators": summary.get("top_operators", [])[:3],  # Top 3 for display
+    }
+
+    # Add human-readable efficiency description
+    efficiency = result.get("efficiency_ratio")
+    if efficiency is not None:
+        if efficiency >= 0.5:
+            result["efficiency_description"] = "Good (returning most scanned rows)"
+        elif efficiency >= 0.1:
+            result["efficiency_description"] = f"Moderate ({1/efficiency:.0f}x scan ratio)"
+        elif efficiency >= 0.01:
+            result["efficiency_description"] = f"Poor ({1/efficiency:.0f}x more rows scanned than needed)"
+        elif efficiency > 0:
+            result["efficiency_description"] = f"Very poor ({1/efficiency:,.0f}x scan-to-return ratio)"
+        else:
+            result["efficiency_description"] = "No rows returned"
+
+    return result

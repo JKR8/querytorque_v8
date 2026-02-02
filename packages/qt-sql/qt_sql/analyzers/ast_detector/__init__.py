@@ -10,6 +10,9 @@ from .registry import (
     get_rule_count,
     get_rules_by_category,
     get_opportunity_rules,
+    get_high_precision_rules,
+    get_style_rules,
+    get_rules_for_audit,
 )
 
 
@@ -64,4 +67,7 @@ __all__ = [
     "get_rule_count",
     "get_rules_by_category",
     "get_opportunity_rules",
+    "get_high_precision_rules",
+    "get_style_rules",
+    "get_rules_for_audit",
 ]

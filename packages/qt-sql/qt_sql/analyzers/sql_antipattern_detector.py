@@ -37,12 +37,43 @@ class SQLIssue:
 
 @dataclass
 class SQLAnalysisResult:
-    """Complete SQL anti-pattern analysis result."""
+    """Complete SQL analysis result with execution metrics.
+
+    This dataclass supports two modes:
+    1. Static analysis only: issues from AST detection
+    2. Plan-based analysis: execution metrics from EXPLAIN ANALYZE
+
+    The opportunity_score is the new primary metric, based on:
+    - Execution efficiency (rows_returned / rows_scanned)
+    - Detected optimization opportunities
+    - Bottleneck severity
+    """
     sql: str
+
+    # Static analysis issues (from AST detector)
     issues: list[SQLIssue] = field(default_factory=list)
     query_structure: Optional[dict] = None
 
-    # Scoring
+    # ============================================================
+    # NEW: Execution reality (from plan_parser)
+    # ============================================================
+    execution_time_ms: Optional[float] = None
+    rows_scanned: Optional[int] = None
+    rows_returned: Optional[int] = None
+    efficiency_ratio: Optional[float] = None  # rows_returned / rows_scanned
+
+    # Cost distribution
+    top_operators: list[dict] = field(default_factory=list)
+    bottleneck: Optional[dict] = None  # Operator with highest cost %
+
+    # ============================================================
+    # NEW: Opportunities (from opportunity_detector)
+    # ============================================================
+    opportunities: list = field(default_factory=list)  # List of OpportunityResult
+
+    # ============================================================
+    # DEPRECATED: Old penalty-based scoring (kept for backward compat)
+    # ============================================================
     base_score: int = 100
     total_penalty: int = 0
     final_score: int = 100
@@ -53,9 +84,41 @@ class SQLAnalysisResult:
     medium_count: int = 0
     low_count: int = 0
 
+    def calculate_opportunity_score(self) -> int:
+        """Calculate score based on what can be improved, not what's wrong.
+
+        This is the new primary scoring method when execution data is available.
+
+        Returns:
+            Score 0-100, where 100 means no obvious optimization opportunities
+        """
+        score = 100
+
+        # Deduct based on bottleneck severity
+        if self.bottleneck:
+            cost_pct = self.bottleneck.get("cost_pct", 0)
+            if cost_pct >= 80:
+                score -= 30  # Single operator is 80%+ of cost
+            elif cost_pct >= 50:
+                score -= 15  # Single operator is 50%+ of cost
+
+        # Deduct based on efficiency ratio
+        if self.efficiency_ratio is not None and self.efficiency_ratio < 0.01:
+            score -= 20  # Scanning 100x more rows than needed
+
+        # Deduct for each concrete opportunity
+        score -= len(self.opportunities) * 10
+
+        return max(0, score)
+
+    @property
+    def has_execution_data(self) -> bool:
+        """Check if execution plan data is available."""
+        return self.execution_time_ms is not None
+
     def to_dict(self) -> dict:
         """Export as JSON-serializable dict."""
-        return {
+        result = {
             "score": self.final_score,
             "total_penalty": self.total_penalty,
             "severity_counts": {
@@ -79,8 +142,31 @@ class SQLAnalysisResult:
                 }
                 for issue in self.issues
             ],
-            "query_structure": self.query_structure
+            "query_structure": self.query_structure,
         }
+
+        # Add execution metrics if available
+        if self.has_execution_data:
+            result["execution"] = {
+                "time_ms": self.execution_time_ms,
+                "rows_scanned": self.rows_scanned,
+                "rows_returned": self.rows_returned,
+                "efficiency_ratio": self.efficiency_ratio,
+            }
+            if self.bottleneck:
+                result["bottleneck"] = self.bottleneck
+            if self.top_operators:
+                result["top_operators"] = self.top_operators
+            result["opportunity_score"] = self.calculate_opportunity_score()
+
+        # Add opportunities if any
+        if self.opportunities:
+            result["opportunities"] = [
+                opp.to_dict() if hasattr(opp, 'to_dict') else opp
+                for opp in self.opportunities
+            ]
+
+        return result
 
 
 class SQLAntiPatternDetector:
@@ -90,14 +176,17 @@ class SQLAntiPatternDetector:
     All detection is performed by the AST detector - no regex patterns are used.
     """
 
-    def __init__(self, dialect: str = "generic"):
+    def __init__(self, dialect: str = "generic", include_style: bool = False):
         """Initialize detector.
 
         Args:
             dialect: SQL dialect (generic, snowflake, postgres, duckdb, tsql)
+            include_style: Include noisy style rules (SELECT *, implicit join, etc.)
+                           Default False for cleaner, more actionable output.
         """
         self.dialect = dialect
-        self._ast_detector = ASTDetector(dialect=dialect)
+        self.include_style = include_style
+        self._ast_detector = ASTDetector(dialect=dialect, include_style=include_style)
 
     def analyze(self, sql: str, include_structure: bool = True) -> SQLAnalysisResult:
         """Analyze SQL for anti-patterns using AST-based detection.

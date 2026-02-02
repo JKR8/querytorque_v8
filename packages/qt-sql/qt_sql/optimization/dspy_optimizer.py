@@ -147,6 +147,23 @@ def load_gold_examples(num_examples: int = 3) -> List[dspy.Example]:
         return []
 
 
+def detect_knowledge_patterns(sql: str) -> str:
+    """Detect KNOWLEDGE_BASE patterns relevant to this query.
+
+    This function is now a wrapper around the centralized opportunity_detector module.
+    It provides backward compatibility while delegating to the single source of truth.
+
+    Args:
+        sql: SQL query to analyze
+
+    Returns:
+        Formatted string with relevant patterns, or empty string if none
+    """
+    # Use the centralized opportunity detector
+    from qt_sql.analyzers.opportunity_detector import detect_knowledge_patterns as _detect
+    return _detect(sql)
+
+
 @dataclass
 class OptimizationResult:
     """Result of an optimization attempt."""
@@ -170,6 +187,10 @@ class SQLOptimizer(dspy.Signature):
     )
     row_estimates: str = dspy.InputField(
         desc="Table scan statistics: table name, rows scanned, filter status"
+    )
+    optimization_hints: str = dspy.InputField(
+        desc="Detected optimization opportunities with rewrite patterns",
+        default=""
     )
     constraints: str = dspy.InputField(
         desc="Model and DB-specific constraints to follow",
@@ -195,6 +216,10 @@ class SQLOptimizerWithFeedback(dspy.Signature):
     )
     row_estimates: str = dspy.InputField(
         desc="Table scan statistics: table name, rows scanned, filter status"
+    )
+    optimization_hints: str = dspy.InputField(
+        desc="Detected optimization opportunities with rewrite patterns",
+        default=""
     )
     constraints: str = dspy.InputField(
         desc="Model and DB-specific constraints to follow",
@@ -330,12 +355,16 @@ class ValidatedOptimizationPipeline(dspy.Module):
         last_attempt = None
         last_error = None
 
+        # Detect relevant optimization patterns
+        hints = detect_knowledge_patterns(query)
+
         # First attempt
         attempts += 1
         result = self.optimizer(
             original_query=query,
             execution_plan=plan,
             row_estimates=rows,
+            optimization_hints=hints,
             constraints=self.constraints
         )
         optimized_sql = result.optimized_query
@@ -369,6 +398,7 @@ class ValidatedOptimizationPipeline(dspy.Module):
                     original_query=query,
                     execution_plan=plan,
                     row_estimates=rows,
+                    optimization_hints=hints,
                     constraints=self.constraints,
                     previous_attempt=last_attempt,
                     failure_reason=last_error
@@ -828,3 +858,327 @@ def load_pipeline(
     )
     pipeline.load(path)
     return pipeline
+
+
+# ============================================================
+# DAG-Based Optimizer (Node-Level Rewrites)
+# ============================================================
+
+class SQLDagOptimizer(dspy.Signature):
+    """Optimize SQL by rewriting specific DAG nodes.
+
+    Instead of rewriting the entire SQL, output targeted rewrites
+    for specific nodes (CTEs, subqueries, main_query).
+    """
+
+    query_dag: str = dspy.InputField(
+        desc="DAG structure showing nodes (CTEs, subqueries, main_query) and their dependencies"
+    )
+    node_sql: str = dspy.InputField(
+        desc="SQL for each node in the DAG"
+    )
+    execution_plan: str = dspy.InputField(
+        desc="Execution plan showing operator costs and row counts"
+    )
+    optimization_hints: str = dspy.InputField(
+        desc="Detected optimization opportunities with rewrite patterns",
+        default=""
+    )
+    constraints: str = dspy.InputField(
+        desc="Model and DB-specific constraints",
+        default=""
+    )
+
+    rewrites: str = dspy.OutputField(
+        desc='JSON object: {"node_id": "new SELECT statement", ...} for nodes to rewrite. Only include nodes you are changing.'
+    )
+    explanation: str = dspy.OutputField(
+        desc="What was optimized and why"
+    )
+
+
+class SQLDagOptimizerWithFeedback(dspy.Signature):
+    """Retry DAG optimization with a DIFFERENT strategy after failure."""
+
+    query_dag: str = dspy.InputField(
+        desc="DAG structure showing nodes and dependencies"
+    )
+    node_sql: str = dspy.InputField(
+        desc="SQL for each node in the DAG"
+    )
+    execution_plan: str = dspy.InputField(
+        desc="Execution plan showing operator costs"
+    )
+    optimization_hints: str = dspy.InputField(
+        desc="Detected optimization opportunities with rewrite patterns",
+        default=""
+    )
+    constraints: str = dspy.InputField(
+        desc="Model and DB-specific constraints",
+        default=""
+    )
+    previous_rewrites: str = dspy.InputField(
+        desc="Previous rewrites that FAILED - try a different approach"
+    )
+    failure_reason: str = dspy.InputField(
+        desc="Why the previous attempt failed"
+    )
+
+    rewrites: str = dspy.OutputField(
+        desc='JSON object with DIFFERENT rewrites. Return {} to keep original.'
+    )
+    explanation: str = dspy.OutputField(
+        desc="What different approach you tried"
+    )
+
+
+@dataclass
+class DagOptimizationResult:
+    """Result of a DAG-based optimization attempt."""
+    original_sql: str
+    optimized_sql: str
+    rewrites: Dict[str, str]  # node_id -> new SQL
+    explanation: str
+    correct: Optional[bool] = None
+    attempts: int = 1
+    error: Optional[str] = None
+
+
+class DagOptimizationPipeline(dspy.Module):
+    """DAG-based optimization pipeline with validation and retries.
+
+    Key difference from ValidatedOptimizationPipeline:
+    - Uses DAG structure for targeted node rewrites
+    - Outputs node-level changes, not full SQL
+    - Better for large queries (less token usage)
+    - Preserves unchanged parts exactly
+    """
+
+    def __init__(
+        self,
+        validator_fn: Callable = None,
+        max_retries: int = 2,
+        model_name: str = None,
+        db_name: str = None,
+    ):
+        """
+        Args:
+            validator_fn: Function(original_sql, optimized_sql) -> (correct, error)
+            max_retries: Maximum retry attempts
+            model_name: Model name for constraints
+            db_name: Database name for hints
+        """
+        super().__init__()
+        self.optimizer = dspy.ChainOfThought(SQLDagOptimizer)
+        self.retry_optimizer = dspy.ChainOfThought(SQLDagOptimizerWithFeedback)
+        self.validator_fn = validator_fn
+        self.max_retries = max_retries
+        self.constraints = build_system_prompt(model_name, db_name)
+
+    def _parse_rewrites(self, rewrites_str: str) -> Dict[str, str]:
+        """Parse rewrites JSON from LLM output."""
+        text = rewrites_str.strip()
+
+        # Remove markdown code blocks
+        if text.startswith("```"):
+            lines = text.split("\n")
+            text = "\n".join(lines[1:])
+            if text.endswith("```"):
+                text = text[:-3].strip()
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Try to extract JSON object
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start != -1 and end > start:
+                try:
+                    return json.loads(text[start:end])
+                except json.JSONDecodeError:
+                    pass
+            return {}
+
+    def forward(
+        self,
+        sql: str,
+        plan: str = "",
+        dag: "SQLDag" = None,
+    ) -> DagOptimizationResult:
+        """Run DAG-based optimization with validation and retries.
+
+        Args:
+            sql: Original SQL query
+            plan: Execution plan summary
+            dag: Pre-built SQLDag (optional, will build if not provided)
+
+        Returns:
+            DagOptimizationResult with optimized SQL and rewrites
+        """
+        # Build DAG if not provided
+        if dag is None:
+            from .sql_dag import SQLDag
+            dag = SQLDag.from_sql(sql)
+
+        # Build DAG prompt components
+        dag_structure = []
+        dag_structure.append("Nodes:")
+        for node_id in dag.topological_order():
+            node = dag.nodes[node_id]
+            parts = [f"  [{node_id}]", f"type={node.node_type}"]
+            if node.tables:
+                parts.append(f"tables={node.tables}")
+            if node.cte_refs:
+                parts.append(f"refs={node.cte_refs}")
+            if node.is_correlated:
+                parts.append("CORRELATED")
+            dag_structure.append(" ".join(parts))
+
+        dag_structure.append("\nEdges:")
+        for edge in dag.edges:
+            dag_structure.append(f"  {edge.source} → {edge.target}")
+
+        query_dag = "\n".join(dag_structure)
+
+        # Build node SQL
+        node_sql_parts = []
+        for node_id in dag.topological_order():
+            node = dag.nodes[node_id]
+            if node.sql:
+                node_sql_parts.append(f"### {node_id}\n```sql\n{node.sql.strip()}\n```")
+
+        node_sql = "\n\n".join(node_sql_parts)
+
+        # Detect relevant optimization patterns
+        hints = detect_knowledge_patterns(sql)
+
+        attempts = 0
+        last_rewrites_str = ""
+        last_error = None
+
+        # First attempt
+        attempts += 1
+        result = self.optimizer(
+            query_dag=query_dag,
+            node_sql=node_sql,
+            execution_plan=plan,
+            optimization_hints=hints,
+            constraints=self.constraints
+        )
+
+        rewrites = self._parse_rewrites(result.rewrites)
+        explanation = result.explanation
+
+        # Apply rewrites
+        if rewrites:
+            optimized_sql = dag.apply_rewrites(rewrites)
+        else:
+            optimized_sql = sql
+
+        # Validate if validator provided
+        if self.validator_fn:
+            correct, error = self.validator_fn(sql, optimized_sql)
+
+            if correct:
+                return DagOptimizationResult(
+                    original_sql=sql,
+                    optimized_sql=optimized_sql,
+                    rewrites=rewrites,
+                    explanation=explanation,
+                    correct=True,
+                    attempts=attempts
+                )
+
+            # Validation failed - retry with feedback
+            last_rewrites_str = result.rewrites
+            last_error = error or "Results don't match original query"
+
+            while attempts < self.max_retries + 1:
+                attempts += 1
+
+                retry_result = self.retry_optimizer(
+                    query_dag=query_dag,
+                    node_sql=node_sql,
+                    execution_plan=plan,
+                    optimization_hints=hints,
+                    constraints=self.constraints,
+                    previous_rewrites=last_rewrites_str,
+                    failure_reason=last_error
+                )
+
+                rewrites = self._parse_rewrites(retry_result.rewrites)
+                explanation = retry_result.explanation
+
+                if rewrites:
+                    optimized_sql = dag.apply_rewrites(rewrites)
+                else:
+                    optimized_sql = sql
+
+                correct, error = self.validator_fn(sql, optimized_sql)
+
+                if correct:
+                    return DagOptimizationResult(
+                        original_sql=sql,
+                        optimized_sql=optimized_sql,
+                        rewrites=rewrites,
+                        explanation=f"[After {attempts} attempts] {explanation}",
+                        correct=True,
+                        attempts=attempts
+                    )
+
+                last_rewrites_str = retry_result.rewrites
+                last_error = error or "Results don't match"
+
+            # All retries exhausted
+            return DagOptimizationResult(
+                original_sql=sql,
+                optimized_sql=optimized_sql,
+                rewrites=rewrites,
+                explanation=explanation,
+                correct=False,
+                attempts=attempts,
+                error=f"Validation failed after {attempts} attempts: {last_error}"
+            )
+
+        # No validator - return unvalidated result
+        return DagOptimizationResult(
+            original_sql=sql,
+            optimized_sql=optimized_sql,
+            rewrites=rewrites,
+            explanation=explanation,
+            attempts=attempts
+        )
+
+
+def optimize_with_dag(
+    sql: str,
+    plan: str,
+    db_path: str,
+    provider: str = "deepseek",
+    db_name: str = "duckdb",
+    max_retries: int = 2
+) -> DagOptimizationResult:
+    """Convenience function for DAG-based optimization.
+
+    Args:
+        sql: SQL query to optimize
+        plan: Execution plan summary
+        db_path: Path to database for validation
+        provider: LLM provider name
+        db_name: Database type for hints
+        max_retries: Max retry attempts
+
+    Returns:
+        DagOptimizationResult
+    """
+    configure_lm(provider=provider)
+
+    validator = create_duckdb_validator(db_path)
+    pipeline = DagOptimizationPipeline(
+        validator_fn=validator,
+        max_retries=max_retries,
+        model_name=provider,
+        db_name=db_name
+    )
+
+    return pipeline(sql=sql, plan=plan)

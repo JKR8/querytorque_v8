@@ -1,6 +1,11 @@
 """Rule registry for AST-based detection.
 
 Collects all rules and provides lookup utilities.
+
+Rule Classification:
+- STYLE rules: Low signal, high noise. Fire too often (SELECT *, implicit join, etc.)
+- HIGH-PRECISION rules: DuckDB optimizer exploits, opportunity rules, optimization rules
+- By default, only HIGH-PRECISION rules are used for audit. Use include_style=True for all.
 """
 
 from typing import Optional
@@ -396,3 +401,96 @@ def get_opportunity_rules() -> list[ASTRule]:
     based on measured speedups from TPC-DS SF100 benchmarks.
     """
     return get_rules_by_category("optimization_opportunity")
+
+
+# ============================================================
+# Style Rule Classification
+# ============================================================
+
+# Rule IDs that are considered "style" rules - low signal, high noise.
+# These fire too often on TPC-DS queries (119 rules fire 841 times on 99 queries).
+# They are useful for code review but not for optimization assessment.
+STYLE_RULE_IDS = {
+    # SELECT rules - subjective style preferences
+    "SQL-SEL-001",  # SELECT * - too common, not always bad
+    "SQL-SEL-005",  # DISTINCT crutch - often intentional
+    "SQL-SEL-006",  # Scalar UDF in SELECT - may be necessary
+
+    # JOIN rules - style preferences, not performance issues
+    "SQL-JOIN-001",  # Cartesian join - often detected incorrectly
+    "SQL-JOIN-002",  # Implicit join - style preference, not bug
+    "SQL-JOIN-005",  # Expression in join - sometimes necessary
+    "SQL-JOIN-006",  # Inequality join - sometimes necessary
+
+    # Aggregation rules - style preferences
+    "SQL-AGG-001",  # GROUP BY ordinal - sometimes cleaner
+    "SQL-AGG-003",  # GROUP BY expression - sometimes necessary
+    "SQL-AGG-005",  # Missing GROUP BY column - often false positive
+
+    # ORDER BY rules - style preferences
+    "SQL-ORD-002",  # ORDER BY without LIMIT - often intentional
+    "SQL-ORD-003",  # ORDER BY expression - sometimes necessary
+    "SQL-ORD-004",  # ORDER BY ordinal - sometimes cleaner
+
+    # CTE rules - style preferences
+    "SQL-CTE-001",  # SELECT * in CTE - sometimes intentional
+    "SQL-CTE-004",  # Deeply nested CTE - complexity metric
+    "SQL-CTE-006",  # CTE should be subquery - subjective
+
+    # Window rules - style preferences
+    "SQL-WIN-003",  # Window without partition - often intentional
+
+    # Type rules - database-specific
+    "SQL-TYPE-001",  # String/numeric comparison
+    "SQL-TYPE-002",  # Date as string
+    "SQL-TYPE-003",  # Unicode mismatch
+
+    # Cursor rules - T-SQL specific
+    "SQL-CURSOR-001",  # Cursor usage
+    "SQL-CURSOR-002",  # While loop
+    "SQL-CURSOR-003",  # Dynamic SQL
+
+    # Fabric rules - SQL Server specific
+    "SQL-FAB-001",  # Table variable
+    "SQL-FAB-002",  # Temp table without index
+    "SQL-FAB-003",  # Missing OPTION RECOMPILE
+}
+
+
+def get_high_precision_rules() -> list[ASTRule]:
+    """Get only high-precision rules (excludes noisy style rules).
+
+    Returns rules that:
+    - Are DuckDB optimizer exploits (SQL-DUCK-011 to 018)
+    - Are optimization opportunity rules (QT-OPT-*)
+    - Are structural optimization rules (from POC rulebook)
+    - Have proven value from TPC-DS benchmarks
+
+    This is the default set for 'qt-sql audit' to reduce noise.
+    """
+    return [r for r in _ALL_RULES if r.rule_id not in STYLE_RULE_IDS]
+
+
+def get_style_rules() -> list[ASTRule]:
+    """Get only style rules (the noisy ones).
+
+    These rules are useful for code review but fire too often
+    to be useful for optimization assessment.
+    """
+    return [r for r in _ALL_RULES if r.rule_id in STYLE_RULE_IDS]
+
+
+def get_rules_for_audit(include_style: bool = False) -> list[ASTRule]:
+    """Get rules appropriate for audit command.
+
+    Args:
+        include_style: If True, include all rules including noisy style rules.
+                       If False (default), only high-precision rules are returned.
+
+    Returns:
+        List of ASTRule objects for the audit.
+    """
+    if include_style:
+        return get_all_rules()
+    else:
+        return get_high_precision_rules()

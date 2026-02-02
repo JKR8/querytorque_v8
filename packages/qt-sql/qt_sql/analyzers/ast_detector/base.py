@@ -207,19 +207,31 @@ class ASTDetector:
     Example:
         detector = ASTDetector(dialect="snowflake")
         issues = detector.detect("SELECT * FROM users")
+
+        # Include noisy style rules (for code review):
+        detector = ASTDetector(dialect="duckdb", include_style=True)
     """
 
     def __init__(
         self,
         dialect: str = "snowflake",
-        rules: Optional[list[ASTRule]] = None
+        rules: Optional[list[ASTRule]] = None,
+        include_style: bool = False,
     ):
+        """Initialize the AST detector.
+
+        Args:
+            dialect: SQL dialect (snowflake, postgres, duckdb, etc.)
+            rules: Optional list of rules to use (bypasses registry)
+            include_style: Include noisy style rules. Default False for cleaner output.
+        """
         self.dialect = dialect
+        self.include_style = include_style
 
         # Load rules from registry if not provided
         if rules is None:
-            from .registry import get_all_rules
-            all_rules = get_all_rules()
+            from .registry import get_rules_for_audit
+            all_rules = get_rules_for_audit(include_style=include_style)
         else:
             all_rules = rules
 
