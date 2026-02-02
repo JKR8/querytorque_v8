@@ -449,6 +449,20 @@ def escalate_to_mcts(sql: str, db_path: str, iterations: int, parallel: int):
             nodes_expanded=result.tree_stats.get("total_nodes", 0)
         )
 
+        # Add detailed log and summary to mcts_log
+        if result.detailed_log:
+            mcts_log["detailed_log"] = result.detailed_log
+        if result.attempt_summary:
+            mcts_log["attempt_summary"] = result.attempt_summary
+            # Log summary to console
+            tracker.logger.info("    MCTS Attempt Summary:")
+            for tid, stats in result.attempt_summary.items():
+                tracker.logger.info(
+                    f"      {tid}: {stats['total']} attempts, "
+                    f"{stats['validation_pass']} passed, "
+                    f"max speedup={stats['max_speedup']:.2f}x"
+                )
+
         if result.valid and result.speedup > 1.0:
             return result.optimized_sql, result.method, result.speedup, True, mcts_log
         return None, None, None, False, mcts_log

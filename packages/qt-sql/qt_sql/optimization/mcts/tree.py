@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from typing import Optional, Callable, Any
 
 from .node import MCTSNode
@@ -12,6 +14,78 @@ from .transforms import get_all_transform_ids, apply_transformation
 from .reward import compute_reward, RewardConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TransformAttempt:
+    """Record of a single transformation attempt for detailed logging."""
+
+    iteration: int
+    parent_path: list[str]  # Transforms applied to reach parent
+    transform_id: str
+    timestamp: float
+    duration_ms: int = 0
+
+    # LLM results
+    llm_success: bool = False
+    llm_error: Optional[str] = None
+    output_sql: Optional[str] = None
+    sql_changed: bool = False
+
+    # Validation results
+    validated: bool = False
+    validation_status: Optional[str] = None
+    validation_error: Optional[str] = None
+    speedup: float = 1.0
+    original_rows: int = 0
+    optimized_rows: int = 0
+
+    # UCT context
+    uct_score: float = 0.0
+    parent_visits: int = 0
+
+    # Reward
+    reward: float = 0.0
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "iteration": self.iteration,
+            "parent_path": self.parent_path,
+            "transform_id": self.transform_id,
+            "duration_ms": self.duration_ms,
+            "llm_success": self.llm_success,
+            "llm_error": self.llm_error,
+            "sql_changed": self.sql_changed,
+            "output_sql_preview": (self.output_sql[:200] + "...") if self.output_sql and len(self.output_sql) > 200 else self.output_sql,
+            "validated": self.validated,
+            "validation_status": self.validation_status,
+            "validation_error": self.validation_error,
+            "speedup": round(self.speedup, 4),
+            "original_rows": self.original_rows,
+            "optimized_rows": self.optimized_rows,
+            "uct_score": round(self.uct_score, 4),
+            "parent_visits": self.parent_visits,
+            "reward": round(self.reward, 4),
+        }
+
+
+@dataclass
+class SelectionStep:
+    """Record of a UCT selection decision."""
+
+    node_path: list[str]
+    candidates: list[dict]  # [{transform_id, uct_score, visits, avg_reward}]
+    selected: str
+    reason: str  # "uct_best", "untried", "terminal"
+
+    def to_dict(self) -> dict:
+        return {
+            "node_path": self.node_path,
+            "candidates": self.candidates,
+            "selected": self.selected,
+            "reason": self.reason,
+        }
 
 
 class MCTSTree:
@@ -81,7 +155,11 @@ class MCTSTree:
         self.failed_expansions = 0
         self.validation_calls = 0
 
-    def select(self, node: Optional[MCTSNode] = None) -> MCTSNode:
+        # Detailed logging
+        self.transform_attempts: list[TransformAttempt] = []
+        self.selection_steps: list[SelectionStep] = []
+
+    def select(self, node: Optional[MCTSNode] = None, log_selection: bool = True) -> MCTSNode:
         """Select a node for expansion using UCT.
 
         Walk tree from root picking best UCT child at each step
@@ -91,6 +169,7 @@ class MCTSTree:
 
         Args:
             node: Starting node. If None, starts from root.
+            log_selection: Whether to log selection decisions.
 
         Returns:
             The selected node for expansion.
@@ -102,28 +181,75 @@ class MCTSTree:
             # If node has untried transforms, select it for expansion
             untried = node.get_untried_transforms()
             if untried:
+                if log_selection:
+                    self.selection_steps.append(SelectionStep(
+                        node_path=node.applied_transforms,
+                        candidates=[{"transform_id": t, "status": "untried"} for t in untried],
+                        selected=untried[0] if untried else "",
+                        reason="untried_available",
+                    ))
                 return node
 
             # If no children (terminal or all failed), return this node
             if not node.children:
+                if log_selection:
+                    self.selection_steps.append(SelectionStep(
+                        node_path=node.applied_transforms,
+                        candidates=[],
+                        selected="",
+                        reason="terminal_no_children",
+                    ))
                 return node
 
             # If at max depth, return this node
             if node.depth >= self.max_depth:
+                if log_selection:
+                    self.selection_steps.append(SelectionStep(
+                        node_path=node.applied_transforms,
+                        candidates=[],
+                        selected="",
+                        reason="max_depth_reached",
+                    ))
                 return node
 
             # Select best child by UCT score
             best_child = None
             best_score = float("-inf")
+            candidates = []
 
             for child in node.children.values():
                 score = child.uct_score(node.visit_count, self.c)
+                transform_id = child.applied_transforms[-1] if child.applied_transforms else "?"
+                candidates.append({
+                    "transform_id": transform_id,
+                    "uct_score": round(score, 4) if score != float("inf") else "inf",
+                    "visits": child.visit_count,
+                    "avg_reward": round(child.avg_reward, 4),
+                    "is_valid": child.is_valid,
+                    "speedup": round(child.speedup, 4),
+                })
                 if score > best_score:
                     best_score = score
                     best_child = child
 
             if best_child is None:
+                if log_selection:
+                    self.selection_steps.append(SelectionStep(
+                        node_path=node.applied_transforms,
+                        candidates=candidates,
+                        selected="",
+                        reason="no_viable_children",
+                    ))
                 return node
+
+            if log_selection:
+                selected_transform = best_child.applied_transforms[-1] if best_child.applied_transforms else "?"
+                self.selection_steps.append(SelectionStep(
+                    node_path=node.applied_transforms,
+                    candidates=candidates,
+                    selected=selected_transform,
+                    reason="uct_best",
+                ))
 
             node = best_child
 
@@ -147,16 +273,30 @@ class MCTSTree:
         # Pick transform to try (could use heuristics here)
         transform_id = self._select_transform(untried, node)
 
+        # Create attempt record
+        attempt = TransformAttempt(
+            iteration=self.total_iterations,
+            parent_path=node.applied_transforms.copy(),
+            transform_id=transform_id,
+            timestamp=time.time(),
+            parent_visits=node.visit_count,
+        )
+
         # Apply transformation via LLM
+        start_time = time.perf_counter()
         new_sql, error = apply_transformation(
             query=node.query_sql,
             transform_id=transform_id,
             llm_client=self.llm_client,
         )
+        attempt.duration_ms = int((time.perf_counter() - start_time) * 1000)
 
         if error or new_sql is None:
             # Mark this transform as tried but failed
-            # Create a placeholder child to remember we tried this
+            attempt.llm_success = False
+            attempt.llm_error = error
+            self.transform_attempts.append(attempt)
+
             child = node.add_child(
                 transform_id=transform_id,
                 new_sql=node.query_sql,  # Keep original SQL
@@ -167,11 +307,17 @@ class MCTSTree:
             logger.debug(f"Transform {transform_id} failed: {error}")
             return None
 
+        # Record successful LLM call
+        attempt.llm_success = True
+        attempt.output_sql = new_sql
+        attempt.sql_changed = new_sql.strip() != node.query_sql.strip()
+
         # Create child node with transformed SQL
         child = node.add_child(
             transform_id=transform_id,
             new_sql=new_sql,
         )
+        child._attempt = attempt  # Link attempt for later update
         self.successful_expansions += 1
         logger.debug(f"Transform {transform_id} applied successfully")
 
@@ -205,16 +351,18 @@ class MCTSTree:
         transforms_to_try = untried[:num_transforms]
 
         # Apply transformations in parallel
-        results: list[tuple[str, Optional[str], Optional[str]]] = []
+        results: list[tuple[str, Optional[str], Optional[str], int]] = []
 
-        def apply_single(transform_id: str) -> tuple[str, Optional[str], Optional[str]]:
-            """Apply a single transformation, return (id, sql, error)."""
+        def apply_single(transform_id: str) -> tuple[str, Optional[str], Optional[str], int]:
+            """Apply a single transformation, return (id, sql, error, duration_ms)."""
+            start_time = time.perf_counter()
             new_sql, error = apply_transformation(
                 query=node.query_sql,
                 transform_id=transform_id,
                 llm_client=self.llm_client,
             )
-            return (transform_id, new_sql, error)
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            return (transform_id, new_sql, error, duration_ms)
 
         with ThreadPoolExecutor(max_workers=num_transforms) as executor:
             futures = {
@@ -228,13 +376,27 @@ class MCTSTree:
                     results.append(result)
                 except Exception as e:
                     tid = futures[future]
-                    results.append((tid, None, str(e)))
+                    results.append((tid, None, str(e), 0))
 
         # Create child nodes from results
         children = []
-        for transform_id, new_sql, error in results:
+        for transform_id, new_sql, error, duration_ms in results:
+            # Create attempt record
+            attempt = TransformAttempt(
+                iteration=self.total_iterations,
+                parent_path=node.applied_transforms.copy(),
+                transform_id=transform_id,
+                timestamp=time.time(),
+                duration_ms=duration_ms,
+                parent_visits=node.visit_count,
+            )
+
             if error or new_sql is None:
                 # Mark as tried but failed
+                attempt.llm_success = False
+                attempt.llm_error = error
+                self.transform_attempts.append(attempt)
+
                 child = node.add_child(
                     transform_id=transform_id,
                     new_sql=node.query_sql,
@@ -245,10 +407,15 @@ class MCTSTree:
                 logger.debug(f"Transform {transform_id} failed: {error}")
             else:
                 # Success - create child for validation
+                attempt.llm_success = True
+                attempt.output_sql = new_sql
+                attempt.sql_changed = new_sql.strip() != node.query_sql.strip()
+
                 child = node.add_child(
                     transform_id=transform_id,
                     new_sql=new_sql,
                 )
+                child._attempt = attempt  # Link for later update
                 self.successful_expansions += 1
                 logger.debug(f"Transform {transform_id} applied successfully")
                 children.append(child)
@@ -313,6 +480,9 @@ class MCTSTree:
             # Already validated, compute reward from cached result
             return compute_reward(node.validation_result, self.reward_config)
 
+        # Get linked attempt if available
+        attempt = getattr(node, '_attempt', None)
+
         try:
             # Run validation
             result = self.validator.validate(
@@ -325,6 +495,19 @@ class MCTSTree:
             # Compute reward
             reward = compute_reward(result, self.reward_config)
 
+            # Update attempt with validation results
+            if attempt:
+                attempt.validated = True
+                attempt.validation_status = str(getattr(result, 'status', 'unknown'))
+                attempt.speedup = getattr(result, 'speedup', 1.0)
+                attempt.reward = reward
+                # Try to get row counts if available
+                if hasattr(result, 'original_rows'):
+                    attempt.original_rows = result.original_rows
+                if hasattr(result, 'optimized_rows'):
+                    attempt.optimized_rows = result.optimized_rows
+                self.transform_attempts.append(attempt)
+
             logger.debug(
                 f"Validation: status={getattr(result, 'status', 'unknown')}, "
                 f"speedup={getattr(result, 'speedup', 1.0):.2f}x, "
@@ -334,6 +517,14 @@ class MCTSTree:
             return reward
 
         except Exception as e:
+            # Update attempt with error
+            if attempt:
+                attempt.validated = True
+                attempt.validation_status = "error"
+                attempt.validation_error = str(e)
+                attempt.reward = 0.0
+                self.transform_attempts.append(attempt)
+
             logger.warning(f"Validation failed: {e}")
             return 0.0
 
@@ -493,7 +684,97 @@ class MCTSTree:
             "failed_expansions": self.failed_expansions,
             "validation_calls": self.validation_calls,
             "root_visits": self.root.visit_count,
+            "total_attempts": len(self.transform_attempts),
         }
+
+    def get_all_attempts(self) -> list[dict]:
+        """Get all transformation attempts as dicts for JSON export."""
+        return [a.to_dict() for a in self.transform_attempts]
+
+    def get_selection_log(self) -> list[dict]:
+        """Get all selection decisions as dicts for JSON export."""
+        return [s.to_dict() for s in self.selection_steps]
+
+    def get_detailed_log(self) -> dict:
+        """Get comprehensive log of all MCTS activity.
+
+        Returns dict with:
+        - stats: Summary statistics
+        - attempts: All transform attempts with LLM/validation results
+        - selections: All UCT selection decisions
+        - tree: Serialized tree structure
+        """
+        return {
+            "stats": self.get_stats(),
+            "attempts": self.get_all_attempts(),
+            "selections": self.get_selection_log(),
+            "tree": self._serialize_tree(),
+        }
+
+    def _serialize_tree(self, node: Optional[MCTSNode] = None, max_depth: int = 10) -> dict:
+        """Serialize tree to nested dict for JSON export."""
+        if node is None:
+            node = self.root
+
+        result = {
+            "transforms": node.applied_transforms,
+            "depth": node.depth,
+            "visits": node.visit_count,
+            "avg_reward": round(node.avg_reward, 4),
+            "is_valid": node.is_valid,
+            "speedup": round(node.speedup, 4),
+            "error": node.transform_error,
+        }
+
+        if node.depth < max_depth and node.children:
+            result["children"] = {
+                tid: self._serialize_tree(child, max_depth)
+                for tid, child in node.children.items()
+            }
+
+        return result
+
+    def get_attempt_summary(self) -> dict:
+        """Get summary of attempts by transform type and outcome."""
+        summary = {}
+        for attempt in self.transform_attempts:
+            tid = attempt.transform_id
+            if tid not in summary:
+                summary[tid] = {
+                    "total": 0,
+                    "llm_success": 0,
+                    "llm_failed": 0,
+                    "validation_pass": 0,
+                    "validation_fail": 0,
+                    "validation_error": 0,
+                    "avg_speedup": 0.0,
+                    "max_speedup": 0.0,
+                    "speedups": [],
+                }
+            s = summary[tid]
+            s["total"] += 1
+
+            if attempt.llm_success:
+                s["llm_success"] += 1
+                if attempt.validated:
+                    if "pass" in str(attempt.validation_status).lower():
+                        s["validation_pass"] += 1
+                        s["speedups"].append(attempt.speedup)
+                        s["max_speedup"] = max(s["max_speedup"], attempt.speedup)
+                    elif attempt.validation_error:
+                        s["validation_error"] += 1
+                    else:
+                        s["validation_fail"] += 1
+            else:
+                s["llm_failed"] += 1
+
+        # Compute averages
+        for tid, s in summary.items():
+            if s["speedups"]:
+                s["avg_speedup"] = round(sum(s["speedups"]) / len(s["speedups"]), 4)
+            del s["speedups"]  # Don't include raw list
+
+        return summary
 
     def print_tree(self, max_depth: int = 3) -> str:
         """Generate ASCII representation of tree for debugging."""

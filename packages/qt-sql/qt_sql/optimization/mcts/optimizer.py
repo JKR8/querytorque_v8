@@ -48,6 +48,8 @@ class MCTSOptimizationResult:
         tree_stats: Statistics about the MCTS tree.
         validation_result: Raw validation result for best node.
         elapsed_time: Total optimization time in seconds.
+        detailed_log: Full log of all attempts and selections (optional).
+        attempt_summary: Summary by transform type (optional).
     """
 
     original_sql: str
@@ -60,10 +62,12 @@ class MCTSOptimizationResult:
     tree_stats: dict = field(default_factory=dict)
     validation_result: Optional[Any] = None
     elapsed_time: float = 0.0
+    detailed_log: Optional[dict] = None
+    attempt_summary: Optional[dict] = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
-        return {
+        result = {
             "valid": self.valid,
             "speedup": round(self.speedup, 2),
             "method": self.method,
@@ -72,6 +76,9 @@ class MCTSOptimizationResult:
             "tree_stats": self.tree_stats,
             "elapsed_time": round(self.elapsed_time, 2),
         }
+        if self.attempt_summary:
+            result["attempt_summary"] = self.attempt_summary
+        return result
 
 
 class MCTSSQLOptimizer:
@@ -270,6 +277,8 @@ class MCTSSQLOptimizer:
             tree_stats=tree.get_stats(),
             validation_result=best_node.validation_result,
             elapsed_time=elapsed_time,
+            detailed_log=tree.get_detailed_log(),
+            attempt_summary=tree.get_attempt_summary(),
         )
 
         logger.info(
@@ -416,6 +425,8 @@ class MCTSSQLOptimizer:
             tree_stats=tree.get_stats(),
             validation_result=best_node.validation_result,
             elapsed_time=elapsed_time,
+            detailed_log=tree.get_detailed_log(),
+            attempt_summary=tree.get_attempt_summary(),
         )
 
         logger.info(
