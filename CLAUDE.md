@@ -8,11 +8,13 @@
 
 | What | Where |
 |------|-------|
+| **Benchmark Results** | `BENCHMARKS.md` |
 | **Shared Infrastructure** | `packages/qt-shared/` |
 | **Calcite Optimizer** | `packages/qt-calcite/` |
 | **SQL Product** | `packages/qt-sql/` |
 | **DAX Product** | `packages/qt-dax/` |
 | **Shared UI Components** | `packages/qt-ui-shared/` |
+| **Research/Experiments** | `research/` |
 
 ---
 
@@ -61,8 +63,15 @@ QueryTorque_V8/
 │       │   └── theme/          # Design tokens
 │       └── package.json
 │
+├── research/
+│   └── benchmarks/             # TPC-DS benchmark results by provider
+│       ├── deepseek/           # DeepSeek V3 results
+│       ├── kimi/               # Kimi results
+│       └── _template.md        # Template for new runs
+│
 ├── alembic/                    # Shared database migrations
 ├── docker-compose.yml          # Orchestrates all services
+├── BENCHMARKS.md               # Benchmark results dashboard
 └── pyproject.toml              # Workspace root
 ```
 
@@ -186,6 +195,66 @@ cd packages/qt-sql && pytest tests/ -v
 # qt-dax tests
 cd packages/qt-dax && pytest tests/ -v
 ```
+
+---
+
+## Recording Results
+
+**All benchmark and experiment results MUST be recorded.** Never run benchmarks without saving the results.
+
+### Benchmark Results Location
+
+```
+research/experiments/dspy_runs/
+├── {name}_{YYYYMMDD_HHMMSS}/    # Timestamped run folder
+│   ├── results.json             # Full results (query, status, speedup, times)
+│   ├── summary.txt              # Human-readable summary
+│   └── q{N}/                    # Per-query artifacts (SQL, plans, logs)
+```
+
+### Naming Convention
+
+Format: `{description}_{YYYYMMDD_HHMMSS}_{mode}/`
+
+Examples:
+- `all_20260201_205640/` - Full benchmark run
+- `all_20260202_143844_dag_mcts/` - DAG + MCTS mode
+- `kimi_dag_20260202_190306/` - Kimi model with DAG mode
+- `failures_20260201_223223/` - Re-run of failed queries
+
+### Required Files
+
+1. **`results.json`** - Machine-readable results array:
+```json
+[
+  {"query": "q1", "status": "success", "speedup": 2.90, "original_time": 0.5, "optimized_time": 0.17},
+  {"query": "q2", "status": "validation_failed", "error": "row count mismatch"}
+]
+```
+
+2. **`summary.txt`** - Human-readable summary with:
+   - Date, model, mode, parameters
+   - Success/failed/error counts
+   - Top speedups list
+
+### When to Record
+
+- Running TPC-DS benchmarks (full or partial)
+- Testing new optimization strategies
+- Comparing LLM providers/models
+- Validating bug fixes with before/after metrics
+
+---
+
+## Test Data
+
+| Dataset | Location | Description |
+|---------|----------|-------------|
+| **TPC-DS SF100** | `D:\TPC-DS\` | TPC-DS benchmark at scale factor 100 |
+| TPC-DS Queries | `D:\TPC-DS\queries_sf100\` | 99 original TPC-DS queries |
+| DuckDB Converted | `D:\TPC-DS\queries_duckdb_converted\` | DuckDB-compatible queries |
+| Postgres Converted | `D:\TPC-DS\queries_postgres_converted\` | PostgreSQL-compatible queries |
+| DuckDB Database | `D:\TPC-DS\tpcds_sf100.duckdb` | ~28GB DuckDB database with SF100 data |
 
 ---
 
