@@ -168,6 +168,7 @@ class SQLValidator:
         """
         errors: list[str] = []
         warnings: list[str] = []
+        stripped_comments: list[str] = []
 
         # Load schema if provided
         if schema_sql:
@@ -175,6 +176,22 @@ class SQLValidator:
                 self.load_schema(schema_sql)
             except Exception as e:
                 return self._error_result(f"Failed to load schema: {e}")
+
+        # Step 0: Strip SQL comments (preserve for analysis)
+        normalizer = self._get_normalizer()
+        orig_comment_result, opt_comment_result = normalizer.strip_comments_pair(
+            original_sql, optimized_sql
+        )
+
+        # Store comments for analysis
+        if orig_comment_result.had_comments:
+            stripped_comments.extend([f"[original] {c}" for c in orig_comment_result.comments])
+        if opt_comment_result.had_comments:
+            stripped_comments.extend([f"[optimized] {c}" for c in opt_comment_result.comments])
+
+        # Use comment-stripped SQL from here on
+        original_sql = orig_comment_result.sql
+        optimized_sql = opt_comment_result.sql
 
         # Step 1: Syntax validation
         orig_valid, orig_errors = self.validate_syntax(original_sql)
@@ -186,7 +203,6 @@ class SQLValidator:
             return self._error_result(f"Optimized SQL syntax error: {opt_errors}")
 
         # Step 2: LIMIT/ORDER BY normalization
-        normalizer = self._get_normalizer()
         orig_norm, opt_norm = normalizer.normalize_pair(
             original_sql, optimized_sql, self.limit_strategy
         )

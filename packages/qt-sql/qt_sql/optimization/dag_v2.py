@@ -609,8 +609,9 @@ OUTPUT FORMAT:
 class RewriteAssembler:
     """Apply rewrite sets to produce optimized SQL."""
 
-    def __init__(self, dag: QueryDag):
+    def __init__(self, dag: QueryDag, dialect: str = "duckdb"):
         self.dag = dag
+        self.dialect = dialect
 
     def apply_rewrite_set(self, rewrite_set: RewriteSet) -> str:
         """Apply a rewrite set and produce optimized SQL.
@@ -699,9 +700,34 @@ class RewriteAssembler:
 
         return result
 
+    def _strip_sql_comments(self, sql: str) -> str:
+        """Strip SQL comments using sqlglot for safety.
+
+        Handles both block comments (/* */) and line comments (--).
+        Preserves comment-like patterns inside string literals.
+        """
+        try:
+            parsed = sqlglot.parse_one(sql, dialect=self.dialect)
+
+            # Recursively clear comments
+            def clear_comments(node):
+                if hasattr(node, 'comments'):
+                    node.comments = None
+                for child in node.iter_expressions():
+                    clear_comments(child)
+
+            clear_comments(parsed)
+            return parsed.sql(dialect=self.dialect)
+        except Exception:
+            # Fallback: return original if parsing fails
+            return sql
+
     def _assemble_sql(self, nodes: Dict[str, str]) -> str:
         """Reassemble full SQL from nodes."""
         main_sql = nodes.get("main_query", "")
+
+        # Strip comments before processing (LLM often echoes original comments)
+        main_sql = self._strip_sql_comments(main_sql)
 
         # Check if main_query already has WITH clause (LLM included full SQL)
         if main_sql.strip().upper().startswith("WITH "):
@@ -710,6 +736,9 @@ class RewriteAssembler:
 
         # Build CTEs in dependency order
         cte_nodes = {k: v for k, v in nodes.items() if k != "main_query"}
+
+        # Strip comments from all CTE nodes too
+        cte_nodes = {k: self._strip_sql_comments(v) for k, v in cte_nodes.items()}
 
         # Handle empty CTEs
         if not cte_nodes:

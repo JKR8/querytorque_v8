@@ -205,12 +205,17 @@ def audit(
 @click.argument("file", type=click.Path(exists=True))
 @click.option("--dialect", default="duckdb", help="SQL dialect (duckdb, postgres, snowflake, generic)")
 @click.option("--database", "-d", type=click.Path(), help="DuckDB database path for schema/execution plan context")
-@click.option("--provider", default=None, help="LLM provider (anthropic, deepseek, openai, groq, gemini)")
+@click.option("--provider", default=None, help="LLM provider (anthropic, deepseek, openai, groq, gemini, openrouter)")
 @click.option("--model", default=None, help="LLM model name")
 @click.option("--output", "-o", type=click.Path(), help="Output file for optimized SQL")
 @click.option("--dry-run", is_flag=True, help="Show prompt without calling LLM")
 @click.option("--show-prompt", is_flag=True, help="Display the full prompt sent to LLM")
-@click.option("--mcts", is_flag=True, help="Use MCTS-guided optimization with validation")
+@click.option(
+    "--mode",
+    type=click.Choice(["dag-v2", "full", "mcts"]),
+    default="dag-v2",
+    help="Optimization mode: dag-v2 (default), full (full SQL), mcts (tree search)"
+)
 @click.option("--mcts-iterations", default=30, help="Maximum MCTS iterations (default: 30)")
 def optimize(
     file: str,
@@ -221,23 +226,25 @@ def optimize(
     output: Optional[str],
     dry_run: bool,
     show_prompt: bool,
-    mcts: bool,
+    mode: str,
     mcts_iterations: int,
 ):
     """Optimize SQL using LLM-powered analysis.
 
+    Modes:
+    - dag-v2 (default): DAG-based node-level optimization with contracts
+    - full: Full SQL replacement optimization
+    - mcts: MCTS-guided tree search with validation
+
     When a --database is provided, includes schema context and execution plan
     in the prompt for better optimization recommendations.
-
-    Use --mcts for MCTS-guided optimization that systematically explores
-    transformation sequences with validation feedback.
 
     Examples:
         qt-sql optimize query.sql
         qt-sql optimize query.sql --database /path/to/data.duckdb
         qt-sql optimize query.sql -d mydata.duckdb --provider deepseek
-        qt-sql optimize query.sql -o optimized.sql
-        qt-sql optimize query.sql -d data.duckdb --mcts --mcts-iterations 30
+        qt-sql optimize query.sql -o optimized.sql --mode dag-v2
+        qt-sql optimize query.sql -d data.duckdb --mode mcts --mcts-iterations 30
     """
     try:
         sql = read_sql_file(file)
@@ -349,7 +356,7 @@ Return your response as JSON:
         return
 
     # MCTS optimization mode
-    if mcts:
+    if mode == "mcts":
         if not database:
             console.print("[red]MCTS optimization requires --database for validation.[/red]")
             sys.exit(1)
@@ -411,11 +418,84 @@ Return your response as JSON:
 
         return
 
+    # DAG v2 optimization mode (default)
+    if mode == "dag-v2":
+        try:
+            from qt_sql.optimization.dag_v2 import DagV2Pipeline, get_dag_v2_examples
+
+            console.print(f"\n[bold]Running DAG v2 optimization...[/bold]")
+
+            # Build pipeline
+            pipeline = DagV2Pipeline(sql)
+
+            # Show DAG structure
+            console.print(f"[dim]{pipeline.get_dag_summary()}[/dim]\n")
+
+            # Build prompt with few-shot examples
+            examples = get_dag_v2_examples()
+            few_shot_parts = []
+            for ex in examples[:2]:
+                few_shot_parts.append(f"### Example: {ex['opportunity']}")
+                few_shot_parts.append(f"Input:\n{ex['input_slice']}")
+                import json as json_mod
+                few_shot_parts.append(f"Output:\n```json\n{json_mod.dumps(ex['output'], indent=2)}\n```")
+                if 'key_insight' in ex:
+                    few_shot_parts.append(f"Key insight: {ex['key_insight']}")
+                few_shot_parts.append("")
+
+            few_shot = "\n".join(few_shot_parts)
+            base_prompt = pipeline.get_prompt()
+            full_prompt = f"## Examples\n\n{few_shot}\n\n---\n\n## Your Task\n\n{base_prompt}"
+
+            if show_prompt:
+                console.print("[bold]Full Prompt:[/bold]")
+                console.print(Panel(full_prompt, title="DAG v2 Prompt", border_style="dim"))
+
+            if dry_run:
+                console.print("\n[yellow]Dry run mode - LLM call skipped.[/yellow]")
+                return
+
+            # Call LLM
+            from qt_shared.llm import create_llm_client
+            llm_client = create_llm_client(provider=provider, model=model)
+
+            if llm_client is None:
+                console.print(
+                    "[red]No LLM provider configured. "
+                    "Set QT_LLM_PROVIDER and API key environment variables.[/red]"
+                )
+                sys.exit(1)
+
+            console.print("[bold]Requesting LLM optimization...[/bold]")
+            response = llm_client.analyze(full_prompt)
+
+            # Apply response to get optimized SQL
+            optimized_sql = pipeline.apply_response(response)
+
+            console.print("\n[bold green]DAG v2 Optimization Result:[/bold green]")
+            console.print(Syntax(optimized_sql, "sql", theme="monokai", line_numbers=True))
+
+            if output:
+                Path(output).write_text(optimized_sql, encoding="utf-8")
+                console.print(f"\n[green]Optimized SQL saved to: {output}[/green]")
+
+        except ImportError as e:
+            console.print(f"[red]DAG v2 optimizer not available: {e}[/red]")
+            sys.exit(1)
+        except Exception as e:
+            console.print(f"[red]DAG v2 optimization failed: {e}[/red]")
+            import traceback
+            console.print(f"[dim]{traceback.format_exc()}[/dim]")
+            sys.exit(1)
+
+        return
+
+    # Full SQL optimization mode
     if not issues and not database:
         console.print("\n[green]No issues found - query already looks optimal.[/green]")
         return
 
-    # Create LLM client
+    # Create LLM client for full mode
     try:
         from qt_shared.llm import create_llm_client
 
