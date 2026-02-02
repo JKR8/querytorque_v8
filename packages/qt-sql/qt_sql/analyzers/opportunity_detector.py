@@ -117,6 +117,11 @@ def detect_opportunities(sql: str) -> list[OpportunityResult]:
     if opportunity:
         opportunities.append(opportunity)
 
+    # SQL-SUB-001: Correlated subquery with aggregate (convert to window function)
+    opportunity = _check_correlated_subquery(parsed)
+    if opportunity:
+        opportunities.append(opportunity)
+
     return opportunities
 
 
@@ -372,6 +377,77 @@ def _check_triangular_join(parsed: exp.Expression) -> Optional[OpportunityResult
                                 rewrite_hint="Use SUM/COUNT OVER (ORDER BY col ROWS UNBOUNDED PRECEDING)",
                                 expected_benefit="O(n^2) -> O(n)",
                             )
+    return None
+
+
+def _check_correlated_subquery(parsed: exp.Expression) -> Optional[OpportunityResult]:
+    """Check for correlated subquery with aggregate in WHERE clause.
+
+    Pattern: WHERE col > (SELECT agg(x) FROM t2 WHERE t2.key = t1.key)
+    Rewrite: Add aggregate as window function in CTE, compare directly
+
+    This is the Q1 pattern that provides 2.5x speedup:
+    ctr1.ctr_total_return > (SELECT AVG(...) FROM ctr2 WHERE ctr1.store = ctr2.store)
+    → AVG(...) OVER (PARTITION BY store) computed once in CTE
+    """
+    # Find all subqueries
+    for subq in parsed.find_all(exp.Subquery):
+        # Skip subqueries not in a comparison context (WHERE/HAVING)
+        parent = subq.parent
+        if not parent:
+            continue
+
+        # Check if subquery is in a comparison (>, <, >=, <=, =)
+        is_comparison = isinstance(parent, (exp.GT, exp.LT, exp.GTE, exp.LTE, exp.EQ, exp.NEQ))
+        if not is_comparison:
+            continue
+
+        # Get the inner SELECT
+        inner_select = subq.find(exp.Select)
+        if not inner_select:
+            continue
+
+        # Must have an aggregate function (AVG, SUM, MAX, MIN, COUNT)
+        has_aggregate = False
+        agg_name = ""
+        for agg in inner_select.find_all(exp.AggFunc):
+            has_aggregate = True
+            agg_name = type(agg).__name__.upper()
+            break
+
+        if not has_aggregate:
+            continue
+
+        # Check for correlation: subquery WHERE references outer table
+        inner_where = inner_select.find(exp.Where)
+        if not inner_where:
+            continue
+
+        # Look for equality condition that references outer scope
+        # Pattern: inner.col = outer.col (correlation)
+        has_correlation = False
+        for eq in inner_where.find_all(exp.EQ):
+            columns = list(eq.find_all(exp.Column))
+            if len(columns) >= 2:
+                # Check if columns have different table references (different aliases)
+                tables = set()
+                for col in columns:
+                    if col.table:
+                        tables.add(str(col.table).lower())
+                if len(tables) >= 2:
+                    has_correlation = True
+                    break
+
+        if has_correlation:
+            return OpportunityResult(
+                pattern_id="SQL-SUB-001",
+                pattern_name="Correlated Subquery to Window Function",
+                trigger=f"Correlated subquery with {agg_name}() in WHERE comparison",
+                rewrite_hint="Compute aggregate as window function in CTE, avoid O(n²) re-scan",
+                expected_benefit="2.5x speedup by eliminating nested loop",
+                example="AVG(value) OVER (PARTITION BY key) computed once in CTE",
+            )
+
     return None
 
 

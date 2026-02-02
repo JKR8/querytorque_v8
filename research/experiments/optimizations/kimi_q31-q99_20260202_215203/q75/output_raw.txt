@@ -1,0 +1,219 @@
+ The user wants me to optimize a SQL query based on the provided examples and rules.
+
+ Looking at the input:
+ 1. There's a CTE `[all_sales]` that does a UNION ALL of three sales channels (catalog, store, web), each joining with item, date_dim, and returns tables, filtering for `i_category = 'Home'`, and then grouping by year and item attributes.
+ 2. The `[main_query]` uses this CTE twice (as `curr_yr` and `prev_yr`) to compare sales between year 1999 and year 1998 (1999-1).
+ 3. The main query filters: `curr_yr.d_year = 1999` and `prev_yr.d_year = 1998` (implied by 1999-1).
+
+ The detected opportunities mention PUSHDOWN: filters on [all_sales] after GROUP BY should be pushed into the CTE before aggregation.
+
+ Currently, `all_sales` computes aggregates for ALL years where `i_category = 'Home'`, but the main query only needs years 1998 and 1999. This is a classic case for predicate pushdown to reduce the amount of data being aggregated.
+
+ The transformation should:
+ 1. Push the year filters (d_year = 1999 and d_year = 1998) into the CTE `all_sales` 
+ 2. Since the main_query uses all_sales twice with different year filters, we could either:
+    - Create separate CTEs for each year (but that might duplicate code)
+    - Push the filter into the subqueries inside the UNION ALL
+    - Or push the filter into the CTE definition so it filters before the GROUP BY
+
+ Actually, looking at the structure, `all_sales` is defined as a CTE that aggregates by `d_year`. The main query then filters on specific years after the aggregation.
+
+ To optimize:
+ - Push `d_year IN (1998, 1999)` or specific year filters into the subqueries inside the UNION ALL in `all_sales`
+ - This will reduce the data scanned and aggregated significantly
+
+ However, since `all_sales` is used twice in the main query with different year predicates (curr_yr.d_year = 1999 vs prev_yr.d_year = 1998), we need to be careful. If we push both filters into the CTE, we need to make sure both years are included.
+
+ Actually, looking at the main_query:
+ - `curr_yr.d_year = 1999`
+ - `prev_yr.d_year = 1999 - 1` (which is 1998)
+
+ So we need both years 1998 and 1999 in the all_sales CTE.
+
+ The optimization is to add `WHERE d_year IN (1998, 1999)` or push the date filter down to the date_dim joins in each UNION branch.
+
+ Wait, looking at the contracts:
+ - `all_sales` has required_predicates: `["i_category = 'Home'"]`
+ - `main_query` has required_predicates including the year filters
+
+ The transform is `pushdown` - pushing the year filter from the main_query into the all_sales CTE.
+
+ Since the main_query uses all_sales with specific year filters, we can modify all_sales to accept or include these filters. But since all_sales is a CTE defined in the query, we can push the predicate down into the CTE definition.
+
+ Specifically, we can add `WHERE d_year IN (1998, 1999)` to the inner queries (the UNION ALL parts) to filter before the GROUP BY.
+
+ Actually, looking at the structure of `all_sales`, it has:
+ ```sql
+ SELECT ... FROM (
+   SELECT ... FROM catalog_sales ... WHERE i_category = 'Home'
+   UNION
+   SELECT ... FROM store_sales ... WHERE i_category = 'Home'
+   UNION
+   SELECT ... FROM web_sales ... WHERE i_category = 'Home'
+ ) AS sales_detail
+ GROUP BY ...
+ ```
+
+ We can push the year filter into each branch by joining with date_dim and filtering on d_year there. Wait, it's already joining with date_dim. So we can add `AND d_year IN (1998, 1999)` to each branch.
+
+ Or, since the date_dim is already joined, we can filter at the outer level of the CTE before the GROUP BY, but that would still require scanning all the data. Better to push it into each UNION branch.
+
+ So the rewrite would be:
+ - In `all_sales`, add `AND d_year IN (1998, 1999)` to each of the three subqueries (catalog, store, web) in the WHERE clause (or in the ON clause for the date_dim join).
+
+ Wait, looking at the SQL:
+ ```sql
+ ... FROM catalog_sales JOIN item ... JOIN date_dim ON d_date_sk = cs_sold_date_sk ... WHERE i_category = 'Home'
+ ```
+
+ So we can change it to:
+ ```sql
+ ... FROM catalog_sales JOIN item ... JOIN date_dim ON d_date_sk = cs_sold_date_sk ... WHERE i_category = 'Home' AND d_year IN (1998, 1999)
+ ```
+
+ This applies to all three branches.
+
+ Then the main_query can remain the same, or we could potentially remove the year filters from the main_query since they're already applied, but we need to keep them for correctness (to ensure curr_yr only gets 1999 and prev_yr only gets 1998, though if we filter the CTE to only contain these two years, the join will work correctly).
+
+ Actually, if we filter all_sales to only contain 1998 and 1999, then:
+ - curr_yr will only have 1999 data
+ - prev_yr will only have 1998 data
+ - The join will match them correctly
+
+ So we can push `d_year IN (1998, 1999)` into the CTE.
+
+ But wait, the main_query specifically filters `curr_yr.d_year = 1999` and `prev_yr.d_year = 1998`. If we push this down, we should ensure the semantics are preserved. Since the CTE is only used in this query (it's a CTE in the main query), we can push the filter down.
+
+ However, looking at the "Node Contracts", `all_sales` doesn't have the year filter as a required predicate, but `main_query` does. The pushdown transform moves predicates from the parent (main_query) to the child (all_sales).
+
+ So the rewrite set should:
+ 1. Transform: `pushdown`
+ 2. Modify `all_sales` to include the year filter `d_year IN (1998, 1999)` in each subquery
+ 3. Keep `main_query` mostly the same, though technically the year filters are now redundant but harmless (and good for documentation/correctness)
+
+ Wait, looking at the example format, they usually show the modified SQL for each node.
+
+ For `all_sales`, I need to show the new SQL with the filter pushed down.
+
+ The new SQL for `all_sales` would filter each branch by `d_year IN (1998, 1999)` or specifically by the years needed.
+
+ Actually, since the main query joins the CTE to itself with specific year filters, and the CTE is computed once (in SQL with CTEs, the CTE is typically materialized or computed once and reused), pushing the filter down reduces the size of the CTE.
+
+ So:
+ ```sql
+ SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, SUM(sales_cnt) AS sales_cnt, SUM(sales_amt) AS sales_amt 
+ FROM (
+   SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, cs_quantity - COALESCE(cr_return_quantity, 0) AS sales_cnt, cs_ext_sales_price - COALESCE(cr_return_amount, 0.0) AS sales_amt 
+   FROM catalog_sales 
+   JOIN item ON i_item_sk = cs_item_sk 
+   JOIN date_dim ON d_date_sk = cs_sold_date_sk 
+   LEFT JOIN catalog_returns ON (cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk) 
+   WHERE i_category = 'Home' AND d_year IN (1998, 1999)
+   
+   UNION ALL
+   
+   SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ss_quantity - COALESCE(sr_return_quantity, 0) AS sales_cnt, ss_ext_sales_price - COALESCE(sr_return_amt, 0.0) AS sales_amt 
+   FROM store_sales 
+   JOIN item ON i_item_sk = ss_item_sk 
+   JOIN date_dim ON d_date_sk = ss_sold_date_sk 
+   LEFT JOIN store_returns ON (ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk) 
+   WHERE i_category = 'Home' AND d_year IN (1998, 1999)
+   
+   UNION ALL
+   
+   SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ws_quantity - COALESCE(wr_return_quantity, 0) AS sales_cnt, ws_ext_sales_price - COALESCE(wr_return_amt, 0.0) AS sales_amt 
+   FROM web_sales 
+   JOIN item ON i_item_sk = ws_item_sk 
+   JOIN date_dim ON d_date_sk = ws_sold_date_sk 
+   LEFT JOIN web_returns ON (ws_order_number = wr_order_number AND ws_item_sk = wr_item_sk) 
+   WHERE i_category = 'Home' AND d_year IN (1998, 1999)
+ ) AS sales_detail 
+ GROUP BY d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id
+ ```
+
+ The `main_query` remains essentially the same, though we could note that the filters are now redundant but kept for correctness/clarity.
+
+ Wait, looking at the detected opportunities, it says "PUSHDOWN: [main_query] filters on [all_sales] after GROUP BY". This confirms we need to push the year filters (1998, 1999) into the CTE.
+
+ Risk is low because we're just filtering earlier.
+
+ Expected speedup: 2x (as mentioned in the prompt).
+
+ Invariants kept: same result rows, same grouping, same output columns.
+
+ Let me check if there are other opportunities. The query uses UNION (not UNION ALL). Wait, looking at the SQL:
+ ```sql
+ ... FROM catalog_sales ... WHERE i_category = 'Home' UNION SELECT ... FROM store_sales ... WHERE i_category = 'Home' UNION SELECT ... FROM web_sales ...
+ ```
+
+ It uses UNION, not UNION ALL. This means it's removing duplicates between the three channels. However, since each channel has different source tables (catalog_sales vs store_sales vs web_sales), and assuming an item can't be sold in both catalog and store with the exact same details in a way that creates duplicates... actually, UNION implies deduplication which is expensive. But changing UNION to UNION ALL would be a semantic change unless we can prove no duplicates exist. The prompt doesn't mention this as a detected opportunity, so I should probably stick to the pushdown.
+
+ Also, looking at the main_query, it does a self-join on all_sales. If we materialize all_sales with only 1998 and 1999 data, that's good.
+
+ One more thing: the main_query has `CAST(curr_yr.sales_cnt AS DECIMAL(17, 2)) / CAST(prev_yr.sales_cnt AS DECIMAL(17, 2)) < 0.9`. This could potentially be pushed down as well, but it's a filter on the result of the join, not on all_sales directly. Actually, it references both curr_yr and prev_yr, so it can't be pushed into the CTE easily.
+
+ So the main rewrite is the pushdown of the year filters.
+
+ Let me format the JSON properly.
+
+ ```json
+ {
+   "rewrite_sets": [
+     {
+       "id": "rs_01",
+       "transform": "pushdown",
+       "nodes": {
+         "all_sales": "SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, SUM(sales_cnt) AS sales_cnt, SUM(sales_amt) AS sales_amt FROM (SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, cs_quantity - COALESCE(cr_return_quantity, 0) AS sales_cnt, cs_ext_sales_price - COALESCE(cr_return_amount, 0.0) AS sales_amt FROM catalog_sales JOIN item ON i_item_sk = cs_item_sk JOIN date_dim ON d_date_sk = cs_sold_date_sk LEFT JOIN catalog_returns ON (cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk) WHERE i_category = 'Home' AND d_year IN (1998, 1999) UNION SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ss_quantity - COALESCE(sr_return_quantity, 0) AS sales_cnt, ss_ext_sales_price - COALESCE(sr_return_amt, 0.0) AS sales_amt FROM store_sales JOIN item ON i_item_sk = ss_item_sk JOIN date_dim ON d_date_sk = ss_sold_date_sk LEFT JOIN store_returns ON (ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk) WHERE i_category = 'Home' AND d_year IN (1998, 1999) UNION SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ws_quantity - COALESCE(wr_return_quantity, 0) AS sales_cnt, ws_ext_sales_price - COALESCE(wr_return_amt, 0.0) AS sales_amt FROM web_sales JOIN item ON i_item_sk = ws_item_sk JOIN date_dim ON d_date_sk = ws_sold_date_sk LEFT JOIN web_returns ON (ws_order_number = wr_order_number AND ws_item_sk = wr_item_sk) WHERE i_category = 'Home' AND d_year IN (1998, 1999)) AS sales_detail GROUP BY d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id",
+         "main_query": "WITH all_sales AS (SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, SUM(sales_cnt) AS sales_cnt, SUM(sales_amt) AS sales_amt FROM (SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, cs_quantity - COALESCE(cr_return_quantity, 0) AS sales_cnt, cs_ext_sales_price - COALESCE(cr_return_amount, 0.0) AS sales_amt FROM catalog_sales JOIN item ON i_item_sk = cs_item_sk JOIN date_dim ON d_date_sk = cs_sold_date_sk LEFT JOIN catalog_returns ON (cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk) WHERE i_category = 'Home' AND d_year IN (1998, 1999) UNION SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ss_quantity - COALESCE(sr_return_quantity, 0) AS sales_cnt, ss_ext_sales_price - COALESCE(sr_return_amt, 0.0) AS sales_amt FROM store_sales JOIN item ON i_item_sk = ss_item_sk JOIN date_dim ON d_date_sk = ss_sold_date_sk LEFT JOIN store_returns ON (ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk) WHERE i_category = 'Home' AND d_year IN (1998, 1999) UNION SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ws_quantity - COALESCE(wr_return_quantity, 0) AS sales_cnt, ws_ext_sales_price - COALESCE(wr_return_amt, 0.0) AS sales_amt FROM web_sales JOIN item ON i_item_sk = ws_item_sk JOIN date_dim ON d_date_sk = ws_sold_date_sk LEFT JOIN web_returns ON (ws_order_number = wr_order_number AND ws_item_sk = wr_item_sk) WHERE i_category = 'Home' AND d_year IN (1998, 1999)) AS sales_detail GROUP BY d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id) SELECT prev_yr.d_year AS prev_year, curr_yr.d_year AS year, curr_yr.i_brand_id, curr_yr.i_class_id, curr_yr.i_category_id, curr_yr.i_manufact_id, prev_yr.sales_cnt AS prev_yr_cnt, curr_yr.sales_cnt AS curr_yr_cnt, curr_yr.sales_cnt - prev_yr.sales_cnt AS sales_cnt_diff, curr_yr.sales_amt - prev_yr.sales_amt AS sales_amt_diff FROM all_sales AS curr_yr, all_sales AS prev_yr WHERE curr_yr.i_brand_id = prev_yr.i_brand_id AND curr_yr.i_class_id = prev_yr.i_class_id AND curr_yr.i_category_id = prev_yr.i_category_id AND curr_yr.i_manufact_id = prev_yr.i_manufact_id AND curr_yr.d_year = 1999 AND prev_yr.d_year = 1999 - 1 AND CAST(curr_yr.sales_cnt AS DECIMAL(17, 2)) / CAST(prev_yr.sales_cnt AS DECIMAL(17, 2)) < 0.9 ORDER BY sales_cnt_diff, sales_amt_diff LIMIT 100"
+       },
+       "invariants_kept": [
+         "same result rows",
+         "same grouping columns",
+         "same output columns"
+       ],
+       "expected_speedup": "2x",
+       "risk": "low"
+     }
+   ],
+   "explanation": "Pushed year filters (1998, 1999) from main_query into all_sales CTE to filter data before aggregation. This reduces the amount of data scanned and grouped by eliminating all years except the two needed for the year-over-year comparison."
+ }
+ ```
+
+ Wait, I should check if the SQL uses UNION or UNION ALL. Looking carefully at the input:
+ ```sql
+ ... WHERE i_category = 'Home' UNION SELECT ... WHERE i_category = 'Home' UNION SELECT ... WHERE i_category = 'Home'
+ ```
+
+ It's UNION, not UNION ALL. But in my rewrite I should preserve UNION (not change to UNION ALL) unless there's a specific reason. The prompt says "No formatting-only changes" and "Preserve node contracts". So I should keep it as UNION.
+
+ Also, I notice the main_query uses `1999 - 1` for the previous year. I should keep that as is or use 1998? The original uses `1999 - 1`, so I should keep it as `1999 - 1` to be safe, though `1998` would be equivalent. The prompt says "No column renames unless required" and implies we should keep the SQL as close as possible while applying the transform.
+
+ Actually, looking at the example, they kept the original expressions. So I'll keep `1999 - 1`.
+
+ One final check: the detected opportunities mention "PUSHDOWN" twice, probably referring to the two different usages (curr_yr and prev_yr), but it's the same fix - push both year conditions into the CTE.
+
+ The explanation should mention that we're filtering early to reduce the dataset before the expensive GROUP BY and UNION operations.
+
+ I think this is correct. </think> ```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "pushdown",
+      "nodes": {
+        "all_sales": "SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, SUM(sales_cnt) AS sales_cnt, SUM(sales_amt) AS sales_amt FROM (SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, cs_quantity - COALESCE(cr_return_quantity, 0) AS sales_cnt, cs_ext_sales_price - COALESCE(cr_return_amount, 0.0) AS sales_amt FROM catalog_sales JOIN item ON i_item_sk = cs_item_sk JOIN date_dim ON d_date_sk = cs_sold_date_sk LEFT JOIN catalog_returns ON (cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk) WHERE i_category = 'Home' AND d_year IN (1998, 1999) UNION SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ss_quantity - COALESCE(sr_return_quantity, 0) AS sales_cnt, ss_ext_sales_price - COALESCE(sr_return_amt, 0.0) AS sales_amt FROM store_sales JOIN item ON i_item_sk = ss_item_sk JOIN date_dim ON d_date_sk = ss_sold_date_sk LEFT JOIN store_returns ON (ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk) WHERE i_category = 'Home' AND d_year IN (1998, 1999) UNION SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ws_quantity - COALESCE(wr_return_quantity, 0) AS sales_cnt, ws_ext_sales_price - COALESCE(wr_return_amt, 0.0) AS sales_amt FROM web_sales JOIN item ON i_item_sk = ws_item_sk JOIN date_dim ON d_date_sk = ws_sold_date_sk LEFT JOIN web_returns ON (ws_order_number = wr_order_number AND ws_item_sk = wr_item_sk) WHERE i_category = 'Home' AND d_year IN (1998, 1999)) AS sales_detail GROUP BY d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id",
+        "main_query": "WITH all_sales AS (SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, SUM(sales_cnt) AS sales_cnt, SUM(sales_amt) AS sales_amt FROM (SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, cs_quantity - COALESCE(cr_return_quantity, 0) AS sales_cnt, cs_ext_sales_price - COALESCE(cr_return_amount, 0.0) AS sales_amt FROM catalog_sales JOIN item ON i_item_sk = cs_item_sk JOIN date_dim ON d_date_sk = cs_sold_date_sk LEFT JOIN catalog_returns ON (cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk) WHERE i_category = 'Home' AND d_year IN (1998, 1999) UNION SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ss_quantity - COALESCE(sr_return_quantity, 0) AS sales_cnt, ss_ext_sales_price - COALESCE(sr_return_amt, 0.0) AS sales_amt FROM store_sales JOIN item ON i_item_sk = ss_item_sk JOIN date_dim ON d_date_sk = ss_sold_date_sk LEFT JOIN store_returns ON (ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk) WHERE i_category = 'Home' AND d_year IN (1998, 1999) UNION SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ws_quantity - COALESCE(wr_return_quantity, 0) AS sales_cnt, ws_ext_sales_price - COALESCE(wr_return_amt, 0.0) AS sales_amt FROM web_sales JOIN item ON i_item_sk = ws_item_sk JOIN date_dim ON d_date_sk = ws_sold_date_sk LEFT JOIN web_returns ON (ws_order_number = wr_order_number AND ws_item_sk = wr_item_sk) WHERE i_category = 'Home' AND d_year IN (1998, 1999)) AS sales_detail GROUP BY d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id) SELECT prev_yr.d_year AS prev_year, curr_yr.d_year AS year, curr_yr.i_brand_id, curr_yr.i_class_id, curr_yr.i_category_id, curr_yr.i_manufact_id, prev_yr.sales_cnt AS prev_yr_cnt, curr_yr.sales_cnt AS curr_yr_cnt, curr_yr.sales_cnt - prev_yr.sales_cnt AS sales_cnt_diff, curr_yr.sales_amt - prev_yr.sales_amt AS sales_amt_diff FROM all_sales AS curr_yr, all_sales AS prev_yr WHERE curr_yr.i_brand_id = prev_yr.i_brand_id AND curr_yr.i_class_id = prev_yr.i_class_id AND curr_yr.i_category_id = prev_yr.i_category_id AND curr_yr.i_manufact_id = prev_yr.i_manufact_id AND curr_yr.d_year = 1999 AND prev_yr.d_year = 1999 - 1 AND CAST(curr_yr.sales_cnt AS DECIMAL(17, 2)) / CAST(prev_yr.sales_cnt AS DECIMAL(17, 2)) < 0.9 ORDER BY sales_cnt_diff, sales_amt_diff LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same grouping columns",
+        "same output columns",
+        "same join semantics"
+      ],
+      "expected_speedup": "2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Pushed year filters (d_year IN (1998, 1999)) from main_query into all_sales CTE to filter data before the UNION and GROUP BY operations. This eliminates scanning and aggregating data for all other years, significantly reducing I/O and computation since only two specific years are needed for the year-over-year comparison."
+}
+```

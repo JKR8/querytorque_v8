@@ -40,17 +40,24 @@ class DeepSeekClient:
 
         client = OpenAI(api_key=self.api_key, base_url=self.DEEPSEEK_BASE_URL)
 
-        # DeepSeek reasoner doesn't support response_format or system messages well
+        # DeepSeek reasoner needs high max_tokens - reasoning can use 10k+ tokens
+        # before producing the final content
         response = client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=4096,
+            max_tokens=16384,  # High limit for reasoning models
         )
 
         duration = time.time() - start_time
-        response_text = response.choices[0].message.content
+        response_text = response.choices[0].message.content or ""
+
+        # Log reasoning content if available (R1 models)
+        reasoning = getattr(response.choices[0].message, 'reasoning_content', None)
+        if reasoning:
+            logger.debug("DeepSeek reasoning: %s...", reasoning[:200])
+
         logger.info(
             "DeepSeek API response: model=%s, duration=%.2fs, response=%d chars",
             self.model, duration, len(response_text)

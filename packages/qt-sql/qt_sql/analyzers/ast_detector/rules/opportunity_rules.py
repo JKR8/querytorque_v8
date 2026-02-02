@@ -145,9 +145,9 @@ class LateDateFilterOpportunity(ASTRule):
 
     rule_id = "QT-OPT-002"
     name = "Late Date Filter - Early CTE Opportunity"
-    severity = "optimization"
+    severity = "high"  # Promoted: 43% optimizer hit rate, common win on TPC-DS
     category = "optimization_opportunity"
-    penalty = 0
+    penalty = 15  # Directly actionable - filter pushdown optimization
     description = "Date filtering late in query - early date CTE can give 1.5-2.5x speedup"
     suggestion = "Extract date filtering into a CTE and join early to fact tables"
 

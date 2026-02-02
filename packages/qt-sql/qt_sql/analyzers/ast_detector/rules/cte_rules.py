@@ -255,9 +255,9 @@ class CTEWithAggregateReusedRule(ASTRule):
 
     rule_id = "SQL-CTE-006"
     name = "Aggregate CTE Reused"
-    severity = "medium"
+    severity = "high"  # Promoted: 59% optimizer hit rate, triggers materialization
     category = "cte"
-    penalty = 10
+    penalty = 15  # Directly actionable - leads to CTE materialization
     description = "Aggregate CTE referenced multiple times - may recompute"
     suggestion = "Use MATERIALIZED hint or temp table for expensive CTEs"
 

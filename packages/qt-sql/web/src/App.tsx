@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { BrowserRouter, Routes, Route, useNavigate, useLocation } from 'react-router-dom'
 import { useAuth0 } from '@auth0/auth0-react'
 import { isAuthConfigured } from './config'
@@ -7,6 +8,12 @@ import HomePage from './pages/HomePage'
 import EditorPage from './pages/EditorPage'
 import ReportsPage from './pages/ReportsPage'
 import AccountPage from './pages/AccountPage'
+
+// Components
+import SettingsModal from './components/SettingsModal'
+
+// Hooks
+import useSettings from './hooks/useSettings'
 
 // Protected Route wrapper
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -34,7 +41,7 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 }
 
 // App Header
-function AppHeader() {
+function AppHeader({ onOpenSettings }: { onOpenSettings: () => void }) {
   const navigate = useNavigate()
   const location = useLocation()
   const authEnabled = isAuthConfigured()
@@ -75,6 +82,18 @@ function AppHeader() {
 
       <div className="header-spacer" />
 
+      {/* Settings button */}
+      <button
+        className="settings-btn"
+        onClick={onOpenSettings}
+        title="Settings"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+        </svg>
+      </button>
+
       {authEnabled && isAuthenticated && user ? (
         <div className="user-menu">
           <button className="user-menu-btn" onClick={() => navigate('/account')}>
@@ -111,6 +130,8 @@ function AppHeader() {
 function AppLayout() {
   const location = useLocation()
   const isHome = location.pathname === '/'
+  const [showSettings, setShowSettings] = useState(false)
+  const { settings, setMode } = useSettings()
 
   // Home page has its own layout
   if (isHome) {
@@ -119,7 +140,17 @@ function AppLayout() {
 
   return (
     <div className="app">
-      <AppHeader />
+      <AppHeader onOpenSettings={() => setShowSettings(true)} />
+
+      {/* Settings Modal */}
+      {showSettings && (
+        <SettingsModal
+          settings={settings}
+          onModeChange={setMode}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
+
       <main className="container">
         <Routes>
           <Route path="/editor" element={

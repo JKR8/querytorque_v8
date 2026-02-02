@@ -1,0 +1,685 @@
+rulebook:
+  id: qt-semantic-optimizer-rulebook-v1
+  goal: "Detect semantic/perf anti-patterns in SQL and fix via AST when safe; otherwise via LLM/hybrid with metadata + validation harness."
+  target_engines: [duckdb, postgres, databricks]
+  operating_modes:
+    safe_mode:
+      semantics_change_allowed: false
+      require_equivalence: true
+      min_speedup_x: 2.0
+    turbo_mode:
+      semantics_change_allowed: true
+      require_equivalence: false
+      require_tolerance_contract: true
+      min_speedup_x: 2.0
+
+  metadata_contract:
+    # What your pipeline should try to supply before any non-trivial rewrite
+    required:
+      - schema_tables_columns
+      - join_keys
+      - known_constraints: [primary_keys, unique_keys, foreign_keys]
+      - row_counts_estimate
+    optional_high_value:
+      - distinct_counts_estimate
+      - null_fraction_estimate
+      - topk_values
+      - file_source_stats_present: "e.g., parquet/csv tables have real stats?"
+      - engine_behavior_flags:
+          - cte_materialization_fence_possible
+          - window_pushdown_sensitive
+    user_assertions:
+      enabled: true
+      allowed_assertions:
+        - column_unique
+        - table_key_unique_compound
+        - one_to_one_relationship
+        - one_to_many_relationship
+        - stable_monotonic_order_key_for_pagination
+      note: "Assertions unlock aggressive rewrites like DISTINCT removal or keyset pagination when constraints are missing."
+
+  families:
+    - id: INTENT_PAGINATION
+      coverage_priority: core
+    - id: INTENT_TOPK_PER_GROUP
+      coverage_priority: core
+    - id: SUBQUERY_DECORRELATION
+      coverage_priority: core
+    - id: JOIN_SEMI_ANTI
+      coverage_priority: core
+    - id: DISTINCT_DEDUP_CONSTRAINTS
+      coverage_priority: core
+    - id: AGG_PREAGG_AND_REDUCE
+      coverage_priority: core
+    - id: FILTER_SARGABILITY
+      coverage_priority: core
+    - id: CTE_AND_COMMON_SUBEXPR
+      coverage_priority: core
+    - id: WINDOW_PLANNER_BLINDSPOTS
+      coverage_priority: extended
+    - id: SET_OPS_AND_BOOLEAN_LOGIC
+      coverage_priority: extended
+    - id: NULL_SEMANTICS_TRAPS
+      coverage_priority: extended
+    - id: SEMANTICS_TRADEOFFS_APPROX
+      coverage_priority: extended
+    - id: ENGINE_SPECIFIC_LORE
+      coverage_priority: extended
+
+  rules:
+
+    # =========================
+    # Core 20 (the 70-80% set)
+    # =========================
+
+    - id: QT-INT-001
+      family: INTENT_PAGINATION
+      name: "OFFSET pagination scan hazard -> keyset pagination"
+      core: true
+      semantics_change: true
+      detect:
+        sqlglot_signals:
+          - "SELECT with ORDER BY + OFFSET N + LIMIT M"
+          - "N >= 1000 (configurable threshold)"
+      fix:
+        approach: llm_rewrite
+        requires_metadata:
+          - stable_monotonic_order_key_for_pagination
+        output_templates:
+          - "WHERE (order_key, tie_key) > (:last_order_key, :last_tie_key) ORDER BY ... LIMIT M"
+      validate:
+        safe_mode: "deny (semantics_change)"
+        turbo_mode:
+          require_plan_delta: true
+          require_result_contract: "pagination_equivalence_by_key (not by OFFSET slice)"
+
+    - id: QT-TOPK-001
+      family: INTENT_TOPK_PER_GROUP
+      name: "Latest-per-group via correlated MAX() -> window/qualify"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "WHERE t.date = (SELECT MAX(date) ... correlated on group key)"
+          - "JOIN to derived MAX(date) per group then equality join back"
+      fix:
+        approach: ast_rewrite
+        output_templates:
+          - "ROW_NUMBER() OVER (PARTITION BY g ORDER BY date DESC, tie_key DESC) = 1"
+      validate:
+        require_equivalence: true
+        require_tie_breaker: true
+
+    - id: QT-TOPK-002
+      family: INTENT_TOPK_PER_GROUP
+      name: "Greatest-per-group self-join (non-equi + IS NULL) -> window"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "self join on group key and (a.metric < b.metric OR a.metric > b.metric)"
+          - "filter: b.metric IS NULL OR COUNT(b.*)=0"
+      fix:
+        approach: ast_rewrite
+        output_templates:
+          - "ROW_NUMBER() or RANK() OVER (PARTITION BY g ORDER BY metric DESC) filter rk = 1"
+      validate:
+        require_equivalence: true
+        tie_policy: "match_original (RANK vs ROW_NUMBER)"
+
+    - id: QT-TOPK-003
+      family: INTENT_TOPK_PER_GROUP
+      name: "Top-N per group -> window filter (rk <= N) or LATERAL strategy"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "pattern indicates N per group (row_number/rank filtered) OR complex subqueries doing per-group limiting"
+      fix:
+        approach: hybrid
+        ast_first: "prefer window if dialect supports efficiently"
+        llm_fallback: "choose LATERAL/CROSS APPLY if engine performs better"
+      validate:
+        require_equivalence: true
+
+    - id: QT-SUBQ-001
+      family: SUBQUERY_DECORRELATION
+      name: "Correlated scalar aggregate subquery -> join + group"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "SELECT (SELECT agg(...) FROM B WHERE B.fk = A.pk) AS x FROM A"
+      fix:
+        approach: hybrid
+        ast_rewrite: "LEFT JOIN B ON ... GROUP BY A.pk"
+        requires_metadata:
+          - "uniqueness or aggregate guarantee to prevent row multiplication"
+      validate:
+        require_equivalence: true
+        require_constraints_or_probe: true
+
+    - id: QT-SUBQ-002
+      family: SUBQUERY_DECORRELATION
+      name: "Correlated EXISTS/IN -> SEMI-JOIN"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "WHERE EXISTS (SELECT 1 FROM B WHERE B.fk = A.pk AND ...)"
+          - "WHERE A.key IN (SELECT B.fk FROM B WHERE ...)"
+      fix:
+        approach: ast_rewrite
+        output_templates:
+          - "WHERE EXISTS(...) -> JOIN + DISTINCT A.pk OR SEMI JOIN form (engine dependent)"
+      validate:
+        require_equivalence: true
+
+    - id: QT-JOIN-001
+      family: JOIN_SEMI_ANTI
+      name: "LEFT JOIN + filter on right table in WHERE -> move predicate into ON or convert to INNER"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "LEFT JOIN B ... WHERE B.col = ... (non-null-rejecting predicate)"
+      fix:
+        approach: hybrid
+        ast_rewrite_options:
+          - "convert to INNER JOIN"
+          - "move predicate from WHERE to ON (if intent is keep non-matching rows)"
+      validate:
+        require_intent_or_heuristic: true
+
+    - id: QT-JOIN-002
+      family: JOIN_SEMI_ANTI
+      name: "LEFT JOIN ... WHERE B.pk IS NULL -> ANTI-JOIN (NOT EXISTS)"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "LEFT JOIN + WHERE B.key IS NULL"
+      fix:
+        approach: ast_rewrite
+        output_templates:
+          - "WHERE NOT EXISTS (SELECT 1 FROM B WHERE ...)"
+      validate:
+        require_equivalence: true
+
+    - id: QT-DIST-001
+      family: DISTINCT_DEDUP_CONSTRAINTS
+      name: "Unnecessary DISTINCT masking join duplication -> remove DISTINCT OR fix join keys"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "SELECT DISTINCT with joins"
+      fix:
+        approach: llm_or_hybrid
+        requires_metadata:
+          - "keys/FDs to prove uniqueness"
+        strategies:
+          - "remove DISTINCT if projection functionally determined by unique key"
+          - "tighten join predicates if DISTINCT is compensating for missing join condition"
+      validate:
+        require_equivalence: true
+        require_constraints_or_sampling: true
+
+    - id: QT-AGG-001
+      family: AGG_PREAGG_AND_REDUCE
+      name: "Manual pivot via repeated subqueries/self-joins -> conditional aggregation / FILTER"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "multiple scalar subqueries over same table differing by literal predicate"
+          - "same base table joined multiple times with mutually exclusive filters"
+      fix:
+        approach: ast_rewrite
+        output_templates:
+          - "COUNT(*) FILTER (WHERE cond)"
+          - "SUM(CASE WHEN cond THEN 1 ELSE 0 END)"
+      validate:
+        require_equivalence: true
+        require_disjointness_check: "best-effort"
+
+    - id: QT-AGG-002
+      family: AGG_PREAGG_AND_REDUCE
+      name: "Pre-aggregate before join (reduce join volume)"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "large fact join to dim then group by dim attrs"
+          - "aggregates on fact columns after join, but join keys allow pre-agg"
+      fix:
+        approach: llm_rewrite
+        requires_metadata:
+          - "join cardinalities or uniqueness hints"
+        output_templates:
+          - "WITH fact_agg AS (SELECT join_key, agg(...) FROM fact GROUP BY join_key) JOIN dim ..."
+      validate:
+        require_equivalence: true
+        require_plan_delta: true
+
+    - id: QT-AGG-003
+      family: AGG_PREAGG_AND_REDUCE
+      name: "Drop redundant GROUP BY columns using functional dependencies"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "GROUP BY includes both a PK and dependent columns from same table"
+      fix:
+        approach: hybrid
+        requires_metadata:
+          - "unique key / FD proof (PK implies others)"
+      validate:
+        require_equivalence: true
+
+    - id: QT-FILT-001
+      family: FILTER_SARGABILITY
+      name: "Non-sargable predicate (function on column) -> rewrite to range predicate"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "WHERE DATE(col)=... / EXTRACT(...) / CAST(col) = ..."
+      fix:
+        approach: ast_rewrite
+        output_templates:
+          - "col >= start_ts AND col < end_ts"
+      validate:
+        require_equivalence: true
+        timezone_warning: true
+
+    - id: QT-FILT-002
+      family: FILTER_SARGABILITY
+      name: "OR-of-equalities on same column -> IN list"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "(col = a OR col = b OR col = c)"
+      fix:
+        approach: ast_rewrite
+        output_templates:
+          - "col IN (a,b,c)"
+      validate:
+        require_equivalence: true
+
+    - id: QT-BOOL-001
+      family: SET_OPS_AND_BOOLEAN_LOGIC
+      name: "OR across different columns -> UNION ALL of two filtered branches (when safe)"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "(A.pred) OR (B.pred) with low selectivity + prevents index usage"
+      fix:
+        approach: llm_or_hybrid
+        safety:
+          - "use UNION ALL + DISTINCT only if required"
+          - "preserve duplicates semantics"
+      validate:
+        require_equivalence: true
+
+    - id: QT-CTE-001
+      family: CTE_AND_COMMON_SUBEXPR
+      name: "Nested CTE cascade / unused CTEs -> flatten/remove"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "cte2 selects directly from cte1 (linear chain)"
+          - "CTE defined but never referenced"
+      fix:
+        approach: ast_rewrite
+        output_templates:
+          - "inline trivial CTEs"
+          - "remove unused CTEs"
+      validate:
+        require_equivalence: true
+        caution:
+          - "don't flatten recursive/volatile/limit-without-order cases"
+
+    - id: QT-CTE-002
+      family: CTE_AND_COMMON_SUBEXPR
+      name: "CTE fence blocking predicate pushdown -> inline CTE or push filter into it"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "CTE used once + outer query has selective WHERE on its columns"
+      fix:
+        approach: llm_or_hybrid
+        requires_metadata:
+          - "engine_behavior_flags.cte_materialization_fence_possible"
+      validate:
+        require_equivalence: true
+        require_plan_delta: true
+
+    - id: QT-NULL-001
+      family: NULL_SEMANTICS_TRAPS
+      name: "NOT IN subquery (NULL trap) -> NOT EXISTS"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "WHERE a.key NOT IN (SELECT b.key ...)"
+      fix:
+        approach: ast_rewrite
+        output_templates:
+          - "WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.key = a.key AND ...)"
+      validate:
+        require_equivalence: true
+        note: "Preserves correct NULL semantics vs NOT IN."
+
+    - id: QT-PLAN-001
+      family: WINDOW_PLANNER_BLINDSPOTS
+      name: "Window blocks pushdown -> isolate filtered subset before window"
+      core: true
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "window function present + filter on partition/cluster key"
+      fix:
+        approach: llm_or_hybrid
+        output_templates:
+          - "SELECT ... FROM (SELECT * FROM T WHERE part_key=...) subset; then apply window"
+      validate:
+        require_equivalence: true
+        require_plan_delta: true
+
+    # ===================================
+    # Long tail (implement as many as you like)
+    # ===================================
+
+    - id: QT-SUBQ-003
+      family: SUBQUERY_DECORRELATION
+      name: "Correlated subquery in SELECT returning non-aggregate single value -> join with uniqueness proof"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "scalar subquery without aggregate but correlated on key"
+      fix:
+        approach: llm_rewrite
+        requires_metadata: ["unique_keys or one_to_one_relationship assertion"]
+      validate:
+        require_equivalence: true
+
+    - id: QT-SUBQ-004
+      family: SUBQUERY_DECORRELATION
+      name: "ANY/ALL correlated subquery -> rewrite to join + aggregate comparison"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "x op ANY(SELECT ... correlated)"
+          - "x op ALL(SELECT ... correlated)"
+      fix:
+        approach: llm_rewrite
+      validate:
+        require_equivalence: true
+
+    - id: QT-JOIN-003
+      family: JOIN_SEMI_ANTI
+      name: "Join only used for existence filter -> convert to SEMI-JOIN / EXISTS"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "selected columns never reference joined table"
+          - "join used only to restrict rows"
+      fix:
+        approach: hybrid
+        requires_metadata: ["foreign_keys preferred"]
+      validate:
+        require_equivalence: true
+
+    - id: QT-JOIN-004
+      family: JOIN_SEMI_ANTI
+      name: "Many-to-many join explosion -> pre-deduplicate join keys"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "join keys not unique on either side + downstream DISTINCT/GROUP BY to clean up"
+      fix:
+        approach: llm_rewrite
+      validate:
+        require_equivalence: true
+
+    - id: QT-AGG-004
+      family: AGG_PREAGG_AND_REDUCE
+      name: "COUNT(*) over join where join multiplies -> COUNT DISTINCT key or pre-agg"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "COUNT(*) with joins and no GROUP BY, suspicious"
+      fix:
+        approach: llm_rewrite
+      validate:
+        require_equivalence: true
+
+    - id: QT-AGG-005
+      family: AGG_PREAGG_AND_REDUCE
+      name: "HAVING filter that can be pushed to WHERE (non-aggregate predicate) -> push down"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "HAVING contains predicate on raw columns only"
+      fix:
+        approach: ast_rewrite
+      validate:
+        require_equivalence: true
+
+    - id: QT-AGG-006
+      family: AGG_PREAGG_AND_REDUCE
+      name: "DISTINCT + GROUP BY redundancy -> remove redundant layer"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "SELECT DISTINCT ... GROUP BY same columns"
+      fix:
+        approach: ast_rewrite
+      validate:
+        require_equivalence: true
+
+    - id: QT-FILT-003
+      family: FILTER_SARGABILITY
+      name: "LIKE '%prefix' leading wildcard -> suggest trigram/fulltext or rewrite (engine dependent)"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "LIKE pattern starts with wildcard"
+      fix:
+        approach: llm_suggestion_only
+      validate:
+        not_applicable: true
+
+    - id: QT-FILT-004
+      family: FILTER_SARGABILITY
+      name: "Implicit cast on join/filter column -> cast literal instead (preserve index usage)"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "CAST(col AS type)=literal OR col = CAST(literal AS coltype)"
+      fix:
+        approach: ast_rewrite
+      validate:
+        require_equivalence: true
+
+    - id: QT-BOOL-002
+      family: SET_OPS_AND_BOOLEAN_LOGIC
+      name: "De Morgan simplification + predicate normalization"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "NOT (A AND B) / NOT (A OR B)"
+      fix:
+        approach: ast_rewrite
+      validate:
+        require_equivalence: true
+
+    - id: QT-SET-001
+      family: SET_OPS_AND_BOOLEAN_LOGIC
+      name: "UNION where UNION ALL is safe -> switch"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "UNION used but branches provably disjoint (heuristic/metadata)"
+      fix:
+        approach: llm_or_hybrid
+      validate:
+        require_equivalence: true
+        require_disjointness_proof: true
+
+    - id: QT-CTE-003
+      family: CTE_AND_COMMON_SUBEXPR
+      name: "Repeated identical subquery blocks -> factor into single CTE"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "two subtrees structurally identical (sqlglot hash match)"
+      fix:
+        approach: ast_rewrite
+      validate:
+        require_equivalence: true
+
+    - id: QT-CTE-004
+      family: CTE_AND_COMMON_SUBEXPR
+      name: "Repeated scans of same base table with same filters -> factor and reuse"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "same FROM source repeated across UNION branches or joins"
+      fix:
+        approach: llm_or_hybrid
+      validate:
+        require_equivalence: true
+
+    - id: QT-NULL-002
+      family: NULL_SEMANTICS_TRAPS
+      name: "COALESCE in join predicate (null-equality) -> rewrite to (a=b OR (a IS NULL AND b IS NULL))"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "JOIN ON COALESCE(a,'x') = COALESCE(b,'x')"
+      fix:
+        approach: ast_rewrite
+      validate:
+        require_equivalence: true
+
+    - id: QT-NULL-003
+      family: NULL_SEMANTICS_TRAPS
+      name: "COUNT(col) vs COUNT(*) correctness trap -> normalize"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "COUNT(col) used where NULLs might be unintended"
+      fix:
+        approach: llm_assisted
+      validate:
+        require_intent: true
+
+    - id: QT-APPROX-001
+      family: SEMANTICS_TRADEOFFS_APPROX
+      name: "COUNT DISTINCT -> APPROX_COUNT_DISTINCT (opt-in)"
+      core: false
+      semantics_change: true
+      detect:
+        sqlglot_signals:
+          - "COUNT(DISTINCT x)"
+          - "large table heuristics from metadata"
+      fix:
+        approach: ast_rewrite
+        requires_flags: ["approx_ok=true"]
+      validate:
+        turbo_mode:
+          require_tolerance_contract: "relative_error <= configured"
+          require_trend_preservation_checks: true
+
+    - id: QT-APPROX-002
+      family: SEMANTICS_TRADEOFFS_APPROX
+      name: "Exact percentile/median -> approx quantile function (opt-in)"
+      core: false
+      semantics_change: true
+      detect:
+        sqlglot_signals:
+          - "PERCENTILE_CONT / exact median pattern"
+      fix:
+        approach: llm_rewrite
+        requires_flags: ["approx_ok=true"]
+      validate:
+        turbo_mode:
+          require_tolerance_contract: true
+
+    - id: QT-ENG-001
+      family: ENGINE_SPECIFIC_LORE
+      name: "Stats-missing sources (parquet/csv external) -> force early reduction (pre-filter/pre-agg)"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "FROM read_parquet/read_csv or external files"
+          - "3+ joins with external sources"
+      fix:
+        approach: llm_rewrite
+        strategies:
+          - "push selective filters into earliest possible subquery"
+          - "pre-aggregate before joining"
+      validate:
+        require_equivalence: true
+        require_plan_delta: true
+
+    - id: QT-ENG-002
+      family: ENGINE_SPECIFIC_LORE
+      name: "Join order hazard (small table filter should drive plan) -> rewrite with derived-table driving side"
+      core: false
+      semantics_change: false
+      detect:
+        sqlglot_signals:
+          - "high rowcount fact joined to tiny dim with selective predicate"
+      fix:
+        approach: llm_rewrite
+        output_templates:
+          - "WITH small AS (SELECT ... FROM dim WHERE ...) SELECT ... FROM small JOIN fact ..."
+      validate:
+        require_equivalence: true
+        require_plan_delta: true
+
+  validation_harness_contract:
+    # What your DuckDBHarness / Postgres/Databricks harness should enforce
+    run_steps:
+      - "compile original + rewrite"
+      - "EXPLAIN / EXPLAIN ANALYZE capture (rows, time, memory, spilled, join types)"
+      - "execute and compare results (checksum + rowcount), unless approx_ok"
+    reject_conditions:
+      - "plan did not materially change when rule expects plan_delta"
+      - "speedup < min_speedup_x"
+      - "result mismatch in safe_mode"
+      - "uses unsupported feature/hint in target engine"
+    allow_conditions:
+      - "turbo_mode + tolerance contract satisfied"
+
+  implementation_notes:
+    sqlglot_detector_design:
+      - "Each rule: detector(ast)-> features -> (ast_fix | llm_fix)"
+      - "Prefer AST rewrite when transformation is local + provably semantics-preserving."
+      - "Escalate to LLM when intent/constraints/engine-lore is required."
+    roadmap_hint:
+      - "Implement and benchmark the core 20 first; they typically dominate analytics workloads."
+      - "Add engine-specific lore rules behind feature flags; verify via harness."

@@ -12,6 +12,7 @@ import picocli.CommandLine.Option;
         subcommands = {
                 ManualCommand.class,
                 AutoCommand.class,
+                TpcdsBenchmarkCommand.class,
                 CommandLine.HelpCommand.class
         }
 )

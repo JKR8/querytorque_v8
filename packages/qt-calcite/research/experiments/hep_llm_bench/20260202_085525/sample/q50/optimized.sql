@@ -1,0 +1,11 @@
+SELECT store.s_store_name AS S_STORE_NAME, store.s_company_id AS S_COMPANY_ID, store.s_street_number AS S_STREET_NUMBER, store.s_street_name AS S_STREET_NAME, store.s_street_type AS S_STREET_TYPE, store.s_suite_number AS S_SUITE_NUMBER, store.s_city AS S_CITY, store.s_county AS S_COUNTY, store.s_state AS S_STATE, store.s_zip AS S_ZIP, SUM(CASE WHEN store_returns.sr_returned_date_sk - store_sales.ss_sold_date_sk <= 30 THEN 1 ELSE 0 END) AS 30 days, SUM(CASE WHEN store_returns.sr_returned_date_sk - store_sales.ss_sold_date_sk > 30 AND store_returns.sr_returned_date_sk - store_sales.ss_sold_date_sk <= 60 THEN 1 ELSE 0 END) AS 31-60 days, SUM(CASE WHEN store_returns.sr_returned_date_sk - store_sales.ss_sold_date_sk > 60 AND store_returns.sr_returned_date_sk - store_sales.ss_sold_date_sk <= 90 THEN 1 ELSE 0 END) AS 61-90 days, SUM(CASE WHEN store_returns.sr_returned_date_sk - store_sales.ss_sold_date_sk > 90 AND store_returns.sr_returned_date_sk - store_sales.ss_sold_date_sk <= 120 THEN 1 ELSE 0 END) AS 91-120 days, SUM(CASE WHEN store_returns.sr_returned_date_sk - store_sales.ss_sold_date_sk > 120 THEN 1 ELSE 0 END) AS >120 days
+FROM store_sales
+INNER JOIN store_returns ON store_sales.ss_ticket_number = store_returns.sr_ticket_number AND store_sales.ss_item_sk = store_returns.sr_item_sk AND store_sales.ss_customer_sk = store_returns.sr_customer_sk
+INNER JOIN store ON store_sales.ss_store_sk = store.s_store_sk
+INNER JOIN date_dim ON store_sales.ss_sold_date_sk = date_dim.d_date_sk
+INNER JOIN (SELECT *
+FROM date_dim
+WHERE d_year = 2001 AND d_moy = 8) AS t ON store_returns.sr_returned_date_sk = t.d_date_sk
+GROUP BY store.s_store_name, store.s_company_id, store.s_street_number, store.s_street_name, store.s_street_type, store.s_suite_number, store.s_city, store.s_county, store.s_state, store.s_zip
+ORDER BY store.s_store_name, store.s_company_id, store.s_street_number, store.s_street_name, store.s_street_type, store.s_suite_number, store.s_city, store.s_county, store.s_state, store.s_zip
+FETCH NEXT 100 ROWS ONLY

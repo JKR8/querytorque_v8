@@ -19,6 +19,39 @@ from pathlib import Path
 import dspy
 import yaml
 import json
+import time
+
+
+# ============================================================
+# Validation Result (Core QueryTorque Output)
+# ============================================================
+
+@dataclass
+class ValidationResult:
+    """Result of validating an optimized query against the original.
+
+    This is QueryTorque's core output - semantic correctness AND timing.
+    """
+    is_correct: bool
+    original_time_ms: float
+    optimized_time_ms: float
+    speedup: float
+    original_rows: int
+    optimized_rows: int
+    error: Optional[str] = None
+
+    @property
+    def is_regression(self) -> bool:
+        """True if optimized query is slower than original."""
+        return self.speedup < 1.0
+
+    def __str__(self) -> str:
+        if not self.is_correct:
+            return f"INVALID: {self.error}"
+        status = "REGRESSION" if self.is_regression else "IMPROVED"
+        return (f"{status}: {self.speedup:.2f}x speedup "
+                f"({self.original_time_ms:.1f}ms → {self.optimized_time_ms:.1f}ms, "
+                f"{self.original_rows} rows)")
 
 # DSPy 3.x removed Suggest/Assert - make it optional
 try:
@@ -591,6 +624,126 @@ def create_duckdb_validator_with_regression_guard(
     return validator
 
 
+def validate_optimization(
+    original_sql: str,
+    optimized_sql: str,
+    db_path: str,
+    benchmark_runs: int = 3
+) -> ValidationResult:
+    """Validate an optimized query and measure performance improvement.
+
+    This is QueryTorque's core validation - checks semantic correctness
+    AND measures actual speedup.
+
+    Args:
+        original_sql: The original SQL query
+        optimized_sql: The optimized SQL query
+        db_path: Path to DuckDB database
+        benchmark_runs: Number of benchmark runs (first is warmup)
+
+    Returns:
+        ValidationResult with correctness, timing, and speedup
+    """
+    import duckdb
+
+    try:
+        conn = duckdb.connect(db_path, read_only=True)
+
+        # Run original for correctness
+        try:
+            orig_result = conn.execute(original_sql).fetchall()
+        except Exception as e:
+            conn.close()
+            return ValidationResult(
+                is_correct=False,
+                original_time_ms=0,
+                optimized_time_ms=0,
+                speedup=0,
+                original_rows=0,
+                optimized_rows=0,
+                error=f"Original query error: {e}"
+            )
+
+        # Run optimized for correctness
+        try:
+            opt_result = conn.execute(optimized_sql).fetchall()
+        except Exception as e:
+            conn.close()
+            return ValidationResult(
+                is_correct=False,
+                original_time_ms=0,
+                optimized_time_ms=0,
+                speedup=0,
+                original_rows=len(orig_result),
+                optimized_rows=0,
+                error=f"Optimized query syntax error: {e}"
+            )
+
+        # Check semantic equivalence
+        orig_set = set(tuple(r) for r in orig_result)
+        opt_set = set(tuple(r) for r in opt_result)
+
+        if orig_set != opt_set:
+            conn.close()
+            missing = len(orig_set - opt_set)
+            extra = len(opt_set - orig_set)
+            return ValidationResult(
+                is_correct=False,
+                original_time_ms=0,
+                optimized_time_ms=0,
+                speedup=0,
+                original_rows=len(orig_result),
+                optimized_rows=len(opt_result),
+                error=f"Results differ: missing {missing} rows, extra {extra} rows"
+            )
+
+        # Benchmark timing
+        orig_times = []
+        opt_times = []
+
+        for _ in range(benchmark_runs):
+            start = time.perf_counter()
+            conn.execute(original_sql).fetchall()
+            orig_times.append((time.perf_counter() - start) * 1000)  # ms
+
+            start = time.perf_counter()
+            conn.execute(optimized_sql).fetchall()
+            opt_times.append((time.perf_counter() - start) * 1000)  # ms
+
+        conn.close()
+
+        # Average excluding first run (warmup)
+        if benchmark_runs > 1:
+            orig_avg = sum(orig_times[1:]) / (benchmark_runs - 1)
+            opt_avg = sum(opt_times[1:]) / (benchmark_runs - 1)
+        else:
+            orig_avg = orig_times[0]
+            opt_avg = opt_times[0]
+
+        speedup = orig_avg / opt_avg if opt_avg > 0 else 1.0
+
+        return ValidationResult(
+            is_correct=True,
+            original_time_ms=orig_avg,
+            optimized_time_ms=opt_avg,
+            speedup=speedup,
+            original_rows=len(orig_result),
+            optimized_rows=len(opt_result),
+            error=None
+        )
+
+    except Exception as e:
+        return ValidationResult(
+            is_correct=False,
+            original_time_ms=0,
+            optimized_time_ms=0,
+            speedup=0,
+            original_rows=0,
+            optimized_rows=0,
+            error=f"Validation error: {e}"
+        )
+
+
 def configure_lm(
     provider: str = "deepseek",
     model: Optional[str] = None,
@@ -944,6 +1097,30 @@ class DagOptimizationResult:
     error: Optional[str] = None
 
 
+def load_dag_gold_examples(num_examples: int = 3) -> List[dspy.Example]:
+    """Load DAG-format gold examples for few-shot learning.
+
+    Args:
+        num_examples: Number of examples to load (default 3)
+
+    Returns:
+        List of dspy.Example objects
+    """
+    try:
+        from research.knowledge_base.examples.dag_gold_examples import get_dag_gold_examples
+        return get_dag_gold_examples(num_examples)
+    except ImportError:
+        # Fall back to relative import
+        examples_path = get_config_dir() / "examples" / "dag_gold_examples.py"
+        if examples_path.exists():
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("dag_gold_examples", examples_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.get_dag_gold_examples(num_examples)
+        return []
+
+
 class DagOptimizationPipeline(dspy.Module):
     """DAG-based optimization pipeline with validation and retries.
 
@@ -952,6 +1129,7 @@ class DagOptimizationPipeline(dspy.Module):
     - Outputs node-level changes, not full SQL
     - Better for large queries (less token usage)
     - Preserves unchanged parts exactly
+    - Uses DAG-format few-shot examples for consistent output
     """
 
     def __init__(
@@ -960,6 +1138,8 @@ class DagOptimizationPipeline(dspy.Module):
         max_retries: int = 2,
         model_name: str = None,
         db_name: str = None,
+        use_few_shot: bool = True,
+        num_examples: int = 3,
     ):
         """
         Args:
@@ -967,6 +1147,8 @@ class DagOptimizationPipeline(dspy.Module):
             max_retries: Maximum retry attempts
             model_name: Model name for constraints
             db_name: Database name for hints
+            use_few_shot: Whether to use few-shot examples (default True)
+            num_examples: Number of few-shot examples to use (default 3)
         """
         super().__init__()
         self.optimizer = dspy.ChainOfThought(SQLDagOptimizer)
@@ -974,6 +1156,16 @@ class DagOptimizationPipeline(dspy.Module):
         self.validator_fn = validator_fn
         self.max_retries = max_retries
         self.constraints = build_system_prompt(model_name, db_name)
+
+        # Load DAG-format few-shot examples
+        if use_few_shot:
+            examples = load_dag_gold_examples(num_examples)
+            if examples:
+                # In DSPy 3.x, demos go on .predict.demos or .demos
+                if hasattr(self.optimizer, 'predict') and hasattr(self.optimizer.predict, 'demos'):
+                    self.optimizer.predict.demos = examples
+                elif hasattr(self.optimizer, 'demos'):
+                    self.optimizer.demos = examples
 
     def _parse_rewrites(self, rewrites_str: str) -> Dict[str, str]:
         """Parse rewrites JSON from LLM output."""

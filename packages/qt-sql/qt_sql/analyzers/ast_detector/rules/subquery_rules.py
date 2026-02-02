@@ -311,9 +311,9 @@ class ExistsWithSelectStarRule(ASTRule):
 
     rule_id = "SQL-SUB-006"
     name = "EXISTS with SELECT *"
-    severity = "low"
+    severity = "high"  # Promoted: 60% optimizer hit rate, triggers EXISTS conversion
     category = "subqueries"
-    penalty = 5
+    penalty = 15  # Directly actionable - EXISTS conversion optimization
     description = "EXISTS with SELECT * - use SELECT 1 for clarity"
     suggestion = "Use SELECT 1 in EXISTS for explicit intent"
 

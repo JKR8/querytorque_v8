@@ -177,13 +177,26 @@ public class VolcanoOptimizer {
 
     private String relToSql(RelNode relNode) {
         try {
+            org.apache.calcite.sql.SqlDialect dialect = new org.apache.calcite.sql.dialect.AnsiSqlDialect(
+                    org.apache.calcite.sql.SqlDialect.EMPTY_CONTEXT) {
+                @Override
+                public boolean supportsCharSet() {
+                    return false;
+                }
+
+                @Override
+                public boolean supportsNestedAggregations() {
+                    return false;
+                }
+            };
             org.apache.calcite.rel.rel2sql.RelToSqlConverter converter =
-                    new org.apache.calcite.rel.rel2sql.RelToSqlConverter(
-                            org.apache.calcite.sql.dialect.AnsiSqlDialect.DEFAULT);
+                    new org.apache.calcite.rel.rel2sql.RelToSqlConverter(dialect);
             org.apache.calcite.sql.SqlNode sqlNode = converter.visitRoot(relNode).asStatement();
-            return sqlNode.toSqlString(org.apache.calcite.sql.dialect.AnsiSqlDialect.DEFAULT)
+            return sqlNode.toSqlString(dialect)
                     .getSql()
-                    .replaceAll("\"?DUCKDB\"?\\.", "");
+                    .replaceAll("\"?DUCKDB\"?\\.", "")
+                    // DuckDB doesn't accept CHARACTER SET in CASTs; strip it.
+                    .replaceAll("(?i)\\s+character\\s+set\\s+[A-Za-z0-9_-]+", "");
         } catch (Exception e) {
             return "-- Error converting to SQL: " + e.getMessage();
         }

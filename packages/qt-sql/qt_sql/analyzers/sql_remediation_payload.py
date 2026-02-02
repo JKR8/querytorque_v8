@@ -18,7 +18,7 @@ from typing import Optional, Protocol, Any
 from abc import abstractmethod
 import json
 
-from ..parsers.sql_parser import SQLParser, QueryGraph
+from ..sql_parser import SQLParser, QueryGraph
 
 
 class DBConnection(Protocol):

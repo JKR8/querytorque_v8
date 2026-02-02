@@ -201,13 +201,84 @@ def audit(
         sys.exit(1)
 
 
+def _run_validation(
+    original_sql: str,
+    optimized_sql: str,
+    database: str,
+    mode: str,
+    console,
+    out_dir: Optional[Path] = None
+) -> bool:
+    """Run validation and display results. Returns True if passed."""
+    import json
+
+    console.print(f"\n[bold]Validating optimization ({mode} mode)...[/bold]")
+
+    try:
+        from qt_sql.validation import SQLValidator, ValidationMode, ValidationStatus
+
+        validation_mode = ValidationMode.FULL if mode == "full" else ValidationMode.SAMPLE
+
+        with SQLValidator(database=database, mode=validation_mode) as validator:
+            result = validator.validate(original_sql, optimized_sql)
+
+        # Save validation result
+        if out_dir:
+            validation_data = {
+                "status": result.status.value,
+                "speedup": result.speedup,
+                "mode": mode,
+                "row_counts_match": result.row_counts_match,
+                "values_match": result.values_match or result.checksum_match,
+                "original_timing_ms": result.original_timing_ms,
+                "optimized_timing_ms": result.optimized_timing_ms,
+                "original_row_count": result.original_row_count,
+                "optimized_row_count": result.optimized_row_count,
+                "errors": result.errors,
+                "warnings": result.warnings,
+            }
+            (out_dir / "validation.json").write_text(json.dumps(validation_data, indent=2))
+
+        # Display result
+        if result.status == ValidationStatus.PASS:
+            speedup_color = "green" if result.speedup >= 1.0 else "yellow"
+            console.print(Panel(
+                f"[bold green]PASSED[/bold green]\n"
+                f"Speedup: [{speedup_color}]{result.speedup:.2f}x[/{speedup_color}]\n"
+                f"Rows: {result.original_row_count} → {result.optimized_row_count}\n"
+                f"Time: {result.original_timing_ms:.1f}ms → {result.optimized_timing_ms:.1f}ms",
+                title="Validation Result",
+                border_style="green",
+            ))
+            return True
+        else:
+            console.print(Panel(
+                f"[bold red]FAILED[/bold red]\n"
+                f"Row match: {result.row_counts_match}\n"
+                f"Value match: {result.values_match or result.checksum_match}",
+                title="Validation Result",
+                border_style="red",
+            ))
+            for err in result.errors:
+                console.print(f"  [red]{err}[/red]")
+            return False
+
+    except ImportError as e:
+        console.print(f"[yellow]Validation skipped (module not available): {e}[/yellow]")
+        return False
+    except Exception as e:
+        console.print(f"[yellow]Validation failed: {e}[/yellow]")
+        return False
+
+
 @cli.command()
 @click.argument("file", type=click.Path(exists=True))
 @click.option("--dialect", default="duckdb", help="SQL dialect (duckdb, postgres, snowflake, generic)")
 @click.option("--database", "-d", type=click.Path(), help="DuckDB database path for schema/execution plan context")
 @click.option("--provider", default=None, help="LLM provider (anthropic, deepseek, openai, groq, gemini, openrouter)")
 @click.option("--model", default=None, help="LLM model name")
-@click.option("--output", "-o", type=click.Path(), help="Output file for optimized SQL")
+@click.option("--output-dir", "-o", type=click.Path(), help="Output directory (default: ./qt-output/<filename>/)")
+@click.option("--no-save", is_flag=True, help="Don't save output files")
 @click.option("--dry-run", is_flag=True, help="Show prompt without calling LLM")
 @click.option("--show-prompt", is_flag=True, help="Display the full prompt sent to LLM")
 @click.option(
@@ -217,40 +288,70 @@ def audit(
     help="Optimization mode: dag (default), full (full SQL), mcts (tree search)"
 )
 @click.option("--mcts-iterations", default=30, help="Maximum MCTS iterations (default: 30)")
+@click.option("--no-validate", is_flag=True, help="Skip validation after optimization")
+@click.option(
+    "--validate-mode",
+    type=click.Choice(["sample", "full"]),
+    default="full",
+    help="Validation mode when --database provided (default: full)"
+)
 def optimize(
     file: str,
     dialect: str,
     database: Optional[str],
     provider: Optional[str],
     model: Optional[str],
-    output: Optional[str],
+    output_dir: Optional[str],
+    no_save: bool,
     dry_run: bool,
     show_prompt: bool,
     mode: str,
     mcts_iterations: int,
+    no_validate: bool,
+    validate_mode: str,
 ):
     """Optimize SQL using LLM-powered analysis.
 
     Modes:
-    - dag-v2 (default): DAG-based node-level optimization with contracts
+    - dag (default): DAG-based node-level optimization with contracts
     - full: Full SQL replacement optimization
     - mcts: MCTS-guided tree search with validation
 
-    When a --database is provided, includes schema context and execution plan
-    in the prompt for better optimization recommendations.
+    Output files (saved to ./qt-output/<filename>/ by default):
+    - original.sql      The input SQL
+    - prompt.txt        Full prompt sent to LLM
+    - response.txt      Raw LLM response
+    - optimized.sql     Extracted optimized SQL
+    - validation.json   Validation results (if --database provided)
 
     Examples:
-        qt-sql optimize query.sql
-        qt-sql optimize query.sql --database /path/to/data.duckdb
-        qt-sql optimize query.sql -d mydata.duckdb --provider deepseek
-        qt-sql optimize query.sql -o optimized.sql --mode dag-v2
-        qt-sql optimize query.sql -d data.duckdb --mode mcts --mcts-iterations 30
+        qt-sql optimize query.sql -d data.duckdb
+        qt-sql optimize query.sql -d data.duckdb -o ./my-output/
+        qt-sql optimize query.sql -d data.duckdb --no-save
+        qt-sql optimize query.sql -d data.duckdb --validate-mode sample
     """
+    from datetime import datetime
+    import json
+
     try:
         sql = read_sql_file(file)
     except click.ClickException as e:
         console.print(f"[red]Error: {e.message}[/red]")
         sys.exit(1)
+
+    # Setup output directory
+    if no_save:
+        out_dir = None
+    else:
+        if output_dir:
+            out_dir = Path(output_dir)
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_stem = Path(file).stem
+            out_dir = Path("./qt-output") / f"{file_stem}_{timestamp}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Save original
+        (out_dir / "original.sql").write_text(sql, encoding="utf-8")
 
     # Run static analysis
     detector = SQLAntiPatternDetector(dialect=dialect)
@@ -260,6 +361,8 @@ def optimize(
     console.print(f"[dim]Dialect: {dialect}[/dim]")
     if database:
         console.print(f"[dim]Database: {database}[/dim]")
+    if out_dir:
+        console.print(f"[dim]Output: {out_dir}[/dim]")
     console.print()
 
     display_analysis_result(result, verbose=False)
@@ -398,9 +501,19 @@ Return your response as JSON:
                 console.print("\n[bold]Optimized SQL:[/bold]")
                 console.print(Syntax(mcts_result.optimized_sql, "sql", theme="monokai", line_numbers=True))
 
-                if output:
-                    Path(output).write_text(mcts_result.optimized_sql, encoding="utf-8")
-                    console.print(f"\n[green]Optimized SQL saved to: {output}[/green]")
+                # Save files
+                if out_dir:
+                    (out_dir / "optimized.sql").write_text(mcts_result.optimized_sql, encoding="utf-8")
+                    (out_dir / "validation.json").write_text(json.dumps({
+                        "status": "pass" if mcts_result.valid else "fail",
+                        "speedup": mcts_result.speedup,
+                        "method": mcts_result.method,
+                        "iterations": mcts_result.iterations,
+                        "elapsed_time": mcts_result.elapsed_time,
+                        "transforms_applied": mcts_result.transforms_applied,
+                        "tree_stats": mcts_result.tree_stats,
+                    }, indent=2), encoding="utf-8")
+                    console.print(f"\n[green]Files saved to: {out_dir}[/green]")
             else:
                 console.print("[yellow]No valid optimization found.[/yellow]")
 
@@ -418,8 +531,8 @@ Return your response as JSON:
 
         return
 
-    # DAG v2 optimization mode (default)
-    if mode == "dag-v2":
+    # DAG optimization mode (default)
+    if mode == "dag":
         try:
             from qt_sql.optimization.dag_v2 import DagV2Pipeline, get_dag_v2_examples
 
@@ -447,12 +560,18 @@ Return your response as JSON:
             base_prompt = pipeline.get_prompt()
             full_prompt = f"## Examples\n\n{few_shot}\n\n---\n\n## Your Task\n\n{base_prompt}"
 
+            # Save prompt
+            if out_dir:
+                (out_dir / "prompt.txt").write_text(full_prompt, encoding="utf-8")
+
             if show_prompt:
                 console.print("[bold]Full Prompt:[/bold]")
                 console.print(Panel(full_prompt, title="DAG v2 Prompt", border_style="dim"))
 
             if dry_run:
                 console.print("\n[yellow]Dry run mode - LLM call skipped.[/yellow]")
+                if out_dir:
+                    console.print(f"[dim]Prompt saved to: {out_dir / 'prompt.txt'}[/dim]")
                 return
 
             # Call LLM
@@ -469,15 +588,26 @@ Return your response as JSON:
             console.print("[bold]Requesting LLM optimization...[/bold]")
             response = llm_client.analyze(full_prompt)
 
+            # Save response
+            if out_dir:
+                (out_dir / "response.txt").write_text(response, encoding="utf-8")
+
             # Apply response to get optimized SQL
             optimized_sql = pipeline.apply_response(response)
 
-            console.print("\n[bold green]DAG v2 Optimization Result:[/bold green]")
+            # Save optimized SQL
+            if out_dir:
+                (out_dir / "optimized.sql").write_text(optimized_sql, encoding="utf-8")
+
+            console.print("\n[bold green]DAG Optimization Result:[/bold green]")
             console.print(Syntax(optimized_sql, "sql", theme="monokai", line_numbers=True))
 
-            if output:
-                Path(output).write_text(optimized_sql, encoding="utf-8")
-                console.print(f"\n[green]Optimized SQL saved to: {output}[/green]")
+            if out_dir:
+                console.print(f"\n[green]Files saved to: {out_dir}[/green]")
+
+            # Auto-validate if database provided
+            if database and not no_validate:
+                _run_validation(sql, optimized_sql, database, validate_mode, console, out_dir)
 
         except ImportError as e:
             console.print(f"[red]DAG v2 optimizer not available: {e}[/red]")
@@ -494,6 +624,10 @@ Return your response as JSON:
     if not issues and not database:
         console.print("\n[green]No issues found - query already looks optimal.[/green]")
         return
+
+    # Save prompt for full mode
+    if out_dir:
+        (out_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
     # Create LLM client for full mode
     try:
@@ -517,35 +651,43 @@ Return your response as JSON:
     try:
         response = llm_client.analyze(prompt)
 
+        # Save response
+        if out_dir:
+            (out_dir / "response.txt").write_text(response, encoding="utf-8")
+
         console.print("\n[bold green]LLM Optimization Result:[/bold green]")
         console.print(Markdown(response))
 
-        # Extract optimized SQL if output file requested
-        if output:
-            import re
-            # Try JSON format first
-            import json
-            try:
-                # Find JSON in response
-                json_match = re.search(r'\{[^{}]*"optimized_sql"[^{}]*\}', response, re.DOTALL)
-                if json_match:
-                    parsed = json.loads(json_match.group())
-                    optimized_sql = parsed.get("optimized_sql", "").strip()
-                    if optimized_sql:
-                        Path(output).write_text(optimized_sql, encoding="utf-8")
-                        console.print(f"\n[green]Optimized SQL saved to: {output}[/green]")
-                        return
-            except (json.JSONDecodeError, AttributeError):
-                pass
+        # Extract optimized SQL from response
+        import re
+        optimized_sql = None
 
-            # Fallback to markdown code block
+        # Try JSON format first
+        try:
+            json_match = re.search(r'\{[^{}]*"optimized_sql"[^{}]*\}', response, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
+                optimized_sql = parsed.get("optimized_sql", "").strip()
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        # Fallback to markdown code block
+        if not optimized_sql:
             sql_match = re.search(r"```sql\s*(.*?)\s*```", response, re.DOTALL)
             if sql_match:
                 optimized_sql = sql_match.group(1).strip()
-                Path(output).write_text(optimized_sql, encoding="utf-8")
-                console.print(f"\n[green]Optimized SQL saved to: {output}[/green]")
-            else:
-                console.print("[yellow]Could not extract optimized SQL from response.[/yellow]")
+
+        if optimized_sql:
+            # Save optimized SQL
+            if out_dir:
+                (out_dir / "optimized.sql").write_text(optimized_sql, encoding="utf-8")
+                console.print(f"\n[green]Files saved to: {out_dir}[/green]")
+
+            # Auto-validate if database provided
+            if database and not no_validate:
+                _run_validation(sql, optimized_sql, database, validate_mode, console, out_dir)
+        else:
+            console.print("[yellow]Could not extract optimized SQL from response.[/yellow]")
 
     except Exception as e:
         console.print(f"[red]LLM optimization failed: {e}[/red]")
@@ -767,6 +909,311 @@ def validate(
     else:
         console.print("\n[red]Validation failed.[/red]")
         sys.exit(1)
+
+
+@cli.command()
+@click.argument("input_dir", type=click.Path(exists=True))
+@click.option("--database", "-d", required=True, type=click.Path(exists=True), help="DuckDB database path")
+@click.option("--output", "-o", type=click.Path(), help="Output directory for results")
+@click.option("--provider", default=None, help="LLM provider (anthropic, deepseek, openai, groq, gemini, openrouter)")
+@click.option("--model", default=None, help="LLM model name")
+@click.option("--pattern", default="*.sql", help="Glob pattern for SQL files (default: *.sql)")
+@click.option(
+    "--mode",
+    type=click.Choice(["sample", "full"]),
+    default="full",
+    help="Validation mode: sample (1%% DB) or full (default)"
+)
+@click.option("--parallel", "-p", type=int, default=10, help="Max parallel API calls (default: 10)")
+@click.option("--skip-optimize", is_flag=True, help="Skip optimization, just run validation on existing files")
+@click.option("--json", "output_json", is_flag=True, help="Output final report as JSON")
+def batch(
+    input_dir: str,
+    database: str,
+    output: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    pattern: str,
+    mode: str,
+    parallel: int,
+    skip_optimize: bool,
+    output_json: bool,
+):
+    """Batch optimize and validate multiple SQL files.
+
+    Fires all LLM optimization calls in parallel, then runs validation
+    sequentially on the database (to avoid resource contention).
+
+    Input can be:
+    - Directory with SQL files (uses --pattern to filter)
+    - Results from previous batch run (with --skip-optimize)
+
+    Examples:
+        qt-sql batch /path/to/queries -d data.duckdb
+        qt-sql batch ./queries -d data.duckdb --mode sample --parallel 20
+        qt-sql batch ./queries -d data.duckdb --provider openrouter --model moonshotai/kimi-k2.5
+        qt-sql batch ./results -d data.duckdb --skip-optimize  # Re-validate existing results
+    """
+    import glob
+    import json
+    import time
+    import traceback
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from dataclasses import dataclass, asdict, field
+    from datetime import datetime
+    from typing import List, Dict, Any
+
+    @dataclass
+    class BatchResult:
+        """Result for a single query in batch."""
+        name: str
+        status: str  # success, failed, error, skipped
+        original_sql: str = ""
+        optimized_sql: str = ""
+        speedup: float = 0.0
+        validation_passed: bool = False
+        error: Optional[str] = None
+        optimize_latency_ms: float = 0
+        validate_latency_ms: float = 0
+
+        def to_dict(self) -> dict:
+            return asdict(self)
+
+    # Setup paths
+    input_path = Path(input_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = Path(output) if output else input_path / f"batch_results_{timestamp}"
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Find SQL files
+    sql_files = sorted(input_path.glob(pattern))
+    if not sql_files:
+        console.print(f"[red]No SQL files found matching {pattern} in {input_dir}[/red]")
+        sys.exit(1)
+
+    console.print(f"\n[bold]Batch Optimization & Validation[/bold]")
+    console.print(f"Input: {input_dir} ({len(sql_files)} files)")
+    console.print(f"Database: {database}")
+    console.print(f"Mode: {mode}")
+    console.print(f"Output: {output_path}")
+    if not skip_optimize:
+        console.print(f"Parallel API calls: {parallel}")
+    console.print()
+
+    results: List[BatchResult] = []
+
+    # Phase 1: Parallel LLM optimization
+    if not skip_optimize:
+        console.print("[bold]Phase 1: Optimizing (parallel API calls)...[/bold]")
+
+        try:
+            from qt_shared.llm import create_llm_client
+            from qt_sql.optimization.dag_v2 import DagV2Pipeline, get_dag_v2_examples
+
+            llm_client = create_llm_client(provider=provider, model=model)
+            if llm_client is None:
+                console.print("[red]No LLM provider configured.[/red]")
+                sys.exit(1)
+
+        except ImportError as e:
+            console.print(f"[red]Required modules not available: {e}[/red]")
+            sys.exit(1)
+
+        def optimize_one(sql_file: Path) -> BatchResult:
+            """Optimize a single SQL file."""
+            name = sql_file.stem
+            result = BatchResult(name=name, status="pending")
+
+            try:
+                sql = sql_file.read_text(encoding="utf-8")
+                result.original_sql = sql
+
+                # Build DAG pipeline
+                pipeline = DagV2Pipeline(sql)
+
+                # Build prompt with few-shot examples
+                examples = get_dag_v2_examples()
+                few_shot_parts = []
+                for ex in examples[:2]:
+                    few_shot_parts.append(f"### Example: {ex['opportunity']}")
+                    few_shot_parts.append(f"Input:\n{ex['input_slice']}")
+                    few_shot_parts.append(f"Output:\n```json\n{json.dumps(ex['output'], indent=2)}\n```")
+                    if 'key_insight' in ex:
+                        few_shot_parts.append(f"Key insight: {ex['key_insight']}")
+                    few_shot_parts.append("")
+
+                few_shot = "\n".join(few_shot_parts)
+                base_prompt = pipeline.get_prompt()
+                full_prompt = f"## Examples\n\n{few_shot}\n\n---\n\n## Your Task\n\n{base_prompt}"
+
+                # Call LLM
+                start = time.perf_counter()
+                response = llm_client.analyze(full_prompt)
+                result.optimize_latency_ms = (time.perf_counter() - start) * 1000
+
+                # Apply response
+                optimized_sql = pipeline.apply_response(response)
+                result.optimized_sql = optimized_sql
+                result.status = "optimized"
+
+                # Save files
+                query_dir = output_path / name
+                query_dir.mkdir(exist_ok=True)
+                (query_dir / "original.sql").write_text(sql)
+                (query_dir / "optimized.sql").write_text(optimized_sql)
+                (query_dir / "llm_response.txt").write_text(response)
+
+            except Exception as e:
+                result.status = "error"
+                result.error = f"{type(e).__name__}: {str(e)}"
+
+            return result
+
+        # Fire parallel optimization
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = {executor.submit(optimize_one, f): f for f in sql_files}
+
+            for future in as_completed(futures):
+                sql_file = futures[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    status_char = "✓" if result.status == "optimized" else "✗"
+                    console.print(f"  {result.name}: {status_char} ({result.optimize_latency_ms:.0f}ms)")
+                except Exception as e:
+                    console.print(f"  {sql_file.stem}: [red]EXCEPTION ({e})[/red]")
+                    results.append(BatchResult(
+                        name=sql_file.stem,
+                        status="error",
+                        error=str(e)
+                    ))
+
+        results.sort(key=lambda r: r.name)
+        optimized_count = len([r for r in results if r.status == "optimized"])
+        console.print(f"\n  Optimized: {optimized_count}/{len(results)}")
+
+    else:
+        # Load existing results for validation
+        console.print("[bold]Phase 1: Loading existing optimizations...[/bold]")
+        for sql_file in sql_files:
+            name = sql_file.stem
+            query_dir = input_path / name
+            if query_dir.is_dir():
+                orig_file = query_dir / "original.sql"
+                opt_file = query_dir / "optimized.sql"
+                if orig_file.exists() and opt_file.exists():
+                    results.append(BatchResult(
+                        name=name,
+                        status="optimized",
+                        original_sql=orig_file.read_text(),
+                        optimized_sql=opt_file.read_text(),
+                    ))
+                    console.print(f"  {name}: loaded")
+                else:
+                    console.print(f"  {name}: [yellow]missing files[/yellow]")
+            else:
+                # Single file, no optimized version
+                console.print(f"  {name}: [yellow]no optimized version[/yellow]")
+
+    # Phase 2: Sequential validation
+    console.print(f"\n[bold]Phase 2: Validating (sequential on {mode} DB)...[/bold]")
+
+    optimized_results = [r for r in results if r.status == "optimized"]
+    if not optimized_results:
+        console.print("[yellow]No optimized queries to validate.[/yellow]")
+    else:
+        try:
+            from qt_sql.validation import SQLValidator, ValidationMode, ValidationStatus
+
+            validation_mode = ValidationMode.FULL if mode == "full" else ValidationMode.SAMPLE
+
+            with SQLValidator(database=database, mode=validation_mode) as validator:
+                for result in optimized_results:
+                    try:
+                        start = time.perf_counter()
+                        val_result = validator.validate(
+                            result.original_sql,
+                            result.optimized_sql,
+                        )
+                        result.validate_latency_ms = (time.perf_counter() - start) * 1000
+                        result.speedup = val_result.speedup
+                        result.validation_passed = val_result.status == ValidationStatus.PASS
+
+                        if result.validation_passed:
+                            result.status = "success"
+                            status_str = f"[green]✓ {result.speedup:.2f}x[/green]"
+                        else:
+                            result.status = "failed"
+                            status_str = f"[red]✗ validation failed[/red]"
+
+                        console.print(f"  {result.name}: {status_str} ({result.validate_latency_ms/1000:.1f}s)")
+
+                        # Save validation result
+                        query_dir = output_path / result.name
+                        query_dir.mkdir(exist_ok=True)
+                        (query_dir / "validation.json").write_text(json.dumps({
+                            "status": result.status,
+                            "speedup": result.speedup,
+                            "validation_passed": result.validation_passed,
+                            "mode": mode,
+                        }, indent=2))
+
+                    except Exception as e:
+                        result.status = "error"
+                        result.error = f"Validation error: {e}"
+                        console.print(f"  {result.name}: [red]ERROR ({e})[/red]")
+
+        except ImportError as e:
+            console.print(f"[red]Validation module not available: {e}[/red]")
+
+    # Summary report
+    console.print(f"\n[bold]{'='*60}[/bold]")
+    console.print("[bold]Summary[/bold]")
+
+    success = [r for r in results if r.status == "success"]
+    failed = [r for r in results if r.status == "failed"]
+    errors = [r for r in results if r.status == "error"]
+
+    console.print(f"  Total: {len(results)}")
+    console.print(f"  [green]Passed: {len(success)}[/green]")
+    console.print(f"  [red]Failed: {len(failed)}[/red]")
+    console.print(f"  [yellow]Errors: {len(errors)}[/yellow]")
+
+    if success:
+        speedups = [r.speedup for r in success]
+        avg_speedup = sum(speedups) / len(speedups)
+        wins = [r for r in success if r.speedup >= 1.2]
+        regressions = [r for r in success if r.speedup < 1.0]
+        console.print(f"\n  Avg speedup: {avg_speedup:.2f}x")
+        console.print(f"  Wins (>=1.2x): {len(wins)}")
+        console.print(f"  Regressions (<1.0x): {len(regressions)}")
+
+        if wins:
+            console.print("\n  [bold]Top wins:[/bold]")
+            top_wins = sorted(wins, key=lambda r: r.speedup, reverse=True)[:10]
+            for r in top_wins:
+                console.print(f"    {r.name}: {r.speedup:.2f}x")
+
+    # Save final report
+    report = {
+        "timestamp": timestamp,
+        "input_dir": str(input_dir),
+        "database": str(database),
+        "mode": mode,
+        "total": len(results),
+        "success": len(success),
+        "failed": len(failed),
+        "errors": len(errors),
+        "avg_speedup": sum(r.speedup for r in success) / len(success) if success else 0,
+        "results": [r.to_dict() for r in results],
+    }
+
+    report_file = output_path / "report.json"
+    report_file.write_text(json.dumps(report, indent=2))
+    console.print(f"\n  Report saved: {report_file}")
+
+    if output_json:
+        console.print_json(json.dumps(report))
 
 
 def main():

@@ -36,6 +36,7 @@ from .vpax_differ import (
     VPAXDiffResult,
     DiffReportGenerator,
 )
+from .pbip_analyzer import PBIPReportGenerator
 
 __all__ = [
     # VPAX Analyzer
@@ -66,4 +67,5 @@ __all__ = [
     "VPAXDiffer",
     "VPAXDiffResult",
     "DiffReportGenerator",
+    "PBIPReportGenerator",
 ]

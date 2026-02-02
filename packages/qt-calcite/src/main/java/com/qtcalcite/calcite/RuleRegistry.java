@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.qtcalcite.rules.FkJoinEliminationRule;
 import com.qtcalcite.rules.GroupedTopNToLateralRule;
 import org.apache.calcite.rel.rules.CoreRules;
 
@@ -141,6 +142,7 @@ public class RuleRegistry {
 
         // ==================== CUSTOM RULES (QTCalcite) ====================
         rules.put("GROUPED_TOPN_TO_LATERAL", GroupedTopNToLateralRule.INSTANCE);
+        rules.put("FK_JOIN_ELIMINATION", FkJoinEliminationRule.INSTANCE);
 
         // ==================== JOIN RULES ====================
         rules.put("JOIN_ASSOCIATE", CoreRules.JOIN_ASSOCIATE);

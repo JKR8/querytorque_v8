@@ -192,9 +192,299 @@ anti_patterns:
       This adds overhead without benefit.
     why_it_fails: Filter already exists via join
 
+  - id: decorrelate
+    name: Decorrelation (Correlated Subquery to CTE)
+    speedup: "2.8x"
+    tier: consistent_winner
+    description: >
+      Convert correlated subqueries to pre-computed CTEs with GROUP BY.
+      When a subquery references the outer table (correlation), it runs once
+      per row. Pre-computing the aggregate eliminates repeated execution.
+    detection:
+      - Correlated subquery in WHERE clause
+      - Subquery contains AVG, SUM, COUNT, MAX, MIN
+      - Correlation on a grouping key (e.g., store_sk, customer_sk)
+    fix: >
+      1. Extract correlated subquery to a CTE
+      2. GROUP BY the correlation column
+      3. JOIN the CTE instead of using subquery
+    example_query: q1
+    example_before: |
+      SELECT c_customer_id
+      FROM customer_total_return ctr1, customer c
+      WHERE ctr1.ctr_total_return > (
+        SELECT AVG(ctr_total_return) * 1.2
+        FROM customer_total_return ctr2
+        WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk  -- CORRELATED
+      )
+    example_after: |
+      WITH store_avg_return AS (
+        SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return
+        FROM customer_total_return
+        GROUP BY ctr_store_sk
+      )
+      SELECT c_customer_id
+      FROM customer_total_return ctr1
+      JOIN store_avg_return sar ON ctr1.ctr_store_sk = sar.ctr_store_sk
+      JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk
+      WHERE ctr1.ctr_total_return > sar.avg_return
+    verified_on: TPC-DS SF100 Full DB
+    verified_queries: [Q1]
+    kimi_speedup: 2.81x
+    deepseek_speedup: 1.35x
+
+  - id: or_to_union
+    name: OR to UNION ALL
+    speedup: "2.7x"
+    tier: consistent_winner
+    description: >
+      Split OR conditions on different columns into UNION ALL branches.
+      Each branch can use different indexes/partitions independently.
+      Only valid when predicates are disjoint (no overlap).
+    detection:
+      - OR condition with predicates on different columns
+      - Each predicate could use a different index
+      - No overlap between predicate sets
+    fix: >
+      1. Create separate SELECT for each OR branch
+      2. Combine with UNION ALL (not UNION - we want all rows)
+      3. Apply common filters (like date) to each branch
+    example_query: q15
+    example_before: |
+      SELECT ca_zip, SUM(cs_sales_price)
+      FROM catalog_sales, customer_address
+      WHERE (substr(ca_zip,1,5) IN ('85669','86197')
+             OR ca_state IN ('CA','WA','GA')
+             OR cs_sales_price > 500)
+      GROUP BY ca_zip
+    example_after: |
+      WITH filtered_sales AS (
+        SELECT ca_zip, cs_sales_price FROM catalog_sales, customer_address
+        WHERE substr(ca_zip,1,5) IN ('85669','86197')
+        UNION ALL
+        SELECT ca_zip, cs_sales_price FROM catalog_sales, customer_address
+        WHERE ca_state IN ('CA','WA','GA')
+        UNION ALL
+        SELECT ca_zip, cs_sales_price FROM catalog_sales, customer_address
+        WHERE cs_sales_price > 500
+      )
+      SELECT ca_zip, SUM(cs_sales_price) FROM filtered_sales GROUP BY ca_zip
+    critical_note: >
+      Only use when predicates are DISJOINT. If rows can match multiple
+      conditions, UNION ALL will create duplicates. Check for overlap first.
+    verified_on: TPC-DS SF100 Full DB
+    verified_queries: [Q15]
+    kimi_speedup: 2.67x
+    deepseek_speedup: 2.98x
+
+  - id: early_dimension_filter
+    name: Early Dimension Filter
+    speedup: "2.7x"
+    tier: consistent_winner
+    description: >
+      Filter dimension tables BEFORE joining to fact tables.
+      Push highly selective dimension filters into a CTE that joins
+      to the fact table early, reducing rows before expensive operations.
+    detection:
+      - Small dimension table with selective filter
+      - Dimension joined to large fact table
+      - Filter applied after fact table scan
+    fix: >
+      1. Create CTE that filters dimension table first
+      2. Join filtered dimension to fact table
+      3. Reduces fact table rows before aggregation/joins
+    example_query: q93
+    example_before: |
+      SELECT ss_customer_sk, SUM(act_sales)
+      FROM store_sales ss
+      LEFT JOIN store_returns sr ON ss.ss_item_sk = sr.sr_item_sk
+      JOIN reason r ON sr.sr_reason_sk = r.r_reason_sk
+      WHERE r.r_reason_desc = 'duplicate purchase'
+      GROUP BY ss_customer_sk
+    example_after: |
+      WITH filtered_reason AS (
+        SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'
+      ),
+      filtered_returns AS (
+        SELECT sr_item_sk, sr_ticket_number, sr_return_quantity
+        FROM store_returns
+        JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+      )
+      SELECT ss_customer_sk, SUM(act_sales)
+      FROM store_sales ss
+      JOIN filtered_returns fr ON ss.ss_item_sk = fr.sr_item_sk
+      GROUP BY ss_customer_sk
+    verified_on: TPC-DS SF100 Full DB
+    verified_queries: [Q93, Q90]
+    kimi_speedup: 2.71x
+
+  - id: self_join_filter_pushdown
+    name: Self-Join Filter Pushdown
+    speedup: "1.4x"
+    tier: hidden_gem
+    description: >
+      When CTE is self-joined with different filters (e.g., month=1 vs month=2),
+      push the union of filters into the CTE definition.
+    detection:
+      - CTE used multiple times with different filter values
+      - Self-join pattern: FROM cte c1, cte c2 WHERE c1.x=1 AND c2.x=2
+    fix: >
+      Add filter to CTE: WHERE x IN (1, 2)
+      This prevents computing unused data.
+    example_query: q74
+    example_before: |
+      WITH yearly_sales AS (
+        SELECT customer_sk, year, SUM(sales) FROM fact GROUP BY customer_sk, year
+      )
+      SELECT * FROM yearly_sales y1, yearly_sales y2
+      WHERE y1.year = 2000 AND y2.year = 2001
+    example_after: |
+      WITH yearly_sales AS (
+        SELECT customer_sk, year, SUM(sales) FROM fact
+        WHERE year IN (2000, 2001)  -- PUSHED DOWN
+        GROUP BY customer_sk, year
+      )
+      SELECT * FROM yearly_sales y1, yearly_sales y2
+      WHERE y1.year = 2000 AND y2.year = 2001
+    verified_on: TPC-DS SF100 Full DB
+    verified_queries: [Q74, Q39]
+    kimi_speedup: 1.42x
+
+  - id: projection_pruning
+    name: Projection Pruning
+    speedup: "1.2x"
+    tier: hidden_gem
+    description: >
+      Remove unused columns from intermediate CTEs.
+      Especially impactful for wide fact tables with many columns.
+    detection:
+      - CTE selects columns not used by downstream queries
+      - Wide tables (>20 columns)
+      - Column only used for join, not in final output
+    fix: >
+      Only SELECT columns actually needed by downstream queries.
+      Remove columns used only for intermediate joins.
+    verified_on: TPC-DS SF100 Full DB
+    verified_queries: [Q78, Q80]
+    kimi_speedup: 1.21x
+
+# Verified query results (Full DB is what matters)
+verified_queries:
+  top_performers:
+    description: Queries with significant speedup on full TPC-DS SF100.
+    queries:
+      - id: Q1
+        speedup: 2.81x
+        pattern: decorrelate
+        model: kimi
+      - id: Q93
+        speedup: 2.71x
+        pattern: early_dimension_filter
+        model: kimi
+      - id: Q15
+        speedup: 2.67x
+        pattern: or_to_union
+        model: kimi
+      - id: Q90
+        speedup: 1.84x
+        pattern: early_dimension_filter
+        model: kimi
+      - id: Q74
+        speedup: 1.42x
+        pattern: self_join_filter_pushdown
+        model: kimi
+      - id: Q95
+        speedup: 1.36x
+        pattern: early_filter
+        model: kimi
+
+  scale_dependent:
+    description: >
+      Queries where optimization benefits grow with data size.
+      May show modest improvement on sample but significant on full DB.
+    queries:
+      - id: Q73
+        speedup: 1.24x
+        pattern: pushdown
+        note: Date range filter more impactful at scale
+      - id: Q80
+        speedup: 1.24x
+        pattern: early_filter
+        note: Store returns filter more selective at scale
+      - id: Q27
+        speedup: 1.23x
+        pattern: state_filter_pushdown
+        note: State filter eliminates more rows at scale
+      - id: Q78
+        speedup: 1.21x
+        pattern: projection_pruning
+        note: Column reduction saves more I/O at scale
+
+  unreliable:
+    description: >
+      Queries that regressed or showed no improvement on full DB.
+      Don't trust these patterns.
+    queries:
+      - id: Q28
+        speedup: 1.00x
+      - id: Q62
+        speedup: 0.99x
+      - id: Q66
+        speedup: 0.86x
+      - id: Q84
+        speedup: 0.94x
+
+anti_patterns:
+  - id: add_filter_to_alltime
+    name: Add Filter to "All-Time" CTE
+    description: >
+      Don't add year filters to CTEs that intentionally aggregate all-time data.
+      Some queries compare filtered data to all-time totals; adding a filter
+      would change the semantics.
+    why_it_fails: May be intentional (comparing periods)
+
+  - id: remove_join_without_null_check
+    name: Remove Join Without IS NOT NULL
+    description: >
+      Don't remove a join without adding IS NOT NULL.
+      The join implicitly filters NULL foreign keys.
+    why_it_fails: Changes results (NULLs included)
+
+  - id: add_redundant_in_subquery
+    name: Add Redundant IN Subquery
+    description: >
+      Don't add an IN subquery filter if the filter already exists via join.
+      This adds overhead without benefit.
+    why_it_fails: Filter already exists via join
+
+  - id: over_decompose_simple_queries
+    name: Over-Decompose Simple Queries
+    description: >
+      Don't add CTEs to queries under 5 lines or simple single-table queries.
+      CTE materialization has overhead that may exceed benefit.
+    why_it_fails: CTE overhead > benefit
+    examples: [Q32, Q34, Q61]
+
+  - id: or_to_union_with_overlap
+    name: OR to UNION with Overlapping Predicates
+    description: >
+      Don't use UNION ALL when OR predicates can match the same rows.
+      This creates duplicate rows in the result.
+    why_it_fails: Creates duplicate rows
+    examples: [Q7, Q26]
+
+  - id: in_to_exists_small_set
+    name: IN to EXISTS on Small Sets
+    description: >
+      Don't convert IN to EXISTS when the subquery returns <1000 rows.
+      EXISTS overhead not worth it for small sets.
+    why_it_fails: EXISTS overhead exceeds benefit
+    examples: [Q41]
+
 metadata:
-  version: "1.0"
-  last_updated: "2025-02-01"
+  version: "2.0"
+  last_updated: "2026-02-02"
   benchmark: TPC-DS SF100
   benchmark_db: DuckDB
   benchmark_size: "~28GB"
+  models_tested: [deepseek_v3, kimi_k2.5]

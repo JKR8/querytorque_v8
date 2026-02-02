@@ -42,6 +42,11 @@ public class ManualCommand implements Callable<Integer> {
     @Option(names = {"--prompt-only"}, description = "Only output the prompt, don't wait for response")
     private boolean promptOnly;
 
+    @Option(names = {"--rules"}, description = "Comma-separated rule names to apply (skip prompt)")
+    private String rulesInput;
+
+    @Option(names = {"--show-plan"}, description = "Show Calcite original and optimized plans")
+    private boolean showPlan;
     @Override
     public Integer call() {
         try {
@@ -75,13 +80,18 @@ public class ManualCommand implements Callable<Integer> {
                     return 0;
                 }
 
-                // Wait for user to paste LLM response
-                System.out.println("\nPaste LLM response (rules to apply), then press Enter twice:");
-                String response = readMultiLineInput();
+                String response;
+                if (rulesInput != null && !rulesInput.trim().isEmpty()) {
+                    response = rulesInput;
+                } else {
+                    // Wait for user to paste LLM response
+                    System.out.println("\nPaste LLM response (rules to apply), then press Enter twice:");
+                    response = readMultiLineInput();
 
-                if (response.trim().isEmpty()) {
-                    System.err.println("No response provided. Exiting.");
-                    return 1;
+                    if (response.trim().isEmpty()) {
+                        System.err.println("No response provided. Exiting.");
+                        return 1;
+                    }
                 }
 
                 // Parse rules from response
@@ -108,6 +118,16 @@ public class ManualCommand implements Callable<Integer> {
                 System.out.println("OPTIMIZATION RESULT");
                 System.out.println("=".repeat(60));
                 System.out.println(result.formatSummary());
+
+                if (showPlan) {
+                    System.out.println("\n" + "=".repeat(60));
+                    System.out.println("CALCITE PLANS");
+                    System.out.println("=".repeat(60));
+                    System.out.println("\n--- ORIGINAL PLAN ---");
+                    System.out.println(result.getOriginalPlan());
+                    System.out.println("\n--- OPTIMIZED PLAN ---");
+                    System.out.println(result.getOptimizedPlan());
+                }
 
                 if (dryRun) {
                     System.out.println("(Dry run - not executing query)");

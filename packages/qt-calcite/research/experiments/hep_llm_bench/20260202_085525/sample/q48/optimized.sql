@@ -1,0 +1,8 @@
+SELECT SUM(store_sales.ss_quantity)
+FROM store_sales
+INNER JOIN store ON store_sales.ss_store_sk = store.s_store_sk
+INNER JOIN customer_demographics ON store_sales.ss_cdemo_sk = customer_demographics.cd_demo_sk AND customer_demographics.cd_marital_status = 'M' AND customer_demographics.cd_education_status = '4 yr Degree' AND (store_sales.ss_sales_price >= 100.00 AND store_sales.ss_sales_price <= 150.00) OR store_sales.ss_cdemo_sk = customer_demographics.cd_demo_sk AND customer_demographics.cd_marital_status = 'D' AND customer_demographics.cd_education_status = '2 yr Degree' AND (store_sales.ss_sales_price >= 50.00 AND store_sales.ss_sales_price <= 100.00) OR store_sales.ss_cdemo_sk = customer_demographics.cd_demo_sk AND customer_demographics.cd_marital_status = 'S' AND customer_demographics.cd_education_status = 'College' AND (store_sales.ss_sales_price >= 150.00 AND store_sales.ss_sales_price <= 200.00)
+INNER JOIN customer_address ON store_sales.ss_addr_sk = customer_address.ca_address_sk AND customer_address.ca_country = 'United States' AND customer_address.ca_state IN ('CO', 'OH', 'TX') AND (store_sales.ss_net_profit >= 0 AND store_sales.ss_net_profit <= 2000) OR store_sales.ss_addr_sk = customer_address.ca_address_sk AND customer_address.ca_country = 'United States' AND customer_address.ca_state IN ('KY', 'MN', 'OR') AND (store_sales.ss_net_profit >= 150 AND store_sales.ss_net_profit <= 3000) OR store_sales.ss_addr_sk = customer_address.ca_address_sk AND customer_address.ca_country = 'United States' AND customer_address.ca_state IN ('CA', 'MS', 'VA') AND (store_sales.ss_net_profit >= 50 AND store_sales.ss_net_profit <= 25000)
+INNER JOIN (SELECT *
+FROM date_dim
+WHERE d_year = 2000) AS t ON store_sales.ss_sold_date_sk = t.d_date_sk

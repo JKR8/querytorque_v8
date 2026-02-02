@@ -826,7 +826,11 @@ class DagV2Pipeline:
 def get_dag_v2_examples() -> List[dict]:
     """Get verified gold examples for DAG v2 format.
 
-    Uses Q1 (2.90x), Q15 (2.98x), Q39 (2.44x) - all VERIFIED on SF100.
+    Updated 2026-02-02 with Kimi K2.5 Full DB validated results:
+    - Q1: 2.81x (decorrelate) - CONSISTENT WINNER
+    - Q15: 2.67x (or_to_union) - CONSISTENT WINNER
+    - Q93: 2.71x (early_filter) - CONSISTENT WINNER
+    - Q39: 2.44x (pushdown) - DeepSeek verified
     """
     return [
         # Q1 - Correlated Subquery -> Early Filter + Separate Avg CTE (2.90x VERIFIED)
@@ -920,7 +924,37 @@ WHERE inv1.d_moy = 1 AND inv2.d_moy = 2 ...""",
             "speedup": "2.44x"
         },
 
-        # Q23 - IN to EXISTS
+        # Q93 - Early Dimension Filter (2.71x Full DB Verified - Kimi K2.5) - CONSISTENT WINNER
+        {
+            "opportunity": "EARLY_FILTER",
+            "input_slice": """[main_query]:
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales
+FROM (SELECT ss.ss_customer_sk, CASE WHEN sr.sr_return_quantity IS NOT NULL
+        THEN (ss.ss_quantity - sr.sr_return_quantity) * ss.ss_sales_price
+        ELSE ss.ss_quantity * ss.ss_sales_price END AS act_sales
+      FROM store_sales ss LEFT JOIN store_returns sr ON ss.ss_item_sk = sr.sr_item_sk
+      JOIN reason r ON sr.sr_reason_sk = r.r_reason_sk
+      WHERE r.r_reason_desc = 'duplicate purchase') t
+GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100""",
+            "output": {
+                "rewrite_sets": [{
+                    "id": "rs_01",
+                    "transform": "early_filter",
+                    "nodes": {
+                        "filtered_reason": "SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'",
+                        "filtered_returns": "SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk",
+                        "main_query": "SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100"
+                    },
+                    "invariants_kept": ["output columns unchanged", "grain preserved", "same result rows"],
+                    "expected_speedup": "2.71x",
+                    "risk": "low"
+                }]
+            },
+            "speedup": "2.71x",
+            "key_insight": "Filter dimension table (reason) FIRST, then join to fact. Reduces returns to only 'duplicate purchase' before expensive store_sales join."
+        },
+
+        # Q23 - IN to EXISTS (DeepSeek - failed validation, keep for reference)
         {
             "opportunity": "IN_TO_EXISTS",
             "input_slice": """[main_query]:
@@ -937,9 +971,10 @@ WHERE cs_item_sk IN (SELECT item_sk FROM frequent_ss_items)
                     },
                     "invariants_kept": ["same result rows", "same ordering"],
                     "expected_speedup": "2.33x",
-                    "risk": "low"
+                    "risk": "medium"  # Failed validation on DeepSeek
                 }]
             },
-            "speedup": "2.33x"
+            "speedup": "2.33x",
+            "note": "DeepSeek failed validation - use with caution"
         }
     ]

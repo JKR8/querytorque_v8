@@ -1,0 +1,200 @@
+ The user wants me to optimize a SQL query using specific transforms from an allowlist: pushdown, decorrelate, or_to_union, in_to_exists, projection_prune, early_filter.
+
+Looking at the input query:
+```sql
+SELECT SUM(cs_ext_discount_amt) AS "excess discount amount" 
+FROM catalog_sales, item, date_dim 
+WHERE i_manufact_id = 29 
+  AND i_item_sk = cs_item_sk 
+  AND d_date BETWEEN '1999-01-07' AND (CAST('1999-01-07' AS DATE) + INTERVAL '90' DAY) 
+  AND d_date_sk = cs_sold_date_sk 
+  AND cs_ext_discount_amt > (
+    SELECT 1.3 * AVG(cs_ext_discount_amt) 
+    FROM catalog_sales, date_dim 
+    WHERE cs_item_sk = i_item_sk 
+      AND d_date BETWEEN '1999-01-07' AND (CAST('1999-01-07' AS DATE) + INTERVAL '90' DAY) 
+      AND d_date_sk = cs_sold_date_sk
+  ) 
+LIMIT 100
+```
+
+This is a correlated subquery. The subquery references `i_item_sk` from the outer query (correlated on item). The pattern is:
+- Outer query filters items with i_manufact_id = 29 and joins with catalog_sales and date_dim
+- For each row, it checks if cs_ext_discount_amt > 1.3 * average discount for that specific item in the same date range
+
+This is a classic case for DECORRELATE transform. We can:
+1. Pre-compute the average discount per item for the date range
+2. Join this result back to the main query instead of using a correlated subquery
+
+Let me break down the steps:
+
+1. Create a CTE for the date filter (early_filter/pushdown)
+2. Create a CTE for item-level average discount (decorrelate)
+3. Join this CTE with the main query instead of the correlated subquery
+
+The correlated subquery is:
+```sql
+SELECT 1.3 * AVG(cs_ext_discount_amt) 
+FROM catalog_sales, date_dim 
+WHERE cs_item_sk = i_item_sk 
+  AND d_date BETWEEN '1999-01-07' AND (CAST('1999-01-07' AS DATE) + INTERVAL '90' DAY) 
+  AND d_date_sk = cs_sold_date_sk
+```
+
+This can be rewritten as:
+- Compute avg discount per item for the date range
+- Join on item_sk
+
+So the rewrite would look like:
+
+```sql
+WITH filtered_dates AS (
+  SELECT d_date_sk 
+  FROM date_dim 
+  WHERE d_date BETWEEN '1999-01-07' AND (CAST('1999-01-07' AS DATE) + INTERVAL '90' DAY)
+),
+item_avg_discount AS (
+  SELECT cs_item_sk, 1.3 * AVG(cs_ext_discount_amt) AS avg_discount_threshold
+  FROM catalog_sales
+  JOIN filtered_dates ON d_date_sk = cs_sold_date_sk
+  GROUP BY cs_item_sk
+),
+filtered_items AS (
+  SELECT i_item_sk 
+  FROM item 
+  WHERE i_manufact_id = 29
+)
+SELECT SUM(cs.cs_ext_discount_amt) AS "excess discount amount"
+FROM catalog_sales cs
+JOIN filtered_dates d ON cs.cs_sold_date_sk = d.d_date_sk
+JOIN filtered_items i ON cs.cs_item_sk = i.i_item_sk
+JOIN item_avg_discount iad ON cs.cs_item_sk = iad.cs_item_sk
+WHERE cs.cs_ext_discount_amt > iad.avg_discount_threshold
+LIMIT 100
+```
+
+Wait, I need to be careful. The original query has:
+- `cs_ext_discount_amt > (subquery)`
+- The subquery calculates average for the specific item (correlated on i_item_sk)
+
+So yes, we can decorrelate by computing the average per item first, then joining.
+
+Also, I should push down the date filter and item filter early.
+
+Let me structure the nodes properly:
+
+1. `filtered_dates`: Filter date_dim early
+2. `item_avg_discount`: Compute 1.3 * average discount per item for the date range (this decorrelates the subquery)
+3. `filtered_items`: Filter items with i_manufact_id = 29 early (pushdown)
+4. `main_query`: Join everything together with the threshold comparison
+
+Actually, looking at the example format, I should use the node IDs to represent the transformation steps.
+
+The transform is "decorrelate" primarily, but also involves "early_filter" and "pushdown". However, the main transform to specify is "decorrelate" since that's the major structural change.
+
+Let me check the example again. In the first example, they used "decorrelate" as the transform name even though they also did pushdown (pushing s_state='SD' early).
+
+So I'll use "decorrelate" as the transform.
+
+Nodes:
+- `filtered_dates`: Early filter on date_dim
+- `filtered_items`: Early filter on item (i_manufact_id = 29) - this is pushdown/early_filter
+- `item_avg_discount`: The decorrelated aggregation (1.3 * avg per item)
+- `main_query`: The final query joining everything
+
+Wait, in the example output, they had:
+- filtered_returns (pushing down the state filter)
+- customer_total_return (the CTE)
+- store_avg_return (the decorrelated aggregation)
+- main_query
+
+So for this query:
+- `date_filter` or `filtered_dates`: SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN ...
+- `item_avg_discount`: SELECT cs_item_sk, 1.3 * AVG(cs_ext_discount_amt) AS threshold FROM catalog_sales JOIN date_filter ON ... GROUP BY cs_item_sk
+- `filtered_items`: SELECT i_item_sk FROM item WHERE i_manufact_id = 29
+- `main_query`: SELECT SUM(cs_ext_discount_amt) FROM catalog_sales JOIN filtered_items ON ... JOIN date_filter ON ... JOIN item_avg_discount ON cs_item_sk = item_avg_discount.cs_item_sk WHERE cs_ext_discount_amt > threshold LIMIT 100
+
+Actually, looking carefully at the query, the correlated subquery references `i_item_sk` from the outer item table. So when we decorrelate, we need to group by cs_item_sk in the subquery and join on that.
+
+Also, the outer query joins catalog_sales with item and date_dim. The correlated subquery also joins catalog_sales with date_dim (same date filter).
+
+So the decorrelated version should:
+1. Filter dates once (early_filter)
+2. Compute average per item for those dates (decorrelate)
+3. Filter items by manufacturer (pushdown)
+4. Join catalog_sales with filtered items, filtered dates, and the average table, then filter where amount > avg
+
+Let me write the SQL:
+
+Node: `date_range`
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '1999-01-07' AND (CAST('1999-01-07' AS DATE) + INTERVAL '90' DAY)
+```
+
+Node: `item_thresholds` (or `item_avg_discount`)
+```sql
+SELECT cs_item_sk, 1.3 * AVG(cs_ext_discount_amt) AS avg_discount_threshold 
+FROM catalog_sales 
+JOIN date_range ON cs_sold_date_sk = d_date_sk 
+GROUP BY cs_item_sk
+```
+
+Node: `target_items`
+```sql
+SELECT i_item_sk FROM item WHERE i_manufact_id = 29
+```
+
+Node: `main_query`
+```sql
+SELECT SUM(cs.cs_ext_discount_amt) AS "excess discount amount" 
+FROM catalog_sales cs
+JOIN target_items ti ON cs.cs_item_sk = ti.i_item_sk
+JOIN date_range dr ON cs.cs_sold_date_sk = dr.d_date_sk
+JOIN item_thresholds it ON cs.cs_item_sk = it.cs_item_sk
+WHERE cs.cs_ext_discount_amt > it.avg_discount_threshold
+LIMIT 100
+```
+
+This looks correct. The correlated subquery is removed and replaced with a join to a pre-computed aggregation.
+
+Invariants kept:
+- Same result rows (the decorrelation is equivalent because we join on the same key and compare against the same computed average)
+- Same column output (excess discount amount)
+- Same limit
+
+Expected speedup: Correlated subqueries are expensive because they run once per row. Decorrelating allows the database to use hash joins or merge joins. Probably 2-3x speedup.
+
+Risk: low, this is a standard decorrelation pattern.
+
+I should check if I need to include the date filter in the item_avg_discount CTE. Yes, because the correlated subquery had that filter.
+
+Also, I need to make sure the column names match. The outer query uses `cs_ext_discount_amt` and the subquery also uses `cs_ext_discount_amt`.
+
+One detail: In the original query, the correlated subquery references `i_item_sk` from the outer scope. In my rewrite, `item_thresholds` groups by `cs_item_sk` and then I join `cs.cs_item_sk = it.cs_item_sk`. This is correct because in the outer query, `cs_item_sk = i_item_sk` (from the join condition `i_item_sk = cs_item_sk`).
+
+So the decorrelation is valid.
+
+Let me format this as JSON. </think> ```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "decorrelate",
+      "nodes": {
+        "date_range": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '1999-01-07' AND (CAST('1999-01-07' AS DATE) + INTERVAL '90' DAY)",
+        "target_items": "SELECT i_item_sk FROM item WHERE i_manufact_id = 29",
+        "item_avg_discount": "SELECT cs_item_sk, 1.3 * AVG(cs_ext_discount_amt) AS avg_discount_threshold FROM catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk GROUP BY cs_item_sk",
+        "main_query": "SELECT SUM(cs.cs_ext_discount_amt) AS \"excess discount amount\" FROM catalog_sales cs JOIN target_items ti ON cs.cs_item_sk = ti.i_item_sk JOIN date_range dr ON cs.cs_sold_date_sk = dr.d_date_sk JOIN item_avg_discount iad ON cs.cs_item_sk = iad.cs_item_sk WHERE cs.cs_ext_discount_amt > iad.avg_discount_threshold LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same column output",
+        "same limit clause"
+      ],
+      "expected_speedup": "3.50x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Decorrelated the scalar subquery by pre-computing 1.3*AVG(cs_ext_discount_amt) per item for the date range. This eliminates the correlated execution (which runs once per row) and replaces it with a hash join. Also pushed down i_manufact_id=29 filter and date filter into separate CTEs for early filtering."
+}
+```

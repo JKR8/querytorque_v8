@@ -1,15 +1,26 @@
 import { useState, useRef, useEffect } from 'react'
 import CodeEditor from '@/components/CodeEditor'
 import ReportViewer from '@/components/ReportViewer'
+import ValidationReport from '@/components/ValidationReport'
+import QueryResults, { QueryResultData } from '@/components/QueryResults'
+import DatabaseConnection, { DatabaseConfig, ConnectionStatus } from '@/components/DatabaseConnection'
+import BatchView from '@/components/BatchView'
+import PlanViewer from '@/components/PlanViewer'
+import useBatchProcessor from '@/hooks/useBatchProcessor'
 import {
   analyzeSql,
   startOptimization,
-  submitOptimizationResponse,
-  acceptOptimization,
   retryOptimization,
   getHealth,
+  validateManualResponse,
+  connectDuckDB,
+  executeQuery,
+  getExecutionPlan,
+  disconnectDatabase,
   AnalysisResult,
   OptimizationSession,
+  ValidationPreviewResponse,
+  ExecutionPlanResponse,
 } from '@/api/client'
 import './EditorPage.css'
 
@@ -49,6 +60,27 @@ export default function EditorPage() {
   const [optimizeSession, setOptimizeSession] = useState<OptimizationSession | null>(null)
   const [isOptimizing, setIsOptimizing] = useState(false)
   const [isAccepting, setIsAccepting] = useState(false)
+  const [validationPreview, setValidationPreview] = useState<ValidationPreviewResponse | null>(null)
+
+  // Database connection state
+  const [dbSessionId, setDbSessionId] = useState<string | null>(null)
+  const [dbStatus, setDbStatus] = useState<ConnectionStatus>({ connected: false })
+  const [isConnecting, setIsConnecting] = useState(false)
+  const [showDbConnect, setShowDbConnect] = useState(false)
+
+  // Query execution state
+  const [queryResult, setQueryResult] = useState<QueryResultData | null>(null)
+  const [isExecuting, setIsExecuting] = useState(false)
+  const [showQueryResults, setShowQueryResults] = useState(false)
+
+  // Execution plan state
+  const [planResult, setPlanResult] = useState<ExecutionPlanResponse | null>(null)
+  const [isExplaining, setIsExplaining] = useState(false)
+  const [showPlanResult, setShowPlanResult] = useState(false)
+
+  // Batch processing
+  const [isBatchMode, setIsBatchMode] = useState(false)
+  const batch = useBatchProcessor()
 
   // Resizable panel state
   const [editorWidth, setEditorWidth] = useState(50)
@@ -111,20 +143,61 @@ export default function EditorPage() {
     return () => window.removeEventListener('message', handleMessage)
   }, [optimizeSession])
 
-  // Handle file upload
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
+  // Handle file upload (single or multiple)
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || [])
+    if (files.length === 0) return
 
-    const reader = new FileReader()
-    reader.onload = (event) => {
-      const content = event.target?.result as string
-      setCode(content)
-      setResult(null)
-      setShowResults(false)
+    if (files.length === 1) {
+      // Single file mode
+      const reader = new FileReader()
+      reader.onload = (event) => {
+        const content = event.target?.result as string
+        setCode(content)
+        setResult(null)
+        setShowResults(false)
+        setIsBatchMode(false)
+      }
+      reader.readAsText(files[0])
+    } else {
+      // Multiple files - enter batch mode
+      await batch.addFiles(files)
+      setIsBatchMode(true)
     }
-    reader.readAsText(file)
+
     e.target.value = ''
+  }
+
+  // Handle file drop for batch mode
+  const handleFileDrop = async (e: React.DragEvent) => {
+    e.preventDefault()
+    const files = Array.from(e.dataTransfer.files).filter(
+      f => f.name.endsWith('.sql') || f.name.endsWith('.txt')
+    )
+
+    if (files.length === 0) return
+
+    if (files.length === 1 && !isBatchMode) {
+      // Single file mode
+      const reader = new FileReader()
+      reader.onload = (event) => {
+        const content = event.target?.result as string
+        setCode(content)
+        setResult(null)
+        setShowResults(false)
+      }
+      reader.readAsText(files[0])
+    } else {
+      // Multiple files - enter batch mode
+      await batch.addFiles(files)
+      setIsBatchMode(true)
+    }
+  }
+
+  // Exit batch mode
+  const handleExitBatch = () => {
+    batch.reset()
+    setIsBatchMode(false)
   }
 
   // Analyze SQL
@@ -189,29 +262,17 @@ export default function EditorPage() {
 
   // Validate LLM response (manual mode)
   const handleValidateResponse = async (llmResponse: string) => {
-    if (!optimizeSession && !result) return
+    if (!result?.original_sql && !code) return
 
     setOptimizeStep('validating')
     setError(null)
 
     try {
-      // Start a session if we don't have one
-      let session = optimizeSession
-      if (!session) {
-        session = await startOptimization(
-          result?.original_sql || code,
-          'manual',
-          'query.sql'
-        )
-        setOptimizeSession(session)
-      }
-
-      // Submit the response
-      const validatedSession = await submitOptimizationResponse(
-        session.session_id,
+      const validationResult = await validateManualResponse(
+        result?.original_sql || code,
         llmResponse
       )
-      setOptimizeSession(validatedSession)
+      setValidationPreview(validationResult)
       setOptimizeStep('preview')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Validation failed')
@@ -221,25 +282,21 @@ export default function EditorPage() {
 
   // Accept optimization
   const handleAccept = async () => {
-    if (!optimizeSession) return
+    if (!validationPreview?.optimized_code) return
 
     setIsAccepting(true)
     setError(null)
 
     try {
-      await acceptOptimization(optimizeSession.session_id)
-
-      // Update code with optimized version
-      if (optimizeSession.optimized_code) {
-        const marker = '-- qt:optimized\n'
-        const optimizedCode = optimizeSession.optimized_code.startsWith('-- qt:')
-          ? optimizeSession.optimized_code
-          : marker + optimizeSession.optimized_code
-        setCode(optimizedCode)
-      }
+      const marker = '-- qt:optimized\n'
+      const optimizedCode = validationPreview.optimized_code.startsWith('-- qt:')
+        ? validationPreview.optimized_code
+        : marker + validationPreview.optimized_code
+      setCode(optimizedCode)
 
       // Reset state
       setOptimizeStep('idle')
+      setValidationPreview(null)
       setOptimizeSession(null)
       setShowResults(false)
       setResult(null)
@@ -253,6 +310,7 @@ export default function EditorPage() {
   // Reject optimization
   const handleReject = () => {
     setOptimizeStep('idle')
+    setValidationPreview(null)
     setOptimizeSession(null)
   }
 
@@ -296,10 +354,133 @@ export default function EditorPage() {
     setError(null)
   }
 
+  // Database connection
+  const handleDbConnect = async (config: DatabaseConfig) => {
+    setIsConnecting(true)
+    setError(null)
+
+    try {
+      if (config.type === 'duckdb' && config.fixtureFile) {
+        const response = await connectDuckDB(config.fixtureFile)
+
+        if (response.connected) {
+          setDbSessionId(response.session_id)
+          setDbStatus({
+            connected: true,
+            type: 'duckdb',
+            details: response.details,
+          })
+          setShowDbConnect(false)
+        } else {
+          setError(response.error || 'Connection failed')
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Connection failed')
+    } finally {
+      setIsConnecting(false)
+    }
+  }
+
+  const handleDbDisconnect = async () => {
+    if (dbSessionId) {
+      try {
+        await disconnectDatabase(dbSessionId)
+      } catch {
+        // Ignore disconnect errors
+      }
+    }
+    setDbSessionId(null)
+    setDbStatus({ connected: false })
+    setQueryResult(null)
+    setPlanResult(null)
+    setShowQueryResults(false)
+  }
+
+  // Execute query
+  const handleExecute = async () => {
+    if (!dbSessionId || !code.trim()) return
+
+    setIsExecuting(true)
+    setError(null)
+    setQueryResult(null)
+
+    try {
+      const result = await executeQuery(dbSessionId, code, 100)
+      setQueryResult(result)
+      setShowQueryResults(true)
+      setShowResults(false) // Hide analysis results to show query results
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Execution failed')
+    } finally {
+      setIsExecuting(false)
+    }
+  }
+
+  // Get execution plan
+  const handleExplain = async () => {
+    if (!dbSessionId || !code.trim()) return
+
+    setIsExplaining(true)
+    setError(null)
+    setPlanResult(null)
+
+    try {
+      const result = await getExecutionPlan(dbSessionId, code, true)
+      setPlanResult(result)
+      setShowPlanResult(true)
+      setShowResults(false)
+      setShowQueryResults(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Explain failed')
+    } finally {
+      setIsExplaining(false)
+    }
+  }
+
   const lineCount = code.split('\n').length
 
+  // Batch mode view
+  if (isBatchMode) {
+    return (
+      <div className="editor-page batch-mode">
+        <div className="mode-controls">
+          <div className="mode-indicator">
+            <span className="mode-badge batch">Batch Mode</span>
+          </div>
+          <button className="action-btn" onClick={handleExitBatch}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+            Exit Batch
+          </button>
+        </div>
+
+        <div className="batch-container">
+          <BatchView
+            files={batch.files}
+            isProcessing={batch.isProcessing}
+            progress={batch.progress}
+            settings={batch.settings}
+            onStart={batch.start}
+            onAbort={batch.abort}
+            onReset={batch.reset}
+            onRetry={batch.retryFile}
+            onRemoveFile={batch.removeFile}
+            onUpdateSettings={batch.updateSettings}
+          />
+        </div>
+      </div>
+    )
+  }
+
   return (
-    <div className="editor-page">
+    <div
+      className="editor-page"
+      onDragOver={e => e.preventDefault()}
+      onDrop={handleFileDrop}
+    >
       {/* Mode Controls */}
       <div className="mode-controls">
         <div className="mode-indicator">
@@ -307,7 +488,52 @@ export default function EditorPage() {
             {isAutoMode ? 'Auto Mode' : 'Manual Mode'}
           </span>
         </div>
+
+        {/* Database Connection Status */}
+        <div className="db-controls">
+          {dbStatus.connected ? (
+            <>
+              <span className="db-status connected">
+                <span className="db-dot" />
+                DuckDB
+              </span>
+              <button
+                className="action-btn db-disconnect-btn"
+                onClick={handleDbDisconnect}
+                title="Disconnect database"
+              >
+                Disconnect
+              </button>
+            </>
+          ) : (
+            <button
+              className="action-btn"
+              onClick={() => setShowDbConnect(true)}
+              title="Connect database for query execution"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <ellipse cx="12" cy="5" rx="9" ry="3" />
+                <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
+                <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+              </svg>
+              Connect DB
+            </button>
+          )}
+        </div>
       </div>
+
+      {/* Database Connection Modal */}
+      {showDbConnect && (
+        <div className="modal-overlay" onClick={() => setShowDbConnect(false)}>
+          <div className="modal-content" onClick={e => e.stopPropagation()}>
+            <DatabaseConnection
+              onConnect={handleDbConnect}
+              onCancel={() => setShowDbConnect(false)}
+              isConnecting={isConnecting}
+            />
+          </div>
+        </div>
+      )}
 
       <div className="editor-layout" ref={layoutRef}>
         {/* Editor Panel */}
@@ -325,6 +551,7 @@ export default function EditorPage() {
                 ref={fileInputRef}
                 type="file"
                 accept=".sql,.txt"
+                multiple
                 onChange={handleFileSelect}
                 style={{ display: 'none' }}
               />
@@ -359,6 +586,54 @@ export default function EditorPage() {
                   </>
                 )}
               </button>
+
+              {/* Execute Button - only when DB connected */}
+              {dbStatus.connected && (
+                <button
+                  className="action-btn execute-btn"
+                  onClick={handleExecute}
+                  disabled={isExecuting || !code.trim()}
+                  title="Execute query against connected database"
+                >
+                  {isExecuting ? (
+                    <>
+                      <span className="spinner" />
+                      Running...
+                    </>
+                  ) : (
+                    <>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <polygon points="5,3 19,12 5,21 5,3" fill="currentColor" />
+                      </svg>
+                      Execute
+                    </>
+                  )}
+                </button>
+              )}
+
+              {/* Explain Button - only when DB connected */}
+              {dbStatus.connected && (
+                <button
+                  className="action-btn"
+                  onClick={handleExplain}
+                  disabled={isExplaining || !code.trim()}
+                  title="Show execution plan"
+                >
+                  {isExplaining ? (
+                    <>
+                      <span className="spinner" />
+                      Planning...
+                    </>
+                  ) : (
+                    <>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M9 18l6-6-6-6" />
+                      </svg>
+                      Explain
+                    </>
+                  )}
+                </button>
+              )}
             </div>
           </div>
 
@@ -390,7 +665,7 @@ export default function EditorPage() {
         )}
 
         {/* Results Panel */}
-        {showResults && result && optimizeStep === 'idle' && (
+        {showResults && result && optimizeStep === 'idle' && !showQueryResults && (
           <div className="results-panel">
             <div className="results-header">
               <span>Analysis Results</span>
@@ -441,6 +716,69 @@ export default function EditorPage() {
           </div>
         )}
 
+        {/* Query Results Panel */}
+        {showQueryResults && (
+          <div className="results-panel">
+            <div className="results-header">
+              <span>Query Results</span>
+              <div className="results-actions">
+                <button
+                  className="close-btn"
+                  onClick={() => {
+                    setShowQueryResults(false)
+                    setQueryResult(null)
+                  }}
+                  title="Close results"
+                >
+                  x
+                </button>
+              </div>
+            </div>
+            <QueryResults
+              result={queryResult}
+              isLoading={isExecuting}
+              error={queryResult?.error}
+            />
+          </div>
+        )}
+
+        {/* Execution Plan Panel */}
+        {showPlanResult && planResult && (
+          <div className="results-panel">
+            <div className="results-header">
+              <span>Execution Plan</span>
+              <div className="results-actions">
+                <button
+                  className="close-btn"
+                  onClick={() => {
+                    setShowPlanResult(false)
+                    setPlanResult(null)
+                  }}
+                  title="Close plan"
+                >
+                  x
+                </button>
+              </div>
+            </div>
+            <div style={{ flex: 1, overflow: 'auto', padding: '1rem' }}>
+              {planResult.success && planResult.plan_tree ? (
+                <PlanViewer
+                  planTree={planResult.plan_tree}
+                  totalCost={planResult.total_cost}
+                  executionTimeMs={planResult.execution_time_ms}
+                  bottleneck={planResult.bottleneck}
+                  warnings={planResult.warnings}
+                  title="Query Plan"
+                />
+              ) : (
+                <div className="no-validation">
+                  <p>{planResult.error || 'Failed to generate execution plan'}</p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Optimization Loading */}
         {isOptimizing && (
           <div className="optimization-panel loading-panel">
@@ -456,60 +794,21 @@ export default function EditorPage() {
           </div>
         )}
 
-        {/* Optimization Preview */}
-        {optimizeStep === 'preview' && optimizeSession && (
-          <div className="optimization-panel preview-panel">
-            <div className="optimize-header">
-              <h3>Optimization Preview</h3>
+        {/* Optimization Preview - ValidationReport */}
+        {optimizeStep === 'preview' && validationPreview && (
+          <div className="results-panel">
+            <div className="results-header">
+              <span>Validation Results</span>
               <button className="close-btn" onClick={handleCancel}>x</button>
             </div>
-            <div className="preview-content">
-              {optimizeSession.validation ? (
-                <>
-                  <div className="validation-summary">
-                    <div className={`validation-badge ${optimizeSession.validation.success ? 'pass' : 'fail'}`}>
-                      {optimizeSession.validation.success ? 'All Checks Passed' : 'Validation Issues'}
-                    </div>
-                    {optimizeSession.validation.issues_fixed.length > 0 && (
-                      <div className="issues-fixed">
-                        Fixed {optimizeSession.validation.issues_fixed.length} issue(s)
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="code-diff">
-                    <h4>Optimized SQL</h4>
-                    <pre className="optimized-code">
-                      {optimizeSession.optimized_code}
-                    </pre>
-                  </div>
-
-                  <div className="preview-actions">
-                    <button
-                      className="btn btn-success"
-                      onClick={handleAccept}
-                      disabled={isAccepting}
-                    >
-                      {isAccepting ? 'Accepting...' : 'Accept'}
-                    </button>
-                    {optimizeSession.can_retry && (
-                      <button className="btn btn-secondary" onClick={handleRetry}>
-                        Retry
-                      </button>
-                    )}
-                    <button className="btn btn-ghost" onClick={handleReject}>
-                      Cancel
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <div className="no-validation">
-                  <p>No validation results available.</p>
-                  <button className="btn btn-ghost" onClick={handleCancel}>
-                    Cancel
-                  </button>
-                </div>
-              )}
+            <div className="validation-container">
+              <ValidationReport
+                result={validationPreview}
+                onAccept={handleAccept}
+                onReject={handleReject}
+                onRetry={handleRetry}
+                isAccepting={isAccepting}
+              />
             </div>
           </div>
         )}

@@ -1,0 +1,540 @@
+ The user wants me to optimize SQL queries based on the provided examples and rules. Let me analyze the input.
+
+The target nodes are `[ss_items]` and `[cs_items]`, both are GROUP_BY CTEs.
+
+Looking at the subgraph slice:
+1. `ss_items` is a CTE that calculates sum of sales for store_sales joined with item and date_dim, filtered by a specific week sequence.
+2. `cs_items` is similar but for catalog_sales.
+3. There's also `ws_items` (web_sales) mentioned in the main query but not listed as a target node for rewriting, though the opportunities mention pushing filters into it too.
+
+The main query joins these three CTEs and applies filters like:
+- `ss_items.item_id = cs_items.item_id`
+- `ss_items.item_id = ws_items.item_id`
+- Range comparisons between the revenue columns (ss_item_rev, cs_item_rev, ws_item_rev)
+
+The detected opportunities mention:
+- PUSHDOWN: filters on [ss_items] after GROUP BY
+- PUSHDOWN: filters on [cs_items] after GROUP BY  
+- PUSHDOWN: filters on [ws_items] after GROUP BY
+
+But looking at the main query, the filters are actually join conditions and range predicates on the aggregated results. However, the main query also has implicit filters through the joins - since it's doing inner joins between ss_items, cs_items, and ws_items, only items present in all three channels will be returned.
+
+Wait, looking more carefully at the main query:
+```sql
+SELECT ... FROM ss_items, cs_items, ws_items 
+WHERE ss_items.item_id = cs_items.item_id 
+  AND ss_items.item_id = ws_items.item_id 
+  AND ss_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev 
+  AND ...
+```
+
+The key insight is that the main query filters on `item_id` equality across the three CTEs. This means we can push the join condition down into the CTEs to filter early. But actually, looking at the "Detected Opportunities", it says "filters on [ss_items] after GROUP BY" - this likely refers to the fact that the main query joins these CTEs together, effectively filtering each CTE to only include item_ids that exist in all three.
+
+However, there's a bigger optimization opportunity here: the subquery in the date filter is correlated/expensive. Both `ss_items` and `cs_items` have:
+```sql
+d_date IN (SELECT d_date FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24'))
+```
+
+This can be optimized by:
+1. Computing the week sequence once (early_filter/pushdown)
+2. Or converting the IN subquery to a join
+
+But looking at the allowed transforms: pushdown, decorrelate, or_to_union, in_to_exists, projection_prune, early_filter.
+
+The most applicable here seems to be:
+1. **early_filter**: Compute the date filter once and reuse it, or push the date filter down
+2. **pushdown**: Push the join conditions (item_id matches) into the CTEs to reduce the amount of data being aggregated
+
+Wait, actually looking at the main query structure, the joins between ss_items, cs_items, and ws_items happen AFTER the aggregation. If we push the join conditions down, we would need to join the three sales tables together before aggregating, which changes the semantics (we'd be aggregating only sales that appear in all channels, rather than aggregating all sales then filtering).
+
+But actually, looking at the query logic:
+- ss_items aggregates store_sales by item_id
+- cs_items aggregates catalog_sales by item_id  
+- ws_items aggregates web_sales by item_id
+- Then they join on item_id
+
+This is a classic "correlated aggregation" pattern. The optimization here is to push the join predicate down so that each CTE only processes items that exist in the other channels? No, that would require computing the other channels first or doing a semi-join.
+
+Actually, looking at the "Detected Opportunities" text:
+"PUSHDOWN: [main_query] filters on [ss_items] after GROUP BY
+  Fix: Push filter into CTE before aggregation"
+
+This suggests that the filter from the main query (which joins the three CTEs) should be pushed into the CTE. But since the filter involves comparing ss_item_rev with cs_item_rev and ws_item_rev, we can't push those down easily because they depend on the other CTEs.
+
+However, we CAN push down the item_id filter. Since the main query only wants item_ids that exist in all three channels, we could:
+1. Find the intersection of item_ids first
+2. Then aggregate only those item_ids in each CTE
+
+But that would require changing the structure significantly.
+
+Let me reconsider the date filter. Both CTEs have:
+```sql
+AND d_date IN (SELECT d_date FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24'))
+```
+
+This is inefficient. We can:
+1. Use early_filter to compute the week sequence once
+2. Use decorrelate to turn the IN subquery into a join
+3. Use pushdown to push the date filter down to the fact table early
+
+Actually, looking at the example "DECORRELATE + PUSHDOWN", it shows how to decorrelate a subquery and push filters down.
+
+In this case, the subquery:
+```sql
+d_date IN (SELECT d_date FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24'))
+```
+
+Can be optimized by:
+1. First, compute the target week sequence: `SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24'`
+2. Then get all dates in that week: `SELECT d_date FROM date_dim WHERE d_week_seq = <target_week_seq>`
+3. Join this with the sales table instead of using IN
+
+Or even better, join date_dim twice: once to filter by the specific week, once to get the date_sk.
+
+Wait, looking at the query:
+```sql
+FROM store_sales, item, date_dim 
+WHERE ss_item_sk = i_item_sk 
+  AND d_date IN (SELECT d_date FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')) 
+  AND ss_sold_date_sk = d_date_sk
+```
+
+The issue is that `d_date` is from the outer date_dim (aliased in the FROM clause), and we're checking if it's in a subquery. But `ss_sold_date_sk = d_date_sk` links store_sales to date_dim.
+
+Actually, looking carefully:
+- `date_dim` in the outer query is joined via `ss_sold_date_sk = d_date_sk`
+- Then `d_date` (from that date_dim) is checked against the IN subquery
+
+So effectively, we want store_sales where the corresponding date is in the same week as '2001-03-24'.
+
+Optimization:
+1. Create a CTE that finds all `d_date_sk` values for the week containing '2001-03-24'
+2. Join store_sales directly to that CTE on `ss_sold_date_sk`
+
+This is a decorrelation + pushdown.
+
+But the "Detected Opportunities" specifically mention pushing filters from the main query into the CTEs. The main query filters are the join conditions between the three CTEs and the range predicates on revenues.
+
+Actually, looking at the main query WHERE clause:
+```sql
+WHERE ss_items.item_id = cs_items.item_id 
+  AND ss_items.item_id = ws_items.item_id 
+  AND ss_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev 
+  AND ss_item_rev BETWEEN 0.9 * ws_item_rev AND 1.1 * ws_item_rev 
+  AND cs_item_rev BETWEEN 0.9 * ss_item_rev AND 1.1 * ss_item_rev 
+  AND cs_item_rev BETWEEN 0.9 * ws_item_rev AND 1.1 * ws_item_rev 
+  AND ws_item_rev BETWEEN 0.9 * ss_item_rev AND 1.1 * ss_item_rev 
+  AND ws_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev
+```
+
+These are filters on the aggregated results. We cannot push these down into the individual CTEs because they depend on the values from the other CTEs.
+
+However, we CAN push down the item_id equality. If we compute the intersection of item_ids from all three channels first, we can filter each CTE by that set of item_ids before aggregating. This would reduce the aggregation cost.
+
+But to do that, we'd need to:
+1. Find distinct item_ids from store_sales for that week
+2. Find distinct item_ids from catalog_sales for that week  
+3. Find distinct item_ids from web_sales for that week
+4. Intersect them
+5. Use that to filter each sales table before aggregation
+
+That's complex and might not be faster if the intersection is large.
+
+Alternatively, the "early_filter" transform could be used to compute the date subquery once and reuse it.
+
+Let me look at the allowed transforms again:
+- pushdown: Push filters down the query tree
+- decorrelate: Remove correlation by rewriting subqueries as joins
+- or_to_union: Convert OR predicates to UNION
+- in_to_exists: Convert IN to EXISTS (probably not useful here)
+- projection_prune: Remove unused columns
+- early_filter: Apply filters as early as possible
+
+Given the structure, I think the best optimization is:
+1. **early_filter**: Extract the date subquery into a separate CTE that computes the set of valid date_sks for the week, then use that to filter the sales tables early.
+2. **pushdown**: Push this date filter down to the sales tables before the join with item.
+
+Actually, looking at the query, the date filter is already at the bottom, but it's written as an IN subquery. We can rewrite it as a join with a materialized date set.
+
+Also, looking at the main query, it selects from all three CTEs. The CTEs are defined separately but could share the date filter computation.
+
+So the rewrite should:
+1. Create a CTE `target_dates` that selects `d_date_sk` from date_dim for the target week
+2. Rewrite `ss_items` to join with `target_dates` instead of using the IN subquery
+3. Rewrite `cs_items` similarly
+4. (Optionally) Rewrite `ws_items` similarly, though it's not in the target nodes, but the main query uses it
+
+Wait, the task says "Target Nodes: [ss_items] GROUP_BY, [cs_items] GROUP_BY". So I should focus on rewriting these two nodes, possibly with auxiliary nodes.
+
+The output should be a JSON with rewrite_sets.
+
+Let me draft the rewrite:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "early_filter",
+      "nodes": {
+        "target_week": "SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24'",
+        "target_dates": "SELECT d_date_sk, d_date FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM target_week)",
+        "ss_items": "SELECT i_item_id AS item_id, SUM(ss_ext_sales_price) AS ss_item_rev FROM store_sales JOIN target_dates ON ss_sold_date_sk = d_date_sk JOIN item ON ss_item_sk = i_item_sk GROUP BY i_item_id",
+        "cs_items": "SELECT i_item_id AS item_id, SUM(cs_ext_sales_price) AS cs_item_rev FROM catalog_sales JOIN target_dates ON cs_sold_date_sk = d_date_sk JOIN item ON cs_item_sk = i_item_sk GROUP BY i_item_id"
+      },
+      "invariants_kept": [
+        "output columns unchanged",
+        "grain unchanged",
+        "same aggregation results"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+But wait, the `target_week` subquery still has a scalar subquery. We can compute the week number directly since it's a constant, or keep it as is. Actually, we can combine them:
+
+```sql
+target_dates AS (
+  SELECT d_date_sk 
+  FROM date_dim 
+  WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')
+)
+```
+
+This is still a subquery, but it's not correlated with the outer query anymore (it's a constant subquery). This allows the optimizer to materialize it once.
+
+Alternatively, we could use a JOIN:
+
+```sql
+target_dates AS (
+  SELECT d1.d_date_sk 
+  FROM date_dim d1
+  JOIN date_dim d2 ON d1.d_week_seq = d2.d_week_seq
+  WHERE d2.d_date = '2001-03-24'
+)
+```
+
+This is a decorrelation.
+
+Actually, looking at the example "DECORRELATE + PUSHDOWN", it shows how to break down correlated queries. Here, the correlation is on the date filter.
+
+But is the subquery correlated? In the original:
+```sql
+d_date IN (SELECT d_date FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24'))
+```
+
+This is not correlated with the outer tables (store_sales, item), but it is a subquery. The database might execute it once or multiple times. By extracting it to a CTE, we ensure it executes once.
+
+Also, by converting the IN predicate to a JOIN, we allow the optimizer to use hash joins or other efficient join methods.
+
+So the transform is a combination of early_filter (computing the date set once) and pushdown (pushing the join down).
+
+But looking at the allowed transforms, I should pick the primary one. "early_filter" seems appropriate for extracting the date filter. "decorrelate" might also apply if we view the IN subquery as a form of correlation (though technically it's not correlated with the outer query's row variables, it is a subquery in the WHERE clause).
+
+Actually, looking at the node contracts, `ss_items` requires predicates including `d_week_seq = (SELECT d_week_seq FROM date_dim WHER...`. This suggests the system views this as a required predicate that must be preserved.
+
+Let me reconsider the "Detected Opportunities". It says:
+"PUSHDOWN: [main_query] filters on [ss_items] after GROUP BY"
+
+This is confusing because the main query doesn't seem to have explicit filters on ss_items other than the join conditions. Unless... the BETWEEN clauses are considered filters on ss_items? No, those are on the aggregated ss_item_rev.
+
+Wait, I think I understand now. The main query joins ss_items, cs_items, and ws_items. This acts as a filter on each CTE - only item_ids present in all three will survive the join. If we push this filter down, we would filter each sales table to only include item_ids that appear in the other channels.
+
+But we can't easily do that without computing the other channels first.
+
+Unless... we pre-compute the distinct item_ids for each channel for that week, intersect them, and then use that to filter the sales tables before aggregation. This would be a significant rewrite.
+
+For example:
+1. Create `ss_item_ids` (distinct item_ids from store_sales for that week)
+2. Create `cs_item_ids` (distinct item_ids from catalog_sales for that week)  
+3. Create `ws_item_ids` (distinct item_ids from web_sales for that week)
+4. Create `common_items` as the intersection of the three
+5. Use `common_items` to filter each sales table before aggregation
+
+This would reduce the aggregation cost significantly if the intersection is small.
+
+But this changes the semantics slightly if there are items with NULL revenues or other edge cases, but generally, it should be equivalent.
+
+However, this is complex. The simpler optimization is to fix the date filter.
+
+Let me look at the example outputs again. In the first example, they:
+1. Created a filtered_returns CTE with pushed down filters
+2. Created customer_total_return from that
+3. Created store_avg_return as a separate aggregation
+4. Joined them in main_query
+
+So they broke down the query into more CTEs with specific roles.
+
+For this query, I should:
+1. Create a `target_week_dates` CTE that materializes the date_sks for the target week
+2. Rewrite `ss_items` to join with this instead of using IN subquery
+3. Rewrite `cs_items` similarly
+
+This is primarily "early_filter" (materializing the filter) and "pushdown" (pushing the date filter into the base table access).
+
+But the prompt asks for atomic rewrite sets. I can combine these into one rewrite set.
+
+Also, I notice that `ws_items` has the exact same pattern, but it's not in the target nodes. However, since the main_query uses it, and we're rewriting the pattern, we should probably include it or note it. But the instructions say "Target Nodes: [ss_items] GROUP_BY, [cs_items] GROUP_BY", so I'll focus on those two, but I can reference the date CTE which is a new node.
+
+Actually, looking at the main_query in the subgraph slice, it includes the full query with all three CTEs. But the target nodes are only ss_items and cs_items. This suggests I should only provide new SQL for those two nodes, but I can introduce auxiliary nodes if needed.
+
+In the first example, they introduced `filtered_returns`, `customer_total_return`, `store_avg_return`, and `main_query`. So I can introduce new nodes.
+
+So my plan:
+- Transform: early_filter (or pushdown, or both)
+- New nodes:
+  - `target_dates`: computes the d_date_sk values for the week of '2001-03-24'
+  - `ss_items`: rewritten to join with target_dates instead of IN subquery
+  - `cs_items`: rewritten similarly
+
+Wait, if I introduce `target_dates`, I need to make sure the main_query uses it or that it's inlined. But the main_query isn't being rewritten according to the target nodes... actually, the output format shows that I can rewrite multiple nodes including the main_query if needed, but the focus is on the target nodes.
+
+Looking at the example, they rewrote the main_query as well to use the new CTEs.
+
+So I'll provide:
+- `target_dates`: the date filter CTE
+- `ss_items`: optimized
+- `cs_items`: optimized
+- `main_query`: updated to include the new CTE (though it might just reference the new ss_items and cs_items which reference target_dates)
+
+Actually, CTEs are defined in the main_query. So if I rewrite ss_items and cs_items to reference a new CTE target_dates, I need to define target_dates in the main_query as well.
+
+So the nodes would be:
+- `target_dates`: new CTE
+- `ss_items`: rewritten CTE
+- `cs_items`: rewritten CTE  
+- `main_query`: rewritten to include target_dates and use the rewritten ss_items and cs_items
+
+But wait, the main_query in the input already contains the definitions of ss_items and cs_items. So when I rewrite ss_items and cs_items, I'm rewriting their definitions within the main_query, or as separate nodes? The example shows them as separate entries in the "nodes" dict.
+
+In the example:
+```
+"nodes": {
+  "filtered_returns": "...",
+  "customer_total_return": "...",
+  "store_avg_return": "...",
+  "main_query": "..."
+}
+```
+
+So I should provide the full SQL for each node.
+
+For `target_dates`:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')
+```
+
+For `ss_items`:
+```sql
+SELECT i_item_id AS item_id, SUM(ss_ext_sales_price) AS ss_item_rev 
+FROM store_sales 
+JOIN target_dates ON ss_sold_date_sk = target_dates.d_date_sk 
+JOIN item ON ss_item_sk = i_item_sk 
+GROUP BY i_item_id
+```
+
+For `cs_items`:
+```sql
+SELECT i_item_id AS item_id, SUM(cs_ext_sales_price) AS cs_item_rev 
+FROM catalog_sales 
+JOIN target_dates ON cs_sold_date_sk = target_dates.d_date_sk 
+JOIN item ON cs_item_sk = i_item_sk 
+GROUP BY i_item_id
+```
+
+For `main_query`:
+It needs to include the target_dates CTE and the rewritten ss_items and cs_items, plus the original ws_items (or I could rewrite ws_items too for consistency, but it's not a target).
+
+Actually, looking at the main_query structure, it's:
+```sql
+WITH ss_items AS (...), cs_items AS (...), ws_items AS (...) SELECT ...
+```
+
+So if I rewrite main_query, I need to include the WITH clause with all three CTEs, where ss_items and cs_items are rewritten and ws_items is as original (or also rewritten).
+
+But the prompt says "Target Nodes: [ss_items] GROUP_BY, [cs_items] GROUP_BY". It doesn't say I must rewrite main_query, but to coordinate multi-node changes, I probably should.
+
+However, looking at the detected opportunities, it mentions pushing filters from main_query into the CTEs. The filters are the join conditions. But as I analyzed, we can't easily push the revenue comparisons down.
+
+Unless... the opportunity is about the item_id join conditions. If we create a CTE that finds item_ids present in all three channels, we can push that down. But that requires computing the distinct item_ids first.
+
+Let me reconsider the "PUSHDOWN" opportunity description: "Push filter into CTE before aggregation". This could mean pushing the date filter (which is currently in the WHERE clause as an IN subquery) down to the table access level, which is what I proposed with the target_dates CTE.
+
+Or it could mean pushing the item_id filters from the main query joins. But that would require the intersection approach.
+
+Given the expected speedup of 2x mentioned in the opportunities, and the simplicity of the date filter optimization, I think the date filter optimization is the intended solution.
+
+Also, note that the date filter involves a subquery that accesses date_dim twice. By materializing the result once, we avoid redundant computation between ss_items and cs_items (and ws_items). This is the "early_filter" transform.
+
+So I'll go with:
+- Transform: early_filter (and possibly pushdown since we're pushing the filter down to the fact table)
+- Nodes: target_dates, ss_items, cs_items, main_query (to wire them together)
+
+Wait, looking at the example JSON, the transform field has a single value like "decorrelate" or "or_to_union". I should pick the most appropriate one. "early_filter" fits well because we're extracting the filter predicate into an early CTE.
+
+Actually, looking at the first example, they used "decorrelate" for a correlated subquery. Here we have an uncorrelated subquery (the date filter), but it's still a subquery that can be extracted. "early_filter" is appropriate.
+
+But I also see "pushdown" in the allowed list. The act of changing from IN subquery to JOIN is also a form of decorrelation or pushdown.
+
+Let me check if "in_to_exists" is relevant. No, that's for converting IN to EXISTS.
+
+I think "early_filter" is the best choice because we're computing the filter values early and reusing them.
+
+One more thing: in the rewritten ss_items, I should probably use explicit JOIN syntax instead of the comma syntax used in the original, to be clearer and more modern.
+
+Original:
+```sql
+FROM store_sales, item, date_dim WHERE ss_item_sk = i_item_sk AND ...
+```
+
+My rewrite:
+```sql
+FROM store_sales JOIN item ON ss_item_sk = i_item_sk JOIN target_dates ON ss_sold_date_sk = d_date_sk
+```
+
+This is cleaner.
+
+Also, I should ensure that the grain and output columns match the contracts.
+- ss_items output columns: ['item_id', 'ss_item_rev'] - check
+- ss_items grain: ['i_item_id'] - check
+- required_predicates: ['ss_sold_date_sk = d_date_sk', 'ss_item_sk = i_item_sk', 'd_week_seq = ...'] - the d_week_seq predicate is now implicit in the join with target_dates, which was derived from that predicate. So the semantics are preserved.
+
+Similarly for cs_items.
+
+For the main_query, I need to include the ws_items CTE as well since it's part of the query. I should probably rewrite it too for consistency, or leave it as is. The prompt doesn't target it, but to make the query work, I need to provide the full main_query SQL with all CTEs.
+
+Actually, looking at the example, when they rewrote the main_query, they included all the necessary parts. So I'll include ws_items rewritten as well, or at least present in the main_query WITH clause.
+
+But to be safe and consistent, I'll rewrite ws_items too using the same pattern, even though it's not a target node. Or I can leave it as the original SQL within the main_query.
+
+The instructions say: "Coordinate multi-node changes in rewrite_sets". It doesn't say I can only touch target nodes. So I can rewrite ws_items too.
+
+So final plan:
+- id: rs_01
+- transform: early_filter
+- nodes:
+  - target_dates: computes valid date_sks for the week
+  - ss_items: uses target_dates instead of IN subquery
+  - cs_items: uses target_dates instead of IN subquery  
+  - ws_items: uses target_dates instead of IN subquery (for consistency)
+  - main_query: the full query with these CTEs
+
+Wait, looking at the detected opportunities again, it lists three separate PUSHDOWN opportunities for ss_items, cs_items, and ws_items. This suggests that the optimization applies to all three, and I should probably include all three in my rewrite to be complete, even though only two are "target nodes".
+
+Yes, I'll include ws_items as well.
+
+Let me write the SQL:
+
+target_dates:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')
+```
+
+ss_items:
+```sql
+SELECT i_item_id AS item_id, SUM(ss_ext_sales_price) AS ss_item_rev 
+FROM store_sales 
+JOIN item ON ss_item_sk = i_item_sk 
+JOIN target_dates ON ss_sold_date_sk = target_dates.d_date_sk 
+GROUP BY i_item_id
+```
+
+cs_items:
+```sql
+SELECT i_item_id AS item_id, SUM(cs_ext_sales_price) AS cs_item_rev 
+FROM catalog_sales 
+JOIN item ON cs_item_sk = i_item_sk 
+JOIN target_dates ON cs_sold_date_sk = target_dates.d_date_sk 
+GROUP BY i_item_id
+```
+
+ws_items:
+```sql
+SELECT i_item_id AS item_id, SUM(ws_ext_sales_price) AS ws_item_rev 
+FROM web_sales 
+JOIN item ON ws_item_sk = i_item_sk 
+JOIN target_dates ON ws_sold_date_sk = target_dates.d_date_sk 
+GROUP BY i_item_id
+```
+
+main_query:
+```sql
+WITH target_dates AS (SELECT d_date_sk FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')),
+ss_items AS (SELECT i_item_id AS item_id, SUM(ss_ext_sales_price) AS ss_item_rev FROM store_sales JOIN item ON ss_item_sk = i_item_sk JOIN target_dates ON ss_sold_date_sk = target_dates.d_date_sk GROUP BY i_item_id),
+cs_items AS (SELECT i_item_id AS item_id, SUM(cs_ext_sales_price) AS cs_item_rev FROM catalog_sales JOIN item ON cs_item_sk = i_item_sk JOIN target_dates ON cs_sold_date_sk = target_dates.d_date_sk GROUP BY i_item_id),
+ws_items AS (SELECT i_item_id AS item_id, SUM(ws_ext_sales_price) AS ws_item_rev FROM web_sales JOIN item ON ws_item_sk = i_item_sk JOIN target_dates ON ws_sold_date_sk = target_dates.d_date_sk GROUP BY i_item_id)
+SELECT ss_items.item_id, ss_item_rev, ss_item_rev / ((ss_item_rev + cs_item_rev + ws_item_rev) / 3) * 100 AS ss_dev, cs_item_rev, cs_item_rev / ((ss_item_rev + cs_item_rev + ws_item_rev) / 3) * 100 AS cs_dev, ws_item_rev, ws_item_rev / ((ss_item_rev + cs_item_rev + ws_item_rev) / 3) * 100 AS ws_dev, (ss_item_rev + cs_item_rev + ws_item_rev) / 3 AS average 
+FROM ss_items, cs_items, ws_items 
+WHERE ss_items.item_id = cs_items.item_id AND ss_items.item_id = ws_items.item_id AND ss_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev AND ss_item_rev BETWEEN 0.9 * ws_item_rev AND 1.1 * ws_item_rev AND cs_item_rev BETWEEN 0.9 * ss_item_rev AND 1.1 * ss_item_rev AND cs_item_rev BETWEEN 0.9 * ws_item_rev AND 1.1 * ws_item_rev AND ws_item_rev BETWEEN 0.9 * ss_item_rev AND 1.1 * ss_item_rev AND ws_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev 
+ORDER BY ss_items.item_id, ss_item_rev LIMIT 100
+```
+
+This looks correct.
+
+One final check: the original query had `d_date IN (SELECT d_date FROM ...)` but also `ss_sold_date_sk = d_date_sk`. By joining target_dates (which has d_date_sk) directly on ss_sold_date_sk, I'm effectively filtering by the date. This is correct because:
+- Original: join date_dim on ss_sold_date_sk = d_date_sk, then check if d_date is in the set of dates for the week
+- New: join target_dates (which contains d_date_sk for the week) on ss_sold_date_sk = d_date_sk
+
+This is equivalent and more efficient.
+
+The risk is low because it's a straightforward transformation from subquery to join with a materialized set.
+
+Expected speedup: The opportunities say 2x for each, so overall maybe 2x or higher. I'll say 2.5x.
+
+Invariants kept: output columns unchanged, grain unchanged, same result set.
+
+Transform name: early_filter (or pushdown). I think early_filter is better because we're extracting the filter computation to happen early. But pushdown is also valid because we're pushing the filter down to the base tables. I'll go with early_filter as the primary, but mention both in explanation? No, the field is "transform": "transform_name", singular.
+
+Looking at the examples, they use specific names like "decorrelate", "or_to_union". I'll use "early_filter".
+
+Actually, looking at the first example, they used "decorrelate" even though they also did pushdown. The transform name seems to be the primary logical transformation. Here, the primary issue is the subquery which acts as a filter, so extracting it early is the key.
+
+I'll use "early_filter".
+
+Wait, I should check if "projection_prune" is applicable. The original selects d_date from date_dim in the subquery, but only uses it for the IN check. In my rewrite, I select d_date_sk in target_dates. This is actually changing the column selected from the subquery (from d_date to d_date_sk), but it's the correct key to join on. The original joined on d_date_sk and then checked d_date. My version joins directly on d_date_sk. This is actually better because d_date_sk is likely the primary key or indexed, while d_date might not be unique or indexed.
+
+So I'm good.
+
+Final JSON structure check:
+- rewrite_sets array with one object
+- id: rs_01
+- transform: early_filter
+- nodes: target_dates, ss_items, cs_items, ws_items, main_query
+- invariants_kept: array of strings
+- expected_speedup: string like "2.5x"
+- risk: "low"
+- explanation: string explaining what was changed
+
+The user asked for the rewrite_sets output, and the format includes an explanation field at the end.
+
+Let me write the explanation: "Extracted the date subquery into a separate CTE (target_dates) to compute the valid date_sk values for the target week once, rather than repeating the subquery in each items CTE. Changed from IN-subquery filter to direct join with target_dates, pushing the filter down to the base tables (store_sales, catalog_sales, web_sales) before aggregation. This reduces redundant date_dim scans and allows the optimizer to use hash joins for the date filtering."
+
+This looks good. </think> ```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "early_filter",
+      "nodes": {
+        "target_dates": "SELECT d_date_sk FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')",
+        "ss_items": "SELECT i_item_id AS item_id, SUM(ss_ext_sales_price) AS ss_item_rev FROM store_sales JOIN item ON ss_item_sk = i_item_sk JOIN target_dates ON ss_sold_date_sk = target_dates.d_date_sk GROUP BY i_item_id",
+        "cs_items": "SELECT i_item_id AS item_id, SUM(cs_ext_sales_price) AS cs_item_rev FROM catalog_sales JOIN item ON cs_item_sk = i_item_sk JOIN target_dates ON cs_sold_date_sk = target_dates.d_date_sk GROUP BY i_item_id",
+        "ws_items": "SELECT i_item_id AS item_id, SUM(ws_ext_sales_price) AS ws_item_rev FROM web_sales JOIN item ON ws_item_sk = i_item_sk JOIN target_dates ON ws_sold_date_sk = target_dates.d_date_sk GROUP BY i_item_id",
+        "main_query": "WITH target_dates AS (SELECT d_date_sk FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')), ss_items AS (SELECT i_item_id AS item_id, SUM(ss_ext_sales_price) AS ss_item_rev FROM store_sales JOIN item ON ss_item_sk = i_item_sk JOIN target_dates ON ss_sold_date_sk = target_dates.d_date_sk GROUP BY i_item_id), cs_items AS (SELECT i_item_id AS item_id, SUM(cs_ext_sales_price) AS cs_item_rev FROM catalog_sales JOIN item ON cs_item_sk = i_item_sk JOIN target_dates ON cs_sold_date_sk = target_dates.d_date_sk GROUP BY i_item_id), ws_items AS (SELECT i_item_id AS item_id, SUM(ws_ext_sales_price) AS ws_item_rev FROM web_sales JOIN item ON ws_item_sk = i_item_sk JOIN target_dates ON ws_sold_date_sk = target_dates.d_date_sk GROUP BY i_item_id) SELECT ss_items.item_id, ss_item_rev, ss_item_rev / ((ss_item_rev + cs_item_rev + ws_item_rev) / 3) * 100 AS ss_dev, cs_item_rev, cs_item_rev / ((ss_item_rev + cs_item_rev + ws_item_rev) / 3) * 100 AS cs_dev, ws_item_rev, ws_item_rev / ((ss_item_rev + cs_item_rev + ws_item_rev) / 3) * 100 AS ws_dev, (ss_item_rev + cs_item_rev + ws_item_rev) / 3 AS average FROM ss_items, cs_items, ws_items WHERE ss_items.item_id = cs_items.item_id AND ss_items.item_id = ws_items.item_id AND ss_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev AND ss_item_rev BETWEEN 0.9 * ws_item_rev AND 1.1 * ws_item_rev AND cs_item_rev BETWEEN 0.9 * ss_item_rev AND 1.1 * ss_item_rev AND cs_item_rev BETWEEN 0.9 * ws_item_rev AND 1.1 * ws_item_rev AND ws_item_rev BETWEEN 0.9 * ss_item_rev AND 1.1 * ss_item_rev AND ws_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev ORDER BY ss_items.item_id, ss_item_rev LIMIT 100"
+      },
+      "invariants_kept": [
+        "output columns unchanged",
+        "grain unchanged",
+        "same aggregation results",
+        "same join semantics"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Extracted the date subquery into a separate CTE (target_dates) to compute the valid date_sk values for the target week once, rather than repeating the subquery in each items CTE. Changed from IN-subquery filter to direct join with target_dates, pushing the filter down to the base tables (store_sales, catalog_sales, web_sales) before aggregation. This eliminates redundant scans of date_dim and allows the optimizer to use efficient hash joins for the date filtering."
+}
+```

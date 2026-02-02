@@ -1,0 +1,176 @@
+ The user wants me to optimize a SQL query based on the provided examples and rules.
+
+ Looking at the input:
+ 1. There's a CTE `[wss]` that does a GROUP BY on `d_week_seq, ss_store_sk` with sums of sales by day of week.
+ 2. The `[main_query]` uses this CTE twice (in two subqueries aliased as `y` and `x`) with different date filters:
+    - First subquery (`y`): `d_month_seq BETWEEN 1196 AND 1196 + 11` (first year)
+    - Second subquery (`x`): `d_month_seq BETWEEN 1196 + 12 AND 1196 + 23` (second year)
+ 3. Then it joins these two subqueries on `s_store_id1 = s_store_id2 AND d_week_seq1 = d_week_seq2 - 52`
+
+ The detected opportunities mention:
+ - PUSHDOWN: [main_query] filters on [wss] after GROUP BY
+ - Fix: Push filter into CTE before aggregation
+
+ Currently, the CTE `[wss]` aggregates ALL data from store_sales and date_dim, then the main query filters it by joining with date_dim again and applying the month_seq filters.
+
+ The optimization should:
+ 1. Push the date filters into the CTE `[wss]` to reduce the amount of data being aggregated.
+ 2. However, since `[wss]` is used twice with different date ranges (year 1 and year 2), we need to be careful.
+
+ Wait, looking closely at the main_query:
+ - The CTE `wss` is defined as: `SELECT ... FROM store_sales, date_dim WHERE d_date_sk = ss_sold_date_sk GROUP BY d_week_seq, ss_store_sk`
+ - Then in the main query:
+   - Subquery `y`: joins `wss` with `store` and `date_dim AS d` where `d.d_week_seq = wss.d_week_seq` and `d_month_seq BETWEEN 1196 AND 1196 + 11`
+   - Subquery `x`: joins `wss` with `store` and `date_dim AS d` where `d.d_week_seq = wss.d_week_seq` and `d_month_seq BETWEEN 1196 + 12 AND 1196 + 23`
+
+ So currently, `wss` aggregates data for all dates, then the main query filters by specific date ranges by joining with date_dim again.
+
+ The optimization is to push the date filters into the CTE `wss`. But since `wss` is used with two different date ranges, we have two options:
+ 1. Create two separate CTEs (one for each date range)
+ 2. Or, push the filter into the CTE by including the date_dim join and filter in the CTE itself, but since we need two different ranges, we might need to parameterize or split.
+
+ Actually, looking at the structure, the best approach is to push the date_dim filter into the wss CTE. But since wss needs to serve two different time periods, we should probably create a filtered version of wss that includes the date_dim join, or we should create two CTEs.
+
+ Wait, the detected opportunity says "Push filter into CTE before aggregation". This suggests we should modify the `wss` CTE to include the date filtering.
+
+ But since `wss` is used twice with different filters, we can't just push one filter. However, looking at the query, the filters are on `d_month_seq` which comes from `date_dim`. The CTE `wss` already joins with `date_dim` but only uses `d_date_sk` and `d_day_name`.
+
+ So the optimization is to:
+ 1. Include `d_month_seq` in the CTE output (projection change? but that's not allowed unless required)
+ 2. Or, better yet, since we need to filter by date ranges in the main query, we should push those filters into the CTE. But since there are two different ranges, we might need to create two CTEs or use a different approach.
+
+ Actually, looking at the main query structure again:
+ - It joins `wss` with `date_dim` again in both subqueries to get `d_month_seq`
+ - This is redundant because `wss` already joins with `date_dim` to get `d_day_name` and `d_week_seq`
+
+ The optimization should be:
+ - Push the `d_month_seq` filter into the `wss` CTE by including `d_month_seq` in the GROUP BY and SELECT, OR
+ - Since we need two different date ranges, create two CTEs: `wss_y` and `wss_x` (or `wss_year1` and `wss_year2`), each with their respective date filters pushed down.
+
+ But the transform is "pushdown", and the nodes are `[wss]` and `[main_query]`.
+
+ Let me think about how to structure this:
+
+ Option 1: Modify `wss` to include `d_month_seq` in the output and group by, then filter in the main query. But that's not really pushing down the filter, that's just exposing the column.
+
+ Option 2: Split `wss` into two CTEs, each with the appropriate date filter. This would be a more significant rewrite but achieves the pushdown.
+
+ Option 3: Since `wss` is used in two places with different implicit date filters (via the join to date_dim in the subqueries), we should push the date_dim join and filter into the CTE. But since the filters are different, we need two CTEs.
+
+ Looking at the examples, the first example shows creating multiple nodes (filtered_returns, customer_total_return, etc.). So creating multiple CTEs is acceptable.
+
+ So the rewrite should:
+ 1. Create `wss_year1` (or `wss_y`) with the filter `d_month_seq BETWEEN 1196 AND 1196 + 11` pushed into the WHERE clause
+ 2. Create `wss_year2` (or `wss_x`) with the filter `d_month_seq BETWEEN 1196 + 12 AND 1196 + 23` pushed into the WHERE clause
+ 3. Update `main_query` to use these two CTEs instead of joining with date_dim again
+
+ Wait, but the main query also joins with `store` table. The subqueries are:
+ - `y`: `FROM wss, store, date_dim AS d WHERE d.d_week_seq = wss.d_week_seq AND ss_store_sk = s_store_sk AND d_month_seq BETWEEN 1196 AND 1196 + 11`
+ - `x`: similar for the other date range
+
+ If we push the date filter into `wss`, we don't need to join with `date_dim` again in the subqueries (for the purpose of filtering), but we still need `d_week_seq` for the final join condition `d_week_seq1 = d_week_seq2 - 52`.
+
+ Actually, looking at the join condition: `d_week_seq1 = d_week_seq2 - 52`. This suggests that `d_week_seq` values from year 1 and year 2 are being compared with an offset of 52 weeks.
+
+ So if we create:
+ - `wss_y`: filtered for year 1, outputs `d_week_seq`, `ss_store_sk`, and the sales columns
+ - `wss_x`: filtered for year 2, outputs `d_week_seq`, `ss_store_sk`, and the sales columns
+
+ Then in the main query:
+ - Join `wss_y` with `store` to get store info (but we don't need date_dim anymore for filtering)
+ - Join `wss_x` with `store` to get store info
+ - Then join these two on the store_id and week_seq conditions
+
+ But wait, the original query selects `d_week_seq1` from the first subquery. If we push the filter into the CTE, we still have `d_week_seq` available.
+
+ So the rewrite would be:
+
+ ```json
+ {
+   "rewrite_sets": [
+     {
+       "id": "rs_01",
+       "transform": "pushdown",
+       "nodes": {
+         "wss_year1": "SELECT d_week_seq, ss_store_sk, SUM(CASE WHEN (d_day_name = 'Sunday') THEN ss_sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN ss_sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN ss_sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN ss_sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN ss_sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN ss_sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN ss_sales_price ELSE NULL END) AS sat_sales FROM store_sales, date_dim WHERE d_date_sk = ss_sold_date_sk AND d_month_seq BETWEEN 1196 AND 1196 + 11 GROUP BY d_week_seq, ss_store_sk",
+         "wss_year2": "SELECT d_week_seq, ss_store_sk, SUM(CASE WHEN (d_day_name = 'Sunday') THEN ss_sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN ss_sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN ss_sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN ss_sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN ss_sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN ss_sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN ss_sales_price ELSE NULL END) AS sat_sales FROM store_sales, date_dim WHERE d_date_sk = ss_sold_date_sk AND d_month_seq BETWEEN 1196 + 12 AND 1196 + 23 GROUP BY d_week_seq, ss_store_sk",
+         "main_query": "SELECT s_store_name1, s_store_id1, d_week_seq1, sun_sales1 / sun_sales2, mon_sales1 / mon_sales2, tue_sales1 / tue_sales2, wed_sales1 / wed_sales2, thu_sales1 / thu_sales2, fri_sales1 / fri_sales2, sat_sales1 / sat_sales2 FROM (SELECT s_store_name AS s_store_name1, wss_year1.d_week_seq AS d_week_seq1, s_store_id AS s_store_id1, sun_sales AS sun_sales1, mon_sales AS mon_sales1, tue_sales AS tue_sales1, wed_sales AS wed_sales1, thu_sales AS thu_sales1, fri_sales AS fri_sales1, sat_sales AS sat_sales1 FROM wss_year1, store WHERE ss_store_sk = s_store_sk) AS y, (SELECT s_store_name AS s_store_name2, wss_year2.d_week_seq AS d_week_seq2, s_store_id AS s_store_id2, sun_sales AS sun_sales2, mon_sales AS mon_sales2, tue_sales AS tue_sales2, wed_sales AS wed_sales2, thu_sales AS thu_sales2, fri_sales AS fri_sales2, sat_sales AS sat_sales2 FROM wss_year2, store WHERE ss_store_sk = s_store_sk) AS x WHERE s_store_id1 = s_store_id2 AND d_week_seq1 = d_week_seq2 - 52 ORDER BY s_store_name1, s_store_id1, d_week_seq1 LIMIT 100"
+       },
+       "invariants_kept": [
+         "same result rows",
+         "same ordering",
+         "same column output"
+       ],
+       "expected_speedup": "2x",
+       "risk": "low"
+     }
+   ]
+ }
+ ```
+
+ Wait, I need to check if the column names in the main_query output are correct. The original main_query has:
+ `sun_sales1 / sun_sales2` etc.
+
+ In my rewrite, I have `sun_sales1 / sun_sales2` which matches.
+
+ Also, I need to make sure the grain is preserved. The original `wss` has grain `[d_week_seq, ss_store_sk]`. The new CTEs have the same grain.
+
+ The `main_query` contract says grain is `['d_week_seq', 'ss_store_sk']` - actually looking at the output, it seems the grain is determined by the join of the two subqueries.
+
+ One thing to check: in the original query, the subqueries `y` and `x` select `s_store_name`, `d_week_seq`, `s_store_id`, and the sales columns. The `d_week_seq` comes from `wss` (aliased as `wss.d_week_seq`).
+
+ In my rewrite, `wss_year1` and `wss_year2` provide `d_week_seq`, so that's fine.
+
+ Also, the original query joins with `date_dim AS d` in both subqueries to filter by `d_month_seq`. By pushing this filter into the CTEs, we eliminate the need to join with `date_dim` in the main query subqueries. This reduces the data processed by the GROUP BY operations significantly (from all history to just 2 years of data).
+
+ This looks correct.
+
+ However, I should verify the column output names. The main_query output columns include expressions like `sun_sales1 / NULLIF(sun_sales2`. Wait, looking at the contract:
+ `output_columns: ['s_store_name1', 's_store_id1', 'd_week_seq1', 'sun_sales1 / NULLIF(sun_sales2', ...]`
+
+ But in the SQL provided:
+ `SELECT s_store_name1, s_store_id1, d_week_seq1, sun_sales1 / sun_sales2, ...`
+
+ There's a mismatch between the contract (which mentions NULLIF) and the actual SQL. I should follow the actual SQL provided in the subgraph slice, not the contract description which might be a simplified representation.
+
+ In the subgraph slice:
+ `SELECT s_store_name1, s_store_id1, d_week_seq1, sun_sales1 / sun_sales2, mon_sales1 / mon_sales2, tue_sales1 / tue_sales2, wed_sales1 / wed_sales2, thu_sales1 / thu_sales2, fri_sales1 / fri_sales2, sat_sales1 / sat_sales2`
+
+ So my rewrite should match this.
+
+ Also, I need to make sure I don't rename columns. The CTEs `wss_year1` and `wss_year2` output the same column names as the original `wss`, so the references in the main query will work (after updating the table names from `wss` to `wss_year1`/`wss_year2`).
+
+ Actually, looking at the main query, it references `wss.d_week_seq` and `sun_sales` etc. So if I change the CTE name from `wss` to `wss_year1`, I need to update the references in the main query.
+
+ Also, the original `wss` CTE is defined once and used twice. In my rewrite, I define two CTEs and use each once. This is effectively inlining the filtered versions.
+
+ One final check: the original query has `FROM wss, store, date_dim AS d` in both subqueries. In my rewrite, I removed the `date_dim` join because the filter is now in the CTE. But I kept the `store` join. That's correct.
+
+ The risk is low because we're just pushing filters down to reduce the dataset before aggregation.
+
+ Expected speedup is 2x as suggested in the detected opportunities.
+
+ So the final JSON should look like what I drafted above. </think> ```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "pushdown",
+      "nodes": {
+        "wss_year1": "SELECT d_week_seq, ss_store_sk, SUM(CASE WHEN (d_day_name = 'Sunday') THEN ss_sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN ss_sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN ss_sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN ss_sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN ss_sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN ss_sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN ss_sales_price ELSE NULL END) AS sat_sales FROM store_sales, date_dim WHERE d_date_sk = ss_sold_date_sk AND d_month_seq BETWEEN 1196 AND 1196 + 11 GROUP BY d_week_seq, ss_store_sk",
+        "wss_year2": "SELECT d_week_seq, ss_store_sk, SUM(CASE WHEN (d_day_name = 'Sunday') THEN ss_sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN ss_sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN ss_sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN ss_sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN ss_sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN ss_sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN ss_sales_price ELSE NULL END) AS sat_sales FROM store_sales, date_dim WHERE d_date_sk = ss_sold_date_sk AND d_month_seq BETWEEN 1196 + 12 AND 1196 + 23 GROUP BY d_week_seq, ss_store_sk",
+        "main_query": "SELECT s_store_name1, s_store_id1, d_week_seq1, sun_sales1 / sun_sales2, mon_sales1 / mon_sales2, tue_sales1 / tue_sales2, wed_sales1 / wed_sales2, thu_sales1 / thu_sales2, fri_sales1 / fri_sales2, sat_sales1 / sat_sales2 FROM (SELECT s_store_name AS s_store_name1, wss_year1.d_week_seq AS d_week_seq1, s_store_id AS s_store_id1, sun_sales AS sun_sales1, mon_sales AS mon_sales1, tue_sales AS tue_sales1, wed_sales AS wed_sales1, thu_sales AS thu_sales1, fri_sales AS fri_sales1, sat_sales AS sat_sales1 FROM wss_year1, store WHERE ss_store_sk = s_store_sk) AS y, (SELECT s_store_name AS s_store_name2, wss_year2.d_week_seq AS d_week_seq2, s_store_id AS s_store_id2, sun_sales AS sun_sales2, mon_sales AS mon_sales2, tue_sales AS tue_sales2, wed_sales AS wed_sales2, thu_sales AS thu_sales2, fri_sales AS fri_sales2, sat_sales AS sat_sales2 FROM wss_year2, store WHERE ss_store_sk = s_store_sk) AS x WHERE s_store_id1 = s_store_id2 AND d_week_seq1 = d_week_seq2 - 52 ORDER BY s_store_name1, s_store_id1, d_week_seq1 LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "grain preserved in CTEs"
+      ],
+      "expected_speedup": "2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Split the wss CTE into two CTEs (wss_year1 and wss_year2) and pushed the d_month_seq date range filters into each CTE before the GROUP BY aggregation. This eliminates the redundant date_dim joins in the main query subqueries and reduces the data volume processed by the aggregations by filtering to specific 12-month periods before computing the daily sales sums."
+}
+```

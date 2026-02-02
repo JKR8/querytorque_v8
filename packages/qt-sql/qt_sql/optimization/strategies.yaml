@@ -1,0 +1,134 @@
+# SQL Optimization Strategies
+# Patterns that have produced >2x speedups on analytical queries
+
+strategies:
+  - id: dimension_filter_hoisting
+    name: Dimension Filter Hoisting
+    description: |
+      Move filtered dimension joins from outer query into CTE/subquery that
+      aggregates fact data with FK relationship to that dimension.
+    signal:
+      - Filtered dimension table in main_query (e.g., state='X', year=2000)
+      - CTE aggregates fact table that has FK to that dimension
+      - CTE does NOT include the dimension filter
+    fix: |
+      Join the filtered dimension INTO the CTE before GROUP BY.
+      This filters fact rows early, reducing aggregation work.
+    example:
+      before: |
+        WITH agg AS (SELECT fk_col, SUM(val) FROM fact GROUP BY fk_col)
+        SELECT * FROM agg, dim WHERE agg.fk_col = dim.pk AND dim.filter = 'X'
+      after: |
+        WITH agg AS (
+          SELECT fk_col, SUM(val) FROM fact, dim
+          WHERE fact.fk_col = dim.pk AND dim.filter = 'X'
+          GROUP BY fk_col
+        )
+        SELECT * FROM agg
+    verified_speedup: "2.44x"
+
+  - id: correlated_to_window
+    name: Correlated Subquery to Window Function
+    description: |
+      Replace correlated subqueries that compute per-group aggregates with
+      window functions computed in a single pass.
+    signal:
+      - Correlated subquery in WHERE/SELECT computing AVG, SUM, COUNT per group
+      - Subquery references outer query's grouping column
+    fix: |
+      Add window function to CTE: AGG(...) OVER (PARTITION BY group_col)
+      Reference the pre-computed value instead of subquery.
+    example:
+      before: |
+        SELECT * FROM t1 WHERE val > (SELECT AVG(val) FROM t1 t2 WHERE t1.grp = t2.grp)
+      after: |
+        WITH t AS (SELECT *, AVG(val) OVER (PARTITION BY grp) as grp_avg FROM t1)
+        SELECT * FROM t WHERE val > grp_avg
+    verified_speedup: "2x+ (combined with filter hoisting)"
+
+  - id: join_elimination
+    name: Join Elimination
+    description: |
+      Remove tables that are joined only to validate FK existence,
+      when no columns from that table are used in output.
+    signal:
+      - Table joined but no columns selected from it
+      - Join is on FK relationship
+      - No filters on the joined table
+    fix: |
+      Remove the join entirely.
+      Add WHERE fk_column IS NOT NULL to preserve the FK validation.
+    example:
+      before: |
+        SELECT a.* FROM fact a, dim b WHERE a.dim_sk = b.dim_sk
+      after: |
+        SELECT a.* FROM fact a WHERE a.dim_sk IS NOT NULL
+    verified_speedup: "2.18x"
+
+  - id: union_all_decomposition
+    name: UNION ALL Decomposition
+    description: |
+      Split complex OR conditions into separate queries with simple filters,
+      then UNION ALL the results.
+    signal:
+      - Complex OR condition in WHERE clause
+      - OR spans different columns or value ranges
+      - Query does full table scan due to OR
+    fix: |
+      Create separate queries for each OR branch with simple equality/range filters.
+      UNION ALL the results (ensure no duplicates or handle with DISTINCT).
+    example:
+      before: |
+        SELECT * FROM t WHERE (col1 IN (...) OR col2 = 'X' OR col3 > 500)
+      after: |
+        SELECT * FROM t WHERE col3 > 500
+        UNION ALL
+        SELECT * FROM t WHERE col3 <= 500 AND (col1 IN (...) OR col2 = 'X')
+    verified_speedup: "1.37x"
+
+  - id: scan_consolidation
+    name: Scan Consolidation
+    description: |
+      Combine multiple scans of the same table (with different filters)
+      into a single scan with conditional aggregation.
+    signal:
+      - Same table appears in multiple CTEs or subqueries
+      - Each scan has different filter conditions
+      - Results are combined later
+    fix: |
+      Single scan with CASE WHEN expressions to compute multiple aggregates.
+    example:
+      before: |
+        SELECT (SELECT SUM(x) FROM t WHERE year=2000),
+               (SELECT SUM(x) FROM t WHERE year=2001)
+      after: |
+        SELECT SUM(CASE WHEN year=2000 THEN x END),
+               SUM(CASE WHEN year=2001 THEN x END)
+        FROM t WHERE year IN (2000, 2001)
+    verified_speedup: "Variable - depends on scan cost"
+
+# Priority order for applying strategies
+priority:
+  - dimension_filter_hoisting  # Highest impact - filters early
+  - correlated_to_window       # Eliminates O(n²) patterns
+  - join_elimination           # Removes unnecessary work
+  - union_all_decomposition    # Helps with complex OR
+  - scan_consolidation         # Reduces I/O
+
+# Detection hints for prompts
+detection_signals:
+  dimension_filter_hoisting:
+    - "Filtered dimension in main_query, unfiltered fact aggregation in CTE"
+    - "Table scans show: dim table FILTERED, fact table NO FILTER"
+  correlated_to_window:
+    - "Correlated subquery with AVG/SUM/COUNT"
+    - "Subquery references outer table's column"
+  join_elimination:
+    - "Table in FROM but no columns in SELECT"
+    - "Join only validates FK existence"
+  union_all_decomposition:
+    - "Complex OR condition spanning multiple columns"
+    - "Full table scan despite selective conditions"
+  scan_consolidation:
+    - "Same table scanned N× in different CTEs"
+    - "Repeated Scans section shows table: N×"

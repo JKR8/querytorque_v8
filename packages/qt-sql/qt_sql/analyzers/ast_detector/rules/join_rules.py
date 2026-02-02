@@ -30,9 +30,9 @@ class CartesianJoinRule(ASTRule):
 
     rule_id = "SQL-JOIN-001"
     name = "Cartesian Join"
-    severity = "critical"
+    severity = "info"  # Demoted: high false positive rate on comma joins with WHERE predicates
     category = "joins"
-    penalty = 20
+    penalty = 0  # Info only - not actionable by optimizer
     description = "Possible Cartesian product - rows multiply between tables"
     suggestion = "Add explicit JOIN with ON clause, or confirm CROSS JOIN is intentional"
 
@@ -208,30 +208,29 @@ class ImplicitJoinRule(ASTRule):
 
     rule_id = "SQL-JOIN-002"
     name = "Implicit Join Syntax"
-    severity = "medium"
+    severity = "info"  # Demoted: style preference only, not a performance issue
     category = "joins"
-    penalty = 10
+    penalty = 0  # Info only - not actionable by optimizer
     description = "Legacy comma-join syntax - use explicit JOIN instead"
     suggestion = "Rewrite using explicit INNER JOIN with ON clause"
 
-    target_node_types = (exp.From,)
+    # Target Join nodes directly (they're siblings of From in sqlglot's parse tree)
+    target_node_types = (exp.Join,)
 
     def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
-        # Look for joins with empty/null kind (comma syntax)
-        for join in node.find_all(exp.Join):
-            join_kind = getattr(join, 'kind', None)
-            on_clause = join.args.get('on')
-            using_clause = join.args.get('using')
+        # Check if this Join has empty kind (comma syntax)
+        join_kind = getattr(node, 'kind', None)
+        on_clause = node.args.get('on')
+        using_clause = node.args.get('using')
 
-            # Empty kind = comma join (even if WHERE provides the condition)
-            if not join_kind and not on_clause and not using_clause:
-                yield RuleMatch(
-                    node=join,
-                    context=context,
-                    message="Implicit comma-join syntax - prefer explicit JOIN",
-                    matched_text=join.sql()[:80],
-                )
-                return  # Only report once per FROM
+        # Empty kind = comma join (even if WHERE provides the condition)
+        if not join_kind and not on_clause and not using_clause:
+            yield RuleMatch(
+                node=node,
+                context=context,
+                message="Implicit comma-join syntax - prefer explicit JOIN",
+                matched_text=node.sql()[:80],
+            )
 
 
 class FunctionInJoinRule(ASTRule):

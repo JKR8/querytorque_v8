@@ -161,7 +161,17 @@ public class CalciteOptimizer {
                     .withIdentifierQuoteString("\"")
                     .withUnquotedCasing(org.apache.calcite.avatica.util.Casing.TO_LOWER)
                     .withQuotedCasing(org.apache.calcite.avatica.util.Casing.UNCHANGED)
-    );
+    ) {
+        @Override
+        public boolean supportsCharSet() {
+            return false;
+        }
+
+        @Override
+        public boolean supportsNestedAggregations() {
+            return false;
+        }
+    };
 
     /**
      * Convert RelNode back to SQL string.
@@ -174,6 +184,8 @@ public class CalciteOptimizer {
         sql = sql.replaceAll("\"?DUCKDB\"?\\.", "");
         // Remove double quotes around identifiers for cleaner output
         sql = sql.replace("\"", "");
+        // DuckDB doesn't accept CHARACTER SET in CASTs; strip it.
+        sql = sql.replaceAll("(?i)\\s+character\\s+set\\s+[A-Za-z0-9_-]+", "");
         return sql;
     }
 

@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from qt_shared.auth import OptionalUser, CurrentUser, UserContext
 from qt_shared.config import get_settings, Settings
 
-from qt_dax.analyzers.vpax_analyzer import VPAXAnalyzer
+from qt_dax.analyzers.vpax_analyzer import ReportGenerator, DiagnosticReport, VPAXIssue
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -39,20 +39,17 @@ app = FastAPI(
 )
 
 
-# CORS configuration
-@app.on_event("startup")
-async def configure_cors():
-    """Configure CORS based on settings."""
-    settings = get_settings()
-    origins = [origin.strip() for origin in settings.cors_origins.split(",")]
+# CORS configuration - must be added at module level, not in startup event
+_settings = get_settings()
+_origins = [origin.strip() for origin in _settings.cors_origins.split(",")]
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # Request/Response models
@@ -60,14 +57,16 @@ class DAXIssueResponse(BaseModel):
     """A detected DAX issue."""
 
     rule_id: str
-    name: str
+    rule_name: str
     severity: str
     category: str
-    penalty: int
     description: str
-    affected_object: Optional[str] = None
-    explanation: str = ""
-    suggestion: str = ""
+    recommendation: str
+    object_type: str
+    object_name: str
+    table_name: Optional[str] = None
+    code_snippet: Optional[str] = None
+    reference: Optional[str] = None
 
 
 class ModelStatsResponse(BaseModel):
@@ -234,42 +233,51 @@ async def analyze_vpax(
 
         try:
             # Run analysis
-            analyzer = VPAXAnalyzer()
-            result = analyzer.analyze(tmp_path)
+            generator = ReportGenerator(str(tmp_path))
+            result = generator.generate()
 
             # Convert to response format
             issues = [
                 DAXIssueResponse(
                     rule_id=issue.rule_id,
-                    name=issue.name,
+                    rule_name=issue.rule_name,
                     severity=issue.severity,
                     category=issue.category,
-                    penalty=issue.penalty,
                     description=issue.description,
-                    affected_object=issue.affected_object,
-                    explanation=issue.explanation,
-                    suggestion=issue.suggestion,
+                    recommendation=issue.recommendation,
+                    object_type=issue.object_type,
+                    object_name=issue.object_name,
+                    table_name=issue.table_name,
+                    code_snippet=issue.code_snippet,
+                    reference=issue.reference,
                 )
-                for issue in result.issues
+                for issue in result.all_issues
             ]
 
-            model_stats = None
-            if result.model_stats:
-                model_stats = ModelStatsResponse(**result.model_stats)
+            # Build model stats from summary
+            summary = result.summary
+            model_stats = ModelStatsResponse(
+                total_size_mb=summary.total_size_bytes / (1024 * 1024),
+                table_count=summary.total_tables,
+                column_count=summary.total_columns,
+                measure_count=summary.total_measures,
+                relationship_count=summary.total_relationships,
+                local_date_tables=summary.local_date_table_count,
+            )
 
             return AnalyzeResponse(
-                torque_score=result.torque_score,
-                total_penalty=result.total_penalty,
-                quality_gate=get_quality_gate(result.torque_score),
+                torque_score=summary.torque_score,
+                total_penalty=summary.total_penalty,
+                quality_gate=get_quality_gate(summary.torque_score),
                 severity_counts={
-                    "critical": result.critical_count,
-                    "high": result.high_count,
-                    "medium": result.medium_count,
-                    "low": result.low_count,
+                    "critical": summary.critical_count,
+                    "high": summary.high_count,
+                    "medium": summary.medium_count,
+                    "low": summary.low_count,
                 },
                 issues=issues,
                 model_stats=model_stats,
-                optimization_context=result.optimization_context,
+                optimization_context=None,
             )
 
         finally:
@@ -320,8 +328,8 @@ async def analyze_vpax_report(
 
         try:
             # Run analysis
-            analyzer = VPAXAnalyzer()
-            result = analyzer.analyze(tmp_path)
+            generator = ReportGenerator(str(tmp_path))
+            result = generator.generate()
 
             # Generate HTML report
             from qt_dax.renderers import DAXRenderer

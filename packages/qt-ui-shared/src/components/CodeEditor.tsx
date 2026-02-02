@@ -114,7 +114,7 @@ export function CodeEditor({
     // Register DAX language if not already registered
     if (language === 'dax') {
       const languages = monaco.languages.getLanguages()
-      const daxExists = languages.some(lang => lang.id === 'dax')
+      const daxExists = languages.some((lang: { id: string }) => lang.id === 'dax')
 
       if (!daxExists) {
         // Register DAX as a custom language
