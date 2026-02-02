@@ -212,9 +212,9 @@ def audit(
 @click.option("--show-prompt", is_flag=True, help="Display the full prompt sent to LLM")
 @click.option(
     "--mode",
-    type=click.Choice(["dag-v2", "full", "mcts"]),
-    default="dag-v2",
-    help="Optimization mode: dag-v2 (default), full (full SQL), mcts (tree search)"
+    type=click.Choice(["dag", "full", "mcts"]),
+    default="dag",
+    help="Optimization mode: dag (default), full (full SQL), mcts (tree search)"
 )
 @click.option("--mcts-iterations", default=30, help="Maximum MCTS iterations (default: 30)")
 def optimize(
