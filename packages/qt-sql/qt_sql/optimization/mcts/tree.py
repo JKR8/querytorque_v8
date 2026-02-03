@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,6 +13,7 @@ from typing import Optional, Callable, Any
 from .node import MCTSNode
 from .transforms import get_all_transform_ids, apply_transformation, apply_dag_transformation
 from .reward import compute_reward, RewardConfig
+from .priors import PriorConfig, TransformPrior, compute_contextual_priors, get_priors_for_node
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +128,7 @@ class MCTSTree:
         llm_client: Any,
         validator: Any,
         reward_config: Optional[RewardConfig] = None,
+        prior_config: Optional[PriorConfig] = None,
         c: float = 1.414,
         max_depth: int = 5,
         transform_ids: Optional[list[str]] = None,
@@ -138,6 +141,7 @@ class MCTSTree:
             llm_client: LLM client with analyze() method.
             validator: SQLValidator instance.
             reward_config: Configuration for reward computation.
+            prior_config: Configuration for PUCT prior computation.
             c: UCT exploration constant. Higher = more exploration.
             max_depth: Maximum depth of transformations to chain.
             transform_ids: List of transformation IDs to use.
@@ -148,6 +152,7 @@ class MCTSTree:
         self.llm_client = llm_client
         self.validator = validator
         self.reward_config = reward_config or RewardConfig()
+        self.prior_config = prior_config or PriorConfig()
         self.c = c
         self.max_depth = max_depth
         self.use_dag_mode = use_dag_mode
@@ -170,10 +175,14 @@ class MCTSTree:
         self.successful_expansions = 0
         self.failed_expansions = 0
         self.validation_calls = 0
+        self.llm_ranking_calls = 0
 
         # Detailed logging
         self.transform_attempts: list[TransformAttempt] = []
         self.selection_steps: list[SelectionStep] = []
+
+        # Cache priors per node (keyed by tuple of applied_transforms)
+        self._prior_cache: dict[tuple[str, ...], dict[str, TransformPrior]] = {}
 
     def select(self, node: Optional[MCTSNode] = None, log_selection: bool = True) -> MCTSNode:
         """Select a node for expansion using UCT.
@@ -272,22 +281,26 @@ class MCTSTree:
     def expand(self, node: MCTSNode) -> Optional[MCTSNode]:
         """Expand a node by applying an untried transformation.
 
+        Uses progressive widening to limit candidates based on visit count,
+        then selects using PUCT scores.
+
         Args:
             node: Node to expand.
 
         Returns:
             New child node if expansion successful, None if failed.
         """
-        untried = node.get_untried_transforms()
-        if not untried:
+        # Get candidates with progressive widening
+        candidates = self._get_expansion_candidates(node)
+        if not candidates:
             return None
 
         # Don't expand beyond max depth
         if node.depth >= self.max_depth:
             return None
 
-        # Pick transform to try (could use heuristics here)
-        transform_id = self._select_transform(untried, node)
+        # Pick transform using PUCT selection
+        transform_id = self._select_transform(candidates, node)
 
         # Create attempt record
         attempt = TransformAttempt(
@@ -354,6 +367,7 @@ class MCTSTree:
         """Expand a node by applying multiple transformations in parallel.
 
         Makes parallel LLM API calls but returns nodes for sequential validation.
+        Uses progressive widening to select candidates.
 
         Args:
             node: Node to expand.
@@ -362,16 +376,23 @@ class MCTSTree:
         Returns:
             List of successfully created child nodes (not yet validated).
         """
-        untried = node.get_untried_transforms()
-        if not untried:
+        # Get candidates with progressive widening
+        candidates = self._get_expansion_candidates(node)
+        if not candidates:
             return []
 
         # Don't expand beyond max depth
         if node.depth >= self.max_depth:
             return []
 
-        # Pick transforms to try (up to num_transforms)
-        transforms_to_try = untried[:num_transforms]
+        # Pick transforms to try (up to num_transforms), sorted by PUCT prior
+        priors = self._get_priors(node)
+        sorted_candidates = sorted(
+            candidates,
+            key=lambda t: priors.get(t, TransformPrior(t, 0, "")).prior,
+            reverse=True,
+        )
+        transforms_to_try = sorted_candidates[:num_transforms]
 
         # Apply transformations in parallel
         results: list[tuple[str, Optional[str], Optional[str], int]] = []
@@ -605,10 +626,11 @@ class MCTSTree:
     def _select_transform(self, candidates: list[str], node: MCTSNode) -> str:
         """Select which transform to try next.
 
-        Currently uses random selection, but could incorporate:
-        - Transform success rates
-        - Query-specific heuristics
-        - Learning from past runs
+        If use_puct=True (default), uses PUCT scores to balance:
+        - Exploitation: prefer transforms that have worked well
+        - Exploration: weighted by prior probability from KB/opportunity detection
+
+        If use_puct=False, uses original random selection for comparison.
 
         Args:
             candidates: List of untried transform IDs.
@@ -617,8 +639,144 @@ class MCTSTree:
         Returns:
             Transform ID to try.
         """
-        # Simple random selection for now
-        return random.choice(candidates)
+        if not candidates:
+            return ""
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Original random selection mode (for comparison)
+        if not self.prior_config.use_puct:
+            return random.choice(candidates)
+
+        # PUCT selection mode
+        priors = self._get_priors(node)
+
+        best_score = float("-inf")
+        best_transform = candidates[0]
+
+        for tid in candidates:
+            prior = priors.get(tid)
+            p = prior.prior if prior else 1.0 / len(candidates)
+
+            if tid in node.children:
+                # Visited child: use full PUCT formula
+                score = node.children[tid].puct_score(
+                    node.visit_count, p, self.prior_config.c_puct
+                )
+            else:
+                # Unvisited: pure exploration term
+                score = self.prior_config.c_puct * p * math.sqrt(node.visit_count + 1)
+
+            if score > best_score:
+                best_score = score
+                best_transform = tid
+
+        return best_transform
+
+    def _get_priors(self, node: MCTSNode) -> dict[str, TransformPrior]:
+        """Get cached or compute priors for a node.
+
+        Args:
+            node: The node to get priors for.
+
+        Returns:
+            Dict mapping transform_id to TransformPrior.
+        """
+        # Use applied_transforms as cache key
+        cache_key = tuple(node.applied_transforms)
+
+        if cache_key in self._prior_cache:
+            return self._prior_cache[cache_key]
+
+        # Check if we should use LLM ranking
+        use_llm = False
+        if self.prior_config.use_llm_ranking:
+            from .llm_ranker import should_use_llm_ranking
+
+            children_stats = None
+            if node.children:
+                children_stats = {
+                    tid: (child.visit_count, child.avg_reward)
+                    for tid, child in node.children.items()
+                }
+
+            use_llm = should_use_llm_ranking(
+                node.visit_count,
+                node.avg_reward,
+                len(node.remaining_transforms),
+                children_stats,
+            )
+
+            if use_llm:
+                self.llm_ranking_calls += 1
+
+        # Compute priors
+        priors = get_priors_for_node(
+            sql=node.query_sql,
+            transform_ids=node.remaining_transforms,
+            applied_transforms=node.applied_transforms,
+            config=self.prior_config,
+            llm_client=self.llm_client if use_llm else None,
+        )
+
+        self._prior_cache[cache_key] = priors
+        return priors
+
+    def _get_expansion_candidates(self, node: MCTSNode) -> list[str]:
+        """Get candidates for expansion with progressive widening.
+
+        If use_puct=True, progressive widening limits the number of children
+        considered based on parent visits: k = factor * sqrt(visits)
+
+        If use_puct=False (original mode), returns all untried transforms.
+
+        Args:
+            node: Node to get expansion candidates for.
+
+        Returns:
+            List of transform IDs to consider (may be subset of untried).
+        """
+        untried = node.get_untried_transforms()
+        if not untried:
+            return []
+
+        # Original mode: no widening, return all untried
+        if not self.prior_config.use_puct:
+            return untried
+
+        # PUCT mode: apply progressive widening
+        k = self._compute_widening_limit(node.visit_count, len(untried))
+
+        if k >= len(untried):
+            return untried
+
+        # Sort by prior and return top-k
+        priors = self._get_priors(node)
+        sorted_candidates = sorted(
+            untried,
+            key=lambda t: priors.get(t, TransformPrior(t, 0, "")).prior,
+            reverse=True,
+        )
+        return sorted_candidates[:k]
+
+    def _compute_widening_limit(self, parent_visits: int, num_candidates: int) -> int:
+        """Compute the progressive widening limit.
+
+        k = min(ceil(factor * sqrt(visits)), candidates)
+
+        Args:
+            parent_visits: Number of visits to parent node.
+            num_candidates: Total number of candidate transforms.
+
+        Returns:
+            Maximum number of transforms to consider.
+        """
+        k = int(math.ceil(
+            self.prior_config.widening_factor * math.sqrt(max(parent_visits, 1))
+        ))
+        k = max(k, self.prior_config.min_widening)  # Ensure minimum
+        return min(k, num_candidates)
 
     def get_best_node(self) -> MCTSNode:
         """Get the best node found so far.
@@ -713,6 +871,7 @@ class MCTSTree:
             "successful_expansions": self.successful_expansions,
             "failed_expansions": self.failed_expansions,
             "validation_calls": self.validation_calls,
+            "llm_ranking_calls": self.llm_ranking_calls,
             "root_visits": self.root.visit_count,
             "total_attempts": len(self.transform_attempts),
         }

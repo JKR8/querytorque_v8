@@ -100,6 +100,35 @@ class MCTSNode:
         exploration = c * math.sqrt(math.log(parent_visits) / self.visit_count)
         return exploitation + exploration
 
+    def puct_score(self, parent_visits: int, prior: float, c_puct: float = 2.0) -> float:
+        """Calculate PUCT score for this node.
+
+        PUCT = Q(s,a) + c * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
+
+        The PUCT formula (from AlphaGo/AlphaZero) balances:
+        - Exploitation (Q): average reward of this action
+        - Exploration: weighted by prior probability and inverse visit count
+
+        Unlike UCT, PUCT uses a prior probability P(s,a) to guide initial
+        exploration toward more promising transforms.
+
+        Args:
+            parent_visits: Number of visits to parent node N(s).
+            prior: Prior probability P(s,a) for this action (0.0 to 1.0).
+            c_puct: PUCT exploration constant. Higher = more exploration.
+                    Default 2.0 is typical for tree search problems.
+
+        Returns:
+            PUCT score for this node.
+        """
+        if self.visit_count == 0:
+            # Unvisited: pure exploration term (infinite if prior > 0)
+            return c_puct * prior * math.sqrt(parent_visits + 1)
+
+        exploitation = self.avg_reward
+        exploration = c_puct * prior * math.sqrt(parent_visits) / (1 + self.visit_count)
+        return exploitation + exploration
+
     def get_untried_transforms(self) -> list[str]:
         """Get transforms that haven't been tried yet at this node."""
         tried = set(self.children.keys())

@@ -29,6 +29,7 @@ from .node import MCTSNode
 from .tree import MCTSTree
 from .transforms import get_all_transform_ids, get_transform_description, apply_dag_transformation
 from .reward import RewardConfig
+from .priors import PriorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ class MCTSSQLOptimizer:
         c: float = 1.414,
         max_depth: int = 5,
         reward_config: Optional[RewardConfig] = None,
+        prior_config: Optional[PriorConfig] = None,
         transform_ids: Optional[list[str]] = None,
         use_dag_mode: bool = True,
     ):
@@ -122,6 +124,7 @@ class MCTSSQLOptimizer:
             c: UCT exploration constant.
             max_depth: Maximum depth of transformation chains.
             reward_config: Reward function configuration.
+            prior_config: PUCT prior computation configuration.
             transform_ids: Specific transforms to use (None = all).
             use_dag_mode: Use DAG-based node patching (default True).
         """
@@ -129,6 +132,7 @@ class MCTSSQLOptimizer:
         self.c = c
         self.max_depth = max_depth
         self.reward_config = reward_config or RewardConfig()
+        self.prior_config = prior_config or PriorConfig()
         self.transform_ids = transform_ids or get_all_transform_ids()
         self.use_dag_mode = use_dag_mode
 
@@ -199,6 +203,7 @@ class MCTSSQLOptimizer:
             llm_client=self._get_llm_client(),
             validator=self._get_validator(),
             reward_config=self.reward_config,
+            prior_config=self.prior_config,
             c=self.c,
             max_depth=self.max_depth,
             transform_ids=self.transform_ids,
@@ -331,6 +336,7 @@ class MCTSSQLOptimizer:
             llm_client=self._get_llm_client(),
             validator=self._get_validator(),
             reward_config=self.reward_config,
+            prior_config=self.prior_config,
             c=self.c,
             max_depth=self.max_depth,
             transform_ids=self.transform_ids,
