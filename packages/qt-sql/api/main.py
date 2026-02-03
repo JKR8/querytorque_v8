@@ -84,6 +84,28 @@ class SQLIssueResponse(BaseModel):
     suggestion: str = ""
 
 
+class OpportunityResponse(BaseModel):
+    """A detected optimization opportunity."""
+
+    pattern_id: str
+    pattern_name: str
+    trigger: str
+    rewrite_hint: str
+    weight: int = 5  # 1-10 impact score
+    weight_label: str = "Medium"  # Critical/High/Medium/Low/Minor
+
+
+class SavingsEstimateResponse(BaseModel):
+    """Estimated annual savings from optimization."""
+
+    band_display: str  # e.g., "$500 - $2,000"
+    low: float
+    mid: float
+    high: float
+    total_weight: int
+    opportunity_count: int
+
+
 class AnalyzeResponse(BaseModel):
     """Response from SQL analysis."""
 
@@ -91,6 +113,14 @@ class AnalyzeResponse(BaseModel):
     total_penalty: int = Field(..., description="Total penalty points")
     severity_counts: dict = Field(..., description="Issue counts by severity")
     issues: list[SQLIssueResponse] = Field(default_factory=list)
+    opportunities: list[OpportunityResponse] = Field(
+        default_factory=list,
+        description="High-value optimization opportunities (fed to LLM optimizer)"
+    )
+    savings_estimate: Optional[SavingsEstimateResponse] = Field(
+        default=None,
+        description="Estimated annual savings if query runs daily"
+    )
     query_structure: Optional[dict] = Field(
         default=None,
         description="Query structure information (CTEs, joins, etc.)"
@@ -251,11 +281,62 @@ async def analyze_sql(
     )
 
     try:
-        # Run static analysis
+        # Run static analysis (includes AST-based opportunity detection)
         detector = SQLAntiPatternDetector(dialect=request.dialect)
         result = detector.analyze(request.sql, include_structure=request.include_structure)
 
-        # Convert to response format
+        # Separate AST-detected optimization opportunities from regular issues
+        # Opportunities have category="optimization_opportunity" and rule_id starts with "QT-OPT-"
+        ast_opportunities = []
+        regular_issues = []
+        for issue in result.issues:
+            if issue.category == "optimization_opportunity" and issue.rule_id.startswith("QT-OPT-"):
+                ast_opportunities.append(issue)
+            else:
+                regular_issues.append(issue)
+
+        # Convert AST opportunities to OpportunityResponse format
+        from qt_sql.optimization.knowledge_base import get_transform, TransformID
+        from qt_sql.optimization.cost_estimator import (
+            estimate_savings, get_weight_description
+        )
+
+        opportunities = []
+        for opp in ast_opportunities:
+            # Look up the pattern in knowledge base for rewrite hints and weight
+            transform = None
+            for tid in TransformID:
+                t = get_transform(tid)
+                if t and t.code == opp.rule_id:
+                    transform = t
+                    break
+
+            weight = transform.weight if transform else 5
+            opportunities.append(OpportunityResponse(
+                pattern_id=opp.rule_id,
+                pattern_name=opp.name,
+                trigger=opp.match or opp.description,
+                rewrite_hint=transform.rewrite_hint if transform else opp.suggestion,
+                weight=weight,
+                weight_label=get_weight_description(weight),
+            ))
+
+        # Estimate savings (100x data scale, 24 runs/day, Snowflake pricing)
+        savings = estimate_savings(
+            opportunities=opportunities,
+            query_complexity=result.query_structure,
+            dialect=request.dialect,
+        )
+        savings_estimate = SavingsEstimateResponse(
+            band_display=savings.band_display,
+            low=savings.low,
+            mid=savings.mid,
+            high=savings.high,
+            total_weight=savings.total_weight,
+            opportunity_count=savings.opportunity_count,
+        ) if opportunities else None
+
+        # Convert regular issues to response format (excluding opportunities)
         issues = [
             SQLIssueResponse(
                 rule_id=issue.rule_id,
@@ -269,7 +350,7 @@ async def analyze_sql(
                 explanation=issue.explanation,
                 suggestion=issue.suggestion,
             )
-            for issue in result.issues
+            for issue in regular_issues
         ]
 
         # Determine status based on score
@@ -290,6 +371,8 @@ async def analyze_sql(
                 sql=request.sql,
                 filename="query.sql",
                 dialect=request.dialect,
+                opportunities=opportunities,
+                savings_estimate=savings.to_dict() if savings_estimate else None,
             )
         except Exception as e:
             logger.warning(f"Failed to render HTML report: {e}")
@@ -305,6 +388,8 @@ async def analyze_sql(
                 "low": result.low_count,
             },
             issues=issues,
+            opportunities=opportunities,
+            savings_estimate=savings_estimate,
             query_structure=result.query_structure,
             html=html_report,
             original_sql=request.sql,

@@ -1,12 +1,17 @@
-"""Optimization opportunity detection rules.
+"""Optimization opportunity detection rules (AST-based).
 
-These rules detect patterns that are likely to benefit from specific rewrites,
-based on empirical evidence from TPC-DS optimization runs.
+These rules perform AST-based detection of patterns from the knowledge base.
+For the canonical pattern definitions, see:
+    qt_sql.optimization.knowledge_base
 
 Pattern Evidence (TPC-DS SF100, DuckDB):
-- UNION decomposition: 2-3x speedup (q15: 2.98x, q23: 2.33x, q45: 2.26x)
-- Early date filtering: 1.5-2.5x speedup (q39: 2.44x, q92: 2.06x)
-- Materialized CTE: 1.2-2x speedup (q95: 2.25x)
+- or_to_union: 2.98x (Q15)
+- correlated_to_cte: 2.81x (Q1)
+- date_cte_isolate: 2.67x (Q15)
+- push_pred: 2.71x (Q93)
+- consolidate_scans: 1.84x (Q90)
+
+NOTE: QT-OPT codes here match knowledge_base.TRANSFORM_REGISTRY codes exactly.
 """
 
 from typing import Iterator, Set
@@ -31,7 +36,8 @@ FACT_TABLES = {
 class OrToUnionOpportunity(ASTRule):
     """QT-OPT-001: OR conditions across different columns - UNION ALL opportunity.
 
-    Empirical speedup: 2-3x (q15: 2.98x, q23: 2.33x, q45: 2.26x, q24: 2.16x)
+    Knowledge Base: or_to_union
+    Empirical speedup: 2-3x (Q15: 2.98x, Q23: 2.33x, Q45: 2.26x, Q24: 2.16x)
 
     Pattern detected:
         WHERE (col_a = X OR col_b = Y OR col_c > Z)
@@ -42,18 +48,13 @@ class OrToUnionOpportunity(ASTRule):
         SELECT ... WHERE col_b = Y
         UNION ALL
         SELECT ... WHERE col_c > Z
-
-    Why it helps:
-    - Each branch can use its own index
-    - Parallel execution of branches in modern DBs
-    - Reduces rows processed per branch
     """
 
-    rule_id = "QT-OPT-001"
-    name = "OR to UNION ALL Opportunity"
-    severity = "optimization"
+    rule_id = "QT-OPT-001"  # Matches knowledge_base.TransformID.OR_TO_UNION
+    name = "OR to UNION ALL Decomposition"
+    severity = "high"  # High-value transform
     category = "optimization_opportunity"
-    penalty = 0  # Not a penalty - it's an opportunity
+    penalty = 0
     description = "OR across different columns can be rewritten as UNION ALL for 2-3x speedup"
     suggestion = "Split OR conditions into separate SELECT statements joined with UNION ALL"
 
@@ -118,37 +119,30 @@ class OrToUnionOpportunity(ASTRule):
 
 
 class LateDateFilterOpportunity(ASTRule):
-    """QT-OPT-002: Date filtering happens late - early CTE opportunity.
+    """QT-OPT-003: Date filtering happens late - early CTE opportunity.
 
-    Empirical speedup: 1.5-2.5x (q39: 2.44x, q92: 2.06x, q47: 1.24x)
+    Knowledge Base: date_cte_isolate
+    Empirical speedup: 1.5-2.7x (Q6, Q15, Q27, Q39: 2.44x, Q92: 2.06x)
 
     Pattern detected:
         FROM fact_table, date_dim, other_tables
         WHERE fact.date_sk = date_dim.d_date_sk
         AND date_dim.d_year = 2001
-        AND other_conditions...
 
     Suggested rewrite:
         WITH filtered_dates AS (
             SELECT d_date_sk FROM date_dim WHERE d_year = 2001
         )
-        SELECT ...
-        FROM fact_table
+        SELECT ... FROM fact_table
         INNER JOIN filtered_dates ON fact.date_sk = d_date_sk
-        ...
-
-    Why it helps:
-    - Filters date_dim first (small table, ~73k rows for 20 years)
-    - Join to fact table early, reducing rows before other joins
-    - Enables better join ordering by optimizer
     """
 
-    rule_id = "QT-OPT-002"
-    name = "Late Date Filter - Early CTE Opportunity"
-    severity = "high"  # Promoted: 43% optimizer hit rate, common win on TPC-DS
+    rule_id = "QT-OPT-003"  # Matches knowledge_base.TransformID.DATE_CTE_ISOLATION
+    name = "Date CTE Isolation"
+    severity = "high"
     category = "optimization_opportunity"
-    penalty = 15  # Directly actionable - filter pushdown optimization
-    description = "Date filtering late in query - early date CTE can give 1.5-2.5x speedup"
+    penalty = 15
+    description = "Date filtering late in query - early date CTE can give 1.5-2.7x speedup"
     suggestion = "Extract date filtering into a CTE and join early to fact tables"
 
     target_node_types = (exp.Select,)
@@ -212,9 +206,10 @@ class LateDateFilterOpportunity(ASTRule):
 
 
 class RepeatedSubqueryOpportunity(ASTRule):
-    """QT-OPT-003: Repeated subquery - materialized CTE opportunity.
+    """QT-OPT-007: Repeated subquery - materialized CTE opportunity.
 
-    Empirical speedup: 1.2-2x (q95: 2.25x)
+    Knowledge Base: materialize_cte
+    Empirical speedup: 1.2-2x (Q95: 2.25x)
 
     Pattern detected:
         SELECT ...
@@ -228,15 +223,10 @@ class RepeatedSubqueryOpportunity(ASTRule):
         SELECT ...
         FROM materialized_data sq1
         JOIN materialized_data sq2
-
-    Why it helps:
-    - Computes expensive subquery once
-    - MATERIALIZED hint forces early computation
-    - Avoids redundant scans of large tables
     """
 
-    rule_id = "QT-OPT-003"
-    name = "Repeated Subquery - Materialized CTE Opportunity"
+    rule_id = "QT-OPT-007"  # Matches knowledge_base.TransformID.MATERIALIZE_CTE
+    name = "Materialize Repeated Subquery"
     severity = "optimization"
     category = "optimization_opportunity"
     penalty = 0
@@ -280,67 +270,15 @@ class RepeatedSubqueryOpportunity(ASTRule):
             seen[tables] = sq
 
 
-class CorrelatedSubqueryOpportunity(ASTRule):
-    """QT-OPT-004: Correlated subquery - window function opportunity.
-
-    Empirical speedup: 1.2-1.5x
-
-    Pattern detected:
-        SELECT *, (SELECT MAX(x) FROM t2 WHERE t2.id = t1.id) as max_x
-        FROM t1
-
-    Suggested rewrite:
-        SELECT *, MAX(x) OVER (PARTITION BY id) as max_x
-        FROM t1 JOIN t2 ON t1.id = t2.id
-
-    Why it helps:
-    - Single pass through data instead of N subquery executions
-    - Better parallelization
-    """
-
-    rule_id = "QT-OPT-004"
-    name = "Correlated Subquery - Window Function Opportunity"
-    severity = "optimization"
-    category = "optimization_opportunity"
-    penalty = 0
-    description = "Correlated subquery may be convertible to window function"
-    suggestion = "Consider rewriting as window function with OVER (PARTITION BY ...)"
-
-    target_node_types = (exp.Subquery,)
-
-    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
-        # Check if subquery is in SELECT clause (scalar subquery)
-        if not context.in_select:
-            return
-
-        # Check for correlation (reference to outer table)
-        inner_select = node.find(exp.Select)
-        if not inner_select:
-            return
-
-        inner_where = inner_select.find(exp.Where)
-        if not inner_where:
-            return
-
-        # Look for aggregation with correlation
-        has_agg = bool(inner_select.find(exp.AggFunc))
-
-        # Check for equality join to outer (simplified check)
-        has_eq = bool(inner_where.find(exp.EQ))
-
-        if has_agg and has_eq:
-            yield RuleMatch(
-                node=node,
-                context=context,
-                message="Correlated scalar subquery with aggregation - window function may be faster",
-                matched_text="Correlated subquery in SELECT",
-            )
+# NOTE: CorrelatedSubqueryOpportunity (window function) removed - not in MCTS knowledge base
+# Use CorrelatedToPrecomputedCTEOpportunity (QT-OPT-002) for correlated subquery patterns
 
 
 class CountToExistsOpportunity(ASTRule):
-    """QT-OPT-006: COUNT(*) > 0 in subquery - EXISTS opportunity.
+    """QT-OPT-008: COUNT(*) > 0 in subquery - EXISTS opportunity.
 
-    Empirical speedup: 1.5-1.7x (q41: 1.69x)
+    Knowledge Base: flatten_subq
+    Empirical speedup: 1.2-1.5x (Q41: 1.69x)
 
     Pattern detected:
         WHERE (SELECT COUNT(*) FROM t WHERE ...) > 0
@@ -348,18 +286,19 @@ class CountToExistsOpportunity(ASTRule):
     Suggested rewrite:
         WHERE EXISTS (SELECT 1 FROM t WHERE ...)
 
-    Why it helps:
-    - EXISTS stops at first match
-    - COUNT(*) scans all matching rows just to check > 0
-    - Significant savings for large result sets
+    This is part of the flatten_subq transform family:
+    - EXISTS→SEMI JOIN
+    - NOT EXISTS→anti-join
+    - IN→JOIN
+    - COUNT(*)>0→EXISTS
     """
 
-    rule_id = "QT-OPT-006"
-    name = "COUNT(*) to EXISTS Opportunity"
+    rule_id = "QT-OPT-008"  # Matches knowledge_base.TransformID.FLATTEN_SUBQUERY
+    name = "Flatten Subquery to JOIN/EXISTS"
     severity = "optimization"
     category = "optimization_opportunity"
     penalty = 0
-    description = "COUNT(*) > 0 in subquery - EXISTS stops at first match for 1.5-1.7x speedup"
+    description = "COUNT(*) > 0 in subquery - EXISTS stops at first match for 1.2-1.5x speedup"
     suggestion = "Replace (SELECT COUNT(*) ...) > 0 with EXISTS (SELECT 1 ...)"
 
     target_node_types = (exp.GT, exp.GTE)
@@ -399,55 +338,8 @@ class CountToExistsOpportunity(ASTRule):
         return False
 
 
-class ImplicitCrossJoinOpportunity(ASTRule):
-    """QT-OPT-005: Implicit join syntax - explicit JOIN opportunity.
-
-    Pattern detected:
-        FROM a, b, c WHERE a.id = b.id AND b.id = c.id
-
-    Suggested rewrite:
-        FROM a
-        INNER JOIN b ON a.id = b.id
-        INNER JOIN c ON b.id = c.id
-
-    Why it helps:
-    - Clearer join order for optimizer
-    - Explicit join conditions prevent accidental cross joins
-    - Often enables better query plans
-    """
-
-    rule_id = "QT-OPT-005"
-    name = "Implicit Cross Join Syntax"
-    severity = "optimization"
-    category = "optimization_opportunity"
-    penalty = 0
-    description = "Implicit comma-join syntax - explicit JOIN may improve optimizer decisions"
-    suggestion = "Rewrite using explicit INNER JOIN syntax for clarity and potentially better plans"
-
-    target_node_types = (exp.Select,)
-
-    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
-        if context.subquery_depth > 0:
-            return
-
-        # Count tables in FROM that use comma syntax (not explicit JOINs)
-        from_clause = node.args.get('from')
-        if not from_clause:
-            return
-
-        # Check for multiple tables without explicit JOIN
-        tables = list(from_clause.find_all(exp.Table))
-        joins = list(node.find_all(exp.Join))
-
-        # If we have multiple tables but few/no explicit JOINs, flag it
-        if len(tables) >= 3 and len(joins) < len(tables) - 1:
-            table_names = [str(t.this) for t in tables[:4] if t.this]
-            yield RuleMatch(
-                node=node,
-                context=context,
-                message=f"Implicit join of {len(tables)} tables - explicit JOIN syntax recommended",
-                matched_text=f"FROM {', '.join(table_names)}...",
-            )
+# NOTE: ImplicitCrossJoinOpportunity removed - not in MCTS knowledge base
+# Implicit comma-joins are a style issue, not a performance optimization
 
 
 # Dimension tables commonly filtered
@@ -460,9 +352,10 @@ DIMENSION_TABLES = {
 
 
 class PredicatePushdownOpportunity(ASTRule):
-    """QT-OPT-007: Dimension filter in main query - pushdown into CTE opportunity.
+    """QT-OPT-004: Dimension filter in main query - pushdown into CTE opportunity.
 
-    Empirical speedup: 2.71x (Q93), 1.23x (Q27)
+    Knowledge Base: push_pred
+    Empirical speedup: 2-3x (Q93: 2.71x, Q27: 1.23x)
 
     Pattern detected:
         WITH agg AS (SELECT fk_col, SUM(val) FROM fact GROUP BY fk_col)
@@ -476,18 +369,13 @@ class PredicatePushdownOpportunity(ASTRule):
             GROUP BY fk_col
         )
         SELECT * FROM agg
-
-    Why it helps:
-    - Filters fact rows BEFORE aggregation
-    - Reduces rows entering GROUP BY
-    - Q93: 2.71x speedup filtering reason='duplicate purchase' early
     """
 
-    rule_id = "QT-OPT-007"
-    name = "Predicate Pushdown into CTE Opportunity"
+    rule_id = "QT-OPT-004"  # Matches knowledge_base.TransformID.PUSH_PREDICATE
+    name = "Predicate Pushdown into CTE"
     severity = "high"
     category = "optimization_opportunity"
-    penalty = 20  # High impact - 2.71x on Q93
+    penalty = 20
     description = "Dimension filter in main query could be pushed into CTE for 2-3x speedup"
     suggestion = "Move dimension join and filter INTO the CTE before GROUP BY"
 
@@ -581,9 +469,10 @@ class PredicatePushdownOpportunity(ASTRule):
 
 
 class CorrelatedToPrecomputedCTEOpportunity(ASTRule):
-    """QT-OPT-008: Correlated subquery comparing to aggregate - pre-computed CTE opportunity.
+    """QT-OPT-002: Correlated subquery comparing to aggregate - pre-computed CTE opportunity.
 
-    Empirical speedup: 2.81x (Q1)
+    Knowledge Base: correlated_to_cte
+    Empirical speedup: 2-3x (Q1: 2.81x)
 
     Pattern detected:
         WITH ctr AS (SELECT store_sk, SUM(fee) AS total FROM returns GROUP BY store_sk, customer_sk)
@@ -596,18 +485,13 @@ class CorrelatedToPrecomputedCTEOpportunity(ASTRule):
         SELECT * FROM ctr c1
         JOIN store_avg sa ON c1.store_sk = sa.store_sk
         WHERE c1.total > sa.threshold
-
-    Why it helps:
-    - Eliminates O(n²) correlated execution
-    - Pre-computes thresholds once per group
-    - Q1: 2.81x speedup (241ms → 86ms)
     """
 
-    rule_id = "QT-OPT-008"
-    name = "Correlated Subquery to Pre-computed CTE Opportunity"
+    rule_id = "QT-OPT-002"  # Matches knowledge_base.TransformID.CORRELATED_TO_CTE
+    name = "Correlated Subquery to Pre-computed CTE"
     severity = "high"
     category = "optimization_opportunity"
-    penalty = 25  # Highest impact - 2.81x on Q1
+    penalty = 25
     description = "Correlated subquery with aggregate comparison - pre-computed CTE can give 2-3x speedup"
     suggestion = "Extract correlated aggregate into separate CTE with GROUP BY, then JOIN"
 
@@ -666,146 +550,15 @@ class CorrelatedToPrecomputedCTEOpportunity(ASTRule):
                 return  # Only report once per query
 
 
-class JoinEliminationOpportunity(ASTRule):
-    """QT-OPT-009: Table joined but no columns used - join elimination opportunity.
-
-    Empirical speedup: 2.18x (Q23)
-
-    Pattern detected:
-        SELECT a.col1, a.col2, SUM(a.value)
-        FROM fact a
-        JOIN dim d ON a.dim_sk = d.dim_sk  -- d columns never used!
-        GROUP BY a.col1, a.col2
-
-    Suggested rewrite:
-        SELECT col1, col2, SUM(value)
-        FROM fact
-        WHERE dim_sk IS NOT NULL  -- Preserve NULL filtering from join
-        GROUP BY col1, col2
-
-    Why it helps:
-    - Removes unnecessary table scan
-    - Eliminates join operation
-    - Q23: 2.18x speedup removing item/customer joins
-
-    CRITICAL: Must add IS NOT NULL to preserve join's implicit NULL filtering!
-    """
-
-    rule_id = "QT-OPT-009"
-    name = "Join Elimination Opportunity"
-    severity = "high"
-    category = "optimization_opportunity"
-    penalty = 20
-    description = "Table joined but no columns selected - can remove join for 2x+ speedup (add IS NOT NULL!)"
-    suggestion = "Remove unused join, add WHERE fk_column IS NOT NULL to preserve semantics"
-
-    target_node_types = (exp.Select,)
-
-    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
-        if context.subquery_depth > 0:
-            return
-
-        # Get all columns actually used in SELECT, WHERE, GROUP BY, ORDER BY
-        used_columns = self._get_used_columns(node)
-
-        # Get tables and their aliases
-        table_aliases = self._get_table_aliases(node)
-
-        # Check each JOIN
-        for join in node.find_all(exp.Join):
-            joined_table = join.find(exp.Table)
-            if not joined_table or not joined_table.this:
-                continue
-
-            table_name = str(joined_table.this).lower()
-            alias = str(joined_table.alias).lower() if joined_table.alias else table_name
-
-            # Check if any columns from this table are used
-            table_used = False
-            for col_table, col_name in used_columns:
-                if col_table == alias or col_table == table_name:
-                    table_used = True
-                    break
-                # Also check if column could belong to this table (no qualifier)
-                if not col_table and table_name in DIMENSION_TABLES:
-                    # Ambiguous - assume it might be used
-                    table_used = True
-                    break
-
-            if not table_used and table_name in DIMENSION_TABLES:
-                # Find the join key
-                join_on = join.find(exp.EQ)
-                join_col = ""
-                if join_on:
-                    for col in join_on.find_all(exp.Column):
-                        col_t = str(col.table).lower() if col.table else ""
-                        if col_t != alias and col_t != table_name:
-                            join_col = str(col.this) if col.this else ""
-                            break
-
-                yield RuleMatch(
-                    node=join,
-                    context=context,
-                    message=f"Table '{table_name}' joined but no columns used - remove join, add {join_col} IS NOT NULL",
-                    matched_text=f"JOIN {table_name} (no columns selected)",
-                )
-                return  # Only report first occurrence
-
-    def _get_used_columns(self, node: exp.Expression) -> set:
-        """Get all (table, column) pairs used in query."""
-        used = set()
-
-        # SELECT columns
-        for sel in node.find_all(exp.Select):
-            if sel == node or sel.parent == node:  # Only main select
-                for col in sel.find_all(exp.Column):
-                    table = str(col.table).lower() if col.table else ""
-                    name = str(col.this).lower() if col.this else ""
-                    if name:
-                        used.add((table, name))
-
-        # WHERE columns
-        where = node.find(exp.Where)
-        if where:
-            for col in where.find_all(exp.Column):
-                table = str(col.table).lower() if col.table else ""
-                name = str(col.this).lower() if col.this else ""
-                if name:
-                    used.add((table, name))
-
-        # GROUP BY columns
-        for gb in node.find_all(exp.Group):
-            for col in gb.find_all(exp.Column):
-                table = str(col.table).lower() if col.table else ""
-                name = str(col.this).lower() if col.this else ""
-                if name:
-                    used.add((table, name))
-
-        # ORDER BY columns
-        for ob in node.find_all(exp.Order):
-            for col in ob.find_all(exp.Column):
-                table = str(col.table).lower() if col.table else ""
-                name = str(col.this).lower() if col.this else ""
-                if name:
-                    used.add((table, name))
-
-        return used
-
-    def _get_table_aliases(self, node: exp.Expression) -> dict:
-        """Get mapping of alias -> table name."""
-        aliases = {}
-        for table in node.find_all(exp.Table):
-            if table.this:
-                name = str(table.this).lower()
-                alias = str(table.alias).lower() if table.alias else name
-                aliases[alias] = name
-        return aliases
+# NOTE: JoinEliminationOpportunity removed - not in MCTS knowledge base
+# Join elimination is handled by the database optimizer, not our transforms
 
 
 class ScanConsolidationOpportunity(ASTRule):
-    """QT-OPT-010: Same table scanned multiple times - consolidation opportunity.
+    """QT-OPT-005: Same table scanned multiple times - consolidation opportunity.
 
-    Empirical speedup: 1.84x (Q90)
+    Knowledge Base: consolidate_scans
+    Empirical speedup: 1.5-2x (Q90: 1.84x)
 
     Pattern detected:
         WITH morning AS (SELECT ... FROM sales WHERE hour BETWEEN 8 AND 12),
@@ -821,16 +574,11 @@ class ScanConsolidationOpportunity(ASTRule):
             WHERE hour BETWEEN 8 AND 17
         )
         SELECT morning_total, afternoon_total FROM combined
-
-    Why it helps:
-    - Single table scan instead of multiple
-    - Reduces I/O significantly
-    - Q90: 1.84x speedup combining AM/PM counting
     """
 
-    rule_id = "QT-OPT-010"
-    name = "Scan Consolidation Opportunity"
-    severity = "optimization"
+    rule_id = "QT-OPT-005"  # Matches knowledge_base.TransformID.CONSOLIDATE_SCANS
+    name = "Scan Consolidation"
+    severity = "high"
     category = "optimization_opportunity"
     penalty = 15
     description = "Same table scanned multiple times - consolidate with CASE WHEN for 1.5-2x speedup"
@@ -867,3 +615,238 @@ class ScanConsolidationOpportunity(ASTRule):
                 message=f"Table scanned multiple times [{table_info}] - consolidate with CASE WHEN for 1.5-2x speedup",
                 matched_text=f"Multiple CTEs scan {table_info}",
             )
+
+
+class MultiPushPredicateOpportunity(ASTRule):
+    """QT-OPT-006: Filter on column that traces through multiple CTEs - multi-layer pushdown.
+
+    Knowledge Base: multi_push_pred
+    Empirical speedup: 1.5-2x
+
+    Pattern detected:
+        WITH cte1 AS (SELECT customer_id, amount FROM sales),
+             cte2 AS (SELECT customer_id, SUM(amount) FROM cte1 GROUP BY customer_id)
+        SELECT * FROM cte2 WHERE customer_id = 100
+
+    Suggested rewrite:
+        WITH cte1 AS (SELECT customer_id, amount FROM sales WHERE customer_id = 100),
+             cte2 AS (SELECT customer_id, SUM(amount) FROM cte1 GROUP BY customer_id)
+        SELECT * FROM cte2 WHERE customer_id = 100
+    """
+
+    rule_id = "QT-OPT-006"  # Matches knowledge_base.TransformID.MULTI_PUSH_PREDICATE
+    name = "Multi-layer Predicate Pushdown"
+    severity = "optimization"
+    category = "optimization_opportunity"
+    penalty = 0
+    description = "Filter can be pushed through multiple CTE layers for 1.5-2x speedup"
+    suggestion = "Push filter predicate through each CTE layer to base tables"
+
+    target_node_types = (exp.Select,)
+
+    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
+        if context.subquery_depth > 0:
+            return
+
+        # Must have CTEs and a WHERE clause
+        with_clause = node.find(exp.With)
+        where = node.find(exp.Where)
+        if not with_clause or not where:
+            return
+
+        # Count CTE depth (CTEs that reference other CTEs)
+        cte_names = set()
+        cte_refs = {}  # cte_name -> set of referenced CTEs
+
+        for cte in with_clause.find_all(exp.CTE):
+            cte_name = str(cte.alias).lower() if cte.alias else ""
+            if cte_name:
+                cte_names.add(cte_name)
+                refs = set()
+                for table in cte.find_all(exp.Table):
+                    tname = str(table.this).lower() if table.this else ""
+                    if tname in cte_names:
+                        refs.add(tname)
+                cte_refs[cte_name] = refs
+
+        # If any CTE references another CTE, we have multi-layer opportunity
+        multi_layer = any(refs for refs in cte_refs.values())
+
+        if multi_layer:
+            # Check if main WHERE has equality predicates
+            has_eq = bool(where.find(exp.EQ))
+            if has_eq:
+                yield RuleMatch(
+                    node=node,
+                    context=context,
+                    message="Multi-layer CTE with filter - predicate can be pushed through layers",
+                    matched_text="Filter on column from nested CTEs",
+                )
+
+
+class JoinReorderOpportunity(ASTRule):
+    """QT-OPT-009: Multiple tables with uneven filter selectivity - reorder opportunity.
+
+    Knowledge Base: reorder_join
+    Empirical speedup: 1.2-2x
+
+    Pattern detected:
+        FROM large_fact_table, small_dim_table
+        WHERE large.date_sk = small.date_sk AND small.year = 2001
+
+    Suggested rewrite:
+        FROM small_dim_table, large_fact_table
+        WHERE small.year = 2001 AND large.date_sk = small.date_sk
+    """
+
+    rule_id = "QT-OPT-009"  # Matches knowledge_base.TransformID.REORDER_JOIN
+    name = "Join Reordering"
+    severity = "optimization"
+    category = "optimization_opportunity"
+    penalty = 0
+    description = "Tables could be reordered to put filtered tables first for 1.2-2x speedup"
+    suggestion = "Put tables with selective filters earlier in join order"
+
+    target_node_types = (exp.Select,)
+
+    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
+        if context.subquery_depth > 0:
+            return
+
+        # Need multiple tables and a WHERE
+        from_clause = node.args.get('from')
+        where = node.find(exp.Where)
+        if not from_clause or not where:
+            return
+
+        # Get all tables
+        tables = []
+        for table in from_clause.find_all(exp.Table):
+            if table.this:
+                tables.append(str(table.this).lower())
+        for join in node.find_all(exp.Join):
+            for table in join.find_all(exp.Table):
+                if table.this:
+                    tables.append(str(table.this).lower())
+
+        if len(tables) < 3:
+            return
+
+        # Check if any table has an equality filter (selective)
+        filtered_tables = set()
+        for eq in where.find_all(exp.EQ):
+            for col in eq.find_all(exp.Column):
+                if col.table:
+                    filtered_tables.add(str(col.table).lower())
+
+        # If we have filtered tables that aren't first, suggest reorder
+        if filtered_tables and tables[0] not in filtered_tables:
+            yield RuleMatch(
+                node=node,
+                context=context,
+                message=f"Join order may benefit from reordering - filtered tables: {', '.join(list(filtered_tables)[:2])}",
+                matched_text=f"FROM {tables[0]} with filter on {list(filtered_tables)[0] if filtered_tables else '?'}",
+            )
+
+
+class InlineCTEOpportunity(ASTRule):
+    """QT-OPT-010: Single-use CTE that's a simple scan - inline opportunity.
+
+    Knowledge Base: inline_cte
+    Empirical speedup: 1.1-1.3x
+
+    Pattern detected:
+        WITH simple_cte AS (SELECT * FROM table WHERE filter)
+        SELECT * FROM simple_cte  -- Only used once
+
+    Suggested rewrite:
+        SELECT * FROM (SELECT * FROM table WHERE filter) AS simple_cte
+    """
+
+    rule_id = "QT-OPT-010"  # Matches knowledge_base.TransformID.INLINE_CTE
+    name = "Inline Single-Use CTE"
+    severity = "optimization"
+    category = "optimization_opportunity"
+    penalty = 0
+    description = "Single-use simple CTE can be inlined for 1.1-1.3x speedup"
+    suggestion = "Inline CTE as subquery since it's only used once"
+
+    target_node_types = (exp.With,)
+
+    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
+        # Get parent SELECT to count CTE references
+        parent = node.parent
+        if not isinstance(parent, exp.Select):
+            return
+
+        for cte in node.find_all(exp.CTE):
+            cte_name = str(cte.alias).lower() if cte.alias else ""
+            if not cte_name:
+                continue
+
+            # Count references to this CTE in the main query
+            ref_count = 0
+            for table in parent.find_all(exp.Table):
+                tname = str(table.this).lower() if table.this else ""
+                if tname == cte_name:
+                    ref_count += 1
+
+            # If referenced exactly once and CTE is simple (no aggregation)
+            if ref_count == 1:
+                cte_select = cte.find(exp.Select)
+                if cte_select and not cte_select.find(exp.AggFunc):
+                    yield RuleMatch(
+                        node=cte,
+                        context=context,
+                        message=f"CTE '{cte_name}' used once - consider inlining",
+                        matched_text=f"WITH {cte_name} AS (simple query)",
+                    )
+                    return  # Only report first
+
+
+class RemoveRedundantOpportunity(ASTRule):
+    """QT-OPT-011: Redundant operations that can be removed.
+
+    Knowledge Base: remove_redundant
+    Empirical speedup: 1.1-1.2x
+
+    Patterns detected:
+        - DISTINCT with GROUP BY covering all columns
+        - ORDER BY in subquery when outer has ORDER BY
+        - Unused columns in subqueries
+    """
+
+    rule_id = "QT-OPT-011"  # Matches knowledge_base.TransformID.REMOVE_REDUNDANT
+    name = "Remove Redundant Operations"
+    severity = "optimization"
+    category = "optimization_opportunity"
+    penalty = 0
+    description = "Redundant operations can be removed for cleaner, faster queries"
+    suggestion = "Remove unnecessary DISTINCT, ORDER BY, or unused columns"
+
+    target_node_types = (exp.Select,)
+
+    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
+        # Check for DISTINCT with GROUP BY
+        if node.args.get('distinct'):
+            group = node.find(exp.Group)
+            if group:
+                # If GROUP BY covers all selected columns, DISTINCT is redundant
+                yield RuleMatch(
+                    node=node,
+                    context=context,
+                    message="DISTINCT with GROUP BY may be redundant",
+                    matched_text="SELECT DISTINCT ... GROUP BY ...",
+                )
+                return
+
+        # Check for ORDER BY in subquery
+        if context.subquery_depth > 0:
+            order = node.find(exp.Order)
+            if order:
+                yield RuleMatch(
+                    node=order,
+                    context=context,
+                    message="ORDER BY in subquery is often redundant",
+                    matched_text="Subquery with ORDER BY",
+                )

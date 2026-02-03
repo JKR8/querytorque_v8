@@ -5,20 +5,15 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# System prompt for optimization calls
-OPTIMIZATION_SYSTEM_PROMPT = (
-    "You are a senior SQL performance engineer. "
-    "Return ONLY valid JSON — no markdown fences, no commentary."
-)
-
 
 class OpenAIClient:
     """LLM client for OpenAI API.
 
     Supports GPT-4o and other OpenAI models.
+    Also supports OpenAI-compatible APIs (OpenRouter, etc.) via base_url.
     """
 
-    def __init__(self, api_key: str, model: str = "gpt-4o"):
+    def __init__(self, api_key: str, model: str = "gpt-4o", base_url: str = None):
         """Initialize OpenAI client.
 
         Args:
@@ -27,10 +22,12 @@ class OpenAIClient:
                 - gpt-4o (recommended)
                 - gpt-4o-mini
                 - gpt-4-turbo
+            base_url: Optional base URL for OpenAI-compatible APIs (e.g., OpenRouter)
         """
         self.api_key = api_key
         self.model = model
-        logger.info("Initialized OpenAIClient with model=%s", model)
+        self.base_url = base_url
+        logger.info("Initialized OpenAIClient with model=%s, base_url=%s", model, base_url)
 
     def analyze(self, prompt: str) -> str:
         """Send prompt to OpenAI and return response."""
@@ -43,17 +40,19 @@ class OpenAIClient:
         logger.debug("Sending request to OpenAI API (prompt=%d chars)", len(prompt))
         start_time = time.time()
 
-        client = OpenAI(api_key=self.api_key)
+        client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+
+        # Kimi K2.5 via OpenRouter supports up to 128k context, 8k output
+        # GPT-4o supports 128k context, 16k output
+        max_tokens = 8192
 
         response = client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": OPTIMIZATION_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=4096,
+            max_tokens=max_tokens,
             temperature=0.0,
-            response_format={"type": "json_object"},
         )
 
         duration = time.time() - start_time

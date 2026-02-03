@@ -143,18 +143,18 @@ from .rules import (
     WindowPushdownRule,
     PreAggregateRule,
     GroupByFunctionalDependencyRule,
-    # Optimization opportunity rules (empirical - from TPC-DS wins)
-    OrToUnionOpportunity,
-    LateDateFilterOpportunity,
-    RepeatedSubqueryOpportunity,
-    CorrelatedSubqueryOpportunity,
-    ImplicitCrossJoinOpportunity,
-    CountToExistsOpportunity,
-    # NEW: High-impact patterns from Kimi/DeepSeek benchmarks
-    PredicatePushdownOpportunity,
-    CorrelatedToPrecomputedCTEOpportunity,
-    JoinEliminationOpportunity,
-    ScanConsolidationOpportunity,
+    # Optimization opportunity rules - synced with knowledge_base (11 MCTS transforms)
+    OrToUnionOpportunity,              # QT-OPT-001: or_to_union
+    CorrelatedToPrecomputedCTEOpportunity,  # QT-OPT-002: correlated_to_cte
+    LateDateFilterOpportunity,         # QT-OPT-003: date_cte_isolate
+    PredicatePushdownOpportunity,      # QT-OPT-004: push_pred
+    ScanConsolidationOpportunity,      # QT-OPT-005: consolidate_scans
+    MultiPushPredicateOpportunity,     # QT-OPT-006: multi_push_pred
+    RepeatedSubqueryOpportunity,       # QT-OPT-007: materialize_cte
+    CountToExistsOpportunity,          # QT-OPT-008: flatten_subq
+    JoinReorderOpportunity,            # QT-OPT-009: reorder_join
+    InlineCTEOpportunity,              # QT-OPT-010: inline_cte
+    RemoveRedundantOpportunity,        # QT-OPT-011: remove_redundant
     # Snowflake
     CopyIntoWithoutFileFormatRule,
     SelectWithoutLimitOrSampleRule,
@@ -354,18 +354,18 @@ _ALL_RULES: list[ASTRule] = [
     PreAggregateRule(),
     GroupByFunctionalDependencyRule(),
 
-    # Optimization opportunity rules - empirical from TPC-DS wins (10)
-    OrToUnionOpportunity(),
-    LateDateFilterOpportunity(),
-    RepeatedSubqueryOpportunity(),
-    CorrelatedSubqueryOpportunity(),
-    ImplicitCrossJoinOpportunity(),
-    CountToExistsOpportunity(),
-    # NEW: High-impact patterns from Kimi/DeepSeek benchmarks
-    PredicatePushdownOpportunity(),        # QT-OPT-007: 2.71x (Q93)
-    CorrelatedToPrecomputedCTEOpportunity(),  # QT-OPT-008: 2.81x (Q1)
-    JoinEliminationOpportunity(),          # QT-OPT-009: 2.18x (Q23)
-    ScanConsolidationOpportunity(),        # QT-OPT-010: 1.84x (Q90)
+    # Optimization opportunity rules - synced with knowledge_base (11 MCTS transforms)
+    OrToUnionOpportunity(),              # QT-OPT-001: or_to_union (2.98x)
+    CorrelatedToPrecomputedCTEOpportunity(),  # QT-OPT-002: correlated_to_cte (2.81x)
+    LateDateFilterOpportunity(),         # QT-OPT-003: date_cte_isolate (2.67x)
+    PredicatePushdownOpportunity(),      # QT-OPT-004: push_pred (2.71x)
+    ScanConsolidationOpportunity(),      # QT-OPT-005: consolidate_scans (1.84x)
+    MultiPushPredicateOpportunity(),     # QT-OPT-006: multi_push_pred
+    RepeatedSubqueryOpportunity(),       # QT-OPT-007: materialize_cte
+    CountToExistsOpportunity(),          # QT-OPT-008: flatten_subq
+    JoinReorderOpportunity(),            # QT-OPT-009: reorder_join
+    InlineCTEOpportunity(),              # QT-OPT-010: inline_cte
+    RemoveRedundantOpportunity(),        # QT-OPT-011: remove_redundant
 ]
 
 # Rule lookup by ID

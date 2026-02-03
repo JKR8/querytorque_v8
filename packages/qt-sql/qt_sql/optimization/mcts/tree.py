@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Callable, Any
 
 from .node import MCTSNode
-from .transforms import get_all_transform_ids, apply_transformation
+from .transforms import get_all_transform_ids, apply_transformation, apply_dag_transformation
 from .reward import compute_reward, RewardConfig
 
 logger = logging.getLogger(__name__)
@@ -47,9 +47,13 @@ class TransformAttempt:
     # Reward
     reward: float = 0.0
 
-    def to_dict(self) -> dict:
-        """Convert to dictionary for JSON serialization."""
-        return {
+    def to_dict(self, include_full_sql: bool = False) -> dict:
+        """Convert to dictionary for JSON serialization.
+
+        Args:
+            include_full_sql: If True, include full output_sql. Otherwise truncate to 200 chars.
+        """
+        result = {
             "iteration": self.iteration,
             "parent_path": self.parent_path,
             "transform_id": self.transform_id,
@@ -57,7 +61,6 @@ class TransformAttempt:
             "llm_success": self.llm_success,
             "llm_error": self.llm_error,
             "sql_changed": self.sql_changed,
-            "output_sql_preview": (self.output_sql[:200] + "...") if self.output_sql and len(self.output_sql) > 200 else self.output_sql,
             "validated": self.validated,
             "validation_status": self.validation_status,
             "validation_error": self.validation_error,
@@ -68,6 +71,16 @@ class TransformAttempt:
             "parent_visits": self.parent_visits,
             "reward": round(self.reward, 4),
         }
+
+        if include_full_sql:
+            result["output_sql"] = self.output_sql
+        else:
+            result["output_sql_preview"] = (
+                (self.output_sql[:200] + "...") if self.output_sql and len(self.output_sql) > 200
+                else self.output_sql
+            )
+
+        return result
 
 
 @dataclass
@@ -116,6 +129,7 @@ class MCTSTree:
         c: float = 1.414,
         max_depth: int = 5,
         transform_ids: Optional[list[str]] = None,
+        use_dag_mode: bool = True,
     ):
         """Initialize MCTS tree.
 
@@ -128,6 +142,7 @@ class MCTSTree:
             max_depth: Maximum depth of transformations to chain.
             transform_ids: List of transformation IDs to use.
                           If None, uses all available transforms.
+            use_dag_mode: Use DAG-based node patching (default True).
         """
         self.original_sql = original_sql
         self.llm_client = llm_client
@@ -135,6 +150,7 @@ class MCTSTree:
         self.reward_config = reward_config or RewardConfig()
         self.c = c
         self.max_depth = max_depth
+        self.use_dag_mode = use_dag_mode
 
         # Initialize transform IDs
         if transform_ids is None:
@@ -282,13 +298,20 @@ class MCTSTree:
             parent_visits=node.visit_count,
         )
 
-        # Apply transformation via LLM
+        # Apply transformation via LLM (use DAG mode if enabled)
         start_time = time.perf_counter()
-        new_sql, error = apply_transformation(
-            query=node.query_sql,
-            transform_id=transform_id,
-            llm_client=self.llm_client,
-        )
+        if self.use_dag_mode:
+            new_sql, error = apply_dag_transformation(
+                query=node.query_sql,
+                transform_id=transform_id,
+                llm_client=self.llm_client,
+            )
+        else:
+            new_sql, error = apply_transformation(
+                query=node.query_sql,
+                transform_id=transform_id,
+                llm_client=self.llm_client,
+            )
         attempt.duration_ms = int((time.perf_counter() - start_time) * 1000)
 
         if error or new_sql is None:
@@ -356,11 +379,18 @@ class MCTSTree:
         def apply_single(transform_id: str) -> tuple[str, Optional[str], Optional[str], int]:
             """Apply a single transformation, return (id, sql, error, duration_ms)."""
             start_time = time.perf_counter()
-            new_sql, error = apply_transformation(
-                query=node.query_sql,
-                transform_id=transform_id,
-                llm_client=self.llm_client,
-            )
+            if self.use_dag_mode:
+                new_sql, error = apply_dag_transformation(
+                    query=node.query_sql,
+                    transform_id=transform_id,
+                    llm_client=self.llm_client,
+                )
+            else:
+                new_sql, error = apply_transformation(
+                    query=node.query_sql,
+                    transform_id=transform_id,
+                    llm_client=self.llm_client,
+                )
             duration_ms = int((time.perf_counter() - start_time) * 1000)
             return (transform_id, new_sql, error, duration_ms)
 
@@ -687,16 +717,23 @@ class MCTSTree:
             "total_attempts": len(self.transform_attempts),
         }
 
-    def get_all_attempts(self) -> list[dict]:
-        """Get all transformation attempts as dicts for JSON export."""
-        return [a.to_dict() for a in self.transform_attempts]
+    def get_all_attempts(self, include_full_sql: bool = False) -> list[dict]:
+        """Get all transformation attempts as dicts for JSON export.
+
+        Args:
+            include_full_sql: If True, include full SQL in each attempt.
+        """
+        return [a.to_dict(include_full_sql=include_full_sql) for a in self.transform_attempts]
 
     def get_selection_log(self) -> list[dict]:
         """Get all selection decisions as dicts for JSON export."""
         return [s.to_dict() for s in self.selection_steps]
 
-    def get_detailed_log(self) -> dict:
+    def get_detailed_log(self, include_full_sql: bool = False) -> dict:
         """Get comprehensive log of all MCTS activity.
+
+        Args:
+            include_full_sql: If True, include full SQL in attempts.
 
         Returns dict with:
         - stats: Summary statistics
@@ -706,7 +743,7 @@ class MCTSTree:
         """
         return {
             "stats": self.get_stats(),
-            "attempts": self.get_all_attempts(),
+            "attempts": self.get_all_attempts(include_full_sql=include_full_sql),
             "selections": self.get_selection_log(),
             "tree": self._serialize_tree(),
         }

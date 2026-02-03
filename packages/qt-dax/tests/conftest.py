@@ -341,7 +341,7 @@ def sample_clean_vpax_file(sample_clean_vpax_data, tmp_path) -> Path:
 def dax_analyzer():
     """Create a DAXAnalyzer instance."""
     from qt_dax.analyzers.vpax_analyzer import DAXAnalyzer
-    return DAXAnalyzer()
+    return DAXAnalyzer(confirmed_only=False)
 
 
 @pytest.fixture

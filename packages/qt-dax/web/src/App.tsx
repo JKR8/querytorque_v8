@@ -10,6 +10,7 @@ import AnalyzePage from './pages/AnalyzePage'
 import ModelBrowserPage from './pages/ModelBrowserPage'
 import ReportsPage from './pages/ReportsPage'
 import AccountPage from './pages/AccountPage'
+import ToolsPage from './pages/ToolsPage'
 
 // ============================================
 // Protected Route Component
@@ -69,6 +70,7 @@ function AppHeader() {
         <Link to="/" className={isActive('/') ? 'active' : ''}>Home</Link>
         <Link to="/analyze" className={isActive('/analyze') ? 'active' : ''}>Analyze</Link>
         <Link to="/model-browser" className={isActive('/model-browser') ? 'active' : ''}>Model Browser</Link>
+        <Link to="/tools" className={isActive('/tools') ? 'active' : ''}>Tools</Link>
         <Link to="/reports" className={isActive('/reports') ? 'active' : ''}>Reports</Link>
       </nav>
 
@@ -157,6 +159,18 @@ function AppLayout() {
                 </ProtectedRoute>
               ) : (
                 <ModelBrowserPage />
+              )
+            }
+          />
+          <Route
+            path="/tools"
+            element={
+              config.features.authEnabled ? (
+                <ProtectedRoute>
+                  <ToolsPage />
+                </ProtectedRoute>
+              ) : (
+                <ToolsPage />
               )
             }
           />

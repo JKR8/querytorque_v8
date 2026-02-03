@@ -358,6 +358,16 @@ DAX_RULES = {
         "penalty": 12,
         "recommendation": "Use ratio-of-sums: DIVIDE(SUMX(..., weight * numerator), SUMX(..., weight * denominator))",
     },
+    "DAXC001": {
+        "name": "ROW_ITERATION_OWNERSHIP_CARBON",
+        "description": "Row-by-row SUMX over assets with inline ownership+carbon calc; likely missing grain-first materialization",
+        "pattern": None,  # Complex detection - see _check_rule
+        "severity": Severity.HIGH,
+        "category": Category.DAX_PERFORMANCE,
+        "penalty": 14,
+        "confirmed": True,
+        "recommendation": "Materialize CarbonByAsset + OwnershipByAsset and join once (NATURALINNERJOIN), then SUMX over the joined table",
+    },
 }
 
 # Calculation group rules
@@ -730,9 +740,10 @@ class VPAXParser:
 class DAXAnalyzer:
     """Analyze DAX measures for anti-patterns and issues."""
 
-    def __init__(self, dependency_result: Optional[DependencyAnalysisResult] = None):
+    def __init__(self, dependency_result: Optional[DependencyAnalysisResult] = None, confirmed_only: bool = True):
         self.rules = DAX_RULES
         self._dependency_result = dependency_result
+        self._confirmed_only = confirmed_only
         logger.debug("Initialized DAXAnalyzer with %d rules", len(self.rules))
 
     def analyze_measure(self, name: str, table: str, expression: str) -> MeasureAnalysis:
@@ -766,6 +777,8 @@ class DAXAnalyzer:
 
         # Apply rules
         for rule_id, rule in self.rules.items():
+            if self._confirmed_only and not rule.get("confirmed", False):
+                continue
             issue = self._check_rule(rule_id, rule, name, table, expression, analysis.metrics)
             if issue:
                 analysis.issues.append(issue)
@@ -888,6 +901,27 @@ class DAXAnalyzer:
         elif rule_id == 'DAX028':  # Sum-of-ratios pattern (parser-based detection)
             # Use DAX parser to detect division in iterator body (2nd argument)
             violated, details = self._has_division_in_iterator_body(expression)
+
+        elif rule_id == 'DAXC001':  # Grain-first materialization missing in scope-switch asset iteration
+            has_asset_sumx = bool(re.search(r"\bSUMX\s*\(\s*'GS Asset'\s*,", expr_upper))
+            has_groupby = bool(re.search(r"\bGROUPBY\s*\(", expr_upper))
+            has_scope_switch = bool(re.search(r"\bSCOPE_TYPE_CODE\b", expr_upper)) or bool(re.search(r"\bSELECTEDVALUE\s*\(\s*'SCOPE EMISSION TYPES'", expr_upper))
+            has_carbon = bool(re.search(r"\bCARBON_SCOPE_[12]_TONNES_CO2E\b", expr_upper)) or bool(re.search(r"\bABSOLUTE_GHG_SCOPE_3_", expr_upper))
+            has_revenue = bool(re.search(r"\bREVENUE_", expr_upper))
+            has_ownership = bool(re.search(r"\bMV_OWNERSHIP\b", expr_upper)) or bool(re.search(r"\bBENCHMARK_WEIGHT_EOD\b", expr_upper)) or bool(re.search(r"\bMARKET_CAP_BASE\b", expr_upper)) or bool(re.search(r"\bEVIC_BASE\b", expr_upper))
+            has_join_materialization = bool(re.search(r"\bNATURALINNERJOIN\b", expr_upper)) or bool(re.search(r"\bADDCOLUMNS\s*\(.*\"@OWNERSHIP\"", expr_upper, re.DOTALL)) or bool(re.search(r"\bADDCOLUMNS\s*\(.*\"@CARBON\"", expr_upper, re.DOTALL))
+
+            if (has_asset_sumx or has_groupby) and has_scope_switch and (has_carbon or has_revenue) and not has_join_materialization:
+                violated = True
+                details.update({
+                    "has_asset_sumx": has_asset_sumx,
+                    "has_groupby": has_groupby,
+                    "has_scope_switch": True,
+                    "has_carbon": has_carbon,
+                    "has_revenue": has_revenue,
+                    "has_ownership": has_ownership,
+                    "has_join_materialization": False,
+                })
 
         if violated:
             return VPAXIssue(
@@ -1125,11 +1159,12 @@ class ModelAnalyzer:
 class ReportGenerator:
     """Generate comprehensive diagnostic reports."""
 
-    def __init__(self, vpax_path: str):
+    def __init__(self, vpax_path: str, confirmed_only: bool = True):
         self.vpax_path = Path(vpax_path)
         logger.info("Initializing ReportGenerator for %s", vpax_path)
         self.parser = VPAXParser(vpax_path)
-        self.dax_analyzer = DAXAnalyzer()
+        self.dax_analyzer = DAXAnalyzer(confirmed_only=confirmed_only)
+        self._confirmed_only = confirmed_only
 
     def _analyze_calculation_groups(self, vpa_view: dict) -> list:
         """Analyze calculation groups and items for CG rules."""
@@ -1331,7 +1366,7 @@ class ReportGenerator:
         )
 
         # Create DAXAnalyzer with dependency result for accurate DAX027 detection
-        self.dax_analyzer = DAXAnalyzer(dependency_result=dependency_result)
+        self.dax_analyzer = DAXAnalyzer(dependency_result=dependency_result, confirmed_only=self._confirmed_only)
 
         # Analyze measures
         logger.info("Analyzing %d measures...", len(vpa_view.get('Measures', [])))

@@ -44,6 +44,13 @@ class DagNode:
     columns_out: list[str] = field(default_factory=list)  # Output columns
     filters: list[str] = field(default_factory=list)  # WHERE/HAVING conditions
 
+    # Column lineage tracking (for predicate pushdown analysis)
+    output_columns: list[str] = field(default_factory=list)  # Full list of output column names
+    column_sources: dict[str, str] = field(default_factory=dict)  # output_col -> source expression
+    has_aggregation: bool = False  # Whether this node has GROUP BY or aggregates
+    has_window: bool = False  # Whether this node has window functions
+    group_by_columns: list[str] = field(default_factory=list)  # Columns in GROUP BY clause
+
     def __hash__(self):
         return hash(self.id)
 
@@ -55,6 +62,10 @@ class DagEdge:
     source: str  # Node ID that provides data
     target: str  # Node ID that consumes data
     edge_type: str = "ref"  # "ref" (CTE ref), "table", "correlated"
+
+    # Column mapping for predicate pushdown analysis
+    column_mapping: dict[str, str] = field(default_factory=dict)  # target_col -> source_col
+    alias: Optional[str] = None  # Alias used in the target node for this source
 
 
 @dataclass
@@ -384,12 +395,29 @@ def _build_node_from_scope(scope: Scope, node_id: str, node_type: str,
 
     # Extract output columns
     columns_out = []
+    output_columns = []
+    column_sources = {}
     if isinstance(scope.expression, exp.Select):
-        for expr in scope.expression.expressions[:10]:  # Limit to first 10
+        for expr in scope.expression.expressions:
+            col_name = None
+            source_expr = None
+
             if hasattr(expr, 'alias') and expr.alias:
-                columns_out.append(expr.alias)
+                col_name = expr.alias
+                source_expr = expr.this.sql() if hasattr(expr, 'this') else expr.sql()
             elif isinstance(expr, exp.Column):
-                columns_out.append(expr.name)
+                col_name = expr.name
+                source_expr = expr.sql()
+            elif isinstance(expr, exp.Alias):
+                col_name = expr.alias
+                source_expr = expr.this.sql() if hasattr(expr, 'this') else None
+
+            if col_name:
+                output_columns.append(col_name)
+                if len(columns_out) < 10:  # Keep legacy limit for columns_out
+                    columns_out.append(col_name)
+                if source_expr:
+                    column_sources[col_name.lower()] = source_expr
 
     # Extract filters
     filters = []
@@ -397,6 +425,33 @@ def _build_node_from_scope(scope: Scope, node_id: str, node_type: str,
         where = scope.expression.find(exp.Where)
         if where:
             filters.append(str(where.this)[:100])
+
+    # Check for aggregations and window functions
+    has_aggregation = False
+    has_window = False
+    group_by_columns = []
+
+    if isinstance(scope.expression, exp.Select):
+        # Check for GROUP BY
+        group = scope.expression.find(exp.Group)
+        if group:
+            has_aggregation = True
+            for group_expr in group.expressions:
+                if isinstance(group_expr, exp.Column):
+                    group_by_columns.append(group_expr.name)
+
+        # Check for aggregate functions
+        agg_funcs = (exp.Sum, exp.Count, exp.Avg, exp.Min, exp.Max, exp.AggFunc)
+        for node in scope.expression.walk():
+            if isinstance(node, agg_funcs):
+                has_aggregation = True
+                break
+
+        # Check for window functions
+        for node in scope.expression.walk():
+            if isinstance(node, exp.Window):
+                has_window = True
+                break
 
     return DagNode(
         id=node_id,
@@ -406,6 +461,11 @@ def _build_node_from_scope(scope: Scope, node_id: str, node_type: str,
         sql=sql,
         columns_out=columns_out,
         filters=filters,
+        output_columns=output_columns,
+        column_sources=column_sources,
+        has_aggregation=has_aggregation,
+        has_window=has_window,
+        group_by_columns=group_by_columns,
     )
 
 
@@ -510,12 +570,13 @@ def _sql_matches(expr1: exp.Expression, expr2: exp.Expression) -> bool:
     return expr1.sql() == expr2.sql()
 
 
-def build_dag_prompt(sql: str, plan_summary: Optional[dict] = None) -> str:
+def build_dag_prompt(sql: str, plan_summary: Optional[dict] = None, include_pushdown: bool = True) -> str:
     """Build a complete optimization prompt using DAG structure.
 
     Args:
         sql: The SQL query to optimize
         plan_summary: Optional execution plan summary
+        include_pushdown: Whether to include pushdown analysis (default True)
 
     Returns:
         Complete prompt string for LLM
@@ -529,6 +590,18 @@ def build_dag_prompt(sql: str, plan_summary: Optional[dict] = None) -> str:
     # Add DAG representation
     lines.append(dag.to_prompt(include_sql=True, plan_summary=plan_summary))
 
+    # Add pushdown analysis if enabled
+    if include_pushdown:
+        try:
+            from .predicate_analysis import analyze_pushdown_opportunities
+            analysis = analyze_pushdown_opportunities(dag)
+            pushdown_context = analysis.to_prompt_context()
+            if pushdown_context:
+                lines.append("\n---\n")
+                lines.append(pushdown_context)
+        except Exception:
+            pass  # Silently skip if analysis fails
+
     # Optimization patterns
     lines.append("""
 ---
@@ -537,7 +610,7 @@ def build_dag_prompt(sql: str, plan_summary: Optional[dict] = None) -> str:
 
 These patterns have produced >2x speedups:
 
-1. **Filter pushdown**: Move filters from main_query into CTEs that scan the filtered dimension
+1. **Multi-node filter pushdown**: Push filters through CTEs to base table scans (see pushdown analysis above)
 2. **Correlated → Window**: Replace correlated subquery with window function in the CTE
 3. **Join elimination**: Remove joins where only FK existence is checked, add IS NOT NULL
 4. **Scan consolidation**: Merge multiple scans of same table using CASE WHEN

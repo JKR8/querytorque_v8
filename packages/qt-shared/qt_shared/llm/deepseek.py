@@ -40,14 +40,16 @@ class DeepSeekClient:
 
         client = OpenAI(api_key=self.api_key, base_url=self.DEEPSEEK_BASE_URL)
 
-        # DeepSeek reasoner needs high max_tokens - reasoning can use 10k+ tokens
-        # before producing the final content
+        # DeepSeek chat supports max 8192 output tokens
+        # DeepSeek reasoner supports up to 16384
+        max_tokens = 16384 if "reasoner" in self.model else 8192
+
         response = client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=16384,  # High limit for reasoning models
+            max_tokens=max_tokens,
         )
 
         duration = time.time() - start_time

@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     groq_api_key: str = ""
     openai_api_key: str = ""
+    openrouter_api_key: str = ""
     llm_provider: str = ""
     llm_model: str = ""
     manual_mode: bool = False
@@ -112,6 +113,8 @@ class Settings(BaseSettings):
             return provider, model or "llama-3.3-70b-versatile", self.groq_api_key
         elif provider == "openai":
             return provider, model or "gpt-4o", self.openai_api_key
+        elif provider == "openrouter":
+            return provider, model or "moonshotai/kimi-k2.5", self.openrouter_api_key
         return "", "", ""
 
 

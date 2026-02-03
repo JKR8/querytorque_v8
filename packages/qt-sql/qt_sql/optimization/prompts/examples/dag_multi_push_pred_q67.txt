@@ -1,0 +1,199 @@
+Apply MULTI-NODE predicate pushdown optimization using node-level rewrites.
+
+TASK: Push WHERE conditions through multiple CTE/subquery layers to base table scans.
+
+## Query DAG
+
+```
+Nodes:
+  [derived_1] type=derived_table tables=['store_sales', 'date_dim', 'store', 'item']
+  [derived_2] type=derived_table
+  [main_query] type=main_query
+
+Edges:
+```
+
+## Node SQL
+
+### derived_1
+```sql
+SELECT
+  i_category,
+  i_class,
+  i_brand,
+  i_product_name,
+  d_year,
+  d_qoy,
+  d_moy,
+  s_store_id,
+  SUM(COALESCE(ss_sales_price * ss_quantity, 0)) AS sumsales
+FROM store_sales, date_dim, store, item
+WHERE
+  ss_sold_date_sk = d_date_sk
+  AND ss_item_sk = i_item_sk
+  AND ss_store_sk = s_store_sk
+  AND d_month_seq BETWEEN 1206 AND 1206 + 11
+GROUP BY
+  ROLLUP (
+    i_category,
+    i_class,
+    i_brand,
+    i_product_name,
+    d_year,
+    d_qoy,
+    d_moy,
+    s_store_id
+  )
+```
+
+### derived_2
+```sql
+SELECT
+  i_category,
+  i_class,
+  i_brand,
+  i_product_name,
+  d_year,
+  d_qoy,
+  d_moy,
+  s_store_id,
+  sumsales,
+  RANK() OVER (PARTITION BY i_category ORDER BY sumsales DESC) AS rk
+FROM (
+  SELECT
+    i_category,
+    i_class,
+    i_brand,
+    i_product_name,
+    d_year,
+    d_qoy,
+    d_moy,
+    s_store_id,
+    SUM(COALESCE(ss_sales_price * ss_quantity, 0)) AS sumsales
+  FROM store_sales, date_dim, store, item
+  WHERE
+    ss_sold_date_sk = d_date_sk
+    AND ss_item_sk = i_item_sk
+    AND ss_store_sk = s_store_sk
+    AND d_month_seq BETWEEN 1206 AND 1206 + 11
+  GROUP BY
+    ROLLUP (
+      i_category,
+      i_class,
+      i_brand,
+      i_product_name,
+      d_year,
+      d_qoy,
+      d_moy,
+      s_store_id
+    )
+) AS dw1
+```
+
+### main_query
+```sql
+/* start query 67 in stream 0 using template query67.tpl */
+SELECT
+  *
+FROM (
+  SELECT
+    i_category,
+    i_class,
+    i_brand,
+    i_product_name,
+    d_year,
+    d_qoy,
+    d_moy,
+    s_store_id,
+    sumsales,
+    RANK() OVER (PARTITION BY i_category ORDER BY sumsales DESC) AS rk
+  FROM (
+    SELECT
+      i_category,
+      i_class,
+      i_brand,
+      i_product_name,
+      d_year,
+      d_qoy,
+      d_moy,
+      s_store_id,
+      SUM(COALESCE(ss_sales_price * ss_quantity, 0)) AS sumsales
+    FROM store_sales, date_dim, store, item
+    WHERE
+      ss_sold_date_sk = d_date_sk
+      AND ss_item_sk = i_item_sk
+      AND ss_store_sk = s_store_sk
+      AND d_month_seq BETWEEN 1206 AND 1206 + 11
+    GROUP BY
+      ROLLUP (
+        i_category,
+        i_class,
+        i_brand,
+        i_product_name,
+        d_year,
+        d_qoy,
+        d_moy,
+        s_store_id
+      )
+  ) AS dw1
+) AS dw2
+WHERE
+  rk <= 100
+ORDER BY
+  i_category,
+  i_class,
+  i_brand,
+  i_product_name,
+  d_year,
+  d_qoy,
+  d_moy,
+  s_store_id,
+  sumsales,
+  rk
+LIMIT 100
+```
+
+
+Available nodes: `derived_1`, `derived_2`, `main_query`
+
+(No pushdown opportunities found)
+
+## Strategy
+
+For each pushable predicate path listed above:
+1. Add the predicate to the target node's WHERE clause
+2. Adjust column names according to the column_chain (columns may be aliased)
+3. Keep the original predicate in place (don't remove it)
+
+## Example
+
+Given this pushdown path:
+- From: main_query
+- To: cte1
+- Predicate: customer_id = 100
+- Column path: customer_id → customer_id
+
+Before:
+```sql
+cte1: SELECT customer_id, amount FROM sales
+```
+
+After:
+```sql
+cte1: SELECT customer_id, amount FROM sales WHERE customer_id = 100
+```
+
+## Rules
+
+1. Only push predicates marked as "pushable" in the analysis above
+2. Push through GROUP BY ONLY if filter column IS a GROUP BY column
+3. Adjust column names based on column_chain (left-to-right = outer-to-inner)
+4. Keep original filters in place - redundancy is OK
+5. For equality predicates (=, IN), always safe to push through GROUP BY on same column
+6. For range predicates (<, >, BETWEEN), same rule applies
+7. NEVER push filters that would change result set semantics
+
+Return JSON with rewrites for each target node you're modifying:
+```json
+{"rewrites": {"target_node_id": "SELECT ... WHERE pushed_predicate ..."}, "explanation": "..."}
+```

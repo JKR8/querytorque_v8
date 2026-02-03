@@ -26,10 +26,11 @@ from ..parsers.tmdl_parser import TMDLParser
 class PBIPReportGenerator:
     """Generate diagnostic reports from PBIP semantic model (TMDL)."""
 
-    def __init__(self, semantic_model_dir: str):
+    def __init__(self, semantic_model_dir: str, confirmed_only: bool = True):
         self.semantic_model_dir = Path(semantic_model_dir)
         self.parser = TMDLParser(self.semantic_model_dir)
-        self.dax_analyzer = DAXAnalyzer()
+        self.dax_analyzer = DAXAnalyzer(confirmed_only=confirmed_only)
+        self._confirmed_only = confirmed_only
 
     def generate(self) -> DiagnosticReport:
         parsed = self.parser.parse()
@@ -45,7 +46,7 @@ class PBIPReportGenerator:
 
         dep_analyzer = MeasureDependencyAnalyzer()
         dependency_result = dep_analyzer.analyze(measures_data)
-        self.dax_analyzer = DAXAnalyzer(dependency_result=dependency_result)
+        self.dax_analyzer = DAXAnalyzer(dependency_result=dependency_result, confirmed_only=self._confirmed_only)
 
         measure_analyses: list[MeasureAnalysis] = []
         for measure in measures_data:

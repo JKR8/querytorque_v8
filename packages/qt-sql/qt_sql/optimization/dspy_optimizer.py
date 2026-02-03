@@ -180,21 +180,41 @@ def load_gold_examples(num_examples: int = 3) -> List[dspy.Example]:
         return []
 
 
-def detect_knowledge_patterns(sql: str) -> str:
+def detect_knowledge_patterns(sql: str, dag: "SQLDag" = None) -> str:
     """Detect KNOWLEDGE_BASE patterns relevant to this query.
 
     This function is now a wrapper around the centralized opportunity_detector module.
     It provides backward compatibility while delegating to the single source of truth.
 
+    When a DAG is provided, also includes multi-node predicate pushdown analysis.
+
     Args:
         sql: SQL query to analyze
+        dag: Optional pre-built SQLDag for pushdown analysis
 
     Returns:
         Formatted string with relevant patterns, or empty string if none
     """
     # Use the centralized opportunity detector
     from qt_sql.analyzers.opportunity_detector import detect_knowledge_patterns as _detect
-    return _detect(sql)
+    patterns = _detect(sql)
+
+    # Add pushdown analysis if DAG is provided
+    if dag is not None:
+        try:
+            from qt_sql.optimization.predicate_analysis import analyze_pushdown_opportunities
+            analysis = analyze_pushdown_opportunities(dag)
+            pushdown_context = analysis.to_prompt_context()
+            if pushdown_context:
+                if patterns:
+                    patterns += "\n\n" + pushdown_context
+                else:
+                    patterns = pushdown_context
+        except Exception:
+            # Silently ignore pushdown analysis failures
+            pass
+
+    return patterns
 
 
 @dataclass
@@ -1241,8 +1261,8 @@ class DagOptimizationPipeline(dspy.Module):
 
         node_sql = "\n\n".join(node_sql_parts)
 
-        # Detect relevant optimization patterns
-        hints = detect_knowledge_patterns(sql)
+        # Detect relevant optimization patterns (including pushdown analysis)
+        hints = detect_knowledge_patterns(sql, dag=dag)
 
         attempts = 0
         last_rewrites_str = ""

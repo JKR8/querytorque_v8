@@ -321,6 +321,16 @@ def optimize(
                 console.print(f"  - {issue.name}: {issue.suggestion or issue.description}")
             return
 
+        # Get measures with issues
+        measure_issues = {}
+        for issue in result.all_issues:
+            if issue.category == "dax_anti_pattern" and issue.affected_object:
+                if measures_to_optimize and issue.affected_object not in measures_to_optimize:
+                    continue
+                if issue.affected_object not in measure_issues:
+                    measure_issues[issue.affected_object] = []
+                measure_issues[issue.affected_object].append(issue)
+
         if dspy:
             try:
                 import dspy  # noqa: F401
@@ -449,16 +459,6 @@ def optimize(
         except ImportError:
             console.print("[red]qt_shared package not installed. Cannot use LLM optimization.[/red]")
             sys.exit(1)
-
-        # Get measures with issues
-        measure_issues = {}
-        for issue in result.all_issues:
-            if issue.category == "dax_anti_pattern" and issue.affected_object:
-                if measures_to_optimize and issue.affected_object not in measures_to_optimize:
-                    continue
-                if issue.affected_object not in measure_issues:
-                    measure_issues[issue.affected_object] = []
-                measure_issues[issue.affected_object].append(issue)
 
         if not measure_issues:
             console.print("\n[yellow]No DAX measure issues to optimize.[/yellow]")

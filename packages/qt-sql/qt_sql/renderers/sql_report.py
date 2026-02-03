@@ -14,6 +14,8 @@ def render_sql_report(
     sql: str,
     filename: str = "query.sql",
     dialect: str = "generic",
+    opportunities: list = None,
+    savings_estimate: dict = None,
 ) -> str:
     """Render SQL analysis result as HTML report.
 
@@ -22,10 +24,16 @@ def render_sql_report(
         sql: The original SQL query
         filename: Name of the SQL file
         dialect: SQL dialect (generic, snowflake, postgres, etc.)
+        opportunities: List of OpportunityResponse objects with weight/rewrite_hint
+        savings_estimate: Dict with savings band info (band_display, low, mid, high)
 
     Returns:
         HTML string of the rendered report
     """
+    if opportunities is None:
+        opportunities = []
+    if savings_estimate is None:
+        savings_estimate = {"band_display": "$0", "low": 0, "mid": 0, "high": 0}
     # Set up Jinja2 environment
     template_dir = Path(__file__).parent.parent / "templates"
     env = Environment(loader=FileSystemLoader(str(template_dir)))
@@ -102,6 +110,19 @@ def render_sql_report(
                     "ok": True,
                 })
 
+    # Convert opportunities to template format
+    opportunities_data = [
+        {
+            "pattern_id": getattr(opp, 'pattern_id', opp.get('pattern_id', '')),
+            "pattern_name": getattr(opp, 'pattern_name', opp.get('pattern_name', '')),
+            "trigger": getattr(opp, 'trigger', opp.get('trigger', '')),
+            "rewrite_hint": getattr(opp, 'rewrite_hint', opp.get('rewrite_hint', '')),
+            "weight": getattr(opp, 'weight', opp.get('weight', 5)),
+            "weight_label": getattr(opp, 'weight_label', opp.get('weight_label', 'Medium')),
+        }
+        for opp in opportunities
+    ]
+
     # Build the full data structure
     json_data = {
         "report_id": report_id,
@@ -115,6 +136,8 @@ def render_sql_report(
         },
         "summary": summary,
         "issues": issues,
+        "opportunities": opportunities_data,
+        "savings_estimate": savings_estimate,
         "source": source,
         "constraints": constraints,
         "schema_map": schema_map,
@@ -125,7 +148,7 @@ def render_sql_report(
     }
 
     # Generate LLM payload
-    llm_payload = _generate_llm_payload(sql, issues, filename, dialect)
+    llm_payload = _generate_llm_payload(sql, issues, filename, dialect, opportunities_data)
 
     # Render template
     html = template.render(
@@ -188,8 +211,11 @@ def _escape_for_js(text: str) -> str:
     return text
 
 
-def _generate_llm_payload(sql: str, issues: list, filename: str, dialect: str) -> str:
+def _generate_llm_payload(sql: str, issues: list, filename: str, dialect: str, opportunities: list = None) -> str:
     """Generate the LLM payload for optimization."""
+    if opportunities is None:
+        opportunities = []
+
     lines = [
         "# SQL Optimization Request",
         "",
@@ -203,9 +229,27 @@ def _generate_llm_payload(sql: str, issues: list, filename: str, dialect: str) -
         "",
     ]
 
+    # Optimization Opportunities (primary - fed to optimizer)
+    if opportunities:
+        lines.extend([
+            "## Optimization Opportunities",
+            "",
+            "*These high-value patterns are injected into the LLM optimizer:*",
+            "",
+        ])
+        for i, opp in enumerate(opportunities, 1):
+            weight_label = opp.get('weight_label', 'Medium')
+            lines.append(f"{i}. **{opp['pattern_id']}** ({weight_label}) - {opp['pattern_name']}")
+            lines.append(f"   - Trigger: {opp['trigger']}")
+            lines.append(f"   - Rewrite: {opp['rewrite_hint']}")
+            lines.append("")
+
+    # Code Quality Issues (secondary - informational)
     if issues:
         lines.extend([
-            "## Detected Anti-Patterns",
+            "## Code Quality Issues",
+            "",
+            "*Static analysis findings (informational):*",
             "",
         ])
         for i, issue in enumerate(issues, 1):
@@ -220,10 +264,20 @@ def _generate_llm_payload(sql: str, issues: list, filename: str, dialect: str) -
         "## Instructions",
         "",
         "Please provide an optimized version of this SQL that:",
-        "1. Fixes the detected anti-patterns",
-        "2. Preserves the same output columns and row count",
-        "3. Uses explicit JOIN syntax instead of comma joins",
-        "4. Avoids functions on indexed columns in WHERE clauses",
+    ])
+
+    if opportunities:
+        lines.append("1. **Applies the optimization opportunities above** (primary goal)")
+        lines.append("2. Preserves the same output columns and row count")
+        lines.append("3. Uses explicit JOIN syntax instead of comma joins")
+        lines.append("4. Avoids functions on indexed columns in WHERE clauses")
+    else:
+        lines.append("1. Fixes the detected code quality issues")
+        lines.append("2. Preserves the same output columns and row count")
+        lines.append("3. Uses explicit JOIN syntax instead of comma joins")
+        lines.append("4. Avoids functions on indexed columns in WHERE clauses")
+
+    lines.extend([
         "",
         "Return the optimized SQL in a code block.",
     ])

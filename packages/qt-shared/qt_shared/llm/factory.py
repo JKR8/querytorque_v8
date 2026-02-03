@@ -51,6 +51,8 @@ def create_llm_client(
             api_key = settings.groq_api_key
         elif provider == "openai":
             api_key = settings.openai_api_key
+        elif provider == "openrouter":
+            api_key = settings.openrouter_api_key
 
     # Create client based on provider
     if provider == "anthropic":
@@ -89,6 +91,14 @@ def create_llm_client(
         return OpenAIClient(
             api_key=api_key,
             model=model or "gpt-4o",
+        )
+    elif provider == "openrouter":
+        if not api_key:
+            raise ValueError("OpenRouter API key required")
+        return OpenAIClient(
+            api_key=api_key,
+            model=model or "moonshotai/kimi-k2.5",
+            base_url="https://openrouter.ai/api/v1",
         )
     else:
         raise ValueError(f"Unknown LLM provider: {provider}")

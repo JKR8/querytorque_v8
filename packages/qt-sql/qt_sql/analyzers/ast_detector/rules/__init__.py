@@ -173,19 +173,20 @@ from .optimization_rules import (
     GroupByFunctionalDependencyRule,
 )
 
-# Optimization opportunity rules (empirical - from TPC-DS wins)
+# Optimization opportunity rules - synced with knowledge_base.TRANSFORM_REGISTRY
+# These 11 rules match the MCTS transforms exactly
 from .opportunity_rules import (
-    OrToUnionOpportunity,
-    LateDateFilterOpportunity,
-    RepeatedSubqueryOpportunity,
-    CorrelatedSubqueryOpportunity,
-    ImplicitCrossJoinOpportunity,
-    CountToExistsOpportunity,
-    # NEW: High-impact patterns from Kimi/DeepSeek benchmarks
-    PredicatePushdownOpportunity,
-    CorrelatedToPrecomputedCTEOpportunity,
-    JoinEliminationOpportunity,
-    ScanConsolidationOpportunity,
+    OrToUnionOpportunity,              # QT-OPT-001: or_to_union
+    CorrelatedToPrecomputedCTEOpportunity,  # QT-OPT-002: correlated_to_cte
+    LateDateFilterOpportunity,         # QT-OPT-003: date_cte_isolate
+    PredicatePushdownOpportunity,      # QT-OPT-004: push_pred
+    ScanConsolidationOpportunity,      # QT-OPT-005: consolidate_scans
+    MultiPushPredicateOpportunity,     # QT-OPT-006: multi_push_pred
+    RepeatedSubqueryOpportunity,       # QT-OPT-007: materialize_cte
+    CountToExistsOpportunity,          # QT-OPT-008: flatten_subq
+    JoinReorderOpportunity,            # QT-OPT-009: reorder_join
+    InlineCTEOpportunity,              # QT-OPT-010: inline_cte
+    RemoveRedundantOpportunity,        # QT-OPT-011: remove_redundant
 )
 
 # Snowflake-specific rules
@@ -365,16 +366,16 @@ __all__ = [
     "WindowPushdownRule",
     "PreAggregateRule",
     "GroupByFunctionalDependencyRule",
-    # Optimization opportunities (empirical - from TPC-DS wins)
-    "OrToUnionOpportunity",
-    "LateDateFilterOpportunity",
-    "RepeatedSubqueryOpportunity",
-    "CorrelatedSubqueryOpportunity",
-    "ImplicitCrossJoinOpportunity",
-    "CountToExistsOpportunity",
-    # NEW: High-impact patterns from Kimi/DeepSeek benchmarks
-    "PredicatePushdownOpportunity",        # QT-OPT-007: 2.71x (Q93)
-    "CorrelatedToPrecomputedCTEOpportunity",  # QT-OPT-008: 2.81x (Q1)
-    "JoinEliminationOpportunity",          # QT-OPT-009: 2.18x (Q23)
-    "ScanConsolidationOpportunity",        # QT-OPT-010: 1.84x (Q90)
+    # Optimization opportunities (synced with knowledge_base - 11 MCTS transforms)
+    "OrToUnionOpportunity",              # QT-OPT-001
+    "CorrelatedToPrecomputedCTEOpportunity",  # QT-OPT-002
+    "LateDateFilterOpportunity",         # QT-OPT-003
+    "PredicatePushdownOpportunity",      # QT-OPT-004
+    "ScanConsolidationOpportunity",      # QT-OPT-005
+    "MultiPushPredicateOpportunity",     # QT-OPT-006
+    "RepeatedSubqueryOpportunity",       # QT-OPT-007
+    "CountToExistsOpportunity",          # QT-OPT-008
+    "JoinReorderOpportunity",            # QT-OPT-009
+    "InlineCTEOpportunity",              # QT-OPT-010
+    "RemoveRedundantOpportunity",        # QT-OPT-011
 ]

@@ -27,7 +27,7 @@ from typing import Any, Optional
 
 from .node import MCTSNode
 from .tree import MCTSTree
-from .transforms import get_all_transform_ids, get_transform_description
+from .transforms import get_all_transform_ids, get_transform_description, apply_dag_transformation
 from .reward import RewardConfig
 
 logger = logging.getLogger(__name__)
@@ -111,23 +111,26 @@ class MCTSSQLOptimizer:
         max_depth: int = 5,
         reward_config: Optional[RewardConfig] = None,
         transform_ids: Optional[list[str]] = None,
+        use_dag_mode: bool = True,
     ):
         """Initialize MCTS SQL optimizer.
 
         Args:
             database: Path to DuckDB database.
-            provider: LLM provider name (deepseek, anthropic, etc.).
+            provider: LLM provider name (deepseek, anthropic, openrouter, etc.).
             model: LLM model name.
             c: UCT exploration constant.
             max_depth: Maximum depth of transformation chains.
             reward_config: Reward function configuration.
             transform_ids: Specific transforms to use (None = all).
+            use_dag_mode: Use DAG-based node patching (default True).
         """
         self.database = database
         self.c = c
         self.max_depth = max_depth
         self.reward_config = reward_config or RewardConfig()
         self.transform_ids = transform_ids or get_all_transform_ids()
+        self.use_dag_mode = use_dag_mode
 
         # Lazy initialization
         self._llm_client = None
@@ -171,6 +174,7 @@ class MCTSSQLOptimizer:
         max_iterations: int = 30,
         early_stop_speedup: float = 3.0,
         convergence_patience: int = 10,
+        log_full_sql: bool = False,
     ) -> MCTSOptimizationResult:
         """Optimize a SQL query using MCTS.
 
@@ -179,10 +183,12 @@ class MCTSSQLOptimizer:
             max_iterations: Maximum number of MCTS iterations.
             early_stop_speedup: Stop early if this speedup achieved.
             convergence_patience: Stop if best unchanged for this many iterations.
+            log_full_sql: If True, include full SQL in detailed_log for each transform attempt.
 
         Returns:
             MCTSOptimizationResult with best optimization found.
         """
+        self._log_full_sql = log_full_sql
         start_time = time.time()
 
         logger.info(f"Starting MCTS optimization (max_iterations={max_iterations})")
@@ -196,6 +202,7 @@ class MCTSSQLOptimizer:
             c=self.c,
             max_depth=self.max_depth,
             transform_ids=self.transform_ids,
+            use_dag_mode=self.use_dag_mode,
         )
 
         # Track best result for convergence detection
@@ -277,7 +284,7 @@ class MCTSSQLOptimizer:
             tree_stats=tree.get_stats(),
             validation_result=best_node.validation_result,
             elapsed_time=elapsed_time,
-            detailed_log=tree.get_detailed_log(),
+            detailed_log=tree.get_detailed_log(include_full_sql=self._log_full_sql),
             attempt_summary=tree.get_attempt_summary(),
         )
 
@@ -327,6 +334,7 @@ class MCTSSQLOptimizer:
             c=self.c,
             max_depth=self.max_depth,
             transform_ids=self.transform_ids,
+            use_dag_mode=self.use_dag_mode,
         )
 
         # Track best result for convergence detection

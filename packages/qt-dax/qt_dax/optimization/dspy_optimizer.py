@@ -146,7 +146,7 @@ def optimize_measure_with_validation(
 
     constraints = (
         "Preserve semantics exactly. Return only the DAX expression (no measure name). "
-        "Do not use EVALUATE or DEFINE. Keep it compatible with Power BI." 
+        "Do not use EVALUATE or DEFINE. Keep it compatible with Power BI. "
         "Prefer readable variables and avoid unnecessary iterators."
     )
 
