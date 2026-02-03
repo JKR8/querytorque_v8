@@ -118,7 +118,7 @@ class OptimizeRequest(BaseModel):
     measures: list[OptimizeMeasureRequest] = Field(..., description="Measures to optimize")
     provider: Optional[str] = Field(
         default=None,
-        description="LLM provider override (anthropic, deepseek, openai, etc.)"
+        description="LLM provider override (deepseek, openrouter)"
     )
     model: Optional[str] = Field(default=None, description="LLM model override")
 

@@ -87,28 +87,34 @@ class DAXEquivalenceValidator:
     def __init__(
         self,
         connection: "PBIDesktopConnection",
-        tolerance: float = 1e-9,
+        tolerance: float = 0.0,
         max_rows_to_compare: int = 10000,
         sample_mismatch_limit: int = 5,
         timeout_ms: int = 30000,
-        warmup_runs: int = 1,
+        warmup_runs: int = 2,
+        discard_first: bool = True,
+        exact_match: bool = True,
     ):
         """Initialize the validator.
 
         Args:
             connection: PBIDesktopConnection to a running Power BI Desktop instance
-            tolerance: Numeric tolerance for floating-point comparisons
+            tolerance: Numeric tolerance for floating-point comparisons (0.0 = exact match)
             max_rows_to_compare: Maximum rows to compare (for performance)
             sample_mismatch_limit: Max mismatches to include in result
             timeout_ms: Query execution timeout in milliseconds
-            warmup_runs: Number of times to run each query (min time used for comparison)
+            warmup_runs: Number of timed runs per query (after discarding first)
+            discard_first: If True, run once to warm cache before timing runs
+            exact_match: If True, require exact value match (tolerance=0)
         """
         self.connection = connection
-        self.tolerance = tolerance
+        self.tolerance = 0.0 if exact_match else tolerance
         self.max_rows = max_rows_to_compare
         self.sample_limit = sample_mismatch_limit
         self.timeout_ms = timeout_ms
         self.warmup_runs = warmup_runs
+        self.discard_first = discard_first
+        self.exact_match = exact_match
 
     def validate(
         self,
@@ -139,15 +145,24 @@ class DAXEquivalenceValidator:
             result.errors.append(f"Failed to prepare DAX: {e}")
             return result
 
-        # Execute original DAX multiple times, keep all timings
+        # Execute original DAX - first run discarded for cache warmup
         original_results = None
+        if self.discard_first:
+            try:
+                self.connection.execute_dax(original_query)  # Warmup run (discarded)
+            except Exception as e:
+                result.equivalent = False
+                result.status = "error"
+                result.errors.append(f"Original DAX warmup failed: {e}")
+                return result
+
+        # Timed runs for original
         for run in range(self.warmup_runs):
             try:
                 start = time.perf_counter()
                 run_results = self.connection.execute_dax(original_query)
                 elapsed_ms = (time.perf_counter() - start) * 1000
                 result.original_run_times_ms.append(elapsed_ms)
-                # Keep last run's results for comparison
                 original_results = run_results
             except Exception as e:
                 result.equivalent = False
@@ -159,15 +174,24 @@ class DAXEquivalenceValidator:
         result.original_execution_time_ms = min(result.original_run_times_ms)
         result.original_row_count = len(original_results) if original_results else 0
 
-        # Execute optimized DAX multiple times, keep all timings
+        # Execute optimized DAX - first run discarded for cache warmup
         optimized_results = None
+        if self.discard_first:
+            try:
+                self.connection.execute_dax(optimized_query)  # Warmup run (discarded)
+            except Exception as e:
+                result.equivalent = False
+                result.status = "error"
+                result.errors.append(f"Optimized DAX warmup failed: {e}")
+                return result
+
+        # Timed runs for optimized
         for run in range(self.warmup_runs):
             try:
                 start = time.perf_counter()
                 run_results = self.connection.execute_dax(optimized_query)
                 elapsed_ms = (time.perf_counter() - start) * 1000
                 result.optimized_run_times_ms.append(elapsed_ms)
-                # Keep last run's results for comparison
                 optimized_results = run_results
             except Exception as e:
                 result.equivalent = False
@@ -338,7 +362,7 @@ class DAXEquivalenceValidator:
 
         Handles:
         - NULL/None comparison
-        - Floating-point tolerance
+        - Exact match mode (tolerance=0) or tolerance-based comparison
         - Numeric type coercion
         - NaN and infinity handling
         """
@@ -350,7 +374,27 @@ class DAXEquivalenceValidator:
         if a is None or b is None:
             return False
 
-        # Same type, direct comparison
+        # Exact match mode
+        if self.exact_match or self.tolerance == 0.0:
+            # For floats, still need to handle NaN specially
+            if isinstance(a, float) and isinstance(b, float):
+                if math.isnan(a) and math.isnan(b):
+                    return True
+                if math.isnan(a) or math.isnan(b):
+                    return False
+                return a == b  # Exact float comparison
+            # Direct comparison for same types
+            if type(a) == type(b):
+                return a == b
+            # Numeric coercion for exact comparison
+            if isinstance(a, (int, float, Decimal)) and isinstance(b, (int, float, Decimal)):
+                try:
+                    return float(a) == float(b)
+                except (TypeError, ValueError):
+                    pass
+            return str(a) == str(b)
+
+        # Tolerance-based comparison (legacy mode)
         if type(a) == type(b):
             if isinstance(a, float):
                 return self._float_equal(a, b)

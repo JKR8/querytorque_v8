@@ -96,37 +96,23 @@ def configure_lm(
             "api_key": api_key or os.getenv("DEEPSEEK_API_KEY"),
             "api_base": "https://api.deepseek.com",
         },
-        "groq": {
-            "model": model or "llama-3.3-70b-versatile",
-            "api_key": api_key or os.getenv("GROQ_API_KEY"),
-        },
-        "gemini": {
-            "model": model or "gemini-2.0-flash",
-            "api_key": api_key or os.getenv("GEMINI_API_KEY"),
-        },
-        "anthropic": {
-            "model": model or "claude-3-5-sonnet-20241022",
-            "api_key": api_key or os.getenv("ANTHROPIC_API_KEY"),
+        "openrouter": {
+            "model": model or "deepseek/deepseek-chat",
+            "api_key": api_key or os.getenv("OPENROUTER_API_KEY"),
+            "api_base": "https://openrouter.ai/api/v1",
         },
     }
 
     if provider not in provider_configs:
-        raise ValueError(f"Unknown provider: {provider}")
+        raise ValueError(f"Unknown provider: {provider}. Supported: deepseek, openrouter")
 
     config = provider_configs[provider]
 
-    if provider == "groq":
-        lm = dspy.LM(f"groq/{config['model']}", api_key=config["api_key"])
-    elif provider == "gemini":
-        lm = dspy.LM(f"gemini/{config['model']}", api_key=config["api_key"])
-    elif provider == "anthropic":
-        lm = dspy.LM(f"anthropic/{config['model']}", api_key=config["api_key"])
-    else:
-        lm = dspy.LM(
-            f"openai/{config['model']}",
-            api_key=config["api_key"],
-            api_base=config.get("api_base"),
-        )
+    lm = dspy.LM(
+        f"openai/{config['model']}",
+        api_key=config["api_key"],
+        api_base=config.get("api_base"),
+    )
 
     dspy.configure(lm=lm)
 

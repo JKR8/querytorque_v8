@@ -311,7 +311,7 @@ def audit(
 
 @cli.command()
 @click.argument("file", type=click.Path(exists=True))
-@click.option("--provider", default=None, help="LLM provider (anthropic, deepseek, openai, groq, gemini)")
+@click.option("--provider", default=None, help="LLM provider (deepseek, openrouter)")
 @click.option("--model", default=None, help="LLM model name")
 @click.option("--output", "-o", type=click.Path(), help="Output file for optimized measures")
 @click.option("--dry-run", is_flag=True, help="Show what would be optimized without calling LLM")
@@ -345,7 +345,7 @@ def optimize(
 
     Examples:
         qt-dax optimize model.vpax
-        qt-dax optimize model.vpax --provider anthropic
+        qt-dax optimize model.vpax --provider openrouter
         qt-dax optimize model.vpax -m "Total Sales" -m "Profit %"
         qt-dax optimize model.vpax --dspy --port 54000
     """
