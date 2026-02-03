@@ -150,6 +150,11 @@ from .rules import (
     CorrelatedSubqueryOpportunity,
     ImplicitCrossJoinOpportunity,
     CountToExistsOpportunity,
+    # NEW: High-impact patterns from Kimi/DeepSeek benchmarks
+    PredicatePushdownOpportunity,
+    CorrelatedToPrecomputedCTEOpportunity,
+    JoinEliminationOpportunity,
+    ScanConsolidationOpportunity,
     # Snowflake
     CopyIntoWithoutFileFormatRule,
     SelectWithoutLimitOrSampleRule,
@@ -349,13 +354,18 @@ _ALL_RULES: list[ASTRule] = [
     PreAggregateRule(),
     GroupByFunctionalDependencyRule(),
 
-    # Optimization opportunity rules - empirical from TPC-DS wins (6)
+    # Optimization opportunity rules - empirical from TPC-DS wins (10)
     OrToUnionOpportunity(),
     LateDateFilterOpportunity(),
     RepeatedSubqueryOpportunity(),
     CorrelatedSubqueryOpportunity(),
     ImplicitCrossJoinOpportunity(),
     CountToExistsOpportunity(),
+    # NEW: High-impact patterns from Kimi/DeepSeek benchmarks
+    PredicatePushdownOpportunity(),        # QT-OPT-007: 2.71x (Q93)
+    CorrelatedToPrecomputedCTEOpportunity(),  # QT-OPT-008: 2.81x (Q1)
+    JoinEliminationOpportunity(),          # QT-OPT-009: 2.18x (Q23)
+    ScanConsolidationOpportunity(),        # QT-OPT-010: 1.84x (Q90)
 ]
 
 # Rule lookup by ID

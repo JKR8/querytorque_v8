@@ -181,6 +181,11 @@ from .opportunity_rules import (
     CorrelatedSubqueryOpportunity,
     ImplicitCrossJoinOpportunity,
     CountToExistsOpportunity,
+    # NEW: High-impact patterns from Kimi/DeepSeek benchmarks
+    PredicatePushdownOpportunity,
+    CorrelatedToPrecomputedCTEOpportunity,
+    JoinEliminationOpportunity,
+    ScanConsolidationOpportunity,
 )
 
 # Snowflake-specific rules
@@ -367,4 +372,9 @@ __all__ = [
     "CorrelatedSubqueryOpportunity",
     "ImplicitCrossJoinOpportunity",
     "CountToExistsOpportunity",
+    # NEW: High-impact patterns from Kimi/DeepSeek benchmarks
+    "PredicatePushdownOpportunity",        # QT-OPT-007: 2.71x (Q93)
+    "CorrelatedToPrecomputedCTEOpportunity",  # QT-OPT-008: 2.81x (Q1)
+    "JoinEliminationOpportunity",          # QT-OPT-009: 2.18x (Q23)
+    "ScanConsolidationOpportunity",        # QT-OPT-010: 1.84x (Q90)
 ]

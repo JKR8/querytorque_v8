@@ -27,24 +27,67 @@ strategies:
         SELECT * FROM agg
     verified_speedup: "2.44x"
 
+  - id: correlated_to_precomputed_cte
+    name: Correlated Subquery to Pre-computed CTE
+    description: |
+      Replace correlated subqueries that compare against per-group aggregates
+      with a pre-computed CTE using GROUP BY, then JOIN.
+    signal:
+      - Correlated subquery in WHERE computing AVG, SUM, COUNT per group
+      - Subquery used for threshold comparison (>, <, =)
+      - Same CTE referenced in both main query and correlated subquery
+    fix: |
+      Create separate CTE with GROUP BY to pre-compute the aggregate.
+      JOIN the pre-computed CTE instead of correlated subquery.
+    example:
+      before: |
+        WITH ctr AS (SELECT store_sk, SUM(fee) AS total FROM returns GROUP BY store_sk, customer_sk)
+        SELECT * FROM ctr c1 WHERE c1.total > (SELECT AVG(total)*1.2 FROM ctr c2 WHERE c1.store_sk = c2.store_sk)
+      after: |
+        WITH ctr AS (...),
+             store_avg AS (SELECT store_sk, AVG(total)*1.2 AS threshold FROM ctr GROUP BY store_sk)
+        SELECT * FROM ctr c1 JOIN store_avg sa ON c1.store_sk = sa.store_sk WHERE c1.total > sa.threshold
+    verified_speedup: "2.81x"
+    verified_query: "Q1"
+
+  - id: date_cte_isolation
+    name: Date CTE Isolation
+    description: |
+      Extract date dimension filtering into a small, early CTE.
+      Particularly effective when date filter is repeated or complex.
+    signal:
+      - Date dimension joined with filter (d_year, d_qoy, d_month_seq, etc.)
+      - Same date filter repeated in multiple CTEs or joins
+      - Complex date range expression
+    fix: |
+      Create small CTE selecting only d_date_sk with the date filter.
+      Join fact tables to this CTE instead of date_dim directly.
+    example:
+      before: |
+        SELECT ... FROM fact, date_dim WHERE fact.date_sk = d_date_sk AND d_year = 2001 AND d_qoy = 1
+      after: |
+        WITH filtered_dates AS (SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_qoy = 1)
+        SELECT ... FROM fact JOIN filtered_dates ON fact.date_sk = d_date_sk
+    verified_speedup: "1.2-2.7x"
+    verified_query: "Q6, Q15, Q27"
+
   - id: correlated_to_window
     name: Correlated Subquery to Window Function
     description: |
-      Replace correlated subqueries that compute per-group aggregates with
-      window functions computed in a single pass.
+      Replace correlated subqueries in SELECT list that compute per-group aggregates
+      with window functions computed in a single pass.
     signal:
-      - Correlated subquery in WHERE/SELECT computing AVG, SUM, COUNT per group
-      - Subquery references outer query's grouping column
+      - Correlated subquery in SELECT computing AVG, SUM, COUNT per group
+      - Aggregate needed alongside each row (not just for filtering)
     fix: |
-      Add window function to CTE: AGG(...) OVER (PARTITION BY group_col)
-      Reference the pre-computed value instead of subquery.
+      Add window function: AGG(...) OVER (PARTITION BY group_col)
     example:
       before: |
-        SELECT * FROM t1 WHERE val > (SELECT AVG(val) FROM t1 t2 WHERE t1.grp = t2.grp)
+        SELECT *, (SELECT AVG(val) FROM t1 t2 WHERE t1.grp = t2.grp) as grp_avg FROM t1
       after: |
-        WITH t AS (SELECT *, AVG(val) OVER (PARTITION BY grp) as grp_avg FROM t1)
-        SELECT * FROM t WHERE val > grp_avg
-    verified_speedup: "2x+ (combined with filter hoisting)"
+        SELECT *, AVG(val) OVER (PARTITION BY grp) as grp_avg FROM t1
+    verified_speedup: "2x+"
+    note: "For threshold comparisons in WHERE, prefer correlated_to_precomputed_cte"
 
   - id: join_elimination
     name: Join Elimination
@@ -109,20 +152,30 @@ strategies:
 
 # Priority order for applying strategies
 priority:
-  - dimension_filter_hoisting  # Highest impact - filters early
-  - correlated_to_window       # Eliminates O(n²) patterns
-  - join_elimination           # Removes unnecessary work
-  - union_all_decomposition    # Helps with complex OR
-  - scan_consolidation         # Reduces I/O
+  - correlated_to_precomputed_cte  # Highest impact - 2.81x on Q1
+  - dimension_filter_hoisting       # 2.71x on Q93 - filters early
+  - union_all_decomposition         # 2.67x on Q15 - OR splitting
+  - date_cte_isolation              # 1.2-2.7x - enables partition pruning
+  - correlated_to_window            # Eliminates O(n²) in SELECT
+  - join_elimination                # Removes unnecessary work
+  - scan_consolidation              # Reduces I/O
 
 # Detection hints for prompts
 detection_signals:
+  correlated_to_precomputed_cte:
+    - "Correlated subquery comparing against AVG/SUM of same CTE"
+    - "WHERE val > (SELECT AGG(...) FROM cte WHERE correlated)"
+    - "Self-referencing CTE with aggregate threshold"
   dimension_filter_hoisting:
     - "Filtered dimension in main_query, unfiltered fact aggregation in CTE"
     - "Table scans show: dim table FILTERED, fact table NO FILTER"
+  date_cte_isolation:
+    - "Date dimension joined with d_year, d_qoy, d_month_seq filter"
+    - "Same date filter in multiple CTEs"
+    - "Date filter in main WHERE clause with fact table"
   correlated_to_window:
-    - "Correlated subquery with AVG/SUM/COUNT"
-    - "Subquery references outer table's column"
+    - "Correlated subquery in SELECT with AVG/SUM/COUNT"
+    - "Aggregate needed alongside row, not just for filtering"
   join_elimination:
     - "Table in FROM but no columns in SELECT"
     - "Join only validates FK existence"

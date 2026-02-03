@@ -448,3 +448,422 @@ class ImplicitCrossJoinOpportunity(ASTRule):
                 message=f"Implicit join of {len(tables)} tables - explicit JOIN syntax recommended",
                 matched_text=f"FROM {', '.join(table_names)}...",
             )
+
+
+# Dimension tables commonly filtered
+DIMENSION_TABLES = {
+    'store', 'customer', 'item', 'customer_address', 'customer_demographics',
+    'household_demographics', 'promotion', 'reason', 'ship_mode', 'warehouse',
+    'web_site', 'web_page', 'catalog_page', 'call_center', 'income_band',
+    'time_dim', 'date_dim'
+}
+
+
+class PredicatePushdownOpportunity(ASTRule):
+    """QT-OPT-007: Dimension filter in main query - pushdown into CTE opportunity.
+
+    Empirical speedup: 2.71x (Q93), 1.23x (Q27)
+
+    Pattern detected:
+        WITH agg AS (SELECT fk_col, SUM(val) FROM fact GROUP BY fk_col)
+        SELECT * FROM agg, dim
+        WHERE agg.fk_col = dim.pk AND dim.filter = 'X'
+
+    Suggested rewrite:
+        WITH agg AS (
+            SELECT fk_col, SUM(val) FROM fact, dim
+            WHERE fact.fk_col = dim.pk AND dim.filter = 'X'
+            GROUP BY fk_col
+        )
+        SELECT * FROM agg
+
+    Why it helps:
+    - Filters fact rows BEFORE aggregation
+    - Reduces rows entering GROUP BY
+    - Q93: 2.71x speedup filtering reason='duplicate purchase' early
+    """
+
+    rule_id = "QT-OPT-007"
+    name = "Predicate Pushdown into CTE Opportunity"
+    severity = "high"
+    category = "optimization_opportunity"
+    penalty = 20  # High impact - 2.71x on Q93
+    description = "Dimension filter in main query could be pushed into CTE for 2-3x speedup"
+    suggestion = "Move dimension join and filter INTO the CTE before GROUP BY"
+
+    target_node_types = (exp.Select,)
+
+    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
+        if context.subquery_depth > 0:
+            return
+
+        # Must have WITH clause (CTEs)
+        with_clause = node.find(exp.With)
+        if not with_clause:
+            return
+
+        # Get CTE names
+        cte_names = set()
+        for cte in with_clause.find_all(exp.CTE):
+            if cte.alias:
+                cte_names.add(str(cte.alias).lower())
+
+        if not cte_names:
+            return
+
+        # Check main query for dimension table with filter
+        where = node.find(exp.Where)
+        if not where:
+            return
+
+        # Get tables in main FROM (not in CTEs)
+        main_tables = self._get_main_query_tables(node, cte_names)
+
+        # Find dimension tables with filters in main query
+        dim_filters = []
+        for table in main_tables:
+            table_lower = table.lower()
+            if table_lower in DIMENSION_TABLES or any(d in table_lower for d in ['dim', 'store', 'customer', 'item', 'reason']):
+                # Check if this table has a filter in WHERE
+                filters = self._find_table_filters(where, table)
+                if filters:
+                    dim_filters.append((table, filters))
+
+        # Check if CTEs reference fact tables (aggregation target)
+        cte_has_fact = False
+        for cte in with_clause.find_all(exp.CTE):
+            cte_sql = cte.sql().lower()
+            if any(f in cte_sql for f in FACT_TABLES) and ('group by' in cte_sql or 'sum(' in cte_sql or 'count(' in cte_sql):
+                cte_has_fact = True
+                break
+
+        if dim_filters and cte_has_fact:
+            dim_info = ", ".join(f"{t}({','.join(f[:2])})" for t, f in dim_filters[:2])
+            yield RuleMatch(
+                node=node,
+                context=context,
+                message=f"Dimension filter [{dim_info}] in main query - push into CTE for 2-3x speedup",
+                matched_text=f"Filter on {dim_info} outside CTE aggregation",
+            )
+
+    def _get_main_query_tables(self, node: exp.Expression, cte_names: set) -> list:
+        """Get tables from main query FROM clause (excluding CTE references)."""
+        tables = []
+        from_clause = node.args.get('from')
+        if from_clause:
+            for table in from_clause.find_all(exp.Table):
+                if table.this:
+                    name = str(table.this)
+                    if name.lower() not in cte_names:
+                        tables.append(name)
+        # Also check JOINs
+        for join in node.find_all(exp.Join):
+            for table in join.find_all(exp.Table):
+                if table.this:
+                    name = str(table.this)
+                    if name.lower() not in cte_names:
+                        tables.append(name)
+        return tables
+
+    def _find_table_filters(self, where: exp.Expression, table_name: str) -> list:
+        """Find filter columns for a specific table."""
+        filters = []
+        table_lower = table_name.lower()
+        for eq in where.find_all(exp.EQ):
+            for col in eq.find_all(exp.Column):
+                col_table = str(col.table).lower() if col.table else ""
+                col_name = str(col.this).lower() if col.this else ""
+                # Check if column belongs to this table (by alias or table name prefix)
+                if col_table and (col_table == table_lower or col_table.startswith(table_lower[0])):
+                    if col_name and not col_name.endswith('_sk'):  # Skip join keys
+                        filters.append(col_name)
+        return filters
+
+
+class CorrelatedToPrecomputedCTEOpportunity(ASTRule):
+    """QT-OPT-008: Correlated subquery comparing to aggregate - pre-computed CTE opportunity.
+
+    Empirical speedup: 2.81x (Q1)
+
+    Pattern detected:
+        WITH ctr AS (SELECT store_sk, SUM(fee) AS total FROM returns GROUP BY store_sk, customer_sk)
+        SELECT * FROM ctr c1
+        WHERE c1.total > (SELECT AVG(total) * 1.2 FROM ctr c2 WHERE c1.store_sk = c2.store_sk)
+
+    Suggested rewrite:
+        WITH ctr AS (...),
+             store_avg AS (SELECT store_sk, AVG(total) * 1.2 AS threshold FROM ctr GROUP BY store_sk)
+        SELECT * FROM ctr c1
+        JOIN store_avg sa ON c1.store_sk = sa.store_sk
+        WHERE c1.total > sa.threshold
+
+    Why it helps:
+    - Eliminates O(n²) correlated execution
+    - Pre-computes thresholds once per group
+    - Q1: 2.81x speedup (241ms → 86ms)
+    """
+
+    rule_id = "QT-OPT-008"
+    name = "Correlated Subquery to Pre-computed CTE Opportunity"
+    severity = "high"
+    category = "optimization_opportunity"
+    penalty = 25  # Highest impact - 2.81x on Q1
+    description = "Correlated subquery with aggregate comparison - pre-computed CTE can give 2-3x speedup"
+    suggestion = "Extract correlated aggregate into separate CTE with GROUP BY, then JOIN"
+
+    target_node_types = (exp.Select,)
+
+    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
+        if context.subquery_depth > 0:
+            return
+
+        where = node.find(exp.Where)
+        if not where:
+            return
+
+        # Look for comparison with correlated subquery containing aggregate
+        for compare in where.find_all((exp.GT, exp.GTE, exp.LT, exp.LTE)):
+            subq = compare.find(exp.Subquery)
+            if not subq:
+                continue
+
+            inner_select = subq.find(exp.Select)
+            if not inner_select:
+                continue
+
+            # Check for aggregate function (AVG, SUM, COUNT, MAX, MIN)
+            has_agg = bool(inner_select.find(exp.AggFunc))
+            if not has_agg:
+                continue
+
+            # Check for correlation (WHERE with equality referencing outer)
+            inner_where = inner_select.find(exp.Where)
+            if not inner_where:
+                continue
+
+            # Look for correlated equality (col1 = col2 pattern)
+            has_correlation = False
+            corr_col = None
+            for eq in inner_where.find_all(exp.EQ):
+                cols = list(eq.find_all(exp.Column))
+                if len(cols) >= 2:
+                    # Two columns in equality suggests correlation
+                    has_correlation = True
+                    corr_col = str(cols[0].this) if cols[0].this else "column"
+                    break
+
+            if has_correlation:
+                # Find the aggregate function name
+                agg_func = inner_select.find(exp.AggFunc)
+                agg_name = type(agg_func).__name__ if agg_func else "aggregate"
+
+                yield RuleMatch(
+                    node=compare,
+                    context=context,
+                    message=f"Correlated {agg_name} subquery on {corr_col} - pre-computed CTE can give 2-3x speedup",
+                    matched_text=f"WHERE ... > (SELECT {agg_name}(...) ... WHERE correlated)",
+                )
+                return  # Only report once per query
+
+
+class JoinEliminationOpportunity(ASTRule):
+    """QT-OPT-009: Table joined but no columns used - join elimination opportunity.
+
+    Empirical speedup: 2.18x (Q23)
+
+    Pattern detected:
+        SELECT a.col1, a.col2, SUM(a.value)
+        FROM fact a
+        JOIN dim d ON a.dim_sk = d.dim_sk  -- d columns never used!
+        GROUP BY a.col1, a.col2
+
+    Suggested rewrite:
+        SELECT col1, col2, SUM(value)
+        FROM fact
+        WHERE dim_sk IS NOT NULL  -- Preserve NULL filtering from join
+        GROUP BY col1, col2
+
+    Why it helps:
+    - Removes unnecessary table scan
+    - Eliminates join operation
+    - Q23: 2.18x speedup removing item/customer joins
+
+    CRITICAL: Must add IS NOT NULL to preserve join's implicit NULL filtering!
+    """
+
+    rule_id = "QT-OPT-009"
+    name = "Join Elimination Opportunity"
+    severity = "high"
+    category = "optimization_opportunity"
+    penalty = 20
+    description = "Table joined but no columns selected - can remove join for 2x+ speedup (add IS NOT NULL!)"
+    suggestion = "Remove unused join, add WHERE fk_column IS NOT NULL to preserve semantics"
+
+    target_node_types = (exp.Select,)
+
+    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
+        if context.subquery_depth > 0:
+            return
+
+        # Get all columns actually used in SELECT, WHERE, GROUP BY, ORDER BY
+        used_columns = self._get_used_columns(node)
+
+        # Get tables and their aliases
+        table_aliases = self._get_table_aliases(node)
+
+        # Check each JOIN
+        for join in node.find_all(exp.Join):
+            joined_table = join.find(exp.Table)
+            if not joined_table or not joined_table.this:
+                continue
+
+            table_name = str(joined_table.this).lower()
+            alias = str(joined_table.alias).lower() if joined_table.alias else table_name
+
+            # Check if any columns from this table are used
+            table_used = False
+            for col_table, col_name in used_columns:
+                if col_table == alias or col_table == table_name:
+                    table_used = True
+                    break
+                # Also check if column could belong to this table (no qualifier)
+                if not col_table and table_name in DIMENSION_TABLES:
+                    # Ambiguous - assume it might be used
+                    table_used = True
+                    break
+
+            if not table_used and table_name in DIMENSION_TABLES:
+                # Find the join key
+                join_on = join.find(exp.EQ)
+                join_col = ""
+                if join_on:
+                    for col in join_on.find_all(exp.Column):
+                        col_t = str(col.table).lower() if col.table else ""
+                        if col_t != alias and col_t != table_name:
+                            join_col = str(col.this) if col.this else ""
+                            break
+
+                yield RuleMatch(
+                    node=join,
+                    context=context,
+                    message=f"Table '{table_name}' joined but no columns used - remove join, add {join_col} IS NOT NULL",
+                    matched_text=f"JOIN {table_name} (no columns selected)",
+                )
+                return  # Only report first occurrence
+
+    def _get_used_columns(self, node: exp.Expression) -> set:
+        """Get all (table, column) pairs used in query."""
+        used = set()
+
+        # SELECT columns
+        for sel in node.find_all(exp.Select):
+            if sel == node or sel.parent == node:  # Only main select
+                for col in sel.find_all(exp.Column):
+                    table = str(col.table).lower() if col.table else ""
+                    name = str(col.this).lower() if col.this else ""
+                    if name:
+                        used.add((table, name))
+
+        # WHERE columns
+        where = node.find(exp.Where)
+        if where:
+            for col in where.find_all(exp.Column):
+                table = str(col.table).lower() if col.table else ""
+                name = str(col.this).lower() if col.this else ""
+                if name:
+                    used.add((table, name))
+
+        # GROUP BY columns
+        for gb in node.find_all(exp.Group):
+            for col in gb.find_all(exp.Column):
+                table = str(col.table).lower() if col.table else ""
+                name = str(col.this).lower() if col.this else ""
+                if name:
+                    used.add((table, name))
+
+        # ORDER BY columns
+        for ob in node.find_all(exp.Order):
+            for col in ob.find_all(exp.Column):
+                table = str(col.table).lower() if col.table else ""
+                name = str(col.this).lower() if col.this else ""
+                if name:
+                    used.add((table, name))
+
+        return used
+
+    def _get_table_aliases(self, node: exp.Expression) -> dict:
+        """Get mapping of alias -> table name."""
+        aliases = {}
+        for table in node.find_all(exp.Table):
+            if table.this:
+                name = str(table.this).lower()
+                alias = str(table.alias).lower() if table.alias else name
+                aliases[alias] = name
+        return aliases
+
+
+class ScanConsolidationOpportunity(ASTRule):
+    """QT-OPT-010: Same table scanned multiple times - consolidation opportunity.
+
+    Empirical speedup: 1.84x (Q90)
+
+    Pattern detected:
+        WITH morning AS (SELECT ... FROM sales WHERE hour BETWEEN 8 AND 12),
+             afternoon AS (SELECT ... FROM sales WHERE hour BETWEEN 13 AND 17)
+        SELECT morning.total, afternoon.total FROM morning, afternoon
+
+    Suggested rewrite:
+        WITH combined AS (
+            SELECT
+                SUM(CASE WHEN hour BETWEEN 8 AND 12 THEN amount END) AS morning_total,
+                SUM(CASE WHEN hour BETWEEN 13 AND 17 THEN amount END) AS afternoon_total
+            FROM sales
+            WHERE hour BETWEEN 8 AND 17
+        )
+        SELECT morning_total, afternoon_total FROM combined
+
+    Why it helps:
+    - Single table scan instead of multiple
+    - Reduces I/O significantly
+    - Q90: 1.84x speedup combining AM/PM counting
+    """
+
+    rule_id = "QT-OPT-010"
+    name = "Scan Consolidation Opportunity"
+    severity = "optimization"
+    category = "optimization_opportunity"
+    penalty = 15
+    description = "Same table scanned multiple times - consolidate with CASE WHEN for 1.5-2x speedup"
+    suggestion = "Combine multiple scans into single scan with CASE WHEN conditional aggregates"
+
+    target_node_types = (exp.With,)
+
+    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
+        # Count table occurrences across CTEs
+        table_counts = {}
+        cte_tables = {}  # CTE name -> tables used
+
+        for cte in node.find_all(exp.CTE):
+            cte_name = str(cte.alias).lower() if cte.alias else ""
+            tables_in_cte = set()
+
+            for table in cte.find_all(exp.Table):
+                if table.this:
+                    table_name = str(table.this).lower()
+                    tables_in_cte.add(table_name)
+                    table_counts[table_name] = table_counts.get(table_name, 0) + 1
+
+            if cte_name:
+                cte_tables[cte_name] = tables_in_cte
+
+        # Find tables scanned 2+ times
+        repeated = [(t, c) for t, c in table_counts.items() if c >= 2 and t in FACT_TABLES]
+
+        if repeated:
+            table_info = ", ".join(f"{t}({c}x)" for t, c in repeated[:2])
+            yield RuleMatch(
+                node=node,
+                context=context,
+                message=f"Table scanned multiple times [{table_info}] - consolidate with CASE WHEN for 1.5-2x speedup",
+                matched_text=f"Multiple CTEs scan {table_info}",
+            )
