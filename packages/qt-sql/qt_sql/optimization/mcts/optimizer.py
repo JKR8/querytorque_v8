@@ -361,6 +361,7 @@ class MCTSSQLOptimizer:
                 continue
 
             # Process results
+            improved_this_iter = False
             for expanded, reward in results:
                 total_nodes_expanded += 1
 
@@ -370,7 +371,7 @@ class MCTSSQLOptimizer:
                     if speedup > best_speedup:
                         best_speedup = speedup
                         best_node = expanded
-                        iterations_without_improvement = 0
+                        improved_this_iter = True
 
                         logger.info(
                             f"Iteration {iteration+1}: New best speedup {speedup:.2f}x "
@@ -381,10 +382,10 @@ class MCTSSQLOptimizer:
                         if speedup >= early_stop_speedup:
                             logger.info(f"Early stop: achieved {speedup:.2f}x speedup")
                             break
-                    else:
-                        iterations_without_improvement += 1
-                else:
-                    iterations_without_improvement += 1
+            if improved_this_iter:
+                iterations_without_improvement = 0
+            else:
+                iterations_without_improvement += 1
 
             # Check for early stop
             if best_speedup >= early_stop_speedup:

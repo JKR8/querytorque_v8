@@ -184,27 +184,90 @@ class MCTSTree:
         # Cache priors per node (keyed by tuple of applied_transforms)
         self._prior_cache: dict[tuple[str, ...], dict[str, TransformPrior]] = {}
 
-    def select(self, node: Optional[MCTSNode] = None, log_selection: bool = True) -> MCTSNode:
-        """Select a node for expansion using UCT.
+    def select(
+        self,
+        node: Optional[MCTSNode] = None,
+        log_selection: bool = True,
+    ) -> tuple[MCTSNode, Optional[str]]:
+        """Select a node (and optionally an action) for expansion.
 
-        Walk tree from root picking best UCT child at each step
-        until we find a node that:
-        - Has untried transforms, OR
-        - Is terminal (no remaining transforms)
-
-        Args:
-            node: Starting node. If None, starts from root.
-            log_selection: Whether to log selection decisions.
-
-        Returns:
-            The selected node for expansion.
+        In PUCT mode, actions (tried and untried) compete using PUCT scores.
+        If the best action is untried, return the current node plus that
+        transform to expand. In UCT mode, return the first node that has
+        untried transforms.
         """
         if node is None:
             node = self.root
 
         while True:
-            # If node has untried transforms, select it for expansion
+            # If at max depth, return this node
+            if node.depth >= self.max_depth:
+                if log_selection:
+                    self.selection_steps.append(SelectionStep(
+                        node_path=node.applied_transforms,
+                        candidates=[],
+                        selected="",
+                        reason="max_depth_reached",
+                    ))
+                return node, None
+
             untried = node.get_untried_transforms()
+
+            # PUCT mode: choose best action (tried or untried)
+            if untried and self.prior_config.use_puct:
+                priors = self._get_priors(node)
+                best_score = float("-inf")
+                best_action: Optional[str] = None
+                candidates = []
+
+                for tid in node.remaining_transforms:
+                    prior = priors.get(tid)
+                    p = prior.prior if prior else 1.0 / max(len(node.remaining_transforms), 1)
+                    if tid in node.children:
+                        child = node.children[tid]
+                        score = child.puct_score(node.visit_count, p, self.prior_config.c_puct)
+                        visits = child.visit_count
+                        avg_reward = child.avg_reward
+                        is_valid = child.is_valid
+                        speedup = child.speedup
+                        status = "tried"
+                    else:
+                        score = self.prior_config.c_puct * p * math.sqrt(node.visit_count + 1)
+                        visits = 0
+                        avg_reward = 0.0
+                        is_valid = False
+                        speedup = 1.0
+                        status = "untried"
+
+                    candidates.append({
+                        "transform_id": tid,
+                        "uct_score": round(score, 4) if score != float("inf") else "inf",
+                        "visits": visits,
+                        "avg_reward": round(avg_reward, 4),
+                        "is_valid": is_valid,
+                        "speedup": round(speedup, 4),
+                        "status": status,
+                    })
+
+                    if score > best_score:
+                        best_score = score
+                        best_action = tid
+
+                if log_selection:
+                    self.selection_steps.append(SelectionStep(
+                        node_path=node.applied_transforms,
+                        candidates=candidates,
+                        selected=best_action or "",
+                        reason="puct_action",
+                    ))
+
+                if best_action and best_action not in node.children:
+                    return node, best_action
+                if best_action and best_action in node.children:
+                    node = node.children[best_action]
+                    continue
+
+            # UCT mode (or no untried): return first node with untried transforms
             if untried:
                 if log_selection:
                     self.selection_steps.append(SelectionStep(
@@ -213,7 +276,7 @@ class MCTSTree:
                         selected=untried[0] if untried else "",
                         reason="untried_available",
                     ))
-                return node
+                return node, None
 
             # If no children (terminal or all failed), return this node
             if not node.children:
@@ -224,26 +287,24 @@ class MCTSTree:
                         selected="",
                         reason="terminal_no_children",
                     ))
-                return node
+                return node, None
 
-            # If at max depth, return this node
-            if node.depth >= self.max_depth:
-                if log_selection:
-                    self.selection_steps.append(SelectionStep(
-                        node_path=node.applied_transforms,
-                        candidates=[],
-                        selected="",
-                        reason="max_depth_reached",
-                    ))
-                return node
-
-            # Select best child by UCT score
+            # Select best child by UCT/PUCT score
             best_child = None
             best_score = float("-inf")
             candidates = []
+            priors = None
+            if self.prior_config.use_puct:
+                priors = self._get_priors(node)
 
             for child in node.children.values():
-                score = child.uct_score(node.visit_count, self.c)
+                if self.prior_config.use_puct:
+                    transform_id = child.applied_transforms[-1] if child.applied_transforms else "?"
+                    prior = priors.get(transform_id) if priors else None
+                    p = prior.prior if prior else 1.0 / max(len(node.children), 1)
+                    score = child.puct_score(node.visit_count, p, self.prior_config.c_puct)
+                else:
+                    score = child.uct_score(node.visit_count, self.c)
                 transform_id = child.applied_transforms[-1] if child.applied_transforms else "?"
                 candidates.append({
                     "transform_id": transform_id,
@@ -265,7 +326,7 @@ class MCTSTree:
                         selected="",
                         reason="no_viable_children",
                     ))
-                return node
+                return node, None
 
             if log_selection:
                 selected_transform = best_child.applied_transforms[-1] if best_child.applied_transforms else "?"
@@ -273,12 +334,12 @@ class MCTSTree:
                     node_path=node.applied_transforms,
                     candidates=candidates,
                     selected=selected_transform,
-                    reason="uct_best",
+                    reason="puct_best" if self.prior_config.use_puct else "uct_best",
                 ))
 
             node = best_child
 
-    def expand(self, node: MCTSNode) -> Optional[MCTSNode]:
+    def expand(self, node: MCTSNode, transform_id: Optional[str] = None) -> Optional[MCTSNode]:
         """Expand a node by applying an untried transformation.
 
         Uses progressive widening to limit candidates based on visit count,
@@ -286,6 +347,7 @@ class MCTSTree:
 
         Args:
             node: Node to expand.
+            transform_id: Optional forced transform ID to expand.
 
         Returns:
             New child node if expansion successful, None if failed.
@@ -300,7 +362,10 @@ class MCTSTree:
             return None
 
         # Pick transform using PUCT selection
-        transform_id = self._select_transform(candidates, node)
+        if transform_id is None:
+            transform_id = self._select_transform(candidates, node)
+        elif transform_id not in candidates:
+            return None
 
         # Create attempt record
         attempt = TransformAttempt(
@@ -363,6 +428,7 @@ class MCTSTree:
         self,
         node: MCTSNode,
         num_transforms: int = 4,
+        preferred_transform: Optional[str] = None,
     ) -> list[MCTSNode]:
         """Expand a node by applying multiple transformations in parallel.
 
@@ -372,6 +438,7 @@ class MCTSTree:
         Args:
             node: Node to expand.
             num_transforms: Max number of transforms to try in parallel.
+            preferred_transform: Optional transform to ensure is included.
 
         Returns:
             List of successfully created child nodes (not yet validated).
@@ -393,6 +460,9 @@ class MCTSTree:
             reverse=True,
         )
         transforms_to_try = sorted_candidates[:num_transforms]
+        if preferred_transform and preferred_transform in candidates:
+            if preferred_transform not in transforms_to_try:
+                transforms_to_try = [preferred_transform] + transforms_to_try[:-1]
 
         # Apply transformations in parallel
         results: list[tuple[str, Optional[str], Optional[str], int]] = []
@@ -490,10 +560,14 @@ class MCTSTree:
         self.total_iterations += 1
 
         # 1. Selection
-        selected = self.select()
+        selected, preferred_transform = self.select()
 
         # 2. Parallel Expansion (LLM calls)
-        children = self.expand_parallel(selected, num_transforms=num_parallel)
+        children = self.expand_parallel(
+            selected,
+            num_transforms=num_parallel,
+            preferred_transform=preferred_transform,
+        )
 
         if not children:
             # All expansions failed
@@ -605,10 +679,10 @@ class MCTSTree:
         self.total_iterations += 1
 
         # 1. Selection
-        selected = self.select()
+        selected, preferred_transform = self.select()
 
         # 2. Expansion
-        expanded = self.expand(selected)
+        expanded = self.expand(selected, transform_id=preferred_transform)
 
         if expanded is None:
             # Expansion failed, backpropagate zero reward from selected node
@@ -684,12 +758,6 @@ class MCTSTree:
             Dict mapping transform_id to TransformPrior.
         """
         # Use applied_transforms as cache key
-        cache_key = tuple(node.applied_transforms)
-
-        if cache_key in self._prior_cache:
-            return self._prior_cache[cache_key]
-
-        # Check if we should use LLM ranking
         use_llm = False
         if self.prior_config.use_llm_ranking:
             from .llm_ranker import should_use_llm_ranking
@@ -708,8 +776,12 @@ class MCTSTree:
                 children_stats,
             )
 
-            if use_llm:
-                self.llm_ranking_calls += 1
+        cache_key = (tuple(node.applied_transforms), "llm" if use_llm else "contextual")
+        if cache_key in self._prior_cache:
+            return self._prior_cache[cache_key]
+
+        if use_llm:
+            self.llm_ranking_calls += 1
 
         # Compute priors
         priors = get_priors_for_node(
