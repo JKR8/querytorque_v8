@@ -15,13 +15,19 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 
+# Check virtual environment
+if not (hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)):
+    print("❌ ERROR: Not running in virtual environment!")
+    print("Please run: source .venv/bin/activate")
+    sys.exit(1)
+
 sys.path.insert(0, "packages/qt-sql")
 
 from qt_sql.analyzers.ast_detector import detect_antipatterns
 
 BASE = Path(__file__).parent.parent
 BENCHMARK_DIR = BASE / "research" / "experiments" / "benchmarks" / "kimi_benchmark_20260202_221828"
-OUTPUT_CSV = BASE / "research" / "ml_training_data.csv"
+OUTPUT_CSV = BASE / "research" / "ml_pipeline" / "data" / "ml_training_data.csv"
 
 # Known winning transforms from analysis
 WINNING_TRANSFORMS = {

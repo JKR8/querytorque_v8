@@ -7,13 +7,14 @@ import sys
 from pathlib import Path
 
 # Add packages to path
-sys.path.insert(0, str(Path(__file__).parent / "packages" / "qt-shared"))
-sys.path.insert(0, str(Path(__file__).parent / "packages" / "qt-sql"))
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "packages" / "qt-shared"))
+sys.path.insert(0, str(ROOT / "packages" / "qt-sql"))
 
 from qt_sql.optimization.adaptive_rewriter_v5 import optimize_v5_dspy
 
 # Load Q1
-q1_path = Path(__file__).parent / "research" / "archive" / "queries" / "q1.sql"
+q1_path = ROOT / "research" / "archive" / "queries" / "q1.sql"
 with open(q1_path) as f:
     sql = f.read()
 

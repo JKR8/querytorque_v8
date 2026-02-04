@@ -5,12 +5,19 @@ Converts normalized SQL to fixed-size feature vectors using AST-based features.
 """
 
 import json
+import sys
 import numpy as np
 from pathlib import Path
 from typing import Dict, List
 import sqlglot
 from sqlglot import exp
 from collections import Counter
+
+# Check virtual environment
+if not (hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)):
+    print("❌ ERROR: Not running in virtual environment!")
+    print("Please run: source .venv/bin/activate")
+    sys.exit(1)
 
 BASE = Path(__file__).parent.parent
 
@@ -379,9 +386,9 @@ class ASTVectorizer:
 def vectorize_benchmark_queries():
     """Vectorize all normalized TPC-DS queries."""
 
-    NORMALIZED_QUERIES = BASE / "research" / "normalized_queries.json"
-    OUTPUT_VECTORS = BASE / "research" / "query_vectors.npz"
-    OUTPUT_METADATA = BASE / "research" / "query_vectors_metadata.json"
+    NORMALIZED_QUERIES = BASE / "research" / "ml_pipeline" / "data" / "normalized_queries.json"
+    OUTPUT_VECTORS = BASE / "research" / "ml_pipeline" / "vectors" / "query_vectors.npz"
+    OUTPUT_METADATA = BASE / "research" / "ml_pipeline" / "vectors" / "query_vectors_metadata.json"
 
     if not NORMALIZED_QUERIES.exists():
         print("Error: normalized_queries.json not found")

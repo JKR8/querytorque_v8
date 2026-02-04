@@ -2,9 +2,10 @@
 """Test complete gold detector coverage on all 7 winning transforms."""
 
 import sys
-sys.path.insert(0, "packages/qt-sql")
-
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "packages" / "qt-sql"))
 from qt_sql.analyzers.ast_detector import detect_antipatterns
 
 # All winning transforms from WINNING_TRANSFORMS
@@ -23,7 +24,7 @@ print("GOLD DETECTOR COVERAGE TEST - All 7 Winning Transforms")
 print("=" * 80)
 
 results_summary = []
-benchmark_dir = Path("research/experiments/benchmarks/kimi_benchmark_20260202_221828")
+benchmark_dir = ROOT / "research" / "experiments" / "benchmarks" / "kimi_benchmark_20260202_221828"
 
 for qnum, info in sorted(TRANSFORMS.items(), key=lambda x: x[1]["speedup"], reverse=True):
     query_dir = benchmark_dir / f"q{qnum}"

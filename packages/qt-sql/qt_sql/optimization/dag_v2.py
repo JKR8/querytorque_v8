@@ -96,13 +96,18 @@ class DagBuilder:
     """Build a DAG from SQL query."""
 
     ALLOWED_TRANSFORMS = [
-        "pushdown",           # Push filters into CTEs
-        "decorrelate",        # Correlated subquery -> window/join
-        "or_to_union",        # OR conditions -> UNION ALL
-        "in_to_exists",       # IN subquery -> EXISTS
-        "projection_prune",   # Remove unused columns
-        "early_filter",       # Add filter CTE for selective predicates
-        "semantic_rewrite",   # Semantics-aware rewrite with domain assumptions
+        "pushdown",             # Push filters into CTEs/subqueries
+        "decorrelate",          # Correlated subquery -> CTE with GROUP BY
+        "or_to_union",          # OR conditions -> UNION ALL branches
+        "early_filter",         # Filter dimension tables before joining to facts
+        "date_cte_isolate",     # Extract date dimension filtering into early CTE
+        "materialize_cte",      # Extract repeated subqueries into CTE
+        "flatten_subquery",     # Convert EXISTS/IN to JOINs
+        "reorder_join",         # Reorder joins for selectivity
+        "multi_push_predicate", # Push predicates through multiple CTE layers
+        "inline_cte",           # Inline single-use CTEs
+        "remove_redundant",     # Remove unnecessary DISTINCT/ORDER BY
+        "semantic_rewrite",     # Catch-all for other valid optimizations
     ]
 
     def __init__(self, sql: str, dialect: str = "duckdb"):
@@ -166,18 +171,31 @@ class DagBuilder:
 
     def _add_main_query(self, parsed: exp.Expression):
         """Add main SELECT as a DAG node."""
-        # Find the outermost SELECT not inside a CTE
-        main_select = None
-        for select in parsed.find_all(exp.Select):
-            if not select.find_ancestor(exp.CTE):
-                main_select = select
-                break
+        # If parsed is a WITH expression, get the final expression
+        if isinstance(parsed, exp.With):
+            main_select = parsed.this
+        else:
+            # Find the outermost SELECT not inside a CTE
+            main_select = None
+            for select in parsed.find_all(exp.Select):
+                if not select.find_ancestor(exp.CTE):
+                    main_select = select
+                    break
 
         if not main_select:
             return
 
-        tables = [str(t.name) for t in main_select.find_all(exp.Table)]
-        refs = self._find_cte_refs(main_select)
+        try:
+            main_expr_no_with = main_select.copy()
+            if main_expr_no_with.args.get("with_"):
+                main_expr_no_with.set("with_", None)
+            if main_expr_no_with.args.get("with"):
+                main_expr_no_with.set("with", None)
+        except Exception:
+            main_expr_no_with = main_select
+
+        tables = [str(t.name) for t in main_expr_no_with.find_all(exp.Table)]
+        refs = self._find_cte_refs(main_expr_no_with)
 
         flags = []
         if main_select.find(exp.Group):
@@ -198,10 +216,22 @@ class DagBuilder:
                     flags.append("IN_SUBQUERY")
                     break
 
+        # Get SQL for main query (strip WITH since CTEs are shown separately)
+        try:
+            main_expr = main_select.copy()
+            if main_expr.args.get("with_"):
+                main_expr.set("with_", None)
+            if main_expr.args.get("with"):
+                main_expr.set("with", None)
+            main_sql = main_expr.sql(dialect=self.dialect)
+        except Exception:
+            # Fallback if AST manipulation fails
+            main_sql = main_select.sql(dialect=self.dialect)
+
         self.nodes["main_query"] = DagNode(
             node_id="main_query",
             node_type="main",
-            sql=main_select.sql(dialect=self.dialect),
+            sql=main_sql,
             tables=tables,
             refs=refs,
             flags=flags
@@ -272,7 +302,11 @@ class DagBuilder:
                 where = select.find(exp.Where)
                 if where:
                     for cond in where.find_all(exp.EQ, exp.GT, exp.LT, exp.GTE, exp.LTE):
-                        predicates.append(cond.sql()[:50])
+                        pred_sql = cond.sql()
+                        # Limit to 150 chars with ellipsis
+                        if len(pred_sql) > 150:
+                            pred_sql = pred_sql[:147] + "..."
+                        predicates.append(pred_sql)
 
                 node.contract = NodeContract(
                     node_id=node_id,
@@ -283,10 +317,30 @@ class DagBuilder:
             except Exception:
                 pass
 
+    def _get_output_column_names(self, sql: str) -> Set[str]:
+        """Extract output column names for downstream usage checks."""
+        try:
+            parsed = sqlglot.parse_one(sql, dialect=self.dialect)
+            select = parsed.find(exp.Select) or parsed
+            names = set()
+            for expr in select.expressions:
+                if isinstance(expr, exp.Alias) and expr.alias:
+                    names.add(str(expr.alias))
+                elif isinstance(expr, exp.Column):
+                    names.add(str(expr.name))
+            return {n.lower() for n in names if n}
+        except Exception:
+            return set()
+
     def _compute_usage(self):
         """Compute how each node is used downstream."""
         for node_id, node in self.nodes.items():
             consumers = [n for n, m in self.nodes.items() if node_id in m.refs]
+
+            # Get node's output columns for filtering
+            node_output_cols = self._get_output_column_names(node.sql)
+            if not node_output_cols and node.contract and node.contract.output_columns:
+                node_output_cols = {col.lower() for col in node.contract.output_columns}
 
             # Find which columns are referenced by consumers
             downstream_refs = set()
@@ -295,11 +349,14 @@ class DagBuilder:
                 try:
                     parsed = sqlglot.parse_one(consumer.sql, dialect=self.dialect)
                     for col in parsed.find_all(exp.Column):
+                        col_name = str(col.name)
                         if col.table and str(col.table).lower() == node_id.lower():
-                            downstream_refs.add(str(col.name))
-                        elif not col.table:
-                            # Might be from this node
-                            downstream_refs.add(str(col.name))
+                            # Explicitly qualified with this node's name
+                            downstream_refs.add(col_name)
+                        elif not col.table and node_output_cols:
+                            # Unqualified - only add if it's in this node's output
+                            if col_name.lower() in node_output_cols:
+                                downstream_refs.add(col_name)
                 except Exception:
                     pass
 
@@ -317,59 +374,139 @@ class DagBuilder:
 class CostAnalyzer:
     """Analyze execution plan and attribute costs to DAG nodes."""
 
-    def __init__(self, dag: QueryDag, plan_json: Optional[dict] = None):
+    def __init__(self, dag: QueryDag, plan_context: Optional[Any] = None):
+        """Initialize cost analyzer.
+
+        Args:
+            dag: Query DAG
+            plan_context: OptimizationContext from plan_analyzer (optional)
+        """
         self.dag = dag
-        self.plan_json = plan_json or {}
+        self.plan_context = plan_context
 
     def analyze(self) -> Dict[str, NodeCost]:
         """Attribute plan costs to DAG nodes."""
         costs = {}
 
-        # If no plan, use heuristics based on tables
-        if not self.plan_json:
+        # If no plan context, use heuristics based on tables
+        if not self.plan_context:
             for node_id, node in self.dag.nodes.items():
                 costs[node_id] = NodeCost(
                     node_id=node_id,
                     cost_pct=100.0 / len(self.dag.nodes),
                     row_estimate=1000,
-                    operators=[]
+                    operators=self._get_heuristic_operators(node)
                 )
             return costs
 
-        # Parse plan and attribute to nodes
-        total_cost = self._get_total_cost(self.plan_json)
+        if not self.plan_context.table_scans and not self.plan_context.bottleneck_operators:
+            for node_id, node in self.dag.nodes.items():
+                costs[node_id] = NodeCost(
+                    node_id=node_id,
+                    cost_pct=100.0 / len(self.dag.nodes),
+                    row_estimate=1000,
+                    operators=self._get_heuristic_operators(node)
+                )
+            return costs
 
+        # Use real plan data from OptimizationContext
+        # Map tables to nodes
+        table_to_node = {}
         for node_id, node in self.dag.nodes.items():
-            node_cost = self._get_node_cost(node, self.plan_json)
+            for table in node.tables:
+                table_to_node[table.lower()] = node_id
+
+        # Attribute scans to nodes
+        node_rows: Dict[str, int] = {}
+        node_operators: Dict[str, List[str]] = {}
+        node_cost_pct: Dict[str, float] = {}
+
+        def _add_cost(node_id: str, cost: float) -> None:
+            if cost is None:
+                return
+            node_cost_pct[node_id] = node_cost_pct.get(node_id, 0.0) + float(cost)
+
+        for scan in self.plan_context.table_scans:
+            table = scan.table.lower()
+            node_id = table_to_node.get(table, "main_query")
+
+            # Track max rows for this node
+            if node_id not in node_rows:
+                node_rows[node_id] = scan.rows_out or scan.rows_scanned
+            else:
+                node_rows[node_id] = max(node_rows[node_id], scan.rows_out or scan.rows_scanned)
+
+            # Track operators
+            if node_id not in node_operators:
+                node_operators[node_id] = []
+            node_operators[node_id].append(f"SEQ_SCAN[{scan.table}]")
+            _add_cost(node_id, scan.cost_pct)
+
+        # Get top operators and attribute to nodes
+        top_ops = self.plan_context.get_top_operators(10)
+        has_scan_info = bool(self.plan_context.table_scans)
+        for op in top_ops:
+            op_name = op.get("operator", "")
+            if has_scan_info and "SCAN" in op_name.upper():
+                continue
+
+            # Try to attribute operator to a node
+            attributed = False
+            for node_id, node in self.dag.nodes.items():
+                if self._operator_belongs_to_node(op_name, node, node_operators.get(node_id, [])):
+                    _add_cost(node_id, op.get("cost_pct", 0.0))
+
+                    # Add operator to list
+                    if node_id not in node_operators:
+                        node_operators[node_id] = []
+                    if op_name not in node_operators[node_id]:
+                        node_operators[node_id].append(op_name)
+                    attributed = True
+                    break
+
+            # If not attributed, assign to main_query
+            if not attributed:
+                _add_cost("main_query", op.get("cost_pct", 0.0))
+
+        # Build cost objects for each node
+        for node_id, node in self.dag.nodes.items():
             costs[node_id] = NodeCost(
                 node_id=node_id,
-                cost_pct=round(node_cost / total_cost * 100, 1) if total_cost > 0 else 0,
-                row_estimate=self._get_row_estimate(node, self.plan_json),
-                operators=self._get_operators(node, self.plan_json),
+                cost_pct=round(node_cost_pct.get(node_id, 0), 1),
+                row_estimate=node_rows.get(node_id, 1000),
+                operators=node_operators.get(node_id, self._get_heuristic_operators(node))[:5],
                 has_filter=self._has_filter(node),
-                join_type=self._get_join_type(node, self.plan_json)
+                join_type=self._get_join_type(node)
             )
             node.cost = costs[node_id]
 
         return costs
 
-    def _get_total_cost(self, plan: dict) -> float:
-        """Get total plan cost."""
-        if "total_time" in plan:
-            return plan["total_time"]
-        return 1.0
+    def _operator_belongs_to_node(self, op_name: str, node: DagNode, node_scan_ops: List[str]) -> bool:
+        """Check if operator belongs to a node."""
+        op_upper = op_name.upper()
 
-    def _get_node_cost(self, node: DagNode, plan: dict) -> float:
-        """Get cost attributed to a node."""
-        # Simplified: estimate based on tables
-        return 1.0
+        # Scans belong to the node
+        for scan_op in node_scan_ops:
+            if scan_op.upper() in op_upper:
+                return True
 
-    def _get_row_estimate(self, node: DagNode, plan: dict) -> int:
-        """Get row estimate for a node."""
-        return 1000
+        # GROUP_BY belongs to nodes with GROUP BY
+        if "GROUP" in op_upper and "GROUP_BY" in node.flags:
+            return True
 
-    def _get_operators(self, node: DagNode, plan: dict) -> List[str]:
-        """Get plan operators for a node."""
+        # JOINs belong to nodes with refs
+        if "JOIN" in op_upper and node.refs:
+            return True
+
+        # CTE scan belongs to main_query
+        if "CTE" in op_upper and node.node_type == "main":
+            return True
+
+        return False
+
+    def _get_heuristic_operators(self, node: DagNode) -> List[str]:
+        """Get heuristic operators when no plan available."""
         ops = []
         if "GROUP_BY" in node.flags:
             ops.append("HASH_GROUP_BY")
@@ -383,7 +520,7 @@ class CostAnalyzer:
         """Check if node has WHERE filters."""
         return "WHERE" in node.sql.upper()
 
-    def _get_join_type(self, node: DagNode, plan: dict) -> Optional[str]:
+    def _get_join_type(self, node: DagNode) -> Optional[str]:
         """Get join type used in node."""
         if "JOIN" in node.sql.upper():
             return "hash"
@@ -437,14 +574,17 @@ class SubgraphSlicer:
 class DagV2PromptBuilder:
     """Build DAG v2 prompt with contracts, usage, and subgraph slicing."""
 
-    SYSTEM_PROMPT = """You are a SQL optimizer. Output atomic rewrite sets in JSON.
+    SYSTEM_PROMPT = """You are an autonomous Query Rewrite Engine. Your goal is to maximize execution speed while strictly preserving semantic invariants.
+
+Output atomic rewrite sets in JSON.
 
 RULES:
-- Only use transforms from the allowlist
-- Preserve node contracts (output columns, grain, predicates)
-- Coordinate multi-node changes in rewrite_sets
-- No formatting-only changes
-- No column renames unless required
+- Primary Goal: Maximize execution speed while strictly preserving semantic invariants.
+- Allowed Transforms: Use the provided list. If a standard SQL optimization applies that is not listed, label it "semantic_rewrite".
+- Atomic Sets: Group dependent changes (e.g., creating a CTE and joining it) into a single rewrite_set.
+- Contracts: Output columns, grain, and total result rows must remain invariant.
+- Naming: Use descriptive CTE names (e.g., `filtered_returns` vs `cte1`).
+- Column Aliasing: Permitted only for aggregations or disambiguation.
 
 ALLOWED TRANSFORMS: {transforms}
 
@@ -467,10 +607,16 @@ OUTPUT FORMAT:
 }}
 ```"""
 
-    def __init__(self, dag: QueryDag, plan_json: Optional[dict] = None):
+    def __init__(self, dag: QueryDag, plan_context: Optional[Any] = None):
+        """Initialize prompt builder.
+
+        Args:
+            dag: Query DAG
+            plan_context: OptimizationContext from plan_analyzer (optional)
+        """
         self.dag = dag
-        self.plan_json = plan_json
-        self.cost_analyzer = CostAnalyzer(dag, plan_json)
+        self.plan_context = plan_context
+        self.cost_analyzer = CostAnalyzer(dag, plan_context)
         self.slicer = SubgraphSlicer(dag)
 
     def build_prompt(self, target_nodes: Optional[List[str]] = None) -> str:
@@ -796,11 +942,19 @@ class RewriteAssembler:
 class DagV2Pipeline:
     """DAG v2 optimization pipeline."""
 
-    def __init__(self, sql: str, plan_json: Optional[dict] = None):
+    def __init__(self, sql: str, plan_json: Optional[dict] = None, plan_context: Optional[Any] = None):
+        """Initialize DAG v2 pipeline.
+
+        Args:
+            sql: SQL query to optimize
+            plan_json: DEPRECATED - use plan_context instead
+            plan_context: OptimizationContext from plan_analyzer
+        """
         self.sql = sql
-        self.plan_json = plan_json
+        self.plan_json = plan_json  # Keep for backwards compat
+        self.plan_context = plan_context
         self.dag = DagBuilder(sql).build()
-        self.prompt_builder = DagV2PromptBuilder(self.dag, plan_json)
+        self.prompt_builder = DagV2PromptBuilder(self.dag, plan_context)
         self.assembler = RewriteAssembler(self.dag)
 
     def get_prompt(self, target_nodes: Optional[List[str]] = None) -> str:

@@ -11,10 +11,17 @@ This creates universal query patterns for similarity matching.
 
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Dict, Tuple
 import sqlglot
 from sqlglot import exp
+
+# Check virtual environment
+if not (hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix)):
+    print("❌ ERROR: Not running in virtual environment!")
+    print("Please run: source .venv/bin/activate")
+    sys.exit(1)
 
 # Known fact tables (high cardinality, transactional)
 FACT_TABLES = {
@@ -230,7 +237,7 @@ def normalize_benchmark_queries():
 
     BASE = Path(__file__).parent.parent
     BENCHMARK_DIR = BASE / "research" / "experiments" / "benchmarks" / "kimi_benchmark_20260202_221828"
-    OUTPUT_FILE = BASE / "research" / "normalized_queries.json"
+    OUTPUT_FILE = BASE / "research" / "ml_pipeline" / "data" / "normalized_queries.json"
 
     normalizer = SQLNormalizer()
     results = {}

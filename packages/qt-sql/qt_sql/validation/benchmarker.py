@@ -243,3 +243,110 @@ class QueryBenchmarker:
             result.optimized.checksum = checker.compute_checksum(result.optimized.rows)
 
         return result
+
+    def benchmark_single_trimmed_mean(
+        self,
+        sql: str,
+        runs: int = 5,
+        capture_results: bool = False
+    ) -> QueryExecutionResult:
+        """Benchmark with N runs, discard min/max, average middle runs.
+
+        This is more robust than the standard 1-1-2 pattern as it:
+        - Runs more iterations for statistical stability
+        - Discards outliers (min and max)
+        - Averages the middle values
+
+        Args:
+            sql: SQL query to benchmark.
+            runs: Number of runs (default 5, minimum 3).
+            capture_results: If True, capture full result rows from first run.
+
+        Returns:
+            QueryExecutionResult with trimmed mean timing.
+        """
+        if runs < 3:
+            raise ValueError("Need at least 3 runs for trimmed mean")
+
+        try:
+            times = []
+            rows = None
+
+            # Run N times
+            for i in range(runs):
+                start = time.perf_counter()
+                result_rows = self.executor.execute(sql)
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                times.append(elapsed_ms)
+
+                # Capture results on first run
+                if i == 0 and capture_results:
+                    rows = result_rows
+
+            # Sort and trim
+            times.sort()
+            trimmed = times[1:-1]  # Discard min and max
+            avg_ms = sum(trimmed) / len(trimmed)
+
+            # Get cost estimate
+            cost = self._get_cost(sql)
+
+            return QueryExecutionResult(
+                timing=TimingResult(
+                    warmup_time_ms=times[0],  # First run used as warmup indicator
+                    measured_time_ms=avg_ms
+                ),
+                cost=cost,
+                row_count=len(rows) if rows else 0,
+                rows=rows if capture_results else None
+            )
+
+        except Exception as e:
+            return QueryExecutionResult(
+                timing=TimingResult(warmup_time_ms=0, measured_time_ms=0),
+                cost=CostResult(estimated_cost=float("inf")),
+                row_count=0,
+                error=str(e),
+            )
+
+    def benchmark_pair_trimmed_mean(
+        self,
+        original_sql: str,
+        optimized_sql: str,
+        runs: int = 5,
+        capture_results: bool = True,
+    ) -> BenchmarkResult:
+        """Benchmark pair with N-run trimmed mean for each query.
+
+        More robust timing than standard 1-1-2 pattern.
+
+        Args:
+            original_sql: Original SQL query.
+            optimized_sql: Optimized SQL query.
+            runs: Number of runs per query (default 5).
+            capture_results: If True, capture full result rows for comparison.
+
+        Returns:
+            BenchmarkResult with trimmed mean timing for both queries.
+        """
+        original_result = self.benchmark_single_trimmed_mean(
+            original_sql, runs=runs, capture_results=capture_results
+        )
+        optimized_result = self.benchmark_single_trimmed_mean(
+            optimized_sql, runs=runs, capture_results=capture_results
+        )
+
+        # Calculate speedup
+        if optimized_result.timing.measured_time_ms > 0:
+            speedup = (
+                original_result.timing.measured_time_ms /
+                optimized_result.timing.measured_time_ms
+            )
+        else:
+            speedup = 1.0
+
+        return BenchmarkResult(
+            original=original_result,
+            optimized=optimized_result,
+            speedup=speedup,
+        )

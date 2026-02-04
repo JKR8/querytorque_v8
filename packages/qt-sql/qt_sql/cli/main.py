@@ -26,7 +26,11 @@ from rich.markdown import Markdown
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from qt_sql.analyzers.sql_antipattern_detector import SQLAntiPatternDetector, SQLAnalysisResult
-from qt_sql.analyzers.opportunity_detector import detect_opportunities, OpportunityResult
+try:
+    from qt_sql.analyzers.opportunity_detector import detect_opportunities, OpportunityResult
+except ImportError:
+    detect_opportunities = lambda sql: []  # Stub
+    OpportunityResult = None
 from qt_sql.validation.schemas import ValidationStatus
 
 console = Console()
@@ -313,10 +317,20 @@ def audit(
 @click.option("--model", default=None, help="LLM model name")
 @click.option("--output", "-o", type=click.Path(), help="Output file for optimized SQL")
 @click.option("--dry-run", is_flag=True, help="Show what would be optimized without calling LLM")
-@click.option("--database", "-d", type=click.Path(), help="DuckDB database path for schema/execution plan context")
+@click.option("--sample-db", type=click.Path(), help="Sample database for validation")
+@click.option("--full-db", type=click.Path(), help="Full database for benchmarking")
+@click.option("--database", "-d", type=click.Path(), help="Database path (used as sample-db if not specified)")
 @click.option("--show-prompt", is_flag=True, help="Display the full prompt sent to LLM")
-# DAG option
-@click.option("--dag", is_flag=True, help="Use DAG v2 + JSON v5 node-level rewrites (recommended)")
+# V5 Mode selection
+@click.option("--mode", type=click.Choice(['retry', 'corrective', 'parallel', 'tournament', 'evolutionary', 'stacking'], case_sensitive=False), help="V5 optimization mode")
+@click.option("--retries", type=int, default=3, help="Max retries for retry mode (default: 3)")
+@click.option("--workers", type=int, default=5, help="Number of workers for parallel mode (default: 5)")
+@click.option("--iterations", type=int, default=5, help="Max iterations for evolutionary mode (default: 5)")
+@click.option("--target-speedup", type=float, default=2.0, help="Target speedup threshold (default: 2.0)")
+@click.option("--query-id", help="Query ID for ML recommendations (e.g., q1, q15)")
+@click.option("--save-results", type=click.Path(), help="Save detailed results to directory")
+# Legacy option
+@click.option("--dag", is_flag=True, help="[Legacy] Use DAG v2 + JSON v5 (use --mode instead)")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 def optimize(
     file: str,
@@ -325,33 +339,57 @@ def optimize(
     model: Optional[str],
     output: Optional[str],
     dry_run: bool,
+    sample_db: Optional[str],
+    full_db: Optional[str],
     database: Optional[str],
     show_prompt: bool,
+    mode: Optional[str],
+    retries: int,
+    workers: int,
+    iterations: int,
+    target_speedup: float,
+    query_id: Optional[str],
+    save_results: Optional[str],
     dag: bool,
     verbose: bool
 ):
-    """Optimize SQL using LLM-powered analysis.
+    """Optimize SQL using LLM-powered V5 optimizer.
 
-    Analyzes the SQL file and uses an LLM to suggest optimizations
-    based on detected anti-patterns and best practices.
-
-    OPTIMIZATION MODES:
+    Three optimization modes available:
 
     \b
-    --dag              DAG v2 + JSON v5 node-level rewrites with validation.
-                       Recommended for complex queries with CTEs/subqueries.
-                       Requires --database for validation.
+    MODE 1: RETRY (default) - Single worker with error feedback
+        qt-sql optimize query.sql --mode retry --sample-db sample.db --full-db full.db
+        - Retries up to 3 times on failure
+        - Learns from errors
+        - Low cost, high reliability
 
-    When --database is provided, includes:
-    - Schema with row counts for referenced tables
-    - Execution plan with row estimates (enables semantic optimizations)
+    \b
+    MODE 2: PARALLEL - Multiple workers compete
+        qt-sql optimize query.sql --mode parallel --workers 5 --sample-db sample.db --full-db full.db
+        - 5 workers with different strategies
+        - Best speedup wins
+        - High exploration, medium cost
 
+    \b
+    MODE 3: EVOLUTIONARY - Iterative improvement
+        qt-sql optimize query.sql --mode evolutionary --iterations 5 --full-db full.db
+        - Builds on previous best
+        - Examples rotate each iteration
+        - Maximum speedup potential
+
+    \b
+    Aliases:
+        retry = corrective
+        parallel = tournament
+        evolutionary = stacking
+
+    \b
     Examples:
-        qt-sql optimize query.sql
-        qt-sql optimize query.sql --provider deepseek
-        qt-sql optimize query.sql -d /path/to/db.duckdb --dag
-        qt-sql optimize query.sql -d /path/to/db.duckdb --dag
-        qt-sql optimize query.sql -o optimized.sql
+        qt-sql optimize q1.sql --mode retry --sample-db sample.db --full-db full.db
+        qt-sql optimize q1.sql --mode parallel --workers 3
+        qt-sql optimize q1.sql --mode evolutionary --iterations 5
+        qt-sql optimize q1.sql --mode stacking --save-results results/q1/
     """
     # Setup logging
     if verbose:
@@ -365,27 +403,117 @@ def optimize(
         console.print(f"[red]Error: {e.message}[/red]")
         sys.exit(1)
 
-    # First, run analysis
-    detector = SQLAntiPatternDetector(dialect=dialect)
-    result = detector.analyze(sql, include_structure=True)
+    # Normalize mode aliases
+    mode_map = {
+        'corrective': 'retry',
+        'tournament': 'parallel',
+        'stacking': 'evolutionary',
+    }
+    if mode:
+        mode = mode_map.get(mode.lower(), mode.lower())
 
-    console.print(f"\n[bold]Analyzing:[/bold] {file}")
-    console.print(f"[dim]Dialect: {dialect}[/dim]\n")
+    # Handle database parameters
+    if not sample_db and database:
+        sample_db = database
+    if not full_db and database:
+        full_db = database
 
-    display_analysis_result(result, verbose=False)
+    # Default to retry mode if not specified
+    if not mode and not dag:
+        mode = 'retry'
 
-    # Validate mode requirements
-    if dag and not database:
-        console.print("[red]Error: --database is required for --dag mode[/red]")
-        sys.exit(1)
-
-    if database:
-        console.print(f"\n[bold]Database:[/bold] {database}")
+    # Show header
+    console.print(f"\n[bold]Optimizing:[/bold] {file}")
+    if mode:
+        mode_display = {
+            'retry': 'Mode 1: Retry (Corrective Learning)',
+            'parallel': 'Mode 2: Parallel (Tournament Competition)',
+            'evolutionary': 'Mode 3: Evolutionary (Stacking)',
+        }
+        console.print(f"[bold]Mode:[/bold] {mode_display.get(mode, mode)}")
+    console.print(f"[dim]Dialect: {dialect}[/dim]")
+    if provider:
+        console.print(f"[dim]Provider: {provider}[/dim]")
+    if model:
+        console.print(f"[dim]Model: {model}[/dim]")
+    console.print()
 
     # ============================================================
-    # MODE 1: DAG-based optimization (recommended)
+    # V5 OPTIMIZATION MODES
+    # ============================================================
+    if mode in ['retry', 'parallel', 'evolutionary']:
+        # Validate mode requirements
+        if mode == 'retry':
+            if not sample_db or not full_db:
+                console.print("[red]Error: --sample-db and --full-db required for retry mode[/red]")
+                console.print("[dim]Example: qt-sql optimize query.sql --mode retry --sample-db sample.db --full-db full.db[/dim]")
+                sys.exit(1)
+
+        if mode == 'parallel':
+            if not sample_db or not full_db:
+                console.print("[red]Error: --sample-db and --full-db required for parallel mode[/red]")
+                console.print("[dim]Example: qt-sql optimize query.sql --mode parallel --sample-db sample.db --full-db full.db[/dim]")
+                sys.exit(1)
+
+        if mode == 'evolutionary':
+            if not full_db:
+                console.print("[red]Error: --full-db required for evolutionary mode[/red]")
+                console.print("[dim]Example: qt-sql optimize query.sql --mode evolutionary --full-db full.db[/dim]")
+                sys.exit(1)
+
+        # Run the appropriate mode
+        if mode == 'retry':
+            optimized_sql = _run_v5_retry(
+                sql=sql,
+                sample_db=sample_db,
+                full_db=full_db,
+                query_id=query_id,
+                max_retries=retries,
+                target_speedup=target_speedup,
+                provider=provider,
+                model=model,
+                show_prompt=show_prompt,
+                save_results=save_results,
+            )
+        elif mode == 'parallel':
+            optimized_sql = _run_v5_parallel(
+                sql=sql,
+                sample_db=sample_db,
+                full_db=full_db,
+                query_id=query_id,
+                max_workers=workers,
+                target_speedup=target_speedup,
+                provider=provider,
+                model=model,
+                show_prompt=show_prompt,
+                save_results=save_results,
+            )
+        elif mode == 'evolutionary':
+            optimized_sql = _run_v5_evolutionary(
+                sql=sql,
+                full_db=full_db,
+                query_id=query_id,
+                max_iterations=iterations,
+                target_speedup=target_speedup,
+                provider=provider,
+                model=model,
+                show_prompt=show_prompt,
+                save_results=save_results,
+            )
+
+        if optimized_sql:
+            _output_result(optimized_sql, output, verbose)
+        return
+
+    # ============================================================
+    # Legacy DAG mode (deprecated, use --mode instead)
     # ============================================================
     if dag:
+        if not database:
+            console.print("[red]Error: --database is required for --dag mode[/red]")
+            sys.exit(1)
+
+        console.print(f"\n[bold]Database:[/bold] {database}")
         optimized_sql = _run_dag_optimization(
             sql=sql,
             database=database,
@@ -531,6 +659,210 @@ Return ONLY the optimized SQL in a code block. No explanation needed.
     except Exception as e:
         console.print(f"[red]LLM optimization failed: {e}[/red]")
         sys.exit(1)
+
+
+def _run_v5_retry(
+    sql: str,
+    sample_db: str,
+    full_db: str,
+    query_id: Optional[str],
+    max_retries: int,
+    target_speedup: float,
+    provider: Optional[str],
+    model: Optional[str],
+    show_prompt: bool,
+    save_results: Optional[str],
+) -> Optional[str]:
+    """Run Mode 1: Retry optimization."""
+    from qt_sql.optimization.adaptive_rewriter_v5 import optimize_v5_retry
+
+    console.print(f"[dim]Sample DB: {sample_db}[/dim]")
+    console.print(f"[dim]Full DB: {full_db}[/dim]")
+    console.print(f"[dim]Max retries: {max_retries}[/dim]")
+    console.print(f"[dim]Target speedup: {target_speedup}x[/dim]")
+    console.print()
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Running retry optimization...", total=None)
+
+        try:
+            candidate, full_result, attempts = optimize_v5_retry(
+                sql=sql,
+                sample_db=sample_db,
+                full_db=full_db,
+                query_id=query_id,
+                max_retries=max_retries,
+                target_speedup=target_speedup,
+                provider=provider,
+                model=model,
+            )
+
+            progress.update(task, completed=True)
+
+        except Exception as e:
+            progress.stop()
+            console.print(f"[red]Optimization failed: {e}[/red]")
+            return None
+
+    # Display results
+    console.print(f"\n[bold]Attempts:[/bold] {len(attempts)}")
+    for attempt in attempts:
+        status_icon = "✓" if attempt['status'] == 'pass' else "✗"
+        status_color = "green" if attempt['status'] == 'pass' else "red"
+        console.print(f"  [{status_color}]{status_icon}[/{status_color}] Attempt {attempt['attempt']}: {attempt['status']}")
+        if attempt.get('error'):
+            console.print(f"    [dim]{attempt['error'][:80]}...[/dim]")
+        if attempt.get('speedup'):
+            console.print(f"    [dim]Speedup: {attempt['speedup']:.2f}x[/dim]")
+
+    if candidate and full_result:
+        console.print(f"\n[bold green]✅ Success after {len(attempts)} attempts![/bold green]")
+        console.print(f"[bold]Sample speedup:[/bold] {candidate.speedup:.2f}x")
+        console.print(f"[bold]Full DB speedup:[/bold] {full_result.full_speedup:.2f}x")
+        return candidate.optimized_sql
+    else:
+        console.print(f"\n[bold red]❌ All {max_retries} attempts exhausted[/bold red]")
+        return None
+
+
+def _run_v5_parallel(
+    sql: str,
+    sample_db: str,
+    full_db: str,
+    query_id: Optional[str],
+    max_workers: int,
+    target_speedup: float,
+    provider: Optional[str],
+    model: Optional[str],
+    show_prompt: bool,
+    save_results: Optional[str],
+) -> Optional[str]:
+    """Run Mode 2: Parallel optimization."""
+    from qt_sql.optimization.adaptive_rewriter_v5 import optimize_v5_json_queue
+
+    console.print(f"[dim]Sample DB: {sample_db}[/dim]")
+    console.print(f"[dim]Full DB: {full_db}[/dim]")
+    console.print(f"[dim]Workers: {max_workers}[/dim]")
+    console.print(f"[dim]Target speedup: {target_speedup}x[/dim]")
+    console.print()
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Running parallel optimization...", total=None)
+
+        try:
+            valid, full_results, winner = optimize_v5_json_queue(
+                sql=sql,
+                sample_db=sample_db,
+                full_db=full_db,
+                query_id=query_id,
+                max_workers=max_workers,
+                target_speedup=target_speedup,
+                provider=provider,
+                model=model,
+            )
+
+            progress.update(task, completed=True)
+
+        except Exception as e:
+            progress.stop()
+            console.print(f"[red]Optimization failed: {e}[/red]")
+            return None
+
+    # Display results
+    console.print(f"\n[bold]Valid candidates:[/bold] {len(valid)}/{max_workers}")
+    for cand in valid:
+        console.print(f"  [green]✓[/green] Worker {cand.worker_id}: {cand.speedup:.2f}x (sample)")
+
+    if winner:
+        console.print(f"\n[bold green]🏆 Winner: Worker {winner.sample.worker_id}[/bold green]")
+        console.print(f"[bold]Sample speedup:[/bold] {winner.sample.speedup:.2f}x")
+        console.print(f"[bold]Full DB speedup:[/bold] {winner.full_speedup:.2f}x")
+        if winner.full_speedup >= target_speedup:
+            console.print(f"[green]✅ Target speedup {target_speedup}x MET![/green]")
+        else:
+            console.print(f"[yellow]⚠️  Below target {target_speedup}x[/yellow]")
+        return winner.sample.optimized_sql
+    else:
+        console.print(f"\n[bold red]❌ No candidate met target speedup {target_speedup}x[/bold red]")
+        return None
+
+
+def _run_v5_evolutionary(
+    sql: str,
+    full_db: str,
+    query_id: Optional[str],
+    max_iterations: int,
+    target_speedup: float,
+    provider: Optional[str],
+    model: Optional[str],
+    show_prompt: bool,
+    save_results: Optional[str],
+) -> Optional[str]:
+    """Run Mode 3: Evolutionary optimization."""
+    from qt_sql.optimization.adaptive_rewriter_v5 import optimize_v5_evolutionary
+
+    console.print(f"[dim]Full DB: {full_db}[/dim]")
+    console.print(f"[dim]Max iterations: {max_iterations}[/dim]")
+    console.print(f"[dim]Target speedup: {target_speedup}x[/dim]")
+    console.print()
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Running evolutionary optimization...", total=None)
+
+        try:
+            best, full_result, iterations = optimize_v5_evolutionary(
+                sql=sql,
+                full_db=full_db,
+                query_id=query_id,
+                max_iterations=max_iterations,
+                target_speedup=target_speedup,
+                provider=provider,
+                model=model,
+            )
+
+            progress.update(task, completed=True)
+
+        except Exception as e:
+            progress.stop()
+            console.print(f"[red]Optimization failed: {e}[/red]")
+            return None
+
+    # Display results
+    console.print(f"\n[bold]Iterations:[/bold] {len(iterations)}")
+    for it in iterations:
+        if it['status'] == 'success':
+            speedup = it['speedup']
+            improved = it.get('improved', False)
+            icon = "🔼" if improved else "→"
+            console.print(f"  [green]{icon}[/green] Iteration {it['iteration']}: {speedup:.2f}x")
+        else:
+            console.print(f"  [red]✗[/red] Iteration {it['iteration']}: {it['status']}")
+            if it.get('error'):
+                console.print(f"    [dim]{it['error'][:80]}...[/dim]")
+
+    if best and full_result:
+        console.print(f"\n[bold green]🏆 Best result: Iteration {best.worker_id}[/bold green]")
+        console.print(f"[bold]Final speedup:[/bold] {full_result.full_speedup:.2f}x")
+        if full_result.full_speedup >= target_speedup:
+            console.print(f"[green]✅ Target speedup {target_speedup}x MET![/green]")
+        else:
+            console.print(f"[yellow]⚠️  Below target {target_speedup}x[/yellow]")
+        return best.optimized_sql
+    else:
+        console.print(f"\n[bold red]❌ No successful optimizations in {max_iterations} iterations[/bold red]")
+        return None
 
 
 def _run_dag_optimization(

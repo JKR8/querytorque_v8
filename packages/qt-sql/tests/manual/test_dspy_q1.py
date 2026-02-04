@@ -3,8 +3,9 @@
 import os, sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "packages" / "qt-shared"))
-sys.path.insert(0, str(Path(__file__).parent / "packages" / "qt-sql"))
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "packages" / "qt-shared"))
+sys.path.insert(0, str(ROOT / "packages" / "qt-sql"))
 
 from dotenv import load_dotenv
 load_dotenv()

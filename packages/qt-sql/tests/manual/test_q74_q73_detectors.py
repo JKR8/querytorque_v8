@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Test GLD-006 and GLD-007 on Q74 and Q73."""
 
-import sys
-sys.path.insert(0, "packages/qt-sql")
-
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "packages" / "qt-sql"))
 from qt_sql.analyzers.ast_detector import detect_antipatterns
 
 # Test Q74
@@ -12,7 +13,7 @@ print("=" * 70)
 print("Testing Q74 (UNION CTE Specialization - GLD-006)")
 print("=" * 70)
 
-q74_sql = Path("research/experiments/benchmarks/kimi_benchmark_20260202_221828/q74/original.sql").read_text()
+q74_sql = (ROOT / "research" / "experiments" / "benchmarks" / "kimi_benchmark_20260202_221828" / "q74" / "original.sql").read_text()
 
 results = detect_antipatterns(q74_sql, dialect="duckdb")
 gld006_found = False
@@ -34,7 +35,7 @@ print("Testing Q73 (Subquery Materialization - GLD-007)")
 print("=" * 70)
 
 q73_path = None
-for path in Path("research/experiments/benchmarks").rglob("q73/original.sql"):
+for path in (ROOT / "research" / "experiments" / "benchmarks").rglob("q73/original.sql"):
     q73_path = path
     break
 
