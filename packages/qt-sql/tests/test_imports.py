@@ -15,7 +15,6 @@ class TestQtSqlImports:
         import qt_sql
         assert hasattr(qt_sql, "__version__")
         assert hasattr(qt_sql, "detect_antipatterns")
-        assert hasattr(qt_sql, "CalciteClient")
 
     def test_import_ast_detector_base(self):
         """Test AST detector base classes import."""
@@ -63,17 +62,6 @@ class TestQtSqlImports:
         )
         assert SQLRemediationPayload is not None
         assert callable(generate_sql_remediation_payload)
-
-    def test_import_calcite_client(self):
-        """Test Calcite client imports."""
-        from qt_sql.calcite_client import (
-            CalciteClient,
-            CalciteResult,
-            get_calcite_client,
-        )
-        assert CalciteClient is not None
-        assert CalciteResult is not None
-        assert callable(get_calcite_client)
 
     def test_import_sql_parser(self):
         """Test SQL parser imports."""

@@ -53,8 +53,8 @@ class TransformPattern:
         description: What this pattern does
         trigger: How to detect this pattern (AST/text description)
         rewrite_hint: How to fix (for LLM prompts)
-        weight: Impact score 1-10 (10 = transformative, used for savings estimate)
         benchmark_queries: TPC-DS queries where this helped (e.g., ["Q1", "Q15"])
+        avg_speedup: Normalized speedup 0-1 from benchmarks (1.0 = best, 3x+)
         category: "high_value" for high-impact patterns, "standard" otherwise
         enabled: Whether this transform is active
     """
@@ -65,8 +65,8 @@ class TransformPattern:
     description: str
     trigger: str
     rewrite_hint: str
-    weight: int = 5  # 1-10 scale, higher = more impactful
     benchmark_queries: list[str] = field(default_factory=list)
+    avg_speedup: float = 0.0  # Normalized 0-1 from benchmarks
     category: str = "standard"
     enabled: bool = True
 
@@ -85,7 +85,9 @@ class TransformPattern:
 # =============================================================================
 
 TRANSFORM_REGISTRY: dict[TransformID, TransformPattern] = {
-    # ----- HIGH VALUE (weight 7-9) -----
+    # ----- HIGH VALUE (proven 2x+ speedups) -----
+    # avg_speedup = (speedup - 1) * num_queries / 10
+    # Measures total impact: 1.5x on 10 queries (5.0) > 3x on 1 query (2.0)
     TransformID.OR_TO_UNION: TransformPattern(
         id=TransformID.OR_TO_UNION,
         code="QT-OPT-001",
@@ -93,8 +95,8 @@ TRANSFORM_REGISTRY: dict[TransformID, TransformPattern] = {
         description="Split OR conditions across different columns into UNION ALL branches",
         trigger="OR conditions spanning different columns (col_a = X OR col_b = Y)",
         rewrite_hint="Split into separate SELECTs with UNION ALL, add exclusion predicates to avoid duplicates",
-        weight=8,
         benchmark_queries=["Q15", "Q23", "Q24", "Q45"],
+        avg_speedup=0.79,  # (2.98-1) * 4 / 10
         category="high_value",
     ),
     TransformID.CORRELATED_TO_CTE: TransformPattern(
@@ -104,8 +106,8 @@ TRANSFORM_REGISTRY: dict[TransformID, TransformPattern] = {
         description="Replace correlated subquery with aggregate by pre-computing in a CTE",
         trigger="WHERE col > (SELECT AVG/SUM/COUNT FROM ... WHERE correlated)",
         rewrite_hint="Create CTE with GROUP BY on correlation key, then JOIN instead of correlated lookup",
-        weight=9,  # O(n²) to O(n) - highest impact
         benchmark_queries=["Q1"],
+        avg_speedup=0.18,  # (2.81-1) * 1 / 10
         category="high_value",
     ),
     TransformID.DATE_CTE_ISOLATION: TransformPattern(
@@ -115,8 +117,8 @@ TRANSFORM_REGISTRY: dict[TransformID, TransformPattern] = {
         description="Extract date dimension filtering into small early CTE",
         trigger="date_dim joined with d_year/d_qoy/d_month filter, fact table present",
         rewrite_hint="Create CTE: SELECT d_date_sk FROM date_dim WHERE filter, join fact to CTE early",
-        weight=7,
         benchmark_queries=["Q6", "Q15", "Q27", "Q39", "Q92"],
+        avg_speedup=0.84,  # (2.67-1) * 5 / 10 - HIGHEST: good speedup + broad coverage
         category="high_value",
     ),
     TransformID.PUSH_PREDICATE: TransformPattern(
@@ -126,8 +128,8 @@ TRANSFORM_REGISTRY: dict[TransformID, TransformPattern] = {
         description="Push dimension filters from main query into CTE before aggregation",
         trigger="Dimension filter in main WHERE, CTE has aggregation on fact table",
         rewrite_hint="Move dimension join+filter INTO CTE before GROUP BY",
-        weight=8,
-        benchmark_queries=["Q27", "Q93"],
+        benchmark_queries=["Q27", "Q93", "Q9"],
+        avg_speedup=0.33,  # (2.11-1) * 3 / 10
         category="high_value",
     ),
     TransformID.CONSOLIDATE_SCANS: TransformPattern(
@@ -137,12 +139,12 @@ TRANSFORM_REGISTRY: dict[TransformID, TransformPattern] = {
         description="Combine multiple scans of same table into single scan with CASE WHEN",
         trigger="Same table scanned in multiple CTEs with different filters",
         rewrite_hint="Single scan with SUM(CASE WHEN cond THEN val END) for each branch",
-        weight=7,
         benchmark_queries=["Q90"],
+        avg_speedup=0.08,  # (1.84-1) * 1 / 10
         category="high_value",
     ),
 
-    # ----- STANDARD TRANSFORMS (weight 2-6) -----
+    # ----- STANDARD TRANSFORMS (no benchmark data yet) -----
     TransformID.MULTI_PUSH_PREDICATE: TransformPattern(
         id=TransformID.MULTI_PUSH_PREDICATE,
         code="QT-OPT-006",
@@ -150,7 +152,7 @@ TRANSFORM_REGISTRY: dict[TransformID, TransformPattern] = {
         description="Push predicates through multiple CTE/subquery layers to base tables",
         trigger="Filter on column that traces back through multiple CTEs to base table",
         rewrite_hint="Trace column path through CTEs, add filter at each layer where column exists",
-        weight=6,
+        avg_speedup=0.0,  # No benchmark data
         category="standard",
     ),
     TransformID.MATERIALIZE_CTE: TransformPattern(
@@ -160,8 +162,8 @@ TRANSFORM_REGISTRY: dict[TransformID, TransformPattern] = {
         description="Extract repeated subquery patterns into a CTE",
         trigger="Same subquery pattern appears multiple times in query",
         rewrite_hint="Extract to CTE with MATERIALIZED hint, reference by name",
-        weight=5,
         benchmark_queries=["Q95"],
+        avg_speedup=0.0,  # Needs speedup benchmark
         category="standard",
     ),
     TransformID.FLATTEN_SUBQUERY: TransformPattern(
@@ -171,7 +173,7 @@ TRANSFORM_REGISTRY: dict[TransformID, TransformPattern] = {
         description="Convert correlated subqueries to equivalent JOINs",
         trigger="EXISTS, NOT EXISTS, IN, or scalar subquery in WHERE/SELECT",
         rewrite_hint="EXISTS→SEMI JOIN, NOT EXISTS→anti-join (LEFT+NULL), IN→JOIN",
-        weight=5,
+        avg_speedup=0.0,  # No benchmark data
         category="standard",
     ),
     TransformID.REORDER_JOIN: TransformPattern(
@@ -181,7 +183,7 @@ TRANSFORM_REGISTRY: dict[TransformID, TransformPattern] = {
         description="Reorder joins to put most selective tables first",
         trigger="Multiple tables joined, some with strong filters",
         rewrite_hint="Put tables with equality filters first, dimension before fact",
-        weight=4,
+        avg_speedup=0.0,  # No benchmark data
         category="standard",
     ),
     TransformID.INLINE_CTE: TransformPattern(
@@ -191,7 +193,7 @@ TRANSFORM_REGISTRY: dict[TransformID, TransformPattern] = {
         description="Inline CTEs used only once back into main query",
         trigger="CTE referenced exactly once, simple scan with filter",
         rewrite_hint="Replace CTE reference with inline subquery",
-        weight=3,
+        avg_speedup=0.0,  # No benchmark data
         category="standard",
     ),
     TransformID.REMOVE_REDUNDANT: TransformPattern(
@@ -201,7 +203,7 @@ TRANSFORM_REGISTRY: dict[TransformID, TransformPattern] = {
         description="Remove unnecessary DISTINCT, unused columns, redundant ORDER BY",
         trigger="DISTINCT with GROUP BY covering all columns, unused subquery columns",
         rewrite_hint="Remove DISTINCT if uniqueness guaranteed, trim unused columns",
-        weight=2,
+        avg_speedup=0.0,  # No benchmark data
         category="standard",
     ),
 }
@@ -284,19 +286,32 @@ def detect_opportunities(sql: str) -> list[DetectedOpportunity]:
             ))
 
     # QT-OPT-002: Correlated subquery with aggregate
-    # Look for correlated pattern: WHERE ... > (SELECT AVG/SUM
-    correlated_pattern = r'where.*[><]=?\s*\(\s*select\s+(?:avg|sum|count|max|min)\s*\('
+    # Look for correlated pattern: WHERE ... > (SELECT [expr *] AVG/SUM/etc
+    # Handles both direct aggregates and expressions like "1.3 * avg(...)"
+    correlated_pattern = r'where.*[><]=?\s*\(\s*select\s+[\d\.\s\*]*(?:avg|sum|count|max|min)\s*\('
     if re.search(correlated_pattern, sql_lower, re.DOTALL):
         opportunities.append(DetectedOpportunity(
             pattern=TRANSFORM_REGISTRY[TransformID.CORRELATED_TO_CTE],
             trigger_match="Correlated subquery with aggregate comparison",
         ))
 
+    # QT-OPT-008: Flatten correlated subquery to JOIN
+    # Scalar subquery in WHERE comparison with inner WHERE (correlation indicator)
+    # Matches: col > (SELECT ... FROM ... WHERE inner_col = outer_col)
+    flatten_pattern = r'[><]=?\s*\(\s*select\b[^)]+\bwhere\b[^)]+='
+    if re.search(flatten_pattern, sql_lower, re.DOTALL):
+        opportunities.append(DetectedOpportunity(
+            pattern=TRANSFORM_REGISTRY[TransformID.FLATTEN_SUBQUERY],
+            trigger_match="Correlated scalar subquery (flatten to JOIN candidate)",
+        ))
+
     # QT-OPT-003: Date filtering opportunity
-    # Look for date_dim with d_year/d_qoy filter and fact table
+    # Look for date_dim with date filter and fact table
     fact_tables = ['store_sales', 'catalog_sales', 'web_sales', 'store_returns',
                    'catalog_returns', 'web_returns', 'inventory']
+    # Check for any date filter: d_year, d_qoy, d_moy, d_month, or d_date between
     has_date_filter = any(col in sql_lower for col in ['d_year', 'd_qoy', 'd_moy', 'd_month'])
+    has_date_filter = has_date_filter or bool(re.search(r'd_date\s+between', sql_lower))
     has_date_dim = 'date_dim' in sql_lower
     has_fact = any(t in sql_lower for t in fact_tables)
 

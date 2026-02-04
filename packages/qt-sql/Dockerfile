@@ -24,7 +24,6 @@ RUN pip install --no-cache-dir -e . || pip install --no-cache-dir .
 # Environment
 ENV PYTHONUNBUFFERED=1
 ENV QT_DATABASE_URL=""
-ENV QTCALCITE_URL="http://qt-calcite:8000"
 
 EXPOSE 8000
 

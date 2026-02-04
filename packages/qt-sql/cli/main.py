@@ -4,12 +4,10 @@ Command-line interface for SQL analysis and optimization.
 
 Commands:
     qt-sql audit <file.sql>              Static analysis, generate report
-    qt-sql audit <file.sql> --calcite    Include Calcite optimization
     qt-sql optimize <file.sql>           LLM-powered optimization
     qt-sql validate <orig.sql> <opt.sql> Validate optimization equivalence
 """
 
-import asyncio
 import sys
 from pathlib import Path
 from typing import Optional
@@ -22,7 +20,6 @@ from rich.syntax import Syntax
 from rich.markdown import Markdown
 
 from qt_sql.analyzers.sql_antipattern_detector import SQLAntiPatternDetector, SQLAnalysisResult
-from qt_sql.calcite_client import CalciteClient, get_calcite_client, CalciteResult
 
 console = Console()
 
@@ -100,36 +97,6 @@ def display_analysis_result(result: SQLAnalysisResult, verbose: bool = False) ->
             console.print()
 
 
-def display_calcite_result(result: CalciteResult) -> None:
-    """Display Calcite optimization result."""
-    if not result.success:
-        console.print(f"[red]Calcite optimization failed: {result.error}[/red]")
-        return
-
-    if not result.query_changed:
-        console.print("[yellow]Calcite: No optimization opportunities found.[/yellow]")
-        return
-
-    console.print(Panel(
-        f"[green]Query optimized by Calcite[/green]\n"
-        f"Rules applied: {', '.join(result.rules_applied) if result.rules_applied else 'N/A'}",
-        title="Calcite Optimization",
-        border_style="green"
-    ))
-
-    if result.optimized_sql:
-        console.print("\n[bold]Optimized SQL:[/bold]")
-        console.print(Syntax(result.optimized_sql, "sql", theme="monokai", line_numbers=True))
-
-    if result.improvement_percent is not None:
-        console.print(f"\n[green]Performance improvement: {result.improvement_percent:.1f}%[/green]")
-
-    if result.original_cost is not None and result.optimized_cost is not None:
-        console.print(
-            f"Cost reduction: {result.original_cost:.2f} -> {result.optimized_cost:.2f}"
-        )
-
-
 @click.group()
 @click.version_option(version="0.1.0", prog_name="qt-sql")
 def cli():
@@ -139,18 +106,14 @@ def cli():
 
 @cli.command()
 @click.argument("file", type=click.Path(exists=True))
-@click.option("--calcite", is_flag=True, help="Include Calcite optimization")
 @click.option("--dialect", default="generic", help="SQL dialect (generic, snowflake, postgres, duckdb, tsql)")
 @click.option("--verbose", "-v", is_flag=True, help="Show detailed issue information")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
-@click.option("--calcite-url", default=None, help="Calcite service URL (default: http://localhost:8001)")
 def audit(
     file: str,
-    calcite: bool,
     dialect: str,
     verbose: bool,
-    output_json: bool,
-    calcite_url: Optional[str]
+    output_json: bool
 ):
     """Analyze SQL file for anti-patterns and issues.
 
@@ -159,7 +122,6 @@ def audit(
 
     Examples:
         qt-sql audit query.sql
-        qt-sql audit query.sql --calcite
         qt-sql audit query.sql --dialect snowflake -v
     """
     try:
@@ -184,17 +146,6 @@ def audit(
     console.print(f"[dim]Dialect: {dialect}[/dim]\n")
 
     display_analysis_result(result, verbose=verbose)
-
-    # Run Calcite optimization if requested
-    if calcite:
-        console.print("\n[bold]Running Calcite optimization...[/bold]")
-
-        async def run_calcite():
-            client = get_calcite_client(base_url=calcite_url)
-            return await client.optimize(sql)
-
-        calcite_result = asyncio.run(run_calcite())
-        display_calcite_result(calcite_result)
 
     # Exit with non-zero if critical/high issues found
     if result.critical_count > 0 or result.high_count > 0:

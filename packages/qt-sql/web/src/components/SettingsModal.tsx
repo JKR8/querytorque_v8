@@ -151,21 +151,6 @@ export default function SettingsModal({
             </p>
           </div>
 
-          {/* Calcite Status */}
-          <div className="settings-section">
-            <h3>Calcite Optimizer</h3>
-            <div className="provider-status">
-              <div className="provider-info">
-                <span className={`status-dot ${settings.calciteAvailable ? 'connected' : 'disconnected'}`} />
-                <span className="provider-name">
-                  {settings.calciteAvailable ? 'Available' : 'Not available'}
-                </span>
-              </div>
-            </div>
-            <p className="settings-hint">
-              Calcite provides algebraic SQL optimization before LLM processing
-            </p>
-          </div>
         </div>
 
         <div className="settings-footer">

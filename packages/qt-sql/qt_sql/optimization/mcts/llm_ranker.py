@@ -1,14 +1,12 @@
 """LLM-based transform ranking for MCTS PUCT priors.
 
-This module provides batched LLM ranking of transforms to compute
-prior probabilities for PUCT selection. It's designed for Phase 3
-of the PUCT implementation.
+This module provides intelligent LLM ranking of transforms by analyzing:
+1. The SQL query structure
+2. The execution plan (EXPLAIN output)
+3. Known patterns from the knowledge base (as reference, not priority)
 
-Key features:
-- Single batched LLM call to rank all candidates
-- Timeout handling with graceful fallback
-- JSON response parsing with error handling
-- Conversion of rankings to prior probabilities
+The LLM determines which transforms are ACTUALLY APPLICABLE to the specific
+query, not just which have high static weights.
 
 Usage:
     from qt_sql.optimization.mcts.llm_ranker import (
@@ -16,7 +14,7 @@ Usage:
         ranking_to_priors,
     )
 
-    ranking = rank_transforms_llm(candidates, sql, applied, llm_client)
+    ranking = rank_transforms_llm(candidates, sql, applied, llm_client, plan=plan)
     if ranking:
         priors = ranking_to_priors(ranking, candidates)
 """
@@ -32,50 +30,130 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-RANKING_PROMPT = """Rank these SQL transformations for the query below.
-Return most-to-least likely to improve performance.
+RANKING_PROMPT = """You are an expert SQL optimizer. Analyze this query and rank the transforms by likelihood of improving performance.
 
-## Available Transforms
-{transform_list}
+## CRITICAL: Learn from Previous Attempts
+The MCTS tree has already tried some transforms. USE THIS DATA to make better decisions:
+- If a transform achieved good speedup, similar transforms may help
+- If a transform failed or regressed, avoid it or related approaches
+- If a transform wasn't applicable (LLM couldn't apply it), deprioritize it
 
-## Query Context
-- Tables: {tables}
-- Has CTEs: {has_ctes}
-- Has correlated subquery: {has_correlated}
-- Has OR conditions: {has_or}
-- Already applied: {applied}
+{attempt_history}
 
-## SQL (truncated to 2000 chars)
+## Available Transforms (from Knowledge Base)
+{kb_patterns}
+
+## Execution Plan
+```
+{execution_plan}
+```
+
+## SQL Query
 ```sql
 {sql}
 ```
 
-## Instructions
-Rank the transforms from MOST to LEAST likely to improve this query's performance.
-Consider:
-1. Which patterns are present in the query
-2. What has already been applied (avoid redundant transforms)
-3. Known high-value transforms for the detected patterns
+## Already Applied in Current Path
+{applied}
 
-Return ONLY valid JSON in this exact format:
-{{"ranking": ["transform_id_1", "transform_id_2", ...]}}
+## Instructions
+1. FIRST review the previous attempts - what worked, what failed, what regressed
+2. Analyze the query structure and execution plan
+3. Determine which transforms are ACTUALLY APPLICABLE (have matching patterns)
+4. Rank transforms considering:
+   - Previous attempt results (avoid what failed/regressed)
+   - Query patterns present
+   - Likelihood of improvement
+
+Return ONLY valid JSON:
+{{"ranking": ["transform_id_1", "transform_id_2", ...], "reasoning": "brief explanation of why top picks, considering previous attempts"}}
 """
 
 
-# Transform descriptions for the ranking prompt
-TRANSFORM_DESCRIPTIONS = {
-    "push_pred": "Push WHERE predicates closer to base tables",
-    "reorder_join": "Reorder joins to put selective tables first",
-    "materialize_cte": "Extract repeated subqueries to CTEs",
-    "inline_cte": "Inline single-use CTEs back into query",
-    "flatten_subq": "Convert correlated subqueries to JOINs",
-    "remove_redundant": "Remove unnecessary DISTINCT, columns, ORDER BY",
-    "multi_push_pred": "Push predicates through multiple CTE layers",
-    "or_to_union": "Split OR conditions into UNION ALL branches (2.98x on Q15)",
-    "correlated_to_cte": "Replace correlated subquery with pre-computed CTE (2.81x on Q1)",
-    "date_cte_isolate": "Isolate date filter into small early CTE (2.67x on Q15)",
-    "consolidate_scans": "Combine multiple scans into conditional aggregation (1.84x on Q90)",
-}
+def should_use_llm_ranking(
+    *,
+    node_visit_count: int,
+    node_avg_reward: float,
+    num_candidates: int,
+    children_stats: Optional[dict[str, tuple[int, float]]] = None,
+) -> bool:
+    """Heuristic gate for when to invoke LLM ranking.
+
+    Triggers when:
+    - There are many candidates (>4), or
+    - The node appears "stuck": many visits, low reward, and low-performing children
+    """
+    # Many candidates: LLM can triage
+    if num_candidates > 4:
+        return True
+
+    # Too few candidates: no need for LLM
+    if num_candidates <= 3 and node_avg_reward >= 0.2:
+        return False
+
+    # Stuck node: lots of visits, low reward, and children not improving
+    if node_visit_count >= 5 and node_avg_reward < 0.2:
+        if not children_stats:
+            return True
+
+        low_reward_children = [
+            avg_reward for _, avg_reward in children_stats.values()
+            if avg_reward < 0.2
+        ]
+        if len(low_reward_children) == len(children_stats):
+            return True
+
+    return False
+
+
+def _get_kb_patterns_for_prompt() -> str:
+    """Format KB patterns for the ranking prompt."""
+    from ..knowledge_base import get_all_transforms
+
+    lines = []
+    for pattern in get_all_transforms():
+        evidence = ""
+        if pattern.benchmark_queries:
+            evidence = f" (proven on {', '.join(pattern.benchmark_queries)})"
+        lines.append(
+            f"- `{pattern.id.value}`: {pattern.name}{evidence}\n"
+            f"  Trigger: {pattern.trigger}\n"
+            f"  Rewrite: {pattern.rewrite_hint}"
+        )
+    return "\n\n".join(lines)
+
+
+def _format_attempt_history(attempt_summary: Optional[dict]) -> str:
+    """Format attempt history for the LLM prompt."""
+    if not attempt_summary:
+        return "## Previous Attempts\nNo attempts yet - this is the first ranking call."
+
+    lines = ["## Previous Attempts on This Query"]
+
+    for transform_id, stats in attempt_summary.items():
+        total = stats.get("total", 0)
+        llm_success = stats.get("llm_success", 0)
+        llm_failed = stats.get("llm_failed", 0)
+        validation_pass = stats.get("validation_pass", 0)
+        validation_fail = stats.get("validation_fail", 0)
+        avg_speedup = stats.get("avg_speedup", 0)
+        max_speedup = stats.get("max_speedup", 0)
+
+        if llm_failed == total:
+            lines.append(f"- `{transform_id}`: tried {total}x, LLM couldn't apply (not applicable?)")
+        elif validation_fail > 0 and validation_pass == 0:
+            lines.append(f"- `{transform_id}`: tried {total}x, all failed validation (breaks semantics)")
+        elif avg_speedup < 1.0:
+            lines.append(f"- `{transform_id}`: tried {total}x, REGRESSION avg {avg_speedup:.2f}x - AVOID")
+        elif max_speedup > 1.1:
+            lines.append(f"- `{transform_id}`: tried {total}x, best {max_speedup:.2f}x speedup - PROMISING")
+        else:
+            lines.append(f"- `{transform_id}`: tried {total}x, avg {avg_speedup:.2f}x (marginal)")
+
+    if not lines[1:]:
+        return "## Previous Attempts\nNo attempts yet - this is the first ranking call."
+
+    return "\n".join(lines)
 
 
 def rank_transforms_llm(
@@ -83,18 +161,22 @@ def rank_transforms_llm(
     sql: str,
     applied_transforms: list[str],
     llm_client,
-    timeout_ms: int = 5000,
+    timeout_ms: int = 10000,
     query_context: Optional[dict] = None,
+    execution_plan: Optional[str] = None,
+    attempt_summary: Optional[dict] = None,
 ) -> Optional[list[str]]:
-    """Rank transforms using a single batched LLM call.
+    """Rank transforms using LLM analysis of query, plan, and previous attempts.
 
     Args:
         candidates: List of candidate transform IDs to rank.
-        sql: Current SQL query (will be truncated for prompt).
+        sql: Current SQL query.
         applied_transforms: Transforms already applied in current path.
         llm_client: LLM client with analyze() method.
         timeout_ms: Timeout in milliseconds for LLM call.
-        query_context: Optional dict with tables, has_ctes, etc.
+        query_context: Optional dict with additional context.
+        execution_plan: Optional EXPLAIN output for the query.
+        attempt_summary: Optional dict of previous attempt results per transform.
 
     Returns:
         Ordered list of transform IDs (best first), or None on failure.
@@ -102,36 +184,27 @@ def rank_transforms_llm(
     if not candidates:
         return None
 
-    # Build transform list for prompt
-    transform_list = "\n".join(
-        f"- `{tid}`: {TRANSFORM_DESCRIPTIONS.get(tid, tid)}"
-        for tid in candidates
-    )
+    # Get KB patterns for prompt
+    kb_patterns = _get_kb_patterns_for_prompt()
 
-    # Extract query context
-    context = query_context or {}
-    sql_lower = sql.lower()
+    # Format attempt history
+    attempt_history = _format_attempt_history(attempt_summary)
 
-    tables = context.get("tables", _extract_tables(sql))
-    has_ctes = context.get("has_ctes", "with " in sql_lower)
-    has_correlated = context.get(
-        "has_correlated",
-        bool(re.search(r"where.*[><]=?\s*\(\s*select", sql_lower, re.DOTALL))
-    )
-    has_or = context.get("has_or", " or " in sql_lower)
+    # Get execution plan if not provided
+    plan_text = execution_plan or "Not available"
+    if plan_text == "Not available" and query_context and "plan" in query_context:
+        plan_text = query_context["plan"]
 
-    # Truncate SQL for prompt
-    sql_truncated = sql[:2000] + "..." if len(sql) > 2000 else sql
+    # Truncate SQL if too long
+    sql_truncated = sql[:3000] + "..." if len(sql) > 3000 else sql
 
     # Build prompt
     prompt = RANKING_PROMPT.format(
-        transform_list=transform_list,
-        tables=", ".join(tables) if tables else "unknown",
-        has_ctes=has_ctes,
-        has_correlated=has_correlated,
-        has_or=has_or,
-        applied=", ".join(applied_transforms) if applied_transforms else "none",
+        kb_patterns=kb_patterns,
+        attempt_history=attempt_history,
+        execution_plan=plan_text[:2000] if plan_text else "Not available",
         sql=sql_truncated,
+        applied=", ".join(applied_transforms) if applied_transforms else "none",
     )
 
     # Call LLM with timeout
@@ -142,6 +215,10 @@ def rank_transforms_llm(
 
         # Parse response
         ranking = _parse_ranking_response(response, candidates)
+
+        if ranking:
+            logger.debug(f"LLM ranking: {ranking}")
+
         return ranking
 
     except FuturesTimeoutError:
@@ -150,23 +227,6 @@ def rank_transforms_llm(
     except Exception as e:
         logger.debug(f"LLM ranking failed: {e}")
         return None
-
-
-def _extract_tables(sql: str) -> list[str]:
-    """Extract table names from SQL query (simple heuristic)."""
-    sql_lower = sql.lower()
-    tables = set()
-
-    # Match FROM and JOIN clauses
-    for pattern in [r'\bfrom\s+(\w+)', r'\bjoin\s+(\w+)']:
-        matches = re.findall(pattern, sql_lower)
-        tables.update(matches)
-
-    # Remove common keywords that aren't tables
-    keywords = {'select', 'where', 'group', 'order', 'having', 'union', 'with', 'as'}
-    tables -= keywords
-
-    return list(tables)
 
 
 def _parse_ranking_response(response: str, candidates: list[str]) -> Optional[list[str]]:
@@ -231,12 +291,12 @@ def ranking_to_priors(ranking: list[str], all_candidates: list[str]) -> dict[str
     """Convert ordered ranking to prior probabilities.
 
     Uses a decreasing distribution that heavily favors top-ranked transforms:
-    - Rank 1: 0.30
-    - Rank 2: 0.20
+    - Rank 1: 0.35
+    - Rank 2: 0.25
     - Rank 3: 0.15
     - Rank 4: 0.10
-    - Rank 5: 0.08
-    - Remaining: share 0.17 equally
+    - Rank 5: 0.05
+    - Remaining: share 0.10 equally
 
     Args:
         ranking: Ordered list of transform IDs (best first).
@@ -250,8 +310,8 @@ def ranking_to_priors(ranking: list[str], all_candidates: list[str]) -> dict[str
         n = len(all_candidates) if all_candidates else 1
         return {tid: 1.0 / n for tid in all_candidates}
 
-    # Base distribution for top ranks
-    top_priors = [0.30, 0.20, 0.15, 0.10, 0.08]
+    # Base distribution for top ranks - more aggressive than before
+    top_priors = [0.35, 0.25, 0.15, 0.10, 0.05]
     remaining_mass = 1.0 - sum(top_priors[:min(len(top_priors), len(ranking))])
 
     priors: dict[str, float] = {}
@@ -276,39 +336,3 @@ def ranking_to_priors(ranking: list[str], all_candidates: list[str]) -> dict[str
         priors = {tid: p / total for tid, p in priors.items()}
 
     return priors
-
-
-def should_use_llm_ranking(
-    node_visit_count: int,
-    node_avg_reward: float,
-    num_candidates: int,
-    children_stats: Optional[dict] = None,
-) -> bool:
-    """Determine if LLM ranking should be triggered for this node.
-
-    Triggers LLM ranking when:
-    1. Many candidates (>4) make random selection inefficient
-    2. Node is "stuck" (many visits, low reward, high failure rate)
-
-    Args:
-        node_visit_count: Number of visits to the node.
-        node_avg_reward: Average reward of the node.
-        num_candidates: Number of candidate transforms.
-        children_stats: Optional dict with {transform_id: (visits, avg_reward)}.
-
-    Returns:
-        True if LLM ranking should be used.
-    """
-    # Trigger 1: Many candidates
-    if num_candidates > 4:
-        return True
-
-    # Trigger 2: Node is stuck (many visits with poor results)
-    if node_visit_count >= 5 and node_avg_reward < 0.3:
-        if children_stats:
-            # Check failure rate
-            failed = sum(1 for _, (_, reward) in children_stats.items() if reward < 0.1)
-            if len(children_stats) > 0 and failed / len(children_stats) > 0.5:
-                return True
-
-    return False

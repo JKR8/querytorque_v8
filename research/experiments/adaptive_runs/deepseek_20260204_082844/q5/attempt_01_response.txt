@@ -1,0 +1,29 @@
+Looking at the execution plan and the detected opportunities, I can see that the main optimization opportunity is to push the date filter down into the CTEs before the UNION ALL operations. Currently, the date filter is applied after the UNION ALL, which means all sales and returns data is joined with date_dim before filtering. By pushing the filter earlier, we can significantly reduce the amount of data flowing through the UNION ALL.
+
+Here's my rewrite:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "pushdown",
+      "nodes": {
+        "ssr": "SELECT s_store_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS \"returns\", SUM(net_loss) AS profit_loss FROM (SELECT ss_store_sk AS store_sk, ss_sold_date_sk AS date_sk, ss_ext_sales_price AS sales_price, ss_net_profit AS profit, CAST(0 AS DECIMAL(7, 2)) AS return_amt, CAST(0 AS DECIMAL(7, 2)) AS net_loss FROM store_sales WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL '14' DAY)) UNION ALL SELECT sr_store_sk AS store_sk, sr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7, 2)) AS sales_price, CAST(0 AS DECIMAL(7, 2)) AS profit, sr_return_amt AS return_amt, sr_net_loss AS net_loss FROM store_returns WHERE sr_returned_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL '14' DAY))) AS salesreturns, store WHERE store_sk = s_store_sk GROUP BY s_store_id",
+        "csr": "SELECT cp_catalog_page_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS \"returns\", SUM(net_loss) AS profit_loss FROM (SELECT cs_catalog_page_sk AS page_sk, cs_sold_date_sk AS date_sk, cs_ext_sales_price AS sales_price, cs_net_profit AS profit, CAST(0 AS DECIMAL(7, 2)) AS return_amt, CAST(0 AS DECIMAL(7, 2)) AS net_loss FROM catalog_sales WHERE cs_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL '14' DAY)) UNION ALL SELECT cr_catalog_page_sk AS page_sk, cr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7, 2)) AS sales_price, CAST(0 AS DECIMAL(7, 2)) AS profit, cr_return_amount AS return_amt, cr_net_loss AS net_loss FROM catalog_returns WHERE cr_returned_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL '14' DAY))) AS salesreturns, catalog_page WHERE page_sk = cp_catalog_page_sk GROUP BY cp_catalog_page_id"
+      },
+      "invariants_kept": [
+        "ssr output columns unchanged",
+        "csr output columns unchanged",
+        "same grouping and aggregation",
+        "same result rows"
+      ],
+      "expected_speedup": "2.0x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Pushed the date filter (d_date BETWEEN '2000-08-19' AND '2000-09-02') down into the UNION ALL branches of ssr and csr CTEs. This filters store_sales/store_returns and catalog_sales/catalog_returns rows BEFORE the UNION ALL operations, significantly reducing the amount of data that needs to be processed. The date_dim join is converted to an IN subquery for early filtering. The main_query remains unchanged as it only references the CTE outputs."
+}
+```
+
+**Key insight:** The date filter `d_date BETWEEN '2000-08-19' AND '2000-09-02'` is currently applied after UNION ALL operations in both ssr and csr CTEs. By pushing this filter into each branch of the UNION ALL using an IN subquery, we filter the fact tables (store_sales, store_returns, catalog_sales, catalog_returns) early, reducing the data volume flowing through the UNION ALL by ~95% (from millions of rows to thousands). This matches the QT-OPT-003 pattern from the knowledge base.

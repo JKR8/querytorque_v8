@@ -153,7 +153,8 @@ class RepeatedSubqueryToCTERewriter(BaseRewriter):
             if isinstance(parent, exp.CTE):
                 continue
 
-            sql_hash = _hash_sql(subq.sql())
+            inner = subq.this if isinstance(subq.this, exp.Expression) else None
+            sql_hash = _hash_sql(inner.sql() if inner is not None else subq.sql())
             subqueries_by_hash[sql_hash].append(subq)
 
         # Filter to only duplicates
@@ -248,13 +249,14 @@ class RepeatedSubqueryToCTERewriter(BaseRewriter):
         ctes: list[exp.CTE]
     ) -> None:
         """Add CTEs to a SELECT statement."""
-        existing_with = select.find(exp.With)
-
-        if existing_with:
-            # Add to existing WITH clause
-            for cte in ctes:
-                existing_with.append("expressions", cte)
-        else:
-            # Create new WITH clause
-            with_clause = exp.With(expressions=ctes)
-            select.set("with", with_clause)
+        for cte in ctes:
+            alias = None
+            if cte.alias:
+                if isinstance(cte.alias, str):
+                    alias = cte.alias
+                else:
+                    alias = cte.alias.this
+            inner = cte.this
+            if alias is None or inner is None:
+                continue
+            select.with_(alias, inner, append=True, copy=False)

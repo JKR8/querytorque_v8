@@ -9,7 +9,6 @@ export interface AppSettings {
   mode: 'auto' | 'manual'
   llmProvider: string | null
   llmConfigured: boolean
-  calciteAvailable: boolean | null
 }
 
 interface UseSettingsReturn {
@@ -26,7 +25,6 @@ const DEFAULT_SETTINGS: AppSettings = {
   mode: 'manual',
   llmProvider: null,
   llmConfigured: false,
-  calciteAvailable: null,
 }
 
 function loadFromStorage(): Partial<AppSettings> {
@@ -67,7 +65,6 @@ export function useSettings(): UseSettingsReturn {
         mode: health.mode,
         llmProvider: health.llm_provider,
         llmConfigured: health.llm_configured,
-        calciteAvailable: health.calcite_available,
       }
       setSettings(newSettings)
       saveToStorage({ mode: newSettings.mode })

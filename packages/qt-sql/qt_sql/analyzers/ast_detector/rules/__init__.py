@@ -189,6 +189,15 @@ from .opportunity_rules import (
     RemoveRedundantOpportunity,        # QT-OPT-011: remove_redundant
 )
 
+# Gold Standard Rules - Verified transforms with proven speedups
+from .gold_rules import (
+    EarlyFilterPushdownGold,           # GLD-003: early_filter (2.71x, 1.84x, 1.24x, 1.23x)
+    ProjectionPruningGold,             # GLD-004: projection_prune (1.21x)
+    CorrelatedSubqueryGold,            # GLD-005: correlated_subquery (1.80x avg)
+    DecorrelateSubqueryGold,           # GLD-001: decorrelate (2.81x)
+    OrToUnionGold,                     # GLD-002: or_to_union (2.67x)
+)
+
 # Snowflake-specific rules
 from .snowflake_rules import (
     CopyIntoWithoutFileFormatRule,

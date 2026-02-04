@@ -192,37 +192,3 @@ class TestSQLCLIEdgeCases:
         # Should complete
         assert result.exit_code in (0, 1)
 
-
-class TestSQLCLICalcite:
-    """Tests for Calcite integration in CLI."""
-
-    @pytest.fixture
-    def runner(self):
-        return CliRunner()
-
-    @pytest.fixture
-    def cli(self):
-        from cli.main import cli
-        return cli
-
-    @pytest.fixture
-    def sample_sql_file(self, tmp_path):
-        sql_file = tmp_path / "test.sql"
-        sql_file.write_text("SELECT id, name FROM users")
-        return str(sql_file)
-
-    def test_audit_calcite_flag(self, runner, cli, sample_sql_file):
-        """Test audit --calcite flag is accepted."""
-        result = runner.invoke(cli, ["audit", sample_sql_file, "--calcite"])
-        # May fail if Calcite not available, but flag should be accepted
-        assert result.exit_code in (0, 1)
-
-    def test_audit_calcite_url_option(self, runner, cli, sample_sql_file):
-        """Test audit --calcite-url option."""
-        result = runner.invoke(cli, [
-            "audit", sample_sql_file,
-            "--calcite",
-            "--calcite-url", "http://localhost:8001"
-        ])
-        # May fail if Calcite not available
-        assert result.exit_code in (0, 1)

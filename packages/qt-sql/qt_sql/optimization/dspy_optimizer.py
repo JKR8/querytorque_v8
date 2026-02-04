@@ -156,6 +156,38 @@ def build_system_prompt(model_name: str = None, db_name: str = None) -> str:
     return "\n".join(parts)
 
 
+def load_constraint_set(name: str = "dag_v5") -> Dict[str, Any]:
+    """Load a constraint set from knowledge_base/constraints.
+
+    Args:
+        name: Constraint set name (without .yaml)
+
+    Returns:
+        Config dict with constraints and prompt_suffix
+    """
+    config_path = get_config_dir() / "constraints" / f"{name}.yaml"
+    if not config_path.exists():
+        return {"constraints": [], "prompt_suffix": ""}
+    with open(config_path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def build_dag_constraints(constraint_set: str = "dag_v5") -> str:
+    """Build constraints text for DAG-based DSPy prompts."""
+    cfg = load_constraint_set(constraint_set)
+    if cfg.get("prompt_suffix"):
+        return cfg["prompt_suffix"]
+    # Fallback: join constraint texts if prompt_suffix absent
+    items = cfg.get("constraints", [])
+    lines = []
+    for i, item in enumerate(items, 1):
+        if isinstance(item, dict) and item.get("text"):
+            lines.append(f"{i}. {item['text']}")
+    if not lines:
+        return ""
+    return "CONSTRAINTS:\n" + "\n".join(lines)
+
+
 def load_gold_examples(num_examples: int = 3) -> List[dspy.Example]:
     """Load gold examples for few-shot learning.
 
@@ -166,11 +198,11 @@ def load_gold_examples(num_examples: int = 3) -> List[dspy.Example]:
         List of dspy.Example objects
     """
     try:
-        from research.knowledge_base.examples.gold_examples import get_gold_examples
+        from research.knowledge_base.duckdb.gold_examples import get_gold_examples
         return get_gold_examples(num_examples)
     except ImportError:
         # Fall back to relative import if running from different location
-        examples_path = get_config_dir() / "examples" / "gold_examples.py"
+        examples_path = get_config_dir() / "duckdb" / "gold_examples.py"
         if examples_path.exists():
             import importlib.util
             spec = importlib.util.spec_from_file_location("gold_examples", examples_path)
@@ -195,9 +227,10 @@ def detect_knowledge_patterns(sql: str, dag: "SQLDag" = None) -> str:
     Returns:
         Formatted string with relevant patterns, or empty string if none
     """
-    # Use the centralized opportunity detector
-    from qt_sql.analyzers.opportunity_detector import detect_knowledge_patterns as _detect
-    patterns = _detect(sql)
+    # Use the centralized knowledge base
+    from qt_sql.optimization.knowledge_base import detect_opportunities, format_opportunities_for_prompt
+    opportunities = detect_opportunities(sql)
+    patterns = format_opportunities_for_prompt(opportunities)
 
     # Add pushdown analysis if DAG is provided
     if dag is not None:
@@ -1127,11 +1160,11 @@ def load_dag_gold_examples(num_examples: int = 3) -> List[dspy.Example]:
         List of dspy.Example objects
     """
     try:
-        from research.knowledge_base.examples.dag_gold_examples import get_dag_gold_examples
+        from research.knowledge_base.duckdb.dag_gold_examples import get_dag_gold_examples
         return get_dag_gold_examples(num_examples)
     except ImportError:
         # Fall back to relative import
-        examples_path = get_config_dir() / "examples" / "dag_gold_examples.py"
+        examples_path = get_config_dir() / "duckdb" / "dag_gold_examples.py"
         if examples_path.exists():
             import importlib.util
             spec = importlib.util.spec_from_file_location("dag_gold_examples", examples_path)

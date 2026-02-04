@@ -19,7 +19,6 @@ from qt_shared.auth import OptionalUser, CurrentUser, UserContext
 from qt_shared.config import get_settings, Settings
 
 from qt_sql.analyzers.sql_antipattern_detector import SQLAntiPatternDetector
-from qt_sql.calcite_client import get_calcite_client
 from qt_sql.renderers import render_sql_report
 
 # Configure logging
@@ -62,10 +61,6 @@ class AnalyzeRequest(BaseModel):
     include_structure: bool = Field(
         default=True,
         description="Include query structure analysis (CTEs, joins, tables)"
-    )
-    include_calcite: bool = Field(
-        default=False,
-        description="Include Calcite optimization analysis"
     )
 
 
@@ -125,10 +120,6 @@ class AnalyzeResponse(BaseModel):
         default=None,
         description="Query structure information (CTEs, joins, etc.)"
     )
-    calcite: Optional[dict] = Field(
-        default=None,
-        description="Calcite optimization results if requested"
-    )
     html: str = Field(
         default="",
         description="HTML audit report"
@@ -157,10 +148,6 @@ class OptimizeRequest(BaseModel):
         description="LLM provider override (anthropic, deepseek, openai, etc.)"
     )
     model: Optional[str] = Field(default=None, description="LLM model override")
-    use_calcite: bool = Field(
-        default=True,
-        description="Include Calcite optimization before LLM"
-    )
 
 
 class OptimizeResponse(BaseModel):
@@ -170,7 +157,6 @@ class OptimizeResponse(BaseModel):
     optimized_sql: Optional[str] = None
     analysis: AnalyzeResponse
     llm_response: Optional[str] = None
-    calcite_result: Optional[dict] = None
     success: bool = True
     error: Optional[str] = None
 
@@ -182,7 +168,6 @@ class HealthResponse(BaseModel):
     version: str
     auth_enabled: bool
     llm_configured: bool
-    calcite_available: Optional[bool] = None
     mode: Literal['auto', 'manual'] = 'manual'
     llm_provider: Optional[str] = None
 
@@ -237,20 +222,11 @@ async def health_check():
     """
     settings = get_settings()
 
-    # Check Calcite availability
-    calcite_available = None
-    try:
-        client = get_calcite_client()
-        calcite_available = await client.is_available()
-    except Exception:
-        calcite_available = False
-
     return HealthResponse(
         status="ok",
         version="0.1.0",
         auth_enabled=settings.auth_enabled,
         llm_configured=settings.has_llm_provider,
-        calcite_available=calcite_available,
         mode='manual' if settings.is_manual_mode else 'auto',
         llm_provider=settings.llm_provider if settings.llm_provider else None,
     )
@@ -269,7 +245,6 @@ async def analyze_sql(
     - **sql**: The SQL query to analyze
     - **dialect**: SQL dialect for analysis (affects available rules)
     - **include_structure**: Whether to include query structure info
-    - **include_calcite**: Whether to include Calcite optimization
     """
     logger.info(
         "Analyzing SQL",
@@ -397,25 +372,6 @@ async def analyze_sql(
             status=status_str,
         )
 
-        # Include Calcite analysis if requested
-        if request.include_calcite:
-            try:
-                client = get_calcite_client()
-                calcite_result = await client.optimize(request.sql, dry_run=True)
-
-                response.calcite = {
-                    "available": calcite_result.success or calcite_result.error != "Calcite service not available",
-                    "query_changed": calcite_result.query_changed,
-                    "rules_applied": calcite_result.rules_applied,
-                    "optimized_sql": calcite_result.optimized_sql if calcite_result.query_changed else None,
-                    "error": calcite_result.error if not calcite_result.success else None,
-                }
-            except Exception as e:
-                response.calcite = {
-                    "available": False,
-                    "error": str(e),
-                }
-
         return response
 
     except Exception as e:
@@ -442,7 +398,6 @@ async def optimize_sql(
     - **dialect**: SQL dialect for analysis
     - **provider**: Optional LLM provider override
     - **model**: Optional LLM model override
-    - **use_calcite**: Whether to include Calcite optimization
     """
     logger.info(
         "Optimizing SQL",
@@ -502,29 +457,8 @@ async def optimize_sql(
             analysis=analysis_response,
         )
 
-        # Run Calcite optimization if requested
-        if request.use_calcite:
-            try:
-                client = get_calcite_client()
-                calcite_result = await client.optimize(request.sql)
-
-                response.calcite_result = {
-                    "success": calcite_result.success,
-                    "query_changed": calcite_result.query_changed,
-                    "optimized_sql": calcite_result.optimized_sql,
-                    "rules_applied": calcite_result.rules_applied,
-                    "improvement_percent": calcite_result.improvement_percent,
-                    "error": calcite_result.error if not calcite_result.success else None,
-                }
-
-                # Use Calcite-optimized SQL as base for LLM if it improved
-                if calcite_result.query_changed and calcite_result.optimized_sql:
-                    response.optimized_sql = calcite_result.optimized_sql
-            except Exception as e:
-                response.calcite_result = {"success": False, "error": str(e)}
-
-        # If no issues found and no Calcite changes, skip LLM
-        if not analysis_result.issues and not response.calcite_result:
+        # If no issues found, skip LLM
+        if not analysis_result.issues:
             response.success = True
             response.optimized_sql = request.sql
             return response
@@ -550,7 +484,7 @@ async def optimize_sql(
                 for issue in analysis_result.issues
             )
 
-            base_sql = response.optimized_sql or request.sql
+            base_sql = request.sql
 
             prompt = f"""You are a SQL optimization expert. Optimize the following SQL query.
 

@@ -43,7 +43,6 @@ export interface HealthResponse {
   mode: 'auto' | 'manual'
   auth_enabled: boolean
   llm_configured: boolean
-  calcite_available: boolean | null
   llm_provider: string | null
 }
 

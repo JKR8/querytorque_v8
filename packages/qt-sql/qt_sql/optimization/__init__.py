@@ -1,4 +1,11 @@
-"""SQL optimization utilities."""
+"""SQL optimization utilities.
+
+Main entry point for LLM-powered optimization (Dag v2 + JSON v5):
+    from qt_sql.optimization import optimize_v5_json
+    result = optimize_v5_json(sql, db_path)
+
+MCTS module reserved for deterministic transform search.
+"""
 
 from .payload_builder import (
     build_optimization_payload_v2,
@@ -31,11 +38,10 @@ from .block_map import (
     Block,
     Clause,
 )
-from .sql_dag import (
-    SQLDag,
+# sql_dag.py deprecated - use dag_v2.py instead
+from .dag_v2 import (
+    DagV2Pipeline,
     DagNode,
-    DagEdge,
-    build_dag_prompt,
 )
 from .iterative_optimizer import (
     test_optimization,
@@ -46,34 +52,10 @@ from .iterative_optimizer import (
     TestResult,
 )
 
-# DSPy-based optimizer (optional, requires dspy-ai)
-try:
-    from .dspy_optimizer import (
-        optimize_query,
-        configure_lm,
-        SQLOptimizationPipeline,
-        SQLOptimizer,
-        OptimizationValidator,
-        speedup_metric,
-        # DAG-based optimizer
-        DagOptimizationPipeline,
-        DagOptimizationResult,
-        SQLDagOptimizer,
-        optimize_with_dag,
-    )
-    DSPY_AVAILABLE = True
-except ImportError:
-    DSPY_AVAILABLE = False
-    optimize_query = None
-    configure_lm = None
-    SQLOptimizationPipeline = None
-    SQLOptimizer = None
-    OptimizationValidator = None
-    speedup_metric = None
-    DagOptimizationPipeline = None
-    DagOptimizationResult = None
-    SQLDagOptimizer = None
-    optimize_with_dag = None
+from .adaptive_rewriter_v5 import (
+    optimize_v5_json,
+    optimize_v5_json_queue,
+)
 
 # MCTS-based optimizer
 try:
@@ -82,11 +64,13 @@ try:
         MCTSOptimizationResult,
         MCTSNode,
         MCTSTree,
-        TRANSFORMATION_LIBRARY,
-        TransformationType,
-        apply_transformation,
-        compute_reward,
-        RewardConfig,
+        MCTSConfig,
+        TRANSFORM_REGISTRY,
+        get_all_transform_ids,
+        apply_transform,
+        PolicyNetwork,
+        PolicyConfig,
+        BenchmarkRunner,
     )
     MCTS_AVAILABLE = True
 except ImportError:
@@ -95,19 +79,44 @@ except ImportError:
     MCTSOptimizationResult = None
     MCTSNode = None
     MCTSTree = None
-    TRANSFORMATION_LIBRARY = None
-    TransformationType = None
-    apply_transformation = None
-    compute_reward = None
-    RewardConfig = None
+    MCTSConfig = None
+    TRANSFORM_REGISTRY = None
+    get_all_transform_ids = None
+    apply_transform = None
+    PolicyNetwork = None
+    PolicyConfig = None
+    BenchmarkRunner = None
 
 __all__ = [
-    # Legacy v2 payload builder
+    # ============================================================
+    # PRIMARY: Dag v2 + JSON v5 (recommended for LLM optimization)
+    # ============================================================
+    "optimize_v5_json",
+    "optimize_v5_json_queue",
+    # ============================================================
+    # Hybrid MCTS
+    # ============================================================
+    "MCTS_AVAILABLE",
+    "MCTSSQLOptimizer",
+    "MCTSOptimizationResult",
+    "MCTSNode",
+    "MCTSTree",
+    "MCTSConfig",
+    "TRANSFORM_REGISTRY",
+    "get_all_transform_ids",
+    "apply_transform",
+    "PolicyNetwork",
+    "PolicyConfig",
+    "BenchmarkRunner",
+    # ============================================================
+    # UTILITIES
+    # ============================================================
+    # Payload builder
     "build_optimization_payload_v2",
     "PayloadV2Result",
     "get_duckdb_engine_info",
     "payload_v2_to_markdown",
-    # Lightweight analyzer (patches)
+    # Plan analyzer
     "analyze_plan_for_optimization",
     "build_optimization_prompt",
     "apply_patches",
@@ -119,18 +128,16 @@ __all__ = [
     "CTEFlow",
     "SQLPatch",
     "PatchResult",
-    # Block Map (structured operations)
+    # Block Map
     "generate_block_map",
     "format_block_map",
     "build_full_prompt",
     "BlockMapResult",
     "Block",
     "Clause",
-    # SQL DAG (proper graph structure)
-    "SQLDag",
+    # DAG V2 (replaces sql_dag)
+    "DagV2Pipeline",
     "DagNode",
-    "DagEdge",
-    "build_dag_prompt",
     # Iterative optimizer
     "test_optimization",
     "format_test_feedback",
@@ -138,31 +145,7 @@ __all__ = [
     "apply_operations",
     "parse_response",
     "TestResult",
-    # Schemas for structured output
+    # Schemas
     "OPTIMIZATION_PATCH_SCHEMA",
     "OPTIMIZATION_SQL_SCHEMA",
-    # DSPy optimizer (legacy - full SQL output)
-    "DSPY_AVAILABLE",
-    "optimize_query",
-    "configure_lm",
-    "SQLOptimizationPipeline",
-    "SQLOptimizer",
-    "OptimizationValidator",
-    "speedup_metric",
-    # DSPy DAG optimizer (node-level rewrites)
-    "DagOptimizationPipeline",
-    "DagOptimizationResult",
-    "SQLDagOptimizer",
-    "optimize_with_dag",
-    # MCTS optimizer
-    "MCTS_AVAILABLE",
-    "MCTSSQLOptimizer",
-    "MCTSOptimizationResult",
-    "MCTSNode",
-    "MCTSTree",
-    "TRANSFORMATION_LIBRARY",
-    "TransformationType",
-    "apply_transformation",
-    "compute_reward",
-    "RewardConfig",
 ]

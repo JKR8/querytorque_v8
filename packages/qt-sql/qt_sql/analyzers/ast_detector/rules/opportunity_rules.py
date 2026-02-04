@@ -425,8 +425,14 @@ class PredicatePushdownOpportunity(ASTRule):
                 cte_has_fact = True
                 break
 
-        if dim_filters and cte_has_fact:
+        # Special case: quantity-range CTEs with shared filters in main query (Q9-style)
+        quantity_range_ctes = self._has_quantity_range_ctes(with_clause)
+        main_filter_hint = self._has_main_filters_of_interest(where)
+
+        if (dim_filters and cte_has_fact) or (quantity_range_ctes and main_filter_hint and cte_has_fact):
             dim_info = ", ".join(f"{t}({','.join(f[:2])})" for t, f in dim_filters[:2])
+            if not dim_info and quantity_range_ctes:
+                dim_info = "quantity_range + shared filters"
             yield RuleMatch(
                 node=node,
                 context=context,
@@ -466,6 +472,26 @@ class PredicatePushdownOpportunity(ASTRule):
                     if col_name and not col_name.endswith('_sk'):  # Skip join keys
                         filters.append(col_name)
         return filters
+
+    def _has_quantity_range_ctes(self, with_clause: exp.With) -> bool:
+        """Detect repeated quantity-range CTEs (Q9-style)."""
+        count = 0
+        for cte in with_clause.find_all(exp.CTE):
+            cte_name = str(cte.alias).lower() if cte.alias else ""
+            cte_sql = cte.sql().lower()
+            if "quantity_range" in cte_name or ("ss_quantity" in cte_sql and "between" in cte_sql):
+                count += 1
+                if count >= 2:
+                    return True
+        return False
+
+    def _has_main_filters_of_interest(self, where: exp.Expression) -> bool:
+        """Detect common shared filters in main query (item/date)."""
+        for col in where.find_all(exp.Column):
+            col_name = str(col.this).lower() if col.this else ""
+            if any(key in col_name for key in ["item", "sold_date", "date_sk", "d_date", "d_year"]):
+                return True
+        return False
 
 
 class CorrelatedToPrecomputedCTEOpportunity(ASTRule):

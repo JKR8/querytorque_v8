@@ -84,6 +84,11 @@ class DuckDBExecutor:
             database=self.database,
             read_only=self.read_only,
         )
+        try:
+            self._conn.execute("PRAGMA temp_directory='/tmp'")
+        except Exception:
+            # Best-effort: some environments may not allow setting this
+            pass
 
     def close(self) -> None:
         """Close connection to DuckDB."""

@@ -238,30 +238,6 @@ class TestSQLAPIIssueFormat:
                 assert "penalty" in issue
 
 
-class TestSQLAPICalciteIntegration:
-    """Tests for Calcite integration in API."""
-
-    @pytest.fixture
-    def client(self):
-        from fastapi.testclient import TestClient
-        from api.main import app
-        return TestClient(app)
-
-    def test_analyze_with_calcite_flag(self, client):
-        """Test analyze with include_calcite flag."""
-        response = client.post(
-            "/api/sql/analyze",
-            json={
-                "sql": "SELECT id FROM users",
-                "include_calcite": True
-            }
-        )
-        if response.status_code == 200:
-            data = response.json()
-            # Should include calcite field (may be null if not available)
-            assert "calcite" in data or response.status_code == 200
-
-
 class TestSQLAPIEdgeCases:
     """Tests for edge cases in API."""
 

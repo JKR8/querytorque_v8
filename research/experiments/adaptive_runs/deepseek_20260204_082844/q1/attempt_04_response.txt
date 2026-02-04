@@ -1,0 +1,40 @@
+Looking at the query structure and the execution plan, I can see a key opportunity: the correlated subquery calculates the average `ctr_total_return` per store, but this calculation is done AFTER filtering for `s_state = 'SD'` in the main query. This means we're computing averages for ALL stores, then filtering to just SD stores, which is inefficient.
+
+**Key insight:** We can push the store filter (`s_state = 'SD'`) into the average calculation CTE, so we only compute averages for stores in SD state, not all stores.
+
+Here's my approach:
+1. Create a filtered version of `customer_total_return` that only includes stores in SD state
+2. Compute the average from this filtered CTE
+3. This reduces the amount of data processed in the average calculation
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "pushdown",
+      "nodes": {
+        "customer_total_return_sd": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns, date_dim WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000 AND sr_store_sk IN (SELECT s_store_sk FROM store WHERE s_state = 'SD') GROUP BY sr_customer_sk, sr_store_sk",
+        "main_query": "/* start query 1 in stream 0 using template query1.tpl */ WITH customer_total_return_sd AS (SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns, date_dim WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000 AND sr_store_sk IN (SELECT s_store_sk FROM store WHERE s_state = 'SD') GROUP BY sr_customer_sk, sr_store_sk) SELECT c_customer_id FROM customer_total_return_sd AS ctr1, store, customer WHERE ctr1.ctr_total_return > (SELECT AVG(ctr_total_return) * 1.2 FROM customer_total_return_sd AS ctr2 WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk) AND s_store_sk = ctr1.ctr_store_sk AND s_state = 'SD' AND ctr1.ctr_customer_sk = c_customer_sk ORDER BY c_customer_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation semantics"
+      ],
+      "expected_speedup": "1.3x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Pushed store filter (s_state = 'SD') into the customer_total_return CTE using an IN subquery. This reduces the data volume before aggregation and ensures the average calculation only processes stores in SD state, not all stores. The main query still filters for SD stores, but now the correlated subquery computes averages from a much smaller dataset."
+}
+```
+
+**Why this should beat 1.24x:**
+1. The original query computes averages for ALL stores (~2,310 rows in CTE), then filters to SD stores (~41 stores)
+2. My rewrite computes averages only for SD stores from the start
+3. This reduces the hash group by operation in the correlated subquery from ~2,310 rows to ~41 rows
+4. The IN subquery is efficient since store table is small and has s_state filter
+
+The pushdown transform is allowed and this approach directly addresses the inefficiency identified in the execution plan where the average calculation processes all stores before filtering.

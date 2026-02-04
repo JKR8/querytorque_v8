@@ -4,9 +4,8 @@ Command-line interface for SQL analysis and optimization.
 
 Commands:
     qt-sql audit <file.sql>              Static analysis, generate report
-    qt-sql audit <file.sql> --calcite    Include Calcite optimization
     qt-sql optimize <file.sql>           LLM-powered optimization
-    qt-sql optimize <file.sql> --dag     DAG-based node-level rewrites (recommended)
+    qt-sql optimize <file.sql> --dag     DAG v2 + JSON v5 node-level rewrites (recommended)
     qt-sql optimize <file.sql> --dag --mcts-on-failure   DAG + MCTS fallback
     qt-sql validate <orig.sql> <opt.sql> Validate optimization equivalence
 """
@@ -28,7 +27,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from qt_sql.analyzers.sql_antipattern_detector import SQLAntiPatternDetector, SQLAnalysisResult
 from qt_sql.analyzers.opportunity_detector import detect_opportunities, OpportunityResult
-from qt_sql.calcite_client import CalciteClient, get_calcite_client, CalciteResult
+from qt_sql.validation.schemas import ValidationStatus
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -205,36 +204,6 @@ def display_assessment(result: SQLAnalysisResult, verbose: bool = False) -> None
             console.print(f"  [dim]... and {len(result.issues) - 5} more[/dim]")
 
 
-def display_calcite_result(result: CalciteResult) -> None:
-    """Display Calcite optimization result."""
-    if not result.success:
-        console.print(f"[red]Calcite optimization failed: {result.error}[/red]")
-        return
-
-    if not result.query_changed:
-        console.print("[yellow]Calcite: No optimization opportunities found.[/yellow]")
-        return
-
-    console.print(Panel(
-        f"[green]Query optimized by Calcite[/green]\n"
-        f"Rules applied: {', '.join(result.rules_applied) if result.rules_applied else 'N/A'}",
-        title="Calcite Optimization",
-        border_style="green"
-    ))
-
-    if result.optimized_sql:
-        console.print("\n[bold]Optimized SQL:[/bold]")
-        console.print(Syntax(result.optimized_sql, "sql", theme="monokai", line_numbers=True))
-
-    if result.improvement_percent is not None:
-        console.print(f"\n[green]Performance improvement: {result.improvement_percent:.1f}%[/green]")
-
-    if result.original_cost is not None and result.optimized_cost is not None:
-        console.print(
-            f"Cost reduction: {result.original_cost:.2f} -> {result.optimized_cost:.2f}"
-        )
-
-
 @click.group()
 @click.version_option(version="0.1.0", prog_name="qt-sql")
 def cli():
@@ -244,20 +213,16 @@ def cli():
 
 @cli.command()
 @click.argument("file", type=click.Path(exists=True))
-@click.option("--calcite", is_flag=True, help="Include Calcite optimization")
 @click.option("--dialect", default="generic", help="SQL dialect (generic, snowflake, postgres, duckdb, tsql)")
 @click.option("--verbose", "-v", is_flag=True, help="Show detailed issue information")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
-@click.option("--calcite-url", default=None, help="Calcite service URL (default: http://localhost:8001)")
 @click.option("-d", "--database", type=click.Path(), help="DuckDB database for execution plan analysis")
 @click.option("--style", is_flag=True, help="Include style/convention rules (noisy)")
 def audit(
     file: str,
-    calcite: bool,
     dialect: str,
     verbose: bool,
     output_json: bool,
-    calcite_url: Optional[str],
     database: Optional[str],
     style: bool
 ):
@@ -279,7 +244,6 @@ def audit(
         qt-sql audit query.sql
         qt-sql audit query.sql -d mydb.duckdb
         qt-sql audit query.sql --style -v
-        qt-sql audit query.sql --calcite
     """
     try:
         sql = read_sql_file(file)
@@ -337,17 +301,6 @@ def audit(
         # Fall back to old display for backward compatibility
         display_analysis_result(result, verbose=verbose)
 
-    # Run Calcite optimization if requested
-    if calcite:
-        console.print("\n[bold]Running Calcite optimization...[/bold]")
-
-        async def run_calcite():
-            client = get_calcite_client(base_url=calcite_url)
-            return await client.optimize(sql)
-
-        calcite_result = asyncio.run(run_calcite())
-        display_calcite_result(calcite_result)
-
     # Exit with non-zero if critical/high issues found
     if result.critical_count > 0 or result.high_count > 0:
         sys.exit(1)
@@ -363,9 +316,9 @@ def audit(
 @click.option("--database", "-d", type=click.Path(), help="DuckDB database path for schema/execution plan context")
 @click.option("--show-prompt", is_flag=True, help="Display the full prompt sent to LLM")
 # DAG and MCTS options
-@click.option("--dag", is_flag=True, help="Use DAG node-level rewrites (recommended for complex queries)")
+@click.option("--dag", is_flag=True, help="Use DAG v2 + JSON v5 node-level rewrites (recommended)")
 @click.option("--mcts", is_flag=True, help="Use MCTS optimizer directly")
-@click.option("--mcts-on-failure", is_flag=True, help="Escalate to MCTS if DAG/DSPy fails")
+@click.option("--mcts-on-failure", is_flag=True, help="Escalate to MCTS if DAG v2 JSON v5 fails")
 @click.option("--mcts-iterations", default=30, help="Max MCTS iterations (default: 30)")
 @click.option("--mcts-parallel", default=4, help="MCTS parallel workers (default: 4)")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
@@ -393,7 +346,7 @@ def optimize(
     OPTIMIZATION MODES:
 
     \b
-    --dag              DAG-based node-level rewrites with DSPy validation.
+    --dag              DAG v2 + JSON v5 node-level rewrites with validation.
                        Recommended for complex queries with CTEs/subqueries.
                        Requires --database for validation.
 
@@ -444,18 +397,8 @@ def optimize(
         console.print("[red]Error: --database is required for --dag and --mcts modes[/red]")
         sys.exit(1)
 
-    # Get execution plan for DAG/MCTS modes
-    plan_text = ""
     if database:
         console.print(f"\n[bold]Database:[/bold] {database}")
-        try:
-            from qt_sql.execution.database_utils import run_explain_text
-            plan_text = run_explain_text(database, sql) or ""
-            if plan_text:
-                console.print(f"  Execution plan obtained ({len(plan_text)} chars)")
-        except Exception as e:
-            if verbose:
-                console.print(f"  [yellow]Warning: Could not get execution plan: {e}[/yellow]")
 
     # ============================================================
     # MODE 1: DAG-based optimization (recommended)
@@ -463,13 +406,14 @@ def optimize(
     if dag:
         optimized_sql = _run_dag_optimization(
             sql=sql,
-            plan=plan_text,
             database=database,
-            provider=provider or "deepseek",
+            provider=provider,
+            model=model,
             mcts_on_failure=mcts_on_failure,
             mcts_iterations=mcts_iterations,
             mcts_parallel=mcts_parallel,
             verbose=verbose,
+            show_prompt=show_prompt,
         )
 
         if optimized_sql:
@@ -629,75 +573,46 @@ Return ONLY the optimized SQL in a code block. No explanation needed.
 
 def _run_dag_optimization(
     sql: str,
-    plan: str,
     database: str,
-    provider: str,
+    provider: Optional[str],
+    model: Optional[str],
     mcts_on_failure: bool,
     mcts_iterations: int,
     mcts_parallel: int,
     verbose: bool,
+    show_prompt: bool,
 ) -> Optional[str]:
-    """Run DAG-based optimization with optional MCTS escalation.
-
-    Args:
-        sql: Original SQL query
-        plan: Execution plan text
-        database: Path to DuckDB database
-        provider: LLM provider name
-        mcts_on_failure: Whether to escalate to MCTS on failure
-        mcts_iterations: Max MCTS iterations
-        mcts_parallel: MCTS parallel workers
-        verbose: Verbose output
-
-    Returns:
-        Optimized SQL string, or None if all attempts failed
-    """
-    console.print("\n[bold blue]Running DAG optimization (node-level rewrites)...[/bold blue]")
+    """Run DAG v2 + JSON v5 optimization with optional MCTS escalation."""
+    console.print("\n[bold blue]Running DAG v2 + JSON v5 optimization...[/bold blue]")
 
     try:
-        import dspy
-        from qt_sql.optimization.dspy_optimizer import (
-            DagOptimizationPipeline,
-            create_duckdb_validator,
-            configure_lm,
-        )
+        from qt_sql.optimization import optimize_v5_json
 
-        # Configure DSPy LLM
-        console.print(f"  Configuring {provider} LLM...")
-        configure_lm(provider=provider)
-
-        # Create validator
-        console.print(f"  Creating validator for {database}...")
-        validator = create_duckdb_validator(database)
-
-        # Create DAG pipeline
-        pipeline = DagOptimizationPipeline(
-            validator_fn=validator,
-            max_retries=2,
-            model_name=provider,
-            db_name="duckdb"
-        )
-
-        # Run optimization
         start_time = time.time()
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            task = progress.add_task("Optimizing with DAG pipeline...", total=None)
-            result = pipeline(sql=sql, plan=plan)
+            progress.add_task("Optimizing with DAG v2 + JSON v5...", total=None)
+            result = optimize_v5_json(
+                sql=sql,
+                sample_db=database,
+                provider=provider,
+                model=model,
+            )
         elapsed = time.time() - start_time
 
-        console.print(f"  Completed in {elapsed:.1f}s, attempts={result.attempts}")
+        console.print(f"  Completed in {elapsed:.1f}s, status={result.status.value}")
 
-        if result.correct:
-            console.print(f"[green]DAG optimization succeeded![/green]")
-            if verbose and result.explanation:
-                console.print(f"  [dim]Explanation: {result.explanation[:100]}...[/dim]")
+        if show_prompt:
+            console.print("\n[bold]DAG v2 Prompt Sent to LLM:[/bold]")
+            console.print(Panel(result.prompt, title="LLM Prompt", border_style="blue"))
+
+        if result.status == ValidationStatus.PASS and result.optimized_sql:
+            console.print("[green]DAG optimization succeeded![/green]")
             return result.optimized_sql
 
-        # DAG failed
         error_preview = (result.error or "Unknown")[:60]
         console.print(f"[yellow]DAG optimization failed: {error_preview}...[/yellow]")
 
@@ -711,14 +626,10 @@ def _run_dag_optimization(
                 parallel=mcts_parallel,
                 verbose=verbose,
             )
-        else:
-            console.print("[dim]Use --mcts-on-failure to escalate to MCTS search[/dim]")
-            return None
 
-    except ImportError as e:
-        console.print(f"[red]Error: Missing dependency for DAG mode: {e}[/red]")
-        console.print("[dim]Install with: pip install dspy-ai[/dim]")
-        sys.exit(1)
+        console.print("[dim]Use --mcts-on-failure to escalate to MCTS search[/dim]")
+        return None
+
     except Exception as e:
         console.print(f"[red]DAG optimization error: {e}[/red]")
         if verbose:

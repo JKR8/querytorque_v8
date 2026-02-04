@@ -1,29 +1,37 @@
 """PUCT prior computation for MCTS transform selection.
 
-This module provides prior probability computation for transforms using:
-1. Knowledge base weights (baseline)
-2. Opportunity detection boosts (context-aware)
-3. LLM ranking (optional, batched)
+This module computes prior probabilities for transforms using:
+1) Knowledge-base weights (baseline)
+2) Opportunity detection (contextual boosts)
+3) Optional LLM ranking (when enabled + triggered)
 
-The priors guide MCTS selection via PUCT formula:
+The priors guide MCTS selection via PUCT:
     PUCT = Q(s,a) + c * P(s,a) * sqrt(N(s)) / (1 + N(s,a))
-
-Usage:
-    from qt_sql.optimization.mcts.priors import (
-        PriorConfig,
-        TransformPrior,
-        compute_uniform_priors,
-        compute_contextual_priors,
-    )
-
-    config = PriorConfig(use_opportunity_detection=True)
-    priors = compute_contextual_priors(sql, candidates, applied, config)
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
+
+from ..knowledge_base import detect_opportunities, get_transform
+
+
+# Knowledge-base weights (1-10). Higher = more promising transform.
+# These are used as a baseline prior distribution.
+KB_WEIGHTS: dict[str, int] = {
+    "correlated_to_cte": 9,
+    "push_pred": 8,
+    "or_to_union": 8,
+    "date_cte_isolate": 7,
+    "consolidate_scans": 7,
+    "multi_push_pred": 6,
+    "materialize_cte": 5,
+    "flatten_subq": 5,
+    "reorder_join": 4,
+    "inline_cte": 3,
+    "remove_redundant": 2,
+}
 
 
 @dataclass
@@ -33,18 +41,19 @@ class TransformPrior:
     Attributes:
         transform_id: Canonical transform ID (e.g., "push_pred").
         prior: Prior probability (0.0 to 1.0), normalized across candidates.
-        source: How this prior was computed ("kb_weight", "contextual", "llm_rank", "uniform").
-        boost_reason: Optional explanation if this prior was boosted.
+        source: How this prior was computed ("llm_rank" or "uniform").
+        reason: Optional explanation for this prior value.
     """
 
     transform_id: str
     prior: float
     source: str
+    reason: Optional[str] = None
     boost_reason: Optional[str] = None
 
     def __repr__(self) -> str:
-        boost = f" ({self.boost_reason})" if self.boost_reason else ""
-        return f"TransformPrior({self.transform_id}: {self.prior:.3f} via {self.source}{boost})"
+        reason = f" ({self.reason})" if self.reason else ""
+        return f"TransformPrior({self.transform_id}: {self.prior:.3f} via {self.source}{reason})"
 
 
 @dataclass
@@ -53,19 +62,19 @@ class PriorConfig:
 
     Attributes:
         use_puct: Enable PUCT selection. If False, uses original random selection.
-        use_kb_weights: Use knowledge base weights as baseline priors.
+        use_kb_weights: Use KB weights as baseline prior.
         use_opportunity_detection: Boost priors for detected opportunities.
-        use_llm_ranking: Use LLM to rank transforms (Phase 3).
-        opportunity_boost: Multiplier for detected opportunities (1.5 = 50% boost).
-        high_value_boost: Multiplier for high-value category transforms.
-        diminishing_returns_penalty: Multiplier for already-applied transforms.
+        use_llm_ranking: Enable LLM-based ranking (gated by should_use_llm_ranking).
+        opportunity_boost: Multiplier for detected opportunities.
+        high_value_boost: Multiplier for high_value category transforms.
+        diminishing_returns_penalty: Penalty for re-applying already-used transforms.
         llm_timeout_ms: Timeout for LLM ranking calls.
         c_puct: PUCT exploration constant.
         widening_factor: Progressive widening factor (k = factor * sqrt(visits)).
         min_widening: Minimum number of candidates to consider.
     """
 
-    use_puct: bool = True  # Set to False for original random selection
+    use_puct: bool = True
     use_kb_weights: bool = True
     use_opportunity_detection: bool = True
     use_llm_ranking: bool = False
@@ -78,48 +87,56 @@ class PriorConfig:
     min_widening: int = 2
 
 
-# Pre-defined configs for easy comparison
-PUCT_CONFIG = PriorConfig(use_puct=True)  # Default PUCT with KB weights + opportunity detection
-RANDOM_CONFIG = PriorConfig(use_puct=False)  # Original random selection
-PUCT_LLM_CONFIG = PriorConfig(use_puct=True, use_llm_ranking=True)  # Full PUCT with LLM
+# Pre-defined configs for A/B comparison
+RANDOM_CONFIG = PriorConfig(
+    use_puct=False,
+    use_kb_weights=False,
+    use_opportunity_detection=False,
+    use_llm_ranking=False,
+)
+PUCT_CONFIG = PriorConfig(
+    use_puct=True,
+    use_kb_weights=True,
+    use_opportunity_detection=True,
+    use_llm_ranking=False,
+)
+PUCT_LLM_CONFIG = PriorConfig(
+    use_puct=True,
+    use_kb_weights=True,
+    use_opportunity_detection=True,
+    use_llm_ranking=True,
+)
+
+# Legacy config name for backwards compatibility
+PUCT_NO_LLM_CONFIG = PUCT_CONFIG
 
 
 def compute_uniform_priors(transform_ids: list[str]) -> dict[str, TransformPrior]:
-    """Compute uniform priors based on knowledge base weights.
-
-    Transforms with higher KB weights get proportionally higher priors.
-    Priors are normalized to sum to 1.0.
+    """Compute priors from KB weights (baseline, no context).
 
     Args:
         transform_ids: List of transform IDs to compute priors for.
 
     Returns:
-        Dict mapping transform_id to TransformPrior.
+        Dict mapping transform_id to TransformPrior with KB-weighted priors.
     """
-    from ..knowledge_base import get_transform
-
     if not transform_ids:
         return {}
 
-    # Get weights from knowledge base (default 5 if not found)
-    weights: dict[str, float] = {}
-    for tid in transform_ids:
-        pattern = get_transform(tid)
-        weights[tid] = float(pattern.weight) if pattern else 5.0
-
-    # Normalize to sum to 1.0
-    total = sum(weights.values())
-    if total == 0:
-        total = len(transform_ids)
-        weights = {tid: 1.0 for tid in transform_ids}
+    weights = [float(KB_WEIGHTS.get(tid, 3)) for tid in transform_ids]
+    total = sum(weights)
+    if total <= 0:
+        total = float(len(transform_ids))
+        weights = [1.0 for _ in transform_ids]
 
     return {
         tid: TransformPrior(
             transform_id=tid,
-            prior=w / total,
+            prior=weights[i] / total,
             source="kb_weight",
+            reason=f"kb_weight={KB_WEIGHTS.get(tid, 3)}",
         )
-        for tid, w in weights.items()
+        for i, tid in enumerate(transform_ids)
     }
 
 
@@ -129,86 +146,65 @@ def compute_contextual_priors(
     applied_transforms: list[str],
     config: PriorConfig,
 ) -> dict[str, TransformPrior]:
-    """Compute context-aware priors with opportunity detection and boosts.
+    """Compute contextual priors using KB weights + opportunity detection.
 
-    Enhances uniform priors with:
-    1. Opportunity boost: transforms matched by detect_opportunities() get boosted
-    2. High-value boost: high_value category transforms get boosted
-    3. Diminishing returns: already-applied transforms get penalized
-
-    Args:
-        sql: Current SQL query to analyze.
-        transform_ids: List of candidate transform IDs.
-        applied_transforms: Transforms already applied in current path.
-        config: Prior configuration.
-
-    Returns:
-        Dict mapping transform_id to TransformPrior with contextual adjustments.
+    Applies:
+    - KB weights (optional)
+    - Opportunity boosts (optional)
+    - High-value boosts (optional)
+    - Diminishing returns penalty for already-applied transforms
     """
-    from ..knowledge_base import detect_opportunities, get_transform
-
     if not transform_ids:
         return {}
 
-    # Start with uniform KB-weighted priors
-    if config.use_kb_weights:
-        priors = compute_uniform_priors(transform_ids)
-    else:
-        # Pure uniform
-        uniform_p = 1.0 / len(transform_ids)
-        priors = {
-            tid: TransformPrior(tid, uniform_p, "uniform")
-            for tid in transform_ids
-        }
+    applied_set = set(applied_transforms)
+    opportunities = detect_opportunities(sql) if config.use_opportunity_detection else []
+    opportunity_ids = {o.pattern.id.value for o in opportunities}
+    opportunity_reasons = {o.pattern.id.value: o.trigger_match for o in opportunities}
 
-    # Detect opportunities if enabled
-    opportunity_ids: set[str] = set()
-    if config.use_opportunity_detection:
-        opportunities = detect_opportunities(sql)
-        opportunity_ids = {opp.pattern.id.value for opp in opportunities}
-
-    # Apply boosts and build adjusted weights
-    adjusted_weights: dict[str, float] = {}
-    boost_reasons: dict[str, str] = {}
+    weights: dict[str, float] = {}
+    reasons: dict[str, list[str]] = {}
 
     for tid in transform_ids:
-        weight = priors[tid].prior
-        reasons = []
+        base = float(KB_WEIGHTS.get(tid, 3)) if config.use_kb_weights else 1.0
+        reasons[tid] = []
+
+        # High-value boost (from KB category)
+        if config.high_value_boost and config.high_value_boost != 1.0:
+            pattern = get_transform(tid)
+            if pattern and pattern.category == "high_value":
+                base *= config.high_value_boost
+                reasons[tid].append("high_value")
 
         # Opportunity boost
         if tid in opportunity_ids:
-            weight *= config.opportunity_boost
-            reasons.append(f"opportunity:{tid}")
+            base *= config.opportunity_boost
+            trigger = opportunity_reasons.get(tid, "opportunity detected")
+            reasons[tid].append(f"opportunity: {trigger}")
 
-        # High-value category boost
-        pattern = get_transform(tid)
-        if pattern and pattern.category == "high_value":
-            weight *= config.high_value_boost
-            reasons.append("high_value")
+        # Diminishing returns for repeated transforms
+        if tid in applied_set:
+            base *= config.diminishing_returns_penalty
+            reasons[tid].append("diminishing_returns")
 
-        # Diminishing returns for applied transforms
-        if tid in applied_transforms:
-            weight *= config.diminishing_returns_penalty
-            reasons.append("already_applied")
+        weights[tid] = base
 
-        adjusted_weights[tid] = weight
-        if reasons:
-            boost_reasons[tid] = ", ".join(reasons)
+    total = sum(weights.values())
+    if total <= 0:
+        total = float(len(transform_ids))
+        weights = {tid: 1.0 for tid in transform_ids}
 
-    # Re-normalize to sum to 1.0
-    total = sum(adjusted_weights.values())
-    if total == 0:
-        total = 1.0
-
-    return {
-        tid: TransformPrior(
+    priors: dict[str, TransformPrior] = {}
+    for tid in transform_ids:
+        boost_reason = "; ".join(reasons[tid]) if reasons[tid] else None
+        priors[tid] = TransformPrior(
             transform_id=tid,
-            prior=w / total,
-            source="contextual",
-            boost_reason=boost_reasons.get(tid),
+            prior=weights[tid] / total,
+            source="contextual" if (config.use_kb_weights or config.use_opportunity_detection) else "uniform",
+            boost_reason=boost_reason,
         )
-        for tid, w in adjusted_weights.items()
-    }
+
+    return priors
 
 
 def get_priors_for_node(
@@ -218,13 +214,21 @@ def get_priors_for_node(
     config: PriorConfig,
     llm_client=None,
     query_context: Optional[dict] = None,
+    attempt_summary: Optional[dict] = None,
 ) -> dict[str, TransformPrior]:
-    """Get priors for a node, using LLM ranking if enabled and triggered.
+    """Get priors for a node using LLM ranking or contextual fallback.
 
-    This is the main entry point for prior computation. It:
-    1. Computes contextual priors as baseline
-    2. Optionally calls LLM ranking if enabled and conditions are met
-    3. Falls back gracefully on LLM errors
+    This is the main entry point for prior computation.
+
+    When LLM ranking is enabled:
+    - LLM analyzes the query structure and execution plan
+    - Reviews previous attempt results (what worked, what failed)
+    - Determines which transforms are applicable
+    - Ranks by likelihood of performance improvement
+
+    Fallback (LLM disabled or fails):
+    - Pure uniform priors
+    - MCTS exploration discovers what works
 
     Args:
         sql: Current SQL query.
@@ -232,23 +236,25 @@ def get_priors_for_node(
         applied_transforms: Already-applied transforms in path.
         config: Prior configuration.
         llm_client: Optional LLM client for ranking.
-        query_context: Optional context dict with tables, has_ctes, etc.
+        query_context: Optional context dict with plan, etc.
+        attempt_summary: Optional dict of previous attempt results per transform.
 
     Returns:
         Dict mapping transform_id to TransformPrior.
     """
-    # Always compute contextual priors as baseline/fallback
-    contextual_priors = compute_contextual_priors(
-        sql, transform_ids, applied_transforms, config
-    )
+    if not transform_ids:
+        return {}
 
-    # If LLM ranking not enabled or no client, return contextual
+    # If LLM ranking not enabled or no client, return contextual priors
     if not config.use_llm_ranking or llm_client is None:
-        return contextual_priors
+        return compute_contextual_priors(sql, transform_ids, applied_transforms, config)
 
-    # Try LLM ranking
+    # Try LLM ranking - the LLM analyzes the query and ranks transforms
     try:
         from .llm_ranker import rank_transforms_llm, ranking_to_priors
+
+        # Extract execution plan from query_context if available
+        execution_plan = query_context.get("plan") if query_context else None
 
         ranking = rank_transforms_llm(
             candidates=transform_ids,
@@ -257,6 +263,8 @@ def get_priors_for_node(
             llm_client=llm_client,
             timeout_ms=config.llm_timeout_ms,
             query_context=query_context,
+            execution_plan=execution_plan,
+            attempt_summary=attempt_summary,
         )
 
         if ranking:
@@ -271,7 +279,8 @@ def get_priors_for_node(
             }
 
     except Exception:
-        # Fallback to contextual on any error
+        # Fallback to uniform on any error
         pass
 
-    return contextual_priors
+    # LLM failed - use contextual priors
+    return compute_contextual_priors(sql, transform_ids, applied_transforms, config)

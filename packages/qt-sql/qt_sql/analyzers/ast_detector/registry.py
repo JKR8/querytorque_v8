@@ -12,6 +12,12 @@ from typing import Optional
 
 from .base import ASTRule
 from .rules import (
+    # Gold Standard Rules (verified transforms)
+    EarlyFilterPushdownGold,
+    ProjectionPruningGold,
+    CorrelatedSubqueryGold,
+    DecorrelateSubqueryGold,
+    OrToUnionGold,
     # SELECT
     SelectStarRule,
     ScalarSubqueryInSelectRule,
@@ -155,6 +161,12 @@ from .rules import (
     JoinReorderOpportunity,            # QT-OPT-009: reorder_join
     InlineCTEOpportunity,              # QT-OPT-010: inline_cte
     RemoveRedundantOpportunity,        # QT-OPT-011: remove_redundant
+    # Gold Standard Rules - Verified transforms with proven speedups
+    EarlyFilterPushdownGold,           # GLD-003: early_filter (2.71x proven)
+    ProjectionPruningGold,             # GLD-004: projection_prune (1.21x proven)
+    CorrelatedSubqueryGold,            # GLD-005: correlated_subquery (1.80x avg)
+    DecorrelateSubqueryGold,           # GLD-001: decorrelate (2.81x proven)
+    OrToUnionGold,                     # GLD-002: or_to_union (2.67x proven)
     # Snowflake
     CopyIntoWithoutFileFormatRule,
     SelectWithoutLimitOrSampleRule,
@@ -366,6 +378,13 @@ _ALL_RULES: list[ASTRule] = [
     JoinReorderOpportunity(),            # QT-OPT-009: reorder_join
     InlineCTEOpportunity(),              # QT-OPT-010: inline_cte
     RemoveRedundantOpportunity(),        # QT-OPT-011: remove_redundant
+
+    # Gold Standard Rules - Verified transforms with proven speedups from benchmarks
+    EarlyFilterPushdownGold(),           # GLD-003: early_filter (2.71x, 1.84x proven)
+    ProjectionPruningGold(),             # GLD-004: projection_prune (1.21x proven)
+    CorrelatedSubqueryGold(),            # GLD-005: correlated_subquery (1.80x avg)
+    DecorrelateSubqueryGold(),           # GLD-001: decorrelate (2.81x proven)
+    OrToUnionGold(),                     # GLD-002: or_to_union (2.67x proven)
 ]
 
 # Rule lookup by ID

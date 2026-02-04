@@ -1,0 +1,47 @@
+Looking at this query pattern, I can see two main optimization opportunities:
+
+1. **Correlated subquery**: The main query has a correlated subquery `WHERE ctr1.ctr_total_return > (SELECT AVG(ctr_total_return) * 1.2 FROM customer_total_return AS ctr2 WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk)`. This forces execution of the subquery for each row in the outer query.
+
+2. **Filter pushdown**: The `s_state = 'SD'` filter on the store table could be pushed down earlier to reduce the amount of data processed in the CTE.
+
+However, I need to be careful because the CTE `customer_total_return` is referenced twice - once in the main FROM clause and once in the correlated subquery. This is actually a perfect case for decorrelation.
+
+Let me apply the decorrelation transform to eliminate the correlated subquery by pre-computing the average per store:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "decorrelate",
+      "nodes": {
+        "store_avg_return": "SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk",
+        "customer_total_return": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns, date_dim WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000 GROUP BY sr_customer_sk, sr_store_sk",
+        "main_query": "/* start query 1 in stream 0 using template query1.tpl */ WITH customer_total_return AS (SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns, date_dim WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000 GROUP BY sr_customer_sk, sr_store_sk), store_avg_return AS (SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk) SELECT c_customer_id FROM customer_total_return AS ctr1 JOIN store_avg_return AS sar ON ctr1.ctr_store_sk = sar.ctr_store_sk JOIN store ON s_store_sk = ctr1.ctr_store_sk JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk WHERE ctr1.ctr_total_return > sar.avg_return_threshold AND s_state = 'SD' ORDER BY c_customer_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same aggregation logic",
+        "same ordering"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "pushdown",
+      "nodes": {
+        "customer_total_return": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns, date_dim WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000 GROUP BY sr_customer_sk, sr_store_sk",
+        "main_query": "/* start query 1 in stream 0 using template query1.tpl */ WITH customer_total_return AS (SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns, date_dim WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000 GROUP BY sr_customer_sk, sr_store_sk), store_avg_return AS (SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk), filtered_stores AS (SELECT s_store_sk FROM store WHERE s_state = 'SD') SELECT c_customer_id FROM customer_total_return AS ctr1 JOIN store_avg_return AS sar ON ctr1.ctr_store_sk = sar.ctr_store_sk JOIN filtered_stores ON s_store_sk = ctr1.ctr_store_sk JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk WHERE ctr1.ctr_total_return > sar.avg_return_threshold ORDER BY c_customer_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same join relationships"
+      ],
+      "expected_speedup": "1.3x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Applied two transforms: 1) Decorrelated the subquery by creating a CTE that pre-computes the average return threshold per store, allowing a simple join instead of correlated execution. 2) Pushed down the store filter (s_state = 'SD') into a separate CTE to reduce the join size early. The decorrelation eliminates the N+1 query pattern where the subquery executes for each outer row, while the filter pushdown reduces the amount of data flowing through the joins."
+}
+```

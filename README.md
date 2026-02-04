@@ -28,13 +28,13 @@ QueryTorque is a comprehensive query optimization platform for SQL and DAX. It a
                   +------+------+
                          |
     +--------------------+--------------------+
-    |                    |                    |
-    v                    v                    v
-+----------+      +------------+      +-------------+
-|PostgreSQL|      | Qt-Calcite |      |  LLM APIs   |
-|  (Data)  |      |   (Java)   |      | (Anthropic) |
-|Port: 5432|      | Port: 8001 |      +-------------+
-+----------+      +------------+
+    |                                         |
+    v                                         v
++----------+                           +-------------+
+|PostgreSQL|                           |  LLM APIs   |
+|  (Data)  |                           | (Anthropic) |
+|Port: 5432|                           +-------------+
++----------+
 
 Package Structure:
 ==================
@@ -46,9 +46,6 @@ packages/
       database/    # SQLAlchemy models, migrations
       llm/         # Multi-provider LLM client
       config/      # Settings management
-
-  qt-calcite/      # SQL parsing service (Java)
-    src/main/java/ # Apache Calcite integration
 
   qt-sql/          # SQL optimization product (Python)
     qt_sql/
@@ -80,7 +77,6 @@ packages/
 - Python 3.11+
 - Docker and Docker Compose
 - Node.js 18+ (for UI development)
-- Java 17+ (for Qt-Calcite development)
 
 ### Development Setup
 
@@ -98,8 +94,8 @@ cp .env.example .env
 2. **Start infrastructure services**
 
 ```bash
-# Start PostgreSQL and Qt-Calcite
-docker-compose up -d postgres qt-calcite
+# Start PostgreSQL
+docker-compose up -d postgres
 
 # Wait for services to be healthy
 docker-compose ps
@@ -111,6 +107,9 @@ docker-compose ps
 # Create virtual environment
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Verify you're using the root venv
+./scripts/check-venv.sh
 
 # Install packages in development mode
 pip install -e packages/qt-shared[dev,all-llm]

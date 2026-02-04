@@ -10,7 +10,6 @@
 |------|-------|
 | **Benchmark Results** | `BENCHMARKS.md` |
 | **Shared Infrastructure** | `packages/qt-shared/` |
-| **Calcite Optimizer** | `packages/qt-calcite/` |
 | **SQL Product** | `packages/qt-sql/` |
 | **DAX Product** | `packages/qt-dax/` |
 | **Shared UI Components** | `packages/qt-ui-shared/` |
@@ -32,17 +31,11 @@ QueryTorque_V8/
 │   │   │   └── config/         # Settings class
 │   │   └── pyproject.toml
 │   │
-│   ├── qt-calcite/             # Java Calcite Service
-│   │   ├── src/main/java/      # Java source
-│   │   ├── api/                # FastAPI wrapper
-│   │   └── build.gradle.kts
-│   │
 │   ├── qt-sql/                 # SQL Optimization Product
 │   │   ├── qt_sql/
 │   │   │   ├── analyzers/      # AST detector, 119 SQL rules
 │   │   │   ├── execution/      # DuckDB, Postgres executors
 │   │   │   ├── templates/      # sql_report.html.j2
-│   │   │   └── calcite_client.py
 │   │   ├── cli/                # qt-sql CLI
 │   │   ├── api/                # FastAPI backend
 │   │   └── web/                # React frontend (sql.querytorque.com)
@@ -85,7 +78,6 @@ QueryTorque_V8/
 | Database | Single shared DB | Unified user/org/billing |
 | Auth | Single Auth0 tenant | SSO across both apps |
 | Web apps | Separate subdomains | Independent deployments |
-| qt-calcite | Optional service | qt-sql works without it |
 
 ---
 
@@ -94,7 +86,6 @@ QueryTorque_V8/
 ### qt-sql CLI
 ```bash
 qt-sql audit <file.sql>              # Static analysis
-qt-sql audit <file.sql> --calcite    # Include Calcite optimization
 qt-sql optimize <file.sql>           # LLM-powered optimization
 qt-sql validate <orig.sql> <opt.sql> # Validate optimization
 ```
@@ -117,9 +108,6 @@ qt-dax connect                       # Connect to Power BI Desktop
 docker compose up
 
 # Or individually:
-# Calcite (port 8001)
-cd packages/qt-calcite && ./gradlew fatJar && python api/main.py
-
 # SQL API (port 8002)
 cd packages/qt-sql && python -m uvicorn api.main:app --port 8002
 
@@ -154,9 +142,6 @@ QT_STRIPE_WEBHOOK_SECRET=whsec_xxx
 QT_LLM_PROVIDER=groq  # or: anthropic, deepseek, openai, gemini-api
 QT_GROQ_API_KEY=xxx
 
-# Calcite
-QTCALCITE_URL=http://localhost:8001
-DEEPSEEK_API_KEY=xxx  # For Calcite's LLM optimization
 ```
 
 ---
@@ -167,7 +152,6 @@ DEEPSEEK_API_KEY=xxx  # For Calcite's LLM optimization
 qt-shared (standalone)
     ↑
     ├── qt-sql (depends on qt-shared)
-    │     └── qt-calcite (optional, HTTP)
     │
     └── qt-dax (depends on qt-shared)
 
@@ -185,9 +169,6 @@ qt-ui-shared (standalone React)
 ```bash
 # qt-shared tests
 cd packages/qt-shared && pytest tests/ -v
-
-# qt-calcite tests
-cd packages/qt-calcite && ./gradlew test
 
 # qt-sql tests
 cd packages/qt-sql && pytest tests/ -v
@@ -282,10 +263,5 @@ Examples:
                       ┌─────────┴─────────┐
                       │  Shared Database  │
                       │   (PostgreSQL)    │
-                      └───────────────────┘
-                                │
-                      ┌─────────┴─────────┐
-                      │   qt-calcite      │
-                      │   :8001           │
                       └───────────────────┘
 ```

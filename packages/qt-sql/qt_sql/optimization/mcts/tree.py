@@ -1,921 +1,267 @@
-"""MCTS tree operations: selection, expansion, simulation, backpropagation."""
+"""MCTS tree implementation using PUCT and deterministic transforms."""
 
 from __future__ import annotations
 
-import logging
-import math
-import random
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from typing import Optional, Callable, Any
+from dataclasses import dataclass
+from typing import Optional
+import re
 
 from .node import MCTSNode
-from .transforms import get_all_transform_ids, apply_transformation, apply_dag_transformation
-from .reward import compute_reward, RewardConfig
-from .priors import PriorConfig, TransformPrior, compute_contextual_priors, get_priors_for_node
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class TransformAttempt:
-    """Record of a single transformation attempt for detailed logging."""
-
-    iteration: int
-    parent_path: list[str]  # Transforms applied to reach parent
-    transform_id: str
-    timestamp: float
-    duration_ms: int = 0
-
-    # LLM results
-    llm_success: bool = False
-    llm_error: Optional[str] = None
-    output_sql: Optional[str] = None
-    sql_changed: bool = False
-
-    # Validation results
-    validated: bool = False
-    validation_status: Optional[str] = None
-    validation_error: Optional[str] = None
-    speedup: float = 1.0
-    original_rows: int = 0
-    optimized_rows: int = 0
-
-    # UCT context
-    uct_score: float = 0.0
-    parent_visits: int = 0
-
-    # Reward
-    reward: float = 0.0
-
-    def to_dict(self, include_full_sql: bool = False) -> dict:
-        """Convert to dictionary for JSON serialization.
-
-        Args:
-            include_full_sql: If True, include full output_sql. Otherwise truncate to 200 chars.
-        """
-        result = {
-            "iteration": self.iteration,
-            "parent_path": self.parent_path,
-            "transform_id": self.transform_id,
-            "duration_ms": self.duration_ms,
-            "llm_success": self.llm_success,
-            "llm_error": self.llm_error,
-            "sql_changed": self.sql_changed,
-            "validated": self.validated,
-            "validation_status": self.validation_status,
-            "validation_error": self.validation_error,
-            "speedup": round(self.speedup, 4),
-            "original_rows": self.original_rows,
-            "optimized_rows": self.optimized_rows,
-            "uct_score": round(self.uct_score, 4),
-            "parent_visits": self.parent_visits,
-            "reward": round(self.reward, 4),
-        }
-
-        if include_full_sql:
-            result["output_sql"] = self.output_sql
-        else:
-            result["output_sql_preview"] = (
-                (self.output_sql[:200] + "...") if self.output_sql and len(self.output_sql) > 200
-                else self.output_sql
-            )
-
-        return result
+from .policy import PolicyNetwork
+from .benchmark import BenchmarkRunner
+from .transforms import apply_transform, get_all_transform_ids
+from qt_sql.validation import SQLValidator
+from qt_sql.validation.schemas import ValidationMode, ValidationStatus
 
 
 @dataclass
-class SelectionStep:
-    """Record of a UCT selection decision."""
+class MCTSConfig:
+    c_puct: float = 1.0
+    fpu: float = 1.5
+    max_depth: int = 5
+    validate: bool = True
+    validation_mode: ValidationMode = ValidationMode.SAMPLE
+    validation_sample_pct: float = 1.0
+    transposition_min_score: float = 0.01
 
-    node_path: list[str]
-    candidates: list[dict]  # [{transform_id, uct_score, visits, avg_reward}]
-    selected: str
-    reason: str  # "uct_best", "untried", "terminal"
 
-    def to_dict(self) -> dict:
-        return {
-            "node_path": self.node_path,
-            "candidates": self.candidates,
-            "selected": self.selected,
-            "reason": self.reason,
-        }
+@dataclass
+class TranspositionStats:
+    visits: int = 0
+    value_sum: float = 0.0
+
+    @property
+    def avg_reward(self) -> float:
+        if self.visits == 0:
+            return 0.0
+        return self.value_sum / self.visits
 
 
 class MCTSTree:
-    """Monte Carlo Tree Search operations for SQL optimization.
-
-    Implements the four phases of MCTS:
-    1. Selection: Walk tree picking best UCT child until unexpanded node
-    2. Expansion: Pick untried transform, call LLM, create child node
-    3. Simulation: Evaluate node quality via validation
-    4. Backpropagation: Update visit counts and rewards up to root
-
-    Attributes:
-        root: Root node (original query).
-        llm_client: LLM client for applying transformations.
-        validator: SQL validator for checking equivalence and timing.
-        original_sql: The original query being optimized.
-        reward_config: Configuration for reward computation.
-        c: UCT exploration constant.
-        max_depth: Maximum tree depth.
-    """
+    """Hybrid MCTS tree: deterministic transforms + trimmed mean reward."""
 
     def __init__(
         self,
+        *,
         original_sql: str,
-        llm_client: Any,
-        validator: Any,
-        reward_config: Optional[RewardConfig] = None,
-        prior_config: Optional[PriorConfig] = None,
-        c: float = 1.414,
-        max_depth: int = 5,
+        policy: PolicyNetwork,
+        benchmark: BenchmarkRunner,
+        config: Optional[MCTSConfig] = None,
         transform_ids: Optional[list[str]] = None,
-        use_dag_mode: bool = True,
+        validator: Optional[SQLValidator] = None,
     ):
-        """Initialize MCTS tree.
-
-        Args:
-            original_sql: The original SQL query to optimize.
-            llm_client: LLM client with analyze() method.
-            validator: SQLValidator instance.
-            reward_config: Configuration for reward computation.
-            prior_config: Configuration for PUCT prior computation.
-            c: UCT exploration constant. Higher = more exploration.
-            max_depth: Maximum depth of transformations to chain.
-            transform_ids: List of transformation IDs to use.
-                          If None, uses all available transforms.
-            use_dag_mode: Use DAG-based node patching (default True).
-        """
         self.original_sql = original_sql
-        self.llm_client = llm_client
+        self.policy = policy
+        self.benchmark = benchmark
+        self.config = config or MCTSConfig()
+        self.transform_ids = transform_ids or get_all_transform_ids()
         self.validator = validator
-        self.reward_config = reward_config or RewardConfig()
-        self.prior_config = prior_config or PriorConfig()
-        self.c = c
-        self.max_depth = max_depth
-        self.use_dag_mode = use_dag_mode
+        self._transform_cache: dict[tuple[str, str], Optional[str]] = {}
+        self._validation_cache: dict[str, bool] = {}
+        self._hash_cache: dict[str, str] = {}
+        self._transposition: dict[str, dict[str, TranspositionStats]] = {}
 
-        # Initialize transform IDs
-        if transform_ids is None:
-            transform_ids = get_all_transform_ids()
-        self.transform_ids = transform_ids
-
-        # Create root node
-        self.root = MCTSNode(
-            query_sql=original_sql,
-            applied_transforms=[],
-            remaining_transforms=list(transform_ids),
-            depth=0,
-        )
-
-        # Statistics
+        root_hash = self._get_state_hash(original_sql)
+        self.root = MCTSNode(query_sql=original_sql, state_hash=root_hash)
         self.total_iterations = 0
-        self.successful_expansions = 0
-        self.failed_expansions = 0
-        self.validation_calls = 0
-        self.llm_ranking_calls = 0
 
-        # Detailed logging
-        self.transform_attempts: list[TransformAttempt] = []
-        self.selection_steps: list[SelectionStep] = []
+        if self.config.validate and self.validator is None:
+            self.validator = SQLValidator(
+                database=self.benchmark.database,
+                mode=self.config.validation_mode,
+                sample_pct=self.config.validation_sample_pct,
+            )
 
-        # Cache priors per node (keyed by tuple of applied_transforms)
-        self._prior_cache: dict[tuple[str, ...], dict[str, TransformPrior]] = {}
+        baseline = self.benchmark.run_query_robust(original_sql)
+        self.baseline_latency_s = baseline.latency_s
 
-    def select(
+    def _get_state_hash(self, sql: str) -> str:
+        cached = self._hash_cache.get(sql)
+        if cached is not None:
+            return cached
+
+        normalized = sql.strip()
+        normalized = re.sub(r"\s+", " ", normalized)
+        normalized = normalized.lower()
+        self._hash_cache[sql] = normalized
+        return normalized
+
+    def _get_ancestor_hashes(self, node: MCTSNode) -> set[str]:
+        hashes: set[str] = set()
+        current = node
+        while current is not None:
+            hashes.add(current.state_hash)
+            current = current.parent
+        return hashes
+
+    def _get_transposition_priors(
         self,
-        node: Optional[MCTSNode] = None,
-        log_selection: bool = True,
-    ) -> tuple[MCTSNode, Optional[str]]:
-        """Select a node (and optionally an action) for expansion.
+        state_hash: str,
+        available_rules: list[str],
+    ) -> Optional[dict[str, float]]:
+        stats_by_rule = self._transposition.get(state_hash)
+        if not stats_by_rule:
+            return None
 
-        In PUCT mode, actions (tried and untried) compete using PUCT scores.
-        If the best action is untried, return the current node plus that
-        transform to expand. In UCT mode, return the first node that has
-        untried transforms.
-        """
-        if node is None:
-            node = self.root
+        priors: dict[str, float] = {}
+        for rule in available_rules:
+            stats = stats_by_rule.get(rule)
+            if stats is None:
+                continue
+            priors[rule] = max(stats.avg_reward, self.config.transposition_min_score)
 
-        while True:
-            # If at max depth, return this node
-            if node.depth >= self.max_depth:
-                if log_selection:
-                    self.selection_steps.append(SelectionStep(
-                        node_path=node.applied_transforms,
-                        candidates=[],
-                        selected="",
-                        reason="max_depth_reached",
-                    ))
-                return node, None
+        if not priors:
+            return None
 
-            untried = node.get_untried_transforms()
+        total = sum(priors.values())
+        if total <= 0:
+            uniform = 1.0 / len(available_rules)
+            return {rule: uniform for rule in available_rules}
 
-            # PUCT mode: choose best action (tried or untried)
-            if untried and self.prior_config.use_puct:
-                priors = self._get_priors(node)
-                best_score = float("-inf")
-                best_action: Optional[str] = None
-                candidates = []
+        return {rule: score / total for rule, score in priors.items()}
 
-                for tid in node.remaining_transforms:
-                    prior = priors.get(tid)
-                    p = prior.prior if prior else 1.0 / max(len(node.remaining_transforms), 1)
-                    if tid in node.children:
-                        child = node.children[tid]
-                        score = child.puct_score(node.visit_count, p, self.prior_config.c_puct)
-                        visits = child.visit_count
-                        avg_reward = child.avg_reward
-                        is_valid = child.is_valid
-                        speedup = child.speedup
-                        status = "tried"
-                    else:
-                        score = self.prior_config.c_puct * p * math.sqrt(node.visit_count + 1)
-                        visits = 0
-                        avg_reward = 0.0
-                        is_valid = False
-                        speedup = 1.0
-                        status = "untried"
+    def close(self) -> None:
+        if self.validator is not None:
+            self.validator.close()
 
-                    candidates.append({
-                        "transform_id": tid,
-                        "uct_score": round(score, 4) if score != float("inf") else "inf",
-                        "visits": visits,
-                        "avg_reward": round(avg_reward, 4),
-                        "is_valid": is_valid,
-                        "speedup": round(speedup, 4),
-                        "status": status,
-                    })
+    def select(self) -> MCTSNode:
+        """Select a node for expansion using PUCT."""
+        node = self.root
+        while node.expanded and node.children and node.depth < self.config.max_depth:
+            node = self._select_best_child(node)
+        return node
 
-                    if score > best_score:
-                        best_score = score
-                        best_action = tid
+    def _select_best_child(self, node: MCTSNode) -> MCTSNode:
+        best_child = None
+        best_score = float("-inf")
 
-                if log_selection:
-                    self.selection_steps.append(SelectionStep(
-                        node_path=node.applied_transforms,
-                        candidates=candidates,
-                        selected=best_action or "",
-                        reason="puct_action",
-                    ))
+        for child in node.children.values():
+            score = child.puct_score(
+                node.visit_count,
+                self.config.c_puct,
+                self.config.fpu,
+            )
+            if score > best_score:
+                best_score = score
+                best_child = child
 
-                if best_action and best_action not in node.children:
-                    return node, best_action
-                if best_action and best_action in node.children:
-                    node = node.children[best_action]
+        return best_child if best_child is not None else node
+
+    def expand(self, node: MCTSNode) -> Optional[MCTSNode]:
+        """Expand node by generating children for all valid transforms."""
+        if node.expanded or node.depth >= self.config.max_depth:
+            node.expanded = True
+            return None
+
+        valid_moves: dict[str, str] = {}
+        seen_sql: set[str] = set()
+        ancestor_hashes = self._get_ancestor_hashes(node)
+        for transform_id in self.transform_ids:
+            cache_key = (node.query_sql, transform_id)
+            if cache_key in self._transform_cache:
+                new_sql = self._transform_cache[cache_key]
+            else:
+                new_sql = apply_transform(node.query_sql, transform_id)
+                self._transform_cache[cache_key] = new_sql
+
+            if new_sql is not None:
+                canonical_sql = new_sql.strip()
+                if canonical_sql in seen_sql:
                     continue
+                state_hash = self._get_state_hash(canonical_sql)
+                if state_hash in ancestor_hashes:
+                    continue
+                seen_sql.add(canonical_sql)
+                valid_moves[transform_id] = new_sql
 
-            # UCT mode (or no untried): return first node with untried transforms
-            if untried:
-                if log_selection:
-                    self.selection_steps.append(SelectionStep(
-                        node_path=node.applied_transforms,
-                        candidates=[{"transform_id": t, "status": "untried"} for t in untried],
-                        selected=untried[0] if untried else "",
-                        reason="untried_available",
-                    ))
-                return node, None
+        node.expanded = True
 
-            # If no children (terminal or all failed), return this node
-            if not node.children:
-                if log_selection:
-                    self.selection_steps.append(SelectionStep(
-                        node_path=node.applied_transforms,
-                        candidates=[],
-                        selected="",
-                        reason="terminal_no_children",
-                    ))
-                return node, None
-
-            # Select best child by UCT/PUCT score
-            best_child = None
-            best_score = float("-inf")
-            candidates = []
-            priors = None
-            if self.prior_config.use_puct:
-                priors = self._get_priors(node)
-
-            for child in node.children.values():
-                if self.prior_config.use_puct:
-                    transform_id = child.applied_transforms[-1] if child.applied_transforms else "?"
-                    prior = priors.get(transform_id) if priors else None
-                    p = prior.prior if prior else 1.0 / max(len(node.children), 1)
-                    score = child.puct_score(node.visit_count, p, self.prior_config.c_puct)
-                else:
-                    score = child.uct_score(node.visit_count, self.c)
-                transform_id = child.applied_transforms[-1] if child.applied_transforms else "?"
-                candidates.append({
-                    "transform_id": transform_id,
-                    "uct_score": round(score, 4) if score != float("inf") else "inf",
-                    "visits": child.visit_count,
-                    "avg_reward": round(child.avg_reward, 4),
-                    "is_valid": child.is_valid,
-                    "speedup": round(child.speedup, 4),
-                })
-                if score > best_score:
-                    best_score = score
-                    best_child = child
-
-            if best_child is None:
-                if log_selection:
-                    self.selection_steps.append(SelectionStep(
-                        node_path=node.applied_transforms,
-                        candidates=candidates,
-                        selected="",
-                        reason="no_viable_children",
-                    ))
-                return node, None
-
-            if log_selection:
-                selected_transform = best_child.applied_transforms[-1] if best_child.applied_transforms else "?"
-                self.selection_steps.append(SelectionStep(
-                    node_path=node.applied_transforms,
-                    candidates=candidates,
-                    selected=selected_transform,
-                    reason="puct_best" if self.prior_config.use_puct else "uct_best",
-                ))
-
-            node = best_child
-
-    def expand(self, node: MCTSNode, transform_id: Optional[str] = None) -> Optional[MCTSNode]:
-        """Expand a node by applying an untried transformation.
-
-        Uses progressive widening to limit candidates based on visit count,
-        then selects using PUCT scores.
-
-        Args:
-            node: Node to expand.
-            transform_id: Optional forced transform ID to expand.
-
-        Returns:
-            New child node if expansion successful, None if failed.
-        """
-        # Get candidates with progressive widening
-        candidates = self._get_expansion_candidates(node)
-        if not candidates:
+        if not valid_moves:
             return None
 
-        # Don't expand beyond max depth
-        if node.depth >= self.max_depth:
-            return None
-
-        # Pick transform using PUCT selection
-        if transform_id is None:
-            transform_id = self._select_transform(candidates, node)
-        elif transform_id not in candidates:
-            return None
-
-        # Create attempt record
-        attempt = TransformAttempt(
-            iteration=self.total_iterations,
-            parent_path=node.applied_transforms.copy(),
-            transform_id=transform_id,
-            timestamp=time.time(),
-            parent_visits=node.visit_count,
-        )
-
-        # Apply transformation via LLM (use DAG mode if enabled)
-        start_time = time.perf_counter()
-        if self.use_dag_mode:
-            new_sql, error = apply_dag_transformation(
-                query=node.query_sql,
-                transform_id=transform_id,
-                llm_client=self.llm_client,
-            )
-        else:
-            new_sql, error = apply_transformation(
-                query=node.query_sql,
-                transform_id=transform_id,
-                llm_client=self.llm_client,
-            )
-        attempt.duration_ms = int((time.perf_counter() - start_time) * 1000)
-
-        if error or new_sql is None:
-            # Mark this transform as tried but failed
-            attempt.llm_success = False
-            attempt.llm_error = error
-            self.transform_attempts.append(attempt)
-
-            child = node.add_child(
-                transform_id=transform_id,
-                new_sql=node.query_sql,  # Keep original SQL
-                remaining=[],  # No further transforms from failed node
-            )
-            child.transform_error = error
-            self.failed_expansions += 1
-            logger.debug(f"Transform {transform_id} failed: {error}")
-            return None
-
-        # Record successful LLM call
-        attempt.llm_success = True
-        attempt.output_sql = new_sql
-        attempt.sql_changed = new_sql.strip() != node.query_sql.strip()
-
-        # Create child node with transformed SQL
-        child = node.add_child(
-            transform_id=transform_id,
-            new_sql=new_sql,
-        )
-        child._attempt = attempt  # Link attempt for later update
-        self.successful_expansions += 1
-        logger.debug(f"Transform {transform_id} applied successfully")
-
-        return child
-
-    def expand_parallel(
-        self,
-        node: MCTSNode,
-        num_transforms: int = 4,
-        preferred_transform: Optional[str] = None,
-    ) -> list[MCTSNode]:
-        """Expand a node by applying multiple transformations in parallel.
-
-        Makes parallel LLM API calls but returns nodes for sequential validation.
-        Uses progressive widening to select candidates.
-
-        Args:
-            node: Node to expand.
-            num_transforms: Max number of transforms to try in parallel.
-            preferred_transform: Optional transform to ensure is included.
-
-        Returns:
-            List of successfully created child nodes (not yet validated).
-        """
-        # Get candidates with progressive widening
-        candidates = self._get_expansion_candidates(node)
-        if not candidates:
-            return []
-
-        # Don't expand beyond max depth
-        if node.depth >= self.max_depth:
-            return []
-
-        # Pick transforms to try (up to num_transforms), sorted by PUCT prior
-        priors = self._get_priors(node)
-        sorted_candidates = sorted(
-            candidates,
-            key=lambda t: priors.get(t, TransformPrior(t, 0, "")).prior,
-            reverse=True,
-        )
-        transforms_to_try = sorted_candidates[:num_transforms]
-        if preferred_transform and preferred_transform in candidates:
-            if preferred_transform not in transforms_to_try:
-                transforms_to_try = [preferred_transform] + transforms_to_try[:-1]
-
-        # Apply transformations in parallel
-        results: list[tuple[str, Optional[str], Optional[str], int]] = []
-
-        def apply_single(transform_id: str) -> tuple[str, Optional[str], Optional[str], int]:
-            """Apply a single transformation, return (id, sql, error, duration_ms)."""
-            start_time = time.perf_counter()
-            if self.use_dag_mode:
-                new_sql, error = apply_dag_transformation(
-                    query=node.query_sql,
-                    transform_id=transform_id,
-                    llm_client=self.llm_client,
-                )
-            else:
-                new_sql, error = apply_transformation(
-                    query=node.query_sql,
-                    transform_id=transform_id,
-                    llm_client=self.llm_client,
-                )
-            duration_ms = int((time.perf_counter() - start_time) * 1000)
-            return (transform_id, new_sql, error, duration_ms)
-
-        with ThreadPoolExecutor(max_workers=num_transforms) as executor:
-            futures = {
-                executor.submit(apply_single, tid): tid
-                for tid in transforms_to_try
-            }
-
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    tid = futures[future]
-                    results.append((tid, None, str(e), 0))
-
-        # Create child nodes from results
-        children = []
-        for transform_id, new_sql, error, duration_ms in results:
-            # Create attempt record
-            attempt = TransformAttempt(
-                iteration=self.total_iterations,
-                parent_path=node.applied_transforms.copy(),
-                transform_id=transform_id,
-                timestamp=time.time(),
-                duration_ms=duration_ms,
-                parent_visits=node.visit_count,
+        available_rules = list(valid_moves.keys())
+        priors = self._get_transposition_priors(node.state_hash, available_rules)
+        if priors is None:
+            priors = self.policy.get_priors(
+                sql=node.query_sql,
+                available_rules=available_rules,
             )
 
-            if error or new_sql is None:
-                # Mark as tried but failed
-                attempt.llm_success = False
-                attempt.llm_error = error
-                self.transform_attempts.append(attempt)
+        for transform_id, new_sql in valid_moves.items():
+            prior = priors.get(transform_id, 0.0)
+            child_hash = self._get_state_hash(new_sql)
+            node.add_child(
+                transform=transform_id,
+                sql=new_sql,
+                prior=prior,
+                state_hash=child_hash,
+            )
 
-                child = node.add_child(
-                    transform_id=transform_id,
-                    new_sql=node.query_sql,
-                    remaining=[],
-                )
-                child.transform_error = error
-                self.failed_expansions += 1
-                logger.debug(f"Transform {transform_id} failed: {error}")
-            else:
-                # Success - create child for validation
-                attempt.llm_success = True
-                attempt.output_sql = new_sql
-                attempt.sql_changed = new_sql.strip() != node.query_sql.strip()
-
-                child = node.add_child(
-                    transform_id=transform_id,
-                    new_sql=new_sql,
-                )
-                child._attempt = attempt  # Link for later update
-                self.successful_expansions += 1
-                logger.debug(f"Transform {transform_id} applied successfully")
-                children.append(child)
-
-        return children
-
-    def iterate_parallel(
-        self,
-        num_parallel: int = 4,
-    ) -> list[tuple[MCTSNode, float]]:
-        """Run one MCTS iteration with parallel LLM calls.
-
-        Expands multiple transforms in parallel, then validates sequentially.
-
-        Args:
-            num_parallel: Number of parallel LLM calls.
-
-        Returns:
-            List of (node, reward) tuples for successfully expanded nodes.
-        """
-        self.total_iterations += 1
-
-        # 1. Selection
-        selected, preferred_transform = self.select()
-
-        # 2. Parallel Expansion (LLM calls)
-        children = self.expand_parallel(
-            selected,
-            num_transforms=num_parallel,
-            preferred_transform=preferred_transform,
-        )
-
-        if not children:
-            # All expansions failed
-            self.backpropagate(selected, 0.0)
-            return []
-
-        # 3. Sequential Simulation (validation) - DB access must be sequential
-        results = []
-        for child in children:
-            reward = self.simulate(child)
-            # 4. Backpropagation
-            self.backpropagate(child, reward)
-            results.append((child, reward))
-
-        return results
+        # Simulate the top-prior child first
+        return max(node.children.values(), key=lambda c: c.prior, default=None)
 
     def simulate(self, node: MCTSNode) -> float:
-        """Simulate (evaluate) a node by validating the query.
+        """Execute SQL and compute speedup reward."""
+        if self.validator is not None:
+            cached = self._validation_cache.get(node.query_sql)
+            if cached is None:
+                result = self.validator.validate(self.original_sql, node.query_sql)
+                status = result.status
+                valid = status in (ValidationStatus.PASS, ValidationStatus.WARN)
+                self._validation_cache[node.query_sql] = valid
+            else:
+                valid = cached
 
-        Runs validation to check:
-        - Semantic equivalence (row counts, checksums)
-        - Performance (speedup)
+            if not valid:
+                return 0.0
 
-        Args:
-            node: Node to evaluate.
+        timeout_s = self.baseline_latency_s * 2.0
+        result = self.benchmark.run_query_robust(node.query_sql, timeout_s=timeout_s)
 
-        Returns:
-            Reward value for this node.
-        """
-        if node.transform_error:
-            # Failed transformation gets zero reward
-            return 0.0
+        if result.timed_out or result.latency_s > timeout_s:
+            return 0.4
 
-        if node.validation_result is not None:
-            # Already validated, compute reward from cached result
-            return compute_reward(node.validation_result, self.reward_config)
+        if result.latency_s <= 0:
+            return 0.4
 
-        # Get linked attempt if available
-        attempt = getattr(node, '_attempt', None)
-
-        try:
-            # Run validation
-            result = self.validator.validate(
-                self.original_sql,
-                node.query_sql,
-            )
-            node.validation_result = result
-            self.validation_calls += 1
-
-            # Compute reward
-            reward = compute_reward(result, self.reward_config)
-
-            # Update attempt with validation results
-            if attempt:
-                attempt.validated = True
-                attempt.validation_status = str(getattr(result, 'status', 'unknown'))
-                attempt.speedup = getattr(result, 'speedup', 1.0)
-                attempt.reward = reward
-                # Try to get row counts if available
-                if hasattr(result, 'original_rows'):
-                    attempt.original_rows = result.original_rows
-                if hasattr(result, 'optimized_rows'):
-                    attempt.optimized_rows = result.optimized_rows
-                self.transform_attempts.append(attempt)
-
-            logger.debug(
-                f"Validation: status={getattr(result, 'status', 'unknown')}, "
-                f"speedup={getattr(result, 'speedup', 1.0):.2f}x, "
-                f"reward={reward:.3f}"
-            )
-
-            return reward
-
-        except Exception as e:
-            # Update attempt with error
-            if attempt:
-                attempt.validated = True
-                attempt.validation_status = "error"
-                attempt.validation_error = str(e)
-                attempt.reward = 0.0
-                self.transform_attempts.append(attempt)
-
-            logger.warning(f"Validation failed: {e}")
-            return 0.0
+        return self.baseline_latency_s / result.latency_s
 
     def backpropagate(self, node: MCTSNode, reward: float) -> None:
-        """Backpropagate reward up to root.
-
-        Updates visit counts and total rewards for all nodes
-        from the given node up to the root.
-
-        Args:
-            node: Starting node.
-            reward: Reward to propagate.
-        """
         current = node
         while current is not None:
             current.visit_count += 1
-            current.total_reward += reward
+            current.value_sum += reward
+            if current.parent is not None and current.transform:
+                state_hash = current.parent.state_hash
+                by_rule = self._transposition.setdefault(state_hash, {})
+                stats = by_rule.setdefault(current.transform, TranspositionStats())
+                stats.visits += 1
+                stats.value_sum += reward
             current = current.parent
 
     def iterate(self) -> tuple[Optional[MCTSNode], float]:
-        """Run one MCTS iteration.
-
-        Returns:
-            Tuple of (expanded_node, reward).
-            Node may be None if expansion failed.
-        """
         self.total_iterations += 1
 
-        # 1. Selection
-        selected, preferred_transform = self.select()
-
-        # 2. Expansion
-        expanded = self.expand(selected, transform_id=preferred_transform)
-
+        selected = self.select()
+        expanded = self.expand(selected)
         if expanded is None:
-            # Expansion failed, backpropagate zero reward from selected node
             self.backpropagate(selected, 0.0)
             return None, 0.0
 
-        # 3. Simulation
         reward = self.simulate(expanded)
-
-        # 4. Backpropagation
         self.backpropagate(expanded, reward)
-
         return expanded, reward
 
-    def _select_transform(self, candidates: list[str], node: MCTSNode) -> str:
-        """Select which transform to try next.
-
-        If use_puct=True (default), uses PUCT scores to balance:
-        - Exploitation: prefer transforms that have worked well
-        - Exploration: weighted by prior probability from KB/opportunity detection
-
-        If use_puct=False, uses original random selection for comparison.
-
-        Args:
-            candidates: List of untried transform IDs.
-            node: Current node.
-
-        Returns:
-            Transform ID to try.
-        """
-        if not candidates:
-            return ""
-
-        if len(candidates) == 1:
-            return candidates[0]
-
-        # Original random selection mode (for comparison)
-        if not self.prior_config.use_puct:
-            return random.choice(candidates)
-
-        # PUCT selection mode
-        priors = self._get_priors(node)
-
-        best_score = float("-inf")
-        best_transform = candidates[0]
-
-        for tid in candidates:
-            prior = priors.get(tid)
-            p = prior.prior if prior else 1.0 / len(candidates)
-
-            if tid in node.children:
-                # Visited child: use full PUCT formula
-                score = node.children[tid].puct_score(
-                    node.visit_count, p, self.prior_config.c_puct
-                )
-            else:
-                # Unvisited: pure exploration term
-                score = self.prior_config.c_puct * p * math.sqrt(node.visit_count + 1)
-
-            if score > best_score:
-                best_score = score
-                best_transform = tid
-
-        return best_transform
-
-    def _get_priors(self, node: MCTSNode) -> dict[str, TransformPrior]:
-        """Get cached or compute priors for a node.
-
-        Args:
-            node: The node to get priors for.
-
-        Returns:
-            Dict mapping transform_id to TransformPrior.
-        """
-        # Use applied_transforms as cache key
-        use_llm = False
-        if self.prior_config.use_llm_ranking:
-            from .llm_ranker import should_use_llm_ranking
-
-            children_stats = None
-            if node.children:
-                children_stats = {
-                    tid: (child.visit_count, child.avg_reward)
-                    for tid, child in node.children.items()
-                }
-
-            use_llm = should_use_llm_ranking(
-                node.visit_count,
-                node.avg_reward,
-                len(node.remaining_transforms),
-                children_stats,
-            )
-
-        cache_key = (tuple(node.applied_transforms), "llm" if use_llm else "contextual")
-        if cache_key in self._prior_cache:
-            return self._prior_cache[cache_key]
-
-        if use_llm:
-            self.llm_ranking_calls += 1
-
-        # Compute priors
-        priors = get_priors_for_node(
-            sql=node.query_sql,
-            transform_ids=node.remaining_transforms,
-            applied_transforms=node.applied_transforms,
-            config=self.prior_config,
-            llm_client=self.llm_client if use_llm else None,
-        )
-
-        self._prior_cache[cache_key] = priors
-        return priors
-
-    def _get_expansion_candidates(self, node: MCTSNode) -> list[str]:
-        """Get candidates for expansion with progressive widening.
-
-        If use_puct=True, progressive widening limits the number of children
-        considered based on parent visits: k = factor * sqrt(visits)
-
-        If use_puct=False (original mode), returns all untried transforms.
-
-        Args:
-            node: Node to get expansion candidates for.
-
-        Returns:
-            List of transform IDs to consider (may be subset of untried).
-        """
-        untried = node.get_untried_transforms()
-        if not untried:
-            return []
-
-        # Original mode: no widening, return all untried
-        if not self.prior_config.use_puct:
-            return untried
-
-        # PUCT mode: apply progressive widening
-        k = self._compute_widening_limit(node.visit_count, len(untried))
-
-        if k >= len(untried):
-            return untried
-
-        # Sort by prior and return top-k
-        priors = self._get_priors(node)
-        sorted_candidates = sorted(
-            untried,
-            key=lambda t: priors.get(t, TransformPrior(t, 0, "")).prior,
-            reverse=True,
-        )
-        return sorted_candidates[:k]
-
-    def _compute_widening_limit(self, parent_visits: int, num_candidates: int) -> int:
-        """Compute the progressive widening limit.
-
-        k = min(ceil(factor * sqrt(visits)), candidates)
-
-        Args:
-            parent_visits: Number of visits to parent node.
-            num_candidates: Total number of candidate transforms.
-
-        Returns:
-            Maximum number of transforms to consider.
-        """
-        k = int(math.ceil(
-            self.prior_config.widening_factor * math.sqrt(max(parent_visits, 1))
-        ))
-        k = max(k, self.prior_config.min_widening)  # Ensure minimum
-        return min(k, num_candidates)
-
     def get_best_node(self) -> MCTSNode:
-        """Get the best node found so far.
-
-        Uses most-visited valid leaf as the best result,
-        which is statistically more robust than highest reward.
-
-        Returns:
-            Best node (may be root if no valid transformations found).
-        """
+        """Return the node with highest average reward."""
         best = self.root
-        best_visits = 0
+        best_reward = best.avg_reward
 
-        def visit(node: MCTSNode):
-            nonlocal best, best_visits
-
-            # Only consider nodes that passed validation
-            if node.is_valid and node.visit_count > best_visits:
-                best = node
-                best_visits = node.visit_count
-
-            for child in node.children.values():
-                visit(child)
-
-        visit(self.root)
-        return best
-
-    def get_highest_reward_node(self) -> MCTSNode:
-        """Get node with highest average reward.
-
-        Alternative to get_best_node for more aggressive optimization.
-
-        Returns:
-            Node with highest avg_reward.
-        """
-        best = self.root
-        best_reward = self.root.avg_reward
-
-        def visit(node: MCTSNode):
+        def visit(node: MCTSNode) -> None:
             nonlocal best, best_reward
-
-            if node.is_valid and node.avg_reward > best_reward:
+            if node.visit_count > 0 and node.avg_reward > best_reward:
                 best = node
                 best_reward = node.avg_reward
-
-            for child in node.children.values():
-                visit(child)
-
-        visit(self.root)
-        return best
-
-    def get_best_speedup_node(self) -> MCTSNode:
-        """Get node with highest speedup.
-
-        Returns:
-            Node with highest speedup value.
-        """
-        best = self.root
-        best_speedup = 1.0
-
-        def visit(node: MCTSNode):
-            nonlocal best, best_speedup
-
-            if node.is_valid and node.speedup > best_speedup:
-                best = node
-                best_speedup = node.speedup
-
             for child in node.children.values():
                 visit(child)
 
@@ -923,10 +269,9 @@ class MCTSTree:
         return best
 
     def get_tree_size(self) -> int:
-        """Get total number of nodes in tree."""
         count = 0
 
-        def visit(node: MCTSNode):
+        def visit(node: MCTSNode) -> None:
             nonlocal count
             count += 1
             for child in node.children.values():
@@ -936,135 +281,8 @@ class MCTSTree:
         return count
 
     def get_stats(self) -> dict:
-        """Get tree statistics."""
         return {
             "total_iterations": self.total_iterations,
             "tree_size": self.get_tree_size(),
-            "successful_expansions": self.successful_expansions,
-            "failed_expansions": self.failed_expansions,
-            "validation_calls": self.validation_calls,
-            "llm_ranking_calls": self.llm_ranking_calls,
-            "root_visits": self.root.visit_count,
-            "total_attempts": len(self.transform_attempts),
+            "baseline_latency_s": self.baseline_latency_s,
         }
-
-    def get_all_attempts(self, include_full_sql: bool = False) -> list[dict]:
-        """Get all transformation attempts as dicts for JSON export.
-
-        Args:
-            include_full_sql: If True, include full SQL in each attempt.
-        """
-        return [a.to_dict(include_full_sql=include_full_sql) for a in self.transform_attempts]
-
-    def get_selection_log(self) -> list[dict]:
-        """Get all selection decisions as dicts for JSON export."""
-        return [s.to_dict() for s in self.selection_steps]
-
-    def get_detailed_log(self, include_full_sql: bool = False) -> dict:
-        """Get comprehensive log of all MCTS activity.
-
-        Args:
-            include_full_sql: If True, include full SQL in attempts.
-
-        Returns dict with:
-        - stats: Summary statistics
-        - attempts: All transform attempts with LLM/validation results
-        - selections: All UCT selection decisions
-        - tree: Serialized tree structure
-        """
-        return {
-            "stats": self.get_stats(),
-            "attempts": self.get_all_attempts(include_full_sql=include_full_sql),
-            "selections": self.get_selection_log(),
-            "tree": self._serialize_tree(),
-        }
-
-    def _serialize_tree(self, node: Optional[MCTSNode] = None, max_depth: int = 10) -> dict:
-        """Serialize tree to nested dict for JSON export."""
-        if node is None:
-            node = self.root
-
-        result = {
-            "transforms": node.applied_transforms,
-            "depth": node.depth,
-            "visits": node.visit_count,
-            "avg_reward": round(node.avg_reward, 4),
-            "is_valid": node.is_valid,
-            "speedup": round(node.speedup, 4),
-            "error": node.transform_error,
-        }
-
-        if node.depth < max_depth and node.children:
-            result["children"] = {
-                tid: self._serialize_tree(child, max_depth)
-                for tid, child in node.children.items()
-            }
-
-        return result
-
-    def get_attempt_summary(self) -> dict:
-        """Get summary of attempts by transform type and outcome."""
-        summary = {}
-        for attempt in self.transform_attempts:
-            tid = attempt.transform_id
-            if tid not in summary:
-                summary[tid] = {
-                    "total": 0,
-                    "llm_success": 0,
-                    "llm_failed": 0,
-                    "validation_pass": 0,
-                    "validation_fail": 0,
-                    "validation_error": 0,
-                    "avg_speedup": 0.0,
-                    "max_speedup": 0.0,
-                    "speedups": [],
-                }
-            s = summary[tid]
-            s["total"] += 1
-
-            if attempt.llm_success:
-                s["llm_success"] += 1
-                if attempt.validated:
-                    if "pass" in str(attempt.validation_status).lower():
-                        s["validation_pass"] += 1
-                        s["speedups"].append(attempt.speedup)
-                        s["max_speedup"] = max(s["max_speedup"], attempt.speedup)
-                    elif attempt.validation_error:
-                        s["validation_error"] += 1
-                    else:
-                        s["validation_fail"] += 1
-            else:
-                s["llm_failed"] += 1
-
-        # Compute averages
-        for tid, s in summary.items():
-            if s["speedups"]:
-                s["avg_speedup"] = round(sum(s["speedups"]) / len(s["speedups"]), 4)
-            del s["speedups"]  # Don't include raw list
-
-        return summary
-
-    def print_tree(self, max_depth: int = 3) -> str:
-        """Generate ASCII representation of tree for debugging."""
-        lines = []
-
-        def visit(node: MCTSNode, prefix: str = "", is_last: bool = True):
-            # Node info
-            transform = node.applied_transforms[-1] if node.applied_transforms else "root"
-            status = "✓" if node.is_valid else "✗" if node.validation_result else "?"
-            info = f"{transform} [{status}] v={node.visit_count} r={node.avg_reward:.2f}"
-
-            # Tree branch
-            connector = "└── " if is_last else "├── "
-            lines.append(prefix + connector + info)
-
-            # Children
-            if node.depth < max_depth:
-                children = list(node.children.values())
-                for i, child in enumerate(children):
-                    is_last_child = i == len(children) - 1
-                    new_prefix = prefix + ("    " if is_last else "│   ")
-                    visit(child, new_prefix, is_last_child)
-
-        visit(self.root, "", True)
-        return "\n".join(lines)

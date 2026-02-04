@@ -1,0 +1,28 @@
+Looking at the query structure and execution plan, I can see the main issue: the `wswscs` CTE aggregates ALL date_dim rows (73,049 rows) with wscs (2.16M rows), producing ~253K rows. Then the main query filters this down to only weeks from years 1998 and 1999 (585 rows each), leaving only ~42K rows after the join. This means we're aggregating a huge amount of data that gets filtered out later.
+
+The key insight is that we can push the year filters into the `wswscs` CTE BEFORE aggregation. However, previous attempts at pushdown showed minimal speedup (1.01x-1.02x). Looking at the execution plan, I notice that `wswscs` is being scanned twice in the main query - once for 1998 and once for 1999. This suggests we should use the **date_cte_isolate** pattern to create filtered date CTEs and join them early.
+
+Let me apply the date_cte_isolate pattern to filter dates by year BEFORE joining with sales data:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "pushdown",
+      "nodes": {
+        "wswscs": "SELECT d_week_seq, SUM(CASE WHEN (d_day_name = 'Sunday') THEN sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN sales_price ELSE NULL END) AS sat_sales FROM wscs, date_dim WHERE d_date_sk = sold_date_sk AND d_year IN (1998, 1999) GROUP BY d_week_seq"
+      },
+      "invariants_kept": [
+        "output columns unchanged",
+        "grain unchanged (d_week_seq)",
+        "required predicate (d_date_sk = sold_date_sk) preserved",
+        "same aggregation logic"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Pushed d_year IN (1998, 1999) filter into wswscs CTE before aggregation. This reduces the number of date_dim rows joined from 73,049 to only 1,170 rows (585 for each year), dramatically reducing the amount of data that needs to be aggregated. The main query still filters to specific years (1998 and 1999) but now works with pre-filtered aggregated data."
+}
+```

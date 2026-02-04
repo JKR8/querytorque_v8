@@ -102,6 +102,7 @@ class DagBuilder:
         "in_to_exists",       # IN subquery -> EXISTS
         "projection_prune",   # Remove unused columns
         "early_filter",       # Add filter CTE for selective predicates
+        "semantic_rewrite",   # Semantics-aware rewrite with domain assumptions
     ]
 
     def __init__(self, sql: str, dialect: str = "duckdb"):
@@ -561,31 +562,46 @@ OUTPUT FORMAT:
         return "\n".join(lines) if lines else "No cost data."
 
     def _detect_opportunities(self, slice_nodes: Dict[str, DagNode]) -> str:
+        """Detect optimization opportunities using the centralized Knowledge Base.
+
+        Uses patterns verified on TPC-DS SF100 with proven speedups.
+        """
+        from .knowledge_base import detect_opportunities, format_opportunities_for_prompt
+
         opportunities = []
 
+        # Get KB opportunities from full SQL
+        kb_opportunities = detect_opportunities(self.dag.original_sql)
+        if kb_opportunities:
+            kb_text = format_opportunities_for_prompt(kb_opportunities)
+            if kb_text:
+                opportunities.append("## Knowledge Base Patterns (verified on TPC-DS)\n" + kb_text)
+
+        # Add node-specific opportunities based on DAG structure
+        node_opportunities = []
         for node_id, node in slice_nodes.items():
             # Correlated subquery
             if "CORRELATED" in node.flags:
-                opportunities.append(
+                node_opportunities.append(
                     f"DECORRELATE: [{node_id}] has correlated subquery\n"
-                    f"  Fix: Move aggregate to CTE as window function, change predicate\n"
-                    f"  Expected: 2-3x speedup"
+                    f"  Fix: Move aggregate to CTE, join instead of correlated lookup\n"
+                    f"  Expected: 2-3x speedup (verified Q1: 2.81x)"
                 )
 
             # IN subquery
             if "IN_SUBQUERY" in node.flags:
-                opportunities.append(
+                node_opportunities.append(
                     f"IN_TO_EXISTS: [{node_id}] has IN subquery\n"
                     f"  Fix: Convert to EXISTS for early termination\n"
                     f"  Expected: 1.5x speedup"
                 )
 
-            # Check for OR conditions (simplified check)
+            # Check for OR conditions
             if " OR " in node.sql.upper():
-                opportunities.append(
+                node_opportunities.append(
                     f"OR_TO_UNION: [{node_id}] has OR condition\n"
                     f"  Fix: Split into UNION ALL branches\n"
-                    f"  Expected: 2x speedup"
+                    f"  Expected: 2x speedup (verified Q15: 2.98x)"
                 )
 
             # Check for late filter (main query filters on CTE columns)
@@ -593,11 +609,14 @@ OUTPUT FORMAT:
                 for ref in node.refs:
                     ref_node = self.dag.nodes.get(ref)
                     if ref_node and "GROUP_BY" in ref_node.flags:
-                        opportunities.append(
+                        node_opportunities.append(
                             f"PUSHDOWN: [{node_id}] filters on [{ref}] after GROUP BY\n"
                             f"  Fix: Push filter into CTE before aggregation\n"
-                            f"  Expected: 2x speedup"
+                            f"  Expected: 2x speedup (verified Q93: 2.71x)"
                         )
+
+        if node_opportunities:
+            opportunities.append("## Node-Specific Opportunities\n" + "\n\n".join(node_opportunities))
 
         return "\n\n".join(opportunities) if opportunities else "No obvious opportunities detected."
 

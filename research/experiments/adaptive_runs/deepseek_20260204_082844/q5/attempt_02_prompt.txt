@@ -1,0 +1,435 @@
+## Example: Decorrelate Subquery (DECORRELATE)
+Verified speedup: 2.90x
+
+### Input:
+[customer_total_return] CORRELATED:
+SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return
+FROM store_returns, date_dim
+WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000
+GROUP BY sr_customer_sk, sr_store_sk
+
+[main_query]:
+SELECT c_customer_id FROM customer_total_return ctr1, store, customer
+WHERE ctr1.ctr_total_return > (SELECT avg(ctr_total_return)*1.2 FROM customer_total_return ctr2 WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk)
+  AND s_store_sk = ctr1.ctr_store_sk AND s_state = 'SD' AND ctr1.ctr_customer_sk = c_customer_sk
+ORDER BY c_customer_id LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "decorrelate",
+      "nodes": {
+        "filtered_returns": "SELECT sr.sr_customer_sk, sr.sr_store_sk, sr.sr_fee FROM store_returns sr JOIN date_dim d ON sr.sr_returned_date_sk = d.d_date_sk JOIN store s ON sr.sr_store_sk = s.s_store_sk WHERE d.d_year = 2000 AND s.s_state = 'SD'",
+        "customer_total_return": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(sr_fee) AS ctr_total_return FROM filtered_returns GROUP BY sr_customer_sk, sr_store_sk",
+        "store_avg_return": "SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk",
+        "main_query": "SELECT c.c_customer_id FROM customer_total_return ctr1 JOIN store_avg_return sar ON ctr1.ctr_store_sk = sar.ctr_store_sk JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk WHERE ctr1.ctr_total_return > sar.avg_return_threshold ORDER BY c.c_customer_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "2.90x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Push s_state='SD' filter EARLY into first CTE. Compute average as SEPARATE CTE with GROUP BY (NOT window function). Join on average instead of correlated subquery.
+
+
+---
+
+## Example: Early Dimension Filter (EARLY_FILTER)
+Verified speedup: 2.71x
+
+### Input:
+[main_query]:
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales
+FROM (SELECT ss.ss_customer_sk, CASE WHEN sr.sr_return_quantity IS NOT NULL
+        THEN (ss.ss_quantity - sr.sr_return_quantity) * ss.ss_sales_price
+        ELSE ss.ss_quantity * ss.ss_sales_price END AS act_sales
+      FROM store_sales ss LEFT JOIN store_returns sr ON ss.ss_item_sk = sr.sr_item_sk
+      JOIN reason r ON sr.sr_reason_sk = r.r_reason_sk
+      WHERE r.r_reason_desc = 'duplicate purchase') t
+GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "early_filter",
+      "nodes": {
+        "filtered_reason": "SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'",
+        "filtered_returns": "SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk",
+        "main_query": "SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100"
+      },
+      "invariants_kept": [
+        "output columns unchanged",
+        "grain preserved",
+        "same result rows"
+      ],
+      "expected_speedup": "2.71x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Filter dimension table (reason) FIRST, then join to fact. Reduces returns to only 'duplicate purchase' before expensive store_sales join.
+
+
+---
+
+## Example: Flatten Subquery to JOIN (FLATTEN_SUBQUERY)
+Verified speedup: 1.3-2.0x
+
+### Input:
+[main_query]:
+SELECT c_customer_id, c_first_name, c_last_name
+FROM customer
+WHERE c_customer_sk IN (
+  SELECT ss_customer_sk FROM store_sales
+  WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_year = 2000)
+)
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "flatten_subquery",
+      "nodes": {
+        "target_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000",
+        "active_customers": "SELECT DISTINCT ss_customer_sk FROM store_sales JOIN target_dates ON ss_sold_date_sk = d_date_sk",
+        "main_query": "SELECT c.c_customer_id, c.c_first_name, c.c_last_name FROM customer c JOIN active_customers ac ON c.c_customer_sk = ac.ss_customer_sk"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same columns"
+      ],
+      "expected_speedup": "1.5x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** IN subquery becomes a JOIN. Nested IN becomes chained CTEs. DISTINCT ensures no duplicates from the semi-join semantics.
+
+
+---
+
+You are a SQL optimizer. Output atomic rewrite sets in JSON.
+
+RULES:
+- Only use transforms from the allowlist
+- Preserve node contracts (output columns, grain, predicates)
+- Coordinate multi-node changes in rewrite_sets
+- No formatting-only changes
+- No column renames unless required
+
+ALLOWED TRANSFORMS: pushdown, decorrelate, or_to_union, in_to_exists, projection_prune, early_filter, semantic_rewrite
+
+OUTPUT FORMAT:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "transform_name",
+      "nodes": {
+        "node_id": "new SQL..."
+      },
+      "invariants_kept": ["list of preserved semantics"],
+      "expected_speedup": "2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "what was changed and why"
+}
+```
+
+## Target Nodes
+  [ssr] GROUP_BY UNION_ALL
+  [csr] GROUP_BY UNION_ALL
+
+## Subgraph Slice
+[ssr] type=cte
+```sql
+SELECT s_store_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS "returns", SUM(net_loss) AS profit_loss FROM (SELECT ss_store_sk AS store_sk, ss_sold_date_sk AS date_sk, ss_ext_sales_price AS sales_price, ss_net_profit AS profit, CAST(0 AS DECIMAL(7, 2)) AS return_amt, CAST(0 AS DECIMAL(7, 2)) AS net_loss FROM store_sales UNION ALL SELECT sr_store_sk AS store_sk, sr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7, 2)) AS sales_price, CAST(0 AS DECIMAL(7, 2)) AS profit, sr_return_amt AS return_amt, sr_net_loss AS net_loss FROM store_returns) AS salesreturns, date_dim, store WHERE date_sk = d_date_sk AND d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL '14' DAY) AND store_sk = s_store_sk GROUP BY s_store_id
+```
+
+[main_query] type=main
+```sql
+/* start query 5 in stream 0 using template query5.tpl */ WITH ssr AS (SELECT s_store_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS "returns", SUM(net_loss) AS profit_loss FROM (SELECT ss_store_sk AS store_sk, ss_sold_date_sk AS date_sk, ss_ext_sales_price AS sales_price, ss_net_profit AS profit, CAST(0 AS DECIMAL(7, 2)) AS return_amt, CAST(0 AS DECIMAL(7, 2)) AS net_loss FROM store_sales UNION ALL SELECT sr_store_sk AS store_sk, sr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7, 2)) AS sales_price, CAST(0 AS DECIMAL(7, 2)) AS profit, sr_return_amt AS return_amt, sr_net_loss AS net_loss FROM store_returns) AS salesreturns, date_dim, store WHERE date_sk = d_date_sk AND d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL '14' DAY) AND store_sk = s_store_sk GROUP BY s_store_id), csr AS (SELECT cp_catalog_page_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS "returns", SUM(net_loss) AS profit_loss FROM (SELECT cs_catalog_page_sk AS page_sk, cs_sold_date_sk AS date_sk, cs_ext_sales_price AS sales_price, cs_net_profit AS profit, CAST(0 AS DECIMAL(7, 2)) AS return_amt, CAST(0 AS DECIMAL(7, 2)) AS net_loss FROM catalog_sales UNION ALL SELECT cr_catalog_page_sk AS page_sk, cr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7, 2)) AS sales_price, CAST(0 AS DECIMAL(7, 2)) AS profit, cr_return_amount AS return_amt, cr_net_loss AS net_loss FROM catalog_returns) AS salesreturns, date_dim, catalog_page WHERE date_sk = d_date_sk AND d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL '14' DAY) AND page_sk = cp_catalog_page_sk GROUP BY cp_catalog_page_id), wsr AS (SELECT web_site_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS "returns", SUM(net_loss) AS profit_loss FROM (SELECT ws_web_site_sk AS wsr_web_site_sk, ws_sold_date_sk AS date_sk, ws_ext_sales_price AS sales_price, ws_net_profit AS profit, CAST(0 AS DECIMAL(7, 2)) AS return_amt, CAST(0 AS DECIMAL(7, 2)) AS net_loss FROM web_sales UNION ALL SELECT ws_web_site_sk AS wsr_web_site_sk, wr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7, 2)) AS sales_price, CAST(0 AS DECIMAL(7, 2)) AS profit, wr_return_amt AS return_amt, wr_net_loss AS net_loss FROM web_returns LEFT OUTER JOIN web_sales ON (wr_item_sk = ws_item_sk AND wr_order_number = ws_order_number)) AS salesreturns, date_dim, web_site WHERE date_sk = d_date_sk AND d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL '14' DAY) AND wsr_web_site_sk = web_site_sk GROUP BY web_site_id) SELECT channel, id, SUM(sales) AS sales, SUM("returns") AS "returns", SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, 'store' || s_store_id AS id, sales, "returns", (profit - profit_loss) AS profit FROM ssr UNION ALL SELECT 'catalog channel' AS channel, 'catalog_page' || cp_catalog_page_id AS id, sales, "returns", (profit - profit_loss) AS profit FROM csr UNION ALL SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, "returns", (profit - profit_loss) AS profit FROM wsr) AS x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100
+```
+
+[csr] type=cte
+```sql
+SELECT cp_catalog_page_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS "returns", SUM(net_loss) AS profit_loss FROM (SELECT cs_catalog_page_sk AS page_sk, cs_sold_date_sk AS date_sk, cs_ext_sales_price AS sales_price, cs_net_profit AS profit, CAST(0 AS DECIMAL(7, 2)) AS return_amt, CAST(0 AS DECIMAL(7, 2)) AS net_loss FROM catalog_sales UNION ALL SELECT cr_catalog_page_sk AS page_sk, cr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7, 2)) AS sales_price, CAST(0 AS DECIMAL(7, 2)) AS profit, cr_return_amount AS return_amt, cr_net_loss AS net_loss FROM catalog_returns) AS salesreturns, date_dim, catalog_page WHERE date_sk = d_date_sk AND d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL '14' DAY) AND page_sk = cp_catalog_page_sk GROUP BY cp_catalog_page_id
+```
+
+
+## Node Contracts
+[ssr]:
+  output_columns: ['s_store_id', 'sales', 'profit', 'returns', 'profit_loss']
+  grain: ['s_store_id']
+  required_predicates: ['store_sk = s_store_sk', 'date_sk = d_date_sk']
+[main_query]:
+  output_columns: ['channel', 'id', 'sales', 'returns', 'profit']
+  required_predicates: ['store_sk = s_store_sk', 'date_sk = d_date_sk']
+[csr]:
+  output_columns: ['cp_catalog_page_id', 'sales', 'profit', 'returns', 'profit_loss']
+  grain: ['cp_catalog_page_id']
+  required_predicates: ['page_sk = cp_catalog_page_sk', 'date_sk = d_date_sk']
+
+## Downstream Usage
+[ssr]: downstream_refs=['ws_order_number', 'wr_returned_date_sk', 'sales_price', 'net_loss', 'page_sk', 'profit', 'sales', 'ss_store_sk', 'profit_loss', 'ss_ext_sales_price']
+[csr]: downstream_refs=['ws_order_number', 'wr_returned_date_sk', 'sales_price', 'net_loss', 'page_sk', 'profit', 'sales', 'ss_store_sk', 'profit_loss', 'ss_ext_sales_price']
+
+## Cost Attribution
+No cost data.
+
+## Detected Opportunities
+## Knowledge Base Patterns (verified on TPC-DS)
+## Detected Optimization Opportunities
+
+1. **QT-OPT-003** - Date CTE Isolation
+  Trigger: date_dim joined with d_year/d_qoy/d_month filter, fact table present
+  Rewrite: Create CTE: SELECT d_date_sk FROM date_dim WHERE filter, join fact to CTE early
+   Matched: date_dim filter with fact table
+
+
+## Node-Specific Opportunities
+PUSHDOWN: [main_query] filters on [wsr] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+PUSHDOWN: [main_query] filters on [ssr] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+PUSHDOWN: [main_query] filters on [csr] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+Now output your rewrite_sets:
+
+## Execution Plan
+```
+┌───────────────┐
+│     TOP_N     │
+│    ────────   │
+│    Top: 100   │
+│               │
+│   Order By:   │
+│ x.channel ASC │
+│    x.id ASC   │
+└───────┬───────┘
+┌───────┴───────┐
+│ HASH_GROUP_BY │
+│    ────────   │
+│    Groups:    │
+│       #0      │
+│       #1      │
+│               │
+│  Aggregates:  │
+│    sum(#2)    │
+│    sum(#3)    │
+│    sum(#4)    │
+│               │
+│   ~161 rows   │
+└───────┬───────┘
+┌───────┴───────┐
+│   PROJECTION  │
+│    ────────   │
+│    channel    │
+│       id      │
+│     sales     │
+│    returns    │
+│     profit    │
+│               │
+│  ~5,878 rows  │
+└───────┬───────┘
+┌───────┴───────┐
+│     UNION     ├───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+└───────┬───────┘                                                                                                                               │
+┌───────┴───────┐                                                                                                                       ┌───────┴───────┐
+│     UNION     │                                                                                                                       │   PROJECTION  │
+│               │                                                                                                                       │    ────────   │
+│               │                                                                                                                       │    channel    │
+│               │                                                                                                                       │       id      │
+│               ├───────────────────────────────────────────────────────────┐                                                           │     sales     │
+│               │                                                           │                                                           │    returns    │
+│               │                                                           │                                                           │     profit    │
+│               │                                                           │                                                           │               │
+│               │                                                           │                                                           │  ~1,990 rows  │
+└───────┬───────┘                                                           │                                                           └───────┬───────┘
+┌───────┴───────┐                                                   ┌───────┴───────┐                                                   ┌───────┴───────┐
+│   PROJECTION  │                                                   │   PROJECTION  │                                                   │ HASH_GROUP_BY │
+│    ────────   │                                                   │    ────────   │                                                   │    ────────   │
+│    channel    │                                                   │    channel    │                                                   │    Groups:    │
+│       id      │                                                   │       id      │                                                   │       #0      │
+│     sales     │                                                   │     sales     │                                                   │               │
+│    returns    │                                                   │    returns    │                                                   │  Aggregates:  │
+│     profit    │                                                   │     profit    │                                                   │    sum(#1)    │
+│               │                                                   │               │                                                   │    sum(#2)    │
+│               │                                                   │               │                                                   │    sum(#3)    │
+│               │                                                   │               │                                                   │    sum(#4)    │
+│               │                                                   │               │                                                   │               │
+│  ~1,990 rows  │                                                   │  ~1,898 rows  │                                                   │  ~1,990 rows  │
+└───────┬───────┘                                                   └───────┬───────┘                                                   └───────┬───────┘
+┌───────┴───────┐                                                   ┌───────┴───────┐                                                   ┌───────┴───────┐
+│ HASH_GROUP_BY │                                                   │ HASH_GROUP_BY │                                                   │   PROJECTION  │
+│    ────────   │                                                   │    ────────   │                                                   │    ────────   │
+│    Groups:    │                                                   │    Groups:    │                                                   │  web_site_id  │
+│       #0      │                                                   │       #0      │                                                   │  sales_price  │
+│               │                                                   │               │                                                   │     profit    │
+│  Aggregates:  │                                                   │  Aggregates:  │                                                   │   return_amt  │
+│    sum(#1)    │                                                   │    sum(#1)    │                                                   │    net_loss   │
+│    sum(#2)    │                                                   │    sum(#2)    │                                                   │               │
+│    sum(#3)    │                                                   │    sum(#3)    │                                                   │               │
+│    sum(#4)    │                                                   │    sum(#4)    │                                                   │               │
+│               │                                                   │               │                                                   │               │
+│  ~1,990 rows  │                                                   │  ~1,898 rows  │                                                   │ ~287,922 rows │
+└───────┬───────┘                                                   └───────┬───────┘                                                   └───────┬───────┘
+┌───────┴───────┐                                                   ┌───────┴───────┐                                                   ┌───────┴───────┐
+│   PROJECTION  │                                                   │   PROJECTION  │                                                   │   HASH_JOIN   │
+│    ────────   │                                                   │    ────────   │                                                   │    ────────   │
+│   s_store_id  │                                                   │cp_catalog_page│                                                   │   Join Type:  │
+│  sales_price  │                                                   │      _id      │                                                   │     INNER     │
+│     profit    │                                                   │  sales_price  │                                                   │               │
+│   return_amt  │                                                   │     profit    │                                                   │  Conditions:  ├───────────────────────────────────────────────────────────┐
+│    net_loss   │                                                   │   return_amt  │                                                   │wsr_web_site_sk│                                                           │
+│               │                                                   │    net_loss   │                                                   │  = web_site_sk│                                                           │
+│               │                                                   │               │                                                   │               │                                                           │
+│ ~633,302 rows │                                                   │ ~316,685 rows │                                                   │ ~287,922 rows │                                                           │
+└───────┬───────┘                                                   └───────┬───────┘                                                   └───────┬───────┘                                                           │
+┌───────┴───────┐                                                   ┌───────┴───────┐                                                   ┌───────┴───────┐                                                   ┌───────┴───────┐
+│   HASH_JOIN   │                                                   │   HASH_JOIN   │                                                   │   HASH_JOIN   │                                                   │   SEQ_SCAN    │
+│    ────────   │                                                   │    ────────   │                                                   │    ────────   │                                                   │    ────────   │
+│   Join Type:  │                                                   │   Join Type:  │                                                   │   Join Type:  │                                                   │     Table:    │
+│     INNER     │                                                   │     INNER     │                                                   │     INNER     │                                                   │    web_site   │
+│               │                                                   │               │                                                   │               │                                                   │               │
+│  Conditions:  │                                                   │  Conditions:  │                                                   │  Conditions:  │                                                   │     Type:     │
+│   store_sk =  ├──────────────────────────────────────────┐        │   page_sk =   ├──────────────────────────────────────────┐        │   date_sk =   ├──────────────────────────────────────────┐        │Sequential Scan│
+│   s_store_sk  │                                          │        │ cp_catalog_pag│                                          │        │    d_date_sk  │                                          │        │               │
+│               │                                          │        │      e_sk     │                                          │        │               │                                          │        │  Projections: │
+│               │                                          │        │               │                                          │        │               │                                          │        │  web_site_sk  │
+│               │                                          │        │               │                                          │        │               │                                          │        │  web_site_id  │
+│               │                                          │        │               │                                          │        │               │                                          │        │               │
+│ ~633,302 rows │                                          │        │ ~316,685 rows │                                          │        │ ~287,922 rows │                                          │        │    ~24 rows   │
+└───────┬───────┘                                          │        └───────┬───────┘                                          │        └───────┬───────┘                                          │        └───────────────┘
+┌───────┴───────┐                                  ┌───────┴───────┐┌───────┴───────┐                                  ┌───────┴───────┐┌───────┴───────┐                                  ┌───────┴───────┐
+│   HASH_JOIN   │                                  │   SEQ_SCAN    ││   HASH_JOIN   │                                  │   SEQ_SCAN    ││     UNION     │                                  │     FILTER    │
+│    ────────   │                                  │    ────────   ││    ────────   │                                  │    ────────   ││               │                                  │    ────────   │
+│   Join Type:  │                                  │     Table:    ││   Join Type:  │                                  │     Table:    ││               │                                  │   (d_date_sk  │
+│     INNER     │                                  │     store     ││     INNER     │                                  │  catalog_page ││               │                                  │     BETWEEN   │
+│               │                                  │               ││               │                                  │               ││               │                                  │   2450816 AND │
+│  Conditions:  │                                  │     Type:     ││  Conditions:  │                                  │     Type:     ││               │                                  │    2452983)   │
+│   date_sk =   │                                  │Sequential Scan││   date_sk =   │                                  │Sequential Scan││               │                                  │               │
+│    d_date_sk  │                                  │               ││    d_date_sk  │                                  │               ││               │                                  │               │
+│               │                                  │  Projections: ││               │                                  │  Projections: ││               │                                  │               │
+│               ├─────────────────────────┐        │   s_store_sk  ││               ├─────────────────────────┐        │cp_catalog_page││               ├────────┐                         │               │
+│               │                         │        │   s_store_id  ││               │                         │        │      _sk      ││               │        │                         │               │
+│               │                         │        │               ││               │                         │        │cp_catalog_page││               │        │                         │               │
+│               │                         │        │    Filters:   ││               │                         │        │      _id      ││               │        │                         │               │
+│               │                         │        │s_store_sk<=400││               │                         │        │               ││               │        │                         │               │
+│               │                         │        │               ││               │                         │        │    Filters:   ││               │        │                         │               │
+│               │                         │        │               ││               │                         │        │cp_catalog_page││               │        │                         │               │
+│               │                         │        │               ││               │                         │        │   _sk<=17108  ││               │        │                         │               │
+│               │                         │        │               ││               │                         │        │               ││               │        │                         │               │
+│ ~633,302 rows │                         │        │   ~402 rows   ││ ~316,685 rows │                         │        │  ~20,400 rows ││               │        │                         │  ~14,609 rows │
+└───────┬───────┘                         │        └───────────────┘└───────┬───────┘                         │        └───────────────┘└───────┬───────┘        │                         └───────┬───────┘
+┌───────┴───────┐                 ┌───────┴───────┐                 ┌───────┴───────┐                 ┌───────┴───────┐                 ┌───────┴───────┐┌───────┴───────┐                 ┌───────┴───────┐
+│     UNION     │                 │     FILTER    │                 │     UNION     │                 │     FILTER    │                 │   PROJECTION  ││   PROJECTION  │                 │   SEQ_SCAN    │
+│               │                 │    ────────   │                 │               │                 │    ────────   │                 │    ────────   ││    ────────   │                 │    ────────   │
+│               │                 │   (d_date_sk  │                 │               │                 │   (d_date_sk  │                 │wsr_web_site_sk││wsr_web_site_sk│                 │     Table:    │
+│               │                 │     BETWEEN   │                 │               │                 │     BETWEEN   │                 │    date_sk    ││    date_sk    │                 │    date_dim   │
+│               │                 │   2450816 AND │                 │               │                 │   2450815 AND │                 │  sales_price  ││  sales_price  │                 │               │
+│               │                 │    2452822)   │                 │               │                 │    2452911)   │                 │     profit    ││     profit    │                 │     Type:     │
+│               │                 │               │                 │               │                 │               │                 │   return_amt  ││   return_amt  │                 │Sequential Scan│
+│               │                 │               │                 │               │                 │               │                 │    net_loss   ││    net_loss   │                 │               │
+│               │                 │               │                 │               │                 │               │                 │               ││               │                 │  Projections: │
+│               │                 │               │                 │               │                 │               │                 │               ││               │                 │   d_date_sk   │
+│               │                 │               │                 │               │                 │               │                 │               ││               │                 │               │
+│               ├────────┐        │               │                 │               ├────────┐        │               │                 │               ││               │                 │    Filters:   │
+│               │        │        │               │                 │               │        │        │               │                 │               ││               │                 │  (CAST(d_date │
+│               │        │        │               │                 │               │        │        │               │                 │               ││               │                 │  AS TIMESTAMP)│
+│               │        │        │               │                 │               │        │        │               │                 │               ││               │                 │  BETWEEN '2000│
+│               │        │        │               │                 │               │        │        │               │                 │               ││               │                 │  -08-19 00:00 │
+│               │        │        │               │                 │               │        │        │               │                 │               ││               │                 │:00'::TIMESTAMP│
+│               │        │        │               │                 │               │        │        │               │                 │               ││               │                 │  AND '2000-09 │
+│               │        │        │               │                 │               │        │        │               │                 │               ││               │                 │ -02 00:00:00':│
+│               │        │        │               │                 │               │        │        │               │                 │               ││               │                 │  :TIMESTAMP)  │
+│               │        │        │               │                 │               │        │        │               │                 │               ││               │                 │               │
+│               │        │        │  ~14,609 rows │                 │               │        │        │  ~14,609 rows │                 │ ~719,845 rows ││ ~719,845 rows │                 │  ~14,609 rows │
+└───────┬───────┘        │        └───────┬───────┘                 └───────┬───────┘        │        └───────┬───────┘                 └───────┬───────┘└───────┬───────┘                 └───────────────┘
+┌───────┴───────┐┌───────┴───────┐┌───────┴───────┐                 ┌───────┴───────┐┌───────┴───────┐┌───────┴───────┐                 ┌───────┴───────┐┌───────┴───────┐
+│   PROJECTION  ││   PROJECTION  ││   SEQ_SCAN    │                 │   PROJECTION  ││   PROJECTION  ││   SEQ_SCAN    │                 │   SEQ_SCAN    ││   HASH_JOIN   │
+│    ────────   ││    ────────   ││    ────────   │                 │    ────────   ││    ────────   ││    ────────   │                 │    ────────   ││    ────────   │
+│    store_sk   ││    store_sk   ││     Table:    │                 │    page_sk    ││    page_sk    ││     Table:    │                 │     Table:    ││   Join Type:  │
+│    date_sk    ││    date_sk    ││    date_dim   │                 │    date_sk    ││    date_sk    ││    date_dim   │                 │   web_sales   ││     RIGHT     │
+│  sales_price  ││  sales_price  ││               │                 │  sales_price  ││  sales_price  ││               │                 │               ││               │
+│     profit    ││     profit    ││     Type:     │                 │     profit    ││     profit    ││     Type:     │                 │     Type:     ││  Conditions:  │
+│   return_amt  ││   return_amt  ││Sequential Scan│                 │   return_amt  ││   return_amt  ││Sequential Scan│                 │Sequential Scan││  ws_item_sk = │
+│    net_loss   ││    net_loss   ││               │                 │    net_loss   ││    net_loss   ││               │                 │               ││   wr_item_sk  │
+│               ││               ││  Projections: │                 │               ││               ││  Projections: │                 │  Projections: ││ws_order_number│
+│               ││               ││   d_date_sk   │                 │               ││               ││   d_date_sk   │                 │ ws_web_site_sk││ = wr_order_num│
+│               ││               ││               │                 │               ││               ││               │                 │ws_sold_date_sk││      ber      │
+│               ││               ││    Filters:   │                 │               ││               ││    Filters:   │                 │ws_ext_sales_pr││               ├────────┐
+│               ││               ││  (CAST(d_date │                 │               ││               ││  (CAST(d_date │                 │      ice      ││               │        │
+│               ││               ││  AS TIMESTAMP)│                 │               ││               ││  AS TIMESTAMP)│                 │ ws_net_profit ││               │        │
+│               ││               ││  BETWEEN '2000│                 │               ││               ││  BETWEEN '2000│                 │               ││               │        │
+│               ││               ││  -08-19 00:00 │                 │               ││               ││  -08-19 00:00 │                 │               ││               │        │
+│               ││               ││:00'::TIMESTAMP│                 │               ││               ││:00'::TIMESTAMP│                 │               ││               │        │
+│               ││               ││  AND '2000-09 │                 │               ││               ││  AND '2000-09 │                 │               ││               │        │
+│               ││               ││ -02 00:00:00':│                 │               ││               ││ -02 00:00:00':│                 │               ││               │        │
+│               ││               ││  :TIMESTAMP)  │                 │               ││               ││  :TIMESTAMP)  │                 │               ││               │        │
+│               ││               ││               │                 │               ││               ││               │                 │               ││               │        │
+│~2,878,107 rows││ ~288,581 rows ││  ~14,609 rows │                 │~1,439,513 rows││ ~144,001 rows ││  ~14,609 rows │                 │ ~719,845 rows ││ ~719,845 rows │        │
+└───────┬───────┘└───────┬───────┘└───────────────┘                 └───────┬───────┘└───────┬───────┘└───────────────┘                 └───────────────┘└───────┬───────┘        │
+┌───────┴───────┐┌───────┴───────┐                                  ┌───────┴───────┐┌───────┴───────┐                                                   ┌───────┴───────┐┌───────┴───────┐
+│   SEQ_SCAN    ││   SEQ_SCAN    │                                  │   SEQ_SCAN    ││   SEQ_SCAN    │                                                   │   SEQ_SCAN    ││   SEQ_SCAN    │
+│    ────────   ││    ────────   │                                  │    ────────   ││    ────────   │                                                   │    ────────   ││    ────────   │
+│     Table:    ││     Table:    │                                  │     Table:    ││     Table:    │                                                   │     Table:    ││     Table:    │
+│  store_sales  ││ store_returns │                                  │ catalog_sales ││catalog_returns│                                                   │   web_sales   ││  web_returns  │
+│               ││               │                                  │               ││               │                                                   │               ││               │
+│     Type:     ││     Type:     │                                  │     Type:     ││     Type:     │                                                   │     Type:     ││     Type:     │
+│Sequential Scan││Sequential Scan│                                  │Sequential Scan││Sequential Scan│                                                   │Sequential Scan││Sequential Scan│
+│               ││               │                                  │               ││               │                                                   │               ││               │
+│  Projections: ││  Projections: │                                  │  Projections: ││  Projections: │                                                   │  Projections: ││  Projections: │
+│  ss_store_sk  ││  sr_store_sk  │                                  │cs_catalog_page││cr_catalog_page│                                                   │   ws_item_sk  ││   wr_item_sk  │
+│ss_sold_date_sk││sr_returned_dat│                                  │      _sk      ││      _sk      │                                                   │ws_order_number││wr_order_number│
+│ss_ext_sales_pr││      e_sk     │                                  │cs_sold_date_sk││cr_returned_dat│                                                   │ ws_web_site_sk││wr_returned_dat│
+│      ice      ││ sr_return_amt │                                  │cs_ext_sales_pr││      e_sk     │                                                   │               ││      e_sk     │
+│ ss_net_profit ││  sr_net_loss  │                                  │      ice      ││cr_return_amoun│                                                   │               ││ wr_return_amt │
+│               ││               │                                  │ cs_net_profit ││       t       │                                                   │               ││  wr_net_loss  │
+│               ││               │                                  │               ││  cr_net_loss  │                                                   │               ││               │
+│               ││               │                                  │               ││               │                                                   │               ││               │
+│~2,878,107 rows││ ~288,581 rows │                                  │~1,439,513 rows││ ~144,001 rows │                                                   │ ~719,845 rows ││  ~71,681 rows │
+└───────────────┘└───────────────┘                                  └───────────────┘└───────────────┘                                                   └───────────────┘└───────────────┘
+
+```
+
+
+## Previous Attempts (Learn From These!)
+
+### Attempt 1: SUCCESS
+Speedup: 1.04x
+Strategy: pushdown
+Nodes changed: ssr, csr
+Changes: ssr output columns unchanged, csr output columns unchanged, same grouping and aggregation, same result rows
+
+## Current Best: 1.04x (Attempt 1)
+You must BEAT this to improve the result.
+
+**IMPORTANT:** The following patterns were provided: decorrelate, early_filter, flatten_subquery. Consider a DIFFERENT approach!
