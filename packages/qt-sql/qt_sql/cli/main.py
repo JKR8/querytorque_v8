@@ -6,7 +6,7 @@ Commands:
     qt-sql audit <file.sql>              Static analysis, generate report
     qt-sql optimize <file.sql>           LLM-powered optimization
     qt-sql optimize <file.sql> --dag     DAG v2 + JSON v5 node-level rewrites (recommended)
-    qt-sql optimize <file.sql> --dag --mcts-on-failure   DAG + MCTS fallback
+    qt-sql optimize <file.sql> --dag     DAG v2 + JSON v5 optimization
     qt-sql validate <orig.sql> <opt.sql> Validate optimization equivalence
 """
 
@@ -315,12 +315,8 @@ def audit(
 @click.option("--dry-run", is_flag=True, help="Show what would be optimized without calling LLM")
 @click.option("--database", "-d", type=click.Path(), help="DuckDB database path for schema/execution plan context")
 @click.option("--show-prompt", is_flag=True, help="Display the full prompt sent to LLM")
-# DAG and MCTS options
+# DAG option
 @click.option("--dag", is_flag=True, help="Use DAG v2 + JSON v5 node-level rewrites (recommended)")
-@click.option("--mcts", is_flag=True, help="Use MCTS optimizer directly")
-@click.option("--mcts-on-failure", is_flag=True, help="Escalate to MCTS if DAG v2 JSON v5 fails")
-@click.option("--mcts-iterations", default=30, help="Max MCTS iterations (default: 30)")
-@click.option("--mcts-parallel", default=4, help="MCTS parallel workers (default: 4)")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 def optimize(
     file: str,
@@ -332,10 +328,6 @@ def optimize(
     database: Optional[str],
     show_prompt: bool,
     dag: bool,
-    mcts: bool,
-    mcts_on_failure: bool,
-    mcts_iterations: int,
-    mcts_parallel: int,
     verbose: bool
 ):
     """Optimize SQL using LLM-powered analysis.
@@ -350,15 +342,6 @@ def optimize(
                        Recommended for complex queries with CTEs/subqueries.
                        Requires --database for validation.
 
-    \b
-    --mcts             Direct MCTS tree search optimization.
-                       Explores multiple transformation strategies.
-                       Requires --database for validation.
-
-    \b
-    --mcts-on-failure  Escalate to MCTS if DAG optimization fails validation.
-                       Combines DAG's efficiency with MCTS's robustness.
-
     When --database is provided, includes:
     - Schema with row counts for referenced tables
     - Execution plan with row estimates (enables semantic optimizations)
@@ -367,8 +350,7 @@ def optimize(
         qt-sql optimize query.sql
         qt-sql optimize query.sql --provider deepseek
         qt-sql optimize query.sql -d /path/to/db.duckdb --dag
-        qt-sql optimize query.sql -d /path/to/db.duckdb --dag --mcts-on-failure
-        qt-sql optimize query.sql -d /path/to/db.duckdb --mcts
+        qt-sql optimize query.sql -d /path/to/db.duckdb --dag
         qt-sql optimize query.sql -o optimized.sql
     """
     # Setup logging
@@ -393,8 +375,8 @@ def optimize(
     display_analysis_result(result, verbose=False)
 
     # Validate mode requirements
-    if (dag or mcts) and not database:
-        console.print("[red]Error: --database is required for --dag and --mcts modes[/red]")
+    if dag and not database:
+        console.print("[red]Error: --database is required for --dag mode[/red]")
         sys.exit(1)
 
     if database:
@@ -409,9 +391,6 @@ def optimize(
             database=database,
             provider=provider,
             model=model,
-            mcts_on_failure=mcts_on_failure,
-            mcts_iterations=mcts_iterations,
-            mcts_parallel=mcts_parallel,
             verbose=verbose,
             show_prompt=show_prompt,
         )
@@ -421,24 +400,7 @@ def optimize(
         return
 
     # ============================================================
-    # MODE 2: Direct MCTS optimization
-    # ============================================================
-    if mcts:
-        optimized_sql = _run_mcts_optimization(
-            sql=sql,
-            database=database,
-            provider=provider,
-            iterations=mcts_iterations,
-            parallel=mcts_parallel,
-            verbose=verbose,
-        )
-
-        if optimized_sql:
-            _output_result(optimized_sql, output, verbose)
-        return
-
-    # ============================================================
-    # MODE 3: Simple LLM optimization (default/legacy)
+    # MODE 2: Simple LLM optimization (default/legacy)
     # ============================================================
     if not result.issues:
         console.print("\n[green]No issues found - query already looks optimal.[/green]")
@@ -576,13 +538,10 @@ def _run_dag_optimization(
     database: str,
     provider: Optional[str],
     model: Optional[str],
-    mcts_on_failure: bool,
-    mcts_iterations: int,
-    mcts_parallel: int,
     verbose: bool,
     show_prompt: bool,
 ) -> Optional[str]:
-    """Run DAG v2 + JSON v5 optimization with optional MCTS escalation."""
+    """Run DAG v2 + JSON v5 optimization."""
     console.print("\n[bold blue]Running DAG v2 + JSON v5 optimization...[/bold blue]")
 
     try:
@@ -616,18 +575,6 @@ def _run_dag_optimization(
         error_preview = (result.error or "Unknown")[:60]
         console.print(f"[yellow]DAG optimization failed: {error_preview}...[/yellow]")
 
-        if mcts_on_failure:
-            console.print("\n[bold yellow]Escalating to MCTS...[/bold yellow]")
-            return _run_mcts_optimization(
-                sql=sql,
-                database=database,
-                provider=provider,
-                iterations=mcts_iterations,
-                parallel=mcts_parallel,
-                verbose=verbose,
-            )
-
-        console.print("[dim]Use --mcts-on-failure to escalate to MCTS search[/dim]")
         return None
 
     except Exception as e:
@@ -636,99 +583,6 @@ def _run_dag_optimization(
             import traceback
             console.print(f"[dim]{traceback.format_exc()}[/dim]")
 
-        if mcts_on_failure:
-            console.print("\n[bold yellow]Escalating to MCTS after error...[/bold yellow]")
-            return _run_mcts_optimization(
-                sql=sql,
-                database=database,
-                provider=provider,
-                iterations=mcts_iterations,
-                parallel=mcts_parallel,
-                verbose=verbose,
-            )
-        return None
-
-
-def _run_mcts_optimization(
-    sql: str,
-    database: str,
-    provider: Optional[str],
-    iterations: int,
-    parallel: int,
-    verbose: bool,
-) -> Optional[str]:
-    """Run MCTS-based optimization.
-
-    Args:
-        sql: Original SQL query
-        database: Path to DuckDB database
-        provider: LLM provider name
-        iterations: Max MCTS iterations
-        parallel: Number of parallel workers
-        verbose: Verbose output
-
-    Returns:
-        Optimized SQL string, or None if optimization failed
-    """
-    console.print(f"\n[bold blue]Running MCTS optimization...[/bold blue]")
-    console.print(f"  Iterations: {iterations}, Parallel: {parallel}")
-
-    try:
-        from qt_sql.optimization.mcts import MCTSSQLOptimizer
-
-        start_time = time.time()
-
-        with MCTSSQLOptimizer(database=database, provider=provider) as optimizer:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console,
-            ) as progress:
-                task = progress.add_task(
-                    f"Searching optimization space ({iterations} iterations)...",
-                    total=None
-                )
-
-                if parallel > 1:
-                    result = optimizer.optimize_parallel(
-                        query=sql,
-                        max_iterations=iterations,
-                        num_parallel=parallel,
-                    )
-                else:
-                    result = optimizer.optimize(
-                        query=sql,
-                        max_iterations=iterations,
-                    )
-
-        elapsed = time.time() - start_time
-        console.print(f"  Completed in {elapsed:.1f}s, {result.iterations} iterations")
-
-        if result.valid and result.speedup > 1.0:
-            console.print(
-                f"[green]MCTS optimization succeeded![/green] "
-                f"Speedup: {result.speedup:.2f}x"
-            )
-            if verbose:
-                console.print(f"  Method: {result.method}")
-                if result.transforms_applied:
-                    console.print(f"  Transforms: {', '.join(result.transforms_applied)}")
-            return result.optimized_sql
-        else:
-            console.print(
-                f"[yellow]MCTS found no improvement[/yellow] "
-                f"(speedup: {result.speedup:.2f}x)"
-            )
-            return None
-
-    except ImportError as e:
-        console.print(f"[red]Error: Missing dependency for MCTS mode: {e}[/red]")
-        sys.exit(1)
-    except Exception as e:
-        console.print(f"[red]MCTS optimization error: {e}[/red]")
-        if verbose:
-            import traceback
-            console.print(f"[dim]{traceback.format_exc()}[/dim]")
         return None
 
 

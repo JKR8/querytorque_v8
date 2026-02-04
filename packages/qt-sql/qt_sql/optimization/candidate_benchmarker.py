@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional
 from dataclasses import dataclass, asdict
 
 from qt_sql.optimization.adaptive_rewriter_v5 import CandidateResult
-from qt_sql.optimization.mcts.benchmark import BenchmarkRunner, BenchmarkResult
+from qt_sql.execution.duckdb_executor import DuckDBExecutor
 from qt_sql.validation.schemas import ValidationStatus
 
 logger = logging.getLogger(__name__)
@@ -111,6 +112,25 @@ def save_candidates_to_disk(
     return run_dir
 
 
+def _trimmed_mean(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    if len(values) <= 2:
+        return sum(values) / len(values)
+    ordered = sorted(values)
+    trimmed = ordered[1:-1]
+    return sum(trimmed) / len(trimmed)
+
+
+def _benchmark_query(executor: DuckDBExecutor, sql: str, runs: int) -> float:
+    timings: list[float] = []
+    for _ in range(max(runs, 1)):
+        start = time.perf_counter()
+        executor.execute(sql)
+        timings.append(time.perf_counter() - start)
+    return _trimmed_mean(timings)
+
+
 def benchmark_candidates(
     candidates: List[CandidateResult],
     original_sql: str,
@@ -135,18 +155,11 @@ def benchmark_candidates(
     """
     logger.info(f"Benchmarking {len(candidates)} candidates on main DB with {runs} runs each")
 
-    benchmarker = BenchmarkRunner(
-        database=main_db,
-        runs=runs,
-        dialect="duckdb",
-        use_cache=False  # Don't cache, we want fresh timings
-    )
-
     # Benchmark original query once (reused for all candidates)
     logger.info("Benchmarking original query...")
-    original_result = benchmarker.run_query_robust(original_sql)
-    original_latency = original_result.latency_s
-    logger.info(f"Original latency: {original_latency:.3f}s (trimmed mean of {runs} runs)")
+    with DuckDBExecutor(main_db, read_only=True) as executor:
+        original_latency = _benchmark_query(executor, original_sql, runs=runs)
+        logger.info(f"Original latency: {original_latency:.3f}s (trimmed mean of {runs} runs)")
 
     # Benchmark each candidate
     benchmarked = []
@@ -155,8 +168,8 @@ def benchmark_candidates(
 
         try:
             # Run optimized query
-            optimized_result = benchmarker.run_query_robust(candidate.optimized_sql)
-            optimized_latency = optimized_result.latency_s
+            with DuckDBExecutor(main_db, read_only=True) as executor:
+                optimized_latency = _benchmark_query(executor, candidate.optimized_sql, runs=runs)
 
             # Compute speedup
             if optimized_latency > 0:
@@ -297,9 +310,8 @@ def optimize_v5_complete(
     logger.info("Step 4: Saving benchmark results...")
 
     # Get original latency
-    benchmarker = BenchmarkRunner(main_db, runs=runs, use_cache=False)
-    original_result = benchmarker.run_query_robust(sql)
-    original_latency = original_result.latency_s
+    with DuckDBExecutor(main_db, read_only=True) as executor:
+        original_latency = _benchmark_query(executor, sql, runs=runs)
 
     save_benchmark_results(benchmarked, original_latency, run_dir)
     logger.info("")

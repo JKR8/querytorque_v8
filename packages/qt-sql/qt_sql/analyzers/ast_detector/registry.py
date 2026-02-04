@@ -18,6 +18,8 @@ from .rules import (
     CorrelatedSubqueryGold,
     DecorrelateSubqueryGold,
     OrToUnionGold,
+    UnionCTESpecializationGold,
+    SubqueryMaterializationGold,
     # SELECT
     SelectStarRule,
     ScalarSubqueryInSelectRule,
@@ -149,7 +151,7 @@ from .rules import (
     WindowPushdownRule,
     PreAggregateRule,
     GroupByFunctionalDependencyRule,
-    # Optimization opportunity rules - synced with knowledge_base (11 MCTS transforms)
+    # Optimization opportunity rules - synced with knowledge_base (11 KB transforms)
     OrToUnionOpportunity,              # QT-OPT-001: or_to_union
     CorrelatedToPrecomputedCTEOpportunity,  # QT-OPT-002: correlated_to_cte
     LateDateFilterOpportunity,         # QT-OPT-003: date_cte_isolate
@@ -366,7 +368,7 @@ _ALL_RULES: list[ASTRule] = [
     PreAggregateRule(),
     GroupByFunctionalDependencyRule(),
 
-    # Optimization opportunity rules - synced with knowledge_base (11 MCTS transforms)
+    # Optimization opportunity rules - synced with knowledge_base (11 KB transforms)
     OrToUnionOpportunity(),              # QT-OPT-001: or_to_union (2.98x)
     CorrelatedToPrecomputedCTEOpportunity(),  # QT-OPT-002: correlated_to_cte (2.81x)
     LateDateFilterOpportunity(),         # QT-OPT-003: date_cte_isolate (2.67x)
@@ -385,6 +387,8 @@ _ALL_RULES: list[ASTRule] = [
     CorrelatedSubqueryGold(),            # GLD-005: correlated_subquery (1.80x avg)
     DecorrelateSubqueryGold(),           # GLD-001: decorrelate (2.81x proven)
     OrToUnionGold(),                     # GLD-002: or_to_union (2.67x proven)
+    UnionCTESpecializationGold(),        # GLD-006: CTE UNION split (1.42x Q74 proven)
+    SubqueryMaterializationGold(),       # GLD-007: subquery to CTE (1.24x Q73 proven)
 ]
 
 # Rule lookup by ID

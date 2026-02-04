@@ -1,7 +1,7 @@
 """Unified Knowledge Base for SQL Optimization.
 
 This is the SINGLE SOURCE OF TRUTH for all optimization patterns.
-All services (MCTS, DSPy, Web UI, AST detection) import from here.
+All services (JSON v5, Web UI, AST detection) import from here.
 
 Pattern Evidence (TPC-DS SF100, DuckDB):
 - or_to_union: 2.98x (Q15)
@@ -26,7 +26,7 @@ import re
 
 
 class TransformID(str, Enum):
-    """Canonical transform identifiers used by MCTS."""
+    """Canonical transform identifiers used by the optimizer."""
 
     PUSH_PREDICATE = "push_pred"
     REORDER_JOIN = "reorder_join"
@@ -47,7 +47,7 @@ class TransformPattern:
     """A SQL optimization pattern with detection and rewrite metadata.
 
     Attributes:
-        id: Canonical ID (e.g., "push_pred") - used by MCTS
+        id: Canonical ID (e.g., "push_pred") - used by optimizer
         code: Display code (e.g., "QT-OPT-001") - used by UI
         name: Human-readable name
         description: What this pattern does
@@ -242,7 +242,7 @@ def get_high_value_transforms() -> list[TransformPattern]:
 
 
 def get_transform_ids() -> list[str]:
-    """Get all transform ID strings for MCTS."""
+    """Get all transform ID strings."""
     return [t.value for t in TransformID]
 
 

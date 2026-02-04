@@ -174,7 +174,7 @@ from .optimization_rules import (
 )
 
 # Optimization opportunity rules - synced with knowledge_base.TRANSFORM_REGISTRY
-# These 11 rules match the MCTS transforms exactly
+# These 11 rules match the KB transform registry
 from .opportunity_rules import (
     OrToUnionOpportunity,              # QT-OPT-001: or_to_union
     CorrelatedToPrecomputedCTEOpportunity,  # QT-OPT-002: correlated_to_cte
@@ -196,6 +196,8 @@ from .gold_rules import (
     CorrelatedSubqueryGold,            # GLD-005: correlated_subquery (1.80x avg)
     DecorrelateSubqueryGold,           # GLD-001: decorrelate (2.81x)
     OrToUnionGold,                     # GLD-002: or_to_union (2.67x)
+    UnionCTESpecializationGold,        # GLD-006: CTE UNION split (1.42x Q74)
+    SubqueryMaterializationGold,       # GLD-007: subquery to CTE (1.24x Q73)
 )
 
 # Snowflake-specific rules
@@ -375,7 +377,7 @@ __all__ = [
     "WindowPushdownRule",
     "PreAggregateRule",
     "GroupByFunctionalDependencyRule",
-    # Optimization opportunities (synced with knowledge_base - 11 MCTS transforms)
+    # Optimization opportunities (synced with knowledge_base - 11 KB transforms)
     "OrToUnionOpportunity",              # QT-OPT-001
     "CorrelatedToPrecomputedCTEOpportunity",  # QT-OPT-002
     "LateDateFilterOpportunity",         # QT-OPT-003

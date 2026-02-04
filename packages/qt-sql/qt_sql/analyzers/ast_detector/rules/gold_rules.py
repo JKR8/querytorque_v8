@@ -11,7 +11,7 @@ Evidence:
 - GLD-005 (Correlated WHERE): 1.80x avg, 67% win rate
 """
 
-from typing import Iterator, Set
+from typing import Iterator, Set, List
 from sqlglot import exp
 from ..base import ASTRule, ASTContext, RuleMatch
 
@@ -157,13 +157,28 @@ class EarlyFilterPushdownGold(ASTRule):
                 col_table = str(col.table).lower() if col.table else ""
                 col_name = str(col.this).lower() if col.this else ""
 
-                # Check if column belongs to dimension table (match by name OR alias)
+                if not col_name:
+                    continue
+
+                # Match column to dimension table by:
+                # 1. Explicit table qualifier (col_table matches)
+                # 2. Column name prefix (e.g., r_reason_desc → reason table)
                 for dim_name, dim_alias in dim_tables:
+                    matched = False
+
+                    # Explicit table qualifier
                     if col_table and (col_table == dim_name or col_table == dim_alias):
-                        if col_name and not col_name.endswith('_sk'):  # Skip join keys
-                            if dim_name not in filters:
-                                filters[dim_name] = []
-                            filters[dim_name].append(col_name)
+                        matched = True
+
+                    # Infer from column name prefix when unqualified
+                    # E.g., 'r_reason_desc' likely belongs to 'reason' table (r_ prefix)
+                    elif not col_table and col_name.startswith(dim_alias + '_'):
+                        matched = True
+
+                    if matched and not col_name.endswith('_sk'):  # Skip join keys
+                        if dim_name not in filters:
+                            filters[dim_name] = []
+                        filters[dim_name].append(col_name)
 
         return filters
 
@@ -305,6 +320,236 @@ class ProjectionPruningGold(ASTRule):
                 used.add(col_name)
 
         return used
+
+
+class UnionCTESpecializationGold(ASTRule):
+    """GLD-006: CTE with UNION ALL filtered by discriminator - specialization opportunity.
+
+    Evidence: Q74 (1.42x speedup)
+
+    Pattern detected:
+        WITH combined AS (
+            SELECT ..., 's' AS sale_type FROM store_sales ...
+            UNION ALL
+            SELECT ..., 'w' AS sale_type FROM web_sales ...
+        )
+        SELECT * FROM combined c1, combined c2
+        WHERE c1.sale_type = 's' AND c2.sale_type = 'w'
+
+    Suggested rewrite:
+        WITH store_cte AS (SELECT ... FROM store_sales ...),
+             web_cte AS (SELECT ... FROM web_sales ...)
+        SELECT * FROM store_cte c1, web_cte c2
+
+    Transform: Split generic UNION ALL CTE into specialized CTEs based on discriminator column.
+    """
+
+    rule_id = "GLD-006"
+    name = "Union CTE Specialization"
+    severity = "gold"
+    category = "verified_optimization"
+    penalty = 20
+    description = "CTE with UNION ALL and discriminator column - split into specialized CTEs for 1.4x speedup"
+    suggestion = "Split UNION ALL CTE into separate CTEs for each branch, eliminate discriminator filtering"
+
+    target_node_types = (exp.With,)
+
+    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
+        """Detect CTEs with UNION ALL that are filtered by discriminator in main query."""
+
+        # Find CTEs with UNION ALL
+        for cte in node.find_all(exp.CTE):
+            cte_name = str(cte.alias).lower() if cte.alias else ""
+            if not cte_name:
+                continue
+
+            # Check if CTE contains UNION ALL
+            union_all = cte.find(exp.Union)
+            if not union_all or not union_all.args.get('distinct') is False:
+                continue  # Need UNION ALL (distinct=False)
+
+            # Find discriminator columns (literal values that differ between branches)
+            discriminators = self._find_discriminators(union_all)
+            if not discriminators:
+                continue
+
+            # Check if main query filters on discriminator columns
+            parent = node.parent
+            if not isinstance(parent, exp.Select):
+                continue
+
+            where = parent.find(exp.Where)
+            if not where:
+                continue
+
+            # Check if WHERE filters on discriminator columns of this CTE
+            filtered_discriminators = self._find_discriminator_filters(where, cte_name, discriminators)
+
+            if filtered_discriminators:
+                disc_list = ", ".join(f"{col}={val}" for col, val in filtered_discriminators[:2])
+                yield RuleMatch(
+                    node=cte,
+                    context=context,
+                    message=f"💰 GOLD: CTE '{cte_name}' with UNION ALL filtered by [{disc_list}] - "
+                           f"split into specialized CTEs for 1.4x speedup (Q74 pattern)",
+                    matched_text=f"WITH {cte_name} AS (...UNION ALL...) WHERE {disc_list}",
+                )
+                return  # Only report once
+
+    def _find_discriminators(self, union_all: exp.Union) -> List[str]:
+        """Find column names that have literal discriminator values (e.g., sale_type = 's' vs 'w')."""
+        discriminators = []
+
+        # Get both sides of UNION
+        left_select = union_all.this if isinstance(union_all.this, exp.Select) else union_all.this.find(exp.Select)
+        right_select = union_all.expression if isinstance(union_all.expression, exp.Select) else union_all.expression.find(exp.Select)
+
+        if not left_select or not right_select:
+            return []
+
+        # Look for columns with literal values in SELECT
+        left_exprs = left_select.args.get('expressions', [])
+        right_exprs = right_select.args.get('expressions', [])
+
+        for i, (left_expr, right_expr) in enumerate(zip(left_exprs, right_exprs)):
+            # Check if both sides have literals (discriminator pattern)
+            left_literal = left_expr.find(exp.Literal)
+            right_literal = right_expr.find(exp.Literal)
+
+            if left_literal and right_literal:
+                # Get alias name if present
+                col_name = ""
+                if isinstance(left_expr, exp.Alias) and left_expr.alias:
+                    col_name = str(left_expr.alias).lower()
+                elif isinstance(left_expr, exp.Literal):
+                    col_name = f"col_{i}"
+
+                if col_name and str(left_literal.this) != str(right_literal.this):
+                    discriminators.append(col_name)
+
+        return discriminators
+
+    def _find_discriminator_filters(self, where: exp.Where, cte_name: str,
+                                   discriminators: List[str]) -> List[tuple]:
+        """Find filters on discriminator columns."""
+        filters = []
+
+        for eq in where.find_all(exp.EQ):
+            for col in eq.find_all(exp.Column):
+                col_table = str(col.table).lower() if col.table else ""
+                col_name = str(col.this).lower() if col.this else ""
+
+                # Check if this column references the CTE and is a discriminator
+                if col_table and col_name in discriminators:
+                    # Find the literal value being compared
+                    literal = eq.find(exp.Literal)
+                    if literal:
+                        filters.append((col_name, str(literal.this)))
+
+        return filters
+
+
+class SubqueryMaterializationGold(ASTRule):
+    """GLD-007: Complex subquery in FROM - materialized CTE opportunity.
+
+    Evidence: Q73 (1.24x speedup)
+
+    Pattern detected:
+        SELECT ... FROM
+            (SELECT ... FROM fact_table, date_dim, dimension_table
+             WHERE ... AND date_dim.d_year IN (...)
+             GROUP BY ...) subq,
+            another_table
+        WHERE ...
+
+    Suggested rewrite:
+        WITH materialized AS (
+            SELECT ... FROM fact_table, date_dim, dimension_table
+            WHERE ... AND date_dim.d_year IN (...)
+            GROUP BY ...
+        )
+        SELECT ... FROM materialized, another_table WHERE ...
+
+    Transform: Convert inline subquery to materialized CTE for better optimization.
+    """
+
+    rule_id = "GLD-007"
+    name = "Subquery Materialization"
+    severity = "gold"
+    category = "verified_optimization"
+    penalty = 15
+    description = "Complex subquery in FROM with joins/aggregation - materialize as CTE for 1.2x speedup"
+    suggestion = "Convert inline subquery to WITH clause for better query planning and optimization"
+
+    target_node_types = (exp.Select,)
+
+    def check(self, node: exp.Expression, context: ASTContext) -> Iterator[RuleMatch]:
+        """Detect complex subqueries in FROM that should be CTEs."""
+
+        # Only check top-level queries (not already inside subqueries)
+        if context.subquery_depth > 0:
+            return
+
+        # Skip if query already uses CTEs (already optimized)
+        if node.find(exp.With):
+            return
+
+        # Find subqueries in FROM clause
+        from_clause = node.args.get('from')
+        if not from_clause:
+            return
+
+        for subquery in from_clause.find_all(exp.Subquery):
+            inner_select = subquery.find(exp.Select)
+            if not inner_select:
+                continue
+
+            # Check complexity indicators
+            complexity_score = 0
+            indicators = []
+
+            # Multiple tables (joins)
+            tables = list(inner_select.find_all(exp.Table))
+            if len(tables) >= 3:
+                complexity_score += 2
+                indicators.append(f"{len(tables)} tables")
+
+            # Has aggregation
+            if inner_select.find(exp.AggFunc):
+                complexity_score += 2
+                indicators.append("aggregation")
+
+            # Has GROUP BY
+            if inner_select.find(exp.Group):
+                complexity_score += 1
+                indicators.append("GROUP BY")
+
+            # Has date dimension with filter
+            has_date_dim = any('date' in str(t.this).lower() for t in tables)
+            has_date_filter = False
+            where = inner_select.find(exp.Where)
+            if where and has_date_dim:
+                for col in where.find_all(exp.Column):
+                    col_name = str(col.this).lower() if col.this else ""
+                    if 'd_year' in col_name or 'd_date' in col_name or 'd_qoy' in col_name:
+                        has_date_filter = True
+                        break
+
+            if has_date_dim and has_date_filter:
+                complexity_score += 2
+                indicators.append("date filter")
+
+            # If complex enough, suggest materialization
+            if complexity_score >= 4:
+                indicator_list = ", ".join(indicators)
+                yield RuleMatch(
+                    node=subquery,
+                    context=context,
+                    message=f"💰 GOLD: Complex subquery in FROM [{indicator_list}] - "
+                           f"materialize as CTE for 1.2x speedup (Q73 pattern)",
+                    matched_text=f"FROM (SELECT ... {len(tables)} tables, {indicator_list})",
+                )
+                return  # Only report first
 
 
 # ============================================================================

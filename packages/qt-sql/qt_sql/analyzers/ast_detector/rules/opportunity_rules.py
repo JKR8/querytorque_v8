@@ -270,7 +270,7 @@ class RepeatedSubqueryOpportunity(ASTRule):
             seen[tables] = sq
 
 
-# NOTE: CorrelatedSubqueryOpportunity (window function) removed - not in MCTS knowledge base
+# NOTE: CorrelatedSubqueryOpportunity (window function) removed - not in KB
 # Use CorrelatedToPrecomputedCTEOpportunity (QT-OPT-002) for correlated subquery patterns
 
 
@@ -338,7 +338,7 @@ class CountToExistsOpportunity(ASTRule):
         return False
 
 
-# NOTE: ImplicitCrossJoinOpportunity removed - not in MCTS knowledge base
+# NOTE: ImplicitCrossJoinOpportunity removed - not in KB
 # Implicit comma-joins are a style issue, not a performance optimization
 
 
@@ -576,7 +576,7 @@ class CorrelatedToPrecomputedCTEOpportunity(ASTRule):
                 return  # Only report once per query
 
 
-# NOTE: JoinEliminationOpportunity removed - not in MCTS knowledge base
+# NOTE: JoinEliminationOpportunity removed - not in KB
 # Join elimination is handled by the database optimizer, not our transforms
 
 

@@ -4,7 +4,7 @@ Main entry point for LLM-powered optimization (Dag v2 + JSON v5):
     from qt_sql.optimization import optimize_v5_json
     result = optimize_v5_json(sql, db_path)
 
-MCTS module reserved for deterministic transform search.
+MCTS module removed; JSON v5 is the only optimization path.
 """
 
 from .payload_builder import (
@@ -57,57 +57,12 @@ from .adaptive_rewriter_v5 import (
     optimize_v5_json_queue,
 )
 
-# MCTS-based optimizer
-try:
-    from .mcts import (
-        MCTSSQLOptimizer,
-        MCTSOptimizationResult,
-        MCTSNode,
-        MCTSTree,
-        MCTSConfig,
-        TRANSFORM_REGISTRY,
-        get_all_transform_ids,
-        apply_transform,
-        PolicyNetwork,
-        PolicyConfig,
-        BenchmarkRunner,
-    )
-    MCTS_AVAILABLE = True
-except ImportError:
-    MCTS_AVAILABLE = False
-    MCTSSQLOptimizer = None
-    MCTSOptimizationResult = None
-    MCTSNode = None
-    MCTSTree = None
-    MCTSConfig = None
-    TRANSFORM_REGISTRY = None
-    get_all_transform_ids = None
-    apply_transform = None
-    PolicyNetwork = None
-    PolicyConfig = None
-    BenchmarkRunner = None
-
 __all__ = [
     # ============================================================
     # PRIMARY: Dag v2 + JSON v5 (recommended for LLM optimization)
     # ============================================================
     "optimize_v5_json",
     "optimize_v5_json_queue",
-    # ============================================================
-    # Hybrid MCTS
-    # ============================================================
-    "MCTS_AVAILABLE",
-    "MCTSSQLOptimizer",
-    "MCTSOptimizationResult",
-    "MCTSNode",
-    "MCTSTree",
-    "MCTSConfig",
-    "TRANSFORM_REGISTRY",
-    "get_all_transform_ids",
-    "apply_transform",
-    "PolicyNetwork",
-    "PolicyConfig",
-    "BenchmarkRunner",
     # ============================================================
     # UTILITIES
     # ============================================================
