@@ -1,0 +1,61 @@
+Looking at this query, I can see multiple optimization opportunities:
+
+1. **OR_TO_UNION**: The query has an OR condition between two EXISTS subqueries
+2. **DATE_CTE_ISOLATE**: The date_dim filter is repeated in multiple subqueries
+3. **PUSHDOWN**: Filters on customer_address can be pushed down early
+
+The main issue is the OR between two correlated EXISTS subqueries. We can rewrite this using UNION ALL to allow better filtering and join planning.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "or_to_union",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_moy BETWEEN 1 AND 4",
+        "filtered_customers_base": "SELECT DISTINCT c.c_customer_sk, c.c_current_cdemo_sk, cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating, cd.cd_dep_count, cd.cd_dep_employed_count, cd.cd_dep_college_count FROM customer c JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk WHERE ca.ca_county IN ('Storey County', 'Marquette County', 'Warren County', 'Cochran County', 'Kandiyohi County')",
+        "customers_with_store_sales": "SELECT fc.* FROM filtered_customers_base fc WHERE EXISTS (SELECT 1 FROM store_sales ss JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk WHERE ss.ss_customer_sk = fc.c_customer_sk)",
+        "customers_with_web_sales": "SELECT fc.* FROM filtered_customers_base fc WHERE EXISTS (SELECT 1 FROM web_sales ws JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk WHERE ws.ws_bill_customer_sk = fc.c_customer_sk)",
+        "customers_with_catalog_sales": "SELECT fc.* FROM filtered_customers_base fc WHERE EXISTS (SELECT 1 FROM catalog_sales cs JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk WHERE cs.cs_ship_customer_sk = fc.c_customer_sk)",
+        "union_customers": "SELECT * FROM customers_with_store_sales WHERE c_customer_sk IN (SELECT c_customer_sk FROM customers_with_web_sales) UNION SELECT * FROM customers_with_store_sales WHERE c_customer_sk IN (SELECT c_customer_sk FROM customers_with_catalog_sales)",
+        "main_query": "SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3, cd_dep_count, COUNT(*) AS cnt4, cd_dep_employed_count, COUNT(*) AS cnt5, cd_dep_college_count, COUNT(*) AS cnt6 FROM union_customers GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100"
+      },
+      "invariants_kept": [
+        "output columns unchanged",
+        "same result rows after aggregation",
+        "grouping grain preserved",
+        "ordering preserved"
+      ],
+      "expected_speedup": "3.5x",
+      "risk": "medium"
+    },
+    {
+      "id": "rs_02",
+      "transform": "semantic_rewrite",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_moy BETWEEN 1 AND 4",
+        "filtered_customers": "SELECT c.c_customer_sk, c.c_current_cdemo_sk, cd.* FROM customer c JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk WHERE ca.ca_county IN ('Storey County', 'Marquette County', 'Warren County', 'Cochran County', 'Kandiyohi County')",
+        "customers_with_any_sales": "SELECT DISTINCT fc.c_customer_sk, fc.c_current_cdemo_sk, fc.cd_gender, fc.cd_marital_status, fc.cd_education_status, fc.cd_purchase_estimate, fc.cd_credit_rating, fc.cd_dep_count, fc.cd_dep_employed_count, fc.cd_dep_college_count FROM filtered_customers fc WHERE EXISTS (SELECT 1 FROM store_sales ss JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk WHERE ss.ss_customer_sk = fc.c_customer_sk) AND (EXISTS (SELECT 1 FROM web_sales ws JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk WHERE ws.ws_bill_customer_sk = fc.c_customer_sk) OR EXISTS (SELECT 1 FROM catalog_sales cs JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk WHERE cs.cs_ship_customer_sk = fc.c_customer_sk))",
+        "main_query": "SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3, cd_dep_count, COUNT(*) AS cnt4, cd_dep_employed_count, COUNT(*) AS cnt5, cd_dep_college_count, COUNT(*) AS cnt6 FROM customers_with_any_sales GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100"
+      },
+      "invariants_kept": [
+        "output columns unchanged",
+        "same result rows after aggregation",
+        "grouping grain preserved",
+        "ordering preserved"
+      ],
+      "expected_speedup": "2.2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Applied OR_TO_UNION transform to decompose the OR condition between EXISTS subqueries into separate UNION branches. Also isolated date_dim filter into a reusable CTE (date_cte_isolate). This allows the optimizer to push filters earlier and avoid scanning large fact tables multiple times for the same date range. The first rewrite (rs_01) provides better speedup by fully decomposing the OR, while the second (rs_02) is a more conservative semantic rewrite that maintains the original structure but pushes filters earlier."
+}
+```
+
+**Key insights:**
+1. The OR condition between web_sales and catalog_sales EXISTS subqueries prevents efficient join planning
+2. Date filters are repeated across all subqueries - isolate them once
+3. Customer and address filters can be pushed down before checking sales existence
+4. By separating the OR branches with UNION, each branch can be optimized independently
+5. The store_sales condition is required for all customers, so it can be applied first to reduce the working set

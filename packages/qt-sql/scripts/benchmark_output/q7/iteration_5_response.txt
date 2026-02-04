@@ -1,0 +1,45 @@
+Looking at the query and the execution plan, I notice a key issue: there's an OR condition on promotion table (`(p_channel_email = 'N' OR p_channel_event = 'N')`), but the current best rewrite failed because it incorrectly handled the promotion filtering. The previous attempt tried to split the OR condition but created duplicate counting issues.
+
+Better approach: **Early filter promotion table first** to reduce the join cardinality early in the pipeline. The promotion table is small (1000 rows), so filtering it first should be cheap and significantly reduce the join with store_sales.
+
+Let me create a rewrite that:
+1. Filters promotion table early to get only rows where `p_channel_email = 'N' OR p_channel_event = 'N'`
+2. Extracts date_dim filter into a CTE
+3. Extracts customer_demographics filter into a CTE
+4. Then joins store_sales with all filtered dimension tables
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "early_filter",
+      "nodes": {
+        "date_filtered": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001",
+        "cd_filtered": "SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'F' AND cd_marital_status = 'W' AND cd_education_status = 'College'",
+        "promo_filtered": "SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'",
+        "main_query": "SELECT i_item_id, AVG(ss_quantity) AS agg1, AVG(ss_list_price) AS agg2, AVG(ss_coupon_amt) AS agg3, AVG(ss_sales_price) AS agg4 FROM store_sales ss JOIN date_filtered df ON ss.ss_sold_date_sk = df.d_date_sk JOIN cd_filtered cd ON ss.ss_cdemo_sk = cd.cd_demo_sk JOIN promo_filtered pf ON ss.ss_promo_sk = pf.p_promo_sk JOIN item i ON ss.ss_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "output columns unchanged",
+        "same grain (i_item_id)",
+        "same result rows",
+        "same ordering"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Created filtered CTEs for date_dim, customer_demographics, and promotion to reduce join cardinality early. The promotion table filter (p_channel_email = 'N' OR p_channel_event = 'N') is applied first in a small CTE (1000 rows) before the expensive store_sales join. This reduces the 52M row store_sales scan earlier in the pipeline."
+}
+```
+
+**Alternative more aggressive approach**: Since the OR condition is on the same table and doesn't involve different columns, we should NOT use OR_TO_UNION here. Instead, we should push all dimension filters as early as possible.
+
+The key insight from the execution plan: The store_sales scan (75.8% cost, 52M rows) is the bottleneck. By filtering promotion early, we reduce the join cardinality before the store_sales scan is performed in the join tree.
+
+This approach should work because:
+1. All dimension filters are pushed down to CTEs
+2. Promotion filter is applied before joining with store_sales
+3. The join order remains logically equivalent
+4. No risk of duplicate counting (unlike the failed OR_TO_UNION attempt)

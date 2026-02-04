@@ -1,0 +1,35 @@
+Looking at the query, I see a significant opportunity to apply OR-to-UNION decomposition for the promotion table conditions, combined with early filtering of dimension tables to reduce the massive store_sales scan.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "or_to_union",
+      "nodes": {
+        "date_filtered": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001",
+        "cd_filtered": "SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'F' AND cd_marital_status = 'W' AND cd_education_status = 'College'",
+        "promo_email": "SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N'",
+        "promo_event": "SELECT p_promo_sk FROM promotion WHERE p_channel_event = 'N' AND p_channel_email != 'N'",
+        "main_query": "SELECT i_item_id, AVG(ss_quantity) AS agg1, AVG(ss_list_price) AS agg2, AVG(ss_coupon_amt) AS agg3, AVG(ss_sales_price) AS agg4 FROM ((SELECT ss_item_sk, ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price FROM store_sales JOIN date_filtered ON ss_sold_date_sk = d_date_sk JOIN cd_filtered ON ss_cdemo_sk = cd_demo_sk JOIN promo_email ON ss_promo_sk = p_promo_sk) UNION ALL (SELECT ss_item_sk, ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price FROM store_sales JOIN date_filtered ON ss_sold_date_sk = d_date_sk JOIN cd_filtered ON ss_cdemo_sk = cd_demo_sk JOIN promo_event ON ss_promo_sk = p_promo_sk)) AS combined JOIN item ON ss_item_sk = i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same aggregation",
+        "same output columns"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Decomposed the OR condition (p_channel_email='N' OR p_channel_event='N') into separate UNION ALL branches with disjoint promotion filters. Created filtered CTEs for date_dim and customer_demographics to push predicates early before the large store_sales join. This reduces store_sales scans and allows better predicate pushdown."
+}
+```
+
+**Key insights:**
+1. **OR decomposition**: The condition `(p_channel_email = 'N' OR p_channel_event = 'N')` spans two columns and creates evaluation complexity. By splitting into separate promotion CTEs with UNION ALL and making them disjoint (`promo_event` excludes `p_channel_email = 'N'`), we avoid duplicate rows.
+2. **Early filtering**: Creating filtered CTEs for date_dim and customer_demographics pushes their restrictive predicates early, reducing the rows joined with store_sales.
+3. **Store_sales reduction**: The current plan scans all 52M store_sales rows. By filtering promotion, date, and customer early, we reduce this significantly.
+4. **Join reordering**: The rewritten structure allows the optimizer to push filters through the UNION ALL structure more effectively.
+
+The expected 2.5x speedup comes from reducing the store_sales scan from 52M rows to a smaller subset and allowing better predicate pushdown through the UNION ALL structure.

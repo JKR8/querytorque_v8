@@ -1,0 +1,36 @@
+Looking at the execution plan, I can see that the main cost driver is scanning the massive `store_sales` table (45.9% + 40.8% cost, ~7.6M rows). The key insight is that we can push filters from the store dimension into the store_sales scan by creating a filtered version of stores first.
+
+The join condition uses `SUBSTRING(s.s_zip, 1, 2)` which is a computed expression. We can pre-compute the valid zip prefixes from `valid_zips` and use those to filter stores early.
+
+Here's my approach:
+1. Extract distinct 2-character zip prefixes from `valid_zips`
+2. Filter stores using those prefixes (pushing the filter into store_sales)
+3. Eliminate the join on the computed expression in the main query
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "pushdown",
+      "nodes": {
+        "zip_set2": "SELECT SUBSTRING(ca_zip, 1, 5) AS ca_zip, COUNT(*) AS cnt FROM customer_address JOIN customer ON ca_address_sk = c_current_addr_sk WHERE c_preferred_cust_flag = 'Y' GROUP BY SUBSTRING(ca_zip, 1, 5) HAVING COUNT(*) > 10",
+        "valid_zips": "SELECT DISTINCT z1.ca_zip FROM zip_set1 AS z1 JOIN zip_set2 AS z2 ON z1.ca_zip = z2.ca_zip",
+        "zip_prefixes": "SELECT DISTINCT SUBSTRING(ca_zip, 1, 2) AS zip_prefix FROM valid_zips",
+        "filtered_stores": "SELECT s_store_sk, s_store_name FROM store WHERE SUBSTRING(s_zip, 1, 2) IN (SELECT zip_prefix FROM zip_prefixes)",
+        "main_query": "SELECT s.s_store_name, SUM(ss.ss_net_profit) FROM store_sales AS ss JOIN date_filtered AS df ON ss.ss_sold_date_sk = df.d_date_sk JOIN filtered_stores AS s ON ss.ss_store_sk = s.s_store_sk GROUP BY s.s_store_name HAVING NOT SUM(ss.ss_net_profit) IS NULL ORDER BY s.s_store_name LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same output columns",
+        "same aggregation results"
+      ],
+      "expected_speedup": "1.8-2.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Created zip_prefixes CTE to extract distinct 2-character zip prefixes from valid_zips, then filtered stores using those prefixes before joining with store_sales. This allows the store filter to be pushed down and reduces the number of stores that need to be joined, which in turn reduces the store_sales scan cost since we can eliminate rows early. The join condition on SUBSTRING(s.s_zip, 1, 2) = SUBSTRING(vz.ca_zip, 1, 2) is now handled in the filtered_stores CTE."
+}
+```
+
+**Key insight:** The original query joins store_sales with all stores and then filters by zip prefix. By pre-filtering stores using the valid zip prefixes, we reduce the store dimension size before joining with the massive fact table. This is similar to the reorder_join pattern but focuses on pushing the zip prefix filter into the store selection.

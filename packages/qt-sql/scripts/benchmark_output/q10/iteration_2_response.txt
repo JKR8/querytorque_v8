@@ -1,0 +1,67 @@
+Looking at this query, I can identify several optimization opportunities. The main issues are:
+1. Multiple EXISTS subqueries with OR condition (opportunity for OR_TO_UNION)
+2. Repeated date_dim joins with same filter across subqueries (opportunity for DATE_CTE_ISOLATE)
+3. Customer table filtered through multiple levels of joins
+
+I'll use a combination of transforms to address these.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "date_filter": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_moy BETWEEN 1 AND 4",
+        "store_customers": "SELECT DISTINCT ss_customer_sk FROM store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk",
+        "web_customers": "SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN date_filter ON ws_sold_date_sk = d_date_sk",
+        "catalog_customers": "SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN date_filter ON cs_sold_date_sk = d_date_sk",
+        "main_query": "SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3, cd_dep_count, COUNT(*) AS cnt4, cd_dep_employed_count, COUNT(*) AS cnt5, cd_dep_college_count, COUNT(*) AS cnt6 FROM customer c JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics cd ON cd_demo_sk = c.c_current_cdemo_sk WHERE ca_county IN ('Storey County', 'Marquette County', 'Warren County', 'Cochran County', 'Kandiyohi County') AND c.c_customer_sk IN (SELECT ss_customer_sk FROM store_customers) AND (c.c_customer_sk IN (SELECT ws_bill_customer_sk FROM web_customers) OR c.c_customer_sk IN (SELECT cs_ship_customer_sk FROM catalog_customers)) GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "1.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "or_to_union",
+      "nodes": {
+        "date_filter": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_moy BETWEEN 1 AND 4",
+        "store_customers": "SELECT DISTINCT ss_customer_sk FROM store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk",
+        "web_customers": "SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN date_filter ON ws_sold_date_sk = d_date_sk",
+        "catalog_customers": "SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN date_filter ON cs_sold_date_sk = d_date_sk",
+        "eligible_customers": "SELECT DISTINCT sc.ss_customer_sk FROM store_customers sc JOIN web_customers wc ON sc.ss_customer_sk = wc.ws_bill_customer_sk UNION SELECT DISTINCT sc.ss_customer_sk FROM store_customers sc JOIN catalog_customers cc ON sc.ss_customer_sk = cc.cs_ship_customer_sk",
+        "main_query": "SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3, cd_dep_count, COUNT(*) AS cnt4, cd_dep_employed_count, COUNT(*) AS cnt5, cd_dep_college_count, COUNT(*) AS cnt6 FROM customer c JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics cd ON cd_demo_sk = c.c_current_cdemo_sk JOIN eligible_customers ec ON c.c_customer_sk = ec.ss_customer_sk WHERE ca_county IN ('Storey County', 'Marquette County', 'Warren County', 'Cochran County', 'Kandiyohi County') GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Applied two-phase optimization: First, isolated date_dim filtering into a reusable CTE, creating pre-filtered customer sets for each sales channel. Second, transformed the OR condition between web and catalog sales into a UNION of two joins, which allows parallel execution and better use of indexes. The date CTE eliminates repeated date_dim scans, while the UNION transform enables the optimizer to choose optimal join strategies for each branch separately."
+}
+```
+
+**Key insights:**
+1. **Date CTE Isolation**: The same date filter (d_year=2001, d_moy BETWEEN 1 AND 4) is used in three EXISTS subqueries. Creating a reusable CTE reduces scanning date_dim from 3 times to 1 time.
+
+2. **OR to UNION transformation**: The OR condition between web_sales and catalog_sales prevents the optimizer from using optimal join strategies. Splitting into UNION branches allows:
+   - Separate statistics and join planning for each branch
+   - Parallel execution of both branches
+   - Better index usage on web_sales and catalog_sales
+
+3. **Early filtering**: By creating pre-filtered customer sets (store_customers, web_customers, catalog_customers), we reduce the data volume early in the query pipeline.
+
+4. **Join instead of EXISTS**: Converting EXISTS to JOINs allows the optimizer to consider different join algorithms (hash join, merge join) based on data distribution.
+
+The combination of these transforms addresses the major inefficiencies in the execution plan, particularly the expensive sequential scans on store_sales, web_sales, and catalog_sales tables with billions of rows.

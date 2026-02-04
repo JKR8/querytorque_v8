@@ -1,0 +1,40 @@
+Looking at this query, I can see several optimization opportunities:
+
+1. **Date CTE Isolation**: The date_dim filter is a range condition that can be isolated early
+2. **EXISTS/NOT EXISTS decorrelation**: The EXISTS subquery on catalog_sales and NOT EXISTS on catalog_returns can be rewritten as joins
+3. **Early filtering**: Dimension tables (customer_address, call_center) have selective filters that can be applied before joins
+
+The biggest opportunity is decorrelating the EXISTS/NOT EXISTS subqueries which are currently causing correlated scans. Let me create a rewrite set that:
+- Extracts date range into a CTE
+- Applies dimension filters early
+- Rewrites EXISTS as a semi-join and NOT EXISTS as an anti-join
+- Materializes the multi-warehouse condition
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "decorrelate",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '2002-4-01' AND (CAST('2002-4-01' AS DATE) + INTERVAL '60' DAY)",
+        "filtered_address": "SELECT ca_address_sk FROM customer_address WHERE ca_state = 'WV'",
+        "filtered_call_center": "SELECT cc_call_center_sk FROM call_center WHERE cc_county IN ('Ziebach County', 'Luce County', 'Richland County', 'Daviess County', 'Barrow County')",
+        "multi_warehouse_orders": "SELECT DISTINCT cs_order_number FROM catalog_sales GROUP BY cs_order_number HAVING COUNT(DISTINCT cs_warehouse_sk) > 1",
+        "orders_with_returns": "SELECT DISTINCT cr_order_number FROM catalog_returns",
+        "filtered_cs1": "SELECT cs1.* FROM catalog_sales cs1 JOIN filtered_dates fd ON cs1.cs_ship_date_sk = fd.d_date_sk JOIN filtered_address fa ON cs1.cs_ship_addr_sk = fa.ca_address_sk JOIN filtered_call_center fcc ON cs1.cs_call_center_sk = fcc.cc_call_center_sk",
+        "main_query": "SELECT COUNT(DISTINCT cs_order_number) AS \"order count\", SUM(cs_ext_ship_cost) AS \"total shipping cost\", SUM(cs_net_profit) AS \"total net profit\" FROM filtered_cs1 fcs1 JOIN multi_warehouse_orders mwo ON fcs1.cs_order_number = mwo.cs_order_number LEFT JOIN orders_with_returns owr ON fcs1.cs_order_number = owr.cr_order_number WHERE owr.cr_order_number IS NULL ORDER BY COUNT(DISTINCT cs_order_number) LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same column output",
+        "same aggregation semantics",
+        "same ordering"
+      ],
+      "expected_speedup": "3.0x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "1) Isolated date range into CTE to reduce date_dim scan. 2) Applied dimension filters (customer_address.ca_state='WV', call_center.cc_county IN list) early in separate CTEs. 3) Decorrelated EXISTS subquery by creating CTE of orders with multiple warehouses using DISTINCT warehouse count. 4) Decorrelated NOT EXISTS by creating CTE of orders with returns and using LEFT JOIN...IS NULL anti-join pattern. This eliminates correlated subqueries and allows each CTE to be scanned once with proper filters."
+}
+```

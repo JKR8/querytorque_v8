@@ -278,13 +278,46 @@ class SQLValidator:
         # Step 6: Determine status
         if not row_counts_match:
             status = ValidationStatus.FAIL
-            errors.append(
-                f"Row count mismatch: original={benchmark_result.original.row_count}, "
-                f"optimized={benchmark_result.optimized.row_count}"
-            )
+            # Build detailed error message for LLM feedback
+            orig_count = benchmark_result.original.row_count
+            opt_count = benchmark_result.optimized.row_count
+
+            error_parts = [
+                f"SEMANTIC ERROR: Row count mismatch (original={orig_count}, optimized={opt_count})",
+            ]
+
+            # Determine likely cause
+            if opt_count < orig_count:
+                error_parts.append(f"Your query DROPPED {orig_count - opt_count} rows - likely an incorrect filter or JOIN condition")
+            else:
+                error_parts.append(f"Your query ADDED {opt_count - orig_count} extra rows - likely a missing DISTINCT or incorrect JOIN")
+
+            # Show sample rows from original
+            if benchmark_result.original.rows:
+                sample_orig = benchmark_result.original.rows[:3]
+                error_parts.append(f"Original query sample (first 3 of {orig_count} rows): {sample_orig}")
+
+            # Show sample rows from optimized
+            if benchmark_result.optimized.rows:
+                sample_opt = benchmark_result.optimized.rows[:3]
+                error_parts.append(f"Optimized query sample (first 3 of {opt_count} rows): {sample_opt}")
+
+            # Include the problematic SQL
+            error_parts.append(f"Your optimized SQL that failed:\n```sql\n{optimized_sql}\n```")
+
+            errors.append("\n".join(error_parts))
         elif not values_match:
             status = ValidationStatus.FAIL
-            errors.append("Value mismatch detected between original and optimized results")
+            error_parts = [
+                "SEMANTIC ERROR: Value mismatch - row counts match but VALUES differ",
+            ]
+            if value_differences:
+                error_parts.append(f"Sample differences: {value_differences[:5]}")
+            if benchmark_result.original.rows and benchmark_result.optimized.rows:
+                error_parts.append(f"Original row 0: {benchmark_result.original.rows[0]}")
+                error_parts.append(f"Optimized row 0: {benchmark_result.optimized.rows[0]}")
+            error_parts.append(f"Your optimized SQL that failed:\n```sql\n{optimized_sql}\n```")
+            errors.append("\n".join(error_parts))
         else:
             status = ValidationStatus.PASS
 

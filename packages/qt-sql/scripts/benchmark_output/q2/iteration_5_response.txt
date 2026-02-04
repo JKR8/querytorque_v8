@@ -1,0 +1,35 @@
+Looking at the query structure and the failed attempts, I can see the main issue: the original query compares weeks from consecutive years (1998 and 1999) using a week sequence offset of 53. The failed attempts tried to filter both years in one CTE, which changed the semantics. Instead, we should isolate the date dimension filtering early and push it down to reduce the data volume for the expensive UNION ALL of web_sales and catalog_sales.
+
+Here's my approach:
+1. Create date CTEs for 1998 and 1999 weeks early to filter date_dim once
+2. Filter the sales data by year before the expensive aggregation
+3. Use a semantic rewrite to compute both years' data in parallel
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "wscs_1998": "SELECT ws_sold_date_sk AS sold_date_sk, ws_ext_sales_price AS sales_price FROM web_sales WHERE EXISTS (SELECT 1 FROM date_dim WHERE d_date_sk = ws_sold_date_sk AND d_year = 1998) UNION ALL SELECT cs_sold_date_sk AS sold_date_sk, cs_ext_sales_price AS sales_price FROM catalog_sales WHERE EXISTS (SELECT 1 FROM date_dim WHERE d_date_sk = cs_sold_date_sk AND d_year = 1998)",
+        "wscs_1999": "SELECT ws_sold_date_sk AS sold_date_sk, ws_ext_sales_price AS sales_price FROM web_sales WHERE EXISTS (SELECT 1 FROM date_dim WHERE d_date_sk = ws_sold_date_sk AND d_year = 1999) UNION ALL SELECT cs_sold_date_sk AS sold_date_sk, cs_ext_sales_price AS sales_price FROM catalog_sales WHERE EXISTS (SELECT 1 FROM date_dim WHERE d_date_sk = cs_sold_date_sk AND d_year = 1999)",
+        "dates_1998": "SELECT d_date_sk, d_week_seq FROM date_dim WHERE d_year = 1998",
+        "dates_1999": "SELECT d_date_sk, d_week_seq FROM date_dim WHERE d_year = 1999",
+        "wswscs_1998": "SELECT d.d_week_seq, SUM(CASE WHEN (d.d_day_name = 'Sunday') THEN w.sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d.d_day_name = 'Monday') THEN w.sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d.d_day_name = 'Tuesday') THEN w.sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d.d_day_name = 'Wednesday') THEN w.sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d.d_day_name = 'Thursday') THEN w.sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d.d_day_name = 'Friday') THEN w.sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d.d_day_name = 'Saturday') THEN w.sales_price ELSE NULL END) AS sat_sales FROM wscs_1998 w JOIN dates_1998 d ON d.d_date_sk = w.sold_date_sk GROUP BY d.d_week_seq",
+        "wswscs_1999": "SELECT d.d_week_seq, SUM(CASE WHEN (d.d_day_name = 'Sunday') THEN w.sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d.d_day_name = 'Monday') THEN w.sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d.d_day_name = 'Tuesday') THEN w.sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d.d_day_name = 'Wednesday') THEN w.sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d.d_day_name = 'Thursday') THEN w.sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d.d_day_name = 'Friday') THEN w.sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d.d_day_name = 'Saturday') THEN w.sales_price ELSE NULL END) AS sat_sales FROM wscs_1999 w JOIN dates_1999 d ON d.d_date_sk = w.sold_date_sk GROUP BY d.d_week_seq",
+        "main_query": "SELECT y.d_week_seq AS d_week_seq1, ROUND(y.sun_sales / z.sun_sales, 2), ROUND(y.mon_sales / z.mon_sales, 2), ROUND(y.tue_sales / z.tue_sales, 2), ROUND(y.wed_sales / z.wed_sales, 2), ROUND(y.thu_sales / z.thu_sales, 2), ROUND(y.fri_sales / z.fri_sales, 2), ROUND(y.sat_sales / z.sat_sales, 2) FROM wswscs_1998 y JOIN wswscs_1999 z ON y.d_week_seq = z.d_week_seq - 53 ORDER BY y.d_week_seq"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "3.0x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Isolated date_dim filtering into separate CTEs for 1998 and 1999, then pushed year filters early into wscs CTEs using EXISTS subqueries. This reduces the massive UNION ALL of web_sales and catalog_sales to only include rows from the target years before aggregation. The main query then joins the pre-computed weekly aggregates for both years directly."
+}
+```

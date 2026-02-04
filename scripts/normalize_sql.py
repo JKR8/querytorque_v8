@@ -63,13 +63,17 @@ class SQLNormalizer:
             # Parse SQL
             ast = sqlglot.parse_one(sql, dialect=dialect)
 
-            # Step 1: Classify and rename tables
+            # Step 1: Alphabetize predicates FIRST (before renaming)
+            # This ensures column names are assigned in consistent order
+            ast = self._alphabetize_predicates(ast)
+
+            # Step 2: Classify and rename tables
             self._normalize_tables(ast)
 
-            # Step 2: Rename columns
+            # Step 3: Rename columns (now in alphabetized order)
             self._normalize_columns(ast)
 
-            # Step 3: Abstract literals
+            # Step 4: Abstract literals
             normalized_ast = self._abstract_literals(ast)
 
             # Generate normalized SQL
@@ -207,6 +211,58 @@ class SQLNormalizer:
             literal.set("is_string", True)  # Treat as string to preserve quotes
 
         return ast
+
+    def _alphabetize_predicates(self, ast: exp.Expression) -> exp.Expression:
+        """Sort AND/OR predicates alphabetically for canonical form.
+
+        This ensures:
+            WHERE a=1 AND b=2
+            WHERE b=2 AND a=1
+        Both become:
+            WHERE a=1 AND b=2
+        """
+
+        def sort_binary_op(node: exp.Expression) -> exp.Expression:
+            """Recursively sort AND/OR operands alphabetically."""
+            if isinstance(node, (exp.And, exp.Or)):
+                # Collect all operands of the same type
+                operands = []
+                op_type = type(node)
+
+                def collect_operands(n):
+                    if isinstance(n, op_type):
+                        collect_operands(n.left)
+                        collect_operands(n.right)
+                    else:
+                        # Recursively sort nested expressions first
+                        sorted_n = sort_binary_op(n)
+                        operands.append(sorted_n)
+
+                collect_operands(node)
+
+                # Sort operands by their SQL string representation
+                operands.sort(key=lambda x: x.sql())
+
+                # Rebuild the tree from sorted operands
+                if len(operands) == 0:
+                    return node
+                elif len(operands) == 1:
+                    return operands[0]
+                else:
+                    result = operands[0]
+                    for operand in operands[1:]:
+                        result = op_type(this=result, expression=operand)
+                    return result
+            else:
+                # For non-AND/OR nodes, recurse into children
+                for key, value in node.args.items():
+                    if isinstance(value, exp.Expression):
+                        node.set(key, sort_binary_op(value))
+                    elif isinstance(value, list):
+                        node.set(key, [sort_binary_op(v) if isinstance(v, exp.Expression) else v for v in value])
+                return node
+
+        return sort_binary_op(ast)
 
     def _is_fact_table(self, name: str) -> bool:
         """Heuristic to detect fact tables from name."""

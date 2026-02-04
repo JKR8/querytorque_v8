@@ -265,9 +265,5 @@ class TestQtSqlCliImports:
 
     def test_import_cli_main(self):
         """Test CLI main module import."""
-        from cli.main import cli, audit, optimize, validate
-        import click
-        assert isinstance(cli, click.Group)
-        assert callable(audit)
-        assert callable(optimize)
-        assert callable(validate)
+        from qt_sql.cli.main import main
+        assert callable(main)

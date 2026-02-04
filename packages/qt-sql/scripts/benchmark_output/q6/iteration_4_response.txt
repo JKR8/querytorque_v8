@@ -1,0 +1,40 @@
+Looking at the query structure and execution plan, I notice a key optimization opportunity: **the fact table (store_sales) is being filtered by date but NOT by the item/customer filters until much later**. The current filtered_sales_items CTE only applies date filtering, leaving it to join with massive dimension tables later.
+
+**Better approach**: Create a CTE that filters store_sales by ALL relevant filters EARLY - both date AND item/customer conditions - to drastically reduce the fact table rows before expensive joins.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "multi_push_predicate",
+      "nodes": {
+        "target_month_seq": "SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2002 AND d_moy = 3",
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_month_seq = (SELECT d_month_seq FROM target_month_seq)",
+        "filtered_items_by_price": "SELECT i_item_sk, i_category FROM item i JOIN category_avg_price cap ON i.i_category = cap.i_category WHERE i.i_current_price > cap.avg_threshold",
+        "early_filtered_sales": "SELECT ss_customer_sk, ss_item_sk FROM store_sales ss JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk JOIN filtered_items_by_price fip ON ss.ss_item_sk = fip.i_item_sk",
+        "main_query": "SELECT a.ca_state AS state, COUNT(*) AS cnt FROM customer_address a JOIN customer c ON a.ca_address_sk = c.c_current_addr_sk JOIN early_filtered_sales s ON c.c_customer_sk = s.ss_customer_sk GROUP BY a.ca_state HAVING COUNT(*) >= 10 ORDER BY cnt, a.ca_state LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows", 
+        "same output columns",
+        "same grouping grain"
+      ],
+      "expected_speedup": "1.8-2.5x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Applied multi-push predicate optimization: (1) Created filtered_items_by_price CTE to isolate expensive item-price comparison early, (2) Created early_filtered_sales CTE that joins store_sales with BOTH date AND item filters BEFORE joining with customer/customer_address dimension tables. This reduces the fact table rows early from ~2.6M to only those matching both date AND item price conditions, before expensive dimension table joins. The main query then only needs to join this already-filtered fact table with customer/customer_address tables."
+}
+```
+
+**Key differences from previous approaches:**
+1. **Item filter pushdown**: Instead of filtering items after all joins, we filter items by price threshold EARLY and use that to filter store_sales
+2. **Fact table reduction**: The store_sales table is filtered by BOTH date AND item conditions before any customer joins
+3. **Removed redundant join**: The main query no longer needs to join with item table at all since item filtering is already done
+
+**Why this achieves >2x speedup:**
+- Store_sales scan cost (82.5% of total) is dramatically reduced by applying both date AND item filters early
+- Avoids joining 2.6M fact rows with customer and customer_address tables (each with millions of rows)
+- Eliminates the late-stage item join and price comparison
+- Better aligns with star schema optimization principles: filter fact table by all applicable dimension predicates early

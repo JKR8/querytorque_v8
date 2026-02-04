@@ -317,10 +317,18 @@ def audit(
 @click.option("--model", default=None, help="LLM model name")
 @click.option("--output", "-o", type=click.Path(), help="Output file for optimized SQL")
 @click.option("--dry-run", is_flag=True, help="Show what would be optimized without calling LLM")
-@click.option("--sample-db", type=click.Path(), help="Sample database for validation")
-@click.option("--full-db", type=click.Path(), help="Full database for benchmarking")
+@click.option("--sample-db", type=click.Path(), help="Sample database for validation (DuckDB path)")
+@click.option("--full-db", type=click.Path(), help="Full database for benchmarking (DuckDB path)")
 @click.option("--database", "-d", type=click.Path(), help="Database path (used as sample-db if not specified)")
 @click.option("--show-prompt", is_flag=True, help="Display the full prompt sent to LLM")
+# PostgreSQL connection options
+@click.option("--db-type", type=click.Choice(['duckdb', 'postgres']), default='duckdb', help="Database type (duckdb or postgres)")
+@click.option("--pg-host", default=None, help="PostgreSQL host (default: localhost or QT_POSTGRES_HOST)")
+@click.option("--pg-port", type=int, default=None, help="PostgreSQL port (default: 5432 or QT_POSTGRES_PORT)")
+@click.option("--pg-database", default=None, help="PostgreSQL database name (or QT_POSTGRES_DATABASE)")
+@click.option("--pg-user", default=None, help="PostgreSQL username (or QT_POSTGRES_USER)")
+@click.option("--pg-password", default=None, help="PostgreSQL password (or QT_POSTGRES_PASSWORD)")
+@click.option("--pg-dsn", default=None, help="PostgreSQL DSN (postgresql://user:pass@host:port/db)")
 # V5 Mode selection
 @click.option("--mode", type=click.Choice(['retry', 'corrective', 'parallel', 'tournament', 'evolutionary', 'stacking'], case_sensitive=False), help="V5 optimization mode")
 @click.option("--retries", type=int, default=3, help="Max retries for retry mode (default: 3)")
@@ -343,6 +351,13 @@ def optimize(
     full_db: Optional[str],
     database: Optional[str],
     show_prompt: bool,
+    db_type: str,
+    pg_host: Optional[str],
+    pg_port: Optional[int],
+    pg_database: Optional[str],
+    pg_user: Optional[str],
+    pg_password: Optional[str],
+    pg_dsn: Optional[str],
     mode: Optional[str],
     retries: int,
     workers: int,
@@ -355,7 +370,23 @@ def optimize(
 ):
     """Optimize SQL using LLM-powered V5 optimizer.
 
-    Three optimization modes available:
+    Supports DuckDB (default) and PostgreSQL databases.
+
+    \b
+    DATABASE CONNECTION:
+        DuckDB (default):
+            qt-sql optimize query.sql -d /path/to/db.duckdb
+
+        PostgreSQL:
+            qt-sql optimize query.sql --db-type postgres --pg-dsn "postgres://user:pass@host:port/db"
+            qt-sql optimize query.sql --db-type postgres --pg-host localhost --pg-port 5433 --pg-database mydb
+
+        Environment variables (PostgreSQL):
+            QT_POSTGRES_HOST, QT_POSTGRES_PORT, QT_POSTGRES_DATABASE,
+            QT_POSTGRES_USER, QT_POSTGRES_PASSWORD
+
+    \b
+    OPTIMIZATION MODES:
 
     \b
     MODE 1: RETRY (default) - Single worker with error feedback
@@ -386,8 +417,12 @@ def optimize(
 
     \b
     Examples:
+        # DuckDB
         qt-sql optimize q1.sql --mode retry --sample-db sample.db --full-db full.db
         qt-sql optimize q1.sql --mode parallel --workers 3
+
+        # PostgreSQL
+        qt-sql optimize q1.sql --db-type postgres --pg-dsn "postgres://user:pass@localhost:5433/db" --dry-run
         qt-sql optimize q1.sql --mode evolutionary --iterations 5
         qt-sql optimize q1.sql --mode stacking --save-results results/q1/
     """
@@ -413,6 +448,30 @@ def optimize(
         mode = mode_map.get(mode.lower(), mode.lower())
 
     # Handle database parameters
+    # For PostgreSQL, construct DSN and use as both sample_db and full_db
+    if db_type == 'postgres':
+        if pg_dsn:
+            # Use provided DSN
+            pg_connection = pg_dsn
+        else:
+            # Construct DSN from individual params or env vars
+            import os
+            _host = pg_host or os.getenv("QT_POSTGRES_HOST", "localhost")
+            _port = pg_port or int(os.getenv("QT_POSTGRES_PORT", "5432"))
+            _database = pg_database or os.getenv("QT_POSTGRES_DATABASE", "postgres")
+            _user = pg_user or os.getenv("QT_POSTGRES_USER", "postgres")
+            _password = pg_password or os.getenv("QT_POSTGRES_PASSWORD", "")
+            pg_connection = f"postgres://{_user}:{_password}@{_host}:{_port}/{_database}"
+
+        # Use postgres connection for both sample and full db
+        if not sample_db:
+            sample_db = pg_connection
+        if not full_db:
+            full_db = pg_connection
+        if not database:
+            database = pg_connection
+
+    # For DuckDB, use file paths
     if not sample_db and database:
         sample_db = database
     if not full_db and database:
@@ -460,6 +519,49 @@ def optimize(
                 console.print("[red]Error: --full-db required for evolutionary mode[/red]")
                 console.print("[dim]Example: qt-sql optimize query.sql --mode evolutionary --full-db full.db[/dim]")
                 sys.exit(1)
+
+        # Handle dry-run: generate and show the prompt without calling LLM
+        if dry_run:
+            console.print(f"\n[dim]Sample DB: {sample_db}[/dim]")
+            console.print(f"[dim]Full DB: {full_db}[/dim]")
+            console.print()
+
+            from qt_sql.execution.database_utils import run_explain_analyze
+            from qt_sql.optimization.dag_v2 import DagV2Pipeline
+            from qt_sql.optimization.dag_v3 import get_matching_examples, build_prompt_with_examples
+
+            # Get execution plan
+            explain_result = run_explain_analyze(sample_db, sql)
+            plan_text = "(execution plan not available)"
+            if explain_result:
+                plan_text = explain_result.get("plan_text") or plan_text
+
+            # Get ML-recommended examples
+            examples = get_matching_examples(sql)
+            console.print(f"[bold]ML-recommended examples ({len(examples)}):[/bold]")
+            for ex in examples[:5]:
+                console.print(f"  - {ex.id}: {ex.name} ({ex.verified_speedup})")
+            if len(examples) > 5:
+                console.print(f"  ... and {len(examples) - 5} more")
+
+            # Build the prompt (same as what would be sent to LLM)
+            pipeline = DagV2Pipeline(sql)
+            base_prompt = pipeline.get_prompt()
+            prompt = build_prompt_with_examples(
+                base_prompt=base_prompt,
+                examples=examples[:3],
+                execution_plan=plan_text,
+            )
+
+            console.print(f"\n[dim]Prompt: {len(prompt)} chars (~{len(prompt)//4} tokens)[/dim]")
+
+            if show_prompt:
+                console.print("\n[bold]Prompt:[/bold]")
+                console.print(Panel(prompt[:4000] + "\n\n... [truncated] ..." if len(prompt) > 4000 else prompt,
+                                  title="LLM Prompt", border_style="blue"))
+
+            console.print("\n[yellow]Dry run mode - LLM call skipped.[/yellow]")
+            return
 
         # Run the appropriate mode
         if mode == 'retry':

@@ -1,0 +1,74 @@
+Looking at the query and failed attempts, I can see the pattern from previous attempts was to try to precompute multi-warehouse orders and returned orders using CTEs, but this is changing the semantics because the EXISTS and NOT EXISTS subqueries in the original query are correlated to the outer query's filters (date, address, call_center). The precomputed CTEs without those filters produce different results.
+
+Let me analyze the query structure:
+1. Main FROM clause joins catalog_sales (cs1) with date_dim, customer_address, call_center
+2. WHERE clause has date range filter, state filter, and county filter
+3. EXISTS subquery checks for same order in different warehouse
+4. NOT EXISTS subquery checks for no returns for that order
+
+The key insight is that the EXISTS and NOT EXISTS subqueries should be evaluated **after** applying the dimension filters from the main query, not on the entire unfiltered tables.
+
+Here's a correct approach using `early_filter` and `decorrelate`:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "early_filter",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '2002-4-01' AND (CAST('2002-4-01' AS DATE) + INTERVAL '60' DAY)",
+        "filtered_addresses": "SELECT ca_address_sk FROM customer_address WHERE ca_state = 'WV'",
+        "filtered_call_centers": "SELECT cc_call_center_sk FROM call_center WHERE cc_county IN ('Ziebach County', 'Luce County', 'Richland County', 'Daviess County', 'Barrow County')",
+        "filtered_cs1": "SELECT cs1.cs_order_number, cs1.cs_ext_ship_cost, cs1.cs_net_profit FROM catalog_sales cs1 JOIN filtered_dates ON cs1.cs_ship_date_sk = filtered_dates.d_date_sk JOIN filtered_addresses ON cs1.cs_ship_addr_sk = filtered_addresses.ca_address_sk JOIN filtered_call_centers ON cs1.cs_call_center_sk = filtered_call_centers.cc_call_center_sk",
+        "multi_warehouse_orders": "SELECT cs2.cs_order_number FROM catalog_sales cs2 JOIN filtered_cs1 fcs1 ON cs2.cs_order_number = fcs1.cs_order_number WHERE EXISTS (SELECT 1 FROM filtered_cs1 fcs2 WHERE fcs2.cs_order_number = fcs1.cs_order_number AND fcs2.rowid != fcs1.rowid)",
+        "non_returned_orders": "SELECT fcs1.cs_order_number FROM filtered_cs1 fcs1 WHERE NOT EXISTS (SELECT 1 FROM catalog_returns cr WHERE cr.cr_order_number = fcs1.cs_order_number)",
+        "main_query": "SELECT COUNT(DISTINCT fcs1.cs_order_number) AS \"order count\", SUM(fcs1.cs_ext_ship_cost) AS \"total shipping cost\", SUM(fcs1.cs_net_profit) AS \"total net profit\" FROM filtered_cs1 fcs1 WHERE EXISTS (SELECT 1 FROM catalog_sales cs2 WHERE fcs1.cs_order_number = cs2.cs_order_number AND fcs1.cs_warehouse_sk <> cs2.cs_warehouse_sk) AND NOT EXISTS (SELECT 1 FROM catalog_returns cr WHERE fcs1.cs_order_number = cr.cr_order_number) ORDER BY COUNT(DISTINCT fcs1.cs_order_number) LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same output columns",
+        "same aggregation",
+        "same ordering"
+      ],
+      "expected_speedup": "2.0x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+Actually, I realize even this approach has issues with the EXISTS correlation. Let me try a different approach that properly handles the correlation while still pushing filters early:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "decorrelate",
+      "nodes": {
+        "filtered_base": "SELECT cs.cs_order_number, cs.cs_ext_ship_cost, cs.cs_net_profit, cs.cs_warehouse_sk FROM catalog_sales cs JOIN date_dim d ON cs.cs_ship_date_sk = d.d_date_sk JOIN customer_address ca ON cs.cs_ship_addr_sk = ca.ca_address_sk JOIN call_center cc ON cs.cs_call_center_sk = cc.cc_call_center_sk WHERE d.d_date BETWEEN '2002-4-01' AND (CAST('2002-4-01' AS DATE) + INTERVAL '60' DAY) AND ca.ca_state = 'WV' AND cc.cc_county IN ('Ziebach County', 'Luce County', 'Richland County', 'Daviess County', 'Barrow County')",
+        "orders_with_multiple_warehouses": "SELECT cs_order_number FROM filtered_base GROUP BY cs_order_number HAVING COUNT(DISTINCT cs_warehouse_sk) > 1",
+        "orders_with_returns": "SELECT DISTINCT cr_order_number FROM catalog_returns",
+        "main_query": "SELECT COUNT(DISTINCT fb.cs_order_number) AS \"order count\", SUM(fb.cs_ext_ship_cost) AS \"total shipping cost\", SUM(fb.cs_net_profit) AS \"total net profit\" FROM filtered_base fb WHERE fb.cs_order_number IN (SELECT cs_order_number FROM orders_with_multiple_warehouses) AND fb.cs_order_number NOT IN (SELECT cr_order_number FROM orders_with_returns) ORDER BY COUNT(DISTINCT fb.cs_order_number) LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same output columns",
+        "same aggregation",
+        "same ordering"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Explanation:** This approach correctly handles the correlation by:
+1. Creating a `filtered_base` CTE that applies all dimension filters early (date, address, call_center)
+2. Finding orders with multiple warehouses **within the filtered set** (not the entire catalog_sales table)
+3. Finding all returned orders (this can be from entire catalog_returns as the NOT EXISTS checks the entire table)
+4. Using IN and NOT IN instead of EXISTS/NOT EXISTS for better performance
+
+The key difference from failed attempts is that `orders_with_multiple_warehouses` is computed from `filtered_base` (which already has dimension filters applied), not from the entire catalog_sales table. This preserves the correlation semantics where the EXISTS subquery sees the same filtered set as the outer query.

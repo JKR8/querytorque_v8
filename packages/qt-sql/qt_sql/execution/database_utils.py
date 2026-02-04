@@ -1,15 +1,48 @@
 """Database utilities for SQL optimization.
 
 Functions for running EXPLAIN ANALYZE and fetching schema with stats.
-Adapted for CLI usage with direct database paths.
+Supports both DuckDB (file paths) and PostgreSQL (DSN strings).
 """
 
 import logging
 import re
 from pathlib import Path
-from typing import Any, Optional, Set
+from typing import Any, Optional, Set, Union
 
 logger = logging.getLogger(__name__)
+
+
+def _detect_db_type(database_path: str) -> str:
+    """Detect database type from path or DSN.
+
+    Args:
+        database_path: Database path or connection string
+
+    Returns:
+        "duckdb" or "postgres"
+    """
+    path_lower = database_path.lower()
+    if path_lower.startswith("postgres://") or path_lower.startswith("postgresql://"):
+        return "postgres"
+    if path_lower.startswith("snowflake://"):
+        return "snowflake"
+    if path_lower.startswith("duckdb://"):
+        return "duckdb"
+    # Default to DuckDB for file paths
+    return "duckdb"
+
+
+def _get_executor(database_path: str):
+    """Get the appropriate executor for a database path/DSN.
+
+    Args:
+        database_path: Database path or connection string
+
+    Returns:
+        Executor instance (DuckDBExecutor or PostgresExecutor)
+    """
+    from .factory import create_executor_from_dsn
+    return create_executor_from_dsn(database_path)
 
 
 def extract_table_names(sql: str) -> Set[str]:
@@ -71,8 +104,10 @@ def fetch_schema_with_stats(
 ) -> Optional[dict]:
     """Fetch schema with stats (row counts, indexes, primary keys).
 
+    Supports both DuckDB file paths and PostgreSQL DSN strings.
+
     Args:
-        database_path: Path to DuckDB database file
+        database_path: Path to DuckDB database file or PostgreSQL DSN
         sql: Optional SQL query to filter tables by
 
     Returns:
@@ -98,9 +133,10 @@ def fetch_schema_with_stats(
             logger.debug(f"Filtering schema to tables: {referenced_tables}")
 
     try:
-        from .duckdb_executor import DuckDBExecutor
+        db = _get_executor(database_path)
+        db_type = _detect_db_type(database_path)
 
-        with DuckDBExecutor(database_path, read_only=True) as db:
+        with db:
             # Get base schema
             schema_info = db.get_schema_info(include_row_counts=True)
 
@@ -126,7 +162,7 @@ def fetch_schema_with_stats(
 
             return {
                 "tables": tables_with_stats,
-                "source": "database",
+                "source": db_type,
             }
 
     except Exception as e:
@@ -140,8 +176,10 @@ def run_explain_analyze(
 ) -> Optional[dict]:
     """Run EXPLAIN ANALYZE on SQL and return execution plan analysis.
 
+    Supports both DuckDB file paths and PostgreSQL DSN strings.
+
     Args:
-        database_path: Path to DuckDB database file
+        database_path: Path to DuckDB database file or PostgreSQL DSN
         sql: SQL query to explain
 
     Returns:
@@ -150,9 +188,19 @@ def run_explain_analyze(
             "execution_time_ms": 12.5,
             "plan_text": "...",  # Raw EXPLAIN output
             "plan_json": {...},  # Parsed JSON plan
-            "row_estimates": {...},
+            "actual_rows": ...,
         }
     """
+    db_type = _detect_db_type(database_path)
+
+    if db_type == "postgres":
+        return _run_explain_analyze_postgres(database_path, sql)
+    else:
+        return _run_explain_analyze_duckdb(database_path, sql)
+
+
+def _run_explain_analyze_duckdb(database_path: str, sql: str) -> Optional[dict]:
+    """Run EXPLAIN ANALYZE on DuckDB."""
     try:
         from .duckdb_executor import DuckDBExecutor
         import duckdb
@@ -198,8 +246,87 @@ def run_explain_analyze(
             return result
 
     except Exception as e:
-        logger.warning(f"Failed to run EXPLAIN: {e}")
+        logger.warning(f"Failed to run DuckDB EXPLAIN: {e}")
         return None
+
+
+def _run_explain_analyze_postgres(database_path: str, sql: str) -> Optional[dict]:
+    """Run EXPLAIN ANALYZE on PostgreSQL."""
+    try:
+        from .factory import PostgresConfig
+        import json as json_mod
+
+        config = PostgresConfig.from_dsn(database_path)
+        db = config.get_executor()
+
+        with db:
+            result = {
+                "execution_time_ms": None,
+                "plan_text": None,
+                "plan_json": None,
+                "actual_rows": None,
+            }
+
+            # Get JSON plan with ANALYZE
+            try:
+                explain_result = db.explain(sql, analyze=True)
+
+                if explain_result:
+                    result["plan_json"] = explain_result.get("Plan")
+                    result["execution_time_ms"] = explain_result.get("Execution Time", 0)
+                    result["actual_rows"] = explain_result.get("rows_returned", 0)
+
+                    # Build text representation
+                    plan = explain_result.get("Plan", {})
+                    result["plan_text"] = _plan_to_text(plan)
+
+            except Exception as e:
+                logger.warning(f"Failed to get PostgreSQL JSON plan: {e}")
+
+                # Fallback to text-only EXPLAIN
+                try:
+                    text_rows = db.execute(f"EXPLAIN {sql}")
+                    result["plan_text"] = "\n".join(
+                        row.get("QUERY PLAN", str(row)) for row in text_rows
+                    )
+                except Exception as text_e:
+                    logger.warning(f"Text EXPLAIN also failed: {text_e}")
+
+            return result
+
+    except Exception as e:
+        logger.warning(f"Failed to run PostgreSQL EXPLAIN: {e}")
+        return None
+
+
+def _plan_to_text(plan: dict, indent: int = 0) -> str:
+    """Convert PostgreSQL JSON plan to text representation."""
+    lines = []
+    prefix = "  " * indent
+
+    node_type = plan.get("Node Type", "Unknown")
+    relation = plan.get("Relation Name", "")
+    alias = plan.get("Alias", "")
+
+    # Build node description
+    node_desc = f"{prefix}{node_type}"
+    if relation:
+        node_desc += f" on {relation}"
+    if alias and alias != relation:
+        node_desc += f" ({alias})"
+
+    # Add cost/rows info
+    rows = plan.get("Actual Rows", plan.get("Plan Rows", "?"))
+    time = plan.get("Actual Total Time", plan.get("Total Cost", "?"))
+    node_desc += f"  (rows={rows}, time={time})"
+
+    lines.append(node_desc)
+
+    # Recursively add children
+    for child in plan.get("Plans", []):
+        lines.append(_plan_to_text(child, indent + 1))
+
+    return "\n".join(lines)
 
 
 def run_explain_text(
@@ -208,23 +335,35 @@ def run_explain_text(
 ) -> Optional[str]:
     """Run EXPLAIN and return the text plan only (fast, no execution).
 
+    Supports both DuckDB file paths and PostgreSQL DSN strings.
+
     Args:
-        database_path: Path to DuckDB database file
+        database_path: Path to DuckDB database file or PostgreSQL DSN
         sql: SQL query to explain
 
     Returns:
         EXPLAIN plan as text string
     """
-    try:
-        from .duckdb_executor import DuckDBExecutor
+    db_type = _detect_db_type(database_path)
 
-        with DuckDBExecutor(database_path, read_only=True) as db:
-            conn = db._ensure_connected()
-            text_result = conn.execute(f"EXPLAIN {sql}").fetchall()
-            return "\n".join(
-                row[1] if len(row) > 1 else row[0]
-                for row in text_result
-            )
+    try:
+        db = _get_executor(database_path)
+
+        with db:
+            if db_type == "postgres":
+                # PostgreSQL EXPLAIN
+                rows = db.execute(f"EXPLAIN {sql}")
+                return "\n".join(
+                    row.get("QUERY PLAN", str(row)) for row in rows
+                )
+            else:
+                # DuckDB EXPLAIN
+                conn = db._ensure_connected()
+                text_result = conn.execute(f"EXPLAIN {sql}").fetchall()
+                return "\n".join(
+                    row[1] if len(row) > 1 else row[0]
+                    for row in text_result
+                )
     except Exception as e:
         logger.warning(f"Failed to get EXPLAIN: {e}")
         return None

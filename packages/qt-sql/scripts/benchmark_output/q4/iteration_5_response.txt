@@ -1,0 +1,35 @@
+Looking at this query pattern, I can see a key optimization opportunity: **redundant computations across the six year/channel CTEs**. The current structure has multiple CTEs that all join customer with date_dim and different sales tables, then group by customer attributes. However, the main query only needs the year_total for ratios (1999 vs 2000) for each channel.
+
+The opportunity is to **compute all channel/year combinations in a single pass** and then pivot/filter in the main query, eliminating redundant scans of large fact tables.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "semantic_rewrite",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk, d_year FROM date_dim WHERE d_year IN (1999, 2000)",
+        "all_year_totals": "SELECT c_customer_id AS customer_id, c_first_name AS customer_first_name, c_last_name AS customer_last_name, c_preferred_cust_flag AS customer_preferred_cust_flag, c_birth_country AS customer_birth_country, c_login AS customer_login, c_email_address AS customer_email_address, d_year, sale_type, SUM(sales_amount) AS year_total FROM (SELECT c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year, 's' AS sale_type, ((ss_ext_list_price - ss_ext_wholesale_cost - ss_ext_discount_amt) + ss_ext_sales_price) / 2 AS sales_amount FROM customer JOIN store_sales ON c_customer_sk = ss_customer_sk JOIN filtered_dates ON ss_sold_date_sk = d_date_sk UNION ALL SELECT c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year, 'c' AS sale_type, ((cs_ext_list_price - cs_ext_wholesale_cost - cs_ext_discount_amt) + cs_ext_sales_price) / 2 FROM customer JOIN catalog_sales ON c_customer_sk = cs_bill_customer_sk JOIN filtered_dates ON cs_sold_date_sk = d_date_sk UNION ALL SELECT c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year, 'w' AS sale_type, ((ws_ext_list_price - ws_ext_wholesale_cost - ws_ext_discount_amt) + ws_ext_sales_price) / 2 FROM customer JOIN web_sales ON c_customer_sk = ws_bill_customer_sk JOIN filtered_dates ON ws_sold_date_sk = d_date_sk) AS all_sales GROUP BY c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year, sale_type",
+        "main_query": "SELECT t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name, t_s_secyear.customer_birth_country FROM (SELECT * FROM all_year_totals WHERE sale_type = 's' AND d_year = 1999) AS t_s_firstyear JOIN (SELECT * FROM all_year_totals WHERE sale_type = 's' AND d_year = 2000) AS t_s_secyear ON t_s_firstyear.customer_id = t_s_secyear.customer_id JOIN (SELECT * FROM all_year_totals WHERE sale_type = 'c' AND d_year = 1999) AS t_c_firstyear ON t_s_firstyear.customer_id = t_c_firstyear.customer_id JOIN (SELECT * FROM all_year_totals WHERE sale_type = 'c' AND d_year = 2000) AS t_c_secyear ON t_s_firstyear.customer_id = t_c_secyear.customer_id JOIN (SELECT * FROM all_year_totals WHERE sale_type = 'w' AND d_year = 1999) AS t_w_firstyear ON t_s_firstyear.customer_id = t_w_firstyear.customer_id JOIN (SELECT * FROM all_year_totals WHERE sale_type = 'w' AND d_year = 2000) AS t_w_secyear ON t_s_firstyear.customer_id = t_w_secyear.customer_id WHERE t_c_secyear.year_total / NULLIF(t_c_firstyear.year_total, 0) > t_s_secyear.year_total / NULLIF(t_s_firstyear.year_total, 0) AND t_c_secyear.year_total / NULLIF(t_c_firstyear.year_total, 0) > t_w_secyear.year_total / NULLIF(t_w_firstyear.year_total, 0) ORDER BY t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name, t_s_secyear.customer_birth_country LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same aggregation logic"
+      ],
+      "expected_speedup": "3.0x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Consolidated six separate CTE computations into a single 'all_year_totals' CTE that computes sales totals for all channels (store, catalog, web) and both years (1999, 2000) in one pass. This eliminates redundant scans of the large sales fact tables (store_sales, catalog_sales, web_sales) and repeated joins with customer and date_dim. The main query then filters this consolidated CTE for the specific channel/year combinations needed. This reduces I/O and computational overhead significantly while maintaining identical results."
+}
+```
+
+**Key insights:**
+1. The original query was scanning each sales fact table twice (once per year), plus the customer table six times
+2. The new approach scans each sales fact table once, aggregates all years/channels together, then filters
+3. This reduces the total number of large table scans from 6 to 3 (store_sales, catalog_sales, web_sales)
+4. The UNION ALL inside the CTE allows parallel processing of the three channels
+5. This is especially beneficial since sales tables are huge (billions of rows)

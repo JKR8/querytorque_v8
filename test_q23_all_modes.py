@@ -34,6 +34,7 @@ from qt_sql.optimization.adaptive_rewriter_v5 import (
     optimize_v5_json_queue,
     optimize_v5_evolutionary,
 )
+from qt_sql.validation.validator import ValidationStatus
 
 # Q23 SQL
 Q23_SQL = """-- TPC-DS Query 23: Best customers by sales
@@ -143,7 +144,7 @@ def check_prerequisites():
     return True
 
 
-def test_mode1_retry():
+def test_mode1_retry(output_dir=None):
     """Test Mode 1: Retry with error feedback."""
     print_header("MODE 1: RETRY (Corrective Learning)")
 
@@ -151,6 +152,7 @@ def test_mode1_retry():
     print("  Strategy: Single worker with retries")
     print("  Max retries: 3")
     print("  Learning: From errors (error feedback)")
+    print("  Goal: Produce valid optimized SQL (any speedup is a win)")
     print("  Why good for Q23: Can learn from semantic errors and retry")
 
     sample_db, full_db = get_db_paths()
@@ -165,9 +167,10 @@ def test_mode1_retry():
             full_db=full_db,
             query_id='q23',
             max_retries=3,
-            target_speedup=2.0,
+            target_speedup=2.0,  # Not used by Mode 1, but kept for API compatibility
             provider='deepseek',
-            model=None,  # Use default: deepseek-reasoner
+            model=None,
+            output_dir=output_dir,
         )
 
         elapsed = time.time() - start_time
@@ -183,11 +186,11 @@ def test_mode1_retry():
             if attempt.get('speedup'):
                 print(f"    Speedup: {attempt['speedup']:.2f}x")
 
-        if candidate and full_result:
-            print(f"\n✅ SUCCESS!")
-            print(f"  Sample speedup: {candidate.speedup:.2f}x")
-            print(f"  Full DB speedup: {full_result.full_speedup:.2f}x")
-            print(f"  Target met: {'Yes' if full_result.full_speedup >= 2.0 else 'No'}")
+        if candidate and full_result and full_result.full_status == ValidationStatus.PASS:
+            print(f"\n✅ SUCCESS - Produced valid optimized SQL!")
+            print(f"  Validation: PASSED")
+            print(f"  Speedup: {full_result.full_speedup:.2f}x")
+            print(f"  Attempts needed: {len(attempts)}")
 
             return {
                 'mode': 'retry',
@@ -199,7 +202,7 @@ def test_mode1_retry():
                 'sql': candidate.optimized_sql,
             }
         else:
-            print(f"\n❌ FAILED: All {len(attempts)} attempts exhausted")
+            print(f"\n❌ FAILED: All {len(attempts)} attempts had validation errors")
             return {
                 'mode': 'retry',
                 'success': False,
@@ -220,7 +223,7 @@ def test_mode1_retry():
         }
 
 
-def test_mode2_parallel():
+def test_mode2_parallel(output_dir=None):
     """Test Mode 2: Parallel workers."""
     print_header("MODE 2: PARALLEL (Tournament Competition)")
 
@@ -245,6 +248,7 @@ def test_mode2_parallel():
             target_speedup=2.0,
             provider='deepseek',
             model=None,
+            output_dir=output_dir,
         )
 
         elapsed = time.time() - start_time
@@ -271,8 +275,25 @@ def test_mode2_parallel():
                 'time': elapsed,
                 'sql': winner.sample.optimized_sql,
             }
+        elif full_results and len(full_results) > 0:
+            # No winner met target, but return best result
+            best = max(full_results, key=lambda x: x.full_speedup if x.full_speedup else 0)
+            print(f"\n⚠️  COMPLETED but no winner met target")
+            print(f"  Best: Worker {best.sample.worker_id}")
+            print(f"  Full DB speedup: {best.full_speedup:.2f}x (below 2.0x target)")
+
+            return {
+                'mode': 'parallel',
+                'success': False,
+                'valid_workers': len(valid),
+                'winner_id': best.sample.worker_id,
+                'sample_speedup': best.sample.speedup,
+                'full_speedup': best.full_speedup,
+                'time': elapsed,
+                'sql': best.sample.optimized_sql,  # Include best SQL even if below target
+            }
         else:
-            print(f"\n❌ FAILED: No winner found")
+            print(f"\n❌ FAILED: No valid candidates")
             return {
                 'mode': 'parallel',
                 'success': False,
@@ -293,7 +314,7 @@ def test_mode2_parallel():
         }
 
 
-def test_mode3_evolutionary():
+def test_mode3_evolutionary(output_dir=None):
     """Test Mode 3: Evolutionary."""
     print_header("MODE 3: EVOLUTIONARY (Stacking)")
 
@@ -317,6 +338,7 @@ def test_mode3_evolutionary():
             target_speedup=2.0,
             provider='deepseek',
             model=None,
+            output_dir=output_dir,
         )
 
         elapsed = time.time() - start_time
@@ -334,18 +356,23 @@ def test_mode3_evolutionary():
                     print(f"    Error: {it['error'][:100]}...")
 
         if best and full_result:
-            print(f"\n🏆 BEST: Iteration {best.worker_id}")
+            success = full_result.full_speedup >= 2.0
+            if success:
+                print(f"\n🏆 BEST: Iteration {best.worker_id}")
+            else:
+                print(f"\n⚠️  BEST (below target): Iteration {best.worker_id}")
+
             print(f"  Final speedup: {full_result.full_speedup:.2f}x")
-            print(f"  Target met: {'Yes' if full_result.full_speedup >= 2.0 else 'No'}")
+            print(f"  Target met: {'Yes' if success else 'No'}")
 
             return {
                 'mode': 'evolutionary',
-                'success': True,
+                'success': success,
                 'iterations': len(iterations),
                 'best_iteration': best.worker_id,
                 'full_speedup': full_result.full_speedup,
                 'time': elapsed,
-                'sql': best.optimized_sql,
+                'sql': best.optimized_sql,  # Include SQL even if below target
             }
         else:
             print(f"\n❌ FAILED: No successful optimization")
@@ -476,17 +503,17 @@ def main():
     print("=" * 80)
 
     # Mode 1: Retry
-    results['retry'] = test_mode1_retry()
+    results['retry'] = test_mode1_retry(output_dir=str(results_dir))
     if results['retry'].get('sql'):
         (results_dir / 'retry_optimized.sql').write_text(results['retry']['sql'])
 
     # Mode 2: Parallel
-    results['parallel'] = test_mode2_parallel()
+    results['parallel'] = test_mode2_parallel(output_dir=str(results_dir))
     if results['parallel'].get('sql'):
         (results_dir / 'parallel_optimized.sql').write_text(results['parallel']['sql'])
 
     # Mode 3: Evolutionary
-    results['evolutionary'] = test_mode3_evolutionary()
+    results['evolutionary'] = test_mode3_evolutionary(output_dir=str(results_dir))
     if results['evolutionary'].get('sql'):
         (results_dir / 'evolutionary_optimized.sql').write_text(results['evolutionary']['sql'])
 

@@ -1,0 +1,355 @@
+## Example: Decorrelate Subquery (DECORRELATE)
+Verified speedup: 2.90x
+
+### Input:
+[customer_total_return] CORRELATED:
+SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return
+FROM store_returns, date_dim
+WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000
+GROUP BY sr_customer_sk, sr_store_sk
+
+[main_query]:
+SELECT c_customer_id FROM customer_total_return ctr1, store, customer
+WHERE ctr1.ctr_total_return > (SELECT avg(ctr_total_return)*1.2 FROM customer_total_return ctr2 WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk)
+  AND s_store_sk = ctr1.ctr_store_sk AND s_state = 'SD' AND ctr1.ctr_customer_sk = c_customer_sk
+ORDER BY c_customer_id LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "decorrelate",
+      "nodes": {
+        "filtered_returns": "SELECT sr.sr_customer_sk, sr.sr_store_sk, sr.sr_fee FROM store_returns sr JOIN date_dim d ON sr.sr_returned_date_sk = d.d_date_sk JOIN store s ON sr.sr_store_sk = s.s_store_sk WHERE d.d_year = 2000 AND s.s_state = 'SD'",
+        "customer_total_return": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(sr_fee) AS ctr_total_return FROM filtered_returns GROUP BY sr_customer_sk, sr_store_sk",
+        "store_avg_return": "SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk",
+        "main_query": "SELECT c.c_customer_id FROM customer_total_return ctr1 JOIN store_avg_return sar ON ctr1.ctr_store_sk = sar.ctr_store_sk JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk WHERE ctr1.ctr_total_return > sar.avg_return_threshold ORDER BY c.c_customer_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "2.90x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Push s_state='SD' filter EARLY into first CTE. Compute average as SEPARATE CTE with GROUP BY (NOT window function). Join on average instead of correlated subquery.
+
+
+---
+
+## Example: Date CTE Isolation (DATE_CTE_ISOLATE)
+Verified speedup: 1.5-2.5x
+
+### Input:
+[main_query]:
+SELECT a.ca_state state, count(*) cnt
+FROM customer_address a, customer c, store_sales s, date_dim d, item i
+WHERE a.ca_address_sk = c.c_current_addr_sk
+  AND c.c_customer_sk = s.ss_customer_sk
+  AND s.ss_sold_date_sk = d.d_date_sk
+  AND s.ss_item_sk = i.i_item_sk
+  AND d.d_month_seq = (SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1)
+  AND i.i_current_price > 1.2 * (SELECT avg(j.i_current_price) FROM item j WHERE j.i_category = i.i_category)
+GROUP BY a.ca_state HAVING count(*) >= 10
+ORDER BY cnt, a.ca_state LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "target_month": "SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1",
+        "category_avg_price": "SELECT i_category, AVG(i_current_price) * 1.2 AS avg_threshold FROM item GROUP BY i_category",
+        "filtered_dates": "SELECT d_date_sk FROM date_dim JOIN target_month ON d_month_seq = target_month.d_month_seq",
+        "filtered_sales": "SELECT ss_customer_sk, ss_item_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
+        "main_query": "SELECT a.ca_state AS state, COUNT(*) AS cnt FROM customer_address a JOIN customer c ON a.ca_address_sk = c.c_current_addr_sk JOIN filtered_sales s ON c.c_customer_sk = s.ss_customer_sk JOIN item i ON s.ss_item_sk = i.i_item_sk JOIN category_avg_price cap ON i.i_category = cap.i_category WHERE i.i_current_price > cap.avg_threshold GROUP BY a.ca_state HAVING COUNT(*) >= 10 ORDER BY cnt, a.ca_state LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "2.0x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Extract date month_seq subquery into CTE. Extract category average into separate CTE with GROUP BY. Join instead of correlated subquery. This allows each CTE to be scanned once.
+
+
+---
+
+## Example: Early Dimension Filter (EARLY_FILTER)
+Verified speedup: 2.71x
+
+### Input:
+[main_query]:
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales
+FROM (SELECT ss.ss_customer_sk, CASE WHEN sr.sr_return_quantity IS NOT NULL
+        THEN (ss.ss_quantity - sr.sr_return_quantity) * ss.ss_sales_price
+        ELSE ss.ss_quantity * ss.ss_sales_price END AS act_sales
+      FROM store_sales ss LEFT JOIN store_returns sr ON ss.ss_item_sk = sr.sr_item_sk
+      JOIN reason r ON sr.sr_reason_sk = r.r_reason_sk
+      WHERE r.r_reason_desc = 'duplicate purchase') t
+GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "early_filter",
+      "nodes": {
+        "filtered_reason": "SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'",
+        "filtered_returns": "SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk",
+        "main_query": "SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100"
+      },
+      "invariants_kept": [
+        "output columns unchanged",
+        "grain preserved",
+        "same result rows"
+      ],
+      "expected_speedup": "2.71x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Filter dimension table (reason) FIRST, then join to fact. Reduces returns to only 'duplicate purchase' before expensive store_sales join.
+
+
+---
+
+You are an autonomous Query Rewrite Engine. Your goal is to maximize execution speed while strictly preserving semantic invariants.
+
+Output atomic rewrite sets in JSON.
+
+RULES:
+- Primary Goal: Maximize execution speed while strictly preserving semantic invariants.
+- Allowed Transforms: Use the provided list. If a standard SQL optimization applies that is not listed, label it "semantic_rewrite".
+- Atomic Sets: Group dependent changes (e.g., creating a CTE and joining it) into a single rewrite_set.
+- Contracts: Output columns, grain, and total result rows must remain invariant.
+- Naming: Use descriptive CTE names (e.g., `filtered_returns` vs `cte1`).
+- Column Aliasing: Permitted only for aggregations or disambiguation.
+
+ALLOWED TRANSFORMS: pushdown, decorrelate, or_to_union, early_filter, date_cte_isolate, materialize_cte, flatten_subquery, reorder_join, multi_push_predicate, inline_cte, remove_redundant, semantic_rewrite
+
+OUTPUT FORMAT:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "transform_name",
+      "nodes": {
+        "node_id": "new SQL..."
+      },
+      "invariants_kept": ["list of preserved semantics"],
+      "expected_speedup": "2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "what was changed and why"
+}
+```
+
+## Target Nodes
+  [year_total] GROUP_BY UNION_ALL
+  [year_total_store_2000] GROUP_BY
+
+## Subgraph Slice
+[year_total] type=cte
+```sql
+SELECT c_customer_id AS customer_id, c_first_name AS customer_first_name, c_last_name AS customer_last_name, c_preferred_cust_flag AS customer_preferred_cust_flag, c_birth_country AS customer_birth_country, c_login AS customer_login, c_email_address AS customer_email_address, d_year AS dyear, SUM(((ss_ext_list_price - ss_ext_wholesale_cost - ss_ext_discount_amt) + ss_ext_sales_price) / 2) AS year_total, 's' AS sale_type FROM customer JOIN store_sales ON c_customer_sk = ss_customer_sk JOIN filtered_dates ON ss_sold_date_sk = d_date_sk GROUP BY c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year UNION ALL SELECT c_customer_id AS customer_id, c_first_name AS customer_first_name, c_last_name AS customer_last_name, c_preferred_cust_flag AS customer_preferred_cust_flag, c_birth_country AS customer_birth_country, c_login AS customer_login, c_email_address AS customer_email_address, d_year AS dyear, SUM((((cs_ext_list_price - cs_ext_wholesale_cost - cs_ext_discount_amt) + cs_ext_sales_price) / 2)) AS year_total, 'c' AS sale_type FROM customer JOIN catalog_sales ON c_customer_sk = cs_bill_customer_sk JOIN filtered_dates ON cs_sold_date_sk = d_date_sk GROUP BY c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year UNION ALL SELECT c_customer_id AS customer_id, c_first_name AS customer_first_name, c_last_name AS customer_last_name, c_preferred_cust_flag AS customer_preferred_cust_flag, c_birth_country AS customer_birth_country, c_login AS customer_login, c_email_address AS customer_email_address, d_year AS dyear, SUM((((ws_ext_list_price - ws_ext_wholesale_cost - ws_ext_discount_amt) + ws_ext_sales_price) / 2)) AS year_total, 'w' AS sale_type FROM customer JOIN web_sales ON c_customer_sk = ws_bill_customer_sk JOIN filtered_dates ON ws_sold_date_sk = d_date_sk GROUP BY c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year
+```
+
+[filtered_dates] type=cte
+```sql
+SELECT d_date_sk, d_year FROM date_dim WHERE d_year IN (1999, 2000)
+```
+
+[year_total_store_2000] type=cte
+```sql
+SELECT c_customer_id AS customer_id, c_first_name AS customer_first_name, c_last_name AS customer_last_name, c_preferred_cust_flag AS customer_preferred_cust_flag, c_birth_country AS customer_birth_country, c_login AS customer_login, c_email_address AS customer_email_address, 2000 AS dyear, SUM(((ss_ext_list_price - ss_ext_wholesale_cost - ss_ext_discount_amt) + ss_ext_sales_price) / 2) AS year_total, 's' AS sale_type FROM customer JOIN store_sales ON c_customer_sk = ss_customer_sk JOIN filtered_dates_2000 ON ss_sold_date_sk = d_date_sk GROUP BY c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address
+```
+
+[filtered_dates_2000] type=cte
+```sql
+SELECT d_date_sk, d_year FROM date_dim WHERE d_year = 2000
+```
+
+[main_query] type=main
+```sql
+SELECT t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name, t_s_secyear.customer_birth_country FROM year_total_store_1999 AS t_s_firstyear JOIN year_total_store_2000 AS t_s_secyear ON t_s_firstyear.customer_id = t_s_secyear.customer_id JOIN year_total_catalog_1999 AS t_c_firstyear ON t_s_firstyear.customer_id = t_c_firstyear.customer_id JOIN year_total_catalog_2000 AS t_c_secyear ON t_s_firstyear.customer_id = t_c_secyear.customer_id JOIN year_total_web_1999 AS t_w_firstyear ON t_s_firstyear.customer_id = t_w_firstyear.customer_id JOIN year_total_web_2000 AS t_w_secyear ON t_s_firstyear.customer_id = t_w_secyear.customer_id WHERE t_c_secyear.year_total / t_c_firstyear.year_total > t_s_secyear.year_total / t_s_firstyear.year_total AND t_c_secyear.year_total / t_c_firstyear.year_total > t_w_secyear.year_total / t_w_firstyear.year_total ORDER BY t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name, t_s_secyear.customer_birth_country LIMIT 100
+```
+
+
+## Node Contracts
+[year_total]:
+  output_columns: ['customer_id', 'customer_first_name', 'customer_last_name', 'customer_preferred_cust_flag', 'customer_birth_country', 'customer_login', 'customer_email_address', 'dyear', 'year_total', 'sale_type']
+  grain: ['c_customer_id', 'c_first_name', 'c_last_name', 'c_preferred_cust_flag', 'c_birth_country', 'c_login', 'c_email_address', 'd_year']
+[filtered_dates]:
+  output_columns: ['d_date_sk', 'd_year']
+[year_total_store_2000]:
+  output_columns: ['customer_id', 'customer_first_name', 'customer_last_name', 'customer_preferred_cust_flag', 'customer_birth_country', 'customer_login', 'customer_email_address', 'dyear', 'year_total', 'sale_type']
+  grain: ['c_customer_id', 'c_first_name', 'c_last_name', 'c_preferred_cust_flag', 'c_birth_country', 'c_login', 'c_email_address']
+[filtered_dates_2000]:
+  output_columns: ['d_date_sk', 'd_year']
+  required_predicates: ['d_year = 2000']
+[main_query]:
+  output_columns: ['customer_id', 'customer_first_name', 'customer_last_name', 'customer_birth_country']
+  required_predicates: ['t_c_secyear.year_total / NULLIF(t_c_firstyear.year_total, 0) > t_s_secyear.year_total / NULLIF(t_s_firstyear.year_total, 0)', 't_c_secyear.year_total / NULLIF(t_c_firstyear.year_total, 0) > t_w_secyear.year_total / NULLIF(t_w_firstyear.year_total, 0)']
+
+## Downstream Usage
+[filtered_dates]: downstream_refs=['d_date_sk', 'd_year']
+[filtered_dates_2000]: downstream_refs=['d_date_sk']
+
+## Cost Attribution
+[year_total]: 59.9% cost, ~1000 rows, ops=[HASH_JOIN, HASH_GROUP_BY]
+[filtered_dates]: 0.0% cost, ~366 rows, ops=[SEQ_SCAN[date_dim], SEQ_SCAN[date_dim], SEQ_SCAN[date_dim]]
+[year_total_store_2000]: 9.4% cost, ~55295162 rows, ops=[SEQ_SCAN[store_sales], SEQ_SCAN[store_sales]]
+[filtered_dates_2000]: 0% cost, ~1000 rows, ops=[SEQ_SCAN[date_dim]]
+[main_query]: 0% cost, ~1000 rows, ops=[HASH_GROUP_BY, HASH_JOIN, SEQ_SCAN[year_total_store_1999]]
+
+## Detected Opportunities
+## Node-Specific Opportunities
+PUSHDOWN: [main_query] filters on [year_total_store_1999] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+PUSHDOWN: [main_query] filters on [year_total_store_2000] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+PUSHDOWN: [main_query] filters on [year_total_catalog_1999] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+PUSHDOWN: [main_query] filters on [year_total_catalog_2000] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+PUSHDOWN: [main_query] filters on [year_total_web_1999] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+PUSHDOWN: [main_query] filters on [year_total_web_2000] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+Now output your rewrite_sets:
+
+## Execution Plan
+```
+Operators by cost:
+- HASH_JOIN: 11.0% cost, 53,991,762 rows
+- HASH_JOIN: 10.7% cost, 53,724,161 rows
+- HASH_GROUP_BY: 8.9% cost, 1,821,441 rows
+- HASH_GROUP_BY: 8.8% cost, 1,818,875 rows
+- HASH_JOIN: 5.3% cost, 28,587,297 rows
+
+Scans:
+- store_sales x2: 3,455,964,288 rows (no filter)
+- catalog_sales x2: 1,727,964,780 rows (no filter)
+- web_sales x2: 864,014,844 rows (no filter)
+- customer x6: 24,000,000 rows (no filter)
+- date_dim x6: 73,049 → 366 rows (filtered)
+
+Misestimates:
+- PROJECTION: est 18,446,744,073,709,551,615 vs actual 71,455 (258158898239585.1x)
+- FILTER: est 18,446,744,073,709,551,615 vs actual 71,455 (258158898239585.1x)
+- HASH_JOIN: est 18,446,744,073,709,551,615 vs actual 206,905 (89155622501677.3x)
+- HASH_JOIN: est 53,192 vs actual 1,419,177 (26.7x)
+- PROJECTION: est 2,306,373 vs actual 53,724,161 (23.3x)
+- PROJECTION: est 2,306,373 vs actual 53,724,161 (23.3x)
+- HASH_JOIN: est 2,306,373 vs actual 53,724,161 (23.3x)
+- PROJECTION: est 2,306,373 vs actual 55,020,211 (23.9x)
+- HASH_JOIN: est 2,306,373 vs actual 55,020,211 (23.9x)
+- SEQ_SCAN: est 287,997,024 vs actual 55,020,211 (5.2x)
+- PROJECTION: est 230,635 vs actual 1,560,750 (6.8x)
+- FILTER: est 230,635 vs actual 1,560,750 (6.8x)
+- PROJECTION: est 1,153,175 vs actual 28,422,013 (24.6x)
+- PROJECTION: est 1,153,175 vs actual 28,422,013 (24.6x)
+- HASH_JOIN: est 1,153,175 vs actual 28,422,013 (24.6x)
+- PROJECTION: est 1,153,175 vs actual 28,493,774 (24.7x)
+- HASH_JOIN: est 1,153,175 vs actual 28,493,774 (24.7x)
+- SEQ_SCAN: est 143,997,065 vs actual 28,493,774 (5.1x)
+- HASH_JOIN: est 11,053 vs actual 291,988 (26.4x)
+- PROJECTION: est 2,306,373 vs actual 53,991,762 (23.4x)
+- PROJECTION: est 2,306,373 vs actual 53,991,762 (23.4x)
+- HASH_JOIN: est 2,306,373 vs actual 53,991,762 (23.4x)
+- PROJECTION: est 2,306,373 vs actual 55,295,162 (24.0x)
+- HASH_JOIN: est 2,306,373 vs actual 55,295,162 (24.0x)
+- SEQ_SCAN: est 287,997,024 vs actual 55,295,162 (5.2x)
+- HASH_JOIN: est 9,585 vs actual 320,661 (33.5x)
+- PROJECTION: est 1,153,175 vs actual 28,587,297 (24.8x)
+- PROJECTION: est 1,153,175 vs actual 28,587,297 (24.8x)
+- HASH_JOIN: est 1,153,175 vs actual 28,587,297 (24.8x)
+- PROJECTION: est 1,153,175 vs actual 28,659,455 (24.9x)
+- HASH_JOIN: est 1,153,175 vs actual 28,659,455 (24.9x)
+- SEQ_SCAN: est 143,997,065 vs actual 28,659,455 (5.0x)
+- HASH_JOIN: est 33,247 vs actual 402,314 (12.1x)
+- PROJECTION: est 576,609 vs actual 14,458,415 (25.1x)
+- PROJECTION: est 576,609 vs actual 14,458,415 (25.1x)
+- HASH_JOIN: est 576,609 vs actual 14,458,415 (25.1x)
+- HASH_JOIN: est 576,609 vs actual 14,460,227 (25.1x)
+- PROJECTION: est 115,321 vs actual 889,439 (7.7x)
+- FILTER: est 115,321 vs actual 889,439 (7.7x)
+- PROJECTION: est 576,609 vs actual 14,390,895 (25.0x)
+- PROJECTION: est 576,609 vs actual 14,390,895 (25.0x)
+- HASH_JOIN: est 576,609 vs actual 14,390,895 (25.0x)
+- HASH_JOIN: est 576,609 vs actual 14,392,597 (25.0x)
+- SEQ_SCAN: est 72,001,237 vs actual 14,392,597 (5.0x)
+
+Joins:
+- HASH_JOIN: ? x ? -> 206,905 rows
+- HASH_JOIN: ? x ? -> 1,419,177 rows
+- HASH_JOIN: ? x ? -> 53,724,161 rows
+- HASH_JOIN: store_sales x ? -> 55,020,211 rows (late)
+- HASH_JOIN: ? x ? -> 28,422,013 rows
+```
+
+
+## Previous Successful Iterations
+
+### Iteration 3: 1.01x speedup ✓
+
+### Iteration 4: 1.03x speedup ✓
+
+## Failed Attempts (avoid these approaches)
+- Iteration 1: Original query execution failed: Binder Error: Referenced column "d_year" not found in FROM clause!
+Candidate bindings: "c_email_address", "d_date_sk", "ss_addr_sk", "ss_ext_tax", "ss_net_paid"
+
+LINE 1: ...rred_cust_flag, c_birth_country, c_login, c_email_address, d_year UNION ALL SELECT c_customer_id AS customer_id, c_fir...
+                                                                      ^
+- Iteration 2: Original query execution failed: Binder Error: Referenced column "d_year" not found in FROM clause!
+Candidate bindings: "c_email_address", "d_date_sk", "ss_addr_sk", "ss_ext_tax", "ss_net_paid"
+
+LINE 1: ...rred_cust_flag, c_birth_country, c_login, c_email_address, d_year UNION ALL SELECT c_customer_id AS customer_id, c_fir...
+                                                                      ^
+
+## Current Challenge
+**Current best:** 1.03x speedup
+**Target:** 2.0x
+**Gap:** 0.97x needed
+
+Try a DIFFERENT approach to improve upon the current best.
+
+
+
+**IMPORTANT:** The following patterns were provided: decorrelate, date_cte_isolate, early_filter. Consider a DIFFERENT approach!

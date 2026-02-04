@@ -14,13 +14,110 @@ import logging
 
 from qt_sql.optimization.dag_v2 import DagV2Pipeline
 from qt_sql.optimization.dag_v3 import build_prompt_with_examples, GoldExample, get_matching_examples, load_example, load_all_examples
-from qt_sql.optimization.query_recommender import get_query_recommendations
+from qt_sql.optimization.query_recommender import get_recommendations_for_sql
 from qt_sql.optimization.plan_analyzer import analyze_plan_for_optimization, OptimizationContext
 from qt_sql.execution.database_utils import run_explain_analyze
 from qt_sql.validation.sql_validator import SQLValidator
 from qt_sql.validation.schemas import ValidationStatus
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# VERIFIED TRANSFORMS - Only transforms with proven speedups on TPC-DS
+# ============================================================================
+
+VERIFIED_TRANSFORMS = {
+    "decorrelate": {"speedup": 2.92, "query": "Q1", "description": "Decorrelate subquery to CTE with GROUP BY"},
+    "or_to_union": {"speedup": 3.17, "query": "Q15", "description": "Split OR conditions into UNION ALL branches"},
+    "early_filter": {"speedup": 4.00, "query": "Q93", "description": "Filter dimension tables FIRST before fact joins"},
+    "pushdown": {"speedup": 2.11, "query": "Q9", "description": "Push predicates into CTEs/subqueries"},
+    "date_cte_isolate": {"speedup": 4.00, "query": "Q6", "description": "Extract date filtering into separate CTE"},
+    "union_cte_split": {"speedup": 1.36, "query": "Q74", "description": "Split generic UNION CTE into year-specific CTEs"},
+    "materialize_cte": {"speedup": 1.37, "query": "Q95", "description": "Extract repeated subquery into CTE"},
+}
+
+
+# AST hints for detected patterns without full verified examples
+AST_HINTS = {
+    "projection_prune": "Consider removing unused columns from CTE projections",
+    "reorder_join": "Consider reordering joins - filter dimensions first, then join to facts",
+    "flatten_subquery": "Consider flattening IN/EXISTS subquery to JOIN",
+    "inline_cte": "Consider inlining single-use CTE for optimizer flexibility",
+}
+
+
+def get_verified_example_ids() -> List[str]:
+    """Return list of verified transform IDs."""
+    return list(VERIFIED_TRANSFORMS.keys())
+
+
+def is_verified_transform(transform_id: str) -> bool:
+    """Check if a transform ID has verified speedup."""
+    return transform_id in VERIFIED_TRANSFORMS
+
+
+def get_verified_examples(sql: str) -> List[GoldExample]:
+    """Return only examples with verified speedups.
+
+    Args:
+        sql: SQL query (used to get matching examples)
+
+    Returns:
+        List of GoldExample objects for verified transforms only
+    """
+    all_examples = get_matching_examples(sql)
+    return [ex for ex in all_examples if ex.id in VERIFIED_TRANSFORMS]
+
+
+def filter_to_verified(recommendations: List[str]) -> List[str]:
+    """Filter ML recommendations to only verified transforms.
+
+    Args:
+        recommendations: List of transform IDs from ML recommender
+
+    Returns:
+        Filtered list containing only verified transform IDs
+    """
+    return [r for r in recommendations if r in VERIFIED_TRANSFORMS]
+
+
+def format_ast_hint(pattern_id: str) -> str:
+    """Format detected pattern as hint without full example.
+
+    Used for patterns detected by AST analysis but without verified examples.
+
+    Args:
+        pattern_id: The pattern identifier
+
+    Returns:
+        Formatted hint string
+    """
+    hint = AST_HINTS.get(pattern_id, f"Consider applying {pattern_id} transform")
+    return f"**AST Hint:** {hint}"
+
+
+def get_ast_hints_for_query(sql: str) -> List[str]:
+    """Get AST hints for unverified patterns detected in query.
+
+    Args:
+        sql: SQL query to analyze
+
+    Returns:
+        List of formatted hint strings
+    """
+    from .knowledge_base import detect_opportunities
+
+    hints = []
+    kb_hits = detect_opportunities(sql)
+
+    for hit in kb_hits:
+        pattern_id = hit.pattern.id if hasattr(hit, 'pattern') else str(hit)
+        # Only add hints for patterns without verified examples
+        if pattern_id in AST_HINTS and pattern_id not in VERIFIED_TRANSFORMS:
+            hints.append(format_ast_hint(pattern_id))
+
+    return hints
 
 
 def _create_llm_client(provider: Optional[str], model: Optional[str]):
@@ -436,6 +533,7 @@ def optimize_v5_json_queue(
     target_speedup: float = 2.0,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    output_dir: Optional[str] = None,
 ) -> tuple[list[CandidateResult], list[FullRunResult], Optional[FullRunResult]]:
     """Run v5 in parallel on sample, then validate all valid candidates on full DB in sequence.
 
@@ -448,49 +546,51 @@ def optimize_v5_json_queue(
         target_speedup: Target speedup threshold
         provider: LLM provider
         model: LLM model
+        output_dir: Optional directory to save intermediate SQL files immediately after LLM response
 
     Returns: (valid_candidates, full_results, first_over_target)
     """
     plan_summary, plan_text, plan_context = _get_plan_context(sample_db, sql)
     base_prompt = _build_base_prompt(sql, plan_context)
 
-    # Get query-specific examples if query_id provided
-    if query_id:
-        # 1. Get ML recommendations (up to 12)
-        ml_recs = get_query_recommendations(query_id, top_n=12)
-        logger.info(f"Query {query_id}: Got {len(ml_recs)} ML recommendations: {ml_recs[:3]}")
+    # Get ML recommendations based on SQL similarity (works with ANY query)
+    # LIVE FAISS search - vectorizes input SQL and finds similar verified queries
+    ml_recs = get_recommendations_for_sql(sql, top_n=12)
+    verified_recs = filter_to_verified(ml_recs)
+    logger.info(f"LIVE FAISS: ML recs={len(ml_recs)}, verified={len(verified_recs)}: {verified_recs}")
 
-        # 2. Pad with remaining examples if needed
-        all_examples = load_all_examples()
-        all_example_ids = [ex.id for ex in all_examples]
+    # Fallback to KB-matched verified examples if ML has few
+    if len(verified_recs) < 6:
+        kb_examples = get_matching_examples(sql)
+        kb_verified = [ex.id for ex in kb_examples if ex.id in VERIFIED_TRANSFORMS]
+        for ex_id in kb_verified:
+            if ex_id not in verified_recs:
+                verified_recs.append(ex_id)
+        logger.info(f"Padded with KB-verified to {len(verified_recs)}: {verified_recs}")
 
-        padded_recs = ml_recs.copy()
-        for ex_id in all_example_ids:
-            if len(padded_recs) >= 12:
-                break
-            if ex_id not in padded_recs:
-                padded_recs.append(ex_id)
+    # Load example objects (verified only)
+    example_objects = []
+    for ex_id in verified_recs:
+        ex = load_example(ex_id)
+        if ex:
+            example_objects.append(ex)
 
-        # 3. Load example objects
-        example_objects = []
-        for ex_id in padded_recs[:12]:
-            ex = load_example(ex_id)
-            if ex:
-                example_objects.append(ex)
+    # Split into 4 batches of up to 3 for diversity
+    batches = [
+        example_objects[0:3],   # Worker 1: Top verified ML recs
+        example_objects[3:6],   # Worker 2
+        example_objects[6:9],   # Worker 3 (may be empty)
+        example_objects[9:12],  # Worker 4 (may be empty)
+    ]
+    logger.info(f"Split into 4 batches of {[len(b) for b in batches]} verified examples")
 
-        # 4. Split into 4 batches of 3 for diversity
-        batches = [
-            example_objects[0:3],   # Worker 1: Top ML recs
-            example_objects[3:6],   # Worker 2
-            example_objects[6:9],   # Worker 3
-            example_objects[9:12],  # Worker 4
-        ]
-        logger.info(f"Query {query_id}: Split into 4 batches of {[len(b) for b in batches]} examples")
-    else:
-        # Fallback: Use KB pattern matching (old behavior)
-        examples = get_matching_examples(sql)
-        batches = _split_example_batches(examples, batch_size=3)
+    if not example_objects:
+        # Final fallback: Use KB pattern matching with verified filter
+        kb_examples = get_matching_examples(sql)
+        verified_examples = [ex for ex in kb_examples if ex.id in VERIFIED_TRANSFORMS]
+        batches = _split_example_batches(verified_examples, batch_size=3)
         batches = batches[:4]
+        logger.info(f"Final fallback: Using {len(verified_examples)} KB-verified examples")
 
     # Ensure we have 4 batches
     while len(batches) < 4:
@@ -527,6 +627,16 @@ def optimize_v5_json_queue(
         ))
 
         results = [t.result() for t in as_completed(tasks)]
+
+    # Save all worker SQL immediately after receiving from LLM, before full validation
+    if output_dir:
+        from pathlib import Path
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        for r in results:
+            sql_file = output_path / f"parallel_worker_{r.worker_id}.sql"
+            sql_file.write_text(r.optimized_sql)
+            logger.info(f"Saved Worker {r.worker_id} SQL to {sql_file}")
 
     valid = [r for r in results if r.status == ValidationStatus.PASS]
     logger.info(f"Sample validation: {len(valid)}/{len(results)} workers produced valid results")
@@ -567,6 +677,7 @@ def optimize_v5_retry(
     target_speedup: float = 2.0,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    output_dir: Optional[str] = None,
 ) -> tuple[Optional[CandidateResult], Optional[FullRunResult], list[dict]]:
     """
     Mode 1: Retry - Single worker with error feedback retries.
@@ -580,6 +691,7 @@ def optimize_v5_retry(
         target_speedup: Target speedup threshold (default: 2.0)
         provider: LLM provider
         model: LLM model
+        output_dir: Optional directory to save intermediate SQL files immediately after LLM response
 
     Returns: (final_candidate, full_result, attempts_history)
     """
@@ -588,16 +700,31 @@ def optimize_v5_retry(
     plan_summary, plan_text, plan_context = _get_plan_context(sample_db, sql)
     base_prompt = _build_base_prompt(sql, plan_context)
 
-    # Get ML-recommended examples
-    if query_id:
-        ml_recs = get_query_recommendations(query_id, top_n=3)
-        examples = []
-        for ex_id in ml_recs[:3]:
-            ex = load_example(ex_id)
-            if ex:
+    # Get ML-recommended examples using LIVE FAISS similarity (VERIFIED ONLY)
+    ml_recs = get_recommendations_for_sql(sql, top_n=6)
+    verified_recs = filter_to_verified(ml_recs)
+    logger.info(f"LIVE FAISS: ML recs={len(ml_recs)}, verified={len(verified_recs)}")
+
+    examples = []
+    for ex_id in verified_recs:
+        if len(examples) >= 3:
+            break
+        ex = load_example(ex_id)
+        if ex:
+            examples.append(ex)
+            logger.debug(f"Loaded verified ML example: {ex_id}")
+
+    # Pad with KB-matched VERIFIED examples if needed
+    if len(examples) < 3:
+        fallback = get_matching_examples(sql)
+        for ex in fallback:
+            if len(examples) >= 3:
+                break
+            if ex not in examples and ex.id in VERIFIED_TRANSFORMS:
                 examples.append(ex)
-    else:
-        examples = get_matching_examples(sql)[:3]
+                logger.debug(f"Added verified fallback example: {ex.id}")
+
+    logger.info(f"Using {len(examples)} verified examples: {[e.id for e in examples]}")
 
     attempts_history = []
     error_history = []
@@ -632,6 +759,15 @@ def optimize_v5_retry(
             model=model,
         )
 
+        # Save SQL immediately after LLM response, before validation
+        if output_dir:
+            from pathlib import Path
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            sql_file = output_path / f"retry_attempt_{attempt}.sql"
+            sql_file.write_text(result.optimized_sql)
+            logger.info(f"Saved SQL to {sql_file}")
+
         attempts_history.append({
             "attempt": attempt,
             "status": result.status.value,
@@ -640,7 +776,7 @@ def optimize_v5_retry(
         })
 
         if result.status == ValidationStatus.PASS:
-            # Success! Benchmark on full DB
+            # Success - validation passed! Benchmark on full DB and return
             logger.info(f"Attempt {attempt} succeeded on sample DB, benchmarking on full DB")
             full_validator = SQLValidator(database=full_db)
             full = full_validator.validate(sql, result.optimized_sql)
@@ -651,18 +787,20 @@ def optimize_v5_retry(
                 full_error=full.errors[0] if full.errors else None,
             )
 
-            if full.status == ValidationStatus.PASS and full.speedup >= target_speedup:
-                logger.info(f"✅ Target met after {attempt} attempts: {full.speedup:.2f}x")
+            if full.status == ValidationStatus.PASS:
+                logger.info(f"✅ Mode 1 succeeded after {attempt} attempts: {full.speedup:.2f}x speedup")
                 return result, full_result, attempts_history
             else:
-                logger.info(f"⚠️ Full DB validation passed but speedup {full.speedup:.2f}x below target {target_speedup}x")
-                # Continue trying
-
-        # Failed - add to error history for next attempt
-        if result.error:
-            error_hist = _build_history_section(result.response, result.error)
-            error_history.append(error_hist)
-            logger.info(f"Attempt {attempt} failed: {result.error}")
+                # Full DB validation failed - treat as error and retry
+                logger.info(f"⚠️ Sample passed but full DB failed: {full_result.full_error}")
+                error_hist = _build_history_section(result.response, full_result.full_error or "Full DB validation failed")
+                error_history.append(error_hist)
+        else:
+            # Failed - add to error history for next attempt
+            if result.error:
+                error_hist = _build_history_section(result.response, result.error)
+                error_history.append(error_hist)
+                logger.info(f"Attempt {attempt} failed: {result.error}")
 
     logger.info(f"❌ All {max_retries} attempts exhausted without success")
     return None, None, attempts_history
@@ -680,6 +818,7 @@ def optimize_v5_evolutionary(
     target_speedup: float = 2.0,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    output_dir: Optional[str] = None,
 ) -> tuple[Optional[CandidateResult], Optional[FullRunResult], list[dict]]:
     """
     Mode 3: Evolutionary - Iterative improvement with stacking optimizations.
@@ -692,19 +831,44 @@ def optimize_v5_evolutionary(
         target_speedup: Target speedup threshold (default: 2.0)
         provider: LLM provider
         model: LLM model
+        output_dir: Optional directory to save intermediate SQL files immediately after LLM response
 
     Returns: (best_candidate, best_full_result, iterations_history)
     """
     logger.info(f"Starting Mode 3 (Evolutionary) optimization with max {max_iterations} iterations")
 
-    # Example rotation sets
+    # Get ML-recommended examples using LIVE FAISS similarity (VERIFIED ONLY)
     all_examples = load_all_examples()
+    verified_examples = [ex for ex in all_examples if ex.id in VERIFIED_TRANSFORMS]
+
+    # Use LIVE FAISS ML recommendations to prioritize VERIFIED examples
+    ml_recs = get_recommendations_for_sql(sql, top_n=12)
+    verified_recs = filter_to_verified(ml_recs)
+    logger.info(f"LIVE FAISS: ML recs={len(ml_recs)}, verified={len(verified_recs)}")
+
+    # Map verified transform names to example objects
+    example_by_id = {ex.id: ex for ex in verified_examples}
+
+    # Build prioritized example list from verified ML recs
+    prioritized_examples = []
+    for rec_id in verified_recs:
+        if rec_id in example_by_id:
+            prioritized_examples.append(example_by_id[rec_id])
+
+    # Pad with remaining verified examples
+    for ex in verified_examples:
+        if ex not in prioritized_examples:
+            prioritized_examples.append(ex)
+
+    logger.info(f"{len(prioritized_examples)} verified examples prioritized by FAISS similarity")
+
+    # Create rotation sets from prioritized examples
     example_rotation = [
-        all_examples[0:3],   # Iteration 1
-        all_examples[3:6],   # Iteration 2
-        all_examples[6:9],   # Iteration 3
-        all_examples[9:12],  # Iteration 4
-        all_examples[0:3],   # Iteration 5 (wrap around)
+        prioritized_examples[0:3],   # Iteration 1: Top ML recs
+        prioritized_examples[3:6],   # Iteration 2
+        prioritized_examples[6:9],   # Iteration 3
+        prioritized_examples[9:12],  # Iteration 4
+        prioritized_examples[0:3],   # Iteration 5 (wrap around to top recs)
     ]
 
     current_sql = sql
@@ -726,39 +890,68 @@ def optimize_v5_evolutionary(
         # Build success history from previous iterations
         history = ""
         if iteration > 1:
-            history = "## Previous Iterations\n\n"
-            for it in iterations_history:
-                history += f"### Iteration {it['iteration']}: {it['speedup']:.2f}x speedup ✓\n"
-                history += f"**Transform:** {it['transform']}\n"
-                if it.get('key_changes'):
-                    history += f"**Key changes:** {it['key_changes']}\n"
+            successful_iterations = [it for it in iterations_history if it.get('status') == 'success']
+            failed_iterations = [it for it in iterations_history if it.get('status') != 'success']
+
+            if successful_iterations:
+                history = "## Previous Successful Iterations\n\n"
+                for it in successful_iterations:
+                    history += f"### Iteration {it['iteration']}: {it.get('speedup', 0):.2f}x speedup ✓\n"
+                    if it.get('transform'):
+                        history += f"**Transform:** {it['transform']}\n"
+                    history += "\n"
+
+            if failed_iterations:
+                history += "## Failed Attempts (avoid these approaches)\n"
+                for it in failed_iterations:
+                    history += f"- Iteration {it['iteration']}: {it.get('error', 'Unknown error')}\n"
                 history += "\n"
 
             history += f"## Current Challenge\n"
             history += f"**Current best:** {best_speedup:.2f}x speedup\n"
             history += f"**Target:** {target_speedup}x\n"
-            history += f"**Gap:** {target_speedup - best_speedup:.2f}x\n\n"
-            history += "Now try to improve upon the current best while preserving all previous optimizations.\n\n"
+            if best_speedup < target_speedup:
+                history += f"**Gap:** {target_speedup - best_speedup:.2f}x needed\n\n"
+            history += "Try a DIFFERENT approach to improve upon the current best.\n\n"
 
         # Call worker (no sample DB - directly benchmark on full)
-        prompt = base_prompt + "\n\n" + history if history else base_prompt
+        full_prompt = _build_prompt_with_examples(base_prompt, examples, plan_summary, history)
 
         # Generate optimization
         llm_client = _create_llm_client(provider, model)
-        response = llm_client.call(prompt)
+        response = llm_client.analyze(full_prompt)
 
-        # Assemble SQL
-        pipeline = DagV2Pipeline()
+        # Save API response immediately, BEFORE any processing
+        if output_dir:
+            from pathlib import Path
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            # Save raw response
+            response_file = output_path / f"iteration_{iteration}_response.txt"
+            response_file.write_text(response)
+            # Save prompt too
+            prompt_file = output_path / f"iteration_{iteration}_prompt.txt"
+            prompt_file.write_text(full_prompt)
+            logger.info(f"Saved iteration {iteration} response to {response_file}")
+
+        # Assemble SQL from response
+        pipeline = DagV2Pipeline(current_sql, plan_context=plan_context)
         try:
-            optimized_sql = pipeline.assemble_from_response(response, current_sql)
+            optimized_sql = pipeline.apply_response(response)
         except Exception as e:
             logger.error(f"Iteration {iteration} failed to assemble: {e}")
             iterations_history.append({
                 "iteration": iteration,
-                "status": "failed",
+                "status": "assembly_failed",
                 "error": str(e),
             })
             continue
+
+        # Save SQL immediately after assembly, before validation
+        if output_dir:
+            sql_file = output_path / f"iteration_{iteration}_optimized.sql"
+            sql_file.write_text(optimized_sql)
+            logger.info(f"Saved iteration {iteration} SQL to {sql_file}")
 
         # Benchmark on full DB
         validator = SQLValidator(database=full_db)
@@ -766,7 +959,8 @@ def optimize_v5_evolutionary(
 
         if full.status == ValidationStatus.PASS:
             speedup = full.speedup
-            logger.info(f"Iteration {iteration}: {speedup:.2f}x speedup")
+            improved = speedup > best_speedup
+            logger.info(f"Iteration {iteration}: {speedup:.2f}x speedup {'(NEW BEST)' if improved else ''}")
 
             # Create candidate result
             candidate = CandidateResult(
@@ -775,12 +969,17 @@ def optimize_v5_evolutionary(
                 status=full.status,
                 speedup=speedup,
                 error=None,
-                prompt=prompt,
+                prompt=full_prompt,
                 response=response,
             )
 
+            # Always save validated SQL with speedup info
+            if output_dir:
+                validated_file = output_path / f"iteration_{iteration}_validated_{speedup:.2f}x.sql"
+                validated_file.write_text(optimized_sql)
+
             # Check if improved
-            if speedup > best_speedup:
+            if improved:
                 best_speedup = speedup
                 best_candidate = candidate
                 best_full_result = FullRunResult(
@@ -789,28 +988,28 @@ def optimize_v5_evolutionary(
                     full_speedup=speedup,
                     full_error=None,
                 )
-                # Update current SQL to best so far
+                # Update current SQL to best so far for next iteration
                 current_sql = optimized_sql
-                logger.info(f"✅ New best: {best_speedup:.2f}x (iteration {iteration})")
+                logger.info(f"New best: {best_speedup:.2f}x (iteration {iteration})")
 
             iterations_history.append({
                 "iteration": iteration,
                 "status": "success",
                 "speedup": speedup,
-                "transform": "extracted_from_response",  # Would parse from response
-                "improved": speedup > best_speedup,
+                "improved": improved,
             })
 
-            # Check if target met
+            # Check if target met - early exit
             if speedup >= target_speedup:
-                logger.info(f"🏆 Target met after {iteration} iterations: {speedup:.2f}x")
+                logger.info(f"Target {target_speedup}x met after {iteration} iterations: {speedup:.2f}x")
                 break
         else:
-            logger.error(f"Iteration {iteration} failed validation: {full.errors}")
+            error_msg = full.errors[0] if full.errors else "Unknown validation error"
+            logger.warning(f"Iteration {iteration} failed validation: {error_msg}")
             iterations_history.append({
                 "iteration": iteration,
-                "status": "failed",
-                "error": full.errors[0] if full.errors else "Unknown error",
+                "status": "validation_failed",
+                "error": error_msg,
             })
 
     if best_candidate:

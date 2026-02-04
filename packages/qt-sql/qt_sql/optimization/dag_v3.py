@@ -76,21 +76,26 @@ def get_example_ids() -> List[str]:
 
 
 # KB pattern ID -> example ID mapping
+# VERIFIED TRANSFORMS ONLY - 7 patterns with proven TPC-DS speedups
 KB_TO_EXAMPLE = {
-    # High-value patterns (proven 2x+)
-    "or_to_union": "or_to_union",
-    "correlated_to_cte": "decorrelate",
-    "date_cte_isolate": "date_cte_isolate",
-    "push_pred": "quantity_range_pushdown",
-    "consolidate_scans": "early_filter",
+    # VERIFIED: 7 transforms with proven speedups
+    "or_to_union": "or_to_union",           # 3.17x Q15 - Split OR to UNION ALL
+    "correlated_to_cte": "decorrelate",     # 2.92x Q1 - Decorrelate subquery
+    "consolidate_scans": "early_filter",    # 4.00x Q93 - Early dimension filter
+    "push_pred": "pushdown",                # 2.11x Q9 - Push predicates into CTEs
+    "date_cte_isolate": "date_cte_isolate", # 4.00x Q6 - Date CTE isolation
+    "union_cte_split": "union_cte_split",   # 1.36x Q74 - Year-specialized CTEs
+    "materialize_cte": "materialize_cte",   # 1.37x Q95 - Materialize repeated subquery
+}
 
-    # Standard patterns
-    "multi_push_pred": "multi_push_predicate",
-    "materialize_cte": "materialize_cte",
-    "flatten_subq": "flatten_subquery",
-    "reorder_join": "reorder_join",
-    "inline_cte": "inline_cte",
-    "remove_redundant": "remove_redundant",
+# Unverified patterns - detected by AST but no verified example
+# These will show as AST hints rather than full examples
+KB_UNVERIFIED_PATTERNS = {
+    "multi_push_pred": "Consider pushing multiple predicates into CTEs",
+    "flatten_subq": "Consider flattening IN/EXISTS subquery to JOIN",
+    "reorder_join": "Consider reordering joins - filter dimensions first",
+    "inline_cte": "Consider inlining single-use CTE for optimizer flexibility",
+    "remove_redundant": "Consider removing redundant operations",
 }
 
 
