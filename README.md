@@ -68,6 +68,19 @@ packages/
 
   qt-ui-shared/    # Shared React components
     src/
+
+Repository Layout:
+==================
+alembic/           # Database migrations
+artifacts/         # Local artifacts (reports, lists, exports)
+docs/              # Project documentation
+landing_page/      # Marketing/landing page assets
+packages/          # Product packages (see above)
+research/          # Exploratory notes and experiments
+runs/              # Local run outputs (test runs, retries, temp data)
+scripts/           # Utility scripts for dev/test workflows
+secrets/           # Local API keys and credentials (ignored by git)
+tests/             # Repository-level tests and harnesses
 ```
 
 ## Quick Start

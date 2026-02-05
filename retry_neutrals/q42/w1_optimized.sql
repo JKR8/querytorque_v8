@@ -1,2 +1,0 @@
-WITH filtered_date AS (SELECT d_date_sk FROM date_dim WHERE d_year = 2000 AND d_moy = 11), filtered_item AS (SELECT i_item_sk, i_category_id, i_category FROM item WHERE i_manager_id = 1)
-SELECT 2000 AS d_year, i.i_category_id, i.i_category, SUM(ss.ss_ext_sales_price) FROM filtered_date AS d JOIN store_sales AS ss ON d.d_date_sk = ss.ss_sold_date_sk JOIN filtered_item AS i ON ss.ss_item_sk = i.i_item_sk GROUP BY i.i_category_id, i.i_category ORDER BY SUM(ss.ss_ext_sales_price) DESC, d_year, i.i_category_id, i.i_category LIMIT 100
