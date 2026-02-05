@@ -77,7 +77,7 @@ def extract_query_num(path: Path) -> int:
     return int(name.split("_")[1])
 
 
-def test_single_query(query_path: Path, detector: ASTDetector) -> QueryResult:
+def _run_single_query(query_path: Path, detector: ASTDetector) -> QueryResult:
     """Test a single TPC-DS query."""
     query_num = extract_query_num(query_path)
     result = QueryResult(query_num=query_num, file_path=query_path, parse_success=True)
@@ -148,7 +148,7 @@ def run_tpcds_tests() -> TestSummary:
 
     # Test each query
     for query_path in queries:
-        result = test_single_query(query_path, detector)
+        result = _run_single_query(query_path, detector)
         summary.query_results.append(result)
         summary.total_detection_time_ms += result.detection_time_ms
 

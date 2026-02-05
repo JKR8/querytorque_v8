@@ -1,0 +1,1441 @@
+# PostgreSQL DSB Query Rewrite Rules Catalog
+# Version: 1.0
+# Target: PostgreSQL 12+ (some rules require specific versions noted)
+# Purpose: Systematic optimization of DSB (Decision Support Benchmark) queries
+
+metadata:
+  catalog_version: "1.0"
+  last_updated: "2026-02-05"
+  total_rules: 47
+  categories:
+    - subquery_transformations
+    - cte_materialization
+    - join_optimization
+    - window_functions
+    - aggregation_optimization
+    - predicate_rewrites
+    - set_operations
+    - index_strategies
+    - statistics_configuration
+    - planner_configuration
+    - pg_hint_plan
+    - dsb_specific
+
+rules:
+
+  # ============================================================================
+  # SUBQUERY TRANSFORMATIONS
+  # ============================================================================
+
+  - id: CORRELATED_SCALAR_TO_LEFT_JOIN
+    category: subquery_transformations
+    description: |
+      Convert correlated scalar subqueries in SELECT clause to LEFT JOIN.
+      PostgreSQL executes scalar subqueries as nested loops and cannot 
+      decorrelate them automatically, preventing optimal join strategies.
+    when_to_apply: |
+      When a correlated subquery returns a single value and the outer table 
+      is large. Look for scalar subqueries in SELECT list referencing outer columns.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT o.order_id, o.customer_id,
+             (SELECT c.name FROM customers c 
+              WHERE c.id = o.customer_id) AS customer_name
+      FROM orders o;
+    after_sql: |
+      SELECT o.order_id, o.customer_id, c.name AS customer_name
+      FROM orders o
+      LEFT JOIN customers c ON c.id = o.customer_id;
+
+  - id: CORRELATED_AGGREGATE_TO_LATERAL
+    category: subquery_transformations
+    description: |
+      Rewrite scalar subqueries with aggregations to LATERAL joins, enabling
+      the optimizer to select optimal join strategies (hash, merge) rather
+      than being restricted to nested loop execution.
+    when_to_apply: |
+      When scalar subqueries contain aggregates (COUNT, SUM, AVG, MAX, MIN)
+      that reference outer query columns.
+    pg_version: "9.3+"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT c.id, c.name,
+             (SELECT SUM(o.amount) FROM orders o 
+              WHERE o.customer_id = c.id) AS total_spent
+      FROM customers c;
+    after_sql: |
+      SELECT c.id, c.name, agg.total_spent
+      FROM customers c
+      LEFT JOIN LATERAL (
+          SELECT SUM(amount) AS total_spent
+          FROM orders
+          WHERE customer_id = c.id
+      ) agg ON TRUE;
+
+  - id: TOP_N_PER_GROUP_TO_LATERAL
+    category: subquery_transformations
+    description: |
+      Convert correlated subqueries for "top N per group" to LATERAL joins
+      with LIMIT, enabling index-only scans per group instead of window
+      functions over entire dataset.
+    when_to_apply: |
+      Finding top N rows per group where an appropriate index exists on
+      (group_key, sort_column). Especially effective when N is small.
+    pg_version: "9.3+"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT c.id, c.name,
+             (SELECT o.order_id FROM orders o 
+              WHERE o.customer_id = c.id 
+              ORDER BY o.order_date DESC LIMIT 1) AS latest_order
+      FROM customers c;
+    after_sql: |
+      SELECT c.id, c.name, latest.order_id AS latest_order
+      FROM customers c
+      LEFT JOIN LATERAL (
+          SELECT order_id
+          FROM orders
+          WHERE customer_id = c.id
+          ORDER BY order_date DESC
+          LIMIT 1
+      ) latest ON TRUE;
+    notes: |
+      With index on (customer_id, order_date DESC), PostgreSQL performs
+      efficient index scan per customer rather than sorting all orders.
+
+  - id: NOT_IN_TO_NOT_EXISTS
+    category: subquery_transformations
+    description: |
+      PostgreSQL CANNOT automatically transform NOT IN to anti-join due to
+      different NULL semantics. NOT IN with any NULL in subquery returns
+      no rows, while NOT EXISTS handles NULLs correctly and enables anti-join.
+    when_to_apply: |
+      Always prefer NOT EXISTS over NOT IN for exclusion patterns. Critical
+      for correctness when subquery may contain NULLs.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    performance_impact: "High - enables Hash Anti Join vs O(N²) SubPlan"
+    before_sql: |
+      SELECT * FROM customers 
+      WHERE customer_id NOT IN (
+          SELECT customer_id FROM blacklist
+      );
+      -- Returns 0 rows if ANY blacklist.customer_id is NULL!
+    after_sql: |
+      SELECT * FROM customers c
+      WHERE NOT EXISTS (
+          SELECT 1 FROM blacklist b 
+          WHERE b.customer_id = c.customer_id
+      );
+    alternative_sql: |
+      -- LEFT JOIN pattern also produces anti-join
+      SELECT c.* FROM customers c
+      LEFT JOIN blacklist b ON c.customer_id = b.customer_id
+      WHERE b.customer_id IS NULL;
+
+  - id: ANTI_JOIN_LEFT_JOIN_IS_NULL
+    category: subquery_transformations
+    description: |
+      Convert NOT EXISTS to LEFT JOIN with IS NULL check when the optimizer
+      produces better plans for the join-based pattern.
+    when_to_apply: |
+      When NOT EXISTS produces SubPlan instead of Anti Join. Some query
+      structures work better with explicit LEFT JOIN pattern.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT * FROM orders o
+      WHERE NOT EXISTS (
+          SELECT 1 FROM returns r 
+          WHERE r.order_id = o.order_id
+      );
+    after_sql: |
+      SELECT o.*
+      FROM orders o
+      LEFT JOIN returns r ON o.order_id = r.order_id
+      WHERE r.order_id IS NULL;
+
+  - id: EXISTS_SUBPLAN_TO_SEMI_JOIN
+    category: subquery_transformations
+    description: |
+      Restructure EXISTS subqueries to ensure PostgreSQL recognizes semi-join
+      pattern. Moving correlation condition placement can enable semi-join
+      vs SubPlan execution.
+    when_to_apply: |
+      When EXPLAIN shows SubPlan for EXISTS instead of Semi Join. Often
+      triggered by ANSI JOIN syntax inside the EXISTS subquery.
+    pg_version: "All"
+    auto_applied_by_pg: "Syntax dependent"
+    before_sql: |
+      -- May produce SubPlan with ANSI join syntax
+      SELECT * FROM customers c
+      WHERE EXISTS (
+          SELECT 1 FROM orders o
+          JOIN order_items oi ON o.id = oi.order_id
+          WHERE o.customer_id = c.id
+      );
+    after_sql: |
+      -- Comma-join with correlation in WHERE promotes Semi Join
+      SELECT * FROM customers c
+      WHERE EXISTS (
+          SELECT 1 FROM orders o, order_items oi
+          WHERE o.id = oi.order_id
+            AND o.customer_id = c.id
+      );
+
+  - id: CORRELATED_WHERE_TO_DERIVED_TABLE
+    category: subquery_transformations
+    description: |
+      Convert correlated subqueries in WHERE clause to derived table joins
+      when PostgreSQL fails to decorrelate automatically.
+    when_to_apply: |
+      Queries comparing row values against group aggregates. Common pattern
+      for "above average" type queries.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT * FROM employees emp
+      WHERE salary > (
+          SELECT AVG(salary) FROM employees 
+          WHERE department = emp.department
+      );
+    after_sql: |
+      SELECT emp.*
+      FROM employees emp
+      JOIN (
+          SELECT department, AVG(salary) AS avg_salary
+          FROM employees
+          GROUP BY department
+      ) dept_avg ON emp.department = dept_avg.department
+      WHERE emp.salary > dept_avg.avg_salary;
+
+  - id: LATERAL_FORCE_NESTED_LOOP
+    category: subquery_transformations
+    description: |
+      Use CROSS JOIN LATERAL to force nested loop execution when you know
+      it's optimal (small outer table, indexed inner lookup).
+    when_to_apply: |
+      When planner incorrectly chooses hash/merge join but nested loop with
+      parameterized index scan would be faster.
+    pg_version: "9.3+"
+    auto_applied_by_pg: false
+    before_sql: |
+      -- Planner may choose hash join
+      SELECT a.*, b.*
+      FROM small_table a 
+      JOIN large_indexed_table b ON a.id = b.ref_id;
+    after_sql: |
+      -- LATERAL always executes as nested loop
+      SELECT a.*, b.*
+      FROM small_table a
+      CROSS JOIN LATERAL (
+          SELECT * FROM large_indexed_table 
+          WHERE ref_id = a.id
+      ) b;
+
+  # ============================================================================
+  # CTE MATERIALIZATION CONTROL
+  # ============================================================================
+
+  - id: CTE_INLINE_NOT_MATERIALIZED
+    category: cte_materialization
+    description: |
+      Force CTE inlining with NOT MATERIALIZED to enable predicate pushdown
+      when CTE is referenced multiple times but benefits from different
+      filters in each reference.
+    when_to_apply: |
+      When CTE is referenced multiple times and each reference has different
+      WHERE conditions that could be pushed down.
+    pg_version: "12+"
+    auto_applied_by_pg: "Only for single-reference CTEs"
+    before_sql: |
+      WITH data AS (
+          SELECT * FROM very_large_table
+      )
+      SELECT * FROM data WHERE category = 'A'
+      UNION ALL
+      SELECT * FROM data WHERE category = 'B';
+      -- Scans entire table, then filters twice
+    after_sql: |
+      WITH data AS NOT MATERIALIZED (
+          SELECT * FROM very_large_table
+      )
+      SELECT * FROM data WHERE category = 'A'
+      UNION ALL
+      SELECT * FROM data WHERE category = 'B';
+      -- Predicates pushed down: two filtered scans
+
+  - id: CTE_OPTIMIZATION_FENCE_MATERIALIZED
+    category: cte_materialization
+    description: |
+      Use MATERIALIZED to create optimization fence, preventing predicate
+      pushdown and forcing single evaluation of expensive CTE computation. 
+    when_to_apply: |
+      - CTE contains expensive computation that should run once
+      - Need to isolate subquery planning to prevent bad plan choices
+      - Force specific join ordering
+    pg_version: "12+"
+    auto_applied_by_pg: false
+    before_sql: |
+      -- May be inlined and computed multiple times in PG12+
+      WITH expensive_calc AS (
+          SELECT id, complex_function(data) AS result 
+          FROM big_table
+      )
+      SELECT * FROM expensive_calc e1
+      JOIN expensive_calc e2 ON e1.result = e2.result;
+    after_sql: |
+      WITH expensive_calc AS MATERIALIZED (
+          SELECT id, complex_function(data) AS result 
+          FROM big_table
+      )
+      SELECT * FROM expensive_calc e1
+      JOIN expensive_calc e2 ON e1.result = e2.result;
+      -- Computed once, stored in temp table
+
+  - id: CTE_RECURSIVE_ALWAYS_MATERIALIZED
+    category: cte_materialization
+    description: |
+      Recursive CTEs are always materialized. Design recursive queries
+      knowing this constraint; consider iterative alternatives for simple
+      hierarchies.
+    when_to_apply: |
+      Document for awareness. No rewrite needed but impacts optimization
+      strategy for hierarchical DSB queries.
+    pg_version: "All"
+    auto_applied_by_pg: true
+    notes: |
+      CTEs with DML (INSERT/UPDATE/DELETE RETURNING) are also always
+      materialized for correctness.
+
+  # ============================================================================
+  # JOIN OPTIMIZATION
+  # ============================================================================
+
+  - id: JOIN_ORDER_COLLAPSE_LIMIT
+    category: join_optimization
+    description: |
+      Set join_collapse_limit = 1 to force PostgreSQL to respect explicit
+      JOIN clause ordering instead of reordering for optimization. 
+    when_to_apply: |
+      - Optimizer consistently chooses suboptimal join order
+      - Specific knowledge about data distribution optimizer lacks
+      - Complex queries where planning time is excessive
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      -- PostgreSQL may reorder JOINs arbitrarily
+      SELECT * FROM orders o
+      JOIN customers c ON o.customer_id = c.id
+      JOIN products p ON o.product_id = p.id
+      WHERE c.region = 'WEST';
+    after_sql: |
+      SET LOCAL join_collapse_limit = 1;
+      
+      -- Now joins in written order: orders → customers → products
+      SELECT * FROM orders o
+      JOIN customers c ON o.customer_id = c.id
+      JOIN products p ON o.product_id = p.id
+      WHERE c.region = 'WEST';
+
+  - id: SUBQUERY_OFFSET_ZERO_BARRIER
+    category: join_optimization
+    description: |
+      Add OFFSET 0 to subquery to create optimization barrier preventing
+      subquery pull-up, forcing materialization and specific execution order. 
+    when_to_apply: |
+      - Force specific join order without global setting changes
+      - Subquery results should compute before joining
+      - Debug plans by isolating subquery execution
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      -- Subquery may be "pulled up" and reordered
+      SELECT * FROM fact_table f
+      JOIN (
+          SELECT * FROM dim_table WHERE active = true
+      ) d ON f.dim_id = d.id;
+    after_sql: |
+      -- OFFSET 0 prevents subquery pull-up
+      SELECT * FROM fact_table f
+      JOIN (
+          SELECT * FROM dim_table WHERE active = true
+          OFFSET 0
+      ) d ON f.dim_id = d.id;
+
+  - id: STAR_SCHEMA_DIMENSION_FILTER_FIRST
+    category: join_optimization
+    description: |
+      Restructure star schema queries to filter dimension tables first
+      using optimization barriers, then join filtered results to fact table.
+    when_to_apply: |
+      Star schema queries with selective dimension filters where optimizer
+      scans fact table first instead of filtering dimensions.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      -- May scan fact table first
+      SELECT f.*, d1.name, d2.category
+      FROM fact_sales f
+      JOIN dim_date d1 ON f.date_id = d1.id
+      JOIN dim_product d2 ON f.product_id = d2.id
+      WHERE d1.year = 2025
+        AND d2.category = 'Electronics';
+    after_sql: |
+      SELECT f.*, fd.name, fp.category
+      FROM (
+          SELECT id, name FROM dim_date 
+          WHERE year = 2025 OFFSET 0
+      ) fd
+      JOIN fact_sales f ON f.date_id = fd.id
+      JOIN (
+          SELECT id, category FROM dim_product 
+          WHERE category = 'Electronics' OFFSET 0
+      ) fp ON f.product_id = fp.id;
+
+  - id: REDUNDANT_JOIN_ELIMINATION
+    category: join_optimization
+    description: |
+      Remove unnecessary joins to parent tables when only the foreign key
+      is used from the joined table and the FK is NOT NULL. PostgreSQL
+      does not automatically eliminate these (unlike Oracle/DB2). 
+    when_to_apply: |
+      When only FK column is selected from joined table and FK has NOT NULL
+      constraint ensuring all rows match.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT o.order_id, o.amount, o.customer_id
+      FROM orders o
+      JOIN customers c ON o.customer_id = c.id
+      WHERE o.status = 'completed';
+      -- Customer join is unnecessary if only customer_id needed
+    after_sql: |
+      SELECT o.order_id, o.amount, o.customer_id
+      FROM orders o
+      WHERE o.status = 'completed'
+        AND o.customer_id IS NOT NULL;
+
+  # ============================================================================
+  # WINDOW FUNCTIONS
+  # ============================================================================
+
+  - id: CORRELATED_SUBQUERY_TO_WINDOW
+    category: window_functions
+    description: |
+      Rewrite scalar subqueries computing group aggregates to window functions,
+      eliminating correlated execution and enabling single-pass processing.
+    when_to_apply: |
+      Correlated subquery calculates aggregate for current row's group
+      without changing row count.
+    pg_version: "8.4+"
+    auto_applied_by_pg: false
+    performance_impact: "High - single scan vs N scans"
+    before_sql: |
+      SELECT employee_id, name, salary
+      FROM employees emp
+      WHERE salary > (
+          SELECT AVG(salary) FROM employees 
+          WHERE department = emp.department
+      );
+    after_sql: |
+      SELECT employee_id, name, salary
+      FROM (
+          SELECT *, AVG(salary) OVER (PARTITION BY department) AS dept_avg
+          FROM employees
+      ) emp
+      WHERE salary > dept_avg;
+
+  - id: SELF_JOIN_TO_WINDOW
+    category: window_functions
+    description: |
+      Replace self-joins used to access group-level values with window
+      functions, eliminating the join entirely.
+    when_to_apply: |
+      Self-join retrieves aggregate values or rankings within a group.
+    pg_version: "8.4+"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT a.*, b.max_salary
+      FROM employees a
+      JOIN (
+          SELECT department, MAX(salary) AS max_salary
+          FROM employees GROUP BY department
+      ) b ON a.department = b.department;
+    after_sql: |
+      SELECT *, MAX(salary) OVER (PARTITION BY department) AS max_salary
+      FROM employees;
+
+  - id: TOP_N_PER_GROUP_DISTINCT_ON
+    category: window_functions
+    description: |
+      Use PostgreSQL's DISTINCT ON for "top-1-per-group" instead of
+      ROW_NUMBER() window function.  More concise and often faster. 
+    when_to_apply: |
+      Retrieving exactly one row per group based on ordering.
+      PostgreSQL-specific extension.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT * FROM (
+          SELECT *, ROW_NUMBER() OVER (
+              PARTITION BY customer_id ORDER BY order_date DESC
+          ) AS rn
+          FROM orders
+      ) ranked WHERE rn = 1;
+    after_sql: |
+      SELECT DISTINCT ON (customer_id) *
+      FROM orders
+      ORDER BY customer_id, order_date DESC;
+    notes: |
+      ORDER BY must start with DISTINCT ON columns.  For top-N (N>1),
+      use window functions with ROW_NUMBER/RANK/DENSE_RANK.
+
+  - id: TOP_N_PER_GROUP_ROW_NUMBER
+    category: window_functions
+    description: |
+      Use ROW_NUMBER() window function instead of correlated subquery
+      COUNT for top-N-per-group patterns. 
+    when_to_apply: |
+      Retrieving multiple rows per group based on ranking.
+    pg_version: "8.4+"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT * FROM items i
+      WHERE (
+          SELECT COUNT(*) FROM items i2
+          WHERE i2.category = i.category 
+            AND i2.created_at > i.created_at
+      ) < 3;
+    after_sql: |
+      SELECT * FROM (
+          SELECT *, ROW_NUMBER() OVER (
+              PARTITION BY category ORDER BY created_at DESC
+          ) AS rank
+          FROM items
+      ) ranked WHERE rank <= 3;
+
+  - id: WINDOW_SORT_ALIGNMENT
+    category: window_functions
+    description: |
+      Align window function ORDER BY clauses to minimize sorts when
+      multiple window functions are used in same query.
+    when_to_apply: |
+      Queries with multiple window functions using different orderings.
+      Group windows with same sort together.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT id,
+          SUM(value) OVER (ORDER BY date ASC) as running_asc,
+          SUM(value) OVER (ORDER BY date DESC) as running_desc,
+          COUNT(*) OVER (ORDER BY date ASC) as count_asc
+      FROM transactions;
+    after_sql: |
+      -- Group same-sorted windows together
+      SELECT id,
+          SUM(value) OVER w_asc as running_asc,
+          COUNT(*) OVER w_asc as count_asc,
+          SUM(value) OVER (ORDER BY date DESC) as running_desc
+      FROM transactions
+      WINDOW w_asc AS (ORDER BY date ASC);
+
+  - id: WINDOW_EARLY_TERMINATION_PG16
+    category: window_functions
+    description: |
+      PostgreSQL 16+ automatically terminates window function processing
+      early for ROW_NUMBER, RANK, COUNT, NTILE with LIMIT/filter conditions. 
+    when_to_apply: |
+      Queries using window functions with LIMIT or rn <= N filter.
+      No rewrite needed in PG16+, but document for awareness.
+    pg_version: "16+"
+    auto_applied_by_pg: true
+    performance_impact: "4x+ faster for limited result sets" 
+    notes: |
+      Same query in PG15 processes all rows; PG16 stops after limit reached.
+
+  # ============================================================================
+  # AGGREGATION OPTIMIZATION
+  # ============================================================================
+
+  - id: EXISTS_INSTEAD_OF_COUNT
+    category: aggregation_optimization
+    description: |
+      Replace COUNT(*) > 0 existence checks with EXISTS for early termination.
+      EXISTS stops after finding first match. 
+    when_to_apply: |
+      Checking if any matching rows exist rather than needing exact count.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    performance_impact: "30-40x faster in many cases" 
+    before_sql: |
+      SELECT * FROM customers c
+      WHERE (SELECT COUNT(*) FROM orders o 
+             WHERE o.customer_id = c.id) > 0;
+    after_sql: |
+      SELECT * FROM customers c
+      WHERE EXISTS (
+          SELECT 1 FROM orders o WHERE o.customer_id = c.id
+      );
+
+  - id: LIMITED_COUNT_FOR_THRESHOLD
+    category: aggregation_optimization
+    description: |
+      When checking if count exceeds threshold, use LIMIT to avoid
+      counting all rows. 
+    when_to_apply: |
+      Need to know if "at least N" rows exist, not exact count.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT CASE WHEN COUNT(*) >= 100 THEN true ELSE false END
+      FROM orders WHERE customer_id = 123;
+    after_sql: |
+      SELECT COUNT(*) >= 100
+      FROM (
+          SELECT 1 FROM orders 
+          WHERE customer_id = 123 LIMIT 100
+      ) sub;
+
+  - id: GROUPING_SETS_INSTEAD_OF_UNION
+    category: aggregation_optimization
+    description: |
+      Replace multiple GROUP BY queries with UNION ALL using single
+      GROUPING SETS/ROLLUP/CUBE query for multi-level aggregations. 
+    when_to_apply: |
+      Reports requiring multiple aggregation levels (subtotals, grand totals).
+    pg_version: "9.5+"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT region, NULL as product, SUM(sales) FROM sales GROUP BY region
+      UNION ALL
+      SELECT NULL, product, SUM(sales) FROM sales GROUP BY product
+      UNION ALL
+      SELECT NULL, NULL, SUM(sales) FROM sales;
+    after_sql: |
+      SELECT region, product, SUM(sales)
+      FROM sales
+      GROUP BY GROUPING SETS ((region), (product), ());
+    alternative_sql: |
+      -- For hierarchical rollups
+      SELECT region, product, SUM(sales)
+      FROM sales
+      GROUP BY ROLLUP (region, product);
+
+  - id: AGGREGATE_PUSH_BELOW_JOIN
+    category: aggregation_optimization
+    description: |
+      Push aggregation below join when only aggregated values are needed
+      from one side, reducing join cardinality.
+    when_to_apply: |
+      Join followed by aggregation where one side contributes only to
+      aggregate, not to grouping.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT c.region, SUM(o.amount)
+      FROM customers c
+      JOIN orders o ON c.id = o.customer_id
+      GROUP BY c.region;
+    after_sql: |
+      SELECT c.region, pre_agg.total_amount
+      FROM customers c
+      JOIN (
+          SELECT customer_id, SUM(amount) as total_amount
+          FROM orders GROUP BY customer_id
+      ) pre_agg ON c.id = pre_agg.customer_id
+      GROUP BY c.region;
+      -- May not always be faster; test with EXPLAIN ANALYZE
+
+  # ============================================================================
+  # PREDICATE REWRITES
+  # ============================================================================
+
+  - id: OR_TO_UNION_ALL
+    category: predicate_rewrites
+    description: |
+      Rewrite OR conditions to UNION ALL when OR prevents efficient index
+      usage, especially in JOIN contexts.
+    when_to_apply: |
+      OR conditions span different columns with separate indexes.
+      Ensure result sets are mutually exclusive for UNION ALL.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT * FROM orders
+      WHERE customer_id = 100 OR product_id = 200;
+    after_sql: |
+      SELECT * FROM orders WHERE customer_id = 100
+      UNION ALL
+      SELECT * FROM orders WHERE product_id = 200 
+        AND customer_id != 100;  -- Exclude overlap
+
+  - id: LIKE_PREFIX_INDEX_USAGE
+    category: predicate_rewrites
+    description: |
+      Ensure LIKE 'prefix%' uses index by creating text_pattern_ops index
+      for non-C locale databases.
+    when_to_apply: |
+      Prefix searches on text columns in non-C collation databases.
+    pg_version: "All"
+    auto_applied_by_pg: "Only with C locale or pattern_ops index"
+    before_sql: |
+      -- May not use index with non-C collation
+      SELECT * FROM paths WHERE path LIKE '/media/photos/%';
+    after_sql: |
+      -- Create pattern_ops index
+      CREATE INDEX idx_path_pattern ON paths (path text_pattern_ops);
+      
+      SELECT * FROM paths WHERE path LIKE '/media/photos/%';
+    alternative_sql: |
+      -- Explicit range predicate always works
+      SELECT * FROM paths 
+      WHERE path >= '/media/photos/' 
+        AND path < '/media/photot/';
+
+  - id: EXPRESSION_TO_SARGABLE
+    category: predicate_rewrites
+    description: |
+      Transform non-sargable predicates (functions on columns) to sargable
+      form enabling index usage.
+    when_to_apply: |
+      Functions applied to indexed columns preventing index scan.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT * FROM orders 
+      WHERE EXTRACT(YEAR FROM order_date) = 2025;
+    after_sql: |
+      SELECT * FROM orders 
+      WHERE order_date >= '2025-01-01' 
+        AND order_date < '2026-01-01';
+
+  - id: CONSTANT_FOLDING_COLUMN_SIDE
+    category: predicate_rewrites
+    description: |
+      Move calculations to constant side of comparisons to enable index
+      usage. PostgreSQL folds constants but won't rearrange expressions. 
+    when_to_apply: |
+      Arithmetic or function on indexed column in WHERE clause.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT * FROM products WHERE price * 1.1 > 100;
+    after_sql: |
+      SELECT * FROM products WHERE price > 100 / 1.1;
+
+  - id: PARTITION_PRUNING_PREDICATE
+    category: predicate_rewrites
+    description: |
+      Rewrite predicates to enable partition pruning by using direct
+      comparisons on partition key columns.
+    when_to_apply: |
+      Partitioned tables where pruning isn't occurring due to
+      functions/expressions on partition key.
+    pg_version: "10+"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT * FROM sales 
+      WHERE EXTRACT(YEAR FROM sale_date) = 2025;
+    after_sql: |
+      SELECT * FROM sales 
+      WHERE sale_date >= '2025-01-01' 
+        AND sale_date < '2026-01-01';
+
+  - id: IS_NOT_DISTINCT_FROM_NULL_SAFE
+    category: predicate_rewrites
+    description: |
+      Use IS NOT DISTINCT FROM for NULL-safe equality comparisons where
+      NULL should equal NULL.
+    when_to_apply: |
+      Self-joins or comparisons on nullable columns where NULL=NULL
+      should be TRUE.
+    pg_version: "8.0+"
+    auto_applied_by_pg: false
+    before_sql: |
+      -- NULL won't match NULL
+      SELECT * FROM t1 JOIN t2 ON t1.x = t2.x;
+    after_sql: |
+      -- NULL matches NULL
+      SELECT * FROM t1 JOIN t2 ON t1.x IS NOT DISTINCT FROM t2.x;
+
+  - id: COALESCE_NULL_PROPAGATION
+    category: predicate_rewrites
+    description: |
+      Use COALESCE to provide default values and prevent NULL propagation
+      in calculations.
+    when_to_apply: |
+      Arithmetic with potentially NULL values where NULL should be
+      treated as zero or default.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT price * (1 - discount) AS final_price FROM products;
+      -- Returns NULL if discount is NULL
+    after_sql: |
+      SELECT price * (1 - COALESCE(discount, 0)) AS final_price 
+      FROM products;
+
+  # ============================================================================
+  # SET OPERATIONS
+  # ============================================================================
+
+  - id: UNION_TO_UNION_ALL
+    category: set_operations
+    description: |
+      Replace UNION with UNION ALL when duplicate elimination is unnecessary,
+      avoiding expensive sort/hash operations.
+    when_to_apply: |
+      Result sets are provably disjoint or duplicates are acceptable.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT id FROM active_users WHERE region = 'US'
+      UNION
+      SELECT id FROM active_users WHERE region = 'EU';
+    after_sql: |
+      SELECT id FROM active_users WHERE region = 'US'
+      UNION ALL
+      SELECT id FROM active_users WHERE region = 'EU';
+
+  - id: IN_LIST_TO_VALUES_JOIN
+    category: set_operations
+    description: |
+      Convert large IN lists to VALUES clause with join for better plan
+      optimization with many values.
+    when_to_apply: |
+      IN lists with dozens to thousands of values where optimizer
+      estimates become unreliable.
+    pg_version: "All"
+    auto_applied_by_pg: false
+    before_sql: |
+      SELECT * FROM orders 
+      WHERE customer_id IN (1001, 1002, 1003, ..., 1500);
+    after_sql: |
+      SELECT o.* FROM orders o
+      JOIN (VALUES (1001), (1002), (1003), ..., (1500)) AS v(id)
+      ON o.customer_id = v.id;
+    alternative_sql: |
+      SELECT * FROM orders 
+      WHERE customer_id = ANY(ARRAY[1001, 1002, 1003, ..., 1500]);
+
+  # ============================================================================
+  # INDEX STRATEGIES
+  # ============================================================================
+
+  - id: COVERING_INDEX_INDEX_ONLY_SCAN
+    category: index_strategies
+    description: |
+      Create covering indexes with INCLUDE clause to enable index-only
+      scans, avoiding heap fetches entirely.
+    when_to_apply: |
+      Frequently-run queries where all SELECT columns can be included
+      in the index.
+    pg_version: "11+"
+    before_sql: |
+      CREATE INDEX orders_customer_idx ON orders (customer_id);
+      
+      SELECT customer_id, order_total FROM orders 
+      WHERE customer_id = 123;
+      -- Requires heap fetch for order_total
+    after_sql: |
+      CREATE INDEX orders_customer_covering_idx 
+      ON orders (customer_id) INCLUDE (order_total);
+      
+      SELECT customer_id, order_total FROM orders 
+      WHERE customer_id = 123;
+      -- Index Only Scan, Heap Fetches: 0
+
+  - id: BRIN_INDEX_SEQUENTIAL_DATA
+    category: index_strategies
+    description: |
+      Use Block Range Indexes (BRIN) for naturally ordered sequential data
+      achieving 99%+ space savings over B-tree.
+    when_to_apply: |
+      Very large tables with physically ordered data (timestamps,
+      auto-increment IDs, append-only log tables).
+    pg_version: "9.5+"
+    before_sql: |
+      CREATE INDEX events_ts_btree ON events (created_at);
+      -- Index size: 10GB+ for 500M rows
+    after_sql: |
+      CREATE INDEX events_ts_brin ON events USING BRIN (created_at);
+      -- Index size: ~200KB (99.99% smaller)
+
+  - id: PARTIAL_INDEX_FILTERED_QUERIES
+    category: index_strategies
+    description: |
+      Create partial indexes matching common WHERE clause filters,
+      reducing index size for targeted queries.
+    when_to_apply: |
+      Queries consistently filter for small subset of rows (active
+      records, pending orders, recent data).
+    pg_version: "All"
+    before_sql: |
+      CREATE INDEX orders_date_idx ON orders (order_date);
+      -- Includes all 10M rows
+    after_sql: |
+      CREATE INDEX orders_pending_idx ON orders (order_date) 
+      WHERE status = 'pending';
+      -- Only ~5% of rows, 95% smaller index
+
+  - id: EXPRESSION_INDEX_FUNCTIONAL
+    category: index_strategies
+    description: |
+      Create indexes on expressions/functions to optimize queries filtering
+      or sorting on computed values.
+    when_to_apply: |
+      Queries consistently use functions (LOWER, DATE_TRUNC) or
+      expressions in WHERE/ORDER BY.
+    pg_version: "All"
+    before_sql: |
+      SELECT * FROM customers 
+      WHERE LOWER(email) = 'user@example.com';
+      -- Seq Scan with function evaluation
+    after_sql: |
+      CREATE INDEX customers_email_lower_idx 
+      ON customers (LOWER(email));
+      
+      SELECT * FROM customers 
+      WHERE LOWER(email) = 'user@example.com';
+      -- Index Scan
+
+  - id: INDEX_ORDER_BY_ELIMINATION
+    category: index_strategies
+    description: |
+      Create indexes with matching sort order to eliminate explicit sort
+      operations, especially powerful with LIMIT.
+    when_to_apply: |
+      Queries frequently ORDER BY specific columns. Match index
+      direction to query ORDER BY.
+    pg_version: "All"
+    before_sql: |
+      SELECT * FROM sales 
+      WHERE sale_date >= '2025-01-01' 
+      ORDER BY sale_date DESC, product_id DESC 
+      LIMIT 10;
+      -- Requires Sort node
+    after_sql: |
+      CREATE INDEX sales_dt_pr ON sales (sale_date DESC, product_id DESC);
+      
+      SELECT * FROM sales 
+      WHERE sale_date >= '2025-01-01' 
+      ORDER BY sale_date DESC, product_id DESC 
+      LIMIT 10;
+      -- Index Scan Backward, no Sort
+
+  # ============================================================================
+  # STATISTICS CONFIGURATION
+  # ============================================================================
+
+  - id: EXTENDED_STATS_DEPENDENCIES
+    category: statistics_configuration
+    description: |
+      Create functional dependency statistics for correlated columns to
+      prevent underestimating row counts when columns are logically related.
+    when_to_apply: |
+      Multi-column WHERE clauses where one column's value determines
+      another (e.g., city determines state).
+    pg_version: "10+"
+    before_sql: |
+      -- Planner assumes independence, multiplies selectivities
+      SELECT * FROM customer 
+      WHERE state = 'CA' AND city = 'San Francisco';
+      -- Estimates: 1 row, Actual: 100 rows
+    after_sql: |
+      CREATE STATISTICS stts_cust_geo (dependencies) 
+      ON state, city FROM customer;
+      ANALYZE customer;
+      
+      SELECT * FROM customer 
+      WHERE state = 'CA' AND city = 'San Francisco';
+      -- Accurate estimate
+
+  - id: EXTENDED_STATS_NDISTINCT
+    category: statistics_configuration
+    description: |
+      Create n-distinct statistics for column combinations used in GROUP BY
+      to correct group count estimates.
+    when_to_apply: |
+      GROUP BY queries with severely over/underestimated group counts
+      leading to wrong HashAggregate vs GroupAggregate choice.
+    pg_version: "10+"
+    before_sql: |
+      EXPLAIN SELECT COUNT(*) FROM orders 
+      GROUP BY product_type, warehouse_id;
+      -- rows=1000000 (actual: 100)
+    after_sql: |
+      CREATE STATISTICS stts_orders_nd (ndistinct) 
+      ON product_type, warehouse_id FROM orders;
+      ANALYZE orders;
+      
+      EXPLAIN SELECT COUNT(*) FROM orders 
+      GROUP BY product_type, warehouse_id;
+      -- rows=100 (accurate)
+
+  - id: EXTENDED_STATS_MCV
+    category: statistics_configuration
+    description: |
+      Create Most Common Values (MCV) statistics for multi-column
+      combinations to handle skewed DSB data distributions.
+    when_to_apply: |
+      Skewed distributions across column combinations; queries filter
+      on specific value combinations.
+    pg_version: "10+"
+    before_sql: |
+      -- Planner doesn't know (a=1, b=1) is common
+      SELECT * FROM t WHERE a = 1 AND b = 1;
+    after_sql: |
+      CREATE STATISTICS stts_mcv (mcv) ON a, b FROM t;
+      ANALYZE t;
+      
+      SELECT * FROM t WHERE a = 1 AND b = 1;
+      -- Accurate estimate from MCV list
+
+  - id: STATISTICS_TARGET_TUNING
+    category: statistics_configuration
+    description: |
+      Increase statistics collection granularity for columns with skewed
+      distributions or complex queries.
+    when_to_apply: |
+      Planner estimates consistently poor for specific high-cardinality
+      or skewed columns.
+    pg_version: "All"
+    before_sql: |
+      -- Default statistics target = 100
+      SHOW default_statistics_target;
+    after_sql: |
+      -- Increase for specific column
+      ALTER TABLE sales ALTER COLUMN customer_id SET STATISTICS 1000;
+      
+      -- Or globally for data warehouse workloads
+      ALTER SYSTEM SET default_statistics_target = 500;
+      
+      ANALYZE sales;
+
+  # ============================================================================
+  # PLANNER CONFIGURATION
+  # ============================================================================
+
+  - id: WORK_MEM_HASH_OPTIMIZATION
+    category: planner_configuration
+    description: |
+      Increase work_mem to enable in-memory hash joins and sorts,
+      preventing expensive disk-based operations.
+    when_to_apply: |
+      EXPLAIN shows "external merge Disk" for sorts or hash batches > 1.
+    pg_version: "All"
+    before_sql: |
+      -- Default work_mem = 4MB
+      EXPLAIN ANALYZE SELECT * FROM large_table ORDER BY col;
+      -- Sort Method: external merge Disk: 102400kB
+    after_sql: |
+      SET LOCAL work_mem = '256MB';
+      
+      EXPLAIN ANALYZE SELECT * FROM large_table ORDER BY col;
+      -- Sort Method: quicksort Memory: 51200kB
+
+  - id: RANDOM_PAGE_COST_SSD
+    category: planner_configuration
+    description: |
+      Lower random_page_cost for SSD storage to favor index scans over
+      sequential scans.
+    when_to_apply: |
+      Running on SSDs where planner chooses sequential scans over
+      beneficial index scans.
+    pg_version: "All"
+    recommended_values:
+      hdd: 4.0
+      ssd_nvme: 1.1-2.0
+      fully_cached: 1.0
+    before_sql: |
+      SHOW random_page_cost;  -- 4.0 (HDD default)
+    after_sql: |
+      ALTER SYSTEM SET random_page_cost = 1.1;
+      SELECT pg_reload_conf();
+
+  - id: PARALLEL_QUERY_TUNING
+    category: planner_configuration
+    description: |
+      Configure parallel query execution for large DSB analytical queries
+      to utilize multiple CPU cores.
+    when_to_apply: |
+      Queries scanning large tables where parallel execution reduces
+      wall-clock time.
+    pg_version: "9.6+"
+    before_sql: |
+      -- Default may not parallelize
+      EXPLAIN SELECT COUNT(*), SUM(amount) FROM sales;
+      -- workers planned: 0
+    after_sql: |
+      SET max_parallel_workers_per_gather = 4;
+      SET parallel_tuple_cost = 0.01;
+      SET min_parallel_table_scan_size = '8MB';
+      
+      EXPLAIN SELECT COUNT(*), SUM(amount) FROM sales;
+      -- workers planned: 4, Partial Aggregate
+
+  - id: JIT_COMPILATION_ANALYTICAL
+    category: planner_configuration
+    description: |
+      Enable and tune JIT compilation for CPU-bound analytical queries
+      with complex expressions and large result sets.
+    when_to_apply: |
+      Long-running analytical queries with complex expressions,
+      aggregations. DSB workloads benefit significantly.
+    pg_version: "11+"
+    before_sql: |
+      SET jit = off;
+    after_sql: |
+      SET jit = on;
+      SET jit_above_cost = 50000;
+      SET jit_inline_above_cost = 100000;
+      SET jit_optimize_above_cost = 100000;
+
+  - id: DISABLE_NESTED_LOOP_HINT
+    category: planner_configuration
+    description: |
+      Disable nested loop joins when PostgreSQL underestimates cardinalities.
+      #1 most impactful hint found by AutoSteer research for JOB queries.
+    when_to_apply: |
+      Complex predicates where selectivity is overestimated, multi-table
+      joins with correlated predicates.
+    pg_version: "All"
+    research_source: "AutoSteer (VLDB 2023), Bao (SIGMOD 2021)"
+    before_sql: |
+      SET enable_nestloop = on;  -- Default
+    after_sql: |
+      SET enable_nestloop = off;
+      -- Forces hash/merge joins
+
+  - id: DISABLE_INDEX_SCAN_SELECTIVITY
+    category: planner_configuration
+    description: |
+      Disable index scans when PostgreSQL overestimates predicate
+      selectivity for complex/compound predicates.
+    when_to_apply: |
+      DSB queries with complex predicates, multi-column filters with
+      correlations.
+    pg_version: "All"
+    research_source: "AutoSteer (VLDB 2023)"
+    before_sql: |
+      SET enable_indexscan = on;  -- Default
+    after_sql: |
+      SET enable_indexscan = off;
+      -- Forces sequential scans
+
+  # ============================================================================
+  # PG_HINT_PLAN PATTERNS
+  # ============================================================================
+
+  - id: HINT_SCAN_METHOD_FORCE
+    category: pg_hint_plan
+    description: |
+      Force specific scan methods using pg_hint_plan when optimizer
+      chooses wrong access path.
+    when_to_apply: |
+      Optimizer incorrectly chooses sequential scan over index scan
+      or vice versa.
+    pg_version: "9.4+ with pg_hint_plan extension"
+    before_sql: |
+      SELECT * FROM orders WHERE status = 'pending';
+    after_sql: |
+      /*+ IndexScan(orders orders_status_idx) */
+      SELECT * FROM orders WHERE status = 'pending';
+      
+      -- Other scan hints:
+      -- /*+ SeqScan(orders) */
+      -- /*+ IndexOnlyScan(orders idx) */
+      -- /*+ BitmapScan(orders idx) */
+      -- /*+ NoSeqScan(orders) */
+      -- /*+ NoIndexScan(orders) */
+
+  - id: HINT_JOIN_METHOD_FORCE
+    category: pg_hint_plan
+    description: |
+      Force specific join methods when optimizer chooses suboptimal join
+      algorithm.
+    when_to_apply: |
+      Optimizer underestimates row counts and chooses wrong join type.
+    pg_version: "9.4+ with pg_hint_plan extension"
+    before_sql: |
+      SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id;
+    after_sql: |
+      /*+ HashJoin(o c) */
+      SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id;
+      
+      -- Other join hints:
+      -- /*+ NestLoop(o c) */
+      -- /*+ MergeJoin(o c) */
+      -- /*+ NoHashJoin(o c) */
+
+  - id: HINT_LEADING_JOIN_ORDER
+    category: pg_hint_plan
+    description: |
+      Force specific join order and direction using Leading hint.
+    when_to_apply: |
+      Need precise control over join order for star schema or complex
+      multi-table queries.
+    pg_version: "9.4+ with pg_hint_plan extension"
+    before_sql: |
+      SELECT * FROM fact f
+      JOIN dim1 d1 ON f.d1_id = d1.id
+      JOIN dim2 d2 ON f.d2_id = d2.id;
+    after_sql: |
+      /*+ Leading((d1 (d2 f))) */
+      SELECT * FROM fact f
+      JOIN dim1 d1 ON f.d1_id = d1.id
+      JOIN dim2 d2 ON f.d2_id = d2.id;
+      
+      -- Leading format:
+      -- Leading(t1 t2 t3)       -- order only
+      -- Leading((t1 (t2 t3)))   -- t2 joins t3 first, then t1
+
+  - id: HINT_ROWS_CARDINALITY
+    category: pg_hint_plan
+    description: |
+      Override PostgreSQL's row count estimates for joins when statistics
+      are consistently wrong.
+    when_to_apply: |
+      After observing actual vs estimated rows in EXPLAIN ANALYZE.
+    pg_version: "9.4+ with pg_hint_plan extension"
+    before_sql: |
+      -- Estimates 100 rows, actual 10000
+      SELECT * FROM orders o JOIN items i ON o.id = i.order_id
+      WHERE o.status = 'pending';
+    after_sql: |
+      /*+ Rows(o i #10000) */
+      SELECT * FROM orders o JOIN items i ON o.id = i.order_id
+      WHERE o.status = 'pending';
+      
+      -- Rows operators:
+      -- Rows(t1 t2 #100)   -- absolute
+      -- Rows(t1 t2 *10)    -- multiply estimate by 10
+      -- Rows(t1 t2 +100)   -- add to estimate
+
+  - id: HINT_SET_GUC
+    category: pg_hint_plan
+    description: |
+      Temporarily change PostgreSQL GUC parameters for specific query
+      using Set hint.
+    when_to_apply: |
+      Need query-specific work_mem, cost parameters, or enable_* settings.
+    pg_version: "9.4+ with pg_hint_plan extension"
+    before_sql: |
+      SELECT * FROM large_t1 JOIN large_t2 ON t1.id = t2.ref_id;
+    after_sql: |
+      /*+ 
+        Set(work_mem "256MB")
+        Set(random_page_cost 1.1)
+        Set(enable_seqscan off)
+      */
+      SELECT * FROM large_t1 JOIN large_t2 ON t1.id = t2.ref_id;
+
+  # ============================================================================
+  # DSB-SPECIFIC PATTERNS
+  # ============================================================================
+
+  - id: DSB_SELF_JOIN_DECOMPOSITION
+    category: dsb_specific
+    description: |
+      Decompose many-to-many self-joins into multiple passes with
+      intermediate materialization for better cardinality estimation.
+    when_to_apply: |
+      DSB Query 100 pattern: items frequently sold together.
+    pg_version: "12+"
+    research_source: "DSB Benchmark Paper (VLDB 2021)"
+    before_sql: |
+      -- DSB Query 100: items sold together
+      SELECT i1.i_item_id, i2.i_item_id, COUNT(*)
+      FROM store_sales ss1
+      JOIN store_sales ss2 ON ss1.ss_ticket_number = ss2.ss_ticket_number 
+                           AND ss1.ss_item_sk < ss2.ss_item_sk
+      JOIN item i1 ON ss1.ss_item_sk = i1.i_item_sk
+      JOIN item i2 ON ss2.ss_item_sk = i2.i_item_sk
+      GROUP BY i1.i_item_id, i2.i_item_id;
+    after_sql: |
+      WITH ticket_items AS MATERIALIZED (
+          SELECT ss_ticket_number, ss_item_sk
+          FROM store_sales
+          WHERE ss_ticket_number IS NOT NULL
+      )
+      SELECT i1.i_item_id, i2.i_item_id, COUNT(*)
+      FROM ticket_items t1
+      JOIN ticket_items t2 ON t1.ss_ticket_number = t2.ss_ticket_number 
+                           AND t1.ss_item_sk < t2.ss_item_sk
+      JOIN item i1 ON t1.ss_item_sk = i1.i_item_sk
+      JOIN item i2 ON t2.ss_item_sk = i2.i_item_sk
+      GROUP BY i1.i_item_id, i2.i_item_id;
+
+  - id: DSB_NON_EQUI_JOIN_WINDOW
+    category: dsb_specific
+    description: |
+      Rewrite non-equi joins with temporal ordering into window function
+      patterns for better estimation.
+    when_to_apply: |
+      DSB Query 101, 102 patterns with range/temporal constraints.
+    pg_version: "All"
+    research_source: "DSB Benchmark Paper (VLDB 2021)"
+    before_sql: |
+      -- Purchase, return, repurchase pattern
+      SELECT * FROM web_returns wr
+      JOIN web_sales ws ON wr.wr_item_sk = ws.ws_item_sk
+      JOIN store_sales ss ON ws.ws_item_sk = ss.ss_item_sk
+      WHERE wr.wr_returned_date_sk < ss.ss_sold_date_sk
+        AND ws.ws_sold_date_sk < wr.wr_returned_date_sk;
+    after_sql: |
+      WITH ordered_events AS MATERIALIZED (
+          SELECT 'web_sale' as event_type, ws_item_sk as item_sk, 
+                 ws_sold_date_sk as event_date
+          FROM web_sales
+          UNION ALL
+          SELECT 'web_return', wr_item_sk, wr_returned_date_sk
+          FROM web_returns
+          UNION ALL
+          SELECT 'store_sale', ss_item_sk, ss_sold_date_sk
+          FROM store_sales
+      )
+      SELECT item_sk, array_agg(event_type ORDER BY event_date)
+      FROM ordered_events
+      GROUP BY item_sk
+      HAVING array_agg(event_type ORDER BY event_date) 
+             @> ARRAY['web_sale','web_return','store_sale'];
+
+  - id: DSB_CYCLIC_JOIN_BARRIER
+    category: dsb_specific
+    description: |
+      Use CTE materialization barriers to break cyclic join graphs common
+      in DSB Query 102, preventing GEQO inconsistency.
+    when_to_apply: |
+      DSB queries with cyclic join patterns; queries with >12 tables
+      that trigger GEQO.
+    pg_version: "12+"
+    research_source: "DSB Benchmark, pgsql-hackers"
+    notes: |
+      Set geqo_threshold to 18+ for DSB queries to force dynamic
+      programming over genetic algorithm for join planning.
+
+  - id: DSB_PREDICATE_CORRELATION_STATS
+    category: dsb_specific
+    description: |
+      Create extended statistics for DSB's intentionally correlated
+      predicates that defeat independence assumption.
+    when_to_apply: |
+      DSB explicitly introduces cross-table correlations. Create
+      statistics after identifying correlated filter patterns.
+    pg_version: "10+"
+    research_source: "DSB Benchmark Paper, Leis et al. VLDB 2015"
+    before_sql: |
+      -- PostgreSQL assumes independence, underestimates
+      SELECT * FROM customer c
+      WHERE c.c_birth_country = 'United States'
+        AND c.c_current_addr_sk IN (
+            SELECT ca_address_sk FROM customer_address 
+            WHERE ca_state = 'CA'
+        );
+    after_sql: |
+      CREATE STATISTICS customer_geo_stats 
+      ON c_birth_country, c_current_addr_sk FROM customer;
+      ANALYZE customer;
+      
+      SELECT * FROM customer c
+      WHERE c.c_birth_country = 'United States'
+        AND c.c_current_addr_sk IN (
+            SELECT ca_address_sk FROM customer_address 
+            WHERE ca_state = 'CA'
+        );
+
+# ============================================================================
+# RULE APPLICATION GUIDE
+# ============================================================================
+
+application_guide:
+  systematic_approach:
+    - step: "Run EXPLAIN ANALYZE to identify bottlenecks"
+    - step: "Check estimated vs actual rows for cardinality issues"
+    - step: "Apply statistics rules (EXTENDED_STATS_*) first"
+    - step: "Apply subquery transformations if correlated subqueries exist"
+    - step: "Apply join optimization if join order is suboptimal"
+    - step: "Apply planner configuration for systemic issues"
+    - step: "Apply pg_hint_plan for query-specific overrides"
+    - step: "Re-run EXPLAIN ANALYZE to verify improvement"
+
+  dsb_specific_guidance:
+    query_100: "Use DSB_SELF_JOIN_DECOMPOSITION for many-to-many patterns"
+    query_101_102: "Use DSB_NON_EQUI_JOIN_WINDOW or CTE barriers for temporal joins"
+    star_schema: "Use STAR_SCHEMA_DIMENSION_FILTER_FIRST"
+    high_join_count: "Set geqo_threshold >= 18, use JOIN_ORDER_COLLAPSE_LIMIT"
+
+  cardinality_fix_priority:
+    1: "EXTENDED_STATS_DEPENDENCIES for correlated columns"
+    2: "EXTENDED_STATS_MCV for skewed distributions"
+    3: "HINT_ROWS_CARDINALITY for query-specific overrides"
+    4: "DISABLE_NESTED_LOOP_HINT as last resort"
+
+# ============================================================================
+# VERSION COMPATIBILITY MATRIX
+# ============================================================================
+
+version_matrix:
+  all_versions:
+    - NOT_IN_TO_NOT_EXISTS
+    - CORRELATED_SCALAR_TO_LEFT_JOIN
+    - EXISTS_INSTEAD_OF_COUNT
+    - UNION_TO_UNION_ALL
+    - PARTIAL_INDEX_FILTERED_QUERIES
+  pg_9_3_plus:
+    - CORRELATED_AGGREGATE_TO_LATERAL
+    - TOP_N_PER_GROUP_TO_LATERAL
+    - LATERAL_FORCE_NESTED_LOOP
+  pg_9_5_plus:
+    - GROUPING_SETS_INSTEAD_OF_UNION
+    - BRIN_INDEX_SEQUENTIAL_DATA
+  pg_10_plus:
+    - EXTENDED_STATS_DEPENDENCIES
+    - EXTENDED_STATS_NDISTINCT
+    - EXTENDED_STATS_MCV
+    - PARTITION_PRUNING_PREDICATE
+  pg_11_plus:
+    - COVERING_INDEX_INDEX_ONLY_SCAN
+    - JIT_COMPILATION_ANALYTICAL
+  pg_12_plus:
+    - CTE_INLINE_NOT_MATERIALIZED
+    - CTE_OPTIMIZATION_FENCE_MATERIALIZED
+  pg_16_plus:
+    - WINDOW_EARLY_TERMINATION_PG16
+
+# ============================================================================
+# RESEARCH SOURCES
+# ============================================================================
+
+sources:
+  academic_papers:
+    - name: "Bao: Making Learned Query Optimization Practical"
+      venue: "SIGMOD 2021"
+      authors: "Marcus et al."
+    - name: "AutoSteer: Automatic Steering of Query Optimizer Hints"
+      venue: "VLDB 2023"
+      authors: "Anneser et al."
+    - name: "QUITE: Query Optimization via LLM-based Rewriting"
+      venue: "arXiv 2024"
+      authors: "Song et al."
+    - name: "WeTune: Automatic Discovery of SQL Rewrite Rules"
+      venue: "SIGMOD 2022"
+      authors: "Wang et al."
+    - name: "DSB: Decision Support Benchmark"
+      venue: "VLDB 2021"
+      authors: "Ding et al."
+    - name: "How Good Are Query Optimizers, Really?"
+      venue: "VLDB 2015/2018"
+      authors: "Leis et al."
+  postgresql_sources:
+    - "PostgreSQL Official Documentation"
+    - "PostgreSQL Wiki (wiki.postgresql.org)"
+    - "pgsql-hackers mailing list"
+    - "pg_hint_plan documentation"
+  technical_blogs:
+    - "CYBERTEC PostgreSQL Blog"
+    - "pganalyze Blog"
+    - "Crunchy Data Blog"
+    - "EDB PostgreSQL Tutorials"

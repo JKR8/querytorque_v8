@@ -221,3 +221,16 @@ qt-sql audit <file.sql>              # Static analysis (119 rules)
 qt-sql optimize <file.sql>           # LLM-powered optimization (V5)
 qt-sql validate <orig.sql> <opt.sql> # Validate optimization
 ```
+
+## ADO Mode
+
+ADO (Autonomous Data Optimization) is a separate mode that runs batches of TPC-DS queries in parallel, captures wins and failures, and emits a YAML "brain" summary for new GOLD examples and constraints. It uses the fast sf5 DuckDB for validation by default.
+
+```bash
+python3 scripts/ado.py \
+  --sample-db /mnt/d/TPC-DS/tpcds_sf5.duckdb \
+  --query-count 10 \
+  --workers 10 \
+  --examples-per-prompt 3 \
+  --provider deepseek
+```

@@ -380,9 +380,9 @@ def _is_postgres_dsn(dsn: str) -> bool:
 
 
 def _load_prompt_template(template_name: str) -> str:
-    """Load a prompt template from the prompts/v5 directory."""
+    """Load a prompt template from the prompts/templates directory."""
     from pathlib import Path
-    template_path = Path(__file__).parent / "prompts" / "v5" / template_name
+    template_path = Path(__file__).parent / "prompts" / "templates" / template_name
     if template_path.exists():
         return template_path.read_text()
     return ""
@@ -398,7 +398,7 @@ def _build_postgres_prompt(sql: str, sample_db: str, full_explain_plan: str) -> 
     from qt_sql.optimization.pg_context_builder import build_pg_optimization_context
 
     # Load template
-    template = _load_prompt_template("explore_full_sql_postgres.txt")
+    template = _load_prompt_template("full_sql_postgres.txt")
     if not template:
         logger.warning("PostgreSQL prompt template not found, using generic")
         return ""

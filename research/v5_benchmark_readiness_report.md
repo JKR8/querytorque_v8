@@ -80,7 +80,7 @@ The v5 process implements a **parallel fan-out optimization strategy**:
 
 **Problem**: Benchmark script cannot import `qt_sql` module
 
-**File**: `packages/qt-sql/scripts/run_v5_benchmark.py:13`
+**File**: `research/benchmarks/qt-sql/scripts/run_v5_benchmark.py:13`
 
 **Error**:
 ```
@@ -102,13 +102,13 @@ pip install -e packages/qt-shared
 ```bash
 cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
 export PYTHONPATH="${PYTHONPATH}:${PWD}/packages/qt-sql:${PWD}/packages/qt-shared"
-python3 packages/qt-sql/scripts/run_v5_benchmark.py --output-csv ...
+python3 research/benchmarks/qt-sql/scripts/run_v5_benchmark.py --output-csv ...
 ```
 
 **Option 3: Run from workspace root with UV**
 ```bash
 cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
-uv run --package qt-sql python packages/qt-sql/scripts/run_v5_benchmark.py --output-csv ...
+uv run --package qt-sql python research/benchmarks/qt-sql/scripts/run_v5_benchmark.py --output-csv ...
 ```
 
 ---
@@ -129,7 +129,7 @@ uv run --package qt-sql python packages/qt-sql/scripts/run_v5_benchmark.py --out
 
 **Problem**: Queries 2 and 9 are hardcoded as "prefilled" in benchmark script
 
-**File**: `packages/qt-sql/scripts/run_v5_benchmark.py:34-63`
+**File**: `research/benchmarks/qt-sql/scripts/run_v5_benchmark.py:34-63`
 
 **Rationale**: These were run in a previous session and results are being reused
 
@@ -281,7 +281,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_CSV="research/experiments/benchmarks/v5_parallel_${TIMESTAMP}.csv"
 
 # Run benchmark
-python3 packages/qt-sql/scripts/run_v5_benchmark.py \
+python3 research/benchmarks/qt-sql/scripts/run_v5_benchmark.py \
   --sample-db /mnt/d/TPC-DS/tpcds_sf100_sampled_1pct.duckdb \
   --full-db /mnt/d/TPC-DS/tpcds_sf100.duckdb \
   --queries-dir /mnt/d/TPC-DS/queries_duckdb_converted \
@@ -297,7 +297,7 @@ echo "Results saved to: $OUTPUT_CSV"
 To re-run Q2 and Q9 instead of using prefilled data:
 
 ```bash
-python3 packages/qt-sql/scripts/run_v5_benchmark.py \
+python3 research/benchmarks/qt-sql/scripts/run_v5_benchmark.py \
   --output-csv "research/experiments/benchmarks/v5_parallel_${TIMESTAMP}.csv" \
   --exclude ""
 ```

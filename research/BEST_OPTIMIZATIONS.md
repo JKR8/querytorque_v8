@@ -9,7 +9,7 @@
 
 ### Q11 - 4.00x (v5_run_20260205)
 **Transform:** `early_filter` + `date_cte_isolate`
-**Source:** `packages/qt-sql/scripts/benchmark_output/q11/iteration_1_validated_4.00x.sql`
+**Source:** `research/benchmarks/qt-sql/runs/benchmark_output/q11/iteration_1_validated_4.00x.sql`
 
 ```sql
 WITH filtered_dates_2001 AS (
@@ -58,7 +58,7 @@ LIMIT 100
 
 ### Q15 - 3.17x (v5_run_20260205)
 **Transform:** `or_to_union`
-**Source:** `packages/qt-sql/scripts/benchmark_output/q15/iteration_1_validated_3.17x.sql`
+**Source:** `research/benchmarks/qt-sql/runs/benchmark_output/q15/iteration_1_validated_3.17x.sql`
 
 ```sql
 WITH filtered_dates AS (
@@ -170,7 +170,7 @@ LIMIT 100
 
 ### Q9 - 2.11x (deepseek_20260204) / 2.07x (v5_run)
 **Transform:** `pushdown` (quantity_range)
-**Source:** `packages/qt-sql/scripts/benchmark_output/q9/iteration_2_validated_2.07x.sql`
+**Source:** `research/benchmarks/qt-sql/runs/benchmark_output/q9/iteration_2_validated_2.07x.sql`
 
 ```sql
 WITH quantity_1_20_stats AS (
@@ -371,9 +371,9 @@ LIMIT 100
 
 | Query | Speedup | Source | Path |
 |-------|---------|--------|------|
-| Q11 | 4.00x | v5_run | `packages/qt-sql/scripts/benchmark_output/q11/iteration_1_validated_4.00x.sql` |
-| Q15 | 3.17x | v5_run | `packages/qt-sql/scripts/benchmark_output/q15/iteration_1_validated_3.17x.sql` |
-| Q9 | 2.07x | v5_run | `packages/qt-sql/scripts/benchmark_output/q9/iteration_2_validated_2.07x.sql` |
+| Q11 | 4.00x | v5_run | `research/benchmarks/qt-sql/runs/benchmark_output/q11/iteration_1_validated_4.00x.sql` |
+| Q15 | 3.17x | v5_run | `research/benchmarks/qt-sql/runs/benchmark_output/q15/iteration_1_validated_3.17x.sql` |
+| Q9 | 2.07x | v5_run | `research/benchmarks/qt-sql/runs/benchmark_output/q9/iteration_2_validated_2.07x.sql` |
 | Q1 | 2.92x | kimi | `research/experiments/optimizations/kimi_q1-q30_20260202_213955/benchmark_ready/q1_optimized.sql` |
 | Q93 | 2.73x | kimi | `research/experiments/optimizations/kimi_q31-q99_20260202_215203/benchmark_ready/q93_optimized.sql` |
 | Q90 | 1.57x | kimi | `research/experiments/optimizations/kimi_q31-q99_20260202_215203/benchmark_ready/q90_optimized.sql` |

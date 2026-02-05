@@ -1256,6 +1256,142 @@ def assess(
     display_assessment(result, verbose=verbose)
 
 
+@cli.command()
+@click.option("--sample-db", required=True, help="Sample database for validation (DSN or path)")
+@click.option("--queries", help="Comma-separated query IDs (e.g., 'q1,q15,q28') or 'all'")
+@click.option("--queries-dir", required=True, type=click.Path(exists=True), help="Directory with DSB/TPC-DS queries")
+@click.option("--workers", default=10, type=int, help="Workers per query (default: 10)")
+@click.option("--output-dir", default="ado_results", help="Output directory (default: ado_results)")
+@click.option("--provider", help="LLM provider override")
+@click.option("--model", help="LLM model override")
+@click.option("--min-speedup", default=1.5, type=float, help="Minimum speedup to curate as gold example (default: 1.5)")
+@click.option("--curate/--no-curate", default=True, help="Auto-curate validated wins into gold examples")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+def ado(
+    sample_db: str,
+    queries: Optional[str],
+    queries_dir: str,
+    workers: int,
+    output_dir: str,
+    provider: Optional[str],
+    model: Optional[str],
+    min_speedup: float,
+    curate: bool,
+    verbose: bool,
+):
+    """Run Autonomous Data Optimization on DSB benchmark.
+
+    ADO validates optimizations on sample DB and auto-curates wins into gold examples.
+
+    \b
+    Examples:
+        # Single query
+        qt-sql ado --sample-db sample.duckdb --queries q1 --queries-dir /path/to/dsb/queries
+
+        # Multiple queries
+        qt-sql ado --sample-db sample.duckdb --queries q1,q15,q28 --queries-dir /path/to/dsb/queries
+
+        # All queries
+        qt-sql ado --sample-db sample.duckdb --queries all --queries-dir /path/to/dsb/queries
+
+        # PostgreSQL
+        qt-sql ado --sample-db "postgres://user:pass@localhost:5433/dsb_sample" --queries q1 --queries-dir queries/
+
+        # With curation disabled
+        qt-sql ado --sample-db sample.duckdb --queries q1 --queries-dir queries/ --no-curate
+    """
+    # Setup logging
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG, format='%(message)s')
+    else:
+        logging.basicConfig(level=logging.WARNING)
+
+    from pathlib import Path as PathLib
+    from ado.runner import ADORunner, ADOConfig
+    from ado.query_loader import load_dsb_queries, get_all_dsb_query_ids, parse_query_list
+    from ado.aggregator import aggregate_results
+
+    queries_path = PathLib(queries_dir)
+    output_path = PathLib(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Parse query list
+    if queries == "all" or not queries:
+        query_ids = get_all_dsb_query_ids(queries_path)
+        if not query_ids:
+            console.print(f"[red]No queries found in {queries_path}[/red]")
+            sys.exit(1)
+    else:
+        query_ids = parse_query_list(queries)
+        if 'all' in query_ids:
+            query_ids = get_all_dsb_query_ids(queries_path)
+
+    # Load queries
+    query_sql = load_dsb_queries(query_ids, queries_path)
+
+    if not query_sql:
+        console.print(f"[red]No queries loaded![/red]")
+        console.print(f"[dim]Looked for: {query_ids[:5]}... in {queries_path}[/dim]")
+        sys.exit(1)
+
+    console.print(f"\n[bold]Running ADO on {len(query_sql)} DSB queries[/bold]")
+    console.print(f"[dim]Sample DB: {sample_db}[/dim]")
+    console.print(f"[dim]Workers per query: {workers}[/dim]")
+    console.print(f"[dim]Auto-curation: {'enabled' if curate else 'disabled'} (min speedup: {min_speedup}x)[/dim]")
+    console.print()
+
+    # Configure and run
+    config = ADOConfig(
+        sample_db=sample_db,
+        candidates_per_round=workers,
+        provider=provider,
+        model=model,
+    )
+
+    runner = ADORunner(config, run_dir=output_path)
+
+    results = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("[bold green]Processing queries...", total=None)
+
+        for qid, sql in query_sql.items():
+            progress.update(task, description=f"[bold]{qid}[/bold]")
+
+            result = runner.run_query(qid, sql)
+            results.append(result)
+
+            # Display inline result
+            speedup = result.speedup
+            status_icon = "[green]ok[/green]" if result.status == "pass" else "[red]fail[/red]"
+            console.print(f"  {status_icon} {qid}: {result.status} ({speedup:.2f}x)")
+
+    runner.close()
+
+    # Aggregate results and curate
+    summary = aggregate_results(
+        results,
+        output_dir=output_path,
+        min_speedup_for_curation=min_speedup,
+        curate=curate,
+    )
+
+    # Final summary
+    console.print(f"\n[bold green]Results saved to {output_path}[/bold green]")
+    console.print(f"Summary: {summary['summary_file']}")
+    console.print(f"Wins: {summary['wins']}/{summary['total_queries']}")
+
+    if curate and summary.get('curated_examples'):
+        console.print(f"\n[bold]Curated {len(summary['curated_examples'])} gold examples:[/bold]")
+        for ex_id in summary['curated_examples']:
+            console.print(f"  - {ex_id}")
+    elif curate:
+        console.print(f"\n[yellow]No wins met the minimum speedup threshold ({min_speedup}x) for curation[/yellow]")
+
+
 def main():
     """Entry point for the CLI."""
     cli()

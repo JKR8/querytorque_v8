@@ -286,7 +286,11 @@ async def analyze_sql(
                     transform = t
                     break
 
-            weight = transform.weight if transform else 5
+            # Convert avg_speedup (0-1) to weight (1-10)
+            # avg_speedup is normalized: (speedup - 1) * num_queries / 10
+            # So 0.8 avg_speedup = high value, map to weight ~8
+            weight = int(transform.avg_speedup * 10) + 1 if transform and transform.avg_speedup > 0 else 5
+            weight = min(10, max(1, weight))  # Clamp to 1-10
             opportunities.append(OpportunityResponse(
                 pattern_id=opp.rule_id,
                 pattern_name=opp.name,

@@ -45,10 +45,10 @@ pip install -e packages/qt-shared packages/qt-sql
 export DEEPSEEK_API_KEY=your_key_here
 
 # 2. Run setup script
-./scripts/setup_v5_benchmark.sh
+./research/benchmarks/qt-sql/scripts/setup_v5_benchmark.sh
 
 # 3. Launch benchmark
-./scripts/run_v5_benchmark.sh
+./research/benchmarks/qt-sql/scripts/run_v5_benchmark.sh
 ```
 
 **Expected runtime**: 4-6 hours for 97 queries (Q2 and Q9 excluded as prefilled)
@@ -109,8 +109,8 @@ Contains:
 | **V5_REVIEW_SUMMARY.md** | This file - executive summary |
 | **research/v5_quick_start.md** | Quick reference guide |
 | **research/v5_benchmark_readiness_report.md** | Detailed analysis (30 pages) |
-| **scripts/setup_v5_benchmark.sh** | Automated setup script |
-| **scripts/run_v5_benchmark.sh** | Automated benchmark runner |
+| **research/benchmarks/qt-sql/scripts/setup_v5_benchmark.sh** | Automated setup script |
+| **research/benchmarks/qt-sql/scripts/run_v5_benchmark.sh** | Automated benchmark runner |
 
 ---
 
@@ -142,8 +142,8 @@ Based on review in `research/dspy_v5_review.md`:
 - [ ] Set `DEEPSEEK_API_KEY` environment variable
 - [ ] Install packages: `pip install -e packages/qt-shared packages/qt-sql`
 - [ ] Verify imports: `python3 -c "from qt_sql.optimization import optimize_v5_json_queue"`
-- [ ] Test single query: `./scripts/setup_v5_benchmark.sh`
-- [ ] Launch full benchmark: `./scripts/run_v5_benchmark.sh`
+- [ ] Test single query: `./research/benchmarks/qt-sql/scripts/setup_v5_benchmark.sh`
+- [ ] Launch full benchmark: `./research/benchmarks/qt-sql/scripts/run_v5_benchmark.sh`
 
 ---
 
@@ -171,7 +171,7 @@ Based on review in `research/dspy_v5_review.md`:
 
 ```bash
 export DEEPSEEK_API_KEY=your_key_here
-./scripts/setup_v5_benchmark.sh
+./research/benchmarks/qt-sql/scripts/setup_v5_benchmark.sh
 ```
 
 This will:
@@ -183,7 +183,7 @@ This will:
 ### 2. Launch Benchmark (4-6 hours)
 
 ```bash
-./scripts/run_v5_benchmark.sh
+./research/benchmarks/qt-sql/scripts/run_v5_benchmark.sh
 ```
 
 This will:
@@ -264,8 +264,8 @@ The v5 process is solid. Just run the setup script and launch the benchmark.
 **Commands**:
 ```bash
 export DEEPSEEK_API_KEY=your_key_here
-./scripts/setup_v5_benchmark.sh   # 5 min
-./scripts/run_v5_benchmark.sh     # 4-6 hours
+./research/benchmarks/qt-sql/scripts/setup_v5_benchmark.sh   # 5 min
+./research/benchmarks/qt-sql/scripts/run_v5_benchmark.sh     # 4-6 hours
 ```
 
 Results will be saved with proper timestamps and summaries according to `CLAUDE.md` requirements.

@@ -23,20 +23,21 @@ from qt_sql.analyzers.ast_detector.registry import (
 class TestRuleRegistry:
     """Tests for the rule registry."""
 
-    def test_rule_count_is_119(self):
-        """Verify we have 119 registered rules."""
+    def test_rule_count_is_reasonable(self):
+        """Verify we have a reasonable number of registered rules."""
         count = get_rule_count()
         assert count >= 100, f"Expected at least 100 rules, got {count}"
-        # The code says 119, but let's be flexible
-        assert count <= 150, f"Unexpected rule count: {count}"
+        # Rule count can grow over time
+        assert count <= 200, f"Unexpected rule count: {count}"
 
     def test_all_rules_have_required_attributes(self):
         """Every rule should have required attributes."""
+        valid_severities = ("critical", "high", "medium", "low", "info", "optimization", "gold")
         rules = get_all_rules()
         for rule in rules:
             assert rule.rule_id, f"Rule missing rule_id: {rule}"
             assert rule.name, f"Rule {rule.rule_id} missing name"
-            assert rule.severity in ("critical", "high", "medium", "low", "info")
+            assert rule.severity in valid_severities, f"Rule {rule.rule_id} has invalid severity: {rule.severity}"
             assert rule.category, f"Rule {rule.rule_id} missing category"
             assert isinstance(rule.penalty, int)
             assert rule.description, f"Rule {rule.rule_id} missing description"

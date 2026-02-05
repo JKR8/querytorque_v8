@@ -15,8 +15,8 @@ from qt_sql.analyzers.ast_detector.registry import get_all_rules, get_rule_by_id
 
 @pytest.fixture
 def detector() -> SQLAntiPatternDetector:
-    """Create a detector with generic dialect."""
-    return SQLAntiPatternDetector(dialect="generic")
+    """Create a detector with generic dialect (includes style rules for full testing)."""
+    return SQLAntiPatternDetector(dialect="generic", include_style=True)
 
 
 @pytest.fixture

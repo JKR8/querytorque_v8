@@ -20,7 +20,7 @@
 ```bash
 cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
 
-./scripts/run_benchmark_all.sh
+./research/benchmarks/qt-sql/scripts/run_benchmark_all.sh
 ```
 
 **Expected time**: 1-2 hours
@@ -32,13 +32,13 @@ cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
 
 ```bash
 # Run queries 1-20
-./scripts/run_benchmark_all.sh --start-from 1 --end-at 20
+./research/benchmarks/qt-sql/scripts/run_benchmark_all.sh --start-from 1 --end-at 20
 
 # Run queries 50-99
-./scripts/run_benchmark_all.sh --start-from 50 --end-at 99
+./research/benchmarks/qt-sql/scripts/run_benchmark_all.sh --start-from 50 --end-at 99
 
 # Resume from query 25
-./scripts/run_benchmark_all.sh --start-from 25
+./research/benchmarks/qt-sql/scripts/run_benchmark_all.sh --start-from 25
 ```
 
 ---
@@ -154,7 +154,7 @@ If interrupted at Q50:
 
 ```bash
 # Resume from Q51
-./scripts/run_benchmark_all.sh --start-from 51
+./research/benchmarks/qt-sql/scripts/run_benchmark_all.sh --start-from 51
 ```
 
 The new run will create a new directory, but you can merge CSVs later.
@@ -318,13 +318,13 @@ ls research/experiments/v5_benchmark_20workers/run_*/q50/gen_* 2>/dev/null | wc 
 
 ```bash
 # Run full benchmark
-./scripts/run_benchmark_all.sh
+./research/benchmarks/qt-sql/scripts/run_benchmark_all.sh
 
 # Run subset
-./scripts/run_benchmark_all.sh --start-from 1 --end-at 20
+./research/benchmarks/qt-sql/scripts/run_benchmark_all.sh --start-from 1 --end-at 20
 
 # Resume from Q50
-./scripts/run_benchmark_all.sh --start-from 50
+./research/benchmarks/qt-sql/scripts/run_benchmark_all.sh --start-from 50
 
 # View latest results
 LATEST=$(ls -td research/experiments/v5_benchmark_20workers/run_* | head -1)
@@ -349,7 +349,7 @@ cat $LATEST/final_summary.json | jq
 **Ready to run all 99 queries?**
 
 ```bash
-./scripts/run_benchmark_all.sh
+./research/benchmarks/qt-sql/scripts/run_benchmark_all.sh
 ```
 
 **1,980 LLM API calls** across **99 queries** with **20 workers each**! 🚀

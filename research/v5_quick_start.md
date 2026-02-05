@@ -13,10 +13,10 @@ cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
 export DEEPSEEK_API_KEY=your_key_here
 
 # 2. Setup and test
-./scripts/setup_v5_benchmark.sh
+./research/benchmarks/qt-sql/scripts/setup_v5_benchmark.sh
 
 # 3. Run full benchmark (4-6 hours)
-./scripts/run_v5_benchmark.sh
+./research/benchmarks/qt-sql/scripts/run_v5_benchmark.sh
 ```
 
 ---
@@ -90,7 +90,7 @@ pip install -e packages/qt-shared packages/qt-sql
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # Run benchmark
-python3 packages/qt-sql/scripts/run_v5_benchmark.py \
+python3 research/benchmarks/qt-sql/scripts/run_v5_benchmark.py \
   --sample-db /mnt/d/TPC-DS/tpcds_sf100_sampled_1pct.duckdb \
   --full-db /mnt/d/TPC-DS/tpcds_sf100.duckdb \
   --queries-dir /mnt/d/TPC-DS/queries_duckdb_converted \
@@ -211,8 +211,8 @@ ls -lh /mnt/d/TPC-DS/*.duckdb
 |------|---------|
 | `research/v5_benchmark_readiness_report.md` | Detailed analysis and setup guide |
 | `research/v5_quick_start.md` | This file - quick reference |
-| `scripts/setup_v5_benchmark.sh` | Setup and test script |
-| `scripts/run_v5_benchmark.sh` | Full benchmark runner |
+| `research/benchmarks/qt-sql/scripts/setup_v5_benchmark.sh` | Setup and test script |
+| `research/benchmarks/qt-sql/scripts/run_v5_benchmark.sh` | Full benchmark runner |
 
 ---
 
@@ -220,5 +220,5 @@ ls -lh /mnt/d/TPC-DS/*.duckdb
 
 - **Code review**: `research/dspy_v5_review.md`
 - **Implementation**: `packages/qt-sql/qt_sql/optimization/adaptive_rewriter_v5.py`
-- **Benchmark script**: `packages/qt-sql/scripts/run_v5_benchmark.py`
+- **Benchmark script**: `research/benchmarks/qt-sql/scripts/run_v5_benchmark.py`
 - **Project context**: `CLAUDE.md`

@@ -380,7 +380,7 @@ Reduce workers or use smaller sample DB:
 Once single-query test works:
 
 ```bash
-./scripts/run_v5_benchmark.sh
+./research/benchmarks/qt-sql/scripts/run_v5_benchmark.sh
 ```
 
 This runs all 97 queries with the same incremental saving strategy.
