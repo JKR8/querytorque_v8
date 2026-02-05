@@ -1,0 +1,117 @@
+Looking at this query pattern, I see several optimization opportunities:
+
+1. **Date CTE Isolation**: Multiple date_dim joins with same filter (d_year=1998)
+2. **Pushdown opportunities**: Main query filters on frequent_ss_items.item_sk and best_ss_customer.c_customer_sk can be pushed down
+3. **Materialize repeated patterns**: The UNION ALL in main_query has same structure repeated
+
+However, I notice a critical constraint: **LITERAL_PRESERVATION**. The query has specific literal values (1998, 3, 26-36, etc.) that must be preserved exactly.
+
+Let me analyze the main issues:
+
+1. **main_query** has two UNION ALL branches with identical structure - we can create a CTE for the date filter
+2. **frequent_ss_items** and **max_store_sales** both use d_year=1998 - we can create a shared date CTE
+3. **best_ss_customer** uses a correlated subquery - we can decorrelate it
+
+Here's my optimization plan:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "date_1998": "SELECT d_date_sk FROM date_dim WHERE d_year = 1998",
+        "date_1998_m03": "SELECT d_date_sk FROM date_dim WHERE d_year = 1998 AND d_moy = 3"
+      },
+      "invariants_kept": ["date_dim filters preserved", "d_date_sk join condition preserved"],
+      "expected_speedup": "1.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "pushdown",
+      "nodes": {
+        "frequent_ss_items": "SELECT SUBSTRING(i_item_desc, 1, 30) AS itemdesc, i_item_sk AS item_sk, d_date AS solddate, COUNT(*) AS cnt FROM store_sales JOIN date_1998 ON ss_sold_date_sk = d_date_sk JOIN item ON ss_item_sk = i_item_sk WHERE i_manager_id BETWEEN 81 AND 100 AND i_category IN ('Home', 'Jewelry', 'Music') GROUP BY SUBSTRING(i_item_desc, 1, 30), i_item_sk, d_date HAVING COUNT(*) > 4",
+        "max_store_sales": "SELECT MAX(csales) AS tpcds_cmax FROM (SELECT c_customer_sk, SUM(ss_quantity * ss_sales_price) AS csales FROM store_sales JOIN customer ON ss_customer_sk = c_customer_sk JOIN date_1998 ON ss_sold_date_sk = d_date_sk WHERE ss_wholesale_cost BETWEEN 26 AND 36 GROUP BY c_customer_sk) AS tmp1"
+      },
+      "invariants_kept": ["output columns preserved", "grouping preserved", "filter predicates preserved"],
+      "expected_speedup": "2x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_03",
+      "transform": "decorrelate",
+      "nodes": {
+        "best_ss_customer": "WITH max_sales AS (SELECT tpcds_cmax FROM max_store_sales) SELECT c_customer_sk, SUM(ss_quantity * ss_sales_price) AS ssales FROM store_sales JOIN customer ON ss_customer_sk = c_customer_sk WHERE c_birth_year BETWEEN 1927 AND 1933 GROUP BY c_customer_sk HAVING SUM(ss_quantity * ss_sales_price) > (95 / 100.0) * (SELECT tpcds_cmax FROM max_sales)"
+      },
+      "invariants_kept": ["HAVING condition preserved", "aggregation logic preserved"],
+      "expected_speedup": "1.8x",
+      "risk": "medium"
+    },
+    {
+      "id": "rs_04",
+      "transform": "materialize_cte",
+      "nodes": {
+        "filtered_sales_template": "SELECT sales, source FROM (SELECT cs_quantity * cs_list_price AS sales, 'catalog' AS source, cs_item_sk, cs_bill_customer_sk, cs_wholesale_cost FROM catalog_sales UNION ALL SELECT ws_quantity * ws_list_price AS sales, 'web' AS source, ws_item_sk, ws_bill_customer_sk, ws_wholesale_cost FROM web_sales) AS sales_data WHERE sales_data.wholesale_cost BETWEEN 26 AND 36 AND sales_data.item_sk IN (SELECT item_sk FROM frequent_ss_items) AND sales_data.bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer)",
+        "main_query": "SELECT SUM(sales) FROM filtered_sales_template JOIN date_1998_m03 ON (source = 'catalog' AND cs_sold_date_sk = d_date_sk) OR (source = 'web' AND ws_sold_date_sk = d_date_sk) LIMIT 100"
+      },
+      "invariants_kept": ["UNION ALL logic preserved", "aggregation preserved", "LIMIT preserved"],
+      "expected_speedup": "1.3x",
+      "risk": "high"
+    }
+  ],
+  "explanation": "Applied multiple optimizations: 1) Created date CTEs to isolate date_dim filters (d_year=1998 and d_moy=3), 2) Pushed down date filters into CTEs using the date CTEs, 3) Decorrelated the subquery in best_ss_customer by extracting max_store_sales as a CTE, 4) Created a materialized CTE template for the UNION ALL pattern to avoid scanning catalog_sales and web_sales twice with the same filters. All literal values are preserved exactly as in the original query."
+}
+```
+
+However, I realize the `rs_04` approach with OR condition might be problematic based on the **OR_TO_UNION_LIMIT** constraint. Let me provide a safer alternative that doesn't use OR expansion:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "date_1998": "SELECT d_date_sk FROM date_dim WHERE d_year = 1998",
+        "date_1998_m03": "SELECT d_date_sk FROM date_dim WHERE d_year = 1998 AND d_moy = 3"
+      },
+      "invariants_kept": ["date_dim filters preserved", "d_date_sk join condition preserved"],
+      "expected_speedup": "1.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02", 
+      "transform": "pushdown",
+      "nodes": {
+        "frequent_ss_items": "SELECT SUBSTRING(i_item_desc, 1, 30) AS itemdesc, i_item_sk AS item_sk, d_date AS solddate, COUNT(*) AS cnt FROM store_sales JOIN date_1998 ON ss_sold_date_sk = d_date_sk JOIN item ON ss_item_sk = i_item_sk WHERE i_manager_id BETWEEN 81 AND 100 AND i_category IN ('Home', 'Jewelry', 'Music') GROUP BY SUBSTRING(i_item_desc, 1, 30), i_item_sk, d_date HAVING COUNT(*) > 4"
+      },
+      "invariants_kept": ["output columns preserved", "grouping preserved"],
+      "expected_speedup": "2x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_03",
+      "transform": "pushdown",
+      "nodes": {
+        "max_store_sales": "SELECT MAX(csales) AS tpcds_cmax FROM (SELECT c_customer_sk, SUM(ss_quantity * ss_sales_price) AS csales FROM store_sales JOIN customer ON ss_customer_sk = c_customer_sk JOIN date_1998 ON ss_sold_date_sk = d_date_sk WHERE ss_wholesale_cost BETWEEN 26 AND 36 GROUP BY c_customer_sk) AS tmp1"
+      },
+      "invariants_kept": ["output columns preserved", "aggregation logic preserved"],
+      "expected_speedup": "2x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_04",
+      "transform": "reorder_join",
+      "nodes": {
+        "main_query": "SELECT SUM(sales) FROM (SELECT cs_quantity * cs_list_price AS sales FROM catalog_sales JOIN date_1998_m03 ON cs_sold_date_sk = d_date_sk WHERE cs_item_sk IN (SELECT item_sk FROM frequent_ss_items) AND cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer) AND cs_wholesale_cost BETWEEN 26 AND 36 UNION ALL SELECT ws_quantity * ws_list_price AS sales FROM web_sales JOIN date_1998_m03 ON ws_sold_date_sk = d_date_sk WHERE ws_item_sk IN (SELECT item_sk FROM frequent_ss_items) AND ws_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer) AND ws_wholesale_cost BETWEEN 26 AND 36) AS tmp2 LIMIT 100"
+      },
+      "invariants_kept": ["UNION ALL structure preserved", "all filters preserved", "LIMIT preserved"],
+      "expected_speedup": "1.2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Applied safe optimizations: 1) Created date CTEs to isolate date_dim filters and avoid repeated scans, 2) Pushed date filters into frequent_ss_items and max_store_sales CTEs using the date_1998 CTE, 3) Reordered joins in main_query to apply date filter first using date_1998_m03 CTE. This avoids OR expansion and preserves all original literal values exactly."
+}
+```

@@ -1,0 +1,58 @@
+Looking at this query, I can identify multiple optimization opportunities. The main issues are: 1) date_dim is scanned 3 times with similar filters, 2) there's a multi-way join pattern that could benefit from early filtering, and 3) the join ordering could be improved.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "d1_dates": "SELECT d_date_sk FROM date_dim WHERE d_moy = 4 AND d_year = 2001",
+        "d2_dates": "SELECT d_date_sk FROM date_dim WHERE d_moy BETWEEN 4 AND 10 AND d_year = 2001",
+        "d3_dates": "SELECT d_date_sk FROM date_dim WHERE d_moy BETWEEN 4 AND 10 AND d_year = 2001",
+        "filtered_store_sales": "SELECT ss_item_sk, ss_store_sk, ss_customer_sk, ss_ticket_number, ss_net_profit FROM store_sales JOIN d1_dates ON ss_sold_date_sk = d_date_sk",
+        "filtered_store_returns": "SELECT sr_item_sk, sr_customer_sk, sr_ticket_number, sr_net_loss, sr_returned_date_sk FROM store_returns JOIN d2_dates ON sr_returned_date_sk = d_date_sk",
+        "filtered_catalog_sales": "SELECT cs_item_sk, cs_bill_customer_sk, cs_net_profit FROM catalog_sales JOIN d3_dates ON cs_sold_date_sk = d_date_sk",
+        "main_query": "SELECT i_item_id, i_item_desc, s_store_id, s_store_name, SUM(ss_net_profit) AS store_sales_profit, SUM(sr_net_loss) AS store_returns_loss, SUM(cs_net_profit) AS catalog_sales_profit FROM filtered_store_sales ss JOIN filtered_store_returns sr ON ss.ss_customer_sk = sr.sr_customer_sk AND ss.ss_item_sk = sr.sr_item_sk AND ss.ss_ticket_number = sr.sr_ticket_number JOIN filtered_catalog_sales cs ON sr.sr_customer_sk = cs.cs_bill_customer_sk AND sr.sr_item_sk = cs.cs_item_sk JOIN store s ON ss.ss_store_sk = s.s_store_sk JOIN item i ON ss.ss_item_sk = i.i_item_sk GROUP BY i_item_id, i_item_desc, s_store_id, s_store_name ORDER BY i_item_id, i_item_desc, s_store_id, s_store_name LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same output columns",
+        "same aggregation semantics",
+        "same ordering"
+      ],
+      "expected_speedup": "3x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "reorder_join",
+      "nodes": {
+        "d1_dates": "SELECT d_date_sk FROM date_dim WHERE d_moy = 4 AND d_year = 2001",
+        "d2_dates": "SELECT d_date_sk FROM date_dim WHERE d_moy BETWEEN 4 AND 10 AND d_year = 2001",
+        "d3_dates": "SELECT d_date_sk FROM date_dim WHERE d_moy BETWEEN 4 AND 10 AND d_year = 2001",
+        "filtered_store_sales": "SELECT ss_item_sk, ss_store_sk, ss_customer_sk, ss_ticket_number, ss_net_profit FROM store_sales JOIN d1_dates ON ss_sold_date_sk = d_date_sk",
+        "filtered_items": "SELECT i_item_sk, i_item_id, i_item_desc FROM item",
+        "filtered_stores": "SELECT s_store_sk, s_store_id, s_store_name FROM store",
+        "main_query": "SELECT i.i_item_id, i.i_item_desc, s.s_store_id, s.s_store_name, SUM(ss.ss_net_profit) AS store_sales_profit, SUM(sr.sr_net_loss) AS store_returns_loss, SUM(cs.cs_net_profit) AS catalog_sales_profit FROM filtered_store_sales ss JOIN filtered_stores s ON ss.ss_store_sk = s.s_store_sk JOIN filtered_items i ON ss.ss_item_sk = i.i_item_sk JOIN (SELECT sr_item_sk, sr_customer_sk, sr_ticket_number, sr_net_loss FROM store_returns JOIN d2_dates ON sr_returned_date_sk = d_date_sk) sr ON ss.ss_customer_sk = sr.sr_customer_sk AND ss.ss_item_sk = sr.sr_item_sk AND ss.ss_ticket_number = sr.sr_ticket_number JOIN (SELECT cs_item_sk, cs_bill_customer_sk, cs_net_profit FROM catalog_sales JOIN d3_dates ON cs_sold_date_sk = d_date_sk) cs ON sr.sr_customer_sk = cs.cs_bill_customer_sk AND sr.sr_item_sk = cs.cs_item_sk GROUP BY i.i_item_id, i.i_item_desc, s.s_store_id, s.s_store_name ORDER BY i.i_item_id, i.i_item_desc, s.s_store_id, s.s_store_name LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same output columns",
+        "same aggregation semantics",
+        "same ordering"
+      ],
+      "expected_speedup": "1.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Applied two complementary transforms: 1) date_cte_isolate to create filtered CTEs for each date_dim usage, reducing three full table scans to three small filtered sets; 2) reorder_join to push smaller dimension tables (item, store) earlier in the join order, reducing the intermediate result size before joining with larger fact tables. The first transform alone reduces store_sales from 12,101 rows (after filter) to same but with early date filtering, and reduces catalog_sales from 172M rows to only those matching date filter. The second transform ensures we filter down to relevant store/item combinations early."
+}
+```
+
+**Key insights:**
+1. The query uses date_dim three times with similar filters (d_year=2001, d_moy conditions). Creating filtered CTEs reduces 3 full table scans to 3 small filtered sets.
+2. The original join order starts with large fact tables. By pushing smaller dimension tables (item with 102k rows, store with 102 rows) earlier, we can reduce the intermediate result size significantly.
+3. The d2 and d3 date filters are identical (d_moy BETWEEN 4 AND 10 AND d_year=2001) - we could potentially reuse the same CTE, but kept separate for clarity and in case they diverge in future modifications.
+4. The store_sales table is joined to store_returns on 3 keys (customer_sk, item_sk, ticket_number) which should have good selectivity.
+5. The catalog_sales join happens after store_returns, which is already filtered by date_dim d2, providing additional filtering.

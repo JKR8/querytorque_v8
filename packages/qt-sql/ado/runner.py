@@ -130,19 +130,35 @@ class ADORunner:
                 sample_db=self.config.sample_db,
             )
 
-            # 2. Retrieve examples and constraints
-            retrieval = self.knowledge.retrieve(sql, k_examples=3)
+            # 2. Retrieve examples and constraints (using DSB query mapping if available)
+            retrieval = self.knowledge.retrieve(sql, k_examples=3, query_id=query_id)
 
-            # 3. Build prompt
+            # 3. Build prompt with retrieved examples
             history_text = history.ranked_text() if history.summaries else ""
+
+            # Convert knowledge GoldExamples to prompt_builder format
+            from .prompt_builder import GoldExample as PromptExample
+            prompt_examples = [
+                PromptExample(
+                    id=ex.id,
+                    name=ex.name,
+                    description=ex.description,
+                    verified_speedup=ex.verified_speedup,
+                    example=ex.example,
+                )
+                for ex in retrieval.gold_examples
+            ]
+
             prompt_text = self.prompt_builder.build(
                 original_sql=sql,
                 execution_plan=context.plan_summary,
                 history=history_text,
+                use_specific_examples=prompt_examples,  # Pass retrieved examples
             )
 
             # 4. Generate candidates
             examples_used = [e.id for e in retrieval.gold_examples]
+            logger.info(f"Using examples for {query_id}: {examples_used}")
             candidates = self.generator.generate(
                 sql=sql,
                 prompt=prompt_text,

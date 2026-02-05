@@ -1,0 +1,41 @@
+Looking at this query, I can see a clear opportunity to apply the **date_cte_isolate** transform. The `ss` and `sr` CTEs both filter on the same date range in `date_dim`, and they're currently scanning the entire fact tables before filtering. This is inefficient because:
+
+1. Both CTEs use the same date filter (`d_date BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-22' AS DATE)`)
+2. The fact tables (`store_sales` and `store_returns`) are huge (345M and 34M rows)
+3. Currently, they're scanning the entire fact tables before applying the date filter via join
+
+Let me create a rewrite set that isolates the date filter into a CTE and joins it early with the fact tables:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-22' AS DATE)",
+        "ss": "SELECT s_store_sk, SUM(ss_ext_sales_price) AS sales, SUM(ss_net_profit) AS profit FROM store_sales JOIN filtered_dates ON store_sales.ss_sold_date_sk = filtered_dates.d_date_sk JOIN store ON store_sales.ss_store_sk = store.s_store_sk GROUP BY s_store_sk",
+        "sr": "SELECT s_store_sk, SUM(sr_return_amt) AS returns_, SUM(sr_net_loss) AS profit_loss FROM store_returns JOIN filtered_dates ON store_returns.sr_returned_date_sk = filtered_dates.d_date_sk JOIN store ON store_returns.sr_store_sk = store.s_store_sk GROUP BY s_store_sk",
+        "main_query": "WITH filtered_dates AS (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-22' AS DATE)), ss AS (SELECT s_store_sk, SUM(ss_ext_sales_price) AS sales, SUM(ss_net_profit) AS profit FROM store_sales JOIN filtered_dates ON store_sales.ss_sold_date_sk = filtered_dates.d_date_sk JOIN store ON store_sales.ss_store_sk = store.s_store_sk GROUP BY s_store_sk), sr AS (SELECT s_store_sk, SUM(sr_return_amt) AS returns_, SUM(sr_net_loss) AS profit_loss FROM store_returns JOIN filtered_dates ON store_returns.sr_returned_date_sk = filtered_dates.d_date_sk JOIN store ON store_returns.sr_store_sk = store.s_store_sk GROUP BY s_store_sk) SELECT channel, id, SUM(sales) AS sales, SUM(returns_) AS returns_, SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, ss.s_store_sk AS id, sales, COALESCE(returns_, 0) AS returns_, (profit - COALESCE(profit_loss, 0)) AS profit FROM ss LEFT JOIN sr ON ss.s_store_sk = sr.s_store_sk UNION ALL SELECT 'catalog channel' AS channel, cs_call_center_sk AS id, sales, returns_, (profit - profit_loss) AS profit FROM cs, cr UNION ALL SELECT 'web channel' AS channel, ws.wp_web_page_sk AS id, sales, COALESCE(returns_, 0) AS returns_, (profit - COALESCE(profit_loss, 0)) AS profit FROM ws LEFT JOIN wr ON ws.wp_web_page_sk = wr.wp_web_page_sk) AS x GROUP BY ROLLUP (channel, id) ORDER BY channel NULLS FIRST, id NULLS FIRST, returns_ DESC LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "3.0x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Created a shared 'filtered_dates' CTE that isolates the date dimension filter (d_date BETWEEN '2000-08-23' AND '2000-09-22'). This CTE is then joined early with both store_sales and store_returns in their respective CTEs (ss and sr). This allows the database to filter fact rows by date before performing expensive aggregations and joins, significantly reducing the cardinality of intermediate results. Both CTEs (ss and sr) were using the exact same date filter, so extracting it into a common CTE prevents redundant computation and allows better join optimization."
+}
+```
+
+**Key insight**: Both `ss` and `sr` CTEs use the same date filter on `date_dim`. By extracting this filter into a shared CTE (`filtered_dates`), we can:
+1. Filter the huge fact tables (`store_sales` and `store_returns`) early using only the relevant date keys
+2. Avoid scanning the entire fact tables
+3. Reduce the cardinality of joins and aggregations
+4. Allow the optimizer to choose more efficient join strategies
+
+The date filter is highly selective (only 31 days), so this should dramatically reduce the amount of data processed in both CTEs.

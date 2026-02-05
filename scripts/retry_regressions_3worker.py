@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-3-Worker Fan-Out Retry for Regression Queries
+4-Worker Fan-Out Retry for Neutral Queries
 
-Runs 3 workers in parallel per query, each with different gold example sets
-to ensure coverage of all 8 verified optimization patterns.
+Runs 4 workers in parallel per query, each with different gold example sets
+to ensure coverage of all 13 verified optimization patterns.
 
 Worker Strategy:
-- W1: decorrelate, pushdown, early_filter (Subquery/filter transforms)
-- W2: date_cte_isolate, materialize_cte, union_cte_split (CTE optimizations)
-- W3: or_to_union, intersect_to_exists (Set operation transforms)
+- W1: decorrelate, pushdown, early_filter (Subquery transforms)
+- W2: date_cte_isolate, dimension_cte_isolate, multi_date_range_cte (CTE isolation)
+- W3: prefetch_fact_join, multi_dimension_prefetch, materialize_cte (Fact prefetch)
+- W4: single_pass_aggregation, or_to_union, intersect_to_exists, union_cte_split (Consolidation + set ops)
 
 Usage:
     python scripts/retry_regressions_3worker.py --db /path/to/tpcds.duckdb
@@ -48,18 +49,21 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ============================================================================
 
-# 25 pending retry queries with regression (speedup <= 0.99)
+# 43 neutral queries to target (0.95x - 1.1x speedup)
 PENDING_RETRIES = [
-    "q16", "q94", "q34", "q9", "q26", "q4", "q5", "q42", "q58", "q91",
-    "q12", "q29", "q63", "q43", "q38", "q48", "q37", "q82", "q96", "q22",
-    "q25", "q53", "q7", "q73", "q75"
+    "q45", "q52", "q20", "q40", "q23", "q58", "q33", "q79", "q19", "q31",
+    "q4", "q8", "q54", "q69", "q80", "q10", "q46", "q49", "q57", "q60",
+    "q13", "q27", "q64", "q77", "q78", "q47", "q48", "q85", "q99", "q21",
+    "q39", "q88", "q3", "q25", "q97", "q42", "q72", "q36", "q71", "q98",
+    "q14", "q68", "q92"
 ]
 
-# 3-Worker Gold Example Strategy
+# 4-Worker Gold Example Strategy (13 examples total)
 WORKER_EXAMPLES = {
-    1: ["decorrelate", "pushdown", "early_filter"],      # Subquery/filter transforms
-    2: ["date_cte_isolate", "materialize_cte", "union_cte_split"],  # CTE optimizations
-    3: ["or_to_union", "intersect_to_exists"],           # Set operation transforms
+    1: ["decorrelate", "pushdown", "early_filter"],      # Subquery transforms
+    2: ["date_cte_isolate", "dimension_cte_isolate", "multi_date_range_cte"],  # CTE isolation
+    3: ["prefetch_fact_join", "multi_dimension_prefetch", "materialize_cte"],  # Fact prefetch
+    4: ["single_pass_aggregation", "or_to_union", "intersect_to_exists", "union_cte_split"],  # Consolidation + set ops
 }
 
 # Query file patterns
@@ -154,11 +158,17 @@ def run_worker(
     sql: str,
     db_path: str,
     example_ids: List[str],
+    output_dir: Path,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    collect_only: bool = False,
 ) -> WorkerResult:
     """Run a single optimization worker."""
     start_time = time.time()
+
+    # Create query output directory
+    query_dir = output_dir / query_id
+    query_dir.mkdir(parents=True, exist_ok=True)
 
     # Load gold examples
     examples: List[GoldExample] = []
@@ -184,6 +194,9 @@ def run_worker(
 
         prompt_tokens = len(full_prompt) // 4  # Rough estimate
 
+        # Save prompt BEFORE API call
+        (query_dir / f"w{worker_id}_prompt.txt").write_text(full_prompt)
+
         # Call LLM
         llm_start = time.time()
         llm_client = _create_llm_client(provider, model)
@@ -192,8 +205,32 @@ def run_worker(
 
         response_tokens = len(response_text) // 4  # Rough estimate
 
+        # Save response
+        (query_dir / f"w{worker_id}_response.txt").write_text(response_text)
+
         # Apply response
         optimized_sql = pipeline.apply_response(response_text)
+
+        # Save optimized SQL
+        (query_dir / f"w{worker_id}_optimized.sql").write_text(optimized_sql)
+
+        # Skip validation in collect-only mode
+        if collect_only:
+            return WorkerResult(
+                worker_id=worker_id,
+                query_id=query_id,
+                examples_used=example_ids,
+                status="collected",
+                speedup=0.0,
+                error_message=None,
+                error_category=None,
+                original_time_ms=0,
+                optimized_time_ms=0,
+                optimized_sql=optimized_sql,
+                prompt_tokens=prompt_tokens,
+                response_tokens=response_tokens,
+                llm_time_ms=llm_time_ms,
+            )
 
         # Validate
         validator = SQLValidator(database=db_path)
@@ -202,6 +239,17 @@ def run_worker(
         status = "pass" if result.status == ValidationStatus.PASS else "fail"
         error_msg = result.errors[0] if result.errors else None
         error_cat = categorize_error(error_msg) if error_msg else None
+
+        # Save validation result
+        validation_info = {
+            "worker_id": worker_id,
+            "status": status,
+            "speedup": result.speedup,
+            "error": error_msg,
+            "error_category": error_cat,
+            "examples_used": example_ids,
+        }
+        (query_dir / f"w{worker_id}_validation.json").write_text(json.dumps(validation_info, indent=2))
 
         return WorkerResult(
             worker_id=worker_id,
@@ -238,14 +286,16 @@ def run_worker(
         )
 
 
-def run_query_3workers(
+def run_query_4workers(
     query_id: str,
     db_path: str,
+    output_dir: Path,
     original_speedup: float = 0.0,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    collect_only: bool = False,
 ) -> QueryResult:
-    """Run 3 workers in parallel for a query."""
+    """Run 4 workers in parallel for a query."""
     sql = load_query_sql(query_id)
     if not sql:
         logger.error(f"Query file not found: {query_id}")
@@ -263,8 +313,13 @@ def run_query_3workers(
     logger.info(f"Processing {query_id.upper()} (original speedup: {original_speedup:.2f}x)")
     logger.info(f"{'='*60}")
 
-    # Run 3 workers in parallel
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    # Save original SQL
+    query_dir = output_dir / query_id
+    query_dir.mkdir(parents=True, exist_ok=True)
+    (query_dir / "original.sql").write_text(sql)
+
+    # Run 4 workers in parallel
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {}
         for worker_id, example_ids in WORKER_EXAMPLES.items():
             future = pool.submit(
@@ -274,8 +329,10 @@ def run_query_3workers(
                 sql,
                 db_path,
                 example_ids,
+                output_dir,
                 provider,
                 model,
+                collect_only,
             )
             futures[future] = worker_id
 
@@ -325,12 +382,13 @@ def run_query_3workers(
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="3-Worker Fan-Out Retry for Regression Queries")
+    parser = argparse.ArgumentParser(description="4-Worker Fan-Out Retry for Neutral Queries")
     parser.add_argument("--db", required=True, help="Path to DuckDB database")
     parser.add_argument("--queries", help="Comma-separated query IDs (default: all 25 pending)")
     parser.add_argument("--output-dir", default="retry_results", help="Output directory")
     parser.add_argument("--provider", help="LLM provider override")
     parser.add_argument("--model", help="LLM model override")
+    parser.add_argument("--collect-only", action="store_true", help="Skip validation, just collect LLM responses")
     args = parser.parse_args()
 
     # Parse queries
@@ -339,13 +397,17 @@ def main():
     else:
         query_ids = PENDING_RETRIES
 
-    # Original speedups (from your data)
+    # Original speedups for neutral queries
     ORIGINAL_SPEEDUPS = {
-        "q16": 0.06, "q94": 0.25, "q34": 0.32, "q9": 0.47, "q26": 0.60,
-        "q4": 0.85, "q5": 0.93, "q42": 0.93, "q58": 0.94, "q91": 0.94,
-        "q12": 0.95, "q29": 0.95, "q63": 0.95, "q43": 0.96, "q38": 0.96,
-        "q48": 0.96, "q37": 0.97, "q82": 0.97, "q96": 0.97, "q22": 0.98,
-        "q25": 0.98, "q53": 0.98, "q7": 0.99, "q73": 0.99, "q75": 0.99,
+        "q45": 1.08, "q52": 1.08, "q20": 1.07, "q40": 1.07, "q23": 1.06,
+        "q58": 1.06, "q33": 1.05, "q79": 1.05, "q19": 1.04, "q31": 1.04,
+        "q4": 1.03, "q8": 1.03, "q54": 1.03, "q69": 1.03, "q80": 1.03,
+        "q10": 1.02, "q46": 1.02, "q49": 1.02, "q57": 1.02, "q60": 1.02,
+        "q13": 1.01, "q27": 1.01, "q64": 1.01, "q77": 1.01, "q78": 1.01,
+        "q47": 1.00, "q48": 1.00, "q85": 1.00, "q99": 1.00, "q21": 0.99,
+        "q39": 0.99, "q88": 0.99, "q3": 0.98, "q25": 0.98, "q97": 0.98,
+        "q42": 0.97, "q72": 0.97, "q36": 0.96, "q71": 0.96, "q98": 0.96,
+        "q14": 0.95, "q68": 0.95, "q92": 0.95,
     }
 
     # Setup output
@@ -353,11 +415,11 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_file = output_dir / f"retry_3worker_{timestamp}.csv"
-    details_file = output_dir / f"retry_3worker_{timestamp}_details.json"
+    results_file = output_dir / f"retry_4worker_{timestamp}.csv"
+    details_file = output_dir / f"retry_4worker_{timestamp}_details.json"
 
     logger.info(f"\n{'#'*60}")
-    logger.info(f"# 3-WORKER FAN-OUT RETRY")
+    logger.info(f"# 4-WORKER FAN-OUT RETRY")
     logger.info(f"# Queries: {len(query_ids)}")
     logger.info(f"# Database: {args.db}")
     logger.info(f"# Output: {output_dir}")
@@ -366,22 +428,104 @@ def main():
     for wid, examples in WORKER_EXAMPLES.items():
         logger.info(f"  W{wid}: {', '.join(examples)}")
 
-    # Process queries
+    # Process queries - ALL IN PARALLEL when collect_only
     all_results: List[QueryResult] = []
     start_time = time.time()
 
-    for i, qid in enumerate(query_ids, 1):
-        logger.info(f"\n[{i}/{len(query_ids)}] Processing {qid}...")
-        original_speedup = ORIGINAL_SPEEDUPS.get(qid, 0.0)
+    if args.collect_only:
+        # Blast all API calls at once (43 queries × 4 workers = 172)
+        logger.info(f"\nSending {len(query_ids) * 4} API calls in parallel...")
 
-        result = run_query_3workers(
-            qid,
-            args.db,
-            original_speedup,
-            args.provider,
-            args.model,
-        )
-        all_results.append(result)
+        # Store worker results grouped by query_id
+        worker_results_by_query: Dict[str, List[WorkerResult]] = {qid: [] for qid in query_ids}
+
+        with ThreadPoolExecutor(max_workers=172) as pool:
+            futures = {}
+            for qid in query_ids:
+                sql = load_query_sql(qid)
+                if not sql:
+                    continue
+                # Save original
+                query_dir = output_dir / qid
+                query_dir.mkdir(parents=True, exist_ok=True)
+                (query_dir / "original.sql").write_text(sql)
+
+                for worker_id, example_ids in WORKER_EXAMPLES.items():
+                    # Skip if already collected
+                    response_file = query_dir / f"w{worker_id}_response.txt"
+                    if response_file.exists():
+                        logger.info(f"  {qid}/W{worker_id}: already collected, skipping")
+                        # Create a placeholder result for already-collected workers
+                        optimized_sql_file = query_dir / f"w{worker_id}_optimized.sql"
+                        worker_results_by_query[qid].append(WorkerResult(
+                            worker_id=worker_id,
+                            query_id=qid,
+                            examples_used=example_ids,
+                            status="collected",
+                            speedup=0.0,
+                            error_message=None,
+                            error_category=None,
+                            original_time_ms=0,
+                            optimized_time_ms=0,
+                            optimized_sql=optimized_sql_file.read_text() if optimized_sql_file.exists() else None,
+                            prompt_tokens=0,
+                            response_tokens=0,
+                            llm_time_ms=0,
+                        ))
+                        continue
+
+                    future = pool.submit(
+                        run_worker,
+                        worker_id,
+                        qid,
+                        sql,
+                        args.db,
+                        example_ids,
+                        output_dir,
+                        args.provider,
+                        args.model,
+                        True,  # collect_only
+                    )
+                    futures[future] = (qid, worker_id)
+
+            # Collect results
+            for future in as_completed(futures):
+                qid, wid = futures[future]
+                try:
+                    result = future.result()
+                    worker_results_by_query[qid].append(result)
+                    logger.info(f"  {qid}/W{wid}: collected")
+                except Exception as e:
+                    logger.error(f"  {qid}/W{wid}: {e}")
+
+        # Build QueryResults with populated all_workers
+        for qid in query_ids:
+            workers = worker_results_by_query.get(qid, [])
+            all_results.append(QueryResult(
+                query_id=qid,
+                best_worker=None,
+                best_speedup=0.0,
+                best_status="collected",
+                all_workers=workers,
+                original_speedup=ORIGINAL_SPEEDUPS.get(qid, 0.0),
+                improvement=0.0,
+            ))
+    else:
+        # Sequential with validation
+        for i, qid in enumerate(query_ids, 1):
+            logger.info(f"\n[{i}/{len(query_ids)}] Processing {qid}...")
+            original_speedup = ORIGINAL_SPEEDUPS.get(qid, 0.0)
+
+            result = run_query_4workers(
+                qid,
+                args.db,
+                output_dir,
+                original_speedup,
+                args.provider,
+                args.model,
+                args.collect_only,
+            )
+            all_results.append(result)
 
     total_time = time.time() - start_time
 
@@ -414,6 +558,7 @@ def main():
             "w1_speedup", "w1_status", "w1_error",
             "w2_speedup", "w2_status", "w2_error",
             "w3_speedup", "w3_status", "w3_error",
+            "w4_speedup", "w4_status", "w4_error",
         ])
 
         for r in all_results:
@@ -426,7 +571,7 @@ def main():
                 r.best_worker,
                 r.best_status,
             ]
-            for wid in [1, 2, 3]:
+            for wid in [1, 2, 3, 4]:
                 w = w_data.get(wid)
                 if w:
                     row.extend([f"{w.speedup:.3f}", w.status, w.error_category or ""])

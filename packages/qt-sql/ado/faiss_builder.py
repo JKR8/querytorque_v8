@@ -282,8 +282,8 @@ class ASTVectorizer:
 # Example Loading
 # =============================================================================
 
-# Additional example directories
-GOLD_EXAMPLES_DIR = BASE_DIR.parent / "qt_sql" / "optimization" / "examples"
+# ADO is PostgreSQL-focused - only use ado/examples/ (DSB catalog rules)
+# Do NOT load qt_sql/optimization/examples/ - those are DuckDB TPC-DS gold examples
 
 
 def _clean_sql_markers(sql: str) -> str:
@@ -327,12 +327,8 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
     """
     examples = []
 
-    # Load from both directories
-    example_dirs = [EXAMPLES_DIR]
-    if GOLD_EXAMPLES_DIR.exists():
-        example_dirs.append(GOLD_EXAMPLES_DIR)
-
-    for example_dir in example_dirs:
+    # Load only from ado/examples/ (PostgreSQL DSB catalog rules)
+    for example_dir in [EXAMPLES_DIR]:
         if not example_dir.exists():
             continue
 

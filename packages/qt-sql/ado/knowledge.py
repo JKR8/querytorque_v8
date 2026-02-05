@@ -27,6 +27,7 @@ EXAMPLES_DIR = BASE_DIR / "examples"
 CONSTRAINTS_DIR = BASE_DIR / "constraints"
 MODELS_DIR = BASE_DIR / "models"
 DSB_RULES_FILE = BASE_DIR / "knowledge_dsb.yaml"
+DSB_QUERY_MAPPING_FILE = BASE_DIR / "dsb_query_rule_mapping.json"
 
 
 # =============================================================================
@@ -137,6 +138,86 @@ def _load_dsb_rules() -> list[DSBRule]:
     except Exception as e:
         logger.warning(f"Failed to load DSB rules: {e}")
         return []
+
+
+# DSB query mapping cache
+_DSB_QUERY_MAPPING: dict[str, list[str]] | None = None
+
+
+def _load_dsb_query_mapping() -> dict[str, list[str]]:
+    """Load DSB query to rule mapping from dsb_query_rule_mapping.json."""
+    global _DSB_QUERY_MAPPING
+    if _DSB_QUERY_MAPPING is not None:
+        return _DSB_QUERY_MAPPING
+
+    if not DSB_QUERY_MAPPING_FILE.exists():
+        logger.debug(f"DSB query mapping not found at {DSB_QUERY_MAPPING_FILE}")
+        _DSB_QUERY_MAPPING = {}
+        return _DSB_QUERY_MAPPING
+
+    try:
+        _DSB_QUERY_MAPPING = json.loads(DSB_QUERY_MAPPING_FILE.read_text())
+        logger.info(f"Loaded DSB query mapping with {len(_DSB_QUERY_MAPPING)} queries")
+        return _DSB_QUERY_MAPPING
+    except Exception as e:
+        logger.warning(f"Failed to load DSB query mapping: {e}")
+        _DSB_QUERY_MAPPING = {}
+        return _DSB_QUERY_MAPPING
+
+
+def _get_rules_for_dsb_query(query_id: str) -> list[str]:
+    """Get applicable rules for a DSB query by ID.
+
+    Normalizes query_id to match mapping keys (e.g., 'q13' -> 'query013_agg').
+
+    Args:
+        query_id: Query identifier (e.g., 'q13', 'query013', 'query013_agg')
+
+    Returns:
+        List of applicable rule IDs, or empty list if not found
+    """
+    import re
+
+    mapping = _load_dsb_query_mapping()
+    if not mapping:
+        return []
+
+    # Try exact match first
+    if query_id in mapping:
+        return mapping[query_id]
+
+    # Normalize query_id to find matches
+    # Extract query number
+    match = re.search(r'(\d+)', query_id)
+    if not match:
+        return []
+
+    qnum = int(match.group(1))
+    qnum_padded = f"{qnum:03d}"  # e.g., "013"
+
+    # Determine variant (agg, spj, multi)
+    variant = None
+    if 'spj' in query_id.lower():
+        variant = 'spj_spj'
+    elif 'agg' in query_id.lower():
+        variant = 'agg'
+    elif 'multi' in query_id.lower():
+        variant = 'multi'
+
+    # Try to find matching keys
+    candidates = []
+    for key in mapping.keys():
+        if f"query{qnum_padded}" in key or f"query{qnum}" in key:
+            if variant:
+                if variant in key:
+                    return mapping[key]
+            candidates.append(key)
+
+    # Return first matching candidate
+    if candidates:
+        return mapping[candidates[0]]
+
+    return []
 
 
 # =============================================================================
@@ -312,47 +393,70 @@ class KnowledgeRetriever:
             self._constraints_cache = _load_constraints()
         return self._constraints_cache
 
-    def retrieve(self, sql: str, k_examples: int = 3) -> RetrievalResult:
+    def retrieve(
+        self, sql: str, k_examples: int = 3, query_id: str | None = None
+    ) -> RetrievalResult:
         """Retrieve relevant examples and constraints for a SQL query.
 
-        Uses FAISS similarity search to find the most relevant examples.
-        Falls back to returning all examples if FAISS is unavailable.
+        Uses explicit DSB query mapping when query_id is provided and matches
+        a known DSB query. Falls back to FAISS similarity search otherwise.
 
         Args:
             sql: The SQL query to optimize
             k_examples: Maximum number of examples to return
+            query_id: Optional query identifier (e.g., 'q13', 'query013_agg')
 
         Returns:
             RetrievalResult with examples and constraints
         """
-        # Get FAISS recommendations
-        faiss_recs = _get_faiss_recommendations(sql, k=max(5, k_examples))
-
-        # Select examples based on FAISS recommendations
+        examples_by_id = {ex.id: ex for ex in self.examples}
         selected: list[GoldExample] = []
+        retrieval_method = "fallback"
+        rule_ids: list[str] = []
 
-        if faiss_recs:
-            # FAISS returned recommendations - try to match by ID
-            examples_by_id = {ex.id: ex for ex in self.examples}
+        # 1. Try explicit DSB query mapping first (if query_id provided)
+        if query_id:
+            rule_ids = _get_rules_for_dsb_query(query_id)
+            if rule_ids:
+                retrieval_method = "dsb_mapping"
+                logger.info(f"Using DSB mapping for {query_id}: {len(rule_ids)} rules")
 
-            for rec_id in faiss_recs:
-                # Try exact match
-                if rec_id in examples_by_id:
-                    selected.append(examples_by_id[rec_id])
-                else:
-                    # Try partial match (e.g., 'decorrelate' matches 'decorrelate_example')
-                    for ex_id, ex in examples_by_id.items():
-                        if rec_id in ex_id or ex_id in rec_id:
-                            if ex not in selected:
-                                selected.append(ex)
-                                break
+                for rule_id in rule_ids[:k_examples]:
+                    if rule_id in examples_by_id:
+                        selected.append(examples_by_id[rule_id])
+                    else:
+                        # Try case-insensitive match
+                        for ex_id, ex in examples_by_id.items():
+                            if ex_id.upper() == rule_id.upper():
+                                if ex not in selected:
+                                    selected.append(ex)
+                                    break
 
-                if len(selected) >= k_examples:
-                    break
+        # 2. Fall back to FAISS similarity if no DSB mapping match
+        faiss_recs: list[str] = []
+        if not selected:
+            faiss_recs = _get_faiss_recommendations(sql, k=max(5, k_examples))
+            if faiss_recs:
+                retrieval_method = "faiss"
 
-        # If no FAISS matches, use all available examples
+                for rec_id in faiss_recs:
+                    if rec_id in examples_by_id:
+                        selected.append(examples_by_id[rec_id])
+                    else:
+                        # Try partial match
+                        for ex_id, ex in examples_by_id.items():
+                            if rec_id.upper() in ex_id.upper() or ex_id.upper() in rec_id.upper():
+                                if ex not in selected:
+                                    selected.append(ex)
+                                    break
+
+                    if len(selected) >= k_examples:
+                        break
+
+        # 3. Final fallback - return first k examples
         if not selected:
             selected = self.examples[:k_examples]
+            retrieval_method = "fallback"
 
         # Load DSB rules for additional context
         dsb_rules = _load_dsb_rules()
@@ -361,6 +465,9 @@ class KnowledgeRetriever:
             gold_examples=selected,
             constraints=self.constraints,
             rationale={
+                "retrieval_method": retrieval_method,
+                "query_id": query_id,
+                "dsb_rule_ids": rule_ids[:k_examples] if rule_ids else [],
                 "faiss_recommendations": faiss_recs,
                 "selected_example_ids": [e.id for e in selected],
                 "dsb_rules": [r.id for r in dsb_rules],

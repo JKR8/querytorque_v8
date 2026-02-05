@@ -1,0 +1,57 @@
+Looking at this query, I can identify several optimization opportunities:
+
+1. **Date dimension filtering**: The query has a date range filter (`d_year BETWEEN 2000 AND 2000 + 1`) that can be isolated early.
+2. **Multiple table joins with filtering**: Many tables have filter conditions that can be pushed down.
+3. **Self-join pattern**: Similar to DSB Query 100 with additional filters.
+4. **Redundant MIN operations**: The query computes MIN of item1.i_item_sk and s1.ss_item_sk, which are the same value (joined on equality).
+
+Here's my rewrite plan:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "date_dim_cte": "SELECT d_date_sk FROM date_dim WHERE d_year BETWEEN 2000 AND 2000 + 1"
+      },
+      "invariants_kept": ["Date filtering preserved", "Join condition d_date_sk = s1.ss_sold_date_sk preserved"],
+      "expected_speedup": "1.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "pushdown",
+      "nodes": {
+        "filtered_item1": "SELECT i_item_sk FROM item WHERE i_category IN ('Electronics', 'Men')",
+        "filtered_item2": "SELECT i_item_sk FROM item WHERE i_manager_id BETWEEN 81 AND 100",
+        "filtered_customer_demographics": "SELECT cd_demo_sk FROM customer_demographics WHERE cd_marital_status = 'S' AND cd_education_status = 'Secondary'"
+      },
+      "invariants_kept": ["All filter conditions preserved", "Join keys preserved"],
+      "expected_speedup": "2x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_03",
+      "transform": "semantic_rewrite",
+      "nodes": {
+        "main_query": "WITH date_filtered AS (SELECT d_date_sk FROM date_dim WHERE d_year BETWEEN 2000 AND 2000 + 1),\n  item1_filtered AS (SELECT i_item_sk FROM item WHERE i_category IN ('Electronics', 'Men')),\n  item2_filtered AS (SELECT i_item_sk FROM item WHERE i_manager_id BETWEEN 81 AND 100),\n  cd_filtered AS (SELECT cd_demo_sk FROM customer_demographics WHERE cd_marital_status = 'S' AND cd_education_status = 'Secondary'),\n  filtered_s1 AS (\n    SELECT ss_ticket_number, ss_item_sk, ss_customer_sk\n    FROM store_sales\n    WHERE ss_list_price BETWEEN 16 AND 30\n  ),\n  filtered_s2 AS (\n    SELECT ss_ticket_number, ss_item_sk\n    FROM store_sales\n    WHERE ss_list_price BETWEEN 16 AND 30\n  ),\n  s1_with_date AS (\n    SELECT s1.ss_ticket_number, s1.ss_item_sk, s1.ss_customer_sk\n    FROM filtered_s1 s1\n    JOIN date_filtered d ON d.d_date_sk = s1.ss_sold_date_sk\n  ),\n  joined_base AS (\n    SELECT s1.ss_ticket_number, s1.ss_item_sk AS item1_sk, s2.ss_item_sk AS item2_sk, s1.ss_customer_sk\n    FROM s1_with_date s1\n    JOIN filtered_s2 s2 ON s1.ss_ticket_number = s2.ss_ticket_number\n    JOIN item1_filtered i1 ON s1.ss_item_sk = i1.i_item_sk\n    JOIN item2_filtered i2 ON s2.ss_item_sk = i2.i_item_sk\n    WHERE s1.ss_item_sk < s2.ss_item_sk\n  )\n  SELECT MIN(j.item1_sk), MIN(j.item2_sk), MIN(j.ss_ticket_number), MIN(j.item1_sk)\n  FROM joined_base j\n  JOIN customer c ON j.ss_customer_sk = c.c_customer_sk\n  JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\n  JOIN cd_filtered cd ON c.c_current_cdemo_sk = cd.cd_demo_sk"
+      },
+      "invariants_kept": ["Output columns preserved", "All join conditions preserved", "All filter conditions preserved", "Result cardinality invariant (single row)", "MIN(item1.i_item_sk) = MIN(s1.ss_item_sk) relationship preserved"],
+      "expected_speedup": "3x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "1. Isolated date_dim filtering into a CTE to reduce join size early. 2. Pushed down filters on item tables and customer_demographics to reduce table sizes before joins. 3. Applied semantic rewrite to restructure the query: separated s1 and s2 filtering, applied filters before joins, and removed redundant joins (original had duplicate item table references). 4. Note: MIN(item1.i_item_sk) and MIN(s1.ss_item_sk) compute the same value due to the equality join, but preserved both as required by the contract. The rewrite maintains all original semantics while reducing intermediate result sizes."
+}
+```
+
+**Key optimizations applied:**
+1. **Early filtering**: All dimension table filters applied before joins
+2. **Date CTE isolation**: Date range filter applied early to date_dim
+3. **Reduced join fanout**: Filtered store_sales (s1 and s2) before the self-join
+4. **Preserved semantic invariants**: All original conditions maintained, output columns unchanged
+5. **Literal preservation**: All literal values ('Electronics', 'Men', 'S', 'Secondary', numeric ranges) preserved exactly
+
+The rewrite reduces the size of intermediate results by filtering early and avoids scanning large fact tables multiple times with unfiltered joins.

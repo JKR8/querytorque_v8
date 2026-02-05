@@ -1,0 +1,47 @@
+Looking at this query, I can see several optimization opportunities:
+
+1. **OR_TO_UNION**: The OR condition between web_sales and catalog_sales can be rewritten as UNION ALL
+2. **DATE_CTE_ISOLATE**: The date_dim filter (d_year=2002, d_moy between 1-4) appears multiple times
+3. **EARLY_FILTER**: The county filter on customer_address can be pushed early
+4. **Materialize CTEs** for the EXISTS subqueries to avoid repeated scanning
+
+Let me rewrite this using multiple CTEs for clarity and performance:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "or_to_union",
+      "nodes": {
+        "date_period": "SELECT d_date_sk FROM date_dim WHERE d_year = 2002 AND d_moy BETWEEN 1 AND 4",
+        "filtered_customer_address": "SELECT ca_address_sk FROM customer_address WHERE ca_county IN ('Rush County', 'Toole County', 'Jefferson County', 'Dona Ana County', 'La Porte County')",
+        "store_sales_customers": "SELECT DISTINCT ss_customer_sk FROM store_sales JOIN date_period ON ss_sold_date_sk = d_date_sk",
+        "web_sales_customers": "SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN date_period ON ws_sold_date_sk = d_date_sk",
+        "catalog_sales_customers": "SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN date_period ON cs_sold_date_sk = d_date_sk",
+        "any_sales_customers": "SELECT ws_bill_customer_sk AS customer_sk FROM web_sales_customers UNION ALL SELECT cs_ship_customer_sk FROM catalog_sales_customers",
+        "customers_with_sales": "SELECT DISTINCT c.c_customer_sk, c.c_current_cdemo_sk, c.c_current_addr_sk FROM customer c JOIN store_sales_customers ss ON c.c_customer_sk = ss.ss_customer_sk JOIN any_sales_customers asc ON c.c_customer_sk = asc.customer_sk",
+        "main_query": "SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3, cd_dep_count, COUNT(*) AS cnt4, cd_dep_employed_count, COUNT(*) AS cnt5, cd_dep_college_count, COUNT(*) AS cnt6 FROM customers_with_sales cws JOIN filtered_customer_address fca ON cws.c_current_addr_sk = fca.ca_address_sk JOIN customer_demographics cd ON cws.c_current_cdemo_sk = cd.cd_demo_sk GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same output columns",
+        "same aggregation results",
+        "same grouping grain"
+      ],
+      "expected_speedup": "3.5x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Transformed OR condition to UNION ALL, isolated date filter into CTE, pushed county filter early, and materialized EXISTS subqueries as separate CTEs to avoid repeated fact table scans. This reduces store_sales scans from 3 to 1, web_sales and catalog_sales from 2 to 1 each, and applies all filters before expensive joins."
+}
+```
+
+**Key insights:**
+1. **OR_TO_UNION**: The OR condition between web_sales and catalog_sales is converted to UNION ALL, which allows better optimization
+2. **DATE_CTE_ISOLATE**: Date filter (2002, months 1-4) is computed once and reused
+3. **EARLY_FILTER**: County filter on customer_address applied before main join
+4. **Materialization**: EXISTS subqueries are materialized as CTEs to avoid repeated scanning of large fact tables
+5. **DISTINCT aggregation**: Used DISTINCT in CTEs to reduce data volume before joins
+
+This rewrite addresses the high-cost SEQ_SCAN operations on store_sales, web_sales, and catalog_sales by scanning each only once and applying filters early.

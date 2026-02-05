@@ -1,0 +1,40 @@
+Looking at this query, I can see it's computing return ratios and ranking items across three channels (web, catalog, store) for December 2001. The main opportunities are:
+
+1. **Date CTE Isolation**: Same date filter (d_year=2001 AND d_moy=12) is used in all three UNION branches
+2. **OR to UNION ALL**: The OR condition `(return_rank <= 10 OR currency_rank <= 10)` can be split
+3. **Early filtering**: Returns tables have filter `return_amt > 10000`
+
+The biggest opportunity is isolating the date_dim filter into a CTE and pushing it early.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_moy = 12",
+        "web_sales_filtered": "SELECT ws.ws_item_sk, ws.ws_order_number, ws.ws_quantity, ws.ws_net_paid, ws.ws_net_profit FROM web_sales ws JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk WHERE ws.ws_net_profit > 1 AND ws.ws_net_paid > 0 AND ws.ws_quantity > 0",
+        "catalog_sales_filtered": "SELECT cs.cs_item_sk, cs.cs_order_number, cs.cs_quantity, cs.cs_net_paid, cs.cs_net_profit FROM catalog_sales cs JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk WHERE cs.cs_net_profit > 1 AND cs.cs_net_paid > 0 AND cs.cs_quantity > 0",
+        "store_sales_filtered": "SELECT sts.ss_item_sk, sts.ss_ticket_number, sts.ss_quantity, sts.ss_net_paid, sts.ss_net_profit FROM store_sales sts JOIN filtered_dates fd ON sts.ss_sold_date_sk = fd.d_date_sk WHERE sts.ss_net_profit > 1 AND sts.ss_net_paid > 0 AND sts.ss_quantity > 0",
+        "web_returns_filtered": "SELECT wr.wr_order_number, wr.wr_item_sk, wr.wr_return_quantity, wr.wr_return_amt FROM web_returns wr WHERE wr.wr_return_amt > 10000",
+        "catalog_returns_filtered": "SELECT cr.cr_order_number, cr.cr_item_sk, cr.cr_return_quantity, cr.cr_return_amount FROM catalog_returns cr WHERE cr.cr_return_amount > 10000",
+        "store_returns_filtered": "SELECT sr.sr_ticket_number, sr.sr_item_sk, sr.sr_return_quantity, sr.sr_return_amt FROM store_returns sr WHERE sr.sr_return_amt > 10000",
+        "web_channel": "SELECT 'web' AS channel, ws.ws_item_sk AS item, (CAST(SUM(COALESCE(wr.wr_return_quantity, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(ws.ws_quantity, 0)) AS DECIMAL(15, 4))) AS return_ratio, (CAST(SUM(COALESCE(wr.wr_return_amt, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(ws.ws_net_paid, 0)) AS DECIMAL(15, 4))) AS currency_ratio FROM web_sales_filtered ws LEFT OUTER JOIN web_returns_filtered wr ON (ws.ws_order_number = wr.wr_order_number AND ws.ws_item_sk = wr.wr_item_sk) GROUP BY ws.ws_item_sk",
+        "catalog_channel": "SELECT 'catalog' AS channel, cs.cs_item_sk AS item, (CAST(SUM(COALESCE(cr.cr_return_quantity, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(cs.cs_quantity, 0)) AS DECIMAL(15, 4))) AS return_ratio, (CAST(SUM(COALESCE(cr.cr_return_amount, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(cs.cs_net_paid, 0)) AS DECIMAL(15, 4))) AS currency_ratio FROM catalog_sales_filtered cs LEFT OUTER JOIN catalog_returns_filtered cr ON (cs.cs_order_number = cr.cr_order_number AND cs.cs_item_sk = cr.cr_item_sk) GROUP BY cs.cs_item_sk",
+        "store_channel": "SELECT 'store' AS channel, sts.ss_item_sk AS item, (CAST(SUM(COALESCE(sr.sr_return_quantity, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(sts.ss_quantity, 0)) AS DECIMAL(15, 4))) AS return_ratio, (CAST(SUM(COALESCE(sr.sr_return_amt, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(sts.ss_net_paid, 0)) AS DECIMAL(15, 4))) AS currency_ratio FROM store_sales_filtered sts LEFT OUTER JOIN store_returns_filtered sr ON (sts.ss_ticket_number = sr.sr_ticket_number AND sts.ss_item_sk = sr.sr_item_sk) GROUP BY sts.ss_item_sk",
+        "main_query": "SELECT channel, item, return_ratio, RANK() OVER (PARTITION BY channel ORDER BY return_ratio) AS return_rank, RANK() OVER (PARTITION BY channel ORDER BY currency_ratio) AS currency_rank FROM (SELECT * FROM web_channel UNION ALL SELECT * FROM catalog_channel UNION ALL SELECT * FROM store_channel) AS all_channels WHERE return_rank <= 10 OR currency_rank <= 10 ORDER BY channel NULLS FIRST, return_rank NULLS FIRST, currency_rank NULLS FIRST, item NULLS FIRST LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Isolated date_dim filter into CTE and pushed it early into each sales fact table. This reduces the large fact tables (web_sales, catalog_sales, store_sales) before the expensive group by and window functions. Also pre-filtered returns tables by amount condition. This should reduce the cardinality of early joins significantly."
+}
+```

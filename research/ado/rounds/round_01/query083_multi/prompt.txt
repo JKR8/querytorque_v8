@@ -1,0 +1,171 @@
+## Example: Aggregate Push Below Join (AGGREGATE_PUSH_BELOW_JOIN)
+Verified speedup: unknown
+
+### Input:
+[main_query]:
+SELECT c.region, SUM(o.amount)
+      FROM customers c
+      JOIN orders o ON c.id = o.customer_id
+      GROUP BY c.region;
+
+
+**Key insight:** Join followed by aggregation where one side contributes only to
+      aggregate, not to grouping.
+
+---
+
+## Example: Star Schema Dimension Filter First (STAR_SCHEMA_DIMENSION_FILTER_FIRST)
+Verified speedup: unknown
+
+### Input:
+[main_query]:
+-- May scan fact table first
+      SELECT f.*, d1.name, d2.category
+      FROM fact_sales f
+      JOIN dim_date d1 ON f.date_id = d1.id
+      JOIN dim_product d2 ON f.product_id = d2.id
+      WHERE d1.year = 2025
+        AND d2.category = 'Electronics';
+
+
+**Key insight:** Star schema queries with selective dimension filters where optimizer
+      scans fact table first instead of filtering dimensions.
+
+---
+
+## Example: Cte Optimization Fence Materialized (CTE_OPTIMIZATION_FENCE_MATERIALIZED)
+Verified speedup: unknown
+
+### Input:
+[main_query]:
+-- May be inlined and computed multiple times in PG12+
+      WITH expensive_calc AS (
+          SELECT id, complex_function(data) AS result 
+          FROM big_table
+      )
+      SELECT * FROM expensive_calc e1
+      JOIN expensive_calc e2 ON e1.result = e2.result;
+
+
+**Key insight:** - CTE contains expensive computation that should run once
+      - Need to isolate subquery planning to prevent bad plan choices
+      - Force specific join ordering
+
+---
+
+## CONSTRAINTS (Learned from Benchmark Failures)
+
+The following constraints are MANDATORY based on observed failures:
+
+### LITERAL_PRESERVATION [CRITICAL]
+CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+
+### OR_TO_UNION_LIMIT [HIGH]
+CAUTION with OR→UNION: Only split OR conditions into UNION ALL when there are ≤3 simple branches AND they have different access patterns. If you have nested ORs (e.g., 3 conditions × 3 values = 9 combinations), DO NOT expand them - keep the original OR structure. DuckDB handles OR predicates efficiently. Over-splitting causes multiple scans of fact tables and severe regressions (0.23x-0.41x observed). When in doubt, preserve the original OR structure.
+
+
+---
+
+You are an autonomous Query Rewrite Engine. Your goal is to maximize execution speed while strictly preserving semantic invariants.
+
+Output atomic rewrite sets in JSON.
+
+RULES:
+- Primary Goal: Maximize execution speed while strictly preserving semantic invariants.
+- Allowed Transforms: Use the provided list. If a standard SQL optimization applies that is not listed, label it "semantic_rewrite".
+- Atomic Sets: Group dependent changes (e.g., creating a CTE and joining it) into a single rewrite_set.
+- Contracts: Output columns, grain, and total result rows must remain invariant.
+- Naming: Use descriptive CTE names (e.g., `filtered_returns` vs `cte1`).
+- Column Aliasing: Permitted only for aggregations or disambiguation.
+
+ALLOWED TRANSFORMS: pushdown, decorrelate, or_to_union, early_filter, date_cte_isolate, materialize_cte, flatten_subquery, reorder_join, multi_push_predicate, inline_cte, remove_redundant, semantic_rewrite
+
+OUTPUT FORMAT:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "transform_name",
+      "nodes": {
+        "node_id": "new SQL..."
+      },
+      "invariants_kept": ["list of preserved semantics"],
+      "expected_speedup": "2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "what was changed and why"
+}
+```
+
+## Target Nodes
+  [sr_items] GROUP_BY
+  [cr_items] GROUP_BY
+
+## Subgraph Slice
+[sr_items] type=cte
+```sql
+SELECT i_item_id AS item_id, SUM(sr_return_quantity) AS sr_item_qty FROM store_returns, item, date_dim WHERE sr_item_sk = i_item_sk AND d_date IN (SELECT d_date FROM date_dim WHERE d_month_seq IN (SELECT d_month_seq FROM date_dim WHERE d_date IN ('2002-02-01', '2002-04-11', '2002-07-17', '2002-10-09'))) AND sr_returned_date_sk = d_date_sk AND i_category IN ('Jewelry', 'Music') AND i_manager_id BETWEEN 16 AND 25 AND sr_return_amt / sr_return_quantity BETWEEN 184 AND 213 AND sr_reason_sk IN (26, 32, 40, 66, 73) GROUP BY i_item_id
+```
+
+[main_query] type=main
+```sql
+SELECT sr_items.item_id, sr_item_qty, sr_item_qty / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0 * 100 AS sr_dev, cr_item_qty, cr_item_qty / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0 * 100 AS cr_dev, wr_item_qty, wr_item_qty / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0 * 100 AS wr_dev, (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0 AS average FROM sr_items, cr_items, wr_items WHERE sr_items.item_id = cr_items.item_id AND sr_items.item_id = wr_items.item_id ORDER BY sr_items.item_id, sr_item_qty LIMIT 100
+```
+
+[cr_items] type=cte
+```sql
+SELECT i_item_id AS item_id, SUM(cr_return_quantity) AS cr_item_qty FROM catalog_returns, item, date_dim WHERE cr_item_sk = i_item_sk AND d_date IN (SELECT d_date FROM date_dim WHERE d_month_seq IN (SELECT d_month_seq FROM date_dim WHERE d_date IN ('2002-02-01', '2002-04-11', '2002-07-17', '2002-10-09'))) AND cr_returned_date_sk = d_date_sk AND i_category IN ('Jewelry', 'Music') AND i_manager_id BETWEEN 16 AND 25 AND cr_return_amount / cr_return_quantity BETWEEN 184 AND 213 AND cr_reason_sk IN (26, 32, 40, 66, 73) GROUP BY i_item_id
+```
+
+
+## Node Contracts
+[sr_items]:
+  output_columns: ['item_id', 'sr_item_qty']
+  grain: ['i_item_id']
+  required_predicates: ['sr_returned_date_sk = d_date_sk', 'sr_item_sk = i_item_sk']
+[main_query]:
+  output_columns: ['item_id', 'sr_item_qty', 'sr_dev', 'cr_item_qty', 'cr_dev', 'wr_item_qty', 'wr_dev', 'average']
+  required_predicates: ['sr_items.item_id = cr_items.item_id', 'sr_items.item_id = wr_items.item_id']
+[cr_items]:
+  output_columns: ['item_id', 'cr_item_qty']
+  grain: ['i_item_id']
+  required_predicates: ['cr_returned_date_sk = d_date_sk', 'cr_item_sk = i_item_sk']
+
+## Downstream Usage
+[sr_items]: downstream_refs=['item_id', 'sr_item_qty']
+[cr_items]: downstream_refs=['item_id', 'cr_item_qty']
+
+## Cost Attribution
+No cost data.
+
+## Detected Opportunities
+## Knowledge Base Patterns (verified on TPC-DS)
+## Detected Optimization Opportunities
+
+1. **QT-OPT-003** - Date CTE Isolation
+  Trigger: date_dim joined with d_year/d_qoy/d_month filter, fact table present
+  Rewrite: Create CTE: SELECT d_date_sk FROM date_dim WHERE filter, join fact to CTE early
+   Matched: date_dim filter with fact table
+
+2. **QT-OPT-007** - Materialize Repeated Subquery
+  Trigger: Same subquery pattern appears multiple times in query
+  Rewrite: Extract to CTE with MATERIALIZED hint, reference by name
+   Matched: Repeated subquery pattern
+
+
+## Node-Specific Opportunities
+PUSHDOWN: [main_query] filters on [sr_items] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+PUSHDOWN: [main_query] filters on [cr_items] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+PUSHDOWN: [main_query] filters on [wr_items] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+Now output your rewrite_sets:

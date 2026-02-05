@@ -171,14 +171,7 @@ def format_constraints_for_prompt(constraints: List[Constraint]) -> str:
     lines.append("The following constraints are MANDATORY based on observed failures:\n")
 
     for c in constraints:
-        severity_marker = {
-            "CRITICAL": "🚨",
-            "HIGH": "⚠️",
-            "MEDIUM": "ℹ️",
-            "LOW": "*"
-        }.get(c.severity, "ℹ️")
-
-        lines.append(f"### {severity_marker} {c.id} ({c.severity})")
+        lines.append(f"### {c.id} [{c.severity}]")
         lines.append(c.prompt_instruction)
         lines.append("")
 

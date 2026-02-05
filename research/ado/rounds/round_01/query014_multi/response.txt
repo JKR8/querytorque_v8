@@ -1,0 +1,55 @@
+Looking at this query pattern, I see a classic "year-over-year comparison" query with several optimization opportunities. The main issues are: repeated scalar subqueries for date lookups, repeated CTE usage, and complex INTERSECT operations in `cross_items`.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "date_weeks": "WITH date_weeks AS (\n  SELECT \n    d_week_seq AS week_seq_2001,\n    (SELECT d_week_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 12 AND d_dom = 17) AS week_seq_2000\n  FROM date_dim \n  WHERE d_year = 2000 + 1 AND d_moy = 12 AND d_dom = 17\n)"
+      },
+      "invariants_kept": ["Same week sequences for both years", "Exact date literals preserved"],
+      "expected_speedup": "1.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "materialize_cte",
+      "nodes": {
+        "cross_items_rewrite": "WITH cross_items AS (\n  SELECT DISTINCT i_item_sk\n  FROM item i\n  WHERE i.i_category IN ('Electronics', 'Home', 'Men')\n    AND i.i_manager_id BETWEEN 25 AND 34\n    AND EXISTS (\n      SELECT 1 FROM store_sales ss, date_dim d1 \n      WHERE ss.ss_item_sk = i.i_item_sk \n        AND ss.ss_sold_date_sk = d1.d_date_sk \n        AND d1.d_year BETWEEN 2000 AND 2000 + 2\n        AND ss.ss_wholesale_cost BETWEEN 34 AND 54\n    )\n    AND EXISTS (\n      SELECT 1 FROM catalog_sales cs, date_dim d2\n      WHERE cs.cs_item_sk = i.i_item_sk\n        AND cs.cs_sold_date_sk = d2.d_date_sk\n        AND d2.d_year BETWEEN 2000 AND 2000 + 2\n        AND cs.cs_wholesale_cost BETWEEN 34 AND 54\n    )\n    AND EXISTS (\n      SELECT 1 FROM web_sales ws, date_dim d3\n      WHERE ws.ws_item_sk = i.i_item_sk\n        AND ws.ws_sold_date_sk = d3.d_date_sk\n        AND d3.d_year BETWEEN 2000 AND 2000 + 2\n        AND ws.ws_wholesale_cost BETWEEN 34 AND 54\n    )\n)"
+      },
+      "invariants_kept": ["Same item filter conditions", "Same date range literals", "Same wholesale cost range"],
+      "expected_speedup": "3x",
+      "risk": "medium"
+    },
+    {
+      "id": "rs_03", 
+      "transform": "semantic_rewrite",
+      "nodes": {
+        "main_query_rewrite": "WITH date_weeks AS (/* from rs_01 */),\ncross_items AS (/* from rs_02 */),\navg_sales AS (/* original avg_sales */)\nSELECT \n  'store' AS ty_channel, \n  ty.i_brand_id AS ty_brand,\n  ty.i_class_id AS ty_class,\n  ty.i_category_id AS ty_category,\n  ty.sales AS ty_sales,\n  ty.number_sales AS ty_number_sales,\n  'store' AS ly_channel,\n  ly.i_brand_id AS ly_brand,\n  ly.i_class_id AS ly_class,\n  ly.i_category_id AS ly_category,\n  ly.sales AS ly_sales,\n  ly.number_sales AS ly_number_sales\nFROM (\n  SELECT \n    i.i_brand_id,\n    i.i_class_id, \n    i.i_category_id,\n    SUM(ss.ss_quantity * ss.ss_list_price) AS sales,\n    COUNT(*) AS number_sales\n  FROM store_sales ss\n  JOIN item i ON ss.ss_item_sk = i.i_item_sk\n  JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk\n  JOIN date_weeks dw ON d.d_week_seq = dw.week_seq_2001\n  WHERE ss.ss_item_sk IN (SELECT ss_item_sk FROM cross_items)\n    AND i.i_category IN ('Electronics', 'Home', 'Men')\n    AND i.i_manager_id BETWEEN 25 AND 34\n    AND ss.ss_wholesale_cost BETWEEN 34 AND 54\n  GROUP BY i.i_brand_id, i.i_class_id, i.i_category_id\n  HAVING SUM(ss.ss_quantity * ss.ss_list_price) > (SELECT average_sales FROM avg_sales)\n) ty\nJOIN (\n  SELECT \n    i.i_brand_id,\n    i.i_class_id,\n    i.i_category_id,\n    SUM(ss.ss_quantity * ss.ss_list_price) AS sales,\n    COUNT(*) AS number_sales\n  FROM store_sales ss\n  JOIN item i ON ss.ss_item_sk = i.i_item_sk\n  JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk\n  JOIN date_weeks dw ON d.d_week_seq = dw.week_seq_2000\n  WHERE ss.ss_item_sk IN (SELECT ss_item_sk FROM cross_items)\n    AND i.i_category IN ('Electronics', 'Home', 'Men')\n    AND i.i_manager_id BETWEEN 25 AND 34\n    AND ss.ss_wholesale_cost BETWEEN 34 AND 54\n  GROUP BY i.i_brand_id, i.i_class_id, i.i_category_id\n  HAVING SUM(ss.ss_quantity * ss.ss_list_price) > (SELECT average_sales FROM avg_sales)\n) ly ON ty.i_brand_id = ly.i_brand_id \n  AND ty.i_class_id = ly.i_class_id\n  AND ty.i_category_id = ly.i_category_id\nORDER BY ty_channel, ty_brand, ty_class, ty_category\nLIMIT 100"
+      },
+      "invariants_kept": ["Same output columns and grain", "Same join conditions", "Same filter literals", "Same HAVING condition"],
+      "expected_speedup": "2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "1. Created date_weeks CTE to compute both week sequences once, avoiding repeated scalar subqueries. 2. Rewrote cross_items CTE using EXISTS instead of INTERSECT for better performance while maintaining same semantics. 3. Flattened main query by removing correlated subqueries and using explicit joins with the pre-computed date weeks. All literal values are preserved exactly as in original query."
+}
+```
+
+**Key optimizations applied:**
+
+1. **Date CTE Isolation**: Created `date_weeks` CTE to compute both week sequences (2000 and 2001) in one pass, avoiding repeated scalar subquery execution.
+
+2. **INTERSECT to EXISTS**: Transformed the complex INTERSECT pattern in `cross_items` to EXISTS subqueries. This is often more efficient in DuckDB as it can use semi-joins instead of materializing multiple sets for intersection.
+
+3. **Subquery Flattening**: Converted the correlated subqueries for week sequences to explicit joins using the pre-computed date_weeks CTE.
+
+4. **Predicate Preservation**: All literal values ('Electronics', 'Home', 'Men', 34, 54, 25, 34, 2000, 12, 17) are preserved exactly as in the original query.
+
+**Expected benefits:**
+- Eliminates repeated scalar subquery execution for date lookups
+- Reduces complexity of cross_items computation
+- Enables better join ordering and predicate pushdown
+- Maintains exact same semantics and result set

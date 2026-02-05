@@ -1,0 +1,2 @@
+WITH filtered_store AS (SELECT s_store_sk FROM store WHERE s_store_name = 'ese'), filtered_hd AS (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 7), filtered_time AS (SELECT t_time_sk FROM time_dim WHERE t_hour = 20 AND t_minute >= 30), filtered_sales AS (SELECT ss_store_sk, ss_hdemo_sk, ss_sold_time_sk FROM store_sales JOIN filtered_store ON ss_store_sk = s_store_sk JOIN filtered_hd ON ss_hdemo_sk = hd_demo_sk JOIN filtered_time ON ss_sold_time_sk = t_time_sk)
+SELECT COUNT(*) FROM filtered_sales ORDER BY COUNT(*) LIMIT 100

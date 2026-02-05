@@ -10,6 +10,109 @@ The ADO (Adaptive Data Optimization) learning system captures and analyzes three
 
 This enables continuous improvement of the optimization system through structured learning records.
 
+## LLM Feedback Loop
+
+The ADO system uses a **closed-loop learning process** where the LLM acts as both the optimizer and the critic:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      ADO FEEDBACK LOOP                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   ┌──────────┐     ┌──────────┐     ┌──────────┐               │
+│   │ Prompt + │ ──► │   LLM    │ ──► │ Rewrite  │               │
+│   │ Examples │     │ Generate │     │   SQL    │               │
+│   └──────────┘     └──────────┘     └────┬─────┘               │
+│                                          │                      │
+│                                          ▼                      │
+│   ┌──────────┐     ┌──────────┐     ┌──────────┐               │
+│   │ Feedback │ ◄── │   LLM    │ ◄── │ Validate │               │
+│   │   YAML   │     │ Analyze  │     │ & Bench  │               │
+│   └────┬─────┘     └──────────┘     └──────────┘               │
+│        │                                                        │
+│        │  (points to better rules)                              │
+│        ▼                                                        │
+│   ┌──────────┐                                                  │
+│   │  Better  │ ──► Next Iteration                               │
+│   │ Examples │                                                  │
+│   └──────────┘                                                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### The Process
+
+1. **LLM generates rewrite** - Using examples from the prompt (selected via DSB query mapping or FAISS similarity)
+2. **Validate and benchmark** - Test the rewrite for correctness and measure actual speedup
+3. **LLM analyzes result** - The same or another LLM examines why the rewrite succeeded or failed
+4. **Structured feedback** - Analysis is captured in YAML format pointing to better rules
+5. **Improved examples** - Next iteration uses the recommended rules/patterns
+
+### Why LLM as Critic?
+
+The LLM can:
+- Identify which patterns in the query weren't addressed (e.g., non-equi joins)
+- Explain why a transform was ineffective (e.g., "CTEs without MATERIALIZED are inlined")
+- Map query features to specific rules in `ado/examples/`
+- Suggest alternative approaches based on database-specific optimizer behavior
+
+### Feedback YAML Structure
+
+Feedback is stored in `ado/feedback/` with structured fields:
+
+```yaml
+query_id: query072_agg
+rewrite_id: query072_agg_20260206_001
+transform_used: early_filter
+
+validation:
+  syntax_valid: true
+  semantic_valid: true
+  rows_match: true
+
+performance:
+  original_ms: 8180.95
+  optimized_ms: 7498.11
+  speedup: 1.09
+  claimed_speedup: "3x"
+  speedup_accurate: false
+
+diagnosis:
+  bottleneck_identified: false
+  actual_bottleneck: |
+    The real costs are:
+    1. Non-equi join: d3.d_date > d1.d_date + INTERVAL '3 day'
+    2. Date_dim self-join correlation
+    3. Inventory comparison: inv_quantity_on_hand < cs_quantity
+  why_ineffective: |
+    CTEs without MATERIALIZED hint are inlined by PostgreSQL optimizer.
+    The dimension filters are already selective and PostgreSQL pushes them down.
+
+recommendations:
+  - category: technique
+    recommendation: "Use MATERIALIZED hint on CTEs"
+  - category: bottleneck
+    recommendation: "Focus on non-equi joins, not dimension filters"
+
+suggested_transforms:
+  - dsb_non_equi_join_window
+  - cte_optimization_fence_materialized
+  - subquery_offset_zero_barrier
+
+learning_priority: high
+```
+
+### Example: Successful Iteration
+
+**Attempt 1**: early_filter without MATERIALIZED → 1.09x speedup
+- LLM feedback: "CTEs inlined, dimension filters already pushed down"
+- Suggested: `cte_optimization_fence_materialized`, `dsb_non_equi_join_window`
+
+**Attempt 2**: MATERIALIZED CTEs + fact table filter → 2.48x speedup
+- The feedback from Attempt 1 guided the LLM to the correct approach
+
+This demonstrates the feedback loop improving optimization effectiveness from 1.09x to 2.48x on the same query.
+
 ## Three Critical Data Points
 
 ### 1. Speedup (Performance Metric)
