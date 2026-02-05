@@ -106,13 +106,13 @@ class LiveFAISSRecommender:
             with open(metadata_file) as f:
                 self.faiss_metadata = json.load(f)
 
-            # Load vectorizer
+            # Load vectorizer from ado.faiss_builder
             if ASTVectorizer is None:
                 import sys
-                scripts_dir = Path(__file__).parent.parent.parent.parent.parent / "scripts"
-                if str(scripts_dir) not in sys.path:
-                    sys.path.insert(0, str(scripts_dir))
-                from vectorize_queries import ASTVectorizer as ASTVectorizerClass
+                ado_dir = Path(__file__).parent.parent.parent / "ado"
+                if str(ado_dir.parent) not in sys.path:
+                    sys.path.insert(0, str(ado_dir.parent))
+                from ado.faiss_builder import ASTVectorizer as ASTVectorizerClass
                 ASTVectorizer = ASTVectorizerClass
 
             self.vectorizer = ASTVectorizer()
@@ -189,28 +189,55 @@ class LiveFAISSRecommender:
 
         return standardized
 
-    def _normalize_sql(self, sql: str) -> str:
+    def _normalize_sql(self, sql: str, dialect: str = "duckdb") -> str:
         """Normalize SQL for consistent vectorization.
 
-        Applies the same normalization as the training data:
-        - Table/column renaming to generic names
-        - Literal abstraction
-        - Predicate alphabetization
+        Applies Percona-style fingerprinting:
+        - Replace all literals (strings, numbers, dates) with $N placeholders
+        - Normalize identifiers to lowercase
+        - Normalize whitespace
+
+        This ensures structurally similar queries produce similar vectors
+        regardless of specific literal values or identifier casing.
         """
         try:
-            import sys
-            from pathlib import Path
-            scripts_dir = Path(__file__).parent.parent.parent.parent.parent / "scripts"
-            if str(scripts_dir) not in sys.path:
-                sys.path.insert(0, str(scripts_dir))
-            from normalize_sql import SQLNormalizer
+            import re
+            import sqlglot
+            from sqlglot import exp
+            from sqlglot.optimizer import normalize_identifiers
 
-            normalizer = SQLNormalizer()
-            normalized_sql, _ = normalizer.normalize(sql, dialect="duckdb")
-            return normalized_sql
+            # Parse SQL
+            ast = sqlglot.parse_one(sql, dialect=dialect)
+
+            # Replace all literals with placeholders
+            placeholder_counter = [0]  # Use list for mutable closure
+
+            def replace_literals(node):
+                if isinstance(node, exp.Literal):
+                    placeholder_counter[0] += 1
+                    return exp.Placeholder(this=f"${placeholder_counter[0]}")
+                if isinstance(node, exp.Null):
+                    return exp.Placeholder(this="$NULL")
+                return node
+
+            ast = ast.transform(replace_literals)
+
+            # Normalize identifiers to lowercase
+            ast = normalize_identifiers.normalize_identifiers(ast, dialect=dialect)
+
+            # Generate normalized SQL
+            normalized = ast.sql(dialect=dialect)
+
+            # Additional whitespace normalization
+            normalized = re.sub(r'\s+', ' ', normalized).strip()
+
+            return normalized
+
         except Exception as e:
             logger.debug(f"SQL normalization failed, using raw SQL: {e}")
-            return sql
+            # Fallback: basic whitespace normalization
+            import re
+            return re.sub(r'\s+', ' ', sql).strip()
 
     def find_similar_queries(self, sql: str, k: int = 5) -> List[SimilarQuery]:
         """Find similar verified training queries using LIVE FAISS search.
@@ -228,11 +255,9 @@ class LiveFAISSRecommender:
         try:
             import numpy as np
 
-            # Normalize SQL first (same as training data)
-            normalized_sql = self._normalize_sql(sql)
-
-            # LIVE vectorization of normalized SQL
-            query_vector = self.vectorizer.vectorize(normalized_sql, dialect="duckdb")
+            # Vectorize directly - AST features (node counts, depth, patterns)
+            # are structural and don't depend on literal values
+            query_vector = self.vectorizer.vectorize(sql, dialect="duckdb")
             query_vector = query_vector.reshape(1, -1).astype('float32')
 
             # Apply z-score normalization FIRST (same as training data)
