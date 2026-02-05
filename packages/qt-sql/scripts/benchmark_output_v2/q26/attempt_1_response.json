@@ -1,0 +1,42 @@
+Looking at this query, I can see an opportunity for **OR_TO_UNION** transformation since there's an OR condition on promotion columns. The query also has a date filter that can benefit from **DATE_CTE_ISOLATE**.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "or_to_union",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001",
+        "filtered_customer_demographics": "SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'Unknown'",
+        "channel_email_branch": "SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN filtered_customer_demographics ON cs_bill_cdemo_sk = cd_demo_sk JOIN promotion ON cs_promo_sk = p_promo_sk WHERE p_channel_email = 'N'",
+        "channel_event_branch": "SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN filtered_customer_demographics ON cs_bill_cdemo_sk = cd_demo_sk JOIN promotion ON cs_promo_sk = p_promo_sk WHERE p_channel_event = 'N' AND (p_channel_email != 'N' OR p_channel_email IS NULL)",
+        "combined_sales": "SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM channel_email_branch UNION ALL SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM channel_event_branch",
+        "main_query": "SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM combined_sales JOIN item ON cs_item_sk = i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same output columns",
+        "same grouping and aggregation",
+        "same ordering"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Transformed OR condition on promotion columns (p_channel_email = 'N' OR p_channel_event = 'N') into UNION ALL of two mutually exclusive branches. This allows each branch to use potentially different indexes and reduces OR predicate evaluation cost. Added EXCLUSION condition in second branch (p_channel_email != 'N' OR p_channel_email IS NULL) to avoid duplicates from rows where both conditions are true. Extracted date and customer_demographics filters into CTEs for early filtering and reuse across both branches. This reduces the number of rows flowing into the expensive UNION operation and subsequent aggregation."
+}
+```
+
+**Key insights:**
+1. **OR_TO_UNION**: The OR condition on promotion columns (`p_channel_email = 'N' OR p_channel_event = 'N'`) is ideal for decomposition into UNION ALL branches. This allows each branch to potentially use different indexes and avoids the cost of OR predicate evaluation.
+2. **Mutual Exclusion**: Added `AND (p_channel_email != 'N' OR p_channel_email IS NULL)` to the second branch to prevent duplicate rows when both conditions are true (though rare in practice).
+3. **DATE_CTE_ISOLATE**: Extracted date filter into a CTE to scan date_dim once and reuse across both branches.
+4. **Early Filtering**: Also extracted customer_demographics filter into a CTE to reduce rows early in the pipeline.
+5. **Pushdown**: Pushed date and demographic filters down into each branch before the UNION, reducing the volume of data flowing into the aggregation phase.
+
+This rewrite is expected to provide significant speedup because:
+- Eliminates expensive OR predicate evaluation on large result sets
+- Allows parallel execution of independent branches
+- Reduces data volume early through CTE filtering
+- Maintains exact same semantics with proper handling of NULL values

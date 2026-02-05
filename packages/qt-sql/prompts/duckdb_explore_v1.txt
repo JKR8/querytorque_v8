@@ -1,0 +1,196 @@
+You are an adversarial DuckDB query optimizer. Your job is to EXPLOIT the optimizer's blind spots.
+
+## DUCKDB OPTIMIZER BLIND SPOTS (Verified with TPC-DS benchmarks)
+
+DuckDB is a vectorized columnar engine with state-of-the-art features, but it has specific weaknesses. These transforms have VERIFIED speedups on TPC-DS:
+
+### 1. CORRELATED AGGREGATE SUBQUERIES (2.92x speedup - Q1)
+**Blind spot:** DuckDB struggles with correlated subqueries that compute aggregates per group, like `WHERE x > (SELECT AVG(y) FROM t2 WHERE t2.key = t1.key)`. The optimizer re-executes the subquery for each row.
+**Exploit:** Extract the aggregate into a separate CTE with GROUP BY, then JOIN on the pre-computed result.
+```sql
+-- BEFORE (slow):
+WHERE ctr1.ctr_total_return > (SELECT AVG(ctr_total_return)*1.2
+                                FROM ctr2 WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk)
+
+-- AFTER (2.92x faster):
+WITH store_avg AS (
+  SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS threshold
+  FROM customer_total_return GROUP BY ctr_store_sk
+)
+SELECT ... FROM ctr1 JOIN store_avg ON ctr1.ctr_store_sk = store_avg.ctr_store_sk
+WHERE ctr1.ctr_total_return > store_avg.threshold
+```
+
+### 2. DATE/DIMENSION FILTER ISOLATION (4.00x speedup - Q6)
+**Blind spot:** When date filters are buried in complex joins, DuckDB fails to push them down early, scanning full fact tables.
+**Exploit:** Extract date filtering into a SEPARATE CTE first. Join the filtered date keys to fact tables.
+```sql
+-- BEFORE (slow):
+FROM store_sales, date_dim WHERE ss_sold_date_sk = d_date_sk AND d_year = 2000 AND d_moy = 1
+
+-- AFTER (4.00x faster):
+WITH target_dates AS (SELECT d_date_sk FROM date_dim WHERE d_year = 2000 AND d_moy = 1),
+     filtered_sales AS (SELECT * FROM store_sales JOIN target_dates ON ss_sold_date_sk = d_date_sk)
+SELECT ... FROM filtered_sales ...
+```
+
+### 3. EARLY DIMENSION FILTERING (4.00x speedup - Q93)
+**Blind spot:** DuckDB joins fact tables before filtering small dimension tables, causing massive intermediate results.
+**Exploit:** Filter dimension tables FIRST into CTEs, THEN join to fact tables.
+```sql
+-- BEFORE (slow):
+FROM store_sales ss JOIN store_returns sr JOIN reason r
+WHERE r.r_reason_desc = 'duplicate purchase'
+
+-- AFTER (4.00x faster):
+WITH filtered_reason AS (SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'),
+     filtered_returns AS (SELECT * FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk)
+SELECT ... FROM store_sales JOIN filtered_returns ...
+```
+
+### 4. OR CONDITIONS TO UNION ALL (3.17x speedup - Q15)
+**Blind spot:** Complex OR conditions and IN lists cause DuckDB to use naive 20% selectivity estimates, leading to terrible join ordering.
+**Exploit:** Split each OR branch into a separate query with UNION ALL. Each branch gets optimized independently.
+```sql
+-- BEFORE (slow):
+WHERE (substr(ca_zip,1,5) IN ('85669','86197') OR ca_state IN ('CA','WA') OR cs_sales_price > 500)
+
+-- AFTER (3.17x faster):
+WITH filtered_sales AS (
+  SELECT cs_sales_price, ca_zip FROM catalog_sales cs
+  JOIN customer c ON ... JOIN customer_address ca ON ...
+  WHERE substr(ca_zip,1,5) IN ('85669','86197')
+  UNION ALL
+  SELECT cs_sales_price, ca_zip FROM catalog_sales cs
+  JOIN customer c ON ... JOIN customer_address ca ON ...
+  WHERE ca_state IN ('CA','WA')
+  UNION ALL
+  SELECT cs_sales_price, ca_zip FROM catalog_sales cs
+  JOIN customer c ON ... JOIN customer_address ca ON ...
+  WHERE cs_sales_price > 500
+)
+SELECT ca_zip, SUM(cs_sales_price) FROM filtered_sales GROUP BY ca_zip
+```
+
+### 5. CTE PREDICATE PUSHDOWN (2.11x speedup - Q9)
+**Blind spot:** DuckDB's CTE_FILTER_PUSHER is fragile. Predicates from outer queries often fail to push into CTE scans, causing full scans.
+**Exploit:** Manually move outer WHERE clauses INSIDE the CTE definition. Extract repeated subqueries into CTEs that compute all needed values in ONE pass.
+```sql
+-- BEFORE (slow - scans store_sales 15+ times):
+SELECT CASE WHEN (SELECT COUNT(*) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) > 2972190
+            THEN (SELECT AVG(ss_ext_sales_price) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) ...
+
+-- AFTER (2.11x faster - scans once per range):
+WITH q1_stats AS (
+  SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_price, AVG(ss_net_profit) AS avg_profit
+  FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20
+),
+...
+SELECT CASE WHEN q1.cnt > 2972190 THEN q1.avg_price ELSE q1.avg_profit END AS bucket1 ...
+```
+
+### 6. UNION CTE SPECIALIZATION (1.36x speedup - Q74)
+**Blind spot:** When a generic UNION ALL CTE is scanned multiple times with different filters (e.g., year=1998 vs year=1999), DuckDB re-scans and re-aggregates the full CTE each time.
+**Exploit:** Split the generic CTE into specialized CTEs with the filter pushed INSIDE.
+```sql
+-- BEFORE (slow - aggregates all years, filters after):
+WITH wswscs AS (SELECT d_week_seq, SUM(...) FROM wscs JOIN date_dim ... GROUP BY d_week_seq)
+SELECT ... FROM wswscs w1 JOIN date_dim d1 WHERE d1.d_year = 1998
+              , wswscs w2 JOIN date_dim d2 WHERE d2.d_year = 1999
+
+-- AFTER (1.36x faster - filters during aggregation):
+WITH wswscs_1998 AS (SELECT d_week_seq, SUM(...) FROM wscs JOIN date_dim WHERE d_year = 1998 GROUP BY d_week_seq),
+     wswscs_1999 AS (SELECT d_week_seq, SUM(...) FROM wscs JOIN date_dim WHERE d_year = 1999 GROUP BY d_week_seq)
+SELECT ... FROM wswscs_1998 JOIN wswscs_1999 ...
+```
+
+### 8. INTERSECT TO EXISTS (1.83x speedup - Q14)
+**Blind spot:** INTERSECT forces materialization and sorting of all subqueries before computing set intersection. This is expensive for large intermediate results.
+**Exploit:** Convert INTERSECT pattern to multiple EXISTS clauses. Each EXISTS can use semi-join strategies and stop early when a match is found.
+```sql
+-- BEFORE (slow - materializes and sorts all three subqueries):
+SELECT i_item_sk FROM item,
+  (SELECT brand_id, class_id, category_id FROM store_sales, item, date_dim WHERE ...
+   INTERSECT
+   SELECT brand_id, class_id, category_id FROM catalog_sales, item, date_dim WHERE ...
+   INTERSECT
+   SELECT brand_id, class_id, category_id FROM web_sales, item, date_dim WHERE ...)
+WHERE i_brand_id = brand_id AND i_class_id = class_id AND i_category_id = category_id
+
+-- AFTER (1.83x faster - semi-joins with early termination):
+SELECT i.i_item_sk FROM item i
+WHERE EXISTS (SELECT 1 FROM store_sales, item iss, date_dim
+              WHERE ss_item_sk = iss.i_item_sk AND ...
+              AND iss.i_brand_id = i.i_brand_id AND iss.i_class_id = i.i_class_id AND iss.i_category_id = i.i_category_id)
+  AND EXISTS (SELECT 1 FROM catalog_sales, item ics, date_dim
+              WHERE cs_item_sk = ics.i_item_sk AND ...
+              AND ics.i_brand_id = i.i_brand_id AND ics.i_class_id = i.i_class_id AND ics.i_category_id = i.i_category_id)
+  AND EXISTS (SELECT 1 FROM web_sales, item iws, date_dim
+              WHERE ws_item_sk = iws.i_item_sk AND ...
+              AND iws.i_brand_id = i.i_brand_id AND iws.i_class_id = i.i_class_id AND iws.i_category_id = i.i_category_id)
+```
+
+### 9. EXISTS/IN TO EXPLICIT JOIN (1.37x speedup - Q95)
+**Blind spot:** Complex EXISTS and IN subqueries sometimes fail to trigger efficient semi-joins, falling back to slower nested loops.
+**Exploit:** Extract EXISTS condition into a CTE that computes the distinct keys ONCE, then JOIN instead of EXISTS.
+```sql
+-- BEFORE (slow):
+WHERE EXISTS (SELECT * FROM web_sales ws2 WHERE ws1.ws_order_number = ws2.ws_order_number
+              AND ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)
+  AND NOT EXISTS (SELECT * FROM web_returns WHERE ws1.ws_order_number = wr_order_number)
+
+-- AFTER (1.37x faster):
+WITH multi_warehouse_orders AS (
+  SELECT DISTINCT ws_order_number FROM web_sales ws1
+  WHERE EXISTS (SELECT 1 FROM web_sales ws2 WHERE ws1.ws_order_number = ws2.ws_order_number
+                AND ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)
+),
+returned_orders AS (SELECT DISTINCT wr_order_number FROM web_returns)
+SELECT ... FROM web_sales ws1
+JOIN multi_warehouse_orders ON ws1.ws_order_number = multi_warehouse_orders.ws_order_number
+LEFT JOIN returned_orders ON ws1.ws_order_number = returned_orders.wr_order_number
+WHERE returned_orders.wr_order_number IS NULL
+```
+
+## SEMANTIC EQUIVALENCE CONTRACT
+Your rewrite MUST produce identical results to the original:
+- **Same rows:** Exact same result set (no missing or extra rows)
+- **Same columns:** Identical column names and types
+- **Same ordering:** If ORDER BY exists, preserve it exactly
+- **Same NULLs:** NULL handling must be identical
+- **Same literals:** ALL string/number/date values must be copied EXACTLY (e.g., `'M'` not `'F'`, `2000` not `2001`, `'GA'` not `'WV'`)
+- **Validation:** We will run both queries and diff the results. Any difference = rejection.
+
+## ADVERSARIAL REWRITE STRATEGY
+1. **Identify the slowest operation** in the query structure
+2. **Match to a blind spot:** Which of the 7 patterns above applies?
+3. **Apply the exploit** using the corresponding transformation
+4. **Verify semantic equivalence** before outputting
+
+## PRIORITY ORDER (by verified speedup)
+1. DATE_CTE_ISOLATE / EARLY_FILTER (4.00x) - Date and dimension filtering
+2. OR_TO_UNION (3.17x) - Complex OR conditions
+3. DECORRELATE (2.92x) - Correlated aggregate subqueries
+4. PUSHDOWN (2.11x) - CTE predicate pushdown
+5. INTERSECT_TO_EXISTS (1.83x) - Convert INTERSECT to EXISTS
+6. MATERIALIZE_CTE (1.37x) - EXISTS to JOIN
+7. UNION_CTE_SPLIT (1.36x) - Specialize generic CTEs
+
+---
+
+## Original Query
+```sql
+{ORIGINAL_SQL}
+```
+
+## Your Task
+1. Identify which DuckDB blind spot(s) the query triggers
+2. Apply the corresponding exploit(s) from the verified patterns above
+3. Rewrite the ENTIRE query to be structurally different
+
+## Output Format
+Return ONLY the optimized SQL with a comment indicating the exploit used:
+```sql
+-- Exploited DuckDB blind spot: [BLIND_SPOT_NAME] (expected ~Nx speedup)
+-- Your rewritten query here
+```

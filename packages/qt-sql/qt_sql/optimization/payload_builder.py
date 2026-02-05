@@ -499,6 +499,7 @@ def _build_constraints_section(constraints: dict) -> dict:
     # Note: CTE usage omitted - DuckDB materializes CTEs by default which can hurt performance
 
     forbidden_transforms = [
+        "change_literal_values",            # CRITICAL: Do NOT change ANY string/number/date literals
         "remove_or_weaken_filters",
         "add_row_count_limit",              # No LIMIT/TOP/QUALIFY unless in original
         "change_join_types",                # No INNER<->LEFT conversion

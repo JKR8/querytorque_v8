@@ -1,0 +1,46 @@
+Looking at this query, I can see several optimization opportunities. The main issues are:
+1. Multiple scans of the same tables with similar filters
+2. Predicates can be pushed down earlier
+3. Date filtering can be isolated into a CTE
+4. The inventory table is being scanned multiple times in the plan
+
+Here's my optimized version:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1999-07-09' AS DATE) AND (CAST('1999-07-09' AS DATE) + INTERVAL '60' DAY)",
+        "filtered_items": "SELECT i_item_sk, i_item_id, i_item_desc, i_current_price FROM item WHERE i_current_price BETWEEN 17 AND 47 AND i_manufact_id IN (639, 169, 138, 339)",
+        "inventory_with_dates": "SELECT inv_item_sk FROM inventory JOIN filtered_dates ON inv_date_sk = d_date_sk WHERE inv_quantity_on_hand BETWEEN 100 AND 500",
+        "main_query": "SELECT fi.i_item_id, fi.i_item_desc, fi.i_current_price FROM filtered_items fi JOIN inventory_with_dates inv ON fi.i_item_sk = inv.inv_item_sk JOIN store_sales ss ON fi.i_item_sk = ss.ss_item_sk GROUP BY fi.i_item_id, fi.i_item_desc, fi.i_current_price ORDER BY fi.i_item_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping"
+      ],
+      "expected_speedup": "3.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Extracted date_dim filter into CTE to reduce date_dim scan from 73K rows to 61 rows early. Pushed item filters (price range and manufacturer) into CTE to reduce item scan from 408K to ~7K rows. Created filtered inventory CTE that joins with filtered dates early, reducing inventory scan from 47M to ~46K rows. The main query now only needs to join the pre-filtered sets, eliminating redundant scans and allowing better join ordering."
+}
+```
+
+**Key optimizations:**
+1. **Date CTE Isolation**: Extracted the date range filter into a separate CTE that reduces date_dim from 73,049 rows to just 61 rows early
+2. **Early Filter Pushdown**: Pushed item price and manufacturer filters into a CTE, reducing item table from 408,000 to ~6,913 rows
+3. **Inventory Pre-filtering**: Created inventory_with_dates CTE that applies both date and quantity filters early, reducing inventory from 47M to 46,267 rows
+4. **Eliminated Redundant Scans**: The original plan showed multiple scans of inventory table - this rewrite ensures each table is scanned only once with appropriate filters applied early
+
+**Why this works:**
+- The date filter is highly selective (61 out of 73,049 rows)
+- The item filters are moderately selective (6,913 out of 408,000 rows)
+- The inventory filter with dates is very selective (46,267 out of 47M rows)
+- By filtering these tables early in CTEs, we dramatically reduce the data volume for the final joins
+- The store_sales table doesn't have direct filters, but it only needs to join with the already-filtered items, reducing the join cost significantly

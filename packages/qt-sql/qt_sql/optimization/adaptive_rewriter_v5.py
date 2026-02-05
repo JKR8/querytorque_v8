@@ -373,6 +373,65 @@ def _worker_json(
     )
 
 
+def _is_postgres_dsn(dsn: str) -> bool:
+    """Check if DSN is for PostgreSQL."""
+    dsn_lower = dsn.lower()
+    return dsn_lower.startswith("postgres://") or dsn_lower.startswith("postgresql://")
+
+
+def _load_prompt_template(template_name: str) -> str:
+    """Load a prompt template from the prompts/v5 directory."""
+    from pathlib import Path
+    template_path = Path(__file__).parent / "prompts" / "v5" / template_name
+    if template_path.exists():
+        return template_path.read_text()
+    return ""
+
+
+def _build_postgres_prompt(sql: str, sample_db: str, full_explain_plan: str) -> str:
+    """Build PostgreSQL-specific prompt with full context.
+
+    Uses pg_context_builder to extract schema, stats, and settings
+    for only the tables referenced in the query.
+    """
+    from qt_sql.execution.factory import create_executor_from_dsn
+    from qt_sql.optimization.pg_context_builder import build_pg_optimization_context
+
+    # Load template
+    template = _load_prompt_template("explore_full_sql_postgres.txt")
+    if not template:
+        logger.warning("PostgreSQL prompt template not found, using generic")
+        return ""
+
+    # Build context using executor
+    try:
+        executor = create_executor_from_dsn(sample_db)
+        executor.connect()
+
+        context = build_pg_optimization_context(
+            executor=executor,
+            sql=sql,
+            explain_output=full_explain_plan,
+        )
+
+        executor.close()
+
+        # Fill template placeholders
+        prompt = template.format(
+            postgres_version=context["postgres_version"],
+            postgres_settings=context["postgres_settings"],
+            schema_ddl=context["schema_ddl"],
+            table_statistics=context["table_statistics"],
+            original_query=context["original_query"],
+            explain_analyze_output=context["explain_analyze_output"],
+        )
+        return prompt
+
+    except Exception as e:
+        logger.warning(f"Failed to build PostgreSQL context: {e}")
+        return ""
+
+
 def _worker_full_sql(
     worker_id: int,
     sql: str,
@@ -388,11 +447,18 @@ def _worker_full_sql(
     - Gets full EXPLAIN plan (not summary)
     - Is instructed to be adversarial/creative
     - Outputs full SQL directly (not JSON)
+    - Uses PostgreSQL-specific prompt with schema/stats when available
     """
     llm_client = _create_llm_client(provider, model)
 
-    # Build prompt for full SQL output
-    prompt = f"""You are a SQL optimizer. Rewrite the ENTIRE query for maximum performance.
+    # Try PostgreSQL-specific prompt if database is PostgreSQL
+    prompt = ""
+    if _is_postgres_dsn(sample_db):
+        prompt = _build_postgres_prompt(sql, sample_db, full_explain_plan)
+
+    # Fall back to generic prompt if PostgreSQL prompt failed or not applicable
+    if not prompt:
+        prompt = f"""You are a SQL optimizer. Rewrite the ENTIRE query for maximum performance.
 
 ## Adversarial Explore Mode
 Be creative and aggressive. Try radical structural rewrites that the database

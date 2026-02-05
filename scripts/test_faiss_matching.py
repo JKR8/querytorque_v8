@@ -19,8 +19,8 @@ from qt_sql.optimization.query_recommender import get_recommendations_for_sql, g
 # Query files
 QUERY_DIR = BASE / "packages" / "qt-sql" / "tests" / "fixtures" / "tpcds"
 
-# The 7 gold queries
-GOLD_QUERIES = {"q1", "q6", "q9", "q15", "q74", "q93", "q95"}
+# The 8 gold queries
+GOLD_QUERIES = {"q1", "q6", "q9", "q14", "q15", "q74", "q93", "q95"}
 
 
 def test_faiss_matching():

@@ -476,3 +476,172 @@ class PostgresExecutor:
                     )
 
         return stats
+
+    def get_version(self) -> str:
+        """Get PostgreSQL version string.
+
+        Returns:
+            PostgreSQL version (e.g., "PostgreSQL 15.4 on x86_64-pc-linux-gnu")
+        """
+        try:
+            result = self.execute("SELECT version()")
+            return result[0]["version"] if result else "Unknown"
+        except Exception:
+            return "Unknown"
+
+    def get_settings(self) -> dict[str, str]:
+        """Get optimization-relevant PostgreSQL settings.
+
+        Returns:
+            Dictionary of setting names to formatted values (e.g., {"work_mem": "256MB"})
+        """
+        sql = """
+        SELECT name, setting, unit
+        FROM pg_settings
+        WHERE name IN (
+            'work_mem', 'shared_buffers', 'effective_cache_size',
+            'random_page_cost', 'seq_page_cost',
+            'join_collapse_limit', 'from_collapse_limit',
+            'geqo_threshold', 'default_statistics_target',
+            'max_parallel_workers_per_gather', 'jit'
+        )
+        ORDER BY name
+        """
+        try:
+            result = self.execute(sql)
+            settings = {}
+            for r in result:
+                name = r["name"]
+                setting = r["setting"]
+                unit = r.get("unit") or ""
+                # Format setting with unit (e.g., "256" + "MB" -> "256MB")
+                if unit:
+                    settings[name] = f"{setting}{unit}"
+                else:
+                    settings[name] = setting
+            return settings
+        except Exception:
+            return {}
+
+    def get_pg_column_stats(self, table_name: str) -> list[dict[str, Any]]:
+        """Get column statistics from pg_stats for a table.
+
+        Returns richer statistics than get_column_stats() including
+        ndistinct, null_frac, most_common_vals, and correlation.
+
+        Args:
+            table_name: Name of the table.
+
+        Returns:
+            List of dicts with column statistics from pg_stats.
+        """
+        sql = """
+        SELECT
+            attname as column_name,
+            n_distinct as ndistinct,
+            null_frac,
+            CASE
+                WHEN most_common_vals IS NOT NULL
+                THEN most_common_vals::text
+                ELSE NULL
+            END as most_common_vals,
+            correlation
+        FROM pg_stats
+        WHERE schemaname = %s AND tablename = %s
+        ORDER BY attname
+        """
+        try:
+            result = self.execute(sql, (self.schema, table_name))
+            return result
+        except Exception:
+            return []
+
+    def get_table_ddl(self, table_name: str) -> str:
+        """Generate CREATE TABLE DDL for a table.
+
+        Args:
+            table_name: Name of the table.
+
+        Returns:
+            CREATE TABLE statement with columns, constraints, and indexes.
+        """
+        lines = []
+
+        # Get columns
+        col_sql = """
+        SELECT
+            column_name,
+            data_type,
+            character_maximum_length,
+            numeric_precision,
+            numeric_scale,
+            is_nullable,
+            column_default
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+        ORDER BY ordinal_position
+        """
+        try:
+            columns = self.execute(col_sql, (self.schema, table_name))
+        except Exception:
+            return f"-- Could not generate DDL for {table_name}"
+
+        if not columns:
+            return f"-- Table {table_name} not found"
+
+        col_defs = []
+        for col in columns:
+            col_name = col["column_name"]
+            data_type = col["data_type"].upper()
+
+            # Format type with precision
+            if col.get("character_maximum_length"):
+                data_type = f"{data_type}({col['character_maximum_length']})"
+            elif col.get("numeric_precision") and col.get("numeric_scale"):
+                data_type = f"{data_type}({col['numeric_precision']},{col['numeric_scale']})"
+
+            nullable = "" if col["is_nullable"] == "YES" else " NOT NULL"
+            default = f" DEFAULT {col['column_default']}" if col.get("column_default") else ""
+
+            col_defs.append(f"    {col_name} {data_type}{nullable}{default}")
+
+        # Get primary key
+        pk_sql = """
+        SELECT kcu.column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'PRIMARY KEY'
+          AND tc.table_schema = %s
+          AND tc.table_name = %s
+        ORDER BY kcu.ordinal_position
+        """
+        try:
+            pk_cols = self.execute(pk_sql, (self.schema, table_name))
+            if pk_cols:
+                pk_columns = ", ".join(c["column_name"] for c in pk_cols)
+                col_defs.append(f"    PRIMARY KEY ({pk_columns})")
+        except Exception:
+            pass
+
+        lines.append(f"CREATE TABLE {table_name} (")
+        lines.append(",\n".join(col_defs))
+        lines.append(");")
+
+        # Get indexes
+        idx_sql = """
+        SELECT indexname, indexdef
+        FROM pg_indexes
+        WHERE schemaname = %s AND tablename = %s
+          AND indexname NOT LIKE '%_pkey'
+        ORDER BY indexname
+        """
+        try:
+            indexes = self.execute(idx_sql, (self.schema, table_name))
+            for idx in indexes:
+                lines.append(idx["indexdef"] + ";")
+        except Exception:
+            pass
+
+        return "\n".join(lines)

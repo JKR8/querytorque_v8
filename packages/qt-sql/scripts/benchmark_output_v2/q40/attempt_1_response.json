@@ -1,0 +1,59 @@
+Looking at this query, I can identify several optimization opportunities:
+
+1. **Date CTE Isolation**: The date filter on `date_dim` is used to filter `catalog_sales`. We can extract this into a CTE.
+2. **Filter Pushdown**: The `item` table has a price filter that can be applied early.
+3. **Redundant Casts**: The date casts and interval calculations are repeated.
+4. **Left Join Optimization**: The LEFT OUTER JOIN with `catalog_returns` might be optimized by pushing filters into it.
+
+Here's my rewrite:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN (CAST('2001-04-02' AS DATE) - INTERVAL '30' DAY) AND (CAST('2001-04-02' AS DATE) + INTERVAL '30' DAY)",
+        "filtered_items": "SELECT i_item_sk, i_item_id FROM item WHERE i_current_price BETWEEN 0.99 AND 1.49",
+        "filtered_sales": "SELECT cs_sales_price, cs_order_number, cs_item_sk, cs_warehouse_sk FROM catalog_sales WHERE cs_sold_date_sk IN (SELECT d_date_sk FROM filtered_dates) AND cs_item_sk IN (SELECT i_item_sk FROM filtered_items)",
+        "main_query": "SELECT w_state, fi.i_item_id, SUM(CASE WHEN (fd.d_date < CAST('2001-04-02' AS DATE)) THEN cs_sales_price - COALESCE(cr_refunded_cash, 0) ELSE 0 END) AS sales_before, SUM(CASE WHEN (fd.d_date >= CAST('2001-04-02' AS DATE)) THEN cs_sales_price - COALESCE(cr_refunded_cash, 0) ELSE 0 END) AS sales_after FROM filtered_sales cs JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_items fi ON cs.cs_item_sk = fi.i_item_sk JOIN warehouse w ON cs.cs_warehouse_sk = w_warehouse_sk LEFT OUTER JOIN catalog_returns cr ON (cs.cs_order_number = cr.cr_order_number AND cs.cs_item_sk = cr.cr_item_sk) GROUP BY w_state, fi.i_item_id ORDER BY w_state, fi.i_item_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "semantic_rewrite",
+      "nodes": {
+        "date_const": "WITH date_const AS (SELECT CAST('2001-04-02' AS DATE) AS cutoff_date, CAST('2001-04-02' AS DATE) - INTERVAL '30' DAY AS start_date, CAST('2001-04-02' AS DATE) + INTERVAL '30' DAY AS end_date)",
+        "filtered_dates": "SELECT d_date_sk, d_date FROM date_dim, date_const WHERE d_date BETWEEN start_date AND end_date",
+        "filtered_items": "SELECT i_item_sk, i_item_id FROM item WHERE i_current_price BETWEEN 0.99 AND 1.49",
+        "main_query": "SELECT w_state, fi.i_item_id, SUM(CASE WHEN (fd.d_date < dc.cutoff_date) THEN cs_sales_price - COALESCE(cr_refunded_cash, 0) ELSE 0 END) AS sales_before, SUM(CASE WHEN (fd.d_date >= dc.cutoff_date) THEN cs_sales_price - COALESCE(cr_refunded_cash, 0) ELSE 0 END) AS sales_after FROM catalog_sales cs, date_const dc JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_items fi ON cs.cs_item_sk = fi.i_item_sk JOIN warehouse w ON cs.cs_warehouse_sk = w_warehouse_sk LEFT OUTER JOIN catalog_returns cr ON (cs.cs_order_number = cr.cr_order_number AND cs.cs_item_sk = cr.cr_item_sk) WHERE fd.d_date BETWEEN dc.start_date AND dc.end_date GROUP BY w_state, fi.i_item_id ORDER BY w_state, fi.i_item_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "1.1x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "First, extracted date_dim filter into CTE to reduce join size early. Second, extracted item price filter into CTE to reduce catalog_sales join early. The filtered_sales CTE reduces the main fact table significantly before expensive joins. The semantic rewrite removes redundant date calculations by computing them once in a CTE."
+}
+```
+
+**Key insights:**
+1. The date filter reduces `date_dim` from 73,049 rows to ~61 rows, so creating a CTE for filtered dates isolates this early
+2. The item price filter reduces `item` from 408,000 rows to 12,855 rows
+3. By pushing both filters into CTEs and applying them to `catalog_sales` early, we reduce the 17M row table before expensive joins
+4. The LEFT JOIN with `catalog_returns` is preserved but operates on a much smaller intermediate result
+5. The date calculations (cast and intervals) are computed once in the semantic rewrite version

@@ -26,15 +26,16 @@ faiss = None
 ASTVectorizer = None
 
 
-# The 7 verified transforms with proven TPC-DS speedups
+# The 8 verified transforms with proven TPC-DS speedups
 VERIFIED_TRANSFORMS = frozenset([
-    "decorrelate",      # 2.92x Q1
-    "or_to_union",      # 3.17x Q15
-    "early_filter",     # 4.00x Q93
-    "pushdown",         # 2.11x Q9
-    "date_cte_isolate", # 4.00x Q6
-    "union_cte_split",  # 1.36x Q74
-    "materialize_cte",  # 1.37x Q95
+    "decorrelate",         # 2.92x Q1
+    "or_to_union",         # 3.17x Q15
+    "early_filter",        # 4.00x Q93
+    "pushdown",            # 2.11x Q9
+    "date_cte_isolate",    # 4.00x Q6
+    "intersect_to_exists", # 1.83x Q14
+    "union_cte_split",     # 1.36x Q74
+    "materialize_cte",     # 1.37x Q95
 ])
 
 

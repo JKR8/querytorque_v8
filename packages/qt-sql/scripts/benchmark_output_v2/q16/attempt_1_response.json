@@ -1,0 +1,41 @@
+Looking at this query, I can see several optimization opportunities:
+
+1. **Date CTE Isolation**: The date range filter on `date_dim` can be isolated into a CTE
+2. **Flattening correlated subqueries**: The `EXISTS` and `NOT EXISTS` subqueries can be flattened into CTEs
+3. **Early filtering**: Apply filters early to reduce data volume
+4. **OR to UNION** pattern doesn't apply here since there are no OR predicates
+
+The main issues are:
+- Two correlated subqueries scanning `catalog_sales` and `catalog_returns` repeatedly
+- No early filtering on date range
+- Multiple sequential scans on large tables
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "semantic_rewrite",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '2002-4-01' AND (CAST('2002-4-01' AS DATE) + INTERVAL '60' DAY)",
+        "filtered_call_center": "SELECT cc_call_center_sk FROM call_center WHERE cc_county IN ('Ziebach County', 'Luce County', 'Richland County', 'Daviess County', 'Barrow County')",
+        "filtered_customer_address": "SELECT ca_address_sk FROM customer_address WHERE ca_state = 'WV'",
+        "multi_warehouse_orders": "SELECT cs_order_number FROM catalog_sales GROUP BY cs_order_number HAVING COUNT(DISTINCT cs_warehouse_sk) > 1",
+        "returned_orders": "SELECT DISTINCT cr_order_number FROM catalog_returns",
+        "filtered_catalog_sales": "SELECT cs_order_number, cs_ext_ship_cost, cs_net_profit FROM catalog_sales cs WHERE cs.cs_ship_date_sk IN (SELECT d_date_sk FROM filtered_dates) AND cs.cs_ship_addr_sk IN (SELECT ca_address_sk FROM filtered_customer_address) AND cs.cs_call_center_sk IN (SELECT cc_call_center_sk FROM filtered_call_center)",
+        "main_query": "SELECT COUNT(DISTINCT fcs.cs_order_number) AS \"order count\", SUM(fcs.cs_ext_ship_cost) AS \"total shipping cost\", SUM(fcs.cs_net_profit) AS \"total net profit\" FROM filtered_catalog_sales fcs JOIN multi_warehouse_orders mwo ON fcs.cs_order_number = mwo.cs_order_number WHERE NOT EXISTS (SELECT 1 FROM returned_orders ro WHERE fcs.cs_order_number = ro.cr_order_number) ORDER BY COUNT(DISTINCT fcs.cs_order_number) LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same output columns",
+        "same aggregation logic",
+        "same ordering",
+        "same EXISTS/NOT EXISTS semantics"
+      ],
+      "expected_speedup": "3.5x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Isolated date filter into CTE to reduce join size early. Created CTEs for filtered dimensions (call_center, customer_address) to apply filters before joining. Flattened EXISTS subquery into multi_warehouse_orders CTE that computes order numbers with multiple warehouses in a single scan. Created returned_orders CTE to avoid repeated scans of catalog_returns. This reduces multiple sequential scans of large fact tables and applies filters earlier in the execution pipeline."
+}
+```

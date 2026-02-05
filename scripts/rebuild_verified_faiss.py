@@ -37,7 +37,7 @@ if not (hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base
 
 BASE = Path(__file__).parent.parent
 
-# The 7 verified training queries with their transforms and speedups
+# The 8 verified training queries with their transforms and speedups
 VERIFIED_TRAINING_DATA = {
     "q1": {
         "transform": "decorrelate",
@@ -53,6 +53,11 @@ VERIFIED_TRAINING_DATA = {
         "transform": "pushdown",
         "speedup": 2.11,
         "description": "Push predicates into CTEs/subqueries",
+    },
+    "q14": {
+        "transform": "intersect_to_exists",
+        "speedup": 1.83,
+        "description": "Convert INTERSECT to multiple EXISTS for better join planning",
     },
     "q15": {
         "transform": "or_to_union",
@@ -193,7 +198,7 @@ def rebuild_faiss_index(use_normalized: bool = True):
     vectorizer = ASTVectorizer()
 
     print("=" * 60)
-    print("Rebuilding FAISS index with 7 verified training queries")
+    print("Rebuilding FAISS index with 8 verified training queries")
     print(f"Using: {'NORMALIZED' if use_normalized else 'RAW'} SQL")
     print("=" * 60)
 
@@ -234,8 +239,8 @@ def rebuild_faiss_index(use_normalized: bool = True):
         print(f"  Vector shape: {vector.shape}")
         print(f"  Non-zero features: {np.count_nonzero(vector)}/{len(vector)}")
 
-    if len(vectors) != 7:
-        print(f"\nWARNING: Expected 7 queries, got {len(vectors)}")
+    if len(vectors) != 8:
+        print(f"\nWARNING: Expected 8 queries, got {len(vectors)}")
 
     # Stack vectors into matrix
     vectors_array = np.vstack(vectors).astype('float32')
@@ -276,7 +281,7 @@ def rebuild_faiss_index(use_normalized: bool = True):
     full_metadata = {
         "query_metadata": query_metadata,
         "index_stats": {
-            "total_vectors": 7,
+            "total_vectors": 8,
             "dimensions": dimension,
             "index_type": "IndexFlatL2 (cosine similarity via normalization)",
             "normalized_sql": use_normalized,
@@ -311,8 +316,8 @@ def rebuild_faiss_index(use_normalized: bool = True):
         print(f"  {query_id} -> {', '.join(top_matches)}")
 
     print(f"\n{'=' * 60}")
-    print("Done! The FAISS index now contains ONLY the 7 verified queries.")
-    print("Any input query will be compared against these 7 training examples.")
+    print("Done! The FAISS index now contains ONLY the 8 verified queries.")
+    print("Any input query will be compared against these 8 training examples.")
     print("=" * 60)
 
 

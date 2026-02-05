@@ -1,0 +1,57 @@
+Looking at the query, I can see several optimization opportunities:
+
+1. **OR condition** on `household_demographics` (hd_dep_count = 6 OR hd_vehicle_count = 0)
+2. **Date filter isolation** with date_dim joined via d_date_sk
+3. **Store filter** on s_city that can be pushed down
+4. **Complex correlated subquery** structure that can be flattened
+
+The biggest opportunity is the OR condition on household_demographics which can be transformed into a UNION ALL pattern. I'll also isolate the date filter and store filter into CTEs.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "or_to_union",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_dow IN (6, 0) AND d_year IN (1999, 2000, 2001)",
+        "filtered_stores": "SELECT s_store_sk FROM store WHERE s_city IN ('Five Points', 'Centerville', 'Oak Grove', 'Fairview', 'Liberty')",
+        "sales_branch1": "SELECT ss_ticket_number, ss_customer_sk, ss_addr_sk, ss_coupon_amt, ss_net_profit FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN filtered_stores ON ss_store_sk = s_store_sk JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk WHERE hd_dep_count = 6",
+        "sales_branch2": "SELECT ss_ticket_number, ss_customer_sk, ss_addr_sk, ss_coupon_amt, ss_net_profit FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN filtered_stores ON ss_store_sk = s_store_sk JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk WHERE hd_vehicle_count = 0",
+        "combined_sales": "SELECT ss_ticket_number, ss_customer_sk, ss_addr_sk, ss_coupon_amt, ss_net_profit FROM sales_branch1 UNION ALL SELECT ss_ticket_number, ss_customer_sk, ss_addr_sk, ss_coupon_amt, ss_net_profit FROM sales_branch2",
+        "dn": "SELECT ss_ticket_number, ss_customer_sk, ca_city AS bought_city, SUM(ss_coupon_amt) AS amt, SUM(ss_net_profit) AS profit FROM combined_sales JOIN customer_address ON ss_addr_sk = ca_address_sk GROUP BY ss_ticket_number, ss_customer_sk, ss_addr_sk, ca_city",
+        "main_query": "SELECT c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, amt, profit FROM dn JOIN customer ON ss_customer_sk = c_customer_sk JOIN customer_address AS current_addr ON customer.c_current_addr_sk = current_addr.ca_address_sk WHERE current_addr.ca_city <> bought_city ORDER BY c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "early_filter",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_dow IN (6, 0) AND d_year IN (1999, 2000, 2001)",
+        "filtered_stores": "SELECT s_store_sk FROM store WHERE s_city IN ('Five Points', 'Centerville', 'Oak Grove', 'Fairview', 'Liberty')",
+        "filtered_hd": "SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 6 OR hd_vehicle_count = 0",
+        "filtered_sales": "SELECT ss_ticket_number, ss_customer_sk, ss_addr_sk, ss_coupon_amt, ss_net_profit FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN filtered_stores ON ss_store_sk = s_store_sk JOIN filtered_hd ON ss_hdemo_sk = hd_demo_sk",
+        "dn": "SELECT ss_ticket_number, ss_customer_sk, ca_city AS bought_city, SUM(ss_coupon_amt) AS amt, SUM(ss_net_profit) AS profit FROM filtered_sales JOIN customer_address ON ss_addr_sk = ca_address_sk GROUP BY ss_ticket_number, ss_customer_sk, ss_addr_sk, ca_city",
+        "main_query": "SELECT c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, amt, profit FROM dn JOIN customer ON ss_customer_sk = c_customer_sk JOIN customer_address AS current_addr ON customer.c_current_addr_sk = current_addr.ca_address_sk WHERE current_addr.ca_city <> bought_city ORDER BY c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "1.8x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Applied two complementary rewrites: (1) OR_TO_UNION splits the household_demographics OR condition into two branches with UNION ALL, allowing focused predicate evaluation and potentially better index usage. Each branch scans date_dim and store once. (2) EARLY_FILTER creates filtered CTEs for date_dim, store, and household_demographics to push filters early into the join sequence. Both approaches isolate the date and store filters into reusable CTEs, reducing the cardinality before the expensive store_sales scan."
+}
+```

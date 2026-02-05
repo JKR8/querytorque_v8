@@ -2,6 +2,7 @@
 DAG V3 - File-based gold examples with KB pattern matching.
 
 Loads examples from qt_sql/optimization/examples/*.json
+Loads constraints from qt_sql/optimization/constraints/*.json
 Rotates examples on failure based on KB pattern detection.
 """
 
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Examples directory
 EXAMPLES_DIR = Path(__file__).parent / "examples"
+CONSTRAINTS_DIR = Path(__file__).parent / "constraints"
 
 
 @dataclass
@@ -27,6 +29,77 @@ class GoldExample:
     verified_speedup: str
     example: dict  # Contains opportunity, input_slice, output, key_insight
     example_class: str = "standard"
+
+
+@dataclass
+class Constraint:
+    """A constraint learned from benchmark failures."""
+    id: str
+    severity: str  # CRITICAL, HIGH, MEDIUM
+    description: str
+    prompt_instruction: str  # The actual text to inject into prompts
+    observed_failures: List[dict] = None
+    constraint_rules: List[dict] = None
+
+
+def load_constraint(constraint_id: str) -> Optional[Constraint]:
+    """Load a single constraint by ID."""
+    path = CONSTRAINTS_DIR / f"{constraint_id}.json"
+    if not path.exists():
+        logger.warning(f"Constraint file not found: {path}")
+        return None
+
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return Constraint(
+            id=data["id"],
+            severity=data.get("severity", "MEDIUM"),
+            description=data.get("description", ""),
+            prompt_instruction=data.get("prompt_instruction", ""),
+            observed_failures=data.get("observed_failures", []),
+            constraint_rules=data.get("constraint_rules", []),
+        )
+    except Exception as e:
+        logger.error(f"Failed to load constraint {constraint_id}: {e}")
+        return None
+
+
+def load_all_constraints() -> List[Constraint]:
+    """Load all constraints from the constraints directory."""
+    constraints = []
+    if not CONSTRAINTS_DIR.exists():
+        logger.warning(f"Constraints directory not found: {CONSTRAINTS_DIR}")
+        return constraints
+
+    for path in CONSTRAINTS_DIR.glob("*.json"):
+        constraint = load_constraint(path.stem)
+        if constraint and constraint.prompt_instruction:
+            constraints.append(constraint)
+
+    # Sort by severity: CRITICAL first, then HIGH, then others
+    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    constraints.sort(key=lambda c: severity_order.get(c.severity, 99))
+
+    logger.info(f"Loaded {len(constraints)} constraints: {[c.id for c in constraints]}")
+    return constraints
+
+
+def format_constraints_for_prompt(constraints: List[Constraint]) -> str:
+    """Format constraints for inclusion in the prompt."""
+    if not constraints:
+        return ""
+
+    lines = ["## CONSTRAINTS (Learned from Benchmark Failures)\n"]
+    lines.append("The following constraints are MANDATORY based on observed failures:\n")
+
+    for c in constraints:
+        severity_emoji = {"CRITICAL": "🚨", "HIGH": "⚠️"}.get(c.severity, "ℹ️")
+        lines.append(f"### {severity_emoji} {c.id} ({c.severity})")
+        lines.append(c.prompt_instruction)
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def load_example(example_id: str) -> Optional[GoldExample]:
@@ -76,16 +149,17 @@ def get_example_ids() -> List[str]:
 
 
 # KB pattern ID -> example ID mapping
-# VERIFIED TRANSFORMS ONLY - 7 patterns with proven TPC-DS speedups
+# VERIFIED TRANSFORMS ONLY - 8 patterns with proven TPC-DS speedups
 KB_TO_EXAMPLE = {
-    # VERIFIED: 7 transforms with proven speedups
-    "or_to_union": "or_to_union",           # 3.17x Q15 - Split OR to UNION ALL
-    "correlated_to_cte": "decorrelate",     # 2.92x Q1 - Decorrelate subquery
-    "consolidate_scans": "early_filter",    # 4.00x Q93 - Early dimension filter
-    "push_pred": "pushdown",                # 2.11x Q9 - Push predicates into CTEs
-    "date_cte_isolate": "date_cte_isolate", # 4.00x Q6 - Date CTE isolation
-    "union_cte_split": "union_cte_split",   # 1.36x Q74 - Year-specialized CTEs
-    "materialize_cte": "materialize_cte",   # 1.37x Q95 - Materialize repeated subquery
+    # VERIFIED: 8 transforms with proven speedups
+    "or_to_union": "or_to_union",               # 3.17x Q15 - Split OR to UNION ALL
+    "correlated_to_cte": "decorrelate",         # 2.92x Q1 - Decorrelate subquery
+    "consolidate_scans": "early_filter",        # 4.00x Q93 - Early dimension filter
+    "push_pred": "pushdown",                    # 2.11x Q9 - Push predicates into CTEs
+    "date_cte_isolate": "date_cte_isolate",     # 4.00x Q6 - Date CTE isolation
+    "intersect_to_exists": "intersect_to_exists", # 1.83x Q14 - INTERSECT to EXISTS
+    "union_cte_split": "union_cte_split",       # 1.36x Q74 - Year-specialized CTEs
+    "materialize_cte": "materialize_cte",       # 1.37x Q95 - Materialize repeated subquery
 }
 
 # Unverified patterns - detected by AST but no verified example
@@ -177,20 +251,30 @@ def build_prompt_with_examples(
     base_prompt: str,
     examples: List[GoldExample],
     execution_plan: str = "",
-    history_section: str = ""
+    history_section: str = "",
+    include_constraints: bool = True
 ) -> str:
-    """Build full prompt with multiple gold examples.
+    """Build full prompt with multiple gold examples and constraints.
 
     Args:
         base_prompt: The DAG structure prompt
         examples: The gold examples to include
         execution_plan: Optional execution plan
         history_section: Optional history of previous attempts
+        include_constraints: Whether to include learned constraints (default True)
 
     Returns:
         Complete prompt string
     """
     parts = []
+
+    # CONSTRAINTS FIRST - these are mandatory rules learned from failures
+    if include_constraints:
+        constraints = load_all_constraints()
+        constraints_section = format_constraints_for_prompt(constraints)
+        if constraints_section:
+            parts.append(constraints_section)
+            parts.append("\n---\n")
 
     # Example sections
     for example in examples:
@@ -277,13 +361,20 @@ class DagV3ExampleSelector:
         )
         return self.current_example
 
-    def get_prompt(self, base_prompt: str, execution_plan: str = "", history: str = "") -> str:
-        """Get prompt with current example.
+    def get_prompt(
+        self,
+        base_prompt: str,
+        execution_plan: str = "",
+        history: str = "",
+        include_constraints: bool = True
+    ) -> str:
+        """Get prompt with current example and constraints.
 
         Args:
             base_prompt: The DAG structure prompt
             execution_plan: Optional execution plan
             history: Optional attempt history
+            include_constraints: Whether to include learned constraints
 
         Returns:
             Complete prompt string
@@ -292,7 +383,9 @@ class DagV3ExampleSelector:
         if not examples:
             return base_prompt
 
-        return build_prompt_with_examples(base_prompt, examples, execution_plan, history)
+        return build_prompt_with_examples(
+            base_prompt, examples, execution_plan, history, include_constraints
+        )
 
 
 # Convenience function for backwards compatibility
