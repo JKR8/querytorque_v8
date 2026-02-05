@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
 
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent.parent  # research/scripts -> research -> PROJECT_ROOT
 sys.path.insert(0, str(PROJECT_ROOT / "packages" / "qt-sql"))
 
 from qt_sql.validation.sql_validator import SQLValidator
@@ -37,26 +37,20 @@ _parser.add_argument("--dir", default="retry_neutrals")
 _args2, _ = _parser.parse_known_args()
 COLLECT_DIR = PROJECT_ROOT / _args2.dir
 
-# 43 neutral queries
-QUERIES = [
-    "q45", "q52", "q20", "q40", "q23", "q58", "q33", "q79", "q19", "q31",
-    "q4", "q8", "q54", "q69", "q80", "q10", "q46", "q49", "q57", "q60",
-    "q13", "q27", "q64", "q77", "q78", "q47", "q48", "q85", "q99", "q21",
-    "q39", "q88", "q3", "q25", "q97", "q42", "q72", "q36", "q71", "q98",
-    "q14", "q68", "q92"
-]
+# Auto-detect queries from directory
+def get_queries_from_dir(collect_dir: Path) -> list[str]:
+    """Get list of query IDs from the collect directory."""
+    queries = []
+    if collect_dir.exists():
+        for d in collect_dir.iterdir():
+            if d.is_dir() and d.name.startswith("q") and d.name[1:].isdigit():
+                queries.append(d.name)
+    return sorted(queries, key=lambda x: int(x[1:]))
 
-ORIGINAL_SPEEDUPS = {
-    "q45": 1.08, "q52": 1.08, "q20": 1.07, "q40": 1.07, "q23": 1.06,
-    "q58": 1.06, "q33": 1.05, "q79": 1.05, "q19": 1.04, "q31": 1.04,
-    "q4": 1.03, "q8": 1.03, "q54": 1.03, "q69": 1.03, "q80": 1.03,
-    "q10": 1.02, "q46": 1.02, "q49": 1.02, "q57": 1.02, "q60": 1.02,
-    "q13": 1.01, "q27": 1.01, "q64": 1.01, "q77": 1.01, "q78": 1.01,
-    "q47": 1.00, "q48": 1.00, "q85": 1.00, "q99": 1.00, "q21": 0.99,
-    "q39": 0.99, "q88": 0.99, "q3": 0.98, "q25": 0.98, "q97": 0.98,
-    "q42": 0.97, "q72": 0.97, "q36": 0.96, "q71": 0.96, "q98": 0.96,
-    "q14": 0.95, "q68": 0.95, "q92": 0.95,
-}
+QUERIES = get_queries_from_dir(COLLECT_DIR)
+
+# Default speedups (1.0 if not known)
+ORIGINAL_SPEEDUPS = {}
 
 WORKER_EXAMPLES = {
     1: ["decorrelate", "pushdown", "early_filter"],

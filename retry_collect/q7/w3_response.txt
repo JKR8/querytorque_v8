@@ -1,0 +1,41 @@
+Looking at the query, I can see two main optimization opportunities:
+
+1. **OR_TO_UNION**: The OR condition on promotion table (`p_channel_email = 'N' OR p_channel_event = 'N'`) can be decomposed into separate UNION ALL branches to allow better predicate pushdown and index usage.
+
+2. **DATE_CTE_ISOLATE**: The date_dim filter (`d_year = 2000`) can be isolated into a CTE and joined early to reduce the join size.
+
+However, I notice something important: The OR condition involves two different columns from the same table (promotion). To avoid duplicates when using UNION ALL, we need to make the branches mutually exclusive. Also, we need to be careful about NULL handling in the promotion conditions.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "or_to_union",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000",
+        "filtered_customer_demographics": "SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'",
+        "sales_branch1": "SELECT ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price, i_item_id FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN filtered_customer_demographics ON ss_cdemo_sk = cd_demo_sk JOIN item ON ss_item_sk = i_item_sk JOIN promotion ON ss_promo_sk = p_promo_sk WHERE p_channel_email = 'N'",
+        "sales_branch2": "SELECT ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price, i_item_id FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN filtered_customer_demographics ON ss_cdemo_sk = cd_demo_sk JOIN item ON ss_item_sk = i_item_sk JOIN promotion ON ss_promo_sk = p_promo_sk WHERE p_channel_event = 'N' AND (p_channel_email != 'N' OR p_channel_email IS NULL)",
+        "main_query": "SELECT i_item_id, AVG(ss_quantity) AS agg1, AVG(ss_list_price) AS agg2, AVG(ss_coupon_amt) AS agg3, AVG(ss_sales_price) AS agg4 FROM (SELECT * FROM sales_branch1 UNION ALL SELECT * FROM sales_branch2) AS unioned_sales GROUP BY i_item_id ORDER BY i_item_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "output columns unchanged",
+        "same grain (i_item_id)",
+        "same result rows after aggregation",
+        "handles NULL values correctly in OR conditions"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Transformed OR condition on promotion table into UNION ALL with mutually exclusive branches to allow predicate pushdown and better index usage. Also isolated date_dim and customer_demographics filters into CTEs for early filtering. Branch2 excludes rows already captured by Branch1 to avoid duplicates. This allows each branch to use focused indexes on promotion columns and reduces the number of rows joined from large fact tables."
+}
+```
+
+**Key insights:**
+1. The OR condition on `p_channel_email` and `p_channel_event` prevents effective index usage in the original query.
+2. By splitting into UNION ALL branches, each branch can use separate indexes on these columns.
+3. We need to make the branches mutually exclusive to avoid duplicate counting (hence the `p_channel_email != 'N' OR p_channel_email IS NULL` condition in branch2).
+4. Isolating the date and customer demographics filters into CTEs allows early reduction of the fact table join size.
+5. The execution plan shows store_sales is scanned without filters - this rewrite allows pushing promotion filters earlier into the join sequence.

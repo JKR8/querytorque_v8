@@ -1,0 +1,55 @@
+Looking at the target query, I can see significant optimization opportunities:
+
+1. **Repeated subquery materialization**: The same date filtering subquery appears in both `ss_items` and `ws_items` CTEs
+2. **Pushdown opportunities**: The main query has complex revenue comparison filters that can be pushed down into the CTEs
+3. **Excessive date_dim scans**: Multiple scans of date_dim with the same filter
+
+Here's my optimized rewrite:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "materialize_cte",
+      "nodes": {
+        "week_dates": "SELECT d_date_sk, d_date FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2000-01-03')",
+        "ss_items": "SELECT i_item_id AS item_id, SUM(ss_ext_sales_price) AS ss_item_rev FROM store_sales JOIN item ON ss_item_sk = i_item_sk JOIN week_dates ON ss_sold_date_sk = d_date_sk GROUP BY i_item_id",
+        "cs_items": "SELECT i_item_id AS item_id, SUM(cs_ext_sales_price) AS cs_item_rev FROM catalog_sales JOIN item ON cs_item_sk = i_item_sk JOIN week_dates ON cs_sold_date_sk = d_date_sk GROUP BY i_item_id",
+        "ws_items": "SELECT i_item_id AS item_id, SUM(ws_ext_sales_price) AS ws_item_rev FROM web_sales JOIN item ON ws_item_sk = i_item_sk JOIN week_dates ON ws_sold_date_sk = d_date_sk GROUP BY i_item_id",
+        "main_query": "WITH filtered_items AS (SELECT s.item_id, s.ss_item_rev, c.cs_item_rev, w.ws_item_rev FROM ss_items s JOIN cs_items c ON s.item_id = c.item_id JOIN ws_items w ON s.item_id = w.item_id WHERE s.ss_item_rev BETWEEN 0.9 * c.cs_item_rev AND 1.1 * c.cs_item_rev AND s.ss_item_rev BETWEEN 0.9 * w.ws_item_rev AND 1.1 * w.ws_item_rev AND c.cs_item_rev BETWEEN 0.9 * s.ss_item_rev AND 1.1 * s.ss_item_rev AND c.cs_item_rev BETWEEN 0.9 * w.ws_item_rev AND 1.1 * w.ws_item_rev AND w.ws_item_rev BETWEEN 0.9 * s.ss_item_rev AND 1.1 * s.ss_item_rev AND w.ws_item_rev BETWEEN 0.9 * c.cs_item_rev AND 1.1 * c.cs_item_rev) SELECT item_id, ss_item_rev, ss_item_rev / ((ss_item_rev + cs_item_rev + ws_item_rev) / 3) * 100 AS ss_dev, cs_item_rev, cs_item_rev / ((ss_item_rev + cs_item_rev + ws_item_rev) / 3) * 100 AS cs_dev, ws_item_rev, ws_item_rev / ((ss_item_rev + cs_item_rev + ws_item_rev) / 3) * 100 AS ws_dev, (ss_item_rev + cs_item_rev + ws_item_rev) / 3 AS average FROM filtered_items ORDER BY item_id NULLS FIRST, ss_item_rev NULLS FIRST LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same column output",
+        "same ordering",
+        "same aggregation"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "pushdown",
+      "nodes": {
+        "ss_items_opt": "SELECT i_item_id AS item_id, SUM(ss_ext_sales_price) AS ss_item_rev FROM store_sales JOIN item ON ss_item_sk = i_item_sk JOIN (SELECT d_date_sk FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2000-01-03')) AS week_dates ON ss_sold_date_sk = d_date_sk GROUP BY i_item_id HAVING COUNT(*) > 0",
+        "ws_items_opt": "SELECT i_item_id AS item_id, SUM(ws_ext_sales_price) AS ws_item_rev FROM web_sales JOIN item ON ws_item_sk = i_item_sk JOIN (SELECT d_date_sk FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2000-01-03')) AS week_dates ON ws_sold_date_sk = d_date_sk GROUP BY i_item_id HAVING COUNT(*) > 0"
+      },
+      "invariants_kept": [
+        "same grain",
+        "same output columns"
+      ],
+      "expected_speedup": "1.2x",
+      "risk": "low",
+      "note": "Alternative: Push filters into CTEs and materialize week_dates once"
+    }
+  ],
+  "explanation": "1. Created week_dates CTE to materialize the repeated date filter subquery (executed once instead of 3+ times). 2. Added cs_items CTE (implied by main query). 3. Moved revenue comparison filters to filtered_items CTE to reduce join cardinality before expensive calculations. 4. Used HAVING COUNT(*) > 0 as a lightweight filter to eliminate zero-sum groups early. This reduces date_dim scans from 9 to 1-2 and applies filters earlier in the execution plan."
+}
+```
+
+**Key insights:**
+1. The repeated date filter subquery (`d_week_seq = (SELECT ...)`) appears multiple times. Materializing it as `week_dates` CTE reduces date_dim scans from 9 to 1-2.
+2. The main query's revenue comparison filters (0.9-1.1 bounds) can be pushed into a CTE (`filtered_items`) to reduce the 3-way join cardinality before performing expensive division operations.
+3. The execution plan shows massive cardinality misestimates (up to 10,435x), suggesting the optimizer struggles with correlated date subqueries. Materializing helps provide accurate statistics.
+4. The `cs_items` CTE was missing but implied by the main query - needed for complete rewrite.

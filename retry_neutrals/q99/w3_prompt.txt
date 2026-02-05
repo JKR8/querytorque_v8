@@ -1,0 +1,236 @@
+## Example: Prefetch Fact Join (PREFETCH_FACT_JOIN)
+Verified speedup: 3.77x
+
+### Input:
+SELECT * FROM (
+  SELECT i_manager_id, sum(ss_sales_price) sum_sales,
+    avg(sum(ss_sales_price)) OVER (PARTITION BY i_manager_id) avg_monthly_sales
+  FROM item, store_sales, date_dim, store
+  WHERE ss_item_sk = i_item_sk AND ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk
+    AND d_month_seq IN (1200,1201,1202,1203,1204,1205,1206,1207,1208,1209,1210,1211)
+    AND ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN (...))
+      OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN (...)))
+  GROUP BY i_manager_id, d_moy
+) AS tmp1
+WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
+ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "prefetch_fact_join",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk, d_moy FROM date_dim WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)",
+        "filtered_sales": "SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_moy FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
+        "main_query": "SELECT * FROM (SELECT i_manager_id, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales FROM item JOIN filtered_sales ON ss_item_sk = i_item_sk JOIN store ON ss_store_sk = s_store_sk WHERE ((i_category IN ('Books', 'Children', 'Electronics') AND i_class IN ('personal', 'portable', 'reference', 'self-help') AND i_brand IN (...)) OR (i_category IN ('Women', 'Music', 'Men') AND i_class IN ('accessories', 'classical', 'fragrances', 'pants') AND i_brand IN (...))) GROUP BY i_manager_id, d_moy) AS tmp1 WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "3.77x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** First CTE filters the dimension (date_dim). Second CTE pre-joins this with the fact table (store_sales). This creates a smaller intermediate result before joining with other dimension tables. The pre-join materializes the filtered fact rows, making subsequent joins faster.
+
+
+---
+
+## Example: Multi Dimension Prefetch (MULTI_DIMENSION_PREFETCH)
+Verified speedup: 2.71x
+
+### Input:
+SELECT s_store_name, s_store_id,
+  sum(CASE WHEN (d_day_name='Sunday') THEN ss_sales_price ELSE NULL END) sun_sales,
+  sum(CASE WHEN (d_day_name='Monday') THEN ss_sales_price ELSE NULL END) mon_sales,
+  sum(CASE WHEN (d_day_name='Tuesday') THEN ss_sales_price ELSE NULL END) tue_sales,
+  sum(CASE WHEN (d_day_name='Wednesday') THEN ss_sales_price ELSE NULL END) wed_sales,
+  sum(CASE WHEN (d_day_name='Thursday') THEN ss_sales_price ELSE NULL END) thu_sales,
+  sum(CASE WHEN (d_day_name='Friday') THEN ss_sales_price ELSE NULL END) fri_sales,
+  sum(CASE WHEN (d_day_name='Saturday') THEN ss_sales_price ELSE NULL END) sat_sales
+FROM date_dim, store_sales, store
+WHERE d_date_sk = ss_sold_date_sk AND s_store_sk = ss_store_sk
+  AND s_gmt_offset = -5 AND d_year = 2000
+GROUP BY s_store_name, s_store_id
+ORDER BY s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "multi_dimension_prefetch",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk, d_day_name FROM date_dim WHERE d_year = 2000",
+        "filtered_stores": "SELECT s_store_sk, s_store_name, s_store_id FROM store WHERE s_gmt_offset = -5",
+        "main_query": "SELECT s_store_name, s_store_id, SUM(CASE WHEN (d_day_name = 'Sunday') THEN ss_sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN ss_sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN ss_sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN ss_sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN ss_sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN ss_sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN ss_sales_price ELSE NULL END) AS sat_sales FROM store_sales JOIN filtered_dates ON d_date_sk = ss_sold_date_sk JOIN filtered_stores ON s_store_sk = ss_store_sk GROUP BY s_store_name, s_store_id ORDER BY s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "2.71x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Pre-filter BOTH date_dim AND store into separate CTEs. Include only the columns needed for the join and grouping. The optimizer can then use these smaller CTEs efficiently when joining with the fact table.
+
+
+---
+
+## Example: Materialize Repeated Subquery (MATERIALIZE_CTE)
+Verified speedup: 1.37x
+
+### Input:
+[main_query]:
+SELECT COUNT(DISTINCT ws_order_number) AS order_count,
+       SUM(ws_ext_ship_cost) AS total_shipping
+FROM web_sales ws1, date_dim, customer_address, web_site
+WHERE d_date BETWEEN '2000-03-01' AND '2000-05-01'
+  AND ws1.ws_ship_date_sk = d_date_sk
+  AND ws1.ws_ship_addr_sk = ca_address_sk
+  AND ca_state = 'IL'
+  AND ws1.ws_web_site_sk = web_site_sk
+  AND web_company_name = 'pri'
+  AND EXISTS (SELECT * FROM web_sales ws2 WHERE ws1.ws_order_number = ws2.ws_order_number AND ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)
+  AND NOT EXISTS (SELECT * FROM web_returns wr1 WHERE ws1.ws_order_number = wr1.wr_order_number)
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "materialize_cte",
+      "nodes": {
+        "multi_warehouse_orders": "SELECT DISTINCT ws_order_number FROM web_sales ws1 WHERE EXISTS (SELECT 1 FROM web_sales ws2 WHERE ws1.ws_order_number = ws2.ws_order_number AND ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)",
+        "returned_orders": "SELECT DISTINCT wr_order_number FROM web_returns",
+        "main_query": "SELECT COUNT(DISTINCT ws_order_number) AS order_count, SUM(ws_ext_ship_cost) AS total_shipping FROM web_sales ws1 JOIN date_dim ON ws1.ws_ship_date_sk = d_date_sk JOIN customer_address ON ws1.ws_ship_addr_sk = ca_address_sk JOIN web_site ON ws1.ws_web_site_sk = web_site_sk JOIN multi_warehouse_orders mwo ON ws1.ws_order_number = mwo.ws_order_number LEFT JOIN returned_orders ro ON ws1.ws_order_number = ro.wr_order_number WHERE d_date BETWEEN '2000-03-01' AND '2000-05-01' AND ca_state = 'IL' AND web_company_name = 'pri' AND ro.wr_order_number IS NULL"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same aggregation"
+      ],
+      "expected_speedup": "1.8x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Extract the EXISTS subquery into a CTE that finds multi-warehouse orders ONCE. Extract returned orders into another CTE. Join instead of nested EXISTS checks.
+
+
+---
+
+You are an autonomous Query Rewrite Engine. Your goal is to maximize execution speed while strictly preserving semantic invariants.
+
+Output atomic rewrite sets in JSON.
+
+RULES:
+- Primary Goal: Maximize execution speed while strictly preserving semantic invariants.
+- Allowed Transforms: Use the provided list. If a standard SQL optimization applies that is not listed, label it "semantic_rewrite".
+- Atomic Sets: Group dependent changes (e.g., creating a CTE and joining it) into a single rewrite_set.
+- Contracts: Output columns, grain, and total result rows must remain invariant.
+- Naming: Use descriptive CTE names (e.g., `filtered_returns` vs `cte1`).
+- Column Aliasing: Permitted only for aggregations or disambiguation.
+
+ALLOWED TRANSFORMS: pushdown, decorrelate, or_to_union, early_filter, date_cte_isolate, materialize_cte, flatten_subquery, reorder_join, multi_push_predicate, inline_cte, remove_redundant, semantic_rewrite
+
+OUTPUT FORMAT:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "transform_name",
+      "nodes": {
+        "node_id": "new SQL..."
+      },
+      "invariants_kept": ["list of preserved semantics"],
+      "expected_speedup": "2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "what was changed and why"
+}
+```
+
+## Target Nodes
+  [main_query] GROUP_BY
+
+## Subgraph Slice
+[main_query] type=main
+```sql
+SELECT w_substr, sm_type, LOWER(cc_name) AS cc_name_lower, SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 30) AND (cs_ship_date_sk - cs_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS "31-60 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 60) AND (cs_ship_date_sk - cs_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS "61-90 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 90) AND (cs_ship_date_sk - cs_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS "91-120 days", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 120) THEN 1 ELSE 0 END) AS ">120 days" FROM catalog_sales, (SELECT SUBSTRING(w_warehouse_name, 1, 20) AS w_substr, * FROM warehouse) AS sq1, ship_mode, call_center, date_dim WHERE d_month_seq BETWEEN 1200 AND 1200 + 11 AND cs_ship_date_sk = d_date_sk AND cs_warehouse_sk = w_warehouse_sk AND cs_ship_mode_sk = sm_ship_mode_sk AND cs_call_center_sk = cc_call_center_sk GROUP BY w_substr, sm_type, cc_name ORDER BY w_substr NULLS FIRST, sm_type NULLS FIRST, cc_name_lower NULLS FIRST LIMIT 100
+```
+
+
+## Node Contracts
+[main_query]:
+  output_columns: ['w_substr', 'sm_type', 'cc_name_lower', '30 days', '31-60 days', '61-90 days', '91-120 days', '>120 days']
+  grain: ['w_substr', 'sm_type', 'cc_name']
+  required_predicates: ['cs_call_center_sk = cc_call_center_sk', 'cs_ship_mode_sk = sm_ship_mode_sk', 'cs_warehouse_sk = w_warehouse_sk']
+
+## Downstream Usage
+No usage data.
+
+## Cost Attribution
+[main_query]: 99.9% cost, ~2852442 rows, ops=[SEQ_SCAN[catalog_sales], SEQ_SCAN[date_dim], SEQ_SCAN[warehouse]]
+
+## Detected Opportunities
+## Knowledge Base Patterns (verified on TPC-DS)
+## Detected Optimization Opportunities
+
+1. **QT-OPT-003** - Date CTE Isolation
+  Trigger: date_dim joined with d_year/d_qoy/d_month filter, fact table present
+  Rewrite: Create CTE: SELECT d_date_sk FROM date_dim WHERE filter, join fact to CTE early
+   Matched: date_dim filter with fact table
+
+
+Now output your rewrite_sets:
+
+## Execution Plan
+```
+Operators by cost:
+- SEQ_SCAN(catalog_sales): 88.1% cost, 2,852,442 rows
+- HASH_GROUP_BY: 7.5% cost, 720 rows
+- PROJECTION: 1.3% cost, 2,852,442 rows
+- TOP_N: 0.6% cost, 100 rows
+- PROJECTION: 0.6% cost, 2,852,442 rows
+
+Scans:
+- catalog_sales x1: 172,815,132 rows (no filter)
+- date_dim x1: 73,049 → 366 rows (filtered)
+- call_center x1: 24 rows (no filter)
+- ship_mode x1: 20 rows (no filter)
+- warehouse x1: 10 rows (no filter)
+
+Misestimates:
+- PROJECTION: est 229,102 vs actual 720 (318.2x)
+- PROJECTION: est 229,102 vs actual 720 (318.2x)
+- HASH_GROUP_BY: est 229,102 vs actual 720 (318.2x)
+- SEQ_SCAN: est 14,401,261 vs actual 2,852,442 (5.0x)
+- FILTER: est 14,609 vs actual 366 (39.9x)
+- SEQ_SCAN: est 14,609 vs actual 366 (39.9x)
+
+Joins:
+- HASH_JOIN: ? x call_center -> 2,852,442 rows (late)
+- HASH_JOIN: ? x ship_mode -> 2,852,442 rows (late)
+- HASH_JOIN: ? x ? -> 2,852,442 rows (late)
+- HASH_JOIN: catalog_sales x ? -> 2,852,442 rows (late)
+```

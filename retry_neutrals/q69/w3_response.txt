@@ -1,0 +1,47 @@
+Looking at this query, I can see several optimization opportunities:
+
+1. **Date dimension filtering repeated 3 times** - each subquery joins with date_dim using the same date range (2001, months 4-6)
+2. **Correlated subqueries** that can be decorrelated and materialized
+3. **Multiple fact table scans** that can be filtered early
+
+Let me create a rewrite set using materialize_cte and date_cte_isolate transforms:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "multi_dimension_prefetch",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_moy BETWEEN 4 AND 6",
+        "store_sales_customers": "SELECT DISTINCT ss_customer_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
+        "web_sales_customers": "SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk",
+        "catalog_sales_customers": "SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk",
+        "filtered_ca": "SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('KY', 'GA', 'NM')",
+        "main_query": "SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3 FROM customer_demographics cd JOIN customer c ON cd.cd_demo_sk = c.c_current_cdemo_sk JOIN filtered_ca ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN store_sales_customers ssc ON c.c_customer_sk = ssc.ss_customer_sk LEFT JOIN web_sales_customers wsc ON c.c_customer_sk = wsc.ws_bill_customer_sk LEFT JOIN catalog_sales_customers csc ON c.c_customer_sk = csc.cs_ship_customer_sk WHERE wsc.ws_bill_customer_sk IS NULL AND csc.cs_ship_customer_sk IS NULL GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same grouping",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "3.2x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Created 5 CTEs: 1) filtered_dates to isolate date dimension filtering once, 2-4) pre-joined fact tables with dates to get distinct customer keys meeting date criteria, 5) filtered customer addresses. Main query joins all CTEs: INNER join for store_sales (EXISTS), LEFT JOIN + IS NULL for web_sales and catalog_sales (NOT EXISTS). This reduces 3 date_dim scans to 1, and allows early filtering of fact tables by date range before joining with customer dimension."
+}
+```
+
+**Key insights:**
+1. **Single date_dim scan**: The date filter (d_year=2001, d_moy 4-6) is applied once in `filtered_dates` CTE instead of 3 times
+2. **Fact table filtering early**: Each fact table is pre-joined with filtered dates to get relevant customer keys before joining to customer dimension
+3. **Decorrelated subqueries**: EXISTS/NOT EXISTS are converted to joins (INNER for EXISTS, LEFT JOIN + IS NULL for NOT EXISTS)
+4. **Distinct customer keys**: Using DISTINCT reduces row counts before joining with customer table
+5. **Customer address filtering**: Isolated in separate CTE for early reduction
+
+This rewrite follows the pattern shown in the examples: filter dimensions first into CTEs, then join with fact tables. The expected speedup comes from:
+- Reduced date_dim scans: 3→1
+- Early filtering of large fact tables by date range
+- Smaller intermediate results before joining with customer dimension
