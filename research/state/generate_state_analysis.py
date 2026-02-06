@@ -139,7 +139,8 @@ def load_all_query_states() -> Dict[str, QueryState]:
                     continue
 
                 qs = states[query_id]
-                qs.category = row['Classification']
+                # Note: Don't use CSV classification - we'll recalculate based on actual best_speedup
+                # qs.category = row['Classification']
                 try:
                     qs.original_ms = float(row.get('Kimi_Original_ms', 0) or 0)
                 except (ValueError, TypeError):
@@ -153,6 +154,22 @@ def load_all_query_states() -> Dict[str, QueryState]:
                 # Track which worker achieved best result in 4W retry
                 if row.get('Retry3W_Best_Worker'):
                     qs.best_worker = f"W{row['Retry3W_Best_Worker']}"
+
+    # Recalculate classifications based on actual best_speedup (State 0 → State 1)
+    # State 0 = unoptimized baseline (1.0x)
+    # State 1 = current best achieved (best_speedup)
+    # Intermediate failures don't matter - only net result matters
+    for qs in states.values():
+        if qs.best_speedup >= 1.5:
+            qs.category = "WIN"
+        elif qs.best_speedup >= 1.1:
+            qs.category = "IMPROVED"
+        elif qs.best_speedup >= 0.95:
+            qs.category = "NEUTRAL"
+        elif qs.best_speedup < 0.95:
+            qs.category = "REGRESSION"
+        else:
+            qs.category = "NO_DATA"
 
     return states
 
@@ -453,16 +470,24 @@ def generate_executive_dashboard(
         count = classifications[cat]
         lines.append(f"- {cat}: {count}")
 
-    # Top 20 longest queries (highest business value)
-    lines.append("\n## Top 20 Longest-Running Queries (Highest Value Targets)\n")
+    # Complete leaderboard of all 99 queries by runtime
+    lines.append("\n## Complete Query Leaderboard (All 99 Queries by Runtime)\n")
+    lines.append("| Rank | Query | Runtime | Speedup | Classification | Time Savings @ 2x |\n")
+    lines.append("|------|-------|---------|---------|-----------------|------------------|\n")
+
     sorted_by_runtime = sorted(
         [s for s in all_states.values() if s.original_ms > 0],
         key=lambda x: x.original_ms,
         reverse=True
     )
 
-    for i, qs in enumerate(sorted_by_runtime[:20], 1):
-        lines.append(f"{i}. Q{qs.query_num}: {qs.original_ms:.0f}ms - {qs.best_speedup:.2f}x ({qs.category})")
+    for i, qs in enumerate(sorted_by_runtime, 1):
+        savings_2x = qs.original_ms / 2
+        rank_marker = "⭐ TOP 20" if i <= 20 else ""
+        lines.append(
+            f"| {i} | Q{qs.query_num} | {qs.original_ms:.0f}ms | {qs.best_speedup:.2f}x | "
+            f"{qs.category} | {savings_2x:.0f}ms {rank_marker} |"
+        )
 
     # Transform stats
     lines.append("\n## Transform Effectiveness\n")
@@ -581,7 +606,7 @@ def generate_full_report() -> str:
 if __name__ == "__main__":
     report = generate_full_report()
 
-    output_path = Path("/mnt/c/Users/jakc9/Documents/QueryTorque_V8/research/STATE_ANALYSIS_REPORT.md")
+    output_path = Path("/mnt/c/Users/jakc9/Documents/QueryTorque_V8/research/state/STATE_ANALYSIS_REPORT.md")
     with open(output_path, 'w') as f:
         f.write(report)
 
