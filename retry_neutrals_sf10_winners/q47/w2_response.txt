@@ -1,0 +1,53 @@
+Looking at this query structure, I can see two main optimization opportunities:
+
+1. **OR-to-UNION decomposition** for the complex date filter in v1
+2. **Date CTE isolation** to pre-filter date_dim and reduce the size of store_sales early
+
+The most expensive part is v1 (92.4% cost), which does a full scan of store_sales. The OR condition on date_dim is preventing early filtering.
+
+Here's my rewrite:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "or_to_union",
+      "nodes": {
+        "dates_1999": "SELECT d_date_sk, d_year, d_moy FROM date_dim WHERE d_year = 1999",
+        "dates_1998_m12": "SELECT d_date_sk, d_year, d_moy FROM date_dim WHERE d_year = 1998 AND d_moy = 12",
+        "dates_2000_m1": "SELECT d_date_sk, d_year, d_moy FROM date_dim WHERE d_year = 2000 AND d_moy = 1",
+        "filtered_store_sales_part1": "SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_year, d_moy FROM store_sales JOIN dates_1999 ON ss_sold_date_sk = d_date_sk",
+        "filtered_store_sales_part2": "SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_year, d_moy FROM store_sales JOIN dates_1998_m12 ON ss_sold_date_sk = d_date_sk",
+        "filtered_store_sales_part3": "SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_year, d_moy FROM store_sales JOIN dates_2000_m1 ON ss_sold_date_sk = d_date_sk",
+        "filtered_store_sales": "SELECT * FROM filtered_store_sales_part1 UNION ALL SELECT * FROM filtered_store_sales_part2 UNION ALL SELECT * FROM filtered_store_sales_part3",
+        "v1": "SELECT i.i_category, i.i_brand, s.s_store_name, s.s_company_name, fss.d_year, fss.d_moy, SUM(fss.ss_sales_price) AS sum_sales, AVG(SUM(fss.ss_sales_price)) OVER (PARTITION BY i.i_category, i.i_brand, s.s_store_name, s.s_company_name, fss.d_year) AS avg_monthly_sales, RANK() OVER (PARTITION BY i.i_category, i.i_brand, s.s_store_name, s.s_company_name ORDER BY fss.d_year, fss.d_moy) AS rn FROM filtered_store_sales fss JOIN item i ON fss.ss_item_sk = i.i_item_sk JOIN store s ON fss.ss_store_sk = s.s_store_sk GROUP BY i.i_category, i.i_brand, s.s_store_name, s.s_company_name, fss.d_year, fss.d_moy",
+        "v2": "SELECT v1.i_category, v1.i_brand, v1.s_store_name, v1.s_company_name, v1.d_year, v1.d_moy, v1.avg_monthly_sales, v1.sum_sales, v1_lag.sum_sales AS psum, v1_lead.sum_sales AS nsum FROM v1, v1 AS v1_lag, v1 AS v1_lead WHERE v1.i_category = v1_lag.i_category AND v1.i_category = v1_lead.i_category AND v1.i_brand = v1_lag.i_brand AND v1.i_brand = v1_lead.i_brand AND v1.s_store_name = v1_lag.s_store_name AND v1.s_store_name = v1_lead.s_store_name AND v1.s_company_name = v1_lag.s_company_name AND v1.s_company_name = v1_lead.s_company_name AND v1.rn = v1_lag.rn + 1 AND v1.rn = v1_lead.rn - 1",
+        "main_query": "SELECT * FROM v2 WHERE d_year = 1999 AND avg_monthly_sales > 0 AND CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY sum_sales - avg_monthly_sales, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows", 
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "3.0x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Transformed the OR condition in v1's date filter into UNION ALL of three separate date ranges, each with its own CTE. This allows: 1) Each date range can use appropriate indexes on date_dim (year, month). 2) Store_sales is filtered early by joining with pre-filtered date CTEs instead of scanning entire table. 3) The UNION ALL ensures no duplicates. Also used date_cte_isolate pattern to create filtered date CTEs before joining with store_sales."
+}
+```
+
+**Key insights:**
+1. The OR condition `(d_year = 1999 OR (d_year = 1999-1 AND d_moy = 12) OR (d_year = 1999+1 AND d_moy = 1))` is perfect for OR-to-UNION decomposition
+2. The three date ranges are mutually exclusive, so UNION ALL is safe (no duplicates)
+3. By creating date CTEs first, we filter date_dim early and reduce the store_sales join dramatically
+4. Store_sales (345M rows) is the biggest table - filtering it early gives maximum benefit
+5. The window functions in v1 are computed after the UNION, preserving correct partitioning
+
+**Expected benefits:**
+- Store_sales scan reduced from full 345M rows to only rows matching the three date ranges
+- Each date range can use efficient index access on date_dim
+- Parallel execution of the three UNION ALL branches possible
+- Maintains all invariants: same result, same ordering, same columns

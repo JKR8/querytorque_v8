@@ -1,0 +1,42 @@
+Looking at this query pattern, I can see it's similar to the PREFETCH_FACT_JOIN example but with additional complexity from the window function and self-join pattern. The key insight is that the date_dim filter can be isolated early, and the fact table (catalog_sales) can be pre-joined with this filtered date set before joining with other dimensions.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk, d_year, d_moy FROM date_dim WHERE (d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1))",
+        "filtered_sales": "SELECT cs_item_sk, cs_call_center_sk, cs_sales_price, d_year, d_moy FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk",
+        "v1": "SELECT i_category, i_brand, cc_name, d_year, d_moy, SUM(cs_sales_price) AS sum_sales, AVG(SUM(cs_sales_price)) OVER (PARTITION BY i_category, i_brand, cc_name, d_year) AS avg_monthly_sales, RANK() OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy) AS rn FROM item, filtered_sales, call_center WHERE cs_item_sk = i_item_sk AND cc_call_center_sk = cs_call_center_sk GROUP BY i_category, i_brand, cc_name, d_year, d_moy",
+        "v2": "SELECT v1.i_category, v1.i_brand, v1.cc_name, v1.d_year, v1.d_moy, v1.avg_monthly_sales, v1.sum_sales, v1_lag.sum_sales AS psum, v1_lead.sum_sales AS nsum FROM v1, v1 AS v1_lag, v1 AS v1_lead WHERE v1.i_category = v1_lag.i_category AND v1.i_category = v1_lead.i_category AND v1.i_brand = v1_lag.i_brand AND v1.i_brand = v1_lead.i_brand AND v1.cc_name = v1_lag.cc_name AND v1.cc_name = v1_lead.cc_name AND v1.rn = v1_lag.rn + 1 AND v1.rn = v1_lead.rn - 1"
+      },
+      "invariants_kept": [
+        "same result rows", 
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "3.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "semantic_rewrite",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk, d_year, d_moy FROM date_dim WHERE (d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1))",
+        "filtered_sales": "SELECT cs_item_sk, cs_call_center_sk, cs_sales_price, d_year, d_moy FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk",
+        "v1_combined": "WITH v1_base AS (SELECT i_category, i_brand, cc_name, d_year, d_moy, SUM(cs_sales_price) AS sum_sales, AVG(SUM(cs_sales_price)) OVER (PARTITION BY i_category, i_brand, cc_name, d_year) AS avg_monthly_sales, RANK() OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy) AS rn FROM item, filtered_sales, call_center WHERE cs_item_sk = i_item_sk AND cc_call_center_sk = cs_call_center_sk GROUP BY i_category, i_brand, cc_name, d_year, d_moy) SELECT v1.i_category, v1.i_brand, v1.cc_name, v1.d_year, v1.d_moy, v1.avg_monthly_sales, v1.sum_sales, LAG(v1.sum_sales) OVER (PARTITION BY v1.i_category, v1.i_brand, v1.cc_name ORDER BY v1.d_year, v1.d_moy) AS psum, LEAD(v1.sum_sales) OVER (PARTITION BY v1.i_category, v1.i_brand, v1.cc_name ORDER BY v1.d_year, v1.d_moy) AS nsum FROM v1_base v1"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same column output",
+        "same aggregation"
+      ],
+      "expected_speedup": "1.5x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Applied two key optimizations: 1) DATE_CTE_ISOLATE to filter date_dim early and pre-join with catalog_sales, reducing the fact table early. This creates a smaller filtered_sales CTE before joining with item and call_center. 2) SEMANTIC_REWRITE to replace the self-join pattern in v2 with window functions (LAG/LEAD), eliminating two extra CTE scans and hash joins. The combined effect reduces the heavy sequential scan on catalog_sales by applying date filters early and eliminates expensive self-joins."
+}
+```

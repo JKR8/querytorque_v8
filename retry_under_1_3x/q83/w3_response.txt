@@ -1,0 +1,72 @@
+Looking at this query structure, I see a prime opportunity to apply **date_cte_isolate** and **pushdown** transforms. The key issue is that all three CTEs (sr_items, cr_items, wr_items) have the exact same complex date filtering logic repeated three times, each scanning date_dim multiple times. This is massively inefficient.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk, d_date FROM date_dim WHERE d_week_seq IN (SELECT d_week_seq FROM date_dim WHERE d_date IN ('2000-06-30', '2000-09-27', '2000-11-17'))",
+        "sr_items": "SELECT i_item_id AS item_id, SUM(sr_return_quantity) AS sr_item_qty FROM store_returns JOIN item ON sr_item_sk = i_item_sk JOIN filtered_dates ON sr_returned_date_sk = d_date_sk GROUP BY i_item_id",
+        "cr_items": "SELECT i_item_id AS item_id, SUM(cr_return_quantity) AS cr_item_qty FROM catalog_returns JOIN item ON cr_item_sk = i_item_sk JOIN filtered_dates ON cr_returned_date_sk = d_date_sk GROUP BY i_item_id",
+        "wr_items": "SELECT i_item_id AS item_id, SUM(wr_return_quantity) AS wr_item_qty FROM web_returns JOIN item ON wr_item_sk = i_item_sk JOIN filtered_dates ON wr_returned_date_sk = d_date_sk GROUP BY i_item_id",
+        "main_query": "SELECT sr_items.item_id, sr_item_qty, (sr_item_qty * 1.0000) / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0000 * 100 AS sr_dev, cr_item_qty, (cr_item_qty * 1.0000) / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0000 * 100 AS cr_dev, wr_item_qty, (wr_item_qty * 1.0000) / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0000 * 100 AS wr_dev, (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0 AS average FROM sr_items, cr_items, wr_items WHERE sr_items.item_id = cr_items.item_id AND sr_items.item_id = wr_items.item_id ORDER BY sr_items.item_id NULLS FIRST, sr_item_qty NULLS FIRST LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same column output",
+        "same aggregation results"
+      ],
+      "expected_speedup": "2.8x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "materialize_cte",
+      "nodes": {
+        "filtered_dates_materialized": "SELECT d_date_sk, d_date FROM date_dim WHERE d_week_seq IN (SELECT d_week_seq FROM date_dim WHERE d_date IN ('2000-06-30', '2000-09-27', '2000-11-17'))",
+        "sr_items": "SELECT i_item_id AS item_id, SUM(sr_return_quantity) AS sr_item_qty FROM store_returns JOIN item ON sr_item_sk = i_item_sk JOIN filtered_dates_materialized ON sr_returned_date_sk = d_date_sk GROUP BY i_item_id",
+        "cr_items": "SELECT i_item_id AS item_id, SUM(cr_return_quantity) AS cr_item_qty FROM catalog_returns JOIN item ON cr_item_sk = i_item_sk JOIN filtered_dates_materialized ON cr_returned_date_sk = d_date_sk GROUP BY i_item_id",
+        "wr_items": "SELECT i_item_id AS item_id, SUM(wr_return_quantity) AS wr_item_qty FROM web_returns JOIN item ON wr_item_sk = i_item_sk JOIN filtered_dates_materialized ON wr_returned_date_sk = d_date_sk GROUP BY i_item_id",
+        "main_query": "SELECT sr_items.item_id, sr_item_qty, (sr_item_qty * 1.0000) / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0000 * 100 AS sr_dev, cr_item_qty, (cr_item_qty * 1.0000) / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0000 * 100 AS cr_dev, wr_item_qty, (wr_item_qty * 1.0000) / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0000 * 100 AS wr_dev, (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0 AS average FROM sr_items, cr_items, wr_items WHERE sr_items.item_id = cr_items.item_id AND sr_items.item_id = wr_items.item_id ORDER BY sr_items.item_id NULLS FIRST, sr_item_qty NULLS FIRST LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same column output",
+        "same aggregation results"
+      ],
+      "expected_speedup": "1.5x",
+      "risk": "medium",
+      "note": "Materialized hint may not be supported in all SQL dialects"
+    },
+    {
+      "id": "rs_03",
+      "transform": "semantic_rewrite",
+      "nodes": {
+        "filtered_dates_simplified": "SELECT DISTINCT d_date_sk FROM date_dim WHERE d_week_seq IN (SELECT d_week_seq FROM date_dim WHERE d_date IN ('2000-06-30', '2000-09-27', '2000-11-17'))",
+        "sr_items": "SELECT i_item_id AS item_id, SUM(sr_return_quantity) AS sr_item_qty FROM store_returns JOIN item ON sr_item_sk = i_item_sk WHERE sr_returned_date_sk IN (SELECT d_date_sk FROM filtered_dates_simplified) GROUP BY i_item_id",
+        "cr_items": "SELECT i_item_id AS item_id, SUM(cr_return_quantity) AS cr_item_qty FROM catalog_returns JOIN item ON cr_item_sk = i_item_sk WHERE cr_returned_date_sk IN (SELECT d_date_sk FROM filtered_dates_simplified) GROUP BY i_item_id",
+        "wr_items": "SELECT i_item_id AS item_id, SUM(wr_return_quantity) AS wr_item_qty FROM web_returns JOIN item ON wr_item_sk = i_item_sk WHERE wr_returned_date_sk IN (SELECT d_date_sk FROM filtered_dates_simplified) GROUP BY i_item_id",
+        "main_query": "SELECT sr_items.item_id, sr_item_qty, (sr_item_qty * 1.0000) / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0000 * 100 AS sr_dev, cr_item_qty, (cr_item_qty * 1.0000) / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0000 * 100 AS cr_dev, wr_item_qty, (wr_item_qty * 1.0000) / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0000 * 100 AS wr_dev, (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0 AS average FROM sr_items, cr_items, wr_items WHERE sr_items.item_id = cr_items.item_id AND sr_items.item_id = wr_items.item_id ORDER BY sr_items.item_id NULLS FIRST, sr_item_qty NULLS FIRST LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same column output",
+        "same aggregation results"
+      ],
+      "expected_speedup": "3.1x",
+      "risk": "low",
+      "note": "Simplified date filtering using IN clause instead of JOIN, reduces join complexity"
+    }
+  ],
+  "explanation": "The original query repeats the same complex date filtering logic 3 times (for store_returns, catalog_returns, web_returns), each scanning date_dim multiple times. This rewrite isolates the date filtering into a single CTE that's reused across all three return tables. Additionally, simplified the date filtering to use IN clause instead of JOIN, which can be more efficient for large fact tables. The materialized version ensures the date filter is computed once and cached."
+}
+```
+
+**Key insight**: The core inefficiency is the repeated execution of the same complex date filtering subquery across three separate CTEs. Each CTE independently:
+1. Scans date_dim to find the three target dates
+2. Scans date_dim again to find weeks matching those dates  
+3. Scans date_dim a third time in the main filter
+
+By isolating this into a single CTE, we reduce from 9 date_dim scans (3×3) to just 2 scans (once for the inner query, once for the outer). The materialized version ensures this computation happens once, and the semantic rewrite simplifies the join to an IN clause which is often more efficient for large fact table joins to small dimension filters.

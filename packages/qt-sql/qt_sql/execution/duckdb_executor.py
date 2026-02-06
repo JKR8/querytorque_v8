@@ -80,15 +80,14 @@ class DuckDBExecutor:
         if self._conn is not None:
             return  # Already connected
 
+        # Use D: drive for temp files to avoid filling up C: drive during large queries
+        import os
+        os.environ['DUCKDB_TEMP_DIRECTORY'] = '/mnt/d/duckdb_temp'
+
         self._conn = duckdb.connect(
             database=self.database,
             read_only=self.read_only,
         )
-        try:
-            self._conn.execute("PRAGMA temp_directory='/tmp'")
-        except Exception:
-            # Best-effort: some environments may not allow setting this
-            pass
 
     def close(self) -> None:
         """Close connection to DuckDB."""

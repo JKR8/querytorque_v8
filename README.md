@@ -154,8 +154,16 @@ uvicorn qt_dax.api.main:app --reload --port 8003
 # Start all services
 docker-compose up -d
 
+# Start only specific services
+docker-compose up -d postgres         # Application database
+docker-compose up -d dsb-postgres     # Benchmarking database
+docker-compose up -d qt-sql-api       # SQL API
+
 # View logs
 docker-compose logs -f
+
+# View specific service logs
+docker-compose logs -f dsb-postgres
 
 # Stop all services
 docker-compose down
@@ -163,12 +171,25 @@ docker-compose down
 
 ### Service Endpoints
 
-| Service     | URL                    | Description              |
-|-------------|------------------------|--------------------------|
-| Qt-Calcite  | http://localhost:8001  | SQL parsing service      |
-| Qt-SQL API  | http://localhost:8002  | SQL optimization API     |
-| Qt-DAX API  | http://localhost:8003  | DAX optimization API     |
-| PostgreSQL  | localhost:5432         | Database                 |
+| Service            | URL                    | Description                          |
+|--------------------|------------------------|--------------------------------------|
+| Qt-Calcite         | http://localhost:8001  | SQL parsing service                  |
+| Qt-SQL API         | http://localhost:8002  | SQL optimization API                 |
+| Qt-DAX API         | http://localhost:8003  | DAX optimization API                 |
+| PostgreSQL         | localhost:5432         | Application database (Docker)        |
+| DSB PostgreSQL     | localhost:5433         | Benchmarking database (Docker)       |
+
+#### Database Details
+
+**Application PostgreSQL** (port 5432):
+- User: `querytorque`
+- Password: `querytorque_dev`
+- Database: `querytorque`
+
+**DSB PostgreSQL** (port 5433, for benchmarking):
+- User: `jakc9`
+- Password: `jakc9`
+- Databases: `dsb_sf10` (SF10), `dsb_sf10_sample` (1% sample), `tpch10` (TPC-H SF10)
 
 ## CLI Commands
 

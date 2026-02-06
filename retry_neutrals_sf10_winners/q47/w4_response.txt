@@ -1,0 +1,44 @@
+Looking at the query structure, I can see a significant opportunity to optimize v1 (93% cost) by converting the OR condition into a more efficient form. The OR condition on date_dim filters is causing inefficient scanning.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "or_to_union",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk, d_year, d_moy FROM date_dim WHERE d_year = 1999 UNION ALL SELECT d_date_sk, d_year, d_moy FROM date_dim WHERE d_year = 1998 AND d_moy = 12 UNION ALL SELECT d_date_sk, d_year, d_moy FROM date_dim WHERE d_year = 2000 AND d_moy = 1",
+        "v1": "SELECT i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name, d_year) AS avg_monthly_sales, RANK() OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS rn FROM item, store_sales, filtered_dates, store WHERE ss_item_sk = i_item_sk AND ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk GROUP BY i_category, i_brand, s_store_name, s_company_name, d_year, d_moy",
+        "v2": "SELECT v1.i_category, v1.i_brand, v1.s_store_name, v1.s_company_name, v1.d_year, v1.d_moy, v1.avg_monthly_sales, v1.sum_sales, v1_lag.sum_sales AS psum, v1_lead.sum_sales AS nsum FROM v1, v1 AS v1_lag, v1 AS v1_lead WHERE v1.i_category = v1_lag.i_category AND v1.i_category = v1_lead.i_category AND v1.i_brand = v1_lag.i_brand AND v1.i_brand = v1_lead.i_brand AND v1.s_store_name = v1_lag.s_store_name AND v1.s_store_name = v1_lead.s_store_name AND v1.s_company_name = v1_lag.s_company_name AND v1.s_company_name = v1_lead.s_company_name AND v1.rn = v1_lag.rn + 1 AND v1.rn = v1_lead.rn - 1",
+        "main_query": "SELECT * FROM v2 WHERE d_year = 1999 AND avg_monthly_sales > 0 AND CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY sum_sales - avg_monthly_sales, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same column output",
+        "same ordering and limit",
+        "same grouping and window semantics"
+      ],
+      "expected_speedup": "3.0x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "early_filter",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk, d_year, d_moy FROM date_dim WHERE (d_year = 1999) OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1)",
+        "v1": "SELECT i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name, d_year) AS avg_monthly_sales, RANK() OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS rn FROM item JOIN store_sales ON ss_item_sk = i_item_sk JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN store ON ss_store_sk = s_store_sk GROUP BY i_category, i_brand, s_store_name, s_company_name, d_year, d_moy",
+        "v2": "SELECT v1.i_category, v1.i_brand, v1.s_store_name, v1.s_company_name, v1.d_year, v1.d_moy, v1.avg_monthly_sales, v1.sum_sales, v1_lag.sum_sales AS psum, v1_lead.sum_sales AS nsum FROM v1 JOIN v1 AS v1_lag ON v1.i_category = v1_lag.i_category AND v1.i_brand = v1_lag.i_brand AND v1.s_store_name = v1_lag.s_store_name AND v1.s_company_name = v1_lag.s_company_name AND v1.rn = v1_lag.rn + 1 JOIN v1 AS v1_lead ON v1.i_category = v1_lead.i_category AND v1.i_brand = v1_lead.i_brand AND v1.s_store_name = v1_lead.s_store_name AND v1.s_company_name = v1_lead.s_company_name AND v1.rn = v1_lead.rn - 1",
+        "main_query": "SELECT * FROM v2 WHERE d_year = 1999 AND avg_monthly_sales > 0 AND ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales > 0.1 ORDER BY sum_sales - avg_monthly_sales, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same column output",
+        "same ordering and limit"
+      ],
+      "expected_speedup": "1.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "The main optimization (rs_01) transforms the OR condition in v1's date_dim filter into UNION ALL branches, allowing each branch to use focused indexes and avoid evaluating all OR conditions for every row. The second optimization (rs_02) creates an early-filtered date_dim CTE to reduce join cardinality early and converts v2's self-join from implicit to explicit JOIN syntax for better optimization."
+}
+```

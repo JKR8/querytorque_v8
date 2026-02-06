@@ -1,0 +1,235 @@
+## Example: Decorrelate Subquery (DECORRELATE)
+Verified speedup: 2.92x
+
+### Input:
+[customer_total_return] CORRELATED:
+SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return
+FROM store_returns, date_dim
+WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000
+GROUP BY sr_customer_sk, sr_store_sk
+
+[main_query]:
+SELECT c_customer_id FROM customer_total_return ctr1, store, customer
+WHERE ctr1.ctr_total_return > (SELECT avg(ctr_total_return)*1.2 FROM customer_total_return ctr2 WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk)
+  AND s_store_sk = ctr1.ctr_store_sk AND s_state = 'SD' AND ctr1.ctr_customer_sk = c_customer_sk
+ORDER BY c_customer_id LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "decorrelate",
+      "nodes": {
+        "filtered_returns": "SELECT sr.sr_customer_sk, sr.sr_store_sk, sr.sr_fee FROM store_returns sr JOIN date_dim d ON sr.sr_returned_date_sk = d.d_date_sk JOIN store s ON sr.sr_store_sk = s.s_store_sk WHERE d.d_year = 2000 AND s.s_state = 'SD'",
+        "customer_total_return": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(sr_fee) AS ctr_total_return FROM filtered_returns GROUP BY sr_customer_sk, sr_store_sk",
+        "store_avg_return": "SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk",
+        "main_query": "SELECT c.c_customer_id FROM customer_total_return ctr1 JOIN store_avg_return sar ON ctr1.ctr_store_sk = sar.ctr_store_sk JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk WHERE ctr1.ctr_total_return > sar.avg_return_threshold ORDER BY c.c_customer_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "2.90x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Push s_state='SD' filter EARLY into first CTE. Compute average as SEPARATE CTE with GROUP BY (NOT window function). Join on average instead of correlated subquery.
+
+
+---
+
+## Example: Filter Pushdown (PUSHDOWN)
+Verified speedup: 2.11x
+
+### Input:
+[main_query]:
+SELECT CASE WHEN (SELECT COUNT(*) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) > 2972190 
+  THEN (SELECT AVG(ss_ext_sales_price) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20)
+  ELSE (SELECT AVG(ss_net_profit) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) END AS bucket1,
+  CASE WHEN (SELECT COUNT(*) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40) > 4505785
+  THEN (SELECT AVG(ss_ext_sales_price) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40)
+  ELSE (SELECT AVG(ss_net_profit) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40) END AS bucket2
+FROM reason WHERE r_reason_sk = 1
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "pushdown",
+      "nodes": {
+        "quantity_1_20_stats": "SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20",
+        "quantity_21_40_stats": "SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40",
+        "quantity_41_60_stats": "SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 41 AND 60",
+        "quantity_61_80_stats": "SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 61 AND 80",
+        "quantity_81_100_stats": "SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 81 AND 100",
+        "main_query": "SELECT CASE WHEN q1.cnt > 2972190 THEN q1.avg_ext_price ELSE q1.avg_net_profit END AS bucket1, CASE WHEN q2.cnt > 4505785 THEN q2.avg_ext_price ELSE q2.avg_net_profit END AS bucket2, CASE WHEN q3.cnt > 1575726 THEN q3.avg_ext_price ELSE q3.avg_net_profit END AS bucket3, CASE WHEN q4.cnt > 3188917 THEN q4.avg_ext_price ELSE q4.avg_net_profit END AS bucket4, CASE WHEN q5.cnt > 3525216 THEN q5.avg_ext_price ELSE q5.avg_net_profit END AS bucket5 FROM reason CROSS JOIN quantity_1_20_stats AS q1 CROSS JOIN quantity_21_40_stats AS q2 CROSS JOIN quantity_41_60_stats AS q3 CROSS JOIN quantity_61_80_stats AS q4 CROSS JOIN quantity_81_100_stats AS q5 WHERE r_reason_sk = 1"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same aggregation results",
+        "same output columns"
+      ],
+      "expected_speedup": "2.11x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Extract repeated quantity-range subqueries into CTEs. Each CTE computes count, avg_ext_price, avg_net_profit in ONE pass instead of scanning store_sales 15+ times.
+
+
+---
+
+## Example: Early Dimension Filter (EARLY_FILTER)
+Verified speedup: 4.00x
+
+### Input:
+[main_query]:
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales
+FROM (SELECT ss.ss_customer_sk, CASE WHEN sr.sr_return_quantity IS NOT NULL
+        THEN (ss.ss_quantity - sr.sr_return_quantity) * ss.ss_sales_price
+        ELSE ss.ss_quantity * ss.ss_sales_price END AS act_sales
+      FROM store_sales ss LEFT JOIN store_returns sr ON ss.ss_item_sk = sr.sr_item_sk
+      JOIN reason r ON sr.sr_reason_sk = r.r_reason_sk
+      WHERE r.r_reason_desc = 'duplicate purchase') t
+GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "early_filter",
+      "nodes": {
+        "filtered_reason": "SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'",
+        "filtered_returns": "SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk",
+        "main_query": "SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100"
+      },
+      "invariants_kept": [
+        "output columns unchanged",
+        "grain preserved",
+        "same result rows"
+      ],
+      "expected_speedup": "2.71x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Filter dimension table (reason) FIRST, then join to fact. Reduces returns to only 'duplicate purchase' before expensive store_sales join.
+
+
+---
+
+You are an autonomous Query Rewrite Engine. Your goal is to maximize execution speed while strictly preserving semantic invariants.
+
+Output atomic rewrite sets in JSON.
+
+RULES:
+- Primary Goal: Maximize execution speed while strictly preserving semantic invariants.
+- Allowed Transforms: Use the provided list. If a standard SQL optimization applies that is not listed, label it "semantic_rewrite".
+- Atomic Sets: Group dependent changes (e.g., creating a CTE and joining it) into a single rewrite_set.
+- Contracts: Output columns, grain, and total result rows must remain invariant.
+- Naming: Use descriptive CTE names (e.g., `filtered_returns` vs `cte1`).
+- Column Aliasing: Permitted only for aggregations or disambiguation.
+
+ALLOWED TRANSFORMS: pushdown, decorrelate, or_to_union, early_filter, date_cte_isolate, materialize_cte, flatten_subquery, reorder_join, multi_push_predicate, inline_cte, remove_redundant, semantic_rewrite
+
+OUTPUT FORMAT:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "transform_name",
+      "nodes": {
+        "node_id": "new SQL..."
+      },
+      "invariants_kept": ["list of preserved semantics"],
+      "expected_speedup": "2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "what was changed and why"
+}
+```
+
+## Target Nodes
+  [main_query] GROUP_BY
+
+## Subgraph Slice
+[main_query] type=main
+```sql
+SELECT s_store_name, SUM(ss_net_profit) FROM store_sales, date_dim, store, (SELECT ca_zip FROM (SELECT SUBSTRING(ca_zip, 1, 5) AS ca_zip FROM customer_address WHERE SUBSTRING(ca_zip, 1, 5) IN ('24128', '76232', '65084', '87816', '83926', '77556', '20548', '26231', '43848', '15126', '91137', '61265', '98294', '25782', '17920', '18426', '98235', '40081', '84093', '28577', '55565', '17183', '54601', '67897', '22752', '86284', '18376', '38607', '45200', '21756', '29741', '96765', '23932', '89360', '29839', '25989', '28898', '91068', '72550', '10390', '18845', '47770', '82636', '41367', '76638', '86198', '81312', '37126', '39192', '88424', '72175', '81426', '53672', '10445', '42666', '66864', '66708', '41248', '48583', '82276', '18842', '78890', '49448', '14089', '38122', '34425', '79077', '19849', '43285', '39861', '66162', '77610', '13695', '99543', '83444', '83041', '12305', '57665', '68341', '25003', '57834', '62878', '49130', '81096', '18840', '27700', '23470', '50412', '21195', '16021', '76107', '71954', '68309', '18119', '98359', '64544', '10336', '86379', '27068', '39736', '98569', '28915', '24206', '56529', '57647', '54917', '42961', '91110', '63981', '14922', '36420', '23006', '67467', '32754', '30903', '20260', '31671', '51798', '72325', '85816', '68621', '13955', '36446', '41766', '68806', '16725', '15146', '22744', '35850', '88086', '51649', '18270', '52867', '39972', '96976', '63792', '11376', '94898', '13595', '10516', '90225', '58943', '39371', '94945', '28587', '96576', '57855', '28488', '26105', '83933', '25858', '34322', '44438', '73171', '30122', '34102', '22685', '71256', '78451', '54364', '13354', '45375', '40558', '56458', '28286', '45266', '47305', '69399', '83921', '26233', '11101', '15371', '69913', '35942', '15882', '25631', '24610', '44165', '99076', '33786', '70738', '26653', '14328', '72305', '62496', '22152', '10144', '64147', '48425', '14663', '21076', '18799', '30450', '63089', '81019', '68893', '24996', '51200', '51211', '45692', '92712', '70466', '79994', '22437', '25280', '38935', '71791', '73134', '56571', '14060', '19505', '72425', '56575', '74351', '68786', '51650', '20004', '18383', '76614', '11634', '18906', '15765', '41368', '73241', '76698', '78567', '97189', '28545', '76231', '75691', '22246', '51061', '90578', '56691', '68014', '51103', '94167', '57047', '14867', '73520', '15734', '63435', '25733', '35474', '24676', '94627', '53535', '17879', '15559', '53268', '59166', '11928', '59402', '33282', '45721', '43933', '68101', '33515', '36634', '71286', '19736', '58058', '55253', '67473', '41918', '19515', '36495', '19430', '22351', '77191', '91393', '49156', '50298', '87501', '18652', '53179', '18767', '63193', '23968', '65164', '68880', '21286', '72823', '58470', '67301', '13394', '31016', '70372', '67030', '40604', '24317', '45748', '39127', '26065', '77721', '31029', '31880', '60576', '24671', '45549', '13376', '50016', '33123', '19769', '22927', '97789', '46081', '72151', '15723', '46136', '51949', '68100', '96888', '64528', '14171', '79777', '28709', '11489', '25103', '32213', '78668', '22245', '15798', '27156', '37930', '62971', '21337', '51622', '67853', '10567', '38415', '15455', '58263', '42029', '60279', '37125', '56240', '88190', '50308', '26859', '64457', '89091', '82136', '62377', '36233', '63837', '58078', '17043', '30010', '60099', '28810', '98025', '29178', '87343', '73273', '30469', '64034', '39516', '86057', '21309', '90257', '67875', '40162', '11356', '73650', '61810', '72013', '30431', '22461', '19512', '13375', '55307', '30625', '83849', '68908', '26689', '96451', '38193', '46820', '88885', '84935', '69035', '83144', '47537', '56616', '94983', '48033', '69952', '25486', '61547', '27385', '61860', '58048', '56910', '16807', '17871', '35258', '31387', '35458', '35576') INTERSECT SELECT ca_zip FROM (SELECT SUBSTRING(ca_zip, 1, 5) AS ca_zip, COUNT(*) AS cnt FROM customer_address, customer WHERE ca_address_sk = c_current_addr_sk AND c_preferred_cust_flag = 'Y' GROUP BY ca_zip HAVING COUNT(*) > 10) AS A1) AS A2) AS V1 WHERE ss_store_sk = s_store_sk AND ss_sold_date_sk = d_date_sk AND d_qoy = 2 AND d_year = 1998 AND (SUBSTRING(s_zip, 1, 2) = SUBSTRING(V1.ca_zip, 1, 2)) GROUP BY s_store_name ORDER BY s_store_name LIMIT 100
+```
+
+
+## Node Contracts
+[main_query]:
+  output_columns: ['s_store_name', 'SUM(ss_net_profit)']
+  grain: ['s_store_name']
+  required_predicates: ['d_year = 1998', 'SUBSTRING(s_zip, 1, 2) = SUBSTRING(V1.ca_zip, 1, 2)', 'd_qoy = 2']
+
+## Downstream Usage
+No usage data.
+
+## Cost Attribution
+[main_query]: 98.4% cost, ~684608 rows, ops=[SEQ_SCAN[store_sales], SEQ_SCAN[date_dim], SEQ_SCAN[customer_address]]
+
+## Detected Opportunities
+## Knowledge Base Patterns (verified on TPC-DS)
+## Detected Optimization Opportunities
+
+1. **QT-OPT-003** - Date CTE Isolation
+  Trigger: date_dim joined with d_year/d_qoy/d_month filter, fact table present
+  Rewrite: Create CTE: SELECT d_date_sk FROM date_dim WHERE filter, join fact to CTE early
+   Matched: date_dim filter with fact table
+
+
+Now output your rewrite_sets:
+
+## Execution Plan
+```
+Operators by cost:
+- SEQ_SCAN(store_sales): 54.6% cost, 684,608 rows
+- SEQ_SCAN(store_sales): 27.1% cost, 1,945 rows
+- HASH_GROUP_BY: 3.3% cost, 9 rows
+- HASH_JOIN: 3.2% cost, 236,826 rows
+- HASH_JOIN: 2.6% cost, 415,262 rows
+
+Scans:
+- store_sales x1: 345,611,892 rows (no filter)
+- customer x1: 2,500,000 → 236,826 rows (filtered)
+- customer_address x2: 750,000 rows (no filter)
+- date_dim x1: 73,049 → 91 rows (filtered)
+- store x1: 102 → 100 rows (filtered)
+
+Misestimates:
+- PROJECTION: est 630,923 vs actual 9 (70102.6x)
+- HASH_GROUP_BY: est 630,923 vs actual 9 (70102.6x)
+- PROJECTION: est 11,545,866 vs actual 415,262 (27.8x)
+- PROJECTION: est 11,545,866 vs actual 415,262 (27.8x)
+- HASH_JOIN: est 11,545,866 vs actual 415,262 (27.8x)
+- SEQ_SCAN: est 28,800,991 vs actual 684,608 (42.1x)
+- HASH_JOIN: est 5,005 vs actual 37 (135.3x)
+- PROJECTION: est 50,000 vs actual 1,945 (25.7x)
+- SEQ_SCAN: est 50,000 vs actual 1,945 (25.7x)
+
+Joins:
+- HASH_JOIN: ? x ? -> 415,262 rows (late)
+- HASH_JOIN: store_sales x ? -> 684,608 rows (late)
+- HASH_JOIN: ? x store -> 37 rows
+- HASH_JOIN: ? x ? -> 1,886 rows
+- HASH_JOIN: customer_address x customer -> 236,826 rows
+```

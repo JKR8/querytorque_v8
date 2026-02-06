@@ -1,0 +1,56 @@
+Looking at this query pattern, I can identify a key optimization opportunity:
+
+**Opportunity**: The `[main_query]` scans the `[results]` CTE three times (once per UNION ALL branch), performing similar aggregations each time. This can be consolidated into a single pass using `GROUPING SETS` or `ROLLUP` with conditional logic.
+
+**Analysis**:
+1. The `[results]` CTE contains 95.8% of the cost and is scanned 3 times in the UNION ALL
+2. Each branch does: `AVG(agg1)`, `AVG(agg2)`, `AVG(agg3)`, `AVG(agg4)`
+3. The branches differ only in grouping columns:
+   - Branch 1: GROUP BY i_item_id, s_state (with s_state='TN')
+   - Branch 2: GROUP BY i_item_id only
+   - Branch 3: Overall aggregates (no GROUP BY)
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "single_pass_aggregation",
+      "nodes": {
+        "main_query": "WITH single_pass AS (\n  SELECT \n    i_item_id,\n    s_state,\n    GROUPING(i_item_id, s_state) AS grouping_id,\n    AVG(agg1) AS agg1_avg,\n    AVG(agg2) AS agg2_avg,\n    AVG(agg3) AS agg3_avg,\n    AVG(agg4) AS agg4_avg\n  FROM results\n  GROUP BY GROUPING SETS ((i_item_id, s_state), (i_item_id), ())\n)\nSELECT \n  CASE WHEN BIT_AND(grouping_id, 3) = 0 THEN i_item_id ELSE NULL END AS i_item_id,\n  CASE WHEN BIT_AND(grouping_id, 3) = 0 THEN s_state \n       WHEN BIT_AND(grouping_id, 3) = 1 THEN NULL  -- grouping by i_item_id only\n       ELSE NULL END AS s_state,  -- overall aggregate\n  CASE WHEN BIT_AND(grouping_id, 3) = 0 THEN 0 ELSE 1 END AS g_state,\n  agg1_avg AS agg1,\n  agg2_avg AS agg2,\n  agg3_avg AS agg3,\n  agg4_avg AS agg4\nFROM single_pass\nORDER BY i_item_id NULLS FIRST, s_state NULLS FIRST\nLIMIT 100"
+      },
+      "invariants_kept": [
+        "same output columns",
+        "same result rows and values",
+        "same ordering (NULLS FIRST)",
+        "same aggregation semantics (AVG)",
+        "same grouping levels"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 2002",
+        "results": "SELECT i_item_id, s_state, 0 AS g_state, ss_quantity AS agg1, ss_list_price AS agg2, ss_coupon_amt AS agg3, ss_sales_price AS agg4 FROM store_sales, customer_demographics, filtered_dates, store, item WHERE ss_sold_date_sk = d_date_sk AND ss_item_sk = i_item_sk AND ss_store_sk = s_store_sk AND ss_cdemo_sk = cd_demo_sk AND cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College' AND s_state = 'TN'"
+      },
+      "invariants_kept": [
+        "same filter predicates",
+        "same join conditions",
+        "same output columns"
+      ],
+      "expected_speedup": "1.2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "1. rs_01 consolidates three scans of the results CTE into a single pass using GROUPING SETS to compute all three aggregation levels simultaneously. This reduces I/O on the large store_sales table from 3 scans to 1 scan. 2. rs_02 isolates the date_dim filter into a CTE to push the year filter earlier and avoid redundant date_dim lookups across joins."
+}
+```
+
+**Key insights**:
+1. The UNION ALL pattern with different GROUP BY levels is a classic case for GROUPING SETS
+2. The `GROUPING()` function allows us to reconstruct the original s_state and g_state values
+3. We can compute all AVG aggregates once and then use the grouping_id to select the appropriate grouping level
+4. Date dimension filtering can be isolated early to reduce join cardinality

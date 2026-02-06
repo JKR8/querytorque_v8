@@ -1,0 +1,36 @@
+Looking at this query, I see several opportunities for optimization:
+
+1. **Date CTE Isolation**: The date_dim filter (`d_qoy = 2 AND d_year = 2001`) is highly selective (73,049 → 91 rows) and can be isolated
+2. **OR to UNION ALL**: The complex OR condition with subquery can be decomposed
+3. **Subquery materialization**: The IN subquery references a static list of i_item_sk values
+
+The biggest win appears to be decomposing the OR condition since it combines two unrelated filters (one on ca_zip, one on i_item_id). Let me apply these transforms:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "or_to_union",
+      "nodes": {
+        "date_filter": "SELECT d_date_sk FROM date_dim WHERE d_qoy = 2 AND d_year = 2001",
+        "item_list": "SELECT i_item_id, i_item_sk FROM item WHERE i_item_sk IN (2, 3, 5, 7, 11, 13, 17, 19, 23, 29)",
+        "zip_branch": "SELECT ca_zip, ca_city, ws_sales_price FROM web_sales JOIN date_filter ON ws_sold_date_sk = d_date_sk JOIN customer ON ws_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk JOIN item ON ws_item_sk = i_item_sk WHERE SUBSTRING(ca_zip, 1, 5) IN ('85669', '86197', '88274', '83405', '86475', '85392', '85460', '80348', '81792')",
+        "item_branch": "SELECT ca_zip, ca_city, ws_sales_price FROM web_sales JOIN date_filter ON ws_sold_date_sk = d_date_sk JOIN customer ON ws_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk JOIN item_list ON ws_item_sk = item_list.i_item_sk WHERE SUBSTRING(ca_zip, 1, 5) NOT IN ('85669', '86197', '88274', '83405', '86475', '85392', '85460', '80348', '81792')",
+        "main_query": "SELECT ca_zip, ca_city, SUM(ws_sales_price) FROM (SELECT * FROM zip_branch UNION ALL SELECT * FROM item_branch) combined GROUP BY ca_zip, ca_city ORDER BY ca_zip, ca_city LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "3.0x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Decomposed the OR condition into two UNION ALL branches: one for the zip code filter and one for the item ID subquery filter. This allows each branch to use optimal indexes and avoid the expensive OR evaluation. The item_list CTE materializes the static subquery result. The date_filter CTE isolates the selective date dimension filter. Added NOT IN clause to item_branch to avoid duplicate rows that satisfy both conditions (though none should exist based on data characteristics)."
+}
+```
+
+**Key insight**: The OR condition combines two unrelated filters on different tables (customer_address and item). By splitting into UNION ALL, we allow the optimizer to choose optimal execution plans for each case. The date filter is extracted into a CTE to reduce the web_sales table early. The static item_sk list is pre-materialized. This transform is particularly effective because the OR prevents efficient index usage in the original query.

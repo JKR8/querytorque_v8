@@ -1,0 +1,57 @@
+Looking at this query pattern, I can see several optimization opportunities:
+
+1. **Date CTE Isolation**: The date_dim table is joined multiple times with the same filter (d_year = 1999+2 and d_moy = 11 in main_query, d_year BETWEEN 1999 AND 1999+2 in others). We can create pre-filtered CTEs.
+2. **Materialize Repeated Subquery**: The `cross_items` CTE is complex and used multiple times. We can materialize it.
+3. **Pushdown Opportunities**: The `cross_items` CTE can be simplified by pushing predicates earlier.
+
+Here's my optimized version:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "date_three_years": "SELECT d_date_sk FROM date_dim WHERE d_year BETWEEN 1999 AND 1999 + 2",
+        "date_nov_2001": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999 + 2 AND d_moy = 11",
+        "avg_sales": "SELECT AVG(quantity * list_price) AS average_sales FROM (SELECT ss_quantity AS quantity, ss_list_price AS list_price FROM store_sales JOIN date_three_years ON ss_sold_date_sk = d_date_sk UNION ALL SELECT cs_quantity AS quantity, cs_list_price AS list_price FROM catalog_sales JOIN date_three_years ON cs_sold_date_sk = d_date_sk UNION ALL SELECT ws_quantity AS quantity, ws_list_price AS list_price FROM web_sales JOIN date_three_years ON ws_sold_date_sk = d_date_sk) AS sq2",
+        "cross_items_improved": "SELECT i_item_sk AS ss_item_sk FROM item JOIN (SELECT DISTINCT i_brand_id AS brand_id, i_class_id AS class_id, i_category_id AS category_id FROM store_sales JOIN item AS iss ON ss_item_sk = iss.i_item_sk JOIN date_three_years AS d1 ON ss_sold_date_sk = d1.d_date_sk INTERSECT SELECT DISTINCT i_brand_id, i_class_id, i_category_id FROM catalog_sales JOIN item AS ics ON cs_item_sk = ics.i_item_sk JOIN date_three_years AS d2 ON cs_sold_date_sk = d2.d_date_sk INTERSECT SELECT DISTINCT i_brand_id, i_class_id, i_category_id FROM web_sales JOIN item AS iws ON ws_item_sk = iws.i_item_sk JOIN date_three_years AS d3 ON ws_sold_date_sk = d3.d_date_sk) AS sq1 ON i_brand_id = brand_id AND i_class_id = class_id AND i_category_id = category_id",
+        "main_query": "SELECT channel, i_brand_id, i_class_id, i_category_id, SUM(sales) AS sum_sales, SUM(number_sales) AS sum_number_sales FROM (SELECT 'store' AS channel, i.i_brand_id, i.i_class_id, i.i_category_id, SUM(ss_quantity * ss_list_price) AS sales, COUNT(*) AS number_sales FROM store_sales ss JOIN date_nov_2001 dn ON ss.ss_sold_date_sk = dn.d_date_sk JOIN item i ON ss.ss_item_sk = i.i_item_sk WHERE ss.ss_item_sk IN (SELECT ss_item_sk FROM cross_items_improved) GROUP BY i.i_brand_id, i.i_class_id, i.i_category_id HAVING SUM(ss_quantity * ss_list_price) > (SELECT average_sales FROM avg_sales) UNION ALL SELECT 'catalog' AS channel, i.i_brand_id, i.i_class_id, i.i_category_id, SUM(cs_quantity * cs_list_price) AS sales, COUNT(*) AS number_sales FROM catalog_sales cs JOIN date_nov_2001 dn ON cs.cs_sold_date_sk = dn.d_date_sk JOIN item i ON cs.cs_item_sk = i.i_item_sk WHERE cs.cs_item_sk IN (SELECT ss_item_sk FROM cross_items_improved) GROUP BY i.i_brand_id, i.i_class_id, i.i_category_id HAVING SUM(cs_quantity * cs_list_price) > (SELECT average_sales FROM avg_sales) UNION ALL SELECT 'web' AS channel, i.i_brand_id, i.i_class_id, i.i_category_id, SUM(ws_quantity * ws_list_price) AS sales, COUNT(*) AS number_sales FROM web_sales ws JOIN date_nov_2001 dn ON ws.ws_sold_date_sk = dn.d_date_sk JOIN item i ON ws.ws_item_sk = i.i_item_sk WHERE ws.ws_item_sk IN (SELECT ss_item_sk FROM cross_items_improved) GROUP BY i.i_brand_id, i.i_class_id, i.i_category_id HAVING SUM(ws_quantity * ws_list_price) > (SELECT average_sales FROM avg_sales)) AS y GROUP BY ROLLUP (channel, i_brand_id, i_class_id, i_category_id) ORDER BY channel NULLS FIRST, i_brand_id NULLS FIRST, i_class_id NULLS FIRST, i_category_id NULLS FIRST LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same output columns",
+        "same aggregation results",
+        "same ordering"
+      ],
+      "expected_speedup": "3.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "materialize_cte",
+      "nodes": {
+        "cross_items_materialized": "WITH cross_items_materialized AS MATERIALIZED (SELECT i_item_sk AS ss_item_sk FROM item JOIN (SELECT DISTINCT i_brand_id AS brand_id, i_class_id AS class_id, i_category_id AS category_id FROM store_sales JOIN item AS iss ON ss_item_sk = iss.i_item_sk JOIN date_three_years AS d1 ON ss_sold_date_sk = d1.d_date_sk INTERSECT SELECT DISTINCT i_brand_id, i_class_id, i_category_id FROM catalog_sales JOIN item AS ics ON cs_item_sk = ics.i_item_sk JOIN date_three_years AS d2 ON cs_sold_date_sk = d2.d_date_sk INTERSECT SELECT DISTINCT i_brand_id, i_class_id, i_category_id FROM web_sales JOIN item AS iws ON ws_item_sk = iws.i_item_sk JOIN date_three_years AS d3 ON ws_sold_date_sk = d3.d_date_sk) AS sq1 ON i_brand_id = brand_id AND i_class_id = class_id AND i_category_id = category_id) SELECT ss_item_sk FROM cross_items_materialized",
+        "avg_sales_materialized": "WITH avg_sales_materialized AS MATERIALIZED (SELECT AVG(quantity * list_price) AS average_sales FROM (SELECT ss_quantity AS quantity, ss_list_price AS list_price FROM store_sales JOIN date_three_years ON ss_sold_date_sk = d_date_sk UNION ALL SELECT cs_quantity AS quantity, cs_list_price AS list_price FROM catalog_sales JOIN date_three_years ON cs_sold_date_sk = d_date_sk UNION ALL SELECT ws_quantity AS quantity, ws_list_price AS list_price FROM web_sales JOIN date_three_years ON ws_sold_date_sk = d_date_sk) AS sq2) SELECT average_sales FROM avg_sales_materialized"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same output columns"
+      ],
+      "expected_speedup": "1.2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Created pre-filtered date CTEs to reduce redundant date_dim scans. Isolated date filters early to minimize fact table joins. Added DISTINCT to INTERSECT subqueries to reduce intermediate data. Materialized complex CTEs for reuse. Estimated 3.5x speedup from reduced date_dim scans and early filtering."
+}
+```
+
+**Key insights:**
+1. **Date CTE Isolation**: Created `date_three_years` and `date_nov_2001` CTEs to filter date_dim once instead of 9+ times
+2. **Early Filtering**: Pushed date filters before expensive fact table joins
+3. **Materialization**: Complex `cross_items` and `avg_sales` CTEs are computed once and reused
+4. **DISTINCT optimization**: Added DISTINCT to INTERSECT subqueries to reduce intermediate row counts
+5. **Join simplification**: Changed implicit joins to explicit JOIN syntax for better optimization hints
+
+The main speedup comes from reducing 9+ date_dim scans to just 2 pre-filtered CTE scans, and materializing the complex cross_items computation.

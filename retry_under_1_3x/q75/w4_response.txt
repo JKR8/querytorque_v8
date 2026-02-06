@@ -1,0 +1,38 @@
+Looking at this query structure, I can see two main optimization opportunities:
+
+1. **Date filter pushdown into the union CTE** - Currently, `all_sales` aggregates all years, then `main_query` filters for specific years (2002 and 2001). We can push these year filters into the CTE.
+
+2. **Date CTE isolation** - Multiple date_dim joins in the union can be consolidated using a CTE.
+
+Here's my optimized rewrite:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "pushdown",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk, d_year FROM date_dim WHERE d_year IN (2001, 2002)",
+        "all_sales": "SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, SUM(sales_cnt) AS sales_cnt, SUM(sales_amt) AS sales_amt FROM (SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, cs_quantity - COALESCE(cr_return_quantity, 0) AS sales_cnt, cs_ext_sales_price - COALESCE(cr_return_amount, 0.0) AS sales_amt FROM catalog_sales JOIN item ON i_item_sk = cs_item_sk JOIN filtered_dates ON d_date_sk = cs_sold_date_sk LEFT JOIN catalog_returns ON (cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk) WHERE i_category = 'Books' UNION SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ss_quantity - COALESCE(sr_return_quantity, 0) AS sales_cnt, ss_ext_sales_price - COALESCE(sr_return_amt, 0.0) AS sales_amt FROM store_sales JOIN item ON i_item_sk = ss_item_sk JOIN filtered_dates ON d_date_sk = ss_sold_date_sk LEFT JOIN store_returns ON (ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk) WHERE i_category = 'Books' UNION SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ws_quantity - COALESCE(wr_return_quantity, 0) AS sales_cnt, ws_ext_sales_price - COALESCE(wr_return_amt, 0.0) AS sales_amt FROM web_sales JOIN item ON i_item_sk = ws_item_sk JOIN filtered_dates ON d_date_sk = ws_sold_date_sk LEFT JOIN web_returns ON (ws_order_number = wr_order_number AND ws_item_sk = wr_item_sk) WHERE i_category = 'Books') AS sales_detail GROUP BY d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id",
+        "main_query": "SELECT prev_yr.d_year AS prev_year, curr_yr.d_year AS year_, curr_yr.i_brand_id, curr_yr.i_class_id, curr_yr.i_category_id, curr_yr.i_manufact_id, prev_yr.sales_cnt AS prev_yr_cnt, curr_yr.sales_cnt AS curr_yr_cnt, curr_yr.sales_cnt - prev_yr.sales_cnt AS sales_cnt_diff, curr_yr.sales_amt - prev_yr.sales_amt AS sales_amt_diff FROM all_sales AS curr_yr, all_sales AS prev_yr WHERE curr_yr.i_brand_id = prev_yr.i_brand_id AND curr_yr.i_class_id = prev_yr.i_class_id AND curr_yr.i_category_id = prev_yr.i_category_id AND curr_yr.i_manufact_id = prev_yr.i_manufact_id AND curr_yr.d_year = 2002 AND prev_yr.d_year = 2001 AND CAST(curr_yr.sales_cnt AS DECIMAL(17, 2)) / CAST(prev_yr.sales_cnt AS DECIMAL(17, 2)) < 0.9 ORDER BY sales_cnt_diff, sales_amt_diff LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same output columns",
+        "same ordering",
+        "same aggregation semantics"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Pushed year filters (2001, 2002) from main_query into the all_sales CTE using filtered_dates CTE. This reduces the data scanned from all years to only the needed years before aggregation. Also isolated date_dim scans into a single CTE (filtered_dates) to avoid redundant filtering and joins."
+}
+```
+
+**Key insights:**
+1. The original `all_sales` CTE aggregates ALL years, but `main_query` only needs 2001 and 2002. By pushing year filters into the CTE, we reduce the data volume by ~97% (assuming uniform year distribution).
+2. Created a `filtered_dates` CTE to isolate date_dim filtering and avoid 3 separate date_dim scans in the union.
+3. The pushdown transform is low-risk because we're filtering earlier but preserving all required data for the main query.
+4. This optimization is similar to the example "PUSHDOWN: [main_query] filters on [all_sales] after GROUP BY" with expected 2x speedup.
