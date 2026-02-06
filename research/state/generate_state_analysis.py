@@ -75,6 +75,144 @@ class Recommendation:
 
 
 # ============================================================================
+# TPC-DS QUERY CHARACTERISTICS
+# Maps each query to its structural features for pattern matching
+# ============================================================================
+
+# Features:
+#   correlated_subquery: Has correlated subquery pattern → decorrelate
+#   date_filter: Joins date_dim with year/month filter → date_cte_isolate
+#   multi_date_alias: Multiple date_dim aliases (d1,d2,d3) → multi_date_range_cte
+#   or_condition: OR on different columns → or_to_union
+#   multi_dim_filter: Multiple dimension filters → dimension_cte_isolate / multi_dimension_prefetch
+#   dim_fact_chain: Dimension filter → fact join chain → prefetch_fact_join / early_filter
+#   repeated_scan: Same table scanned multiple times → single_pass_aggregation / pushdown
+#   intersect: Uses INTERSECT → intersect_to_exists
+#   union_year: UNION ALL with year discriminator → union_cte_split
+#   exists_repeat: Repeated EXISTS subqueries → materialize_cte
+#   complex_multi_join: 5+ table joins, hard to decompose → EXPLAIN_ANALYZE
+#   window_fn: Window functions (ROW_NUMBER, RANK) → EXPLAIN_ANALYZE (TopN issue)
+
+TPCDS_QUERY_FEATURES = {
+    1:  ["correlated_subquery", "date_filter", "dim_fact_chain"],
+    2:  ["date_filter", "complex_multi_join"],
+    3:  ["date_filter", "dim_fact_chain"],
+    4:  ["multi_date_alias", "complex_multi_join", "correlated_subquery"],
+    5:  ["date_filter", "union_year", "multi_dim_filter"],
+    6:  ["correlated_subquery", "date_filter"],
+    7:  ["date_filter", "multi_dim_filter", "dim_fact_chain"],
+    8:  ["correlated_subquery", "date_filter"],
+    9:  ["repeated_scan"],  # 15+ scalar subqueries on same table
+    10: ["date_filter", "multi_dim_filter", "exists_repeat"],
+    11: ["correlated_subquery", "date_filter", "multi_date_alias"],
+    12: ["date_filter", "dim_fact_chain"],
+    13: ["multi_dim_filter", "dim_fact_chain"],  # demographics filters
+    14: ["intersect", "date_filter", "complex_multi_join"],
+    15: ["or_condition", "date_filter"],
+    16: ["date_filter", "exists_repeat", "complex_multi_join"],
+    17: ["multi_date_alias", "dim_fact_chain"],
+    18: ["date_filter", "multi_dim_filter"],
+    19: ["date_filter", "multi_dim_filter", "dim_fact_chain"],
+    20: ["date_filter", "dim_fact_chain"],
+    21: ["date_filter", "dim_fact_chain"],
+    22: ["date_filter", "window_fn"],  # ROLLUP/grouping
+    23: ["correlated_subquery", "date_filter", "complex_multi_join"],
+    24: ["correlated_subquery", "complex_multi_join"],
+    25: ["multi_date_alias", "dim_fact_chain"],
+    26: ["multi_dim_filter", "dim_fact_chain"],
+    27: ["multi_dim_filter", "dim_fact_chain"],
+    28: ["repeated_scan"],  # multiple aggregation subqueries
+    29: ["multi_date_alias", "dim_fact_chain"],
+    30: ["correlated_subquery", "date_filter"],
+    31: ["date_filter", "complex_multi_join"],
+    32: ["correlated_subquery", "date_filter"],
+    33: ["date_filter", "multi_dim_filter", "union_year"],
+    34: ["multi_dim_filter", "dim_fact_chain"],
+    35: ["date_filter", "exists_repeat", "multi_dim_filter"],
+    36: ["date_filter", "multi_dim_filter", "dim_fact_chain"],
+    37: ["date_filter", "multi_dim_filter", "dim_fact_chain"],
+    38: ["date_filter", "intersect", "complex_multi_join"],
+    39: ["date_filter", "dim_fact_chain"],
+    40: ["date_filter", "dim_fact_chain"],
+    41: ["correlated_subquery"],
+    42: ["date_filter", "dim_fact_chain"],
+    43: ["date_filter", "multi_dim_filter", "dim_fact_chain"],
+    44: ["repeated_scan", "window_fn"],
+    45: ["or_condition", "date_filter", "correlated_subquery"],
+    46: ["multi_dim_filter", "dim_fact_chain"],
+    47: ["date_filter", "dim_fact_chain", "window_fn"],
+    48: ["multi_dim_filter", "or_condition"],
+    49: ["date_filter", "union_year", "window_fn"],
+    50: ["date_filter", "dim_fact_chain"],
+    51: ["date_filter", "window_fn"],
+    52: ["date_filter", "dim_fact_chain"],
+    53: ["date_filter", "dim_fact_chain"],
+    54: ["date_filter", "complex_multi_join"],
+    55: ["date_filter", "dim_fact_chain"],
+    56: ["multi_dim_filter", "union_year"],
+    57: ["date_filter", "dim_fact_chain", "window_fn"],
+    58: ["date_filter", "multi_date_alias"],
+    59: ["date_filter", "complex_multi_join"],
+    60: ["date_filter", "multi_dim_filter", "union_year"],
+    61: ["date_filter", "multi_dim_filter"],
+    62: ["date_filter", "dim_fact_chain"],
+    63: ["date_filter", "dim_fact_chain"],  # prefetch_fact_join proven here
+    64: ["complex_multi_join", "multi_date_alias"],
+    65: ["date_filter", "dim_fact_chain"],
+    66: ["date_filter", "multi_dim_filter", "union_year"],
+    67: ["date_filter", "dim_fact_chain", "window_fn"],
+    68: ["multi_dim_filter", "dim_fact_chain"],
+    69: ["multi_dim_filter", "dim_fact_chain"],
+    70: ["date_filter", "window_fn", "correlated_subquery"],
+    71: ["date_filter", "multi_dim_filter", "dim_fact_chain"],
+    72: ["multi_date_alias", "multi_dim_filter", "complex_multi_join"],
+    73: ["multi_dim_filter", "dim_fact_chain"],
+    74: ["union_year", "date_filter"],
+    75: ["date_filter", "union_year"],
+    76: ["date_filter", "or_condition", "union_year"],
+    77: ["date_filter", "union_year"],
+    78: ["date_filter", "complex_multi_join"],
+    79: ["multi_dim_filter", "dim_fact_chain"],
+    80: ["date_filter", "multi_date_alias", "union_year"],
+    81: ["correlated_subquery", "date_filter"],
+    82: ["multi_dim_filter", "dim_fact_chain"],
+    83: ["multi_dim_filter", "dim_fact_chain"],
+    84: ["multi_dim_filter", "dim_fact_chain"],
+    85: ["multi_dim_filter", "dim_fact_chain"],
+    86: ["multi_dim_filter", "dim_fact_chain"],
+    87: ["date_filter", "multi_dim_filter", "complex_multi_join"],
+    88: ["repeated_scan", "or_condition"],  # multiple CASE WHEN subqueries + OR
+    89: ["date_filter", "dim_fact_chain"],
+    90: ["date_filter", "dim_fact_chain"],
+    91: ["date_filter", "dim_fact_chain"],
+    92: ["date_filter", "dim_fact_chain"],
+    93: ["dim_fact_chain"],  # early_filter proven here (reason code)
+    94: ["date_filter", "exists_repeat", "complex_multi_join"],
+    95: ["exists_repeat", "date_filter"],
+    96: ["multi_dim_filter", "dim_fact_chain"],
+    97: ["date_filter", "union_year"],
+    98: ["date_filter", "dim_fact_chain"],
+    99: ["date_filter", "multi_dim_filter"],
+}
+
+# Maps query features → best-fit gold patterns (ordered by priority)
+FEATURE_TO_PATTERN = {
+    "correlated_subquery": ["decorrelate", "date_cte_isolate"],
+    "date_filter":         ["date_cte_isolate", "prefetch_fact_join"],
+    "multi_date_alias":    ["multi_date_range_cte"],
+    "or_condition":        ["or_to_union"],
+    "multi_dim_filter":    ["dimension_cte_isolate", "multi_dimension_prefetch", "early_filter"],
+    "dim_fact_chain":      ["prefetch_fact_join", "early_filter", "multi_dimension_prefetch"],
+    "repeated_scan":       ["single_pass_aggregation", "pushdown"],
+    "intersect":           ["intersect_to_exists"],
+    "union_year":          ["union_cte_split"],
+    "exists_repeat":       ["materialize_cte"],
+    "complex_multi_join":  [],  # No gold pattern, needs EXPLAIN ANALYZE
+    "window_fn":           [],  # No gold pattern, needs EXPLAIN ANALYZE
+}
+
+
+# ============================================================================
 # DATA LOADING
 # ============================================================================
 
@@ -117,10 +255,13 @@ def load_all_query_states() -> Dict[str, QueryState]:
                 # Track transforms (skip empty ones)
                 for transform in transforms:
                     qs.transforms_tried.add(transform)
-                    if state.get('status') == 'success' and state.get('speedup', 1.0) > 1.0:
+                    speedup = state.get('speedup', 1.0)
+                    status = state.get('status', 'unknown')
+                    if status == 'success' and speedup > 1.1:
                         qs.transforms_succeeded.add(transform)
-                    elif state.get('status') != 'success':
+                    elif status in ('error', 'regression') or speedup < 0.95:
                         qs.transforms_failed.add(transform)
+                    # else: neutral (tried, no meaningful improvement or regression)
 
             states[query_id] = qs
         except Exception as e:
@@ -355,60 +496,105 @@ def score_recommendation(
     return rec
 
 
+def get_matching_patterns(query_num: int) -> List[str]:
+    """Get gold patterns that match this query's structural features"""
+    features = TPCDS_QUERY_FEATURES.get(query_num, [])
+    matched = []
+    seen = set()
+    for feature in features:
+        for pattern in FEATURE_TO_PATTERN.get(feature, []):
+            if pattern not in seen:
+                matched.append(pattern)
+                seen.add(pattern)
+    return matched
+
+
+def needs_explain_analyze(query_num: int) -> List[str]:
+    """Return EXPLAIN ANALYZE investigation reasons if no gold pattern fits"""
+    features = TPCDS_QUERY_FEATURES.get(query_num, [])
+    reasons = []
+    if "complex_multi_join" in features:
+        reasons.append("Complex multi-join: Check join ordering and cardinality estimates (actual vs EC)")
+    if "window_fn" in features:
+        reasons.append("Window functions: Check for full sort on grouped TopN (ROW_NUMBER OVER PARTITION)")
+    return reasons
+
+
 def generate_recommendations(
     qs: QueryState,
-    patterns: Dict[str, TransformStats]
+    patterns: Dict[str, TransformStats],
+    failure_queries: Optional[Dict[str, Set[str]]] = None,
 ) -> List[Recommendation]:
-    """Generate 2-5 recommendations for a query
+    """Generate recommendations based on query structure, not generic success rates.
 
     Strategy:
-    - Untried transforms: Safe bets, prioritize these
-    - Failed transforms: Learn what didn't work, only recommend with good reason
-    - Succeeded transforms: Build on them
-    - Remember: For regressions, baseline is State 0, never build from the failed state
+    1. Match gold patterns to this query's TPC-DS structural features
+    2. Filter out patterns already tried (unless there's a reason to retry)
+    3. For queries where no gold pattern fits, recommend EXPLAIN ANALYZE investigation
+    4. Always start from baseline (State 0) for regressions
     """
     recommendations = {}
 
-    # First: Untried transforms (no failure history, safest bets)
-    for transform in ['prefetch_fact_join', 'single_pass_aggregation', 'date_cte_isolate', 'early_filter',
-                      'dimension_cte_isolate', 'multi_dimension_prefetch', 'materialize_cte',
-                      'union_cte_split', 'decorrelate', 'pushdown', 'or_to_union', 'intersect_to_exists',
-                      'multi_date_range_cte']:
-        if transform in patterns and transform not in qs.transforms_tried:
-            pattern = patterns[transform]
+    # Get structurally matched patterns for this query
+    matched_patterns = get_matching_patterns(qs.query_num)
+    explain_reasons = needs_explain_analyze(qs.query_num)
+
+    # Score matched patterns that haven't been tried
+    for transform in matched_patterns:
+        if transform not in patterns:
+            continue
+
+        pattern = patterns[transform]
+
+        if transform not in qs.transforms_tried:
+            # Not tried yet - recommend it
+            features = TPCDS_QUERY_FEATURES.get(qs.query_num, [])
+            # Find which feature matched this pattern
+            matching_features = []
+            for feat in features:
+                if transform in FEATURE_TO_PATTERN.get(feat, []):
+                    matching_features.append(feat)
+
+            rationale = f"Query has {', '.join(matching_features)} structure"
             rec = score_recommendation(qs, transform, pattern, from_best_state=False)
-            if rec and rec.confidence > 40 and transform not in recommendations:
+            if rec:
+                rec.rationale = rationale
+                # Boost confidence for structural match
+                rec.confidence = min(100, rec.confidence + 15)
                 recommendations[transform] = rec
 
-    # Second: Build on what succeeded (compound benefits)
-    if qs.best_speedup > 1.0 and qs.best_worker:
-        best_state = None
-        for state_id in [qs.best_worker, 'kimi', 'v2_standard']:
-            if state_id in qs.states:
-                best_state = qs.states[state_id]
-                break
+        elif transform in qs.transforms_failed:
+            # Tried and failed - note it but don't recommend unless strong reason
+            pass  # History shows failure, skip
 
-        if best_state and best_state.transforms:
-            current_transforms = set(best_state.transforms)
-            for transform in patterns:
-                if (transform not in current_transforms and
-                    transform not in qs.transforms_tried and
-                    transform not in recommendations):
-                    pattern = patterns[transform]
-                    rec = score_recommendation(qs, transform, pattern, from_best_state=True)
-                    if rec and rec.confidence > 50:
-                        recommendations[transform] = rec
+    # If no structural matches left untried, suggest EXPLAIN ANALYZE
+    if not recommendations and explain_reasons:
+        rec = Recommendation(
+            transform="EXPLAIN_ANALYZE",
+            confidence=60,
+            expected_speedup=0.0,
+            risk="MEDIUM",
+            rationale="No untried gold pattern matches query structure. " + " ".join(explain_reasons),
+        )
+        recommendations["EXPLAIN_ANALYZE"] = rec
 
-    # Third: Failed transforms only if high success rate elsewhere (indicates query-specific issue)
-    if len(recommendations) < 2:
-        for transform in qs.transforms_failed:
-            if transform in patterns and transform not in recommendations:
-                pattern = patterns[transform]
-                if pattern.success_rate > 0.7:  # High success elsewhere, worth retry
-                    rec = score_recommendation(qs, transform, pattern, from_best_state=False)
-                    if rec and rec.confidence > 50:
-                        rec.rationale = f"(Tried before but high success rate elsewhere - worth retry)"
-                        recommendations[transform] = rec
+    # If we still have no recommendations, check if ALL matched patterns were tried
+    if not recommendations and matched_patterns:
+        tried_and_failed = [p for p in matched_patterns if p in qs.transforms_failed]
+        tried_and_succeeded = [p for p in matched_patterns if p in qs.transforms_succeeded]
+
+        if tried_and_failed and not tried_and_succeeded:
+            # All structural matches failed - need novel approach
+            rec = Recommendation(
+                transform="EXPLAIN_ANALYZE",
+                confidence=50,
+                expected_speedup=0.0,
+                risk="MEDIUM",
+                rationale=f"Matched patterns already tried and failed ({', '.join(tried_and_failed)}). "
+                          f"Run EXPLAIN ANALYZE to identify specific bottleneck: "
+                          f"cardinality misestimates, nested loop joins, missing filter pushdown.",
+            )
+            recommendations["EXPLAIN_ANALYZE"] = rec
 
     sorted_recs = sorted(recommendations.values(), key=lambda r: r.confidence, reverse=True)
     return sorted_recs[:5]
@@ -461,11 +647,14 @@ def format_query_analysis(
         lines.append(f"\n**Transforms Tried** (learning record):")
         succeeded = sorted(qs.transforms_succeeded)
         failed = sorted(qs.transforms_failed)
+        neutral = sorted(qs.transforms_tried - qs.transforms_succeeded - qs.transforms_failed)
 
         if succeeded:
-            lines.append(f"✓ SUCCEEDED: {', '.join(succeeded)}")
+            lines.append(f"  Worked: {', '.join(succeeded)}")
+        if neutral:
+            lines.append(f"  No effect: {', '.join(neutral)}")
         if failed:
-            lines.append(f"✗ FAILED: {', '.join(failed)}")
+            lines.append(f"  Failed: {', '.join(failed)}")
 
     # Untried gold patterns - opportunities
     untried = set(patterns.keys()) - qs.transforms_tried
@@ -476,13 +665,18 @@ def format_query_analysis(
 
     # Recommendations
     if recommendations:
-        lines.append(f"\n**Top Recommendations**:")
+        lines.append(f"\n**Recommended Next Moves**:")
         for i, rec in enumerate(recommendations[:3], 1):
-            pattern = patterns[rec.transform]
-            lines.append(f"\n{i}. **{rec.transform}** [CONFIDENCE: {rec.confidence:.0f}%] [RISK: {rec.risk}]")
-            lines.append(f"   - Expected: {rec.expected_speedup:.2f}x improvement")
-            lines.append(f"   - Success Rate: {pattern.success_rate*100:.0f}%")
-            lines.append(f"   - Rationale: {rec.rationale}")
+            if rec.transform == "EXPLAIN_ANALYZE":
+                lines.append(f"\n{i}. **EXPLAIN ANALYZE investigation** [CONFIDENCE: {rec.confidence:.0f}%]")
+                lines.append(f"   - {rec.rationale}")
+            else:
+                pattern = patterns.get(rec.transform)
+                success_str = f"{pattern.success_rate*100:.0f}%" if pattern else "N/A"
+                lines.append(f"\n{i}. **{rec.transform}** [CONFIDENCE: {rec.confidence:.0f}%] [RISK: {rec.risk}]")
+                lines.append(f"   - Why: {rec.rationale}")
+                lines.append(f"   - Verified: {rec.expected_speedup:.2f}x on benchmark queries")
+                lines.append(f"   - Success rate: {success_str}")
 
     return "\n".join(lines)
 

@@ -150,6 +150,7 @@
 - v2_standard: 1.00x [materialize_cte] success
 
 **Transforms Tried** (learning record):
+  No effect: materialize_cte
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -165,22 +166,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **single_pass_aggregation** [CONFIDENCE: 65%] [RISK: HIGH]
+   - Why: Query has repeated_scan structure
+   - Verified: 4.47x on benchmark queries
+   - Success rate: 0%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **or_to_union** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has or_condition structure
+   - Verified: 3.17x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **pushdown** [CONFIDENCE: 31%] [RISK: HIGH]
+   - Why: Query has repeated_scan structure
+   - Verified: 2.11x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 87.5 (TOP_20%)
 
@@ -196,6 +197,7 @@
 - v2_standard: 1.00x [pushdown] success
 
 **Transforms Tried** (learning record):
+  No effect: pushdown
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -211,22 +213,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 86.0 (TOP_20%)
 
@@ -242,6 +239,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -257,22 +255,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter, dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 85.0 (TOP_20%)
 
@@ -289,6 +287,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -304,22 +303,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **union_cte_split** [CONFIDENCE: 84%] [RISK: LOW]
+   - Why: Query has union_year structure
+   - Verified: 1.36x on benchmark queries
+   - Success rate: 100%
 
 **Priority Score**: 83.4 (TOP_20%)
 
@@ -336,6 +330,7 @@
 - v2_standard: 1.00x [pushdown] success
 
 **Transforms Tried** (learning record):
+  No effect: pushdown
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -351,22 +346,12 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
-
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+1. **multi_date_range_cte** [CONFIDENCE: 44%] [RISK: HIGH]
+   - Why: Query has multi_date_alias structure
+   - Verified: 2.35x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 82.5 (TOP_20%)
 
@@ -383,6 +368,7 @@
 - v2_standard: 1.00x [or_to_union] success
 
 **Transforms Tried** (learning record):
+  No effect: or_to_union
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -398,22 +384,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter, dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 82.5 (TOP_20%)
 
@@ -431,6 +417,7 @@
 - retry3w_2: 0.67x [none] regression
 
 **Transforms Tried** (learning record):
+  No effect: pushdown
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -446,22 +433,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **union_cte_split** [CONFIDENCE: 84%] [RISK: LOW]
+   - Why: Query has union_year structure
+   - Verified: 1.36x on benchmark queries
+   - Success rate: 100%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 82.3 (TOP_20%)
 
@@ -478,6 +465,7 @@
 - v2_standard: 1.00x [pushdown] success
 
 **Transforms Tried** (learning record):
+  No effect: pushdown
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -493,22 +481,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 81.7 (TOP_20%)
 
@@ -525,6 +508,7 @@
 - v2_standard: 1.00x [semantic_rewrite] success
 
 **Transforms Tried** (learning record):
+  No effect: semantic_rewrite
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -541,22 +525,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **single_pass_aggregation** [CONFIDENCE: 65%] [RISK: HIGH]
+   - Why: Query has repeated_scan structure
+   - Verified: 4.47x on benchmark queries
+   - Success rate: 0%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **pushdown** [CONFIDENCE: 31%] [RISK: HIGH]
+   - Why: Query has repeated_scan structure
+   - Verified: 2.11x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 77.5 (TOP_20%)
 
@@ -572,6 +551,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -587,22 +567,12 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
-
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
 **Priority Score**: 76.6 (TOP_20%)
 
@@ -619,6 +589,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -634,22 +605,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **decorrelate** [CONFIDENCE: 44%] [RISK: HIGH]
+   - Why: Query has correlated_subquery structure
+   - Verified: 2.92x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 75.8 (TOP_20%)
 
@@ -679,22 +645,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **intersect_to_exists** [CONFIDENCE: 43%] [RISK: HIGH]
+   - Why: Query has intersect structure
+   - Verified: 1.83x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 75.3 (TOP_20%)
 
@@ -724,22 +690,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has correlated_subquery, date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **decorrelate** [CONFIDENCE: 44%] [RISK: HIGH]
+   - Why: Query has correlated_subquery structure
+   - Verified: 2.92x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 74.7 (TOP_20%)
 
@@ -770,22 +736,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has correlated_subquery structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **decorrelate** [CONFIDENCE: 44%] [RISK: HIGH]
+   - Why: Query has correlated_subquery structure
+   - Verified: 2.92x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_date_range_cte** [CONFIDENCE: 44%] [RISK: HIGH]
+   - Why: Query has multi_date_alias structure
+   - Verified: 2.35x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 71.9 (TOP_20%)
 
@@ -802,6 +768,7 @@
 - v2_standard: 1.00x [semantic_rewrite] success
 
 **Transforms Tried** (learning record):
+  No effect: semantic_rewrite
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -818,22 +785,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **materialize_cte** [CONFIDENCE: 24%] [RISK: HIGH]
+   - Why: Query has exists_repeat structure
+   - Verified: 1.37x on benchmark queries
+   - Success rate: 0%
 
 
 # TIER 2: INCREMENTAL OPPORTUNITIES (Priority 40-70)
@@ -854,7 +821,7 @@
 - v2_standard: 1.00x [pushdown] success
 
 **Transforms Tried** (learning record):
-✓ SUCCEEDED: pushdown
+  Worked: pushdown
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -870,22 +837,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **union_cte_split** [CONFIDENCE: 84%] [RISK: LOW]
+   - Why: Query has union_year structure
+   - Verified: 1.36x on benchmark queries
+   - Success rate: 100%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 62.5 (TOP_50%)
 
@@ -902,6 +869,7 @@
 - v2_standard: 1.00x [multi_push_predicate] success
 
 **Transforms Tried** (learning record):
+  No effect: multi_push_predicate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -918,22 +886,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter, dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 62.5 (TOP_50%)
 
@@ -950,6 +918,7 @@
 - v2_standard: 1.00x [semantic_rewrite] success
 
 **Transforms Tried** (learning record):
+  No effect: semantic_rewrite
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -966,22 +935,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **multi_date_range_cte** [CONFIDENCE: 44%] [RISK: HIGH]
+   - Why: Query has multi_date_alias structure
+   - Verified: 2.35x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 62.5 (TOP_50%)
 
@@ -997,6 +966,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -1012,22 +982,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter, dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 62.4 (TOP_50%)
 
@@ -1044,6 +1014,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -1059,22 +1030,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 61.9 (TOP_50%)
 
@@ -1091,6 +1062,7 @@
 - v2_standard: 1.00x [pushdown] success
 
 **Transforms Tried** (learning record):
+  No effect: pushdown
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -1106,22 +1078,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 61.5 (TOP_20%)
 
@@ -1139,6 +1106,7 @@
 - retry3w_2: 1.69x [none] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -1154,22 +1122,12 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
-
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
 **Priority Score**: 61.0 (TOP_50%)
 
@@ -1186,6 +1144,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -1201,22 +1160,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 61.0 (TOP_50%)
 
@@ -1233,6 +1192,7 @@
 - v2_standard: 1.00x [or_to_union] success
 
 **Transforms Tried** (learning record):
+  No effect: or_to_union
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -1248,22 +1208,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter, dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 60.0 (TOP_50%)
 
@@ -1281,6 +1241,7 @@
 - retry3w_1: 0.24x [none] regression
 
 **Transforms Tried** (learning record):
+  No effect: or_to_union
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -1296,22 +1257,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **dimension_cte_isolate** [CONFIDENCE: 39%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter structure
+   - Verified: 1.93x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 59.8 (TOP_50%)
 
@@ -1328,6 +1289,7 @@
 - v2_standard: 1.00x [or_to_union] success
 
 **Transforms Tried** (learning record):
+  No effect: or_to_union
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -1343,22 +1305,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 59.5 (TOP_50%)
 
@@ -1375,6 +1337,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -1390,22 +1353,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **union_cte_split** [CONFIDENCE: 84%] [RISK: LOW]
+   - Why: Query has union_year structure
+   - Verified: 1.36x on benchmark queries
+   - Success rate: 100%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_date_range_cte** [CONFIDENCE: 44%] [RISK: HIGH]
+   - Why: Query has multi_date_alias structure
+   - Verified: 2.35x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 58.5 (TOP_50%)
 
@@ -1422,6 +1385,7 @@
 - v2_standard: 1.00x [pushdown] success
 
 **Transforms Tried** (learning record):
+  No effect: pushdown
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -1437,22 +1401,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has correlated_subquery structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **decorrelate** [CONFIDENCE: 44%] [RISK: HIGH]
+   - Why: Query has correlated_subquery structure
+   - Verified: 2.92x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 57.5 (TOP_50%)
 
@@ -1470,6 +1429,7 @@
 - retry3w_2: 0.69x [none] regression
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -1485,22 +1445,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_date_range_cte** [CONFIDENCE: 44%] [RISK: HIGH]
+   - Why: Query has multi_date_alias structure
+   - Verified: 2.35x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 57.5 (TOP_50%)
 
@@ -1516,6 +1476,7 @@
 - v2_standard: 1.00x [pushdown] success
 
 **Transforms Tried** (learning record):
+  No effect: pushdown
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -1531,22 +1492,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 57.5 (TOP_50%)
 
@@ -1564,6 +1520,7 @@
 - retry3w_2: 0.80x [none] regression
 
 **Transforms Tried** (learning record):
+  No effect: or_to_union
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -1579,22 +1536,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 57.5 (TOP_50%)
 
@@ -1610,6 +1567,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -1625,22 +1583,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 57.5 (TOP_50%)
 
@@ -1657,6 +1615,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -1672,22 +1631,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter, dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 57.5 (TOP_50%)
 
@@ -1704,6 +1663,7 @@
 - v2_standard: 1.00x [or_to_union] success
 
 **Transforms Tried** (learning record):
+  No effect: or_to_union
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -1719,22 +1679,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 57.5 (TOP_50%)
 
@@ -1751,6 +1711,7 @@
 - v2_standard: 1.00x [or_to_union] success
 
 **Transforms Tried** (learning record):
+  No effect: or_to_union
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -1766,22 +1727,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter, dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 57.2 (TOP_50%)
 
@@ -1798,6 +1759,7 @@
 - v2_standard: 1.00x [or_to_union] success
 
 **Transforms Tried** (learning record):
+  No effect: or_to_union
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -1813,22 +1775,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 57.2 (TOP_50%)
 
@@ -1845,6 +1807,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -1860,22 +1823,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **union_cte_split** [CONFIDENCE: 84%] [RISK: LOW]
+   - Why: Query has union_year structure
+   - Verified: 1.36x on benchmark queries
+   - Success rate: 100%
 
 **Priority Score**: 57.2 (TOP_50%)
 
@@ -1892,6 +1850,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -1907,22 +1866,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter, dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 56.8 (TOP_50%)
 
@@ -1939,6 +1898,7 @@
 - v2_standard: 1.00x [or_to_union] success
 
 **Transforms Tried** (learning record):
+  No effect: or_to_union
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -1954,22 +1914,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has multi_dim_filter, dim_fact_chain structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 56.4 (TOP_20%)
 
@@ -1986,7 +1946,8 @@
 - v2_standard: 1.00x [decorrelate] success
 
 **Transforms Tried** (learning record):
-✓ SUCCEEDED: early_filter
+  Worked: early_filter
+  No effect: decorrelate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - date_cte_isolate
@@ -2001,22 +1962,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 55.0 (TOP_50%)
 
@@ -2033,6 +1989,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -2048,22 +2005,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **decorrelate** [CONFIDENCE: 44%] [RISK: HIGH]
+   - Why: Query has correlated_subquery structure
+   - Verified: 2.92x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 55.0 (TOP_20%)
 
@@ -2094,22 +2046,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **single_pass_aggregation** [CONFIDENCE: 65%] [RISK: HIGH]
+   - Why: Query has repeated_scan structure
+   - Verified: 4.47x on benchmark queries
+   - Success rate: 0%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **pushdown** [CONFIDENCE: 31%] [RISK: HIGH]
+   - Why: Query has repeated_scan structure
+   - Verified: 2.11x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 49.7 (TOP_50%)
 
@@ -2139,22 +2086,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **date_cte_isolate** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has correlated_subquery, date_filter structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **decorrelate** [CONFIDENCE: 44%] [RISK: HIGH]
+   - Why: Query has correlated_subquery structure
+   - Verified: 2.92x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 45.0 (BOTTOM_50%)
 
@@ -2171,6 +2118,7 @@
 - v2_standard: 1.00x [date_cte_isolate] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -2186,22 +2134,22 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter, dim_fact_chain structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
+2. **early_filter** [CONFIDENCE: 50%] [RISK: HIGH]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 4.00x on benchmark queries
+   - Success rate: 0%
 
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+3. **multi_dimension_prefetch** [CONFIDENCE: 42%] [RISK: HIGH]
+   - Why: Query has dim_fact_chain structure
+   - Verified: 2.71x on benchmark queries
+   - Success rate: 0%
 
 **Priority Score**: 40.9 (TOP_50%)
 
@@ -2219,6 +2167,7 @@
 - retry3w_2: 1.44x [none] success
 
 **Transforms Tried** (learning record):
+  No effect: date_cte_isolate
 
 **Gold Patterns NOT Tried** (candidates for next attempt):
   - decorrelate
@@ -2234,22 +2183,17 @@
   - single_pass_aggregation
   - union_cte_split
 
-**Top Recommendations**:
+**Recommended Next Moves**:
 
-1. **prefetch_fact_join** [CONFIDENCE: 93%] [RISK: LOW]
-   - Expected: 3.77x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 3.77x average speedup
+1. **prefetch_fact_join** [CONFIDENCE: 100%] [RISK: LOW]
+   - Why: Query has date_filter structure
+   - Verified: 3.77x on benchmark queries
+   - Success rate: 100%
 
-2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
-   - Expected: 1.36x improvement
-   - Success Rate: 100%
-   - Rationale: Transform has 100% success rate with 1.36x average speedup
-
-3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
-   - Expected: 4.47x improvement
-   - Success Rate: 0%
-   - Rationale: Transform has 0% success rate with 4.47x average speedup
+2. **intersect_to_exists** [CONFIDENCE: 43%] [RISK: HIGH]
+   - Why: Query has intersect structure
+   - Verified: 1.83x on benchmark queries
+   - Success rate: 0%
 
 
 # TIER 3: MATURE WINS (Priority < 40)
