@@ -19,10 +19,8 @@
 
 ## Complete Query Leaderboard (All 99 Queries by Runtime)
 
-| Rank | Query | Runtime | Speedup | Classification | Time Savings @ 2x |
-
-|------|-------|---------|---------|-----------------|------------------|
-
+| Rank | Query | Runtime | Speedup | Status | Savings @2x |
+|------|-------|---------|---------|--------|-------------|
 | 1 | Q23 | 24404ms | 1.06x | NEUTRAL | 12202ms ⭐ TOP 20 |
 | 2 | Q4 | 10209ms | 1.03x | NEUTRAL | 5104ms ⭐ TOP 20 |
 | 3 | Q14 | 9211ms | 0.95x | NEUTRAL | 4605ms ⭐ TOP 20 |

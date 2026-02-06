@@ -508,8 +508,8 @@ def generate_executive_dashboard(
 
     # Complete leaderboard of all 99 queries by runtime
     lines.append("\n## Complete Query Leaderboard (All 99 Queries by Runtime)\n")
-    lines.append("| Rank | Query | Runtime | Speedup | Classification | Time Savings @ 2x |\n")
-    lines.append("|------|-------|---------|---------|-----------------|------------------|\n")
+    lines.append("| Rank | Query | Runtime | Speedup | Status | Savings @2x |")
+    lines.append("|------|-------|---------|---------|--------|-------------|")
 
     sorted_by_runtime = sorted(
         [s for s in all_states.values() if s.original_ms > 0],
@@ -519,10 +519,10 @@ def generate_executive_dashboard(
 
     for i, qs in enumerate(sorted_by_runtime, 1):
         savings_2x = qs.original_ms / 2
-        rank_marker = "⭐ TOP 20" if i <= 20 else ""
+        top_mark = "⭐ TOP 20" if i <= 20 else ""
         lines.append(
             f"| {i} | Q{qs.query_num} | {qs.original_ms:.0f}ms | {qs.best_speedup:.2f}x | "
-            f"{qs.category} | {savings_2x:.0f}ms {rank_marker} |"
+            f"{qs.category} | {savings_2x:.0f}ms {top_mark} |"
         )
 
     # Transform stats
