@@ -1,0 +1,301 @@
+## Example: Date CTE Isolation (DATE_CTE_ISOLATE)
+Verified speedup: 4.00x
+
+### Input:
+[main_query]:
+SELECT a.ca_state state, count(*) cnt
+FROM customer_address a, customer c, store_sales s, date_dim d, item i
+WHERE a.ca_address_sk = c.c_current_addr_sk
+  AND c.c_customer_sk = s.ss_customer_sk
+  AND s.ss_sold_date_sk = d.d_date_sk
+  AND s.ss_item_sk = i.i_item_sk
+  AND d.d_month_seq = (SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1)
+  AND i.i_current_price > 1.2 * (SELECT avg(j.i_current_price) FROM item j WHERE j.i_category = i.i_category)
+GROUP BY a.ca_state HAVING count(*) >= 10
+ORDER BY cnt, a.ca_state LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "target_month": "SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1",
+        "category_avg_price": "SELECT i_category, AVG(i_current_price) * 1.2 AS avg_threshold FROM item GROUP BY i_category",
+        "filtered_dates": "SELECT d_date_sk FROM date_dim JOIN target_month ON d_month_seq = target_month.d_month_seq",
+        "filtered_sales": "SELECT ss_customer_sk, ss_item_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
+        "main_query": "SELECT a.ca_state AS state, COUNT(*) AS cnt FROM customer_address a JOIN customer c ON a.ca_address_sk = c.c_current_addr_sk JOIN filtered_sales s ON c.c_customer_sk = s.ss_customer_sk JOIN item i ON s.ss_item_sk = i.i_item_sk JOIN category_avg_price cap ON i.i_category = cap.i_category WHERE i.i_current_price > cap.avg_threshold GROUP BY a.ca_state HAVING COUNT(*) >= 10 ORDER BY cnt, a.ca_state LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "2.0x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Extract date month_seq subquery into CTE. Extract category average into separate CTE with GROUP BY. Join instead of correlated subquery. This allows each CTE to be scanned once.
+
+---
+
+## Example: Prefetch Fact Join (PREFETCH_FACT_JOIN)
+Verified speedup: 3.77x
+
+### Input:
+[main_query]:
+SELECT * FROM (
+  SELECT i_manager_id, sum(ss_sales_price) sum_sales,
+    avg(sum(ss_sales_price)) OVER (PARTITION BY i_manager_id) avg_monthly_sales
+  FROM item, store_sales, date_dim, store
+  WHERE ss_item_sk = i_item_sk AND ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk
+    AND d_month_seq IN (1200,1201,1202,1203,1204,1205,1206,1207,1208,1209,1210,1211)
+    AND ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN (...))
+      OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN (...)))
+  GROUP BY i_manager_id, d_moy
+) AS tmp1
+WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
+ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "prefetch_fact_join",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk, d_moy FROM date_dim WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)",
+        "filtered_sales": "SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_moy FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
+        "main_query": "SELECT * FROM (SELECT i_manager_id, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales FROM item JOIN filtered_sales ON ss_item_sk = i_item_sk JOIN store ON ss_store_sk = s_store_sk WHERE ((i_category IN ('Books', 'Children', 'Electronics') AND i_class IN ('personal', 'portable', 'reference', 'self-help') AND i_brand IN (...)) OR (i_category IN ('Women', 'Music', 'Men') AND i_class IN ('accessories', 'classical', 'fragrances', 'pants') AND i_brand IN (...))) GROUP BY i_manager_id, d_moy) AS tmp1 WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "3.77x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** First CTE filters the dimension (date_dim). Second CTE pre-joins this with the fact table (store_sales). This creates a smaller intermediate result before joining with other dimension tables. The pre-join materializes the filtered fact rows, making subsequent joins faster.
+
+---
+
+## Example: Early Dimension Filter (EARLY_FILTER)
+Verified speedup: 4.00x
+
+### Input:
+[main_query]:
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales
+FROM (SELECT ss.ss_customer_sk, CASE WHEN sr.sr_return_quantity IS NOT NULL
+        THEN (ss.ss_quantity - sr.sr_return_quantity) * ss.ss_sales_price
+        ELSE ss.ss_quantity * ss.ss_sales_price END AS act_sales
+      FROM store_sales ss LEFT JOIN store_returns sr ON ss.ss_item_sk = sr.sr_item_sk
+      JOIN reason r ON sr.sr_reason_sk = r.r_reason_sk
+      WHERE r.r_reason_desc = 'duplicate purchase') t
+GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "early_filter",
+      "nodes": {
+        "filtered_reason": "SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'",
+        "filtered_returns": "SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk",
+        "main_query": "SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100"
+      },
+      "invariants_kept": [
+        "output columns unchanged",
+        "grain preserved",
+        "same result rows"
+      ],
+      "expected_speedup": "2.71x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Filter dimension table (reason) FIRST, then join to fact. Reduces returns to only 'duplicate purchase' before expensive store_sales join.
+
+---
+
+## CONSTRAINTS (Learned from Benchmark Failures)
+
+The following constraints are MANDATORY based on observed failures:
+
+### LITERAL_PRESERVATION [CRITICAL]
+CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+
+### OR_TO_UNION_LIMIT [HIGH]
+CAUTION with OR→UNION: Only split OR conditions into UNION ALL when there are ≤3 simple branches AND they have different access patterns. If you have nested ORs (e.g., 3 conditions × 3 values = 9 combinations), DO NOT expand them - keep the original OR structure. DuckDB handles OR predicates efficiently. Over-splitting causes multiple scans of fact tables and severe regressions (0.23x-0.41x observed). When in doubt, preserve the original OR structure.
+
+
+---
+
+You are an autonomous Query Rewrite Engine. Your goal is to maximize execution speed while strictly preserving semantic invariants.
+
+Output atomic rewrite sets in JSON.
+
+RULES:
+- Primary Goal: Maximize execution speed while strictly preserving semantic invariants.
+- Allowed Transforms: Use the provided list. If a standard SQL optimization applies that is not listed, label it "semantic_rewrite".
+- Atomic Sets: Group dependent changes (e.g., creating a CTE and joining it) into a single rewrite_set.
+- Contracts: Output columns, grain, and total result rows must remain invariant.
+- Naming: Use descriptive CTE names (e.g., `filtered_returns` vs `cte1`).
+- Column Aliasing: Permitted only for aggregations or disambiguation.
+
+ALLOWED TRANSFORMS: pushdown, decorrelate, or_to_union, early_filter, date_cte_isolate, materialize_cte, flatten_subquery, reorder_join, multi_push_predicate, inline_cte, remove_redundant, semantic_rewrite
+
+OUTPUT FORMAT:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "transform_name",
+      "nodes": {
+        "node_id": "new SQL..."
+      },
+      "invariants_kept": ["list of preserved semantics"],
+      "expected_speedup": "2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "what was changed and why"
+}
+```
+
+## Target Nodes
+  [filtered_returns] 
+  [customer_total_return] GROUP_BY
+
+## Subgraph Slice
+[filtered_returns] type=cte
+```sql
+SELECT sr.sr_customer_sk, sr.sr_store_sk, sr.SR_FEE FROM store_returns AS sr JOIN date_dim AS d ON sr.sr_returned_date_sk = d.d_date_sk JOIN store AS s ON sr.sr_store_sk = s.s_store_sk WHERE d.d_year = 2000 AND s.s_state = 'SD'
+```
+
+[customer_total_return] type=cte
+```sql
+SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM filtered_returns GROUP BY sr_customer_sk, sr_store_sk
+```
+
+[store_avg_return] type=cte
+```sql
+SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk
+```
+
+[main_query] type=main
+```sql
+SELECT c.c_customer_id FROM customer_total_return AS ctr1 JOIN store_avg_return AS sar ON ctr1.ctr_store_sk = sar.ctr_store_sk JOIN customer AS c ON ctr1.ctr_customer_sk = c.c_customer_sk WHERE ctr1.ctr_total_return > sar.avg_return_threshold ORDER BY c.c_customer_id LIMIT 100
+```
+
+
+## Node Contracts
+[filtered_returns]:
+  output_columns: ['sr_customer_sk', 'sr_store_sk', 'SR_FEE']
+  required_predicates: ['d.d_year = 2000', "s.s_state = 'SD'"]
+[customer_total_return]:
+  output_columns: ['ctr_customer_sk', 'ctr_store_sk', 'ctr_total_return']
+  grain: ['sr_customer_sk', 'sr_store_sk']
+[store_avg_return]:
+  output_columns: ['ctr_store_sk', 'avg_return_threshold']
+  grain: ['ctr_store_sk']
+[main_query]:
+  output_columns: ['c_customer_id']
+  required_predicates: ['ctr1.ctr_total_return > sar.avg_return_threshold']
+
+## Downstream Usage
+[filtered_returns]: downstream_refs=['sr_store_sk', 'SR_FEE', 'sr_customer_sk']
+[customer_total_return]: downstream_refs=['ctr_store_sk', 'ctr_total_return']
+
+## Cost Attribution
+[filtered_returns]: 82.4% cost, ~547442 rows, ops=[SEQ_SCAN[store_returns], SEQ_SCAN[date_dim], SEQ_SCAN[store]]
+[customer_total_return]: 12.4% cost, ~1000 rows, ops=[HASH_GROUP_BY, HASH_JOIN]
+[store_avg_return]: 0% cost, ~1000 rows, ops=[HASH_GROUP_BY, HASH_JOIN, SEQ_SCAN[customer_total_return]]
+[main_query]: 4.7% cost, ~499996 rows, ops=[SEQ_SCAN[customer], SEQ_SCAN[CTE_SCAN], SEQ_SCAN[CTE_SCAN]]
+
+## Detected Opportunities
+## Knowledge Base Patterns (verified on TPC-DS)
+## Detected Optimization Opportunities
+
+1. **QT-OPT-003** - Date CTE Isolation
+  Trigger: date_dim joined with d_year/d_qoy/d_month filter, fact table present
+  Rewrite: Create CTE: SELECT d_date_sk FROM date_dim WHERE filter, join fact to CTE early
+   Matched: date_dim filter with fact table
+
+
+## Node-Specific Opportunities
+PUSHDOWN: [main_query] filters on [customer_total_return] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+PUSHDOWN: [main_query] filters on [store_avg_return] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+Now output your rewrite_sets:
+
+## Execution Plan
+```
+Operators by cost:
+- SEQ_SCAN(store_returns): 82.2% cost, 547,442 rows
+- HASH_GROUP_BY: 7.6% cost, 157,800 rows
+- SEQ_SCAN(store_returns): 4.1% cost, 499,996 rows
+- HASH_JOIN: 1.7% cost, 61,974 rows
+- HASH_JOIN: 1.1% cost, 61,989 rows
+
+Scans:
+- store_returns x1: 34,530,384 rows (no filter)
+- customer x1: 2,500,000 → 499,996 rows (filtered)
+- CTE_SCAN x2: 157,800 rows (no filter)
+- date_dim x1: 73,049 → 366 rows (filtered)
+- store x1: 102 → 35 rows (filtered)
+
+Misestimates:
+- PROJECTION: est 7,834 vs actual 157,800 (20.1x)
+- HASH_GROUP_BY: est 7,834 vs actual 157,800 (20.1x)
+- PROJECTION: est 7,835 vs actual 161,697 (20.6x)
+- PROJECTION: est 7,835 vs actual 161,697 (20.6x)
+- PROJECTION: est 7,835 vs actual 161,697 (20.6x)
+- HASH_JOIN: est 7,835 vs actual 161,697 (20.6x)
+- HASH_JOIN: est 23,044 vs actual 547,442 (23.8x)
+- SEQ_SCAN: est 2,877,532 vs actual 547,442 (5.3x)
+- PROJECTION: est 25 vs actual 61,974 (2479.0x)
+- HASH_JOIN: est 25 vs actual 61,974 (2479.0x)
+- HASH_JOIN: est 30 vs actual 61,989 (2066.3x)
+- CTE_SCAN: est 7,834 vs actual 157,800 (20.1x)
+- PROJECTION: est 7,834 vs actual 157,800 (20.1x)
+- CTE_SCAN: est 7,834 vs actual 157,800 (20.1x)
+
+Joins:
+- HASH_JOIN: ? x ? -> 161,697 rows (late)
+- HASH_JOIN: store_returns x ? -> 547,442 rows (late)
+- HASH_JOIN: customer x ? -> 61,974 rows
+- HASH_JOIN: ? x ? -> 61,989 rows (late)
+```
+
+
+## Previous Attempts
+
+- baseline: 1.00x [none] NEUTRAL
+- kimi: 2.92x [decorrelate] WIN
+- v2_standard: 1.00x [decorrelate] NEUTRAL
+
+**Worked**: decorrelate
+
+**IMPORTANT:** The following patterns were provided: date_cte_isolate, prefetch_fact_join, early_filter. Consider a DIFFERENT approach!
