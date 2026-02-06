@@ -74,12 +74,12 @@ class DSBRule:
 # =============================================================================
 
 def _load_examples() -> list[GoldExample]:
-    """Load all examples from ado/examples/ directory."""
+    """Load all examples from ado/examples/ and subdirectories."""
     if not EXAMPLES_DIR.exists():
         return []
 
     examples: list[GoldExample] = []
-    for path in sorted(EXAMPLES_DIR.glob("*.json")):
+    for path in sorted(EXAMPLES_DIR.glob("**/*.json")):
         try:
             data = json.loads(path.read_text())
             examples.append(GoldExample(
@@ -290,9 +290,14 @@ class ADOFAISSRecommender:
         try:
             import faiss
             import numpy as np
+            from .faiss_builder import SQLNormalizer
 
-            # Vectorize input SQL
-            vector = self.vectorizer.vectorize(sql, dialect="postgres")
+            # Fingerprint first: normalize literals/identifiers for consistent matching
+            normalizer = SQLNormalizer()
+            fingerprinted = normalizer.normalize(sql, dialect="postgres")
+
+            # Vectorize fingerprinted SQL
+            vector = self.vectorizer.vectorize(fingerprinted, dialect="postgres")
             vector = vector.reshape(1, -1).astype('float32')
 
             # Apply z-score normalization (same as index)

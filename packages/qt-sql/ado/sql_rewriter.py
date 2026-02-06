@@ -363,8 +363,31 @@ class SQLRewriter:
         self.parser = ResponseParser()
         self.assembler = SQLAssembler(dialect=dialect)
 
+    @staticmethod
+    def _extract_raw_sql(response: str) -> Optional[str]:
+        """Extract raw SQL from a ```sql code block in the response."""
+        # Find SQL code blocks
+        matches = re.findall(r'```sql\s*(.*?)\s*```', response, re.DOTALL)
+        if not matches:
+            return None
+
+        # Take the first SQL block that looks like a real query (not a comment-only block)
+        for match in matches:
+            stripped = match.strip()
+            if stripped == "-- Your rewritten query here":
+                continue
+            # Must contain SELECT to be a real query
+            if "SELECT" in stripped.upper():
+                return stripped
+
+        return None
+
     def apply_response(self, llm_response: str) -> RewriteResult:
-        """Parse LLM response and apply the first valid rewrite_set.
+        """Parse LLM response and apply the rewrite.
+
+        Supports two response formats:
+        1. Raw SQL in a ```sql code block (full-query prompt format)
+        2. JSON with rewrite_sets (legacy per-node format)
 
         Args:
             llm_response: Raw LLM response text (may contain markdown, JSON, etc.)
@@ -372,14 +395,27 @@ class SQLRewriter:
         Returns:
             RewriteResult with optimized SQL or error
         """
-        # Parse rewrite_sets from response
+        # Try raw SQL extraction first (full-query prompt format)
+        raw_sql = self._extract_raw_sql(llm_response)
+        if raw_sql and self._validate_sql(raw_sql):
+            # Infer transform from diff
+            transforms = infer_transforms_from_sql_diff(
+                self.original_sql, raw_sql
+            )
+            return RewriteResult(
+                success=True,
+                optimized_sql=raw_sql,
+                transform=transforms[0] if transforms else "semantic_rewrite",
+            )
+
+        # Fall back to JSON rewrite_sets format
         rewrite_sets = self.parser.parse(llm_response)
 
         if not rewrite_sets:
             return RewriteResult(
                 success=False,
                 optimized_sql=self.original_sql,
-                error="No rewrite_sets found in LLM response",
+                error="No valid SQL or rewrite_sets found in LLM response",
             )
 
         # Try each rewrite_set until one succeeds

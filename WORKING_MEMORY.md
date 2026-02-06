@@ -1,5 +1,5 @@
  Most recent tpc-ds run:
- 
+
   Ready to validate:
   - Collection: retry_neutrals/ (43 queries)
   - Variants per query: 4 workers (W1, W2, W3, W4)
@@ -21,6 +21,6 @@ Output Location:
     - Allows resuming if interrupted
 
 
-    best and latest prompt: 
+    best and latest prompt:
     Written to research/q47_prompt_test.txt — should be visible in your Windows file explorer at
   C:\Users\jakc9\Documents\QueryTorque_V8\research\q47_prompt_test.txt.

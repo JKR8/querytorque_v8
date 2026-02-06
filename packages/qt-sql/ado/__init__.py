@@ -1,32 +1,40 @@
-"""ADO (Autonomous Data Optimization) package.
+"""ADO (Autonomous Data Optimization) — production SQL optimization engine.
 
-This package provides autonomous SQL optimization capabilities:
-- Parallel candidate generation with LLM inference
-- Validation against sample/full databases
-- Automatic curation of validated wins into gold examples
-- YAML summary generation
+5-phase DAG pipeline:
+1. Parse:     SQL → DAG (deterministic)
+2. Annotate:  DAG → {node: pattern} (1 LLM call)
+3. Rewrite:   Full-query prompt with DAG topology (N parallel workers)
+4. Validate:  Syntax check (deterministic)
+5. Validate:  Timing + correctness (3-run or 5-run)
 
 Usage:
-    from ado.runner import ADORunner, ADOConfig
+    from ado.pipeline import Pipeline
+    p = Pipeline("ado/benchmarks/duckdb_tpcds")
+    result = p.run_query("query_1", sql)
 
-    config = ADOConfig(
-        sample_db="postgres://...",
-        candidates_per_round=10,
-        provider="anthropic",
-        model="claude-3-5-sonnet",
-    )
-
+    # Or via ADORunner wrapper:
+    from ado import ADORunner, ADOConfig
+    config = ADOConfig(benchmark_dir="ado/benchmarks/duckdb_tpcds")
     runner = ADORunner(config)
-    result = runner.run_query("q1", sql)
+    result = runner.run_query("query_1", sql)
 """
 
+from .pipeline import Pipeline
 from .runner import ADORunner, ADOConfig, ADOResult
-from .schemas import ValidationStatus, ValidationResult
+from .schemas import (
+    BenchmarkConfig,
+    PipelineResult,
+    ValidationStatus,
+    ValidationResult,
+)
 
 __all__ = [
+    "Pipeline",
     "ADORunner",
     "ADOConfig",
     "ADOResult",
+    "BenchmarkConfig",
+    "PipelineResult",
     "ValidationStatus",
     "ValidationResult",
 ]

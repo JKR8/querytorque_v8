@@ -327,12 +327,20 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
     """
     examples = []
 
-    # Load only from ado/examples/ (PostgreSQL DSB catalog rules)
-    for example_dir in [EXAMPLES_DIR]:
+    # Load from ado/examples/ (gold) + ado/benchmarks/*/state_0/seed/ (seed rules)
+    search_dirs = [EXAMPLES_DIR]
+    benchmarks_dir = BASE_DIR / "benchmarks"
+    if benchmarks_dir.exists():
+        for bm in benchmarks_dir.iterdir():
+            seed = bm / "state_0" / "seed"
+            if seed.exists():
+                search_dirs.append(seed)
+
+    for example_dir in search_dirs:
         if not example_dir.exists():
             continue
 
-        for path in sorted(example_dir.glob("*.json")):
+        for path in sorted(example_dir.glob("**/*.json")):
             try:
                 data = json.loads(path.read_text())
                 example_id = data.get("id", path.stem)
@@ -371,6 +379,18 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
                 # Get speedup from example or data level
                 speedup = data.get("verified_speedup", "unknown")
 
+                # Determine engine from path
+                rel = path.relative_to(BASE_DIR)
+                parts = rel.parts
+                if "duckdb" in parts:
+                    source_engine = "duckdb"
+                elif "postgres" in parts:
+                    source_engine = "postgres"
+                elif "seed" in parts:
+                    source_engine = "seed"
+                else:
+                    source_engine = "unknown"
+
                 metadata = {
                     "name": data.get("name", example_id),
                     "description": data.get("description", ""),
@@ -378,6 +398,7 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
                     "transforms": transforms,
                     "key_insight": example_data.get("key_insight", ""),
                     "benchmark_queries": data.get("benchmark_queries", []),
+                    "engine": source_engine,
                 }
 
                 examples.append((example_id, sql_text, metadata))
@@ -415,17 +436,18 @@ def build_faiss_index(
         logger.warning("No examples to index")
         return None, {}, {}
 
+    normalizer = SQLNormalizer()
     vectorizer = ASTVectorizer()
     vectors = []
     query_metadata = {}
 
     print(f"Vectorizing {len(examples)} examples...")
-    print("  (AST features are literal-independent, no SQL normalization needed)")
+    print("  Fingerprint (normalize literals/identifiers) → AST vectorize")
 
     for i, (example_id, sql_text, meta) in enumerate(examples):
-        # Vectorize directly - AST features (node counts, depth, patterns)
-        # are structural and don't depend on literal values
-        vector = vectorizer.vectorize(sql_text, dialect=dialect)
+        # Fingerprint first: replace literals with $N, lowercase identifiers
+        fingerprinted = normalizer.normalize(sql_text, dialect=dialect)
+        vector = vectorizer.vectorize(fingerprinted, dialect=dialect)
         vectors.append(vector)
 
         query_metadata[example_id] = {
@@ -436,6 +458,7 @@ def build_faiss_index(
             "transforms": meta.get("transforms", []),
             "winning_transform": meta.get("transforms", [""])[0] if meta.get("transforms") else "",
             "key_insight": meta.get("key_insight", ""),
+            "engine": meta.get("engine", "unknown"),
         }
 
         print(f"  [{i+1}/{len(examples)}] {example_id}: {np.count_nonzero(vector)} non-zero features")

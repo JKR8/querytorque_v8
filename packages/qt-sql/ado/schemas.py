@@ -1,10 +1,18 @@
-"""ADO schemas (standalone)."""
+"""ADO schemas (standalone).
+
+Data structures for the ADO pipeline:
+- Validation: ValidationStatus, ValidationResult
+- Pipeline: BenchmarkConfig, EdgeContract, NodeAnnotation, AnnotationResult,
+  NodeRewriteResult, PipelineResult
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 
 class ValidationStatus(str, Enum):
@@ -26,3 +34,98 @@ class ValidationResult:
     def __post_init__(self):
         if self.errors is None:
             self.errors = []
+
+
+# =============================================================================
+# Pipeline Data Structures (5-phase DAG pipeline)
+# =============================================================================
+
+
+@dataclass
+class BenchmarkConfig:
+    """Configuration loaded from benchmarks/<name>/config.json."""
+    engine: str           # "duckdb" | "postgresql" | "snowflake"
+    benchmark: str        # "tpcds" | "dsb"
+    db_path_or_dsn: str   # DuckDB path or PostgreSQL DSN
+    scale_factor: int
+    timeout_seconds: int
+    validation_method: str  # "3-run" | "5-run"
+    n_queries: int
+    workers_state_0: int
+    workers_state_n: int
+    promote_threshold: float
+
+    @classmethod
+    def from_file(cls, config_path: str | Path) -> BenchmarkConfig:
+        """Load config from a JSON file."""
+        path = Path(config_path)
+        data = json.loads(path.read_text())
+        return cls(
+            engine=data["engine"],
+            benchmark=data["benchmark"],
+            db_path_or_dsn=data.get("db_path") or data.get("dsn", ""),
+            scale_factor=data.get("scale_factor", 10),
+            timeout_seconds=data.get("timeout_seconds", 300),
+            validation_method=data.get("validation_method", "3-run"),
+            n_queries=data.get("n_queries", 99),
+            workers_state_0=data.get("workers_state_0", 5),
+            workers_state_n=data.get("workers_state_n", 1),
+            promote_threshold=data.get("promote_threshold", 1.05),
+        )
+
+
+@dataclass
+class EdgeContract:
+    """Contract for a DAG edge — what flows between nodes."""
+    columns: List[str]
+    grain: str
+    filters: List[str]
+    cardinality_estimate: Optional[int] = None
+
+
+@dataclass
+class NodeAnnotation:
+    """Phase 2 annotation for a single node."""
+    node_id: str
+    pattern: str
+    rationale: str
+
+
+@dataclass
+class SkippedNode:
+    """A node skipped by Phase 2 annotation."""
+    node_id: str
+    reason: str
+
+
+@dataclass
+class AnnotationResult:
+    """Result from Phase 2 annotation."""
+    rewrites: List[NodeAnnotation]
+    skipped: List[SkippedNode]
+
+
+@dataclass
+class NodeRewriteResult:
+    """Result from rewriting a single node in Phase 3."""
+    node_id: str
+    status: str           # "rewritten" | "skipped" | "error" | "kept_original"
+    original_sql: str
+    rewritten_sql: Optional[str] = None
+    output_contract: Optional[EdgeContract] = None
+    pattern_applied: Optional[str] = None
+    retries: int = 0
+
+
+@dataclass
+class PipelineResult:
+    """Complete result from a single query through the 5-phase pipeline."""
+    query_id: str
+    status: str           # WIN | IMPROVED | NEUTRAL | REGRESSION | ERROR
+    speedup: float
+    original_sql: str
+    optimized_sql: str
+    nodes_rewritten: List[str] = field(default_factory=list)
+    transforms_applied: List[str] = field(default_factory=list)
+    annotation: Optional[AnnotationResult] = None
+    prompt: Optional[str] = None

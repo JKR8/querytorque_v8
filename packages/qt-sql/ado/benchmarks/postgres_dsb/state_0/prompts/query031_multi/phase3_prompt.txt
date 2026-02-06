@@ -1,0 +1,222 @@
+You are a SQL query rewrite engine.
+
+Your goal: rewrite the complete SQL query to maximize execution speed
+while preserving exact semantic equivalence (same rows, same columns,
+same ordering).
+
+You will receive the full query, its DAG structure showing how CTEs and
+subqueries connect, cost analysis per node, and suggested rewrite patterns.
+You may restructure the query freely: create new CTEs, merge existing ones,
+push filters across node boundaries, or decompose subqueries.
+
+## Query: query031_multi
+
+```sql
+WITH ss AS (
+  SELECT
+    ca_county,
+    d_qoy,
+    d_year,
+    SUM(ss_ext_sales_price) AS store_sales
+  FROM store_sales, date_dim, customer_address, item
+  WHERE
+    ss_sold_date_sk = d_date_sk
+    AND ss_addr_sk = ca_address_sk
+    AND ss_item_sk = i_item_sk
+    AND i_color IN ('blanched', 'rosy')
+    AND i_manager_id BETWEEN 16 AND 35
+    AND ss_list_price BETWEEN 286 AND 300
+    AND ca_state IN ('TX', 'VA')
+  GROUP BY
+    ca_county,
+    d_qoy,
+    d_year
+), ws AS (
+  SELECT
+    ca_county,
+    d_qoy,
+    d_year,
+    SUM(ws_ext_sales_price) AS web_sales
+  FROM web_sales, date_dim, customer_address, item
+  WHERE
+    ws_sold_date_sk = d_date_sk
+    AND ws_bill_addr_sk = ca_address_sk
+    AND ws_item_sk = i_item_sk
+    AND i_color IN ('blanched', 'rosy')
+    AND i_manager_id BETWEEN 16 AND 35
+    AND ws_list_price BETWEEN 286 AND 300
+    AND ca_state IN ('TX', 'VA')
+  GROUP BY
+    ca_county,
+    d_qoy,
+    d_year
+)
+SELECT
+  ss1.ca_county,
+  ss1.d_year,
+  ws2.web_sales / ws1.web_sales AS web_q1_q2_increase,
+  ss2.store_sales / ss1.store_sales AS store_q1_q2_increase,
+  ws3.web_sales / ws2.web_sales AS web_q2_q3_increase,
+  ss3.store_sales / ss2.store_sales AS store_q2_q3_increase
+FROM ss AS ss1, ss AS ss2, ss AS ss3, ws AS ws1, ws AS ws2, ws AS ws3
+WHERE
+  ss1.d_qoy = 1
+  AND ss1.d_year = 1998
+  AND ss1.ca_county = ss2.ca_county
+  AND ss2.d_qoy = 2
+  AND ss2.d_year = 1998
+  AND ss2.ca_county = ss3.ca_county
+  AND ss3.d_qoy = 3
+  AND ss3.d_year = 1998
+  AND ss1.ca_county = ws1.ca_county
+  AND ws1.d_qoy = 1
+  AND ws1.d_year = 1998
+  AND ws1.ca_county = ws2.ca_county
+  AND ws2.d_qoy = 2
+  AND ws2.d_year = 1998
+  AND ws1.ca_county = ws3.ca_county
+  AND ws3.d_qoy = 3
+  AND ws3.d_year = 1998
+  AND CASE WHEN ws1.web_sales > 0 THEN ws2.web_sales / ws1.web_sales ELSE NULL END > CASE WHEN ss1.store_sales > 0 THEN ss2.store_sales / ss1.store_sales ELSE NULL END
+  AND CASE WHEN ws2.web_sales > 0 THEN ws3.web_sales / ws2.web_sales ELSE NULL END > CASE WHEN ss2.store_sales > 0 THEN ss3.store_sales / ss2.store_sales ELSE NULL END
+ORDER BY
+  web_q1_q2_increase
+```
+
+## DAG Topology
+
+```sql
+-- DAG TOPOLOGY
+-- Depth 0:
+--   ss (cte, 33% cost) [GROUP_BY]
+--     outputs: [ca_county, d_qoy, d_year, store_sales]
+--   ws (cte, 33% cost) [GROUP_BY]
+--     outputs: [ca_county, d_qoy, d_year, web_sales]
+-- Depth 1:
+--   main_query (main, 33% cost) [GROUP_BY] ← reads [ss, ss, ss, ws, ws, ws]
+--     outputs: [ca_county, d_year, web_q1_q2_increase, store_q1_q2_increase, web_q2_q3_increase, store_q2_q3_increase]
+-- Edges:
+--   ss → main_query
+--   ss → main_query
+--   ss → main_query
+--   ws → main_query
+--   ws → main_query
+--   ws → main_query
+```
+
+## Performance Profile
+
+**ss**: 33% of total cost, ~1,000 rows
+  operators: HASH_GROUP_BY, SEQ_SCAN[store_sales], SEQ_SCAN[date_dim], SEQ_SCAN[customer_address]
+**ws**: 33% of total cost, ~1,000 rows
+  operators: HASH_GROUP_BY, SEQ_SCAN[web_sales], SEQ_SCAN[date_dim], SEQ_SCAN[customer_address]
+**main_query**: 33% of total cost, ~1,000 rows
+  operators: HASH_GROUP_BY, HASH_JOIN, SEQ_SCAN[ss], SEQ_SCAN[ss], SEQ_SCAN[ss]
+
+## Suggested Rewrite Strategy
+
+Phase 2 analysis identified these optimization opportunities:
+
+- **ss** → apply **pushdown**
+  Heuristic: 33.3% cost, flags=['GROUP_BY']
+- **ws** → apply **pushdown**
+  Heuristic: 33.3% cost, flags=['GROUP_BY']
+
+Nodes not flagged (low cost or no opportunity):
+- main_query: No matching pattern for flags=['GROUP_BY']
+
+## Reference Example: pushdown
+
+### BEFORE (slow)
+```sql
+[main_query]:
+SELECT CASE WHEN (SELECT COUNT(*) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) > 2972190 
+  THEN (SELECT AVG(ss_ext_sales_price) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20)
+  ELSE (SELECT AVG(ss_net_profit) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) END AS bucket1,
+  CASE WHEN (SELECT COUNT(*) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40) > 4505785
+  THEN (SELECT AVG(ss_ext_sales_price) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40)
+  ELSE (SELECT AVG(ss_net_profit) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40) END AS bucket2
+FROM reason WHERE r_reason_sk = 1
+```
+
+**Key insight:** Extract repeated quantity-range subqueries into CTEs. Each CTE computes count, avg_ext_price, avg_net_profit in ONE pass instead of scanning store_sales 15+ times.
+
+### AFTER (fast)
+[quantity_1_20_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20
+```
+[quantity_21_40_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40
+```
+[quantity_41_60_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 41 AND 60
+```
+[quantity_61_80_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 61 AND 80
+```
+[quantity_81_100_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 81 AND 100
+```
+[main_query]:
+```sql
+SELECT CASE WHEN q1.cnt > 2972190 THEN q1.avg_ext_price ELSE q1.avg_net_profit END AS bucket1, CASE WHEN q2.cnt > 4505785 THEN q2.avg_ext_price ELSE q2.avg_net_profit END AS bucket2, CASE WHEN q3.cnt > 1575726 THEN q3.avg_ext_price ELSE q3.avg_net_profit END AS bucket3, CASE WHEN q4.cnt > 3188917 THEN q4.avg_ext_price ELSE q4.avg_net_profit END AS bucket4, CASE WHEN q5.cnt > 3525216 THEN q5.avg_ext_price ELSE q5.avg_net_profit END AS bucket5 FROM reason CROSS JOIN quantity_1_20_stats AS q1 CROSS JOIN quantity_21_40_stats AS q2 CROSS JOIN quantity_41_60_stats AS q3 CROSS JOIN quantity_61_80_stats AS q4 CROSS JOIN quantity_81_100_stats AS q5 WHERE r_reason_sk = 1
+```
+
+## Constraints
+
+### CRITICAL — Correctness Guards (top of sandwich)
+
+**SEMANTIC_EQUIVALENCE**
+The rewritten query MUST return exactly the same rows, columns, and
+ordering as the original. This is the prime directive.
+
+**LITERAL_PRESERVATION**
+Keep all literal values (dates, strings, numbers) exactly as they appear in
+the original SQL. Do not round, truncate, or reformat them.
+
+### HIGH — Performance and Style Rules (middle of sandwich)
+
+**NO_UNFILTERED_DIM_CTE**
+When creating a new CTE that scans a dimension table, include at least one
+filter predicate. Never materialize an entire dimension without a WHERE clause.
+
+**OR_TO_UNION_LIMIT**
+When converting OR predicates to UNION ALL, limit to 4 branches maximum.
+Beyond 4, the UNION overhead exceeds the OR scan cost for most planners.
+
+**EXPLICIT_JOINS**
+Convert comma-separated implicit joins to explicit JOIN ... ON syntax.
+This gives the optimizer better join-order freedom.
+
+### CRITICAL — Correctness Guards (bottom of sandwich)
+
+**KEEP_EXISTS_AS_EXISTS**
+Preserve EXISTS/NOT EXISTS subqueries as-is. Do not convert them to
+IN/NOT IN or to JOINs — this risks NULL-handling semantic changes.
+
+**COMPLETE_OUTPUT**
+The rewritten query must output ALL columns from the original SELECT.
+Never drop, rename, or reorder output columns.
+
+## Output
+
+Return the complete rewritten SQL query. The query must be syntactically
+valid and ready to execute.
+
+```sql
+-- Your rewritten query here
+```
+
+After the SQL, briefly explain what you changed:
+
+```
+Changes: <1-2 sentence summary of the rewrite>
+Expected speedup: <estimate>
+```
+
+Now output your rewritten SQL:
