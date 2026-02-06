@@ -35,19 +35,23 @@ QueryTorque uses two separate PostgreSQL instances:
 - **Host**: `localhost` (Docker) or `dsb-postgres` (Docker Compose network)
 - **Username**: `jakc9`
 - **Password**: `jakc9`
-- **Database**: `dsb_sf10`
+- **Databases**: `dsb_sf10` (51GB), `dsb_sf5` (22GB)
 - **Data Directory**: `/mnt/d/pgdata` (bind mount from host)
-- **Connection String**:
+- **Connection Strings**:
   ```
-  postgresql://jakc9:jakc9@localhost:5433/dsb_sf10
+  postgresql://jakc9:jakc9@127.0.0.1:5433/dsb_sf10
+  postgresql://jakc9:jakc9@127.0.0.1:5433/dsb_sf5
   ```
 
 **Used by**:
-- `research/ado/validate_dsb_pg.py` - DSB query validation (line 41)
+- `research/ado/validate_dsb_pg.py` - DSB query validation
+- `research/ado/validate_postgresql_dsb_monitored.py` - Full benchmark with C: monitoring
 - `research/scripts/dsb_collect_rewrites.py` - DSB rewrite collection
 
-**Scale Factor**: SF10 (10GB dataset)
-**Sample DB**: `dsb_sf10_sample` (1%, for testing)
+**Scale Factors**:
+- SF10 (51GB, 165M fact rows) - Full benchmark
+- SF5 (22GB, 82M fact rows) - Faster iteration
+- `dsb_sf10_sample` (1%, for testing)
 
 ---
 
@@ -88,8 +92,11 @@ docker-compose down dsb-postgres
 ### Access Local DSB PostgreSQL
 
 ```bash
-# Connect to DSB database
+# Connect to DSB SF10
 psql -h 127.0.0.1 -p 5433 -U jakc9 -d dsb_sf10
+
+# Connect to DSB SF5 (faster iteration)
+psql -h 127.0.0.1 -p 5433 -U jakc9 -d dsb_sf5
 
 # Query list
 \dt           # Show tables

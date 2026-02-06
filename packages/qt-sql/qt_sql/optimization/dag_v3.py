@@ -29,6 +29,8 @@ class GoldExample:
     verified_speedup: str
     example: dict  # Contains opportunity, input_slice, output, key_insight
     example_class: str = "standard"
+    original_sql: str = ""   # Full runnable original SQL
+    optimized_sql: str = ""  # Full runnable optimized SQL
 
 
 @dataclass
@@ -119,7 +121,9 @@ def load_example(example_id: str) -> Optional[GoldExample]:
             example_class=data.get("example_class", "standard"),
             benchmark_queries=data.get("benchmark_queries", []),
             verified_speedup=data.get("verified_speedup", "unknown"),
-            example=data["example"]
+            example=data["example"],
+            original_sql=data.get("original_sql", ""),
+            optimized_sql=data.get("optimized_sql", ""),
         )
     except Exception as e:
         logger.error(f"Failed to load example {example_id}: {e}")
@@ -230,19 +234,31 @@ def get_matching_examples(sql: str) -> List[GoldExample]:
 
 
 def format_example_for_prompt(example: GoldExample) -> str:
-    """Format a single example for inclusion in the prompt."""
+    """Format a single example for inclusion in the prompt.
+
+    If complete SQL pairs are available (original_sql + optimized_sql),
+    uses those instead of the abstract input_slice/output pattern.
+    """
     ex = example.example
-    output_json = json.dumps(ex["output"], indent=2)
 
     text = f"## Example: {example.name} ({example.id.upper()})\n"
-    text += f"Verified speedup: {example.verified_speedup}\n\n"
+    text += f"Verified speedup: {example.verified_speedup}\n"
+    text += f"Benchmark: {', '.join(example.benchmark_queries)}\n\n"
     if example.example_class and example.example_class != "standard":
         text += f"Class: {example.example_class}\n\n"
-    text += f"### Input:\n{ex['input_slice']}\n\n"
-    text += f"### Output:\n```json\n{output_json}\n```\n"
+
+    # Prefer complete SQL pairs when available
+    if example.original_sql and example.optimized_sql:
+        text += f"### Original SQL:\n```sql\n{example.original_sql}\n```\n\n"
+        text += f"### Optimized SQL:\n```sql\n{example.optimized_sql}\n```\n\n"
+    else:
+        # Fallback to abstract pattern
+        output_json = json.dumps(ex["output"], indent=2)
+        text += f"### Input:\n{ex['input_slice']}\n\n"
+        text += f"### Output:\n```json\n{output_json}\n```\n"
 
     if "key_insight" in ex:
-        text += f"\n**Key insight:** {ex['key_insight']}\n"
+        text += f"**Key insight:** {ex['key_insight']}\n"
 
     if "when_not_to_use" in ex:
         text += f"\n**When NOT to use:** {ex['when_not_to_use']}\n"

@@ -15,6 +15,7 @@ Prompt structure v2 (attention-optimized):
 import sys
 import yaml
 import json
+import sqlglot
 from pathlib import Path
 from typing import List, Dict, Optional, Set
 
@@ -26,11 +27,11 @@ sys.path.insert(0, str(PROJECT / "packages" / "qt-shared"))
 from qt_sql.optimization.dag_v3 import (
     load_example,
     load_all_examples,
+    format_example_for_prompt,
     GoldExample,
 )
 from ado.prompt_builder import (
     load_all_constraints,
-    format_example_for_prompt,
 )
 from qt_sql.optimization.dag_v2 import DagV2Pipeline, DagBuilder
 from qt_sql.optimization.plan_analyzer import analyze_plan_for_optimization
@@ -339,7 +340,11 @@ def format_constraints_sandwich(constraints) -> str:
 # ============================================================================
 
 def parse_dag_sections(dag_prompt: str) -> Dict[str, str]:
-    """Parse the monolithic DAG prompt into named sections."""
+    """Parse the monolithic DAG prompt into named sections.
+
+    Strips premature output instructions (e.g. 'Now output your rewrite_sets:')
+    that leak from DagV2Pipeline's internal prompt structure.
+    """
     sections = {}
     current_key = None
     current_lines = []
@@ -352,6 +357,9 @@ def parse_dag_sections(dag_prompt: str) -> Dict[str, str]:
             current_key = line[3:].strip()
             current_lines = []
         elif current_key:
+            # Strip premature output instructions from DAG prompt
+            if line.strip().startswith('Now output'):
+                continue
             current_lines.append(line)
         # Skip lines before first ## (system prompt)
 
@@ -368,6 +376,57 @@ def parse_dag_sections(dag_prompt: str) -> Dict[str, str]:
 
 
 # ============================================================================
+# DAG TOPOLOGY + SQL FORMATTING
+# ============================================================================
+
+def format_dag_topology(pipeline) -> str:
+    """Render explicit DAG topology: nodes with types + dependency edges."""
+    dag = pipeline.dag
+    lines = ["### DAG Topology", "```"]
+
+    # Nodes
+    for node_id, node in dag.nodes.items():
+        flags = " ".join(node.flags) if node.flags else ""
+        tables = ", ".join(node.tables[:5]) if node.tables else ""
+        lines.append(f"  [{node_id}] type={node.node_type} tables=[{tables}] {flags}")
+
+    # Edges
+    if dag.edges:
+        lines.append("")
+        lines.append("  Edges:")
+        seen = set()
+        for src, dst in dag.edges:
+            key = f"{src} -> {dst}"
+            if key not in seen:
+                lines.append(f"    {key}")
+                seen.add(key)
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def pretty_format_sql(sql: str) -> str:
+    """Format SQL for human readability using sqlglot."""
+    try:
+        result = sqlglot.transpile(sql, read="duckdb", write="duckdb", pretty=True)
+        return result[0] if result else sql
+    except Exception:
+        return sql
+
+
+def format_dag_nodes_sql(pipeline) -> str:
+    """Format each DAG node's SQL as a human-readable block."""
+    lines = []
+    for node_id, node in pipeline.dag.nodes.items():
+        lines.append(f"[{node_id}] type={node.node_type}")
+        lines.append("```sql")
+        lines.append(pretty_format_sql(node.sql))
+        lines.append("```")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ============================================================================
 # PROMPT ASSEMBLY v2
 # ============================================================================
 
@@ -377,6 +436,7 @@ def build_prompt_v2(
     history_text: str,
     examples: List[GoldExample],
     pattern_hint: str,
+    pipeline=None,
 ) -> str:
     """Assemble prompt in v2 order: Role → Query → Performance → History → Examples → Constraints → Output."""
     parts = []
@@ -392,14 +452,26 @@ def build_prompt_v2(
     parts.append("---")
     parts.append("## Query Structure")
     parts.append("")
+
+    # DAG topology (explicit node graph)
+    if pipeline:
+        parts.append(format_dag_topology(pipeline))
+        parts.append("")
+
     if 'Target Nodes' in dag:
         parts.append("### Target Nodes")
         parts.append(dag['Target Nodes'])
         parts.append("")
-    if 'Subgraph Slice' in dag:
+
+    # Node SQL — use pretty-formatted from pipeline if available, else fallback
+    if pipeline:
+        parts.append("### SQL")
+        parts.append(format_dag_nodes_sql(pipeline))
+    elif 'Subgraph Slice' in dag:
         parts.append("### SQL")
         parts.append(dag['Subgraph Slice'])
         parts.append("")
+
     if 'Node Contracts' in dag:
         parts.append("### Contracts")
         parts.append(dag['Node Contracts'])
@@ -477,6 +549,7 @@ def build_discovery_prompt_v2(
     dag_prompt: str,
     plan_summary: str,
     history_text: str,
+    pipeline=None,
 ) -> str:
     """Build discovery prompt for exhausted queries, using v2 structure."""
     parts = []
@@ -503,14 +576,26 @@ def build_discovery_prompt_v2(
     parts.append("---")
     parts.append("## Query Structure")
     parts.append("")
+
+    # DAG topology
+    if pipeline:
+        parts.append(format_dag_topology(pipeline))
+        parts.append("")
+
     if 'Target Nodes' in dag:
         parts.append("### Target Nodes")
         parts.append(dag['Target Nodes'])
         parts.append("")
-    if 'Subgraph Slice' in dag:
+
+    # Node SQL — pretty-formatted
+    if pipeline:
+        parts.append("### SQL")
+        parts.append(format_dag_nodes_sql(pipeline))
+    elif 'Subgraph Slice' in dag:
         parts.append("### SQL")
         parts.append(dag['Subgraph Slice'])
         parts.append("")
+
     if 'Node Contracts' in dag:
         parts.append("### Contracts")
         parts.append(dag['Node Contracts'])
@@ -635,6 +720,7 @@ def main():
             print(f"EXPLAIN:ERR({e}) ", file=sys.stderr, end="", flush=True)
 
         # 4. Build DAG base prompt
+        pipeline = None
         try:
             pipeline = DagV2Pipeline(sql_for_explain, plan_context=plan_context)
             dag_prompt = pipeline.get_prompt()
@@ -648,6 +734,7 @@ def main():
                 dag_prompt=dag_prompt,
                 plan_summary=plan_summary,
                 history_text=history_text,
+                pipeline=pipeline,
             )
             mode = "DISCOVERY"
         else:
@@ -658,6 +745,7 @@ def main():
                 history_text=history_text,
                 examples=examples,
                 pattern_hint=pattern_hint,
+                pipeline=pipeline,
             )
             mode = "STANDARD"
 
