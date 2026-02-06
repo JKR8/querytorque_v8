@@ -359,11 +359,29 @@ def generate_recommendations(
     qs: QueryState,
     patterns: Dict[str, TransformStats]
 ) -> List[Recommendation]:
-    """Generate 2-5 recommendations for a query"""
-    recommendations = {}  # Use dict to avoid duplicates by transform
+    """Generate 2-5 recommendations for a query
 
-    # FROM BEST STATE: Build on what worked
-    if qs.best_worker and qs.best_speedup > 1.0:
+    Strategy:
+    - Untried transforms: Safe bets, prioritize these
+    - Failed transforms: Learn what didn't work, only recommend with good reason
+    - Succeeded transforms: Build on them
+    - Remember: For regressions, baseline is State 0, never build from the failed state
+    """
+    recommendations = {}
+
+    # First: Untried transforms (no failure history, safest bets)
+    for transform in ['prefetch_fact_join', 'single_pass_aggregation', 'date_cte_isolate', 'early_filter',
+                      'dimension_cte_isolate', 'multi_dimension_prefetch', 'materialize_cte',
+                      'union_cte_split', 'decorrelate', 'pushdown', 'or_to_union', 'intersect_to_exists',
+                      'multi_date_range_cte']:
+        if transform in patterns and transform not in qs.transforms_tried:
+            pattern = patterns[transform]
+            rec = score_recommendation(qs, transform, pattern, from_best_state=False)
+            if rec and rec.confidence > 40 and transform not in recommendations:
+                recommendations[transform] = rec
+
+    # Second: Build on what succeeded (compound benefits)
+    if qs.best_speedup > 1.0 and qs.best_worker:
         best_state = None
         for state_id in [qs.best_worker, 'kimi', 'v2_standard']:
             if state_id in qs.states:
@@ -371,25 +389,27 @@ def generate_recommendations(
                 break
 
         if best_state and best_state.transforms:
-            # Find untried transforms compatible with current best
             current_transforms = set(best_state.transforms)
             for transform in patterns:
-                if transform not in current_transforms and transform not in qs.transforms_failed:
+                if (transform not in current_transforms and
+                    transform not in qs.transforms_tried and
+                    transform not in recommendations):
                     pattern = patterns[transform]
                     rec = score_recommendation(qs, transform, pattern, from_best_state=True)
-                    if rec and rec.confidence > 50 and transform not in recommendations:
+                    if rec and rec.confidence > 50:
                         recommendations[transform] = rec
 
-    # FROM BASELINE: Try gold patterns not yet attempted
-    for transform in ['single_pass_aggregation', 'date_cte_isolate', 'early_filter',
-                      'dimension_cte_isolate', 'prefetch_fact_join', 'multi_dimension_prefetch']:
-        if transform in patterns and transform not in qs.transforms_tried:
-            pattern = patterns[transform]
-            rec = score_recommendation(qs, transform, pattern, from_best_state=False)
-            if rec and rec.confidence > 40 and transform not in recommendations:
-                recommendations[transform] = rec
+    # Third: Failed transforms only if high success rate elsewhere (indicates query-specific issue)
+    if len(recommendations) < 2:
+        for transform in qs.transforms_failed:
+            if transform in patterns and transform not in recommendations:
+                pattern = patterns[transform]
+                if pattern.success_rate > 0.7:  # High success elsewhere, worth retry
+                    rec = score_recommendation(qs, transform, pattern, from_best_state=False)
+                    if rec and rec.confidence > 50:
+                        rec.rationale = f"(Tried before but high success rate elsewhere - worth retry)"
+                        recommendations[transform] = rec
 
-    # Sort by confidence descending, take top 5
     sorted_recs = sorted(recommendations.values(), key=lambda r: r.confidence, reverse=True)
     return sorted_recs[:5]
 
@@ -417,26 +437,42 @@ def format_query_analysis(
     lines.append(f"**Current Best**: {qs.best_speedup:.2f}x ({qs.best_worker or 'baseline'})")
     lines.append(f"**Gap to Expectation**: {abs(qs.expected_speedup - qs.best_speedup):.2f}x")
 
-    # State history
-    lines.append(f"\n**State History**:")
-    state_order = ['baseline', 'kimi', 'v2_standard', 'W1', 'W2', 'W3', 'W4']
+    # State history - show all attempts clearly
+    lines.append(f"\n**Attempt History** (State 0 = baseline, current best = next starting point):")
+    # Order: baseline first, then attempts, prioritize by speedup
+    state_order = ['baseline', 'kimi', 'v2_standard', 'retry3w_1', 'retry3w_2', 'retry3w_3', 'retry3w_4',
+                   'W1', 'W2', 'W3', 'W4']
+    shown = set()
     for state_id in state_order:
-        if state_id in qs.states:
+        if state_id in qs.states and state_id not in shown:
             ws = qs.states[state_id]
-            transforms_str = ", ".join(ws.transforms) if ws.transforms else "none"
-            lines.append(f"- {state_id}: {ws.speedup:.2f}x [{transforms_str}] - {ws.status}")
+            transforms_str = ", ".join(t for t in ws.transforms if t.strip()) if ws.transforms else "none"
+            lines.append(f"- {state_id}: {ws.speedup:.2f}x [{transforms_str}] {ws.status}")
+            shown.add(state_id)
+    # Show any other states not in order
+    for state_id in sorted(qs.states.keys()):
+        if state_id not in shown:
+            ws = qs.states[state_id]
+            transforms_str = ", ".join(t for t in ws.transforms if t.strip()) if ws.transforms else "none"
+            lines.append(f"- {state_id}: {ws.speedup:.2f}x [{transforms_str}] {ws.status}")
 
-    # Transforms attempted
+    # Transforms attempted - clear success/failure record
     if qs.transforms_tried:
-        lines.append(f"\n**Transforms Attempted**:")
-        for transform in sorted(qs.transforms_tried):
-            status = "✓" if transform in qs.transforms_succeeded else "✗"
-            lines.append(f"- {status} {transform}")
+        lines.append(f"\n**Transforms Tried** (learning record):")
+        succeeded = sorted(qs.transforms_succeeded)
+        failed = sorted(qs.transforms_failed)
 
-    # Untried gold patterns
+        if succeeded:
+            lines.append(f"✓ SUCCEEDED: {', '.join(succeeded)}")
+        if failed:
+            lines.append(f"✗ FAILED: {', '.join(failed)}")
+
+    # Untried gold patterns - opportunities
     untried = set(patterns.keys()) - qs.transforms_tried
     if untried:
-        lines.append(f"\n**Gold Patterns NOT Tried**: {', '.join(sorted(untried))}")
+        lines.append(f"\n**Gold Patterns NOT Tried** (candidates for next attempt):")
+        for transform in sorted(untried):
+            lines.append(f"  - {transform}")
 
     # Recommendations
     if recommendations:

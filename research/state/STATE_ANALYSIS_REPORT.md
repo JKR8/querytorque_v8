@@ -146,15 +146,26 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 5.00x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.99x [none] - neutral
-- v2_standard: 1.00x [materialize_cte] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.99x [none] neutral
+- v2_standard: 1.00x [materialize_cte] success
 
-**Transforms Attempted**:
-- ✗ materialize_cte
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -163,7 +174,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -177,14 +193,25 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 2.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- v2_standard: 1.00x [pushdown] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- v2_standard: 1.00x [pushdown] success
 
-**Transforms Attempted**:
-- ✗ pushdown
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -193,7 +220,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -207,14 +239,25 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 2.20x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -223,7 +266,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -237,15 +285,26 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 2.00x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.98x [none] - neutral
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.98x [none] neutral
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -254,7 +313,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -268,15 +332,26 @@
 **Current Best**: 1.01x (baseline)
 **Gap to Expectation**: 1.70x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.01x [none] - neutral
-- v2_standard: 1.00x [pushdown] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.01x [none] neutral
+- v2_standard: 1.00x [pushdown] success
 
-**Transforms Attempted**:
-- ✗ pushdown
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -285,7 +360,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -299,15 +379,26 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 1.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.00x [none] - neutral
-- v2_standard: 1.00x [or_to_union] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.00x [none] neutral
+- v2_standard: 1.00x [or_to_union] success
 
-**Transforms Attempted**:
-- ✗ or_to_union
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -316,7 +407,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -330,15 +426,27 @@
 **Current Best**: 1.00x (W2)
 **Gap to Expectation**: 1.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.94x [none] - regression
-- v2_standard: 1.00x [pushdown] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.94x [none] regression
+- v2_standard: 1.00x [pushdown] success
+- retry3w_2: 0.67x [none] regression
 
-**Transforms Attempted**:
-- ✗ pushdown
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -347,7 +455,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -361,15 +474,26 @@
 **Current Best**: 1.01x (baseline)
 **Gap to Expectation**: 1.49x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.01x [none] - neutral
-- v2_standard: 1.00x [pushdown] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.01x [none] neutral
+- v2_standard: 1.00x [pushdown] success
 
-**Transforms Attempted**:
-- ✗ pushdown
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -378,7 +502,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -392,15 +521,27 @@
 **Current Best**: 1.33x (baseline)
 **Gap to Expectation**: 4.47x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.33x [none] - success
-- v2_standard: 1.00x [semantic_rewrite] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.33x [none] success
+- v2_standard: 1.00x [semantic_rewrite] success
 
-**Transforms Attempted**:
-- ✗ semantic_rewrite
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -409,7 +550,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -423,14 +569,25 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 0.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -439,7 +596,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -453,15 +615,26 @@
 **Current Best**: 1.06x (baseline)
 **Gap to Expectation**: 0.44x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.06x [none] - neutral
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.06x [none] neutral
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -470,7 +643,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -484,11 +662,24 @@
 **Current Best**: 0.95x (baseline)
 **Gap to Expectation**: 0.05x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.95x [none] - neutral
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.95x [none] neutral
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -497,7 +688,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -511,11 +707,24 @@
 **Current Best**: 0.98x (baseline)
 **Gap to Expectation**: 0.02x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.98x [none] - neutral
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.98x [none] neutral
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -524,7 +733,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -538,11 +752,25 @@
 **Current Best**: 1.03x (W3)
 **Gap to Expectation**: 0.03x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.03x [none] - neutral
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.03x [none] neutral
+- retry3w_3: 0.35x [none] regression
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -551,7 +779,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -565,15 +798,27 @@
 **Current Best**: 1.37x (baseline)
 **Gap to Expectation**: 2.13x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.37x [none] - success
-- v2_standard: 1.00x [semantic_rewrite] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.37x [none] success
+- v2_standard: 1.00x [semantic_rewrite] success
 
-**Transforms Attempted**:
-- ✗ semantic_rewrite
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -582,7 +827,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -600,15 +850,27 @@
 **Current Best**: 1.36x (baseline)
 **Gap to Expectation**: 1.14x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.36x [pushdown] - success
-- v2_standard: 1.00x [pushdown] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.36x [pushdown] success
+- v2_standard: 1.00x [pushdown] success
 
-**Transforms Attempted**:
-- ✓ pushdown
+**Transforms Tried** (learning record):
+✓ SUCCEEDED: pushdown
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -617,7 +879,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -631,15 +898,27 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 2.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.96x [none] - neutral
-- v2_standard: 1.00x [multi_push_predicate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.96x [none] neutral
+- v2_standard: 1.00x [multi_push_predicate] success
 
-**Transforms Attempted**:
-- ✗ multi_push_predicate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -648,7 +927,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -662,15 +946,27 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 2.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.97x [none] - neutral
-- v2_standard: 1.00x [semantic_rewrite] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.97x [none] neutral
+- v2_standard: 1.00x [semantic_rewrite] success
 
-**Transforms Attempted**:
-- ✗ semantic_rewrite
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -679,7 +975,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -693,14 +994,25 @@
 **Current Best**: 1.00x (W2)
 **Gap to Expectation**: 2.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -709,7 +1021,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -723,15 +1040,26 @@
 **Current Best**: 1.01x (baseline)
 **Gap to Expectation**: 2.49x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.01x [none] - neutral
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.01x [none] neutral
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -740,7 +1068,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -754,15 +1087,26 @@
 **Current Best**: 1.04x (baseline)
 **Gap to Expectation**: 2.46x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.04x [none] - neutral
-- v2_standard: 1.00x [pushdown] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.04x [none] neutral
+- v2_standard: 1.00x [pushdown] success
 
-**Transforms Attempted**:
-- ✗ pushdown
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -771,7 +1115,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -785,15 +1134,27 @@
 **Current Best**: 1.69x (W2)
 **Gap to Expectation**: 1.31x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.98x [none] - neutral
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.98x [none] neutral
+- v2_standard: 1.00x [date_cte_isolate] success
+- retry3w_2: 1.69x [none] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -802,7 +1163,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -816,15 +1182,26 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 2.20x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.86x [none] - regression
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.86x [none] regression
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -833,7 +1210,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -847,15 +1229,26 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 2.20x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.60x [none] - regression
-- v2_standard: 1.00x [or_to_union] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.60x [none] regression
+- v2_standard: 1.00x [or_to_union] success
 
-**Transforms Attempted**:
-- ✗ or_to_union
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -864,7 +1257,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -878,15 +1276,27 @@
 **Current Best**: 1.00x (W1)
 **Gap to Expectation**: 2.00x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.00x [none] - neutral
-- v2_standard: 1.00x [or_to_union] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.00x [none] neutral
+- v2_standard: 1.00x [or_to_union] success
+- retry3w_1: 0.24x [none] regression
 
-**Transforms Attempted**:
-- ✗ or_to_union
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -895,7 +1305,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -909,15 +1324,26 @@
 **Current Best**: 1.01x (baseline)
 **Gap to Expectation**: 1.97x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.01x [none] - neutral
-- v2_standard: 1.00x [or_to_union] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.01x [none] neutral
+- v2_standard: 1.00x [or_to_union] success
 
-**Transforms Attempted**:
-- ✗ or_to_union
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -926,7 +1352,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -940,15 +1371,26 @@
 **Current Best**: 1.03x (baseline)
 **Gap to Expectation**: 1.97x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.03x [none] - neutral
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.03x [none] neutral
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -957,7 +1399,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -971,15 +1418,26 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 1.70x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.87x [none] - regression
-- v2_standard: 1.00x [pushdown] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.87x [none] regression
+- v2_standard: 1.00x [pushdown] success
 
-**Transforms Attempted**:
-- ✗ pushdown
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -988,7 +1446,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1002,15 +1465,27 @@
 **Current Best**: 1.00x (W2)
 **Gap to Expectation**: 1.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.98x [none] - neutral
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.98x [none] neutral
+- v2_standard: 1.00x [date_cte_isolate] success
+- retry3w_2: 0.69x [none] regression
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1019,7 +1494,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1033,14 +1513,25 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 1.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- v2_standard: 1.00x [pushdown] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- v2_standard: 1.00x [pushdown] success
 
-**Transforms Attempted**:
-- ✗ pushdown
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1049,7 +1540,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1063,15 +1559,27 @@
 **Current Best**: 1.00x (W2)
 **Gap to Expectation**: 1.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.29x [none] - regression
-- v2_standard: 1.00x [or_to_union] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.29x [none] regression
+- v2_standard: 1.00x [or_to_union] success
+- retry3w_2: 0.80x [none] regression
 
-**Transforms Attempted**:
-- ✗ or_to_union
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1080,7 +1588,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1094,14 +1607,25 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 1.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1110,7 +1634,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1124,15 +1653,26 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 1.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.91x [none] - regression
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.91x [none] regression
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1141,7 +1681,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1155,15 +1700,26 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 1.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.95x [none] - neutral
-- v2_standard: 1.00x [or_to_union] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.95x [none] neutral
+- v2_standard: 1.00x [or_to_union] success
 
-**Transforms Attempted**:
-- ✗ or_to_union
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1172,7 +1728,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1186,15 +1747,26 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 1.50x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.96x [none] - neutral
-- v2_standard: 1.00x [or_to_union] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.96x [none] neutral
+- v2_standard: 1.00x [or_to_union] success
 
-**Transforms Attempted**:
-- ✗ or_to_union
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1203,7 +1775,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1217,15 +1794,26 @@
 **Current Best**: 1.02x (baseline)
 **Gap to Expectation**: 1.48x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.02x [none] - neutral
-- v2_standard: 1.00x [or_to_union] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.02x [none] neutral
+- v2_standard: 1.00x [or_to_union] success
 
-**Transforms Attempted**:
-- ✗ or_to_union
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1234,7 +1822,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1248,15 +1841,26 @@
 **Current Best**: 1.02x (baseline)
 **Gap to Expectation**: 1.48x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.02x [none] - neutral
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.02x [none] neutral
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1265,7 +1869,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1279,15 +1888,26 @@
 **Current Best**: 1.02x (baseline)
 **Gap to Expectation**: 1.48x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.02x [none] - neutral
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.02x [none] neutral
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1296,7 +1916,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1310,15 +1935,26 @@
 **Current Best**: 1.05x (baseline)
 **Gap to Expectation**: 1.45x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.05x [none] - neutral
-- v2_standard: 1.00x [or_to_union] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.05x [none] neutral
+- v2_standard: 1.00x [or_to_union] success
 
-**Transforms Attempted**:
-- ✗ or_to_union
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1327,7 +1963,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1341,16 +1982,26 @@
 **Current Best**: 2.73x (baseline)
 **Gap to Expectation**: 0.27x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 2.73x [early_filter] - success
-- v2_standard: 1.00x [decorrelate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 2.73x [early_filter] success
+- v2_standard: 1.00x [decorrelate] success
 
-**Transforms Attempted**:
-- ✗ decorrelate
-- ✓ early_filter
+**Transforms Tried** (learning record):
+✓ SUCCEEDED: early_filter
 
-**Gold Patterns NOT Tried**: date_cte_isolate, dimension_cte_isolate, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - dimension_cte_isolate
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1359,7 +2010,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1373,15 +2029,26 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 1.00x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.75x [none] - regression
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.75x [none] regression
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1390,7 +2057,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1404,11 +2076,25 @@
 **Current Best**: 4.47x (W2)
 **Gap to Expectation**: 3.47x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.42x [none] - regression
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.42x [none] regression
+- retry3w_2: 4.47x [none] success
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1417,7 +2103,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1431,11 +2122,24 @@
 **Current Best**: 1.03x (baseline)
 **Gap to Expectation**: 0.03x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 1.03x [none] - neutral
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 1.03x [none] neutral
 
-**Gold Patterns NOT Tried**: date_cte_isolate, decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - date_cte_isolate
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1444,7 +2148,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1458,15 +2167,26 @@
 **Current Best**: 1.00x (baseline)
 **Gap to Expectation**: 7.00x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.96x [none] - neutral
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.96x [none] neutral
+- v2_standard: 1.00x [date_cte_isolate] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1475,7 +2195,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
@@ -1489,15 +2214,27 @@
 **Current Best**: 1.44x (W2)
 **Gap to Expectation**: 1.06x
 
-**State History**:
-- baseline: 1.00x [none] - success
-- kimi: 0.99x [none] - neutral
-- v2_standard: 1.00x [date_cte_isolate] - success
+**Attempt History** (State 0 = baseline, current best = next starting point):
+- baseline: 1.00x [none] success
+- kimi: 0.99x [none] neutral
+- v2_standard: 1.00x [date_cte_isolate] success
+- retry3w_2: 1.44x [none] success
 
-**Transforms Attempted**:
-- ✗ date_cte_isolate
+**Transforms Tried** (learning record):
 
-**Gold Patterns NOT Tried**: decorrelate, dimension_cte_isolate, early_filter, intersect_to_exists, materialize_cte, multi_date_range_cte, multi_dimension_prefetch, or_to_union, prefetch_fact_join, pushdown, single_pass_aggregation, union_cte_split
+**Gold Patterns NOT Tried** (candidates for next attempt):
+  - decorrelate
+  - dimension_cte_isolate
+  - early_filter
+  - intersect_to_exists
+  - materialize_cte
+  - multi_date_range_cte
+  - multi_dimension_prefetch
+  - or_to_union
+  - prefetch_fact_join
+  - pushdown
+  - single_pass_aggregation
+  - union_cte_split
 
 **Top Recommendations**:
 
@@ -1506,7 +2243,12 @@
    - Success Rate: 100%
    - Rationale: Transform has 100% success rate with 3.77x average speedup
 
-2. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
+2. **union_cte_split** [CONFIDENCE: 69%] [RISK: LOW]
+   - Expected: 1.36x improvement
+   - Success Rate: 100%
+   - Rationale: Transform has 100% success rate with 1.36x average speedup
+
+3. **single_pass_aggregation** [CONFIDENCE: 50%] [RISK: HIGH]
    - Expected: 4.47x improvement
    - Success Rate: 0%
    - Rationale: Transform has 0% success rate with 4.47x average speedup
