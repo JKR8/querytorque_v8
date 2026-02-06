@@ -159,6 +159,10 @@ def format_example_for_prompt(example: GoldExample) -> str:
     if "key_insight" in ex:
         lines.append(f"\n**Key insight:** {ex['key_insight']}")
 
+    # When NOT to use (counter-examples from regressions)
+    if "when_not_to_use" in ex:
+        lines.append(f"\n**When NOT to use:** {ex['when_not_to_use']}")
+
     return "\n".join(lines)
 
 

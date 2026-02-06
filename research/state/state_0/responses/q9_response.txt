@@ -1,0 +1,53 @@
+Looking at this query pattern and the provided examples, I can see a clear optimization opportunity. The current query has a CTE that groups by bucket, but then the main query does 15 scalar subqueries (3 per bucket) to access the aggregated values. This is inefficient - we can flatten these subqueries into a single join.
+
+**Key insight**: Instead of having the main query repeatedly scan the CTE via scalar subqueries for each bucket, we can join once with the CTE (properly pivoted) and compute all buckets in a single row.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "pushdown",
+      "nodes": {
+        "quantity_aggregations": "SELECT CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 WHEN ss_quantity BETWEEN 21 AND 40 THEN 2 WHEN ss_quantity BETWEEN 41 AND 60 THEN 3 WHEN ss_quantity BETWEEN 61 AND 80 THEN 4 WHEN ss_quantity BETWEEN 81 AND 100 THEN 5 END AS bucket, COUNT(*) AS cnt, AVG(ss_ext_discount_amt) AS avg_disc, AVG(ss_net_paid) AS avg_net FROM store_sales WHERE ss_quantity BETWEEN 1 AND 100 GROUP BY CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 WHEN ss_quantity BETWEEN 21 AND 40 THEN 2 WHEN ss_quantity BETWEEN 41 AND 60 THEN 3 WHEN ss_quantity BETWEEN 61 AND 80 THEN 4 WHEN ss_quantity BETWEEN 81 AND 100 THEN 5 END",
+        "main_query": "SELECT CASE WHEN q1.cnt > 74129 THEN q1.avg_disc ELSE q1.avg_net END AS bucket1, CASE WHEN q2.cnt > 122840 THEN q2.avg_disc ELSE q2.avg_net END AS bucket2, CASE WHEN q3.cnt > 56580 THEN q3.avg_disc ELSE q3.avg_net END AS bucket3, CASE WHEN q4.cnt > 10097 THEN q4.avg_disc ELSE q4.avg_net END AS bucket4, CASE WHEN q5.cnt > 165306 THEN q5.avg_disc ELSE q5.avg_net END AS bucket5 FROM reason CROSS JOIN (SELECT cnt, avg_disc, avg_net FROM quantity_aggregations WHERE bucket = 1) AS q1 CROSS JOIN (SELECT cnt, avg_disc, avg_net FROM quantity_aggregations WHERE bucket = 2) AS q2 CROSS JOIN (SELECT cnt, avg_disc, avg_net FROM quantity_aggregations WHERE bucket = 3) AS q3 CROSS JOIN (SELECT cnt, avg_disc, avg_net FROM quantity_aggregations WHERE bucket = 4) AS q4 CROSS JOIN (SELECT cnt, avg_disc, avg_net FROM quantity_aggregations WHERE bucket = 5) AS q5 WHERE r_reason_sk = 1"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same aggregation results",
+        "same output columns"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "The original query performed 15 scalar subqueries against the quantity_aggregations CTE (3 per bucket: cnt, avg_disc, avg_net). This rewrite flattens these subqueries into a single query that joins with the CTE once per bucket using CROSS JOINs, reducing 15 CTE scans to 5. Since the reason table has only 1 row (r_reason_sk = 1), this creates a single row result with all 5 bucket calculations. All literal values are preserved exactly as in the original."
+}
+```
+
+**Alternative, more aggressive optimization**: Since we know the bucket values (1-5) are fixed and the CTE computes all of them, we could also pivot the CTE into a single row with all aggregates:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "semantic_rewrite",
+      "nodes": {
+        "quantity_aggregations": "SELECT SUM(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 ELSE 0 END) AS cnt1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_ext_discount_amt END) AS avg_disc1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_net_paid END) AS avg_net1, SUM(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN 1 ELSE 0 END) AS cnt2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_ext_discount_amt END) AS avg_disc2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_net_paid END) AS avg_net2, SUM(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN 1 ELSE 0 END) AS cnt3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_ext_discount_amt END) AS avg_disc3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_net_paid END) AS avg_net3, SUM(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN 1 ELSE 0 END) AS cnt4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_ext_discount_amt END) AS avg_disc4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_net_paid END) AS avg_net4, SUM(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN 1 ELSE 0 END) AS cnt5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_ext_discount_amt END) AS avg_disc5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_net_paid END) AS avg_net5 FROM store_sales WHERE ss_quantity BETWEEN 1 AND 100",
+        "main_query": "SELECT CASE WHEN q.cnt1 > 74129 THEN q.avg_disc1 ELSE q.avg_net1 END AS bucket1, CASE WHEN q.cnt2 > 122840 THEN q.avg_disc2 ELSE q.avg_net2 END AS bucket2, CASE WHEN q.cnt3 > 56580 THEN q.avg_disc3 ELSE q.avg_net3 END AS bucket3, CASE WHEN q.cnt4 > 10097 THEN q.avg_disc4 ELSE q.avg_net4 END AS bucket4, CASE WHEN q.cnt5 > 165306 THEN q.avg_disc5 ELSE q.avg_net5 END AS bucket5 FROM reason CROSS JOIN quantity_aggregations AS q WHERE r_reason_sk = 1"
+      },
+      "invariants_kept": [
+        "same result values",
+        "same column output",
+        "same aggregation logic"
+      ],
+      "expected_speedup": "4.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "This rewrite pivots the CTE from 5 rows (one per bucket) to a single row with 15 columns (3 aggregates × 5 buckets). This eliminates the GROUP BY operation entirely and allows the main query to compute all 5 buckets from a single CROSS JOIN with the CTE. The store_sales table is scanned once, computing all conditional aggregates simultaneously. All literal thresholds are preserved exactly as in the original query."
+}
+```
+
+**Note**: The second rewrite (single-pass aggregation) follows the pattern from the example and would likely provide the greatest speedup (~4.5x) by eliminating the GROUP BY and reducing all computation to a single scan with conditional aggregates.

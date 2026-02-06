@@ -1,0 +1,34 @@
+Looking at the query, I see a multi-table join with two date_dim instances (d1 and d2). The main cost comes from scanning large fact tables (store_sales and store_returns). The key insight is that we can prefetch and pre-filter the date dimensions, then join them with their respective fact tables early to reduce the intermediate result sizes.
+
+The query has:
+- d1 (ss_sold_date_sk) with no filter
+- d2 (sr_returned_date_sk) with filters: d_year=2001 AND d_moy=8
+- store with no explicit filter but used in GROUP BY
+
+Strategy: Create CTEs for filtered d2 and pre-join it with store_returns, and create a CTE for store_sales joined with d1. This reduces the fact tables before the final join.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "multi_dimension_prefetch",
+      "nodes": {
+        "filtered_d2": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_moy = 8",
+        "filtered_returns": "SELECT sr_ticket_number, sr_item_sk, sr_customer_sk, sr_returned_date_sk FROM store_returns JOIN filtered_d2 ON sr_returned_date_sk = d_date_sk",
+        "filtered_sales": "SELECT ss_ticket_number, ss_item_sk, ss_customer_sk, ss_store_sk, ss_sold_date_sk FROM store_sales",
+        "main_query": "SELECT s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS \"30 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 30) AND (sr_returned_date_sk - ss_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS \"31-60 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 60) AND (sr_returned_date_sk - ss_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS \"61-90 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 90) AND (sr_returned_date_sk - ss_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS \"91-120 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 120) THEN 1 ELSE 0 END) AS \">120 days\" FROM filtered_sales JOIN filtered_returns ON (ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk) JOIN store ON ss_store_sk = s_store_sk GROUP BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip ORDER BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "grain preserved"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Created three CTEs: 1) filtered_d2 pre-filters date_dim for return dates (d_year=2001, d_moy=8). 2) filtered_returns joins store_returns with filtered_d2, reducing returns to only those in the specified period. 3) filtered_sales isolates store_sales columns needed. Main query then joins these pre-filtered CTEs with store table. This reduces the large fact table scans early and minimizes intermediate join sizes."
+}
+```

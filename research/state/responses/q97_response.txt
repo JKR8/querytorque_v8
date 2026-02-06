@@ -1,0 +1,61 @@
+Looking at this query, I can see it's computing customer overlaps between store and catalog sales for a 12-month period. The main issue is that both CTEs (`ssci` and `csci`) are scanning massive fact tables (store_sales and catalog_sales) and joining with date_dim to filter by month range, then grouping. The execution plan shows full table scans of store_sales (345M rows) and catalog_sales (172M rows).
+
+**Key insight**: Both CTEs have the same date filter pattern (`d_month_seq BETWEEN 1214 AND 1214+11`). I can apply the "prefetch_fact_join" pattern to create a filtered date CTE first, then join it with the fact tables. This should allow DuckDB to push the date filter much earlier in the execution plan.
+
+However, I notice the previous attempt with `date_cte_isolate` had no effect. This suggests the optimizer already recognizes the date filter pattern. Let me try a different approach: `early_filter` + `materialize_cte` to force materialization of the filtered dates.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "early_filter",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1214 AND 1214 + 11",
+        "ssci": "SELECT ss_customer_sk AS customer_sk, ss_item_sk AS item_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk GROUP BY ss_customer_sk, ss_item_sk",
+        "csci": "SELECT cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk GROUP BY cs_bill_customer_sk, cs_item_sk",
+        "main_query": "SELECT SUM(CASE WHEN NOT ssci.customer_sk IS NULL AND csci.customer_sk IS NULL THEN 1 ELSE 0 END) AS store_only, SUM(CASE WHEN ssci.customer_sk IS NULL AND NOT csci.customer_sk IS NULL THEN 1 ELSE 0 END) AS catalog_only, SUM(CASE WHEN NOT ssci.customer_sk IS NULL AND NOT csci.customer_sk IS NULL THEN 1 ELSE 0 END) AS store_and_catalog FROM ssci FULL OUTER JOIN csci ON (ssci.customer_sk = csci.customer_sk AND ssci.item_sk = csci.item_sk) LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same column output",
+        "same aggregation semantics",
+        "same grouping"
+      ],
+      "expected_speedup": "1.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Created a 'filtered_dates' CTE that isolates the date filter (d_month_seq BETWEEN 1214 AND 1225). This CTE is then joined with store_sales and catalog_sales in their respective CTEs. This enables early filtering of fact tables using a small date dimension subset, potentially allowing the optimizer to use indexed joins or push filters earlier in the execution plan. The main query remains unchanged as it already references the ssci and csci CTEs correctly."
+}
+```
+
+**Alternative approach**: Since the previous `date_cte_isolate` didn't work, I could also try a `materialize_cte` transform to force materialization of the filtered dates, which might help DuckDB's optimizer:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "materialize_cte",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1214 AND 1214 + 11",
+        "ssci": "SELECT ss_customer_sk AS customer_sk, ss_item_sk AS item_sk FROM store_sales, filtered_dates WHERE ss_sold_date_sk = d_date_sk GROUP BY ss_customer_sk, ss_item_sk",
+        "csci": "SELECT cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk FROM catalog_sales, filtered_dates WHERE cs_sold_date_sk = d_date_sk GROUP BY cs_bill_customer_sk, cs_item_sk",
+        "main_query": "SELECT SUM(CASE WHEN NOT ssci.customer_sk IS NULL AND csci.customer_sk IS NULL THEN 1 ELSE 0 END) AS store_only, SUM(CASE WHEN ssci.customer_sk IS NULL AND NOT csci.customer_sk IS NULL THEN 1 ELSE 0 END) AS catalog_only, SUM(CASE WHEN NOT ssci.customer_sk IS NULL AND NOT csci.customer_sk IS NULL THEN 1 ELSE 0 END) AS store_and_catalog FROM ssci FULL OUTER JOIN csci ON (ssci.customer_sk = csci.customer_sk AND ssci.item_sk = csci.item_sk) LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same column output",
+        "same aggregation semantics",
+        "same grouping"
+      ],
+      "expected_speedup": "2.0x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Materializes the filtered dates into a CTE that can be reused by both store_sales and catalog_sales joins. This ensures the date filter is evaluated once and the result cached, potentially enabling more efficient hash joins with the large fact tables. The explicit materialization may help DuckDB's optimizer choose a better join order and avoid redundant date filter evaluations."
+}
+```
+
+**Note**: I'm using both approaches in different ways. The first uses `early_filter` which focuses on pushing the filter earlier, while the second uses `materialize_cte` which focuses on caching the filtered result. Given that `date_cte_isolate` didn't work previously, I'm leaning toward the second approach with `materialize_cte` as it forces a different execution strategy that might bypass whatever optimization block existed before.

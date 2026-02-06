@@ -1,0 +1,56 @@
+Looking at the query pattern and execution plan, I can identify several optimization opportunities:
+
+1. **INTERSECT to EXISTS** - The `cross_items` CTE uses INTERSECT which forces materialization
+2. **Date CTE Isolation** - Multiple date_dim scans with same filter (d_year = 2002)
+3. **Repeated Subquery Pattern** - Same date filter pattern across all sales tables
+
+Here's my optimized rewrite:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "intersect_to_exists",
+      "nodes": {
+        "cross_items": "SELECT i.i_item_sk AS ss_item_sk FROM item i WHERE EXISTS (SELECT 1 FROM store_sales, item iss, date_dim d1 WHERE ss_item_sk = iss.i_item_sk AND ss_sold_date_sk = d1.d_date_sk AND d1.d_year BETWEEN 2000 AND 2000 + 2 AND iss.i_brand_id = i.i_brand_id AND iss.i_class_id = i.i_class_id AND iss.i_category_id = i.i_category_id) AND EXISTS (SELECT 1 FROM catalog_sales, item ics, date_dim d2 WHERE cs_item_sk = ics.i_item_sk AND cs_sold_date_sk = d2.d_date_sk AND d2.d_year BETWEEN 2000 AND 2000 + 2 AND ics.i_brand_id = i.i_brand_id AND ics.i_class_id = i.i_class_id AND ics.i_category_id = i.i_category_id) AND EXISTS (SELECT 1 FROM web_sales, item iws, date_dim d3 WHERE ws_item_sk = iws.i_item_sk AND ws_sold_date_sk = d3.d_date_sk AND d3.d_year BETWEEN 2000 AND 2000 + 2 AND iws.i_brand_id = i.i_brand_id AND iws.i_class_id = i.i_class_id AND iws.i_category_id = i.i_category_id)"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same columns",
+        "same cross_items definition"
+      ],
+      "expected_speedup": "1.83x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "date_cte_isolate",
+      "nodes": {
+        "date_month_2002_11": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000 + 2 AND d_moy = 11",
+        "date_range_2000_2002": "SELECT d_date_sk FROM date_dim WHERE d_year BETWEEN 2000 AND 2000 + 2",
+        "avg_sales": "SELECT AVG(quantity * list_price) AS average_sales FROM ((SELECT ss_quantity AS quantity, ss_list_price AS list_price FROM store_sales JOIN date_range_2000_2002 ON ss_sold_date_sk = d_date_sk) UNION ALL (SELECT cs_quantity AS quantity, cs_list_price AS list_price FROM catalog_sales JOIN date_range_2000_2002 ON cs_sold_date_sk = d_date_sk) UNION ALL (SELECT ws_quantity AS quantity, ws_list_price AS list_price FROM web_sales JOIN date_range_2000_2002 ON ws_sold_date_sk = d_date_sk)) AS x",
+        "main_query": "SELECT channel, i_brand_id, i_class_id, i_category_id, SUM(sales), SUM(number_sales) FROM (SELECT 'store' AS channel, i_brand_id, i_class_id, i_category_id, SUM(ss_quantity * ss_list_price) AS sales, COUNT(*) AS number_sales FROM store_sales JOIN date_month_2002_11 ON ss_sold_date_sk = d_date_sk JOIN item ON ss_item_sk = i_item_sk WHERE ss_item_sk IN (SELECT ss_item_sk FROM cross_items) GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(ss_quantity * ss_list_price) > (SELECT average_sales FROM avg_sales) UNION ALL SELECT 'catalog' AS channel, i_brand_id, i_class_id, i_category_id, SUM(cs_quantity * cs_list_price) AS sales, COUNT(*) AS number_sales FROM catalog_sales JOIN date_month_2002_11 ON cs_sold_date_sk = d_date_sk JOIN item ON cs_item_sk = i_item_sk WHERE cs_item_sk IN (SELECT ss_item_sk FROM cross_items) GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(cs_quantity * cs_list_price) > (SELECT average_sales FROM avg_sales) UNION ALL SELECT 'web' AS channel, i_brand_id, i_class_id, i_category_id, SUM(ws_quantity * ws_list_price) AS sales, COUNT(*) AS number_sales FROM web_sales JOIN date_month_2002_11 ON ws_sold_date_sk = d_date_sk JOIN item ON ws_item_sk = i_item_sk WHERE ws_item_sk IN (SELECT ss_item_sk FROM cross_items) GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(ws_quantity * ws_list_price) > (SELECT average_sales FROM avg_sales)) AS y GROUP BY ROLLUP (channel, i_brand_id, i_class_id, i_category_id) ORDER BY channel, i_brand_id, i_class_id, i_category_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation",
+        "preserves all literal values"
+      ],
+      "expected_speedup": "2.0x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Applied two complementary optimizations: 1) Converted INTERSECT in cross_items to EXISTS for better semi-join planning, 2) Isolated date_dim filters into CTEs to prevent repeated scans. The INTERSECT transformation avoids materializing and sorting all three subquery results. Date CTEs reduce 9 separate date_dim scans to just 2 (one for month filter, one for range). Both transforms preserve exact semantics while enabling better join strategies and early filtering."
+}
+```
+
+**Key insights:**
+1. **INTERSECT to EXISTS**: The original `cross_items` CTE uses INTERSECT which forces materialization and sorting of all three subqueries. Converting to EXISTS allows the optimizer to use semi-joins with early stopping.
+2. **Date CTE Isolation**: The execution plan shows 9 separate date_dim scans with similar filters. Creating two CTEs (`date_month_2002_11` and `date_range_2000_2002`) reduces this to 2 scans.
+3. **Preserved OR structure**: Didn't split OR conditions into UNION as per the constraint (OR_TO_UNION_LIMIT).
+4. **Literal preservation**: Kept all literal values exactly as in the original (2000+2, 11, etc.).
+
+The combined effect should significantly reduce the high-cost SEQ_SCAN operations on sales tables and date_dim, addressing the major bottlenecks in the execution plan.

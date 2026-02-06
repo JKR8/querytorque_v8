@@ -244,6 +244,9 @@ def format_example_for_prompt(example: GoldExample) -> str:
     if "key_insight" in ex:
         text += f"\n**Key insight:** {ex['key_insight']}\n"
 
+    if "when_not_to_use" in ex:
+        text += f"\n**When NOT to use:** {ex['when_not_to_use']}\n"
+
     return text
 
 

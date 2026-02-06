@@ -86,11 +86,29 @@ FROM reason WHERE r_reason_sk = 1
 
 The following constraints are MANDATORY based on observed failures:
 
+### CTE_COLUMN_COMPLETENESS [CRITICAL]
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
 ### LITERAL_PRESERVATION [CRITICAL]
 CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
 
+### NO_MATERIALIZE_EXISTS [CRITICAL]
+NEVER convert EXISTS or NOT EXISTS subqueries into materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)). EXISTS uses semi-join short-circuiting: it stops scanning after the first match. A materialized CTE forces a full table scan and GROUP BY of the entire table, which is catastrophically slower. Keep EXISTS as EXISTS.
+
+### MIN_BASELINE_THRESHOLD [HIGH]
+If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
+
+### NO_UNFILTERED_DIMENSION_CTE [HIGH]
+Every CTE you create MUST have a WHERE clause that actually reduces the number of rows. Do NOT create CTEs like 'filtered_stores AS (SELECT s_store_sk, s_store_id FROM store)' that select all rows from a dimension table. Selecting fewer columns is NOT filtering - the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query.
+
+### NO_UNION_SAME_COLUMN_OR [HIGH]
+Only apply or_to_union when the OR conditions span DIFFERENT tables or create fundamentally different access paths. Do NOT split OR conditions into UNION ALL when all branches filter the SAME column (e.g., 't_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17'). Splitting same-column ORs into UNION ALL doubles or triples the fact table scans. The database optimizer already handles same-column OR efficiently with a single scan.
+
 ### OR_TO_UNION_LIMIT [HIGH]
 CAUTION with OR→UNION: Only split OR conditions into UNION ALL when there are ≤3 simple branches AND they have different access patterns. If you have nested ORs (e.g., 3 conditions × 3 values = 9 combinations), DO NOT expand them - keep the original OR structure. DuckDB handles OR predicates efficiently. Over-splitting causes multiple scans of fact tables and severe regressions (0.23x-0.41x observed). When in doubt, preserve the original OR structure.
+
+### REMOVE_REPLACED_CTES [HIGH]
+When you create new CTEs that replace existing ones, you MUST remove the original CTEs from the WITH clause. Your rewrite_sets 'nodes' object should include the replacement node with the SAME node_id to overwrite it, or the original must not appear. Never leave dead/unused CTEs in the query - they still get materialized and waste resources.
 
 
 ---
@@ -129,18 +147,12 @@ OUTPUT FORMAT:
 ```
 
 ## Target Nodes
-  [main_query] GROUP_BY
-  [quantity_aggregations] GROUP_BY
+  [main_query] 
 
 ## Subgraph Slice
 [main_query] type=main
 ```sql
-SELECT CASE WHEN (SELECT cnt FROM quantity_aggregations WHERE bucket = 1) > 74129 THEN (SELECT avg_disc FROM quantity_aggregations WHERE bucket = 1) ELSE (SELECT avg_net FROM quantity_aggregations WHERE bucket = 1) END AS bucket1, CASE WHEN (SELECT cnt FROM quantity_aggregations WHERE bucket = 2) > 122840 THEN (SELECT avg_disc FROM quantity_aggregations WHERE bucket = 2) ELSE (SELECT avg_net FROM quantity_aggregations WHERE bucket = 2) END AS bucket2, CASE WHEN (SELECT cnt FROM quantity_aggregations WHERE bucket = 3) > 56580 THEN (SELECT avg_disc FROM quantity_aggregations WHERE bucket = 3) ELSE (SELECT avg_net FROM quantity_aggregations WHERE bucket = 3) END AS bucket3, CASE WHEN (SELECT cnt FROM quantity_aggregations WHERE bucket = 4) > 10097 THEN (SELECT avg_disc FROM quantity_aggregations WHERE bucket = 4) ELSE (SELECT avg_net FROM quantity_aggregations WHERE bucket = 4) END AS bucket4, CASE WHEN (SELECT cnt FROM quantity_aggregations WHERE bucket = 5) > 165306 THEN (SELECT avg_disc FROM quantity_aggregations WHERE bucket = 5) ELSE (SELECT avg_net FROM quantity_aggregations WHERE bucket = 5) END AS bucket5 FROM reason WHERE r_reason_sk = 1
-```
-
-[quantity_aggregations] type=cte
-```sql
-SELECT CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 WHEN ss_quantity BETWEEN 21 AND 40 THEN 2 WHEN ss_quantity BETWEEN 41 AND 60 THEN 3 WHEN ss_quantity BETWEEN 61 AND 80 THEN 4 WHEN ss_quantity BETWEEN 81 AND 100 THEN 5 END AS bucket, COUNT(*) AS cnt, AVG(ss_ext_discount_amt) AS avg_disc, AVG(ss_net_paid) AS avg_net FROM store_sales WHERE ss_quantity BETWEEN 1 AND 100 GROUP BY CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 WHEN ss_quantity BETWEEN 21 AND 40 THEN 2 WHEN ss_quantity BETWEEN 41 AND 60 THEN 3 WHEN ss_quantity BETWEEN 61 AND 80 THEN 4 WHEN ss_quantity BETWEEN 81 AND 100 THEN 5 END
+SELECT CASE WHEN (SELECT COUNT(*) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) > 2972190 THEN (SELECT AVG(ss_ext_sales_price) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) ELSE (SELECT AVG(ss_net_profit) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) END AS bucket1, CASE WHEN (SELECT COUNT(*) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40) > 4505785 THEN (SELECT AVG(ss_ext_sales_price) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40) ELSE (SELECT AVG(ss_net_profit) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40) END AS bucket2, CASE WHEN (SELECT COUNT(*) FROM store_sales WHERE ss_quantity BETWEEN 41 AND 60) > 1575726 THEN (SELECT AVG(ss_ext_sales_price) FROM store_sales WHERE ss_quantity BETWEEN 41 AND 60) ELSE (SELECT AVG(ss_net_profit) FROM store_sales WHERE ss_quantity BETWEEN 41 AND 60) END AS bucket3, CASE WHEN (SELECT COUNT(*) FROM store_sales WHERE ss_quantity BETWEEN 61 AND 80) > 3188917 THEN (SELECT AVG(ss_ext_sales_price) FROM store_sales WHERE ss_quantity BETWEEN 61 AND 80) ELSE (SELECT AVG(ss_net_profit) FROM store_sales WHERE ss_quantity BETWEEN 61 AND 80) END AS bucket4, CASE WHEN (SELECT COUNT(*) FROM store_sales WHERE ss_quantity BETWEEN 81 AND 100) > 3525216 THEN (SELECT AVG(ss_ext_sales_price) FROM store_sales WHERE ss_quantity BETWEEN 81 AND 100) ELSE (SELECT AVG(ss_net_profit) FROM store_sales WHERE ss_quantity BETWEEN 81 AND 100) END AS bucket5 FROM reason WHERE r_reason_sk = 1
 ```
 
 
@@ -148,159 +160,37 @@ SELECT CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 WHEN ss_quantity BETWEEN 21
 [main_query]:
   output_columns: ['bucket1', 'bucket2', 'bucket3', 'bucket4', 'bucket5']
   required_predicates: ['r_reason_sk = 1']
-[quantity_aggregations]:
-  output_columns: ['bucket', 'cnt', 'avg_disc', 'avg_net']
-  grain: ['CASE WHEN ss_quantity BETWEEN ']
 
 ## Downstream Usage
-[quantity_aggregations]: downstream_refs=['cnt', 'avg_disc', 'bucket', 'avg_net']
+No usage data.
 
 ## Cost Attribution
-[main_query]: 71.1% cost, ~5 rows, ops=[SEQ_SCAN[CTE_SCAN], SEQ_SCAN[CTE_SCAN], SEQ_SCAN[CTE_SCAN]]
-[quantity_aggregations]: 28.9% cost, ~27504809 rows, ops=[SEQ_SCAN[store_sales], HASH_GROUP_BY]
+[main_query]: 97.4% cost, ~5505755 rows, ops=[SEQ_SCAN[store_sales], SEQ_SCAN[store_sales], SEQ_SCAN[store_sales]]
 
 ## Detected Opportunities
-## Node-Specific Opportunities
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
+## Knowledge Base Patterns (verified on TPC-DS)
+## Detected Optimization Opportunities
 
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
+1. **QT-OPT-007** - Materialize Repeated Subquery
+  Trigger: Same subquery pattern appears multiple times in query
+  Rewrite: Extract to CTE with MATERIALIZED hint, reference by name
+   Matched: Repeated subquery pattern
 
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [quantity_aggregations] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
 
 Now output your rewrite_sets:
 
 ## Execution Plan
 ```
 Operators by cost:
-- FILTER: 64.0% cost, 27,504,809 rows
-- SEQ_SCAN(store_sales): 22.6% cost, 27,504,809 rows
-- PROJECTION: 7.1% cost, 27,504,809 rows
-- HASH_GROUP_BY: 6.3% cost, 5 rows
-- CTE: 0.0% cost, 0 rows
+- SEQ_SCAN(store_sales): 37.9% cost, 5,498,216 rows
+- SEQ_SCAN(store_sales): 25.6% cost, 5,498,216 rows
+- SEQ_SCAN(store_sales): 13.1% cost, 5,498,216 rows
+- SEQ_SCAN(store_sales): 2.0% cost, 5,503,144 rows
+- SEQ_SCAN(store_sales): 2.0% cost, 5,505,755 rows
 
 Scans:
-- store_sales x1: 345,611,892 → 27,504,809 rows (filtered)
+- store_sales x15: 345,611,892 → 5,505,755 rows (filtered)
 - reason x1: 45 → 1 rows (filtered)
-- CTE_SCAN x15: 5 rows (no filter)
-
-Misestimates:
-- HASH_GROUP_BY: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 1,152,039 vs actual 27,504,809 (23.9x)
-- FILTER: est 1,152,039 vs actual 27,504,809 (23.9x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- PROJECTION: est 576,019 vs actual 1 (576019.0x)
-- FILTER: est 576,019 vs actual 1 (576019.0x)
-- CTE_SCAN: est 576,019 vs actual 5 (115203.8x)
 ```
 
 
@@ -309,5 +199,8 @@ Misestimates:
 - baseline: 1.00x [none] NEUTRAL
 - kimi: 0.42x [none] REGRESSION
 - retry3w_2: 4.47x [none] WIN
+- dsr1: 1.28x [pushdown] WIN
+
+**Worked**: pushdown
 
 **IMPORTANT:** The following patterns were provided: single_pass_aggregation, pushdown. Consider a DIFFERENT approach!

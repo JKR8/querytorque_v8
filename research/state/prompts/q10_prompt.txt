@@ -42,6 +42,8 @@ ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
 
 **Key insight:** First CTE filters the dimension (date_dim). Second CTE pre-joins this with the fact table (store_sales). This creates a smaller intermediate result before joining with other dimension tables. The pre-join materializes the filtered fact rows, making subsequent joins faster.
 
+**When NOT to use:** Do not use on queries with baseline runtime under 50ms — CTE materialization overhead dominates on fast queries. Do not use on window-function-dominated queries where filtering is not the bottleneck. Avoid on queries with 5+ table joins and complex inter-table predicates where forcing join order via CTEs prevents the optimizer from choosing a better plan. Caused 0.50x on Q25 (fast baseline query), 0.87x on Q51 (window-function bottleneck), and 0.77x on Q72 (complex multi-table join reordering).
+
 ---
 
 ## Example: Dimension CTE Isolation (DIMENSION_CTE_ISOLATE)
@@ -133,17 +135,37 @@ LIMIT 100
 
 **Key insight:** Pre-filter BOTH date_dim AND store into separate CTEs. Include only the columns needed for the join and grouping. The optimizer can then use these smaller CTEs efficiently when joining with the fact table.
 
+**When NOT to use:** Do not create dimension CTEs without a WHERE clause that actually reduces rows — an unfiltered dimension CTE is pure overhead (full scan + materialization for zero selectivity benefit). Avoid on queries with 5+ tables and complex inter-table predicates where forcing join order via CTEs prevents the optimizer from choosing a better plan. Caused 0.85x on Q67 (unfiltered dimension CTEs added overhead) and 0.77x on Q72 (forced suboptimal join ordering on complex multi-table query).
+
 ---
 
 ## CONSTRAINTS (Learned from Benchmark Failures)
 
 The following constraints are MANDATORY based on observed failures:
 
+### CTE_COLUMN_COMPLETENESS [CRITICAL]
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
 ### LITERAL_PRESERVATION [CRITICAL]
 CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
 
+### NO_MATERIALIZE_EXISTS [CRITICAL]
+NEVER convert EXISTS or NOT EXISTS subqueries into materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)). EXISTS uses semi-join short-circuiting: it stops scanning after the first match. A materialized CTE forces a full table scan and GROUP BY of the entire table, which is catastrophically slower. Keep EXISTS as EXISTS.
+
+### MIN_BASELINE_THRESHOLD [HIGH]
+If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
+
+### NO_UNFILTERED_DIMENSION_CTE [HIGH]
+Every CTE you create MUST have a WHERE clause that actually reduces the number of rows. Do NOT create CTEs like 'filtered_stores AS (SELECT s_store_sk, s_store_id FROM store)' that select all rows from a dimension table. Selecting fewer columns is NOT filtering - the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query.
+
+### NO_UNION_SAME_COLUMN_OR [HIGH]
+Only apply or_to_union when the OR conditions span DIFFERENT tables or create fundamentally different access paths. Do NOT split OR conditions into UNION ALL when all branches filter the SAME column (e.g., 't_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17'). Splitting same-column ORs into UNION ALL doubles or triples the fact table scans. The database optimizer already handles same-column OR efficiently with a single scan.
+
 ### OR_TO_UNION_LIMIT [HIGH]
 CAUTION with OR→UNION: Only split OR conditions into UNION ALL when there are ≤3 simple branches AND they have different access patterns. If you have nested ORs (e.g., 3 conditions × 3 values = 9 combinations), DO NOT expand them - keep the original OR structure. DuckDB handles OR predicates efficiently. Over-splitting causes multiple scans of fact tables and severe regressions (0.23x-0.41x observed). When in doubt, preserve the original OR structure.
+
+### REMOVE_REPLACED_CTES [HIGH]
+When you create new CTEs that replace existing ones, you MUST remove the original CTEs from the WITH clause. Your rewrite_sets 'nodes' object should include the replacement node with the SAME node_id to overwrite it, or the original must not appear. Never leave dead/unused CTEs in the query - they still get materialized and waste resources.
 
 
 ---
@@ -201,7 +223,7 @@ SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_p
 No usage data.
 
 ## Cost Attribution
-[main_query]: 98.9% cost, ~1919415 rows, ops=[SEQ_SCAN[customer_demographics], SEQ_SCAN[customer], SEQ_SCAN[customer_address]]
+[main_query]: 98.7% cost, ~1919415 rows, ops=[SEQ_SCAN[customer_demographics], SEQ_SCAN[customer], SEQ_SCAN[customer_address]]
 
 ## Detected Opportunities
 ## Knowledge Base Patterns (verified on TPC-DS)
@@ -228,9 +250,9 @@ Now output your rewrite_sets:
 ## Execution Plan
 ```
 Operators by cost:
-- SEQ_SCAN(store_sales): 73.2% cost, 1,032,040 rows
-- SEQ_SCAN(store_sales): 18.3% cost, 273,352 rows
-- SEQ_SCAN(store_sales): 2.1% cost, 1,919,415 rows
+- SEQ_SCAN(store_sales): 70.2% cost, 1,032,040 rows
+- SEQ_SCAN(store_sales): 20.7% cost, 273,352 rows
+- SEQ_SCAN(store_sales): 2.7% cost, 1,919,415 rows
 - SEQ_SCAN(store_sales): 1.3% cost, 498,783 rows
 - SEQ_SCAN(store_sales): 1.0% cost, 534,615 rows
 
@@ -292,7 +314,9 @@ Joins:
 - baseline: 1.00x [none] NEUTRAL
 - kimi: 1.02x [none] NEUTRAL
 - v2_standard: 1.00x [date_cte_isolate] NEUTRAL
+- dsr1: 0.95x [semantic_rewrite] REGRESSION
 
 **No effect**: date_cte_isolate
+**Failed/Regression**: semantic_rewrite — DO NOT use these patterns
 
 **IMPORTANT:** The following patterns were provided: prefetch_fact_join, dimension_cte_isolate, multi_dimension_prefetch. Consider a DIFFERENT approach!

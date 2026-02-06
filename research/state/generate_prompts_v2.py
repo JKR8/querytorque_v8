@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Generate optimization prompts for all 99 TPC-DS queries using the real DAG V3 system.
+Generate optimization prompts for all 99 TPC-DS queries.
 
-Uses:
-- DagV2Pipeline for base prompt (DAG decomposition + JSON output format)
-- run_explain_analyze → analyze_plan_for_optimization → _format_plan_summary (parsed EXPLAIN)
-- State analysis recommendations to select and order gold examples (not FAISS)
-- Attempt history from state YAMLs
-- build_prompt_with_examples to assemble (constraints + examples + DAG + EXPLAIN + history)
-
-Output: research/state/prompts/qN_prompt.txt (overwrites previous garbage prompts)
+Prompt structure v2 (attention-optimized):
+  1. ROLE + TASK          (primacy: model knows what it is)
+  2. THE QUERY            (DAG structure, SQL, contracts)
+  3. PERFORMANCE PROFILE  (execution plan, costs, opportunities)
+  4. HISTORY + HINT       (what was tried + pattern preview)
+  5. EXAMPLES             (contrastive: DO + DON'T paired)
+  6. CONSTRAINTS          (sandwich: CRITICAL top/bottom)
+  7. OUTPUT FORMAT        (recency: last thing before generation)
 """
 
 import sys
@@ -28,8 +28,11 @@ from qt_sql.optimization.dag_v3 import (
     load_all_examples,
     GoldExample,
 )
-from ado.prompt_builder import build_prompt_with_examples
-from qt_sql.optimization.dag_v2 import DagV2Pipeline
+from ado.prompt_builder import (
+    load_all_constraints,
+    format_example_for_prompt,
+)
+from qt_sql.optimization.dag_v2 import DagV2Pipeline, DagBuilder
 from qt_sql.optimization.plan_analyzer import analyze_plan_for_optimization
 from qt_sql.execution.database_utils import run_explain_analyze
 from qt_sql.optimization.adaptive_rewriter_v5 import _format_plan_summary
@@ -42,6 +45,51 @@ DB_PATH = "/mnt/d/TPC-DS/tpcds_sf10.duckdb"
 STATE_DIR = PROJECT / "research" / "state_histories_all_99"
 QUERIES_DIR = PROJECT / "research" / "state" / "queries"
 OUTPUT_DIR = PROJECT / "research" / "state" / "prompts"
+DISCOVERY_TEMPLATE = PROJECT / "research" / "discovery_prompts" / "PROMPT_DISCOVER_NEW_PATTERNS.txt"
+
+# ============================================================================
+# ALLOWED TRANSFORMS (from DagBuilder)
+# ============================================================================
+
+ALLOWED_TRANSFORMS = ", ".join(DagBuilder.ALLOWED_TRANSFORMS)
+
+# ============================================================================
+# PROMPT SECTIONS
+# ============================================================================
+
+ROLE_SECTION = f"""You are an autonomous Query Rewrite Engine. Your goal is to maximize execution speed while strictly preserving semantic invariants.
+
+RULES:
+- Maximize execution speed while preserving semantic invariants (output columns, grain, total result rows).
+- Group dependent changes into a single rewrite_set.
+- Use descriptive CTE names (e.g., `filtered_returns` not `cte1`).
+- If a standard SQL optimization applies that is not in the allowed list, label it "semantic_rewrite".
+
+ALLOWED TRANSFORMS: {ALLOWED_TRANSFORMS}"""
+
+OUTPUT_FORMAT_SECTION = """## Output Format
+
+Respond with a JSON object containing your rewrite_sets:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "transform_name",
+      "nodes": {
+        "node_id": "new SQL..."
+      },
+      "invariants_kept": ["same result rows", "same ordering"],
+      "expected_speedup": "2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "what was changed and why"
+}
+```
+
+Now output your rewrite_sets:"""
 
 # ============================================================================
 # RECOMMENDATION DATA (from state analysis)
@@ -150,32 +198,29 @@ TPCDS_QUERY_FEATURES = {
 }
 
 FEATURE_TO_PATTERN = {
-    "correlated_subquery": ["decorrelate", "date_cte_isolate"],
+    "correlated_subquery": ["decorrelate", "composite_decorrelate_union", "date_cte_isolate"],
     "date_filter":         ["date_cte_isolate", "prefetch_fact_join"],
     "multi_date_alias":    ["multi_date_range_cte"],
-    "or_condition":        ["or_to_union"],
-    "multi_dim_filter":    ["dimension_cte_isolate", "multi_dimension_prefetch", "early_filter"],
-    "dim_fact_chain":      ["prefetch_fact_join", "early_filter", "multi_dimension_prefetch"],
+    "or_condition":        ["or_to_union", "composite_decorrelate_union"],
+    "multi_dim_filter":    ["dimension_cte_isolate", "multi_dimension_prefetch", "early_filter", "shared_dimension_multi_channel"],
+    "dim_fact_chain":      ["prefetch_fact_join", "early_filter", "multi_dimension_prefetch", "shared_dimension_multi_channel"],
     "repeated_scan":       ["single_pass_aggregation", "pushdown"],
     "intersect":           ["intersect_to_exists"],
     "union_year":          ["union_cte_split"],
-    "exists_repeat":       ["materialize_cte"],
+    "exists_repeat":       ["materialize_cte", "composite_decorrelate_union"],
     "complex_multi_join":  [],
-    "window_fn":           [],
+    "window_fn":           ["deferred_window_aggregation"],
 }
 
 
-def get_recommended_examples(query_num: int, transforms_tried: Set[str], transforms_failed: Set[str]) -> List[GoldExample]:
-    """Get gold examples selected by our state analysis, in recommended order.
+# ============================================================================
+# EXAMPLE / HISTORY / CONSTRAINT HELPERS
+# ============================================================================
 
-    Priority:
-    1. Untried patterns that match query structure (highest value)
-    2. Patterns that worked before on this query (reinforcement)
-    3. Skip patterns that failed on this query
-    """
+def get_recommended_examples(query_num: int, transforms_tried: Set[str], transforms_failed: Set[str], transforms_succeeded: Set[str]) -> List[GoldExample]:
+    """Get gold examples in recommended order: untried first, then succeeded."""
     features = TPCDS_QUERY_FEATURES.get(query_num, [])
 
-    # Get structurally matched pattern IDs in priority order
     matched_ids = []
     seen = set()
     for feature in features:
@@ -184,30 +229,24 @@ def get_recommended_examples(query_num: int, transforms_tried: Set[str], transfo
                 matched_ids.append(pattern_id)
                 seen.add(pattern_id)
 
-    # Partition into untried, succeeded, and failed
     untried = [p for p in matched_ids if p not in transforms_tried]
-    succeeded = [p for p in matched_ids if p in transforms_tried and p not in transforms_failed]
-    failed = [p for p in matched_ids if p in transforms_failed]
-
-    # Order: untried first, then succeeded (reinforcement), skip failed
+    succeeded = [p for p in matched_ids if p in transforms_succeeded]
     ordered_ids = untried + succeeded
 
-    # Load actual GoldExample objects
     examples = []
     for pid in ordered_ids:
         ex = load_example(pid)
         if ex:
             examples.append(ex)
 
-    # Cap at 3 examples per prompt
     return examples[:3]
 
 
 def load_attempt_history(query_num: int) -> tuple:
-    """Load attempt history from state YAML. Returns (history_text, transforms_tried, transforms_failed)."""
+    """Load attempt history. Returns (history_text, transforms_tried, transforms_failed, transforms_succeeded)."""
     yaml_path = STATE_DIR / f"q{query_num}_state_history.yaml"
     if not yaml_path.exists():
-        return "", set(), set()
+        return "", set(), set(), set()
 
     with open(yaml_path) as f:
         data = yaml.safe_load(f)
@@ -217,15 +256,12 @@ def load_attempt_history(query_num: int) -> tuple:
     transforms_failed = set()
 
     lines = []
-    lines.append("## Previous Attempts\n")
-
     for state in data.get('states', []):
         state_id = state.get('state_id', 'unknown')
         speedup = state.get('speedup', 1.0)
         transforms = [t.strip() for t in state.get('transforms', []) if t and t.strip()]
         yaml_status = state.get('status', 'unknown')
 
-        # Derive status from speedup, not YAML (YAML often says "success" for 1.0x)
         if yaml_status == 'error':
             status = 'ERROR'
         elif speedup >= 1.1:
@@ -247,20 +283,287 @@ def load_attempt_history(query_num: int) -> tuple:
         t_str = ", ".join(transforms) if transforms else "none"
         lines.append(f"- {state_id}: {speedup:.2f}x [{t_str}] {status}")
 
+    summary_parts = []
     if transforms_tried:
-        lines.append("")
         succeeded = sorted(transforms_succeeded)
         failed = sorted(transforms_failed)
         neutral = sorted(transforms_tried - transforms_succeeded - transforms_failed)
         if succeeded:
-            lines.append(f"**Worked**: {', '.join(succeeded)}")
+            summary_parts.append(f"**Worked**: {', '.join(succeeded)}")
         if neutral:
-            lines.append(f"**No effect**: {', '.join(neutral)}")
+            summary_parts.append(f"**No effect**: {', '.join(neutral)}")
         if failed:
-            lines.append(f"**Failed/Regression**: {', '.join(failed)} — DO NOT use these patterns")
+            summary_parts.append(f"**Regression**: {', '.join(failed)}")
 
-    return "\n".join(lines), transforms_tried, transforms_failed
+    history = "\n".join(lines)
+    if summary_parts:
+        history += "\n\n" + "\n".join(summary_parts)
 
+    return history, transforms_tried, transforms_failed, transforms_succeeded
+
+
+def format_pattern_hint(examples: List[GoldExample]) -> str:
+    """Generate a 3-5 line primacy-boosted pattern preview."""
+    if not examples:
+        return ""
+    lines = ["**Recommended patterns** (details in Examples section below):"]
+    for ex in examples:
+        lines.append(f"- **{ex.id}** ({ex.verified_speedup}) — {ex.description.split('.')[0]}.")
+    return "\n".join(lines)
+
+
+def format_constraints_sandwich(constraints) -> str:
+    """Format constraints with sandwich ordering: CRITICAL top+bottom, HIGH in middle."""
+    if not constraints:
+        return ""
+
+    critical = [c for c in constraints if c.severity == "CRITICAL"]
+    high = [c for c in constraints if c.severity == "HIGH"]
+
+    # Sandwich: split CRITICAL between top and bottom
+    top_critical = critical[:2]    # CTE_COLUMN_COMPLETENESS, LITERAL_PRESERVATION
+    bottom_critical = critical[2:] # NO_MATERIALIZE_EXISTS (if any)
+
+    ordered = top_critical + high + bottom_critical
+
+    lines = []
+    for c in ordered:
+        lines.append(f"**{c.id}** [{c.severity}]: {c.prompt_instruction}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ============================================================================
+# DAG PARSING - extract sections from DagV2Pipeline output
+# ============================================================================
+
+def parse_dag_sections(dag_prompt: str) -> Dict[str, str]:
+    """Parse the monolithic DAG prompt into named sections."""
+    sections = {}
+    current_key = None
+    current_lines = []
+
+    for line in dag_prompt.split('\n'):
+        if line.startswith('## '):
+            # Save previous section
+            if current_key:
+                sections[current_key] = '\n'.join(current_lines).strip()
+            current_key = line[3:].strip()
+            current_lines = []
+        elif current_key:
+            current_lines.append(line)
+        # Skip lines before first ## (system prompt)
+
+    # Save last section
+    if current_key:
+        sections[current_key] = '\n'.join(current_lines).strip()
+
+    # Extract system prompt (everything before first ##)
+    first_section = dag_prompt.find('## ')
+    if first_section > 0:
+        sections['_system_prompt'] = dag_prompt[:first_section].strip()
+
+    return sections
+
+
+# ============================================================================
+# PROMPT ASSEMBLY v2
+# ============================================================================
+
+def build_prompt_v2(
+    dag_prompt: str,
+    plan_summary: str,
+    history_text: str,
+    examples: List[GoldExample],
+    pattern_hint: str,
+) -> str:
+    """Assemble prompt in v2 order: Role → Query → Performance → History → Examples → Constraints → Output."""
+    parts = []
+
+    # Parse DAG output into sections
+    dag = parse_dag_sections(dag_prompt)
+
+    # ── 1. ROLE + TASK ──
+    parts.append(ROLE_SECTION)
+    parts.append("")
+
+    # ── 2. THE QUERY (DAG structure) ──
+    parts.append("---")
+    parts.append("## Query Structure")
+    parts.append("")
+    if 'Target Nodes' in dag:
+        parts.append("### Target Nodes")
+        parts.append(dag['Target Nodes'])
+        parts.append("")
+    if 'Subgraph Slice' in dag:
+        parts.append("### SQL")
+        parts.append(dag['Subgraph Slice'])
+        parts.append("")
+    if 'Node Contracts' in dag:
+        parts.append("### Contracts")
+        parts.append(dag['Node Contracts'])
+    if 'Downstream Usage' in dag:
+        parts.append("")
+        parts.append("### Downstream Usage")
+        parts.append(dag['Downstream Usage'])
+
+    # ── 3. PERFORMANCE PROFILE ──
+    parts.append("")
+    parts.append("---")
+    parts.append("## Performance Profile")
+    parts.append("")
+    if 'Cost Attribution' in dag:
+        parts.append("### Cost Attribution")
+        parts.append(dag['Cost Attribution'])
+        parts.append("")
+    if plan_summary and plan_summary.strip():
+        parts.append("### Execution Plan")
+        parts.append(f"```\n{plan_summary}\n```")
+        parts.append("")
+    # Merge all opportunity sections into one
+    opps = []
+    for key in ['Detected Opportunities', 'Knowledge Base Patterns (verified on TPC-DS)',
+                 'Detected Optimization Opportunities', 'Node-Specific Opportunities']:
+        if key in dag and dag[key].strip():
+            opps.append(dag[key])
+    if opps:
+        parts.append("### Optimization Opportunities")
+        parts.append("\n\n".join(opps))
+
+    # ── 4. HISTORY + PATTERN HINT ──
+    parts.append("")
+    parts.append("---")
+    parts.append("## Previous Attempts")
+    parts.append("")
+    if history_text:
+        parts.append(history_text)
+    else:
+        parts.append("No previous attempts.")
+
+    if pattern_hint:
+        parts.append("")
+        parts.append(pattern_hint)
+
+    # ── 5. EXAMPLES (contrastive: key_insight + when_not_to_use paired) ──
+    if examples:
+        parts.append("")
+        parts.append("---")
+        parts.append("## Examples (Verified Patterns)")
+        parts.append("")
+        for i, ex in enumerate(examples):
+            parts.append(format_example_for_prompt(ex))
+            if i < len(examples) - 1:
+                parts.append("")
+
+    # ── 6. CONSTRAINTS (sandwich ordered) ──
+    constraints = load_all_constraints()
+    if constraints:
+        parts.append("")
+        parts.append("---")
+        parts.append("## Constraints")
+        parts.append("")
+        parts.append(format_constraints_sandwich(constraints))
+
+    # ── 7. OUTPUT FORMAT (recency: last thing before generation) ──
+    parts.append("")
+    parts.append("---")
+    parts.append(OUTPUT_FORMAT_SECTION)
+
+    return "\n".join(parts)
+
+
+def build_discovery_prompt_v2(
+    dag_prompt: str,
+    plan_summary: str,
+    history_text: str,
+) -> str:
+    """Build discovery prompt for exhausted queries, using v2 structure."""
+    parts = []
+
+    # Load discovery template
+    if DISCOVERY_TEMPLATE.exists():
+        discovery_text = DISCOVERY_TEMPLATE.read_text()
+        discovery_text = discovery_text.replace(
+            "## The Query to Optimize\n\n[QUERY_WILL_BE_INSERTED_HERE]\n", ""
+        )
+        if "## Important Notes" in discovery_text:
+            discovery_text = discovery_text[:discovery_text.index("## Important Notes")]
+    else:
+        discovery_text = "# DISCOVERY MODE: All known patterns exhausted.\nFind a NOVEL optimization technique.\n"
+
+    # Parse DAG sections
+    dag = parse_dag_sections(dag_prompt)
+
+    # ── 1. DISCOVERY PREAMBLE (replaces ROLE for exhausted queries) ──
+    parts.append(discovery_text.strip())
+
+    # ── 2. THE QUERY ──
+    parts.append("")
+    parts.append("---")
+    parts.append("## Query Structure")
+    parts.append("")
+    if 'Target Nodes' in dag:
+        parts.append("### Target Nodes")
+        parts.append(dag['Target Nodes'])
+        parts.append("")
+    if 'Subgraph Slice' in dag:
+        parts.append("### SQL")
+        parts.append(dag['Subgraph Slice'])
+        parts.append("")
+    if 'Node Contracts' in dag:
+        parts.append("### Contracts")
+        parts.append(dag['Node Contracts'])
+    if 'Downstream Usage' in dag:
+        parts.append("")
+        parts.append("### Downstream Usage")
+        parts.append(dag['Downstream Usage'])
+
+    # ── 3. PERFORMANCE PROFILE ──
+    parts.append("")
+    parts.append("---")
+    parts.append("## Performance Profile")
+    parts.append("")
+    if 'Cost Attribution' in dag:
+        parts.append("### Cost Attribution")
+        parts.append(dag['Cost Attribution'])
+        parts.append("")
+    if plan_summary and plan_summary.strip():
+        parts.append("### Execution Plan")
+        parts.append(f"```\n{plan_summary}\n```")
+
+    # ── 4. HISTORY ──
+    parts.append("")
+    parts.append("---")
+    parts.append("## Previous Attempts")
+    parts.append("")
+    if history_text:
+        parts.append(history_text)
+    parts.append("")
+    parts.append("**ALL known patterns have been tried. You MUST find a novel technique.**")
+
+    # ── 5. No examples (exhausted) ──
+
+    # ── 6. CONSTRAINTS ──
+    constraints = load_all_constraints()
+    if constraints:
+        parts.append("")
+        parts.append("---")
+        parts.append("## Constraints")
+        parts.append("")
+        parts.append(format_constraints_sandwich(constraints))
+
+    # ── 7. OUTPUT FORMAT ──
+    parts.append("")
+    parts.append("---")
+    parts.append(OUTPUT_FORMAT_SECTION)
+
+    return "\n".join(parts)
+
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
 
 def clean_sql(sql_text: str) -> str:
     """Strip comments and trailing semicolons."""
@@ -276,6 +579,10 @@ def clean_sql(sql_text: str) -> str:
     return clean
 
 
+# ============================================================================
+# MAIN
+# ============================================================================
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -285,11 +592,11 @@ def main():
     errors = 0
 
     for q in range(1, 100):
-        # Read current SQL (from state queries - optimized or baseline)
-        query_path = QUERIES_DIR / f"q{q}_current.sql"
+        # ALWAYS use original baseline SQL - compound optimization (opt->opt) failed
+        BASELINE_DIR = PROJECT / "research" / "pipeline" / "state_0" / "queries"
+        query_path = BASELINE_DIR / f"q{q}.sql"
         if not query_path.exists():
-            # Fall back to pipeline state_0
-            query_path = PROJECT / "research" / "pipeline" / "state_0" / "queries" / f"q{q}.sql"
+            query_path = QUERIES_DIR / f"q{q}_current.sql"
         if not query_path.exists():
             print(f"Q{q}: SKIP - no SQL file", file=sys.stderr)
             continue
@@ -301,21 +608,19 @@ def main():
             print(f"Q{q}: SKIP - empty SQL", file=sys.stderr)
             continue
 
-        # For multi-statement queries (e.g. Q23 has two WITH blocks),
-        # use only the first statement for EXPLAIN
         statements = [s.strip() for s in sql_clean.split(';') if s.strip()]
         sql_for_explain = statements[0] if statements else sql_clean
 
         print(f"Q{q}: ", file=sys.stderr, end="", flush=True)
 
         # 1. Load attempt history
-        history_text, transforms_tried, transforms_failed = load_attempt_history(q)
+        history_text, transforms_tried, transforms_failed, transforms_succeeded = load_attempt_history(q)
 
-        # 2. Get recommended examples (analysis-driven, not FAISS)
-        examples = get_recommended_examples(q, transforms_tried, transforms_failed)
+        # 2. Get recommended examples
+        examples = get_recommended_examples(q, transforms_tried, transforms_failed, transforms_succeeded)
         ex_ids = [e.id for e in examples]
 
-        # 3. Run EXPLAIN ANALYZE (JSON parsed)
+        # 3. Run EXPLAIN ANALYZE
         plan_summary = ""
         plan_context = None
         try:
@@ -329,30 +634,39 @@ def main():
         except Exception as e:
             print(f"EXPLAIN:ERR({e}) ", file=sys.stderr, end="", flush=True)
 
-        # 4. Build DAG base prompt (with plan context for node-level optimization hints)
+        # 4. Build DAG base prompt
         try:
             pipeline = DagV2Pipeline(sql_for_explain, plan_context=plan_context)
-            base_prompt = pipeline.get_prompt()
+            dag_prompt = pipeline.get_prompt()
         except Exception as e:
-            # Fallback: raw SQL without DAG decomposition
             print(f"DAG:ERR({e}) ", file=sys.stderr, end="", flush=True)
-            base_prompt = f"Optimize this SQL query:\n```sql\n{sql_clean}\n```"
+            dag_prompt = f"## Subgraph Slice\n[main_query] type=main\n```sql\n{sql_clean}\n```"
 
-        # 5. Assemble with build_prompt_with_examples (constraints + examples + DAG + EXPLAIN + history)
-        prompt = build_prompt_with_examples(
-            base_prompt=base_prompt,
-            examples=examples,
-            execution_plan=plan_summary,
-            history_section=history_text,
-            include_constraints=True,
-        )
+        # 5. Assemble prompt v2
+        if not examples:
+            prompt = build_discovery_prompt_v2(
+                dag_prompt=dag_prompt,
+                plan_summary=plan_summary,
+                history_text=history_text,
+            )
+            mode = "DISCOVERY"
+        else:
+            pattern_hint = format_pattern_hint(examples)
+            prompt = build_prompt_v2(
+                dag_prompt=dag_prompt,
+                plan_summary=plan_summary,
+                history_text=history_text,
+                examples=examples,
+                pattern_hint=pattern_hint,
+            )
+            mode = "STANDARD"
 
         # 6. Save
         output_path = OUTPUT_DIR / f"q{q}_prompt.txt"
         with open(output_path, 'w') as f:
             f.write(prompt)
 
-        print(f"examples={ex_ids} len={len(prompt)}", file=sys.stderr)
+        print(f"mode={mode} examples={ex_ids} len={len(prompt)}", file=sys.stderr)
         generated += 1
 
     print(f"\nDone: {generated} prompts, {errors} errors", file=sys.stderr)

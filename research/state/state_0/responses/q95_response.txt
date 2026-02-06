@@ -1,0 +1,44 @@
+Looking at this query, I can see two main optimization opportunities:
+
+1. **Date CTE Isolation**: The date filter is a range condition that can be isolated early
+2. **Materialize Repeated Subqueries**: The EXISTS subqueries against ws_wh and web_returns can be materialized as CTEs
+
+However, I notice something important about the structure: the second EXISTS joins web_returns with ws_wh, which already filters for multi-warehouse orders. This means we're looking for orders that:
+- Are in ws_wh (multi-warehouse)
+- Have returns in web_returns (but only for those multi-warehouse orders)
+
+Let me analyze and create an optimized version:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "materialize_cte",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '1999-2-01' AND (CAST('1999-2-01' AS DATE) + INTERVAL '60' DAY)",
+        "multi_warehouse_orders": "SELECT DISTINCT ws_order_number FROM ws_wh",
+        "returned_multi_warehouse_orders": "SELECT DISTINCT wr_order_number FROM web_returns wr JOIN ws_wh ON wr.wr_order_number = ws_wh.ws_order_number",
+        "main_query": "SELECT COUNT(DISTINCT ws1.ws_order_number) AS \"order count\", SUM(ws1.ws_ext_ship_cost) AS \"total shipping cost\", SUM(ws1.ws_net_profit) AS \"total net profit\" FROM web_sales ws1 JOIN filtered_dates fd ON ws1.ws_ship_date_sk = fd.d_date_sk JOIN customer_address ca ON ws1.ws_ship_addr_sk = ca.ca_address_sk JOIN web_site ws ON ws1.ws_web_site_sk = ws.web_site_sk JOIN multi_warehouse_orders mwo ON ws1.ws_order_number = mwo.ws_order_number JOIN returned_multi_warehouse_orders rmwo ON ws1.ws_order_number = rmwo.wr_order_number WHERE ca.ca_state = 'NC' AND ws.web_company_name = 'pri' ORDER BY COUNT(DISTINCT ws1.ws_order_number) LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same aggregation",
+        "same ordering"
+      ],
+      "expected_speedup": "1.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Created three CTEs: 1) filtered_dates to isolate date range filtering early, 2) multi_warehouse_orders to materialize the first EXISTS condition, 3) returned_multi_warehouse_orders to materialize the second EXISTS condition (which joins web_returns with ws_wh). This replaces correlated subqueries with join-based CTEs that can be computed once and reused, reducing repeated computation. The date CTE reduces the web_sales scan size early."
+}
+```
+
+**Key insights:**
+1. The date filter can be isolated to reduce the fact table (web_sales) early
+2. Both EXISTS conditions are transformed into materialized CTEs with DISTINCT to avoid duplicates
+3. The second CTE correctly captures the join between web_returns and ws_wh as specified in the original query
+4. All literal values are preserved exactly as in the original query
+5. The ORDER BY clause is maintained (though it's redundant for a single row result with LIMIT 100, we preserve it for semantic correctness)
+
+This approach follows the successful pattern from the first example (Materialize Repeated Subquery) while also incorporating the date filtering optimization from the second example.

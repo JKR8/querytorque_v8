@@ -1,0 +1,27 @@
+{
+  "id": "deferred_window_aggregation",
+  "name": "Deferred Window Aggregation",
+  "description": "When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joined with FULL OUTER JOIN followed by another WINDOW pass for NULL carry-forward: defer the WINDOW out of the CTEs, join daily totals, then compute cumulative sums once on the joined result. SUM() OVER() naturally skips NULLs, eliminating the need for a separate MAX() carry-forward window.",
+  "benchmark_queries": ["Q51"],
+  "verified_speedup": "1.36x",
+  "example": {
+    "opportunity": "CONSOLIDATE WINDOW PASSES",
+    "input_slice": "[web_v1] type=cte\nSELECT ws_item_sk AS item_sk, d_date,\n  SUM(SUM(ws_sales_price)) OVER (PARTITION BY ws_item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cume_sales\nFROM web_sales, date_dim\nWHERE ws_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216+11 AND ws_item_sk IS NOT NULL\nGROUP BY ws_item_sk, d_date\n\n[store_v1] type=cte\nSELECT ss_item_sk AS item_sk, d_date,\n  SUM(SUM(ss_sales_price)) OVER (PARTITION BY ss_item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cume_sales\nFROM store_sales, date_dim\nWHERE ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216+11 AND ss_item_sk IS NOT NULL\nGROUP BY ss_item_sk, d_date\n\n[main_query] type=main\nSELECT * FROM (\n  SELECT item_sk, d_date, web_sales, store_sales,\n    MAX(web_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS web_cumulative,\n    MAX(store_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS store_cumulative\n  FROM (\n    SELECT COALESCE(web.item_sk, store.item_sk) AS item_sk, COALESCE(web.d_date, store.d_date) AS d_date,\n      web.cume_sales AS web_sales, store.cume_sales AS store_sales\n    FROM web_v1 web FULL OUTER JOIN store_v1 store ON (web.item_sk = store.item_sk AND web.d_date = store.d_date)\n  ) x\n) y\nWHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100",
+    "output": {
+      "rewrite_sets": [{
+        "id": "rs_01",
+        "transform": "semantic_rewrite",
+        "nodes": {
+          "web_daily": "SELECT ws_item_sk AS item_sk, d_date, SUM(ws_sales_price) AS daily_sales FROM web_sales, date_dim WHERE ws_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ws_item_sk IS NOT NULL GROUP BY ws_item_sk, d_date",
+          "store_daily": "SELECT ss_item_sk AS item_sk, d_date, SUM(ss_sales_price) AS daily_sales FROM store_sales, date_dim WHERE ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ss_item_sk IS NOT NULL GROUP BY ss_item_sk, d_date",
+          "main_query": "SELECT * FROM (SELECT COALESCE(web.item_sk, store.item_sk) AS item_sk, COALESCE(web.d_date, store.d_date) AS d_date, SUM(web.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS web_cumulative, SUM(store.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS store_cumulative FROM web_daily web FULL OUTER JOIN store_daily store ON web.item_sk = store.item_sk AND web.d_date = store.d_date) y WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100"
+        },
+        "invariants_kept": ["same result rows", "same ordering", "same column output", "same cumulative semantics"],
+        "expected_speedup": "1.4x",
+        "risk": "low"
+      }]
+    },
+    "key_insight": "When CTEs compute GROUP BY + WINDOW (running sum), then FULL OUTER JOIN introduces NULLs requiring a MAX() OVER() carry-forward pass: remove WINDOW from the CTEs (keep only GROUP BY for daily totals), join the daily totals, then compute SUM() OVER() once on the joined result. SUM() naturally skips NULLs, so the carry-forward is free. Reduces 3 WINDOW passes (2 in CTEs + 1 MAX carry-forward) to 1.",
+    "when_not_to_use": "Do not use when the CTE window function is referenced by other consumers besides the final join (the cumulative value is needed elsewhere). Do not use when the window function is not a monotonically accumulating SUM - e.g., AVG, COUNT, or non-monotonic window functions require separate computation. Only applies when the join is FULL OUTER and the carry-forward window is MAX/LAST_VALUE over a cumulative sum."
+  }
+}

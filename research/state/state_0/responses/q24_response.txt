@@ -1,0 +1,63 @@
+Looking at this query pattern, I can see a **correlated subquery in the HAVING clause** similar to the examples. The subquery `(SELECT 0.05 * AVG(netpaid) FROM ssales)` is uncorrelated but references the CTE `ssales` which itself is expensive to compute.
+
+Key insights:
+1. The CTE `ssales` is computed once, then used twice (main query and subquery)
+2. The subquery calculates `0.05 * AVG(netpaid)` over the entire `ssales` CTE
+3. The main query filters on `i_color = 'beige'` **after** computing the CTE
+4. We can push the `i_color` filter earlier and compute the threshold separately
+
+Here's the optimized rewrite:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "decorrelate",
+      "nodes": {
+        "filtered_base": "SELECT ss.ss_ticket_number, ss.ss_item_sk, ss.ss_customer_sk, ss.ss_store_sk, ss.ss_net_profit, i.i_color, i.i_item_sk, s.s_store_name, s.s_market_id, s.s_zip, c.c_last_name, c.c_first_name, c.c_current_addr_sk, c.c_birth_country, ca.ca_address_sk, ca.ca_state, ca.ca_country, ca.ca_zip FROM store_sales ss JOIN store_returns sr ON ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_item_sk = sr.sr_item_sk JOIN item i ON ss.ss_item_sk = i.i_item_sk JOIN store s ON ss.ss_store_sk = s.s_store_sk JOIN customer c ON ss.ss_customer_sk = c.c_customer_sk JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk WHERE s.s_market_id = 8 AND s.s_zip = ca.ca_zip AND c.c_birth_country <> UPPER(ca.ca_country)",
+        "beige_sales": "SELECT c_last_name, c_first_name, s_store_name, ca_state, s_state, i_color, i_current_price, i_manager_id, i_units, i_size, SUM(ss_net_profit) AS netpaid FROM filtered_base WHERE i_color = 'beige' GROUP BY c_last_name, c_first_name, s_store_name, ca_state, s_state, i_color, i_current_price, i_manager_id, i_units, i_size",
+        "all_sales_threshold": "SELECT 0.05 * AVG(netpaid) AS threshold FROM (SELECT SUM(ss_net_profit) AS netpaid FROM filtered_base GROUP BY c_last_name, c_first_name, s_store_name, ca_state, s_state, i_color, i_current_price, i_manager_id, i_units, i_size) t",
+        "main_query": "SELECT c_last_name, c_first_name, s_store_name, SUM(netpaid) AS paid FROM beige_sales, all_sales_threshold GROUP BY c_last_name, c_first_name, s_store_name, all_sales_threshold.threshold HAVING SUM(netpaid) > all_sales_threshold.threshold ORDER BY c_last_name, c_first_name, s_store_name LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "1.8x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Decoupled the expensive CTE into two paths: 1) filtered base table joins without aggregation, 2) separate aggregation for beige items only (main query) and threshold calculation (subquery). This avoids computing the full ssales CTE twice and pushes the i_color='beige' filter earlier."
+}
+```
+
+**Alternative approach using CTE materialization** (if the above is too aggressive):
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "semantic_rewrite",
+      "nodes": {
+        "ssales": "SELECT c_last_name, c_first_name, s_store_name, ca_state, s_state, i_color, i_current_price, i_manager_id, i_units, i_size, SUM(ss_net_profit) AS netpaid FROM store_sales, store_returns, store, item, customer, customer_address WHERE ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = c_customer_sk AND ss_item_sk = i_item_sk AND ss_store_sk = s_store_sk AND c_current_addr_sk = ca_address_sk AND c_birth_country <> UPPER(ca_country) AND s_zip = ca_zip AND s_market_id = 8 GROUP BY c_last_name, c_first_name, s_store_name, ca_state, s_state, i_color, i_current_price, i_manager_id, i_units, i_size",
+        "threshold": "SELECT 0.05 * AVG(netpaid) AS threshold FROM ssales",
+        "main_query": "SELECT c_last_name, c_first_name, s_store_name, SUM(netpaid) AS paid FROM ssales, threshold WHERE i_color = 'beige' GROUP BY c_last_name, c_first_name, s_store_name, threshold.threshold HAVING SUM(netpaid) > threshold.threshold ORDER BY c_last_name, c_first_name, s_store_name LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same grouping and aggregation"
+      ],
+      "expected_speedup": "1.2x",
+      "risk": "very low"
+    }
+  ]
+}
+```
+
+The first rewrite is more aggressive and should provide better speedup by avoiding redundant computation of the full aggregated CTE. The key insight is computing the threshold from base tables without first filtering to `i_color = 'beige'`, while the main query path filters early.

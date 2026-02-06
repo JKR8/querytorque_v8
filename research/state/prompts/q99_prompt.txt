@@ -1,49 +1,3 @@
-## Example: Prefetch Fact Join (PREFETCH_FACT_JOIN)
-Verified speedup: 3.77x
-
-### Input:
-[main_query]:
-SELECT * FROM (
-  SELECT i_manager_id, sum(ss_sales_price) sum_sales,
-    avg(sum(ss_sales_price)) OVER (PARTITION BY i_manager_id) avg_monthly_sales
-  FROM item, store_sales, date_dim, store
-  WHERE ss_item_sk = i_item_sk AND ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk
-    AND d_month_seq IN (1200,1201,1202,1203,1204,1205,1206,1207,1208,1209,1210,1211)
-    AND ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN (...))
-      OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN (...)))
-  GROUP BY i_manager_id, d_moy
-) AS tmp1
-WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
-ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
-
-### Output:
-```json
-{
-  "rewrite_sets": [
-    {
-      "id": "rs_01",
-      "transform": "prefetch_fact_join",
-      "nodes": {
-        "filtered_dates": "SELECT d_date_sk, d_moy FROM date_dim WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)",
-        "filtered_sales": "SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_moy FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
-        "main_query": "SELECT * FROM (SELECT i_manager_id, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales FROM item JOIN filtered_sales ON ss_item_sk = i_item_sk JOIN store ON ss_store_sk = s_store_sk WHERE ((i_category IN ('Books', 'Children', 'Electronics') AND i_class IN ('personal', 'portable', 'reference', 'self-help') AND i_brand IN (...)) OR (i_category IN ('Women', 'Music', 'Men') AND i_class IN ('accessories', 'classical', 'fragrances', 'pants') AND i_brand IN (...))) GROUP BY i_manager_id, d_moy) AS tmp1 WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100"
-      },
-      "invariants_kept": [
-        "same result rows",
-        "same ordering",
-        "same column output"
-      ],
-      "expected_speedup": "3.77x",
-      "risk": "low"
-    }
-  ]
-}
-```
-
-**Key insight:** First CTE filters the dimension (date_dim). Second CTE pre-joins this with the fact table (store_sales). This creates a smaller intermediate result before joining with other dimension tables. The pre-join materializes the filtered fact rows, making subsequent joins faster.
-
----
-
 ## Example: Dimension CTE Isolation (DIMENSION_CTE_ISOLATE)
 Verified speedup: 1.93x
 
@@ -133,17 +87,79 @@ LIMIT 100
 
 **Key insight:** Pre-filter BOTH date_dim AND store into separate CTEs. Include only the columns needed for the join and grouping. The optimizer can then use these smaller CTEs efficiently when joining with the fact table.
 
+**When NOT to use:** Do not create dimension CTEs without a WHERE clause that actually reduces rows — an unfiltered dimension CTE is pure overhead (full scan + materialization for zero selectivity benefit). Avoid on queries with 5+ tables and complex inter-table predicates where forcing join order via CTEs prevents the optimizer from choosing a better plan. Caused 0.85x on Q67 (unfiltered dimension CTEs added overhead) and 0.77x on Q72 (forced suboptimal join ordering on complex multi-table query).
+
+---
+
+## Example: Early Dimension Filter (EARLY_FILTER)
+Verified speedup: 4.00x
+
+### Input:
+[main_query]:
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales
+FROM (SELECT ss.ss_customer_sk, CASE WHEN sr.sr_return_quantity IS NOT NULL
+        THEN (ss.ss_quantity - sr.sr_return_quantity) * ss.ss_sales_price
+        ELSE ss.ss_quantity * ss.ss_sales_price END AS act_sales
+      FROM store_sales ss LEFT JOIN store_returns sr ON ss.ss_item_sk = sr.sr_item_sk
+      JOIN reason r ON sr.sr_reason_sk = r.r_reason_sk
+      WHERE r.r_reason_desc = 'duplicate purchase') t
+GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "early_filter",
+      "nodes": {
+        "filtered_reason": "SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'",
+        "filtered_returns": "SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk",
+        "main_query": "SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100"
+      },
+      "invariants_kept": [
+        "output columns unchanged",
+        "grain preserved",
+        "same result rows"
+      ],
+      "expected_speedup": "2.71x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Filter dimension table (reason) FIRST, then join to fact. Reduces returns to only 'duplicate purchase' before expensive store_sales join.
+
 ---
 
 ## CONSTRAINTS (Learned from Benchmark Failures)
 
 The following constraints are MANDATORY based on observed failures:
 
+### CTE_COLUMN_COMPLETENESS [CRITICAL]
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
 ### LITERAL_PRESERVATION [CRITICAL]
 CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
 
+### NO_MATERIALIZE_EXISTS [CRITICAL]
+NEVER convert EXISTS or NOT EXISTS subqueries into materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)). EXISTS uses semi-join short-circuiting: it stops scanning after the first match. A materialized CTE forces a full table scan and GROUP BY of the entire table, which is catastrophically slower. Keep EXISTS as EXISTS.
+
+### MIN_BASELINE_THRESHOLD [HIGH]
+If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
+
+### NO_UNFILTERED_DIMENSION_CTE [HIGH]
+Every CTE you create MUST have a WHERE clause that actually reduces the number of rows. Do NOT create CTEs like 'filtered_stores AS (SELECT s_store_sk, s_store_id FROM store)' that select all rows from a dimension table. Selecting fewer columns is NOT filtering - the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query.
+
+### NO_UNION_SAME_COLUMN_OR [HIGH]
+Only apply or_to_union when the OR conditions span DIFFERENT tables or create fundamentally different access paths. Do NOT split OR conditions into UNION ALL when all branches filter the SAME column (e.g., 't_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17'). Splitting same-column ORs into UNION ALL doubles or triples the fact table scans. The database optimizer already handles same-column OR efficiently with a single scan.
+
 ### OR_TO_UNION_LIMIT [HIGH]
 CAUTION with OR→UNION: Only split OR conditions into UNION ALL when there are ≤3 simple branches AND they have different access patterns. If you have nested ORs (e.g., 3 conditions × 3 values = 9 combinations), DO NOT expand them - keep the original OR structure. DuckDB handles OR predicates efficiently. Over-splitting causes multiple scans of fact tables and severe regressions (0.23x-0.41x observed). When in doubt, preserve the original OR structure.
+
+### REMOVE_REPLACED_CTES [HIGH]
+When you create new CTEs that replace existing ones, you MUST remove the original CTEs from the WITH clause. Your rewrite_sets 'nodes' object should include the replacement node with the SAME node_id to overwrite it, or the original must not appear. Never leave dead/unused CTEs in the query - they still get materialized and waste resources.
 
 
 ---
@@ -201,7 +217,7 @@ SELECT SUBSTRING(w_warehouse_name, 1, 20), sm_type, cc_name, SUM(CASE WHEN (cs_s
 No usage data.
 
 ## Cost Attribution
-[main_query]: 99.7% cost, ~2837457 rows, ops=[SEQ_SCAN[catalog_sales], SEQ_SCAN[date_dim], SEQ_SCAN[warehouse]]
+[main_query]: 100.0% cost, ~2837457 rows, ops=[SEQ_SCAN[catalog_sales], SEQ_SCAN[date_dim], SEQ_SCAN[warehouse]]
 
 ## Detected Opportunities
 ## Knowledge Base Patterns (verified on TPC-DS)
@@ -218,11 +234,11 @@ Now output your rewrite_sets:
 ## Execution Plan
 ```
 Operators by cost:
-- SEQ_SCAN(catalog_sales): 60.9% cost, 2,837,457 rows
-- HASH_GROUP_BY: 21.1% cost, 720 rows
-- PROJECTION: 10.9% cost, 2,837,457 rows
-- PROJECTION: 2.0% cost, 2,837,457 rows
-- HASH_JOIN: 1.2% cost, 2,837,457 rows
+- SEQ_SCAN(catalog_sales): 59.4% cost, 2,837,457 rows
+- HASH_GROUP_BY: 21.4% cost, 720 rows
+- PROJECTION: 11.7% cost, 2,837,457 rows
+- PROJECTION: 2.1% cost, 2,837,457 rows
+- HASH_JOIN: 1.3% cost, 2,837,457 rows
 
 Scans:
 - catalog_sales x1: 172,815,132 rows (no filter)
@@ -249,7 +265,9 @@ Joins:
 - baseline: 1.00x [none] NEUTRAL
 - kimi: 1.00x [none] NEUTRAL
 - v2_standard: 1.00x [date_cte_isolate] NEUTRAL
+- dsr1: 1.11x [prefetch_fact_join] WIN
 
+**Worked**: prefetch_fact_join
 **No effect**: date_cte_isolate
 
-**IMPORTANT:** The following patterns were provided: prefetch_fact_join, dimension_cte_isolate, multi_dimension_prefetch. Consider a DIFFERENT approach!
+**IMPORTANT:** The following patterns were provided: dimension_cte_isolate, multi_dimension_prefetch, early_filter. Consider a DIFFERENT approach!

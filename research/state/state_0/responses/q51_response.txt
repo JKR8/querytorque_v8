@@ -1,0 +1,38 @@
+Looking at this query structure, I notice an opportunity to apply **prefetch_fact_join** pattern similar to the first example. The current plan shows late joins with fact tables and expensive window operations over large intermediate results. The key insight is to pre-join the filtered dates with fact tables early, creating smaller filtered fact datasets before the window functions.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "prefetch_fact_join",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1216 AND 1216 + 11",
+        "filtered_web_sales": "SELECT ws_item_sk AS item_sk, d_date, ws_sales_price FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk WHERE NOT ws_item_sk IS NULL",
+        "filtered_store_sales": "SELECT ss_item_sk AS item_sk, d_date, ss_sales_price FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk WHERE NOT ss_item_sk IS NULL",
+        "web_v1": "SELECT item_sk, d_date, SUM(SUM(ws_sales_price)) OVER (PARTITION BY item_sk ORDER BY d_date rows BETWEEN UNBOUNDED preceding AND CURRENT ROW) AS cume_sales FROM filtered_web_sales GROUP BY item_sk, d_date",
+        "store_v1": "SELECT item_sk, d_date, SUM(SUM(ss_sales_price)) OVER (PARTITION BY item_sk ORDER BY d_date rows BETWEEN UNBOUNDED preceding AND CURRENT ROW) AS cume_sales FROM filtered_store_sales GROUP BY item_sk, d_date",
+        "main_query": "SELECT * FROM (SELECT item_sk, d_date, web_sales, store_sales, MAX(web_sales) OVER (PARTITION BY item_sk ORDER BY d_date rows BETWEEN UNBOUNDED preceding AND CURRENT ROW) AS web_cumulative, MAX(store_sales) OVER (PARTITION BY item_sk ORDER BY d_date rows BETWEEN UNBOUNDED preceding AND CURRENT ROW) AS store_cumulative FROM (SELECT CASE WHEN NOT web.item_sk IS NULL THEN web.item_sk ELSE store.item_sk END AS item_sk, CASE WHEN NOT web.d_date IS NULL THEN web.d_date ELSE store.d_date END AS d_date, web.cume_sales AS web_sales, store.cume_sales AS store_sales FROM web_v1 AS web FULL OUTER JOIN store_v1 AS store ON (web.item_sk = store.item_sk AND web.d_date = store.d_date)) AS x) AS y WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same window function semantics",
+        "same date filter values (1216 to 1227)"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Applied prefetch_fact_join pattern: 1) Created filtered_dates CTE to isolate date_dim filtering once. 2) Pre-joined dates with fact tables early (filtered_web_sales, filtered_store_sales) before aggregation and window functions. This reduces the amount of data flowing into the expensive window operations by applying date filters at the earliest possible stage. The main query structure remains identical but now works with pre-filtered fact data."
+}
+```
+
+**Key optimizations:**
+1. **Date filter isolation**: The date filter (`d_month_seq BETWEEN 1216 AND 1216 + 11`) is applied once in `filtered_dates` CTE instead of twice (once in each original CTE).
+2. **Early fact filtering**: Fact tables are joined with filtered dates immediately, reducing the data volume before expensive GROUP BY and window operations.
+3. **Preserved semantics**: All window functions, full outer join logic, and filter conditions remain exactly the same.
+4. **Literal preservation**: Kept the exact literal values (1216) as required.
+
+This pattern matches the successful example from the knowledge base where pre-joining filtered dimensions with fact tables created significant speedups (3.77x verified).

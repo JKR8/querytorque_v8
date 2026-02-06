@@ -1,0 +1,40 @@
+Looking at the query structure, I can see three CTEs (ssr, csr, wsr) that have identical filtering patterns on date_dim, item, and promotion. They all scan large fact tables (store_sales, catalog_sales, web_sales) with the same date range filter. This is a perfect opportunity for a "prefetch_fact_join" pattern.
+
+However, I notice the date_dim filter is used in all three CTEs. Instead of creating separate CTEs for each, I can create a single filtered date CTE and pre-join it with each fact table separately. This is similar to the multi_date_range_cte pattern but optimized for this specific case.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "prefetch_fact_join",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL '30' DAY)",
+        "filtered_items": "SELECT i_item_sk FROM item WHERE i_current_price > 50",
+        "filtered_promotions": "SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N'",
+        "prefiltered_store_sales": "SELECT ss_item_sk, ss_store_sk, ss_ticket_number, ss_ext_sales_price, ss_net_profit FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN filtered_items ON ss_item_sk = i_item_sk JOIN filtered_promotions ON ss_promo_sk = p_promo_sk",
+        "prefiltered_web_sales": "SELECT ws_item_sk, ws_web_site_sk, ws_order_number, ws_ext_sales_price, ws_net_profit FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk JOIN filtered_items ON ws_item_sk = i_item_sk JOIN filtered_promotions ON ws_promo_sk = p_promo_sk",
+        "ssr": "SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS \"returns\", SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit FROM prefiltered_store_sales LEFT OUTER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) JOIN store ON ss_store_sk = s_store_sk GROUP BY s_store_id",
+        "wsr": "SELECT web_site_id, SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS \"returns\", SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit FROM prefiltered_web_sales LEFT OUTER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number) JOIN web_site ON ws_web_site_sk = web_site_sk GROUP BY web_site_id",
+        "main_query": "SELECT channel, id, SUM(sales) AS sales, SUM(\"returns\") AS \"returns\", SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, \"returns\", profit FROM ssr UNION ALL SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, \"returns\", profit FROM csr UNION ALL SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, \"returns\", profit FROM wsr) AS x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same aggregation semantics"
+      ],
+      "expected_speedup": "3.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Applied prefetch_fact_join pattern by creating filtered CTEs for date_dim, item, and promotion tables that are common to all three sales channels. Pre-joined these filtered dimension tables with each fact table (store_sales, web_sales) before the expensive outer joins with returns tables and grouping. This reduces the fact table rows early and applies filters before joins, dramatically reducing the intermediate result sizes. The pattern is similar to multi_date_range_cte but optimized for the shared filters across multiple CTEs."
+}
+```
+
+**Key insights:**
+1. All three CTEs (ssr, csr, wsr) use identical filters on date_dim, item, and promotion
+2. Creating shared filtered dimension CTEs allows them to be reused across all three sales channels
+3. Pre-joining these filtered dimensions with fact tables reduces the largest tables (store_sales, web_sales) before expensive outer joins and groupings
+4. The returns tables (store_returns, web_returns) remain as outer joins since they don't have the same date filters
+5. This approach minimizes repeated filtering of the same dimension tables across multiple CTEs

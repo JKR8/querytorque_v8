@@ -43,51 +43,7 @@ ORDER BY cnt, a.ca_state LIMIT 100
 
 **Key insight:** Extract date month_seq subquery into CTE. Extract category average into separate CTE with GROUP BY. Join instead of correlated subquery. This allows each CTE to be scanned once.
 
----
-
-## Example: Prefetch Fact Join (PREFETCH_FACT_JOIN)
-Verified speedup: 3.77x
-
-### Input:
-[main_query]:
-SELECT * FROM (
-  SELECT i_manager_id, sum(ss_sales_price) sum_sales,
-    avg(sum(ss_sales_price)) OVER (PARTITION BY i_manager_id) avg_monthly_sales
-  FROM item, store_sales, date_dim, store
-  WHERE ss_item_sk = i_item_sk AND ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk
-    AND d_month_seq IN (1200,1201,1202,1203,1204,1205,1206,1207,1208,1209,1210,1211)
-    AND ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN (...))
-      OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN (...)))
-  GROUP BY i_manager_id, d_moy
-) AS tmp1
-WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
-ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
-
-### Output:
-```json
-{
-  "rewrite_sets": [
-    {
-      "id": "rs_01",
-      "transform": "prefetch_fact_join",
-      "nodes": {
-        "filtered_dates": "SELECT d_date_sk, d_moy FROM date_dim WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)",
-        "filtered_sales": "SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_moy FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
-        "main_query": "SELECT * FROM (SELECT i_manager_id, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales FROM item JOIN filtered_sales ON ss_item_sk = i_item_sk JOIN store ON ss_store_sk = s_store_sk WHERE ((i_category IN ('Books', 'Children', 'Electronics') AND i_class IN ('personal', 'portable', 'reference', 'self-help') AND i_brand IN (...)) OR (i_category IN ('Women', 'Music', 'Men') AND i_class IN ('accessories', 'classical', 'fragrances', 'pants') AND i_brand IN (...))) GROUP BY i_manager_id, d_moy) AS tmp1 WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100"
-      },
-      "invariants_kept": [
-        "same result rows",
-        "same ordering",
-        "same column output"
-      ],
-      "expected_speedup": "3.77x",
-      "risk": "low"
-    }
-  ]
-}
-```
-
-**Key insight:** First CTE filters the dimension (date_dim). Second CTE pre-joins this with the fact table (store_sales). This creates a smaller intermediate result before joining with other dimension tables. The pre-join materializes the filtered fact rows, making subsequent joins faster.
+**When NOT to use:** Do not use when the optimizer already pushes date predicates effectively (e.g., simple equality filters on date columns in self-joins). Do not decompose an already-efficient existing CTE into sub-CTEs — this adds materialization overhead without reducing scans. Caused 0.49x regression on Q31 (DuckDB already optimized the date pushdown) and 0.71x on Q1 (decomposed a well-structured CTE into slower pieces).
 
 ---
 
@@ -141,15 +97,76 @@ WHERE y.d_week_seq = z.d_week_seq - 53 ORDER BY d_week_seq1
 
 ---
 
+## Example: Dimension CTE Isolation (DIMENSION_CTE_ISOLATE)
+Verified speedup: 1.93x
+
+### Input:
+[main_query]:
+SELECT i_item_id, avg(cs_quantity) agg1, avg(cs_list_price) agg2, avg(cs_coupon_amt) agg3, avg(cs_sales_price) agg4
+FROM catalog_sales, customer_demographics, date_dim, item, promotion
+WHERE cs_sold_date_sk = d_date_sk AND cs_item_sk = i_item_sk
+  AND cs_bill_cdemo_sk = cd_demo_sk AND cs_promo_sk = p_promo_sk
+  AND cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'
+  AND (p_channel_email = 'N' OR p_channel_event = 'N') AND d_year = 2000
+GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "dimension_cte_isolate",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000",
+        "filtered_customer_demographics": "SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'",
+        "filtered_promotions": "SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'",
+        "joined_facts": "SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales AS cs JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk",
+        "main_query": "SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM joined_facts AS jf JOIN item AS i ON jf.cs_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "1.90x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Pre-filter EACH dimension table into its own CTE returning only the surrogate key. This reduces the cardinality of subsequent joins. Works best when dimension filters are highly selective.
+
+---
+
 ## CONSTRAINTS (Learned from Benchmark Failures)
 
 The following constraints are MANDATORY based on observed failures:
 
+### CTE_COLUMN_COMPLETENESS [CRITICAL]
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
 ### LITERAL_PRESERVATION [CRITICAL]
 CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
 
+### NO_MATERIALIZE_EXISTS [CRITICAL]
+NEVER convert EXISTS or NOT EXISTS subqueries into materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)). EXISTS uses semi-join short-circuiting: it stops scanning after the first match. A materialized CTE forces a full table scan and GROUP BY of the entire table, which is catastrophically slower. Keep EXISTS as EXISTS.
+
+### MIN_BASELINE_THRESHOLD [HIGH]
+If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
+
+### NO_UNFILTERED_DIMENSION_CTE [HIGH]
+Every CTE you create MUST have a WHERE clause that actually reduces the number of rows. Do NOT create CTEs like 'filtered_stores AS (SELECT s_store_sk, s_store_id FROM store)' that select all rows from a dimension table. Selecting fewer columns is NOT filtering - the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query.
+
+### NO_UNION_SAME_COLUMN_OR [HIGH]
+Only apply or_to_union when the OR conditions span DIFFERENT tables or create fundamentally different access paths. Do NOT split OR conditions into UNION ALL when all branches filter the SAME column (e.g., 't_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17'). Splitting same-column ORs into UNION ALL doubles or triples the fact table scans. The database optimizer already handles same-column OR efficiently with a single scan.
+
 ### OR_TO_UNION_LIMIT [HIGH]
 CAUTION with OR→UNION: Only split OR conditions into UNION ALL when there are ≤3 simple branches AND they have different access patterns. If you have nested ORs (e.g., 3 conditions × 3 values = 9 combinations), DO NOT expand them - keep the original OR structure. DuckDB handles OR predicates efficiently. Over-splitting causes multiple scans of fact tables and severe regressions (0.23x-0.41x observed). When in doubt, preserve the original OR structure.
+
+### REMOVE_REPLACED_CTES [HIGH]
+When you create new CTEs that replace existing ones, you MUST remove the original CTEs from the WITH clause. Your rewrite_sets 'nodes' object should include the replacement node with the SAME node_id to overwrite it, or the original must not appear. Never leave dead/unused CTEs in the query - they still get materialized and waste resources.
 
 
 ---
@@ -194,49 +211,49 @@ OUTPUT FORMAT:
 ## Subgraph Slice
 [ssr] type=cte
 ```sql
-SELECT s_store_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS returns_, SUM(net_loss) AS profit_loss FROM (SELECT ss_store_sk AS store_sk, ss_sold_date_sk AS date_sk, ss_ext_sales_price AS sales_price, ss_net_profit AS profit, CAST(0 AS DECIMAL(7, 2)) AS return_amt, CAST(0 AS DECIMAL(7, 2)) AS net_loss FROM store_sales UNION ALL SELECT sr_store_sk AS store_sk, sr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7, 2)) AS sales_price, CAST(0 AS DECIMAL(7, 2)) AS profit, sr_return_amt AS return_amt, sr_net_loss AS net_loss FROM store_returns) AS salesreturns, date_dim, store WHERE date_sk = d_date_sk AND d_date BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-06' AS DATE) AND store_sk = s_store_sk GROUP BY s_store_id
+SELECT s_store_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS "returns", SUM(net_loss) AS profit_loss FROM (SELECT ss_store_sk AS store_sk, ss_sold_date_sk AS date_sk, ss_ext_sales_price AS sales_price, ss_net_profit AS profit, CAST(0 AS DECIMAL(7, 2)) AS return_amt, CAST(0 AS DECIMAL(7, 2)) AS net_loss FROM store_sales UNION ALL SELECT sr_store_sk AS store_sk, sr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7, 2)) AS sales_price, CAST(0 AS DECIMAL(7, 2)) AS profit, sr_return_amt AS return_amt, sr_net_loss AS net_loss FROM store_returns) AS salesreturns, date_dim, store WHERE date_sk = d_date_sk AND d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL '14' DAY) AND store_sk = s_store_sk GROUP BY s_store_id
 ```
 
 [main_query] type=main
 ```sql
-SELECT channel, id, SUM(sales) AS sales, SUM(returns_) AS returns_, SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, CONCAT('store', s_store_id) AS id, sales, returns_, (profit - profit_loss) AS profit FROM ssr UNION ALL SELECT 'catalog channel' AS channel, CONCAT('catalog_page', cp_catalog_page_id) AS id, sales, returns_, (profit - profit_loss) AS profit FROM csr UNION ALL SELECT 'web channel' AS channel, CONCAT('web_site', web_site_id) AS id, sales, returns_, (profit - profit_loss) AS profit FROM wsr) AS x GROUP BY ROLLUP (channel, id) ORDER BY channel NULLS FIRST, id NULLS FIRST LIMIT 100
+SELECT channel, id, SUM(sales) AS sales, SUM("returns") AS "returns", SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, 'store' || s_store_id AS id, sales, "returns", (profit - profit_loss) AS profit FROM ssr UNION ALL SELECT 'catalog channel' AS channel, 'catalog_page' || cp_catalog_page_id AS id, sales, "returns", (profit - profit_loss) AS profit FROM csr UNION ALL SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, "returns", (profit - profit_loss) AS profit FROM wsr) AS x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100
 ```
 
 [wsr] type=cte
 ```sql
-SELECT web_site_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS returns_, SUM(net_loss) AS profit_loss FROM (SELECT ws_web_site_sk AS wsr_web_site_sk, ws_sold_date_sk AS date_sk, ws_ext_sales_price AS sales_price, ws_net_profit AS profit, CAST(0 AS DECIMAL(7, 2)) AS return_amt, CAST(0 AS DECIMAL(7, 2)) AS net_loss FROM web_sales UNION ALL SELECT ws_web_site_sk AS wsr_web_site_sk, wr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7, 2)) AS sales_price, CAST(0 AS DECIMAL(7, 2)) AS profit, wr_return_amt AS return_amt, wr_net_loss AS net_loss FROM web_returns LEFT OUTER JOIN web_sales ON (wr_item_sk = ws_item_sk AND wr_order_number = ws_order_number)) AS salesreturns, date_dim, web_site WHERE date_sk = d_date_sk AND d_date BETWEEN CAST('2000-08-23' AS DATE) AND CAST('2000-09-06' AS DATE) AND wsr_web_site_sk = web_site_sk GROUP BY web_site_id
+SELECT web_site_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS "returns", SUM(net_loss) AS profit_loss FROM (SELECT ws_web_site_sk AS wsr_web_site_sk, ws_sold_date_sk AS date_sk, ws_ext_sales_price AS sales_price, ws_net_profit AS profit, CAST(0 AS DECIMAL(7, 2)) AS return_amt, CAST(0 AS DECIMAL(7, 2)) AS net_loss FROM web_sales UNION ALL SELECT ws_web_site_sk AS wsr_web_site_sk, wr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7, 2)) AS sales_price, CAST(0 AS DECIMAL(7, 2)) AS profit, wr_return_amt AS return_amt, wr_net_loss AS net_loss FROM web_returns LEFT OUTER JOIN web_sales ON (wr_item_sk = ws_item_sk AND wr_order_number = ws_order_number)) AS salesreturns, date_dim, web_site WHERE date_sk = d_date_sk AND d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL '14' DAY) AND wsr_web_site_sk = web_site_sk GROUP BY web_site_id
 ```
 
 
 ## Node Contracts
 [ssr]:
-  output_columns: ['s_store_id', 'sales', 'profit', 'returns_', 'profit_loss']
+  output_columns: ['s_store_id', 'sales', 'profit', 'returns', 'profit_loss']
   grain: ['s_store_id']
   required_predicates: ['store_sk = s_store_sk', 'date_sk = d_date_sk']
 [main_query]:
-  output_columns: ['channel', 'id', 'sales', 'returns_', 'profit']
+  output_columns: ['channel', 'id', 'sales', 'returns', 'profit']
 [wsr]:
-  output_columns: ['web_site_id', 'sales', 'profit', 'returns_', 'profit_loss']
+  output_columns: ['web_site_id', 'sales', 'profit', 'returns', 'profit_loss']
   grain: ['web_site_id']
   required_predicates: ['wsr_web_site_sk = web_site_sk', 'date_sk = d_date_sk']
 
 ## Downstream Usage
-[ssr]: downstream_refs=['s_store_id', 'sales', 'profit_loss', 'profit', 'returns_']
-[wsr]: downstream_refs=['sales', 'web_site_id', 'profit_loss', 'profit', 'returns_']
+[ssr]: downstream_refs=['profit', 'sales', 's_store_id', 'profit_loss', 'returns']
+[wsr]: downstream_refs=['profit', 'sales', 'web_site_id', 'profit_loss', 'returns']
 
 ## Cost Attribution
-[ssr]: 67.8% cost, ~291394 rows, ops=[SEQ_SCAN[store_sales], SEQ_SCAN[store_returns], SEQ_SCAN[store]]
-[main_query]: 0% cost, ~1000 rows, ops=[HASH_GROUP_BY, HASH_JOIN, SEQ_SCAN[wsr]]
+[ssr]: 68.6% cost, ~289064 rows, ops=[SEQ_SCAN[store_sales], SEQ_SCAN[store_returns], SEQ_SCAN[store]]
+[main_query]: 3.3% cost, ~1000 rows, ops=[HASH_JOIN]
 [wsr]: 26.3% cost, ~7195721 rows, ops=[SEQ_SCAN[date_dim], SEQ_SCAN[date_dim], SEQ_SCAN[web_sales]]
 
 ## Detected Opportunities
 ## Knowledge Base Patterns (verified on TPC-DS)
 ## Detected Optimization Opportunities
 
-1. **QT-OPT-007** - Materialize Repeated Subquery
-  Trigger: Same subquery pattern appears multiple times in query
-  Rewrite: Extract to CTE with MATERIALIZED hint, reference by name
-   Matched: Repeated subquery pattern
+1. **QT-OPT-003** - Date CTE Isolation
+  Trigger: date_dim joined with d_year/d_qoy/d_month filter, fact table present
+  Rewrite: Create CTE: SELECT d_date_sk FROM date_dim WHERE filter, join fact to CTE early
+   Matched: date_dim filter with fact table
 
 
 ## Node-Specific Opportunities
@@ -257,10 +274,10 @@ Now output your rewrite_sets:
 ## Execution Plan
 ```
 Operators by cost:
-- SEQ_SCAN(store_sales): 60.5% cost, 291,394 rows
-- SEQ_SCAN(store_sales): 20.5% cost, 78,842 rows
-- SEQ_SCAN(store_sales): 7.3% cost, 15,360 rows
-- SEQ_SCAN(store_sales): 3.9% cost, 7,195,721 rows
+- SEQ_SCAN(store_sales): 61.8% cost, 289,064 rows
+- SEQ_SCAN(store_sales): 20.9% cost, 79,034 rows
+- SEQ_SCAN(store_sales): 6.5% cost, 15,049 rows
+- SEQ_SCAN(store_sales): 3.3% cost, 7,195,721 rows
 - HASH_JOIN: 2.8% cost, 719,222 rows
 
 Scans:
@@ -274,45 +291,45 @@ Scans:
 - catalog_page x1: 12,000 → 10,101 rows (filtered)
 
 Misestimates:
-- HASH_GROUP_BY: est 53 vs actual 1,291 (24.4x)
+- HASH_GROUP_BY: est 53 vs actual 1,209 (22.8x)
 - PROJECTION: est 1,990 vs actual 51 (39.0x)
 - HASH_GROUP_BY: est 1,990 vs actual 51 (39.0x)
-- PROJECTION: est 6,462,064 vs actual 306,754 (21.1x)
-- HASH_JOIN: est 6,462,064 vs actual 306,754 (21.1x)
-- HASH_JOIN: est 6,335,357 vs actual 306,754 (20.7x)
-- PROJECTION: est 28,800,991 vs actual 291,394 (98.8x)
-- SEQ_SCAN: est 28,800,991 vs actual 291,394 (98.8x)
-- PROJECTION: est 2,877,532 vs actual 15,360 (187.3x)
-- SEQ_SCAN: est 2,877,532 vs actual 15,360 (187.3x)
+- PROJECTION: est 6,462,064 vs actual 304,113 (21.2x)
+- HASH_JOIN: est 6,462,064 vs actual 304,113 (21.2x)
+- HASH_JOIN: est 6,335,357 vs actual 304,113 (20.8x)
+- PROJECTION: est 28,800,991 vs actual 289,064 (99.6x)
+- SEQ_SCAN: est 28,800,991 vs actual 289,064 (99.6x)
+- PROJECTION: est 2,877,532 vs actual 15,049 (191.2x)
+- SEQ_SCAN: est 2,877,532 vs actual 15,049 (191.2x)
 - FILTER: est 14,609 vs actual 15 (973.9x)
 - SEQ_SCAN: est 14,609 vs actual 15 (973.9x)
-- PROJECTION: est 3,649,091 vs actual 161,649 (22.6x)
-- HASH_JOIN: est 3,649,091 vs actual 161,649 (22.6x)
-- HASH_JOIN: est 3,168,323 vs actual 161,649 (19.6x)
-- PROJECTION: est 14,401,261 vs actual 154,269 (93.4x)
-- SEQ_SCAN: est 14,401,261 vs actual 154,269 (93.4x)
-- PROJECTION: est 1,441,224 vs actual 7,380 (195.3x)
-- SEQ_SCAN: est 1,441,224 vs actual 7,380 (195.3x)
+- PROJECTION: est 3,649,091 vs actual 161,769 (22.6x)
+- HASH_JOIN: est 3,649,091 vs actual 161,769 (22.6x)
+- HASH_JOIN: est 3,168,323 vs actual 161,769 (19.6x)
+- PROJECTION: est 14,401,261 vs actual 154,254 (93.4x)
+- SEQ_SCAN: est 14,401,261 vs actual 154,254 (93.4x)
+- PROJECTION: est 1,441,224 vs actual 7,515 (191.8x)
+- SEQ_SCAN: est 1,441,224 vs actual 7,515 (191.8x)
 - FILTER: est 14,609 vs actual 15 (973.9x)
 - SEQ_SCAN: est 14,609 vs actual 15 (973.9x)
 - PROJECTION: est 1,990 vs actual 21 (94.8x)
 - HASH_GROUP_BY: est 1,990 vs actual 21 (94.8x)
-- PROJECTION: est 2,811,918 vs actual 83,931 (33.5x)
-- HASH_JOIN: est 2,811,918 vs actual 83,931 (33.5x)
-- HASH_JOIN: est 2,878,868 vs actual 83,933 (34.3x)
-- PROJECTION: est 7,197,566 vs actual 78,842 (91.3x)
-- SEQ_SCAN: est 7,197,566 vs actual 78,842 (91.3x)
+- PROJECTION: est 2,811,918 vs actual 84,255 (33.4x)
+- HASH_JOIN: est 2,811,918 vs actual 84,255 (33.4x)
+- HASH_JOIN: est 2,878,868 vs actual 84,257 (34.2x)
+- PROJECTION: est 7,197,566 vs actual 79,034 (91.1x)
+- SEQ_SCAN: est 7,197,566 vs actual 79,034 (91.1x)
 - PROJECTION: est 7,197,566 vs actual 719,222 (10.0x)
 - HASH_JOIN: est 7,197,566 vs actual 719,222 (10.0x)
 - FILTER: est 14,609 vs actual 15 (973.9x)
 - SEQ_SCAN: est 14,609 vs actual 15 (973.9x)
 
 Joins:
-- HASH_JOIN: ? x store -> 306,754 rows (late)
-- HASH_JOIN: ? x ? -> 306,754 rows
-- HASH_JOIN: ? x catalog_page -> 161,649 rows
-- HASH_JOIN: ? x ? -> 161,649 rows
-- HASH_JOIN: ? x web_site -> 83,931 rows
+- HASH_JOIN: ? x store -> 304,113 rows (late)
+- HASH_JOIN: ? x ? -> 304,113 rows
+- HASH_JOIN: ? x catalog_page -> 161,769 rows
+- HASH_JOIN: ? x ? -> 161,769 rows
+- HASH_JOIN: ? x web_site -> 84,255 rows
 ```
 
 
@@ -321,5 +338,8 @@ Joins:
 - baseline: 1.00x [none] NEUTRAL
 - kimi: 1.09x [none] IMPROVED
 - retry3w_1: 1.89x [none] WIN
+- dsr1: 0.96x [prefetch_fact_join] NEUTRAL
 
-**IMPORTANT:** The following patterns were provided: date_cte_isolate, prefetch_fact_join, union_cte_split. Consider a DIFFERENT approach!
+**No effect**: prefetch_fact_join
+
+**IMPORTANT:** The following patterns were provided: date_cte_isolate, union_cte_split, dimension_cte_isolate. Consider a DIFFERENT approach!

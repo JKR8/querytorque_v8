@@ -1,3 +1,54 @@
+## Example: Decorrelate EXISTS + OR-to-UNION Composite (COMPOSITE_DECORRELATE_UNION)
+Verified speedup: 2.42x
+
+### Input:
+[main_query]:
+SELECT ca_state, cd_gender, cd_marital_status, cd_dep_count, count(*) cnt1, ...
+FROM customer c, customer_address ca, customer_demographics
+WHERE c.c_current_addr_sk = ca.ca_address_sk
+  AND cd_demo_sk = c.c_current_cdemo_sk
+  AND EXISTS (SELECT * FROM store_sales, date_dim
+              WHERE c.c_customer_sk = ss_customer_sk
+              AND ss_sold_date_sk = d_date_sk AND d_year = 2001 AND d_qoy < 4)
+  AND (EXISTS (SELECT * FROM web_sales, date_dim
+               WHERE c.c_customer_sk = ws_bill_customer_sk
+               AND ws_sold_date_sk = d_date_sk AND d_year = 2001 AND d_qoy < 4)
+       OR EXISTS (SELECT * FROM catalog_sales, date_dim
+                  WHERE c.c_customer_sk = cs_ship_customer_sk
+                  AND cs_sold_date_sk = d_date_sk AND d_year = 2001 AND d_qoy < 4))
+GROUP BY ... ORDER BY ... LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "decorrelate",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_qoy < 4",
+        "store_customers": "SELECT DISTINCT ss_customer_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
+        "web_customers": "SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk",
+        "catalog_customers": "SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk",
+        "web_or_catalog_customers": "SELECT ws_bill_customer_sk AS customer_sk FROM web_customers UNION SELECT cs_ship_customer_sk AS customer_sk FROM catalog_customers",
+        "main_query": "SELECT ca_state, cd_gender, cd_marital_status, cd_dep_count, COUNT(*) AS cnt1, MAX(cd_dep_count), SUM(cd_dep_count), MAX(cd_dep_count), cd_dep_employed_count, COUNT(*) AS cnt2, MAX(cd_dep_employed_count), SUM(cd_dep_employed_count), MAX(cd_dep_employed_count), cd_dep_college_count, COUNT(*) AS cnt3, MAX(cd_dep_college_count), SUM(cd_dep_college_count), MAX(cd_dep_college_count) FROM customer AS c JOIN customer_address AS ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics ON cd_demo_sk = c.c_current_cdemo_sk JOIN store_customers AS sc ON c.c_customer_sk = sc.ss_customer_sk JOIN web_or_catalog_customers AS wcc ON c.c_customer_sk = wcc.customer_sk GROUP BY ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "2.40x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Three-part composite: (1) Extract shared date filter into CTE (all 3 EXISTS use same d_year/d_qoy). (2) Decorrelate each EXISTS into SELECT DISTINCT customer_sk joined with filtered_dates. (3) Replace OR(EXISTS web, EXISTS catalog) with UNION of customer key CTEs. The EXISTS->JOIN conversion works because the main query only needs to know IF a customer exists, which DISTINCT + JOIN achieves. The UNION replaces OR logic at the set level.
+
+---
+
 ## Example: Date CTE Isolation (DATE_CTE_ISOLATE)
 Verified speedup: 4.00x
 
@@ -43,51 +94,7 @@ ORDER BY cnt, a.ca_state LIMIT 100
 
 **Key insight:** Extract date month_seq subquery into CTE. Extract category average into separate CTE with GROUP BY. Join instead of correlated subquery. This allows each CTE to be scanned once.
 
----
-
-## Example: Prefetch Fact Join (PREFETCH_FACT_JOIN)
-Verified speedup: 3.77x
-
-### Input:
-[main_query]:
-SELECT * FROM (
-  SELECT i_manager_id, sum(ss_sales_price) sum_sales,
-    avg(sum(ss_sales_price)) OVER (PARTITION BY i_manager_id) avg_monthly_sales
-  FROM item, store_sales, date_dim, store
-  WHERE ss_item_sk = i_item_sk AND ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk
-    AND d_month_seq IN (1200,1201,1202,1203,1204,1205,1206,1207,1208,1209,1210,1211)
-    AND ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN (...))
-      OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN (...)))
-  GROUP BY i_manager_id, d_moy
-) AS tmp1
-WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
-ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
-
-### Output:
-```json
-{
-  "rewrite_sets": [
-    {
-      "id": "rs_01",
-      "transform": "prefetch_fact_join",
-      "nodes": {
-        "filtered_dates": "SELECT d_date_sk, d_moy FROM date_dim WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)",
-        "filtered_sales": "SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_moy FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
-        "main_query": "SELECT * FROM (SELECT i_manager_id, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales FROM item JOIN filtered_sales ON ss_item_sk = i_item_sk JOIN store ON ss_store_sk = s_store_sk WHERE ((i_category IN ('Books', 'Children', 'Electronics') AND i_class IN ('personal', 'portable', 'reference', 'self-help') AND i_brand IN (...)) OR (i_category IN ('Women', 'Music', 'Men') AND i_class IN ('accessories', 'classical', 'fragrances', 'pants') AND i_brand IN (...))) GROUP BY i_manager_id, d_moy) AS tmp1 WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100"
-      },
-      "invariants_kept": [
-        "same result rows",
-        "same ordering",
-        "same column output"
-      ],
-      "expected_speedup": "3.77x",
-      "risk": "low"
-    }
-  ]
-}
-```
-
-**Key insight:** First CTE filters the dimension (date_dim). Second CTE pre-joins this with the fact table (store_sales). This creates a smaller intermediate result before joining with other dimension tables. The pre-join materializes the filtered fact rows, making subsequent joins faster.
+**When NOT to use:** Do not use when the optimizer already pushes date predicates effectively (e.g., simple equality filters on date columns in self-joins). Do not decompose an already-efficient existing CTE into sub-CTEs — this adds materialization overhead without reducing scans. Caused 0.49x regression on Q31 (DuckDB already optimized the date pushdown) and 0.71x on Q1 (decomposed a well-structured CTE into slower pieces).
 
 ---
 
@@ -132,17 +139,37 @@ GROUP BY ca_zip ORDER BY ca_zip LIMIT 100
 
 **Key insight:** Each OR branch becomes a separate query with focused predicates. Date filter is extracted as CTE and joined into each branch.
 
+**When NOT to use:** Do not split OR when all branches filter the SAME column on the same table (e.g., t_hour >= 8 OR t_hour <= 17). This duplicates the entire fact table scan for each branch with no selectivity benefit. Only apply when OR conditions span DIFFERENT tables or fundamentally different column families. Also never split into more than 3 UNION branches — each branch rescans the fact table. Caused 0.59x on Q90 (same-column time range split doubled fact scans) and historically 0.23x-0.41x on queries with 9+ UNION branches.
+
 ---
 
 ## CONSTRAINTS (Learned from Benchmark Failures)
 
 The following constraints are MANDATORY based on observed failures:
 
+### CTE_COLUMN_COMPLETENESS [CRITICAL]
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
 ### LITERAL_PRESERVATION [CRITICAL]
 CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
 
+### NO_MATERIALIZE_EXISTS [CRITICAL]
+NEVER convert EXISTS or NOT EXISTS subqueries into materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)). EXISTS uses semi-join short-circuiting: it stops scanning after the first match. A materialized CTE forces a full table scan and GROUP BY of the entire table, which is catastrophically slower. Keep EXISTS as EXISTS.
+
+### MIN_BASELINE_THRESHOLD [HIGH]
+If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
+
+### NO_UNFILTERED_DIMENSION_CTE [HIGH]
+Every CTE you create MUST have a WHERE clause that actually reduces the number of rows. Do NOT create CTEs like 'filtered_stores AS (SELECT s_store_sk, s_store_id FROM store)' that select all rows from a dimension table. Selecting fewer columns is NOT filtering - the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query.
+
+### NO_UNION_SAME_COLUMN_OR [HIGH]
+Only apply or_to_union when the OR conditions span DIFFERENT tables or create fundamentally different access paths. Do NOT split OR conditions into UNION ALL when all branches filter the SAME column (e.g., 't_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17'). Splitting same-column ORs into UNION ALL doubles or triples the fact table scans. The database optimizer already handles same-column OR efficiently with a single scan.
+
 ### OR_TO_UNION_LIMIT [HIGH]
 CAUTION with OR→UNION: Only split OR conditions into UNION ALL when there are ≤3 simple branches AND they have different access patterns. If you have nested ORs (e.g., 3 conditions × 3 values = 9 combinations), DO NOT expand them - keep the original OR structure. DuckDB handles OR predicates efficiently. Over-splitting causes multiple scans of fact tables and severe regressions (0.23x-0.41x observed). When in doubt, preserve the original OR structure.
+
+### REMOVE_REPLACED_CTES [HIGH]
+When you create new CTEs that replace existing ones, you MUST remove the original CTEs from the WITH clause. Your rewrite_sets 'nodes' object should include the replacement node with the SAME node_id to overwrite it, or the original must not appear. Never leave dead/unused CTEs in the query - they still get materialized and waste resources.
 
 
 ---
@@ -181,88 +208,79 @@ OUTPUT FORMAT:
 ```
 
 ## Target Nodes
-  [filtered_sales] UNION_ALL
-  [filtered_dates] 
+  [main_query] GROUP_BY
 
 ## Subgraph Slice
-[filtered_sales] type=cte
-```sql
-SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE SUBSTRING(ca_zip, 1, 5) IN ('85669', '86197', '88274', '83405', '86475', '85392', '85460', '80348', '81792') UNION ALL SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE ca_state IN ('CA', 'WA', 'GA') UNION ALL SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE cs_sales_price > 500
-```
-
-[filtered_dates] type=cte
-```sql
-SELECT d_date_sk FROM date_dim WHERE d_qoy = 1 AND d_year = 2001
-```
-
 [main_query] type=main
 ```sql
-SELECT ca_zip, SUM(cs_sales_price) FROM filtered_sales GROUP BY ca_zip ORDER BY ca_zip LIMIT 100
+SELECT ca_zip, SUM(cs_sales_price) FROM catalog_sales, customer, customer_address, date_dim WHERE cs_bill_customer_sk = c_customer_sk AND c_current_addr_sk = ca_address_sk AND (SUBSTRING(ca_zip, 1, 5) IN ('85669', '86197', '88274', '83405', '86475', '85392', '85460', '80348', '81792') OR ca_state IN ('CA', 'WA', 'GA') OR cs_sales_price > 500) AND cs_sold_date_sk = d_date_sk AND d_qoy = 1 AND d_year = 2001 GROUP BY ca_zip ORDER BY ca_zip LIMIT 100
 ```
 
 
 ## Node Contracts
-[filtered_sales]:
-  output_columns: ['cs_sales_price', 'ca_zip']
-  required_predicates: ['cs_sales_price > 500']
-[filtered_dates]:
-  output_columns: ['d_date_sk']
-  required_predicates: ['d_qoy = 1', 'd_year = 2001']
 [main_query]:
   output_columns: ['ca_zip', 'SUM(cs_sales_price)']
   grain: ['ca_zip']
+  required_predicates: ['d_year = 2001', 'd_qoy = 1', 'cs_sold_date_sk = d_date_sk']
 
 ## Downstream Usage
-[filtered_sales]: downstream_refs=['cs_sales_price', 'ca_zip']
-[filtered_dates]: downstream_refs=['d_date_sk']
+No usage data.
 
 ## Cost Attribution
-[filtered_sales]: 87.9% cost, ~499984 rows, ops=[SEQ_SCAN[customer], SEQ_SCAN[customer_address], SEQ_SCAN[catalog_sales]]
-[filtered_dates]: 5.5% cost, ~91 rows, ops=[SEQ_SCAN[date_dim], SEQ_SCAN[date_dim], SEQ_SCAN[date_dim]]
-[main_query]: 0% cost, ~1000 rows, ops=[HASH_GROUP_BY, HASH_JOIN, SEQ_SCAN[filtered_sales]]
+[main_query]: 99.7% cost, ~500000 rows, ops=[SEQ_SCAN[catalog_sales], SEQ_SCAN[customer_address], SEQ_SCAN[customer]]
 
 ## Detected Opportunities
-No obvious opportunities detected.
+## Knowledge Base Patterns (verified on TPC-DS)
+## Detected Optimization Opportunities
+
+1. **QT-OPT-001** - OR to UNION ALL Decomposition
+  Trigger: OR conditions spanning different columns (col_a = X OR col_b = Y)
+  Rewrite: Split into separate SELECTs with UNION ALL, add exclusion predicates to avoid duplicates
+   Matched: OR condition in WHERE clause
+
+2. **QT-OPT-003** - Date CTE Isolation
+  Trigger: date_dim joined with d_year/d_qoy/d_month filter, fact table present
+  Rewrite: Create CTE: SELECT d_date_sk FROM date_dim WHERE filter, join fact to CTE early
+   Matched: date_dim filter with fact table
+
+
+## Node-Specific Opportunities
+OR_TO_UNION: [main_query] has OR condition
+  Fix: Split into UNION ALL branches
+  Expected: 2x speedup (verified Q15: 2.98x)
 
 Now output your rewrite_sets:
 
 ## Execution Plan
 ```
 Operators by cost:
-- SEQ_SCAN(catalog_sales): 21.6% cost, 409,682 rows
-- SEQ_SCAN(catalog_sales): 15.0% cost, 466,680 rows
-- SEQ_SCAN(catalog_sales): 13.9% cost, 10,240 rows
-- SEQ_SCAN(catalog_sales): 12.1% cost, 18 rows
-- SEQ_SCAN(catalog_sales): 8.3% cost, 250,000 rows
+- HASH_JOIN: 23.4% cost, 500,000 rows
+- SEQ_SCAN(catalog_sales): 17.5% cost, 408,654 rows
+- SEQ_SCAN(catalog_sales): 15.9% cost, 500,000 rows
+- HASH_JOIN: 13.1% cost, 408,654 rows
+- SEQ_SCAN(catalog_sales): 10.5% cost, 250,000 rows
 
 Scans:
-- catalog_sales x2: 172,815,132 rows (no filter)
-- customer x3: 2,500,000 rows (no filter)
-- customer_address x3: 750,000 → 250,000 rows (filtered)
-- date_dim x3: 73,049 → 91 rows (filtered)
+- catalog_sales x1: 172,815,132 rows (no filter)
+- customer x1: 2,500,000 rows (no filter)
+- customer_address x1: 750,000 rows (no filter)
+- date_dim x1: 73,049 → 91 rows (filtered)
+- COLUMN_DATA_SCAN x1: 9 rows (no filter)
 
 Misestimates:
-- PROJECTION: est 52,246 vs actual 520 (100.5x)
-- HASH_GROUP_BY: est 52,246 vs actual 520 (100.5x)
-- PROJECTION: est 18,943 vs actual 53 (357.4x)
-- HASH_JOIN: est 18,943 vs actual 53 (357.4x)
-- HASH_JOIN: est 82,127 vs actual 39 (2105.8x)
-- SEQ_SCAN: est 50,000 vs actual 18 (2777.8x)
-- SEQ_SCAN: est 14,401,261 vs actual 409,682 (35.2x)
-- SEQ_SCAN: est 14,401,261 vs actual 409,682 (35.2x)
-- PROJECTION: est 18,943 vs actual 0 (18943.0x)
-- HASH_JOIN: est 18,943 vs actual 0 (18943.0x)
-- SEQ_SCAN: est 250,000 vs actual 6,144 (40.7x)
-- HASH_JOIN: est 23,065 vs actual 0 (23065.0x)
-- SEQ_SCAN: est 500,000 vs actual 10,240 (48.8x)
-- HASH_JOIN: est 23,065 vs actual 0 (23065.0x)
+- PROJECTION: est 13,441 vs actual 520 (25.8x)
+- HASH_GROUP_BY: est 13,441 vs actual 520 (25.8x)
+- PROJECTION: est 2,365,492 vs actual 33,303 (71.0x)
+- FILTER: est 2,365,492 vs actual 33,303 (71.0x)
+- HASH_JOIN: est 11,827,463 vs actual 408,654 (28.9x)
+- HASH_JOIN: est 11,827,463 vs actual 408,654 (28.9x)
+- SEQ_SCAN: est 14,401,261 vs actual 408,654 (35.2x)
 
 Joins:
-- HASH_JOIN: ? x ? -> 53 rows (late)
-- HASH_JOIN: customer x customer_address -> 39 rows (late)
-- HASH_JOIN: catalog_sales x ? -> 409,682 rows (late)
-- HASH_JOIN: ? x ? -> 33,250 rows
-- HASH_JOIN: customer x ? -> 39,869 rows
+- HASH_JOIN: ? x ? -> 33,303 rows
+- HASH_JOIN: ? x ? -> 408,654 rows (late)
+- HASH_JOIN: catalog_sales x ? -> 408,654 rows
+- HASH_JOIN: customer_address x customer -> 500,000 rows
 ```
 
 
@@ -270,7 +288,9 @@ Joins:
 
 - baseline: 1.00x [none] NEUTRAL
 - kimi: 2.78x [or_to_union] WIN
+- dsr1: 1.09x [prefetch_fact_join] IMPROVED
 
 **Worked**: or_to_union
+**No effect**: prefetch_fact_join
 
-**IMPORTANT:** The following patterns were provided: date_cte_isolate, prefetch_fact_join, or_to_union. Consider a DIFFERENT approach!
+**IMPORTANT:** The following patterns were provided: composite_decorrelate_union, date_cte_isolate, or_to_union. Consider a DIFFERENT approach!

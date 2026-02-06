@@ -1,43 +1,3 @@
-## Example: Single Pass Aggregation (SINGLE_PASS_AGGREGATION)
-Verified speedup: 4.47x
-
-### Input:
-[main_query]:
-SELECT
-  CASE WHEN (SELECT count(*) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) > 74129
-       THEN (SELECT avg(ss_ext_discount_amt) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20)
-       ELSE (SELECT avg(ss_net_paid) FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20) END AS bucket1,
-  CASE WHEN (SELECT count(*) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40) > 122840
-       THEN (SELECT avg(ss_ext_discount_amt) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40)
-       ELSE (SELECT avg(ss_net_paid) FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40) END AS bucket2,
-  -- ... 3 more buckets, 15 total scans of store_sales
-
-### Output:
-```json
-{
-  "rewrite_sets": [
-    {
-      "id": "rs_01",
-      "transform": "single_pass_aggregation",
-      "nodes": {
-        "store_sales_aggregates": "SELECT SUM(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 ELSE 0 END) AS cnt1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_ext_discount_amt END) AS avg_disc1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_net_paid END) AS avg_paid1, SUM(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN 1 ELSE 0 END) AS cnt2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_ext_discount_amt END) AS avg_disc2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_net_paid END) AS avg_paid2, SUM(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN 1 ELSE 0 END) AS cnt3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_ext_discount_amt END) AS avg_disc3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_net_paid END) AS avg_paid3, SUM(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN 1 ELSE 0 END) AS cnt4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_ext_discount_amt END) AS avg_disc4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_net_paid END) AS avg_paid4, SUM(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN 1 ELSE 0 END) AS cnt5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_ext_discount_amt END) AS avg_disc5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_net_paid END) AS avg_paid5 FROM store_sales",
-        "main_query": "SELECT CASE WHEN cnt1 > 74129 THEN avg_disc1 ELSE avg_paid1 END AS bucket1, CASE WHEN cnt2 > 122840 THEN avg_disc2 ELSE avg_paid2 END AS bucket2, CASE WHEN cnt3 > 56580 THEN avg_disc3 ELSE avg_paid3 END AS bucket3, CASE WHEN cnt4 > 10097 THEN avg_disc4 ELSE avg_paid4 END AS bucket4, CASE WHEN cnt5 > 165306 THEN avg_disc5 ELSE avg_paid5 END AS bucket5 FROM store_sales_aggregates"
-      },
-      "invariants_kept": [
-        "same result values",
-        "same column output"
-      ],
-      "expected_speedup": "4.50x",
-      "risk": "low"
-    }
-  ]
-}
-```
-
-**Key insight:** Multiple scalar subqueries with different filter conditions on the same table can be consolidated into a single CTE using conditional CASE expressions inside aggregates. Reduces N scans to 1 scan.
-
----
-
 ## Example: Filter Pushdown (PUSHDOWN)
 Verified speedup: 2.11x
 
@@ -123,17 +83,88 @@ GROUP BY ca_zip ORDER BY ca_zip LIMIT 100
 
 **Key insight:** Each OR branch becomes a separate query with focused predicates. Date filter is extracted as CTE and joined into each branch.
 
+**When NOT to use:** Do not split OR when all branches filter the SAME column on the same table (e.g., t_hour >= 8 OR t_hour <= 17). This duplicates the entire fact table scan for each branch with no selectivity benefit. Only apply when OR conditions span DIFFERENT tables or fundamentally different column families. Also never split into more than 3 UNION branches — each branch rescans the fact table. Caused 0.59x on Q90 (same-column time range split doubled fact scans) and historically 0.23x-0.41x on queries with 9+ UNION branches.
+
+---
+
+## Example: Decorrelate EXISTS + OR-to-UNION Composite (COMPOSITE_DECORRELATE_UNION)
+Verified speedup: 2.42x
+
+### Input:
+[main_query]:
+SELECT ca_state, cd_gender, cd_marital_status, cd_dep_count, count(*) cnt1, ...
+FROM customer c, customer_address ca, customer_demographics
+WHERE c.c_current_addr_sk = ca.ca_address_sk
+  AND cd_demo_sk = c.c_current_cdemo_sk
+  AND EXISTS (SELECT * FROM store_sales, date_dim
+              WHERE c.c_customer_sk = ss_customer_sk
+              AND ss_sold_date_sk = d_date_sk AND d_year = 2001 AND d_qoy < 4)
+  AND (EXISTS (SELECT * FROM web_sales, date_dim
+               WHERE c.c_customer_sk = ws_bill_customer_sk
+               AND ws_sold_date_sk = d_date_sk AND d_year = 2001 AND d_qoy < 4)
+       OR EXISTS (SELECT * FROM catalog_sales, date_dim
+                  WHERE c.c_customer_sk = cs_ship_customer_sk
+                  AND cs_sold_date_sk = d_date_sk AND d_year = 2001 AND d_qoy < 4))
+GROUP BY ... ORDER BY ... LIMIT 100
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "decorrelate",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_qoy < 4",
+        "store_customers": "SELECT DISTINCT ss_customer_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
+        "web_customers": "SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk",
+        "catalog_customers": "SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk",
+        "web_or_catalog_customers": "SELECT ws_bill_customer_sk AS customer_sk FROM web_customers UNION SELECT cs_ship_customer_sk AS customer_sk FROM catalog_customers",
+        "main_query": "SELECT ca_state, cd_gender, cd_marital_status, cd_dep_count, COUNT(*) AS cnt1, MAX(cd_dep_count), SUM(cd_dep_count), MAX(cd_dep_count), cd_dep_employed_count, COUNT(*) AS cnt2, MAX(cd_dep_employed_count), SUM(cd_dep_employed_count), MAX(cd_dep_employed_count), cd_dep_college_count, COUNT(*) AS cnt3, MAX(cd_dep_college_count), SUM(cd_dep_college_count), MAX(cd_dep_college_count) FROM customer AS c JOIN customer_address AS ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics ON cd_demo_sk = c.c_current_cdemo_sk JOIN store_customers AS sc ON c.c_customer_sk = sc.ss_customer_sk JOIN web_or_catalog_customers AS wcc ON c.c_customer_sk = wcc.customer_sk GROUP BY ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "2.40x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** Three-part composite: (1) Extract shared date filter into CTE (all 3 EXISTS use same d_year/d_qoy). (2) Decorrelate each EXISTS into SELECT DISTINCT customer_sk joined with filtered_dates. (3) Replace OR(EXISTS web, EXISTS catalog) with UNION of customer key CTEs. The EXISTS->JOIN conversion works because the main query only needs to know IF a customer exists, which DISTINCT + JOIN achieves. The UNION replaces OR logic at the set level.
+
 ---
 
 ## CONSTRAINTS (Learned from Benchmark Failures)
 
 The following constraints are MANDATORY based on observed failures:
 
+### CTE_COLUMN_COMPLETENESS [CRITICAL]
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
 ### LITERAL_PRESERVATION [CRITICAL]
 CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
 
+### NO_MATERIALIZE_EXISTS [CRITICAL]
+NEVER convert EXISTS or NOT EXISTS subqueries into materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)). EXISTS uses semi-join short-circuiting: it stops scanning after the first match. A materialized CTE forces a full table scan and GROUP BY of the entire table, which is catastrophically slower. Keep EXISTS as EXISTS.
+
+### MIN_BASELINE_THRESHOLD [HIGH]
+If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
+
+### NO_UNFILTERED_DIMENSION_CTE [HIGH]
+Every CTE you create MUST have a WHERE clause that actually reduces the number of rows. Do NOT create CTEs like 'filtered_stores AS (SELECT s_store_sk, s_store_id FROM store)' that select all rows from a dimension table. Selecting fewer columns is NOT filtering - the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query.
+
+### NO_UNION_SAME_COLUMN_OR [HIGH]
+Only apply or_to_union when the OR conditions span DIFFERENT tables or create fundamentally different access paths. Do NOT split OR conditions into UNION ALL when all branches filter the SAME column (e.g., 't_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17'). Splitting same-column ORs into UNION ALL doubles or triples the fact table scans. The database optimizer already handles same-column OR efficiently with a single scan.
+
 ### OR_TO_UNION_LIMIT [HIGH]
 CAUTION with OR→UNION: Only split OR conditions into UNION ALL when there are ≤3 simple branches AND they have different access patterns. If you have nested ORs (e.g., 3 conditions × 3 values = 9 combinations), DO NOT expand them - keep the original OR structure. DuckDB handles OR predicates efficiently. Over-splitting causes multiple scans of fact tables and severe regressions (0.23x-0.41x observed). When in doubt, preserve the original OR structure.
+
+### REMOVE_REPLACED_CTES [HIGH]
+When you create new CTEs that replace existing ones, you MUST remove the original CTEs from the WITH clause. Your rewrite_sets 'nodes' object should include the replacement node with the SAME node_id to overwrite it, or the original must not appear. Never leave dead/unused CTEs in the query - they still get materialized and waste resources.
 
 
 ---
@@ -190,7 +221,7 @@ SELECT * FROM (SELECT COUNT(*) AS h8_30_to_9 FROM store_sales, household_demogra
 No usage data.
 
 ## Cost Attribution
-[main_query]: 93.3% cost, ~1253672 rows, ops=[SEQ_SCAN[store_sales], SEQ_SCAN[time_dim], SEQ_SCAN[store]]
+[main_query]: 92.8% cost, ~1253672 rows, ops=[SEQ_SCAN[store_sales], SEQ_SCAN[time_dim], SEQ_SCAN[store]]
 
 ## Detected Opportunities
 ## Knowledge Base Patterns (verified on TPC-DS)
@@ -212,10 +243,10 @@ Now output your rewrite_sets:
 ## Execution Plan
 ```
 Operators by cost:
-- SEQ_SCAN(store_sales): 56.4% cost, 418,547 rows
-- SEQ_SCAN(store_sales): 5.2% cost, 831,156 rows
-- SEQ_SCAN(store_sales): 5.2% cost, 1,239,151 rows
-- SEQ_SCAN(store_sales): 5.1% cost, 721,325 rows
+- SEQ_SCAN(store_sales): 55.4% cost, 418,547 rows
+- SEQ_SCAN(store_sales): 5.9% cost, 831,757 rows
+- SEQ_SCAN(store_sales): 5.4% cost, 1,239,151 rows
+- SEQ_SCAN(store_sales): 5.3% cost, 834,484 rows
 - SEQ_SCAN(store_sales): 5.1% cost, 1,253,672 rows
 
 Scans:
@@ -248,7 +279,9 @@ Joins:
 - baseline: 1.00x [none] NEUTRAL
 - kimi: 0.99x [none] NEUTRAL
 - v2_standard: 1.00x [materialize_cte] NEUTRAL
+- dsr1: 3.32x [single_pass_aggregation] WIN
 
+**Worked**: single_pass_aggregation
 **No effect**: materialize_cte
 
-**IMPORTANT:** The following patterns were provided: single_pass_aggregation, pushdown, or_to_union. Consider a DIFFERENT approach!
+**IMPORTANT:** The following patterns were provided: pushdown, or_to_union, composite_decorrelate_union. Consider a DIFFERENT approach!

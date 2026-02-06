@@ -55,10 +55,15 @@ class DeepSeekClient:
         duration = time.time() - start_time
         response_text = response.choices[0].message.content or ""
 
-        # Log reasoning content if available (R1 models)
+        # R1 reasoner: final answer should be in content, reasoning chain in reasoning_content.
+        # Known issue: sometimes content is empty and the JSON answer is in reasoning_content.
         reasoning = getattr(response.choices[0].message, 'reasoning_content', None)
         if reasoning:
-            logger.debug("DeepSeek reasoning: %s...", reasoning[:200])
+            logger.debug("DeepSeek reasoning (%d chars): %s...", len(reasoning), reasoning[:200])
+
+        if not response_text.strip() and reasoning:
+            logger.warning("DeepSeek content empty, extracting from reasoning_content")
+            response_text = self._extract_from_reasoning(reasoning)
 
         logger.info(
             "DeepSeek API response: model=%s, duration=%.2fs, response=%d chars",
@@ -66,3 +71,44 @@ class DeepSeekClient:
         )
 
         return response_text
+
+    @staticmethod
+    def _extract_from_reasoning(reasoning: str) -> str:
+        """Extract JSON answer from reasoning_content when content is empty.
+
+        The reasoner sometimes puts the final JSON in reasoning_content
+        instead of content. We look for the last complete JSON block.
+        """
+        import re
+
+        # Look for ```json ... ``` blocks (last one is usually the final answer)
+        json_blocks = re.findall(r'```json\s*(.*?)\s*```', reasoning, re.DOTALL)
+        if json_blocks:
+            return json_blocks[-1]
+
+        # Look for raw JSON with rewrite_sets
+        matches = re.findall(r'\{[^{}]*"rewrite_sets".*?\}(?:\s*\})?', reasoning, re.DOTALL)
+        if matches:
+            return matches[-1]
+
+        # Last resort: find the last { ... } block
+        brace_depth = 0
+        last_json_start = -1
+        last_json_end = -1
+        for i, ch in enumerate(reasoning):
+            if ch == '{':
+                if brace_depth == 0:
+                    last_json_start = i
+                brace_depth += 1
+            elif ch == '}':
+                brace_depth -= 1
+                if brace_depth == 0 and last_json_start >= 0:
+                    last_json_end = i + 1
+
+        if last_json_start >= 0 and last_json_end > last_json_start:
+            candidate = reasoning[last_json_start:last_json_end]
+            if '"rewrite_sets"' in candidate:
+                return candidate
+
+        # Return full reasoning as fallback
+        return reasoning

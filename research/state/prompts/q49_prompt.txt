@@ -1,49 +1,3 @@
-## Example: Prefetch Fact Join (PREFETCH_FACT_JOIN)
-Verified speedup: 3.77x
-
-### Input:
-[main_query]:
-SELECT * FROM (
-  SELECT i_manager_id, sum(ss_sales_price) sum_sales,
-    avg(sum(ss_sales_price)) OVER (PARTITION BY i_manager_id) avg_monthly_sales
-  FROM item, store_sales, date_dim, store
-  WHERE ss_item_sk = i_item_sk AND ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk
-    AND d_month_seq IN (1200,1201,1202,1203,1204,1205,1206,1207,1208,1209,1210,1211)
-    AND ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN (...))
-      OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN (...)))
-  GROUP BY i_manager_id, d_moy
-) AS tmp1
-WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
-ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
-
-### Output:
-```json
-{
-  "rewrite_sets": [
-    {
-      "id": "rs_01",
-      "transform": "prefetch_fact_join",
-      "nodes": {
-        "filtered_dates": "SELECT d_date_sk, d_moy FROM date_dim WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)",
-        "filtered_sales": "SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_moy FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
-        "main_query": "SELECT * FROM (SELECT i_manager_id, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales FROM item JOIN filtered_sales ON ss_item_sk = i_item_sk JOIN store ON ss_store_sk = s_store_sk WHERE ((i_category IN ('Books', 'Children', 'Electronics') AND i_class IN ('personal', 'portable', 'reference', 'self-help') AND i_brand IN (...)) OR (i_category IN ('Women', 'Music', 'Men') AND i_class IN ('accessories', 'classical', 'fragrances', 'pants') AND i_brand IN (...))) GROUP BY i_manager_id, d_moy) AS tmp1 WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100"
-      },
-      "invariants_kept": [
-        "same result rows",
-        "same ordering",
-        "same column output"
-      ],
-      "expected_speedup": "3.77x",
-      "risk": "low"
-    }
-  ]
-}
-```
-
-**Key insight:** First CTE filters the dimension (date_dim). Second CTE pre-joins this with the fact table (store_sales). This creates a smaller intermediate result before joining with other dimension tables. The pre-join materializes the filtered fact rows, making subsequent joins faster.
-
----
-
 ## Example: Union CTE Split/Specialization (UNION_CTE_SPLIT)
 Verified speedup: 1.36x
 
@@ -94,21 +48,36 @@ WHERE y.d_week_seq = z.d_week_seq - 53 ORDER BY d_week_seq1
 
 ---
 
-## Example: Date CTE Isolation (DATE_CTE_ISOLATE)
-Verified speedup: 4.00x
+## Example: Deferred Window Aggregation (DEFERRED_WINDOW_AGGREGATION)
+Verified speedup: 1.36x
 
 ### Input:
-[main_query]:
-SELECT a.ca_state state, count(*) cnt
-FROM customer_address a, customer c, store_sales s, date_dim d, item i
-WHERE a.ca_address_sk = c.c_current_addr_sk
-  AND c.c_customer_sk = s.ss_customer_sk
-  AND s.ss_sold_date_sk = d.d_date_sk
-  AND s.ss_item_sk = i.i_item_sk
-  AND d.d_month_seq = (SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1)
-  AND i.i_current_price > 1.2 * (SELECT avg(j.i_current_price) FROM item j WHERE j.i_category = i.i_category)
-GROUP BY a.ca_state HAVING count(*) >= 10
-ORDER BY cnt, a.ca_state LIMIT 100
+[web_v1] type=cte
+SELECT ws_item_sk AS item_sk, d_date,
+  SUM(SUM(ws_sales_price)) OVER (PARTITION BY ws_item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cume_sales
+FROM web_sales, date_dim
+WHERE ws_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216+11 AND ws_item_sk IS NOT NULL
+GROUP BY ws_item_sk, d_date
+
+[store_v1] type=cte
+SELECT ss_item_sk AS item_sk, d_date,
+  SUM(SUM(ss_sales_price)) OVER (PARTITION BY ss_item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cume_sales
+FROM store_sales, date_dim
+WHERE ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216+11 AND ss_item_sk IS NOT NULL
+GROUP BY ss_item_sk, d_date
+
+[main_query] type=main
+SELECT * FROM (
+  SELECT item_sk, d_date, web_sales, store_sales,
+    MAX(web_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS web_cumulative,
+    MAX(store_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS store_cumulative
+  FROM (
+    SELECT COALESCE(web.item_sk, store.item_sk) AS item_sk, COALESCE(web.d_date, store.d_date) AS d_date,
+      web.cume_sales AS web_sales, store.cume_sales AS store_sales
+    FROM web_v1 web FULL OUTER JOIN store_v1 store ON (web.item_sk = store.item_sk AND web.d_date = store.d_date)
+  ) x
+) y
+WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100
 
 ### Output:
 ```json
@@ -116,28 +85,28 @@ ORDER BY cnt, a.ca_state LIMIT 100
   "rewrite_sets": [
     {
       "id": "rs_01",
-      "transform": "date_cte_isolate",
+      "transform": "semantic_rewrite",
       "nodes": {
-        "target_month": "SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1",
-        "category_avg_price": "SELECT i_category, AVG(i_current_price) * 1.2 AS avg_threshold FROM item GROUP BY i_category",
-        "filtered_dates": "SELECT d_date_sk FROM date_dim JOIN target_month ON d_month_seq = target_month.d_month_seq",
-        "filtered_sales": "SELECT ss_customer_sk, ss_item_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
-        "main_query": "SELECT a.ca_state AS state, COUNT(*) AS cnt FROM customer_address a JOIN customer c ON a.ca_address_sk = c.c_current_addr_sk JOIN filtered_sales s ON c.c_customer_sk = s.ss_customer_sk JOIN item i ON s.ss_item_sk = i.i_item_sk JOIN category_avg_price cap ON i.i_category = cap.i_category WHERE i.i_current_price > cap.avg_threshold GROUP BY a.ca_state HAVING COUNT(*) >= 10 ORDER BY cnt, a.ca_state LIMIT 100"
+        "web_daily": "SELECT ws_item_sk AS item_sk, d_date, SUM(ws_sales_price) AS daily_sales FROM web_sales, date_dim WHERE ws_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ws_item_sk IS NOT NULL GROUP BY ws_item_sk, d_date",
+        "store_daily": "SELECT ss_item_sk AS item_sk, d_date, SUM(ss_sales_price) AS daily_sales FROM store_sales, date_dim WHERE ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ss_item_sk IS NOT NULL GROUP BY ss_item_sk, d_date",
+        "main_query": "SELECT * FROM (SELECT COALESCE(web.item_sk, store.item_sk) AS item_sk, COALESCE(web.d_date, store.d_date) AS d_date, SUM(web.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS web_cumulative, SUM(store.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS store_cumulative FROM web_daily web FULL OUTER JOIN store_daily store ON web.item_sk = store.item_sk AND web.d_date = store.d_date) y WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100"
       },
       "invariants_kept": [
         "same result rows",
         "same ordering",
         "same column output",
-        "same grouping and aggregation"
+        "same cumulative semantics"
       ],
-      "expected_speedup": "2.0x",
+      "expected_speedup": "1.4x",
       "risk": "low"
     }
   ]
 }
 ```
 
-**Key insight:** Extract date month_seq subquery into CTE. Extract category average into separate CTE with GROUP BY. Join instead of correlated subquery. This allows each CTE to be scanned once.
+**Key insight:** When CTEs compute GROUP BY + WINDOW (running sum), then FULL OUTER JOIN introduces NULLs requiring a MAX() OVER() carry-forward pass: remove WINDOW from the CTEs (keep only GROUP BY for daily totals), join the daily totals, then compute SUM() OVER() once on the joined result. SUM() naturally skips NULLs, so the carry-forward is free. Reduces 3 WINDOW passes (2 in CTEs + 1 MAX carry-forward) to 1.
+
+**When NOT to use:** Do not use when the CTE window function is referenced by other consumers besides the final join (the cumulative value is needed elsewhere). Do not use when the window function is not a monotonically accumulating SUM - e.g., AVG, COUNT, or non-monotonic window functions require separate computation. Only applies when the join is FULL OUTER and the carry-forward window is MAX/LAST_VALUE over a cumulative sum.
 
 ---
 
@@ -145,11 +114,29 @@ ORDER BY cnt, a.ca_state LIMIT 100
 
 The following constraints are MANDATORY based on observed failures:
 
+### CTE_COLUMN_COMPLETENESS [CRITICAL]
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
 ### LITERAL_PRESERVATION [CRITICAL]
 CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
 
+### NO_MATERIALIZE_EXISTS [CRITICAL]
+NEVER convert EXISTS or NOT EXISTS subqueries into materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)). EXISTS uses semi-join short-circuiting: it stops scanning after the first match. A materialized CTE forces a full table scan and GROUP BY of the entire table, which is catastrophically slower. Keep EXISTS as EXISTS.
+
+### MIN_BASELINE_THRESHOLD [HIGH]
+If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
+
+### NO_UNFILTERED_DIMENSION_CTE [HIGH]
+Every CTE you create MUST have a WHERE clause that actually reduces the number of rows. Do NOT create CTEs like 'filtered_stores AS (SELECT s_store_sk, s_store_id FROM store)' that select all rows from a dimension table. Selecting fewer columns is NOT filtering - the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query.
+
+### NO_UNION_SAME_COLUMN_OR [HIGH]
+Only apply or_to_union when the OR conditions span DIFFERENT tables or create fundamentally different access paths. Do NOT split OR conditions into UNION ALL when all branches filter the SAME column (e.g., 't_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17'). Splitting same-column ORs into UNION ALL doubles or triples the fact table scans. The database optimizer already handles same-column OR efficiently with a single scan.
+
 ### OR_TO_UNION_LIMIT [HIGH]
 CAUTION with OR→UNION: Only split OR conditions into UNION ALL when there are ≤3 simple branches AND they have different access patterns. If you have nested ORs (e.g., 3 conditions × 3 values = 9 combinations), DO NOT expand them - keep the original OR structure. DuckDB handles OR predicates efficiently. Over-splitting causes multiple scans of fact tables and severe regressions (0.23x-0.41x observed). When in doubt, preserve the original OR structure.
+
+### REMOVE_REPLACED_CTES [HIGH]
+When you create new CTEs that replace existing ones, you MUST remove the original CTEs from the WITH clause. Your rewrite_sets 'nodes' object should include the replacement node with the SAME node_id to overwrite it, or the original must not appear. Never leave dead/unused CTEs in the query - they still get materialized and waste resources.
 
 
 ---
@@ -207,7 +194,7 @@ SELECT channel, item, return_ratio, return_rank, currency_rank FROM (SELECT 'web
 No usage data.
 
 ## Cost Attribution
-[main_query]: 99.8% cost, ~231261 rows, ops=[SEQ_SCAN[web_returns], SEQ_SCAN[web_sales], SEQ_SCAN[date_dim]]
+[main_query]: 99.4% cost, ~231261 rows, ops=[SEQ_SCAN[web_returns], SEQ_SCAN[web_sales], SEQ_SCAN[date_dim]]
 
 ## Detected Opportunities
 ## Knowledge Base Patterns (verified on TPC-DS)
@@ -239,11 +226,11 @@ Now output your rewrite_sets:
 ## Execution Plan
 ```
 Operators by cost:
-- SEQ_SCAN(store_sales): 66.0% cost, 231,261 rows
-- SEQ_SCAN(store_sales): 26.1% cost, 94,072 rows
-- SEQ_SCAN(store_sales): 4.2% cost, 4,813 rows
+- SEQ_SCAN(store_sales): 67.5% cost, 231,261 rows
+- SEQ_SCAN(store_sales): 23.8% cost, 94,072 rows
+- SEQ_SCAN(store_sales): 5.0% cost, 4,813 rows
 - SEQ_SCAN(store_sales): 1.3% cost, 187,852 rows
-- SEQ_SCAN(store_sales): 1.2% cost, 5,972 rows
+- SEQ_SCAN(store_sales): 0.9% cost, 5,972 rows
 
 Scans:
 - store_sales x1: 345,611,892 → 231,261 rows (filtered)
@@ -307,7 +294,8 @@ Joins:
 - baseline: 1.00x [none] NEUTRAL
 - kimi: 1.02x [none] NEUTRAL
 - v2_standard: 1.00x [date_cte_isolate] NEUTRAL
+- dsr1: 0.98x [prefetch_fact_join, materialize_cte] NEUTRAL
 
-**No effect**: date_cte_isolate
+**No effect**: date_cte_isolate, materialize_cte, prefetch_fact_join
 
-**IMPORTANT:** The following patterns were provided: prefetch_fact_join, union_cte_split, date_cte_isolate. Consider a DIFFERENT approach!
+**IMPORTANT:** The following patterns were provided: union_cte_split, deferred_window_aggregation. Consider a DIFFERENT approach!

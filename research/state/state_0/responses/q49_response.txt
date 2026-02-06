@@ -1,0 +1,56 @@
+Looking at this query, I can see multiple opportunities for optimization. The key insight is that we have three parallel channels (web, catalog, store) with identical patterns, each scanning date_dim with the same filter. The main cost is scanning large fact tables (store_sales, catalog_sales, web_sales). I'll use a combination of prefetch_fact_join and materialize_cte transforms.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "prefetch_fact_join",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy = 12",
+        "web_sales_prejoin": "SELECT ws.ws_order_number, ws.ws_item_sk, ws.ws_quantity, ws.ws_net_paid, ws.ws_net_profit FROM web_sales ws JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk WHERE ws.ws_net_profit > 1 AND ws.ws_net_paid > 0 AND ws.ws_quantity > 0",
+        "catalog_sales_prejoin": "SELECT cs.cs_order_number, cs.cs_item_sk, cs.cs_quantity, cs.cs_net_paid, cs.cs_net_profit FROM catalog_sales cs JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk WHERE cs.cs_net_profit > 1 AND cs.cs_net_paid > 0 AND cs.cs_quantity > 0",
+        "store_sales_prejoin": "SELECT ss.ss_ticket_number, ss.ss_item_sk, ss.ss_quantity, ss.ss_net_paid, ss.ss_net_profit FROM store_sales ss JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk WHERE ss.ss_net_profit > 1 AND ss.ss_net_paid > 0 AND ss.ss_quantity > 0",
+        "main_query": "SELECT channel, item, return_ratio, return_rank, currency_rank FROM (SELECT 'web' AS channel, web.item, web.return_ratio, web.return_rank, web.currency_rank FROM (SELECT item, return_ratio, currency_ratio, RANK() OVER (ORDER BY return_ratio) AS return_rank, RANK() OVER (ORDER BY currency_ratio) AS currency_rank FROM (SELECT ws.ws_item_sk AS item, (CAST(SUM(COALESCE(wr.wr_return_quantity, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(ws.ws_quantity, 0)) AS DECIMAL(15, 4))) AS return_ratio, (CAST(SUM(COALESCE(wr.wr_return_amt, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(ws.ws_net_paid, 0)) AS DECIMAL(15, 4))) AS currency_ratio FROM web_sales_prejoin AS ws LEFT OUTER JOIN web_returns AS wr ON (ws.ws_order_number = wr.wr_order_number AND ws.ws_item_sk = wr.wr_item_sk) WHERE wr.wr_return_amt > 10000 GROUP BY ws.ws_item_sk) AS in_web) AS web WHERE (web.return_rank <= 10 OR web.currency_rank <= 10) UNION SELECT 'catalog' AS channel, catalog.item, catalog.return_ratio, catalog.return_rank, catalog.currency_rank FROM (SELECT item, return_ratio, currency_ratio, RANK() OVER (ORDER BY return_ratio) AS return_rank, RANK() OVER (ORDER BY currency_ratio) AS currency_rank FROM (SELECT cs.cs_item_sk AS item, (CAST(SUM(COALESCE(cr.cr_return_quantity, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(cs.cs_quantity, 0)) AS DECIMAL(15, 4))) AS return_ratio, (CAST(SUM(COALESCE(cr.cr_return_amount, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(cs.cs_net_paid, 0)) AS DECIMAL(15, 4))) AS currency_ratio FROM catalog_sales_prejoin AS cs LEFT OUTER JOIN catalog_returns AS cr ON (cs.cs_order_number = cr.cr_order_number AND cs.cs_item_sk = cr.cr_item_sk) WHERE cr.cr_return_amount > 10000 GROUP BY cs.cs_item_sk) AS in_cat) AS catalog WHERE (catalog.return_rank <= 10 OR catalog.currency_rank <= 10) UNION SELECT 'store' AS channel, store.item, store.return_ratio, store.return_rank, store.currency_rank FROM (SELECT item, return_ratio, currency_ratio, RANK() OVER (ORDER BY return_ratio) AS return_rank, RANK() OVER (ORDER BY currency_ratio) AS currency_rank FROM (SELECT sts.ss_item_sk AS item, (CAST(SUM(COALESCE(sr.sr_return_quantity, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(sts.ss_quantity, 0)) AS DECIMAL(15, 4))) AS return_ratio, (CAST(SUM(COALESCE(sr.sr_return_amt, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(sts.ss_net_paid, 0)) AS DECIMAL(15, 4))) AS currency_ratio FROM store_sales_prejoin AS sts LEFT OUTER JOIN store_returns AS sr ON (sts.ss_ticket_number = sr.sr_ticket_number AND sts.ss_item_sk = sr.sr_item_sk) WHERE sr.sr_return_amt > 10000 GROUP BY sts.ss_item_sk) AS in_store) AS store WHERE (store.return_rank <= 10 OR store.currency_rank <= 10)) ORDER BY 1, 4, 5, 2 LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows", 
+        "same ordering",
+        "same column output",
+        "same aggregation semantics",
+        "same filter conditions"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "low"
+    },
+    {
+      "id": "rs_02",
+      "transform": "materialize_cte",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy = 12",
+        "web_returns_filtered": "SELECT wr_order_number, wr_item_sk, wr_return_quantity, wr_return_amt FROM web_returns WHERE wr_return_amt > 10000",
+        "catalog_returns_filtered": "SELECT cr_order_number, cr_item_sk, cr_return_quantity, cr_return_amount FROM catalog_returns WHERE cr_return_amount > 10000",
+        "store_returns_filtered": "SELECT sr_ticket_number, sr_item_sk, sr_return_quantity, sr_return_amt FROM store_returns WHERE sr_return_amt > 10000",
+        "main_query": "SELECT channel, item, return_ratio, return_rank, currency_rank FROM (SELECT 'web' AS channel, web.item, web.return_ratio, web.return_rank, web.currency_rank FROM (SELECT item, return_ratio, currency_ratio, RANK() OVER (ORDER BY return_ratio) AS return_rank, RANK() OVER (ORDER BY currency_ratio) AS currency_rank FROM (SELECT ws.ws_item_sk AS item, (CAST(SUM(COALESCE(wr.wr_return_quantity, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(ws.ws_quantity, 0)) AS DECIMAL(15, 4))) AS return_ratio, (CAST(SUM(COALESCE(wr.wr_return_amt, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(ws.ws_net_paid, 0)) AS DECIMAL(15, 4))) AS currency_ratio FROM (SELECT ws_order_number, ws_item_sk, ws_quantity, ws_net_paid FROM web_sales WHERE ws_sold_date_sk IN (SELECT d_date_sk FROM filtered_dates) AND ws_net_profit > 1 AND ws_net_paid > 0 AND ws_quantity > 0) AS ws LEFT OUTER JOIN web_returns_filtered AS wr ON (ws.ws_order_number = wr.wr_order_number AND ws.ws_item_sk = wr.wr_item_sk) GROUP BY ws.ws_item_sk) AS in_web) AS web WHERE (web.return_rank <= 10 OR web.currency_rank <= 10) UNION SELECT 'catalog' AS channel, catalog.item, catalog.return_ratio, catalog.return_rank, catalog.currency_rank FROM (SELECT item, return_ratio, currency_ratio, RANK() OVER (ORDER BY return_ratio) AS return_rank, RANK() OVER (ORDER BY currency_ratio) AS currency_rank FROM (SELECT cs.cs_item_sk AS item, (CAST(SUM(COALESCE(cr.cr_return_quantity, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(cs.cs_quantity, 0)) AS DECIMAL(15, 4))) AS return_ratio, (CAST(SUM(COALESCE(cr.cr_return_amount, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(cs.cs_net_paid, 0)) AS DECIMAL(15, 4))) AS currency_ratio FROM (SELECT cs_order_number, cs_item_sk, cs_quantity, cs_net_paid FROM catalog_sales WHERE cs_sold_date_sk IN (SELECT d_date_sk FROM filtered_dates) AND cs_net_profit > 1 AND cs_net_paid > 0 AND cs_quantity > 0) AS cs LEFT OUTER JOIN catalog_returns_filtered AS cr ON (cs.cs_order_number = cr.cr_order_number AND cs.cs_item_sk = cr.cr_item_sk) GROUP BY cs.cs_item_sk) AS in_cat) AS catalog WHERE (catalog.return_rank <= 10 OR catalog.currency_rank <= 10) UNION SELECT 'store' AS channel, store.item, store.return_ratio, store.return_rank, store.currency_rank FROM (SELECT item, return_ratio, currency_ratio, RANK() OVER (ORDER BY return_ratio) AS return_rank, RANK() OVER (ORDER BY currency_ratio) AS currency_rank FROM (SELECT sts.ss_item_sk AS item, (CAST(SUM(COALESCE(sr.sr_return_quantity, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(sts.ss_quantity, 0)) AS DECIMAL(15, 4))) AS return_ratio, (CAST(SUM(COALESCE(sr.sr_return_amt, 0)) AS DECIMAL(15, 4)) / CAST(SUM(COALESCE(sts.ss_net_paid, 0)) AS DECIMAL(15, 4))) AS currency_ratio FROM (SELECT ss_ticket_number, ss_item_sk, ss_quantity, ss_net_paid FROM store_sales WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_dates) AND ss_net_profit > 1 AND ss_net_paid > 0 AND ss_quantity > 0) AS sts LEFT OUTER JOIN store_returns_filtered AS sr ON (sts.ss_ticket_number = sr.sr_ticket_number AND sts.ss_item_sk = sr.sr_item_sk) GROUP BY sts.ss_item_sk) AS in_store) AS store WHERE (store.return_rank <= 10 OR store.currency_rank <= 10)) ORDER BY 1, 4, 5, 2 LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same aggregation semantics"
+      ],
+      "expected_speedup": "1.2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Applied two complementary transforms: 1) PREFETCH_FACT_JOIN to pre-join sales tables with filtered dates, creating smaller intermediate results before joining with returns tables. This reduces the data volume for expensive joins and aggregations. 2) MATERIALIZE_CTE to isolate filtered returns tables and date_dim filter into reusable CTEs, preventing repeated scans of large tables. The combination should significantly reduce the cost of scanning store_sales (66% of baseline cost) and other large fact tables."
+}
+```
+
+**Key insights:**
+1. The query has three identical patterns (web, catalog, store) each scanning date_dim with the same filter `d_year = 1999 AND d_moy = 12`. Isolating this into a CTE prevents triple scanning.
+2. Each channel joins a large sales table with a returns table. Pre-joining sales with filtered dates creates smaller intermediate results before the expensive LEFT OUTER JOIN with returns.
+3. Returns tables have filters (`> 10000`) that can be pushed down early via materialized CTEs.
+4. The OR conditions on ranks are preserved as-is (following OR_TO_UNION_LIMIT constraint - these are simple conditions on computed columns, not on base table columns with different access patterns).
+
+**Expected combined speedup:** ~3x (2.5x from prefetch_fact_join × 1.2x from materialize_cte).

@@ -41,54 +41,6 @@ GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
 
 ---
 
-## Example: Multi Dimension Prefetch (MULTI_DIMENSION_PREFETCH)
-Verified speedup: 2.71x
-
-### Input:
-[main_query]:
-SELECT s_store_name, s_store_id,
-  sum(CASE WHEN (d_day_name='Sunday') THEN ss_sales_price ELSE NULL END) sun_sales,
-  sum(CASE WHEN (d_day_name='Monday') THEN ss_sales_price ELSE NULL END) mon_sales,
-  sum(CASE WHEN (d_day_name='Tuesday') THEN ss_sales_price ELSE NULL END) tue_sales,
-  sum(CASE WHEN (d_day_name='Wednesday') THEN ss_sales_price ELSE NULL END) wed_sales,
-  sum(CASE WHEN (d_day_name='Thursday') THEN ss_sales_price ELSE NULL END) thu_sales,
-  sum(CASE WHEN (d_day_name='Friday') THEN ss_sales_price ELSE NULL END) fri_sales,
-  sum(CASE WHEN (d_day_name='Saturday') THEN ss_sales_price ELSE NULL END) sat_sales
-FROM date_dim, store_sales, store
-WHERE d_date_sk = ss_sold_date_sk AND s_store_sk = ss_store_sk
-  AND s_gmt_offset = -5 AND d_year = 2000
-GROUP BY s_store_name, s_store_id
-ORDER BY s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
-LIMIT 100
-
-### Output:
-```json
-{
-  "rewrite_sets": [
-    {
-      "id": "rs_01",
-      "transform": "multi_dimension_prefetch",
-      "nodes": {
-        "filtered_dates": "SELECT d_date_sk, d_day_name FROM date_dim WHERE d_year = 2000",
-        "filtered_stores": "SELECT s_store_sk, s_store_name, s_store_id FROM store WHERE s_gmt_offset = -5",
-        "main_query": "SELECT s_store_name, s_store_id, SUM(CASE WHEN (d_day_name = 'Sunday') THEN ss_sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN ss_sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN ss_sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN ss_sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN ss_sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN ss_sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN ss_sales_price ELSE NULL END) AS sat_sales FROM store_sales JOIN filtered_dates ON d_date_sk = ss_sold_date_sk JOIN filtered_stores ON s_store_sk = ss_store_sk GROUP BY s_store_name, s_store_id ORDER BY s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales LIMIT 100"
-      },
-      "invariants_kept": [
-        "same result rows",
-        "same ordering",
-        "same column output"
-      ],
-      "expected_speedup": "2.71x",
-      "risk": "low"
-    }
-  ]
-}
-```
-
-**Key insight:** Pre-filter BOTH date_dim AND store into separate CTEs. Include only the columns needed for the join and grouping. The optimizer can then use these smaller CTEs efficiently when joining with the fact table.
-
----
-
 ## Example: Early Dimension Filter (EARLY_FILTER)
 Verified speedup: 4.00x
 
@@ -131,15 +83,93 @@ GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
 
 ---
 
+## Example: Shared Dimension CTEs Across Multi-Channel Queries (SHARED_DIMENSION_MULTI_CHANNEL)
+Verified speedup: 1.30x
+
+### Input:
+[ssr] type=cte:
+SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, ...
+FROM store_sales LEFT OUTER JOIN store_returns ON (...), date_dim, store, item, promotion
+WHERE ss_sold_date_sk = d_date_sk
+  AND d_date BETWEEN '1998-08-28' AND '1998-08-28' + 30 days
+  AND ss_item_sk = i_item_sk AND i_current_price > 50
+  AND ss_promo_sk = p_promo_sk AND p_channel_tv = 'N'
+GROUP BY s_store_id
+
+[wsr] type=cte:
+SELECT web_site_id, SUM(ws_ext_sales_price) AS sales, ...
+FROM web_sales LEFT OUTER JOIN web_returns ON (...), date_dim, web_site, item, promotion
+WHERE ws_sold_date_sk = d_date_sk
+  AND d_date BETWEEN '1998-08-28' AND '1998-08-28' + 30 days
+  AND ws_item_sk = i_item_sk AND i_current_price > 50
+  AND ws_promo_sk = p_promo_sk AND p_channel_tv = 'N'
+GROUP BY web_site_id
+
+[csr] type=cte: (same pattern for catalog_sales)
+
+[main_query]: SELECT channel, id, SUM(sales), SUM(returns), SUM(profit)
+FROM (ssr UNION ALL csr UNION ALL wsr) GROUP BY ROLLUP(channel, id)
+
+### Output:
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "dimension_cte_isolate",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL '30' DAY)",
+        "filtered_items": "SELECT i_item_sk FROM item WHERE i_current_price > 50",
+        "filtered_promotions": "SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N'",
+        "prefiltered_store_sales": "SELECT ss_item_sk, ss_store_sk, ss_ticket_number, ss_ext_sales_price, ss_net_profit FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN filtered_items ON ss_item_sk = i_item_sk JOIN filtered_promotions ON ss_promo_sk = p_promo_sk",
+        "prefiltered_web_sales": "SELECT ws_item_sk, ws_web_site_sk, ws_order_number, ws_ext_sales_price, ws_net_profit FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk JOIN filtered_items ON ws_item_sk = i_item_sk JOIN filtered_promotions ON ws_promo_sk = p_promo_sk",
+        "ssr": "SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS returns, SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit FROM prefiltered_store_sales LEFT OUTER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) JOIN store ON ss_store_sk = s_store_sk GROUP BY s_store_id",
+        "wsr": "SELECT web_site_id, SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS returns, SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit FROM prefiltered_web_sales LEFT OUTER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number) JOIN web_site ON ws_web_site_sk = web_site_sk GROUP BY web_site_id"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output",
+        "same ROLLUP semantics"
+      ],
+      "expected_speedup": "1.30x",
+      "risk": "low"
+    }
+  ]
+}
+```
+
+**Key insight:** When multiple CTEs (store/catalog/web channels) apply identical dimension filters (same date range, same item price threshold, same promotion filter), extract those filters into shared dimension CTEs and pre-join them with each fact table. This eliminates redundant dimension scans. Note: only pre-join channels where the join is straightforward. If one channel (e.g., catalog) has a more complex join structure, leave it unchanged.
+
+---
+
 ## CONSTRAINTS (Learned from Benchmark Failures)
 
 The following constraints are MANDATORY based on observed failures:
 
+### CTE_COLUMN_COMPLETENESS [CRITICAL]
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
 ### LITERAL_PRESERVATION [CRITICAL]
 CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
 
+### NO_MATERIALIZE_EXISTS [CRITICAL]
+NEVER convert EXISTS or NOT EXISTS subqueries into materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)). EXISTS uses semi-join short-circuiting: it stops scanning after the first match. A materialized CTE forces a full table scan and GROUP BY of the entire table, which is catastrophically slower. Keep EXISTS as EXISTS.
+
+### MIN_BASELINE_THRESHOLD [HIGH]
+If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
+
+### NO_UNFILTERED_DIMENSION_CTE [HIGH]
+Every CTE you create MUST have a WHERE clause that actually reduces the number of rows. Do NOT create CTEs like 'filtered_stores AS (SELECT s_store_sk, s_store_id FROM store)' that select all rows from a dimension table. Selecting fewer columns is NOT filtering - the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query.
+
+### NO_UNION_SAME_COLUMN_OR [HIGH]
+Only apply or_to_union when the OR conditions span DIFFERENT tables or create fundamentally different access paths. Do NOT split OR conditions into UNION ALL when all branches filter the SAME column (e.g., 't_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17'). Splitting same-column ORs into UNION ALL doubles or triples the fact table scans. The database optimizer already handles same-column OR efficiently with a single scan.
+
 ### OR_TO_UNION_LIMIT [HIGH]
 CAUTION with OR→UNION: Only split OR conditions into UNION ALL when there are ≤3 simple branches AND they have different access patterns. If you have nested ORs (e.g., 3 conditions × 3 values = 9 combinations), DO NOT expand them - keep the original OR structure. DuckDB handles OR predicates efficiently. Over-splitting causes multiple scans of fact tables and severe regressions (0.23x-0.41x observed). When in doubt, preserve the original OR structure.
+
+### REMOVE_REPLACED_CTES [HIGH]
+When you create new CTEs that replace existing ones, you MUST remove the original CTEs from the WITH clause. Your rewrite_sets 'nodes' object should include the replacement node with the SAME node_id to overwrite it, or the original must not appear. Never leave dead/unused CTEs in the query - they still get materialized and waste resources.
 
 
 ---
@@ -224,10 +254,10 @@ Now output your rewrite_sets:
 ## Execution Plan
 ```
 Operators by cost:
-- SEQ_SCAN(store_sales): 96.6% cost, 13,337,215 rows
+- SEQ_SCAN(store_sales): 96.5% cost, 13,337,215 rows
 - HASH_JOIN: 0.9% cost, 205,735 rows
 - HASH_JOIN: 0.9% cost, 1,889,712 rows
-- SEQ_SCAN(store_sales): 0.5% cost, 499,974 rows
+- SEQ_SCAN(store_sales): 0.6% cost, 499,974 rows
 - HASH_JOIN: 0.5% cost, 1,740,928 rows
 
 Scans:
@@ -259,7 +289,8 @@ Joins:
 - baseline: 1.00x [none] NEUTRAL
 - kimi: 1.05x [none] IMPROVED
 - v2_standard: 1.00x [or_to_union] NEUTRAL
+- dsr1: 0.98x [multi_dimension_prefetch] NEUTRAL
 
-**No effect**: or_to_union
+**No effect**: multi_dimension_prefetch, or_to_union
 
-**IMPORTANT:** The following patterns were provided: dimension_cte_isolate, multi_dimension_prefetch, early_filter. Consider a DIFFERENT approach!
+**IMPORTANT:** The following patterns were provided: dimension_cte_isolate, early_filter, shared_dimension_multi_channel. Consider a DIFFERENT approach!

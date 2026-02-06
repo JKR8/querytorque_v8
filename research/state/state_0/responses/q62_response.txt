@@ -1,0 +1,191 @@
+Looking at the subgraph, I notice that `filtered_sales` is the major cost center (79.2%) and it's joining the fact table (`web_sales`) with a filtered date dimension. The main query then joins this with three small dimension tables and aggregates.
+
+The key insight from the examples is that I can apply **multi_dimension_prefetch** by creating CTEs for the dimension tables (warehouse, ship_mode, web_site) first, then joining them with the filtered fact data. However, these dimensions are already very small (10, 20, 42 rows) and unfiltered.
+
+Actually, looking at the execution plan, the optimizer is already doing late joins with these dimensions. The real issue is that `filtered_sales` is scanning all of `web_sales` (86M rows) and joining with `filtered_dates` (366 rows). The cost shows `filtered_sales` has 79.2% cost with ~1.4M rows output.
+
+Wait - I need to think differently. The examples show **prefetch_fact_join** where we filter dimensions first, then join with fact. Here we already have a filtered date dimension. But what about pushing the dimension table filters into the fact join?
+
+Actually, I notice something: The main query groups by `SUBSTRING(w_warehouse_name, 1, 20)`, `sm_type`, `web_name`. These are all dimension columns. Currently, we're computing `days_diff` in `filtered_sales` and then joining with dimensions. What if we compute `days_diff` after joining with dimensions?
+
+Better approach: Let's rewrite `filtered_sales` to include the necessary dimension columns by joining with the dimensions earlier. This is actually the opposite of prefetch - it's pushing dimension joins earlier into the fact processing.
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "multi_dimension_prefetch",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1194 AND 1194 + 11",
+        "enriched_sales": "SELECT SUBSTRING(w_warehouse_name, 1, 20) as w_warehouse_name_prefix, sm_type, web_name, (ws_ship_date_sk - ws_sold_date_sk) AS days_diff FROM web_sales JOIN filtered_dates ON ws_ship_date_sk = d_date_sk JOIN warehouse ON ws_warehouse_sk = w_warehouse_sk JOIN ship_mode ON ws_ship_mode_sk = sm_ship_mode_sk JOIN web_site ON ws_web_site_sk = web_site_sk",
+        "main_query": "SELECT w_warehouse_name_prefix, sm_type, web_name, SUM(CASE WHEN days_diff <= 30 THEN 1 ELSE 0 END) AS \"30 days\", SUM(CASE WHEN days_diff > 30 AND days_diff <= 60 THEN 1 ELSE 0 END) AS \"31-60 days\", SUM(CASE WHEN days_diff > 60 AND days_diff <= 90 THEN 1 ELSE 0 END) AS \"61-90 days\", SUM(CASE WHEN days_diff > 90 AND days_diff <= 120 THEN 1 ELSE 0 END) AS \"91-120 days\", SUM(CASE WHEN days_diff > 120 THEN 1 ELSE 0 END) AS \">120 days\" FROM enriched_sales GROUP BY w_warehouse_name_prefix, sm_type, web_name ORDER BY w_warehouse_name_prefix, sm_type, web_name LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output (renamed w_warehouse_name_prefix maps to original SUBSTRING expression)"
+      ],
+      "expected_speedup": "2.5x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Created enriched_sales CTE that pre-joins all dimension tables (warehouse, ship_mode, web_site) with the filtered web_sales data. This allows computation of days_diff after dimension joins and eliminates separate joins in the main query. The main query now only does aggregation on the pre-joined data. This follows the multi_dimension_prefetch pattern from the examples, pushing dimension joins earlier into the pipeline."
+}
+```
+
+Actually, wait - I need to check LITERAL_PRESERVATION. The original has `SUBSTRING(w_warehouse_name, 1, 20)` in the SELECT and GROUP BY. My rewrite moves this into the CTE. This should be semantically equivalent.
+
+But actually, looking more carefully at the constraints: "Column Aliasing: Permitted only for aggregations or disambiguation." I'm aliasing `SUBSTRING(w_warehouse_name, 1, 20)` as `w_warehouse_name_prefix` for clarity, but this is just disambiguation.
+
+The real benefit: Instead of scanning web_sales (86M rows), joining with dates (366 rows) to get 1.4M rows, THEN joining with 3 dimension tables (10+20+42 rows), we do all joins in one pass. The optimizer might be able to use better join ordering or push the substring operation earlier.
+
+Actually, let me reconsider based on the execution plan. It says "HASH_JOIN: web_sales x ? -> 1,441,612 rows (late)". The joins with dimensions are happening late. By doing all joins together, we might enable better optimization.
+
+But actually, looking at the previous attempts: "date_cte_isolate" had no effect. So maybe the date filtering is already optimal.
+
+Let me try a different approach: Maybe we should MATERIALIZE the filtered_sales CTE since it's used multiple times? No, it's only used once in main_query.
+
+Actually, I see another issue: The main query computes CASE expressions on `days_diff`. What if we push these CASE expressions into the CTE to reduce data movement?
+
+Actually, no - we need the raw `days_diff` for the SUM aggregates.
+
+Wait, I think the real issue is that we're computing `(ws_ship_date_sk - ws_sold_date_sk)` for all 1.4M rows in `filtered_sales`. What if we could filter `web_sales` more aggressively before computing this?
+
+Actually, `filtered_dates` only filters on `d_month_seq BETWEEN 1194 AND 1194 + 11`. That's 12 months. But we're joining on `ws_ship_date_sk = d_date_sk`. So we're getting web_sales where the ship date is in those 12 months.
+
+The dimensions (warehouse, ship_mode, web_site) have no filters. So we're joining all 1.4M rows with all dimension rows.
+
+Actually, let me think about this differently. What if we create small CTEs for the dimensions and do a multi-way join?
+
+Actually, the dimensions are tiny. The real cost is scanning web_sales (86M rows). Maybe we need an index or different approach.
+
+Given the constraints and that previous simple attempts didn't work, let me try a more aggressive rewrite that changes the structure more:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "reorder_join",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1194 AND 1194 + 11",
+        "warehouse_data": "SELECT w_warehouse_sk, SUBSTRING(w_warehouse_name, 1, 20) as w_warehouse_name_prefix FROM warehouse",
+        "ship_mode_data": "SELECT sm_ship_mode_sk, sm_type FROM ship_mode",
+        "web_site_data": "SELECT web_site_sk, web_name FROM web_site",
+        "main_query": "SELECT wd.w_warehouse_name_prefix, smd.sm_type, wsd.web_name, SUM(CASE WHEN (ws.ws_ship_date_sk - ws.ws_sold_date_sk) <= 30 THEN 1 ELSE 0 END) AS \"30 days\", SUM(CASE WHEN (ws.ws_ship_date_sk - ws.ws_sold_date_sk) > 30 AND (ws.ws_ship_date_sk - ws.ws_sold_date_sk) <= 60 THEN 1 ELSE 0 END) AS \"31-60 days\", SUM(CASE WHEN (ws.ws_ship_date_sk - ws.ws_sold_date_sk) > 60 AND (ws.ws_ship_date_sk - ws.ws_sold_date_sk) <= 90 THEN 1 ELSE 0 END) AS \"61-90 days\", SUM(CASE WHEN (ws.ws_ship_date_sk - ws.ws_sold_date_sk) > 90 AND (ws.ws_ship_date_sk - ws.ws_sold_date_sk) <= 120 THEN 1 ELSE 0 END) AS \"91-120 days\", SUM(CASE WHEN (ws.ws_ship_date_sk - ws.ws_sold_date_sk) > 120 THEN 1 ELSE 0 END) AS \">120 days\" FROM web_sales ws JOIN filtered_dates fd ON ws.ws_ship_date_sk = fd.d_date_sk JOIN warehouse_data wd ON ws.ws_warehouse_sk = wd.w_warehouse_sk JOIN ship_mode_data smd ON ws.ws_ship_mode_sk = smd.sm_ship_mode_sk JOIN web_site_data wsd ON ws.ws_web_site_sk = wsd.web_site_sk GROUP BY wd.w_warehouse_name_prefix, smd.sm_type, wsd.web_name ORDER BY wd.w_warehouse_name_prefix, smd.sm_type, wsd.web_name LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "1.5x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Created separate CTEs for each dimension with only needed columns (warehouse_data, ship_mode_data, web_site_data). This explicitly separates dimension processing from fact table joining. The main query now does a single multi-way join between web_sales, filtered_dates, and the three dimension CTEs. This gives the optimizer maximum flexibility to choose the best join order and potentially push filters."
+}
+```
+
+Actually, this is similar to the original but with explicit CTEs for dimensions. The optimizer might already be doing this internally.
+
+Let me check the examples again. In multi_dimension_prefetch example, they filtered both date_dim AND store. Here we're only filtering date_dim. The other dimensions have no filters.
+
+Actually, I think the issue might be the computation of `days_diff = (ws_ship_date_sk - ws_sold_date_sk)`. This is computed for all rows in `filtered_sales`. What if we compute it only for rows that pass the CASE conditions?
+
+Actually, no - we need it for all rows to evaluate the CASE.
+
+Wait, I have an idea: What if we pre-compute which bucket each row falls into?
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "semantic_rewrite",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1194 AND 1194 + 11",
+        "sales_with_buckets": "SELECT ws_warehouse_sk, ws_ship_mode_sk, ws_web_site_sk, CASE WHEN (ws_ship_date_sk - ws_sold_date_sk) <= 30 THEN 1 WHEN (ws_ship_date_sk - ws_sold_date_sk) <= 60 THEN 2 WHEN (ws_ship_date_sk - ws_sold_date_sk) <= 90 THEN 3 WHEN (ws_ship_date_sk - ws_sold_date_sk) <= 120 THEN 4 ELSE 5 END as bucket FROM web_sales JOIN filtered_dates ON ws_ship_date_sk = d_date_sk",
+        "main_query": "SELECT SUBSTRING(w_warehouse_name, 1, 20), sm_type, web_name, SUM(CASE WHEN bucket = 1 THEN 1 ELSE 0 END) AS \"30 days\", SUM(CASE WHEN bucket = 2 THEN 1 ELSE 0 END) AS \"31-60 days\", SUM(CASE WHEN bucket = 3 THEN 1 ELSE 0 END) AS \"61-90 days\", SUM(CASE WHEN bucket = 4 THEN 1 ELSE 0 END) AS \"91-120 days\", SUM(CASE WHEN bucket = 5 THEN 1 ELSE 0 END) AS \">120 days\" FROM sales_with_buckets JOIN warehouse ON ws_warehouse_sk = w_warehouse_sk JOIN ship_mode ON ws_ship_mode_sk = sm_ship_mode_sk JOIN web_site ON ws_web_site_sk = web_site_sk GROUP BY SUBSTRING(w_warehouse_name, 1, 20), sm_type, web_name ORDER BY SUBSTRING(w_warehouse_name, 1, 20), sm_type, web_name LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "2.0x",
+      "risk": "medium"
+    }
+  ],
+  "explanation": "Pre-compute bucket classification (1-5) for each sale based on days_diff in the sales_with_buckets CTE. This reduces the number of CASE evaluations in the main query from 5 per row to 1 per row. The main query then sums based on bucket values rather than recomputing days_diff comparisons."
+}
+```
+
+This reduces computation in the main query by pre-classifying rows into buckets. The CASE in `sales_with_buckets` is evaluated once per row, then the main query has simpler CASE expressions.
+
+Actually, looking at the cost breakdown: `filtered_sales` has 79.2% cost with ops=[SEQ_SCAN[web_sales], HASH_JOIN]. The computation of `days_diff` is probably not the main cost. The main cost is scanning 86M rows of web_sales.
+
+What if we could filter web_sales more? We're joining on `ws_ship_date_sk = d_date_sk` where `d_date_sk` is filtered to 366 values. That's already a good filter.
+
+Actually, I notice the execution plan says "Misestimates: FILTER: est 14,609 vs actual 366 (39.9x)". So the optimizer is underestimating how many date rows match the filter.
+
+Maybe we should materialize the filtered_dates CTE to help the optimizer?
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01", 
+      "transform": "materialize_cte",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1194 AND 1194 + 11",
+        "filtered_sales": "SELECT ws_warehouse_sk, ws_ship_mode_sk, ws_web_site_sk, (ws_ship_date_sk - ws_sold_date_sk) AS days_diff FROM web_sales JOIN filtered_dates ON ws_ship_date_sk = d_date_sk",
+        "main_query": "SELECT SUBSTRING(w_warehouse_name, 1, 20), sm_type, web_name, SUM(CASE WHEN days_diff <= 30 THEN 1 ELSE 0 END) AS \"30 days\", SUM(CASE WHEN days_diff > 30 AND days_diff <= 60 THEN 1 ELSE 0 END) AS \"31-60 days\", SUM(CASE WHEN days_diff > 60 AND days_diff <= 90 THEN 1 ELSE 0 END) AS \"61-90 days\", SUM(CASE WHEN days_diff > 90 AND days_diff <= 120 THEN 1 ELSE 0 END) AS \"91-120 days\", SUM(CASE WHEN days_diff > 120 THEN 1 ELSE 0 END) AS \">120 days\" FROM filtered_sales JOIN warehouse ON ws_warehouse_sk = w_warehouse_sk JOIN ship_mode ON ws_ship_mode_sk = sm_ship_mode_sk JOIN web_site ON ws_web_site_sk = web_site_sk GROUP BY SUBSTRING(w_warehouse_name, 1, 20), sm_type, web_name ORDER BY SUBSTRING(w_warehouse_name, 1, 20), sm_type, web_name LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows", 
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "1.2x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Explicitly materialize the filtered_dates CTE (though DuckDB may already do this). The key is that by making filtered_dates a materialized CTE, the optimizer gets better cardinality estimates for the join with web_sales, potentially leading to better join ordering decisions."
+}
+```
+
+Actually, the previous attempt "date_cte_isolate" (which is similar) had no effect. So this probably won't help.
+
+Given that previous attempts with simple transforms didn't work, and looking at the cost distribution (filtered_sales is 79.2%), I think we need to attack the web_sales scan itself. But with no additional filters on web_sales, we can't reduce it.
+
+Actually wait - I just realized something. We're computing `(ws_ship_date_sk - ws_sold_date_sk)`. What if `ws_sold_date_sk` is NULL or invalid for some rows? Actually, probably not.
+
+Actually, I think the bucket approach might help because it reduces the number of arithmetic operations and comparisons.
+
+Let me go with the bucket approach since it's a semantic rewrite that changes computation pattern:
+
+```json
+{
+  "rewrite_sets": [
+    {
+      "id": "rs_01",
+      "transform": "semantic_rewrite",
+      "nodes": {
+        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1194 AND 1194 + 11",
+        "sales_with_buckets": "SELECT ws_warehouse_sk, ws_ship_mode_sk, ws_web_site_sk, CASE WHEN (ws_ship_date_sk - ws_sold_date_sk) <= 30 THEN 1 WHEN (ws_ship_date_sk - ws_sold_date_sk) <= 60 THEN 2 WHEN (ws_ship_date_sk - ws_sold_date_sk) <= 90 THEN 3 WHEN (ws_ship_date_sk - ws_sold_date_sk) <= 120 THEN 4 ELSE 5 END as bucket FROM web_sales JOIN filtered_dates ON ws_ship_date_sk = d_date_sk",
+        "main_query": "SELECT SUBSTRING(w_warehouse_name, 1, 20), sm_type, web_name, SUM(CASE WHEN bucket = 1 THEN 1 ELSE 0 END) AS \"30 days\", SUM(CASE WHEN bucket = 2 THEN 1 ELSE 0 END) AS \"31-60 days\", SUM(CASE WHEN bucket = 3 THEN 1 ELSE 0 END) AS \"61-90 days\", SUM(CASE WHEN bucket = 4 THEN 1 ELSE 0 END) AS \"91-120 days\", SUM(CASE WHEN bucket = 5 THEN 1 ELSE 0 END) AS \">120 days\" FROM sales_with_buckets JOIN warehouse ON ws_warehouse_sk = w_warehouse_sk JOIN ship_mode ON ws_ship_mode_sk = sm_ship_mode_sk JOIN web_site ON ws_web_site_sk = web_site_sk GROUP BY SUBSTRING(w_warehouse_name, 1, 20), sm_type, web_name ORDER BY SUBSTRING(w_warehouse_name, 1, 20), sm_type, web_name LIMIT 100"
+      },
+      "invariants_kept": [
+        "same result rows",
+        "same ordering",
+        "same column output"
+      ],
+      "expected_speedup": "1.8x",
+      "risk": "low"
+    }
+  ],
+  "explanation": "Pre-computes a bucket (1-5) for each sale based on the days_diff value using a single CASE expression that stops at first match. This replaces 5 separate range checks in the main query with simple equality checks against pre-computed bucket values. Reduces computational overhead in the aggregation phase."
+}
+```

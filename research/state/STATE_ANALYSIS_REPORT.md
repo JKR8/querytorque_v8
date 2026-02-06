@@ -10,113 +10,123 @@
 
 ## Progress Summary
 
+### DSR1 (DeepSeek Reasoner, state_0)
+- **WIN**: 30 (≥1.1x)
+- **IMPROVED**: 8 (1.05-1.1x)
+- **NEUTRAL**: 21 (0.95-1.05x)
+- **REGRESSION**: 26 (<0.95x)
+- **ERROR**: 14 (parse/execution failures)
+- **Avg speedup**: 1.06x
+- Top: Q88 3.32x, Q35 2.42x, Q59 1.68x, Q41 1.63x, Q65 1.60x
+
+### Prior Best (Kimi + V2 + 3W Retry)
 - WIN: 13
 - IMPROVED: 16
 - NEUTRAL: 70
-- REGRESSION: 0
-- ERROR: 0
-- GOLD_EXAMPLE: 0
 
 ## Complete Query Leaderboard (All 99 Queries by Runtime)
 
-| Rank | Query | Runtime | Speedup | Status | Savings @2x |
-|------|-------|---------|---------|--------|-------------|
-| 1 | Q23 | 24404ms | 1.06x | NEUTRAL | 12202ms ⭐ TOP 20 |
-| 2 | Q4 | 10209ms | 1.03x | NEUTRAL | 5104ms ⭐ TOP 20 |
-| 3 | Q14 | 9211ms | 0.95x | NEUTRAL | 4605ms ⭐ TOP 20 |
-| 4 | Q78 | 9002ms | 1.01x | NEUTRAL | 4501ms ⭐ TOP 20 |
-| 5 | Q51 | 7935ms | 1.00x | NEUTRAL | 3968ms ⭐ TOP 20 |
-| 6 | Q22 | 7655ms | 1.69x | WIN | 3827ms ⭐ TOP 20 |
-| 7 | Q11 | 6017ms | 0.98x | NEUTRAL | 3009ms ⭐ TOP 20 |
-| 8 | Q95 | 5151ms | 1.37x | IMPROVED | 2576ms ⭐ TOP 20 |
-| 9 | Q74 | 4130ms | 1.36x | IMPROVED | 2065ms ⭐ TOP 20 |
-| 10 | Q64 | 3841ms | 1.01x | NEUTRAL | 1921ms ⭐ TOP 20 |
-| 11 | Q28 | 3731ms | 1.33x | IMPROVED | 1865ms ⭐ TOP 20 |
-| 12 | Q65 | 3548ms | 1.00x | NEUTRAL | 1774ms ⭐ TOP 20 |
-| 13 | Q59 | 2873ms | 1.00x | NEUTRAL | 1437ms ⭐ TOP 20 |
-| 14 | Q93 | 2861ms | 2.73x | WIN | 1430ms ⭐ TOP 20 |
-| 15 | Q75 | 2845ms | 1.00x | NEUTRAL | 1422ms ⭐ TOP 20 |
-| 16 | Q47 | 2706ms | 1.00x | NEUTRAL | 1353ms ⭐ TOP 20 |
-| 17 | Q97 | 2643ms | 1.00x | NEUTRAL | 1321ms ⭐ TOP 20 |
-| 18 | Q9 | 2206ms | 4.47x | WIN | 1103ms ⭐ TOP 20 |
-| 19 | Q88 | 2070ms | 1.00x | NEUTRAL | 1035ms ⭐ TOP 20 |
-| 20 | Q87 | 1822ms | 1.00x | NEUTRAL | 911ms ⭐ TOP 20 |
-| 21 | Q38 | 1599ms | 1.44x | IMPROVED | 799ms  |
-| 22 | Q80 | 1553ms | 1.03x | NEUTRAL | 777ms  |
-| 23 | Q72 | 1467ms | 1.00x | NEUTRAL | 734ms  |
-| 24 | Q57 | 1317ms | 1.02x | NEUTRAL | 658ms  |
-| 25 | Q70 | 1300ms | 1.00x | NEUTRAL | 650ms  |
-| 26 | Q5 | 1169ms | 1.89x | WIN | 585ms  |
-| 27 | Q35 | 1148ms | 1.00x | NEUTRAL | 574ms  |
-| 28 | Q50 | 1008ms | 1.00x | NEUTRAL | 504ms  |
-| 29 | Q13 | 981ms | 1.01x | NEUTRAL | 490ms  |
-| 30 | Q79 | 940ms | 1.05x | NEUTRAL | 470ms  |
-| 31 | Q2 | 937ms | 1.00x | NEUTRAL | 469ms  |
-| 32 | Q48 | 934ms | 1.00x | NEUTRAL | 467ms  |
-| 33 | Q36 | 897ms | 1.00x | NEUTRAL | 448ms  |
-| 34 | Q68 | 890ms | 1.00x | NEUTRAL | 445ms  |
-| 35 | Q17 | 864ms | 1.19x | IMPROVED | 432ms  |
-| 36 | Q46 | 860ms | 1.02x | NEUTRAL | 430ms  |
-| 37 | Q24 | 780ms | 1.00x | NEUTRAL | 390ms  |
-| 38 | Q8 | 704ms | 1.03x | NEUTRAL | 352ms  |
-| 39 | Q27 | 703ms | 1.01x | NEUTRAL | 351ms  |
-| 40 | Q29 | 692ms | 2.35x | WIN | 346ms  |
-| 41 | Q31 | 661ms | 1.04x | NEUTRAL | 331ms  |
-| 42 | Q7 | 660ms | 1.00x | NEUTRAL | 330ms  |
-| 43 | Q43 | 619ms | 2.71x | WIN | 309ms  |
-| 44 | Q71 | 579ms | 1.00x | NEUTRAL | 290ms  |
-| 45 | Q34 | 540ms | 1.00x | NEUTRAL | 270ms  |
-| 46 | Q49 | 534ms | 1.02x | NEUTRAL | 267ms  |
-| 47 | Q89 | 521ms | 1.00x | NEUTRAL | 261ms  |
-| 48 | Q25 | 515ms | 1.00x | NEUTRAL | 258ms  |
-| 49 | Q76 | 513ms | 1.10x | IMPROVED | 257ms  |
-| 50 | Q99 | 464ms | 1.00x | NEUTRAL | 232ms  |
-| 51 | Q85 | 460ms | 1.00x | NEUTRAL | 230ms  |
-| 52 | Q39 | 452ms | 1.00x | NEUTRAL | 226ms  |
-| 53 | Q73 | 450ms | 1.57x | WIN | 225ms  |
-| 54 | Q66 | 445ms | 1.23x | IMPROVED | 222ms  |
-| 55 | Q69 | 441ms | 1.03x | NEUTRAL | 221ms  |
-| 56 | Q18 | 424ms | 1.14x | IMPROVED | 212ms  |
-| 57 | Q77 | 421ms | 1.01x | NEUTRAL | 210ms  |
-| 58 | Q6 | 419ms | 1.33x | IMPROVED | 209ms  |
-| 59 | Q62 | 414ms | 1.23x | IMPROVED | 207ms  |
-| 60 | Q19 | 389ms | 1.04x | NEUTRAL | 195ms  |
-| 61 | Q54 | 389ms | 1.03x | NEUTRAL | 195ms  |
-| 62 | Q63 | 387ms | 3.77x | WIN | 194ms  |
-| 63 | Q98 | 385ms | 1.00x | NEUTRAL | 192ms  |
-| 64 | Q60 | 378ms | 1.02x | NEUTRAL | 189ms  |
-| 65 | Q53 | 356ms | 1.00x | NEUTRAL | 178ms  |
-| 66 | Q81 | 355ms | 1.00x | NEUTRAL | 178ms  |
-| 67 | Q56 | 349ms | 1.00x | NEUTRAL | 175ms  |
-| 68 | Q33 | 339ms | 1.05x | NEUTRAL | 169ms  |
-| 69 | Q3 | 296ms | 0.98x | NEUTRAL | 148ms  |
-| 70 | Q10 | 290ms | 1.02x | NEUTRAL | 145ms  |
-| 71 | Q58 | 269ms | 1.06x | NEUTRAL | 135ms  |
-| 72 | Q82 | 265ms | 1.18x | IMPROVED | 132ms  |
-| 73 | Q96 | 253ms | 1.64x | WIN | 127ms  |
-| 74 | Q40 | 252ms | 1.07x | NEUTRAL | 126ms  |
-| 75 | Q1 | 239ms | 2.92x | WIN | 120ms  |
-| 76 | Q52 | 239ms | 1.08x | NEUTRAL | 119ms  |
-| 77 | Q86 | 236ms | 1.00x | NEUTRAL | 118ms  |
-| 78 | Q55 | 228ms | 1.00x | NEUTRAL | 114ms  |
-| 79 | Q42 | 218ms | 1.00x | NEUTRAL | 109ms  |
-| 80 | Q45 | 192ms | 1.08x | NEUTRAL | 96ms  |
-| 81 | Q26 | 167ms | 1.93x | WIN | 83ms  |
-| 82 | Q15 | 150ms | 2.78x | WIN | 75ms  |
-| 83 | Q94 | 141ms | 1.00x | NEUTRAL | 71ms  |
-| 84 | Q37 | 124ms | 1.30x | IMPROVED | 62ms  |
-| 85 | Q12 | 110ms | 1.23x | IMPROVED | 55ms  |
-| 86 | Q90 | 109ms | 1.57x | WIN | 55ms  |
-| 87 | Q92 | 96ms | 1.00x | NEUTRAL | 48ms  |
-| 88 | Q84 | 80ms | 1.22x | IMPROVED | 40ms  |
-| 89 | Q83 | 76ms | 1.24x | IMPROVED | 38ms  |
-| 90 | Q20 | 72ms | 1.07x | NEUTRAL | 36ms  |
-| 91 | Q21 | 71ms | 1.00x | NEUTRAL | 36ms  |
-| 92 | Q91 | 43ms | 1.00x | NEUTRAL | 22ms  |
-| 93 | Q16 | 40ms | 1.00x | NEUTRAL | 20ms  |
-| 94 | Q41 | 20ms | 1.14x | IMPROVED | 10ms  |
-| 95 | Q61 | 19ms | 1.00x | NEUTRAL | 10ms  |
-| 96 | Q32 | 17ms | 1.00x | NEUTRAL | 9ms  |
+| Rank | Query | Runtime | Best | Prior | DSR1 | Status | Savings @2x |
+|------|-------|---------|------|-------|------|--------|-------------|
+| 1 | Q9 | 2206ms | 4.47x | 4.47x | 1.28x | WIN | 1103ms ⭐ TOP 20 |
+| 2 | Q81 | 355ms | 4.38x | 4.38x | 1.20x | WIN | 177ms |
+| 3 | Q63 | 387ms | 3.77x | 3.77x | 1.00x | WIN | 193ms |
+| 4 | Q88 | 2069ms | 3.32x | 1.00x | 3.32x | WIN | 1034ms ⭐ TOP 20 |
+| 5 | Q1 | 239ms | 2.92x | 2.92x | 0.71x | WIN | 119ms |
+| 6 | Q15 | 150ms | 2.78x | 2.78x | 1.09x | WIN | 75ms |
+| 7 | Q93 | 2860ms | 2.73x | 2.73x | 0.34x | WIN | 1430ms ⭐ TOP 20 |
+| 8 | Q43 | 618ms | 2.71x | 2.71x | 1.10x | WIN | 309ms |
+| 9 | Q35 | 1147ms | 2.42x | 1.51x | 2.42x | WIN | 573ms |
+| 10 | Q29 | 692ms | 2.35x | 2.35x | 1.00x | WIN | 346ms |
+| 11 | Q2 | 937ms | 2.10x | 2.10x | - | WIN | 468ms |
+| 12 | Q26 | 166ms | 1.93x | 1.93x | 1.01x | WIN | 83ms |
+| 13 | Q5 | 1169ms | 1.89x | 1.89x | 0.96x | WIN | 584ms |
+| 14 | Q59 | 2873ms | 1.86x | 1.86x | 1.68x | WIN | 1436ms ⭐ TOP 20 |
+| 15 | Q65 | 3547ms | 1.83x | 1.83x | 1.60x | WIN | 1773ms ⭐ TOP 20 |
+| 16 | Q22 | 7654ms | 1.69x | 1.69x | 1.10x | WIN | 3827ms ⭐ TOP 20 |
+| 17 | Q96 | 253ms | 1.64x | 1.64x | 0.98x | WIN | 126ms |
+| 18 | Q41 | 19ms | 1.63x | 1.14x | 1.63x | WIN | 9ms |
+| 19 | Q27 | 702ms | 1.58x | 1.01x | 1.58x | WIN | 351ms |
+| 20 | Q73 | 450ms | 1.57x | 1.57x | 0.87x | WIN | 225ms |
+| 21 | Q90 | 109ms | 1.57x | 1.57x | 0.59x | WIN | 54ms |
+| 22 | Q51 | 7935ms | 1.51x | 1.51x | 0.87x | WIN | 3967ms ⭐ TOP 20 |
+| 23 | Q61 | 19ms | 1.46x | 1.00x | 1.46x | WIN | 9ms |
+| 24 | Q38 | 1598ms | 1.44x | 1.44x | 1.00x | WIN | 799ms |
+| 25 | Q14 | 9210ms | 1.40x | 1.00x | 1.40x | WIN | 4605ms ⭐ TOP 20 |
+| 26 | Q95 | 5151ms | 1.37x | 1.37x | 0.54x | WIN | 2575ms ⭐ TOP 20 |
+| 27 | Q44 | 0ms | 1.37x | 1.00x | 1.37x | WIN | 0ms |
+| 28 | Q74 | 4129ms | 1.36x | 1.36x | 0.68x | WIN | 2064ms ⭐ TOP 20 |
+| 29 | Q6 | 418ms | 1.33x | 1.33x | 0.85x | WIN | 209ms |
+| 30 | Q28 | 3730ms | 1.33x | 1.33x | 0.92x | WIN | 1865ms ⭐ TOP 20 |
+| 31 | Q37 | 124ms | 1.30x | 1.30x | 1.10x | WIN | 62ms |
+| 32 | Q80 | 1553ms | 1.30x | 1.03x | 1.30x | WIN | 776ms |
+| 33 | Q12 | 110ms | 1.27x | 1.23x | 1.27x | WIN | 55ms |
+| 34 | Q83 | 75ms | 1.24x | 1.24x | 1.16x | WIN | 37ms |
+| 35 | Q46 | 859ms | 1.23x | 1.02x | 1.23x | WIN | 429ms |
+| 36 | Q62 | 413ms | 1.23x | 1.23x | 1.00x | WIN | 206ms |
+| 37 | Q66 | 444ms | 1.23x | 1.23x | 1.21x | WIN | 222ms |
+| 38 | Q84 | 80ms | 1.22x | 1.22x | 1.10x | WIN | 40ms |
+| 39 | Q57 | 1316ms | 1.20x | 1.02x | 1.20x | WIN | 658ms |
+| 40 | Q45 | 192ms | 1.19x | 1.08x | 1.19x | WIN | 96ms |
+| 41 | Q17 | 864ms | 1.19x | 1.19x | 0.90x | WIN | 432ms |
+| 42 | Q82 | 264ms | 1.18x | 1.18x | - | WIN | 132ms |
+| 43 | Q8 | 704ms | 1.16x | 1.03x | 1.16x | WIN | 352ms |
+| 44 | Q56 | 349ms | 1.16x | 1.00x | 1.16x | WIN | 174ms |
+| 45 | Q70 | 1299ms | 1.15x | 1.00x | 1.15x | WIN | 649ms |
+| 46 | Q40 | 251ms | 1.15x | 1.07x | 1.15x | WIN | 125ms |
+| 47 | Q30 | 0ms | 1.15x | 1.00x | 1.15x | WIN | 0ms |
+| 48 | Q18 | 424ms | 1.14x | 1.14x | - | WIN | 212ms |
+| 49 | Q69 | 441ms | 1.13x | 1.03x | 1.13x | WIN | 220ms |
+| 50 | Q53 | 355ms | 1.12x | 1.00x | 1.12x | WIN | 177ms |
+| 51 | Q4 | 10208ms | 1.12x | 1.03x | 1.12x | WIN | 5104ms ⭐ TOP 20 |
+| 52 | Q99 | 464ms | 1.11x | 1.00x | 1.11x | WIN | 232ms |
+| 53 | Q50 | 1007ms | 1.11x | 1.00x | 1.11x | WIN | 503ms |
+| 54 | Q76 | 513ms | 1.10x | 1.10x | - | WIN | 256ms |
+| 55 | Q33 | 338ms | 1.08x | 1.05x | 1.08x | IMPROVED | 169ms |
+| 56 | Q78 | 9002ms | 1.08x | 1.01x | 1.08x | IMPROVED | 4501ms ⭐ TOP 20 |
+| 57 | Q52 | 238ms | 1.08x | 1.08x | - | IMPROVED | 119ms |
+| 58 | Q34 | 539ms | 1.08x | 1.00x | 1.08x | IMPROVED | 269ms |
+| 59 | Q20 | 71ms | 1.07x | 1.07x | 1.01x | IMPROVED | 35ms |
+| 60 | Q11 | 6017ms | 1.06x | 1.00x | 1.06x | IMPROVED | 3008ms ⭐ TOP 20 |
+| 61 | Q23 | 24403ms | 1.06x | 1.06x | 1.02x | IMPROVED | 12201ms ⭐ TOP 20 |
+| 62 | Q58 | 269ms | 1.06x | 1.06x | 0.78x | IMPROVED | 134ms |
+| 63 | Q7 | 659ms | 1.05x | 1.00x | 1.05x | IMPROVED | 329ms |
+| 64 | Q79 | 939ms | 1.05x | 1.05x | 0.98x | IMPROVED | 469ms |
+| 65 | Q39 | 452ms | 1.05x | 1.00x | 1.05x | NEUTRAL | 226ms |
+| 66 | Q3 | 296ms | 1.04x | 1.00x | 1.04x | NEUTRAL | 148ms |
+| 67 | Q19 | 389ms | 1.04x | 1.04x | 0.99x | NEUTRAL | 194ms |
+| 68 | Q31 | 661ms | 1.04x | 1.04x | 0.49x | NEUTRAL | 330ms |
+| 69 | Q54 | 389ms | 1.03x | 1.03x | - | NEUTRAL | 194ms |
+| 70 | Q91 | 43ms | 1.03x | 1.00x | 1.03x | NEUTRAL | 21ms |
+| 71 | Q55 | 227ms | 1.03x | 1.00x | 1.03x | NEUTRAL | 113ms |
+| 72 | Q10 | 290ms | 1.02x | 1.02x | 0.95x | NEUTRAL | 145ms |
+| 73 | Q49 | 534ms | 1.02x | 1.02x | 0.98x | NEUTRAL | 267ms |
+| 74 | Q60 | 378ms | 1.02x | 1.02x | - | NEUTRAL | 189ms |
+| 75 | Q68 | 889ms | 1.02x | 1.00x | 1.02x | NEUTRAL | 444ms |
+| 76 | Q13 | 980ms | 1.01x | 1.01x | - | NEUTRAL | 490ms |
+| 77 | Q64 | 3841ms | 1.01x | 1.01x | - | NEUTRAL | 1920ms ⭐ TOP 20 |
+| 78 | Q77 | 420ms | 1.01x | 1.01x | 0.99x | NEUTRAL | 210ms |
+| 79 | Q16 | 40ms | 1.00x | 1.00x | 0.14x | NEUTRAL | 20ms |
+| 80 | Q21 | 71ms | 1.00x | 1.00x | - | NEUTRAL | 35ms |
+| 81 | Q24 | 780ms | 1.00x | 1.00x | - | NEUTRAL | 390ms |
+| 82 | Q25 | 515ms | 1.00x | 1.00x | 0.50x | NEUTRAL | 257ms |
+| 83 | Q32 | 17ms | 1.00x | 1.00x | 0.82x | NEUTRAL | 8ms |
+| 84 | Q36 | 896ms | 1.00x | 1.00x | 0.91x | NEUTRAL | 448ms |
+| 85 | Q42 | 217ms | 1.00x | 1.00x | 1.00x | NEUTRAL | 108ms |
+| 86 | Q47 | 2705ms | 1.00x | 1.00x | 0.91x | NEUTRAL | 1352ms ⭐ TOP 20 |
+| 87 | Q48 | 933ms | 1.00x | 1.00x | 0.90x | NEUTRAL | 466ms |
+| 88 | Q67 | 0ms | 1.00x | 1.00x | 0.85x | NEUTRAL | 0ms |
+| 89 | Q71 | 579ms | 1.00x | 1.00x | 0.89x | NEUTRAL | 289ms |
+| 90 | Q72 | 1467ms | 1.00x | 1.00x | 0.77x | NEUTRAL | 733ms |
+| 91 | Q75 | 2844ms | 1.00x | 1.00x | 0.97x | NEUTRAL | 1422ms ⭐ TOP 20 |
+| 92 | Q85 | 459ms | 1.00x | 1.00x | 0.95x | NEUTRAL | 229ms |
+| 93 | Q86 | 235ms | 1.00x | 1.00x | 0.98x | NEUTRAL | 117ms |
+| 94 | Q87 | 1821ms | 1.00x | 1.00x | 0.97x | NEUTRAL | 910ms ⭐ TOP 20 |
+| 95 | Q89 | 521ms | 1.00x | 1.00x | 0.94x | NEUTRAL | 260ms |
+| 96 | Q92 | 95ms | 1.00x | 1.00x | 0.92x | NEUTRAL | 47ms |
+| 97 | Q94 | 141ms | 1.00x | 1.00x | - | NEUTRAL | 70ms |
+| 98 | Q97 | 2642ms | 1.00x | 1.00x | 0.90x | NEUTRAL | 1321ms ⭐ TOP 20 |
+| 99 | Q98 | 384ms | 1.00x | 1.00x | 0.97x | NEUTRAL | 192ms |
 
 ## Transform Effectiveness
 

@@ -1,49 +1,126 @@
-## Example: Date CTE Isolation (DATE_CTE_ISOLATE)
-Verified speedup: 4.00x
+You are an autonomous Query Rewrite Engine. Your goal is to maximize execution speed while strictly preserving semantic invariants.
 
-### Input:
-[main_query]:
-SELECT a.ca_state state, count(*) cnt
-FROM customer_address a, customer c, store_sales s, date_dim d, item i
-WHERE a.ca_address_sk = c.c_current_addr_sk
-  AND c.c_customer_sk = s.ss_customer_sk
-  AND s.ss_sold_date_sk = d.d_date_sk
-  AND s.ss_item_sk = i.i_item_sk
-  AND d.d_month_seq = (SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1)
-  AND i.i_current_price > 1.2 * (SELECT avg(j.i_current_price) FROM item j WHERE j.i_category = i.i_category)
-GROUP BY a.ca_state HAVING count(*) >= 10
-ORDER BY cnt, a.ca_state LIMIT 100
+RULES:
+- Maximize execution speed while preserving semantic invariants (output columns, grain, total result rows).
+- Group dependent changes into a single rewrite_set.
+- Use descriptive CTE names (e.g., `filtered_returns` not `cte1`).
+- If a standard SQL optimization applies that is not in the allowed list, label it "semantic_rewrite".
 
-### Output:
-```json
-{
-  "rewrite_sets": [
-    {
-      "id": "rs_01",
-      "transform": "date_cte_isolate",
-      "nodes": {
-        "target_month": "SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1",
-        "category_avg_price": "SELECT i_category, AVG(i_current_price) * 1.2 AS avg_threshold FROM item GROUP BY i_category",
-        "filtered_dates": "SELECT d_date_sk FROM date_dim JOIN target_month ON d_month_seq = target_month.d_month_seq",
-        "filtered_sales": "SELECT ss_customer_sk, ss_item_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk",
-        "main_query": "SELECT a.ca_state AS state, COUNT(*) AS cnt FROM customer_address a JOIN customer c ON a.ca_address_sk = c.c_current_addr_sk JOIN filtered_sales s ON c.c_customer_sk = s.ss_customer_sk JOIN item i ON s.ss_item_sk = i.i_item_sk JOIN category_avg_price cap ON i.i_category = cap.i_category WHERE i.i_current_price > cap.avg_threshold GROUP BY a.ca_state HAVING COUNT(*) >= 10 ORDER BY cnt, a.ca_state LIMIT 100"
-      },
-      "invariants_kept": [
-        "same result rows",
-        "same ordering",
-        "same column output",
-        "same grouping and aggregation"
-      ],
-      "expected_speedup": "2.0x",
-      "risk": "low"
-    }
-  ]
-}
-```
-
-**Key insight:** Extract date month_seq subquery into CTE. Extract category average into separate CTE with GROUP BY. Join instead of correlated subquery. This allows each CTE to be scanned once.
+ALLOWED TRANSFORMS: pushdown, decorrelate, or_to_union, early_filter, date_cte_isolate, materialize_cte, flatten_subquery, reorder_join, multi_push_predicate, inline_cte, remove_redundant, semantic_rewrite
 
 ---
+## Query Structure
+
+### Target Nodes
+[wscs] UNION_ALL
+  [wswscs] GROUP_BY
+
+### SQL
+[wscs] type=cte
+```sql
+SELECT sold_date_sk, sales_price FROM (SELECT ws_sold_date_sk AS sold_date_sk, ws_ext_sales_price AS sales_price FROM web_sales UNION ALL SELECT cs_sold_date_sk AS sold_date_sk, cs_ext_sales_price AS sales_price FROM catalog_sales)
+```
+
+[wswscs] type=cte
+```sql
+SELECT d_week_seq, SUM(CASE WHEN (d_day_name = 'Sunday') THEN sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN sales_price ELSE NULL END) AS sat_sales FROM wscs, date_dim WHERE d_date_sk = sold_date_sk GROUP BY d_week_seq
+```
+
+[main_query] type=main
+```sql
+SELECT d_week_seq1, ROUND(sun_sales1 / sun_sales2, 2), ROUND(mon_sales1 / mon_sales2, 2), ROUND(tue_sales1 / tue_sales2, 2), ROUND(wed_sales1 / wed_sales2, 2), ROUND(thu_sales1 / thu_sales2, 2), ROUND(fri_sales1 / fri_sales2, 2), ROUND(sat_sales1 / sat_sales2, 2) FROM (SELECT wswscs.d_week_seq AS d_week_seq1, sun_sales AS sun_sales1, mon_sales AS mon_sales1, tue_sales AS tue_sales1, wed_sales AS wed_sales1, thu_sales AS thu_sales1, fri_sales AS fri_sales1, sat_sales AS sat_sales1 FROM wswscs, date_dim WHERE date_dim.d_week_seq = wswscs.d_week_seq AND d_year = 1998) AS y, (SELECT wswscs.d_week_seq AS d_week_seq2, sun_sales AS sun_sales2, mon_sales AS mon_sales2, tue_sales AS tue_sales2, wed_sales AS wed_sales2, thu_sales AS thu_sales2, fri_sales AS fri_sales2, sat_sales AS sat_sales2 FROM wswscs, date_dim WHERE date_dim.d_week_seq = wswscs.d_week_seq AND d_year = 1998 + 1) AS z WHERE d_week_seq1 = d_week_seq2 - 53 ORDER BY d_week_seq1
+```
+
+### Contracts
+[wscs]:
+  output_columns: ['sold_date_sk', 'sales_price']
+[wswscs]:
+  output_columns: ['d_week_seq', 'sun_sales', 'mon_sales', 'tue_sales', 'wed_sales', 'thu_sales', 'fri_sales', 'sat_sales']
+  grain: ['d_week_seq']
+  required_predicates: ['d_date_sk = sold_date_sk']
+[main_query]:
+  output_columns: ['d_week_seq1', 'ROUND(sun_sales1 / NULLIF(sun_', 'ROUND(mon_sales1 / NULLIF(mon_', 'ROUND(tue_sales1 / NULLIF(tue_', 'ROUND(wed_sales1 / NULLIF(wed_', 'ROUND(thu_sales1 / NULLIF(thu_', 'ROUND(fri_sales1 / NULLIF(fri_', 'ROUND(sat_sales1 / NULLIF(sat_']
+  required_predicates: ['d_week_seq1 = d_week_seq2 - 53']
+
+### Downstream Usage
+[wscs]: downstream_refs=['sold_date_sk', 'sales_price']
+[wswscs]: downstream_refs=['mon_sales', 'tue_sales', 'wed_sales', 'fri_sales', 'sat_sales', 'thu_sales', 'sun_sales', 'd_week_seq']
+
+---
+## Performance Profile
+
+### Cost Attribution
+[wscs]: 65.4% cost, ~14329227 rows, ops=[SEQ_SCAN[web_sales], SEQ_SCAN[catalog_sales]]
+[wswscs]: 18.7% cost, ~1000 rows, ops=[HASH_GROUP_BY, HASH_JOIN]
+[main_query]: 15.6% cost, ~1839 rows, ops=[SEQ_SCAN[date_dim], SEQ_SCAN[CTE_SCAN], SEQ_SCAN[date_dim]]
+
+### Execution Plan
+```
+Operators by cost:
+- SEQ_SCAN(catalog_sales): 46.2% cost, 14,329,227 rows
+- SEQ_SCAN(catalog_sales): 19.2% cost, 7,195,796 rows
+- HASH_GROUP_BY: 16.8% cost, 263 rows
+- PROJECTION: 14.0% cost, 21,525,023 rows
+- HASH_JOIN: 1.9% cost, 21,525,023 rows
+
+Scans:
+- catalog_sales x1: 172,815,132 rows (no filter)
+- web_sales x1: 86,370,792 rows (no filter)
+- date_dim x3: 73,049 → 1,839 rows (filtered)
+- CTE_SCAN x2: 263 rows (no filter)
+
+Misestimates:
+- CTE: est 4,522,963 vs actual 0 (4522963.0x)
+- PROJECTION: est 562,912 vs actual 263 (2140.3x)
+- HASH_GROUP_BY: est 562,912 vs actual 263 (2140.3x)
+- SEQ_SCAN: est 73,049 vs actual 1,839 (39.7x)
+- PROJECTION: est 4,522,963 vs actual 2,513 (1799.8x)
+- HASH_JOIN: est 4,522,963 vs actual 2,513 (1799.8x)
+- PROJECTION: est 94,872 vs actual 365 (259.9x)
+- HASH_JOIN: est 94,872 vs actual 365 (259.9x)
+- CTE_SCAN: est 562,912 vs actual 263 (2140.3x)
+- PROJECTION: est 94,872 vs actual 365 (259.9x)
+- HASH_JOIN: est 94,872 vs actual 365 (259.9x)
+- CTE_SCAN: est 562,912 vs actual 263 (2140.3x)
+
+Joins:
+- HASH_JOIN: ? x date_dim -> 21,525,023 rows
+- HASH_JOIN: ? x ? -> 2,513 rows
+- HASH_JOIN: ? x date_dim -> 365 rows
+- HASH_JOIN: ? x date_dim -> 365 rows
+```
+
+### Optimization Opportunities
+1. **QT-OPT-003** - Date CTE Isolation
+  Trigger: date_dim joined with d_year/d_qoy/d_month filter, fact table present
+  Rewrite: Create CTE: SELECT d_date_sk FROM date_dim WHERE filter, join fact to CTE early
+   Matched: date_dim filter with fact table
+
+PUSHDOWN: [main_query] filters on [wswscs] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+PUSHDOWN: [main_query] filters on [wswscs] after GROUP BY
+  Fix: Push filter into CTE before aggregation
+  Expected: 2x speedup (verified Q93: 2.71x)
+
+Now output your rewrite_sets:
+
+---
+## Previous Attempts
+
+- baseline: 1.00x [none] NEUTRAL
+- v2_standard: 1.00x [pushdown] NEUTRAL
+- dsr1: 0.00x [date_cte_isolate] ERROR
+
+**No effect**: pushdown
+**Regression**: date_cte_isolate
+
+**Recommended patterns** (details in Examples section below):
+- **prefetch_fact_join** (3.77x) — Pre-filter dimension table into CTE, then pre-join with fact table in second CTE before joining other dimensions.
+
+---
+## Examples (Verified Patterns)
 
 ## Example: Prefetch Fact Join (PREFETCH_FACT_JOIN)
 Verified speedup: 3.77x
@@ -89,36 +166,31 @@ ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
 
 **Key insight:** First CTE filters the dimension (date_dim). Second CTE pre-joins this with the fact table (store_sales). This creates a smaller intermediate result before joining with other dimension tables. The pre-join materializes the filtered fact rows, making subsequent joins faster.
 
----
-
-## CONSTRAINTS (Learned from Benchmark Failures)
-
-The following constraints are MANDATORY based on observed failures:
-
-### LITERAL_PRESERVATION [CRITICAL]
-CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
-
-### OR_TO_UNION_LIMIT [HIGH]
-CAUTION with OR→UNION: Only split OR conditions into UNION ALL when there are ≤3 simple branches AND they have different access patterns. If you have nested ORs (e.g., 3 conditions × 3 values = 9 combinations), DO NOT expand them - keep the original OR structure. DuckDB handles OR predicates efficiently. Over-splitting causes multiple scans of fact tables and severe regressions (0.23x-0.41x observed). When in doubt, preserve the original OR structure.
-
+**When NOT to use:** Do not use on queries with baseline runtime under 50ms — CTE materialization overhead dominates on fast queries. Do not use on window-function-dominated queries where filtering is not the bottleneck. Avoid on queries with 5+ table joins and complex inter-table predicates where forcing join order via CTEs prevents the optimizer from choosing a better plan. Caused 0.50x on Q25 (fast baseline query), 0.87x on Q51 (window-function bottleneck), and 0.77x on Q72 (complex multi-table join reordering).
 
 ---
+## Constraints
 
-You are an autonomous Query Rewrite Engine. Your goal is to maximize execution speed while strictly preserving semantic invariants.
+**CTE_COLUMN_COMPLETENESS** [CRITICAL]: CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
 
-Output atomic rewrite sets in JSON.
+**LITERAL_PRESERVATION** [CRITICAL]: CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
 
-RULES:
-- Primary Goal: Maximize execution speed while strictly preserving semantic invariants.
-- Allowed Transforms: Use the provided list. If a standard SQL optimization applies that is not listed, label it "semantic_rewrite".
-- Atomic Sets: Group dependent changes (e.g., creating a CTE and joining it) into a single rewrite_set.
-- Contracts: Output columns, grain, and total result rows must remain invariant.
-- Naming: Use descriptive CTE names (e.g., `filtered_returns` vs `cte1`).
-- Column Aliasing: Permitted only for aggregations or disambiguation.
+**MIN_BASELINE_THRESHOLD** [HIGH]: If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
 
-ALLOWED TRANSFORMS: pushdown, decorrelate, or_to_union, early_filter, date_cte_isolate, materialize_cte, flatten_subquery, reorder_join, multi_push_predicate, inline_cte, remove_redundant, semantic_rewrite
+**NO_UNFILTERED_DIMENSION_CTE** [HIGH]: Every CTE you create must include a WHERE clause that actually reduces row count. Selecting fewer columns is not filtering — the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query instead of wrapping it in a CTE.
 
-OUTPUT FORMAT:
+**OR_TO_UNION_GUARD** [HIGH]: Only apply or_to_union when (a) the OR branches involve different tables or fundamentally different access paths — never when all branches filter the same column (e.g., t_hour ranges), since the optimizer already handles same-column ORs efficiently in a single scan — and (b) the result is 3 or fewer UNION ALL branches. Nested ORs that would expand into 4+ branches (e.g., 3 conditions x 3 values = 9 combinations) must be left as-is. Violating these rules causes 0.23x–0.59x regressions from multiplied fact table scans.
+
+**REMOVE_REPLACED_CTES** [HIGH]: When creating replacement CTEs, overwrite the original by using the same node_id in your rewrite_sets, or ensure the original is removed from the WITH clause. Every CTE in the final query should be actively used — dead CTEs still get materialized and waste resources (caused 0.49x on Q31, 0.68x on Q74).
+
+**NO_MATERIALIZE_EXISTS** [CRITICAL]: Keep EXISTS and NOT EXISTS as-is — they use semi-join short-circuiting that stops scanning after the first match. Converting them to materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)) forces a full table scan, which is catastrophically slower (0.14x observed on Q16). When you see EXISTS, preserve it.
+
+
+---
+## Output Format
+
+Respond with a JSON object containing your rewrite_sets:
+
 ```json
 {
   "rewrite_sets": [
@@ -128,7 +200,7 @@ OUTPUT FORMAT:
       "nodes": {
         "node_id": "new SQL..."
       },
-      "invariants_kept": ["list of preserved semantics"],
+      "invariants_kept": ["same result rows", "same ordering"],
       "expected_speedup": "2x",
       "risk": "low"
     }
@@ -137,110 +209,4 @@ OUTPUT FORMAT:
 }
 ```
 
-## Target Nodes
-  [wscs] UNION_ALL
-  [wswscs] GROUP_BY
-
-## Subgraph Slice
-[wscs] type=cte
-```sql
-SELECT sold_date_sk, sales_price FROM (SELECT ws_sold_date_sk AS sold_date_sk, ws_ext_sales_price AS sales_price FROM web_sales UNION ALL SELECT cs_sold_date_sk AS sold_date_sk, cs_ext_sales_price AS sales_price FROM catalog_sales)
-```
-
-[wswscs] type=cte
-```sql
-SELECT d_week_seq, SUM(CASE WHEN (d_day_name = 'Sunday') THEN sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN sales_price ELSE NULL END) AS sat_sales FROM wscs, date_dim WHERE d_date_sk = sold_date_sk GROUP BY d_week_seq
-```
-
-[main_query] type=main
-```sql
-SELECT d_week_seq1, ROUND(sun_sales1 / sun_sales2, 2), ROUND(mon_sales1 / mon_sales2, 2), ROUND(tue_sales1 / tue_sales2, 2), ROUND(wed_sales1 / wed_sales2, 2), ROUND(thu_sales1 / thu_sales2, 2), ROUND(fri_sales1 / fri_sales2, 2), ROUND(sat_sales1 / sat_sales2, 2) FROM (SELECT wswscs.d_week_seq AS d_week_seq1, sun_sales AS sun_sales1, mon_sales AS mon_sales1, tue_sales AS tue_sales1, wed_sales AS wed_sales1, thu_sales AS thu_sales1, fri_sales AS fri_sales1, sat_sales AS sat_sales1 FROM wswscs, date_dim WHERE date_dim.d_week_seq = wswscs.d_week_seq AND d_year = 1998) AS y, (SELECT wswscs.d_week_seq AS d_week_seq2, sun_sales AS sun_sales2, mon_sales AS mon_sales2, tue_sales AS tue_sales2, wed_sales AS wed_sales2, thu_sales AS thu_sales2, fri_sales AS fri_sales2, sat_sales AS sat_sales2 FROM wswscs, date_dim WHERE date_dim.d_week_seq = wswscs.d_week_seq AND d_year = 1998 + 1) AS z WHERE d_week_seq1 = d_week_seq2 - 53 ORDER BY d_week_seq1
-```
-
-
-## Node Contracts
-[wscs]:
-  output_columns: ['sold_date_sk', 'sales_price']
-[wswscs]:
-  output_columns: ['d_week_seq', 'sun_sales', 'mon_sales', 'tue_sales', 'wed_sales', 'thu_sales', 'fri_sales', 'sat_sales']
-  grain: ['d_week_seq']
-  required_predicates: ['d_date_sk = sold_date_sk']
-[main_query]:
-  output_columns: ['d_week_seq1', 'ROUND(sun_sales1 / NULLIF(sun_', 'ROUND(mon_sales1 / NULLIF(mon_', 'ROUND(tue_sales1 / NULLIF(tue_', 'ROUND(wed_sales1 / NULLIF(wed_', 'ROUND(thu_sales1 / NULLIF(thu_', 'ROUND(fri_sales1 / NULLIF(fri_', 'ROUND(sat_sales1 / NULLIF(sat_']
-  required_predicates: ['d_week_seq1 = d_week_seq2 - 53']
-
-## Downstream Usage
-[wscs]: downstream_refs=['sales_price', 'sold_date_sk']
-[wswscs]: downstream_refs=['wed_sales', 'sat_sales', 'fri_sales', 'sun_sales', 'thu_sales', 'tue_sales', 'mon_sales', 'd_week_seq']
-
-## Cost Attribution
-[wscs]: 66.3% cost, ~14329227 rows, ops=[SEQ_SCAN[web_sales], SEQ_SCAN[catalog_sales]]
-[wswscs]: 18.9% cost, ~1000 rows, ops=[HASH_GROUP_BY, HASH_JOIN]
-[main_query]: 14.6% cost, ~1839 rows, ops=[SEQ_SCAN[date_dim], SEQ_SCAN[CTE_SCAN], SEQ_SCAN[date_dim]]
-
-## Detected Opportunities
-## Knowledge Base Patterns (verified on TPC-DS)
-## Detected Optimization Opportunities
-
-1. **QT-OPT-003** - Date CTE Isolation
-  Trigger: date_dim joined with d_year/d_qoy/d_month filter, fact table present
-  Rewrite: Create CTE: SELECT d_date_sk FROM date_dim WHERE filter, join fact to CTE early
-   Matched: date_dim filter with fact table
-
-
-## Node-Specific Opportunities
-PUSHDOWN: [main_query] filters on [wswscs] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
-PUSHDOWN: [main_query] filters on [wswscs] after GROUP BY
-  Fix: Push filter into CTE before aggregation
-  Expected: 2x speedup (verified Q93: 2.71x)
-
 Now output your rewrite_sets:
-
-## Execution Plan
-```
-Operators by cost:
-- SEQ_SCAN(catalog_sales): 43.8% cost, 14,329,227 rows
-- SEQ_SCAN(catalog_sales): 22.5% cost, 7,195,796 rows
-- HASH_GROUP_BY: 17.2% cost, 263 rows
-- PROJECTION: 13.7% cost, 21,525,023 rows
-- HASH_JOIN: 1.7% cost, 21,525,023 rows
-
-Scans:
-- catalog_sales x1: 172,815,132 rows (no filter)
-- web_sales x1: 86,370,792 rows (no filter)
-- date_dim x3: 73,049 → 1,839 rows (filtered)
-- CTE_SCAN x2: 263 rows (no filter)
-
-Misestimates:
-- CTE: est 4,522,963 vs actual 0 (4522963.0x)
-- PROJECTION: est 562,912 vs actual 263 (2140.3x)
-- HASH_GROUP_BY: est 562,912 vs actual 263 (2140.3x)
-- SEQ_SCAN: est 73,049 vs actual 1,839 (39.7x)
-- PROJECTION: est 4,522,963 vs actual 2,513 (1799.8x)
-- HASH_JOIN: est 4,522,963 vs actual 2,513 (1799.8x)
-- PROJECTION: est 94,872 vs actual 365 (259.9x)
-- HASH_JOIN: est 94,872 vs actual 365 (259.9x)
-- CTE_SCAN: est 562,912 vs actual 263 (2140.3x)
-- PROJECTION: est 94,872 vs actual 365 (259.9x)
-- HASH_JOIN: est 94,872 vs actual 365 (259.9x)
-- CTE_SCAN: est 562,912 vs actual 263 (2140.3x)
-
-Joins:
-- HASH_JOIN: ? x date_dim -> 21,525,023 rows
-- HASH_JOIN: ? x ? -> 2,513 rows
-- HASH_JOIN: ? x date_dim -> 365 rows
-- HASH_JOIN: ? x date_dim -> 365 rows
-```
-
-
-## Previous Attempts
-
-- baseline: 1.00x [none] NEUTRAL
-- v2_standard: 1.00x [pushdown] NEUTRAL
-
-**No effect**: pushdown
-
-**IMPORTANT:** The following patterns were provided: date_cte_isolate, prefetch_fact_join. Consider a DIFFERENT approach!
