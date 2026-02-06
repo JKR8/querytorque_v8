@@ -19,3 +19,8 @@ Output Location:
     - Saved after each query
     - Deleted on successful completion
     - Allows resuming if interrupted
+
+
+    best and latest prompt: 
+    Written to research/q47_prompt_test.txt — should be visible in your Windows file explorer at
+  C:\Users\jakc9\Documents\QueryTorque_V8\research\q47_prompt_test.txt.
