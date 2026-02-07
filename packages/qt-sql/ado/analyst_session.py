@@ -141,7 +141,7 @@ class AnalystSession:
         history = self._build_iteration_history()
 
         # Phase 1: Parse ORIGINAL SQL (always)
-        dag, costs = self.pipeline._parse_dag(self.original_sql, dialect=dialect)
+        dag, costs, _explain = self.pipeline._parse_dag(self.original_sql, dialect=dialect, query_id=self.query_id)
 
         # Phase 2: FAISS example retrieval (on original SQL)
         examples = self.pipeline._find_examples(
@@ -157,7 +157,7 @@ class AnalystSession:
         # Always run analyst in deep-dive mode
         expert_analysis = None
         analysis_raw = None
-        expert_analysis, analysis_raw, examples = self.pipeline._run_analyst(
+        expert_analysis, analysis_raw, _analysis_prompt, examples = self.pipeline._run_analyst(
             query_id=self.query_id,
             sql=self.original_sql,
             dag=dag,

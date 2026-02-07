@@ -79,21 +79,77 @@ class Pipeline:
     # Phase 1: Parse SQL → DAG
     # =========================================================================
 
-    @staticmethod
-    def _parse_dag(sql: str, dialect: str = "duckdb"):
-        """Phase 1: Parse SQL into DAG structure.
+    def _parse_dag(self, sql: str, dialect: str = "duckdb", query_id: str = "unknown"):
+        """Phase 1: Parse SQL into DAG structure with real EXPLAIN costs.
 
-        Returns (dag, costs) tuple.
+        Reads cached EXPLAIN ANALYZE from benchmark_dir/explains/.
+        If not cached, runs EXPLAIN ANALYZE and caches the result.
+        Falls back to heuristic cost splitting if EXPLAIN fails.
+
+        Returns (dag, costs, explain_result) tuple.
+        explain_result is the raw EXPLAIN output dict (or None).
         """
         from qt_sql.optimization.dag_v2 import DagBuilder, CostAnalyzer
 
         builder = DagBuilder(sql, dialect=dialect)
         dag = builder.build()
 
-        cost_analyzer = CostAnalyzer(dag)
+        # Get real costs from cached EXPLAIN ANALYZE (or run if not cached)
+        plan_context = None
+        explain_result = None
+        try:
+            explain_result = self._get_explain(query_id, sql)
+            if explain_result and explain_result.get("plan_json"):
+                from qt_sql.optimization.plan_analyzer import analyze_plan_for_optimization
+                plan_context = analyze_plan_for_optimization(
+                    explain_result["plan_json"], sql
+                )
+                logger.info(
+                    f"EXPLAIN: {explain_result.get('execution_time_ms', '?')}ms, "
+                    f"{len(plan_context.table_scans)} scans, "
+                    f"{len(plan_context.bottleneck_operators)} operators"
+                )
+        except Exception as e:
+            logger.warning(f"EXPLAIN failed, using heuristic costs: {e}")
+
+        cost_analyzer = CostAnalyzer(dag, plan_context=plan_context)
         costs = cost_analyzer.analyze()
 
-        return dag, costs
+        return dag, costs, explain_result
+
+    def _get_explain(self, query_id: str, sql: str) -> Optional[Dict[str, Any]]:
+        """Get EXPLAIN ANALYZE result — cached first, run if missing.
+
+        Cache location: benchmark_dir/explains/{query_id}.json
+        """
+        cache_dir = self.benchmark_dir / "explains"
+        cache_path = cache_dir / f"{query_id}.json"
+
+        # Try cache first
+        if cache_path.exists():
+            try:
+                data = json.loads(cache_path.read_text())
+                logger.info(f"[{query_id}] EXPLAIN loaded from cache")
+                return data
+            except Exception:
+                pass
+
+        # Run EXPLAIN ANALYZE and cache
+        logger.info(f"[{query_id}] Running EXPLAIN ANALYZE (will cache)")
+        try:
+            from qt_sql.execution.database_utils import run_explain_analyze
+            result = run_explain_analyze(self.config.db_path_or_dsn, sql)
+            if result:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps(result, indent=2, default=str))
+                logger.info(
+                    f"[{query_id}] Cached EXPLAIN: "
+                    f"{result.get('execution_time_ms', '?')}ms"
+                )
+            return result
+        except Exception as e:
+            logger.warning(f"[{query_id}] EXPLAIN ANALYZE failed: {e}")
+            return None
 
     # =========================================================================
     # Phase 5: Validate
@@ -176,7 +232,7 @@ class Pipeline:
 
         # Phase 1: Parse
         logger.info(f"[{query_id}] Phase 1: Parsing DAG")
-        dag, costs = self._parse_dag(sql, dialect=dialect)
+        dag, costs, explain_result = self._parse_dag(sql, dialect=dialect, query_id=query_id)
         logger.info(
             f"[{query_id}] DAG: {len(dag.nodes)} nodes, "
             f"{len(dag.edges)} edges"
@@ -198,8 +254,9 @@ class Pipeline:
         # Analyst sees FAISS picks and can swap them for better ones
         expert_analysis = None
         analysis_raw = None
+        analysis_prompt_text = None
         if analyst_enabled:
-            expert_analysis, analysis_raw, examples = self._run_analyst(
+            expert_analysis, analysis_raw, analysis_prompt_text, examples = self._run_analyst(
                 query_id=query_id,
                 sql=sql,
                 dag=dag,
@@ -249,6 +306,7 @@ class Pipeline:
         # Pick best candidate
         optimized_sql = sql
         transforms = []
+        best_response = None
         if candidates:
             best = None
             for cand in candidates:
@@ -258,6 +316,7 @@ class Pipeline:
             if best:
                 optimized_sql = best.optimized_sql
                 transforms = best.transforms
+                best_response = best.response
 
         # Phase 4: Validate (syntax check)
         logger.info(f"[{query_id}] Phase 4: Syntax check")
@@ -282,7 +341,10 @@ class Pipeline:
             optimized_sql=optimized_sql,
             transforms_applied=transforms,
             prompt=prompt,
+            response=best_response,
             analysis=analysis_raw,
+            analysis_prompt=analysis_prompt_text,
+            analysis_formatted=expert_analysis,
         )
 
         # Create learning record
@@ -375,7 +437,7 @@ class Pipeline:
                 query_id=query_id,
                 worker_id=0,
                 prompt=result.prompt or "",
-                response="",
+                response=result.response or "",
                 optimized_sql=result.optimized_sql,
                 validation={
                     "status": result.status,
@@ -383,6 +445,15 @@ class Pipeline:
                     "transforms": result.transforms_applied,
                 },
             )
+
+            # Save analyst artifacts if present (audit trail)
+            qdir = state_dir / query_id / "worker_00"
+            if result.analysis_prompt:
+                (qdir / "analysis_prompt.txt").write_text(result.analysis_prompt)
+            if result.analysis:
+                (qdir / "analysis_response.txt").write_text(result.analysis)
+            if result.analysis_formatted:
+                (qdir / "analysis_formatted.txt").write_text(result.analysis_formatted)
 
         # Save state leaderboard
         leaderboard = {
@@ -398,7 +469,7 @@ class Pipeline:
         )
 
         # Update top-level benchmark leaderboard
-        self._update_benchmark_leaderboard(results)
+        self._update_benchmark_leaderboard(results, state_num=state_num)
 
         # Save learning summary + generate history.json for analyst
         self.learner.save_learning_summary()
@@ -704,7 +775,7 @@ class Pipeline:
         faiss_examples: List[Dict[str, Any]],
         engine: str,
         dialect: str,
-    ) -> tuple[Optional[str], Optional[str], List[Dict[str, Any]]]:
+    ) -> tuple[Optional[str], Optional[str], Optional[str], List[Dict[str, Any]]]:
         """Run LLM analyst to generate deep structural analysis.
 
         The analyst sees the FAISS-selected examples and the full list of
@@ -714,9 +785,9 @@ class Pipeline:
         Costs 1 extra API call. Only use for stubborn queries.
 
         Returns:
-            (formatted_analysis, raw_response, final_examples) —
+            (formatted_analysis, raw_response, analysis_prompt, final_examples) —
             final_examples may differ from faiss_examples if the analyst
-            recommended swaps. Returns (None, None, faiss_examples) on failure.
+            recommended swaps. Returns (None, None, None, faiss_examples) on failure.
         """
         from .analyst import (
             build_analysis_prompt,
@@ -768,7 +839,7 @@ class Pipeline:
             raw_response = generator._analyze(analysis_prompt)
         except Exception as e:
             logger.warning(f"[{query_id}] Analyst LLM call failed: {e}")
-            return None, None, faiss_examples
+            return None, None, analysis_prompt, faiss_examples
 
         # Parse and format for injection into rewrite prompt
         parsed = parse_analysis_response(raw_response)
@@ -790,7 +861,7 @@ class Pipeline:
             f"examples: {[e.get('id', '?') for e in final_examples]}"
         )
 
-        return formatted, raw_response, final_examples
+        return formatted, raw_response, analysis_prompt, final_examples
 
     def _list_gold_examples(self, engine: str) -> List[Dict[str, str]]:
         """List all available gold examples with id + short description.
@@ -1085,10 +1156,12 @@ class Pipeline:
     def _update_benchmark_leaderboard(
         self,
         results: List[PipelineResult],
+        state_num: int = 0,
     ) -> None:
         """Merge state results into the top-level benchmark leaderboard.
 
         Updates leaderboard.json with improved results (better speedup wins).
+        Tracks all attempts per query for learning from regressions.
         Regenerates leaderboard.md as human-readable view.
         """
         lb_path = self.benchmark_dir / "leaderboard.json"
@@ -1105,11 +1178,21 @@ class Pipeline:
             except Exception:
                 pass
 
-        # Merge: keep the better result per query
+        # Merge: keep the better result per query + track all attempts
         for r in results:
-            prev = existing.get(r.query_id, {})
-            prev_speedup = prev.get("speedup", 0) if isinstance(prev, dict) else 0
+            entry = existing.get(r.query_id, {})
+            prev_speedup = entry.get("speedup", 0) if isinstance(entry, dict) else 0
 
+            # Append this attempt to history
+            attempts = entry.get("attempts", []) if isinstance(entry, dict) else []
+            attempts.append({
+                "state": state_num,
+                "status": r.status,
+                "speedup": r.speedup,
+                "transforms": r.transforms_applied,
+            })
+
+            # Update top-level if this is the best result
             if r.speedup > prev_speedup or r.query_id not in existing:
                 existing[r.query_id] = {
                     "query_id": r.query_id,
@@ -1119,7 +1202,12 @@ class Pipeline:
                     "original_sql": r.original_sql,
                     "optimized_sql": r.optimized_sql,
                     "nodes_rewritten": r.nodes_rewritten,
+                    "attempts": attempts,
                 }
+            else:
+                # Keep existing best but update attempts list
+                entry["attempts"] = attempts
+                existing[r.query_id] = entry
 
         # Save as list sorted by query_id
         lb_list = sorted(existing.values(), key=lambda e: e.get("query_id", ""))
@@ -1179,13 +1267,15 @@ class Pipeline:
 
         lines.append("## All Queries")
         lines.append("")
-        lines.append("| Query | Status | Speedup | Transforms |")
-        lines.append("|-------|--------|--------:|------------|")
+        lines.append("| Query | Status | Speedup | Transforms | Attempts |")
+        lines.append("|-------|--------|--------:|------------|:--------:|")
         for e in leaderboard:
             t = ", ".join(e.get("transforms", [])[:3]) if isinstance(e.get("transforms"), list) else str(e.get("transforms", ""))
+            n_attempts = len(e.get("attempts", []))
+            attempts_str = str(n_attempts) if n_attempts else "1"
             lines.append(
                 f"| {e.get('query_id', '')} | {e.get('status', '')} "
-                f"| {e.get('speedup', 0):.2f}x | {t} |"
+                f"| {e.get('speedup', 0):.2f}x | {t} | {attempts_str} |"
             )
 
         md_path.write_text("\n".join(lines) + "\n")

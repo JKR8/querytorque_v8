@@ -147,4 +147,7 @@ class PipelineResult:
     nodes_rewritten: List[str] = field(default_factory=list)
     transforms_applied: List[str] = field(default_factory=list)
     prompt: Optional[str] = None
-    analysis: Optional[str] = None  # LLM analyst output (only when use_analyst=True)
+    response: Optional[str] = None  # LLM rewrite response
+    analysis: Optional[str] = None  # Raw analyst LLM response
+    analysis_prompt: Optional[str] = None  # Analyst prompt sent to LLM
+    analysis_formatted: Optional[str] = None  # Formatted analysis injected into rewrite prompt

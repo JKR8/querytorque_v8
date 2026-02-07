@@ -97,7 +97,7 @@ def build_analysis_prompt(
     # DAG topology + costs
     lines.append("## Query Structure (DAG)")
     lines.append("")
-    _append_dag_analysis(lines, dag, costs)
+    _append_dag_analysis(lines, dag, costs, dialect=dialect)
     lines.append("")
 
     # Previous attempts
@@ -202,47 +202,466 @@ def _append_dag_analysis(
     lines: List[str],
     dag: Any,
     costs: Dict[str, Any],
+    dialect: str = "duckdb",
 ) -> None:
-    """Append DAG structure with costs to the analysis prompt."""
+    """Append structured DAG analysis — one card per node.
+
+    Gold standard format per node:
+      Role, Stats, Flags, Outputs, Dependencies, Joins, Filters,
+      Operators, Key Logic (SQL)
+    """
     from .node_prompter import compute_depths
     depths = compute_depths(dag)
 
     max_depth = max(depths.values()) if depths else 0
+    node_num = 0
     for depth in range(max_depth + 1):
         nodes_at_depth = [nid for nid, d in depths.items() if d == depth]
         if not nodes_at_depth:
             continue
 
         for nid in nodes_at_depth:
+            node_num += 1
             node = dag.nodes[nid]
             cost = costs.get(nid)
             cost_pct = cost.cost_pct if cost and hasattr(cost, "cost_pct") else 0
-            flags = node.flags if hasattr(node, "flags") and node.flags else []
-            refs = list(node.refs) if hasattr(node, "refs") else []
-            tables = list(node.tables) if hasattr(node, "tables") else []
+            row_est = cost.row_estimate if cost and hasattr(cost, "row_estimate") else 0
+            base_flags = node.flags if hasattr(node, "flags") and node.flags else []
 
-            flag_str = f" [{', '.join(flags)}]" if flags else ""
-            ref_str = f" ← reads [{', '.join(refs)}]" if refs else ""
-            table_str = f" tables: {', '.join(tables)}" if tables else ""
-
-            lines.append(
-                f"- **{nid}** ({node.node_type}, depth {depth}, "
-                f"**{cost_pct:.0f}%** cost){flag_str}{ref_str}"
+            # Extract structured metadata from SQL
+            meta = _extract_node_metadata(
+                node.sql if hasattr(node, "sql") else "", dialect
             )
-            if table_str:
-                lines.append(f"  {table_str}")
 
-            # Show operators if available
+            # Role label
+            if node.node_type == "main":
+                role = "Root / Output"
+            elif node.node_type == "cte":
+                role = "CTE"
+            elif node.node_type == "subquery":
+                role = "Subquery"
+            else:
+                role = node.node_type.title()
+
+            # --- Header ---
+            lines.append(f"### {node_num}. {nid}")
+            lines.append(f"**Role**: {role} (Definition Order: {depth})")
+
+            # Stats
+            output_rows = meta.get("limit")
+            if output_rows:
+                lines.append(
+                    f"**Stats**: {cost_pct:.0f}% Cost | "
+                    f"~{_fmt_rows(row_est)} rows processed → "
+                    f"{output_rows} rows output"
+                )
+            else:
+                lines.append(
+                    f"**Stats**: {cost_pct:.0f}% Cost | "
+                    f"~{_fmt_rows(row_est)} rows"
+                )
+
+            # Flags
+            rich_flags = _build_rich_flags(base_flags, meta)
+            if rich_flags:
+                lines.append(f"**Flags**: {', '.join(rich_flags)}")
+
+            # Outputs
+            out_cols = []
+            if hasattr(node, "contract") and node.contract and node.contract.output_columns:
+                out_cols = node.contract.output_columns[:10]
+            out_str = ", ".join(out_cols) if out_cols else "?"
+            if hasattr(node, "contract") and node.contract and node.contract.output_columns:
+                if len(node.contract.output_columns) > 10:
+                    out_str += ", ..."
+            out_suffix = ""
+            if meta.get("order_by"):
+                out_suffix = f" — ordered by {meta['order_by']}"
+            lines.append(f"**Outputs**: [{out_str}]{out_suffix}")
+
+            # Dependencies
+            deps = meta.get("dependencies", [])
+            if deps:
+                lines.append(f"**Dependencies**: {', '.join(deps)}")
+            else:
+                tables = list(node.tables) if hasattr(node, "tables") else []
+                if tables:
+                    lines.append(f"**Dependencies**: {', '.join(tables)}")
+
+            # Joins
+            joins = meta.get("joins", [])
+            if joins:
+                lines.append(f"**Joins**: {' | '.join(joins)}")
+
+            # Filters
+            filters = meta.get("filters", [])
+            if filters:
+                lines.append(f"**Filters**: {' | '.join(filters)}")
+
+            # Operators
             if cost and hasattr(cost, "operators") and cost.operators:
-                ops = ", ".join(cost.operators[:5])
-                lines.append(f"  operators: {ops}")
+                ops = [_clean_operator(op) for op in cost.operators[:6]]
+                lines.append(f"**Operators**: {', '.join(ops)}")
 
-            # Show SQL snippet (first 200 chars)
+            # Key Logic (SQL) — blank line before code block
             if hasattr(node, "sql") and node.sql:
-                snippet = node.sql[:200].replace("\n", " ")
-                if len(node.sql) > 200:
-                    snippet += "..."
-                lines.append(f"  sql: `{snippet}`")
+                lines.append("**Key Logic (SQL)**:")
+                lines.append("```sql")
+                lines.append(_format_key_logic(node.sql, dialect))
+                lines.append("```")
+
+            # Blank line between nodes
+            lines.append("")
+
+    # Edges
+    if dag.edges:
+        lines.append("### Edges")
+        for src, dst in dag.edges:
+            lines.append(f"- {src} → {dst}")
+        lines.append("")
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+def _fmt_rows(n: int) -> str:
+    """Format row count: 557705 → '557k', 28000000 → '28M'."""
+    if n >= 1_000_000:
+        val = n / 1_000_000
+        return f"{val:.1f}M" if val != int(val) else f"{int(val)}M"
+    if n >= 1_000:
+        return f"{n // 1_000}k"
+    return str(n)
+
+
+def _clean_operator(op: str) -> str:
+    """Clean operator names: SEQ_SCAN[CTE_SCAN] → CTE_SCAN, keep SEQ_SCAN[store]."""
+    import re
+    m = re.match(r"SEQ_SCAN\[(.+)\]", op)
+    if m:
+        inner = m.group(1)
+        # If inner is itself an operator type, unwrap
+        if inner in ("CTE_SCAN", "COLUMN_DATA_SCAN", "TEMP_SCAN"):
+            return inner
+        return op
+    return op
+
+
+def _build_rich_flags(
+    base_flags: List[str], meta: Dict[str, Any]
+) -> List[str]:
+    """Enrich DAG flags with sqlglot-extracted details."""
+    flags = []
+    for f in base_flags:
+        if f == "CORRELATED" and meta.get("correlated_detail"):
+            flags.append(f"CORRELATED_SUBQUERY({meta['correlated_detail']})")
+        else:
+            flags.append(f)
+
+    # Add ORDER_BY and LIMIT if detected
+    if meta.get("order_by") and "ORDER_BY" not in flags:
+        flags.append("ORDER_BY")
+    if meta.get("limit") and "LIMIT" not in flags:
+        flags.append(f"LIMIT({meta['limit']})")
+
+    return flags
+
+
+def _extract_node_metadata(sql: str, dialect: str = "duckdb") -> Dict[str, Any]:
+    """Extract structured metadata from a node's SQL using sqlglot.
+
+    Returns dict with: joins, filters, dependencies, order_by, limit,
+    correlated_detail, table_aliases.
+    """
+    result: Dict[str, Any] = {
+        "joins": [],
+        "filters": [],
+        "dependencies": [],
+        "order_by": None,
+        "limit": None,
+        "correlated_detail": None,
+        "table_aliases": {},
+    }
+
+    if not sql or not sql.strip():
+        return result
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+        parsed = sqlglot.parse_one(sql, read=dialect)
+    except Exception:
+        return result
+
+    # --- Table aliases ---
+    aliases: Dict[str, str] = {}  # alias → table_name
+    for table in parsed.find_all(exp.Table):
+        name = table.name
+        alias = table.alias or name
+        aliases[alias] = name
+
+    result["table_aliases"] = aliases
+
+    # --- ORDER BY ---
+    order = parsed.find(exp.Order)
+    if order:
+        parts = []
+        for ordered in order.find_all(exp.Ordered):
+            col = ordered.this.sql(dialect=dialect)
+            desc = " DESC" if ordered.args.get("desc") else " ASC"
+            parts.append(f"{col}{desc}")
+        if parts:
+            result["order_by"] = ", ".join(parts)
+
+    # --- LIMIT ---
+    limit = parsed.find(exp.Limit)
+    if limit:
+        limit_expr = limit.args.get("expression") or limit.this
+        if limit_expr:
+            try:
+                result["limit"] = int(limit_expr.sql(dialect=dialect))
+            except (ValueError, TypeError):
+                pass
+
+    # --- WHERE conditions → joins vs filters ---
+    where = parsed.find(exp.Where)
+    if where:
+        conditions = _split_conditions(where.this)
+        for cond in conditions:
+            classified = _classify_condition(cond, aliases, dialect)
+            if classified:
+                cat, text = classified
+                if cat == "join":
+                    result["joins"].append(text)
+                elif cat == "filter":
+                    result["filters"].append(text)
+                elif cat == "correlated":
+                    result["joins"].append(text + " (correlated)")
+                    result["correlated_detail"] = text
+
+    # --- Correlated subquery detection ---
+    for subq in parsed.find_all(exp.Subquery):
+        _detect_correlated(subq, parsed, result, aliases, dialect)
+
+    # --- Dependencies with roles ---
+    deps = _build_dependency_list(parsed, aliases, result, dialect)
+    if deps:
+        result["dependencies"] = deps
+
+    return result
+
+
+def _split_conditions(node) -> list:
+    """Split an AND-chain into individual conditions."""
+    from sqlglot import exp
+    if isinstance(node, exp.And):
+        return _split_conditions(node.left) + _split_conditions(node.right)
+    return [node]
+
+
+def _classify_condition(
+    cond, aliases: Dict[str, str], dialect: str
+) -> Optional[tuple]:
+    """Classify a WHERE condition as join, filter, or correlated.
+
+    Returns (category, text) or None if unclassifiable.
+    """
+    from sqlglot import exp
+
+    # Subquery comparisons — abbreviate intelligently
+    if cond.find(exp.Subquery):
+        text = cond.sql(dialect=dialect)
+        if len(text) > 80:
+            # Try to produce a meaningful abbreviation
+            left = cond.left.sql(dialect=dialect) if hasattr(cond, "left") else "?"
+            subq = cond.find(exp.Subquery)
+            abbrev = _abbreviate_subquery_filter(subq, dialect)
+            op = ">" if isinstance(cond, exp.GT) else ">=" if isinstance(cond, exp.GTE) else \
+                 "<" if isinstance(cond, exp.LT) else "<=" if isinstance(cond, exp.LTE) else "op"
+            return ("filter", f"{left} {op} {abbrev}")
+        return ("filter", text)
+
+    cond_sql = cond.sql(dialect=dialect)
+
+    # Equality: join or filter?
+    if isinstance(cond, (exp.EQ, exp.Is)):
+        left_cols = list(cond.left.find_all(exp.Column))
+        right_cols = list(cond.right.find_all(exp.Column))
+
+        if left_cols and right_cols:
+            # Two column refs → join condition
+            left_tables = {c.table for c in left_cols if c.table}
+            right_tables = {c.table for c in right_cols if c.table}
+            if left_tables != right_tables:
+                return ("join", cond_sql)
+            # Same table on both sides → still a join-like condition
+            return ("join", cond_sql)
+        elif left_cols and not right_cols:
+            return ("filter", cond_sql)
+        elif right_cols and not left_cols:
+            return ("filter", cond_sql)
+    elif isinstance(cond, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.NEQ)):
+        if cond.find(exp.Subquery):
+            return None
+        return ("filter", cond_sql)
+    elif isinstance(cond, exp.In):
+        return ("filter", cond_sql)
+
+    # Default: treat as filter
+    if cond_sql and len(cond_sql) < 200:
+        return ("filter", cond_sql)
+    return None
+
+
+def _abbreviate_subquery_filter(subq, dialect: str) -> str:
+    """Produce a short description of a subquery used in a filter.
+
+    e.g. SELECT AVG(x) * 1.2 FROM t WHERE corr → 'AVG(ctr_total_return) * 1.2 (per store)'
+    """
+    from sqlglot import exp
+
+    try:
+        # Find the SELECT expression
+        select = subq.find(exp.Select)
+        if not select:
+            return "(subquery)"
+
+        # Get the projected expression
+        exprs = select.expressions
+        if exprs:
+            proj = exprs[0].sql(dialect=dialect)
+            # Limit length
+            if len(proj) > 60:
+                # Try to find aggregate function name
+                agg = select.find(exp.Avg) or select.find(exp.Sum) or \
+                      select.find(exp.Count) or select.find(exp.Max) or \
+                      select.find(exp.Min)
+                if agg:
+                    proj = f"{type(agg).__name__.upper()}(...)"
+                else:
+                    proj = proj[:40] + "..."
+
+            # Check for correlation — describe what the grouping is
+            where = subq.find(exp.Where)
+            if where:
+                for eq in where.find_all(exp.EQ):
+                    cols = list(eq.find_all(exp.Column))
+                    if len(cols) >= 2:
+                        # Use the column name to describe the grouping
+                        col_name = cols[0].name
+                        # Strip common prefixes like ctr_
+                        semantic = col_name
+                        for prefix in ("ctr_", "sr_", "ss_", "cs_", "ws_"):
+                            if semantic.startswith(prefix):
+                                semantic = semantic[len(prefix):]
+                                break
+                        return f"{proj} (per {semantic})"
+            return proj
+    except Exception:
+        pass
+    return "(subquery)"
+
+
+def _detect_correlated(subq, outer, result, aliases, dialect):
+    """Detect correlated subquery and extract correlation columns."""
+    from sqlglot import exp
+
+    subq_where = subq.find(exp.Where)
+    if not subq_where:
+        return
+
+    # Check for references to outer aliases inside the subquery WHERE
+    for col in subq_where.find_all(exp.Column):
+        table = col.table
+        if table and table in aliases and table not in _get_subq_aliases(subq):
+            # This column references an outer table → correlated
+            inner_cond = subq_where.this
+            for cond in _split_conditions(inner_cond):
+                cond_sql = cond.sql(dialect=dialect)
+                if table in cond_sql:
+                    result["correlated_detail"] = cond_sql
+                    return
+
+
+def _get_subq_aliases(subq) -> set:
+    """Get all table aliases defined inside a subquery."""
+    from sqlglot import exp
+    aliases = set()
+    for table in subq.find_all(exp.Table):
+        aliases.add(table.alias or table.name)
+    return aliases
+
+
+def _build_dependency_list(
+    parsed, aliases: Dict[str, str], result: Dict[str, Any], dialect: str
+) -> List[str]:
+    """Build dependency list with alias roles (join, correlated subquery, etc.)."""
+    from sqlglot import exp
+
+    deps = []
+    seen = set()
+
+    # Main FROM tables
+    from_clause = parsed.find(exp.From)
+    if from_clause:
+        for table in from_clause.find_all(exp.Table):
+            name = table.name
+            alias = table.alias or name
+            key = f"{name}_{alias}"
+            if key not in seen:
+                seen.add(key)
+                role = "join" if alias != name else ""
+                dep = f"{name} AS {alias}" if alias != name else name
+                if role:
+                    dep += f" ({role})"
+                deps.append(dep)
+
+    # JOIN tables
+    for join in parsed.find_all(exp.Join):
+        for table in join.find_all(exp.Table):
+            name = table.name
+            alias = table.alias or name
+            key = f"{name}_{alias}"
+            if key not in seen:
+                seen.add(key)
+                dep = f"{name} AS {alias}" if alias != name else name
+                dep += " (join)"
+                deps.append(dep)
+
+    # Subquery tables (correlated)
+    for subq in parsed.find_all(exp.Subquery):
+        for table in subq.find_all(exp.Table):
+            name = table.name
+            alias = table.alias or name
+            key = f"{name}_{alias}"
+            if key not in seen:
+                seen.add(key)
+                dep = f"{name} AS {alias}" if alias != name else name
+                dep += " (correlated subquery)"
+                deps.append(dep)
+
+    return deps
+
+
+def _format_key_logic(sql: str, dialect: str = "duckdb") -> str:
+    """Format node SQL as clean, readable Key Logic block.
+
+    Uses sqlglot pretty-print. For short SQL (≤15 lines), shows full.
+    For longer SQL, shows full but limits to 20 lines.
+    """
+    compact = " ".join(sql.split())
+    try:
+        import sqlglot
+        pretty = sqlglot.transpile(compact, read=dialect, write=dialect, pretty=True)[0]
+        pretty_lines = pretty.split("\n")
+        if len(pretty_lines) <= 20:
+            return pretty
+        return "\n".join(pretty_lines[:20]) + "\n..."
+    except Exception:
+        if len(compact) > 500:
+            return compact[:500] + " ..."
+        return compact
 
 
 def _append_history_analysis(

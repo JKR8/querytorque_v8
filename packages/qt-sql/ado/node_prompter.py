@@ -137,11 +137,8 @@ class Prompter:
         # Section 2: Full Query SQL (PRIMACY)
         sections.append(self._section_full_sql(query_id, full_sql, dialect))
 
-        # Section 3: DAG Topology (PRIMACY)
-        sections.append(self._section_dag_topology(dag, costs))
-
-        # Section 4: Performance Profile (EARLY)
-        sections.append(self._section_performance(dag, costs))
+        # Section 3+4: Query Structure (DAG) — unified gold standard format
+        sections.append(self._section_query_structure(dag, costs, dialect))
 
         # Section 5: History (EARLY-MID)
         if history:
@@ -291,36 +288,18 @@ class Prompter:
         )
 
     @staticmethod
-    def _section_dag_topology(dag: Any, costs: Dict[str, Any]) -> str:
-        """Section 3: DAG Topology as SQL comments."""
-        dag_comments = Prompter._build_dag_comments(dag, costs)
-        return (
-            f"## DAG Topology\n"
-            f"\n"
-            f"```sql\n"
-            f"{dag_comments}\n"
-            f"```"
-        )
+    def _section_query_structure(
+        dag: Any, costs: Dict[str, Any], dialect: str = "duckdb"
+    ) -> str:
+        """Sections 3+4: Query Structure (DAG) — gold standard card format.
 
-    @staticmethod
-    def _section_performance(dag: Any, costs: Dict[str, Any]) -> str:
-        """Section 4: Performance Profile — per-node cost breakdown."""
-        lines = ["## Performance Profile", ""]
+        Reuses the shared format from analyst.py so both prompts
+        present the same structured view.
+        """
+        from .analyst import _append_dag_analysis
 
-        for nid, node in dag.nodes.items():
-            cost = costs.get(nid)
-            if not cost:
-                continue
-
-            cost_pct = cost.cost_pct if hasattr(cost, "cost_pct") else 0
-            operators = cost.operators if hasattr(cost, "operators") else []
-            row_est = cost.row_estimate if hasattr(cost, "row_estimate") else 0
-
-            lines.append(f"**{nid}**: {cost_pct:.0f}% of total cost, ~{row_est:,} rows")
-            if operators:
-                ops_str = ", ".join(operators[:5])
-                lines.append(f"  operators: {ops_str}")
-
+        lines = ["## Query Structure (DAG)", ""]
+        _append_dag_analysis(lines, dag, costs, dialect=dialect)
         return "\n".join(lines)
 
     @staticmethod
