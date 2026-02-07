@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate ADO prompts for all DSB queries on PostgreSQL.
 
-Runs Phase 1 (Parse) → Phase 2 (Annotate) → Phase 3 (Build prompt)
+Runs Phase 1 (Parse) → Phase 2 (FAISS) → Phase 3 (Build prompt)
 for each query and saves prompts to state_0/prompts/.
 
 Usage:
@@ -27,8 +27,8 @@ def main():
     # Create output dirs
     state_dir = benchmark_dir / "state_0"
     prompts_dir = state_dir / "prompts"
-    annotations_dir = state_dir / "annotations"
-    for d in [prompts_dir, annotations_dir, state_dir / "responses", state_dir / "validation"]:
+    metadata_dir = state_dir / "metadata"
+    for d in [prompts_dir, metadata_dir, state_dir / "responses", state_dir / "validation"]:
         d.mkdir(parents=True, exist_ok=True)
 
     # Load queries
@@ -50,13 +50,8 @@ def main():
             # Phase 1: Parse
             dag, costs = p._parse_dag(sql, dialect=dialect)
 
-            # Phase 2: Annotate
-            annotation = p._annotate(dag, costs)
-            flagged = [a.node_id for a in annotation.rewrites]
-            patterns = [a.pattern for a in annotation.rewrites]
-
-            # Find examples (FAISS + gold)
-            examples = p._find_examples(sql, annotation, engine=engine, k=3)
+            # Phase 2: Find FAISS examples
+            examples = p._find_examples(sql, engine=engine, k=3)
             example_ids = [e.get("id", "?") for e in examples]
 
             # Phase 3: Build prompt
@@ -65,7 +60,6 @@ def main():
                 full_sql=sql,
                 dag=dag,
                 costs=costs,
-                annotation=annotation,
                 examples=examples,
                 dialect=dialect,
             )
@@ -75,28 +69,25 @@ def main():
             # Save prompt
             (prompts_dir / f"{qid}.txt").write_text(prompt)
 
-            # Save annotation metadata
-            ann_data = {
+            # Save metadata
+            meta_data = {
                 "query_id": qid,
                 "dag_nodes": len(dag.nodes),
                 "dag_edges": len(dag.edges),
-                "flagged_nodes": flagged,
-                "patterns": patterns,
                 "examples_matched": example_ids,
                 "prompt_length": len(prompt),
                 "generation_time_s": round(elapsed, 2),
             }
-            (annotations_dir / f"{qid}.json").write_text(
-                json.dumps(ann_data, indent=2)
+            (metadata_dir / f"{qid}.json").write_text(
+                json.dumps(meta_data, indent=2)
             )
 
-            results.append(ann_data)
+            results.append(meta_data)
 
-            status_icon = "✓" if flagged else "○"
             print(
-                f"  [{i:2d}/{len(queries)}] {status_icon} {qid:30s} "
-                f"nodes={len(dag.nodes):2d}  flagged={len(flagged)}  "
-                f"patterns={patterns}  examples={example_ids}  "
+                f"  [{i:2d}/{len(queries)}] ✓ {qid:30s} "
+                f"nodes={len(dag.nodes):2d}  "
+                f"examples={example_ids}  "
                 f"prompt={len(prompt):,d}ch  ({elapsed:.1f}s)"
             )
 
@@ -109,14 +100,11 @@ def main():
         "total_queries": len(queries),
         "prompts_generated": len(results),
         "errors": len(errors),
-        "patterns_used": {},
         "examples_used": {},
         "avg_prompt_length": 0,
     }
 
     for r in results:
-        for pat in r["patterns"]:
-            summary["patterns_used"][pat] = summary["patterns_used"].get(pat, 0) + 1
         for ex in r["examples_matched"]:
             summary["examples_used"][ex] = summary["examples_used"].get(ex, 0) + 1
 
@@ -136,12 +124,6 @@ def main():
     print("=" * 70)
     print(f"DONE: {len(results)}/{len(queries)} prompts generated, {len(errors)} errors")
     print(f"Avg prompt length: {summary['avg_prompt_length']:,} chars")
-    print()
-    print("Pattern frequency:")
-    for pat, count in sorted(
-        summary["patterns_used"].items(), key=lambda x: -x[1]
-    ):
-        print(f"  {pat:40s} {count:3d} queries")
     print()
     print("Example frequency:")
     for ex, count in sorted(

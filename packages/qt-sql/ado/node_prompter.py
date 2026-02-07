@@ -2,7 +2,7 @@
 
 Builds attention-optimized full-query rewrite prompts with DAG topology.
 All rewrites are full-query scope — the LLM sees the complete SQL, the DAG
-structure, and pattern hints for which nodes to target.
+structure, and FAISS-matched gold examples.
 
 Section ordering (attention-optimized):
 1. Role + Task          (PRIMACY - frames rewrite mindset)
@@ -10,10 +10,10 @@ Section ordering (attention-optimized):
 3. DAG Topology         (PRIMACY - nodes, edges, depths, flags, costs)
 4. Performance Profile  (EARLY - per-node costs, bottleneck operators)
 5. History              (EARLY-MID - previous attempts on this query)
-6. Pattern Hints        (EARLY-MID - from Phase 2 annotation: which patterns where)
-7. Full Example         (MIDDLE - 1 contrastive BEFORE/AFTER pair)
-8. Constraints          (LATE-MID - sandwich: CRITICAL top/bottom, HIGH middle)
-9. Output Format        (RECENCY - return complete rewritten SQL)
+5b. Global Learnings    (EARLY-MID - aggregate benchmark stats, optional)
+6. Examples             (MIDDLE - FAISS-matched contrastive BEFORE/AFTER pairs)
+7. Constraints          (LATE-MID - sandwich: CRITICAL top/bottom, HIGH middle)
+8. Output Format        (RECENCY - return complete rewritten SQL)
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .schemas import AnnotationResult, EdgeContract, NodeAnnotation, PromotionAnalysis
+from .schemas import EdgeContract, PromotionAnalysis
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +33,61 @@ EXAMPLES_DIR = BASE_DIR / "examples"          # ado/examples/{duckdb,postgres}/
 CONSTRAINTS_DIR = BASE_DIR / "constraints"
 
 
+def compute_depths(dag) -> Dict[str, int]:
+    """Compute topological depth for each node in the DAG."""
+    depths: Dict[str, int] = {}
+
+    def _depth(node_id: str) -> int:
+        if node_id in depths:
+            return depths[node_id]
+        node = dag.nodes.get(node_id)
+        if not node or not node.refs:
+            depths[node_id] = 0
+            return 0
+        max_parent = max(
+            (_depth(ref) for ref in node.refs if ref in dag.nodes),
+            default=-1,
+        )
+        depths[node_id] = max_parent + 1
+        return depths[node_id]
+
+    for node_id in dag.nodes:
+        _depth(node_id)
+
+    return depths
+
+
+def _load_constraint_files() -> List[Dict[str, Any]]:
+    """Load all constraint JSON files from CONSTRAINTS_DIR.
+
+    Returns list of constraint dicts sorted by severity (CRITICAL first,
+    then HIGH, then MEDIUM).
+    """
+    if not CONSTRAINTS_DIR.exists():
+        return []
+
+    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
+    constraints = []
+
+    for path in sorted(CONSTRAINTS_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+            if "id" in data and "prompt_instruction" in data:
+                constraints.append(data)
+        except Exception as e:
+            logger.warning(f"Failed to load constraint {path}: {e}")
+
+    constraints.sort(key=lambda c: severity_order.get(c.get("severity", "MEDIUM"), 2))
+    return constraints
+
+
 class Prompter:
     """Build attention-optimized full-query rewrite prompts with DAG context.
 
     The LLM sees:
     - Complete query SQL (not isolated nodes)
     - Full DAG topology (nodes, edges, depths, flags, costs)
-    - Pattern hints from Phase 2 (which patterns to apply where)
-    - 1 gold example (contrastive BEFORE/AFTER)
+    - FAISS-matched gold examples (contrastive BEFORE/AFTER pairs)
     - Constraints (sandwich ordered)
 
     This enables cross-node rewrites: creating new CTEs, restructuring
@@ -53,10 +100,10 @@ class Prompter:
         full_sql: str,
         dag: Any,
         costs: Dict[str, Any],
-        annotation: AnnotationResult,
         history: Optional[Dict[str, Any]] = None,
         examples: Optional[List[Dict[str, Any]]] = None,
         expert_analysis: Optional[str] = None,
+        global_learnings: Optional[Dict[str, Any]] = None,
         dialect: str = "duckdb",
     ) -> str:
         """Build the full-query rewrite prompt.
@@ -66,13 +113,15 @@ class Prompter:
             full_sql: Complete original SQL query
             dag: Parsed DAG from Phase 1 (DagBuilder output)
             costs: Per-node cost analysis from CostAnalyzer
-            annotation: Phase 2 annotation result ({node: pattern} mapping)
             history: Previous attempts and promotion context for this query.
                      Dict with 'attempts' (list) and 'promotion' (PromotionAnalysis).
             examples: List of gold examples (FAISS-matched, up to 3)
             expert_analysis: Pre-computed LLM analyst output (analyst mode only).
-                             When present, replaces pattern hints + examples with
-                             concrete structural guidance.
+                             When present, replaces examples with concrete
+                             structural guidance.
+            global_learnings: Aggregate learnings from benchmark runs (from
+                              Learner.build_learning_summary()). Shows transform
+                              effectiveness, known anti-patterns, example success rates.
             dialect: SQL dialect for pretty-printing
         """
         sections = []
@@ -93,23 +142,26 @@ class Prompter:
         if history:
             sections.append(self._section_history(history))
 
+        # Section 5b: Global Learnings (EARLY-MID, after history)
+        if global_learnings:
+            gl_section = self._section_global_learnings(global_learnings)
+            if gl_section:
+                sections.append(gl_section)
+
         if expert_analysis:
-            # Analyst mode: inject the LLM analysis instead of pattern hints
+            # Analyst mode: inject the LLM analysis instead of examples
             # This gives the rewrite LLM concrete structural guidance
             sections.append(expert_analysis)
         else:
-            # Default mode: FAISS-matched gold examples + pattern hints
-            # Section 6: Pattern Hints (EARLY-MID)
-            sections.append(self._section_pattern_hints(annotation))
-
-            # Section 7: Examples (MIDDLE) — up to 3 FAISS-matched
+            # Default mode: FAISS-matched gold examples
+            # Section 6: Examples (MIDDLE) — up to 3 FAISS-matched
             if examples:
                 sections.append(self._section_examples(examples))
 
-        # Section 8: Constraints (LATE-MID, sandwich ordered)
+        # Section 7: Constraints (LATE-MID, sandwich ordered)
         sections.append(self._section_constraints())
 
-        # Section 9: Output Format (RECENCY)
+        # Section 8: Output Format (RECENCY)
         sections.append(self._section_output_format())
 
         return "\n\n".join(sections)
@@ -129,7 +181,8 @@ class Prompter:
             "same ordering).\n"
             "\n"
             "You will receive the full query, its DAG structure showing how CTEs and\n"
-            "subqueries connect, cost analysis per node, and suggested rewrite patterns.\n"
+            "subqueries connect, cost analysis per node, and reference examples of\n"
+            "proven rewrites on structurally similar queries.\n"
             "You may restructure the query freely: create new CTEs, merge existing ones,\n"
             "push filters across node boundaries, or decompose subqueries."
         )
@@ -149,8 +202,7 @@ class Prompter:
     @staticmethod
     def _build_dag_comments(dag: Any, costs: Dict[str, Any]) -> str:
         """Build DAG topology as SQL comments to embed in the query."""
-        from .annotator import Annotator
-        depths = Annotator._compute_depths(dag)
+        depths = compute_depths(dag)
 
         lines = ["-- DAG TOPOLOGY"]
 
@@ -333,28 +385,94 @@ class Prompter:
         return "\n".join(lines)
 
     @staticmethod
-    def _section_pattern_hints(annotation: AnnotationResult) -> str:
-        """Section 6: Pattern Hints from Phase 2 annotation."""
-        lines = ["## Suggested Rewrite Strategy", ""]
+    def _section_global_learnings(learnings: Dict[str, Any]) -> str:
+        """Section 5b: Global learnings from benchmark runs.
 
-        if not annotation.rewrites:
-            lines.append("No specific patterns identified. Use your judgment.")
-            return "\n".join(lines)
+        Shows transform effectiveness, known anti-patterns, and example
+        success rates to help the LLM make informed rewrite choices.
+        """
+        if not learnings or not learnings.get("total_attempts"):
+            return ""
 
-        lines.append(
-            "Phase 2 analysis identified these optimization opportunities:"
-        )
-        lines.append("")
+        lines = ["## Benchmark Learnings", ""]
 
-        for ann in annotation.rewrites:
-            lines.append(f"- **{ann.node_id}** → apply **{ann.pattern}**")
-            lines.append(f"  {ann.rationale}")
+        # Transform effectiveness (top transforms by success rate + avg speedup)
+        transform_eff = learnings.get("transform_effectiveness", {})
+        if transform_eff:
+            # Sort by avg_speedup descending, filter to those with >= 2 attempts
+            ranked = sorted(
+                [
+                    (name, stats)
+                    for name, stats in transform_eff.items()
+                    if stats.get("attempts", 0) >= 2
+                ],
+                key=lambda x: -x[1].get("avg_speedup", 0),
+            )
 
-        if annotation.skipped:
+            if ranked:
+                lines.append("### Effective Transforms")
+                for name, stats in ranked[:8]:
+                    rate = stats.get("success_rate", 0)
+                    avg = stats.get("avg_speedup", 0)
+                    n = stats.get("attempts", 0)
+                    lines.append(
+                        f"- **{name}**: {rate:.0%} success rate, "
+                        f"{avg:.2f}x avg speedup ({n} attempts)"
+                    )
+                lines.append("")
+
+            # Known anti-patterns: transforms with low success rate or low speedup
+            anti = [
+                (name, stats)
+                for name, stats in transform_eff.items()
+                if stats.get("attempts", 0) >= 2
+                and stats.get("success_rate", 1) < 0.3
+            ]
+            if anti:
+                lines.append("### Known Anti-Patterns (avoid these)")
+                for name, stats in anti:
+                    rate = stats.get("success_rate", 0)
+                    n = stats.get("attempts", 0)
+                    lines.append(
+                        f"- **{name}**: {rate:.0%} success rate "
+                        f"({n} attempts) — usually causes regressions"
+                    )
+                lines.append("")
+
+        # Example effectiveness
+        example_eff = learnings.get("example_effectiveness", {})
+        if example_eff:
+            ranked_ex = sorted(
+                [
+                    (name, stats)
+                    for name, stats in example_eff.items()
+                    if stats.get("times_recommended", 0) >= 2
+                ],
+                key=lambda x: -x[1].get("effectiveness", 0),
+            )
+            if ranked_ex:
+                lines.append("### Example Effectiveness")
+                for name, stats in ranked_ex[:6]:
+                    eff = stats.get("effectiveness", 0)
+                    n = stats.get("times_recommended", 0)
+                    lines.append(
+                        f"- **{name}**: {eff:.0%} led to success "
+                        f"({n} recommendations)"
+                    )
+                lines.append("")
+
+        # Error patterns summary
+        error_patterns = learnings.get("error_patterns", {})
+        if error_patterns:
+            lines.append("### Common Error Patterns")
+            for category, info in error_patterns.items():
+                count = info.get("count", 0)
+                lines.append(f"- **{category}**: {count} occurrences")
             lines.append("")
-            lines.append("Nodes not flagged (low cost or no opportunity):")
-            for sk in annotation.skipped:
-                lines.append(f"- {sk.node_id}: {sk.reason}")
+
+        # Only return if we have content beyond the header
+        if len(lines) <= 2:
+            return ""
 
         return "\n".join(lines)
 
@@ -377,8 +495,13 @@ class Prompter:
 
             ex = example.get("example", example)
 
-            # BEFORE (slow)
-            before_sql = ex.get("input_slice") or ex.get("before_sql", "")
+            # BEFORE (slow) — prefer complete original_sql over abbreviated input_slice
+            before_sql = (
+                example.get("original_sql")
+                or ex.get("before_sql")
+                or ex.get("input_slice")
+                or ""
+            )
             if not before_sql:
                 inp = example.get("input", {})
                 before_sql = inp.get("sql", "")
@@ -414,44 +537,42 @@ class Prompter:
 
     @staticmethod
     def _section_constraints() -> str:
-        """Section 8: Constraints (sandwich ordered)."""
-        return (
-            "## Constraints\n"
-            "\n"
-            "### CRITICAL — Correctness Guards (top of sandwich)\n"
-            "\n"
-            "**SEMANTIC_EQUIVALENCE**\n"
-            "The rewritten query MUST return exactly the same rows, columns, and\n"
-            "ordering as the original. This is the prime directive.\n"
-            "\n"
-            "**LITERAL_PRESERVATION**\n"
-            "Keep all literal values (dates, strings, numbers) exactly as they appear in\n"
-            "the original SQL. Do not round, truncate, or reformat them.\n"
-            "\n"
-            "### HIGH — Performance and Style Rules (middle of sandwich)\n"
-            "\n"
-            "**NO_UNFILTERED_DIM_CTE**\n"
-            "When creating a new CTE that scans a dimension table, include at least one\n"
-            "filter predicate. Never materialize an entire dimension without a WHERE clause.\n"
-            "\n"
-            "**OR_TO_UNION_LIMIT**\n"
-            "When converting OR predicates to UNION ALL, limit to 4 branches maximum.\n"
-            "Beyond 4, the UNION overhead exceeds the OR scan cost for most planners.\n"
-            "\n"
-            "**EXPLICIT_JOINS**\n"
-            "Convert comma-separated implicit joins to explicit JOIN ... ON syntax.\n"
-            "This gives the optimizer better join-order freedom.\n"
-            "\n"
-            "### CRITICAL — Correctness Guards (bottom of sandwich)\n"
-            "\n"
-            "**KEEP_EXISTS_AS_EXISTS**\n"
-            "Preserve EXISTS/NOT EXISTS subqueries as-is. Do not convert them to\n"
-            "IN/NOT IN or to JOINs — this risks NULL-handling semantic changes.\n"
-            "\n"
-            "**COMPLETE_OUTPUT**\n"
-            "The rewritten query must output ALL columns from the original SELECT.\n"
-            "Never drop, rename, or reorder output columns."
-        )
+        """Section 8: Constraints (sandwich ordered).
+
+        Loads constraints from ado/constraints/*.json and groups by severity:
+        - CRITICAL at top and bottom (sandwich pattern for attention)
+        - HIGH + MEDIUM in the middle
+        """
+        constraints = _load_constraint_files()
+
+        critical = [c for c in constraints if c.get("severity") == "CRITICAL"]
+        high = [c for c in constraints if c.get("severity") == "HIGH"]
+        medium = [c for c in constraints if c.get("severity") == "MEDIUM"]
+
+        lines = ["## Constraints", ""]
+
+        # Top sandwich: CRITICAL
+        if critical:
+            lines.append("### CRITICAL — Correctness Guards (top of sandwich)")
+            for c in critical:
+                lines.append(f"\n**{c['id']}**")
+                lines.append(c.get("prompt_instruction", c.get("description", "")))
+
+        # Middle: HIGH + MEDIUM
+        if high or medium:
+            lines.append("\n### HIGH — Performance and Style Rules (middle of sandwich)")
+            for c in high + medium:
+                lines.append(f"\n**{c['id']}**")
+                lines.append(c.get("prompt_instruction", c.get("description", "")))
+
+        # Bottom sandwich: repeat CRITICAL IDs
+        if critical:
+            lines.append("\n### CRITICAL — Correctness Guards (bottom of sandwich)")
+            for c in critical:
+                lines.append(f"\n**{c['id']}**")
+                lines.append(c.get("prompt_instruction", c.get("description", "")))
+
+        return "\n".join(lines)
 
     @staticmethod
     def _section_output_format() -> str:

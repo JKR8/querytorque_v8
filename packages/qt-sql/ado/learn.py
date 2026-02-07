@@ -322,3 +322,91 @@ class Learner:
 
         logger.info(f"Saved learning summary: {filepath}")
         return filepath
+
+    def generate_benchmark_history(self, benchmark_dir: Path) -> Path:
+        """Generate history.json with cumulative_learnings for the analyst.
+
+        Creates the structure the analyst expects:
+        {
+            "cumulative_learnings": {
+                "effective_patterns": { ... },
+                "known_regressions": { ... }
+            }
+        }
+
+        Also loads constraint files to extract known regression examples.
+
+        Args:
+            benchmark_dir: Benchmark directory to write history.json into.
+
+        Returns:
+            Path to the generated history.json file.
+        """
+        summary = self.build_learning_summary()
+        if not summary:
+            return None
+
+        # Build effective_patterns from transform effectiveness
+        effective_patterns = {}
+        transform_eff = summary.get("transform_effectiveness", {})
+        for name, stats in transform_eff.items():
+            if stats.get("success_rate", 0) >= 0.3 and stats.get("avg_speedup", 0) >= 1.0:
+                effective_patterns[name] = {
+                    "wins": stats.get("successful_attempts", 0),
+                    "avg_speedup": round(stats.get("avg_speedup", 0), 2),
+                    "success_rate": round(stats.get("success_rate", 0), 2),
+                    "attempts": stats.get("attempts", 0),
+                }
+
+        # Build known_regressions from:
+        # 1. Low success rate transforms
+        # 2. Constraint files with observed_failures
+        known_regressions = {}
+
+        # From learning records: transforms that mostly fail
+        for name, stats in transform_eff.items():
+            if (
+                stats.get("attempts", 0) >= 2
+                and stats.get("success_rate", 1) < 0.3
+            ):
+                known_regressions[name] = (
+                    f"{stats['success_rate']:.0%} success rate over "
+                    f"{stats['attempts']} attempts"
+                )
+
+        # From constraint files: extract observed failures
+        constraints_dir = Path(__file__).resolve().parent / "constraints"
+        if constraints_dir.exists():
+            for path in constraints_dir.glob("*.json"):
+                try:
+                    data = json.loads(path.read_text())
+                    for failure in data.get("observed_failures", []):
+                        query = failure.get("query", "")
+                        regression = failure.get("regression", "")
+                        problem = failure.get("problem", "")
+                        if regression and problem:
+                            key = f"{data['id']}_{query}" if query else data["id"]
+                            known_regressions[key] = (
+                                f"{regression}. {problem}" if regression else problem
+                            )
+                except Exception:
+                    continue
+
+        history = {
+            "cumulative_learnings": {
+                "effective_patterns": effective_patterns,
+                "known_regressions": known_regressions,
+            },
+            "summary": {
+                "total_attempts": summary.get("total_attempts", 0),
+                "pass_rate": round(summary.get("pass_rate", 0), 3),
+                "avg_speedup": round(summary.get("avg_speedup", 0), 3),
+            },
+        }
+
+        filepath = Path(benchmark_dir) / "history.json"
+        with open(filepath, 'w') as f:
+            json.dump(history, f, indent=2)
+
+        logger.info(f"Generated benchmark history: {filepath}")
+        return filepath

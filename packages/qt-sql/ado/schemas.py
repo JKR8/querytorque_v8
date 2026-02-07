@@ -2,8 +2,7 @@
 
 Data structures for the ADO pipeline:
 - Validation: ValidationStatus, ValidationResult
-- Pipeline: BenchmarkConfig, EdgeContract, NodeAnnotation, AnnotationResult,
-  NodeRewriteResult, PipelineResult
+- Pipeline: BenchmarkConfig, EdgeContract, NodeRewriteResult, PipelineResult
 """
 
 from __future__ import annotations
@@ -84,28 +83,6 @@ class EdgeContract:
 
 
 @dataclass
-class NodeAnnotation:
-    """Phase 2 annotation for a single node."""
-    node_id: str
-    pattern: str
-    rationale: str
-
-
-@dataclass
-class SkippedNode:
-    """A node skipped by Phase 2 annotation."""
-    node_id: str
-    reason: str
-
-
-@dataclass
-class AnnotationResult:
-    """Result from Phase 2 annotation."""
-    rewrites: List[NodeAnnotation]
-    skipped: List[SkippedNode]
-
-
-@dataclass
 class NodeRewriteResult:
     """Result from rewriting a single node in Phase 3."""
     node_id: str
@@ -169,6 +146,5 @@ class PipelineResult:
     optimized_sql: str
     nodes_rewritten: List[str] = field(default_factory=list)
     transforms_applied: List[str] = field(default_factory=list)
-    annotation: Optional[AnnotationResult] = None
     prompt: Optional[str] = None
     analysis: Optional[str] = None  # LLM analyst output (only when use_analyst=True)

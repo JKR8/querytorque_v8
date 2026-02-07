@@ -54,7 +54,7 @@ class ADORunner:
 
     Thin wrapper around Pipeline that provides a simplified interface.
     All optimization flows through the 5-phase DAG pipeline:
-    1. Parse → 2. Annotate → 3. Rewrite → 4. Reassemble → 5. Validate
+    1. Parse → 2. FAISS → 3. Rewrite → 4. Syntax Gate → 5. Validate
     """
 
     def __init__(self, config: ADOConfig):
@@ -126,6 +126,67 @@ class ADORunner:
             if progress_callback:
                 progress_callback(query_id, result)
         return results
+
+    def run_analyst(
+        self,
+        query_id: str,
+        sql: str,
+        max_iterations: int = 5,
+        target_speedup: float = 1.5,
+        n_workers: int = 3,
+    ) -> ADOResult:
+        """Run deep-dive analyst mode on a single query.
+
+        Iteratively optimizes from the ORIGINAL SQL with full history
+        across iterations. Uses the LLM analyst for structural guidance.
+
+        Args:
+            query_id: Query identifier (e.g., 'query_88')
+            sql: Original SQL query
+            max_iterations: Max optimization rounds
+            target_speedup: Stop early when this speedup is reached
+            n_workers: Parallel workers per iteration
+
+        Returns:
+            ADOResult with the best iteration's outcome
+        """
+        session = self.pipeline.run_analyst_session(
+            query_id=query_id,
+            sql=sql,
+            max_iterations=max_iterations,
+            target_speedup=target_speedup,
+            n_workers=n_workers,
+        )
+        best = session._best_iteration()
+        if best is None:
+            return ADOResult(
+                query_id=query_id,
+                status="ERROR",
+                speedup=0.0,
+                optimized_sql=sql,
+                original_sql=sql,
+                transforms=[],
+                attempts=0,
+            )
+
+        return ADOResult(
+            query_id=query_id,
+            status=best.status,
+            speedup=best.speedup,
+            optimized_sql=best.optimized_sql,
+            original_sql=session.original_sql,
+            transforms=best.transforms,
+            attempts=len(session.iterations),
+            all_validations=[
+                {
+                    "iteration": it.iteration,
+                    "status": it.status,
+                    "speedup": it.speedup,
+                    "transforms": it.transforms,
+                }
+                for it in session.iterations
+            ],
+        )
 
     def promote(self, state_num: int) -> str:
         """Promote winners from state_N → state_N+1."""

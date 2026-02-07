@@ -204,8 +204,8 @@ def _append_dag_analysis(
     costs: Dict[str, Any],
 ) -> None:
     """Append DAG structure with costs to the analysis prompt."""
-    from .annotator import Annotator
-    depths = Annotator._compute_depths(dag)
+    from .node_prompter import compute_depths
+    depths = compute_depths(dag)
 
     max_depth = max(depths.values()) if depths else 0
     for depth in range(max_depth + 1):

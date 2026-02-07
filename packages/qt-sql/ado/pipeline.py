@@ -1,8 +1,8 @@
-"""5-phase DAG pipeline orchestrator.
+"""ADO pipeline orchestrator.
 
 Phases:
 1. Parse:     SQL → DAG (deterministic, DagBuilder)
-2. Annotate:  DAG → {node: pattern} (1 LLM call, Annotator)
+2. Retrieve:  FAISS example matching (engine-specific)
 3. Rewrite:   Full-query prompt with DAG topology (N parallel workers)
 4. Validate:  Syntax check (deterministic)
 5. Validate:  Timing + correctness (3-run or 5-run)
@@ -20,11 +20,9 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .annotator import Annotator
 from .learn import Learner
 from .node_prompter import Prompter
 from .schemas import (
-    AnnotationResult,
     BenchmarkConfig,
     PipelineResult,
     PromotionAnalysis,
@@ -35,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 class Pipeline:
-    """5-phase DAG pipeline with contract propagation and state management."""
+    """ADO pipeline with FAISS example retrieval, LLM rewrite, and validation."""
 
     def __init__(
         self,
@@ -43,7 +41,6 @@ class Pipeline:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         analyze_fn=None,
-        annotate_with_llm: bool = False,
         use_analyst: bool = False,
     ):
         """Load config.json from benchmark dir, initialize components.
@@ -53,7 +50,6 @@ class Pipeline:
             provider: LLM provider for generation
             model: LLM model name
             analyze_fn: Optional custom LLM function
-            annotate_with_llm: If True, Phase 2 uses LLM. Default False (heuristic).
             use_analyst: If True, runs LLM analyst before rewrite (costs 1 extra
                          API call per query). Use for stubborn queries only.
         """
@@ -65,13 +61,9 @@ class Pipeline:
         self.provider = provider
         self.model = model
         self.analyze_fn = analyze_fn
-        self.annotate_with_llm = annotate_with_llm
         self.use_analyst = use_analyst
 
         # Initialize pipeline components
-        self.annotator = Annotator(
-            provider=provider, model=model, analyze_fn=analyze_fn
-        )
         self.prompter = Prompter()
         self.learner = Learner(
             journal_dir=self.benchmark_dir / "learning"
@@ -102,60 +94,6 @@ class Pipeline:
         costs = cost_analyzer.analyze()
 
         return dag, costs
-
-    # =========================================================================
-    # Phase 2: Annotate → {node: pattern}
-    # =========================================================================
-
-    def _annotate(self, dag, costs) -> AnnotationResult:
-        """Phase 2: Get pattern assignments from annotator.
-
-        Uses heuristic by default. Set annotate_with_llm=True on Pipeline
-        to use LLM annotation (costs 1 API call per query).
-        """
-        available_patterns = self._get_available_patterns()
-        return self.annotator.annotate(
-            dag, costs, available_patterns, use_llm=self.annotate_with_llm,
-        )
-
-    def _get_available_patterns(self) -> List[str]:
-        """Get list of available pattern names from gold examples + seed rules.
-
-        Searches:
-        1. ado/examples/<engine>/  (gold verified for this DB)
-        2. ado/examples/*/         (gold for other DBs)
-        3. state_0/seed/           (unverified catalog rules)
-        """
-        patterns = set()
-        base = Path(__file__).resolve().parent
-        examples_dir = base / "examples"
-
-        # Map engine to example subdir
-        engine_dir = (
-            "postgres"
-            if self.config.engine in ("postgresql", "postgres")
-            else self.config.engine
-        )
-
-        # Gold examples for this DB first
-        primary = examples_dir / engine_dir
-        if primary.exists():
-            for p in primary.glob("*.json"):
-                patterns.add(p.stem)
-
-        # Gold examples from other DBs
-        if examples_dir.exists():
-            for subdir in examples_dir.iterdir():
-                if subdir.is_dir() and subdir != primary:
-                    for p in subdir.glob("*.json"):
-                        patterns.add(p.stem)
-
-        # Seed rules from state_0
-        for seed_dir in self._seed_dirs:
-            for p in seed_dir.glob("*.json"):
-                patterns.add(p.stem)
-
-        return sorted(patterns)
 
     # =========================================================================
     # Phase 5: Validate
@@ -244,31 +182,11 @@ class Pipeline:
             f"{len(dag.edges)} edges"
         )
 
-        # Phase 2: Annotate
-        logger.info(f"[{query_id}] Phase 2: Annotating nodes")
-        annotation = self._annotate(dag, costs)
-        flagged = [a.node_id for a in annotation.rewrites]
-        logger.info(f"[{query_id}] Flagged for rewrite: {flagged}")
-
-        if not annotation.rewrites:
-            return PipelineResult(
-                query_id=query_id,
-                status="NEUTRAL",
-                speedup=1.0,
-                original_sql=sql,
-                optimized_sql=sql,
-                annotation=annotation,
-            )
-
-        # Phase 3: Build full-query prompt + generate rewrites
-        logger.info(f"[{query_id}] Phase 3: Generating {n_workers} candidates")
-
-        # FAISS: find structurally similar gold examples
+        # Phase 2: FAISS example retrieval
+        logger.info(f"[{query_id}] Phase 2: Finding FAISS examples")
         examples = self._find_examples(sql, engine=engine, k=3)
-        logger.info(
-            f"[{query_id}] FAISS examples: "
-            f"{[e.get('id', '?') for e in examples]}"
-        )
+        example_ids = [e.get('id', '?') for e in examples]
+        logger.info(f"[{query_id}] FAISS examples: {example_ids}")
 
         # Optional: LLM analyst (stubborn query mode)
         # Analyst sees FAISS picks and can swap them for better ones
@@ -285,17 +203,23 @@ class Pipeline:
                 engine=engine,
                 dialect=dialect,
             )
+            example_ids = [e.get('id', '?') for e in examples]
 
-        # Build full-query prompt with DAG topology
+        # Load global learnings from benchmark runs
+        global_learnings = self.learner.build_learning_summary() or None
+
+        # Phase 3: Build full-query prompt + generate rewrites
+        logger.info(f"[{query_id}] Phase 3: Generating {n_workers} candidates")
+
         prompt = self.prompter.build_prompt(
             query_id=query_id,
             full_sql=sql,
             dag=dag,
             costs=costs,
-            annotation=annotation,
             history=history,
             examples=examples,
             expert_analysis=expert_analysis,
+            global_learnings=global_learnings,
             dialect=dialect,
         )
 
@@ -310,14 +234,14 @@ class Pipeline:
         candidates = generator.generate(
             sql=sql,
             prompt=prompt,
-            examples_used=[a.pattern for a in annotation.rewrites],
+            examples_used=example_ids,
             n=n_workers,
             dialect=dialect,
         )
 
         # Pick best candidate
         optimized_sql = sql
-        transforms = [a.pattern for a in annotation.rewrites]
+        transforms = []
         if candidates:
             best = None
             for cand in candidates:
@@ -326,6 +250,7 @@ class Pipeline:
                     break
             if best:
                 optimized_sql = best.optimized_sql
+                transforms = best.transforms
 
         # Phase 4: Validate (syntax check)
         logger.info(f"[{query_id}] Phase 4: Syntax check")
@@ -348,9 +273,7 @@ class Pipeline:
             speedup=speedup,
             original_sql=sql,
             optimized_sql=optimized_sql,
-            nodes_rewritten=flagged,
             transforms_applied=transforms,
-            annotation=annotation,
             prompt=prompt,
             analysis=analysis_raw,
         )
@@ -360,12 +283,8 @@ class Pipeline:
             error_cat = "execution" if status == "ERROR" else None
             lr = self.learner.create_learning_record(
                 query_id=query_id,
-                examples_recommended=[
-                    a.pattern for a in annotation.rewrites
-                ],
-                transforms_recommended=[
-                    a.pattern for a in annotation.rewrites
-                ],
+                examples_recommended=example_ids,
+                transforms_recommended=example_ids,
                 status="pass" if status in ("WIN", "IMPROVED", "NEUTRAL") else "error",
                 speedup=speedup,
                 transforms_used=transforms,
@@ -474,10 +393,49 @@ class Pipeline:
         # Update top-level benchmark leaderboard
         self._update_benchmark_leaderboard(results)
 
-        # Save learning summary
+        # Save learning summary + generate history.json for analyst
         self.learner.save_learning_summary()
+        self.learner.generate_benchmark_history(self.benchmark_dir)
 
         return results
+
+    def run_analyst_session(
+        self,
+        query_id: str,
+        sql: str,
+        max_iterations: int = 5,
+        target_speedup: float = 1.5,
+        n_workers: int = 3,
+    ) -> "AnalystSession":
+        """Run iterative deep-dive optimization on a single query.
+
+        The analyst session runs multiple iterations, always optimizing from
+        the ORIGINAL SQL with full history of all previous attempts. Each
+        iteration uses the LLM analyst for structural guidance.
+
+        Args:
+            query_id: Query identifier (e.g., 'query_88')
+            sql: Original SQL query (never modified)
+            max_iterations: Max optimization rounds (default 5)
+            target_speedup: Stop early when this speedup is reached
+            n_workers: Parallel workers per iteration
+
+        Returns:
+            AnalystSession with all iterations and best result
+        """
+        from .analyst_session import AnalystSession
+
+        session = AnalystSession(
+            pipeline=self,
+            query_id=query_id,
+            original_sql=sql,
+            max_iterations=max_iterations,
+            target_speedup=target_speedup,
+            n_workers=n_workers,
+        )
+        session.run()
+        session.save_session()
+        return session
 
     def promote(self, state_num: int) -> str:
         """Create state_{N+1} from state_N with enriched promotion context.
