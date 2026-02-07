@@ -310,24 +310,84 @@ class AnalystSession:
         )
 
     def _build_iteration_history(self) -> Optional[Dict[str, Any]]:
-        """Build history dict from all previous analyst iterations.
+        """Build history dict from all previous iterations.
 
-        Each iteration becomes an 'attempt' with full SQL, status, speedup.
-        The best result so far gets special treatment via a PromotionAnalysis.
+        Includes BOTH:
+        1. Prior batch pipeline results from state_N/validation/ and leaderboard
+        2. Within-session analyst iterations
+
+        This ensures the first analyst iteration sees all prior batch results
+        (e.g., state_0 regressions) instead of starting with no history.
         """
-        if not self.iterations:
-            return None
-
         attempts = []
+
+        # Load prior batch results from state_N/validation/ directories
+        benchmark_dir = self.pipeline.benchmark_dir
+        for state_dir in sorted(benchmark_dir.glob("state_*")):
+            if not state_dir.is_dir():
+                continue
+            state_num = state_dir.name.split("_")[-1]
+            val_dir = state_dir / "validation"
+            if not val_dir.exists():
+                continue
+            # Try both naming conventions (q51 vs query_51)
+            for variant in [self.query_id, self.query_id.replace("query_", "q"),
+                            self.query_id.replace("q", "query_")]:
+                val_path = val_dir / f"{variant}.json"
+                if val_path.exists():
+                    try:
+                        data = json.loads(val_path.read_text())
+                        attempts.append({
+                            "state": int(state_num),
+                            "source": f"state_{state_num}",
+                            "status": data.get("status", "unknown"),
+                            "speedup": data.get("speedup", 0),
+                            "transforms": data.get("transforms_applied", []),
+                            "original_sql": data.get("original_sql", ""),
+                            "optimized_sql": data.get("optimized_sql", ""),
+                        })
+                    except Exception:
+                        pass
+                    break
+
+        # Load from leaderboard (may have analyst_mode results from prior sessions)
+        lb_path = benchmark_dir / "leaderboard.json"
+        if lb_path.exists():
+            try:
+                lb = json.loads(lb_path.read_text())
+                queries = lb.get("queries", lb) if isinstance(lb, dict) else lb
+                if isinstance(queries, list):
+                    existing_sources = {a.get("source") for a in attempts}
+                    for q in queries:
+                        qid = q.get("query_id", "")
+                        if qid in (self.query_id,
+                                   self.query_id.replace("query_", "q"),
+                                   self.query_id.replace("q", "query_")):
+                            source = q.get("source", "state_0")
+                            if source not in existing_sources:
+                                attempts.append({
+                                    "source": source,
+                                    "status": q.get("status", "unknown"),
+                                    "speedup": q.get("speedup", 0),
+                                    "transforms": q.get("transforms", []),
+                                })
+            except Exception:
+                pass
+
+        # Add within-session analyst iterations
         for it in self.iterations:
             attempts.append({
                 "state": it.iteration,
+                "source": f"analyst_iter_{it.iteration}",
                 "status": it.status,
                 "speedup": it.speedup,
                 "transforms": it.transforms,
                 "original_sql": it.original_sql,
                 "optimized_sql": it.optimized_sql,
             })
+
+        if not attempts:
+            return None
 
         history = {"attempts": attempts, "promotion": None}
 

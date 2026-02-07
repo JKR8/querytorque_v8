@@ -99,6 +99,64 @@ def save(name, content):
 save("00_input.sql", sql)
 save("01_faiss_examples.json", json.dumps(faiss_examples, indent=2))
 
+# ── Load history (what was already tried for this query) ──────
+def load_query_history(query_id: str) -> dict:
+    """Load prior attempts for this query from all sources."""
+    attempts = []
+
+    # Source 1: state_N validation directories
+    for state_dir in sorted(BENCHMARK_DIR.glob("state_*")):
+        if not state_dir.is_dir():
+            continue
+        state_num = state_dir.name.split("_")[-1]
+        # Try both naming conventions: q51 and query_51
+        for variant in [query_id, query_id.replace("query_", "q")]:
+            val_path = state_dir / "validation" / f"{variant}.json"
+            if val_path.exists():
+                data = json.loads(val_path.read_text())
+                attempts.append({
+                    "state": int(state_num),
+                    "source": f"state_{state_num}",
+                    "status": data.get("status", "unknown"),
+                    "speedup": data.get("speedup", 0),
+                    "transforms": data.get("transforms_applied", []),
+                    "error": data.get("error", ""),
+                })
+                break
+
+    # Source 2: leaderboard (may have analyst_mode results)
+    lb_path = BENCHMARK_DIR / "leaderboard.json"
+    if lb_path.exists():
+        lb = json.loads(lb_path.read_text())
+        queries = lb.get("queries", lb) if isinstance(lb, dict) else lb
+        if isinstance(queries, list):
+            for q in queries:
+                qid = q.get("query_id", "")
+                if qid in (query_id, query_id.replace("query_", "q")):
+                    source = q.get("source", "state_0")
+                    # Only add if not already captured from state validation
+                    if source != "state_0" or not attempts:
+                        existing_sources = {a.get("source") for a in attempts}
+                        if source not in existing_sources:
+                            attempts.append({
+                                "source": source,
+                                "status": q.get("status", "unknown"),
+                                "speedup": q.get("speedup", 0),
+                                "transforms": q.get("transforms", []),
+                            })
+
+    if not attempts:
+        return None
+
+    logger.info(f"Loaded history: {len(attempts)} prior attempts")
+    for a in attempts:
+        logger.info(f"  {a.get('source','?')}: {a.get('status','?')} "
+                     f"{a.get('speedup',0):.2f}x [{', '.join(a.get('transforms',[]))}]")
+
+    return {"attempts": attempts, "promotion": None}
+
+history = load_query_history(query_id)
+
 # ── Analyst prompt ─────────────────────────────────────────────
 from ado.analyst import build_analysis_prompt
 
@@ -107,7 +165,7 @@ analyst_prompt = build_analysis_prompt(
     sql=sql,
     dag=dag,
     costs=costs,
-    history=None,
+    history=history,
     faiss_picks=faiss_picks,
     available_examples=available_examples,
     dialect=DIALECT,
@@ -150,7 +208,7 @@ rewrite_prompt = prompter.build_prompt(
     full_sql=sql,
     dag=dag,
     costs=costs,
-    history=None,
+    history=history,
     examples=examples_to_use,
     expert_analysis=formatted,
     dialect=DIALECT,

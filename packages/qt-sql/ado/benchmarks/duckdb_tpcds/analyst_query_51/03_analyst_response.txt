@@ -1,67 +1,147 @@
 ## 1. STRUCTURAL BREAKDOWN
 
-**web_v1**: Computes daily cumulative sales for web items over a 12-month period. Scans `web_sales` (large fact table) and `date_dim` (dimension), outputs ~1k rows (item_sk, d_date, cumulative sum).
+**web_v1 CTE:**
+- Computes cumulative sales per item over time from web_sales for a 12-month period.
+- Scans web_sales (large fact table) and date_dim (dimension), filters to ~1k rows after grouping.
+- Outputs (item_sk, d_date, cume_sales) ordered by item_sk, d_date.
 
-**store_v1**: Computes daily cumulative sales for store items over the same 12-month period. Scans `store_sales` (large fact table) and `date_dim` (dimension), outputs ~1k rows (item_sk, d_date, cumulative sum).
+**store_v1 CTE:**
+- Computes cumulative sales per item over time from store_sales for the same 12-month period.
+- Scans store_sales (large fact table) and date_dim (dimension), filters to ~1k rows after grouping.
+- Outputs (item_sk, d_date, cume_sales) ordered by item_sk, d_date.
 
-**main_query**: FULL OUTER JOINs the two CTEs, computes running maximums of cumulative sales per item/date, filters where web exceeds store, orders, and limits to 100 rows. Processes ~1k rows from each CTE.
+**main_query:**
+- FULL OUTER JOINs web_v1 and store_v1 on (item_sk, d_date), computes cumulative max of both sales streams, filters where web cumulative exceeds store cumulative.
+- Processes ~1k rows from the join, applies two window functions, outputs top 100 rows.
+- Final output ordered by item_sk, d_date.
 
 ## 2. BOTTLENECK IDENTIFICATION
 
-The dominant cost center is **scanning the same dimension table (`date_dim`) twice** in independent CTEs. Each CTE performs:
-1. Full scan of `date_dim` with filter `d_month_seq BETWEEN 1216 AND 1227`
-2. Hash join with large fact tables (`web_sales`/`store_sales`)
-3. Hash aggregation + window function
+The dominant cost is **redundant full table scans and window function computations**. Both CTEs independently scan large fact tables (web_sales, store_sales) with the same date filter, perform identical grouping, and compute windowed cumulative sums. This causes:
 
-The **mechanism**: Duplicated dimension filtering and joining. Both CTEs apply identical date filters to `date_dim` but execute independently, causing:
-- Redundant `date_dim` scans (twice)
-- Redundant hash join build sides for the same filtered dimension data
-- Missed opportunity to share filtered dimension results
+1. **Duplicate date_dim processing**: The same date filter (d_month_seq BETWEEN 1216 AND 1227) is applied twice via joins, scanning date_dim multiple times.
+2. **Premature window computation**: The cumulative sum (SUM OVER) is computed in each CTE before the join, but the main query then computes cumulative max (MAX OVER) on these results. This results in **two separate window computations per CTE** (one in CTE, one in main) with the same partitioning/ordering.
+3. **Inefficient join ordering**: The current structure prevents predicate pushdown into the fact tables, forcing full scans before filtering.
 
-Since CTEs are independent, DuckDB cannot push the filter optimization across CTEs, forcing complete re-execution.
+The mechanism is: **Multiple passes over large fact tables with identical filters, plus redundant window function sorting on the same keys**.
 
 ## 3. PROPOSED OPTIMIZATION
 
-**Change 1**: Extract shared date filter into a CTE
-- **What**: Create `date_filtered AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1216 AND 1216+11)` and reference it in both `web_v1` and `store_v1`
-- **Why**: Eliminates duplicate `date_dim` scans and redundant hash join build sides. Filter applied once, result reused.
-- **Risk**: Must ensure `date_dim` filter semantics remain identical (`BETWEEN` inclusive). No change to join logic.
-- **Estimated impact**: Significant (reduces dimension processing by 50%)
+**Change 1: Shared filtered date_dim CTE + early fact table filtering**
+- **What**: Create a CTE `filtered_dates` with date_dim rows for the 12-month period, then join with fact tables in web_v1/store_v1.
+- **Why**: Enables predicate pushdown, reduces fact table scans to relevant rows only, and shares date filtering logic.
+- **Risk**: Must ensure NULL handling on item_sk filters remains correct.
+- **Impact**: Significant (reduces largest table scans).
 
-**Change 2**: Defer window aggregation to main query
-- **What**: In CTEs, compute only daily aggregates (SUM without window). Move cumulative sum and running max to later stage.
-- **Why**: Avoids computing cumulative sums for items/dates that may be filtered out after join. Reduces window function overhead.
-- **Risk**: Must maintain correct NULL handling in FULL OUTER JOIN and window ordering.
-- **Estimated impact**: Moderate (reduces early window computation)
+**Change 2: Defer window aggregation to post-join**
+- **What**: Modify CTEs to compute only daily sales (GROUP BY item_sk, d_date), then compute cumulative sums and cumulative max in a single pass after the join.
+- **Why**: Eliminates duplicate window computations (cumulative sum in CTE + cumulative max in main) and reduces sorting operations from three to one.
+- **Risk**: Must handle NULLs correctly in FULL OUTER JOIN when computing cumulative sums separately for web/store.
+- **Impact**: Moderate (reduces window function overhead).
 
-**Change 3**: Convert FULL OUTER JOIN to UNION ALL + pivot
-- **What**: Instead of joining, union daily aggregates with channel flag, then pivot with conditional aggregation.
-- **Why**: Eliminates expensive outer join on composite key (item_sk, d_date). More efficient for sparse data.
-- **Risk**: Must handle NULLs correctly when one channel lacks data for a date.
-- **Estimated impact**: Moderate (avoids hash join on two CTEs)
+**Change 3: Merge date filtering and fact table joins into single-pass CTEs**
+- **What**: Combine filtered_dates CTE with each fact table join, removing the redundant date_dim scans.
+- **Why**: Reduces join cardinality early and leverages DuckDB's join optimizations.
+- **Risk**: Semantic equivalence must be preserved; the same date range must apply to both channels.
+- **Impact**: Moderate (optimizes join performance).
+
+## 4. FAILURE ANALYSIS
+
+**Previous attempt: date_cte_isolate (REGRESSION 0.87x)**
+- **Why it failed**: Likely because the CTE materialization prevented join reordering or predicate pushdown that DuckDB's optimizer could otherwise achieve. Isolating date_dim into a CTE may have forced a materialized subplan that blocked efficient join strategies (e.g., hash join with fact table as probe side).
+- **Lesson**: Simple CTE isolation without reconsidering the entire flow can inhibit optimizations. We need a holistic restructuring that maintains optimization opportunities while reducing redundant work.
 
 ## 5. RECOMMENDED STRATEGY
 
-**Primary optimization**: Implement **shared_dimension_multi_channel** pattern. Create a pre-filtered `date_filtered` CTE containing only the 12-month date range, then join it separately with `web_sales` and `store_sales` in their respective CTEs. This eliminates duplicate dimension scanning and allows predicate pushdown.
+Implement a combined optimization that:
+1. **Create a shared filtered date_dim CTE** (`filtered_dates`) containing only the 12-month range rows.
+2. **Rewrite web_v1/store_v1 CTEs** to:
+   - Join `filtered_dates` with the respective fact table (web_sales/store_sales) on the date key.
+   - Apply the non-NULL item_sk filter.
+   - Group by item_sk, d_date to compute **daily sales only** (not cumulative sums).
+3. **In the main query**:
+   - Perform FULL OUTER JOIN of the daily sales CTEs.
+   - Compute cumulative sums (SUM OVER) for web and store sales separately in a single CTE.
+   - Compute cumulative max (MAX OVER) on these cumulative sums in the same or subsequent CTE.
+   - Apply filter and limit.
 
-**Secondary optimization**: Apply **early_filter** to the date dimension before any joins. The filtered date CTE should be small and can be hash-joined efficiently with both fact tables.
+This approach ensures:
+- Date filtering happens once and is pushed down.
+- Window functions are computed only once, after the join, with a single sort per item_sk.
+- The plan is more amenable to DuckDB's join optimizations.
 
-**Implementation steps**:
-1. Create `date_filtered` CTE with `d_date_sk, d_date` for the 12-month range
-2. Modify `web_v1` and `store_v1` to join with `date_filtered` instead of `date_dim`
-3. Keep window functions as-is initially (simplest correctness)
-4. Test for semantic equivalence (same 100-row output)
-
-This approach directly attacks the root cause of duplicate dimension processing while maintaining query correctness.
+**Implementation sketch**:
+```sql
+WITH filtered_dates AS (
+  SELECT d_date_sk, d_date
+  FROM date_dim
+  WHERE d_month_seq BETWEEN 1216 AND 1216 + 11
+),
+web_daily AS (
+  SELECT ws_item_sk AS item_sk, d.d_date, SUM(ws_sales_price) AS daily_sales
+  FROM web_sales
+  JOIN filtered_dates d ON ws_sold_date_sk = d.d_date_sk
+  WHERE ws_item_sk IS NOT NULL
+  GROUP BY ws_item_sk, d.d_date
+),
+store_daily AS (
+  SELECT ss_item_sk AS item_sk, d.d_date, SUM(ss_sales_price) AS daily_sales
+  FROM store_sales
+  JOIN filtered_dates d ON ss_sold_date_sk = d.d_date_sk
+  WHERE ss_item_sk IS NOT NULL
+  GROUP BY ss_item_sk, d.d_date
+),
+joined AS (
+  SELECT
+    COALESCE(w.item_sk, s.item_sk) AS item_sk,
+    COALESCE(w.d_date, s.d_date) AS d_date,
+    w.daily_sales AS web_daily,
+    s.daily_sales AS store_daily
+  FROM web_daily w
+  FULL OUTER JOIN store_daily s
+    ON w.item_sk = s.item_sk AND w.d_date = s.d_date
+),
+cumulative AS (
+  SELECT
+    item_sk,
+    d_date,
+    SUM(web_daily) OVER (PARTITION BY item_sk ORDER BY d_date
+                         ROWS UNBOUNDED PRECEDING) AS web_cume,
+    SUM(store_daily) OVER (PARTITION BY item_sk ORDER BY d_date
+                           ROWS UNBOUNDED PRECEDING) AS store_cume
+  FROM joined
+),
+final AS (
+  SELECT
+    item_sk,
+    d_date,
+    web_cume,
+    store_cume,
+    MAX(web_cume) OVER (PARTITION BY item_sk ORDER BY d_date
+                        ROWS UNBOUNDED PRECEDING) AS web_cumulative,
+    MAX(store_cume) OVER (PARTITION BY item_sk ORDER BY d_date
+                          ROWS UNBOUNDED PRECEDING) AS store_cumulative
+  FROM cumulative
+)
+SELECT *
+FROM final
+WHERE web_cumulative > store_cumulative
+ORDER BY item_sk, d_date
+LIMIT 100;
+```
 
 ## 6. EXAMPLE SELECTION
 
-FAISS picks are **excellent** for this query:
+**FAISS picks are appropriate**:
+- `deferred_window_aggregation`: Directly addresses the redundant window functions.
+- `early_filter`: Optimizes the fact table scans via predicate pushdown.
+- `shared_dimension_multi_channel`: Captures sharing date_dim across multiple fact tables.
 
-- **shared_dimension_multi_channel**: Directly addresses shared date filtering across web/store channels
-- **early_filter**: Optimizes dimension table access before expensive fact joins
-- **deferred_window_aggregation**: Relevant but secondary (window functions could be optimized after fixing dimension scans)
+**Additional relevant examples**:
+- `dimension_cte_isolate`: Similar to early_filter but for dimension tables.
+- `single_pass_aggregation`: Though not directly applicable (different tables), the philosophy of consolidating passes is relevant.
 
-These three patterns comprehensively cover the optimization opportunities.
-
-**EXAMPLES: shared_dimension_multi_channel, early_filter, deferred_window_aggregation**
+**Final selection**:
+```
+EXAMPLES: deferred_window_aggregation, early_filter, shared_dimension_multi_channel
+```
