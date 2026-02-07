@@ -231,7 +231,7 @@ class SwarmSession(OptimizationSession):
         )
 
         worker_results = []
-        for wid, (status, speedup, error_msg) in zip(sorted_wids, batch_results):
+        for wid, (status, speedup, error_msg, error_cat) in zip(sorted_wids, batch_results):
             assignment, optimized_sql, transforms = candidates_by_assignment[wid]
 
             wr = WorkerResult(
@@ -259,9 +259,12 @@ class SwarmSession(OptimizationSession):
                 )
 
         # Learning records for each worker
-        for wr in worker_results:
+        for wid, (status, speedup, error_msg, error_cat) in zip(sorted_wids, batch_results):
+            wr_match = [w for w in worker_results if w.worker_id == wid]
+            if not wr_match:
+                continue
+            wr = wr_match[0]
             try:
-                error_cat = "execution" if wr.status == "ERROR" else None
                 lr = self.pipeline.learner.create_learning_record(
                     query_id=self.query_id,
                     examples_recommended=wr.examples_used,
@@ -270,6 +273,7 @@ class SwarmSession(OptimizationSession):
                     speedup=wr.speedup,
                     transforms_used=wr.transforms,
                     error_category=error_cat,
+                    error_messages=[error_msg] if error_msg else [],
                 )
                 self.pipeline.learner.save_learning_record(lr)
             except Exception as e:
@@ -381,7 +385,7 @@ class SwarmSession(OptimizationSession):
             optimized_sql = self.original_sql
 
         # Validate
-        status, speedup = self.pipeline._validate(self.original_sql, optimized_sql)
+        status, speedup, val_errors, val_error_cat = self.pipeline._validate(self.original_sql, optimized_sql)
 
         wr = WorkerResult(
             worker_id=1,
@@ -392,16 +396,18 @@ class SwarmSession(OptimizationSession):
             status=status,
             transforms=candidate.transforms,
             hint=analysis.hint,
+            error_message=" | ".join(val_errors) if val_errors else None,
         )
         self.all_worker_results.append(wr)
 
         logger.info(
             f"[{self.query_id}] Snipe {snipe_num}: {status} {speedup:.2f}x"
         )
+        if val_errors:
+            logger.info(f"[{self.query_id}] Snipe errors: {val_errors}")
 
         # Learning record
         try:
-            error_cat = "execution" if status == "ERROR" else None
             lr = self.pipeline.learner.create_learning_record(
                 query_id=self.query_id,
                 examples_recommended=analysis.examples,
@@ -409,7 +415,8 @@ class SwarmSession(OptimizationSession):
                 status="pass" if status in ("WIN", "IMPROVED", "NEUTRAL") else "error",
                 speedup=speedup,
                 transforms_used=candidate.transforms,
-                error_category=error_cat,
+                error_category=val_error_cat,
+                error_messages=val_errors,
             )
             self.pipeline.learner.save_learning_record(lr)
         except Exception as e:

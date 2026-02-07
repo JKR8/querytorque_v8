@@ -97,12 +97,13 @@ class StandardSession(OptimizationSession):
             optimized_sql = self.original_sql
 
         # Phase 5: Validate
-        status, speedup = self.pipeline._validate(self.original_sql, optimized_sql)
+        status, speedup, val_errors, val_error_cat = self.pipeline._validate(self.original_sql, optimized_sql)
         logger.info(f"[{self.query_id}] Standard result: {status} ({speedup:.2f}x)")
+        if val_errors:
+            logger.info(f"[{self.query_id}] Validation errors: {val_errors}")
 
         # Learning record
         try:
-            error_cat = "execution" if status == "ERROR" else None
             lr = self.pipeline.learner.create_learning_record(
                 query_id=self.query_id,
                 examples_recommended=example_ids,
@@ -110,7 +111,8 @@ class StandardSession(OptimizationSession):
                 status="pass" if status in ("WIN", "IMPROVED", "NEUTRAL") else "error",
                 speedup=speedup,
                 transforms_used=transforms,
-                error_category=error_cat,
+                error_category=val_error_cat,
+                error_messages=val_errors,
             )
             self.pipeline.learner.save_learning_record(lr)
         except Exception as e:

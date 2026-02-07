@@ -139,16 +139,16 @@ class ADORunner:
         """Run optimization on a single query in the specified mode.
 
         Modes:
-        - STANDARD: Fast, no analyst, single iteration
-        - EXPERT: Iterative with analyst failure analysis (default, legacy behavior)
-        - SWARM: Multi-worker fan-out with snipe refinement
+        - STANDARD: Fast, no analyst, N workers, single iteration
+        - EXPERT: Iterative, 1 worker per round, analyst failure analysis steers each attempt
+        - SWARM: Fan-out 4 workers, then snipe with 1 worker per round
 
         Args:
             query_id: Query identifier (e.g., 'query_88')
             sql: Original SQL query
             max_iterations: Max optimization rounds
             target_speedup: Stop early when this speedup is reached
-            n_workers: Parallel workers per iteration
+            n_workers: Parallel workers (STANDARD only; EXPERT=1, SWARM=4 always)
             mode: Optimization mode (standard, expert, swarm)
 
         Returns:

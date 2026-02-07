@@ -150,6 +150,11 @@ class Prompter:
         """
         sections = []
 
+        # Section 0: Retry preamble (PRIMACY — if this is a retry, say so FIRST)
+        retry_preamble = self._section_retry_preamble(history)
+        if retry_preamble:
+            sections.append(retry_preamble)
+
         # Section 1: Role + Task (PRIMACY)
         sections.append(self._section_role_task())
 
@@ -195,6 +200,54 @@ class Prompter:
     # =========================================================================
     # Section builders
     # =========================================================================
+
+    @staticmethod
+    def _section_retry_preamble(history: Optional[Dict[str, Any]]) -> str:
+        """Section 0: Retry context — if previous attempts exist, lead with that.
+
+        This goes FIRST in the prompt so the LLM knows it's a retry and
+        immediately sees what failed and why.
+        """
+        if not history:
+            return ""
+
+        attempts = history.get("attempts", [])
+        if not attempts:
+            return ""
+
+        # Only include analyst-iteration attempts (not batch state results)
+        failed = [
+            a for a in attempts
+            if a.get("source", "").startswith("analyst_iter")
+            and a.get("status") in ("ERROR", "FAIL", "error")
+        ]
+        if not failed:
+            return ""
+
+        n_attempts = len(attempts)
+        lines = [
+            f"## RETRY — This is attempt {n_attempts + 1}",
+            "",
+            f"The previous {len(failed)} attempt(s) on this query FAILED.",
+            "You MUST use a different approach. Do NOT repeat the same structural mistake.",
+            "",
+        ]
+
+        for a in failed[-3:]:  # Show last 3 failures max
+            transforms = ", ".join(a.get("transforms", [])) or "unknown"
+            status = a.get("status", "ERROR")
+            fa = a.get("failure_analysis", "")
+            lines.append(f"**Attempt ({transforms}): {status}**")
+            if fa:
+                # Truncate to first 400 chars — the key insight
+                summary = fa[:400].strip()
+                if len(fa) > 400:
+                    summary += "..."
+                lines.append(f"Why it failed: {summary}")
+            lines.append("")
+
+        lines.append("---")
+        return "\n".join(lines)
 
     @staticmethod
     def _section_role_task() -> str:
@@ -389,17 +442,26 @@ class Prompter:
                 status = attempt.get("status", "unknown")
                 transforms = attempt.get("transforms", [])
                 speedup = attempt.get("speedup", 0)
-                error = attempt.get("error", "")
+                failure_analysis = attempt.get("failure_analysis", "")
 
                 t_str = ", ".join(transforms) if transforms else "unknown"
-                if status in ("error", "ERROR"):
-                    lines.append(f"- {t_str}: ERROR — {error}")
+                if status in ("error", "ERROR", "FAIL"):
+                    lines.append(f"- {t_str}: {status} (0.00x)")
+                    if failure_analysis:
+                        # Include the LLM failure analysis so next attempt learns
+                        lines.append("")
+                        lines.append(f"  **Why it failed:** {failure_analysis[:500]}")
+                        lines.append("")
                 elif speedup < 0.95:
                     lines.append(
                         f"- {t_str}: REGRESSION ({speedup:.2f}x), reverted"
                     )
+                    if failure_analysis:
+                        lines.append("")
+                        lines.append(f"  **Why it regressed:** {failure_analysis[:500]}")
+                        lines.append("")
                 elif speedup >= 1.10:
-                    lines.append(f"- {t_str}: **{speedup:.2f}x improvement** ✓")
+                    lines.append(f"- {t_str}: **{speedup:.2f}x improvement**")
                 else:
                     lines.append(f"- {t_str}: {speedup:.2f}x (neutral)")
 
@@ -568,13 +630,8 @@ class Prompter:
     ) -> str:
         """Section 6b: Regression warnings for structurally similar queries.
 
-        Shows BEFORE/AFTER pairs from past regressions where a structurally
-        similar query was rewritten and got SLOWER. The LLM sees:
-        - The original query that was similar to this one
-        - The rewrite that caused the regression
-        - Why it regressed (regression_mechanism)
-
-        This prevents the LLM from repeating the same mistakes on similar SQL.
+        Shows concise anti-pattern descriptions from past regressions.
+        No full SQL — just the transform, why it failed, and what to avoid.
         """
         if not regressions:
             return ""
@@ -582,13 +639,12 @@ class Prompter:
         lines = [
             "## Regression Warnings",
             "",
-            "The following rewrites were attempted on **structurally similar queries**",
-            "and caused **performance regressions**. Do NOT repeat these patterns.",
+            "The following transforms were attempted on structurally similar queries",
+            "and caused performance regressions. Do NOT repeat these patterns.",
             "",
         ]
 
         for i, reg in enumerate(regressions):
-            reg_id = reg.get("id", f"regression_{i + 1}")
             speedup = reg.get("verified_speedup", "?")
             query_id = reg.get("query_id", "?")
             transform = reg.get("transform_attempted", "unknown")
@@ -596,41 +652,16 @@ class Prompter:
             description = reg.get("description", "")
 
             lines.append(
-                f"### Warning {i + 1}: {reg_id} ({speedup} — REGRESSION)"
+                f"### Warning {i + 1}: {transform} on {query_id} ({speedup}x)"
             )
-            lines.append(
-                f"**Query:** {query_id} | **Transform attempted:** {transform}"
-            )
-            lines.append("")
 
             if description:
                 lines.append(f"**Anti-pattern:** {description}")
-                lines.append("")
 
-            # Show the original SQL (the similar query)
-            original_sql = reg.get("original_sql", "")
-            if original_sql:
-                # Truncate very long SQL to keep prompt manageable
-                if len(original_sql) > 2000:
-                    original_sql = original_sql[:2000] + "\n-- ... (truncated)"
-                lines.append("**Original query (similar to yours):**")
-                lines.append(f"```sql\n{original_sql}\n```")
-                lines.append("")
-
-            # Show the regressed rewrite (what NOT to do)
-            example = reg.get("example", {})
-            after_sql = example.get("after_sql", "")
-            if after_sql:
-                if len(after_sql) > 2000:
-                    after_sql = after_sql[:2000] + "\n-- ... (truncated)"
-                lines.append("**Regressed rewrite (DO NOT replicate this pattern):**")
-                lines.append(f"```sql\n{after_sql}\n```")
-                lines.append("")
-
-            # Why it regressed
             if mechanism:
                 lines.append(f"**Why it regressed:** {mechanism}")
-                lines.append("")
+
+            lines.append("")
 
         return "\n".join(lines)
 

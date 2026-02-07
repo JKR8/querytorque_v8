@@ -631,6 +631,7 @@ class TestPipelineHistoryWiring:
         pipeline.learner = MagicMock()
         pipeline.learner.build_learning_summary.return_value = None
         pipeline.benchmark_dir = Path(".")
+        pipeline._semantic_intents = {}
         return pipeline
 
     def test_run_query_passes_history_to_analyst_and_rewrite_prompt(self):
@@ -659,7 +660,7 @@ class TestPipelineHistoryWiring:
                 [{"id": "deferred_window_aggregation"}],
             )
         )
-        pipeline._validate = MagicMock(return_value=("NEUTRAL", 1.0))
+        pipeline._validate = MagicMock(return_value=("NEUTRAL", 1.0, [], None))
 
         with patch("ado.generate.CandidateGenerator") as mock_generator:
             mock_generator.return_value.generate.return_value = []
@@ -691,7 +692,7 @@ class TestPipelineHistoryWiring:
         pipeline._find_examples = MagicMock(return_value=[{"id": "early_filter"}])
         pipeline._find_regression_warnings = MagicMock(return_value=[])
         pipeline._run_analyst = MagicMock()
-        pipeline._validate = MagicMock(return_value=("NEUTRAL", 1.0))
+        pipeline._validate = MagicMock(return_value=("NEUTRAL", 1.0, [], None))
 
         with patch("ado.generate.CandidateGenerator") as mock_generator:
             mock_generator.return_value.generate.return_value = []

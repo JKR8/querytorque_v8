@@ -200,11 +200,11 @@ class Pipeline:
         self,
         original_sql: str,
         optimized_sql: str,
-    ) -> tuple[str, float]:
+    ) -> tuple[str, float, list[str], str | None]:
         """Phase 5: Validate the optimized SQL.
 
-        Returns (status, speedup) tuple.
-        Status: WIN | IMPROVED | NEUTRAL | REGRESSION | ERROR
+        Returns (status, speedup, error_messages, error_category) tuple.
+        Status: WIN | IMPROVED | NEUTRAL | REGRESSION | FAIL | ERROR
         """
         from .validate import Validator
 
@@ -217,22 +217,24 @@ class Pipeline:
             )
 
             speedup = result.speedup
+            errors = result.errors or []
+            error_cat = result.error_category
 
             if result.status.value == "error":
-                return "ERROR", 0.0
+                return "ERROR", 0.0, errors, error_cat or "execution"
             elif result.status.value == "fail":
-                return "ERROR", 0.0
+                return "FAIL", 0.0, errors, error_cat or "semantic"
             elif speedup >= 1.10:
-                return "WIN", speedup
+                return "WIN", speedup, [], None
             elif speedup >= 1.05:
-                return "IMPROVED", speedup
+                return "IMPROVED", speedup, [], None
             elif speedup >= 0.95:
-                return "NEUTRAL", speedup
+                return "NEUTRAL", speedup, [], None
             else:
-                return "REGRESSION", speedup
+                return "REGRESSION", speedup, [], None
         except Exception as e:
             logger.error(f"Validation failed: {e}")
-            return "ERROR", 0.0
+            return "ERROR", 0.0, [str(e)], "execution"
         finally:
             validator.close()
 
@@ -240,20 +242,14 @@ class Pipeline:
         self,
         original_sql: str,
         optimized_sqls: List[str],
-    ) -> List[tuple[str, float, str]]:
+    ) -> List[tuple[str, float, str, str | None]]:
         """Validate multiple optimized SQLs against a single original baseline.
 
         Times the original SQL ONCE, then validates each optimized SQL
-        sequentially against the cached baseline. Much more efficient than
-        calling _validate() repeatedly for swarm fan-out (saves 3 redundant
-        original benchmarks for 4 workers).
-
-        Args:
-            original_sql: The original SQL query (timed once)
-            optimized_sqls: List of optimized SQL queries to validate
+        sequentially against the cached baseline.
 
         Returns:
-            List of (status, speedup, error_message) tuples, one per optimized SQL
+            List of (status, speedup, error_message, error_category) tuples
         """
         from .validate import Validator
 
@@ -277,25 +273,26 @@ class Pipeline:
 
                 speedup = result.speedup
                 error_msg = result.error or ""
+                error_cat = result.error_category
 
                 if result.status.value == "error":
-                    results.append(("ERROR", 0.0, error_msg))
+                    results.append(("ERROR", 0.0, error_msg, error_cat or "execution"))
                 elif result.status.value == "fail":
-                    results.append(("ERROR", 0.0, error_msg))
+                    results.append(("FAIL", 0.0, error_msg, error_cat or "semantic"))
                 elif speedup >= 1.10:
-                    results.append(("WIN", speedup, ""))
+                    results.append(("WIN", speedup, "", None))
                 elif speedup >= 1.05:
-                    results.append(("IMPROVED", speedup, ""))
+                    results.append(("IMPROVED", speedup, "", None))
                 elif speedup >= 0.95:
-                    results.append(("NEUTRAL", speedup, ""))
+                    results.append(("NEUTRAL", speedup, "", None))
                 else:
-                    results.append(("REGRESSION", speedup, ""))
+                    results.append(("REGRESSION", speedup, "", None))
 
             return results
 
         except Exception as e:
             logger.error(f"Batch validation failed: {e}")
-            return [("ERROR", 0.0, str(e))] * len(optimized_sqls)
+            return [("ERROR", 0.0, str(e), "execution")] * len(optimized_sqls)
         finally:
             validator.close()
 
@@ -435,8 +432,10 @@ class Pipeline:
 
         # Phase 5: Validate (timing + correctness)
         logger.info(f"[{query_id}] Phase 5: Validating")
-        status, speedup = self._validate(sql, optimized_sql)
+        status, speedup, val_errors, val_error_cat = self._validate(sql, optimized_sql)
         logger.info(f"[{query_id}] Result: {status} ({speedup:.2f}x)")
+        if val_errors:
+            logger.info(f"[{query_id}] Validation errors: {val_errors}")
 
         result = PipelineResult(
             query_id=query_id,
@@ -454,7 +453,6 @@ class Pipeline:
 
         # Create learning record
         try:
-            error_cat = "execution" if status == "ERROR" else None
             lr = self.learner.create_learning_record(
                 query_id=query_id,
                 examples_recommended=example_ids,
@@ -462,7 +460,8 @@ class Pipeline:
                 status="pass" if status in ("WIN", "IMPROVED", "NEUTRAL") else "error",
                 speedup=speedup,
                 transforms_used=transforms,
-                error_category=error_cat,
+                error_category=val_error_cat,
+                error_messages=val_errors,
             )
             self.learner.save_learning_record(lr)
         except Exception as e:
@@ -660,7 +659,7 @@ class Pipeline:
                 original_sql=sql,
                 max_iterations=max_iterations,
                 target_speedup=target_speedup,
-                n_workers=n_workers,
+                n_workers=1,  # Expert: always 1 worker, analyst-steered
             )
         elif mode == OptimizationMode.SWARM:
             from .sessions.swarm_session import SwarmSession

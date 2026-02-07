@@ -3,12 +3,10 @@
 Wraps the existing AnalystSession behavior:
 1. Always optimize from ORIGINAL SQL (no compounding)
 2. Run analyst for structural guidance each iteration
-3. Generate N candidates and validate
+3. Generate 1 candidate per iteration (analyst-steered sniper)
 4. If speedup < target → LLM failure analysis
 5. History includes all previous failure analyses
 6. Stop when target reached or max iterations exhausted
-
-This is the DEFAULT mode and matches prior behavior exactly.
 """
 
 from __future__ import annotations
@@ -39,7 +37,7 @@ class ExpertSession(OptimizationSession):
             f"[{self.query_id}] ExpertSession: "
             f"max {self.max_iterations} iterations, "
             f"target {self.target_speedup:.1f}x, "
-            f"{self.n_workers} workers"
+            f"1 worker (analyst-steered)"
         )
 
         session = AnalystSession(
@@ -48,7 +46,7 @@ class ExpertSession(OptimizationSession):
             original_sql=self.original_sql,
             max_iterations=self.max_iterations,
             target_speedup=self.target_speedup,
-            n_workers=self.n_workers,
+            n_workers=1,  # Expert mode: always 1 worker, analyst-steered
         )
         best_iteration = session.run()
         session.save_session()

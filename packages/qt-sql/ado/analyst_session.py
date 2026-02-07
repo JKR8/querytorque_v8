@@ -245,15 +245,16 @@ class AnalystSession:
             optimized_sql = input_sql
 
         # Phase 5: Validate against TRUE ORIGINAL
-        status, speedup = self.pipeline._validate(self.original_sql, optimized_sql)
+        status, speedup, val_errors, val_error_cat = self.pipeline._validate(self.original_sql, optimized_sql)
         logger.info(
             f"[{self.query_id}] Iteration {iteration_num + 1}: "
             f"{status} ({speedup:.2f}x vs original)"
         )
+        if val_errors:
+            logger.info(f"[{self.query_id}] Validation errors: {val_errors}")
 
         # Create learning record for this iteration
         try:
-            error_cat = "execution" if status == "ERROR" else None
             lr = self.pipeline.learner.create_learning_record(
                 query_id=self.query_id,
                 examples_recommended=example_ids,
@@ -263,7 +264,8 @@ class AnalystSession:
                 transforms_used=transforms,
                 worker_id=0,
                 attempt_number=iteration_num + 1,
-                error_category=error_cat,
+                error_category=val_error_cat,
+                error_messages=val_errors,
             )
             self.pipeline.learner.save_learning_record(lr)
         except Exception as e:
