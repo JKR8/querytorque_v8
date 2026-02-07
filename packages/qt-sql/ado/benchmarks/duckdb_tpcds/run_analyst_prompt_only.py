@@ -39,6 +39,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("analyst")
 
+from ado.benchmarks.artifact_checks import (
+    check_input_sql, check_faiss_examples, check_analyst_prompt,
+    check_analyst_response, check_formatted_analysis, check_rewrite_prompt,
+)
+
 DIALECT = "duckdb"
 BENCHMARK_DIR = Path(__file__).parent
 AUDIT_DIR = BENCHMARK_DIR / f"analyst_{query_id}"
@@ -97,7 +102,9 @@ def save(name, content):
     logger.info(f"Saved {name} ({len(content):,} bytes)")
 
 save("00_input.sql", sql)
+check_input_sql(sql, query_id)
 save("01_faiss_examples.json", json.dumps(faiss_examples, indent=2))
+check_faiss_examples(json.dumps(faiss_examples, indent=2), query_id)
 
 # ── Load history (what was already tried for this query) ──────
 def load_query_history(query_id: str) -> dict:
@@ -171,6 +178,7 @@ analyst_prompt = build_analysis_prompt(
     dialect=DIALECT,
 )
 save("02_analyst_prompt.txt", analyst_prompt)
+check_analyst_prompt(analyst_prompt, query_id, history)
 
 # ── Call analyst LLM ───────────────────────────────────────────
 from qt_shared.llm import create_llm_client
@@ -184,6 +192,7 @@ analyst_response = llm.analyze(analyst_prompt)
 t1 = time.time()
 logger.info(f"Analyst: {len(analyst_response)} chars in {t1-t0:.1f}s")
 save("03_analyst_response.txt", analyst_response)
+check_analyst_response(analyst_response, query_id, history)
 
 # ── Parse + build rewrite prompt ───────────────────────────────
 from ado.analyst import parse_analysis_response, parse_example_overrides, format_analysis_for_prompt
@@ -191,6 +200,7 @@ from ado.analyst import parse_analysis_response, parse_example_overrides, format
 analysis = parse_analysis_response(analyst_response)
 formatted = format_analysis_for_prompt(analysis)
 save("04_analysis_formatted.txt", formatted)
+check_formatted_analysis(formatted, query_id)
 
 overrides = parse_example_overrides(analyst_response)
 if overrides:
@@ -214,5 +224,6 @@ rewrite_prompt = prompter.build_prompt(
     dialect=DIALECT,
 )
 save("05_rewrite_prompt.txt", rewrite_prompt)
+check_rewrite_prompt(rewrite_prompt, query_id, history)
 
 logger.info(f"DONE — prompts saved to {AUDIT_DIR}/")

@@ -39,6 +39,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rewrite")
 
+from ado.benchmarks.artifact_checks import check_input_sql, check_rewrite_prompt
+
 DB_PATH = "/mnt/d/TPC-DS/tpcds_sf10.duckdb"
 BENCHMARK_DIR = Path(__file__).parent
 AUDIT_DIR = BENCHMARK_DIR / f"analyst_{query_id}"
@@ -53,6 +55,10 @@ rewrite_prompt = prompt_path.read_text()
 # ── Load original SQL ─────────────────────────────────────────
 sql_path = AUDIT_DIR / "00_input.sql"
 original_sql = sql_path.read_text()
+
+# ── In-flight checks on loaded artifacts ──────────────────────
+check_input_sql(original_sql, query_id)
+check_rewrite_prompt(rewrite_prompt, query_id)
 
 # ── LLM ───────────────────────────────────────────────────────
 from qt_shared.llm import create_llm_client
@@ -72,9 +78,22 @@ blocks = re.findall(r'```sql\s*(.*?)\s*```', rewrite_response, re.DOTALL)
 if blocks:
     optimized_sql = max(blocks, key=len).strip().rstrip(";")
 else:
-    logger.error("Failed to extract SQL!")
-    (AUDIT_DIR / "07_optimized.sql").write_text("-- EXTRACTION FAILED --")
-    sys.exit(1)
+    # Fallback: try any ``` block, or the text before "Changes:" / "Expected"
+    blocks = re.findall(r'```\s*(.*?)\s*```', rewrite_response, re.DOTALL)
+    if blocks:
+        optimized_sql = max(blocks, key=len).strip().rstrip(";")
+        logger.warning("Extracted SQL from unfenced code block (no ```sql tag)")
+    else:
+        # Last resort: take everything up to "Changes:" or "Expected speedup:"
+        parts = re.split(r'\n(?:Changes|Expected speedup):', rewrite_response, maxsplit=1)
+        candidate = parts[0].strip().rstrip(";")
+        if "SELECT" in candidate.upper():
+            optimized_sql = candidate
+            logger.warning("Extracted SQL from raw response (no code fences)")
+        else:
+            logger.error("Failed to extract SQL!")
+            (AUDIT_DIR / "07_optimized.sql").write_text("-- EXTRACTION FAILED --")
+            sys.exit(1)
 
 (AUDIT_DIR / "07_optimized.sql").write_text(optimized_sql)
 logger.info(f"Extracted SQL: {len(optimized_sql)} chars")

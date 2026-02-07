@@ -14,6 +14,7 @@ Tested artifacts (saved by run_analyst_prompt_only.py):
     05_rewrite_prompt.txt   — sent to rewrite LLM
 """
 
+import ast
 import json
 import os
 import sys
@@ -32,6 +33,40 @@ sys.path.insert(0, str(REPO / "packages" / "qt-shared"))
 ARTIFACTS_DIR = (
     QT_SQL / "ado" / "benchmarks" / "duckdb_tpcds" / "analyst_query_51"
 )
+ANALYST_PROMPT_SCRIPT = (
+    QT_SQL / "ado" / "benchmarks" / "duckdb_tpcds" / "run_analyst_prompt_only.py"
+)
+
+
+def _extract_load_query_history_fn(benchmark_dir: Path):
+    """Load the real load_query_history() function body from the script.
+
+    run_analyst_prompt_only.py is a script with heavy top-level side effects, so
+    we extract and execute only the function definition for unit testing.
+    """
+    source = ANALYST_PROMPT_SCRIPT.read_text()
+    parsed = ast.parse(source, filename=str(ANALYST_PROMPT_SCRIPT))
+    fn_node = next(
+        (
+            node
+            for node in parsed.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "load_query_history"
+        ),
+        None,
+    )
+    assert fn_node is not None, "load_query_history() not found in script"
+
+    module = ast.Module(body=[fn_node], type_ignores=[])
+    ast.fix_missing_locations(module)
+
+    namespace = {
+        "json": json,
+        "BENCHMARK_DIR": benchmark_dir,
+        "logger": MagicMock(),
+    }
+    exec(compile(module, str(ANALYST_PROMPT_SCRIPT), "exec"), namespace)
+    return namespace["load_query_history"]
 
 
 # ─── Fixture: load all saved artifacts ────────────────────────────
@@ -321,7 +356,7 @@ class TestHistoryLoading:
     """Unit tests for history loading from state_N and leaderboard."""
 
     def test_manual_script_loads_state_history(self):
-        """Verify load_query_history() finds state_0 validation results."""
+        """Verify real script load_query_history() finds state_N validation results."""
         benchmark_dir = QT_SQL / "ado" / "benchmarks" / "duckdb_tpcds"
         state_0_val = benchmark_dir / "state_0" / "validation"
         if not state_0_val.exists():
@@ -333,33 +368,36 @@ class TestHistoryLoading:
             pytest.skip("No validation files in state_0")
 
         query_id = val_files[0].stem
-        # Import and call the function
-        sys_path_orig = sys.path[:]
-        try:
-            # Simulate the manual script's load logic
-            attempts = []
-            for state_dir in sorted(benchmark_dir.glob("state_*")):
-                if not state_dir.is_dir():
-                    continue
-                state_num = state_dir.name.split("_")[-1]
-                for variant in [query_id, query_id.replace("query_", "q"),
-                                query_id.replace("q", "query_")]:
-                    val_path = state_dir / "validation" / f"{variant}.json"
-                    if val_path.exists():
-                        data = json.loads(val_path.read_text())
-                        attempts.append({
-                            "state": int(state_num),
-                            "source": f"state_{state_num}",
-                            "status": data.get("status", "unknown"),
-                            "speedup": data.get("speedup", 0),
-                        })
-                        break
+        load_query_history = _extract_load_query_history_fn(benchmark_dir)
+        history = load_query_history(query_id)
+        assert history is not None, f"Should find history for {query_id}"
+        assert len(history["attempts"]) > 0
+        assert "status" in history["attempts"][0]
+        assert "speedup" in history["attempts"][0]
 
-            assert len(attempts) > 0, f"Should find history for {query_id}"
-            assert "status" in attempts[0]
-            assert "speedup" in attempts[0]
-        finally:
-            sys.path[:] = sys_path_orig
+    def test_manual_script_loads_leaderboard_only_history(self):
+        """Verify script loader can return history from leaderboard-only source."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            benchmark_dir = Path(tmpdir)
+            leaderboard = {
+                "queries": [
+                    {
+                        "query_id": "query_99",
+                        "source": "analyst_mode",
+                        "status": "IMPROVED",
+                        "speedup": 1.23,
+                        "transforms": ["deferred_window_aggregation"],
+                    }
+                ]
+            }
+            (benchmark_dir / "leaderboard.json").write_text(json.dumps(leaderboard))
+
+            load_query_history = _extract_load_query_history_fn(benchmark_dir)
+            history = load_query_history("query_99")
+            assert history is not None
+            assert len(history["attempts"]) == 1
+            assert history["attempts"][0]["source"] == "analyst_mode"
+            assert history["attempts"][0]["status"] == "IMPROVED"
 
     def test_analyst_session_loads_batch_history(self):
         """Verify AnalystSession._build_iteration_history() loads state_N results."""
@@ -573,3 +611,98 @@ class TestPromptBuildersUseHistory:
             dialect="duckdb",
         )
         assert "## Optimization History" not in prompt
+
+
+class TestPipelineHistoryWiring:
+    """Regression tests for history propagation through run_query()."""
+
+    @staticmethod
+    def _make_pipeline(use_analyst: bool = True):
+        from ado.pipeline import Pipeline
+
+        pipeline = Pipeline.__new__(Pipeline)
+        pipeline.use_analyst = use_analyst
+        pipeline.provider = "test-provider"
+        pipeline.model = "test-model"
+        pipeline.analyze_fn = None
+        pipeline.config = type("Cfg", (), {"engine": "duckdb"})()
+        pipeline.prompter = MagicMock()
+        pipeline.prompter.build_prompt.return_value = "PROMPT"
+        pipeline.learner = MagicMock()
+        pipeline.learner.build_learning_summary.return_value = None
+        pipeline.benchmark_dir = Path(".")
+        return pipeline
+
+    def test_run_query_passes_history_to_analyst_and_rewrite_prompt(self):
+        from ado.pipeline import Pipeline
+
+        history = {
+            "attempts": [
+                {
+                    "source": "state_0",
+                    "status": "REGRESSION",
+                    "speedup": 0.87,
+                    "transforms": ["date_cte_isolate"],
+                }
+            ],
+            "promotion": None,
+        }
+        pipeline = self._make_pipeline(use_analyst=True)
+        pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
+        pipeline._find_examples = MagicMock(return_value=[{"id": "deferred_window_aggregation"}])
+        pipeline._find_regression_warnings = MagicMock(return_value=[])
+        pipeline._run_analyst = MagicMock(
+            return_value=(
+                "## Expert Analysis\n...",
+                "raw analyst response",
+                "analyst prompt text",
+                [{"id": "deferred_window_aggregation"}],
+            )
+        )
+        pipeline._validate = MagicMock(return_value=("NEUTRAL", 1.0))
+
+        with patch("ado.generate.CandidateGenerator") as mock_generator:
+            mock_generator.return_value.generate.return_value = []
+            result = Pipeline.run_query(
+                pipeline,
+                query_id="query_1",
+                sql="SELECT 1",
+                n_workers=1,
+                history=history,
+                use_analyst=True,
+            )
+
+        assert pipeline._run_analyst.call_args.kwargs["history"] is history
+        assert pipeline.prompter.build_prompt.call_args.kwargs["history"] is history
+        assert result.analysis_prompt == "analyst prompt text"
+        assert result.analysis_formatted == "## Expert Analysis\n..."
+
+    def test_run_query_passes_history_without_analyst(self):
+        from ado.pipeline import Pipeline
+
+        history = {
+            "attempts": [
+                {"source": "state_0", "status": "REGRESSION", "speedup": 0.87}
+            ],
+            "promotion": None,
+        }
+        pipeline = self._make_pipeline(use_analyst=False)
+        pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
+        pipeline._find_examples = MagicMock(return_value=[{"id": "early_filter"}])
+        pipeline._find_regression_warnings = MagicMock(return_value=[])
+        pipeline._run_analyst = MagicMock()
+        pipeline._validate = MagicMock(return_value=("NEUTRAL", 1.0))
+
+        with patch("ado.generate.CandidateGenerator") as mock_generator:
+            mock_generator.return_value.generate.return_value = []
+            Pipeline.run_query(
+                pipeline,
+                query_id="query_2",
+                sql="SELECT 1",
+                n_workers=1,
+                history=history,
+                use_analyst=False,
+            )
+
+        pipeline._run_analyst.assert_not_called()
+        assert pipeline.prompter.build_prompt.call_args.kwargs["history"] is history
