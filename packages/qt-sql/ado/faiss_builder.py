@@ -92,17 +92,27 @@ class SQLNormalizer:
             return re.sub(r'\s+', ' ', sql).strip()
 
     def _replace_literals(self, node):
-        """Replace literal values with placeholders."""
+        """Replace literal values with neutral constants.
+
+        Uses 0 for numbers and 'x' for strings instead of dialect-specific
+        parameter placeholders ($1, %s, ?). This ensures the fingerprinted
+        SQL can be parsed back by any dialect for AST vectorization.
+
+        Preserves INTERVAL literals (e.g., '30 day') since replacing them
+        produces invalid SQL that can't be re-parsed.
+        """
         from sqlglot import exp
 
         if isinstance(node, exp.Literal):
-            self._placeholder_counter += 1
-            # Use $N placeholder style (PostgreSQL compatible)
-            return exp.Placeholder(this=f"${self._placeholder_counter}")
+            # Skip literals inside INTERVAL expressions (e.g., INTERVAL '30 day')
+            if node.parent and isinstance(node.parent, exp.Interval):
+                return node
+            if node.is_string:
+                return exp.Literal.string("x")
+            return exp.Literal.number(0)
 
-        # Also handle NULL as a literal
         if isinstance(node, exp.Null):
-            return exp.Placeholder(this="$NULL")
+            return exp.Literal.number(0)
 
         return node
 
@@ -345,12 +355,13 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
                 data = json.loads(path.read_text())
                 example_id = data.get("id", path.stem)
 
-                # Get SQL to vectorize - try multiple fields
+                # Get SQL to vectorize - prefer top-level original_sql (always complete)
+                # over example.input_slice (often abbreviated with ... or markers)
                 example_data = data.get("example", {})
                 sql_text = (
+                    data.get("original_sql") or
                     example_data.get("before_sql") or
                     example_data.get("input_slice") or
-                    example_data.get("original_sql") or
                     ""
                 )
 
@@ -445,9 +456,18 @@ def build_faiss_index(
     print("  Fingerprint (normalize literals/identifiers) → AST vectorize")
 
     for i, (example_id, sql_text, meta) in enumerate(examples):
-        # Fingerprint first: replace literals with $N, lowercase identifiers
-        fingerprinted = normalizer.normalize(sql_text, dialect=dialect)
-        vector = vectorizer.vectorize(fingerprinted, dialect=dialect)
+        # Use per-example dialect based on engine (DuckDB vs PostgreSQL syntax differs)
+        engine = meta.get("engine", "unknown")
+        if engine in ("postgres", "postgresql"):
+            ex_dialect = "postgres"
+        elif engine == "duckdb":
+            ex_dialect = "duckdb"
+        else:
+            ex_dialect = dialect  # fallback to global default
+
+        # Fingerprint first: replace literals with neutral constants, lowercase identifiers
+        fingerprinted = normalizer.normalize(sql_text, dialect=ex_dialect)
+        vector = vectorizer.vectorize(fingerprinted, dialect=ex_dialect)
         vectors.append(vector)
 
         query_metadata[example_id] = {

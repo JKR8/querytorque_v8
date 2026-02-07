@@ -118,6 +118,48 @@ class NodeRewriteResult:
 
 
 @dataclass
+class PromotionAnalysis:
+    """Analysis generated when promoting a winning query to the next state.
+
+    Captures what the transform did, why it worked, and what to try next.
+    Included in the prompt for the next state so the LLM has full context.
+    """
+    query_id: str
+    original_sql: str
+    optimized_sql: str
+    speedup: float
+    transforms: List[str]
+    analysis: str            # LLM-generated reasoning about what the transform did
+    suggestions: str         # LLM-generated ideas for further optimization
+    state_promoted_from: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query_id": self.query_id,
+            "original_sql": self.original_sql,
+            "optimized_sql": self.optimized_sql,
+            "speedup": self.speedup,
+            "transforms": self.transforms,
+            "analysis": self.analysis,
+            "suggestions": self.suggestions,
+            "state_promoted_from": self.state_promoted_from,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> PromotionAnalysis:
+        return cls(
+            query_id=data["query_id"],
+            original_sql=data["original_sql"],
+            optimized_sql=data["optimized_sql"],
+            speedup=data.get("speedup", 0.0),
+            transforms=data.get("transforms", []),
+            analysis=data.get("analysis", ""),
+            suggestions=data.get("suggestions", ""),
+            state_promoted_from=data.get("state_promoted_from", 0),
+        )
+
+
+@dataclass
 class PipelineResult:
     """Complete result from a single query through the 5-phase pipeline."""
     query_id: str
@@ -129,3 +171,4 @@ class PipelineResult:
     transforms_applied: List[str] = field(default_factory=list)
     annotation: Optional[AnnotationResult] = None
     prompt: Optional[str] = None
+    analysis: Optional[str] = None  # LLM analyst output (only when use_analyst=True)

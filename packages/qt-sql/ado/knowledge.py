@@ -274,12 +274,15 @@ class ADOFAISSRecommender:
         except Exception as e:
             logger.warning(f"Failed to load ADO FAISS index: {e}")
 
-    def find_similar_examples(self, sql: str, k: int = 5) -> list[tuple[str, float, dict]]:
+    def find_similar_examples(
+        self, sql: str, k: int = 5, dialect: str = "duckdb",
+    ) -> list[tuple[str, float, dict]]:
         """Find similar examples using FAISS search.
 
         Args:
             sql: SQL query to find similar examples for
             k: Number of results to return
+            dialect: SQL dialect for parsing (duckdb, postgres, etc.)
 
         Returns:
             List of (example_id, similarity_score, metadata) tuples
@@ -294,10 +297,10 @@ class ADOFAISSRecommender:
 
             # Fingerprint first: normalize literals/identifiers for consistent matching
             normalizer = SQLNormalizer()
-            fingerprinted = normalizer.normalize(sql, dialect="postgres")
+            fingerprinted = normalizer.normalize(sql, dialect=dialect)
 
             # Vectorize fingerprinted SQL
-            vector = self.vectorizer.vectorize(fingerprinted, dialect="postgres")
+            vector = self.vectorizer.vectorize(fingerprinted, dialect=dialect)
             vector = vector.reshape(1, -1).astype('float32')
 
             # Apply z-score normalization (same as index)

@@ -24,6 +24,7 @@ from .runner import ADORunner, ADOConfig, ADOResult
 from .schemas import (
     BenchmarkConfig,
     PipelineResult,
+    PromotionAnalysis,
     ValidationStatus,
     ValidationResult,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "ADOResult",
     "BenchmarkConfig",
     "PipelineResult",
+    "PromotionAnalysis",
     "ValidationStatus",
     "ValidationResult",
 ]

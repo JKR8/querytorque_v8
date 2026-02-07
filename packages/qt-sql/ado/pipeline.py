@@ -27,6 +27,7 @@ from .schemas import (
     AnnotationResult,
     BenchmarkConfig,
     PipelineResult,
+    PromotionAnalysis,
 )
 from .store import Store
 
@@ -43,6 +44,7 @@ class Pipeline:
         model: Optional[str] = None,
         analyze_fn=None,
         annotate_with_llm: bool = False,
+        use_analyst: bool = False,
     ):
         """Load config.json from benchmark dir, initialize components.
 
@@ -52,6 +54,8 @@ class Pipeline:
             model: LLM model name
             analyze_fn: Optional custom LLM function
             annotate_with_llm: If True, Phase 2 uses LLM. Default False (heuristic).
+            use_analyst: If True, runs LLM analyst before rewrite (costs 1 extra
+                         API call per query). Use for stubborn queries only.
         """
         self.benchmark_dir = Path(benchmark_dir)
         self.config = BenchmarkConfig.from_file(
@@ -62,6 +66,7 @@ class Pipeline:
         self.model = model
         self.analyze_fn = analyze_fn
         self.annotate_with_llm = annotate_with_llm
+        self.use_analyst = use_analyst
 
         # Initialize pipeline components
         self.annotator = Annotator(
@@ -205,7 +210,8 @@ class Pipeline:
         query_id: str,
         sql: str,
         n_workers: int = 5,
-        history: Optional[List[Dict]] = None,
+        history: Optional[Dict[str, Any]] = None,
+        use_analyst: Optional[bool] = None,
     ) -> PipelineResult:
         """Run a single query through all 5 phases.
 
@@ -213,11 +219,16 @@ class Pipeline:
             query_id: Query identifier (e.g., 'query_1')
             sql: Original SQL query
             n_workers: Number of parallel workers for Phase 3
-            history: Previous attempts on this query [{status, transforms, speedup}]
+            history: Previous attempts and promotion context for this query.
+                     Dict with 'attempts' (list of dicts) and 'promotion'
+                     (PromotionAnalysis or None).
+            use_analyst: Override pipeline-level use_analyst setting.
+                         When True, runs LLM analyst before rewrite (1 extra API call).
 
         Returns:
             PipelineResult with full pipeline outcome
         """
+        analyst_enabled = use_analyst if use_analyst is not None else self.use_analyst
         dialect = self.config.engine if self.config.engine != "postgresql" else "postgres"
         engine = (
             "postgres"
@@ -252,12 +263,28 @@ class Pipeline:
         # Phase 3: Build full-query prompt + generate rewrites
         logger.info(f"[{query_id}] Phase 3: Generating {n_workers} candidates")
 
-        # Find examples: gold by annotation first, then FAISS for remaining slots
-        examples = self._find_examples(sql, annotation, engine=engine, k=3)
+        # FAISS: find structurally similar gold examples
+        examples = self._find_examples(sql, engine=engine, k=3)
         logger.info(
             f"[{query_id}] FAISS examples: "
             f"{[e.get('id', '?') for e in examples]}"
         )
+
+        # Optional: LLM analyst (stubborn query mode)
+        # Analyst sees FAISS picks and can swap them for better ones
+        expert_analysis = None
+        analysis_raw = None
+        if analyst_enabled:
+            expert_analysis, analysis_raw, examples = self._run_analyst(
+                query_id=query_id,
+                sql=sql,
+                dag=dag,
+                costs=costs,
+                history=history,
+                faiss_examples=examples,
+                engine=engine,
+                dialect=dialect,
+            )
 
         # Build full-query prompt with DAG topology
         prompt = self.prompter.build_prompt(
@@ -268,6 +295,7 @@ class Pipeline:
             annotation=annotation,
             history=history,
             examples=examples,
+            expert_analysis=expert_analysis,
             dialect=dialect,
         )
 
@@ -324,6 +352,7 @@ class Pipeline:
             transforms_applied=transforms,
             annotation=annotation,
             prompt=prompt,
+            analysis=analysis_raw,
         )
 
         # Create learning record
@@ -353,6 +382,7 @@ class Pipeline:
         state_num: int,
         n_workers: Optional[int] = None,
         query_ids: Optional[List[str]] = None,
+        use_analyst: Optional[bool] = None,
     ) -> List[PipelineResult]:
         """Run all queries for a state.
 
@@ -363,6 +393,7 @@ class Pipeline:
             state_num: State number (0 = discovery, 1+ = refinement)
             n_workers: Override worker count
             query_ids: Optional subset of queries to run
+            use_analyst: Override pipeline-level analyst setting per-state
 
         Returns:
             List of PipelineResult for each query
@@ -397,6 +428,7 @@ class Pipeline:
                 sql=sql,
                 n_workers=n_workers,
                 history=history.get(query_id),
+                use_analyst=use_analyst,
             )
             results.append(result)
 
@@ -448,10 +480,12 @@ class Pipeline:
         return results
 
     def promote(self, state_num: int) -> str:
-        """Create state_{N+1} from state_N.
+        """Create state_{N+1} from state_N with enriched promotion context.
 
         Winners (speedup >= promote_threshold):
-            Optimized SQL becomes next state's baseline query
+            - Optimized SQL becomes next state's baseline query
+            - LLM generates analysis of what worked and suggestions for next steps
+            - Original SQL, optimized SQL, and analysis saved for the next state's prompt
         Non-winners:
             Original query carries forward unchanged
 
@@ -465,7 +499,7 @@ class Pipeline:
             raise FileNotFoundError(f"State {state_num} not found: {state_dir}")
 
         # Create next state structure
-        for subdir in ["prompts", "responses", "validation"]:
+        for subdir in ["prompts", "responses", "validation", "promotion_context"]:
             (next_state_dir / subdir).mkdir(parents=True, exist_ok=True)
 
         # Copy seed from current state (knowledge carries forward)
@@ -485,27 +519,54 @@ class Pipeline:
         # Load baseline queries
         queries_dir = self.benchmark_dir / "queries"
 
-        # Promote winners: copy optimized SQL as new baseline
+        # Promote winners: copy optimized SQL + generate analysis
         promoted = 0
         for query_id, entry in leaderboard.items():
             speedup = entry.get("speedup", 0)
-            baseline_path = queries_dir / f"{query_id}.sql"
+            transforms = entry.get("transforms", [])
 
             if speedup >= self.config.promote_threshold:
                 # Get winning optimized SQL from validation
                 val_path = state_dir / "validation" / f"{query_id}.json"
-                if val_path.exists():
-                    val_data = json.loads(val_path.read_text())
-                    opt_sql = val_data.get("optimized_sql", "")
-                    if opt_sql:
-                        # Save as next state's query
-                        (next_state_dir / f"{query_id}_promoted.sql").write_text(opt_sql)
-                        promoted += 1
-                        logger.info(
-                            f"  Promoted {query_id}: {speedup:.2f}x → "
-                            f"optimized SQL becomes state_{state_num + 1} baseline"
-                        )
-                        continue
+                if not val_path.exists():
+                    continue
+
+                val_data = json.loads(val_path.read_text())
+                opt_sql = val_data.get("optimized_sql", "")
+                orig_sql = val_data.get("original_sql", "")
+
+                if not opt_sql:
+                    continue
+
+                # If no original in validation, load from queries/
+                if not orig_sql:
+                    baseline_path = queries_dir / f"{query_id}.sql"
+                    if baseline_path.exists():
+                        orig_sql = baseline_path.read_text()
+
+                # Save promoted SQL as next state's baseline
+                (next_state_dir / f"{query_id}_promoted.sql").write_text(opt_sql)
+
+                # Generate promotion analysis via LLM
+                analysis = self._generate_promotion_analysis(
+                    query_id=query_id,
+                    original_sql=orig_sql,
+                    optimized_sql=opt_sql,
+                    speedup=speedup,
+                    transforms=transforms,
+                    state_num=state_num,
+                )
+
+                # Save promotion context for the next state's prompt
+                ctx_path = next_state_dir / "promotion_context" / f"{query_id}.json"
+                ctx_path.write_text(json.dumps(analysis.to_dict(), indent=2))
+
+                promoted += 1
+                logger.info(
+                    f"  Promoted {query_id}: {speedup:.2f}x → "
+                    f"optimized SQL + analysis → state_{state_num + 1}"
+                )
+                continue
 
             # Non-winner: carry original forward (no file needed, queries/ is shared)
             logger.debug(f"  {query_id}: {speedup:.2f}x → original carries forward")
@@ -516,6 +577,294 @@ class Pipeline:
         )
 
         return str(next_state_dir)
+
+    def _generate_promotion_analysis(
+        self,
+        query_id: str,
+        original_sql: str,
+        optimized_sql: str,
+        speedup: float,
+        transforms: List[str],
+        state_num: int,
+    ) -> PromotionAnalysis:
+        """Generate LLM analysis of what a winning transform did and what to try next.
+
+        Args:
+            query_id: Query identifier
+            original_sql: The original SQL before optimization
+            optimized_sql: The winning optimized SQL
+            speedup: Measured speedup ratio
+            transforms: Transforms that were applied
+            state_num: State being promoted from
+
+        Returns:
+            PromotionAnalysis with LLM-generated reasoning and suggestions
+        """
+        prompt = self._build_promotion_analysis_prompt(
+            query_id=query_id,
+            original_sql=original_sql,
+            optimized_sql=optimized_sql,
+            speedup=speedup,
+            transforms=transforms,
+        )
+
+        analysis_text = ""
+        suggestions_text = ""
+
+        try:
+            from .generate import CandidateGenerator
+            generator = CandidateGenerator(
+                provider=self.provider,
+                model=self.model,
+                analyze_fn=self.analyze_fn,
+            )
+            response = generator._analyze(prompt)
+            analysis_text, suggestions_text = self._parse_promotion_response(response)
+
+        except Exception as e:
+            logger.warning(f"[{query_id}] Promotion analysis LLM call failed: {e}")
+            # Fallback: generate deterministic analysis from available data
+            t_str = ", ".join(transforms) if transforms else "unknown transforms"
+            analysis_text = (
+                f"Applied {t_str} to achieve {speedup:.2f}x speedup. "
+                f"The optimized query restructured the original to reduce "
+                f"redundant computation."
+            )
+            suggestions_text = (
+                f"The current {speedup:.2f}x improvement leaves room for further "
+                f"optimization. Consider: additional predicate pushdown, "
+                f"CTE materialization boundaries, or join reordering."
+            )
+
+        return PromotionAnalysis(
+            query_id=query_id,
+            original_sql=original_sql,
+            optimized_sql=optimized_sql,
+            speedup=speedup,
+            transforms=transforms,
+            analysis=analysis_text,
+            suggestions=suggestions_text,
+            state_promoted_from=state_num,
+        )
+
+    @staticmethod
+    def _build_promotion_analysis_prompt(
+        query_id: str,
+        original_sql: str,
+        optimized_sql: str,
+        speedup: float,
+        transforms: List[str],
+    ) -> str:
+        """Build prompt asking LLM to analyze a winning optimization."""
+        t_str = ", ".join(transforms) if transforms else "unknown"
+        return (
+            "You are a SQL performance analyst reviewing a successful query optimization.\n"
+            "\n"
+            f"## Query: {query_id}\n"
+            f"## Measured Speedup: {speedup:.2f}x\n"
+            f"## Transforms Applied: {t_str}\n"
+            "\n"
+            "### Original SQL (BEFORE):\n"
+            f"```sql\n{original_sql}\n```\n"
+            "\n"
+            "### Optimized SQL (AFTER):\n"
+            f"```sql\n{optimized_sql}\n```\n"
+            "\n"
+            "## Task\n"
+            "\n"
+            "Provide two sections:\n"
+            "\n"
+            "### ANALYSIS\n"
+            "Explain specifically what structural changes were made and WHY they\n"
+            "improved performance. Reference specific clauses, joins, or subqueries.\n"
+            "Be concrete — don't just name the transform, explain the mechanism\n"
+            "(e.g., 'moved the date filter into a CTE so the hash join probes a\n"
+            "100-row table instead of 73K rows').\n"
+            "\n"
+            "### SUGGESTIONS\n"
+            "Based on what remains in the optimized query, suggest 2-3 specific\n"
+            "further optimizations that could yield additional speedup. For each:\n"
+            "- Name the technique\n"
+            "- Identify the specific clause/join/subquery to target\n"
+            "- Estimate the potential impact (minor/moderate/significant)\n"
+            "\n"
+            "Focus on opportunities the current optimization did NOT address.\n"
+            "Do NOT suggest re-applying transforms that were already applied.\n"
+        )
+
+    @staticmethod
+    def _parse_promotion_response(response: str) -> tuple[str, str]:
+        """Parse promotion analysis LLM response into (analysis, suggestions)."""
+        analysis = ""
+        suggestions = ""
+
+        # Split on section headers
+        import re
+
+        # Try to find ANALYSIS section
+        analysis_match = re.search(
+            r'###?\s*ANALYSIS\s*\n(.*?)(?=###?\s*SUGGESTION|$)',
+            response, re.DOTALL | re.IGNORECASE
+        )
+        if analysis_match:
+            analysis = analysis_match.group(1).strip()
+
+        # Try to find SUGGESTIONS section
+        suggestions_match = re.search(
+            r'###?\s*SUGGESTION[S]?\s*\n(.*?)$',
+            response, re.DOTALL | re.IGNORECASE
+        )
+        if suggestions_match:
+            suggestions = suggestions_match.group(1).strip()
+
+        # Fallback: if no sections found, use the whole response as analysis
+        if not analysis and not suggestions:
+            parts = response.strip().split("\n\n", 1)
+            analysis = parts[0]
+            suggestions = parts[1] if len(parts) > 1 else ""
+
+        return analysis, suggestions
+
+    # =========================================================================
+    # Analyst (opt-in, stubborn query mode)
+    # =========================================================================
+
+    def _run_analyst(
+        self,
+        query_id: str,
+        sql: str,
+        dag: Any,
+        costs: Dict[str, Any],
+        history: Optional[Dict[str, Any]],
+        faiss_examples: List[Dict[str, Any]],
+        engine: str,
+        dialect: str,
+    ) -> tuple[Optional[str], Optional[str], List[Dict[str, Any]]]:
+        """Run LLM analyst to generate deep structural analysis.
+
+        The analyst sees the FAISS-selected examples and the full list of
+        available gold examples. It can accept the FAISS picks or recommend
+        swaps if it thinks different examples would be more relevant.
+
+        Costs 1 extra API call. Only use for stubborn queries.
+
+        Returns:
+            (formatted_analysis, raw_response, final_examples) —
+            final_examples may differ from faiss_examples if the analyst
+            recommended swaps. Returns (None, None, faiss_examples) on failure.
+        """
+        from .analyst import (
+            build_analysis_prompt,
+            format_analysis_for_prompt,
+            parse_analysis_response,
+            parse_example_overrides,
+        )
+
+        logger.info(f"[{query_id}] Running LLM analyst (stubborn query mode)")
+
+        # Load benchmark learnings for the analyst
+        history_path = self.benchmark_dir / "history.json"
+        effective_patterns = None
+        known_regressions = None
+        if history_path.exists():
+            try:
+                hdata = json.loads(history_path.read_text())
+                learnings = hdata.get("cumulative_learnings", {})
+                effective_patterns = learnings.get("effective_patterns")
+                known_regressions = learnings.get("known_regressions")
+            except Exception:
+                pass
+
+        # Build catalogue of all available gold examples (id + description)
+        available_examples = self._list_gold_examples(engine)
+
+        # Build the analysis prompt
+        analysis_prompt = build_analysis_prompt(
+            query_id=query_id,
+            sql=sql,
+            dag=dag,
+            costs=costs,
+            history=history,
+            effective_patterns=effective_patterns,
+            known_regressions=known_regressions,
+            faiss_picks=[e.get("id", "?") for e in faiss_examples],
+            available_examples=available_examples,
+            dialect=dialect,
+        )
+
+        # Send to LLM
+        try:
+            from .generate import CandidateGenerator
+            generator = CandidateGenerator(
+                provider=self.provider,
+                model=self.model,
+                analyze_fn=self.analyze_fn,
+            )
+            raw_response = generator._analyze(analysis_prompt)
+        except Exception as e:
+            logger.warning(f"[{query_id}] Analyst LLM call failed: {e}")
+            return None, None, faiss_examples
+
+        # Parse and format for injection into rewrite prompt
+        parsed = parse_analysis_response(raw_response)
+        formatted = format_analysis_for_prompt(parsed)
+
+        # Check if analyst wants different examples
+        overrides = parse_example_overrides(raw_response)
+        final_examples = faiss_examples
+        if overrides:
+            logger.info(f"[{query_id}] Analyst overrides FAISS picks: {overrides}")
+            final_examples = self._load_examples_by_id(overrides, engine)
+            if not final_examples:
+                final_examples = faiss_examples  # fallback if load fails
+
+        logger.info(
+            f"[{query_id}] Analyst complete: "
+            f"{len(raw_response)} chars response, "
+            f"{len(parsed) - 1} sections parsed, "
+            f"examples: {[e.get('id', '?') for e in final_examples]}"
+        )
+
+        return formatted, raw_response, final_examples
+
+    def _list_gold_examples(self, engine: str) -> List[Dict[str, str]]:
+        """List all available gold examples with id + short description.
+
+        Used to give the analyst a menu it can pick from.
+        """
+        engine_dir = "postgres" if engine in ("postgresql", "postgres") else engine
+        examples_dir = Path(__file__).resolve().parent / "examples" / engine_dir
+        result = []
+
+        if not examples_dir.exists():
+            return result
+
+        for path in sorted(examples_dir.glob("*.json")):
+            try:
+                data = json.loads(path.read_text())
+                ex_id = data.get("id", path.stem)
+                speedup = data.get("verified_speedup", "?")
+                desc = data.get("description", "")[:80]
+                result.append({"id": ex_id, "speedup": speedup, "description": desc})
+            except Exception:
+                continue
+
+        return result
+
+    def _load_examples_by_id(
+        self,
+        example_ids: List[str],
+        engine: str,
+    ) -> List[Dict[str, Any]]:
+        """Load gold examples by their IDs."""
+        examples = []
+        for ex_id in example_ids:
+            ex = self.prompter.load_example_for_pattern(
+                ex_id, engine=engine, seed_dirs=self._seed_dirs,
+            )
+            if ex:
+                examples.append(ex)
+        return examples
 
     # =========================================================================
     # Helpers
@@ -558,35 +907,53 @@ class Pipeline:
     def _load_history(
         self,
         state_num: int,
-    ) -> Dict[str, Dict[str, List]]:
-        """Load cumulative history from all previous states."""
-        history: Dict[str, Dict[str, List]] = {}
+    ) -> Dict[str, Any]:
+        """Load cumulative history from all previous states.
+
+        Returns dict keyed by query_id. Each value contains:
+        - 'attempts': list of per-state validation results
+        - 'promotion': PromotionAnalysis if query was promoted (most recent)
+        """
+        history: Dict[str, Any] = {}
 
         for s in range(state_num):
             state_dir = self.benchmark_dir / f"state_{s}"
+
+            # Load validation results
             validation_dir = state_dir / "validation"
-            if not validation_dir.exists():
-                continue
+            if validation_dir.exists():
+                for path in validation_dir.glob("*.json"):
+                    try:
+                        data = json.loads(path.read_text())
+                        qid = data.get("query_id", path.stem)
+                        if qid not in history:
+                            history[qid] = {"attempts": [], "promotion": None}
 
-            for path in validation_dir.glob("*.json"):
-                try:
-                    data = json.loads(path.read_text())
-                    qid = data.get("query_id", path.stem)
-                    if qid not in history:
-                        history[qid] = {}
-
-                    # Add per-node results to history
-                    for node_id in data.get("nodes_rewritten", []):
-                        if node_id not in history[qid]:
-                            history[qid][node_id] = []
-                        history[qid][node_id].append({
+                        history[qid]["attempts"].append({
                             "state": s,
                             "status": data.get("status", "unknown"),
                             "speedup": data.get("speedup", 0),
                             "transforms": data.get("transforms_applied", []),
+                            "original_sql": data.get("original_sql", ""),
+                            "optimized_sql": data.get("optimized_sql", ""),
                         })
-                except Exception:
-                    continue
+                    except Exception:
+                        continue
+
+            # Load promotion context from the NEXT state's promotion_context/
+            # (promote(s) creates state_{s+1}/promotion_context/)
+            next_state_dir = self.benchmark_dir / f"state_{s + 1}"
+            promo_dir = next_state_dir / "promotion_context"
+            if promo_dir.exists():
+                for path in promo_dir.glob("*.json"):
+                    try:
+                        data = json.loads(path.read_text())
+                        qid = data.get("query_id", path.stem)
+                        if qid not in history:
+                            history[qid] = {"attempts": [], "promotion": None}
+                        history[qid]["promotion"] = PromotionAnalysis.from_dict(data)
+                    except Exception:
+                        continue
 
         return history
 
@@ -605,67 +972,47 @@ class Pipeline:
     def _find_examples(
         self,
         sql: str,
-        annotation: AnnotationResult,
         engine: str = "duckdb",
         k: int = 3,
     ) -> List[Dict[str, Any]]:
-        """Find examples: gold first (by annotation pattern), then FAISS for the rest.
+        """Find gold examples via FAISS structural similarity.
 
-        Priority:
-        1. Gold examples matching annotated patterns (verified speedups)
-        2. FAISS similarity on fingerprinted SQL for remaining slots
+        Fingerprints the SQL (literals → placeholders, lowercase identifiers),
+        vectorizes the AST into 90 features, and finds the nearest gold
+        examples in the FAISS index.
 
-        Returns up to k examples.
+        Engine-specific: only returns examples for the current engine.
+        DuckDB queries get DuckDB examples, PostgreSQL gets PostgreSQL, etc.
+
+        Returns up to k examples sorted by similarity.
         """
+        from .knowledge import ADOFAISSRecommender
+
+        engine_dir = "postgres" if engine in ("postgresql", "postgres") else engine
+        dialect = "postgres" if engine_dir == "postgres" else engine_dir
         examples = []
         seen_ids = set()
 
-        # 1. Gold examples matching annotation patterns (sorted by speedup)
-        gold_candidates = []
-        for ann in annotation.rewrites:
-            ex = self.prompter.load_example_for_pattern(
-                ann.pattern, engine=engine, seed_dirs=self._seed_dirs,
-            )
-            if ex:
-                ex_id = ex.get("id", ann.pattern)
-                if ex_id not in seen_ids:
-                    speedup = self._parse_speedup(ex.get("verified_speedup", 0))
-                    gold_candidates.append((speedup, ex_id, ex))
-                    seen_ids.add(ex_id)
+        recommender = ADOFAISSRecommender()
+        if recommender._initialized:
+            matches = recommender.find_similar_examples(sql, k=k * 5, dialect=dialect)
+            for ex_id, score, meta in matches:
+                if len(examples) >= k:
+                    break
+                if score <= 0.0 or ex_id in seen_ids:
+                    continue
 
-        # Sort gold by speedup descending, take best ones first
-        gold_candidates.sort(key=lambda x: -x[0])
-        for _, ex_id, ex in gold_candidates:
-            if len(examples) >= k:
-                break
-            examples.append(ex)
+                # Strict engine filtering: only this engine's examples
+                ex_engine = meta.get("engine", "unknown")
+                if ex_engine != engine_dir:
+                    continue
 
-        # 2. Fill remaining slots with FAISS similarity matches (same engine + seed only)
-        if len(examples) < k:
-            from .knowledge import ADOFAISSRecommender
-
-            engine_dir = "postgres" if engine in ("postgresql", "postgres") else engine
-
-            recommender = ADOFAISSRecommender()
-            if recommender._initialized:
-                matches = recommender.find_similar_examples(sql, k=k * 5)
-                for ex_id, score, meta in matches:
-                    if len(examples) >= k:
-                        break
-                    if score <= 0.0 or ex_id in seen_ids:
-                        continue
-
-                    # Only allow same engine or seed (generic) examples
-                    ex_engine = meta.get("engine", "unknown")
-                    if ex_engine not in (engine_dir, "seed", "unknown"):
-                        continue
-
-                    seen_ids.add(ex_id)
-                    ex_data = self.prompter.load_example_for_pattern(
-                        ex_id, engine=engine, seed_dirs=self._seed_dirs,
-                    )
-                    if ex_data:
-                        examples.append(ex_data)
+                seen_ids.add(ex_id)
+                ex_data = self.prompter.load_example_for_pattern(
+                    ex_id, engine=engine, seed_dirs=self._seed_dirs,
+                )
+                if ex_data:
+                    examples.append(ex_data)
 
         return examples
 

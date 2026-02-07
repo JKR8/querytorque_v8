@@ -23,7 +23,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .schemas import AnnotationResult, EdgeContract, NodeAnnotation
+from .schemas import AnnotationResult, EdgeContract, NodeAnnotation, PromotionAnalysis
 
 logger = logging.getLogger(__name__)
 
@@ -54,11 +54,12 @@ class Prompter:
         dag: Any,
         costs: Dict[str, Any],
         annotation: AnnotationResult,
-        history: Optional[List[Dict[str, Any]]] = None,
+        history: Optional[Dict[str, Any]] = None,
         examples: Optional[List[Dict[str, Any]]] = None,
+        expert_analysis: Optional[str] = None,
         dialect: str = "duckdb",
     ) -> str:
-        """Build the 9-section full-query rewrite prompt.
+        """Build the full-query rewrite prompt.
 
         Args:
             query_id: Query identifier (e.g., 'query_1')
@@ -66,8 +67,12 @@ class Prompter:
             dag: Parsed DAG from Phase 1 (DagBuilder output)
             costs: Per-node cost analysis from CostAnalyzer
             annotation: Phase 2 annotation result ({node: pattern} mapping)
-            history: Previous attempts on this query
+            history: Previous attempts and promotion context for this query.
+                     Dict with 'attempts' (list) and 'promotion' (PromotionAnalysis).
             examples: List of gold examples (FAISS-matched, up to 3)
+            expert_analysis: Pre-computed LLM analyst output (analyst mode only).
+                             When present, replaces pattern hints + examples with
+                             concrete structural guidance.
             dialect: SQL dialect for pretty-printing
         """
         sections = []
@@ -88,12 +93,18 @@ class Prompter:
         if history:
             sections.append(self._section_history(history))
 
-        # Section 6: Pattern Hints (EARLY-MID)
-        sections.append(self._section_pattern_hints(annotation))
+        if expert_analysis:
+            # Analyst mode: inject the LLM analysis instead of pattern hints
+            # This gives the rewrite LLM concrete structural guidance
+            sections.append(expert_analysis)
+        else:
+            # Default mode: FAISS-matched gold examples + pattern hints
+            # Section 6: Pattern Hints (EARLY-MID)
+            sections.append(self._section_pattern_hints(annotation))
 
-        # Section 7: Examples (MIDDLE) — up to 3 FAISS-matched
-        if examples:
-            sections.append(self._section_examples(examples))
+            # Section 7: Examples (MIDDLE) — up to 3 FAISS-matched
+            if examples:
+                sections.append(self._section_examples(examples))
 
         # Section 8: Constraints (LATE-MID, sandwich ordered)
         sections.append(self._section_constraints())
@@ -252,29 +263,72 @@ class Prompter:
         return "\n".join(lines)
 
     @staticmethod
-    def _section_history(history: List[Dict[str, Any]]) -> str:
-        """Section 5: History of previous attempts."""
-        lines = [
-            "## History",
-            "",
-            "Previous optimization attempts on this query:",
-        ]
+    def _section_history(history: Dict[str, Any]) -> str:
+        """Section 5: History of previous attempts with promotion context.
 
-        for attempt in history[-5:]:
-            status = attempt.get("status", "unknown")
-            transforms = attempt.get("transforms", [])
-            speedup = attempt.get("speedup", 0)
-            error = attempt.get("error", "")
+        If the query was promoted from a previous state, includes:
+        - The original SQL before optimization
+        - The optimized SQL that achieved the speedup
+        - LLM analysis of what the transform did and why it worked
+        - Suggestions for further optimization
+        """
+        lines = ["## Optimization History", ""]
 
-            t_str = ", ".join(transforms) if transforms else "unknown"
-            if status in ("error", "ERROR"):
-                lines.append(f"- {t_str}: ERROR — {error}")
-            elif speedup < 0.95:
-                lines.append(f"- {t_str}: REGRESSION ({speedup:.2f}x), reverted")
-            elif speedup >= 1.10:
-                lines.append(f"- {t_str}: {speedup:.2f}x improvement")
-            else:
-                lines.append(f"- {t_str}: {speedup:.2f}x (neutral)")
+        # Promotion context (most valuable — shows what already worked)
+        promotion = history.get("promotion")
+        if isinstance(promotion, PromotionAnalysis):
+            lines.append(
+                f"### Previous Winning Optimization "
+                f"(State {promotion.state_promoted_from} → {promotion.speedup:.2f}x)"
+            )
+            lines.append("")
+            lines.append(
+                f"**Transforms applied:** {', '.join(promotion.transforms)}"
+            )
+            lines.append("")
+            lines.append("**Original SQL (BEFORE optimization):**")
+            lines.append(f"```sql\n{promotion.original_sql}\n```")
+            lines.append("")
+            lines.append(
+                f"**Current SQL (AFTER optimization, {promotion.speedup:.2f}x faster):**"
+            )
+            lines.append(f"```sql\n{promotion.optimized_sql}\n```")
+            lines.append("")
+            lines.append("**Analysis — what the transform did and why it worked:**")
+            lines.append(promotion.analysis)
+            lines.append("")
+            lines.append("**Suggestions — further optimization opportunities:**")
+            lines.append(promotion.suggestions)
+            lines.append("")
+            lines.append(
+                "Your task: build on this success. The current SQL above is your "
+                "starting point. Apply the suggested optimizations or find new "
+                "opportunities the previous round missed."
+            )
+            lines.append("")
+
+        # Previous attempts summary (what was tried, what failed)
+        attempts = history.get("attempts", [])
+        if attempts:
+            lines.append("### All Previous Attempts")
+            lines.append("")
+            for attempt in attempts[-5:]:
+                status = attempt.get("status", "unknown")
+                transforms = attempt.get("transforms", [])
+                speedup = attempt.get("speedup", 0)
+                error = attempt.get("error", "")
+
+                t_str = ", ".join(transforms) if transforms else "unknown"
+                if status in ("error", "ERROR"):
+                    lines.append(f"- {t_str}: ERROR — {error}")
+                elif speedup < 0.95:
+                    lines.append(
+                        f"- {t_str}: REGRESSION ({speedup:.2f}x), reverted"
+                    )
+                elif speedup >= 1.10:
+                    lines.append(f"- {t_str}: **{speedup:.2f}x improvement** ✓")
+                else:
+                    lines.append(f"- {t_str}: {speedup:.2f}x (neutral)")
 
         return "\n".join(lines)
 
