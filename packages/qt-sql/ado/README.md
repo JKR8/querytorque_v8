@@ -1,64 +1,35 @@
-# ADO (Autonomous Data Optimization)
+# ADO — Autonomous Data Optimization
 
-ADO is a parallel optimization loop that uses fast validation (sf5) to generate, evaluate, and learn from candidate rewrites. The loop is intentionally compact and stateful: each round feeds relevance-ordered knowledge from other candidates into the next attempt.
+Iterative SQL optimization engine: parse query structure, retrieve similar examples via FAISS, generate rewrites with LLM, validate with real execution timing.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   ADO RUNNER (Orchestrator)                 │
-└─────────────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 1) PREPARE (Plan the attempt)                               │
-│    - build ContextBundle (plan + stats + heuristics)         │
-│    - fetch Knowledge (FAISS examples + constraints)          │
-│    - rank AttemptHistory by relevance (from last round)      │
-│    - build Prompt (generated from DAG v2 + v3 wrapper)       │
-└─────────────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 2) GENERATE (Parallel)                                      │
-│    - produce N candidates (diverse styles)                   │
-│    - record provenance (examples, style, neighbors)          │
-└─────────────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 3) VALIDATE + PICK                                           │
-│    - correctness + timing + plan deltas                      │
-│    - pick best passing candidate                             │
-└─────────────────────────────────────────────────────────────┘
-            │
-            ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 4) LEARN + STORE                                              │
-│    - aggregate wins/failures to update scores                │
-│    - update AttemptHistory relevance for next attempt         │
-│    - update retrieval index + curate gold queue               │
-└─────────────────────────────────────────────────────────────┘
+## Quick Start
 
-         ┌──────────────────────────────────────────┐
-         │ If no winner: adjust strategy and loop    │
-         │ (rotate examples, increase diversity,     │
-         │ switch validation profile)                │
-         └──────────────────────────────────────────┘
+```python
+from ado import ADORunner, ADOConfig
+
+runner = ADORunner(ADOConfig(
+    benchmark_dir="benchmarks/duckdb_tpcds",
+))
+result = runner.run_query("query_1", sql)
+print(f"{result.query_id}: {result.status} {result.speedup:.2f}x")
 ```
 
-## Start Building
+## Documentation
 
-Planned components (stubs to implement):
+Full architecture, module reference, and configuration: **[docs/ADO_WORKFLOW.md](docs/ADO_WORKFLOW.md)**
 
-- `ado/context.py`: build ContextBundle (plan + stats + heuristics)
-- `ado/knowledge.py`: FAISS retrieval + constraint selection
-- `ado/prompt.py`: prompt assembly (DAG v2 base + v3 wrapper)
-- `ado/generate.py`: parallel candidate generation + provenance
-- `ado/validate.py`: correctness + speed + plan deltas
-- `ado/learn.py`: score updates + AttemptHistory ranking
-- `ado/store.py`: write artifacts + update indexes + gold queue
+## Structure
 
-## Defaults
-
-- Engine: DuckDB
-- Validation DB: sf5 (`/mnt/d/TPC-DS/tpcds_sf5.duckdb`)
-- Candidates per round: 10
+```
+ado/
+├── core/           # Python modules (pipeline, prompter, validator, etc.)
+├── constraints/    # 11 optimization constraint rules (JSON)
+├── examples/       # 31 gold examples + regression anti-patterns (JSON)
+├── models/         # FAISS similarity index + metadata
+├── benchmarks/     # Per-engine benchmark configs, queries, results
+│   ├── duckdb_tpcds/    → leaderboard.json + leaderboard.md (auto-generated)
+│   ├── postgres_dsb/    → leaderboard.json + leaderboard.md (auto-generated)
+│   └── snowflake_tpcds/ → stub
+├── learnings/      # Cross-benchmark learning records
+└── docs/           # Architecture and reference documentation
+```
