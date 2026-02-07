@@ -131,14 +131,14 @@ class ADORunner:
         self,
         query_id: str,
         sql: str,
-        max_iterations: int = 5,
-        target_speedup: float = 1.5,
+        max_iterations: int = 3,
+        target_speedup: float = 2.0,
         n_workers: int = 3,
     ) -> ADOResult:
         """Run deep-dive analyst mode on a single query.
 
-        Iteratively optimizes from the ORIGINAL SQL with full history
-        across iterations. Uses the LLM analyst for structural guidance.
+        Always optimizes from the ORIGINAL SQL with full history.
+        Generates LLM failure analysis when speedup < target.
 
         Args:
             query_id: Query identifier (e.g., 'query_88')

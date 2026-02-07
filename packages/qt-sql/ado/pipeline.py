@@ -481,21 +481,21 @@ class Pipeline:
         self,
         query_id: str,
         sql: str,
-        max_iterations: int = 5,
-        target_speedup: float = 1.5,
+        max_iterations: int = 3,
+        target_speedup: float = 2.0,
         n_workers: int = 3,
     ) -> "AnalystSession":
         """Run iterative deep-dive optimization on a single query.
 
-        The analyst session runs multiple iterations, always optimizing from
-        the ORIGINAL SQL with full history of all previous attempts. Each
-        iteration uses the LLM analyst for structural guidance.
+        Always optimizes from the ORIGINAL SQL with full history.
+        Generates LLM failure analysis when speedup < target.
+        Stops when target reached or max iterations exhausted.
 
         Args:
             query_id: Query identifier (e.g., 'query_88')
             sql: Original SQL query (never modified)
-            max_iterations: Max optimization rounds (default 5)
-            target_speedup: Stop early when this speedup is reached
+            max_iterations: Max optimization rounds (default 3)
+            target_speedup: Stop early when this speedup is reached (default 2.0)
             n_workers: Parallel workers per iteration
 
         Returns:

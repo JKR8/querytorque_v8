@@ -769,6 +769,178 @@ def parse_example_overrides(response: str) -> Optional[List[str]]:
     return ids
 
 
+def build_failure_analysis_prompt(
+    query_id: str,
+    original_sql: str,
+    attempted_sql: str,
+    target_speedup: float,
+    actual_speedup: float,
+    status: str,
+    transforms: List[str],
+    dag_original: Any,
+    costs_original: Any,
+    dag_attempted: Any,
+    costs_attempted: Any,
+    previous_attempts: List[Any],
+    dialect: str = "duckdb",
+) -> str:
+    """Build prompt for LLM to analyze why optimization failed to reach target.
+
+    Returns prompt asking 4 critical questions:
+    1. What went wrong?
+    2. Why was speedup insufficient?
+    3. What should the NEXT attempt try?
+    4. What constraints did we learn?
+    """
+    lines = []
+
+    # Context
+    lines.append(
+        "You are a database performance expert analyzing a failed optimization attempt."
+    )
+    lines.append(f"**Target**: {target_speedup:.1f}x speedup")
+    lines.append(f"**Achieved**: {actual_speedup:.2f}x ({status})")
+    lines.append("")
+
+    if actual_speedup < 1.0:
+        lines.append("WARNING: The optimization REGRESSED performance. This is critical.")
+    elif actual_speedup < 1.1:
+        lines.append("The optimization barely improved performance.")
+    else:
+        lines.append(
+            f"The optimization improved performance but fell short of "
+            f"the {target_speedup:.1f}x target."
+        )
+    lines.append("")
+
+    # Pretty-print SQL helper
+    def _pp(sql: str) -> str:
+        try:
+            import sqlglot
+            return sqlglot.transpile(sql, read=dialect, write=dialect, pretty=True)[0]
+        except Exception:
+            return sql
+
+    # Original query
+    lines.append("## Original SQL")
+    lines.append("```sql")
+    lines.append(_pp(original_sql))
+    lines.append("```")
+    lines.append("")
+
+    # Attempted optimization
+    lines.append("## Attempted Optimization")
+    lines.append(
+        f"**Transforms applied**: "
+        f"{', '.join(transforms) if transforms else 'unknown'}"
+    )
+    lines.append("```sql")
+    lines.append(_pp(attempted_sql))
+    lines.append("```")
+    lines.append("")
+
+    # DAG comparison
+    lines.append("## Performance Analysis")
+    lines.append("")
+    lines.append("### Original Query Structure")
+    _append_dag_summary(lines, dag_original, costs_original)
+    lines.append("")
+    lines.append("### Attempted Query Structure")
+    _append_dag_summary(lines, dag_attempted, costs_attempted)
+    lines.append("")
+
+    # Previous attempts (if any)
+    if previous_attempts:
+        lines.append("## Previous Attempts")
+        for i, att in enumerate(previous_attempts, 1):
+            t_str = (
+                ", ".join(att.transforms) if att.transforms else "unknown"
+            )
+            lines.append(
+                f"**Attempt {i}**: {t_str} -> {att.status} ({att.speedup:.2f}x)"
+            )
+            if att.failure_analysis:
+                preview = (
+                    att.failure_analysis[:150] + "..."
+                    if len(att.failure_analysis) > 150
+                    else att.failure_analysis
+                )
+                lines.append(f"  Analysis: {preview}")
+        lines.append("")
+
+    # The 4 critical questions
+    lines.append("## Your Task")
+    lines.append("")
+    lines.append("Analyze this failed attempt and answer these questions:")
+    lines.append("")
+    lines.append("### 1. What went wrong?")
+    lines.append(
+        "Explain the specific mechanism that prevented reaching the target speedup."
+    )
+    lines.append(
+        "Don't just say 'the transform didn't work' - explain WHY "
+        "at the query execution level."
+    )
+    lines.append("")
+    lines.append("### 2. Why was the speedup insufficient?")
+    lines.append(
+        "Identify the bottleneck that is STILL present after this optimization."
+    )
+    lines.append(
+        "Use the DAG cost analysis above to pinpoint the dominant cost center."
+    )
+    lines.append("")
+    lines.append("### 3. What should the NEXT attempt try?")
+    lines.append(
+        f"Propose a DIFFERENT structural approach that could reach "
+        f"{target_speedup:.1f}x."
+    )
+    lines.append(
+        "Be specific: what transforms, what query restructuring, what mechanism."
+    )
+    lines.append(
+        "If previous attempts tried similar approaches, suggest something NOVEL."
+    )
+    lines.append("")
+    lines.append("### 4. What did this failure teach us?")
+    lines.append(
+        "What constraints or patterns should we AVOID in the next attempt?"
+    )
+    lines.append("")
+    lines.append("Format your response with these exact section headers:")
+    lines.append("```")
+    lines.append("### What went wrong")
+    lines.append("[Explain the mechanism]")
+    lines.append("")
+    lines.append("### Why speedup was insufficient")
+    lines.append("[Bottleneck analysis]")
+    lines.append("")
+    lines.append("### Next approach")
+    lines.append("[Specific recommendation]")
+    lines.append("")
+    lines.append("### Learned constraints")
+    lines.append("[What to avoid]")
+    lines.append("```")
+
+    return "\n".join(lines)
+
+
+def _append_dag_summary(lines: List[str], dag: Any, costs: Any) -> None:
+    """Append DAG node summary with costs for failure analysis."""
+    if not hasattr(dag, "nodes") or not dag.nodes:
+        lines.append("(DAG unavailable)")
+        return
+
+    for nid in dag.nodes:
+        node = dag.nodes[nid]
+        cost = costs.get(nid) if isinstance(costs, dict) else None
+        cost_pct = cost.cost_pct if cost and hasattr(cost, "cost_pct") else 0
+        row_est = cost.row_estimate if cost and hasattr(cost, "row_estimate") else 0
+        lines.append(
+            f"- **{nid}**: ~{row_est} rows, {cost_pct:.0f}% cost"
+        )
+
+
 def format_analysis_for_prompt(analysis: Dict[str, str]) -> str:
     """Format the parsed analysis into a prompt section for the rewrite LLM.
 
