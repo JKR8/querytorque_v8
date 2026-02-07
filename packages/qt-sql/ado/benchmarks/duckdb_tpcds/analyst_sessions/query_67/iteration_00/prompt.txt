@@ -127,84 +127,135 @@ FROM (
 - **materialize_cte**: 20% success rate (5 attempts) — usually causes regressions
 
 ### Example Effectiveness
+- **decorrelate**: 50% led to success (2 recommendations)
 - **early_filter**: 50% led to success (2 recommendations)
 - **single_pass_aggregation**: 0% led to success (3 recommendations)
 - **dimension_cte_isolate**: 0% led to success (2 recommendations)
-- **prefetch_fact_join**: 0% led to success (2 recommendations)
+- **deferred_window_aggregation**: 0% led to success (2 recommendations)
+- **prefetch_fact_join**: 0% led to success (3 recommendations)
 
 ### Common Error Patterns
 - **execution**: 4 occurrences
+- **None**: 1 occurrences
 
+
+## Expert Analysis
+
+### Query Structure
+**Innermost subquery (dw1)**: Computes aggregated sales (price × quantity) for store sales over a 12-month period (month_seq 1206-1217). Joins store_sales (fact table) with date_dim (date filter), store, and item (dimensions). Uses ROLLUP to generate hierarchical subtotals across 8 grouping dimensions. Processes ~5.4M fact rows with dimensions, outputs aggregated rows for all grouping combinations.
+
+**Middle subquery (dw2)**: Computes rank within each i_category partition based on sumsales DESC. Takes dw1's aggregated result, applies window function to rank sales performance per category across all ROLLUP levels (including subtotal rows where some dimensions are NULL).
+
+**Outer query**: Filters to top 100 ranks per category, orders by all 10 columns (including grouping dimensions and sumsales), then limits to 100 total rows. Final output shows top performers within each category across multiple aggregation levels.
+
+### Performance Bottleneck
+The dominant cost center is the **large ROLLUP aggregation on 5.4M fact rows joined with 3 dimension tables**. The MECHANISM causing slowness is:
+
+1. **Unfiltered dimension joins**: All three dimension tables (date_dim, store, item) are joined in their entirety before any aggregation, though only date_dim has a filter predicate.
+2. **Excessive ROLLUP cardinality**: ROLLUP on 8 columns generates 2^8 = 256 grouping sets. With 5.4M input rows, this creates massive intermediate results before the window function.
+3. **Late filtering**: The rank filter (rk <= 100) and LIMIT 100 are applied AFTER computing the entire ROLLUP and window function, wasting computation on rows that won't make the final cut.
+
+The window function itself partitions by i_category and sorts by sumsales DESC, which requires a sort of the entire ROLLUP result per category. This is expensive but a symptom of the large input, not the root cause.
+
+### Proposed Optimization Strategy
+**Optimization 1: Pre-filter dimensions into CTEs before join**
+- **What**: Extract filtered date_dim (month_seq filter), store (no filter), and item (no filter) into separate CTEs before joining with store_sales.
+- **Why**: DuckDB can build smaller hash tables for dimension joins. The date_dim filter reduces dimension size early, and separate CTEs help the optimizer push predicates.
+- **Risk**: Must ensure all needed columns are preserved (d_year, d_qoy, d_moy from date_dim). No semantic change.
+- **Estimated impact**: Moderate (1.3-1.5x)
+
+**Optimization 2: Push rank filtering into subquery**
+- **What**: Convert RANK() window to use QUALIFY clause or move filter earlier: `QUALIFY RANK() OVER (PARTITION BY i_category ORDER BY sumsales DESC) <= 100`
+- **Why**: DuckDB's optimizer may push the rank filter down, reducing the amount of data sorted and processed by the window function. Currently processes all ROLLUP rows, then filters 99%+ away.
+- **Risk**: QUALIFY syntax may not be supported or may change semantics with NULL groups from ROLLUP. Must test thoroughly.
+- **Estimated impact**: Significant (2-3x if optimization works)
+
+**Optimization 3: Eliminate unnecessary ROLLUP columns for ranking**
+- **What**: The business question likely wants ranking at the most granular level (product-store-month), but ROLLUP creates aggregated rows (like category totals) that also get ranked. Consider if business logic requires ranking aggregated subtotals.
+- **Why**: If only granular rankings matter, remove ROLLUP or filter out aggregated rows (where any grouping column is NULL) before ranking.
+- **Risk**: Changes semantics if business needs category/subcategory rankings.
+- **Estimated impact**: Major (3-5x reduction in rows to rank)
+
+### Lessons from Previous Failures
+**Previous attempt: date_cte_isolate → REGRESSION (0.85x)**
+- **Why it failed**: Isolating date_dim into a CTE likely prevented join reordering or predicate pushdown that DuckDB's optimizer could do with the original explicit joins. The date filter (d_month_seq BETWEEN) is already selective; forcing materialization may have added overhead.
+- **Constraint learned**: DuckDB's optimizer handles simple dimension filtering well in explicit joins. Structural changes must preserve the optimizer's ability to reorder joins based on statistics.
+
+### Recommended Approach
+Implement a **two-phase filtering strategy**:
+
+1. **Create filtered fact CTE**: First join store_sales with ONLY date_dim (filtered) to reduce fact rows early using the selective date predicate. This leverages date_dim's small size and selective filter.
+   
+2. **Materialize dimension CTEs**: Create CTEs for store and item with only needed columns (store_id, item category/brand/etc.) to serve as dimension lookups.
+
+3. **Join filtered fact with dimensions**: Join the reduced fact set with store and item CTEs.
+
+4. **Apply QUALIFY for early rank filtering**: Use DuckDB's QUALIFY clause to filter during window computation rather than after.
+
+The key insight: **date_dim is the most selective filter and should be applied BEFORE other dimension joins**. Store and item have no filters, so joining them early adds cost without reducing rows.
+
+Implementation sketch:
+```sql
+WITH filtered_dates AS (
+  SELECT d_date_sk, d_year, d_qoy, d_moy
+  FROM date_dim
+  WHERE d_month_seq BETWEEN 1206 AND 1206 + 11
+),
+filtered_sales AS (
+  SELECT ss_sales_price, ss_quantity, ss_item_sk, ss_store_sk,
+         d.d_year, d.d_qoy, d.d_moy
+  FROM store_sales ss
+  JOIN filtered_dates d ON ss.ss_sold_date_sk = d.d_date_sk
+),
+item_dim AS (
+  SELECT i_item_sk, i_category, i_class, i_brand, i_product_name
+  FROM item
+),
+store_dim AS (
+  SELECT s_store_sk, s_store_id
+  FROM store
+)
+SELECT i_category, i_class, i_brand, i_product_name,
+       d_year, d_qoy, d_moy, s_store_id, sumsales,
+       RANK() OVER (PARTITION BY i_category ORDER BY sumsales DESC) AS rk
+FROM (
+  SELECT i_category, i_class, i_brand, i_product_name,
+         d_year, d_qoy, d_moy, s_store_id,
+         SUM(COALESCE(ss_sales_price * ss_quantity, 0)) AS sumsales
+  FROM filtered_sales fs
+  JOIN item_dim i ON fs.ss_item_sk = i.i_item_sk
+  JOIN store_dim s ON fs.ss_store_sk = s.s_store_sk
+  GROUP BY ROLLUP(i_category, i_class, i_brand, i_product_name,
+                  d_year, d_qoy, d_moy, s_store_id)
+) dw1
+QUALIFY rk <= 100
+ORDER BY i_category, i_class, i_brand, i_product_name,
+         d_year, d_qoy, d_moy, s_store_id, sumsales, rk
+LIMIT 100;
+```
+
+## 6. EXAMPLE SELECTION
+
+**FAISS picks**: deferred_window_aggregation, prefetch_fact_join, decorrelate
+
+**My selection**: 
+- **prefetch_fact_join** (most relevant): Pre-filtering date_dim and pre-joining with fact table matches our strategy.
+- **early_filter**: Directly applicable - filter date_dim first before other joins.
+- **dimension_cte_isolate**: Creating CTEs for store and item dimensions isolates them for cleaner optimization.
+
+**Why not deferred_window_aggregation**: The window function depends on the ROLLUP aggregation result, so it cannot be deferred past joins. The window is the final computation step.
+
+**Why not decorrelate**: No correlated subqueries in this query.
+
+EXAMPLES: prefetch_fact_join, early_filter, dimension_cte_isolate
+
+Apply the recommended strategy above. The analysis has already identified the bottleneck and the specific structural change needed. Focus on implementing it correctly while preserving semantic equivalence.
 
 ## Reference Examples
 
 The following examples are for **pattern reference only**. Do not copy their table names, column names, or literal values into your rewrite. Use only the schema and tables from the target query above.
 
-### 1. deferred_window_aggregation (1.36x)
-
-**Principle:** Deferred Aggregation: delay expensive operations (window functions) until after joins reduce the dataset. Computing window functions inside individual CTEs then joining is more expensive than joining first and computing windows once on the combined result.
-
-**BEFORE (slow):**
-```sql
-WITH web_v1 as (
-select
-  ws_item_sk item_sk, d_date,
-  sum(sum(ws_sales_price))
-      over (partition by ws_item_sk order by d_date rows between unbounded preceding and current row) cume_sales
-from web_sales
-    ,date_dim
-where ws_sold_date_sk=d_date_sk
-  and d_month_seq between 1216 and 1216+11
-  and ws_item_sk is not NULL
-group by ws_item_sk, d_date),
-store_v1 as (
-select
-  ss_item_sk item_sk, d_date,
-  sum(sum(ss_sales_price))
-      over (partition by ss_item_sk order by d_date rows between unbounded preceding and current row) cume_sales
-from store_sales
-    ,date_dim
-where ss_sold_date_sk=d_date_sk
-  and d_month_seq between 1216 and 1216+11
-  and ss_item_sk is not NULL
-group by ss_item_sk, d_date)
- select *
-from (select item_sk
-     ,d_date
-     ,web_sales
-     ,store_sales
-     ,max(web_sales)
-         over (partition by item_sk order by d_date rows between unbounded preceding and current row) web_cumulative
-     ,max(store_sales)
-         over (partition by item_sk order by d_date rows between unbounded preceding and current row) store_cumulative
-     from (select case when web.item_sk is not null then web.item_sk else store.item_sk end item_sk
-                 ,case when web.d_date is not null then web.d_date else store.d_date end d_date
-                 ,web.cume_sales web_sales
-                 ,store.cume_sales store_sales
-           from web_v1 web full outer join store_v1 store on (web.item_sk = store.item_sk
-                                                          and web.d_date = store.d_date)
-          )x )y
-where web_cumulative > store_cumulative
-order by item_sk
-        ,d_date
- LIMIT 100;
-```
-
-**AFTER (fast):**
-[web_daily]:
-```sql
-SELECT ws_item_sk AS item_sk, d_date, SUM(ws_sales_price) AS daily_sales FROM web_sales, date_dim WHERE ws_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ws_item_sk IS NOT NULL GROUP BY ws_item_sk, d_date
-```
-[store_daily]:
-```sql
-SELECT ss_item_sk AS item_sk, d_date, SUM(ss_sales_price) AS daily_sales FROM store_sales, date_dim WHERE ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ss_item_sk IS NOT NULL GROUP BY ss_item_sk, d_date
-```
-[main_query]:
-```sql
-SELECT * FROM (SELECT COALESCE(web.item_sk, store.item_sk) AS item_sk, COALESCE(web.d_date, store.d_date) AS d_date, SUM(web.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS web_cumulative, SUM(store.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS store_cumulative FROM web_daily web FULL OUTER JOIN store_daily store ON web.item_sk = store.item_sk AND web.d_date = store.d_date) y WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100
-```
-
-### 2. prefetch_fact_join (3.77x)
+### 1. prefetch_fact_join (3.77x)
 
 **Principle:** Staged Join Pipeline: build a CTE chain that progressively reduces data — first CTE filters the dimension, second CTE pre-joins filtered dimension keys with the fact table, subsequent CTEs join remaining dimensions against the already-reduced fact set.
 
@@ -252,52 +303,89 @@ SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_moy FROM store_sales JOIN filt
 SELECT * FROM (SELECT i_manager_id, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales FROM item JOIN filtered_sales ON ss_item_sk = i_item_sk JOIN store ON ss_store_sk = s_store_sk WHERE ((i_category IN ('Books', 'Children', 'Electronics') AND i_class IN ('personal', 'portable', 'reference', 'self-help') AND i_brand IN (...)) OR (i_category IN ('Women', 'Music', 'Men') AND i_class IN ('accessories', 'classical', 'fragrances', 'pants') AND i_brand IN (...))) GROUP BY i_manager_id, d_moy) AS tmp1 WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
 ```
 
-### 3. decorrelate (2.92x)
+### 2. early_filter (4.00x)
 
-**Principle:** Decorrelation: convert correlated subqueries to standalone CTEs with GROUP BY, then JOIN. Correlated subqueries re-execute per outer row; a pre-computed CTE executes once.
+**Principle:** Early Selection: filter small dimension tables first, then join to large fact tables. This reduces the fact table scan to only rows matching the filter, rather than scanning all rows and filtering after the join.
 
 **BEFORE (slow):**
 ```sql
-with customer_total_return as
-(select sr_customer_sk as ctr_customer_sk
-,sr_store_sk as ctr_store_sk
-,sum(SR_FEE) as ctr_total_return
-from store_returns
-,date_dim
-where sr_returned_date_sk = d_date_sk
-and d_year =2000
-group by sr_customer_sk
-,sr_store_sk)
- select c_customer_id
-from customer_total_return ctr1
-,store
-,customer
-where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2
-from customer_total_return ctr2
-where ctr1.ctr_store_sk = ctr2.ctr_store_sk)
-and s_store_sk = ctr1.ctr_store_sk
-and s_state = 'SD'
-and ctr1.ctr_customer_sk = c_customer_sk
-order by c_customer_id
+select ss_customer_sk
+            ,sum(act_sales) sumsales
+      from (select ss_item_sk
+                  ,ss_ticket_number
+                  ,ss_customer_sk
+                  ,case when sr_return_quantity is not null then (ss_quantity-sr_return_quantity)*ss_sales_price
+                                                            else (ss_quantity*ss_sales_price) end act_sales
+            from store_sales left outer join store_returns on (sr_item_sk = ss_item_sk
+                                                               and sr_ticket_number = ss_ticket_number)
+                ,reason
+            where sr_reason_sk = r_reason_sk
+              and r_reason_desc = 'duplicate purchase') t
+      group by ss_customer_sk
+      order by sumsales, ss_customer_sk
  LIMIT 100;
 ```
 
 **AFTER (fast):**
+[filtered_reason]:
+```sql
+SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'
+```
 [filtered_returns]:
 ```sql
-SELECT sr.sr_customer_sk, sr.sr_store_sk, sr.sr_fee FROM store_returns sr JOIN date_dim d ON sr.sr_returned_date_sk = d.d_date_sk JOIN store s ON sr.sr_store_sk = s.s_store_sk WHERE d.d_year = 2000 AND s.s_state = 'SD'
-```
-[customer_total_return]:
-```sql
-SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(sr_fee) AS ctr_total_return FROM filtered_returns GROUP BY sr_customer_sk, sr_store_sk
-```
-[store_avg_return]:
-```sql
-SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk
+SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk
 ```
 [main_query]:
 ```sql
-SELECT c.c_customer_id FROM customer_total_return ctr1 JOIN store_avg_return sar ON ctr1.ctr_store_sk = sar.ctr_store_sk JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk WHERE ctr1.ctr_total_return > sar.avg_return_threshold ORDER BY c.c_customer_id LIMIT 100
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
+```
+
+### 3. dimension_cte_isolate (1.93x)
+
+**Principle:** Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
+
+**BEFORE (slow):**
+```sql
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year = 2000
+```
+[filtered_customer_demographics]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'
+```
+[filtered_promotions]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+```
+[joined_facts]:
+```sql
+SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales AS cs JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk
+```
+[main_query]:
+```sql
+SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM joined_facts AS jf JOIN item AS i ON jf.cs_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
 ```
 
 ## Regression Warnings

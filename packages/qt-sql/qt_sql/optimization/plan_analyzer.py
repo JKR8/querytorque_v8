@@ -108,19 +108,25 @@ class OptimizationContext:
 
 
 def analyze_plan_for_optimization(
-    plan_json: dict[str, Any],
+    plan_json: dict[str, Any] | list,
     sql: str,
+    engine: str = "duckdb",
 ) -> OptimizationContext:
     """Extract optimization signals from EXPLAIN plan and SQL.
 
     Args:
-        plan_json: DuckDB EXPLAIN (ANALYZE, FORMAT JSON) output
+        plan_json: EXPLAIN JSON output (DuckDB dict or PostgreSQL list)
         sql: The original SQL query
+        engine: Database engine ("duckdb" or "postgresql"/"postgres")
 
     Returns:
         OptimizationContext with all extracted signals
     """
     ctx = OptimizationContext()
+
+    # Normalize PostgreSQL plans to internal (DuckDB-like) format
+    if engine in ("postgresql", "postgres") or isinstance(plan_json, list):
+        plan_json = _normalize_pg_plan(plan_json)
 
     # Extract from plan
     _extract_operators(plan_json, ctx)
@@ -132,6 +138,74 @@ def analyze_plan_for_optimization(
     _extract_data_flow(sql, ctx)
 
     return ctx
+
+
+def _normalize_pg_plan(pg_plan: list | dict) -> dict[str, Any]:
+    """Convert PostgreSQL EXPLAIN (ANALYZE, FORMAT JSON) to internal format.
+
+    PG format: [{"Plan": {"Node Type": ..., "Actual Total Time": ..., "Plans": [...]}}]
+    Internal:  {"children": [{"operator_name": ..., "operator_timing": ..., "children": [...]}]}
+
+    PG times are inclusive (include children) in milliseconds.
+    Internal times are exclusive in seconds.
+    """
+    # Unwrap PG list wrapper
+    if isinstance(pg_plan, list):
+        if not pg_plan:
+            return {"children": []}
+        pg_plan = pg_plan[0]
+
+    root = pg_plan.get("Plan", pg_plan)
+
+    def _exclusive_time_s(node: dict) -> float:
+        """Compute exclusive time in seconds (subtract children)."""
+        inclusive_ms = node.get("Actual Total Time", 0.0) * node.get("Actual Loops", 1)
+        children_ms = sum(
+            c.get("Actual Total Time", 0.0) * c.get("Actual Loops", 1)
+            for c in node.get("Plans", [])
+        )
+        return max(0.0, inclusive_ms - children_ms) / 1000.0
+
+    def _convert_node(node: dict) -> dict[str, Any]:
+        loops = node.get("Actual Loops", 1)
+        actual_rows = node.get("Actual Rows", 0) * loops
+        rows_removed = node.get("Rows Removed by Filter", 0) * loops
+
+        # Build node type string (append join type if present)
+        node_type = node.get("Node Type", "")
+        join_type = node.get("Join Type", "")
+        if join_type:
+            op_name = f"{node_type} ({join_type})"
+        else:
+            op_name = node_type
+
+        result: dict[str, Any] = {
+            "operator_name": op_name,
+            "operator_timing": _exclusive_time_s(node),
+            "operator_cardinality": actual_rows,
+            "operator_rows_scanned": actual_rows + rows_removed,
+        }
+
+        # Build extra_info for scans and cardinality estimates
+        extra: dict[str, Any] = {}
+        if "Relation Name" in node:
+            extra["Table"] = node["Relation Name"]
+        if node.get("Filter"):
+            extra["Filters"] = node["Filter"]
+        if node.get("Index Cond"):
+            extra["Index Cond"] = node["Index Cond"]
+        plan_rows = node.get("Plan Rows", 0)
+        if plan_rows:
+            extra["Estimated Cardinality"] = str(plan_rows)
+        if extra:
+            result["extra_info"] = extra
+
+        # Recurse children
+        result["children"] = [_convert_node(c) for c in node.get("Plans", [])]
+        return result
+
+    converted = _convert_node(root)
+    return {"children": [converted]}
 
 
 def _extract_operators(plan_json: dict[str, Any], ctx: OptimizationContext) -> None:
@@ -223,7 +297,7 @@ def _extract_joins(plan_json: dict[str, Any], ctx: OptimizationContext) -> None:
         name = node.get("operator_name", node.get("name", "")).strip()
         rows = node.get("operator_cardinality", 0)
 
-        if "JOIN" in name.upper():
+        if "JOIN" in name.upper() or "NESTED LOOP" in name.upper():
             children = node.get("children", [])
             left_rows = 0
             right_rows = 0

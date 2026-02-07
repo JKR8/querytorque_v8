@@ -137,7 +137,7 @@ class PostgresExecutor:
             cur.execute(sql_script)
         conn.commit()
 
-    def explain(self, sql: str, analyze: bool = True) -> dict[str, Any]:
+    def explain(self, sql: str, analyze: bool = True, timeout_ms: int = 300_000) -> dict[str, Any]:
         """Get execution plan as JSON dict.
 
         Uses PostgreSQL's EXPLAIN (FORMAT JSON) to get plan information.
@@ -146,6 +146,7 @@ class PostgresExecutor:
         Args:
             sql: SQL query to explain.
             analyze: If True, run EXPLAIN ANALYZE for actual timing.
+            timeout_ms: Statement timeout in milliseconds (default 5 min).
 
         Returns:
             Execution plan as dictionary with plan tree and timing.
@@ -159,6 +160,7 @@ class PostgresExecutor:
 
         with conn.cursor() as cur:
             try:
+                cur.execute(f"SET statement_timeout = {timeout_ms}")
                 cur.execute(f"EXPLAIN ({explain_options}) {sql}")
                 plan_result = cur.fetchall()
 
@@ -187,6 +189,11 @@ class PostgresExecutor:
                     "error": str(e),
                     "type": "error_plan",
                 }
+            finally:
+                try:
+                    cur.execute("SET statement_timeout = 0")
+                except Exception:
+                    pass
 
         # Commit any changes from ANALYZE
         conn.commit()

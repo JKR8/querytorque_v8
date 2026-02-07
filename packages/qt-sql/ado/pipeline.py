@@ -166,7 +166,8 @@ class Pipeline:
             if explain_result and explain_result.get("plan_json"):
                 from qt_sql.optimization.plan_analyzer import analyze_plan_for_optimization
                 plan_context = analyze_plan_for_optimization(
-                    explain_result["plan_json"], sql
+                    explain_result["plan_json"], sql,
+                    engine=self.config.engine,
                 )
                 logger.info(
                     f"EXPLAIN: {explain_result.get('execution_time_ms', '?')}ms, "
@@ -198,8 +199,9 @@ class Pipeline:
             except Exception:
                 pass
 
-        # Run EXPLAIN ANALYZE and cache
+        # Run EXPLAIN ANALYZE and cache (with timeout)
         logger.info(f"[{query_id}] Running EXPLAIN ANALYZE (will cache)")
+        timeout_ms = int(self.config.extra.get("explain_timeout_ms", 300_000)) if hasattr(self.config, 'extra') else 300_000
         try:
             from qt_sql.execution.database_utils import run_explain_analyze
             result = run_explain_analyze(self.config.db_path_or_dsn, sql)
@@ -213,6 +215,26 @@ class Pipeline:
             return result
         except Exception as e:
             logger.warning(f"[{query_id}] EXPLAIN ANALYZE failed: {e}")
+            # Fallback: EXPLAIN without ANALYZE (plan structure only, no execution)
+            try:
+                logger.info(f"[{query_id}] Falling back to EXPLAIN (no ANALYZE)")
+                from qt_sql.execution.factory import create_executor_from_dsn
+                with create_executor_from_dsn(self.config.db_path_or_dsn) as executor:
+                    plan_result = executor.explain(sql, analyze=False, timeout_ms=30_000)
+                    if plan_result and not plan_result.get("error"):
+                        result = {
+                            "execution_time_ms": None,
+                            "plan_text": None,
+                            "plan_json": plan_result.get("children", [plan_result.get("Plan", {})]),
+                            "actual_rows": plan_result.get("rows_returned", 0),
+                            "note": "EXPLAIN only (no ANALYZE) — estimated costs",
+                        }
+                        cache_dir.mkdir(parents=True, exist_ok=True)
+                        cache_path.write_text(json.dumps(result, indent=2, default=str))
+                        logger.info(f"[{query_id}] Cached EXPLAIN (plan-only)")
+                        return result
+            except Exception as e2:
+                logger.warning(f"[{query_id}] EXPLAIN fallback also failed: {e2}")
             return None
 
     # =========================================================================
