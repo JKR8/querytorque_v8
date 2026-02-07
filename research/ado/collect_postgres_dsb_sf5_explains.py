@@ -2,8 +2,7 @@
 """Collect PostgreSQL DSB SF5 EXPLAIN ANALYZE plans for all 52 benchmark queries.
 
 Outputs:
-- research/ado/explain_plans/postgres_dsb_sf5/  (text + JSON plans + manifest)
-- packages/qt-sql/ado/benchmarks/postgres_dsb/explains/  (per-query JSON baselines for ADO)
+- packages/qt-sql/ado/benchmarks/postgres_dsb/explain_plans/  (text + JSON plans + manifest)
 """
 
 from __future__ import annotations
@@ -18,8 +17,8 @@ import psycopg2
 DSN = "host=127.0.0.1 port=5433 dbname=dsb_sf5 user=jakc9 password=jakc9"
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 QUERIES_DIR = REPO_ROOT / "packages" / "qt-sql" / "ado" / "benchmarks" / "postgres_dsb" / "queries"
-OUTPUT_ROOT = Path(__file__).resolve().parent / "explain_plans" / "postgres_dsb_sf5"
-ADO_EXPLAINS = REPO_ROOT / "packages" / "qt-sql" / "ado" / "benchmarks" / "postgres_dsb" / "explains"
+OUTPUT_ROOT = REPO_ROOT / "packages" / "qt-sql" / "ado" / "benchmarks" / "postgres_dsb" / "explain_plans"
+ADO_EXPLAINS = OUTPUT_ROOT
 
 TIMEOUT_MS = 300_000  # 5 minutes per query
 
@@ -59,7 +58,6 @@ def collect_all():
 
     print(f"Found {len(query_files)} queries in {QUERIES_DIR}")
     print(f"Output: {OUTPUT_ROOT}")
-    print(f"ADO baselines: {ADO_EXPLAINS}")
     print()
 
     conn = psycopg2.connect(DSN)
@@ -209,8 +207,7 @@ def collect_all():
 
     print(f"\nCollection complete:")
     print(f"  Total: {len(query_files)}, OK: {ok}, Errors: {errors}")
-    print(f"  Plans: {OUTPUT_ROOT}")
-    print(f"  ADO baselines: {ADO_EXPLAINS}")
+    print(f"  Output: {OUTPUT_ROOT}")
     print(f"  Manifest: {OUTPUT_ROOT / 'manifest.json'}")
 
 

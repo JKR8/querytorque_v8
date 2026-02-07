@@ -1,0 +1,291 @@
+You are an expert database performance analyst. Your job is to deeply analyze a slow SQL query, identify the root cause of its performance problems, and propose specific structural changes.
+
+You follow a rigorous methodology: understand the structure, profile the costs, identify the mechanism (not just the symptom), propose changes with correctness reasoning, and learn from past failures.
+
+## Query: query_23a
+## Dialect: duckdb
+
+```sql
+WITH frequent_ss_items AS (
+  SELECT
+    SUBSTRING(i_item_desc, 1, 30) AS itemdesc,
+    i_item_sk AS item_sk,
+    d_date AS solddate,
+    COUNT(*) AS cnt
+  FROM store_sales, date_dim, item
+  WHERE
+    ss_sold_date_sk = d_date_sk
+    AND ss_item_sk = i_item_sk
+    AND d_year IN (2000, 2000 + 1, 2000 + 2, 2000 + 3)
+  GROUP BY
+    SUBSTRING(i_item_desc, 1, 30),
+    i_item_sk,
+    d_date
+  HAVING
+    COUNT(*) > 4
+), max_store_sales AS (
+  SELECT
+    MAX(csales) AS tpcds_cmax
+  FROM (
+    SELECT
+      c_customer_sk,
+      SUM(ss_quantity * ss_sales_price) AS csales
+    FROM store_sales, customer, date_dim
+    WHERE
+      ss_customer_sk = c_customer_sk
+      AND ss_sold_date_sk = d_date_sk
+      AND d_year IN (2000, 2000 + 1, 2000 + 2, 2000 + 3)
+    GROUP BY
+      c_customer_sk
+  )
+), best_ss_customer AS (
+  SELECT
+    c_customer_sk,
+    SUM(ss_quantity * ss_sales_price) AS ssales
+  FROM store_sales, customer
+  WHERE
+    ss_customer_sk = c_customer_sk
+  GROUP BY
+    c_customer_sk
+  HAVING
+    SUM(ss_quantity * ss_sales_price) > (
+      95 / 100.0
+    ) * (
+      SELECT
+        *
+      FROM max_store_sales
+    )
+)
+SELECT
+  SUM(sales)
+FROM (
+  SELECT
+    cs_quantity * cs_list_price AS sales
+  FROM catalog_sales, date_dim
+  WHERE
+    d_year = 2000
+    AND d_moy = 5
+    AND cs_sold_date_sk = d_date_sk
+    AND cs_item_sk IN (
+      SELECT
+        item_sk
+      FROM frequent_ss_items
+    )
+    AND cs_bill_customer_sk IN (
+      SELECT
+        c_customer_sk
+      FROM best_ss_customer
+    )
+  UNION ALL
+  SELECT
+    ws_quantity * ws_list_price AS sales
+  FROM web_sales, date_dim
+  WHERE
+    d_year = 2000
+    AND d_moy = 5
+    AND ws_sold_date_sk = d_date_sk
+    AND ws_item_sk IN (
+      SELECT
+        item_sk
+      FROM frequent_ss_items
+    )
+    AND ws_bill_customer_sk IN (
+      SELECT
+        c_customer_sk
+      FROM best_ss_customer
+    )
+)
+LIMIT 100
+```
+
+## Query Structure (DAG)
+
+### 1. frequent_ss_items
+**Role**: CTE (Definition Order: 0)
+**Stats**: 25% Cost | ~1k rows
+**Flags**: GROUP_BY
+**Outputs**: [itemdesc, item_sk, solddate, cnt]
+**Dependencies**: store_sales, date_dim (join), item (join)
+**Joins**: ss_sold_date_sk = d_date_sk | ss_item_sk = i_item_sk
+**Filters**: d_year IN (2000, 2000 + 1, 2000 + 2, 2000 + 3)
+**Operators**: HASH_GROUP_BY, SEQ_SCAN[store_sales], SEQ_SCAN[date_dim], SEQ_SCAN[item]
+**Key Logic (SQL)**:
+```sql
+SELECT
+  SUBSTRING(i_item_desc, 1, 30) AS itemdesc,
+  i_item_sk AS item_sk,
+  d_date AS solddate,
+  COUNT(*) AS cnt
+FROM store_sales, date_dim, item
+WHERE
+  ss_sold_date_sk = d_date_sk
+  AND ss_item_sk = i_item_sk
+  AND d_year IN (2000, 2000 + 1, 2000 + 2, 2000 + 3)
+GROUP BY
+  SUBSTRING(i_item_desc, 1, 30),
+  i_item_sk,
+  d_date
+HAVING
+  COUNT(*) > 4
+```
+
+### 2. max_store_sales
+**Role**: CTE (Definition Order: 0)
+**Stats**: 25% Cost | ~1k rows
+**Flags**: GROUP_BY
+**Outputs**: [tpcds_cmax]
+**Dependencies**: store_sales, customer, date_dim
+**Joins**: ss_customer_sk = c_customer_sk | ss_sold_date_sk = d_date_sk
+**Filters**: d_year IN (2000, 2000 + 1, 2000 + 2, 2000 + 3)
+**Operators**: HASH_GROUP_BY, SEQ_SCAN[store_sales], SEQ_SCAN[customer], SEQ_SCAN[date_dim]
+**Key Logic (SQL)**:
+```sql
+SELECT
+  MAX(csales) AS tpcds_cmax
+FROM (
+  SELECT
+    c_customer_sk,
+    SUM(ss_quantity * ss_sales_price) AS csales
+  FROM store_sales, customer, date_dim
+  WHERE
+    ss_customer_sk = c_customer_sk
+    AND ss_sold_date_sk = d_date_sk
+    AND d_year IN (2000, 2000 + 1, 2000 + 2, 2000 + 3)
+  GROUP BY
+    c_customer_sk
+)
+```
+
+### 3. best_ss_customer
+**Role**: CTE (Definition Order: 1)
+**Stats**: 25% Cost | ~1k rows
+**Flags**: GROUP_BY
+**Outputs**: [c_customer_sk, ssales]
+**Dependencies**: store_sales, customer (join), max_store_sales (correlated subquery)
+**Joins**: ss_customer_sk = c_customer_sk
+**Operators**: HASH_GROUP_BY, HASH_JOIN, SEQ_SCAN[store_sales], SEQ_SCAN[customer], SEQ_SCAN[max_store_sales]
+**Key Logic (SQL)**:
+```sql
+SELECT
+  c_customer_sk,
+  SUM(ss_quantity * ss_sales_price) AS ssales
+FROM store_sales, customer
+WHERE
+  ss_customer_sk = c_customer_sk
+GROUP BY
+  c_customer_sk
+HAVING
+  SUM(ss_quantity * ss_sales_price) > (
+    95 / 100.0
+  ) * (
+    SELECT
+      *
+    FROM max_store_sales
+  )
+```
+
+### 4. main_query
+**Role**: Root / Output (Definition Order: 2)
+**Stats**: 25% Cost | ~1k rows processed → 100 rows output
+**Flags**: GROUP_BY, LIMIT(100)
+**Outputs**: [SUM(sales)]
+**Dependencies**: catalog_sales, date_dim, web_sales, best_ss_customer, frequent_ss_items
+**Joins**: cs_sold_date_sk = d_date_sk
+**Filters**: d_year = 2000 | d_moy = 5 | cs_item_sk IN (SELECT item_sk FROM frequent_ss_items) | cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer)
+**Operators**: HASH_GROUP_BY, HASH_JOIN, SEQ_SCAN[catalog_sales], SEQ_SCAN[date_dim], SEQ_SCAN[web_sales]
+**Key Logic (SQL)**:
+```sql
+SELECT
+  SUM(sales)
+FROM (
+  SELECT
+    cs_quantity * cs_list_price AS sales
+  FROM catalog_sales, date_dim
+  WHERE
+    d_year = 2000
+    AND d_moy = 5
+    AND cs_sold_date_sk = d_date_sk
+    AND cs_item_sk IN (
+      SELECT
+        item_sk
+      FROM frequent_ss_items
+    )
+    AND cs_bill_customer_sk IN (
+      SELECT
+        c_customer_sk
+      FROM best_ss_customer
+    )
+...
+```
+
+### Edges
+- max_store_sales → best_ss_customer
+- best_ss_customer → main_query
+- best_ss_customer → main_query
+- frequent_ss_items → main_query
+- frequent_ss_items → main_query
+
+
+## Reference Examples
+
+**FAISS selected (by structural similarity):** intersect_to_exists, shared_dimension_multi_channel, union_cte_split
+
+**All available gold examples:**
+
+- **composite_decorrelate_union** (2.42xx) — Decorrelate multiple correlated EXISTS subqueries into pre-materialized DISTINCT
+- **date_cte_isolate** (4.00xx) — Extract date filtering into a separate CTE to enable predicate pushdown and redu
+- **decorrelate** (2.92xx) — Convert correlated subquery to separate CTE with GROUP BY, then JOIN
+- **deferred_window_aggregation** (1.36xx) — When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joi
+- **dimension_cte_isolate** (1.93xx) — Pre-filter ALL dimension tables into CTEs before joining with fact table, not ju
+- **early_filter** (4.00xx) — Filter dimension tables FIRST, then join to fact tables to reduce expensive join
+- **intersect_to_exists** (1.83xx) — Convert INTERSECT subquery pattern to multiple EXISTS clauses for better join pl
+- **materialize_cte** (1.37xx) — Extract repeated subquery patterns into a CTE to avoid recomputation
+- **multi_date_range_cte** (2.35xx) — When query uses multiple date_dim aliases with different filters (d1, d2, d3), c
+- **multi_dimension_prefetch** (2.71xx) — Pre-filter multiple dimension tables (date + store) into separate CTEs before jo
+- **or_to_union** (3.17xx) — Split OR conditions on different columns into UNION ALL branches for better inde
+- **prefetch_fact_join** (3.77xx) — Pre-filter dimension table into CTE, then pre-join with fact table in second CTE
+- **pushdown** (2.11xx) — Push filters from outer query into CTEs/subqueries to reduce intermediate result
+- **shared_dimension_multi_channel** (1.30xx) — Extract shared dimension filters (date, item, promotion) into CTEs when multiple
+- **single_pass_aggregation** (4.47xx) — Consolidate multiple subqueries scanning the same table into a single CTE with c
+- **union_cte_split** (1.36xx) — Split a generic UNION ALL CTE into specialized CTEs when the main query filters 
+
+## Your Task
+
+Analyze this query following these steps IN ORDER:
+
+### 1. STRUCTURAL BREAKDOWN
+For each CTE/subquery/block, explain in 1-2 sentences:
+- What it computes (in plain language)
+- What tables it reads and approximately how many rows
+- What it outputs (cardinality estimate)
+
+### 2. BOTTLENECK IDENTIFICATION
+Using the DAG costs above, identify the dominant cost center.
+Don't just name it — explain the MECHANISM:
+- Is it a full table scan that could be filtered?
+- Is it a sort for a window function that could be deferred?
+- Is it a hash join on a large build side that could be pre-filtered?
+- Is it scanning the same table multiple times when once would suffice?
+
+### 3. PROPOSED OPTIMIZATION
+Propose 1-3 specific structural changes. For EACH one:
+- **What**: Exactly what to change (e.g., 'merge CTEs X and Y into one scan')
+- **Why**: The performance mechanism (e.g., 'eliminates a 28M-row rescan of store_sales')
+- **Risk**: What semantic constraint could break (e.g., 'the HAVING filter must be preserved')
+- **Estimated impact**: minor / moderate / significant
+
+### 5. RECOMMENDED STRATEGY
+Synthesize everything into a single recommended optimization approach.
+Be specific enough that another engineer could implement it from your description.
+
+### 6. EXAMPLE SELECTION
+FAISS selected these examples: intersect_to_exists, shared_dimension_multi_channel, union_cte_split
+Review the FAISS picks against the available examples above.
+If you think different examples would be more relevant for this query,
+list your preferred examples. Otherwise confirm the FAISS picks are good.
+
+```
+EXAMPLES: example_id_1, example_id_2, example_id_3
+```
+
+Use exact IDs from the available examples list above.

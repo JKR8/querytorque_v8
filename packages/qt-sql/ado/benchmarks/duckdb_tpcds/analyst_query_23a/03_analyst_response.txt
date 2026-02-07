@@ -1,0 +1,60 @@
+## 1. STRUCTURAL BREAKDOWN
+
+**frequent_ss_items**: Finds store-sold items that sold >4 times on any single day during 2000-2003. Scans store_sales (large), joins with date_dim (filtered by year) and item. Outputs ~1k rows (item_sk, date).
+
+**max_store_sales**: Calculates the maximum total sales per customer during 2000-2003. Scans store_sales (large), joins with date_dim (filtered) and customer. Outputs a single scalar value.
+
+**best_ss_customer**: Finds customers whose lifetime total store sales exceed 95% of the max from previous CTE. Scans entire store_sales (unfiltered) and customer. Outputs ~1k customer_sk.
+
+**main_query**: Sums May 2000 sales from catalog_sales and web_sales, filtered to items from frequent_ss_items and customers from best_ss_customer. Scans two large fact tables with date filter and two IN subqueries. Outputs single sum.
+
+## 2. BOTTLENECK IDENTIFICATION
+
+**Primary bottleneck: Redundant full scans of store_sales.** The same 100M+ row table is scanned three times with different grouping patterns:
+1. **frequent_ss_items**: Scan with date filter, group by item+date
+2. **max_store_sales**: Scan with date filter, group by customer  
+3. **best_ss_customer**: Scan without date filter, group by customer
+
+**Secondary bottleneck: IN subqueries in main query.** Each channel (catalog/web) executes two correlated IN subqueries against CTE results, potentially forcing nested-loop joins instead of efficient hash joins.
+
+**Root mechanism**: Store_sales is scanned multiple times for overlapping computations (2000-2003 period appears in first two scans). The best_ss_customer scan is particularly expensive as it processes the entire historical table when only customers from 2000-2003 matter for the final result.
+
+## 3. PROPOSED OPTIMIZATION
+
+**Change 1: Merge frequent_ss_items and max_store_sales into single store_sales scan**
+- **What**: Create single CTE scanning store_sales once for 2000-2003, computing both item-date counts AND per-customer sales.
+- **Why**: Eliminates duplicate 100M+ row scan of same date-filtered store_sales. Both CTEs filter by identical d_year range.
+- **Risk**: Must preserve HAVING COUNT(*) > 4 logic and ensure per-customer sums use same date filter.
+- **Impact**: Significant (reduces store_sales scans from 3→2).
+
+**Change 2: Pre-filter best_ss_customer using 2000-2003 customers only**
+- **What**: Restrict best_ss_customer to customers who actually purchased during 2000-2003, before computing lifetime total.
+- **Why**: The HAVING clause compares to max from 2000-2003, so customers with no 2000-2003 sales cannot qualify. Avoids scanning entire store_sales for irrelevant customers.
+- **Risk**: Must verify semantic correctness - original query includes all customers in store_sales.
+- **Impact**: Moderate to significant (reduces best_ss_customer build side).
+
+**Change 3: Convert IN subqueries to JOINs with pre-materialized CTEs**
+- **What**: Extract DISTINCT item_sk from frequent_ss_items and c_customer_sk from best_ss_customer, then JOIN instead of IN.
+- **Why**: Allows optimizer to use hash joins instead of potentially nested-loop execution. DuckDB can better optimize join ordering.
+- **Risk**: Must ensure no duplicate rows from CTEs (use DISTINCT).
+- **Impact**: Moderate (improves main query join strategy).
+
+## 4. RECOMMENDED STRATEGY
+
+1. **Create date_dim CTEs**: Pre-filter date_dim for 2000-2003 and for May 2000 separately.
+2. **Single store_sales pass**: Scan store_sales once with 2000-2003 date filter, computing:
+   - Per (item_sk, d_date, substring) counts
+   - Per c_customer_sk sales sums
+3. **Compute CTEs sequentially**:
+   - frequent_ss_items from item-date aggregates (COUNT > 4)
+   - max_store_sales from MAX of per-customer sums
+   - best_ss_customer by first identifying qualifying customers (those in 2000-2003 sums), then computing their lifetime totals only for those customers
+4. **Main query**: Convert IN subqueries to JOINs with pre-materialized distinct keys from CTEs.
+
+## 5. EXAMPLE SELECTION
+
+**shared_dimension_multi_channel** - Relevant because we filter date_dim multiple times across channels.
+**single_pass_aggregation** - Most relevant: consolidates multiple store_sales aggregations.
+**early_filter** - Critical: pre-filtering dimension tables before expensive joins.
+
+EXAMPLES: single_pass_aggregation, shared_dimension_multi_channel, early_filter

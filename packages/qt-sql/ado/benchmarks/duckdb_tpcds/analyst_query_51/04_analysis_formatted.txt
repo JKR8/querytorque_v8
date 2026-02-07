@@ -1,0 +1,67 @@
+## Expert Analysis
+
+### Query Structure
+**web_v1**: Computes daily cumulative sales for web items over a 12-month period. Scans `web_sales` (large fact table) and `date_dim` (dimension), outputs ~1k rows (item_sk, d_date, cumulative sum).
+
+**store_v1**: Computes daily cumulative sales for store items over the same 12-month period. Scans `store_sales` (large fact table) and `date_dim` (dimension), outputs ~1k rows (item_sk, d_date, cumulative sum).
+
+**main_query**: FULL OUTER JOINs the two CTEs, computes running maximums of cumulative sales per item/date, filters where web exceeds store, orders, and limits to 100 rows. Processes ~1k rows from each CTE.
+
+### Performance Bottleneck
+The dominant cost center is **scanning the same dimension table (`date_dim`) twice** in independent CTEs. Each CTE performs:
+1. Full scan of `date_dim` with filter `d_month_seq BETWEEN 1216 AND 1227`
+2. Hash join with large fact tables (`web_sales`/`store_sales`)
+3. Hash aggregation + window function
+
+The **mechanism**: Duplicated dimension filtering and joining. Both CTEs apply identical date filters to `date_dim` but execute independently, causing:
+- Redundant `date_dim` scans (twice)
+- Redundant hash join build sides for the same filtered dimension data
+- Missed opportunity to share filtered dimension results
+
+Since CTEs are independent, DuckDB cannot push the filter optimization across CTEs, forcing complete re-execution.
+
+### Proposed Optimization Strategy
+**Change 1**: Extract shared date filter into a CTE
+- **What**: Create `date_filtered AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1216 AND 1216+11)` and reference it in both `web_v1` and `store_v1`
+- **Why**: Eliminates duplicate `date_dim` scans and redundant hash join build sides. Filter applied once, result reused.
+- **Risk**: Must ensure `date_dim` filter semantics remain identical (`BETWEEN` inclusive). No change to join logic.
+- **Estimated impact**: Significant (reduces dimension processing by 50%)
+
+**Change 2**: Defer window aggregation to main query
+- **What**: In CTEs, compute only daily aggregates (SUM without window). Move cumulative sum and running max to later stage.
+- **Why**: Avoids computing cumulative sums for items/dates that may be filtered out after join. Reduces window function overhead.
+- **Risk**: Must maintain correct NULL handling in FULL OUTER JOIN and window ordering.
+- **Estimated impact**: Moderate (reduces early window computation)
+
+**Change 3**: Convert FULL OUTER JOIN to UNION ALL + pivot
+- **What**: Instead of joining, union daily aggregates with channel flag, then pivot with conditional aggregation.
+- **Why**: Eliminates expensive outer join on composite key (item_sk, d_date). More efficient for sparse data.
+- **Risk**: Must handle NULLs correctly when one channel lacks data for a date.
+- **Estimated impact**: Moderate (avoids hash join on two CTEs)
+
+### Recommended Approach
+**Primary optimization**: Implement **shared_dimension_multi_channel** pattern. Create a pre-filtered `date_filtered` CTE containing only the 12-month date range, then join it separately with `web_sales` and `store_sales` in their respective CTEs. This eliminates duplicate dimension scanning and allows predicate pushdown.
+
+**Secondary optimization**: Apply **early_filter** to the date dimension before any joins. The filtered date CTE should be small and can be hash-joined efficiently with both fact tables.
+
+**Implementation steps**:
+1. Create `date_filtered` CTE with `d_date_sk, d_date` for the 12-month range
+2. Modify `web_v1` and `store_v1` to join with `date_filtered` instead of `date_dim`
+3. Keep window functions as-is initially (simplest correctness)
+4. Test for semantic equivalence (same 100-row output)
+
+This approach directly attacks the root cause of duplicate dimension processing while maintaining query correctness.
+
+## 6. EXAMPLE SELECTION
+
+FAISS picks are **excellent** for this query:
+
+- **shared_dimension_multi_channel**: Directly addresses shared date filtering across web/store channels
+- **early_filter**: Optimizes dimension table access before expensive fact joins
+- **deferred_window_aggregation**: Relevant but secondary (window functions could be optimized after fixing dimension scans)
+
+These three patterns comprehensively cover the optimization opportunities.
+
+**EXAMPLES: shared_dimension_multi_channel, early_filter, deferred_window_aggregation**
+
+Apply the recommended strategy above. The analysis has already identified the bottleneck and the specific structural change needed. Focus on implementing it correctly while preserving semantic equivalence.

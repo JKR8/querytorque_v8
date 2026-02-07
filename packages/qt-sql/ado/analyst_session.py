@@ -1,15 +1,16 @@
 """Iterative single-query deep-dive optimization (Analyst Mode).
 
 The AnalystSession runs an iterative loop on a single query:
-1. Analyze the ORIGINAL query (never intermediate results)
+1. Analyze the current baseline SQL (starts as original, promoted on success)
 2. Generate N candidates via parallel workers
-3. Validate the best candidate
-4. Record the iteration's result and transforms
-5. Repeat with full history of all previous iterations
+3. Validate the best candidate against the TRUE ORIGINAL
+4. If speedup improved >=10% over current best → promote optimized SQL as
+   new baseline for the next iteration (compound gains)
+5. If not → keep current baseline, try again with history
+6. At end: return the fastest result if it's >=5% vs true original
 
-Critical invariant: every iteration optimizes from the ORIGINAL SQL,
-never from the best intermediate. The full iteration history is passed
-to the LLM so it can learn from what worked and what didn't.
+Promotion gate (10%): prevents compounding noise from marginal gains.
+Final threshold (5%): lower bar for "was this worth it".
 
 Usage:
     from ado.pipeline import Pipeline
@@ -37,31 +38,37 @@ logger = logging.getLogger(__name__)
 class AnalystIteration:
     """One iteration of the analyst deep-dive loop."""
     iteration: int
-    original_sql: str        # ALWAYS the original — never changes
+    original_sql: str        # TRUE original — never changes
     optimized_sql: str       # This iteration's rewrite
-    status: str              # WIN | IMPROVED | NEUTRAL | REGRESSION | ERROR
-    speedup: float
-    transforms: List[str]
-    prompt: str              # The prompt used
+    baseline_sql: str = ""   # What this iteration optimized FROM
+    status: str = ""         # WIN | IMPROVED | NEUTRAL | REGRESSION | ERROR
+    speedup: float = 0.0    # vs true original
+    transforms: List[str] = field(default_factory=list)
+    prompt: str = ""         # The prompt used
     analysis: Optional[str] = None  # LLM analyst output (if analyst enabled)
     examples_used: List[str] = field(default_factory=list)
+    promoted: bool = False   # Whether this iteration's result was promoted
 
 
 class AnalystSession:
     """Iterative single-query deep-dive optimization.
 
     Each iteration:
-    1. ALWAYS starts from the original SQL (not from previous best)
+    1. Optimizes from current_baseline_sql (promoted best, or original)
     2. Builds full history from ALL previous iterations
     3. Runs LLM analyst for structural guidance
-    4. Generates N candidates and validates
-    5. Records result
+    4. Generates N candidates and validates against TRUE original
+    5. Promotion gate: >=10% improvement over current best → promote
+    6. Final selection: best result if >=5% vs original
 
     Stops when:
     - Target speedup is reached
     - Max iterations exhausted
     - Last 2 iterations made no meaningful progress (converged)
     """
+
+    PROMOTE_THRESHOLD = 1.10   # 10% improvement required to promote
+    FINAL_THRESHOLD = 1.05     # 5% minimum for final result
 
     def __init__(
         self,
@@ -74,7 +81,8 @@ class AnalystSession:
     ):
         self.pipeline = pipeline
         self.query_id = query_id
-        self.original_sql = original_sql  # NEVER changes
+        self.original_sql = original_sql       # TRUE original — never changes
+        self.current_baseline_sql = original_sql  # What we optimize FROM (promoted on success)
         self.max_iterations = max_iterations
         self.target_speedup = target_speedup
         self.n_workers = n_workers
@@ -82,24 +90,42 @@ class AnalystSession:
         self.best_speedup = 1.0
         self.best_sql = original_sql
 
-    def run(self) -> AnalystIteration:
-        """Run the full iterative loop. Returns best iteration."""
+    def run(self) -> Optional[AnalystIteration]:
+        """Run the full iterative loop. Returns best iteration (if >=5% speedup)."""
         for i in range(self.max_iterations):
+            baseline_label = (
+                "original" if self.current_baseline_sql == self.original_sql
+                else f"{self.best_speedup:.2f}x winner"
+            )
             logger.info(
                 f"[{self.query_id}] Analyst iteration {i + 1}/{self.max_iterations} "
-                f"(best so far: {self.best_speedup:.2f}x)"
+                f"(best: {self.best_speedup:.2f}x, optimizing from: {baseline_label})"
             )
 
             iteration = self._run_iteration(i)
             self.iterations.append(iteration)
 
-            # Track best
-            if iteration.speedup > self.best_speedup:
+            # Promotion gate: >=10% improvement over current best
+            prev_best = self.best_speedup
+            if iteration.speedup >= prev_best * self.PROMOTE_THRESHOLD:
                 self.best_speedup = iteration.speedup
                 self.best_sql = iteration.optimized_sql
+                self.current_baseline_sql = iteration.optimized_sql
+                iteration.promoted = True
                 logger.info(
-                    f"[{self.query_id}] New best: {self.best_speedup:.2f}x "
-                    f"(iteration {i + 1})"
+                    f"[{self.query_id}] PROMOTED: {prev_best:.2f}x → "
+                    f"{iteration.speedup:.2f}x (iteration {i + 1}) — "
+                    f"next iteration will optimize from this result"
+                )
+            else:
+                # Track best even without promotion (for final selection)
+                if iteration.speedup > self.best_speedup:
+                    self.best_speedup = iteration.speedup
+                    self.best_sql = iteration.optimized_sql
+                logger.info(
+                    f"[{self.query_id}] Not promoted: {iteration.speedup:.2f}x "
+                    f"< {prev_best:.2f}x * 1.10 = {prev_best * self.PROMOTE_THRESHOLD:.2f}x — "
+                    f"staying on current baseline"
                 )
 
             # Stopping criteria
@@ -117,6 +143,14 @@ class AnalystSession:
                 break
 
         best = self._best_iteration()
+        if best is None or best.speedup < self.FINAL_THRESHOLD:
+            logger.info(
+                f"[{self.query_id}] Analyst session complete: "
+                f"{len(self.iterations)} iterations, "
+                f"best {best.speedup if best else 0:.2f}x — below {self.FINAL_THRESHOLD}x minimum"
+            )
+            return best  # Caller decides what to do with sub-threshold result
+
         logger.info(
             f"[{self.query_id}] Analyst session complete: "
             f"{len(self.iterations)} iterations, "
@@ -125,7 +159,11 @@ class AnalystSession:
         return best
 
     def _run_iteration(self, iteration_num: int) -> AnalystIteration:
-        """Single iteration: analyze -> rewrite -> validate."""
+        """Single iteration: analyze -> rewrite -> validate.
+
+        Analyzes and rewrites from current_baseline_sql (promoted best).
+        Validates against the TRUE original_sql for consistent speedup measurement.
+        """
         dialect = (
             self.pipeline.config.engine
             if self.pipeline.config.engine != "postgresql"
@@ -137,21 +175,23 @@ class AnalystSession:
             else self.pipeline.config.engine
         )
 
+        input_sql = self.current_baseline_sql  # What we're optimizing FROM
+
         # Build history from ALL previous iterations
         history = self._build_iteration_history()
 
-        # Phase 1: Parse ORIGINAL SQL (always)
-        dag, costs, _explain = self.pipeline._parse_dag(self.original_sql, dialect=dialect, query_id=self.query_id)
+        # Phase 1: Parse DAG from current baseline
+        dag, costs, _explain = self.pipeline._parse_dag(input_sql, dialect=dialect, query_id=self.query_id)
 
-        # Phase 2: FAISS example retrieval (on original SQL)
+        # Phase 2: FAISS example retrieval (on current baseline)
         examples = self.pipeline._find_examples(
-            self.original_sql, engine=engine, k=3,
+            input_sql, engine=engine, k=3,
         )
         example_ids = [e.get("id", "?") for e in examples]
 
         # Also find regression warnings for structurally similar queries
         regression_warnings = self.pipeline._find_regression_warnings(
-            self.original_sql, engine=engine, k=2,
+            input_sql, engine=engine, k=2,
         )
 
         # Always run analyst in deep-dive mode
@@ -159,7 +199,7 @@ class AnalystSession:
         analysis_raw = None
         expert_analysis, analysis_raw, _analysis_prompt, examples = self.pipeline._run_analyst(
             query_id=self.query_id,
-            sql=self.original_sql,
+            sql=input_sql,
             dag=dag,
             costs=costs,
             history=history,
@@ -172,10 +212,10 @@ class AnalystSession:
         # Load global learnings
         global_learnings = self.pipeline.learner.build_learning_summary() or None
 
-        # Phase 3: Build prompt with full iteration history
+        # Phase 3: Build prompt (analyzes current baseline)
         prompt = self.pipeline.prompter.build_prompt(
             query_id=self.query_id,
-            full_sql=self.original_sql,  # ALWAYS original
+            full_sql=input_sql,
             dag=dag,
             costs=costs,
             history=history,
@@ -195,7 +235,7 @@ class AnalystSession:
         )
 
         candidates = generator.generate(
-            sql=self.original_sql,
+            sql=input_sql,
             prompt=prompt,
             examples_used=example_ids,
             n=self.n_workers,
@@ -203,7 +243,7 @@ class AnalystSession:
         )
 
         # Pick best candidate
-        optimized_sql = self.original_sql
+        optimized_sql = input_sql
         transforms = []
         if candidates:
             best_cand = None
@@ -211,7 +251,7 @@ class AnalystSession:
                 if (
                     not cand.error
                     and cand.optimized_sql
-                    and cand.optimized_sql != self.original_sql
+                    and cand.optimized_sql != input_sql
                 ):
                     best_cand = cand
                     break
@@ -227,13 +267,13 @@ class AnalystSession:
             logger.warning(
                 f"[{self.query_id}] Iteration {iteration_num + 1} syntax error: {e}"
             )
-            optimized_sql = self.original_sql
+            optimized_sql = input_sql
 
-        # Phase 5: Validate
+        # Phase 5: Validate against TRUE ORIGINAL (not baseline)
         status, speedup = self.pipeline._validate(self.original_sql, optimized_sql)
         logger.info(
             f"[{self.query_id}] Iteration {iteration_num + 1}: "
-            f"{status} ({speedup:.2f}x)"
+            f"{status} ({speedup:.2f}x vs original)"
         )
 
         # Create learning record for this iteration
@@ -260,6 +300,7 @@ class AnalystSession:
             iteration=iteration_num,
             original_sql=self.original_sql,
             optimized_sql=optimized_sql,
+            baseline_sql=input_sql,
             status=status,
             speedup=speedup,
             transforms=transforms,
@@ -356,6 +397,7 @@ class AnalystSession:
             "n_workers": self.n_workers,
             "best_speedup": self.best_speedup,
             "best_sql": self.best_sql,
+            "current_baseline_sql": self.current_baseline_sql,
             "n_iterations": len(self.iterations),
         }
         (output_dir / "session.json").write_text(
@@ -374,7 +416,10 @@ class AnalystSession:
                 "speedup": it.speedup,
                 "transforms": it.transforms,
                 "examples_used": it.examples_used,
+                "promoted": it.promoted,
             }, indent=2))
+            if it.baseline_sql and it.baseline_sql != it.original_sql:
+                (it_dir / "baseline.sql").write_text(it.baseline_sql)
             if it.analysis:
                 (it_dir / "analysis.txt").write_text(it.analysis)
 
@@ -428,6 +473,7 @@ class AnalystSession:
         )
         session.best_speedup = meta.get("best_speedup", 1.0)
         session.best_sql = meta.get("best_sql", original_sql)
+        session.current_baseline_sql = meta.get("current_baseline_sql", original_sql)
 
         # Load iterations
         n_iterations = meta.get("n_iterations", 0)

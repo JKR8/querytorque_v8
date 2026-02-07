@@ -1153,6 +1153,58 @@ class Pipeline:
             return path.read_text()
         return None
 
+    def _load_benchmark_leaderboard(self) -> dict:
+        """Load benchmark leaderboard as dict keyed by query_id.
+
+        Handles all formats: standard wrapper, bare list, legacy dict.
+        """
+        lb_path = self.benchmark_dir / "leaderboard.json"
+        if not lb_path.exists():
+            return {}
+        try:
+            data = json.loads(lb_path.read_text())
+            if isinstance(data, dict) and "queries" in data:
+                return {e["query_id"]: e for e in data["queries"]}
+            elif isinstance(data, list):
+                return {e["query_id"]: e for e in data}
+            elif isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_benchmark_leaderboard(self, queries_dict: dict) -> None:
+        """Save benchmark leaderboard in standard format.
+
+        Standard format: {benchmark, engine, scale_factor, updated_at, summary, queries: []}
+        """
+        from datetime import datetime
+
+        lb_path = self.benchmark_dir / "leaderboard.json"
+        queries = sorted(queries_dict.values(), key=lambda e: -e.get("speedup", 0))
+
+        speedups = [q["speedup"] for q in queries if q.get("speedup", 0) > 0]
+        summary = {
+            "total": len(queries),
+            "wins": sum(1 for q in queries if q.get("status") == "WIN"),
+            "improved": sum(1 for q in queries if q.get("status") == "IMPROVED"),
+            "neutral": sum(1 for q in queries if q.get("status") == "NEUTRAL"),
+            "regression": sum(1 for q in queries if q.get("status") == "REGRESSION"),
+            "errors": sum(1 for q in queries if q.get("status") in ("ERROR", "error")),
+            "avg_speedup": round(sum(speedups) / len(speedups), 4) if speedups else 0,
+        }
+
+        standard = {
+            "benchmark": self.config.benchmark,
+            "engine": self.config.engine,
+            "scale_factor": self.config.scale_factor,
+            "updated_at": datetime.now().isoformat(),
+            "summary": summary,
+            "queries": queries,
+        }
+        lb_path.write_text(json.dumps(standard, indent=2))
+        return queries
+
     def _update_benchmark_leaderboard(
         self,
         results: List[PipelineResult],
@@ -1164,19 +1216,7 @@ class Pipeline:
         Tracks all attempts per query for learning from regressions.
         Regenerates leaderboard.md as human-readable view.
         """
-        lb_path = self.benchmark_dir / "leaderboard.json"
-
-        # Load existing leaderboard
-        existing = {}
-        if lb_path.exists():
-            try:
-                data = json.loads(lb_path.read_text())
-                if isinstance(data, list):
-                    existing = {e["query_id"]: e for e in data}
-                elif isinstance(data, dict):
-                    existing = data
-            except Exception:
-                pass
+        existing = self._load_benchmark_leaderboard()
 
         # Merge: keep the better result per query + track all attempts
         for r in results:
@@ -1199,6 +1239,7 @@ class Pipeline:
                     "status": r.status,
                     "speedup": r.speedup,
                     "transforms": r.transforms_applied,
+                    "source": f"state_{state_num}",
                     "original_sql": r.original_sql,
                     "optimized_sql": r.optimized_sql,
                     "nodes_rewritten": r.nodes_rewritten,
@@ -1209,12 +1250,9 @@ class Pipeline:
                 entry["attempts"] = attempts
                 existing[r.query_id] = entry
 
-        # Save as list sorted by query_id
-        lb_list = sorted(existing.values(), key=lambda e: e.get("query_id", ""))
-        lb_path.write_text(json.dumps(lb_list, indent=2))
-
-        # Regenerate leaderboard.md
-        self._regenerate_leaderboard_md(lb_list)
+        # Save in standard format and regenerate md
+        queries = self._save_benchmark_leaderboard(existing)
+        self._regenerate_leaderboard_md(queries)
 
     def _regenerate_leaderboard_md(self, leaderboard: List[Dict]) -> None:
         """Regenerate human-readable leaderboard.md from leaderboard.json."""

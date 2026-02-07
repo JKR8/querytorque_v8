@@ -151,14 +151,12 @@ class Prompter:
                 sections.append(gl_section)
 
         if expert_analysis:
-            # Analyst mode: inject the LLM analysis instead of examples
-            # This gives the rewrite LLM concrete structural guidance
+            # Analyst mode: inject analysis AND examples
+            # Analysis tells the rewriter WHAT to do, examples show HOW
             sections.append(expert_analysis)
-        else:
-            # Default mode: FAISS-matched gold examples
-            # Section 6: Examples (MIDDLE) — up to 3 FAISS-matched
-            if examples:
-                sections.append(self._section_examples(examples))
+        # Gold examples (FAISS-matched or analyst-overridden)
+        if examples:
+            sections.append(self._section_examples(examples))
 
         # Section 6b: Regression warnings (after examples, before constraints)
         if regression_warnings:
