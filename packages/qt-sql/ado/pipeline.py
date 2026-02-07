@@ -77,6 +77,9 @@ class Pipeline:
         if seed_dir.exists():
             self._seed_dirs.append(seed_dir)
 
+        # Resolve engine version (cached, used in prompts)
+        self._engine_version = self._resolve_engine_version()
+
         # Load pre-computed semantic intents (LLM-generated per-query intents)
         self._semantic_intents: Dict[str, Dict[str, Any]] = {}
         intents_path = self.benchmark_dir / "semantic_intents.json"
@@ -92,6 +95,26 @@ class Pipeline:
                 )
             except Exception as e:
                 logger.warning(f"Failed to load semantic_intents.json: {e}")
+
+    def _resolve_engine_version(self) -> Optional[str]:
+        """Detect the target engine version for prompt context."""
+        engine = self.config.engine
+        try:
+            if engine == "duckdb":
+                import duckdb
+                return duckdb.__version__
+            elif engine in ("postgresql", "postgres"):
+                import subprocess
+                result = subprocess.run(
+                    ["psql", "--version"], capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    # "psql (PostgreSQL) 16.2" → "16.2"
+                    parts = result.stdout.strip().split()
+                    return parts[-1] if parts else None
+        except Exception:
+            pass
+        return None
 
     def get_semantic_intents(self, query_id: str) -> Optional[Dict[str, Any]]:
         """Look up pre-computed semantic intents for a query.
@@ -387,6 +410,7 @@ class Pipeline:
             regression_warnings=regression_warnings,
             dialect=dialect,
             semantic_intents=self.get_semantic_intents(query_id),
+            engine_version=self._engine_version,
         )
 
         # Generate candidates via parallel workers

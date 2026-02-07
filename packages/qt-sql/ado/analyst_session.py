@@ -38,13 +38,15 @@ class AnalystIteration:
     iteration: int
     original_sql: str        # TRUE original — never changes
     optimized_sql: str       # This iteration's rewrite
-    status: str = ""         # WIN | IMPROVED | NEUTRAL | REGRESSION | ERROR
+    status: str = ""         # WIN | IMPROVED | NEUTRAL | REGRESSION | ERROR | FAIL
     speedup: float = 0.0    # vs true original
     transforms: List[str] = field(default_factory=list)
     prompt: str = ""         # The prompt used
     analysis: Optional[str] = None  # LLM analyst output
     examples_used: List[str] = field(default_factory=list)
     failure_analysis: Optional[str] = None  # LLM-generated why/what-next
+    error_messages: List[str] = field(default_factory=list)  # Raw validation errors
+    error_category: Optional[str] = None  # syntax|semantic|timeout|execution|unknown
 
 
 class AnalystSession:
@@ -199,6 +201,7 @@ class AnalystSession:
             regression_warnings=regression_warnings,
             dialect=dialect,
             semantic_intents=self.pipeline.get_semantic_intents(self.query_id),
+            engine_version=self.pipeline._engine_version,
         )
 
         # Generate candidates
@@ -283,6 +286,8 @@ class AnalystSession:
             prompt=prompt,
             analysis=analysis_raw,
             examples_used=example_ids,
+            error_messages=val_errors,
+            error_category=val_error_cat,
         )
 
     def _generate_failure_analysis(self, iteration: AnalystIteration) -> str:
@@ -426,6 +431,8 @@ class AnalystSession:
                 "original_sql": it.original_sql,
                 "optimized_sql": it.optimized_sql,
                 "failure_analysis": it.failure_analysis,
+                "error_messages": it.error_messages,
+                "error_category": it.error_category,
             })
 
         if not attempts:
@@ -510,6 +517,8 @@ class AnalystSession:
                 "speedup": it.speedup,
                 "transforms": it.transforms,
                 "examples_used": it.examples_used,
+                "error_messages": it.error_messages,
+                "error_category": it.error_category,
             }, indent=2))
             if it.analysis:
                 (it_dir / "analysis.txt").write_text(it.analysis)

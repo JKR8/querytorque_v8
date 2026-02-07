@@ -61,6 +61,7 @@ class StandardSession(OptimizationSession):
             regression_warnings=regression_warnings,
             dialect=self.dialect,
             semantic_intents=self.pipeline.get_semantic_intents(self.query_id),
+            engine_version=self.pipeline._engine_version,
         )
 
         # Generate candidates

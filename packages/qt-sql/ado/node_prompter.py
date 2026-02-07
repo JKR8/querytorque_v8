@@ -13,7 +13,7 @@ Section ordering (attention-optimized):
 5b. Global Learnings    (EARLY-MID - aggregate benchmark stats, optional)
 6. Examples             (MIDDLE - FAISS-matched contrastive BEFORE/AFTER pairs)
 6b. Regression Warnings (MIDDLE - FAISS-matched anti-patterns from past regressions)
-7. Constraints          (LATE-MID - sandwich: CRITICAL top/bottom, HIGH middle)
+7. Constraints          (LATE-MID - CRITICAL top/bottom, HIGH middle)
 8. Output Format        (RECENCY - return complete rewritten SQL)
 """
 
@@ -105,7 +105,7 @@ class Prompter:
     - Complete query SQL (not isolated nodes)
     - Full DAG topology (nodes, edges, depths, flags, costs)
     - FAISS-matched gold examples (contrastive BEFORE/AFTER pairs)
-    - Constraints (sandwich ordered)
+    - Constraints (CRITICAL top/bottom, HIGH middle)
 
     This enables cross-node rewrites: creating new CTEs, restructuring
     joins, pushing filters across node boundaries.
@@ -124,6 +124,7 @@ class Prompter:
         regression_warnings: Optional[List[Dict[str, Any]]] = None,
         dialect: str = "duckdb",
         semantic_intents: Optional[Dict[str, Any]] = None,
+        engine_version: Optional[str] = None,
     ) -> str:
         """Build the full-query rewrite prompt.
 
@@ -147,6 +148,7 @@ class Prompter:
             dialect: SQL dialect for pretty-printing
             semantic_intents: Pre-computed LLM-generated query and per-node intents.
                               Dict with 'query_intent' (str) and 'dag_nodes' (list).
+            engine_version: Engine version string (e.g., '1.4.3' for DuckDB).
         """
         sections = []
 
@@ -156,7 +158,7 @@ class Prompter:
             sections.append(retry_preamble)
 
         # Section 1: Role + Task (PRIMACY)
-        sections.append(self._section_role_task())
+        sections.append(self._section_role_task(dialect, engine_version))
 
         # Section 2: Full Query SQL (PRIMACY)
         sections.append(self._section_full_sql(query_id, full_sql, dialect))
@@ -236,24 +238,47 @@ class Prompter:
         for a in failed[-3:]:  # Show last 3 failures max
             transforms = ", ".join(a.get("transforms", [])) or "unknown"
             status = a.get("status", "ERROR")
+            error_msgs = a.get("error_messages", [])
+            error_cat = a.get("error_category", "")
             fa = a.get("failure_analysis", "")
+
             lines.append(f"**Attempt ({transforms}): {status}**")
+
+            # Raw error messages — the concrete validation failures
+            if error_msgs:
+                cat_label = f" [{error_cat}]" if error_cat else ""
+                lines.append(f"Error{cat_label}:")
+                for msg in error_msgs[:5]:
+                    lines.append(f"  - {msg[:200]}")
+
+            # Expert analysis — LLM commentary on root cause + next steps
             if fa:
-                # Truncate to first 400 chars — the key insight
                 summary = fa[:400].strip()
                 if len(fa) > 400:
                     summary += "..."
-                lines.append(f"Why it failed: {summary}")
+                lines.append(f"Expert analysis: {summary}")
+
             lines.append("")
 
         lines.append("---")
         return "\n".join(lines)
 
     @staticmethod
-    def _section_role_task() -> str:
+    def _section_role_task(
+        dialect: str = "duckdb",
+        engine_version: Optional[str] = None,
+    ) -> str:
         """Section 1: Role + Task."""
+        engine_names = {
+            "duckdb": "DuckDB",
+            "postgres": "PostgreSQL",
+            "postgresql": "PostgreSQL",
+            "snowflake": "Snowflake",
+        }
+        engine = engine_names.get(dialect, dialect)
+        ver = f" v{engine_version}" if engine_version else ""
         return (
-            "You are a SQL query rewrite engine.\n"
+            f"You are a SQL query rewrite engine for {engine}{ver}.\n"
             "\n"
             "Your goal: rewrite the complete SQL query to maximize execution speed\n"
             "while preserving exact semantic equivalence (same rows, same columns,\n"
@@ -444,14 +469,16 @@ class Prompter:
                 speedup = attempt.get("speedup", 0)
                 failure_analysis = attempt.get("failure_analysis", "")
 
+                error_msgs = attempt.get("error_messages", [])
                 t_str = ", ".join(transforms) if transforms else "unknown"
                 if status in ("error", "ERROR", "FAIL"):
                     lines.append(f"- {t_str}: {status} (0.00x)")
+                    if error_msgs:
+                        for msg in error_msgs[:3]:
+                            lines.append(f"  - {msg[:200]}")
                     if failure_analysis:
-                        # Include the LLM failure analysis so next attempt learns
-                        lines.append("")
-                        lines.append(f"  **Why it failed:** {failure_analysis[:500]}")
-                        lines.append("")
+                        lines.append(f"  **Expert analysis:** {failure_analysis[:500]}")
+                    lines.append("")
                 elif speedup < 0.95:
                     lines.append(
                         f"- {t_str}: REGRESSION ({speedup:.2f}x), reverted"
@@ -667,10 +694,10 @@ class Prompter:
 
     @staticmethod
     def _section_constraints() -> str:
-        """Section 8: Constraints (sandwich ordered).
+        """Section 8: Constraints.
 
         Loads constraints from ado/constraints/*.json and groups by severity:
-        - CRITICAL at top and bottom (sandwich pattern for attention)
+        - CRITICAL at top and bottom (repeated for attention)
         - HIGH + MEDIUM in the middle
         """
         constraints = _load_constraint_files()
@@ -683,21 +710,21 @@ class Prompter:
 
         # Top sandwich: CRITICAL
         if critical:
-            lines.append("### CRITICAL — Correctness Guards (top of sandwich)")
+            lines.append("### CRITICAL — Correctness Guards")
             for c in critical:
                 lines.append(f"\n**{c['id']}**")
                 lines.append(c.get("prompt_instruction", c.get("description", "")))
 
         # Middle: HIGH + MEDIUM
         if high or medium:
-            lines.append("\n### HIGH — Performance and Style Rules (middle of sandwich)")
+            lines.append("\n### HIGH — Performance and Style Rules")
             for c in high + medium:
                 lines.append(f"\n**{c['id']}**")
                 lines.append(c.get("prompt_instruction", c.get("description", "")))
 
         # Bottom sandwich: repeat CRITICAL IDs
         if critical:
-            lines.append("\n### CRITICAL — Correctness Guards (bottom of sandwich)")
+            lines.append("\n### CRITICAL — Correctness Guards (repeated for emphasis)")
             for c in critical:
                 lines.append(f"\n**{c['id']}**")
                 lines.append(c.get("prompt_instruction", c.get("description", "")))

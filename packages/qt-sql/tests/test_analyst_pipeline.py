@@ -632,6 +632,7 @@ class TestPipelineHistoryWiring:
         pipeline.learner.build_learning_summary.return_value = None
         pipeline.benchmark_dir = Path(".")
         pipeline._semantic_intents = {}
+        pipeline._engine_version = None
         return pipeline
 
     def test_run_query_passes_history_to_analyst_and_rewrite_prompt(self):
