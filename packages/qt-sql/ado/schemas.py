@@ -14,6 +14,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+class OptimizationMode(str, Enum):
+    """Optimization mode selection for the ADO pipeline."""
+    STANDARD = "standard"   # Fast: skip analyst, single iteration
+    EXPERT = "expert"       # Iterative with analyst failure analysis (default)
+    SWARM = "swarm"         # Multi-worker fan-out with snipe refinement
+
+
 class ValidationStatus(str, Enum):
     PASS = "pass"
     FAIL = "fail"
@@ -151,3 +158,45 @@ class PipelineResult:
     analysis: Optional[str] = None  # Raw analyst LLM response
     analysis_prompt: Optional[str] = None  # Analyst prompt sent to LLM
     analysis_formatted: Optional[str] = None  # Formatted analysis injected into rewrite prompt
+
+
+@dataclass
+class WorkerResult:
+    """Result from a single optimization worker (used in swarm mode)."""
+    worker_id: int
+    strategy: str
+    examples_used: List[str]
+    optimized_sql: str
+    speedup: float
+    status: str
+    transforms: List[str] = field(default_factory=list)
+    hint: str = ""
+    error_message: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "worker_id": self.worker_id,
+            "strategy": self.strategy,
+            "examples_used": self.examples_used,
+            "optimized_sql": self.optimized_sql,
+            "speedup": self.speedup,
+            "status": self.status,
+            "transforms": self.transforms,
+            "hint": self.hint,
+            "error_message": self.error_message,
+        }
+
+
+@dataclass
+class SessionResult:
+    """Result from an optimization session (any mode)."""
+    query_id: str
+    mode: str  # OptimizationMode value
+    best_speedup: float
+    best_sql: str
+    original_sql: str
+    best_transforms: List[str] = field(default_factory=list)
+    status: str = ""  # WIN | IMPROVED | NEUTRAL | REGRESSION | ERROR
+    iterations: List[Any] = field(default_factory=list)
+    n_iterations: int = 0
+    n_api_calls: int = 0

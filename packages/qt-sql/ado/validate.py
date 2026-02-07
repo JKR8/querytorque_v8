@@ -7,12 +7,25 @@ infrastructure. It benchmarks performance and checks semantic equivalence.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Optional
+import time
+from dataclasses import dataclass, field
+from typing import Any, List, Optional
 
 from .schemas import ValidationStatus, ValidationResult
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class OriginalBaseline:
+    """Cached baseline from benchmarking the original query once.
+
+    Used by SwarmSession to avoid re-timing the original for every worker.
+    """
+    measured_time_ms: float
+    row_count: int
+    rows: Optional[List[Any]] = None
+    checksum: Optional[str] = None
 
 
 def categorize_error(error_msg: str) -> str:
@@ -161,6 +174,296 @@ class Validator:
                 errors=[error_str],
                 error_category=categorize_error(error_str),
             )
+
+    def benchmark_baseline(self, original_sql: str) -> OriginalBaseline:
+        """Benchmark original SQL once and return cached baseline.
+
+        Uses 3-run pattern (warmup + 2 measures, average) for DuckDB,
+        or simple 3-run for PostgreSQL. The baseline can be reused for
+        multiple validate_against_baseline() calls.
+
+        Args:
+            original_sql: The original SQL query
+
+        Returns:
+            OriginalBaseline with timing, rows, and checksum
+
+        Raises:
+            RuntimeError: If the original query fails
+        """
+        validator = self._get_validator()
+        if validator is None:
+            raise RuntimeError("Validator not available (missing qt_sql.validation)")
+
+        if isinstance(validator, PostgresValidatorWrapper):
+            # PostgreSQL: 3-run pattern using executor
+            executor = validator._get_executor()
+
+            # Warmup
+            executor.execute(original_sql)
+
+            # Measure 1 (capture rows)
+            start = time.perf_counter()
+            rows = executor.execute(original_sql)
+            t1 = (time.perf_counter() - start) * 1000
+
+            # Measure 2
+            start = time.perf_counter()
+            executor.execute(original_sql)
+            t2 = (time.perf_counter() - start) * 1000
+
+            avg_ms = (t1 + t2) / 2
+            logger.info(f"Baseline (PG): {avg_ms:.1f}ms ({len(rows)} rows)")
+
+            return OriginalBaseline(
+                measured_time_ms=avg_ms,
+                row_count=len(rows),
+                rows=rows,
+            )
+        else:
+            # DuckDB: use benchmarker's benchmark_single (3-run)
+            benchmarker = validator._get_benchmarker()
+            result = benchmarker.benchmark_single(original_sql, capture_results=True)
+
+            if result.error:
+                raise RuntimeError(f"Original query failed: {result.error}")
+
+            # Compute checksum
+            checksum = None
+            if result.rows:
+                checker = validator._get_checker()
+                checksum = checker.compute_checksum(result.rows)
+
+            logger.info(
+                f"Baseline (DuckDB): {result.timing.measured_time_ms:.1f}ms "
+                f"({result.row_count} rows)"
+            )
+
+            return OriginalBaseline(
+                measured_time_ms=result.timing.measured_time_ms,
+                row_count=result.row_count,
+                rows=result.rows,
+                checksum=checksum,
+            )
+
+    def validate_against_baseline(
+        self,
+        baseline: OriginalBaseline,
+        candidate_sql: str,
+        worker_id: int,
+    ) -> ValidationResult:
+        """Validate optimized SQL against a pre-computed baseline.
+
+        Only benchmarks the candidate — does NOT re-run the original.
+        Speedup is computed as baseline.measured_time_ms / candidate_time_ms.
+
+        Args:
+            baseline: Pre-computed original baseline
+            candidate_sql: The optimized SQL to validate
+            worker_id: Worker ID for tracking
+
+        Returns:
+            ValidationResult with status, speedup, and errors
+        """
+        validator = self._get_validator()
+        if validator is None:
+            error_msg = "Validator not available (missing qt_sql.validation)"
+            return ValidationResult(
+                worker_id=worker_id,
+                status=ValidationStatus.ERROR,
+                speedup=0.0,
+                error=error_msg,
+                optimized_sql=candidate_sql,
+                errors=[error_msg],
+                error_category="execution",
+            )
+
+        try:
+            if isinstance(validator, PostgresValidatorWrapper):
+                return self._validate_against_baseline_pg(
+                    validator, baseline, candidate_sql, worker_id
+                )
+            else:
+                return self._validate_against_baseline_duckdb(
+                    validator, baseline, candidate_sql, worker_id
+                )
+        except Exception as e:
+            error_str = str(e)
+            logger.warning(f"Validation failed for worker {worker_id}: {error_str}")
+            return ValidationResult(
+                worker_id=worker_id,
+                status=ValidationStatus.ERROR,
+                speedup=0.0,
+                error=error_str,
+                optimized_sql=candidate_sql,
+                errors=[error_str],
+                error_category=categorize_error(error_str),
+            )
+
+    def _validate_against_baseline_duckdb(
+        self,
+        validator,
+        baseline: OriginalBaseline,
+        candidate_sql: str,
+        worker_id: int,
+    ) -> ValidationResult:
+        """DuckDB path: benchmark candidate only, compare against baseline."""
+        from qt_sql.validation.schemas import ValidationStatus as QtStatus
+
+        errors = []
+
+        # Syntax check
+        try:
+            import sqlglot
+            sqlglot.parse_one(candidate_sql, dialect="duckdb")
+        except Exception as e:
+            error_msg = f"Optimized SQL syntax error: {e}"
+            return ValidationResult(
+                worker_id=worker_id,
+                status=ValidationStatus.ERROR,
+                speedup=0.0,
+                error=error_msg,
+                optimized_sql=candidate_sql,
+                errors=[error_msg],
+                error_category="syntax",
+            )
+
+        # Benchmark candidate only (3-run)
+        benchmarker = validator._get_benchmarker()
+        opt_result = benchmarker.benchmark_single(candidate_sql, capture_results=True)
+
+        if opt_result.error:
+            error_msg = f"Optimized query execution failed: {opt_result.error}"
+            return ValidationResult(
+                worker_id=worker_id,
+                status=ValidationStatus.ERROR,
+                speedup=0.0,
+                error=error_msg,
+                optimized_sql=candidate_sql,
+                errors=[error_msg],
+                error_category=categorize_error(error_msg),
+            )
+
+        # Compare row counts
+        row_counts_match = opt_result.row_count == baseline.row_count
+        if not row_counts_match:
+            errors.append(
+                f"Row count mismatch: original={baseline.row_count}, "
+                f"optimized={opt_result.row_count}"
+            )
+
+        # Compare checksums
+        opt_checksum = None
+        values_match = False
+        if opt_result.rows:
+            checker = validator._get_checker()
+            opt_checksum = checker.compute_checksum(opt_result.rows)
+            checksum_match = opt_checksum == baseline.checksum
+
+            if checksum_match:
+                values_match = True
+            elif baseline.rows and opt_result.rows:
+                # Detailed value comparison
+                val_result = checker.compare_values(baseline.rows, opt_result.rows)
+                values_match = val_result.match
+                if not values_match:
+                    errors.append("Value mismatch: rows differ between original and optimized")
+
+        # Determine status
+        if not row_counts_match:
+            ado_status = ValidationStatus.FAIL
+        elif not values_match:
+            ado_status = ValidationStatus.FAIL
+        else:
+            ado_status = ValidationStatus.PASS
+
+        # Compute speedup
+        if opt_result.timing.measured_time_ms > 0:
+            speedup = baseline.measured_time_ms / opt_result.timing.measured_time_ms
+        else:
+            speedup = 1.0
+
+        error_msg = " | ".join(errors) if errors else None
+        error_category = categorize_error(errors[0]) if errors else None
+
+        return ValidationResult(
+            worker_id=worker_id,
+            status=ado_status,
+            speedup=speedup,
+            error=error_msg,
+            optimized_sql=candidate_sql,
+            errors=errors,
+            error_category=error_category,
+        )
+
+    def _validate_against_baseline_pg(
+        self,
+        validator: "PostgresValidatorWrapper",
+        baseline: OriginalBaseline,
+        candidate_sql: str,
+        worker_id: int,
+    ) -> ValidationResult:
+        """PostgreSQL path: execute candidate only, compare against baseline."""
+        errors = []
+
+        executor = validator._get_executor()
+
+        # Time candidate (3-run: warmup + 2 measures)
+        try:
+            executor.execute(candidate_sql)  # warmup
+
+            start = time.perf_counter()
+            cand_rows = executor.execute(candidate_sql)
+            t1 = (time.perf_counter() - start) * 1000
+
+            start = time.perf_counter()
+            executor.execute(candidate_sql)
+            t2 = (time.perf_counter() - start) * 1000
+
+            cand_time = (t1 + t2) / 2
+        except Exception as e:
+            error_msg = f"Execution failed: {e}"
+            return ValidationResult(
+                worker_id=worker_id,
+                status=ValidationStatus.ERROR,
+                speedup=0.0,
+                error=error_msg,
+                optimized_sql=candidate_sql,
+                errors=[error_msg],
+                error_category=categorize_error(error_msg),
+            )
+
+        # Compare row counts
+        cand_count = len(cand_rows)
+        row_counts_match = cand_count == baseline.row_count
+
+        if not row_counts_match:
+            errors.append(
+                f"Row count mismatch: original={baseline.row_count}, "
+                f"optimized={cand_count}"
+            )
+            ado_status = ValidationStatus.FAIL
+        elif baseline.rows and cand_rows != baseline.rows:
+            errors.append("Value mismatch: rows differ between original and optimized")
+            ado_status = ValidationStatus.FAIL
+        else:
+            ado_status = ValidationStatus.PASS
+
+        # Compute speedup
+        speedup = baseline.measured_time_ms / cand_time if cand_time > 0 else 1.0
+
+        error_msg = " | ".join(errors) if errors else None
+        error_category = categorize_error(errors[0]) if errors else None
+
+        return ValidationResult(
+            worker_id=worker_id,
+            status=ado_status,
+            speedup=speedup,
+            error=error_msg,
+            optimized_sql=candidate_sql,
+            errors=errors,
+            error_category=error_category,
+        )
 
     def close(self) -> None:
         """Close the validator and release resources."""

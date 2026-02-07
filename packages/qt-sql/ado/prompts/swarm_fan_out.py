@@ -1,0 +1,140 @@
+"""Fan-out prompt for swarm mode.
+
+Asks the analyst to distribute FAISS examples across 4 workers,
+each with a different optimization strategy.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+
+from .dag_helpers import append_dag_summary
+
+
+def build_fan_out_prompt(
+    query_id: str,
+    sql: str,
+    dag: Any,
+    costs: Dict[str, Any],
+    faiss_examples: List[Dict[str, Any]],
+    all_available_examples: List[Dict[str, str]],
+    dialect: str = "duckdb",
+) -> str:
+    """Build prompt asking analyst to distribute examples across 4 workers.
+
+    Args:
+        query_id: Query identifier
+        sql: The SQL query to optimize
+        dag: Parsed DAG from Phase 1
+        costs: Per-node cost analysis
+        faiss_examples: Top 12 FAISS-matched examples
+        all_available_examples: Full catalog of gold examples (id + description)
+        dialect: SQL dialect
+
+    Returns:
+        Fan-out prompt string
+    """
+    lines = []
+
+    # Role
+    lines.append(
+        "You are coordinating a swarm of 4 optimization specialists. "
+        "Each specialist will attempt to optimize the same query using a "
+        "DIFFERENT strategy and set of examples."
+    )
+    lines.append("")
+    lines.append(
+        "Your job: analyze the query structure, identify 4 diverse optimization "
+        "angles, and assign each specialist a unique strategy with 3 relevant "
+        "examples. Maximize diversity to cover the optimization space."
+    )
+    lines.append("")
+
+    # Query
+    lines.append(f"## Query: {query_id}")
+    lines.append(f"## Dialect: {dialect}")
+    lines.append("")
+    lines.append("```sql")
+    lines.append(sql.strip())
+    lines.append("```")
+    lines.append("")
+
+    # DAG structure with costs
+    lines.append("## DAG Structure & Bottlenecks")
+    lines.append("")
+    append_dag_summary(lines, dag, costs, include_operations=True)
+    lines.append("")
+
+    # FAISS examples (top 12)
+    lines.append(f"## Top {len(faiss_examples)} FAISS Examples (by structural similarity)")
+    lines.append("")
+    for i, ex in enumerate(faiss_examples, 1):
+        ex_id = ex.get("id", "?")
+        speedup = ex.get("verified_speedup", ex.get("speedup", "?"))
+        desc = ex.get("description", "")[:120]
+        lines.append(f"{i}. **{ex_id}** ({speedup}x) — {desc}")
+    lines.append("")
+
+    # Full catalog
+    lines.append("## All Available Examples (full catalog — can swap if needed)")
+    lines.append("")
+    for ex in all_available_examples:
+        ex_id = ex.get("id", "?")
+        speedup = ex.get("speedup", "?")
+        desc = ex.get("description", "")[:100]
+        lines.append(f"- **{ex_id}** ({speedup}x) — {desc}")
+    lines.append("")
+
+    # Task
+    lines.append("## Your Task")
+    lines.append("")
+    lines.append(
+        "Design 4 DIFFERENT optimization strategies exploring diverse approaches. "
+        "You may keep FAISS recommendations OR swap examples from the catalog."
+    )
+    lines.append("")
+    lines.append("**Constraints**:")
+    lines.append("- Each worker gets exactly 3 examples")
+    lines.append("- No duplicate examples across workers (12 total, 3 per worker)")
+    lines.append("- If fewer than 12 unique examples are available, reuse is allowed")
+    lines.append("")
+    lines.append("**Diversity guidelines**:")
+    lines.append("- Worker 1: Conservative — proven patterns, low risk (e.g., pushdown, early filter)")
+    lines.append("- Worker 2: Moderate — date/dimension isolation, CTE restructuring")
+    lines.append("- Worker 3: Aggressive — multi-CTE restructuring, prefetch patterns")
+    lines.append("- Worker 4: Novel — OR-to-UNION, structural transforms, intersect-to-exists")
+    lines.append("")
+    lines.append("For each worker, specify:")
+    lines.append("1. **Strategy name** (e.g., `aggressive_date_prefetch`)")
+    lines.append("2. **3 examples** to use (from FAISS picks or catalog)")
+    lines.append("3. **Strategy hint** (1-2 sentences guiding the optimization approach)")
+    lines.append("")
+
+    # Output format
+    lines.append("### Output Format (follow EXACTLY)")
+    lines.append("")
+    lines.append("```")
+    lines.append("WORKER_1:")
+    lines.append("STRATEGY: <strategy_name>")
+    lines.append("EXAMPLES: <ex1>, <ex2>, <ex3>")
+    lines.append("HINT: <strategy guidance>")
+    lines.append("")
+    lines.append("WORKER_2:")
+    lines.append("STRATEGY: <strategy_name>")
+    lines.append("EXAMPLES: <ex4>, <ex5>, <ex6>")
+    lines.append("HINT: <strategy guidance>")
+    lines.append("")
+    lines.append("WORKER_3:")
+    lines.append("STRATEGY: <strategy_name>")
+    lines.append("EXAMPLES: <ex7>, <ex8>, <ex9>")
+    lines.append("HINT: <strategy guidance>")
+    lines.append("")
+    lines.append("WORKER_4:")
+    lines.append("STRATEGY: <strategy_name>")
+    lines.append("EXAMPLES: <ex10>, <ex11>, <ex12>")
+    lines.append("HINT: <strategy guidance>")
+    lines.append("```")
+
+    return "\n".join(lines)
+
+

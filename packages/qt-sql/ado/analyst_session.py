@@ -198,6 +198,7 @@ class AnalystSession:
             global_learnings=global_learnings,
             regression_warnings=regression_warnings,
             dialect=dialect,
+            semantic_intents=self.pipeline.get_semantic_intents(self.query_id),
         )
 
         # Generate candidates

@@ -27,6 +27,10 @@ class DeepSeekClient:
         self.model = model
         logger.info("Initialized DeepSeekClient with model=%s", model)
 
+    # Store last reasoning for callers that want to inspect/save it
+    last_reasoning: str = ""
+    last_duration: float = 0.0
+
     def analyze(self, prompt: str) -> str:
         """Send prompt to DeepSeek and return response."""
         try:
@@ -53,13 +57,19 @@ class DeepSeekClient:
         )
 
         duration = time.time() - start_time
+        DeepSeekClient.last_duration = duration
         response_text = response.choices[0].message.content or ""
 
         # R1 reasoner: final answer should be in content, reasoning chain in reasoning_content.
         # Known issue: sometimes content is empty and the JSON answer is in reasoning_content.
         reasoning = getattr(response.choices[0].message, 'reasoning_content', None)
+        DeepSeekClient.last_reasoning = reasoning or ""
+
         if reasoning:
-            logger.debug("DeepSeek reasoning (%d chars): %s...", len(reasoning), reasoning[:200])
+            logger.info(
+                "DeepSeek reasoning: %d chars (%.1fs thinking)",
+                len(reasoning), duration
+            )
 
         if not response_text.strip() and reasoning:
             logger.warning("DeepSeek content empty, extracting from reasoning_content")

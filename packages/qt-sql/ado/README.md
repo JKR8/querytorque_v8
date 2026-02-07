@@ -16,7 +16,9 @@ print(f"{result.query_id}: {result.status} {result.speedup:.2f}x")
 
 ## Documentation
 
-Full architecture, module reference, and configuration: **[docs/ADO_WORKFLOW.md](docs/ADO_WORKFLOW.md)**
+Full architecture and runtime workflow: **[docs/ADO_WORKFLOW.md](docs/ADO_WORKFLOW.md)**  
+Cleanup safety verification: **[docs/ADO_DELETE_SAFETY_MANIFEST.md](docs/ADO_DELETE_SAFETY_MANIFEST.md)**  
+Product refactor plan (qt-sql centered): **[docs/QT_SQL_ADO_PRODUCT_REFACTOR_PLAN.md](docs/QT_SQL_ADO_PRODUCT_REFACTOR_PLAN.md)**
 
 ## Structure
 

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .pipeline import Pipeline
-from .schemas import ValidationStatus, PipelineResult
+from .schemas import OptimizationMode, ValidationStatus, PipelineResult, SessionResult
 
 logger = logging.getLogger(__name__)
 
@@ -134,11 +134,14 @@ class ADORunner:
         max_iterations: int = 3,
         target_speedup: float = 2.0,
         n_workers: int = 3,
+        mode: OptimizationMode = OptimizationMode.EXPERT,
     ) -> ADOResult:
-        """Run deep-dive analyst mode on a single query.
+        """Run optimization on a single query in the specified mode.
 
-        Always optimizes from the ORIGINAL SQL with full history.
-        Generates LLM failure analysis when speedup < target.
+        Modes:
+        - STANDARD: Fast, no analyst, single iteration
+        - EXPERT: Iterative with analyst failure analysis (default, legacy behavior)
+        - SWARM: Multi-worker fan-out with snipe refinement
 
         Args:
             query_id: Query identifier (e.g., 'query_88')
@@ -146,45 +149,41 @@ class ADORunner:
             max_iterations: Max optimization rounds
             target_speedup: Stop early when this speedup is reached
             n_workers: Parallel workers per iteration
+            mode: Optimization mode (standard, expert, swarm)
 
         Returns:
-            ADOResult with the best iteration's outcome
+            ADOResult with the best result
         """
-        session = self.pipeline.run_analyst_session(
+        session_result = self.pipeline.run_optimization_session(
             query_id=query_id,
             sql=sql,
             max_iterations=max_iterations,
             target_speedup=target_speedup,
             n_workers=n_workers,
+            mode=mode,
         )
-        best = session._best_iteration()
-        if best is None:
-            return ADOResult(
-                query_id=query_id,
-                status="ERROR",
-                speedup=0.0,
-                optimized_sql=sql,
-                original_sql=sql,
-                transforms=[],
-                attempts=0,
-            )
+        return self._session_result_to_ado_result(session_result)
 
+    @staticmethod
+    def _session_result_to_ado_result(sr: SessionResult) -> ADOResult:
+        """Convert SessionResult to ADOResult."""
         return ADOResult(
-            query_id=query_id,
-            status=best.status,
-            speedup=best.speedup,
-            optimized_sql=best.optimized_sql,
-            original_sql=session.original_sql,
-            transforms=best.transforms,
-            attempts=len(session.iterations),
+            query_id=sr.query_id,
+            status=sr.status,
+            speedup=sr.best_speedup,
+            optimized_sql=sr.best_sql,
+            original_sql=sr.original_sql,
+            transforms=sr.best_transforms,
+            attempts=sr.n_iterations,
             all_validations=[
                 {
-                    "iteration": it.iteration,
-                    "status": it.status,
-                    "speedup": it.speedup,
-                    "transforms": it.transforms,
+                    "iteration": it.get("iteration", i),
+                    "status": it.get("status", ""),
+                    "speedup": it.get("speedup", 0.0) if isinstance(it.get("speedup"), (int, float)) else it.get("best_speedup", 0.0),
+                    "transforms": it.get("transforms", it.get("best_transforms", [])),
                 }
-                for it in session.iterations
+                for i, it in enumerate(sr.iterations)
+                if isinstance(it, dict)
             ],
         )
 

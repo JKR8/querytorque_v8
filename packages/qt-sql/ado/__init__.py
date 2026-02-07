@@ -7,20 +7,29 @@ Pipeline:
 4. Validate:  Syntax check (deterministic)
 5. Validate:  Timing + correctness (3-run or 5-run)
 
+Optimization Modes:
+- STANDARD: Fast, no analyst, single iteration
+- EXPERT:   Iterative with analyst failure analysis (default)
+- SWARM:    Multi-worker fan-out with snipe refinement
+
 Usage:
     from ado.pipeline import Pipeline
+    from ado.schemas import OptimizationMode
     p = Pipeline("ado/benchmarks/duckdb_tpcds")
-    result = p.run_query("query_1", sql)
+
+    # Standard mode (fast, no analyst):
+    result = p.run_optimization_session("query_1", sql, mode=OptimizationMode.STANDARD)
+
+    # Expert mode (default, iterative with failure analysis):
+    result = p.run_optimization_session("query_1", sql, mode=OptimizationMode.EXPERT)
+
+    # Swarm mode (4-worker fan-out + snipe):
+    result = p.run_optimization_session("query_88", sql, mode=OptimizationMode.SWARM)
 
     # Or via ADORunner wrapper:
-    from ado import ADORunner, ADOConfig
-    config = ADOConfig(benchmark_dir="ado/benchmarks/duckdb_tpcds")
-    runner = ADORunner(config)
-    result = runner.run_query("query_1", sql)
-
-    # Deep-dive analyst mode (iterative single-query optimization):
-    from ado import AnalystSession
-    session = p.run_analyst_session("query_88", sql, max_iterations=5)
+    from ado import ADORunner, ADOConfig, OptimizationMode
+    runner = ADORunner(ADOConfig(benchmark_dir="ado/benchmarks/duckdb_tpcds"))
+    result = runner.run_analyst("query_88", sql, mode=OptimizationMode.SWARM)
 """
 
 from .pipeline import Pipeline
@@ -28,10 +37,19 @@ from .runner import ADORunner, ADOConfig, ADOResult
 from .analyst_session import AnalystSession, AnalystIteration
 from .schemas import (
     BenchmarkConfig,
+    OptimizationMode,
     PipelineResult,
     PromotionAnalysis,
+    SessionResult,
     ValidationStatus,
     ValidationResult,
+    WorkerResult,
+)
+from .sessions import (
+    OptimizationSession,
+    StandardSession,
+    ExpertSession,
+    SwarmSession,
 )
 
 __all__ = [
@@ -42,8 +60,15 @@ __all__ = [
     "AnalystSession",
     "AnalystIteration",
     "BenchmarkConfig",
+    "OptimizationMode",
+    "OptimizationSession",
+    "StandardSession",
+    "ExpertSession",
+    "SwarmSession",
     "PipelineResult",
     "PromotionAnalysis",
+    "SessionResult",
     "ValidationStatus",
     "ValidationResult",
+    "WorkerResult",
 ]

@@ -203,13 +203,20 @@ def _append_dag_analysis(
     dag: Any,
     costs: Dict[str, Any],
     dialect: str = "duckdb",
+    node_intents: Optional[Dict[str, str]] = None,
 ) -> None:
     """Append structured DAG analysis — one card per node.
 
     Gold standard format per node:
       Role, Stats, Flags, Outputs, Dependencies, Joins, Filters,
       Operators, Key Logic (SQL)
+
+    Args:
+        node_intents: Optional {node_id: intent_string} from semantic_intents.json.
+                      When present, each node card includes an Intent line.
     """
+    if node_intents is None:
+        node_intents = {}
     from .node_prompter import compute_depths
     depths = compute_depths(dag)
 
@@ -246,6 +253,11 @@ def _append_dag_analysis(
             # --- Header ---
             lines.append(f"### {node_num}. {nid}")
             lines.append(f"**Role**: {role} (Definition Order: {depth})")
+
+            # Semantic intent (LLM-generated, from semantic_intents.json)
+            node_intent = node_intents.get(nid, "")
+            if node_intent:
+                lines.append(f"**Intent**: {node_intent}")
 
             # Stats
             output_rows = meta.get("limit")
@@ -650,6 +662,10 @@ def _format_key_logic(sql: str, dialect: str = "duckdb") -> str:
     Uses sqlglot pretty-print. For short SQL (≤15 lines), shows full.
     For longer SQL, shows full but limits to 20 lines.
     """
+    import re
+    # Strip block and line comments before formatting
+    sql = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
+    sql = re.sub(r'--[^\n]*', '', sql)
     compact = " ".join(sql.split())
     try:
         import sqlglot

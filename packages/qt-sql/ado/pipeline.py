@@ -24,8 +24,10 @@ from .learn import Learner
 from .node_prompter import Prompter
 from .schemas import (
     BenchmarkConfig,
+    OptimizationMode,
     PipelineResult,
     PromotionAnalysis,
+    SessionResult,
 )
 from .store import Store
 
@@ -74,6 +76,45 @@ class Pipeline:
         seed_dir = self.benchmark_dir / "state_0" / "seed"
         if seed_dir.exists():
             self._seed_dirs.append(seed_dir)
+
+        # Load pre-computed semantic intents (LLM-generated per-query intents)
+        self._semantic_intents: Dict[str, Dict[str, Any]] = {}
+        intents_path = self.benchmark_dir / "semantic_intents.json"
+        if intents_path.exists():
+            try:
+                data = json.loads(intents_path.read_text())
+                for q in data.get("queries", []):
+                    qid = q.get("query_id", "")
+                    if qid:
+                        self._semantic_intents[qid] = q
+                logger.info(
+                    f"Loaded semantic intents for {len(self._semantic_intents)} queries"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to load semantic_intents.json: {e}")
+
+    def get_semantic_intents(self, query_id: str) -> Optional[Dict[str, Any]]:
+        """Look up pre-computed semantic intents for a query.
+
+        Tries exact match first, then normalized forms (q1, query_1, etc.).
+        """
+        if not self._semantic_intents:
+            return None
+
+        # Exact match
+        if query_id in self._semantic_intents:
+            return self._semantic_intents[query_id]
+
+        # Normalize: query_75 → q75, q75 → q75
+        import re
+        m = re.match(r"(?:query_?)?(\d+)", query_id)
+        if m:
+            num = m.group(1)
+            for variant in [f"q{num}", f"query_{num}", f"query{num}"]:
+                if variant in self._semantic_intents:
+                    return self._semantic_intents[variant]
+
+        return None
 
     # =========================================================================
     # Phase 1: Parse SQL → DAG
@@ -195,6 +236,69 @@ class Pipeline:
         finally:
             validator.close()
 
+    def _validate_batch(
+        self,
+        original_sql: str,
+        optimized_sqls: List[str],
+    ) -> List[tuple[str, float, str]]:
+        """Validate multiple optimized SQLs against a single original baseline.
+
+        Times the original SQL ONCE, then validates each optimized SQL
+        sequentially against the cached baseline. Much more efficient than
+        calling _validate() repeatedly for swarm fan-out (saves 3 redundant
+        original benchmarks for 4 workers).
+
+        Args:
+            original_sql: The original SQL query (timed once)
+            optimized_sqls: List of optimized SQL queries to validate
+
+        Returns:
+            List of (status, speedup, error_message) tuples, one per optimized SQL
+        """
+        from .validate import Validator
+
+        validator = Validator(sample_db=self.config.db_path_or_dsn)
+        try:
+            # Step 1: Benchmark original once
+            baseline = validator.benchmark_baseline(original_sql)
+            logger.info(
+                f"Baseline: {baseline.measured_time_ms:.1f}ms "
+                f"({baseline.row_count} rows)"
+            )
+
+            # Step 2: Validate each optimized SQL sequentially
+            results = []
+            for i, opt_sql in enumerate(optimized_sqls):
+                result = validator.validate_against_baseline(
+                    baseline=baseline,
+                    candidate_sql=opt_sql,
+                    worker_id=i,
+                )
+
+                speedup = result.speedup
+                error_msg = result.error or ""
+
+                if result.status.value == "error":
+                    results.append(("ERROR", 0.0, error_msg))
+                elif result.status.value == "fail":
+                    results.append(("ERROR", 0.0, error_msg))
+                elif speedup >= 1.10:
+                    results.append(("WIN", speedup, ""))
+                elif speedup >= 1.05:
+                    results.append(("IMPROVED", speedup, ""))
+                elif speedup >= 0.95:
+                    results.append(("NEUTRAL", speedup, ""))
+                else:
+                    results.append(("REGRESSION", speedup, ""))
+
+            return results
+
+        except Exception as e:
+            logger.error(f"Batch validation failed: {e}")
+            return [("ERROR", 0.0, str(e))] * len(optimized_sqls)
+        finally:
+            validator.close()
+
     # =========================================================================
     # Main entry points
     # =========================================================================
@@ -285,6 +389,7 @@ class Pipeline:
             global_learnings=global_learnings,
             regression_warnings=regression_warnings,
             dialect=dialect,
+            semantic_intents=self.get_semantic_intents(query_id),
         )
 
         # Generate candidates via parallel workers
@@ -514,6 +619,63 @@ class Pipeline:
         session.run()
         session.save_session()
         return session
+
+    def run_optimization_session(
+        self,
+        query_id: str,
+        sql: str,
+        max_iterations: int = 3,
+        target_speedup: float = 2.0,
+        n_workers: int = 3,
+        mode: OptimizationMode = OptimizationMode.EXPERT,
+    ) -> SessionResult:
+        """Run optimization session in specified mode.
+
+        Args:
+            query_id: Query identifier (e.g., 'query_88')
+            sql: Original SQL query
+            max_iterations: Max optimization rounds
+            target_speedup: Stop early when this speedup is reached
+            n_workers: Parallel workers per iteration
+            mode: Optimization mode (standard, expert, swarm)
+
+        Returns:
+            SessionResult with the best result across all iterations
+        """
+        if mode == OptimizationMode.STANDARD:
+            from .sessions.standard_session import StandardSession
+            session = StandardSession(
+                pipeline=self,
+                query_id=query_id,
+                original_sql=sql,
+                target_speedup=target_speedup,
+                max_iterations=1,
+                n_workers=n_workers,
+            )
+        elif mode == OptimizationMode.EXPERT:
+            from .sessions.expert_session import ExpertSession
+            session = ExpertSession(
+                pipeline=self,
+                query_id=query_id,
+                original_sql=sql,
+                max_iterations=max_iterations,
+                target_speedup=target_speedup,
+                n_workers=n_workers,
+            )
+        elif mode == OptimizationMode.SWARM:
+            from .sessions.swarm_session import SwarmSession
+            session = SwarmSession(
+                pipeline=self,
+                query_id=query_id,
+                original_sql=sql,
+                max_iterations=max_iterations,
+                target_speedup=target_speedup,
+                n_workers=4,  # Always 4 in swarm mode
+            )
+        else:
+            raise ValueError(f"Unknown optimization mode: {mode}")
+
+        return session.run()
 
     def promote(self, state_num: int) -> str:
         """Create state_{N+1} from state_N with enriched promotion context.

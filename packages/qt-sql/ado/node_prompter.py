@@ -82,6 +82,22 @@ def _load_constraint_files() -> List[Dict[str, Any]]:
     return constraints
 
 
+
+def _build_node_intent_map(
+    semantic_intents: Optional[Dict[str, Any]],
+) -> Dict[str, str]:
+    """Build {node_id: intent_string} from semantic_intents data."""
+    if not semantic_intents:
+        return {}
+    result: Dict[str, str] = {}
+    for node in semantic_intents.get("dag_nodes", []):
+        nid = node.get("node_id", "")
+        intent = node.get("intent", "")
+        if nid and intent:
+            result[nid] = intent
+    return result
+
+
 class Prompter:
     """Build attention-optimized full-query rewrite prompts with DAG context.
 
@@ -107,6 +123,7 @@ class Prompter:
         global_learnings: Optional[Dict[str, Any]] = None,
         regression_warnings: Optional[List[Dict[str, Any]]] = None,
         dialect: str = "duckdb",
+        semantic_intents: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Build the full-query rewrite prompt.
 
@@ -128,6 +145,8 @@ class Prompter:
                                  structurally similar queries that regressed.
                                  Displayed as anti-patterns so the LLM avoids them.
             dialect: SQL dialect for pretty-printing
+            semantic_intents: Pre-computed LLM-generated query and per-node intents.
+                              Dict with 'query_intent' (str) and 'dag_nodes' (list).
         """
         sections = []
 
@@ -138,7 +157,9 @@ class Prompter:
         sections.append(self._section_full_sql(query_id, full_sql, dialect))
 
         # Section 3+4: Query Structure (DAG) — unified gold standard format
-        sections.append(self._section_query_structure(dag, costs, dialect))
+        sections.append(self._section_query_structure(
+            dag, costs, dialect, semantic_intents=semantic_intents,
+        ))
 
         # Section 5: History (EARLY-MID)
         if history:
@@ -165,8 +186,9 @@ class Prompter:
         # Section 7: Constraints (LATE-MID, sandwich ordered)
         sections.append(self._section_constraints())
 
-        # Section 8: Output Format (RECENCY)
-        sections.append(self._section_output_format())
+        # Section 8: Output Format (RECENCY) — includes column completeness contract
+        output_columns = self._extract_output_columns(dag)
+        sections.append(self._section_output_format(output_columns=output_columns))
 
         return "\n\n".join(sections)
 
@@ -287,17 +309,30 @@ class Prompter:
 
     @staticmethod
     def _section_query_structure(
-        dag: Any, costs: Dict[str, Any], dialect: str = "duckdb"
+        dag: Any, costs: Dict[str, Any], dialect: str = "duckdb",
+        semantic_intents: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Sections 3+4: Query Structure (DAG) — gold standard card format.
 
         Reuses the shared format from analyst.py so both prompts
-        present the same structured view.
+        present the same structured view. When semantic_intents are
+        available, annotates each DAG node with its LLM-generated intent.
         """
         from .analyst import _append_dag_analysis
 
         lines = ["## Query Structure (DAG)", ""]
-        _append_dag_analysis(lines, dag, costs, dialect=dialect)
+
+        # Merge query-level intent into main_query's node intent
+        node_intents = _build_node_intent_map(semantic_intents)
+        if semantic_intents:
+            query_intent = semantic_intents.get("query_intent", "")
+            if query_intent and "main_query" not in node_intents:
+                node_intents["main_query"] = query_intent
+
+        _append_dag_analysis(
+            lines, dag, costs, dialect=dialect,
+            node_intents=node_intents,
+        )
         return "\n".join(lines)
 
     @staticmethod
@@ -465,7 +500,13 @@ class Prompter:
     @staticmethod
     def _section_examples(examples: List[Dict[str, Any]]) -> str:
         """Section 7: Up to 3 contrastive BEFORE/AFTER examples (FAISS-matched)."""
-        lines = ["## Reference Examples"]
+        lines = [
+            "## Reference Examples",
+            "",
+            "The following examples are for **pattern reference only**. Do not copy "
+            "their table names, column names, or literal values into your rewrite. "
+            "Use only the schema and tables from the target query above.",
+        ]
 
         for i, example in enumerate(examples):
             pattern_name = (
@@ -481,6 +522,11 @@ class Prompter:
 
             ex = example.get("example", example)
 
+            # Principle — the abstract optimization reasoning
+            principle = example.get("principle", "")
+            if principle:
+                lines.append(f"\n**Principle:** {principle}")
+
             # BEFORE (slow) — prefer complete original_sql over abbreviated input_slice
             before_sql = (
                 example.get("original_sql")
@@ -495,11 +541,6 @@ class Prompter:
                 lines.append("")
                 lines.append("**BEFORE (slow):**")
                 lines.append(f"```sql\n{before_sql}\n```")
-
-            # Key insight
-            insight = ex.get("key_insight") or example.get("key_insight", "")
-            if insight:
-                lines.append(f"\n**Key insight:** {insight}")
 
             # AFTER (fast)
             output = ex.get("output", example.get("output", {}))
@@ -633,27 +674,72 @@ class Prompter:
         return "\n".join(lines)
 
     @staticmethod
-    def _section_output_format() -> str:
-        """Section 9: Output Format (RECENCY position)."""
-        return (
-            "## Output\n"
-            "\n"
-            "Return the complete rewritten SQL query. The query must be syntactically\n"
-            "valid and ready to execute.\n"
-            "\n"
-            "```sql\n"
-            "-- Your rewritten query here\n"
-            "```\n"
-            "\n"
-            "After the SQL, briefly explain what you changed:\n"
-            "\n"
-            "```\n"
-            "Changes: <1-2 sentence summary of the rewrite>\n"
-            "Expected speedup: <estimate>\n"
-            "```\n"
-            "\n"
-            "Now output your rewritten SQL:"
-        )
+    def _extract_output_columns(dag: Any) -> List[str]:
+        """Extract the final output columns from the main_query node's contract."""
+        main = dag.nodes.get("main_query")
+        if main and hasattr(main, "contract") and main.contract:
+            cols = main.contract.output_columns
+            if cols:
+                return list(cols)
+        # Fallback: try the last node in definition order
+        for nid in reversed(list(dag.nodes)):
+            node = dag.nodes[nid]
+            if hasattr(node, "contract") and node.contract and node.contract.output_columns:
+                return list(node.contract.output_columns)
+        return []
+
+    @staticmethod
+    def _section_output_format(
+        output_columns: Optional[List[str]] = None,
+    ) -> str:
+        """Section 9: Output Format (RECENCY position).
+
+        Includes a column completeness contract when output_columns
+        are available, so the LLM knows every column the rewritten
+        query must produce.
+        """
+        lines = [
+            "## Output",
+            "",
+            "Return the complete rewritten SQL query. The query must be syntactically",
+            "valid and ready to execute.",
+        ]
+
+        # Column completeness contract (RECENCY — LLM sees this last)
+        if output_columns:
+            lines.append("")
+            lines.append("### Column Completeness Contract")
+            lines.append("")
+            lines.append(
+                "Your rewritten query MUST produce **exactly** these output columns "
+                "(same names, same order):"
+            )
+            lines.append("")
+            for i, col in enumerate(output_columns, 1):
+                lines.append(f"  {i}. `{col}`")
+            lines.append("")
+            lines.append(
+                "Do NOT add, remove, or rename any columns. "
+                "The result set schema must be identical to the original query."
+            )
+
+        lines.extend([
+            "",
+            "```sql",
+            "-- Your rewritten query here",
+            "```",
+            "",
+            "After the SQL, briefly explain what you changed:",
+            "",
+            "```",
+            "Changes: <1-2 sentence summary of the rewrite>",
+            "Expected speedup: <estimate>",
+            "```",
+            "",
+            "Now output your rewritten SQL:",
+        ])
+
+        return "\n".join(lines)
 
     # =========================================================================
     # Utility: Load and match examples
