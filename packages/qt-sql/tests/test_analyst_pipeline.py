@@ -708,3 +708,169 @@ class TestPipelineHistoryWiring:
 
         pipeline._run_analyst.assert_not_called()
         assert pipeline.prompter.build_prompt.call_args.kwargs["history"] is history
+
+    def test_error_messages_propagate_through_pipeline(self):
+        """Verify error_messages from _validate reach the learning record."""
+        from ado.pipeline import Pipeline
+
+        pipeline = self._make_pipeline(use_analyst=False)
+        pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
+        pipeline._find_examples = MagicMock(return_value=[])
+        pipeline._find_regression_warnings = MagicMock(return_value=[])
+
+        # Simulate ERROR with actual error messages
+        pipeline._validate = MagicMock(return_value=(
+            "ERROR", 0.0,
+            ["Catalog Error: Table 'foo' does not exist", "Binder Error: column 'x' not found"],
+            "execution",
+        ))
+
+        with patch("ado.generate.CandidateGenerator") as mock_gen:
+            mock_gen.return_value.generate.return_value = []
+            result = Pipeline.run_query(
+                pipeline, query_id="query_fail", sql="SELECT 1", n_workers=1,
+            )
+
+        # Verify learner got the error messages
+        call_kwargs = pipeline.learner.create_learning_record.call_args.kwargs
+        assert call_kwargs["error_messages"] == [
+            "Catalog Error: Table 'foo' does not exist",
+            "Binder Error: column 'x' not found",
+        ]
+        assert call_kwargs["error_category"] == "execution"
+        assert call_kwargs["status"] == "error"
+
+    def test_fail_status_distinct_from_error(self):
+        """Verify FAIL (semantic mismatch) is captured differently from ERROR."""
+        from ado.pipeline import Pipeline
+
+        pipeline = self._make_pipeline(use_analyst=False)
+        pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
+        pipeline._find_examples = MagicMock(return_value=[])
+        pipeline._find_regression_warnings = MagicMock(return_value=[])
+
+        # Simulate FAIL with semantic error
+        pipeline._validate = MagicMock(return_value=(
+            "FAIL", 0.0,
+            ["Row count mismatch: expected 100, got 87"],
+            "semantic",
+        ))
+
+        with patch("ado.generate.CandidateGenerator") as mock_gen:
+            mock_gen.return_value.generate.return_value = []
+            result = Pipeline.run_query(
+                pipeline, query_id="query_sem", sql="SELECT 1", n_workers=1,
+            )
+
+        call_kwargs = pipeline.learner.create_learning_record.call_args.kwargs
+        assert call_kwargs["error_messages"] == ["Row count mismatch: expected 100, got 87"]
+        assert call_kwargs["error_category"] == "semantic"
+
+    def test_analyst_session_error_messages_in_iteration(self):
+        """Verify AnalystSession captures error_messages in AnalystIteration."""
+        from ado.analyst_session import AnalystSession
+        from unittest.mock import PropertyMock
+
+        pipeline = self._make_pipeline(use_analyst=True)
+        pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
+        pipeline._find_examples = MagicMock(return_value=[])
+        pipeline._find_regression_warnings = MagicMock(return_value=[])
+        pipeline._run_analyst = MagicMock(return_value=(None, None, None, []))
+
+        # Simulate ERROR with messages
+        pipeline._validate = MagicMock(return_value=(
+            "ERROR", 0.0,
+            ["Parser Error: syntax error at position 42"],
+            "syntax",
+        ))
+
+        session = AnalystSession(
+            pipeline=pipeline,
+            query_id="query_test",
+            original_sql="SELECT 1",
+            max_iterations=1,
+            target_speedup=2.0,
+            n_workers=1,
+        )
+
+        with patch("ado.generate.CandidateGenerator") as mock_gen:
+            mock_gen.return_value.generate.return_value = []
+            session.run()
+
+        # Check iteration has error_messages
+        assert len(session.iterations) == 1
+        it = session.iterations[0]
+        assert it.error_messages == ["Parser Error: syntax error at position 42"]
+        assert it.error_category == "syntax"
+        assert it.status == "ERROR"
+
+    def test_analyst_session_errors_in_history(self):
+        """Verify error_messages flow into the history dict for retry prompts."""
+        from ado.analyst_session import AnalystSession
+
+        pipeline = self._make_pipeline(use_analyst=True)
+        pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
+        pipeline._find_examples = MagicMock(return_value=[])
+        pipeline._find_regression_warnings = MagicMock(return_value=[])
+        pipeline._run_analyst = MagicMock(return_value=(None, None, None, []))
+
+        # Simulate ERROR
+        pipeline._validate = MagicMock(return_value=(
+            "ERROR", 0.0,
+            ["column 'rk' must appear in GROUP BY clause"],
+            "semantic",
+        ))
+
+        session = AnalystSession(
+            pipeline=pipeline,
+            query_id="query_hist",
+            original_sql="SELECT 1",
+            max_iterations=2,
+            target_speedup=2.0,
+            n_workers=1,
+        )
+
+        with patch("ado.generate.CandidateGenerator") as mock_gen:
+            mock_gen.return_value.generate.return_value = []
+            session.run()
+
+        # After 2 iterations, iteration 2's history should include iteration 1's errors
+        assert len(session.iterations) == 2
+        history = session._build_iteration_history()
+        analyst_attempts = [
+            a for a in history["attempts"]
+            if a.get("source", "").startswith("analyst_iter")
+        ]
+        assert len(analyst_attempts) == 2
+        assert analyst_attempts[0]["error_messages"] == ["column 'rk' must appear in GROUP BY clause"]
+        assert analyst_attempts[0]["error_category"] == "semantic"
+
+    def test_retry_preamble_shows_error_messages(self):
+        """Verify the retry preamble renders error messages clearly."""
+        from ado.node_prompter import Prompter
+
+        history = {
+            "attempts": [
+                {
+                    "source": "analyst_iter_0",
+                    "status": "ERROR",
+                    "transforms": ["decorrelate"],
+                    "failure_analysis": "The ROLLUP ordering was broken",
+                    "error_messages": [
+                        "Binder Error: column 'rk' not found",
+                        "Result mismatch: 87 rows vs 100 expected",
+                    ],
+                    "error_category": "execution",
+                },
+            ],
+            "promotion": None,
+        }
+
+        preamble = Prompter._section_retry_preamble(history)
+        assert "RETRY" in preamble
+        assert "attempt 2" in preamble.lower()
+        assert "Binder Error: column 'rk' not found" in preamble
+        assert "Result mismatch" in preamble
+        assert "execution" in preamble
+        assert "Expert analysis:" in preamble
+        assert "ROLLUP ordering was broken" in preamble

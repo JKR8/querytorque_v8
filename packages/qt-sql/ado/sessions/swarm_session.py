@@ -231,7 +231,7 @@ class SwarmSession(OptimizationSession):
         )
 
         worker_results = []
-        for wid, (status, speedup, error_msg, error_cat) in zip(sorted_wids, batch_results):
+        for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
             assignment, optimized_sql, transforms = candidates_by_assignment[wid]
 
             wr = WorkerResult(
@@ -243,14 +243,14 @@ class SwarmSession(OptimizationSession):
                 status=status,
                 transforms=transforms,
                 hint=assignment.hint,
-                error_message=error_msg,
+                error_message=" | ".join(error_msgs) if error_msgs else None,
             )
             worker_results.append(wr)
             self.all_worker_results.append(wr)
-            if error_msg:
+            if error_msgs:
                 logger.info(
                     f"[{self.query_id}] W{wr.worker_id} ({wr.strategy}): "
-                    f"{wr.status} {wr.speedup:.2f}x — {error_msg}"
+                    f"{wr.status} {wr.speedup:.2f}x — {error_msgs}"
                 )
             else:
                 logger.info(
@@ -259,7 +259,7 @@ class SwarmSession(OptimizationSession):
                 )
 
         # Learning records for each worker
-        for wid, (status, speedup, error_msg, error_cat) in zip(sorted_wids, batch_results):
+        for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
             wr_match = [w for w in worker_results if w.worker_id == wid]
             if not wr_match:
                 continue
@@ -273,7 +273,7 @@ class SwarmSession(OptimizationSession):
                     speedup=wr.speedup,
                     transforms_used=wr.transforms,
                     error_category=error_cat,
-                    error_messages=[error_msg] if error_msg else [],
+                    error_messages=error_msgs,
                 )
                 self.pipeline.learner.save_learning_record(lr)
             except Exception as e:

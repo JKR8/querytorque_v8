@@ -265,14 +265,14 @@ class Pipeline:
         self,
         original_sql: str,
         optimized_sqls: List[str],
-    ) -> List[tuple[str, float, str, str | None]]:
+    ) -> List[tuple[str, float, list[str], str | None]]:
         """Validate multiple optimized SQLs against a single original baseline.
 
         Times the original SQL ONCE, then validates each optimized SQL
         sequentially against the cached baseline.
 
         Returns:
-            List of (status, speedup, error_message, error_category) tuples
+            List of (status, speedup, error_messages, error_category) tuples
         """
         from .validate import Validator
 
@@ -295,27 +295,27 @@ class Pipeline:
                 )
 
                 speedup = result.speedup
-                error_msg = result.error or ""
+                errors = result.errors or []
                 error_cat = result.error_category
 
                 if result.status.value == "error":
-                    results.append(("ERROR", 0.0, error_msg, error_cat or "execution"))
+                    results.append(("ERROR", 0.0, errors, error_cat or "execution"))
                 elif result.status.value == "fail":
-                    results.append(("FAIL", 0.0, error_msg, error_cat or "semantic"))
+                    results.append(("FAIL", 0.0, errors, error_cat or "semantic"))
                 elif speedup >= 1.10:
-                    results.append(("WIN", speedup, "", None))
+                    results.append(("WIN", speedup, [], None))
                 elif speedup >= 1.05:
-                    results.append(("IMPROVED", speedup, "", None))
+                    results.append(("IMPROVED", speedup, [], None))
                 elif speedup >= 0.95:
-                    results.append(("NEUTRAL", speedup, "", None))
+                    results.append(("NEUTRAL", speedup, [], None))
                 else:
-                    results.append(("REGRESSION", speedup, "", None))
+                    results.append(("REGRESSION", speedup, [], None))
 
             return results
 
         except Exception as e:
             logger.error(f"Batch validation failed: {e}")
-            return [("ERROR", 0.0, str(e), "execution")] * len(optimized_sqls)
+            return [("ERROR", 0.0, [str(e)], "execution")] * len(optimized_sqls)
         finally:
             validator.close()
 

@@ -38,12 +38,14 @@ If omitted, the pipeline reads from `QT_LLM_PROVIDER` / `QT_LLM_MODEL` automatic
 All modes run from the **project root**. Common preamble:
 
 ```python
-from ado.runner import ADORunner, ADOConfig
+from ado.pipeline import Pipeline
 from ado.schemas import OptimizationMode
 
-runner = ADORunner(ADOConfig(
+p = Pipeline(
     benchmark_dir="packages/qt-sql/ado/benchmarks/duckdb_tpcds",
-))
+    provider="deepseek",
+    model="deepseek-reasoner",
+)
 sql = open("packages/qt-sql/ado/benchmarks/duckdb_tpcds/queries/query_67.sql").read()
 ```
 
@@ -52,56 +54,44 @@ sql = open("packages/qt-sql/ado/benchmarks/duckdb_tpcds/queries/query_67.sql").r
 Single iteration: FAISS retrieval, prompt, generate, validate. No analyst call, no retry.
 
 ```python
-result = runner.run_analyst(
-    query_id="q67",
-    sql=sql,
-    mode=OptimizationMode.STANDARD,
-    n_workers=3,
+result = p.run_optimization_session(
+    query_id="query_67", sql=sql,
+    mode=OptimizationMode.STANDARD, n_workers=3,
 )
 ```
 
-### Expert (iterative with analyst failure analysis)
+### Expert (iterative, 1 worker, analyst-steered)
 
-Up to N iterations. On failure, the analyst LLM analyzes why it failed and steers the next attempt.
+Up to N iterations with 1 worker per round. On failure, the analyst LLM analyzes why it
+failed (with full error messages) and steers the next attempt. Retry preamble shows raw
+validation errors + expert analysis.
 
 ```python
-result = runner.run_analyst(
-    query_id="q67",
-    sql=sql,
+result = p.run_optimization_session(
+    query_id="query_67", sql=sql,
     mode=OptimizationMode.EXPERT,
-    max_iterations=3,
-    target_speedup=2.0,
-    n_workers=3,
+    max_iterations=3, target_speedup=2.0,
 )
+# n_workers is always 1 in expert mode (hardcoded)
 ```
 
-### Swarm (multi-worker fan-out)
+### Swarm (4-worker fan-out + snipe)
 
-Parallel workers with different strategies, then snipe refinement on the best candidate.
+4 parallel workers with different strategies, then single-worker snipe refinement.
 
 ```python
-result = runner.run_analyst(
-    query_id="q67",
-    sql=sql,
+result = p.run_optimization_session(
+    query_id="query_67", sql=sql,
     mode=OptimizationMode.SWARM,
-    n_workers=4,
+    max_iterations=3, target_speedup=2.0,
 )
+# n_workers is always 4 in swarm mode (hardcoded)
 ```
 
-### Batch (full state run)
-
-Run a complete state across all queries in the benchmark:
+### Single query (no session, no retry)
 
 ```python
-results = runner.run_batch(state_num=0, n_workers=5)
-for r in results:
-    print(f"{r.query_id}: {r.status} {r.speedup:.2f}x")
-```
-
-### Single query (legacy, no analyst)
-
-```python
-result = runner.run_query("q67", sql, n_workers=5)
+result = p.run_query("query_67", sql, n_workers=5)
 ```
 
 ## Running from CLI
@@ -109,12 +99,13 @@ result = runner.run_query("q67", sql, n_workers=5)
 ```bash
 cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
 PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -c "
-from ado.runner import ADORunner, ADOConfig
+from dotenv import load_dotenv; load_dotenv('.env')
+from ado.pipeline import Pipeline
 from ado.schemas import OptimizationMode
-runner = ADORunner(ADOConfig(benchmark_dir='packages/qt-sql/ado/benchmarks/duckdb_tpcds'))
+p = Pipeline('packages/qt-sql/ado/benchmarks/duckdb_tpcds', provider='deepseek', model='deepseek-reasoner')
 sql = open('packages/qt-sql/ado/benchmarks/duckdb_tpcds/queries/query_67.sql').read()
-result = runner.run_analyst('q67', sql, mode=OptimizationMode.EXPERT, max_iterations=3, n_workers=3)
-print(f'{result.status} {result.speedup:.2f}x')
+result = p.run_optimization_session('query_67', sql, mode=OptimizationMode.EXPERT, max_iterations=3)
+print(f'{result.status} {result.best_speedup:.2f}x')
 "
 ```
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
@@ -86,13 +87,20 @@ class AnalystSession:
         self.best_speedup = 1.0
         self.best_sql = original_sql
 
+    @staticmethod
+    def _stage(query_id: str, msg: str):
+        """Print a clear stage banner to console."""
+        print(f"  [{query_id}] {msg}", flush=True)
+
     def run(self) -> Optional[AnalystIteration]:
         """Run the full iterative loop. Returns best iteration (if >=5% speedup)."""
+        print(f"\n{'='*60}", flush=True)
+        print(f"  EXPERT SESSION: {self.query_id}", flush=True)
+        print(f"  max_iterations={self.max_iterations}  target={self.target_speedup:.1f}x  workers={self.n_workers}", flush=True)
+        print(f"{'='*60}", flush=True)
+
         for i in range(self.max_iterations):
-            logger.info(
-                f"[{self.query_id}] Analyst iteration {i + 1}/{self.max_iterations} "
-                f"(best: {self.best_speedup:.2f}x, optimizing from: original)"
-            )
+            print(f"\n--- Iteration {i + 1}/{self.max_iterations} ---", flush=True)
 
             iteration = self._run_iteration(i)
             self.iterations.append(iteration)
@@ -104,34 +112,25 @@ class AnalystSession:
 
             # Generate failure analysis if < target
             if iteration.speedup < self.target_speedup:
-                logger.info(
-                    f"[{self.query_id}] Speedup {iteration.speedup:.2f}x < "
-                    f"target {self.target_speedup:.2f}x, generating failure analysis..."
-                )
+                self._stage(self.query_id, f"Phase 7: LLM failure analysis ({iteration.speedup:.2f}x < {self.target_speedup:.1f}x target)...")
+                t_fa = time.time()
                 iteration.failure_analysis = self._generate_failure_analysis(iteration)
+                self._stage(self.query_id, f"  Failure analysis done ({time.time() - t_fa:.0f}s)")
 
             # Stop if target reached
             if self.best_speedup >= self.target_speedup:
-                logger.info(
-                    f"[{self.query_id}] Target speedup {self.target_speedup:.2f}x "
-                    f"reached at iteration {i + 1}"
-                )
+                self._stage(self.query_id, f"Target {self.target_speedup:.1f}x reached!")
                 break
 
         best = self._best_iteration()
-        if best is None or best.speedup < self.FINAL_THRESHOLD:
-            logger.info(
-                f"[{self.query_id}] Analyst session complete: "
-                f"{len(self.iterations)} iterations, "
-                f"best {best.speedup if best else 0:.2f}x — below {self.FINAL_THRESHOLD}x minimum"
-            )
-            return best  # Caller decides what to do with sub-threshold result
+        total_time = time.time() - t0 if 't0' in dir() else 0
+        print(f"\n{'='*60}", flush=True)
+        if best:
+            print(f"  DONE: {self.query_id} — {best.status} {best.speedup:.2f}x (iter {best.iteration + 1})", flush=True)
+        else:
+            print(f"  DONE: {self.query_id} — no improvement", flush=True)
+        print(f"{'='*60}\n", flush=True)
 
-        logger.info(
-            f"[{self.query_id}] Analyst session complete: "
-            f"{len(self.iterations)} iterations, "
-            f"best {best.speedup:.2f}x (iteration {best.iteration + 1})"
-        )
         return best
 
     def _run_iteration(self, iteration_num: int) -> AnalystIteration:
@@ -152,18 +151,23 @@ class AnalystSession:
         )
 
         input_sql = self.original_sql  # Always from original
+        t0 = time.time()
 
         # Build history from ALL previous iterations
         history = self._build_iteration_history()
 
         # Phase 1: Parse DAG from original
+        self._stage(self.query_id, "Phase 1: Parsing DAG...")
         dag, costs, _explain = self.pipeline._parse_dag(input_sql, dialect=dialect, query_id=self.query_id)
+        self._stage(self.query_id, f"  DAG: {len(dag.nodes)} nodes, {len(dag.edges)} edges")
 
         # Phase 2: FAISS example retrieval
+        self._stage(self.query_id, "Phase 2: FAISS example retrieval...")
         examples = self.pipeline._find_examples(
             input_sql, engine=engine, k=3,
         )
         example_ids = [e.get("id", "?") for e in examples]
+        self._stage(self.query_id, f"  Examples: {example_ids}")
 
         # Also find regression warnings for structurally similar queries
         regression_warnings = self.pipeline._find_regression_warnings(
@@ -171,6 +175,8 @@ class AnalystSession:
         )
 
         # Always run analyst in deep-dive mode
+        self._stage(self.query_id, "Phase 3: LLM analyst (structural analysis)...")
+        t_analyst = time.time()
         expert_analysis = None
         analysis_raw = None
         expert_analysis, analysis_raw, _analysis_prompt, examples = self.pipeline._run_analyst(
@@ -184,11 +190,14 @@ class AnalystSession:
             dialect=dialect,
         )
         example_ids = [e.get("id", "?") for e in examples]
+        self._stage(self.query_id, f"  Analyst done ({time.time() - t_analyst:.0f}s), examples: {example_ids}")
 
         # Load global learnings
         global_learnings = self.pipeline.learner.build_learning_summary() or None
 
-        # Phase 3: Build prompt
+        # Phase 4: Build prompt + generate rewrite
+        self._stage(self.query_id, "Phase 4: LLM rewrite (generating candidate)...")
+        t_rewrite = time.time()
         prompt = self.pipeline.prompter.build_prompt(
             query_id=self.query_id,
             full_sql=input_sql,
@@ -236,25 +245,26 @@ class AnalystSession:
             if best_cand:
                 optimized_sql = best_cand.optimized_sql
                 transforms = best_cand.transforms
+        self._stage(self.query_id, f"  Rewrite done ({time.time() - t_rewrite:.0f}s), transforms: {transforms or ['none']}")
 
-        # Phase 4: Syntax check
+        # Phase 5: Syntax check
+        self._stage(self.query_id, "Phase 5: Syntax check...")
         try:
             import sqlglot
             sqlglot.parse_one(optimized_sql, dialect=dialect)
+            self._stage(self.query_id, "  Syntax: OK")
         except Exception as e:
-            logger.warning(
-                f"[{self.query_id}] Iteration {iteration_num + 1} syntax error: {e}"
-            )
+            self._stage(self.query_id, f"  Syntax: FAILED — {e}")
             optimized_sql = input_sql
 
-        # Phase 5: Validate against TRUE ORIGINAL
+        # Phase 6: Validate against TRUE ORIGINAL
+        self._stage(self.query_id, "Phase 6: Validating (semantic + timing)...")
+        t_val = time.time()
         status, speedup, val_errors, val_error_cat = self.pipeline._validate(self.original_sql, optimized_sql)
-        logger.info(
-            f"[{self.query_id}] Iteration {iteration_num + 1}: "
-            f"{status} ({speedup:.2f}x vs original)"
-        )
+        self._stage(self.query_id, f"  Result: {status} ({speedup:.2f}x) — {time.time() - t_val:.0f}s")
         if val_errors:
-            logger.info(f"[{self.query_id}] Validation errors: {val_errors}")
+            for err in val_errors[:3]:
+                self._stage(self.query_id, f"  Error [{val_error_cat}]: {err[:150]}")
 
         # Create learning record for this iteration
         try:
