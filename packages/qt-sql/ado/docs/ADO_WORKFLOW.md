@@ -10,7 +10,10 @@
 Inputs:
   - benchmark config (engine, db_path/dsn, workers, promote threshold)
   - baseline SQL queries (benchmarks/<name>/queries/*.sql)
-  - gold examples (ado/examples/<engine>/*.json) + constraints + FAISS index
+  - gold examples (ado/examples/<engine>/*.json) + regression anti-patterns
+  - constraints (ado/constraints/*.json)
+  - FAISS index (ado/models/similarity_index.faiss)
+  - LLM provider (configured via QT_LLM_PROVIDER env var or ADOConfig)
 
             |
             v
@@ -64,7 +67,7 @@ Inputs:
             v
 +------------------------------------------------------+
 | Phase 5: Validate + Score                            |
-| - semantic + runtime validation                      |
+| - semantic + runtime validation (1-1-2-2 pattern)   |
 | - DuckDB: qt_sql.validation.sql_validator            |
 | - PostgreSQL: executor-based PG validator             |
 | - status buckets: WIN / IMPROVED / NEUTRAL / etc.   |
@@ -77,7 +80,7 @@ Inputs:
 | - save prompt/response/sql/validation artifacts      |
 | - create learning record (per query)                 |
 | - update state leaderboard + benchmark leaderboard   |
-| - update learning summary                            |
+| - update learning summary + history.json             |
 +------------------------------------------------------+
             |
             v
@@ -90,6 +93,26 @@ Inputs:
 +------------------------------------------------------+
 ```
 
+## Module Reference
+
+| Module | Purpose |
+|--------|---------|
+| `pipeline.py` | Core orchestrator — all 5 phases, state management, promote, analyst |
+| `runner.py` | Thin wrapper — `ADORunner`, `ADOConfig`, `ADOResult` for simplified API |
+| `node_prompter.py` | Prompt builder — attention-ordered sections, dynamic constraints, regression warnings |
+| `generate.py` | LLM candidate generation — parallel workers via `ThreadPoolExecutor` |
+| `sql_rewriter.py` | SQL extraction — parses LLM response, extracts rewritten SQL + transforms |
+| `validate.py` | Validation + scoring — semantic equivalence, runtime benchmarking, error categorization |
+| `analyst.py` | Analyst prompt builder — structural analysis, bottleneck identification, example overrides |
+| `analyst_session.py` | Deep-dive iterative mode — `AnalystSession`, `AnalystIteration` |
+| `knowledge.py` | FAISS recommender — `ADOFAISSRecommender` for similarity search |
+| `faiss_builder.py` | FAISS index builder — vectorize examples, build/rebuild index |
+| `learn.py` | Learning system — `Learner`, `LearningRecord`, summary analytics |
+| `schemas.py` | Data models — `PipelineResult`, `BenchmarkConfig`, `PromotionAnalysis`, `ValidationResult`, `ValidationStatus`, `EdgeContract`, `NodeRewriteResult` |
+| `store.py` | Artifact persistence — saves prompt/response/sql/validation per worker |
+| `context.py` | Context builder — `ContextBundle` for EXPLAIN plans and table stats (optional, not in main pipeline) |
+| `parse_dsb_catalog.py` | DSB catalog parser — utility for importing DSB benchmark rules |
+
 ## Phase Details
 
 ### Phase 1: Parse
@@ -98,28 +121,41 @@ Inputs:
 - Output: DAG nodes/edges and per-node cost breakdown.
 
 ### Phase 2: FAISS Example Retrieval
-- Module: `ado/pipeline.py` (`Pipeline._find_examples`) -> `ado/knowledge.py` (`ADOFAISSRecommender`).
+- Module: `ado/pipeline.py` (`Pipeline._find_examples`, `Pipeline._find_regression_warnings`) -> `ado/knowledge.py` (`ADOFAISSRecommender`).
 - Fingerprints the input SQL: replaces literals with neutral constants (`0`, `'x'`), lowercases identifiers.
 - Vectorizes the AST into a 90-dimensional feature vector (node type counts, depth metrics, cardinality, pattern indicators, complexity).
 - Searches FAISS index (IndexFlatL2 with z-score + L2 normalization for cosine similarity).
 - **Engine-specific**: strict filtering ensures DuckDB queries only get DuckDB gold examples, PostgreSQL queries only get PostgreSQL gold examples.
-- Returns top-k gold examples (default k=3).
-- Also retrieves regression warnings: structurally similar queries that regressed (type=regression in FAISS metadata). These are shown as anti-patterns in the prompt so the LLM avoids repeating past mistakes.
-- Index: `ado/models/similarity_index.faiss` (105 vectors: 21 gold + 74 catalog rules + 10 regressions, 90 dimensions).
-- Rebuild: `python3 -m ado.faiss_builder` from `packages/qt-sql/`.
+- **Gold examples** (type=gold): Returns top-k (default k=3) — proven rewrites to emulate.
+- **Regression warnings** (type=regression): Returns top-k (default k=2, min similarity 0.3) — failed rewrites to avoid. Shown as anti-patterns in the prompt.
+- Index: `ado/models/similarity_index.faiss` (105 vectors, 90 dimensions).
+  - 68 metadata entries: 16 DuckDB gold + 5 PG gold + 37 seed catalog rules + 10 DuckDB regressions
+  - 37 additional anonymous vectors from multi-dialect vectorization of seed rules
+- Rebuild: `python3 -m ado.faiss_builder` from `packages/qt-sql/` (use `--stats` to inspect).
 
 ### LLM Analyst (Optional)
 - Module: `ado/pipeline.py` (`Pipeline._run_analyst`) + `ado/analyst.py`.
 - **Off by default** — costs 1 extra API call per query. Set `use_analyst=True` on Pipeline or per-call.
-- Sees: FAISS-selected examples, full catalogue of available gold examples for the engine, DAG, costs, history.
+- Sees: FAISS-selected examples, full catalogue of available gold examples for the engine, DAG, costs, history, effective_patterns, known_regressions.
 - Can: accept FAISS picks, or override with specific example IDs via `EXAMPLES: id1, id2, id3` in response.
-- Provides expert structural analysis injected into the Phase 3 prompt (replaces examples section).
+- Output: parsed into sections (structural breakdown, bottleneck, proposed optimizations, recommended strategy, example selection).
+- Formatted analysis injected into the Phase 3 prompt (replaces examples section with expert structural guidance).
 
 ### Phase 3: Prompt + Candidate Generation
 - Prompt assembly: `ado/node_prompter.py` (`Prompter.build_prompt`).
-- Prompt sections (attention-ordered): Role/Task, Full SQL, DAG Topology, Performance Profile, History, Global Learnings (from benchmark runs), Examples or Expert Analysis, Regression Warnings (FAISS-matched anti-patterns), Constraints (sandwich-ordered from JSON), Output Format.
+- Prompt sections (attention-ordered):
+  1. **Role/Task** — frames the LLM as a SQL rewrite engine
+  2. **Full SQL** — pretty-printed complete query with query_id
+  3. **DAG Topology** — nodes, edges, depths, flags, costs as SQL comments
+  4. **Performance Profile** — per-node cost %, row estimates, operators
+  5. **History** — previous attempts (status, speedup, transforms) + promotion context
+  5b. **Global Learnings** — aggregate benchmark stats (transform effectiveness, anti-patterns, example success rates, error patterns)
+  6. **Examples** (default) or **Expert Analysis** (analyst mode) — FAISS-matched gold BEFORE/AFTER pairs, or LLM analyst structural guidance
+  6b. **Regression Warnings** — FAISS-matched anti-patterns showing similar queries that regressed (original SQL, regressed rewrite, regression mechanism)
+  7. **Constraints** — sandwich-ordered from JSON (CRITICAL top+bottom, HIGH+MEDIUM middle)
+  8. **Output Format** — return complete rewritten SQL + changes summary
 - Candidate generation: `ado/generate.py` (`CandidateGenerator.generate`) with N parallel workers via `ThreadPoolExecutor`.
-- Response application: `ado/sql_rewriter.py` (`SQLRewriter`) extracts optimized SQL from LLM response.
+- Response application: `ado/sql_rewriter.py` (`SQLRewriter`) extracts optimized SQL from LLM response, with fallback AST-based transform inference.
 - **Candidate selection**: first syntactically valid, non-trivial candidate is picked (not best-of-N by speedup).
 
 ### Phase 4: Syntax Gate
@@ -130,6 +166,8 @@ Inputs:
 - Validator: `ado/validate.py` (`Validator`).
 - DuckDB: uses `qt_sql.validation.sql_validator.SQLValidator`.
 - PostgreSQL: uses executor-based PG validator (`Validator._create_pg_validator()`).
+- Validation pattern: 1-1-2-2 (warmup runs, then measurement runs).
+- Error categorization: `categorize_error()` classifies errors as syntax|semantic|timeout|execution|unknown.
 - Pipeline status mapping:
   - `WIN`: speedup >= `1.10`
   - `IMPROVED`: speedup >= `1.05`
@@ -137,14 +175,86 @@ Inputs:
   - `REGRESSION`: speedup < `0.95`
   - `ERROR`: validation error/failure
 
+## LLM Configuration
+
+### Provider Setup
+LLM inference is configured via environment variables (`.env` file at project root):
+
+```bash
+QT_LLM_PROVIDER=deepseek          # Provider: deepseek | openrouter | anthropic | openai | groq | gemini-api
+QT_LLM_MODEL=deepseek-reasoner    # Model name (provider-specific)
+QT_DEEPSEEK_API_KEY=sk-...        # API key for chosen provider
+```
+
+### Supported Providers
+| Provider | Default Model | Env Key |
+|----------|--------------|---------|
+| `deepseek` | `deepseek-reasoner` | `QT_DEEPSEEK_API_KEY` |
+| `openrouter` | `moonshotai/kimi-k2.5` | `QT_OPENROUTER_API_KEY` |
+| `anthropic` | `claude-sonnet-4-5-20250929` | `QT_ANTHROPIC_API_KEY` |
+| `openai` | `gpt-4o` | `QT_OPENAI_API_KEY` |
+| `groq` | `llama-3.3-70b-versatile` | `QT_GROQ_API_KEY` |
+| `gemini-api` | `gemini-3-flash-preview` | `QT_GEMINI_API_KEY` |
+
+### Programmatic Override
+```python
+config = ADOConfig(
+    benchmark_dir="ado/benchmarks/duckdb_tpcds",
+    provider="anthropic",
+    model="claude-sonnet-4-5-20250929",
+)
+# Or pass a custom function:
+config = ADOConfig(
+    benchmark_dir="ado/benchmarks/duckdb_tpcds",
+    analyze_fn=my_custom_llm_function,
+)
+```
+
+Infrastructure: `qt_shared/llm/` (`create_llm_client()` factory, `LLMClient` protocol).
+
+## Entry Points
+
+### ADORunner (recommended)
+```python
+from ado import ADORunner, ADOConfig
+
+config = ADOConfig(benchmark_dir="ado/benchmarks/duckdb_tpcds")
+runner = ADORunner(config)
+
+# Single query
+result = runner.run_query("query_1", sql)
+
+# Batch (full state)
+results = runner.run_batch(state_num=0)
+
+# Multiple queries with progress callback
+results = runner.run_queries({"q1": sql1, "q2": sql2})
+
+# Analyst deep-dive
+result = runner.run_analyst("query_88", sql, max_iterations=5, target_speedup=1.5)
+
+# Promote winners to next state
+runner.promote(state_num=0)
+```
+
+### Pipeline (direct)
+```python
+from ado import Pipeline
+
+p = Pipeline("ado/benchmarks/duckdb_tpcds", use_analyst=True)
+result = p.run_query("query_1", sql, n_workers=5)
+results = p.run_state(state_num=0)
+session = p.run_analyst_session("query_88", sql, max_iterations=5)
+```
+
 ## State Lifecycle
 
 ### `run_state(state_num)`
 - For each query:
   - load baseline SQL (`queries/*.sql` or promoted SQL from previous state)
-  - execute all phases: parse → FAISS → (analyst) → prompt+generate → syntax gate → validate
-  - persist validation + artifacts
-  - create learning record
+  - execute all phases: parse -> FAISS -> (analyst) -> prompt+generate -> syntax gate -> validate
+  - persist validation + artifacts via `Store`
+  - create learning record via `Learner`
 - Writes:
   - `state_N/validation/<query_id>.json`
   - `state_N/<query_id>/worker_00/{prompt.txt,response.txt,optimized.sql,validation.json}`
@@ -170,16 +280,20 @@ Inputs:
 - Injected into the prompt so the LLM knows what was already tried.
 
 ## Core Artifacts
-- Config: `ado/benchmarks/<name>/config.json`
-- Query input: `ado/benchmarks/<name>/queries/*.sql`
-- State outputs: `ado/benchmarks/<name>/state_*`
-- FAISS index: `ado/models/similarity_index.faiss` + `similarity_metadata.json`
-- Gold examples: `ado/examples/<engine>/*.json` (duckdb: 16, postgres: 5)
-- Regression examples: `ado/examples/<engine>/regressions/*.json` (duckdb: 10)
-- Constraints: `ado/constraints/*.json` (11 files: 6 CRITICAL, 4 HIGH, 1 MEDIUM)
-- Learning journal: `ado/benchmarks/<name>/learning/`
-- Benchmark history: `ado/benchmarks/<name>/history.json` (auto-generated)
-- Analyst sessions: `ado/benchmarks/<name>/analyst_sessions/{query_id}/`
+
+| Artifact | Location |
+|----------|----------|
+| Benchmark config | `ado/benchmarks/<name>/config.json` |
+| Query inputs | `ado/benchmarks/<name>/queries/*.sql` |
+| State outputs | `ado/benchmarks/<name>/state_*` |
+| FAISS index | `ado/models/similarity_index.faiss` + `similarity_metadata.json` + `feature_stats.json` |
+| Gold examples | `ado/examples/<engine>/*.json` (duckdb: 16, postgres: 5) |
+| Regression examples | `ado/examples/<engine>/regressions/*.json` (duckdb: 10) |
+| Constraints | `ado/constraints/*.json` (11 files: 6 CRITICAL, 4 HIGH, 1 MEDIUM) |
+| Learning journal | `ado/benchmarks/<name>/learning/` |
+| Benchmark history | `ado/benchmarks/<name>/history.json` (auto-generated for analyst) |
+| Analyst sessions | `ado/benchmarks/<name>/analyst_sessions/{query_id}/` |
+| Leaderboards | `ado/benchmarks/<name>/leaderboard.json` + `leaderboard.md` |
 
 ## Analyst Deep-Dive Mode
 
@@ -187,8 +301,8 @@ Inputs:
 Iterative single-query optimization loop where the LLM analyst steers direction, reviews output, and retries with intelligence. Critical invariant: **always optimizes from the ORIGINAL query** with full history of all iterations — never from intermediate results.
 
 ### Entry Points
-- **Pipeline**: `p.run_analyst_session("query_88", sql, max_iterations=5, target_speedup=1.5, n_workers=3)`
 - **ADORunner**: `runner.run_analyst("query_88", sql, max_iterations=5, target_speedup=1.5, n_workers=3)`
+- **Pipeline**: `p.run_analyst_session("query_88", sql, max_iterations=5, target_speedup=1.5, n_workers=3)`
 - **Direct**: `from ado.analyst_session import AnalystSession`
 
 ### How It Works
@@ -199,7 +313,7 @@ Each iteration:
 4. Build prompt with iteration history + global learnings + regression warnings
 5. Generate N candidates via parallel workers
 6. Validate best candidate
-7. Record iteration result
+7. Record iteration result + learning record
 
 ### Stopping Criteria
 - Target speedup reached
@@ -208,7 +322,8 @@ Each iteration:
 
 ### Session Persistence
 - Sessions saved to `benchmark_dir/analyst_sessions/{query_id}/`
-- Each iteration's prompt, SQL, validation, and analysis saved individually
+- Each iteration: `iteration_NN/{prompt.txt, optimized.sql, validation.json, analysis.txt}`
+- Session metadata: `session.json` (query_id, best_speedup, best_sql, n_iterations)
 - Sessions can be resumed via `AnalystSession.load_session(pipeline, session_dir)`
 
 ### Module
@@ -218,6 +333,21 @@ Each iteration:
 
 ### Overview
 Constraints are loaded dynamically from `ado/constraints/*.json` instead of being hardcoded. Each constraint file contains an `id`, `severity` (CRITICAL/HIGH/MEDIUM), and a `prompt_instruction` that is injected into the rewrite prompt.
+
+### Current Constraints (11)
+| ID | Severity | Purpose |
+|----|----------|---------|
+| COMPLETE_OUTPUT | CRITICAL | Preserve all output columns |
+| CTE_COLUMN_COMPLETENESS | CRITICAL | CTE must include all downstream columns |
+| KEEP_EXISTS_AS_EXISTS | CRITICAL | Don't convert EXISTS to IN/JOIN |
+| LITERAL_PRESERVATION | CRITICAL | Copy all literals exactly |
+| NO_MATERIALIZE_EXISTS | CRITICAL | Don't materialize EXISTS into CTEs |
+| SEMANTIC_EQUIVALENCE | CRITICAL | Same rows, columns, ordering |
+| MIN_BASELINE_THRESHOLD | HIGH | Be conservative on fast queries |
+| NO_UNFILTERED_DIMENSION_CTE | HIGH | Every CTE must have a WHERE filter |
+| OR_TO_UNION_GUARD | HIGH | Max 3 UNION branches, same-column ORs left alone |
+| REMOVE_REPLACED_CTES | HIGH | Remove dead CTEs after rewriting |
+| EXPLICIT_JOINS | MEDIUM | Prefer JOIN ON over comma joins |
 
 ### Sandwich Pattern
 Constraints are ordered in the prompt using an attention-optimized sandwich pattern:
@@ -237,6 +367,55 @@ Create a JSON file in `ado/constraints/` with this structure:
   "constraint_rules": []
 }
 ```
+Then rebuild the FAISS index if the constraint references new regression patterns.
+
+## Regression Warning System
+
+### Overview
+Past benchmark regressions are indexed into FAISS alongside gold examples. When a new query is structurally similar to a query that previously regressed, the regression is shown as an anti-pattern in the prompt.
+
+### How It Works
+1. Regression examples stored in `ado/examples/<engine>/regressions/*.json`
+2. Each has `type: "regression"` — indexed into FAISS with this metadata
+3. `Pipeline._find_regression_warnings()` searches FAISS for type=regression matches (min similarity 0.3)
+4. `Prompter._section_regression_warnings()` renders: original query, regressed rewrite, regression mechanism
+5. LLM sees what went wrong and avoids repeating the same mistake
+
+### Adding New Regressions
+Create a JSON file in `ado/examples/<engine>/regressions/` with:
+```json
+{
+  "id": "regression_qNN_transform",
+  "type": "regression",
+  "name": "QNN regression: transform (0.XXx)",
+  "description": "Anti-pattern description",
+  "verified_speedup": "0.XXx",
+  "query_id": "qNN",
+  "transform_attempted": "transform_name",
+  "regression_mechanism": "Why it regressed — specific structural explanation",
+  "original_sql": "-- complete original SQL",
+  "example": {
+    "before_sql": "-- original SQL",
+    "after_sql": "-- the regressed rewrite",
+    "key_insight": "What NOT to do"
+  }
+}
+```
+Then rebuild the FAISS index: `python3 -m ado.faiss_builder` from `packages/qt-sql/`.
+
+### Current Regressions (10 DuckDB)
+| ID | Speedup | Transform | Key Anti-Pattern |
+|----|---------|-----------|-----------------|
+| Q16 | 0.14x | semantic_rewrite | Don't materialize EXISTS into CTEs |
+| Q93 | 0.34x | decorrelate | Don't decorrelate when join expands rows |
+| Q31 | 0.49x | pushdown | Don't leave dead CTEs after rewriting |
+| Q25 | 0.50x | date_cte_isolate | Don't isolate date when filter is already in WHERE |
+| Q95 | 0.54x | semantic_rewrite | Don't decouple correlated EXISTS pairs into CTEs |
+| Q90 | 0.59x | materialize_cte | Don't materialize tightly-coupled OR conditions |
+| Q74 | 0.68x | pushdown | Don't duplicate CTEs instead of replacing |
+| Q1 | 0.71x | decorrelate | Don't pre-aggregate when optimizer computes incrementally |
+| Q67 | 0.85x | date_cte_isolate | Don't isolate date for queries with many window functions |
+| Q51 | 0.87x | date_cte_isolate | Don't materialize running window aggregates into CTEs |
 
 ## Global Learnings
 
@@ -244,10 +423,17 @@ Create a JSON file in `ado/constraints/` with this structure:
 Aggregate learnings from benchmark runs are automatically loaded from the learning journal and injected into rewrite prompts. This includes transform effectiveness, known anti-patterns, and example success rates.
 
 ### Data Flow
-1. Learning records saved per-query during `run_query()`
-2. `Learner.build_learning_summary()` aggregates all records
-3. Summary injected into prompt via `Prompter._section_global_learnings()`
-4. `Learner.generate_benchmark_history()` creates `history.json` for the analyst
+1. Learning records saved per-query during `run_query()` via `Learner.create_learning_record()`
+2. `Learner.build_learning_summary()` aggregates all records into transform/example effectiveness stats
+3. Summary injected into prompt via `Prompter._section_global_learnings()` (section 5b)
+4. `Learner.generate_benchmark_history()` creates `history.json` for the analyst (effective_patterns + known_regressions)
+
+### Learning Record Structure
+```
+LearningRecord: timestamp, query_id, query_pattern, examples_recommended,
+  transforms_recommended, status, speedup, transforms_used, error_messages,
+  error_category (syntax|semantic|timeout|execution|unknown)
+```
 
 ### history.json Structure
 ```json
@@ -263,12 +449,41 @@ Aggregate learnings from benchmark runs are automatically loaded from the learni
 }
 ```
 
+## Benchmarks
+
+### Configured Benchmarks
+| Benchmark | Engine | Location |
+|-----------|--------|----------|
+| `duckdb_tpcds` | DuckDB | `ado/benchmarks/duckdb_tpcds/` |
+| `postgres_dsb` | PostgreSQL | `ado/benchmarks/postgres_dsb/` |
+
+### Benchmark Directory Structure
+```
+ado/benchmarks/<name>/
+  config.json              # BenchmarkConfig (engine, db_path, workers, threshold)
+  queries/*.sql            # Baseline SQL queries
+  state_0/                 # Discovery state
+    seed/                  # Unverified catalog rules (carry forward)
+    prompts/               # Generated prompts
+    responses/             # LLM responses
+    validation/            # Per-query validation results
+    leaderboard.json       # State leaderboard
+  state_1/                 # Refinement state (after promote)
+    promotion_context/     # LLM analysis of what worked
+  learning/                # Learning records + summary
+  analyst_sessions/        # Deep-dive session artifacts
+  history.json             # Cumulative learnings for analyst
+  leaderboard.json         # Best-of-all-states leaderboard
+  leaderboard.md           # Human-readable leaderboard
+```
+
 ## Operational Defaults (duckdb_tpcds)
 - Engine: `duckdb`
 - Scale factor: `10`
 - Database: `/mnt/d/TPC-DS/tpcds_sf10.duckdb`
-- Validation method: `3-run` (discard 1st warmup, average runs 2-3)
+- Validation: `1-1-2-2` pattern (warmup + measurement via `qt_sql.validation.SQLValidator`)
 - State 0 workers: `5` (discovery)
 - State N workers: `1` (refinement)
 - Promotion threshold: `1.05`
-- Analyst: off (opt-in per query)
+- Analyst: off by default (opt-in per query or per state)
+- LLM: DeepSeek Reasoner (via `QT_LLM_PROVIDER=deepseek`)
