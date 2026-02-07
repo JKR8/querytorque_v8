@@ -287,7 +287,7 @@ class SwarmSession(OptimizationSession):
                 f" {marker} W{wr.worker_id} ({wr.strategy}): {wr.status} {wr.speedup:.2f}x{err}"
             )
 
-        # Learning records for each worker
+        # Learning records + blackboard entries for each worker
         for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
             wr_match = [w for w in worker_results if w.worker_id == wid]
             if not wr_match:
@@ -307,6 +307,29 @@ class SwarmSession(OptimizationSession):
                 self.pipeline.learner.save_learning_record(lr)
             except Exception as e:
                 logger.warning(f"[{self.query_id}] Learning record failed: {e}")
+
+            # Blackboard entry
+            if self.pipeline._blackboard_writer:
+                try:
+                    w_prompt, w_response = worker_prompts.get(wid, ("", ""))
+                    intent_data = self.pipeline.get_semantic_intents(self.query_id) or {}
+                    entry = self.pipeline._blackboard_writer.create_entry(
+                        query_id=self.query_id,
+                        worker_id=wr.worker_id,
+                        run_name=self.pipeline.run_name or "",
+                        status=wr.status,
+                        speedup=wr.speedup,
+                        transforms=wr.transforms,
+                        examples_used=wr.examples_used,
+                        strategy=wr.strategy,
+                        error_category=error_cat,
+                        error_messages=error_msgs,
+                        llm_response=w_response or "",
+                        query_intent=intent_data.get("query_intent", ""),
+                    )
+                    self.pipeline._blackboard_writer.write_entry(entry)
+                except Exception as e:
+                    logger.warning(f"[{self.query_id}] Blackboard entry failed: {e}")
 
         # Sort by worker_id for consistency
         worker_results.sort(key=lambda w: w.worker_id)
@@ -459,6 +482,48 @@ class SwarmSession(OptimizationSession):
             self.pipeline.learner.save_learning_record(lr)
         except Exception as e:
             logger.warning(f"[{self.query_id}] Learning record failed: {e}")
+
+        # Blackboard entry for snipe worker
+        if self.pipeline._blackboard_writer:
+            try:
+                intent_data = self.pipeline.get_semantic_intents(self.query_id) or {}
+                entry = self.pipeline._blackboard_writer.create_entry(
+                    query_id=self.query_id,
+                    worker_id=1,
+                    run_name=self.pipeline.run_name or "",
+                    status=status,
+                    speedup=speedup,
+                    transforms=candidate.transforms,
+                    examples_used=analysis.examples,
+                    strategy=f"snipe_{snipe_num}",
+                    error_category=val_error_cat,
+                    error_messages=val_errors,
+                    llm_response=snipe_worker_response or "",
+                    query_intent=intent_data.get("query_intent", ""),
+                    failure_analysis=analysis.failure_analysis or "",
+                )
+                self.pipeline._blackboard_writer.write_entry(entry)
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] Blackboard entry failed: {e}")
+
+        # Blackboard entry for analyst failure analysis (if present)
+        if self.pipeline._blackboard_writer and analysis.failure_analysis:
+            try:
+                analyst_entry = self.pipeline._blackboard_writer.create_entry(
+                    query_id=self.query_id,
+                    worker_id=100 + snipe_num,  # Analyst entries use high worker IDs
+                    run_name=self.pipeline.run_name or "",
+                    status="ANALYSIS",
+                    speedup=0.0,
+                    transforms=[],
+                    examples_used=[],
+                    strategy="analyst_failure_review",
+                    failure_analysis=analysis.failure_analysis,
+                    query_intent=intent_data.get("query_intent", ""),
+                )
+                self.pipeline._blackboard_writer.write_entry(analyst_entry)
+            except Exception:
+                pass  # Analyst entries are supplementary
 
         return {
             "iteration": snipe_num,
@@ -616,14 +681,22 @@ class SwarmSession(OptimizationSession):
     def save_session(self, output_dir: Optional[Path] = None) -> Path:
         """Save swarm session artifacts for audit trail.
 
-        Saves to benchmark_dir/swarm_sessions/{query_id}/.
+        Saves to runs/<run_name>/results/<query_id>/ if run_name is set,
+        otherwise falls back to benchmark_dir/swarm_sessions/<query_id>/.
         """
         if output_dir is None:
-            output_dir = (
-                self.pipeline.benchmark_dir
-                / "swarm_sessions"
-                / self.query_id
-            )
+            # Prefer named run directory
+            if self.pipeline.run_name and self.pipeline._run_manager:
+                run_dir = self.pipeline._run_manager.get_run_dir(
+                    self.pipeline.run_name
+                )
+                output_dir = run_dir / "results" / self.query_id
+            else:
+                output_dir = (
+                    self.pipeline.benchmark_dir
+                    / "swarm_sessions"
+                    / self.query_id
+                )
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 

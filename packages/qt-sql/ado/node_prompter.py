@@ -125,6 +125,7 @@ class Prompter:
         dialect: str = "duckdb",
         semantic_intents: Optional[Dict[str, Any]] = None,
         engine_version: Optional[str] = None,
+        principles: Optional[List[Any]] = None,
     ) -> str:
         """Build the full-query rewrite prompt.
 
@@ -149,6 +150,7 @@ class Prompter:
             semantic_intents: Pre-computed LLM-generated query and per-node intents.
                               Dict with 'query_intent' (str) and 'dag_nodes' (list).
             engine_version: Engine version string (e.g., '1.4.3' for DuckDB).
+            principles: Matched KnowledgePrinciple objects from global knowledge.
         """
         sections = []
 
@@ -185,6 +187,12 @@ class Prompter:
         # Gold examples (FAISS-matched or analyst-overridden)
         if examples:
             sections.append(self._section_examples(examples))
+
+        # Section 6a: Discovered Principles (between examples and constraints)
+        if principles:
+            principles_section = self._section_principles(principles)
+            if principles_section:
+                sections.append(principles_section)
 
         # Section 6b: Regression warnings (after examples, before constraints)
         if regression_warnings:
@@ -648,6 +656,46 @@ class Prompter:
                     lines.append("")
                     lines.append("**AFTER (fast):**")
                     lines.append(f"```sql\n{out_sql}\n```")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _section_principles(principles: List[Any]) -> str:
+        """Section 6a: Discovered Principles from benchmark learnings.
+
+        Inserted between examples and constraints so the LLM sees verified
+        optimization patterns with concrete evidence.
+        """
+        if not principles:
+            return ""
+
+        lines = [
+            "## Discovered Principles (from benchmark learnings)",
+            "",
+        ]
+
+        for p in principles:
+            # Handle both KnowledgePrinciple objects and dicts
+            name = getattr(p, "name", p.get("name", "")) if isinstance(p, dict) else p.name
+            avg = getattr(p, "avg_speedup", 0) if not isinstance(p, dict) else p.get("avg_speedup", 0)
+            queries = getattr(p, "queries", []) if not isinstance(p, dict) else p.get("queries", [])
+            what = getattr(p, "what", "") if not isinstance(p, dict) else p.get("what", "")
+            why = getattr(p, "why", "") if not isinstance(p, dict) else p.get("why", "")
+            when = getattr(p, "when", "") if not isinstance(p, dict) else p.get("when", "")
+            when_not = getattr(p, "when_not", "") if not isinstance(p, dict) else p.get("when_not", "")
+
+            q_str = ", ".join(queries[:5]) if queries else "?"
+            lines.append(f"### Principle: {name}")
+            lines.append(f"Verified: {avg:.2f}x avg across {len(queries)} queries ({q_str})")
+            if what:
+                lines.append(f"What: {what}")
+            if why:
+                lines.append(f"Why: {why}")
+            if when:
+                lines.append(f"When to apply: {when}")
+            if when_not:
+                lines.append(f"When NOT: {when_not}")
+            lines.append("")
 
         return "\n".join(lines)
 

@@ -323,6 +323,63 @@ class Learner:
         logger.info(f"Saved learning summary: {filepath}")
         return filepath
 
+    @staticmethod
+    def to_blackboard_entry(
+        record: LearningRecord,
+        run_name: str = "",
+        query_intent: str = "",
+        strategy: str = "",
+        llm_response: str = "",
+        failure_analysis: str = "",
+    ) -> "BlackboardEntry":
+        """Bridge: convert a LearningRecord to a BlackboardEntry.
+
+        Args:
+            record: The learning record to convert
+            run_name: Name of the current run
+            query_intent: Semantic intent of the query
+            strategy: Worker strategy name
+            llm_response: Raw LLM response for knowledge extraction
+            failure_analysis: Analyst failure analysis text
+
+        Returns:
+            BlackboardEntry ready to be written.
+        """
+        from .blackboard import BlackboardWriter
+
+        # Map learning status to blackboard status
+        status_map = {
+            "pass": "IMPROVED" if record.speedup >= 1.05 else "NEUTRAL",
+        }
+        if record.status == "pass" and record.speedup >= 1.10:
+            bb_status = "WIN"
+        elif record.status == "pass":
+            bb_status = status_map.get(record.status, "NEUTRAL")
+        elif record.status == "error":
+            bb_status = "ERROR"
+        else:
+            bb_status = "FAIL"
+
+        # Create entry via the writer's helper (for knowledge extraction)
+        writer = BlackboardWriter.__new__(BlackboardWriter)
+        writer.run_dir = None
+        writer.raw_dir = None
+        return writer.create_entry(
+            query_id=record.query_id,
+            worker_id=record.worker_id,
+            run_name=run_name,
+            status=bb_status,
+            speedup=record.speedup,
+            transforms=record.transforms_used,
+            examples_used=record.examples_recommended,
+            strategy=strategy,
+            error_category=record.error_category,
+            error_messages=record.error_messages,
+            llm_response=llm_response,
+            query_intent=query_intent,
+            failure_analysis=failure_analysis,
+        )
+
     def generate_benchmark_history(self, benchmark_dir: Path) -> Path:
         """Generate history.json with cumulative_learnings for the analyst.
 

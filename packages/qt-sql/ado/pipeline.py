@@ -7,10 +7,11 @@ Phases:
 4. Validate:  Syntax check (deterministic)
 5. Validate:  Timing + correctness (3-run or 5-run)
 
-State management:
-- State 0: Discovery with N workers
-- State 1+: Refinement with 1 worker + full history
-- Promote: Best-of-state SQL becomes next state's baseline
+Knowledge-centric architecture:
+- Seed folder: consolidated initialization package (seed/)
+- Named runs: replace anonymous state_N directories (runs/<name>/)
+- Blackboard: per-run knowledge accumulation (runs/<name>/blackboard/)
+- Global knowledge: collated principles + anti-patterns (knowledge/)
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from .learn import Learner
 from .node_prompter import Prompter
 from .schemas import (
     BenchmarkConfig,
+    GlobalKnowledge,
     OptimizationMode,
     PipelineResult,
     PromotionAnalysis,
@@ -44,8 +46,9 @@ class Pipeline:
         model: Optional[str] = None,
         analyze_fn=None,
         use_analyst: bool = False,
+        run_name: Optional[str] = None,
     ):
-        """Load config.json from benchmark dir, initialize components.
+        """Load from seed/ folder, initialize components.
 
         Args:
             benchmark_dir: Path to benchmark directory (e.g., ado/benchmarks/duckdb_tpcds)
@@ -54,11 +57,22 @@ class Pipeline:
             analyze_fn: Optional custom LLM function
             use_analyst: If True, runs LLM analyst before rewrite (costs 1 extra
                          API call per query). Use for stubborn queries only.
+            run_name: Named run for this pipeline execution (creates runs/<name>/).
         """
         self.benchmark_dir = Path(benchmark_dir)
-        self.config = BenchmarkConfig.from_file(
-            self.benchmark_dir / "config.json"
-        )
+        self.run_name = run_name
+
+        # Load config from seed/ first, fall back to benchmark root
+        self.seed_dir = self.benchmark_dir / "seed"
+        self._seed_loader = None
+        if self.seed_dir.exists():
+            from .seed import SeedLoader
+            self._seed_loader = SeedLoader(self.seed_dir)
+            self.config = self._seed_loader.config
+        else:
+            self.config = BenchmarkConfig.from_file(
+                self.benchmark_dir / "config.json"
+            )
 
         self.provider = provider
         self.model = model
@@ -71,30 +85,75 @@ class Pipeline:
             journal_dir=self.benchmark_dir / "learning"
         )
 
-        # Seed dirs: state_0/seed/ for unverified catalog rules
+        # Seed dirs: seed/catalog_rules/ for unverified catalog rules,
+        # fall back to state_0/seed/ for legacy layouts
         self._seed_dirs = []
-        seed_dir = self.benchmark_dir / "state_0" / "seed"
-        if seed_dir.exists():
-            self._seed_dirs.append(seed_dir)
+        catalog_dir = self.seed_dir / "catalog_rules"
+        if catalog_dir.exists():
+            self._seed_dirs.append(catalog_dir)
+        else:
+            legacy_seed = self.benchmark_dir / "state_0" / "seed"
+            if legacy_seed.exists():
+                self._seed_dirs.append(legacy_seed)
 
         # Resolve engine version (cached, used in prompts)
         self._engine_version = self._resolve_engine_version()
 
-        # Load pre-computed semantic intents (LLM-generated per-query intents)
+        # Load semantic intents (seed/intents/ or legacy semantic_intents.json)
         self._semantic_intents: Dict[str, Dict[str, Any]] = {}
-        intents_path = self.benchmark_dir / "semantic_intents.json"
-        if intents_path.exists():
-            try:
-                data = json.loads(intents_path.read_text())
-                for q in data.get("queries", []):
-                    qid = q.get("query_id", "")
-                    if qid:
-                        self._semantic_intents[qid] = q
+        if self._seed_loader:
+            self._semantic_intents = self._seed_loader.load_all_intents()
+            if self._semantic_intents:
                 logger.info(
-                    f"Loaded semantic intents for {len(self._semantic_intents)} queries"
+                    f"Loaded semantic intents for {len(self._semantic_intents)} queries (seed)"
                 )
+        if not self._semantic_intents:
+            intents_path = self.benchmark_dir / "semantic_intents.json"
+            if intents_path.exists():
+                try:
+                    data = json.loads(intents_path.read_text())
+                    for q in data.get("queries", []):
+                        qid = q.get("query_id", "")
+                        if qid:
+                            self._semantic_intents[qid] = q
+                    logger.info(
+                        f"Loaded semantic intents for {len(self._semantic_intents)} queries"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to load semantic_intents.json: {e}")
+
+        # Load global knowledge (from knowledge/ directory)
+        self._global_knowledge: Optional[GlobalKnowledge] = None
+        self._load_global_knowledge()
+
+        # Initialize run manager and blackboard writer if run_name provided
+        self._run_manager = None
+        self._blackboard_writer = None
+        if run_name:
+            from .run_manager import RunManager
+            self._run_manager = RunManager(self.benchmark_dir)
+            run_dir = self._run_manager.get_run_dir(run_name)
+            if run_dir.exists():
+                from .blackboard import BlackboardWriter
+                self._blackboard_writer = BlackboardWriter(run_dir)
+
+    def _load_global_knowledge(self) -> None:
+        """Load global knowledge from knowledge/ directory."""
+        knowledge_dir = self.benchmark_dir / "knowledge"
+        if not knowledge_dir.exists():
+            return
+        # Find the first .json knowledge file
+        for path in knowledge_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+                self._global_knowledge = GlobalKnowledge.from_dict(data)
+                logger.info(
+                    f"Loaded global knowledge: {len(self._global_knowledge.principles)} "
+                    f"principles, {len(self._global_knowledge.anti_patterns)} anti-patterns"
+                )
+                break
             except Exception as e:
-                logger.warning(f"Failed to load semantic_intents.json: {e}")
+                logger.warning(f"Failed to load knowledge {path}: {e}")
 
     def _resolve_engine_version(self) -> Optional[str]:
         """Detect the target engine version for prompt context."""
@@ -185,8 +244,15 @@ class Pipeline:
     def _get_explain(self, query_id: str, sql: str) -> Optional[Dict[str, Any]]:
         """Get EXPLAIN ANALYZE result — cached first, run if missing.
 
-        Cache location: benchmark_dir/explains/{query_id}.json
+        Cache location: seed/explains/ (preferred) or benchmark_dir/explains/
         """
+        # Try seed first
+        if self._seed_loader:
+            result = self._seed_loader.load_explain(query_id)
+            if result:
+                logger.info(f"[{query_id}] EXPLAIN loaded from seed")
+                return result
+
         cache_dir = self.benchmark_dir / "explains"
         cache_path = cache_dir / f"{query_id}.json"
 
@@ -420,6 +486,9 @@ class Pipeline:
         # Phase 3: Build full-query prompt + generate rewrites
         logger.info(f"[{query_id}] Phase 3: Generating {n_workers} candidates")
 
+        # Match principles from global knowledge
+        matched_principles = self._match_principles(query_id, sql)
+
         prompt = self.prompter.build_prompt(
             query_id=query_id,
             full_sql=sql,
@@ -433,6 +502,7 @@ class Pipeline:
             dialect=dialect,
             semantic_intents=self.get_semantic_intents(query_id),
             engine_version=self._engine_version,
+            principles=matched_principles,
         )
 
         # Generate candidates via parallel workers
@@ -512,6 +582,27 @@ class Pipeline:
             self.learner.save_learning_record(lr)
         except Exception as e:
             logger.warning(f"[{query_id}] Learning record failed: {e}")
+
+        # Write blackboard entry (if run_name set)
+        if self._blackboard_writer:
+            try:
+                intent_data = self.get_semantic_intents(query_id) or {}
+                entry = self._blackboard_writer.create_entry(
+                    query_id=query_id,
+                    worker_id=0,
+                    run_name=self.run_name or "",
+                    status=status,
+                    speedup=speedup,
+                    transforms=transforms,
+                    examples_used=example_ids,
+                    error_category=val_error_cat,
+                    error_messages=val_errors,
+                    llm_response=best_response or "",
+                    query_intent=intent_data.get("query_intent", ""),
+                )
+                self._blackboard_writer.write_entry(entry)
+            except Exception as e:
+                logger.warning(f"[{query_id}] Blackboard entry failed: {e}")
 
         return result
 
@@ -721,6 +812,133 @@ class Pipeline:
             raise ValueError(f"Unknown optimization mode: {mode}")
 
         return session.run()
+
+    def run_named_session(
+        self,
+        run_name: str,
+        query_ids: Optional[List[str]] = None,
+        mode: OptimizationMode = OptimizationMode.SWARM,
+        n_workers: int = 4,
+        target_speedup: float = 2.0,
+        max_iterations: int = 3,
+    ) -> List[SessionResult]:
+        """Run optimization session with named run tracking.
+
+        Creates a named run directory, runs optimization on selected queries,
+        writes blackboard entries, and auto-collates knowledge.
+
+        Args:
+            run_name: Name for this run (e.g., "discovery_20260208")
+            query_ids: Optional query filter (None = all queries)
+            mode: Optimization mode
+            n_workers: Number of workers
+            target_speedup: Target speedup
+            max_iterations: Max iterations
+
+        Returns:
+            List of SessionResult for each query.
+        """
+        from .run_manager import RunManager
+        from .blackboard import BlackboardWriter
+        from .blackboard_collator import BlackboardCollator
+
+        # Create named run
+        run_mgr = RunManager(self.benchmark_dir)
+        run_dir = run_mgr.create_run(
+            name=run_name,
+            mode=mode.value,
+            n_workers=n_workers,
+            target_speedup=target_speedup,
+            max_iterations=max_iterations,
+            query_filter=query_ids,
+        )
+
+        # Set up blackboard writer for this run
+        self.run_name = run_name
+        self._run_manager = run_mgr
+        self._blackboard_writer = BlackboardWriter(run_dir)
+
+        # Load queries
+        queries = self._load_queries(query_ids)
+
+        # Run each query
+        results = []
+        for query_id, sql in queries.items():
+            logger.info(f"[{run_name}] Processing {query_id}")
+            session_result = self.run_optimization_session(
+                query_id=query_id,
+                sql=sql,
+                max_iterations=max_iterations,
+                target_speedup=target_speedup,
+                n_workers=n_workers,
+                mode=mode,
+            )
+            results.append(session_result)
+
+            # Save worker results
+            run_mgr.save_best(
+                run_name=run_name,
+                query_id=query_id,
+                best_worker_id=0,
+                best_data={
+                    "query_id": query_id,
+                    "status": session_result.status,
+                    "speedup": session_result.best_speedup,
+                    "transforms": session_result.best_transforms,
+                },
+            )
+
+        # Save run leaderboard and summary
+        leaderboard = [
+            {
+                "query_id": r.query_id,
+                "status": r.status,
+                "speedup": r.best_speedup,
+                "transforms": r.best_transforms,
+            }
+            for r in results
+        ]
+        run_mgr.save_run_leaderboard(run_name, leaderboard)
+
+        speedups = [r.best_speedup for r in results if r.best_speedup > 0]
+        summary = {
+            "total_queries": len(results),
+            "wins": sum(1 for r in results if r.status == "WIN"),
+            "improved": sum(1 for r in results if r.status == "IMPROVED"),
+            "neutral": sum(1 for r in results if r.status == "NEUTRAL"),
+            "regressions": sum(1 for r in results if r.status == "REGRESSION"),
+            "errors": sum(1 for r in results if r.status in ("ERROR", "FAIL")),
+            "avg_speedup": round(sum(speedups) / len(speedups), 4) if speedups else 0,
+        }
+        run_mgr.save_run_summary(run_name, summary)
+
+        # Auto-collate blackboard entries
+        try:
+            collator = BlackboardCollator(run_dir)
+            collator.auto_collate()
+        except Exception as e:
+            logger.warning(f"Blackboard auto-collation failed: {e}")
+
+        # Update benchmark leaderboard
+        from .schemas import PipelineResult
+        pipeline_results = [
+            PipelineResult(
+                query_id=r.query_id,
+                status=r.status,
+                speedup=r.best_speedup,
+                original_sql=r.original_sql,
+                optimized_sql=r.best_sql,
+                transforms_applied=r.best_transforms,
+            )
+            for r in results
+        ]
+        self._update_benchmark_leaderboard(pipeline_results)
+
+        # Save learning summary
+        self.learner.save_learning_summary()
+        self.learner.generate_benchmark_history(self.benchmark_dir)
+
+        return results
 
     def promote(self, state_num: int) -> str:
         """Create state_{N+1} from state_N with enriched promotion context.
@@ -1118,11 +1336,18 @@ class Pipeline:
         query_ids: Optional[List[str]] = None,
         state_num: int = 0,
     ) -> Dict[str, str]:
-        """Load queries from benchmark queries/ directory.
+        """Load queries from seed/queries/ (preferred) or benchmark queries/.
 
         For state > 0, check if promoted SQL exists from the previous state
         and use that as the baseline instead of the original.
         """
+        # Prefer seed loader
+        if self._seed_loader:
+            queries = self._seed_loader.load_queries(query_ids)
+            if queries:
+                return queries
+
+        # Fall back to legacy path
         queries_dir = self.benchmark_dir / "queries"
         if not queries_dir.exists():
             return {}
@@ -1353,12 +1578,45 @@ class Pipeline:
         return None
 
     def load_query(self, query_id: str) -> Optional[str]:
-        """Load a single query by ID."""
+        """Load a single query by ID from seed/ or queries/."""
+        if self._seed_loader:
+            queries = self._seed_loader.load_queries([query_id])
+            if query_id in queries:
+                return queries[query_id]
+
         queries_dir = self.benchmark_dir / "queries"
         path = queries_dir / f"{query_id}.sql"
         if path.exists():
             return path.read_text()
         return None
+
+    def _match_principles(
+        self,
+        query_id: str,
+        sql: str,
+    ) -> List[Any]:
+        """Match global knowledge principles to a query.
+
+        Uses intent matching and FAISS-based transform matching.
+        Returns list of KnowledgePrinciple objects.
+        """
+        if not self._global_knowledge:
+            return []
+
+        from .intent_matcher import match_by_intent
+
+        # Get query intent
+        intent_data = self.get_semantic_intents(query_id)
+        query_intent = ""
+        if intent_data:
+            query_intent = intent_data.get("query_intent", "")
+
+        if not query_intent:
+            return []
+
+        return match_by_intent(
+            query_intent, self._global_knowledge, max_results=3
+        )
 
     def _load_benchmark_leaderboard(self) -> dict:
         """Load benchmark leaderboard as dict keyed by query_id.

@@ -633,6 +633,12 @@ class TestPipelineHistoryWiring:
         pipeline.benchmark_dir = Path(".")
         pipeline._semantic_intents = {}
         pipeline._engine_version = None
+        pipeline._global_knowledge = None
+        pipeline._blackboard_writer = None
+        pipeline._run_manager = None
+        pipeline._seed_loader = None
+        pipeline.run_name = None
+        pipeline.seed_dir = Path(".") / "seed"
         return pipeline
 
     def test_run_query_passes_history_to_analyst_and_rewrite_prompt(self):
