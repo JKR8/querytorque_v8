@@ -26,6 +26,8 @@ Inputs:
 | - fingerprint SQL (literals->constants)       |
 | - vectorize AST (90-dim feature vector)       |
 | - find top-k gold examples for this engine    |
+| - find regression warnings (similar queries   |
+|   that regressed — anti-patterns)             |
 | - DuckDB queries -> DuckDB examples only      |
 | - PostgreSQL queries -> PG examples only      |
 +-----------------------------------------------+
@@ -46,7 +48,7 @@ Inputs:
 | - prompt sections (attention-ordered):                       |
 |   1. Role/Task  2. Full SQL  3. DAG  4. Performance         |
 |   5. History  5b. Global Learnings  6. Examples/Analyst      |
-|   7. Constraints (sandwich)  8. Output Format                |
+|   6b. Regression Warnings  7. Constraints  8. Output Format  |
 | - CandidateGenerator runs N workers (parallel LLM calls)    |
 | - SQLRewriter extracts optimized SQL from each response       |
 | - first valid non-trivial candidate is selected              |
@@ -101,8 +103,9 @@ Inputs:
 - Vectorizes the AST into a 90-dimensional feature vector (node type counts, depth metrics, cardinality, pattern indicators, complexity).
 - Searches FAISS index (IndexFlatL2 with z-score + L2 normalization for cosine similarity).
 - **Engine-specific**: strict filtering ensures DuckDB queries only get DuckDB gold examples, PostgreSQL queries only get PostgreSQL gold examples.
-- Returns top-k examples (default k=3).
-- Index: `ado/models/similarity_index.faiss` (95 vectors, 90 dimensions).
+- Returns top-k gold examples (default k=3).
+- Also retrieves regression warnings: structurally similar queries that regressed (type=regression in FAISS metadata). These are shown as anti-patterns in the prompt so the LLM avoids repeating past mistakes.
+- Index: `ado/models/similarity_index.faiss` (105 vectors: 21 gold + 74 catalog rules + 10 regressions, 90 dimensions).
 - Rebuild: `python3 -m ado.faiss_builder` from `packages/qt-sql/`.
 
 ### LLM Analyst (Optional)
@@ -114,7 +117,7 @@ Inputs:
 
 ### Phase 3: Prompt + Candidate Generation
 - Prompt assembly: `ado/node_prompter.py` (`Prompter.build_prompt`).
-- Prompt sections (attention-ordered): Role/Task, Full SQL, DAG Topology, Performance Profile, History, Global Learnings (from benchmark runs), Examples or Expert Analysis, Constraints (sandwich-ordered from JSON), Output Format.
+- Prompt sections (attention-ordered): Role/Task, Full SQL, DAG Topology, Performance Profile, History, Global Learnings (from benchmark runs), Examples or Expert Analysis, Regression Warnings (FAISS-matched anti-patterns), Constraints (sandwich-ordered from JSON), Output Format.
 - Candidate generation: `ado/generate.py` (`CandidateGenerator.generate`) with N parallel workers via `ThreadPoolExecutor`.
 - Response application: `ado/sql_rewriter.py` (`SQLRewriter`) extracts optimized SQL from LLM response.
 - **Candidate selection**: first syntactically valid, non-trivial candidate is picked (not best-of-N by speedup).
@@ -172,6 +175,7 @@ Inputs:
 - State outputs: `ado/benchmarks/<name>/state_*`
 - FAISS index: `ado/models/similarity_index.faiss` + `similarity_metadata.json`
 - Gold examples: `ado/examples/<engine>/*.json` (duckdb: 16, postgres: 5)
+- Regression examples: `ado/examples/<engine>/regressions/*.json` (duckdb: 10)
 - Constraints: `ado/constraints/*.json` (11 files: 6 CRITICAL, 4 HIGH, 1 MEDIUM)
 - Learning journal: `ado/benchmarks/<name>/learning/`
 - Benchmark history: `ado/benchmarks/<name>/history.json` (auto-generated)
@@ -190,9 +194,9 @@ Iterative single-query optimization loop where the LLM analyst steers direction,
 ### How It Works
 Each iteration:
 1. Parse the ORIGINAL SQL into DAG (never intermediate)
-2. FAISS example retrieval (on original SQL)
+2. FAISS example retrieval (on original SQL) + regression warning matching
 3. LLM analyst generates structural analysis with full history of all previous iterations
-4. Build prompt with iteration history + global learnings
+4. Build prompt with iteration history + global learnings + regression warnings
 5. Generate N candidates via parallel workers
 6. Validate best candidate
 7. Record iteration result

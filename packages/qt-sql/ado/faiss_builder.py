@@ -1,7 +1,10 @@
-"""FAISS index builder for ADO PostgreSQL DSB knowledge base.
+"""FAISS index builder for ADO knowledge base.
 
-Builds a FAISS similarity index from gold examples in ado/examples/.
-Each example's before_sql (or input_slice) is vectorized and indexed.
+Builds a FAISS similarity index from gold examples AND regression examples
+in ado/examples/. Each example's original SQL is vectorized and indexed.
+
+Gold examples (type=gold): proven rewrites to emulate
+Regression examples (type=regression): failed rewrites to avoid
 
 Usage:
     python -m ado.faiss_builder          # Build index
@@ -402,6 +405,9 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
                 else:
                     source_engine = "unknown"
 
+                # Determine example type: gold (positive) or regression (negative)
+                example_type = data.get("type", "gold")
+
                 metadata = {
                     "name": data.get("name", example_id),
                     "description": data.get("description", ""),
@@ -410,6 +416,7 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
                     "key_insight": example_data.get("key_insight", ""),
                     "benchmark_queries": data.get("benchmark_queries", []),
                     "engine": source_engine,
+                    "type": example_type,
                 }
 
                 examples.append((example_id, sql_text, metadata))
@@ -479,6 +486,7 @@ def build_faiss_index(
             "winning_transform": meta.get("transforms", [""])[0] if meta.get("transforms") else "",
             "key_insight": meta.get("key_insight", ""),
             "engine": meta.get("engine", "unknown"),
+            "type": meta.get("type", "gold"),
         }
 
         print(f"  [{i+1}/{len(examples)}] {example_id}: {np.count_nonzero(vector)} non-zero features")

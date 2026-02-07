@@ -182,11 +182,17 @@ class Pipeline:
             f"{len(dag.edges)} edges"
         )
 
-        # Phase 2: FAISS example retrieval
+        # Phase 2: FAISS example retrieval (gold + regressions)
         logger.info(f"[{query_id}] Phase 2: Finding FAISS examples")
         examples = self._find_examples(sql, engine=engine, k=3)
         example_ids = [e.get('id', '?') for e in examples]
         logger.info(f"[{query_id}] FAISS examples: {example_ids}")
+
+        # Also find regression warnings for structurally similar queries
+        regression_warnings = self._find_regression_warnings(sql, engine=engine, k=2)
+        if regression_warnings:
+            reg_ids = [r.get('id', '?') for r in regression_warnings]
+            logger.info(f"[{query_id}] Regression warnings: {reg_ids}")
 
         # Optional: LLM analyst (stubborn query mode)
         # Analyst sees FAISS picks and can swap them for better ones
@@ -220,6 +226,7 @@ class Pipeline:
             examples=examples,
             expert_analysis=expert_analysis,
             global_learnings=global_learnings,
+            regression_warnings=regression_warnings,
             dialect=dialect,
         )
 
@@ -942,7 +949,9 @@ class Pipeline:
         Engine-specific: only returns examples for the current engine.
         DuckDB queries get DuckDB examples, PostgreSQL gets PostgreSQL, etc.
 
-        Returns up to k examples sorted by similarity.
+        Returns up to k gold examples sorted by similarity.
+        Only returns type=gold examples; regressions are handled separately
+        by _find_regression_warnings().
         """
         from .knowledge import ADOFAISSRecommender
 
@@ -965,6 +974,10 @@ class Pipeline:
                 if ex_engine != engine_dir:
                     continue
 
+                # Skip regressions — those go through _find_regression_warnings
+                if meta.get("type") == "regression":
+                    continue
+
                 seen_ids.add(ex_id)
                 ex_data = self.prompter.load_example_for_pattern(
                     ex_id, engine=engine, seed_dirs=self._seed_dirs,
@@ -973,6 +986,93 @@ class Pipeline:
                     examples.append(ex_data)
 
         return examples
+
+    def _find_regression_warnings(
+        self,
+        sql: str,
+        engine: str = "duckdb",
+        k: int = 2,
+        min_similarity: float = 0.3,
+    ) -> List[Dict[str, Any]]:
+        """Find regression examples via FAISS structural similarity.
+
+        Returns regression examples where structurally similar queries
+        were rewritten and REGRESSED. These serve as anti-patterns in
+        the prompt so the LLM avoids repeating the same mistakes.
+
+        Args:
+            sql: Query SQL to match against
+            engine: Database engine for filtering
+            k: Max regression warnings to return
+            min_similarity: Minimum FAISS similarity score (0-1)
+
+        Returns:
+            List of regression example dicts with regression_mechanism
+        """
+        from .knowledge import ADOFAISSRecommender
+
+        engine_dir = "postgres" if engine in ("postgresql", "postgres") else engine
+        dialect = "postgres" if engine_dir == "postgres" else engine_dir
+        regressions = []
+        seen_ids = set()
+
+        recommender = ADOFAISSRecommender()
+        if recommender._initialized:
+            matches = recommender.find_similar_examples(sql, k=k * 10, dialect=dialect)
+            for ex_id, score, meta in matches:
+                if len(regressions) >= k:
+                    break
+                if score < min_similarity or ex_id in seen_ids:
+                    continue
+
+                # Only regression type
+                if meta.get("type") != "regression":
+                    continue
+
+                # Engine filtering
+                ex_engine = meta.get("engine", "unknown")
+                if ex_engine != engine_dir:
+                    continue
+
+                seen_ids.add(ex_id)
+
+                # Load regression example from the regressions/ subdir
+                reg_data = self._load_regression_example(ex_id, engine_dir)
+                if reg_data:
+                    reg_data["_faiss_score"] = score
+                    regressions.append(reg_data)
+
+        return regressions
+
+    @staticmethod
+    def _load_regression_example(
+        example_id: str, engine_dir: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Load a regression example JSON file."""
+        from .node_prompter import EXAMPLES_DIR
+
+        regressions_dir = EXAMPLES_DIR / engine_dir / "regressions"
+        if not regressions_dir.exists():
+            return None
+
+        # Try exact filename match
+        path = regressions_dir / f"{example_id}.json"
+        if path.exists():
+            try:
+                return json.loads(path.read_text())
+            except Exception:
+                pass
+
+        # Search by id field
+        for p in regressions_dir.glob("*.json"):
+            try:
+                data = json.loads(p.read_text())
+                if data.get("id") == example_id:
+                    return data
+            except Exception:
+                continue
+
+        return None
 
     def load_query(self, query_id: str) -> Optional[str]:
         """Load a single query by ID."""

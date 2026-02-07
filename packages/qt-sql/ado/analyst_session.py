@@ -149,6 +149,11 @@ class AnalystSession:
         )
         example_ids = [e.get("id", "?") for e in examples]
 
+        # Also find regression warnings for structurally similar queries
+        regression_warnings = self.pipeline._find_regression_warnings(
+            self.original_sql, engine=engine, k=2,
+        )
+
         # Always run analyst in deep-dive mode
         expert_analysis = None
         analysis_raw = None
@@ -177,6 +182,7 @@ class AnalystSession:
             examples=examples,
             expert_analysis=expert_analysis,
             global_learnings=global_learnings,
+            regression_warnings=regression_warnings,
             dialect=dialect,
         )
 

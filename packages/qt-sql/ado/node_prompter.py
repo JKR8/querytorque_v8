@@ -12,6 +12,7 @@ Section ordering (attention-optimized):
 5. History              (EARLY-MID - previous attempts on this query)
 5b. Global Learnings    (EARLY-MID - aggregate benchmark stats, optional)
 6. Examples             (MIDDLE - FAISS-matched contrastive BEFORE/AFTER pairs)
+6b. Regression Warnings (MIDDLE - FAISS-matched anti-patterns from past regressions)
 7. Constraints          (LATE-MID - sandwich: CRITICAL top/bottom, HIGH middle)
 8. Output Format        (RECENCY - return complete rewritten SQL)
 """
@@ -104,6 +105,7 @@ class Prompter:
         examples: Optional[List[Dict[str, Any]]] = None,
         expert_analysis: Optional[str] = None,
         global_learnings: Optional[Dict[str, Any]] = None,
+        regression_warnings: Optional[List[Dict[str, Any]]] = None,
         dialect: str = "duckdb",
     ) -> str:
         """Build the full-query rewrite prompt.
@@ -122,6 +124,9 @@ class Prompter:
             global_learnings: Aggregate learnings from benchmark runs (from
                               Learner.build_learning_summary()). Shows transform
                               effectiveness, known anti-patterns, example success rates.
+            regression_warnings: FAISS-matched regression examples showing
+                                 structurally similar queries that regressed.
+                                 Displayed as anti-patterns so the LLM avoids them.
             dialect: SQL dialect for pretty-printing
         """
         sections = []
@@ -157,6 +162,10 @@ class Prompter:
             # Section 6: Examples (MIDDLE) — up to 3 FAISS-matched
             if examples:
                 sections.append(self._section_examples(examples))
+
+        # Section 6b: Regression warnings (after examples, before constraints)
+        if regression_warnings:
+            sections.append(self._section_regression_warnings(regression_warnings))
 
         # Section 7: Constraints (LATE-MID, sandwich ordered)
         sections.append(self._section_constraints())
@@ -532,6 +541,78 @@ class Prompter:
                     lines.append("")
                     lines.append("**AFTER (fast):**")
                     lines.append(f"```sql\n{out_sql}\n```")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _section_regression_warnings(
+        regressions: List[Dict[str, Any]],
+    ) -> str:
+        """Section 6b: Regression warnings for structurally similar queries.
+
+        Shows BEFORE/AFTER pairs from past regressions where a structurally
+        similar query was rewritten and got SLOWER. The LLM sees:
+        - The original query that was similar to this one
+        - The rewrite that caused the regression
+        - Why it regressed (regression_mechanism)
+
+        This prevents the LLM from repeating the same mistakes on similar SQL.
+        """
+        if not regressions:
+            return ""
+
+        lines = [
+            "## Regression Warnings",
+            "",
+            "The following rewrites were attempted on **structurally similar queries**",
+            "and caused **performance regressions**. Do NOT repeat these patterns.",
+            "",
+        ]
+
+        for i, reg in enumerate(regressions):
+            reg_id = reg.get("id", f"regression_{i + 1}")
+            speedup = reg.get("verified_speedup", "?")
+            query_id = reg.get("query_id", "?")
+            transform = reg.get("transform_attempted", "unknown")
+            mechanism = reg.get("regression_mechanism", "")
+            description = reg.get("description", "")
+
+            lines.append(
+                f"### Warning {i + 1}: {reg_id} ({speedup} — REGRESSION)"
+            )
+            lines.append(
+                f"**Query:** {query_id} | **Transform attempted:** {transform}"
+            )
+            lines.append("")
+
+            if description:
+                lines.append(f"**Anti-pattern:** {description}")
+                lines.append("")
+
+            # Show the original SQL (the similar query)
+            original_sql = reg.get("original_sql", "")
+            if original_sql:
+                # Truncate very long SQL to keep prompt manageable
+                if len(original_sql) > 2000:
+                    original_sql = original_sql[:2000] + "\n-- ... (truncated)"
+                lines.append("**Original query (similar to yours):**")
+                lines.append(f"```sql\n{original_sql}\n```")
+                lines.append("")
+
+            # Show the regressed rewrite (what NOT to do)
+            example = reg.get("example", {})
+            after_sql = example.get("after_sql", "")
+            if after_sql:
+                if len(after_sql) > 2000:
+                    after_sql = after_sql[:2000] + "\n-- ... (truncated)"
+                lines.append("**Regressed rewrite (DO NOT replicate this pattern):**")
+                lines.append(f"```sql\n{after_sql}\n```")
+                lines.append("")
+
+            # Why it regressed
+            if mechanism:
+                lines.append(f"**Why it regressed:** {mechanism}")
+                lines.append("")
 
         return "\n".join(lines)
 
