@@ -111,14 +111,14 @@ def phase1_prep(pipeline: Pipeline, queries: dict[str, str], output_dir: Path):
 
         try:
             dag, costs, _explain = pipeline._parse_dag(sql, dialect=DIALECT, query_id=qid)
-            faiss_examples = pipeline._find_examples(sql, engine=ENGINE, k=12)
+            faiss_examples = pipeline._find_examples(sql, engine=ENGINE, k=20)
             regression_warnings = pipeline._find_regression_warnings(
                 sql, engine=ENGINE, k=2,
             )
 
             prompt = build_fan_out_prompt(
                 query_id=qid, sql=sql, dag=dag, costs=costs,
-                faiss_examples=faiss_examples,
+                matched_examples=faiss_examples,
                 all_available_examples=all_available,
                 dialect=DIALECT,
             )

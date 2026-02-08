@@ -229,7 +229,7 @@ class AnalystSession:
             dag=dag,
             costs=costs,
             history=history,
-            faiss_examples=examples,
+            matched_examples=examples,
             engine=engine,
             dialect=dialect,
         )

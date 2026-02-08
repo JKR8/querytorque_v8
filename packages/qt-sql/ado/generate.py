@@ -92,6 +92,46 @@ class CandidateGenerator:
 
         return client.analyze(prompt)
 
+    def _analyze_with_max_tokens(
+        self, prompt: str, max_tokens: int = 4096
+    ) -> str:
+        """Analyst call with explicit max_tokens.
+
+        The V2 analyst needs ~2000-3200 output tokens. DeepSeek defaults
+        to 16384 (sufficient), but Anthropic/OpenAI default to 4096.
+        Falls back to _analyze() if the client doesn't support max_tokens.
+
+        Args:
+            prompt: The analysis prompt
+            max_tokens: Maximum output tokens
+
+        Returns:
+            LLM response text
+        """
+        # Custom analyze_fn doesn't support max_tokens — use it directly
+        if self._analyze_fn is not None:
+            return self._analyze_fn(prompt)
+
+        client = self._get_llm_client()
+        if client is None:
+            raise RuntimeError(
+                "No LLM client available. Either provide analyze_fn, "
+                "or install qt_shared and configure LLM provider."
+            )
+
+        # Try calling with max_tokens if the client supports it
+        try:
+            if hasattr(client, "analyze"):
+                import inspect
+                sig = inspect.signature(client.analyze)
+                if "max_tokens" in sig.parameters:
+                    return client.analyze(prompt, max_tokens=max_tokens)
+        except Exception:
+            pass
+
+        # Fallback: use default analyze
+        return client.analyze(prompt)
+
     def generate_one(
         self,
         sql: str,

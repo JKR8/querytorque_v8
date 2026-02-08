@@ -3,21 +3,27 @@
 Mode 1 (Swarm): Reads a swarm batch directory and produces:
   1. blackboard/raw/<query_id>/worker_NN.json  — one BlackboardEntry per worker
   2. blackboard/collated.json                  — KnowledgePrinciple[] + KnowledgeAntiPattern[]
-  3. knowledge/duckdb_tpcds.json               — GlobalKnowledge for prompt injection
+  3. benchmarks/<name>/knowledge/<dataset>.json — GlobalKnowledge for prompt injection
+     (also copied to batch_dir/knowledge/ for provenance)
+
+  Engine/dataset auto-detected from benchmarks/<name>/config.json.
 
 Mode 2 (Global --global): Aggregates the BEST optimization per query across ALL
 historical sources (Swarm, Retry4W, Retry3W, Kimi, V2, Evo, analyst_mode, etc.)
 with full provenance: optimized SQL, model, run, reasoning, transforms.
-  Output: ado/knowledge/duckdb_tpcds.json
+  Output: benchmarks/duckdb_tpcds/knowledge/duckdb_tpcds.json
 
 No LLM calls. Purely deterministic extraction from existing files.
 
 Usage:
     cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
-    # Swarm blackboard (existing)
+    # DuckDB TPC-DS swarm blackboard
     PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard \\
         packages/qt-sql/ado/benchmarks/duckdb_tpcds/swarm_batch_20260208_102033
-    # Global blackboard (new)
+    # PostgreSQL DSB swarm blackboard
+    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard \\
+        packages/qt-sql/ado/benchmarks/postgres_dsb/swarm_batch_20260208_142643
+    # Global blackboard (DuckDB TPC-DS only)
     PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard --global
 """
 
@@ -734,7 +740,7 @@ def phase1_extract(batch_dir: Path) -> List[BlackboardEntry]:
 
     # Find all query directories
     query_dirs = sorted(
-        [d for d in batch_dir.iterdir() if d.is_dir() and d.name.startswith("query_")],
+        [d for d in batch_dir.iterdir() if d.is_dir() and d.name.startswith("query")],
         key=lambda d: d.name,
     )
 
@@ -953,11 +959,21 @@ def phase3_global(
     principles: List[KnowledgePrinciple],
     anti_patterns: List[KnowledgeAntiPattern],
     batch_dir: Path,
+    dataset: str = "duckdb_tpcds",
+    benchmark_dir: Optional[Path] = None,
 ) -> GlobalKnowledge:
-    """Phase 3: Write GlobalKnowledge to knowledge/duckdb_tpcds.json."""
-    knowledge_dir = batch_dir / "knowledge"
+    """Phase 3: Write GlobalKnowledge to benchmark-level knowledge dir.
+
+    Canonical output: benchmark_dir/knowledge/<dataset>.json
+    Batch copy:       batch_dir/knowledge/<dataset>.json (for provenance)
+    """
+    if benchmark_dir is None:
+        benchmark_dir = batch_dir.resolve().parent
+
+    # Canonical knowledge path (benchmark level)
+    knowledge_dir = benchmark_dir / "knowledge"
     knowledge_dir.mkdir(parents=True, exist_ok=True)
-    knowledge_path = knowledge_dir / "duckdb_tpcds.json"
+    knowledge_path = knowledge_dir / f"{dataset}.json"
 
     run_name = batch_dir.name
 
@@ -1028,15 +1044,24 @@ def phase3_global(
         )
     else:
         gk = GlobalKnowledge(
-            dataset="duckdb_tpcds",
+            dataset=dataset,
             last_updated=datetime.now().isoformat(),
             source_runs=[run_name],
             principles=principles,
             anti_patterns=anti_patterns,
         )
 
+    # Write canonical knowledge file
     knowledge_path.write_text(json.dumps(gk.to_dict(), indent=2))
     logger.info(f"Phase 3 complete: wrote {knowledge_path}")
+
+    # Write batch-level copy for provenance
+    batch_knowledge_dir = batch_dir / "knowledge"
+    batch_knowledge_dir.mkdir(parents=True, exist_ok=True)
+    batch_copy = batch_knowledge_dir / f"{dataset}.json"
+    batch_copy.write_text(json.dumps(gk.to_dict(), indent=2))
+    logger.info(f"  Batch copy: {batch_copy}")
+
     logger.info(
         f"  {len(gk.principles)} principles, {len(gk.anti_patterns)} anti-patterns, "
         f"{len(gk.source_runs)} source runs"
@@ -1111,6 +1136,41 @@ def validate_output(gk: GlobalKnowledge, batch_dir: Path) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Benchmark config detection (for engine/dataset-aware output paths)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ADO_DIR = Path(__file__).resolve().parent  # .../ado/
+
+
+def _detect_benchmark_config(batch_dir: Path) -> Dict[str, Any]:
+    """Detect engine/dataset from config.json in the parent benchmark dir.
+
+    batch_dir is e.g. benchmarks/postgres_dsb/swarm_batch_20260208_142643/
+    so parent is benchmarks/postgres_dsb/ which contains config.json.
+    """
+    parent = batch_dir.resolve().parent  # benchmarks/<benchmark>/
+    config_path = parent / "config.json"
+    if config_path.exists():
+        cfg = json.loads(config_path.read_text())
+        engine = cfg.get("engine", "duckdb")
+        benchmark = cfg.get("benchmark", parent.name)
+        dataset = f"{engine}_{benchmark}"
+        return {
+            "engine": engine,
+            "benchmark": benchmark,
+            "dataset": dataset,
+            "benchmark_dir": parent,
+        }
+    # Fallback for duckdb_tpcds (no config.json needed)
+    return {
+        "engine": "duckdb",
+        "benchmark": "tpcds",
+        "dataset": "duckdb_tpcds",
+        "benchmark_dir": parent,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Global blackboard: Source readers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1141,7 +1201,7 @@ def read_swarm_source(batch_dir: Path) -> Dict[str, List[SourceAttempt]]:
     run_name = batch_dir.name
 
     query_dirs = sorted(
-        [d for d in batch_dir.iterdir() if d.is_dir() and d.name.startswith("query_")],
+        [d for d in batch_dir.iterdir() if d.is_dir() and d.name.startswith("query")],
         key=lambda d: d.name,
     )
 
@@ -1873,8 +1933,8 @@ def build_global_blackboard() -> Path:
         "anti_patterns": [a.to_dict() for a in anti_patterns],
     }
 
-    # Write to ado/knowledge/duckdb_tpcds.json
-    knowledge_dir = Path(__file__).resolve().parent / "knowledge"
+    # Write to benchmarks/duckdb_tpcds/knowledge/duckdb_tpcds.json
+    knowledge_dir = _ADO_BENCHMARKS / "knowledge"
     knowledge_dir.mkdir(parents=True, exist_ok=True)
     output_path = knowledge_dir / "duckdb_tpcds.json"
     output_path.write_text(json.dumps(output, indent=2))
@@ -1981,6 +2041,266 @@ def _find_best_attempt(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phase 4: Auto-promote winners to gold examples
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def phase4_promote_winners(
+    batch_dir: Path,
+    min_speedup: float = 2.0,
+    dry_run: bool = False,
+) -> List[Dict[str, Any]]:
+    """Phase 4: Auto-promote high-speedup winners to gold examples.
+
+    Scans batch results for candidates meeting promotion criteria:
+    - speedup >= min_speedup (default 2.0x)
+    - Has both original_sql and optimized_sql
+    - Has at least one known transform
+    - Transform is not already a gold example with a higher speedup
+
+    Writes promoted examples to:
+    - ado/examples/{engine}/<transform>.json (ADO)
+    - qt_sql/optimization/examples/<transform>.json (V5 CLI)
+
+    Args:
+        batch_dir: Path to swarm batch directory
+        min_speedup: Minimum speedup to qualify for promotion
+        dry_run: If True, only report what would be promoted without writing
+
+    Returns:
+        List of promotion records (transform, query_id, speedup, paths)
+    """
+    bench_cfg = _detect_benchmark_config(batch_dir)
+    engine = bench_cfg["engine"]
+
+    # Locate example directories
+    ado_examples_dir = _ADO_DIR / "examples" / engine
+    v5_examples_dir = _ADO_DIR.parent / "qt_sql" / "optimization" / "examples"
+
+    logger.info(f"Phase 4: Auto-promote winners (min_speedup={min_speedup}x, dry_run={dry_run})")
+
+    # Collect existing gold example speedups per transform
+    existing_speedups: Dict[str, float] = {}
+    if ado_examples_dir.is_dir():
+        for ex_path in ado_examples_dir.glob("*.json"):
+            try:
+                ex_data = json.loads(ex_path.read_text())
+                ex_id = ex_data.get("id", ex_path.stem)
+                speedup_str = ex_data.get("verified_speedup", "0x")
+                existing_speedups[ex_id] = float(speedup_str.replace("x", ""))
+            except Exception:
+                pass
+
+    # Scan all query directories for promotion candidates
+    candidates: List[Dict[str, Any]] = []
+
+    query_dirs = sorted(
+        [d for d in batch_dir.iterdir() if d.is_dir() and d.name.startswith("query")],
+        key=lambda d: d.name,
+    )
+
+    for qdir in query_dirs:
+        query_id = qdir.name
+
+        # Check all benchmark iterations for winners
+        iter_configs = [
+            (0, "benchmark_iter0.json", range(1, 5), "worker_{}_sql.sql"),
+            (1, "benchmark_iter1.json", [5], "snipe_worker_sql.sql"),
+            (2, "benchmark_iter2.json", [6], "final_worker_sql.sql"),
+        ]
+
+        original_sql = load_text(qdir / "original.sql")
+        if not original_sql:
+            continue
+
+        for iteration, bench_file, worker_ids, sql_pattern in iter_configs:
+            bench_data = load_json(qdir / bench_file)
+            if not bench_data:
+                continue
+
+            workers = {w["worker_id"]: w for w in bench_data.get("workers", [])}
+
+            for wid in worker_ids:
+                worker = workers.get(wid)
+                if not worker:
+                    continue
+
+                speedup = worker.get("speedup", 0.0)
+                if speedup < min_speedup:
+                    continue
+
+                if not worker.get("rows_match", True):
+                    continue
+
+                if worker.get("error"):
+                    continue
+
+                # Get optimized SQL
+                if iteration == 0:
+                    sql_file = sql_pattern.format(wid)
+                elif iteration == 1:
+                    sql_file = "snipe_worker_sql.sql"
+                else:
+                    sql_file = "final_worker_sql.sql"
+
+                optimized_sql = load_text(qdir / sql_file)
+                if not optimized_sql:
+                    continue
+
+                # Get response text for changes description
+                if iteration == 0:
+                    resp_file = f"worker_{wid}_response.txt"
+                elif iteration == 1:
+                    resp_file = "snipe_worker_response.txt"
+                else:
+                    resp_file = "final_worker_response.txt"
+                response_text = load_text(qdir / resp_file)
+
+                # Get transforms
+                assignments_data = load_json(qdir / "assignments.json")
+                assignment = None
+                if assignments_data and isinstance(assignments_data, list):
+                    for a in assignments_data:
+                        if a.get("worker_id") == wid:
+                            assignment = a
+                            break
+
+                strategy = (assignment or {}).get("strategy", "")
+                transforms = extract_transforms(
+                    assignment, response_text, strategy,
+                    original_sql=original_sql,
+                    optimized_sql=optimized_sql,
+                )
+
+                if not transforms:
+                    continue
+
+                # Use primary transform as the example ID
+                primary_transform = transforms[0]
+
+                # Skip if existing example already has a higher speedup
+                if primary_transform in existing_speedups:
+                    if existing_speedups[primary_transform] >= speedup:
+                        continue
+
+                candidates.append({
+                    "transform": primary_transform,
+                    "query_id": query_id,
+                    "worker_id": wid,
+                    "iteration": iteration,
+                    "speedup": speedup,
+                    "original_sql": original_sql,
+                    "optimized_sql": optimized_sql,
+                    "response_text": response_text,
+                    "transforms": transforms,
+                    "strategy": strategy,
+                })
+
+    # Deduplicate: keep highest speedup per transform
+    best_per_transform: Dict[str, Dict[str, Any]] = {}
+    for c in candidates:
+        t = c["transform"]
+        if t not in best_per_transform or c["speedup"] > best_per_transform[t]["speedup"]:
+            best_per_transform[t] = c
+
+    promoted: List[Dict[str, Any]] = []
+
+    for transform, candidate in sorted(best_per_transform.items()):
+        speedup = candidate["speedup"]
+        query_id = candidate["query_id"]
+        qnum = query_id.replace("query_", "")
+
+        logger.info(
+            f"  {'[DRY RUN] ' if dry_run else ''}Promoting {transform} "
+            f"from {query_id} ({speedup:.2f}x)"
+        )
+
+        # Build gold example JSON
+        changes = extract_changes_section(candidate.get("response_text", "") or "")
+        principle_text = TRANSFORM_PRINCIPLES.get(transform, "")
+        when_text = PRINCIPLE_WHEN.get(transform, "")
+
+        example_data = {
+            "id": transform,
+            "name": transform.replace("_", " ").title(),
+            "description": changes or f"Apply {transform} optimization pattern",
+            "benchmark_queries": [f"Q{qnum}"],
+            "verified_speedup": f"{speedup:.2f}x",
+            "principle": principle_text,
+            "when": when_text,
+            "example": {
+                "opportunity": transform.upper().replace("_", " "),
+                "input_slice": candidate["original_sql"][:1000],
+                "output": {
+                    "rewrite_sets": [
+                        {
+                            "id": "rs_01",
+                            "transform": transform,
+                            "nodes": {
+                                "main_query": candidate["optimized_sql"][:3000],
+                            },
+                            "invariants_kept": [
+                                "same result values",
+                                "same column output",
+                            ],
+                            "expected_speedup": f"{speedup:.2f}x",
+                            "risk": "low" if speedup < 3.0 else "medium",
+                        }
+                    ]
+                },
+                "key_insight": (
+                    f"Principle: {transform.replace('_', ' ').title()} — "
+                    f"{principle_text} "
+                    f"Achieved {speedup:.2f}x speedup on {query_id}."
+                ),
+            },
+            "original_sql": candidate["original_sql"],
+            "optimized_sql": candidate["optimized_sql"],
+            "optimized_source": f"auto_promoted_{candidate.get('strategy', 'swarm')[:50]}",
+            "benchmark_query_num": int(qnum) if qnum.isdigit() else 0,
+        }
+
+        record = {
+            "transform": transform,
+            "query_id": query_id,
+            "speedup": speedup,
+            "action": "update" if transform in existing_speedups else "create",
+        }
+
+        if not dry_run:
+            # Write to ADO examples
+            ado_examples_dir.mkdir(parents=True, exist_ok=True)
+            ado_path = ado_examples_dir / f"{transform}.json"
+            ado_path.write_text(json.dumps(example_data, indent=2))
+            record["ado_path"] = str(ado_path)
+
+            # Write to V5 CLI examples
+            v5_examples_dir.mkdir(parents=True, exist_ok=True)
+            v5_path = v5_examples_dir / f"{transform}.json"
+            v5_path.write_text(json.dumps(example_data, indent=2))
+            record["v5_path"] = str(v5_path)
+
+            logger.info(f"    Wrote: {ado_path.name} + {v5_path.name}")
+        else:
+            record["ado_path"] = str(ado_examples_dir / f"{transform}.json")
+            record["v5_path"] = str(v5_examples_dir / f"{transform}.json")
+
+        promoted.append(record)
+
+    if promoted:
+        logger.info(
+            f"Phase 4 complete: {len(promoted)} examples "
+            f"{'would be ' if dry_run else ''}promoted"
+        )
+        if not dry_run:
+            logger.info("  Run `python3 -m ado.faiss_builder` to rebuild the tag index")
+    else:
+        logger.info("Phase 4 complete: no new examples qualify for promotion")
+
+    return promoted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1990,10 +2310,26 @@ def main():
         build_global_blackboard()
         return
 
+    if "--promote-only" in sys.argv:
+        # Run only phase 4 (auto-promote) on an existing batch
+        args = [a for a in sys.argv[1:] if not a.startswith("--")]
+        if not args:
+            print("Usage: python3 -m ado.build_blackboard --promote-only <swarm_batch_dir>")
+            sys.exit(1)
+        batch_dir = Path(args[0])
+        dry_run = "--dry-run" in sys.argv
+        promoted = phase4_promote_winners(batch_dir, dry_run=dry_run)
+        logger.info(f"Promoted {len(promoted)} examples")
+        return
+
     if len(sys.argv) < 2:
         print("Usage:")
         print("  python3 -m ado.build_blackboard <swarm_batch_dir>   # Swarm blackboard")
         print("  python3 -m ado.build_blackboard --global            # Global blackboard")
+        print("  python3 -m ado.build_blackboard --promote-only <dir> # Auto-promote winners only")
+        print()
+        print("Flags:")
+        print("  --dry-run    Show what would be promoted without writing")
         print()
         print("Examples:")
         print("  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard \\")
@@ -2006,7 +2342,13 @@ def main():
         logger.error(f"Not a directory: {batch_dir}")
         sys.exit(1)
 
+    # Detect benchmark config (engine, dataset, output paths)
+    bench_cfg = _detect_benchmark_config(batch_dir)
+    dataset = bench_cfg["dataset"]
+    benchmark_dir = bench_cfg["benchmark_dir"]
+
     logger.info(f"Building blackboard from: {batch_dir}")
+    logger.info(f"  Engine: {bench_cfg['engine']}, Benchmark: {bench_cfg['benchmark']}, Dataset: {dataset}")
     logger.info("=" * 70)
 
     # Phase 1: Extract
@@ -2018,7 +2360,7 @@ def main():
     logger.info("")
 
     # Phase 3: Global knowledge
-    gk = phase3_global(principles, anti_patterns, batch_dir)
+    gk = phase3_global(principles, anti_patterns, batch_dir, dataset=dataset, benchmark_dir=benchmark_dir)
     logger.info("")
 
     # Validate
@@ -2030,17 +2372,24 @@ def main():
     else:
         logger.warning("Validation had warnings/errors — check output above")
 
+    # Phase 4: Auto-promote winners
+    logger.info("")
+    promoted = phase4_promote_winners(batch_dir, dry_run="--dry-run" in sys.argv)
+    logger.info("")
+
     # Final summary
+    knowledge_path = benchmark_dir / "knowledge" / f"{dataset}.json"
     logger.info("")
     logger.info("=" * 70)
     logger.info("BLACKBOARD BUILD COMPLETE")
     logger.info(f"  Raw entries:    {len(entries)}")
     logger.info(f"  Principles:     {len(principles)}")
     logger.info(f"  Anti-patterns:  {len(anti_patterns)}")
+    logger.info(f"  Promoted:       {len(promoted)}")
     logger.info(f"  Output dirs:")
     logger.info(f"    blackboard/raw/     — {len(set(e.query_id for e in entries))} queries")
     logger.info(f"    blackboard/collated.json")
-    logger.info(f"    knowledge/duckdb_tpcds.json")
+    logger.info(f"    {knowledge_path}")
 
 
 if __name__ == "__main__":

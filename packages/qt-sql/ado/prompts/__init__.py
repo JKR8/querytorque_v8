@@ -8,7 +8,14 @@ from .swarm_parsers import (
     SnipeAnalysis,
     parse_fan_out_response,
     parse_snipe_response,
+    # V2 briefing types
+    BriefingShared,
+    BriefingWorker,
+    ParsedBriefing,
+    parse_briefing_response,
 )
+from .analyst_briefing import build_analyst_briefing_prompt
+from .worker_v2 import build_worker_v2_prompt
 
 __all__ = [
     "build_fan_out_prompt",
@@ -19,4 +26,11 @@ __all__ = [
     "SnipeAnalysis",
     "parse_fan_out_response",
     "parse_snipe_response",
+    # V2
+    "BriefingShared",
+    "BriefingWorker",
+    "ParsedBriefing",
+    "parse_briefing_response",
+    "build_analyst_briefing_prompt",
+    "build_worker_v2_prompt",
 ]

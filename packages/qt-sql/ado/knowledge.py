@@ -289,7 +289,9 @@ class ADOFAISSRecommender:
 
             scored = []
             for ex in self.tag_entries:
-                if ex.get("engine") != engine:
+                ex_engine = ex.get("engine")
+                # Match engine-specific + seed (universal) examples
+                if ex_engine != engine and ex_engine != "seed":
                     continue
                 if ex.get("type") == "regression":
                     continue
@@ -343,7 +345,8 @@ class ADOFAISSRecommender:
 
             scored = []
             for ex in self.tag_entries:
-                if ex.get("engine") != engine:
+                ex_engine = ex.get("engine")
+                if ex_engine != engine and ex_engine != "seed":
                     continue
                 if ex.get("type") != "regression":
                     continue

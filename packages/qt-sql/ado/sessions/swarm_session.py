@@ -1,7 +1,7 @@
 """Swarm optimization session — multi-worker fan-out with snipe refinement.
 
 Workflow:
-1. Fan-out: Analyst distributes top 12 FAISS examples across 4 workers
+1. Fan-out: Analyst distributes top 20 matched examples across 4 workers
    (3 each, no duplicates). Each worker gets a different strategy.
 2. Validate all 4 candidates. If any >= target_speedup, done.
 3. Snipe: If all fail, analyst synthesizes failures into 1 refined worker.
@@ -41,12 +41,14 @@ def _fmt_elapsed(seconds: float) -> str:
 class SwarmSession(OptimizationSession):
     """Multi-worker fan-out with snipe refinement."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, use_v2_prompts: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.use_v2_prompts = use_v2_prompts
         self.all_worker_results: List[WorkerResult] = []
         self.iterations_data: List[Dict[str, Any]] = []
         self._run_log_path: Optional[Path] = None
         self._run_log_handler: Optional[logging.Handler] = None
+        self._cached_baseline: Optional[Any] = None  # OriginalBaseline from first validation
 
     @staticmethod
     def _stage(query_id: str, msg: str):
@@ -118,6 +120,18 @@ class SwarmSession(OptimizationSession):
                 self.save_session()
                 return self._build_result()
 
+            # Cache baseline for snipe iterations (avoids re-timing original)
+            if self._cached_baseline is None and self.max_iterations > 1:
+                try:
+                    self._cached_baseline = self.pipeline._benchmark_baseline(self.original_sql)
+                    self._stage(
+                        self.query_id,
+                        f"BASELINE: cached ({self._cached_baseline.measured_time_ms:.1f}ms, "
+                        f"{self._cached_baseline.row_count} rows)"
+                    )
+                except Exception as e:
+                    logger.warning(f"[{self.query_id}] Baseline caching failed: {e}")
+
             # Iterations 2-N: Snipe phase
             for snipe_num in range(1, self.max_iterations):
                 print(f"\n--- Snipe {snipe_num}/{self.max_iterations - 1} ---", flush=True)
@@ -156,25 +170,29 @@ class SwarmSession(OptimizationSession):
     ) -> Dict[str, Any]:
         """Iteration 1: Generate 4 specialized workers with different strategies.
 
-        1. Get top 12 FAISS examples
+        1. Get top 20 matched examples
         2. Call analyst to distribute examples + strategies
         3. Parse 4 worker assignments
         4. Generate 4 parallel workers with different prompts
         5. Validate all 4 candidates
         """
+        # V2 branch: analyst-as-interpreter
+        if self.use_v2_prompts:
+            return self._fan_out_iteration_v2(dag, costs, t_session)
+
         from ..prompts import build_fan_out_prompt, parse_fan_out_response
 
-        # FAISS retrieval
-        self._stage(self.query_id, "FAISS: Retrieving examples...")
+        # Example retrieval (tag-based similarity)
+        self._stage(self.query_id, "EXAMPLES: Retrieving matches...")
         t0 = time.time()
-        faiss_examples = self.pipeline._find_examples(
-            self.original_sql, engine=self.engine, k=12
+        matched_examples = self.pipeline._find_examples(
+            self.original_sql, engine=self.engine, k=20
         )
         all_available = self.pipeline._list_gold_examples(self.engine)
         regression_warnings = self.pipeline._find_regression_warnings(
             self.original_sql, engine=self.engine, k=3
         )
-        self._stage(self.query_id, f"FAISS: {len(faiss_examples)} examples, {len(regression_warnings)} warnings ({_fmt_elapsed(time.time() - t0)})")
+        self._stage(self.query_id, f"EXAMPLES: {len(matched_examples)} matched, {len(regression_warnings)} warnings ({_fmt_elapsed(time.time() - t0)})")
 
         # Build fan-out prompt
         fan_out_prompt = build_fan_out_prompt(
@@ -182,7 +200,7 @@ class SwarmSession(OptimizationSession):
             sql=self.original_sql,
             dag=dag,
             costs=costs,
-            faiss_examples=faiss_examples,
+            matched_examples=matched_examples,
             all_available_examples=all_available,
             regression_warnings=regression_warnings,
             dialect=self.dialect,
@@ -202,7 +220,7 @@ class SwarmSession(OptimizationSession):
             analyst_response = generator._analyze(fan_out_prompt)
         except Exception as e:
             self._stage(self.query_id, f"ANALYST: failed ({e}), using fallback")
-            analyst_response = self._build_fallback_fan_out(faiss_examples, all_available)
+            analyst_response = self._build_fallback_fan_out(matched_examples, all_available)
 
         # Parse worker assignments
         assignments = parse_fan_out_response(analyst_response)
@@ -362,6 +380,357 @@ class SwarmSession(OptimizationSession):
             "best_speedup": max((wr.speedup for wr in worker_results), default=0.0),
         }
 
+    # =========================================================================
+    # V2: Analyst-as-interpreter fan-out
+    # =========================================================================
+
+    def _get_explain_plan_text(self, query_id: str) -> Optional[str]:
+        """Load EXPLAIN ANALYZE plan text from cached explains.
+
+        Searches: explains/sf10/ → explains/sf5/ → explains/ (flat).
+        Returns the ASCII text plan or None.
+        """
+        for subdir in ["sf10", "sf5", ""]:
+            if subdir:
+                cache_dir = self.pipeline.benchmark_dir / "explains" / subdir
+            else:
+                cache_dir = self.pipeline.benchmark_dir / "explains"
+            cache_path = cache_dir / f"{query_id}.json"
+
+            if cache_path.exists():
+                try:
+                    data = json.loads(cache_path.read_text())
+                    plan_text = data.get("plan_text")
+                    if plan_text:
+                        return plan_text
+                except Exception:
+                    pass
+
+        return None
+
+    def _fan_out_iteration_v2(
+        self, dag: Any, costs: Dict[str, Any], t_session: float,
+    ) -> Dict[str, Any]:
+        """V2 Fan-out: Analyst produces structured briefing, workers get precise specs.
+
+        1. Gather all raw data (EXPLAIN, GlobalKnowledge, constraints, examples, etc.)
+        2. Build V2 analyst prompt via build_analyst_briefing_prompt()
+        3. Call analyst LLM with explicit max_tokens
+        4. Parse via parse_briefing_response()
+        5. If malformed, fall back to V1 _fan_out_iteration()
+        6. For each worker: load examples, build V2 prompt, generate candidate
+        7. Validate all 4 (same _validate_batch as V1)
+        """
+        from ..prompts import (
+            build_analyst_briefing_prompt,
+            build_worker_v2_prompt,
+            parse_briefing_response,
+        )
+        from ..node_prompter import _load_constraint_files
+
+        # ── Step 1: Gather all raw data ──────────────────────────────────
+        self._stage(self.query_id, "V2: Gathering data (EXPLAIN, knowledge, examples)...")
+        t0 = time.time()
+
+        # EXPLAIN plan text
+        explain_plan_text = self._get_explain_plan_text(self.query_id)
+
+        # GlobalKnowledge (principles + anti-patterns)
+        global_knowledge = self.pipeline.load_global_knowledge()
+
+        # Semantic intents
+        semantic_intents = self.pipeline.get_semantic_intents(self.query_id)
+
+        # Tag-matched examples (top 20 — analyst picks best per worker)
+        matched_examples = self.pipeline._find_examples(
+            self.original_sql, engine=self.engine, k=20
+        )
+
+        # Full catalog
+        all_available = self.pipeline._list_gold_examples(self.engine)
+
+        # All constraints (engine-filtered)
+        constraints = _load_constraint_files(self.dialect)
+
+        # Regression warnings
+        regression_warnings = self.pipeline._find_regression_warnings(
+            self.original_sql, engine=self.engine, k=3
+        )
+
+        self._stage(
+            self.query_id,
+            f"V2: Data ready — {len(matched_examples)} examples, "
+            f"{len(constraints)} constraints, "
+            f"EXPLAIN={'yes' if explain_plan_text else 'no'}, "
+            f"GlobalKnowledge={'yes' if global_knowledge else 'no'} "
+            f"({_fmt_elapsed(time.time() - t0)})"
+        )
+
+        # ── Step 2: Build V2 analyst prompt ──────────────────────────────
+        analyst_prompt = build_analyst_briefing_prompt(
+            query_id=self.query_id,
+            sql=self.original_sql,
+            explain_plan_text=explain_plan_text,
+            dag=dag,
+            costs=costs,
+            semantic_intents=semantic_intents,
+            global_knowledge=global_knowledge,
+            matched_examples=matched_examples,
+            all_available_examples=all_available,
+            constraints=constraints,
+            regression_warnings=regression_warnings,
+            dialect=self.dialect,
+        )
+
+        # ── Step 3: Call analyst LLM ─────────────────────────────────────
+        self._stage(self.query_id, "V2 ANALYST: Generating structured briefing...")
+        t0 = time.time()
+
+        from ..generate import CandidateGenerator
+        generator = CandidateGenerator(
+            provider=self.pipeline.provider,
+            model=self.pipeline.model,
+            analyze_fn=self.pipeline.analyze_fn,
+        )
+
+        try:
+            analyst_response = generator._analyze_with_max_tokens(
+                analyst_prompt, max_tokens=4096
+            )
+        except Exception as e:
+            self._stage(self.query_id, f"V2 ANALYST: failed ({e}), falling back to V1")
+            logger.warning(f"[{self.query_id}] V2 analyst failed, falling back: {e}")
+            self.use_v2_prompts = False  # prevent recursion
+            return self._fan_out_iteration(dag, costs, t_session)
+
+        self._stage(
+            self.query_id,
+            f"V2 ANALYST: done ({len(analyst_response)} chars, "
+            f"{_fmt_elapsed(time.time() - t0)})"
+        )
+
+        # ── Step 4: Parse briefing ───────────────────────────────────────
+        briefing = parse_briefing_response(analyst_response)
+
+        # Check if we got meaningful worker assignments
+        has_workers = any(
+            w.strategy and w.strategy != f"strategy_{w.worker_id}"
+            for w in briefing.workers
+        )
+        if not has_workers:
+            self._stage(self.query_id, "V2 ANALYST: no worker strategies parsed, falling back to V1")
+            logger.warning(f"[{self.query_id}] V2 briefing had no workers, falling back to V1")
+            self.use_v2_prompts = False
+            return self._fan_out_iteration(dag, costs, t_session)
+
+        # Log parsed briefing
+        for w in briefing.workers:
+            self._stage(self.query_id, f"  V2 W{w.worker_id}: {w.strategy}")
+        self._stage(
+            self.query_id,
+            f"  Shared: semantic_contract={len(briefing.shared.semantic_contract)} chars, "
+            f"bottleneck={len(briefing.shared.bottleneck_diagnosis)} chars, "
+            f"constraints={len(briefing.shared.active_constraints)} chars"
+        )
+
+        # ── Step 5: Generate 4 workers in PARALLEL ───────────────────────
+        self._stage(self.query_id, f"V2 GENERATE: 4 workers in parallel... | total {_fmt_elapsed(time.time() - t_session)}")
+        t_gen = time.time()
+
+        # Extract output columns for column completeness contract
+        from ..node_prompter import Prompter
+        output_columns = Prompter._extract_output_columns(dag)
+
+        candidates_by_worker = {}
+
+        def generate_v2_worker(worker_briefing):
+            """Generate a single V2 worker's candidate."""
+            # Load examples by ID
+            examples = self.pipeline._load_examples_by_id(
+                worker_briefing.examples, self.engine
+            )
+
+            # Build V2 worker prompt
+            prompt = build_worker_v2_prompt(
+                worker_briefing=worker_briefing,
+                shared_briefing=briefing.shared,
+                examples=examples,
+                original_sql=self.original_sql,
+                output_columns=output_columns,
+                dialect=self.dialect,
+                engine_version=self.pipeline._engine_version,
+            )
+
+            example_ids = [e.get("id", "?") for e in examples]
+            candidate = generator.generate_one(
+                sql=self.original_sql,
+                prompt=prompt,
+                examples_used=example_ids,
+                worker_id=worker_briefing.worker_id,
+                dialect=self.dialect,
+            )
+
+            # Syntax check
+            optimized_sql = candidate.optimized_sql
+            try:
+                import sqlglot
+                sqlglot.parse_one(optimized_sql, dialect=self.dialect)
+            except Exception:
+                optimized_sql = self.original_sql
+
+            return worker_briefing, optimized_sql, candidate.transforms, candidate.prompt, candidate.response
+
+        # Parallel LLM generation
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(generate_v2_worker, w): w for w in briefing.workers
+            }
+            for future in as_completed(futures):
+                try:
+                    wb, optimized_sql, transforms, w_prompt, w_response = future.result()
+                    candidates_by_worker[wb.worker_id] = (
+                        wb, optimized_sql, transforms, w_prompt, w_response
+                    )
+                    self._stage(
+                        self.query_id,
+                        f"V2 GENERATE: W{wb.worker_id} ({wb.strategy}) ready "
+                        f"({_fmt_elapsed(time.time() - t_gen)})"
+                    )
+                except Exception as e:
+                    wb = futures[future]
+                    logger.error(f"[{self.query_id}] V2 W{wb.worker_id} generation failed: {e}")
+                    candidates_by_worker[wb.worker_id] = (
+                        wb, self.original_sql, [], "", str(e)
+                    )
+
+        self._stage(self.query_id, f"V2 GENERATE: all 4 workers complete ({_fmt_elapsed(time.time() - t_gen)})")
+
+        # ── Step 5b: EXPLAIN cost pre-screening (DuckDB only) ────────────
+        sorted_wids = sorted(candidates_by_worker.keys())
+        optimized_sqls = [
+            candidates_by_worker[wid][1] for wid in sorted_wids
+        ]
+
+        # Cost-rank candidates to only fully benchmark top 2 (saves ~6 executions)
+        cost_ranked_indices = None
+        if self.dialect == "duckdb":
+            try:
+                from ..validate import cost_rank_candidates
+                cost_ranked_indices = cost_rank_candidates(
+                    db_path=self.pipeline.config.db_path_or_dsn,
+                    original_sql=self.original_sql,
+                    candidate_sqls=optimized_sqls,
+                    top_k=2,
+                )
+                if cost_ranked_indices and len(cost_ranked_indices) < len(optimized_sqls):
+                    ranked_wids = [sorted_wids[i] for i in cost_ranked_indices]
+                    self._stage(
+                        self.query_id,
+                        f"COST SCREEN: Top 2 by EXPLAIN cost: W{ranked_wids[0]}, W{ranked_wids[1]}"
+                    )
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] Cost pre-screening failed: {e}")
+                cost_ranked_indices = None
+
+        # ── Step 6: Batch validation ─────────────────────────────────────
+        self._stage(self.query_id, f"VALIDATE: Timing original + candidates... | total {_fmt_elapsed(time.time() - t_session)}")
+        t_val = time.time()
+
+        if cost_ranked_indices is not None and len(cost_ranked_indices) < len(optimized_sqls):
+            # Only fully benchmark top-K candidates, mark rest as NEUTRAL 1.00x
+            benchmark_sqls = [optimized_sqls[i] for i in cost_ranked_indices]
+            real_results = self.pipeline._validate_batch(
+                self.original_sql, benchmark_sqls
+            )
+
+            # Build full results list: real for benchmarked, placeholder for skipped
+            batch_results = []
+            real_idx = 0
+            for i in range(len(optimized_sqls)):
+                if i in cost_ranked_indices:
+                    batch_results.append(real_results[real_idx])
+                    real_idx += 1
+                else:
+                    # Not benchmarked — mark as NEUTRAL with cost-screened flag
+                    batch_results.append(("NEUTRAL", 1.00, [], None))
+        else:
+            batch_results = self.pipeline._validate_batch(
+                self.original_sql, optimized_sqls
+            )
+
+        worker_results = []
+        worker_prompts = {}
+        for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
+            wb, optimized_sql, transforms, w_prompt, w_response = candidates_by_worker[wid]
+            worker_prompts[wid] = (w_prompt, w_response)
+
+            wr = WorkerResult(
+                worker_id=wb.worker_id,
+                strategy=wb.strategy,
+                examples_used=wb.examples,
+                optimized_sql=optimized_sql,
+                speedup=speedup,
+                status=status,
+                transforms=transforms,
+                hint=wb.example_reasoning[:80] if wb.example_reasoning else "",
+                error_message=" | ".join(error_msgs) if error_msgs else None,
+                error_messages=error_msgs or [],
+                error_category=error_cat,
+            )
+            worker_results.append(wr)
+            self.all_worker_results.append(wr)
+
+        # Print results table
+        self._stage(self.query_id, f"VALIDATE: complete ({_fmt_elapsed(time.time() - t_val)})")
+        for wr in sorted(worker_results, key=lambda w: w.worker_id):
+            marker = "*" if wr.speedup >= 1.10 else " "
+            err = f" — {wr.error_message[:60]}" if wr.error_message else ""
+            self._stage(
+                self.query_id,
+                f" {marker} W{wr.worker_id} ({wr.strategy}): {wr.status} {wr.speedup:.2f}x{err}"
+            )
+
+        # Learning records
+        for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
+            wr_match = [w for w in worker_results if w.worker_id == wid]
+            if not wr_match:
+                continue
+            wr = wr_match[0]
+            try:
+                lr = self.pipeline.learner.create_learning_record(
+                    query_id=self.query_id,
+                    examples_recommended=wr.examples_used,
+                    transforms_recommended=wr.examples_used,
+                    status="pass" if wr.status in ("WIN", "IMPROVED", "NEUTRAL") else "error",
+                    speedup=wr.speedup,
+                    transforms_used=wr.transforms,
+                    error_category=error_cat,
+                    error_messages=error_msgs,
+                )
+                self.pipeline.learner.save_learning_record(lr)
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] Learning record failed: {e}")
+
+        worker_results.sort(key=lambda w: w.worker_id)
+
+        return {
+            "iteration": 0,
+            "phase": "fan_out_v2",
+            "analyst_prompt": analyst_prompt,
+            "analyst_response": analyst_response,
+            "briefing_shared": {
+                "semantic_contract": briefing.shared.semantic_contract,
+                "bottleneck_diagnosis": briefing.shared.bottleneck_diagnosis,
+                "active_constraints": briefing.shared.active_constraints,
+                "regression_warnings": briefing.shared.regression_warnings,
+            },
+            "worker_prompts": worker_prompts,
+            "worker_results": [wr.to_dict() for wr in worker_results],
+            "best_speedup": max((wr.speedup for wr in worker_results), default=0.0),
+        }
+
     def _snipe_iteration(
         self, dag: Any, costs: Dict[str, Any], snipe_num: int, t_session: float,
     ) -> Dict[str, Any]:
@@ -464,10 +833,15 @@ class SwarmSession(OptimizationSession):
         except Exception:
             optimized_sql = self.original_sql
 
-        # Validate against original
+        # Validate against original (use cached baseline if available)
         self._stage(self.query_id, f"VALIDATE: Timing... | total {_fmt_elapsed(time.time() - t_session)}")
         t_val = time.time()
-        status, speedup, val_errors, val_error_cat = self.pipeline._validate(self.original_sql, optimized_sql)
+        if self._cached_baseline is not None:
+            status, speedup, val_errors, val_error_cat = self.pipeline._validate_against_baseline(
+                self._cached_baseline, optimized_sql
+            )
+        else:
+            status, speedup, val_errors, val_error_cat = self.pipeline._validate(self.original_sql, optimized_sql)
 
         wr = WorkerResult(
             worker_id=1,
@@ -606,15 +980,15 @@ class SwarmSession(OptimizationSession):
 
     @staticmethod
     def _build_fallback_fan_out(
-        faiss_examples: List[Dict[str, Any]],
+        matched_examples: List[Dict[str, Any]],
         all_available: List[Dict[str, str]],
     ) -> str:
         """Build fallback fan-out response when analyst call fails.
 
-        Distributes FAISS examples evenly across 4 workers with generic strategies.
+        Distributes matched examples evenly across 4 workers with generic strategies.
         """
         # Get example IDs
-        ex_ids = [e.get("id", f"ex_{i}") for i, e in enumerate(faiss_examples)]
+        ex_ids = [e.get("id", f"ex_{i}") for i, e in enumerate(matched_examples)]
 
         # Pad with catalog examples if needed
         catalog_ids = [e.get("id", "") for e in all_available if e.get("id")]

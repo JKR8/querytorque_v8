@@ -344,6 +344,70 @@ class Pipeline:
         finally:
             validator.close()
 
+    def _validate_against_baseline(
+        self,
+        baseline: Any,
+        optimized_sql: str,
+    ) -> tuple[str, float, list[str], str | None]:
+        """Validate optimized SQL against a pre-computed OriginalBaseline.
+
+        Skips re-timing the original query (saves 3 executions per snipe).
+
+        Args:
+            baseline: OriginalBaseline from a previous benchmark_baseline() call
+            optimized_sql: The optimized SQL to validate
+
+        Returns (status, speedup, error_messages, error_category) tuple.
+        """
+        from .validate import Validator
+
+        validator = Validator(sample_db=self.config.db_path_or_dsn)
+        try:
+            result = validator.validate_against_baseline(
+                baseline=baseline,
+                candidate_sql=optimized_sql,
+                worker_id=0,
+            )
+
+            speedup = result.speedup
+            errors = result.errors or []
+            error_cat = result.error_category
+
+            if result.status.value == "error":
+                return "ERROR", 0.0, errors, error_cat or "execution"
+            elif result.status.value == "fail":
+                return "FAIL", 0.0, errors, error_cat or "semantic"
+            elif speedup >= 1.10:
+                return "WIN", speedup, [], None
+            elif speedup >= 1.05:
+                return "IMPROVED", speedup, [], None
+            elif speedup >= 0.95:
+                return "NEUTRAL", speedup, [], None
+            else:
+                return "REGRESSION", speedup, [], None
+        except Exception as e:
+            logger.error(f"Validation against baseline failed: {e}")
+            return "ERROR", 0.0, [str(e)], "execution"
+        finally:
+            validator.close()
+
+    def _benchmark_baseline(self, original_sql: str) -> Any:
+        """Benchmark original SQL once and return OriginalBaseline.
+
+        Args:
+            original_sql: The original SQL query
+
+        Returns:
+            OriginalBaseline with timing, rows, and checksum
+        """
+        from .validate import Validator
+
+        validator = Validator(sample_db=self.config.db_path_or_dsn)
+        try:
+            return validator.benchmark_baseline(original_sql)
+        finally:
+            validator.close()
+
     # =========================================================================
     # Main entry points
     # =========================================================================
@@ -411,7 +475,7 @@ class Pipeline:
                 dag=dag,
                 costs=costs,
                 history=history,
-                faiss_examples=examples,
+                matched_examples=examples,
                 engine=engine,
                 dialect=dialect,
             )
@@ -679,6 +743,7 @@ class Pipeline:
         target_speedup: float = 2.0,
         n_workers: int = 3,
         mode: OptimizationMode = OptimizationMode.EXPERT,
+        use_v2_prompts: bool = False,
     ) -> SessionResult:
         """Run optimization session in specified mode.
 
@@ -689,6 +754,9 @@ class Pipeline:
             target_speedup: Stop early when this speedup is reached
             n_workers: Parallel workers per iteration
             mode: Optimization mode (standard, expert, swarm)
+            use_v2_prompts: If True, use V2 analyst-as-interpreter prompts
+                           (swarm mode only). Falls back to V1 if analyst
+                           produces malformed output.
 
         Returns:
             SessionResult with the best result across all iterations
@@ -722,6 +790,7 @@ class Pipeline:
                 max_iterations=max_iterations,
                 target_speedup=target_speedup,
                 n_workers=4,  # Always 4 in swarm mode
+                use_v2_prompts=use_v2_prompts,
             )
         else:
             raise ValueError(f"Unknown optimization mode: {mode}")
@@ -985,22 +1054,22 @@ class Pipeline:
         dag: Any,
         costs: Dict[str, Any],
         history: Optional[Dict[str, Any]],
-        faiss_examples: List[Dict[str, Any]],
+        matched_examples: List[Dict[str, Any]],
         engine: str,
         dialect: str,
     ) -> tuple[Optional[str], Optional[str], Optional[str], List[Dict[str, Any]]]:
         """Run LLM analyst to generate deep structural analysis.
 
-        The analyst sees the FAISS-selected examples and the full list of
-        available gold examples. It can accept the FAISS picks or recommend
+        The analyst sees the tag-matched examples and the full list of
+        available gold examples. It can accept the picks or recommend
         swaps if it thinks different examples would be more relevant.
 
         Costs 1 extra API call. Only use for stubborn queries.
 
         Returns:
             (formatted_analysis, raw_response, analysis_prompt, final_examples) —
-            final_examples may differ from faiss_examples if the analyst
-            recommended swaps. Returns (None, None, None, faiss_examples) on failure.
+            final_examples may differ from matched_examples if the analyst
+            recommended swaps. Returns (None, None, None, matched_examples) on failure.
         """
         from .analyst import (
             build_analysis_prompt,
@@ -1036,7 +1105,7 @@ class Pipeline:
             history=history,
             effective_patterns=effective_patterns,
             known_regressions=known_regressions,
-            faiss_picks=[e.get("id", "?") for e in faiss_examples],
+            faiss_picks=[e.get("id", "?") for e in matched_examples],
             available_examples=available_examples,
             dialect=dialect,
         )
@@ -1052,7 +1121,7 @@ class Pipeline:
             raw_response = generator._analyze(analysis_prompt)
         except Exception as e:
             logger.warning(f"[{query_id}] Analyst LLM call failed: {e}")
-            return None, None, analysis_prompt, faiss_examples
+            return None, None, analysis_prompt, matched_examples
 
         # Parse and format for injection into rewrite prompt
         parsed = parse_analysis_response(raw_response)
@@ -1060,12 +1129,12 @@ class Pipeline:
 
         # Check if analyst wants different examples
         overrides = parse_example_overrides(raw_response)
-        final_examples = faiss_examples
+        final_examples = matched_examples
         if overrides:
-            logger.info(f"[{query_id}] Analyst overrides FAISS picks: {overrides}")
+            logger.info(f"[{query_id}] Analyst overrides matched picks: {overrides}")
             final_examples = self._load_examples_by_id(overrides, engine)
             if not final_examples:
-                final_examples = faiss_examples  # fallback if load fails
+                final_examples = matched_examples  # fallback if load fails
 
         logger.info(
             f"[{query_id}] Analyst complete: "
@@ -1336,6 +1405,45 @@ class Pipeline:
                     return data
             except Exception:
                 continue
+
+        return None
+
+    def load_global_knowledge(self) -> Optional[Dict[str, Any]]:
+        """Load GlobalKnowledge from benchmarks/*/knowledge/*.json.
+
+        GlobalKnowledge is built by build_blackboard.py phase3_global()
+        and contains verified optimization principles + anti-patterns.
+
+        Returns:
+            Dict with 'principles' and 'anti_patterns' lists, or None
+        """
+        # Search in knowledge/ subdirectory
+        knowledge_dir = self.benchmark_dir / "knowledge"
+        if knowledge_dir.exists():
+            for path in sorted(knowledge_dir.glob("*.json")):
+                try:
+                    data = json.loads(path.read_text())
+                    if data.get("principles") or data.get("anti_patterns"):
+                        logger.info(
+                            f"Loaded GlobalKnowledge from {path.name}: "
+                            f"{len(data.get('principles', []))} principles, "
+                            f"{len(data.get('anti_patterns', []))} anti-patterns"
+                        )
+                        return data
+                except Exception as e:
+                    logger.warning(f"Failed to load knowledge {path}: {e}")
+
+        # Fallback: check parent benchmark dirs
+        for parent in [self.benchmark_dir.parent]:
+            knowledge_dir = parent / "knowledge"
+            if knowledge_dir.exists():
+                for path in sorted(knowledge_dir.glob("*.json")):
+                    try:
+                        data = json.loads(path.read_text())
+                        if data.get("principles") or data.get("anti_patterns"):
+                            return data
+                    except Exception:
+                        continue
 
         return None
 

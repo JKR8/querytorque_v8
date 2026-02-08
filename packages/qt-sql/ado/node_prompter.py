@@ -58,8 +58,12 @@ def compute_depths(dag) -> Dict[str, int]:
     return depths
 
 
-def _load_constraint_files() -> List[Dict[str, Any]]:
-    """Load all constraint JSON files from CONSTRAINTS_DIR.
+def _load_constraint_files(dialect: str = "duckdb") -> List[Dict[str, Any]]:
+    """Load constraint JSON files from CONSTRAINTS_DIR, filtered by engine.
+
+    Each constraint may have an ``"engine"`` field (e.g. ``"postgresql"``).
+    - If ``"engine"`` is absent, the constraint is universal (always loaded).
+    - If ``"engine"`` is present, it's only loaded when ``dialect`` matches.
 
     Returns list of constraint dicts sorted by severity (CRITICAL first,
     then HIGH, then MEDIUM).
@@ -67,14 +71,23 @@ def _load_constraint_files() -> List[Dict[str, Any]]:
     if not CONSTRAINTS_DIR.exists():
         return []
 
+    # Normalize dialect for matching (e.g. "postgres" -> "postgresql")
+    norm = dialect.lower()
+    if norm in ("postgres", "pg"):
+        norm = "postgresql"
+
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
     constraints = []
 
     for path in sorted(CONSTRAINTS_DIR.glob("*.json")):
         try:
             data = json.loads(path.read_text())
-            if "id" in data and "prompt_instruction" in data:
-                constraints.append(data)
+            if "id" not in data or "prompt_instruction" not in data:
+                continue
+            engine = data.get("engine")
+            if engine and engine.lower() != norm:
+                continue  # skip constraints for other engines
+            constraints.append(data)
         except Exception as e:
             logger.warning(f"Failed to load constraint {path}: {e}")
 
@@ -195,8 +208,8 @@ class Prompter:
         if pushdown:
             sections.append(pushdown)
 
-        # Section 7: Constraints (LATE-MID, sandwich ordered)
-        sections.append(self._section_constraints())
+        # Section 7: Constraints (LATE-MID, sandwich ordered, engine-filtered)
+        sections.append(self._section_constraints(dialect))
 
         # Section 8: Output Format (RECENCY) — includes column completeness contract
         output_columns = self._extract_output_columns(dag)
@@ -766,14 +779,17 @@ class Prompter:
         )
 
     @staticmethod
-    def _section_constraints() -> str:
-        """Section 8: Constraints.
+    def _section_constraints(dialect: str = "duckdb") -> str:
+        """Section 8: Constraints (engine-filtered).
 
         Loads constraints from ado/constraints/*.json and groups by severity:
         - CRITICAL at top and bottom (repeated for attention)
         - HIGH + MEDIUM in the middle
+
+        Constraints with an ``"engine"`` field are only included when the
+        dialect matches. Constraints without ``"engine"`` are universal.
         """
-        constraints = _load_constraint_files()
+        constraints = _load_constraint_files(dialect)
 
         critical = [c for c in constraints if c.get("severity") == "CRITICAL"]
         high = [c for c in constraints if c.get("severity") == "HIGH"]
