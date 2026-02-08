@@ -1,0 +1,436 @@
+# ==============================================================================
+# ADO Blackboard → Global Knowledge Workflow
+# ==============================================================================
+#
+# This file is the operating manual for promoting blackboard entries from a
+# completed optimization run into the global knowledge base.  It is designed
+# to be read by an LLM (or a human) and executed step-by-step.
+#
+# Prerequisite: A completed swarm run with blackboard/raw/ entries.
+# End result:   benchmarks/<name>/knowledge/<dataset>.json updated.
+
+workflow:
+  name: Blackboard Review and Merge
+  description: >
+    Three-step manual process to review raw blackboard entries from a
+    completed run, clean them into deduplicated principles and anti-patterns,
+    and merge the reviewed knowledge into the global knowledge base.
+
+  when_to_run: >
+    After every completed swarm or expert run that produced meaningful
+    results (wins, regressions, or notable failures).  Not necessary for
+    trivial runs (all NEUTRAL, no new patterns).
+
+  environment:
+    working_directory: packages/qt-sql/
+    python_path: "PYTHONPATH=packages/qt-shared:packages/qt-sql:."
+    run_from: project root (QueryTorque_V8 or worktree root)
+
+# ==============================================================================
+# Step 1: Review auto-collated entries
+# ==============================================================================
+steps:
+  - id: review
+    name: Review Auto-Collated Blackboard
+    description: >
+      After a swarm run completes, auto_collate() runs automatically and
+      writes blackboard/collated.json.  Review it to understand what was
+      discovered and decide what needs editing before merge.
+
+    input:
+      file: "runs/<run_name>/blackboard/collated.json"
+      also_check: "runs/<run_name>/blackboard/raw/<query_id>/worker_<N>.json"
+
+    command: >
+      python3 -m ado.blackboard list runs/<run_name>
+
+    output_format:
+      description: "Prints each entry: query_id/worker_id: STATUS speedup [transforms]"
+      example_output: |
+        Blackboard entries: 12
+          query_1/W0: WIN 2.92x [decorrelate,early_filter]
+            + Applied decorrelate, early_filter achieving 2.92x speedup
+          query_88/W3: WIN 5.25x [or_to_union]
+            + Applied or_to_union achieving 5.25x speedup
+          query_13/W3: REGRESSION 0.41x [or_to_union]
+            - 9 UNION branches caused 9x fact table scans
+          query_42/W1: NEUTRAL 1.02x [date_cte_isolate]
+
+    what_to_look_for:
+      - Principles with "reviewed": false that need human review
+      - "when" and "when_not" fields that are empty (need to be filled)
+      - "avoid_when" fields on anti-patterns that are empty
+      - Duplicate principles that should be merged
+      - Principles whose "what" or "why" are generic and need rewriting
+
+    action: >
+      Read collated.json.  For each principle and anti-pattern, decide:
+      (a) Keep as-is → no action needed
+      (b) Edit fields → edit collated.json directly
+      (c) Delete → remove from principles/anti_patterns list
+      Focus on filling empty "when", "when_not", and "avoid_when" fields.
+
+# ==============================================================================
+# Step 2: Cleanup (mark as reviewed)
+# ==============================================================================
+  - id: cleanup
+    name: Cleanup and Mark Reviewed
+    description: >
+      Run deterministic cleanup to dedup entries with the same principle ID,
+      then mark all entries as reviewed=true.  After this step, entries are
+      eligible for global merge.
+
+    input:
+      file: "runs/<run_name>/blackboard/collated.json"
+      required_state: "auto-collated (from step 1)"
+
+    command: >
+      python3 -m ado.blackboard cleanup runs/<run_name>
+
+    what_it_does:
+      - Merges principles with duplicate IDs (combines speedup lists, query lists)
+      - Merges anti-patterns with duplicate IDs
+      - Recalculates avg_speedup after merge
+      - Sets "reviewed": true on all entries
+      - Writes cleaned_at timestamp
+
+    output:
+      file: "runs/<run_name>/blackboard/collated.json"
+      description: "Same file, updated in place with reviewed=true"
+
+    after_cleanup: >
+      Re-read collated.json.  If you edited "when"/"when_not"/"avoid_when"
+      in Step 1, verify your edits survived the cleanup merge.  If not,
+      re-apply them now.
+
+    collated_json_format:
+      description: "The collated.json structure after cleanup"
+      schema:
+        run_name: "string — name of the source run"
+        collated_at: "ISO timestamp"
+        cleaned_at: "ISO timestamp (added by cleanup)"
+        summary:
+          total_entries: "int — total raw blackboard entries"
+          wins: "int"
+          improved: "int"
+          neutral: "int"
+          regressions: "int"
+          errors: "int"
+        entries: "list of raw BlackboardEntry dicts (preserved for audit)"
+        principles:
+          - id: "string — transform or principle name (e.g. decorrelate)"
+            name: "string — human-readable name"
+            what: "string — what optimization was applied"
+            why: "string — mechanism explanation"
+            when: "string — when to apply this principle"
+            when_not: "string — when NOT to apply"
+            verified_speedups: "list[float] — all measured speedups"
+            avg_speedup: "float — average of verified_speedups"
+            queries: "list[string] — query IDs where this worked"
+            transforms: "list[string] — sqlglot transform names"
+            reviewed: "bool — true after cleanup"
+        anti_patterns:
+          - id: "string — pattern identifier"
+            name: "string — human-readable name"
+            mechanism: "string — why this causes regression"
+            observed_regressions: "list[float] — measured regression ratios"
+            queries: "list[string] — affected query IDs"
+            avoid_when: "string — conditions to avoid"
+            reviewed: "bool — true after cleanup"
+
+# ==============================================================================
+# Step 3: Merge to Global Knowledge
+# ==============================================================================
+  - id: merge
+    name: Merge to Global Knowledge
+    description: >
+      Promote reviewed principles and anti-patterns from this run into
+      the global knowledge file.  Only entries with reviewed=true are
+      merged.  Existing principles are extended (new speedups, queries
+      appended); new principles are added.
+
+    input:
+      file: "runs/<run_name>/blackboard/collated.json"
+      required_state: "cleaned up with reviewed=true (from step 2)"
+
+    command: >
+      python3 -c "
+      from pathlib import Path
+      from ado.blackboard_collator import BlackboardCollator
+
+      benchmark = 'ado/benchmarks/duckdb_tpcds'
+      run_name = '<run_name>'
+
+      collator = BlackboardCollator(Path(benchmark) / 'runs' / run_name)
+      knowledge = collator.merge_to_global_knowledge(
+          knowledge_dir=Path(benchmark) / 'knowledge',
+          dataset_name='duckdb_tpcds',
+      )
+      print(f'Merged: {len(knowledge.principles)} principles, {len(knowledge.anti_patterns)} anti-patterns')
+      "
+
+    what_it_does:
+      - Loads existing global knowledge (or creates empty if first run)
+      - Skips any principle/anti-pattern with reviewed=false
+      - For existing principle IDs: extends verified_speedups and queries lists, recalculates avg_speedup
+      - For new principle IDs: appends as new KnowledgePrinciple
+      - For new anti-pattern IDs: appends as new KnowledgeAntiPattern
+      - Adds run_name to source_runs list
+      - Writes updated global knowledge
+
+    output:
+      file: "benchmarks/<name>/knowledge/<dataset>.json"
+      description: "Global knowledge file, created or updated"
+
+    global_knowledge_format:
+      description: "The knowledge/<dataset>.json structure"
+      schema:
+        dataset: "string — dataset identifier (e.g. duckdb_tpcds)"
+        last_updated: "ISO timestamp"
+        source_runs: "list[string] — run names that contributed"
+        principles:
+          - id: "string"
+            name: "string"
+            what: "string"
+            why: "string"
+            when: "string"
+            when_not: "string"
+            verified_speedups: "list[float]"
+            avg_speedup: "float"
+            queries: "list[string]"
+            transforms: "list[string]"
+        anti_patterns:
+          - id: "string"
+            name: "string"
+            mechanism: "string"
+            observed_regressions: "list[float]"
+            queries: "list[string]"
+            avoid_when: "string"
+
+    how_knowledge_is_used: >
+      The pipeline loads knowledge/<dataset>.json at startup.  When building
+      a prompt for a query, intent_matcher.py scores each principle against
+      the query's semantic intent and transforms.  Top-matching principles
+      are injected into the prompt as a "Discovered Principles" section,
+      between the Examples and Constraints sections.
+
+# ==============================================================================
+# Full Worked Example
+# ==============================================================================
+example:
+  scenario: >
+    A swarm run named "discovery_20260208" has completed on the duckdb_tpcds
+    benchmark with 12 workers across 3 queries.  Auto-collation ran at the
+    end and produced collated.json.
+
+  step_1_review:
+    read_file: "ado/benchmarks/duckdb_tpcds/runs/discovery_20260208/blackboard/collated.json"
+    contents: |
+      {
+        "run_name": "discovery_20260208",
+        "collated_at": "2026-02-08T15:30:00",
+        "summary": {
+          "total_entries": 12,
+          "wins": 3,
+          "improved": 2,
+          "neutral": 4,
+          "regressions": 2,
+          "errors": 1
+        },
+        "principles": [
+          {
+            "id": "or_to_union",
+            "name": "Or To Union",
+            "what": "Applied or_to_union achieving 5.25x speedup",
+            "why": "Converting OR to UNION ALL lets optimizer choose independent index paths per branch",
+            "when": "",
+            "when_not": "",
+            "verified_speedups": [5.25, 1.49],
+            "avg_speedup": 3.37,
+            "queries": ["query_10", "query_88"],
+            "transforms": ["or_to_union"],
+            "reviewed": false
+          },
+          {
+            "id": "decorrelate",
+            "name": "Decorrelate",
+            "what": "Applied decorrelate, early_filter achieving 2.92x speedup",
+            "why": "Correlated subqueries re-execute per outer row; converting to JOIN eliminates per-row overhead",
+            "when": "",
+            "when_not": "",
+            "verified_speedups": [2.92],
+            "avg_speedup": 2.92,
+            "queries": ["query_1"],
+            "transforms": ["decorrelate", "early_filter"],
+            "reviewed": false
+          }
+        ],
+        "anti_patterns": [
+          {
+            "id": "or_to_union",
+            "name": "Or To Union",
+            "mechanism": "9 UNION branches caused 9x independent fact table scans",
+            "observed_regressions": [0.41, 0.23],
+            "queries": ["query_13", "query_48"],
+            "avoid_when": "",
+            "reviewed": false
+          }
+        ]
+      }
+
+    observations:
+      - "or_to_union appears as BOTH a principle (5.25x on Q88) AND an anti-pattern (0.41x on Q13)"
+      - "'when' and 'when_not' fields are empty — need human input"
+      - "'avoid_when' on the anti-pattern is empty — need human input"
+
+    edits_to_make:
+      - field: "principles[0].when"
+        set_to: "WHERE clause has 2-3 OR branches on indexed columns over large fact tables"
+      - field: "principles[0].when_not"
+        set_to: "More than 3 OR branches, or fact table is small (<10K rows)"
+      - field: "principles[1].when"
+        set_to: "Correlated subquery in WHERE EXISTS/IN with selective dimension filters"
+      - field: "principles[1].when_not"
+        set_to: "Small outer table (<1000 rows) or subquery is already a simple lookup"
+      - field: "anti_patterns[0].avoid_when"
+        set_to: "More than 3 OR branches, each scanning a large fact table independently"
+
+  step_2_cleanup:
+    command: "python3 -m ado.blackboard cleanup ado/benchmarks/duckdb_tpcds/runs/discovery_20260208"
+    result: >
+      Merges duplicates, sets reviewed=true on all principles and anti-patterns.
+      Re-read collated.json to verify the edits from step 1 survived.
+
+    collated_after_cleanup: |
+      {
+        "run_name": "discovery_20260208",
+        "collated_at": "2026-02-08T15:30:00",
+        "cleaned_at": "2026-02-08T16:00:00",
+        "summary": { "total_entries": 12, "wins": 3, "improved": 2, "neutral": 4, "regressions": 2, "errors": 1 },
+        "principles": [
+          {
+            "id": "or_to_union",
+            "name": "Or To Union",
+            "what": "Applied or_to_union achieving 5.25x speedup",
+            "why": "Converting OR to UNION ALL lets optimizer choose independent index paths per branch",
+            "when": "WHERE clause has 2-3 OR branches on indexed columns over large fact tables",
+            "when_not": "More than 3 OR branches, or fact table is small (<10K rows)",
+            "verified_speedups": [5.25, 1.49],
+            "avg_speedup": 3.37,
+            "queries": ["query_10", "query_88"],
+            "transforms": ["or_to_union"],
+            "reviewed": true
+          },
+          {
+            "id": "decorrelate",
+            "name": "Decorrelate",
+            "what": "Applied decorrelate, early_filter achieving 2.92x speedup",
+            "why": "Correlated subqueries re-execute per outer row; converting to JOIN eliminates per-row overhead",
+            "when": "Correlated subquery in WHERE EXISTS/IN with selective dimension filters",
+            "when_not": "Small outer table (<1000 rows) or subquery is already a simple lookup",
+            "verified_speedups": [2.92],
+            "avg_speedup": 2.92,
+            "queries": ["query_1"],
+            "transforms": ["decorrelate", "early_filter"],
+            "reviewed": true
+          }
+        ],
+        "anti_patterns": [
+          {
+            "id": "or_to_union",
+            "name": "Or To Union",
+            "mechanism": "9 UNION branches caused 9x independent fact table scans",
+            "observed_regressions": [0.41, 0.23],
+            "queries": ["query_13", "query_48"],
+            "avoid_when": "More than 3 OR branches, each scanning a large fact table independently",
+            "reviewed": true
+          }
+        ]
+      }
+
+  step_3_merge:
+    command: |
+      python3 -c "
+      from pathlib import Path
+      from ado.blackboard_collator import BlackboardCollator
+
+      collator = BlackboardCollator(Path('ado/benchmarks/duckdb_tpcds/runs/discovery_20260208'))
+      knowledge = collator.merge_to_global_knowledge(
+          knowledge_dir=Path('ado/benchmarks/duckdb_tpcds/knowledge'),
+          dataset_name='duckdb_tpcds',
+      )
+      print(f'Merged: {len(knowledge.principles)} principles, {len(knowledge.anti_patterns)} anti-patterns')
+      "
+
+    result_file: "ado/benchmarks/duckdb_tpcds/knowledge/duckdb_tpcds.json"
+    result_contents: |
+      {
+        "dataset": "duckdb_tpcds",
+        "last_updated": "2026-02-08T16:05:00",
+        "source_runs": ["discovery_20260208"],
+        "principles": [
+          {
+            "id": "or_to_union",
+            "name": "Or To Union",
+            "what": "Applied or_to_union achieving 5.25x speedup",
+            "why": "Converting OR to UNION ALL lets optimizer choose independent index paths per branch",
+            "when": "WHERE clause has 2-3 OR branches on indexed columns over large fact tables",
+            "when_not": "More than 3 OR branches, or fact table is small (<10K rows)",
+            "verified_speedups": [5.25, 1.49],
+            "avg_speedup": 3.37,
+            "queries": ["query_10", "query_88"],
+            "transforms": ["or_to_union"]
+          },
+          {
+            "id": "decorrelate",
+            "name": "Decorrelate",
+            "what": "Applied decorrelate, early_filter achieving 2.92x speedup",
+            "why": "Correlated subqueries re-execute per outer row; converting to JOIN eliminates per-row overhead",
+            "when": "Correlated subquery in WHERE EXISTS/IN with selective dimension filters",
+            "when_not": "Small outer table (<1000 rows) or subquery is already a simple lookup",
+            "verified_speedups": [2.92],
+            "avg_speedup": 2.92,
+            "queries": ["query_1"],
+            "transforms": ["decorrelate", "early_filter"]
+          }
+        ],
+        "anti_patterns": [
+          {
+            "id": "or_to_union",
+            "name": "Or To Union",
+            "mechanism": "9 UNION branches caused 9x independent fact table scans",
+            "observed_regressions": [0.41, 0.23],
+            "queries": ["query_13", "query_48"],
+            "avoid_when": "More than 3 OR branches, each scanning a large fact table independently"
+          }
+        ]
+      }
+
+    what_happens_on_next_run: >
+      When the pipeline starts the next optimization run, it loads
+      knowledge/duckdb_tpcds.json at init.  For each query, intent_matcher
+      scores principles against the query's semantic intent.  Matching
+      principles appear in the prompt's "Discovered Principles" section,
+      giving the LLM concrete, verified guidance before it rewrites.
+
+# ==============================================================================
+# Quick Reference
+# ==============================================================================
+quick_reference:
+  list_entries: "python3 -m ado.blackboard list runs/<run_name>"
+  auto_collate: "python3 -m ado.blackboard collate runs/<run_name>"
+  cleanup: "python3 -m ado.blackboard cleanup runs/<run_name>"
+  merge: |
+    python3 -c "
+    from pathlib import Path
+    from ado.blackboard_collator import BlackboardCollator
+    collator = BlackboardCollator(Path('ado/benchmarks/<benchmark>/runs/<run_name>'))
+    collator.merge_to_global_knowledge(Path('ado/benchmarks/<benchmark>/knowledge'), '<dataset>')
+    "
+
+  key_rules:
+    - "Only reviewed=true entries get merged to global knowledge"
+    - "Fill 'when', 'when_not', 'avoid_when' before cleanup — they guide the LLM"
+    - "The same transform can be BOTH a principle AND an anti-pattern (e.g. or_to_union)"
+    - "Merge is additive — existing principles get extended, never overwritten"
+    - "Run merge after EVERY completed run to keep knowledge current"
