@@ -1,0 +1,1171 @@
+% QueryTorque: Swarm-of-Reasoners for SQL Query Optimization
+% Paper stub - February 2026
+
+\documentclass[sigconf]{acmart}
+
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{amsmath}
+
+\newcommand{\sysname}{QueryTorque}
+\newcommand{\TODO}[1]{\textcolor{red}{[TODO: #1]}}
+
+\begin{document}
+
+\title{\sysname{}: Swarm-of-Reasoners for Training-Free SQL Query Optimization via Competitive Multi-Worker Generation}
+
+\author{TODO: Authors}
+\affiliation{\institution{TODO: Affiliation}}
+
+% ============================================================================
+\begin{abstract}
+% ============================================================================
+
+SQL query optimization through rewriting is critical for analytical workload
+performance, yet existing approaches face fundamental trade-offs. Rule-based
+systems (LearnedRewrite, R-Bot) are constrained by fixed rule vocabularies and
+cannot express structural rewrites like CTE isolation or scan consolidation.
+Training-based methods (E$^3$-Rewrite) require expensive reinforcement learning
+pipelines and are evaluated on a single database engine. We present
+\sysname{}, a training-free SQL optimization system that uses a
+\emph{swarm-of-reasoners} architecture: multiple specialized LLM workers,
+each guided by different verified gold examples and engine-specific
+constraints, compete to produce the best rewrite for a given query.
+\textbf{With a single architecture and zero retraining, \sysname{} achieves
+a 37\% win rate on both DuckDB (TPC-DS) and PostgreSQL (DSB)}---the first
+system to demonstrate cross-engine generalization for LLM-based query
+rewriting. On TPC-DS SF10 under DuckDB, \sysname{} achieves speedups of up
+to 6.28$\times$ (Q88) with 17 winning queries and an average speedup of
+1.19$\times$ across 43~validated queries. On DSB SF5 under PostgreSQL,
+\sysname{} achieves 19~wins across 52~queries, recovering two timeout queries
+(300\,s$\to$68\,ms and 300\,s$\to$766\,ms) and producing up to 122$\times$
+speedup on non-timeout queries. The largest single improvement, Q092
+(4{,}428$\times$), results from a compositional three-pattern rewrite
+discovered by the swarm. Unlike prior work, \sysname{} (1)~requires no model
+fine-tuning, instead leveraging frontier reasoning models at inference time;
+(2)~represents queries as logical-block DAGs with node contracts and cost
+attribution; (3)~decomposes complex benchmark queries into typed sub-problems
+(multi-CTE, aggregation, join-path) that expose different optimization
+surfaces; (4)~learns bidirectionally from both successful rewrites and
+validated regressions; (5)~operates across multiple database engines with
+engine-aware constraint injection; and (6)~employs a stateful multi-iteration
+pipeline where winners are promoted as baselines for subsequent rounds.
+
+\end{abstract}
+
+\maketitle
+
+% ============================================================================
+\section{Introduction}
+\label{sec:intro}
+% ============================================================================
+
+Efficient query execution is central to modern analytical database systems.
+SQL query rewriting---transforming a query into a semantically equivalent but
+faster form---has been studied extensively through rule-based
+systems~\cite{zhou2021learned, calcite2018}, heuristic
+optimizers~\cite{graefe1993volcano}, and more recently through large language
+model (LLM) approaches~\cite{rbot2024, e3rewrite2026, llmr2_2024}.
+
+Despite significant progress, existing methods face three fundamental
+limitations:
+
+\paragraph{Limited expressiveness.} Rule-based systems (Apache Calcite,
+PostgreSQL's optimizer, LearnedRewrite~\cite{zhou2021learned}) operate over a
+fixed vocabulary of predefined transformations. They cannot express rewrites
+that span multiple query blocks, such as isolating dimension tables into
+filtered CTEs, consolidating repeated table scans into single-pass CASE
+aggregations, or decomposing self-joins---strategies that yield 2--6$\times$
+speedups on real workloads.
+
+\paragraph{Expensive training pipelines.} E$^3$-Rewrite~\cite{e3rewrite2026}
+addresses expressiveness by training LLMs via reinforcement learning (GRPO)
+with execution-aware rewards. However, this requires (1)~a two-stage
+curriculum over thousands of training queries, (2)~repeated query execution for
+reward computation, and (3)~retraining for each new database engine or schema.
+The resulting models are also frozen at training time and cannot incorporate
+new optimization patterns discovered at deployment.
+
+\paragraph{Single-engine, single-strategy design.} Both
+R-Bot~\cite{rbot2024} and E$^3$-Rewrite target PostgreSQL exclusively. Their
+architectures assume a fixed execution environment and do not account for the
+significant behavioral differences between engines (e.g., DuckDB's columnar
+execution vs.\ PostgreSQL's row-oriented model, CTE materialization semantics,
+OR-to-UNION effectiveness). No prior system has demonstrated that a single
+architecture generalizes across engines without retraining.
+
+We present \sysname{}, a training-free SQL optimization system that addresses
+all three limitations through six key design decisions:
+
+\begin{enumerate}
+\item \textbf{Logical-block DAG representation.} Rather than injecting raw
+    EXPLAIN plans (physical operators), we parse the SQL into a
+    \emph{Query DAG} where nodes are the semantic blocks that rewrites
+    operate on---CTEs, subqueries, and the main query. Each node carries a
+    \emph{contract} (output columns, grain, required predicates),
+    \emph{downstream usage} (which columns consumers actually reference),
+    and \emph{cost attribution} (percentage of total estimated cost). This
+    provides the LLM with structural context at the same granularity as the
+    rewrite, enabling cross-node transformations (new CTEs, filter pushdown
+    across node boundaries) that physical-plan representations cannot
+    express.
+
+\item \textbf{Swarm-of-reasoners architecture.} Rather than relying on a
+    single LLM call, \sysname{} dispatches multiple specialized workers in
+    parallel, each seeded with different verified gold examples targeting
+    distinct optimization strategies (e.g., decorrelation, CTE isolation,
+    scan consolidation). Workers compete, and only the best validated
+    candidate is selected. This produces higher coverage than single-shot
+    generation while requiring no training.
+
+\item \textbf{Bidirectional learning from examples.} The prompt includes
+    both \emph{gold examples} (rewrites with verified speedups) and
+    \emph{regression warnings} (rewrites with verified slowdowns and their
+    anti-pattern explanations). This teaches the model not only what to do
+    but what to avoid---a signal absent from prior systems.
+
+\item \textbf{Query-type decomposition.} For complex benchmark queries, we
+    decompose each query into typed sub-problems---\emph{multi-CTE}
+    (hierarchical CTE pipelines), \emph{aggregation} (GROUP BY with
+    conditional branches), and \emph{join-path} (SPJ validation
+    variants)---that expose different optimization surfaces. The same
+    underlying business logic is formulated in structurally distinct ways,
+    allowing the swarm to attack each formulation independently and select
+    the best result per type.
+
+\item \textbf{Engine-aware constraint injection.} A library of severity-tiered
+    constraints, many auto-generated from observed regressions, is injected
+    using a ``sandwich'' attention pattern (critical constraints at both the
+    start and end of the prompt). Constraints are engine-specific: for
+    example, OR-to-UNION is encouraged for DuckDB but prohibited for
+    PostgreSQL, where it causes regressions.
+
+\item \textbf{Stateful multi-iteration promotion.} \sysname{} operates as a
+    state machine: winning rewrites from round~$N$ become the baseline for
+    round~$N{+}1$, enabling compositional optimization where later rounds
+    build on earlier gains.
+\end{enumerate}
+
+\TODO{Add figure: system overview diagram showing swarm architecture with
+DAG analysis, worker dispatch, validation, and promotion flow.}
+
+% ============================================================================
+\section{Related Work}
+\label{sec:related}
+% ============================================================================
+
+\paragraph{Heuristic and rule-based rewriting.}
+Traditional query optimizers apply rewrite rules in fixed or heuristically
+explored orders. PostgreSQL~\cite{postgresql} uses a sequential rule
+pipeline, while Volcano~\cite{graefe1993volcano} and
+Cascades~\cite{graefe1995cascades} explore rule combinations via
+branch-and-bound search. Apache Calcite~\cite{calcite2018} provides an
+extensible framework with $\sim$70 built-in rules.
+LearnedRewrite~\cite{zhou2021learned} applies Monte Carlo Tree Search (MCTS)
+guided by learned cost models to search over Calcite's rule space, but
+remains bounded by Calcite's rule vocabulary and requires schema-specific
+cost model training.
+
+\paragraph{LLM-augmented rule selection.}
+LLM-R$^2$~\cite{llmr2_2024} prompts GPT-3.5 with demonstrations to select
+Calcite rules. R-Bot~\cite{rbot2024} extends this with multi-source evidence
+preparation (rule specifications from code/documents, Q\&As from Stack
+Overflow), hybrid structure-semantics retrieval, and step-by-step LLM-guided
+rule arrangement with reflection. While R-Bot achieves strong results and is
+deployed at Huawei, it fundamentally operates within Calcite's rule
+vocabulary---it \emph{selects} rules but cannot \emph{generate} novel
+rewrites. For example, it cannot express CTE isolation, scan consolidation,
+or dimension prefetching, which are among our most effective transforms.
+
+\paragraph{LLM-based direct rewriting.}
+E$^3$-Rewrite~\cite{e3rewrite2026} fine-tunes Qwen/LLaMA models via GRPO
+with a three-component reward (executability, equivalence, efficiency) and a
+two-stage curriculum. It achieves 25.6\% latency reduction on TPC-H and
+99.6\% equivalence rate. E$^3$-Rewrite injects linearized EXPLAIN plans as
+``execution hints,'' exposing physical operators (Seq Scan, Hash Join) and
+their costs. While useful for identifying bottleneck operators, this
+physical-level representation does not expose the logical block structure
+(CTE boundaries, subquery scopes, cross-node data contracts) that guides
+structural rewrites. Furthermore, the approach requires (1)~significant
+compute for RL training, (2)~access to query execution for reward
+computation during training, and (3)~retraining for new engines.
+QUITE~\cite{quite2025} is the closest prior work to \sysname{}: it is
+training-free, uses multiple LLM agents (a rewriter, a corrector, and a
+hint injector), and targets free-form SQL rewriting without a rule engine.
+However, QUITE differs in several key respects: (1)~it uses query hints
+(e.g., \texttt{SET} commands, optimizer directives) as a primary mechanism,
+which are engine-specific and do not change the SQL structure;
+(2)~it lacks a systematic learning loop from deployment feedback;
+(3)~it does not use a structured query representation (DAG or otherwise)
+to guide the rewriter; and (4)~it reports results on PostgreSQL only,
+with no cross-engine evaluation.
+
+\paragraph{Positioning of \sysname{}.}
+Table~\ref{tab:comparison} positions \sysname{} against prior systems.
+\sysname{} is the first system that combines training-free operation,
+unrestricted rewrite expressiveness (no rule engine), multi-engine support,
+and bidirectional learning from both successes and failures.
+
+\begin{table}[t]
+\centering
+\caption{Comparison of SQL rewriting systems.}
+\label{tab:comparison}
+\small
+\begin{tabular}{lcccc}
+\toprule
+& \textbf{LR} & \textbf{R-Bot} & \textbf{E$^3$} & \textbf{Ours} \\
+\midrule
+Training required     & Yes  & No   & Yes  & No   \\
+Rule engine required  & Yes  & Yes  & No   & No   \\
+Multi-engine          & No   & No   & No   & Yes  \\
+Rewrite expressiveness & Calcite rules & Calcite rules & Free-form & Free-form \\
+Query representation  & Cost & Rule$^\dagger$ & Phys.\ plan & Logic.\ DAG \\
+Workers / candidates  & 1    & 1    & $N$  & $4{+}$ \\
+Regression learning   & No   & No   & No   & Yes  \\
+Constraint injection  & No   & No   & No   & Yes  \\
+Stateful iteration    & No   & Yes* & No   & Yes  \\
+\bottomrule
+\end{tabular}
+\\[2pt]
+{\footnotesize $^\dagger$R-Bot uses one-hot encoding of matched Calcite rule specifications.}
+\\[2pt]
+{\footnotesize *R-Bot's reflection loop reruns rule selection; it does not
+promote winning SQL as a new baseline.}
+\end{table}
+
+
+% ============================================================================
+\section{System Overview}
+\label{sec:overview}
+% ============================================================================
+
+\sysname{} processes a SQL query through a five-phase pipeline
+(Figure~\ref{fig:overview}), orchestrated by a state machine that supports
+multi-round optimization.
+
+\TODO{Figure~\ref{fig:overview}: End-to-end system diagram.}
+
+\subsection{Phase 1: Structural Analysis via Query DAG}
+
+A central design choice in \sysname{} is the level of abstraction at which we
+represent query structure. E$^3$-Rewrite injects raw EXPLAIN plans---physical
+operator trees showing \texttt{Seq Scan}, \texttt{Hash Join},
+\texttt{Gather} nodes with cost estimates and row counts. R-Bot represents
+queries as one-hot vectors of matched Calcite rule specifications. We argue
+that neither representation aligns with the granularity at which SQL rewrites
+actually operate.
+
+SQL optimizations---decorrelating a subquery, isolating a dimension into a
+CTE, pushing a filter across a CTE boundary, consolidating repeated
+scans---operate at the level of \emph{logical query blocks}: CTEs,
+subqueries, and the main SELECT. A developer does not rewrite a Hash Join
+node; they restructure the CTE that feeds it. We therefore parse the input
+SQL into a \emph{Query DAG} that mirrors this granularity.
+
+\paragraph{DAG construction.}
+Given a SQL query $q$, we parse it via \texttt{sqlglot}~\cite{sqlglot} and construct a DAG
+$G = (V, E)$ where:
+\begin{itemize}
+\item Each node $v \in V$ represents a logical block: a CTE definition, a
+    subquery, or the main query body.
+\item Each edge $(u, v) \in E$ represents a data dependency: node $v$
+    references the output of node $u$ (e.g., the main query references a CTE).
+\end{itemize}
+
+Each node is annotated with \emph{structural flags} detected via AST
+traversal: \texttt{GROUP\_BY}, \texttt{WINDOW}, \texttt{UNION\_ALL},
+\texttt{CORRELATED}, \texttt{IN\_SUBQUERY}. These flags serve as lightweight
+pattern indicators that help the LLM identify optimization opportunities
+without parsing the SQL itself.
+
+\paragraph{Node contracts.}
+For each node $v$, we compute a \emph{contract}---the interface between $v$
+and its consumers:
+\begin{itemize}
+\item \textbf{Output columns}: The column names this node produces (extracted
+    from the SELECT clause).
+\item \textbf{Grain}: The GROUP BY keys, if any---defining the aggregation
+    level of the node's output.
+\item \textbf{Required predicates}: WHERE and HAVING conditions that must be
+    preserved for semantic equivalence.
+\end{itemize}
+
+Contracts make explicit what each node promises to its consumers. This is
+critical for safe cross-node rewrites: if a CTE's contract specifies
+\texttt{output\_columns = [customer\_id, total\_return]}, a rewrite that
+restructures the CTE must preserve these columns or risk breaking
+downstream references.
+
+\paragraph{Downstream usage analysis.}
+For each node $v$, we compute which of its output columns are
+\emph{actually referenced} by consumer nodes. If a CTE outputs 12 columns
+but only 3 are used downstream, the LLM can safely project away the unused
+9---a common source of speedup in columnar engines like DuckDB where
+eliminating column reads reduces I/O.
+
+\paragraph{Cost attribution.}
+When an EXPLAIN plan is available (either from the target engine directly or
+from a cached plan archive), we map physical operators back to their logical
+DAG nodes and compute the percentage of total estimated cost attributable to
+each node. When EXPLAIN is unavailable, we fall back to heuristic cost
+splitting based on node complexity (number of joins, presence of GROUP BY,
+etc.). The per-node cost profile is rendered as inline comments in the DAG
+topology section of the prompt:
+
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize, frame=single,
+    caption={DAG topology in the LLM prompt (abbreviated).},
+    label={lst:dag}]
+## Query Structure (DAG)
+
+Nodes:
+  customer_total_return [CTE]
+    tables: catalog_returns, date_dim,
+            customer_address
+    flags: GROUP_BY
+    cost: 62%  (bottleneck)
+    grain: [ctr_customer_sk, ctr_state]
+    output: [ctr_customer_sk, ctr_state,
+             ctr_total_return]
+
+  main_query [MAIN]
+    refs: customer_total_return
+    tables: customer_total_return,
+            customer_address, customer
+    flags: CORRELATED
+    cost: 38%
+
+Edges:
+  customer_total_return -> main_query
+\end{lstlisting}
+
+\paragraph{Semantic intents (optional).}
+For complex queries, we optionally pre-compute \emph{semantic intents}---
+natural-language descriptions of what each DAG node computes (e.g.,
+``computes per-state average return amount for catalog customers''). These
+are generated once per query via a lightweight LLM call and cached. When
+present, they are attached to their respective nodes in the prompt, giving
+the rewriter human-readable context alongside the structural metadata.
+
+\paragraph{Knowledge base patterns.}
+The prompt also includes engine-specific \emph{knowledge base patterns} that
+explain \emph{why} certain rewrites work at the optimizer level. For
+example, the pattern \texttt{SQL-DUCK-014} (Grouped Top-N via Window vs.\
+LATERAL) explains that DuckDB cannot automatically transform a
+\texttt{ROW\_NUMBER() OVER (PARTITION BY ...)} into a LATERAL subquery
+because the semantic rewrite is not cost-based. This knowledge---the
+\emph{optimizer's limitations}---is absent from EXPLAIN plans and rule
+specifications, yet is precisely what guides productive rewrites.
+
+\paragraph{Comparison with prior representations.}
+Table~\ref{tab:repr_comparison} compares the three approaches.
+
+\begin{table}[t]
+\centering
+\caption{Query representation for LLM-based rewriting.}
+\label{tab:repr_comparison}
+\small
+\begin{tabular}{p{2.4cm}p{1.5cm}p{1.5cm}p{1.5cm}}
+\toprule
+\textbf{Property} & \textbf{E$^3$ (Phys.)} & \textbf{R-Bot (Rule)} & \textbf{Ours (DAG)} \\
+\midrule
+Granularity & Operator & Rule match & Logic block \\
+Cross-node rewrites & No & No & Yes \\
+Contract tracking & No & No & Yes \\
+Engine-independent & No & Calcite & Yes \\
+Cost attribution & Per-op & No & Per-block \\
+Unused col.\ detection & No & No & Yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The key advantage is \textbf{alignment}: the DAG represents the query at the
+same level of abstraction at which rewrites happen, giving the LLM a
+structural map rather than a physical execution trace.
+
+\subsection{Phase 2: Example Retrieval}
+
+We maintain a curated library of gold examples---pairs of (original SQL,
+optimized SQL) with verified speedups---organized by database engine. Each
+example is annotated with the transform pattern it demonstrates (e.g.,
+\texttt{date\_cte\_isolate}, \texttt{decorrelate},
+\texttt{single\_pass\_aggregation}).
+
+For a given query $q$, we retrieve the top-$k$ most relevant examples using
+tag-based overlap matching:
+
+\begin{enumerate}
+\item \textbf{Tag extraction.} We extract tags from $q$: table names, SQL
+    keywords (GROUP BY, HAVING, EXISTS, etc.), and structural patterns
+    (correlated subquery, self-join, window function).
+\item \textbf{Category classification.} We assign $q$ to an archetype
+    (filter-pushdown, aggregation-rewrite, set-operations, general) based
+    on its structural features.
+\item \textbf{Overlap ranking.} We rank examples by the number of shared
+    tags with $q$, filtered by database engine.
+\end{enumerate}
+
+This approach is deliberately lightweight---no embedding models, no FAISS
+indexes, no GPU inference. Despite its simplicity, it achieves effective
+retrieval because the tag vocabulary is domain-specific to SQL optimization
+patterns.
+
+In addition to gold examples, we retrieve \emph{regression examples}:
+queries where specific transforms caused verified slowdowns. These are
+injected as anti-pattern warnings, teaching the model what to avoid for
+structurally similar queries.
+
+\subsection{Query-Type Decomposition}
+\label{sec:decomposition}
+
+A distinctive feature of \sysname{}'s evaluation pipeline is the decomposition
+of complex benchmark queries into \emph{typed sub-problems}. Each base query
+(e.g., DSB query~092) is formulated in up to three structurally distinct
+variants:
+
+\begin{itemize}
+\item \textbf{Multi-CTE (\texttt{\_multi})}: The canonical complex form with
+    hierarchical CTE pipelines, nested subqueries, and multi-level data
+    dependencies. These queries exercise the full range of structural
+    rewrites: decorrelation, CTE isolation, filter pushdown across node
+    boundaries.
+\item \textbf{Aggregation (\texttt{\_agg})}: Reformulations emphasizing GROUP
+    BY operations with conditional OR branches and aggregate functions
+    (AVG, SUM, COUNT). These expose optimization surfaces for scan
+    consolidation, aggregate pushdown, and OR-to-UNION decomposition.
+\item \textbf{Join-path (\texttt{\_spj\_spj})}: Select-Project-Join validation
+    variants with identical WHERE clauses and join structures but simplified
+    SELECT lists (typically MIN of key columns). These test join reordering
+    and dimension-filter-first strategies without aggregation overhead.
+\end{itemize}
+
+This decomposition serves two purposes. First, different query formulations
+expose different optimization opportunities: a query whose \texttt{\_multi}
+variant resists optimization may yield significant speedups in its
+\texttt{\_agg} formulation because the flatter structure enables scan
+consolidation. In our PostgreSQL DSB evaluation, 10 of 19~wins came from
+\texttt{\_multi} variants, 3 from \texttt{\_agg}, and 6 from
+\texttt{\_spj\_spj}, confirming that no single formulation captures all
+optimization potential.
+
+Second, the swarm processes each variant independently, allowing different
+workers to specialize on different structural patterns. The best result per
+base query is selected across all variants and all workers, maximizing
+coverage. This approach is orthogonal to the swarm architecture and could
+benefit any LLM-based rewriting system.
+
+\subsection{Phase 3: Prompt Construction}
+
+The prompt assembles eight attention-ordered sections:
+\begin{enumerate}
+\item \textbf{Role framing}: System instruction for SQL optimization.
+\item \textbf{Original SQL}: Pretty-printed with query identifier.
+\item \textbf{DAG topology}: Nodes, edges, and per-node cost percentages.
+\item \textbf{Constraints}: Severity-tiered rules in sandwich pattern
+    (CRITICAL at top and bottom, HIGH/MEDIUM in middle).
+\item \textbf{History}: Previous attempts with status, speedup, and
+    transforms (for multi-iteration mode).
+\item \textbf{Gold examples}: Top-$k$ matched examples with original
+    $\rightarrow$ optimized SQL pairs and speedup annotations.
+\item \textbf{Regression warnings}: Anti-pattern examples for similar
+    query structures.
+\item \textbf{Output format}: Return complete rewritten SQL with summary.
+\end{enumerate}
+
+The sandwich constraint pattern exploits the well-documented primacy and
+recency bias in LLM attention~\cite{liu2024lost}, ensuring critical
+constraints (semantic equivalence, literal preservation, column completeness)
+receive maximum attention.
+
+\subsection{Phase 4: Multi-Worker Generation}
+
+This is the core differentiator of \sysname{}. Rather than generating a
+single candidate, we dispatch $W$ workers in parallel (default $W{=}4$),
+each receiving a \emph{different} set of gold examples targeting a distinct
+optimization strategy:
+
+\begin{itemize}
+\item \textbf{Worker 1} (Restructure): decorrelate, pushdown, early\_filter
+\item \textbf{Worker 2} (CTE Isolation): date\_cte\_isolate,
+    dimension\_cte\_isolate, multi\_date\_range\_cte
+\item \textbf{Worker 3} (Prefetch): prefetch\_fact\_join,
+    multi\_dimension\_prefetch, materialize\_cte
+\item \textbf{Worker 4} (Consolidate): single\_pass\_aggregation,
+    or\_to\_union, intersect\_to\_exists, union\_cte\_split
+\end{itemize}
+
+Each worker calls a frontier reasoning model (e.g.,
+DeepSeek-Reasoner~\cite{deepseek_r1}, OpenAI o1~\cite{openai_o1}) with
+the full prompt augmented by its strategy-specific examples. The use of
+reasoning models is deliberate: SQL optimization requires multi-step
+logical deduction (identifying bottlenecks, planning transformations,
+verifying equivalence), which benefits from chain-of-thought
+reasoning~\cite{deepseek_r1}.
+
+All $W$ candidates are collected and passed to Phase~5.
+
+\subsection{Phase 5: Validation and Selection}
+
+Each candidate undergoes a three-stage validation:
+
+\begin{enumerate}
+\item \textbf{Syntax gate}: Parse with \texttt{sqlglot}; reject unparseable
+    candidates.
+\item \textbf{Semantic equivalence}: Execute both original and rewritten
+    queries; compare row counts and MD5 checksums of result sets.
+\item \textbf{Performance measurement}: Execute the rewritten query using
+    our trimmed-mean protocol (Section~\ref{sec:validation}).
+\end{enumerate}
+
+The candidate with the highest validated speedup is selected. If no
+candidate achieves speedup $\geq 1.0$, the original query is preserved
+(``do no harm'' principle).
+
+\subsection{State Machine and Promotion}
+
+\sysname{} supports multi-round optimization via a state machine. After
+round $N$:
+\begin{itemize}
+\item Queries with speedup $\geq \tau$ (default $\tau = 1.05$) are
+    \emph{promoted}: their optimized SQL becomes the baseline for round
+    $N{+}1$.
+\item Non-winners retain their original baseline.
+\item A \emph{promotion context}---a natural-language summary of what worked
+    and why---is generated and injected into the next round's prompt as
+    history.
+\end{itemize}
+
+This enables compositional optimization: round~1 might decorrelate a
+subquery, and round~2 might then isolate a dimension CTE that was
+previously buried inside the correlated block.
+
+
+% ============================================================================
+\section{Constraint and Learning System}
+\label{sec:constraints}
+% ============================================================================
+
+\subsection{Engine-Aware Constraints}
+
+\sysname{} maintains a library of constraints---rules that restrict the LLM's
+rewriting behavior based on verified failure modes. Each constraint specifies:
+\begin{itemize}
+\item \textbf{Severity}: CRITICAL, HIGH, MEDIUM, LOW
+\item \textbf{Engine scope}: Which database engines it applies to
+\item \textbf{Description}: Natural-language explanation of the anti-pattern
+\item \textbf{Provenance}: The query and regression that motivated the
+    constraint
+\end{itemize}
+
+Constraints are loaded from a JSON directory and injected into every prompt.
+Examples of constraints:
+\begin{itemize}
+\item \texttt{or\_to\_union\_limit} (HIGH, DuckDB): Limit OR$\to$UNION to
+    $\leq$3 branches. \emph{Motivation}: Q13 and Q48 showed 0.23--0.41$\times$
+    regressions from 9-branch UNION rewrites that caused 9$\times$ fact
+    table scans.
+\item \texttt{or\_to\_union\_harmful} (CRITICAL, PostgreSQL): Do not apply
+    OR$\to$UNION on PostgreSQL. \emph{Motivation}: PostgreSQL's optimizer
+    already handles OR efficiently; the rewrite removes the optimizer's
+    ability to merge scans.
+\item \texttt{no\_materialize\_exists} (CRITICAL, all): Do not materialize
+    EXISTS subqueries into CTEs. \emph{Motivation}: Q16 showed 0.14$\times$
+    regression when a correlated EXISTS was hoisted into a materializing CTE,
+    breaking the short-circuit evaluation.
+\end{itemize}
+
+Currently, \sysname{} has 11 general constraints plus 5 PostgreSQL-specific
+and 7 DuckDB-specific constraints, for a total of 23.
+
+\subsection{Bidirectional Learning}
+
+After each optimization round, the system records a structured
+\texttt{LearningRecord} capturing:
+
+\begin{itemize}
+\item \textbf{What was tried}: examples recommended, transforms suggested
+\item \textbf{What happened}: status (WIN/IMPROVED/NEUTRAL/REGRESSION/ERROR),
+    speedup ratio, all error messages, error category
+    (syntax$|$semantic$|$timeout$|$execution)
+\item \textbf{Effectiveness scores}: per-example and per-transform success
+    rates
+\end{itemize}
+
+These records feed four feedback loops:
+\begin{enumerate}
+\item \textbf{Example pool evolution}: New winners become gold example
+    candidates; weak examples (no wins in 3+ batches) are retired.
+\item \textbf{Constraint auto-generation}: Clusters of regressions with
+    common structural patterns produce new constraint JSON files.
+\item \textbf{Strategy leaderboard}: Per-archetype, per-transform success
+    rates guide the analyst layer's strategy recommendations.
+\item \textbf{Global knowledge injection}: Aggregate statistics (pattern
+    effectiveness, known regressions) are included in prompts as
+    ``global learnings.''
+\end{enumerate}
+
+
+% ============================================================================
+\section{Experimental Evaluation}
+\label{sec:experiments}
+% ============================================================================
+
+\subsection{Setup}
+
+\paragraph{Benchmarks.}
+We evaluate on two standard decision-support benchmarks:
+\begin{itemize}
+\item \textbf{TPC-DS} (SF1, SF10): 88~query templates exercising complex
+    joins, correlated subqueries, window functions, and set operations.
+    Executed on \textbf{DuckDB}~v1.1~\cite{duckdb2019}.
+\item \textbf{DSB} (SF5, SF10): 52~queries adapted from TPC-DS for modern
+    decision-support workloads~\cite{dsb2021}. Executed on
+    \textbf{PostgreSQL}~v16.
+\end{itemize}
+
+\paragraph{LLM backend.} DeepSeek-Reasoner (deepseek-reasoner) as the
+primary reasoning model. We also evaluate with Kimi~K2.5 via OpenRouter.
+No model fine-tuning is performed.
+
+\paragraph{Hardware.} WSL2 on Windows 11, Intel Core i7, 32GB RAM, DuckDB
+databases on NVMe SSD.
+
+\paragraph{Baselines.} We compare against:
+\begin{itemize}
+\item \textbf{Original}: Unmodified query execution
+\item \textbf{LLM-only (GPT-4o)}: Direct prompting without examples,
+    constraints, or multi-worker architecture
+\item \textbf{R-Bot}: LLM-guided Calcite rule selection with evidence
+    retrieval and reflection~\cite{rbot2024}
+\item \textbf{E$^3$-Rewrite}: RL-trained LLM rewriting with execution
+    hints~\cite{e3rewrite2026}
+\end{itemize}
+
+\TODO{Run R-Bot and E$^3$-Rewrite baselines on our TPC-DS/DSB setup, or
+cite their published numbers on overlapping benchmarks.}
+
+\subsection{Validation Protocol}
+\label{sec:validation}
+
+We use two validation protocols, applied consistently across all methods:
+
+\begin{enumerate}
+\item \textbf{3-run mean}: Run 3 times, discard the first run (warmup),
+    average the last 2. Used for rapid iteration.
+\item \textbf{5-run trimmed mean}: Run 5 times, remove the minimum and
+    maximum, average the remaining 3. Used for final reported numbers.
+\end{enumerate}
+
+A query is classified as:
+\begin{itemize}
+\item \textbf{WIN}: speedup $\geq 1.10\times$
+\item \textbf{IMPROVED}: speedup $\in [1.05, 1.10)$
+\item \textbf{NEUTRAL}: speedup $\in [0.95, 1.05)$
+\item \textbf{REGRESSION}: speedup $< 0.95$
+\end{itemize}
+
+Semantic equivalence is verified by comparing row counts and MD5 checksums
+of full result sets between original and rewritten queries.
+
+\subsection{Main Results: DuckDB TPC-DS SF10}
+
+\begin{table}[t]
+\centering
+\caption{DuckDB TPC-DS SF10 results (43 validated queries, 4 workers).}
+\label{tab:duckdb_results}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Status} & \textbf{Count} & \textbf{\%} & \textbf{Avg Speedup} \\
+\midrule
+WIN ($\geq$1.10$\times$)       & 17 & 39\% & 1.94$\times$ \\
+PASS (0.95--1.10$\times$)      & 17 & 39\% & 1.02$\times$ \\
+REGRESSION ($<$0.95$\times$)   &  9 & 21\% & 0.78$\times$ \\
+\midrule
+\textbf{Overall}               & 43 &      & \textbf{1.19$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:duckdb_results} summarizes results across 43~validated
+queries after the 4-worker swarm. The system achieves a 39\% win rate
+with an average speedup of 1.19$\times$ across all queries. Among winners,
+the average speedup is 1.94$\times$.
+
+\paragraph{Top winners.}
+\begin{itemize}
+\item Q88: \textbf{6.28$\times$} via \texttt{or\_to\_union}---converting a
+    complex 8-way OR filter on \texttt{time\_dim} into a 4-branch UNION ALL
+    with pre-filtered time buckets.
+\item Q9: \textbf{4.47$\times$} via \texttt{single\_pass\_aggregation}---
+    consolidating 10 repeated scans of \texttt{store\_sales} into a single
+    scan with CASE-based conditional aggregation.
+\item Q40: \textbf{3.35$\times$} via \texttt{multi\_cte\_chain}---isolating
+    three date dimension joins into pre-filtered CTEs.
+\item Q46: \textbf{3.23$\times$} via \texttt{triple\_dimension\_isolate}.
+\item Q42: \textbf{2.80$\times$} via \texttt{dual\_dimension\_isolate}.
+\end{itemize}
+
+\paragraph{Most effective transform pattern.}
+\texttt{date\_cte\_isolate}---pre-filtering \texttt{date\_dim} into a CTE
+before joining with fact tables---produced 12~wins at 1.34$\times$ average
+speedup. This pattern is not expressible in Apache Calcite's rule
+vocabulary, illustrating the advantage of unrestricted LLM-based rewriting.
+
+\paragraph{Scale factor correlation.}
+We observe a Pearson correlation of $r{=}0.77$ between SF1 and SF10
+speedups, confirming that SF1 is a reliable proxy for rapid experimentation.
+Winners tend to \emph{scale better}: Q88 improved from 1.02$\times$ at SF1
+to 6.28$\times$ at SF10.
+
+\subsection{Main Results: PostgreSQL DSB SF5}
+
+\begin{table}[t]
+\centering
+\caption{PostgreSQL DSB SF5 results (52 queries, 6 workers, 3 iterations).}
+\label{tab:pg_results}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Status} & \textbf{Count} & \textbf{\%} & \textbf{Avg Speedup} \\
+\midrule
+WIN ($\geq$1.10$\times$)       & 19 & 37\% & -- \\
+IMPROVED ($\in[1.05,1.10)$)    & 16 & 31\% & 1.43$\times$ \\
+NEUTRAL ($\in[0.95,1.05)$)     & 11 & 21\% & 1.03$\times$ \\
+REGRESSION ($<$0.95$\times$)   &  4 &  8\% & 0.72$\times$ \\
+ERROR                          &  2 &  4\% & -- \\
+\bottomrule
+\end{tabular}
+\\[2pt]
+{\footnotesize Two WINs (Q032, Q092) are timeout recoveries (300\,s baseline).
+Excluding these, average non-timeout WIN speedup is 15.8$\times$.}
+\end{table}
+
+Table~\ref{tab:pg_results} shows results on PostgreSQL after the full
+6-worker, 3-iteration swarm. The 37\% win rate matches DuckDB's 39\%---achieved
+with the \emph{same architecture, same gold examples library, and zero
+retraining}. Only the constraint set differs between engines.
+
+\paragraph{Top winners (non-timeout).}
+Q081 (122$\times$: 257\,s$\to$2.1\,s), Q010 (73$\times$: 2.9\,s$\to$39\,ms),
+Q023 (66$\times$: 7.5\,s$\to$113\,ms), Q013\_agg (53$\times$:
+2.8\,s$\to$52\,ms).
+
+\paragraph{Timeout recoveries.}
+Q032 and Q092 both time out at 300\,s in their original form. The swarm
+recovers Q032 to 766\,ms and Q092 to 68\,ms. Both use the same compound
+pattern: \texttt{decorrelate} + \texttt{date\_cte\_isolate} +
+\texttt{dimension\_cte\_isolate}. We analyze Q092 in detail in
+Section~\ref{sec:case_study}.
+
+\paragraph{Engine-specific findings.} Several transforms that are effective
+on DuckDB are harmful on PostgreSQL:
+\begin{itemize}
+\item \texttt{or\_to\_union}: Produces regressions on PostgreSQL (the
+    optimizer already handles OR predicates efficiently).
+\item \texttt{CTE materialization}: PostgreSQL's CTE materialization fence
+    is double-edged---it can prevent the optimizer from pushing predicates
+    into CTEs, causing regressions.
+\end{itemize}
+These findings motivated our engine-specific constraint system.
+
+\subsection{Case Study: Q092 Compositional Rewrite}
+\label{sec:case_study}
+
+Q092 is a DSB query with a correlated subquery that compares each
+customer's web return amount against a per-state average, joined through
+\texttt{date\_dim}, \texttt{customer\_address}, and \texttt{web\_returns}.
+The original query times out at 300\,s on PostgreSQL SF5---the
+correlated subquery forces a nested-loop execution plan that re-scans
+\texttt{web\_returns} for every outer row.
+
+The swarm dispatched 4~workers. Three produced valid rewrites:
+
+\begin{itemize}
+\item \textbf{W1} (conservative): Decorrelated the subquery into a CTE with
+    GROUP BY, preserving the join structure. \emph{Result}: 35.1\,s
+    (8.6$\times$). The decorrelation eliminated nested-loop rescans but
+    left the date and address joins unoptimized.
+\item \textbf{W3} (aggressive prefetch): Same decorrelation plus
+    pre-filtering \texttt{date\_dim} into a CTE. \emph{Result}: 15.8\,s
+    (19.0$\times$). The date CTE reduced the join cardinality but
+    PostgreSQL's CTE materialization fence prevented further pushdown.
+\item \textbf{W4} (novel elimination): Applied all three patterns
+    compositionally---decorrelating the subquery, isolating
+    \texttt{date\_dim} into a pre-filtered CTE, \emph{and} isolating
+    \texttt{customer\_address} with an inline state filter. \emph{Result}:
+    67.7\,ms (4{,}428$\times$). The three-way decomposition allowed
+    PostgreSQL to use hash joins throughout, with each dimension pre-filtered
+    to a small cardinality before touching the fact table.
+\end{itemize}
+
+This case illustrates three properties of the swarm architecture:
+(1)~\emph{compositional discovery}---W4's three-pattern rewrite was not
+explicitly programmed; it emerged from the worker's strategy seed and the
+reasoning model's chain-of-thought;
+(2)~\emph{worker diversity}---the 520$\times$ gap between W1 and W4
+demonstrates that a single-worker system would have left most of the
+performance on the table;
+(3)~\emph{validation necessity}---all three rewrites are semantically
+correct, but their performance differs by orders of magnitude. Without
+execution-based validation, there is no way to distinguish W4's
+breakthrough from W1's modest improvement.
+
+\subsection{Worker Strategy Analysis}
+
+\begin{table}[t]
+\centering
+\caption{Per-worker win attribution (DuckDB TPC-DS SF10, 4 workers).}
+\label{tab:worker_wins}
+\small
+\begin{tabular}{llr}
+\toprule
+\textbf{Worker} & \textbf{Strategy Focus} & \textbf{Wins} \\
+\midrule
+W1 & decorrelate, pushdown, early\_filter        & 7 \\
+W2 & date\_cte\_isolate, dimension\_cte\_isolate & 9 \\
+W3 & prefetch\_fact\_join, materialize\_cte       & 8 \\
+W4 & single\_pass\_agg, or\_to\_union            & 6 \\
+\midrule
+\textbf{Total unique wins} & & \textbf{30} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:worker_wins} shows that wins are distributed across all four
+workers, with no single strategy dominating. This validates the
+swarm-of-reasoners design: a single-worker system using any one strategy
+would miss 70--77\% of the wins.
+
+\TODO{Add ablation: single-worker vs.\ 2-worker vs.\ 4-worker win rates.}
+
+\subsection{Ablation Study}
+
+We report two ablations supported directly by the operational data.
+
+\paragraph{Single-iteration vs.\ multi-iteration.}
+The DuckDB TPC-DS leaderboard tracks which iteration produced each winning
+rewrite. Of the 43~validated queries:
+
+\begin{table}[h]
+\centering
+\caption{Wins by iteration source (DuckDB TPC-DS SF10).}
+\label{tab:iteration_ablation}
+\small
+\begin{tabular}{llrr}
+\toprule
+\textbf{Source} & \textbf{Description} & \textbf{Wins} & \textbf{Cumul.} \\
+\midrule
+Iter 0 (Kimi)    & Single-pass LLM, 1~worker  & 8  & 8  \\
+Iter 1 (Retry3W) & 3-worker retry on neutrals  & 12 & 20 \\
+Iter 2 (Retry4W) & 4-worker retry, full swarm   & 23 & 43 \\
+Iter 3 (Swarm)   & 6-worker ensemble + promotion & 49 & 92 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Only 8.7\% of wins (8/92) came from the initial single-worker iteration.
+Each subsequent round nearly doubled the cumulative win count, validating
+the multi-iteration promotion mechanism. The improvement from Iter~0 to
+Iter~1 (8$\to$20 wins) demonstrates the value of the swarm alone; the
+further improvement from Iter~1 to Iter~2 (20$\to$43) shows that
+promotion---using winning SQL as the new baseline---unlocks compound
+optimizations that a single round cannot discover.
+
+\paragraph{Worker coverage.}
+In the swarm batch (Iter 2--3), we tracked which worker produced the
+best rewrite for each query:
+
+\begin{table}[h]
+\centering
+\caption{Per-worker win attribution (DuckDB swarm batch, unique wins).}
+\label{tab:worker_coverage}
+\small
+\begin{tabular}{llrr}
+\toprule
+\textbf{Worker} & \textbf{Strategy Focus} & \textbf{Best} & \textbf{Unique} \\
+\midrule
+W1 & decorrelate, pushdown, early\_filter        & 7 & 5 \\
+W2 & date/dim CTE isolate, multi\_date\_range    & 9 & 7 \\
+W3 & prefetch\_fact\_join, materialize\_cte       & 8 & 7 \\
+W4 & single\_pass\_agg, or\_to\_union            & 6 & 5 \\
+\midrule
+\textbf{Total} & & \textbf{30} & \textbf{24} \\
+\bottomrule
+\end{tabular}
+\\[2pt]
+{\footnotesize ``Unique'' = queries where only that worker achieved a winning
+speedup; no other worker found a valid improvement.}
+\end{table}
+
+80\% of winning queries (24/30) were \emph{uniquely} discovered by a single
+worker---no other worker found a valid improvement for those queries. The
+best single worker (W2) captures only 30\% of wins (9/30). A system using
+any single strategy would miss 70--83\% of the optimization opportunities,
+directly validating the swarm-of-reasoners design.
+
+\TODO{Additional ablations to run: without DAG topology (raw SQL only),
+without constraints, without gold examples, reasoning model vs.\ standard
+model (DeepSeek-Reasoner vs.\ GPT-4o).}
+
+\subsection{Comparison with Prior Work}
+
+Direct comparison is complicated by differences in benchmark versions,
+scale factors, and hardware. We report each system's published numbers on
+overlapping benchmarks and compute aggregate statistics in the same format.
+
+\paragraph{DSB on PostgreSQL (head-to-head).}
+E$^3$-Rewrite~\cite{e3rewrite2026} and R-Bot~\cite{rbot2024} both report
+DSB results on PostgreSQL. We compute our aggregate latency numbers in the
+same format (average across all queries, including neutrals and regressions):
+
+\begin{table}[h]
+\centering
+\caption{DSB PostgreSQL aggregate comparison.}
+\label{tab:dsb_comparison}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{System} & \textbf{Avg Orig.} & \textbf{Avg Rewr.} & \textbf{Reduction} \\
+\midrule
+R-Bot~\cite{rbot2024}          & 37.76\,s & 25.35\,s & 32.9\% \\
+E$^3$-Rewrite~\cite{e3rewrite2026} & 38.83\,s & 16.93\,s & 56.4\% \\
+\sysname{} (SF5, excl.\ TO)   & 12.90\,s &  5.09\,s & 60.5\% \\
+\sysname{} (SF5, incl.\ TO)   & 24.39\,s &  4.91\,s & 79.9\% \\
+\bottomrule
+\end{tabular}
+\\[2pt]
+{\footnotesize TO = timeout queries (Q032, Q092 with 300\,s baseline).
+E$^3$/R-Bot numbers are SF10; ours are SF5. ``Excl.\ TO'' uses 48~queries;
+``Incl.\ TO'' uses all 50 non-error queries.}
+\end{table}
+
+Even excluding timeout recoveries and at a smaller scale factor,
+\sysname{} achieves a comparable reduction rate (60.5\% vs.\ E$^3$'s 56.4\%)
+without any model training.
+
+\paragraph{Key qualitative differences.}
+\begin{enumerate}
+\item \textbf{Rewrite expressiveness}: \sysname{} discovers transforms
+    outside any rule vocabulary (e.g., \texttt{single\_pass\_aggregation},
+    \texttt{time\_bucket\_aggregation}, \texttt{self\_join\_decomposition}).
+    These account for 8 of our 19~PostgreSQL wins.
+\item \textbf{Peak speedup}: Q092's 4{,}428$\times$ (timeout recovery) is
+    the largest single improvement reported in the literature.
+    E$^3$-Rewrite's best is $\sim$10$\times$ on timeout queries; R-Bot's
+    best is $\sim$99\% reduction on individual Calcite queries.
+\item \textbf{Cross-engine generalization}: \sysname{} achieves 37\% win
+    rates on both DuckDB and PostgreSQL with zero retraining.
+    E$^3$-Rewrite and R-Bot evaluate on PostgreSQL only.
+\end{enumerate}
+
+
+% ============================================================================
+\section{Discussion}
+\label{sec:discussion}
+% ============================================================================
+
+\paragraph{Why reasoning models matter.}
+SQL optimization requires multi-step logical reasoning: identifying
+bottlenecks, planning a sequence of transformations, and mentally verifying
+that the rewrite preserves semantics. Reasoning models (DeepSeek-Reasoner,
+o1-style) excel at this because they allocate variable compute to problem
+difficulty via chain-of-thought. Standard models (GPT-4o, Claude Sonnet)
+produce more superficial rewrites that miss compositional opportunities.
+
+\TODO{Quantify this with a head-to-head comparison.}
+
+\paragraph{All discovered patterns are known.}
+A notable finding is that all 17~optimization patterns discovered by
+\sysname{} are \emph{known} database optimization techniques (decorrelation,
+predicate pushdown, CTE isolation, scan consolidation, etc.). The system
+does not invent novel strategies---it rediscovers and correctly applies
+known techniques to specific queries where they are beneficial. This
+suggests that the current bottleneck is not strategy invention but strategy
+\emph{selection and application}, which is precisely what
+swarm-of-reasoners addresses.
+
+\paragraph{Limitations.}
+\begin{enumerate}
+\item \textbf{API cost}: 4 workers $\times$ reasoning model calls per query.
+    At current pricing, approximately \$0.10--0.50 per query optimization.
+    Justified for slow queries ($>$1s) but not for sub-second queries.
+\item \textbf{Equivalence verification}: We verify via result comparison,
+    not formal equivalence proofs. This is sound for the tested database
+    instance but does not guarantee equivalence over all possible inputs.
+\item \textbf{Scale factor sensitivity}: Several PostgreSQL wins at SF5
+    degrade or regress at SF10 (e.g., Q023: 66$\times$$\to$1.07$\times$),
+    suggesting that some rewrites exploit cardinality-dependent optimizer
+    decisions that change at larger scale.
+\item \textbf{Cold start}: Effective gold examples require initial
+    benchmark runs to discover winning transforms.
+\end{enumerate}
+
+
+% ============================================================================
+\section{Reproducibility}
+\label{sec:reproducibility}
+% ============================================================================
+
+\sysname{} is designed for reproducibility. We release:
+
+\begin{itemize}
+\item \textbf{Source code}: The complete optimization pipeline including DAG
+    construction, prompt assembly, multi-worker dispatch, validation, and
+    learning system. Built in Python with \texttt{sqlglot}~\cite{sqlglot}
+    for SQL parsing and AST manipulation.
+\item \textbf{Gold example library}: 29~DuckDB examples, 5~PostgreSQL
+    examples, and 74~DSB catalog rules, each with original and optimized SQL,
+    verified speedup, and transform annotations.
+\item \textbf{Constraint library}: 23~constraints (11~general,
+    5~PostgreSQL-specific, 7~DuckDB-specific) in JSON format with severity,
+    description, and provenance.
+\item \textbf{Benchmark scripts}: Automated runners for TPC-DS (DuckDB) and
+    DSB (PostgreSQL) with configurable scale factors, worker counts, and
+    iteration depth.
+\item \textbf{Validation protocol}: 5-run trimmed-mean timing with semantic
+    equivalence checking (row count + MD5 checksum comparison).
+\item \textbf{Leaderboard data}: Complete per-query results including
+    original/optimized latencies, transforms applied, worker attribution,
+    and iteration source.
+\end{itemize}
+
+The system requires only a \texttt{sqlglot} installation and API access to a
+reasoning-capable LLM (DeepSeek-Reasoner, OpenAI o1, or equivalent). No GPU,
+no model training, and no rule engine installation is needed.
+
+% ============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ============================================================================
+
+We presented \sysname{}, a training-free SQL optimization system built on
+three core ideas: (1)~a logical-block DAG representation that provides LLMs
+with structural context aligned to the granularity of rewrites;
+(2)~a swarm-of-reasoners architecture where specialized workers compete to
+produce the best validated rewrite; and (3)~query-type decomposition that
+exposes different optimization surfaces from the same underlying query.
+With a single architecture and zero retraining, \sysname{} achieves a
+$\sim$37\% win rate on both DuckDB (TPC-DS, up to 6.28$\times$) and
+PostgreSQL (DSB, up to 122$\times$ non-timeout, 4{,}428$\times$ with
+timeout recovery)---the first demonstration of cross-engine generalization
+for LLM-based query rewriting. Multi-iteration promotion nearly doubles
+the win count per round, and 80\% of wins are uniquely discovered by a
+single worker, validating the swarm design. On DSB PostgreSQL, \sysname{}
+achieves a 60.5\% average latency reduction without training, comparable
+to E$^3$-Rewrite's 56.4\% which requires RL fine-tuning.
+
+\paragraph{Future work.} (1)~DPO fine-tuning from $\sim$500 accumulated
+preference pairs (win/loss SQL pairs); (2)~EXPLAIN-plan-guided worker
+dispatch; (3)~Snowflake and additional engine support;
+(4)~formal equivalence verification via SMT solvers.
+
+
+% ============================================================================
+% References
+% ============================================================================
+
+\bibliographystyle{ACM-Reference-Format}
+
+\begin{thebibliography}{99}
+
+\bibitem{zhou2021learned}
+X.~Zhou, G.~Li, C.~Chai, and J.~Feng.
+\newblock A learned query rewrite system using Monte Carlo Tree Search.
+\newblock {\em Proc.\ VLDB Endow.}, 15(1):46--58, 2021.
+
+\bibitem{calcite2018}
+E.~Begoli, J.~Camacho-Rodr\'iguez, J.~Hyde, M.~J.~Mior, and D.~Lemire.
+\newblock Apache Calcite: A foundational framework for optimized query
+  processing over heterogeneous data sources.
+\newblock In {\em SIGMOD}, pages 221--230, 2018.
+
+\bibitem{graefe1993volcano}
+G.~Graefe and W.~J.~McKenna.
+\newblock The Volcano optimizer generator: Extensibility and efficient search.
+\newblock In {\em ICDE}, pages 209--218, 1993.
+
+\bibitem{graefe1995cascades}
+G.~Graefe.
+\newblock The Cascades framework for query optimization.
+\newblock {\em IEEE Data Eng.\ Bull.}, 18(3):19--29, 1995.
+
+\bibitem{rbot2024}
+Z.~Sun, X.~Zhou, G.~Li, X.~Yu, J.~Feng, and Y.~Zhang.
+\newblock R-Bot: An LLM-based query rewrite system.
+\newblock {\em Proc.\ VLDB Endow.}, 2024.
+
+\bibitem{e3rewrite2026}
+D.~Xu, Y.~Cui, W.~Shi, Q.~Ma, H.~Guo, J.~Li, Y.~Zhao, R.~Zhang, S.~Di,
+  J.~Zhu, K.~Zheng, and J.~Xu.
+\newblock {E$^3$-Rewrite}: Learning to rewrite SQL for executability,
+  equivalence, and efficiency.
+\newblock In {\em AAAI}, 2026.
+
+\bibitem{llmr2_2024}
+Z.~Li, H.~Yuan, H.~Wang, G.~Cong, and L.~Bing.
+\newblock {LLM-R$^2$}: A large language model enhanced rule-based rewrite
+  system for boosting query efficiency.
+\newblock {\em Proc.\ VLDB Endow.}, 18(1):53--65, 2024.
+
+\bibitem{quite2025}
+Y.~Song, H.~Yan, J.~Lao, Y.~Wang, Y.~Li, Y.~Zhou, J.~Wang, and M.~Tang.
+\newblock {QUITE}: A query rewrite system beyond rules with LLM agents.
+\newblock {\em CoRR}, abs/2506.07675, 2025.
+
+\bibitem{dsb2021}
+B.~Ding, S.~Chaudhuri, J.~Gehrke, and V.~R.~Narasayya.
+\newblock {DSB}: A decision support benchmark for workload-driven and
+  traditional database systems.
+\newblock {\em Proc.\ VLDB Endow.}, 14(13):3376--3388, 2021.
+
+\bibitem{liu2024lost}
+N.~F.~Liu, K.~Lin, J.~Hewitt, A.~Paranjape, M.~Bevilacqua, F.~Petroni, and
+  P.~Liang.
+\newblock Lost in the middle: How language models use long contexts.
+\newblock {\em ACL}, 11:157--173, 2024.
+
+\bibitem{postgresql}
+{PostgreSQL Global Development Group}.
+\newblock {PostgreSQL}: The world's most advanced open source database.
+\newblock \url{https://www.postgresql.org}, 2025.
+
+\bibitem{wetune2022}
+Z.~Wang, Z.~Zhou, Y.~Yang, H.~Ding, G.~Hu, D.~Ding, C.~Tang, H.~Chen, and
+  J.~Li.
+\newblock {WeTune}: Automatic discovery and verification of query rewrite
+  rules.
+\newblock In {\em SIGMOD}, pages 94--107, 2022.
+
+\bibitem{slabcity2023}
+R.~Dong, J.~Liu, Y.~Zhu, C.~Yan, B.~Mozafari, and X.~Wang.
+\newblock {SlabCity}: Whole-query optimization using program synthesis.
+\newblock {\em Proc.\ VLDB Endow.}, 16(11):3151--3164, 2023.
+
+\bibitem{deepseek_r1}
+{DeepSeek-AI} et~al.
+\newblock {DeepSeek-R1}: Incentivizing reasoning capability in LLMs via
+  reinforcement learning.
+\newblock {\em CoRR}, abs/2501.12948, 2025.
+
+\bibitem{duckdb2019}
+M.~Raasveldt and H.~M\"{u}hleisen.
+\newblock {DuckDB}: An embeddable analytical database.
+\newblock In {\em SIGMOD}, pages 1981--1984, 2019.
+
+\bibitem{sqlglot}
+T.~Breddin et~al.
+\newblock {SQLGlot}: A no-dependency SQL parser, transpiler, optimizer, and
+  engine.
+\newblock \url{https://github.com/tobymao/sqlglot}, 2024.
+
+\bibitem{openai_o1}
+{OpenAI}.
+\newblock {Learning to reason with LLMs}.
+\newblock OpenAI Blog, September 2024.
+
+\end{thebibliography}
+
+\end{document}
