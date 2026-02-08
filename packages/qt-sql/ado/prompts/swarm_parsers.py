@@ -47,10 +47,12 @@ def parse_fan_out_response(response: str) -> List[WorkerAssignment]:
     Returns:
         List of 4 WorkerAssignment objects.
 
-    Raises:
-        ValueError: If response cannot be parsed into valid assignments.
+    Notes:
+        This parser is fault-tolerant: it normalizes worker IDs to 1..4 and
+        synthesizes fallback assignments for missing/invalid sections.
     """
-    assignments = []
+    assignments: List[WorkerAssignment] = []
+    assignments_by_worker: dict[int, WorkerAssignment] = {}
 
     # Split by WORKER_N: headers
     worker_blocks = re.split(r'WORKER_(\d+)\s*:', response, flags=re.IGNORECASE)
@@ -58,6 +60,9 @@ def parse_fan_out_response(response: str) -> List[WorkerAssignment]:
     # worker_blocks alternates: [preamble, "1", block1, "2", block2, ...]
     for i in range(1, len(worker_blocks) - 1, 2):
         worker_id = int(worker_blocks[i])
+        if worker_id < 1 or worker_id > 4:
+            logger.warning(f"Ignoring invalid worker id WORKER_{worker_id}")
+            continue
         block = worker_blocks[i + 1]
 
         strategy = _extract_field(block, "STRATEGY")
@@ -65,30 +70,37 @@ def parse_fan_out_response(response: str) -> List[WorkerAssignment]:
         hint = _extract_field(block, "HINT")
 
         examples = [ex.strip() for ex in examples_raw.split(",") if ex.strip()]
+        if len(examples) > 3:
+            logger.warning(
+                f"WORKER_{worker_id} had {len(examples)} examples; trimming to 3"
+            )
+            examples = examples[:3]
 
-        assignments.append(WorkerAssignment(
+        if worker_id in assignments_by_worker:
+            logger.warning(f"Duplicate WORKER_{worker_id} block found; keeping first")
+            continue
+
+        assignments_by_worker[worker_id] = WorkerAssignment(
             worker_id=worker_id,
-            strategy=strategy,
+            strategy=strategy or f"fallback_{worker_id}",
             examples=examples,
-            hint=hint,
-        ))
-
-    # Validate we got exactly 4
-    if len(assignments) < 4:
-        logger.warning(
-            f"Expected 4 worker assignments, got {len(assignments)}. "
-            f"Padding with defaults."
+            hint=hint or "Apply any relevant optimization pattern.",
         )
-        # Pad with defaults using any remaining examples
-        used = {ex for a in assignments for ex in a.examples}
-        while len(assignments) < 4:
-            wid = len(assignments) + 1
-            assignments.append(WorkerAssignment(
-                worker_id=wid,
-                strategy=f"fallback_{wid}",
+
+    # Build normalized 1..4 assignments so downstream always gets stable IDs.
+    for worker_id in range(1, 5):
+        assignment = assignments_by_worker.get(worker_id)
+        if assignment is None:
+            logger.warning(
+                f"Missing WORKER_{worker_id} assignment, creating fallback entry"
+            )
+            assignment = WorkerAssignment(
+                worker_id=worker_id,
+                strategy=f"fallback_{worker_id}",
                 examples=[],
                 hint="Apply any relevant optimization pattern.",
-            ))
+            )
+        assignments.append(assignment)
 
     # Warn on duplicates but don't fail (LLM may not follow strictly)
     all_examples = [ex for a in assignments for ex in a.examples]
@@ -97,7 +109,7 @@ def parse_fan_out_response(response: str) -> List[WorkerAssignment]:
         dupes = [ex for ex in unique_examples if all_examples.count(ex) > 1]
         logger.warning(f"Duplicate examples across workers: {dupes}")
 
-    return assignments[:4]
+    return assignments
 
 
 def parse_snipe_response(response: str) -> SnipeAnalysis:

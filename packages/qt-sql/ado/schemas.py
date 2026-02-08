@@ -171,7 +171,9 @@ class WorkerResult:
     status: str
     transforms: List[str] = field(default_factory=list)
     hint: str = ""
-    error_message: str = ""
+    error_message: Optional[str] = None
+    error_messages: List[str] = field(default_factory=list)
+    error_category: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -184,6 +186,8 @@ class WorkerResult:
             "transforms": self.transforms,
             "hint": self.hint,
             "error_message": self.error_message,
+            "error_messages": self.error_messages,
+            "error_category": self.error_category,
         }
 
 

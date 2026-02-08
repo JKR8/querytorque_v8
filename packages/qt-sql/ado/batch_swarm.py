@@ -40,7 +40,11 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 from ado.pipeline import Pipeline
 from ado.generate import CandidateGenerator
-from ado.prompts import build_fan_out_prompt, parse_fan_out_response
+from ado.prompts import (
+    build_fan_out_prompt,
+    build_worker_strategy_header,
+    parse_fan_out_response,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -279,14 +283,7 @@ def phase2_5_parse(
                     engine_version=pipeline._engine_version,
                 )
 
-                header = (
-                    f"## Optimization Strategy: {a.strategy}\n\n"
-                    f"**Your approach**: {a.hint}\n\n"
-                    f"**Focus**: Apply the examples below in service of this "
-                    f"strategy. Prioritize this specific approach over generic "
-                    f"optimizations.\n\n---\n\n"
-                )
-                worker_prompt = header + base_prompt
+                worker_prompt = build_worker_strategy_header(a.strategy, a.hint) + base_prompt
 
                 # Save prompt
                 (qdir / f"worker_{a.worker_id}_prompt.txt").write_text(worker_prompt)

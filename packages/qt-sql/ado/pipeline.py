@@ -595,6 +595,9 @@ class Pipeline:
                     "transforms": result.transforms_applied,
                 },
             )
+            # Keep top-level state artifacts populated for easy prompt/response review.
+            (state_dir / "prompts" / f"{query_id}.txt").write_text(result.prompt or "")
+            (state_dir / "responses" / f"{query_id}.txt").write_text(result.response or "")
 
             # Save analyst artifacts if present (audit trail)
             qdir = state_dir / query_id / "worker_00"

@@ -23,12 +23,15 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .pipeline import Pipeline
+
+from .session_logging import attach_session_handler, detach_session_handler
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +47,8 @@ class AnalystIteration:
     transforms: List[str] = field(default_factory=list)
     prompt: str = ""         # The prompt used
     analysis: Optional[str] = None  # LLM analyst output
+    analysis_prompt: Optional[str] = None  # Prompt sent to analyst LLM
+    rewrite_response: Optional[str] = None  # Raw rewrite LLM response
     examples_used: List[str] = field(default_factory=list)
     failure_analysis: Optional[str] = None  # LLM-generated why/what-next
     error_messages: List[str] = field(default_factory=list)  # Raw validation errors
@@ -86,52 +91,92 @@ class AnalystSession:
         self.iterations: List[AnalystIteration] = []
         self.best_speedup = 1.0
         self.best_sql = original_sql
+        self._run_log_path: Optional[Path] = None
+        self._run_log_handler: Optional[logging.Handler] = None
 
     @staticmethod
     def _stage(query_id: str, msg: str):
         """Print a clear stage banner to console."""
         print(f"  [{query_id}] {msg}", flush=True)
+        logger.info(f"[{query_id}] {msg}")
+
+    def _setup_run_logging(self, session_dir: Path) -> Path:
+        """Attach a per-run file handler so analyst sessions keep a log file."""
+        session_dir.mkdir(parents=True, exist_ok=True)
+        log_path = session_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"
+        handler = logging.FileHandler(log_path, mode="w")
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(name)s %(levelname)s %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        attach_session_handler(handler)
+        self._run_log_handler = handler
+        self._run_log_path = log_path
+        logger.info(f"[{self.query_id}] Expert run log: {log_path}")
+        return log_path
+
+    def _teardown_run_logging(self) -> None:
+        """Detach and close the per-run file handler."""
+        if self._run_log_handler is None:
+            return
+        detach_session_handler(self._run_log_handler)
+        self._run_log_handler.close()
+        self._run_log_handler = None
 
     def run(self) -> Optional[AnalystIteration]:
         """Run the full iterative loop. Returns best iteration (if >=5% speedup)."""
-        print(f"\n{'='*60}", flush=True)
-        print(f"  EXPERT SESSION: {self.query_id}", flush=True)
-        print(f"  max_iterations={self.max_iterations}  target={self.target_speedup:.1f}x  workers={self.n_workers}", flush=True)
-        print(f"{'='*60}", flush=True)
+        session_dir = (
+            self.pipeline.benchmark_dir / "analyst_sessions" / self.query_id
+        )
+        self._setup_run_logging(session_dir)
+        session_start = time.time()
+        try:
+            print(f"\n{'='*60}", flush=True)
+            print(f"  EXPERT SESSION: {self.query_id}", flush=True)
+            print(f"  max_iterations={self.max_iterations}  target={self.target_speedup:.1f}x  workers={self.n_workers}", flush=True)
+            print(f"{'='*60}", flush=True)
 
-        for i in range(self.max_iterations):
-            print(f"\n--- Iteration {i + 1}/{self.max_iterations} ---", flush=True)
+            for i in range(self.max_iterations):
+                print(f"\n--- Iteration {i + 1}/{self.max_iterations} ---", flush=True)
 
-            iteration = self._run_iteration(i)
-            self.iterations.append(iteration)
+                iteration = self._run_iteration(i)
+                self.iterations.append(iteration)
 
-            # Track best result
-            if iteration.speedup > self.best_speedup:
-                self.best_speedup = iteration.speedup
-                self.best_sql = iteration.optimized_sql
+                # Track best result
+                if iteration.speedup > self.best_speedup:
+                    self.best_speedup = iteration.speedup
+                    self.best_sql = iteration.optimized_sql
 
-            # Generate failure analysis if < target
-            if iteration.speedup < self.target_speedup:
-                self._stage(self.query_id, f"Phase 7: LLM failure analysis ({iteration.speedup:.2f}x < {self.target_speedup:.1f}x target)...")
-                t_fa = time.time()
-                iteration.failure_analysis = self._generate_failure_analysis(iteration)
-                self._stage(self.query_id, f"  Failure analysis done ({time.time() - t_fa:.0f}s)")
+                # Generate failure analysis if < target
+                if iteration.speedup < self.target_speedup:
+                    self._stage(self.query_id, f"Phase 7: LLM failure analysis ({iteration.speedup:.2f}x < {self.target_speedup:.1f}x target)...")
+                    t_fa = time.time()
+                    iteration.failure_analysis = self._generate_failure_analysis(iteration)
+                    self._stage(self.query_id, f"  Failure analysis done ({time.time() - t_fa:.0f}s)")
 
-            # Stop if target reached
-            if self.best_speedup >= self.target_speedup:
-                self._stage(self.query_id, f"Target {self.target_speedup:.1f}x reached!")
-                break
+                # Stop if target reached
+                if self.best_speedup >= self.target_speedup:
+                    self._stage(self.query_id, f"Target {self.target_speedup:.1f}x reached!")
+                    break
 
-        best = self._best_iteration()
-        total_time = time.time() - t0 if 't0' in dir() else 0
-        print(f"\n{'='*60}", flush=True)
-        if best:
-            print(f"  DONE: {self.query_id} — {best.status} {best.speedup:.2f}x (iter {best.iteration + 1})", flush=True)
-        else:
-            print(f"  DONE: {self.query_id} — no improvement", flush=True)
-        print(f"{'='*60}\n", flush=True)
+            best = self._best_iteration()
+            total_time = time.time() - session_start
+            print(f"\n{'='*60}", flush=True)
+            if best:
+                print(f"  DONE: {self.query_id} — {best.status} {best.speedup:.2f}x (iter {best.iteration + 1})", flush=True)
+            else:
+                print(f"  DONE: {self.query_id} — no improvement", flush=True)
+            print(f"  elapsed={total_time:.1f}s", flush=True)
+            print(f"{'='*60}\n", flush=True)
 
-        return best
+            return best
+        finally:
+            if self._run_log_path:
+                logger.info(f"[{self.query_id}] Expert log file saved: {self._run_log_path}")
+            self._teardown_run_logging()
 
     def _run_iteration(self, iteration_num: int) -> AnalystIteration:
         """Single iteration: analyze -> rewrite -> validate.
@@ -151,7 +196,6 @@ class AnalystSession:
         )
 
         input_sql = self.original_sql  # Always from original
-        t0 = time.time()
 
         # Build history from ALL previous iterations
         history = self._build_iteration_history()
@@ -179,7 +223,7 @@ class AnalystSession:
         t_analyst = time.time()
         expert_analysis = None
         analysis_raw = None
-        expert_analysis, analysis_raw, _analysis_prompt, examples = self.pipeline._run_analyst(
+        expert_analysis, analysis_raw, analysis_prompt, examples = self.pipeline._run_analyst(
             query_id=self.query_id,
             sql=input_sql,
             dag=dag,
@@ -232,6 +276,7 @@ class AnalystSession:
         # Pick best candidate
         optimized_sql = input_sql
         transforms = []
+        rewrite_response = None
         if candidates:
             best_cand = None
             for cand in candidates:
@@ -245,6 +290,9 @@ class AnalystSession:
             if best_cand:
                 optimized_sql = best_cand.optimized_sql
                 transforms = best_cand.transforms
+                rewrite_response = best_cand.response
+            elif candidates:
+                rewrite_response = candidates[0].response
         self._stage(self.query_id, f"  Rewrite done ({time.time() - t_rewrite:.0f}s), transforms: {transforms or ['none']}")
 
         # Phase 5: Syntax check
@@ -295,6 +343,8 @@ class AnalystSession:
             transforms=transforms,
             prompt=prompt,
             analysis=analysis_raw,
+            analysis_prompt=analysis_prompt,
+            rewrite_response=rewrite_response,
             examples_used=example_ids,
             error_messages=val_errors,
             error_category=val_error_cat,
@@ -510,6 +560,7 @@ class AnalystSession:
             "best_speedup": self.best_speedup,
             "best_sql": self.best_sql,
             "n_iterations": len(self.iterations),
+            "run_log_path": str(self._run_log_path) if self._run_log_path else None,
         }
         (output_dir / "session.json").write_text(
             json.dumps(session_data, indent=2)
@@ -532,6 +583,10 @@ class AnalystSession:
             }, indent=2))
             if it.analysis:
                 (it_dir / "analysis.txt").write_text(it.analysis)
+            if it.analysis_prompt:
+                (it_dir / "analysis_prompt.txt").write_text(it.analysis_prompt)
+            if it.rewrite_response:
+                (it_dir / "rewrite_response.txt").write_text(it.rewrite_response)
             if it.failure_analysis:
                 (it_dir / "failure_analysis.txt").write_text(it.failure_analysis)
 
@@ -608,6 +663,16 @@ class AnalystSession:
             if analysis_path.exists():
                 analysis = analysis_path.read_text()
 
+            analysis_prompt = None
+            analysis_prompt_path = it_dir / "analysis_prompt.txt"
+            if analysis_prompt_path.exists():
+                analysis_prompt = analysis_prompt_path.read_text()
+
+            rewrite_response = None
+            rewrite_response_path = it_dir / "rewrite_response.txt"
+            if rewrite_response_path.exists():
+                rewrite_response = rewrite_response_path.read_text()
+
             failure_analysis = None
             fa_path = it_dir / "failure_analysis.txt"
             if fa_path.exists():
@@ -627,6 +692,8 @@ class AnalystSession:
                 transforms=val_data.get("transforms", []),
                 prompt=prompt,
                 analysis=analysis,
+                analysis_prompt=analysis_prompt,
+                rewrite_response=rewrite_response,
                 examples_used=val_data.get("examples_used", []),
                 failure_analysis=failure_analysis,
             ))

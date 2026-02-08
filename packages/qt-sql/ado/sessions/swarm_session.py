@@ -16,10 +16,12 @@ import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from .base_session import OptimizationSession
+from ..session_logging import attach_session_handler, detach_session_handler
 from ..schemas import SessionResult, WorkerResult
 
 if TYPE_CHECKING:
@@ -43,73 +45,111 @@ class SwarmSession(OptimizationSession):
         super().__init__(*args, **kwargs)
         self.all_worker_results: List[WorkerResult] = []
         self.iterations_data: List[Dict[str, Any]] = []
+        self._run_log_path: Optional[Path] = None
+        self._run_log_handler: Optional[logging.Handler] = None
 
     @staticmethod
     def _stage(query_id: str, msg: str):
         """Print a clear stage message to console."""
         print(f"  [{query_id}] {msg}", flush=True)
+        logger.info(f"[{query_id}] {msg}")
+
+    def _setup_run_logging(self, session_dir: Path) -> Path:
+        """Attach a per-run file handler so session logs are persisted."""
+        session_dir.mkdir(parents=True, exist_ok=True)
+        log_path = session_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.log"
+        handler = logging.FileHandler(log_path, mode="w")
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(name)s %(levelname)s %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        attach_session_handler(handler)
+        self._run_log_handler = handler
+        self._run_log_path = log_path
+        logger.info(f"[{self.query_id}] Swarm run log: {log_path}")
+        return log_path
+
+    def _teardown_run_logging(self) -> None:
+        """Remove and close the per-run file handler."""
+        if self._run_log_handler is None:
+            return
+        detach_session_handler(self._run_log_handler)
+        self._run_log_handler.close()
+        self._run_log_handler = None
 
     def run(self) -> SessionResult:
         """Execute swarm optimization: fan-out then snipe."""
         t_session = time.time()
-
-        print(f"\n{'='*60}", flush=True)
-        print(f"  SWARM SESSION: {self.query_id}", flush=True)
-        print(f"  fan-out=4 workers  snipe=max {self.max_iterations - 1}  target={self.target_speedup:.1f}x", flush=True)
-        print(f"{'='*60}", flush=True)
-
-        # Phase 1: Parse DAG once (shared across all iterations)
-        self._stage(self.query_id, "PARSE: Building DAG...")
-        t0 = time.time()
-        dag, costs, _explain = self.pipeline._parse_dag(
-            self.original_sql, dialect=self.dialect, query_id=self.query_id
+        session_dir = (
+            self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id
         )
-        self._stage(self.query_id, f"PARSE: done ({_fmt_elapsed(time.time() - t0)})")
+        self._setup_run_logging(session_dir)
 
-        # Iteration 1: Fan-out phase
-        print(f"\n--- Fan-out (4 workers) ---", flush=True)
-        t_fanout = time.time()
-        fan_out_result = self._fan_out_iteration(dag, costs, t_session)
-        self.iterations_data.append(fan_out_result)
-        self._stage(self.query_id, f"FAN-OUT: complete ({_fmt_elapsed(time.time() - t_fanout)}) | total {_fmt_elapsed(time.time() - t_session)}")
-
-        best_wr = self._best_worker()
-        if best_wr and best_wr.speedup >= self.target_speedup:
+        try:
             print(f"\n{'='*60}", flush=True)
-            print(f"  DONE: {self.query_id} — {best_wr.status} {best_wr.speedup:.2f}x "
-                  f"(W{best_wr.worker_id} {best_wr.strategy}) | {_fmt_elapsed(time.time() - t_session)}", flush=True)
-            print(f"{'='*60}\n", flush=True)
-            self.save_session()
-            return self._build_result()
+            print(f"  SWARM SESSION: {self.query_id}", flush=True)
+            print(f"  fan-out=4 workers  snipe=max {self.max_iterations - 1}  target={self.target_speedup:.1f}x", flush=True)
+            print(f"{'='*60}", flush=True)
 
-        # Iterations 2-N: Snipe phase
-        for snipe_num in range(1, self.max_iterations):
-            print(f"\n--- Snipe {snipe_num}/{self.max_iterations - 1} ---", flush=True)
-            t_snipe = time.time()
-            snipe_result = self._snipe_iteration(dag, costs, snipe_num, t_session)
-            self.iterations_data.append(snipe_result)
-            self._stage(self.query_id, f"SNIPE {snipe_num}: complete ({_fmt_elapsed(time.time() - t_snipe)}) | total {_fmt_elapsed(time.time() - t_session)}")
+            # Phase 1: Parse DAG once (shared across all iterations)
+            self._stage(self.query_id, "PARSE: Building DAG...")
+            t0 = time.time()
+            dag, costs, _explain = self.pipeline._parse_dag(
+                self.original_sql, dialect=self.dialect, query_id=self.query_id
+            )
+            self._stage(self.query_id, f"PARSE: done ({_fmt_elapsed(time.time() - t0)})")
+
+            # Iteration 1: Fan-out phase
+            print(f"\n--- Fan-out (4 workers) ---", flush=True)
+            t_fanout = time.time()
+            fan_out_result = self._fan_out_iteration(dag, costs, t_session)
+            self.iterations_data.append(fan_out_result)
+            self._stage(self.query_id, f"FAN-OUT: complete ({_fmt_elapsed(time.time() - t_fanout)}) | total {_fmt_elapsed(time.time() - t_session)}")
 
             best_wr = self._best_worker()
             if best_wr and best_wr.speedup >= self.target_speedup:
                 print(f"\n{'='*60}", flush=True)
                 print(f"  DONE: {self.query_id} — {best_wr.status} {best_wr.speedup:.2f}x "
-                      f"(snipe {snipe_num}) | {_fmt_elapsed(time.time() - t_session)}", flush=True)
+                      f"(W{best_wr.worker_id} {best_wr.strategy}) | {_fmt_elapsed(time.time() - t_session)}", flush=True)
                 print(f"{'='*60}\n", flush=True)
                 self.save_session()
                 return self._build_result()
 
-        # Final summary
-        best_wr = self._best_worker()
-        print(f"\n{'='*60}", flush=True)
-        if best_wr:
-            print(f"  DONE: {self.query_id} — {best_wr.status} {best_wr.speedup:.2f}x "
-                  f"(W{best_wr.worker_id} {best_wr.strategy}) | {_fmt_elapsed(time.time() - t_session)}", flush=True)
-        else:
-            print(f"  DONE: {self.query_id} — no valid results | {_fmt_elapsed(time.time() - t_session)}", flush=True)
-        print(f"{'='*60}\n", flush=True)
-        self.save_session()
-        return self._build_result()
+            # Iterations 2-N: Snipe phase
+            for snipe_num in range(1, self.max_iterations):
+                print(f"\n--- Snipe {snipe_num}/{self.max_iterations - 1} ---", flush=True)
+                t_snipe = time.time()
+                snipe_result = self._snipe_iteration(dag, costs, snipe_num, t_session)
+                self.iterations_data.append(snipe_result)
+                self._stage(self.query_id, f"SNIPE {snipe_num}: complete ({_fmt_elapsed(time.time() - t_snipe)}) | total {_fmt_elapsed(time.time() - t_session)}")
+
+                best_wr = self._best_worker()
+                if best_wr and best_wr.speedup >= self.target_speedup:
+                    print(f"\n{'='*60}", flush=True)
+                    print(f"  DONE: {self.query_id} — {best_wr.status} {best_wr.speedup:.2f}x "
+                          f"(snipe {snipe_num}) | {_fmt_elapsed(time.time() - t_session)}", flush=True)
+                    print(f"{'='*60}\n", flush=True)
+                    self.save_session()
+                    return self._build_result()
+
+            # Final summary
+            best_wr = self._best_worker()
+            print(f"\n{'='*60}", flush=True)
+            if best_wr:
+                print(f"  DONE: {self.query_id} — {best_wr.status} {best_wr.speedup:.2f}x "
+                      f"(W{best_wr.worker_id} {best_wr.strategy}) | {_fmt_elapsed(time.time() - t_session)}", flush=True)
+            else:
+                print(f"  DONE: {self.query_id} — no valid results | {_fmt_elapsed(time.time() - t_session)}", flush=True)
+            print(f"{'='*60}\n", flush=True)
+            self.save_session()
+            return self._build_result()
+        finally:
+            if self._run_log_path:
+                logger.info(f"[{self.query_id}] Swarm log file saved: {self._run_log_path}")
+            self._teardown_run_logging()
 
     def _fan_out_iteration(
         self, dag: Any, costs: Dict[str, Any], t_session: float,
@@ -273,6 +313,8 @@ class SwarmSession(OptimizationSession):
                 transforms=transforms,
                 hint=assignment.hint,
                 error_message=" | ".join(error_msgs) if error_msgs else None,
+                error_messages=error_msgs or [],
+                error_category=error_cat,
             )
             worker_results.append(wr)
             self.all_worker_results.append(wr)
@@ -438,6 +480,8 @@ class SwarmSession(OptimizationSession):
             transforms=candidate.transforms,
             hint=analysis.hint,
             error_message=" | ".join(val_errors) if val_errors else None,
+            error_messages=val_errors or [],
+            error_category=val_error_cat,
         )
         self.all_worker_results.append(wr)
 
@@ -489,6 +533,8 @@ class SwarmSession(OptimizationSession):
 
         Prepends strategy-specific guidance to the standard optimization prompt.
         """
+        from ..prompts import build_worker_strategy_header
+
         base_prompt = self.pipeline.prompter.build_prompt(
             query_id=f"{self.query_id}_w{worker_id}",
             full_sql=self.original_sql,
@@ -504,19 +550,7 @@ class SwarmSession(OptimizationSession):
             engine_version=self.pipeline._engine_version,
         )
 
-        strategy_header = (
-            f"## Optimization Strategy: {strategy}\n"
-            f"\n"
-            f"**Your approach**: {hint}\n"
-            f"\n"
-            f"**Focus**: Apply the examples below in service of this strategy. "
-            f"Prioritize this specific approach over generic optimizations.\n"
-            f"\n"
-            f"---\n"
-            f"\n"
-        )
-
-        return strategy_header + base_prompt
+        return build_worker_strategy_header(strategy, hint) + base_prompt
 
     def _best_worker(self) -> Optional[WorkerResult]:
         """Return the worker with the highest speedup across all iterations."""
@@ -557,8 +591,9 @@ class SwarmSession(OptimizationSession):
     def _count_api_calls(self) -> int:
         """Count total API calls made.
 
-        Fan-out: 1 analyst + 4 worker generation + 4 validation = 5 API calls
-        Snipe: 1 analyst + 1 worker generation + 1 validation = 2 API calls
+        Counts only LLM calls:
+        - Fan-out iteration: 1 analyst + N worker generations
+        - Snipe iteration: 1 analyst + 1 worker generation
         """
         total = 0
         for it_data in self.iterations_data:
@@ -640,6 +675,7 @@ class SwarmSession(OptimizationSession):
             "best_strategy": best.strategy if best else None,
             "total_workers": len(self.all_worker_results),
             "n_api_calls": self._count_api_calls(),
+            "run_log_path": str(self._run_log_path) if self._run_log_path else None,
         }
         (output_dir / "session.json").write_text(
             json.dumps(session_data, indent=2)
