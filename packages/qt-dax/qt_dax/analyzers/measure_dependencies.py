@@ -122,11 +122,14 @@ class DAXReferenceParser:
     MEASURE_REF_PATTERN = re.compile(
         r"""
         (?:                           # Optional table prefix
-            '?([A-Za-z_][A-Za-z0-9_ ]*)'?  # Table name (group 1)
+            '([^']+)'                 # Quoted table name (group 1)
+            \s*
+            |                         # OR
+            ([A-Za-z_][A-Za-z0-9_ ]*) # Unquoted table name (group 2)
             \s*
         )?
         \[                            # Opening bracket
-            ([A-Za-z_][A-Za-z0-9_ ]*)  # Measure/Column name (group 2)
+            ([^\]]+)                  # Measure/Column name (group 3)
         \]                            # Closing bracket
         """,
         re.VERBOSE | re.IGNORECASE
@@ -193,8 +196,8 @@ class DAXReferenceParser:
 
         # Find all bracket references
         for match in self.MEASURE_REF_PATTERN.finditer(clean_expr):
-            table_name = match.group(1)
-            ref_name = match.group(2)
+            table_name = match.group(1) or match.group(2)
+            ref_name = match.group(3)
             ref_name_lower = ref_name.lower()
 
             # Skip if this is definitely a column (has table prefix and not a known measure)

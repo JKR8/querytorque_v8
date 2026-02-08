@@ -25,6 +25,7 @@ from rich.markdown import Markdown
 
 from qt_dax.analyzers.vpax_analyzer import ReportGenerator, DiagnosticReport
 from qt_dax.analyzers.pbip_analyzer import PBIPReportGenerator
+from qt_dax.case_exporter import export_cases
 
 console = Console()
 
@@ -235,6 +236,58 @@ def display_analysis_result(result: DiagnosticReport, verbose: bool = False) -> 
 def cli():
     """QueryTorque DAX - Power BI/DAX Analysis and Optimization CLI."""
     pass
+
+
+@cli.command("export-cases")
+@click.option(
+    "--input-path",
+    type=click.Path(exists=True),
+    default=str(Path(__file__).resolve().parents[2] / "dax_optimizations_extracted.jsonl"),
+    show_default=True,
+    help="Input case dataset (.jsonl or .csv).",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(),
+    default=str(Path(__file__).resolve().parents[2] / "pbi" / "case_study_artifacts" / "exports"),
+    show_default=True,
+    help="Directory for exported ADO-style case artifacts.",
+)
+@click.option(
+    "--measure",
+    "-m",
+    multiple=True,
+    help="Filter to specific measure name(s).",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=None,
+    help="Maximum number of cases to export.",
+)
+def export_cases_cmd(
+    input_path: str,
+    output_dir: str,
+    measure: tuple[str, ...],
+    limit: Optional[int],
+):
+    """Export normalized DAX case records in ADO-style folder artifacts."""
+    try:
+        manifest = export_cases(
+            input_path=input_path,
+            output_dir=output_dir,
+            measure_filters=measure,
+            limit=limit,
+        )
+    except Exception as e:
+        console.print(f"[red]Case export failed: {e}[/red]")
+        sys.exit(1)
+
+    console.print(
+        f"[green]Exported {manifest['exported_count']} case(s)[/green] "
+        f"to {manifest['output_dir']}"
+    )
+    console.print(f"[dim]Manifest: {Path(manifest['output_dir']) / 'manifest.json'}[/dim]")
 
 
 @cli.command()

@@ -18,14 +18,55 @@ from typing import Optional
 import click
 from rich.console import Console
 from rich.panel import Panel
+from rich.prompt import Prompt, IntPrompt, Confirm
 from rich.table import Table
 from rich.syntax import Syntax
 from rich.markdown import Markdown
 
 from qt_dax.analyzers.vpax_analyzer import ReportGenerator, DiagnosticReport
 from qt_dax.analyzers.pbip_analyzer import PBIPReportGenerator
+from qt_dax.case_exporter import export_cases
 
 console = Console()
+
+
+def _safe_call(fn, *args, **kwargs):
+    try:
+        fn(*args, **kwargs)
+    except SystemExit:
+        return
+
+
+def _prompt_path(label: str, default: Optional[str] = None, must_exist: bool = True) -> str:
+    while True:
+        value = Prompt.ask(label, default=default).strip().strip('"').strip("'")
+        if not value:
+            console.print("[red]Path is required.[/red]")
+            continue
+        path = Path(value)
+        if must_exist and not path.exists():
+            console.print(f"[red]Path not found: {value}[/red]")
+            continue
+        return str(path)
+
+
+def _prompt_measures() -> tuple:
+    raw = Prompt.ask("Measure names (comma-separated, blank for all)", default="")
+    if not raw.strip():
+        return ()
+    return tuple(m.strip() for m in raw.split(",") if m.strip())
+
+
+def _prompt_int(label: str, default: Optional[int] = None) -> Optional[int]:
+    default_str = "" if default is None else str(default)
+    while True:
+        value = Prompt.ask(label, default=default_str).strip()
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            console.print("[red]Enter a whole number or leave blank.[/red]")
 
 
 def read_vpax_file(file_path: str) -> Path:
@@ -80,6 +121,17 @@ def read_dax_file(file_path: str) -> str:
 def display_analysis_result(result: DiagnosticReport, verbose: bool = False) -> None:
     """Display analysis result with rich formatting."""
     summary = result.summary
+
+    def issue_field(issue, field, default=None):
+        if isinstance(issue, dict):
+            if field == "name":
+                return issue.get("name") or issue.get("rule_name") or default
+            if field == "affected_object":
+                return issue.get("affected_object") or issue.get("object_name") or default
+            if field == "suggestion":
+                return issue.get("suggestion") or issue.get("recommendation") or default
+            return issue.get(field, default)
+        return getattr(issue, field, default)
 
     # Score panel
     score = summary.torque_score
@@ -147,12 +199,15 @@ def display_analysis_result(result: DiagnosticReport, verbose: bool = False) -> 
     }
 
     for issue in result.all_issues:
-        color = severity_colors.get(issue.severity, "white")
+        severity = issue_field(issue, "severity", "info")
+        color = severity_colors.get(severity, "white")
         table.add_row(
-            f"[{color}]{issue.severity.upper()}[/{color}]",
-            issue.rule_id,
-            issue.description[:50] + "..." if len(issue.description) > 50 else issue.description,
-            str(issue.penalty)
+            f"[{color}]{severity.upper()}[/{color}]",
+            str(issue_field(issue, "rule_id", "")),
+            (issue_field(issue, "description", "")[:50] + "...")
+            if len(issue_field(issue, "description", "")) > 50
+            else issue_field(issue, "description", ""),
+            str(issue_field(issue, "penalty", ""))
         )
 
     console.print(table)
@@ -161,13 +216,18 @@ def display_analysis_result(result: DiagnosticReport, verbose: bool = False) -> 
     if verbose:
         console.print("\n[bold]Issue Details:[/bold]\n")
         for i, issue in enumerate(result.all_issues, 1):
-            console.print(f"[bold]{i}. {issue.name}[/bold] ({issue.rule_id})")
-            console.print(f"   [dim]Category:[/dim] {issue.category}")
-            console.print(f"   [dim]Description:[/dim] {issue.description}")
-            if issue.affected_object:
-                console.print(f"   [dim]Affected:[/dim] {issue.affected_object}")
-            if issue.suggestion:
-                console.print(f"   [dim]Suggestion:[/dim] {issue.suggestion}")
+            console.print(
+                f"[bold]{i}. {issue_field(issue, 'name', '')}[/bold] "
+                f"({issue_field(issue, 'rule_id', '')})"
+            )
+            console.print(f"   [dim]Category:[/dim] {issue_field(issue, 'category', '')}")
+            console.print(f"   [dim]Description:[/dim] {issue_field(issue, 'description', '')}")
+            affected = issue_field(issue, "affected_object")
+            if affected:
+                console.print(f"   [dim]Affected:[/dim] {affected}")
+            suggestion = issue_field(issue, "suggestion")
+            if suggestion:
+                console.print(f"   [dim]Suggestion:[/dim] {suggestion}")
             console.print()
 
 
@@ -178,16 +238,70 @@ def cli():
     pass
 
 
+@cli.command("export-cases")
+@click.option(
+    "--input-path",
+    type=click.Path(exists=True),
+    default=str(Path(__file__).resolve().parents[2] / "dax_optimizations_extracted.jsonl"),
+    show_default=True,
+    help="Input case dataset (.jsonl or .csv).",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(),
+    default=str(Path(__file__).resolve().parents[2] / "pbi" / "case_study_artifacts" / "exports"),
+    show_default=True,
+    help="Directory for exported ADO-style case artifacts.",
+)
+@click.option(
+    "--measure",
+    "-m",
+    multiple=True,
+    help="Filter to specific measure name(s).",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=None,
+    help="Maximum number of cases to export.",
+)
+def export_cases_cmd(
+    input_path: str,
+    output_dir: str,
+    measure: tuple[str, ...],
+    limit: Optional[int],
+):
+    """Export normalized DAX case records in ADO-style folder artifacts."""
+    try:
+        manifest = export_cases(
+            input_path=input_path,
+            output_dir=output_dir,
+            measure_filters=measure,
+            limit=limit,
+        )
+    except Exception as e:
+        console.print(f"[red]Case export failed: {e}[/red]")
+        sys.exit(1)
+
+    console.print(
+        f"[green]Exported {manifest['exported_count']} case(s)[/green] "
+        f"to {manifest['output_dir']}"
+    )
+    console.print(f"[dim]Manifest: {Path(manifest['output_dir']) / 'manifest.json'}[/dim]")
+
+
 @cli.command()
 @click.argument("file", type=click.Path(exists=True))
 @click.option("--verbose", "-v", is_flag=True, help="Show detailed issue information")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON")
 @click.option("--output", "-o", type=click.Path(), help="Output report to HTML file")
+@click.option("--include-heuristics", is_flag=True, help="Include unconfirmed heuristic rules")
 def audit(
     file: str,
     verbose: bool,
     output_json: bool,
-    output: Optional[str]
+    output: Optional[str],
+    include_heuristics: bool,
 ):
     """Analyze VPAX file for anti-patterns and issues.
 
@@ -209,10 +323,11 @@ def audit(
 
     try:
         # Run analysis
+        confirmed_only = not include_heuristics
         if model_kind == "vpax":
-            generator = ReportGenerator(str(model_path))
+            generator = ReportGenerator(str(model_path), confirmed_only=confirmed_only)
         else:
-            generator = PBIPReportGenerator(str(model_path))
+            generator = PBIPReportGenerator(str(model_path), confirmed_only=confirmed_only)
         result = generator.generate()
 
         if output_json:
@@ -239,8 +354,8 @@ def audit(
                 console.print(f"[red]Failed to generate HTML report: {e}[/red]")
 
         # Exit with non-zero if critical/high issues found
-    if result.summary.critical_count > 0 or result.summary.high_count > 0:
-        sys.exit(1)
+        if result.summary.critical_count > 0 or result.summary.high_count > 0:
+            sys.exit(1)
 
     except Exception as e:
         console.print(f"[red]Analysis failed: {e}[/red]")
@@ -287,6 +402,17 @@ def optimize(
         qt-dax optimize model.vpax -m "Total Sales" -m "Profit %"
         qt-dax optimize model.vpax --dspy --port 54000
     """
+    def issue_field(issue, field, default=None):
+        if isinstance(issue, dict):
+            if field == "name":
+                return issue.get("name") or issue.get("rule_name") or default
+            if field == "affected_object":
+                return issue.get("affected_object") or issue.get("object_name") or default
+            if field == "suggestion":
+                return issue.get("suggestion") or issue.get("recommendation") or default
+            return issue.get(field, default)
+        return getattr(issue, field, default)
+
     try:
         model_kind, model_path = resolve_model_input(file)
     except click.ClickException as e:
@@ -316,20 +442,30 @@ def optimize(
             console.print("\n[yellow]Dry run mode - LLM optimization skipped.[/yellow]")
             console.print("Issues that would be addressed:")
             for issue in result.all_issues:
-                if measures_to_optimize and issue.affected_object not in measures_to_optimize:
+                affected = issue_field(issue, "affected_object")
+                if measures_to_optimize and affected not in measures_to_optimize:
                     continue
-                console.print(f"  - {issue.name}: {issue.suggestion or issue.description}")
+                name = issue_field(issue, "name", "")
+                suggestion = issue_field(issue, "suggestion")
+                description = issue_field(issue, "description", "")
+                label = affected or name or "<unknown>"
+                if affected and name:
+                    label = f"{affected} ({name})"
+                console.print(f"  - {label}: {suggestion or description}")
             return
 
         # Get measures with issues
         measure_issues = {}
         for issue in result.all_issues:
-            if issue.category == "dax_anti_pattern" and issue.affected_object:
-                if measures_to_optimize and issue.affected_object not in measures_to_optimize:
+            if issue_field(issue, "category") == "dax_anti_pattern":
+                affected = issue_field(issue, "affected_object")
+                if not affected:
                     continue
-                if issue.affected_object not in measure_issues:
-                    measure_issues[issue.affected_object] = []
-                measure_issues[issue.affected_object].append(issue)
+                if measures_to_optimize and affected not in measures_to_optimize:
+                    continue
+                if affected not in measure_issues:
+                    measure_issues[affected] = []
+                measure_issues[affected].append(issue)
 
         if dspy:
             try:
@@ -385,7 +521,8 @@ def optimize(
                         continue
 
                     issues_text = "\n".join(
-                        f"- {issue.name} ({issue.severity}): {issue.description}"
+                        f"- {issue_field(issue, 'name')} ({issue_field(issue, 'severity')}): "
+                        f"{issue_field(issue, 'description')}"
                         for issue in issues
                     )
 
@@ -426,18 +563,18 @@ def optimize(
                 else:
                     content = []
                     for opt in optimizations:
-                        content.append(f\"-- Measure: {opt['measure']}\")
-                        content.append(\"-- Original:\")
-                        content.append(f\"-- {opt['original'].replace(chr(10), chr(10) + '-- ')}\")
-                        content.append(\"\")
-                        content.append(f\"{opt['measure']} =\")
-                        content.append(opt[\"optimized\"])
-                        content.append(\"\")
-                        content.append(\"\")
+                        content.append(f"-- Measure: {opt['measure']}")
+                        content.append("-- Original:")
+                        content.append(f"-- {opt['original'].replace(chr(10), chr(10) + '-- ')}")
+                        content.append("")
+                        content.append(f"{opt['measure']} =")
+                        content.append(opt["optimized"])
+                        content.append("")
+                        content.append("")
 
-                    output_path.write_text(\"\\n\".join(content), encoding=\"utf-8\")
+                    output_path.write_text("\n".join(content), encoding="utf-8")
 
-                console.print(f\"\\n[green]Optimizations saved to: {output}[/green]\")
+                console.print(f"\n[green]Optimizations saved to: {output}[/green]")
 
             return
 
@@ -481,7 +618,8 @@ def optimize(
                 continue
 
             issues_text = "\n".join(
-                f"- {issue.name} ({issue.severity}): {issue.description}"
+                f"- {issue_field(issue, 'name')} ({issue_field(issue, 'severity')}): "
+                f"{issue_field(issue, 'description')}"
                 for issue in issues
             )
 
@@ -869,6 +1007,102 @@ def connect(
     except Exception as e:
         console.print(f"[red]Connection failed: {e}[/red]")
         sys.exit(1)
+
+
+@cli.command()
+def menu():
+    """Interactive menu for common workflows."""
+    while True:
+        console.print(Panel(
+            "[bold]QT DAX Menu[/bold]\n"
+            "1) Analyze model (VPAX/PBIP)\n"
+            "2) Optimize measures (LLM)\n"
+            "3) Optimize measures (DSPy + validation)\n"
+            "4) Validate optimized DAX\n"
+            "5) List Power BI Desktop instances\n"
+            "6) Exit",
+            border_style="blue"
+        ))
+
+        choice = IntPrompt.ask("Select", choices=["1", "2", "3", "4", "5", "6"])
+
+        if choice == 1:
+            file_path = _prompt_path("Model path (.vpax/.pbip/.SemanticModel)")
+            verbose = Confirm.ask("Show detailed issues?", default=False)
+            _safe_call(audit, file_path, verbose, False, None)
+        elif choice == 2:
+            file_path = _prompt_path("Model path (.vpax/.pbip/.SemanticModel)")
+            provider = Prompt.ask("Provider (blank=auto)", default="").strip() or None
+            model = Prompt.ask("Model (blank=default)", default="").strip() or None
+            output = Prompt.ask("Output file (optional)", default="").strip() or None
+            dry_run = Confirm.ask("Dry run only?", default=False)
+            measures = _prompt_measures()
+            _safe_call(
+                optimize,
+                file_path,
+                provider,
+                model,
+                output,
+                dry_run,
+                measures,
+                False,
+                None,
+                2,
+                2,
+                10000,
+                5,
+                1e-9,
+            )
+        elif choice == 3:
+            file_path = _prompt_path("Model path (.vpax/.pbip/.SemanticModel)")
+            provider = Prompt.ask("Provider", default="deepseek").strip() or "deepseek"
+            model = Prompt.ask("Model (blank=default)", default="").strip() or None
+            port = _prompt_int("Power BI Desktop port (blank=auto)", default=None)
+            output = Prompt.ask("Output file (optional)", default="").strip() or None
+            max_retries = _prompt_int("Max retries", default=2) or 2
+            warmup_runs = _prompt_int("Warmup runs", default=2) or 2
+            max_rows = _prompt_int("Max rows to compare", default=10000) or 10000
+            sample_limit = _prompt_int("Sample mismatch limit", default=5) or 5
+            measures = _prompt_measures()
+            _safe_call(
+                optimize,
+                file_path,
+                provider,
+                model,
+                output,
+                False,
+                measures,
+                True,
+                port,
+                max_retries,
+                warmup_runs,
+                max_rows,
+                sample_limit,
+                1e-9,
+            )
+        elif choice == 4:
+            original = _prompt_path("Original DAX file (.dax/.txt)")
+            optimized = _prompt_path("Optimized DAX file (.dax/.txt)")
+            port = _prompt_int("Power BI Desktop port (blank=auto)", default=None)
+            warmup_runs = _prompt_int("Warmup runs", default=2) or 2
+            max_rows = _prompt_int("Max rows to compare", default=10000) or 10000
+            sample_limit = _prompt_int("Sample mismatch limit", default=5) or 5
+            _safe_call(
+                validate,
+                original,
+                optimized,
+                port,
+                warmup_runs,
+                max_rows,
+                sample_limit,
+                1e-9,
+                False,
+                False,
+            )
+        elif choice == 5:
+            _safe_call(connect, None, True, None, None)
+        else:
+            return
 
 
 @cli.command()

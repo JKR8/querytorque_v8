@@ -24,9 +24,20 @@ if os.path.exists(adomd_path):
     except Exception as e:
         print(f"Warning: Could not pre-load ADOMD client: {e}")
 
+
+def configure_api_key() -> bool:
+    """Load DeepSeek key from environment and normalize legacy var name."""
+    key = os.environ.get("QT_DEEPSEEK_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+    if not key:
+        print("ERROR: Set QT_DEEPSEEK_API_KEY (or DEEPSEEK_API_KEY) before running.")
+        return False
+    os.environ["DEEPSEEK_API_KEY"] = key
+    return True
+
+
 def main():
-    # Set API key
-    os.environ["DEEPSEEK_API_KEY"] = "sk-fdc7c2f4536742f6a322a03c04ce79dd"
+    if not configure_api_key():
+        return 1
 
     from qt_dax.connections import PBIDesktopConnection, find_pbi_instances
     from qt_dax.validation import DAXEquivalenceValidator

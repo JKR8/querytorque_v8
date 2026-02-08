@@ -144,6 +144,34 @@ class TestMeasureDependencyIntegration:
         # Max depth should be 3 (D -> C -> B -> A)
         assert result.max_depth >= 3
 
+    def test_dependency_with_special_char_measure_names(self):
+        """Measure names with symbols should still be resolved as dependencies."""
+        from qt_dax.analyzers.measure_dependencies import MeasureDependencyAnalyzer
+
+        measures = [
+            {
+                "name": "Matrix MV CR Intensity (Scope 1 & 2)_BM",
+                "table": "ESG Trucost Climate",
+                "expression": "SUM('ESG Trucost Climate'[Revenue_AUD_mn])",
+            },
+            {
+                "name": "Matrix MV CR Intensity Switch_BM",
+                "table": "ESG Trucost Climate",
+                "expression": (
+                    "SWITCH(TRUE(), "
+                    "SELECTEDVALUE('Scope Emission Types'[Scope_Type_Code]) = 1, "
+                    "[Matrix MV CR Intensity (Scope 1 & 2)_BM], "
+                    "[Matrix MV CR Intensity (Scope 1 & 2)_BM])"
+                ),
+            },
+        ]
+
+        analyzer = MeasureDependencyAnalyzer()
+        result = analyzer.analyze(measures)
+
+        switch_node = result.nodes["matrix mv cr intensity switch_bm"]
+        assert "matrix mv cr intensity (scope 1 & 2)_bm" in switch_node.depends_on
+
 
 class TestVPAXDifferIntegration:
     """Tests for VPAX diff integration."""

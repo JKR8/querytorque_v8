@@ -27,6 +27,16 @@ if os.path.exists(adomd_path):
         pass
 
 
+def configure_api_key() -> bool:
+    """Load DeepSeek key from environment and normalize legacy var name."""
+    key = os.environ.get("QT_DEEPSEEK_API_KEY") or os.environ.get("DEEPSEEK_API_KEY")
+    if not key:
+        print("ERROR: Set QT_DEEPSEEK_API_KEY (or DEEPSEEK_API_KEY) before running.")
+        return False
+    os.environ["DEEPSEEK_API_KEY"] = key
+    return True
+
+
 def extract_measure_from_pa_query(query: str) -> tuple[str, str, str]:
     """
     Extract the measure reference from a PA query's SUMMARIZECOLUMNS.
@@ -78,7 +88,8 @@ def create_optimized_pa_query(original_query: str, measure_table: str, measure_n
 
 
 def main():
-    os.environ["DEEPSEEK_API_KEY"] = "sk-fdc7c2f4536742f6a322a03c04ce79dd"
+    if not configure_api_key():
+        return 1
 
     from qt_dax.connections import PBIDesktopConnection, find_pbi_instances
 
