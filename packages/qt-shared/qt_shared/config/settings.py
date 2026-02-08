@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     llm_model: str = ""
     manual_mode: bool = False
 
+    # Pattern selector (local Ollama or any OpenAI-compatible endpoint)
+    pattern_selector_url: str = ""
+    pattern_selector_model: str = "qwen2.5-coder:14b-instruct-q4_K_M"
+    pattern_selector_api_key: str = ""
+
     class Config:
         env_prefix = "QT_"
         env_file = ".env"

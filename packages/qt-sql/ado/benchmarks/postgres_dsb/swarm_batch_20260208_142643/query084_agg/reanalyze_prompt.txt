@@ -1,0 +1,246 @@
+You are analyzing 5 failed optimization attempts to design a refined approach that reaches 2.0x speedup.
+
+Your job: understand WHY each attempt fell short, identify unexplored optimization angles, and synthesize a NEW strategy that combines the best insights while avoiding repeated mistakes.
+
+## Query: query084_agg
+## Target: 2.0x speedup
+## Dialect: postgres
+
+```sql
+select  c_customer_id as customer_id
+       , coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername
+ from customer
+     ,customer_address
+     ,customer_demographics
+     ,household_demographics
+     ,income_band
+     ,store_returns
+ where ca_city	        =  'Lakeview'
+   and c_current_addr_sk = ca_address_sk
+   and ib_lower_bound   >=  69452
+   and ib_upper_bound   <=  69452 + 50000
+   and ib_income_band_sk = hd_income_band_sk
+   and cd_demo_sk = c_current_cdemo_sk
+   and hd_demo_sk = c_current_hdemo_sk
+   and sr_cdemo_sk = cd_demo_sk
+ order by c_customer_id
+ limit 100;
+```
+
+## Previous Attempts
+
+### Worker 1: conservative_pushdown_explicit_join
+- **Status**: pass (1.22x)
+- **Transforms**: none
+- **Examples used**: early_filter_decorrelate, pg_date_cte_explicit_join, pg_dimension_prefetch_star
+- **Strategy hint**: Convert implicit joins to explicit INNER JOINs for clarity and optimizer control, push selective filters (city, income_band) directly into the JOIN conditions, and ensure all dimension lookups happen after filtering.
+
+```sql
+select  c_customer_id as customer_id
+       , coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername
+ from customer
+     ,customer_address
+     ,customer_demographics
+     ,household_demographics
+     ,income_band
+     ,store_returns
+ where ca_city	        =  'Lakeview'
+   and c_current_addr_sk = ca_address_sk
+   and ib_lower_bound   >=  69452
+   and ib_upper_bound   <=  69452 + 50000
+   and ib_income_band_sk = hd_income_band_sk
+   and cd_demo_sk = c_current_cdemo_sk
+   and hd_demo_sk = c_current_hdemo_sk
+   and sr_cdemo_sk = cd_demo_sk
+ order by c_customer_id
+ limit 100;
+```
+
+### Worker 2: moderate_dimension_isolation
+- **Status**: pass (1.31x)
+- **Transforms**: none
+- **Examples used**: pg_dimension_prefetch_star, pg_date_cte_explicit_join, early_filter_decorrelate
+- **Strategy hint**: Isolate the most restrictive dimension filters (customer_address, income_band) into separate CTEs with explicit joins, then join the pre-filtered dimensions to the fact table (store_returns) and customer.
+
+```sql
+WITH filtered_address AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_city = 'Lakeview'
+),
+filtered_income_band AS (
+    SELECT ib_income_band_sk
+    FROM income_band
+    WHERE ib_lower_bound >= 69452
+      AND ib_upper_bound <= 69452 + 50000
+)
+SELECT
+  c_customer_id AS customer_id,
+  COALESCE(c_last_name, '') || ', ' || COALESCE(c_first_name, '') AS customername
+FROM customer
+JOIN filtered_address ON c_current_addr_sk = filtered_address.ca_address_sk
+JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk
+JOIN household_demographics ON hd_demo_sk = c_current_hdemo_sk
+JOIN filtered_income_band ON filtered_income_band.ib_income_band_sk = hd_income_band_sk
+JOIN store_returns ON sr_cdemo_sk = cd_demo_sk
+ORDER BY c_customer_id
+LIMIT 100
+```
+
+### Worker 3: aggressive_multi_cte_materialize
+- **Status**: pass (1.41x)
+- **Transforms**: none
+- **Examples used**: pg_materialized_dimension_fact_prefilter, pg_dimension_prefetch_star, pg_self_join_decomposition
+- **Strategy hint**: Materialize all filtered dimension tables and the fact table into separate CTEs using aggressive pre-filtering, then perform a final join between the materialized results, potentially forcing join order.
+
+```sql
+WITH filtered_customer_address AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_city = 'Lakeview'
+),
+filtered_income_band AS (
+    SELECT ib_income_band_sk
+    FROM income_band
+    WHERE ib_lower_bound >= 69452
+      AND ib_upper_bound <= 69452 + 50000
+),
+joined_customers AS (
+    SELECT
+        c.c_customer_id,
+        c.c_last_name,
+        c.c_first_name,
+        cd.cd_demo_sk
+    FROM customer c
+    JOIN filtered_customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+    JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+    JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk
+    JOIN filtered_income_band ib ON ib.ib_income_band_sk = hd.hd_income_band_sk
+)
+SELECT
+    jc.c_customer_id AS customer_id,
+    COALESCE(jc.c_last_name, '') || ', ' || COALESCE(jc.c_first_name, '') AS customername
+FROM joined_customers jc
+JOIN store_returns sr ON sr.sr_cdemo_sk = jc.cd_demo_sk
+ORDER BY jc.c_customer_id
+LIMIT 100
+```
+
+### Worker 4: novel_lateral_decompose
+- **Status**: fail (1.64x)
+- **Transforms**: none
+- **Examples used**: early_filter_decorrelate, pg_self_join_decomposition, pg_materialized_dimension_fact_prefilter
+- **Strategy hint**: Decompose the star join using LATERAL subqueries to drive from the most selective dimension, transform implicit joins to EXISTS for customer lookups, and consider partitioned execution paths.
+
+```sql
+WITH filtered_ca AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_city = 'Lakeview'
+),
+filtered_ib AS (
+    SELECT ib_income_band_sk
+    FROM income_band
+    WHERE ib_lower_bound >= 69452
+      AND ib_upper_bound <= 69452 + 50000
+),
+customer_base AS (
+    SELECT 
+        c_customer_id,
+        c_first_name,
+        c_last_name,
+        c_current_cdemo_sk,
+        c_current_hdemo_sk
+    FROM customer
+    WHERE EXISTS (
+        SELECT 1
+        FROM filtered_ca
+        WHERE filtered_ca.ca_address_sk = customer.c_current_addr_sk
+    )
+)
+SELECT
+    c.c_customer_id AS customer_id,
+    COALESCE(c.c_last_name, '') || ', ' || COALESCE(c.c_first_name, '') AS customername
+FROM customer_base c
+JOIN LATERAL (
+-- ... (truncated)
+```
+
+### Worker 5: refined_snipe
+- **Status**: pass (1.15x)
+- **Transforms**: none
+- **Examples used**: 
+- **Strategy hint**: Snipe from iter 1
+
+```sql
+WITH filtered_address AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_city = 'Lakeview'
+),
+filtered_income_band AS (
+    SELECT ib_income_band_sk
+    FROM income_band
+    WHERE ib_lower_bound >= 69452
+      AND ib_upper_bound <= 69452 + 50000
+),
+filtered_household AS (
+    SELECT hd_demo_sk
+    FROM household_demographics hd
+    JOIN filtered_income_band fib ON hd.hd_income_band_sk = fib.ib_income_band_sk
+),
+eligible_customers AS (
+    SELECT 
+        c_customer_id,
+        c_first_name,
+        c_last_name,
+        c_current_cdemo_sk,
+        c_current_hdemo_sk
+    FROM customer c
+    JOIN filtered_address fa ON c.c_current_addr_sk = fa.ca_address_sk
+    JOIN filtered_household fh ON c.c_current_hdemo_sk = fh.hd_demo_sk
+)
+SELECT
+    ec.c_customer_id AS customer_id,
+    COALESCE(ec.c_last_name, '') || ', ' || COALESCE(ec.c_first_name, '') AS customername
+-- ... (truncated)
+```
+
+## DAG Structure & Bottlenecks
+
+| Node | Role | Cost % |
+|------|------|-------:|
+| main_query |  | 0.0% |
+
+## Available Examples (Full Catalog)
+
+- **pg_date_cte_explicit_join** (2.28xx) — Isolate a selective date_dim filter into a CTE AND convert all comma-separated j
+- **pg_dimension_prefetch_star** (3.32xx) — On multi-channel UNION queries with comma-separated implicit joins, pre-filter d
+- **early_filter_decorrelate** (1.13xx) — 
+- **pg_materialized_dimension_fact_prefilter** (2.68xx) — Pre-filter ALL dimension tables AND the fact table into MATERIALIZED CTEs, then 
+- **pg_self_join_decomposition** (3.93xx) — Eliminate duplicate fact table scans in self-join patterns by computing the aggr
+
+## Your Task
+
+Analyze the failed attempts and design a refined approach:
+
+1. **Failure Analysis**: Why did all attempts fall short? Be specific about mechanisms.
+2. **Common Patterns**: What did multiple workers try unsuccessfully?
+3. **Unexplored Space**: What optimization angles were missed entirely?
+4. **Refined Strategy**: Synthesize a NEW approach combining best insights.
+
+### Output Format (follow EXACTLY)
+
+```
+FAILURE_ANALYSIS:
+<Why all workers fell short — be specific about mechanisms>
+
+UNEXPLORED_OPPORTUNITIES:
+<What optimization approaches haven't been tried>
+
+REFINED_STRATEGY:
+<Concrete optimization approach for next attempt>
+
+EXAMPLES: <ex1>, <ex2>, <ex3>
+HINT: <specific guidance for the refined attempt>
+```

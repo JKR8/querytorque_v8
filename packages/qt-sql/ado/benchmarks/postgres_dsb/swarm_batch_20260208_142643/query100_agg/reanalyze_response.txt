@@ -1,0 +1,23 @@
+FAILURE_ANALYSIS:
+All workers fell short due to fundamental PostgreSQL optimizer limitations with CTE materialization and self-join patterns. Specifically:
+1. **CTE Materialization Overhead**: Workers 3-5 created multiple CTEs that PostgreSQL materializes (acts as optimization fences), preventing filter pushdown and join reordering. This forced sequential execution of large intermediate results.
+2. **Inefficient Self-Join Strategy**: The core bottleneck is the `store_sales` self-join on `ss_ticket_number`. Workers 1-2 preserved the original self-join without reducing the Cartesian product size early. Workers 3-4 attempted decomposition but still generated large intermediate sets before applying item filters.
+3. **Missing Join Elimination**: No worker eliminated the `customer_address` join (which has no filters and only provides `ca_address_sk` for equality join) or recognized that `customer_demographics` could be joined directly to `store_sales` via `customer`.
+4. **Incorrect Cardinality Reduction**: Worker 4's EXISTS approach and Worker 3's materialization actually increased data movement. PostgreSQL's planner couldn't leverage indexes effectively with CTE barriers.
+
+UNEXPLORED_OPPORTUNITIES:
+1. **Derived Table with Early Aggregation**: Pre-aggregate `store_sales` by `ss_ticket_number` and `ss_item_sk` after applying all filters, then self-join on the smaller set.
+2. **Window Function for Pair Generation**: Use `LAG` or array functions within tickets to generate item pairs without a full self-join.
+3. **Lateral Join for Correlated Filtering**: Use `LATERAL` to correlate item filters with sales data in a single scan.
+4. **Join Order Optimization**: Force join order where highly selective filters (`item1.i_category`, `item2.i_manager_id`, `cd_marital_status`) reduce the fact table first.
+5. **Eliminate Redundant Joins**: Remove `customer_address` entirely since it's only an equality join with no filters.
+
+REFINED_STRATEGY:
+1. **Eliminate `customer_address` join** - it's unnecessary for filtering or grouping.
+2. **Create a single filtered fact CTE** that joins `store_sales` with all dimension filters except items, applying `ss_list_price` and date/year filters early.
+3. **Use two derived tables** for item1 and item2 conditions, joining each to the filtered fact CTE on `ss_item_sk`, then self-join on `ss_ticket_number` with inequality.
+4. **Force early aggregation** by grouping on `ss_ticket_number` in the filtered fact CTE to reduce rows before the self-join.
+5. **Avoid CTE materialization barriers** by using subqueries or `LATERAL` joins to keep everything in a single query block.
+
+EXAMPLES: pg_self_join_decomposition, early_filter_decorrelate, pg_dimension_prefetch_star
+HINT: Pre-filter store_sales with all selective dimension filters (date, demographics) first, then join to item tables in separate subqueries, then self-join the reduced sets. Use explicit JOIN syntax without CTE materialization barriers.

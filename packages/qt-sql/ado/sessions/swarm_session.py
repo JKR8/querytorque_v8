@@ -171,7 +171,10 @@ class SwarmSession(OptimizationSession):
             self.original_sql, engine=self.engine, k=12
         )
         all_available = self.pipeline._list_gold_examples(self.engine)
-        self._stage(self.query_id, f"FAISS: {len(faiss_examples)} examples ({_fmt_elapsed(time.time() - t0)})")
+        regression_warnings = self.pipeline._find_regression_warnings(
+            self.original_sql, engine=self.engine, k=3
+        )
+        self._stage(self.query_id, f"FAISS: {len(faiss_examples)} examples, {len(regression_warnings)} warnings ({_fmt_elapsed(time.time() - t0)})")
 
         # Build fan-out prompt
         fan_out_prompt = build_fan_out_prompt(
@@ -181,6 +184,7 @@ class SwarmSession(OptimizationSession):
             costs=costs,
             faiss_examples=faiss_examples,
             all_available_examples=all_available,
+            regression_warnings=regression_warnings,
             dialect=self.dialect,
         )
 
@@ -206,11 +210,6 @@ class SwarmSession(OptimizationSession):
         self._stage(self.query_id, f"ANALYST: {len(assignments)} workers assigned ({_fmt_elapsed(time.time() - t0)})")
         for a in assignments:
             self._stage(self.query_id, f"  W{a.worker_id}: {a.strategy}")
-
-        # Regression warnings (shared across all workers)
-        regression_warnings = self.pipeline._find_regression_warnings(
-            self.original_sql, engine=self.engine, k=2
-        )
 
         # Global learnings
         global_learnings = self.pipeline.learner.build_learning_summary() or None

@@ -1,0 +1,57 @@
+WITH filtered_store AS (
+    SELECT s_store_sk
+    FROM store
+    WHERE s_state IN ('MI', 'ND', 'TX')
+),
+filtered_customer AS (
+    SELECT c_customer_sk, c_customer_id
+    FROM customer
+    JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk
+    WHERE cd_marital_status IN ('M', 'M')
+      AND cd_education_status IN ('College', 'College')
+      AND cd_gender = 'M'
+      AND c_birth_month = 9
+      AND c_birth_year BETWEEN 1979 AND 1985
+),
+filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2000
+),
+filtered_returns AS (
+    SELECT
+        sr_customer_sk,
+        sr_store_sk,
+        sr_reason_sk,
+        SUM(SR_REFUNDED_CASH) AS total_return
+    FROM store_returns
+    JOIN filtered_date ON sr_returned_date_sk = filtered_date.d_date_sk
+    JOIN filtered_store ON sr_store_sk = filtered_store.s_store_sk
+    JOIN filtered_customer ON sr_customer_sk = filtered_customer.c_customer_sk
+    WHERE sr_return_amt / sr_return_quantity BETWEEN 16 AND 75
+    GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk
+),
+store_averages AS (
+    SELECT
+        sr_store_sk,
+        AVG(total_return) * 1.2 AS store_avg_threshold
+    FROM filtered_returns
+    GROUP BY sr_store_sk
+),
+customer_returns AS (
+    SELECT
+        sr_customer_sk AS ctr_customer_sk,
+        sr_store_sk AS ctr_store_sk,
+        sr_reason_sk AS ctr_reason_sk,
+        total_return AS ctr_total_return
+    FROM filtered_returns
+    WHERE sr_reason_sk BETWEEN 25 AND 28
+)
+SELECT
+    c.c_customer_id
+FROM customer_returns ctr1
+JOIN store_averages sa ON ctr1.ctr_store_sk = sa.sr_store_sk
+JOIN filtered_customer c ON ctr1.ctr_customer_sk = c.c_customer_sk
+WHERE ctr1.ctr_total_return > sa.store_avg_threshold
+ORDER BY c.c_customer_id
+LIMIT 100

@@ -2,6 +2,45 @@
 
 Iterative SQL optimization engine: parse query structure, retrieve similar examples via FAISS, generate rewrites with LLM, validate with real execution timing.
 
+## Architecture (ASCII)
+
+```text
++---------------------- Inputs -----------------------+
+| Benchmark config | SQL queries | Examples/Constraints|
+| FAISS index | LLM provider | History/Learnings      |
++-------------------------------+---------------------+
+                                |
+                                v
++------------------------- Core Pipeline ----------------------+
+| 1 Parse -> DAG + cost (pipeline.py)                           |
+| 2 FAISS retrieval: examples + regressions (knowledge.py)      |
+| 3 Prompt + N candidates (node_prompter.py, generate.py,       |
+|    sql_rewriter.py)                                           |
+| 4 Syntax gate (sqlglot)                                       |
+| 5 Validate + score (validate.py; DuckDB/PG validators)        |
++-------------------------------+------------------------------+
+                                |
+                 +--------------+--------------+
+                 |                             |
+                 v                             v
+      +---------------------+        +------------------------+
+      | Analyst (Expert)    |        | Swarm (fan-out + snipe)|
+      | analyst.py +        |        | swarm_prep/run.py      |
+      | analyst_session.py  |        | 4 workers -> snipe     |
+      | iterates on same    |        | batch or single query  |
+      | original SQL        |        |                        |
+      +---------------------+        +------------------------+
+                 |                             |
+                 +--------------+--------------+
+                                |
+                                v
++------------------------ Outputs -----------------------------+
+| Artifacts: prompt/response/sql/validation (store.py)          |
+| Learnings + leaderboards + history (learn.py)                 |
+| Optional promotion to next state (pipeline.promote)           |
++--------------------------------------------------------------+
+```
+
 ## Environment Setup
 
 LLM config lives in the **project root** `.env` file (`QueryTorque_V8/.env`).

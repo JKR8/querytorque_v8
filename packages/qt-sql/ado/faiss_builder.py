@@ -1,7 +1,8 @@
-"""FAISS index builder for ADO knowledge base.
+"""Tag-based example index builder for ADO knowledge base.
 
-Builds a FAISS similarity index from gold examples AND regression examples
-in ado/examples/. Each example's original SQL is vectorized and indexed.
+Builds a tag similarity index from gold examples AND regression examples
+in ado/examples/. Each example's original SQL is parsed for keyword/table
+tags and indexed for overlap-based matching.
 
 Gold examples (type=gold): proven rewrites to emulate
 Regression examples (type=regression): failed rewrites to avoid
@@ -15,11 +16,10 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
+import re
+from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
+from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +27,8 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 EXAMPLES_DIR = BASE_DIR / "examples"
 MODELS_DIR = BASE_DIR / "models"
-INDEX_FILE = MODELS_DIR / "similarity_index.faiss"
+TAGS_FILE = MODELS_DIR / "similarity_tags.json"
 METADATA_FILE = MODELS_DIR / "similarity_metadata.json"
-FEATURE_STATS_FILE = MODELS_DIR / "feature_stats.json"
 
 
 # =============================================================================
@@ -83,7 +82,6 @@ class SQLNormalizer:
             normalized = ast.sql(dialect=dialect)
 
             # Additional whitespace normalization
-            import re
             normalized = re.sub(r'\s+', ' ', normalized).strip()
 
             return normalized
@@ -91,7 +89,6 @@ class SQLNormalizer:
         except Exception as e:
             logger.warning(f"SQL normalization failed: {e}")
             # Fallback: basic whitespace normalization
-            import re
             return re.sub(r'\s+', ' ', sql).strip()
 
     def _replace_literals(self, node):
@@ -121,174 +118,236 @@ class SQLNormalizer:
 
 
 # =============================================================================
-# AST Vectorizer (inline for self-containment)
+# Tag Extraction
 # =============================================================================
 
-class ASTVectorizer:
-    """Convert SQL queries to feature vectors using AST analysis.
+# SQL keywords to detect as tags
+_SQL_KEYWORDS = {
+    "intersect", "except", "union", "rollup", "cube", "grouping",
+    "exists", "case", "having", "distinct", "lateral", "recursive",
+    "between", "like", "in",
+}
 
-    This is a copy of scripts/vectorize_queries.py ASTVectorizer for
-    self-containment within the ado/ module.
+# Window function keywords
+_WINDOW_KEYWORDS = {"window", "rank", "row_number", "dense_rank", "ntile", "lead", "lag"}
+
+
+def extract_tags(sql: str, dialect: str = "duckdb") -> Set[str]:
+    """Extract tags from SQL using AST analysis with regex fallback.
+
+    Tags include:
+    - Table names (lowercased)
+    - SQL keywords present (intersect, union, rollup, etc.)
+    - Structural patterns (self_join, repeated_scan, multi_cte, correlated_subquery)
+
+    Args:
+        sql: SQL query text
+        dialect: SQL dialect for parsing
+
+    Returns:
+        Set of tag strings
     """
+    tags: Set[str] = set()
 
-    NODE_TYPES = [
-        'Select', 'From', 'Where', 'Join', 'Group', 'Having', 'Order', 'Limit',
-        'With', 'CTE', 'Union', 'Subquery', 'Column', 'Table', 'Alias',
-        'EQ', 'GT', 'LT', 'GTE', 'LTE', 'NEQ', 'In', 'Like', 'Between',
-        'And', 'Or', 'Not', 'Is', 'IsNull',
-        'Sum', 'Count', 'Avg', 'Min', 'Max', 'StdDev',
-        'Cast', 'Case', 'Window', 'RowNumber', 'Rank'
-    ]
+    try:
+        import sqlglot
+        from sqlglot import exp
 
-    def __init__(self):
-        self.feature_names = self._build_feature_names()
+        ast = sqlglot.parse_one(sql, dialect=dialect)
 
-    def _build_feature_names(self) -> List[str]:
-        features = []
-        # Node type counts (40)
-        features.extend([f"node_{nt.lower()}" for nt in self.NODE_TYPES])
-        # Depth metrics (5)
-        features.extend(["max_depth", "max_subquery_depth", "max_join_depth", "cte_depth", "union_depth"])
-        # Cardinality (10)
-        features.extend([
-            "num_tables", "num_select_cols", "num_where_conditions", "num_joins",
-            "num_ctes", "num_subqueries", "num_aggregates", "num_window_functions",
-            "num_unions", "num_case_statements"
-        ])
-        # Pattern indicators (30)
-        features.extend([
-            "has_cte", "has_union", "has_union_all", "has_subquery", "has_correlated_subquery",
-            "has_aggregation", "has_group_by", "has_having", "has_window_function",
-            "has_self_join", "has_cross_join", "has_left_join", "has_outer_join",
-            "has_distinct", "has_limit", "has_order_by", "has_multiple_tables",
-            "has_date_filter", "has_in_clause", "has_exists", "has_not_exists",
-            "has_like", "has_between", "has_case_when", "has_cast", "has_null_check",
-            "has_complex_predicate", "has_nested_aggregation", "has_multiple_ctes", "has_recursive_cte"
-        ])
-        # Complexity (5)
-        features.extend([
-            "total_nodes", "avg_branching_factor", "predicate_complexity",
-            "select_complexity", "join_complexity"
-        ])
-        return features
+        # 1. Table names
+        table_names = []
+        for t in ast.find_all(exp.Table):
+            name = t.name.lower() if t.name else ""
+            if name:
+                table_names.append(name)
+                tags.add(name)
 
-    @property
-    def num_features(self) -> int:
-        return len(self.feature_names)
+        # 2. SQL keywords via AST node types
+        if list(ast.find_all(exp.Intersect)):
+            tags.add("intersect")
+        if list(ast.find_all(exp.Except)):
+            tags.add("except")
+        if list(ast.find_all(exp.Union)):
+            tags.add("union")
+        if list(ast.find_all(exp.Exists)):
+            tags.add("exists")
+        if list(ast.find_all(exp.Case)):
+            tags.add("case")
+        if list(ast.find_all(exp.Having)):
+            tags.add("having")
+        if list(ast.find_all(exp.Distinct)):
+            tags.add("distinct")
+        if list(ast.find_all(exp.Between)):
+            tags.add("between")
+        if list(ast.find_all(exp.Like)):
+            tags.add("like")
+        if list(ast.find_all(exp.In)):
+            tags.add("in")
+        if list(ast.find_all(exp.Window)):
+            tags.add("window")
+        if list(ast.find_all(exp.Subquery)):
+            tags.add("subquery")
+        if list(ast.find_all(exp.CTE)):
+            tags.add("cte")
+        if list(ast.find_all(exp.Join)):
+            tags.add("join")
+        if list(ast.find_all(exp.Group)):
+            tags.add("group_by")
+        if list(ast.find_all(exp.AggFunc)):
+            tags.add("aggregate")
+        if list(ast.find_all(exp.Order)):
+            tags.add("order_by")
 
-    def vectorize(self, sql: str, dialect: str = "postgres") -> np.ndarray:
-        """Convert SQL query to feature vector."""
-        try:
-            import sqlglot
-            from sqlglot import exp
-            from collections import Counter
+        # Window function subtypes
+        if list(ast.find_all(exp.Rank)):
+            tags.add("rank")
+        if list(ast.find_all(exp.RowNumber)):
+            tags.add("row_number")
 
-            ast = sqlglot.parse_one(sql, dialect=dialect)
-            features = []
+        # ROLLUP / CUBE / GROUPING — check via SQL text since sqlglot
+        # represents these differently across versions
+        sql_upper = sql.upper()
+        if "ROLLUP" in sql_upper:
+            tags.add("rollup")
+        if "CUBE" in sql_upper:
+            tags.add("cube")
+        if "GROUPING" in sql_upper:
+            tags.add("grouping")
+        if "LATERAL" in sql_upper:
+            tags.add("lateral")
+        if re.search(r'\bRECURSIVE\b', sql_upper):
+            tags.add("recursive")
 
-            # 1. Node type counts
-            node_counts = Counter()
-            for node in ast.walk():
-                node_type = type(node).__name__
-                if node_type in self.NODE_TYPES:
-                    node_counts[node_type] += 1
-            for nt in self.NODE_TYPES:
-                features.append(float(node_counts.get(nt, 0)))
+        # 3. Structural patterns
+        # Self-join: same table appears more than once
+        name_counts = Counter(table_names)
+        for name, count in name_counts.items():
+            if count > 1:
+                tags.add("self_join")
+                break
 
-            # 2. Depth metrics
-            max_depth = max_subquery_depth = max_join_depth = cte_depth = union_depth = 0
+        # Repeated scan: a table appears 3+ times
+        for name, count in name_counts.items():
+            if count >= 3:
+                tags.add("repeated_scan")
+                break
 
-            def traverse(node, depth=0, sq_depth=0, j_depth=0):
-                nonlocal max_depth, max_subquery_depth, max_join_depth, cte_depth, union_depth
-                max_depth = max(max_depth, depth)
-                if isinstance(node, exp.Subquery):
-                    sq_depth += 1
-                    max_subquery_depth = max(max_subquery_depth, sq_depth)
-                if isinstance(node, exp.Join):
-                    j_depth += 1
-                    max_join_depth = max(max_join_depth, j_depth)
-                if isinstance(node, exp.CTE):
-                    cte_depth = max(cte_depth, depth)
-                if isinstance(node, exp.Union):
-                    union_depth = max(union_depth, depth)
-                for child in node.iter_expressions():
-                    traverse(child, depth + 1, sq_depth, j_depth)
+        # Multi-CTE: 2+ CTEs
+        ctes = list(ast.find_all(exp.CTE))
+        if len(ctes) >= 2:
+            tags.add("multi_cte")
 
-            traverse(ast)
-            features.extend([float(max_depth), float(max_subquery_depth), float(max_join_depth),
-                           float(cte_depth), float(union_depth)])
+        # Correlated subquery: subquery referencing outer columns
+        for sq in ast.find_all(exp.Subquery):
+            # Simple heuristic: if subquery contains Column refs that don't
+            # match tables inside the subquery, it's likely correlated
+            sq_tables = {t.name.lower() for t in sq.find_all(exp.Table) if t.name}
+            for col in sq.find_all(exp.Column):
+                tbl = col.table.lower() if col.table else ""
+                if tbl and tbl not in sq_tables:
+                    tags.add("correlated_subquery")
+                    break
+            if "correlated_subquery" in tags:
+                break
 
-            # 3. Cardinality
-            num_tables = len(list(ast.find_all(exp.Table)))
-            num_select_cols = sum(len(s.expressions) if s.expressions else 0 for s in ast.find_all(exp.Select))
-            num_where_conditions = 0
-            for where in ast.find_all(exp.Where):
-                num_where_conditions += len(list(where.find_all((
-                    exp.EQ, exp.GT, exp.LT, exp.GTE, exp.LTE, exp.NEQ, exp.In, exp.Like, exp.Between, exp.Is
-                ))))
-            num_joins = len(list(ast.find_all(exp.Join)))
-            num_ctes = len(list(ast.find_all(exp.CTE)))
-            num_subqueries = len(list(ast.find_all(exp.Subquery)))
-            num_aggregates = len(list(ast.find_all(exp.AggFunc)))
-            num_window_functions = len(list(ast.find_all(exp.Window)))
-            num_unions = len(list(ast.find_all(exp.Union)))
-            num_case_statements = len(list(ast.find_all(exp.Case)))
-            features.extend([float(num_tables), float(num_select_cols), float(num_where_conditions),
-                           float(num_joins), float(num_ctes), float(num_subqueries),
-                           float(num_aggregates), float(num_window_functions),
-                           float(num_unions), float(num_case_statements)])
+        # Left/outer join
+        for j in ast.find_all(exp.Join):
+            j_str = str(j).lower()
+            if "left" in j_str:
+                tags.add("left_join")
+            if "outer" in j_str:
+                tags.add("outer_join")
+            if "cross" in j_str:
+                tags.add("cross_join")
 
-            # 4. Pattern indicators (30 binary features)
-            table_names = [str(t.this).lower() for t in ast.find_all(exp.Table) if t.this]
-            patterns = [
-                1.0 if node_counts.get('With', 0) > 0 else 0.0,  # has_cte
-                1.0 if node_counts.get('Union', 0) > 0 else 0.0,  # has_union
-                1.0 if any(u.args.get('distinct') is False for u in ast.find_all(exp.Union)) else 0.0,  # has_union_all
-                1.0 if node_counts.get('Subquery', 0) > 0 else 0.0,  # has_subquery
-                1.0 if any(sq.find(exp.Column) for sq in ast.find_all(exp.Subquery)) else 0.0,  # has_correlated
-                1.0 if node_counts.get('Sum', 0) + node_counts.get('Count', 0) > 0 else 0.0,  # has_aggregation
-                1.0 if node_counts.get('Group', 0) > 0 else 0.0,  # has_group_by
-                1.0 if node_counts.get('Having', 0) > 0 else 0.0,  # has_having
-                1.0 if node_counts.get('Window', 0) > 0 else 0.0,  # has_window_function
-                1.0 if len(table_names) != len(set(table_names)) else 0.0,  # has_self_join
-                1.0 if any('cross' in str(j).lower() for j in ast.find_all(exp.Join)) else 0.0,  # has_cross_join
-                1.0 if any('left' in str(j).lower() for j in ast.find_all(exp.Join)) else 0.0,  # has_left_join
-                1.0 if any('outer' in str(j).lower() for j in ast.find_all(exp.Join)) else 0.0,  # has_outer_join
-                1.0 if ast.find(exp.Distinct) else 0.0,  # has_distinct
-                1.0 if node_counts.get('Limit', 0) > 0 else 0.0,  # has_limit
-                1.0 if node_counts.get('Order', 0) > 0 else 0.0,  # has_order_by
-                1.0 if len(table_names) > 1 else 0.0,  # has_multiple_tables
-                1.0 if any('date' in str(c).lower() for c in ast.find_all(exp.Column)) else 0.0,  # has_date_filter
-                1.0 if node_counts.get('In', 0) > 0 else 0.0,  # has_in_clause
-                1.0 if ast.find(exp.Exists) else 0.0,  # has_exists
-                1.0 if any(n.find(exp.Exists) for n in ast.find_all(exp.Not)) else 0.0,  # has_not_exists
-                1.0 if node_counts.get('Like', 0) > 0 else 0.0,  # has_like
-                1.0 if node_counts.get('Between', 0) > 0 else 0.0,  # has_between
-                1.0 if node_counts.get('Case', 0) > 0 else 0.0,  # has_case_when
-                1.0 if node_counts.get('Cast', 0) > 0 else 0.0,  # has_cast
-                1.0 if node_counts.get('IsNull', 0) + node_counts.get('Is', 0) > 0 else 0.0,  # has_null_check
-                1.0 if node_counts.get('And', 0) > 2 or node_counts.get('Or', 0) > 1 else 0.0,  # has_complex_predicate
-                1.0 if any(a.find(exp.AggFunc) for a in ast.find_all(exp.AggFunc)) else 0.0,  # has_nested_aggregation
-                1.0 if node_counts.get('CTE', 0) > 1 else 0.0,  # has_multiple_ctes
-                1.0 if any(c.find(exp.Union) for c in ast.find_all(exp.CTE)) else 0.0,  # has_recursive_cte
-            ]
-            features.extend(patterns)
+    except Exception as e:
+        logger.debug(f"AST tag extraction failed, falling back to regex: {e}")
+        # Regex fallback for fragments
+        _extract_tags_regex(sql, tags)
 
-            # 5. Complexity metrics
-            total_nodes = sum(1 for _ in ast.walk())
-            branching_factors = [len(list(n.iter_expressions())) for n in ast.walk() if list(n.iter_expressions())]
-            avg_branching = np.mean(branching_factors) if branching_factors else 0.0
-            predicate_complexity = node_counts.get('And', 0) + node_counts.get('Or', 0) + node_counts.get('Not', 0)
-            select_complexity = sum(len(s.expressions) if s.expressions else 0 for s in ast.find_all(exp.Select))
-            join_complexity = sum(len(list(j.find_all((exp.EQ, exp.And)))) for j in ast.find_all(exp.Join))
-            features.extend([float(total_nodes), float(avg_branching), float(predicate_complexity),
-                           float(select_complexity), float(join_complexity)])
+    # Always do regex fallback for keywords AST might miss
+    _extract_tags_regex_keywords(sql, tags)
 
-            return np.array(features, dtype=np.float32)
+    return tags
 
-        except Exception as e:
-            logger.warning(f"Failed to vectorize SQL: {e}")
-            return np.zeros(self.num_features, dtype=np.float32)
+
+def _extract_tags_regex(sql: str, tags: Set[str]) -> None:
+    """Regex-based tag extraction fallback for SQL fragments."""
+    sql_upper = sql.upper()
+
+    # Table name patterns (FROM/JOIN followed by identifier)
+    for m in re.finditer(r'(?:FROM|JOIN)\s+([a-zA-Z_]\w*)', sql, re.IGNORECASE):
+        tags.add(m.group(1).lower())
+
+    # SQL keywords
+    for kw in _SQL_KEYWORDS | _WINDOW_KEYWORDS:
+        if re.search(rf'\b{kw.upper()}\b', sql_upper):
+            tags.add(kw)
+
+    # Structural
+    if "CTE" not in tags and "WITH" in sql_upper:
+        tags.add("cte")
+    if re.search(r'\bROLLUP\b', sql_upper):
+        tags.add("rollup")
+    if re.search(r'\bGROUPING\b', sql_upper):
+        tags.add("grouping")
+
+
+def _extract_tags_regex_keywords(sql: str, tags: Set[str]) -> None:
+    """Supplement AST tags with regex keyword detection for edge cases."""
+    sql_upper = sql.upper()
+
+    # Keywords that AST might miss on fragments
+    if "ROLLUP" in sql_upper and "rollup" not in tags:
+        tags.add("rollup")
+    if "GROUPING" in sql_upper and "grouping" not in tags:
+        tags.add("grouping")
+    if "CUBE" in sql_upper and "cube" not in tags:
+        tags.add("cube")
+    if re.search(r'\bOR\b', sql_upper):
+        tags.add("or_predicate")
+
+
+# =============================================================================
+# Category Classification
+# =============================================================================
+
+def classify_category(tags: Set[str]) -> str:
+    """Assign a category based on dominant SQL patterns in tags.
+
+    Categories:
+    - set_operations: intersect, except, or union-dominated
+    - aggregation_rewrite: rollup, grouping, or case-in-aggregate
+    - subquery_elimination: correlated subquery, exists, or in-subquery
+    - scan_consolidation: repeated_scan or self_join
+    - join_reorder: multi-table joins without the above
+    - filter_pushdown: cte + filter-heavy structure
+    - general: fallback
+
+    Args:
+        tags: Set of tags from extract_tags()
+
+    Returns:
+        Category string
+    """
+    if tags & {"intersect", "except"}:
+        return "set_operations"
+    if tags & {"rollup", "cube", "grouping"}:
+        return "aggregation_rewrite"
+    if tags & {"correlated_subquery"} or ("exists" in tags and "subquery" in tags):
+        return "subquery_elimination"
+    if tags & {"repeated_scan", "self_join"}:
+        return "scan_consolidation"
+    if "union" in tags and "case" not in tags:
+        return "set_operations"
+    if "cte" in tags and "multi_cte" not in tags:
+        return "filter_pushdown"
+    if len(tags & {"join", "self_join", "left_join", "outer_join", "cross_join"}) >= 2:
+        return "join_reorder"
+    if "case" in tags and "aggregate" in tags:
+        return "aggregation_rewrite"
+    return "general"
 
 
 # =============================================================================
@@ -301,8 +360,6 @@ class ASTVectorizer:
 
 def _clean_sql_markers(sql: str) -> str:
     """Remove [xxx]: markers from example SQL and extract main query."""
-    import re
-
     # Remove lines with [xxx]: markers
     lines = sql.split('\n')
     clean_lines = []
@@ -329,7 +386,7 @@ def _clean_sql_markers(sql: str) -> str:
 
 
 def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
-    """Load examples from multiple directories for FAISS indexing.
+    """Load examples from multiple directories for indexing.
 
     Loads from:
     - ado/examples/ (generic PostgreSQL patterns)
@@ -429,180 +486,188 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
 
 
 # =============================================================================
-# FAISS Index Building
+# Tag Index Building
 # =============================================================================
 
-def build_faiss_index(
+def _extract_description_tags(description: str) -> Set[str]:
+    """Extract signal words from example description text."""
+    if not description:
+        return set()
+
+    desc_lower = description.lower()
+    signal_words = set()
+
+    # Known transform/pattern terms in descriptions
+    patterns = [
+        "decorrelate", "pushdown", "early_filter", "early filter",
+        "date_cte", "date cte", "dimension_cte", "dimension cte",
+        "prefetch", "materialize", "single_pass", "single pass",
+        "or_to_union", "or to union", "intersect_to_exists",
+        "intersect to exists", "union_cte_split", "union cte split",
+        "rollup", "grouping", "bitmap", "windowing", "window",
+        "correlated", "self-join", "self join", "repeated scan",
+    ]
+
+    for pat in patterns:
+        if pat in desc_lower:
+            # Normalize to underscore form
+            signal_words.add(pat.replace(" ", "_").replace("-", "_"))
+
+    return signal_words
+
+
+def build_tag_index(
     examples: List[Tuple[str, str, Dict]],
-    dialect: str = "postgres",
-) -> Tuple[Optional[object], Dict, Dict]:
-    """Build FAISS index from examples.
+) -> Tuple[List[Dict], Dict]:
+    """Build tag index from examples.
+
+    For each example, extracts tags from original SQL and description,
+    classifies category, and stores in a searchable format.
 
     Args:
         examples: List of (example_id, sql_text, metadata) tuples
-        dialect: SQL dialect for parsing
 
     Returns:
-        (faiss_index, metadata_dict, feature_stats_dict)
+        (tag_entries, metadata_dict)
     """
-    try:
-        import faiss
-    except ImportError:
-        logger.error("FAISS not installed. Run: pip install faiss-cpu")
-        return None, {}, {}
-
     if not examples:
         logger.warning("No examples to index")
-        return None, {}, {}
+        return [], {}
 
-    normalizer = SQLNormalizer()
-    vectorizer = ASTVectorizer()
-    vectors = []
+    tag_entries = []
     query_metadata = {}
 
-    print(f"Vectorizing {len(examples)} examples...")
-    print("  Fingerprint (normalize literals/identifiers) → AST vectorize")
+    print(f"Extracting tags from {len(examples)} examples...")
 
     for i, (example_id, sql_text, meta) in enumerate(examples):
-        # Use per-example dialect based on engine (DuckDB vs PostgreSQL syntax differs)
         engine = meta.get("engine", "unknown")
         if engine in ("postgres", "postgresql"):
-            ex_dialect = "postgres"
+            dialect = "postgres"
         elif engine == "duckdb":
-            ex_dialect = "duckdb"
+            dialect = "duckdb"
         else:
-            ex_dialect = dialect  # fallback to global default
+            dialect = "duckdb"
 
-        # Fingerprint first: replace literals with neutral constants, lowercase identifiers
-        fingerprinted = normalizer.normalize(sql_text, dialect=ex_dialect)
-        vector = vectorizer.vectorize(fingerprinted, dialect=ex_dialect)
-        vectors.append(vector)
+        # Extract tags from SQL
+        tags = extract_tags(sql_text, dialect=dialect)
 
-        query_metadata[example_id] = {
-            "vector_index": i,
-            "name": meta.get("name", example_id),
-            "description": meta.get("description", ""),
-            "verified_speedup": meta.get("verified_speedup", "unknown"),
-            "transforms": meta.get("transforms", []),
-            "winning_transform": meta.get("transforms", [""])[0] if meta.get("transforms") else "",
-            "principle": meta.get("principle", ""),
-            "key_insight": meta.get("key_insight", ""),
-            "engine": meta.get("engine", "unknown"),
+        # Add description-based tags
+        desc_tags = _extract_description_tags(meta.get("description", ""))
+        tags |= desc_tags
+
+        # Classify category
+        category = classify_category(tags)
+
+        tag_entry = {
+            "id": example_id,
+            "tags": sorted(tags),
+            "category": category,
+            "engine": engine,
             "type": meta.get("type", "gold"),
+            "metadata": {
+                "name": meta.get("name", example_id),
+                "description": meta.get("description", ""),
+                "verified_speedup": meta.get("verified_speedup", "unknown"),
+                "transforms": meta.get("transforms", []),
+                "winning_transform": meta.get("transforms", [""])[0] if meta.get("transforms") else "",
+                "principle": meta.get("principle", ""),
+                "key_insight": meta.get("key_insight", ""),
+                "engine": engine,
+                "type": meta.get("type", "gold"),
+            },
         }
+        tag_entries.append(tag_entry)
 
-        print(f"  [{i+1}/{len(examples)}] {example_id}: {np.count_nonzero(vector)} non-zero features")
+        # Also store in flat metadata for backward compat
+        query_metadata[example_id] = tag_entry["metadata"]
 
-    # Stack vectors
-    vectors_array = np.vstack(vectors).astype('float32')
+        print(f"  [{i+1}/{len(examples)}] {example_id}: {len(tags)} tags, category={category}")
 
-    # Compute feature statistics for z-score normalization
-    mean = np.mean(vectors_array, axis=0)
-    std = np.std(vectors_array, axis=0)
-    std[std == 0] = 1.0  # Avoid division by zero
-
-    feature_stats = {
-        "mean": mean.tolist(),
-        "std": std.tolist(),
-        "num_features": len(mean),
-    }
-
-    # Apply z-score normalization
-    normalized = (vectors_array - mean) / std
-
-    # L2 normalize for cosine similarity
-    faiss.normalize_L2(normalized)
-
-    # Build index
-    dimension = normalized.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(normalized)
-
-    # Build metadata
     metadata = {
         "query_metadata": query_metadata,
         "index_stats": {
-            "total_vectors": len(examples),
-            "dimensions": dimension,
-            "index_type": "IndexFlatL2 (cosine similarity via normalization)",
-            "normalized_sql": True,
-            "zscore_normalized": True,
-            "feature_stats_file": "feature_stats.json",
-            "dialect": dialect,
-            "normalization": "literals replaced with $N placeholders, identifiers lowercased",
-        }
+            "total_examples": len(examples),
+            "index_type": "tag_overlap",
+        },
     }
 
-    print(f"\nBuilt FAISS index: {len(examples)} vectors, {dimension} dimensions")
+    print(f"\nBuilt tag index: {len(examples)} examples")
 
-    return index, metadata, feature_stats
+    return tag_entries, metadata
 
 
-def save_index(
-    index,
-    metadata: Dict,
-    feature_stats: Dict,
-) -> None:
-    """Save FAISS index and metadata to ado/models/."""
-    import faiss
-
+def save_tag_index(tag_entries: List[Dict], metadata: Dict) -> None:
+    """Save tag index and metadata to ado/models/."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Save index
-    faiss.write_index(index, str(INDEX_FILE))
-    print(f"Saved index to {INDEX_FILE}")
+    # Save tag index
+    with open(TAGS_FILE, 'w') as f:
+        json.dump({"examples": tag_entries}, f, indent=2)
+    print(f"Saved tag index to {TAGS_FILE}")
 
     # Save metadata
     with open(METADATA_FILE, 'w') as f:
         json.dump(metadata, f, indent=2)
     print(f"Saved metadata to {METADATA_FILE}")
 
-    # Save feature stats
-    with open(FEATURE_STATS_FILE, 'w') as f:
-        json.dump(feature_stats, f, indent=2)
-    print(f"Saved feature stats to {FEATURE_STATS_FILE}")
-
 
 def show_index_stats() -> None:
-    """Show statistics about the current FAISS index."""
-    if not METADATA_FILE.exists():
-        print("No FAISS index found. Run: python -m ado.faiss_builder")
+    """Show statistics about the current tag index."""
+    if not TAGS_FILE.exists():
+        print("No tag index found. Run: python -m ado.faiss_builder")
         return
 
-    with open(METADATA_FILE) as f:
-        metadata = json.load(f)
+    with open(TAGS_FILE) as f:
+        data = json.load(f)
 
-    stats = metadata.get("index_stats", {})
-    query_meta = metadata.get("query_metadata", {})
+    examples = data.get("examples", [])
 
     print("=" * 60)
-    print("ADO FAISS Index Statistics")
+    print("ADO Tag Index Statistics")
     print("=" * 60)
-    print(f"Total vectors:    {stats.get('total_vectors', 0)}")
-    print(f"Dimensions:       {stats.get('dimensions', 0)}")
-    print(f"Index type:       {stats.get('index_type', 'unknown')}")
-    print(f"Z-score norm:     {stats.get('zscore_normalized', False)}")
-    print(f"Dialect:          {stats.get('dialect', 'postgres')}")
+    print(f"Total examples:   {len(examples)}")
     print()
+
+    # Category distribution
+    categories = Counter(ex.get("category", "general") for ex in examples)
+    print("Categories:")
+    for cat, count in categories.most_common():
+        print(f"  {cat}: {count}")
+    print()
+
+    # Engine distribution
+    engines = Counter(ex.get("engine", "unknown") for ex in examples)
+    print("Engines:")
+    for eng, count in engines.most_common():
+        print(f"  {eng}: {count}")
+    print()
+
+    # Type distribution
+    types = Counter(ex.get("type", "gold") for ex in examples)
+    print("Types:")
+    for t, count in types.most_common():
+        print(f"  {t}: {count}")
+    print()
+
     print("Indexed Examples:")
     print("-" * 60)
-
-    for ex_id, meta in sorted(query_meta.items()):
-        transforms = meta.get("transforms", [])
+    for ex in sorted(examples, key=lambda x: x["id"]):
+        tags = ex.get("tags", [])
+        meta = ex.get("metadata", {})
         speedup = meta.get("verified_speedup", "unknown")
-        print(f"  {ex_id}")
-        print(f"    transforms: {transforms}")
-        print(f"    speedup: {speedup}")
+        print(f"  {ex['id']}")
+        print(f"    category: {ex.get('category', '?')}, speedup: {speedup}")
+        print(f"    tags ({len(tags)}): {', '.join(tags[:10])}{'...' if len(tags) > 10 else ''}")
 
 
 def rebuild_index() -> bool:
-    """Rebuild FAISS index from ado/examples/.
+    """Rebuild tag index from ado/examples/.
 
     Returns:
         True if successful, False otherwise
     """
     print("=" * 60)
-    print("Building ADO FAISS Index for PostgreSQL DSB")
+    print("Building ADO Tag Index")
     print("=" * 60)
 
     # Load examples
@@ -615,17 +680,17 @@ def rebuild_index() -> bool:
     print(f"\nFound {len(examples)} examples")
 
     # Build index
-    index, metadata, feature_stats = build_faiss_index(examples, dialect="postgres")
+    tag_entries, metadata = build_tag_index(examples)
 
-    if index is None:
+    if not tag_entries:
         print("\nFailed to build index")
         return False
 
     # Save
-    save_index(index, metadata, feature_stats)
+    save_tag_index(tag_entries, metadata)
 
     print("\n" + "=" * 60)
-    print("FAISS index built successfully!")
+    print("Tag index built successfully!")
     print("=" * 60)
 
     return True
@@ -638,7 +703,7 @@ def rebuild_index() -> bool:
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Build ADO FAISS index")
+    parser = argparse.ArgumentParser(description="Build ADO tag index")
     parser.add_argument("--stats", action="store_true", help="Show index statistics")
     parser.add_argument("--rebuild", action="store_true", help="Force rebuild index")
 

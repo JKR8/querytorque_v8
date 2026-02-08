@@ -6,10 +6,117 @@ all failure information into a refined single-worker approach.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ..schemas import WorkerResult
 from .dag_helpers import append_dag_summary
+
+if TYPE_CHECKING:
+    from .swarm_parsers import WorkerAssignment
+
+
+def build_snipe_worker_context(
+    bench: Any,
+    assignments: "List[WorkerAssignment]",
+    worker_sqls: Dict[int, str],
+    target_speedup: float,
+) -> str:
+    """Build rich context header for the snipe worker from all previous attempts.
+
+    Shows each worker's strategy, examples, hint, speedup, status, and
+    abbreviated SQL so the snipe worker can learn from all 4 attempts and
+    try a genuinely different approach.
+
+    Args:
+        bench: QueryBench from iter0 benchmarking.
+        assignments: WorkerAssignment list from fan-out parse.
+        worker_sqls: Dict mapping worker_id -> optimized SQL string.
+        target_speedup: Target speedup (e.g. 2.0).
+
+    Returns:
+        Prompt header string to prepend to the base prompt.
+    """
+    # Build lookup maps: worker_id -> assignment, worker_id -> bench result
+    asn_map = {a.worker_id: a for a in assignments}
+    wb_map = {w.worker_id: w for w in bench.workers}
+
+    # Sort workers by speedup descending (best first)
+    sorted_workers = sorted(bench.workers, key=lambda w: w.speedup, reverse=True)
+    best_speedup = sorted_workers[0].speedup if sorted_workers else 0.0
+
+    total = len(sorted_workers)
+    reaching = sum(1 for w in sorted_workers if w.speedup >= target_speedup)
+
+    lines: list[str] = []
+    lines.append(f"## Previous Optimization Attempts ({total} workers tried, "
+                 f"{'none' if reaching == 0 else reaching} reached {target_speedup:.1f}x)")
+    lines.append("")
+
+    strategies_tried: list[str] = []
+    examples_tried: set[str] = set()
+
+    for w in sorted_workers:
+        asn = asn_map.get(w.worker_id)
+        strategy = asn.strategy if asn else "unknown"
+        hint = asn.hint if asn else ""
+        examples = asn.examples if asn else []
+
+        strategies_tried.append(strategy)
+        examples_tried.update(examples)
+
+        # Status label
+        if w.status == "error":
+            status_label = "ERROR"
+        elif w.speedup >= target_speedup:
+            status_label = f"WIN ({w.speedup:.2f}x)"
+        elif w.speedup >= 1.0:
+            status_label = f"PASS, below target ({w.speedup:.2f}x)"
+        else:
+            status_label = f"REGRESSION ({w.speedup:.2f}x)"
+
+        best_marker = " ★ BEST" if w.speedup == best_speedup and total > 1 else ""
+
+        lines.append(f"### W{w.worker_id}: {strategy} → {w.speedup:.2f}x{best_marker} [{status_label}]")
+
+        if examples:
+            lines.append(f"- **Examples**: {', '.join(examples)}")
+        if hint:
+            lines.append(f"- **Approach**: {hint}")
+        if w.error:
+            lines.append(f"- **Error**: {w.error}")
+
+        # Abbreviated SQL (first 20 lines)
+        sql = worker_sqls.get(w.worker_id, "")
+        if sql.strip():
+            sql_lines = sql.strip().split("\n")
+            if len(sql_lines) > 20:
+                preview = "\n".join(sql_lines[:20]) + "\n-- ... (truncated)"
+            else:
+                preview = sql.strip()
+            lines.append("- **SQL** (abbreviated):")
+            lines.append("```sql")
+            lines.append(preview)
+            lines.append("```")
+
+        lines.append("")
+
+    # Summary of exhausted approaches
+    lines.append("### What's been exhausted")
+    lines.append(f"- **Strategies tried**: {', '.join(strategies_tried)}")
+    if examples_tried:
+        lines.append(f"- **Examples used across workers**: {', '.join(sorted(examples_tried))}")
+    if best_speedup > 0:
+        lines.append(f"- **Best result**: {best_speedup:.2f}x (target: {target_speedup:.1f}x)")
+    lines.append("")
+
+    lines.append("### Your task")
+    lines.append(f"Find an UNEXPLORED optimization angle that reaches >={target_speedup:.1f}x. "
+                 "Do NOT repeat the strategies above — they have already been tried and fell short.")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 def build_snipe_prompt(

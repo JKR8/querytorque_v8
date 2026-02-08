@@ -67,6 +67,7 @@ from ado.sql_rewriter import SQLRewriter
 from ado.schemas import WorkerResult
 from ado.prompts import (
     build_snipe_prompt,
+    build_snipe_worker_context,
     build_worker_strategy_header,
     WorkerAssignment,
     parse_fan_out_response,
@@ -829,24 +830,12 @@ def main():
             qdir = batch_dir / qid
             br = bench0[qid]
 
-            passing = [w for w in br.workers if w.status == "pass"]
-            if passing:
-                best_w = max(passing, key=lambda w: w.speedup)
-                asn_list = all_assignments.get(qid, [])
-                best_strat = next(
-                    (a.strategy for a in asn_list
-                     if a.worker_id == best_w.worker_id),
-                    "unknown",
-                )
-                ctx = (f"Best result: W{best_w.worker_id} achieved "
-                       f"{best_w.speedup:.2f}x via {best_strat}")
-            else:
-                ctx = "All 4 workers failed to produce valid results"
-
-            snipe_hint = (
-                f"CONTEXT: {ctx}. "
-                f"Your goal: optimize the ORIGINAL SQL to >={EXIT_SPEEDUP}x. "
-                f"Try a DIFFERENT approach."
+            asn_list = all_assignments.get(qid, [])
+            context_header = build_snipe_worker_context(
+                bench=br,
+                assignments=asn_list,
+                worker_sqls=worker_sqls.get(qid, {}),
+                target_speedup=EXIT_SPEEDUP,
             )
 
             try:
@@ -870,9 +859,7 @@ def main():
                         semantic_intents=pipeline.get_semantic_intents(qid),
                         engine_version=pipeline._engine_version,
                     )
-                    wp = build_worker_strategy_header(
-                        "refined_snipe", snipe_hint,
-                    ) + base_prompt
+                    wp = context_header + base_prompt
                     prompt_path.write_text(wp)
                 else:
                     wp = prompt_path.read_text()

@@ -1,6 +1,6 @@
 """Fan-out prompt for swarm mode.
 
-Asks the analyst to distribute FAISS examples across 4 workers,
+Asks the analyst to distribute matched examples across 4 workers,
 each with a different optimization strategy.
 """
 
@@ -18,6 +18,7 @@ def build_fan_out_prompt(
     costs: Dict[str, Any],
     faiss_examples: List[Dict[str, Any]],
     all_available_examples: List[Dict[str, str]],
+    regression_warnings: Optional[List[Dict[str, Any]]] = None,
     dialect: str = "duckdb",
 ) -> str:
     """Build prompt asking analyst to distribute examples across 4 workers.
@@ -27,8 +28,9 @@ def build_fan_out_prompt(
         sql: The SQL query to optimize
         dag: Parsed DAG from Phase 1
         costs: Per-node cost analysis
-        faiss_examples: Top 12 FAISS-matched examples
+        faiss_examples: Top matched examples (by tag similarity)
         all_available_examples: Full catalog of gold examples (id + description)
+        regression_warnings: Regression examples for similar queries (analyst reviews relevance)
         dialect: SQL dialect
 
     Returns:
@@ -65,14 +67,14 @@ def build_fan_out_prompt(
     append_dag_summary(lines, dag, costs, include_operations=True)
     lines.append("")
 
-    # FAISS examples (top 12)
-    lines.append(f"## Top {len(faiss_examples)} FAISS Examples (by structural similarity)")
+    # Matched examples (top N by tag similarity)
+    lines.append(f"## Top {len(faiss_examples)} Matched Examples (by structural similarity)")
     lines.append("")
     for i, ex in enumerate(faiss_examples, 1):
         ex_id = ex.get("id", "?")
         speedup = ex.get("verified_speedup", ex.get("speedup", "?"))
         desc = ex.get("description", "")[:120]
-        lines.append(f"{i}. **{ex_id}** ({speedup}x) — {desc}")
+        lines.append(f"{i}. **{ex_id}** ({speedup}) — {desc}")
     lines.append("")
 
     # Full catalog
@@ -82,15 +84,32 @@ def build_fan_out_prompt(
         ex_id = ex.get("id", "?")
         speedup = ex.get("speedup", "?")
         desc = ex.get("description", "")[:100]
-        lines.append(f"- **{ex_id}** ({speedup}x) — {desc}")
+        lines.append(f"- **{ex_id}** ({speedup}) — {desc}")
     lines.append("")
+
+    # Regression warnings
+    if regression_warnings:
+        lines.append("## Regression Warnings (review relevance to THIS query)")
+        lines.append("")
+        lines.append(
+            "These transforms caused regressions on structurally similar queries. "
+            "Review each — if relevant to this query, AVOID the listed transform. "
+            "If not relevant (different structure/bottleneck), you may ignore."
+        )
+        lines.append("")
+        for rw in regression_warnings:
+            rw_id = rw.get("id", "?")
+            mechanism = rw.get("regression_mechanism", rw.get("description", ""))[:120]
+            speedup = rw.get("verified_speedup", rw.get("speedup", "?"))
+            lines.append(f"- **{rw_id}** ({speedup}) — {mechanism}")
+        lines.append("")
 
     # Task
     lines.append("## Your Task")
     lines.append("")
     lines.append(
         "Design 4 DIFFERENT optimization strategies exploring diverse approaches. "
-        "You may keep FAISS recommendations OR swap examples from the catalog."
+        "You may keep the matched recommendations OR swap examples from the catalog."
     )
     lines.append("")
     lines.append("**Constraints**:")
@@ -106,7 +125,7 @@ def build_fan_out_prompt(
     lines.append("")
     lines.append("For each worker, specify:")
     lines.append("1. **Strategy name** (e.g., `aggressive_date_prefetch`)")
-    lines.append("2. **3 examples** to use (from FAISS picks or catalog)")
+    lines.append("2. **3 examples** to use (from matched picks or catalog)")
     lines.append("3. **Strategy hint** (1-2 sentences guiding the optimization approach)")
     lines.append("")
 

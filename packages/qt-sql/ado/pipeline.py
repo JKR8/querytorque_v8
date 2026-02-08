@@ -1224,11 +1224,10 @@ class Pipeline:
         engine: str = "duckdb",
         k: int = 3,
     ) -> List[Dict[str, Any]]:
-        """Find gold examples via FAISS structural similarity.
+        """Find gold examples via tag-based similarity matching.
 
-        Fingerprints the SQL (literals → placeholders, lowercase identifiers),
-        vectorizes the AST into 90 features, and finds the nearest gold
-        examples in the FAISS index.
+        Extracts SQL tags (table names, keywords, structural patterns)
+        and ranks examples by tag overlap count.
 
         Engine-specific: only returns examples for the current engine.
         DuckDB queries get DuckDB examples, PostgreSQL gets PostgreSQL, etc.
@@ -1250,16 +1249,7 @@ class Pipeline:
             for ex_id, score, meta in matches:
                 if len(examples) >= k:
                     break
-                if score <= 0.0 or ex_id in seen_ids:
-                    continue
-
-                # Strict engine filtering: only this engine's examples
-                ex_engine = meta.get("engine", "unknown")
-                if ex_engine != engine_dir:
-                    continue
-
-                # Skip regressions — those go through _find_regression_warnings
-                if meta.get("type") == "regression":
+                if ex_id in seen_ids:
                     continue
 
                 seen_ids.add(ex_id)
@@ -1276,9 +1266,9 @@ class Pipeline:
         sql: str,
         engine: str = "duckdb",
         k: int = 2,
-        min_similarity: float = 0.3,
+        min_similarity: float = 0.1,
     ) -> List[Dict[str, Any]]:
-        """Find regression examples via FAISS structural similarity.
+        """Find regression examples via tag-based similarity matching.
 
         Returns regression examples where structurally similar queries
         were rewritten and REGRESSED. These serve as anti-patterns in
@@ -1288,7 +1278,7 @@ class Pipeline:
             sql: Query SQL to match against
             engine: Database engine for filtering
             k: Max regression warnings to return
-            min_similarity: Minimum FAISS similarity score (0-1)
+            min_similarity: Minimum tag similarity score (0-1)
 
         Returns:
             List of regression example dicts with regression_mechanism
@@ -1302,20 +1292,11 @@ class Pipeline:
 
         recommender = ADOFAISSRecommender()
         if recommender._initialized:
-            matches = recommender.find_similar_examples(sql, k=k * 10, dialect=dialect)
+            matches = recommender.find_relevant_regressions(sql, k=k * 5, dialect=dialect)
             for ex_id, score, meta in matches:
                 if len(regressions) >= k:
                     break
                 if score < min_similarity or ex_id in seen_ids:
-                    continue
-
-                # Only regression type
-                if meta.get("type") != "regression":
-                    continue
-
-                # Engine filtering
-                ex_engine = meta.get("engine", "unknown")
-                if ex_engine != engine_dir:
                     continue
 
                 seen_ids.add(ex_id)
@@ -1323,7 +1304,7 @@ class Pipeline:
                 # Load regression example from the regressions/ subdir
                 reg_data = self._load_regression_example(ex_id, engine_dir)
                 if reg_data:
-                    reg_data["_faiss_score"] = score
+                    reg_data["_tag_score"] = score
                     regressions.append(reg_data)
 
         return regressions

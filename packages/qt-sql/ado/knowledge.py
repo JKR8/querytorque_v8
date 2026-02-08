@@ -1,7 +1,7 @@
 """Knowledge retrieval for ADO.
 
 This module retrieves gold examples and constraints for SQL optimization.
-Uses FAISS vector similarity from qt_sql when available, with fallback
+Uses tag-based similarity matching from the tag index, with fallback
 to loading all local examples.
 
 Local directories:
@@ -221,120 +221,151 @@ def _get_rules_for_dsb_query(query_id: str) -> list[str]:
 
 
 # =============================================================================
-# FAISS Integration (ADO's own index for PostgreSQL DSB)
+# Tag-Based Similarity Matching (replaces FAISS)
 # =============================================================================
 
 class ADOFAISSRecommender:
-    """FAISS similarity recommender using ADO's PostgreSQL DSB examples.
+    """Tag-based similarity recommender for ADO examples.
 
-    Uses ado/models/ index - separate from qt_sql's DuckDB TPC-DS index.
+    Uses ado/models/similarity_tags.json for tag overlap matching.
+    Class name kept as ADOFAISSRecommender for backward compatibility
+    with pipeline.py and other callers.
     """
 
     def __init__(self):
-        self.faiss_index = None
-        self.faiss_metadata = None
-        self.feature_stats = None
-        self.vectorizer = None
+        self.tag_entries: list[dict] = []
+        self.tag_metadata: dict | None = None
         self._initialized = False
         self._load_index()
 
     def _load_index(self):
-        """Load FAISS index from ado/models/."""
-        index_file = MODELS_DIR / "similarity_index.faiss"
+        """Load tag index from ado/models/."""
+        tags_file = MODELS_DIR / "similarity_tags.json"
         metadata_file = MODELS_DIR / "similarity_metadata.json"
-        stats_file = MODELS_DIR / "feature_stats.json"
 
-        if not index_file.exists() or not metadata_file.exists():
-            logger.debug(f"ADO FAISS index not found at {index_file}")
+        if not tags_file.exists():
+            logger.debug(f"ADO tag index not found at {tags_file}")
             return
 
         try:
-            import faiss
+            data = json.loads(tags_file.read_text())
+            self.tag_entries = data.get("examples", [])
 
-            # Load index
-            self.faiss_index = faiss.read_index(str(index_file))
+            if metadata_file.exists():
+                self.tag_metadata = json.loads(metadata_file.read_text())
 
-            # Load metadata
-            self.faiss_metadata = json.loads(metadata_file.read_text())
+            self._initialized = bool(self.tag_entries)
+            logger.info(f"Loaded ADO tag index with {len(self.tag_entries)} examples")
 
-            # Load feature stats for z-score normalization
-            if stats_file.exists():
-                self.feature_stats = json.loads(stats_file.read_text())
-
-            # Import vectorizer from faiss_builder
-            from .faiss_builder import ASTVectorizer
-            self.vectorizer = ASTVectorizer()
-
-            self._initialized = True
-            num_vectors = self.faiss_metadata.get("index_stats", {}).get("total_vectors", "?")
-            logger.info(f"Loaded ADO FAISS index with {num_vectors} PostgreSQL DSB vectors")
-
-        except ImportError as e:
-            logger.debug(f"FAISS not available: {e}")
         except Exception as e:
-            logger.warning(f"Failed to load ADO FAISS index: {e}")
+            logger.warning(f"Failed to load ADO tag index: {e}")
 
     def find_similar_examples(
         self, sql: str, k: int = 5, dialect: str = "duckdb",
     ) -> list[tuple[str, float, dict]]:
-        """Find similar examples using FAISS search.
+        """Find similar gold examples using tag overlap matching.
+
+        Returns gold examples for the target engine only. Regressions
+        and cross-engine examples are excluded.
 
         Args:
             sql: SQL query to find similar examples for
             k: Number of results to return
-            dialect: SQL dialect for parsing (duckdb, postgres, etc.)
+            dialect: SQL dialect — "duckdb" or "postgres"
 
         Returns:
             List of (example_id, similarity_score, metadata) tuples
         """
-        if not self._initialized or not self.faiss_index:
+        if not self._initialized or not self.tag_entries:
             return []
 
+        engine = "postgres" if dialect == "postgres" else "duckdb"
+
         try:
-            import faiss
-            import numpy as np
-            from .faiss_builder import SQLNormalizer
+            from .faiss_builder import extract_tags, classify_category
 
-            # Fingerprint first: normalize literals/identifiers for consistent matching
-            normalizer = SQLNormalizer()
-            fingerprinted = normalizer.normalize(sql, dialect=dialect)
+            query_tags = extract_tags(sql, dialect=dialect)
+            query_category = classify_category(query_tags)
 
-            # Vectorize fingerprinted SQL
-            vector = self.vectorizer.vectorize(fingerprinted, dialect=dialect)
-            vector = vector.reshape(1, -1).astype('float32')
-
-            # Apply z-score normalization (same as index)
-            if self.feature_stats:
-                mean = np.array(self.feature_stats["mean"], dtype='float32')
-                std = np.array(self.feature_stats["std"], dtype='float32')
-                vector = (vector - mean) / std
-
-            # L2 normalize for cosine similarity
-            faiss.normalize_L2(vector)
-
-            # Search
-            distances, indices = self.faiss_index.search(vector, k)
-
-            # Build results
-            results = []
-            example_ids = list(self.faiss_metadata.get("query_metadata", {}).keys())
-
-            for dist, idx in zip(distances[0], indices[0]):
-                if idx < 0 or idx >= len(example_ids):
+            scored = []
+            for ex in self.tag_entries:
+                if ex.get("engine") != engine:
                     continue
+                if ex.get("type") == "regression":
+                    continue
+                ex_tags = set(ex.get("tags", []))
+                overlap = len(query_tags & ex_tags)
+                category_bonus = 1 if ex.get("category") == query_category else 0
+                if overlap > 0:
+                    scored.append((ex, overlap, category_bonus))
 
-                example_id = example_ids[idx]
-                meta = self.faiss_metadata["query_metadata"].get(example_id, {})
+            scored.sort(key=lambda x: (x[1], x[2]), reverse=True)
 
-                # Convert L2 distance to similarity (0-1)
-                similarity = max(0.0, 1.0 - (float(dist) ** 2) / 2)
-
-                results.append((example_id, similarity, meta))
+            results = []
+            for ex, overlap, _ in scored[:k]:
+                meta = ex.get("metadata", {})
+                max_possible = max(len(query_tags), 1)
+                similarity = overlap / max_possible
+                results.append((ex["id"], similarity, meta))
 
             return results
 
         except Exception as e:
-            logger.warning(f"FAISS search failed: {e}")
+            logger.warning(f"Tag search failed: {e}")
+            return []
+
+    def find_relevant_regressions(
+        self, sql: str, k: int = 5, dialect: str = "duckdb",
+    ) -> list[tuple[str, float, dict]]:
+        """Find relevant regression examples (anti-patterns) for a query.
+
+        Same engine-filtered tag overlap, but returns only regressions.
+        Use these as warnings — transforms that hurt similar queries.
+
+        Args:
+            sql: SQL query to check against
+            k: Number of results to return
+            dialect: SQL dialect — "duckdb" or "postgres"
+
+        Returns:
+            List of (example_id, similarity_score, metadata) tuples
+        """
+        if not self._initialized or not self.tag_entries:
+            return []
+
+        engine = "postgres" if dialect == "postgres" else "duckdb"
+
+        try:
+            from .faiss_builder import extract_tags, classify_category
+
+            query_tags = extract_tags(sql, dialect=dialect)
+            query_category = classify_category(query_tags)
+
+            scored = []
+            for ex in self.tag_entries:
+                if ex.get("engine") != engine:
+                    continue
+                if ex.get("type") != "regression":
+                    continue
+                ex_tags = set(ex.get("tags", []))
+                overlap = len(query_tags & ex_tags)
+                category_bonus = 1 if ex.get("category") == query_category else 0
+                if overlap > 0:
+                    scored.append((ex, overlap, category_bonus))
+
+            scored.sort(key=lambda x: (x[1], x[2]), reverse=True)
+
+            results = []
+            for ex, overlap, _ in scored[:k]:
+                meta = ex.get("metadata", {})
+                max_possible = max(len(query_tags), 1)
+                similarity = overlap / max_possible
+                results.append((ex["id"], similarity, meta))
+
+            return results
+
+        except Exception as e:
+            logger.warning(f"Regression search failed: {e}")
             return []
 
 
@@ -343,7 +374,7 @@ _ADO_RECOMMENDER: ADOFAISSRecommender | None = None
 
 
 def _get_ado_recommender() -> ADOFAISSRecommender | None:
-    """Get or create the ADO FAISS recommender."""
+    """Get or create the ADO tag-based recommender."""
     global _ADO_RECOMMENDER
     if _ADO_RECOMMENDER is None:
         _ADO_RECOMMENDER = ADOFAISSRecommender()
@@ -351,9 +382,9 @@ def _get_ado_recommender() -> ADOFAISSRecommender | None:
 
 
 def _get_faiss_recommendations(sql: str, k: int = 5) -> list[str]:
-    """Get example recommendations using ADO's FAISS index.
+    """Get example recommendations using ADO's tag index.
 
-    Uses ado/models/ FAISS index for PostgreSQL DSB examples.
+    Uses ado/models/ tag index for similarity matching.
 
     Args:
         sql: The SQL query text
@@ -364,7 +395,7 @@ def _get_faiss_recommendations(sql: str, k: int = 5) -> list[str]:
     """
     recommender = _get_ado_recommender()
     if not recommender or not recommender._initialized:
-        logger.debug("ADO FAISS recommender not initialized")
+        logger.debug("ADO tag recommender not initialized")
         return []
 
     similar = recommender.find_similar_examples(sql, k=k)

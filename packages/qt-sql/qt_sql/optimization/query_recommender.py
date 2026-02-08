@@ -106,13 +106,13 @@ class LiveFAISSRecommender:
             with open(metadata_file) as f:
                 self.faiss_metadata = json.load(f)
 
-            # Load vectorizer from ado.faiss_builder
+            # Load vectorizer from scripts/vectorize_queries.py
             if ASTVectorizer is None:
                 import sys
-                ado_dir = Path(__file__).parent.parent.parent / "ado"
-                if str(ado_dir.parent) not in sys.path:
-                    sys.path.insert(0, str(ado_dir.parent))
-                from ado.faiss_builder import ASTVectorizer as ASTVectorizerClass
+                scripts_dir = Path(__file__).parent.parent.parent.parent.parent / "research" / "scripts"
+                if str(scripts_dir) not in sys.path:
+                    sys.path.insert(0, str(scripts_dir))
+                from vectorize_queries import ASTVectorizer as ASTVectorizerClass
                 ASTVectorizer = ASTVectorizerClass
 
             self.vectorizer = ASTVectorizer()

@@ -1,0 +1,29 @@
+FAILURE_ANALYSIS:
+The fundamental issue is that all attempts treated this as a simple CTE/materalization problem when the real bottleneck lies elsewhere. The original query already has optimal filter pushdown - PostgreSQL's optimizer pushes date_dim, item, and customer_address filters into the CTE naturally. The attempts failed because:
+
+1. **Wrong optimization target**: CTE restructuring provided negligible gains (0.76x-1.02x) because the CTE is computed once anyway. The real bottleneck is the CORRELATED SUBQUERY that computes `avg(ctr_total_return)*1.2` per state - this forces repeated computation of averages for each row.
+
+2. **CTE as optimization fence**: PostgreSQL treats CTEs as optimization fences, preventing cross-CTE predicate pushdown. Worker 1's `state_thresholds` CTE actually HURTS performance by materializing intermediate results that can't be optimized with the main query.
+
+3. **Missing window function opportunity**: None tried computing the state average IN THE SAME PASS as the aggregation using window functions, which eliminates the correlated subquery entirely.
+
+4. **Execution plan blindness**: The DAG shows 0% cost on CTEs because they're optimization fences - the real work happens in joins between CTEs. The attempts didn't address the N² nature of the correlated subquery.
+
+UNEXPLORED_OPPORTUNITIES:
+1. **Window functions to eliminate correlation**: Compute `AVG(ctr_total_return) OVER (PARTITION BY ctr_state) * 1.2` directly in the CTE
+2. **LATERAL joins for state-specific thresholds**: Use LATERAL to compute thresholds once per state, not per row
+3. **Transforming IN to EXISTS/ANY**: For the `ctr_reason_sk in (50, 73)` filter
+4. **Partial aggregation before joining**: Pre-aggregate by state first, then join to customer details
+5. **Columnstore/vectorization hints**: Using array operations for the state filter
+6. **Optimizer hints to force join order**: PostgreSQL's join_collapse_limit and from_collapse_limit adjustments
+
+REFINED_STRATEGY:
+Completely eliminate the correlated subquery by computing state thresholds WITHIN the main CTE using window functions, then restructure as a single-pass query with strategic filter ordering:
+1. Use a WINDOW function to compute state average thresholds alongside aggregation
+2. Apply ALL filters (state, reason_sk, birth_year) BEFORE the expensive customer join
+3. Use LATERAL for state-specific computations to guarantee single evaluation
+4. Convert implicit joins to explicit JOINs with optimal order (smallest tables first)
+5. Add optimizer hints via comment-style directives
+
+EXAMPLES: pg_self_join_decomposition, early_filter_decorrelate, pg_date_cte_explicit_join
+HINT: Use window functions in a derived table to compute state thresholds in the same pass as aggregation, then filter in a single WHERE clause without CTE fences. Structure: WITH base_aggregation AS (SELECT ..., AVG(SUM(...)) OVER (PARTITION BY state) * 1.2 AS threshold FROM ... GROUP BY ...) SELECT ... FROM base_aggregation JOIN customer WHERE ctr_total_return > threshold AND ...
