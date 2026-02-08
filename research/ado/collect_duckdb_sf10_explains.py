@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Collect DuckDB SF10 EXPLAIN ANALYZE plans for benchmark query sets.
 
+Single JSON EXPLAIN ANALYZE per query — no redundant text run.
+
 Default targets:
 - TPC-DS: /mnt/d/TPC-DS/tpcds_sf10.duckdb + /mnt/d/TPC-DS/queries_duckdb_converted
 - DSB:    /mnt/d/TPC-DS/dsb_sf10.duckdb   + /mnt/d/dsb_sf10/queries
@@ -13,7 +15,6 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Iterable
 
 import duckdb
 
@@ -63,16 +64,6 @@ def query_sort_key(path: Path) -> tuple[int, str]:
     return (int(match.group(1)), stem)
 
 
-def flatten_rows(rows: Iterable[tuple]) -> str:
-    """Convert DB row tuples into plain text."""
-    chunks = []
-    for row in rows:
-        for col in row:
-            if col is not None:
-                chunks.append(str(col))
-    return "\n".join(chunks)
-
-
 def collect_one_benchmark(
     benchmark: str,
     db_path: str,
@@ -82,9 +73,7 @@ def collect_one_benchmark(
     max_queries: int | None,
 ) -> dict:
     bench_out = output_root / f"duckdb_{benchmark}_sf10"
-    txt_out = bench_out / "plans_text"
     json_out = bench_out / "plans_json"
-    txt_out.mkdir(parents=True, exist_ok=True)
     json_out.mkdir(parents=True, exist_ok=True)
 
     query_files = sorted(queries_dir.glob(query_glob), key=query_sort_key)
@@ -124,7 +113,6 @@ def collect_one_benchmark(
             "statement_count": None,
             "client_elapsed_ms": None,
             "execution_time_ms": None,
-            "text_plan_file": str(txt_out / f"{query_id}_explain.txt"),
             "json_plan_file": str(json_out / f"{query_id}_explain.json"),
         }
 
@@ -132,14 +120,13 @@ def collect_one_benchmark(
             sql_single, statement_count = first_statement(sql, con)
             record["statement_count"] = statement_count
 
+            # Single JSON EXPLAIN ANALYZE — no redundant text run
             t0 = time.perf_counter()
-            text_rows = con.execute(f"EXPLAIN ANALYZE {sql_single}").fetchall()
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            plan_text = flatten_rows(text_rows)
-
             json_rows = con.execute(
                 f"EXPLAIN (ANALYZE, FORMAT JSON) {sql_single}"
             ).fetchall()
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
             plan_json = None
             for row in json_rows:
                 if len(row) >= 2 and row[0] == "analyzed_plan":
@@ -162,27 +149,6 @@ def collect_one_benchmark(
                 latency_s = plan_json.get("latency")
                 if isinstance(latency_s, (int, float)):
                     execution_time_ms = latency_s * 1000.0
-
-            (txt_out / f"{query_id}_explain.txt").write_text(
-                "\n".join(
-                    [
-                        f"-- benchmark: {benchmark}",
-                        f"-- query_id: {query_id}",
-                        f"-- source_sql: {query_path}",
-                        f"-- database: {db_path}",
-                        f"-- statement_count: {statement_count}",
-                        f"-- client_elapsed_ms: {elapsed_ms:.3f}",
-                        (
-                            f"-- execution_time_ms: {execution_time_ms:.3f}"
-                            if execution_time_ms is not None
-                            else "-- execution_time_ms: null"
-                        ),
-                        "",
-                        plan_text,
-                        "",
-                    ]
-                )
-            )
 
             (json_out / f"{query_id}_explain.json").write_text(
                 json.dumps(
