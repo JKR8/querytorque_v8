@@ -31,15 +31,20 @@ except ImportError:
 
 # These transforms have proven speedups on TPC-DS/DSB benchmarks
 ALLOWED_TRANSFORMS = frozenset([
-    # Core transforms with verified speedups
-    "pushdown",             # 2.11x Q9 - Push filters into CTEs/subqueries
-    "decorrelate",          # 2.92x Q1 - Correlated subquery -> CTE with GROUP BY
-    "or_to_union",          # 3.17x Q15 - OR conditions -> UNION ALL branches
-    "early_filter",         # 4.00x Q93 - Filter dimension tables before joining
-    "date_cte_isolate",     # 4.00x Q6 - Extract date filtering into early CTE
-    "materialize_cte",      # 1.37x Q95 - Extract repeated subqueries into CTE
-    "intersect_to_exists",  # 1.83x Q14 - INTERSECT to EXISTS
-    "union_cte_split",      # 1.36x Q74 - Year-specialized CTEs
+    # Core transforms with verified speedups (13 gold patterns)
+    "pushdown",                 # 2.11x Q9 - Push filters into CTEs/subqueries
+    "decorrelate",              # 2.92x Q1 - Correlated subquery -> CTE with GROUP BY
+    "or_to_union",              # 3.17x Q15 - OR conditions -> UNION ALL branches
+    "early_filter",             # 4.00x Q93 - Filter dimension tables before joining
+    "date_cte_isolate",         # 4.00x Q6 - Extract date filtering into early CTE
+    "materialize_cte",          # 1.37x Q95 - Extract repeated subqueries into CTE
+    "intersect_to_exists",      # 1.83x Q14 - INTERSECT to EXISTS
+    "union_cte_split",          # 1.36x Q74 - Year-specialized CTEs
+    "single_pass_aggregation",  # 4.47x Q9 - CASE WHEN inside aggregates
+    "dimension_cte_isolate",    # 1.93x Q26 - Pre-filter dimension tables into CTEs
+    "multi_dimension_prefetch", # 2.71x Q43 - Pre-filter multiple dimension tables
+    "prefetch_fact_join",       # 3.77x Q63 - Pre-join fact table with filtered dims
+    "multi_date_range_cte",     # 2.35x Q29 - Separate CTEs for date aliases
 
     # Additional valid transforms
     "flatten_subquery",     # Convert EXISTS/IN to JOINs
@@ -474,64 +479,293 @@ class SQLRewriter:
 # Utility Functions
 # =============================================================================
 
-def infer_transforms_from_sql_diff(original_sql: str, optimized_sql: str) -> List[str]:
+def _get_cte_names_and_bodies(ast) -> Dict[str, Any]:
+    """Extract CTE names and their body ASTs from a parsed SQL AST."""
+    ctes = {}
+    for cte in ast.find_all(exp.CTE):
+        name = str(cte.alias).lower() if cte.alias else None
+        if name and cte.this:
+            ctes[name] = cte.this
+    return ctes
+
+
+def _get_table_refs(ast) -> List[str]:
+    """Get all table references (not CTE refs) from an AST node."""
+    refs = []
+    for table in ast.find_all(exp.Table):
+        name = table.name.lower() if table.name else ""
+        if name:
+            refs.append(name)
+    return refs
+
+
+def _sql_lower(sql: str) -> str:
+    """Normalize SQL for text-level pattern matching."""
+    return " ".join(sql.lower().split())
+
+
+# Dimension table names in TPC-DS / DSB
+_DIM_TABLES = frozenset([
+    "date_dim", "item", "customer", "customer_address", "customer_demographics",
+    "store", "store_returns", "household_demographics", "promotion", "time_dim",
+    "income_band", "reason", "ship_mode", "warehouse", "web_page", "web_site",
+    "call_center", "catalog_page",
+])
+
+# Date-specific filter columns
+_DATE_FILTER_COLS = frozenset([
+    "d_year", "d_moy", "d_qoy", "d_date", "d_month_seq", "d_week_seq",
+    "d_date_sk",
+])
+
+
+def infer_transforms_from_sql_diff(
+    original_sql: str,
+    optimized_sql: str,
+    dialect: str = "duckdb",
+) -> List[str]:
     """Infer transforms by analyzing SQL structure differences.
 
     Fallback mechanism when LLM response doesn't explicitly name transforms.
-    This looks for common optimization patterns in the SQL AST.
+    Uses sqlglot AST parsing for structural detection of all 13 gold transforms.
 
     Args:
         original_sql: Original query
         optimized_sql: Optimized query
+        dialect: SQL dialect for parsing
 
     Returns:
-        List of inferred transform names
+        List of inferred transform names (ordered by confidence)
     """
-    if not sqlglot or original_sql == optimized_sql:
+    if not sqlglot or not original_sql or not optimized_sql:
+        return []
+
+    # Normalize whitespace for comparison
+    if original_sql.strip() == optimized_sql.strip():
         return []
 
     inferred = []
+    orig_lower = _sql_lower(original_sql)
+    opt_lower = _sql_lower(optimized_sql)
 
     try:
-        orig_ast = sqlglot.parse_one(original_sql, dialect="duckdb")
-        opt_ast = sqlglot.parse_one(optimized_sql, dialect="duckdb")
+        orig_ast = sqlglot.parse_one(original_sql, dialect=dialect)
+        opt_ast = sqlglot.parse_one(optimized_sql, dialect=dialect)
+    except Exception:
+        # Fall back to text-only heuristics if AST parsing fails
+        return _infer_transforms_text_only(orig_lower, opt_lower)
 
-        # Count patterns to infer transforms
+    try:
+        # ── Structural counts ──
         orig_subqueries = len(list(orig_ast.find_all(exp.Subquery)))
         opt_subqueries = len(list(opt_ast.find_all(exp.Subquery)))
 
-        orig_ctes = len(list(orig_ast.find_all(exp.CTE)))
-        opt_ctes = len(list(opt_ast.find_all(exp.CTE)))
+        orig_ctes = _get_cte_names_and_bodies(orig_ast)
+        opt_ctes = _get_cte_names_and_bodies(opt_ast)
+        new_cte_names = set(opt_ctes.keys()) - set(orig_ctes.keys())
 
         orig_unions = len(list(orig_ast.find_all(exp.Union)))
         opt_unions = len(list(opt_ast.find_all(exp.Union)))
 
-        orig_conditions = len(list(orig_ast.find_all(exp.Or)))
+        orig_or_count = len(list(orig_ast.find_all(exp.Or)))
         opt_or_count = len(list(opt_ast.find_all(exp.Or)))
 
-        # Detect patterns
-        if orig_subqueries > opt_subqueries:
-            inferred.append("decorrelate")
-
-        if opt_ctes > orig_ctes:
-            inferred.append("materialize_cte")
-
-        if opt_unions > orig_unions and opt_or_count < orig_conditions:
-            inferred.append("or_to_union")
-
-        # Look for UNION to UNION ALL conversion
-        if "UNION ALL" in optimized_sql.upper() and "UNION" in original_sql.upper():
-            if "UNION ALL" not in original_sql.upper():
-                inferred.append("union_cte_split")
-
-        # Look for window function usage increase (subquery_to_window)
         orig_windows = len(list(orig_ast.find_all(exp.Window)))
         opt_windows = len(list(opt_ast.find_all(exp.Window)))
-        if opt_windows > orig_windows:
-            inferred.append("subquery_to_window")
+
+        # ── 1. decorrelate: correlated subquery → JOIN or window function ──
+        # Detected when subquery count drops and JOIN/CTE/window count increases
+        if orig_subqueries > opt_subqueries and len(opt_ctes) >= len(orig_ctes):
+            inferred.append("decorrelate")
+        # Also: correlated subquery replaced by window function
+        # (subquery count may stay same if correlated sub becomes derived table)
+        elif opt_windows > orig_windows and orig_subqueries >= opt_subqueries:
+            inferred.append("decorrelate")
+
+        # ── 2. or_to_union: OR conditions → UNION ALL branches ──
+        if opt_unions > orig_unions and opt_or_count < orig_or_count:
+            inferred.append("or_to_union")
+
+        # ── 3. union_cte_split: UNION split into separate CTEs ──
+        if "union all" in opt_lower and "union" in orig_lower:
+            if "union all" not in orig_lower:
+                inferred.append("union_cte_split")
+
+        # ── 4. intersect_to_exists: INTERSECT/IN subquery → EXISTS ──
+        orig_intersects = orig_lower.count("intersect")
+        opt_intersects = opt_lower.count("intersect")
+        opt_exists = len(list(opt_ast.find_all(exp.Exists)))
+        orig_exists = len(list(orig_ast.find_all(exp.Exists)))
+        if (orig_intersects > opt_intersects and opt_exists > orig_exists):
+            inferred.append("intersect_to_exists")
+        # Also detect IN-subquery → EXISTS conversion
+        elif opt_exists > orig_exists and orig_subqueries > opt_subqueries:
+            orig_in_count = len(list(orig_ast.find_all(exp.In)))
+            opt_in_count = len(list(opt_ast.find_all(exp.In)))
+            if orig_in_count > opt_in_count:
+                inferred.append("intersect_to_exists")
+
+        # ── 5. single_pass_aggregation: CASE WHEN inside aggregate functions ──
+        # Detected when optimized query has CASE inside COUNT/SUM/AVG and
+        # original has multiple scans or subqueries of the same table
+        opt_case_in_agg = _count_case_in_aggregates(opt_ast)
+        orig_case_in_agg = _count_case_in_aggregates(orig_ast)
+        if opt_case_in_agg > orig_case_in_agg and opt_case_in_agg >= 2:
+            inferred.append("single_pass_aggregation")
+
+        # ── 6-8. CTE-based dimension/date isolation ──
+        if new_cte_names:
+            date_ctes = 0
+            dim_ctes = 0
+            fact_join_ctes = 0
+            multi_date_ctes = 0
+
+            for cte_name in new_cte_names:
+                cte_body = opt_ctes[cte_name]
+                table_refs = [t.lower() for t in _get_table_refs(cte_body)]
+                cte_sql = cte_body.sql(dialect=dialect).lower() if cte_body else ""
+
+                # Check if this CTE references date_dim with date filters
+                has_date_dim = "date_dim" in table_refs
+                has_date_filter = any(col in cte_sql for col in _DATE_FILTER_COLS)
+
+                # Check if this CTE references dimension tables (non-date)
+                dim_refs = [t for t in table_refs if t in _DIM_TABLES and t != "date_dim"]
+
+                # Check if this CTE joins a fact table with a pre-filtered dim
+                fact_tables = {"store_sales", "catalog_sales", "web_sales",
+                              "store_returns", "catalog_returns", "web_returns",
+                              "inventory"}
+                has_fact = any(t in fact_tables for t in table_refs)
+
+                if has_date_dim and has_date_filter and not has_fact:
+                    date_ctes += 1
+                elif dim_refs and not has_fact:
+                    dim_ctes += 1
+                elif has_fact and (has_date_dim or dim_refs):
+                    fact_join_ctes += 1
+
+            # 6. date_cte_isolate: New CTE referencing date_dim with filters
+            if date_ctes >= 1:
+                # Check for multiple date CTEs (multi_date_range_cte)
+                if date_ctes >= 2:
+                    multi_date_ctes = date_ctes
+
+            # 7. dimension_cte_isolate: New CTE referencing dimension tables
+            # 8. multi_dimension_prefetch: Multiple dimension CTEs
+
+            if date_ctes >= 1 and "date_cte_isolate" not in inferred:
+                inferred.append("date_cte_isolate")
+
+            if dim_ctes >= 2:
+                inferred.append("multi_dimension_prefetch")
+            elif dim_ctes >= 1:
+                inferred.append("dimension_cte_isolate")
+
+            if multi_date_ctes >= 2:
+                inferred.append("multi_date_range_cte")
+
+            # 9. prefetch_fact_join: CTE that joins fact table with pre-filtered dim
+            if fact_join_ctes >= 1:
+                inferred.append("prefetch_fact_join")
+
+        # ── 10. early_filter: WHERE pushed into CTE/subquery ──
+        # Detected when new CTEs contain WHERE clauses with selective filters
+        # and the outer query has fewer WHERE conditions
+        if new_cte_names and not inferred:
+            # If we added CTEs but didn't match any specific pattern above,
+            # it's likely an early_filter optimization
+            orig_where_count = len(list(orig_ast.find_all(exp.Where)))
+            opt_where_count = len(list(opt_ast.find_all(exp.Where)))
+            if opt_where_count > orig_where_count or new_cte_names:
+                inferred.append("early_filter")
+
+        # ── 11. pushdown: Filter predicates moved deeper ──
+        # Detected when WHERE clause conditions move from outer to inner queries
+        if not new_cte_names and not inferred:
+            # Check if existing CTEs got new WHERE clauses
+            for cte_name in set(orig_ctes.keys()) & set(opt_ctes.keys()):
+                orig_body_sql = orig_ctes[cte_name].sql(dialect=dialect).lower() if orig_ctes[cte_name] else ""
+                opt_body_sql = opt_ctes[cte_name].sql(dialect=dialect).lower() if opt_ctes[cte_name] else ""
+                if "where" in opt_body_sql and "where" not in orig_body_sql:
+                    inferred.append("pushdown")
+                    break
+
+        # ── 12. materialize_cte: Subexpression → CTE ──
+        # Only add if no more specific CTE pattern was found
+        if new_cte_names and "materialize_cte" not in inferred:
+            # Check if the new CTEs don't match date/dim/fact patterns
+            specific_cte_patterns = {
+                "date_cte_isolate", "dimension_cte_isolate",
+                "multi_dimension_prefetch", "prefetch_fact_join",
+                "multi_date_range_cte",
+            }
+            if not (set(inferred) & specific_cte_patterns):
+                inferred.append("materialize_cte")
+
+        # ── 13. early_filter additional: when existing CTEs get filters ──
+        if not inferred:
+            # Last resort: if CTEs existed but got modified with more conditions
+            for cte_name in set(orig_ctes.keys()) & set(opt_ctes.keys()):
+                orig_body = orig_ctes[cte_name].sql(dialect=dialect).lower() if orig_ctes[cte_name] else ""
+                opt_body = opt_ctes[cte_name].sql(dialect=dialect).lower() if opt_ctes[cte_name] else ""
+                if len(opt_body) > len(orig_body) * 1.1:  # Substantial change
+                    inferred.append("early_filter")
+                    break
 
     except Exception:
-        pass  # Silent fallback
+        pass  # Silent fallback - return whatever we found so far
+
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for t in inferred:
+        if t not in seen:
+            seen.add(t)
+            result.append(t)
+    return result
+
+
+def _count_case_in_aggregates(ast) -> int:
+    """Count CASE expressions nested inside aggregate functions (SUM, COUNT, AVG)."""
+    count = 0
+    agg_types = (exp.Sum, exp.Count, exp.Avg, exp.Min, exp.Max)
+    for agg in ast.find_all(*agg_types):
+        for case in agg.find_all(exp.Case, exp.If):
+            count += 1
+    return count
+
+
+def _infer_transforms_text_only(orig_lower: str, opt_lower: str) -> List[str]:
+    """Text-only heuristic fallback when AST parsing fails."""
+    inferred = []
+
+    # Check for CASE in aggregate pattern (single_pass_aggregation)
+    case_agg_pattern = r'(sum|count|avg)\s*\(\s*case\s+when'
+    opt_case_aggs = len(re.findall(case_agg_pattern, opt_lower))
+    orig_case_aggs = len(re.findall(case_agg_pattern, orig_lower))
+    if opt_case_aggs > orig_case_aggs and opt_case_aggs >= 2:
+        inferred.append("single_pass_aggregation")
+
+    # Check for new CTEs with date_dim
+    if "date_dim" in opt_lower and "as (" in opt_lower:
+        if opt_lower.count("as (") > orig_lower.count("as ("):
+            inferred.append("date_cte_isolate")
+
+    # Check for EXISTS increase
+    if opt_lower.count("exists") > orig_lower.count("exists"):
+        if orig_lower.count("intersect") > opt_lower.count("intersect"):
+            inferred.append("intersect_to_exists")
+
+    # Check for UNION ALL increase with OR decrease
+    if opt_lower.count("union all") > orig_lower.count("union all"):
+        if orig_lower.count(" or ") > opt_lower.count(" or "):
+            inferred.append("or_to_union")
+
+    # Check for more CTEs in general
+    if opt_lower.count("as (") > orig_lower.count("as ("):
+        if not inferred:
+            inferred.append("materialize_cte")
 
     return inferred
 

@@ -19,6 +19,14 @@
 - Was the principle implemented correctly:
 - If slower, why:
 
+## Validation Evidence (Required)
+- Schema parity evidence (same columns, same order):
+- Rowcount parity evidence (original vs candidate):
+- Checksum/hash parity evidence (original vs candidate):
+- Validation source files/commands:
+- Validation status: pass / fail / blocked
+- If blocked, exact blocker:
+
 ## Semantic Integrity Check
 - Drift risks observed:
 - Risk severity: low / medium / high

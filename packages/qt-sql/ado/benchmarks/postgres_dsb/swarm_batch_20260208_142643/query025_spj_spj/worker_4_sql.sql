@@ -1,0 +1,120 @@
+WITH filtered_d1 AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_moy = 6
+      AND d_year = 2002
+),
+filtered_d2 AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_moy BETWEEN 6 AND 8
+      AND d_year = 2002
+),
+filtered_d3 AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_moy BETWEEN 6 AND 8
+      AND d_year = 2002
+),
+filtered_store_sales AS (
+    SELECT
+        ss_item_sk,
+        ss_store_sk,
+        ss_customer_sk,
+        ss_ticket_number,
+        ss_net_profit,
+        ss_sold_date_sk
+    FROM store_sales
+    WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_d1)
+),
+filtered_store_returns AS (
+    SELECT
+        sr_item_sk,
+        sr_customer_sk,
+        sr_ticket_number,
+        sr_net_loss,
+        sr_returned_date_sk
+    FROM store_returns
+    WHERE sr_returned_date_sk IN (SELECT d_date_sk FROM filtered_d2)
+),
+filtered_catalog_sales AS (
+    SELECT
+        cs_item_sk,
+        cs_bill_customer_sk,
+        cs_order_number,
+        cs_net_profit,
+        cs_sold_date_sk
+    FROM catalog_sales
+    WHERE cs_sold_date_sk IN (SELECT d_date_sk FROM filtered_d3)
+),
+matched_store_sales AS (
+    SELECT DISTINCT fss.*
+    FROM filtered_store_sales fss
+    WHERE EXISTS (
+        SELECT 1
+        FROM filtered_store_returns fsr
+        WHERE fss.ss_customer_sk = fsr.sr_customer_sk
+          AND fss.ss_item_sk = fsr.sr_item_sk
+          AND fss.ss_ticket_number = fsr.sr_ticket_number
+    )
+      AND EXISTS (
+        SELECT 1
+        FROM filtered_catalog_sales fcs
+        WHERE fss.ss_customer_sk = fcs.cs_bill_customer_sk
+          AND fss.ss_item_sk = fcs.cs_item_sk
+    )
+),
+matched_store_returns AS (
+    SELECT DISTINCT fsr.*
+    FROM filtered_store_returns fsr
+    WHERE EXISTS (
+        SELECT 1
+        FROM filtered_store_sales fss
+        WHERE fss.ss_customer_sk = fsr.sr_customer_sk
+          AND fss.ss_item_sk = fsr.sr_item_sk
+          AND fss.ss_ticket_number = fsr.sr_ticket_number
+    )
+      AND EXISTS (
+        SELECT 1
+        FROM filtered_catalog_sales fcs
+        WHERE fsr.sr_customer_sk = fcs.cs_bill_customer_sk
+          AND fsr.sr_item_sk = fcs.cs_item_sk
+    )
+),
+matched_catalog_sales AS (
+    SELECT DISTINCT fcs.*
+    FROM filtered_catalog_sales fcs
+    WHERE EXISTS (
+        SELECT 1
+        FROM filtered_store_sales fss
+        WHERE fss.ss_customer_sk = fcs.cs_bill_customer_sk
+          AND fss.ss_item_sk = fcs.cs_item_sk
+    )
+      AND EXISTS (
+        SELECT 1
+        FROM filtered_store_returns fsr
+        WHERE fsr.sr_customer_sk = fcs.cs_bill_customer_sk
+          AND fsr.sr_item_sk = fcs.cs_item_sk
+    )
+)
+SELECT
+    MIN(i_item_id),
+    MIN(i_item_desc),
+    MIN(s_store_id),
+    MIN(s_store_name),
+    MIN(ss_net_profit),
+    MIN(sr_net_loss),
+    MIN(cs_net_profit),
+    MIN(ss_item_sk),
+    MIN(sr_ticket_number),
+    MIN(cs_order_number)
+FROM matched_store_sales
+JOIN item ON matched_store_sales.ss_item_sk = item.i_item_sk
+JOIN store ON matched_store_sales.ss_store_sk = store.s_store_sk
+CROSS JOIN matched_store_returns
+CROSS JOIN matched_catalog_sales
+WHERE matched_store_sales.ss_customer_sk = matched_store_returns.sr_customer_sk
+  AND matched_store_sales.ss_item_sk = matched_store_returns.sr_item_sk
+  AND matched_store_sales.ss_ticket_number = matched_store_returns.sr_ticket_number
+  AND matched_store_returns.sr_customer_sk = matched_catalog_sales.cs_bill_customer_sk
+  AND matched_store_returns.sr_item_sk = matched_catalog_sales.cs_item_sk;

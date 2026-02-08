@@ -1,0 +1,81 @@
+WITH filtered_date AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 1998
+    AND d_qoy IN (1, 2, 3)
+),
+filtered_item AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_color IN ('blanched', 'rosy')
+    AND i_manager_id BETWEEN 16 AND 35
+),
+filtered_ca AS (
+  SELECT ca_address_sk, ca_county
+  FROM customer_address
+  WHERE ca_state IN ('TX', 'VA')
+),
+ss_agg AS (
+  SELECT
+    ca.ca_county,
+    d.d_qoy,
+    d.d_year,
+    SUM(ss.ss_ext_sales_price) AS store_sales
+  FROM store_sales ss
+  JOIN filtered_date d ON ss.ss_sold_date_sk = d.d_date_sk
+  JOIN filtered_ca ca ON ss.ss_addr_sk = ca.ca_address_sk
+  JOIN filtered_item i ON ss.ss_item_sk = i.i_item_sk
+  WHERE ss.ss_list_price BETWEEN 286 AND 300
+  GROUP BY ca.ca_county, d.d_qoy, d.d_year
+),
+ws_agg AS (
+  SELECT
+    ca.ca_county,
+    d.d_qoy,
+    d.d_year,
+    SUM(ws.ws_ext_sales_price) AS web_sales
+  FROM web_sales ws
+  JOIN filtered_date d ON ws.ws_sold_date_sk = d.d_date_sk
+  JOIN filtered_ca ca ON ws.ws_bill_addr_sk = ca.ca_address_sk
+  JOIN filtered_item i ON ws.ws_item_sk = i.i_item_sk
+  WHERE ws.ws_list_price BETWEEN 286 AND 300
+  GROUP BY ca.ca_county, d.d_qoy, d.d_year
+),
+ss_pivot AS (
+  SELECT
+    ca_county,
+    MAX(CASE WHEN d_qoy = 1 THEN store_sales END) AS store_q1,
+    MAX(CASE WHEN d_qoy = 2 THEN store_sales END) AS store_q2,
+    MAX(CASE WHEN d_qoy = 3 THEN store_sales END) AS store_q3
+  FROM ss_agg
+  GROUP BY ca_county
+  HAVING
+    COUNT(CASE WHEN d_qoy = 1 THEN 1 END) = 1
+    AND COUNT(CASE WHEN d_qoy = 2 THEN 1 END) = 1
+    AND COUNT(CASE WHEN d_qoy = 3 THEN 1 END) = 1
+),
+ws_pivot AS (
+  SELECT
+    ca_county,
+    MAX(CASE WHEN d_qoy = 1 THEN web_sales END) AS web_q1,
+    MAX(CASE WHEN d_qoy = 2 THEN web_sales END) AS web_q2,
+    MAX(CASE WHEN d_qoy = 3 THEN web_sales END) AS web_q3
+  FROM ws_agg
+  GROUP BY ca_county
+  HAVING
+    COUNT(CASE WHEN d_qoy = 1 THEN 1 END) = 1
+    AND COUNT(CASE WHEN d_qoy = 2 THEN 1 END) = 1
+    AND COUNT(CASE WHEN d_qoy = 3 THEN 1 END) = 1
+)
+SELECT
+  s.ca_county,
+  1998 AS d_year,
+  w.web_q2 / NULLIF(w.web_q1, 0) AS web_q1_q2_increase,
+  s.store_q2 / NULLIF(s.store_q1, 0) AS store_q1_q2_increase,
+  w.web_q3 / NULLIF(w.web_q2, 0) AS web_q2_q3_increase,
+  s.store_q3 / NULLIF(s.store_q2, 0) AS store_q2_q3_increase
+FROM ss_pivot s
+JOIN ws_pivot w ON s.ca_county = w.ca_county
+WHERE w.web_q2 / NULLIF(w.web_q1, 0) > s.store_q2 / NULLIF(s.store_q1, 0)
+  AND w.web_q3 / NULLIF(w.web_q2, 0) > s.store_q3 / NULLIF(s.store_q2, 0)
+ORDER BY web_q1_q2_increase

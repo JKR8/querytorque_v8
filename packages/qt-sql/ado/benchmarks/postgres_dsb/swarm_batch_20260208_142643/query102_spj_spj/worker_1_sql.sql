@@ -1,0 +1,41 @@
+WITH filtered_d1 AS (
+    SELECT d_date_sk, d_date
+    FROM date_dim
+    WHERE d_year = 2002
+),
+filtered_item AS (
+    SELECT i_item_sk
+    FROM item
+    WHERE i_category IN ('Home', 'Men', 'Music')
+      AND i_manager_id IN (1, 2, 4, 11, 12, 14, 21, 29, 32, 52)
+),
+filtered_customer_address AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_state IN ('GA', 'MD', 'MO', 'NC', 'OR')
+)
+SELECT
+    MIN(ss_item_sk),
+    MIN(ss_ticket_number),
+    MIN(ws_order_number),
+    MIN(c_customer_sk),
+    MIN(cd_demo_sk),
+    MIN(hd_demo_sk)
+FROM store_sales
+INNER JOIN filtered_item ON store_sales.ss_item_sk = filtered_item.i_item_sk
+INNER JOIN filtered_d1 d1 ON store_sales.ss_sold_date_sk = d1.d_date_sk
+INNER JOIN customer ON store_sales.ss_customer_sk = customer.c_customer_sk
+INNER JOIN customer_demographics ON customer.c_current_cdemo_sk = customer_demographics.cd_demo_sk
+INNER JOIN household_demographics ON customer.c_current_hdemo_sk = household_demographics.hd_demo_sk
+INNER JOIN filtered_customer_address ON customer.c_current_addr_sk = filtered_customer_address.ca_address_sk
+INNER JOIN inventory ON inventory.inv_item_sk = store_sales.ss_item_sk
+                     AND inventory.inv_date_sk = store_sales.ss_sold_date_sk
+                     AND inventory.inv_quantity_on_hand >= store_sales.ss_quantity
+INNER JOIN web_sales ON web_sales.ws_item_sk = store_sales.ss_item_sk
+                     AND web_sales.ws_bill_customer_sk = customer.c_customer_sk
+                     AND web_sales.ws_warehouse_sk = inventory.inv_warehouse_sk
+INNER JOIN warehouse ON web_sales.ws_warehouse_sk = warehouse.w_warehouse_sk
+INNER JOIN store ON store.s_state = warehouse.w_state
+INNER JOIN date_dim d2 ON web_sales.ws_sold_date_sk = d2.d_date_sk
+WHERE d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '30 DAY')
+  AND web_sales.ws_wholesale_cost BETWEEN 34 AND 54;

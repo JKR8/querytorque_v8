@@ -46,12 +46,61 @@ def load_assignments(query_dir: Path) -> dict:
 
 
 def get_transforms_for_worker(query_dir: Path, worker_id: int) -> list:
-    """Extract transform/example names for a given worker."""
+    """Extract transform/example names for a given worker.
+
+    For workers 1-4: use assignments.json examples.
+    For workers 5-6 (snipe/final): infer from SQL diff using structural analysis.
+    """
     assignments = load_assignments(query_dir)
     if worker_id in assignments:
         a = assignments[worker_id]
-        return a.get("examples", [])
-    # For later-iteration workers (id=5,6 = snipe/final), try to infer
+        examples = a.get("examples", [])
+        if examples:
+            return examples
+
+    # For later-iteration workers (id=5,6 = snipe/final), infer from SQL diff
+    original_sql = ""
+    optimized_sql = ""
+
+    # Load original SQL
+    orig_path = query_dir / "original.sql"
+    if orig_path.exists():
+        with open(orig_path) as f:
+            original_sql = f.read().strip()
+
+    # Load optimized SQL for this worker
+    if worker_id == 5:
+        sql_path = query_dir / "snipe_worker_sql.sql"
+    elif worker_id == 6:
+        sql_path = query_dir / "final_worker_sql.sql"
+    else:
+        sql_path = query_dir / f"worker_{worker_id}_sql.sql"
+
+    if sql_path.exists():
+        with open(sql_path) as f:
+            optimized_sql = f.read().strip()
+
+    # Try SQL-diff inference
+    if original_sql and optimized_sql:
+        try:
+            import sys
+            # Ensure ado module is importable
+            project_root = Path(__file__).resolve().parent.parent.parent.parent.parent.parent
+            for p in [
+                str(project_root / "packages" / "qt-shared"),
+                str(project_root / "packages" / "qt-sql"),
+                str(project_root),
+            ]:
+                if p not in sys.path:
+                    sys.path.insert(0, p)
+            from ado.sql_rewriter import infer_transforms_from_sql_diff
+            inferred = infer_transforms_from_sql_diff(original_sql, optimized_sql)
+            if inferred:
+                return inferred
+        except Exception:
+            pass
+
+    # Last resort fallback (should rarely hit now)
     if worker_id == 5:
         return ["snipe_worker"]
     elif worker_id == 6:

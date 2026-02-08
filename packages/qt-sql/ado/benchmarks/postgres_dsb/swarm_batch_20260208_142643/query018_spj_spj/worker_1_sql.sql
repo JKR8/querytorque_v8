@@ -1,0 +1,45 @@
+WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 1998
+),
+filtered_item AS (
+    SELECT i_item_sk, i_item_id
+    FROM item
+    WHERE i_category = 'Jewelry'
+),
+filtered_customer_demographics AS (
+    SELECT cd_demo_sk, cd_dep_count
+    FROM customer_demographics
+    WHERE cd_gender = 'F'
+      AND cd_education_status = 'College'
+),
+filtered_customer AS (
+    SELECT c_customer_sk, c_birth_year, c_current_addr_sk
+    FROM customer
+    WHERE c_birth_month = 1
+),
+filtered_customer_address AS (
+    SELECT ca_address_sk, ca_country, ca_state, ca_county
+    FROM customer_address
+    WHERE ca_state IN ('GA', 'LA', 'SD')
+)
+SELECT
+  MIN(i_item_id),
+  MIN(ca_country),
+  MIN(ca_state),
+  MIN(ca_county),
+  MIN(cs_quantity),
+  MIN(cs_list_price),
+  MIN(cs_coupon_amt),
+  MIN(cs_sales_price),
+  MIN(cs_net_profit),
+  MIN(c_birth_year),
+  MIN(cd_dep_count)
+FROM catalog_sales
+JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk
+JOIN filtered_item ON cs_item_sk = filtered_item.i_item_sk
+JOIN filtered_customer_demographics ON cs_bill_cdemo_sk = filtered_customer_demographics.cd_demo_sk
+JOIN filtered_customer ON cs_bill_customer_sk = filtered_customer.c_customer_sk
+JOIN filtered_customer_address ON filtered_customer.c_current_addr_sk = filtered_customer_address.ca_address_sk
+WHERE cs_wholesale_cost BETWEEN 52 AND 57

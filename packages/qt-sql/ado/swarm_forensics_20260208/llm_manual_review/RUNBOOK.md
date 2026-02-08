@@ -15,11 +15,21 @@ Enable another LLM agent to perform strict manual forensic review for every prev
 2. Give reviewing LLM:
    - `REVIEW_PROMPT.md`
    - packet folder path.
-3. Save output into `packets/<query_id>/review_result.md`.
-4. Update `review_index.csv` status to `completed` and reviewer name.
-5. Repeat for all 52 queries.
+3. Save output into `packets/<query_id>/review_result.md` using `REVIEW_OUTPUT_TEMPLATE.md`.
+4. Ensure the review includes explicit strict-equivalence evidence:
+   - schema parity (same columns, same order)
+   - rowcount parity
+   - checksum/hash parity
+   or a blocker note.
+5. Update `review_index.csv` status:
+   - `completed` only if validation status is `pass`.
+   - `blocked` if rowcount/checksum evidence is missing or cannot be produced.
+6. Record reviewer name and blocker details in `notes` when applicable.
+7. Repeat for all queries.
 
 ## Completion Criteria
 - All queries have non-placeholder `review_result.md`.
-- `review_index.csv` has `status=completed` for all rows.
+- Every query has explicit validation status (`pass` or `blocked`) with evidence.
+- `pass` is allowed only when strict schema+rowcount+checksum parity is documented.
+- `review_index.csv` has no `not_started` rows.
 - Final synthesis should be written only after all per-query manual reviews are complete.

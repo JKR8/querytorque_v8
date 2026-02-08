@@ -1,0 +1,75 @@
+WITH filtered_date AS (
+    SELECT d_date_sk 
+    FROM date_dim 
+    WHERE d_year = 2002
+),
+filtered_customer_demographics AS (
+    SELECT cd_demo_sk 
+    FROM customer_demographics 
+    WHERE cd_gender = 'M' 
+      AND cd_marital_status = 'S' 
+      AND cd_education_status = 'Advanced Degree'
+),
+filtered_store AS (
+    SELECT s_store_sk, s_state 
+    FROM store 
+    WHERE s_state = 'VA'
+),
+filtered_item AS (
+    SELECT i_item_sk, i_item_id 
+    FROM item 
+    WHERE i_category = 'Jewelry'
+),
+base_aggregates AS (
+    SELECT 
+        i.i_item_id,
+        s.s_state,
+        ss.ss_quantity,
+        ss.ss_list_price,
+        ss.ss_coupon_amt,
+        ss.ss_sales_price
+    FROM store_sales ss
+    INNER JOIN filtered_date d ON ss.ss_sold_date_sk = d.d_date_sk
+    INNER JOIN filtered_customer_demographics cd ON ss.ss_cdemo_sk = cd.cd_demo_sk
+    INNER JOIN filtered_store s ON ss.ss_store_sk = s.s_store_sk
+    INNER JOIN filtered_item i ON ss.ss_item_sk = i.i_item_sk
+)
+-- Decompose ROLLUP using UNION ALL
+SELECT 
+    i_item_id,
+    s_state,
+    0 AS g_state,  -- GROUPING(s_state) when both columns are grouped
+    AVG(ss_quantity) AS agg1,
+    AVG(ss_list_price) AS agg2,
+    AVG(ss_coupon_amt) AS agg3,
+    AVG(ss_sales_price) AS agg4
+FROM base_aggregates
+GROUP BY i_item_id, s_state
+
+UNION ALL
+
+SELECT 
+    i_item_id,
+    NULL AS s_state,
+    1 AS g_state,  -- GROUPING(s_state) = 1 when s_state is rolled up
+    AVG(ss_quantity) AS agg1,
+    AVG(ss_list_price) AS agg2,
+    AVG(ss_coupon_amt) AS agg3,
+    AVG(ss_sales_price) AS agg4
+FROM base_aggregates
+GROUP BY i_item_id
+
+UNION ALL
+
+SELECT 
+    NULL AS i_item_id,
+    NULL AS s_state,
+    1 AS g_state,  -- GROUPING(s_state) = 1 for grand total
+    AVG(ss_quantity) AS agg1,
+    AVG(ss_list_price) AS agg2,
+    AVG(ss_coupon_amt) AS agg3,
+    AVG(ss_sales_price) AS agg4
+FROM base_aggregates
+
+ORDER BY i_item_id, s_state
+LIMIT 100;

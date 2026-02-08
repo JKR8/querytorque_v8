@@ -458,8 +458,13 @@ def extract_transforms(
     assignment: Optional[Dict[str, Any]],
     response_text: str,
     strategy: str,
+    original_sql: Optional[str] = None,
+    optimized_sql: Optional[str] = None,
 ) -> List[str]:
-    """3-tier transform extraction: assignments → response regex → strategy fallback."""
+    """4-tier transform extraction: assignments → response regex → strategy → SQL diff.
+
+    Tier 4 (SQL-diff inference) is the final fallback when Tiers 1-3 fail.
+    """
     # Tier 1: assignments.json examples list
     if assignment:
         examples = assignment.get("examples", [])
@@ -480,7 +485,32 @@ def extract_transforms(
         if mapped:
             return [mapped]
 
+    # Tier 4: SQL-diff inference (structural analysis)
+    if original_sql and optimized_sql:
+        from ado.sql_rewriter import infer_transforms_from_sql_diff
+        inferred = infer_transforms_from_sql_diff(original_sql, optimized_sql)
+        if inferred:
+            return inferred
+
     return []
+
+
+def relabel_query(original_sql: str, optimized_sql: str, dialect: str = "duckdb") -> List[str]:
+    """Relabel a query's transforms using SQL-diff inference.
+
+    Utility for re-labeling queries with placeholder/unknown labels.
+    Uses the enhanced infer_transforms_from_sql_diff() for structural detection.
+
+    Args:
+        original_sql: Original query SQL
+        optimized_sql: Optimized query SQL
+        dialect: SQL dialect for parsing
+
+    Returns:
+        List of inferred transform names
+    """
+    from ado.sql_rewriter import infer_transforms_from_sql_diff
+    return infer_transforms_from_sql_diff(original_sql, optimized_sql, dialect=dialect)
 
 
 def load_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -558,8 +588,12 @@ def extract_query_entries(
                 best_iter0 = bench_data.get("best_worker_id")
                 assignment = assignments_by_worker.get(best_iter0)
             else:
-                # Final worker uses reanalyze strategy
+                # Final worker: try reanalyze examples as pseudo-assignment
                 assignment = None
+                if reanalyze:
+                    reanalyze_examples = reanalyze.get("examples", [])
+                    if reanalyze_examples:
+                        assignment = {"examples": reanalyze_examples}
             strategy = (assignment or {}).get("strategy", "")
 
             # For iter2, try to get strategy from reanalyze
@@ -570,10 +604,24 @@ def extract_query_entries(
             status = classify_status(worker)
             speedup = worker.get("speedup", 0.0)
 
-            # Extract transforms
-            transforms = extract_transforms(assignment, response_text, strategy)
+            # Load SQL for Tier 4 inference fallback
+            original_sql_text = load_text(query_dir / "original.sql") or None
+            if iteration == 0:
+                opt_sql_file = f"worker_{wid}_sql.sql"
+            elif iteration == 1:
+                opt_sql_file = "snipe_worker_sql.sql"
+            else:
+                opt_sql_file = "final_worker_sql.sql"
+            optimized_sql_text = load_text(query_dir / opt_sql_file) or None
 
-            # For iter2, also try reanalyze examples
+            # Extract transforms (now with Tier 4 SQL-diff fallback)
+            transforms = extract_transforms(
+                assignment, response_text, strategy,
+                original_sql=original_sql_text,
+                optimized_sql=optimized_sql_text,
+            )
+
+            # For iter2, also try reanalyze examples if still empty
             if iteration == 2 and reanalyze and not transforms:
                 reanalyze_examples = reanalyze.get("examples", [])
                 transforms = [e for e in reanalyze_examples if e in KNOWN_TRANSFORMS]
@@ -1149,8 +1197,12 @@ def read_swarm_source(batch_dir: Path) -> Dict[str, List[SourceAttempt]]:
                 strategy = (assignment or {}).get("strategy", "")
                 examples = (assignment or {}).get("examples", [])
 
-                # Transforms
-                transforms = extract_transforms(assignment, response_text or "", strategy)
+                # Transforms (with Tier 4 SQL-diff fallback)
+                transforms = extract_transforms(
+                    assignment, response_text or "", strategy,
+                    original_sql=original_sql,
+                    optimized_sql=optimized_sql,
+                )
                 changes = extract_changes_section(response_text or "")
 
                 speedup = worker.get("speedup", 0.0)
