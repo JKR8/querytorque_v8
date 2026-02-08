@@ -1,6 +1,6 @@
 # ADO — Autonomous Data Optimization
 
-Iterative SQL optimization engine: parse query structure, retrieve similar examples via FAISS, generate rewrites with LLM, validate with real execution timing.
+Iterative SQL optimization engine: parse query structure, retrieve similar examples via tag-based matching, generate rewrites with LLM, validate with real execution timing.
 
 ## Architecture (ASCII)
 
@@ -13,7 +13,7 @@ Iterative SQL optimization engine: parse query structure, retrieve similar examp
                                 v
 +------------------------- Core Pipeline ----------------------+
 | 1 Parse -> DAG + cost (pipeline.py)                           |
-| 2 FAISS retrieval: examples + regressions (knowledge.py)      |
+| 2 Tag-based retrieval: examples + regressions (knowledge.py)  |
 | 3 Prompt + N candidates (node_prompter.py, generate.py,       |
 |    sql_rewriter.py)                                           |
 | 4 Syntax gate (sqlglot)                                       |
@@ -171,10 +171,15 @@ result = runner.run_analyst(
 **Fallback**: If the analyst produces malformed output or no worker strategies are extracted,
 V2 silently falls back to V1 (logged as warning). No data loss.
 
+**Strategy leaderboard**: V2 analyst prompt includes per-archetype transform success rates
+from historical benchmark data (`strategy_leaderboard.json`). The analyst sees which
+transforms work for the query's structural archetype and which to avoid.
+
 **V2 prompt files:**
-- `prompts/analyst_briefing.py` — Analyst prompt builder (~900 lines, 14-section input)
+- `prompts/analyst_briefing.py` — Analyst prompt builder (~900 lines, 14-section input + strategy leaderboard)
 - `prompts/worker_v2.py` — Worker prompt builder (attention-optimized 8-section output)
 - `prompts/swarm_parsers.py` — `parse_briefing_response()` + `ParsedBriefing` dataclasses
+- `benchmarks/duckdb_tpcds/build_strategy_leaderboard.py` — Builds leaderboard from benchmark history
 
 **Review samples:** `prompts/samples/generate_sample.py` renders analyst + worker prompts
 for Q74 using real benchmark data. Output: `prompts/samples/analyst_v2_query_74.md` and
@@ -205,7 +210,7 @@ PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.swarm_prep \
 ```
 
 Phase 0 caches EXPLAIN ANALYZE (DuckDB: runs live; PG: loads from `explains/sf10/`).
-Phase 1 builds fan-out prompts (DAG + FAISS + regression warnings).
+Phase 1 builds fan-out prompts (DAG + examples + regression warnings).
 
 ### 2. Run — LLM generation + benchmarking
 
@@ -256,20 +261,38 @@ print(f'{result.status} {result.best_speedup:.2f}x')
 "
 ```
 
-## Rebuilding the FAISS Index
+## Rebuilding the Example Index
+
+Tag-based matching (no FAISS/numpy). Extracts table names, SQL keywords, and structural
+patterns from gold examples, then ranks by tag overlap count at query time.
 
 ```bash
 cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
 PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.faiss_builder
 ```
 
+Output: `models/similarity_tags.json` + `similarity_metadata.json` (108 examples).
+
 ## Validation Rules
 
-Only 2 valid ways to validate query speedup:
+Only 2 valid ways to **confirm** a speedup for promotion:
 1. **3-run**: Run 3 times, discard 1st (warmup), average last 2
 2. **5-run trimmed mean**: Run 5 times, remove min/max, average remaining 3
 
+For **quick screening between rounds**, use a **2x check**: run twice, discard 1st (warmup),
+use 2nd run. This is fast but noisy — only use it to filter obvious regressions before
+committing to a full validation run. Never promote a result based on a 2x check alone.
+
 Never use single-run comparisons.
+
+### Why not EXPLAIN cost gates?
+
+EXPLAIN (estimated) cost does **not** reliably predict runtime speedup. Observed failures:
+- PG CTE short-circuiting: original skips expensive CTEs at runtime, but EXPLAIN costs them
+- OR-join fan-out: EXPLAIN underestimates nested-loop blowup from `(a.col = x OR b.col = x)`
+- Q031: EXPLAIN predicted 4.55x improvement, actual was 0.33x regression
+
+**Do not use EXPLAIN cost as an intermediate gate.** Use 2x runtime checks instead.
 
 ## Documentation
 
@@ -281,7 +304,7 @@ Product refactor plan (qt-sql centered): **[docs/QT_SQL_ADO_PRODUCT_REFACTOR_PLA
 
 ```
 ado/
-├── pipeline.py       # 5-phase orchestrator (parse → FAISS → rewrite → syntax → validate)
+├── pipeline.py       # 5-phase orchestrator (parse → retrieve → rewrite → syntax → validate)
 ├── node_prompter.py  # Prompt builder (attention-optimized sections)
 ├── analyst.py        # LLM-guided structural analysis
 ├── analyst_session.py # Expert mode session driver
@@ -291,8 +314,8 @@ ado/
 ├── validate.py       # Timing + correctness validation
 ├── schemas.py        # Data structures (BenchmarkConfig, SessionResult, etc.)
 ├── learn.py          # Learning records + analytics
-├── knowledge.py      # FAISS recommender (example retrieval)
-├── faiss_builder.py  # Build/rebuild FAISS similarity index
+├── knowledge.py      # Example recommender (tag-based retrieval)
+├── faiss_builder.py  # Build/rebuild tag-based similarity index
 ├── context.py        # Context management
 ├── store.py          # Result storage
 ├── session_logging.py # Session log utilities
@@ -305,7 +328,7 @@ ado/
 ├── examples/         # 21 gold examples (16 DuckDB + 5 PostgreSQL)
 │   ├── duckdb/       # Gold examples with principle fields
 │   └── postgres/     # PostgreSQL-specific gold examples
-├── models/           # FAISS similarity index + metadata
+├── models/           # Tag-based similarity index + metadata
 ├── prompts/          # Swarm prompt builders (V1 fan-out, V2 analyst briefing, parsers)
 ├── sessions/         # Session drivers (standard, expert, swarm)
 ├── learnings/        # Learning journal data
