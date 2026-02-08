@@ -457,12 +457,26 @@ class SwarmSession(OptimizationSession):
             self.original_sql, engine=self.engine, k=3
         )
 
+        # Strategy leaderboard + query archetype
+        strategy_leaderboard = None
+        query_archetype = None
+        benchmark_dir = Path(__file__).resolve().parent.parent / "benchmarks" / "duckdb_tpcds"
+        leaderboard_path = benchmark_dir / "strategy_leaderboard.json"
+        if leaderboard_path.exists():
+            try:
+                strategy_leaderboard = json.loads(leaderboard_path.read_text())
+                from ..faiss_builder import extract_tags, classify_category
+                query_archetype = classify_category(extract_tags(self.original_sql, dialect=self.dialect))
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] Failed to load strategy leaderboard: {e}")
+
         self._stage(
             self.query_id,
             f"V2: Data ready — {len(matched_examples)} examples, "
             f"{len(constraints)} constraints, "
             f"EXPLAIN={'yes' if explain_plan_text else 'no'}, "
-            f"GlobalKnowledge={'yes' if global_knowledge else 'no'} "
+            f"GlobalKnowledge={'yes' if global_knowledge else 'no'}"
+            f"{f', archetype={query_archetype}' if query_archetype else ''} "
             f"({_fmt_elapsed(time.time() - t0)})"
         )
 
@@ -480,6 +494,8 @@ class SwarmSession(OptimizationSession):
             constraints=constraints,
             regression_warnings=regression_warnings,
             dialect=self.dialect,
+            strategy_leaderboard=strategy_leaderboard,
+            query_archetype=query_archetype,
         )
 
         # ── Step 3: Call analyst LLM ─────────────────────────────────────

@@ -547,6 +547,26 @@ Select 4 transforms that are applicable to THIS query, maximizing structural div
 - **exists_restructuring**: Convert INTERSECT to EXISTS for semi-join short-circuit, or restructure complex EXISTS with shared CTEs. CHECK: does the query actually have INTERSECT or complex EXISTS.
   Maps to examples: intersect_to_exists, multi_intersect_exists_cte
 
+## Strategy Leaderboard (observed success rates)
+
+Archetype: **filter_pushdown** (20 queries in pool, 144 total attempts)
+
+| Transform | Attempts | Win Rate | Avg Speedup | Avoid? |
+|-----------|----------|----------|-------------|--------|
+| multi_date_range_cte | 6 | 83% | 1.18x |  |
+| union_cte_split | 5 | 60% | 1.01x |  |
+| multi_dimension_prefetch | 14 | 50% | 1.44x |  |
+| dimension_cte_isolate | 18 | 50% | 1.11x |  |
+| decorrelate | 22 | 46% | 1.20x |  |
+| date_cte_isolate | 52 | 44% | 1.19x |  |
+| prefetch_fact_join | 30 | 40% | 1.14x |  |
+| single_pass_aggregation | 15 | 33% | 1.20x |  |
+| pushdown | 40 | 30% | 0.99x |  |
+| or_to_union | 27 | 30% | 1.07x |  |
+| materialize_cte | 22 | 27% | 0.97x |  |
+| intersect_to_exists | 15 | 27% | 0.85x |  |
+| early_filter | 25 | 20% | 1.01x |  |
+
 ## Strategy Selection Rules
 
 1. **CHECK APPLICABILITY**: Each transform has a structural prerequisite (correlated subquery, UNION ALL CTE, LEFT JOIN, etc.). Verify the query actually has the prerequisite before assigning a transform. DO NOT assign decorrelation if there are no correlated subqueries.

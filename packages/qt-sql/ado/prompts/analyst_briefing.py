@@ -349,6 +349,75 @@ def _format_global_knowledge(gk: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _section_strategy_leaderboard(
+    leaderboard: Dict[str, Any],
+    archetype: str,
+) -> str:
+    """Format strategy leaderboard section for a specific archetype.
+
+    Shows observed success rates per transform so the analyst can make
+    data-driven strategy selections instead of guessing.
+    """
+    lines: list[str] = []
+
+    arch_summary = leaderboard.get("archetype_summary", {}).get(archetype)
+    if not arch_summary:
+        return ""
+
+    lines.append(f"## Strategy Leaderboard (observed success rates)")
+    lines.append("")
+    lines.append(
+        f"Archetype: **{archetype}** ({arch_summary['query_count']} queries in pool, "
+        f"{arch_summary['total_attempts']} total attempts)"
+    )
+    lines.append("")
+
+    # Get transforms for this archetype
+    transforms = leaderboard.get("transform_by_archetype", {}).get(archetype, {})
+    if not transforms:
+        lines.append("*No transform data available for this archetype.*")
+        return "\n".join(lines)
+
+    # Get elimination list
+    elim = leaderboard.get("elimination_table", {}).get(archetype, {})
+    avoid_set = set(elim.get("avoid", []))
+    elim_reasons = elim.get("reason", {})
+
+    # Sort by success_rate descending, then avg_speedup
+    ranked = sorted(
+        transforms.items(),
+        key=lambda x: (-x[1]["success_rate"], -x[1]["avg_speedup_all"]),
+    )
+
+    # Filter to transforms with at least 3 attempts (enough signal)
+    ranked = [(t, d) for t, d in ranked if d["attempts"] >= 3]
+
+    if not ranked:
+        lines.append("*Insufficient data (< 3 attempts per transform).*")
+        return "\n".join(lines)
+
+    lines.append("| Transform | Attempts | Win Rate | Avg Speedup | Avoid? |")
+    lines.append("|-----------|----------|----------|-------------|--------|")
+
+    for transform, data in ranked:
+        avoid_flag = "AVOID" if transform in avoid_set else ""
+        win_pct = f"{data['success_rate']:.0%}"
+        avg_sp = f"{data['avg_speedup_all']:.2f}x"
+        lines.append(
+            f"| {transform} | {data['attempts']} | {win_pct} | {avg_sp} | {avoid_flag} |"
+        )
+
+    # Show elimination reasons if any
+    if avoid_set:
+        lines.append("")
+        lines.append("**Elimination reasons:**")
+        for t in sorted(avoid_set):
+            reason = elim_reasons.get(t, "low success rate")
+            lines.append(f"- **{t}**: {reason}")
+
+    return "\n".join(lines)
+
+
 def build_analyst_briefing_prompt(
     query_id: str,
     sql: str,
@@ -363,6 +432,8 @@ def build_analyst_briefing_prompt(
     regression_warnings: Optional[List[Dict[str, Any]]],
     dialect: str = "duckdb",
     dialect_version: Optional[str] = None,
+    strategy_leaderboard: Optional[Dict[str, Any]] = None,
+    query_archetype: Optional[str] = None,
 ) -> str:
     """Build the V2 analyst briefing prompt.
 
@@ -383,6 +454,8 @@ def build_analyst_briefing_prompt(
         regression_warnings: Tag-matched regression examples (may be None)
         dialect: SQL dialect
         dialect_version: Engine version string (e.g., '1.4.3')
+        strategy_leaderboard: Pre-built leaderboard JSON (from build_strategy_leaderboard.py)
+        query_archetype: Archetype classification for this query (e.g., 'scan_consolidation')
 
     Returns:
         Complete analyst prompt string (~3000-5000 tokens input)
@@ -832,6 +905,15 @@ def build_analyst_briefing_prompt(
         "  Maps to examples: intersect_to_exists, multi_intersect_exists_cte"
     )
     lines.append("")
+
+    # ── 13b. Strategy Leaderboard (observed success rates) ────────────────
+    if strategy_leaderboard and query_archetype:
+        leaderboard_section = _section_strategy_leaderboard(
+            strategy_leaderboard, query_archetype
+        )
+        if leaderboard_section:
+            lines.append(leaderboard_section)
+            lines.append("")
 
     # ── 14. Strategy Selection Rules ──────────────────────────────────────
     lines.append("## Strategy Selection Rules")

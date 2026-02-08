@@ -321,6 +321,19 @@ def main():
     constraints = load_constraints()
     regression_warnings = load_regression_warnings(original_sql, recommender)
 
+    # ── Strategy leaderboard + archetype ──────────────────────────
+    strategy_leaderboard = None
+    query_archetype = None
+    leaderboard_path = BENCHMARK_DIR / "strategy_leaderboard.json"
+    if leaderboard_path.exists():
+        strategy_leaderboard = json.loads(leaderboard_path.read_text())
+        from ado.faiss_builder import extract_tags, classify_category
+        query_archetype = classify_category(extract_tags(original_sql, dialect="duckdb"))
+        print(f"Strategy leaderboard: {strategy_leaderboard['total_attempts']} attempts, "
+              f"archetype={query_archetype}")
+    else:
+        print("No strategy leaderboard found (run build_strategy_leaderboard.py first)")
+
     # ── Analyst prompt ──────────────────────────────────────────────
     from ado.prompts.analyst_briefing import build_analyst_briefing_prompt
 
@@ -345,6 +358,8 @@ def main():
         regression_warnings=regression_warnings,
         dialect="duckdb",
         dialect_version=dialect_version,
+        strategy_leaderboard=strategy_leaderboard,
+        query_archetype=query_archetype,
     )
 
     analyst_path = SAMPLES_DIR / f"analyst_v2_{QUERY_ID}.md"
