@@ -21,7 +21,6 @@ Nothing else at runtime.
                          |      qt-shared       |
                          |----------------------|
                          | llm / config / obs   |
-                         | auth / session APIs  |
                          +----------+-----------+
                                     ^
                                     |
@@ -73,7 +72,8 @@ Rules:
 
 ### 3.3 What to fork from qt_sql into ado
 
-Three modules currently cross the boundary. Fork the minimum needed:
+Three ADO files import from six `qt_sql` modules. Fork into two new ADO files
+plus inline changes to two existing ones:
 
 | qt_sql source | Fork to | What ADO actually uses |
 |---------------|---------|----------------------|
@@ -106,15 +106,40 @@ No other source of queries, explains, or intents. Seed is the single source.
 
 ### 4.2 Named runs (write)
 
+All modes write to the same root. The iteration/phase layer captures every
+prompt and response at every stage — nothing is overwritten.
+
 ```text
 benchmarks/<benchmark>/runs/<run_name>/
   run.yaml                   # Config: mode, workers, query_filter
   results/<query_id>/
-    worker_<id>/
-      prompt.txt
+    iteration_00_fan_out/    # Swarm: fan-out phase
+      analyst_prompt.txt     # Analyst distributes strategies
+      analyst_response.txt
+      worker_01/
+        prompt.txt           # Worker rewrite prompt
+        response.txt         # LLM response
+        optimized.sql
+        validation.json
+      worker_02/ ...
+      worker_04/
+    iteration_01_snipe/      # Swarm: snipe refinement
+      analyst_prompt.txt     # Analyst synthesizes failures
+      analyst_response.txt
+      worker_01/
+        prompt.txt
+        response.txt
+        optimized.sql
+        validation.json
+    iteration_00/            # Expert: analyst round 0
+      prompt.txt             # Rewrite prompt
       response.txt
+      analysis.txt           # Analyst structural guidance
       optimized.sql
       validation.json
+      failure_analysis.txt   # Why it failed (feeds next iter)
+    iteration_01/            # Expert: analyst round 1
+      ...
     best.json
   blackboard/
     raw/<query_id>/worker_<id>.json
@@ -124,7 +149,13 @@ benchmarks/<benchmark>/runs/<run_name>/
   logs/run.log
 ```
 
-No `state_0/`, `state_1/`, `swarm_sessions/`, or mode-specific paths.
+The iteration directory naming encodes the mode:
+- Swarm: `iteration_<NN>_fan_out/` or `iteration_<NN>_snipe/`
+- Expert: `iteration_<NN>/`
+- Standard: `iteration_00/` (single iteration, no phase)
+
+No `state_0/`, `state_1/`, `swarm_sessions/`, `analyst_sessions/`, or
+mode-specific root paths. Every mode writes under `runs/<name>/results/`.
 
 ### 4.3 Knowledge (accumulated)
 
@@ -136,7 +167,10 @@ Built from blackboard collation. Loaded at pipeline init. Served in prompts.
 
 ## 5) Provenance
 
-Every `best.json` and leaderboard entry includes:
+Every `best.json` and leaderboard entry uses a mode-agnostic schema.
+Fields that don't apply to a mode are omitted (not nulled).
+
+### 5.1 Common fields (all modes)
 
 ```json
 {
@@ -144,17 +178,50 @@ Every `best.json` and leaderboard entry includes:
   "run_name": "discovery_20260208",
   "mode": "swarm",
   "iteration": 1,
-  "worker_id": 3,
-  "strategy": "W4_single_pass",
-  "source": "run:discovery_20260208:mode:swarm:iter:1:worker:3",
   "status": "WIN",
   "speedup": 5.25,
-  "transforms": ["or_to_union"]
+  "transforms": ["or_to_union"],
+  "source": "run:discovery_20260208:mode:swarm:iter:1:worker:3"
 }
 ```
 
-`best_worker_id` must reflect the actual winning worker.
-Current bug: `run_named_session()` hardcodes `best_worker_id=0`. Fix required.
+### 5.2 Mode-specific fields
+
+| Field | Swarm | Expert | Standard |
+|-------|-------|--------|----------|
+| `worker_id` | 1-4 (fan-out), 1 (snipe) | omit | omit |
+| `strategy` | W1_pushdown, snipe_1, etc. | omit | omit |
+| `phase` | fan_out, snipe | omit | omit |
+| `analyst_iteration` | omit | 0, 1, 2... | omit |
+
+### 5.3 Source string format
+
+Mode-aware, includes only relevant dimensions:
+
+- Swarm: `run:<name>:mode:swarm:iter:<N>:phase:<phase>:worker:<id>`
+- Expert: `run:<name>:mode:expert:iter:<N>`
+- Standard: `run:<name>:mode:standard`
+
+### 5.4 Blackboard entry model
+
+All modes write blackboard entries. The entry schema is the same — modes
+that lack `worker_id` or `strategy` leave those fields empty/zero.
+
+| Mode | Blackboard entries per query |
+|------|----------------------------|
+| Swarm fan-out | 1 per worker (4) + 1 analyst failure analysis (worker_id=100) |
+| Swarm snipe | 1 per snipe worker + 1 analyst failure analysis per snipe |
+| Expert | 1 per iteration + 1 failure analysis per failed iteration |
+| Standard | 1 per query |
+
+Expert mode currently skips blackboard writes. This must be fixed so expert
+learnings feed the knowledge lifecycle.
+
+### 5.5 Current bugs to fix
+
+1. `run_named_session()` hardcodes `best_worker_id=0` — must capture actual winner.
+2. Expert mode saves to `analyst_sessions/` — must save to `runs/<name>/results/`.
+3. Expert mode writes no blackboard entries — must write per-iteration entries.
 
 ## 6) Blackboard and Knowledge Lifecycle
 
@@ -178,7 +245,10 @@ Manual workflow documented in `ado/docs/blackboard_workflow.yaml`.
 Stage banners for human scanability in swarm and expert flows.
 
 ### 7.2 Structured artifacts
-Every worker attempt persists: prompt, response, SQL, validation, blackboard entry.
+Every iteration persists all prompts at every stage:
+- Swarm: analyst prompt/response + per-worker prompt/response/SQL/validation
+- Expert: prompt + analysis + response + SQL + validation + failure_analysis
+- All modes: one blackboard entry per validated attempt
 
 ### 7.3 Per-run log file
 `runs/<run_name>/logs/run.log` with structured lines:
@@ -196,7 +266,7 @@ grep -rn "from qt_sql\|import qt_sql" ado/ --include="*.py" | grep -v "^Binary"
 Zero tolerance. No matches = pass.
 
 ### 8.2 Functional
-1. `pytest packages/qt-sql/tests/` — all pass
+1. `pytest packages/qt-sql/tests/test_ado*.py` — ADO tests pass
 2. Smoke test: single-query swarm run produces:
    - `runs/<name>/results/<query_id>/best.json` with correct `worker_id`
    - `runs/<name>/blackboard/raw/` populated
@@ -220,12 +290,13 @@ ADO runs with restricted PYTHONPATH (no qt_sql on path). No import errors.
 ### Remaining
 1. **Fork qt_sql dependencies** — create `ado/dag.py` and `ado/execution.py`
 2. **Delete all qt_sql imports** — no fallbacks, no try/except shims
-3. **Fix provenance** — `best_worker_id` from actual winner, `source` lineage string
-4. **Per-run log file** — file handler in `run_named_session()`
-5. **Delete legacy paths** — remove `state_N` refs, `queries/` fallback, `semantic_intents.json` fallback
-6. **Import lint** — add grep check (gate 8.1)
-7. **Smoke test script** — `python3 -m ado.smoke_test <benchmark> <run_name>`
-8. **Run all tests** — verify zero regressions
+3. **Fix swarm provenance** — `best_worker_id` from actual winner, mode-aware `source` string
+4. **Fix expert mode integration** — save to `runs/<name>/results/`, write blackboard entries per iteration, use `iteration_<NN>/` path structure
+5. **Per-run log file** — file handler in `run_named_session()`
+6. **Delete legacy paths** — remove `state_N` refs, `queries/` fallback, `semantic_intents.json` fallback, `analyst_sessions/` and `swarm_sessions/` root paths
+7. **Import lint** — add grep check (gate 8.1)
+8. **Smoke test script** — `python3 -m ado.smoke_test <benchmark> <run_name>`
+9. **Run ADO tests** — `pytest packages/qt-sql/tests/test_ado*.py`, verify zero regressions
 
 ## 10) Non-Goals
 
