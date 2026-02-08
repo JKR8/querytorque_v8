@@ -1,0 +1,47 @@
+WITH filtered_address AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_city = 'Oakwood'
+),
+filtered_income_band AS (
+    SELECT ib_income_band_sk
+    FROM income_band
+    WHERE ib_lower_bound >= 5806
+      AND ib_upper_bound <= 5806 + 50000
+),
+filtered_household_demographics AS (
+    SELECT hd_demo_sk
+    FROM household_demographics
+    JOIN filtered_income_band ON ib_income_band_sk = hd_income_band_sk
+),
+filtered_customer_demographics AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+),
+filtered_customer AS (
+    SELECT 
+        c_customer_id,
+        c_last_name,
+        c_first_name,
+        c_current_cdemo_sk,
+        c_current_hdemo_sk
+    FROM customer
+    JOIN filtered_address ON c_current_addr_sk = ca_address_sk
+    JOIN filtered_household_demographics ON c_current_hdemo_sk = hd_demo_sk
+),
+filtered_customer_with_demo AS (
+    SELECT 
+        fc.c_customer_id,
+        fc.c_last_name,
+        fc.c_first_name,
+        cd.cd_demo_sk
+    FROM filtered_customer fc
+    JOIN filtered_customer_demographics cd ON fc.c_current_cdemo_sk = cd.cd_demo_sk
+)
+SELECT
+    c_customer_id AS customer_id,
+    COALESCE(c_last_name, '') || ', ' || COALESCE(c_first_name, '') AS customername
+FROM filtered_customer_with_demo fcd
+JOIN store_returns sr ON fcd.cd_demo_sk = sr.sr_cdemo_sk
+ORDER BY c_customer_id
+LIMIT 100

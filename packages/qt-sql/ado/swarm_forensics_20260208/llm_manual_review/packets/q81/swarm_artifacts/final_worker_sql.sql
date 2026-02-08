@@ -1,0 +1,77 @@
+WITH ca_customers AS (
+  SELECT 
+    c_customer_sk,
+    c_customer_id,
+    c_salutation,
+    c_first_name,
+    c_last_name,
+    ca_address_sk,
+    ca_street_number,
+    ca_street_name,
+    ca_street_type,
+    ca_suite_number,
+    ca_city,
+    ca_county,
+    ca_state,
+    ca_zip,
+    ca_country,
+    ca_gmt_offset,
+    ca_location_type
+  FROM customer
+  JOIN customer_address ON c_current_addr_sk = ca_address_sk
+  WHERE ca_state = 'CA'
+),
+filtered_dates AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 2002
+),
+customer_returns AS (
+  SELECT
+    cr.cr_returning_customer_sk,
+    ca.ca_state,
+    SUM(cr.cr_return_amt_inc_tax) AS ctr_total_return,
+    AVG(SUM(cr.cr_return_amt_inc_tax)) OVER (PARTITION BY ca.ca_state) * 1.2 AS state_avg_120pct
+  FROM catalog_returns cr
+  JOIN filtered_dates fd ON cr.cr_returned_date_sk = fd.d_date_sk
+  JOIN customer_address ca ON cr.cr_returning_addr_sk = ca.ca_address_sk
+  GROUP BY cr.cr_returning_customer_sk, ca.ca_state
+)
+SELECT
+  cc.c_customer_id,
+  cc.c_salutation,
+  cc.c_first_name,
+  cc.c_last_name,
+  cc.ca_street_number,
+  cc.ca_street_name,
+  cc.ca_street_type,
+  cc.ca_suite_number,
+  cc.ca_city,
+  cc.ca_county,
+  cc.ca_state,
+  cc.ca_zip,
+  cc.ca_country,
+  cc.ca_gmt_offset,
+  cc.ca_location_type,
+  cr.ctr_total_return
+FROM customer_returns cr
+JOIN ca_customers cc ON cr.cr_returning_customer_sk = cc.c_customer_sk
+WHERE cr.ctr_total_return > cr.state_avg_120pct
+ORDER BY
+  cc.c_customer_id,
+  cc.c_salutation,
+  cc.c_first_name,
+  cc.c_last_name,
+  cc.ca_street_number,
+  cc.ca_street_name,
+  cc.ca_street_type,
+  cc.ca_suite_number,
+  cc.ca_city,
+  cc.ca_county,
+  cc.ca_state,
+  cc.ca_zip,
+  cc.ca_country,
+  cc.ca_gmt_offset,
+  cc.ca_location_type,
+  cr.ctr_total_return
+LIMIT 100

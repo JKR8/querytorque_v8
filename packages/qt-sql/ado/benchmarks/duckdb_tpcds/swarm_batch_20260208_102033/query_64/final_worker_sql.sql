@@ -1,0 +1,154 @@
+WITH filtered_item AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_color IN ('blanched', 'medium', 'brown', 'chocolate', 'burlywood', 'drab')
+    AND i_current_price BETWEEN 24 AND 33  -- Consolidated: 23+1 to 23+15
+),
+cs_ui AS (
+  SELECT
+    cs.cs_item_sk,
+    SUM(cs.cs_ext_list_price) AS sale,
+    SUM(cr.cr_refunded_cash + cr.cr_reversed_charge + cr.cr_store_credit) AS refund
+  FROM catalog_sales cs
+  JOIN catalog_returns cr
+    ON cs.cs_item_sk = cr.cr_item_sk
+   AND cs.cs_order_number = cr.cr_order_number
+  JOIN filtered_item fi
+    ON cs.cs_item_sk = fi.i_item_sk
+  GROUP BY cs.cs_item_sk
+  HAVING SUM(cs.cs_ext_list_price) > 2 * SUM(cr.cr_refunded_cash + cr.cr_reversed_charge + cr.cr_store_credit)
+),
+filtered_d1 AS (
+  SELECT d_date_sk, d_year
+  FROM date_dim
+  WHERE d_year IN (2001, 2002)
+),
+pre_joined_sales AS (
+  SELECT
+    ss.ss_item_sk,
+    ss.ss_ticket_number,
+    ss.ss_store_sk,
+    ss.ss_customer_sk,
+    ss.ss_cdemo_sk,
+    ss.ss_hdemo_sk,
+    ss.ss_addr_sk,
+    ss.ss_promo_sk,
+    ss.ss_wholesale_cost,
+    ss.ss_list_price,
+    ss.ss_coupon_amt,
+    d1.d_year AS syear
+  FROM store_sales ss
+  JOIN filtered_d1 d1
+    ON ss.ss_sold_date_sk = d1.d_date_sk
+  JOIN filtered_item fi
+    ON ss.ss_item_sk = fi.i_item_sk
+),
+cross_sales AS (
+  SELECT
+    i.i_product_name AS product_name,
+    i.i_item_sk AS item_sk,
+    s.s_store_name AS store_name,
+    s.s_zip AS store_zip,
+    ad1.ca_street_number AS b_street_number,
+    ad1.ca_street_name AS b_street_name,
+    ad1.ca_city AS b_city,
+    ad1.ca_zip AS b_zip,
+    ad2.ca_street_number AS c_street_number,
+    ad2.ca_street_name AS c_street_name,
+    ad2.ca_city AS c_city,
+    ad2.ca_zip AS c_zip,
+    pjs.syear,
+    d2.d_year AS fsyear,
+    d3.d_year AS s2year,
+    COUNT(*) AS cnt,
+    SUM(pjs.ss_wholesale_cost) AS s1,
+    SUM(pjs.ss_list_price) AS s2,
+    SUM(pjs.ss_coupon_amt) AS s3
+  FROM pre_joined_sales pjs
+  JOIN store_returns sr
+    ON pjs.ss_item_sk = sr.sr_item_sk
+   AND pjs.ss_ticket_number = sr.sr_ticket_number
+  JOIN cs_ui
+    ON pjs.ss_item_sk = cs_ui.cs_item_sk
+  JOIN store s
+    ON pjs.ss_store_sk = s.s_store_sk
+  JOIN customer c
+    ON pjs.ss_customer_sk = c.c_customer_sk
+  JOIN customer_demographics cd1
+    ON pjs.ss_cdemo_sk = cd1.cd_demo_sk
+  JOIN customer_demographics cd2
+    ON c.c_current_cdemo_sk = cd2.cd_demo_sk
+  JOIN household_demographics hd1
+    ON pjs.ss_hdemo_sk = hd1.hd_demo_sk
+  JOIN household_demographics hd2
+    ON c.c_current_hdemo_sk = hd2.hd_demo_sk
+  JOIN customer_address ad1
+    ON pjs.ss_addr_sk = ad1.ca_address_sk
+  JOIN customer_address ad2
+    ON c.c_current_addr_sk = ad2.ca_address_sk
+  JOIN promotion p
+    ON pjs.ss_promo_sk = p.p_promo_sk
+  JOIN date_dim d2
+    ON c.c_first_sales_date_sk = d2.d_date_sk
+  JOIN date_dim d3
+    ON c.c_first_shipto_date_sk = d3.d_date_sk
+  JOIN income_band ib1
+    ON hd1.hd_income_band_sk = ib1.ib_income_band_sk
+  JOIN income_band ib2
+    ON hd2.hd_income_band_sk = ib2.ib_income_band_sk
+  JOIN item i
+    ON pjs.ss_item_sk = i.i_item_sk
+  WHERE cd1.cd_marital_status <> cd2.cd_marital_status
+  GROUP BY
+    i.i_product_name,
+    i.i_item_sk,
+    s.s_store_name,
+    s.s_zip,
+    ad1.ca_street_number,
+    ad1.ca_street_name,
+    ad1.ca_city,
+    ad1.ca_zip,
+    ad2.ca_street_number,
+    ad2.ca_street_name,
+    ad2.ca_city,
+    ad2.ca_zip,
+    pjs.syear,
+    d2.d_year,
+    d3.d_year
+)
+SELECT
+  cs1.product_name,
+  cs1.store_name,
+  cs1.store_zip,
+  cs1.b_street_number,
+  cs1.b_street_name,
+  cs1.b_city,
+  cs1.b_zip,
+  cs1.c_street_number,
+  cs1.c_street_name,
+  cs1.c_city,
+  cs1.c_zip,
+  cs1.syear,
+  cs1.cnt,
+  cs1.s1 AS s11,
+  cs1.s2 AS s21,
+  cs1.s3 AS s31,
+  cs2.s1 AS s12,
+  cs2.s2 AS s22,
+  cs2.s3 AS s32,
+  cs2.syear,
+  cs2.cnt
+FROM cross_sales cs1
+JOIN cross_sales cs2
+  ON cs1.item_sk = cs2.item_sk
+ AND cs1.store_name = cs2.store_name
+ AND cs1.store_zip = cs2.store_zip
+WHERE cs1.syear = 2001
+  AND cs2.syear = 2002
+  AND cs2.cnt <= cs1.cnt
+ORDER BY
+  cs1.product_name,
+  cs1.store_name,
+  cs2.cnt,
+  cs1.s1,
+  cs2.s1;

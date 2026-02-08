@@ -1,0 +1,331 @@
+You are analyzing 5 failed optimization attempts to design a refined approach that reaches 2.0x speedup.
+
+Your job: understand WHY each attempt fell short, identify unexplored optimization angles, and synthesize a NEW strategy that combines the best insights while avoiding repeated mistakes.
+
+## Query: query_58
+## Target: 2.0x speedup
+## Dialect: duckdb
+
+```sql
+-- start query 58 in stream 0 using template query58.tpl
+with ss_items as
+ (select i_item_id item_id
+        ,sum(ss_ext_sales_price) ss_item_rev 
+ from store_sales
+     ,item
+     ,date_dim
+ where ss_item_sk = i_item_sk
+   and d_date in (select d_date
+                  from date_dim
+                  where d_week_seq = (select d_week_seq 
+                                      from date_dim
+                                      where d_date = '2001-03-24'))
+   and ss_sold_date_sk   = d_date_sk
+ group by i_item_id),
+ cs_items as
+ (select i_item_id item_id
+        ,sum(cs_ext_sales_price) cs_item_rev
+  from catalog_sales
+      ,item
+      ,date_dim
+ where cs_item_sk = i_item_sk
+  and  d_date in (select d_date
+                  from date_dim
+                  where d_week_seq = (select d_week_seq 
+                                      from date_dim
+                                      where d_date = '2001-03-24'))
+  and  cs_sold_date_sk = d_date_sk
+ group by i_item_id),
+ ws_items as
+ (select i_item_id item_id
+        ,sum(ws_ext_sales_price) ws_item_rev
+  from web_sales
+      ,item
+      ,date_dim
+ where ws_item_sk = i_item_sk
+  and  d_date in (select d_date
+                  from date_dim
+                  where d_week_seq =(select d_week_seq 
+                                     from date_dim
+                                     where d_date = '2001-03-24'))
+  and ws_sold_date_sk   = d_date_sk
+ group by i_item_id)
+  select ss_items.item_id
+       ,ss_item_rev
+       ,ss_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 ss_dev
+       ,cs_item_rev
+       ,cs_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 cs_dev
+       ,ws_item_rev
+       ,ws_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 ws_dev
+       ,(ss_item_rev+cs_item_rev+ws_item_rev)/3 average
+ from ss_items,cs_items,ws_items
+ where ss_items.item_id=cs_items.item_id
+   and ss_items.item_id=ws_items.item_id 
+   and ss_item_rev between 0.9 * cs_item_rev and 1.1 * cs_item_rev
+   and ss_item_rev between 0.9 * ws_item_rev and 1.1 * ws_item_rev
+   and cs_item_rev between 0.9 * ss_item_rev and 1.1 * ss_item_rev
+   and cs_item_rev between 0.9 * ws_item_rev and 1.1 * ws_item_rev
+   and ws_item_rev between 0.9 * ss_item_rev and 1.1 * ss_item_rev
+   and ws_item_rev between 0.9 * cs_item_rev and 1.1 * cs_item_rev
+ order by ss_items.item_id
+         ,ss_item_rev
+ LIMIT 100;
+
+-- end query 58 in stream 0 using template query58.tpl
+```
+
+## Previous Attempts
+
+### Worker 1: conservative_pushdown_filter
+- **Status**: pass (0.94x)
+- **Transforms**: none
+- **Examples used**: pushdown, early_filter, materialize_cte
+- **Strategy hint**: Push filters into CTEs early, materialize repeated date subqueries, and reduce intermediate result sizes through dimension-first filtering.
+
+```sql
+WITH week_dates AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_week_seq = (
+    SELECT d_week_seq
+    FROM date_dim
+    WHERE d_date = '2001-03-24'
+  )
+),
+ss_items AS (
+  SELECT
+    i_item_id AS item_id,
+    SUM(ss_ext_sales_price) AS ss_item_rev
+  FROM store_sales
+  JOIN item ON ss_item_sk = i_item_sk
+  JOIN week_dates ON ss_sold_date_sk = week_dates.d_date_sk
+  GROUP BY i_item_id
+),
+cs_items AS (
+  SELECT
+    i_item_id AS item_id,
+    SUM(cs_ext_sales_price) AS cs_item_rev
+  FROM catalog_sales
+  JOIN item ON cs_item_sk = i_item_sk
+  JOIN week_dates ON cs_sold_date_sk = week_dates.d_date_sk
+  GROUP BY i_item_id
+),
+ws_items AS (
+  SELECT
+    i_item_id AS item_id,
+-- ... (truncated)
+```
+
+### Worker 2: moderate_date_dimension_isolation
+- **Status**: error (0.00x)
+- **Error**: Binder Error: Ambiguous reference to column name "d_week_seq" (use: "date_dim.d_week_seq" or "target_week.d_week_seq")
+- **Transforms**: none
+- **Examples used**: shared_dimension_multi_channel, date_cte_isolate, dimension_cte_isolate
+- **Strategy hint**: Extract shared date-week logic into reusable CTEs, pre-filter all dimension tables, and isolate date filtering to enable predicate pushdown across channel CTEs.
+
+```sql
+WITH target_week AS (
+  SELECT d_week_seq
+  FROM date_dim
+  WHERE d_date = '2001-03-24'
+),
+target_dates AS (
+  SELECT d_date_sk
+  FROM date_dim, target_week
+  WHERE d_week_seq = target_week.d_week_seq
+),
+filtered_item AS (
+  SELECT i_item_sk, i_item_id
+  FROM item
+),
+ss_filtered AS (
+  SELECT ss_item_sk, ss_ext_sales_price
+  FROM store_sales
+  JOIN target_dates ON ss_sold_date_sk = target_dates.d_date_sk
+),
+cs_filtered AS (
+  SELECT cs_item_sk, cs_ext_sales_price
+  FROM catalog_sales
+  JOIN target_dates ON cs_sold_date_sk = target_dates.d_date_sk
+),
+ws_filtered AS (
+  SELECT ws_item_sk, ws_ext_sales_price
+  FROM web_sales
+  JOIN target_dates ON ws_sold_date_sk = target_dates.d_date_sk
+),
+ss_items AS (
+-- ... (truncated)
+```
+
+### Worker 3: aggressive_prefetch_restructure
+- **Status**: pass (0.93x)
+- **Transforms**: none
+- **Examples used**: prefetch_fact_join, multi_dimension_prefetch, single_pass_aggregation
+- **Strategy hint**: Pre-join filtered dimensions with fact tables in CTEs, consider merging the three channel CTEs into one conditional-aggregation pass over a union of sales tables.
+
+```sql
+WITH filtered_dates AS (
+  SELECT d_date_sk, d_date
+  FROM date_dim
+  WHERE d_week_seq = (
+    SELECT d_week_seq
+    FROM date_dim
+    WHERE d_date = '2001-03-24'
+  )
+),
+all_sales AS (
+  SELECT 
+    i.i_item_id AS item_id,
+    'store' AS channel,
+    ss.ss_ext_sales_price AS sales_price
+  FROM store_sales ss
+  JOIN filtered_dates d ON ss.ss_sold_date_sk = d.d_date_sk
+  JOIN item i ON ss.ss_item_sk = i.i_item_sk
+  
+  UNION ALL
+  
+  SELECT 
+    i.i_item_id AS item_id,
+    'catalog' AS channel,
+    cs.cs_ext_sales_price AS sales_price
+  FROM catalog_sales cs
+  JOIN filtered_dates d ON cs.cs_sold_date_sk = d.d_date_sk
+  JOIN item i ON cs.cs_item_sk = i.i_item_sk
+  
+  UNION ALL
+  
+-- ... (truncated)
+```
+
+### Worker 4: novel_structural_transform
+- **Status**: pass (1.03x)
+- **Transforms**: none
+- **Examples used**: intersect_to_exists, decorrelate, composite_decorrelate_union
+- **Strategy hint**: Transform the subquery structure—decorrelate date subqueries, convert implicit joins to explicit exists patterns, and restructure for better join planning.
+
+```sql
+WITH target_dates AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_week_seq = (
+    SELECT d_week_seq
+    FROM date_dim
+    WHERE d_date = '2001-03-24'
+  )
+),
+ss_items AS (
+  SELECT
+    i_item_id AS item_id,
+    SUM(ss_ext_sales_price) AS ss_item_rev
+  FROM store_sales
+  JOIN item ON ss_item_sk = i_item_sk
+  JOIN target_dates ON ss_sold_date_sk = target_dates.d_date_sk
+  GROUP BY i_item_id
+),
+cs_items AS (
+  SELECT
+    i_item_id AS item_id,
+    SUM(cs_ext_sales_price) AS cs_item_rev
+  FROM catalog_sales
+  JOIN item ON cs_item_sk = i_item_sk
+  JOIN target_dates ON cs_sold_date_sk = target_dates.d_date_sk
+  GROUP BY i_item_id
+),
+ws_items AS (
+  SELECT
+    i_item_id AS item_id,
+-- ... (truncated)
+```
+
+### Worker 5: refined_snipe
+- **Status**: pass (1.19x)
+- **Transforms**: none
+- **Examples used**: 
+- **Strategy hint**: Snipe from iter 1
+
+```sql
+WITH week_dates AS (
+  SELECT d_date_sk, d_date
+  FROM date_dim
+  WHERE d_week_seq = (
+    SELECT d_week_seq
+    FROM date_dim
+    WHERE d_date = '2001-03-24'
+  )
+),
+ss_items AS (
+  SELECT
+    i_item_id AS item_id,
+    SUM(ss_ext_sales_price) AS ss_item_rev
+  FROM store_sales
+  JOIN item ON ss_item_sk = i_item_sk
+  JOIN week_dates ON ss_sold_date_sk = d_date_sk
+  GROUP BY i_item_id
+),
+cs_items AS (
+  SELECT
+    i_item_id AS item_id,
+    SUM(cs_ext_sales_price) AS cs_item_rev
+  FROM catalog_sales
+  JOIN item ON cs_item_sk = i_item_sk
+  JOIN week_dates ON cs_sold_date_sk = d_date_sk
+  GROUP BY i_item_id
+),
+ws_items AS (
+  SELECT
+    i_item_id AS item_id,
+-- ... (truncated)
+```
+
+## DAG Structure & Bottlenecks
+
+| Node | Role | Cost % |
+|------|------|-------:|
+| ss_items |  | 0.0% |
+| cs_items |  | 0.0% |
+| ws_items |  | 0.0% |
+| main_query |  | 0.0% |
+
+## Available Examples (Full Catalog)
+
+- **composite_decorrelate_union** (2.42xx) — Decorrelate multiple correlated EXISTS subqueries into pre-materialized DISTINCT
+- **date_cte_isolate** (4.00xx) — Extract date filtering into a separate CTE to enable predicate pushdown and redu
+- **decorrelate** (2.92xx) — Convert correlated subquery to separate CTE with GROUP BY, then JOIN
+- **deferred_window_aggregation** (1.36xx) — When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joi
+- **dimension_cte_isolate** (1.93xx) — Pre-filter ALL dimension tables into CTEs before joining with fact table, not ju
+- **early_filter** (4.00xx) — Filter dimension tables FIRST, then join to fact tables to reduce expensive join
+- **intersect_to_exists** (1.83xx) — Convert INTERSECT subquery pattern to multiple EXISTS clauses for better join pl
+- **materialize_cte** (1.37xx) — Extract repeated subquery patterns into a CTE to avoid recomputation
+- **multi_date_range_cte** (2.35xx) — When query uses multiple date_dim aliases with different filters (d1, d2, d3), c
+- **multi_dimension_prefetch** (2.71xx) — Pre-filter multiple dimension tables (date + store) into separate CTEs before jo
+- **or_to_union** (3.17xx) — Split OR conditions on different columns into UNION ALL branches for better inde
+- **prefetch_fact_join** (3.77xx) — Pre-filter dimension table into CTE, then pre-join with fact table in second CTE
+- **pushdown** (2.11xx) — Push filters from outer query into CTEs/subqueries to reduce intermediate result
+- **shared_dimension_multi_channel** (1.30xx) — Extract shared dimension filters (date, item, promotion) into CTEs when multiple
+- **single_pass_aggregation** (4.47xx) — Consolidate multiple subqueries scanning the same table into a single CTE with c
+- **union_cte_split** (1.36xx) — Split a generic UNION ALL CTE into specialized CTEs when the main query filters 
+
+## Your Task
+
+Analyze the failed attempts and design a refined approach:
+
+1. **Failure Analysis**: Why did all attempts fall short? Be specific about mechanisms.
+2. **Common Patterns**: What did multiple workers try unsuccessfully?
+3. **Unexplored Space**: What optimization angles were missed entirely?
+4. **Refined Strategy**: Synthesize a NEW approach combining best insights.
+
+### Output Format (follow EXACTLY)
+
+```
+FAILURE_ANALYSIS:
+<Why all workers fell short — be specific about mechanisms>
+
+UNEXPLORED_OPPORTUNITIES:
+<What optimization approaches haven't been tried>
+
+REFINED_STRATEGY:
+<Concrete optimization approach for next attempt>
+
+EXAMPLES: <ex1>, <ex2>, <ex3>
+HINT: <specific guidance for the refined attempt>
+```

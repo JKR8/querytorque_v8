@@ -1,0 +1,269 @@
+## Optimization Strategy: refined_snipe
+
+**Your approach**: CONTEXT: Best result: W1 achieved 1.04x via conservative_early_filtering. Your goal: optimize the ORIGINAL SQL to >=2.0x. Try a DIFFERENT approach.
+
+**Focus**: Apply the examples below in service of this strategy. Prioritize this specific approach over generic optimizations.
+
+---
+
+You are a SQL query rewrite engine for DuckDB v1.4.3.
+
+Your goal: rewrite the complete SQL query to maximize execution speed
+while preserving exact semantic equivalence (same rows, same columns,
+same ordering).
+
+You will receive the full query, its DAG structure showing how CTEs and
+subqueries connect, cost analysis per node, and reference examples of
+proven rewrites on structurally similar queries.
+You may restructure the query freely: create new CTEs, merge existing ones,
+push filters across node boundaries, or decompose subqueries.
+
+## Query: query_94_snipe
+
+```sql
+SELECT
+  COUNT(DISTINCT ws_order_number) AS "order count",
+  SUM(ws_ext_ship_cost) AS "total shipping cost",
+  SUM(ws_net_profit) AS "total net profit"
+FROM web_sales AS ws1, date_dim, customer_address, web_site
+WHERE
+  d_date BETWEEN '2000-2-01' AND (
+    CAST('2000-2-01' AS DATE) + INTERVAL '60' DAY
+  )
+  AND ws1.ws_ship_date_sk = d_date_sk
+  AND ws1.ws_ship_addr_sk = ca_address_sk
+  AND ca_state = 'OK'
+  AND ws1.ws_web_site_sk = web_site_sk
+  AND web_company_name = 'pri'
+  AND EXISTS(
+    SELECT
+      *
+    FROM web_sales AS ws2
+    WHERE
+      ws1.ws_order_number = ws2.ws_order_number
+      AND ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk
+  )
+  AND NOT EXISTS(
+    SELECT
+      *
+    FROM web_returns AS wr1
+    WHERE
+      ws1.ws_order_number = wr1.wr_order_number
+  )
+ORDER BY
+  COUNT(DISTINCT ws_order_number)
+LIMIT 100
+```
+
+## Query Structure (DAG)
+
+### 1. main_query
+**Role**: Root / Output (Definition Order: 0)
+**Intent**: Filter web sales by ship date range, destination state, and web company; require existence of same order across different warehouses; exclude orders present in web_returns; then aggregate order/profitability metrics.
+**Stats**: 100% Cost | ~1k rows processed → 100 rows output
+**Flags**: ORDER_BY, LIMIT(100)
+**Outputs**: [order count, total shipping cost, total net profit] — ordered by COUNT(DISTINCT ws_order_number) ASC
+**Dependencies**: web_sales AS ws1 (join), date_dim (join), customer_address (join), web_site (join)
+**Joins**: ws1.ws_ship_date_sk = d_date_sk | ws1.ws_ship_addr_sk = ca_address_sk | ws1.ws_web_site_sk = web_site_sk
+**Filters**: d_date BETWEEN '2000-2-01' AND (CAST('2000-2-01' AS DATE) + INTERVAL '60' DAY) | ca_state = 'OK' | web_company_name = 'pri' | EXISTS(SELECT * FROM web_sales AS ws2 WHERE ws1.ws_order_number = ws2.ws_order_number AND ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk) | NOT EXISTS(SELECT * FROM web_returns AS wr1 WHERE ws1.ws_order_number = wr1.wr_order_number)
+**Operators**: SEQ_SCAN[web_sales], SEQ_SCAN[date_dim], SEQ_SCAN[customer_address]
+**Key Logic (SQL)**:
+```sql
+SELECT
+  COUNT(DISTINCT ws_order_number) AS "order count",
+  SUM(ws_ext_ship_cost) AS "total shipping cost",
+  SUM(ws_net_profit) AS "total net profit"
+FROM web_sales AS ws1, date_dim, customer_address, web_site
+WHERE
+  d_date BETWEEN '2000-2-01' AND (
+    CAST('2000-2-01' AS DATE) + INTERVAL '60' DAY
+  )
+  AND ws1.ws_ship_date_sk = d_date_sk
+  AND ws1.ws_ship_addr_sk = ca_address_sk
+  AND ca_state = 'OK'
+  AND ws1.ws_web_site_sk = web_site_sk
+  AND web_company_name = 'pri'
+  AND EXISTS(
+    SELECT
+      *
+    FROM web_sales AS ws2
+    WHERE
+      ws1.ws_order_number = ws2.ws_order_number
+...
+```
+
+
+## Benchmark Learnings
+
+### Effective Transforms
+- **decorrelate**: 25% success rate, 2.50x avg speedup (4 attempts)
+- **materialize_cte**: 43% success rate, 1.56x avg speedup (7 attempts)
+
+### Known Anti-Patterns (avoid these)
+- **decorrelate**: 25% success rate (4 attempts) — usually causes regressions
+
+### Example Effectiveness
+- **early_filter**: 67% led to success (3 recommendations)
+- **dimension_cte_isolate**: 33% led to success (3 recommendations)
+- **prefetch_fact_join**: 33% led to success (3 recommendations)
+- **single_pass_aggregation**: 0% led to success (3 recommendations)
+
+### Common Error Patterns
+- **execution**: 4 occurrences
+
+
+## Reference Examples
+
+The following examples are for **pattern reference only**. Do not copy their table names, column names, or literal values into your rewrite. Use only the schema and tables from the target query above.
+
+### 1. materialize_cte (1.37x)
+
+**Principle:** Shared Materialization: extract repeated subquery patterns into CTEs to avoid recomputation. When the same logical check appears multiple times, compute it once and reference the result.
+
+**BEFORE (slow):**
+```sql
+with ws_wh as
+(select ws1.ws_order_number,ws1.ws_warehouse_sk wh1,ws2.ws_warehouse_sk wh2
+ from web_sales ws1,web_sales ws2
+ where ws1.ws_order_number = ws2.ws_order_number
+   and ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)
+ select 
+   count(distinct ws_order_number) as "order count"
+  ,sum(ws_ext_ship_cost) as "total shipping cost"
+  ,sum(ws_net_profit) as "total net profit"
+from
+   web_sales ws1
+  ,date_dim
+  ,customer_address
+  ,web_site
+where
+    d_date between '1999-2-01' and 
+           (cast('1999-2-01' as date) + INTERVAL 60 DAY)
+and ws1.ws_ship_date_sk = d_date_sk
+and ws1.ws_ship_addr_sk = ca_address_sk
+and ca_state = 'NC'
+and ws1.ws_web_site_sk = web_site_sk
+and web_company_name = 'pri'
+and ws1.ws_order_number in (select ws_order_number
+                            from ws_wh)
+and ws1.ws_order_number in (select wr_order_number
+                            from web_returns,ws_wh
+                            where wr_order_number = ws_wh.ws_order_number)
+order by count(distinct ws_order_number)
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[multi_warehouse_orders]:
+```sql
+SELECT DISTINCT ws_order_number FROM web_sales ws1 WHERE EXISTS (SELECT 1 FROM web_sales ws2 WHERE ws1.ws_order_number = ws2.ws_order_number AND ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)
+```
+[returned_orders]:
+```sql
+SELECT DISTINCT wr_order_number FROM web_returns
+```
+[main_query]:
+```sql
+SELECT COUNT(DISTINCT ws_order_number) AS order_count, SUM(ws_ext_ship_cost) AS total_shipping FROM web_sales ws1 JOIN date_dim ON ws1.ws_ship_date_sk = d_date_sk JOIN customer_address ON ws1.ws_ship_addr_sk = ca_address_sk JOIN web_site ON ws1.ws_web_site_sk = web_site_sk JOIN multi_warehouse_orders mwo ON ws1.ws_order_number = mwo.ws_order_number LEFT JOIN returned_orders ro ON ws1.ws_order_number = ro.wr_order_number WHERE d_date BETWEEN '2000-03-01' AND '2000-05-01' AND ca_state = 'IL' AND web_company_name = 'pri' AND ro.wr_order_number IS NULL
+```
+
+## Regression Warnings
+
+The following transforms were attempted on structurally similar queries
+and caused performance regressions. Do NOT repeat these patterns.
+
+### Warning 1: semantic_rewrite on q16 (0.14xx)
+**Anti-pattern:** Never materialize GROUP BY aggregates with HAVING clauses on fact tables before filtering those fact tables through dimension joins.
+**Why it regressed:** Materialized a GROUP BY self-join (HAVING MIN() <> MAX()) on the entire fact table BEFORE applying date/address/call_center filters. The original query filters catalog_sales first via correlated EXISTS clauses, then checks warehouse conditions. Pre-materializing the unfiltered self-join creates a massive intermediate result the optimizer cannot cost-estimate correctly.
+
+### Warning 2: semantic_rewrite on q95 (0.54xx)
+**Anti-pattern:** Do not decompose tightly-correlated EXISTS/NOT EXISTS clause pairs into independent CTEs. Their cardinality estimates depend on each other; materializing them independently causes severe join cost misestimates.
+**Why it regressed:** Materialized complex correlated EXISTS/NOT EXISTS logic into independent CTEs (multi_warehouse_orders, returned_multi_warehouse_orders). The original EXISTS clauses were tightly correlated and evaluated together. Decoupling them into CTEs severed their cardinality relationship, causing 4x+ join estimate errors.
+
+
+## Constraints
+
+### CRITICAL — Correctness Guards
+
+**COMPLETE_OUTPUT**
+The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original.
+
+**CTE_COLUMN_COMPLETENESS**
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
+**KEEP_EXISTS_AS_EXISTS**
+Preserve EXISTS/NOT EXISTS subqueries as-is. Do NOT convert them to IN/NOT IN or to JOINs — this risks NULL-handling semantic changes and can introduce duplicate rows.
+
+**LITERAL_PRESERVATION**
+CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+
+**NO_MATERIALIZE_EXISTS**
+Keep EXISTS and NOT EXISTS as-is — they use semi-join short-circuiting that stops scanning after the first match. Converting them to materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)) forces a full table scan, which is catastrophically slower (0.14x observed on Q16). When you see EXISTS, preserve it.
+
+**SEMANTIC_EQUIVALENCE**
+The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set — even by one row, one column, or a different sort order — is WRONG and will be REJECTED.
+
+### HIGH — Performance and Style Rules
+
+**MIN_BASELINE_THRESHOLD**
+If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
+
+**NO_UNFILTERED_DIMENSION_CTE**
+Every CTE you create must include a WHERE clause that actually reduces row count. Selecting fewer columns is not filtering — the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query instead of wrapping it in a CTE.
+
+**OR_TO_UNION_GUARD**
+Only apply or_to_union when (a) the OR branches involve different tables or fundamentally different access paths — never when all branches filter the same column (e.g., t_hour ranges), since the optimizer already handles same-column ORs efficiently in a single scan — and (b) the result is 3 or fewer UNION ALL branches. Nested ORs that would expand into 4+ branches (e.g., 3 conditions x 3 values = 9 combinations) must be left as-is. Violating these rules causes 0.23x–0.59x regressions from multiplied fact table scans.
+
+**REMOVE_REPLACED_CTES**
+When creating replacement CTEs, overwrite the original by using the same node_id in your rewrite_sets, or ensure the original is removed from the WITH clause. Every CTE in the final query should be actively used — dead CTEs still get materialized and waste resources (caused 0.49x on Q31, 0.68x on Q74).
+
+**EXPLICIT_JOINS**
+Convert comma-separated implicit joins to explicit JOIN ... ON syntax. This gives the optimizer better join-order freedom.
+
+### CRITICAL — Correctness Guards (repeated for emphasis)
+
+**COMPLETE_OUTPUT**
+The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original.
+
+**CTE_COLUMN_COMPLETENESS**
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
+**KEEP_EXISTS_AS_EXISTS**
+Preserve EXISTS/NOT EXISTS subqueries as-is. Do NOT convert them to IN/NOT IN or to JOINs — this risks NULL-handling semantic changes and can introduce duplicate rows.
+
+**LITERAL_PRESERVATION**
+CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+
+**NO_MATERIALIZE_EXISTS**
+Keep EXISTS and NOT EXISTS as-is — they use semi-join short-circuiting that stops scanning after the first match. Converting them to materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)) forces a full table scan, which is catastrophically slower (0.14x observed on Q16). When you see EXISTS, preserve it.
+
+**SEMANTIC_EQUIVALENCE**
+The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set — even by one row, one column, or a different sort order — is WRONG and will be REJECTED.
+
+## Output
+
+Return the complete rewritten SQL query. The query must be syntactically
+valid and ready to execute.
+
+### Column Completeness Contract
+
+Your rewritten query MUST produce **exactly** these output columns (same names, same order):
+
+  1. `order count`
+  2. `total shipping cost`
+  3. `total net profit`
+
+Do NOT add, remove, or rename any columns. The result set schema must be identical to the original query.
+
+```sql
+-- Your rewritten query here
+```
+
+After the SQL, briefly explain what you changed:
+
+```
+Changes: <1-2 sentence summary of the rewrite>
+Expected speedup: <estimate>
+```
+
+Now output your rewritten SQL:

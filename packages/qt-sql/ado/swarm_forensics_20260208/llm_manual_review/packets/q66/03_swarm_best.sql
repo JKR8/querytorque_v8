@@ -1,0 +1,159 @@
+WITH filtered_date AS (
+    SELECT d_date_sk, d_year, d_moy
+    FROM date_dim
+    WHERE d_year = 1998
+),
+filtered_time AS (
+    SELECT t_time_sk
+    FROM time_dim
+    WHERE t_time BETWEEN 48821 AND 48821 + 28800
+),
+filtered_ship_mode AS (
+    SELECT sm_ship_mode_sk
+    FROM ship_mode
+    WHERE sm_carrier IN ('GREAT EASTERN', 'LATVIAN')
+),
+web_sales_filtered AS (
+    SELECT
+        ws_warehouse_sk,
+        ws_ext_sales_price * ws_quantity AS sales_amount,
+        ws_net_paid_inc_ship_tax * ws_quantity AS net_amount,
+        d_moy,
+        w_warehouse_name,
+        w_warehouse_sq_ft,
+        w_city,
+        w_county,
+        w_state,
+        w_country,
+        d_year
+    FROM web_sales
+    JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+    JOIN filtered_time ON ws_sold_time_sk = t_time_sk
+    JOIN filtered_ship_mode ON ws_ship_mode_sk = sm_ship_mode_sk
+    JOIN warehouse ON ws_warehouse_sk = w_warehouse_sk
+),
+catalog_sales_filtered AS (
+    SELECT
+        cs_warehouse_sk,
+        cs_ext_list_price * cs_quantity AS sales_amount,
+        cs_net_paid_inc_ship_tax * cs_quantity AS net_amount,
+        d_moy,
+        w_warehouse_name,
+        w_warehouse_sq_ft,
+        w_city,
+        w_county,
+        w_state,
+        w_country,
+        d_year
+    FROM catalog_sales
+    JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    JOIN filtered_time ON cs_sold_time_sk = t_time_sk
+    JOIN filtered_ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk
+    JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk
+),
+combined_aggregates AS (
+    SELECT
+        w_warehouse_name,
+        w_warehouse_sq_ft,
+        w_city,
+        w_county,
+        w_state,
+        w_country,
+        'GREAT EASTERN' || ',' || 'LATVIAN' AS ship_carriers,
+        d_year AS year,
+        SUM(CASE WHEN d_moy = 1 THEN sales_amount ELSE 0 END) AS jan_sales,
+        SUM(CASE WHEN d_moy = 2 THEN sales_amount ELSE 0 END) AS feb_sales,
+        SUM(CASE WHEN d_moy = 3 THEN sales_amount ELSE 0 END) AS mar_sales,
+        SUM(CASE WHEN d_moy = 4 THEN sales_amount ELSE 0 END) AS apr_sales,
+        SUM(CASE WHEN d_moy = 5 THEN sales_amount ELSE 0 END) AS may_sales,
+        SUM(CASE WHEN d_moy = 6 THEN sales_amount ELSE 0 END) AS jun_sales,
+        SUM(CASE WHEN d_moy = 7 THEN sales_amount ELSE 0 END) AS jul_sales,
+        SUM(CASE WHEN d_moy = 8 THEN sales_amount ELSE 0 END) AS aug_sales,
+        SUM(CASE WHEN d_moy = 9 THEN sales_amount ELSE 0 END) AS sep_sales,
+        SUM(CASE WHEN d_moy = 10 THEN sales_amount ELSE 0 END) AS oct_sales,
+        SUM(CASE WHEN d_moy = 11 THEN sales_amount ELSE 0 END) AS nov_sales,
+        SUM(CASE WHEN d_moy = 12 THEN sales_amount ELSE 0 END) AS dec_sales,
+        SUM(CASE WHEN d_moy = 1 THEN net_amount ELSE 0 END) AS jan_net,
+        SUM(CASE WHEN d_moy = 2 THEN net_amount ELSE 0 END) AS feb_net,
+        SUM(CASE WHEN d_moy = 3 THEN net_amount ELSE 0 END) AS mar_net,
+        SUM(CASE WHEN d_moy = 4 THEN net_amount ELSE 0 END) AS apr_net,
+        SUM(CASE WHEN d_moy = 5 THEN net_amount ELSE 0 END) AS may_net,
+        SUM(CASE WHEN d_moy = 6 THEN net_amount ELSE 0 END) AS jun_net,
+        SUM(CASE WHEN d_moy = 7 THEN net_amount ELSE 0 END) AS jul_net,
+        SUM(CASE WHEN d_moy = 8 THEN net_amount ELSE 0 END) AS aug_net,
+        SUM(CASE WHEN d_moy = 9 THEN net_amount ELSE 0 END) AS sep_net,
+        SUM(CASE WHEN d_moy = 10 THEN net_amount ELSE 0 END) AS oct_net,
+        SUM(CASE WHEN d_moy = 11 THEN net_amount ELSE 0 END) AS nov_net,
+        SUM(CASE WHEN d_moy = 12 THEN net_amount ELSE 0 END) AS dec_net
+    FROM (
+        SELECT * FROM web_sales_filtered
+        UNION ALL
+        SELECT * FROM catalog_sales_filtered
+    ) AS combined
+    GROUP BY
+        w_warehouse_name,
+        w_warehouse_sq_ft,
+        w_city,
+        w_county,
+        w_state,
+        w_country,
+        d_year
+)
+SELECT
+    w_warehouse_name,
+    w_warehouse_sq_ft,
+    w_city,
+    w_county,
+    w_state,
+    w_country,
+    ship_carriers,
+    year,
+    SUM(jan_sales) AS jan_sales,
+    SUM(feb_sales) AS feb_sales,
+    SUM(mar_sales) AS mar_sales,
+    SUM(apr_sales) AS apr_sales,
+    SUM(may_sales) AS may_sales,
+    SUM(jun_sales) AS jun_sales,
+    SUM(jul_sales) AS jul_sales,
+    SUM(aug_sales) AS aug_sales,
+    SUM(sep_sales) AS sep_sales,
+    SUM(oct_sales) AS oct_sales,
+    SUM(nov_sales) AS nov_sales,
+    SUM(dec_sales) AS dec_sales,
+    SUM(jan_sales / w_warehouse_sq_ft) AS jan_sales_per_sq_foot,
+    SUM(feb_sales / w_warehouse_sq_ft) AS feb_sales_per_sq_foot,
+    SUM(mar_sales / w_warehouse_sq_ft) AS mar_sales_per_sq_foot,
+    SUM(apr_sales / w_warehouse_sq_ft) AS apr_sales_per_sq_foot,
+    SUM(may_sales / w_warehouse_sq_ft) AS may_sales_per_sq_foot,
+    SUM(jun_sales / w_warehouse_sq_ft) AS jun_sales_per_sq_foot,
+    SUM(jul_sales / w_warehouse_sq_ft) AS jul_sales_per_sq_foot,
+    SUM(aug_sales / w_warehouse_sq_ft) AS aug_sales_per_sq_foot,
+    SUM(sep_sales / w_warehouse_sq_ft) AS sep_sales_per_sq_foot,
+    SUM(oct_sales / w_warehouse_sq_ft) AS oct_sales_per_sq_foot,
+    SUM(nov_sales / w_warehouse_sq_ft) AS nov_sales_per_sq_foot,
+    SUM(dec_sales / w_warehouse_sq_ft) AS dec_sales_per_sq_foot,
+    SUM(jan_net) AS jan_net,
+    SUM(feb_net) AS feb_net,
+    SUM(mar_net) AS mar_net,
+    SUM(apr_net) AS apr_net,
+    SUM(may_net) AS may_net,
+    SUM(jun_net) AS jun_net,
+    SUM(jul_net) AS jul_net,
+    SUM(aug_net) AS aug_net,
+    SUM(sep_net) AS sep_net,
+    SUM(oct_net) AS oct_net,
+    SUM(nov_net) AS nov_net,
+    SUM(dec_net) AS dec_net
+FROM combined_aggregates
+GROUP BY
+    w_warehouse_name,
+    w_warehouse_sq_ft,
+    w_city,
+    w_county,
+    w_state,
+    w_country,
+    ship_carriers,
+    year
+ORDER BY
+    w_warehouse_name
+LIMIT 100

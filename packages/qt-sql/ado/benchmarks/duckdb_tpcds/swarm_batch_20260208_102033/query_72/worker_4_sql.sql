@@ -1,0 +1,56 @@
+WITH filtered_d1 AS (
+    SELECT d_date_sk, d_week_seq, d_date
+    FROM date_dim
+    WHERE d_year = 2002
+),
+filtered_hd AS (
+    SELECT hd_demo_sk
+    FROM household_demographics
+    WHERE hd_buy_potential = '501-1000'
+),
+filtered_cd AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_marital_status = 'W'
+)
+SELECT
+    i_item_desc,
+    w_warehouse_name,
+    d1.d_week_seq,
+    COUNT(*) - COUNT(p_promo_sk) AS no_promo,
+    COUNT(p_promo_sk) AS promo,
+    COUNT(*) AS total_cnt
+FROM catalog_sales
+JOIN inventory
+    ON cs_item_sk = inv_item_sk
+JOIN warehouse
+    ON w_warehouse_sk = inv_warehouse_sk
+JOIN item
+    ON i_item_sk = cs_item_sk
+JOIN filtered_cd
+    ON cs_bill_cdemo_sk = cd_demo_sk
+JOIN filtered_hd
+    ON cs_bill_hdemo_sk = hd_demo_sk
+JOIN filtered_d1 AS d1
+    ON cs_sold_date_sk = d1.d_date_sk
+JOIN date_dim AS d2
+    ON inv_date_sk = d2.d_date_sk
+JOIN date_dim AS d3
+    ON cs_ship_date_sk = d3.d_date_sk
+LEFT OUTER JOIN promotion
+    ON cs_promo_sk = p_promo_sk
+LEFT OUTER JOIN catalog_returns
+    ON cr_item_sk = cs_item_sk AND cr_order_number = cs_order_number
+WHERE d1.d_week_seq = d2.d_week_seq
+    AND inv_quantity_on_hand < cs_quantity
+    AND d3.d_date > d1.d_date + 5
+GROUP BY
+    i_item_desc,
+    w_warehouse_name,
+    d1.d_week_seq
+ORDER BY
+    total_cnt DESC,
+    i_item_desc,
+    w_warehouse_name,
+    d1.d_week_seq
+LIMIT 100

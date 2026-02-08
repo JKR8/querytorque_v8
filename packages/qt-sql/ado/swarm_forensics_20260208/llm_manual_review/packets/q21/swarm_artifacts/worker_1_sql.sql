@@ -1,0 +1,54 @@
+WITH filtered_date AS (
+    SELECT d_date_sk, d_date
+    FROM date_dim
+    WHERE d_date BETWEEN (
+        CAST('2002-02-27' AS DATE) - INTERVAL '30' DAY
+    ) AND (
+        CAST('2002-02-27' AS DATE) + INTERVAL '30' DAY
+    )
+),
+filtered_item AS (
+    SELECT i_item_sk, i_item_id
+    FROM item
+    WHERE i_current_price BETWEEN 0.99 AND 1.49
+)
+SELECT
+    w_warehouse_name,
+    i_item_id,
+    SUM(
+        CASE
+            WHEN (
+                CAST(d_date AS DATE) < CAST('2002-02-27' AS DATE)
+            )
+            THEN inv_quantity_on_hand
+            ELSE 0
+        END
+    ) AS inv_before,
+    SUM(
+        CASE
+            WHEN (
+                CAST(d_date AS DATE) >= CAST('2002-02-27' AS DATE)
+            )
+            THEN inv_quantity_on_hand
+            ELSE 0
+        END
+    ) AS inv_after
+FROM inventory
+INNER JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk
+INNER JOIN filtered_item ON i_item_sk = inv_item_sk
+INNER JOIN filtered_date ON inv_date_sk = d_date_sk
+GROUP BY
+    w_warehouse_name,
+    i_item_id
+HAVING
+    (
+        CASE WHEN SUM(CASE WHEN CAST(d_date AS DATE) < CAST('2002-02-27' AS DATE) THEN inv_quantity_on_hand ELSE 0 END) > 0
+            THEN SUM(CASE WHEN CAST(d_date AS DATE) >= CAST('2002-02-27' AS DATE) THEN inv_quantity_on_hand ELSE 0 END) / 
+                 SUM(CASE WHEN CAST(d_date AS DATE) < CAST('2002-02-27' AS DATE) THEN inv_quantity_on_hand ELSE 0 END)
+            ELSE NULL
+        END
+    ) BETWEEN 2.0 / 3.0 AND 3.0 / 2.0
+ORDER BY
+    w_warehouse_name,
+    i_item_id
+LIMIT 100

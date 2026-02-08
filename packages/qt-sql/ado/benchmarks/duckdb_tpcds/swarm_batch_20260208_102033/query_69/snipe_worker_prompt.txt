@@ -1,0 +1,421 @@
+## Optimization Strategy: refined_snipe
+
+**Your approach**: CONTEXT: Best result: W3 achieved 1.04x via aggressive_decorrelate_multi_cte. Your goal: optimize the ORIGINAL SQL to >=2.0x. Try a DIFFERENT approach.
+
+**Focus**: Apply the examples below in service of this strategy. Prioritize this specific approach over generic optimizations.
+
+---
+
+You are a SQL query rewrite engine for DuckDB v1.4.3.
+
+Your goal: rewrite the complete SQL query to maximize execution speed
+while preserving exact semantic equivalence (same rows, same columns,
+same ordering).
+
+You will receive the full query, its DAG structure showing how CTEs and
+subqueries connect, cost analysis per node, and reference examples of
+proven rewrites on structurally similar queries.
+You may restructure the query freely: create new CTEs, merge existing ones,
+push filters across node boundaries, or decompose subqueries.
+
+## Query: query_69_snipe
+
+```sql
+SELECT
+  cd_gender,
+  cd_marital_status,
+  cd_education_status,
+  COUNT(*) AS cnt1,
+  cd_purchase_estimate,
+  COUNT(*) AS cnt2,
+  cd_credit_rating,
+  COUNT(*) AS cnt3
+FROM customer AS c, customer_address AS ca, customer_demographics
+WHERE
+  c.c_current_addr_sk = ca.ca_address_sk
+  AND ca_state IN ('TX', 'VA', 'MI')
+  AND cd_demo_sk = c.c_current_cdemo_sk
+  AND EXISTS(
+    SELECT
+      *
+    FROM store_sales, date_dim
+    WHERE
+      c.c_customer_sk = ss_customer_sk
+      AND ss_sold_date_sk = d_date_sk
+      AND d_year = 2000
+      AND d_moy BETWEEN 1 AND 1 + 2
+  )
+  AND (
+    NOT EXISTS(
+      SELECT
+        *
+      FROM web_sales, date_dim
+      WHERE
+        c.c_customer_sk = ws_bill_customer_sk
+        AND ws_sold_date_sk = d_date_sk
+        AND d_year = 2000
+        AND d_moy BETWEEN 1 AND 1 + 2
+    )
+    AND NOT EXISTS(
+      SELECT
+        *
+      FROM catalog_sales, date_dim
+      WHERE
+        c.c_customer_sk = cs_ship_customer_sk
+        AND cs_sold_date_sk = d_date_sk
+        AND d_year = 2000
+        AND d_moy BETWEEN 1 AND 1 + 2
+    )
+  )
+GROUP BY
+  cd_gender,
+  cd_marital_status,
+  cd_education_status,
+  cd_purchase_estimate,
+  cd_credit_rating
+ORDER BY
+  cd_gender,
+  cd_marital_status,
+  cd_education_status,
+  cd_purchase_estimate,
+  cd_credit_rating
+LIMIT 100
+```
+
+## Query Structure (DAG)
+
+### 1. main_query
+**Role**: Root / Output (Definition Order: 0)
+**Intent**: Join customer/address/demographics, enforce store-sales EXISTS and web/catalog NOT EXISTS constraints over the Jan-Mar 2000 window, then group and count by demographic dimensions.
+**Stats**: 100% Cost | ~1k rows processed → 100 rows output
+**Flags**: GROUP_BY, ORDER_BY, LIMIT(100)
+**Outputs**: [cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3] — ordered by cd_gender ASC, cd_marital_status ASC, cd_education_status ASC, cd_purchase_estimate ASC, cd_credit_rating ASC
+**Dependencies**: customer AS c (join), customer_address AS ca (join), customer_demographics (join), date_dim (join)
+**Joins**: c.c_current_addr_sk = ca.ca_address_sk | cd_demo_sk = c.c_current_cdemo_sk
+**Filters**: ca_state IN ('TX', 'VA', 'MI') | EXISTS(SELECT * FROM store_sales, date_dim WHERE c.c_customer_sk = ss_customer_sk AND ss_sold_date_sk = d_date_sk AND d_year = 2000 AND d_moy BETWEEN 1 AND 1 + 2)
+**Operators**: HASH_GROUP_BY, SEQ_SCAN[customer], SEQ_SCAN[customer_address], SEQ_SCAN[customer_demographics]
+**Key Logic (SQL)**:
+```sql
+SELECT
+  cd_gender,
+  cd_marital_status,
+  cd_education_status,
+  COUNT(*) AS cnt1,
+  cd_purchase_estimate,
+  COUNT(*) AS cnt2,
+  cd_credit_rating,
+  COUNT(*) AS cnt3
+FROM customer AS c, customer_address AS ca, customer_demographics
+WHERE
+  c.c_current_addr_sk = ca.ca_address_sk
+  AND ca_state IN ('TX', 'VA', 'MI')
+  AND cd_demo_sk = c.c_current_cdemo_sk
+  AND EXISTS(
+    SELECT
+      *
+    FROM store_sales, date_dim
+    WHERE
+      c.c_customer_sk = ss_customer_sk
+...
+```
+
+
+## Benchmark Learnings
+
+### Effective Transforms
+- **decorrelate**: 25% success rate, 2.50x avg speedup (4 attempts)
+- **materialize_cte**: 43% success rate, 1.56x avg speedup (7 attempts)
+
+### Known Anti-Patterns (avoid these)
+- **decorrelate**: 25% success rate (4 attempts) — usually causes regressions
+
+### Example Effectiveness
+- **early_filter**: 67% led to success (3 recommendations)
+- **dimension_cte_isolate**: 33% led to success (3 recommendations)
+- **prefetch_fact_join**: 33% led to success (3 recommendations)
+- **single_pass_aggregation**: 0% led to success (3 recommendations)
+
+### Common Error Patterns
+- **execution**: 4 occurrences
+
+
+## Reference Examples
+
+The following examples are for **pattern reference only**. Do not copy their table names, column names, or literal values into your rewrite. Use only the schema and tables from the target query above.
+
+### 1. multi_date_range_cte (2.35x)
+
+**Principle:** Early Selection per Alias: when a query joins the same dimension table multiple times with different filters (d1, d2, d3), create separate CTEs for each filter and pre-join with fact tables to reduce rows entering the main join.
+
+**BEFORE (slow):**
+```sql
+select  
+     i_item_id
+    ,i_item_desc
+    ,s_store_id
+    ,s_store_name
+    ,avg(ss_quantity)        as store_sales_quantity
+    ,avg(sr_return_quantity) as store_returns_quantity
+    ,avg(cs_quantity)        as catalog_sales_quantity
+ from
+    store_sales
+   ,store_returns
+   ,catalog_sales
+   ,date_dim             d1
+   ,date_dim             d2
+   ,date_dim             d3
+   ,store
+   ,item
+ where
+     d1.d_moy               = 4 
+ and d1.d_year              = 1999
+ and d1.d_date_sk           = ss_sold_date_sk
+ and i_item_sk              = ss_item_sk
+ and s_store_sk             = ss_store_sk
+ and ss_customer_sk         = sr_customer_sk
+ and ss_item_sk             = sr_item_sk
+ and ss_ticket_number       = sr_ticket_number
+ and sr_returned_date_sk    = d2.d_date_sk
+ and d2.d_moy               between 4 and  4 + 3 
+ and d2.d_year              = 1999
+ and sr_customer_sk         = cs_bill_customer_sk
+ and sr_item_sk             = cs_item_sk
+ and cs_sold_date_sk        = d3.d_date_sk     
+ and d3.d_year              in (1999,1999+1,1999+2)
+ group by
+    i_item_id
+   ,i_item_desc
+   ,s_store_id
+   ,s_store_name
+ order by
+    i_item_id 
+   ,i_item_desc
+   ,s_store_id
+   ,s_store_name
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[d1_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_moy = 9 AND d_year = 1999
+```
+[d2_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_moy BETWEEN 9 AND 12 AND d_year = 1999
+```
+[d3_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year IN (1999, 2000, 2001)
+```
+[filtered_store_sales]:
+```sql
+SELECT ss_item_sk, ss_customer_sk, ss_ticket_number, ss_store_sk, ss_quantity FROM store_sales JOIN d1_dates ON store_sales.ss_sold_date_sk = d1_dates.d_date_sk
+```
+[filtered_store_returns]:
+```sql
+SELECT sr_item_sk, sr_customer_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN d2_dates ON store_returns.sr_returned_date_sk = d2_dates.d_date_sk
+```
+[filtered_catalog_sales]:
+```sql
+SELECT cs_item_sk, cs_bill_customer_sk, cs_quantity FROM catalog_sales JOIN d3_dates ON catalog_sales.cs_sold_date_sk = d3_dates.d_date_sk
+```
+[main_query]:
+```sql
+SELECT i.i_item_id, i.i_item_desc, s.s_store_id, s.s_store_name, SUM(fss.ss_quantity) AS store_sales_quantity, SUM(fsr.sr_return_quantity) AS store_returns_quantity, SUM(fcs.cs_quantity) AS catalog_sales_quantity FROM filtered_store_sales AS fss JOIN filtered_store_returns AS fsr ON fss.ss_customer_sk = fsr.sr_customer_sk AND fss.ss_item_sk = fsr.sr_item_sk AND fss.ss_ticket_number = fsr.sr_ticket_number JOIN filtered_catalog_sales AS fcs ON fsr.sr_customer_sk = fcs.cs_bill_customer_sk AND fsr.sr_item_sk = fcs.cs_item_sk JOIN store AS s ON fss.ss_store_sk = s.s_store_sk JOIN item AS i ON fss.ss_item_sk = i.i_item_sk GROUP BY i.i_item_id, i.i_item_desc, s.s_store_id, s.s_store_name ORDER BY i.i_item_id, i.i_item_desc, s.s_store_id, s.s_store_name LIMIT 100
+```
+
+### 2. composite_decorrelate_union (2.42x)
+
+**Principle:** Composite Decorrelation: when multiple correlated EXISTS share common filters, extract shared dimensions into a single CTE and decorrelate the EXISTS checks into pre-materialized key sets joined via UNION.
+
+**BEFORE (slow):**
+```sql
+select  
+  ca_state,
+  cd_gender,
+  cd_marital_status,
+  cd_dep_count,
+  count(*) cnt1,
+  max(cd_dep_count),
+  sum(cd_dep_count),
+  max(cd_dep_count),
+  cd_dep_employed_count,
+  count(*) cnt2,
+  max(cd_dep_employed_count),
+  sum(cd_dep_employed_count),
+  max(cd_dep_employed_count),
+  cd_dep_college_count,
+  count(*) cnt3,
+  max(cd_dep_college_count),
+  sum(cd_dep_college_count),
+  max(cd_dep_college_count)
+ from
+  customer c,customer_address ca,customer_demographics
+ where
+  c.c_current_addr_sk = ca.ca_address_sk and
+  cd_demo_sk = c.c_current_cdemo_sk and 
+  exists (select *
+          from store_sales,date_dim
+          where c.c_customer_sk = ss_customer_sk and
+                ss_sold_date_sk = d_date_sk and
+                d_year = 2001 and
+                d_qoy < 4) and
+   (exists (select *
+            from web_sales,date_dim
+            where c.c_customer_sk = ws_bill_customer_sk and
+                  ws_sold_date_sk = d_date_sk and
+                  d_year = 2001 and
+                  d_qoy < 4) or 
+    exists (select * 
+            from catalog_sales,date_dim
+            where c.c_customer_sk = cs_ship_customer_sk and
+                  cs_sold_date_sk = d_date_sk and
+                  d_year = 2001 and
+                  d_qoy < 4))
+ group by ca_state,
+          cd_gender,
+          cd_marital_status,
+          cd_dep_count,
+          cd_dep_employed_count,
+          cd_dep_college_count
+ order by ca_state,
+          cd_gender,
+          cd_marital_status,
+          cd_dep_count,
+          cd_dep_employed_count,
+          cd_dep_college_count
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_qoy < 4
+```
+[store_customers]:
+```sql
+SELECT DISTINCT ss_customer_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+```
+[web_customers]:
+```sql
+SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk
+```
+[catalog_customers]:
+```sql
+SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk
+```
+[web_or_catalog_customers]:
+```sql
+SELECT ws_bill_customer_sk AS customer_sk FROM web_customers UNION SELECT cs_ship_customer_sk AS customer_sk FROM catalog_customers
+```
+[main_query]:
+```sql
+SELECT ca_state, cd_gender, cd_marital_status, cd_dep_count, COUNT(*) AS cnt1, MAX(cd_dep_count), SUM(cd_dep_count), MAX(cd_dep_count), cd_dep_employed_count, COUNT(*) AS cnt2, MAX(cd_dep_employed_count), SUM(cd_dep_employed_count), MAX(cd_dep_employed_count), cd_dep_college_count, COUNT(*) AS cnt3, MAX(cd_dep_college_count), SUM(cd_dep_college_count), MAX(cd_dep_college_count) FROM customer AS c JOIN customer_address AS ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics ON cd_demo_sk = c.c_current_cdemo_sk JOIN store_customers AS sc ON c.c_customer_sk = sc.ss_customer_sk JOIN web_or_catalog_customers AS wcc ON c.c_customer_sk = wcc.customer_sk GROUP BY ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100
+```
+
+## Regression Warnings
+
+The following transforms were attempted on structurally similar queries
+and caused performance regressions. Do NOT repeat these patterns.
+
+### Warning 1: semantic_rewrite on q16 (0.14xx)
+**Anti-pattern:** Never materialize GROUP BY aggregates with HAVING clauses on fact tables before filtering those fact tables through dimension joins.
+**Why it regressed:** Materialized a GROUP BY self-join (HAVING MIN() <> MAX()) on the entire fact table BEFORE applying date/address/call_center filters. The original query filters catalog_sales first via correlated EXISTS clauses, then checks warehouse conditions. Pre-materializing the unfiltered self-join creates a massive intermediate result the optimizer cannot cost-estimate correctly.
+
+### Warning 2: date_cte_isolate on q25 (0.5xx)
+**Anti-pattern:** Do not pre-filter and materialize fact tables when the query has 3+ fact table joins. The optimizer needs freedom to reorder multi-way fact joins and push filters across them.
+**Why it regressed:** Pre-filtered and joined store_sales to date CTE BEFORE the 3-way fact table join (store_sales <- store_returns <- catalog_sales). By materializing the date-filtered store_sales early, the optimizer loses the ability to push filters across the multi-way fact join and reorder joins optimally.
+
+
+## Constraints
+
+### CRITICAL — Correctness Guards
+
+**COMPLETE_OUTPUT**
+The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original.
+
+**CTE_COLUMN_COMPLETENESS**
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
+**KEEP_EXISTS_AS_EXISTS**
+Preserve EXISTS/NOT EXISTS subqueries as-is. Do NOT convert them to IN/NOT IN or to JOINs — this risks NULL-handling semantic changes and can introduce duplicate rows.
+
+**LITERAL_PRESERVATION**
+CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+
+**NO_MATERIALIZE_EXISTS**
+Keep EXISTS and NOT EXISTS as-is — they use semi-join short-circuiting that stops scanning after the first match. Converting them to materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)) forces a full table scan, which is catastrophically slower (0.14x observed on Q16). When you see EXISTS, preserve it.
+
+**SEMANTIC_EQUIVALENCE**
+The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set — even by one row, one column, or a different sort order — is WRONG and will be REJECTED.
+
+### HIGH — Performance and Style Rules
+
+**MIN_BASELINE_THRESHOLD**
+If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
+
+**NO_UNFILTERED_DIMENSION_CTE**
+Every CTE you create must include a WHERE clause that actually reduces row count. Selecting fewer columns is not filtering — the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query instead of wrapping it in a CTE.
+
+**OR_TO_UNION_GUARD**
+Only apply or_to_union when (a) the OR branches involve different tables or fundamentally different access paths — never when all branches filter the same column (e.g., t_hour ranges), since the optimizer already handles same-column ORs efficiently in a single scan — and (b) the result is 3 or fewer UNION ALL branches. Nested ORs that would expand into 4+ branches (e.g., 3 conditions x 3 values = 9 combinations) must be left as-is. Violating these rules causes 0.23x–0.59x regressions from multiplied fact table scans.
+
+**REMOVE_REPLACED_CTES**
+When creating replacement CTEs, overwrite the original by using the same node_id in your rewrite_sets, or ensure the original is removed from the WITH clause. Every CTE in the final query should be actively used — dead CTEs still get materialized and waste resources (caused 0.49x on Q31, 0.68x on Q74).
+
+**EXPLICIT_JOINS**
+Convert comma-separated implicit joins to explicit JOIN ... ON syntax. This gives the optimizer better join-order freedom.
+
+### CRITICAL — Correctness Guards (repeated for emphasis)
+
+**COMPLETE_OUTPUT**
+The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original.
+
+**CTE_COLUMN_COMPLETENESS**
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
+**KEEP_EXISTS_AS_EXISTS**
+Preserve EXISTS/NOT EXISTS subqueries as-is. Do NOT convert them to IN/NOT IN or to JOINs — this risks NULL-handling semantic changes and can introduce duplicate rows.
+
+**LITERAL_PRESERVATION**
+CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+
+**NO_MATERIALIZE_EXISTS**
+Keep EXISTS and NOT EXISTS as-is — they use semi-join short-circuiting that stops scanning after the first match. Converting them to materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)) forces a full table scan, which is catastrophically slower (0.14x observed on Q16). When you see EXISTS, preserve it.
+
+**SEMANTIC_EQUIVALENCE**
+The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set — even by one row, one column, or a different sort order — is WRONG and will be REJECTED.
+
+## Output
+
+Return the complete rewritten SQL query. The query must be syntactically
+valid and ready to execute.
+
+### Column Completeness Contract
+
+Your rewritten query MUST produce **exactly** these output columns (same names, same order):
+
+  1. `cd_gender`
+  2. `cd_marital_status`
+  3. `cd_education_status`
+  4. `cnt1`
+  5. `cd_purchase_estimate`
+  6. `cnt2`
+  7. `cd_credit_rating`
+  8. `cnt3`
+
+Do NOT add, remove, or rename any columns. The result set schema must be identical to the original query.
+
+```sql
+-- Your rewritten query here
+```
+
+After the SQL, briefly explain what you changed:
+
+```
+Changes: <1-2 sentence summary of the rewrite>
+Expected speedup: <estimate>
+```
+
+Now output your rewritten SQL:

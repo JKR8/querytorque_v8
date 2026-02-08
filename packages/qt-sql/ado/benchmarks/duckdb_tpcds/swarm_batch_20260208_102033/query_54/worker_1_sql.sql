@@ -1,0 +1,59 @@
+WITH filtered_item AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_category = 'Women'
+    AND i_class = 'maternity'
+),
+may_date AS (
+  SELECT d_date_sk, d_month_seq
+  FROM date_dim
+  WHERE d_year = 1998
+    AND d_moy = 5
+),
+date_range AS (
+  SELECT d_date_sk
+  FROM date_dim, may_date
+  WHERE d_month_seq BETWEEN may_date.d_month_seq + 1 
+                        AND may_date.d_month_seq + 3
+),
+my_customers AS (
+  SELECT DISTINCT
+    c.c_customer_sk,
+    c.c_current_addr_sk
+  FROM (
+    SELECT cs_bill_customer_sk AS customer_sk
+    FROM catalog_sales
+    JOIN filtered_item ON cs_item_sk = i_item_sk
+    JOIN may_date ON cs_sold_date_sk = d_date_sk
+    UNION ALL
+    SELECT ws_bill_customer_sk AS customer_sk
+    FROM web_sales
+    JOIN filtered_item ON ws_item_sk = i_item_sk
+    JOIN may_date ON ws_sold_date_sk = d_date_sk
+  ) sales
+  JOIN customer c ON sales.customer_sk = c.c_customer_sk
+),
+my_revenue AS (
+  SELECT
+    c.c_customer_sk,
+    SUM(ss_ext_sales_price) AS revenue
+  FROM my_customers c
+  JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+  JOIN store s ON ca.ca_county = s.s_county 
+               AND ca.ca_state = s.s_state
+  JOIN store_sales ss ON c.c_customer_sk = ss.ss_customer_sk
+  JOIN date_range dr ON ss.ss_sold_date_sk = dr.d_date_sk
+  GROUP BY c.c_customer_sk
+),
+segments AS (
+  SELECT CAST((revenue / 50) AS INT) AS segment
+  FROM my_revenue
+)
+SELECT
+  segment,
+  COUNT(*) AS num_customers,
+  segment * 50 AS segment_base
+FROM segments
+GROUP BY segment
+ORDER BY segment, num_customers
+LIMIT 100

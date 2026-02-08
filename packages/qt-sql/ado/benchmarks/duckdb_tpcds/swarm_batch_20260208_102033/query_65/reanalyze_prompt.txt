@@ -1,0 +1,288 @@
+You are analyzing 5 failed optimization attempts to design a refined approach that reaches 2.0x speedup.
+
+Your job: understand WHY each attempt fell short, identify unexplored optimization angles, and synthesize a NEW strategy that combines the best insights while avoiding repeated mistakes.
+
+## Query: query_65
+## Target: 2.0x speedup
+## Dialect: duckdb
+
+```sql
+-- start query 65 in stream 0 using template query65.tpl
+select
+	s_store_name,
+	i_item_desc,
+	sc.revenue,
+	i_current_price,
+	i_wholesale_cost,
+	i_brand
+ from store, item,
+     (select ss_store_sk, avg(revenue) as ave
+ 	from
+ 	    (select  ss_store_sk, ss_item_sk, 
+ 		     sum(ss_sales_price) as revenue
+ 		from store_sales, date_dim
+ 		where ss_sold_date_sk = d_date_sk and d_month_seq between 1221 and 1221+11
+ 		group by ss_store_sk, ss_item_sk) sa
+ 	group by ss_store_sk) sb,
+     (select  ss_store_sk, ss_item_sk, sum(ss_sales_price) as revenue
+ 	from store_sales, date_dim
+ 	where ss_sold_date_sk = d_date_sk and d_month_seq between 1221 and 1221+11
+ 	group by ss_store_sk, ss_item_sk) sc
+ where sb.ss_store_sk = sc.ss_store_sk and 
+       sc.revenue <= 0.1 * sb.ave and
+       s_store_sk = sc.ss_store_sk and
+       i_item_sk = sc.ss_item_sk
+ order by s_store_name, i_item_desc
+ LIMIT 100;
+
+-- end query 65 in stream 0 using template query65.tpl
+```
+
+## Previous Attempts
+
+### Worker 1: conservative_pushdown_materialization
+- **Status**: pass (1.79x)
+- **Transforms**: none
+- **Examples used**: pushdown, early_filter, materialize_cte
+- **Strategy hint**: Push filters early into CTEs, materialize repeated subquery patterns once, and reduce intermediate dataset sizes through predicate pushdown.
+
+```sql
+WITH date_filter AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_month_seq BETWEEN 1221 AND 1232
+),
+store_item_revenue AS (
+    SELECT
+        ss_store_sk,
+        ss_item_sk,
+        SUM(ss_sales_price) AS revenue
+    FROM store_sales
+    JOIN date_filter ON ss_sold_date_sk = d_date_sk
+    GROUP BY ss_store_sk, ss_item_sk
+),
+store_average AS (
+    SELECT
+        ss_store_sk,
+        AVG(revenue) AS ave
+    FROM store_item_revenue
+    GROUP BY ss_store_sk
+)
+SELECT
+    s_store_name,
+    i_item_desc,
+    sc.revenue,
+    i_current_price,
+    i_wholesale_cost,
+    i_brand
+FROM store_item_revenue sc
+JOIN store_average sb ON sc.ss_store_sk = sb.ss_store_sk
+-- ... (truncated)
+```
+
+### Worker 2: moderate_dimension_date_isolation
+- **Status**: pass (1.80x)
+- **Transforms**: none
+- **Examples used**: date_cte_isolate, dimension_cte_isolate, multi_date_range_cte
+- **Strategy hint**: Extract date and dimension filtering into isolated CTEs before joining with fact tables to enable better filter propagation and reduce join cardinality.
+
+```sql
+WITH filtered_dates AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_month_seq BETWEEN 1221 AND 1221 + 11
+),
+filtered_sales AS (
+  SELECT
+    ss_store_sk,
+    ss_item_sk,
+    SUM(ss_sales_price) AS revenue
+  FROM store_sales
+  JOIN filtered_dates ON store_sales.ss_sold_date_sk = filtered_dates.d_date_sk
+  GROUP BY
+    ss_store_sk,
+    ss_item_sk
+),
+store_averages AS (
+  SELECT
+    ss_store_sk,
+    AVG(revenue) AS ave
+  FROM filtered_sales
+  GROUP BY ss_store_sk
+)
+SELECT
+  s_store_name,
+  i_item_desc,
+  fs.revenue,
+  i_current_price,
+  i_wholesale_cost,
+  i_brand
+-- ... (truncated)
+```
+
+### Worker 3: aggressive_prefetch_restructuring
+- **Status**: pass (1.84x)
+- **Transforms**: none
+- **Examples used**: prefetch_fact_join, multi_dimension_prefetch, single_pass_aggregation
+- **Strategy hint**: Pre-join filtered dimensions with fact tables in CTEs, consolidate multiple aggregations into single-pass scans, and prefetch multiple dimension filters to minimize repeated work.
+
+```sql
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_month_seq BETWEEN 1221 AND 1221 + 11
+),
+filtered_sales AS (
+    SELECT 
+        ss_store_sk,
+        ss_item_sk,
+        SUM(ss_sales_price) AS revenue
+    FROM store_sales
+    JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+    GROUP BY ss_store_sk, ss_item_sk
+),
+store_avg AS (
+    SELECT 
+        ss_store_sk,
+        AVG(revenue) AS ave
+    FROM filtered_sales
+    GROUP BY ss_store_sk
+),
+filtered_low_revenue AS (
+    SELECT 
+        fs.ss_store_sk,
+        fs.ss_item_sk,
+        fs.revenue
+    FROM filtered_sales fs
+    JOIN store_avg sa ON fs.ss_store_sk = sa.ss_store_sk
+    WHERE fs.revenue <= 0.1 * sa.ave
+)
+-- ... (truncated)
+```
+
+### Worker 4: novel_structural_transformation
+- **Status**: pass (1.79x)
+- **Transforms**: none
+- **Examples used**: or_to_union, intersect_to_exists, decorrelate
+- **Strategy hint**: Transform query structure by splitting OR conditions into UNION ALL, converting intersect patterns to EXISTS, and decorrelating subqueries into join-friendly CTEs.
+
+```sql
+WITH store_item_revenue AS (
+  SELECT
+    ss_store_sk,
+    ss_item_sk,
+    SUM(ss_sales_price) AS revenue
+  FROM store_sales
+  JOIN date_dim ON ss_sold_date_sk = d_date_sk
+  WHERE d_month_seq BETWEEN 1221 AND 1221 + 11
+  GROUP BY ss_store_sk, ss_item_sk
+),
+store_avg_revenue AS (
+  SELECT
+    ss_store_sk,
+    AVG(revenue) AS ave
+  FROM store_item_revenue
+  GROUP BY ss_store_sk
+)
+SELECT
+  s_store_name,
+  i_item_desc,
+  sir.revenue,
+  i_current_price,
+  i_wholesale_cost,
+  i_brand
+FROM store_item_revenue sir
+JOIN store_avg_revenue sar ON sir.ss_store_sk = sar.ss_store_sk
+JOIN store ON s_store_sk = sir.ss_store_sk
+JOIN item ON i_item_sk = sir.ss_item_sk
+WHERE sir.revenue <= 0.1 * sar.ave
+ORDER BY s_store_name, i_item_desc
+-- ... (truncated)
+```
+
+### Worker 5: refined_snipe
+- **Status**: pass (1.73x)
+- **Transforms**: none
+- **Examples used**: 
+- **Strategy hint**: Snipe from iter 1
+
+```sql
+WITH date_filter AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_month_seq BETWEEN 1221 AND 1221 + 11
+),
+store_item_revenue AS (
+  SELECT
+    ss_store_sk,
+    ss_item_sk,
+    SUM(ss_sales_price) AS revenue,
+    AVG(SUM(ss_sales_price)) OVER (PARTITION BY ss_store_sk) AS store_avg
+  FROM store_sales
+  JOIN date_filter ON store_sales.ss_sold_date_sk = date_filter.d_date_sk
+  GROUP BY ss_store_sk, ss_item_sk
+)
+SELECT
+  s.s_store_name,
+  i.i_item_desc,
+  sir.revenue,
+  i.i_current_price,
+  i.i_wholesale_cost,
+  i.i_brand
+FROM store_item_revenue sir
+JOIN store s ON s.s_store_sk = sir.ss_store_sk
+JOIN item i ON i.i_item_sk = sir.ss_item_sk
+WHERE sir.revenue <= 0.1 * sir.store_avg
+ORDER BY s.s_store_name, i.i_item_desc
+LIMIT 100;
+```
+
+## DAG Structure & Bottlenecks
+
+| Node | Role | Cost % |
+|------|------|-------:|
+| main_query |  | 0.0% |
+
+## Available Examples (Full Catalog)
+
+- **composite_decorrelate_union** (2.42xx) — Decorrelate multiple correlated EXISTS subqueries into pre-materialized DISTINCT
+- **date_cte_isolate** (4.00xx) — Extract date filtering into a separate CTE to enable predicate pushdown and redu
+- **decorrelate** (2.92xx) — Convert correlated subquery to separate CTE with GROUP BY, then JOIN
+- **deferred_window_aggregation** (1.36xx) — When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joi
+- **dimension_cte_isolate** (1.93xx) — Pre-filter ALL dimension tables into CTEs before joining with fact table, not ju
+- **early_filter** (4.00xx) — Filter dimension tables FIRST, then join to fact tables to reduce expensive join
+- **intersect_to_exists** (1.83xx) — Convert INTERSECT subquery pattern to multiple EXISTS clauses for better join pl
+- **materialize_cte** (1.37xx) — Extract repeated subquery patterns into a CTE to avoid recomputation
+- **multi_date_range_cte** (2.35xx) — When query uses multiple date_dim aliases with different filters (d1, d2, d3), c
+- **multi_dimension_prefetch** (2.71xx) — Pre-filter multiple dimension tables (date + store) into separate CTEs before jo
+- **or_to_union** (3.17xx) — Split OR conditions on different columns into UNION ALL branches for better inde
+- **prefetch_fact_join** (3.77xx) — Pre-filter dimension table into CTE, then pre-join with fact table in second CTE
+- **pushdown** (2.11xx) — Push filters from outer query into CTEs/subqueries to reduce intermediate result
+- **shared_dimension_multi_channel** (1.30xx) — Extract shared dimension filters (date, item, promotion) into CTEs when multiple
+- **single_pass_aggregation** (4.47xx) — Consolidate multiple subqueries scanning the same table into a single CTE with c
+- **union_cte_split** (1.36xx) — Split a generic UNION ALL CTE into specialized CTEs when the main query filters 
+
+## Your Task
+
+Analyze the failed attempts and design a refined approach:
+
+1. **Failure Analysis**: Why did all attempts fall short? Be specific about mechanisms.
+2. **Common Patterns**: What did multiple workers try unsuccessfully?
+3. **Unexplored Space**: What optimization angles were missed entirely?
+4. **Refined Strategy**: Synthesize a NEW approach combining best insights.
+
+### Output Format (follow EXACTLY)
+
+```
+FAILURE_ANALYSIS:
+<Why all workers fell short — be specific about mechanisms>
+
+UNEXPLORED_OPPORTUNITIES:
+<What optimization approaches haven't been tried>
+
+REFINED_STRATEGY:
+<Concrete optimization approach for next attempt>
+
+EXAMPLES: <ex1>, <ex2>, <ex3>
+HINT: <specific guidance for the refined attempt>
+```

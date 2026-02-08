@@ -1,0 +1,61 @@
+WITH filtered_dates AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_dom BETWEEN 1 AND 2
+    AND d_year IN (1998, 1999, 2000)
+),
+
+filtered_stores AS (
+  SELECT s_store_sk
+  FROM store
+  WHERE s_city IN ('Pleasant Hill', 'Five Points')
+),
+
+filtered_hd AS (
+  SELECT hd_demo_sk
+  FROM household_demographics
+  WHERE hd_dep_count = 8 OR hd_vehicle_count = -1
+),
+
+sales_prejoin AS (
+  SELECT
+    ss_ticket_number,
+    ss_customer_sk,
+    ca_city AS bought_city,
+    ss_ext_sales_price,
+    ss_ext_list_price,
+    ss_ext_tax
+  FROM store_sales
+  JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+  JOIN filtered_stores ON ss_store_sk = s_store_sk
+  JOIN filtered_hd ON ss_hdemo_sk = hd_demo_sk
+  JOIN customer_address ON ss_addr_sk = ca_address_sk
+),
+
+aggregated_sales AS (
+  SELECT
+    ss_ticket_number,
+    ss_customer_sk,
+    bought_city,
+    SUM(ss_ext_sales_price) AS extended_price,
+    SUM(ss_ext_list_price) AS list_price,
+    SUM(ss_ext_tax) AS extended_tax
+  FROM sales_prejoin
+  GROUP BY ss_ticket_number, ss_customer_sk, bought_city
+)
+
+SELECT
+  c_last_name,
+  c_first_name,
+  current_addr.ca_city AS ca_city,
+  aggregated_sales.bought_city,
+  aggregated_sales.ss_ticket_number,
+  aggregated_sales.extended_price,
+  aggregated_sales.extended_tax,
+  aggregated_sales.list_price
+FROM aggregated_sales
+JOIN customer ON aggregated_sales.ss_customer_sk = customer.c_customer_sk
+JOIN customer_address AS current_addr ON customer.c_current_addr_sk = current_addr.ca_address_sk
+WHERE current_addr.ca_city <> aggregated_sales.bought_city
+ORDER BY c_last_name, aggregated_sales.ss_ticket_number
+LIMIT 100

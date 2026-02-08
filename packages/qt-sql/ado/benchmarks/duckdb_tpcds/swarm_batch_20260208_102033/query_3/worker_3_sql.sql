@@ -1,0 +1,35 @@
+WITH filtered_dates AS (
+  SELECT d_date_sk, d_year
+  FROM date_dim
+  WHERE d_moy = 11
+),
+filtered_items AS (
+  SELECT i_item_sk, i_brand_id, i_brand
+  FROM item
+  WHERE i_manufact_id = 816
+),
+joined_sales AS (
+  SELECT
+    dt.d_year,
+    it.i_brand_id,
+    it.i_brand,
+    ss.ss_sales_price
+  FROM store_sales ss
+  JOIN filtered_dates dt ON ss.ss_sold_date_sk = dt.d_date_sk
+  JOIN filtered_items it ON ss.ss_item_sk = it.i_item_sk
+)
+SELECT
+  d_year,
+  i_brand_id AS brand_id,
+  i_brand AS brand,
+  SUM(ss_sales_price) AS sum_agg
+FROM joined_sales
+GROUP BY
+  d_year,
+  i_brand,
+  i_brand_id
+ORDER BY
+  d_year,
+  sum_agg DESC,
+  brand_id
+LIMIT 100

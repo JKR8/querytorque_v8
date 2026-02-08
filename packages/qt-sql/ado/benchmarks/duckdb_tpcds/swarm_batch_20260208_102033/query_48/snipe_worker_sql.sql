@@ -1,0 +1,138 @@
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 1999
+),
+filtered_sales AS (
+    SELECT 
+        ss_quantity,
+        ss_cdemo_sk,
+        ss_addr_sk,
+        ss_sales_price,
+        ss_net_profit,
+        ss_store_sk
+    FROM store_sales
+    INNER JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+),
+branch1 AS (
+    SELECT ss_quantity
+    FROM filtered_sales
+    INNER JOIN customer_demographics ON cd_demo_sk = ss_cdemo_sk
+    INNER JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE cd_marital_status = 'U'
+      AND cd_education_status = 'Primary'
+      AND ss_sales_price BETWEEN 100.00 AND 150.00
+      AND ca_country = 'United States'
+      AND ca_state IN ('MD', 'MN', 'IA')
+      AND ss_net_profit BETWEEN 0 AND 2000
+),
+branch2 AS (
+    SELECT ss_quantity
+    FROM filtered_sales
+    INNER JOIN customer_demographics ON cd_demo_sk = ss_cdemo_sk
+    INNER JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE cd_marital_status = 'U'
+      AND cd_education_status = 'Primary'
+      AND ss_sales_price BETWEEN 100.00 AND 150.00
+      AND ca_country = 'United States'
+      AND ca_state IN ('VA', 'IL', 'TX')
+      AND ss_net_profit BETWEEN 150 AND 3000
+),
+branch3 AS (
+    SELECT ss_quantity
+    FROM filtered_sales
+    INNER JOIN customer_demographics ON cd_demo_sk = ss_cdemo_sk
+    INNER JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE cd_marital_status = 'U'
+      AND cd_education_status = 'Primary'
+      AND ss_sales_price BETWEEN 100.00 AND 150.00
+      AND ca_country = 'United States'
+      AND ca_state IN ('MI', 'WI', 'IN')
+      AND ss_net_profit BETWEEN 50 AND 25000
+),
+branch4 AS (
+    SELECT ss_quantity
+    FROM filtered_sales
+    INNER JOIN customer_demographics ON cd_demo_sk = ss_cdemo_sk
+    INNER JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE cd_marital_status = 'W'
+      AND cd_education_status = 'College'
+      AND ss_sales_price BETWEEN 50.00 AND 100.00
+      AND ca_country = 'United States'
+      AND ca_state IN ('MD', 'MN', 'IA')
+      AND ss_net_profit BETWEEN 0 AND 2000
+),
+branch5 AS (
+    SELECT ss_quantity
+    FROM filtered_sales
+    INNER JOIN customer_demographics ON cd_demo_sk = ss_cdemo_sk
+    INNER JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE cd_marital_status = 'W'
+      AND cd_education_status = 'College'
+      AND ss_sales_price BETWEEN 50.00 AND 100.00
+      AND ca_country = 'United States'
+      AND ca_state IN ('VA', 'IL', 'TX')
+      AND ss_net_profit BETWEEN 150 AND 3000
+),
+branch6 AS (
+    SELECT ss_quantity
+    FROM filtered_sales
+    INNER JOIN customer_demographics ON cd_demo_sk = ss_cdemo_sk
+    INNER JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE cd_marital_status = 'W'
+      AND cd_education_status = 'College'
+      AND ss_sales_price BETWEEN 50.00 AND 100.00
+      AND ca_country = 'United States'
+      AND ca_state IN ('MI', 'WI', 'IN')
+      AND ss_net_profit BETWEEN 50 AND 25000
+),
+branch7 AS (
+    SELECT ss_quantity
+    FROM filtered_sales
+    INNER JOIN customer_demographics ON cd_demo_sk = ss_cdemo_sk
+    INNER JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE cd_marital_status = 'D'
+      AND cd_education_status = '2 yr Degree'
+      AND ss_sales_price BETWEEN 150.00 AND 200.00
+      AND ca_country = 'United States'
+      AND ca_state IN ('MD', 'MN', 'IA')
+      AND ss_net_profit BETWEEN 0 AND 2000
+),
+branch8 AS (
+    SELECT ss_quantity
+    FROM filtered_sales
+    INNER JOIN customer_demographics ON cd_demo_sk = ss_cdemo_sk
+    INNER JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE cd_marital_status = 'D'
+      AND cd_education_status = '2 yr Degree'
+      AND ss_sales_price BETWEEN 150.00 AND 200.00
+      AND ca_country = 'United States'
+      AND ca_state IN ('VA', 'IL', 'TX')
+      AND ss_net_profit BETWEEN 150 AND 3000
+),
+branch9 AS (
+    SELECT ss_quantity
+    FROM filtered_sales
+    INNER JOIN customer_demographics ON cd_demo_sk = ss_cdemo_sk
+    INNER JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE cd_marital_status = 'D'
+      AND cd_education_status = '2 yr Degree'
+      AND ss_sales_price BETWEEN 150.00 AND 200.00
+      AND ca_country = 'United States'
+      AND ca_state IN ('MI', 'WI', 'IN')
+      AND ss_net_profit BETWEEN 50 AND 25000
+),
+all_branches AS (
+    SELECT ss_quantity FROM branch1
+    UNION ALL SELECT ss_quantity FROM branch2
+    UNION ALL SELECT ss_quantity FROM branch3
+    UNION ALL SELECT ss_quantity FROM branch4
+    UNION ALL SELECT ss_quantity FROM branch5
+    UNION ALL SELECT ss_quantity FROM branch6
+    UNION ALL SELECT ss_quantity FROM branch7
+    UNION ALL SELECT ss_quantity FROM branch8
+    UNION ALL SELECT ss_quantity FROM branch9
+)
+SELECT SUM(ss_quantity)
+FROM all_branches
+INNER JOIN store ON s_store_sk = ss_store_sk

@@ -1,0 +1,37 @@
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_date BETWEEN '2000-2-01' AND (CAST('2000-2-01' AS DATE) + INTERVAL '60' DAY)
+),
+filtered_address AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_state = 'OK'
+),
+filtered_website AS (
+    SELECT web_site_sk
+    FROM web_site
+    WHERE web_company_name = 'pri'
+),
+multi_warehouse_orders AS (
+    SELECT ws_order_number
+    FROM web_sales
+    GROUP BY ws_order_number
+    HAVING MIN(ws_warehouse_sk) <> MAX(ws_warehouse_sk)
+),
+returned_orders AS (
+    SELECT DISTINCT wr_order_number
+    FROM web_returns
+)
+SELECT
+    COUNT(DISTINCT ws_order_number) AS "order count",
+    SUM(ws_ext_ship_cost) AS "total shipping cost",
+    SUM(ws_net_profit) AS "total net profit"
+FROM web_sales AS ws1
+JOIN filtered_dates ON ws1.ws_ship_date_sk = filtered_dates.d_date_sk
+JOIN filtered_address ON ws1.ws_ship_addr_sk = filtered_address.ca_address_sk
+JOIN filtered_website ON ws1.ws_web_site_sk = filtered_website.web_site_sk
+WHERE ws1.ws_order_number IN (SELECT ws_order_number FROM multi_warehouse_orders)
+  AND ws1.ws_order_number NOT IN (SELECT wr_order_number FROM returned_orders)
+ORDER BY COUNT(DISTINCT ws_order_number)
+LIMIT 100;

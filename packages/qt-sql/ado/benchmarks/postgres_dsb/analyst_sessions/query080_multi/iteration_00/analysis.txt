@@ -1,0 +1,94 @@
+## 1. STRUCTURAL BREAKDOWN
+
+**ssr CTE (17% cost):** Computes aggregated sales, returns, and profit for physical stores over a 30-day period, filtering for high-priced jewelry/music items sold via specific promotion channels. Reads store_sales (~300M rows) joined with 4 dimension tables and store_returns. Outputs ~28k rows (store aggregates).
+
+**csr CTE (22% cost):** Computes the same metrics for catalog sales channel. Reads catalog_sales (~100M rows) joined with 4 dimension tables and catalog_returns. Outputs ~7k rows (catalog_page aggregates).
+
+**wsr CTE (60% cost):** Computes the same metrics for web sales channel. Reads web_sales (~200M rows) joined with 4 dimension tables and web_returns. Outputs ~9k rows (website aggregates).
+
+**Main Query (0% cost):** Unites all channel results, performs rollup aggregation, and limits to 100 rows. Processes ~44k rows from CTEs, outputs ≤100 rows.
+
+## 2. BOTTLENECK IDENTIFICATION
+
+The dominant cost center is **wsr CTE (60% cost)**. The mechanism causing slowness is:
+
+**Comma-separated implicit CROSS JOIN + WHERE filter pattern with selective dimension tables.** Each CTE uses the problematic pattern:
+```sql
+FROM fact_table
+LEFT OUTER JOIN returns_table ON ...
+, date_dim, store, item, promotion  -- Implicit CROSS JOIN!
+WHERE ...  -- Join conditions mixed with filters
+```
+
+This forces PostgreSQL to:
+1. Build a massive intermediate Cartesian product before filtering
+2. Prevent optimal join order selection (cannot push date_dim filter early)
+3. Process all promotion/items rows despite high selectivity (p_channel_email='Y', i_current_price>50)
+
+The **same selective dimension tables (date_dim, item, promotion)** are scanned 3 times - once per channel - with identical filters. date_dim is particularly expensive as it's joined via date_sk but filtered on d_date, requiring either full scan or inefficient index usage.
+
+## 3. PROPOSED OPTIMIZATION
+
+### Change 1: Dimension Pre-fetch CTEs
+**What:** Create materialized CTEs for filtered dimension rows before the channel CTEs:
+```sql
+WITH date_filtered AS (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN ...),
+     item_filtered AS (SELECT i_item_sk FROM item WHERE i_current_price > 50 AND i_category IN (...)),
+     promo_filtered AS (SELECT p_promo_sk FROM promotion WHERE p_channel_email='Y' AND ...)
+```
+**Why:** Eliminates 3× repeated scans of selective dimensions, reduces Cartesian product explosion, enables hash join optimization.
+**Risk:** Materialization overhead if dimension tables are huge (but date_dim has 73k rows, item 400k, promotion 5k).
+**Impact:** Significant (2-3× expected).
+
+### Change 2: Convert to Explicit ANSI JOINs
+**What:** Replace comma-separated joins with explicit JOIN syntax:
+```sql
+FROM store_sales
+INNER JOIN date_filtered ON ss_sold_date_sk = d_date_sk
+INNER JOIN store ON ss_store_sk = s_store_sk
+INNER JOIN item_filtered ON ss_item_sk = i_item_sk
+INNER JOIN promo_filtered ON ss_promo_sk = p_promo_sk
+LEFT OUTER JOIN store_returns ON ...
+```
+**Why:** Gives optimizer explicit join graph, enables better join order selection, eliminates implicit CROSS JOIN.
+**Risk:** Semantic change if dimension joins had NULLable FKs (unlikely in star schema).
+**Impact:** Moderate.
+
+### Change 3: Push Fact Table Filters Earlier
+**What:** Move `ss_wholesale_cost BETWEEN 63 AND 78` into a filtered fact subquery or combine with dimension filters.
+**Why:** Reduces fact table rows before expensive joins.
+**Risk:** Must preserve LEFT JOIN semantics with returns (filter after join).
+**Impact:** Minor to moderate depending on selectivity.
+
+## 4. FAILURE ANALYSIS
+
+**Previous attempt "date_cte_isolate" (1.12x WIN):**
+- **Why it worked minimally:** Only isolated date_dim filter but kept comma-join pattern. Reduced date_dim scan from 3× to 1× but didn't fix Cartesian product issue.
+- **Constraint learned:** Isolating one dimension isn't enough; must fix the entire join pattern and pre-filter all selective dimensions.
+
+## 5. RECOMMENDED STRATEGY
+
+Implement all three changes together in this sequence:
+
+1. **Create three materialized CTEs** for filtered dimensions (date_dim, item, promotion) using their respective selective predicates.
+2. **Rewrite each channel CTE** to use explicit ANSI JOINs: fact_table → filtered_date → channel_dim → filtered_item → filtered_promo → LEFT JOIN returns.
+3. **Keep fact table filters** (wholesale_cost range) in the WHERE clause of each channel CTE.
+4. **Maintain the UNION ALL + ROLLUP** structure unchanged.
+
+The optimized query will:
+- Scan each dimension table once instead of 9 times total
+- Enable hash joins with small build sides
+- Eliminate Cartesian intermediate products
+- Allow optimal join order selection by optimizer
+
+## 6. EXAMPLE SELECTION
+
+The FAISS picks are excellent for this pattern:
+
+**pg_dimension_prefetch_star** - Directly addresses comma-join multi-channel queries by pre-filtering dimensions
+**early_filter_decorrelate** - Supports pushing filters early in complex joins
+**pg_date_cte_explicit_join** - Specifically handles date_dim filter isolation with explicit joins
+
+```
+EXAMPLES: pg_dimension_prefetch_star, early_filter_decorrelate, pg_date_cte_explicit_join
+```

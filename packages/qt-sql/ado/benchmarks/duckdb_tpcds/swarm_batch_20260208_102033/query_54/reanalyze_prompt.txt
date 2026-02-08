@@ -1,0 +1,323 @@
+You are analyzing 5 failed optimization attempts to design a refined approach that reaches 2.0x speedup.
+
+Your job: understand WHY each attempt fell short, identify unexplored optimization angles, and synthesize a NEW strategy that combines the best insights while avoiding repeated mistakes.
+
+## Query: query_54
+## Target: 2.0x speedup
+## Dialect: duckdb
+
+```sql
+-- start query 54 in stream 0 using template query54.tpl
+with my_customers as (
+ select distinct c_customer_sk
+        , c_current_addr_sk
+ from   
+        ( select cs_sold_date_sk sold_date_sk,
+                 cs_bill_customer_sk customer_sk,
+                 cs_item_sk item_sk
+          from   catalog_sales
+          union all
+          select ws_sold_date_sk sold_date_sk,
+                 ws_bill_customer_sk customer_sk,
+                 ws_item_sk item_sk
+          from   web_sales
+         ) cs_or_ws_sales,
+         item,
+         date_dim,
+         customer
+ where   sold_date_sk = d_date_sk
+         and item_sk = i_item_sk
+         and i_category = 'Women'
+         and i_class = 'maternity'
+         and c_customer_sk = cs_or_ws_sales.customer_sk
+         and d_moy = 5
+         and d_year = 1998
+ )
+ , my_revenue as (
+ select c_customer_sk,
+        sum(ss_ext_sales_price) as revenue
+ from   my_customers,
+        store_sales,
+        customer_address,
+        store,
+        date_dim
+ where  c_current_addr_sk = ca_address_sk
+        and ca_county = s_county
+        and ca_state = s_state
+        and ss_sold_date_sk = d_date_sk
+        and c_customer_sk = ss_customer_sk
+        and d_month_seq between (select distinct d_month_seq+1
+                                 from   date_dim where d_year = 1998 and d_moy = 5)
+                           and  (select distinct d_month_seq+3
+                                 from   date_dim where d_year = 1998 and d_moy = 5)
+ group by c_customer_sk
+ )
+ , segments as
+ (select cast((revenue/50) as int) as segment
+  from   my_revenue
+ )
+  select segment, count(*) as num_customers, segment*50 as segment_base
+ from segments
+ group by segment
+ order by segment, num_customers
+ LIMIT 100;
+
+-- end query 54 in stream 0 using template query54.tpl
+```
+
+## Previous Attempts
+
+### Worker 1: conservative_early_reduction
+- **Status**: error (0.00x)
+- **Error**: Binder Error: Ambiguous reference to column name "d_date_sk" (use: "date_dim.d_date_sk" or "may_date.d_date_sk")
+- **Transforms**: none
+- **Examples used**: early_filter, pushdown, materialize_cte
+- **Strategy hint**: Push filters into CTEs early to reduce fact table joins, materialize repeated subquery patterns, and apply predicate pushdown to minimize intermediate data.
+
+```sql
+WITH filtered_item AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_category = 'Women'
+    AND i_class = 'maternity'
+),
+may_date AS (
+  SELECT d_date_sk, d_month_seq
+  FROM date_dim
+  WHERE d_year = 1998
+    AND d_moy = 5
+),
+date_range AS (
+  SELECT d_date_sk
+  FROM date_dim, may_date
+  WHERE d_month_seq BETWEEN may_date.d_month_seq + 1 
+                        AND may_date.d_month_seq + 3
+),
+my_customers AS (
+  SELECT DISTINCT
+    c.c_customer_sk,
+    c.c_current_addr_sk
+  FROM (
+    SELECT cs_bill_customer_sk AS customer_sk
+    FROM catalog_sales
+    JOIN filtered_item ON cs_item_sk = i_item_sk
+    JOIN may_date ON cs_sold_date_sk = d_date_sk
+    UNION ALL
+    SELECT ws_bill_customer_sk AS customer_sk
+    FROM web_sales
+-- ... (truncated)
+```
+
+### Worker 2: moderate_dimension_isolation
+- **Status**: pass (1.05x)
+- **Transforms**: none
+- **Examples used**: date_cte_isolate, dimension_cte_isolate, shared_dimension_multi_channel
+- **Strategy hint**: Isolate date and dimension filtering into dedicated CTEs before joining with fact tables, enabling reuse across multiple sales channels and reducing redundant scans.
+
+```sql
+WITH may_1998_dates AS (
+  SELECT DISTINCT d_date_sk, d_month_seq
+  FROM date_dim
+  WHERE d_year = 1998 AND d_moy = 5
+),
+women_maternity_items AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_category = 'Women' AND i_class = 'maternity'
+),
+cs_or_ws_sales AS (
+  SELECT
+    cs_sold_date_sk AS sold_date_sk,
+    cs_bill_customer_sk AS customer_sk,
+    cs_item_sk AS item_sk
+  FROM catalog_sales
+  UNION ALL
+  SELECT
+    ws_sold_date_sk AS sold_date_sk,
+    ws_bill_customer_sk AS customer_sk,
+    ws_item_sk AS item_sk
+  FROM web_sales
+),
+my_customers AS (
+  SELECT DISTINCT
+    c_customer_sk,
+    c_current_addr_sk
+  FROM cs_or_ws_sales
+  JOIN may_1998_dates ON sold_date_sk = d_date_sk
+  JOIN women_maternity_items ON item_sk = i_item_sk
+-- ... (truncated)
+```
+
+### Worker 3: aggressive_prefetch_restructure
+- **Status**: error (0.00x)
+- **Error**: Binder Error: Ambiguous reference to column name "d_month_seq" (use: "date_dim.d_month_seq" or "base_month_seq.d_month_seq")
+- **Transforms**: none
+- **Examples used**: prefetch_fact_join, multi_dimension_prefetch, union_cte_split
+- **Strategy hint**: Pre-filter and pre-join dimension tables with fact tables in separate CTEs, then restructure the UNION into specialized branches for better join optimization and partition pruning.
+
+```sql
+WITH 
+filtered_item AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_category = 'Women' 
+    AND i_class = 'maternity'
+),
+filtered_date_may_1998 AS (
+  SELECT d_date_sk, d_month_seq
+  FROM date_dim
+  WHERE d_year = 1998 
+    AND d_moy = 5
+),
+catalog_sales_filtered AS (
+  SELECT DISTINCT
+    cs_bill_customer_sk AS customer_sk,
+    c_customer_sk,
+    c_current_addr_sk
+  FROM catalog_sales
+  JOIN filtered_date_may_1998 ON cs_sold_date_sk = d_date_sk
+  JOIN filtered_item ON cs_item_sk = i_item_sk
+  JOIN customer ON cs_bill_customer_sk = c_customer_sk
+),
+web_sales_filtered AS (
+  SELECT DISTINCT
+    ws_bill_customer_sk AS customer_sk,
+    c_customer_sk,
+    c_current_addr_sk
+  FROM web_sales
+  JOIN filtered_date_may_1998 ON ws_sold_date_sk = d_date_sk
+-- ... (truncated)
+```
+
+### Worker 4: novel_structural_transform
+- **Status**: pass (0.98x)
+- **Transforms**: none
+- **Examples used**: decorrelate, intersect_to_exists, or_to_union
+- **Strategy hint**: Transform correlated subqueries into join-efficient CTEs, convert hypothetical INTERSECT patterns to EXISTS, and explore splitting OR conditions into UNION ALL for index-friendly access.
+
+```sql
+WITH month_range AS (
+    SELECT DISTINCT
+        d_month_seq + 1 AS start_seq,
+        d_month_seq + 3 AS end_seq
+    FROM date_dim
+    WHERE d_year = 1998 AND d_moy = 5
+),
+my_customers AS (
+    SELECT DISTINCT
+        c.c_customer_sk,
+        c.c_current_addr_sk
+    FROM customer c
+    INNER JOIN (
+        SELECT
+            cs_sold_date_sk AS sold_date_sk,
+            cs_bill_customer_sk AS customer_sk,
+            cs_item_sk AS item_sk
+        FROM catalog_sales
+        UNION ALL
+        SELECT
+            ws_sold_date_sk AS sold_date_sk,
+            ws_bill_customer_sk AS customer_sk,
+            ws_item_sk AS item_sk
+        FROM web_sales
+    ) cs_or_ws_sales ON c.c_customer_sk = cs_or_ws_sales.customer_sk
+    INNER JOIN item i ON cs_or_ws_sales.item_sk = i.i_item_sk
+    INNER JOIN date_dim d ON cs_or_ws_sales.sold_date_sk = d.d_date_sk
+    WHERE i.i_category = 'Women'
+      AND i.i_class = 'maternity'
+      AND d.d_moy = 5
+-- ... (truncated)
+```
+
+### Worker 5: refined_snipe
+- **Status**: pass (0.93x)
+- **Transforms**: none
+- **Examples used**: 
+- **Strategy hint**: Snipe from iter 1
+
+```sql
+WITH may_1998_date AS (
+    SELECT
+        d_date_sk,
+        d_month_seq
+    FROM date_dim
+    WHERE d_year = 1998
+      AND d_moy = 5
+),
+filtered_items AS (
+    SELECT
+        i_item_sk
+    FROM item
+    WHERE i_category = 'Women'
+      AND i_class = 'maternity'
+),
+catalog_customers AS (
+    SELECT DISTINCT
+        cs_bill_customer_sk AS customer_sk
+    FROM catalog_sales
+    INNER JOIN filtered_items ON cs_item_sk = i_item_sk
+    INNER JOIN may_1998_date ON cs_sold_date_sk = d_date_sk
+),
+web_customers AS (
+    SELECT DISTINCT
+        ws_bill_customer_sk AS customer_sk
+    FROM web_sales
+    INNER JOIN filtered_items ON ws_item_sk = i_item_sk
+    INNER JOIN may_1998_date ON ws_sold_date_sk = d_date_sk
+),
+my_customers AS (
+-- ... (truncated)
+```
+
+## DAG Structure & Bottlenecks
+
+| Node | Role | Cost % |
+|------|------|-------:|
+| my_customers |  | 0.0% |
+| my_revenue |  | 0.0% |
+| segments |  | 0.0% |
+| main_query |  | 0.0% |
+
+## Available Examples (Full Catalog)
+
+- **composite_decorrelate_union** (2.42xx) — Decorrelate multiple correlated EXISTS subqueries into pre-materialized DISTINCT
+- **date_cte_isolate** (4.00xx) — Extract date filtering into a separate CTE to enable predicate pushdown and redu
+- **decorrelate** (2.92xx) — Convert correlated subquery to separate CTE with GROUP BY, then JOIN
+- **deferred_window_aggregation** (1.36xx) — When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joi
+- **dimension_cte_isolate** (1.93xx) — Pre-filter ALL dimension tables into CTEs before joining with fact table, not ju
+- **early_filter** (4.00xx) — Filter dimension tables FIRST, then join to fact tables to reduce expensive join
+- **intersect_to_exists** (1.83xx) — Convert INTERSECT subquery pattern to multiple EXISTS clauses for better join pl
+- **materialize_cte** (1.37xx) — Extract repeated subquery patterns into a CTE to avoid recomputation
+- **multi_date_range_cte** (2.35xx) — When query uses multiple date_dim aliases with different filters (d1, d2, d3), c
+- **multi_dimension_prefetch** (2.71xx) — Pre-filter multiple dimension tables (date + store) into separate CTEs before jo
+- **or_to_union** (3.17xx) — Split OR conditions on different columns into UNION ALL branches for better inde
+- **prefetch_fact_join** (3.77xx) — Pre-filter dimension table into CTE, then pre-join with fact table in second CTE
+- **pushdown** (2.11xx) — Push filters from outer query into CTEs/subqueries to reduce intermediate result
+- **shared_dimension_multi_channel** (1.30xx) — Extract shared dimension filters (date, item, promotion) into CTEs when multiple
+- **single_pass_aggregation** (4.47xx) — Consolidate multiple subqueries scanning the same table into a single CTE with c
+- **union_cte_split** (1.36xx) — Split a generic UNION ALL CTE into specialized CTEs when the main query filters 
+
+## Your Task
+
+Analyze the failed attempts and design a refined approach:
+
+1. **Failure Analysis**: Why did all attempts fall short? Be specific about mechanisms.
+2. **Common Patterns**: What did multiple workers try unsuccessfully?
+3. **Unexplored Space**: What optimization angles were missed entirely?
+4. **Refined Strategy**: Synthesize a NEW approach combining best insights.
+
+### Output Format (follow EXACTLY)
+
+```
+FAILURE_ANALYSIS:
+<Why all workers fell short — be specific about mechanisms>
+
+UNEXPLORED_OPPORTUNITIES:
+<What optimization approaches haven't been tried>
+
+REFINED_STRATEGY:
+<Concrete optimization approach for next attempt>
+
+EXAMPLES: <ex1>, <ex2>, <ex3>
+HINT: <specific guidance for the refined attempt>
+```

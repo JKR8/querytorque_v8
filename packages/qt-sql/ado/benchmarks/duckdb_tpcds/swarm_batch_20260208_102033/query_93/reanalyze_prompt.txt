@@ -1,0 +1,273 @@
+You are analyzing 5 failed optimization attempts to design a refined approach that reaches 2.0x speedup.
+
+Your job: understand WHY each attempt fell short, identify unexplored optimization angles, and synthesize a NEW strategy that combines the best insights while avoiding repeated mistakes.
+
+## Query: query_93
+## Target: 2.0x speedup
+## Dialect: duckdb
+
+```sql
+-- start query 93 in stream 0 using template query93.tpl
+select ss_customer_sk
+            ,sum(act_sales) sumsales
+      from (select ss_item_sk
+                  ,ss_ticket_number
+                  ,ss_customer_sk
+                  ,case when sr_return_quantity is not null then (ss_quantity-sr_return_quantity)*ss_sales_price
+                                                            else (ss_quantity*ss_sales_price) end act_sales
+            from store_sales left outer join store_returns on (sr_item_sk = ss_item_sk
+                                                               and sr_ticket_number = ss_ticket_number)
+                ,reason
+            where sr_reason_sk = r_reason_sk
+              and r_reason_desc = 'duplicate purchase') t
+      group by ss_customer_sk
+      order by sumsales, ss_customer_sk
+ LIMIT 100;
+
+-- end query 93 in stream 0 using template query93.tpl
+```
+
+## Previous Attempts
+
+### Worker 1: conservative_early_filter_restructure
+- **Status**: pass (0.81x)
+- **Transforms**: none
+- **Examples used**: early_filter, pushdown, materialize_cte
+- **Strategy hint**: Filter the `reason` table first to reduce join volume, push filters into CTE, and materialize filtered dimension data early to optimize the left join pattern.
+
+```sql
+WITH filtered_reason AS (
+    SELECT r_reason_sk
+    FROM reason
+    WHERE r_reason_desc = 'duplicate purchase'
+),
+filtered_returns AS (
+    SELECT 
+        sr_item_sk,
+        sr_ticket_number,
+        sr_return_quantity
+    FROM store_returns
+    JOIN filtered_reason 
+        ON sr_reason_sk = r_reason_sk
+)
+SELECT
+    ss_customer_sk,
+    SUM(act_sales) AS sumsales
+FROM (
+    SELECT
+        ss_customer_sk,
+        CASE
+            WHEN NOT sr_return_quantity IS NULL
+            THEN (ss_quantity - sr_return_quantity) * ss_sales_price
+            ELSE (ss_quantity * ss_sales_price)
+        END AS act_sales
+    FROM store_sales
+    LEFT OUTER JOIN filtered_returns
+        ON sr_item_sk = ss_item_sk 
+        AND sr_ticket_number = ss_ticket_number
+) AS t
+-- ... (truncated)
+```
+
+### Worker 2: moderate_dimension_isolation
+- **Status**: error (0.00x)
+- **Error**: Binder Error: Values list "t" does not have a column named "sr_reason_sk"
+
+LINE 26:     WHERE t.sr_reason_sk = fr.r_reason_sk
+                   ^
+- **Transforms**: none
+- **Examples used**: dimension_cte_isolate, date_cte_isolate, shared_dimension_multi_channel
+- **Strategy hint**: Isolate dimension table filtering (reason) into a dedicated CTE, then restructure the query to join this pre-filtered dimension with fact tables using explicit joins instead of cross joins.
+
+```sql
+WITH filtered_reason AS (
+    SELECT r_reason_sk
+    FROM reason
+    WHERE r_reason_desc = 'duplicate purchase'
+)
+SELECT
+    ss_customer_sk,
+    SUM(act_sales) AS sumsales
+FROM (
+    SELECT
+        ss_customer_sk,
+        CASE
+            WHEN NOT sr_return_quantity IS NULL
+            THEN (ss_quantity - sr_return_quantity) * ss_sales_price
+            ELSE (ss_quantity * ss_sales_price)
+        END AS act_sales
+    FROM store_sales
+    LEFT OUTER JOIN store_returns
+        ON sr_item_sk = ss_item_sk 
+        AND sr_ticket_number = ss_ticket_number
+        AND sr_reason_sk IN (SELECT r_reason_sk FROM filtered_reason)
+) AS t
+WHERE EXISTS (
+    SELECT 1 
+    FROM filtered_reason fr 
+    WHERE t.sr_reason_sk = fr.r_reason_sk
+    OR t.sr_reason_sk IS NULL
+)
+GROUP BY ss_customer_sk
+ORDER BY sumsales, ss_customer_sk
+-- ... (truncated)
+```
+
+### Worker 3: aggressive_prefetch_restructure
+- **Status**: pass (0.77x)
+- **Transforms**: none
+- **Examples used**: prefetch_fact_join, multi_dimension_prefetch, single_pass_aggregation
+- **Strategy hint**: Pre-filter reason table, then pre-join with store_returns to create a filtered returns CTE before joining to store_sales in a single aggregation pass, eliminating cross join inefficiencies.
+
+```sql
+WITH filtered_reason AS (
+    SELECT r_reason_sk
+    FROM reason
+    WHERE r_reason_desc = 'duplicate purchase'
+),
+filtered_returns AS (
+    SELECT 
+        sr_item_sk,
+        sr_ticket_number,
+        sr_return_quantity
+    FROM store_returns
+    WHERE EXISTS (
+        SELECT 1 
+        FROM filtered_reason 
+        WHERE sr_reason_sk = r_reason_sk
+    )
+)
+SELECT
+    ss_customer_sk,
+    SUM(
+        CASE
+            WHEN NOT sr_return_quantity IS NULL
+            THEN (ss_quantity - sr_return_quantity) * ss_sales_price
+            ELSE (ss_quantity * ss_sales_price)
+        END
+    ) AS sumsales
+FROM store_sales
+LEFT OUTER JOIN filtered_returns
+    ON sr_item_sk = ss_item_sk 
+    AND sr_ticket_number = ss_ticket_number
+-- ... (truncated)
+```
+
+### Worker 4: novel_structural_transform
+- **Status**: pass (0.80x)
+- **Transforms**: none
+- **Examples used**: or_to_union, intersect_to_exists, composite_decorrelate_union
+- **Strategy hint**: Transform the CASE logic and cross join into a UNION ALL structure separating returned vs non-returned sales, or explore decorrelation techniques to restructure the dimension join pattern.
+
+```sql
+WITH filtered_returns AS (
+  SELECT 
+    sr_item_sk,
+    sr_ticket_number,
+    sr_return_quantity
+  FROM store_returns
+  JOIN reason ON sr_reason_sk = r_reason_sk
+  WHERE r_reason_desc = 'duplicate purchase'
+)
+SELECT
+  ss_customer_sk,
+  SUM(
+    CASE 
+      WHEN fr.sr_return_quantity IS NOT NULL
+      THEN (ss_quantity - fr.sr_return_quantity) * ss_sales_price
+      ELSE ss_quantity * ss_sales_price
+    END
+  ) AS sumsales
+FROM store_sales
+LEFT JOIN filtered_returns fr
+  ON ss_item_sk = fr.sr_item_sk
+  AND ss_ticket_number = fr.sr_ticket_number
+GROUP BY ss_customer_sk
+ORDER BY sumsales, ss_customer_sk
+LIMIT 100
+```
+
+### Worker 5: refined_snipe
+- **Status**: pass (0.80x)
+- **Transforms**: none
+- **Examples used**: 
+- **Strategy hint**: Snipe from iter 1
+
+```sql
+WITH filtered_reason AS (
+    SELECT r_reason_sk
+    FROM reason
+    WHERE r_reason_desc = 'duplicate purchase'
+), filtered_returns AS (
+    SELECT sr_item_sk, sr_ticket_number, sr_return_quantity
+    FROM store_returns
+    JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+)
+SELECT
+    ss_customer_sk,
+    SUM(
+        CASE
+            WHEN NOT sr_return_quantity IS NULL
+            THEN (ss_quantity - sr_return_quantity) * ss_sales_price
+            ELSE ss_quantity * ss_sales_price
+        END
+    ) AS sumsales
+FROM store_sales
+LEFT OUTER JOIN filtered_returns ON (
+    sr_item_sk = ss_item_sk 
+    AND sr_ticket_number = ss_ticket_number
+)
+GROUP BY ss_customer_sk
+ORDER BY sumsales, ss_customer_sk
+LIMIT 100
+```
+
+## DAG Structure & Bottlenecks
+
+| Node | Role | Cost % |
+|------|------|-------:|
+| main_query |  | 0.0% |
+
+## Available Examples (Full Catalog)
+
+- **composite_decorrelate_union** (2.42xx) — Decorrelate multiple correlated EXISTS subqueries into pre-materialized DISTINCT
+- **date_cte_isolate** (4.00xx) — Extract date filtering into a separate CTE to enable predicate pushdown and redu
+- **decorrelate** (2.92xx) — Convert correlated subquery to separate CTE with GROUP BY, then JOIN
+- **deferred_window_aggregation** (1.36xx) — When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joi
+- **dimension_cte_isolate** (1.93xx) — Pre-filter ALL dimension tables into CTEs before joining with fact table, not ju
+- **early_filter** (4.00xx) — Filter dimension tables FIRST, then join to fact tables to reduce expensive join
+- **intersect_to_exists** (1.83xx) — Convert INTERSECT subquery pattern to multiple EXISTS clauses for better join pl
+- **materialize_cte** (1.37xx) — Extract repeated subquery patterns into a CTE to avoid recomputation
+- **multi_date_range_cte** (2.35xx) — When query uses multiple date_dim aliases with different filters (d1, d2, d3), c
+- **multi_dimension_prefetch** (2.71xx) — Pre-filter multiple dimension tables (date + store) into separate CTEs before jo
+- **or_to_union** (3.17xx) — Split OR conditions on different columns into UNION ALL branches for better inde
+- **prefetch_fact_join** (3.77xx) — Pre-filter dimension table into CTE, then pre-join with fact table in second CTE
+- **pushdown** (2.11xx) — Push filters from outer query into CTEs/subqueries to reduce intermediate result
+- **shared_dimension_multi_channel** (1.30xx) — Extract shared dimension filters (date, item, promotion) into CTEs when multiple
+- **single_pass_aggregation** (4.47xx) — Consolidate multiple subqueries scanning the same table into a single CTE with c
+- **union_cte_split** (1.36xx) — Split a generic UNION ALL CTE into specialized CTEs when the main query filters 
+
+## Your Task
+
+Analyze the failed attempts and design a refined approach:
+
+1. **Failure Analysis**: Why did all attempts fall short? Be specific about mechanisms.
+2. **Common Patterns**: What did multiple workers try unsuccessfully?
+3. **Unexplored Space**: What optimization angles were missed entirely?
+4. **Refined Strategy**: Synthesize a NEW approach combining best insights.
+
+### Output Format (follow EXACTLY)
+
+```
+FAILURE_ANALYSIS:
+<Why all workers fell short — be specific about mechanisms>
+
+UNEXPLORED_OPPORTUNITIES:
+<What optimization approaches haven't been tried>
+
+REFINED_STRATEGY:
+<Concrete optimization approach for next attempt>
+
+EXAMPLES: <ex1>, <ex2>, <ex3>
+HINT: <specific guidance for the refined attempt>
+```

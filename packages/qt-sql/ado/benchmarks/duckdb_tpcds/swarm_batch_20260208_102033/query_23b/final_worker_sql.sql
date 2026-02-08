@@ -1,0 +1,99 @@
+WITH store_sales_aggregates AS (
+  -- Single pass over store_sales that computes both item frequencies and customer sales
+  SELECT
+    -- Item frequency data
+    ss_item_sk,
+    d_date,
+    COUNT(*) as item_date_cnt,
+    
+    -- Customer sales data (with year filter)
+    ss_customer_sk,
+    CASE WHEN d_year IN (2000, 2001, 2002, 2003) 
+         THEN ss_quantity * ss_sales_price 
+         ELSE 0 END as csales_year_filtered,
+    
+    -- Unfiltered customer sales for best_ss_customer
+    ss_quantity * ss_sales_price as csales_total
+  FROM store_sales
+  JOIN date_dim ON ss_sold_date_sk = d_date_sk
+  WHERE d_year IN (2000, 2001, 2002, 2003)
+  GROUP BY 
+    ss_item_sk, d_date, d_year, 
+    ss_customer_sk, ss_quantity, ss_sales_price
+),
+
+frequent_ss_items AS (
+  -- Distinct items that sold >4 times per date
+  SELECT DISTINCT ss_item_sk as item_sk
+  FROM store_sales_aggregates
+  WHERE item_date_cnt > 4
+),
+
+max_store_sales AS (
+  -- Global max customer sales from the aggregated data
+  SELECT MAX(csales_year) as tpcds_cmax
+  FROM (
+    SELECT 
+      ss_customer_sk,
+      SUM(csales_year_filtered) as csales_year
+    FROM store_sales_aggregates
+    GROUP BY ss_customer_sk
+  )
+),
+
+best_ss_customer AS (
+  -- Customers whose total sales > 95% of max
+  SELECT 
+    ss_customer_sk as c_customer_sk,
+    SUM(csales_total) as ssales
+  FROM store_sales_aggregates
+  GROUP BY ss_customer_sk
+  HAVING SUM(csales_total) > (
+    SELECT tpcds_cmax * (95 / 100.0) 
+    FROM max_store_sales
+  )
+),
+
+dates_may_2000 AS (
+  -- Pre-filtered dates for May 2000
+  SELECT d_date_sk
+  FROM date_dim 
+  WHERE d_year = 2000 AND d_moy = 5
+)
+
+SELECT
+  c_last_name,
+  c_first_name,
+  sales
+FROM (
+  -- Catalog sales branch
+  SELECT
+    c_last_name,
+    c_first_name,
+    SUM(cs_quantity * cs_list_price) AS sales
+  FROM catalog_sales
+  JOIN dates_may_2000 ON cs_sold_date_sk = d_date_sk
+  JOIN frequent_ss_items ON cs_item_sk = item_sk
+  JOIN best_ss_customer ON cs_bill_customer_sk = c_customer_sk
+  JOIN customer ON cs_bill_customer_sk = c_customer_sk
+  GROUP BY c_last_name, c_first_name
+  
+  UNION ALL
+  
+  -- Web sales branch  
+  SELECT
+    c_last_name,
+    c_first_name,
+    SUM(ws_quantity * ws_list_price) AS sales
+  FROM web_sales
+  JOIN dates_may_2000 ON ws_sold_date_sk = d_date_sk
+  JOIN frequent_ss_items ON ws_item_sk = item_sk
+  JOIN best_ss_customer ON ws_bill_customer_sk = c_customer_sk
+  JOIN customer ON ws_bill_customer_sk = c_customer_sk
+  GROUP BY c_last_name, c_first_name
+)
+ORDER BY
+  c_last_name,
+  c_first_name,
+  sales
+LIMIT 100;

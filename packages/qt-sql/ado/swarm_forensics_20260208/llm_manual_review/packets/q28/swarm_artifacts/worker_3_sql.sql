@@ -1,0 +1,69 @@
+WITH all_data AS (
+  SELECT 
+    ss_quantity,
+    ss_list_price,
+    ss_coupon_amt,
+    ss_wholesale_cost,
+    -- Pre-compute bucket flags for conditional aggregation
+    CASE WHEN ss_quantity BETWEEN 0 AND 5 
+          AND (ss_list_price BETWEEN 131 AND 141 
+               OR ss_coupon_amt BETWEEN 16798 AND 17798 
+               OR ss_wholesale_cost BETWEEN 25 AND 45) 
+         THEN 1 ELSE 0 END AS bucket1_flag,
+    CASE WHEN ss_quantity BETWEEN 6 AND 10 
+          AND (ss_list_price BETWEEN 145 AND 155 
+               OR ss_coupon_amt BETWEEN 14792 AND 15792 
+               OR ss_wholesale_cost BETWEEN 46 AND 66) 
+         THEN 1 ELSE 0 END AS bucket2_flag,
+    CASE WHEN ss_quantity BETWEEN 11 AND 15 
+          AND (ss_list_price BETWEEN 150 AND 160 
+               OR ss_coupon_amt BETWEEN 6600 AND 7600 
+               OR ss_wholesale_cost BETWEEN 9 AND 29) 
+         THEN 1 ELSE 0 END AS bucket3_flag,
+    CASE WHEN ss_quantity BETWEEN 16 AND 20 
+          AND (ss_list_price BETWEEN 91 AND 101 
+               OR ss_coupon_amt BETWEEN 13493 AND 14493 
+               OR ss_wholesale_cost BETWEEN 36 AND 56) 
+         THEN 1 ELSE 0 END AS bucket4_flag,
+    CASE WHEN ss_quantity BETWEEN 21 AND 25 
+          AND (ss_list_price BETWEEN 0 AND 10 
+               OR ss_coupon_amt BETWEEN 7629 AND 8629 
+               OR ss_wholesale_cost BETWEEN 6 AND 26) 
+         THEN 1 ELSE 0 END AS bucket5_flag,
+    CASE WHEN ss_quantity BETWEEN 26 AND 30 
+          AND (ss_list_price BETWEEN 89 AND 99 
+               OR ss_coupon_amt BETWEEN 15257 AND 16257 
+               OR ss_wholesale_cost BETWEEN 31 AND 51) 
+         THEN 1 ELSE 0 END AS bucket6_flag
+  FROM store_sales
+)
+SELECT
+  B1_LP, B1_CNT, B1_CNTD,
+  B2_LP, B2_CNT, B2_CNTD,
+  B3_LP, B3_CNT, B3_CNTD,
+  B4_LP, B4_CNT, B4_CNTD,
+  B5_LP, B5_CNT, B5_CNTD,
+  B6_LP, B6_CNT, B6_CNTD
+FROM (
+  SELECT
+    AVG(CASE WHEN bucket1_flag = 1 THEN ss_list_price END) AS B1_LP,
+    COUNT(CASE WHEN bucket1_flag = 1 THEN ss_list_price END) AS B1_CNT,
+    COUNT(DISTINCT CASE WHEN bucket1_flag = 1 THEN ss_list_price END) AS B1_CNTD,
+    AVG(CASE WHEN bucket2_flag = 1 THEN ss_list_price END) AS B2_LP,
+    COUNT(CASE WHEN bucket2_flag = 1 THEN ss_list_price END) AS B2_CNT,
+    COUNT(DISTINCT CASE WHEN bucket2_flag = 1 THEN ss_list_price END) AS B2_CNTD,
+    AVG(CASE WHEN bucket3_flag = 1 THEN ss_list_price END) AS B3_LP,
+    COUNT(CASE WHEN bucket3_flag = 1 THEN ss_list_price END) AS B3_CNT,
+    COUNT(DISTINCT CASE WHEN bucket3_flag = 1 THEN ss_list_price END) AS B3_CNTD,
+    AVG(CASE WHEN bucket4_flag = 1 THEN ss_list_price END) AS B4_LP,
+    COUNT(CASE WHEN bucket4_flag = 1 THEN ss_list_price END) AS B4_CNT,
+    COUNT(DISTINCT CASE WHEN bucket4_flag = 1 THEN ss_list_price END) AS B4_CNTD,
+    AVG(CASE WHEN bucket5_flag = 1 THEN ss_list_price END) AS B5_LP,
+    COUNT(CASE WHEN bucket5_flag = 1 THEN ss_list_price END) AS B5_CNT,
+    COUNT(DISTINCT CASE WHEN bucket5_flag = 1 THEN ss_list_price END) AS B5_CNTD,
+    AVG(CASE WHEN bucket6_flag = 1 THEN ss_list_price END) AS B6_LP,
+    COUNT(CASE WHEN bucket6_flag = 1 THEN ss_list_price END) AS B6_CNT,
+    COUNT(DISTINCT CASE WHEN bucket6_flag = 1 THEN ss_list_price END) AS B6_CNTD
+  FROM all_data
+) AS combined_aggregates
+LIMIT 100

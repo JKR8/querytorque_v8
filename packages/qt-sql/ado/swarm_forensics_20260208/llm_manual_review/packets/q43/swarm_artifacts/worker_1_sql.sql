@@ -1,0 +1,42 @@
+WITH filtered_date AS (
+    SELECT 
+        d_date_sk,
+        d_day_name
+    FROM date_dim
+    WHERE d_year = 2000
+),
+filtered_store AS (
+    SELECT 
+        s_store_sk,
+        s_store_id,
+        s_store_name
+    FROM store
+    WHERE s_gmt_offset = -5
+)
+SELECT
+    s.s_store_name,
+    s.s_store_id,
+    SUM(CASE WHEN d.d_day_name = 'Sunday' THEN ss.ss_sales_price ELSE NULL END) AS sun_sales,
+    SUM(CASE WHEN d.d_day_name = 'Monday' THEN ss.ss_sales_price ELSE NULL END) AS mon_sales,
+    SUM(CASE WHEN d.d_day_name = 'Tuesday' THEN ss.ss_sales_price ELSE NULL END) AS tue_sales,
+    SUM(CASE WHEN d.d_day_name = 'Wednesday' THEN ss.ss_sales_price ELSE NULL END) AS wed_sales,
+    SUM(CASE WHEN d.d_day_name = 'Thursday' THEN ss.ss_sales_price ELSE NULL END) AS thu_sales,
+    SUM(CASE WHEN d.d_day_name = 'Friday' THEN ss.ss_sales_price ELSE NULL END) AS fri_sales,
+    SUM(CASE WHEN d.d_day_name = 'Saturday' THEN ss.ss_sales_price ELSE NULL END) AS sat_sales
+FROM filtered_store s
+JOIN store_sales ss ON s.s_store_sk = ss.ss_store_sk
+JOIN filtered_date d ON d.d_date_sk = ss.ss_sold_date_sk
+GROUP BY
+    s.s_store_name,
+    s.s_store_id
+ORDER BY
+    s.s_store_name,
+    s.s_store_id,
+    sun_sales,
+    mon_sales,
+    tue_sales,
+    wed_sales,
+    thu_sales,
+    fri_sales,
+    sat_sales
+LIMIT 100;

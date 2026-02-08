@@ -1,0 +1,64 @@
+WITH store_sales_filtered AS (
+  SELECT
+    ss_quantity,
+    ss_list_price,
+    CASE
+      WHEN ss_quantity BETWEEN 0 AND 5
+        AND (ss_list_price BETWEEN 131 AND 141
+             OR ss_coupon_amt BETWEEN 16798 AND 17798
+             OR ss_wholesale_cost BETWEEN 25 AND 45) THEN 1
+      WHEN ss_quantity BETWEEN 6 AND 10
+        AND (ss_list_price BETWEEN 145 AND 155
+             OR ss_coupon_amt BETWEEN 14792 AND 15792
+             OR ss_wholesale_cost BETWEEN 46 AND 66) THEN 2
+      WHEN ss_quantity BETWEEN 11 AND 15
+        AND (ss_list_price BETWEEN 150 AND 160
+             OR ss_coupon_amt BETWEEN 6600 AND 7600
+             OR ss_wholesale_cost BETWEEN 9 AND 29) THEN 3
+      WHEN ss_quantity BETWEEN 16 AND 20
+        AND (ss_list_price BETWEEN 91 AND 101
+             OR ss_coupon_amt BETWEEN 13493 AND 14493
+             OR ss_wholesale_cost BETWEEN 36 AND 56) THEN 4
+      WHEN ss_quantity BETWEEN 21 AND 25
+        AND (ss_list_price BETWEEN 0 AND 10
+             OR ss_coupon_amt BETWEEN 7629 AND 8629
+             OR ss_wholesale_cost BETWEEN 6 AND 26) THEN 5
+      WHEN ss_quantity BETWEEN 26 AND 30
+        AND (ss_list_price BETWEEN 89 AND 99
+             OR ss_coupon_amt BETWEEN 15257 AND 16257
+             OR ss_wholesale_cost BETWEEN 31 AND 51) THEN 6
+      ELSE NULL
+    END AS bucket
+  FROM store_sales
+  WHERE ss_quantity BETWEEN 0 AND 30
+), bucket_aggregates AS (
+  SELECT
+    bucket,
+    AVG(ss_list_price) AS avg_lp,
+    COUNT(ss_list_price) AS cnt_lp,
+    COUNT(DISTINCT ss_list_price) AS cntd_lp
+  FROM store_sales_filtered
+  WHERE bucket IS NOT NULL
+  GROUP BY bucket
+)
+SELECT
+  MAX(CASE WHEN bucket = 1 THEN avg_lp END) AS B1_LP,
+  MAX(CASE WHEN bucket = 1 THEN cnt_lp END) AS B1_CNT,
+  MAX(CASE WHEN bucket = 1 THEN cntd_lp END) AS B1_CNTD,
+  MAX(CASE WHEN bucket = 2 THEN avg_lp END) AS B2_LP,
+  MAX(CASE WHEN bucket = 2 THEN cnt_lp END) AS B2_CNT,
+  MAX(CASE WHEN bucket = 2 THEN cntd_lp END) AS B2_CNTD,
+  MAX(CASE WHEN bucket = 3 THEN avg_lp END) AS B3_LP,
+  MAX(CASE WHEN bucket = 3 THEN cnt_lp END) AS B3_CNT,
+  MAX(CASE WHEN bucket = 3 THEN cntd_lp END) AS B3_CNTD,
+  MAX(CASE WHEN bucket = 4 THEN avg_lp END) AS B4_LP,
+  MAX(CASE WHEN bucket = 4 THEN cnt_lp END) AS B4_CNT,
+  MAX(CASE WHEN bucket = 4 THEN cntd_lp END) AS B4_CNTD,
+  MAX(CASE WHEN bucket = 5 THEN avg_lp END) AS B5_LP,
+  MAX(CASE WHEN bucket = 5 THEN cnt_lp END) AS B5_CNT,
+  MAX(CASE WHEN bucket = 5 THEN cntd_lp END) AS B5_CNTD,
+  MAX(CASE WHEN bucket = 6 THEN avg_lp END) AS B6_LP,
+  MAX(CASE WHEN bucket = 6 THEN cnt_lp END) AS B6_CNT,
+  MAX(CASE WHEN bucket = 6 THEN cntd_lp END) AS B6_CNTD
+FROM bucket_aggregates
+LIMIT 100

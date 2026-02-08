@@ -1,0 +1,95 @@
+PRAGMA enable_verification=false;
+
+WITH reason_row AS (
+    SELECT 1 AS dummy
+    FROM reason
+    WHERE r_reason_sk = 1
+),
+bucket_data AS (
+    SELECT 
+        1 AS bucket_id,
+        COUNT(*) AS cnt,
+        SUM(ss_ext_sales_price) AS sum_ext_sales_price,
+        COUNT(ss_ext_sales_price) AS cnt_ext_sales_price,
+        SUM(ss_net_profit) AS sum_net_profit,
+        COUNT(ss_net_profit) AS cnt_net_profit
+    FROM store_sales
+    WHERE ss_quantity BETWEEN 1 AND 20
+    UNION ALL
+    SELECT 
+        2 AS bucket_id,
+        COUNT(*) AS cnt,
+        SUM(ss_ext_sales_price) AS sum_ext_sales_price,
+        COUNT(ss_ext_sales_price) AS cnt_ext_sales_price,
+        SUM(ss_net_profit) AS sum_net_profit,
+        COUNT(ss_net_profit) AS cnt_net_profit
+    FROM store_sales
+    WHERE ss_quantity BETWEEN 21 AND 40
+    UNION ALL
+    SELECT 
+        3 AS bucket_id,
+        COUNT(*) AS cnt,
+        SUM(ss_ext_sales_price) AS sum_ext_sales_price,
+        COUNT(ss_ext_sales_price) AS cnt_ext_sales_price,
+        SUM(ss_net_profit) AS sum_net_profit,
+        COUNT(ss_net_profit) AS cnt_net_profit
+    FROM store_sales
+    WHERE ss_quantity BETWEEN 41 AND 60
+    UNION ALL
+    SELECT 
+        4 AS bucket_id,
+        COUNT(*) AS cnt,
+        SUM(ss_ext_sales_price) AS sum_ext_sales_price,
+        COUNT(ss_ext_sales_price) AS cnt_ext_sales_price,
+        SUM(ss_net_profit) AS sum_net_profit,
+        COUNT(ss_net_profit) AS cnt_net_profit
+    FROM store_sales
+    WHERE ss_quantity BETWEEN 61 AND 80
+    UNION ALL
+    SELECT 
+        5 AS bucket_id,
+        COUNT(*) AS cnt,
+        SUM(ss_ext_sales_price) AS sum_ext_sales_price,
+        COUNT(ss_ext_sales_price) AS cnt_ext_sales_price,
+        SUM(ss_net_profit) AS sum_net_profit,
+        COUNT(ss_net_profit) AS cnt_net_profit
+    FROM store_sales
+    WHERE ss_quantity BETWEEN 81 AND 100
+)
+SELECT
+    CASE 
+        WHEN (SELECT cnt FROM bucket_data WHERE bucket_id = 1) > 2972190
+        THEN (SELECT sum_ext_sales_price / NULLIF(cnt_ext_sales_price, 0) 
+              FROM bucket_data WHERE bucket_id = 1)
+        ELSE (SELECT sum_net_profit / NULLIF(cnt_net_profit, 0) 
+              FROM bucket_data WHERE bucket_id = 1)
+    END AS bucket1,
+    CASE 
+        WHEN (SELECT cnt FROM bucket_data WHERE bucket_id = 2) > 4505785
+        THEN (SELECT sum_ext_sales_price / NULLIF(cnt_ext_sales_price, 0) 
+              FROM bucket_data WHERE bucket_id = 2)
+        ELSE (SELECT sum_net_profit / NULLIF(cnt_net_profit, 0) 
+              FROM bucket_data WHERE bucket_id = 2)
+    END AS bucket2,
+    CASE 
+        WHEN (SELECT cnt FROM bucket_data WHERE bucket_id = 3) > 1575726
+        THEN (SELECT sum_ext_sales_price / NULLIF(cnt_ext_sales_price, 0) 
+              FROM bucket_data WHERE bucket_id = 3)
+        ELSE (SELECT sum_net_profit / NULLIF(cnt_net_profit, 0) 
+              FROM bucket_data WHERE bucket_id = 3)
+    END AS bucket3,
+    CASE 
+        WHEN (SELECT cnt FROM bucket_data WHERE bucket_id = 4) > 3188917
+        THEN (SELECT sum_ext_sales_price / NULLIF(cnt_ext_sales_price, 0) 
+              FROM bucket_data WHERE bucket_id = 4)
+        ELSE (SELECT sum_net_profit / NULLIF(cnt_net_profit, 0) 
+              FROM bucket_data WHERE bucket_id = 4)
+    END AS bucket4,
+    CASE 
+        WHEN (SELECT cnt FROM bucket_data WHERE bucket_id = 5) > 3525216
+        THEN (SELECT sum_ext_sales_price / NULLIF(cnt_ext_sales_price, 0) 
+              FROM bucket_data WHERE bucket_id = 5)
+        ELSE (SELECT sum_net_profit / NULLIF(cnt_net_profit, 0) 
+              FROM bucket_data WHERE bucket_id = 5)
+    END AS bucket5
+FROM reason_row;
