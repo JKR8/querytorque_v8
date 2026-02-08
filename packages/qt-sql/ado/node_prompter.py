@@ -190,6 +190,11 @@ class Prompter:
         if regression_warnings:
             sections.append(self._section_regression_warnings(regression_warnings))
 
+        # Section 6c: Filter pushdown heuristic (engine-specific)
+        pushdown = self._section_filter_pushdown_heuristic(dialect)
+        if pushdown:
+            sections.append(pushdown)
+
         # Section 7: Constraints (LATE-MID, sandwich ordered)
         sections.append(self._section_constraints())
 
@@ -277,7 +282,7 @@ class Prompter:
         }
         engine = engine_names.get(dialect, dialect)
         ver = f" v{engine_version}" if engine_version else ""
-        return (
+        base = (
             f"You are a SQL query rewrite engine for {engine}{ver}.\n"
             "\n"
             "Your goal: rewrite the complete SQL query to maximize execution speed\n"
@@ -290,6 +295,30 @@ class Prompter:
             "You may restructure the query freely: create new CTEs, merge existing ones,\n"
             "push filters across node boundaries, or decompose subqueries."
         )
+
+        # Engine-specific hints
+        if dialect == "duckdb":
+            base += (
+                "\n\n"
+                "### DuckDB Engine Characteristics\n"
+                "\n"
+                "- **Columnar storage**: SELECT only the columns you need. Removing "
+                "unused columns from intermediate CTEs reduces memory and speeds scans.\n"
+                "- **CTE inlining**: DuckDB inlines CTEs by default (no materialization "
+                "fence). A CTE referenced once is zero-cost. A CTE referenced multiple "
+                "times may be re-executed — consider whether re-execution or explicit "
+                "materialization is cheaper.\n"
+                "- **FILTER clause**: Use `COUNT(*) FILTER (WHERE cond)` instead of "
+                "`SUM(CASE WHEN cond THEN 1 ELSE 0 END)`. FILTER is native syntax, "
+                "skips branch evaluation, and enables better vectorized execution.\n"
+                "- **Predicate pushdown limits**: The optimizer pushes simple predicates "
+                "into base table scans but CANNOT push filters through multi-level CTEs, "
+                "window functions, or UNION ALL. You must move filters inside manually.\n"
+                "- **Hash joins**: DuckDB uses hash joins for most equi-joins. Build the "
+                "smaller side first — put the filtered dimension CTE on the build side."
+            )
+
+        return base
 
     @staticmethod
     def _strip_comments(sql: str) -> str:
@@ -691,6 +720,50 @@ class Prompter:
             lines.append("")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _section_filter_pushdown_heuristic(dialect: str = "duckdb") -> str:
+        """Section 6c: Explicit filter pushdown rules.
+
+        SQL engines cannot push predicates through multi-level CTEs,
+        window functions, or UNION ALL. This section teaches the LLM
+        to do it manually — a reliable, low-risk optimization.
+        """
+        if dialect not in ("duckdb", "postgres", "postgresql"):
+            return ""
+
+        return (
+            "## Filter Pushdown Heuristic\n"
+            "\n"
+            "SQL optimizers CANNOT push filters through multi-level CTEs, "
+            "window functions, DISTINCT, GROUP BY, or UNION ALL boundaries. "
+            "You must move them manually. Apply these rules:\n"
+            "\n"
+            "1. **Static filter on CTE output → move inside CTE**\n"
+            "   If the final SELECT (or an outer CTE) filters on a column produced "
+            "by an inner CTE with a literal/constant value, move that WHERE clause "
+            "inside the CTE definition. This reduces the intermediate result set.\n"
+            "\n"
+            "2. **Date/dimension filter → push to earliest scan**\n"
+            "   If a date or dimension filter appears in the final query, push it "
+            "into the CTE that first joins with the dimension table. Pre-filtering "
+            "the dimension table into a small CTE and joining early is even better.\n"
+            "\n"
+            "3. **Repeated filter across CTEs → extract shared CTE**\n"
+            "   If the same filter predicate (e.g., `d_year = 2001`) appears in "
+            "multiple subqueries or CTEs, extract the filtered result into one "
+            "shared CTE and reference it everywhere.\n"
+            "\n"
+            "4. **Filter after GROUP BY → push before GROUP BY**\n"
+            "   If a HAVING clause or post-aggregation filter can be expressed as "
+            "a pre-aggregation WHERE, move it before GROUP BY to reduce rows "
+            "entering the aggregation.\n"
+            "\n"
+            "5. **Filter after window function → cannot push through**\n"
+            "   Window functions require the full partition to compute. Do NOT push "
+            "filters before window functions unless the filter is on partition columns "
+            "only (which narrows partitions without changing results)."
+        )
 
     @staticmethod
     def _section_constraints() -> str:
