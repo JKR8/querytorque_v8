@@ -185,9 +185,12 @@ class Pipeline:
     def _get_explain(self, query_id: str, sql: str) -> Optional[Dict[str, Any]]:
         """Get EXPLAIN ANALYZE result — cached first, run if missing.
 
-        Cache location: benchmark_dir/explains/{query_id}.json
+        Cache location: benchmark_dir/explains/sf10/{query_id}.json
+        Falls back to:  benchmark_dir/explains/sf5/{query_id}.json
         """
-        cache_dir = self.benchmark_dir / "explains"
+        cache_dir = self.benchmark_dir / "explains" / "sf10"
+        if not cache_dir.exists():
+            cache_dir = self.benchmark_dir / "explains" / "sf5"
         cache_path = cache_dir / f"{query_id}.json"
 
         # Try cache first

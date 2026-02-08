@@ -30,7 +30,7 @@ If omitted, the pipeline reads from `QT_LLM_PROVIDER` / `QT_LLM_MODEL` automatic
 | Engine     | Benchmark | Location                                          | Notes                          |
 |------------|-----------|---------------------------------------------------|--------------------------------|
 | DuckDB     | TPC-DS    | `/mnt/d/TPC-DS/tpcds_sf10.duckdb`                | SF10, 99 queries               |
-| PostgreSQL | DSB       | `postgres://jakc9:jakc9@127.0.0.1:5433/dsb_sf10` | SF10, 52 queries               |
+| PostgreSQL | DSB       | `postgres://jakc9:jakc9@127.0.0.1:5433/dsb_sf10` | SF10 (explains), SF5 (bench)   |
 | PostgreSQL | start     | `/usr/lib/postgresql/16/bin/pg_ctl -D /mnt/d/pgdata -l /mnt/d/pgdata/logfile start` | |
 
 ## Optimization Modes
@@ -94,6 +94,48 @@ result = p.run_optimization_session(
 result = p.run_query("query_67", sql, n_workers=5)
 ```
 
+## Swarm Pipeline (batch scripts)
+
+Large-scale swarm optimization across all queries in a benchmark. Three scripts run
+sequentially: prep (zero API calls), run (LLM + benchmark), validate (standalone timing).
+
+All scripts accept `--benchmark-dir` to select the target benchmark. Default is `duckdb_tpcds`.
+
+### 1. Prep — build all prompts (zero API calls)
+
+```bash
+# DuckDB TPC-DS (default)
+PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.swarm_prep
+
+# PostgreSQL DSB
+PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.swarm_prep \
+    --benchmark-dir packages/qt-sql/ado/benchmarks/postgres_dsb
+```
+
+Phase 0 caches EXPLAIN ANALYZE (DuckDB: runs live; PG: loads from `explains/sf10/`).
+Phase 1 builds fan-out prompts (DAG + FAISS + regression warnings).
+
+### 2. Run — LLM generation + benchmarking
+
+```bash
+PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.swarm_run \
+    --benchmark-dir packages/qt-sql/ado/benchmarks/postgres_dsb
+```
+
+Resume-safe: every LLM response and benchmark result is saved to disk immediately.
+Three iterations: fan-out (4 workers) → snipe → re-analyze + final worker.
+DuckDB uses 2 parallel DB slots; PostgreSQL uses 2 connections to the same DSN.
+
+### 3. Validate — standalone batch timing
+
+```bash
+PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.batch_validate \
+    --benchmark-dir packages/qt-sql/ado/benchmarks/postgres_dsb \
+    packages/qt-sql/ado/benchmarks/postgres_dsb/swarm_batch_XXXXXXXX_XXXXXX
+```
+
+3-run validation: discard 1st (warmup), average last 2.
+
 ## Running from CLI
 
 ```bash
@@ -134,26 +176,36 @@ Product refactor plan (qt-sql centered): **[docs/QT_SQL_ADO_PRODUCT_REFACTOR_PLA
 
 ```
 ado/
-├── node_prompter.py  # Prompt builder (attention-optimized sections)
 ├── pipeline.py       # 5-phase orchestrator (parse → FAISS → rewrite → syntax → validate)
+├── node_prompter.py  # Prompt builder (attention-optimized sections)
 ├── analyst.py        # LLM-guided structural analysis
 ├── analyst_session.py # Expert mode session driver
 ├── runner.py         # ADORunner entry point
 ├── generate.py       # Parallel LLM candidate generation
+├── sql_rewriter.py   # Response → SQL extraction + AST transform inference
 ├── validate.py       # Timing + correctness validation
-├── faiss_builder.py  # Build/rebuild FAISS similarity index
-├── knowledge.py      # FAISS recommender (example retrieval)
+├── schemas.py        # Data structures (BenchmarkConfig, SessionResult, etc.)
 ├── learn.py          # Learning records + analytics
-├── schemas.py        # Data structures (ValidationResult, SessionResult, etc.)
+├── knowledge.py      # FAISS recommender (example retrieval)
+├── faiss_builder.py  # Build/rebuild FAISS similarity index
+├── context.py        # Context management
+├── store.py          # Result storage
+├── session_logging.py # Session log utilities
+├── smoke_test.py     # End-to-end smoke test
+├── swarm_prep.py     # Swarm batch prep (Phase 0-1, zero API calls)
+├── swarm_run.py      # Swarm batch run (LLM + benchmark, resume-safe)
+├── batch_swarm.py    # Batch swarm generation (LLM only, no benchmark)
+├── batch_validate.py # Batch validation (3-run timing)
 ├── constraints/      # 11 optimization constraint rules (JSON)
 ├── examples/         # 21 gold examples (16 DuckDB + 5 PostgreSQL)
 │   ├── duckdb/       # Gold examples with principle fields
 │   └── postgres/     # PostgreSQL-specific gold examples
-├── models/           # FAISS similarity index (95 vectors) + metadata
+├── models/           # FAISS similarity index + metadata
+├── prompts/          # Swarm prompt builders (fan-out, snipe, parsers)
 ├── sessions/         # Session drivers (standard, expert, swarm)
-├── prompts/          # Swarm-specific prompt builders
+├── learnings/        # Learning journal data
 ├── benchmarks/       # Per-engine benchmark configs, queries, results
-│   ├── duckdb_tpcds/ # Config, 99 queries, pairs, leaderboard, semantic_intents.json
-│   └── postgres_dsb/ # Config, 52 queries, explains
+│   ├── duckdb_tpcds/ # Config, 99 queries, explains, leaderboard, semantic_intents
+│   └── postgres_dsb/ # Config, 52 queries, explains/sf10 + explains/sf5
 └── docs/             # Architecture and reference documentation
 ```
