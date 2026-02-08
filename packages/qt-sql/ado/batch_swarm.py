@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Batch swarm generation — massively parallel LLM calls, NO validation.
 
+Supports DuckDB TPC-DS (default) and PostgreSQL DSB via --benchmark-dir.
+
 Phase 1 (prep):     Build all fan-out prompts (DAG + FAISS, deterministic, no API)
-Phase 2 (analyst):  Fire ~101 analyst calls (max 100 concurrent), save to disk immediately
+Phase 2 (analyst):  Fire ~N analyst calls (max 100 concurrent), save to disk immediately
 Phase 2.5 (parse):  Parse analyst responses → build 4 worker prompts per query
-Phase 3 (workers):  Fire ~404 worker calls (max 100 concurrent), save to disk immediately
+Phase 3 (workers):  Fire ~4N worker calls (max 100 concurrent), save to disk immediately
 
 Every API response is written to disk THE INSTANT it returns, before any processing.
 Resume-safe: skips queries/workers that already have a response file on disk.
@@ -12,10 +14,13 @@ Resume-safe: skips queries/workers that already have a response file on disk.
 Usage:
     cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
     PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.batch_swarm
+    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.batch_swarm \
+        --benchmark-dir packages/qt-sql/ado/benchmarks/postgres_dsb
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -45,9 +50,10 @@ from ado.prompts import (
     build_worker_strategy_header,
     parse_fan_out_response,
 )
+from ado.schemas import BenchmarkConfig
 
 # ---------------------------------------------------------------------------
-# Config
+# Config (defaults, overridden in main() via --benchmark-dir)
 # ---------------------------------------------------------------------------
 MAX_CONCURRENT = 100
 BENCHMARK_DIR = "packages/qt-sql/ado/benchmarks/duckdb_tpcds"
@@ -55,10 +61,7 @@ DIALECT = "duckdb"
 ENGINE = "duckdb"
 
 # Set to None to run all queries, or a list to filter
-TARGET_QUERIES = [
-    "query_67", "query_64", "query_75", "query_87", "query_57",
-    "query_70", "query_50", "query_13", "query_48", "query_79",
-]
+TARGET_QUERIES = None
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -381,15 +384,34 @@ def phase3_workers(
 # Main
 # ===================================================================
 def main():
+    global BENCHMARK_DIR, DIALECT, ENGINE
+
+    parser = argparse.ArgumentParser(description="Batch swarm generation")
+    parser.add_argument("--benchmark-dir", type=str,
+                        help="Benchmark directory (default: duckdb_tpcds)")
+    args = parser.parse_args()
+
+    # ── Load config ──
+    if args.benchmark_dir:
+        BENCHMARK_DIR = args.benchmark_dir
+    cfg_path = Path(BENCHMARK_DIR) / "config.json"
+    if cfg_path.exists():
+        cfg = BenchmarkConfig.from_file(cfg_path)
+        ENGINE = cfg.engine
+        DIALECT = cfg.engine if cfg.engine != "postgresql" else "postgres"
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(BENCHMARK_DIR) / f"swarm_batch_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     _progress["started"] = timestamp
     _progress["output_dir"] = str(output_dir)
+    _progress["engine"] = ENGINE
+    _progress["dialect"] = DIALECT
     _save_progress(output_dir)
 
     logger.info(f"Output → {output_dir}")
+    logger.info(f"Engine: {ENGINE}, Dialect: {DIALECT}")
 
     # Pipeline (shared, for DAG parsing / FAISS / prompt building)
     pipeline = Pipeline(BENCHMARK_DIR, provider="deepseek", model="deepseek-reasoner")
@@ -398,10 +420,11 @@ def main():
     generator = CandidateGenerator(provider="deepseek", model="deepseek-reasoner")
 
     # Load queries (filtered if TARGET_QUERIES is set)
+    # Works for both query_*.sql (DuckDB TPC-DS) and query0XX_*.sql (PG DSB)
     queries_dir = Path(BENCHMARK_DIR) / "queries"
     queries = {
         f.stem: f.read_text()
-        for f in sorted(queries_dir.glob("query_*.sql"))
+        for f in sorted(queries_dir.glob("query*.sql"))
         if TARGET_QUERIES is None or f.stem in TARGET_QUERIES
     }
     logger.info(f"Loaded {len(queries)} queries")

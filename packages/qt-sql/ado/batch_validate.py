@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Batch validation — run original once, then each worker's optimized SQL.
 
+Supports DuckDB TPC-DS (default) and PostgreSQL DSB via --benchmark-dir.
+
 Validation method: 3-run (run 3 times, discard 1st warmup, average last 2).
 Processes queries sequentially. For each query: time original ONCE,
 then time each worker's SQL against that baseline.
@@ -9,6 +11,10 @@ Usage:
     cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
     PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.batch_validate \
         packages/qt-sql/ado/benchmarks/duckdb_tpcds/swarm_batch_20260208_030342
+
+    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.batch_validate \
+        --benchmark-dir packages/qt-sql/ado/benchmarks/postgres_dsb \
+        packages/qt-sql/ado/benchmarks/postgres_dsb/swarm_batch_XXXXXXXX_XXXXXX
 """
 
 from __future__ import annotations
@@ -27,11 +33,12 @@ for p in ["packages/qt-shared", "packages/qt-sql", "."]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-import duckdb
+from ado.schemas import BenchmarkConfig
 
 # ---------------------------------------------------------------------------
-# Config
+# Config (defaults, overridden in main() via --benchmark-dir)
 # ---------------------------------------------------------------------------
+ENGINE = "duckdb"
 DB_PATH = "/mnt/d/TPC-DS/tpcds_sf10.duckdb"
 N_RUNS = 3  # 3-run: discard 1st (warmup), average last 2
 TIMEOUT_S = 300
@@ -52,34 +59,54 @@ def extract_sql_from_response(response_text: str) -> str | None:
     return None
 
 
-def time_query(con: duckdb.DuckDBPyConnection, sql: str) -> list[float]:
+def _execute(con, sql: str) -> list:
+    """Execute SQL and return rows, engine-aware."""
+    if ENGINE == "duckdb":
+        return con.execute(sql).fetchall()
+    else:
+        cur = con.cursor()
+        cur.execute(sql)
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+
+
+def time_query(con, sql: str) -> list[float]:
     """Run query N_RUNS times, return list of elapsed times in ms."""
     times = []
     for run in range(N_RUNS):
         t0 = time.time()
         try:
-            result = con.execute(sql)
-            result.fetchall()
+            _execute(con, sql)
             elapsed = (time.time() - t0) * 1000
             times.append(elapsed)
         except Exception as e:
             times.append(-1)  # mark as error
             logger.warning(f"    Run {run+1} error: {e}")
+            if ENGINE in ("postgresql", "postgres"):
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
     return times
 
 
-def validate_results(con: duckdb.DuckDBPyConnection,
-                     original_sql: str, optimized_sql: str) -> dict:
+def validate_results(con, original_sql: str, optimized_sql: str) -> dict:
     """Check that optimized produces same results as original."""
     try:
-        orig_rows = con.execute(original_sql).fetchall()
-        opt_rows = con.execute(optimized_sql).fetchall()
+        orig_rows = _execute(con, original_sql)
+        opt_rows = _execute(con, optimized_sql)
         return {
             "rows_match": orig_rows == opt_rows,
             "original_rows": len(orig_rows),
             "optimized_rows": len(opt_rows),
         }
     except Exception as e:
+        if ENGINE in ("postgresql", "postgres"):
+            try:
+                con.rollback()
+            except Exception:
+                pass
         return {
             "rows_match": False,
             "error": str(e),
@@ -95,25 +122,57 @@ def score_3run(times: list[float]) -> float | None:
     return sum(valid[1:]) / len(valid[1:])
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 -m ado.batch_validate <swarm_batch_dir>")
-        sys.exit(1)
+def _connect():
+    """Create a database connection based on ENGINE."""
+    if ENGINE == "duckdb":
+        import duckdb
+        return duckdb.connect(DB_PATH, read_only=True)
+    elif ENGINE in ("postgresql", "postgres"):
+        import psycopg2
+        conn = psycopg2.connect(DB_PATH)
+        conn.autocommit = True
+        # Set statement timeout
+        cur = conn.cursor()
+        cur.execute(f"SET statement_timeout = '{TIMEOUT_S * 1000}'")
+        cur.close()
+        return conn
+    else:
+        raise ValueError(f"Unsupported engine: {ENGINE}")
 
-    batch_dir = Path(sys.argv[1])
+
+def main():
+    global ENGINE, DB_PATH, TIMEOUT_S
+
+    import argparse
+    parser = argparse.ArgumentParser(description="Batch validation")
+    parser.add_argument("batch_dir", type=str, help="Swarm batch directory")
+    parser.add_argument("--benchmark-dir", type=str,
+                        help="Benchmark directory (to load config.json)")
+    args = parser.parse_args()
+
+    # ── Load config ──
+    if args.benchmark_dir:
+        cfg_path = Path(args.benchmark_dir) / "config.json"
+        if cfg_path.exists():
+            cfg = BenchmarkConfig.from_file(cfg_path)
+            ENGINE = cfg.engine
+            DB_PATH = cfg.benchmark_dsn or cfg.db_path_or_dsn
+            TIMEOUT_S = cfg.timeout_seconds
+
+    batch_dir = Path(args.batch_dir)
     if not batch_dir.exists():
         print(f"Not found: {batch_dir}")
         sys.exit(1)
 
-    # Find all query dirs
+    # Find all query dirs — works for both query_* and query0XX_* naming
     query_dirs = sorted(
-        [d for d in batch_dir.iterdir() if d.is_dir() and d.name.startswith("query_")],
+        [d for d in batch_dir.iterdir() if d.is_dir() and d.name.startswith("query")],
         key=lambda d: d.name,
     )
     logger.info(f"Validating {len(query_dirs)} queries from {batch_dir}")
-    logger.info(f"DB: {DB_PATH}, Method: 3-run (discard warmup, avg last 2)")
+    logger.info(f"Engine: {ENGINE}, DB: {DB_PATH}, Method: 3-run (discard warmup, avg last 2)")
 
-    con = duckdb.connect(DB_PATH, read_only=True)
+    con = _connect()
 
     results = {}
     for qi, qdir in enumerate(query_dirs, 1):

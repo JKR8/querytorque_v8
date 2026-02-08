@@ -53,6 +53,7 @@ class BenchmarkConfig:
     engine: str           # "duckdb" | "postgresql" | "snowflake"
     benchmark: str        # "tpcds" | "dsb"
     db_path_or_dsn: str   # DuckDB path or PostgreSQL DSN
+    benchmark_dsn: str    # DSN/path used for benchmarking (may differ from EXPLAIN DSN)
     scale_factor: int
     timeout_seconds: int
     validation_method: str  # "3-run" | "5-run"
@@ -66,10 +67,12 @@ class BenchmarkConfig:
         """Load config from a JSON file."""
         path = Path(config_path)
         data = json.loads(path.read_text())
+        db_path_or_dsn = data.get("db_path") or data.get("dsn", "")
         return cls(
             engine=data["engine"],
             benchmark=data["benchmark"],
-            db_path_or_dsn=data.get("db_path") or data.get("dsn", ""),
+            db_path_or_dsn=db_path_or_dsn,
+            benchmark_dsn=data.get("benchmark_dsn") or db_path_or_dsn,
             scale_factor=data.get("scale_factor", 10),
             timeout_seconds=data.get("timeout_seconds", 300),
             validation_method=data.get("validation_method", "3-run"),

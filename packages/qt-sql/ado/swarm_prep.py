@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Swarm TPC-DS full prep — generate ALL prompts, ZERO API calls.
+"""Swarm full prep — generate ALL prompts, ZERO API calls.
 
-Runs every deterministic step of the swarm pipeline for all TPC-DS
+Runs every deterministic step of the swarm pipeline for all benchmark
 queries and stops just before the analyst LLM call.
 
-Phase 0: Cache EXPLAIN ANALYZE for every query against the SF10 database.
+Supports DuckDB TPC-DS (default) and PostgreSQL DSB via --benchmark-dir.
+
+Phase 0: Cache EXPLAIN ANALYZE (DuckDB: run live; PG: load from explains/).
 Phase 1: Build fan-out prompts (DAG + FAISS + regression warnings).
 
 Per query this produces:
@@ -19,10 +21,13 @@ Per query this produces:
 Usage:
     cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
     PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.swarm_prep
+    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.swarm_prep \
+        --benchmark-dir packages/qt-sql/ado/benchmarks/postgres_dsb
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -43,8 +48,9 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 from ado.pipeline import Pipeline
 from ado.prompts import build_fan_out_prompt
+from ado.schemas import BenchmarkConfig
 
-# ── Config ───────────────────────────────────────────────────────────
+# ── Config (defaults, overridden in main() via --benchmark-dir) ──────
 BENCHMARK_DIR = Path("packages/qt-sql/ado/benchmarks/duckdb_tpcds")
 DIALECT = "duckdb"
 ENGINE = "duckdb"
@@ -65,18 +71,50 @@ log = logging.getLogger("swarm_prep")
 # =====================================================================
 
 def phase0_explain_cache(queries: dict[str, str]) -> dict[str, dict]:
-    """Run EXPLAIN ANALYZE on every query against SF10, cache results.
+    """Cache EXPLAIN ANALYZE for every query.
+
+    DuckDB: runs EXPLAIN ANALYZE live against the database.
+    PostgreSQL: loads pre-collected explains from explains/ directory.
 
     Returns {query_id: explain_result} dict.
     """
     log.info("=" * 70)
-    log.info("  PHASE 0: Cache EXPLAIN ANALYZE (SF10)")
+    log.info(f"  PHASE 0: Cache EXPLAIN ANALYZE ({ENGINE})")
     log.info(f"  Database: {DB_PATH}")
     log.info("=" * 70)
 
-    explains_dir = BENCHMARK_DIR / "explains"
+    explains_dir = BENCHMARK_DIR / "explains" / "sf10"
+    if not explains_dir.exists():
+        explains_dir = BENCHMARK_DIR / "explains" / "sf5"
     explains_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── PostgreSQL: load from pre-collected explains ──
+    if ENGINE in ("postgresql", "postgres"):
+        results = {}
+        ok = 0
+        missing = 0
+        for i, (qid, sql) in enumerate(queries.items(), 1):
+            cache_path = explains_dir / f"{qid}.json"
+            if cache_path.exists():
+                try:
+                    data = json.loads(cache_path.read_text())
+                    results[qid] = data
+                    ok += 1
+                    exec_ms = data.get("execution_time_ms", 0) or 0
+                    log.info(f"  [{i:3d}/{len(queries)}] {qid:20s}  LOADED  "
+                             f"({exec_ms:.1f}ms)")
+                except Exception as e:
+                    log.error(f"  [{i:3d}/{len(queries)}] {qid:20s}  JSON ERROR: {e}")
+                    results[qid] = {}
+            else:
+                missing += 1
+                log.warning(f"  [{i:3d}/{len(queries)}] {qid:20s}  NO EXPLAIN CACHED")
+                results[qid] = {}
+        log.info(f"  Phase 0 done: {ok}/{len(queries)} loaded from cache, "
+                 f"{missing} missing")
+        return results
+
+    # ── DuckDB: run EXPLAIN ANALYZE live ──
     import duckdb
 
     conn = duckdb.connect(DB_PATH, read_only=True)
@@ -91,12 +129,9 @@ def phase0_explain_cache(queries: dict[str, str]) -> dict[str, dict]:
         cache_path = explains_dir / f"{qid}.json"
 
         try:
-            # Run EXPLAIN ANALYZE — captures real execution plan with timings
             explain_sql = f"EXPLAIN ANALYZE {sql}"
             explain_result = conn.execute(explain_sql).fetchall()
 
-            # Also get the JSON profile
-            profile_sql = f"PRAGMA enable_profiling='json'; PRAGMA profile_output=''; {sql}"
             try:
                 conn.execute("PRAGMA enable_profiling='json'")
                 conn.execute("PRAGMA enable_progress_bar=false")
@@ -113,15 +148,12 @@ def phase0_explain_cache(queries: dict[str, str]) -> dict[str, dict]:
                 result_rows = []
                 conn.execute("PRAGMA disable_profiling")
 
-            # Extract plan text from EXPLAIN ANALYZE
             plan_text = ""
             if explain_result:
                 plan_text = "\n".join(str(row[1]) if len(row) > 1 else str(row[0])
                                       for row in explain_result)
 
             row_count = len(result_rows) if result_rows else 0
-
-            # Compute execution time from plan_json if available
             exec_time_ms = plan_json.get("latency", 0.0) if isinstance(plan_json, dict) else 0.0
 
             explain_data = {
@@ -147,7 +179,6 @@ def phase0_explain_cache(queries: dict[str, str]) -> dict[str, dict]:
         except Exception as e:
             errors += 1
             log.error(f"  [{i:3d}/{len(queries)}] {qid:12s}  ERROR  {e}")
-            # Save error marker so pipeline can fall back to heuristic costs
             cache_path.write_text(json.dumps({
                 "execution_time_ms": None,
                 "plan_text": None,
@@ -271,6 +302,26 @@ def phase1_prompts(pipeline: Pipeline, queries: dict[str, str], output_dir: Path
 # =====================================================================
 
 def main():
+    global BENCHMARK_DIR, DIALECT, ENGINE, DB_PATH
+
+    parser = argparse.ArgumentParser(description="Swarm prep — all prompts, zero API calls")
+    parser.add_argument("--benchmark-dir", type=str,
+                        help="Benchmark directory (default: duckdb_tpcds)")
+    args = parser.parse_args()
+
+    # ── Load config ──
+    if args.benchmark_dir:
+        BENCHMARK_DIR = Path(args.benchmark_dir)
+    cfg_path = BENCHMARK_DIR / "config.json"
+    cfg = None
+    if cfg_path.exists():
+        cfg = BenchmarkConfig.from_file(cfg_path)
+        ENGINE = cfg.engine
+        DIALECT = cfg.engine if cfg.engine != "postgresql" else "postgres"
+        DB_PATH = cfg.db_path_or_dsn
+    else:
+        log.warning(f"No config.json in {BENCHMARK_DIR}, using defaults")
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = BENCHMARK_DIR / f"swarm_batch_{ts}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -281,21 +332,23 @@ def main():
 
     log.info("=" * 70)
     log.info("  SWARM PREP — All prompts, zero API calls")
+    log.info(f"  Engine:   {ENGINE}")
+    log.info(f"  Dialect:  {DIALECT}")
     log.info(f"  Database: {DB_PATH}")
-    log.info(f"  Output: {output_dir}")
+    log.info(f"  Output:   {output_dir}")
     log.info("=" * 70)
 
-    # Load all queries
+    # Load all queries — works for both query_*.sql and query0XX_*.sql
     queries_dir = BENCHMARK_DIR / "queries"
     queries = {
         f.stem: f.read_text()
-        for f in sorted(queries_dir.glob("query_*.sql"))
+        for f in sorted(queries_dir.glob("query*.sql"))
     }
     log.info(f"  Loaded {len(queries)} queries")
 
     t_total = time.time()
 
-    # Phase 0: Cache EXPLAIN ANALYZE from SF10
+    # Phase 0: Cache EXPLAIN ANALYZE
     phase0_explain_cache(queries)
 
     # Phase 1: Build all fan-out prompts
@@ -313,8 +366,10 @@ def main():
         "elapsed_s": round(total_elapsed, 1),
         "output_dir": str(output_dir),
         "timestamp": ts,
+        "engine": ENGINE,
+        "dialect": DIALECT,
         "database": DB_PATH,
-        "scale_factor": 10,
+        "scale_factor": cfg.scale_factor if cfg else 10,
         "mode": "swarm (4 workers per query)",
         "prompt_stats": {
             "min_chars": min(prompt_sizes) if prompt_sizes else 0,
@@ -326,27 +381,24 @@ def main():
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
-    # Verify explains all have provenance
-    explains_dir = BENCHMARK_DIR / "explains"
-    provenance_ok = 0
-    for f in explains_dir.glob("*.json"):
-        data = json.loads(f.read_text())
-        prov = data.get("provenance", {})
-        if prov.get("scale_factor") == 10 and prov.get("database") == DB_PATH:
-            provenance_ok += 1
+    # Verify explains
+    explains_dir = BENCHMARK_DIR / "explains" / "sf10"
+    if not explains_dir.exists():
+        explains_dir = BENCHMARK_DIR / "explains" / "sf5"
     total_explains = len(list(explains_dir.glob("*.json")))
 
     log.info("")
     log.info("=" * 70)
     log.info("  PREP COMPLETE")
-    log.info(f"  Explains:  {provenance_ok}/{total_explains} confirmed SF10 provenance")
+    log.info(f"  Engine:    {ENGINE}")
+    log.info(f"  Explains:  {total_explains} cached")
     log.info(f"  Queries:   {results['ok']}/{len(queries)} prompts ready, {results['error']} errors")
     if prompt_sizes:
         log.info(f"  Prompts:   {sum(prompt_sizes):,} total chars ({sum(prompt_sizes)//len(prompt_sizes):,} avg)")
     log.info(f"  Elapsed:   {total_elapsed:.1f}s ({total_elapsed/len(queries):.1f}s/query)")
     log.info(f"  Output:    {output_dir}")
     log.info("")
-    log.info("  NEXT STEP: Fire 101 analyst calls (Phase 2)")
+    log.info(f"  NEXT STEP: Fire analyst calls (Phase 2)")
     log.info(f"  All {results['ok']} fan_out_prompt.txt files are ready to send.")
     log.info("=" * 70)
 

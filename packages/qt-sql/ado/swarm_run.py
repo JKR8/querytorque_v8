@@ -72,16 +72,19 @@ from ado.prompts import (
     parse_fan_out_response,
     parse_snipe_response,
 )
+from ado.schemas import BenchmarkConfig
 
 # ─── Config ──────────────────────────────────────────────────────────
 MAX_LLM_CONCURRENT = 100
+EXIT_SPEEDUP = 2.0
+
+# Module-level config — set in main() from --benchmark-dir arg
 BENCHMARK_DIR = Path("packages/qt-sql/ado/benchmarks/duckdb_tpcds")
 DIALECT = "duckdb"
 ENGINE = "duckdb"
-EXIT_SPEEDUP = 2.0
-
 DB_SLOT_1 = "/mnt/d/TPC-DS/tpcds_sf10_1.duckdb"
 DB_SLOT_2 = "/mnt/d/TPC-DS/tpcds_sf10_2.duckdb"
+TIMEOUT_SECONDS = 300
 
 # ─── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -258,27 +261,50 @@ def fire_llm_calls(
 # =====================================================================
 
 class BenchmarkSlot(threading.Thread):
-    """Benchmark worker with its own DuckDB connection."""
+    """Benchmark worker with its own database connection (DuckDB or PostgreSQL)."""
 
-    def __init__(self, slot_id: int, db_path: str,
+    def __init__(self, slot_id: int, dsn: str,
                  work_queue: queue.Queue,
                  results: dict, results_lock: threading.Lock,
-                 save_dir: Path, iter_name: str):
+                 save_dir: Path, iter_name: str,
+                 engine: str = "duckdb", timeout_seconds: int = 300):
         super().__init__(daemon=True, name=f"bench-slot-{slot_id}")
         self.slot_id = slot_id
-        self.db_path = db_path
+        self.dsn = dsn
+        self.engine = engine
+        self.timeout_seconds = timeout_seconds
         self.work_queue = work_queue
         self.results = results
         self.results_lock = results_lock
         self.save_dir = save_dir
         self.iter_name = iter_name
         self.conn = None
+        self._cursor = None  # For PostgreSQL
 
     def _connect(self):
-        import duckdb
-        self.conn = duckdb.connect(self.db_path, read_only=True)
-        self.conn.execute("SET threads TO 1")
-        self.conn.execute("SET enable_progress_bar = false")
+        if self.engine == "duckdb":
+            import duckdb
+            self.conn = duckdb.connect(self.dsn, read_only=True)
+            self.conn.execute("SET threads TO 1")
+            self.conn.execute("SET enable_progress_bar = false")
+        elif self.engine in ("postgresql", "postgres"):
+            import psycopg2
+            self.conn = psycopg2.connect(self.dsn)
+            self.conn.autocommit = True
+            self._cursor = self.conn.cursor()
+            self._cursor.execute(
+                f"SET statement_timeout = '{self.timeout_seconds * 1000}'"
+            )
+        else:
+            raise ValueError(f"Unsupported engine: {self.engine}")
+
+    def _execute(self, sql: str) -> list:
+        """Execute SQL and return rows, engine-aware."""
+        if self.engine == "duckdb":
+            return self.conn.execute(sql).fetchall()
+        else:
+            self._cursor.execute(sql)
+            return self._cursor.fetchall()
 
     def run(self):
         self._connect()
@@ -299,6 +325,8 @@ class BenchmarkSlot(threading.Thread):
                 finally:
                     self.work_queue.task_done()
         finally:
+            if self._cursor:
+                self._cursor.close()
             if self.conn:
                 self.conn.close()
 
@@ -311,7 +339,7 @@ class BenchmarkSlot(threading.Thread):
         for r in range(1, 6):
             try:
                 t0 = time.perf_counter()
-                rows = self.conn.execute(job.original_sql).fetchall()
+                rows = self._execute(job.original_sql)
                 ms = (time.perf_counter() - t0) * 1000
                 baseline_times.append(ms)
                 if r == 1:
@@ -377,7 +405,7 @@ class BenchmarkSlot(threading.Thread):
         for r in range(1, 6):
             try:
                 t0 = time.perf_counter()
-                rows = self.conn.execute(opt_sql).fetchall()
+                rows = self._execute(opt_sql)
                 ms = (time.perf_counter() - t0) * 1000
                 times.append(ms)
                 if r == 1:
@@ -454,9 +482,11 @@ def run_benchmarks(
     results_lock = threading.Lock()
 
     slot1 = BenchmarkSlot(1, DB_SLOT_1, work_queue, results, results_lock,
-                          batch_dir, iter_name)
+                          batch_dir, iter_name, engine=ENGINE,
+                          timeout_seconds=TIMEOUT_SECONDS)
     slot2 = BenchmarkSlot(2, DB_SLOT_2, work_queue, results, results_lock,
-                          batch_dir, iter_name)
+                          batch_dir, iter_name, engine=ENGINE,
+                          timeout_seconds=TIMEOUT_SECONDS)
     slot1.start()
     slot2.start()
 
@@ -543,11 +573,44 @@ def reload_snipe_sqls(batch_dir: Path, queries: dict) -> dict[str, str]:
 # Main
 # =====================================================================
 
+def _load_config(benchmark_dir: Path) -> BenchmarkConfig:
+    """Load BenchmarkConfig from a benchmark directory's config.json."""
+    cfg_path = benchmark_dir / "config.json"
+    if not cfg_path.exists():
+        log.error(f"config.json not found in {benchmark_dir}")
+        sys.exit(1)
+    return BenchmarkConfig.from_file(cfg_path)
+
+
 def main():
+    global BENCHMARK_DIR, DIALECT, ENGINE, DB_SLOT_1, DB_SLOT_2, TIMEOUT_SECONDS
+
     parser = argparse.ArgumentParser(description="Swarm full run")
     parser.add_argument("--batch", type=str, help="Prep batch directory")
     parser.add_argument("--query", type=str, help="Run single query (e.g. query_42)")
+    parser.add_argument("--benchmark-dir", type=str,
+                        help="Benchmark directory (default: duckdb_tpcds)")
     args = parser.parse_args()
+
+    # ── Load config ──
+    if args.benchmark_dir:
+        BENCHMARK_DIR = Path(args.benchmark_dir)
+    cfg = _load_config(BENCHMARK_DIR)
+    ENGINE = cfg.engine
+    DIALECT = cfg.engine if cfg.engine != "postgresql" else "postgres"
+    TIMEOUT_SECONDS = cfg.timeout_seconds
+
+    # ── DB slots ──
+    if ENGINE == "duckdb":
+        base = cfg.benchmark_dsn or cfg.db_path_or_dsn
+        stem = Path(base).stem
+        parent = Path(base).parent
+        DB_SLOT_1 = str(parent / f"{stem}_1.duckdb")
+        DB_SLOT_2 = str(parent / f"{stem}_2.duckdb")
+    else:
+        # PostgreSQL: both slots use the same benchmark DSN
+        DB_SLOT_1 = cfg.benchmark_dsn or cfg.db_path_or_dsn
+        DB_SLOT_2 = DB_SLOT_1
 
     # ── Find batch ──
     if args.batch:
@@ -562,10 +625,21 @@ def main():
             sys.exit(1)
 
     # ── Preflight ──
-    for db in [DB_SLOT_1, DB_SLOT_2]:
-        if not Path(db).exists():
-            log.error(f"Database not found: {db}")
-            log.error("Create copies: cp tpcds_sf10.duckdb tpcds_sf10_1.duckdb")
+    if ENGINE == "duckdb":
+        for db in [DB_SLOT_1, DB_SLOT_2]:
+            if not Path(db).exists():
+                log.error(f"Database not found: {db}")
+                log.error("Create copies: cp tpcds_sf10.duckdb tpcds_sf10_1.duckdb")
+                sys.exit(1)
+    else:
+        # PostgreSQL: test connectivity
+        try:
+            import psycopg2
+            conn = psycopg2.connect(DB_SLOT_1)
+            conn.close()
+            log.info(f"  PostgreSQL preflight OK: {DB_SLOT_1}")
+        except Exception as e:
+            log.error(f"PostgreSQL connection failed: {e}")
             sys.exit(1)
 
     log_fh = logging.FileHandler(batch_dir / "run.log", mode="a")
@@ -585,7 +659,7 @@ def main():
     # ── Load prep data ──
     queries: dict[str, dict] = {}
     for qdir in sorted(batch_dir.iterdir()):
-        if not qdir.is_dir() or not qdir.name.startswith("query_"):
+        if not qdir.is_dir() or not qdir.name.startswith("query"):
             continue
         sql_p = qdir / "original.sql"
         prompt_p = qdir / "fan_out_prompt.txt"
@@ -1099,6 +1173,7 @@ def main():
         "elapsed_minutes": round(elapsed / 60, 1),
         "exit_speedup": EXIT_SPEEDUP,
         "max_llm_concurrent": MAX_LLM_CONCURRENT,
+        "engine": ENGINE, "dialect": DIALECT,
         "db_slot_1": DB_SLOT_1, "db_slot_2": DB_SLOT_2,
         "timestamp": datetime.now().isoformat(),
     }, indent=2))
