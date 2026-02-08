@@ -234,7 +234,7 @@ def phase1_prompts(pipeline: Pipeline, queries: dict[str, str], output_dir: Path
                 "has_explain": explain_result is not None,
             }, indent=2))
 
-            faiss_examples = pipeline._find_examples(sql, engine=ENGINE, k=12)
+            faiss_examples = pipeline._find_examples(sql, engine=ENGINE, k=20)
             (qdir / "faiss_examples.json").write_text(json.dumps(
                 [{"id": e.get("id", "?"),
                   "speedup": e.get("verified_speedup", e.get("speedup", "?")),
@@ -257,7 +257,7 @@ def phase1_prompts(pipeline: Pipeline, queries: dict[str, str], output_dir: Path
                 sql=sql,
                 dag=dag,
                 costs=costs,
-                faiss_examples=faiss_examples,
+                matched_examples=faiss_examples,
                 all_available_examples=all_available,
                 dialect=DIALECT,
             )

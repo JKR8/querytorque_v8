@@ -1,10 +1,11 @@
 """V2 worker prompt builder — focused SQL generator from analyst briefing.
 
 Workers receive a precise specification from the analyst briefing:
-  [1] Role + dialect + output format (short, mechanical)
+  [1] Role + dialect (short, mechanical — worker follows the DAG)
   [2] SEMANTIC CONTRACT (primacy — frames what MUST be preserved)
   [3] TARGET DAG + NODE CONTRACTS (what to produce — the blueprint)
   [4] HAZARD FLAGS (what to avoid — before they start writing)
+  [4b] REGRESSION WARNINGS (observed failures on similar queries)
   [5] ACTIVE CONSTRAINTS (rules that apply — analyst-filtered 3-6)
   [6] REASONED EXAMPLES + before/after SQL (pattern material)
   [7] ORIGINAL SQL (source reference)
@@ -61,18 +62,19 @@ def build_worker_v2_prompt(
 
     sections.append(
         f"You are a SQL rewrite engine for {engine}{ver}. "
-        f"Rewrite the query for maximum execution speed while preserving "
-        f"exact semantic equivalence (same rows, same columns, same ordering). "
-        f"If you cannot improve performance, return the original unchanged."
+        f"Follow the Target DAG structure below. Your job is to write correct, "
+        f"executable SQL for each node — not to decide whether to restructure. "
+        f"Preserve exact semantic equivalence (same rows, same columns, same ordering)."
     )
 
     # Engine-specific compact hints
     if dialect == "duckdb":
         sections.append(
-            "DuckDB specifics: columnar storage (SELECT only needed columns), "
-            "CTEs inlined by default (no materialization fence), "
-            "FILTER clause native (`COUNT(*) FILTER (WHERE cond)`), "
-            "predicate pushdown stops at multi-level CTEs/window/UNION ALL."
+            "DuckDB specifics: columnar storage (SELECT only needed columns). "
+            "CTEs referenced once are typically inlined; CTEs referenced multiple "
+            "times may be materialized. FILTER clause is native "
+            "(`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at "
+            "UNION ALL boundaries and multi-level CTE references."
         )
 
     # ── [2] SEMANTIC CONTRACT ────────────────────────────────────────────
@@ -97,6 +99,13 @@ def build_worker_v2_prompt(
         sections.append(
             "## Hazard Flags (avoid these specific risks)\n\n"
             + worker_briefing.hazard_flags
+        )
+
+    # ── [4b] REGRESSION WARNINGS ──────────────────────────────────────────
+    if shared_briefing.regression_warnings:
+        sections.append(
+            "## Regression Warnings (observed failures on similar queries)\n\n"
+            + shared_briefing.regression_warnings
         )
 
     # ── [5] ACTIVE CONSTRAINTS ───────────────────────────────────────────

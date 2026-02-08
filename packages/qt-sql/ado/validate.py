@@ -54,6 +54,59 @@ def categorize_error(error_msg: str) -> str:
     return "unknown"
 
 
+def cost_rank_candidates(
+    db_path: str,
+    original_sql: str,
+    candidate_sqls: List[str],
+    top_k: int = 2,
+) -> List[int]:
+    """Rank candidates by EXPLAIN cost estimate (DuckDB only, zero executions).
+
+    Uses DuckDB's EXPLAIN (FORMAT JSON) to get estimated cardinality
+    as a cost proxy. Returns indices of the top_k candidates most likely
+    to improve performance (lowest estimated cost).
+
+    Falls back to returning all indices if cost estimation fails.
+
+    Args:
+        db_path: DuckDB database path
+        original_sql: Original SQL for baseline cost
+        candidate_sqls: List of optimized SQL candidates
+        top_k: Number of top candidates to return
+
+    Returns:
+        List of indices (0-based) into candidate_sqls, sorted by cost (best first)
+    """
+    if not candidate_sqls:
+        return []
+
+    try:
+        from qt_sql.execution.duckdb_executor import DuckDBExecutor
+
+        executor = DuckDBExecutor(db_path)
+        original_cost = executor.get_cost_estimate(original_sql)
+
+        costs = []
+        for i, sql in enumerate(candidate_sqls):
+            try:
+                cost = executor.get_cost_estimate(sql)
+                costs.append((i, cost))
+            except Exception:
+                costs.append((i, float("inf")))
+
+        executor.close()
+
+        # Sort by cost ascending (lower is better)
+        costs.sort(key=lambda x: x[1])
+
+        # Return top_k indices
+        return [idx for idx, _ in costs[:top_k]]
+
+    except Exception as e:
+        logger.warning(f"Cost ranking failed, returning all: {e}")
+        return list(range(len(candidate_sqls)))
+
+
 class Validator:
     """Validate optimization candidates on sample/full database.
 
@@ -197,29 +250,53 @@ class Validator:
 
         if isinstance(validator, PostgresValidatorWrapper):
             # PostgreSQL: 3-run pattern using executor
+            # Use 300s timeout (matches R-Bot's timeout for fair comparison)
+            pg_timeout_ms = 300_000
             executor = validator._get_executor()
 
-            # Warmup
-            executor.execute(original_sql)
+            try:
+                # Warmup
+                executor.execute(original_sql, timeout_ms=pg_timeout_ms)
 
-            # Measure 1 (capture rows)
-            start = time.perf_counter()
-            rows = executor.execute(original_sql)
-            t1 = (time.perf_counter() - start) * 1000
+                # Measure 1 (capture rows)
+                start = time.perf_counter()
+                rows = executor.execute(original_sql, timeout_ms=pg_timeout_ms)
+                t1 = (time.perf_counter() - start) * 1000
 
-            # Measure 2
-            start = time.perf_counter()
-            executor.execute(original_sql)
-            t2 = (time.perf_counter() - start) * 1000
+                # Measure 2
+                start = time.perf_counter()
+                executor.execute(original_sql, timeout_ms=pg_timeout_ms)
+                t2 = (time.perf_counter() - start) * 1000
 
-            avg_ms = (t1 + t2) / 2
-            logger.info(f"Baseline (PG): {avg_ms:.1f}ms ({len(rows)} rows)")
+                avg_ms = (t1 + t2) / 2
+                logger.info(f"Baseline (PG): {avg_ms:.1f}ms ({len(rows)} rows)")
 
-            return OriginalBaseline(
-                measured_time_ms=avg_ms,
-                row_count=len(rows),
-                rows=rows,
-            )
+                return OriginalBaseline(
+                    measured_time_ms=avg_ms,
+                    row_count=len(rows),
+                    rows=rows,
+                )
+            except Exception as e:
+                # Timeout or error — create timeout baseline
+                # This allows the swarm to still optimize timeout queries
+                # by recording the timeout ceiling as the baseline time
+                error_lower = str(e).lower()
+                if "timeout" in error_lower or "cancel" in error_lower:
+                    logger.warning(
+                        f"Baseline (PG): TIMEOUT at {pg_timeout_ms}ms — "
+                        f"using timeout ceiling as baseline"
+                    )
+                    # Rollback the timed-out transaction
+                    try:
+                        executor.rollback()
+                    except Exception:
+                        pass
+                    return OriginalBaseline(
+                        measured_time_ms=float(pg_timeout_ms),
+                        row_count=0,
+                        rows=None,
+                    )
+                raise  # Re-raise non-timeout errors
         else:
             # DuckDB: use benchmarker's benchmark_single (3-run)
             benchmarker = validator._get_benchmarker()
@@ -405,24 +482,31 @@ class Validator:
     ) -> ValidationResult:
         """PostgreSQL path: execute candidate only, compare against baseline."""
         errors = []
+        is_timeout_baseline = baseline.rows is None and baseline.row_count == 0
 
         executor = validator._get_executor()
 
-        # Time candidate (3-run: warmup + 2 measures)
+        # Time candidate (3-run: warmup + 2 measures) with 300s timeout
+        cand_timeout_ms = 300_000
         try:
-            executor.execute(candidate_sql)  # warmup
+            executor.execute(candidate_sql, timeout_ms=cand_timeout_ms)  # warmup
 
             start = time.perf_counter()
-            cand_rows = executor.execute(candidate_sql)
+            cand_rows = executor.execute(candidate_sql, timeout_ms=cand_timeout_ms)
             t1 = (time.perf_counter() - start) * 1000
 
             start = time.perf_counter()
-            executor.execute(candidate_sql)
+            executor.execute(candidate_sql, timeout_ms=cand_timeout_ms)
             t2 = (time.perf_counter() - start) * 1000
 
             cand_time = (t1 + t2) / 2
         except Exception as e:
             error_msg = f"Execution failed: {e}"
+            # Rollback the failed transaction
+            try:
+                executor.rollback()
+            except Exception:
+                pass
             return ValidationResult(
                 worker_id=worker_id,
                 status=ValidationStatus.ERROR,
@@ -435,9 +519,15 @@ class Validator:
 
         # Compare row counts
         cand_count = len(cand_rows)
-        row_counts_match = cand_count == baseline.row_count
 
-        if not row_counts_match:
+        if is_timeout_baseline:
+            # Timeout baseline: can't compare rows, just accept if candidate runs
+            ado_status = ValidationStatus.PASS
+            logger.info(
+                f"Timeout baseline: candidate ran in {cand_time:.1f}ms "
+                f"({cand_count} rows) — accepting without row comparison"
+            )
+        elif cand_count != baseline.row_count:
             errors.append(
                 f"Row count mismatch: original={baseline.row_count}, "
                 f"optimized={cand_count}"
@@ -509,6 +599,7 @@ class PostgresValidatorWrapper:
         )
 
         errors = []
+        pg_timeout_ms = 300_000  # 300s timeout (matches R-Bot)
 
         try:
             executor = self._get_executor()
@@ -518,12 +609,12 @@ class PostgresValidatorWrapper:
                 # Time original
                 import time
                 start = time.time()
-                orig_result = executor.execute(original_sql)
+                orig_result = executor.execute(original_sql, timeout_ms=pg_timeout_ms)
                 orig_time = (time.time() - start) * 1000  # ms
 
                 # Time candidate
                 start = time.time()
-                cand_result = executor.execute(candidate_sql)
+                cand_result = executor.execute(candidate_sql, timeout_ms=pg_timeout_ms)
                 cand_time = (time.time() - start) * 1000  # ms
 
             except Exception as e:

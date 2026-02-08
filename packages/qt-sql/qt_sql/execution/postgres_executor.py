@@ -98,12 +98,13 @@ class PostgresExecutor:
         assert self._conn is not None
         return self._conn
 
-    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    def execute(self, sql: str, params: tuple[Any, ...] = (), timeout_ms: int = 0) -> list[dict[str, Any]]:
         """Execute SQL and return results as list of dicts.
 
         Args:
             sql: SQL query to execute.
             params: Query parameters (optional).
+            timeout_ms: Statement timeout in milliseconds (0 = no limit).
 
         Returns:
             List of dictionaries, one per row.
@@ -111,15 +112,24 @@ class PostgresExecutor:
         conn = self._ensure_connected()
 
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if params:
-                cur.execute(sql, params)
-            else:
-                cur.execute(sql)
+            try:
+                if timeout_ms > 0:
+                    cur.execute(f"SET statement_timeout = {timeout_ms}")
+                if params:
+                    cur.execute(sql, params)
+                else:
+                    cur.execute(sql)
 
-            if cur.description:
-                rows = cur.fetchall()
-                return [dict(row) for row in rows]
-            return []
+                if cur.description:
+                    rows = cur.fetchall()
+                    return [dict(row) for row in rows]
+                return []
+            finally:
+                if timeout_ms > 0:
+                    try:
+                        cur.execute("SET statement_timeout = 0")
+                    except Exception:
+                        pass
 
     def execute_script(self, sql_script: str) -> None:
         """Execute multi-statement SQL script.

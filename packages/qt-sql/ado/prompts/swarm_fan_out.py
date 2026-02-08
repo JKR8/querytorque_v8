@@ -16,7 +16,7 @@ def build_fan_out_prompt(
     sql: str,
     dag: Any,
     costs: Dict[str, Any],
-    faiss_examples: List[Dict[str, Any]],
+    matched_examples: List[Dict[str, Any]],
     all_available_examples: List[Dict[str, str]],
     regression_warnings: Optional[List[Dict[str, Any]]] = None,
     dialect: str = "duckdb",
@@ -28,7 +28,7 @@ def build_fan_out_prompt(
         sql: The SQL query to optimize
         dag: Parsed DAG from Phase 1
         costs: Per-node cost analysis
-        faiss_examples: Top matched examples (by tag similarity)
+        matched_examples: Top matched examples (by tag similarity)
         all_available_examples: Full catalog of gold examples (id + description)
         regression_warnings: Regression examples for similar queries (analyst reviews relevance)
         dialect: SQL dialect
@@ -68,9 +68,9 @@ def build_fan_out_prompt(
     lines.append("")
 
     # Matched examples (top N by tag similarity)
-    lines.append(f"## Top {len(faiss_examples)} Matched Examples (by structural similarity)")
+    lines.append(f"## Top {len(matched_examples)} Matched Examples (by structural similarity)")
     lines.append("")
-    for i, ex in enumerate(faiss_examples, 1):
+    for i, ex in enumerate(matched_examples, 1):
         ex_id = ex.get("id", "?")
         speedup = ex.get("verified_speedup", ex.get("speedup", "?"))
         desc = ex.get("description", "")[:120]

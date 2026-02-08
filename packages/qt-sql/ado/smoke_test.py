@@ -275,7 +275,7 @@ class SmokeTest:
         checks = []
         sdir = self._sdir(4, "faiss")
 
-        self.faiss_examples = self.pipeline._find_examples(self.sql, engine=self.ENGINE, k=12)
+        self.faiss_examples = self.pipeline._find_examples(self.sql, engine=self.ENGINE, k=20)
         self.all_available = self.pipeline._list_gold_examples(self.ENGINE)
 
         _jsave(sdir / "output.json", {
@@ -346,7 +346,7 @@ class SmokeTest:
             sql=self.sql,
             dag=self.dag,
             costs=self.costs,
-            faiss_examples=self.faiss_examples,
+            matched_examples=self.faiss_examples,
             all_available_examples=self.all_available,
             dialect=self.DIALECT,
         )

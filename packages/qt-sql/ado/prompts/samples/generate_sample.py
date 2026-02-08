@@ -178,7 +178,12 @@ def load_regression_warnings(sql: str, recommender):
 
 
 def build_mock_worker_briefing():
-    """Create a realistic mock analyst briefing for Q74 Worker 2."""
+    """Create a realistic mock analyst briefing for Q74 Worker 2.
+
+    Demonstrates late_attribute_binding: customer join deferred to final
+    resolve_names CTE. Each channel×year CTE aggregates on c_customer_sk
+    (the FK already in the fact table), avoiding 3 of 4 customer scans.
+    """
     from ado.prompts.swarm_parsers import BriefingShared, BriefingWorker
 
     shared = BriefingShared(
@@ -193,79 +198,108 @@ def build_mock_worker_briefing():
             "Output: 3 columns, ordered by first_name, customer_id, last_name. LIMIT 100."
         ),
         bottleneck_diagnosis=(
-            "Four separate full scans of store_sales (28M rows) and web_sales (7M rows), "
-            "each joined with date_dim (73K rows) and customer (100K rows). "
-            "The bottleneck is scan-bound: 4x fact table scans dominate at ~80% total cost. "
-            "The optimizer already handles the INNER JOIN ordering well — do not restructure joins. "
-            "DAG cost% is misleading: the 'customer' node shows 2% but it's probed 4 times."
+            "EXPLAIN shows DuckDB already unrolled year_total into 4 branches "
+            "(store×1999, store×2000, web×1999, web×2000). The dominant cost is "
+            "the store_sales × customer hash join at 598ms × 2 = 1.2s (34% of "
+            "3.5s total). Customer is scanned 4× (500K rows each) purely for "
+            "name resolution (c_customer_id, c_first_name, c_last_name) — zero "
+            "selectivity. Deferring customer join to after aggregation and "
+            "self-join resolution eliminates 3 of 4 customer scans and joins "
+            "~4K qualifying rows instead of 5.4M."
         ),
         active_constraints=(
-            "- union_cte_split_must_replace: If splitting a UNION into CTEs, the UNION "
-            "in the main query MUST be replaced with references to the new CTEs\n"
-            "- or_to_union_limit: Limit OR-to-UNION to 3 or fewer branches to avoid "
-            "multiplying fact table scans\n"
-            "- decorrelate_must_filter_first: When decorrelating, apply dimension filters "
-            "before the main join to reduce probe-side cardinality"
+            "- REMOVE_REPLACED_CTES: Your rewrite must NOT include a year_total "
+            "CTE. The 4 channel×year CTEs REPLACE it entirely. Keeping both "
+            "caused 0.68x regression on Q74.\n"
+            "- CTE_COLUMN_COMPLETENESS: Each CTE's SELECT must include ALL "
+            "columns referenced by downstream consumers. Check: c_customer_sk "
+            "flows through all CTEs to resolve_names.\n"
+            "- LITERAL_PRESERVATION: d_year IN (1999, 1999+1) must be preserved "
+            "exactly. Do not substitute computed values."
         ),
         regression_warnings=(
-            "1. union_cte_split on Q74 (0.73x regression):\n"
-            "   CAUSE: Splitting the 4-way structure into separate CTEs forced the optimizer "
-            "to materialize intermediate results that it previously streamed.\n"
-            "   RULE: For Q74, keep the 4-way join structure intact. Optimize the INPUTS "
-            "to the join (date filtering), not the join topology itself."
+            "1. regression_q74_pushdown (0.68x):\n"
+            "   CAUSE: Created year-specific CTEs but KEPT the original year_total "
+            "UNION CTE. DuckDB materialized both, causing redundant computation.\n"
+            "   RULE: Your rewrite must NOT include a year_total CTE. The 4 "
+            "channel×year CTEs REPLACE it entirely."
         ),
     )
 
     worker = BriefingWorker(
         worker_id=2,
-        strategy="date_cte_isolate",
+        strategy="date_cte_isolate + late_attribute_binding",
         target_dag=(
             "TARGET_DAG:\n"
-            "  filtered_dates -> store_1999 -+\n"
-            "  filtered_dates -> store_2000 -+\n"
-            "  filtered_dates -> web_1999   -+-> main_query\n"
-            "  filtered_dates -> web_2000   -+\n\n"
+            "  filtered_dates -> store_agg -+\n"
+            "  filtered_dates -> web_agg   -+-> compare_ratios -> resolve_names\n\n"
             "NODE_CONTRACTS:\n"
             "  filtered_dates:\n"
             "    FROM: date_dim\n"
-            "    WHERE: d_year IN (1999, 2000)\n"
+            "    WHERE: d_year IN (1999, 1999 + 1)\n"
             "    OUTPUT: d_date_sk, d_year\n"
-            "    CONSUMERS: store_1999, store_2000, web_1999, web_2000\n"
-            "  store_1999:\n"
-            "    FROM: store_sales JOIN customer JOIN filtered_dates\n"
-            "    JOIN: c_customer_sk = ss_customer_sk, ss_sold_date_sk = d_date_sk\n"
-            "    WHERE: d_year = 1999\n"
-            "    GROUP BY: c_customer_id, c_first_name, c_last_name\n"
+            "    EXPECTED_ROWS: ~730\n"
+            "    CONSUMERS: store_agg, web_agg\n"
+            "  store_agg:\n"
+            "    FROM: store_sales JOIN filtered_dates\n"
+            "    JOIN: ss_sold_date_sk = d_date_sk\n"
+            "    GROUP BY: ss_customer_sk, d_year\n"
             "    AGGREGATE: STDDEV_SAMP(ss_net_paid) AS year_total\n"
-            "    OUTPUT: customer_id, customer_first_name, customer_last_name, year_total\n"
-            "    CONSUMERS: main_query\n"
-            "  [store_2000, web_1999, web_2000: same pattern, different table/year]\n"
-            "  main_query:\n"
-            "    FROM: store_1999 JOIN store_2000 JOIN web_1999 JOIN web_2000\n"
-            "    JOIN: all on customer_id (INNER — preserves intersection semantics)\n"
-            "    WHERE: store_1999.year_total > 0 AND web_1999.year_total > 0\n"
-            "           AND (web_2000/web_1999) > (store_2000/store_1999)\n"
-            "    OUTPUT: customer_id, customer_first_name, customer_last_name\n"
+            "    OUTPUT: ss_customer_sk, d_year, year_total\n"
+            "    EXPECTED_ROWS: ~600K (300K per year)\n"
+            "    CONSUMERS: compare_ratios\n"
+            "  web_agg:\n"
+            "    FROM: web_sales JOIN filtered_dates\n"
+            "    JOIN: ws_sold_date_sk = d_date_sk\n"
+            "    GROUP BY: ws_bill_customer_sk, d_year\n"
+            "    AGGREGATE: STDDEV_SAMP(ws_net_paid) AS year_total\n"
+            "    OUTPUT: ws_bill_customer_sk, d_year, year_total\n"
+            "    EXPECTED_ROWS: ~200K (100K per year)\n"
+            "    CONSUMERS: compare_ratios\n"
+            "  compare_ratios:\n"
+            "    FROM: store_agg s1 JOIN store_agg s2 JOIN web_agg w1 JOIN web_agg w2\n"
+            "    JOIN: s1.ss_customer_sk = s2.ss_customer_sk = w1.ws_bill_customer_sk = w2.ws_bill_customer_sk\n"
+            "    WHERE: s1.d_year = 1999 AND s2.d_year = 1999 + 1\n"
+            "           AND w1.d_year = 1999 AND w2.d_year = 1999 + 1\n"
+            "           AND s1.year_total > 0 AND w1.year_total > 0\n"
+            "           AND (w2.year_total / w1.year_total) > (s2.year_total / s1.year_total)\n"
+            "    NOTE: The original uses CASE WHEN ... > 0 guards around divisions.\n"
+            "          These are redundant given the > 0 WHERE filters. Either form is correct.\n"
+            "    OUTPUT: ss_customer_sk\n"
+            "    EXPECTED_ROWS: ~4K\n"
+            "    CONSUMERS: resolve_names\n"
+            "  resolve_names:\n"
+            "    FROM: compare_ratios JOIN customer\n"
+            "    JOIN: ss_customer_sk = c_customer_sk\n"
+            "    OUTPUT: c_customer_id AS customer_id, c_first_name AS customer_first_name, "
+            "c_last_name AS customer_last_name\n"
+            "    EXPECTED_ROWS: ~4K -> 100 after ORDER BY + LIMIT\n"
             "    ORDER BY: customer_first_name, customer_id, customer_last_name\n"
             "    LIMIT: 100"
         ),
-        examples=["date_cte_isolate", "dimension_cte_isolate"],
+        examples=["date_cte_isolate", "shared_dimension_multi_channel"],
         example_reasoning=(
             "date_cte_isolate (4.00x on Q6): Q74 joins date_dim 4 times with d_year "
             "filters. Pre-filtering date_dim from 73K to ~730 rows eliminates 4 full "
             "hash-join probes. Same pattern: date join -> date CTE -> probe reduction.\n\n"
-            "dimension_cte_isolate (1.93x on Q26): Q74 also joins customer 4 times. "
-            "While customer can't be pre-filtered (no WHERE on customer), the date CTE "
-            "pattern reduces probe-side cardinality which shrinks the customer join input."
+            "shared_dimension_multi_channel (1.30x on Q56): Q74 has two channels "
+            "(store_sales, web_sales) that both join date_dim with the same filter. "
+            "Shared dimension extraction into a single filtered_dates CTE avoids "
+            "redundant dimension scans — exactly what our target DAG does."
         ),
         hazard_flags=(
             "- STDDEV_SAMP(ss_net_paid) FILTER (WHERE d_year = 1999) computed over "
             "a combined 1999+2000 group IS NOT EQUIVALENT to STDDEV_SAMP computed "
             "over only 1999 rows. The group membership changes the variance. "
-            "You MUST either: (a) GROUP BY d_year first then pivot, or (b) pre-filter "
-            "fact rows to the target year before aggregation.\n"
-            "- Do NOT merge the 4 channel-year CTEs into fewer CTEs. Each must filter "
-            "to its specific year BEFORE aggregation to preserve STDDEV_SAMP semantics."
+            "The target DAG avoids this: store_agg and web_agg GROUP BY d_year, so "
+            "each group is naturally partitioned by year. STDDEV_SAMP is computed "
+            "correctly per-partition. The compare_ratios CTE then filters to the "
+            "specific year via WHERE d_year = 1999.\n"
+            "- Do NOT include a year_total CTE. The original UNION ALL CTE is fully "
+            "replaced by store_agg + web_agg. Including both causes 0.68x regression.\n"
+            "- The customer join is deferred to resolve_names (joins ~4K rows, not 5.4M). "
+            "Do NOT join customer in store_agg or web_agg — use ss_customer_sk/ws_bill_customer_sk "
+            "as the join key throughout."
         ),
     )
 
@@ -324,7 +358,17 @@ def main():
 
     mock_shared, mock_worker = build_mock_worker_briefing()
 
-    worker_examples = matched_examples[:2] if len(matched_examples) >= 2 else matched_examples
+    # Load the specific examples the mock analyst assigned to this worker
+    worker_example_ids = set(mock_worker.examples)
+    worker_examples = [ex for ex in matched_examples if ex.get("id") in worker_example_ids]
+    # Fallback: if assigned examples not in tag-matched set, try full catalog
+    if len(worker_examples) < len(worker_example_ids):
+        examples_dir = ADO_DIR / "examples" / "duckdb"
+        for eid in worker_example_ids:
+            if not any(ex.get("id") == eid for ex in worker_examples):
+                p = examples_dir / f"{eid}.json"
+                if p.exists():
+                    worker_examples.append(json.loads(p.read_text()))
 
     output_columns = []
     try:

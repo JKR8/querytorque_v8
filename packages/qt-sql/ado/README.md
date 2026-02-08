@@ -127,6 +127,59 @@ result = p.run_optimization_session(
 # n_workers is always 4 in swarm mode (hardcoded)
 ```
 
+### Swarm V2 (analyst-as-interpreter)
+
+V2 replaces the V1 "router" analyst (which outputs ~50 tokens of strategy names) with an
+**interpreter** analyst that produces a structured briefing: semantic contract, bottleneck
+diagnosis, target DAG with node contracts, hazard flags, and per-worker example reasoning.
+Workers receive a precise specification instead of a generic prompt dump.
+
+**Enable with `use_v2_prompts=True`:**
+
+```python
+# Via Pipeline (direct)
+result = p.run_optimization_session(
+    query_id="query_67", sql=sql,
+    mode=OptimizationMode.SWARM,
+    max_iterations=3, target_speedup=2.0,
+    use_v2_prompts=True,  # <-- V2 analyst-as-interpreter
+)
+
+# Via ADORunner
+from ado.runner import ADORunner, ADOConfig
+
+runner = ADORunner(ADOConfig(benchmark_dir="packages/qt-sql/ado/benchmarks/duckdb_tpcds"))
+result = runner.run_analyst(
+    query_id="query_67", sql=sql,
+    mode=OptimizationMode.SWARM,
+    use_v2_prompts=True,  # <-- V2 analyst-as-interpreter
+)
+```
+
+**What the analyst produces (V2 briefing):**
+
+| Section | Recipient | Purpose |
+|---------|-----------|---------|
+| `SEMANTIC_CONTRACT` | All workers | Business intent, intersection/union semantics, aggregation traps |
+| `BOTTLENECK_DIAGNOSIS` | All workers | Where the cost is and why, scan/join/agg bound |
+| `ACTIVE_CONSTRAINTS` | All workers | 3-6 of ~19 constraints, analyst-filtered for this query |
+| `REGRESSION_WARNINGS` | All workers | Causal failure rules (not just "this happened") |
+| `TARGET_DAG + NODE_CONTRACTS` | Per worker | CTE structure blueprint with exhaustive column lists |
+| `EXAMPLES + REASONING` | Per worker | Why each example matches, what adaptation needed |
+| `HAZARD_FLAGS` | Per worker | Strategy-specific risks for this query |
+
+**Fallback**: If the analyst produces malformed output or no worker strategies are extracted,
+V2 silently falls back to V1 (logged as warning). No data loss.
+
+**V2 prompt files:**
+- `prompts/analyst_briefing.py` — Analyst prompt builder (~900 lines, 14-section input)
+- `prompts/worker_v2.py` — Worker prompt builder (attention-optimized 8-section output)
+- `prompts/swarm_parsers.py` — `parse_briefing_response()` + `ParsedBriefing` dataclasses
+
+**Review samples:** `prompts/samples/generate_sample.py` renders analyst + worker prompts
+for Q74 using real benchmark data. Output: `prompts/samples/analyst_v2_query_74.md` and
+`prompts/samples/worker_v2_query_74.md`.
+
 ### Single query (no session, no retry)
 
 ```python
@@ -179,13 +232,26 @@ PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.batch_validate \
 
 ```bash
 cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
+
+# V1 swarm (default)
 PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -c "
 from dotenv import load_dotenv; load_dotenv('.env')
 from ado.pipeline import Pipeline
 from ado.schemas import OptimizationMode
 p = Pipeline('packages/qt-sql/ado/benchmarks/duckdb_tpcds', provider='deepseek', model='deepseek-reasoner')
 sql = open('packages/qt-sql/ado/benchmarks/duckdb_tpcds/queries/query_67.sql').read()
-result = p.run_optimization_session('query_67', sql, mode=OptimizationMode.EXPERT, max_iterations=3)
+result = p.run_optimization_session('query_67', sql, mode=OptimizationMode.SWARM, max_iterations=3)
+print(f'{result.status} {result.best_speedup:.2f}x')
+"
+
+# V2 swarm (analyst-as-interpreter)
+PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -c "
+from dotenv import load_dotenv; load_dotenv('.env')
+from ado.pipeline import Pipeline
+from ado.schemas import OptimizationMode
+p = Pipeline('packages/qt-sql/ado/benchmarks/duckdb_tpcds', provider='deepseek', model='deepseek-reasoner')
+sql = open('packages/qt-sql/ado/benchmarks/duckdb_tpcds/queries/query_67.sql').read()
+result = p.run_optimization_session('query_67', sql, mode=OptimizationMode.SWARM, max_iterations=3, use_v2_prompts=True)
 print(f'{result.status} {result.best_speedup:.2f}x')
 "
 ```
@@ -240,7 +306,7 @@ ado/
 │   ├── duckdb/       # Gold examples with principle fields
 │   └── postgres/     # PostgreSQL-specific gold examples
 ├── models/           # FAISS similarity index + metadata
-├── prompts/          # Swarm prompt builders (fan-out, snipe, parsers)
+├── prompts/          # Swarm prompt builders (V1 fan-out, V2 analyst briefing, parsers)
 ├── sessions/         # Session drivers (standard, expert, swarm)
 ├── learnings/        # Learning journal data
 ├── benchmarks/       # Per-engine benchmark configs, queries, results

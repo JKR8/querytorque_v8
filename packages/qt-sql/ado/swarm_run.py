@@ -77,7 +77,7 @@ from ado.schemas import BenchmarkConfig
 
 # ─── Config ──────────────────────────────────────────────────────────
 MAX_LLM_CONCURRENT = 100
-EXIT_SPEEDUP = 2.0
+EXIT_SPEEDUP = 5.0
 
 # Module-level config — set in main() from --benchmark-dir arg
 BENCHMARK_DIR = Path("packages/qt-sql/ado/benchmarks/duckdb_tpcds")

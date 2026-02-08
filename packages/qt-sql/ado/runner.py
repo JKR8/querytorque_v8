@@ -135,6 +135,7 @@ class ADORunner:
         target_speedup: float = 2.0,
         n_workers: int = 3,
         mode: OptimizationMode = OptimizationMode.EXPERT,
+        use_v2_prompts: bool = False,
     ) -> ADOResult:
         """Run optimization on a single query in the specified mode.
 
@@ -150,6 +151,8 @@ class ADORunner:
             target_speedup: Stop early when this speedup is reached
             n_workers: Parallel workers (STANDARD only; EXPERT=1, SWARM=4 always)
             mode: Optimization mode (standard, expert, swarm)
+            use_v2_prompts: If True, use V2 analyst-as-interpreter prompts
+                           (swarm mode only). Falls back to V1 on malformed output.
 
         Returns:
             ADOResult with the best result
@@ -161,6 +164,7 @@ class ADORunner:
             target_speedup=target_speedup,
             n_workers=n_workers,
             mode=mode,
+            use_v2_prompts=use_v2_prompts,
         )
         return self._session_result_to_ado_result(session_result)
 
