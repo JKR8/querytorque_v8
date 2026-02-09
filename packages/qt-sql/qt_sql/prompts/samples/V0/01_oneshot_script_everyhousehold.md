@@ -1303,47 +1303,43 @@ AND b.row_num =1;
 
 ## Output Format
 
-Return a JSON object with one `rewrite_set` per statement you modify. Each rewrite_set targets a specific pipeline stage by its `target` name (the table/view being created). Only include stages you actually change.
+First output a **Modified Logic Tree** for the pipeline, showing which statements and components changed.
 
-Only include nodes (CTEs or main_query) that you **changed or added**. Unchanged nodes are auto-filled from the original.
+Then output a **Component Payload JSON** with one statement entry per pipeline stage you modify.
 
 ```json
 {
-  "rewrite_sets": [
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform>", "description": "<what>", "applied_to": ["<stmt.comp>"]}
+  ],
+  "statements": [
     {
-      "id": "rs_01",
-      "target": "<table_or_view_name>",
-      "transform": "<transform_name>",
-      "nodes": {
-        "<cte_name>": "<SQL for this CTE body>",
-        "main_query": "<final SELECT>"
+      "target_table": "<table_or_view_name>",
+      "change": "modified",
+      "components": {
+        "<cte_name>": {"type": "cte", "change": "modified", "sql": "<CTE body>", "interfaces": {"outputs": ["col1"], "consumes": []}},
+        "main_query": {"type": "main_query", "change": "modified", "sql": "<SELECT>", "interfaces": {"outputs": ["col1"], "consumes": ["<cte_name>"]}}
       },
-      "node_contracts": {
-        "<cte_name>": ["col1", "col2", "..."],
-        "main_query": ["col1", "col2", "..."]
-      },
-      "data_flow": "<cte_a> -> <cte_b> -> main_query",
-      "invariants_kept": ["same output columns", "same rows"],
-      "cross_statement_reasoning": "<why this change requires seeing the full pipeline>",
-      "expected_speedup": "2.0x",
-      "risk": "low"
-    },
-    {
-      "id": "rs_02",
-      "target": "<another_table_or_view>",
-      ...
+      "reconstruction_order": ["<cte_name>", "main_query"],
+      "assembly_template": "CREATE TABLE <target> AS WITH <cte> AS ({<cte>}) {main_query}"
     }
-  ]
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
 }
 ```
 
 ### Rules
-- `target`: the table/view this rewrite modifies (must match a CREATE in the script)
-- Every node in `nodes` MUST appear in `node_contracts` and vice versa
-- `main_query` = the final SELECT of that statement
-- `cross_statement_reasoning`: explain what upstream/downstream knowledge enabled this optimization
+- Tree first — generate the pipeline Logic Tree before writing any SQL
+- Each `statements[]` entry targets a specific pipeline stage (must match a CREATE in the script)
+- Only include statements you actually change
 - Output columns of each stage must remain identical (downstream consumers depend on them)
 - Rewrites must be semantically equivalent for ALL downstream consumers, not just the immediate next stage
+- No ellipsis — every `sql` value must be complete, executable SQL
 
 After the JSON, explain the overall pipeline optimization:
 

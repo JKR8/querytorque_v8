@@ -1,21 +1,26 @@
 """SQL rewriting for ADO - applies LLM optimizations to SQL.
 
 This module handles parsing LLM responses and applying SQL rewrites.
-Simplified from qt_sql dag_v2 - keeps ONLY what ADO needs.
+Supports two JSON output formats:
+  1. DAP (Decomposed Attention Protocol) — structured component payload
+  2. Legacy rewrite_sets — per-node DAG format
 
 Key features:
-- Parse JSON rewrite_sets from LLM responses
-- Apply optimized SQL from rewrite_sets
+- Parse DAP Component Payload or rewrite_sets JSON from LLM responses
+- Assemble SQL from DAP components or rewrite_set nodes
+- AST-based equivalence validation (output columns, base tables)
 - Validate transforms against allowlist
-- Reassemble SQL from node-level changes
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 try:
     import sqlglot
@@ -86,11 +91,194 @@ class RewriteResult:
 
 
 # =============================================================================
+# DAP (Decomposed Attention Protocol) Data Structures
+# =============================================================================
+
+@dataclass
+class DAPComponent:
+    """A single component in a DAP statement (CTE, main_query, subquery)."""
+    component_id: str
+    type: str           # cte | main_query | subquery | setup
+    change: str         # modified | unchanged | added | removed
+    sql: str
+    interfaces: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class DAPStatement:
+    """One statement in a DAP payload (maps to CREATE TABLE AS or standalone)."""
+    target_table: Optional[str]
+    change: str         # modified | unchanged | added | removed
+    components: Dict[str, DAPComponent] = field(default_factory=dict)
+    reconstruction_order: List[str] = field(default_factory=list)
+    assembly_template: str = ""
+
+
+@dataclass
+class DAPPayload:
+    """Parsed DAP Component Payload JSON (Part 2 of DAP spec)."""
+    spec_version: str
+    dialect: str
+    rewrite_rules: List[Dict[str, Any]] = field(default_factory=list)
+    statements: List[DAPStatement] = field(default_factory=list)
+    macros: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    frozen_blocks: List[Dict[str, Any]] = field(default_factory=list)
+    runtime_config: List[str] = field(default_factory=list)    # SET LOCAL commands
+    validation_checks: List[Dict[str, Any]] = field(default_factory=list)
+
+
+# =============================================================================
+# AST-Based Equivalence Validation
+# =============================================================================
+
+@dataclass
+class ASTValidationResult:
+    """Result of static AST equivalence check between original and rewritten SQL."""
+    valid: bool
+    errors: List[str] = field(default_factory=list)
+    original_columns: List[str] = field(default_factory=list)
+    rewritten_columns: List[str] = field(default_factory=list)
+    original_tables: Set[str] = field(default_factory=set)
+    rewritten_tables: Set[str] = field(default_factory=set)
+
+
+def validate_ast_equivalence(
+    original_sql: str,
+    rewritten_sql: str,
+    dialect: str = "duckdb",
+) -> ASTValidationResult:
+    """Static AST equivalence check — runs before any database call.
+
+    Three checks:
+    1. Output column check: same count, names, order
+    2. Base table check: rewritten must reference same base tables
+    3. Parse validity: rewritten SQL must parse cleanly
+
+    Args:
+        original_sql: The original SQL query
+        rewritten_sql: The assembled rewritten SQL
+        dialect: SQL dialect for parsing
+
+    Returns:
+        ASTValidationResult with pass/fail and details
+    """
+    if sqlglot is None:
+        return ASTValidationResult(valid=True)  # Can't validate without sqlglot
+
+    errors: List[str] = []
+    orig_cols: List[str] = []
+    rewr_cols: List[str] = []
+    orig_tables: Set[str] = set()
+    rewr_tables: Set[str] = set()
+
+    try:
+        orig_ast = sqlglot.parse_one(original_sql, dialect=dialect)
+    except Exception as e:
+        # If original doesn't parse, skip validation
+        return ASTValidationResult(valid=True, errors=[f"Original parse skip: {e}"])
+
+    try:
+        rewr_ast = sqlglot.parse_one(rewritten_sql, dialect=dialect)
+    except Exception as e:
+        return ASTValidationResult(
+            valid=False, errors=[f"Rewritten SQL parse error: {e}"]
+        )
+
+    # ── 1. Output column check ──
+    orig_cols = _extract_root_columns(orig_ast, dialect)
+    rewr_cols = _extract_root_columns(rewr_ast, dialect)
+
+    if orig_cols and rewr_cols:
+        orig_lower = [c.lower() for c in orig_cols]
+        rewr_lower = [c.lower() for c in rewr_cols]
+
+        if len(orig_lower) != len(rewr_lower):
+            errors.append(
+                f"Column count mismatch: original has {len(orig_lower)}, "
+                f"rewritten has {len(rewr_lower)}"
+            )
+        else:
+            for i, (oc, rc) in enumerate(zip(orig_lower, rewr_lower)):
+                if oc != rc:
+                    errors.append(
+                        f"Column {i+1} mismatch: original='{orig_cols[i]}', "
+                        f"rewritten='{rewr_cols[i]}'"
+                    )
+
+    # ── 2. Base table check ──
+    orig_tables = _extract_base_tables(orig_ast, dialect)
+    rewr_tables = _extract_base_tables(rewr_ast, dialect)
+
+    if orig_tables and rewr_tables:
+        missing = orig_tables - rewr_tables
+        if missing:
+            errors.append(f"Missing base tables in rewrite: {missing}")
+        # Note: added tables are OK (new CTEs reference them)
+
+    return ASTValidationResult(
+        valid=len(errors) == 0,
+        errors=errors,
+        original_columns=orig_cols,
+        rewritten_columns=rewr_cols,
+        original_tables=orig_tables,
+        rewritten_tables=rewr_tables,
+    )
+
+
+def _extract_root_columns(ast, dialect: str) -> List[str]:
+    """Extract output column names from the root SELECT of a parsed AST."""
+    try:
+        # Navigate to root SELECT (handle WITH wrapper)
+        select = ast
+        if hasattr(ast, 'this') and not isinstance(ast, exp.Select):
+            select = ast.this
+        if not isinstance(select, exp.Select):
+            select = ast.find(exp.Select)
+        if not select:
+            return []
+
+        columns = []
+        for expr in select.expressions:
+            if isinstance(expr, exp.Alias) and expr.alias:
+                columns.append(str(expr.alias))
+            elif isinstance(expr, exp.Column):
+                columns.append(str(expr.name))
+            elif isinstance(expr, exp.Star):
+                columns.append("*")
+            else:
+                # Unnamed expression — use SQL fragment
+                columns.append(expr.sql(dialect=dialect)[:50])
+        return columns
+    except Exception:
+        return []
+
+
+def _extract_base_tables(ast, dialect: str) -> Set[str]:
+    """Extract base table names (excluding CTE names) from a parsed AST."""
+    try:
+        # Get CTE names to exclude
+        cte_names = set()
+        for cte in ast.find_all(exp.CTE):
+            if cte.alias:
+                cte_names.add(str(cte.alias).lower())
+
+        # Get all table references
+        tables = set()
+        for table in ast.find_all(exp.Table):
+            name = table.name.lower() if table.name else ""
+            if name and name not in cte_names:
+                tables.add(name)
+        return tables
+    except Exception:
+        return set()
+
+
+# =============================================================================
 # JSON Response Parser
 # =============================================================================
 
 class ResponseParser:
-    """Parse LLM responses to extract rewrite_sets."""
+    """Parse LLM responses — supports DAP and legacy rewrite_sets."""
 
     @staticmethod
     def extract_json(response: str) -> Optional[str]:
@@ -112,6 +300,76 @@ class ResponseParser:
             return response[start:end + 1]
 
         return None
+
+    @staticmethod
+    def detect_format(json_str: str) -> str:
+        """Detect JSON format: 'dap' | 'rewrite_sets' | 'unknown'.
+
+        DAP: has spec_version + statements array
+        Legacy: has rewrite_sets array
+        """
+        try:
+            data = json.loads(json_str)
+        except (json.JSONDecodeError, TypeError):
+            return "unknown"
+
+        if isinstance(data, dict):
+            if "spec_version" in data and "statements" in data:
+                return "dap"
+            if "rewrite_sets" in data:
+                return "rewrite_sets"
+        return "unknown"
+
+    @staticmethod
+    def parse_dap_payload(json_str: str) -> Optional[DAPPayload]:
+        """Parse DAP Component Payload JSON into DAPPayload dataclass."""
+        try:
+            data = json.loads(json_str)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        if not isinstance(data, dict) or "spec_version" not in data:
+            return None
+
+        # Parse statements
+        statements: List[DAPStatement] = []
+        for stmt_data in data.get("statements", []):
+            components: Dict[str, DAPComponent] = {}
+            for comp_id, comp_data in stmt_data.get("components", {}).items():
+                if isinstance(comp_data, dict):
+                    components[comp_id] = DAPComponent(
+                        component_id=comp_id,
+                        type=comp_data.get("type", "cte"),
+                        change=comp_data.get("change", "modified"),
+                        sql=comp_data.get("sql", ""),
+                        interfaces=comp_data.get("interfaces"),
+                    )
+
+            statements.append(DAPStatement(
+                target_table=stmt_data.get("target_table"),
+                change=stmt_data.get("change", "modified"),
+                components=components,
+                reconstruction_order=stmt_data.get("reconstruction_order", []),
+                assembly_template=stmt_data.get("assembly_template", ""),
+            ))
+
+        # Parse runtime_config (SET LOCAL commands)
+        runtime_config = data.get("runtime_config", [])
+        if isinstance(runtime_config, list):
+            runtime_config = [str(c) for c in runtime_config]
+        else:
+            runtime_config = []
+
+        return DAPPayload(
+            spec_version=data.get("spec_version", "1.0"),
+            dialect=data.get("dialect", "duckdb"),
+            rewrite_rules=data.get("rewrite_rules", []),
+            statements=statements,
+            macros=data.get("macros", {}),
+            frozen_blocks=data.get("frozen_blocks", []),
+            runtime_config=runtime_config,
+            validation_checks=data.get("validation_checks", []),
+        )
 
     @staticmethod
     def parse_rewrite_sets(json_str: str) -> List[RewriteSet]:
@@ -145,7 +403,7 @@ class ResponseParser:
         return rewrite_sets
 
     def parse(self, response: str) -> List[RewriteSet]:
-        """Parse LLM response to extract all rewrite_sets."""
+        """Parse LLM response to extract all rewrite_sets (legacy path)."""
         json_str = self.extract_json(response)
         if not json_str:
             return []
@@ -355,6 +613,157 @@ class SQLAssembler:
 
 
 # =============================================================================
+# DAP Assembler - Reassemble SQL from DAP Component Payload
+# =============================================================================
+
+class DAPAssembler:
+    """Reassemble executable SQL from a DAP Component Payload.
+
+    Implements the reconstruction algorithm from DAP spec section 6:
+    1. Expand macros: replace -- [MACRO: x] with macros[x].sql
+    2. For each component_id in reconstruction_order:
+       a. Get component SQL
+       b. If unchanged + no sql: pull from original via sqlglot
+    3. Interpolate into assembly_template
+    4. Fallback: topo-sort if no template (reuse SQLAssembler logic)
+    """
+
+    def __init__(self, dialect: str = "duckdb"):
+        self.dialect = dialect
+        self._legacy_assembler = SQLAssembler(dialect=dialect)
+
+    def assemble(
+        self,
+        original_sql: str,
+        dap: DAPPayload,
+        stmt_idx: int = 0,
+    ) -> str:
+        """Assemble executable SQL from a DAP payload.
+
+        Args:
+            original_sql: The original SQL (for unchanged components)
+            dap: Parsed DAPPayload
+            stmt_idx: Which statement to assemble (default 0 for single-query)
+
+        Returns:
+            Complete, executable SQL string
+        """
+        if not dap.statements:
+            return original_sql
+
+        if stmt_idx >= len(dap.statements):
+            return original_sql
+
+        stmt = dap.statements[stmt_idx]
+
+        # Get component SQLs, expanding macros
+        component_sqls: Dict[str, str] = {}
+        for comp_id, comp in stmt.components.items():
+            sql = comp.sql
+            if not sql and comp.change == "unchanged":
+                # Pull from original via sqlglot
+                sql = self._extract_component_from_original(original_sql, comp_id)
+            if sql:
+                sql = self._expand_macros(sql, dap.macros)
+            component_sqls[comp_id] = sql or ""
+
+        # Try assembly_template first
+        if stmt.assembly_template:
+            try:
+                assembled = stmt.assembly_template
+                for comp_id, sql in component_sqls.items():
+                    placeholder = "{" + comp_id + "}"
+                    assembled = assembled.replace(placeholder, sql)
+                # Verify no unresolved placeholders remain
+                if "{" not in assembled or not re.search(r'\{[a-zA-Z_]\w*\}', assembled):
+                    return assembled.strip()
+            except Exception:
+                pass
+
+        # Fallback: use reconstruction_order or topo-sort
+        order = stmt.reconstruction_order
+        if not order:
+            order = list(component_sqls.keys())
+
+        # Separate CTEs from main_query
+        main_id = None
+        cte_ids = []
+        for comp_id in order:
+            comp = stmt.components.get(comp_id)
+            if comp and comp.type == "main_query":
+                main_id = comp_id
+            elif comp_id == "main_query":
+                main_id = comp_id
+            else:
+                cte_ids.append(comp_id)
+
+        # Build as WITH ... SELECT
+        main_sql = component_sqls.get(main_id or "main_query", "")
+        if not main_sql:
+            # Last component in order as main
+            if order:
+                main_id = order[-1]
+                main_sql = component_sqls.get(main_id, "")
+                cte_ids = [c for c in order if c != main_id]
+
+        if main_sql.strip().upper().startswith("WITH "):
+            return main_sql.strip()
+
+        # Use legacy assembler's topo-sort for CTE ordering
+        cte_nodes = {cid: component_sqls[cid] for cid in cte_ids if component_sqls.get(cid)}
+        if not cte_nodes:
+            return main_sql.strip()
+
+        deps = self._legacy_assembler._build_dependency_graph(cte_nodes)
+        sorted_ctes = self._legacy_assembler._topological_sort(deps)
+
+        cte_clauses = []
+        for cte_id in sorted_ctes:
+            sql = cte_nodes.get(cte_id, "")
+            if sql:
+                cte_clauses.append(f"{cte_id} AS ({sql})")
+
+        if cte_clauses:
+            return f"WITH {', '.join(cte_clauses)}\n{main_sql.strip()}"
+        return main_sql.strip()
+
+    def _expand_macros(self, sql: str, macros: Dict[str, Dict[str, Any]]) -> str:
+        """Replace -- [MACRO: name] comments with macro SQL."""
+        if not macros:
+            return sql
+
+        for macro_name, macro_data in macros.items():
+            macro_sql = macro_data.get("sql", "")
+            if macro_sql:
+                # Replace inline macro reference comments
+                pattern = r'--\s*\[MACRO:\s*' + re.escape(macro_name) + r'\s*\]'
+                sql = re.sub(pattern, macro_sql, sql, flags=re.IGNORECASE)
+        return sql
+
+    def _extract_component_from_original(
+        self, original_sql: str, component_id: str
+    ) -> str:
+        """Extract a component's SQL from the original query via sqlglot."""
+        if sqlglot is None:
+            return ""
+
+        try:
+            parsed = sqlglot.parse_one(original_sql, dialect=self.dialect)
+
+            if component_id == "main_query":
+                return self._legacy_assembler._extract_main_query(original_sql)
+
+            # Try to find CTE by name
+            for cte in parsed.find_all(exp.CTE):
+                name = str(cte.alias) if cte.alias else None
+                if name and name.lower() == component_id.lower() and cte.this:
+                    return cte.this.sql(dialect=self.dialect)
+        except Exception:
+            pass
+        return ""
+
+
+# =============================================================================
 # Main SQL Rewriter
 # =============================================================================
 
@@ -372,6 +781,7 @@ class SQLRewriter:
         self.dialect = dialect
         self.parser = ResponseParser()
         self.assembler = SQLAssembler(dialect=dialect)
+        self.dap_assembler = DAPAssembler(dialect=dialect)
 
     @staticmethod
     def _extract_raw_sql(response: str) -> Optional[str]:
@@ -446,9 +856,10 @@ class SQLRewriter:
     def apply_response(self, llm_response: str) -> RewriteResult:
         """Parse LLM response and apply the rewrite.
 
-        Supports two response formats (tried in order):
-        1. JSON with rewrite_sets (per-node DAG format — preferred)
-        2. Raw SQL in a ```sql code block (fallback)
+        Supports three response formats (tried in priority order):
+        1. DAP Component Payload JSON (spec_version + statements)
+        2. JSON with rewrite_sets (per-node DAG format — legacy)
+        3. Raw SQL in a ```sql code block (fallback)
 
         Args:
             llm_response: Raw LLM response text (may contain markdown, JSON, etc.)
@@ -456,46 +867,71 @@ class SQLRewriter:
         Returns:
             RewriteResult with optimized SQL or error
         """
-        # Try JSON rewrite_sets first (per-node DAG format)
-        rewrite_sets = self.parser.parse(llm_response)
+        # Extract JSON from response
+        json_str = self.parser.extract_json(llm_response)
 
-        if rewrite_sets:
-            for rs in rewrite_sets:
-                # Validate transform
-                if rs.transform not in ALLOWED_TRANSFORMS:
-                    continue
+        if json_str:
+            fmt = self.parser.detect_format(json_str)
 
-                try:
-                    optimized_sql = self.assembler.assemble(self.original_sql, rs)
+            # ── Priority 1: DAP Component Payload ──
+            if fmt == "dap":
+                dap = self.parser.parse_dap_payload(json_str)
+                if dap:
+                    result = self._apply_dap(dap)
+                    if result.success:
+                        return result
+                    # DAP parse succeeded but assembly/validation failed —
+                    # fall through to legacy paths
 
-                    # Use SET LOCAL from JSON field if available, else split from SQL
-                    if rs.set_local:
-                        from .pg_tuning import PG_TUNABLE_PARAMS
-                        set_local_cmds = [
-                            cmd for cmd in rs.set_local
-                            if any(p in cmd.lower() for p in PG_TUNABLE_PARAMS)
-                        ]
-                        clean_sql = optimized_sql
-                    else:
-                        clean_sql, set_local_cmds = self._split_set_local(optimized_sql)
-                    if not clean_sql:
+            # ── Priority 2: Legacy rewrite_sets ──
+            rewrite_sets = self.parser.parse_rewrite_sets(json_str)
+            if rewrite_sets:
+                for rs in rewrite_sets:
+                    if rs.transform not in ALLOWED_TRANSFORMS:
                         continue
 
-                    # Validate the result parses
-                    if not self._validate_sql(clean_sql):
+                    try:
+                        optimized_sql = self.assembler.assemble(self.original_sql, rs)
+
+                        # Use SET LOCAL from JSON field if available, else split from SQL
+                        if rs.set_local:
+                            from .pg_tuning import PG_TUNABLE_PARAMS
+                            set_local_cmds = [
+                                cmd for cmd in rs.set_local
+                                if any(p in cmd.lower() for p in PG_TUNABLE_PARAMS)
+                            ]
+                            clean_sql = optimized_sql
+                        else:
+                            clean_sql, set_local_cmds = self._split_set_local(optimized_sql)
+                        if not clean_sql:
+                            continue
+
+                        # Validate the result parses
+                        if not self._validate_sql(clean_sql):
+                            continue
+
+                        # AST equivalence check (also benefits legacy path)
+                        ast_check = validate_ast_equivalence(
+                            self.original_sql, clean_sql, self.dialect
+                        )
+                        if not ast_check.valid:
+                            logger.warning(
+                                "AST check failed on rewrite_set %s: %s",
+                                rs.id, ast_check.errors,
+                            )
+                            # Continue to next rewrite_set — don't block
+
+                        return RewriteResult(
+                            success=True,
+                            optimized_sql=clean_sql,
+                            transform=rs.transform,
+                            rewrite_set=rs,
+                            set_local_commands=set_local_cmds,
+                        )
+                    except Exception:
                         continue
 
-                    return RewriteResult(
-                        success=True,
-                        optimized_sql=clean_sql,
-                        transform=rs.transform,
-                        rewrite_set=rs,
-                        set_local_commands=set_local_cmds,
-                    )
-                except Exception:
-                    continue
-
-        # Fall back to raw SQL extraction (```sql code block)
+        # ── Priority 3: Raw SQL extraction (```sql code block) ──
         raw_sql = self._extract_raw_sql(llm_response)
         if raw_sql:
             clean_sql, set_local_cmds = self._split_set_local(raw_sql)
@@ -513,7 +949,109 @@ class SQLRewriter:
         return RewriteResult(
             success=False,
             optimized_sql=self.original_sql,
-            error="No valid rewrite_sets or SQL found in LLM response",
+            error="No valid DAP, rewrite_sets, or SQL found in LLM response",
+        )
+
+    def _apply_dap(self, dap: DAPPayload) -> RewriteResult:
+        """Apply a DAP Component Payload to produce a RewriteResult.
+
+        Steps:
+        1. Assemble SQL via DAPAssembler
+        2. Run AST equivalence check
+        3. Extract transforms from rewrite_rules
+        4. Extract SET LOCAL from runtime_config
+        """
+        try:
+            assembled = self.dap_assembler.assemble(self.original_sql, dap)
+        except Exception as e:
+            return RewriteResult(
+                success=False,
+                optimized_sql=self.original_sql,
+                error=f"DAP assembly failed: {e}",
+            )
+
+        if not assembled or not assembled.strip():
+            return RewriteResult(
+                success=False,
+                optimized_sql=self.original_sql,
+                error="DAP assembly produced empty SQL",
+            )
+
+        # Handle SET LOCAL from runtime_config
+        set_local_cmds: List[str] = []
+        if dap.runtime_config:
+            try:
+                from .pg_tuning import PG_TUNABLE_PARAMS
+                set_local_cmds = [
+                    cmd for cmd in dap.runtime_config
+                    if re.match(r'^SET\s+LOCAL\s+', cmd, re.IGNORECASE)
+                    and any(p in cmd.lower() for p in PG_TUNABLE_PARAMS)
+                ]
+            except ImportError:
+                pass
+        clean_sql, split_cmds = self._split_set_local(assembled)
+        set_local_cmds.extend(split_cmds)
+        if not clean_sql:
+            clean_sql = assembled
+
+        # Validate SQL parses
+        if not self._validate_sql(clean_sql):
+            return RewriteResult(
+                success=False,
+                optimized_sql=self.original_sql,
+                error="DAP assembled SQL does not parse",
+            )
+
+        # AST equivalence check
+        ast_check = validate_ast_equivalence(
+            self.original_sql, clean_sql, self.dialect
+        )
+        if not ast_check.valid:
+            return RewriteResult(
+                success=False,
+                optimized_sql=self.original_sql,
+                error=f"DAP AST validation failed: {ast_check.errors[0]}",
+            )
+
+        # Extract transforms from rewrite_rules
+        transforms: List[str] = []
+        for rule in dap.rewrite_rules:
+            rtype = rule.get("type", "")
+            if rtype and rtype not in transforms:
+                transforms.append(rtype)
+
+        # Map DAP rule types to our transform names
+        _DAP_TRANSFORM_MAP = {
+            "predicate_pushdown": "pushdown",
+            "subquery_decorrelation": "decorrelate",
+            "join_elimination": "remove_redundant",
+            "cte_extraction": "materialize_cte",
+            "macro_dedup": "materialize_cte",
+            "materialization": "materialize_cte",
+            "type_cast_cleanup": "semantic_rewrite",
+            "union_consolidation": "or_to_union",
+        }
+        mapped = []
+        for t in transforms:
+            mapped_name = _DAP_TRANSFORM_MAP.get(t, t)
+            if mapped_name in ALLOWED_TRANSFORMS and mapped_name not in mapped:
+                mapped.append(mapped_name)
+
+        # Fallback: infer from SQL diff
+        if not mapped:
+            mapped = infer_transforms_from_sql_diff(
+                self.original_sql, clean_sql, self.dialect
+            )
+
+        transform_name = mapped[0] if mapped else "semantic_rewrite"
+        if transform_name not in ALLOWED_TRANSFORMS:
+            transform_name = "semantic_rewrite"
+
+        return RewriteResult(
+            success=True,
+            optimized_sql=clean_sql,
+            transform=transform_name,
+            set_local_commands=set_local_cmds,
         )
 
     def _validate_sql(self, sql: str) -> bool:

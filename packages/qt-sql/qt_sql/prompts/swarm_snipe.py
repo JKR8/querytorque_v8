@@ -219,14 +219,24 @@ def build_snipe_analyst_prompt(
         lines.append("```")
         lines.append("")
 
-    # ── 6. DAG structure with costs ─────────────────────────────────────
-    lines.append("## Query Structure (DAG)")
-    lines.append("")
+    # ── 6. Query Structure (Logic Tree + DAG details) ───────────────────
+    from ..logic_tree import build_logic_tree
     node_intents = _build_node_intent_map(semantic_intents)
     if semantic_intents:
         qi = semantic_intents.get("query_intent", "")
         if qi and "main_query" not in node_intents:
             node_intents["main_query"] = qi
+
+    lines.append("## Query Structure (Logic Tree)")
+    lines.append("")
+    tree = build_logic_tree(original_sql, dag, costs, dialect, node_intents)
+    lines.append("```")
+    lines.append(tree)
+    lines.append("```")
+    lines.append("")
+
+    lines.append("## Node Details")
+    lines.append("")
     _append_dag_analysis(lines, dag, costs, dialect=dialect, node_intents=node_intents)
     lines.append("")
 

@@ -101,6 +101,123 @@ W2's approach is nearly optimal — 6.24x from a single-pass scan. The remaining
 single_pass_aggregation: W2 already applied this. The sniper should focus on whether inlining the final aggregation into the CTE body (no separate final_counts step) improves performance.
 dimension_cte_isolate: Already applied by all workers. Verify that join order matches dimension cardinality (store first, then hd, then time).
 
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. single_pass_aggregation (4.47x)
+
+**Principle:** Single-Pass Aggregation: consolidate multiple scalar subqueries on the same table into one CTE using CASE expressions inside aggregate functions. Reduces N separate table scans to 1 pass.
+
+**BEFORE (slow):**
+```sql
+select case when (select count(*) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) > 2972190
+            then (select avg(ss_ext_sales_price) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 1 and 20) end bucket1 ,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 21 and 40) > 4505785
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 21 and 40) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 21 and 40) end bucket2,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 41 and 60) > 1575726
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 41 and 60)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 41 and 60) end bucket3,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 61 and 80) > 3188917
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 61 and 80)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 61 and 80) end bucket4,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 81 and 100) > 3525216
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 81 and 100)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 81 and 100) end bucket5
+from reason
+where r_reason_sk = 1;
+```
+
+**AFTER (fast):**
+[store_sales_aggregates]:
+```sql
+SELECT SUM(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 ELSE 0 END) AS cnt1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_ext_discount_amt END) AS avg_disc1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_net_paid END) AS avg_paid1, SUM(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN 1 ELSE 0 END) AS cnt2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_ext_discount_amt END) AS avg_disc2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_net_paid END) AS avg_paid2, SUM(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN 1 ELSE 0 END) AS cnt3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_ext_discount_amt END) AS avg_disc3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_net_paid END) AS avg_paid3, SUM(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN 1 ELSE 0 END) AS cnt4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_ext_discount_amt END) AS avg_disc4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_net_paid END) AS avg_paid4, SUM(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN 1 ELSE 0 END) AS cnt5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_ext_discount_amt END) AS avg_disc5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_net_paid END) AS avg_paid5 FROM store_sales
+```
+[main_query]:
+```sql
+SELECT CASE WHEN cnt1 > 74129 THEN avg_disc1 ELSE avg_paid1 END AS bucket1, CASE WHEN cnt2 > 122840 THEN avg_disc2 ELSE avg_paid2 END AS bucket2, CASE WHEN cnt3 > 56580 THEN avg_disc3 ELSE avg_paid3 END AS bucket3, CASE WHEN cnt4 > 10097 THEN avg_disc4 ELSE avg_paid4 END AS bucket4, CASE WHEN cnt5 > 165306 THEN avg_disc5 ELSE avg_paid5 END AS bucket5 FROM store_sales_aggregates
+```
+
+### 2. dimension_cte_isolate (1.93x)
+
+**Principle:** Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
+
+**BEFORE (slow):**
+```sql
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year = 2000
+```
+[filtered_customer_demographics]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'
+```
+[filtered_promotions]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+```
+[joined_facts]:
+```sql
+SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales AS cs JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk
+```
+[main_query]:
+```sql
+SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM joined_facts AS jf JOIN item AS i ON jf.cs_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
+```
+
 ## Hazard Flags
 
 - All workers passed — no semantic errors to avoid
@@ -159,6 +276,21 @@ These 4 constraints are absolute. Even with full creative freedom, you may NEVER
 - AVG and STDDEV are NOT duplicate-safe.
 - FILTER over a combined group != separate per-group computation.
 - Verify aggregation equivalence for ANY proposed restructuring.
+
+## Regression Warnings
+
+### regression_q67_date_cte_isolate: date_cte_isolate on q67 (0.85x)
+**Anti-pattern:** Do not materialize dimension filters into CTEs before complex aggregations (ROLLUP, CUBE, GROUPING SETS) with window functions. The optimizer needs to push aggregation through joins; CTEs create materialization barriers.
+**Mechanism:** Materialized date, store, and item dimension filters into CTEs before a ROLLUP aggregation with window functions (RANK() OVER). CTE materialization prevents the optimizer from pushing the ROLLUP and window computation down through the join tree, forcing a full materialized intermediate before the expensive aggregation.
+
+### regression_q90_materialize_cte: materialize_cte on q90 (0.59x)
+**Anti-pattern:** Never convert OR conditions on the SAME column (e.g., range conditions on t_hour) into UNION ALL. The optimizer already handles same-column ORs as a single scan. UNION ALL only helps when branches access fundamentally different tables or columns.
+**Mechanism:** Split a simple OR condition (t_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17) into UNION ALL of two separate web_sales scans. This doubles the fact table scan. DuckDB handles same-column OR ranges efficiently in a single scan — the UNION ALL adds materialization overhead with zero selectivity benefit.
+
+### regression_q1_decorrelate: decorrelate on q1 (0.71x)
+**Anti-pattern:** Do not pre-aggregate GROUP BY results into CTEs when the query uses them in a correlated comparison (e.g., customer return > 1.2x store average). The optimizer can compute aggregates incrementally with filter pushdown; materialization loses this.
+**Mechanism:** Pre-computed customer_total_return (GROUP BY customer, store) and store_avg_return (GROUP BY store) as separate CTEs. The original correlated subquery computed the per-store average incrementally during the customer scan, filtering as it goes. Materializing forces full aggregation of ALL stores before any filtering.
+
 
 ## Original SQL
 
@@ -264,51 +396,75 @@ from
 - Preserve all literals exactly (numbers, strings, date values).
 - Apply `Hazard Flags` as hard guards against known failure modes.
 
-## Output Format
-
-Return a JSON object with your rewrite as `rewrite_sets`. Each node is a CTE
-or the final SELECT. You MUST declare the output columns for every node in
-`node_contracts` — this forces you to reason about what flows between CTEs.
-
-Only include nodes you **changed or added**. Unchanged nodes are auto-filled
-from the original query.
-
 ### Column Completeness Contract
 
-Your `main_query` node MUST produce **exactly** these output columns (same names, same order):
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
 
   1. `*`
 
 Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
 
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
 ```json
 {
-  "rewrite_sets": [{
-    "id": "rs_01",
-    "transform": "<transform_name>",
-    "nodes": {
-      "<cte_name>": "<SQL for this CTE body>",
-      "main_query": "<final SELECT>"
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
     },
-    "node_contracts": {
-      "<cte_name>": ["col1", "col2", "..."],
-      "main_query": ["col1", "col2", "..."]
-    },
-    "set_local": ["SET LOCAL work_mem = '512MB'", "SET LOCAL jit = 'off'"],
-    "data_flow": "<cte_a> -> <cte_b> -> main_query",
-    "invariants_kept": ["same output columns", "same rows"],
-    "expected_speedup": "2.0x",
-    "risk": "low"
-  }]
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
+  "validation_checks": []
 }
 ```
 
 ### Rules
-- Every node in `nodes` MUST appear in `node_contracts` and vice versa
-- `node_contracts`: list the output column names each node produces
-- `data_flow`: show the CTE dependency chain (forces you to think about order)
-- `main_query` = the final SELECT — its contract must match the Column Completeness Contract above
-- New CTE structures are encouraged — design the best topology for the query
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `runtime_config`: SET LOCAL commands (PG only). Omit or use empty array if not needed
+- `reconstruction_order`: topological order of components for assembly
 
 After the JSON, explain the mechanism:
 
@@ -317,4 +473,4 @@ Changes: <1-2 sentences: what structural change + the expected mechanism>
 Expected speedup: <estimate>
 ```
 
-Now output your rewrite as JSON:
+Now output your Logic Tree and Component Payload JSON:

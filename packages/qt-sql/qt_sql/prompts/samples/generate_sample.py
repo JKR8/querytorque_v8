@@ -26,6 +26,7 @@ SAMPLES_DIR = Path(__file__).resolve().parent
 QT_SQL_DIR = SAMPLES_DIR.parent.parent           # qt_sql/
 BENCHMARK_DIR = QT_SQL_DIR / "benchmarks" / "duckdb_tpcds"
 CONSTRAINTS_DIR = QT_SQL_DIR / "constraints"
+EXAMPLES_DIR = QT_SQL_DIR / "examples" / "duckdb"
 BATCH_DIR = BENCHMARK_DIR / "swarm_batch_20260208_102033"
 PROJECT_ROOT = QT_SQL_DIR.parent.parent.parent    # QueryTorque_V8/
 
@@ -132,9 +133,7 @@ def load_matched_examples(sql: str, recommender) -> List[Dict]:
     matched = []
     if recommender._initialized:
         matches = recommender.find_similar_examples(sql, k=16, dialect="duckdb")
-        examples_dir = QT_SQL_DIR / "optimization" / "examples" / "duckdb"
-        if not examples_dir.exists():
-            examples_dir = QT_SQL_DIR.parent.parent.parent / "ado" / "examples" / "duckdb"
+        examples_dir = EXAMPLES_DIR
         for ex_id, score, meta in matches:
             ex_path = examples_dir / f"{ex_id}.json"
             if ex_path.exists():
@@ -147,9 +146,7 @@ def load_matched_examples(sql: str, recommender) -> List[Dict]:
 
 def load_full_catalog() -> List[Dict]:
     catalog = []
-    examples_dir = QT_SQL_DIR / "optimization" / "examples" / "duckdb"
-    if not examples_dir.exists():
-        examples_dir = QT_SQL_DIR.parent.parent.parent / "ado" / "examples" / "duckdb"
+    examples_dir = EXAMPLES_DIR
     if examples_dir.exists():
         for p in sorted(examples_dir.glob("*.json")):
             try:
@@ -159,8 +156,8 @@ def load_full_catalog() -> List[Dict]:
                     "speedup": d.get("verified_speedup", "?"),
                     "description": d.get("description", "")[:80],
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  WARNING: Failed to load example {p.name}: {e}")
     print(f"Full catalog: {len(catalog)} examples")
     return catalog
 
@@ -178,8 +175,8 @@ def load_constraints() -> List[Dict]:
                 if engine and engine.lower() != "duckdb":
                     continue
                 result.append(d)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  WARNING: Failed to load constraint {p.name}: {e}")
         result.sort(key=lambda c: severity_order.get(c.get("severity", "MEDIUM"), 2))
     print(f"Constraints: {len(result)}")
     return result
@@ -189,9 +186,7 @@ def load_regression_warnings(sql: str, recommender) -> List[Dict]:
     warnings = []
     if recommender._initialized:
         reg_matches = recommender.find_relevant_regressions(sql, k=3, dialect="duckdb")
-        reg_dir = QT_SQL_DIR / "optimization" / "examples" / "duckdb" / "regressions"
-        if not reg_dir.exists():
-            reg_dir = QT_SQL_DIR.parent.parent.parent / "ado" / "examples" / "duckdb" / "regressions"
+        reg_dir = EXAMPLES_DIR / "regressions"
         for ex_id, score, meta in reg_matches:
             reg_path = reg_dir / f"{ex_id}.json"
             if reg_path.exists():
@@ -243,9 +238,7 @@ def load_examples_by_ids(
             result.append(ex)
             found_ids.add(ex.get("id"))
     if len(found_ids) < len(example_ids):
-        examples_dir = QT_SQL_DIR / "optimization" / "examples" / "duckdb"
-        if not examples_dir.exists():
-            examples_dir = QT_SQL_DIR.parent.parent.parent / "ado" / "examples" / "duckdb"
+        examples_dir = EXAMPLES_DIR
         for eid in example_ids:
             if eid not in found_ids:
                 p = examples_dir / f"{eid}.json"

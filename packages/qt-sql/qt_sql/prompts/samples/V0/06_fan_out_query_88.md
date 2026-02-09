@@ -108,11 +108,54 @@ from
 |------|------|-------:|----------------|
 | main_query |  | 0.0% | — |
 
-## Top 0 Matched Examples (by structural similarity)
+## Top 16 Matched Examples (by structural similarity)
 
+1. **channel_bitmap_aggregation** (6.24x) — Consolidate repeated scans of the same fact table (one per time/channel bucket) into a single scan with CASE WHEN labels
+2. **prefetch_fact_join** (3.77x) — Pre-filter dimension table into CTE, then pre-join with fact table in second CTE before joining other dimensions
+3. **intersect_to_exists** (1.83x) — Convert INTERSECT subquery pattern to multiple EXISTS clauses for better join planning
+4. **multi_date_range_cte** (2.35x) — When query uses multiple date_dim aliases with different filters (d1, d2, d3), create separate CTEs for each date range 
+5. **multi_intersect_exists_cte** (2.39x) — Convert cascading INTERSECT operations into correlated EXISTS subqueries with pre-materialized date and channel CTEs
+6. **rollup_to_union_windowing** (2.47x) — Replace GROUP BY ROLLUP with explicit UNION ALL of pre-aggregated CTEs at each hierarchy level, combined with window fun
+7. **shared_dimension_multi_channel** (1.30x) — Extract shared dimension filters (date, item, promotion) into CTEs when multiple channel CTEs (store/catalog/web) apply 
+8. **or_to_union** (3.17x) — Split OR conditions on different columns into UNION ALL branches for better index usage
+9. **composite_decorrelate_union** (2.42x) — Decorrelate multiple correlated EXISTS subqueries into pre-materialized DISTINCT customer CTEs with a shared date filter
+10. **date_cte_isolate** (4.00x) — Extract date filtering into a separate CTE to enable predicate pushdown and reduce scans
+11. **decorrelate** (2.92x) — Convert correlated subquery to separate CTE with GROUP BY, then JOIN
+12. **deferred_window_aggregation** (1.36x) — When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joined with FULL OUTER JOIN followed by ano
+13. **early_filter** (4.00x) — Filter dimension tables FIRST, then join to fact tables to reduce expensive joins
+14. **materialize_cte** (1.37x) — Extract repeated subquery patterns into a CTE to avoid recomputation
+15. **multi_dimension_prefetch** (2.71x) — Pre-filter multiple dimension tables (date + store) into separate CTEs before joining with fact table
+16. **union_cte_split** (1.36x) — Split a generic UNION ALL CTE into specialized CTEs when the main query filters by year or discriminator - eliminates re
 
 ## All Available Examples (full catalog — can swap if needed)
 
+- **channel_bitmap_aggregation** (6.24x) — Consolidate repeated scans of the same fact table (one per time/channel bucket) 
+- **composite_decorrelate_union** (2.42x) — Decorrelate multiple correlated EXISTS subqueries into pre-materialized DISTINCT
+- **date_cte_isolate** (4.00x) — Extract date filtering into a separate CTE to enable predicate pushdown and redu
+- **decorrelate** (2.92x) — Convert correlated subquery to separate CTE with GROUP BY, then JOIN
+- **deferred_window_aggregation** (1.36x) — When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joi
+- **dimension_cte_isolate** (1.93x) — Pre-filter ALL dimension tables into CTEs before joining with fact table, not ju
+- **early_filter** (4.00x) — Filter dimension tables FIRST, then join to fact tables to reduce expensive join
+- **intersect_to_exists** (1.83x) — Convert INTERSECT subquery pattern to multiple EXISTS clauses for better join pl
+- **materialize_cte** (1.37x) — Extract repeated subquery patterns into a CTE to avoid recomputation
+- **multi_date_range_cte** (2.35x) — When query uses multiple date_dim aliases with different filters (d1, d2, d3), c
+- **multi_dimension_prefetch** (2.71x) — Pre-filter multiple dimension tables (date + store) into separate CTEs before jo
+- **multi_intersect_exists_cte** (2.39x) — Convert cascading INTERSECT operations into correlated EXISTS subqueries with pr
+- **or_to_union** (3.17x) — Split OR conditions on different columns into UNION ALL branches for better inde
+- **prefetch_fact_join** (3.77x) — Pre-filter dimension table into CTE, then pre-join with fact table in second CTE
+- **pushdown** (2.11x) — Push filters from outer query into CTEs/subqueries to reduce intermediate result
+- **rollup_to_union_windowing** (2.47x) — Replace GROUP BY ROLLUP with explicit UNION ALL of pre-aggregated CTEs at each h
+- **shared_dimension_multi_channel** (1.30x) — Extract shared dimension filters (date, item, promotion) into CTEs when multiple
+- **single_pass_aggregation** (4.47x) — Consolidate multiple subqueries scanning the same table into a single CTE with c
+- **union_cte_split** (1.36x) — Split a generic UNION ALL CTE into specialized CTEs when the main query filters 
+
+## Regression Warnings (review relevance to THIS query)
+
+These transforms caused regressions on structurally similar queries. Review each — if relevant to this query, AVOID the listed transform. If not relevant (different structure/bottleneck), you may ignore.
+
+- **regression_q67_date_cte_isolate** (0.85x) — Materialized date, store, and item dimension filters into CTEs before a ROLLUP aggregation with window functions (RANK()
+- **regression_q90_materialize_cte** (0.59x) — Split a simple OR condition (t_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17) into UNION ALL of two separate web_sa
+- **regression_q1_decorrelate** (0.71x) — Pre-computed customer_total_return (GROUP BY customer, store) and store_avg_return (GROUP BY store) as separate CTEs. Th
 
 ## Your Task
 

@@ -31,6 +31,7 @@ def build_worker_prompt(
     dialect: str = "duckdb",
     engine_version: Optional[str] = None,
     resource_envelope: Optional[str] = None,
+    original_logic_tree: Optional[str] = None,
 ) -> str:
     """Build a worker prompt from analyst briefing sections.
 
@@ -46,6 +47,7 @@ def build_worker_prompt(
         dialect: SQL dialect
         engine_version: Engine version string (e.g., '1.4.3')
         resource_envelope: System resource envelope text for PG workers (may be None)
+        original_logic_tree: Pre-built Logic Tree text (DAP format, all [=] markers)
 
     Returns:
         Complete worker prompt string
@@ -146,8 +148,8 @@ def build_worker_prompt(
 
     sections.append(build_worker_rewrite_checklist())
 
-    # ── [8] COLUMN COMPLETENESS CONTRACT ─────────────────────────────────
-    sections.append(_section_output_format(output_columns))
+    # ── [8] COLUMN COMPLETENESS CONTRACT + OUTPUT FORMAT ─────────────────
+    sections.append(_section_output_format(output_columns, original_logic_tree))
 
     return "\n\n".join(sections)
 
@@ -263,25 +265,25 @@ def _section_set_local_config(resource_envelope: str) -> str:
 
 def _section_output_format(
     output_columns: Optional[List[str]] = None,
+    original_logic_tree: Optional[str] = None,
 ) -> str:
-    """Output format section with per-node contracts."""
-    lines = [
-        "## Output Format",
-        "",
-        "Return a JSON object with your rewrite as `rewrite_sets`. Each node is a CTE",
-        "or the final SELECT. You MUST declare the output columns for every node in",
-        "`node_contracts` — this forces you to reason about what flows between CTEs.",
-        "",
-        "Only include nodes you **changed or added**. Unchanged nodes are auto-filled",
-        "from the original query.",
-    ]
+    """Output format section — DAP (Decomposed Attention Protocol).
 
+    Two-part output:
+    1. Modified Logic Tree (change markers: [+]/[-]/[~]/[=]/[!])
+    2. Component Payload JSON (per DAP spec)
+
+    When original_logic_tree is provided, it's shown as context so the LLM
+    sees the current structure in exactly the format it should output.
+    """
+    lines = []
+
+    # ── Column Completeness Contract (always first) ──
     if output_columns:
-        lines.append("")
         lines.append("### Column Completeness Contract")
         lines.append("")
         lines.append(
-            "Your `main_query` node MUST produce **exactly** these output columns "
+            "Your `main_query` component MUST produce **exactly** these output columns "
             "(same names, same order):"
         )
         lines.append("")
@@ -292,46 +294,102 @@ def _section_output_format(
             "Do NOT add, remove, or rename any output columns. "
             "The result set schema must be identical to the original query."
         )
+        lines.append("")
 
-    lines.extend([
-        "",
-        "```json",
-        "{",
-        '  "rewrite_sets": [{',
-        '    "id": "rs_01",',
-        '    "transform": "<transform_name>",',
-        '    "nodes": {',
-        '      "<cte_name>": "<SQL for this CTE body>",',
-        '      "main_query": "<final SELECT>"',
-        "    },",
-        '    "node_contracts": {',
-        '      "<cte_name>": ["col1", "col2", "..."],',
-        '      "main_query": ["col1", "col2", "..."]',
-        "    },",
-        '    "set_local": ["SET LOCAL work_mem = \'512MB\'", "SET LOCAL jit = \'off\'"],',
-        '    "data_flow": "<cte_a> -> <cte_b> -> main_query",',
-        '    "invariants_kept": ["same output columns", "same rows"],',
-        '    "expected_speedup": "2.0x",',
-        '    "risk": "low"',
-        "  }]",
-        "}",
-        "```",
-        "",
-        "### Rules",
-        "- Every node in `nodes` MUST appear in `node_contracts` and vice versa",
-        "- `node_contracts`: list the output column names each node produces",
-        "- `data_flow`: show the CTE dependency chain (forces you to think about order)",
-        "- `main_query` = the final SELECT — its contract must match the Column Completeness Contract above",
-        "- New CTE structures are encouraged — design the best topology for the query",
-        "",
-        "After the JSON, explain the mechanism:",
-        "",
-        "```",
-        "Changes: <1-2 sentences: what structural change + the expected mechanism>",
-        "Expected speedup: <estimate>",
-        "```",
-        "",
-        "Now output your rewrite as JSON:",
-    ])
+    # ── Original Query Structure (Logic Tree context) ──
+    if original_logic_tree:
+        lines.append("## Original Query Structure")
+        lines.append("")
+        lines.append(
+            "This is the current query structure. All nodes are `[=]` (unchanged). "
+            "Your modified Logic Tree below should show which nodes you changed."
+        )
+        lines.append("")
+        lines.append("```")
+        lines.append(original_logic_tree)
+        lines.append("```")
+        lines.append("")
+
+    # ── Output Format ──
+    lines.append("## Output Format")
+    lines.append("")
+    lines.append(
+        "Your response has **two parts** in order:"
+    )
+    lines.append("")
+
+    # Part 1: Modified Logic Tree
+    lines.append("### Part 1: Modified Logic Tree")
+    lines.append("")
+    lines.append(
+        "Show what changed using change markers. Generate the tree BEFORE writing SQL."
+    )
+    lines.append("")
+    lines.append("Change markers:")
+    lines.append("- `[+]` — New component added")
+    lines.append("- `[-]` — Component removed")
+    lines.append("- `[~]` — Component modified (describe what changed)")
+    lines.append("- `[=]` — Unchanged (no children needed)")
+    lines.append("- `[!]` — Structural change (e.g. CTE → subquery)")
+    lines.append("")
+
+    # Part 2: Component Payload JSON
+    lines.append("### Part 2: Component Payload JSON")
+    lines.append("")
+    lines.append("```json")
+    lines.append("{")
+    lines.append('  "spec_version": "1.0",')
+    lines.append(f'  "dialect": "<dialect>",')
+    lines.append('  "rewrite_rules": [')
+    lines.append('    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}')
+    lines.append("  ],")
+    lines.append('  "statements": [{')
+    lines.append('    "target_table": null,')
+    lines.append('    "change": "modified",')
+    lines.append('    "components": {')
+    lines.append('      "<cte_name>": {')
+    lines.append('        "type": "cte",')
+    lines.append('        "change": "modified",')
+    lines.append('        "sql": "<complete SQL for this CTE body>",')
+    lines.append('        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}')
+    lines.append("      },")
+    lines.append('      "main_query": {')
+    lines.append('        "type": "main_query",')
+    lines.append('        "change": "modified",')
+    lines.append('        "sql": "<final SELECT>",')
+    lines.append('        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}')
+    lines.append("      }")
+    lines.append("    },")
+    lines.append('    "reconstruction_order": ["<cte_name>", "main_query"],')
+    lines.append('    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"')
+    lines.append("  }],")
+    lines.append('  "macros": {},')
+    lines.append('  "frozen_blocks": [],')
+    lines.append('  "runtime_config": ["SET LOCAL work_mem = \'512MB\'"],')
+    lines.append('  "validation_checks": []')
+    lines.append("}")
+    lines.append("```")
+    lines.append("")
+
+    # Rules
+    lines.append("### Rules")
+    lines.append("- **Tree first, always.** Generate the Logic Tree before writing any SQL")
+    lines.append("- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces")
+    lines.append("- **No ellipsis.** Every `sql` value must be complete, executable SQL")
+    lines.append("- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim")
+    lines.append("- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`")
+    lines.append("- Only include components you **changed or added** — set unchanged components to `\"change\": \"unchanged\"` with `\"sql\": \"\"`")
+    lines.append("- `main_query` output columns must match the Column Completeness Contract above")
+    lines.append("- `runtime_config`: SET LOCAL commands (PG only). Omit or use empty array if not needed")
+    lines.append("- `reconstruction_order`: topological order of components for assembly")
+    lines.append("")
+    lines.append("After the JSON, explain the mechanism:")
+    lines.append("")
+    lines.append("```")
+    lines.append("Changes: <1-2 sentences: what structural change + the expected mechanism>")
+    lines.append("Expected speedup: <estimate>")
+    lines.append("```")
+    lines.append("")
+    lines.append("Now output your Logic Tree and Component Payload JSON:")
 
     return "\n".join(lines)

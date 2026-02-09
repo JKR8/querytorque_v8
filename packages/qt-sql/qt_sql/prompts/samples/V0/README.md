@@ -25,6 +25,10 @@ Rendered examples of every prompt type in the QueryTorque V8 system.
 | 10 | `10_sniper_iter2_query_88.md` | `build_sniper_prompt(previous_sniper_result=...)` | Q88 |
 | 11 | `11_pg_tuner_query_88.md` | `build_pg_tuner_prompt()` | Q88 |
 
+## Notes
+- EXPLAIN plans are truncated at 150 lines in snipe/analyst prompts — this is intentional production behavior for LLM context budget, not a generator bug.
+- The rendered samples show exactly what the LLM sees in production.
+
 ## Spec
 See `../PROMPT_SPEC.md` for full input/output specification per prompt type.
 

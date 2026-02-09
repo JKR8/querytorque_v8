@@ -837,10 +837,8 @@ def build_analyst_briefing_prompt(
             lines.append(algo_text)
             lines.append("")
 
-    # ── 4. DAG node cards ────────────────────────────────────────────────
-    lines.append("## Query Structure (DAG)")
-    lines.append("")
-
+    # ── 4. Query Structure (Logic Tree + condensed node details) ─────────
+    from ..logic_tree import build_logic_tree
     from ..analyst import _append_dag_analysis
     from ..node_prompter import _build_node_intent_map
 
@@ -850,6 +848,18 @@ def build_analyst_briefing_prompt(
         if query_intent and "main_query" not in node_intents:
             node_intents["main_query"] = query_intent
 
+    # Logic Tree overview
+    lines.append("## Query Structure (Logic Tree)")
+    lines.append("")
+    tree = build_logic_tree(sql, dag, costs, dialect, node_intents)
+    lines.append("```")
+    lines.append(tree)
+    lines.append("```")
+    lines.append("")
+
+    # Condensed per-node detail cards (analyst needs join/filter details)
+    lines.append("## Node Details")
+    lines.append("")
     _append_dag_analysis(lines, dag, costs, dialect=dialect, node_intents=node_intents)
     lines.append("")
 
@@ -1289,34 +1299,39 @@ def build_analyst_briefing_prompt(
     elif mode == "oneshot":
         lines.append("=== REWRITE ===")
         lines.append("")
+        lines.append("First output a **Modified Logic Tree** showing what changed:")
+        lines.append("- `[+]` new  `[-]` removed  `[~]` modified  `[=]` unchanged  `[!]` structural")
+        lines.append("")
+        lines.append("Then output a **Component Payload JSON**:")
+        lines.append("")
         lines.append("```json")
         lines.append("{")
-        lines.append('  "rewrite_sets": [{')
-        lines.append('    "id": "rs_01",')
-        lines.append('    "transform": "<transform_name>",')
-        lines.append('    "nodes": {')
-        lines.append('      "<cte_name>": "<SQL for this CTE body>",')
-        lines.append('      "main_query": "<final SELECT>"')
+        lines.append('  "spec_version": "1.0",')
+        lines.append('  "dialect": "<dialect>",')
+        lines.append('  "rewrite_rules": [{"id": "R1", "type": "<transform>", "description": "<what>", "applied_to": ["<comp_id>"]}],')
+        lines.append('  "statements": [{')
+        lines.append('    "target_table": null,')
+        lines.append('    "change": "modified",')
+        lines.append('    "components": {')
+        lines.append('      "<cte_name>": {"type": "cte", "change": "modified", "sql": "<CTE body>", "interfaces": {"outputs": ["col1"], "consumes": []}},')
+        lines.append('      "main_query": {"type": "main_query", "change": "modified", "sql": "<final SELECT>", "interfaces": {"outputs": ["col1"], "consumes": ["<cte_name>"]}}')
         lines.append("    },")
-        lines.append('    "node_contracts": {')
-        lines.append('      "<cte_name>": ["col1", "col2", "..."],')
-        lines.append('      "main_query": ["col1", "col2", "..."]')
-        lines.append("    },")
-        lines.append('    "set_local": ["SET LOCAL work_mem = \'512MB\'", "SET LOCAL jit = \'off\'"],')
-        lines.append('    "data_flow": "<cte_a> -> <cte_b> -> main_query",')
-        lines.append('    "invariants_kept": ["same output columns", "same rows"],')
-        lines.append('    "expected_speedup": "2.0x",')
-        lines.append('    "risk": "low"')
-        lines.append("  }]")
+        lines.append('    "reconstruction_order": ["<cte_name>", "main_query"],')
+        lines.append('    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"')
+        lines.append("  }],")
+        lines.append('  "macros": {},')
+        lines.append('  "frozen_blocks": [],')
+        lines.append('  "runtime_config": [],')
+        lines.append('  "validation_checks": []')
         lines.append("}")
         lines.append("```")
         lines.append("")
         lines.append("Rules:")
-        lines.append("- Every node in `nodes` MUST appear in `node_contracts` and vice versa")
-        lines.append("- `node_contracts`: list the output column names each node produces")
-        lines.append("- `data_flow`: show the CTE dependency chain")
-        lines.append("- `main_query` = the final SELECT")
-        lines.append("- Only include nodes you changed or added; unchanged nodes auto-filled from original")
+        lines.append("- Tree first, always — generate Logic Tree before writing SQL")
+        lines.append("- One component at a time — treat other components as opaque interfaces")
+        lines.append("- No ellipsis — every `sql` value must be complete, executable SQL")
+        lines.append("- Only include changed/added components; set unchanged to `\"change\": \"unchanged\"` with `\"sql\": \"\"`")
+        lines.append("- `main_query` output columns must match original exactly")
         lines.append("")
         lines.append("After the JSON, explain the mechanism:")
         lines.append("")
@@ -1806,71 +1821,56 @@ def build_script_oneshot_prompt(
     )
     lines.append(
         "5. **WRITE REWRITES**: For each statement you change, produce a "
-        "rewrite_set in the output format below."
+        "component payload in the output format below."
     )
     lines.append("")
 
-    # ── 8. Output format ─────────────────────────────────────────────
+    # ── 8. Output format (DAP multi-statement) ─────────────────────────
     lines.append("## Output Format")
     lines.append("")
     lines.append(
-        "Return a JSON object with one `rewrite_set` per statement you "
-        "modify. Each rewrite_set targets a specific pipeline stage by its "
-        "`target` name (the table/view being created). Only include stages "
-        "you actually change."
+        "First output a **Modified Logic Tree** for the pipeline, showing "
+        "which statements and components changed."
     )
     lines.append("")
     lines.append(
-        "Only include nodes (CTEs or main_query) that you **changed or "
-        "added**. Unchanged nodes are auto-filled from the original."
+        "Then output a **Component Payload JSON** with one statement entry "
+        "per pipeline stage you modify."
     )
     lines.append("")
     lines.append("```json")
     lines.append("{")
-    lines.append('  "rewrite_sets": [')
+    lines.append('  "spec_version": "1.0",')
+    lines.append('  "dialect": "<dialect>",')
+    lines.append('  "rewrite_rules": [')
+    lines.append('    {"id": "R1", "type": "<transform>", "description": "<what>", "applied_to": ["<stmt.comp>"]}')
+    lines.append("  ],")
+    lines.append('  "statements": [')
     lines.append("    {")
-    lines.append('      "id": "rs_01",')
-    lines.append('      "target": "<table_or_view_name>",')
-    lines.append('      "transform": "<transform_name>",')
-    lines.append('      "nodes": {')
-    lines.append('        "<cte_name>": "<SQL for this CTE body>",')
-    lines.append('        "main_query": "<final SELECT>"')
+    lines.append('      "target_table": "<table_or_view_name>",')
+    lines.append('      "change": "modified",')
+    lines.append('      "components": {')
+    lines.append('        "<cte_name>": {"type": "cte", "change": "modified", "sql": "<CTE body>", "interfaces": {"outputs": ["col1"], "consumes": []}},')
+    lines.append('        "main_query": {"type": "main_query", "change": "modified", "sql": "<SELECT>", "interfaces": {"outputs": ["col1"], "consumes": ["<cte_name>"]}}')
     lines.append("      },")
-    lines.append('      "node_contracts": {')
-    lines.append('        "<cte_name>": ["col1", "col2", "..."],')
-    lines.append('        "main_query": ["col1", "col2", "..."]')
-    lines.append("      },")
-    lines.append('      "data_flow": "<cte_a> -> <cte_b> -> main_query",')
-    lines.append('      "invariants_kept": ["same output columns", "same rows"],')
-    lines.append(
-        '      "cross_statement_reasoning": '
-        '"<why this change requires seeing the full pipeline>",'
-    )
-    lines.append('      "expected_speedup": "2.0x",')
-    lines.append('      "risk": "low"')
-    lines.append("    },")
-    lines.append("    {")
-    lines.append('      "id": "rs_02",')
-    lines.append('      "target": "<another_table_or_view>",')
-    lines.append("      ...")
+    lines.append('      "reconstruction_order": ["<cte_name>", "main_query"],')
+    lines.append('      "assembly_template": "CREATE TABLE <target> AS WITH <cte> AS ({<cte>}) {main_query}"')
     lines.append("    }")
-    lines.append("  ]")
+    lines.append("  ],")
+    lines.append('  "macros": {},')
+    lines.append('  "frozen_blocks": [],')
+    lines.append('  "runtime_config": [],')
+    lines.append('  "validation_checks": []')
     lines.append("}")
     lines.append("```")
     lines.append("")
     lines.append("### Rules")
+    lines.append("- Tree first — generate the pipeline Logic Tree before writing any SQL")
     lines.append(
-        "- `target`: the table/view this rewrite modifies "
+        "- Each `statements[]` entry targets a specific pipeline stage "
         "(must match a CREATE in the script)"
     )
-    lines.append(
-        "- Every node in `nodes` MUST appear in `node_contracts` and vice versa"
-    )
-    lines.append("- `main_query` = the final SELECT of that statement")
-    lines.append(
-        "- `cross_statement_reasoning`: explain what upstream/downstream "
-        "knowledge enabled this optimization"
-    )
+    lines.append("- Only include statements you actually change")
     lines.append(
         "- Output columns of each stage must remain identical "
         "(downstream consumers depend on them)"
@@ -1879,6 +1879,7 @@ def build_script_oneshot_prompt(
         "- Rewrites must be semantically equivalent for ALL downstream "
         "consumers, not just the immediate next stage"
     )
+    lines.append("- No ellipsis — every `sql` value must be complete, executable SQL")
     lines.append("")
     lines.append("After the JSON, explain the overall pipeline optimization:")
     lines.append("")

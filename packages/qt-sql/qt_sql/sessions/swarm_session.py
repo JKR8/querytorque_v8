@@ -320,6 +320,22 @@ class SwarmSession(OptimizationSession):
         output_columns = Prompter._extract_output_columns(dag)
         self._output_columns = output_columns
 
+        # Build Logic Tree once (shared across all workers for DAP context)
+        original_logic_tree = None
+        try:
+            from ..logic_tree import build_logic_tree
+            from ..node_prompter import _build_node_intent_map
+            node_intents = _build_node_intent_map(semantic_intents)
+            if semantic_intents:
+                qi = semantic_intents.get("query_intent", "")
+                if qi and "main_query" not in node_intents:
+                    node_intents["main_query"] = qi
+            original_logic_tree = build_logic_tree(
+                self.original_sql, dag, costs, self.dialect, node_intents
+            )
+        except Exception as e:
+            logger.warning(f"[{self.query_id}] Logic tree build failed: {e}")
+
         candidates_by_worker = {}
 
         def generate_worker(worker_briefing):
@@ -339,6 +355,7 @@ class SwarmSession(OptimizationSession):
                 dialect=self.dialect,
                 engine_version=self.pipeline._engine_version,
                 resource_envelope=resource_envelope,
+                original_logic_tree=original_logic_tree,
             )
 
             example_ids = [e.get("id", "?") for e in examples]
