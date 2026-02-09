@@ -340,10 +340,11 @@ class SwarmSession(OptimizationSession):
         self._stage(self.query_id, f"VALIDATE: complete ({_fmt_elapsed(time.time() - t_val)})")
         for wr in sorted(worker_results, key=lambda w: w.worker_id):
             marker = "*" if wr.speedup >= 1.10 else " "
+            explore_tag = " [EXPLORE]" if getattr(wr, 'exploratory', False) else ""
             err = f" — {wr.error_message[:60]}" if wr.error_message else ""
             self._stage(
                 self.query_id,
-                f" {marker} W{wr.worker_id} ({wr.strategy}): {wr.status} {wr.speedup:.2f}x{err}"
+                f" {marker} W{wr.worker_id} ({wr.strategy}){explore_tag}: {wr.status} {wr.speedup:.2f}x{err}"
             )
 
         # Learning records for each worker
@@ -388,7 +389,42 @@ class SwarmSession(OptimizationSession):
         """Load EXPLAIN ANALYZE plan text from cached explains.
 
         Searches: explains/sf10/ → explains/sf5/ → explains/ (flat).
+        For DuckDB: uses plan_text field (JSON string → rendered tree).
+        For PG: renders plan_json to ASCII tree via format_pg_explain_tree().
         Returns the ASCII text plan or None.
+        """
+        from .analyst_briefing import format_pg_explain_tree
+
+        for subdir in ["sf10", "sf5", ""]:
+            if subdir:
+                cache_dir = self.pipeline.benchmark_dir / "explains" / subdir
+            else:
+                cache_dir = self.pipeline.benchmark_dir / "explains"
+            cache_path = cache_dir / f"{query_id}.json"
+
+            if cache_path.exists():
+                try:
+                    data = json.loads(cache_path.read_text())
+                    # DuckDB path: plan_text is a JSON string
+                    plan_text = data.get("plan_text")
+                    if plan_text:
+                        return plan_text
+                    # PG path: render plan_json to ASCII tree
+                    plan_json = data.get("plan_json")
+                    if plan_json:
+                        rendered = format_pg_explain_tree(plan_json)
+                        if rendered:
+                            return rendered
+                except Exception:
+                    pass
+
+        return None
+
+    def _get_explain_plan_json(self, query_id: str) -> Optional[Any]:
+        """Load raw EXPLAIN JSON plan data (for PG tuner prompt).
+
+        Searches: explains/sf10/ → explains/sf5/ → explains/ (flat).
+        Returns the plan_json list/dict or None.
         """
         for subdir in ["sf10", "sf5", ""]:
             if subdir:
@@ -400,12 +436,11 @@ class SwarmSession(OptimizationSession):
             if cache_path.exists():
                 try:
                     data = json.loads(cache_path.read_text())
-                    plan_text = data.get("plan_text")
-                    if plan_text:
-                        return plan_text
+                    plan_json = data.get("plan_json")
+                    if plan_json:
+                        return plan_json
                 except Exception:
                     pass
-
         return None
 
     def _fan_out_iteration_v2(
@@ -426,7 +461,7 @@ class SwarmSession(OptimizationSession):
             build_worker_v2_prompt,
             parse_briefing_response,
         )
-        from ..node_prompter import _load_constraint_files
+        from ..node_prompter import _load_constraint_files, _load_engine_profile
 
         # ── Step 1: Gather all raw data ──────────────────────────────────
         self._stage(self.query_id, "V2: Gathering data (EXPLAIN, knowledge, examples)...")
@@ -449,7 +484,10 @@ class SwarmSession(OptimizationSession):
         # Full catalog
         all_available = self.pipeline._list_gold_examples(self.engine)
 
-        # All constraints (engine-filtered)
+        # Engine profile (optimizer strengths + gaps)
+        engine_profile = _load_engine_profile(self.dialect)
+
+        # All constraints (engine-filtered, excluding engine profiles)
         constraints = _load_constraint_files(self.dialect)
 
         # Regression warnings
@@ -460,7 +498,7 @@ class SwarmSession(OptimizationSession):
         # Strategy leaderboard + query archetype
         strategy_leaderboard = None
         query_archetype = None
-        benchmark_dir = Path(__file__).resolve().parent.parent / "benchmarks" / "duckdb_tpcds"
+        benchmark_dir = self.pipeline.benchmark_dir
         leaderboard_path = benchmark_dir / "strategy_leaderboard.json"
         if leaderboard_path.exists():
             try:
@@ -480,6 +518,24 @@ class SwarmSession(OptimizationSession):
             f"({_fmt_elapsed(time.time() - t0)})"
         )
 
+        # PG system profile + resource envelope (for per-worker SET LOCAL config)
+        resource_envelope = None
+        if self.dialect in ("postgresql", "postgres"):
+            try:
+                from ..pg_tuning import load_or_collect_profile, build_resource_envelope
+                profile = load_or_collect_profile(
+                    self.pipeline.config.db_path_or_dsn,
+                    self.pipeline.benchmark_dir,
+                )
+                resource_envelope = build_resource_envelope(profile)
+                self._stage(
+                    self.query_id,
+                    f"V2: PG system profile loaded ({len(profile.settings)} settings, "
+                    f"{profile.active_connections} active conns)"
+                )
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] Failed to load PG system profile: {e}")
+
         # ── Step 2: Build V2 analyst prompt ──────────────────────────────
         analyst_prompt = build_analyst_briefing_prompt(
             query_id=self.query_id,
@@ -496,6 +552,8 @@ class SwarmSession(OptimizationSession):
             dialect=self.dialect,
             strategy_leaderboard=strategy_leaderboard,
             query_archetype=query_archetype,
+            engine_profile=engine_profile,
+            resource_envelope=resource_envelope,
         )
 
         # ── Step 3: Call analyst LLM ─────────────────────────────────────
@@ -575,6 +633,7 @@ class SwarmSession(OptimizationSession):
                 output_columns=output_columns,
                 dialect=self.dialect,
                 engine_version=self.pipeline._engine_version,
+                resource_envelope=resource_envelope,
             )
 
             example_ids = [e.get("id", "?") for e in examples]
@@ -594,7 +653,8 @@ class SwarmSession(OptimizationSession):
             except Exception:
                 optimized_sql = self.original_sql
 
-            return worker_briefing, optimized_sql, candidate.transforms, candidate.prompt, candidate.response
+            return (worker_briefing, optimized_sql, candidate.transforms,
+                    candidate.prompt, candidate.response, candidate.set_local_commands)
 
         # Parallel LLM generation
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -605,9 +665,9 @@ class SwarmSession(OptimizationSession):
             }
             for future in as_completed(futures):
                 try:
-                    wb, optimized_sql, transforms, w_prompt, w_response = future.result()
+                    wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds = future.result()
                     candidates_by_worker[wb.worker_id] = (
-                        wb, optimized_sql, transforms, w_prompt, w_response
+                        wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds
                     )
                     self._stage(
                         self.query_id,
@@ -618,7 +678,7 @@ class SwarmSession(OptimizationSession):
                     wb = futures[future]
                     logger.error(f"[{self.query_id}] V2 W{wb.worker_id} generation failed: {e}")
                     candidates_by_worker[wb.worker_id] = (
-                        wb, self.original_sql, [], "", str(e)
+                        wb, self.original_sql, [], "", str(e), []
                     )
 
         self._stage(self.query_id, f"V2 GENERATE: all 4 workers complete ({_fmt_elapsed(time.time() - t_gen)})")
@@ -679,9 +739,11 @@ class SwarmSession(OptimizationSession):
         worker_results = []
         worker_prompts = {}
         for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
-            wb, optimized_sql, transforms, w_prompt, w_response = candidates_by_worker[wid]
+            wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds = candidates_by_worker[wid]
             worker_prompts[wid] = (w_prompt, w_response)
 
+            # Tag Worker 4 as exploratory for separate tracking
+            is_exploratory = (wb.worker_id == 4)
             wr = WorkerResult(
                 worker_id=wb.worker_id,
                 strategy=wb.strategy,
@@ -694,6 +756,7 @@ class SwarmSession(OptimizationSession):
                 error_message=" | ".join(error_msgs) if error_msgs else None,
                 error_messages=error_msgs or [],
                 error_category=error_cat,
+                exploratory=is_exploratory,
             )
             worker_results.append(wr)
             self.all_worker_results.append(wr)
@@ -702,11 +765,85 @@ class SwarmSession(OptimizationSession):
         self._stage(self.query_id, f"VALIDATE: complete ({_fmt_elapsed(time.time() - t_val)})")
         for wr in sorted(worker_results, key=lambda w: w.worker_id):
             marker = "*" if wr.speedup >= 1.10 else " "
+            explore_tag = " [EXPLORE]" if getattr(wr, 'exploratory', False) else ""
             err = f" — {wr.error_message[:60]}" if wr.error_message else ""
             self._stage(
                 self.query_id,
-                f" {marker} W{wr.worker_id} ({wr.strategy}): {wr.status} {wr.speedup:.2f}x{err}"
+                f" {marker} W{wr.worker_id} ({wr.strategy}){explore_tag}: {wr.status} {wr.speedup:.2f}x{err}"
             )
+
+        # ── Step 6.5: Per-worker SET LOCAL config validation (PG only) ──
+        if self.dialect in ("postgresql", "postgres"):
+            from ..pg_tuning import validate_tuning_config, build_set_local_sql
+
+            for wid in sorted_wids:
+                wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds = candidates_by_worker[wid]
+                if not set_local_cmds:
+                    continue
+
+                # Find the matching WorkerResult
+                wr_match = [w for w in worker_results if w.worker_id == wid]
+                if not wr_match:
+                    continue
+                wr = wr_match[0]
+
+                # Only re-validate passing workers (not errors/regressions)
+                if wr.status not in ("WIN", "IMPROVED", "NEUTRAL", "PASS"):
+                    continue
+
+                # Parse SET LOCAL commands into param dict for validation
+                raw_params = {}
+                for cmd in set_local_cmds:
+                    import re as _re
+                    m = _re.match(
+                        r"SET\s+LOCAL\s+(\w+)\s*=\s*'?([^';\s]+)'?",
+                        cmd, _re.IGNORECASE,
+                    )
+                    if m:
+                        raw_params[m.group(1).lower()] = m.group(2)
+
+                validated_params = validate_tuning_config(raw_params)
+                if not validated_params:
+                    continue
+
+                config_commands = build_set_local_sql(validated_params)
+                self._stage(
+                    self.query_id,
+                    f"CONFIG W{wid}: SET LOCAL {len(validated_params)} params: "
+                    f"{', '.join(f'{k}={v}' for k, v in validated_params.items())}"
+                )
+
+                # Re-validate this worker with its SET LOCAL config
+                try:
+                    config_result = self.pipeline.validator.validate_with_config(
+                        original_sql=self.original_sql,
+                        optimized_sql=optimized_sql,
+                        config_commands=config_commands,
+                        worker_id=wid,
+                    )
+                    if config_result and "error" not in config_result:
+                        config_speedup = config_result.get("config_speedup", wr.speedup)
+                        self._stage(
+                            self.query_id,
+                            f"CONFIG W{wid}: rewrite={wr.speedup:.2f}x → "
+                            f"rewrite+config={config_speedup:.2f}x"
+                        )
+                        # Attach config to worker result
+                        wr.set_local_config = {
+                            "params": validated_params,
+                            "commands": config_commands,
+                            "config_speedup": config_speedup,
+                            "rewrite_only_speedup": wr.speedup,
+                        }
+                        # Update speedup if config improved it
+                        if config_speedup > wr.speedup:
+                            wr.speedup = config_speedup
+                    else:
+                        err_msg = config_result.get("error", "unknown") if config_result else "no result"
+                        self._stage(self.query_id, f"CONFIG W{wid}: validation error: {err_msg}")
+                except Exception as e:
+                    self._stage(self.query_id, f"CONFIG W{wid}: validation failed: {e}")
+                    logger.warning(f"[{self.query_id}] Config validation W{wid} failed: {e}")
 
         # Learning records
         for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
@@ -731,7 +868,7 @@ class SwarmSession(OptimizationSession):
 
         worker_results.sort(key=lambda w: w.worker_id)
 
-        return {
+        iteration_data = {
             "iteration": 0,
             "phase": "fan_out_v2",
             "analyst_prompt": analyst_prompt,
@@ -746,6 +883,8 @@ class SwarmSession(OptimizationSession):
             "worker_results": [wr.to_dict() for wr in worker_results],
             "best_speedup": max((wr.speedup for wr in worker_results), default=0.0),
         }
+
+        return iteration_data
 
     def _snipe_iteration(
         self, dag: Any, costs: Dict[str, Any], snipe_num: int, t_session: float,

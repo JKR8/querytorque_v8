@@ -136,12 +136,14 @@ all three limitations through six key design decisions:
     allowing the swarm to attack each formulation independently and select
     the best result per type.
 
-\item \textbf{Engine-aware constraint injection.} A library of severity-tiered
-    constraints, many auto-generated from observed regressions, is injected
-    using a ``sandwich'' attention pattern (critical constraints at both the
-    start and end of the prompt). Constraints are engine-specific: for
-    example, OR-to-UNION is encouraged for DuckDB but prohibited for
-    PostgreSQL, where it causes regressions.
+\item \textbf{Engine-aware gap profiling.} Rather than injecting prohibitive
+    constraints (``do not apply transform~$X$''), we characterize each
+    database engine's optimizer blind spots as structured \emph{gap profiles}
+    that direct the LLM toward high-value rewrites. An analyst LLM performs
+    dynamic \emph{gap matching} per query using EXPLAIN plan evidence,
+    then dispatches workers targeting only the active gaps. Three root
+    causes account for 70\% of DuckDB wins
+    (Section~\ref{sec:gap_profiling}).
 
 \item \textbf{Stateful multi-iteration promotion.} \sysname{} operates as a
     state machine: winning rewrites from round~$N$ become the baseline for
@@ -349,15 +351,17 @@ are generated once per query via a lightweight LLM call and cached. When
 present, they are attached to their respective nodes in the prompt, giving
 the rewriter human-readable context alongside the structural metadata.
 
-\paragraph{Knowledge base patterns.}
-The prompt also includes engine-specific \emph{knowledge base patterns} that
-explain \emph{why} certain rewrites work at the optimizer level. For
-example, the pattern \texttt{SQL-DUCK-014} (Grouped Top-N via Window vs.\
-LATERAL) explains that DuckDB cannot automatically transform a
-\texttt{ROW\_NUMBER() OVER (PARTITION BY ...)} into a LATERAL subquery
-because the semantic rewrite is not cost-based. This knowledge---the
-\emph{optimizer's limitations}---is absent from EXPLAIN plans and rule
-specifications, yet is precisely what guides productive rewrites.
+\paragraph{Engine gap profiles.}
+The prompt includes engine-specific \emph{gap profiles} that characterize
+optimizer blind spots---cases where the optimizer fails to find efficient
+plans due to structural limitations in its search strategy. For example,
+DuckDB's CROSS\_CTE\_PREDICATE\_BLINDNESS gap documents that the optimizer
+cannot push predicates from the outer query into CTE definitions because
+CTEs are planned as independent subplans. This knowledge---the
+\emph{optimizer's behavioral model}---is absent from EXPLAIN plans and rule
+specifications, yet is precisely what guides productive rewrites. We
+describe the gap profiling system in detail in
+Section~\ref{sec:gap_profiling}.
 
 \paragraph{Comparison with prior representations.}
 Table~\ref{tab:repr_comparison} compares the three approaches.
@@ -456,35 +460,47 @@ base query is selected across all variants and all workers, maximizing
 coverage. This approach is orthogonal to the swarm architecture and could
 benefit any LLM-based rewriting system.
 
-\subsection{Phase 3: Prompt Construction}
+\subsection{Phase 3: Analyst Briefing}
 
-The prompt assembles eight attention-ordered sections:
+In the V2 architecture, prompt construction is split into two stages.
+First, an \emph{analyst} LLM receives all available information---the
+original SQL, EXPLAIN plan, DAG topology, engine gap profile, gold
+examples, regression warnings, and correctness constraints---and produces
+a structured briefing for 4~workers.
+
+The analyst prompt assembles attention-ordered sections:
 \begin{enumerate}
-\item \textbf{Role framing}: System instruction for SQL optimization.
-\item \textbf{Original SQL}: Pretty-printed with query identifier.
-\item \textbf{DAG topology}: Nodes, edges, and per-node cost percentages.
-\item \textbf{Constraints}: Severity-tiered rules in sandwich pattern
-    (CRITICAL at top and bottom, HIGH/MEDIUM in middle).
-\item \textbf{History}: Previous attempts with status, speedup, and
-    transforms (for multi-iteration mode).
-\item \textbf{Gold examples}: Top-$k$ matched examples with original
-    $\rightarrow$ optimized SQL pairs and speedup annotations.
-\item \textbf{Regression warnings}: Anti-pattern examples for similar
-    query structures.
-\item \textbf{Output format}: Return complete rewritten SQL with summary.
+\item \textbf{Role framing}: Senior query optimization architect.
+\item \textbf{Original SQL}: Pretty-printed with line numbers.
+\item \textbf{EXPLAIN ANALYZE plan}: Physical execution tree with
+    operator timings and cardinalities.
+\item \textbf{DAG topology}: Logical nodes, edges, and per-node costs.
+\item \textbf{Engine gap profile}: Optimizer strengths (do not fight)
+    and gaps (hunt for these) with field intelligence
+    (Section~\ref{sec:gap_profiling}).
+\item \textbf{Correctness constraints}: 4 non-negotiable validation gates.
+\item \textbf{Gold examples}: Tag-matched examples with full metadata.
+\item \textbf{Transform catalog}: Available transforms organized by
+    category (predicate movement, join restructuring, scan optimization,
+    structural).
+\item \textbf{Output format}: Per-worker briefing with strategy,
+    target DAG, node contracts, and hazard flags.
 \end{enumerate}
 
-The sandwich constraint pattern exploits the well-documented primacy and
-recency bias in LLM attention~\cite{liu2024lost}, ensuring critical
-constraints (semantic equivalence, literal preservation, column completeness)
-receive maximum attention.
+The analyst's structured reasoning follows a six-step checklist:
+(1)~classify query archetype, (2)~analyze EXPLAIN plan bottlenecks,
+(3)~match active engine gaps, (4)~check aggregation traps,
+(5)~select transforms from matched gaps, (6)~design target DAGs
+per worker. The analyst output contains a \emph{shared briefing}
+(semantic contract, bottleneck diagnosis, active constraints, regression
+warnings) plus four \emph{per-worker briefings}, each specifying a
+different optimization strategy.
 
 \subsection{Phase 4: Multi-Worker Generation}
 
-This is the core differentiator of \sysname{}. Rather than generating a
-single candidate, we dispatch $W$ workers in parallel (default $W{=}4$),
-each receiving a \emph{different} set of gold examples targeting a distinct
-optimization strategy:
+Each worker receives only its targeted briefing from the analyst---not the
+full profile or other workers' strategies. This ensures workers operate
+independently on structurally diverse approaches:
 
 \begin{itemize}
 \item \textbf{Worker 1} (Restructure): decorrelate, pushdown, early\_filter
@@ -492,17 +508,23 @@ optimization strategy:
     dimension\_cte\_isolate, multi\_date\_range\_cte
 \item \textbf{Worker 3} (Prefetch): prefetch\_fact\_join,
     multi\_dimension\_prefetch, materialize\_cte
-\item \textbf{Worker 4} (Consolidate): single\_pass\_aggregation,
-    or\_to\_union, intersect\_to\_exists, union\_cte\_split
+\item \textbf{Worker 4} (Exploration): compound strategies, constraint
+    relaxation, or novel combinations not previously tested
 \end{itemize}
 
+Workers~1--3 follow the analyst's strategy assignments, which target
+specific engine gaps identified during gap matching. Worker~4 is the
+\emph{exploration worker}---it may attempt techniques the profile's
+``what didn't work'' sections warn about if the current query's structure
+differs from the documented failure context
+(Section~\ref{sec:gap_selection}).
+
 Each worker calls a frontier reasoning model (e.g.,
-DeepSeek-Reasoner~\cite{deepseek_r1}, OpenAI o1~\cite{openai_o1}) with
-the full prompt augmented by its strategy-specific examples. The use of
-reasoning models is deliberate: SQL optimization requires multi-step
-logical deduction (identifying bottlenecks, planning transformations,
-verifying equivalence), which benefits from chain-of-thought
-reasoning~\cite{deepseek_r1}.
+DeepSeek-Reasoner~\cite{deepseek_r1}, OpenAI o1~\cite{openai_o1}).
+The use of reasoning models is deliberate: SQL optimization requires
+multi-step logical deduction (identifying bottlenecks, planning
+transformations, verifying equivalence), which benefits from
+chain-of-thought reasoning~\cite{deepseek_r1}.
 
 All $W$ candidates are collected and passed to Phase~5.
 
@@ -543,41 +565,171 @@ previously buried inside the correlated block.
 
 
 % ============================================================================
-\section{Constraint and Learning System}
-\label{sec:constraints}
+\section{Engine-Aware Gap Profiling and Learning}
+\label{sec:gap_profiling}
 % ============================================================================
 
-\subsection{Engine-Aware Constraints}
+A central insight of \sysname{} is that effective SQL rewriting requires
+understanding not just \emph{what} the LLM should rewrite, but \emph{why}
+certain rewrites produce speedups on specific engines. The answer lies in
+optimizer blind spots: cases where the query optimizer fails to find an
+efficient execution plan due to structural limitations in its search
+strategy. We formalize this as a two-layer steering architecture.
 
-\sysname{} maintains a library of constraints---rules that restrict the LLM's
-rewriting behavior based on verified failure modes. Each constraint specifies:
+\subsection{Two-Layer Architecture}
+
+Prior LLM rewriting systems inject constraints as prohibitions (``do not
+apply transform $X$'') or as rule specifications (R-Bot's Calcite rules).
+Both frame the problem negatively---what to \emph{avoid}---rather than
+positively---what to \emph{exploit}. We argue this is backwards: the LLM
+should be directed toward optimizer blind spots, not away from past
+failures.
+
+\sysname{} uses a two-layer architecture:
+
+\paragraph{Layer~1: Engine gap profiles (offensive).}
+For each target engine, we maintain a structured \emph{gap profile} that
+characterizes the optimizer's behavioral strengths and weaknesses based on
+empirical testing. Each profile contains:
+
 \begin{itemize}
-\item \textbf{Severity}: CRITICAL, HIGH, MEDIUM, LOW
-\item \textbf{Engine scope}: Which database engines it applies to
-\item \textbf{Description}: Natural-language explanation of the anti-pattern
-\item \textbf{Provenance}: The query and regression that motivated the
-    constraint
+\item \textbf{Strengths}: Capabilities the optimizer already handles well
+    (e.g., DuckDB's intra-scan predicate pushdown, PostgreSQL's BitmapOr for
+    OR predicates). These tell the LLM what \emph{not to fight}---transforms
+    targeting these areas add overhead without benefit.
+\item \textbf{Gaps}: Optimizer blind spots with structured evidence. Each
+    gap specifies:
+    \begin{itemize}
+    \item \emph{What}: The optimizer limitation (e.g., ``cannot push
+        predicates from outer query into CTE definitions'')
+    \item \emph{Why}: The mechanism (e.g., ``CTEs are planned as
+        independent subplans; the optimizer does not trace data lineage
+        through CTE boundaries'')
+    \item \emph{Opportunity}: The rewrite strategy that exploits this gap
+    \item \emph{What worked}: Specific queries and speedups (e.g.,
+        ``Q88: 6.28$\times$ --- 8 time-bucket subqueries consolidated
+        into 1 scan'')
+    \item \emph{What didn't work}: Context-specific failures (e.g.,
+        ``Q25: 0.50$\times$ --- query was 31ms baseline, CTE overhead
+        exceeded filter savings'')
+    \item \emph{Field notes}: Operational heuristics for recognizing when
+        the gap is active (e.g., ``Count scans per base table in the
+        EXPLAIN. If a fact table appears 3+ times, this gap is active.'')
+    \end{itemize}
 \end{itemize}
 
-Constraints are loaded from a JSON directory and injected into every prompt.
-Examples of constraints:
-\begin{itemize}
-\item \texttt{or\_to\_union\_limit} (HIGH, DuckDB): Limit OR$\to$UNION to
-    $\leq$3 branches. \emph{Motivation}: Q13 and Q48 showed 0.23--0.41$\times$
-    regressions from 9-branch UNION rewrites that caused 9$\times$ fact
-    table scans.
-\item \texttt{or\_to\_union\_harmful} (CRITICAL, PostgreSQL): Do not apply
-    OR$\to$UNION on PostgreSQL. \emph{Motivation}: PostgreSQL's optimizer
-    already handles OR efficiently; the rewrite removes the optimizer's
-    ability to merge scans.
-\item \texttt{no\_materialize\_exists} (CRITICAL, all): Do not materialize
-    EXISTS subqueries into CTEs. \emph{Motivation}: Q16 showed 0.14$\times$
-    regression when a correlated EXISTS was hoisted into a materializing CTE,
-    breaking the short-circuit evaluation.
-\end{itemize}
+The framing is deliberately intelligence-oriented: ``here is what we have
+gathered from 88 queries at SF1--SF10; use it to guide your analysis but
+apply your own judgment---every query is different.'' This positions the LLM
+as an analyst interpreting field intelligence, not a compliance checker
+following rules.
 
-Currently, \sysname{} has 11 general constraints plus 5 PostgreSQL-specific
-and 7 DuckDB-specific constraints, for a total of 23.
+\paragraph{Layer~2: Correctness constraints (defensive).}
+Four non-negotiable validation gates that no rewrite may violate:
+\begin{enumerate}
+\item \textbf{Literal preservation}: All string, numeric, and date literals
+    must be copied exactly from the original query.
+\item \textbf{Semantic equivalence}: The rewritten query must return
+    identical rows, columns, and ordering.
+\item \textbf{Complete output}: All original SELECT columns must appear
+    (no drops, renames, or reorders).
+\item \textbf{CTE column completeness}: All downstream-referenced columns
+    must appear in CTE SELECT clauses.
+\end{enumerate}
+
+These are the \emph{only} hard constraints in the system. All performance
+guidance---what was previously encoded as 21 ``craft constraints'' (e.g.,
+``limit OR$\to$UNION to $\leq$3 branches'', ``do not materialize
+EXISTS subqueries'')---is now embedded as field notes within the relevant
+engine gaps, where the context of \emph{when} the advice applies is
+co-located with the advice itself.
+
+\subsection{Gap Profiles as Publishable Artifacts}
+
+Table~\ref{tab:gap_profiles} summarizes the gap profiles for both engines.
+
+\begin{table}[t]
+\centering
+\caption{Engine gap profiles: optimizer blind spots and their yield.}
+\label{tab:gap_profiles}
+\small
+\begin{tabular}{p{3.5cm}lrr}
+\toprule
+\textbf{Gap ID} & \textbf{Engine} & \textbf{Win \%} & \textbf{Best} \\
+\midrule
+Cross-CTE predicate blindness  & DuckDB & 35\% & 4.00$\times$ \\
+Redundant scan elimination      & DuckDB & 20\% & 6.28$\times$ \\
+Correlated subquery paralysis   & DuckDB & 15\% & 2.92$\times$ \\
+Cross-column OR decomposition   & DuckDB & 15\% & 6.28$\times$ \\
+LEFT JOIN filter rigidity       & DuckDB & 10\% & 2.97$\times$ \\
+UNION CTE self-join decomp.     & DuckDB &  5\% & 1.36$\times$ \\
+\midrule
+Comma-join weakness             & PG     & ---  & 3.32$\times$ \\
+Correlated subquery paralysis   & PG     & ---  & 4{,}428$\times$ \\
+Non-equi join input blindness   & PG     & ---  & 2.68$\times$ \\
+CTE materialization fence       & PG     & ---  & 1.95$\times$ \\
+Cross-CTE predicate blindness   & PG     & ---  & 3.32$\times$ \\
+\bottomrule
+\end{tabular}
+\\[2pt]
+{\footnotesize DuckDB win \% = fraction of all DuckDB wins attributable to
+this gap. PG percentages not yet computed (fewer validated queries).}
+\end{table}
+
+Three root causes---cross-CTE predicate blindness, redundant scan
+elimination, and correlated subquery paralysis---account for 70\% of all
+DuckDB wins. This concentration suggests that optimizer behavioral modeling
+is a high-leverage activity: characterizing a small number of blind spots
+enables the LLM to focus its search on the highest-value rewrites.
+
+\subsection{Two-Stage Gap Selection}
+\label{sec:gap_selection}
+
+The full gap profile (6 gaps for DuckDB, 5 for PostgreSQL) is injected
+into the \emph{analyst} prompt---a dedicated LLM call that precedes worker
+dispatch. The analyst performs \emph{dynamic gap matching}: for each gap
+in the profile, it checks whether the current query exhibits the gap by
+examining the EXPLAIN plan for characteristic signals:
+
+\begin{enumerate}
+\item \textbf{Gap profiling} (static, per-engine): Constructed once from
+    benchmark results. Encodes optimizer behavioral model as structured
+    JSON with strengths, gaps, evidence, and field notes.
+\item \textbf{Gap matching} (dynamic, per-query): The analyst LLM
+    compares the EXPLAIN plan against each gap's activation signals.
+    For example:
+    \begin{itemize}
+    \item Is a predicate applied \emph{after} a large scan rather than
+        inside it? $\to$ CROSS\_CTE\_PREDICATE\_BLINDNESS is active.
+    \item Does the same fact table appear in 3+ separate scan nodes?
+        $\to$ REDUNDANT\_SCAN\_ELIMINATION is active.
+    \item Does the EXPLAIN show a nested-loop with repeated subquery
+        execution? $\to$ CORRELATED\_SUBQUERY\_PARALYSIS is active.
+    \end{itemize}
+\end{enumerate}
+
+The analyst then assigns each of the 4 workers a strategy targeting a
+\emph{different} active gap, ensuring structural diversity. Workers receive
+only their targeted briefing---they never see the full profile. A simple
+3-table query with no correlated subqueries will not receive a worker
+assigned to decorrelation, because the analyst's gap matching determines
+that gap is inactive.
+
+This two-stage design---static gap profiling followed by dynamic
+per-query gap matching---is, to our knowledge, novel in LLM-based query
+optimization. Prior systems either inject all rules unconditionally
+(R-Bot, E$^3$-Rewrite) or use no engine-specific guidance at all.
+
+\paragraph{Worker 4: Exploration budget.}
+Workers~1--3 follow the proven patterns from the engine profile. Worker~4
+is designated as the \emph{exploration worker} with a different mandate:
+it may attempt techniques that the profile's ``what didn't work'' sections
+warn about, \emph{if} the structural context of the current query differs
+from the documented failure. It may also combine transforms from different
+gaps into compound strategies not previously tested. This balances
+exploitation of known patterns (Workers~1--3) with exploration of the
+strategy space (Worker~4). Exploration results are tagged separately and,
+when successful, become new field intelligence in the gap profile.
 
 \subsection{Bidirectional Learning}
 
@@ -668,6 +820,18 @@ A query is classified as:
 
 Semantic equivalence is verified by comparing row counts and MD5 checksums
 of full result sets between original and rewritten queries.
+
+\paragraph{Why not formal equivalence provers?}
+\label{sec:equivalence}
+Formal SQL equivalence verification is an active research area. We evaluated
+three recent provers: QED~\cite{qed2024} (Rust, VLDB 2024),
+VeriEQL~\cite{verieql2024} (Python, OOPSLA 2024), and
+SQLSolver~\cite{sqlsolver2024} (Java, SIGMOD 2024). None support Common
+Table Expressions (CTEs) or window functions---features used by every
+TPC-DS and DSB query in our evaluation. We therefore rely on differential
+testing (row count + MD5 checksum comparison on full result sets), which
+is sound for the tested database instance but does not guarantee
+equivalence over all possible inputs.
 
 \subsection{Main Results: DuckDB TPC-DS SF10}
 
@@ -1019,9 +1183,10 @@ swarm-of-reasoners addresses.
 \item \textbf{Gold example library}: 29~DuckDB examples, 5~PostgreSQL
     examples, and 74~DSB catalog rules, each with original and optimized SQL,
     verified speedup, and transform annotations.
-\item \textbf{Constraint library}: 23~constraints (11~general,
-    5~PostgreSQL-specific, 7~DuckDB-specific) in JSON format with severity,
-    description, and provenance.
+\item \textbf{Engine gap profiles}: Structured JSON profiles for DuckDB
+    (7~strengths, 6~gaps) and PostgreSQL (6~strengths, 5~gaps) with
+    field intelligence, evidence, and operational heuristics. Plus
+    4~correctness constraints as validation gates.
 \item \textbf{Benchmark scripts}: Automated runners for TPC-DS (DuckDB) and
     DSB (PostgreSQL) with configurable scale factors, worker counts, and
     iteration depth.
@@ -1042,10 +1207,13 @@ no model training, and no rule engine installation is needed.
 % ============================================================================
 
 We presented \sysname{}, a training-free SQL optimization system built on
-three core ideas: (1)~a logical-block DAG representation that provides LLMs
+four core ideas: (1)~a logical-block DAG representation that provides LLMs
 with structural context aligned to the granularity of rewrites;
 (2)~a swarm-of-reasoners architecture where specialized workers compete to
-produce the best validated rewrite; and (3)~query-type decomposition that
+produce the best validated rewrite; (3)~engine-aware gap profiling that
+characterizes optimizer blind spots as structured intelligence and uses
+two-stage gap selection (static profiling $\to$ dynamic per-query
+matching) to direct LLM search; and (4)~query-type decomposition that
 exposes different optimization surfaces from the same underlying query.
 With a single architecture and zero retraining, \sysname{} achieves a
 $\sim$37\% win rate on both DuckDB (TPC-DS, up to 6.28$\times$) and
@@ -1058,9 +1226,12 @@ achieves a 60.5\% average latency reduction without training, comparable
 to E$^3$-Rewrite's 56.4\% which requires RL fine-tuning.
 
 \paragraph{Future work.} (1)~DPO fine-tuning from $\sim$500 accumulated
-preference pairs (win/loss SQL pairs); (2)~EXPLAIN-plan-guided worker
-dispatch; (3)~Snowflake and additional engine support;
-(4)~formal equivalence verification via SMT solvers.
+preference pairs (win/loss SQL pairs); (2)~automated gap profile
+construction from EXPLAIN plan analysis (currently manual);
+(3)~Snowflake and additional engine gap profiles;
+(4)~formal equivalence verification via SMT solvers (current provers
+cannot handle CTEs and window functions, see
+Section~\ref{sec:equivalence}).
 
 
 % ============================================================================
@@ -1165,6 +1336,22 @@ T.~Breddin et~al.
 {OpenAI}.
 \newblock {Learning to reason with LLMs}.
 \newblock OpenAI Blog, September 2024.
+
+\bibitem{qed2024}
+Z.~Dong, B.~Mozafari, and S.~Sudarshan.
+\newblock {QED}: A fast and correct SQL equivalence verifier.
+\newblock {\em Proc.\ VLDB Endow.}, 2024.
+
+\bibitem{verieql2024}
+Y.~Zhou, J.~Li, and S.~Sudarshan.
+\newblock {VeriEQL}: Bounded equivalence verification of SQL queries with
+  deterministic guarantees.
+\newblock In {\em OOPSLA}, 2024.
+
+\bibitem{sqlsolver2024}
+X.~Wang, Z.~Dong, B.~Mozafari, and S.~Sudarshan.
+\newblock {SQLSolver}: A comprehensive SQL equivalence checker.
+\newblock In {\em SIGMOD}, 2024.
 
 \end{thebibliography}
 

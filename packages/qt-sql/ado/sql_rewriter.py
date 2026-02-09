@@ -80,6 +80,7 @@ class RewriteResult:
     transform: str = ""
     error: Optional[str] = None
     rewrite_set: Optional[RewriteSet] = None
+    set_local_commands: List[str] = field(default_factory=list)
 
 
 # =============================================================================
@@ -387,6 +388,57 @@ class SQLRewriter:
 
         return None
 
+    @staticmethod
+    def _split_set_local(sql: str) -> tuple[str, list[str]]:
+        """Split SET LOCAL commands from the beginning of extracted SQL.
+
+        Handles formats:
+          - SET LOCAL work_mem = '512MB'; SET LOCAL jit = 'off'; SELECT ...
+          - BEGIN; SET LOCAL ...; SELECT ...; COMMIT;
+
+        Returns: (clean_sql, [set_local_commands])
+        """
+        from .pg_tuning import PG_TUNABLE_PARAMS
+
+        if not sql or "SET LOCAL" not in sql.upper():
+            return sql, []
+
+        # Strip optional BEGIN/COMMIT wrapper
+        stripped = sql.strip()
+        if stripped.upper().startswith("BEGIN"):
+            stripped = re.sub(r'^BEGIN\s*;\s*', '', stripped, flags=re.IGNORECASE)
+        if stripped.rstrip().upper().endswith("COMMIT;") or stripped.rstrip().upper().endswith("COMMIT"):
+            stripped = re.sub(r'\s*;\s*COMMIT\s*;?\s*$', '', stripped, flags=re.IGNORECASE)
+
+        # Split by semicolons, preserving content
+        parts = [p.strip() for p in stripped.split(';') if p.strip()]
+
+        set_local_cmds: list[str] = []
+        sql_parts: list[str] = []
+
+        for part in parts:
+            if re.match(r'^SET\s+LOCAL\s+', part, re.IGNORECASE):
+                # Validate the param name against whitelist
+                param_match = re.match(
+                    r'^SET\s+LOCAL\s+(\w+)\s*=', part, re.IGNORECASE
+                )
+                if param_match and param_match.group(1).lower() in PG_TUNABLE_PARAMS:
+                    set_local_cmds.append(part)
+                # else: silently skip non-whitelisted params
+            elif part.upper().startswith("SET "):
+                # Non-LOCAL SET — skip (not safe)
+                pass
+            else:
+                sql_parts.append(part)
+
+        # Rejoin SQL parts with semicolons (multi-statement queries are rare but possible)
+        clean_sql = "; ".join(sql_parts)
+        if clean_sql and not clean_sql.rstrip().endswith(";"):
+            # Don't add trailing semicolon — let caller decide
+            pass
+
+        return clean_sql, set_local_cmds
+
     def apply_response(self, llm_response: str) -> RewriteResult:
         """Parse LLM response and apply the rewrite.
 
@@ -402,16 +454,20 @@ class SQLRewriter:
         """
         # Try raw SQL extraction first (full-query prompt format)
         raw_sql = self._extract_raw_sql(llm_response)
-        if raw_sql and self._validate_sql(raw_sql):
-            # Infer transform from diff
-            transforms = infer_transforms_from_sql_diff(
-                self.original_sql, raw_sql
-            )
-            return RewriteResult(
-                success=True,
-                optimized_sql=raw_sql,
-                transform=transforms[0] if transforms else "semantic_rewrite",
-            )
+        if raw_sql:
+            # Split SET LOCAL commands from SQL (PG workers may prefix them)
+            clean_sql, set_local_cmds = self._split_set_local(raw_sql)
+            if clean_sql and self._validate_sql(clean_sql):
+                # Infer transform from diff
+                transforms = infer_transforms_from_sql_diff(
+                    self.original_sql, clean_sql
+                )
+                return RewriteResult(
+                    success=True,
+                    optimized_sql=clean_sql,
+                    transform=transforms[0] if transforms else "semantic_rewrite",
+                    set_local_commands=set_local_cmds,
+                )
 
         # Fall back to JSON rewrite_sets format
         rewrite_sets = self.parser.parse(llm_response)

@@ -69,8 +69,9 @@ If omitted, the pipeline reads from `QT_LLM_PROVIDER` / `QT_LLM_MODEL` automatic
 | Engine     | Benchmark | Location                                          | Notes                          |
 |------------|-----------|---------------------------------------------------|--------------------------------|
 | DuckDB     | TPC-DS    | `/mnt/d/TPC-DS/tpcds_sf10.duckdb`                | SF10, 99 queries               |
-| PostgreSQL | DSB       | `postgres://jakc9:jakc9@127.0.0.1:5433/dsb_sf10` | SF10 (explains), SF5 (bench)   |
-| PostgreSQL | start     | `/usr/lib/postgresql/16/bin/pg_ctl -D /mnt/d/pgdata -l /mnt/d/pgdata/logfile start` | |
+| PostgreSQL | DSB (52)  | `postgres://jakc9:jakc9@127.0.0.1:5434/dsb_sf10` | PG 14.3, SF10, 52 queries      |
+| PostgreSQL | DSB (156) | `postgres://jakc9:jakc9@127.0.0.1:5434/dsb_sf10` | PG 14.3, SF10, 156 queries (3 streams) |
+| PostgreSQL | start     | `/mnt/d/pg14.3/bin/pg_ctl -D /home/jakc9/pgdata14 -l /home/jakc9/pgdata14/logfile start` | |
 
 ## Optimization Modes
 

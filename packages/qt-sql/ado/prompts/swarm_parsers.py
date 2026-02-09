@@ -195,6 +195,7 @@ class BriefingShared:
     bottleneck_diagnosis: str = ""
     active_constraints: str = ""
     regression_warnings: str = ""
+    resource_envelope: str = ""  # PG only: system resource bounds (input-only, not parsed from LLM)
 
 
 @dataclass

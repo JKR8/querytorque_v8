@@ -177,9 +177,11 @@ class WorkerResult:
     error_message: Optional[str] = None
     error_messages: List[str] = field(default_factory=list)
     error_category: Optional[str] = None
+    exploratory: bool = False  # True for Worker 4 (exploration budget)
+    set_local_config: Optional[Dict[str, Any]] = None  # PG tuning: {"params": {...}, "reasoning": "..."}
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "worker_id": self.worker_id,
             "strategy": self.strategy,
             "examples_used": self.examples_used,
@@ -192,6 +194,11 @@ class WorkerResult:
             "error_messages": self.error_messages,
             "error_category": self.error_category,
         }
+        if self.exploratory:
+            d["exploratory"] = True
+        if self.set_local_config:
+            d["set_local_config"] = self.set_local_config
+        return d
 
 
 @dataclass

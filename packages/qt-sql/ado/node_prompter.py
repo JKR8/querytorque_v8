@@ -58,12 +58,62 @@ def compute_depths(dag) -> Dict[str, int]:
     return depths
 
 
+def _load_engine_profile(dialect: str = "duckdb") -> Optional[Dict[str, Any]]:
+    """Load the engine profile JSON for the target dialect.
+
+    Engine profiles describe what the optimizer handles well (don't fight)
+    and where its gaps are (exploit these). This is the primary guidance
+    for transform selection.
+    """
+    if not CONSTRAINTS_DIR.exists():
+        return None
+
+    norm = dialect.lower()
+    if norm in ("postgres", "pg"):
+        norm = "postgresql"
+
+    profile_path = CONSTRAINTS_DIR / f"engine_profile_{norm}.json"
+    if not profile_path.exists():
+        logger.warning(
+            "Engine profile missing for dialect '%s' at %s",
+            norm,
+            profile_path,
+        )
+        return None
+
+    try:
+        data = json.loads(profile_path.read_text())
+        if data.get("profile_type") != "engine_profile":
+            logger.warning(
+                "Invalid engine profile type in %s: %r",
+                profile_path,
+                data.get("profile_type"),
+            )
+            return None
+
+        profile_engine = str(data.get("engine", "")).lower()
+        if profile_engine and profile_engine != norm:
+            logger.warning(
+                "Engine profile mismatch in %s: expected '%s', got '%s'",
+                profile_path,
+                norm,
+                profile_engine,
+            )
+            return None
+
+        return data
+    except Exception as e:
+        logger.warning(f"Failed to load engine profile {profile_path}: {e}")
+        return None
+
+
 def _load_constraint_files(dialect: str = "duckdb") -> List[Dict[str, Any]]:
     """Load constraint JSON files from CONSTRAINTS_DIR, filtered by engine.
 
     Each constraint may have an ``"engine"`` field (e.g. ``"postgresql"``).
     - If ``"engine"`` is absent, the constraint is universal (always loaded).
     - If ``"engine"`` is present, it's only loaded when ``dialect`` matches.
+    - Engine profile files (profile_type=engine_profile) are excluded.
 
     Returns list of constraint dicts sorted by severity (CRITICAL first,
     then HIGH, then MEDIUM).
@@ -82,6 +132,9 @@ def _load_constraint_files(dialect: str = "duckdb") -> List[Dict[str, Any]]:
     for path in sorted(CONSTRAINTS_DIR.glob("*.json")):
         try:
             data = json.loads(path.read_text())
+            # Skip engine profile files — they're loaded separately
+            if data.get("profile_type") == "engine_profile":
+                continue
             if "id" not in data or "prompt_instruction" not in data:
                 continue
             engine = data.get("engine")

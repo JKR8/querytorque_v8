@@ -30,6 +30,7 @@ def build_worker_v2_prompt(
     output_columns: List[str],
     dialect: str = "duckdb",
     engine_version: Optional[str] = None,
+    resource_envelope: Optional[str] = None,
 ) -> str:
     """Build a V2 worker prompt from analyst briefing sections.
 
@@ -44,6 +45,7 @@ def build_worker_v2_prompt(
         output_columns: Expected output columns for completeness contract
         dialect: SQL dialect
         engine_version: Engine version string (e.g., '1.4.3')
+        resource_envelope: System resource envelope text for PG workers (may be None)
 
     Returns:
         Complete worker prompt string
@@ -133,6 +135,10 @@ def build_worker_v2_prompt(
         "```"
     )
 
+    # ── [7b] PER-REWRITE CONFIG (PG only) ─────────────────────────────────
+    if dialect in ("postgres", "postgresql") and resource_envelope:
+        sections.append(_section_set_local_config(resource_envelope))
+
     # ── [8] COLUMN COMPLETENESS CONTRACT ─────────────────────────────────
     sections.append(_section_output_format(output_columns))
 
@@ -201,6 +207,58 @@ def _section_examples(examples: List[Dict[str, Any]]) -> str:
                 lines.append("")
                 lines.append("**AFTER (fast):**")
                 lines.append(f"```sql\n{out_sql}\n```")
+
+    return "\n".join(lines)
+
+
+def _section_set_local_config(resource_envelope: str) -> str:
+    """Build the per-rewrite SET LOCAL configuration section for PG workers."""
+    from ..pg_tuning import PG_TUNABLE_PARAMS
+
+    lines = [
+        "## Per-Rewrite Configuration (SET LOCAL)",
+        "",
+        "You have two optimization levers: SQL rewrite AND per-query configuration.",
+        "After writing your rewrite, analyze its execution profile and emit SET LOCAL",
+        "commands that fix planner-level bottlenecks specific to YOUR rewrite.",
+        "",
+        resource_envelope,
+        "",
+        "### Tunable Parameters (whitelist — only these are allowed)",
+        "",
+    ]
+
+    for param, (ptype, pmin, pmax, desc) in sorted(PG_TUNABLE_PARAMS.items()):
+        if ptype == "bool":
+            range_str = "on | off"
+        elif ptype == "bytes":
+            range_str = f"{pmin}MB–{pmax}MB"
+        else:
+            range_str = f"{pmin}–{pmax}"
+        lines.append(f"- **{param}** ({range_str}): {desc}")
+
+    lines.extend([
+        "",
+        "### Rules",
+        "- Every SET LOCAL MUST cite a specific EXPLAIN node your rewrite creates/changes",
+        "- work_mem is PER-OPERATION: count hash/sort ops in your rewrite before sizing",
+        "- random_page_cost: ONLY change if your rewrite creates index-favorable access patterns",
+        "- Empty is valid: if your rewrite has no planner bottleneck, emit no SET LOCAL",
+        "- Stay within the resource envelope bounds above",
+        "",
+        "### Output Format",
+        "If you recommend SET LOCAL, prefix your SQL block with the commands:",
+        "",
+        "```sql",
+        "SET LOCAL work_mem = '512MB';",
+        "SET LOCAL jit = 'off';",
+        "-- rewritten query follows",
+        "WITH ...",
+        "SELECT ...",
+        "```",
+        "",
+        "If no config changes help, just output the rewritten SQL directly.",
+    ])
 
     return "\n".join(lines)
 

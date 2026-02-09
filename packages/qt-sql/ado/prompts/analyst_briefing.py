@@ -1,10 +1,14 @@
 """V2 analyst prompt builder — analyst as interpreter, not router.
 
-The V2 analyst produces a structured briefing with 7 sections:
+Two-layer architecture:
+  Layer 1: Engine gap profiles (offensive hunting guide — what optimizer gaps to exploit)
+  Layer 2: Correctness constraints (defensive validation gates — 4 non-negotiable rules)
+
+The V2 analyst produces a structured briefing:
   Shared (all workers):
     1. SEMANTIC_CONTRACT — business intent, invariants, aggregation traps
     2. BOTTLENECK_DIAGNOSIS — dominant cost + mechanism + cardinality flow
-    3. ACTIVE_CONSTRAINTS — 3-6 of 25, each with reason for THIS query
+    3. ACTIVE_CONSTRAINTS — correctness gates + matched engine gaps
     4. REGRESSION_WARNINGS — causal rules, not just "this happened"
   Per-worker:
     5. TARGET_DAG + NODE_CONTRACTS — CTE blueprint + column contracts
@@ -222,6 +226,179 @@ def format_duckdb_explain_tree(plan_text: str) -> str:
     return "\n".join(lines)
 
 
+def _render_pg_node(
+    node: dict,
+    depth: int,
+    lines: list[str],
+    max_depth: int = 30,
+) -> None:
+    """Recursively render a PG EXPLAIN JSON node as indented text."""
+    if depth > max_depth:
+        return
+
+    ntype = node.get("Node Type", "???")
+    rows = node.get("Actual Rows", 0) or 0
+    loops = node.get("Actual Loops", 1) or 1
+    time_ms = node.get("Actual Total Time", 0) or 0
+    indent = "  " * depth
+
+    # Build the main line
+    parts = [f"{indent}-> {ntype}"]
+
+    # Relation/index name
+    rel = node.get("Relation Name") or node.get("Index Name")
+    if rel:
+        parts.append(f"on {rel}")
+    alias = node.get("Alias")
+    if alias and alias != rel:
+        parts.append(f"{alias}")
+
+    # Join type
+    jtype = node.get("Join Type")
+    if jtype:
+        parts[0] = f"{indent}-> {ntype} {jtype}"
+
+    # CTE name
+    cte = node.get("CTE Name")
+    if cte:
+        parts.append(f"(CTE: {cte})")
+
+    line = " ".join(parts)
+
+    # Stats
+    stats = f"(rows={_fmt_count(rows)} loops={loops} time={time_ms:.1f}ms)"
+    lines.append(f"{line}  {stats}")
+
+    # Important detail lines
+    # Sort info
+    sort_method = node.get("Sort Method")
+    if sort_method:
+        space = node.get("Sort Space Used", 0)
+        stype = node.get("Sort Space Type", "")
+        lines.append(f"{indent}   Sort Method: {sort_method}  Space: {space}kB ({stype})")
+
+    # Hash info
+    batches = node.get("Hash Batches")
+    if batches and batches > 1:
+        mem = node.get("Peak Memory Usage", 0)
+        lines.append(f"{indent}   Batches: {batches}  Memory: {mem}kB")
+
+    # Workers
+    w_planned = node.get("Workers Planned")
+    w_launched = node.get("Workers Launched")
+    if w_planned is not None:
+        lines.append(f"{indent}   Workers: {w_launched}/{w_planned} launched")
+
+    # Filter/conditions
+    for key in ("Filter", "Index Cond", "Hash Cond", "Merge Cond", "Join Filter",
+                "Recheck Cond", "One-Time Filter"):
+        val = node.get(key)
+        if val:
+            vstr = str(val)
+            if len(vstr) > 100:
+                vstr = vstr[:97] + "..."
+            lines.append(f"{indent}   {key}: {vstr}")
+
+    # Rows removed by filter
+    removed = node.get("Rows Removed by Filter")
+    if removed and removed > 0:
+        lines.append(f"{indent}   Rows Removed by Filter: {_fmt_count(removed)}")
+
+    # I/O stats (compact)
+    shared_read = node.get("Shared Read Blocks", 0)
+    shared_hit = node.get("Shared Hit Blocks", 0)
+    temp_read = node.get("Temp Read Blocks", 0)
+    temp_write = node.get("Temp Written Blocks", 0)
+    if shared_read > 1000 or temp_read > 0:
+        io_parts = []
+        if shared_hit:
+            io_parts.append(f"hit={_fmt_count(shared_hit)}")
+        if shared_read:
+            io_parts.append(f"read={_fmt_count(shared_read)}")
+        if temp_read:
+            io_parts.append(f"temp_r={_fmt_count(temp_read)}")
+        if temp_write:
+            io_parts.append(f"temp_w={_fmt_count(temp_write)}")
+        lines.append(f"{indent}   Buffers: {' '.join(io_parts)}")
+
+    # Subplan name (for CTEs)
+    subplan = node.get("Subplan Name")
+    if subplan:
+        lines[len(lines) - len(lines)] = lines[len(lines) - len(lines)]  # no-op
+        # Already shown via CTE name above
+
+    # Recurse into children
+    for child in node.get("Plans", []):
+        _render_pg_node(child, depth + 1, lines, max_depth)
+
+
+def format_pg_explain_tree(plan_json: Any) -> str:
+    """Convert PG EXPLAIN (FORMAT JSON) plan to a readable ASCII tree.
+
+    Args:
+        plan_json: The plan_json field from cached explains (list or dict).
+            Standard PG JSON format: [{"Plan": {...}, "Planning Time": ..., ...}]
+
+    Returns:
+        Readable ASCII tree string showing operators, timing, and key details.
+    """
+    if not plan_json:
+        return ""
+
+    # Handle both list wrapper and bare dict
+    if isinstance(plan_json, list):
+        if not plan_json:
+            return ""
+        top = plan_json[0]
+    elif isinstance(plan_json, dict):
+        top = plan_json
+    else:
+        return str(plan_json)
+
+    root = top.get("Plan")
+    if not root:
+        return str(plan_json)
+
+    planning_ms = top.get("Planning Time", 0)
+    exec_ms = top.get("Execution Time", 0)
+
+    lines: list[str] = []
+
+    # Header with total times
+    total_ms = root.get("Actual Total Time", 0)
+    if total_ms:
+        lines.append(f"Total execution time: {total_ms:.1f}ms")
+    if planning_ms:
+        lines.append(f"Planning time: {planning_ms:.1f}ms")
+    if lines:
+        lines.append("")
+
+    # Render the tree
+    _render_pg_node(root, depth=0, lines=lines)
+
+    # JIT info
+    jit = top.get("JIT") or root.get("JIT")
+    if jit:
+        lines.append("")
+        funcs = jit.get("Functions", 0)
+        gen_ms = jit.get("Generation", {}).get("Timing", 0)
+        opt_ms = jit.get("Optimization", {}).get("Timing", 0)
+        emit_ms = jit.get("Emission", {}).get("Timing", 0)
+        total_jit = gen_ms + opt_ms + emit_ms
+        lines.append(f"JIT: {funcs} functions, total={total_jit:.1f}ms "
+                     f"(gen={gen_ms:.1f} opt={opt_ms:.1f} emit={emit_ms:.1f})")
+
+    # Triggers
+    triggers = top.get("Triggers", [])
+    if triggers:
+        lines.append("")
+        for t in triggers:
+            lines.append(f"Trigger: {t.get('Trigger Name', '?')} "
+                         f"calls={t.get('Calls', 0)} time={t.get('Time', 0):.1f}ms")
+
+    return "\n".join(lines)
+
+
 def _strip_template_comments(sql: str) -> str:
     """Strip TPC-DS/DSB template comments from SQL."""
     import re
@@ -253,15 +430,29 @@ def _format_constraint_for_analyst(c: Dict[str, Any]) -> str:
     """Format a single constraint for the analyst's full view."""
     cid = c.get("id", "?")
     severity = c.get("severity", "MEDIUM")
+    overridable = c.get("overridable", False)
     instruction = c.get("prompt_instruction", c.get("description", ""))
     failures = c.get("observed_failures", [])
+    successes = c.get("observed_successes", [])
+    override_conditions = c.get("override_conditions", [])
 
-    parts = [f"**[{severity}] {cid}**: {instruction}"]
+    tag = "[overridable] " if overridable else ""
+    parts = [f"**[{severity}] {tag}{cid}**: {instruction}"]
     if failures:
         for f in failures[:2]:
-            qid = f.get("query_id", "?")
-            speedup = f.get("speedup", "?")
-            parts.append(f"  - Observed: {qid} regressed to {speedup}x")
+            qid = f.get("query", f.get("query_id", "?"))
+            reg = f.get("regression", f.get("speedup", "?"))
+            parts.append(f"  - Failure: {qid} regressed to {reg}")
+    if successes:
+        for s in successes[:2]:
+            qid = s.get("query", "?")
+            spd = str(s.get("speedup", "?")).rstrip("x")
+            ctx = s.get("context", "")
+            parts.append(f"  - Success: {qid} achieved {spd}x — {ctx}")
+    if overridable and override_conditions:
+        parts.append("  - Override conditions (Worker 4 exploration):")
+        for oc in override_conditions:
+            parts.append(f"    * {oc}")
     return "\n".join(parts)
 
 
@@ -434,6 +625,8 @@ def build_analyst_briefing_prompt(
     dialect_version: Optional[str] = None,
     strategy_leaderboard: Optional[Dict[str, Any]] = None,
     query_archetype: Optional[str] = None,
+    engine_profile: Optional[Dict[str, Any]] = None,
+    resource_envelope: Optional[str] = None,
 ) -> str:
     """Build the V2 analyst briefing prompt.
 
@@ -456,6 +649,8 @@ def build_analyst_briefing_prompt(
         dialect_version: Engine version string (e.g., '1.4.3')
         strategy_leaderboard: Pre-built leaderboard JSON (from build_strategy_leaderboard.py)
         query_archetype: Archetype classification for this query (e.g., 'scan_consolidation')
+        engine_profile: Engine profile JSON with optimizer strengths/gaps (may be None)
+        resource_envelope: System resource envelope text for PG workers (may be None)
 
     Returns:
         Complete analyst prompt string (~3000-5000 tokens input)
@@ -639,28 +834,101 @@ def build_analyst_briefing_prompt(
             lines.append(_format_regression_for_analyst(reg))
             lines.append("")
 
-    # ── 10. All constraints (full) ────────────────────────────────────────
-    if constraints:
-        lines.append(f"## All Constraints ({len(constraints)} total)")
+    # ── 10. Engine Profile (field intelligence briefing) ─────────────────
+    if engine_profile:
+        briefing_note = engine_profile.get("briefing_note", "")
+        lines.append("## Engine Profile: Field Intelligence Briefing")
         lines.append("")
-        lines.append("### Constraint Quick-Filter (check prerequisites first)")
+        if briefing_note:
+            lines.append(f"*{briefing_note}*")
+            lines.append("")
+
+        # Strengths (things the optimizer already does — don't fight these)
+        strengths = engine_profile.get("strengths", [])
+        if strengths:
+            lines.append("### Optimizer Strengths (DO NOT fight these)")
+            lines.append("")
+            for s in strengths:
+                sid = s.get("id", "")
+                summary = s.get("summary", "")
+                field_note = s.get("field_note", "")
+                lines.append(f"- **{sid}**: {summary}")
+                if field_note:
+                    lines.append(f"  *Field note:* {field_note}")
+            lines.append("")
+
+        # Gaps (opportunities — the hunting guide)
+        gaps = engine_profile.get("gaps", [])
+        if gaps:
+            lines.append("### Optimizer Gaps (hunt for these)")
+            lines.append("")
+            for g in gaps:
+                gid = g.get("id", "")
+                priority = g.get("priority", "")
+                what = g.get("what", "")
+                why = g.get("why", "")
+                opportunity = g.get("opportunity", "")
+
+                lines.append(f"**{gid}** [{priority}]")
+                lines.append(f"  What: {what}")
+                if why:
+                    lines.append(f"  Why: {why}")
+                if opportunity:
+                    lines.append(f"  Opportunity: {opportunity}")
+
+                # What worked (compact)
+                what_worked = g.get("what_worked", [])
+                if what_worked:
+                    lines.append("  What worked:")
+                    for w in what_worked[:4]:
+                        lines.append(f"    + {w}")
+
+                # What didn't work (compact)
+                what_didnt = g.get("what_didnt_work", [])
+                if what_didnt:
+                    lines.append("  What didn't work:")
+                    for w in what_didnt[:3]:
+                        lines.append(f"    - {w}")
+
+                # Field notes (the real intel)
+                field_notes = g.get("field_notes", [])
+                if field_notes:
+                    lines.append("  Field notes:")
+                    for fn in field_notes:
+                        lines.append(f"    * {fn}")
+                lines.append("")
+
+        # Scale sensitivity warning
+        scale_warn = engine_profile.get("scale_sensitivity_warning")
+        if scale_warn:
+            lines.append(f"**SCALE WARNING**: {scale_warn}")
+            lines.append("")
+
+    # ── 10a. Resource Envelope (PostgreSQL only — passed through to workers) ──
+    if dialect in ("postgresql", "postgres") and resource_envelope:
+        lines.append("## System Resource Envelope (PostgreSQL)")
         lines.append("")
         lines.append(
-            "- EXISTS/NOT EXISTS in query? -> Check KEEP_EXISTS_AS_EXISTS, NO_MATERIALIZE_EXISTS\n"
-            "- OR conditions in WHERE? -> Check OR_TO_UNION_GUARD, OR_TO_UNION_SELF_JOIN, DIMENSION_CTE_SAME_COLUMN_OR\n"
-            "- UNION ALL CTE being split? -> Check UNION_CTE_SPLIT_MUST_REPLACE, REMOVE_REPLACED_CTES\n"
-            "- Self-join (same table/CTE aliased 2+ times)? -> Check OR_TO_UNION_SELF_JOIN\n"
-            "- Creating new CTEs? -> Check NO_UNFILTERED_DIMENSION_CTE, CTE_COLUMN_COMPLETENESS, REMOVE_REPLACED_CTES, EARLY_FILTER_CTE_BEFORE_CHAIN\n"
-            "- Decorrelating subqueries? -> Check DECORRELATE_MUST_FILTER_FIRST\n"
-            "- Fast baseline (<100ms)? -> Check MIN_BASELINE_THRESHOLD\n"
-            "- Multiple dimension CTEs? -> Check NO_CROSS_JOIN_DIMENSIONS\n"
-            "- Fact table CTE chains? -> Check PREFETCH_MULTI_FACT_CHAIN\n"
-            "- Single-pass CASE branches? -> Check SINGLE_PASS_AGGREGATION_LIMIT\n"
-            "\nIf the prerequisite doesn't exist in the query or your proposed "
-            "transforms, skip that constraint entirely."
+            "Workers will use this to size SET LOCAL parameters for their rewrites. "
+            "Included here for your awareness — you do NOT output config. "
+            "Each worker decides its own per-rewrite config."
         )
         lines.append("")
-        for c in constraints:
+        lines.append(resource_envelope)
+        lines.append("")
+
+    # ── 10b. Correctness Constraints (non-negotiable validation gates) ────
+    correctness_constraints = [
+        c for c in constraints
+        if c.get("id") in (
+            "LITERAL_PRESERVATION", "SEMANTIC_EQUIVALENCE",
+            "COMPLETE_OUTPUT", "CTE_COLUMN_COMPLETENESS",
+        )
+    ]
+    if correctness_constraints:
+        lines.append(f"## Correctness Constraints ({len(correctness_constraints)} — NEVER violate)")
+        lines.append("")
+        for c in correctness_constraints:
             lines.append(_format_constraint_for_analyst(c))
             lines.append("")
 
@@ -697,7 +965,19 @@ def build_analyst_briefing_prompt(
     )
     lines.append("")
     lines.append(
-        "3. **AGGREGATION TRAP CHECK**: For every aggregate function in the query, "
+        "3. **GAP MATCHING**: Compare the EXPLAIN analysis to the Engine Profile "
+        "gaps above. For each gap:\n"
+        "   - Does this query exhibit the gap? (e.g., is a predicate NOT pushed "
+        "into a CTE? Is the same fact table scanned multiple times?)\n"
+        "   - Check the 'when_to_exploit' conditions — does this query meet them?\n"
+        "   - Check the 'when_NOT_to_exploit' conditions — any disqualifiers?\n"
+        "   - Also verify: is the optimizer ALREADY handling this well? "
+        "(Check the 'optimizer_handles_well' list — if the engine already does it, "
+        "your transform adds overhead, not value.)"
+    )
+    lines.append("")
+    lines.append(
+        "4. **AGGREGATION TRAP CHECK**: For every aggregate function in the query, "
         "verify: does my proposed restructuring change which rows participate "
         "in each group? STDDEV_SAMP, VARIANCE, PERCENTILE_CONT, CORR are "
         "grouping-sensitive. SUM, COUNT, MIN, MAX are grouping-insensitive "
@@ -706,18 +986,10 @@ def build_analyst_briefing_prompt(
     )
     lines.append("")
     lines.append(
-        "4. **TRANSFORM SELECTION**: From the Transform Catalog below, identify ALL "
-        "transforms that are structurally applicable (prerequisite exists "
-        "in the query). Rank by expected value (rows affected x historical "
-        "speedup). Select 4 that are structurally diverse."
-    )
-    lines.append("")
-    lines.append(
-        "5. **CONSTRAINT FILTERING**: For each constraint in the full list, check:\n"
-        "   - Does this query have the structure the constraint warns about? "
-        "(EXISTS? OR conditions? Self-joins? UNION CTEs being split?)\n"
-        "   - Does any proposed transform create the anti-pattern?\n"
-        "   Select 3-6 that apply. Discard the rest."
+        "5. **TRANSFORM SELECTION**: From the matched engine gaps, select transforms "
+        "that exploit the specific gaps present in THIS query. Rank by expected value "
+        "(rows affected × historical speedup from evidence). Select 4 that are "
+        "structurally diverse — each attacking a different gap or bottleneck."
     )
     lines.append("")
     lines.append(
@@ -748,10 +1020,10 @@ def build_analyst_briefing_prompt(
     lines.append("Whether DAG cost percentages are misleading.]")
     lines.append("")
     lines.append("ACTIVE_CONSTRAINTS:")
-    lines.append("- [CONSTRAINT_ID]: [Why it applies to this query, 1 line]")
-    lines.append("- [CONSTRAINT_ID]: [Why it applies]")
-    lines.append("(Select 3-6 constraints from the full list above. Only include")
-    lines.append("constraints that are RELEVANT to this specific query.)")
+    lines.append("- [CORRECTNESS_CONSTRAINT_ID]: [Why it applies to this query, 1 line]")
+    lines.append("- [ENGINE_GAP_ID]: [Evidence from EXPLAIN that this gap is active]")
+    lines.append("(List all 4 correctness constraints + the 1-3 engine gaps that")
+    lines.append("are active for THIS query based on your EXPLAIN analysis.)")
     lines.append("")
     lines.append("REGRESSION_WARNINGS:")
     lines.append("1. [Pattern name] ([observed regression]):")
@@ -759,6 +1031,7 @@ def build_analyst_briefing_prompt(
     lines.append("   RULE: [Actionable avoidance rule for THIS query]")
     lines.append("(If no regression warnings are relevant, write 'None applicable.')")
     lines.append("")
+
     lines.append("=== WORKER 1 BRIEFING ===")
     lines.append("")
     lines.append("STRATEGY: [strategy_name]")
@@ -790,8 +1063,11 @@ def build_analyst_briefing_prompt(
     lines.append("=== WORKER 3 BRIEFING ===")
     lines.append("[Same structure as Worker 1, DIFFERENT strategy]")
     lines.append("")
-    lines.append("=== WORKER 4 BRIEFING ===")
+    lines.append("=== WORKER 4 BRIEFING === (EXPLORATION WORKER)")
     lines.append("[Same structure as Worker 1, DIFFERENT strategy]")
+    lines.append("CONSTRAINT_OVERRIDE: [CONSTRAINT_ID or 'None']")
+    lines.append("OVERRIDE_REASONING: [Why this query's structure differs from the observed failure, or 'N/A']")
+    lines.append("EXPLORATION_TYPE: [constraint_relaxation | compound_strategy | novel_combination]")
     lines.append("```")
     lines.append("")
 
@@ -943,11 +1219,13 @@ def build_analyst_briefing_prompt(
         "nested correlation inside a CTE. Assess per-assignment."
     )
     lines.append(
-        "5. **COMPOSITION IS ALLOWED**: A worker's strategy can combine 2 "
-        "transforms from different categories (e.g., star_join_prefetch + "
-        "scan_consolidation_pivot). The TARGET_DAG should reflect the combined "
+        "5. **COMPOSITION IS ALLOWED AND ENCOURAGED**: A worker's strategy can "
+        "combine 2-3 transforms from different categories (e.g., "
+        "star_join_prefetch + scan_consolidation_pivot, or date_cte_isolate + "
+        "early_filter + decorrelate). The TARGET_DAG should reflect the combined "
         "structure. Do not assign two workers the same composition — each must "
-        "include at least one unique transform."
+        "include at least one unique transform. Compound strategies are often "
+        "the source of the biggest wins."
     )
     lines.append(
         "6. **MINIMAL-CHANGE BASELINE**: If the EXPLAIN shows the optimizer "
@@ -970,6 +1248,41 @@ def build_analyst_briefing_prompt(
         "The worker's job becomes pure SQL generation within your defined structure. "
         "For NODE_CONTRACTS: Be exhaustive with OUTPUT columns — missing columns "
         "cause semantic breaks."
+    )
+    lines.append("")
+
+    # ── 14b. Exploration Budget ────────────────────────────────────────────
+    lines.append("## Exploration Budget (Worker 4)")
+    lines.append("")
+    lines.append(
+        "Workers 1-3 follow the engine profile's proven patterns. "
+        "**Worker 4 is the EXPLORATION worker** with a different mandate:"
+    )
+    lines.append("")
+    lines.append(
+        "Worker 4 MAY:\n"
+        "  (a) Try a technique that the engine profile's 'what_didnt_work' warns "
+        "about, IF the structural context of THIS query differs from the observed "
+        "failure — explain why in HAZARD_FLAGS\n"
+        "  (b) Combine 2-3 transforms from different engine gaps into a compound "
+        "strategy that hasn't been tested before\n"
+        "  (c) Attempt a novel technique not listed in the engine profile, if "
+        "the EXPLAIN plan reveals an optimizer blind spot not yet documented"
+    )
+    lines.append("")
+    lines.append(
+        "Worker 4 may NEVER violate correctness constraints "
+        "(LITERAL_PRESERVATION, SEMANTIC_EQUIVALENCE, COMPLETE_OUTPUT, "
+        "CTE_COLUMN_COMPLETENESS)."
+    )
+    lines.append("")
+    lines.append(
+        "The exploration worker's output is tagged EXPLORATORY and tracked "
+        "separately. Past failures documented in the engine profile are "
+        "context-specific — they happened on specific queries with specific "
+        "structures. Worker 4's job is to test whether those failures "
+        "generalize or not. If Worker 4 discovers a new win, it becomes "
+        "field intelligence for the engine profile."
     )
     lines.append("")
 

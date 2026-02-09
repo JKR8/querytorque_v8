@@ -27,6 +27,11 @@ class Candidate:
     transforms: list[str]
     style: Optional[str] = None
     error: Optional[str] = None
+    set_local_commands: list[str] = None
+
+    def __post_init__(self):
+        if self.set_local_commands is None:
+            self.set_local_commands = []
 
 
 class CandidateGenerator:
@@ -175,6 +180,7 @@ class CandidateGenerator:
                 examples_used=examples_used,
                 transforms=transforms,
                 error=result.error if not result.success else None,
+                set_local_commands=result.set_local_commands,
             )
 
         except Exception as e:

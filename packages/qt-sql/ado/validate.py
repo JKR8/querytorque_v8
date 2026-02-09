@@ -555,6 +555,84 @@ class Validator:
             error_category=error_category,
         )
 
+    def validate_with_config(
+        self,
+        baseline: OriginalBaseline,
+        sql: str,
+        config_commands: list[str],
+        worker_id: int,
+    ) -> ValidationResult:
+        """Validate SQL executed with SET LOCAL config against a baseline.
+
+        Uses the 3-run pattern (warmup + 2 measures) but wraps each
+        execution in execute_with_config() for SET LOCAL support.
+
+        Only works for PostgreSQL connections.
+
+        Args:
+            baseline: Pre-computed original baseline (no config).
+            sql: SQL query to execute (original or rewritten).
+            config_commands: List of SET LOCAL statements.
+            worker_id: Worker ID for tracking.
+
+        Returns:
+            ValidationResult with speedup computed against the baseline.
+        """
+        validator = self._get_validator()
+        if validator is None or not isinstance(validator, PostgresValidatorWrapper):
+            error_msg = "Config validation requires PostgreSQL"
+            return ValidationResult(
+                worker_id=worker_id,
+                status=ValidationStatus.ERROR,
+                speedup=0.0,
+                error=error_msg,
+                optimized_sql=sql,
+                errors=[error_msg],
+                error_category="execution",
+            )
+
+        try:
+            return validator.validate_with_config(
+                baseline, sql, config_commands, worker_id
+            )
+        except Exception as e:
+            error_str = str(e)
+            logger.warning(f"Config validation failed for worker {worker_id}: {error_str}")
+            return ValidationResult(
+                worker_id=worker_id,
+                status=ValidationStatus.ERROR,
+                speedup=0.0,
+                error=error_str,
+                optimized_sql=sql,
+                errors=[error_str],
+                error_category=categorize_error(error_str),
+            )
+
+    def benchmark_three_variants(
+        self,
+        original_sql: str,
+        rewrite_sql: str,
+        config_commands: list[str],
+    ) -> dict:
+        """Interleaved 3-variant benchmark: original, rewrite, rewrite+config.
+
+        Uses 1-2-3-1-2-3 pattern: first round warmup, second round measure.
+        All variants share the same cache/thermal state via interleaving.
+
+        Only works for PostgreSQL.
+
+        Returns dict with keys:
+            original_ms, rewrite_ms, config_ms,
+            rewrite_speedup, config_speedup, config_additive,
+            rewrite_rows, config_rows, rows_match, best_variant
+        """
+        validator = self._get_validator()
+        if validator is None or not isinstance(validator, PostgresValidatorWrapper):
+            return {"error": "Requires PostgreSQL"}
+        return validator.benchmark_three_variants(
+            original_sql, rewrite_sql, config_commands
+        )
+
     def close(self) -> None:
         """Close the validator and release resources."""
         if self._validator is not None:
@@ -689,6 +767,168 @@ class PostgresValidatorWrapper:
                 values_match=False,
                 errors=[str(e)],
             )
+
+    def validate_with_config(
+        self,
+        baseline: OriginalBaseline,
+        sql: str,
+        config_commands: list[str],
+        worker_id: int,
+    ) -> ValidationResult:
+        """Benchmark SQL + SET LOCAL config against a pre-computed baseline.
+
+        Uses 3-run pattern: warmup + 2 measures, each wrapped in
+        execute_with_config() so SET LOCAL applies per execution.
+
+        Args:
+            baseline: Pre-computed original baseline (no config).
+            sql: SQL query to execute.
+            config_commands: List of SET LOCAL statements.
+            worker_id: Worker ID for tracking.
+
+        Returns:
+            ValidationResult with speedup computed against the baseline.
+        """
+        errors = []
+        is_timeout_baseline = baseline.rows is None and baseline.row_count == 0
+        executor = self._get_executor()
+        cand_timeout_ms = 300_000
+
+        try:
+            # Warmup with config
+            executor.execute_with_config(sql, config_commands, timeout_ms=cand_timeout_ms)
+
+            # Measure 1 (capture rows)
+            start = time.perf_counter()
+            cand_rows = executor.execute_with_config(
+                sql, config_commands, timeout_ms=cand_timeout_ms
+            )
+            t1 = (time.perf_counter() - start) * 1000
+
+            # Measure 2
+            start = time.perf_counter()
+            executor.execute_with_config(sql, config_commands, timeout_ms=cand_timeout_ms)
+            t2 = (time.perf_counter() - start) * 1000
+
+            cand_time = (t1 + t2) / 2
+        except Exception as e:
+            error_msg = f"Config execution failed: {e}"
+            try:
+                executor.rollback()
+            except Exception:
+                pass
+            return ValidationResult(
+                worker_id=worker_id,
+                status=ValidationStatus.ERROR,
+                speedup=0.0,
+                error=error_msg,
+                optimized_sql=sql,
+                errors=[error_msg],
+                error_category=categorize_error(error_msg),
+            )
+
+        # Compare row counts
+        cand_count = len(cand_rows)
+
+        if is_timeout_baseline:
+            ado_status = ValidationStatus.PASS
+            logger.info(
+                f"Timeout baseline + config: candidate ran in {cand_time:.1f}ms "
+                f"({cand_count} rows)"
+            )
+        elif cand_count != baseline.row_count:
+            errors.append(
+                f"Row count mismatch: original={baseline.row_count}, "
+                f"config={cand_count}"
+            )
+            ado_status = ValidationStatus.FAIL
+        else:
+            ado_status = ValidationStatus.PASS
+
+        # Compute speedup vs baseline (no config)
+        speedup = baseline.measured_time_ms / cand_time if cand_time > 0 else 1.0
+
+        error_msg = " | ".join(errors) if errors else None
+        error_category = categorize_error(errors[0]) if errors else None
+
+        return ValidationResult(
+            worker_id=worker_id,
+            status=ado_status,
+            speedup=speedup,
+            error=error_msg,
+            optimized_sql=sql,
+            errors=errors,
+            error_category=error_category,
+        )
+
+    def benchmark_three_variants(
+        self,
+        original_sql: str,
+        rewrite_sql: str,
+        config_commands: list[str],
+    ) -> dict:
+        """Interleaved 3-variant benchmark: original, rewrite, rewrite+config.
+
+        Pattern: 1-2-3-1-2-3 (round 1 = warmup, round 2 = measure).
+        Interleaving controls for cache warming and system drift.
+
+        Returns dict with timing, speedups, and best variant.
+        """
+        executor = self._get_executor()
+        timeout_ms = 300_000
+
+        try:
+            # Round 1: warmup (all three variants)
+            executor.execute(original_sql, timeout_ms=timeout_ms)
+            rows_rw = executor.execute(rewrite_sql, timeout_ms=timeout_ms)
+            rows_cfg = executor.execute_with_config(
+                rewrite_sql, config_commands, timeout_ms=timeout_ms
+            )
+
+            # Round 2: measure (all three variants, same order)
+            t0 = time.perf_counter()
+            executor.execute(original_sql, timeout_ms=timeout_ms)
+            t_orig = (time.perf_counter() - t0) * 1000
+
+            t0 = time.perf_counter()
+            rows_rw = executor.execute(rewrite_sql, timeout_ms=timeout_ms)
+            t_rewrite = (time.perf_counter() - t0) * 1000
+
+            t0 = time.perf_counter()
+            rows_cfg = executor.execute_with_config(
+                rewrite_sql, config_commands, timeout_ms=timeout_ms
+            )
+            t_config = (time.perf_counter() - t0) * 1000
+
+        except Exception as e:
+            return {"error": str(e)}
+
+        rewrite_speedup = t_orig / t_rewrite if t_rewrite > 0 else 1.0
+        config_speedup = t_orig / t_config if t_config > 0 else 1.0
+        config_additive = t_rewrite / t_config if t_config > 0 else 1.0
+
+        rows_match = len(rows_rw) == len(rows_cfg)
+
+        # Best variant
+        if config_speedup > rewrite_speedup and config_speedup >= 1.05:
+            best = "rewrite+config"
+        elif rewrite_speedup >= 1.05:
+            best = "rewrite"
+        else:
+            best = "original"
+
+        return {
+            "original_ms": round(t_orig, 1),
+            "rewrite_ms": round(t_rewrite, 1),
+            "config_ms": round(t_config, 1),
+            "rewrite_speedup": round(rewrite_speedup, 3),
+            "config_speedup": round(config_speedup, 3),
+            "config_additive": round(config_additive, 3),
+            "rewrite_rows": len(rows_rw),
+            "config_rows": len(rows_cfg),
+            "rows_match": rows_match,
+            "best_variant": best,
+        }
 
     def close(self) -> None:
         """Close the executor."""

@@ -353,6 +353,46 @@ class PostgresExecutor:
             result = cur.fetchone()
             return result[0] if result else False
 
+    def execute_with_config(
+        self,
+        sql: str,
+        set_local_commands: list[str],
+        timeout_ms: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Execute SQL within a transaction with SET LOCAL commands.
+
+        Wraps the query in BEGIN...COMMIT so that SET LOCAL settings
+        apply only to this execution and revert automatically.
+
+        Args:
+            sql: SQL query to execute.
+            set_local_commands: List of SET LOCAL statements
+                (e.g., ["SET LOCAL work_mem = '512MB'"]).
+            timeout_ms: Statement timeout in milliseconds (0 = no limit).
+
+        Returns:
+            List of dictionaries, one per row.
+        """
+        conn = self._ensure_connected()
+
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute("BEGIN")
+                if timeout_ms > 0:
+                    cur.execute(f"SET LOCAL statement_timeout = {timeout_ms}")
+                for cmd in set_local_commands:
+                    cur.execute(cmd)
+                cur.execute(sql)
+                rows = cur.fetchall() if cur.description else []
+                cur.execute("COMMIT")
+                return [dict(r) for r in rows]
+            except Exception:
+                try:
+                    cur.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
     def rollback(self) -> None:
         """Rollback the current transaction."""
         if self._conn:
@@ -506,6 +546,46 @@ class PostgresExecutor:
         except Exception:
             return "Unknown"
 
+    def get_full_settings(self) -> tuple[list[dict], int]:
+        """Get full pg_settings metadata including context, min/max, defaults.
+
+        Also queries pg_stat_activity for active connection count.
+
+        Returns:
+            Tuple of (settings_list, active_connections) where settings_list
+            is a list of dicts with name, setting, unit, context, min_val,
+            max_val, boot_val, reset_val.
+        """
+        settings_sql = """
+        SELECT name, setting, unit, context,
+               min_val, max_val, boot_val, reset_val
+        FROM pg_settings
+        WHERE name IN (
+            'work_mem', 'shared_buffers', 'effective_cache_size',
+            'random_page_cost', 'seq_page_cost',
+            'join_collapse_limit', 'from_collapse_limit',
+            'geqo_threshold', 'default_statistics_target',
+            'max_parallel_workers_per_gather', 'max_parallel_workers',
+            'max_worker_processes', 'max_connections',
+            'jit', 'hash_mem_multiplier',
+            'parallel_setup_cost', 'parallel_tuple_cost',
+            'enable_hashjoin', 'enable_mergejoin', 'enable_nestloop',
+            'enable_seqscan', 'jit_above_cost'
+        )
+        ORDER BY name
+        """
+        conn_sql = """
+        SELECT count(*) as cnt FROM pg_stat_activity
+        WHERE state IS NOT NULL
+        """
+        try:
+            settings = self.execute(settings_sql)
+            conn_result = self.execute(conn_sql)
+            active = conn_result[0]["cnt"] if conn_result else 0
+            return settings, active
+        except Exception:
+            return [], 0
+
     def get_settings(self) -> dict[str, str]:
         """Get optimization-relevant PostgreSQL settings.
 
@@ -520,7 +600,10 @@ class PostgresExecutor:
             'random_page_cost', 'seq_page_cost',
             'join_collapse_limit', 'from_collapse_limit',
             'geqo_threshold', 'default_statistics_target',
-            'max_parallel_workers_per_gather', 'jit'
+            'max_parallel_workers_per_gather', 'max_parallel_workers',
+            'max_worker_processes', 'max_connections',
+            'jit', 'hash_mem_multiplier',
+            'parallel_setup_cost', 'parallel_tuple_cost'
         )
         ORDER BY name
         """
