@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from .briefing_checks import build_worker_rewrite_checklist
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,7 +68,11 @@ def build_worker_v2_prompt(
         f"You are a SQL rewrite engine for {engine}{ver}. "
         f"Follow the Target DAG structure below. Your job is to write correct, "
         f"executable SQL for each node — not to decide whether to restructure. "
-        f"Preserve exact semantic equivalence (same rows, same columns, same ordering)."
+        f"Preserve exact semantic equivalence (same rows, same columns, same ordering). "
+        f"Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END "
+        f"around a division, keep it — even when a WHERE clause makes the zero case "
+        f"unreachable. Guards prevent silent breakage if filters change upstream. "
+        f"Strip benchmark comments (-- start query, -- end query) from your output."
     )
 
     # Engine-specific compact hints
@@ -117,10 +123,11 @@ def build_worker_v2_prompt(
             + shared_briefing.active_constraints
         )
 
-    # ── [6] REASONED EXAMPLES ────────────────────────────────────────────
+    # ── [6] EXAMPLE ADAPTATION ─────────────────────────────────────────
     if worker_briefing.example_reasoning:
         sections.append(
-            "## Why These Examples Match\n\n"
+            "## Example Adaptation Notes\n\n"
+            "For each example: what to apply to your rewrite, and what to ignore.\n\n"
             + worker_briefing.example_reasoning
         )
 
@@ -138,6 +145,8 @@ def build_worker_v2_prompt(
     # ── [7b] PER-REWRITE CONFIG (PG only) ─────────────────────────────────
     if dialect in ("postgres", "postgresql") and resource_envelope:
         sections.append(_section_set_local_config(resource_envelope))
+
+    sections.append(build_worker_rewrite_checklist())
 
     # ── [8] COLUMN COMPLETENESS CONTRACT ─────────────────────────────────
     sections.append(_section_output_format(output_columns))
@@ -297,10 +306,12 @@ def _section_output_format(
         "-- Your rewritten query here",
         "```",
         "",
-        "After the SQL, briefly explain what you changed:",
+        "After the SQL, explain the mechanism:",
         "",
         "```",
-        "Changes: <1-2 sentence summary of the rewrite>",
+        "Changes: <1-2 sentences: what structural change + the expected mechanism>",
+        "  e.g., 'Consolidated 4 store_sales scans into 1 with CASE branches — reduces I/O by 3x'",
+        "  e.g., 'Deferred customer join to resolve_names — joins 4K rows instead of 5.4M'",
         "Expected speedup: <estimate>",
         "```",
         "",

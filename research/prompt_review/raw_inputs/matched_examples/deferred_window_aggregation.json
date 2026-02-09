@@ -1,0 +1,42 @@
+{
+  "id": "deferred_window_aggregation",
+  "name": "Deferred Window Aggregation",
+  "description": "When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joined with FULL OUTER JOIN followed by another WINDOW pass for NULL carry-forward: defer the WINDOW out of the CTEs, join daily totals, then compute cumulative sums once on the joined result. SUM() OVER() naturally skips NULLs, eliminating the need for a separate MAX() carry-forward window.",
+  "benchmark_queries": [
+    "Q51"
+  ],
+  "verified_speedup": "1.36x",
+  "principle": "Deferred Aggregation: delay expensive operations (window functions) until after joins reduce the dataset. Computing window functions inside individual CTEs then joining is more expensive than joining first and computing windows once on the combined result.",
+  "example": {
+    "opportunity": "CONSOLIDATE WINDOW PASSES",
+    "input_slice": "[web_v1] type=cte\nSELECT ws_item_sk AS item_sk, d_date,\n  SUM(SUM(ws_sales_price)) OVER (PARTITION BY ws_item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cume_sales\nFROM web_sales, date_dim\nWHERE ws_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216+11 AND ws_item_sk IS NOT NULL\nGROUP BY ws_item_sk, d_date\n\n[store_v1] type=cte\nSELECT ss_item_sk AS item_sk, d_date,\n  SUM(SUM(ss_sales_price)) OVER (PARTITION BY ss_item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cume_sales\nFROM store_sales, date_dim\nWHERE ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216+11 AND ss_item_sk IS NOT NULL\nGROUP BY ss_item_sk, d_date\n\n[main_query] type=main\nSELECT * FROM (\n  SELECT item_sk, d_date, web_sales, store_sales,\n    MAX(web_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS web_cumulative,\n    MAX(store_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS store_cumulative\n  FROM (\n    SELECT COALESCE(web.item_sk, store.item_sk) AS item_sk, COALESCE(web.d_date, store.d_date) AS d_date,\n      web.cume_sales AS web_sales, store.cume_sales AS store_sales\n    FROM web_v1 web FULL OUTER JOIN store_v1 store ON (web.item_sk = store.item_sk AND web.d_date = store.d_date)\n  ) x\n) y\nWHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100",
+    "output": {
+      "rewrite_sets": [
+        {
+          "id": "rs_01",
+          "transform": "semantic_rewrite",
+          "nodes": {
+            "web_daily": "SELECT ws_item_sk AS item_sk, d_date, SUM(ws_sales_price) AS daily_sales FROM web_sales, date_dim WHERE ws_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ws_item_sk IS NOT NULL GROUP BY ws_item_sk, d_date",
+            "store_daily": "SELECT ss_item_sk AS item_sk, d_date, SUM(ss_sales_price) AS daily_sales FROM store_sales, date_dim WHERE ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ss_item_sk IS NOT NULL GROUP BY ss_item_sk, d_date",
+            "main_query": "SELECT * FROM (SELECT COALESCE(web.item_sk, store.item_sk) AS item_sk, COALESCE(web.d_date, store.d_date) AS d_date, SUM(web.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS web_cumulative, SUM(store.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS store_cumulative FROM web_daily web FULL OUTER JOIN store_daily store ON web.item_sk = store.item_sk AND web.d_date = store.d_date) y WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100"
+          },
+          "invariants_kept": [
+            "same result rows",
+            "same ordering",
+            "same column output",
+            "same cumulative semantics"
+          ],
+          "expected_speedup": "1.4x",
+          "risk": "low"
+        }
+      ]
+    },
+    "key_insight": "Principle: Deferred Aggregation — delay expensive operations (window functions) until after joins reduce the dataset. Computing windows in CTEs before joining wastes work on rows that get filtered. Here: remove WINDOW from CTEs (keep only GROUP BY for daily totals), join the reduced results, then compute SUM() OVER() once on the joined output. Reduces 3 WINDOW passes to 1, and SUM() naturally skips NULLs from the FULL OUTER JOIN.",
+    "when_not_to_use": "Do not use when the CTE window function is referenced by other consumers besides the final join (the cumulative value is needed elsewhere). Do not use when the window function is not a monotonically accumulating SUM - e.g., AVG, COUNT, or non-monotonic window functions require separate computation. Only applies when the join is FULL OUTER and the carry-forward window is MAX/LAST_VALUE over a cumulative sum."
+  },
+  "original_sql": "WITH web_v1 as (\nselect\n  ws_item_sk item_sk, d_date,\n  sum(sum(ws_sales_price))\n      over (partition by ws_item_sk order by d_date rows between unbounded preceding and current row) cume_sales\nfrom web_sales\n    ,date_dim\nwhere ws_sold_date_sk=d_date_sk\n  and d_month_seq between 1216 and 1216+11\n  and ws_item_sk is not NULL\ngroup by ws_item_sk, d_date),\nstore_v1 as (\nselect\n  ss_item_sk item_sk, d_date,\n  sum(sum(ss_sales_price))\n      over (partition by ss_item_sk order by d_date rows between unbounded preceding and current row) cume_sales\nfrom store_sales\n    ,date_dim\nwhere ss_sold_date_sk=d_date_sk\n  and d_month_seq between 1216 and 1216+11\n  and ss_item_sk is not NULL\ngroup by ss_item_sk, d_date)\n select *\nfrom (select item_sk\n     ,d_date\n     ,web_sales\n     ,store_sales\n     ,max(web_sales)\n         over (partition by item_sk order by d_date rows between unbounded preceding and current row) web_cumulative\n     ,max(store_sales)\n         over (partition by item_sk order by d_date rows between unbounded preceding and current row) store_cumulative\n     from (select case when web.item_sk is not null then web.item_sk else store.item_sk end item_sk\n                 ,case when web.d_date is not null then web.d_date else store.d_date end d_date\n                 ,web.cume_sales web_sales\n                 ,store.cume_sales store_sales\n           from web_v1 web full outer join store_v1 store on (web.item_sk = store.item_sk\n                                                          and web.d_date = store.d_date)\n          )x )y\nwhere web_cumulative > store_cumulative\norder by item_sk\n        ,d_date\n LIMIT 100;",
+  "optimized_sql": "WITH filtered_dates AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1216 AND 1216 + 11), filtered_web_sales AS (SELECT ws_item_sk AS item_sk, d_date, ws_sales_price FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk WHERE NOT ws_item_sk IS NULL), filtered_store_sales AS (SELECT ss_item_sk AS item_sk, d_date, ss_sales_price FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk WHERE NOT ss_item_sk IS NULL), web_v1 AS (SELECT item_sk, d_date, SUM(SUM(ws_sales_price)) OVER (PARTITION BY item_sk ORDER BY d_date rows BETWEEN UNBOUNDED preceding AND CURRENT ROW) AS cume_sales FROM filtered_web_sales GROUP BY item_sk, d_date), store_v1 AS (SELECT item_sk, d_date, SUM(SUM(ss_sales_price)) OVER (PARTITION BY item_sk ORDER BY d_date rows BETWEEN UNBOUNDED preceding AND CURRENT ROW) AS cume_sales FROM filtered_store_sales GROUP BY item_sk, d_date)\nSELECT * FROM (SELECT item_sk, d_date, web_sales, store_sales, MAX(web_sales) OVER (PARTITION BY item_sk ORDER BY d_date rows BETWEEN UNBOUNDED preceding AND CURRENT ROW) AS web_cumulative, MAX(store_sales) OVER (PARTITION BY item_sk ORDER BY d_date rows BETWEEN UNBOUNDED preceding AND CURRENT ROW) AS store_cumulative FROM (SELECT CASE WHEN NOT web.item_sk IS NULL THEN web.item_sk ELSE store.item_sk END AS item_sk, CASE WHEN NOT web.d_date IS NULL THEN web.d_date ELSE store.d_date END AS d_date, web.cume_sales AS web_sales, store.cume_sales AS store_sales FROM web_v1 AS web FULL OUTER JOIN store_v1 AS store ON (web.item_sk = store.item_sk AND web.d_date = store.d_date)) AS x) AS y WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100;",
+  "optimized_source": "dsr1",
+  "benchmark_query_num": 51,
+  "sf10_baseline_ms": 1735.51
+}

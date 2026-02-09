@@ -698,8 +698,8 @@ class Prompter:
                 or example.get("name")
                 or f"example_{i+1}"
             )
-            speedup = example.get("verified_speedup", "")
-            speedup_str = f" ({speedup})" if speedup else ""
+            speedup = str(example.get("verified_speedup", "")).rstrip("x")
+            speedup_str = f" ({speedup}x)" if speedup else ""
 
             lines.append("")
             lines.append(f"### {i+1}. {pattern_name}{speedup_str}")
@@ -767,7 +767,7 @@ class Prompter:
         ]
 
         for i, reg in enumerate(regressions):
-            speedup = reg.get("verified_speedup", "?")
+            speedup = str(reg.get("verified_speedup", "?")).rstrip("x")
             query_id = reg.get("query_id", "?")
             transform = reg.get("transform_attempted", "unknown")
             mechanism = reg.get("regression_mechanism", "")

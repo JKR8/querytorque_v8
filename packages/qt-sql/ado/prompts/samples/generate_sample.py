@@ -212,8 +212,9 @@ def build_mock_worker_briefing():
             "CTE. The 4 channel×year CTEs REPLACE it entirely. Keeping both "
             "caused 0.68x regression on Q74.\n"
             "- CTE_COLUMN_COMPLETENESS: Each CTE's SELECT must include ALL "
-            "columns referenced by downstream consumers. Check: c_customer_sk "
-            "flows through all CTEs to resolve_names.\n"
+            "columns referenced by downstream consumers. Check: ss_customer_sk "
+            "flows through store_agg → compare_ratios → resolve_names; "
+            "ws_bill_customer_sk flows through web_agg → compare_ratios.\n"
             "- LITERAL_PRESERVATION: d_year IN (1999, 1999+1) must be preserved "
             "exactly. Do not substitute computed values."
         ),
@@ -257,14 +258,19 @@ def build_mock_worker_briefing():
             "    EXPECTED_ROWS: ~200K (100K per year)\n"
             "    CONSUMERS: compare_ratios\n"
             "  compare_ratios:\n"
-            "    FROM: store_agg s1 JOIN store_agg s2 JOIN web_agg w1 JOIN web_agg w2\n"
-            "    JOIN: s1.ss_customer_sk = s2.ss_customer_sk = w1.ws_bill_customer_sk = w2.ws_bill_customer_sk\n"
+            "    FROM: store_agg s1\n"
+            "      JOIN store_agg s2 ON s1.ss_customer_sk = s2.ss_customer_sk\n"
+            "      JOIN web_agg w1  ON s1.ss_customer_sk = w1.ws_bill_customer_sk\n"
+            "      JOIN web_agg w2  ON s1.ss_customer_sk = w2.ws_bill_customer_sk\n"
             "    WHERE: s1.d_year = 1999 AND s2.d_year = 1999 + 1\n"
             "           AND w1.d_year = 1999 AND w2.d_year = 1999 + 1\n"
             "           AND s1.year_total > 0 AND w1.year_total > 0\n"
             "           AND (w2.year_total / w1.year_total) > (s2.year_total / s1.year_total)\n"
             "    NOTE: The original uses CASE WHEN ... > 0 guards around divisions.\n"
-            "          These are redundant given the > 0 WHERE filters. Either form is correct.\n"
+            "          Preserve them — even though WHERE > 0 makes zero unreachable,\n"
+            "          the guards prevent silent breakage if upstream filters change.\n"
+            "    NOTE: ss_customer_sk (store) and ws_bill_customer_sk (web) are both FKs\n"
+            "          to customer.c_customer_sk. They are equi-joined here.\n"
             "    OUTPUT: ss_customer_sk\n"
             "    EXPECTED_ROWS: ~4K\n"
             "    CONSUMERS: resolve_names\n"
@@ -279,13 +285,18 @@ def build_mock_worker_briefing():
         ),
         examples=["date_cte_isolate", "shared_dimension_multi_channel"],
         example_reasoning=(
-            "date_cte_isolate (4.00x on Q6): Q74 joins date_dim 4 times with d_year "
-            "filters. Pre-filtering date_dim from 73K to ~730 rows eliminates 4 full "
-            "hash-join probes. Same pattern: date join -> date CTE -> probe reduction.\n\n"
-            "shared_dimension_multi_channel (1.30x on Q56): Q74 has two channels "
-            "(store_sales, web_sales) that both join date_dim with the same filter. "
-            "Shared dimension extraction into a single filtered_dates CTE avoids "
-            "redundant dimension scans — exactly what our target DAG does."
+            "date_cte_isolate (4.00x on Q6):\n"
+            "  APPLY: Pre-filter date_dim into CTE. Q74 joins date_dim 4 times with "
+            "d_year filters — pre-filtering from 73K to ~730 rows eliminates 4 full "
+            "hash-join probes. Same pattern: date join -> date CTE -> probe reduction.\n"
+            "  IGNORE: The decorrelated scalar subquery pattern from Q6 (month_seq "
+            "lookup + category_avg CTE). Q74 has no correlated subquery.\n\n"
+            "shared_dimension_multi_channel (1.30x on Q56):\n"
+            "  APPLY: Shared dimension CTE across channels. Q74 has store_sales + "
+            "web_sales both joining date_dim with the same d_year filter — a single "
+            "filtered_dates CTE shared by both avoids redundant scans.\n"
+            "  IGNORE: The BETWEEN/INTERVAL date filtering from Q56. Q74 uses "
+            "d_year IN (1999, 2000), not date ranges."
         ),
         hazard_flags=(
             "- STDDEV_SAMP(ss_net_paid) FILTER (WHERE d_year = 1999) computed over "
@@ -334,6 +345,13 @@ def main():
     else:
         print("No strategy leaderboard found (run build_strategy_leaderboard.py first)")
 
+    # ── Engine profile ───────────────────────────────────────────────
+    engine_profile = None
+    engine_profile_path = CONSTRAINTS_DIR / "engine_profile_duckdb.json"
+    if engine_profile_path.exists():
+        engine_profile = json.loads(engine_profile_path.read_text())
+        print(f"Engine profile: {engine_profile.get('engine', '?')} v{engine_profile.get('version_tested', '?')}")
+
     # ── Analyst prompt ──────────────────────────────────────────────
     from ado.prompts.analyst_briefing import build_analyst_briefing_prompt
 
@@ -360,6 +378,7 @@ def main():
         dialect_version=dialect_version,
         strategy_leaderboard=strategy_leaderboard,
         query_archetype=query_archetype,
+        engine_profile=engine_profile,
     )
 
     analyst_path = SAMPLES_DIR / f"analyst_v2_{QUERY_ID}.md"

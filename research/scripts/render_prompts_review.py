@@ -223,9 +223,28 @@ mock_worker1 = BriefingWorker(
         "    FROM: filtered_cs JOIN date_dim d2 ON d2.d_week_seq = filtered_cs.d_week_seq\n"
         "          JOIN inventory ON inv_date_sk = d2.d_date_sk AND inv_item_sk = cs_item_sk\n"
         "    WHERE: inv_quantity_on_hand < cs_quantity\n"
-        "    OUTPUT: all filtered_cs columns + inv_warehouse_sk\n"
+        "    OUTPUT: cs_item_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_ship_date_sk, cs_promo_sk, cs_order_number, cs_quantity, d_week_seq, d_date, inv_warehouse_sk\n"
         "    EXPECTED_ROWS: ~5K\n"
-        "    CONSUMERS: dim_lookups"
+        "    CONSUMERS: dim_lookups\n\n"
+        "  dim_lookups:\n"
+        "    FROM: cs_inv_join JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk\n"
+        "          JOIN item ON cs_item_sk = i_item_sk\n"
+        "          JOIN customer_demographics ON cs_bill_cdemo_sk = cd_demo_sk\n"
+        "          JOIN household_demographics ON cs_bill_hdemo_sk = hd_demo_sk\n"
+        "          JOIN date_dim d3 ON cs_ship_date_sk = d3.d_date_sk\n"
+        "          LEFT JOIN promotion ON cs_promo_sk = p_promo_sk\n"
+        "          LEFT JOIN catalog_returns ON cr_item_sk = cs_item_sk AND cr_order_number = cs_order_number\n"
+        "    WHERE: d3.d_date > d_date + interval '3 day' AND hd_buy_potential = '>10000' AND cd_marital_status = 'U' AND cd_dep_count BETWEEN 9 AND 11 AND i_category IN ('Children', 'Jewelry', 'Men')\n"
+        "    OUTPUT: i_item_desc, w_warehouse_name, d_week_seq, p_promo_sk\n"
+        "    EXPECTED_ROWS: ~2K\n"
+        "    CONSUMERS: final_agg\n\n"
+        "  final_agg:\n"
+        "    FROM: dim_lookups\n"
+        "    GROUP BY: i_item_desc, w_warehouse_name, d_week_seq\n"
+        "    AGGREGATE: SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt\n"
+        "    OUTPUT: i_item_desc, w_warehouse_name, d_week_seq, no_promo, promo, total_cnt\n"
+        "    EXPECTED_ROWS: ~100\n"
+        "    CONSUMERS: result"
     ),
     examples=["pg_date_cte_explicit_join", "pg_dimension_prefetch_star"],
     example_reasoning=(
@@ -260,22 +279,171 @@ worker_prompt = build_worker_v2_prompt(
     resource_envelope=resource_envelope,
 )
 
-# ── Output ─────────────────────────────────────────────────────────────
-separator = "=" * 80
+# ── Build V2 snipe prompts (analyst2 + sniper + sniper retry) ─────────
+from ado.prompts.swarm_snipe import build_snipe_analyst_prompt, build_sniper_prompt
+from ado.prompts.swarm_parsers import SnipeAnalysisV2
+from ado.schemas import WorkerResult
 
-print(separator)
-print("RESOURCE ENVELOPE (passed to both analyst + workers)")
-print(separator)
-print(resource_envelope)
-print()
+# Mock worker results from fan-out
+mock_worker_results = [
+    WorkerResult(
+        worker_id=1, strategy="star_join_prefetch",
+        examples_used=["pg_date_cte_explicit_join", "pg_dimension_prefetch_star"],
+        optimized_sql="WITH filtered_dates AS (\n  SELECT d_date_sk, d_week_seq, d_date\n  FROM date_dim\n  WHERE d_year = 1998\n)\nSELECT i_item_desc, w_warehouse_name, d_week_seq\nFROM catalog_sales cs\nJOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk\n-- ... rest of query",
+        speedup=1.15, status="NEUTRAL", transforms=["pushdown", "date_cte_isolate"],
+        hint="Pre-filter date dim into CTE, then join star schema",
+    ),
+    WorkerResult(
+        worker_id=2, strategy="decorrelate_subquery",
+        examples_used=["pg_decorrelate_exists"],
+        optimized_sql="SELECT i_item_desc, w_warehouse_name, d_week_seq\nFROM catalog_sales cs\nJOIN inventory inv ON inv.inv_item_sk = cs.cs_item_sk\n-- ... decorrelated version",
+        speedup=0.85, status="REGRESSION", transforms=["decorrelate"],
+        error_message="Row count mismatch: expected 142, got 198",
+    ),
+    WorkerResult(
+        worker_id=3, strategy="scan_consolidation",
+        examples_used=["pg_single_pass_agg"],
+        optimized_sql="-- attempted scan consolidation\nSELECT 1",
+        speedup=0.0, status="ERROR", transforms=[],
+        error_message="syntax error at or near 'FILTER' (line 12)",
+    ),
+    WorkerResult(
+        worker_id=4, strategy="exploration_novel",
+        examples_used=[],
+        optimized_sql="SELECT i_item_desc, w_warehouse_name, d_week_seq\nFROM catalog_sales cs\nJOIN date_dim d1 ON cs.cs_sold_date_sk = d1.d_date_sk\n-- ... novel approach",
+        speedup=0.92, status="REGRESSION", transforms=["novel"],
+        exploratory=True,
+    ),
+]
 
-print(separator)
-print(f"ANALYST PROMPT ({len(analyst_prompt)} chars, ~{len(analyst_prompt.split())}) words)")
-print(separator)
-print(analyst_prompt)
-print()
+snipe_analyst_prompt = build_snipe_analyst_prompt(
+    query_id="query072_agg_s1",
+    original_sql=sql,
+    worker_results=mock_worker_results,
+    target_speedup=2.0,
+    dag=mock_dag,
+    costs={},
+    explain_plan_text=explain_tree_text,
+    engine_profile=engine_profile,
+    constraints=constraints,
+    matched_examples=pg_examples[:6],
+    regression_warnings=None,
+    resource_envelope=resource_envelope,
+    dialect="postgresql",
+    dialect_version="14.3",
+)
 
-print(separator)
-print(f"WORKER 1 PROMPT ({len(worker_prompt)} chars, ~{len(worker_prompt.split())} words)")
-print(separator)
-print(worker_prompt)
+# Mock analysis from analyst2
+mock_snipe_analysis = SnipeAnalysisV2(
+    failure_synthesis=(
+        "W1 achieved 1.15x via date CTE isolation — the only passing approach. The bottleneck "
+        "is the nested-loop join between filtered catalog_sales and inventory (non-equi condition "
+        "inv_quantity_on_hand < cs_quantity). W2 broke semantic equivalence by decorrelating a "
+        "non-correlated subquery path. W3 used PG-unsupported FILTER syntax. W4's novel approach "
+        "didn't reduce the critical join input cardinality."
+    ),
+    best_foundation=(
+        "Build on W1's date CTE isolation (1.15x). The date pre-filtering is sound — it reduces "
+        "catalog_sales from 14M to ~170K rows. But the real bottleneck is AFTER this filter: "
+        "the inventory non-equi join processes 170K × 11M = ~1.9T comparisons."
+    ),
+    unexplored_angles=(
+        "No worker attempted to pre-aggregate or pre-filter inventory. The EXPLAIN shows inventory "
+        "is scanned fully (11M rows) for each probe. Pre-filtering inventory by the d_week_seq "
+        "range (only ~7 weeks in 1998) would reduce the join input from 11M to ~1.5M rows."
+    ),
+    strategy_guidance=(
+        "1. Keep W1's date CTE isolation (proven 1.15x). "
+        "2. Add inventory pre-filtering: join inventory with the same date CTE to restrict to "
+        "relevant weeks, reducing from 11M to ~1.5M rows. "
+        "3. Then join filtered_cs with filtered_inventory on (item_sk, quantity < condition). "
+        "This reduces the nested-loop from 170K×11M to 170K×1.5M — a ~7x reduction in join work."
+    ),
+    examples=["pg_date_cte_explicit_join", "pg_dimension_prefetch_star"],
+    example_adaptation=(
+        "pg_date_cte_explicit_join: APPLY the date CTE isolation pattern (proven by W1). "
+        "IGNORE the explicit join conversion — PG already uses explicit joins.\n"
+        "pg_dimension_prefetch_star: APPLY the multi-dimension prefetch concept, adapted for "
+        "INVENTORY pre-filtering. IGNORE the star-join aspect — Q072 is not a star join."
+    ),
+    hazard_flags=(
+        "- Do NOT attempt FILTER clause syntax — PG 14.3 supports it but W3's error suggests "
+        "a syntax context issue. Use CASE WHEN instead.\n"
+        "- The non-equi join (inv_quantity_on_hand < cs_quantity) CANNOT be converted to hash join. "
+        "Keep as nested-loop but reduce input cardinality.\n"
+        "- Preserve LEFT JOINs to promotion and catalog_returns."
+    ),
+    retry_worthiness=(
+        "high — W1's 1.15x with just date isolation leaves clear headroom. Adding inventory "
+        "pre-filtering reduces the dominant join by ~7x, giving a path to 2.0x target."
+    ),
+    retry_digest=(
+        "The nested-loop between catalog_sales and inventory is the bottleneck (170K × 11M probes). "
+        "W1's date CTE gives 1.15x but doesn't touch this join. Pre-filter inventory by d_week_seq "
+        "range to reduce from 11M to ~1.5M rows. Keep W1's date isolation. Use CASE WHEN, not FILTER. "
+        "Preserve LEFT JOINs. Do NOT attempt decorrelation (W2 broke equivalence)."
+    ),
+)
+
+sniper_prompt = build_sniper_prompt(
+    snipe_analysis=mock_snipe_analysis,
+    original_sql=sql,
+    worker_results=mock_worker_results,
+    best_worker_sql=mock_worker_results[0].optimized_sql,
+    examples=pg_examples[:2],
+    output_columns=output_columns,
+    dag=mock_dag,
+    costs={},
+    engine_profile=engine_profile,
+    constraints=constraints,
+    dialect="postgresql",
+    engine_version="14.3",
+    resource_envelope=resource_envelope,
+    target_speedup=2.0,
+)
+
+# Sniper retry prompt
+sniper_retry_prompt = build_sniper_prompt(
+    snipe_analysis=mock_snipe_analysis,
+    original_sql=sql,
+    worker_results=mock_worker_results,
+    best_worker_sql=mock_worker_results[0].optimized_sql,
+    examples=pg_examples[:2],
+    output_columns=output_columns,
+    dag=mock_dag,
+    costs={},
+    engine_profile=engine_profile,
+    constraints=constraints,
+    dialect="postgresql",
+    engine_version="14.3",
+    resource_envelope=resource_envelope,
+    target_speedup=2.0,
+    previous_sniper_result=WorkerResult(
+        worker_id=5, strategy="sniper_1",
+        examples_used=["pg_date_cte_explicit_join"],
+        optimized_sql="WITH date_cte AS (...)\nSELECT ...",
+        speedup=1.45, status="NEUTRAL", transforms=["date_cte_isolate", "inventory_prefetch"],
+    ),
+)
+
+# ── Save to files ──────────────────────────────────────────────────────
+OUT_DIR = ROOT / "research" / "prompt_samples" / "pg_q072_v2"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+files = {
+    "00_resource_envelope.txt": resource_envelope,
+    "01_analyst_prompt.txt": analyst_prompt,
+    "02_worker1_prompt.txt": worker_prompt,
+    "03_snipe_analyst_prompt.txt": snipe_analyst_prompt,
+    "04_sniper_prompt.txt": sniper_prompt,
+    "05_sniper_retry_prompt.txt": sniper_retry_prompt,
+}
+
+for fname, content in files.items():
+    out_path = OUT_DIR / fname
+    out_path.write_text(content)
+    words = len(content.split())
+    chars = len(content)
+    print(f"  {fname}: {chars:,} chars, ~{words:,} words")
+
+print(f"\nSaved to: {OUT_DIR}")

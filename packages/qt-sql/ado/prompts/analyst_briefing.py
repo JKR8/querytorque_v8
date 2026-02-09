@@ -22,6 +22,8 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
+from .briefing_checks import build_analyst_section_checklist
+
 logger = logging.getLogger(__name__)
 
 
@@ -441,8 +443,12 @@ def _format_constraint_for_analyst(c: Dict[str, Any]) -> str:
     if failures:
         for f in failures[:2]:
             qid = f.get("query", f.get("query_id", "?"))
-            reg = f.get("regression", f.get("speedup", "?"))
-            parts.append(f"  - Failure: {qid} regressed to {reg}")
+            reg = f.get("regression", f.get("speedup"))
+            err = f.get("error", "")
+            if reg:
+                parts.append(f"  - Failure: {qid} regressed to {reg}")
+            elif err:
+                parts.append(f"  - Failure: {qid} — {err}")
     if successes:
         for s in successes[:2]:
             qid = s.get("query", "?")
@@ -459,7 +465,7 @@ def _format_constraint_for_analyst(c: Dict[str, Any]) -> str:
 def _format_example_compact(ex: Dict[str, str]) -> str:
     """Format a gold example compactly: id (speedup) — description."""
     eid = ex.get("id", "?")
-    speedup = ex.get("speedup", "?")
+    speedup = str(ex.get("speedup", "?")).rstrip("x")
     desc = ex.get("description", "")[:80]
     return f"- **{eid}** ({speedup}x) — {desc}"
 
@@ -467,26 +473,21 @@ def _format_example_compact(ex: Dict[str, str]) -> str:
 def _format_example_full(ex: Dict[str, Any]) -> str:
     """Format a tag-matched example with full metadata."""
     eid = ex.get("id", "?")
-    speedup = ex.get("verified_speedup", ex.get("speedup", "?"))
+    speedup = str(ex.get("verified_speedup", ex.get("speedup", "?"))).rstrip("x")
     desc = ex.get("description", "")
     principle = ex.get("principle", "")
-    when = ex.get("when", "")
-    when_not = ex.get("when_not", "")
+
+    # when_not_to_use lives inside the example sub-dict
+    example_data = ex.get("example", {})
+    when_not = example_data.get("when_not_to_use", "")
 
     parts = [f"### {eid} ({speedup}x)"]
     if desc:
         parts.append(f"**Description:** {desc}")
     if principle:
         parts.append(f"**Principle:** {principle}")
-    if when:
-        parts.append(f"**When to apply:** {when}")
     if when_not:
         parts.append(f"**When NOT to apply:** {when_not}")
-
-    # Pattern tags (if present from tag-based matching)
-    tags = ex.get("pattern_tags", [])
-    if tags:
-        parts.append(f"**Pattern tags:** {', '.join(tags[:8])}")
 
     return "\n".join(parts)
 
@@ -495,7 +496,7 @@ def _format_regression_for_analyst(reg: Dict[str, Any]) -> str:
     """Format a regression example for the analyst's full view."""
     eid = reg.get("id", "?")
     query_id = reg.get("query_id", "?")
-    speedup = reg.get("verified_speedup", "?")
+    speedup = str(reg.get("verified_speedup", "?")).rstrip("x")
     transform = reg.get("transform_attempted", "unknown")
     mechanism = reg.get("regression_mechanism", "")
     desc = reg.get("description", "")
@@ -811,13 +812,16 @@ def build_analyst_briefing_prompt(
             lines.append(_format_example_full(ex))
             lines.append("")
 
-    # ── 7. Full catalog (compact) ────────────────────────────────────────
+    # ── 7. Additional examples not in tag-matched set (compact) ──────────
     if all_available_examples:
-        lines.append("## Full Example Catalog")
-        lines.append("")
-        for ex in all_available_examples:
-            lines.append(_format_example_compact(ex))
-        lines.append("")
+        matched_ids = {ex.get("id") for ex in matched_examples} if matched_examples else set()
+        additional = [ex for ex in all_available_examples if ex.get("id") not in matched_ids]
+        if additional:
+            lines.append("## Additional Examples (not tag-matched to this query)")
+            lines.append("")
+            for ex in additional:
+                lines.append(_format_example_compact(ex))
+            lines.append("")
 
     # ── 8. Global optimization principles ────────────────────────────────
     if global_knowledge:
@@ -969,10 +973,10 @@ def build_analyst_briefing_prompt(
         "gaps above. For each gap:\n"
         "   - Does this query exhibit the gap? (e.g., is a predicate NOT pushed "
         "into a CTE? Is the same fact table scanned multiple times?)\n"
-        "   - Check the 'when_to_exploit' conditions — does this query meet them?\n"
-        "   - Check the 'when_NOT_to_exploit' conditions — any disqualifiers?\n"
+        "   - Check the 'opportunity' — does this query's structure match?\n"
+        "   - Check 'what_didnt_work' and 'field_notes' — any disqualifiers for this query?\n"
         "   - Also verify: is the optimizer ALREADY handling this well? "
-        "(Check the 'optimizer_handles_well' list — if the engine already does it, "
+        "(Check the Optimizer Strengths above — if the engine already does it, "
         "your transform adds overhead, not value.)"
     )
     lines.append("")
@@ -989,13 +993,22 @@ def build_analyst_briefing_prompt(
         "5. **TRANSFORM SELECTION**: From the matched engine gaps, select transforms "
         "that exploit the specific gaps present in THIS query. Rank by expected value "
         "(rows affected × historical speedup from evidence). Select 4 that are "
-        "structurally diverse — each attacking a different gap or bottleneck."
+        "structurally diverse — each attacking a different gap or bottleneck.\n"
+        "   REJECT tag-matched examples whose primary technique requires a structural "
+        "feature this query lacks (e.g., reject intersect_to_exists if query has no "
+        "INTERSECT; reject decorrelate if query has no correlated subquery). Tag "
+        "matching is approximate — always verify structural applicability."
     )
     lines.append("")
     lines.append(
         "6. **DAG DESIGN**: For each worker's strategy, define the target DAG "
         "topology. Verify that every node contract has exhaustive output "
-        "columns by checking downstream references."
+        "columns by checking downstream references.\n"
+        "   CTE materialization matters for your design: a CTE referenced by "
+        "2+ consumers will likely be materialized (good — computed once, probed "
+        "many). A CTE referenced once may be inlined (no materialization benefit "
+        "from 'sharing'). Design shared CTEs only when multiple downstream nodes "
+        "consume them. See CTE_INLINING in Engine Profile strengths."
     )
     lines.append("")
 
@@ -1050,10 +1063,11 @@ def build_analyst_briefing_prompt(
     lines.append("    OUTPUT: [exhaustive column list]")
     lines.append("    EXPECTED_ROWS: [approximate row count from EXPLAIN analysis]")
     lines.append("    CONSUMERS: [downstream nodes]")
-    lines.append("EXAMPLES: [ex1], [ex2], [ex3]")
-    lines.append("EXAMPLE_REASONING:")
-    lines.append("[Why each example's pattern matches THIS query's bottleneck.")
-    lines.append("What adaptation is needed.]")
+    lines.append("EXAMPLES: [ex1], [ex2], [ex3]  (sharing across workers is OK if adaptation differs)")
+    lines.append("EXAMPLE_ADAPTATION:")
+    lines.append("[For each example: what aspect to apply to THIS worker's strategy,")
+    lines.append("and what to IGNORE (e.g., 'apply the date CTE pattern; ignore the")
+    lines.append("decorrelation — Q74 has no correlated subquery').]")
     lines.append("HAZARD_FLAGS:")
     lines.append("- [Specific risk for this approach on this query]")
     lines.append("")
@@ -1069,6 +1083,8 @@ def build_analyst_briefing_prompt(
     lines.append("OVERRIDE_REASONING: [Why this query's structure differs from the observed failure, or 'N/A']")
     lines.append("EXPLORATION_TYPE: [constraint_relaxation | compound_strategy | novel_combination]")
     lines.append("```")
+    lines.append("")
+    lines.append(build_analyst_section_checklist())
     lines.append("")
 
     # ── 13. Transform Catalog ─────────────────────────────────────────────
@@ -1260,14 +1276,18 @@ def build_analyst_briefing_prompt(
     )
     lines.append("")
     lines.append(
-        "Worker 4 MAY:\n"
-        "  (a) Try a technique that the engine profile's 'what_didnt_work' warns "
-        "about, IF the structural context of THIS query differs from the observed "
-        "failure — explain why in HAZARD_FLAGS\n"
+        "Worker 4 MAY (in priority order — prefer higher-value exploration):\n"
+        "  (c) **PREFERRED**: Attempt a novel technique not listed in the engine "
+        "profile, if the EXPLAIN plan reveals an optimizer blind spot not yet "
+        "documented. This is the highest-value exploration — new discoveries "
+        "expand the engine profile for all future queries.\n"
         "  (b) Combine 2-3 transforms from different engine gaps into a compound "
-        "strategy that hasn't been tested before\n"
-        "  (c) Attempt a novel technique not listed in the engine profile, if "
-        "the EXPLAIN plan reveals an optimizer blind spot not yet documented"
+        "strategy that hasn't been tested before. Medium value — tests "
+        "interaction effects between known patterns.\n"
+        "  (a) Retry a technique from 'what_didnt_work', IF the structural "
+        "context of THIS query differs materially from the observed failure — "
+        "explain the structural difference in HAZARD_FLAGS. Lowest priority — "
+        "only when the query structure clearly diverges from the failed case."
     )
     lines.append("")
     lines.append(
@@ -1294,7 +1314,7 @@ def build_analyst_briefing_prompt(
         "1. SHARED BRIEFING (SEMANTIC_CONTRACT + BOTTLENECK_DIAGNOSIS + "
         "ACTIVE_CONSTRAINTS + REGRESSION_WARNINGS)\n"
         "2. Their specific WORKER N BRIEFING (STRATEGY + TARGET_DAG + "
-        "NODE_CONTRACTS + EXAMPLES + EXAMPLE_REASONING + HAZARD_FLAGS)\n"
+        "NODE_CONTRACTS + EXAMPLES + EXAMPLE_ADAPTATION + HAZARD_FLAGS)\n"
         "3. Full before/after SQL for their assigned examples (retrieved by example ID)\n"
         "4. The original query SQL (full, as reference)\n"
         "5. Column completeness contract + output format spec\n\n"

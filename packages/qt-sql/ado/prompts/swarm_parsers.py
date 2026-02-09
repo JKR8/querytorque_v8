@@ -382,6 +382,100 @@ def _parse_single_worker(block: str, worker_id: int) -> BriefingWorker:
     return w
 
 
+@dataclass
+class SnipeAnalysisV2:
+    """Parsed V2 snipe analyst analysis — diagnosis-then-synthesis output."""
+    failure_synthesis: str = ""     # WHY best won, WHY others didn't
+    best_foundation: str = ""       # What to build on (if any > 1.0x)
+    unexplored_angles: str = ""     # What couldn't be designed without results
+    strategy_guidance: str = ""     # Synthesized approach for sniper
+    examples: List[str] = field(default_factory=list)
+    example_adaptation: str = ""    # APPLY/IGNORE per example
+    hazard_flags: str = ""          # Risks based on observed failures
+    retry_worthiness: str = ""      # "high" or "low" + reason
+    retry_digest: str = ""          # 5-10 line compact failure guide for sniper2
+    raw: str = ""
+
+
+def parse_snipe_analyst_response(response: str) -> SnipeAnalysisV2:
+    """Parse V2 snipe analyst response into structured analysis.
+
+    Fault-tolerant: returns empty fields rather than raising exceptions.
+
+    Expected format:
+        === SNIPE BRIEFING ===
+
+        FAILURE_SYNTHESIS:
+        <text>
+
+        BEST_FOUNDATION:
+        <text>
+
+        UNEXPLORED_ANGLES:
+        <text>
+
+        STRATEGY_GUIDANCE:
+        <text>
+
+        EXAMPLES: <ex1>, <ex2>, <ex3>
+
+        EXAMPLE_ADAPTATION:
+        <text>
+
+        HAZARD_FLAGS:
+        <text>
+
+        RETRY_WORTHINESS: high|low — <reason>
+
+        RETRY_DIGEST:
+        <text>
+    """
+    result = SnipeAnalysisV2(raw=response)
+
+    # Strip <reasoning>...</reasoning> block if present
+    stripped = re.sub(
+        r'<reasoning>.*?</reasoning>',
+        '', response, flags=re.DOTALL,
+    ).strip()
+
+    # All section names in order (used for stop markers)
+    _SNIPE_SECTIONS = [
+        "FAILURE_SYNTHESIS", "BEST_FOUNDATION", "UNEXPLORED_ANGLES",
+        "STRATEGY_GUIDANCE", "EXAMPLES", "EXAMPLE_ADAPTATION",
+        "HAZARD_FLAGS", "RETRY_WORTHINESS", "RETRY_DIGEST",
+    ]
+
+    def _extract_snipe_section(text: str, name: str) -> str:
+        """Extract a multi-line section, stopping at next known section."""
+        others = [s for s in _SNIPE_SECTIONS if s != name]
+        stop_re = "|".join(re.escape(s) for s in others)
+        pattern = rf'{re.escape(name)}\s*:\s*\n?(.*?)(?=(?:{stop_re})\s*:|$)'
+        match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        return ""
+
+    result.failure_synthesis = _extract_snipe_section(stripped, "FAILURE_SYNTHESIS")
+    result.best_foundation = _extract_snipe_section(stripped, "BEST_FOUNDATION")
+    result.unexplored_angles = _extract_snipe_section(stripped, "UNEXPLORED_ANGLES")
+    result.strategy_guidance = _extract_snipe_section(stripped, "STRATEGY_GUIDANCE")
+    result.example_adaptation = _extract_snipe_section(stripped, "EXAMPLE_ADAPTATION")
+    result.hazard_flags = _extract_snipe_section(stripped, "HAZARD_FLAGS")
+    result.retry_worthiness = _extract_snipe_section(stripped, "RETRY_WORTHINESS")
+    result.retry_digest = _extract_snipe_section(stripped, "RETRY_DIGEST")
+
+    # EXAMPLES is single-line comma-separated
+    examples_raw = _extract_field(stripped, "EXAMPLES")
+    result.examples = [ex.strip() for ex in examples_raw.split(",") if ex.strip()]
+
+    # Fallback: if nothing parsed, use the whole response
+    if not result.failure_synthesis and not result.strategy_guidance:
+        logger.warning("Could not parse V2 snipe analyst response, using raw response")
+        result.failure_synthesis = stripped
+
+    return result
+
+
 def _extract_briefing_section(
     text: str,
     section_name: str,

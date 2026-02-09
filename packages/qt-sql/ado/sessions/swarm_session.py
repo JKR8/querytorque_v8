@@ -49,6 +49,18 @@ class SwarmSession(OptimizationSession):
         self._run_log_path: Optional[Path] = None
         self._run_log_handler: Optional[logging.Handler] = None
         self._cached_baseline: Optional[Any] = None  # OriginalBaseline from first validation
+        # V2 snipe state — persisted from fan-out for snipe reuse
+        self._explain_plan_text: Optional[str] = None
+        self._engine_profile: Optional[Dict] = None
+        self._constraints: List[Dict] = []
+        self._resource_envelope: Optional[str] = None
+        self._semantic_intents: Optional[Dict] = None
+        self._output_columns: List[str] = []
+        self._matched_examples: List[Dict] = []
+        self._all_available_examples: List[Dict] = []
+        self._regression_warnings: Optional[List[Dict]] = None
+        self._snipe_analysis: Optional[Any] = None  # SnipeAnalysisV2 from analyst2
+        self._sniper_result: Optional[WorkerResult] = None  # for retry
 
     @staticmethod
     def _stage(query_id: str, msg: str):
@@ -518,6 +530,15 @@ class SwarmSession(OptimizationSession):
             f"({_fmt_elapsed(time.time() - t0)})"
         )
 
+        # Persist V2 data for snipe reuse
+        self._explain_plan_text = explain_plan_text
+        self._engine_profile = engine_profile
+        self._constraints = constraints
+        self._semantic_intents = semantic_intents
+        self._matched_examples = matched_examples
+        self._all_available_examples = all_available
+        self._regression_warnings = regression_warnings
+
         # PG system profile + resource envelope (for per-worker SET LOCAL config)
         resource_envelope = None
         if self.dialect in ("postgresql", "postgres"):
@@ -533,6 +554,7 @@ class SwarmSession(OptimizationSession):
                     f"V2: PG system profile loaded ({len(profile.settings)} settings, "
                     f"{profile.active_connections} active conns)"
                 )
+                self._resource_envelope = resource_envelope
             except Exception as e:
                 logger.warning(f"[{self.query_id}] Failed to load PG system profile: {e}")
 
@@ -614,6 +636,7 @@ class SwarmSession(OptimizationSession):
         # Extract output columns for column completeness contract
         from ..node_prompter import Prompter
         output_columns = Prompter._extract_output_columns(dag)
+        self._output_columns = output_columns
 
         candidates_by_worker = {}
 
@@ -903,13 +926,354 @@ class SwarmSession(OptimizationSession):
     def _snipe_iteration(
         self, dag: Any, costs: Dict[str, Any], snipe_num: int, t_session: float,
     ) -> Dict[str, Any]:
-        """Snipe iteration: analyst synthesizes failures into 1 refined worker.
+        """Snipe iteration: V2 or V1 path depending on use_v2_prompts.
 
-        1. Build snipe prompt with all previous worker results
-        2. Parse refined strategy
-        3. Generate single refined worker
-        4. Validate
+        V2 Path A (snipe_num == 1): analyst2 + sniper
+        V2 Path B (snipe_num >= 2): sniper retry (skip analyst)
+        V1 fallback: original snipe logic
         """
+        if self.use_v2_prompts:
+            return self._snipe_iteration_v2(dag, costs, snipe_num, t_session)
+        return self._snipe_iteration_v1(dag, costs, snipe_num, t_session)
+
+    def _snipe_iteration_v2(
+        self, dag: Any, costs: Dict[str, Any], snipe_num: int, t_session: float,
+    ) -> Dict[str, Any]:
+        """V2 snipe iteration with two paths.
+
+        Path A (snipe_num == 1): analyst2 diagnosis + sniper deployment
+        Path B (snipe_num >= 2): sniper retry with compact failure digest
+        """
+        from ..prompts import (
+            build_snipe_analyst_prompt,
+            build_sniper_prompt,
+            parse_snipe_analyst_response,
+        )
+        from ..generate import CandidateGenerator
+        from ..node_prompter import _load_constraint_files, _load_engine_profile, Prompter
+
+        generator = CandidateGenerator(
+            provider=self.pipeline.provider,
+            model=self.pipeline.model,
+            analyze_fn=self.pipeline.analyze_fn,
+        )
+
+        # Lazy-load any V2 data missing (e.g., V1 fan-out fallback)
+        if not self._engine_profile:
+            self._engine_profile = _load_engine_profile(self.dialect)
+        if not self._constraints:
+            self._constraints = _load_constraint_files(self.dialect)
+        if not self._explain_plan_text:
+            self._explain_plan_text = self._get_explain_plan_text(self.query_id)
+        if not self._matched_examples:
+            self._matched_examples = self.pipeline._find_examples(
+                self.original_sql, engine=self.engine, k=20
+            )
+        if not self._all_available_examples:
+            self._all_available_examples = self.pipeline._list_gold_examples(self.engine)
+        if not self._output_columns:
+            self._output_columns = Prompter._extract_output_columns(dag)
+        if self._regression_warnings is None:
+            self._regression_warnings = self.pipeline._find_regression_warnings(
+                self.original_sql, engine=self.engine, k=3
+            )
+        if not self._semantic_intents:
+            self._semantic_intents = self.pipeline.get_semantic_intents(self.query_id)
+        if self._resource_envelope is None and self.dialect in ("postgresql", "postgres"):
+            try:
+                from ..pg_tuning import load_or_collect_profile, build_resource_envelope
+                profile = load_or_collect_profile(
+                    self.pipeline.config.db_path_or_dsn,
+                    self.pipeline.benchmark_dir,
+                )
+                self._resource_envelope = build_resource_envelope(profile)
+            except Exception:
+                pass
+
+        # ── Path B: Sniper retry (snipe_num >= 2) ────────────────────────
+        if snipe_num >= 2 and self._sniper_result is not None:
+            # Check retry_worthiness
+            if self._snipe_analysis and self._snipe_analysis.retry_worthiness:
+                worthiness = self._snipe_analysis.retry_worthiness.strip().lower()
+                if worthiness.startswith("low"):
+                    reason = self._snipe_analysis.retry_worthiness
+                    self._stage(
+                        self.query_id,
+                        f"SNIPER RETRY: SKIPPED — retry_worthiness=low ({reason})"
+                    )
+                    logger.info(f"[{self.query_id}] Sniper retry skipped: {reason}")
+                    return {
+                        "iteration": snipe_num,
+                        "phase": "snipe_v2_retry_skipped",
+                        "retry_worthiness": reason,
+                        "worker_results": [],
+                        "best_speedup": 0.0,
+                    }
+
+            self._stage(
+                self.query_id,
+                f"SNIPER RETRY: Deploying sniper2... | total {_fmt_elapsed(time.time() - t_session)}"
+            )
+
+            # Recover analysis from iter 1
+            analysis = self._snipe_analysis
+
+            # Find best worker SQL
+            best_worker_sql = self._find_best_worker_sql()
+
+            # Load examples from analyst's recommendations
+            examples = self.pipeline._load_examples_by_id(
+                analysis.examples if analysis else [], self.engine
+            )
+
+            # Build sniper prompt WITH previous_sniper_result
+            sniper_prompt = build_sniper_prompt(
+                snipe_analysis=analysis,
+                original_sql=self.original_sql,
+                worker_results=self.all_worker_results,
+                best_worker_sql=best_worker_sql,
+                examples=examples,
+                output_columns=self._output_columns,
+                dag=dag,
+                costs=costs,
+                engine_profile=self._engine_profile,
+                constraints=self._constraints,
+                semantic_intents=self._semantic_intents,
+                regression_warnings=self._regression_warnings,
+                dialect=self.dialect,
+                engine_version=self.pipeline._engine_version,
+                resource_envelope=self._resource_envelope,
+                target_speedup=self.target_speedup,
+                previous_sniper_result=self._sniper_result,
+            )
+
+            # Generate, validate, update
+            return self._run_sniper(
+                generator, sniper_prompt, analysis, examples,
+                snipe_num, dag, costs, t_session,
+                phase="snipe_v2_retry",
+            )
+
+        # ── Path A: Analyst2 + Sniper (snipe_num == 1) ───────────────────
+        # Step 1: Build analyst2 prompt
+        self._stage(
+            self.query_id,
+            f"SNIPE ANALYST: Diagnosing {len(self.all_worker_results)} results... "
+            f"| total {_fmt_elapsed(time.time() - t_session)}"
+        )
+        t0 = time.time()
+
+        analyst_prompt = build_snipe_analyst_prompt(
+            query_id=self.query_id,
+            original_sql=self.original_sql,
+            worker_results=self.all_worker_results,
+            target_speedup=self.target_speedup,
+            dag=dag,
+            costs=costs,
+            explain_plan_text=self._explain_plan_text,
+            engine_profile=self._engine_profile,
+            constraints=self._constraints,
+            matched_examples=self._matched_examples,
+            all_available_examples=self._all_available_examples,
+            semantic_intents=self._semantic_intents,
+            regression_warnings=self._regression_warnings,
+            resource_envelope=self._resource_envelope,
+            dialect=self.dialect,
+            dialect_version=self.pipeline._engine_version,
+        )
+
+        # Step 2: Call analyst LLM
+        try:
+            analyst_response = generator._analyze_with_max_tokens(
+                analyst_prompt, max_tokens=4096
+            )
+        except Exception as e:
+            self._stage(self.query_id, f"SNIPE ANALYST: failed ({e})")
+            return {
+                "iteration": snipe_num,
+                "phase": "snipe_v2",
+                "error": str(e),
+                "worker_results": [],
+                "best_speedup": 0.0,
+            }
+
+        self._stage(
+            self.query_id,
+            f"SNIPE ANALYST: done ({len(analyst_response)} chars, "
+            f"{_fmt_elapsed(time.time() - t0)})"
+        )
+
+        # Step 3: Parse analyst response
+        analysis = parse_snipe_analyst_response(analyst_response)
+        self._snipe_analysis = analysis  # persist for retry
+
+        self._stage(self.query_id, f"  Retry worthiness: {analysis.retry_worthiness or '?'}")
+        if analysis.strategy_guidance:
+            self._stage(self.query_id, f"  Strategy: {analysis.strategy_guidance[:80]}")
+
+        # Step 4: Find best worker SQL
+        best_worker_sql = self._find_best_worker_sql()
+
+        # Step 5: Load examples
+        examples = self.pipeline._load_examples_by_id(
+            analysis.examples, self.engine
+        )
+
+        # Step 6: Build sniper prompt
+        self._stage(
+            self.query_id,
+            f"SNIPER: Deploying... | total {_fmt_elapsed(time.time() - t_session)}"
+        )
+
+        sniper_prompt = build_sniper_prompt(
+            snipe_analysis=analysis,
+            original_sql=self.original_sql,
+            worker_results=self.all_worker_results,
+            best_worker_sql=best_worker_sql,
+            examples=examples,
+            output_columns=self._output_columns,
+            dag=dag,
+            costs=costs,
+            engine_profile=self._engine_profile,
+            constraints=self._constraints,
+            semantic_intents=self._semantic_intents,
+            regression_warnings=self._regression_warnings,
+            dialect=self.dialect,
+            engine_version=self.pipeline._engine_version,
+            resource_envelope=self._resource_envelope,
+            target_speedup=self.target_speedup,
+            previous_sniper_result=None,  # first sniper attempt
+        )
+
+        # Step 7: Generate, validate
+        result = self._run_sniper(
+            generator, sniper_prompt, analysis, examples,
+            snipe_num, dag, costs, t_session,
+            phase="snipe_v2",
+        )
+
+        # Attach analyst data to iteration
+        result["analyst_prompt"] = analyst_prompt
+        result["analyst_response"] = analyst_response
+        result["failure_synthesis"] = analysis.failure_synthesis
+        result["strategy_guidance"] = analysis.strategy_guidance
+        result["retry_worthiness"] = analysis.retry_worthiness
+
+        return result
+
+    def _run_sniper(
+        self,
+        generator: Any,
+        sniper_prompt: str,
+        analysis: Any,  # SnipeAnalysisV2
+        examples: List[Dict[str, Any]],
+        snipe_num: int,
+        dag: Any,
+        costs: Dict[str, Any],
+        t_session: float,
+        phase: str = "snipe_v2",
+    ) -> Dict[str, Any]:
+        """Run sniper: generate candidate, validate, save result."""
+        t_gen = time.time()
+        example_ids = [e.get("id", "?") for e in examples]
+        candidate = generator.generate_one(
+            sql=self.original_sql,
+            prompt=sniper_prompt,
+            examples_used=example_ids,
+            worker_id=5,  # sniper = worker 5
+            dialect=self.dialect,
+        )
+        self._stage(
+            self.query_id,
+            f"SNIPER: generated ({_fmt_elapsed(time.time() - t_gen)})"
+        )
+
+        # Syntax check
+        optimized_sql = candidate.optimized_sql
+        try:
+            import sqlglot
+            sqlglot.parse_one(optimized_sql, dialect=self.dialect)
+        except Exception:
+            optimized_sql = self.original_sql
+
+        # Validate
+        self._stage(
+            self.query_id,
+            f"VALIDATE: Timing... | total {_fmt_elapsed(time.time() - t_session)}"
+        )
+        t_val = time.time()
+        if self._cached_baseline is not None:
+            status, speedup, val_errors, val_error_cat = self.pipeline._validate_against_baseline(
+                self._cached_baseline, optimized_sql
+            )
+        else:
+            status, speedup, val_errors, val_error_cat = self.pipeline._validate(
+                self.original_sql, optimized_sql
+            )
+
+        strategy = f"sniper_{snipe_num}"
+        if phase == "snipe_v2_retry":
+            strategy = f"sniper_retry_{snipe_num}"
+
+        wr = WorkerResult(
+            worker_id=5,
+            strategy=strategy,
+            examples_used=analysis.examples if analysis else [],
+            optimized_sql=optimized_sql,
+            speedup=speedup,
+            status=status,
+            transforms=candidate.transforms,
+            hint=analysis.strategy_guidance[:80] if analysis and analysis.strategy_guidance else "",
+            error_message=" | ".join(val_errors) if val_errors else None,
+            error_messages=val_errors or [],
+            error_category=val_error_cat,
+        )
+        self.all_worker_results.append(wr)
+        self._sniper_result = wr  # persist for retry
+
+        err = f" — {val_errors[0][:60]}" if val_errors else ""
+        self._stage(
+            self.query_id,
+            f"VALIDATE: {status} {speedup:.2f}x ({_fmt_elapsed(time.time() - t_val)}){err}"
+        )
+
+        # Learning record
+        try:
+            lr = self.pipeline.learner.create_learning_record(
+                query_id=self.query_id,
+                examples_recommended=analysis.examples if analysis else [],
+                transforms_recommended=analysis.examples if analysis else [],
+                status="pass" if status in ("WIN", "IMPROVED", "NEUTRAL") else "error",
+                speedup=speedup,
+                transforms_used=candidate.transforms,
+                error_category=val_error_cat,
+                error_messages=val_errors,
+            )
+            self.pipeline.learner.save_learning_record(lr)
+        except Exception as e:
+            logger.warning(f"[{self.query_id}] Learning record failed: {e}")
+
+        return {
+            "iteration": snipe_num,
+            "phase": phase,
+            "worker_prompt": candidate.prompt,
+            "worker_response": candidate.response,
+            "worker_results": [wr.to_dict()],
+            "best_speedup": speedup,
+        }
+
+    def _find_best_worker_sql(self) -> Optional[str]:
+        """Find the best worker's optimized SQL (if any > 1.0x)."""
+        passing = [w for w in self.all_worker_results if w.speedup > 1.0]
+        if not passing:
+            return None
+        best = max(passing, key=lambda w: w.speedup)
+        return best.optimized_sql
+
+    def _snipe_iteration_v1(
+        self, dag: Any, costs: Dict[str, Any], snipe_num: int, t_session: float,
+    ) -> Dict[str, Any]:
+        """V1 snipe iteration: analyst synthesizes failures into 1 refined worker."""
         from ..prompts import build_snipe_prompt, parse_snipe_response
 
         # Full catalog
@@ -1135,16 +1499,26 @@ class SwarmSession(OptimizationSession):
 
         Counts only LLM calls:
         - Fan-out iteration: 1 analyst + N worker generations
-        - Snipe iteration: 1 analyst + 1 worker generation
+        - Snipe V1: 1 analyst + 1 worker
+        - Snipe V2 (iter 1): 1 analyst + 1 sniper = 2
+        - Snipe V2 retry: 0 analyst + 1 sniper = 1
+        - Snipe V2 retry skipped: 0
         """
         total = 0
         for it_data in self.iterations_data:
-            if it_data.get("phase") == "fan_out":
+            phase = it_data.get("phase", "")
+            if phase in ("fan_out", "fan_out_v2"):
                 total += 1  # analyst
                 total += len(it_data.get("worker_results", []))  # workers
-            elif it_data.get("phase") == "snipe":
+            elif phase == "snipe":
                 total += 1  # analyst
                 total += 1  # worker
+            elif phase == "snipe_v2":
+                total += 1  # analyst2
+                total += 1  # sniper
+            elif phase == "snipe_v2_retry":
+                total += 1  # sniper only (no analyst)
+            # snipe_v2_retry_skipped: 0 calls
         return total
 
     @staticmethod
