@@ -393,7 +393,7 @@ class SwarmSession(OptimizationSession):
         For PG: renders plan_json to ASCII tree via format_pg_explain_tree().
         Returns the ASCII text plan or None.
         """
-        from .analyst_briefing import format_pg_explain_tree
+        from ..prompts.analyst_briefing import format_pg_explain_tree
 
         for subdir in ["sf10", "sf5", ""]:
             if subdir:
@@ -773,6 +773,9 @@ class SwarmSession(OptimizationSession):
             )
 
         # ── Step 6.5: Per-worker SET LOCAL config validation (PG only) ──
+        # Workers with SET LOCAL commands get re-validated: run the optimized
+        # SQL with SET LOCAL applied, compare speedup vs rewrite-only.
+        pg_config_workers = []
         if self.dialect in ("postgresql", "postgres"):
             from ..pg_tuning import validate_tuning_config, build_set_local_sql
 
@@ -806,44 +809,55 @@ class SwarmSession(OptimizationSession):
                 if not validated_params:
                     continue
 
-                config_commands = build_set_local_sql(validated_params)
-                self._stage(
-                    self.query_id,
-                    f"CONFIG W{wid}: SET LOCAL {len(validated_params)} params: "
-                    f"{', '.join(f'{k}={v}' for k, v in validated_params.items())}"
-                )
+                pg_config_workers.append((wid, wr, optimized_sql, validated_params))
 
-                # Re-validate this worker with its SET LOCAL config
-                try:
-                    config_result = self.pipeline.validator.validate_with_config(
-                        original_sql=self.original_sql,
-                        optimized_sql=optimized_sql,
-                        config_commands=config_commands,
-                        worker_id=wid,
+        if pg_config_workers:
+            from ..validate import Validator
+
+            config_validator = Validator(sample_db=self.pipeline.config.db_path_or_dsn)
+            try:
+                baseline = config_validator.benchmark_baseline(self.original_sql)
+
+                for wid, wr, optimized_sql, validated_params in pg_config_workers:
+                    config_commands = build_set_local_sql(validated_params)
+                    self._stage(
+                        self.query_id,
+                        f"CONFIG W{wid}: SET LOCAL {len(validated_params)} params: "
+                        f"{', '.join(f'{k}={v}' for k, v in validated_params.items())}"
                     )
-                    if config_result and "error" not in config_result:
-                        config_speedup = config_result.get("config_speedup", wr.speedup)
-                        self._stage(
-                            self.query_id,
-                            f"CONFIG W{wid}: rewrite={wr.speedup:.2f}x → "
-                            f"rewrite+config={config_speedup:.2f}x"
+
+                    try:
+                        config_result = config_validator.validate_with_config(
+                            baseline=baseline,
+                            sql=optimized_sql,
+                            config_commands=config_commands,
+                            worker_id=wid,
                         )
-                        # Attach config to worker result
-                        wr.set_local_config = {
-                            "params": validated_params,
-                            "commands": config_commands,
-                            "config_speedup": config_speedup,
-                            "rewrite_only_speedup": wr.speedup,
-                        }
-                        # Update speedup if config improved it
-                        if config_speedup > wr.speedup:
-                            wr.speedup = config_speedup
-                    else:
-                        err_msg = config_result.get("error", "unknown") if config_result else "no result"
-                        self._stage(self.query_id, f"CONFIG W{wid}: validation error: {err_msg}")
-                except Exception as e:
-                    self._stage(self.query_id, f"CONFIG W{wid}: validation failed: {e}")
-                    logger.warning(f"[{self.query_id}] Config validation W{wid} failed: {e}")
+                        if config_result.status.value != "error":
+                            config_speedup = config_result.speedup
+                            self._stage(
+                                self.query_id,
+                                f"CONFIG W{wid}: rewrite={wr.speedup:.2f}x → "
+                                f"rewrite+config={config_speedup:.2f}x"
+                            )
+                            # Attach config to worker result
+                            wr.set_local_config = {
+                                "params": validated_params,
+                                "commands": config_commands,
+                                "config_speedup": config_speedup,
+                                "rewrite_only_speedup": wr.speedup,
+                            }
+                            # Update speedup if config improved it
+                            if config_speedup > wr.speedup:
+                                wr.speedup = config_speedup
+                        else:
+                            err_msg = config_result.error or "unknown"
+                            self._stage(self.query_id, f"CONFIG W{wid}: validation error: {err_msg}")
+                    except Exception as e:
+                        self._stage(self.query_id, f"CONFIG W{wid}: validation failed: {e}")
+                        logger.warning(f"[{self.query_id}] Config validation W{wid} failed: {e}")
+            finally:
+                config_validator.close()
 
         # Learning records
         for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):

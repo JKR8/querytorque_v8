@@ -273,10 +273,14 @@ def generate_config(query_id: str, analysis: PlanAnalysis) -> dict:
 
 
 def generate_template_config(query_id: str) -> dict:
-    """Template config for queries without usable EXPLAIN plans (timeouts)."""
+    """Template config for queries without usable EXPLAIN plans (timeouts).
+
+    Does NOT force max_parallel_workers_per_gather — reducing parallel costs
+    already encourages parallelism where the planner thinks it helps, without
+    forcing overhead on fast rewrites (Q039: 187ms → 1782ms with forced 4 workers).
+    """
     params = {
         "work_mem": "256MB",
-        "max_parallel_workers_per_gather": "4",
         "jit": "off",
         "parallel_setup_cost": "100.0",
         "parallel_tuple_cost": "0.001",
