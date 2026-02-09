@@ -24,8 +24,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import yaml
-
 from .briefing_checks import (
     build_analyst_section_checklist,
     build_expert_section_checklist,
@@ -44,6 +42,7 @@ def _load_algorithm(name: str) -> Optional[str]:
     if not path.exists():
         return None
     try:
+        import yaml
         data = yaml.safe_load(path.read_text())
     except Exception as e:
         logger.warning(f"Failed to load algorithm {name}: {e}")
@@ -686,6 +685,7 @@ def build_analyst_briefing_prompt(
     resource_envelope: Optional[str] = None,
     exploit_algorithm_text: Optional[str] = None,
     plan_scanner_text: Optional[str] = None,
+    iteration_history: Optional[Dict[str, Any]] = None,
     mode: str = "swarm",
 ) -> str:
     """Build the analyst briefing prompt for swarm, expert, or oneshot mode.
@@ -716,6 +716,8 @@ def build_analyst_briefing_prompt(
             probing (may be None). When present, replaces engine profile section.
         plan_scanner_text: Pre-computed plan-space scanner results for PG (may be None).
             Shows what happens when planner flags are toggled via SET LOCAL.
+        iteration_history: Prior optimization attempts for this query (expert/oneshot
+            iterative mode). Dict with 'attempts' list. None for first iteration or swarm.
         mode: Prompt mode — "swarm" (4 workers), "expert" (1 worker), or "oneshot"
             (analyze + produce SQL directly). Default "swarm".
 
@@ -952,6 +954,37 @@ def build_analyst_briefing_prompt(
         for reg in regression_warnings:
             lines.append(_format_regression_for_analyst(reg))
             lines.append("")
+
+    # ── 9b. Iteration History (expert/oneshot iterative mode) ────────────
+    if iteration_history and iteration_history.get("attempts"):
+        lines.append("## Previous Optimization Attempts on This Query")
+        lines.append("")
+        lines.append(
+            "The following attempts have already been tried. "
+            "Do NOT repeat strategies that regressed or failed. "
+            "Build on what worked; avoid what didn't."
+        )
+        lines.append("")
+        for i, attempt in enumerate(iteration_history["attempts"]):
+            status = attempt.get("status", "unknown")
+            speedup = attempt.get("speedup", 0)
+            transforms = attempt.get("transforms", [])
+            t_str = ", ".join(transforms) if transforms else "unknown"
+            if status in ("error", "ERROR"):
+                error = attempt.get("error", "")
+                lines.append(f"- Attempt {i+1}: **{t_str}** → ERROR: {error}")
+            elif speedup < 0.95:
+                lines.append(f"- Attempt {i+1}: **{t_str}** → REGRESSION ({speedup:.2f}x)")
+            elif speedup >= 1.10:
+                lines.append(f"- Attempt {i+1}: **{t_str}** → WIN ({speedup:.2f}x)")
+            else:
+                lines.append(f"- Attempt {i+1}: **{t_str}** → NEUTRAL ({speedup:.2f}x)")
+            # Include failure analysis if present
+            failure_analysis = attempt.get("failure_analysis", "")
+            if failure_analysis and status not in ("WIN", "IMPROVED"):
+                preview = failure_analysis[:200] + "..." if len(failure_analysis) > 200 else failure_analysis
+                lines.append(f"  Analysis: {preview}")
+        lines.append("")
 
     # ── 10. Exploit Algorithm or Engine Profile ──────────────────────────
     if exploit_algorithm_text:

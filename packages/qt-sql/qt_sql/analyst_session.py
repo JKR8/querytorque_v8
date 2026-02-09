@@ -251,6 +251,7 @@ class AnalystSession:
             resource_envelope=ctx["resource_envelope"],
             exploit_algorithm_text=ctx["exploit_algorithm_text"],
             plan_scanner_text=ctx["plan_scanner_text"],
+            iteration_history=self._build_iteration_history(),
             mode="expert",
         )
 
@@ -284,8 +285,13 @@ class AnalystSession:
         # Phase 4: Parse briefing and build worker prompt
         briefing = parse_briefing_response(analyst_response)
 
-        # Load examples for the worker
+        # Load examples for the worker — validate the parsed worker has real
+        # content (parse_briefing_response pads empty workers on parse failure,
+        # so we must check strategy is non-empty, not just that workers exist).
         worker = briefing.workers[0] if briefing.workers else None
+        if worker and not worker.strategy.strip():
+            self._stage(self.query_id, "  Briefing parse returned empty worker, falling back to V1")
+            worker = None
         if worker:
             examples = self.pipeline._load_examples_by_id(
                 worker.examples, engine
