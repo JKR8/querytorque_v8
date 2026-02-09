@@ -139,7 +139,7 @@ class ADORunner:
         """Run optimization on a single query in the specified mode.
 
         Modes:
-        - STANDARD: Fast, no analyst, N workers, single iteration
+        - ONESHOT: 1 LLM call per iteration, analyst produces SQL directly
         - EXPERT: Iterative, 1 worker per round, analyst failure analysis steers each attempt
         - SWARM: Fan-out 4 workers, then snipe with 1 worker per round
 
@@ -148,8 +148,8 @@ class ADORunner:
             sql: Original SQL query
             max_iterations: Max optimization rounds
             target_speedup: Stop early when this speedup is reached
-            n_workers: Parallel workers (STANDARD only; EXPERT=1, SWARM=4 always)
-            mode: Optimization mode (standard, expert, swarm)
+            n_workers: Parallel workers (ONESHOT=1, EXPERT=1, SWARM=4 always)
+            mode: Optimization mode (oneshot, expert, swarm)
 
         Returns:
             ADOResult with the best result

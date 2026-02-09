@@ -14,6 +14,9 @@ from .swarm_parsers import (
     BriefingWorker,
     ParsedBriefing,
     parse_briefing_response,
+    # Oneshot types
+    OneshotResult,
+    parse_oneshot_response,
     # Snipe types
     SnipeAnalysis,
     parse_snipe_response,
@@ -38,6 +41,9 @@ __all__ = [
     "BriefingWorker",
     "ParsedBriefing",
     "parse_briefing_response",
+    # Oneshot
+    "OneshotResult",
+    "parse_oneshot_response",
     "build_analyst_briefing_prompt",
     "build_worker_prompt",
     "build_analyst_section_checklist",

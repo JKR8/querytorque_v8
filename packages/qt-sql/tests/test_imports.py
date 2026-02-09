@@ -138,11 +138,11 @@ class TestQtSqlSessionImports:
         """Test sessions package import."""
         from qt_sql.sessions import (
             SwarmSession,
-            StandardSession,
+            OneshotSession,
             ExpertSession,
         )
         assert SwarmSession is not None
-        assert StandardSession is not None
+        assert OneshotSession is not None
         assert ExpertSession is not None
 
 

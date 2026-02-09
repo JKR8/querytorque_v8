@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .learn import Learner
-from .node_prompter import Prompter
 from .schemas import (
     BenchmarkConfig,
     OptimizationMode,
@@ -66,6 +65,7 @@ class Pipeline:
         self.use_analyst = use_analyst
 
         # Initialize pipeline components
+        from .node_prompter import Prompter
         self.prompter = Prompter()
         self.learner = Learner(
             journal_dir=self.benchmark_dir / "learning"
@@ -756,20 +756,20 @@ class Pipeline:
             max_iterations: Max optimization rounds
             target_speedup: Stop early when this speedup is reached
             n_workers: Parallel workers per iteration
-            mode: Optimization mode (standard, expert, swarm)
+            mode: Optimization mode (oneshot, expert, swarm)
 
         Returns:
             SessionResult with the best result across all iterations
         """
-        if mode == OptimizationMode.STANDARD:
-            from .sessions.standard_session import StandardSession
-            session = StandardSession(
+        if mode == OptimizationMode.ONESHOT:
+            from .sessions.oneshot_session import OneshotSession
+            session = OneshotSession(
                 pipeline=self,
                 query_id=query_id,
                 original_sql=sql,
                 target_speedup=target_speedup,
-                max_iterations=1,
-                n_workers=n_workers,
+                max_iterations=max_iterations,
+                n_workers=1,
             )
         elif mode == OptimizationMode.EXPERT:
             from .sessions.expert_session import ExpertSession
@@ -1048,10 +1048,11 @@ class Pipeline:
 
     @staticmethod
     def _format_briefing_as_expert_analysis(briefing) -> str:
-        """Convert a parsed briefing into flat expert_analysis text for V1 prompts.
+        """Convert a parsed briefing into flat expert_analysis text.
 
         Translates briefing shared sections (semantic_contract, bottleneck_diagnosis,
-        etc.) and worker strategy into the format Prompter.build_prompt() expects.
+        etc.) and worker strategy into the format Prompter.build_prompt() expects
+        for the batch pipeline (run_query) path.
         """
         lines = ["## Expert Analysis", ""]
         shared = briefing.shared
@@ -1100,8 +1101,9 @@ class Pipeline:
     ) -> tuple[Optional[str], Optional[str], Optional[str], List[Dict[str, Any]]]:
         """Run LLM analyst to generate deep structural analysis.
 
-        DEPRECATED: Used by the V1 run_query() path. New code should use
-        gather_analyst_context() + build_analyst_briefing_prompt(mode="expert").
+        Used by the run_query() path for single-pass optimization. Session
+        modes (oneshot/expert/swarm) use gather_analyst_context() +
+        build_analyst_briefing_prompt() directly instead.
 
         Returns:
             (formatted_analysis, raw_response, analysis_prompt, final_examples) —
@@ -1142,7 +1144,7 @@ class Pipeline:
             logger.warning(f"[{query_id}] Analyst LLM call failed: {e}")
             return None, None, analysis_prompt, matched_examples
 
-        # Parse briefing-format response and format for V1 rewrite prompt.
+        # Parse briefing-format response and format for the batch rewrite prompt.
         # The LLM responds in briefing format (=== SHARED BRIEFING === etc.),
         # so we parse with parse_briefing_response and convert the shared
         # sections into the flat text format that Prompter.build_prompt() expects.

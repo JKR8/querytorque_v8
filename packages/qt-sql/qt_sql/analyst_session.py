@@ -294,7 +294,7 @@ class AnalystSession:
             import re
             strategy = worker.strategy.strip()
             if not strategy or re.fullmatch(r"strategy_\d+", strategy):
-                self._stage(self.query_id, "  Briefing parse returned empty/placeholder worker, falling back to V1")
+                self._stage(self.query_id, "  Briefing parse returned empty/placeholder worker, falling back to example-based prompt")
                 worker = None
         if worker:
             examples = self.pipeline._load_examples_by_id(
@@ -310,33 +310,16 @@ class AnalystSession:
         output_columns = Prompter._extract_output_columns(dag)
 
         # Build worker prompt (same as swarm workers use)
-        if worker:
-            prompt = build_worker_prompt(
-                worker_briefing=worker,
-                shared_briefing=briefing.shared,
-                examples=examples,
-                original_sql=input_sql,
-                output_columns=output_columns,
-                dialect=dialect,
-                engine_version=self.pipeline._engine_version,
-                resource_envelope=ctx["resource_envelope"],
-            )
-        else:
-            # Fallback to V1 prompter if briefing parse failed
-            prompt = self.pipeline.prompter.build_prompt(
-                query_id=self.query_id,
-                full_sql=input_sql,
-                dag=dag,
-                costs=costs,
-                history=self._build_iteration_history(),
-                examples=examples,
-                expert_analysis=None,
-                global_learnings=self.pipeline.learner.build_learning_summary(),
-                regression_warnings=ctx["regression_warnings"],
-                dialect=dialect,
-                semantic_intents=ctx["semantic_intents"],
-                engine_version=self.pipeline._engine_version,
-            )
+        prompt = build_worker_prompt(
+            worker_briefing=worker if worker else briefing.workers[0],
+            shared_briefing=briefing.shared,
+            examples=examples,
+            original_sql=input_sql,
+            output_columns=output_columns,
+            dialect=dialect,
+            engine_version=self.pipeline._engine_version,
+            resource_envelope=ctx["resource_envelope"],
+        )
 
         # Phase 5: Generate rewrite
         self._stage(self.query_id, "Phase 5: LLM rewrite (generating candidate)...")

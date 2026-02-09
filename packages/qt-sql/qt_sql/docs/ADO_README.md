@@ -89,14 +89,14 @@ p = Pipeline(
 sql = open("packages/qt-sql/ado/benchmarks/duckdb_tpcds/queries/query_67.sql").read()
 ```
 
-### Standard (fast, no analyst)
+### Oneshot (cheapest, 1 LLM call per iteration)
 
-Single iteration: FAISS retrieval, prompt, generate, validate. No analyst call, no retry.
+Analyst produces optimized SQL directly in a single LLM call. Optional iteration with failure analysis.
 
 ```python
 result = p.run_optimization_session(
     query_id="query_67", sql=sql,
-    mode=OptimizationMode.STANDARD, n_workers=3,
+    mode=OptimizationMode.ONESHOT, max_iterations=3,
 )
 ```
 
@@ -128,14 +128,11 @@ result = p.run_optimization_session(
 # n_workers is always 4 in swarm mode (hardcoded)
 ```
 
-### Swarm V2 (analyst-as-interpreter)
+### Swarm (analyst-as-interpreter)
 
-V2 replaces the V1 "router" analyst (which outputs ~50 tokens of strategy names) with an
-**interpreter** analyst that produces a structured briefing: semantic contract, bottleneck
+The analyst produces a structured briefing: semantic contract, bottleneck
 diagnosis, target DAG with node contracts, hazard flags, and per-worker example reasoning.
 Workers receive a precise specification instead of a generic prompt dump.
-
-**Enable with `use_v2_prompts=True`:**
 
 ```python
 # Via Pipeline (direct)
@@ -143,7 +140,6 @@ result = p.run_optimization_session(
     query_id="query_67", sql=sql,
     mode=OptimizationMode.SWARM,
     max_iterations=3, target_speedup=2.0,
-    use_v2_prompts=True,  # <-- V2 analyst-as-interpreter
 )
 
 # Via ADORunner
@@ -153,11 +149,10 @@ runner = ADORunner(ADOConfig(benchmark_dir="packages/qt-sql/ado/benchmarks/duckd
 result = runner.run_analyst(
     query_id="query_67", sql=sql,
     mode=OptimizationMode.SWARM,
-    use_v2_prompts=True,  # <-- V2 analyst-as-interpreter
 )
 ```
 
-**What the analyst produces (V2 briefing):**
+**What the analyst produces:**
 
 | Section | Recipient | Purpose |
 |---------|-----------|---------|
@@ -331,7 +326,7 @@ ado/
 │   └── postgres/     # PostgreSQL-specific gold examples
 ├── models/           # Tag-based similarity index + metadata
 ├── prompts/          # Swarm prompt builders (V1 fan-out, V2 analyst briefing, parsers)
-├── sessions/         # Session drivers (standard, expert, swarm)
+├── sessions/         # Session drivers (oneshot, expert, swarm)
 ├── learnings/        # Learning journal data
 ├── benchmarks/       # Per-engine benchmark configs, queries, results
 │   ├── duckdb_tpcds/ # Config, 99 queries, explains, leaderboard, semantic_intents

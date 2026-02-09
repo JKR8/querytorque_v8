@@ -419,6 +419,89 @@ def parse_snipe_response(response: str) -> SnipeAnalysis:
     return result
 
 
+@dataclass
+class OneshotResult:
+    """Parsed oneshot response — analyst produces SQL directly."""
+    strategy: str = ""
+    transforms: List[str] = field(default_factory=list)
+    optimized_sql: str = ""
+    shared: BriefingShared = field(default_factory=BriefingShared)
+    raw: str = ""
+
+
+def parse_oneshot_response(response: str) -> OneshotResult:
+    """Parse oneshot analyst response into structured result.
+
+    Fault-tolerant: returns empty fields rather than raising.
+
+    Expected format:
+        <reasoning>...</reasoning>
+
+        === SHARED BRIEFING ===
+        SEMANTIC_CONTRACT: ...
+        BOTTLENECK_DIAGNOSIS: ...
+        ACTIVE_CONSTRAINTS: ...
+        REGRESSION_WARNINGS: ...
+
+        === OPTIMIZED SQL ===
+
+        STRATEGY: strategy_name
+        TRANSFORM: transform_names
+
+        ```sql
+        SELECT ...
+        ```
+    """
+    result = OneshotResult(raw=response)
+
+    # Strip <reasoning>...</reasoning> block
+    stripped = re.sub(
+        r'<reasoning>.*?</reasoning>',
+        '', response, flags=re.DOTALL,
+    ).strip()
+
+    # Parse shared briefing (reuse existing parser)
+    result.shared = _parse_shared_briefing(stripped)
+
+    # Find the === OPTIMIZED SQL === section
+    sql_section_match = re.search(
+        r'===\s*OPTIMIZED\s+SQL\s*===\s*\n(.*)',
+        stripped, re.DOTALL | re.IGNORECASE,
+    )
+    if sql_section_match:
+        sql_section = sql_section_match.group(1)
+    else:
+        # Fallback: use everything after shared briefing
+        sql_section = stripped
+
+    # Extract STRATEGY (single line)
+    result.strategy = _extract_field(sql_section, "STRATEGY")
+
+    # Extract TRANSFORM (comma-separated or single)
+    transform_raw = _extract_field(sql_section, "TRANSFORM")
+    if transform_raw:
+        result.transforms = [t.strip() for t in transform_raw.split(",") if t.strip()]
+
+    # Extract SQL from code block
+    sql_match = re.search(
+        r'```sql\s*\n(.*?)```',
+        sql_section, re.DOTALL | re.IGNORECASE,
+    )
+    if sql_match:
+        result.optimized_sql = sql_match.group(1).strip()
+    else:
+        # Try bare code block
+        bare_match = re.search(r'```\s*\n(.*?)```', sql_section, re.DOTALL)
+        if bare_match:
+            result.optimized_sql = bare_match.group(1).strip()
+
+    # Fallback: if nothing parsed, log warning
+    if not result.optimized_sql:
+        logger.warning("Could not parse optimized SQL from oneshot response")
+
+    return result
+
+
 def _extract_briefing_section(
     text: str,
     section_name: str,

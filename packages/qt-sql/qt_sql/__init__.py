@@ -8,17 +8,17 @@ Pipeline:
 5. Validate:  Timing + correctness (3-run or 5-run)
 
 Optimization Modes:
-- STANDARD: Fast, no analyst, single iteration
-- EXPERT:   Iterative with analyst failure analysis (default)
-- SWARM:    Multi-worker fan-out with snipe refinement
+- ONESHOT: 1 LLM call per iteration, analyst produces SQL directly
+- EXPERT:  Iterative with analyst failure analysis (default)
+- SWARM:   Multi-worker fan-out with snipe refinement
 
 Usage:
     from qt_sql.pipeline import Pipeline
     from qt_sql.schemas import OptimizationMode
     p = Pipeline("qt_sql/benchmarks/duckdb_tpcds")
 
-    # Standard mode (fast, no analyst):
-    result = p.run_optimization_session("query_1", sql, mode=OptimizationMode.STANDARD)
+    # Oneshot mode (cheapest, 1 API call per iteration):
+    result = p.run_optimization_session("query_1", sql, mode=OptimizationMode.ONESHOT)
 
     # Expert mode (default, iterative with failure analysis):
     result = p.run_optimization_session("query_1", sql, mode=OptimizationMode.EXPERT)
@@ -47,7 +47,7 @@ from .schemas import (
 )
 from .sessions import (
     OptimizationSession,
-    StandardSession,
+    OneshotSession,
     ExpertSession,
     SwarmSession,
 )
@@ -62,7 +62,7 @@ __all__ = [
     "BenchmarkConfig",
     "OptimizationMode",
     "OptimizationSession",
-    "StandardSession",
+    "OneshotSession",
     "ExpertSession",
     "SwarmSession",
     "PipelineResult",

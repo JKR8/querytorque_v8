@@ -1194,10 +1194,11 @@ def build_analyst_briefing_prompt(
     lines.append("")
     if mode == "oneshot":
         lines.append(
-            "7. **WRITE SQL**: Implement your strategy as complete, working SQL. "
-            "Follow your DAG design from step 6 exactly. Verify every node "
-            "contract's OUTPUT columns are present in the final SQL. The SQL must "
-            "be semantically equivalent to the original."
+            "7. **WRITE REWRITE**: Implement your strategy as a JSON rewrite_set. "
+            "Each changed or added CTE is a node. Produce per-node SQL matching "
+            "your DAG design from step 6. Declare output columns for every node "
+            "in `node_contracts`. The rewrite must be semantically equivalent to "
+            "the original."
         )
         lines.append("")
 
@@ -1286,13 +1287,42 @@ def build_analyst_briefing_prompt(
         for tl in _WORKER_BRIEFING_TEMPLATE:
             lines.append(tl)
     elif mode == "oneshot":
-        lines.append("=== OPTIMIZED SQL ===")
+        lines.append("=== REWRITE ===")
         lines.append("")
-        lines.append("STRATEGY: [strategy_name]")
-        lines.append("TRANSFORM: [transform_names]")
+        lines.append("```json")
+        lines.append("{")
+        lines.append('  "rewrite_sets": [{')
+        lines.append('    "id": "rs_01",')
+        lines.append('    "transform": "<transform_name>",')
+        lines.append('    "nodes": {')
+        lines.append('      "<cte_name>": "<SQL for this CTE body>",')
+        lines.append('      "main_query": "<final SELECT>"')
+        lines.append("    },")
+        lines.append('    "node_contracts": {')
+        lines.append('      "<cte_name>": ["col1", "col2", "..."],')
+        lines.append('      "main_query": ["col1", "col2", "..."]')
+        lines.append("    },")
+        lines.append('    "set_local": ["SET LOCAL work_mem = \'512MB\'", "SET LOCAL jit = \'off\'"],')
+        lines.append('    "data_flow": "<cte_a> -> <cte_b> -> main_query",')
+        lines.append('    "invariants_kept": ["same output columns", "same rows"],')
+        lines.append('    "expected_speedup": "2.0x",')
+        lines.append('    "risk": "low"')
+        lines.append("  }]")
+        lines.append("}")
+        lines.append("```")
         lines.append("")
-        lines.append("```sql")
-        lines.append("[Complete optimized SQL here — must be semantically equivalent to original]")
+        lines.append("Rules:")
+        lines.append("- Every node in `nodes` MUST appear in `node_contracts` and vice versa")
+        lines.append("- `node_contracts`: list the output column names each node produces")
+        lines.append("- `data_flow`: show the CTE dependency chain")
+        lines.append("- `main_query` = the final SELECT")
+        lines.append("- Only include nodes you changed or added; unchanged nodes auto-filled from original")
+        lines.append("")
+        lines.append("After the JSON, explain the mechanism:")
+        lines.append("")
+        lines.append("```")
+        lines.append("Changes: <1-2 sentences: what structural change + the expected mechanism>")
+        lines.append("Expected speedup: <estimate>")
         lines.append("```")
 
     lines.append("```")
