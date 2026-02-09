@@ -1046,6 +1046,47 @@ class Pipeline:
     # Analyst (opt-in, stubborn query mode)
     # =========================================================================
 
+    @staticmethod
+    def _format_briefing_as_expert_analysis(briefing) -> str:
+        """Convert a parsed briefing into flat expert_analysis text for V1 prompts.
+
+        Translates briefing shared sections (semantic_contract, bottleneck_diagnosis,
+        etc.) and worker strategy into the format Prompter.build_prompt() expects.
+        """
+        lines = ["## Expert Analysis", ""]
+        shared = briefing.shared
+        if shared.bottleneck_diagnosis:
+            lines.append("### Performance Bottleneck")
+            lines.append(shared.bottleneck_diagnosis)
+            lines.append("")
+        if shared.semantic_contract:
+            lines.append("### Semantic Contract")
+            lines.append(shared.semantic_contract)
+            lines.append("")
+        if shared.regression_warnings and shared.regression_warnings.lower() != "none applicable.":
+            lines.append("### Regression Warnings")
+            lines.append(shared.regression_warnings)
+            lines.append("")
+        # Worker strategy as recommended approach
+        if briefing.workers:
+            w = briefing.workers[0]
+            if w.strategy and w.strategy.strip():
+                lines.append("### Recommended Approach")
+                lines.append(w.strategy)
+                lines.append("")
+            if w.hazard_flags and w.hazard_flags.strip():
+                lines.append("### Hazard Flags")
+                lines.append(w.hazard_flags)
+                lines.append("")
+        if len(lines) <= 2:
+            # Nothing extracted — return raw response as fallback
+            return "## Expert Analysis\n\n" + briefing.raw[:2000]
+        lines.append(
+            "Apply the recommended strategy above. Focus on implementing it "
+            "correctly while preserving semantic equivalence."
+        )
+        return "\n".join(lines)
+
     def _run_analyst(
         self,
         query_id: str,
@@ -1067,12 +1108,9 @@ class Pipeline:
             final_examples may differ from matched_examples if the analyst
             recommended swaps. Returns (None, None, None, matched_examples) on failure.
         """
-        from .analyst import (
-            format_analysis_for_prompt,
-            parse_analysis_response,
-            parse_example_overrides,
-        )
+        from .analyst import parse_example_overrides
         from .prompts.analyst_briefing import build_analyst_briefing_prompt
+        from .prompts.swarm_parsers import parse_briefing_response
 
         logger.info(f"[{query_id}] Running LLM analyst (stubborn query mode)")
 
@@ -1104,12 +1142,20 @@ class Pipeline:
             logger.warning(f"[{query_id}] Analyst LLM call failed: {e}")
             return None, None, analysis_prompt, matched_examples
 
-        # Parse and format for injection into V1 rewrite prompt
-        parsed = parse_analysis_response(raw_response)
-        formatted = format_analysis_for_prompt(parsed)
+        # Parse briefing-format response and format for V1 rewrite prompt.
+        # The LLM responds in briefing format (=== SHARED BRIEFING === etc.),
+        # so we parse with parse_briefing_response and convert the shared
+        # sections into the flat text format that Prompter.build_prompt() expects.
+        briefing = parse_briefing_response(raw_response)
+        formatted = _format_briefing_as_expert_analysis(briefing)
 
-        # Check if analyst wants different examples
+        # Check if analyst wants different examples (from WORKER 1's EXAMPLES field)
         overrides = parse_example_overrides(raw_response)
+        # Also check worker examples from parsed briefing
+        if not overrides and briefing.workers:
+            worker_examples = briefing.workers[0].examples
+            if worker_examples:
+                overrides = worker_examples
         final_examples = matched_examples
         if overrides:
             logger.info(f"[{query_id}] Analyst overrides matched picks: {overrides}")
@@ -1120,7 +1166,6 @@ class Pipeline:
         logger.info(
             f"[{query_id}] Analyst complete: "
             f"{len(raw_response)} chars response, "
-            f"{len(parsed) - 1} sections parsed, "
             f"examples: {[e.get('id', '?') for e in final_examples]}"
         )
 

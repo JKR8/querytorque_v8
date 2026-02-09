@@ -286,12 +286,16 @@ class AnalystSession:
         briefing = parse_briefing_response(analyst_response)
 
         # Load examples for the worker — validate the parsed worker has real
-        # content (parse_briefing_response pads empty workers on parse failure,
-        # so we must check strategy is non-empty, not just that workers exist).
+        # content. parse_briefing_response pads empty workers on parse failure
+        # (strategy="") and assigns placeholder strategies (strategy="strategy_1")
+        # when extraction partially fails. Both must trigger V1 fallback.
         worker = briefing.workers[0] if briefing.workers else None
-        if worker and not worker.strategy.strip():
-            self._stage(self.query_id, "  Briefing parse returned empty worker, falling back to V1")
-            worker = None
+        if worker:
+            import re
+            strategy = worker.strategy.strip()
+            if not strategy or re.fullmatch(r"strategy_\d+", strategy):
+                self._stage(self.query_id, "  Briefing parse returned empty/placeholder worker, falling back to V1")
+                worker = None
         if worker:
             examples = self.pipeline._load_examples_by_id(
                 worker.examples, engine
