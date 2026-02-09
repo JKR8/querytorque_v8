@@ -1,0 +1,429 @@
+You are a senior SQL optimization architect for PostgreSQL v14.3. You have FULL FREEDOM to design your own approach — you are NOT constrained to any specific DAG topology or CTE structure. The analyst's strategy guidance below is ADVISORY, not mandatory.
+
+Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — guards prevent silent breakage. Strip benchmark comments (-- start query, -- end query) from output.
+
+## Target: >=2.0x speedup
+
+Your target is >=2.0x speedup on this query. This is the bar. Anything below 2.0x is a miss.
+
+## Previous Optimization Attempts
+Target: **>=2.0x** | 4 workers tried | none reached target
+
+| Worker | Strategy | Speedup | Status | Error |
+|--------|----------|---------|--------|-------|
+| W1 ★ | star_join_prefetch | 1.15x | NEUTRAL |  |
+| W4 | exploration_novel | 0.92x | REGRESSION |  |
+| W2 | decorrelate_subquery | 0.85x | REGRESSION | Row count mismatch: expected 142, got 198 |
+| W3 | scan_consolidation | 0.0x | ERROR | syntax error at or near 'FILTER' (line 12) |
+
+
+## Best Foundation SQL
+
+The best previous result. You may build on this or start fresh.
+
+```sql
+WITH filtered_dates AS (
+  SELECT d_date_sk, d_week_seq, d_date
+  FROM date_dim
+  WHERE d_year = 1998
+)
+SELECT i_item_desc, w_warehouse_name, d_week_seq
+FROM catalog_sales cs
+JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk
+-- ... rest of query
+```
+
+## Failure Synthesis (from diagnostic analyst)
+
+W1 achieved 1.15x via date CTE isolation — the only passing approach. The bottleneck is the nested-loop join between filtered catalog_sales and inventory (non-equi condition inv_quantity_on_hand < cs_quantity). W2 broke semantic equivalence by decorrelating a non-correlated subquery path. W3 used PG-unsupported FILTER syntax. W4's novel approach didn't reduce the critical join input cardinality.
+
+## Unexplored Angles
+
+No worker attempted to pre-aggregate or pre-filter inventory. The EXPLAIN shows inventory is scanned fully (11M rows) for each probe. Pre-filtering inventory by the d_week_seq range (only ~7 weeks in 1998) would reduce the join input from 11M to ~1.5M rows.
+
+## Strategy Guidance (ADVISORY — not mandatory)
+
+1. Keep W1's date CTE isolation (proven 1.15x). 2. Add inventory pre-filtering: join inventory with the same date CTE to restrict to relevant weeks, reducing from 11M to ~1.5M rows. 3. Then join filtered_cs with filtered_inventory on (item_sk, quantity < condition). This reduces the nested-loop from 170K×11M to 170K×1.5M — a ~7x reduction in join work.
+
+## Example Adaptation Notes
+
+pg_date_cte_explicit_join: APPLY the date CTE isolation pattern (proven by W1). IGNORE the explicit join conversion — PG already uses explicit joins.
+pg_dimension_prefetch_star: APPLY the multi-dimension prefetch concept, adapted for INVENTORY pre-filtering. IGNORE the star-join aspect — Q072 is not a star join.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. pg_date_cte_explicit_join (2.28x)
+
+**Principle:** Dimension Isolation + Explicit Joins: materialize selective dimension filters into CTEs to create tiny hash tables, AND convert comma-separated joins to explicit JOIN syntax. On PostgreSQL, the combination enables better hash join planning with a tiny probe table.
+
+**BEFORE (slow):**
+```sql
+select 
+   substring(w_warehouse_name,1,20)
+  ,sm_type
+  ,cc_name
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk <= 30 ) then 1 else 0 end)  as "30 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 30) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 60) then 1 else 0 end )  as "31-60 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 60) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 90) then 1 else 0 end)  as "61-90 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 90) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 120) then 1 else 0 end)  as "91-120 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk  > 120) then 1 else 0 end)  as ">120 days"
+from
+   catalog_sales
+  ,warehouse
+  ,ship_mode
+  ,call_center
+  ,date_dim
+where
+d_month_seq between 1193 and 1193 + 23
+and cs_ship_date_sk   = d_date_sk
+and cs_warehouse_sk   = w_warehouse_sk
+and cs_ship_mode_sk   = sm_ship_mode_sk
+and cs_call_center_sk = cc_call_center_sk
+and cs_list_price between 271 and 300
+and sm_type = 'REGULAR'
+and cc_class = 'small'
+and w_gmt_offset = -5
+group by
+   substring(w_warehouse_name,1,20)
+  ,sm_type
+  ,cc_name
+order by substring(w_warehouse_name,1,20)
+        ,sm_type
+        ,cc_name
+limit 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1193 AND 1216
+```
+[main_query]:
+```sql
+SELECT SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name, SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", ... FROM catalog_sales JOIN filtered_dates ON cs_ship_date_sk = d_date_sk JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk JOIN call_center ON cs_call_center_sk = cc_call_center_sk WHERE cs_list_price BETWEEN 271 AND 300 AND sm_type = 'REGULAR' AND cc_class = 'small' AND w_gmt_offset = -5 GROUP BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name ORDER BY 1, 2, 3 LIMIT 100
+```
+
+### 2. pg_dimension_prefetch_star (3.32x)
+
+**Principle:** Multi-Dimension Prefetch (PG): pre-filter all selective dimensions into CTEs to create tiny hash tables, combined with explicit JOIN syntax. PostgreSQL's optimizer gets better cardinality estimates from pre-materialized small dimension results.
+
+**BEFORE (slow):**
+```sql
+with ssr as
+ (select  s_store_id as store_id,
+          sum(ss_ext_sales_price) as sales,
+          sum(coalesce(sr_return_amt, 0)) as returns,
+          sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit
+  from store_sales left outer join store_returns on
+         (ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number),
+     date_dim,
+     store,
+     item,
+     promotion
+ where ss_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+       and ss_store_sk = s_store_sk
+       and ss_item_sk = i_item_sk
+       and i_current_price > 50
+       and ss_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and ss_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+ group by s_store_id)
+ ,
+ csr as
+ (select  cp_catalog_page_id as catalog_page_id,
+          sum(cs_ext_sales_price) as sales,
+          sum(coalesce(cr_return_amount, 0)) as returns,
+          sum(cs_net_profit - coalesce(cr_net_loss, 0)) as profit
+  from catalog_sales left outer join catalog_returns on
+         (cs_item_sk = cr_item_sk and cs_order_number = cr_order_number),
+     date_dim,
+     catalog_page,
+     item,
+     promotion
+ where cs_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+        and cs_catalog_page_sk = cp_catalog_page_sk
+       and cs_item_sk = i_item_sk
+       and i_current_price > 50
+       and cs_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and cs_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+group by cp_catalog_page_id)
+ ,
+ wsr as
+ (select  web_site_id,
+          sum(ws_ext_sales_price) as sales,
+          sum(coalesce(wr_return_amt, 0)) as returns,
+          sum(ws_net_profit - coalesce(wr_net_loss, 0)) as profit
+  from web_sales left outer join web_returns on
+         (ws_item_sk = wr_item_sk and ws_order_number = wr_order_number),
+     date_dim,
+     web_site,
+     item,
+     promotion
+ where ws_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+        and ws_web_site_sk = web_site_sk
+       and ws_item_sk = i_item_sk
+       and i_current_price > 50
+       and ws_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and ws_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+group by web_site_id)
+  select  channel
+        , id
+        , sum(sales) as sales
+        , sum(returns) as returns
+        , sum(profit) as profit
+ from
+ (select 'store channel' as channel
+        , 'store' || store_id as id
+        , sales
+        , returns
+        , profit
+ from   ssr
+ union all
+ select 'catalog channel' as channel
+        , 'catalog_page' || catalog_page_id as id
+        , sales
+        , returns
+        , profit
+ from  csr
+ union all
+ select 'web channel' as channel
+        , 'web_site' || web_site_id as id
+        , sales
+        , returns
+        , profit
+ from   wsr
+ ) x
+ group by rollup (channel, id)
+ order by channel
+         ,id
+ limit 100;
+```
+
+**AFTER (fast):**
+[filtered_date]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-23' AS DATE) AND CAST('1998-08-23' AS DATE) + INTERVAL '30 DAY'
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk FROM item WHERE i_current_price > 50 AND i_category IN ('Jewelry', 'Music')
+```
+[filtered_promotion]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'Y' AND p_channel_tv = 'Y' AND p_channel_radio = 'N' AND p_channel_press = 'N' AND p_channel_event = 'Y'
+```
+[ssr]:
+```sql
+SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS returns, SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit FROM store_sales LEFT OUTER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) INNER JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk INNER JOIN store ON ss_store_sk = s_store_sk INNER JOIN filtered_item ON ss_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ss_promo_sk = filtered_promotion.p_promo_sk WHERE ss_wholesale_cost BETWEEN 63 AND 78 GROUP BY s_store_id
+```
+
+## Hazard Flags
+
+- Do NOT attempt FILTER clause syntax — PG 14.3 supports it but W3's error suggests a syntax context issue. Use CASE WHEN instead.
+- The non-equi join (inv_quantity_on_hand < cs_quantity) CANNOT be converted to hash join. Keep as nested-loop but reduce input cardinality.
+- Preserve LEFT JOINs to promotion and catalog_returns.
+
+## Engine Profile
+
+### Optimizer Strengths (DO NOT fight these)
+- **BITMAP_OR_SCAN**: Multi-branch OR conditions on indexed columns are handled via BitmapOr — a single fact table scan with bitmap combination. Extremely efficient.
+- **SEMI_JOIN_EXISTS**: EXISTS/NOT EXISTS uses semi-join with early termination. Stops scanning after the first match per outer row.
+- **INNER_JOIN_REORDERING**: PostgreSQL freely reorders INNER JOINs based on estimated selectivity. The cost model works well for explicit JOIN...ON syntax.
+- **INDEX_ONLY_SCAN**: When an index covers all requested columns, PostgreSQL reads only the index without touching the heap.
+- **PARALLEL_QUERY_EXECUTION**: PostgreSQL parallelizes large scans and aggregations across worker processes with partial aggregation finalization.
+- **JIT_COMPILATION**: PostgreSQL JIT-compiles complex expressions and tuple deforming for long-running queries.
+
+### Optimizer Gaps (opportunities)
+- **COMMA_JOIN_WEAKNESS**: Implicit comma-separated FROM tables (FROM t1, t2, t3 WHERE t1.id = t2.id) are treated as cross products initially. The cost model is significantly weaker on comma-joins than on explicit JOIN...ON syntax.
+  Opportunity: Convert comma-joins to explicit JOIN...ON syntax. This alone can unlock 2-3x improvements. Best when combined with date_cte_isolate.
+    + Q080: 3.32x — comma-joins to explicit JOINs + date CTE on multi-channel UNION query
+    + Q099: 2.28x — same pattern on star schema
+    + Q054: 1.14x — JOIN conversion alone
+- **CORRELATED_SUBQUERY_PARALYSIS**: Cannot automatically decorrelate complex correlated subqueries. Correlated scalar subqueries with aggregates are executed as nested-loop with repeated evaluation.
+  Opportunity: Convert correlated WHERE to explicit CTE with GROUP BY + JOIN.
+    + Q092: 4428x — timeout recovery. Unbounded correlated subquery converted to explicit JOIN.
+    + Q032: 391x — same pattern, timeout to sub-second.
+- **NON_EQUI_JOIN_INPUT_BLINDNESS**: Cannot pre-filter fact tables before non-equi join operations (date arithmetic, range comparisons, quantity < quantity). Non-equi joins fall back to nested-loop, which is O(N*M).
+  Opportunity: Reduce fact table input size via filtered CTE before the non-equi join.
+    + Q072: 2.68x — pre-filtered catalog_sales by wholesale_cost range before non-equi quantity comparison with inventory. Reduced nested-loop input by ~70%.
+- **CTE_MATERIALIZATION_FENCE**: PostgreSQL materializes CTEs by default (multi-referenced) or by choice (AS MATERIALIZED). This creates a hard optimization fence — no predicate pushdown from outer query into CTE. This makes CTE-based strategies a double-edged sword on PG.
+  Opportunity: Use materialization STRATEGICALLY: materialize when the CTE is expensive and reused multiple times. Avoid CTEs that fence off predicate pushdown for single-use cases.
+    + Q065: 1.95x — strategic materialization prevented redundant fact table scan multiplication
+- **CROSS_CTE_PREDICATE_BLINDNESS**: Same gap as DuckDB but WORSE on PostgreSQL because CTE materialization fence makes it more impactful. Predicates in the outer WHERE cannot propagate into materialized CTEs.
+  Opportunity: Same as DuckDB: pre-filter into CTE definition. But be more cautious — only when the CTE is clearly suboptimal.
+    + Q080: 3.32x — date filter + comma-join conversion (the combo is key)
+    + Q099: 2.28x — date CTE with explicit JOIN
+
+## Correctness Invariants (HARD STOPS — non-negotiable)
+
+These 4 constraints are absolute. Even with full creative freedom, you may NEVER violate these:
+
+- **LITERAL_PRESERVATION**: Correctness gate: Literal Preservation
+- **SEMANTIC_EQUIVALENCE**: Correctness gate: Semantic Equivalence
+- **COMPLETE_OUTPUT**: Correctness gate: Complete Output
+- **CTE_COLUMN_COMPLETENESS**: Correctness gate: Cte Column Completeness
+
+## Aggregation Semantics Check (HARD STOP)
+
+- STDDEV_SAMP/VARIANCE are grouping-sensitive — changing group membership changes the result.
+- AVG and STDDEV are NOT duplicate-safe.
+- FILTER over a combined group != separate per-group computation.
+- Verify aggregation equivalence for ANY proposed restructuring.
+
+## Original SQL
+
+```sql
+ 1 | select  i_item_desc
+ 2 |       ,w_warehouse_name
+ 3 |       ,d1.d_week_seq
+ 4 |       ,sum(case when p_promo_sk is null then 1 else 0 end) no_promo
+ 5 |       ,sum(case when p_promo_sk is not null then 1 else 0 end) promo
+ 6 |       ,count(*) total_cnt
+ 7 | from catalog_sales
+ 8 | join inventory on (cs_item_sk = inv_item_sk)
+ 9 | join warehouse on (w_warehouse_sk=inv_warehouse_sk)
+10 | join item on (i_item_sk = cs_item_sk)
+11 | join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk)
+12 | join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk)
+13 | join date_dim d1 on (cs_sold_date_sk = d1.d_date_sk)
+14 | join date_dim d2 on (inv_date_sk = d2.d_date_sk)
+15 | join date_dim d3 on (cs_ship_date_sk = d3.d_date_sk)
+16 | left outer join promotion on (cs_promo_sk=p_promo_sk)
+17 | left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number)
+18 | where d1.d_week_seq = d2.d_week_seq
+19 |   and inv_quantity_on_hand < cs_quantity
+20 |   and d3.d_date > d1.d_date + interval '3 day'
+21 |   and hd_buy_potential = '>10000'
+22 |   and d1.d_year = 1998
+23 |   and cd_marital_status = 'U'
+24 |   and cd_dep_count between 9 and 11
+25 |   and i_category IN ('Children', 'Jewelry', 'Men')
+26 |   and cs_wholesale_cost BETWEEN 35 AND 55
+27 | group by i_item_desc,w_warehouse_name,d1.d_week_seq
+28 | order by total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq
+29 | limit 100;
+```
+
+## Per-Rewrite Configuration (SET LOCAL)
+
+You have two optimization levers: SQL rewrite AND per-query configuration.
+After writing your rewrite, analyze its execution profile and emit SET LOCAL
+commands that fix planner-level bottlenecks specific to YOUR rewrite.
+
+## System Resource Envelope
+
+Memory budget: shared_buffers=4GB, effective_cache_size=12GB
+Global work_mem: 128MB (per-operation)
+Active connections: ~10 (work_mem headroom: safe up to 512MB per-op)
+Storage: SSD (random_page_cost=1.1)
+Parallel capacity: max_parallel_workers=8, per_gather=4
+
+SET LOCAL permissions:
+  user-level (always available): effective_cache_size, enable_hashjoin, enable_mergejoin, enable_nestloop, enable_seqscan, from_collapse_limit, geqo_threshold, hash_mem_multiplier, jit, jit_above_cost, join_collapse_limit, max_parallel_workers_per_gather, parallel_setup_cost, parallel_tuple_cost, random_page_cost, work_mem
+
+### Tunable Parameters (whitelist — only these are allowed)
+
+- **effective_cache_size** (1024MB–65536MB): Advisory: how much OS cache to expect (MB). Safe to set aggressively.
+- **enable_hashjoin** (on | off): Enable hash join plan type.
+- **enable_mergejoin** (on | off): Enable merge join plan type.
+- **enable_nestloop** (on | off): Enable nested-loop join plan type.
+- **enable_seqscan** (on | off): Enable sequential scan plan type.
+- **from_collapse_limit** (1–20): Max FROM items before subqueries stop being flattened.
+- **geqo_threshold** (2–20): Number of FROM items that triggers genetic query optimizer.
+- **hash_mem_multiplier** (1.0–10.0): Multiplier applied to work_mem for hash-based operations.
+- **jit** (on | off): Enable JIT compilation.
+- **jit_above_cost** (0.0–1000000.0): Query cost above which JIT is activated.
+- **join_collapse_limit** (1–20): Max FROM items before planner stops trying all join orders.
+- **max_parallel_workers_per_gather** (0–8): Max parallel workers per Gather node.
+- **parallel_setup_cost** (0.0–10000.0): Planner estimate of cost to launch parallel workers.
+- **parallel_tuple_cost** (0.0–1.0): Planner estimate of cost to transfer a tuple to parallel worker.
+- **random_page_cost** (1.0–10.0): Planner estimate of cost of a random page fetch (1.0 = SSD, 4.0 = HDD).
+- **work_mem** (64MB–2048MB): Memory for sorts/hashes per operation (MB). Allocated PER-OPERATION, not per-query. Count hash/sort ops in EXPLAIN before sizing.
+
+### Rules
+- Every SET LOCAL MUST cite a specific EXPLAIN node your rewrite creates/changes
+- work_mem is PER-OPERATION: count hash/sort ops in your rewrite before sizing
+- random_page_cost: ONLY change if your rewrite creates index-favorable access patterns
+- Empty is valid: if your rewrite has no planner bottleneck, emit no SET LOCAL
+- Stay within the resource envelope bounds above
+
+### Output Format
+If you recommend SET LOCAL, prefix your SQL block with the commands:
+
+```sql
+SET LOCAL work_mem = '512MB';
+SET LOCAL jit = 'off';
+-- rewritten query follows
+WITH ...
+SELECT ...
+```
+
+If no config changes help, just output the rewritten SQL directly.
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_DAG` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+## Output
+
+Return the complete rewritten SQL query. The query must be syntactically
+valid and ready to execute.
+
+### Column Completeness Contract
+
+Your rewritten query MUST produce **exactly** these output columns (same names, same order):
+
+  1. `i_item_desc`
+  2. `w_warehouse_name`
+  3. `d_week_seq`
+  4. `no_promo`
+  5. `promo`
+  6. `total_cnt`
+
+Do NOT add, remove, or rename any columns. The result set schema must be identical to the original query.
+
+```sql
+-- Your rewritten query here
+```
+
+After the SQL, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+  e.g., 'Consolidated 4 store_sales scans into 1 with CASE branches — reduces I/O by 3x'
+  e.g., 'Deferred customer join to resolve_names — joins 4K rows instead of 5.4M'
+Expected speedup: <estimate>
+```
+
+Now output your rewritten SQL:

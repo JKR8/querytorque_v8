@@ -1128,7 +1128,8 @@ class SwarmSession(OptimizationSession):
     ) -> str:
         """Build fallback fan-out response when analyst call fails.
 
-        Distributes matched examples evenly across 4 workers with generic strategies.
+        Generates output in the format parse_briefing_response() expects:
+        === SHARED BRIEFING === and === WORKER N BRIEFING === sections.
         """
         # Get example IDs
         ex_ids = [e.get("id", f"ex_{i}") for i, e in enumerate(matched_examples)]
@@ -1149,17 +1150,24 @@ class SwarmSession(OptimizationSession):
             ("structural_transform", "Apply structural transforms like OR-to-UNION or decorrelation."),
         ]
 
-        lines = []
+        lines = [
+            "=== SHARED BRIEFING ===",
+            "SEMANTIC_CONTRACT: Preserve exact output columns, row count, and ordering.",
+            "BOTTLENECK_DIAGNOSIS: Analyst unavailable — applying generic strategies.",
+            "ACTIVE_CONSTRAINTS: Preserve semantic equivalence.",
+            "REGRESSION_WARNINGS: None.",
+            "",
+        ]
         for i, (strategy, hint) in enumerate(strategies):
             start = i * 3
             worker_examples = ex_ids[start:start + 3]
             if not worker_examples:
                 worker_examples = ex_ids[:3]  # reuse if not enough
 
-            lines.append(f"WORKER_{i + 1}:")
+            lines.append(f"=== WORKER {i + 1} BRIEFING ===")
             lines.append(f"STRATEGY: {strategy}")
             lines.append(f"EXAMPLES: {', '.join(worker_examples)}")
-            lines.append(f"HINT: {hint}")
+            lines.append(f"HAZARD_FLAGS: {hint}")
             lines.append("")
 
         return "\n".join(lines)

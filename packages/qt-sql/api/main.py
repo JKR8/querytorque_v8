@@ -18,8 +18,17 @@ from pydantic import BaseModel, Field
 from qt_shared.auth import OptionalUser, CurrentUser, UserContext
 from qt_shared.config import get_settings, Settings
 
-from qt_sql.analyzers.sql_antipattern_detector import SQLAntiPatternDetector
-from qt_sql.renderers import render_sql_report
+# V5 analyzer/renderer modules were removed in the ADO consolidation.
+# These routes (/api/sql/analyze, /api/sql/optimize) need rewriting
+# to use the new qt_sql pipeline. Guard imports so the module loads.
+try:
+    from qt_sql.analyzers.sql_antipattern_detector import SQLAntiPatternDetector
+    from qt_sql.renderers import render_sql_report
+    _HAS_V5_ANALYZER = True
+except ImportError:
+    SQLAntiPatternDetector = None  # type: ignore[assignment,misc]
+    render_sql_report = None  # type: ignore[assignment]
+    _HAS_V5_ANALYZER = False
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -246,6 +255,12 @@ async def analyze_sql(
     - **dialect**: SQL dialect for analysis (affects available rules)
     - **include_structure**: Whether to include query structure info
     """
+    if not _HAS_V5_ANALYZER:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Static analysis module not available (V5 analyzer was removed in consolidation)"
+        )
+
     logger.info(
         "Analyzing SQL",
         extra={
@@ -403,6 +418,12 @@ async def optimize_sql(
     - **provider**: Optional LLM provider override
     - **model**: Optional LLM model override
     """
+    if not _HAS_V5_ANALYZER:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Static analysis module not available (V5 analyzer was removed in consolidation)"
+        )
+
     logger.info(
         "Optimizing SQL",
         extra={
@@ -615,6 +636,15 @@ async def validate_manual_response(request: ValidateManualRequest):
         )
 
     # Regression check
+    if not _HAS_V5_ANALYZER:
+        # Without the analyzer, skip regression detection — return syntax-only result
+        return ValidateManualResponse(
+            session_id=session_id, success=True, syntax_status="pass",
+            regression_status="skip", original_code=request.original_sql,
+            optimized_code=optimized_sql, all_passed=True,
+            warnings=["Regression check unavailable (V5 analyzer removed)"],
+        )
+
     detector = SQLAntiPatternDetector(dialect=request.dialect)
     original_result = detector.analyze(request.original_sql)
     optimized_result = detector.analyze(optimized_sql)

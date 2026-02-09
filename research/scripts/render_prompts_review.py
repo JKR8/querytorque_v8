@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render analyst + worker V2 prompts for review — NO API calls.
+"""Render analyst + worker prompts for review — NO API calls.
 
 Loads a real PG DSB query, explain plan, engine profile, and gold examples,
 then builds the full analyst briefing and a sample worker prompt using
@@ -22,12 +22,12 @@ sys.path = [p for p in sys.path if p != script_dir]
 for p in [str(ROOT / "packages" / "qt-sql"), str(ROOT / "packages" / "qt-shared"), str(ROOT)]:
     if p not in sys.path:
         sys.path.insert(0, p)
-BENCH = ROOT / "packages" / "qt-sql" / "ado" / "benchmarks" / "postgres_dsb_156"
+BENCH = ROOT / "packages" / "qt-sql" / "qt_sql" / "benchmarks" / "postgres_dsb_156"
 QUERY_FILE = BENCH / "queries" / "query072_agg_s1.sql"
 EXPLAIN_FILE = BENCH / "explains" / "sf10" / "query072_agg_s1.json"
-ENGINE_PROFILE = ROOT / "packages" / "qt-sql" / "ado" / "constraints" / "engine_profile_postgresql.json"
-EXAMPLES_DIR = ROOT / "packages" / "qt-sql" / "ado" / "examples" / "postgres"
-CONSTRAINTS_DIR = ROOT / "packages" / "qt-sql" / "ado" / "constraints"
+ENGINE_PROFILE = ROOT / "packages" / "qt-sql" / "qt_sql" / "constraints" / "engine_profile_postgresql.json"
+EXAMPLES_DIR = ROOT / "packages" / "qt-sql" / "qt_sql" / "examples" / "postgres"
+CONSTRAINTS_DIR = ROOT / "packages" / "qt-sql" / "qt_sql" / "constraints"
 
 # ── Load real data ─────────────────────────────────────────────────────
 sql = QUERY_FILE.read_text().strip()
@@ -427,7 +427,7 @@ sniper_retry_prompt = build_sniper_prompt(
 )
 
 # ── Save to files ──────────────────────────────────────────────────────
-OUT_DIR = ROOT / "research" / "prompt_samples" / "pg_q072_v2"
+OUT_DIR = ROOT / "research" / "prompt_review"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 files = {
