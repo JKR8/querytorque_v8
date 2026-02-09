@@ -1,0 +1,111 @@
+WITH filtered_date AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_date BETWEEN CAST('1998-08-23' AS DATE) 
+    AND CAST('1998-08-23' AS DATE) + INTERVAL '30 DAY'
+),
+filtered_item AS (
+  SELECT i_item_sk, i_current_price, i_category
+  FROM item
+  WHERE i_current_price > 50
+    AND i_category IN ('Jewelry', 'Music')
+),
+filtered_promotion AS (
+  SELECT p_promo_sk
+  FROM promotion
+  WHERE p_channel_email = 'Y'
+    AND p_channel_tv = 'Y'
+    AND p_channel_radio = 'N'
+    AND p_channel_press = 'N'
+    AND p_channel_event = 'Y'
+),
+unified_facts AS (
+  -- Store channel facts
+  SELECT 
+    'store' AS channel_type,
+    s_store_id AS entity_id,
+    ss_ext_sales_price AS sales_amount,
+    COALESCE(sr_return_amt, 0) AS return_amount,
+    ss_net_profit - COALESCE(sr_net_loss, 0) AS profit_amount,
+    ss_wholesale_cost AS wholesale_cost
+  FROM store_sales
+  LEFT OUTER JOIN store_returns 
+    ON ss_item_sk = sr_item_sk 
+    AND ss_ticket_number = sr_ticket_number
+  JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk
+  JOIN store ON ss_store_sk = s_store_sk
+  JOIN filtered_item ON ss_item_sk = filtered_item.i_item_sk
+  JOIN filtered_promotion ON ss_promo_sk = filtered_promotion.p_promo_sk
+  WHERE ss_wholesale_cost BETWEEN 63 AND 78
+  
+  UNION ALL
+  
+  -- Catalog channel facts
+  SELECT 
+    'catalog' AS channel_type,
+    cp_catalog_page_id AS entity_id,
+    cs_ext_sales_price AS sales_amount,
+    COALESCE(cr_return_amount, 0) AS return_amount,
+    cs_net_profit - COALESCE(cr_net_loss, 0) AS profit_amount,
+    cs_wholesale_cost AS wholesale_cost
+  FROM catalog_sales
+  LEFT OUTER JOIN catalog_returns 
+    ON cs_item_sk = cr_item_sk 
+    AND cs_order_number = cr_order_number
+  JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk
+  JOIN catalog_page ON cs_catalog_page_sk = cp_catalog_page_sk
+  JOIN filtered_item ON cs_item_sk = filtered_item.i_item_sk
+  JOIN filtered_promotion ON cs_promo_sk = filtered_promotion.p_promo_sk
+  WHERE cs_wholesale_cost BETWEEN 63 AND 78
+  
+  UNION ALL
+  
+  -- Web channel facts
+  SELECT 
+    'web' AS channel_type,
+    web_site_id AS entity_id,
+    ws_ext_sales_price AS sales_amount,
+    COALESCE(wr_return_amt, 0) AS return_amount,
+    ws_net_profit - COALESCE(wr_net_loss, 0) AS profit_amount,
+    ws_wholesale_cost AS wholesale_cost
+  FROM web_sales
+  LEFT OUTER JOIN web_returns 
+    ON ws_item_sk = wr_item_sk 
+    AND ws_order_number = wr_order_number
+  JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk
+  JOIN web_site ON ws_web_site_sk = web_site_sk
+  JOIN filtered_item ON ws_item_sk = filtered_item.i_item_sk
+  JOIN filtered_promotion ON ws_promo_sk = filtered_promotion.p_promo_sk
+  WHERE ws_wholesale_cost BETWEEN 63 AND 78
+)
+SELECT
+  CASE 
+    WHEN channel_type = 'store' THEN 'store channel'
+    WHEN channel_type = 'catalog' THEN 'catalog channel'
+    WHEN channel_type = 'web' THEN 'web channel'
+  END AS channel,
+  CASE 
+    WHEN channel_type = 'store' THEN 'store' || entity_id
+    WHEN channel_type = 'catalog' THEN 'catalog_page' || entity_id
+    WHEN channel_type = 'web' THEN 'web_site' || entity_id
+  END AS id,
+  SUM(sales_amount) AS sales,
+  SUM(return_amount) AS returns,
+  SUM(profit_amount) AS profit
+FROM unified_facts
+GROUP BY ROLLUP (
+  CASE 
+    WHEN channel_type = 'store' THEN 'store channel'
+    WHEN channel_type = 'catalog' THEN 'catalog channel'
+    WHEN channel_type = 'web' THEN 'web channel'
+  END,
+  CASE 
+    WHEN channel_type = 'store' THEN 'store' || entity_id
+    WHEN channel_type = 'catalog' THEN 'catalog_page' || entity_id
+    WHEN channel_type = 'web' THEN 'web_site' || entity_id
+  END
+)
+ORDER BY
+  channel,
+  id
+LIMIT 100;

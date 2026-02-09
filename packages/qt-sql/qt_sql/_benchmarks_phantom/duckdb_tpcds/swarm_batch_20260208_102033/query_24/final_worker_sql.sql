@@ -1,0 +1,56 @@
+WITH filtered_store AS (
+  SELECT s_store_sk, s_store_name, s_zip
+  FROM store
+  WHERE s_market_id = 8
+),
+filtered_address AS (
+  SELECT ca_address_sk, ca_zip, ca_country
+  FROM customer_address
+),
+joined_sales AS (
+  SELECT
+    c.c_last_name,
+    c.c_first_name,
+    s.s_store_name,
+    i.i_color,
+    SUM(ss.ss_net_profit) AS netpaid
+  FROM store_sales ss
+  JOIN store_returns sr
+    ON ss.ss_ticket_number = sr.sr_ticket_number
+    AND ss.ss_item_sk = sr.sr_item_sk
+  JOIN filtered_store s
+    ON ss.ss_store_sk = s.s_store_sk
+  JOIN item i
+    ON ss.ss_item_sk = i.i_item_sk
+  JOIN customer c
+    ON ss.ss_customer_sk = c.c_customer_sk
+  JOIN filtered_address ca
+    ON c.c_current_addr_sk = ca.ca_address_sk
+    AND s.s_zip = ca.ca_zip
+  WHERE c.c_birth_country <> UPPER(ca.ca_country)
+  GROUP BY
+    c.c_last_name,
+    c.c_first_name,
+    s.s_store_name,
+    i.i_color
+),
+threshold AS (
+  SELECT 0.05 * AVG(netpaid) AS thresh
+  FROM joined_sales
+)
+SELECT
+  c_last_name,
+  c_first_name,
+  s_store_name,
+  SUM(netpaid) AS paid
+FROM joined_sales
+WHERE i_color = 'beige'
+GROUP BY
+  c_last_name,
+  c_first_name,
+  s_store_name
+HAVING SUM(netpaid) > (SELECT thresh FROM threshold)
+ORDER BY
+  c_last_name,
+  c_first_name,
+  s_store_name

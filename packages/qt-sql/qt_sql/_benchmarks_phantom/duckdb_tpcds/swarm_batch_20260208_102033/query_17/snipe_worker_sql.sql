@@ -1,0 +1,77 @@
+WITH d1_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_quarter_name = '2001Q1'
+),
+d2_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_quarter_name IN ('2001Q1', '2001Q2', '2001Q3')
+),
+d3_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_quarter_name IN ('2001Q1', '2001Q2', '2001Q3')
+),
+filtered_store_sales AS (
+    SELECT
+        ss_item_sk,
+        ss_customer_sk,
+        ss_ticket_number,
+        ss_store_sk,
+        ss_quantity
+    FROM store_sales
+    JOIN d1_dates ON store_sales.ss_sold_date_sk = d1_dates.d_date_sk
+),
+filtered_store_returns AS (
+    SELECT
+        sr_item_sk,
+        sr_customer_sk,
+        sr_ticket_number,
+        sr_return_quantity
+    FROM store_returns
+    JOIN d2_dates ON store_returns.sr_returned_date_sk = d2_dates.d_date_sk
+),
+filtered_catalog_sales AS (
+    SELECT
+        cs_item_sk,
+        cs_bill_customer_sk,
+        cs_quantity
+    FROM catalog_sales
+    JOIN d3_dates ON catalog_sales.cs_sold_date_sk = d3_dates.d_date_sk
+)
+SELECT
+    i.i_item_id,
+    i.i_item_desc,
+    s.s_state,
+    COUNT(fss.ss_quantity) AS store_sales_quantitycount,
+    AVG(fss.ss_quantity) AS store_sales_quantityave,
+    STDDEV_SAMP(fss.ss_quantity) AS store_sales_quantitystdev,
+    STDDEV_SAMP(fss.ss_quantity) / AVG(fss.ss_quantity) AS store_sales_quantitycov,
+    COUNT(fsr.sr_return_quantity) AS store_returns_quantitycount,
+    AVG(fsr.sr_return_quantity) AS store_returns_quantityave,
+    STDDEV_SAMP(fsr.sr_return_quantity) AS store_returns_quantitystdev,
+    STDDEV_SAMP(fsr.sr_return_quantity) / AVG(fsr.sr_return_quantity) AS store_returns_quantitycov,
+    COUNT(fcs.cs_quantity) AS catalog_sales_quantitycount,
+    AVG(fcs.cs_quantity) AS catalog_sales_quantityave,
+    STDDEV_SAMP(fcs.cs_quantity) AS catalog_sales_quantitystdev,
+    STDDEV_SAMP(fcs.cs_quantity) / AVG(fcs.cs_quantity) AS catalog_sales_quantitycov
+FROM filtered_store_sales fss
+JOIN filtered_store_returns fsr ON 
+    fss.ss_customer_sk = fsr.sr_customer_sk
+    AND fss.ss_item_sk = fsr.sr_item_sk
+    AND fss.ss_ticket_number = fsr.sr_ticket_number
+JOIN filtered_catalog_sales fcs ON
+    fsr.sr_customer_sk = fcs.cs_bill_customer_sk
+    AND fsr.sr_item_sk = fcs.cs_item_sk
+JOIN store s ON fss.ss_store_sk = s.s_store_sk
+JOIN item i ON fss.ss_item_sk = i.i_item_sk
+GROUP BY
+    i.i_item_id,
+    i.i_item_desc,
+    s.s_state
+ORDER BY
+    i.i_item_id,
+    i.i_item_desc,
+    s.s_state
+LIMIT 100;

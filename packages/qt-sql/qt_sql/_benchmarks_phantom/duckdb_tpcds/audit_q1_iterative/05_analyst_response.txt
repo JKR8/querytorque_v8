@@ -1,0 +1,88 @@
+## 1. STRUCTURAL BREAKDOWN
+
+**sd_stores (CTE 0)**: Filters stores in South Dakota ('SD'), reading the entire store table but outputting only ~35 store keys.  
+**store_customer_returns (CTE 1)**: For SD stores in year 2000, computes per-customer total returns and per-store average returns via window function, scanning large fact table store_returns and joining with date_dim and sd_stores, outputting ~557K rows.  
+**main_query (CTE 2)**: Joins the 557K CTE rows with customer table, filters rows where customer's return exceeds 120% of store average, orders by customer_id, and outputs top 100 rows.
+
+## 2. BOTTLENECK IDENTIFICATION
+
+The dominant cost (89%) is **store_customer_returns**. The mechanism is:
+
+1. **Unnecessary window computation on full grouped result**: The CTE computes `AVG(SUM(SR_FEE)) OVER (PARTITION BY sr_store_sk)` across all ~557K grouped rows, but the main query immediately filters most away (only rows > 1.2× average pass).
+2. **Inefficient window execution**: DuckDB must compute the window function across all stores before any filtering can occur, even though we only need the average for comparison.
+3. **Missed predicate pushdown opportunity**: The filter `ctr_total_return > store_avg_return * 1.2` cannot be pushed into the window computation, forcing full materialization.
+
+## 3. PROPOSED OPTIMIZATION
+
+**Change 1: Split window computation into separate CTEs**
+- **What**: Replace `store_customer_returns` with two CTEs: one computing per-customer totals, another computing per-store averages, then join them.
+- **Why**: Avoids window function over 557K rows; enables filter pushdown to customer totals before joining with store averages.
+- **Risk**: Must ensure averages are computed over same filtered dataset (SD stores, 2000).
+- **Impact**: Significant (eliminates window sort/partition overhead).
+
+**Change 2: Pre-filter fact table with dimension CTEs**
+- **What**: Create filtered CTEs for both `date_dim` (d_year=2000) and `sd_stores`, then join them with `store_returns`.
+- **Why**: Reduces fact table scan early; DuckDB can use efficient filtered joins.
+- **Risk**: None if filters remain identical.
+- **Impact**: Moderate (reduces fact table participation).
+
+**Change 3: Materialize intermediate results**
+- **What**: Use `MATERIALIZED` hint or temporary table for the per-store averages (~35 rows).
+- **Why**: Store averages are tiny; materializing prevents recomputation.
+- **Risk**: Extra storage, but negligible.
+- **Impact**: Minor (optimizer may already cache).
+
+## 5. RECOMMENDED STRATEGY
+
+**Rewrite query to decompose the window function and push filters early**:
+
+1. Create filtered dimension CTEs for date and store.
+2. Compute per-customer totals by joining fact table with filtered dimensions.
+3. Compute per-store averages from the per-customer totals (now only ~35 stores).
+4. Join per-customer totals with per-store averages, applying the 1.2× filter immediately.
+5. Finally join with customer table, sort, and limit.
+
+**Implementation sketch**:
+```sql
+WITH sd_stores AS (SELECT s_store_sk FROM store WHERE s_state = 'SD'),
+     year2000 AS (SELECT d_date_sk FROM date_dim WHERE d_year = 2000),
+     customer_returns AS (
+       SELECT
+         sr_customer_sk,
+         sr_store_sk,
+         SUM(SR_FEE) AS ctr_total_return
+       FROM store_returns
+       JOIN year2000 ON sr_returned_date_sk = d_date_sk
+       JOIN sd_stores ON sr_store_sk = s_store_sk
+       GROUP BY sr_customer_sk, sr_store_sk
+     ),
+     store_averages AS (
+       SELECT
+         sr_store_sk,
+         AVG(ctr_total_return) AS store_avg_return
+       FROM customer_returns
+       GROUP BY sr_store_sk
+     ),
+     filtered_returns AS (
+       SELECT
+         cr.sr_customer_sk AS ctr_customer_sk,
+         cr.sr_store_sk AS ctr_store_sk,
+         cr.ctr_total_return,
+         sa.store_avg_return
+       FROM customer_returns cr
+       JOIN store_averages sa ON cr.sr_store_sk = sa.sr_store_sk
+       WHERE cr.ctr_total_return > sa.store_avg_return * 1.2
+     )
+SELECT c_customer_id
+FROM filtered_returns
+JOIN customer ON ctr_customer_sk = c_customer_sk
+ORDER BY c_customer_id
+LIMIT 100;
+```
+
+## 6. EXAMPLE SELECTION
+
+FAISS picks are relevant: **deferred_window_aggregation** directly addresses the window function bottleneck; **shared_dimension_multi_channel** supports pre-filtering dimensions; **decorrelate** is less applicable (no correlated subqueries).  
+I confirm these are good matches, but would also include **single_pass_aggregation** since we're consolidating the fact table scan.
+
+**EXAMPLES: deferred_window_aggregation, shared_dimension_multi_channel, single_pass_aggregation**

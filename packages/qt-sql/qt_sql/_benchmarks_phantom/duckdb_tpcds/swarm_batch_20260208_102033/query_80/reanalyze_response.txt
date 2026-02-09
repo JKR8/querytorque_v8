@@ -1,0 +1,39 @@
+FAILURE_ANALYSIS:
+All attempts relied on standard dimension pre-filtering (date, item, promotion) into CTEs—which helps but isn't enough. The fundamental bottleneck is the massive LEFT OUTER JOIN between each large fact table (store_sales, catalog_sales, web_sales) and its corresponding returns table, performed BEFORE aggregation. These joins explode intermediate data sizes because returns are sparse relative to sales, yet the join must preserve all sales rows. Worker 2's 1.91x came closest by reordering joins to filter dimensions first, but still hit the same core scalability wall: joining billions of rows at the finest granularity (item_sk + ticket/order) before aggregation.
+
+UNEXPLORED_OPPORTUNITIES:
+1. **Pre-aggregate returns before joining**: Instead of joining at the row level, aggregate returns by the same grouping keys (store_id + item_sk? No—needs ticket too) — but wait, grouping keys for returns must match sales join keys. However, we can pre-group returns by (item_sk, ticket_number) only if those map to store/catalog_page/web_site via the sales fact. But that's exactly the join we want to avoid.
+
+   Actually: The returns tables don't have the channel-specific ID (store_id, catalog_page_id, web_site_id) directly. So we must join returns with the filtered sales rows to get those IDs. But we can pre-filter returns by date? No—returns aren't filtered by date in the query.
+
+   However: We can pre-join returns with the filtered dimensions (item, promotion) that apply to returns too? Yes, because the join condition includes item_sk, and the promotion key is from sales, not returns. So returns can only be joined if the item matches the price filter. That's a key insight: we can filter returns by joining with filtered_item CTE first, reducing the returns table size dramatically.
+
+2. **Use a two-phase aggregation**: First aggregate sales by (store_id, item_sk, ticket_number) with dimensions applied, then separately aggregate returns by same keys, then combine. This avoids the expensive many-to-many row-level join.
+
+3. **Leverage DuckDB's ASOF join or window functions**: If returns are guaranteed to be after sale date, we could use a time-based join, but not applicable here.
+
+4. **Convert LEFT JOIN to UNION ALL with anti-join**: Separate sales with returns and sales without returns, but that might increase complexity.
+
+5. **Parallelize channel processing via separate statements**: Not allowed in single query.
+
+6. **Use approximate joins or bloom filters**: Not in standard SQL.
+
+REFINED_STRATEGY:
+Pre-filter returns by joining with filtered_item (and filtered_promotion? No, returns don't have promo key). Then, instead of a regular left join, perform a two-step aggregation:
+1. Aggregate sales by channel-specific ID plus the join keys (item_sk, ticket/order) but include dimension filters.
+2. Aggregate pre-filtered returns by the same join keys.
+3. LEFT JOIN the aggregated sales with aggregated returns on the join keys, then roll up to channel ID.
+
+This reduces the join cardinality from billions of rows to millions of distinct (item_sk, ticket/order) groups per channel.
+
+Implementation sketch:
+- Create CTE filtered_returns_store that joins store_returns with filtered_item ON sr_item_sk = i_item_sk.
+- Aggregate returns by (sr_item_sk, sr_ticket_number) to get return amounts and net loss sums.
+- In ssr CTE, first aggregate store_sales (with dimension filters) by (s_store_id, ss_item_sk, ss_ticket_number) with sums of sales price and net profit.
+- Then LEFT JOIN the aggregated sales with aggregated returns on the keys.
+- Finally, sum up by s_store_id.
+
+This transforms a massive row-level join into an aggregate-level join, drastically cutting data movement.
+
+EXAMPLES: dimension_cte_isolate, shared_dimension_multi_channel, single_pass_aggregation
+HINT: Pre-filter returns tables using dimension CTEs (item), then perform a two-phase aggregation: first aggregate sales and returns separately by the join composite keys (item_sk + ticket/order), then left join the aggregates before final rollup by channel ID. This reduces the join cardinality by orders of magnitude.

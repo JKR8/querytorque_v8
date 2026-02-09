@@ -1,0 +1,145 @@
+WITH filtered_dates AS (
+  SELECT d_date_sk, d_week_seq, d_year
+  FROM date_dim
+  WHERE d_year BETWEEN 2000 AND 2002
+),
+cross_items AS (
+  SELECT
+    i_item_sk AS ss_item_sk,
+    i_brand_id,
+    i_class_id,
+    i_category_id
+  FROM item
+  JOIN (
+    SELECT
+      iss.i_brand_id AS brand_id,
+      iss.i_class_id AS class_id,
+      iss.i_category_id AS category_id
+    FROM store_sales
+    JOIN item iss ON ss_item_sk = iss.i_item_sk
+    JOIN filtered_dates d1 ON ss_sold_date_sk = d1.d_date_sk
+    WHERE iss.i_category IN ('Electronics', 'Home', 'Men')
+      AND iss.i_manager_id BETWEEN 25 AND 34
+      AND ss_wholesale_cost BETWEEN 34 AND 54
+    INTERSECT
+    SELECT
+      ics.i_brand_id,
+      ics.i_class_id,
+      ics.i_category_id
+    FROM catalog_sales
+    JOIN item ics ON cs_item_sk = ics.i_item_sk
+    JOIN filtered_dates d2 ON cs_sold_date_sk = d2.d_date_sk
+    WHERE ics.i_category IN ('Electronics', 'Home', 'Men')
+      AND ics.i_manager_id BETWEEN 25 AND 34
+      AND cs_wholesale_cost BETWEEN 34 AND 54
+    INTERSECT
+    SELECT
+      iws.i_brand_id,
+      iws.i_class_id,
+      iws.i_category_id
+    FROM web_sales
+    JOIN item iws ON ws_item_sk = iws.i_item_sk
+    JOIN filtered_dates d3 ON ws_sold_date_sk = d3.d_date_sk
+    WHERE iws.i_category IN ('Electronics', 'Home', 'Men')
+      AND iws.i_manager_id BETWEEN 25 AND 34
+      AND ws_wholesale_cost BETWEEN 34 AND 54
+  ) x ON i_brand_id = x.brand_id
+    AND i_class_id = x.class_id
+    AND i_category_id = x.category_id
+  WHERE i_category IN ('Electronics', 'Home', 'Men')
+    AND i_manager_id BETWEEN 25 AND 34
+),
+avg_sales AS (
+  SELECT
+    AVG(quantity * list_price) AS average_sales
+  FROM (
+    SELECT
+      ss_quantity AS quantity,
+      ss_list_price AS list_price
+    FROM store_sales
+    JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+    WHERE ss_wholesale_cost BETWEEN 34 AND 54
+    UNION ALL
+    SELECT
+      cs_quantity AS quantity,
+      cs_list_price AS list_price
+    FROM catalog_sales
+    JOIN filtered_dates ON cs_sold_date_sk = d_date_sk
+    WHERE cs_wholesale_cost BETWEEN 34 AND 54
+    UNION ALL
+    SELECT
+      ws_quantity AS quantity,
+      ws_list_price AS list_price
+    FROM web_sales
+    JOIN filtered_dates ON ws_sold_date_sk = d_date_sk
+    WHERE ws_wholesale_cost BETWEEN 34 AND 54
+  ) x
+),
+week_seqs AS (
+  SELECT
+    (SELECT d_week_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 12 AND d_dom = 17) AS week_2000,
+    (SELECT d_week_seq FROM date_dim WHERE d_year = 2000 + 1 AND d_moy = 12 AND d_dom = 17) AS week_2001
+),
+this_year AS (
+  SELECT
+    'store' AS channel,
+    ci.i_brand_id,
+    ci.i_class_id,
+    ci.i_category_id,
+    SUM(ss_quantity * ss_list_price) AS sales,
+    COUNT(*) AS number_sales
+  FROM store_sales
+  JOIN cross_items ci ON ss_item_sk = ci.ss_item_sk
+  JOIN date_dim ON ss_sold_date_sk = d_date_sk
+  CROSS JOIN week_seqs
+  WHERE d_week_seq = week_seqs.week_2001
+    AND ss_wholesale_cost BETWEEN 34 AND 54
+  GROUP BY
+    ci.i_brand_id,
+    ci.i_class_id,
+    ci.i_category_id
+  HAVING SUM(ss_quantity * ss_list_price) > (SELECT average_sales FROM avg_sales)
+),
+last_year AS (
+  SELECT
+    'store' AS channel,
+    ci.i_brand_id,
+    ci.i_class_id,
+    ci.i_category_id,
+    SUM(ss_quantity * ss_list_price) AS sales,
+    COUNT(*) AS number_sales
+  FROM store_sales
+  JOIN cross_items ci ON ss_item_sk = ci.ss_item_sk
+  JOIN date_dim ON ss_sold_date_sk = d_date_sk
+  CROSS JOIN week_seqs
+  WHERE d_week_seq = week_seqs.week_2000
+    AND ss_wholesale_cost BETWEEN 34 AND 54
+  GROUP BY
+    ci.i_brand_id,
+    ci.i_class_id,
+    ci.i_category_id
+  HAVING SUM(ss_quantity * ss_list_price) > (SELECT average_sales FROM avg_sales)
+)
+SELECT
+  this_year.channel AS ty_channel,
+  this_year.i_brand_id AS ty_brand,
+  this_year.i_class_id AS ty_class,
+  this_year.i_category_id AS ty_category,
+  this_year.sales AS ty_sales,
+  this_year.number_sales AS ty_number_sales,
+  last_year.channel AS ly_channel,
+  last_year.i_brand_id AS ly_brand,
+  last_year.i_class_id AS ly_class,
+  last_year.i_category_id AS ly_category,
+  last_year.sales AS ly_sales,
+  last_year.number_sales AS ly_number_sales
+FROM this_year
+JOIN last_year ON this_year.i_brand_id = last_year.i_brand_id
+  AND this_year.i_class_id = last_year.i_class_id
+  AND this_year.i_category_id = last_year.i_category_id
+ORDER BY
+  this_year.channel,
+  this_year.i_brand_id,
+  this_year.i_class_id,
+  this_year.i_category_id
+LIMIT 100

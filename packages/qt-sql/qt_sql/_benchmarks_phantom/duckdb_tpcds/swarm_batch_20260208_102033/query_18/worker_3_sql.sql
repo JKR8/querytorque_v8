@@ -1,0 +1,60 @@
+WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 1998
+),
+filtered_cd1 AS (
+    SELECT cd_demo_sk, cd_dep_count
+    FROM customer_demographics
+    WHERE cd_gender = 'F'
+      AND cd_education_status = 'Advanced Degree'
+),
+filtered_customer AS (
+    SELECT c_customer_sk, c_current_cdemo_sk, c_birth_year, c_current_addr_sk
+    FROM customer
+    WHERE c_birth_month IN (10, 7, 8, 4, 1, 2)
+),
+filtered_address AS (
+    SELECT ca_address_sk, ca_country, ca_state, ca_county
+    FROM customer_address
+    WHERE ca_state IN ('WA', 'GA', 'NC', 'ME', 'WY', 'OK', 'IN')
+),
+prejoined_fact AS (
+    SELECT
+        cs.cs_quantity,
+        cs.cs_list_price,
+        cs.cs_coupon_amt,
+        cs.cs_sales_price,
+        cs.cs_net_profit,
+        cs.cs_bill_customer_sk,
+        i.i_item_id,
+        cu.c_birth_year,
+        cu.c_current_cdemo_sk,
+        ca.ca_country,
+        ca.ca_state,
+        ca.ca_county,
+        cd1.cd_dep_count
+    FROM catalog_sales cs
+    JOIN filtered_date fd ON cs.cs_sold_date_sk = fd.d_date_sk
+    JOIN filtered_cd1 cd1 ON cs.cs_bill_cdemo_sk = cd1.cd_demo_sk
+    JOIN filtered_customer cu ON cs.cs_bill_customer_sk = cu.c_customer_sk
+    JOIN filtered_address ca ON cu.c_current_addr_sk = ca.ca_address_sk
+    JOIN item i ON cs.cs_item_sk = i.i_item_sk
+)
+SELECT
+    i_item_id,
+    ca_country,
+    ca_state,
+    ca_county,
+    AVG(CAST(cs_quantity AS DECIMAL(12,2))) AS agg1,
+    AVG(CAST(cs_list_price AS DECIMAL(12,2))) AS agg2,
+    AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))) AS agg3,
+    AVG(CAST(cs_sales_price AS DECIMAL(12,2))) AS agg4,
+    AVG(CAST(cs_net_profit AS DECIMAL(12,2))) AS agg5,
+    AVG(CAST(c_birth_year AS DECIMAL(12,2))) AS agg6,
+    AVG(CAST(cd_dep_count AS DECIMAL(12,2))) AS agg7
+FROM prejoined_fact
+JOIN customer_demographics cd2 ON prejoined_fact.c_current_cdemo_sk = cd2.cd_demo_sk
+GROUP BY ROLLUP (i_item_id, ca_country, ca_state, ca_county)
+ORDER BY ca_country, ca_state, ca_county, i_item_id
+LIMIT 100

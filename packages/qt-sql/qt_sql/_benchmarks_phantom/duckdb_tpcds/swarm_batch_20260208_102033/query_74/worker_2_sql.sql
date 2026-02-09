@@ -1,0 +1,65 @@
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year IN (1999, 2000)
+),
+store_sales_agg AS (
+    SELECT
+        c.c_customer_id AS customer_id,
+        c.c_first_name AS customer_first_name,
+        c.c_last_name AS customer_last_name,
+        d.d_year AS year,
+        STDDEV_SAMP(ss.ss_net_paid) AS year_total,
+        's' AS sale_type
+    FROM customer c
+    JOIN store_sales ss ON c.c_customer_sk = ss.ss_customer_sk
+    JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk
+    WHERE d.d_year IN (1999, 2000)
+    GROUP BY
+        c.c_customer_id,
+        c.c_first_name,
+        c.c_last_name,
+        d.d_year
+),
+web_sales_agg AS (
+    SELECT
+        c.c_customer_id AS customer_id,
+        c.c_first_name AS customer_first_name,
+        c.c_last_name AS customer_last_name,
+        d.d_year AS year,
+        STDDEV_SAMP(ws.ws_net_paid) AS year_total,
+        'w' AS sale_type
+    FROM customer c
+    JOIN web_sales ws ON c.c_customer_sk = ws.ws_bill_customer_sk
+    JOIN date_dim d ON ws.ws_sold_date_sk = d.d_date_sk
+    WHERE d.d_year IN (1999, 2000)
+    GROUP BY
+        c.c_customer_id,
+        c.c_first_name,
+        c.c_last_name,
+        d.d_year
+)
+SELECT
+    t_s_secyear.customer_id,
+    t_s_secyear.customer_first_name,
+    t_s_secyear.customer_last_name
+FROM store_sales_agg t_s_firstyear
+JOIN store_sales_agg t_s_secyear
+    ON t_s_firstyear.customer_id = t_s_secyear.customer_id
+    AND t_s_firstyear.year = 1999
+    AND t_s_secyear.year = 2000
+JOIN web_sales_agg t_w_firstyear
+    ON t_s_firstyear.customer_id = t_w_firstyear.customer_id
+    AND t_w_firstyear.year = 1999
+JOIN web_sales_agg t_w_secyear
+    ON t_s_firstyear.customer_id = t_w_secyear.customer_id
+    AND t_w_secyear.year = 2000
+WHERE t_s_firstyear.year_total > 0
+    AND t_w_firstyear.year_total > 0
+    AND t_w_secyear.year_total / t_w_firstyear.year_total
+        > t_s_secyear.year_total / t_s_firstyear.year_total
+ORDER BY
+    2,
+    1,
+    3
+LIMIT 100

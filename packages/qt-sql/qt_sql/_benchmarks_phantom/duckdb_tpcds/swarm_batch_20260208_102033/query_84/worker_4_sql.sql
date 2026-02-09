@@ -1,0 +1,30 @@
+WITH filtered_customer_address AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_city = 'Oakwood'
+), filtered_income_band AS (
+    SELECT ib_income_band_sk
+    FROM income_band
+    WHERE ib_lower_bound >= 5806
+      AND ib_upper_bound <= 5806 + 50000
+), filtered_household_demographics AS (
+    SELECT hd_demo_sk
+    FROM household_demographics
+    JOIN filtered_income_band ON hd_income_band_sk = ib_income_band_sk
+), eligible_customers AS (
+    SELECT 
+        c_customer_id,
+        c_first_name,
+        c_last_name,
+        c_current_cdemo_sk
+    FROM customer
+    JOIN filtered_customer_address ON c_current_addr_sk = ca_address_sk
+    JOIN filtered_household_demographics ON hd_demo_sk = c_current_hdemo_sk
+)
+SELECT
+    c_customer_id AS customer_id,
+    COALESCE(c_last_name, '') || ', ' || COALESCE(c_first_name, '') AS customername
+FROM eligible_customers
+JOIN store_returns ON sr_cdemo_sk = c_current_cdemo_sk
+ORDER BY c_customer_id
+LIMIT 100

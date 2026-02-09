@@ -1,0 +1,39 @@
+WITH filtered_dates AS (
+  SELECT d_date_sk, d_year
+  FROM date_dim
+  WHERE d_moy = 12
+    AND d_year = 2002
+),
+filtered_sales AS (
+  SELECT 
+    ss_item_sk,
+    d_year,
+    SUM(ss_ext_sales_price) AS item_ext_price
+  FROM store_sales
+  JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+  GROUP BY ss_item_sk, d_year
+),
+filtered_items AS (
+  SELECT 
+    i_item_sk,
+    i_brand_id,
+    i_brand
+  FROM item
+  WHERE i_manager_id = 1
+)
+SELECT
+  fs.d_year,
+  fi.i_brand_id AS brand_id,
+  fi.i_brand AS brand,
+  SUM(fs.item_ext_price) AS ext_price
+FROM filtered_sales fs
+JOIN filtered_items fi ON fs.ss_item_sk = fi.i_item_sk
+GROUP BY
+  fs.d_year,
+  fi.i_brand,
+  fi.i_brand_id
+ORDER BY
+  fs.d_year,
+  ext_price DESC,
+  brand_id
+LIMIT 100

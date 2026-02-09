@@ -84,7 +84,7 @@ class TagRecommender:
         engine = "postgres" if dialect == "postgres" else "duckdb"
 
         try:
-            from .faiss_builder import extract_tags, classify_category
+            from .tag_index import extract_tags, classify_category
 
             query_tags = extract_tags(sql, dialect=dialect)
             query_category = classify_category(query_tags)
@@ -140,7 +140,7 @@ class TagRecommender:
         engine = "postgres" if dialect == "postgres" else "duckdb"
 
         try:
-            from .faiss_builder import extract_tags, classify_category
+            from .tag_index import extract_tags, classify_category
 
             query_tags = extract_tags(sql, dialect=dialect)
             query_category = classify_category(query_tags)

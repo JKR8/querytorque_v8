@@ -2392,7 +2392,7 @@ def phase4_promote_winners(
             f"{'would be ' if dry_run else ''}promoted"
         )
         if not dry_run:
-            logger.info("  Run `python3 -m ado.faiss_builder` to rebuild the tag index")
+            logger.info("  Run `python3 -m ado.tag_index` to rebuild the tag index")
     else:
         logger.info("Phase 4 complete: no new examples qualify for promotion")
 

@@ -1,0 +1,291 @@
+You are analyzing 5 failed optimization attempts to design a refined approach that reaches 2.0x speedup.
+
+Your job: understand WHY each attempt fell short, identify unexplored optimization angles, and synthesize a NEW strategy that combines the best insights while avoiding repeated mistakes.
+
+## Query: query_36
+## Target: 2.0x speedup
+## Dialect: duckdb
+
+```sql
+-- start query 36 in stream 0 using template query36.tpl
+select 
+    sum(ss_net_profit)/sum(ss_ext_sales_price) as gross_margin
+   ,i_category
+   ,i_class
+   ,grouping(i_category)+grouping(i_class) as lochierarchy
+   ,rank() over (
+ 	partition by grouping(i_category)+grouping(i_class),
+ 	case when grouping(i_class) = 0 then i_category end 
+ 	order by sum(ss_net_profit)/sum(ss_ext_sales_price) asc) as rank_within_parent
+ from
+    store_sales
+   ,date_dim       d1
+   ,item
+   ,store
+ where
+    d1.d_year = 2002 
+ and d1.d_date_sk = ss_sold_date_sk
+ and i_item_sk  = ss_item_sk 
+ and s_store_sk  = ss_store_sk
+ and s_state in ('SD','TN','GA','SC',
+                 'MO','AL','MI','OH')
+ group by rollup(i_category,i_class)
+ order by
+   lochierarchy desc
+  ,case when lochierarchy = 0 then i_category end
+  ,rank_within_parent
+ LIMIT 100;
+
+-- end query 36 in stream 0 using template query36.tpl
+```
+
+## Previous Attempts
+
+### Worker 1: conservative_predicate_pushdown
+- **Status**: pass (0.99x)
+- **Transforms**: none
+- **Examples used**: early_filter, pushdown, date_cte_isolate
+- **Strategy hint**: Pre-filter dimension tables (date_dim, store, item) into separate CTEs before the main join to reduce fact table rows early. Push filters into CTEs and use explicit joins.
+
+```sql
+WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2002
+),
+filtered_store AS (
+    SELECT s_store_sk
+    FROM store
+    WHERE s_state IN ('SD', 'TN', 'GA', 'SC', 'MO', 'AL', 'MI', 'OH')
+)
+SELECT
+    SUM(ss_net_profit) / SUM(ss_ext_sales_price) AS gross_margin,
+    i_category,
+    i_class,
+    GROUPING(i_category) + GROUPING(i_class) AS lochierarchy,
+    RANK() OVER (
+        PARTITION BY GROUPING(i_category) + GROUPING(i_class),
+                     CASE WHEN GROUPING(i_class) = 0 THEN i_category END
+        ORDER BY SUM(ss_net_profit) / SUM(ss_ext_sales_price) ASC
+    ) AS rank_within_parent
+FROM store_sales
+JOIN filtered_date ON d_date_sk = ss_sold_date_sk
+JOIN item ON i_item_sk = ss_item_sk
+JOIN filtered_store ON s_store_sk = ss_store_sk
+GROUP BY ROLLUP(i_category, i_class)
+ORDER BY
+    lochierarchy DESC,
+    CASE WHEN lochierarchy = 0 THEN i_category END,
+    rank_within_parent
+LIMIT 100;
+```
+
+### Worker 2: moderate_dimension_isolation
+- **Status**: pass (0.99x)
+- **Transforms**: none
+- **Examples used**: dimension_cte_isolate, materialize_cte, shared_dimension_multi_channel
+- **Strategy hint**: Isolate all dimension filters into individual CTEs, then join with fact table. Materialize grouped aggregations before window function to simplify the final query.
+
+```sql
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2002
+),
+filtered_stores AS (
+    SELECT s_store_sk
+    FROM store
+    WHERE s_state IN ('SD', 'TN', 'GA', 'SC', 'MO', 'AL', 'MI', 'OH')
+),
+filtered_items AS (
+    SELECT i_item_sk, i_category, i_class
+    FROM item
+),
+joined_sales AS (
+    SELECT 
+        i.i_category,
+        i.i_class,
+        ss.ss_net_profit,
+        ss.ss_ext_sales_price
+    FROM store_sales ss
+    JOIN filtered_dates d ON ss.ss_sold_date_sk = d.d_date_sk
+    JOIN filtered_stores s ON ss.ss_store_sk = s.s_store_sk
+    JOIN filtered_items i ON ss.ss_item_sk = i.i_item_sk
+),
+aggregated AS (
+    SELECT 
+        i_category,
+        i_class,
+        SUM(ss_net_profit) AS sum_net_profit,
+-- ... (truncated)
+```
+
+### Worker 3: aggressive_prefetch_restructure
+- **Status**: pass (0.96x)
+- **Transforms**: none
+- **Examples used**: prefetch_fact_join, multi_dimension_prefetch, single_pass_aggregation
+- **Strategy hint**: Pre-filter and pre-join dimensions with the fact table in staged CTEs. Consider consolidating the ROLLUP aggregation into a single-pass CTE before applying the window function.
+
+```sql
+WITH filtered_dates AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 2002
+),
+filtered_stores AS (
+  SELECT s_store_sk
+  FROM store
+  WHERE s_state IN ('SD', 'TN', 'GA', 'SC', 'MO', 'AL', 'MI', 'OH')
+),
+joined_sales AS (
+  SELECT
+    i.i_category,
+    i.i_class,
+    ss.ss_net_profit,
+    ss.ss_ext_sales_price
+  FROM store_sales ss
+  JOIN filtered_dates d1 ON ss.ss_sold_date_sk = d1.d_date_sk
+  JOIN filtered_stores s ON ss.ss_store_sk = s.s_store_sk
+  JOIN item i ON ss.ss_item_sk = i.i_item_sk
+),
+aggregated AS (
+  SELECT
+    i_category,
+    i_class,
+    SUM(ss_net_profit) AS sum_net_profit,
+    SUM(ss_ext_sales_price) AS sum_sales_price,
+    GROUPING(i_category) + GROUPING(i_class) AS lochierarchy
+  FROM joined_sales
+  GROUP BY ROLLUP (i_category, i_class)
+-- ... (truncated)
+```
+
+### Worker 4: novel_structural_transform
+- **Status**: pass (0.43x)
+- **Transforms**: none
+- **Examples used**: or_to_union, intersect_to_exists, union_cte_split
+- **Strategy hint**: Transform the IN-list filter on s_state into UNION ALL branches for parallel filtering. Explore restructuring the ROLLUP logic with set operations to optimize aggregation paths.
+
+```sql
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2002
+),
+filtered_stores AS (
+    SELECT s_store_sk, s_state
+    FROM store
+    WHERE s_state IN ('SD', 'TN', 'GA', 'SC', 'MO', 'AL', 'MI', 'OH')
+),
+joined_base AS (
+    SELECT
+        i.i_category,
+        i.i_class,
+        ss.ss_net_profit,
+        ss.ss_ext_sales_price
+    FROM store_sales ss
+    JOIN filtered_dates d ON d.d_date_sk = ss.ss_sold_date_sk
+    JOIN item i ON i.i_item_sk = ss.ss_item_sk
+    JOIN filtered_stores s ON s.s_store_sk = ss.ss_store_sk
+),
+level_aggregates AS (
+    -- Level 0: category + class
+    SELECT
+        i_category,
+        i_class,
+        0 AS lochierarchy,
+        SUM(ss_net_profit) AS sum_net_profit,
+        SUM(ss_ext_sales_price) AS sum_sales_price
+    FROM joined_base
+-- ... (truncated)
+```
+
+### Worker 5: refined_snipe
+- **Status**: pass (1.05x)
+- **Transforms**: none
+- **Examples used**: 
+- **Strategy hint**: Snipe from iter 1
+
+```sql
+WITH filtered_dates AS (
+    SELECT d_date_sk 
+    FROM date_dim 
+    WHERE d_year = 2002
+),
+filtered_stores AS (
+    SELECT s_store_sk 
+    FROM store 
+    WHERE s_state IN ('SD', 'TN', 'GA', 'SC', 'MO', 'AL', 'MI', 'OH')
+),
+joined_data AS (
+    SELECT 
+        ss_net_profit,
+        ss_ext_sales_price,
+        i_category,
+        i_class
+    FROM store_sales
+    JOIN filtered_dates ON d_date_sk = ss_sold_date_sk
+    JOIN item ON i_item_sk = ss_item_sk
+    JOIN filtered_stores ON s_store_sk = ss_store_sk
+)
+SELECT
+    SUM(ss_net_profit) / SUM(ss_ext_sales_price) AS gross_margin,
+    i_category,
+    i_class,
+    GROUPING(i_category) + GROUPING(i_class) AS lochierarchy,
+    RANK() OVER (
+        PARTITION BY GROUPING(i_category) + GROUPING(i_class), 
+                     CASE WHEN GROUPING(i_class) = 0 THEN i_category END
+        ORDER BY SUM(ss_net_profit) / SUM(ss_ext_sales_price) ASC
+-- ... (truncated)
+```
+
+## DAG Structure & Bottlenecks
+
+| Node | Role | Cost % |
+|------|------|-------:|
+| main_query |  | 0.0% |
+
+## Available Examples (Full Catalog)
+
+- **composite_decorrelate_union** (2.42xx) — Decorrelate multiple correlated EXISTS subqueries into pre-materialized DISTINCT
+- **date_cte_isolate** (4.00xx) — Extract date filtering into a separate CTE to enable predicate pushdown and redu
+- **decorrelate** (2.92xx) — Convert correlated subquery to separate CTE with GROUP BY, then JOIN
+- **deferred_window_aggregation** (1.36xx) — When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joi
+- **dimension_cte_isolate** (1.93xx) — Pre-filter ALL dimension tables into CTEs before joining with fact table, not ju
+- **early_filter** (4.00xx) — Filter dimension tables FIRST, then join to fact tables to reduce expensive join
+- **intersect_to_exists** (1.83xx) — Convert INTERSECT subquery pattern to multiple EXISTS clauses for better join pl
+- **materialize_cte** (1.37xx) — Extract repeated subquery patterns into a CTE to avoid recomputation
+- **multi_date_range_cte** (2.35xx) — When query uses multiple date_dim aliases with different filters (d1, d2, d3), c
+- **multi_dimension_prefetch** (2.71xx) — Pre-filter multiple dimension tables (date + store) into separate CTEs before jo
+- **or_to_union** (3.17xx) — Split OR conditions on different columns into UNION ALL branches for better inde
+- **prefetch_fact_join** (3.77xx) — Pre-filter dimension table into CTE, then pre-join with fact table in second CTE
+- **pushdown** (2.11xx) — Push filters from outer query into CTEs/subqueries to reduce intermediate result
+- **shared_dimension_multi_channel** (1.30xx) — Extract shared dimension filters (date, item, promotion) into CTEs when multiple
+- **single_pass_aggregation** (4.47xx) — Consolidate multiple subqueries scanning the same table into a single CTE with c
+- **union_cte_split** (1.36xx) — Split a generic UNION ALL CTE into specialized CTEs when the main query filters 
+
+## Your Task
+
+Analyze the failed attempts and design a refined approach:
+
+1. **Failure Analysis**: Why did all attempts fall short? Be specific about mechanisms.
+2. **Common Patterns**: What did multiple workers try unsuccessfully?
+3. **Unexplored Space**: What optimization angles were missed entirely?
+4. **Refined Strategy**: Synthesize a NEW approach combining best insights.
+
+### Output Format (follow EXACTLY)
+
+```
+FAILURE_ANALYSIS:
+<Why all workers fell short — be specific about mechanisms>
+
+UNEXPLORED_OPPORTUNITIES:
+<What optimization approaches haven't been tried>
+
+REFINED_STRATEGY:
+<Concrete optimization approach for next attempt>
+
+EXAMPLES: <ex1>, <ex2>, <ex3>
+HINT: <specific guidance for the refined attempt>
+```

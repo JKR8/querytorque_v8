@@ -1,0 +1,59 @@
+WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2001
+),
+filtered_cd AS (
+    SELECT cd_demo_sk, cd_marital_status, cd_education_status
+    FROM customer_demographics
+    WHERE (cd_marital_status = 'D' AND cd_education_status = 'Unknown')
+       OR (cd_marital_status = 'S' AND cd_education_status = 'College')
+       OR (cd_marital_status = 'M' AND cd_education_status = '4 yr Degree')
+),
+filtered_hd AS (
+    SELECT hd_demo_sk, hd_dep_count
+    FROM household_demographics
+    WHERE hd_dep_count IN (1, 3)
+),
+filtered_ca AS (
+    SELECT ca_address_sk, ca_state
+    FROM customer_address
+    WHERE ca_country = 'United States'
+      AND (ca_state IN ('SD', 'KS', 'MI')
+           OR ca_state IN ('MO', 'ND', 'CO')
+           OR ca_state IN ('NH', 'OH', 'TX'))
+),
+prefiltered_sales AS (
+    SELECT
+        ss.ss_quantity,
+        ss.ss_ext_sales_price,
+        ss.ss_ext_wholesale_cost,
+        ss.ss_sales_price,
+        ss.ss_net_profit,
+        ss.ss_store_sk,
+        ss.ss_cdemo_sk,
+        ss.ss_hdemo_sk,
+        ss.ss_addr_sk
+    FROM store_sales ss
+    JOIN filtered_date ON ss.ss_sold_date_sk = filtered_date.d_date_sk
+)
+SELECT
+    AVG(ss_quantity),
+    AVG(ss_ext_sales_price),
+    AVG(ss_ext_wholesale_cost),
+    SUM(ss_ext_wholesale_cost)
+FROM prefiltered_sales ps
+JOIN store s ON ps.ss_store_sk = s.s_store_sk
+JOIN filtered_cd cd ON ps.ss_cdemo_sk = cd.cd_demo_sk
+JOIN filtered_hd hd ON ps.ss_hdemo_sk = hd.hd_demo_sk
+JOIN filtered_ca ca ON ps.ss_addr_sk = ca.ca_address_sk
+WHERE (
+    (hd.hd_dep_count = 3 AND cd.cd_marital_status = 'D' AND cd.cd_education_status = 'Unknown' AND ps.ss_sales_price BETWEEN 100.00 AND 150.00)
+    OR (hd.hd_dep_count = 1 AND cd.cd_marital_status = 'S' AND cd.cd_education_status = 'College' AND ps.ss_sales_price BETWEEN 50.00 AND 100.00)
+    OR (hd.hd_dep_count = 1 AND cd.cd_marital_status = 'M' AND cd.cd_education_status = '4 yr Degree' AND ps.ss_sales_price BETWEEN 150.00 AND 200.00)
+)
+AND (
+    (ca.ca_state IN ('SD', 'KS', 'MI') AND ps.ss_net_profit BETWEEN 100 AND 200)
+    OR (ca.ca_state IN ('MO', 'ND', 'CO') AND ps.ss_net_profit BETWEEN 150 AND 300)
+    OR (ca.ca_state IN ('NH', 'OH', 'TX') AND ps.ss_net_profit BETWEEN 50 AND 250)
+)

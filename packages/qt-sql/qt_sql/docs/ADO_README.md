@@ -264,7 +264,7 @@ patterns from gold examples, then ranks by tag overlap count at query time.
 
 ```bash
 cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
-PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.faiss_builder
+PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.tag_index
 ```
 
 Output: `models/similarity_tags.json` + `similarity_metadata.json` (108 examples).
@@ -311,7 +311,7 @@ ado/
 ├── schemas.py        # Data structures (BenchmarkConfig, SessionResult, etc.)
 ├── learn.py          # Learning records + analytics
 ├── knowledge.py      # Example recommender (tag-based retrieval)
-├── faiss_builder.py  # Build/rebuild tag-based similarity index
+├── tag_index.py      # Build/rebuild tag-based similarity index
 ├── context.py        # Context management
 ├── store.py          # Result storage
 ├── session_logging.py # Session log utilities

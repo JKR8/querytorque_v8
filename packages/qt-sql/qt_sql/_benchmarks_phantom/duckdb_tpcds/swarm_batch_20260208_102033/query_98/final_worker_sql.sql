@@ -1,0 +1,48 @@
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_date BETWEEN CAST('2002-05-20' AS DATE) AND (CAST('2002-05-20' AS DATE) + INTERVAL '30' DAY)
+),
+filtered_items AS (
+    SELECT i_item_sk, i_item_id, i_item_desc, i_category, i_class, i_current_price
+    FROM item
+    WHERE i_category IN ('Sports', 'Music', 'Shoes')
+),
+item_sales AS (
+    SELECT ss_item_sk, SUM(ss_ext_sales_price) AS total_revenue
+    FROM store_sales
+    WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_dates)
+    GROUP BY ss_item_sk
+),
+joined_data AS (
+    SELECT
+        fi.i_item_id,
+        fi.i_item_desc,
+        fi.i_category,
+        fi.i_class,
+        fi.i_current_price,
+        isales.total_revenue
+    FROM filtered_items fi
+    INNER JOIN item_sales isales ON fi.i_item_sk = isales.ss_item_sk
+),
+class_totals AS (
+    SELECT i_class, SUM(total_revenue) AS class_revenue
+    FROM joined_data
+    GROUP BY i_class
+)
+SELECT
+    i_item_id,
+    i_item_desc,
+    i_category,
+    i_class,
+    i_current_price,
+    total_revenue AS itemrevenue,
+    (total_revenue * 100) / class_revenue AS revenueratio
+FROM joined_data
+INNER JOIN class_totals USING (i_class)
+ORDER BY
+    i_category,
+    i_class,
+    i_item_id,
+    i_item_desc,
+    revenueratio

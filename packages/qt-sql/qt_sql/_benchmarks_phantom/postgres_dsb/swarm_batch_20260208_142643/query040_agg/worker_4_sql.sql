@@ -1,0 +1,66 @@
+WITH filtered_date AS (
+    SELECT d_date_sk, d_date
+    FROM date_dim
+    WHERE d_date BETWEEN (CAST('1999-04-19' AS DATE) - INTERVAL '30 DAY')
+                     AND (CAST('1999-04-19' AS DATE) + INTERVAL '30 DAY')
+),
+filtered_item AS (
+    SELECT i_item_sk, i_item_id
+    FROM item
+    WHERE i_category = 'Home'
+      AND i_manager_id BETWEEN 25 AND 64
+),
+cs_filtered AS (
+    SELECT 
+        cs_item_sk,
+        cs_order_number,
+        cs_sales_price,
+        cs_warehouse_sk,
+        cs_sold_date_sk
+    FROM catalog_sales
+    WHERE cs_wholesale_cost BETWEEN 17 AND 36
+),
+joined_sales_returns AS (
+    SELECT 
+        cs.cs_item_sk,
+        cs.cs_order_number,
+        cs.cs_sales_price,
+        cs.cs_warehouse_sk,
+        cs.cs_sold_date_sk,
+        cr.cr_refunded_cash,
+        cr.cr_reason_sk
+    FROM cs_filtered cs
+    LEFT OUTER JOIN catalog_returns cr
+        ON cs.cs_order_number = cr.cr_order_number 
+       AND cs.cs_item_sk = cr.cr_item_sk
+    WHERE cr.cr_reason_sk = 16 OR cr.cr_order_number IS NULL
+)
+SELECT
+    w.w_state,
+    i.i_item_id,
+    SUM(
+        CASE
+            WHEN (fd.d_date < CAST('1999-04-19' AS DATE))
+            THEN jsr.cs_sales_price - COALESCE(jsr.cr_refunded_cash, 0)
+            ELSE 0
+        END
+    ) AS sales_before,
+    SUM(
+        CASE
+            WHEN (fd.d_date >= CAST('1999-04-19' AS DATE))
+            THEN jsr.cs_sales_price - COALESCE(jsr.cr_refunded_cash, 0)
+            ELSE 0
+        END
+    ) AS sales_after
+FROM joined_sales_returns jsr
+INNER JOIN filtered_item i ON jsr.cs_item_sk = i.i_item_sk
+INNER JOIN filtered_date fd ON jsr.cs_sold_date_sk = fd.d_date_sk
+INNER JOIN warehouse w ON jsr.cs_warehouse_sk = w.w_warehouse_sk
+WHERE jsr.cr_reason_sk = 16 OR jsr.cr_refunded_cash IS NULL
+GROUP BY
+    w.w_state,
+    i.i_item_id
+ORDER BY
+    w.w_state,
+    i.i_item_id
+LIMIT 100

@@ -1,0 +1,125 @@
+## 1. STRUCTURAL BREAKDOWN
+
+**Innermost Subquery (dw1)**:
+- Computes aggregated sales (price × quantity) for 12 consecutive months, grouped by 8 dimensions with ROLLUP (producing subtotals at all hierarchy levels).
+- Reads all ~5.4M store_sales rows filtered through date_dim (12 months = ~360 days), then joins with store (~1,000 rows) and item (~400K rows).
+- Outputs ~X rows (base groups + rollup subtotals) where X = (#item categories × classes × brands × products × years × quarters × months × stores × rollup combinations).
+
+**Middle Subquery (dw2)**:
+- Ranks each row within its category by descending sales, including all ROLLUP-generated subtotal rows in the ranking.
+- Processes the entire output from dw1.
+- Outputs same row count as dw1 plus rank column.
+
+**Outermost Query**:
+- Filters to top 100 ranks per category, then sorts by all 8 dimensions plus sales and rank.
+- Processes ~(100 × #categories) rows before LIMIT 100.
+- Final output: 100 rows of top-performing combinations per category.
+
+## 2. BOTTLENECK IDENTIFICATION
+
+The dominant cost is the **SEQ_SCAN of store_sales (5.4M rows) with immediate ROLLUP aggregation**. The mechanism is:
+
+1. **Unnecessary ROLLUP computation**: The query computes expensive ROLLUP (256 grouping sets) for ALL data, then filters to top 100 per category. 95%+ of these rollup aggregations are discarded.
+2. **Late filtering**: The date filter (`d_month_seq BETWEEN 1206 AND 1206+11`) applies during the join, but DuckDB must still scan the entire store_sales table to find matching rows.
+3. **Window function on large intermediate**: RANK() processes the entire rollup result, including subtotal rows that may not be needed.
+
+The root cause: **computing expensive ROLLUP before top-N filtering**. Each rollup level multiplies aggregation work, yet only a tiny fraction (top 100 per category) is needed.
+
+## 3. PROPOSED OPTIMIZATION
+
+**Optimization 1: Pre-filter fact table with dimension CTEs**
+- **What**: Create CTEs for filtered date_dim, store, item; join them with store_sales using fact table last.
+- **Why**: Reduces store_sales scan via selective joins. DuckDB can push predicates and use efficient join orders.
+- **Risk**: Must preserve all rollup combinations. Ensure no cartesian products.
+- **Impact**: Moderate (2-3x expected based on pattern history).
+
+**Optimization 2: Defer ROLLUP until after top-N filtering**
+- **What**: First compute non-rollup aggregates, rank them, filter to top 100 per category, THEN compute ROLLUP only for those groups.
+- **Why**: Avoids computing 256 grouping sets for all data; only computes rollup for top performers.
+- **Risk**: Changes semantics if subtotal rows (NULLs in grouping columns) could rank in top 100. Need business validation.
+- **Impact**: Significant (3-5x) if rollup computation is dominant.
+
+**Optimization 3: Materialize dimension-filtered fact rows**
+- **What**: Create CTE with store_sales pre-joined with filtered date_dim only (key + date columns), then join with other dimensions.
+- **Why**: Enables early fact table reduction via date filter pushdown.
+- **Risk**: May interfere with DuckDB's join optimizer; test with/without CTE materialization hints.
+- **Impact**: Minor to moderate (1.5-2x).
+
+## 4. FAILURE ANALYSIS
+
+**Previous attempt: date_cte_isolate (0.85x regression)**
+- **Why it failed**: DuckDB's optimizer already pushes date filters effectively. The CTE added materialization overhead without providing new optimization opportunities. The real bottleneck was ROLLUP computation, not date filtering.
+- **Lesson**: Isolating a single dimension filter won't help when the dominant cost is massive aggregation. Need to address the ROLLUP mechanism directly.
+
+## 5. RECOMMENDED STRATEGY
+
+Implement **deferred ROLLUP with prefetch join**:
+
+1. **Create dimension-filtered CTEs** for date_dim (month range), store (all), item (all).
+2. **Join CTEs with store_sales** in optimal order: date → store_sales → item → store.
+3. **Compute base aggregates** (GROUP BY all 8 columns, NO ROLLUP).
+4. **Apply window function** (RANK) on this smaller result.
+5. **Filter to top 100 per category** (rk <= 100).
+6. **Compute ROLLUP only on the filtered result** (now ~few hundred rows).
+
+This approach:
+- Eliminates 99% of ROLLUP computations
+- Reduces window function input size dramatically
+- Preserves semantics if business accepts that only fully-specified groups (not subtotals) compete for top ranks
+
+Implementation sketch:
+```sql
+WITH filtered_dates AS (
+  SELECT d_date_sk, d_year, d_qoy, d_moy 
+  FROM date_dim 
+  WHERE d_month_seq BETWEEN 1206 AND 1206 + 11
+),
+joined_data AS (
+  SELECT 
+    i_category, i_class, i_brand, i_product_name,
+    d_year, d_qoy, d_moy, s_store_id,
+    SUM(ss_sales_price * ss_quantity) AS sumsales
+  FROM store_sales
+  JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+  JOIN item ON ss_item_sk = i_item_sk
+  JOIN store ON ss_store_sk = s_store_sk
+  GROUP BY i_category, i_class, i_brand, i_product_name,
+           d_year, d_qoy, d_moy, s_store_id
+),
+ranked AS (
+  SELECT *,
+    RANK() OVER (PARTITION BY i_category ORDER BY sumsales DESC) AS rk
+  FROM joined_data
+)
+SELECT *
+FROM (
+  -- Now apply ROLLUP only to top performers
+  SELECT 
+    i_category, i_class, i_brand, i_product_name,
+    d_year, d_qoy, d_moy, s_store_id,
+    SUM(sumsales) AS sumsales,
+    MIN(rk) AS rk  -- preserve original rank
+  FROM ranked
+  WHERE rk <= 100
+  GROUP BY ROLLUP(i_category, i_class, i_brand, i_product_name,
+                  d_year, d_qoy, d_moy, s_store_id)
+) 
+ORDER BY i_category, i_class, i_brand, i_product_name,
+         d_year, d_qoy, d_moy, s_store_id,
+         sumsales, rk
+LIMIT 100;
+```
+
+## 6. EXAMPLE SELECTION
+
+The FAISS picks are partially relevant:
+- `deferred_window_aggregation`: Relevant for moving RANK after filtering, but we also need ROLLUP deferral.
+- `prefetch_fact_join`: Relevant for dimension pre-filtering.
+- `decorrelate`: Not directly applicable (no correlated subqueries).
+
+Better examples for this query:
+- `single_pass_aggregation`: Because we're consolidating ROLLUP computation.
+- `dimension_cte_isolate`: For pre-filtering all dimensions.
+- `prefetch_fact_join`: For forcing optimal join order.
+
+**EXAMPLES: single_pass_aggregation, dimension_cte_isolate, prefetch_fact_join**

@@ -1,46 +1,62 @@
 #!/usr/bin/env python3
-"""Generate real prompt samples from benchmark data.
+"""Generate rendered prompt samples for every prompt type.
 
-Writes rendered analyst and worker prompts to this samples/ directory
-so they can be reviewed without running the full pipeline.
+Produces a versioned Prompt Pack (V0/, V1/, ...) with one .md file per
+prompt builder. Uses real benchmark data from Q88 and the everyhousehold
+enterprise pipeline.
 
 Usage:
     cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
-    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.prompts.samples.generate_sample query_74
+    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.prompts.samples.generate_sample query_88 --version V0 --script paper/sql/everyhousehold_deidentified.sql
+
+    # Generate just one prompt type:
+    PYTHONPATH=... python3 -m qt_sql.prompts.samples.generate_sample query_88 --version V0 --only oneshot_script
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 # ── Paths ───────────────────────────────────────────────────────────
 SAMPLES_DIR = Path(__file__).resolve().parent
-ADO_DIR = SAMPLES_DIR.parent.parent          # ado/
-BENCHMARK_DIR = ADO_DIR / "benchmarks" / "duckdb_tpcds"
-CONSTRAINTS_DIR = ADO_DIR / "constraints"
+QT_SQL_DIR = SAMPLES_DIR.parent.parent           # qt_sql/
+BENCHMARK_DIR = QT_SQL_DIR / "benchmarks" / "duckdb_tpcds"
+CONSTRAINTS_DIR = QT_SQL_DIR / "constraints"
 BATCH_DIR = BENCHMARK_DIR / "swarm_batch_20260208_102033"
+PROJECT_ROOT = QT_SQL_DIR.parent.parent.parent    # QueryTorque_V8/
 
-QUERY_ID = sys.argv[1] if len(sys.argv) > 1 else "query_74"
+
+def get_output_dir(version: str) -> Path:
+    """Return versioned output directory, creating it if needed."""
+    d = SAMPLES_DIR / version
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-def load_original_sql() -> str:
-    sql_path = BATCH_DIR / QUERY_ID / "original.sql"
+# ═══════════════════════════════════════════════════════════════════════
+# Data loaders (parameterized by query_id)
+# ═══════════════════════════════════════════════════════════════════════
+
+def load_original_sql(query_id: str) -> str:
+    sql_path = BATCH_DIR / query_id / "original.sql"
     if not sql_path.exists():
-        sql_path = ADO_DIR.parent.parent.parent / "research" / "tpcds_queries" / f"{QUERY_ID}.sql"
+        sql_path = PROJECT_ROOT / "research" / "tpcds_queries" / f"{query_id}.sql"
     if not sql_path.exists():
-        print(f"ERROR: Cannot find SQL for {QUERY_ID}")
+        print(f"ERROR: Cannot find SQL for {query_id}")
         sys.exit(1)
     sql = sql_path.read_text().strip()
     print(f"Loaded SQL: {len(sql)} chars from {sql_path}")
     return sql
 
 
-def load_explain_plan() -> str | None:
+def load_explain_plan(query_id: str) -> Optional[str]:
     for subdir in ["sf10", "sf5", ""]:
         d = BENCHMARK_DIR / "explains" / subdir if subdir else BENCHMARK_DIR / "explains"
-        p = d / f"{QUERY_ID}.json"
+        p = d / f"{query_id}.json"
         if p.exists():
             data = json.loads(p.read_text())
             plan_text = data.get("plan_text")
@@ -51,21 +67,20 @@ def load_explain_plan() -> str | None:
     return None
 
 
-def parse_dag(sql: str, explain_plan_text: str | None = None):
+def parse_dag(sql: str, explain_plan_text: Optional[str] = None):
     try:
-        from ...dag import DagBuilder, CostAnalyzer
+        from qt_sql.dag import DagBuilder, CostAnalyzer
         builder = DagBuilder(sql, dialect="duckdb")
         dag = builder.build()
 
-        # Try to get real cost attribution from EXPLAIN plan
         plan_context = None
         if explain_plan_text:
             try:
                 plan_json = json.loads(explain_plan_text) if explain_plan_text.strip().startswith("{") else None
                 if plan_json:
-                    from ...plan_analyzer import analyze_plan_for_optimization
+                    from qt_sql.plan_analyzer import analyze_plan_for_optimization
                     plan_context = analyze_plan_for_optimization(plan_json, sql, "duckdb")
-                    print(f"EXPLAIN → OptimizationContext: {len(plan_context.table_scans)} scans, "
+                    print(f"EXPLAIN -> OptimizationContext: {len(plan_context.table_scans)} scans, "
                           f"{len(plan_context.bottleneck_operators)} operators")
             except Exception as e:
                 print(f"EXPLAIN analysis failed ({e}), using heuristic costs")
@@ -81,7 +96,7 @@ def parse_dag(sql: str, explain_plan_text: str | None = None):
         return SimpleNamespace(nodes={}, edges=[]), {}
 
 
-def load_semantic_intents():
+def load_semantic_intents(query_id: str):
     intents_path = BENCHMARK_DIR / "semantic_intents.json"
     if not intents_path.exists():
         print("No semantic intents found")
@@ -89,11 +104,11 @@ def load_semantic_intents():
 
     import re
     data = json.loads(intents_path.read_text())
-    m = re.match(r"(?:query_?)(\d+\w?)", QUERY_ID)
-    qnum = m.group(1) if m else QUERY_ID
+    m = re.match(r"(?:query_?)(\d+\w?)", query_id)
+    qnum = m.group(1) if m else query_id
     for q in data.get("queries", []):
         qid = q.get("query_id", "")
-        if qid == QUERY_ID or qid == f"q{qnum}":
+        if qid == query_id or qid == f"q{qnum}":
             print(f"Loaded semantic intents for {qid}")
             return q
     print("No semantic intents found")
@@ -113,11 +128,13 @@ def load_global_knowledge():
     return None
 
 
-def load_matched_examples(sql: str, recommender):
+def load_matched_examples(sql: str, recommender) -> List[Dict]:
     matched = []
     if recommender._initialized:
         matches = recommender.find_similar_examples(sql, k=16, dialect="duckdb")
-        examples_dir = ADO_DIR / "examples" / "duckdb"
+        examples_dir = QT_SQL_DIR / "optimization" / "examples" / "duckdb"
+        if not examples_dir.exists():
+            examples_dir = QT_SQL_DIR.parent.parent.parent / "ado" / "examples" / "duckdb"
         for ex_id, score, meta in matches:
             ex_path = examples_dir / f"{ex_id}.json"
             if ex_path.exists():
@@ -128,23 +145,27 @@ def load_matched_examples(sql: str, recommender):
     return matched
 
 
-def load_full_catalog():
+def load_full_catalog() -> List[Dict]:
     catalog = []
-    for p in sorted((ADO_DIR / "examples" / "duckdb").glob("*.json")):
-        try:
-            d = json.loads(p.read_text())
-            catalog.append({
-                "id": d.get("id", p.stem),
-                "speedup": d.get("verified_speedup", "?"),
-                "description": d.get("description", "")[:80],
-            })
-        except Exception:
-            pass
+    examples_dir = QT_SQL_DIR / "optimization" / "examples" / "duckdb"
+    if not examples_dir.exists():
+        examples_dir = QT_SQL_DIR.parent.parent.parent / "ado" / "examples" / "duckdb"
+    if examples_dir.exists():
+        for p in sorted(examples_dir.glob("*.json")):
+            try:
+                d = json.loads(p.read_text())
+                catalog.append({
+                    "id": d.get("id", p.stem),
+                    "speedup": d.get("verified_speedup", "?"),
+                    "description": d.get("description", "")[:80],
+                })
+            except Exception:
+                pass
     print(f"Full catalog: {len(catalog)} examples")
     return catalog
 
 
-def load_constraints():
+def load_constraints() -> List[Dict]:
     result = []
     if CONSTRAINTS_DIR.exists():
         severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
@@ -164,11 +185,13 @@ def load_constraints():
     return result
 
 
-def load_regression_warnings(sql: str, recommender):
+def load_regression_warnings(sql: str, recommender) -> List[Dict]:
     warnings = []
     if recommender._initialized:
         reg_matches = recommender.find_relevant_regressions(sql, k=3, dialect="duckdb")
-        reg_dir = ADO_DIR / "examples" / "duckdb" / "regressions"
+        reg_dir = QT_SQL_DIR / "optimization" / "examples" / "duckdb" / "regressions"
+        if not reg_dir.exists():
+            reg_dir = QT_SQL_DIR.parent.parent.parent / "ado" / "examples" / "duckdb" / "regressions"
         for ex_id, score, meta in reg_matches:
             reg_path = reg_dir / f"{ex_id}.json"
             if reg_path.exists():
@@ -177,446 +200,840 @@ def load_regression_warnings(sql: str, recommender):
     return warnings
 
 
-def build_mock_worker_briefing():
-    """Create a realistic mock analyst briefing for Q74 Worker 2.
+def load_strategy_leaderboard(original_sql: str):
+    leaderboard_path = BENCHMARK_DIR / "strategy_leaderboard.json"
+    if not leaderboard_path.exists():
+        print("No strategy leaderboard found")
+        return None, None
+    strategy_leaderboard = json.loads(leaderboard_path.read_text())
+    from qt_sql.tag_index import extract_tags, classify_category
+    query_archetype = classify_category(extract_tags(original_sql, dialect="duckdb"))
+    print(f"Strategy leaderboard: {strategy_leaderboard['total_attempts']} attempts, "
+          f"archetype={query_archetype}")
+    return strategy_leaderboard, query_archetype
 
-    Demonstrates late_attribute_binding: customer join deferred to final
-    resolve_names CTE. Each channel×year CTE aggregates on c_customer_sk
-    (the FK already in the fact table), avoiding 3 of 4 customer scans.
-    """
-    from ..swarm_parsers import BriefingShared, BriefingWorker
+
+def load_engine_profile(dialect: str = "duckdb") -> Optional[Dict]:
+    engine_profile_path = CONSTRAINTS_DIR / f"engine_profile_{dialect}.json"
+    if engine_profile_path.exists():
+        engine_profile = json.loads(engine_profile_path.read_text())
+        print(f"Engine profile: {engine_profile.get('engine', '?')} "
+              f"v{engine_profile.get('version_tested', '?')}")
+        return engine_profile
+    return None
+
+
+def get_dialect_version() -> Optional[str]:
+    try:
+        import duckdb
+        return duckdb.__version__
+    except ImportError:
+        return None
+
+
+def load_examples_by_ids(
+    example_ids: List[str],
+    matched_examples: List[Dict],
+) -> List[Dict]:
+    """Load gold examples by ID, falling back to disk."""
+    result = []
+    found_ids = set()
+    for ex in matched_examples:
+        if ex.get("id") in example_ids:
+            result.append(ex)
+            found_ids.add(ex.get("id"))
+    if len(found_ids) < len(example_ids):
+        examples_dir = QT_SQL_DIR / "optimization" / "examples" / "duckdb"
+        if not examples_dir.exists():
+            examples_dir = QT_SQL_DIR.parent.parent.parent / "ado" / "examples" / "duckdb"
+        for eid in example_ids:
+            if eid not in found_ids:
+                p = examples_dir / f"{eid}.json"
+                if p.exists():
+                    result.append(json.loads(p.read_text()))
+    return result
+
+
+def extract_output_columns(dag) -> List[str]:
+    try:
+        from qt_sql.node_prompter import Prompter
+        return Prompter._extract_output_columns(dag)
+    except Exception:
+        return []
+
+
+def load_worker_sql(query_id: str, worker_id: int) -> str:
+    """Load actual worker SQL from batch data."""
+    p = BATCH_DIR / query_id / f"worker_{worker_id}_sql.sql"
+    if p.exists():
+        return p.read_text().strip()
+    return f"-- Worker {worker_id} SQL not found"
+
+
+def load_assignments(query_id: str) -> List[Dict]:
+    """Load worker assignments from batch data."""
+    p = BATCH_DIR / query_id / "assignments.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    return []
+
+
+def load_benchmark_results(query_id: str) -> Optional[Dict]:
+    """Load benchmark results from batch data."""
+    p = BATCH_DIR / query_id / "benchmark_iter0.json"
+    if p.exists():
+        return json.loads(p.read_text())
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Shared context holder
+# ═══════════════════════════════════════════════════════════════════════
+
+class PromptContext:
+    """Holds all loaded data needed by generators."""
+
+    def __init__(self, query_id: str):
+        self.query_id = query_id
+        self.original_sql = load_original_sql(query_id)
+        self.explain_plan_text = load_explain_plan(query_id)
+        self.dag, self.costs = parse_dag(self.original_sql, self.explain_plan_text)
+        self.semantic_intents = load_semantic_intents(query_id)
+        self.global_knowledge = load_global_knowledge()
+
+        from qt_sql.knowledge import TagRecommender
+        self.recommender = TagRecommender()
+
+        self.matched_examples = load_matched_examples(self.original_sql, self.recommender)
+        self.all_available = load_full_catalog()
+        self.constraints = load_constraints()
+        self.regression_warnings = load_regression_warnings(self.original_sql, self.recommender)
+        self.strategy_leaderboard, self.query_archetype = load_strategy_leaderboard(self.original_sql)
+        self.engine_profile = load_engine_profile("duckdb")
+        self.dialect_version = get_dialect_version()
+
+        # Q88-specific output columns
+        self.output_columns = extract_output_columns(self.dag)
+        if not self.output_columns:
+            self.output_columns = [
+                "h8_30_to_9", "h9_to_9_30", "h9_30_to_10", "h10_to_10_30",
+                "h10_30_to_11", "h11_to_11_30", "h11_30_to_12", "h12_to_12_30",
+            ]
+
+        # Load real batch data for mock worker results
+        self.assignments = load_assignments(query_id)
+        self.benchmark_results = load_benchmark_results(query_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Mock data builders (Q88 — using real batch data)
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_q88_worker_results(ctx: PromptContext) -> list:
+    """Build WorkerResult objects from real Q88 batch data."""
+    from qt_sql.schemas import WorkerResult
+
+    results = []
+    bench = ctx.benchmark_results or {}
+    worker_benchmarks_list = bench.get("workers", [])
+    # Index by worker_id for easy lookup
+    worker_benchmarks = {w["worker_id"]: w for w in worker_benchmarks_list if isinstance(w, dict)}
+
+    for assignment in ctx.assignments:
+        wid = assignment["worker_id"]
+        w_bench = worker_benchmarks.get(wid, {})
+        w_sql = load_worker_sql(ctx.query_id, wid)
+        speedup = w_bench.get("speedup", 0.0)
+        status = w_bench.get("status", "PASS")
+
+        results.append(WorkerResult(
+            worker_id=wid,
+            strategy=assignment["strategy"],
+            examples_used=assignment["examples"],
+            optimized_sql=w_sql,
+            speedup=speedup,
+            status=status,
+            transforms=assignment["examples"][:2],
+            hint=assignment.get("hint", ""),
+            exploratory=(wid == 4),
+        ))
+
+    if not results:
+        # Fallback with synthetic data if no batch data
+        results = _build_fallback_worker_results()
+    return results
+
+
+def _build_fallback_worker_results() -> list:
+    """Fallback synthetic WorkerResult objects."""
+    from qt_sql.schemas import WorkerResult
+    return [
+        WorkerResult(
+            worker_id=1,
+            strategy="conservative_early_reduction",
+            examples_used=["early_filter", "pushdown", "materialize_cte"],
+            optimized_sql="-- W1: dimension CTE isolation\nWITH ...",
+            speedup=5.27,
+            status="PASS",
+            transforms=["early_filter", "pushdown"],
+            hint="Apply early filtering to dimension tables before joining",
+        ),
+        WorkerResult(
+            worker_id=2,
+            strategy="moderate_dimension_isolation",
+            examples_used=["dimension_cte_isolate", "date_cte_isolate", "shared_dimension_multi_channel"],
+            optimized_sql="-- W2: single-pass time window CASE (BEST)\nWITH ...",
+            speedup=6.24,
+            status="PASS",
+            transforms=["single_pass_aggregation", "multi_date_range_cte"],
+            hint="Consolidate 8 subqueries into single-pass with CASE time windows",
+        ),
+        WorkerResult(
+            worker_id=3,
+            strategy="aggressive_single_pass_restructure",
+            examples_used=["single_pass_aggregation", "prefetch_fact_join", "multi_date_range_cte"],
+            optimized_sql="-- W3: prefetch + time slices\nWITH ...",
+            speedup=5.85,
+            status="PASS",
+            transforms=["prefetch_fact_join", "early_filter"],
+            hint="Prefetch filtered dimensions, single-pass with relaxed time filter",
+        ),
+        WorkerResult(
+            worker_id=4,
+            strategy="novel_structural_transform",
+            examples_used=["or_to_union", "union_cte_split", "composite_decorrelate_union"],
+            optimized_sql="-- W4: time slices + qualified_sales CTE\nWITH ...",
+            speedup=6.10,
+            status="PASS",
+            transforms=["single_pass_aggregation"],
+            hint="Time slices with CASE labels, qualified_sales CTE for single scan",
+            exploratory=True,
+        ),
+    ]
+
+
+def build_q88_mock_briefing(ctx: PromptContext):
+    """Build realistic mock analyst briefing for Q88 Worker 2 (best: 6.24x)."""
+    from qt_sql.prompts.swarm_parsers import BriefingShared, BriefingWorker
 
     shared = BriefingShared(
         semantic_contract=(
-            "This query finds customers whose web-channel payment variability grew "
-            "faster year-over-year than their store-channel variability. "
-            "Intersection semantics: customers must have sales in BOTH channels "
-            "(store and web) in BOTH years (1999 and 2000). This is enforced by "
-            "the 4-way inner join — any rewrite must preserve this intersection. "
-            "STDDEV_SAMP returns NULL for single-row groups. The year_total > 0 "
-            "filter excludes NULL and zero-stddev customers. "
-            "Output: 3 columns, ordered by first_name, customer_id, last_name. LIMIT 100."
+            "This query counts store sales by 8 consecutive half-hour time windows "
+            "(8:30-12:30) at store 'ese' for households matching 3 specific "
+            "(hd_dep_count, hd_vehicle_count) conditions. Returns a single row with "
+            "8 COUNT columns. The 8 subqueries are independent — same fact table, same "
+            "dim filters, different time_dim conditions. Cross-join semantics: each "
+            "count is independent."
         ),
         bottleneck_diagnosis=(
-            "EXPLAIN shows DuckDB already unrolled year_total into 4 branches "
-            "(store×1999, store×2000, web×1999, web×2000). The dominant cost is "
-            "the store_sales × customer hash join at 598ms × 2 = 1.2s (34% of "
-            "3.5s total). Customer is scanned 4× (500K rows each) purely for "
-            "name resolution (c_customer_id, c_first_name, c_last_name) — zero "
-            "selectivity. Deferring customer join to after aggregation and "
-            "self-join resolution eliminates 3 of 4 customer scans and joins "
-            "~4K qualifying rows instead of 5.4M."
+            "EXPLAIN shows 8 independent SEQ_SCAN pipelines on store_sales, each "
+            "joining time_dim, household_demographics, and store with identical filters "
+            "except the time window. Total: 8x store_sales scan, 8x household_demographics "
+            "scan, 8x store scan, 8x time_dim scan. The dominant cost is the repeated "
+            "store_sales scans (8x ~2.5M rows each = 20M rows total). A single-pass "
+            "scan with CASE-based time window classification consolidates to 1x scan."
         ),
         active_constraints=(
-            "- REMOVE_REPLACED_CTES: Your rewrite must NOT include a year_total "
-            "CTE. The 4 channel×year CTEs REPLACE it entirely. Keeping both "
-            "caused 0.68x regression on Q74.\n"
-            "- CTE_COLUMN_COMPLETENESS: Each CTE's SELECT must include ALL "
-            "columns referenced by downstream consumers. Check: ss_customer_sk "
-            "flows through store_agg → compare_ratios → resolve_names; "
-            "ws_bill_customer_sk flows through web_agg → compare_ratios.\n"
-            "- LITERAL_PRESERVATION: d_year IN (1999, 1999+1) must be preserved "
-            "exactly. Do not substitute computed values."
+            "- LITERAL_PRESERVATION: hd_dep_count = -1, hd_dep_count = 4, "
+            "hd_dep_count = 3 and corresponding hd_vehicle_count bounds must be "
+            "preserved exactly.\n"
+            "- SEMANTIC_EQUIVALENCE: Each COUNT must produce identical results — "
+            "no row duplication from joins.\n"
+            "- COMPLETE_OUTPUT: All 8 output columns with exact aliases.\n"
+            "- CTE_COLUMN_COMPLETENESS: Every CTE must pass through all columns "
+            "needed by downstream consumers."
         ),
         regression_warnings=(
-            "1. regression_q74_pushdown (0.68x):\n"
-            "   CAUSE: Created year-specific CTEs but KEPT the original year_total "
-            "UNION CTE. DuckDB materialized both, causing redundant computation.\n"
-            "   RULE: Your rewrite must NOT include a year_total CTE. The 4 "
-            "channel×year CTEs REPLACE it entirely."
+            "None applicable — Q88's 8 independent subqueries have no "
+            "cross-CTE dependencies that could cause the known regression patterns."
         ),
     )
 
     worker = BriefingWorker(
         worker_id=2,
-        strategy="date_cte_isolate + late_attribute_binding",
+        strategy="moderate_dimension_isolation + single_pass_aggregation",
         target_dag=(
             "TARGET_DAG:\n"
-            "  filtered_dates -> store_agg -+\n"
-            "  filtered_dates -> web_agg   -+-> compare_ratios -> resolve_names\n\n"
+            "  filtered_store -> sales_with_time\n"
+            "  filtered_hd -> sales_with_time\n"
+            "  time_ranges -> sales_with_time -> final_counts\n\n"
             "NODE_CONTRACTS:\n"
-            "  filtered_dates:\n"
-            "    FROM: date_dim\n"
-            "    WHERE: d_year IN (1999, 1999 + 1)\n"
-            "    OUTPUT: d_date_sk, d_year\n"
-            "    EXPECTED_ROWS: ~730\n"
-            "    CONSUMERS: store_agg, web_agg\n"
-            "  store_agg:\n"
-            "    FROM: store_sales JOIN filtered_dates\n"
-            "    JOIN: ss_sold_date_sk = d_date_sk\n"
-            "    GROUP BY: ss_customer_sk, d_year\n"
-            "    AGGREGATE: STDDEV_SAMP(ss_net_paid) AS year_total\n"
-            "    OUTPUT: ss_customer_sk, d_year, year_total\n"
-            "    EXPECTED_ROWS: ~600K (300K per year)\n"
-            "    CONSUMERS: compare_ratios\n"
-            "  web_agg:\n"
-            "    FROM: web_sales JOIN filtered_dates\n"
-            "    JOIN: ws_sold_date_sk = d_date_sk\n"
-            "    GROUP BY: ws_bill_customer_sk, d_year\n"
-            "    AGGREGATE: STDDEV_SAMP(ws_net_paid) AS year_total\n"
-            "    OUTPUT: ws_bill_customer_sk, d_year, year_total\n"
-            "    EXPECTED_ROWS: ~200K (100K per year)\n"
-            "    CONSUMERS: compare_ratios\n"
-            "  compare_ratios:\n"
-            "    FROM: store_agg s1\n"
-            "      JOIN store_agg s2 ON s1.ss_customer_sk = s2.ss_customer_sk\n"
-            "      JOIN web_agg w1  ON s1.ss_customer_sk = w1.ws_bill_customer_sk\n"
-            "      JOIN web_agg w2  ON s1.ss_customer_sk = w2.ws_bill_customer_sk\n"
-            "    WHERE: s1.d_year = 1999 AND s2.d_year = 1999 + 1\n"
-            "           AND w1.d_year = 1999 AND w2.d_year = 1999 + 1\n"
-            "           AND s1.year_total > 0 AND w1.year_total > 0\n"
-            "           AND (w2.year_total / w1.year_total) > (s2.year_total / s1.year_total)\n"
-            "    NOTE: The original uses CASE WHEN ... > 0 guards around divisions.\n"
-            "          Preserve them — even though WHERE > 0 makes zero unreachable,\n"
-            "          the guards prevent silent breakage if upstream filters change.\n"
-            "    NOTE: ss_customer_sk (store) and ws_bill_customer_sk (web) are both FKs\n"
-            "          to customer.c_customer_sk. They are equi-joined here.\n"
-            "    OUTPUT: ss_customer_sk\n"
-            "    EXPECTED_ROWS: ~4K\n"
-            "    CONSUMERS: resolve_names\n"
-            "  resolve_names:\n"
-            "    FROM: compare_ratios JOIN customer\n"
-            "    JOIN: ss_customer_sk = c_customer_sk\n"
-            "    OUTPUT: c_customer_id AS customer_id, c_first_name AS customer_first_name, "
-            "c_last_name AS customer_last_name\n"
-            "    EXPECTED_ROWS: ~4K -> 100 after ORDER BY + LIMIT\n"
-            "    ORDER BY: customer_first_name, customer_id, customer_last_name\n"
-            "    LIMIT: 100"
+            "  filtered_store:\n"
+            "    FROM: store\n"
+            "    WHERE: s_store_name = 'ese'\n"
+            "    OUTPUT: s_store_sk\n"
+            "    EXPECTED_ROWS: ~1-5\n"
+            "    CONSUMERS: sales_with_time\n"
+            "  filtered_hd:\n"
+            "    FROM: household_demographics\n"
+            "    WHERE: (hd_dep_count = -1 AND hd_vehicle_count <= 1)\n"
+            "       OR (hd_dep_count = 4 AND hd_vehicle_count <= 6)\n"
+            "       OR (hd_dep_count = 3 AND hd_vehicle_count <= 5)\n"
+            "    OUTPUT: hd_demo_sk\n"
+            "    EXPECTED_ROWS: ~1200\n"
+            "    CONSUMERS: sales_with_time\n"
+            "  time_ranges:\n"
+            "    FROM: time_dim\n"
+            "    WHERE: (t_hour BETWEEN 8 AND 12)\n"
+            "    SELECT: t_time_sk, CASE WHEN t_hour=8 AND t_minute>=30 THEN 1 "
+            "WHEN t_hour=9 AND t_minute<30 THEN 2 ... WHEN t_hour=12 AND t_minute<30 "
+            "THEN 8 END AS time_window\n"
+            "    OUTPUT: t_time_sk, time_window\n"
+            "    EXPECTED_ROWS: ~240 (8 half-hour windows x ~30 per window)\n"
+            "    CONSUMERS: sales_with_time\n"
+            "  sales_with_time:\n"
+            "    FROM: store_sales JOIN filtered_store JOIN filtered_hd JOIN time_ranges\n"
+            "    JOIN: ss_store_sk = s_store_sk, ss_hdemo_sk = hd_demo_sk, "
+            "ss_sold_time_sk = t_time_sk\n"
+            "    OUTPUT: time_window\n"
+            "    EXPECTED_ROWS: ~10K-50K\n"
+            "    CONSUMERS: final_counts\n"
+            "  final_counts:\n"
+            "    FROM: sales_with_time\n"
+            "    AGGREGATE: COUNT(CASE WHEN time_window = N THEN 1 END) for N=1..8\n"
+            "    OUTPUT: h8_30_to_9, h9_to_9_30, h9_30_to_10, h10_to_10_30, "
+            "h10_30_to_11, h11_to_11_30, h11_30_to_12, h12_to_12_30\n"
+            "    EXPECTED_ROWS: 1"
         ),
-        examples=["date_cte_isolate", "shared_dimension_multi_channel"],
+        examples=["dimension_cte_isolate", "date_cte_isolate", "shared_dimension_multi_channel"],
         example_reasoning=(
-            "date_cte_isolate (4.00x on Q6):\n"
-            "  APPLY: Pre-filter date_dim into CTE. Q74 joins date_dim 4 times with "
-            "d_year filters — pre-filtering from 73K to ~730 rows eliminates 4 full "
-            "hash-join probes. Same pattern: date join -> date CTE -> probe reduction.\n"
-            "  IGNORE: The decorrelated scalar subquery pattern from Q6 (month_seq "
-            "lookup + category_avg CTE). Q74 has no correlated subquery.\n\n"
-            "shared_dimension_multi_channel (1.30x on Q56):\n"
-            "  APPLY: Shared dimension CTE across channels. Q74 has store_sales + "
-            "web_sales both joining date_dim with the same d_year filter — a single "
-            "filtered_dates CTE shared by both avoids redundant scans.\n"
-            "  IGNORE: The BETWEEN/INTERVAL date filtering from Q56. Q74 uses "
-            "d_year IN (1999, 2000), not date ranges."
+            "dimension_cte_isolate:\n"
+            "  APPLY: Pre-filter household_demographics and store into CTEs. "
+            "Q88 joins these 8 times each — pre-filtering from 7.2K/1K rows "
+            "to ~1200/5 rows eliminates repeated hash probes.\n"
+            "  IGNORE: The date_dim isolation from the original example — Q88 "
+            "uses time_dim, not date_dim.\n\n"
+            "date_cte_isolate:\n"
+            "  APPLY: Same pattern but for time_dim. Add CASE-based time window "
+            "classification during the CTE so downstream only needs the window ID.\n"
+            "  IGNORE: The d_year filter pattern — Q88 uses t_hour/t_minute.\n\n"
+            "shared_dimension_multi_channel:\n"
+            "  APPLY: Shared dimension CTEs across all 8 time windows. "
+            "Each window shares the same store + household filters.\n"
+            "  IGNORE: The multi-channel (store/web/catalog) structure — Q88 "
+            "is single-channel (store_sales only)."
         ),
         hazard_flags=(
-            "- STDDEV_SAMP(ss_net_paid) FILTER (WHERE d_year = 1999) computed over "
-            "a combined 1999+2000 group IS NOT EQUIVALENT to STDDEV_SAMP computed "
-            "over only 1999 rows. The group membership changes the variance. "
-            "The target DAG avoids this: store_agg and web_agg GROUP BY d_year, so "
-            "each group is naturally partitioned by year. STDDEV_SAMP is computed "
-            "correctly per-partition. The compare_ratios CTE then filters to the "
-            "specific year via WHERE d_year = 1999.\n"
-            "- Do NOT include a year_total CTE. The original UNION ALL CTE is fully "
-            "replaced by store_agg + web_agg. Including both causes 0.68x regression.\n"
-            "- The customer join is deferred to resolve_names (joins ~4K rows, not 5.4M). "
-            "Do NOT join customer in store_agg or web_agg — use ss_customer_sk/ws_bill_customer_sk "
-            "as the join key throughout."
+            "- The 8 subqueries use different OR conditions on household_demographics "
+            "for different time windows. VERIFY: all 8 subqueries actually share the "
+            "same hd filters — they do (all use the same 3 OR branches). The time "
+            "window is the only differentiator.\n"
+            "- Do NOT use FILTER clause with COUNT — use COUNT(CASE WHEN ... THEN 1 END) "
+            "for maximum DuckDB compatibility.\n"
+            "- Preserve exact literal values: hd_dep_count = -1, hd_dep_count = 4, "
+            "hd_dep_count = 3, hd_vehicle_count <= -1+2, <= 4+2, <= 3+2."
         ),
     )
 
     return shared, worker
 
 
-def main():
-    from ...knowledge import TagRecommender
+def build_q88_snipe_analysis():
+    """Build mock SnipeAnalysis from Q88 batch results."""
+    from qt_sql.prompts.swarm_parsers import SnipeAnalysis
 
-    original_sql = load_original_sql()
-    explain_plan_text = load_explain_plan()
-    dag, costs = parse_dag(original_sql, explain_plan_text)
-    semantic_intents = load_semantic_intents()
-    global_knowledge = load_global_knowledge()
-
-    recommender = TagRecommender()
-    matched_examples = load_matched_examples(original_sql, recommender)
-    all_available = load_full_catalog()
-    constraints = load_constraints()
-    regression_warnings = load_regression_warnings(original_sql, recommender)
-
-    # ── Strategy leaderboard + archetype ──────────────────────────
-    strategy_leaderboard = None
-    query_archetype = None
-    leaderboard_path = BENCHMARK_DIR / "strategy_leaderboard.json"
-    if leaderboard_path.exists():
-        strategy_leaderboard = json.loads(leaderboard_path.read_text())
-        from ...faiss_builder import extract_tags, classify_category
-        query_archetype = classify_category(extract_tags(original_sql, dialect="duckdb"))
-        print(f"Strategy leaderboard: {strategy_leaderboard['total_attempts']} attempts, "
-              f"archetype={query_archetype}")
-    else:
-        print("No strategy leaderboard found (run build_strategy_leaderboard.py first)")
-
-    # ── Engine profile ───────────────────────────────────────────────
-    engine_profile = None
-    engine_profile_path = CONSTRAINTS_DIR / "engine_profile_duckdb.json"
-    if engine_profile_path.exists():
-        engine_profile = json.loads(engine_profile_path.read_text())
-        print(f"Engine profile: {engine_profile.get('engine', '?')} v{engine_profile.get('version_tested', '?')}")
-
-    # ── Analyst prompt ──────────────────────────────────────────────
-    from ..analyst_briefing import build_analyst_briefing_prompt
-
-    # Get engine version
-    try:
-        import duckdb
-        dialect_version = duckdb.__version__
-    except ImportError:
-        dialect_version = None
-
-    analyst_prompt = build_analyst_briefing_prompt(
-        query_id=QUERY_ID,
-        sql=original_sql,
-        explain_plan_text=explain_plan_text,
-        dag=dag,
-        costs=costs,
-        semantic_intents=semantic_intents,
-        global_knowledge=global_knowledge,
-        matched_examples=matched_examples,
-        all_available_examples=all_available,
-        constraints=constraints,
-        regression_warnings=regression_warnings,
-        dialect="duckdb",
-        dialect_version=dialect_version,
-        strategy_leaderboard=strategy_leaderboard,
-        query_archetype=query_archetype,
-        engine_profile=engine_profile,
+    return SnipeAnalysis(
+        failure_synthesis=(
+            "All 4 workers achieved strong wins (5.27x–6.24x) by consolidating "
+            "8 independent store_sales scans into a single pass. W2 (6.24x) was "
+            "best because it classified time windows in the CTE itself using CASE, "
+            "avoiding any post-join filtering. W1 (5.27x) was slowest because it "
+            "kept 8 correlated subqueries against a single qualified_sales CTE — "
+            "still 8 scans of the CTE. W3/W4 used similar single-pass strategies "
+            "with minor structural differences."
+        ),
+        best_foundation=(
+            "Worker 2 (6.24x): time_ranges CTE with CASE window classification, "
+            "filtered_store + filtered_hd dimension CTEs, single sales_with_time "
+            "CTE joining all dimensions, final COUNT(CASE) aggregation. Clean, "
+            "minimal structure."
+        ),
+        unexplored_angles=(
+            "1. Aggregate pushdown: compute counts directly in the sales_with_time "
+            "CTE instead of materializing individual rows then aggregating\n"
+            "2. Hash join order optimization: join the smallest dimension first "
+            "(store ~5 rows) to reduce intermediate cardinality earliest\n"
+            "3. Bit manipulation: encode time window as a bitmap for the 8 windows "
+            "and use a single GROUP BY with bit operations"
+        ),
+        strategy_guidance=(
+            "W2's approach is nearly optimal — 6.24x from a single-pass scan. "
+            "The remaining headroom is in join ordering (smallest dim first) and "
+            "potentially pushing the aggregation into a single SELECT without "
+            "materializing sales_with_time as a separate CTE."
+        ),
+        examples=["single_pass_aggregation", "dimension_cte_isolate"],
+        example_adaptation=(
+            "single_pass_aggregation: W2 already applied this. The sniper should "
+            "focus on whether inlining the final aggregation into the CTE body "
+            "(no separate final_counts step) improves performance.\n"
+            "dimension_cte_isolate: Already applied by all workers. Verify that "
+            "join order matches dimension cardinality (store first, then hd, then time)."
+        ),
+        hazard_flags=(
+            "- All workers passed — no semantic errors to avoid\n"
+            "- The 8 COUNT(CASE) pattern is proven correct\n"
+            "- Avoid re-introducing 8 separate scans (the original bottleneck)"
+        ),
+        retry_worthiness="LOW",
+        retry_digest=(
+            "All 4 workers achieved 5.27x–6.24x. W2's single-pass approach is "
+            "near-optimal. Limited headroom for further improvement. A retry "
+            "would focus on micro-optimizations (join order, CTE inlining)."
+        ),
+        raw="",
     )
 
-    analyst_path = SAMPLES_DIR / f"analyst_{QUERY_ID}.md"
-    analyst_path.write_text(analyst_prompt)
-    print(f"\n{'='*70}")
-    print(f"ANALYST PROMPT: {analyst_path}")
-    print(f"  Length: {len(analyst_prompt)} chars, ~{len(analyst_prompt)//4} tokens")
 
-    # ── Worker prompt ────────────────────────────────────────────
-    from ..worker import build_worker_prompt
+# ═══════════════════════════════════════════════════════════════════════
+# Generator functions — one per prompt type
+# ═══════════════════════════════════════════════════════════════════════
 
-    mock_shared, mock_worker = build_mock_worker_briefing()
+def _write_and_report(path: Path, content: str, label: str) -> None:
+    path.write_text(content)
+    print(f"  {label}: {path.name} ({len(content)} chars, ~{len(content)//4} tokens)")
 
-    # Load the specific examples the mock analyst assigned to this worker
-    worker_example_ids = set(mock_worker.examples)
-    worker_examples = [ex for ex in matched_examples if ex.get("id") in worker_example_ids]
-    # Fallback: if assigned examples not in tag-matched set, try full catalog
-    if len(worker_examples) < len(worker_example_ids):
-        examples_dir = ADO_DIR / "examples" / "duckdb"
-        for eid in worker_example_ids:
-            if not any(ex.get("id") == eid for ex in worker_examples):
-                p = examples_dir / f"{eid}.json"
-                if p.exists():
-                    worker_examples.append(json.loads(p.read_text()))
 
-    output_columns = []
-    try:
-        from ...node_prompter import Prompter
-        output_columns = Prompter._extract_output_columns(dag)
-    except Exception:
-        pass
-    if not output_columns:
-        output_columns = ["customer_id", "customer_first_name", "customer_last_name"]
+def generate_oneshot_script(out_dir: Path, script_path: str) -> None:
+    """01 — Script oneshot using ScriptParser + build_script_oneshot_prompt()."""
+    from qt_sql.prompts.analyst_briefing import build_script_oneshot_prompt
+    from qt_sql.script_parser import ScriptParser
+
+    script_file = Path(script_path)
+    if not script_file.is_absolute():
+        script_file = PROJECT_ROOT / script_file
+    if not script_file.exists():
+        print(f"  SKIP oneshot_script: {script_file} not found")
+        return
+
+    sql_script = script_file.read_text()
+    print(f"Loaded script: {len(sql_script)} chars, {sql_script.count(chr(10))+1} lines from {script_file}")
+
+    parser = ScriptParser(sql_script, dialect="duckdb")
+    script_dag = parser.parse()
+    print(f"ScriptDAG: {len(script_dag.statements)} statements, "
+          f"{len(script_dag.optimization_targets())} optimization targets")
+
+    engine_profile = load_engine_profile("duckdb")
+    constraints = load_constraints()
+
+    prompt = build_script_oneshot_prompt(
+        sql_script=sql_script,
+        script_dag=script_dag,
+        dialect="duckdb",
+        engine_profile=engine_profile,
+        constraints=constraints,
+    )
+
+    _write_and_report(
+        out_dir / "01_oneshot_script_everyhousehold.md",
+        prompt, "ONESHOT SCRIPT",
+    )
+
+
+def generate_oneshot_query(ctx: PromptContext, out_dir: Path) -> None:
+    """02 — Query oneshot using build_analyst_briefing_prompt(mode='oneshot')."""
+    from qt_sql.prompts.analyst_briefing import build_analyst_briefing_prompt
+
+    prompt = build_analyst_briefing_prompt(
+        query_id=ctx.query_id,
+        sql=ctx.original_sql,
+        explain_plan_text=ctx.explain_plan_text,
+        dag=ctx.dag,
+        costs=ctx.costs,
+        semantic_intents=ctx.semantic_intents,
+        global_knowledge=ctx.global_knowledge,
+        matched_examples=ctx.matched_examples,
+        all_available_examples=ctx.all_available,
+        constraints=ctx.constraints,
+        regression_warnings=ctx.regression_warnings,
+        dialect="duckdb",
+        dialect_version=ctx.dialect_version,
+        strategy_leaderboard=ctx.strategy_leaderboard,
+        query_archetype=ctx.query_archetype,
+        engine_profile=ctx.engine_profile,
+        mode="oneshot",
+    )
+
+    _write_and_report(
+        out_dir / f"02_oneshot_{ctx.query_id}.md",
+        prompt, "ONESHOT QUERY",
+    )
+
+
+def generate_expert(ctx: PromptContext, out_dir: Path) -> None:
+    """03+04 — Expert analyst + expert worker."""
+    from qt_sql.prompts.analyst_briefing import build_analyst_briefing_prompt
+    from qt_sql.prompts.worker import build_worker_prompt
+
+    # 03: Expert analyst
+    analyst_prompt = build_analyst_briefing_prompt(
+        query_id=ctx.query_id,
+        sql=ctx.original_sql,
+        explain_plan_text=ctx.explain_plan_text,
+        dag=ctx.dag,
+        costs=ctx.costs,
+        semantic_intents=ctx.semantic_intents,
+        global_knowledge=ctx.global_knowledge,
+        matched_examples=ctx.matched_examples,
+        all_available_examples=ctx.all_available,
+        constraints=ctx.constraints,
+        regression_warnings=ctx.regression_warnings,
+        dialect="duckdb",
+        dialect_version=ctx.dialect_version,
+        strategy_leaderboard=ctx.strategy_leaderboard,
+        query_archetype=ctx.query_archetype,
+        engine_profile=ctx.engine_profile,
+        mode="expert",
+    )
+
+    _write_and_report(
+        out_dir / f"03_expert_analyst_{ctx.query_id}.md",
+        analyst_prompt, "EXPERT ANALYST",
+    )
+
+    # 04: Expert worker (uses same mock briefing as swarm worker)
+    mock_shared, mock_worker = build_q88_mock_briefing(ctx)
+    worker_examples = load_examples_by_ids(mock_worker.examples, ctx.matched_examples)
 
     worker_prompt = build_worker_prompt(
         worker_briefing=mock_worker,
         shared_briefing=mock_shared,
         examples=worker_examples,
-        original_sql=original_sql,
-        output_columns=output_columns,
+        original_sql=ctx.original_sql,
+        output_columns=ctx.output_columns,
+        dialect="duckdb",
+        engine_version=ctx.dialect_version,
+    )
+
+    _write_and_report(
+        out_dir / f"04_expert_worker_{ctx.query_id}.md",
+        worker_prompt, "EXPERT WORKER",
+    )
+
+
+def generate_swarm_analyst(ctx: PromptContext, out_dir: Path) -> None:
+    """05 — Swarm analyst briefing."""
+    from qt_sql.prompts.analyst_briefing import build_analyst_briefing_prompt
+
+    prompt = build_analyst_briefing_prompt(
+        query_id=ctx.query_id,
+        sql=ctx.original_sql,
+        explain_plan_text=ctx.explain_plan_text,
+        dag=ctx.dag,
+        costs=ctx.costs,
+        semantic_intents=ctx.semantic_intents,
+        global_knowledge=ctx.global_knowledge,
+        matched_examples=ctx.matched_examples,
+        all_available_examples=ctx.all_available,
+        constraints=ctx.constraints,
+        regression_warnings=ctx.regression_warnings,
+        dialect="duckdb",
+        dialect_version=ctx.dialect_version,
+        strategy_leaderboard=ctx.strategy_leaderboard,
+        query_archetype=ctx.query_archetype,
+        engine_profile=ctx.engine_profile,
+        mode="swarm",
+    )
+
+    _write_and_report(
+        out_dir / f"05_swarm_analyst_{ctx.query_id}.md",
+        prompt, "SWARM ANALYST",
+    )
+
+
+def generate_fan_out(ctx: PromptContext, out_dir: Path) -> None:
+    """06 — Fan-out prompt."""
+    from qt_sql.prompts.swarm_fan_out import build_fan_out_prompt
+
+    prompt = build_fan_out_prompt(
+        query_id=ctx.query_id,
+        sql=ctx.original_sql,
+        dag=ctx.dag,
+        costs=ctx.costs,
+        matched_examples=ctx.matched_examples,
+        all_available_examples=ctx.all_available,
+        regression_warnings=ctx.regression_warnings,
         dialect="duckdb",
     )
 
-    worker_path = SAMPLES_DIR / f"worker_{QUERY_ID}.md"
-    worker_path.write_text(worker_prompt)
-    print(f"WORKER PROMPT: {worker_path}")
-    print(f"  Length: {len(worker_prompt)} chars, ~{len(worker_prompt)//4} tokens")
+    _write_and_report(
+        out_dir / f"06_fan_out_{ctx.query_id}.md",
+        prompt, "FAN-OUT",
+    )
 
-    # ── Snipe analyst prompt ──────────────────────────────────────
-    from ..swarm_snipe import build_snipe_analyst_prompt, build_sniper_prompt
-    from ..swarm_parsers import SnipeAnalysis
-    from ...schemas import WorkerResult
 
-    # Build 4 mock WorkerResult objects with realistic Q74 data
-    mock_worker_results = [
-        WorkerResult(
-            worker_id=1,
-            strategy="decorrelate + early_filter",
-            examples_used=["decorrelate", "early_filter"],
-            optimized_sql="-- W1: decorrelate attempt (mild win)\nWITH ...",
-            speedup=1.21,
-            status="PASS",
-            transforms=["decorrelate", "early_filter"],
-            hint="Decorrelated subquery and pushed filters early",
-        ),
-        WorkerResult(
-            worker_id=2,
-            strategy="date_cte_isolate + late_attribute_binding",
-            examples_used=["date_cte_isolate", "shared_dimension_multi_channel"],
-            optimized_sql="-- W2: date CTE + late binding (mild win)\nWITH ...",
-            speedup=1.18,
-            status="PASS",
-            transforms=["date_cte_isolate", "late_attribute_binding"],
-            hint="Isolated date filter into CTE, deferred customer join",
-        ),
-        WorkerResult(
-            worker_id=3,
-            strategy="prefetch_fact_join + materialize_cte",
-            examples_used=["prefetch_fact_join", "materialize_cte"],
-            optimized_sql="-- W3: prefetch attempt (regression)\nWITH ...",
-            speedup=0.95,
-            status="PASS",
-            transforms=["prefetch_fact_join"],
-            hint="Prefetched fact join — slight regression due to extra materialization",
-        ),
-        WorkerResult(
-            worker_id=4,
-            strategy="single_pass_aggregation",
-            examples_used=["single_pass_aggregation"],
-            optimized_sql="-- W4: single pass attempt (error)\nSELECT ...",
-            speedup=0.0,
-            status="ERROR",
-            transforms=[],
-            hint="",
-            error_message="column \"ss_customer_sk\" must appear in GROUP BY clause",
-            error_messages=["column \"ss_customer_sk\" must appear in GROUP BY clause"],
-            error_category="semantic",
-            exploratory=True,
-        ),
-    ]
+def generate_swarm_worker(ctx: PromptContext, out_dir: Path) -> None:
+    """07 — Swarm worker prompt (Worker 2, best worker)."""
+    from qt_sql.prompts.worker import build_worker_prompt
 
+    mock_shared, mock_worker = build_q88_mock_briefing(ctx)
+    worker_examples = load_examples_by_ids(mock_worker.examples, ctx.matched_examples)
+
+    prompt = build_worker_prompt(
+        worker_briefing=mock_worker,
+        shared_briefing=mock_shared,
+        examples=worker_examples,
+        original_sql=ctx.original_sql,
+        output_columns=ctx.output_columns,
+        dialect="duckdb",
+        engine_version=ctx.dialect_version,
+    )
+
+    _write_and_report(
+        out_dir / f"07_worker_{ctx.query_id}.md",
+        prompt, "SWARM WORKER",
+    )
+
+
+def generate_snipe(ctx: PromptContext, out_dir: Path) -> None:
+    """08+09+10 — Snipe analyst + sniper iter1 + sniper iter2."""
+    from qt_sql.prompts.swarm_snipe import build_snipe_analyst_prompt, build_sniper_prompt
+    from qt_sql.schemas import WorkerResult
+
+    worker_results = build_q88_worker_results(ctx)
+    mock_snipe_analysis = build_q88_snipe_analysis()
+
+    # 08: Snipe analyst
     snipe_analyst_prompt = build_snipe_analyst_prompt(
-        query_id=QUERY_ID,
-        original_sql=original_sql,
-        worker_results=mock_worker_results,
+        query_id=ctx.query_id,
+        original_sql=ctx.original_sql,
+        worker_results=worker_results,
         target_speedup=2.0,
-        dag=dag,
-        costs=costs,
-        explain_plan_text=explain_plan_text,
-        engine_profile=engine_profile,
-        constraints=constraints,
-        matched_examples=matched_examples,
-        all_available_examples=all_available,
-        semantic_intents=semantic_intents,
-        regression_warnings=regression_warnings,
+        dag=ctx.dag,
+        costs=ctx.costs,
+        explain_plan_text=ctx.explain_plan_text,
+        engine_profile=ctx.engine_profile,
+        constraints=ctx.constraints,
+        matched_examples=ctx.matched_examples,
+        all_available_examples=ctx.all_available,
+        semantic_intents=ctx.semantic_intents,
+        regression_warnings=ctx.regression_warnings,
         dialect="duckdb",
-        dialect_version=dialect_version,
+        dialect_version=ctx.dialect_version,
     )
 
-    snipe_analyst_path = SAMPLES_DIR / f"snipe_analyst_{QUERY_ID}.md"
-    snipe_analyst_path.write_text(snipe_analyst_prompt)
-    print(f"SNIPE ANALYST PROMPT: {snipe_analyst_path}")
-    print(f"  Length: {len(snipe_analyst_prompt)} chars, ~{len(snipe_analyst_prompt)//4} tokens")
-
-    # ── Sniper iteration 1 prompt ─────────────────────────────────
-    # Build mock SnipeAnalysis (simulated analyst output)
-    mock_snipe_analysis = SnipeAnalysis(
-        failure_synthesis=(
-            "Workers 1-2 achieved modest wins (1.21x, 1.18x) via date CTE isolation "
-            "and decorrelation, but both fell short of the 2.0x target. The core "
-            "bottleneck -- 4 redundant customer hash joins at 1.2s -- was partially "
-            "addressed by W2's late binding but not aggressively enough. W3's prefetch "
-            "regressed (0.95x) due to unnecessary materialization. W4 crashed on a "
-            "GROUP BY semantic error."
-        ),
-        best_foundation=(
-            "Worker 2 (1.18x): date_cte_isolate eliminated redundant date_dim scans; "
-            "late_attribute_binding deferred customer join. Still joins customer in "
-            "the aggregation CTEs instead of fully deferring to post-comparison resolution."
-        ),
-        unexplored_angles=(
-            "1. Fully defer customer join to after the 4-way self-join comparison "
-            "(resolve_names pattern) -- joins ~4K rows instead of 5.4M\n"
-            "2. Combine channel-specific aggregation CTEs (store_agg, web_agg) with "
-            "year-partitioned grouping to eliminate the UNION ALL year_total CTE entirely\n"
-            "3. Try single-pass aggregation with FILTER (WHERE d_year = X) to avoid "
-            "the self-join entirely -- compute both years' STDDEV in one scan"
-        ),
-        strategy_guidance=(
-            "Build on W2's date CTE isolation but FULLY defer customer join to the "
-            "very end. The key insight: ss_customer_sk and ws_bill_customer_sk are "
-            "sufficient FK keys for the 4-way self-join comparison. Customer name "
-            "resolution (c_customer_id, c_first_name, c_last_name) is needed ONLY "
-            "for the final output -- join customer against ~4K qualifying rows, not "
-            "against 5.4M raw fact rows."
-        ),
-        examples=["date_cte_isolate", "shared_dimension_multi_channel"],
-        example_adaptation=(
-            "date_cte_isolate: Apply the shared date CTE pattern but extend it -- "
-            "instead of just isolating dates, use the date CTE as the entry point "
-            "for both store_agg and web_agg CTEs, ensuring a single scan of date_dim.\n"
-            "shared_dimension_multi_channel: Apply the shared dimension pattern but "
-            "go further -- the customer dimension is NOT shared across channels here, "
-            "it's resolved at the end. Focus on sharing date_dim."
-        ),
-        hazard_flags=(
-            "- STDDEV_SAMP semantics: grouping must be per-year to get correct variance\n"
-            "- year_total CTE: do NOT include -- the 4 channel x year CTEs replace it\n"
-            "- customer join position: defer to end, not in aggregation CTEs"
-        ),
-        retry_worthiness="HIGH",
-        retry_digest=(
-            "W2 (1.18x) is the best foundation. Fully deferring customer join to "
-            "post-comparison should yield the remaining speedup. Target: 1.8-2.5x."
-        ),
-        raw="",
+    _write_and_report(
+        out_dir / f"08_snipe_analyst_{ctx.query_id}.md",
+        snipe_analyst_prompt, "SNIPE ANALYST",
     )
 
+    # Get best worker SQL for sniper
+    best_worker = max(worker_results, key=lambda w: w.speedup)
+    best_sql = best_worker.optimized_sql
+
+    # Sniper examples
+    sniper_example_ids = mock_snipe_analysis.examples
+    sniper_examples = load_examples_by_ids(sniper_example_ids, ctx.matched_examples)
+
+    # 09: Sniper iteration 1
     sniper_prompt_1 = build_sniper_prompt(
         snipe_analysis=mock_snipe_analysis,
-        original_sql=original_sql,
-        worker_results=mock_worker_results,
-        best_worker_sql=mock_worker_results[1].optimized_sql,
-        examples=worker_examples,
-        output_columns=output_columns,
-        dag=dag,
-        costs=costs,
-        engine_profile=engine_profile,
-        constraints=constraints,
-        semantic_intents=semantic_intents,
-        regression_warnings=regression_warnings,
+        original_sql=ctx.original_sql,
+        worker_results=worker_results,
+        best_worker_sql=best_sql,
+        examples=sniper_examples,
+        output_columns=ctx.output_columns,
+        dag=ctx.dag,
+        costs=ctx.costs,
+        engine_profile=ctx.engine_profile,
+        constraints=ctx.constraints,
+        semantic_intents=ctx.semantic_intents,
+        regression_warnings=ctx.regression_warnings,
         dialect="duckdb",
-        engine_version=dialect_version,
+        engine_version=ctx.dialect_version,
         target_speedup=2.0,
         previous_sniper_result=None,
     )
 
-    sniper1_path = SAMPLES_DIR / f"sniper_iter1_{QUERY_ID}.md"
-    sniper1_path.write_text(sniper_prompt_1)
-    print(f"SNIPER ITER1 PROMPT: {sniper1_path}")
-    print(f"  Length: {len(sniper_prompt_1)} chars, ~{len(sniper_prompt_1)//4} tokens")
+    _write_and_report(
+        out_dir / f"09_sniper_iter1_{ctx.query_id}.md",
+        sniper_prompt_1, "SNIPER ITER1",
+    )
 
-    # ── Sniper iteration 2 prompt (with previous result) ──────────
+    # 10: Sniper iteration 2 (with previous result)
     mock_sniper1_result = WorkerResult(
         worker_id=5,
-        strategy="date_cte_isolate + full_late_binding",
-        examples_used=["date_cte_isolate", "shared_dimension_multi_channel"],
-        optimized_sql="-- Sniper iter1: deferred customer join\nWITH ...",
-        speedup=1.65,
+        strategy="single_pass_aggregation + join_order_optimization",
+        examples_used=["single_pass_aggregation", "dimension_cte_isolate"],
+        optimized_sql=best_sql,
+        speedup=5.80,
         status="PASS",
-        transforms=["date_cte_isolate", "late_attribute_binding"],
-        hint="Deferred customer join to resolve_names CTE — improved but still under target",
+        transforms=["single_pass_aggregation", "dimension_cte_isolate"],
+        hint="Single-pass with optimized join order — close to W2 but not better",
     )
 
     sniper_prompt_2 = build_sniper_prompt(
         snipe_analysis=mock_snipe_analysis,
-        original_sql=original_sql,
-        worker_results=mock_worker_results + [mock_sniper1_result],
-        best_worker_sql=mock_sniper1_result.optimized_sql,
-        examples=worker_examples,
-        output_columns=output_columns,
-        dag=dag,
-        costs=costs,
-        engine_profile=engine_profile,
-        constraints=constraints,
-        semantic_intents=semantic_intents,
-        regression_warnings=regression_warnings,
+        original_sql=ctx.original_sql,
+        worker_results=worker_results + [mock_sniper1_result],
+        best_worker_sql=best_sql,
+        examples=sniper_examples,
+        output_columns=ctx.output_columns,
+        dag=ctx.dag,
+        costs=ctx.costs,
+        engine_profile=ctx.engine_profile,
+        constraints=ctx.constraints,
+        semantic_intents=ctx.semantic_intents,
+        regression_warnings=ctx.regression_warnings,
         dialect="duckdb",
-        engine_version=dialect_version,
+        engine_version=ctx.dialect_version,
         target_speedup=2.0,
         previous_sniper_result=mock_sniper1_result,
     )
 
-    sniper2_path = SAMPLES_DIR / f"sniper_iter2_{QUERY_ID}.md"
-    sniper2_path.write_text(sniper_prompt_2)
-    print(f"SNIPER ITER2 PROMPT: {sniper2_path}")
-    print(f"  Length: {len(sniper_prompt_2)} chars, ~{len(sniper_prompt_2)//4} tokens")
+    _write_and_report(
+        out_dir / f"10_sniper_iter2_{ctx.query_id}.md",
+        sniper_prompt_2, "SNIPER ITER2",
+    )
 
+
+def generate_pg_tuner(ctx: PromptContext, out_dir: Path) -> None:
+    """11 — PG tuner prompt with mock PG settings."""
+    from qt_sql.prompts.pg_tuner import build_pg_tuner_prompt
+
+    # Mock PG settings (realistic PG14.3 config)
+    mock_settings = {
+        "shared_buffers": "2GB",
+        "effective_cache_size": "6GB",
+        "work_mem": "64MB",
+        "maintenance_work_mem": "512MB",
+        "max_parallel_workers": "4",
+        "max_parallel_workers_per_gather": "2",
+        "max_connections": "100",
+        "random_page_cost": "4.0",
+        "effective_io_concurrency": "200",
+        "jit": "on",
+    }
+
+    pg_engine_profile = load_engine_profile("postgresql")
+
+    prompt = build_pg_tuner_prompt(
+        query_sql=ctx.original_sql,
+        explain_plan=None,  # No PG EXPLAIN for DuckDB query — mock scenario
+        current_settings=mock_settings,
+        engine_profile=pg_engine_profile,
+        baseline_ms=1415.6,
+    )
+
+    _write_and_report(
+        out_dir / f"11_pg_tuner_{ctx.query_id}.md",
+        prompt, "PG TUNER",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Generator registry
+# ═══════════════════════════════════════════════════════════════════════
+
+GENERATORS = {
+    "oneshot_script": "01_oneshot_script",
+    "oneshot_query": "02_oneshot_query",
+    "expert": "03+04_expert",
+    "swarm_analyst": "05_swarm_analyst",
+    "fan_out": "06_fan_out",
+    "swarm_worker": "07_worker",
+    "snipe": "08+09+10_snipe",
+    "pg_tuner": "11_pg_tuner",
+}
+
+
+def run_generator(
+    name: str,
+    ctx: Optional[PromptContext],
+    out_dir: Path,
+    script_path: Optional[str],
+) -> None:
+    """Run a single generator by name."""
+    if name == "oneshot_script":
+        if not script_path:
+            print(f"  SKIP {name}: no --script provided")
+            return
+        generate_oneshot_script(out_dir, script_path)
+    elif name == "oneshot_query":
+        generate_oneshot_query(ctx, out_dir)
+    elif name == "expert":
+        generate_expert(ctx, out_dir)
+    elif name == "swarm_analyst":
+        generate_swarm_analyst(ctx, out_dir)
+    elif name == "fan_out":
+        generate_fan_out(ctx, out_dir)
+    elif name == "swarm_worker":
+        generate_swarm_worker(ctx, out_dir)
+    elif name == "snipe":
+        generate_snipe(ctx, out_dir)
+    elif name == "pg_tuner":
+        generate_pg_tuner(ctx, out_dir)
+    else:
+        print(f"  ERROR: Unknown generator '{name}'")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate V0 Prompt Pack — rendered samples of every prompt type.",
+    )
+    parser.add_argument(
+        "query_id",
+        nargs="?",
+        default="query_88",
+        help="Query ID for non-script prompts (default: query_88)",
+    )
+    parser.add_argument(
+        "--version", "-v",
+        default="V0",
+        help="Version folder name (default: V0)",
+    )
+    parser.add_argument(
+        "--script", "-s",
+        default=None,
+        help="Path to SQL script for oneshot_script prompt (e.g., paper/sql/everyhousehold_deidentified.sql)",
+    )
+    parser.add_argument(
+        "--only",
+        default=None,
+        choices=list(GENERATORS.keys()),
+        help="Generate only this prompt type",
+    )
+    args = parser.parse_args()
+
+    out_dir = get_output_dir(args.version)
+    print(f"Output directory: {out_dir}")
+    print(f"Query: {args.query_id}")
+    print(f"Version: {args.version}")
+    print(f"{'='*70}")
+
+    # Build context (skip if only generating script oneshot)
+    ctx = None
+    if args.only != "oneshot_script":
+        print("\nLoading data...")
+        ctx = PromptContext(args.query_id)
+
+    print(f"\n{'='*70}")
+    print("Generating prompts...")
+    print(f"{'='*70}")
+
+    if args.only:
+        run_generator(args.only, ctx, out_dir, args.script)
+    else:
+        for name in GENERATORS:
+            try:
+                run_generator(name, ctx, out_dir, args.script)
+            except Exception as e:
+                print(f"  ERROR generating {name}: {e}")
+                import traceback
+                traceback.print_exc()
+
+    # Summary
+    generated = sorted(out_dir.glob("*.md"))
+    print(f"\n{'='*70}")
+    print(f"Generated {len(generated)} files in {out_dir}/:")
+    for f in generated:
+        size = f.stat().st_size
+        print(f"  {f.name} ({size:,} bytes)")
     print(f"{'='*70}")
 
 

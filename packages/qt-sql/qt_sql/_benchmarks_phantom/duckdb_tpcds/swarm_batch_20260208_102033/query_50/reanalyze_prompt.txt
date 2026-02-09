@@ -1,0 +1,321 @@
+You are analyzing 5 failed optimization attempts to design a refined approach that reaches 2.0x speedup.
+
+Your job: understand WHY each attempt fell short, identify unexplored optimization angles, and synthesize a NEW strategy that combines the best insights while avoiding repeated mistakes.
+
+## Query: query_50
+## Target: 2.0x speedup
+## Dialect: duckdb
+
+```sql
+-- start query 50 in stream 0 using template query50.tpl
+select 
+   s_store_name
+  ,s_company_id
+  ,s_street_number
+  ,s_street_name
+  ,s_street_type
+  ,s_suite_number
+  ,s_city
+  ,s_county
+  ,s_state
+  ,s_zip
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk <= 30 ) then 1 else 0 end)  as "30 days" 
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk > 30) and 
+                 (sr_returned_date_sk - ss_sold_date_sk <= 60) then 1 else 0 end )  as "31-60 days" 
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk > 60) and 
+                 (sr_returned_date_sk - ss_sold_date_sk <= 90) then 1 else 0 end)  as "61-90 days" 
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk > 90) and
+                 (sr_returned_date_sk - ss_sold_date_sk <= 120) then 1 else 0 end)  as "91-120 days" 
+  ,sum(case when (sr_returned_date_sk - ss_sold_date_sk  > 120) then 1 else 0 end)  as ">120 days" 
+from
+   store_sales
+  ,store_returns
+  ,store
+  ,date_dim d1
+  ,date_dim d2
+where
+    d2.d_year = 2001
+and d2.d_moy  = 8
+and ss_ticket_number = sr_ticket_number
+and ss_item_sk = sr_item_sk
+and ss_sold_date_sk   = d1.d_date_sk
+and sr_returned_date_sk   = d2.d_date_sk
+and ss_customer_sk = sr_customer_sk
+and ss_store_sk = s_store_sk
+group by
+   s_store_name
+  ,s_company_id
+  ,s_street_number
+  ,s_street_name
+  ,s_street_type
+  ,s_suite_number
+  ,s_city
+  ,s_county
+  ,s_state
+  ,s_zip
+order by s_store_name
+        ,s_company_id
+        ,s_street_number
+        ,s_street_name
+        ,s_street_type
+        ,s_suite_number
+        ,s_city
+        ,s_county
+        ,s_state
+        ,s_zip
+ LIMIT 100;
+
+-- end query 50 in stream 0 using template query50.tpl
+```
+
+## Previous Attempts
+
+### Worker 1: conservative_pushdown_filter
+- **Status**: pass (0.97x)
+- **Transforms**: none
+- **Examples used**: pushdown, early_filter, materialize_cte
+- **Strategy hint**: Apply filter pushdown and early dimension filtering to reduce join sizes, and materialize repeated subqueries to avoid recomputation.
+
+```sql
+WITH filtered_returns AS (
+  SELECT 
+    sr_ticket_number,
+    sr_item_sk,
+    sr_customer_sk,
+    sr_returned_date_sk
+  FROM store_returns
+  JOIN date_dim AS d2 ON sr_returned_date_sk = d2.d_date_sk
+  WHERE d2.d_year = 2001
+    AND d2.d_moy = 8
+),
+joined_sales_returns AS (
+  SELECT
+    ss_sold_date_sk,
+    ss_store_sk,
+    ss_ticket_number,
+    ss_item_sk,
+    ss_customer_sk,
+    fr.sr_returned_date_sk
+  FROM store_sales
+  JOIN filtered_returns fr ON (
+    ss_ticket_number = fr.sr_ticket_number
+    AND ss_item_sk = fr.sr_item_sk
+    AND ss_customer_sk = fr.sr_customer_sk
+  )
+)
+SELECT
+  s_store_name,
+  s_company_id,
+  s_street_number,
+-- ... (truncated)
+```
+
+### Worker 2: moderate_date_dimension_isolation
+- **Status**: pass (1.10x)
+- **Transforms**: none
+- **Examples used**: date_cte_isolate, dimension_cte_isolate, multi_date_range_cte
+- **Strategy hint**: Isolate date and dimension filters into separate CTEs to enable predicate pushdown and reduce the data before joining.
+
+```sql
+WITH filtered_d2 AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2001
+      AND d_moy = 8
+),
+filtered_store_returns AS (
+    SELECT sr_returned_date_sk,
+           sr_ticket_number,
+           sr_item_sk,
+           sr_customer_sk
+    FROM store_returns
+    INNER JOIN filtered_d2 ON sr_returned_date_sk = filtered_d2.d_date_sk
+),
+sales_joined AS (
+    SELECT ss_sold_date_sk,
+           ss_ticket_number,
+           ss_item_sk,
+           ss_customer_sk,
+           ss_store_sk,
+           sr_returned_date_sk
+    FROM store_sales
+    INNER JOIN filtered_store_returns
+        ON ss_ticket_number = sr_ticket_number
+       AND ss_item_sk = sr_item_sk
+       AND ss_customer_sk = sr_customer_sk
+)
+SELECT s_store_name,
+       s_company_id,
+       s_street_number,
+-- ... (truncated)
+```
+
+### Worker 3: aggressive_multi_cte_restructure
+- **Status**: pass (1.08x)
+- **Transforms**: none
+- **Examples used**: multi_dimension_prefetch, prefetch_fact_join, single_pass_aggregation
+- **Strategy hint**: Pre-filter and pre-join multiple dimension tables with fact tables in CTEs, and consolidate multiple aggregations into a single pass.
+
+```sql
+WITH filtered_returns AS (
+    SELECT 
+        sr_ticket_number,
+        sr_item_sk,
+        sr_customer_sk,
+        sr_returned_date_sk
+    FROM store_returns
+    WHERE EXISTS (
+        SELECT 1 
+        FROM date_dim
+        WHERE d_date_sk = sr_returned_date_sk
+          AND d_year = 2001
+          AND d_moy = 8
+    )
+),
+sales_returns_joined AS (
+    SELECT 
+        ss_sold_date_sk,
+        ss_store_sk,
+        filtered_returns.sr_returned_date_sk,
+        (filtered_returns.sr_returned_date_sk - ss_sold_date_sk) AS days_diff
+    FROM store_sales
+    JOIN filtered_returns ON 
+        store_sales.ss_ticket_number = filtered_returns.sr_ticket_number
+        AND store_sales.ss_item_sk = filtered_returns.sr_item_sk
+        AND store_sales.ss_customer_sk = filtered_returns.sr_customer_sk
+)
+SELECT
+    s.s_store_name,
+    s.s_company_id,
+-- ... (truncated)
+```
+
+### Worker 4: novel_structural_transform
+- **Status**: pass (1.03x)
+- **Transforms**: none
+- **Examples used**: or_to_union, intersect_to_exists, composite_decorrelate_union
+- **Strategy hint**: Transform the query structure by splitting OR conditions, converting INTERSECT to EXISTS, and decorrelating multiple subqueries.
+
+```sql
+WITH filtered_returns AS (
+    SELECT 
+        sr_ticket_number,
+        sr_item_sk,
+        sr_customer_sk,
+        sr_returned_date_sk
+    FROM store_returns
+    INNER JOIN date_dim AS d2 ON store_returns.sr_returned_date_sk = d2.d_date_sk
+    WHERE d2.d_year = 2001 AND d2.d_moy = 8
+)
+SELECT
+    s_store_name,
+    s_company_id,
+    s_street_number,
+    s_street_name,
+    s_street_type,
+    s_suite_number,
+    s_city,
+    s_county,
+    s_state,
+    s_zip,
+    SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days",
+    SUM(
+        CASE
+            WHEN (sr_returned_date_sk - ss_sold_date_sk > 30)
+                 AND (sr_returned_date_sk - ss_sold_date_sk <= 60) THEN 1
+            ELSE 0
+        END
+    ) AS "31-60 days",
+    SUM(
+-- ... (truncated)
+```
+
+### Worker 5: refined_snipe
+- **Status**: pass (1.02x)
+- **Transforms**: none
+- **Examples used**: 
+- **Strategy hint**: Snipe from iter 1
+
+```sql
+WITH filtered_returns AS (
+    SELECT 
+        sr_ticket_number,
+        sr_item_sk,
+        sr_customer_sk,
+        sr_returned_date_sk,
+        ss_sold_date_sk,
+        ss_store_sk
+    FROM store_returns
+    INNER JOIN store_sales 
+        ON sr_ticket_number = ss_ticket_number
+        AND sr_item_sk = ss_item_sk
+        AND sr_customer_sk = ss_customer_sk
+    INNER JOIN date_dim d2 
+        ON sr_returned_date_sk = d2.d_date_sk
+        AND d2.d_year = 2001
+        AND d2.d_moy = 8
+)
+SELECT
+    s_store_name,
+    s_company_id,
+    s_street_number,
+    s_street_name,
+    s_street_type,
+    s_suite_number,
+    s_city,
+    s_county,
+    s_state,
+    s_zip,
+    SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days",
+-- ... (truncated)
+```
+
+## DAG Structure & Bottlenecks
+
+| Node | Role | Cost % |
+|------|------|-------:|
+| main_query |  | 0.0% |
+
+## Available Examples (Full Catalog)
+
+- **composite_decorrelate_union** (2.42xx) — Decorrelate multiple correlated EXISTS subqueries into pre-materialized DISTINCT
+- **date_cte_isolate** (4.00xx) — Extract date filtering into a separate CTE to enable predicate pushdown and redu
+- **decorrelate** (2.92xx) — Convert correlated subquery to separate CTE with GROUP BY, then JOIN
+- **deferred_window_aggregation** (1.36xx) — When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joi
+- **dimension_cte_isolate** (1.93xx) — Pre-filter ALL dimension tables into CTEs before joining with fact table, not ju
+- **early_filter** (4.00xx) — Filter dimension tables FIRST, then join to fact tables to reduce expensive join
+- **intersect_to_exists** (1.83xx) — Convert INTERSECT subquery pattern to multiple EXISTS clauses for better join pl
+- **materialize_cte** (1.37xx) — Extract repeated subquery patterns into a CTE to avoid recomputation
+- **multi_date_range_cte** (2.35xx) — When query uses multiple date_dim aliases with different filters (d1, d2, d3), c
+- **multi_dimension_prefetch** (2.71xx) — Pre-filter multiple dimension tables (date + store) into separate CTEs before jo
+- **or_to_union** (3.17xx) — Split OR conditions on different columns into UNION ALL branches for better inde
+- **prefetch_fact_join** (3.77xx) — Pre-filter dimension table into CTE, then pre-join with fact table in second CTE
+- **pushdown** (2.11xx) — Push filters from outer query into CTEs/subqueries to reduce intermediate result
+- **shared_dimension_multi_channel** (1.30xx) — Extract shared dimension filters (date, item, promotion) into CTEs when multiple
+- **single_pass_aggregation** (4.47xx) — Consolidate multiple subqueries scanning the same table into a single CTE with c
+- **union_cte_split** (1.36xx) — Split a generic UNION ALL CTE into specialized CTEs when the main query filters 
+
+## Your Task
+
+Analyze the failed attempts and design a refined approach:
+
+1. **Failure Analysis**: Why did all attempts fall short? Be specific about mechanisms.
+2. **Common Patterns**: What did multiple workers try unsuccessfully?
+3. **Unexplored Space**: What optimization angles were missed entirely?
+4. **Refined Strategy**: Synthesize a NEW approach combining best insights.
+
+### Output Format (follow EXACTLY)
+
+```
+FAILURE_ANALYSIS:
+<Why all workers fell short — be specific about mechanisms>
+
+UNEXPLORED_OPPORTUNITIES:
+<What optimization approaches haven't been tried>
+
+REFINED_STRATEGY:
+<Concrete optimization approach for next attempt>
+
+EXAMPLES: <ex1>, <ex2>, <ex3>
+HINT: <specific guidance for the refined attempt>
+```

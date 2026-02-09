@@ -1,0 +1,490 @@
+## Optimization Strategy: early_filter_pushdown
+
+**Your approach**: Push filters on date, item, and catalog_sales early, and use explicit joins to control join order and reduce row counts.
+
+**Focus**: Apply the examples below in service of this strategy. Prioritize this specific approach over generic optimizations.
+
+---
+
+You are a SQL query rewrite engine for PostgreSQL v16.11-0ubuntu0.24.04.1).
+
+Your goal: rewrite the complete SQL query to maximize execution speed
+while preserving exact semantic equivalence (same rows, same columns,
+same ordering).
+
+You will receive the full query, its DAG structure showing how CTEs and
+subqueries connect, cost analysis per node, and reference examples of
+proven rewrites on structurally similar queries.
+You may restructure the query freely: create new CTEs, merge existing ones,
+push filters across node boundaries, or decompose subqueries.
+
+## Query: query040_agg_w1
+
+```sql
+SELECT
+  w_state,
+  i_item_id,
+  SUM(
+    CASE
+      WHEN (
+        CAST(d_date AS DATE) < CAST('1999-04-19' AS DATE)
+      )
+      THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)
+      ELSE 0
+    END
+  ) AS sales_before,
+  SUM(
+    CASE
+      WHEN (
+        CAST(d_date AS DATE) >= CAST('1999-04-19' AS DATE)
+      )
+      THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)
+      ELSE 0
+    END
+  ) AS sales_after
+FROM catalog_sales
+LEFT OUTER JOIN catalog_returns
+  ON (
+    cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk
+  ), warehouse, item, date_dim
+WHERE
+  i_item_sk = cs_item_sk
+  AND cs_warehouse_sk = w_warehouse_sk
+  AND cs_sold_date_sk = d_date_sk
+  AND d_date BETWEEN (
+    CAST('1999-04-19' AS DATE) - INTERVAL '30 DAY'
+  ) AND (
+    CAST('1999-04-19' AS DATE) + INTERVAL '30 DAY'
+  )
+  AND i_category = 'Home'
+  AND i_manager_id BETWEEN 25 AND 64
+  AND cs_wholesale_cost BETWEEN 17 AND 36
+  AND cr_reason_sk = 16
+GROUP BY
+  w_state,
+  i_item_id
+ORDER BY
+  w_state,
+  i_item_id
+LIMIT 100
+```
+
+## Query Structure (DAG)
+
+### 1. main_query
+**Role**: Root / Output (Definition Order: 0)
+**Intent**: Compare pre/post net catalog sales around 1999-04-19 by warehouse state and item for Home products under manager/cost/reason filters.
+**Stats**: 100% Cost | ~98k rows processed → 100 rows output
+**Flags**: GROUP_BY, ORDER_BY, LIMIT(100)
+**Outputs**: [w_state, i_item_id, sales_before, sales_after] — ordered by w_state ASC, i_item_id ASC
+**Dependencies**: catalog_sales, catalog_returns (join), warehouse (join), item (join), date_dim (join)
+**Joins**: i_item_sk = cs_item_sk | cs_warehouse_sk = w_warehouse_sk | cs_sold_date_sk = d_date_sk
+**Filters**: d_date BETWEEN (CAST('1999-04-19' AS DATE) - INTERVAL '30 DAY') AND (CAST('1999-04-19' AS DATE) + INTERVAL '30 DAY') | i_category = 'Home' | i_manager_id BETWEEN 25 AND 64 | cs_wholesale_cost BETWEEN 17 AND 36 | cr_reason_sk = 16
+**Operators**: SEQ_SCAN[date_dim], SEQ_SCAN[catalog_sales], SEQ_SCAN[item], SEQ_SCAN[catalog_returns], SEQ_SCAN[warehouse]
+**Key Logic (SQL)**:
+```sql
+SELECT
+  w_state,
+  i_item_id,
+  SUM(
+    CASE
+      WHEN (
+        CAST(d_date AS DATE) < CAST('1999-04-19' AS DATE)
+      )
+      THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)
+      ELSE 0
+    END
+  ) AS sales_before,
+  SUM(
+    CASE
+      WHEN (
+        CAST(d_date AS DATE) >= CAST('1999-04-19' AS DATE)
+      )
+      THEN cs_sales_price - COALESCE(cr_refunded_cash, 0)
+      ELSE 0
+    END
+...
+```
+
+
+## Benchmark Learnings
+
+### Effective Transforms
+- **materialize_cte**: 50% success rate, 1.80x avg speedup (2 attempts)
+
+### Example Effectiveness
+- **early_filter_decorrelate**: 50% led to success (2 recommendations)
+- **pg_dimension_prefetch_star**: 50% led to success (2 recommendations)
+
+### Common Error Patterns
+- **None**: 1 occurrences
+
+
+## Reference Examples
+
+The following examples are for **pattern reference only**. Do not copy their table names, column names, or literal values into your rewrite. Use only the schema and tables from the target query above.
+
+### 1. early_filter_decorrelate (1.13x)
+
+**Principle:** Early Selection + Decorrelation: push dimension filters into CTE definitions before materialization, and decorrelate correlated subqueries by pre-computing thresholds in separate CTEs. Filters reduce rows early; decorrelation replaces per-row subquery execution with a single pre-computed JOIN.
+
+**BEFORE (slow):**
+```sql
+WITH customer_total_return AS (
+  SELECT sr_customer_sk AS ctr_customer_sk,
+         sr_store_sk AS ctr_store_sk,
+         sr_reason_sk AS ctr_reason_sk,
+         SUM(SR_REFUNDED_CASH) AS ctr_total_return
+  FROM store_returns, date_dim
+  WHERE sr_returned_date_sk = d_date_sk
+    AND d_year = 2001
+    AND sr_return_amt / sr_return_quantity BETWEEN 236 AND 295
+  GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk
+)
+SELECT c_customer_id
+FROM customer_total_return ctr1, store, customer, customer_demographics
+WHERE ctr1.ctr_total_return > (
+    SELECT AVG(ctr_total_return) * 1.2
+    FROM customer_total_return ctr2
+    WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk
+  )
+  AND ctr1.ctr_reason_sk BETWEEN 28 AND 31
+  AND s_store_sk = ctr1.ctr_store_sk
+  AND s_state IN ('MI', 'NC', 'WI')
+  AND ctr1.ctr_customer_sk = c_customer_sk
+  AND c_current_cdemo_sk = cd_demo_sk
+  AND cd_marital_status IN ('W', 'W')
+  AND cd_education_status IN ('4 yr Degree', 'College')
+  AND cd_gender = 'M'
+  AND c_birth_month = 5
+  AND c_birth_year BETWEEN 1950 AND 1956
+ORDER BY c_customer_id
+LIMIT 100
+```
+
+**AFTER (fast):**
+```sql
+WITH customer_total_return AS (
+    SELECT sr_customer_sk AS ctr_customer_sk,
+           sr_store_sk AS ctr_store_sk,
+           sr_reason_sk AS ctr_reason_sk,
+           SUM(SR_REFUNDED_CASH) AS ctr_total_return
+    FROM store_returns
+    JOIN date_dim ON sr_returned_date_sk = d_date_sk
+    JOIN store ON sr_store_sk = s_store_sk
+    WHERE d_year = 2001
+      AND s_state IN ('MI', 'NC', 'WI')
+      AND sr_return_amt / sr_return_quantity BETWEEN 236 AND 295
+    GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk
+),
+store_thresholds AS (
+    SELECT ctr_store_sk,
+           AVG(ctr_total_return) * 1.2 AS avg_limit
+    FROM customer_total_return
+    GROUP BY ctr_store_sk
+)
+SELECT c_customer_id
+FROM customer_total_return ctr1
+JOIN store_thresholds st ON ctr1.ctr_store_sk = st.ctr_store_sk
+JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk
+JOIN store s ON ctr1.ctr_store_sk = s.s_store_sk
+WHERE ctr1.ctr_total_return > st.avg_limit
+  AND ctr1.ctr_reason_sk BETWEEN 28 AND 31
+  AND s.s_state IN ('MI', 'NC', 'WI')
+  AND cd_marital_status = 'W'
+  AND cd_education_status IN ('4 yr Degree', 'College')
+  AND cd_gender = 'M'
+  AND c_birth_month = 5
+  AND c_birth_year BETWEEN 1950 AND 1956
+ORDER BY c_customer_id
+LIMIT 100
+```
+
+### 2. pg_date_cte_explicit_join (2.28x)
+
+**Principle:** Dimension Isolation + Explicit Joins: materialize selective dimension filters into CTEs to create tiny hash tables, AND convert comma-separated joins to explicit JOIN syntax. On PostgreSQL, the combination enables better hash join planning with a tiny probe table.
+
+**BEFORE (slow):**
+```sql
+select 
+   substring(w_warehouse_name,1,20)
+  ,sm_type
+  ,cc_name
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk <= 30 ) then 1 else 0 end)  as "30 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 30) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 60) then 1 else 0 end )  as "31-60 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 60) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 90) then 1 else 0 end)  as "61-90 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 90) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 120) then 1 else 0 end)  as "91-120 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk  > 120) then 1 else 0 end)  as ">120 days"
+from
+   catalog_sales
+  ,warehouse
+  ,ship_mode
+  ,call_center
+  ,date_dim
+where
+d_month_seq between 1193 and 1193 + 23
+and cs_ship_date_sk   = d_date_sk
+and cs_warehouse_sk   = w_warehouse_sk
+and cs_ship_mode_sk   = sm_ship_mode_sk
+and cs_call_center_sk = cc_call_center_sk
+and cs_list_price between 271 and 300
+and sm_type = 'REGULAR'
+and cc_class = 'small'
+and w_gmt_offset = -5
+group by
+   substring(w_warehouse_name,1,20)
+  ,sm_type
+  ,cc_name
+order by substring(w_warehouse_name,1,20)
+        ,sm_type
+        ,cc_name
+limit 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1193 AND 1216
+```
+[main_query]:
+```sql
+SELECT SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name, SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", ... FROM catalog_sales JOIN filtered_dates ON cs_ship_date_sk = d_date_sk JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk JOIN call_center ON cs_call_center_sk = cc_call_center_sk WHERE cs_list_price BETWEEN 271 AND 300 AND sm_type = 'REGULAR' AND cc_class = 'small' AND w_gmt_offset = -5 GROUP BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name ORDER BY 1, 2, 3 LIMIT 100
+```
+
+### 3. pg_dimension_prefetch_star (3.32x)
+
+**Principle:** Multi-Dimension Prefetch (PG): pre-filter all selective dimensions into CTEs to create tiny hash tables, combined with explicit JOIN syntax. PostgreSQL's optimizer gets better cardinality estimates from pre-materialized small dimension results.
+
+**BEFORE (slow):**
+```sql
+with ssr as
+ (select  s_store_id as store_id,
+          sum(ss_ext_sales_price) as sales,
+          sum(coalesce(sr_return_amt, 0)) as returns,
+          sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit
+  from store_sales left outer join store_returns on
+         (ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number),
+     date_dim,
+     store,
+     item,
+     promotion
+ where ss_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+       and ss_store_sk = s_store_sk
+       and ss_item_sk = i_item_sk
+       and i_current_price > 50
+       and ss_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and ss_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+ group by s_store_id)
+ ,
+ csr as
+ (select  cp_catalog_page_id as catalog_page_id,
+          sum(cs_ext_sales_price) as sales,
+          sum(coalesce(cr_return_amount, 0)) as returns,
+          sum(cs_net_profit - coalesce(cr_net_loss, 0)) as profit
+  from catalog_sales left outer join catalog_returns on
+         (cs_item_sk = cr_item_sk and cs_order_number = cr_order_number),
+     date_dim,
+     catalog_page,
+     item,
+     promotion
+ where cs_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+        and cs_catalog_page_sk = cp_catalog_page_sk
+       and cs_item_sk = i_item_sk
+       and i_current_price > 50
+       and cs_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and cs_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+group by cp_catalog_page_id)
+ ,
+ wsr as
+ (select  web_site_id,
+          sum(ws_ext_sales_price) as sales,
+          sum(coalesce(wr_return_amt, 0)) as returns,
+          sum(ws_net_profit - coalesce(wr_net_loss, 0)) as profit
+  from web_sales left outer join web_returns on
+         (ws_item_sk = wr_item_sk and ws_order_number = wr_order_number),
+     date_dim,
+     web_site,
+     item,
+     promotion
+ where ws_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+        and ws_web_site_sk = web_site_sk
+       and ws_item_sk = i_item_sk
+       and i_current_price > 50
+       and ws_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and ws_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+group by web_site_id)
+  select  channel
+        , id
+        , sum(sales) as sales
+        , sum(returns) as returns
+        , sum(profit) as profit
+ from
+ (select 'store channel' as channel
+        , 'store' || store_id as id
+        , sales
+        , returns
+        , profit
+ from   ssr
+ union all
+ select 'catalog channel' as channel
+        , 'catalog_page' || catalog_page_id as id
+        , sales
+        , returns
+        , profit
+ from  csr
+ union all
+ select 'web channel' as channel
+        , 'web_site' || web_site_id as id
+        , sales
+        , returns
+        , profit
+ from   wsr
+ ) x
+ group by rollup (channel, id)
+ order by channel
+         ,id
+ limit 100;
+```
+
+**AFTER (fast):**
+[filtered_date]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-23' AS DATE) AND CAST('1998-08-23' AS DATE) + INTERVAL '30 DAY'
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk FROM item WHERE i_current_price > 50 AND i_category IN ('Jewelry', 'Music')
+```
+[filtered_promotion]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'Y' AND p_channel_tv = 'Y' AND p_channel_radio = 'N' AND p_channel_press = 'N' AND p_channel_event = 'Y'
+```
+[ssr]:
+```sql
+SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS returns, SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit FROM store_sales LEFT OUTER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) INNER JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk INNER JOIN store ON ss_store_sk = s_store_sk INNER JOIN filtered_item ON ss_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ss_promo_sk = filtered_promotion.p_promo_sk WHERE ss_wholesale_cost BETWEEN 63 AND 78 GROUP BY s_store_id
+```
+
+## Constraints
+
+### CRITICAL — Correctness Guards
+
+**COMPLETE_OUTPUT**
+The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original.
+
+**CTE_COLUMN_COMPLETENESS**
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
+**KEEP_EXISTS_AS_EXISTS**
+Preserve EXISTS/NOT EXISTS subqueries as-is. Do NOT convert them to IN/NOT IN or to JOINs — this risks NULL-handling semantic changes and can introduce duplicate rows.
+
+**LITERAL_PRESERVATION**
+CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+
+**NO_CROSS_JOIN_DIMENSIONS**
+NEVER combine multiple dimension tables into a single CTE via CROSS JOIN, Cartesian product, or JOIN ON TRUE. Even small dimensions (30 dates × 200 items × 20 promos = 120K rows) create huge intermediate results that prevent index use on fact tables. Always keep each dimension as a SEPARATE CTE: filtered_date AS (...), filtered_item AS (...), filtered_promotion AS (...). This was validated at 3.32x with separate CTEs vs 0.0076x with a merged CROSS JOIN CTE.
+
+**NO_MATERIALIZE_EXISTS**
+Keep EXISTS and NOT EXISTS as-is — they use semi-join short-circuiting that stops scanning after the first match. Converting them to materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)) forces a full table scan, which is catastrophically slower (0.14x observed on Q16). When you see EXISTS, preserve it.
+
+**SEMANTIC_EQUIVALENCE**
+The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set — even by one row, one column, or a different sort order — is WRONG and will be REJECTED.
+
+### HIGH — Performance and Style Rules
+
+**MIN_BASELINE_THRESHOLD**
+If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
+
+**NO_MATERIALIZED_KEYWORD_PG**
+Do NOT use the AS MATERIALIZED keyword on CTEs. Write plain CTEs: 'name AS (SELECT ...)'. PostgreSQL automatically materializes CTEs when beneficial. Forcing materialization on small dimension CTEs (< 1000 rows) adds temp-table I/O overhead that causes regressions (0.69x observed). The proven gold examples use plain CTEs without MATERIALIZED.
+
+**NO_UNFILTERED_DIMENSION_CTE**
+Every CTE you create must include a WHERE clause that actually reduces row count. Selecting fewer columns is not filtering — the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query instead of wrapping it in a CTE.
+
+**OR_TO_UNION_GUARD**
+Only apply or_to_union when (a) the OR branches involve different tables or fundamentally different access paths — never when all branches filter the same column (e.g., t_hour ranges), since the optimizer already handles same-column ORs efficiently in a single scan — and (b) the result is 3 or fewer UNION ALL branches. Nested ORs that would expand into 4+ branches (e.g., 3 conditions x 3 values = 9 combinations) must be left as-is. Violating these rules causes 0.23x–0.59x regressions from multiplied fact table scans.
+
+**REMOVE_REPLACED_CTES**
+When creating replacement CTEs, overwrite the original by using the same node_id in your rewrite_sets, or ensure the original is removed from the WITH clause. Every CTE in the final query should be actively used — dead CTEs still get materialized and waste resources (caused 0.49x on Q31, 0.68x on Q74).
+
+**EXPLICIT_JOINS**
+Convert comma-separated implicit joins to explicit JOIN ... ON syntax. This gives the optimizer better join-order freedom.
+
+### CRITICAL — Correctness Guards (repeated for emphasis)
+
+**COMPLETE_OUTPUT**
+The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original.
+
+**CTE_COLUMN_COMPLETENESS**
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
+**KEEP_EXISTS_AS_EXISTS**
+Preserve EXISTS/NOT EXISTS subqueries as-is. Do NOT convert them to IN/NOT IN or to JOINs — this risks NULL-handling semantic changes and can introduce duplicate rows.
+
+**LITERAL_PRESERVATION**
+CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+
+**NO_CROSS_JOIN_DIMENSIONS**
+NEVER combine multiple dimension tables into a single CTE via CROSS JOIN, Cartesian product, or JOIN ON TRUE. Even small dimensions (30 dates × 200 items × 20 promos = 120K rows) create huge intermediate results that prevent index use on fact tables. Always keep each dimension as a SEPARATE CTE: filtered_date AS (...), filtered_item AS (...), filtered_promotion AS (...). This was validated at 3.32x with separate CTEs vs 0.0076x with a merged CROSS JOIN CTE.
+
+**NO_MATERIALIZE_EXISTS**
+Keep EXISTS and NOT EXISTS as-is — they use semi-join short-circuiting that stops scanning after the first match. Converting them to materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)) forces a full table scan, which is catastrophically slower (0.14x observed on Q16). When you see EXISTS, preserve it.
+
+**SEMANTIC_EQUIVALENCE**
+The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set — even by one row, one column, or a different sort order — is WRONG and will be REJECTED.
+
+## Output
+
+Return the complete rewritten SQL query. The query must be syntactically
+valid and ready to execute.
+
+### Column Completeness Contract
+
+Your rewritten query MUST produce **exactly** these output columns (same names, same order):
+
+  1. `w_state`
+  2. `i_item_id`
+  3. `sales_before`
+  4. `sales_after`
+
+Do NOT add, remove, or rename any columns. The result set schema must be identical to the original query.
+
+```sql
+-- Your rewritten query here
+```
+
+After the SQL, briefly explain what you changed:
+
+```
+Changes: <1-2 sentence summary of the rewrite>
+Expected speedup: <estimate>
+```
+
+Now output your rewritten SQL:

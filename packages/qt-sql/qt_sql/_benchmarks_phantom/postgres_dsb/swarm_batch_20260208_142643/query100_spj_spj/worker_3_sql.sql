@@ -1,0 +1,45 @@
+WITH filtered_item1 AS (
+    SELECT i_item_sk
+    FROM item
+    WHERE i_category IN ('Electronics', 'Men')
+),
+filtered_item2 AS (
+    SELECT i_item_sk
+    FROM item
+    WHERE i_manager_id BETWEEN 81 AND 100
+),
+filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year BETWEEN 2000 AND 2000 + 1
+),
+filtered_cd AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_marital_status = 'S'
+      AND cd_education_status = 'Secondary'
+),
+filtered_s1 AS (
+    SELECT ss_ticket_number, ss_item_sk, ss_customer_sk, ss_sold_date_sk
+    FROM store_sales
+    WHERE ss_list_price BETWEEN 16 AND 30
+),
+filtered_s2 AS (
+    SELECT ss_ticket_number, ss_item_sk
+    FROM store_sales
+    WHERE ss_list_price BETWEEN 16 AND 30
+)
+SELECT
+    MIN(item1.i_item_sk),
+    MIN(item2.i_item_sk),
+    MIN(s1.ss_ticket_number),
+    MIN(s1.ss_item_sk)
+FROM filtered_s1 s1
+JOIN filtered_s2 s2 ON s1.ss_ticket_number = s2.ss_ticket_number
+JOIN filtered_item1 item1 ON s1.ss_item_sk = item1.i_item_sk
+JOIN filtered_item2 item2 ON s2.ss_item_sk = item2.i_item_sk
+JOIN filtered_date d ON s1.ss_sold_date_sk = d.d_date_sk
+JOIN customer c ON s1.ss_customer_sk = c.c_customer_sk
+JOIN filtered_cd cd ON c.c_current_cdemo_sk = cd.cd_demo_sk
+JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+WHERE item1.i_item_sk < item2.i_item_sk;

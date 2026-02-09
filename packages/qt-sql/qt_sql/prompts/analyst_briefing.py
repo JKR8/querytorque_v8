@@ -1595,3 +1595,321 @@ def build_analyst_briefing_prompt(
         )
 
     return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Script-level oneshot — full multi-statement pipeline in one prompt
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def build_script_oneshot_prompt(
+    sql_script: str,
+    script_dag: Any,  # ScriptDAG from script_parser.py
+    dialect: str = "duckdb",
+    explain_plans: Optional[Dict[str, str]] = None,
+    engine_profile: Optional[Dict[str, Any]] = None,
+    matched_examples: Optional[List[Dict[str, Any]]] = None,
+    constraints: Optional[List[Dict[str, Any]]] = None,
+    regression_warnings: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Build a oneshot prompt for an entire multi-statement SQL pipeline.
+
+    Unlike the single-query oneshot which optimizes one SELECT in isolation,
+    this prompt gives the model the FULL script + dependency DAG so it can
+    reason about cross-statement optimizations:
+      - Predicate pushdown across materialization boundaries
+      - Redundant scan elimination across statements
+      - Materialization point optimization (table vs view vs CTE)
+      - Filter propagation from downstream consumers to upstream producers
+
+    Args:
+        sql_script: Full SQL script text (all statements)
+        script_dag: ScriptDAG with dependency graph and optimization targets
+        dialect: SQL dialect
+        explain_plans: Map of object_name -> EXPLAIN ANALYZE text for each
+            optimization target. Collected by running the pipeline stages
+            in dependency order against a real database.
+        engine_profile: Engine optimizer strengths/gaps (optional)
+        matched_examples: Gold examples for pattern matching (optional)
+        constraints: Correctness constraints (optional)
+        regression_warnings: Known regression patterns (optional)
+
+    Returns:
+        Complete prompt text for a single LLM call
+    """
+    lines: List[str] = []
+
+    # ── 1. Role framing ──────────────────────────────────────────────
+    lines.append(
+        "You are a senior SQL pipeline optimization architect. Your job is to "
+        "analyze a multi-statement SQL data pipeline end-to-end and produce "
+        "optimized rewrites that exploit cross-statement optimization "
+        "opportunities that no single-query optimizer can see."
+    )
+    lines.append("")
+    lines.append(
+        f"**Dialect**: {dialect}. All SQL must be valid {dialect} syntax."
+    )
+    lines.append("")
+
+    # ── 2. Pipeline DAG context ──────────────────────────────────────
+    lines.append("## Pipeline Dependency Graph")
+    lines.append("")
+    lines.append(
+        "This script is a data pipeline. Each CREATE TABLE/VIEW is a pipeline "
+        "stage that materializes intermediate results. The dependency graph below "
+        "shows what each stage creates, what it depends on, and which stages "
+        "have enough structural complexity to be worth optimizing."
+    )
+    lines.append("")
+    lines.append("```")
+    lines.append(script_dag.summary())
+    lines.append("```")
+    lines.append("")
+
+    # Lineage narrative for optimization targets
+    targets = script_dag.optimization_targets()
+    if targets:
+        lines.append("### Key Optimization Chains")
+        lines.append("")
+        for target in targets:
+            deps = sorted(target.references & set(script_dag._creates_index.keys()))
+            if deps:
+                lines.append(
+                    f"- **{target.creates_object}** (complexity={target.complexity_score}) "
+                    f"← depends on: {', '.join(deps)}"
+                )
+        lines.append("")
+
+    # ── 3. EXPLAIN ANALYZE plans ───────────────────────────────────
+    if explain_plans:
+        lines.append("## EXPLAIN ANALYZE Plans")
+        lines.append("")
+        lines.append(
+            "Execution plans for each optimization target, collected by "
+            "running the pipeline in dependency order against a real database. "
+            "Use these to identify actual cost hotspots, scan sizes, and "
+            "join strategies."
+        )
+        lines.append("")
+        for target in targets:
+            name = target.creates_object
+            if name and name in explain_plans:
+                lines.append(f"### {name} (complexity={target.complexity_score})")
+                lines.append("")
+                lines.append("```")
+                lines.append(explain_plans[name].strip())
+                lines.append("```")
+                lines.append("")
+
+    # ── 4. Cross-statement optimization opportunities ────────────────
+    lines.append("## Cross-Statement Optimization Opportunities")
+    lines.append("")
+    lines.append(
+        "These are the high-value patterns to look for in multi-statement "
+        "pipelines. Single-query optimizers CANNOT do these — they require "
+        "seeing the full pipeline:"
+    )
+    lines.append("")
+    lines.append(
+        "1. **Predicate pushdown across materialization boundaries**: "
+        "A downstream stage filters on a column that exists in an upstream "
+        "view/table. Push that filter into the upstream definition so it "
+        "scans less data from the start. This is the #1 win in pipeline "
+        "optimization."
+    )
+    lines.append(
+        "2. **Redundant scan elimination**: The same base table is scanned "
+        "by multiple views/stages with overlapping columns. Consolidate "
+        "into a shared CTE or materialized stage."
+    )
+    lines.append(
+        "3. **Materialization point optimization**: Some intermediate tables "
+        "exist only because the author couldn't express the logic as CTEs. "
+        "Converting temp tables to CTEs within the consuming query lets the "
+        "optimizer see through the boundary."
+    )
+    lines.append(
+        "4. **Filter propagation**: Downstream consumers apply filters "
+        "(e.g., `WHERE calendar_date = max(...)`, `WHERE customer_type IN (...)`). "
+        "If the upstream stage doesn't filter, it's scanning unnecessary data. "
+        "Propagate the filter upstream."
+    )
+    lines.append(
+        "5. **Join elimination**: If an upstream stage joins a table only to "
+        "produce columns that no downstream consumer uses, that join can be "
+        "removed."
+    )
+    lines.append("")
+
+    # ── 4. Engine profile (if available) ─────────────────────────────
+    if engine_profile:
+        lines.append("## Engine Profile")
+        lines.append("")
+        if "briefing_note" in engine_profile:
+            lines.append(engine_profile["briefing_note"])
+            lines.append("")
+        gaps = engine_profile.get("gaps", [])
+        if gaps:
+            lines.append("### Optimizer Gaps (exploit these)")
+            lines.append("")
+            for gap in gaps:
+                lines.append(
+                    f"- **{gap.get('id', '?')}**: {gap.get('what', '')}"
+                )
+            lines.append("")
+
+    # ── 5. Examples (if available) ───────────────────────────────────
+    if matched_examples:
+        lines.append("## Optimization Examples")
+        lines.append("")
+        for ex in matched_examples[:5]:
+            ex_id = ex.get("id", "?")
+            desc = ex.get("description", "")
+            speedup = ex.get("speedup", "?")
+            lines.append(f"- **{ex_id}** ({speedup}x): {desc}")
+        lines.append("")
+
+    # ── 6. Full SQL script ───────────────────────────────────────────
+    lines.append("## Complete SQL Pipeline")
+    lines.append("")
+    lines.append(
+        "Below is the COMPLETE pipeline. Every statement is shown — views, "
+        "temp tables, drops, selects. Read the full pipeline before proposing "
+        "any changes. Your rewrites must maintain semantic equivalence for "
+        "every downstream consumer."
+    )
+    lines.append("")
+    lines.append("```sql")
+    lines.append(sql_script.strip())
+    lines.append("```")
+    lines.append("")
+
+    # ── 7. Analysis steps ────────────────────────────────────────────
+    lines.append("## Your Analysis Steps")
+    lines.append("")
+    lines.append(
+        "1. **TRACE DATA FLOW**: Follow the pipeline DAG from base tables "
+        "to final outputs."
+    )
+    lines.append(
+        "2. **IDENTIFY FILTER BOUNDARIES**: Where do filters first appear? "
+        "Can they be pushed earlier in the chain?"
+    )
+    lines.append(
+        "3. **MAP BASE TABLE SCANS**: Which base tables are scanned by "
+        "multiple stages? Can scans be consolidated?"
+    )
+    lines.append(
+        "4. **CHECK MATERIALIZATION NECESSITY**: Does each temp table NEED "
+        "to be materialized, or could it be inlined as a CTE?"
+    )
+    lines.append(
+        "5. **WRITE REWRITES**: For each statement you change, produce a "
+        "rewrite_set in the output format below."
+    )
+    lines.append("")
+
+    # ── 8. Output format ─────────────────────────────────────────────
+    lines.append("## Output Format")
+    lines.append("")
+    lines.append(
+        "Return a JSON object with one `rewrite_set` per statement you "
+        "modify. Each rewrite_set targets a specific pipeline stage by its "
+        "`target` name (the table/view being created). Only include stages "
+        "you actually change."
+    )
+    lines.append("")
+    lines.append(
+        "Only include nodes (CTEs or main_query) that you **changed or "
+        "added**. Unchanged nodes are auto-filled from the original."
+    )
+    lines.append("")
+    lines.append("```json")
+    lines.append("{")
+    lines.append('  "rewrite_sets": [')
+    lines.append("    {")
+    lines.append('      "id": "rs_01",')
+    lines.append('      "target": "<table_or_view_name>",')
+    lines.append('      "transform": "<transform_name>",')
+    lines.append('      "nodes": {')
+    lines.append('        "<cte_name>": "<SQL for this CTE body>",')
+    lines.append('        "main_query": "<final SELECT>"')
+    lines.append("      },")
+    lines.append('      "node_contracts": {')
+    lines.append('        "<cte_name>": ["col1", "col2", "..."],')
+    lines.append('        "main_query": ["col1", "col2", "..."]')
+    lines.append("      },")
+    lines.append('      "data_flow": "<cte_a> -> <cte_b> -> main_query",')
+    lines.append('      "invariants_kept": ["same output columns", "same rows"],')
+    lines.append(
+        '      "cross_statement_reasoning": '
+        '"<why this change requires seeing the full pipeline>",'
+    )
+    lines.append('      "expected_speedup": "2.0x",')
+    lines.append('      "risk": "low"')
+    lines.append("    },")
+    lines.append("    {")
+    lines.append('      "id": "rs_02",')
+    lines.append('      "target": "<another_table_or_view>",')
+    lines.append("      ...")
+    lines.append("    }")
+    lines.append("  ]")
+    lines.append("}")
+    lines.append("```")
+    lines.append("")
+    lines.append("### Rules")
+    lines.append(
+        "- `target`: the table/view this rewrite modifies "
+        "(must match a CREATE in the script)"
+    )
+    lines.append(
+        "- Every node in `nodes` MUST appear in `node_contracts` and vice versa"
+    )
+    lines.append("- `main_query` = the final SELECT of that statement")
+    lines.append(
+        "- `cross_statement_reasoning`: explain what upstream/downstream "
+        "knowledge enabled this optimization"
+    )
+    lines.append(
+        "- Output columns of each stage must remain identical "
+        "(downstream consumers depend on them)"
+    )
+    lines.append(
+        "- Rewrites must be semantically equivalent for ALL downstream "
+        "consumers, not just the immediate next stage"
+    )
+    lines.append("")
+    lines.append("After the JSON, explain the overall pipeline optimization:")
+    lines.append("")
+    lines.append("```")
+    lines.append(
+        "Pipeline changes: <2-4 sentences: what cross-statement "
+        "optimizations and why>"
+    )
+    lines.append("Expected overall speedup: <estimate>")
+    lines.append("```")
+    lines.append("")
+
+    # ── 9. Validation checklist ──────────────────────────────────────
+    lines.append("## Pipeline Validation Checklist")
+    lines.append("")
+    lines.append(
+        "- Every modified stage preserves its output schema "
+        "(column names, types, row semantics)"
+    )
+    lines.append(
+        "- Filters pushed upstream do not remove rows that "
+        "downstream consumers need"
+    )
+    lines.append(
+        "- If a temp table is inlined as CTE, ALL consumers of "
+        "that table must be updated"
+    )
+    lines.append(
+        "- Redundant scan consolidation must not change join cardinality"
+    )
+    lines.append("- All literal values preserved exactly")
+    lines.append("")
+
+    return "\n".join(lines)

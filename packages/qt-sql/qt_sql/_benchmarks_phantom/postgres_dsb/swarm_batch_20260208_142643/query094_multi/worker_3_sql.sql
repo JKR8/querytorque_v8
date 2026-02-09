@@ -1,0 +1,58 @@
+WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_date BETWEEN '2002-10-01' AND CAST('2002-10-01' AS DATE) + INTERVAL '60 DAY'
+),
+filtered_customer_address AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_state IN ('IL', 'KS', 'LA', 'MN', 'MT', 'SC')
+),
+filtered_web_site AS (
+    SELECT web_site_sk
+    FROM web_site
+    WHERE web_gmt_offset >= -5
+),
+filtered_web_sales AS (
+    SELECT 
+        ws_order_number,
+        ws_ext_ship_cost,
+        ws_net_profit,
+        ws_warehouse_sk,
+        ws_ship_date_sk,
+        ws_ship_addr_sk,
+        ws_web_site_sk
+    FROM web_sales
+    WHERE ws_list_price BETWEEN 184 AND 213
+),
+multi_warehouse_orders AS (
+    SELECT ws_order_number
+    FROM filtered_web_sales
+    GROUP BY ws_order_number
+    HAVING COUNT(DISTINCT ws_warehouse_sk) > 1
+),
+returned_orders AS (
+    SELECT DISTINCT wr_order_number
+    FROM web_returns
+    WHERE wr_reason_sk IN (17, 48, 50, 56, 68)
+)
+SELECT
+    COUNT(DISTINCT ws1.ws_order_number) AS "order count",
+    SUM(ws1.ws_ext_ship_cost) AS "total shipping cost",
+    SUM(ws1.ws_net_profit) AS "total net profit"
+FROM filtered_web_sales ws1
+INNER JOIN filtered_date ON ws1.ws_ship_date_sk = filtered_date.d_date_sk
+INNER JOIN filtered_customer_address ON ws1.ws_ship_addr_sk = filtered_customer_address.ca_address_sk
+INNER JOIN filtered_web_site ON ws1.ws_web_site_sk = filtered_web_site.web_site_sk
+WHERE EXISTS (
+    SELECT 1
+    FROM multi_warehouse_orders mwo
+    WHERE mwo.ws_order_number = ws1.ws_order_number
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM returned_orders ro
+    WHERE ro.wr_order_number = ws1.ws_order_number
+)
+ORDER BY COUNT(DISTINCT ws1.ws_order_number)
+LIMIT 100;

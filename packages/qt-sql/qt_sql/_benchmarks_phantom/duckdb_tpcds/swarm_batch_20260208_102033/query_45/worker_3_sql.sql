@@ -1,0 +1,57 @@
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_qoy = 2
+      AND d_year = 2000
+),
+filtered_addresses AS (
+    SELECT ca_address_sk, ca_zip, ca_city
+    FROM customer_address
+    WHERE SUBSTRING(ca_zip, 1, 5) IN (
+        '85669', '86197', '88274', '83405', '86475',
+        '85392', '85460', '80348', '81792'
+    )
+),
+filtered_items AS (
+    SELECT i_item_sk, i_item_id
+    FROM item
+    WHERE i_item_sk IN (2, 3, 5, 7, 11, 13, 17, 19, 23, 29)
+),
+address_based_sales AS (
+    SELECT
+        ca.ca_zip,
+        ca.ca_city,
+        ws.ws_sales_price
+    FROM web_sales ws
+    JOIN customer c ON ws.ws_bill_customer_sk = c.c_customer_sk
+    JOIN filtered_addresses ca ON c.c_current_addr_sk = ca.ca_address_sk
+    JOIN filtered_dates d ON ws.ws_sold_date_sk = d.d_date_sk
+    JOIN item i ON ws.ws_item_sk = i.i_item_sk
+),
+item_based_sales AS (
+    SELECT
+        ca.ca_zip,
+        ca.ca_city,
+        ws.ws_sales_price
+    FROM web_sales ws
+    JOIN customer c ON ws.ws_bill_customer_sk = c.c_customer_sk
+    JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+    JOIN filtered_dates d ON ws.ws_sold_date_sk = d.d_date_sk
+    JOIN filtered_items i ON ws.ws_item_sk = i.i_item_sk
+    WHERE ca.ca_address_sk NOT IN (
+        SELECT ca_address_sk FROM filtered_addresses
+    )
+),
+combined_sales AS (
+    SELECT * FROM address_based_sales
+    UNION ALL
+    SELECT * FROM item_based_sales
+)
+SELECT
+    ca_zip,
+    ca_city,
+    SUM(ws_sales_price) AS "sum(ws_sales_price)"
+FROM combined_sales
+GROUP BY ca_zip, ca_city
+ORDER BY ca_zip, ca_city
+LIMIT 100

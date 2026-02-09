@@ -105,8 +105,8 @@ Inputs:
 | `validate.py` | Validation + scoring — semantic equivalence, runtime benchmarking, error categorization |
 | `analyst.py` | Analyst prompt builder — structural analysis, bottleneck identification, example overrides |
 | `analyst_session.py` | Deep-dive iterative mode — `AnalystSession`, `AnalystIteration` |
-| `knowledge.py` | FAISS recommender — `ADOFAISSRecommender` for similarity search |
-| `faiss_builder.py` | FAISS index builder — vectorize examples, build/rebuild index |
+| `knowledge.py` | Tag-based recommender — similarity search via tag overlap |
+| `tag_index.py` | Tag index builder — extract tags, build/rebuild similarity index |
 | `learn.py` | Learning system — `Learner`, `LearningRecord`, summary analytics |
 | `schemas.py` | Data models — `PipelineResult`, `BenchmarkConfig`, `PromotionAnalysis`, `ValidationResult`, `ValidationStatus`, `EdgeContract`, `NodeRewriteResult` |
 | `store.py` | Artifact persistence — saves prompt/response/sql/validation per worker |
@@ -128,10 +128,8 @@ Inputs:
 - **Engine-specific**: strict filtering ensures DuckDB queries only get DuckDB gold examples, PostgreSQL queries only get PostgreSQL gold examples.
 - **Gold examples** (type=gold): Returns top-k (default k=3) — proven rewrites to emulate.
 - **Regression warnings** (type=regression): Returns top-k (default k=2, min similarity 0.3) — failed rewrites to avoid. Shown as anti-patterns in the prompt.
-- Index: `ado/models/similarity_index.faiss` (105 vectors, 90 dimensions).
-  - 68 metadata entries: 16 DuckDB gold + 5 PG gold + 37 seed catalog rules + 10 DuckDB regressions
-  - 37 additional anonymous vectors from multi-dialect vectorization of seed rules
-- Rebuild: `python3 -m ado.faiss_builder` from `packages/qt-sql/` (use `--stats` to inspect).
+- Index: `ado/models/similarity_tags.json` (108 examples, tag-based overlap matching).
+- Rebuild: `python3 -m ado.tag_index` from `packages/qt-sql/` (use `--stats` to inspect).
 
 ### LLM Analyst (Optional)
 - Module: `ado/pipeline.py` (`Pipeline._run_analyst`) + `ado/analyst.py`.
@@ -401,7 +399,7 @@ Create a JSON file in `ado/examples/<engine>/regressions/` with:
   }
 }
 ```
-Then rebuild the FAISS index: `python3 -m ado.faiss_builder` from `packages/qt-sql/`.
+Then rebuild the tag index: `python3 -m ado.tag_index` from `packages/qt-sql/`.
 
 ### Current Regressions (10 DuckDB)
 | ID | Speedup | Transform | Key Anti-Pattern |

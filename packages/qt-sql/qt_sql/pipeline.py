@@ -1560,7 +1560,7 @@ class Pipeline:
         if leaderboard_path.exists():
             try:
                 strategy_leaderboard = json.loads(leaderboard_path.read_text())
-                from .faiss_builder import extract_tags, classify_category
+                from .tag_index import extract_tags, classify_category
                 query_archetype = classify_category(
                     extract_tags(sql, dialect=dialect)
                 )

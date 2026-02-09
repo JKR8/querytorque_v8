@@ -1,0 +1,39 @@
+WITH filtered_d2 AS (
+    SELECT d_date_sk, d_date
+    FROM date_dim
+    WHERE d_moy = 12
+),
+filtered_store AS (
+    SELECT s_store_sk, s_store_name, s_company_id,
+           s_street_number, s_street_name, s_suite_number,
+           s_city, s_zip
+    FROM store
+    WHERE s_state IN ('LA', 'TX', 'VA')
+)
+SELECT
+    MIN(s_store_name),
+    MIN(s_company_id),
+    MIN(s_street_number),
+    MIN(s_street_name),
+    MIN(s_suite_number),
+    MIN(s_city),
+    MIN(s_zip),
+    MIN(ss_ticket_number),
+    MIN(ss_sold_date_sk),
+    MIN(sr_returned_date_sk),
+    MIN(ss_item_sk),
+    MIN(d1.d_date_sk)
+FROM store_sales
+JOIN store_returns 
+    ON ss_ticket_number = sr_ticket_number
+    AND ss_item_sk = sr_item_sk
+    AND ss_customer_sk = sr_customer_sk
+JOIN filtered_store 
+    ON ss_store_sk = s_store_sk 
+    AND sr_store_sk = s_store_sk
+JOIN date_dim d1 
+    ON ss_sold_date_sk = d1.d_date_sk
+    AND d1.d_dow = 1
+JOIN filtered_d2 d2 
+    ON sr_returned_date_sk = d2.d_date_sk
+    AND d1.d_date BETWEEN (d2.d_date - INTERVAL '120 DAY') AND d2.d_date;

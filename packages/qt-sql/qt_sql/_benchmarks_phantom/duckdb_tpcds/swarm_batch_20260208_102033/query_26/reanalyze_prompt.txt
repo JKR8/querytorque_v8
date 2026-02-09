@@ -1,0 +1,283 @@
+You are analyzing 5 failed optimization attempts to design a refined approach that reaches 2.0x speedup.
+
+Your job: understand WHY each attempt fell short, identify unexplored optimization angles, and synthesize a NEW strategy that combines the best insights while avoiding repeated mistakes.
+
+## Query: query_26
+## Target: 2.0x speedup
+## Dialect: duckdb
+
+```sql
+-- start query 26 in stream 0 using template query26.tpl
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
+ LIMIT 100;
+
+-- end query 26 in stream 0 using template query26.tpl
+```
+
+## Previous Attempts
+
+### Worker 1: conservative_pushdown_filter
+- **Status**: pass (1.03x)
+- **Transforms**: none
+- **Examples used**: pushdown, early_filter, materialize_cte
+- **Strategy hint**: Apply safe optimizations by pushing filters into CTEs early, materializing dimension filters first, and reducing intermediate results through predicate pushdown before joining.
+
+```sql
+WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2001
+),
+filtered_customer_demo AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_gender = 'M'
+      AND cd_marital_status = 'S'
+      AND cd_education_status = 'Unknown'
+),
+filtered_promotion AS (
+    SELECT p_promo_sk
+    FROM promotion
+    WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+)
+SELECT
+    i_item_id,
+    AVG(cs_quantity) AS agg1,
+    AVG(cs_list_price) AS agg2,
+    AVG(cs_coupon_amt) AS agg3,
+    AVG(cs_sales_price) AS agg4
+FROM catalog_sales
+JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+JOIN filtered_customer_demo ON cs_bill_cdemo_sk = cd_demo_sk
+JOIN filtered_promotion ON cs_promo_sk = p_promo_sk
+JOIN item ON cs_item_sk = i_item_sk
+GROUP BY i_item_id
+ORDER BY i_item_id
+-- ... (truncated)
+```
+
+### Worker 2: moderate_dimension_isolation
+- **Status**: pass (1.04x)
+- **Transforms**: none
+- **Examples used**: dimension_cte_isolate, date_cte_isolate, shared_dimension_multi_channel
+- **Strategy hint**: Isolate filtered dimension tables (customer_demographics, date_dim, promotion) into separate CTEs before joining with catalog_sales to enable better join planning and reduce fact table scans.
+
+```sql
+WITH filtered_dates AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 2001
+),
+filtered_customer_demographics AS (
+  SELECT cd_demo_sk
+  FROM customer_demographics
+  WHERE cd_gender = 'M'
+    AND cd_marital_status = 'S'
+    AND cd_education_status = 'Unknown'
+),
+filtered_promotions AS (
+  SELECT p_promo_sk
+  FROM promotion
+  WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+),
+joined_facts AS (
+  SELECT 
+    cs_item_sk,
+    cs_quantity,
+    cs_list_price,
+    cs_coupon_amt,
+    cs_sales_price
+  FROM catalog_sales AS cs
+  JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk
+  JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk
+  JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk
+)
+SELECT
+-- ... (truncated)
+```
+
+### Worker 3: aggressive_prefetch_restructure
+- **Status**: pass (0.94x)
+- **Transforms**: none
+- **Examples used**: prefetch_fact_join, multi_dimension_prefetch, single_pass_aggregation
+- **Strategy hint**: Restructure joins by prefiltering dimensions and pre-joining them with the fact table in staged CTEs, then consolidate aggregations in a single pass to minimize intermediate data movement.
+
+```sql
+WITH filtered_customer_demographics AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_gender = 'M'
+      AND cd_marital_status = 'S'
+      AND cd_education_status = 'Unknown'
+),
+filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2001
+),
+filtered_promotion AS (
+    SELECT p_promo_sk
+    FROM promotion
+    WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+),
+filtered_catalog_sales AS (
+    SELECT 
+        cs_item_sk,
+        cs_quantity,
+        cs_list_price,
+        cs_coupon_amt,
+        cs_sales_price
+    FROM catalog_sales
+    INNER JOIN filtered_customer_demographics 
+        ON cs_bill_cdemo_sk = cd_demo_sk
+    INNER JOIN filtered_date 
+        ON cs_sold_date_sk = d_date_sk
+    INNER JOIN filtered_promotion 
+-- ... (truncated)
+```
+
+### Worker 4: novel_structural_transform
+- **Status**: pass (0.51x)
+- **Transforms**: none
+- **Examples used**: or_to_union, intersect_to_exists, composite_decorrelate_union
+- **Strategy hint**: Transform the query structure by splitting the OR condition on promotion into UNION ALL branches, converting potential subquery patterns, and decorrelating joins for better parallelism and index usage.
+
+```sql
+WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2001
+), filtered_customer_demographics AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_gender = 'M'
+      AND cd_marital_status = 'S'
+      AND cd_education_status = 'Unknown'
+), promotion_branch1 AS (
+    SELECT p_promo_sk
+    FROM promotion
+    WHERE p_channel_email = 'N'
+), promotion_branch2 AS (
+    SELECT p_promo_sk
+    FROM promotion
+    WHERE p_channel_event = 'N'
+      AND (p_channel_email IS NULL OR p_channel_email != 'N')
+), union_sales AS (
+    SELECT
+        i.i_item_id,
+        cs.cs_quantity,
+        cs.cs_list_price,
+        cs.cs_coupon_amt,
+        cs.cs_sales_price
+    FROM catalog_sales cs
+    INNER JOIN filtered_date d ON cs.cs_sold_date_sk = d.d_date_sk
+    INNER JOIN filtered_customer_demographics cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk
+    INNER JOIN item i ON cs.cs_item_sk = i.i_item_sk
+-- ... (truncated)
+```
+
+### Worker 5: refined_snipe
+- **Status**: pass (1.05x)
+- **Transforms**: none
+- **Examples used**: 
+- **Strategy hint**: Snipe from iter 1
+
+```sql
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2001
+),
+filtered_customer_demographics AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_gender = 'M'
+        AND cd_marital_status = 'S'
+        AND cd_education_status = 'Unknown'
+),
+filtered_promotions AS (
+    SELECT DISTINCT p_promo_sk
+    FROM promotion
+    WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+),
+filtered_catalog_sales AS (
+    SELECT 
+        cs_item_sk,
+        cs_quantity,
+        cs_list_price,
+        cs_coupon_amt,
+        cs_sales_price
+    FROM catalog_sales cs
+    INNER JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk
+    INNER JOIN filtered_customer_demographics fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk
+    INNER JOIN filtered_promotions fp ON cs.cs_promo_sk = fp.p_promo_sk
+)
+SELECT
+-- ... (truncated)
+```
+
+## DAG Structure & Bottlenecks
+
+| Node | Role | Cost % |
+|------|------|-------:|
+| main_query |  | 0.0% |
+
+## Available Examples (Full Catalog)
+
+- **composite_decorrelate_union** (2.42xx) — Decorrelate multiple correlated EXISTS subqueries into pre-materialized DISTINCT
+- **date_cte_isolate** (4.00xx) — Extract date filtering into a separate CTE to enable predicate pushdown and redu
+- **decorrelate** (2.92xx) — Convert correlated subquery to separate CTE with GROUP BY, then JOIN
+- **deferred_window_aggregation** (1.36xx) — When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joi
+- **dimension_cte_isolate** (1.93xx) — Pre-filter ALL dimension tables into CTEs before joining with fact table, not ju
+- **early_filter** (4.00xx) — Filter dimension tables FIRST, then join to fact tables to reduce expensive join
+- **intersect_to_exists** (1.83xx) — Convert INTERSECT subquery pattern to multiple EXISTS clauses for better join pl
+- **materialize_cte** (1.37xx) — Extract repeated subquery patterns into a CTE to avoid recomputation
+- **multi_date_range_cte** (2.35xx) — When query uses multiple date_dim aliases with different filters (d1, d2, d3), c
+- **multi_dimension_prefetch** (2.71xx) — Pre-filter multiple dimension tables (date + store) into separate CTEs before jo
+- **or_to_union** (3.17xx) — Split OR conditions on different columns into UNION ALL branches for better inde
+- **prefetch_fact_join** (3.77xx) — Pre-filter dimension table into CTE, then pre-join with fact table in second CTE
+- **pushdown** (2.11xx) — Push filters from outer query into CTEs/subqueries to reduce intermediate result
+- **shared_dimension_multi_channel** (1.30xx) — Extract shared dimension filters (date, item, promotion) into CTEs when multiple
+- **single_pass_aggregation** (4.47xx) — Consolidate multiple subqueries scanning the same table into a single CTE with c
+- **union_cte_split** (1.36xx) — Split a generic UNION ALL CTE into specialized CTEs when the main query filters 
+
+## Your Task
+
+Analyze the failed attempts and design a refined approach:
+
+1. **Failure Analysis**: Why did all attempts fall short? Be specific about mechanisms.
+2. **Common Patterns**: What did multiple workers try unsuccessfully?
+3. **Unexplored Space**: What optimization angles were missed entirely?
+4. **Refined Strategy**: Synthesize a NEW approach combining best insights.
+
+### Output Format (follow EXACTLY)
+
+```
+FAILURE_ANALYSIS:
+<Why all workers fell short — be specific about mechanisms>
+
+UNEXPLORED_OPPORTUNITIES:
+<What optimization approaches haven't been tried>
+
+REFINED_STRATEGY:
+<Concrete optimization approach for next attempt>
+
+EXAMPLES: <ex1>, <ex2>, <ex3>
+HINT: <specific guidance for the refined attempt>
+```

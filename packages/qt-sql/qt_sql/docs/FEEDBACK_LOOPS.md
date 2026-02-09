@@ -85,7 +85,7 @@ improves the orchestrator too.
    examples? If an archetype is under-served, promote the best new win.
 4. Retire examples that haven't contributed to a win in 3+ consecutive batches
    (move to `ado/examples/duckdb/retired/`).
-5. Rebuild the tag index: `PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.faiss_builder`
+5. Rebuild the tag index: `PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.tag_index`
 
 **Key files:**
 - `ado/examples/duckdb/*.json` — gold examples

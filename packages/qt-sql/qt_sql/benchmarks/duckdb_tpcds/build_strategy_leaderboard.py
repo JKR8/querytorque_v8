@@ -58,7 +58,7 @@ def _load_query_sql(query_id: str, original_sql_from_knowledge: str | None) -> s
 
 def build_leaderboard() -> Dict:
     """Build the complete strategy leaderboard."""
-    from qt_sql.faiss_builder import extract_tags, classify_category
+    from qt_sql.tag_index import extract_tags, classify_category
 
     # Load knowledge
     if not KNOWLEDGE_FILE.exists():

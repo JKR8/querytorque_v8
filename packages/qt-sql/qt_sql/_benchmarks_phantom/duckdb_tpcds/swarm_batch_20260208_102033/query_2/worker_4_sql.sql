@@ -1,0 +1,37 @@
+WITH wscs AS (
+    SELECT ws_sold_date_sk AS sold_date_sk, ws_ext_sales_price AS sales_price
+    FROM web_sales
+    UNION ALL
+    SELECT cs_sold_date_sk AS sold_date_sk, cs_ext_sales_price AS sales_price
+    FROM catalog_sales
+),
+yearly_week_sales AS (
+    SELECT
+        d_week_seq,
+        d_year,
+        SUM(CASE WHEN d_day_name = 'Sunday' THEN sales_price END) AS sun_sales,
+        SUM(CASE WHEN d_day_name = 'Monday' THEN sales_price END) AS mon_sales,
+        SUM(CASE WHEN d_day_name = 'Tuesday' THEN sales_price END) AS tue_sales,
+        SUM(CASE WHEN d_day_name = 'Wednesday' THEN sales_price END) AS wed_sales,
+        SUM(CASE WHEN d_day_name = 'Thursday' THEN sales_price END) AS thu_sales,
+        SUM(CASE WHEN d_day_name = 'Friday' THEN sales_price END) AS fri_sales,
+        SUM(CASE WHEN d_day_name = 'Saturday' THEN sales_price END) AS sat_sales
+    FROM wscs
+    JOIN date_dim ON d_date_sk = sold_date_sk
+    WHERE d_year IN (1998, 1999)
+    GROUP BY d_week_seq, d_year
+)
+SELECT
+    y1998.d_week_seq AS d_week_seq1,
+    ROUND(y1998.sun_sales / y1999.sun_sales, 2),
+    ROUND(y1998.mon_sales / y1999.mon_sales, 2),
+    ROUND(y1998.tue_sales / y1999.tue_sales, 2),
+    ROUND(y1998.wed_sales / y1999.wed_sales, 2),
+    ROUND(y1998.thu_sales / y1999.thu_sales, 2),
+    ROUND(y1998.fri_sales / y1999.fri_sales, 2),
+    ROUND(y1998.sat_sales / y1999.sat_sales, 2)
+FROM yearly_week_sales y1998
+JOIN yearly_week_sales y1999 
+    ON y1998.d_week_seq = y1999.d_week_seq - 53
+WHERE y1998.d_year = 1998 AND y1999.d_year = 1999
+ORDER BY d_week_seq1

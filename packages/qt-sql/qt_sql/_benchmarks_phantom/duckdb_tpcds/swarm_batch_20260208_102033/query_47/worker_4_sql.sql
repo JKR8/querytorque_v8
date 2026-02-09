@@ -1,0 +1,84 @@
+WITH sales_data AS (
+  SELECT
+    ss.ss_sales_price,
+    i.i_category,
+    i.i_brand,
+    s.s_store_name,
+    s.s_company_name,
+    d.d_year,
+    d.d_moy
+  FROM store_sales ss
+  JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk
+  JOIN item i ON ss.ss_item_sk = i.i_item_sk
+  JOIN store s ON ss.ss_store_sk = s.s_store_sk
+  WHERE d.d_year = 2001
+  UNION ALL
+  SELECT
+    ss.ss_sales_price,
+    i.i_category,
+    i.i_brand,
+    s.s_store_name,
+    s.s_company_name,
+    d.d_year,
+    d.d_moy
+  FROM store_sales ss
+  JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk
+  JOIN item i ON ss.ss_item_sk = i.i_item_sk
+  JOIN store s ON ss.ss_store_sk = s.s_store_sk
+  WHERE d.d_year = 2000 AND d.d_moy = 12
+  UNION ALL
+  SELECT
+    ss.ss_sales_price,
+    i.i_category,
+    i.i_brand,
+    s.s_store_name,
+    s.s_company_name,
+    d.d_year,
+    d.d_moy
+  FROM store_sales ss
+  JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk
+  JOIN item i ON ss.ss_item_sk = i.i_item_sk
+  JOIN store s ON ss.ss_store_sk = s.s_store_sk
+  WHERE d.d_year = 2002 AND d.d_moy = 1
+),
+monthly_aggregates AS (
+  SELECT
+    i_category,
+    i_brand,
+    s_store_name,
+    s_company_name,
+    d_year,
+    d_moy,
+    SUM(ss_sales_price) AS sum_sales,
+    AVG(SUM(ss_sales_price)) OVER (
+      PARTITION BY i_category, i_brand, s_store_name, s_company_name, d_year
+    ) AS avg_monthly_sales,
+    LAG(SUM(ss_sales_price)) OVER (
+      PARTITION BY i_category, i_brand, s_store_name, s_company_name
+      ORDER BY d_year, d_moy
+    ) AS psum,
+    LEAD(SUM(ss_sales_price)) OVER (
+      PARTITION BY i_category, i_brand, s_store_name, s_company_name
+      ORDER BY d_year, d_moy
+    ) AS nsum
+  FROM sales_data
+  GROUP BY i_category, i_brand, s_store_name, s_company_name, d_year, d_moy
+)
+SELECT
+  s_store_name,
+  d_year,
+  avg_monthly_sales,
+  sum_sales,
+  psum,
+  nsum
+FROM monthly_aggregates
+WHERE
+  d_year = 2001
+  AND avg_monthly_sales > 0
+  AND ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales > 0.1
+  AND psum IS NOT NULL
+  AND nsum IS NOT NULL
+ORDER BY
+  sum_sales - avg_monthly_sales,
+  nsum
+LIMIT 100

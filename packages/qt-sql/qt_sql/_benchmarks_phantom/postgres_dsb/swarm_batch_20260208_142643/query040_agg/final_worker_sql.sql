@@ -1,0 +1,61 @@
+WITH filtered_dates AS (
+    SELECT d_date_sk, d_date
+    FROM date_dim
+    WHERE d_date BETWEEN (
+        CAST('1999-04-19' AS DATE) - INTERVAL '30 DAY'
+    ) AND (
+        CAST('1999-04-19' AS DATE) + INTERVAL '30 DAY'
+    )
+),
+filtered_item AS (
+    SELECT i_item_sk, i_item_id
+    FROM item
+    WHERE i_category = 'Home'
+      AND i_manager_id BETWEEN 25 AND 64
+),
+filtered_warehouse AS (
+    SELECT w_warehouse_sk, w_state
+    FROM warehouse
+),
+sales_returns AS (
+    SELECT
+        cs.cs_sold_date_sk,
+        cs.cs_item_sk,
+        cs.cs_warehouse_sk,
+        cs.cs_sales_price,
+        COALESCE(cr.cr_refunded_cash, 0) AS cr_refunded_cash,
+        d.d_date
+    FROM catalog_sales cs
+    INNER JOIN catalog_returns cr
+        ON cs.cs_order_number = cr.cr_order_number
+        AND cs.cs_item_sk = cr.cr_item_sk
+        AND cr.cr_reason_sk = 16
+    INNER JOIN filtered_dates d
+        ON cs.cs_sold_date_sk = d.d_date_sk
+    WHERE cs.cs_wholesale_cost BETWEEN 17 AND 36
+)
+SELECT
+    w.w_state,
+    i.i_item_id,
+    SUM(
+        CASE
+            WHEN sr.d_date < CAST('1999-04-19' AS DATE)
+            THEN sr.cs_sales_price - sr.cr_refunded_cash
+            ELSE 0
+        END
+    ) AS sales_before,
+    SUM(
+        CASE
+            WHEN sr.d_date >= CAST('1999-04-19' AS DATE)
+            THEN sr.cs_sales_price - sr.cr_refunded_cash
+            ELSE 0
+        END
+    ) AS sales_after
+FROM sales_returns sr
+INNER JOIN filtered_item i
+    ON sr.cs_item_sk = i.i_item_sk
+INNER JOIN filtered_warehouse w
+    ON sr.cs_warehouse_sk = w.w_warehouse_sk
+GROUP BY w.w_state, i.i_item_id
+ORDER BY w.w_state, i.i_item_id
+LIMIT 100

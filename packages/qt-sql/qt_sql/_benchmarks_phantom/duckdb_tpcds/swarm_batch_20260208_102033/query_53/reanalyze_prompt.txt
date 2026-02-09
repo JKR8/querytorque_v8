@@ -1,0 +1,290 @@
+You are analyzing 5 failed optimization attempts to design a refined approach that reaches 2.0x speedup.
+
+Your job: understand WHY each attempt fell short, identify unexplored optimization angles, and synthesize a NEW strategy that combines the best insights while avoiding repeated mistakes.
+
+## Query: query_53
+## Target: 2.0x speedup
+## Dialect: duckdb
+
+```sql
+-- start query 53 in stream 0 using template query53.tpl
+select * from 
+(select i_manufact_id,
+sum(ss_sales_price) sum_sales,
+avg(sum(ss_sales_price)) over (partition by i_manufact_id) avg_quarterly_sales
+from item, store_sales, date_dim, store
+where ss_item_sk = i_item_sk and
+ss_sold_date_sk = d_date_sk and
+ss_store_sk = s_store_sk and
+d_month_seq in (1200,1200+1,1200+2,1200+3,1200+4,1200+5,1200+6,1200+7,1200+8,1200+9,1200+10,1200+11) and
+((i_category in ('Books','Children','Electronics') and
+i_class in ('personal','portable','reference','self-help') and
+i_brand in ('scholaramalgamalg #14','scholaramalgamalg #7',
+		'exportiunivamalg #9','scholaramalgamalg #9'))
+or(i_category in ('Women','Music','Men') and
+i_class in ('accessories','classical','fragrances','pants') and
+i_brand in ('amalgimporto #1','edu packscholar #1','exportiimporto #1',
+		'importoamalg #1')))
+group by i_manufact_id, d_qoy ) tmp1
+where case when avg_quarterly_sales > 0 
+	then abs (sum_sales - avg_quarterly_sales)/ avg_quarterly_sales 
+	else null end > 0.1
+order by avg_quarterly_sales,
+	 sum_sales,
+	 i_manufact_id
+ LIMIT 100;
+
+-- end query 53 in stream 0 using template query53.tpl
+```
+
+## Previous Attempts
+
+### Worker 1: conservative_predicate_pushdown
+- **Status**: pass (0.91x)
+- **Transforms**: none
+- **Examples used**: early_filter, pushdown, materialize_cte
+- **Strategy hint**: Focus on early filtering of dimension tables and pushing predicates into CTEs to reduce join sizes before any expensive operations.
+
+```sql
+WITH filtered_date AS (
+  SELECT d_date_sk, d_qoy
+  FROM date_dim
+  WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)
+),
+filtered_item AS (
+  SELECT i_item_sk, i_manufact_id
+  FROM item
+  WHERE (
+    i_category IN ('Books', 'Children', 'Electronics')
+    AND i_class IN ('personal', 'portable', 'reference', 'self-help')
+    AND i_brand IN ('scholaramalgamalg #14', 'scholaramalgamalg #7', 'exportiunivamalg #9', 'scholaramalgamalg #9')
+  ) OR (
+    i_category IN ('Women', 'Music', 'Men')
+    AND i_class IN ('accessories', 'classical', 'fragrances', 'pants')
+    AND i_brand IN ('amalgimporto #1', 'edu packscholar #1', 'exportiimporto #1', 'importoamalg #1')
+  )
+),
+joined_sales AS (
+  SELECT
+    i.i_manufact_id,
+    d.d_qoy,
+    SUM(ss.ss_sales_price) AS sum_sales
+  FROM store_sales ss
+  JOIN filtered_item i ON ss.ss_item_sk = i.i_item_sk
+  JOIN filtered_date d ON ss.ss_sold_date_sk = d.d_date_sk
+  JOIN store s ON ss.ss_store_sk = s.s_store_sk
+  GROUP BY i.i_manufact_id, d.d_qoy
+),
+with_avg AS (
+-- ... (truncated)
+```
+
+### Worker 2: moderate_dimension_isolation
+- **Status**: pass (1.06x)
+- **Transforms**: none
+- **Examples used**: date_cte_isolate, dimension_cte_isolate, shared_dimension_multi_channel
+- **Strategy hint**: Isolate all dimension filtering into dedicated CTEs, then join with fact table to enable predicate pushdown and reuse filtered dimensions.
+
+```sql
+WITH filtered_dates AS (
+    SELECT d_date_sk, d_qoy
+    FROM date_dim
+    WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)
+), filtered_items AS (
+    SELECT i_item_sk, i_manufact_id
+    FROM item
+    WHERE (
+        (i_category IN ('Books', 'Children', 'Electronics')
+         AND i_class IN ('personal', 'portable', 'reference', 'self-help')
+         AND i_brand IN ('scholaramalgamalg #14', 'scholaramalgamalg #7', 'exportiunivamalg #9', 'scholaramalgamalg #9'))
+        OR (i_category IN ('Women', 'Music', 'Men')
+            AND i_class IN ('accessories', 'classical', 'fragrances', 'pants')
+            AND i_brand IN ('amalgimporto #1', 'edu packscholar #1', 'exportiimporto #1', 'importoamalg #1'))
+    )
+), grouped_sales AS (
+    SELECT
+        fi.i_manufact_id,
+        fd.d_qoy,
+        SUM(ss_sales_price) AS sum_sales,
+        AVG(SUM(ss_sales_price)) OVER (PARTITION BY fi.i_manufact_id) AS avg_quarterly_sales
+    FROM store_sales
+    JOIN filtered_dates fd ON ss_sold_date_sk = fd.d_date_sk
+    JOIN filtered_items fi ON ss_item_sk = fi.i_item_sk
+    JOIN store ON ss_store_sk = s_store_sk
+    GROUP BY fi.i_manufact_id, fd.d_qoy
+)
+SELECT
+    i_manufact_id,
+    sum_sales,
+-- ... (truncated)
+```
+
+### Worker 3: aggressive_fact_prefetch
+- **Status**: pass (1.18x)
+- **Transforms**: none
+- **Examples used**: prefetch_fact_join, multi_dimension_prefetch, deferred_window_aggregation
+- **Strategy hint**: Pre-join filtered dimensions with fact table in CTEs, then compute aggregations and window functions in separate stages to optimize data flow.
+
+```sql
+WITH filtered_dates AS (
+  SELECT d_date_sk, d_qoy
+  FROM date_dim
+  WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)
+),
+filtered_items AS (
+  SELECT i_item_sk, i_manufact_id
+  FROM item
+  WHERE (
+    (i_category IN ('Books', 'Children', 'Electronics')
+     AND i_class IN ('personal', 'portable', 'reference', 'self-help')
+     AND i_brand IN ('scholaramalgamalg #14', 'scholaramalgamalg #7', 'exportiunivamalg #9', 'scholaramalgamalg #9'))
+    OR
+    (i_category IN ('Women', 'Music', 'Men')
+     AND i_class IN ('accessories', 'classical', 'fragrances', 'pants')
+     AND i_brand IN ('amalgimporto #1', 'edu packscholar #1', 'exportiimporto #1', 'importoamalg #1'))
+  )
+),
+prejoined_sales AS (
+  SELECT 
+    i.i_manufact_id,
+    fd.d_qoy,
+    ss.ss_sales_price
+  FROM store_sales ss
+  JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk
+  JOIN filtered_items i ON ss.ss_item_sk = i.i_item_sk
+  JOIN store s ON ss.ss_store_sk = s.s_store_sk
+),
+aggregated AS (
+  SELECT
+-- ... (truncated)
+```
+
+### Worker 4: novel_structural_transform
+- **Status**: pass (0.68x)
+- **Transforms**: none
+- **Examples used**: or_to_union, composite_decorrelate_union, intersect_to_exists
+- **Strategy hint**: Transform complex OR conditions into UNION ALL branches and restructure subquery patterns to eliminate correlation and improve join planning.
+
+```sql
+WITH filtered_dates AS (
+  SELECT d_date_sk, d_qoy
+  FROM date_dim
+  WHERE d_month_seq BETWEEN 1200 AND 1211
+),
+item_filter_1 AS (
+  SELECT i_item_sk, i_manufact_id
+  FROM item
+  WHERE i_category IN ('Books', 'Children', 'Electronics')
+    AND i_class IN ('personal', 'portable', 'reference', 'self-help')
+    AND i_brand IN ('scholaramalgamalg #14', 'scholaramalgamalg #7', 'exportiunivamalg #9', 'scholaramalgamalg #9')
+),
+item_filter_2 AS (
+  SELECT i_item_sk, i_manufact_id
+  FROM item
+  WHERE i_category IN ('Women', 'Music', 'Men')
+    AND i_class IN ('accessories', 'classical', 'fragrances', 'pants')
+    AND i_brand IN ('amalgimporto #1', 'edu packscholar #1', 'exportiimporto #1', 'importoamalg #1')
+),
+qualified_sales AS (
+  SELECT
+    i1.i_manufact_id,
+    ss.ss_sales_price,
+    d.d_qoy
+  FROM store_sales ss
+  JOIN item_filter_1 i1 ON ss.ss_item_sk = i1.i_item_sk
+  JOIN filtered_dates d ON ss.ss_sold_date_sk = d.d_date_sk
+  JOIN store s ON ss.ss_store_sk = s.s_store_sk
+  UNION ALL
+  SELECT
+-- ... (truncated)
+```
+
+### Worker 5: refined_snipe
+- **Status**: pass (1.04x)
+- **Transforms**: none
+- **Examples used**: 
+- **Strategy hint**: Snipe from iter 1
+
+```sql
+WITH filtered_dates AS (
+    SELECT d_date_sk, d_qoy
+    FROM date_dim
+    WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)
+),
+filtered_items AS (
+    SELECT i_item_sk, i_manufact_id
+    FROM item
+    WHERE (
+        i_category IN ('Books', 'Children', 'Electronics')
+        AND i_class IN ('personal', 'portable', 'reference', 'self-help')
+        AND i_brand IN ('scholaramalgamalg #14', 'scholaramalgamalg #7', 'exportiunivamalg #9', 'scholaramalgamalg #9')
+    ) OR (
+        i_category IN ('Women', 'Music', 'Men')
+        AND i_class IN ('accessories', 'classical', 'fragrances', 'pants')
+        AND i_brand IN ('amalgimporto #1', 'edu packscholar #1', 'exportiimporto #1', 'importoamalg #1')
+    )
+),
+joined_sales AS (
+    SELECT 
+        i.i_manufact_id,
+        fd.d_qoy,
+        ss.ss_sales_price
+    FROM store_sales ss
+    JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk
+    JOIN filtered_items i ON ss.ss_item_sk = i.i_item_sk
+    JOIN store s ON ss.ss_store_sk = s.s_store_sk
+),
+aggregated_sales AS (
+    SELECT 
+-- ... (truncated)
+```
+
+## DAG Structure & Bottlenecks
+
+| Node | Role | Cost % |
+|------|------|-------:|
+| main_query |  | 0.0% |
+
+## Available Examples (Full Catalog)
+
+- **composite_decorrelate_union** (2.42xx) — Decorrelate multiple correlated EXISTS subqueries into pre-materialized DISTINCT
+- **date_cte_isolate** (4.00xx) — Extract date filtering into a separate CTE to enable predicate pushdown and redu
+- **decorrelate** (2.92xx) — Convert correlated subquery to separate CTE with GROUP BY, then JOIN
+- **deferred_window_aggregation** (1.36xx) — When multiple CTEs each perform GROUP BY + WINDOW (cumulative sum), then are joi
+- **dimension_cte_isolate** (1.93xx) — Pre-filter ALL dimension tables into CTEs before joining with fact table, not ju
+- **early_filter** (4.00xx) — Filter dimension tables FIRST, then join to fact tables to reduce expensive join
+- **intersect_to_exists** (1.83xx) — Convert INTERSECT subquery pattern to multiple EXISTS clauses for better join pl
+- **materialize_cte** (1.37xx) — Extract repeated subquery patterns into a CTE to avoid recomputation
+- **multi_date_range_cte** (2.35xx) — When query uses multiple date_dim aliases with different filters (d1, d2, d3), c
+- **multi_dimension_prefetch** (2.71xx) — Pre-filter multiple dimension tables (date + store) into separate CTEs before jo
+- **or_to_union** (3.17xx) — Split OR conditions on different columns into UNION ALL branches for better inde
+- **prefetch_fact_join** (3.77xx) — Pre-filter dimension table into CTE, then pre-join with fact table in second CTE
+- **pushdown** (2.11xx) — Push filters from outer query into CTEs/subqueries to reduce intermediate result
+- **shared_dimension_multi_channel** (1.30xx) — Extract shared dimension filters (date, item, promotion) into CTEs when multiple
+- **single_pass_aggregation** (4.47xx) — Consolidate multiple subqueries scanning the same table into a single CTE with c
+- **union_cte_split** (1.36xx) — Split a generic UNION ALL CTE into specialized CTEs when the main query filters 
+
+## Your Task
+
+Analyze the failed attempts and design a refined approach:
+
+1. **Failure Analysis**: Why did all attempts fall short? Be specific about mechanisms.
+2. **Common Patterns**: What did multiple workers try unsuccessfully?
+3. **Unexplored Space**: What optimization angles were missed entirely?
+4. **Refined Strategy**: Synthesize a NEW approach combining best insights.
+
+### Output Format (follow EXACTLY)
+
+```
+FAILURE_ANALYSIS:
+<Why all workers fell short — be specific about mechanisms>
+
+UNEXPLORED_OPPORTUNITIES:
+<What optimization approaches haven't been tried>
+
+REFINED_STRATEGY:
+<Concrete optimization approach for next attempt>
+
+EXAMPLES: <ex1>, <ex2>, <ex3>
+HINT: <specific guidance for the refined attempt>
+```

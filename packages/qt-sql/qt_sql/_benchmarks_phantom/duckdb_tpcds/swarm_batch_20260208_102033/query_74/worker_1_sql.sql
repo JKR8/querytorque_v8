@@ -1,0 +1,54 @@
+WITH store_sales_agg AS (
+    SELECT
+        c.c_customer_id AS customer_id,
+        c.c_first_name AS customer_first_name,
+        c.c_last_name AS customer_last_name,
+        d.d_year AS year,
+        STDDEV_SAMP(ss_ss_net_paid) AS year_total
+    FROM customer c
+    INNER JOIN store_sales ss ON c.c_customer_sk = ss.ss_customer_sk
+    INNER JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk
+    WHERE d.d_year IN (1999, 2000)
+    GROUP BY
+        c.c_customer_id,
+        c.c_first_name,
+        c.c_last_name,
+        d.d_year
+),
+web_sales_agg AS (
+    SELECT
+        c.c_customer_id AS customer_id,
+        c.c_first_name AS customer_first_name,
+        c.c_last_name AS customer_last_name,
+        d.d_year AS year,
+        STDDEV_SAMP(ws.ws_net_paid) AS year_total
+    FROM customer c
+    INNER JOIN web_sales ws ON c.c_customer_sk = ws.ws_bill_customer_sk
+    INNER JOIN date_dim d ON ws.ws_sold_date_sk = d.d_date_sk
+    WHERE d.d_year IN (1999, 2000)
+    GROUP BY
+        c.c_customer_id,
+        c.c_first_name,
+        c.c_last_name,
+        d.d_year
+)
+SELECT
+    s2.customer_id,
+    s2.customer_first_name,
+    s2.customer_last_name
+FROM store_sales_agg s1
+INNER JOIN store_sales_agg s2 ON s1.customer_id = s2.customer_id
+INNER JOIN web_sales_agg w1 ON s1.customer_id = w1.customer_id
+INNER JOIN web_sales_agg w2 ON s1.customer_id = w2.customer_id
+WHERE s1.year = 1999
+    AND s2.year = 2000
+    AND w1.year = 1999
+    AND w2.year = 2000
+    AND s1.year_total > 0
+    AND w1.year_total > 0
+    AND (w2.year_total / w1.year_total) > (s2.year_total / s1.year_total)
+ORDER BY
+    s2.customer_first_name,
+    s2.customer_id,
+    s2.customer_last_name
+LIMIT 100;

@@ -1,0 +1,45 @@
+WITH filtered_dates AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_date BETWEEN '2002-4-01' AND (CAST('2002-4-01' AS DATE) + INTERVAL '60' DAY)
+),
+filtered_addresses AS (
+  SELECT ca_address_sk
+  FROM customer_address
+  WHERE ca_state = 'WV'
+),
+filtered_call_centers AS (
+  SELECT cc_call_center_sk
+  FROM call_center
+  WHERE cc_county IN ('Ziebach County', 'Luce County', 'Richland County', 'Daviess County', 'Barrow County')
+),
+multi_warehouse_orders AS (
+  SELECT cs_order_number
+  FROM catalog_sales
+  GROUP BY cs_order_number
+  HAVING COUNT(DISTINCT cs_warehouse_sk) > 1
+),
+returned_orders AS (
+  SELECT DISTINCT cr_order_number
+  FROM catalog_returns
+),
+eligible_sales AS (
+  SELECT 
+    cs1.cs_order_number,
+    cs1.cs_ext_ship_cost,
+    cs1.cs_net_profit
+  FROM catalog_sales cs1
+  INNER JOIN filtered_dates d ON cs1.cs_ship_date_sk = d.d_date_sk
+  INNER JOIN filtered_addresses ca ON cs1.cs_ship_addr_sk = ca.ca_address_sk
+  INNER JOIN filtered_call_centers cc ON cs1.cs_call_center_sk = cc.cc_call_center_sk
+  INNER JOIN multi_warehouse_orders mwo ON cs1.cs_order_number = mwo.cs_order_number
+  LEFT JOIN returned_orders ro ON cs1.cs_order_number = ro.cr_order_number
+  WHERE ro.cr_order_number IS NULL
+)
+SELECT
+  COUNT(DISTINCT cs_order_number) AS "order count",
+  SUM(cs_ext_ship_cost) AS "total shipping cost",
+  SUM(cs_net_profit) AS "total net profit"
+FROM eligible_sales
+ORDER BY COUNT(DISTINCT cs_order_number)
+LIMIT 100

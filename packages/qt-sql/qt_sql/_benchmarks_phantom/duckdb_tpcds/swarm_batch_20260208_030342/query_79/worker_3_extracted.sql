@@ -1,0 +1,54 @@
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_dow = 1
+      AND d_year IN (1998, 1998 + 1, 1998 + 2)
+), filtered_stores AS (
+    SELECT s_store_sk, s_city
+    FROM store
+    WHERE s_number_employees BETWEEN 200 AND 295
+), filtered_hd AS (
+    SELECT hd_demo_sk
+    FROM household_demographics
+    WHERE hd_dep_count = 5 OR hd_vehicle_count > 4
+), prejoined_sales AS (
+    SELECT
+        ss_ticket_number,
+        ss_customer_sk,
+        ss_addr_sk,
+        s_city,
+        ss_coupon_amt,
+        ss_net_profit
+    FROM store_sales
+    INNER JOIN filtered_dates ON store_sales.ss_sold_date_sk = filtered_dates.d_date_sk
+    INNER JOIN filtered_stores ON store_sales.ss_store_sk = filtered_stores.s_store_sk
+    INNER JOIN filtered_hd ON store_sales.ss_hdemo_sk = filtered_hd.hd_demo_sk
+), aggregated_sales AS (
+    SELECT
+        ss_ticket_number,
+        ss_customer_sk,
+        s_city,
+        SUM(ss_coupon_amt) AS amt,
+        SUM(ss_net_profit) AS profit
+    FROM prejoined_sales
+    GROUP BY
+        ss_ticket_number,
+        ss_customer_sk,
+        ss_addr_sk,
+        s_city
+)
+SELECT
+    c_last_name,
+    c_first_name,
+    SUBSTRING(s_city, 1, 30),
+    ss_ticket_number,
+    amt,
+    profit
+FROM aggregated_sales
+INNER JOIN customer ON aggregated_sales.ss_customer_sk = customer.c_customer_sk
+ORDER BY
+    c_last_name,
+    c_first_name,
+    SUBSTRING(s_city, 1, 30),
+    profit
+LIMIT 100;

@@ -1,0 +1,53 @@
+WITH month_range AS (
+    SELECT DISTINCT
+        d_month_seq + 1 AS start_seq,
+        d_month_seq + 3 AS end_seq
+    FROM date_dim
+    WHERE d_year = 1998 AND d_moy = 5
+),
+my_customers AS (
+    SELECT DISTINCT
+        c.c_customer_sk,
+        c.c_current_addr_sk
+    FROM customer c
+    INNER JOIN (
+        SELECT
+            cs_sold_date_sk AS sold_date_sk,
+            cs_bill_customer_sk AS customer_sk,
+            cs_item_sk AS item_sk
+        FROM catalog_sales
+        UNION ALL
+        SELECT
+            ws_sold_date_sk AS sold_date_sk,
+            ws_bill_customer_sk AS customer_sk,
+            ws_item_sk AS item_sk
+        FROM web_sales
+    ) cs_or_ws_sales ON c.c_customer_sk = cs_or_ws_sales.customer_sk
+    INNER JOIN item i ON cs_or_ws_sales.item_sk = i.i_item_sk
+    INNER JOIN date_dim d ON cs_or_ws_sales.sold_date_sk = d.d_date_sk
+    WHERE i.i_category = 'Women'
+      AND i.i_class = 'maternity'
+      AND d.d_moy = 5
+      AND d.d_year = 1998
+),
+my_revenue AS (
+    SELECT
+        mc.c_customer_sk,
+        SUM(ss.ss_ext_sales_price) AS revenue
+    FROM my_customers mc
+    INNER JOIN customer_address ca ON mc.c_current_addr_sk = ca.ca_address_sk
+    INNER JOIN store s ON ca.ca_county = s.s_county AND ca.ca_state = s.s_state
+    INNER JOIN store_sales ss ON mc.c_customer_sk = ss.ss_customer_sk
+    INNER JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk
+    CROSS JOIN month_range mr
+    WHERE d.d_month_seq BETWEEN mr.start_seq AND mr.end_seq
+    GROUP BY mc.c_customer_sk
+)
+SELECT
+    CAST((revenue / 50) AS INT) AS segment,
+    COUNT(*) AS num_customers,
+    CAST((revenue / 50) AS INT) * 50 AS segment_base
+FROM my_revenue
+GROUP BY CAST((revenue / 50) AS INT)
+ORDER BY segment, num_customers
+LIMIT 100;

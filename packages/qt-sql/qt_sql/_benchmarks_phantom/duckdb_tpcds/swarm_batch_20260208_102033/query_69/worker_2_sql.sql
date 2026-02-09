@@ -1,0 +1,59 @@
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2000 AND d_moy BETWEEN 1 AND 1 + 2
+),
+qualified_customers AS (
+    SELECT 
+        c.c_customer_sk,
+        cd_gender,
+        cd_marital_status,
+        cd_education_status,
+        cd_purchase_estimate,
+        cd_credit_rating
+    FROM customer AS c
+    JOIN customer_address AS ca ON c.c_current_addr_sk = ca.ca_address_sk
+    JOIN customer_demographics ON cd_demo_sk = c.c_current_cdemo_sk
+    WHERE ca_state IN ('TX', 'VA', 'MI')
+      AND EXISTS (
+          SELECT 1
+          FROM store_sales
+          JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+          WHERE c.c_customer_sk = ss_customer_sk
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM web_sales
+          JOIN filtered_dates ON ws_sold_date_sk = d_date_sk
+          WHERE c.c_customer_sk = ws_bill_customer_sk
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM catalog_sales
+          JOIN filtered_dates ON cs_sold_date_sk = d_date_sk
+          WHERE c.c_customer_sk = cs_ship_customer_sk
+      )
+)
+SELECT
+    cd_gender,
+    cd_marital_status,
+    cd_education_status,
+    COUNT(*) AS cnt1,
+    cd_purchase_estimate,
+    COUNT(*) AS cnt2,
+    cd_credit_rating,
+    COUNT(*) AS cnt3
+FROM qualified_customers
+GROUP BY
+    cd_gender,
+    cd_marital_status,
+    cd_education_status,
+    cd_purchase_estimate,
+    cd_credit_rating
+ORDER BY
+    cd_gender,
+    cd_marital_status,
+    cd_education_status,
+    cd_purchase_estimate,
+    cd_credit_rating
+LIMIT 100

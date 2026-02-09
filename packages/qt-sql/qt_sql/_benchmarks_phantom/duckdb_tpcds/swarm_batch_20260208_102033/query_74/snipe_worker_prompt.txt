@@ -1,0 +1,765 @@
+## Optimization Strategy: refined_snipe
+
+**Your approach**: CONTEXT: Best result: W4 achieved 1.22x via novel_structural_transform. Your goal: optimize the ORIGINAL SQL to >=2.0x. Try a DIFFERENT approach.
+
+**Focus**: Apply the examples below in service of this strategy. Prioritize this specific approach over generic optimizations.
+
+---
+
+You are a SQL query rewrite engine for DuckDB v1.4.3.
+
+Your goal: rewrite the complete SQL query to maximize execution speed
+while preserving exact semantic equivalence (same rows, same columns,
+same ordering).
+
+You will receive the full query, its DAG structure showing how CTEs and
+subqueries connect, cost analysis per node, and reference examples of
+proven rewrites on structurally similar queries.
+You may restructure the query freely: create new CTEs, merge existing ones,
+push filters across node boundaries, or decompose subqueries.
+
+## Query: query_74_snipe
+
+```sql
+WITH year_total AS (
+  SELECT
+    c_customer_id AS customer_id,
+    c_first_name AS customer_first_name,
+    c_last_name AS customer_last_name,
+    d_year AS year,
+    STDDEV_SAMP(ss_net_paid) AS year_total,
+    's' AS sale_type
+  FROM customer, store_sales, date_dim
+  WHERE
+    c_customer_sk = ss_customer_sk
+    AND ss_sold_date_sk = d_date_sk
+    AND d_year IN (1999, 1999 + 1)
+  GROUP BY
+    c_customer_id,
+    c_first_name,
+    c_last_name,
+    d_year
+  UNION ALL
+  SELECT
+    c_customer_id AS customer_id,
+    c_first_name AS customer_first_name,
+    c_last_name AS customer_last_name,
+    d_year AS year,
+    STDDEV_SAMP(ws_net_paid) AS year_total,
+    'w' AS sale_type
+  FROM customer, web_sales, date_dim
+  WHERE
+    c_customer_sk = ws_bill_customer_sk
+    AND ws_sold_date_sk = d_date_sk
+    AND d_year IN (1999, 1999 + 1)
+  GROUP BY
+    c_customer_id,
+    c_first_name,
+    c_last_name,
+    d_year
+)
+SELECT
+  t_s_secyear.customer_id,
+  t_s_secyear.customer_first_name,
+  t_s_secyear.customer_last_name
+FROM year_total AS t_s_firstyear, year_total AS t_s_secyear, year_total AS t_w_firstyear, year_total AS t_w_secyear
+WHERE
+  t_s_secyear.customer_id = t_s_firstyear.customer_id
+  AND t_s_firstyear.customer_id = t_w_secyear.customer_id
+  AND t_s_firstyear.customer_id = t_w_firstyear.customer_id
+  AND t_s_firstyear.sale_type = 's'
+  AND t_w_firstyear.sale_type = 'w'
+  AND t_s_secyear.sale_type = 's'
+  AND t_w_secyear.sale_type = 'w'
+  AND t_s_firstyear.year = 1999
+  AND t_s_secyear.year = 1999 + 1
+  AND t_w_firstyear.year = 1999
+  AND t_w_secyear.year = 1999 + 1
+  AND t_s_firstyear.year_total > 0
+  AND t_w_firstyear.year_total > 0
+  AND CASE
+    WHEN t_w_firstyear.year_total > 0
+    THEN t_w_secyear.year_total / t_w_firstyear.year_total
+    ELSE NULL
+  END > CASE
+    WHEN t_s_firstyear.year_total > 0
+    THEN t_s_secyear.year_total / t_s_firstyear.year_total
+    ELSE NULL
+  END
+ORDER BY
+  2,
+  1,
+  3
+LIMIT 100
+```
+
+## Query Structure (DAG)
+
+### 1. year_total
+**Role**: CTE (Definition Order: 0)
+**Intent**: Compute per-customer yearly standard deviation of net paid for store and web channels in 1999 and 2000.
+**Stats**: 50% Cost | ~1k rows
+**Flags**: GROUP_BY, UNION_ALL
+**Outputs**: [customer_id, customer_first_name, customer_last_name, year, year_total, sale_type]
+**Dependencies**: customer, store_sales (join), date_dim (join), web_sales (join)
+**Joins**: c_customer_sk = ss_customer_sk | ss_sold_date_sk = d_date_sk
+**Filters**: d_year IN (1999, 1999 + 1)
+**Operators**: HASH_GROUP_BY, SEQ_SCAN[customer], SEQ_SCAN[store_sales], SEQ_SCAN[date_dim]
+**Key Logic (SQL)**:
+```sql
+SELECT
+  c_customer_id AS customer_id,
+  c_first_name AS customer_first_name,
+  c_last_name AS customer_last_name,
+  d_year AS year,
+  STDDEV_SAMP(ss_net_paid) AS year_total,
+  's' AS sale_type
+FROM customer, store_sales, date_dim
+WHERE
+  c_customer_sk = ss_customer_sk
+  AND ss_sold_date_sk = d_date_sk
+  AND d_year IN (1999, 1999 + 1)
+GROUP BY
+  c_customer_id,
+  c_first_name,
+  c_last_name,
+  d_year
+UNION ALL
+SELECT
+  c_customer_id AS customer_id,
+...
+```
+
+### 2. main_query
+**Role**: Root / Output (Definition Order: 1)
+**Intent**: Self-join customer/channel/year variability rows, require positive 1999 variability baselines, compare web versus store year-over-year ratios, and return matching customer names.
+**Stats**: 50% Cost | ~1k rows processed → 100 rows output
+**Flags**: GROUP_BY, ORDER_BY, LIMIT(100)
+**Outputs**: [customer_id, customer_first_name, customer_last_name] — ordered by 2 ASC, 1 ASC, 3 ASC
+**Dependencies**: year_total AS t_s_firstyear (join), year_total AS t_s_secyear (join), year_total AS t_w_firstyear (join), year_total AS t_w_secyear (join)
+**Joins**: t_s_secyear.customer_id = t_s_firstyear.customer_id | t_s_firstyear.customer_id = t_w_secyear.customer_id | t_s_firstyear.customer_id = t_w_firstyear.customer_id
+**Filters**: t_s_firstyear.sale_type = 's' | t_w_firstyear.sale_type = 'w' | t_s_secyear.sale_type = 's' | t_w_secyear.sale_type = 'w' | t_s_firstyear.year = 1999 | t_s_secyear.year = 1999 + 1 | t_w_firstyear.year = 1999 | t_w_secyear.year = 1999 + 1 | t_s_firstyear.year_total > 0 | t_w_firstyear.year_total > 0 | CASE WHEN t_w_firstyear.year_total > 0 THEN t_w_secyear.year_total / t_w_firstyear.year_total ELSE NULL END > CASE WHEN t_s_firstyear.year_total > 0 THEN t_s_secyear.year_total / t_s_firstyear.year_total ELSE NULL END
+**Operators**: HASH_GROUP_BY, HASH_JOIN, SEQ_SCAN[year_total], SEQ_SCAN[year_total], SEQ_SCAN[year_total]
+**Key Logic (SQL)**:
+```sql
+SELECT
+  t_s_secyear.customer_id,
+  t_s_secyear.customer_first_name,
+  t_s_secyear.customer_last_name
+FROM year_total AS t_s_firstyear, year_total AS t_s_secyear, year_total AS t_w_firstyear, year_total AS t_w_secyear
+WHERE
+  t_s_secyear.customer_id = t_s_firstyear.customer_id
+  AND t_s_firstyear.customer_id = t_w_secyear.customer_id
+  AND t_s_firstyear.customer_id = t_w_firstyear.customer_id
+  AND t_s_firstyear.sale_type = 's'
+  AND t_w_firstyear.sale_type = 'w'
+  AND t_s_secyear.sale_type = 's'
+  AND t_w_secyear.sale_type = 'w'
+  AND t_s_firstyear.year = 1999
+  AND t_s_secyear.year = 1999 + 1
+  AND t_w_firstyear.year = 1999
+  AND t_w_secyear.year = 1999 + 1
+  AND t_s_firstyear.year_total > 0
+  AND t_w_firstyear.year_total > 0
+  AND CASE
+...
+```
+
+### Edges
+- year_total → main_query
+- year_total → main_query
+- year_total → main_query
+- year_total → main_query
+
+
+## Benchmark Learnings
+
+### Effective Transforms
+- **decorrelate**: 25% success rate, 2.50x avg speedup (4 attempts)
+- **materialize_cte**: 43% success rate, 1.56x avg speedup (7 attempts)
+
+### Known Anti-Patterns (avoid these)
+- **decorrelate**: 25% success rate (4 attempts) — usually causes regressions
+
+### Example Effectiveness
+- **early_filter**: 67% led to success (3 recommendations)
+- **dimension_cte_isolate**: 33% led to success (3 recommendations)
+- **prefetch_fact_join**: 33% led to success (3 recommendations)
+- **single_pass_aggregation**: 0% led to success (3 recommendations)
+
+### Common Error Patterns
+- **execution**: 4 occurrences
+
+
+## Reference Examples
+
+The following examples are for **pattern reference only**. Do not copy their table names, column names, or literal values into your rewrite. Use only the schema and tables from the target query above.
+
+### 1. union_cte_split (1.36x)
+
+**Principle:** CTE Specialization: when a generic CTE is scanned multiple times with different filters (e.g., by year), split it into specialized CTEs that embed the filter in their definition. Each specialized CTE processes only its relevant subset, eliminating redundant scans.
+
+**BEFORE (slow):**
+```sql
+with year_total as (
+ select c_customer_id customer_id
+       ,c_first_name customer_first_name
+       ,c_last_name customer_last_name
+       ,d_year as year
+       ,stddev_samp(ss_net_paid) year_total
+       ,'s' sale_type
+ from customer
+     ,store_sales
+     ,date_dim
+ where c_customer_sk = ss_customer_sk
+   and ss_sold_date_sk = d_date_sk
+   and d_year in (1999,1999+1)
+ group by c_customer_id
+         ,c_first_name
+         ,c_last_name
+         ,d_year
+ union all
+ select c_customer_id customer_id
+       ,c_first_name customer_first_name
+       ,c_last_name customer_last_name
+       ,d_year as year
+       ,stddev_samp(ws_net_paid) year_total
+       ,'w' sale_type
+ from customer
+     ,web_sales
+     ,date_dim
+ where c_customer_sk = ws_bill_customer_sk
+   and ws_sold_date_sk = d_date_sk
+   and d_year in (1999,1999+1)
+ group by c_customer_id
+         ,c_first_name
+         ,c_last_name
+         ,d_year
+         )
+  select
+        t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name
+ from year_total t_s_firstyear
+     ,year_total t_s_secyear
+     ,year_total t_w_firstyear
+     ,year_total t_w_secyear
+ where t_s_secyear.customer_id = t_s_firstyear.customer_id
+         and t_s_firstyear.customer_id = t_w_secyear.customer_id
+         and t_s_firstyear.customer_id = t_w_firstyear.customer_id
+         and t_s_firstyear.sale_type = 's'
+         and t_w_firstyear.sale_type = 'w'
+         and t_s_secyear.sale_type = 's'
+         and t_w_secyear.sale_type = 'w'
+         and t_s_firstyear.year = 1999
+         and t_s_secyear.year = 1999+1
+         and t_w_firstyear.year = 1999
+         and t_w_secyear.year = 1999+1
+         and t_s_firstyear.year_total > 0
+         and t_w_firstyear.year_total > 0
+         and case when t_w_firstyear.year_total > 0 then t_w_secyear.year_total / t_w_firstyear.year_total else null end
+           > case when t_s_firstyear.year_total > 0 then t_s_secyear.year_total / t_s_firstyear.year_total else null end
+ order by 2,1,3
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[year_1998_dates]:
+```sql
+SELECT d_date_sk, d_week_seq, d_day_name FROM date_dim WHERE d_year = 1998
+```
+[year_1999_dates]:
+```sql
+SELECT d_date_sk, d_week_seq, d_day_name FROM date_dim WHERE d_year = 1999
+```
+[wswscs_1998]:
+```sql
+SELECT d_week_seq, SUM(CASE WHEN d_day_name='Sunday' THEN sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN d_day_name='Monday' THEN sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN d_day_name='Tuesday' THEN sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN d_day_name='Wednesday' THEN sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN d_day_name='Thursday' THEN sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN d_day_name='Friday' THEN sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN d_day_name='Saturday' THEN sales_price ELSE NULL END) AS sat_sales FROM (SELECT ws_sold_date_sk AS sold_date_sk, ws_ext_sales_price AS sales_price FROM web_sales UNION ALL SELECT cs_sold_date_sk AS sold_date_sk, cs_ext_sales_price AS sales_price FROM catalog_sales) wscs JOIN year_1998_dates ON d_date_sk = sold_date_sk GROUP BY d_week_seq
+```
+[wswscs_1999]:
+```sql
+SELECT d_week_seq, SUM(CASE WHEN d_day_name='Sunday' THEN sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN d_day_name='Monday' THEN sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN d_day_name='Tuesday' THEN sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN d_day_name='Wednesday' THEN sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN d_day_name='Thursday' THEN sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN d_day_name='Friday' THEN sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN d_day_name='Saturday' THEN sales_price ELSE NULL END) AS sat_sales FROM (SELECT ws_sold_date_sk AS sold_date_sk, ws_ext_sales_price AS sales_price FROM web_sales UNION ALL SELECT cs_sold_date_sk AS sold_date_sk, cs_ext_sales_price AS sales_price FROM catalog_sales) wscs JOIN year_1999_dates ON d_date_sk = sold_date_sk GROUP BY d_week_seq
+```
+[main_query]:
+```sql
+SELECT y.d_week_seq AS d_week_seq1, ROUND(y.sun_sales / NULLIF(z.sun_sales, 0), 2), ROUND(y.mon_sales / NULLIF(z.mon_sales, 0), 2), ROUND(y.tue_sales / NULLIF(z.tue_sales, 0), 2), ROUND(y.wed_sales / NULLIF(z.wed_sales, 0), 2), ROUND(y.thu_sales / NULLIF(z.thu_sales, 0), 2), ROUND(y.fri_sales / NULLIF(z.fri_sales, 0), 2), ROUND(y.sat_sales / NULLIF(z.sat_sales, 0), 2) FROM wswscs_1998 y JOIN wswscs_1999 z ON y.d_week_seq = z.d_week_seq - 53 ORDER BY y.d_week_seq
+```
+
+### 2. intersect_to_exists (1.83x)
+
+**Principle:** Semi-Join Short-Circuit: replace INTERSECT with EXISTS to avoid full materialization and sorting. INTERSECT must compute complete result sets before intersecting; EXISTS stops at the first match per row, enabling semi-join optimizations.
+
+**BEFORE (slow):**
+```sql
+with  cross_items as
+ (select i_item_sk ss_item_sk
+ from item,
+ (select iss.i_brand_id brand_id
+     ,iss.i_class_id class_id
+     ,iss.i_category_id category_id
+ from store_sales
+     ,item iss
+     ,date_dim d1
+ where ss_item_sk = iss.i_item_sk
+   and ss_sold_date_sk = d1.d_date_sk
+   and d1.d_year between 2000 AND 2000 + 2
+ intersect 
+ select ics.i_brand_id
+     ,ics.i_class_id
+     ,ics.i_category_id
+ from catalog_sales
+     ,item ics
+     ,date_dim d2
+ where cs_item_sk = ics.i_item_sk
+   and cs_sold_date_sk = d2.d_date_sk
+   and d2.d_year between 2000 AND 2000 + 2
+ intersect
+ select iws.i_brand_id
+     ,iws.i_class_id
+     ,iws.i_category_id
+ from web_sales
+     ,item iws
+     ,date_dim d3
+ where ws_item_sk = iws.i_item_sk
+   and ws_sold_date_sk = d3.d_date_sk
+   and d3.d_year between 2000 AND 2000 + 2)
+ where i_brand_id = brand_id
+      and i_class_id = class_id
+      and i_category_id = category_id
+),
+ avg_sales as
+ (select avg(quantity*list_price) average_sales
+  from (select ss_quantity quantity
+             ,ss_list_price list_price
+       from store_sales
+           ,date_dim
+       where ss_sold_date_sk = d_date_sk
+         and d_year between 2000 and 2000 + 2
+       union all 
+       select cs_quantity quantity 
+             ,cs_list_price list_price
+       from catalog_sales
+           ,date_dim
+       where cs_sold_date_sk = d_date_sk
+         and d_year between 2000 and 2000 + 2 
+       union all
+       select ws_quantity quantity
+             ,ws_list_price list_price
+       from web_sales
+           ,date_dim
+       where ws_sold_date_sk = d_date_sk
+         and d_year between 2000 and 2000 + 2) x)
+  select channel, i_brand_id,i_class_id,i_category_id,sum(sales), sum(number_sales)
+ from(
+       select 'store' channel, i_brand_id,i_class_id
+             ,i_category_id,sum(ss_quantity*ss_list_price) sales
+             , count(*) number_sales
+       from store_sales
+           ,item
+           ,date_dim
+       where ss_item_sk in (select ss_item_sk from cross_items)
+         and ss_item_sk = i_item_sk
+         and ss_sold_date_sk = d_date_sk
+         and d_year = 2000+2 
+         and d_moy = 11
+       group by i_brand_id,i_class_id,i_category_id
+       having sum(ss_quantity*ss_list_price) > (select average_sales from avg_sales)
+       union all
+       select 'catalog' channel, i_brand_id,i_class_id,i_category_id, sum(cs_quantity*cs_list_price) sales, count(*) number_sales
+       from catalog_sales
+           ,item
+           ,date_dim
+       where cs_item_sk in (select ss_item_sk from cross_items)
+         and cs_item_sk = i_item_sk
+         and cs_sold_date_sk = d_date_sk
+         and d_year = 2000+2 
+         and d_moy = 11
+       group by i_brand_id,i_class_id,i_category_id
+       having sum(cs_quantity*cs_list_price) > (select average_sales from avg_sales)
+       union all
+       select 'web' channel, i_brand_id,i_class_id,i_category_id, sum(ws_quantity*ws_list_price) sales , count(*) number_sales
+       from web_sales
+           ,item
+           ,date_dim
+       where ws_item_sk in (select ss_item_sk from cross_items)
+         and ws_item_sk = i_item_sk
+         and ws_sold_date_sk = d_date_sk
+         and d_year = 2000+2
+         and d_moy = 11
+       group by i_brand_id,i_class_id,i_category_id
+       having sum(ws_quantity*ws_list_price) > (select average_sales from avg_sales)
+ ) y
+ group by rollup (channel, i_brand_id,i_class_id,i_category_id)
+ order by channel,i_brand_id,i_class_id,i_category_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[cross_items_flat]:
+```sql
+SELECT i.i_item_sk AS ss_item_sk FROM item i WHERE EXISTS (SELECT 1 FROM store_sales, item iss, date_dim d1 WHERE ss_item_sk = iss.i_item_sk AND ss_sold_date_sk = d1.d_date_sk AND d1.d_year BETWEEN 1999 AND 2001 AND iss.i_brand_id = i.i_brand_id AND iss.i_class_id = i.i_class_id AND iss.i_category_id = i.i_category_id) AND EXISTS (SELECT 1 FROM catalog_sales, item ics, date_dim d2 WHERE cs_item_sk = ics.i_item_sk AND cs_sold_date_sk = d2.d_date_sk AND d2.d_year BETWEEN 1999 AND 2001 AND ics.i_brand_id = i.i_brand_id AND ics.i_class_id = i.i_class_id AND ics.i_category_id = i.i_category_id) AND EXISTS (SELECT 1 FROM web_sales, item iws, date_dim d3 WHERE ws_item_sk = iws.i_item_sk AND ws_sold_date_sk = d3.d_date_sk AND d3.d_year BETWEEN 1999 AND 2001 AND iws.i_brand_id = i.i_brand_id AND iws.i_class_id = i.i_class_id AND iws.i_category_id = i.i_category_id)
+```
+[main_query]:
+```sql
+SELECT ... FROM ... WHERE i_item_sk IN (SELECT ss_item_sk FROM cross_items_flat) ...
+```
+
+### 3. shared_dimension_multi_channel (1.30x)
+
+**Principle:** Shared Dimension Extraction: when multiple channel CTEs (store/catalog/web) apply identical dimension filters, extract those shared filters into one CTE and reference it from each channel. Avoids redundant dimension scans.
+
+**BEFORE (slow):**
+```sql
+with ssr as
+ (select  s_store_id as store_id,
+          sum(ss_ext_sales_price) as sales,
+          sum(coalesce(sr_return_amt, 0)) as "returns",
+          sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit
+  from store_sales left outer join store_returns on
+         (ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number),
+     date_dim,
+     store,
+     item,
+     promotion
+ where ss_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-28' as date) 
+                  and (cast('1998-08-28' as date) + INTERVAL 30 DAY)
+       and ss_store_sk = s_store_sk
+       and ss_item_sk = i_item_sk
+       and i_current_price > 50
+       and ss_promo_sk = p_promo_sk
+       and p_channel_tv = 'N'
+ group by s_store_id)
+ ,
+ csr as
+ (select  cp_catalog_page_id as catalog_page_id,
+          sum(cs_ext_sales_price) as sales,
+          sum(coalesce(cr_return_amount, 0)) as "returns",
+          sum(cs_net_profit - coalesce(cr_net_loss, 0)) as profit
+  from catalog_sales left outer join catalog_returns on
+         (cs_item_sk = cr_item_sk and cs_order_number = cr_order_number),
+     date_dim,
+     catalog_page,
+     item,
+     promotion
+ where cs_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-28' as date)
+                  and (cast('1998-08-28' as date) + INTERVAL 30 DAY)
+        and cs_catalog_page_sk = cp_catalog_page_sk
+       and cs_item_sk = i_item_sk
+       and i_current_price > 50
+       and cs_promo_sk = p_promo_sk
+       and p_channel_tv = 'N'
+group by cp_catalog_page_id)
+ ,
+ wsr as
+ (select  web_site_id,
+          sum(ws_ext_sales_price) as sales,
+          sum(coalesce(wr_return_amt, 0)) as "returns",
+          sum(ws_net_profit - coalesce(wr_net_loss, 0)) as profit
+  from web_sales left outer join web_returns on
+         (ws_item_sk = wr_item_sk and ws_order_number = wr_order_number),
+     date_dim,
+     web_site,
+     item,
+     promotion
+ where ws_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-28' as date)
+                  and (cast('1998-08-28' as date) + INTERVAL 30 DAY)
+        and ws_web_site_sk = web_site_sk
+       and ws_item_sk = i_item_sk
+       and i_current_price > 50
+       and ws_promo_sk = p_promo_sk
+       and p_channel_tv = 'N'
+group by web_site_id)
+  select channel
+        , id
+        , sum(sales) as sales
+        , sum("returns") as "returns"
+        , sum(profit) as profit
+ from 
+ (select 'store channel' as channel
+        , 'store' || store_id as id
+        , sales
+        , "returns"
+        , profit
+ from   ssr
+ union all
+ select 'catalog channel' as channel
+        , 'catalog_page' || catalog_page_id as id
+        , sales
+        , "returns"
+        , profit
+ from  csr
+ union all
+ select 'web channel' as channel
+        , 'web_site' || web_site_id as id
+        , sales
+        , "returns"
+        , profit
+ from   wsr
+ ) x
+ group by rollup (channel, id)
+ order by channel
+         ,id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL '30' DAY)
+```
+[filtered_items]:
+```sql
+SELECT i_item_sk FROM item WHERE i_current_price > 50
+```
+[filtered_promotions]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N'
+```
+[prefiltered_store_sales]:
+```sql
+SELECT ss_item_sk, ss_store_sk, ss_ticket_number, ss_ext_sales_price, ss_net_profit FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN filtered_items ON ss_item_sk = i_item_sk JOIN filtered_promotions ON ss_promo_sk = p_promo_sk
+```
+[prefiltered_web_sales]:
+```sql
+SELECT ws_item_sk, ws_web_site_sk, ws_order_number, ws_ext_sales_price, ws_net_profit FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk JOIN filtered_items ON ws_item_sk = i_item_sk JOIN filtered_promotions ON ws_promo_sk = p_promo_sk
+```
+[ssr]:
+```sql
+SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS returns, SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit FROM prefiltered_store_sales LEFT OUTER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) JOIN store ON ss_store_sk = s_store_sk GROUP BY s_store_id
+```
+[wsr]:
+```sql
+SELECT web_site_id, SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS returns, SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit FROM prefiltered_web_sales LEFT OUTER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number) JOIN web_site ON ws_web_site_sk = web_site_sk GROUP BY web_site_id
+```
+
+### 4. multi_date_range_cte (2.35x)
+
+**Principle:** Early Selection per Alias: when a query joins the same dimension table multiple times with different filters (d1, d2, d3), create separate CTEs for each filter and pre-join with fact tables to reduce rows entering the main join.
+
+**BEFORE (slow):**
+```sql
+select  
+     i_item_id
+    ,i_item_desc
+    ,s_store_id
+    ,s_store_name
+    ,avg(ss_quantity)        as store_sales_quantity
+    ,avg(sr_return_quantity) as store_returns_quantity
+    ,avg(cs_quantity)        as catalog_sales_quantity
+ from
+    store_sales
+   ,store_returns
+   ,catalog_sales
+   ,date_dim             d1
+   ,date_dim             d2
+   ,date_dim             d3
+   ,store
+   ,item
+ where
+     d1.d_moy               = 4 
+ and d1.d_year              = 1999
+ and d1.d_date_sk           = ss_sold_date_sk
+ and i_item_sk              = ss_item_sk
+ and s_store_sk             = ss_store_sk
+ and ss_customer_sk         = sr_customer_sk
+ and ss_item_sk             = sr_item_sk
+ and ss_ticket_number       = sr_ticket_number
+ and sr_returned_date_sk    = d2.d_date_sk
+ and d2.d_moy               between 4 and  4 + 3 
+ and d2.d_year              = 1999
+ and sr_customer_sk         = cs_bill_customer_sk
+ and sr_item_sk             = cs_item_sk
+ and cs_sold_date_sk        = d3.d_date_sk     
+ and d3.d_year              in (1999,1999+1,1999+2)
+ group by
+    i_item_id
+   ,i_item_desc
+   ,s_store_id
+   ,s_store_name
+ order by
+    i_item_id 
+   ,i_item_desc
+   ,s_store_id
+   ,s_store_name
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[d1_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_moy = 9 AND d_year = 1999
+```
+[d2_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_moy BETWEEN 9 AND 12 AND d_year = 1999
+```
+[d3_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year IN (1999, 2000, 2001)
+```
+[filtered_store_sales]:
+```sql
+SELECT ss_item_sk, ss_customer_sk, ss_ticket_number, ss_store_sk, ss_quantity FROM store_sales JOIN d1_dates ON store_sales.ss_sold_date_sk = d1_dates.d_date_sk
+```
+[filtered_store_returns]:
+```sql
+SELECT sr_item_sk, sr_customer_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN d2_dates ON store_returns.sr_returned_date_sk = d2_dates.d_date_sk
+```
+[filtered_catalog_sales]:
+```sql
+SELECT cs_item_sk, cs_bill_customer_sk, cs_quantity FROM catalog_sales JOIN d3_dates ON catalog_sales.cs_sold_date_sk = d3_dates.d_date_sk
+```
+[main_query]:
+```sql
+SELECT i.i_item_id, i.i_item_desc, s.s_store_id, s.s_store_name, SUM(fss.ss_quantity) AS store_sales_quantity, SUM(fsr.sr_return_quantity) AS store_returns_quantity, SUM(fcs.cs_quantity) AS catalog_sales_quantity FROM filtered_store_sales AS fss JOIN filtered_store_returns AS fsr ON fss.ss_customer_sk = fsr.sr_customer_sk AND fss.ss_item_sk = fsr.sr_item_sk AND fss.ss_ticket_number = fsr.sr_ticket_number JOIN filtered_catalog_sales AS fcs ON fsr.sr_customer_sk = fcs.cs_bill_customer_sk AND fsr.sr_item_sk = fcs.cs_item_sk JOIN store AS s ON fss.ss_store_sk = s.s_store_sk JOIN item AS i ON fss.ss_item_sk = i.i_item_sk GROUP BY i.i_item_id, i.i_item_desc, s.s_store_id, s.s_store_name ORDER BY i.i_item_id, i.i_item_desc, s.s_store_id, s.s_store_name LIMIT 100
+```
+
+### 5. decorrelate (2.92x)
+
+**Principle:** Decorrelation: convert correlated subqueries to standalone CTEs with GROUP BY, then JOIN. Correlated subqueries re-execute per outer row; a pre-computed CTE executes once.
+
+**BEFORE (slow):**
+```sql
+with customer_total_return as
+(select sr_customer_sk as ctr_customer_sk
+,sr_store_sk as ctr_store_sk
+,sum(SR_FEE) as ctr_total_return
+from store_returns
+,date_dim
+where sr_returned_date_sk = d_date_sk
+and d_year =2000
+group by sr_customer_sk
+,sr_store_sk)
+ select c_customer_id
+from customer_total_return ctr1
+,store
+,customer
+where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2
+from customer_total_return ctr2
+where ctr1.ctr_store_sk = ctr2.ctr_store_sk)
+and s_store_sk = ctr1.ctr_store_sk
+and s_state = 'SD'
+and ctr1.ctr_customer_sk = c_customer_sk
+order by c_customer_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_returns]:
+```sql
+SELECT sr.sr_customer_sk, sr.sr_store_sk, sr.sr_fee FROM store_returns sr JOIN date_dim d ON sr.sr_returned_date_sk = d.d_date_sk JOIN store s ON sr.sr_store_sk = s.s_store_sk WHERE d.d_year = 2000 AND s.s_state = 'SD'
+```
+[customer_total_return]:
+```sql
+SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(sr_fee) AS ctr_total_return FROM filtered_returns GROUP BY sr_customer_sk, sr_store_sk
+```
+[store_avg_return]:
+```sql
+SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk
+```
+[main_query]:
+```sql
+SELECT c.c_customer_id FROM customer_total_return ctr1 JOIN store_avg_return sar ON ctr1.ctr_store_sk = sar.ctr_store_sk JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk WHERE ctr1.ctr_total_return > sar.avg_return_threshold ORDER BY c.c_customer_id LIMIT 100
+```
+
+## Regression Warnings
+
+The following transforms were attempted on structurally similar queries
+and caused performance regressions. Do NOT repeat these patterns.
+
+### Warning 1: pushdown on q74 (0.68xx)
+**Anti-pattern:** When splitting a UNION CTE by year, you MUST remove or replace the original UNION CTE. Keeping both the split and original versions causes redundant materialization and extreme cardinality misestimates.
+**Why it regressed:** Created year-specific CTEs (store_sales_1999, store_sales_2000, etc.) but KEPT the original year_total union CTE alongside them. The optimizer materializes both the split versions and the original union, resulting in redundant computation. Projection cardinality estimates show 10^16x errors from the confused CTE graph.
+
+### Warning 2: pushdown on q31 (0.49xx)
+**Anti-pattern:** When creating filtered versions of existing CTEs, always REMOVE the original unfiltered CTEs. Keeping both causes redundant materialization and 1000x+ cardinality misestimates on self-joins.
+**Why it regressed:** Created both filtered (store_sales_agg, web_sales_agg) AND original (ss, ws) versions of the same aggregations. The query does a 6-way self-join matching quarterly patterns (Q1->Q2->Q3). Duplicate CTEs doubled materialization and confused the optimizer's cardinality estimates for the multi-self-join.
+
+
+## Constraints
+
+### CRITICAL — Correctness Guards
+
+**COMPLETE_OUTPUT**
+The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original.
+
+**CTE_COLUMN_COMPLETENESS**
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
+**KEEP_EXISTS_AS_EXISTS**
+Preserve EXISTS/NOT EXISTS subqueries as-is. Do NOT convert them to IN/NOT IN or to JOINs — this risks NULL-handling semantic changes and can introduce duplicate rows.
+
+**LITERAL_PRESERVATION**
+CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+
+**NO_MATERIALIZE_EXISTS**
+Keep EXISTS and NOT EXISTS as-is — they use semi-join short-circuiting that stops scanning after the first match. Converting them to materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)) forces a full table scan, which is catastrophically slower (0.14x observed on Q16). When you see EXISTS, preserve it.
+
+**SEMANTIC_EQUIVALENCE**
+The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set — even by one row, one column, or a different sort order — is WRONG and will be REJECTED.
+
+### HIGH — Performance and Style Rules
+
+**MIN_BASELINE_THRESHOLD**
+If the query execution plan shows very fast runtime (under 100ms), be conservative with CTE-based transforms. Each CTE adds materialization overhead (hash table creation, intermediate result storage). On fast queries, this overhead can exceed the filtering benefit. Prefer minimal changes or no change over adding multiple CTEs to an already-fast query.
+
+**NO_UNFILTERED_DIMENSION_CTE**
+Every CTE you create must include a WHERE clause that actually reduces row count. Selecting fewer columns is not filtering — the CTE still materializes every row. If a dimension table has no predicate to push down, leave it as a direct join in the main query instead of wrapping it in a CTE.
+
+**OR_TO_UNION_GUARD**
+Only apply or_to_union when (a) the OR branches involve different tables or fundamentally different access paths — never when all branches filter the same column (e.g., t_hour ranges), since the optimizer already handles same-column ORs efficiently in a single scan — and (b) the result is 3 or fewer UNION ALL branches. Nested ORs that would expand into 4+ branches (e.g., 3 conditions x 3 values = 9 combinations) must be left as-is. Violating these rules causes 0.23x–0.59x regressions from multiplied fact table scans.
+
+**REMOVE_REPLACED_CTES**
+When creating replacement CTEs, overwrite the original by using the same node_id in your rewrite_sets, or ensure the original is removed from the WITH clause. Every CTE in the final query should be actively used — dead CTEs still get materialized and waste resources (caused 0.49x on Q31, 0.68x on Q74).
+
+**EXPLICIT_JOINS**
+Convert comma-separated implicit joins to explicit JOIN ... ON syntax. This gives the optimizer better join-order freedom.
+
+### CRITICAL — Correctness Guards (repeated for emphasis)
+
+**COMPLETE_OUTPUT**
+The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original.
+
+**CTE_COLUMN_COMPLETENESS**
+CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+
+**KEEP_EXISTS_AS_EXISTS**
+Preserve EXISTS/NOT EXISTS subqueries as-is. Do NOT convert them to IN/NOT IN or to JOINs — this risks NULL-handling semantic changes and can introduce duplicate rows.
+
+**LITERAL_PRESERVATION**
+CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+
+**NO_MATERIALIZE_EXISTS**
+Keep EXISTS and NOT EXISTS as-is — they use semi-join short-circuiting that stops scanning after the first match. Converting them to materialized CTEs (e.g., WITH cte AS (SELECT DISTINCT ... FROM large_table)) forces a full table scan, which is catastrophically slower (0.14x observed on Q16). When you see EXISTS, preserve it.
+
+**SEMANTIC_EQUIVALENCE**
+The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set — even by one row, one column, or a different sort order — is WRONG and will be REJECTED.
+
+## Output
+
+Return the complete rewritten SQL query. The query must be syntactically
+valid and ready to execute.
+
+### Column Completeness Contract
+
+Your rewritten query MUST produce **exactly** these output columns (same names, same order):
+
+  1. `customer_id`
+  2. `customer_first_name`
+  3. `customer_last_name`
+
+Do NOT add, remove, or rename any columns. The result set schema must be identical to the original query.
+
+```sql
+-- Your rewritten query here
+```
+
+After the SQL, briefly explain what you changed:
+
+```
+Changes: <1-2 sentence summary of the rewrite>
+Expected speedup: <estimate>
+```
+
+Now output your rewritten SQL:
