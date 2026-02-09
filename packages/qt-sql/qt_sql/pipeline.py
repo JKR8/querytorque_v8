@@ -1147,7 +1147,7 @@ class Pipeline:
         # so we parse with parse_briefing_response and convert the shared
         # sections into the flat text format that Prompter.build_prompt() expects.
         briefing = parse_briefing_response(raw_response)
-        formatted = _format_briefing_as_expert_analysis(briefing)
+        formatted = self._format_briefing_as_expert_analysis(briefing)
 
         # Check if analyst wants different examples (from WORKER 1's EXAMPLES field)
         overrides = parse_example_overrides(raw_response)
