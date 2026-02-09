@@ -20,11 +20,44 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .briefing_checks import build_analyst_section_checklist
+import yaml
+
+from .briefing_checks import (
+    build_analyst_section_checklist,
+    build_expert_section_checklist,
+    build_oneshot_section_checklist,
+)
 
 logger = logging.getLogger(__name__)
+
+ALGO_DIR = Path(__file__).resolve().parent.parent / "algorithms"
+
+
+@lru_cache(maxsize=16)
+def _load_algorithm(name: str) -> Optional[str]:
+    """Load a prompt-level algorithm YAML and render it as concise prompt text."""
+    path = ALGO_DIR / f"{name}.yaml"
+    if not path.exists():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text())
+    except Exception as e:
+        logger.warning(f"Failed to load algorithm {name}: {e}")
+        return None
+
+    lines = [f"### Algorithm: {data.get('name', name)}"]
+    lines.append("")
+    for rule in data.get("rules", []):
+        lines.append(f"{rule['id']}. **{rule['trigger']}** — {rule['action'].strip()}")
+        lines.append("")
+    priority = data.get("priority", "")
+    if priority:
+        lines.append(f"**Priority**: {priority.strip()}")
+    return "\n".join(lines)
 
 
 # ── EXPLAIN plan formatter ──────────────────────────────────────────────
@@ -652,11 +685,14 @@ def build_analyst_briefing_prompt(
     engine_profile: Optional[Dict[str, Any]] = None,
     resource_envelope: Optional[str] = None,
     exploit_algorithm_text: Optional[str] = None,
+    plan_scanner_text: Optional[str] = None,
+    mode: str = "swarm",
 ) -> str:
-    """Build the V2 analyst briefing prompt.
+    """Build the analyst briefing prompt for swarm, expert, or oneshot mode.
 
-    The analyst receives ALL available information and produces a structured
-    briefing for 4 workers. This is the only call that sees the full picture.
+    All modes share the same data sections (EXPLAIN, DAG, examples, constraints,
+    etc.). What varies: role framing, output format, strategy rules, and
+    exploration budget.
 
     Args:
         query_id: Query identifier (e.g., 'query_74')
@@ -678,25 +714,57 @@ def build_analyst_briefing_prompt(
         resource_envelope: System resource envelope text for PG workers (may be None)
         exploit_algorithm_text: Evidence-based exploit algorithm YAML from frontier
             probing (may be None). When present, replaces engine profile section.
+        plan_scanner_text: Pre-computed plan-space scanner results for PG (may be None).
+            Shows what happens when planner flags are toggled via SET LOCAL.
+        mode: Prompt mode — "swarm" (4 workers), "expert" (1 worker), or "oneshot"
+            (analyze + produce SQL directly). Default "swarm".
 
     Returns:
         Complete analyst prompt string (~3000-5000 tokens input)
     """
+    if mode not in ("swarm", "expert", "oneshot"):
+        raise ValueError(f"Invalid mode: {mode!r}. Must be 'swarm', 'expert', or 'oneshot'.")
     lines: list[str] = []
 
     # ── 1. Role ──────────────────────────────────────────────────────────
-    lines.append(
-        "You are a senior query optimization architect. Your job is to deeply "
-        "analyze a SQL query and produce a structured briefing for 4 specialist "
-        "workers who will each write a different optimized version."
-    )
-    lines.append("")
-    lines.append(
-        "You are the ONLY call that sees all the data: EXPLAIN plans, DAG costs, "
-        "full constraint list, global knowledge, and the complete example catalog. "
-        "The workers will only see what YOU put in their briefings. "
-        "Your output quality directly determines their success."
-    )
+    if mode == "swarm":
+        lines.append(
+            "You are a senior query optimization architect. Your job is to deeply "
+            "analyze a SQL query and produce a structured briefing for 4 specialist "
+            "workers who will each write a different optimized version."
+        )
+        lines.append("")
+        lines.append(
+            "You are the ONLY call that sees all the data: EXPLAIN plans, DAG costs, "
+            "full constraint list, global knowledge, and the complete example catalog. "
+            "The workers will only see what YOU put in their briefings. "
+            "Your output quality directly determines their success."
+        )
+    elif mode == "expert":
+        lines.append(
+            "You are a senior query optimization architect. Your job is to deeply "
+            "analyze a SQL query and produce a structured briefing for a single "
+            "specialist worker who will write the best possible optimized version."
+        )
+        lines.append("")
+        lines.append(
+            "You are the ONLY call that sees all the data: EXPLAIN plans, DAG costs, "
+            "full constraint list, global knowledge, and the complete example catalog. "
+            "The worker will only see what YOU put in the briefing. "
+            "Your output quality directly determines success."
+        )
+    elif mode == "oneshot":
+        lines.append(
+            "You are a senior query optimization architect. Your job is to deeply "
+            "analyze a SQL query, determine the single best optimization strategy, "
+            "and then produce the optimized SQL directly."
+        )
+        lines.append("")
+        lines.append(
+            "You have all the data: EXPLAIN plans, DAG costs, full constraint list, "
+            "global knowledge, and the complete example catalog. Analyze thoroughly, "
+            "then implement the best strategy as working SQL."
+        )
     lines.append("")
 
     # ── 2. SQL with line numbers ─────────────────────────────────────────
@@ -771,6 +839,17 @@ def build_analyst_briefing_prompt(
         )
         lines.append("")
 
+    # ── 3.5. Plan-Space Scanner Intelligence ─────────────────────────────
+    if plan_scanner_text:
+        lines.append("## Plan-Space Scanner Intelligence")
+        lines.append("")
+        lines.append(plan_scanner_text)
+        lines.append("")
+        algo_text = _load_algorithm("plan_scanner")
+        if algo_text:
+            lines.append(algo_text)
+            lines.append("")
+
     # ── 4. DAG node cards ────────────────────────────────────────────────
     lines.append("## Query Structure (DAG)")
     lines.append("")
@@ -802,11 +881,8 @@ def build_analyst_briefing_prompt(
                 "dependencies. Do NOT re-derive what is already stated above."
             )
             lines.append("")
-    else:
-        lines.append("## Semantic Intent")
-        lines.append("")
-        lines.append("*Not pre-computed. Infer business intent from the SQL.*")
-        lines.append("")
+    # When no pre-computed intents exist, omit this section entirely.
+    # The analyst's task already requires producing SEMANTIC_CONTRACT output.
 
     # ── 5b. Aggregation Semantics Check ───────────────────────────────
     lines.append("## Aggregation Semantics Check")
@@ -1057,33 +1133,62 @@ def build_analyst_briefing_prompt(
         "aggregation, verify equivalence explicitly."
     )
     lines.append("")
-    lines.append(
-        "5. **TRANSFORM SELECTION**: From the matched engine gaps, select transforms "
-        "that exploit the specific gaps present in THIS query. Rank by expected value "
-        "(rows affected × historical speedup from evidence). Select 4 that are "
-        "structurally diverse — each attacking a different gap or bottleneck.\n"
-        "   REJECT tag-matched examples whose primary technique requires a structural "
-        "feature this query lacks (e.g., reject intersect_to_exists if query has no "
-        "INTERSECT; reject decorrelate if query has no correlated subquery). Tag "
-        "matching is approximate — always verify structural applicability."
-    )
+    if mode == "swarm":
+        lines.append(
+            "5. **TRANSFORM SELECTION**: From the matched engine gaps, select transforms "
+            "that exploit the specific gaps present in THIS query. Rank by expected value "
+            "(rows affected × historical speedup from evidence). Select 4 that are "
+            "structurally diverse — each attacking a different gap or bottleneck.\n"
+            "   REJECT tag-matched examples whose primary technique requires a structural "
+            "feature this query lacks (e.g., reject intersect_to_exists if query has no "
+            "INTERSECT; reject decorrelate if query has no correlated subquery). Tag "
+            "matching is approximate — always verify structural applicability."
+        )
+    else:
+        lines.append(
+            "5. **TRANSFORM SELECTION**: From the matched engine gaps, select the single "
+            "best transform (or compound strategy) that maximizes expected value "
+            "(rows affected × historical speedup from evidence) for THIS query.\n"
+            "   REJECT tag-matched examples whose primary technique requires a structural "
+            "feature this query lacks. Tag matching is approximate — always verify "
+            "structural applicability."
+        )
     lines.append("")
-    lines.append(
-        "6. **DAG DESIGN**: For each worker's strategy, define the target DAG "
-        "topology. Verify that every node contract has exhaustive output "
-        "columns by checking downstream references.\n"
-        "   CTE materialization matters for your design: a CTE referenced by "
-        "2+ consumers will likely be materialized (good — computed once, probed "
-        "many). A CTE referenced once may be inlined (no materialization benefit "
-        "from 'sharing'). Design shared CTEs only when multiple downstream nodes "
-        "consume them. See CTE_INLINING in Engine Profile strengths."
-    )
+    if mode == "swarm":
+        lines.append(
+            "6. **DAG DESIGN**: For each worker's strategy, define the target DAG "
+            "topology. Verify that every node contract has exhaustive output "
+            "columns by checking downstream references.\n"
+            "   CTE materialization matters for your design: a CTE referenced by "
+            "2+ consumers will likely be materialized (good — computed once, probed "
+            "many). A CTE referenced once may be inlined (no materialization benefit "
+            "from 'sharing'). Design shared CTEs only when multiple downstream nodes "
+            "consume them. See CTE_INLINING in Engine Profile strengths."
+        )
+    else:
+        lines.append(
+            "6. **DAG DESIGN**: Define the target DAG topology for your chosen "
+            "strategy. Verify that every node contract has exhaustive output "
+            "columns by checking downstream references.\n"
+            "   CTE materialization matters: a CTE referenced by 2+ consumers "
+            "will likely be materialized. A CTE referenced once may be inlined."
+        )
     lines.append("")
+    if mode == "oneshot":
+        lines.append(
+            "7. **WRITE SQL**: Implement your strategy as complete, working SQL. "
+            "Follow your DAG design from step 6 exactly. Verify every node "
+            "contract's OUTPUT columns are present in the final SQL. The SQL must "
+            "be semantically equivalent to the original."
+        )
+        lines.append("")
 
     # ── 12. Output format specification ──────────────────────────────────
     lines.append("Then produce the structured briefing in EXACTLY this format:")
     lines.append("")
     lines.append("```")
+
+    # Shared briefing section (identical across all modes)
     lines.append("=== SHARED BRIEFING ===")
     lines.append("")
     lines.append("SEMANTIC_CONTRACT: (80-150 tokens, cover ONLY:)")
@@ -1113,56 +1218,91 @@ def build_analyst_briefing_prompt(
     lines.append("(If no regression warnings are relevant, write 'None applicable.')")
     lines.append("")
 
-    lines.append("=== WORKER 1 BRIEFING ===")
-    lines.append("")
-    lines.append("STRATEGY: [strategy_name]")
-    lines.append("TARGET_DAG:")
-    lines.append("  [node] -> [node] -> [node]")
-    lines.append("NODE_CONTRACTS:")
-    lines.append("(Write all fields as SQL fragments, not natural language.")
-    lines.append("Example: 'WHERE: d_year IN (1999, 2000)' not 'WHERE: filter to target years'.")
-    lines.append("The worker uses these as specifications to code against.)")
-    lines.append("  [node_name]:")
-    lines.append("    FROM: [tables/CTEs]")
-    lines.append("    JOIN: [join conditions]")
-    lines.append("    WHERE: [filters]")
-    lines.append("    GROUP BY: [columns] (if applicable)")
-    lines.append("    AGGREGATE: [functions] (if applicable)")
-    lines.append("    OUTPUT: [exhaustive column list]")
-    lines.append("    EXPECTED_ROWS: [approximate row count from EXPLAIN analysis]")
-    lines.append("    CONSUMERS: [downstream nodes]")
-    lines.append("EXAMPLES: [ex1], [ex2], [ex3]  (sharing across workers is OK if adaptation differs)")
-    lines.append("EXAMPLE_ADAPTATION:")
-    lines.append("[For each example: what aspect to apply to THIS worker's strategy,")
-    lines.append("and what to IGNORE (e.g., 'apply the date CTE pattern; ignore the")
-    lines.append("decorrelation — Q74 has no correlated subquery').]")
-    lines.append("HAZARD_FLAGS:")
-    lines.append("- [Specific risk for this approach on this query]")
-    lines.append("")
-    lines.append("=== WORKER 2 BRIEFING ===")
-    lines.append("[Same structure as Worker 1, DIFFERENT strategy]")
-    lines.append("")
-    lines.append("=== WORKER 3 BRIEFING ===")
-    lines.append("[Same structure as Worker 1, DIFFERENT strategy]")
-    lines.append("")
-    lines.append("=== WORKER 4 BRIEFING === (EXPLORATION WORKER)")
-    lines.append("[Same structure as Worker 1, DIFFERENT strategy]")
-    lines.append("CONSTRAINT_OVERRIDE: [CONSTRAINT_ID or 'None']")
-    lines.append("OVERRIDE_REASONING: [Why this query's structure differs from the observed failure, or 'N/A']")
-    lines.append("EXPLORATION_TYPE: [constraint_relaxation | compound_strategy | novel_combination]")
+    # Worker briefing format — varies per mode
+    _WORKER_BRIEFING_TEMPLATE = [
+        "STRATEGY: [strategy_name]",
+        "TARGET_DAG:",
+        "  [node] -> [node] -> [node]",
+        "NODE_CONTRACTS:",
+        "(Write all fields as SQL fragments, not natural language.",
+        "Example: 'WHERE: d_year IN (1999, 2000)' not 'WHERE: filter to target years'.",
+        "The worker uses these as specifications to code against.)",
+        "  [node_name]:",
+        "    FROM: [tables/CTEs]",
+        "    JOIN: [join conditions]",
+        "    WHERE: [filters]",
+        "    GROUP BY: [columns] (if applicable)",
+        "    AGGREGATE: [functions] (if applicable)",
+        "    OUTPUT: [exhaustive column list]",
+        "    EXPECTED_ROWS: [approximate row count from EXPLAIN analysis]",
+        "    CONSUMERS: [downstream nodes]",
+        "EXAMPLES: [ex1], [ex2], [ex3]",
+        "EXAMPLE_ADAPTATION:",
+        "[For each example: what aspect to apply to THIS strategy,",
+        "and what to IGNORE (e.g., 'apply the date CTE pattern; ignore the",
+        "decorrelation — Q74 has no correlated subquery').]",
+        "HAZARD_FLAGS:",
+        "- [Specific risk for this approach on this query]",
+    ]
+
+    if mode == "swarm":
+        lines.append("=== WORKER 1 BRIEFING ===")
+        lines.append("")
+        for tl in _WORKER_BRIEFING_TEMPLATE:
+            lines.append(tl)
+        lines.append("")
+        lines.append("=== WORKER 2 BRIEFING ===")
+        lines.append("[Same structure as Worker 1, DIFFERENT strategy]")
+        lines.append("")
+        lines.append("=== WORKER 3 BRIEFING ===")
+        lines.append("[Same structure as Worker 1, DIFFERENT strategy]")
+        lines.append("")
+        lines.append("=== WORKER 4 BRIEFING === (EXPLORATION WORKER)")
+        lines.append("[Same structure as Worker 1, DIFFERENT strategy]")
+        lines.append("CONSTRAINT_OVERRIDE: [CONSTRAINT_ID or 'None']")
+        lines.append("OVERRIDE_REASONING: [Why this query's structure differs from the observed failure, or 'N/A']")
+        lines.append("EXPLORATION_TYPE: [constraint_relaxation | compound_strategy | novel_combination]")
+    elif mode == "expert":
+        lines.append("=== WORKER 1 BRIEFING ===")
+        lines.append("")
+        for tl in _WORKER_BRIEFING_TEMPLATE:
+            lines.append(tl)
+    elif mode == "oneshot":
+        lines.append("=== OPTIMIZED SQL ===")
+        lines.append("")
+        lines.append("STRATEGY: [strategy_name]")
+        lines.append("TRANSFORM: [transform_names]")
+        lines.append("")
+        lines.append("```sql")
+        lines.append("[Complete optimized SQL here — must be semantically equivalent to original]")
+        lines.append("```")
+
     lines.append("```")
     lines.append("")
-    lines.append(build_analyst_section_checklist())
+
+    # Section validation checklist — varies per mode
+    if mode == "swarm":
+        lines.append(build_analyst_section_checklist())
+    elif mode == "expert":
+        lines.append(build_expert_section_checklist())
+    elif mode == "oneshot":
+        lines.append(build_oneshot_section_checklist())
     lines.append("")
 
     # ── 13. Transform Catalog ─────────────────────────────────────────────
     lines.append("## Transform Catalog")
     lines.append("")
-    lines.append(
-        "Select 4 transforms that are applicable to THIS query, maximizing "
-        "structural diversity (each must attack a different part of the "
-        "execution plan)."
-    )
+    if mode == "swarm":
+        lines.append(
+            "Select 4 transforms that are applicable to THIS query, maximizing "
+            "structural diversity (each must attack a different part of the "
+            "execution plan)."
+        )
+    else:
+        lines.append(
+            "Select the best transform (or compound strategy of 2-3 transforms) "
+            "that maximizes expected speedup for THIS query."
+        )
     lines.append("")
     lines.append("### Predicate Movement")
     lines.append(
@@ -1291,11 +1431,18 @@ def build_analyst_briefing_prompt(
         "benefit. Note this in your reasoning and prefer transforms the "
         "optimizer is NOT already doing."
     )
-    lines.append(
-        "3. **MAXIMIZE DIVERSITY**: Each worker must attack a different part of "
-        "the execution plan. Do not assign 'pushdown variant A' and "
-        "'pushdown variant B'. Assign transforms from different categories above."
-    )
+    if mode == "swarm":
+        lines.append(
+            "3. **MAXIMIZE DIVERSITY**: Each worker must attack a different part of "
+            "the execution plan. Do not assign 'pushdown variant A' and "
+            "'pushdown variant B'. Assign transforms from different categories above."
+        )
+    else:
+        lines.append(
+            "3. **MAXIMIZE EXPECTED VALUE**: Select the single strategy with the "
+            "highest expected speedup, considering both the magnitude of the "
+            "bottleneck it addresses and the historical success rate."
+        )
     lines.append(
         "4. **ASSESS RISK PER-QUERY**: Risk is a function of (transform x "
         "query complexity), not an inherent property of the transform. "
@@ -1303,92 +1450,100 @@ def build_analyst_briefing_prompt(
         "nested correlation inside a CTE. Assess per-assignment."
     )
     lines.append(
-        "5. **COMPOSITION IS ALLOWED AND ENCOURAGED**: A worker's strategy can "
+        "5. **COMPOSITION IS ALLOWED AND ENCOURAGED**: A strategy can "
         "combine 2-3 transforms from different categories (e.g., "
         "star_join_prefetch + scan_consolidation_pivot, or date_cte_isolate + "
         "early_filter + decorrelate). The TARGET_DAG should reflect the combined "
-        "structure. Do not assign two workers the same composition — each must "
-        "include at least one unique transform. Compound strategies are often "
-        "the source of the biggest wins."
+        "structure. Compound strategies are often the source of the biggest wins."
     )
-    lines.append(
-        "6. **MINIMAL-CHANGE BASELINE**: If the EXPLAIN shows the optimizer "
-        "already handles the primary bottleneck (e.g., already splits CTEs, "
-        "already pushes predicates), consider assigning one worker as a "
-        "minimal-change baseline: explicit JOINs only, no structural changes. "
-        "This provides a regression-safe fallback."
-    )
+    if mode == "swarm":
+        lines.append(
+            "6. **MINIMAL-CHANGE BASELINE**: If the EXPLAIN shows the optimizer "
+            "already handles the primary bottleneck (e.g., already splits CTEs, "
+            "already pushes predicates), consider assigning one worker as a "
+            "minimal-change baseline: explicit JOINs only, no structural changes. "
+            "This provides a regression-safe fallback."
+        )
+    lines.append("")
+
+    if mode == "swarm":
+        lines.append(
+            "Each worker gets 1-3 examples. If fewer than 2 examples genuinely "
+            "match the worker's strategy, assign 1 and state 'No additional examples "
+            "apply.' Do NOT pad with irrelevant examples — an irrelevant example is "
+            "worse than no example because the worker will try to apply its pattern. "
+            "No duplicate examples across workers. Use example IDs from the catalog above."
+        )
+    else:
+        lines.append(
+            "Select 1-3 examples that genuinely match the strategy. "
+            "Do NOT pad with irrelevant examples — an irrelevant example is "
+            "worse than no example. Use example IDs from the catalog above."
+        )
     lines.append("")
     lines.append(
-        "Each worker gets 1-3 examples. If fewer than 2 examples genuinely "
-        "match the worker's strategy, assign 1 and state 'No additional examples "
-        "apply.' Do NOT pad with irrelevant examples — an irrelevant example is "
-        "worse than no example because the worker will try to apply its pattern. "
-        "No duplicate examples across workers. Use example IDs from the catalog above."
-    )
-    lines.append("")
-    lines.append(
-        "For TARGET_DAG: Define the CTE structure you want the worker to produce. "
-        "The worker's job becomes pure SQL generation within your defined structure. "
+        "For TARGET_DAG: Define the CTE structure you want produced. "
         "For NODE_CONTRACTS: Be exhaustive with OUTPUT columns — missing columns "
         "cause semantic breaks."
     )
     lines.append("")
 
-    # ── 14b. Exploration Budget ────────────────────────────────────────────
-    lines.append("## Exploration Budget (Worker 4)")
-    lines.append("")
-    lines.append(
-        "Workers 1-3 follow the engine profile's proven patterns. "
-        "**Worker 4 is the EXPLORATION worker** with a different mandate:"
-    )
-    lines.append("")
-    lines.append(
-        "Worker 4 MAY (in priority order — prefer higher-value exploration):\n"
-        "  (c) **PREFERRED**: Attempt a novel technique not listed in the engine "
-        "profile, if the EXPLAIN plan reveals an optimizer blind spot not yet "
-        "documented. This is the highest-value exploration — new discoveries "
-        "expand the engine profile for all future queries.\n"
-        "  (b) Combine 2-3 transforms from different engine gaps into a compound "
-        "strategy that hasn't been tested before. Medium value — tests "
-        "interaction effects between known patterns.\n"
-        "  (a) Retry a technique from 'what_didnt_work', IF the structural "
-        "context of THIS query differs materially from the observed failure — "
-        "explain the structural difference in HAZARD_FLAGS. Lowest priority — "
-        "only when the query structure clearly diverges from the failed case."
-    )
-    lines.append("")
-    lines.append(
-        "Worker 4 may NEVER violate correctness constraints "
-        "(LITERAL_PRESERVATION, SEMANTIC_EQUIVALENCE, COMPLETE_OUTPUT, "
-        "CTE_COLUMN_COMPLETENESS)."
-    )
-    lines.append("")
-    lines.append(
-        "The exploration worker's output is tagged EXPLORATORY and tracked "
-        "separately. Past failures documented in the engine profile are "
-        "context-specific — they happened on specific queries with specific "
-        "structures. Worker 4's job is to test whether those failures "
-        "generalize or not. If Worker 4 discovers a new win, it becomes "
-        "field intelligence for the engine profile."
-    )
-    lines.append("")
+    # ── 14b. Exploration Budget (swarm only) ──────────────────────────────
+    if mode == "swarm":
+        lines.append("## Exploration Budget (Worker 4)")
+        lines.append("")
+        lines.append(
+            "Workers 1-3 follow the engine profile's proven patterns. "
+            "**Worker 4 is the EXPLORATION worker** with a different mandate:"
+        )
+        lines.append("")
+        lines.append(
+            "Worker 4 MAY (in priority order — prefer higher-value exploration):\n"
+            "  (c) **PREFERRED**: Attempt a novel technique not listed in the engine "
+            "profile, if the EXPLAIN plan reveals an optimizer blind spot not yet "
+            "documented. This is the highest-value exploration — new discoveries "
+            "expand the engine profile for all future queries.\n"
+            "  (b) Combine 2-3 transforms from different engine gaps into a compound "
+            "strategy that hasn't been tested before. Medium value — tests "
+            "interaction effects between known patterns.\n"
+            "  (a) Retry a technique from 'what_didnt_work', IF the structural "
+            "context of THIS query differs materially from the observed failure — "
+            "explain the structural difference in HAZARD_FLAGS. Lowest priority — "
+            "only when the query structure clearly diverges from the failed case."
+        )
+        lines.append("")
+        lines.append(
+            "Worker 4 may NEVER violate correctness constraints "
+            "(LITERAL_PRESERVATION, SEMANTIC_EQUIVALENCE, COMPLETE_OUTPUT, "
+            "CTE_COLUMN_COMPLETENESS)."
+        )
+        lines.append("")
+        lines.append(
+            "The exploration worker's output is tagged EXPLORATORY and tracked "
+            "separately. Past failures documented in the engine profile are "
+            "context-specific — they happened on specific queries with specific "
+            "structures. Worker 4's job is to test whether those failures "
+            "generalize or not. If Worker 4 discovers a new win, it becomes "
+            "field intelligence for the engine profile."
+        )
+        lines.append("")
 
-    # ── 15. Output Consumption Spec ───────────────────────────────────────
-    lines.append("## Output Consumption Spec")
-    lines.append("")
-    lines.append(
-        "Each worker receives:\n"
-        "1. SHARED BRIEFING (SEMANTIC_CONTRACT + BOTTLENECK_DIAGNOSIS + "
-        "ACTIVE_CONSTRAINTS + REGRESSION_WARNINGS)\n"
-        "2. Their specific WORKER N BRIEFING (STRATEGY + TARGET_DAG + "
-        "NODE_CONTRACTS + EXAMPLES + EXAMPLE_ADAPTATION + HAZARD_FLAGS)\n"
-        "3. Full before/after SQL for their assigned examples (retrieved by example ID)\n"
-        "4. The original query SQL (full, as reference)\n"
-        "5. Column completeness contract + output format spec\n\n"
-        "Workers do NOT see other workers' briefings.\n"
-        "Presentation order: briefing first (understanding), then examples "
-        "(patterns), then original SQL (source), then output format (mechanics)."
-    )
+    # ── 15. Output Consumption Spec (swarm only) ─────────────────────────
+    if mode == "swarm":
+        lines.append("## Output Consumption Spec")
+        lines.append("")
+        lines.append(
+            "Each worker receives:\n"
+            "1. SHARED BRIEFING (SEMANTIC_CONTRACT + BOTTLENECK_DIAGNOSIS + "
+            "ACTIVE_CONSTRAINTS + REGRESSION_WARNINGS)\n"
+            "2. Their specific WORKER N BRIEFING (STRATEGY + TARGET_DAG + "
+            "NODE_CONTRACTS + EXAMPLES + EXAMPLE_ADAPTATION + HAZARD_FLAGS)\n"
+            "3. Full before/after SQL for their assigned examples (retrieved by example ID)\n"
+            "4. The original query SQL (full, as reference)\n"
+            "5. Column completeness contract + output format spec\n\n"
+            "Workers do NOT see other workers' briefings.\n"
+            "Presentation order: briefing first (understanding), then examples "
+            "(patterns), then original SQL (source), then output format (mechanics)."
+        )
 
     return "\n".join(lines)

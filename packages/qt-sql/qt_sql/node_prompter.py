@@ -2,7 +2,7 @@
 
 Builds attention-optimized full-query rewrite prompts with DAG topology.
 All rewrites are full-query scope — the LLM sees the complete SQL, the DAG
-structure, and FAISS-matched gold examples.
+structure, and tag-matched gold examples.
 
 Section ordering (attention-optimized):
 1. Role + Task          (PRIMACY - frames rewrite mindset)
@@ -11,8 +11,8 @@ Section ordering (attention-optimized):
 4. Performance Profile  (EARLY - per-node costs, bottleneck operators)
 5. History              (EARLY-MID - previous attempts on this query)
 5b. Global Learnings    (EARLY-MID - aggregate benchmark stats, optional)
-6. Examples             (MIDDLE - FAISS-matched contrastive BEFORE/AFTER pairs)
-6b. Regression Warnings (MIDDLE - FAISS-matched anti-patterns from past regressions)
+6. Examples             (MIDDLE - tag-matched contrastive BEFORE/AFTER pairs)
+6b. Regression Warnings (MIDDLE - tag-matched anti-patterns from past regressions)
 7. Constraints          (LATE-MID - CRITICAL top/bottom, HIGH middle)
 8. Output Format        (RECENCY - return complete rewritten SQL)
 """
@@ -195,7 +195,7 @@ class Prompter:
     The LLM sees:
     - Complete query SQL (not isolated nodes)
     - Full DAG topology (nodes, edges, depths, flags, costs)
-    - FAISS-matched gold examples (contrastive BEFORE/AFTER pairs)
+    - tag-matched gold examples (contrastive BEFORE/AFTER pairs)
     - Constraints (CRITICAL top/bottom, HIGH middle)
 
     This enables cross-node rewrites: creating new CTEs, restructuring
@@ -226,14 +226,14 @@ class Prompter:
             costs: Per-node cost analysis from CostAnalyzer
             history: Previous attempts and promotion context for this query.
                      Dict with 'attempts' (list) and 'promotion' (PromotionAnalysis).
-            examples: List of gold examples (FAISS-matched, up to 3)
+            examples: List of gold examples (tag-matched, up to 3)
             expert_analysis: Pre-computed LLM analyst output (analyst mode only).
                              When present, replaces examples with concrete
                              structural guidance.
             global_learnings: Aggregate learnings from benchmark runs (from
                               Learner.build_learning_summary()). Shows transform
                               effectiveness, known anti-patterns, example success rates.
-            regression_warnings: FAISS-matched regression examples showing
+            regression_warnings: tag-matched regression examples showing
                                  structurally similar queries that regressed.
                                  Displayed as anti-patterns so the LLM avoids them.
             dialect: SQL dialect for pretty-printing
@@ -273,7 +273,7 @@ class Prompter:
             # Analyst mode: inject analysis AND examples
             # Analysis tells the rewriter WHAT to do, examples show HOW
             sections.append(expert_analysis)
-        # Gold examples (FAISS-matched or analyst-overridden)
+        # Gold examples (tag-matched or analyst-overridden)
         if examples:
             sections.append(self._section_examples(examples))
 
@@ -708,7 +708,7 @@ class Prompter:
 
     @staticmethod
     def _section_examples(examples: List[Dict[str, Any]]) -> str:
-        """Section 7: Up to 3 contrastive BEFORE/AFTER examples (FAISS-matched)."""
+        """Section 7: Up to 3 contrastive BEFORE/AFTER examples (tag-matched)."""
         lines = [
             "## Reference Examples",
             "",

@@ -22,6 +22,8 @@ from .analyst_briefing import build_analyst_briefing_prompt
 from .worker import build_worker_prompt
 from .briefing_checks import (
     build_analyst_section_checklist,
+    build_expert_section_checklist,
+    build_oneshot_section_checklist,
     build_worker_rewrite_checklist,
     validate_parsed_briefing,
 )
@@ -39,6 +41,8 @@ __all__ = [
     "build_analyst_briefing_prompt",
     "build_worker_prompt",
     "build_analyst_section_checklist",
+    "build_expert_section_checklist",
+    "build_oneshot_section_checklist",
     "build_worker_rewrite_checklist",
     "validate_parsed_briefing",
     # Snipe

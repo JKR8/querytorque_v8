@@ -2,7 +2,7 @@
 
 Phases:
 1. Parse:     SQL → DAG (deterministic, DagBuilder)
-2. Retrieve:  FAISS example matching (engine-specific)
+2. Retrieve:  Tag-based example matching (engine-specific)
 3. Rewrite:   Full-query prompt with DAG topology (N parallel workers)
 4. Validate:  Syntax check (deterministic)
 5. Validate:  Timing + correctness (3-run or 5-run)
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 class Pipeline:
-    """ADO pipeline with FAISS example retrieval, LLM rewrite, and validation."""
+    """ADO pipeline with tag-based example retrieval, LLM rewrite, and validation."""
 
     def __init__(
         self,
@@ -455,11 +455,11 @@ class Pipeline:
             f"{len(dag.edges)} edges"
         )
 
-        # Phase 2: FAISS example retrieval (gold + regressions)
-        logger.info(f"[{query_id}] Phase 2: Finding FAISS examples")
+        # Phase 2: Tag-based example retrieval (gold + regressions)
+        logger.info(f"[{query_id}] Phase 2: Finding tag-matched examples")
         examples = self._find_examples(sql, engine=engine, k=3)
         example_ids = [e.get('id', '?') for e in examples]
-        logger.info(f"[{query_id}] FAISS examples: {example_ids}")
+        logger.info(f"[{query_id}] Tag-matched examples: {example_ids}")
 
         # Also find regression warnings for structurally similar queries
         regression_warnings = self._find_regression_warnings(sql, engine=engine, k=2)
@@ -468,7 +468,7 @@ class Pipeline:
             logger.info(f"[{query_id}] Regression warnings: {reg_ids}")
 
         # Optional: LLM analyst (stubborn query mode)
-        # Analyst sees FAISS picks and can swap them for better ones
+        # Analyst sees tag-matched picks and can swap them for better ones
         expert_analysis = None
         analysis_raw = None
         analysis_prompt_text = None
@@ -1059,11 +1059,8 @@ class Pipeline:
     ) -> tuple[Optional[str], Optional[str], Optional[str], List[Dict[str, Any]]]:
         """Run LLM analyst to generate deep structural analysis.
 
-        The analyst sees the tag-matched examples and the full list of
-        available gold examples. It can accept the picks or recommend
-        swaps if it thinks different examples would be more relevant.
-
-        Costs 1 extra API call. Only use for stubborn queries.
+        DEPRECATED: Used by the V1 run_query() path. New code should use
+        gather_analyst_context() + build_analyst_briefing_prompt(mode="expert").
 
         Returns:
             (formatted_analysis, raw_response, analysis_prompt, final_examples) —
@@ -1071,42 +1068,27 @@ class Pipeline:
             recommended swaps. Returns (None, None, None, matched_examples) on failure.
         """
         from .analyst import (
-            build_analysis_prompt,
             format_analysis_for_prompt,
             parse_analysis_response,
             parse_example_overrides,
         )
+        from .prompts.analyst_briefing import build_analyst_briefing_prompt
 
         logger.info(f"[{query_id}] Running LLM analyst (stubborn query mode)")
 
-        # Load benchmark learnings for the analyst
-        history_path = self.benchmark_dir / "history.json"
-        effective_patterns = None
-        known_regressions = None
-        if history_path.exists():
-            try:
-                hdata = json.loads(history_path.read_text())
-                learnings = hdata.get("cumulative_learnings", {})
-                effective_patterns = learnings.get("effective_patterns")
-                known_regressions = learnings.get("known_regressions")
-            except Exception:
-                pass
+        # Gather context via the shared method
+        ctx = self.gather_analyst_context(query_id, sql, dialect, engine)
 
-        # Build catalogue of all available gold examples (id + description)
-        available_examples = self._list_gold_examples(engine)
-
-        # Build the analysis prompt
-        analysis_prompt = build_analysis_prompt(
+        # Build the analysis prompt using expert mode template
+        analysis_prompt = build_analyst_briefing_prompt(
+            mode="expert",
             query_id=query_id,
             sql=sql,
             dag=dag,
             costs=costs,
-            history=history,
-            effective_patterns=effective_patterns,
-            known_regressions=known_regressions,
-            faiss_picks=[e.get("id", "?") for e in matched_examples],
-            available_examples=available_examples,
             dialect=dialect,
+            dialect_version=self._engine_version,
+            **{k: v for k, v in ctx.items()},
         )
 
         # Send to LLM
@@ -1122,7 +1104,7 @@ class Pipeline:
             logger.warning(f"[{query_id}] Analyst LLM call failed: {e}")
             return None, None, analysis_prompt, matched_examples
 
-        # Parse and format for injection into rewrite prompt
+        # Parse and format for injection into V1 rewrite prompt
         parsed = parse_analysis_response(raw_response)
         formatted = format_analysis_for_prompt(parsed)
 
@@ -1304,14 +1286,14 @@ class Pipeline:
         Only returns type=gold examples; regressions are handled separately
         by _find_regression_warnings().
         """
-        from .knowledge import ADOFAISSRecommender
+        from .knowledge import TagRecommender
 
         engine_dir = "postgres" if engine in ("postgresql", "postgres") else engine
         dialect = "postgres" if engine_dir == "postgres" else engine_dir
         examples = []
         seen_ids = set()
 
-        recommender = ADOFAISSRecommender()
+        recommender = TagRecommender()
         if recommender._initialized:
             matches = recommender.find_similar_examples(sql, k=k * 5, dialect=dialect)
             for ex_id, score, meta in matches:
@@ -1351,14 +1333,14 @@ class Pipeline:
         Returns:
             List of regression example dicts with regression_mechanism
         """
-        from .knowledge import ADOFAISSRecommender
+        from .knowledge import TagRecommender
 
         engine_dir = "postgres" if engine in ("postgresql", "postgres") else engine
         dialect = "postgres" if engine_dir == "postgres" else engine_dir
         regressions = []
         seen_ids = set()
 
-        recommender = ADOFAISSRecommender()
+        recommender = TagRecommender()
         if recommender._initialized:
             matches = recommender.find_relevant_regressions(sql, k=k * 5, dialect=dialect)
             for ex_id, score, meta in matches:
@@ -1443,6 +1425,165 @@ class Pipeline:
                             return data
                     except Exception:
                         continue
+
+        return None
+
+    # =========================================================================
+    # Shared analyst context gathering (used by swarm, expert, oneshot)
+    # =========================================================================
+
+    def gather_analyst_context(
+        self,
+        query_id: str,
+        sql: str,
+        dialect: str,
+        engine: str,
+    ) -> Dict[str, Any]:
+        """Gather all context needed for analyst prompt (shared across all modes).
+
+        Returns a dict with keys: explain_plan_text, plan_scanner_text,
+        global_knowledge, semantic_intents, matched_examples,
+        all_available_examples, engine_profile, constraints,
+        regression_warnings, strategy_leaderboard, query_archetype,
+        resource_envelope, exploit_algorithm_text.
+        """
+        from .node_prompter import (
+            _load_constraint_files,
+            _load_engine_profile,
+            load_exploit_algorithm,
+        )
+
+        # Exploit algorithm (replaces engine profile when available)
+        exploit_algorithm_text = load_exploit_algorithm(dialect)
+
+        # EXPLAIN plan text
+        explain_plan_text = self.get_explain_plan_text(query_id, dialect)
+
+        # Plan-space scanner results (PG only, pre-computed)
+        plan_scanner_text = None
+        if dialect in ("postgresql", "postgres"):
+            try:
+                from .plan_scanner import (
+                    load_scan_result, format_scan_for_prompt,
+                    load_explore_result, format_explore_for_prompt,
+                    load_known_sql_ceiling,
+                )
+                scan = load_scan_result(self.benchmark_dir, query_id)
+                explore = load_explore_result(self.benchmark_dir, query_id)
+                known = load_known_sql_ceiling(self.benchmark_dir, query_id)
+                if scan:
+                    plan_scanner_text = format_scan_for_prompt(
+                        scan,
+                        explore=explore,
+                        known_sql_ceiling=known[0] if known else None,
+                        known_sql_technique=known[1] if known else None,
+                    )
+                elif explore:
+                    plan_scanner_text = format_explore_for_prompt(explore)
+            except Exception as e:
+                logger.warning(f"[{query_id}] Failed to load plan scanner: {e}")
+
+        # GlobalKnowledge (principles + anti-patterns)
+        global_knowledge = self.load_global_knowledge()
+
+        # Semantic intents
+        semantic_intents = self.get_semantic_intents(query_id)
+
+        # Tag-matched examples (top 20 — analyst picks best per worker)
+        matched_examples = self._find_examples(sql, engine=engine, k=20)
+
+        # Full catalog
+        all_available_examples = self._list_gold_examples(engine)
+
+        # Engine profile (optimizer strengths + gaps)
+        engine_profile = _load_engine_profile(dialect)
+
+        # All constraints (engine-filtered)
+        constraints = _load_constraint_files(dialect)
+
+        # Regression warnings
+        regression_warnings = self._find_regression_warnings(
+            sql, engine=engine, k=3
+        )
+
+        # Strategy leaderboard + query archetype
+        strategy_leaderboard = None
+        query_archetype = None
+        leaderboard_path = self.benchmark_dir / "strategy_leaderboard.json"
+        if leaderboard_path.exists():
+            try:
+                strategy_leaderboard = json.loads(leaderboard_path.read_text())
+                from .faiss_builder import extract_tags, classify_category
+                query_archetype = classify_category(
+                    extract_tags(sql, dialect=dialect)
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{query_id}] Failed to load strategy leaderboard: {e}"
+                )
+
+        # PG system profile + resource envelope
+        resource_envelope = None
+        if dialect in ("postgresql", "postgres"):
+            try:
+                from .pg_tuning import load_or_collect_profile, build_resource_envelope
+                profile = load_or_collect_profile(
+                    self.config.db_path_or_dsn, self.benchmark_dir,
+                )
+                resource_envelope = build_resource_envelope(profile)
+            except Exception as e:
+                logger.warning(
+                    f"[{query_id}] Failed to load PG system profile: {e}"
+                )
+
+        return {
+            "explain_plan_text": explain_plan_text,
+            "plan_scanner_text": plan_scanner_text,
+            "global_knowledge": global_knowledge,
+            "semantic_intents": semantic_intents,
+            "matched_examples": matched_examples,
+            "all_available_examples": all_available_examples,
+            "engine_profile": engine_profile,
+            "constraints": constraints,
+            "regression_warnings": regression_warnings,
+            "strategy_leaderboard": strategy_leaderboard,
+            "query_archetype": query_archetype,
+            "resource_envelope": resource_envelope,
+            "exploit_algorithm_text": exploit_algorithm_text,
+        }
+
+    def get_explain_plan_text(
+        self, query_id: str, dialect: str = "duckdb",
+    ) -> Optional[str]:
+        """Load EXPLAIN ANALYZE plan text from cached explains.
+
+        Searches: explains/ (flat) -> explains/sf10/ -> explains/sf5/.
+        For DuckDB: uses plan_text field (JSON string -> rendered tree).
+        For PG: renders plan_json to ASCII tree via format_pg_explain_tree().
+        Returns the ASCII text plan or None.
+        """
+        from .prompts.analyst_briefing import format_pg_explain_tree
+
+        search_paths = [
+            self.benchmark_dir / "explains" / f"{query_id}.json",
+            self.benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
+            self.benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
+        ]
+
+        for cache_path in search_paths:
+            if cache_path.exists():
+                try:
+                    data = json.loads(cache_path.read_text())
+                    plan_text = data.get("plan_text")
+                    if plan_text:
+                        return plan_text
+                    plan_json = data.get("plan_json")
+                    if plan_json:
+                        rendered = format_pg_explain_tree(plan_json)
+                        if rendered:
+                            return rendered
+                except Exception:
+                    pass
 
         return None
 

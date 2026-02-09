@@ -40,6 +40,51 @@ def build_analyst_section_checklist() -> str:
     ])
 
 
+def build_expert_section_checklist() -> str:
+    """Checklist for single-worker expert mode."""
+    return "\n".join([
+        "## Section Validation Checklist (MUST pass before final output)",
+        "",
+        "Use this checklist to verify content quality, not just section presence:",
+        "",
+        "### SHARED BRIEFING",
+        "- `SEMANTIC_CONTRACT`: 80-150 tokens and includes business intent, JOIN semantics, aggregation trap, and filter dependency.",
+        "- `BOTTLENECK_DIAGNOSIS`: states dominant mechanism, bound type (`scan-bound`/`join-bound`/`aggregation-bound`), cardinality flow, and what optimizer already handles well.",
+        "- `ACTIVE_CONSTRAINTS`: includes all 4 correctness IDs plus 1-3 active engine gaps with EXPLAIN evidence.",
+        "- `REGRESSION_WARNINGS`: either `None applicable.` or numbered entries with both `CAUSE:` and `RULE:`.",
+        "",
+        "### WORKER 1 BRIEFING",
+        "- `STRATEGY`: non-empty, describes the best single strategy.",
+        "- `TARGET_DAG`: explicit node chain (e.g., `a -> b -> c`).",
+        "- `NODE_CONTRACTS`: every DAG node has a contract with `FROM`, `OUTPUT` (explicit columns), and `CONSUMERS`.",
+        "- `EXAMPLES`: 1-3 IDs. Each has `EXAMPLE_ADAPTATION` explaining what to adapt and what to ignore.",
+        "- `HAZARD_FLAGS`: query-specific risks, not generic cautions.",
+    ])
+
+
+def build_oneshot_section_checklist() -> str:
+    """Checklist for one-shot mode (analysis + SQL output)."""
+    return "\n".join([
+        "## Section Validation Checklist (MUST pass before final output)",
+        "",
+        "Use this checklist to verify content quality, not just section presence:",
+        "",
+        "### SHARED BRIEFING",
+        "- `SEMANTIC_CONTRACT`: 80-150 tokens and includes business intent, JOIN semantics, aggregation trap, and filter dependency.",
+        "- `BOTTLENECK_DIAGNOSIS`: states dominant mechanism, bound type (`scan-bound`/`join-bound`/`aggregation-bound`), cardinality flow, and what optimizer already handles well.",
+        "- `ACTIVE_CONSTRAINTS`: includes all 4 correctness IDs plus 1-3 active engine gaps with EXPLAIN evidence.",
+        "- `REGRESSION_WARNINGS`: either `None applicable.` or numbered entries with both `CAUSE:` and `RULE:`.",
+        "",
+        "### OPTIMIZED SQL",
+        "- `STRATEGY`: non-empty, describes the optimization approach.",
+        "- `TRANSFORM`: lists the transform(s) applied.",
+        "- SQL block is present, complete, and syntactically valid.",
+        "- Output columns match original query exactly (same names, same order).",
+        "- All literals preserved exactly (numbers, strings, date values).",
+        "- Semantically equivalent to the original query.",
+    ])
+
+
 def build_worker_rewrite_checklist() -> str:
     """Checklist the worker uses before returning SQL."""
     return "\n".join([

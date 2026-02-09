@@ -13,189 +13,11 @@ has specific, concrete guidance instead of just pattern names.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-
-def build_analysis_prompt(
-    query_id: str,
-    sql: str,
-    dag: Any,
-    costs: Dict[str, Any],
-    history: Optional[Dict[str, Any]] = None,
-    effective_patterns: Optional[Dict[str, Any]] = None,
-    known_regressions: Optional[Dict[str, str]] = None,
-    faiss_picks: Optional[List[str]] = None,
-    available_examples: Optional[List[Dict[str, str]]] = None,
-    dialect: str = "duckdb",
-) -> str:
-    """Build the LLM-guided analysis prompt.
-
-    This prompt asks the LLM to do deep structural analysis of the query
-    following the methodology from successful manual optimization sessions:
-
-    1. STRUCTURAL BREAKDOWN — what does each CTE/subquery/block do in plain language
-    2. PROFILE ANALYSIS — where is time being spent and why (map DAG costs to blocks)
-    3. ROOT CAUSE — the mechanism: what operation is expensive and why
-       (e.g., "3 separate sorts of 5.5M rows" not just "window functions are slow")
-    4. PROPOSED CHANGES — specific structural changes with:
-       - What to change (concrete: "move the date filter from X to Y")
-       - Why it should be faster (mechanism: "reduces hash join probe from 73K to 365 rows")
-       - Semantic risk (what could break: "NULL handling changes if...")
-    5. FAILURE ANALYSIS — if previous attempts exist, explain why they failed
-       and what constraint that teaches us
-
-    Args:
-        query_id: Query identifier
-        sql: The SQL query to analyze
-        dag: Parsed DAG from Phase 1
-        costs: Per-node cost analysis
-        history: Previous attempts and promotion context
-        effective_patterns: Known effective patterns from history.json
-        known_regressions: Known regression patterns to avoid
-        dialect: SQL dialect
-
-    Returns:
-        Analysis prompt string
-    """
-    lines = []
-
-    # Role
-    lines.append(
-        "You are an expert database performance analyst. Your job is to deeply "
-        "analyze a slow SQL query, identify the root cause of its performance "
-        "problems, and propose specific structural changes."
-    )
-    lines.append("")
-    lines.append(
-        "You follow a rigorous methodology: understand the structure, profile "
-        "the costs, identify the mechanism (not just the symptom), propose "
-        "changes with correctness reasoning, and learn from past failures."
-    )
-    lines.append("")
-
-    # The query
-    lines.append(f"## Query: {query_id}")
-    lines.append(f"## Dialect: {dialect}")
-    lines.append("")
-
-    # Pretty-print SQL
-    clean_sql = sql
-    try:
-        import sqlglot
-        clean_sql = sqlglot.transpile(sql, read=dialect, write=dialect, pretty=True)[0]
-    except Exception:
-        pass
-    lines.append("```sql")
-    lines.append(clean_sql)
-    lines.append("```")
-    lines.append("")
-
-    # DAG topology + costs
-    lines.append("## Query Structure (DAG)")
-    lines.append("")
-    _append_dag_analysis(lines, dag, costs, dialect=dialect)
-    lines.append("")
-
-    # Previous attempts
-    if history:
-        lines.append("## Previous Optimization Attempts")
-        lines.append("")
-        _append_history_analysis(lines, history)
-        lines.append("")
-
-    # Known patterns
-    if effective_patterns:
-        lines.append("## Known Effective Patterns (from benchmark history)")
-        lines.append("")
-        for pat, info in effective_patterns.items():
-            wins = info.get("wins", 0)
-            avg = info.get("avg_speedup", 0)
-            notes = info.get("notes", "")
-            lines.append(f"- **{pat}**: {wins} wins, {avg:.2f}x avg. {notes}")
-        lines.append("")
-
-    # Known regressions
-    if known_regressions:
-        lines.append("## Known Regressions (DO NOT repeat these)")
-        lines.append("")
-        for name, desc in known_regressions.items():
-            lines.append(f"- **{name}**: {desc}")
-        lines.append("")
-
-    # FAISS picks + available examples for override
-    if faiss_picks or available_examples:
-        lines.append("## Reference Examples")
-        lines.append("")
-        if faiss_picks:
-            lines.append(f"**FAISS selected (by structural similarity):** {', '.join(faiss_picks)}")
-            lines.append("")
-        if available_examples:
-            lines.append("**All available gold examples:**")
-            lines.append("")
-            for ex in available_examples:
-                lines.append(
-                    f"- **{ex['id']}** ({ex.get('speedup', '?')}x) — {ex.get('description', '')}"
-                )
-            lines.append("")
-
-    # The task
-    lines.append("## Your Task")
-    lines.append("")
-    lines.append("Analyze this query following these steps IN ORDER:")
-    lines.append("")
-    lines.append("### 1. STRUCTURAL BREAKDOWN")
-    lines.append("For each CTE/subquery/block, explain in 1-2 sentences:")
-    lines.append("- What it computes (in plain language)")
-    lines.append("- What tables it reads and approximately how many rows")
-    lines.append("- What it outputs (cardinality estimate)")
-    lines.append("")
-    lines.append("### 2. BOTTLENECK IDENTIFICATION")
-    lines.append("Using the DAG costs above, identify the dominant cost center.")
-    lines.append("Don't just name it — explain the MECHANISM:")
-    lines.append("- Is it a full table scan that could be filtered?")
-    lines.append("- Is it a sort for a window function that could be deferred?")
-    lines.append("- Is it a hash join on a large build side that could be pre-filtered?")
-    lines.append("- Is it scanning the same table multiple times when once would suffice?")
-    lines.append("")
-    lines.append("### 3. PROPOSED OPTIMIZATION")
-    lines.append("Propose 1-3 specific structural changes. For EACH one:")
-    lines.append("- **What**: Exactly what to change (e.g., 'merge CTEs X and Y into one scan')")
-    lines.append("- **Why**: The performance mechanism (e.g., 'eliminates a 28M-row rescan of store_sales')")
-    lines.append("- **Risk**: What semantic constraint could break (e.g., 'the HAVING filter must be preserved')")
-    lines.append("- **Estimated impact**: minor / moderate / significant")
-    lines.append("")
-
-    if history and history.get("attempts"):
-        lines.append("### 4. FAILURE ANALYSIS")
-        lines.append("For each previous failed/regressed attempt, explain:")
-        lines.append("- WHY it failed (the specific mechanism)")
-        lines.append("- What constraint that teaches us for the next attempt")
-        lines.append("")
-
-    lines.append("### 5. RECOMMENDED STRATEGY")
-    lines.append("Synthesize everything into a single recommended optimization approach.")
-    lines.append("Be specific enough that another engineer could implement it from your description.")
-    lines.append("")
-
-    if available_examples:
-        lines.append("### 6. EXAMPLE SELECTION")
-        lines.append(f"FAISS selected these examples: {', '.join(faiss_picks or [])}")
-        lines.append("Review the FAISS picks against the available examples above.")
-        lines.append("If you think different examples would be more relevant for this query,")
-        lines.append("list your preferred examples. Otherwise confirm the FAISS picks are good.")
-        lines.append("")
-        lines.append("```")
-        lines.append("EXAMPLES: example_id_1, example_id_2, example_id_3")
-        lines.append("```")
-        lines.append("")
-        lines.append("Use exact IDs from the available examples list above.")
-        lines.append("")
-
-    return "\n".join(lines)
 
 
 def _append_dag_analysis(
@@ -204,6 +26,7 @@ def _append_dag_analysis(
     costs: Dict[str, Any],
     dialect: str = "duckdb",
     node_intents: Optional[Dict[str, str]] = None,
+    output_columns: Optional[List[str]] = None,
 ) -> None:
     """Append structured DAG analysis — one card per node.
 
@@ -214,6 +37,8 @@ def _append_dag_analysis(
     Args:
         node_intents: Optional {node_id: intent_string} from semantic_intents.json.
                       When present, each node card includes an Intent line.
+        output_columns: Known output columns for the root node (fallback when
+                        sqlglot contract extraction fails on complex queries).
     """
     if node_intents is None:
         node_intents = {}
@@ -282,6 +107,8 @@ def _append_dag_analysis(
             out_cols = []
             if hasattr(node, "contract") and node.contract and node.contract.output_columns:
                 out_cols = node.contract.output_columns[:10]
+            elif node.node_type == "main" and output_columns:
+                out_cols = output_columns[:10]
             out_str = ", ".join(out_cols) if out_cols else "?"
             if hasattr(node, "contract") and node.contract and node.contract.output_columns:
                 if len(node.contract.output_columns) > 10:

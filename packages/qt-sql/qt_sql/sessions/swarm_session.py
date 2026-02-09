@@ -193,55 +193,31 @@ class SwarmSession(OptimizationSession):
             build_worker_prompt,
             parse_briefing_response,
         )
-        from ..node_prompter import _load_constraint_files, _load_engine_profile, load_exploit_algorithm
-
         # ── Step 1: Gather all raw data ──────────────────────────────────
         self._stage(self.query_id, "Gathering data (EXPLAIN, knowledge, examples)...")
         t0 = time.time()
 
-        # Exploit algorithm (replaces engine profile when available)
-        exploit_algorithm_text = load_exploit_algorithm(self.dialect)
-
-        # EXPLAIN plan text
-        explain_plan_text = self._get_explain_plan_text(self.query_id)
-
-        # GlobalKnowledge (principles + anti-patterns)
-        global_knowledge = self.pipeline.load_global_knowledge()
-
-        # Semantic intents
-        semantic_intents = self.pipeline.get_semantic_intents(self.query_id)
-
-        # Tag-matched examples (top 20 — analyst picks best per worker)
-        matched_examples = self.pipeline._find_examples(
-            self.original_sql, engine=self.engine, k=20
+        ctx = self.pipeline.gather_analyst_context(
+            query_id=self.query_id,
+            sql=self.original_sql,
+            dialect=self.dialect,
+            engine=self.engine,
         )
 
-        # Full catalog
-        all_available = self.pipeline._list_gold_examples(self.engine)
-
-        # Engine profile (optimizer strengths + gaps)
-        engine_profile = _load_engine_profile(self.dialect)
-
-        # All constraints (engine-filtered, excluding engine profiles)
-        constraints = _load_constraint_files(self.dialect)
-
-        # Regression warnings
-        regression_warnings = self.pipeline._find_regression_warnings(
-            self.original_sql, engine=self.engine, k=3
-        )
-
-        # Strategy leaderboard + query archetype
-        strategy_leaderboard = None
-        query_archetype = None
-        benchmark_dir = self.pipeline.benchmark_dir
-        leaderboard_path = benchmark_dir / "strategy_leaderboard.json"
-        if leaderboard_path.exists():
-            try:
-                strategy_leaderboard = json.loads(leaderboard_path.read_text())
-                from ..faiss_builder import extract_tags, classify_category
-                query_archetype = classify_category(extract_tags(self.original_sql, dialect=self.dialect))
-            except Exception as e:
-                logger.warning(f"[{self.query_id}] Failed to load strategy leaderboard: {e}")
+        # Unpack for local use + snipe reuse
+        explain_plan_text = ctx["explain_plan_text"]
+        plan_scanner_text = ctx["plan_scanner_text"]
+        global_knowledge = ctx["global_knowledge"]
+        semantic_intents = ctx["semantic_intents"]
+        matched_examples = ctx["matched_examples"]
+        all_available = ctx["all_available_examples"]
+        engine_profile = ctx["engine_profile"]
+        constraints = ctx["constraints"]
+        regression_warnings = ctx["regression_warnings"]
+        strategy_leaderboard = ctx["strategy_leaderboard"]
+        query_archetype = ctx["query_archetype"]
+        resource_envelope = ctx["resource_envelope"]
+        exploit_algorithm_text = ctx["exploit_algorithm_text"]
 
         self._stage(
             self.query_id,
@@ -261,25 +237,7 @@ class SwarmSession(OptimizationSession):
         self._matched_examples = matched_examples
         self._all_available_examples = all_available
         self._regression_warnings = regression_warnings
-
-        # PG system profile + resource envelope (for per-worker SET LOCAL config)
-        resource_envelope = None
-        if self.dialect in ("postgresql", "postgres"):
-            try:
-                from ..pg_tuning import load_or_collect_profile, build_resource_envelope
-                profile = load_or_collect_profile(
-                    self.pipeline.config.db_path_or_dsn,
-                    self.pipeline.benchmark_dir,
-                )
-                resource_envelope = build_resource_envelope(profile)
-                self._stage(
-                    self.query_id,
-                    f"PG system profile loaded ({len(profile.settings)} settings, "
-                    f"{profile.active_connections} active conns)"
-                )
-                self._resource_envelope = resource_envelope
-            except Exception as e:
-                logger.warning(f"[{self.query_id}] Failed to load PG system profile: {e}")
+        self._resource_envelope = resource_envelope
 
         # ── Step 2: Build analyst prompt ─────────────────────────────────
         analyst_prompt = build_analyst_briefing_prompt(
@@ -300,6 +258,7 @@ class SwarmSession(OptimizationSession):
             engine_profile=engine_profile,
             resource_envelope=resource_envelope,
             exploit_algorithm_text=exploit_algorithm_text,
+            plan_scanner_text=plan_scanner_text,
         )
 
         # ── Step 3: Call analyst LLM ─────────────────────────────────────
@@ -641,40 +600,8 @@ class SwarmSession(OptimizationSession):
         }
 
     def _get_explain_plan_text(self, query_id: str) -> Optional[str]:
-        """Load EXPLAIN ANALYZE plan text from cached explains.
-
-        Searches: explains/ (flat) → explains/sf10/ → explains/sf5/ (backward compat).
-        For DuckDB: uses plan_text field (JSON string → rendered tree).
-        For PG: renders plan_json to ASCII tree via format_pg_explain_tree().
-        Returns the ASCII text plan or None.
-        """
-        from ..prompts.analyst_briefing import format_pg_explain_tree
-
-        # Flat first (new standard), then sf10/sf5 (backward compat)
-        search_paths = [
-            self.pipeline.benchmark_dir / "explains" / f"{query_id}.json",
-            self.pipeline.benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
-            self.pipeline.benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
-        ]
-
-        for cache_path in search_paths:
-            if cache_path.exists():
-                try:
-                    data = json.loads(cache_path.read_text())
-                    # DuckDB path: plan_text is a JSON string
-                    plan_text = data.get("plan_text")
-                    if plan_text:
-                        return plan_text
-                    # PG path: render plan_json to ASCII tree
-                    plan_json = data.get("plan_json")
-                    if plan_json:
-                        rendered = format_pg_explain_tree(plan_json)
-                        if rendered:
-                            return rendered
-                except Exception:
-                    pass
-
-        return None
+        """Load EXPLAIN ANALYZE plan text — delegates to Pipeline."""
+        return self.pipeline.get_explain_plan_text(query_id, self.dialect)
 
     def _get_explain_plan_json(self, query_id: str) -> Optional[Any]:
         """Load raw EXPLAIN JSON plan data (for PG tuner prompt).
