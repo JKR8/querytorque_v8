@@ -71,7 +71,7 @@ logger = logging.getLogger("test_swarm_q75")
 
 def intercept_llm_calls(pipeline):
     """Wrap the CandidateGenerator._analyze to log all LLM I/O."""
-    from ado.generate import CandidateGenerator
+    from qt_sql.generate import CandidateGenerator
     original_analyze = CandidateGenerator._analyze
     call_counter = [0]
 
@@ -179,8 +179,8 @@ def main():
 
     # Import
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from ado.pipeline import Pipeline
-    from ado.schemas import OptimizationMode
+    from qt_sql.pipeline import Pipeline
+    from qt_sql.schemas import OptimizationMode
 
     # Load pipeline
     benchmark_dir = "ado/benchmarks/duckdb_tpcds"

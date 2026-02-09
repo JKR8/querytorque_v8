@@ -21,8 +21,8 @@ load_dotenv(".env")
 
 import psycopg2
 
-from ado.pipeline import Pipeline
-from ado.schemas import OptimizationMode
+from qt_sql.pipeline import Pipeline
+from qt_sql.schemas import OptimizationMode
 
 BENCHMARK_DIR = "packages/qt-sql/ado/benchmarks/postgres_dsb"
 QUERIES_DIR = Path(BENCHMARK_DIR) / "queries"

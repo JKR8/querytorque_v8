@@ -56,7 +56,7 @@ for cid in correctness_ids:
     })
 
 # ── Build resource envelope from mock PGSystemProfile ─────────────────
-from ado.pg_tuning import PGSystemProfile, build_resource_envelope
+from qt_sql.pg_tuning import PGSystemProfile, build_resource_envelope
 
 mock_profile = PGSystemProfile(
     settings=[
@@ -112,12 +112,12 @@ mock_profile = PGSystemProfile(
 resource_envelope = build_resource_envelope(mock_profile)
 
 # ── Render PG explain tree ─────────────────────────────────────────────
-from ado.prompts.analyst_briefing import format_pg_explain_tree
+from qt_sql.prompts.analyst_briefing import format_pg_explain_tree
 
 explain_tree_text = format_pg_explain_tree(plan_json)
 
 # ── Build minimal mock DAG for query072 (flat query, no CTEs) ──────────
-from qt_sql.optimization.dag_v2 import QueryDag, DagNode
+from qt_sql.dag import QueryDag, DagNode
 
 mock_main_node = DagNode(
     node_id="main_query",
@@ -145,7 +145,7 @@ for ex in pg_examples:
     })
 
 # ── Build analyst prompt ───────────────────────────────────────────────
-from ado.prompts.analyst_briefing import build_analyst_briefing_prompt
+from qt_sql.prompts.analyst_briefing import build_analyst_briefing_prompt
 
 analyst_prompt = build_analyst_briefing_prompt(
     query_id="query072_agg_s1",
@@ -168,8 +168,8 @@ analyst_prompt = build_analyst_briefing_prompt(
 )
 
 # ── Build mock worker briefing ─────────────────────────────────────────
-from ado.prompts.swarm_parsers import BriefingShared, BriefingWorker
-from ado.prompts.worker_v2 import build_worker_v2_prompt
+from qt_sql.prompts.swarm_parsers import BriefingShared, BriefingWorker
+from qt_sql.prompts.worker import build_worker_prompt
 
 mock_shared = BriefingShared(
     semantic_contract=(
@@ -268,7 +268,7 @@ output_columns = [
     "no_promo", "promo", "total_cnt",
 ]
 
-worker_prompt = build_worker_v2_prompt(
+worker_prompt = build_worker_prompt(
     worker_briefing=mock_worker1,
     shared_briefing=mock_shared,
     examples=pg_examples[:2],  # First 2 PG examples
@@ -280,9 +280,9 @@ worker_prompt = build_worker_v2_prompt(
 )
 
 # ── Build V2 snipe prompts (analyst2 + sniper + sniper retry) ─────────
-from ado.prompts.swarm_snipe import build_snipe_analyst_prompt, build_sniper_prompt
-from ado.prompts.swarm_parsers import SnipeAnalysisV2
-from ado.schemas import WorkerResult
+from qt_sql.prompts.swarm_snipe import build_snipe_analyst_prompt, build_sniper_prompt
+from qt_sql.prompts.swarm_parsers import SnipeAnalysis
+from qt_sql.schemas import WorkerResult
 
 # Mock worker results from fan-out
 mock_worker_results = [
@@ -334,7 +334,7 @@ snipe_analyst_prompt = build_snipe_analyst_prompt(
 )
 
 # Mock analysis from analyst2
-mock_snipe_analysis = SnipeAnalysisV2(
+mock_snipe_analysis = SnipeAnalysis(
     failure_synthesis=(
         "W1 achieved 1.15x via date CTE isolation — the only passing approach. The bottleneck "
         "is the nested-loop join between filtered catalog_sales and inventory (non-equi condition "

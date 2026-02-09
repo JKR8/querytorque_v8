@@ -29,9 +29,9 @@ from threading import Lock
 sys.path.insert(0, str(Path(__file__).parent.parent / "packages" / "qt-sql"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "packages" / "qt-shared"))
 
-from ado.knowledge import KnowledgeRetriever
-from ado.prompt_builder import PromptBuilder, GoldExample
-from ado.context import ContextBuilder
+from qt_sql.knowledge import KnowledgeRetriever
+from qt_sql.prompt_builder import PromptBuilder, GoldExample
+from qt_sql.context import ContextBuilder
 
 
 def load_dsb_queries(queries_dir: Path) -> dict[str, str]:
@@ -65,9 +65,9 @@ def process_single_query(
     progress: dict,
 ) -> dict:
     """Process a single query (for parallel execution)."""
-    from ado.knowledge import KnowledgeRetriever
-    from ado.prompt_builder import PromptBuilder, GoldExample
-    from ado.context import ContextBuilder
+    from qt_sql.knowledge import KnowledgeRetriever
+    from qt_sql.prompt_builder import PromptBuilder, GoldExample
+    from qt_sql.context import ContextBuilder
 
     start_time = time.time()
 
@@ -233,7 +233,7 @@ def collect_rewrites(
 
     # Import LLM client
     try:
-        from ado.generate import CandidateGenerator
+        from qt_sql.generate import CandidateGenerator
         generator = CandidateGenerator(provider=provider, model=model)
         use_llm = True
         print(f"LLM: {provider} / {model or 'default'}")

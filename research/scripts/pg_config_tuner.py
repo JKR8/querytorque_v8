@@ -28,7 +28,7 @@ OUTPUT_FILE = ROOT / "research/pg_tuning_configs.json"
 sys.path.insert(0, str(ROOT / "packages/qt-sql"))
 sys.path.insert(0, str(ROOT / "packages/qt-shared"))
 
-from ado.pg_tuning import validate_tuning_config, build_set_local_sql
+from qt_sql.pg_tuning import validate_tuning_config, build_set_local_sql
 
 
 @dataclass

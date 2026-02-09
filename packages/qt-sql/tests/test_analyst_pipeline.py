@@ -401,7 +401,7 @@ class TestHistoryLoading:
 
     def test_analyst_session_loads_batch_history(self):
         """Verify AnalystSession._build_iteration_history() loads state_N results."""
-        from ado.analyst_session import AnalystSession
+        from qt_sql.analyst_session import AnalystSession
 
         benchmark_dir = QT_SQL / "ado" / "benchmarks" / "duckdb_tpcds"
         state_0_val = benchmark_dir / "state_0" / "validation"
@@ -438,7 +438,7 @@ class TestHistoryLoading:
 
     def test_analyst_session_no_history_returns_none(self):
         """When no batch results and no iterations, should return None."""
-        from ado.analyst_session import AnalystSession
+        from qt_sql.analyst_session import AnalystSession
 
         with tempfile.TemporaryDirectory() as tmpdir:
             mock_pipeline = MagicMock()
@@ -457,7 +457,7 @@ class TestHistoryLoading:
 
     def test_analyst_session_combines_batch_and_session_history(self):
         """When both batch results and session iterations exist, both should appear."""
-        from ado.analyst_session import AnalystSession, AnalystIteration
+        from qt_sql.analyst_session import AnalystSession, AnalystIteration
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
@@ -528,14 +528,14 @@ class TestPromptBuildersUseHistory:
     @pytest.fixture
     def simple_dag(self):
         """Build a minimal DAG from Q51."""
-        from qt_sql.optimization.dag_v2 import DagBuilder, CostAnalyzer
+        from qt_sql.dag import DagBuilder, CostAnalyzer
         sql = "SELECT 1 AS x"
         dag = DagBuilder(sql, dialect="duckdb").build()
         costs = CostAnalyzer(dag).analyze()
         return dag, costs
 
     def test_analyst_prompt_includes_history(self, sample_history, simple_dag):
-        from ado.analyst import build_analysis_prompt
+        from qt_sql.analyst import build_analysis_prompt
 
         dag, costs = simple_dag
         prompt = build_analysis_prompt(
@@ -552,7 +552,7 @@ class TestPromptBuildersUseHistory:
         assert "0.87" in prompt
 
     def test_analyst_prompt_has_failure_analysis_task(self, sample_history, simple_dag):
-        from ado.analyst import build_analysis_prompt
+        from qt_sql.analyst import build_analysis_prompt
 
         dag, costs = simple_dag
         prompt = build_analysis_prompt(
@@ -566,7 +566,7 @@ class TestPromptBuildersUseHistory:
         assert "FAILURE ANALYSIS" in prompt
 
     def test_analyst_prompt_no_history_no_section(self, simple_dag):
-        from ado.analyst import build_analysis_prompt
+        from qt_sql.analyst import build_analysis_prompt
 
         dag, costs = simple_dag
         prompt = build_analysis_prompt(
@@ -581,7 +581,7 @@ class TestPromptBuildersUseHistory:
         assert "FAILURE ANALYSIS" not in prompt
 
     def test_rewrite_prompt_includes_history(self, sample_history, simple_dag):
-        from ado.node_prompter import Prompter
+        from qt_sql.node_prompter import Prompter
 
         dag, costs = simple_dag
         prompter = Prompter()
@@ -598,7 +598,7 @@ class TestPromptBuildersUseHistory:
         assert "REGRESSION" in prompt
 
     def test_rewrite_prompt_no_history_no_section(self, simple_dag):
-        from ado.node_prompter import Prompter
+        from qt_sql.node_prompter import Prompter
 
         dag, costs = simple_dag
         prompter = Prompter()
@@ -618,7 +618,7 @@ class TestPipelineHistoryWiring:
 
     @staticmethod
     def _make_pipeline(use_analyst: bool = True):
-        from ado.pipeline import Pipeline
+        from qt_sql.pipeline import Pipeline
 
         pipeline = Pipeline.__new__(Pipeline)
         pipeline.use_analyst = use_analyst
@@ -636,7 +636,7 @@ class TestPipelineHistoryWiring:
         return pipeline
 
     def test_run_query_passes_history_to_analyst_and_rewrite_prompt(self):
-        from ado.pipeline import Pipeline
+        from qt_sql.pipeline import Pipeline
 
         history = {
             "attempts": [
@@ -663,7 +663,7 @@ class TestPipelineHistoryWiring:
         )
         pipeline._validate = MagicMock(return_value=("NEUTRAL", 1.0, [], None))
 
-        with patch("ado.generate.CandidateGenerator") as mock_generator:
+        with patch("qt_sql.generate.CandidateGenerator") as mock_generator:
             mock_generator.return_value.generate.return_value = []
             result = Pipeline.run_query(
                 pipeline,
@@ -680,7 +680,7 @@ class TestPipelineHistoryWiring:
         assert result.analysis_formatted == "## Expert Analysis\n..."
 
     def test_run_query_passes_history_without_analyst(self):
-        from ado.pipeline import Pipeline
+        from qt_sql.pipeline import Pipeline
 
         history = {
             "attempts": [
@@ -695,7 +695,7 @@ class TestPipelineHistoryWiring:
         pipeline._run_analyst = MagicMock()
         pipeline._validate = MagicMock(return_value=("NEUTRAL", 1.0, [], None))
 
-        with patch("ado.generate.CandidateGenerator") as mock_generator:
+        with patch("qt_sql.generate.CandidateGenerator") as mock_generator:
             mock_generator.return_value.generate.return_value = []
             Pipeline.run_query(
                 pipeline,
@@ -711,7 +711,7 @@ class TestPipelineHistoryWiring:
 
     def test_error_messages_propagate_through_pipeline(self):
         """Verify error_messages from _validate reach the learning record."""
-        from ado.pipeline import Pipeline
+        from qt_sql.pipeline import Pipeline
 
         pipeline = self._make_pipeline(use_analyst=False)
         pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
@@ -725,7 +725,7 @@ class TestPipelineHistoryWiring:
             "execution",
         ))
 
-        with patch("ado.generate.CandidateGenerator") as mock_gen:
+        with patch("qt_sql.generate.CandidateGenerator") as mock_gen:
             mock_gen.return_value.generate.return_value = []
             result = Pipeline.run_query(
                 pipeline, query_id="query_fail", sql="SELECT 1", n_workers=1,
@@ -742,7 +742,7 @@ class TestPipelineHistoryWiring:
 
     def test_fail_status_distinct_from_error(self):
         """Verify FAIL (semantic mismatch) is captured differently from ERROR."""
-        from ado.pipeline import Pipeline
+        from qt_sql.pipeline import Pipeline
 
         pipeline = self._make_pipeline(use_analyst=False)
         pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
@@ -756,7 +756,7 @@ class TestPipelineHistoryWiring:
             "semantic",
         ))
 
-        with patch("ado.generate.CandidateGenerator") as mock_gen:
+        with patch("qt_sql.generate.CandidateGenerator") as mock_gen:
             mock_gen.return_value.generate.return_value = []
             result = Pipeline.run_query(
                 pipeline, query_id="query_sem", sql="SELECT 1", n_workers=1,
@@ -768,7 +768,7 @@ class TestPipelineHistoryWiring:
 
     def test_analyst_session_error_messages_in_iteration(self):
         """Verify AnalystSession captures error_messages in AnalystIteration."""
-        from ado.analyst_session import AnalystSession
+        from qt_sql.analyst_session import AnalystSession
         from unittest.mock import PropertyMock
 
         pipeline = self._make_pipeline(use_analyst=True)
@@ -793,7 +793,7 @@ class TestPipelineHistoryWiring:
             n_workers=1,
         )
 
-        with patch("ado.generate.CandidateGenerator") as mock_gen:
+        with patch("qt_sql.generate.CandidateGenerator") as mock_gen:
             mock_gen.return_value.generate.return_value = []
             session.run()
 
@@ -806,7 +806,7 @@ class TestPipelineHistoryWiring:
 
     def test_analyst_session_errors_in_history(self):
         """Verify error_messages flow into the history dict for retry prompts."""
-        from ado.analyst_session import AnalystSession
+        from qt_sql.analyst_session import AnalystSession
 
         pipeline = self._make_pipeline(use_analyst=True)
         pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
@@ -830,7 +830,7 @@ class TestPipelineHistoryWiring:
             n_workers=1,
         )
 
-        with patch("ado.generate.CandidateGenerator") as mock_gen:
+        with patch("qt_sql.generate.CandidateGenerator") as mock_gen:
             mock_gen.return_value.generate.return_value = []
             session.run()
 
@@ -847,7 +847,7 @@ class TestPipelineHistoryWiring:
 
     def test_retry_preamble_shows_error_messages(self):
         """Verify the retry preamble renders error messages clearly."""
-        from ado.node_prompter import Prompter
+        from qt_sql.node_prompter import Prompter
 
         history = {
             "attempts": [

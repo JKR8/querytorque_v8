@@ -30,11 +30,11 @@ from qt_sql.optimization.dag_v3 import (
     format_example_for_prompt,
     GoldExample,
 )
-from ado.prompt_builder import (
+from qt_sql.prompt_builder import (
     load_all_constraints,
 )
-from qt_sql.optimization.dag_v2 import DagV2Pipeline, DagBuilder
-from qt_sql.optimization.plan_analyzer import analyze_plan_for_optimization
+from qt_sql.dag import DagV2Pipeline, DagBuilder
+from qt_sql.plan_analyzer import analyze_plan_for_optimization
 from qt_sql.execution.database_utils import run_explain_analyze
 from qt_sql.optimization.adaptive_rewriter_v5 import _format_plan_summary
 

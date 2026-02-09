@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ado.analyst_session import AnalystIteration, AnalystSession
-from ado.pipeline import Pipeline
-from ado.prompts.swarm_parsers import parse_fan_out_response
-from ado.schemas import PipelineResult
+from qt_sql.analyst_session import AnalystIteration, AnalystSession
+from qt_sql.pipeline import Pipeline
+from qt_sql.prompts.swarm_parsers import parse_fan_out_response
+from qt_sql.schemas import PipelineResult
 
 
 class _DummyPipeline:
