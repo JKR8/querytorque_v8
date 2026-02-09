@@ -326,8 +326,6 @@ def build_resource_envelope(profile: PGSystemProfile) -> str:
         work_mem_mb = 4
 
     lines = [
-        "## System Resource Envelope",
-        "",
         f"Memory budget: shared_buffers={_get('shared_buffers')}, "
         f"effective_cache_size={_get('effective_cache_size')}",
         f"Global work_mem: {_get('work_mem')} (per-operation)",

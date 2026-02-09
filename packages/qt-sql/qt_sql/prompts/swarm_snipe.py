@@ -202,16 +202,20 @@ def build_snipe_analyst_prompt(
 
     # ── 5. EXPLAIN plan ─────────────────────────────────────────────────
     if explain_plan_text:
-        formatted_plan = format_duckdb_explain_tree(explain_plan_text)
-        lines.append("## EXPLAIN ANALYZE Plan")
+        # explain_plan_text is already pre-rendered text — just detect mode
+        is_estimate = "est_rows=" in explain_plan_text or "EXPLAIN only" in explain_plan_text
+        if is_estimate:
+            lines.append("## EXPLAIN Plan (planner estimates)")
+        else:
+            lines.append("## EXPLAIN ANALYZE Plan")
         lines.append("")
         lines.append("```")
-        plan_lines = formatted_plan.split("\n")
+        plan_lines = explain_plan_text.split("\n")
         if len(plan_lines) > 150:
             lines.extend(plan_lines[:150])
             lines.append(f"... ({len(plan_lines) - 150} more lines truncated)")
         else:
-            lines.append(formatted_plan)
+            lines.append(explain_plan_text)
         lines.append("```")
         lines.append("")
 
@@ -409,7 +413,7 @@ def build_sniper_prompt(
     """
     from .worker import _section_examples, _section_output_format, _section_set_local_config
     from .analyst_briefing import _format_regression_for_analyst
-    from .briefing_checks import build_worker_rewrite_checklist
+    from .briefing_checks import build_sniper_rewrite_checklist
 
     target = _normalize_speedup(target_speedup)
     sections: list[str] = []
@@ -605,8 +609,8 @@ def build_sniper_prompt(
     if dialect in ("postgres", "postgresql") and resource_envelope:
         sections.append(_section_set_local_config(resource_envelope))
 
-    # ── 17. Rewrite checklist ───────────────────────────────────────────
-    sections.append(build_worker_rewrite_checklist())
+    # ── 17. Rewrite checklist (sniper-specific — no TARGET_DAG ref) ────
+    sections.append(build_sniper_rewrite_checklist())
 
     # ── 18. Column completeness contract + output format ────────────────
     sections.append(_section_output_format(output_columns))

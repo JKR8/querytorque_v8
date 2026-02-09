@@ -79,7 +79,10 @@ def generate_query(template_name: str, template_dir: Path, seed: int,
         "-STREAMS", "1",
         "-QUIET", "Y",
     ]
-    subprocess.run(cmd, cwd=str(DSQGEN.parent), capture_output=True, timeout=30)
+    result = subprocess.run(cmd, cwd=str(DSQGEN.parent), capture_output=True,
+                            text=True, timeout=30)
+    if result.returncode != 0:
+        print(f"    dsqgen stderr: {result.stderr.strip()}")
 
     # dsqgen outputs query_0.sql
     out_file = tmp_dir / "query_0.sql"
@@ -96,7 +99,7 @@ def main():
         sys.exit(1)
 
     QUERIES_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_dir = OUTPUT_DIR / "tmp"
+    tmp_dir = Path("/tmp/dsb_gen")
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     # Template dirs

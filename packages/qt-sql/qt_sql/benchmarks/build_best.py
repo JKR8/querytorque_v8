@@ -64,6 +64,46 @@ def load_analyst_winners(benchmark_dir: Path) -> dict:
     return winners
 
 
+def load_run_leaderboards(benchmark_dir: Path) -> dict:
+    """Load and merge leaderboards from runs/run_*/leaderboard.json.
+
+    Returns dict keyed by query_id with the best result per query across all runs.
+    Each entry gets a 'source' field indicating which run it came from.
+    """
+    runs_dir = benchmark_dir / "runs"
+    if not runs_dir.exists():
+        return {}
+
+    merged = {}
+    for run_dir in sorted(runs_dir.iterdir()):
+        if not run_dir.is_dir() or not run_dir.name.startswith("run_"):
+            continue
+        lb_path = run_dir / "leaderboard.json"
+        if not lb_path.exists():
+            continue
+
+        try:
+            with open(lb_path) as f:
+                data = json.load(f)
+            queries = data.get("queries", []) if isinstance(data, dict) else data
+            if isinstance(queries, list):
+                entries = {e["query_id"]: e for e in queries}
+            elif isinstance(queries, dict):
+                entries = queries
+            else:
+                continue
+
+            for qid, entry in entries.items():
+                entry.setdefault("source", run_dir.name)
+                prev = merged.get(qid)
+                if prev is None or entry.get("speedup", 0) > prev.get("speedup", 0):
+                    merged[qid] = entry
+        except Exception:
+            continue
+
+    return merged
+
+
 def build_best(benchmark_name: str):
     """Build best/ folder for a single benchmark."""
     benchmark_dir = BENCHMARKS_DIR / benchmark_name
@@ -74,8 +114,16 @@ def build_best(benchmark_name: str):
     print(f"\nBuilding best/ for {benchmark_name}")
     print("=" * 50)
 
-    # Load all sources
+    # Load all sources — root leaderboard + runs/ + analyst_winners
     leaderboard = load_leaderboard(benchmark_dir)
+
+    # Merge in results from runs/run_*/leaderboard.json
+    run_results = load_run_leaderboards(benchmark_dir)
+    for qid, entry in run_results.items():
+        prev = leaderboard.get(qid)
+        if prev is None or entry.get("speedup", 0) > prev.get("speedup", 0):
+            leaderboard[qid] = entry
+
     analyst_winners = load_analyst_winners(benchmark_dir)
 
     if not leaderboard:

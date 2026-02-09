@@ -734,15 +734,27 @@ def extract_query_entries(
 
 
 def phase1_extract(batch_dir: Path) -> List[BlackboardEntry]:
-    """Phase 1: Extract all BlackboardEntry records from a swarm batch."""
+    """Phase 1: Extract all BlackboardEntry records from a swarm batch or run.
+
+    Supports both legacy swarm_batch_* layout (query_* subdirs with benchmark_iter*.json)
+    and new runs/run_* layout (query subdirs with validation.json).
+    """
     run_name = batch_dir.name
     timestamp = datetime.now().isoformat()
 
-    # Find all query directories
+    # Find all query directories — support both "query_*" (legacy) and any subdir (new)
     query_dirs = sorted(
-        [d for d in batch_dir.iterdir() if d.is_dir() and d.name.startswith("query")],
+        [d for d in batch_dir.iterdir()
+         if d.is_dir() and not d.name.startswith(".") and d.name != "blackboard"],
         key=lambda d: d.name,
     )
+    # Filter to only dirs that look like query dirs (have query artifacts)
+    query_dirs = [
+        d for d in query_dirs
+        if d.name.startswith("query")
+        or (d / "validation.json").exists()
+        or (d / "original.sql").exists()
+    ]
 
     logger.info(f"Phase 1: Extracting from {len(query_dirs)} query directories")
 
@@ -1145,23 +1157,28 @@ _QT_DIR = Path(__file__).resolve().parent  # .../qt_sql/
 def _detect_benchmark_config(batch_dir: Path) -> Dict[str, Any]:
     """Detect engine/dataset from config.json in the parent benchmark dir.
 
-    batch_dir is e.g. benchmarks/postgres_dsb/swarm_batch_20260208_142643/
-    so parent is benchmarks/postgres_dsb/ which contains config.json.
+    batch_dir can be:
+      - benchmarks/postgres_dsb/swarm_batch_20260208_142643/  (legacy)
+      - benchmarks/postgres_dsb/runs/run_20260209_143000/     (new standard)
+    Walks up from batch_dir looking for config.json.
     """
-    parent = batch_dir.resolve().parent  # benchmarks/<benchmark>/
-    config_path = parent / "config.json"
-    if config_path.exists():
-        cfg = json.loads(config_path.read_text())
-        engine = cfg.get("engine", "duckdb")
-        benchmark = cfg.get("benchmark", parent.name)
-        dataset = f"{engine}_{benchmark}"
-        return {
-            "engine": engine,
-            "benchmark": benchmark,
-            "dataset": dataset,
-            "benchmark_dir": parent,
-        }
+    resolved = batch_dir.resolve()
+    # Try parent, then grandparent (for runs/run_* → benchmark_dir)
+    for ancestor in [resolved.parent, resolved.parent.parent]:
+        config_path = ancestor / "config.json"
+        if config_path.exists():
+            cfg = json.loads(config_path.read_text())
+            engine = cfg.get("engine", "duckdb")
+            benchmark = cfg.get("benchmark", ancestor.name)
+            dataset = f"{engine}_{benchmark}"
+            return {
+                "engine": engine,
+                "benchmark": benchmark,
+                "dataset": dataset,
+                "benchmark_dir": ancestor,
+            }
     # Fallback for duckdb_tpcds (no config.json needed)
+    parent = resolved.parent
     return {
         "engine": "duckdb",
         "benchmark": "tpcds",
@@ -1291,6 +1308,88 @@ def read_swarm_source(batch_dir: Path) -> Dict[str, List[SourceAttempt]]:
                 ))
 
     logger.info(f"  Swarm: {sum(len(v) for v in result.values())} attempts across {len(result)} queries")
+    return dict(result)
+
+
+def read_run_source(run_dir: Path) -> Dict[str, List[SourceAttempt]]:
+    """Read a standardized runs/run_* directory, return attempts keyed by query_id.
+
+    New layout: run_dir/{query_id}/validation.json + worker_*_sql.sql + ...
+    """
+    result: Dict[str, List[SourceAttempt]] = defaultdict(list)
+    run_name = run_dir.name
+
+    # Load run_meta if available
+    run_meta = {}
+    meta_path = run_dir / "run_meta.json"
+    if meta_path.exists():
+        run_meta = load_json(meta_path) or {}
+
+    model = run_meta.get("model", "unknown")
+
+    query_dirs = sorted(
+        [d for d in run_dir.iterdir() if d.is_dir() and not d.name.startswith(".")],
+        key=lambda d: d.name,
+    )
+
+    for qdir in query_dirs:
+        qid = normalize_query_id(qdir.name)
+
+        # Load validation.json (contains all worker results)
+        val_data = load_json(qdir / "validation.json")
+        if not val_data:
+            continue
+
+        original_sql = load_text(qdir / "original.sql") or None
+        assignments = load_json(qdir / "assignments.json") or []
+        assignments_by_worker: Dict[int, Dict[str, Any]] = {}
+        if isinstance(assignments, list):
+            for a in assignments:
+                assignments_by_worker[a.get("worker_id", 0)] = a
+
+        # Read all workers from validation.json
+        for wr in val_data.get("all_workers", []):
+            wid = wr.get("worker_id", 0)
+            strategy = wr.get("strategy", "")
+            examples = wr.get("examples_used", [])
+
+            # Load prompt/response/sql from files
+            is_snipe = "snipe" in strategy
+            if is_snipe:
+                # Extract snipe number from strategy like "sniper_1" or "sniper_retry_2"
+                import re as _re
+                snipe_match = _re.search(r"(\d+)", strategy)
+                snipe_num = int(snipe_match.group(1)) if snipe_match else 1
+                response_text = load_text(qdir / f"snipe_{snipe_num}_response.txt")
+                optimized_sql = load_text(qdir / f"snipe_{snipe_num}_sql.sql") or wr.get("optimized_sql")
+            else:
+                response_text = load_text(qdir / f"worker_{wid}_response.txt")
+                optimized_sql = load_text(qdir / f"worker_{wid}_sql.sql") or wr.get("optimized_sql")
+
+            assignment = assignments_by_worker.get(wid, {})
+
+            result[qid].append(SourceAttempt(
+                source="Run",
+                run=run_name,
+                model=model,
+                worker_id=wid,
+                iteration=0 if not is_snipe else 1,
+                strategy=strategy[:200],
+                speedup=wr.get("speedup", 0.0),
+                original_ms=0.0,  # not tracked per-worker in new format
+                optimized_ms=0.0,
+                status=wr.get("status", ""),
+                rows_match=True,
+                optimized_sql=optimized_sql,
+                original_sql=original_sql,
+                reasoning=response_text,
+                changes_description=None,
+                transforms=wr.get("transforms", []),
+                examples_used=examples,
+                error=wr.get("error_message"),
+            ))
+
+    logger.info(f"  Run: {sum(len(v) for v in result.values())} attempts across {len(result)} queries from {run_name}")
     return dict(result)
 
 
@@ -2324,7 +2423,7 @@ def main():
 
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  python3 -m ado.build_blackboard <swarm_batch_dir>   # Swarm blackboard")
+        print("  python3 -m ado.build_blackboard <batch_or_run_dir>  # Swarm/run blackboard")
         print("  python3 -m ado.build_blackboard --global            # Global blackboard")
         print("  python3 -m ado.build_blackboard --promote-only <dir> # Auto-promote winners only")
         print()
@@ -2332,8 +2431,12 @@ def main():
         print("  --dry-run    Show what would be promoted without writing")
         print()
         print("Examples:")
+        print("  # Legacy swarm batch:")
         print("  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard \\")
         print("      packages/qt-sql/ado/benchmarks/duckdb_tpcds/swarm_batch_20260208_102033")
+        print("  # New standard run:")
+        print("  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard \\")
+        print("      packages/qt-sql/qt_sql/benchmarks/postgres_dsb_76/runs/run_20260209_143000")
         print("  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard --global")
         sys.exit(1)
 

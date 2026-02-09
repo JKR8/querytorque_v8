@@ -52,6 +52,19 @@ def build_worker_rewrite_checklist() -> str:
     ])
 
 
+def build_sniper_rewrite_checklist() -> str:
+    """Checklist the sniper uses before returning SQL (no TARGET_DAG reference)."""
+    return "\n".join([
+        "## Rewrite Checklist (must pass before final SQL)",
+        "",
+        "- Verify output schema matches the Column Completeness Contract (same columns, same names, same order).",
+        "- Keep all semantic invariants from `Correctness Invariants` (including join/null behavior).",
+        "- Verify aggregation equivalence: same rows participate in each group, same aggregate semantics.",
+        "- Preserve all literals exactly (numbers, strings, date values).",
+        "- Apply `Hazard Flags` as hard guards against known failure modes.",
+    ])
+
+
 def validate_parsed_briefing(briefing: Any) -> List[str]:
     """Validate that a parsed analyst briefing is correctly populated.
 

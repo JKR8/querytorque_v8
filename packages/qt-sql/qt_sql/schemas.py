@@ -11,6 +11,7 @@ import json
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
@@ -199,6 +200,84 @@ class WorkerResult:
         if self.set_local_config:
             d["set_local_config"] = self.set_local_config
         return d
+
+
+@dataclass
+class RunMeta:
+    """Metadata for a benchmark run — full traceability for every API-cost run."""
+    run_id: str
+    started_at: str
+    finished_at: str = ""
+    duration_seconds: float = 0.0
+    git_sha: str = ""
+    git_branch: str = ""
+    git_dirty: bool = False
+    model: str = ""
+    provider: str = ""
+    config_snapshot: Dict[str, Any] = field(default_factory=dict)
+    workers: int = 4
+    queries_attempted: int = 0
+    queries_improved: int = 0
+    total_api_calls: int = 0
+    estimated_cost_usd: float = 0.0
+    validation_method: str = ""
+    notes: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration_seconds": self.duration_seconds,
+            "git_sha": self.git_sha,
+            "git_branch": self.git_branch,
+            "git_dirty": self.git_dirty,
+            "model": self.model,
+            "provider": self.provider,
+            "config_snapshot": self.config_snapshot,
+            "workers": self.workers,
+            "queries_attempted": self.queries_attempted,
+            "queries_improved": self.queries_improved,
+            "total_api_calls": self.total_api_calls,
+            "estimated_cost_usd": self.estimated_cost_usd,
+            "validation_method": self.validation_method,
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "RunMeta":
+        data = json.loads(Path(path).read_text())
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+    def save(self, path: str | Path) -> None:
+        Path(path).write_text(json.dumps(self.to_dict(), indent=2))
+
+    @staticmethod
+    def generate_run_id() -> str:
+        return f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    @staticmethod
+    def capture_git_info() -> Dict[str, Any]:
+        """Capture current git SHA, branch, dirty status."""
+        import subprocess
+        info: Dict[str, Any] = {"git_sha": "", "git_branch": "", "git_dirty": False}
+        try:
+            info["git_sha"] = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            info["git_branch"] = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            dirty_check = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True, timeout=5,
+            )
+            info["git_dirty"] = bool(dirty_check.stdout.strip())
+        except Exception:
+            pass
+        return info
 
 
 @dataclass

@@ -40,20 +40,26 @@ pg_examples = []
 for f in sorted(EXAMPLES_DIR.glob("*.json")):
     pg_examples.append(json.loads(f.read_text()))
 
-# Load correctness constraints
-correctness_ids = [
-    "LITERAL_PRESERVATION", "SEMANTIC_EQUIVALENCE",
-    "COMPLETE_OUTPUT", "CTE_COLUMN_COMPLETENESS",
+# Load real correctness constraints from JSON files
+correctness_files = [
+    "literal_preservation.json", "semantic_equivalence.json",
+    "complete_output.json", "cte_column_completeness.json",
 ]
 constraints = []
-for cid in correctness_ids:
-    # These are synthetic — the real ones live embedded in the analyst code
-    constraints.append({
-        "id": cid,
-        "severity": "CRITICAL",
-        "overridable": False,
-        "prompt_instruction": f"Correctness gate: {cid.replace('_', ' ').title()}",
-    })
+for fname in correctness_files:
+    cpath = CONSTRAINTS_DIR / fname
+    if cpath.exists():
+        constraints.append(json.loads(cpath.read_text()))
+    else:
+        print(f"  WARNING: constraint file not found: {cpath}")
+# Add PG-specific constraints relevant to this query
+pg_constraint_files = [
+    "pg_cte_duplication_block.json", "pg_date_cte_caution.json",
+]
+for fname in pg_constraint_files:
+    cpath = CONSTRAINTS_DIR / fname
+    if cpath.exists():
+        constraints.append(json.loads(cpath.read_text()))
 
 # ── Build resource envelope from mock PGSystemProfile ─────────────────
 from qt_sql.pg_tuning import PGSystemProfile, build_resource_envelope
@@ -117,7 +123,7 @@ from qt_sql.prompts.analyst_briefing import format_pg_explain_tree
 explain_tree_text = format_pg_explain_tree(plan_json)
 
 # ── Build minimal mock DAG for query072 (flat query, no CTEs) ──────────
-from qt_sql.dag import QueryDag, DagNode
+from qt_sql.dag import QueryDag, DagNode, NodeCost
 
 mock_main_node = DagNode(
     node_id="main_query",
@@ -134,6 +140,17 @@ mock_dag = QueryDag(
     edges=[],
     original_sql=sql,
 )
+
+# Realistic cost data from EXPLAIN plan (Q072 is a single main node)
+mock_costs = {
+    "main_query": NodeCost(
+        node_id="main_query",
+        cost_pct=100.0,
+        row_estimate=142,
+        operators=["Nested Loop", "Hash Join", "Index Scan", "Seq Scan",
+                    "Sort", "GroupAggregate"],
+    ),
+}
 
 # ── Build compact example catalog ──────────────────────────────────────
 example_catalog = []
@@ -152,7 +169,7 @@ analyst_prompt = build_analyst_briefing_prompt(
     sql=sql,
     explain_plan_text=explain_tree_text,  # pre-rendered PG explain tree
     dag=mock_dag,
-    costs={},
+    costs=mock_costs,
     semantic_intents=None,
     global_knowledge=None,
     matched_examples=pg_examples[:6],  # All PG gold examples
@@ -289,16 +306,73 @@ mock_worker_results = [
     WorkerResult(
         worker_id=1, strategy="star_join_prefetch",
         examples_used=["pg_date_cte_explicit_join", "pg_dimension_prefetch_star"],
-        optimized_sql="WITH filtered_dates AS (\n  SELECT d_date_sk, d_week_seq, d_date\n  FROM date_dim\n  WHERE d_year = 1998\n)\nSELECT i_item_desc, w_warehouse_name, d_week_seq\nFROM catalog_sales cs\nJOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk\n-- ... rest of query",
+        optimized_sql="""\
+WITH filtered_dates AS (
+  SELECT d_date_sk, d_week_seq, d_date
+  FROM date_dim
+  WHERE d_year = 1998
+)
+SELECT i_item_desc, w_warehouse_name, d1.d_week_seq,
+       sum(case when p_promo_sk is null then 1 else 0 end) no_promo,
+       sum(case when p_promo_sk is not null then 1 else 0 end) promo,
+       count(*) total_cnt
+FROM catalog_sales cs
+JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk
+JOIN date_dim d2 ON d2.d_week_seq = fd.d_week_seq
+JOIN inventory inv ON inv.inv_date_sk = d2.d_date_sk
+  AND inv.inv_item_sk = cs.cs_item_sk
+  AND inv.inv_quantity_on_hand < cs.cs_quantity
+JOIN warehouse w ON w.w_warehouse_sk = inv.inv_warehouse_sk
+JOIN item i ON i.i_item_sk = cs.cs_item_sk
+  AND i.i_category IN ('Children', 'Jewelry', 'Men')
+JOIN customer_demographics cd ON cd.cd_demo_sk = cs.cs_bill_cdemo_sk
+  AND cd.cd_marital_status = 'U'
+  AND cd.cd_dep_count BETWEEN 9 AND 11
+JOIN household_demographics hd ON hd.hd_demo_sk = cs.cs_bill_hdemo_sk
+  AND hd.hd_buy_potential = '>10000'
+JOIN date_dim d3 ON d3.d_date_sk = cs.cs_ship_date_sk
+  AND d3.d_date > fd.d_date + interval '3 day'
+LEFT JOIN promotion p ON p.p_promo_sk = cs.cs_promo_sk
+LEFT JOIN catalog_returns cr ON cr.cr_item_sk = cs.cs_item_sk
+  AND cr.cr_order_number = cs.cs_order_number
+WHERE cs.cs_wholesale_cost BETWEEN 35 AND 55
+GROUP BY i_item_desc, w_warehouse_name, d1.d_week_seq
+ORDER BY total_cnt DESC, i_item_desc, w_warehouse_name, d1.d_week_seq
+LIMIT 100""",
         speedup=1.15, status="NEUTRAL", transforms=["pushdown", "date_cte_isolate"],
         hint="Pre-filter date dim into CTE, then join star schema",
     ),
     WorkerResult(
         worker_id=2, strategy="decorrelate_subquery",
         examples_used=["pg_decorrelate_exists"],
-        optimized_sql="SELECT i_item_desc, w_warehouse_name, d_week_seq\nFROM catalog_sales cs\nJOIN inventory inv ON inv.inv_item_sk = cs.cs_item_sk\n-- ... decorrelated version",
+        optimized_sql="""\
+SELECT i.i_item_desc, w.w_warehouse_name, d1.d_week_seq,
+       sum(case when p.p_promo_sk is null then 1 else 0 end) no_promo,
+       sum(case when p.p_promo_sk is not null then 1 else 0 end) promo,
+       count(*) total_cnt
+FROM catalog_sales cs
+JOIN date_dim d1 ON cs.cs_sold_date_sk = d1.d_date_sk AND d1.d_year = 1998
+JOIN date_dim d2 ON d2.d_week_seq = d1.d_week_seq
+JOIN inventory inv ON inv.inv_date_sk = d2.d_date_sk
+  AND inv.inv_item_sk = cs.cs_item_sk
+JOIN warehouse w ON w.w_warehouse_sk = inv.inv_warehouse_sk
+JOIN item i ON i.i_item_sk = cs.cs_item_sk
+  AND i.i_category IN ('Children', 'Jewelry', 'Men')
+JOIN customer_demographics cd ON cd.cd_demo_sk = cs.cs_bill_cdemo_sk
+  AND cd.cd_marital_status = 'U' AND cd.cd_dep_count BETWEEN 9 AND 11
+JOIN household_demographics hd ON hd.hd_demo_sk = cs.cs_bill_hdemo_sk
+  AND hd.hd_buy_potential = '>10000'
+JOIN date_dim d3 ON d3.d_date_sk = cs.cs_ship_date_sk
+LEFT JOIN promotion p ON p.p_promo_sk = cs.cs_promo_sk
+LEFT JOIN catalog_returns cr ON cr.cr_item_sk = cs.cs_item_sk
+  AND cr.cr_order_number = cs.cs_order_number
+WHERE cs.cs_wholesale_cost BETWEEN 35 AND 55
+  AND inv.inv_quantity_on_hand < cs.cs_quantity
+GROUP BY i.i_item_desc, w.w_warehouse_name, d1.d_week_seq
+ORDER BY total_cnt DESC, i.i_item_desc, w.w_warehouse_name, d1.d_week_seq
+LIMIT 100""",
         speedup=0.85, status="REGRESSION", transforms=["decorrelate"],
-        error_message="Row count mismatch: expected 142, got 198",
+        error_message="Row count mismatch: expected 142, got 198 — missing d3.d_date > d1.d_date + interval '3 day' filter",
     ),
     WorkerResult(
         worker_id=3, strategy="scan_consolidation",
@@ -310,7 +384,39 @@ mock_worker_results = [
     WorkerResult(
         worker_id=4, strategy="exploration_novel",
         examples_used=[],
-        optimized_sql="SELECT i_item_desc, w_warehouse_name, d_week_seq\nFROM catalog_sales cs\nJOIN date_dim d1 ON cs.cs_sold_date_sk = d1.d_date_sk\n-- ... novel approach",
+        optimized_sql="""\
+WITH inv_weekly AS (
+  SELECT inv_item_sk, inv_warehouse_sk, d2.d_week_seq,
+         min(inv_quantity_on_hand) AS min_inv_qty
+  FROM inventory inv
+  JOIN date_dim d2 ON d2.d_date_sk = inv.inv_date_sk
+  GROUP BY inv_item_sk, inv_warehouse_sk, d2.d_week_seq
+)
+SELECT i.i_item_desc, w.w_warehouse_name, d1.d_week_seq,
+       sum(case when p.p_promo_sk is null then 1 else 0 end) no_promo,
+       sum(case when p.p_promo_sk is not null then 1 else 0 end) promo,
+       count(*) total_cnt
+FROM catalog_sales cs
+JOIN date_dim d1 ON cs.cs_sold_date_sk = d1.d_date_sk AND d1.d_year = 1998
+JOIN inv_weekly iw ON iw.inv_item_sk = cs.cs_item_sk
+  AND iw.d_week_seq = d1.d_week_seq
+  AND iw.min_inv_qty < cs.cs_quantity
+JOIN warehouse w ON w.w_warehouse_sk = iw.inv_warehouse_sk
+JOIN item i ON i.i_item_sk = cs.cs_item_sk
+  AND i.i_category IN ('Children', 'Jewelry', 'Men')
+JOIN customer_demographics cd ON cd.cd_demo_sk = cs.cs_bill_cdemo_sk
+  AND cd.cd_marital_status = 'U' AND cd.cd_dep_count BETWEEN 9 AND 11
+JOIN household_demographics hd ON hd.hd_demo_sk = cs.cs_bill_hdemo_sk
+  AND hd.hd_buy_potential = '>10000'
+JOIN date_dim d3 ON d3.d_date_sk = cs.cs_ship_date_sk
+  AND d3.d_date > d1.d_date + interval '3 day'
+LEFT JOIN promotion p ON p.p_promo_sk = cs.cs_promo_sk
+LEFT JOIN catalog_returns cr ON cr.cr_item_sk = cs.cs_item_sk
+  AND cr.cr_order_number = cs.cs_order_number
+WHERE cs.cs_wholesale_cost BETWEEN 35 AND 55
+GROUP BY i.i_item_desc, w.w_warehouse_name, d1.d_week_seq
+ORDER BY total_cnt DESC, i.i_item_desc, w.w_warehouse_name, d1.d_week_seq
+LIMIT 100""",
         speedup=0.92, status="REGRESSION", transforms=["novel"],
         exploratory=True,
     ),
@@ -322,7 +428,7 @@ snipe_analyst_prompt = build_snipe_analyst_prompt(
     worker_results=mock_worker_results,
     target_speedup=2.0,
     dag=mock_dag,
-    costs={},
+    costs=mock_costs,
     explain_plan_text=explain_tree_text,
     engine_profile=engine_profile,
     constraints=constraints,
@@ -393,7 +499,7 @@ sniper_prompt = build_sniper_prompt(
     examples=pg_examples[:2],
     output_columns=output_columns,
     dag=mock_dag,
-    costs={},
+    costs=mock_costs,
     engine_profile=engine_profile,
     constraints=constraints,
     dialect="postgresql",
@@ -411,7 +517,7 @@ sniper_retry_prompt = build_sniper_prompt(
     examples=pg_examples[:2],
     output_columns=output_columns,
     dag=mock_dag,
-    costs={},
+    costs=mock_costs,
     engine_profile=engine_profile,
     constraints=constraints,
     dialect="postgresql",

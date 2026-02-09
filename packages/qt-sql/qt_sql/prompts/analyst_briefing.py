@@ -233,15 +233,26 @@ def _render_pg_node(
     depth: int,
     lines: list[str],
     max_depth: int = 30,
+    is_estimate: bool = False,
 ) -> None:
     """Recursively render a PG EXPLAIN JSON node as indented text."""
     if depth > max_depth:
         return
 
     ntype = node.get("Node Type", "???")
-    rows = node.get("Actual Rows", 0) or 0
-    loops = node.get("Actual Loops", 1) or 1
-    time_ms = node.get("Actual Total Time", 0) or 0
+
+    # Prefer ANALYZE actuals; fall back to planner estimates
+    if "Actual Rows" in node:
+        rows = node.get("Actual Rows", 0) or 0
+        loops = node.get("Actual Loops", 1) or 1
+        time_ms = node.get("Actual Total Time", 0) or 0
+        is_estimate = False
+    else:
+        rows = node.get("Plan Rows", 0) or 0
+        loops = 1
+        time_ms = node.get("Total Cost", 0) or 0  # cost units, not ms
+        is_estimate = True
+
     indent = "  " * depth
 
     # Build the main line
@@ -267,8 +278,11 @@ def _render_pg_node(
 
     line = " ".join(parts)
 
-    # Stats
-    stats = f"(rows={_fmt_count(rows)} loops={loops} time={time_ms:.1f}ms)"
+    # Stats — label clearly when using planner estimates vs actual measurements
+    if is_estimate:
+        stats = f"(est_rows={_fmt_count(rows)} cost={time_ms:.0f})"
+    else:
+        stats = f"(rows={_fmt_count(rows)} loops={loops} time={time_ms:.1f}ms)"
     lines.append(f"{line}  {stats}")
 
     # Important detail lines
@@ -331,7 +345,7 @@ def _render_pg_node(
 
     # Recurse into children
     for child in node.get("Plans", []):
-        _render_pg_node(child, depth + 1, lines, max_depth)
+        _render_pg_node(child, depth + 1, lines, max_depth, is_estimate)
 
 
 def format_pg_explain_tree(plan_json: Any) -> str:
@@ -366,17 +380,26 @@ def format_pg_explain_tree(plan_json: Any) -> str:
 
     lines: list[str] = []
 
+    # Detect whether this is EXPLAIN ANALYZE (has actuals) or plain EXPLAIN (estimates only)
+    has_actuals = "Actual Rows" in root
+    is_estimate = not has_actuals
+
     # Header with total times
-    total_ms = root.get("Actual Total Time", 0)
-    if total_ms:
-        lines.append(f"Total execution time: {total_ms:.1f}ms")
+    if has_actuals:
+        total_ms = root.get("Actual Total Time", 0)
+        if total_ms:
+            lines.append(f"Total execution time: {total_ms:.1f}ms")
+    else:
+        total_cost = root.get("Total Cost", 0)
+        lines.append(f"NOTE: EXPLAIN only (no ANALYZE) — rows and costs are planner ESTIMATES, not measurements.")
+        lines.append(f"Total estimated cost: {total_cost:.0f}")
     if planning_ms:
         lines.append(f"Planning time: {planning_ms:.1f}ms")
     if lines:
         lines.append("")
 
     # Render the tree
-    _render_pg_node(root, depth=0, lines=lines)
+    _render_pg_node(root, depth=0, lines=lines, is_estimate=is_estimate)
 
     # JIT info
     jit = top.get("JIT") or root.get("JIT")
@@ -628,6 +651,7 @@ def build_analyst_briefing_prompt(
     query_archetype: Optional[str] = None,
     engine_profile: Optional[Dict[str, Any]] = None,
     resource_envelope: Optional[str] = None,
+    exploit_algorithm_text: Optional[str] = None,
 ) -> str:
     """Build the V2 analyst briefing prompt.
 
@@ -652,6 +676,8 @@ def build_analyst_briefing_prompt(
         query_archetype: Archetype classification for this query (e.g., 'scan_consolidation')
         engine_profile: Engine profile JSON with optimizer strengths/gaps (may be None)
         resource_envelope: System resource envelope text for PG workers (may be None)
+        exploit_algorithm_text: Evidence-based exploit algorithm YAML from frontier
+            probing (may be None). When present, replaces engine profile section.
 
     Returns:
         Complete analyst prompt string (~3000-5000 tokens input)
@@ -686,10 +712,16 @@ def build_analyst_briefing_prompt(
     lines.append("```")
     lines.append("")
 
-    # ── 3. EXPLAIN ANALYZE plan text ─────────────────────────────────────
+    # ── 3. EXPLAIN plan ─────────────────────────────────────────────────
+    is_estimate_plan = False  # hoisted for use in reasoning step 2
     if explain_plan_text:
         formatted_plan = format_duckdb_explain_tree(explain_plan_text)
-        lines.append("## EXPLAIN ANALYZE Plan")
+        # Detect estimate-only plans (no actual timing data)
+        is_estimate_plan = "est_rows=" in formatted_plan or "EXPLAIN only" in formatted_plan
+        if is_estimate_plan:
+            lines.append("## EXPLAIN Plan (planner estimates)")
+        else:
+            lines.append("## EXPLAIN ANALYZE Plan")
         lines.append("")
         lines.append("```")
         # Truncate very long plans to ~150 lines
@@ -717,14 +749,21 @@ def build_analyst_briefing_prompt(
                 "to get pipeline cost. DAG cost percentages are derived metrics that may "
                 "not reflect actual execution time — use EXPLAIN timings as ground truth."
             )
+        elif is_estimate_plan:
+            lines.append(
+                "This is a plan-only EXPLAIN (no ANALYZE). Row counts and costs are "
+                "planner predictions — use them directionally but flag your diagnosis as "
+                "lower-confidence. Fall back to schema-based reasoning (table sizes, index "
+                "selectivity, join fan-out) to validate planner estimates."
+            )
         else:
             lines.append(
-                "Use EXPLAIN timings as ground truth. DAG cost percentages are derived "
-                "metrics that may not reflect actual execution time."
+                "Use EXPLAIN ANALYZE timings as ground truth. DAG cost percentages are "
+                "derived metrics that may not reflect actual execution time."
             )
         lines.append("")
     else:
-        lines.append("## EXPLAIN ANALYZE Plan")
+        lines.append("## EXPLAIN Plan")
         lines.append("")
         lines.append(
             "*EXPLAIN plan not available for this query. "
@@ -838,8 +877,19 @@ def build_analyst_briefing_prompt(
             lines.append(_format_regression_for_analyst(reg))
             lines.append("")
 
-    # ── 10. Engine Profile (field intelligence briefing) ─────────────────
-    if engine_profile:
+    # ── 10. Exploit Algorithm or Engine Profile ──────────────────────────
+    if exploit_algorithm_text:
+        lines.append("## Exploit Algorithm: Evidence-Based Gap Intelligence")
+        lines.append("")
+        lines.append(
+            "The following YAML describes known optimizer gaps with detection rules, "
+            "procedural exploit steps, and evidence. Use DETECT rules to match "
+            "structural features of the query, then follow EXPLOIT_STEPS."
+        )
+        lines.append("")
+        lines.append(exploit_algorithm_text)
+        lines.append("")
+    elif engine_profile:
         briefing_note = engine_profile.get("briefing_note", "")
         lines.append("## Engine Profile: Field Intelligence Briefing")
         lines.append("")
@@ -951,22 +1001,40 @@ def build_analyst_briefing_prompt(
         "multi-channel UNION ALL / EXISTS-set operations / other)"
     )
     lines.append("")
-    lines.append(
-        "2. **EXPLAIN PLAN ANALYSIS**: From the EXPLAIN ANALYZE output, identify:\n"
-        "   - Compute wall-clock ms per EXPLAIN node. Sum repeated operations "
-        "(e.g., 2x store_sales joins = total cost). The EXPLAIN is ground truth, "
-        "not the DAG cost percentages.\n"
-        "   - Which nodes consume >10% of runtime and WHY\n"
-        "   - Where row counts drop sharply (existing selectivity)\n"
-        "   - Where row counts DON'T drop (missed optimization opportunity)\n"
-        "   - Whether the optimizer already splits CTEs, pushes predicates, "
-        "or performs transforms you might otherwise assign\n"
-        "   - Count scans per base table. If a fact table is scanned N times, "
-        "a restructuring that reduces it to 1 scan saves (N-1)/N of that table's "
-        "I/O cost. Prioritize transforms that reduce scan count on the largest tables.\n"
-        "   - Whether the CTE is materialized once and probed multiple times, "
-        "or re-executed per reference"
-    )
+    if is_estimate_plan:
+        lines.append(
+            "2. **EXPLAIN PLAN ANALYSIS**: From the EXPLAIN plan (planner estimates), identify:\n"
+            "   - Compare estimated row counts and costs per node. These are planner "
+            "predictions, not measurements — use them directionally. Cross-check against "
+            "schema knowledge (table sizes, index selectivity) where estimates look suspect.\n"
+            "   - Which nodes have the highest estimated cost and WHY\n"
+            "   - Where estimated row counts drop sharply (existing selectivity)\n"
+            "   - Where estimated row counts DON'T drop (missed optimization opportunity)\n"
+            "   - Whether the optimizer already splits CTEs, pushes predicates, "
+            "or performs transforms you might otherwise assign\n"
+            "   - Count scans per base table. If a fact table is scanned N times, "
+            "a restructuring that reduces it to 1 scan saves (N-1)/N of that table's "
+            "I/O cost. Prioritize transforms that reduce scan count on the largest tables.\n"
+            "   - Whether the CTE is materialized once and probed multiple times, "
+            "or re-executed per reference"
+        )
+    else:
+        lines.append(
+            "2. **EXPLAIN PLAN ANALYSIS**: From the EXPLAIN ANALYZE output, identify:\n"
+            "   - Compute wall-clock ms per EXPLAIN node. Sum repeated operations "
+            "(e.g., 2x store_sales joins = total cost). The EXPLAIN is ground truth, "
+            "not the DAG cost percentages.\n"
+            "   - Which nodes consume >10% of runtime and WHY\n"
+            "   - Where row counts drop sharply (existing selectivity)\n"
+            "   - Where row counts DON'T drop (missed optimization opportunity)\n"
+            "   - Whether the optimizer already splits CTEs, pushes predicates, "
+            "or performs transforms you might otherwise assign\n"
+            "   - Count scans per base table. If a fact table is scanned N times, "
+            "a restructuring that reduces it to 1 scan saves (N-1)/N of that table's "
+            "I/O cost. Prioritize transforms that reduce scan count on the largest tables.\n"
+            "   - Whether the CTE is materialized once and probed multiple times, "
+            "or re-executed per reference"
+        )
     lines.append("")
     lines.append(
         "3. **GAP MATCHING**: Compare the EXPLAIN analysis to the Engine Profile "

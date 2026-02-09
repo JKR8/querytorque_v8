@@ -1,0 +1,171 @@
+# {{ENGINE}} {{VERSION}} Exploit Algorithm
+# Generated: {{date}} | Probes: {{N}} | Queries: {{Q}}
+# Coverage: {{percentage of corpus where >=1.5x achieved}}
+
+## DETECTION RULES
+
+For each query, evaluate these structural features (in order).
+Stop at the first matching exploit with sufficient evidence.
+
+FEATURE_VOCABULARY:
+  has_correlated_subquery: 
+    WHERE/HAVING contains scalar subquery referencing 
+    outer table columns
+  has_non_equi_join: 
+    JOIN condition uses <, >, <=, >=, BETWEEN, or 
+    date arithmetic across tables
+  has_large_non_equi_inputs: 
+    both sides of non-equi join exceed 1M rows
+  has_independent_filters: 
+    filters exist that can reduce one or both sides 
+    of the bottleneck join independently
+  has_comma_joins: 
+    FROM clause uses implicit comma-separated tables 
+    with join conditions in WHERE
+  has_multi_reference_cte:
+    a CTE is referenced by 2+ downstream consumers
+  has_redundant_fact_scan:
+    same fact table appears in 2+ branches of 
+    UNION ALL or self-join
+  has_left_join_null_rejected:
+    downstream WHERE rejects NULLs from LEFT JOIN 
+    outer side
+  [... additional features discovered by probing]
+
+
+## EXPLOITS (ordered by expected value)
+
+### EXPLOIT_1: bilateral_input_reduction
+Expected value: HIGH (median 2.7x, success rate 80%)
+
+DETECT:
+  REQUIRED: has_non_equi_join
+  REQUIRED: has_large_non_equi_inputs  
+  REQUIRED: has_independent_filters
+  
+MECHANISM:
+  Non-equi joins (inequality conditions) fall back to 
+  nested-loop on {{engine}}. Cost is O(N×M). The optimizer 
+  cannot recognize that pre-filtering N and M independently 
+  would reduce total work multiplicatively.
+  
+EXPLOIT_STEPS:
+  1. Identify the non-equi join condition and both input 
+     tables.
+  2. For each input, collect ALL filters that can be 
+     evaluated independently (filters that reference only 
+     columns from that table or its dimension joins).
+  3. Create a CTE for each input that applies its 
+     independent filters. Push dimension joins needed for 
+     filtering INTO the CTE.
+  4. Join the two filtered CTEs with the non-equi condition.
+  5. Apply remaining filters and joins after the reduced 
+     non-equi join.
+     
+CRITICAL_RULES:
+  - Filter BOTH sides. Filtering one side gives sublinear 
+    returns (1.15x observed vs 2.68x for both sides).
+  - All filters must be INSIDE the CTE definition. The 
+    CTE fence blocks pushdown from outer WHERE.
+  - Filters must be tight (eliminate >50% of rows). Loose 
+    superset filters (UNION of conditions) defeat the 
+    purpose (0.79x regression observed).
+  - Do not use AS MATERIALIZED. Let the optimizer decide.
+  
+EVIDENCE:
+  + Q072: 2.68x — catalog_sales×inventory, both pre-filtered
+  + Q072: 1.15x — only catalog_sales pre-filtered (control)
+  - Q013: 0.79x — loose UNION filter, CTE fence blocked 
+    dimension pushdown
+    
+INTERACTION_EFFECTS:
+  - COMBINES_WITH: date_cte_isolation (the date filter is 
+    often one of the independent filters to push in)
+  - CONFLICTS_WITH: CTE fence effects when downstream 
+    query needs predicate pushdown into the CTE result
+  - BREAKS_WHEN: "independent" filters actually depend on 
+    columns from the other side of the join (can't 
+    push down)
+
+
+### EXPLOIT_2: correlated_subquery_decorrelation
+Expected value: EXTREME when applicable (median 400x), 
+  but NARROW applicability (12% of corpus)
+
+DETECT:
+  REQUIRED: has_correlated_subquery
+  REQUIRED: subquery contains aggregate function
+  AMPLIFIER: subquery references >1 outer column
+  
+MECHANISM:
+  {{engine}} executes correlated scalar subqueries with 
+  aggregates as nested-loop with per-row re-evaluation. 
+  For N outer rows, the subquery executes N times. Simple 
+  IN/EXISTS correlation is handled by semi-join 
+  optimization, but aggregate correlation is not.
+  
+EXPLOIT_STEPS:
+  1. Identify the correlated columns (outer references 
+     inside the subquery).
+  2. Create a CTE that computes the subquery's aggregate 
+     grouped by the correlated columns.
+  3. JOIN the CTE to the outer query on the correlated 
+     columns.
+  4. Replace the scalar subquery with a column reference 
+     to the CTE's aggregate result.
+  5. Preserve ALL filters from the original subquery 
+     inside the CTE definition.
+     
+CRITICAL_RULES:
+  - The CTE must include every filter from the original 
+    subquery. Missing a filter changes which rows 
+    participate in the aggregate.
+  - If the subquery uses DISTINCT, the CTE must also 
+    use DISTINCT or GROUP BY equivalently.
+  - NULL handling: if the subquery could return NULL 
+    (no matching rows), the CTE join must be LEFT JOIN 
+    with COALESCE to preserve the original NULL behavior.
+    
+EVIDENCE:
+  + Q092: 4428x — timeout recovery
+  + Q032: 391x — timeout to sub-second
+  
+INTERACTION_EFFECTS:
+  - INDEPENDENT: this exploit is self-contained and 
+    doesn't interact with other transforms
+  - VERIFY: ensure the decorrelated CTE doesn't 
+    accidentally become multi-referenced (triggers 
+    materialization, usually fine here)
+
+
+### EXPLOIT_3: ...
+[additional exploits]
+
+
+## NON-EXPLOITABLE (optimizer handles well)
+
+These are areas where probing confirmed the optimizer 
+is already strong. Do NOT waste transform budget on these.
+
+- INNER_JOIN_REORDERING: {{evidence summary}}
+- BITMAP_OR_SCAN: {{evidence summary}}
+- SEMI_JOIN_EXISTS: {{evidence summary}}
+[...]
+
+
+## SCALE WARNINGS
+
+Optimizations validated at {{scale}} do NOT reliably 
+predict behavior at larger scales. Specific regressions 
+observed:
+  - Q027: 9.62x at SF5, 0.97x at SF10 (date CTE + 
+    explicit join). Cost model divergence at scale.
+[...]
+
+
+## OPEN QUESTIONS (insufficient evidence)
+
+These are hypotheses from Tier 3 probing that have 
+<3 data points. They need more probing before promotion 
+to exploit status.
+  - [hypothesis]: [evidence so far]: [queries to test on]

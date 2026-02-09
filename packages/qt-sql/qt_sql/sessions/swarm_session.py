@@ -193,11 +193,14 @@ class SwarmSession(OptimizationSession):
             build_worker_prompt,
             parse_briefing_response,
         )
-        from ..node_prompter import _load_constraint_files, _load_engine_profile
+        from ..node_prompter import _load_constraint_files, _load_engine_profile, load_exploit_algorithm
 
         # ── Step 1: Gather all raw data ──────────────────────────────────
         self._stage(self.query_id, "Gathering data (EXPLAIN, knowledge, examples)...")
         t0 = time.time()
+
+        # Exploit algorithm (replaces engine profile when available)
+        exploit_algorithm_text = load_exploit_algorithm(self.dialect)
 
         # EXPLAIN plan text
         explain_plan_text = self._get_explain_plan_text(self.query_id)
@@ -296,6 +299,7 @@ class SwarmSession(OptimizationSession):
             query_archetype=query_archetype,
             engine_profile=engine_profile,
             resource_envelope=resource_envelope,
+            exploit_algorithm_text=exploit_algorithm_text,
         )
 
         # ── Step 3: Call analyst LLM ─────────────────────────────────────
@@ -639,20 +643,21 @@ class SwarmSession(OptimizationSession):
     def _get_explain_plan_text(self, query_id: str) -> Optional[str]:
         """Load EXPLAIN ANALYZE plan text from cached explains.
 
-        Searches: explains/sf10/ → explains/sf5/ → explains/ (flat).
+        Searches: explains/ (flat) → explains/sf10/ → explains/sf5/ (backward compat).
         For DuckDB: uses plan_text field (JSON string → rendered tree).
         For PG: renders plan_json to ASCII tree via format_pg_explain_tree().
         Returns the ASCII text plan or None.
         """
         from ..prompts.analyst_briefing import format_pg_explain_tree
 
-        for subdir in ["sf10", "sf5", ""]:
-            if subdir:
-                cache_dir = self.pipeline.benchmark_dir / "explains" / subdir
-            else:
-                cache_dir = self.pipeline.benchmark_dir / "explains"
-            cache_path = cache_dir / f"{query_id}.json"
+        # Flat first (new standard), then sf10/sf5 (backward compat)
+        search_paths = [
+            self.pipeline.benchmark_dir / "explains" / f"{query_id}.json",
+            self.pipeline.benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
+            self.pipeline.benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
+        ]
 
+        for cache_path in search_paths:
             if cache_path.exists():
                 try:
                     data = json.loads(cache_path.read_text())
@@ -674,16 +679,16 @@ class SwarmSession(OptimizationSession):
     def _get_explain_plan_json(self, query_id: str) -> Optional[Any]:
         """Load raw EXPLAIN JSON plan data (for PG tuner prompt).
 
-        Searches: explains/sf10/ → explains/sf5/ → explains/ (flat).
+        Searches: explains/ (flat) → explains/sf10/ → explains/sf5/ (backward compat).
         Returns the plan_json list/dict or None.
         """
-        for subdir in ["sf10", "sf5", ""]:
-            if subdir:
-                cache_dir = self.pipeline.benchmark_dir / "explains" / subdir
-            else:
-                cache_dir = self.pipeline.benchmark_dir / "explains"
-            cache_path = cache_dir / f"{query_id}.json"
+        search_paths = [
+            self.pipeline.benchmark_dir / "explains" / f"{query_id}.json",
+            self.pipeline.benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
+            self.pipeline.benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
+        ]
 
+        for cache_path in search_paths:
             if cache_path.exists():
                 try:
                     data = json.loads(cache_path.read_text())
@@ -1251,3 +1256,83 @@ class SwarmSession(OptimizationSession):
             f"{len(self.all_worker_results)} total workers)"
         )
         return output_dir
+
+    def save_to_run_dir(self, run_dir: Path) -> Path:
+        """Save session artifacts in standardized runs/ layout.
+
+        Layout: run_dir/{query_id}/
+            ├── original.sql
+            ├── assignments.json
+            ├── worker_{N}_prompt.txt
+            ├── worker_{N}_response.txt
+            ├── worker_{N}_sql.sql
+            ├── snipe_{N}_prompt.txt   (if snipe iterations)
+            ├── snipe_{N}_response.txt
+            ├── snipe_{N}_sql.sql
+            └── validation.json
+        """
+        query_dir = Path(run_dir) / self.query_id
+        query_dir.mkdir(parents=True, exist_ok=True)
+
+        # Original SQL
+        (query_dir / "original.sql").write_text(self.original_sql)
+
+        # Process each iteration
+        for it_data in self.iterations_data:
+            phase = it_data.get("phase", "unknown")
+            it_num = it_data.get("iteration", 0)
+            worker_prompts = it_data.get("worker_prompts", {})
+
+            if phase == "fan_out":
+                # Save assignments from worker results
+                assignments = []
+                for wr_data in it_data.get("worker_results", []):
+                    wid = wr_data.get("worker_id", 0)
+                    assignments.append({
+                        "worker_id": wid,
+                        "strategy": wr_data.get("strategy", ""),
+                        "examples_used": wr_data.get("examples_used", []),
+                    })
+                (query_dir / "assignments.json").write_text(
+                    json.dumps(assignments, indent=2)
+                )
+
+                # Worker prompts/responses/SQL
+                for wr_data in it_data.get("worker_results", []):
+                    wid = wr_data.get("worker_id", 0)
+                    if wid in worker_prompts:
+                        w_prompt, w_response = worker_prompts[wid]
+                        if w_prompt:
+                            (query_dir / f"worker_{wid}_prompt.txt").write_text(w_prompt)
+                        if w_response:
+                            (query_dir / f"worker_{wid}_response.txt").write_text(w_response)
+                    if wr_data.get("optimized_sql"):
+                        (query_dir / f"worker_{wid}_sql.sql").write_text(wr_data["optimized_sql"])
+
+            elif phase in ("snipe", "snipe_retry"):
+                # Snipe prompt/response/SQL
+                if it_data.get("worker_prompt"):
+                    (query_dir / f"snipe_{it_num}_prompt.txt").write_text(it_data["worker_prompt"])
+                if it_data.get("worker_response"):
+                    (query_dir / f"snipe_{it_num}_response.txt").write_text(it_data["worker_response"])
+                for wr_data in it_data.get("worker_results", []):
+                    if wr_data.get("optimized_sql"):
+                        (query_dir / f"snipe_{it_num}_sql.sql").write_text(wr_data["optimized_sql"])
+
+        # Validation summary
+        best = self._best_worker()
+        validation = {
+            "query_id": self.query_id,
+            "status": best.status if best else "ERROR",
+            "speedup": best.speedup if best else 0.0,
+            "best_worker_id": best.worker_id if best else None,
+            "best_strategy": best.strategy if best else None,
+            "transforms": best.transforms if best else [],
+            "n_api_calls": self._count_api_calls(),
+            "all_workers": [wr.to_dict() for wr in self.all_worker_results],
+        }
+        (query_dir / "validation.json").write_text(
+            json.dumps(validation, indent=2)
+        )
+
+        return query_dir

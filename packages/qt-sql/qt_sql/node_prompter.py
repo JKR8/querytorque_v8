@@ -58,6 +58,31 @@ def compute_depths(dag) -> Dict[str, int]:
     return depths
 
 
+def load_exploit_algorithm(dialect: str = "duckdb") -> Optional[str]:
+    """Load exploit algorithm YAML text for the target dialect.
+
+    The exploit algorithm is a structured YAML file produced by the
+    frontier probe system. When available, it replaces the engine
+    profile in the analyst prompt.
+
+    Returns the raw YAML text or None if not available.
+    """
+    if not CONSTRAINTS_DIR.exists():
+        return None
+
+    norm = dialect.lower()
+    if norm in ("postgres", "pg"):
+        norm = "postgresql"
+
+    algo_path = CONSTRAINTS_DIR / f"exploit_algorithm_{norm}.yaml"
+    if algo_path.exists():
+        try:
+            return algo_path.read_text()
+        except Exception as e:
+            logger.warning(f"Failed to load exploit algorithm {algo_path}: {e}")
+    return None
+
+
 def _load_engine_profile(dialect: str = "duckdb") -> Optional[Dict[str, Any]]:
     """Load the engine profile JSON for the target dialect.
 

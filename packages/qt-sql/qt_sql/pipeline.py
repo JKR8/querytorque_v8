@@ -185,25 +185,29 @@ class Pipeline:
     def _get_explain(self, query_id: str, sql: str) -> Optional[Dict[str, Any]]:
         """Get EXPLAIN ANALYZE result — cached first, run if missing.
 
-        Cache location: benchmark_dir/explains/sf10/{query_id}.json
-        Falls back to:  benchmark_dir/explains/sf5/{query_id}.json
+        Cache location: benchmark_dir/explains/{query_id}.json (flat)
+        Falls back to:  explains/sf10/ → explains/sf5/ (backward compat)
         """
-        cache_dir = self.benchmark_dir / "explains" / "sf10"
-        if not cache_dir.exists():
-            cache_dir = self.benchmark_dir / "explains" / "sf5"
-        cache_path = cache_dir / f"{query_id}.json"
+        # Try flat path first (new standard), then sf10/sf5 (backward compat)
+        flat_path = self.benchmark_dir / "explains" / f"{query_id}.json"
+        fallback_paths = [
+            self.benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
+            self.benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
+        ]
 
-        # Try cache first
-        if cache_path.exists():
-            try:
-                data = json.loads(cache_path.read_text())
-                logger.info(f"[{query_id}] EXPLAIN loaded from cache")
-                return data
-            except Exception:
-                pass
+        for cache_path in [flat_path] + fallback_paths:
+            if cache_path.exists():
+                try:
+                    data = json.loads(cache_path.read_text())
+                    logger.info(f"[{query_id}] EXPLAIN loaded from cache ({cache_path.parent.name}/)")
+                    return data
+                except Exception:
+                    pass
 
-        # Run EXPLAIN ANALYZE and cache (with timeout)
+        # Run EXPLAIN ANALYZE and cache to flat path (new standard)
         logger.info(f"[{query_id}] Running EXPLAIN ANALYZE (will cache)")
+        cache_dir = self.benchmark_dir / "explains"
+        cache_path = cache_dir / f"{query_id}.json"
         timeout_ms = int(self.config.extra.get("explain_timeout_ms", 300_000)) if hasattr(self.config, 'extra') else 300_000
         try:
             from .execution.database_utils import run_explain_analyze
