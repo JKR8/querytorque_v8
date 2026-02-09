@@ -122,24 +122,29 @@ from qt_sql.prompts.analyst_briefing import format_pg_explain_tree
 
 explain_tree_text = format_pg_explain_tree(plan_json)
 
-# ── Build minimal mock DAG for query072 (flat query, no CTEs) ──────────
-from qt_sql.dag import QueryDag, DagNode, NodeCost
+# ── Build DAG for query072 using DagBuilder (computes contracts) ───────
+from qt_sql.dag import DagBuilder, QueryDag, DagNode, NodeCost
 
-mock_main_node = DagNode(
-    node_id="main_query",
-    node_type="main",
-    sql=sql,
-    tables=["catalog_sales", "inventory", "warehouse", "item",
-            "customer_demographics", "household_demographics",
-            "date_dim", "promotion", "catalog_returns"],
-    refs=[],
-    flags=["multi_join", "non_equi_join", "left_outer_join"],
-)
-mock_dag = QueryDag(
-    nodes={"main_query": mock_main_node},
-    edges=[],
-    original_sql=sql,
-)
+try:
+    builder = DagBuilder(sql, dialect="postgres")
+    mock_dag = builder.build()
+except Exception:
+    # Fallback: manual mock if DagBuilder fails
+    mock_main_node = DagNode(
+        node_id="main_query",
+        node_type="main",
+        sql=sql,
+        tables=["catalog_sales", "inventory", "warehouse", "item",
+                "customer_demographics", "household_demographics",
+                "date_dim", "promotion", "catalog_returns"],
+        refs=[],
+        flags=["multi_join", "non_equi_join", "left_outer_join"],
+    )
+    mock_dag = QueryDag(
+        nodes={"main_query": mock_main_node},
+        edges=[],
+        original_sql=sql,
+    )
 
 # Realistic cost data from EXPLAIN plan (Q072 is a single main node)
 mock_costs = {

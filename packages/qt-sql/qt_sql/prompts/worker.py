@@ -253,18 +253,9 @@ def _section_set_local_config(resource_envelope: str) -> str:
         "- Empty is valid: if your rewrite has no planner bottleneck, emit no SET LOCAL",
         "- Stay within the resource envelope bounds above",
         "",
-        "### Output Format",
-        "If you recommend SET LOCAL, prefix your SQL block with the commands:",
-        "",
-        "```sql",
-        "SET LOCAL work_mem = '512MB';",
-        "SET LOCAL jit = 'off';",
-        "-- rewritten query follows",
-        "WITH ...",
-        "SELECT ...",
-        "```",
-        "",
-        "If no config changes help, just output the rewritten SQL directly.",
+        "### SET LOCAL Syntax",
+        "Include SET LOCAL commands in the `set_local` array field of your JSON output.",
+        "If no config changes help, omit the field or use an empty array.",
     ])
 
     return "\n".join(lines)
@@ -273,12 +264,16 @@ def _section_set_local_config(resource_envelope: str) -> str:
 def _section_output_format(
     output_columns: Optional[List[str]] = None,
 ) -> str:
-    """Output format section with column completeness contract."""
+    """Output format section with per-node contracts."""
     lines = [
-        "## Output",
+        "## Output Format",
         "",
-        "Return the complete rewritten SQL query. The query must be syntactically",
-        "valid and ready to execute.",
+        "Return a JSON object with your rewrite as `rewrite_sets`. Each node is a CTE",
+        "or the final SELECT. You MUST declare the output columns for every node in",
+        "`node_contracts` — this forces you to reason about what flows between CTEs.",
+        "",
+        "Only include nodes you **changed or added**. Unchanged nodes are auto-filled",
+        "from the original query.",
     ]
 
     if output_columns:
@@ -286,7 +281,7 @@ def _section_output_format(
         lines.append("### Column Completeness Contract")
         lines.append("")
         lines.append(
-            "Your rewritten query MUST produce **exactly** these output columns "
+            "Your `main_query` node MUST produce **exactly** these output columns "
             "(same names, same order):"
         )
         lines.append("")
@@ -294,26 +289,49 @@ def _section_output_format(
             lines.append(f"  {i}. `{col}`")
         lines.append("")
         lines.append(
-            "Do NOT add, remove, or rename any columns. "
+            "Do NOT add, remove, or rename any output columns. "
             "The result set schema must be identical to the original query."
         )
 
     lines.extend([
         "",
-        "```sql",
-        "-- Your rewritten query here",
+        "```json",
+        "{",
+        '  "rewrite_sets": [{',
+        '    "id": "rs_01",',
+        '    "transform": "<transform_name>",',
+        '    "nodes": {',
+        '      "<cte_name>": "<SQL for this CTE body>",',
+        '      "main_query": "<final SELECT>"',
+        "    },",
+        '    "node_contracts": {',
+        '      "<cte_name>": ["col1", "col2", "..."],',
+        '      "main_query": ["col1", "col2", "..."]',
+        "    },",
+        '    "set_local": ["SET LOCAL work_mem = \'512MB\'", "SET LOCAL jit = \'off\'"],',
+        '    "data_flow": "<cte_a> -> <cte_b> -> main_query",',
+        '    "invariants_kept": ["same output columns", "same rows"],',
+        '    "expected_speedup": "2.0x",',
+        '    "risk": "low"',
+        "  }]",
+        "}",
         "```",
         "",
-        "After the SQL, explain the mechanism:",
+        "### Rules",
+        "- Every node in `nodes` MUST appear in `node_contracts` and vice versa",
+        "- `node_contracts`: list the output column names each node produces",
+        "- `data_flow`: show the CTE dependency chain (forces you to think about order)",
+        "- `main_query` = the final SELECT — its contract must match the Column Completeness Contract above",
+        "- New CTE structures are encouraged — design the best topology for the query",
+        "",
+        "After the JSON, explain the mechanism:",
         "",
         "```",
         "Changes: <1-2 sentences: what structural change + the expected mechanism>",
-        "  e.g., 'Consolidated 4 store_sales scans into 1 with CASE branches — reduces I/O by 3x'",
-        "  e.g., 'Deferred customer join to resolve_names — joins 4K rows instead of 5.4M'",
         "Expected speedup: <estimate>",
         "```",
         "",
-        "Now output your rewritten SQL:",
+        "Now output your rewrite as JSON:",
     ])
 
     return "\n".join(lines)

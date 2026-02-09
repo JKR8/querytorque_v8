@@ -70,6 +70,8 @@ class RewriteSet:
     expected_speedup: str = "unknown"
     risk: str = "low"
     rationale: str = ""
+    node_contracts: Dict[str, List[str]] = field(default_factory=dict)  # node_id -> output columns
+    set_local: List[str] = field(default_factory=list)  # SET LOCAL commands from JSON
 
 
 @dataclass
@@ -136,6 +138,8 @@ class ResponseParser:
                 expected_speedup=rs.get("expected_speedup", "unknown"),
                 risk=rs.get("risk", "low"),
                 rationale=rs.get("rationale", ""),
+                node_contracts=rs.get("node_contracts", {}),
+                set_local=rs.get("set_local", []),
             ))
 
         return rewrite_sets
@@ -442,9 +446,9 @@ class SQLRewriter:
     def apply_response(self, llm_response: str) -> RewriteResult:
         """Parse LLM response and apply the rewrite.
 
-        Supports two response formats:
-        1. Raw SQL in a ```sql code block (full-query prompt format)
-        2. JSON with rewrite_sets (legacy per-node format)
+        Supports two response formats (tried in order):
+        1. JSON with rewrite_sets (per-node DAG format — preferred)
+        2. Raw SQL in a ```sql code block (fallback)
 
         Args:
             llm_response: Raw LLM response text (may contain markdown, JSON, etc.)
@@ -452,13 +456,50 @@ class SQLRewriter:
         Returns:
             RewriteResult with optimized SQL or error
         """
-        # Try raw SQL extraction first (full-query prompt format)
+        # Try JSON rewrite_sets first (per-node DAG format)
+        rewrite_sets = self.parser.parse(llm_response)
+
+        if rewrite_sets:
+            for rs in rewrite_sets:
+                # Validate transform
+                if rs.transform not in ALLOWED_TRANSFORMS:
+                    continue
+
+                try:
+                    optimized_sql = self.assembler.assemble(self.original_sql, rs)
+
+                    # Use SET LOCAL from JSON field if available, else split from SQL
+                    if rs.set_local:
+                        from .pg_tuning import PG_TUNABLE_PARAMS
+                        set_local_cmds = [
+                            cmd for cmd in rs.set_local
+                            if any(p in cmd.lower() for p in PG_TUNABLE_PARAMS)
+                        ]
+                        clean_sql = optimized_sql
+                    else:
+                        clean_sql, set_local_cmds = self._split_set_local(optimized_sql)
+                    if not clean_sql:
+                        continue
+
+                    # Validate the result parses
+                    if not self._validate_sql(clean_sql):
+                        continue
+
+                    return RewriteResult(
+                        success=True,
+                        optimized_sql=clean_sql,
+                        transform=rs.transform,
+                        rewrite_set=rs,
+                        set_local_commands=set_local_cmds,
+                    )
+                except Exception:
+                    continue
+
+        # Fall back to raw SQL extraction (```sql code block)
         raw_sql = self._extract_raw_sql(llm_response)
         if raw_sql:
-            # Split SET LOCAL commands from SQL (PG workers may prefix them)
             clean_sql, set_local_cmds = self._split_set_local(raw_sql)
             if clean_sql and self._validate_sql(clean_sql):
-                # Infer transform from diff
                 transforms = infer_transforms_from_sql_diff(
                     self.original_sql, clean_sql
                 )
@@ -469,42 +510,10 @@ class SQLRewriter:
                     set_local_commands=set_local_cmds,
                 )
 
-        # Fall back to JSON rewrite_sets format
-        rewrite_sets = self.parser.parse(llm_response)
-
-        if not rewrite_sets:
-            return RewriteResult(
-                success=False,
-                optimized_sql=self.original_sql,
-                error="No valid SQL or rewrite_sets found in LLM response",
-            )
-
-        # Try each rewrite_set until one succeeds
-        for rs in rewrite_sets:
-            # Validate transform
-            if rs.transform not in ALLOWED_TRANSFORMS:
-                continue  # Skip disallowed transforms
-
-            try:
-                optimized_sql = self.assembler.assemble(self.original_sql, rs)
-
-                # Validate the result parses
-                if not self._validate_sql(optimized_sql):
-                    continue
-
-                return RewriteResult(
-                    success=True,
-                    optimized_sql=optimized_sql,
-                    transform=rs.transform,
-                    rewrite_set=rs,
-                )
-            except Exception as e:
-                continue  # Try next rewrite_set
-
         return RewriteResult(
             success=False,
             optimized_sql=self.original_sql,
-            error="No valid rewrite_set could be applied",
+            error="No valid rewrite_sets or SQL found in LLM response",
         )
 
     def _validate_sql(self, sql: str) -> bool:

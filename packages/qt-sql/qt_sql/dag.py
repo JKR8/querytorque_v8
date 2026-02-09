@@ -1,22 +1,13 @@
 """
 DAG v2 SQL Optimizer
 
-Architecture improvements over v1:
-1. Node contracts - output columns, grain, required predicates
-2. Rewrite sets - atomic multi-node changes
-3. Subgraph slicing - target + 1-hop neighbors only
-4. Transform allowlist - minimal diffs, no churn
-5. Downstream column usage - safe projection pruning
-6. Cost attribution per node - map plan operators to nodes
-
-Uses VERIFIED gold examples (Q15 2.98x, Q39 2.44x, Q23 2.33x).
+Data structures, DAG builder, cost analyzer, and rewrite assembler.
 """
 
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Any
-from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import sqlglot
 from sqlglot import exp
@@ -64,6 +55,7 @@ class RewriteSet:
     transform_type: str  # decorrelate, pushdown, or_to_union, etc.
     expected_speedup: str
     risk: str = "low"
+    node_contracts: Dict[str, List[str]] = field(default_factory=dict)  # node_id -> output columns
 
 
 @dataclass
@@ -275,7 +267,12 @@ class DagBuilder:
         for node_id, node in self.nodes.items():
             try:
                 parsed = sqlglot.parse_one(node.sql, dialect=self.dialect)
-                select = parsed.find(exp.Select) or parsed
+                # Use the parsed node itself if it's a Select, to avoid
+                # finding a nested subquery's Select via DFS
+                if isinstance(parsed, exp.Select):
+                    select = parsed
+                else:
+                    select = parsed.find(exp.Select) or parsed
 
                 # Output columns
                 output_cols = []
@@ -315,7 +312,17 @@ class DagBuilder:
                     required_predicates=predicates[:5]
                 )
             except Exception:
-                pass
+                # Regex fallback: extract AS aliases from the SELECT clause
+                alias_matches = re.findall(
+                    r'\bAS\s+([a-zA-Z_]\w*)', node.sql[:500], re.IGNORECASE
+                )
+                if alias_matches:
+                    node.contract = NodeContract(
+                        node_id=node_id,
+                        output_columns=alias_matches[:20],
+                        grain=[],
+                        required_predicates=[]
+                    )
 
     def _get_output_column_names(self, sql: str) -> Set[str]:
         """Extract output column names for downstream usage checks."""
@@ -528,246 +535,6 @@ class CostAnalyzer:
 
 
 # ============================================================
-# Subgraph Slicer - Extract target + 1-hop neighbors
-# ============================================================
-
-class SubgraphSlicer:
-    """Extract minimal subgraph for rewriting."""
-
-    def __init__(self, dag: QueryDag):
-        self.dag = dag
-
-    def get_slice(self, target_id: str) -> Dict[str, DagNode]:
-        """Get target node + 1-hop neighbors."""
-        if target_id not in self.dag.nodes:
-            return {}
-
-        slice_nodes = {target_id: self.dag.nodes[target_id]}
-
-        # Add parents (nodes that target references)
-        target = self.dag.nodes[target_id]
-        for ref in target.refs:
-            if ref in self.dag.nodes:
-                slice_nodes[ref] = self.dag.nodes[ref]
-
-        # Add children (nodes that reference target)
-        for node_id, node in self.dag.nodes.items():
-            if target_id in node.refs:
-                slice_nodes[node_id] = node
-
-        return slice_nodes
-
-    def get_hot_nodes(self, top_n: int = 3) -> List[str]:
-        """Get nodes with highest cost (optimization targets)."""
-        nodes_with_cost = [
-            (node_id, node.cost.cost_pct if node.cost else 0)
-            for node_id, node in self.dag.nodes.items()
-        ]
-        nodes_with_cost.sort(key=lambda x: x[1], reverse=True)
-        return [n[0] for n in nodes_with_cost[:top_n]]
-
-
-# ============================================================
-# Prompt Builder v2
-# ============================================================
-
-class DagV2PromptBuilder:
-    """Build DAG v2 prompt with contracts, usage, and subgraph slicing."""
-
-    SYSTEM_PROMPT = """You are an autonomous Query Rewrite Engine. Your goal is to maximize execution speed while strictly preserving semantic invariants.
-
-Output atomic rewrite sets in JSON.
-
-RULES:
-- Primary Goal: Maximize execution speed while strictly preserving semantic invariants.
-- Allowed Transforms: Use the provided list. If a standard SQL optimization applies that is not listed, label it "semantic_rewrite".
-- Atomic Sets: Group dependent changes (e.g., creating a CTE and joining it) into a single rewrite_set.
-- Contracts: Output columns, grain, and total result rows must remain invariant.
-- Naming: Use descriptive CTE names (e.g., `filtered_returns` vs `cte1`).
-- Column Aliasing: Permitted only for aggregations or disambiguation.
-
-ALLOWED TRANSFORMS: {transforms}
-
-OUTPUT FORMAT:
-```json
-{{
-  "rewrite_sets": [
-    {{
-      "id": "rs_01",
-      "transform": "transform_name",
-      "nodes": {{
-        "node_id": "new SQL..."
-      }},
-      "invariants_kept": ["list of preserved semantics"],
-      "expected_speedup": "2x",
-      "risk": "low"
-    }}
-  ],
-  "explanation": "what was changed and why"
-}}
-```"""
-
-    def __init__(self, dag: QueryDag, plan_context: Optional[Any] = None):
-        """Initialize prompt builder.
-
-        Args:
-            dag: Query DAG
-            plan_context: OptimizationContext from plan_analyzer (optional)
-        """
-        self.dag = dag
-        self.plan_context = plan_context
-        self.cost_analyzer = CostAnalyzer(dag, plan_context)
-        self.slicer = SubgraphSlicer(dag)
-
-    def build_prompt(self, target_nodes: Optional[List[str]] = None) -> str:
-        """Build complete prompt for DAG v2 optimization."""
-        # Analyze costs
-        self.cost_analyzer.analyze()
-
-        # Get targets (hot nodes if not specified)
-        if target_nodes is None:
-            target_nodes = self.slicer.get_hot_nodes(2)
-
-        # Build subgraph slice
-        slice_nodes = {}
-        for target in target_nodes:
-            slice_nodes.update(self.slicer.get_slice(target))
-
-        parts = [
-            self.SYSTEM_PROMPT.format(transforms=", ".join(DagBuilder.ALLOWED_TRANSFORMS)),
-            "",
-            "## Target Nodes",
-            self._format_targets(target_nodes),
-            "",
-            "## Subgraph Slice",
-            self._format_slice(slice_nodes),
-            "",
-            "## Node Contracts",
-            self._format_contracts(slice_nodes),
-            "",
-            "## Downstream Usage",
-            self._format_usage(slice_nodes),
-            "",
-            "## Cost Attribution",
-            self._format_costs(slice_nodes),
-            "",
-            "## Detected Opportunities",
-            self._detect_opportunities(slice_nodes),
-            "",
-            "Now output your rewrite_sets:",
-        ]
-
-        return "\n".join(parts)
-
-    def _format_targets(self, targets: List[str]) -> str:
-        lines = []
-        for t in targets:
-            node = self.dag.nodes.get(t)
-            if node:
-                flags = " ".join(node.flags) if node.flags else ""
-                lines.append(f"  [{t}] {flags}")
-        return "\n".join(lines)
-
-    def _format_slice(self, slice_nodes: Dict[str, DagNode]) -> str:
-        lines = []
-        for node_id, node in slice_nodes.items():
-            lines.append(f"[{node_id}] type={node.node_type}")
-            lines.append(f"```sql")
-            lines.append(node.sql)
-            lines.append(f"```")
-            lines.append("")
-        return "\n".join(lines)
-
-    def _format_contracts(self, slice_nodes: Dict[str, DagNode]) -> str:
-        lines = []
-        for node_id, node in slice_nodes.items():
-            if node.contract:
-                c = node.contract
-                lines.append(f"[{node_id}]:")
-                lines.append(f"  output_columns: {c.output_columns[:10]}")
-                if c.grain:
-                    lines.append(f"  grain: {c.grain}")
-                if c.required_predicates:
-                    lines.append(f"  required_predicates: {c.required_predicates[:3]}")
-        return "\n".join(lines) if lines else "No contracts computed."
-
-    def _format_usage(self, slice_nodes: Dict[str, DagNode]) -> str:
-        lines = []
-        for node_id, node in slice_nodes.items():
-            if node.usage and node.usage.downstream_refs:
-                lines.append(f"[{node_id}]: downstream_refs={node.usage.downstream_refs[:10]}")
-        return "\n".join(lines) if lines else "No usage data."
-
-    def _format_costs(self, slice_nodes: Dict[str, DagNode]) -> str:
-        lines = []
-        for node_id, node in slice_nodes.items():
-            if node.cost:
-                c = node.cost
-                ops = ", ".join(c.operators[:3]) if c.operators else "unknown"
-                lines.append(f"[{node_id}]: {c.cost_pct}% cost, ~{c.row_estimate} rows, ops=[{ops}]")
-        return "\n".join(lines) if lines else "No cost data."
-
-    def _detect_opportunities(self, slice_nodes: Dict[str, DagNode]) -> str:
-        """Detect optimization opportunities using the centralized Knowledge Base.
-
-        Uses patterns verified on TPC-DS SF100 with proven speedups.
-        """
-        from .knowledge_base import detect_opportunities, format_opportunities_for_prompt
-
-        opportunities = []
-
-        # Get KB opportunities from full SQL
-        kb_opportunities = detect_opportunities(self.dag.original_sql)
-        if kb_opportunities:
-            kb_text = format_opportunities_for_prompt(kb_opportunities)
-            if kb_text:
-                opportunities.append("## Knowledge Base Patterns (verified on TPC-DS)\n" + kb_text)
-
-        # Add node-specific opportunities based on DAG structure
-        node_opportunities = []
-        for node_id, node in slice_nodes.items():
-            # Correlated subquery
-            if "CORRELATED" in node.flags:
-                node_opportunities.append(
-                    f"DECORRELATE: [{node_id}] has correlated subquery\n"
-                    f"  Fix: Move aggregate to CTE, join instead of correlated lookup\n"
-                    f"  Expected: 2-3x speedup (verified Q1: 2.81x)"
-                )
-
-            # IN subquery
-            if "IN_SUBQUERY" in node.flags:
-                node_opportunities.append(
-                    f"IN_TO_EXISTS: [{node_id}] has IN subquery\n"
-                    f"  Fix: Convert to EXISTS for early termination\n"
-                    f"  Expected: 1.5x speedup"
-                )
-
-            # Check for OR conditions
-            if " OR " in node.sql.upper():
-                node_opportunities.append(
-                    f"OR_TO_UNION: [{node_id}] has OR condition\n"
-                    f"  Fix: Split into UNION ALL branches\n"
-                    f"  Expected: 2x speedup (verified Q15: 2.98x)"
-                )
-
-            # Check for late filter (main query filters on CTE columns)
-            if node.node_type == "main" and node.refs:
-                for ref in node.refs:
-                    ref_node = self.dag.nodes.get(ref)
-                    if ref_node and "GROUP_BY" in ref_node.flags:
-                        node_opportunities.append(
-                            f"PUSHDOWN: [{node_id}] filters on [{ref}] after GROUP BY\n"
-                            f"  Fix: Push filter into CTE before aggregation\n"
-                            f"  Expected: 2x speedup (verified Q93: 2.71x)"
-                        )
-
-        if node_opportunities:
-            opportunities.append("## Node-Specific Opportunities\n" + "\n\n".join(node_opportunities))
-
-        return "\n\n".join(opportunities) if opportunities else "No obvious opportunities detected."
-
-
-# ============================================================
 # Rewrite Assembler - Apply rewrite sets to SQL
 # ============================================================
 
@@ -933,221 +700,3 @@ class RewriteAssembler:
         if ctes:
             return f"WITH {', '.join(ctes)}\n{main_sql}"
         return main_sql
-
-
-# ============================================================
-# Main Pipeline
-# ============================================================
-
-class DagV2Pipeline:
-    """DAG v2 optimization pipeline."""
-
-    def __init__(self, sql: str, plan_json: Optional[dict] = None, plan_context: Optional[Any] = None):
-        """Initialize DAG v2 pipeline.
-
-        Args:
-            sql: SQL query to optimize
-            plan_json: DEPRECATED - use plan_context instead
-            plan_context: OptimizationContext from plan_analyzer
-        """
-        self.sql = sql
-        self.plan_json = plan_json  # Keep for backwards compat
-        self.plan_context = plan_context
-        self.dag = DagBuilder(sql).build()
-        self.prompt_builder = DagV2PromptBuilder(self.dag, plan_context)
-        self.assembler = RewriteAssembler(self.dag)
-
-    def get_prompt(self, target_nodes: Optional[List[str]] = None) -> str:
-        """Get optimization prompt."""
-        return self.prompt_builder.build_prompt(target_nodes)
-
-    def apply_response(self, llm_response: str) -> str:
-        """Apply LLM response to get optimized SQL."""
-        # Extract JSON from response
-        json_match = re.search(r'```json\s*(.*?)\s*```', llm_response, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1)
-        else:
-            # Try to find raw JSON
-            json_match = re.search(r'\{.*"rewrite_sets".*\}', llm_response, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-            else:
-                return self.sql
-
-        return self.assembler.apply_from_json(json_str)
-
-    def get_dag_summary(self) -> str:
-        """Get a summary of the DAG structure."""
-        lines = ["Nodes:"]
-        for node_id, node in self.dag.nodes.items():
-            flags = " ".join(node.flags) if node.flags else ""
-            tables = ",".join(node.tables[:3]) if node.tables else ""
-            lines.append(f"  [{node_id}] type={node.node_type} tables=[{tables}] {flags}")
-
-        lines.append("\nEdges:")
-        for src, dst in self.dag.edges:
-            lines.append(f"  {src} -> {dst}")
-
-        return "\n".join(lines)
-
-
-# ============================================================
-# Gold Examples for Few-Shot (VERIFIED)
-# ============================================================
-
-def get_dag_v2_examples() -> List[dict]:
-    """Get verified gold examples for DAG v2 format.
-
-    Updated 2026-02-02 with Kimi K2.5 Full DB validated results:
-    - Q1: 2.81x (decorrelate) - CONSISTENT WINNER
-    - Q15: 2.67x (or_to_union) - CONSISTENT WINNER
-    - Q93: 2.71x (early_filter) - CONSISTENT WINNER
-    - Q39: 2.44x (pushdown) - DeepSeek verified
-    """
-    return [
-        # Q1 - Correlated Subquery -> Early Filter + Separate Avg CTE (2.90x VERIFIED)
-        {
-            "opportunity": "DECORRELATE + PUSHDOWN",
-            "input_slice": """[customer_total_return] CORRELATED:
-SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return
-FROM store_returns, date_dim
-WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000
-GROUP BY sr_customer_sk, sr_store_sk
-
-[main_query]:
-SELECT c_customer_id FROM customer_total_return ctr1, store, customer
-WHERE ctr1.ctr_total_return > (SELECT avg(ctr_total_return)*1.2 FROM customer_total_return ctr2 WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk)
-  AND s_store_sk = ctr1.ctr_store_sk AND s_state = 'SD' AND ctr1.ctr_customer_sk = c_customer_sk
-ORDER BY c_customer_id LIMIT 100""",
-            "output": {
-                "rewrite_sets": [{
-                    "id": "rs_01",
-                    "transform": "decorrelate",
-                    "nodes": {
-                        "filtered_returns": "SELECT sr.sr_customer_sk, sr.sr_store_sk, sr.sr_fee FROM store_returns sr JOIN date_dim d ON sr.sr_returned_date_sk = d.d_date_sk JOIN store s ON sr.sr_store_sk = s.s_store_sk WHERE d.d_year = 2000 AND s.s_state = 'SD'",
-                        "customer_total_return": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(sr_fee) AS ctr_total_return FROM filtered_returns GROUP BY sr_customer_sk, sr_store_sk",
-                        "store_avg_return": "SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk",
-                        "main_query": "SELECT c.c_customer_id FROM customer_total_return ctr1 JOIN store_avg_return sar ON ctr1.ctr_store_sk = sar.ctr_store_sk JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk WHERE ctr1.ctr_total_return > sar.avg_return_threshold ORDER BY c.c_customer_id LIMIT 100"
-                    },
-                    "invariants_kept": ["same result rows", "same ordering", "same column output"],
-                    "expected_speedup": "2.90x",
-                    "risk": "low"
-                }]
-            },
-            "speedup": "2.90x",
-            "key_insight": "Push s_state='SD' filter EARLY into first CTE. Compute average as SEPARATE CTE with GROUP BY (NOT window function). Join on average instead of correlated subquery."
-        },
-
-
-        # Q15 - OR to UNION ALL + Early Date Filter
-        {
-            "opportunity": "OR_TO_UNION + EARLY_FILTER",
-            "input_slice": """[main_query]:
-SELECT ca_zip, sum(cs_sales_price)
-FROM catalog_sales, customer, customer_address, date_dim
-WHERE cs_bill_customer_sk = c_customer_sk
-  AND c_current_addr_sk = ca_address_sk
-  AND (substr(ca_zip,1,5) IN ('85669', '86197', ...)
-       OR ca_state IN ('CA','WA','GA')
-       OR cs_sales_price > 500)
-  AND cs_sold_date_sk = d_date_sk
-  AND d_qoy = 1 AND d_year = 2001
-GROUP BY ca_zip ORDER BY ca_zip LIMIT 100""",
-            "output": {
-                "rewrite_sets": [{
-                    "id": "rs_01",
-                    "transform": "or_to_union",
-                    "nodes": {
-                        "filtered_dates": "SELECT d_date_sk FROM date_dim WHERE d_qoy = 1 AND d_year = 2001",
-                        "filtered_sales": "SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE substr(ca_zip,1,5) IN ('85669', '86197', '88274', '83405', '86475', '85392', '85460', '80348', '81792') UNION ALL SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE ca_state IN ('CA','WA','GA') UNION ALL SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE cs_sales_price > 500",
-                        "main_query": "SELECT ca_zip, SUM(cs_sales_price) FROM filtered_sales GROUP BY ca_zip ORDER BY ca_zip LIMIT 100"
-                    },
-                    "invariants_kept": ["output columns unchanged", "same rows after aggregation"],
-                    "expected_speedup": "2.98x",
-                    "risk": "low"
-                }]
-            },
-            "speedup": "2.98x"
-        },
-
-        # Q39 - Filter Pushdown into CTE
-        {
-            "opportunity": "PUSHDOWN",
-            "input_slice": """[inv]:
-SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean, cov
-FROM (SELECT ... FROM inventory JOIN date_dim WHERE d_year = 1998 GROUP BY ...) foo
-WHERE stdev/mean > 1
-
-[main_query]:
-SELECT ... FROM inv inv1, inv inv2
-WHERE inv1.d_moy = 1 AND inv2.d_moy = 2 ...""",
-            "output": {
-                "rewrite_sets": [{
-                    "id": "rs_01",
-                    "transform": "pushdown",
-                    "nodes": {
-                        "inv": "SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev/mean END AS cov FROM (SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, STDDEV_SAMP(inv_quantity_on_hand) AS stdev, AVG(inv_quantity_on_hand) AS mean FROM inventory JOIN item ON inv_item_sk = i_item_sk JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk JOIN date_dim ON inv_date_sk = d_date_sk WHERE d_year = 1998 AND d_moy IN (1, 2) GROUP BY w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy) foo WHERE mean != 0 AND stdev/mean > 1"
-                    },
-                    "invariants_kept": ["inv output columns unchanged", "main_query unmodified"],
-                    "expected_speedup": "2.44x",
-                    "risk": "low"
-                }]
-            },
-            "speedup": "2.44x"
-        },
-
-        # Q93 - Early Dimension Filter (2.71x Full DB Verified - Kimi K2.5) - CONSISTENT WINNER
-        {
-            "opportunity": "EARLY_FILTER",
-            "input_slice": """[main_query]:
-SELECT ss_customer_sk, SUM(act_sales) AS sumsales
-FROM (SELECT ss.ss_customer_sk, CASE WHEN sr.sr_return_quantity IS NOT NULL
-        THEN (ss.ss_quantity - sr.sr_return_quantity) * ss.ss_sales_price
-        ELSE ss.ss_quantity * ss.ss_sales_price END AS act_sales
-      FROM store_sales ss LEFT JOIN store_returns sr ON ss.ss_item_sk = sr.sr_item_sk
-      JOIN reason r ON sr.sr_reason_sk = r.r_reason_sk
-      WHERE r.r_reason_desc = 'duplicate purchase') t
-GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100""",
-            "output": {
-                "rewrite_sets": [{
-                    "id": "rs_01",
-                    "transform": "early_filter",
-                    "nodes": {
-                        "filtered_reason": "SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'",
-                        "filtered_returns": "SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk",
-                        "main_query": "SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100"
-                    },
-                    "invariants_kept": ["output columns unchanged", "grain preserved", "same result rows"],
-                    "expected_speedup": "2.71x",
-                    "risk": "low"
-                }]
-            },
-            "speedup": "2.71x",
-            "key_insight": "Filter dimension table (reason) FIRST, then join to fact. Reduces returns to only 'duplicate purchase' before expensive store_sales join."
-        },
-
-        # Q23 - IN to EXISTS (DeepSeek - failed validation, keep for reference)
-        {
-            "opportunity": "IN_TO_EXISTS",
-            "input_slice": """[main_query]:
-SELECT ... FROM catalog_sales
-WHERE cs_item_sk IN (SELECT item_sk FROM frequent_ss_items)
-  AND cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer)
-...""",
-            "output": {
-                "rewrite_sets": [{
-                    "id": "rs_01",
-                    "transform": "in_to_exists",
-                    "nodes": {
-                        "main_query": "SELECT c_last_name, c_first_name, sales FROM (SELECT c_last_name, c_first_name, SUM(cs_quantity * cs_list_price) AS sales FROM catalog_sales JOIN date_dim ON cs_sold_date_sk = d_date_sk JOIN customer ON cs_bill_customer_sk = c_customer_sk WHERE d_year = 2000 AND d_moy = 5 AND EXISTS (SELECT 1 FROM frequent_ss_items f WHERE f.item_sk = cs_item_sk) AND EXISTS (SELECT 1 FROM best_ss_customer b WHERE b.c_customer_sk = cs_bill_customer_sk) GROUP BY c_last_name, c_first_name UNION ALL SELECT c_last_name, c_first_name, SUM(ws_quantity * ws_list_price) AS sales FROM web_sales JOIN date_dim ON ws_sold_date_sk = d_date_sk JOIN customer ON ws_bill_customer_sk = c_customer_sk WHERE d_year = 2000 AND d_moy = 5 AND EXISTS (SELECT 1 FROM frequent_ss_items f WHERE f.item_sk = ws_item_sk) AND EXISTS (SELECT 1 FROM best_ss_customer b WHERE b.c_customer_sk = ws_bill_customer_sk) GROUP BY c_last_name, c_first_name) ORDER BY c_last_name, c_first_name, sales LIMIT 100"
-                    },
-                    "invariants_kept": ["same result rows", "same ordering"],
-                    "expected_speedup": "2.33x",
-                    "risk": "medium"  # Failed validation on DeepSeek
-                }]
-            },
-            "speedup": "2.33x",
-            "note": "DeepSeek failed validation - use with caution"
-        }
-    ]

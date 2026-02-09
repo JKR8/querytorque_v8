@@ -37,26 +37,11 @@ ALGO_DIR = Path(__file__).resolve().parent.parent / "algorithms"
 
 @lru_cache(maxsize=16)
 def _load_algorithm(name: str) -> Optional[str]:
-    """Load a prompt-level algorithm YAML and render it as concise prompt text."""
+    """Load a prompt-level algorithm YAML and inject into prompt as-is."""
     path = ALGO_DIR / f"{name}.yaml"
     if not path.exists():
         return None
-    try:
-        import yaml
-        data = yaml.safe_load(path.read_text())
-    except Exception as e:
-        logger.warning(f"Failed to load algorithm {name}: {e}")
-        return None
-
-    lines = [f"### Algorithm: {data.get('name', name)}"]
-    lines.append("")
-    for rule in data.get("rules", []):
-        lines.append(f"{rule['id']}. **{rule['trigger']}** — {rule['action'].strip()}")
-        lines.append("")
-    priority = data.get("priority", "")
-    if priority:
-        lines.append(f"**Priority**: {priority.strip()}")
-    return "\n".join(lines)
+    return path.read_text()
 
 
 # ── EXPLAIN plan formatter ──────────────────────────────────────────────
@@ -847,7 +832,7 @@ def build_analyst_briefing_prompt(
         lines.append("")
         lines.append(plan_scanner_text)
         lines.append("")
-        algo_text = _load_algorithm("plan_scanner")
+        algo_text = _load_algorithm("postgres_dsb_sf10_scanner")
         if algo_text:
             lines.append(algo_text)
             lines.append("")

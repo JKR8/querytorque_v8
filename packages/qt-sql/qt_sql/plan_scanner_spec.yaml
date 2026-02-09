@@ -1,0 +1,325 @@
+# ============================================================================
+# Plan-Space Scanner Algorithm for PostgreSQL Query Optimization
+# ============================================================================
+# Layer 1: EXPLAIN-only intelligence (zero execution, ~54 seconds for 76 queries)
+# Layer 2: Wall-clock calibration (22 combos × 4x triage, ~90s per query)
+# Layer 3: LLM-guided SQL rewriting (uses Layer 1+2 as targeting intel)
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# LAYER 1: EXPLAIN-Only Plan Space Exploration
+# ---------------------------------------------------------------------------
+# Cost: ~0.7s per query (EXPLAIN without ANALYZE, no execution)
+# Input: Original SQL + PostgreSQL connection
+# Output: Per-query vulnerability profile
+# Tool: plan_scanner.py --explore
+# ---------------------------------------------------------------------------
+
+layer_1_explore:
+  name: "Plan-Space Exploration"
+  cost: "0.7s per query"
+  requires_execution: false
+
+  # Phase 1: Single + compound probes (22 combos = 17 base + 5 compound)
+  phase_1_single:
+    combos:
+      # Join method toggles
+      no_nestloop:    { enable_nestloop: "off" }
+      no_hashjoin:    { enable_hashjoin: "off" }
+      no_mergejoin:   { enable_mergejoin: "off" }
+      no_seqscan:     { enable_seqscan: "off" }
+      # Force specific join type
+      force_hash:     { enable_nestloop: "off", enable_mergejoin: "off" }
+      force_merge:    { enable_nestloop: "off", enable_hashjoin: "off" }
+      force_nestloop: { enable_hashjoin: "off", enable_mergejoin: "off" }
+      # Memory / resources
+      work_mem_256mb: { work_mem: "256MB" }
+      work_mem_1gb:   { work_mem: "1GB" }
+      work_mem_2gb:   { work_mem: "2GB" }
+      # JIT
+      no_jit:         { jit: "off" }
+      # Parallelism
+      no_parallel:    { max_parallel_workers_per_gather: "0" }
+      max_parallel:   { max_parallel_workers_per_gather: "8" }
+      # Join reordering
+      no_reorder:     { join_collapse_limit: "1" }
+      max_reorder:    { join_collapse_limit: "20", from_collapse_limit: "20" }
+      # Cost model
+      ssd_costs:      { random_page_cost: "1.1", effective_cache_size: "24GB" }
+      ssd_plus_mem:   { random_page_cost: "1.1", effective_cache_size: "24GB",
+                        work_mem: "256MB", hash_mem_multiplier: "4" }
+      # Compound combos (interaction effects)
+      jit_off_mem_256mb:    { jit: "off", work_mem: "256MB" }
+      jit_off_no_parallel:  { jit: "off", max_parallel_workers_per_gather: "0" }
+      mem_256mb_max_par:    { work_mem: "256MB", max_parallel_workers_per_gather: "8" }
+      no_reorder_mem_256mb: { join_collapse_limit: "1", work_mem: "256MB" }
+      ssd_no_jit:           { random_page_cost: "1.1", effective_cache_size: "24GB", jit: "off" }
+
+    method: |
+      For each combo:
+        1. SET LOCAL <config flags> within a transaction
+        2. EXPLAIN (FORMAT JSON, COSTS) the query (no execution)
+        3. Extract plan fingerprint (DFS of node_type, relation_name, join_type, index_name, parallelism)
+        4. Compare fingerprint to baseline
+        5. ROLLBACK (config reverts automatically)
+      Identify which combos produce distinct plans ("plan changers").
+
+  # Phase 2: Pairwise combination of plan changers
+  phase_2_pairwise:
+    method: |
+      For each pair of plan-changing combos from Phase 1:
+        1. Merge their configs (union of SET LOCAL flags)
+        2. EXPLAIN (FORMAT JSON, COSTS)
+        3. Compare fingerprint to ALL known plans (baseline + Phase 1 + other pairs)
+        4. Record as "novel pair" if fingerprint is new
+      This discovers emergent plan shapes from flag interactions.
+
+  # Vulnerability classification
+  vulnerability_types:
+
+    JOIN_TYPE_TRAP:
+      detection: "Any combo changes join node types (Nested Loop ↔ Hash Join ↔ Merge Join)"
+      prevalence: "74/76 queries (97%)"
+      action_for_llm: |
+        Write SQL that naturally guides the optimizer away from the fragile join type.
+        If baseline uses Nested Loop but Hash Join is reachable:
+          - Enlarge inner relation (CTE materialization, subquery)
+          - Remove correlated predicates that force nested loop
+          - Add explicit hash-friendly equi-join conditions
+        If baseline uses Hash Join but Nested Loop is reachable:
+          - Add highly selective predicates on inner table
+          - Use EXISTS with correlated subquery
+      detail_fields:
+        - baseline_joins: "List of join types in baseline plan"
+        - alternative_joins: "Join types in best alternative plan"
+        - triggering_combos: "Which flag toggles cause the change"
+
+    JOIN_ORDER_TRAP:
+      detection: "Any combo changes table access order in plan tree"
+      prevalence: "74/76 queries (97%)"
+      action_for_llm: |
+        Join enumeration is on a knife edge. The optimizer is uncertain about
+        the best table ordering. SQL restructuring can steer it:
+          - Explicit JOIN ordering (FROM a JOIN b ON ... JOIN c ON ...)
+          - CTE to force materialization of a subresult
+          - Subquery factoring to change available join paths
+      detail_fields:
+        - baseline_order: "Table access order in baseline"
+        - alternative_order: "Table order in best alternative"
+
+    SCAN_TYPE_TRAP:
+      detection: "Any combo changes scan types (Seq Scan ↔ Index Scan ↔ Bitmap Scan)"
+      prevalence: "74/76 queries (97%)"
+      action_for_llm: |
+        Scan method selection is fragile. Adding pre-filters or restructuring
+        predicates can flip scans:
+          - Tight WHERE predicates → favor Index Scan
+          - OR conditions on indexed columns → favor Bitmap Scan
+          - Removing broad predicates → may revert to Seq Scan (check if beneficial)
+      detail_fields:
+        - baseline_scans: "Scan types per table in baseline"
+        - alternative_scans: "Scan types in alternative plan"
+
+    MEMORY_SENSITIVITY:
+      detection: "ssd_plus_mem combo produces different plan fingerprint from baseline"
+      prevalence: "46/76 queries (61%)"
+      # IMPORTANT: This detects plan-SHAPE changes from memory settings.
+      # It does NOT detect same-plan spill elimination (see Layer 2 blind spot).
+      action_for_llm: |
+        The optimizer changes plan structure with more memory. This usually means
+        the baseline plan has hash joins or sorts near their spill threshold.
+        SET LOCAL work_mem = '256MB' is a strong candidate.
+      blind_spot: |
+        CRITICAL: The biggest work_mem wins happen when the plan does NOT change.
+        Q001: work_mem_256mb = 1.35x speedup with IDENTICAL plan (spill elimination).
+        Q001 does NOT trigger MEMORY_SENSITIVITY because the plan stays the same.
+        This category of win is INVISIBLE to Layer 1. Only Layer 2 can detect it.
+
+    SPILL_CANDIDATE:
+      detection: "Heuristic: baseline plan contains Hash Join or Sort operators"
+      prevalence: "~90% of queries (nearly all have Hash Join or Sort)"
+      action_for_llm: |
+        Hash Join or Sort operators may be spilling to disk in the baseline.
+        Always try SET LOCAL work_mem = '256MB' as a companion config.
+        This is a broader net than MEMORY_SENSITIVITY — catches same-plan wins.
+      requires_wall_clock: true
+      reason: "EXPLAIN cannot distinguish in-memory vs spilling execution"
+
+    PLAN_LOCKED:
+      detection: "Zero combos produce a different plan fingerprint"
+      prevalence: "2/76 queries (3%)"
+      action_for_llm: |
+        The optimizer found the globally preferred plan. No amount of flag toggling
+        changes it. Do NOT waste effort on plan-shape attacks.
+        Focus on:
+          - Reducing intermediate cardinality (tighter filters, early aggregation)
+          - Eliminating redundant computation (self-join decomposition)
+          - SET LOCAL work_mem for potential spill elimination (still worth trying)
+      deprioritize_for_wall_clock: true
+
+  # Output schema per query
+  output_per_query:
+    query_id: "string"
+    baseline_cost: "float (EXPLAIN cost estimate)"
+    baseline_plan_node: "string (root node type)"
+    baseline_joins: "list[string] (all join types)"
+    baseline_scans: "list[string] (all scan types with table names)"
+    baseline_table_order: "list[string] (table access order)"
+    n_distinct_plans: "int (total reachable plans)"
+    n_plan_changers: "int (combos that change plan)"
+    plan_changers: "list[string] (names of plan-changing combos)"
+    vulnerabilities: "list[VulnerabilityRecord]"
+    pair_results_novel: "list[string] (pairwise combos producing new plans)"
+    # Enriched plan intelligence (v2)
+    scan_counts: "dict[str, int] (per-table scan count — redundancy detection)"
+    predicate_placement: "list[dict] (Filter vs Index Cond classification)"
+    bottleneck_joins: "list[dict] (top-5 joins by cost with input sizes)"
+
+
+# ---------------------------------------------------------------------------
+# LAYER 2: Wall-Clock Calibration
+# ---------------------------------------------------------------------------
+# Cost: ~90s per query (22 combos × 4x triage timing)
+# Input: Original SQL + PostgreSQL connection + Layer 1 results
+# Output: Per-query ceiling + per-combo wall-clock speedups
+# Tool: plan_scanner.py (default mode)
+# Prerequisite: Layer 1 (uses plan fingerprints for cross-reference)
+# ---------------------------------------------------------------------------
+
+layer_2_wallclock:
+  name: "Wall-Clock Calibration"
+  cost: "70s per query"
+  requires_execution: true
+  baseline_timeout_ms: 30000   # Skip queries with baseline > 30s
+
+  timing_method: "4x triage (1-2-1-2)"
+  # 1. Warmup original
+  # 2. Warmup config
+  # 3. Measure original
+  # 4. Measure config
+  # Interleaved to control for thermal/cache drift
+
+  baseline_method: "3-run (discard warmup, avg last 2)"
+
+  # What Layer 2 discovers that Layer 1 CANNOT:
+  discovers:
+
+    same_plan_wins:
+      description: "Configs that produce identical EXPLAIN plans but faster wall-clock"
+      examples:
+        - query: "Q001"
+          combo: "work_mem_256mb"
+          plan_changed: false
+          speedup: 1.35
+          mechanism: "Hash spill elimination — hash table fits in RAM"
+        - query: "Q065"
+          combo: "no_jit"
+          plan_changed: false
+          speedup: 1.07
+          mechanism: "JIT compilation overhead exceeds execution savings"
+      layer1_signal: "NONE — identical plan fingerprint"
+
+    plan_change_direction:
+      description: "Whether a plan change is faster or slower (r=0.44 from EXPLAIN costs)"
+      examples:
+        - query: "Q014"
+          combo: "force_hash"
+          explain_cost_ratio: 0.26   # cost says 3.9x worse
+          actual_speedup: 1.41       # actually 1.41x better
+        - query: "Q010"
+          combo: "no_reorder"
+          explain_cost_ratio: 0.006  # cost says 155x worse
+          actual_speedup: 1.49       # actually 1.49x better (BEST combo!)
+        - query: "Q010"
+          combo: "no_nestloop"
+          explain_cost_ratio: 0.0001
+          actual_speedup: 0.15       # actually terrible (cost was right)
+      layer1_signal: "Plan changed, but direction UNRELIABLE from cost model"
+
+    speedup_magnitude:
+      description: "The actual speedup number for the paper"
+      layer1_signal: "NONE — EXPLAIN says 'different plan' not 'X times faster'"
+
+  # Output schema per query
+  output_per_query:
+    query_id: "string"
+    baseline_ms: "float"
+    ceiling_speedup: "float (best combo speedup)"
+    ceiling_combo: "string (name of best combo)"
+    combos: "list[ComboResult] with time_ms, speedup, plan_changed flag"
+
+  # Cross-reference with Layer 1
+  cross_reference: |
+    For each combo, compare:
+      layer1_plan_changed (bool) × layer2_speedup (float)
+    This produces the 3-category classification:
+      1. Plan-change win: plan_changed=true, speedup>1.05
+      2. Same-plan win: plan_changed=false, speedup>1.05
+      3. Plan-change regression: plan_changed=true, speedup<0.95
+
+
+# ---------------------------------------------------------------------------
+# LAYER 3: LLM-Guided SQL Rewriting (uses Layer 1 + Layer 2 as targeting)
+# ---------------------------------------------------------------------------
+# This is the existing swarm architecture. Layer 1+2 feed the analyst prompt.
+# ---------------------------------------------------------------------------
+
+layer_3_llm:
+  name: "LLM SQL Rewrite Swarm"
+  requires: ["layer_1_explore", "layer_2_wallclock"]
+
+  analyst_prompt_injection:
+    section: "3.5 — Plan-Space Intelligence"
+    content_from_layer_1:
+      - vulnerability_summary
+      - plan_diversity_score
+      - specific_plan_change_details
+      - memory_sensitivity_flag
+      - attack_vector_recommendations
+    content_from_layer_2:
+      - ceiling_speedup_and_combo
+      - same_plan_wins_detected
+      - top_config_recommendations
+
+  worker_targeting:
+    from_vulnerabilities: |
+      JOIN_TYPE_TRAP → W1 assigned to restructure joins
+      JOIN_ORDER_TRAP → W2 assigned to explicit JOIN ordering
+      SCAN_TYPE_TRAP → W3 assigned to predicate restructuring
+      MEMORY_SENSITIVITY → All workers emit SET LOCAL work_mem
+      PLAN_LOCKED → Skip plan-shape workers, use computation-reduction only
+    from_ceiling: |
+      If ceiling > 1.3x via config alone → worker should INCLUDE that config
+      If ceiling < 1.05x → config alone insufficient, SQL rewrite is essential
+
+
+# ---------------------------------------------------------------------------
+# EXECUTION PIPELINE
+# ---------------------------------------------------------------------------
+
+pipeline:
+  # Step 1: Run once per benchmark corpus (offline, cached)
+  step_1:
+    tool: "python -m qt_sql.plan_scanner --explore benchmarks/postgres_dsb_76/"
+    time: "54 seconds for 76 queries"
+    output: "plan_explore/{query_id}.json + summary.json"
+    cached: true
+
+  # Step 2: Run once per benchmark corpus (offline, cached)
+  step_2:
+    tool: "python -m qt_sql.plan_scanner benchmarks/postgres_dsb_76/ --timeout-ms 30000"
+    time: "~60 minutes for 76 queries (skips >30s baselines)"
+    output: "plan_scanner/{query_id}.json + summary.json"
+    cached: true
+
+  # Step 3: Per-query swarm (online, uses cached Layer 1+2)
+  step_3:
+    tool: "swarm_session.py loads plan_explore + plan_scanner into analyst prompt"
+    time: "~2 minutes per query (LLM calls)"
+    output: "optimized SQL + SET LOCAL config per worker"
+
+  # Step 4: Validation (4x triage or 5x trimmed mean)
+  step_4:
+    tool: "validate.py"
+    time: "~30 seconds per candidate"
+    output: "speedup measurement + row count check"

@@ -595,13 +595,13 @@ def build_sniper_prompt(
             rw_lines.append("")
         sections.append("\n".join(rw_lines))
 
-    # ── 15. Original SQL (full, line-numbered) ──────────────────────────
-    from .analyst_briefing import _add_line_numbers, _strip_template_comments
+    # ── 15. Original SQL (clean, no line numbers for rewriter) ──────────
+    from .analyst_briefing import _strip_template_comments
     clean_sql = _strip_template_comments(original_sql)
     sections.append(
         "## Original SQL\n\n"
         "```sql\n"
-        + _add_line_numbers(clean_sql) + "\n"
+        + clean_sql + "\n"
         "```"
     )
 

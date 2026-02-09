@@ -274,6 +274,18 @@ SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'Y' AND p_channel_tv = 
 ```sql
 SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS returns, SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit FROM store_sales LEFT OUTER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) INNER JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk INNER JOIN store ON ss_store_sk = s_store_sk INNER JOIN filtered_item ON ss_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ss_promo_sk = filtered_promotion.p_promo_sk WHERE ss_wholesale_cost BETWEEN 63 AND 78 GROUP BY s_store_id
 ```
+[csr]:
+```sql
+SELECT cp_catalog_page_id AS catalog_page_id, SUM(cs_ext_sales_price) AS sales, SUM(COALESCE(cr_return_amount, 0)) AS returns, SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit FROM catalog_sales LEFT OUTER JOIN catalog_returns ON (cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number) INNER JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk INNER JOIN catalog_page ON cs_catalog_page_sk = cp_catalog_page_sk INNER JOIN filtered_item ON cs_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON cs_promo_sk = filtered_promotion.p_promo_sk WHERE cs_wholesale_cost BETWEEN 63 AND 78 GROUP BY cp_catalog_page_id
+```
+[wsr]:
+```sql
+SELECT web_site_id, SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS returns, SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit FROM web_sales LEFT OUTER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number) INNER JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk INNER JOIN web_site ON ws_web_site_sk = web_site_sk INNER JOIN filtered_item ON ws_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ws_promo_sk = filtered_promotion.p_promo_sk WHERE ws_wholesale_cost BETWEEN 63 AND 78 GROUP BY web_site_id
+```
+[main_query]:
+```sql
+SELECT channel, id, SUM(sales) AS sales, SUM(returns) AS returns, SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, returns, profit FROM ssr UNION ALL SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, returns, profit FROM csr UNION ALL SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, returns, profit FROM wsr) AS x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100
+```
 
 ## Original SQL
 
@@ -350,18 +362,9 @@ SET LOCAL permissions:
 - Empty is valid: if your rewrite has no planner bottleneck, emit no SET LOCAL
 - Stay within the resource envelope bounds above
 
-### Output Format
-If you recommend SET LOCAL, prefix your SQL block with the commands:
-
-```sql
-SET LOCAL work_mem = '512MB';
-SET LOCAL jit = 'off';
--- rewritten query follows
-WITH ...
-SELECT ...
-```
-
-If no config changes help, just output the rewritten SQL directly.
+### SET LOCAL Syntax
+Include SET LOCAL commands in the `set_local` array field of your JSON output.
+If no config changes help, omit the field or use an empty array.
 
 ## Rewrite Checklist (must pass before final SQL)
 
@@ -370,14 +373,18 @@ If no config changes help, just output the rewritten SQL directly.
 - Preserve all literals and the exact final output schema/order.
 - Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
 
-## Output
+## Output Format
 
-Return the complete rewritten SQL query. The query must be syntactically
-valid and ready to execute.
+Return a JSON object with your rewrite as `rewrite_sets`. Each node is a CTE
+or the final SELECT. You MUST declare the output columns for every node in
+`node_contracts` — this forces you to reason about what flows between CTEs.
+
+Only include nodes you **changed or added**. Unchanged nodes are auto-filled
+from the original query.
 
 ### Column Completeness Contract
 
-Your rewritten query MUST produce **exactly** these output columns (same names, same order):
+Your `main_query` node MUST produce **exactly** these output columns (same names, same order):
 
   1. `i_item_desc`
   2. `w_warehouse_name`
@@ -386,19 +393,42 @@ Your rewritten query MUST produce **exactly** these output columns (same names, 
   5. `promo`
   6. `total_cnt`
 
-Do NOT add, remove, or rename any columns. The result set schema must be identical to the original query.
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
 
-```sql
--- Your rewritten query here
+```json
+{
+  "rewrite_sets": [{
+    "id": "rs_01",
+    "transform": "<transform_name>",
+    "nodes": {
+      "<cte_name>": "<SQL for this CTE body>",
+      "main_query": "<final SELECT>"
+    },
+    "node_contracts": {
+      "<cte_name>": ["col1", "col2", "..."],
+      "main_query": ["col1", "col2", "..."]
+    },
+    "set_local": ["SET LOCAL work_mem = '512MB'", "SET LOCAL jit = 'off'"],
+    "data_flow": "<cte_a> -> <cte_b> -> main_query",
+    "invariants_kept": ["same output columns", "same rows"],
+    "expected_speedup": "2.0x",
+    "risk": "low"
+  }]
+}
 ```
 
-After the SQL, explain the mechanism:
+### Rules
+- Every node in `nodes` MUST appear in `node_contracts` and vice versa
+- `node_contracts`: list the output column names each node produces
+- `data_flow`: show the CTE dependency chain (forces you to think about order)
+- `main_query` = the final SELECT — its contract must match the Column Completeness Contract above
+- New CTE structures are encouraged — design the best topology for the query
+
+After the JSON, explain the mechanism:
 
 ```
 Changes: <1-2 sentences: what structural change + the expected mechanism>
-  e.g., 'Consolidated 4 store_sales scans into 1 with CASE branches — reduces I/O by 3x'
-  e.g., 'Deferred customer join to resolve_names — joins 4K rows instead of 5.4M'
 Expected speedup: <estimate>
 ```
 
-Now output your rewritten SQL:
+Now output your rewrite as JSON:

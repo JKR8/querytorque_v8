@@ -1,0 +1,64 @@
+{
+  "query_id": "query080_multi_i1",
+  "engine": "postgresql",
+  "round_num": 0,
+  "n_attacks": 3,
+  "attacks": [
+    {
+      "attack_id": 1,
+      "target_node": "** Nested Loop Inner joining fact tables to `item`",
+      "gap_hypothesis": "** PostgreSQL optimizer fails to push highly selective dimension table filters early when multiple dimension tables join to the same fact table, especially when filters are independent of other join conditions.",
+      "structural_preconditions": "** \n1. A dimension table with highly selective filters (e.g., `i_current_price > 50 AND i_category IN (...)`)\n2. The dimension table joins to a large fact table via foreign key\n3. Multiple other dimension tables join to the same fact table with less selective filters\n4. Current plan places the selective dimension as inner side of nested loop  \n**",
+      "mechanism": "** Use a LATERAL subquery to force early filtering on `item` before joining to other dimensions. This creates a \"pushed-down\" filter that reduces fact table rows early.  \n**",
+      "expected_plan_change": "** `item` scan moves to outer side of a nested loop or becomes part of an early hash join. Fact table access uses index on `item_sk` with pre-filtered `item_sk` list.  \n**",
+      "semantic_risk": "** LATERAL requires correlation; must ensure we don't change join semantics. The original is an inner join to `item`, so equivalent.  \n**",
+      "optimized_sql": "SET LOCAL jit = 'off';\nWITH ssr AS (\n  SELECT s_store_id as store_id,\n         sum(ss_ext_sales_price) as sales,\n         sum(coalesce(sr_return_amt, 0)) as returns,\n         sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit\n  FROM (\n    SELECT ss_item_sk, ss_ticket_number, ss_store_sk, \n           ss_ext_sales_price, ss_net_profit, ss_promo_sk\n    FROM store_sales\n    WHERE ss_sold_date_sk IN (\n      SELECT d_date_sk \n      FROM date_dim \n      WHERE d_date BETWEEN cast('1998-08-29' as date) \n                      AND cast('1998-08-29' as date) + interval '30 day'\n    )\n    AND ss_wholesale_cost BETWEEN 23 AND 38\n  ) ss\n  INNER JOIN LATERAL (\n    SELECT i_item_sk \n    FROM item \n    WHERE i_item_sk = ss.ss_item_sk \n      AND i_current_price > 50 \n      AND i_category IN ('Children', 'Sports')\n  ) i ON true\n  LEFT JOIN store_returns sr ON ss.ss_item_sk = sr.sr_item_sk \n                             AND ss.ss_ticket_number = sr.sr_ticket_number\n  JOIN store ON ss.ss_store_sk = s_store_sk\n  JOIN promotion p ON ss.ss_promo_sk = p.p_promo_sk\n  WHERE p_channel_email = 'N'\n    AND p_channel_tv = 'N'\n    AND p_channel_radio = 'N'\n    AND p_channel_press = 'N'\n    AND p_channel_event = 'N'\n  GROUP BY s_store_id\n),\ncsr AS (...similar transformation...),\nwsr AS (...similar transformation...)\nSELECT channel, id, sum(sales) as sales, sum(returns) as returns, sum(profit) as profit\nFROM (\n  SELECT 'store channel' as channel, 'store' || store_id as id, sales, returns, profit FROM ssr\n  UNION ALL\n  SELECT 'catalog channel' as channel, 'catalog_page' || catalog_page_id as id, sales, returns, profit FROM csr\n  UNION ALL\n  SELECT 'web channel' as channel, 'web_site' || web_site_id as id, sales, returns, profit FROM wsr\n) x\nGROUP BY ROLLUP (channel, id)\nORDER BY channel, id\nLIMIT 100;",
+      "status": "ERROR",
+      "speedup": 0.0,
+      "error_messages": [
+        "Syntax error: Unknown dialect 'postgresql'. Did you mean postgres?"
+      ]
+    },
+    {
+      "attack_id": 2,
+      "target_node": "** All three Nested Loop Inner nodes",
+      "gap_hypothesis": "** PostgreSQL doesn't consider pre-aggregating fact tables before joining to multiple dimension tables when dimensions don't affect grouping columns.",
+      "structural_preconditions": "**\n1. Grouping is by dimension column (store_id, catalog_page_id, web_site_id)\n2. Other dimension tables (item, promotion) only contribute filter predicates, not grouping columns\n3. Fact table has high cardinality relative to filtered result  \n**",
+      "mechanism": "** Aggregate fact table at the `(item_sk, store_sk, promo_sk, ticket_number)` level first, then join to dimensions for filtering. This reduces nested loop iterations because aggregation shrinks row count before dimension joins.  \n**",
+      "expected_plan_change": "** `Aggregate` node appears before joins to `item` and `promotion`. Nested loops run on aggregated rows (fewer iterations).  \n**",
+      "semantic_risk": "** Must preserve `LEFT JOIN` to returns table correctly. Returns must be joined before aggregation since they affect sums. We'll keep returns join before aggregation.  \n**",
+      "optimized_sql": "SET LOCAL jit = 'off';\nWITH ssr AS (\n  SELECT s_store_id as store_id,\n         sum(agg.sales) as sales,\n         sum(agg.returns) as returns,\n         sum(agg.profit) as profit\n  FROM (\n    SELECT ss_store_sk, ss_item_sk, ss_promo_sk,\n           sum(ss_ext_sales_price) as sales,\n           sum(coalesce(sr_return_amt, 0)) as returns,\n           sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit\n    FROM store_sales\n    LEFT JOIN store_returns ON ss_item_sk = sr_item_sk \n                           AND ss_ticket_number = sr_ticket_number\n    WHERE ss_sold_date_sk IN (\n      SELECT d_date_sk \n      FROM date_dim \n      WHERE d_date BETWEEN cast('1998-08-29' as date) \n                      AND cast('1998-08-29' as date) + interval '30 day'\n    )\n    AND ss_wholesale_cost BETWEEN 23 AND 38\n    GROUP BY ss_store_sk, ss_item_sk, ss_promo_sk\n  ) agg\n  JOIN store ON agg.ss_store_sk = s_store_sk\n  JOIN item ON agg.ss_item_sk = i_item_sk\n  JOIN promotion ON agg.ss_promo_sk = p_promo_sk\n  WHERE i_current_price > 50\n    AND i_category IN ('Children', 'Sports')\n    AND p_channel_email = 'N'\n    AND p_channel_tv = 'N'\n    AND p_channel_radio = 'N'\n    AND p_channel_press = 'N'\n    AND p_channel_event = 'N'\n  GROUP BY s_store_id\n),\ncsr AS (...similar...),\nwsr AS (...similar...)\nSELECT channel, id, sum(sales) as sales, sum(returns) as returns, sum(profit) as profit\nFROM (\n  SELECT 'store channel' as channel, 'store' || store_id as id, sales, returns, profit FROM ssr\n  UNION ALL\n  SELECT 'catalog channel' as channel, 'catalog_page' || catalog_page_id as id, sales, returns, profit FROM csr\n  UNION ALL\n  SELECT 'web channel' as channel, 'web_site' || web_site_id as id, sales, returns, profit FROM wsr\n) x\nGROUP BY ROLLUP (channel, id)\nORDER BY channel, id\nLIMIT 100;",
+      "status": "ERROR",
+      "speedup": 0.0,
+      "error_messages": [
+        "Syntax error: Unknown dialect 'postgresql'. Did you mean postgres?"
+      ]
+    },
+    {
+      "attack_id": 3,
+      "target_node": "** Nested Loop Inner joining to `item`",
+      "gap_hypothesis": "** Optimizer underestimates selectivity of `item` filters and chooses nested loop over hash join. Forcing a hash join with a small pre-filtered dimension can reduce total cost.",
+      "structural_preconditions": "**\n1. Dimension table has very selective filter (<1% of rows)\n2. Current plan uses index nested loop (good for ultra-high selectivity)\n3. But hash join might be better if dimension is tiny and fact table index isn't covering  \n**",
+      "mechanism": "** Materialize filtered `item` keys in a CTE, then force hash join via `IN` clause or explicit join with no index hint.  \n**",
+      "expected_plan_change": "** `Hash Join` between fact table and `item` CTE instead of nested loop with index scan.  \n**",
+      "semantic_risk": "** CTE may be materialized (overhead). Works because `item` filter is independent.  \n**",
+      "optimized_sql": "SET LOCAL jit = 'off';\nWITH filtered_items AS (\n  SELECT i_item_sk \n  FROM item \n  WHERE i_current_price > 50 \n    AND i_category IN ('Children', 'Sports')\n),\nssr AS (\n  SELECT s_store_id as store_id,\n         sum(ss_ext_sales_price) as sales,\n         sum(coalesce(sr_return_amt, 0)) as returns,\n         sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit\n  FROM store_sales\n  JOIN filtered_items ON ss_item_sk = filtered_items.i_item_sk\n  LEFT JOIN store_returns ON ss_item_sk = sr_item_sk \n                         AND ss_ticket_number = sr_ticket_number\n  JOIN date_dim ON ss_sold_date_sk = d_date_sk\n  JOIN store ON ss_store_sk = s_store_sk\n  JOIN promotion ON ss_promo_sk = p_promo_sk\n  WHERE d_date BETWEEN cast('1998-08-29' as date) \n                  AND cast('1998-08-29' as date) + interval '30 day'\n    AND ss_wholesale_cost BETWEEN 23 AND 38\n    AND p_channel_email = 'N'\n    AND p_channel_tv = 'N'\n    AND p_channel_radio = 'N'\n    AND p_channel_press = 'N'\n    AND p_channel_event = 'N'\n  GROUP BY s_store_id\n),\ncsr AS (...similar with catalog_sales...),\nwsr AS (...similar with web_sales...)\nSELECT channel, id, sum(sales) as sales, sum(returns) as returns, sum(profit) as profit\nFROM (\n  SELECT 'store channel' as channel, 'store' || store_id as id, sales, returns, profit FROM ssr\n  UNION ALL\n  SELECT 'catalog channel' as channel, 'catalog_page' || catalog_page_id as id, sales, returns, profit FROM csr\n  UNION ALL\n  SELECT 'web channel' as channel, 'web_site' || web_site_id as id, sales, returns, profit FROM wsr\n) x\nGROUP BY ROLLUP (channel, id)\nORDER BY channel, id\nLIMIT 100;",
+      "status": "ERROR",
+      "speedup": 0.0,
+      "error_messages": [
+        "Syntax error: Unknown dialect 'postgresql'. Did you mean postgres?"
+      ]
+    }
+  ],
+  "discovery_summary": {
+    "new_gaps": [
+      "**"
+    ],
+    "extended_gaps": [
+      "** None (first round)"
+    ],
+    "negative_results": [
+      "**"
+    ]
+  }
+}

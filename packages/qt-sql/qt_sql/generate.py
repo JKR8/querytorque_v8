@@ -165,12 +165,18 @@ class CandidateGenerator:
             rewriter = SQLRewriter(sql, dialect=dialect)
             result = rewriter.apply_response(response)
 
-            # Extract transforms from response (with fallback inference)
-            transforms = extract_transforms_from_response(
-                response,
-                original_sql=sql,
-                optimized_sql=result.optimized_sql
-            )
+            # Use explicit transform from JSON rewrite_set when available,
+            # fall back to AST-diff inference for raw SQL responses
+            if result.rewrite_set and result.rewrite_set.transform:
+                transforms = [result.rewrite_set.transform]
+            elif result.transform and result.transform != "semantic_rewrite":
+                transforms = [result.transform]
+            else:
+                transforms = extract_transforms_from_response(
+                    response,
+                    original_sql=sql,
+                    optimized_sql=result.optimized_sql
+                )
 
             return Candidate(
                 worker_id=worker_id,

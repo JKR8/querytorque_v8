@@ -9,11 +9,10 @@ Tests that the assembler correctly handles:
 """
 
 import pytest
-from qt_sql.optimization.dag_v2 import (
+from qt_sql.dag import (
     DagBuilder,
     RewriteAssembler,
     RewriteSet,
-    DagV2Pipeline,
 )
 
 
@@ -208,87 +207,6 @@ class TestRewriteAssemblerEdgeCases:
 
         # Result should be valid SQL without nested WITH
         assert result.count("WITH") == 1
-
-
-class TestDagV2PipelineIntegration:
-    """Integration tests for the full pipeline."""
-
-    def test_pipeline_apply_response_with_new_ctes(self):
-        """Test full pipeline with LLM response adding new CTEs."""
-        original_sql = """
-        WITH customer_total_return AS (
-            SELECT sr_customer_sk AS ctr_customer_sk,
-                   SUM(sr_fee) AS ctr_total_return
-            FROM store_returns
-            GROUP BY sr_customer_sk
-        )
-        SELECT * FROM customer_total_return
-        """
-
-        pipeline = DagV2Pipeline(original_sql)
-
-        # Simulate LLM response with new CTEs
-        llm_response = '''
-        Here is the optimized query:
-        ```json
-        {
-            "rewrite_sets": [{
-                "id": "rs_01",
-                "transform": "early_filter",
-                "nodes": {
-                    "filtered_returns": "SELECT sr_customer_sk, sr_fee FROM store_returns WHERE sr_store_sk = 10",
-                    "customer_total_return": "SELECT sr_customer_sk AS ctr_customer_sk, SUM(sr_fee) AS ctr_total_return FROM filtered_returns GROUP BY sr_customer_sk",
-                    "main_query": "SELECT * FROM customer_total_return"
-                },
-                "invariants_kept": ["same output"],
-                "expected_speedup": "2x",
-                "risk": "low"
-            }],
-            "explanation": "Added early filter CTE"
-        }
-        ```
-        '''
-
-        result = pipeline.apply_response(llm_response)
-
-        # Both CTEs should be present
-        assert "filtered_returns AS (" in result
-        assert "customer_total_return AS (" in result
-        # filtered_returns should come first (customer_total_return depends on it)
-        assert result.find("filtered_returns AS (") < result.find("customer_total_return AS (")
-
-    def test_pipeline_handles_no_rewrite_sets(self):
-        """Pipeline returns original when no rewrite_sets in response."""
-        original_sql = "SELECT * FROM foo"
-
-        pipeline = DagV2Pipeline(original_sql)
-
-        llm_response = '''
-        ```json
-        {
-            "rewrite_sets": [],
-            "explanation": "No optimization needed"
-        }
-        ```
-        '''
-
-        result = pipeline.apply_response(llm_response)
-
-        # Should return original
-        assert result == original_sql
-
-    def test_pipeline_handles_invalid_json(self):
-        """Pipeline returns original when response has invalid JSON."""
-        original_sql = "SELECT * FROM foo"
-
-        pipeline = DagV2Pipeline(original_sql)
-
-        llm_response = "This is not valid JSON at all"
-
-        result = pipeline.apply_response(llm_response)
-
-        # Should return original
-        assert result == original_sql
 
 
 class TestDependencyGraph:

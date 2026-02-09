@@ -318,7 +318,7 @@ def build_mock_worker_briefing():
 
 
 def main():
-    from ...knowledge import ADOFAISSRecommender
+    from ...knowledge import TagRecommender
 
     original_sql = load_original_sql()
     explain_plan_text = load_explain_plan()
@@ -326,7 +326,7 @@ def main():
     semantic_intents = load_semantic_intents()
     global_knowledge = load_global_knowledge()
 
-    recommender = ADOFAISSRecommender()
+    recommender = TagRecommender()
     matched_examples = load_matched_examples(original_sql, recommender)
     all_available = load_full_catalog()
     constraints = load_constraints()
