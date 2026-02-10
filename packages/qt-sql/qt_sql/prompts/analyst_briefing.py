@@ -1212,6 +1212,12 @@ def build_analyst_briefing_prompt(
         )
         lines.append("")
 
+    # ── 11b. PG SET LOCAL config for oneshot (analyst IS the worker) ─────
+    if mode == "oneshot" and dialect in ("postgres", "postgresql") and resource_envelope:
+        from .worker import _section_set_local_config
+        lines.append(_section_set_local_config(resource_envelope))
+        lines.append("")
+
     # ── 12. Output format specification ──────────────────────────────────
     lines.append("Then produce the structured briefing in EXACTLY this format:")
     lines.append("")
@@ -1321,7 +1327,8 @@ def build_analyst_briefing_prompt(
         lines.append("  }],")
         lines.append('  "macros": {},')
         lines.append('  "frozen_blocks": [],')
-        lines.append('  "runtime_config": [],')
+        if dialect in ("postgres", "postgresql"):
+            lines.append('  "runtime_config": ["SET LOCAL work_mem = \'512MB\'"],')
         lines.append('  "validation_checks": []')
         lines.append("}")
         lines.append("```")
@@ -1332,6 +1339,8 @@ def build_analyst_briefing_prompt(
         lines.append("- No ellipsis — every `sql` value must be complete, executable SQL")
         lines.append("- Only include changed/added components; set unchanged to `\"change\": \"unchanged\"` with `\"sql\": \"\"`")
         lines.append("- `main_query` output columns must match original exactly")
+        if dialect in ("postgres", "postgresql"):
+            lines.append("- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit if not needed")
         lines.append("")
         lines.append("After the JSON, explain the mechanism:")
         lines.append("")
@@ -1626,6 +1635,7 @@ def build_script_oneshot_prompt(
     matched_examples: Optional[List[Dict[str, Any]]] = None,
     constraints: Optional[List[Dict[str, Any]]] = None,
     regression_warnings: Optional[List[Dict[str, Any]]] = None,
+    resource_envelope: Optional[str] = None,
 ) -> str:
     """Build a oneshot prompt for an entire multi-statement SQL pipeline.
 
@@ -1825,6 +1835,12 @@ def build_script_oneshot_prompt(
     )
     lines.append("")
 
+    # ── 7b. PG SET LOCAL config (script-level oneshot) ──────────────────
+    if dialect in ("postgres", "postgresql") and resource_envelope:
+        from .worker import _section_set_local_config
+        lines.append(_section_set_local_config(resource_envelope))
+        lines.append("")
+
     # ── 8. Output format (DAP multi-statement) ─────────────────────────
     lines.append("## Output Format")
     lines.append("")
@@ -1859,7 +1875,8 @@ def build_script_oneshot_prompt(
     lines.append("  ],")
     lines.append('  "macros": {},')
     lines.append('  "frozen_blocks": [],')
-    lines.append('  "runtime_config": [],')
+    if dialect in ("postgres", "postgresql"):
+        lines.append('  "runtime_config": ["SET LOCAL work_mem = \'512MB\'"],')
     lines.append('  "validation_checks": []')
     lines.append("}")
     lines.append("```")
@@ -1880,6 +1897,8 @@ def build_script_oneshot_prompt(
         "consumers, not just the immediate next stage"
     )
     lines.append("- No ellipsis — every `sql` value must be complete, executable SQL")
+    if dialect in ("postgres", "postgresql"):
+        lines.append("- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit if not needed")
     lines.append("")
     lines.append("After the JSON, explain the overall pipeline optimization:")
     lines.append("")

@@ -1,12 +1,12 @@
-"""Knowledge retrieval for ADO.
+"""Knowledge retrieval for qt_sql.
 
 This module retrieves gold examples and constraints for SQL optimization.
 Uses tag-based similarity matching from the tag index, with fallback
 to loading all local examples.
 
 Local directories:
-- ado/examples/*.json - Gold optimization examples
-- ado/constraints/*.json - Safety constraints
+- qt_sql/examples/*.json - Gold optimization examples
+- qt_sql/constraints/*.json - Safety constraints
 """
 
 from __future__ import annotations
@@ -29,9 +29,9 @@ MODELS_DIR = BASE_DIR / "models"
 # =============================================================================
 
 class TagRecommender:
-    """Tag-based similarity recommender for ADO examples.
+    """Tag-based similarity recommender for qt_sql examples.
 
-    Uses ado/models/similarity_tags.json for tag overlap matching.
+    Uses qt_sql/models/similarity_tags.json for tag overlap matching.
     """
 
     def __init__(self):
@@ -41,12 +41,12 @@ class TagRecommender:
         self._load_index()
 
     def _load_index(self):
-        """Load tag index from ado/models/."""
+        """Load tag index from qt_sql/models/."""
         tags_file = MODELS_DIR / "similarity_tags.json"
         metadata_file = MODELS_DIR / "similarity_metadata.json"
 
         if not tags_file.exists():
-            logger.debug(f"ADO tag index not found at {tags_file}")
+            logger.debug(f"Tag index not found at {tags_file}")
             return
 
         try:
@@ -57,7 +57,7 @@ class TagRecommender:
                 self.tag_metadata = json.loads(metadata_file.read_text())
 
             self._initialized = bool(self.tag_entries)
-            logger.info(f"Loaded ADO tag index with {len(self.tag_entries)} examples")
+            logger.info(f"Loaded tag index with {len(self.tag_entries)} examples")
 
         except Exception as e:
             logger.warning(f"Failed to load ADO tag index: {e}")

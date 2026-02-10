@@ -11,8 +11,8 @@ Tests 4 diverse queries:
   - Q085 (I/O bound): bitmap scans, minimal spills
 
 Run:
-  cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
-  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.tests.test_pg_tuner_llm
+  cd <repo-root>
+  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.tests.test_pg_tuner_llm
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path("/mnt/c/Users/jakc9/Documents/QueryTorque_V8")
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 for p in ["packages/qt-shared", "packages/qt-sql", "."]:
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -39,9 +39,9 @@ PG_CONN = {
     "password": "jakc9",
 }
 
-QUERY_DIR = PROJECT_ROOT / "packages/qt-sql/ado/benchmarks/postgres_dsb/queries"
-EXPLAIN_DIR = PROJECT_ROOT / "packages/qt-sql/ado/benchmarks/postgres_dsb/explains/sf10"
-ENGINE_PROFILE_PATH = PROJECT_ROOT / "packages/qt-sql/ado/constraints/engine_profile_postgresql.json"
+QUERY_DIR = PROJECT_ROOT / "packages/qt-sql/qt_sql/benchmarks/postgres_dsb/queries"
+EXPLAIN_DIR = PROJECT_ROOT / "packages/qt-sql/qt_sql/benchmarks/postgres_dsb/explains/sf10"
+ENGINE_PROFILE_PATH = PROJECT_ROOT / "packages/qt-sql/qt_sql/constraints/engine_profile_postgresql.json"
 
 # Queries to test — diverse bottleneck profiles
 TEST_QUERIES = [

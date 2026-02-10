@@ -1299,7 +1299,7 @@ AND b.row_num =1;
 2. **IDENTIFY FILTER BOUNDARIES**: Where do filters first appear? Can they be pushed earlier in the chain?
 3. **MAP BASE TABLE SCANS**: Which base tables are scanned by multiple stages? Can scans be consolidated?
 4. **CHECK MATERIALIZATION NECESSITY**: Does each temp table NEED to be materialized, or could it be inlined as a CTE?
-5. **WRITE REWRITES**: For each statement you change, produce a rewrite_set in the output format below.
+5. **WRITE REWRITES**: For each statement you change, produce a component payload in the output format below.
 
 ## Output Format
 
@@ -1328,7 +1328,6 @@ Then output a **Component Payload JSON** with one statement entry per pipeline s
   ],
   "macros": {},
   "frozen_blocks": [],
-  "runtime_config": [],
   "validation_checks": []
 }
 ```

@@ -623,6 +623,6 @@ def build_sniper_prompt(
     sections.append(build_sniper_rewrite_checklist())
 
     # ── 18. Column completeness contract + output format ────────────────
-    sections.append(_section_output_format(output_columns))
+    sections.append(_section_output_format(output_columns, dialect=dialect))
 
     return "\n\n".join(sections)

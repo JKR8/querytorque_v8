@@ -1,93 +1,34 @@
-# SQL Optimization Results
+# Research Archive
 
-> **Knowledge Base**: [Working Optimizations](WORKING_OPTIMIZATIONS.md) ← patterns with examples
->
-> **Architecture**: [Prompt Architecture](PROMPT_ARCHITECTURE.md) | [Agentic Loop Design](AGENTIC_LOOP_DESIGN.md)
->
-> **Details**: [Q23 Optimization Process](Q23_OPTIMIZATION_PROCESS.md) | [Prompt & System Design](PROMPT_AND_SYSTEM_DESIGN.md)
->
-> **Prompts**: [Q1](prompts/q1_prompt.md) | [Q23](prompts/q23_prompt.md)
+Archived research from QueryTorque V8 development (Jan–Feb 2026).
+Everything here is historical reference — the winning system is now in `packages/qt-sql/`.
 
-## Summary
+## Directory Index
 
-| Query | Status | Speedup | Best Model | Optimization Type |
-|-------|--------|---------|------------|-------------------|
-| [Q1](q1_tpcds.md) | ✅ SUCCESS | 2.10x | DeepSeek-reasoner | Predicate pushdown |
-| [Q2](q2_tpcds.md) | ✅ SUCCESS | 2.09x | Gemini | Filter pushdown |
-| [Q23](q23_tpcds.md) | ✅ SUCCESS | 2.18x | Gemini | Join elimination |
+| Folder | Contents |
+|--------|----------|
+| `benchmark_results/` | DuckDB TPC-DS consolidated leaderboard, PG DSB results, retry runs, raw timing data |
+| `prompt_development/` | Prompt iteration history, version snapshots, review notes, stale generators |
+| `experiment_history/` | ML pipeline experiments, state analysis, evolutionary runs, pipeline iterations |
+| `analysis_reports/` | Analyst session logs, research docs, grid system docs, loose reports/notes |
+| `build_artifacts/` | Intermediate models, optimized query outputs, old packages |
+| `adhoc_scripts/` | One-off test scripts, scratch work, payload comparisons |
+| `ado/` | ADO learning system research (journal, analytics) |
+| `papers/` | Reference papers (E2, R-Bot) |
+| `knowledge_base/` | Early knowledge base experiments |
+| `queries/` | Raw TPC-DS query files |
 
-## Key Findings
+## Key Results (for reference)
 
-### AST Rules vs EXPLAIN Plan
+- **DuckDB TPC-DS**: 34 WIN, 25 IMPROVED, 14 NEUTRAL, 15 REGRESSION (88 queries, 4 workers)
+- **Top DuckDB**: Q88 5.25x, Q9 4.47x, Q40 3.35x, Q46 3.23x, Q42 2.80x
+- **PG DSB**: 20 WIN, 4 IMPROVED, 13 NEUTRAL, 11 REGRESSION (50 queries)
+- **Top PG**: Q092 4428x (timeout fix), Q065 3.93x, Q080 3.32x, Q099 2.28x
 
-| Query | AST Issues Detected | Issues That Mattered | Overlap |
-|-------|---------------------|----------------------|---------|
-| Q1 | 9 | 1 (predicate pushdown) | **0%** |
-| Q2 | 13 | 1 (filter pushdown) | **0%** |
+## Regenerating Prompt Pack
 
-**Conclusion:** AST rules detect syntax patterns. EXPLAIN plans reveal performance bottlenecks. They are completely different.
-
-### Model Comparison
-
-| Model | Q1 | Q2 | Q23 | Notes |
-|-------|----|----|-----|-------|
-| DeepSeek-reasoner | ✅ 2.10x | - | - | Conservative, correct |
-| Gemini | - | ✅ 2.09x | ✅ 2.18x | Join elimination with IS NOT NULL |
-| OSS | - | ❌ 3.48x (wrong) | - | Aggressive, broke semantics |
-
-### Critical Finding: Join Elimination Requires IS NOT NULL
-
-Q23 demonstrated the importance of **preserving NULL filtering semantics** when eliminating joins:
-
-| Pattern | Naive Approach | Correct Approach |
-|---------|----------------|------------------|
-| FK-only join to dimension | Remove join | Remove join + add `WHERE fk IS NOT NULL` |
-| "Missing" year filter | Add year filter | Leave alone (intentional: lifetime vs periodic) |
-
-**Lesson:** When a join is only used for FK validation (no columns selected), replace with `IS NOT NULL` to preserve the implicit NULL filtering.
-
-### Validation Gaps
-
-Sample database validation **did not catch** Q23 issues because:
-- Both original and optimized returned NULL on 1% sample
-- HAVING clause conditions weren't met with less data
-- Need larger samples or full-data validation for complex queries
-
-### Optimization Patterns
-
-| Pattern | Description | Example |
-|---------|-------------|---------|
-| **Predicate Pushdown** | Move filter INTO CTE before GROUP BY | Q1: s_state='SD' into CTE |
-| **Filter Pushdown** | Add selective filter to reduce rows before aggregation | Q2: d_year IN subquery |
-| **Scan Consolidation** | Combine multiple scans with CASE WHEN | Q23: filtered + all-time in one pass |
-| **Join Reordering** | Filter by smallest result first | Q23: date + customer before items |
-| **Join Elimination** | Remove redundant dimension join | Q23: ss_customer_sk IS NOT NULL |
-
-### Prompt Structure That Works
-
+The only live prompt generator:
+```bash
+cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
+PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.prompts.samples.generate_sample query_88 --version V0
 ```
-## Algorithm
-1. ANALYZE: Find where rows/cost are largest
-2. OPTIMIZE: For each bottleneck, ask "what could reduce it earlier?"
-3. VERIFY: Result must be semantically equivalent
-
-## Plan
-<operators by cost>
-<table scans with filter status>
-
-## Data Flow
-<CTE dependencies>
-
-## SQL
-<query>
-
-## Output
-<patch JSON format>
-```
-
-## Benchmark Methodology
-
-- **Database:** TPC-DS SF100 on DuckDB
-- **Runs:** 3 runs after cache warmup
-- **Metric:** Average execution time
-- **Verification:** Row count and value comparison

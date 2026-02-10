@@ -209,7 +209,10 @@ def validate_ast_equivalence(
     orig_tables = _extract_base_tables(orig_ast, dialect)
     rewr_tables = _extract_base_tables(rewr_ast, dialect)
 
-    if orig_tables and rewr_tables:
+    if orig_tables and not rewr_tables:
+        # Original references real tables but rewrite has none — reject
+        errors.append(f"Rewrite lost all base tables: original has {orig_tables}")
+    elif orig_tables and rewr_tables:
         missing = orig_tables - rewr_tables
         if missing:
             errors.append(f"Missing base tables in rewrite: {missing}")
@@ -262,12 +265,20 @@ def _extract_base_tables(ast, dialect: str) -> Set[str]:
             if cte.alias:
                 cte_names.add(str(cte.alias).lower())
 
-        # Get all table references
+        # Get all table references (schema-qualified)
         tables = set()
         for table in ast.find_all(exp.Table):
             name = table.name.lower() if table.name else ""
-            if name and name not in cte_names:
-                tables.add(name)
+            if not name or name in cte_names:
+                continue
+            # Build schema-qualified identity: schema.name or just name
+            parts = []
+            if hasattr(table, 'catalog') and table.catalog:
+                parts.append(table.catalog.lower())
+            if hasattr(table, 'db') and table.db:
+                parts.append(table.db.lower())
+            parts.append(name)
+            tables.add(".".join(parts))
         return tables
     except Exception:
         return set()
@@ -898,7 +909,7 @@ class SQLRewriter:
                             from .pg_tuning import PG_TUNABLE_PARAMS
                             set_local_cmds = [
                                 cmd for cmd in rs.set_local
-                                if any(p in cmd.lower() for p in PG_TUNABLE_PARAMS)
+                                if _extract_set_local_param(cmd) in PG_TUNABLE_PARAMS
                             ]
                             clean_sql = optimized_sql
                         else:
@@ -910,7 +921,7 @@ class SQLRewriter:
                         if not self._validate_sql(clean_sql):
                             continue
 
-                        # AST equivalence check (also benefits legacy path)
+                        # AST equivalence check — hard fail, same as DAP path
                         ast_check = validate_ast_equivalence(
                             self.original_sql, clean_sql, self.dialect
                         )
@@ -919,7 +930,7 @@ class SQLRewriter:
                                 "AST check failed on rewrite_set %s: %s",
                                 rs.id, ast_check.errors,
                             )
-                            # Continue to next rewrite_set — don't block
+                            continue
 
                         return RewriteResult(
                             success=True,
@@ -985,7 +996,7 @@ class SQLRewriter:
                 set_local_cmds = [
                     cmd for cmd in dap.runtime_config
                     if re.match(r'^SET\s+LOCAL\s+', cmd, re.IGNORECASE)
-                    and any(p in cmd.lower() for p in PG_TUNABLE_PARAMS)
+                    and _extract_set_local_param(cmd) in PG_TUNABLE_PARAMS
                 ]
             except ImportError:
                 pass
@@ -1081,6 +1092,16 @@ class SQLRewriter:
 # =============================================================================
 # Utility Functions
 # =============================================================================
+
+def _extract_set_local_param(cmd: str) -> str:
+    """Extract the exact parameter name from a SET LOCAL command.
+
+    E.g. 'SET LOCAL work_mem = ...' -> 'work_mem'
+    Returns empty string if pattern doesn't match.
+    """
+    m = re.match(r"^SET\s+LOCAL\s+(\w+)\s*=", cmd, re.IGNORECASE)
+    return m.group(1).lower() if m else ""
+
 
 def _get_cte_names_and_bodies(ast) -> Dict[str, Any]:
     """Extract CTE names and their body ASTs from a parsed SQL AST."""

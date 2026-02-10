@@ -47,7 +47,7 @@ class Pipeline:
         """Load config.json from benchmark dir, initialize components.
 
         Args:
-            benchmark_dir: Path to benchmark directory (e.g., ado/benchmarks/duckdb_tpcds)
+            benchmark_dir: Path to benchmark directory (e.g., qt_sql/benchmarks/duckdb_tpcds)
             provider: LLM provider for generation
             model: LLM model name
             analyze_fn: Optional custom LLM function

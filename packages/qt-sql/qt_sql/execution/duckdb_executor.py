@@ -80,9 +80,11 @@ class DuckDBExecutor:
         if self._conn is not None:
             return  # Already connected
 
-        # Use D: drive for temp files to avoid filling up C: drive during large queries
+        # Respect caller-provided temp directory; otherwise only set the historical
+        # WSL location when it actually exists.
         import os
-        os.environ['DUCKDB_TEMP_DIRECTORY'] = '/mnt/d/duckdb_temp'
+        if "DUCKDB_TEMP_DIRECTORY" not in os.environ and os.path.isdir("/mnt/d/duckdb_temp"):
+            os.environ["DUCKDB_TEMP_DIRECTORY"] = "/mnt/d/duckdb_temp"
 
         self._conn = duckdb.connect(
             database=self.database,

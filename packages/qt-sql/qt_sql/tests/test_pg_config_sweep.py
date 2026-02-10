@@ -9,8 +9,8 @@ Tests 2 config profiles:
   2. ssd_plus_mem: ssd_only + work_mem=256MB, hash_mem_multiplier=4
 
 Run:
-  cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
-  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.tests.test_pg_config_sweep
+  cd <repo-root>
+  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.tests.test_pg_config_sweep
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path("/mnt/c/Users/jakc9/Documents/QueryTorque_V8")
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 for p in ["packages/qt-shared", "packages/qt-sql", "."]:
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -35,7 +35,7 @@ PG_CONN = {
     "password": "jakc9",
 }
 
-QUERY_DIR = PROJECT_ROOT / "packages/qt-sql/ado/benchmarks/postgres_dsb/queries"
+QUERY_DIR = PROJECT_ROOT / "packages/qt-sql/qt_sql/benchmarks/postgres_dsb/queries"
 TIMEOUT_MS = 120_000  # 2 min per execution
 
 CONFIGS = {

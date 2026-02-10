@@ -625,7 +625,6 @@ Then output a **Component Payload JSON**:
   }],
   "macros": {},
   "frozen_blocks": [],
-  "runtime_config": [],
   "validation_checks": []
 }
 ```

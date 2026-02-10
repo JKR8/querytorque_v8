@@ -4,7 +4,7 @@ Usage:
     from qt_sql.runner import ADORunner, ADOConfig
 
     config = ADOConfig(
-        benchmark_dir="ado/benchmarks/duckdb_tpcds",
+        benchmark_dir="qt_sql/benchmarks/duckdb_tpcds",
         provider="anthropic",
         model="claude-sonnet-4-5-20250929",
     )

@@ -6,7 +6,7 @@ prompt builder. Uses real benchmark data from Q88 and the everyhousehold
 enterprise pipeline.
 
 Usage:
-    cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
+    cd <repo-root>
     PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.prompts.samples.generate_sample query_88 --version V0 --script paper/sql/everyhousehold_deidentified.sql
 
     # Generate just one prompt type:

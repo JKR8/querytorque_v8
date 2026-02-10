@@ -1,15 +1,15 @@
-"""Tag-based example index builder for ADO knowledge base.
+"""Tag-based example index builder for the qt_sql knowledge base.
 
 Builds a tag similarity index from gold examples AND regression examples
-in ado/examples/. Each example's original SQL is parsed for keyword/table
+in qt_sql/examples/. Each example's original SQL is parsed for keyword/table
 tags and indexed for overlap-based matching.
 
 Gold examples (type=gold): proven rewrites to emulate
 Regression examples (type=regression): failed rewrites to avoid
 
 Usage:
-    python -m ado.tag_index          # Build index
-    python -m ado.tag_index --stats  # Show index stats
+    python -m qt_sql.tag_index          # Build index
+    python -m qt_sql.tag_index --stats  # Show index stats
 """
 
 from __future__ import annotations
@@ -354,8 +354,7 @@ def classify_category(tags: Set[str]) -> str:
 # Example Loading
 # =============================================================================
 
-# ADO is PostgreSQL-focused - only use ado/examples/ (DSB catalog rules)
-# Do NOT load qt_sql/optimization/examples/ - those are DuckDB TPC-DS gold examples
+# Use qt_sql/examples/ (+ benchmark seed rules) for tag indexing.
 
 
 def _clean_sql_markers(sql: str) -> str:
@@ -389,15 +388,15 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
     """Load examples from multiple directories for indexing.
 
     Loads from:
-    - ado/examples/ (generic PostgreSQL patterns)
-    - qt_sql/optimization/examples/ (verified TPC-DS gold examples)
+    - qt_sql/examples/ (gold patterns)
+    - qt_sql/benchmarks/*/state_0/seed/ (seed rules)
 
     Returns:
         List of (example_id, sql_text, metadata) tuples
     """
     examples = []
 
-    # Load from ado/examples/ (gold) + ado/benchmarks/*/state_0/seed/ (seed rules)
+    # Load from qt_sql/examples/ (gold) + qt_sql/benchmarks/*/state_0/seed/ (seed rules)
     search_dirs = [EXAMPLES_DIR]
     benchmarks_dir = BASE_DIR / "benchmarks"
     if benchmarks_dir.exists():
@@ -597,7 +596,7 @@ def build_tag_index(
 
 
 def save_tag_index(tag_entries: List[Dict], metadata: Dict) -> None:
-    """Save tag index and metadata to ado/models/."""
+    """Save tag index and metadata to qt_sql/models/."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Save tag index
@@ -614,7 +613,7 @@ def save_tag_index(tag_entries: List[Dict], metadata: Dict) -> None:
 def show_index_stats() -> None:
     """Show statistics about the current tag index."""
     if not TAGS_FILE.exists():
-        print("No tag index found. Run: python -m ado.tag_index")
+        print("No tag index found. Run: python -m qt_sql.tag_index")
         return
 
     with open(TAGS_FILE) as f:
@@ -623,7 +622,7 @@ def show_index_stats() -> None:
     examples = data.get("examples", [])
 
     print("=" * 60)
-    print("ADO Tag Index Statistics")
+    print("qt_sql Tag Index Statistics")
     print("=" * 60)
     print(f"Total examples:   {len(examples)}")
     print()
@@ -661,19 +660,19 @@ def show_index_stats() -> None:
 
 
 def rebuild_index() -> bool:
-    """Rebuild tag index from ado/examples/.
+    """Rebuild tag index from qt_sql/examples/.
 
     Returns:
         True if successful, False otherwise
     """
     print("=" * 60)
-    print("Building ADO Tag Index")
+    print("Building qt_sql Tag Index")
     print("=" * 60)
 
     # Load examples
     examples = load_examples_for_indexing()
     if not examples:
-        print("\nNo examples found in ado/examples/")
+        print("\nNo examples found in qt_sql/examples/")
         print("Add example JSON files with 'before_sql' or 'input_slice' fields")
         return False
 

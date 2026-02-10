@@ -149,7 +149,7 @@ def build_worker_prompt(
     sections.append(build_worker_rewrite_checklist())
 
     # ── [8] COLUMN COMPLETENESS CONTRACT + OUTPUT FORMAT ─────────────────
-    sections.append(_section_output_format(output_columns, original_logic_tree))
+    sections.append(_section_output_format(output_columns, original_logic_tree, dialect=dialect))
 
     return "\n\n".join(sections)
 
@@ -256,7 +256,7 @@ def _section_set_local_config(resource_envelope: str) -> str:
         "- Stay within the resource envelope bounds above",
         "",
         "### SET LOCAL Syntax",
-        "Include SET LOCAL commands in the `set_local` array field of your JSON output.",
+        "Include SET LOCAL commands in the `runtime_config` array field of your JSON output.",
         "If no config changes help, omit the field or use an empty array.",
     ])
 
@@ -266,6 +266,7 @@ def _section_set_local_config(resource_envelope: str) -> str:
 def _section_output_format(
     output_columns: Optional[List[str]] = None,
     original_logic_tree: Optional[str] = None,
+    dialect: str = "duckdb",
 ) -> str:
     """Output format section — DAP (Decomposed Attention Protocol).
 
@@ -365,7 +366,8 @@ def _section_output_format(
     lines.append("  }],")
     lines.append('  "macros": {},')
     lines.append('  "frozen_blocks": [],')
-    lines.append('  "runtime_config": ["SET LOCAL work_mem = \'512MB\'"],')
+    if dialect in ("postgres", "postgresql"):
+        lines.append('  "runtime_config": ["SET LOCAL work_mem = \'512MB\'"],')
     lines.append('  "validation_checks": []')
     lines.append("}")
     lines.append("```")
@@ -380,7 +382,8 @@ def _section_output_format(
     lines.append("- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`")
     lines.append("- Only include components you **changed or added** — set unchanged components to `\"change\": \"unchanged\"` with `\"sql\": \"\"`")
     lines.append("- `main_query` output columns must match the Column Completeness Contract above")
-    lines.append("- `runtime_config`: SET LOCAL commands (PG only). Omit or use empty array if not needed")
+    if dialect in ("postgres", "postgresql"):
+        lines.append("- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit or use empty array if not needed")
     lines.append("- `reconstruction_order`: topological order of components for assembly")
     lines.append("")
     lines.append("After the JSON, explain the mechanism:")

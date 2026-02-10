@@ -97,7 +97,7 @@ class Learner:
         Args:
             journal_dir: Directory to store learning records (journal)
         """
-        self.journal_dir = journal_dir or Path("research/ado/learning")
+        self.journal_dir = journal_dir or Path("research/qt_sql/learning")
         if self.journal_dir:
             self.journal_dir.mkdir(parents=True, exist_ok=True)
 

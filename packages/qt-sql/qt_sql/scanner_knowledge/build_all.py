@@ -1,7 +1,7 @@
 """Scanner knowledge pipeline: blackboard → findings.
 
 Usage:
-  cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
+  cd <repo-root>
   PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.scanner_knowledge.build_all \
       packages/qt-sql/qt_sql/benchmarks/postgres_dsb_76
 

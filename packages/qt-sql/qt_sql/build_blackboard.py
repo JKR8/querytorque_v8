@@ -16,15 +16,15 @@ with full provenance: optimized SQL, model, run, reasoning, transforms.
 No LLM calls. Purely deterministic extraction from existing files.
 
 Usage:
-    cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
+    cd <repo-root>
     # DuckDB TPC-DS swarm blackboard
-    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard \\
-        packages/qt-sql/ado/benchmarks/duckdb_tpcds/swarm_batch_20260208_102033
+    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.build_blackboard \\
+        qt_sql/benchmarks/duckdb_tpcds/swarm_batch_20260208_102033
     # PostgreSQL DSB swarm blackboard
-    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard \\
-        packages/qt-sql/ado/benchmarks/postgres_dsb/swarm_batch_20260208_142643
+    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.build_blackboard \\
+        qt_sql/benchmarks/postgres_dsb/swarm_batch_20260208_142643
     # Global blackboard (DuckDB TPC-DS only)
-    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard --global
+    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.build_blackboard --global
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Schemas (matching feature/ado-blackboard worktree exactly)
+# Schemas for blackboard extraction/promotion artifacts
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -1192,7 +1192,7 @@ def _detect_benchmark_config(batch_dir: Path) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Resolve project root (for --global mode, run from project root)
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent  # ado/ → qt-sql/ → packages/ → root
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent  # qt_sql/ → qt-sql/ → packages/ → repo root
 _ADO_BENCHMARKS = Path(__file__).resolve().parent / "benchmarks" / "duckdb_tpcds"
 _RESEARCH = _PROJECT_ROOT / "research"
 _CONSOLIDATED = _RESEARCH / "CONSOLIDATED_BENCHMARKS"
@@ -2158,7 +2158,7 @@ def phase4_promote_winners(
     - Transform is not already a gold example with a higher speedup
 
     Writes promoted examples to:
-    - ado/examples/{engine}/<transform>.json (ADO)
+    - qt_sql/examples/{engine}/<transform>.json (gold examples)
     - qt_sql/optimization/examples/<transform>.json (V5 CLI)
 
     Args:
@@ -2392,7 +2392,7 @@ def phase4_promote_winners(
             f"{'would be ' if dry_run else ''}promoted"
         )
         if not dry_run:
-            logger.info("  Run `python3 -m ado.tag_index` to rebuild the tag index")
+            logger.info("  Run `python3 -m qt_sql.tag_index` to rebuild the tag index")
     else:
         logger.info("Phase 4 complete: no new examples qualify for promotion")
 
@@ -2413,7 +2413,7 @@ def main():
         # Run only phase 4 (auto-promote) on an existing batch
         args = [a for a in sys.argv[1:] if not a.startswith("--")]
         if not args:
-            print("Usage: python3 -m ado.build_blackboard --promote-only <swarm_batch_dir>")
+            print("Usage: python3 -m qt_sql.build_blackboard --promote-only <swarm_batch_dir>")
             sys.exit(1)
         batch_dir = Path(args[0])
         dry_run = "--dry-run" in sys.argv
@@ -2423,21 +2423,21 @@ def main():
 
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  python3 -m ado.build_blackboard <batch_or_run_dir>  # Swarm/run blackboard")
-        print("  python3 -m ado.build_blackboard --global            # Global blackboard")
-        print("  python3 -m ado.build_blackboard --promote-only <dir> # Auto-promote winners only")
+        print("  python3 -m qt_sql.build_blackboard <batch_or_run_dir>  # Swarm/run blackboard")
+        print("  python3 -m qt_sql.build_blackboard --global            # Global blackboard")
+        print("  python3 -m qt_sql.build_blackboard --promote-only <dir> # Auto-promote winners only")
         print()
         print("Flags:")
         print("  --dry-run    Show what would be promoted without writing")
         print()
         print("Examples:")
         print("  # Legacy swarm batch:")
-        print("  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard \\")
-        print("      packages/qt-sql/ado/benchmarks/duckdb_tpcds/swarm_batch_20260208_102033")
+        print("  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.build_blackboard \\")
+        print("      packages/qt-sql/qt_sql/benchmarks/duckdb_tpcds/swarm_batch_20260208_102033")
         print("  # New standard run:")
-        print("  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard \\")
+        print("  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.build_blackboard \\")
         print("      packages/qt-sql/qt_sql/benchmarks/postgres_dsb_76/runs/run_20260209_143000")
-        print("  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.build_blackboard --global")
+        print("  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.build_blackboard --global")
         sys.exit(1)
 
     batch_dir = Path(sys.argv[1])

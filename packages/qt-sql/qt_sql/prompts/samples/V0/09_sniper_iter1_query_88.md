@@ -450,7 +450,6 @@ Change markers:
   }],
   "macros": {},
   "frozen_blocks": [],
-  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
   "validation_checks": []
 }
 ```
@@ -463,7 +462,6 @@ Change markers:
 - **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
 - Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
 - `main_query` output columns must match the Column Completeness Contract above
-- `runtime_config`: SET LOCAL commands (PG only). Omit or use empty array if not needed
 - `reconstruction_order`: topological order of components for assembly
 
 After the JSON, explain the mechanism:

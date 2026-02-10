@@ -2,8 +2,8 @@
 """Test PG tuning infrastructure — whitelist, validation, executor, prompt.
 
 Run:
-  cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
-  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.tests.test_pg_tuning
+  cd <repo-root>
+  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.tests.test_pg_tuning
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 # Bootstrap
-PROJECT_ROOT = Path("/mnt/c/Users/jakc9/Documents/QueryTorque_V8")
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 for p in ["packages/qt-shared", "packages/qt-sql", "."]:
     if p not in sys.path:
         sys.path.insert(0, p)

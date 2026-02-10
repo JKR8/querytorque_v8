@@ -31,10 +31,10 @@ sys.path.insert(0, str(QT_SQL))
 sys.path.insert(0, str(REPO / "packages" / "qt-shared"))
 
 ARTIFACTS_DIR = (
-    QT_SQL / "ado" / "benchmarks" / "duckdb_tpcds" / "analyst_query_51"
+    QT_SQL / "qt_sql" / "benchmarks" / "duckdb_tpcds" / "analyst_query_51"
 )
 ANALYST_PROMPT_SCRIPT = (
-    QT_SQL / "ado" / "benchmarks" / "duckdb_tpcds" / "run_analyst_prompt_only.py"
+    QT_SQL / "qt_sql" / "benchmarks" / "duckdb_tpcds" / "run_analyst_prompt_only.py"
 )
 
 
@@ -357,7 +357,7 @@ class TestHistoryLoading:
 
     def test_manual_script_loads_state_history(self):
         """Verify real script load_query_history() finds state_N validation results."""
-        benchmark_dir = QT_SQL / "ado" / "benchmarks" / "duckdb_tpcds"
+        benchmark_dir = QT_SQL / "qt_sql" / "benchmarks" / "duckdb_tpcds"
         state_0_val = benchmark_dir / "state_0" / "validation"
         if not state_0_val.exists():
             pytest.skip("No state_0/validation/ directory")
@@ -403,7 +403,7 @@ class TestHistoryLoading:
         """Verify AnalystSession._build_iteration_history() loads state_N results."""
         from qt_sql.analyst_session import AnalystSession
 
-        benchmark_dir = QT_SQL / "ado" / "benchmarks" / "duckdb_tpcds"
+        benchmark_dir = QT_SQL / "qt_sql" / "benchmarks" / "duckdb_tpcds"
         state_0_val = benchmark_dir / "state_0" / "validation"
         if not state_0_val.exists():
             pytest.skip("No state_0/validation/ directory")

@@ -12,7 +12,7 @@ The AnalystSession runs an iterative loop on a single query:
 
 Usage:
     from qt_sql.pipeline import Pipeline
-    p = Pipeline("ado/benchmarks/duckdb_tpcds")
+    p = Pipeline("qt_sql/benchmarks/duckdb_tpcds")
     session = p.run_analyst_session("query_88", sql, max_iterations=3)
     print(f"Best: {session.best_speedup:.2f}x")
     print(session.best_sql)

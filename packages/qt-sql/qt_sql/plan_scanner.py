@@ -9,7 +9,7 @@ Offline tool: run ahead of time, cache results to benchmark_dir/plan_scanner/.
 During swarm: load cached results, inject into analyst prompt.
 
 Usage:
-  cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
+  cd <repo-root>
   PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.plan_scanner \\
       packages/qt-sql/qt_sql/benchmarks/postgres_dsb_76 [--query-ids q001 q002]
 """

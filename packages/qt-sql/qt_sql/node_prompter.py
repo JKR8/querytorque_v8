@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Directory paths
 BASE_DIR = Path(__file__).resolve().parent
-EXAMPLES_DIR = BASE_DIR / "examples"          # ado/examples/{duckdb,postgres}/
+EXAMPLES_DIR = BASE_DIR / "examples"
 CONSTRAINTS_DIR = BASE_DIR / "constraints"
 
 
@@ -860,7 +860,7 @@ class Prompter:
     def _section_constraints(dialect: str = "duckdb") -> str:
         """Section 8: Constraints (engine-filtered).
 
-        Loads constraints from ado/constraints/*.json and groups by severity:
+        Loads constraints from qt_sql/constraints/*.json and groups by severity:
         - CRITICAL at top and bottom (repeated for attention)
         - HIGH + MEDIUM in the middle
 
@@ -979,8 +979,8 @@ class Prompter:
         """Load a gold example matching the given pattern name.
 
         Search order (same engine only — never mix DBs):
-        1. ado/examples/<engine>/  (gold verified examples for this DB)
-        2. seed_dirs               (state_0/seed/ generic catalog rules)
+        1. qt_sql/examples/<engine>/  (gold verified examples for this DB)
+        2. seed_dirs                  (state_0/seed/ generic catalog rules)
 
         Args:
             pattern_name: Pattern to match (e.g., "decorrelate")

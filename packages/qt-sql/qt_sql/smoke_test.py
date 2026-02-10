@@ -10,9 +10,9 @@ into 15 numbered steps (01–15).  Each step:
 This is the gate before committing to the full TPC-DS benchmark.
 
 Usage:
-    cd /mnt/c/Users/jakc9/Documents/QueryTorque_V8
-    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.smoke_test
-    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m ado.smoke_test --query query_67
+    cd <repo-root>
+    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.smoke_test
+    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.smoke_test --query query_67
 
 Code-review findings under test:
     F1  Full prompt+response persistence (every iteration)
@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # ── Bootstrap ────────────────────────────────────────────────────────
-PROJECT_ROOT = Path("/mnt/c/Users/jakc9/Documents/QueryTorque_V8")
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 os.chdir(PROJECT_ROOT)
 for p in ["packages/qt-shared", "packages/qt-sql", "."]:
     if p not in sys.path:
@@ -106,7 +106,7 @@ def _sha256(text: str) -> str:
 class SmokeTest:
     """Full pipeline smoke test with per-step contract validation."""
 
-    BENCHMARK_DIR = Path("packages/qt-sql/ado/benchmarks/duckdb_tpcds")
+    BENCHMARK_DIR = Path("packages/qt-sql/qt_sql/benchmarks/duckdb_tpcds")
     DIALECT = "duckdb"
     ENGINE = "duckdb"
 
