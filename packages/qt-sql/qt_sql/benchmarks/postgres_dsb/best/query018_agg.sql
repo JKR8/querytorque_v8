@@ -1,1 +1,61 @@
-WITH date_filtered AS (SELECT d_date_sk FROM date_dim WHERE d_year = 1998), cd_filtered AS (SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'F' AND cd_education_status = 'College'), c_filtered AS (SELECT c_customer_sk, c_current_addr_sk, c_birth_year FROM customer WHERE c_birth_month = 1), ca_filtered AS (SELECT ca_address_sk, ca_country, ca_state, ca_county FROM customer_address WHERE ca_state IN ('GA', 'LA', 'SD')), item_filtered AS (SELECT i_item_sk, i_item_id FROM item WHERE i_category = 'Jewelry') SELECT i_item_id, ca_country, ca_state, ca_county, AVG(CAST(cs_quantity AS DECIMAL(12, 2))) AS agg1, AVG(CAST(cs_list_price AS DECIMAL(12, 2))) AS agg2, AVG(CAST(cs_coupon_amt AS DECIMAL(12, 2))) AS agg3, AVG(CAST(cs_sales_price AS DECIMAL(12, 2))) AS agg4, AVG(CAST(cs_net_profit AS DECIMAL(12, 2))) AS agg5, AVG(CAST(c_birth_year AS DECIMAL(12, 2))) AS agg6 FROM catalog_sales AS cs JOIN date_filtered AS d ON cs.cs_sold_date_sk = d.d_date_sk JOIN cd_filtered AS cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk JOIN c_filtered AS c ON cs.cs_bill_customer_sk = c.c_customer_sk JOIN ca_filtered AS ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN item_filtered AS i ON cs.cs_item_sk = i.i_item_sk WHERE cs.cs_wholesale_cost BETWEEN 52 AND 57 GROUP BY ROLLUP (i_item_id, ca_country, ca_state, ca_county) ORDER BY ca_country, ca_state, ca_county, i_item_id LIMIT 100
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 1998
+),
+filtered_items AS (
+    SELECT i_item_sk, i_item_id
+    FROM item
+    WHERE i_category = 'Jewelry'
+),
+filtered_customer_demographics AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_gender = 'F'
+      AND cd_education_status = 'College'
+),
+filtered_customers AS (
+    SELECT c_customer_sk, c_current_addr_sk, c_birth_year
+    FROM customer
+    WHERE c_birth_month = 1
+),
+filtered_customer_addresses AS (
+    SELECT ca_address_sk, ca_country, ca_state, ca_county
+    FROM customer_address
+    WHERE ca_state IN ('GA', 'LA', 'SD')
+),
+joined_base AS (
+    SELECT
+        i.i_item_id,
+        ca.ca_country,
+        ca.ca_state,
+        ca.ca_county,
+        cs.cs_quantity,
+        cs.cs_list_price,
+        cs.cs_coupon_amt,
+        cs.cs_sales_price,
+        cs.cs_net_profit,
+        c.c_birth_year
+    FROM catalog_sales cs
+    JOIN filtered_dates d ON cs.cs_sold_date_sk = d.d_date_sk
+    JOIN filtered_items i ON cs.cs_item_sk = i.i_item_sk
+    JOIN filtered_customer_demographics cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk
+    JOIN filtered_customers c ON cs.cs_bill_customer_sk = c.c_customer_sk
+    JOIN filtered_customer_addresses ca ON c.c_current_addr_sk = ca.ca_address_sk
+    WHERE cs.cs_wholesale_cost BETWEEN 52 AND 57
+)
+SELECT
+    i_item_id,
+    ca_country,
+    ca_state,
+    ca_county,
+    AVG(CAST(cs_quantity AS DECIMAL(12, 2))) AS agg1,
+    AVG(CAST(cs_list_price AS DECIMAL(12, 2))) AS agg2,
+    AVG(CAST(cs_coupon_amt AS DECIMAL(12, 2))) AS agg3,
+    AVG(CAST(cs_sales_price AS DECIMAL(12, 2))) AS agg4,
+    AVG(CAST(cs_net_profit AS DECIMAL(12, 2))) AS agg5,
+    AVG(CAST(c_birth_year AS DECIMAL(12, 2))) AS agg6
+FROM joined_base
+GROUP BY ROLLUP (i_item_id, ca_country, ca_state, ca_county)
+ORDER BY ca_country, ca_state, ca_county, i_item_id
+LIMIT 100

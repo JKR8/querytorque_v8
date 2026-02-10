@@ -1,62 +1,80 @@
-with my_customers as (
- select distinct c_customer_sk
-        , c_current_addr_sk
- from
-        ( select cs_sold_date_sk sold_date_sk,
-                 cs_bill_customer_sk customer_sk,
-                 cs_item_sk item_sk,
-                 cs_wholesale_cost wholesale_cost
-          from   catalog_sales
-          union all
-          select ws_sold_date_sk sold_date_sk,
-                 ws_bill_customer_sk customer_sk,
-                 ws_item_sk item_sk,
-                 ws_wholesale_cost wholesale_cost
-          from   web_sales
-         ) cs_or_ws_sales,
-         item,
-         date_dim,
-         customer
- where   sold_date_sk = d_date_sk
-         and item_sk = i_item_sk
-         and i_category = 'Books'
-         and i_class = 'fiction'
-         and c_customer_sk = cs_or_ws_sales.customer_sk
-         and d_moy = 11
-         and d_year = 1998
-         and wholesale_cost BETWEEN 70 AND 100
-         and c_birth_year BETWEEN 1993 AND 2006
- )
- , my_revenue as (
- select c_customer_sk,
-        sum(ss_ext_sales_price) as revenue
- from   my_customers,
-        store_sales,
-        customer_address,
-        store,
-        date_dim
- where  c_current_addr_sk = ca_address_sk
-        and ca_county = s_county
-        and ca_state = s_state
-        and ss_sold_date_sk = d_date_sk
-        and c_customer_sk = ss_customer_sk
-        and ss_wholesale_cost BETWEEN 70 AND 100
-        and s_state in ('GA','IA','LA'
-                    ,'MO','OH','PA'
-                    ,'SD','TN','TX'
-                    ,'VA')
-        and d_month_seq between (select distinct d_month_seq+1
-                                 from   date_dim where d_year = 1998 and d_moy = 11)
-                           and  (select distinct d_month_seq+3
-                                 from   date_dim where d_year = 1998 and d_moy = 11)
- group by c_customer_sk
- )
- , segments as
- (select cast((revenue/50) as int) as segment
-  from   my_revenue
- )
-  select  segment, count(*) as num_customers, segment*50 as segment_base
- from segments
- group by segment
- order by segment, num_customers
- limit 100;
+WITH filtered_dates AS (
+    SELECT d_date_sk, d_month_seq
+    FROM date_dim
+    WHERE d_year = 1998 AND d_moy = 11
+),
+filtered_items AS (
+    SELECT i_item_sk
+    FROM item
+    WHERE i_category = 'Books' AND i_class = 'fiction'
+),
+month_range AS (
+    SELECT MIN(d_month_seq) + 1 AS start_seq,
+           MIN(d_month_seq) + 3 AS end_seq
+    FROM filtered_dates
+),
+filtered_date_range AS (
+    SELECT d_date_sk
+    FROM date_dim
+    JOIN month_range ON d_month_seq BETWEEN month_range.start_seq AND month_range.end_seq
+),
+filtered_stores AS (
+    SELECT s_store_sk, s_county, s_state
+    FROM store
+    WHERE s_state IN ('GA', 'IA', 'LA', 'MO', 'OH', 'PA', 'SD', 'TN', 'TX', 'VA')
+),
+unioned_sales AS (
+    SELECT
+        cs_sold_date_sk AS sold_date_sk,
+        cs_bill_customer_sk AS customer_sk,
+        cs_item_sk AS item_sk,
+        cs_wholesale_cost AS wholesale_cost
+    FROM catalog_sales
+    UNION ALL
+    SELECT
+        ws_sold_date_sk AS sold_date_sk,
+        ws_bill_customer_sk AS customer_sk,
+        ws_item_sk AS item_sk,
+        ws_wholesale_cost AS wholesale_cost
+    FROM web_sales
+),
+my_customers AS (
+    SELECT DISTINCT
+        customer.c_customer_sk,
+        customer.c_current_addr_sk
+    FROM unioned_sales
+    JOIN filtered_dates ON unioned_sales.sold_date_sk = filtered_dates.d_date_sk
+    JOIN filtered_items ON unioned_sales.item_sk = filtered_items.i_item_sk
+    JOIN customer ON unioned_sales.customer_sk = customer.c_customer_sk
+    WHERE unioned_sales.wholesale_cost BETWEEN 70 AND 100
+      AND customer.c_birth_year BETWEEN 1993 AND 2006
+),
+my_revenue AS (
+    SELECT
+        my_customers.c_customer_sk,
+        SUM(store_sales.ss_ext_sales_price) AS revenue
+    FROM my_customers
+    JOIN customer_address ON my_customers.c_current_addr_sk = customer_address.ca_address_sk
+    JOIN filtered_stores ON customer_address.ca_county = filtered_stores.s_county
+                        AND customer_address.ca_state = filtered_stores.s_state
+    JOIN store_sales ON my_customers.c_customer_sk = store_sales.ss_customer_sk
+    JOIN filtered_date_range ON store_sales.ss_sold_date_sk = filtered_date_range.d_date_sk
+    WHERE store_sales.ss_wholesale_cost BETWEEN 70 AND 100
+    GROUP BY my_customers.c_customer_sk
+),
+segments AS (
+    SELECT
+        CAST((revenue / 50) AS INT) AS segment
+    FROM my_revenue
+)
+SELECT
+    segment,
+    COUNT(*) AS num_customers,
+    segment * 50 AS segment_base
+FROM segments
+GROUP BY
+    segment
+ORDER BY
+    segment,
+    num_customers
+LIMIT 100;

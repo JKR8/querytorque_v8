@@ -1,2 +1,82 @@
-WITH date_filter AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq = (SELECT d_month_seq FROM date_dim WHERE d_date = '1999-05-02')), ss_items AS (SELECT i_item_id AS item_id, c_birth_year AS birth_year, SUM(ss_ext_sales_price) AS ss_item_rev FROM store_sales JOIN item ON ss_item_sk = i_item_sk JOIN date_filter ON ss_sold_date_sk = d_date_sk JOIN customer ON ss_customer_sk = c_customer_sk WHERE ss_list_price BETWEEN 217 AND 246 AND i_manager_id BETWEEN 25 AND 54 AND c_birth_year BETWEEN 1961 AND 1967 GROUP BY i_item_id, c_birth_year), cs_items AS (SELECT i_item_id AS item_id, c_birth_year AS birth_year, SUM(cs_ext_sales_price) AS cs_item_rev FROM catalog_sales JOIN item ON cs_item_sk = i_item_sk JOIN date_filter ON cs_sold_date_sk = d_date_sk JOIN customer ON cs_bill_customer_sk = c_customer_sk WHERE cs_list_price BETWEEN 217 AND 246 AND i_manager_id BETWEEN 25 AND 54 AND c_birth_year BETWEEN 1961 AND 1967 GROUP BY i_item_id, c_birth_year), ws_items AS (SELECT i_item_id AS item_id, c_birth_year AS birth_year, SUM(ws_ext_sales_price) AS ws_item_rev FROM web_sales, item, date_dim, customer WHERE ws_item_sk = i_item_sk AND d_date IN (SELECT d_date FROM date_dim WHERE d_month_seq = (SELECT d_month_seq FROM date_dim WHERE d_date = '1999-05-02')) AND ws_sold_date_sk = d_date_sk AND ws_list_price BETWEEN 217 AND 246 AND i_manager_id BETWEEN 25 AND 54 AND ws_bill_customer_sk = c_customer_sk AND c_birth_year BETWEEN 1961 AND 1967 GROUP BY i_item_id, c_birth_year)
-SELECT ss_items.item_id, ss_items.birth_year, ss_item_rev, ss_item_rev / ((ss_item_rev + cs_item_rev + ws_item_rev) / 3) * 100 AS ss_dev, cs_item_rev, cs_item_rev / ((ss_item_rev + cs_item_rev + ws_item_rev) / 3) * 100 AS cs_dev, ws_item_rev, ws_item_rev / ((ss_item_rev + cs_item_rev + ws_item_rev) / 3) * 100 AS ws_dev, (ss_item_rev + cs_item_rev + ws_item_rev) / 3 AS average FROM ss_items, cs_items, ws_items WHERE ss_items.item_id = cs_items.item_id AND ss_items.item_id = ws_items.item_id AND ss_items.birth_year = cs_items.birth_year AND ss_items.birth_year = ws_items.birth_year AND ss_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev AND ss_item_rev BETWEEN 0.9 * ws_item_rev AND 1.1 * ws_item_rev AND cs_item_rev BETWEEN 0.9 * ss_item_rev AND 1.1 * ss_item_rev AND cs_item_rev BETWEEN 0.9 * ws_item_rev AND 1.1 * ws_item_rev AND ws_item_rev BETWEEN 0.9 * ss_item_rev AND 1.1 * ss_item_rev AND ws_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev ORDER BY item_id, birth_year, ss_item_rev LIMIT 100
+with ss_items as
+ (select i_item_id item_id
+       ,c_birth_year birth_year
+        ,sum(ss_ext_sales_price) ss_item_rev
+ from store_sales
+     ,item
+     ,date_dim
+     ,customer
+ where ss_item_sk = i_item_sk
+   and d_date in (select d_date
+                  from date_dim
+                  where d_month_seq = (select d_month_seq
+                                      from date_dim
+                                      where d_date = '1999-05-02'))
+   and ss_sold_date_sk   = d_date_sk
+   and ss_list_price between 217 and 246
+   and i_manager_id BETWEEN 25 and 54
+   and ss_customer_sk = c_customer_sk
+   and c_birth_year BETWEEN 1961 AND 1967
+group by i_item_id, c_birth_year),
+ cs_items as
+ (select i_item_id item_id
+        ,c_birth_year birth_year
+        ,sum(cs_ext_sales_price) cs_item_rev
+  from catalog_sales
+      ,item
+      ,date_dim
+      ,customer
+ where cs_item_sk = i_item_sk
+  and  d_date in (select d_date
+                  from date_dim
+                  where d_month_seq = (select d_month_seq
+                                      from date_dim
+                                      where d_date = '1999-05-02'))
+  and  cs_sold_date_sk = d_date_sk
+  and  cs_list_price between 217 and 246
+  and i_manager_id BETWEEN 25 and 54
+  and cs_bill_customer_sk = c_customer_sk
+  and c_birth_year BETWEEN 1961 AND 1967
+group by i_item_id, c_birth_year),
+ ws_items as
+ (select i_item_id item_id
+      ,c_birth_year birth_year
+        ,sum(ws_ext_sales_price) ws_item_rev
+  from web_sales
+      ,item
+      ,date_dim
+      ,customer
+ where ws_item_sk = i_item_sk
+  and  d_date in (select d_date
+                  from date_dim
+                  where d_month_seq = (select d_month_seq
+                                     from date_dim
+                                     where d_date = '1999-05-02'))
+  and ws_sold_date_sk   = d_date_sk
+  and ws_list_price between 217 and 246
+  and i_manager_id BETWEEN 25 and 54
+  and ws_bill_customer_sk = c_customer_sk
+  and c_birth_year BETWEEN 1961 AND 1967
+group by i_item_id, c_birth_year)
+  select  ss_items.item_id, ss_items.birth_year
+       ,ss_item_rev
+       ,ss_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 ss_dev
+       ,cs_item_rev
+       ,cs_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 cs_dev
+       ,ws_item_rev
+       ,ws_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 ws_dev
+       ,(ss_item_rev+cs_item_rev+ws_item_rev)/3 average
+ from ss_items,cs_items,ws_items
+ where ss_items.item_id=cs_items.item_id
+   and ss_items.item_id=ws_items.item_id
+   and ss_items.birth_year = cs_items.birth_year
+   and ss_items.birth_year = ws_items.birth_year
+   and ss_item_rev between 0.9 * cs_item_rev and 1.1 * cs_item_rev
+   and ss_item_rev between 0.9 * ws_item_rev and 1.1 * ws_item_rev
+   and cs_item_rev between 0.9 * ss_item_rev and 1.1 * ss_item_rev
+   and cs_item_rev between 0.9 * ws_item_rev and 1.1 * ws_item_rev
+   and ws_item_rev between 0.9 * ss_item_rev and 1.1 * ss_item_rev
+   and ws_item_rev between 0.9 * cs_item_rev and 1.1 * cs_item_rev
+ order by item_id, birth_year
+         ,ss_item_rev
+ limit 100;

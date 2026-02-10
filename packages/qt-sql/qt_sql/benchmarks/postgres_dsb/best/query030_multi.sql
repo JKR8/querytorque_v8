@@ -1,1 +1,70 @@
-WITH date_cte AS (SELECT d_date_sk FROM date_dim WHERE d_year = 1998), filtered_web_returns AS (SELECT wr_returning_customer_sk, ca_state, wr_reason_sk, wr_return_amt FROM web_returns INNER JOIN date_cte ON wr_returned_date_sk = date_cte.d_date_sk INNER JOIN customer_address ON wr_returning_addr_sk = ca_address_sk INNER JOIN item ON wr_item_sk = i_item_sk WHERE i_manager_id BETWEEN 17 AND 26 AND wr_return_amt / wr_return_quantity BETWEEN 25 AND 54 AND ca_state IN ('IL', 'LA', 'MN', 'SC') AND wr_reason_sk IN (50, 73)), customer_total_return AS (SELECT wr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, wr_reason_sk AS ctr_reason_sk, SUM(wr_return_amt) AS ctr_total_return FROM filtered_web_returns GROUP BY wr_returning_customer_sk, ca_state, wr_reason_sk), state_avg AS (SELECT ctr_state, AVG(ctr_total_return) * 1.2 AS threshold FROM customer_total_return GROUP BY ctr_state) SELECT c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return FROM customer_total_return AS ctr1 INNER JOIN state_avg ON ctr1.ctr_state = state_avg.ctr_state INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk WHERE ctr1.ctr_total_return > state_avg.threshold AND c_birth_year BETWEEN 1961 AND 1967 ORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return LIMIT 100
+WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 1998
+),
+filtered_item AS (
+    SELECT i_item_sk
+    FROM item
+    WHERE i_manager_id BETWEEN 17 AND 26
+),
+base_returns AS (
+    SELECT
+        wr_returning_customer_sk AS ctr_customer_sk,
+        ca_state AS ctr_state,
+        wr_reason_sk AS ctr_reason_sk,
+        SUM(wr_return_amt) AS ctr_total_return
+    FROM web_returns
+    INNER JOIN filtered_date ON wr_returned_date_sk = filtered_date.d_date_sk
+    INNER JOIN customer_address ON wr_returning_addr_sk = ca_address_sk
+    INNER JOIN filtered_item ON wr_item_sk = filtered_item.i_item_sk
+    WHERE wr_return_amt / wr_return_quantity BETWEEN 25 AND 54
+    GROUP BY
+        wr_returning_customer_sk,
+        ca_state,
+        wr_reason_sk
+),
+state_thresholds AS (
+    SELECT
+        ctr_state,
+        AVG(ctr_total_return) * 1.2 AS threshold
+    FROM base_returns
+    GROUP BY ctr_state
+)
+SELECT
+    c_customer_id,
+    c_salutation,
+    c_first_name,
+    c_last_name,
+    c_preferred_cust_flag,
+    c_birth_day,
+    c_birth_month,
+    c_birth_year,
+    c_birth_country,
+    c_login,
+    c_email_address,
+    c_last_review_date_sk,
+    ctr_total_return
+FROM base_returns ctr1
+INNER JOIN state_thresholds st ON ctr1.ctr_state = st.ctr_state
+INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk
+WHERE ctr1.ctr_total_return > st.threshold
+    AND ca_state IN ('IL', 'LA', 'MN', 'SC')
+    AND ctr1.ctr_reason_sk IN (50, 73)
+    AND c_birth_year BETWEEN 1961 AND 1967
+ORDER BY
+    c_customer_id,
+    c_salutation,
+    c_first_name,
+    c_last_name,
+    c_preferred_cust_flag,
+    c_birth_day,
+    c_birth_month,
+    c_birth_year,
+    c_birth_country,
+    c_login,
+    c_email_address,
+    c_last_review_date_sk,
+    ctr_total_return
+LIMIT 100

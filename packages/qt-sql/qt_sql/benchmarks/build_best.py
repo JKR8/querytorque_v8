@@ -104,6 +104,52 @@ def load_run_leaderboards(benchmark_dir: Path) -> dict:
     return merged
 
 
+def resolve_swarm_sql(benchmark_dir: Path, query_id: str, source: str) -> str:
+    """Resolve optimized SQL from swarm batch worker files.
+
+    Source patterns:
+        swarm_w1_iter0  → worker_1_sql.sql (iter0, workers 1-4)
+        swarm_w5_iter1  → snipe_worker_sql.sql (iter1)
+        swarm_w6_iter2  → final_worker_sql.sql (iter2)
+        swarm_w2_q032_sf10 → special per-query swarm
+    """
+    if not source.startswith("swarm_w"):
+        return ""
+
+    # Find the swarm batch directory
+    swarm_dirs = sorted(benchmark_dir.glob("swarm_batch_*"))
+    if not swarm_dirs:
+        return ""
+
+    # Try each swarm batch (most recent first)
+    for swarm_dir in reversed(swarm_dirs):
+        query_dir = swarm_dir / query_id
+        if not query_dir.exists():
+            continue
+
+        # Parse worker number from source (e.g. "swarm_w3_iter0" → 3)
+        import re
+        m = re.match(r"swarm_w(\d+)_", source)
+        if not m:
+            continue
+        worker_num = int(m.group(1))
+
+        # Map worker number to SQL file
+        if worker_num <= 4:
+            sql_file = query_dir / f"worker_{worker_num}_sql.sql"
+        elif worker_num == 5:
+            sql_file = query_dir / "snipe_worker_sql.sql"
+        elif worker_num == 6:
+            sql_file = query_dir / "final_worker_sql.sql"
+        else:
+            continue
+
+        if sql_file.exists():
+            return sql_file.read_text().strip()
+
+    return ""
+
+
 def build_best(benchmark_name: str):
     """Build best/ folder for a single benchmark."""
     benchmark_dir = BENCHMARKS_DIR / benchmark_name
@@ -164,6 +210,10 @@ def build_best(benchmark_name: str):
         status = entry.get("status", "unknown")
         source = entry.get("source", "state_0")
         optimized_sql = entry.get("optimized_sql", "")
+
+        # Resolve SQL from swarm batch worker files if not embedded
+        if not optimized_sql and source.startswith("swarm_w"):
+            optimized_sql = resolve_swarm_sql(benchmark_dir, query_id, source)
 
         # Check if analyst_winners has a better version
         # Analyst winners key format: "query_4" vs leaderboard "q4"
