@@ -54,8 +54,8 @@ SQL + DSN
 ```
 
 **Orchestrators** (choose one):
-- `SwarmSession` — 4-worker fan-out + snipe refinement (production default)
-- `ExpertSession` — iterative analyst + worker with failure analysis
+- `SwarmSession` — 4-worker fan-out + snipe refinement
+- `ExpertSession` — iterative analyst + worker with failure analysis (default)
 - `OneshotSession` — single LLM call, no iteration
 - `ADORunner` / `Pipeline.run_query()` — batch harness wrapping any session
 
@@ -161,11 +161,11 @@ SQL + DSN
 
 | Struct | Location | Key Fields |
 |--------|----------|------------|
-| `ParsedBriefing` | `swarm_parsers.py` | `shared: BriefingShared`, `workers: list[BriefingWorker]` |
-| `BriefingShared` | `swarm_parsers.py` | Query analysis, semantic contract, intent text |
-| `BriefingWorker` | `swarm_parsers.py` | `worker_id`, `strategy`, `assigned_examples`, `hint` |
-| `SnipeAnalysis` | `swarm_parsers.py` | Failure synthesis, refined strategy for sniper worker |
-| `WorkerAssignment` | `swarm_parsers.py` | Legacy fan-out assignment structure |
+| `ParsedBriefing` | `prompts/swarm_parsers.py` | `shared: BriefingShared`, `workers: list[BriefingWorker]` |
+| `BriefingShared` | `prompts/swarm_parsers.py` | Query analysis, semantic contract, intent text |
+| `BriefingWorker` | `prompts/swarm_parsers.py` | `worker_id`, `strategy`, `assigned_examples`, `hint` |
+| `SnipeAnalysis` | `prompts/swarm_parsers.py` | Failure synthesis, refined strategy for sniper worker |
+| `WorkerAssignment` | `prompts/swarm_parsers.py` | Legacy fan-out assignment structure |
 
 **Spec Links:** `prompts/sql_rewrite_spec.md` (DAP v1.0), `prompts/samples/PROMPT_SPEC.md`, `prompts/samples/V0/` (11 rendered samples)
 
@@ -391,7 +391,7 @@ PYTHONPATH=packages/qt-shared:packages/qt-sql:.
 | `sessions/oneshot_session.py` | all | Oneshot session orchestrator |
 | `execution/factory.py` | 1, 6 | Database connector factory |
 | `execution/duckdb_executor.py` | 1, 6 | DuckDB executor |
-| `execution/pg_executor.py` | 1, 6 | PostgreSQL executor |
+| `execution/postgres_executor.py` | 1, 6 | PostgreSQL executor |
 
 ---
 

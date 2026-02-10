@@ -191,10 +191,10 @@ def test_cli_documentation():
     print("=" * 80)
 
     docs = [
-        "packages/qt-sql/CLI_MODES_V5.md",
-        "packages/qt-sql/CLI_MODE3_ITERATIVE.md",
-        "packages/qt-sql/CLI_MODES_OVERVIEW.md",
-        "packages/qt-sql/V5_IMPLEMENTATION_STATUS.md",
+        "packages/qt-sql/qt_sql/docs/archive/CLI_MODES_V5.md",
+        "packages/qt-sql/qt_sql/docs/archive/CLI_MODE3_ITERATIVE.md",
+        "packages/qt-sql/qt_sql/docs/archive/CLI_MODES_OVERVIEW.md",
+        "packages/qt-sql/qt_sql/docs/archive/V5_IMPLEMENTATION_STATUS.md",
     ]
 
     print("\n[Check documentation files]")
