@@ -1,9 +1,9 @@
 """QueryTorque SQL — production SQL optimization engine.
 
 Pipeline:
-1. Parse:     SQL → DAG (deterministic)
+1. Parse:     SQL → logical tree (deterministic)
 2. Retrieve:  Tag-based example matching (engine-specific)
-3. Rewrite:   Full-query prompt with DAG topology (N parallel workers)
+3. Rewrite:   Full-query prompt with logical-tree topology (N parallel workers)
 4. Validate:  Syntax check (deterministic)
 5. Validate:  Timing + correctness (3-run or 5-run)
 

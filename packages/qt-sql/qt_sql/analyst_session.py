@@ -192,6 +192,7 @@ class AnalystSession:
             build_analyst_briefing_prompt,
             build_worker_prompt,
             parse_briefing_response,
+            validate_parsed_briefing,
         )
 
         dialect = (
@@ -207,10 +208,15 @@ class AnalystSession:
 
         input_sql = self.original_sql  # Always from original
 
-        # Phase 1: Parse DAG from original
-        self._stage(self.query_id, "Phase 1: Parsing DAG...")
-        dag, costs, _explain = self.pipeline._parse_dag(input_sql, dialect=dialect, query_id=self.query_id)
-        self._stage(self.query_id, f"  DAG: {len(dag.nodes)} nodes, {len(dag.edges)} edges")
+        # Phase 1: Parse logical tree from original
+        self._stage(self.query_id, "Phase 1: Parsing logical tree...")
+        dag, costs, _explain = self.pipeline._parse_logical_tree(
+            input_sql, dialect=dialect, query_id=self.query_id,
+        )
+        self._stage(
+            self.query_id,
+            f"  Logical tree: {len(dag.nodes)} nodes, {len(dag.edges)} edges",
+        )
 
         # Phase 2: Gather all context (same as swarm — EXPLAIN, examples, constraints, etc.)
         self._stage(self.query_id, "Phase 2: Gathering context...")
@@ -267,41 +273,37 @@ class AnalystSession:
                 analyst_prompt, max_tokens=4096
             )
         except Exception as e:
-            self._stage(self.query_id, f"  Analyst failed ({e}), using minimal briefing")
-            analyst_response = (
-                "=== SHARED BRIEFING ===\n"
-                "SEMANTIC_CONTRACT: Preserve exact output.\n"
-                "BOTTLENECK_DIAGNOSIS: Analysis unavailable.\n"
-                "ACTIVE_CONSTRAINTS: Preserve semantic equivalence.\n"
-                "REGRESSION_WARNINGS: None applicable.\n\n"
-                "=== WORKER 1 BRIEFING ===\n"
-                "STRATEGY: conservative_pushdown\n"
-                "EXAMPLES: early_filter\n"
-                "HAZARD_FLAGS: Analyst unavailable.\n"
-            )
+            self._stage(self.query_id, f"  Analyst failed ({e})")
+            raise RuntimeError(f"Analyst briefing call failed: {e}") from e
 
         self._stage(self.query_id, f"  Analyst done ({time.time() - t_analyst:.0f}s)")
 
         # Phase 4: Parse briefing and build worker prompt
         briefing = parse_briefing_response(analyst_response)
+        briefing_issues = validate_parsed_briefing(briefing)
+        if briefing_issues:
+            for issue in briefing_issues[:8]:
+                self._stage(self.query_id, f"  Analyst briefing error: {issue}")
+            raise RuntimeError(
+                "Analyst briefing failed validation: "
+                + "; ".join(briefing_issues[:4])
+            )
 
-        # Load examples for the worker — validate the parsed worker has real
-        # content. parse_briefing_response pads empty workers on parse failure
-        # (strategy="") and assigns placeholder strategies (strategy="strategy_1")
-        # when extraction partially fails. Both must trigger V1 fallback.
+        # Load examples for the worker — missing/placeholder fields are contract errors.
         worker = briefing.workers[0] if briefing.workers else None
         if worker:
             import re
             strategy = worker.strategy.strip()
             if not strategy or re.fullmatch(r"strategy_\d+", strategy):
-                self._stage(self.query_id, "  Briefing parse returned empty/placeholder worker, falling back to example-based prompt")
-                worker = None
-        if worker:
-            examples = self.pipeline._load_examples_by_id(
-                worker.examples, engine
-            )
+                raise RuntimeError("Analyst briefing returned placeholder worker strategy.")
         else:
-            examples = self.pipeline._find_examples(input_sql, engine=engine, k=3)
+            raise RuntimeError("Analyst briefing returned no worker assignment.")
+
+        examples = self.pipeline._load_examples_by_id(worker.examples, engine)
+        if not examples:
+            raise RuntimeError(
+                f"Analyst-selected examples could not be loaded: {worker.examples}"
+            )
 
         example_ids = [e.get("id", "?") for e in examples]
 
@@ -311,7 +313,7 @@ class AnalystSession:
 
         # Build worker prompt (same as swarm workers use)
         prompt = build_worker_prompt(
-            worker_briefing=worker if worker else briefing.workers[0],
+            worker_briefing=worker,
             shared_briefing=briefing.shared,
             examples=examples,
             original_sql=input_sql,
@@ -411,11 +413,11 @@ class AnalystSession:
             else "postgres"
         )
 
-        # Parse DAGs for comparison
-        dag_original, costs_original, _ = self.pipeline._parse_dag(
+        # Parse logical trees for comparison
+        dag_original, costs_original, _ = self.pipeline._parse_logical_tree(
             self.original_sql, dialect=dialect, query_id=self.query_id
         )
-        dag_attempted, costs_attempted, _ = self.pipeline._parse_dag(
+        dag_attempted, costs_attempted, _ = self.pipeline._parse_logical_tree(
             iteration.optimized_sql, dialect=dialect, query_id=self.query_id
         )
 

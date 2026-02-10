@@ -107,10 +107,10 @@ class SwarmSession(OptimizationSession):
             print(f"  fan-out=4 workers  snipe=max {self.max_iterations - 1}  target={self.target_speedup:.1f}x", flush=True)
             print(f"{'='*60}", flush=True)
 
-            # Phase 1: Parse DAG once (shared across all iterations)
-            self._stage(self.query_id, "PARSE: Building DAG...")
+            # Phase 1: Parse logical tree once (shared across all iterations)
+            self._stage(self.query_id, "PARSE: Building logical tree...")
             t0 = time.time()
-            dag, costs, _explain = self.pipeline._parse_dag(
+            dag, costs, _explain = self.pipeline._parse_logical_tree(
                 self.original_sql, dialect=self.dialect, query_id=self.query_id
             )
             self._stage(self.query_id, f"PARSE: done ({_fmt_elapsed(time.time() - t0)})")
@@ -192,6 +192,7 @@ class SwarmSession(OptimizationSession):
             build_analyst_briefing_prompt,
             build_worker_prompt,
             parse_briefing_response,
+            validate_parsed_briefing,
         )
         # ── Step 1: Gather all raw data ──────────────────────────────────
         self._stage(self.query_id, "Gathering data (EXPLAIN, knowledge, examples)...")
@@ -277,9 +278,8 @@ class SwarmSession(OptimizationSession):
                 analyst_prompt, max_tokens=4096
             )
         except Exception as e:
-            self._stage(self.query_id, f"ANALYST: failed ({e}), using fallback")
-            logger.warning(f"[{self.query_id}] Analyst failed: {e}")
-            analyst_response = self._build_fallback_fan_out(matched_examples, all_available)
+            self._stage(self.query_id, f"ANALYST: failed ({e})")
+            raise RuntimeError(f"Analyst call failed: {e}") from e
 
         self._stage(
             self.query_id,
@@ -289,17 +289,14 @@ class SwarmSession(OptimizationSession):
 
         # ── Step 4: Parse briefing ──────────────────────────────────────
         briefing = parse_briefing_response(analyst_response)
-
-        # Check if we got meaningful worker assignments
-        has_workers = any(
-            w.strategy and w.strategy != f"strategy_{w.worker_id}"
-            for w in briefing.workers
-        )
-        if not has_workers:
-            self._stage(self.query_id, "ANALYST: no worker strategies parsed, using fallback")
-            logger.warning(f"[{self.query_id}] Briefing had no workers, using fallback")
-            analyst_response = self._build_fallback_fan_out(matched_examples, all_available)
-            briefing = parse_briefing_response(analyst_response)
+        briefing_issues = validate_parsed_briefing(briefing)
+        if briefing_issues:
+            for issue in briefing_issues[:8]:
+                self._stage(self.query_id, f"ANALYST BRIEFING ERROR: {issue}")
+            raise RuntimeError(
+                "Analyst briefing failed validation: "
+                + "; ".join(briefing_issues[:4])
+            )
 
         # Log parsed briefing
         for w in briefing.workers:
@@ -1069,57 +1066,6 @@ class SwarmSession(OptimizationSession):
                 total += 1  # sniper only (no analyst)
             # snipe_retry_skipped: 0 calls
         return total
-
-    @staticmethod
-    def _build_fallback_fan_out(
-        matched_examples: List[Dict[str, Any]],
-        all_available: List[Dict[str, str]],
-    ) -> str:
-        """Build fallback fan-out response when analyst call fails.
-
-        Generates output in the format parse_briefing_response() expects:
-        === SHARED BRIEFING === and === WORKER N BRIEFING === sections.
-        """
-        # Get example IDs
-        ex_ids = [e.get("id", f"ex_{i}") for i, e in enumerate(matched_examples)]
-
-        # Pad with catalog examples if needed
-        catalog_ids = [e.get("id", "") for e in all_available if e.get("id")]
-        for cid in catalog_ids:
-            if cid not in ex_ids:
-                ex_ids.append(cid)
-            if len(ex_ids) >= 12:
-                break
-
-        # Distribute across 4 workers
-        strategies = [
-            ("conservative_pushdown", "Apply proven pushdown and early filter patterns."),
-            ("date_cte_isolation", "Isolate date dimensions into CTEs for hash join reduction."),
-            ("multi_cte_restructure", "Restructure query with multiple CTEs for prefetching."),
-            ("structural_transform", "Apply structural transforms like OR-to-UNION or decorrelation."),
-        ]
-
-        lines = [
-            "=== SHARED BRIEFING ===",
-            "SEMANTIC_CONTRACT: Preserve exact output columns, row count, and ordering.",
-            "BOTTLENECK_DIAGNOSIS: Analyst unavailable — applying generic strategies.",
-            "ACTIVE_CONSTRAINTS: Preserve semantic equivalence.",
-            "REGRESSION_WARNINGS: None.",
-            "",
-        ]
-        for i, (strategy, hint) in enumerate(strategies):
-            start = i * 3
-            worker_examples = ex_ids[start:start + 3]
-            if not worker_examples:
-                worker_examples = ex_ids[:3]  # reuse if not enough
-
-            lines.append(f"=== WORKER {i + 1} BRIEFING ===")
-            lines.append(f"STRATEGY: {strategy}")
-            lines.append(f"EXAMPLES: {', '.join(worker_examples)}")
-            lines.append(f"HAZARD_FLAGS: {hint}")
-            lines.append("")
-
-        return "\n".join(lines)
 
     def save_session(self, output_dir: Optional[Path] = None) -> Path:
         """Save swarm session artifacts for audit trail.

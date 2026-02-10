@@ -3,7 +3,7 @@
 This module handles parsing LLM responses and applying SQL rewrites.
 Supports two JSON output formats:
   1. DAP (Decomposed Attention Protocol) — structured component payload
-  2. Legacy rewrite_sets — per-node DAG format
+  2. Legacy rewrite_sets — per-node query-structure format
 
 Key features:
 - Parse DAP Component Payload or rewrite_sets JSON from LLM responses
@@ -869,7 +869,7 @@ class SQLRewriter:
 
         Supports three response formats (tried in priority order):
         1. DAP Component Payload JSON (spec_version + statements)
-        2. JSON with rewrite_sets (per-node DAG format — legacy)
+        2. JSON with rewrite_sets (per-node query-structure format — legacy)
         3. Raw SQL in a ```sql code block (fallback)
 
         Args:

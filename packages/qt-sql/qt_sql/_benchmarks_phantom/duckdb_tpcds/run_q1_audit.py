@@ -46,11 +46,11 @@ logger.info("Loading shared artifacts...")
 sql = (BENCHMARK_DIR / "queries" / f"{QUERY_ID}.sql").read_text()
 explain = json.loads((BENCHMARK_DIR / "explains" / f"{QUERY_ID}.json").read_text())
 
-# Parse DAG with real costs
-from qt_sql.optimization.dag_v2 import DagBuilder, CostAnalyzer
+# Parse logical tree with real costs
+from qt_sql.optimization.dag_v2 import LogicalTreeBuilder, CostAnalyzer
 from qt_sql.optimization.plan_analyzer import analyze_plan_for_optimization
 
-dag = DagBuilder(sql, dialect=DIALECT).build()
+dag = LogicalTreeBuilder(sql, dialect=DIALECT).build()
 ctx = analyze_plan_for_optimization(explain["plan_json"], sql)
 costs = CostAnalyzer(dag, plan_context=ctx).analyze()
 

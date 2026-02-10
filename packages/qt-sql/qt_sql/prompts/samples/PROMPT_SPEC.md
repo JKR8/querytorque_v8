@@ -60,7 +60,7 @@ Master reference for all prompt builders — inputs, outputs, constraints, and t
 | `query_id` | `str` | Yes | Query identifier (e.g., `"query_88"`) |
 | `sql` | `str` | Yes | Original SQL query |
 | `explain_plan_text` | `str` | No | EXPLAIN ANALYZE tree text |
-| `dag` | `Any` | Yes | Parsed DAG from Phase 1 |
+| `dag` | `Any` | Yes | Parsed logical tree from Phase 1 |
 | `costs` | `Dict[str, Any]` | Yes | Per-node cost analysis |
 | `semantic_intents` | `Dict` | No | Pre-computed per-query intents |
 | `global_knowledge` | `Dict` | No | GlobalKnowledge (principles + anti-patterns) |
@@ -85,7 +85,7 @@ Master reference for all prompt builders — inputs, outputs, constraints, and t
 2. Query SQL with line numbers
 3. EXPLAIN plan (DuckDB tree or PG tree, with timing notes)
 4. Plan-Space Scanner Intelligence (PG only, if provided)
-5. Query Structure (DAG) node cards
+5. Query Structure (Logical Tree) node cards
 6. Pre-Computed Semantic Intent (if available)
 7. Aggregation Semantics Check
 8. Tag-Matched Examples (full metadata)
@@ -96,7 +96,7 @@ Master reference for all prompt builders — inputs, outputs, constraints, and t
 13. Engine Profile or Exploit Algorithm
 14. Resource Envelope (PG only)
 15. Correctness Constraints (4 gates)
-16. Reasoning chain (7 steps: CLASSIFY → EXPLAIN → GAP MATCHING → AGG TRAP → TRANSFORM → DAG DESIGN → WRITE REWRITE)
+16. Reasoning chain (7 steps: CLASSIFY → EXPLAIN → GAP MATCHING → AGG TRAP → TRANSFORM → LOGICAL TREE DESIGN → WRITE REWRITE)
 17. Output format: `=== SHARED BRIEFING ===` + `=== REWRITE ===` (JSON rewrite_set)
 18. Section validation checklist (oneshot)
 19. Transform Catalog (full)
@@ -126,7 +126,7 @@ Same as Oneshot Query above, with `mode="expert"`.
 ### Output Sections
 Same as Oneshot, except:
 - Step 5: Single best transform selection (not 4)
-- Step 6: Single DAG design
+- Step 6: Single Logical tree design
 - No Step 7 (WRITE REWRITE) — worker writes the SQL
 - Output format: `=== SHARED BRIEFING ===` + `=== WORKER 1 BRIEFING ===`
 - Section validation checklist (expert)
@@ -163,7 +163,7 @@ Same as Oneshot, except:
 1. Role + dialect + output format
 2. DuckDB specifics (if DuckDB)
 3. Semantic Contract (from shared briefing)
-4. Target DAG + Node Contracts (from worker briefing)
+4. Target Logical Tree + Node Contracts (from worker briefing)
 5. Hazard Flags (from worker briefing)
 6. Regression Warnings (from shared briefing)
 7. Constraints (from shared briefing)
@@ -197,7 +197,7 @@ Same as Oneshot Query above, with `mode="swarm"`.
 ### Output Sections
 Same as Oneshot, except:
 - Step 5: Select 4 structurally diverse transforms
-- Step 6: DAG design for each worker
+- Step 6: Logical tree design for each worker
 - No Step 7 (workers write SQL)
 - Output format: `=== SHARED BRIEFING ===` + 4 × `=== WORKER N BRIEFING ===`
 - Worker 4 has EXPLORATION fields (CONSTRAINT_OVERRIDE, EXPLORATION_TYPE)
@@ -224,7 +224,7 @@ Same as Oneshot, except:
 |------|------|----------|-------------|
 | `query_id` | `str` | Yes | Query identifier |
 | `sql` | `str` | Yes | The SQL query |
-| `dag` | `Any` | Yes | Parsed DAG |
+| `dag` | `Any` | Yes | Parsed logical tree |
 | `costs` | `Dict` | Yes | Per-node cost analysis |
 | `matched_examples` | `List[Dict]` | Yes | Top tag-matched examples |
 | `all_available_examples` | `List[Dict]` | Yes | Full catalog |
@@ -235,7 +235,7 @@ Same as Oneshot, except:
 
 1. Role (swarm coordinator)
 2. Query SQL
-3. DAG Structure & Bottlenecks (via `append_dag_summary`)
+3. Logical Tree Structure & Bottlenecks (via `append_dag_summary`)
 4. Top N Matched Examples (by structural similarity)
 5. All Available Examples (full catalog)
 6. Regression Warnings (if any)
@@ -274,7 +274,7 @@ Same as Expert Worker (#4 above). The worker prompt is identical regardless of s
 | `original_sql` | `str` | Yes | Original SQL query |
 | `worker_results` | `List[WorkerResult]` | Yes | ALL results from previous iterations |
 | `target_speedup` | `float` | Yes | Target speedup ratio |
-| `dag` | `Any` | Yes | Parsed DAG |
+| `dag` | `Any` | Yes | Parsed logical tree |
 | `costs` | `Dict` | Yes | Per-node cost analysis |
 | `explain_plan_text` | `str` | No | EXPLAIN ANALYZE plan text |
 | `engine_profile` | `Dict` | No | Engine profile JSON |
@@ -294,7 +294,7 @@ Same as Expert Worker (#4 above). The worker prompt is identical regardless of s
 3. Previous Optimization Attempts (full SQL for each worker, sorted by speedup)
 4. Original SQL (with line numbers)
 5. EXPLAIN Plan (if available)
-6. Query Structure (DAG)
+6. Query Structure (Logical Tree)
 7. Aggregation Semantics Check
 8. Engine Profile (strengths + gaps)
 9. Tag-Matched Examples
@@ -330,7 +330,7 @@ Same as Expert Worker (#4 above). The worker prompt is identical regardless of s
 | `best_worker_sql` | `str` | No | Best result SQL (if any > 1.0x) |
 | `examples` | `List[Dict]` | Yes | Loaded gold examples |
 | `output_columns` | `List[str]` | Yes | Expected output columns |
-| `dag` | `Any` | Yes | Parsed DAG |
+| `dag` | `Any` | Yes | Parsed logical tree |
 | `costs` | `Dict` | Yes | Per-node cost analysis |
 | `engine_profile` | `Dict` | No | Engine profile JSON |
 | `constraints` | `List[Dict]` | No | Correctness constraints |

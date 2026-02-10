@@ -18,7 +18,7 @@ class OptimizationSession:
     """Base class for Oneshot, Expert, and Swarm optimization sessions.
 
     Subclasses implement run() with mode-specific logic.
-    All sessions share the same Pipeline for DAG parsing, example retrieval,
+    All sessions share the same Pipeline for logical-tree parsing, example retrieval,
     candidate generation, and validation.
     """
 

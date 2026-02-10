@@ -39,9 +39,9 @@ class TestQtSqlCoreImports:
         assert ADOConfig is not None
 
     def test_import_dag(self):
-        """Test DAG module import."""
-        from qt_sql.dag import DagBuilder, CostAnalyzer
-        assert DagBuilder is not None
+        """Test query-structure module import."""
+        from qt_sql.dag import LogicalTreeBuilder, CostAnalyzer
+        assert LogicalTreeBuilder is not None
         assert CostAnalyzer is not None
 
     def test_import_generate(self):

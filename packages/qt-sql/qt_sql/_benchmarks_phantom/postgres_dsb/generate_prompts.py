@@ -48,7 +48,7 @@ def main():
             t0 = time.time()
 
             # Phase 1: Parse
-            dag, costs, _explain = p._parse_dag(sql, dialect=dialect)
+            dag, costs, _explain = p._parse_logical_tree(sql, dialect=dialect)
 
             # Phase 2: Find FAISS examples
             examples = p._find_examples(sql, engine=engine, k=3)

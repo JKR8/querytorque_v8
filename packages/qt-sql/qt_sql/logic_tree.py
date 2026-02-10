@@ -1,7 +1,7 @@
 """Logic Tree generator — DAP Part 1 pre-fill from AST + cost data.
 
 Auto-generates a Logic Tree text from any SQL query using the existing
-DAG/AST infrastructure.  All nodes are marked [=] (original state) so the
+query-structure/AST infrastructure. All nodes are marked [=] (original state) so the
 LLM sees the current structure as context in exactly the format it should
 output (with change markers).
 
@@ -99,7 +99,7 @@ def _map_operations(meta: Dict[str, Any], flags: List[str]) -> List[str]:
 
 
 def _node_type_prefix(node_type: str) -> str:
-    """Map DAG node_type to DAP node type prefix."""
+    """Map node_type to DAP node type prefix."""
     mapping = {
         "cte": "[CTE]",
         "main": "[MAIN]",
@@ -110,19 +110,19 @@ def _node_type_prefix(node_type: str) -> str:
 
 def build_logic_tree(
     sql: str,
-    dag: Any,  # QueryDag from dag.py
+    dag: Any,  # Query structure from dag.py
     costs: Dict[str, Any],
     dialect: str = "duckdb",
     node_intents: Optional[Dict[str, str]] = None,
 ) -> str:
-    """Build a Logic Tree text from a single query's DAG + cost data.
+    """Build a Logic Tree text from a single query's structure + cost data.
 
     All nodes are marked [=] (original, unchanged).  The tree uses
     box-drawing characters for visual structure per DAP spec.
 
     Args:
         sql: Original SQL text (for context, not parsed here)
-        dag: QueryDag from DagBuilder.build()
+        dag: Query structure from builder.build()
         costs: Dict of {node_id: NodeCost} from CostAnalyzer
         dialect: SQL dialect
         node_intents: Optional {node_id: intent_string} for semantic labels
@@ -219,7 +219,7 @@ def build_logic_tree(
 
 def build_pipeline_logic_tree(
     script_dag: Any,  # ScriptDAG from script_parser.py
-    per_stmt_dags: Dict[str, Any],  # {target_table: QueryDag}
+    per_stmt_dags: Dict[str, Any],  # {target_table: query structure}
     per_stmt_costs: Dict[str, Dict],  # {target_table: {node_id: NodeCost}}
     dialect: str = "duckdb",
 ) -> str:
@@ -227,7 +227,7 @@ def build_pipeline_logic_tree(
 
     Args:
         script_dag: ScriptDAG with statement ordering
-        per_stmt_dags: QueryDag per statement target table
+        per_stmt_dags: Query structure per statement target table
         per_stmt_costs: Cost data per statement
         dialect: SQL dialect
 
@@ -251,7 +251,7 @@ def build_pipeline_logic_tree(
         target = getattr(stmt, "target_table", None) or f"stmt_{si}"
         lines.append(f"{stmt_conn} [STMT] {target}  [=]")
 
-        # Get per-statement DAG and costs
+        # Get per-statement structure and costs
         dag = per_stmt_dags.get(target)
         costs = per_stmt_costs.get(target, {})
         if not dag:

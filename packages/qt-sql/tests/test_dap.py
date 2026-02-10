@@ -266,7 +266,7 @@ class TestEndToEndDAP:
 class TestLogicTree:
     def test_build_logic_tree(self):
         from qt_sql.logic_tree import build_logic_tree
-        from qt_sql.dag import DagBuilder, CostAnalyzer
+        from qt_sql.dag import LogicalTreeBuilder, CostAnalyzer
 
         sql = (
             "WITH filtered AS ("
@@ -277,7 +277,7 @@ class TestLogicTree:
             "JOIN filtered ON ss_sold_date_sk = d_date_sk "
             "GROUP BY ss_sold_date_sk"
         )
-        dag = DagBuilder(sql, dialect="duckdb").build()
+        dag = LogicalTreeBuilder(sql, dialect="duckdb").build()
         # Build empty costs dict (no EXPLAIN available)
         costs = {}
         tree = build_logic_tree(sql, dag, costs, "duckdb")

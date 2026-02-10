@@ -37,7 +37,7 @@ result = p.run_optimization_session("query_88", sql, mode=OptimizationMode.SWARM
 │  5-PHASE PIPELINE                                               │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│  1. Parse:     SQL → DAG (CTE topology, join contracts)        │
+│  1. Parse:     SQL → logical tree (CTE topology, join contracts)        │
 │  2. Retrieve:  Tag-based example matching (engine-specific)     │
 │  3. Rewrite:   V2 analyst briefing → worker prompt → LLM       │
 │  4. Syntax:    sqlglot parse gate (deterministic)              │
@@ -76,7 +76,7 @@ result = p.run_optimization_session("query_88", sql, mode=OptimizationMode.SWARM
 | Module | Role |
 |--------|------|
 | `pipeline.py` | Top-level orchestrator — parse → retrieve → rewrite → validate |
-| `dag.py` | SQL → DAG parser (CTE topology, join contracts, column tracking) |
+| `dag.py` | SQL → logical tree parser (CTE topology, join contracts, column tracking) |
 | `logic_tree.py` | DAP Logic Tree builder — structural representation for prompt output |
 | `sql_rewriter.py` | DAP response parser — extracts SQL from Component Payload JSON, infers transforms |
 | `schemas.py` | Core dataclasses: `OptimizationMode`, `WorkerResult`, `SessionResult`, `ValidationResult`, `PipelineResult` |
@@ -104,7 +104,7 @@ result = p.run_optimization_session("query_88", sql, mode=OptimizationMode.SWARM
 | `prompts/swarm_common.py` | Shared utilities for swarm prompts |
 | `prompts/swarm_parsers.py` | Parsers for analyst briefing output |
 | `prompts/briefing_checks.py` | Worker rewrite checklist builder |
-| `prompts/dag_helpers.py` | DAG-related prompt helpers |
+| `prompts/dag_helpers.py` | Logical-tree prompt helpers |
 | `prompts/pg_tuner.py` | PostgreSQL-specific tuning prompt |
 | `prompts/sql_rewrite_spec.md` | DAP spec reference |
 | `prompts/samples/` | V0 Prompt Pack — 11 rendered prompt samples for review |

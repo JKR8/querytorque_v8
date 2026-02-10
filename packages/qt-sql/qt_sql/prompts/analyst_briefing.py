@@ -11,7 +11,7 @@ The V2 analyst produces a structured briefing:
     3. ACTIVE_CONSTRAINTS — correctness gates + matched engine gaps
     4. REGRESSION_WARNINGS — causal rules, not just "this happened"
   Per-worker:
-    5. TARGET_DAG + NODE_CONTRACTS — CTE blueprint + column contracts
+    5. TARGET_LOGICAL_TREE + NODE_CONTRACTS — CTE blueprint + column contracts
     6. EXAMPLES + EXAMPLE_REASONING — why each example matches
     7. HAZARD_FLAGS — strategy-specific risks for this query
 """
@@ -675,7 +675,7 @@ def build_analyst_briefing_prompt(
 ) -> str:
     """Build the analyst briefing prompt for swarm, expert, or oneshot mode.
 
-    All modes share the same data sections (EXPLAIN, DAG, examples, constraints,
+    All modes share the same data sections (EXPLAIN, logical tree, examples, constraints,
     etc.). What varies: role framing, output format, strategy rules, and
     exploration budget.
 
@@ -683,7 +683,7 @@ def build_analyst_briefing_prompt(
         query_id: Query identifier (e.g., 'query_74')
         sql: Original SQL query
         explain_plan_text: ASCII EXPLAIN ANALYZE tree (may be None for ~4 queries)
-        dag: Parsed DAG from Phase 1
+        dag: Parsed logical tree from Phase 1
         costs: Per-node cost analysis
         semantic_intents: Pre-computed per-query + per-node intents (may be None)
         global_knowledge: GlobalKnowledge dict with principles + anti_patterns
@@ -722,7 +722,7 @@ def build_analyst_briefing_prompt(
         )
         lines.append("")
         lines.append(
-            "You are the ONLY call that sees all the data: EXPLAIN plans, DAG costs, "
+            "You are the ONLY call that sees all the data: EXPLAIN plans, logical-tree costs, "
             "full constraint list, global knowledge, and the complete example catalog. "
             "The workers will only see what YOU put in their briefings. "
             "Your output quality directly determines their success."
@@ -735,7 +735,7 @@ def build_analyst_briefing_prompt(
         )
         lines.append("")
         lines.append(
-            "You are the ONLY call that sees all the data: EXPLAIN plans, DAG costs, "
+            "You are the ONLY call that sees all the data: EXPLAIN plans, logical-tree costs, "
             "full constraint list, global knowledge, and the complete example catalog. "
             "The worker will only see what YOU put in the briefing. "
             "Your output quality directly determines success."
@@ -748,7 +748,7 @@ def build_analyst_briefing_prompt(
         )
         lines.append("")
         lines.append(
-            "You have all the data: EXPLAIN plans, DAG costs, full constraint list, "
+            "You have all the data: EXPLAIN plans, logical-tree costs, full constraint list, "
             "global knowledge, and the complete example catalog. Analyze thoroughly, "
             "then implement the best strategy as working SQL."
         )
@@ -790,9 +790,9 @@ def build_analyst_briefing_prompt(
         lines.append("")
         lines.append(
             "**NOTE:** The EXPLAIN plan shows the PHYSICAL execution structure, which "
-            "may differ significantly from the LOGICAL DAG below. The optimizer may have "
+            "may differ significantly from the logical tree below. The optimizer may have "
             "already split CTEs, reordered joins, or pushed predicates. When the EXPLAIN "
-            "and DAG disagree, the EXPLAIN is ground truth for what the optimizer is "
+            "and the logical tree disagree, the EXPLAIN is ground truth for what the optimizer is "
             "already doing."
         )
         lines.append("")
@@ -801,7 +801,7 @@ def build_analyst_briefing_prompt(
                 "DuckDB EXPLAIN ANALYZE reports **operator-exclusive** wall-clock time "
                 "per node (children's time is NOT included in the parent's reported time). "
                 "The percentage annotations are also exclusive. You can sum sibling nodes "
-                "to get pipeline cost. DAG cost percentages are derived metrics that may "
+                "to get pipeline cost. logical-tree cost percentages are derived metrics that may "
                 "not reflect actual execution time — use EXPLAIN timings as ground truth."
             )
         elif is_estimate_plan:
@@ -813,7 +813,7 @@ def build_analyst_briefing_prompt(
             )
         else:
             lines.append(
-                "Use EXPLAIN ANALYZE timings as ground truth. DAG cost percentages are "
+                "Use EXPLAIN ANALYZE timings as ground truth. logical-tree cost percentages are "
                 "derived metrics that may not reflect actual execution time."
             )
         lines.append("")
@@ -822,7 +822,7 @@ def build_analyst_briefing_prompt(
         lines.append("")
         lines.append(
             "*EXPLAIN plan not available for this query. "
-            "Use DAG cost percentages as proxy for bottleneck identification.*"
+            "Use logical-tree cost percentages as proxy for bottleneck identification.*"
         )
         lines.append("")
 
@@ -1127,7 +1127,7 @@ def build_analyst_briefing_prompt(
             "2. **EXPLAIN PLAN ANALYSIS**: From the EXPLAIN ANALYZE output, identify:\n"
             "   - Compute wall-clock ms per EXPLAIN node. Sum repeated operations "
             "(e.g., 2x store_sales joins = total cost). The EXPLAIN is ground truth, "
-            "not the DAG cost percentages.\n"
+            "not the logical-tree cost percentages.\n"
             "   - Which nodes consume >10% of runtime and WHY\n"
             "   - Where row counts drop sharply (existing selectivity)\n"
             "   - Where row counts DON'T drop (missed optimization opportunity)\n"
@@ -1184,7 +1184,7 @@ def build_analyst_briefing_prompt(
     lines.append("")
     if mode == "swarm":
         lines.append(
-            "6. **DAG DESIGN**: For each worker's strategy, define the target DAG "
+            "6. **LOGICAL TREE DESIGN**: For each worker's strategy, define the target logical tree "
             "topology. Verify that every node contract has exhaustive output "
             "columns by checking downstream references.\n"
             "   CTE materialization matters for your design: a CTE referenced by "
@@ -1195,7 +1195,7 @@ def build_analyst_briefing_prompt(
         )
     else:
         lines.append(
-            "6. **DAG DESIGN**: Define the target DAG topology for your chosen "
+            "6. **LOGICAL TREE DESIGN**: Define the target logical tree topology for your chosen "
             "strategy. Verify that every node contract has exhaustive output "
             "columns by checking downstream references.\n"
             "   CTE materialization matters: a CTE referenced by 2+ consumers "
@@ -1206,7 +1206,7 @@ def build_analyst_briefing_prompt(
         lines.append(
             "7. **WRITE REWRITE**: Implement your strategy as a JSON rewrite_set. "
             "Each changed or added CTE is a node. Produce per-node SQL matching "
-            "your DAG design from step 6. Declare output columns for every node "
+            "your logical tree design from step 6. Declare output columns for every node "
             "in `node_contracts`. The rewrite must be semantically equivalent to "
             "the original."
         )
@@ -1238,7 +1238,7 @@ def build_analyst_briefing_prompt(
     lines.append("Scan-bound vs join-bound vs aggregation-bound.")
     lines.append("Cardinality flow (how many rows at each stage).")
     lines.append("What the optimizer already handles well (don't re-optimize).")
-    lines.append("Whether DAG cost percentages are misleading.]")
+    lines.append("Whether logical-tree cost percentages are misleading.]")
     lines.append("")
     lines.append("ACTIVE_CONSTRAINTS:")
     lines.append("- [CORRECTNESS_CONSTRAINT_ID]: [Why it applies to this query, 1 line]")
@@ -1256,7 +1256,7 @@ def build_analyst_briefing_prompt(
     # Worker briefing format — varies per mode
     _WORKER_BRIEFING_TEMPLATE = [
         "STRATEGY: [strategy_name]",
-        "TARGET_DAG:",
+        "TARGET_LOGICAL_TREE:",
         "  [node] -> [node] -> [node]",
         "NODE_CONTRACTS:",
         "(Write all fields as SQL fragments, not natural language.",
@@ -1525,7 +1525,7 @@ def build_analyst_briefing_prompt(
         "5. **COMPOSITION IS ALLOWED AND ENCOURAGED**: A strategy can "
         "combine 2-3 transforms from different categories (e.g., "
         "star_join_prefetch + scan_consolidation_pivot, or date_cte_isolate + "
-        "early_filter + decorrelate). The TARGET_DAG should reflect the combined "
+        "early_filter + decorrelate). The TARGET_LOGICAL_TREE should reflect the combined "
         "structure. Compound strategies are often the source of the biggest wins."
     )
     if mode == "swarm":
@@ -1554,7 +1554,7 @@ def build_analyst_briefing_prompt(
         )
     lines.append("")
     lines.append(
-        "For TARGET_DAG: Define the CTE structure you want produced. "
+        "For TARGET_LOGICAL_TREE: Define the CTE structure you want produced. "
         "For NODE_CONTRACTS: Be exhaustive with OUTPUT columns — missing columns "
         "cause semantic breaks."
     )
@@ -1608,7 +1608,7 @@ def build_analyst_briefing_prompt(
             "Each worker receives:\n"
             "1. SHARED BRIEFING (SEMANTIC_CONTRACT + BOTTLENECK_DIAGNOSIS + "
             "ACTIVE_CONSTRAINTS + REGRESSION_WARNINGS)\n"
-            "2. Their specific WORKER N BRIEFING (STRATEGY + TARGET_DAG + "
+            "2. Their specific WORKER N BRIEFING (STRATEGY + TARGET_LOGICAL_TREE + "
             "NODE_CONTRACTS + EXAMPLES + EXAMPLE_ADAPTATION + HAZARD_FLAGS)\n"
             "3. Full before/after SQL for their assigned examples (retrieved by example ID)\n"
             "4. The original query SQL (full, as reference)\n"
@@ -1640,7 +1640,7 @@ def build_script_oneshot_prompt(
     """Build a oneshot prompt for an entire multi-statement SQL pipeline.
 
     Unlike the single-query oneshot which optimizes one SELECT in isolation,
-    this prompt gives the model the FULL script + dependency DAG so it can
+    this prompt gives the model the FULL script + dependency graph so it can
     reason about cross-statement optimizations:
       - Predicate pushdown across materialization boundaries
       - Redundant scan elimination across statements
@@ -1677,7 +1677,7 @@ def build_script_oneshot_prompt(
     )
     lines.append("")
 
-    # ── 2. Pipeline DAG context ──────────────────────────────────────
+    # ── 2. Pipeline dependency graph context ──────────────────────────────────────
     lines.append("## Pipeline Dependency Graph")
     lines.append("")
     lines.append(
@@ -1814,7 +1814,7 @@ def build_script_oneshot_prompt(
     lines.append("## Your Analysis Steps")
     lines.append("")
     lines.append(
-        "1. **TRACE DATA FLOW**: Follow the pipeline DAG from base tables "
+        "1. **TRACE DATA FLOW**: Follow the pipeline dependency graph from base tables "
         "to final outputs."
     )
     lines.append(

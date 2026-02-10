@@ -67,13 +67,13 @@ if explain_path.exists():
     logger.info("Loaded explain plan")
 else:
     explain = {}
-    logger.warning("No explain plan found — using DAG-only costs")
+    logger.warning("No explain plan found — using logical-tree-only costs")
 
-# ── Parse DAG ──────────────────────────────────────────────────
-from qt_sql.dag import DagBuilder, CostAnalyzer
+# ── Parse logical tree ──────────────────────────────────────────────────
+from qt_sql.dag import LogicalTreeBuilder, CostAnalyzer
 from qt_sql.plan_analyzer import analyze_plan_for_optimization
 
-dag = DagBuilder(sql, dialect=DIALECT).build()
+dag = LogicalTreeBuilder(sql, dialect=DIALECT).build()
 try:
     if explain.get("plan_json"):
         ctx = analyze_plan_for_optimization(explain["plan_json"], sql)
@@ -81,10 +81,10 @@ try:
     else:
         costs = CostAnalyzer(dag).analyze()
 except Exception as e:
-    logger.warning(f"Cost analysis failed ({e}), using DAG-only")
+    logger.warning(f"Cost analysis failed ({e}), using logical-tree-only")
     costs = CostAnalyzer(dag).analyze()
 
-logger.info(f"DAG nodes: {len(dag.nodes) if hasattr(dag, 'nodes') else '?'}")
+logger.info(f"logical tree nodes: {len(dag.nodes) if hasattr(dag, 'nodes') else '?'}")
 
 # ── FAISS ──────────────────────────────────────────────────────
 from qt_sql.pipeline import Pipeline

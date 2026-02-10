@@ -1,9 +1,9 @@
 """ADO pipeline orchestrator.
 
 Phases:
-1. Parse:     SQL → DAG (deterministic, DagBuilder)
+1. Parse:     SQL → logical tree (deterministic structural parse)
 2. Retrieve:  Tag-based example matching (engine-specific)
-3. Rewrite:   Full-query prompt with DAG topology (N parallel workers)
+3. Rewrite:   Full-query prompt with logical-tree topology (N parallel workers)
 4. Validate:  Syntax check (deterministic)
 5. Validate:  Timing + correctness (3-run or 5-run)
 
@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -63,6 +65,10 @@ class Pipeline:
         self.model = model
         self.analyze_fn = analyze_fn
         self.use_analyst = use_analyst
+        self._allow_intelligence_bootstrap = (
+            os.environ.get("QT_ALLOW_INTELLIGENCE_BOOTSTRAP", "").lower()
+            in ("1", "true", "yes")
+        )
 
         # Initialize pipeline components
         from .node_prompter import Prompter
@@ -140,23 +146,28 @@ class Pipeline:
         return None
 
     # =========================================================================
-    # Phase 1: Parse SQL → DAG
+    # Phase 1: Parse SQL → logical tree
     # =========================================================================
 
-    def _parse_dag(self, sql: str, dialect: str = "duckdb", query_id: str = "unknown"):
-        """Phase 1: Parse SQL into DAG structure with real EXPLAIN costs.
+    def _parse_logical_tree(
+        self,
+        sql: str,
+        dialect: str = "duckdb",
+        query_id: str = "unknown",
+    ):
+        """Phase 1: Parse SQL into logical-tree structure with real EXPLAIN costs.
 
         Reads cached EXPLAIN ANALYZE from benchmark_dir/explains/.
         If not cached, runs EXPLAIN ANALYZE and caches the result.
         Falls back to heuristic cost splitting if EXPLAIN fails.
 
-        Returns (dag, costs, explain_result) tuple.
+        Returns (logical_tree, costs, explain_result) tuple.
         explain_result is the raw EXPLAIN output dict (or None).
         """
-        from .dag import DagBuilder, CostAnalyzer
+        from .dag import LogicalTreeBuilder, CostAnalyzer
 
-        builder = DagBuilder(sql, dialect=dialect)
-        dag = builder.build()
+        builder = LogicalTreeBuilder(sql, dialect=dialect)
+        logical_tree = builder.build()
 
         # Get real costs from cached EXPLAIN ANALYZE (or run if not cached)
         plan_context = None
@@ -177,10 +188,10 @@ class Pipeline:
         except Exception as e:
             logger.warning(f"EXPLAIN failed, using heuristic costs: {e}")
 
-        cost_analyzer = CostAnalyzer(dag, plan_context=plan_context)
+        cost_analyzer = CostAnalyzer(logical_tree, plan_context=plan_context)
         costs = cost_analyzer.analyze()
 
-        return dag, costs, explain_result
+        return logical_tree, costs, explain_result
 
     def _get_explain(self, query_id: str, sql: str) -> Optional[Dict[str, Any]]:
         """Get EXPLAIN ANALYZE result — cached first, run if missing.
@@ -448,11 +459,13 @@ class Pipeline:
         )
 
         # Phase 1: Parse
-        logger.info(f"[{query_id}] Phase 1: Parsing DAG")
-        dag, costs, explain_result = self._parse_dag(sql, dialect=dialect, query_id=query_id)
+        logger.info(f"[{query_id}] Phase 1: Parsing logical tree")
+        logical_tree, costs, explain_result = self._parse_logical_tree(
+            sql, dialect=dialect, query_id=query_id,
+        )
         logger.info(
-            f"[{query_id}] DAG: {len(dag.nodes)} nodes, "
-            f"{len(dag.edges)} edges"
+            f"[{query_id}] Logical tree: {len(logical_tree.nodes)} nodes, "
+            f"{len(logical_tree.edges)} edges"
         )
 
         # Phase 2: Tag-based example retrieval (gold + regressions)
@@ -476,7 +489,7 @@ class Pipeline:
             expert_analysis, analysis_raw, analysis_prompt_text, examples = self._run_analyst(
                 query_id=query_id,
                 sql=sql,
-                dag=dag,
+                dag=logical_tree,
                 costs=costs,
                 history=history,
                 matched_examples=examples,
@@ -487,6 +500,13 @@ class Pipeline:
 
         # Load global learnings from benchmark runs
         global_learnings = self.learner.build_learning_summary() or None
+        self._enforce_main_flow_intelligence_gates(
+            query_id=query_id,
+            dialect=dialect,
+            examples=examples,
+            global_learnings=global_learnings,
+            regression_warnings=regression_warnings,
+        )
 
         # Phase 3: Build full-query prompt + generate rewrites
         logger.info(f"[{query_id}] Phase 3: Generating {n_workers} candidates")
@@ -494,7 +514,7 @@ class Pipeline:
         prompt = self.prompter.build_prompt(
             query_id=query_id,
             full_sql=sql,
-            dag=dag,
+            dag=logical_tree,
             costs=costs,
             history=history,
             examples=examples,
@@ -643,41 +663,54 @@ class Pipeline:
 
             # Save validation result
             validation_path = state_dir / "validation" / f"{query_id}.json"
-            validation_path.write_text(json.dumps({
-                "query_id": result.query_id,
-                "status": result.status,
-                "speedup": result.speedup,
-                "nodes_rewritten": result.nodes_rewritten,
-                "transforms_applied": result.transforms_applied,
-                "original_sql": result.original_sql,
-                "optimized_sql": result.optimized_sql,
-            }, indent=2))
-
-            # Save artifacts via store (prompt, response, SQL, validation)
-            store.save_candidate(
-                query_id=query_id,
-                worker_id=0,
-                prompt=result.prompt or "",
-                response=result.response or "",
-                optimized_sql=result.optimized_sql,
-                validation={
+            try:
+                validation_path.write_text(json.dumps({
+                    "query_id": result.query_id,
                     "status": result.status,
                     "speedup": result.speedup,
-                    "transforms": result.transforms_applied,
-                },
-            )
+                    "nodes_rewritten": result.nodes_rewritten,
+                    "transforms_applied": result.transforms_applied,
+                    "original_sql": result.original_sql,
+                    "optimized_sql": result.optimized_sql,
+                }, indent=2))
+            except Exception as e:
+                logger.error("[%s] Failed to write validation artifact: %s", query_id, e)
+
+            # Save artifacts via store (prompt, response, SQL, validation)
+            try:
+                store.save_candidate(
+                    query_id=query_id,
+                    worker_id=0,
+                    prompt=result.prompt or "",
+                    response=result.response or "",
+                    optimized_sql=result.optimized_sql,
+                    validation={
+                        "status": result.status,
+                        "speedup": result.speedup,
+                        "transforms": result.transforms_applied,
+                    },
+                )
+            except Exception as e:
+                logger.error("[%s] Failed to write store artifacts: %s", query_id, e)
+
             # Keep top-level state artifacts populated for easy prompt/response review.
-            (state_dir / "prompts" / f"{query_id}.txt").write_text(result.prompt or "")
-            (state_dir / "responses" / f"{query_id}.txt").write_text(result.response or "")
+            try:
+                (state_dir / "prompts" / f"{query_id}.txt").write_text(result.prompt or "")
+                (state_dir / "responses" / f"{query_id}.txt").write_text(result.response or "")
+            except Exception as e:
+                logger.error("[%s] Failed to write prompt/response artifacts: %s", query_id, e)
 
             # Save analyst artifacts if present (audit trail)
             qdir = state_dir / query_id / "worker_00"
-            if result.analysis_prompt:
-                (qdir / "analysis_prompt.txt").write_text(result.analysis_prompt)
-            if result.analysis:
-                (qdir / "analysis_response.txt").write_text(result.analysis)
-            if result.analysis_formatted:
-                (qdir / "analysis_formatted.txt").write_text(result.analysis_formatted)
+            try:
+                if result.analysis_prompt:
+                    (qdir / "analysis_prompt.txt").write_text(result.analysis_prompt)
+                if result.analysis:
+                    (qdir / "analysis_response.txt").write_text(result.analysis)
+                if result.analysis_formatted:
+                    (qdir / "analysis_formatted.txt").write_text(result.analysis_formatted)
+            except Exception as e:
+                logger.error("[%s] Failed to write analyst artifacts: %s", query_id, e)
 
         # Save state leaderboard
         leaderboard = {
@@ -1080,8 +1113,8 @@ class Pipeline:
                 lines.append(w.hazard_flags)
                 lines.append("")
         if len(lines) <= 2:
-            # Nothing extracted — return raw response as fallback
-            return "## Expert Analysis\n\n" + briefing.raw[:2000]
+            logger.error("Expert analysis formatting produced no structured sections.")
+            return "## Expert Analysis\n\n[ERROR] Missing required structured briefing sections."
         lines.append(
             "Apply the recommended strategy above. Focus on implementing it "
             "correctly while preserving semantic equivalence."
@@ -1108,11 +1141,12 @@ class Pipeline:
         Returns:
             (formatted_analysis, raw_response, analysis_prompt, final_examples) —
             final_examples may differ from matched_examples if the analyst
-            recommended swaps. Returns (None, None, None, matched_examples) on failure.
+            recommended swaps. Returns (None, None, None, []) on failure.
         """
         from .analyst import parse_example_overrides
         from .prompts.analyst_briefing import build_analyst_briefing_prompt
         from .prompts.swarm_parsers import parse_briefing_response
+        from .prompts.briefing_checks import validate_parsed_briefing
 
         logger.info(f"[{query_id}] Running LLM analyst (stubborn query mode)")
 
@@ -1142,13 +1176,21 @@ class Pipeline:
             raw_response = generator._analyze(analysis_prompt)
         except Exception as e:
             logger.warning(f"[{query_id}] Analyst LLM call failed: {e}")
-            return None, None, analysis_prompt, matched_examples
+            return None, None, analysis_prompt, []
 
         # Parse briefing-format response and format for the batch rewrite prompt.
         # The LLM responds in briefing format (=== SHARED BRIEFING === etc.),
         # so we parse with parse_briefing_response and convert the shared
         # sections into the flat text format that Prompter.build_prompt() expects.
         briefing = parse_briefing_response(raw_response)
+        briefing_issues = validate_parsed_briefing(briefing)
+        if briefing_issues:
+            logger.error(
+                "[%s] Analyst briefing invalid: %s",
+                query_id,
+                "; ".join(briefing_issues[:6]),
+            )
+            return None, raw_response, analysis_prompt, []
         formatted = self._format_briefing_as_expert_analysis(briefing)
 
         # Check if analyst wants different examples (from WORKER 1's EXAMPLES field)
@@ -1163,7 +1205,11 @@ class Pipeline:
             logger.info(f"[{query_id}] Analyst overrides matched picks: {overrides}")
             final_examples = self._load_examples_by_id(overrides, engine)
             if not final_examples:
-                final_examples = matched_examples  # fallback if load fails
+                logger.error(
+                    "[%s] Analyst selected examples that could not be loaded: %s",
+                    query_id,
+                    overrides,
+                )
 
         logger.info(
             f"[{query_id}] Analyst complete: "
@@ -1332,6 +1378,8 @@ class Pipeline:
         Returns up to k gold examples sorted by similarity.
         Only returns type=gold examples; regressions are handled separately
         by _find_regression_warnings().
+
+        If no examples are available, returns [] and logs an error.
         """
         from .knowledge import TagRecommender
 
@@ -1356,6 +1404,13 @@ class Pipeline:
                 if ex_data:
                     examples.append(ex_data)
 
+        if not examples:
+            logger.error(
+                "No tag-matched examples found (engine=%s, dialect=%s, k=%d).",
+                engine,
+                dialect,
+                k,
+            )
         return examples
 
     def _find_regression_warnings(
@@ -1583,7 +1638,7 @@ class Pipeline:
                     f"[{query_id}] Failed to load PG system profile: {e}"
                 )
 
-        return {
+        ctx = {
             "explain_plan_text": explain_plan_text,
             "plan_scanner_text": plan_scanner_text,
             "global_knowledge": global_knowledge,
@@ -1598,6 +1653,68 @@ class Pipeline:
             "resource_envelope": resource_envelope,
             "exploit_algorithm_text": exploit_algorithm_text,
         }
+        self._enforce_intelligence_gates(query_id=query_id, dialect=dialect, ctx=ctx)
+        return ctx
+
+    def _enforce_intelligence_gates(
+        self,
+        query_id: str,
+        dialect: str,
+        ctx: Dict[str, Any],
+    ) -> None:
+        """Hard gate for required intelligence inputs before analyst prompting."""
+        missing: list[str] = []
+
+        if not ctx.get("matched_examples"):
+            missing.append("gold_examples")
+        if not ctx.get("global_knowledge"):
+            missing.append("intelligence_briefing_global")
+
+        if dialect in ("postgresql", "postgres"):
+            if not ctx.get("plan_scanner_text"):
+                missing.append("intelligence_briefing_local_pg_scanner")
+            if not ctx.get("exploit_algorithm_text"):
+                missing.append("intelligence_algorithm_pg")
+
+        if not missing:
+            return
+
+        message = (
+            f"[{query_id}] Intelligence gate failed: missing {', '.join(missing)}"
+        )
+        if self._allow_intelligence_bootstrap:
+            logger.warning("%s (bootstrap override enabled)", message)
+            return
+        raise RuntimeError(message)
+
+    def _enforce_main_flow_intelligence_gates(
+        self,
+        query_id: str,
+        dialect: str,
+        examples: List[Dict[str, Any]],
+        global_learnings: Optional[Dict[str, Any]],
+        regression_warnings: List[Dict[str, Any]],
+    ) -> None:
+        """Hard gate for non-analyst prompt flow intelligence inputs."""
+        missing: list[str] = []
+        if not examples:
+            missing.append("gold_examples")
+        if not global_learnings:
+            missing.append("intelligence_briefing_global")
+        if not regression_warnings:
+            missing.append("intelligence_briefing_local")
+
+        if not missing:
+            return
+
+        message = (
+            f"[{query_id}] Main flow intelligence gate failed: missing "
+            + ", ".join(missing)
+        )
+        if self._allow_intelligence_bootstrap:
+            logger.warning("%s (bootstrap override enabled)", message)
+            return
+        raise RuntimeError(message)
 
     def get_explain_plan_text(
         self, query_id: str, dialect: str = "duckdb",
@@ -1691,7 +1808,23 @@ class Pipeline:
             "summary": summary,
             "queries": queries,
         }
-        lb_path.write_text(json.dumps(standard, indent=2))
+        lb_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            prefix=f"{lb_path.name}.",
+            suffix=".tmp",
+            dir=str(lb_path.parent),
+        )
+        try:
+            with open(tmp_fd, "w", encoding="utf-8") as tmp_file:
+                tmp_file.write(json.dumps(standard, indent=2))
+            Path(tmp_path).replace(lb_path)
+        finally:
+            tmp_file_path = Path(tmp_path)
+            if tmp_file_path.exists():
+                try:
+                    tmp_file_path.unlink()
+                except OSError:
+                    pass
         return queries
 
     def _update_benchmark_leaderboard(

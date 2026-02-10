@@ -28,7 +28,7 @@ def _append_dag_analysis(
     node_intents: Optional[Dict[str, str]] = None,
     output_columns: Optional[List[str]] = None,
 ) -> None:
-    """Append structured DAG analysis — one card per node.
+    """Append structured logical-tree analysis — one card per node.
 
     Gold standard format per node:
       Role, Stats, Flags, Outputs, Dependencies, Joins, Filters,
@@ -190,7 +190,7 @@ def _clean_operator(op: str) -> str:
 def _build_rich_flags(
     base_flags: List[str], meta: Dict[str, Any]
 ) -> List[str]:
-    """Enrich DAG flags with sqlglot-extracted details."""
+    """Enrich structural flags with sqlglot-extracted details."""
     flags = []
     for f in base_flags:
         if f == "CORRELATED" and meta.get("correlated_detail"):
@@ -682,7 +682,7 @@ def build_failure_analysis_prompt(
     lines.append("```")
     lines.append("")
 
-    # DAG comparison
+    # Structural comparison
     lines.append("## Performance Analysis")
     lines.append("")
     lines.append("### Original Query Structure")
@@ -730,7 +730,7 @@ def build_failure_analysis_prompt(
         "Identify the bottleneck that is STILL present after this optimization."
     )
     lines.append(
-        "Use the DAG cost analysis above to pinpoint the dominant cost center."
+        "Use the logical-tree cost analysis above to pinpoint the dominant cost center."
     )
     lines.append("")
     lines.append("### 3. What should the NEXT attempt try?")
@@ -769,9 +769,9 @@ def build_failure_analysis_prompt(
 
 
 def _append_dag_summary(lines: List[str], dag: Any, costs: Any) -> None:
-    """Append DAG node summary with costs for failure analysis."""
+    """Append logical-tree node summary with costs for failure analysis."""
     if not hasattr(dag, "nodes") or not dag.nodes:
-        lines.append("(DAG unavailable)")
+        lines.append("(Logical tree unavailable)")
         return
 
     for nid in dag.nodes:

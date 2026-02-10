@@ -29,8 +29,8 @@ def build_analyst_section_checklist() -> str:
         "",
         "### WORKER N BRIEFING (N=1..4)",
         "- `STRATEGY`: non-empty and unique across workers.",
-        "- `TARGET_DAG`: explicit node chain (e.g., `a -> b -> c`).",
-        "- `NODE_CONTRACTS`: every DAG node has a contract with `FROM`, `OUTPUT` (explicit columns), and `CONSUMERS`.",
+        "- `TARGET_LOGICAL_TREE`: explicit node chain (e.g., `a -> b -> c`).",
+        "- `NODE_CONTRACTS`: every logical tree node has a contract with `FROM`, `OUTPUT` (explicit columns), and `CONSUMERS`.",
         "- `EXAMPLES`: 1-3 IDs per worker. Sharing an example across workers is allowed if each worker's EXAMPLE_ADAPTATION explains a different aspect to apply.",
         "- `EXAMPLE_ADAPTATION`: for each example, states what to adapt and what to ignore for this worker's strategy.",
         "- `HAZARD_FLAGS`: query-specific risks, not generic cautions.",
@@ -55,8 +55,8 @@ def build_expert_section_checklist() -> str:
         "",
         "### WORKER 1 BRIEFING",
         "- `STRATEGY`: non-empty, describes the best single strategy.",
-        "- `TARGET_DAG`: explicit node chain (e.g., `a -> b -> c`).",
-        "- `NODE_CONTRACTS`: every DAG node has a contract with `FROM`, `OUTPUT` (explicit columns), and `CONSUMERS`.",
+        "- `TARGET_LOGICAL_TREE`: explicit node chain (e.g., `a -> b -> c`).",
+        "- `NODE_CONTRACTS`: every logical tree node has a contract with `FROM`, `OUTPUT` (explicit columns), and `CONSUMERS`.",
         "- `EXAMPLES`: 1-3 IDs. Each has `EXAMPLE_ADAPTATION` explaining what to adapt and what to ignore.",
         "- `HAZARD_FLAGS`: query-specific risks, not generic cautions.",
     ])
@@ -92,7 +92,7 @@ def build_worker_rewrite_checklist() -> str:
     return "\n".join([
         "## Rewrite Checklist (must pass before final SQL)",
         "",
-        "- Follow every node in `TARGET_DAG` and produce each `NODE_CONTRACT` output column exactly.",
+        "- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.",
         "- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).",
         "- Preserve all literals and the exact final output schema/order.",
         "- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.",
@@ -100,7 +100,7 @@ def build_worker_rewrite_checklist() -> str:
 
 
 def build_sniper_rewrite_checklist() -> str:
-    """Checklist the sniper uses before returning SQL (no TARGET_DAG reference)."""
+    """Checklist the sniper uses before returning SQL (no TARGET_LOGICAL_TREE reference)."""
     return "\n".join([
         "## Rewrite Checklist (must pass before final SQL)",
         "",
@@ -158,11 +158,11 @@ def validate_parsed_briefing(briefing: Any) -> List[str]:
         if not (getattr(worker, "hazard_flags", "") or "").strip():
             issues.append(f"WORKER_{wid}: HAZARD_FLAGS missing.")
 
-        target_dag = (getattr(worker, "target_dag", "") or "").strip()
-        if not target_dag:
-            issues.append(f"WORKER_{wid}: TARGET_DAG/NODE_CONTRACTS missing.")
+        target_logical_tree = (getattr(worker, "target_logical_tree", "") or "").strip()
+        if not target_logical_tree:
+            issues.append(f"WORKER_{wid}: TARGET_LOGICAL_TREE/NODE_CONTRACTS missing.")
             continue
-        issues.extend(_validate_worker_target_dag(wid, target_dag))
+        issues.extend(_validate_worker_target_logical_tree(wid, target_logical_tree))
 
     return issues
 
@@ -222,19 +222,22 @@ def _validate_shared(shared: Any) -> List[str]:
     return issues
 
 
-def _validate_worker_target_dag(worker_id: int, target_dag: str) -> List[str]:
+def _validate_worker_target_logical_tree(
+    worker_id: int,
+    target_logical_tree: str,
+) -> List[str]:
     issues: List[str] = []
-    dag_nodes = _extract_dag_nodes(target_dag)
-    if not dag_nodes:
-        issues.append(f"WORKER_{worker_id}: TARGET_DAG node chain missing.")
+    logical_tree_nodes = _extract_logical_tree_nodes(target_logical_tree)
+    if not logical_tree_nodes:
+        issues.append(f"WORKER_{worker_id}: TARGET_LOGICAL_TREE node chain missing.")
         return issues
 
-    contracts = _extract_node_contracts(target_dag)
+    contracts = _extract_node_contracts(target_logical_tree)
     if not contracts:
         issues.append(f"WORKER_{worker_id}: NODE_CONTRACTS block missing or unparsable.")
         return issues
 
-    for node in dag_nodes:
+    for node in logical_tree_nodes:
         if node not in contracts:
             issues.append(f"WORKER_{worker_id}: NODE_CONTRACTS missing node '{node}'.")
 
@@ -258,22 +261,22 @@ def _validate_worker_target_dag(worker_id: int, target_dag: str) -> List[str]:
                 "not an explicit column list."
             )
 
-    for idx, node in enumerate(dag_nodes[:-1]):
-        next_node = dag_nodes[idx + 1]
+    for idx, node in enumerate(logical_tree_nodes[:-1]):
+        next_node = logical_tree_nodes[idx + 1]
         consumers = contracts.get(node, {}).get("CONSUMERS", "")
         consumer_nodes = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", consumers))
         if next_node not in consumer_nodes:
             issues.append(
                 f"WORKER_{worker_id}: node '{node}' CONSUMERS does not include "
-                f"next DAG node '{next_node}'."
+                f"next logical tree node '{next_node}'."
             )
 
     return issues
 
 
-def _extract_dag_nodes(text: str) -> List[str]:
+def _extract_logical_tree_nodes(text: str) -> List[str]:
     match = re.search(
-        r"TARGET_DAG:\s*(.*?)(?:\n\s*NODE_CONTRACTS\s*:|$)",
+        r"TARGET_LOGICAL_TREE:\s*(.*?)(?:\n\s*NODE_CONTRACTS\s*:|$)",
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )

@@ -12,16 +12,16 @@ SQL + DSN
   │
   ▼
 ┌──────────────────────────────┐
-│  Phase 1: Context Gathering  │  _parse_dag(), _get_explain(), plan_analyzer, pg_tuning
-│  SQL → QueryDag + EXPLAIN    │
+│  Phase 1: Context Gathering  │  _parse_logical_tree(), _get_explain(), plan_analyzer, pg_tuning
+│  SQL → logical tree + EXPLAIN│
 └──────────┬───────────────────┘
-           │  QueryDag, costs, explain_result
+           │  logical_tree, costs, explain_result
            ▼
 ┌──────────────────────────────┐
 │  Phase 2: Knowledge          │  TagRecommender, _load_engine_profile(), _load_constraint_files()
-│  Retrieval                   │
+│  Retrieval + Intelligence    │
 └──────────┬───────────────────┘
-           │  matched_examples, engine_profile, constraints, regression_warnings
+           │  matched_examples, intelligence_briefing_local/global, engine_profile, constraints, regression_warnings
            ▼
 ┌──────────────────────────────┐
 │  Phase 3: Prompt Generation  │  build_analyst_briefing_prompt(), build_worker_prompt()
@@ -53,6 +53,33 @@ SQL + DSN
 └──────────────────────────────┘
 ```
 
+### Intelligence Workflows (Product-Defining)
+
+#### A) PostgreSQL Scanner Intelligence Flow
+
+`scanner (plan_scanner.py)`  
+`-> blackboard/findings artifacts (scanner_knowledge/*)`  
+`-> algorithm + query-specific finding`  
+`-> analyst prompt section (plan_scanner_text / exploit algorithm context)`
+
+Contract:
+- Scanner outputs are evidence, not optional flavor text.
+- Prompt must include scanner-derived intelligence when available for PostgreSQL.
+- Missing scanner intelligence is an intelligence-gate failure for PostgreSQL optimization runs (unless explicit bootstrap override is enabled).
+
+#### B) Optimization Blackboard Intelligence Flow
+
+`optimization runs`  
+`-> optimization blackboard (build_blackboard.py)`  
+`-> findings/principles/anti-patterns`  
+`-> intelligence briefing (local + global)`  
+`-> prompt context + gold-example guidance`
+
+Contract:
+- Blackboard findings feed both local (query/run-adjacent) and global intelligence context.
+- Gold examples are selected with intelligence context, not in isolation.
+- Missing intelligence data is an intelligence-gate failure (unless explicit bootstrap override is enabled). No generic/synthetic fallback sections are allowed.
+
 **Orchestrators** (choose one):
 - `SwarmSession` — 4-worker fan-out + snipe refinement
 - `ExpertSession` — iterative analyst + worker with failure analysis (default)
@@ -63,22 +90,22 @@ SQL + DSN
 
 ## Phase 1: Context Gathering
 
-**Purpose:** Parse the input SQL into a DAG, run EXPLAIN, extract plan signals.
+**Purpose:** Parse the input SQL into a logical tree, run EXPLAIN, extract plan signals.
 
 | Field | Detail |
 |-------|--------|
 | CLI | `python3 -m qt_sql.plan_scanner`, `python3 -m qt_sql.scanner_knowledge.build_all` |
-| Entry Point | `Pipeline._parse_dag()` in `pipeline.py` |
+| Entry Point | `Pipeline._parse_logical_tree()` in `pipeline.py` |
 | Input | SQL text (`str`) + DSN (`str`) + dialect (`str`) |
-| Output | `QueryDag` + `costs: dict` + `explain_result: dict` |
-| Success Condition | DAG has >= 1 node; EXPLAIN returns valid plan or falls back gracefully |
+| Output | `logical_tree` + `costs: dict` + `explain_result: dict` |
+| Success Condition | logical tree has >= 1 node; EXPLAIN returns valid plan or falls back gracefully |
 | Failure Handling | If EXPLAIN ANALYZE fails, falls back to EXPLAIN (no ANALYZE). If that fails, uses heuristic cost splitting. Never blocks pipeline. |
 
 **Key Modules:**
 
 | Module | Responsibility |
 |--------|----------------|
-| `dag.py` | `DagBuilder` — parse SQL into `QueryDag` (nodes, edges, contracts). `CostAnalyzer` — assign cost percentages. |
+| `dag.py` | Query-structure parser/builder + `CostAnalyzer` — parse SQL into logical tree representation (nodes, edges, contracts) and assign cost percentages. |
 | `plan_analyzer.py` | `analyze_plan_for_optimization()` — extract `OptimizationContext` (table scans, joins, CTE flows, bottlenecks) from EXPLAIN JSON. |
 | `pg_tuning.py` | `PGSystemProfile`, `load_or_collect_profile()`, `build_resource_envelope()` — PostgreSQL system introspection, cached to disk. |
 | `plan_scanner.py` | Three-layer plan-space scanner (hint scan, explore, knowledge) for PostgreSQL. |
@@ -88,8 +115,8 @@ SQL + DSN
 
 | Struct | Location | Key Fields |
 |--------|----------|------------|
-| `QueryDag` | `dag.py` | `nodes: Dict[str, DagNode]`, `edges`, `original_sql` |
-| `DagNode` | `dag.py` | `node_id`, `node_type` (cte/main/subquery), `sql`, `tables`, `refs`, `flags`, `contract`, `cost` |
+| `logical_tree` | `dag.py` | `nodes`, `edges`, `original_sql` |
+| `logical_tree node` | `dag.py` | `node_id`, `node_type` (cte/main/subquery), `sql`, `tables`, `refs`, `flags`, `contract`, `cost` |
 | `NodeContract` | `dag.py` | `output_columns`, `grain`, `required_predicates` |
 | `OptimizationContext` | `plan_analyzer.py` | `table_scans`, `joins`, `cte_flows`, `bottleneck_operators` |
 
@@ -99,16 +126,16 @@ SQL + DSN
 
 ## Phase 2: Knowledge Retrieval
 
-**Purpose:** Find relevant gold examples, load engine profiles, constraints, and regression warnings.
+**Purpose:** Find relevant gold examples and assemble intelligence briefing context (local + global), plus engine profiles, constraints, and regression warnings.
 
 | Field | Detail |
 |-------|--------|
 | CLI | `python3 -m qt_sql.tag_index [--stats\|--rebuild]` |
 | Entry Point | `Pipeline._find_examples()` in `pipeline.py`, `TagRecommender.find_similar_examples()` in `knowledge.py` |
 | Input | SQL text + dialect |
-| Output | `matched_examples: list[dict]`, `engine_profile: dict`, `constraints: list[dict]`, `regression_warnings: list[dict]` |
-| Success Condition | >= 1 example returned; engine profile loaded for dialect |
-| Failure Handling | If tag index missing, falls back to loading all local examples. Missing engine profile logs warning, does not block. |
+| Output | `matched_examples: list[dict]`, `global_knowledge/intelligence_briefing_global`, `plan_scanner_text/intelligence_briefing_local` (PG), `engine_profile: dict`, `constraints: list[dict]`, `regression_warnings: list[dict]` |
+| Success Condition | >= 1 example returned; local + global intelligence briefings are loaded; for PG, scanner intelligence + exploit algorithm are loaded; engine profile loaded for dialect |
+| Failure Handling | Missing required intelligence inputs triggers hard failure via intelligence gates. Optional bootstrap override (`QT_ALLOW_INTELLIGENCE_BOOTSTRAP=1`) may downgrade to warning for controlled bootstrap/debug runs only. |
 
 **Key Modules:**
 
@@ -117,7 +144,7 @@ SQL + DSN
 | `knowledge.py` | `TagRecommender` — tag-based similarity matching from `models/similarity_tags.json`. |
 | `tag_index.py` | `SQLNormalizer`, tag extraction, index builder. CLI: `python3 -m qt_sql.tag_index`. |
 | `node_prompter.py` | `_load_engine_profile()`, `_load_constraint_files()`, `load_exploit_algorithm()` — load JSON profiles and constraints. |
-| `models/similarity_tags.json` | Tag index (108 examples: 29 DuckDB + 5 PG + 74 DSB catalog rules). |
+| `models/similarity_tags.json` | Tag index for similarity matching (exact counts vary as the catalog evolves). |
 
 **Data Files:**
 
@@ -132,16 +159,16 @@ SQL + DSN
 
 ## Phase 3: Prompt Generation
 
-**Purpose:** Assemble structured prompts for the analyst and workers from Phase 1+2 outputs.
+**Purpose:** Assemble structured prompts for the analyst and workers from Phase 1+2 outputs, including intelligence briefings (local + global).
 
 | Field | Detail |
 |-------|--------|
 | CLI | `python3 -m qt_sql.prompts.samples.generate_sample` |
 | Entry Point | `build_analyst_briefing_prompt()` in `prompts/analyst_briefing.py`, `build_worker_prompt()` in `prompts/worker.py`, `build_sniper_prompt()` in `prompts/swarm_snipe.py` |
-| Input | Phase 1+2 context dict (from `Pipeline.gather_analyst_context()`), mode, worker assignments |
+| Input | Phase 1+2 context dict (from `Pipeline.gather_analyst_context()`): logical tree/EXPLAIN + matched examples + intelligence briefing local/global + constraints/profiles; mode; worker assignments |
 | Output | Prompt text(s) — one analyst prompt + one per worker |
-| Success Condition | All required sections present (semantic contract, target DAG, examples, DAP output format) |
-| Failure Handling | Missing optional sections (plan scanner, semantic intents) are omitted gracefully. Missing required sections raise errors. |
+| Success Condition | All required sections present (semantic contract, target logical tree, examples, DAP output format) |
+| Failure Handling | Missing required intelligence or required analyst briefing sections is a hard failure (no synthetic fallback briefing generation). |
 
 **Key Modules:**
 
@@ -153,7 +180,7 @@ SQL + DSN
 | `prompts/swarm_fan_out.py` | `build_fan_out_prompt()` — legacy fan-out prompt (pre-briefing). |
 | `prompts/swarm_parsers.py` | `parse_briefing_response()` → `ParsedBriefing`, `parse_snipe_response()` → `SnipeAnalysis`, `parse_oneshot_response()` → `OneshotResult`. |
 | `prompts/briefing_checks.py` | Section checklists for prompt validation — `build_analyst_section_checklist()`, `validate_parsed_briefing()`. |
-| `prompts/dag_helpers.py` | DAG formatting utilities for prompt text. |
+| `prompts/dag_helpers.py` | Logical-tree formatting utilities for prompt text. |
 | `prompts/pg_tuner.py` | PostgreSQL tuning prompt builder. |
 | `prompts/swarm_common.py` | `build_worker_strategy_header()` — shared strategy text. |
 
@@ -245,7 +272,7 @@ SQL + DSN
 | Entry Point | `Validator.validate()` in `validate.py` |
 | Input | Original SQL + candidate SQL + executor (DSN) |
 | Output | `ValidationResult` (`status`, `speedup`, `error_category`) |
-| Success Condition | sqlglot gate passes; row counts match; checksums match (DuckDB); timing shows improvement |
+| Success Condition | sqlglot gate passes; row counts match; checksums match (DuckDB). Performance is measured and classified separately (WIN/IMPROVED/NEUTRAL/REGRESSION). |
 | Failure Handling | Returns structured `ValidationResult` with `ValidationStatus.ERROR` or `.FAIL`, `errors` list, and `error_category`. |
 
 **Speedup Thresholds:**
@@ -358,7 +385,7 @@ PYTHONPATH=packages/qt-shared:packages/qt-sql:.
 
 | Module | Phase(s) | Primary Responsibility |
 |--------|----------|----------------------|
-| `dag.py` | 1 | SQL → QueryDag parsing, cost analysis |
+| `dag.py` | 1 | SQL → logical tree parsing, cost analysis |
 | `plan_analyzer.py` | 1 | EXPLAIN plan → OptimizationContext |
 | `pg_tuning.py` | 1 | PostgreSQL system introspection |
 | `plan_scanner.py` | 1 | Three-layer plan-space scanner (PG) |
@@ -403,6 +430,6 @@ PYTHONPATH=packages/qt-shared:packages/qt-sql:.
 
 3. **Cost-rank pre-screening** — `cost_rank_candidates()` uses EXPLAIN cost estimates for DuckDB only. PG pre-screening is not implemented.
 
-4. **Prompt section validation** — `briefing_checks.py` validates presence of sections but not semantic correctness of their content.
+4. **Bootstrap override risk** — `QT_ALLOW_INTELLIGENCE_BOOTSTRAP=1` intentionally bypasses intelligence hard gates for bootstrap/debug runs. This must stay off for performance-critical or SOTA claims.
 
 5. **Timeout baseline handling** — When the original query times out (PG), baseline is set to the timeout ceiling. This can inflate speedup ratios for queries that were previously timing out.

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from .dag_helpers import append_dag_summary
+from .dag_helpers import append_logical_tree_summary
 
 
 def build_fan_out_prompt(
@@ -26,7 +26,7 @@ def build_fan_out_prompt(
     Args:
         query_id: Query identifier
         sql: The SQL query to optimize
-        dag: Parsed DAG from Phase 1
+        dag: Parsed logical tree from Phase 1
         costs: Per-node cost analysis
         matched_examples: Top matched examples (by tag similarity)
         all_available_examples: Full catalog of gold examples (id + description)
@@ -61,10 +61,10 @@ def build_fan_out_prompt(
     lines.append("```")
     lines.append("")
 
-    # DAG structure with costs
-    lines.append("## DAG Structure & Bottlenecks")
+    # Logical tree structure with costs
+    lines.append("## Logical Tree Structure & Bottlenecks")
     lines.append("")
-    append_dag_summary(lines, dag, costs, include_operations=True)
+    append_logical_tree_summary(lines, dag, costs, include_operations=True)
     lines.append("")
 
     # Matched examples (top N by tag similarity)
@@ -155,5 +155,4 @@ def build_fan_out_prompt(
     lines.append("```")
 
     return "\n".join(lines)
-
 

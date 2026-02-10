@@ -1,4 +1,4 @@
-You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target DAG structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
 
 DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
 
@@ -6,11 +6,11 @@ DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced
 
 This query counts store sales by 8 consecutive half-hour time windows (8:30-12:30) at store 'ese' for households matching 3 specific (hd_dep_count, hd_vehicle_count) conditions. Returns a single row with 8 COUNT columns. The 8 subqueries are independent — same fact table, same dim filters, different time_dim conditions. Cross-join semantics: each count is independent.
 
-## Target DAG + Node Contracts
+## Target Logical Tree + Node Contracts
 
 Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
 
-TARGET_DAG:
+TARGET_LOGICAL_TREE:
   filtered_store -> sales_with_time
   filtered_hd -> sales_with_time
   time_ranges -> sales_with_time -> final_counts
@@ -419,7 +419,7 @@ from
 
 ## Rewrite Checklist (must pass before final SQL)
 
-- Follow every node in `TARGET_DAG` and produce each `NODE_CONTRACT` output column exactly.
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
 - Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
 - Preserve all literals and the exact final output schema/order.
 - Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.

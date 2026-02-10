@@ -170,7 +170,7 @@ class TestStep2AnalystPrompt:
 
     def test_has_dag_structure(self, artifacts):
         prompt = artifacts["02_analyst_prompt.txt"]
-        assert "## Query Structure (DAG)" in prompt
+        assert "## Query Structure (Logical Tree)" in prompt
 
     def test_dag_has_nodes(self, artifacts):
         prompt = artifacts["02_analyst_prompt.txt"]
@@ -302,7 +302,7 @@ class TestStep5RewritePrompt:
 
     def test_has_dag_structure(self, artifacts):
         prompt = artifacts["05_rewrite_prompt.txt"]
-        assert "## Query Structure (DAG)" in prompt
+        assert "## Query Structure (Logical Tree)" in prompt
 
     def test_has_optimization_history(self, artifacts):
         """Critical: rewrite prompt must include history."""
@@ -527,10 +527,10 @@ class TestPromptBuildersUseHistory:
 
     @pytest.fixture
     def simple_dag(self):
-        """Build a minimal DAG from Q51."""
-        from qt_sql.dag import DagBuilder, CostAnalyzer
+        """Build a minimal logical tree from Q51."""
+        from qt_sql.dag import LogicalTreeBuilder, CostAnalyzer
         sql = "SELECT 1 AS x"
-        dag = DagBuilder(sql, dialect="duckdb").build()
+        dag = LogicalTreeBuilder(sql, dialect="duckdb").build()
         costs = CostAnalyzer(dag).analyze()
         return dag, costs
 
@@ -650,7 +650,7 @@ class TestPipelineHistoryWiring:
             "promotion": None,
         }
         pipeline = self._make_pipeline(use_analyst=True)
-        pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
+        pipeline._parse_logical_tree = MagicMock(return_value=(MagicMock(), {}, None))
         pipeline._find_examples = MagicMock(return_value=[{"id": "deferred_window_aggregation"}])
         pipeline._find_regression_warnings = MagicMock(return_value=[])
         pipeline._run_analyst = MagicMock(
@@ -689,7 +689,7 @@ class TestPipelineHistoryWiring:
             "promotion": None,
         }
         pipeline = self._make_pipeline(use_analyst=False)
-        pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
+        pipeline._parse_logical_tree = MagicMock(return_value=(MagicMock(), {}, None))
         pipeline._find_examples = MagicMock(return_value=[{"id": "early_filter"}])
         pipeline._find_regression_warnings = MagicMock(return_value=[])
         pipeline._run_analyst = MagicMock()
@@ -714,7 +714,7 @@ class TestPipelineHistoryWiring:
         from qt_sql.pipeline import Pipeline
 
         pipeline = self._make_pipeline(use_analyst=False)
-        pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
+        pipeline._parse_logical_tree = MagicMock(return_value=(MagicMock(), {}, None))
         pipeline._find_examples = MagicMock(return_value=[])
         pipeline._find_regression_warnings = MagicMock(return_value=[])
 
@@ -745,7 +745,7 @@ class TestPipelineHistoryWiring:
         from qt_sql.pipeline import Pipeline
 
         pipeline = self._make_pipeline(use_analyst=False)
-        pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
+        pipeline._parse_logical_tree = MagicMock(return_value=(MagicMock(), {}, None))
         pipeline._find_examples = MagicMock(return_value=[])
         pipeline._find_regression_warnings = MagicMock(return_value=[])
 
@@ -772,7 +772,7 @@ class TestPipelineHistoryWiring:
         from unittest.mock import PropertyMock
 
         pipeline = self._make_pipeline(use_analyst=True)
-        pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
+        pipeline._parse_logical_tree = MagicMock(return_value=(MagicMock(), {}, None))
         pipeline._find_examples = MagicMock(return_value=[])
         pipeline._find_regression_warnings = MagicMock(return_value=[])
         pipeline._run_analyst = MagicMock(return_value=(None, None, None, []))
@@ -809,7 +809,7 @@ class TestPipelineHistoryWiring:
         from qt_sql.analyst_session import AnalystSession
 
         pipeline = self._make_pipeline(use_analyst=True)
-        pipeline._parse_dag = MagicMock(return_value=(MagicMock(), {}, None))
+        pipeline._parse_logical_tree = MagicMock(return_value=(MagicMock(), {}, None))
         pipeline._find_examples = MagicMock(return_value=[])
         pipeline._find_regression_warnings = MagicMock(return_value=[])
         pipeline._run_analyst = MagicMock(return_value=(None, None, None, []))

@@ -70,8 +70,8 @@ def load_explain_plan(query_id: str) -> Optional[str]:
 
 def parse_dag(sql: str, explain_plan_text: Optional[str] = None):
     try:
-        from qt_sql.dag import DagBuilder, CostAnalyzer
-        builder = DagBuilder(sql, dialect="duckdb")
+        from qt_sql.dag import LogicalTreeBuilder, CostAnalyzer
+        builder = LogicalTreeBuilder(sql, dialect="duckdb")
         dag = builder.build()
 
         plan_context = None
@@ -89,10 +89,10 @@ def parse_dag(sql: str, explain_plan_text: Optional[str] = None):
         analyzer = CostAnalyzer(dag, plan_context)
         costs = analyzer.analyze()
         nonzero = sum(1 for c in costs.values() if c.cost_pct > 0)
-        print(f"Parsed DAG: {len(dag.nodes)} nodes, {nonzero} with cost > 0%")
+        print(f"Parsed logical tree: {len(dag.nodes)} nodes, {nonzero} with cost > 0%")
         return dag, costs
     except Exception as e:
-        print(f"DAG parsing failed ({e}), using stub")
+        print(f"Logical-tree parsing failed ({e}), using stub")
         from types import SimpleNamespace
         return SimpleNamespace(nodes={}, edges=[]), {}
 
@@ -445,8 +445,8 @@ def build_q88_mock_briefing(ctx: PromptContext):
     worker = BriefingWorker(
         worker_id=2,
         strategy="moderate_dimension_isolation + single_pass_aggregation",
-        target_dag=(
-            "TARGET_DAG:\n"
+        target_logical_tree=(
+            "TARGET_LOGICAL_TREE:\n"
             "  filtered_store -> sales_with_time\n"
             "  filtered_hd -> sales_with_time\n"
             "  time_ranges -> sales_with_time -> final_counts\n\n"
@@ -604,7 +604,7 @@ def generate_oneshot_script(out_dir: Path, script_path: str) -> None:
 
     parser = ScriptParser(sql_script, dialect="duckdb")
     script_dag = parser.parse()
-    print(f"ScriptDAG: {len(script_dag.statements)} statements, "
+    print(f"Script dependency graph: {len(script_dag.statements)} statements, "
           f"{len(script_dag.optimization_targets())} optimization targets")
 
     engine_profile = load_engine_profile("duckdb")

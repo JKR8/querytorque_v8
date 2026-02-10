@@ -47,21 +47,21 @@ logger.info("ITERATIVE TEST: Feeding 1.85x winner back as input")
 logger.info("Stops at prompt — review before continuing")
 logger.info("="*60)
 
-# ── Parse DAG from OPTIMIZED input ─────────────────────────────
+# ── Parse logical tree from OPTIMIZED input ─────────────────────────────
 explain = json.loads((BENCHMARK_DIR / "explains" / f"{QUERY_ID}.json").read_text())
 
-from qt_sql.optimization.dag_v2 import DagBuilder, CostAnalyzer
+from qt_sql.optimization.dag_v2 import LogicalTreeBuilder, CostAnalyzer
 from qt_sql.optimization.plan_analyzer import analyze_plan_for_optimization
 
-dag = DagBuilder(optimized_input_sql, dialect=DIALECT).build()
+dag = LogicalTreeBuilder(optimized_input_sql, dialect=DIALECT).build()
 try:
     ctx = analyze_plan_for_optimization(explain["plan_json"], optimized_input_sql)
     costs = CostAnalyzer(dag, plan_context=ctx).analyze()
 except Exception as e:
-    logger.warning(f"Cost analysis on optimized SQL failed ({e}), using DAG-only costs")
+    logger.warning(f"Cost analysis on optimized SQL failed ({e}), using logical-tree-only costs")
     costs = CostAnalyzer(dag).analyze()
 
-logger.info(f"DAG nodes: {len(dag.nodes) if hasattr(dag, 'nodes') else '?'}")
+logger.info(f"logical tree nodes: {len(dag.nodes) if hasattr(dag, 'nodes') else '?'}")
 logger.info(f"Costs: {str(costs)[:500]}")
 
 # ── FAISS examples ─────────────────────────────────────────────

@@ -1,4 +1,4 @@
-"""ADO runner — delegates to the 5-phase DAG Pipeline.
+"""ADO runner — delegates to the 5-phase logical-tree pipeline.
 
 Usage:
     from qt_sql.runner import ADORunner, ADOConfig
@@ -53,7 +53,7 @@ class ADORunner:
     """Run the ADO optimization pipeline.
 
     Thin wrapper around Pipeline that provides a simplified interface.
-    All optimization flows through the 5-phase DAG pipeline:
+    All optimization flows through the 5-phase logical-tree pipeline:
     1. Parse → 2. FAISS → 3. Rewrite → 4. Syntax Gate → 5. Validate
     """
 

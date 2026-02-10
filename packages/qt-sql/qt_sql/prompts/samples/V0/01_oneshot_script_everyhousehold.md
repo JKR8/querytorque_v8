@@ -1295,7 +1295,7 @@ AND b.row_num =1;
 
 ## Your Analysis Steps
 
-1. **TRACE DATA FLOW**: Follow the pipeline DAG from base tables to final outputs.
+1. **TRACE DATA FLOW**: Follow the pipeline dependency graph from base tables to final outputs.
 2. **IDENTIFY FILTER BOUNDARIES**: Where do filters first appear? Can they be pushed earlier in the chain?
 3. **MAP BASE TABLE SCANS**: Which base tables are scanned by multiple stages? Can scans be consolidated?
 4. **CHECK MATERIALIZATION NECESSITY**: Does each temp table NEED to be materialized, or could it be inlined as a CTE?

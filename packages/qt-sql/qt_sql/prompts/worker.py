@@ -1,9 +1,9 @@
 """Worker prompt builder — focused SQL generator from analyst briefing.
 
 Workers receive a precise specification from the analyst briefing:
-  [1] Role + dialect (short, mechanical — worker follows the DAG)
+  [1] Role + dialect (short, mechanical — worker follows the logical tree)
   [2] SEMANTIC CONTRACT (primacy — frames what MUST be preserved)
-  [3] TARGET DAG + NODE CONTRACTS (what to produce — the blueprint)
+  [3] TARGET LOGICAL TREE + NODE CONTRACTS (what to produce — the blueprint)
   [4] HAZARD FLAGS (what to avoid — before they start writing)
   [4b] REGRESSION WARNINGS (observed failures on similar queries)
   [5] ACTIVE CONSTRAINTS (rules that apply — analyst-filtered 3-6)
@@ -66,7 +66,7 @@ def build_worker_prompt(
 
     sections.append(
         f"You are a SQL rewrite engine for {engine}{ver}. "
-        f"Follow the Target DAG structure below. Your job is to write correct, "
+        f"Follow the Target Logical Tree structure below. Your job is to write correct, "
         f"executable SQL for each node — not to decide whether to restructure. "
         f"Preserve exact semantic equivalence (same rows, same columns, same ordering). "
         f"Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END "
@@ -92,14 +92,14 @@ def build_worker_prompt(
             + shared_briefing.semantic_contract
         )
 
-    # ── [3] TARGET DAG + NODE CONTRACTS ──────────────────────────────────
-    if worker_briefing.target_dag:
+    # ── [3] TARGET LOGICAL TREE + NODE CONTRACTS ─────────────────────────
+    if worker_briefing.target_logical_tree:
         sections.append(
-            "## Target DAG + Node Contracts\n\n"
+            "## Target Logical Tree + Node Contracts\n\n"
             "Build your rewrite following this CTE structure. Each node's "
             "OUTPUT list is exhaustive — your SQL must produce exactly those "
             "columns.\n\n"
-            + worker_briefing.target_dag
+            + worker_briefing.target_logical_tree
         )
 
     # ── [4] HAZARD FLAGS ─────────────────────────────────────────────────

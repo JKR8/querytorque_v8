@@ -1,11 +1,11 @@
 """Oneshot optimization session — single LLM call produces rewrite directly.
 
 The analyst prompt in oneshot mode asks the LLM to analyze AND rewrite in one
-shot (no separate worker step). Output uses the same JSON DAG rewrite_sets
+shot (no separate worker step). Output uses the same JSON rewrite_sets
 format as worker prompts — parsed by SQLRewriter.apply_response().
 
 Flow per iteration:
-1. Parse DAG + gather context (same as expert/swarm)
+1. Parse logical tree + gather context (same as expert/swarm)
 2. build_analyst_briefing_prompt(mode="oneshot") → LLM call
 3. SQLRewriter.apply_response() → extract per-node SQL + transforms
 4. Syntax check → validate → failure analysis if needed → iterate
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class OneshotSession(OptimizationSession):
-    """Single-LLM-call optimization: analyst produces JSON DAG rewrite directly."""
+    """Single-LLM-call optimization: analyst produces JSON rewrite directly."""
 
     def run(self) -> SessionResult:
         """Run oneshot optimization with optional iteration on failure."""
@@ -50,8 +50,8 @@ class OneshotSession(OptimizationSession):
         for i in range(self.max_iterations):
             logger.info(f"[{self.query_id}] Oneshot iteration {i + 1}/{self.max_iterations}")
 
-            # Phase 1: Parse DAG
-            dag, costs, _explain = self.pipeline._parse_dag(
+            # Phase 1: Parse logical tree
+            dag, costs, _explain = self.pipeline._parse_logical_tree(
                 self.original_sql, dialect=self.dialect, query_id=self.query_id,
             )
 
@@ -87,7 +87,7 @@ class OneshotSession(OptimizationSession):
                 mode="oneshot",
             )
 
-            # Phase 4: LLM call + JSON DAG parsing via generate_one()
+            # Phase 4: LLM call + JSON rewrite parsing via generate_one()
             from ..generate import CandidateGenerator
             generator = CandidateGenerator(
                 provider=self.pipeline.provider,

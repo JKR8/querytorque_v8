@@ -1,4 +1,4 @@
-"""Tests for DAG v2 RewriteAssembler.
+"""Tests for logical tree v2 RewriteAssembler.
 
 Tests that the assembler correctly handles:
 1. New CTEs added by LLM rewrites
@@ -10,7 +10,7 @@ Tests that the assembler correctly handles:
 
 import pytest
 from qt_sql.dag import (
-    DagBuilder,
+    LogicalTreeBuilder,
     RewriteAssembler,
     RewriteSet,
 )
@@ -20,7 +20,7 @@ class TestRewriteAssemblerNewCTEs:
     """Test that assembler handles new CTEs added by LLM."""
 
     def test_new_ctes_added(self):
-        """Rewrite adds new CTEs not in original DAG."""
+        """Rewrite adds new CTEs not in original logical tree."""
         # Original SQL with one CTE
         original_sql = """
         WITH customer_total_return AS (
@@ -35,8 +35,8 @@ class TestRewriteAssemblerNewCTEs:
         WHERE ctr1.ctr_customer_sk = c_customer_sk
         """
 
-        # Build DAG
-        dag = DagBuilder(original_sql).build()
+        # Build logical tree
+        dag = LogicalTreeBuilder(original_sql).build()
         assembler = RewriteAssembler(dag)
 
         # Rewrite adds TWO new CTEs: filtered_returns, store_avg_return
@@ -68,7 +68,7 @@ class TestRewriteAssemblerNewCTEs:
         SELECT * FROM base
         """
 
-        dag = DagBuilder(original_sql).build()
+        dag = LogicalTreeBuilder(original_sql).build()
         assembler = RewriteAssembler(dag)
 
         # Create chain: level1 -> level2 -> level3
@@ -107,7 +107,7 @@ class TestRewriteAssemblerEdgeCases:
         SELECT * FROM base
         """
 
-        dag = DagBuilder(original_sql).build()
+        dag = LogicalTreeBuilder(original_sql).build()
         assembler = RewriteAssembler(dag)
 
         # LLM returns complete SQL with WITH in main_query
@@ -135,7 +135,7 @@ class TestRewriteAssemblerEdgeCases:
         SELECT * FROM base
         """
 
-        dag = DagBuilder(original_sql).build()
+        dag = LogicalTreeBuilder(original_sql).build()
         assembler = RewriteAssembler(dag)
 
         rewrite_set = RewriteSet(
@@ -159,7 +159,7 @@ class TestRewriteAssemblerEdgeCases:
         SELECT * FROM cte1, cte2
         """
 
-        dag = DagBuilder(original_sql).build()
+        dag = LogicalTreeBuilder(original_sql).build()
         assembler = RewriteAssembler(dag)
 
         # Only rewrite cte1, keep cte2
@@ -188,7 +188,7 @@ class TestRewriteAssemblerEdgeCases:
         SELECT * FROM base
         """
 
-        dag = DagBuilder(original_sql).build()
+        dag = LogicalTreeBuilder(original_sql).build()
         assembler = RewriteAssembler(dag)
 
         # LLM erroneously includes WITH in CTE body
@@ -215,7 +215,7 @@ class TestDependencyGraph:
     def test_build_dependency_graph_simple(self):
         """Test simple dependency detection."""
         original_sql = "SELECT 1"
-        dag = DagBuilder(original_sql).build()
+        dag = LogicalTreeBuilder(original_sql).build()
         assembler = RewriteAssembler(dag)
 
         cte_nodes = {
@@ -233,7 +233,7 @@ class TestDependencyGraph:
     def test_build_dependency_graph_multiple_deps(self):
         """Test CTE with multiple dependencies."""
         original_sql = "SELECT 1"
-        dag = DagBuilder(original_sql).build()
+        dag = LogicalTreeBuilder(original_sql).build()
         assembler = RewriteAssembler(dag)
 
         cte_nodes = {
@@ -251,7 +251,7 @@ class TestDependencyGraph:
     def test_topological_sort_simple(self):
         """Test topological sort produces correct order."""
         original_sql = "SELECT 1"
-        dag = DagBuilder(original_sql).build()
+        dag = LogicalTreeBuilder(original_sql).build()
         assembler = RewriteAssembler(dag)
 
         deps = {
@@ -269,7 +269,7 @@ class TestDependencyGraph:
     def test_topological_sort_handles_cycle(self):
         """Topological sort should handle cycles gracefully (not infinite loop)."""
         original_sql = "SELECT 1"
-        dag = DagBuilder(original_sql).build()
+        dag = LogicalTreeBuilder(original_sql).build()
         assembler = RewriteAssembler(dag)
 
         # Cycle: a -> b -> c -> a
@@ -291,7 +291,7 @@ class TestDependencyGraph:
         'store' should not match 'store_returns'.
         """
         original_sql = "SELECT 1"
-        dag = DagBuilder(original_sql).build()
+        dag = LogicalTreeBuilder(original_sql).build()
         assembler = RewriteAssembler(dag)
 
         cte_nodes = {

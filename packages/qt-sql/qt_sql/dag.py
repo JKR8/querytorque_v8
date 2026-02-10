@@ -1,7 +1,7 @@
 """
-DAG v2 SQL Optimizer
+Logical Tree v2 SQL Optimizer
 
-Data structures, DAG builder, cost analyzer, and rewrite assembler.
+Data structures, Logical Tree builder, cost analyzer, and rewrite assembler.
 """
 
 import json
@@ -19,7 +19,7 @@ from sqlglot import exp
 
 @dataclass
 class NodeContract:
-    """Contract for a DAG node - what it promises to provide."""
+    """Contract for a Logical Tree node - what it promises to provide."""
     node_id: str
     output_columns: List[str]  # Column names this node outputs
     grain: List[str]  # Grouping keys (empty if not aggregated)
@@ -59,8 +59,8 @@ class RewriteSet:
 
 
 @dataclass
-class DagNode:
-    """A node in the query DAG."""
+class LogicalTreeNode:
+    """A node in the query Logical Tree."""
     node_id: str
     node_type: str  # cte, main, subquery
     sql: str
@@ -73,19 +73,19 @@ class DagNode:
 
 
 @dataclass
-class QueryDag:
-    """Complete DAG representation of a query."""
-    nodes: Dict[str, DagNode]
+class QueryLogicalTree:
+    """Complete Logical Tree representation of a query."""
+    nodes: Dict[str, LogicalTreeNode]
     edges: List[Tuple[str, str]]  # (from_node, to_node)
     original_sql: str
 
 
 # ============================================================
-# DAG Builder - Parse SQL into DAG structure
+# Logical Tree Builder - Parse SQL into Logical Tree structure
 # ============================================================
 
-class DagBuilder:
-    """Build a DAG from SQL query."""
+class LogicalTreeBuilder:
+    """Build a Logical Tree from SQL query."""
 
     ALLOWED_TRANSFORMS = [
         "pushdown",             # Push filters into CTEs/subqueries
@@ -105,11 +105,11 @@ class DagBuilder:
     def __init__(self, sql: str, dialect: str = "duckdb"):
         self.sql = sql
         self.dialect = dialect
-        self.nodes: Dict[str, DagNode] = {}
+        self.nodes: Dict[str, LogicalTreeNode] = {}
         self.edges: List[Tuple[str, str]] = []
 
-    def build(self) -> QueryDag:
-        """Parse SQL and build DAG."""
+    def build(self) -> QueryLogicalTree:
+        """Parse SQL and build Logical Tree."""
         try:
             parsed = sqlglot.parse_one(self.sql, dialect=self.dialect)
         except Exception:
@@ -130,14 +130,14 @@ class DagBuilder:
         self._compute_contracts()
         self._compute_usage()
 
-        return QueryDag(
+        return QueryLogicalTree(
             nodes=self.nodes,
             edges=self.edges,
             original_sql=self.sql
         )
 
     def _add_cte_node(self, cte: exp.CTE):
-        """Add a CTE as a DAG node."""
+        """Add a CTE as a Logical Tree node."""
         node_id = str(cte.alias) if cte.alias else "unnamed_cte"
         inner = cte.this
 
@@ -152,7 +152,7 @@ class DagBuilder:
         if inner and inner.find(exp.Union):
             flags.append("UNION_ALL")
 
-        self.nodes[node_id] = DagNode(
+        self.nodes[node_id] = LogicalTreeNode(
             node_id=node_id,
             node_type="cte",
             sql=inner.sql(dialect=self.dialect) if inner else "",
@@ -162,7 +162,7 @@ class DagBuilder:
         )
 
     def _add_main_query(self, parsed: exp.Expression):
-        """Add main SELECT as a DAG node."""
+        """Add main SELECT as a Logical Tree node."""
         # If parsed is a WITH expression, get the final expression
         if isinstance(parsed, exp.With):
             main_select = parsed.this
@@ -220,7 +220,7 @@ class DagBuilder:
             # Fallback if AST manipulation fails
             main_sql = main_select.sql(dialect=self.dialect)
 
-        self.nodes["main_query"] = DagNode(
+        self.nodes["main_query"] = LogicalTreeNode(
             node_id="main_query",
             node_type="main",
             sql=main_sql,
@@ -379,20 +379,20 @@ class DagBuilder:
 # ============================================================
 
 class CostAnalyzer:
-    """Analyze execution plan and attribute costs to DAG nodes."""
+    """Analyze execution plan and attribute costs to Logical Tree nodes."""
 
-    def __init__(self, dag: QueryDag, plan_context: Optional[Any] = None):
+    def __init__(self, dag: QueryLogicalTree, plan_context: Optional[Any] = None):
         """Initialize cost analyzer.
 
         Args:
-            dag: Query DAG
+            dag: Query Logical Tree
             plan_context: OptimizationContext from plan_analyzer (optional)
         """
         self.dag = dag
         self.plan_context = plan_context
 
     def analyze(self) -> Dict[str, NodeCost]:
-        """Attribute plan costs to DAG nodes."""
+        """Attribute plan costs to Logical Tree nodes."""
         costs = {}
 
         # If no plan context, use heuristics based on tables
@@ -489,7 +489,7 @@ class CostAnalyzer:
 
         return costs
 
-    def _operator_belongs_to_node(self, op_name: str, node: DagNode, node_scan_ops: List[str]) -> bool:
+    def _operator_belongs_to_node(self, op_name: str, node: LogicalTreeNode, node_scan_ops: List[str]) -> bool:
         """Check if operator belongs to a node."""
         op_upper = op_name.upper()
 
@@ -512,7 +512,7 @@ class CostAnalyzer:
 
         return False
 
-    def _get_heuristic_operators(self, node: DagNode) -> List[str]:
+    def _get_heuristic_operators(self, node: LogicalTreeNode) -> List[str]:
         """Get heuristic operators when no plan available."""
         ops = []
         if "GROUP_BY" in node.flags:
@@ -523,11 +523,11 @@ class CostAnalyzer:
             ops.extend([f"SEQ_SCAN[{t}]" for t in node.tables[:3]])
         return ops
 
-    def _has_filter(self, node: DagNode) -> bool:
+    def _has_filter(self, node: LogicalTreeNode) -> bool:
         """Check if node has WHERE filters."""
         return "WHERE" in node.sql.upper()
 
-    def _get_join_type(self, node: DagNode) -> Optional[str]:
+    def _get_join_type(self, node: LogicalTreeNode) -> Optional[str]:
         """Get join type used in node."""
         if "JOIN" in node.sql.upper():
             return "hash"
@@ -541,7 +541,7 @@ class CostAnalyzer:
 class RewriteAssembler:
     """Apply rewrite sets to produce optimized SQL."""
 
-    def __init__(self, dag: QueryDag, dialect: str = "duckdb"):
+    def __init__(self, dag: QueryLogicalTree, dialect: str = "duckdb"):
         self.dag = dag
         self.dialect = dialect
 

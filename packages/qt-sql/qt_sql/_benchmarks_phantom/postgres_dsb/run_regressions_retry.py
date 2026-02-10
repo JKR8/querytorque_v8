@@ -110,8 +110,8 @@ def generate_candidates(query_id: str, sql: str) -> list[dict]:
     dialect = "postgres"
     engine = "postgresql"
 
-    print(f"  [{query_id}] PARSE: Building DAG...", flush=True)
-    dag, costs, _explain = pipeline._parse_dag(sql, dialect=dialect, query_id=query_id)
+    print(f"  [{query_id}] PARSE: Building logical tree...", flush=True)
+    dag, costs, _explain = pipeline._parse_logical_tree(sql, dialect=dialect, query_id=query_id)
     print(f"  [{query_id}] PARSE: done", flush=True)
 
     # Gather data

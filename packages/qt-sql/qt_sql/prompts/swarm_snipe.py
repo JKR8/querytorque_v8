@@ -138,7 +138,7 @@ def build_snipe_analyst_prompt(
         original_sql: The original SQL query
         worker_results: ALL results from previous iterations
         target_speedup: Target speedup ratio
-        dag: Parsed DAG
+        dag: Parsed logical tree
         costs: Per-node cost analysis
         explain_plan_text: EXPLAIN ANALYZE plan text (may be None)
         engine_profile: Engine profile JSON with optimizer strengths/gaps
@@ -219,7 +219,7 @@ def build_snipe_analyst_prompt(
         lines.append("```")
         lines.append("")
 
-    # ── 6. Query Structure (Logic Tree + DAG details) ───────────────────
+    # ── 6. Query Structure (Logic Tree + node details) ──────────────────
     from ..logic_tree import build_logic_tree
     node_intents = _build_node_intent_map(semantic_intents)
     if semantic_intents:
@@ -406,7 +406,7 @@ def build_sniper_prompt(
         best_worker_sql: Full optimized SQL of the best result (if any > 1.0x)
         examples: Loaded gold examples (full before/after SQL)
         output_columns: Expected output columns for completeness contract
-        dag: Parsed DAG
+        dag: Parsed logical tree
         costs: Per-node cost analysis
         engine_profile: Engine profile JSON
         constraints: Correctness constraints
@@ -470,7 +470,7 @@ def build_sniper_prompt(
     sections.append(
         f"You are a senior SQL optimization architect for {engine}{ver}. "
         f"You have FULL FREEDOM to design your own approach — you are NOT "
-        f"constrained to any specific DAG topology or CTE structure. "
+        f"constrained to any specific logical tree topology or CTE structure. "
         f"The analyst's strategy guidance below is ADVISORY, not mandatory.\n\n"
         f"Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN "
         f"y/x END around a division, keep it — guards prevent silent breakage. "
@@ -619,7 +619,7 @@ def build_sniper_prompt(
     if dialect in ("postgres", "postgresql") and resource_envelope:
         sections.append(_section_set_local_config(resource_envelope))
 
-    # ── 17. Rewrite checklist (sniper-specific — no TARGET_DAG ref) ────
+    # ── 17. Rewrite checklist (sniper-specific — no TARGET_LOGICAL_TREE ref) ────
     sections.append(build_sniper_rewrite_checklist())
 
     # ── 18. Column completeness contract + output format ────────────────

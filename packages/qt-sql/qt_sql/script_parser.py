@@ -1,11 +1,11 @@
-"""Enterprise SQL script parser — multi-statement DAG builder.
+"""Enterprise SQL script parser — multi-statement dependency-graph builder.
 
 Parses multi-statement SQL scripts (CREATE VIEW, CREATE TABLE AS SELECT,
-DROP TABLE, standalone SELECT, etc.) into a statement-level dependency DAG.
+DROP TABLE, standalone SELECT, etc.) into a statement-level dependency graph.
 
-Two-level DAG architecture:
-  Level 1 (this module): Script DAG — nodes = statements, edges = table/view dependencies
-  Level 2 (dag.py):      Query DAG — nodes = CTEs within a statement, edges = CTE references
+Two-level graph architecture:
+  Level 1 (this module): Script dependency graph — nodes = statements, edges = table/view dependencies
+  Level 2 (dag.py):      Query logical tree graph — nodes = CTEs within a statement, edges = CTE references
 
 Enterprise SQL scripts are data pipelines: views build on base tables, temp
 tables build on views, final queries build on temp tables. This module
@@ -20,7 +20,7 @@ Usage:
     print(dag.summary())
 
     for target in dag.optimization_targets():
-        # target.inner_select → feed to DagBuilder + oneshot/swarm prompt
+        # target.inner_select → feed to query structure parser + oneshot/swarm prompt
         # target.creates_object → use as query_id
         ...
 """
@@ -168,7 +168,7 @@ class ScriptDAG:
 
 
 class ScriptParser:
-    """Parse multi-statement SQL scripts into a statement-level DAG.
+    """Parse multi-statement SQL scripts into a statement-level dependency graph.
 
     Handles enterprise SQL patterns:
     - CREATE [OR REPLACE] [TEMPORARY] TABLE/VIEW ... AS SELECT ...

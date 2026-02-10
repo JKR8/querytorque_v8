@@ -43,8 +43,8 @@ def check_analyst_prompt(
 ) -> None:
     """Validate step 02: analyst prompt."""
     assert f"## Query" in prompt, "Missing query header"
-    assert "## Query Structure (DAG)" in prompt, "Missing DAG section"
-    assert "### 1." in prompt, "Missing DAG node 1"
+    assert "## Query Structure (Logical Tree)" in prompt, "Missing logical tree section"
+    assert "### 1." in prompt, "Missing logical tree node 1"
 
     # History checks — the critical regression gate
     if history and history.get("attempts"):
@@ -113,7 +113,7 @@ def check_rewrite_prompt(
 ) -> None:
     """Validate step 05: rewrite prompt."""
     assert "SQL query rewrite engine" in prompt, "Missing role/task header"
-    assert "## Query Structure (DAG)" in prompt, "Missing DAG section"
+    assert "## Query Structure (Logical Tree)" in prompt, "Missing logical tree section"
 
     # History must flow through
     if history and history.get("attempts"):

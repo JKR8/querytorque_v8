@@ -102,7 +102,7 @@ from
 -- end query 88 in stream 0 using template query88.tpl
 ```
 
-## DAG Structure & Bottlenecks
+## Logical Tree Structure & Bottlenecks
 
 | Node | Role | Cost % | Key Operations |
 |------|------|-------:|----------------|

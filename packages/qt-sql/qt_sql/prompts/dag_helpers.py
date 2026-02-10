@@ -1,26 +1,26 @@
-"""Shared DAG formatting helpers for swarm prompts."""
+"""Shared logical-tree formatting helpers for swarm prompts."""
 
 from __future__ import annotations
 
 from typing import Any, Dict, List
 
 
-def append_dag_summary(
+def append_logical_tree_summary(
     lines: List[str],
     dag: Any,
     costs: Dict[str, Any],
     include_operations: bool = False,
 ) -> None:
-    """Append a concise DAG summary table with cost percentages.
+    """Append a concise logical-tree summary table with cost percentages.
 
     Args:
         lines: List to append lines to
-        dag: Parsed DAG from Phase 1
+        dag: Parsed logical tree from Phase 1
         costs: Per-node cost analysis
         include_operations: If True, add a "Key Operations" column
     """
     if not hasattr(dag, "nodes") or not dag.nodes:
-        lines.append("(DAG not available)")
+        lines.append("(Logical tree not available)")
         return
 
     if include_operations:

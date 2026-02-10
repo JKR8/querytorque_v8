@@ -1,13 +1,13 @@
 """Phase 3: Query-level rewrite prompt builder.
 
-Builds attention-optimized full-query rewrite prompts with DAG topology.
-All rewrites are full-query scope — the LLM sees the complete SQL, the DAG
+Builds attention-optimized full-query rewrite prompts with logical-tree topology.
+All rewrites are full-query scope — the LLM sees the complete SQL, the logical tree
 structure, and tag-matched gold examples.
 
 Section ordering (attention-optimized):
 1. Role + Task          (PRIMACY - frames rewrite mindset)
 2. Full Query SQL       (PRIMACY - pretty-formatted, complete query)
-3. DAG Topology         (PRIMACY - nodes, edges, depths, flags, costs)
+3. Logical Tree Topology (PRIMACY - nodes, edges, depths, flags, costs)
 4. Performance Profile  (EARLY - per-node costs, bottleneck operators)
 5. History              (EARLY-MID - previous attempts on this query)
 5b. Global Learnings    (EARLY-MID - aggregate benchmark stats, optional)
@@ -35,7 +35,7 @@ CONSTRAINTS_DIR = BASE_DIR / "constraints"
 
 
 def compute_depths(dag) -> Dict[str, int]:
-    """Compute topological depth for each node in the DAG."""
+    """Compute topological depth for each node in the logical tree."""
     depths: Dict[str, int] = {}
 
     def _depth(node_id: str) -> int:
@@ -190,11 +190,11 @@ def _build_node_intent_map(
 
 
 class Prompter:
-    """Build attention-optimized full-query rewrite prompts with DAG context.
+    """Build attention-optimized full-query rewrite prompts with logical-tree context.
 
     The LLM sees:
     - Complete query SQL (not isolated nodes)
-    - Full DAG topology (nodes, edges, depths, flags, costs)
+    - Full logical-tree topology (nodes, edges, depths, flags, costs)
     - tag-matched gold examples (contrastive BEFORE/AFTER pairs)
     - Constraints (CRITICAL top/bottom, HIGH middle)
 
@@ -222,7 +222,7 @@ class Prompter:
         Args:
             query_id: Query identifier (e.g., 'query_1')
             full_sql: Complete original SQL query
-            dag: Parsed DAG from Phase 1 (DagBuilder output)
+            dag: Parsed logical tree from Phase 1
             costs: Per-node cost analysis from CostAnalyzer
             history: Previous attempts and promotion context for this query.
                      Dict with 'attempts' (list) and 'promotion' (PromotionAnalysis).
@@ -254,7 +254,7 @@ class Prompter:
         # Section 2: Full Query SQL (PRIMACY)
         sections.append(self._section_full_sql(query_id, full_sql, dialect))
 
-        # Section 3+4: Query Structure (DAG) — unified gold standard format
+        # Section 3+4: Query Structure (Logical Tree) — unified gold standard format
         sections.append(self._section_query_structure(
             dag, costs, dialect, semantic_intents=semantic_intents,
         ))
@@ -380,7 +380,7 @@ class Prompter:
             "while preserving exact semantic equivalence (same rows, same columns,\n"
             "same ordering).\n"
             "\n"
-            "You will receive the full query, its DAG structure showing how CTEs and\n"
+            "You will receive the full query, its logical tree structure showing how CTEs and\n"
             "subqueries connect, cost analysis per node, and reference examples of\n"
             "proven rewrites on structurally similar queries.\n"
             "You may restructure the query freely: create new CTEs, merge existing ones,\n"
@@ -424,11 +424,11 @@ class Prompter:
         return sql.strip()
 
     @staticmethod
-    def _build_dag_comments(dag: Any, costs: Dict[str, Any]) -> str:
-        """Build DAG topology as SQL comments to embed in the query."""
+    def _build_logical_tree_comments(dag: Any, costs: Dict[str, Any]) -> str:
+        """Build logical-tree topology as SQL comments to embed in the query."""
         depths = compute_depths(dag)
 
-        lines = ["-- DAG TOPOLOGY"]
+        lines = ["-- LOGICAL TREE TOPOLOGY"]
 
         max_depth = max(depths.values()) if depths else 0
         for depth in range(max_depth + 1):
@@ -484,7 +484,7 @@ class Prompter:
 
     @staticmethod
     def _section_full_sql(query_id: str, sql: str, dialect: str) -> str:
-        """Section 2: Full Query SQL with DAG topology stripped of comments."""
+        """Section 2: Full query SQL with topology comments stripped."""
         # Strip existing comments
         clean_sql = Prompter._strip_comments(sql)
 
@@ -510,15 +510,15 @@ class Prompter:
         dag: Any, costs: Dict[str, Any], dialect: str = "duckdb",
         semantic_intents: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Sections 3+4: Query Structure (DAG) — gold standard card format.
+        """Sections 3+4: Query Structure (Logical Tree) — gold standard card format.
 
         Reuses the shared format from analyst.py so both prompts
         present the same structured view. When semantic_intents are
-        available, annotates each DAG node with its LLM-generated intent.
+        available, annotates each logical tree node with its LLM-generated intent.
         """
         from .analyst import _append_dag_analysis
 
-        lines = ["## Query Structure (DAG)", ""]
+        lines = ["## Query Structure (Logical Tree)", ""]
 
         # Merge query-level intent into main_query's node intent
         node_intents = _build_node_intent_map(semantic_intents)
@@ -1021,7 +1021,7 @@ class Prompter:
 
     @staticmethod
     def build_edge_contract_from_node(node) -> EdgeContract:
-        """Build an EdgeContract from a DAG node's contract."""
+        """Build an EdgeContract from a logical-tree node's contract."""
         if node.contract:
             return EdgeContract(
                 columns=node.contract.output_columns or [],

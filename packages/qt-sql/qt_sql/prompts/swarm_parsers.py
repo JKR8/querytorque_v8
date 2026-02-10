@@ -146,7 +146,7 @@ class BriefingWorker:
     """Per-worker briefing from the analyst."""
     worker_id: int = 0
     strategy: str = ""
-    target_dag: str = ""         # DAG topology + node contracts
+    target_logical_tree: str = ""  # Logical tree topology + node contracts
     examples: List[str] = field(default_factory=list)
     example_reasoning: str = ""
     hazard_flags: str = ""
@@ -177,7 +177,7 @@ def parse_briefing_response(response: str) -> ParsedBriefing:
 
         === WORKER 1 BRIEFING ===
         STRATEGY: ...
-        TARGET_DAG: ...
+        TARGET_LOGICAL_TREE: ...
         NODE_CONTRACTS: ...
         EXAMPLES: ...
         EXAMPLE_REASONING: ...
@@ -292,23 +292,23 @@ def _parse_single_worker(block: str, worker_id: int) -> BriefingWorker:
     if len(w.examples) > 3:
         w.examples = w.examples[:3]
 
-    # TARGET_DAG + NODE_CONTRACTS (multi-line, combined)
+    # TARGET_LOGICAL_TREE + NODE_CONTRACTS (multi-line, combined)
     # These are conceptually one unit — the CTE blueprint
-    target_dag = _extract_briefing_section(
-        block, "TARGET_DAG",
+    target_logical_tree = _extract_briefing_section(
+        block, "TARGET_LOGICAL_TREE",
         ["EXAMPLES", "EXAMPLE_REASONING", "HAZARD_FLAGS", "==="],
     )
     node_contracts = _extract_briefing_section(
         block, "NODE_CONTRACTS",
         ["EXAMPLES", "EXAMPLE_REASONING", "HAZARD_FLAGS", "==="],
     )
-    # Combine target_dag and node_contracts
+    # Combine target logical tree and node contracts
     parts = []
-    if target_dag:
-        parts.append(f"TARGET_DAG:\n{target_dag}")
+    if target_logical_tree:
+        parts.append(f"TARGET_LOGICAL_TREE:\n{target_logical_tree}")
     if node_contracts:
         parts.append(f"NODE_CONTRACTS:\n{node_contracts}")
-    w.target_dag = "\n\n".join(parts)
+    w.target_logical_tree = "\n\n".join(parts)
 
     # EXAMPLE_REASONING (multi-line)
     w.example_reasoning = _extract_briefing_section(

@@ -44,7 +44,7 @@ class ValidationResult:
 
 
 # =============================================================================
-# Pipeline Data Structures (5-phase DAG pipeline)
+# Pipeline Data Structures (5-phase logical-tree pipeline)
 # =============================================================================
 
 
@@ -86,7 +86,7 @@ class BenchmarkConfig:
 
 @dataclass
 class EdgeContract:
-    """Contract for a DAG edge — what flows between nodes."""
+    """Contract for a logical-tree edge — what flows between nodes."""
     columns: List[str]
     grain: str
     filters: List[str]
