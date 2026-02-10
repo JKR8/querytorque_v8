@@ -840,7 +840,7 @@ def build_analyst_briefing_prompt(
     # ── 4. Query Structure (Logic Tree + condensed node details) ─────────
     from ..logic_tree import build_logic_tree
     from ..analyst import _append_dag_analysis
-    from ..node_prompter import _build_node_intent_map
+    from ..prompter import _build_node_intent_map
 
     node_intents = _build_node_intent_map(semantic_intents)
     if semantic_intents:

@@ -249,7 +249,7 @@ def load_examples_by_ids(
 
 def extract_output_columns(dag) -> List[str]:
     try:
-        from qt_sql.node_prompter import Prompter
+        from qt_sql.prompter import Prompter
         return Prompter._extract_output_columns(dag)
     except Exception:
         return []

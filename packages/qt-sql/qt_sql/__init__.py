@@ -25,15 +25,9 @@ Usage:
 
     # Swarm mode (4-worker fan-out + snipe):
     result = p.run_optimization_session("query_88", sql, mode=OptimizationMode.SWARM)
-
-    # Or via ADORunner wrapper:
-    from qt_sql import ADORunner, ADOConfig, OptimizationMode
-    runner = ADORunner(ADOConfig(benchmark_dir="qt_sql/benchmarks/duckdb_tpcds"))
-    result = runner.run_analyst("query_88", sql, mode=OptimizationMode.SWARM)
 """
 
 from .pipeline import Pipeline
-from .runner import ADORunner, ADOConfig, ADOResult
 from .analyst_session import AnalystSession, AnalystIteration
 from .schemas import (
     BenchmarkConfig,
@@ -54,9 +48,6 @@ from .sessions import (
 
 __all__ = [
     "Pipeline",
-    "ADORunner",
-    "ADOConfig",
-    "ADOResult",
     "AnalystSession",
     "AnalystIteration",
     "BenchmarkConfig",

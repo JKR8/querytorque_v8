@@ -1,187 +1,212 @@
-"""Phase 4: API Endpoint Tests - SQL API.
+"""API endpoint tests for qt_sql V2 API.
 
-Tests for SQL API REST endpoints using FastAPI TestClient.
+Tests for the FastAPI routes defined in api/main.py:
+    POST /api/sql/optimize  - Pipeline-backed optimization
+    POST /api/sql/validate  - Equivalence + timing validation
+    GET  /health            - Health check
+    Database session routes
 """
 
 import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, patch
 
 
-class TestSQLAPIEndpoints:
-    """Tests for SQL API endpoints."""
+class TestHealthEndpoint:
+    """Tests for the health check endpoint."""
 
     @pytest.fixture
     def client(self):
-        """Create a test client for the API."""
         from fastapi.testclient import TestClient
         from api.main import app
         return TestClient(app)
 
-    @pytest.fixture
-    def mock_auth_user(self):
-        """Mock authenticated user."""
-        from qt_shared.auth.context import UserContext
-        return UserContext(
-            user_id="test-user-123",
-            org_id="test-org-456",
-            email="test@example.com",
-            role="user",
-            tier="professional",
-            auth_method="jwt",
-        )
-
-    @pytest.fixture
-    def mock_free_user(self):
-        """Mock free tier user."""
-        from qt_shared.auth.context import UserContext
-        return UserContext(
-            user_id="free-user-123",
-            org_id="free-org-456",
-            email="free@example.com",
-            role="user",
-            tier="free",
-            auth_method="jwt",
-        )
-
-    def test_health_endpoint_returns_200(self, client):
-        """Test health endpoint returns 200."""
+    def test_health_returns_200(self, client):
         response = client.get("/health")
         assert response.status_code == 200
 
-    def test_health_endpoint_returns_status(self, client):
-        """Test health endpoint returns status field."""
+    def test_health_returns_status_ok(self, client):
         response = client.get("/health")
         data = response.json()
-        assert "status" in data
         assert data["status"] == "ok"
 
-    def test_health_endpoint_returns_version(self, client):
-        """Test health endpoint returns version."""
+    def test_health_returns_version(self, client):
         response = client.get("/health")
         data = response.json()
         assert "version" in data
+        assert data["version"] == "2.0.0"
 
-    def test_health_endpoint_returns_config_info(self, client):
-        """Test health endpoint returns configuration info."""
+    def test_health_returns_llm_configured(self, client):
         response = client.get("/health")
         data = response.json()
-        assert "auth_enabled" in data
         assert "llm_configured" in data
+        assert isinstance(data["llm_configured"], bool)
 
-    def test_analyze_endpoint_accepts_sql(self, client):
-        """Test analyze endpoint accepts SQL."""
-        response = client.post(
-            "/api/sql/analyze",
-            json={"sql": "SELECT * FROM users"}
-        )
-        # Should return 200 or appropriate status
-        assert response.status_code in (200, 422)
+    def test_health_returns_llm_provider(self, client):
+        response = client.get("/health")
+        data = response.json()
+        assert "llm_provider" in data
 
-    def test_analyze_endpoint_returns_score(self, client):
-        """Test analyze endpoint returns score."""
-        response = client.post(
-            "/api/sql/analyze",
-            json={"sql": "SELECT id, name FROM users"}
-        )
-        if response.status_code == 200:
-            data = response.json()
-            assert "score" in data
-            assert 0 <= data["score"] <= 100
 
-    def test_analyze_endpoint_returns_issues(self, client):
-        """Test analyze endpoint returns issues list."""
-        response = client.post(
-            "/api/sql/analyze",
-            json={"sql": "SELECT * FROM users"}
-        )
-        if response.status_code == 200:
-            data = response.json()
-            assert "issues" in data
-            assert isinstance(data["issues"], list)
+class TestOptimizeEndpoint:
+    """Tests for the /api/sql/optimize endpoint."""
 
-    def test_analyze_endpoint_returns_severity_counts(self, client):
-        """Test analyze endpoint returns severity counts."""
-        response = client.post(
-            "/api/sql/analyze",
-            json={"sql": "SELECT id FROM users"}
-        )
-        if response.status_code == 200:
-            data = response.json()
-            assert "severity_counts" in data
-            counts = data["severity_counts"]
-            assert "critical" in counts
-            assert "high" in counts
-            assert "medium" in counts
-            assert "low" in counts
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
 
-    def test_analyze_endpoint_accepts_dialect(self, client):
-        """Test analyze endpoint accepts dialect parameter."""
-        response = client.post(
-            "/api/sql/analyze",
-            json={"sql": "SELECT * FROM users", "dialect": "snowflake"}
-        )
-        # Should not error on dialect
-        assert response.status_code in (200, 422)
+    def test_optimize_requires_sql_and_dsn(self, client):
+        """Missing required fields should return 422."""
+        response = client.post("/api/sql/optimize", json={})
+        assert response.status_code == 422
 
-    def test_analyze_endpoint_invalid_input_returns_422(self, client):
-        """Test analyze endpoint returns 422 for invalid input."""
-        # Empty SQL should fail validation
+    def test_optimize_rejects_empty_sql(self, client):
+        """Empty SQL should fail validation."""
         response = client.post(
-            "/api/sql/analyze",
-            json={"sql": ""}
+            "/api/sql/optimize",
+            json={"sql": "", "dsn": "duckdb:///:memory:"}
         )
         assert response.status_code == 422
 
-    def test_analyze_endpoint_missing_sql_returns_422(self, client):
-        """Test analyze endpoint returns 422 for missing SQL."""
+    def test_optimize_requires_dsn(self, client):
+        """Missing DSN should return 422."""
         response = client.post(
-            "/api/sql/analyze",
-            json={}
+            "/api/sql/optimize",
+            json={"sql": "SELECT 1"}
         )
         assert response.status_code == 422
 
-    def test_analyze_includes_query_structure(self, client):
-        """Test analyze endpoint includes query structure by default."""
+    def test_optimize_accepts_valid_request(self, client):
+        """Valid request should return 200 (even if pipeline errors)."""
         response = client.post(
-            "/api/sql/analyze",
+            "/api/sql/optimize",
             json={
-                "sql": "SELECT id FROM users JOIN orders ON users.id = orders.user_id",
-                "include_structure": True
+                "sql": "SELECT 1",
+                "dsn": "duckdb:///:memory:",
+                "mode": "oneshot",
+            }
+        )
+        # Pipeline may error (no intelligence data) but API should return 200
+        assert response.status_code == 200
+        data = response.json()
+        assert "status" in data
+        assert "query_id" in data
+
+    def test_optimize_response_has_contract_fields(self, client):
+        """Response should include all contract fields."""
+        response = client.post(
+            "/api/sql/optimize",
+            json={
+                "sql": "SELECT 1",
+                "dsn": "duckdb:///:memory:",
+                "mode": "oneshot",
+            }
+        )
+        assert response.status_code == 200
+        data = response.json()
+        # Contract-required fields
+        assert "status" in data
+        assert "speedup" in data
+        assert "speedup_type" in data
+        assert "validation_confidence" in data
+        assert "optimized_sql" in data or data["status"] == "ERROR"
+        assert "original_sql" in data
+        assert "transforms" in data
+        assert "workers" in data
+        assert "query_id" in data
+        assert "n_iterations" in data
+        assert "n_api_calls" in data
+
+    def test_optimize_accepts_mode_parameter(self, client):
+        """Should accept all three optimization modes."""
+        for mode in ["swarm", "expert", "oneshot"]:
+            response = client.post(
+                "/api/sql/optimize",
+                json={
+                    "sql": "SELECT 1",
+                    "dsn": "duckdb:///:memory:",
+                    "mode": mode,
+                }
+            )
+            assert response.status_code == 200
+
+    def test_optimize_rejects_invalid_mode(self, client):
+        """Invalid mode should return 422."""
+        response = client.post(
+            "/api/sql/optimize",
+            json={
+                "sql": "SELECT 1",
+                "dsn": "duckdb:///:memory:",
+                "mode": "invalid_mode",
+            }
+        )
+        assert response.status_code == 422
+
+    def test_optimize_accepts_optional_fields(self, client):
+        """Should accept query_id, max_iterations, target_speedup."""
+        response = client.post(
+            "/api/sql/optimize",
+            json={
+                "sql": "SELECT 1",
+                "dsn": "duckdb:///:memory:",
+                "mode": "oneshot",
+                "query_id": "test_q",
+                "max_iterations": 2,
+                "target_speedup": 1.5,
+            }
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["query_id"] == "test_q"
+
+
+class TestValidateEndpoint:
+    """Tests for the /api/sql/validate endpoint."""
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    def test_validate_requires_both_sqls(self, client):
+        """Missing SQL fields should return 422."""
+        response = client.post("/api/sql/validate", json={})
+        assert response.status_code == 422
+
+    def test_validate_accepts_valid_request(self, client):
+        """Valid request should return 200."""
+        response = client.post(
+            "/api/sql/validate",
+            json={
+                "original_sql": "SELECT 1",
+                "optimized_sql": "SELECT 1",
+                "schema_sql": "CREATE TABLE t (id INT);",
+            }
+        )
+        # Should succeed or return validation result
+        assert response.status_code in (200, 500)
+
+    def test_validate_response_has_expected_fields(self, client):
+        """Response should include validation result fields."""
+        response = client.post(
+            "/api/sql/validate",
+            json={
+                "original_sql": "SELECT 1 AS x",
+                "optimized_sql": "SELECT 1 AS x",
             }
         )
         if response.status_code == 200:
             data = response.json()
-            assert "query_structure" in data
-
-    def test_optimize_requires_auth(self, client):
-        """Test optimize endpoint requires authentication."""
-        # Without auth header, should get 401 or require auth
-        response = client.post(
-            "/api/sql/optimize",
-            json={"sql": "SELECT * FROM users"}
-        )
-        # Should require auth (401/403) or fail validation (422) or internal error (500)
-        # The exact code depends on auth middleware configuration
-        assert response.status_code in (401, 403, 422, 500)
-
-    @patch("api.main.CurrentUser")
-    def test_optimize_requires_paid_tier(self, mock_current_user, client, mock_free_user):
-        """Test optimize endpoint requires paid tier."""
-        # Mock the dependency to return free user
-        mock_current_user.return_value = mock_free_user
-
-        # This test would need proper dependency injection
-        # For now, just verify the endpoint exists
-        response = client.post(
-            "/api/sql/optimize",
-            json={"sql": "SELECT * FROM users"}
-        )
-        # Will likely fail auth, which is expected
-        assert response.status_code in (401, 403, 422, 500)
+            assert "status" in data
+            assert "row_counts_match" in data
+            assert "speedup" in data
+            assert "timing" in data
 
 
-class TestSQLAPIIssueFormat:
-    """Tests for issue format in API responses."""
+class TestDatabaseEndpoints:
+    """Tests for database session management endpoints."""
 
     @pytest.fixture
     def client(self):
@@ -189,56 +214,52 @@ class TestSQLAPIIssueFormat:
         from api.main import app
         return TestClient(app)
 
-    def test_issue_has_rule_id(self, client):
-        """Test that issues include rule_id."""
+    def test_quick_connect_duckdb(self, client, tmp_path):
+        """Test DuckDB quick connect with a fixture file."""
+        fixture = tmp_path / "test.sql"
+        fixture.write_text("CREATE TABLE t (id INT); INSERT INTO t VALUES (1);")
+
         response = client.post(
-            "/api/sql/analyze",
-            json={"sql": "SELECT * FROM users"}
+            "/api/database/connect/duckdb/quick",
+            data={"fixture_path": str(fixture)},
         )
-        if response.status_code == 200:
-            data = response.json()
-            if data["issues"]:
-                issue = data["issues"][0]
-                assert "rule_id" in issue
+        assert response.status_code == 200
+        data = response.json()
+        assert data["connected"] is True
+        assert data["type"] == "duckdb"
+        assert "session_id" in data
 
-    def test_issue_has_severity(self, client):
-        """Test that issues include severity."""
+        # Clean up
+        session_id = data["session_id"]
+        client.delete(f"/api/database/disconnect/{session_id}")
+
+    def test_session_status(self, client):
+        """Test session status for nonexistent session."""
+        response = client.get("/api/database/status/nonexistent")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["connected"] is False
+
+    def test_disconnect_nonexistent(self, client):
+        """Test disconnecting a nonexistent session."""
+        response = client.delete("/api/database/disconnect/nonexistent")
+        assert response.status_code == 200
+
+    def test_execute_requires_session(self, client):
+        """Execute without valid session should return 404."""
         response = client.post(
-            "/api/sql/analyze",
-            json={"sql": "SELECT * FROM users"}
+            "/api/database/execute/nonexistent",
+            json={"sql": "SELECT 1"},
         )
-        if response.status_code == 200:
-            data = response.json()
-            if data["issues"]:
-                issue = data["issues"][0]
-                assert "severity" in issue
+        assert response.status_code == 404
 
-    def test_issue_has_description(self, client):
-        """Test that issues include description."""
-        response = client.post(
-            "/api/sql/analyze",
-            json={"sql": "SELECT * FROM users"}
-        )
-        if response.status_code == 200:
-            data = response.json()
-            if data["issues"]:
-                issue = data["issues"][0]
-                assert "description" in issue
-
-    def test_issue_has_penalty(self, client):
-        """Test that issues include penalty."""
-        response = client.post(
-            "/api/sql/analyze",
-            json={"sql": "SELECT * FROM users"}
-        )
-        if response.status_code == 200:
-            data = response.json()
-            if data["issues"]:
-                issue = data["issues"][0]
-                assert "penalty" in issue
+    def test_schema_requires_session(self, client):
+        """Schema without valid session should return 404."""
+        response = client.get("/api/database/schema/nonexistent")
+        assert response.status_code == 404
 
 
-class TestSQLAPIEdgeCases:
+class TestEdgeCases:
     """Tests for edge cases in API."""
 
     @pytest.fixture
@@ -249,24 +270,26 @@ class TestSQLAPIEdgeCases:
 
     def test_very_long_sql(self, client):
         """Test handling of very long SQL."""
-        # Generate a long SQL
         columns = ", ".join([f"col{i}" for i in range(100)])
         sql = f"SELECT {columns} FROM very_long_table_name"
 
         response = client.post(
-            "/api/sql/analyze",
-            json={"sql": sql}
+            "/api/sql/optimize",
+            json={"sql": sql, "dsn": "duckdb:///:memory:", "mode": "oneshot"}
         )
-        # Should handle without error
-        assert response.status_code in (200, 422, 500)
+        assert response.status_code == 200
 
     def test_unicode_in_sql(self, client):
         """Test handling of Unicode in SQL."""
         response = client.post(
-            "/api/sql/analyze",
-            json={"sql": "SELECT * FROM users WHERE name = '日本語'"}
+            "/api/sql/optimize",
+            json={
+                "sql": "SELECT * FROM users WHERE name = '日本語'",
+                "dsn": "duckdb:///:memory:",
+                "mode": "oneshot",
+            }
         )
-        assert response.status_code in (200, 422)
+        assert response.status_code == 200
 
     def test_multiline_sql(self, client):
         """Test handling of multiline SQL."""
@@ -279,7 +302,7 @@ class TestSQLAPIEdgeCases:
         WHERE active = true
         """
         response = client.post(
-            "/api/sql/analyze",
-            json={"sql": sql}
+            "/api/sql/optimize",
+            json={"sql": sql, "dsn": "duckdb:///:memory:", "mode": "oneshot"}
         )
         assert response.status_code == 200

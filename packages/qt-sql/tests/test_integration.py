@@ -1,72 +1,94 @@
-"""Phase 6: Integration Tests - SQL Integration.
+"""Integration tests for qt_sql pipeline components.
 
-Full pipeline validation tests for SQL analysis.
+Tests cross-module interactions: DAG parsing, knowledge retrieval,
+SQL rewriting, validation, and execution.
 """
 
 import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, patch
 
 
-class TestSQLAnalysisPipeline:
-    """Tests for the full SQL analysis pipeline."""
+class TestDAGPipeline:
+    """Tests for the logical tree (DAG) parsing pipeline."""
 
-    def test_full_analysis_pipeline(self, detector, sample_clean_sql):
-        """Test complete analysis from SQL to result."""
-        result = detector.analyze(sample_clean_sql)
+    def test_simple_query_parsing(self):
+        """Test DAG builds from a simple query."""
+        from qt_sql.dag import LogicalTreeBuilder, CostAnalyzer
 
-        # Verify all expected fields
-        assert hasattr(result, "sql")
-        assert hasattr(result, "issues")
-        assert hasattr(result, "final_score")
-        assert hasattr(result, "query_structure")
+        sql = "SELECT id, name FROM users WHERE active = true"
+        dag = LogicalTreeBuilder(sql, dialect="duckdb").build()
+        costs = CostAnalyzer(dag).analyze()
 
-        # Clean SQL should score well
-        assert result.final_score >= 80
+        assert dag is not None
+        assert len(dag.nodes) >= 1
+        assert costs is not None
 
-    def test_analysis_with_issues_pipeline(self, detector, sample_multiple_issues_sql):
-        """Test analysis pipeline with multiple issues."""
-        result = detector.analyze(sample_multiple_issues_sql)
+    def test_cte_structure_extraction(self):
+        """Test CTE structure is correctly extracted."""
+        from qt_sql.dag import LogicalTreeBuilder
 
-        # Should detect issues
-        assert len(result.issues) > 0
-
-        # Score should reflect issues
-        assert result.final_score < 100
-
-        # Issue counts should match
-        total_counted = (
-            result.critical_count +
-            result.high_count +
-            result.medium_count +
-            result.low_count
+        sql = """
+        WITH active_users AS (
+            SELECT id, name FROM users WHERE active = true
+        ),
+        user_orders AS (
+            SELECT u.id, COUNT(*) as order_count
+            FROM active_users u
+            JOIN orders o ON u.id = o.user_id
+            GROUP BY u.id
         )
-        # May have info issues not counted
-        assert total_counted <= len(result.issues)
+        SELECT * FROM user_orders WHERE order_count > 5
+        """
+        dag = LogicalTreeBuilder(sql, dialect="duckdb").build()
 
-    def test_analysis_to_json_pipeline(self, detector, sample_cte_sql):
-        """Test analysis to JSON serialization."""
-        result = detector.analyze(sample_cte_sql)
-        json_dict = result.to_dict()
+        assert len(dag.nodes) >= 2  # At least 2 CTEs + main
+        node_names = list(dag.nodes.keys())
+        assert any("active_users" in name for name in node_names)
 
-        # Should be serializable
-        import json
-        json_str = json.dumps(json_dict)
-        assert len(json_str) > 0
+    def test_join_structure_extraction(self):
+        """Test JOIN structure is correctly extracted."""
+        from qt_sql.dag import LogicalTreeBuilder
 
-        # Should contain expected keys
-        assert "score" in json_dict
-        assert "issues" in json_dict
-        assert "query_structure" in json_dict
+        sql = """
+        SELECT u.id, o.order_id, p.name
+        FROM users u
+        JOIN orders o ON u.id = o.user_id
+        JOIN products p ON o.product_id = p.id
+        """
+        dag = LogicalTreeBuilder(sql, dialect="duckdb").build()
+        assert dag is not None
+        assert len(dag.nodes) >= 1
+
+    def test_subquery_structure_extraction(self):
+        """Test subquery structure is correctly extracted."""
+        from qt_sql.dag import LogicalTreeBuilder
+
+        sql = """
+        SELECT * FROM users
+        WHERE id IN (
+            SELECT user_id FROM orders
+            WHERE amount > (SELECT AVG(amount) FROM orders)
+        )
+        """
+        dag = LogicalTreeBuilder(sql, dialect="duckdb").build()
+        assert dag is not None
 
 
 class TestDuckDBIntegration:
     """Tests for DuckDB execution integration."""
 
     @pytest.mark.duckdb
-    def test_duckdb_executor_execute(self, duckdb_executor):
+    def test_duckdb_executor_execute(self):
         """Test DuckDB execution."""
-        results = duckdb_executor.execute("SELECT 1 as value")
-        assert len(results) > 0
+        from qt_sql.execution import DuckDBExecutor
+
+        executor = DuckDBExecutor(":memory:")
+        executor.connect()
+        try:
+            result = executor.execute("SELECT 1 as value")
+            assert result is not None
+        finally:
+            executor.close()
 
     @pytest.mark.duckdb
     def test_duckdb_executor_with_tables(self, duckdb_connection):
@@ -75,18 +97,23 @@ class TestDuckDBIntegration:
         assert len(results) > 0
 
     @pytest.mark.duckdb
-    def test_duckdb_explain(self, duckdb_executor):
+    def test_duckdb_explain(self):
         """Test DuckDB EXPLAIN."""
-        result = duckdb_executor.explain("SELECT 1")
-        assert result is not None
+        from qt_sql.execution import DuckDBExecutor
+
+        executor = DuckDBExecutor(":memory:")
+        executor.connect()
+        try:
+            result = executor.explain("SELECT 1")
+            assert result is not None
+        finally:
+            executor.close()
 
     @pytest.mark.duckdb
     def test_duckdb_validate_sql(self, duckdb_connection):
         """Test SQL validation via DuckDB."""
-        # Valid SQL should not raise
         duckdb_connection.execute("SELECT id FROM users WHERE id = 1")
 
-        # Invalid SQL should raise
         with pytest.raises(Exception):
             duckdb_connection.execute("SELEKT * FORM users")
 
@@ -94,46 +121,20 @@ class TestDuckDBIntegration:
 class TestCrossPackageIntegration:
     """Tests for cross-package integration."""
 
-    def test_sql_analyzer_uses_shared_config(self):
-        """Test that SQL analyzer can use shared config."""
+    def test_shared_config_available(self):
+        """Test that shared config is importable and works."""
         from qt_shared.config import get_settings
-        from qt_sql.analyzers.sql_antipattern_detector import SQLAntiPatternDetector
 
         settings = get_settings()
-        detector = SQLAntiPatternDetector()
-
-        # Both should work together
         assert settings is not None
-        assert detector is not None
-
-    def test_sql_analyzer_with_llm_mock(self):
-        """Test SQL analysis with mocked LLM."""
-        from qt_sql.analyzers.sql_antipattern_detector import SQLAntiPatternDetector
-
-        detector = SQLAntiPatternDetector()
-        result = detector.analyze("SELECT * FROM users")
-
-        # Analysis should work without LLM
-        assert result is not None
-        assert result.final_score >= 0
 
     @patch("qt_shared.llm.factory.create_llm_client")
     def test_optimization_with_llm_mock(self, mock_create_client):
-        """Test optimization pipeline with mocked LLM."""
-        # Mock LLM client
+        """Test LLM client integration pattern."""
         mock_client = MagicMock()
-        mock_client.analyze.return_value = """
-## Optimized SQL
-```sql
-SELECT id, name FROM users WHERE active = true
-```
-
-## Changes
-- Replaced SELECT * with explicit columns
-"""
+        mock_client.analyze.return_value = "SELECT id, name FROM users WHERE active = true"
         mock_create_client.return_value = mock_client
 
-        # This tests the pattern but may need actual endpoint test
         from qt_shared.llm import create_llm_client
         client = create_llm_client()
 
@@ -142,147 +143,173 @@ SELECT id, name FROM users WHERE active = true
             assert "SELECT" in result
 
 
-class TestQueryStructureAnalysis:
-    """Tests for query structure analysis integration."""
+class TestSQLRewriterIntegration:
+    """Tests for SQL rewriter integration."""
 
-    def test_cte_structure_extraction(self, detector, sample_cte_sql):
-        """Test CTE structure is correctly extracted."""
-        result = detector.analyze(sample_cte_sql)
-        structure = result.query_structure
+    def test_transform_inference_from_diff(self):
+        """Test AST-based transform inference."""
+        from qt_sql.sql_rewriter import infer_transforms_from_sql_diff
 
-        assert structure["cte_count"] >= 1
-        assert len(structure["cte_names"]) >= 1
-
-    def test_join_structure_extraction(self, detector):
-        """Test JOIN structure is correctly extracted."""
-        sql = """
-        SELECT u.id, o.order_id, p.name
-        FROM users u
-        JOIN orders o ON u.id = o.user_id
-        JOIN products p ON o.product_id = p.id
+        original = "SELECT * FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE active = true)"
+        optimized = """
+        WITH active_customers AS (
+            SELECT id FROM customers WHERE active = true
+        )
+        SELECT o.* FROM orders o
+        JOIN active_customers ac ON o.customer_id = ac.id
         """
-        result = detector.analyze(sql)
-        structure = result.query_structure
 
-        assert structure["join_count"] >= 2
-        assert structure["table_count"] >= 3
+        transforms = infer_transforms_from_sql_diff(original, optimized, dialect="duckdb")
+        assert isinstance(transforms, list)
 
-    def test_subquery_structure_extraction(self, detector, sample_deeply_nested_sql):
-        """Test subquery structure is correctly extracted."""
-        result = detector.analyze(sample_deeply_nested_sql)
-        structure = result.query_structure
+    def test_set_local_split(self):
+        """Test SET LOCAL extraction from SQL."""
+        from qt_sql.sql_rewriter import SQLRewriter
 
-        assert structure["subquery_count"] >= 3
+        rewriter = SQLRewriter("SELECT 1", dialect="duckdb")
+        sql_with_config = """SET LOCAL work_mem = '256MB';
+SET LOCAL jit = off;
+SELECT id FROM users WHERE active = true"""
+
+        sql, commands = rewriter._split_set_local(sql_with_config)
+        assert "SELECT" in sql
+        assert len(commands) >= 1
 
 
-class TestRemediationPayloadIntegration:
-    """Tests for remediation payload generation."""
+class TestKnowledgeIntegration:
+    """Tests for knowledge retrieval integration."""
 
-    def test_remediation_payload_generation(self):
-        """Test generating remediation payload."""
-        from qt_sql.analyzers.sql_remediation_payload import (
-            generate_sql_remediation_payload,
+    def test_tag_recommender_loads(self):
+        """Test TagRecommender can be instantiated."""
+        from qt_sql.knowledge import TagRecommender
+
+        recommender = TagRecommender()
+        assert recommender is not None
+
+    def test_tag_recommender_finds_examples(self):
+        """Test TagRecommender returns examples for TPC-DS-like SQL."""
+        from qt_sql.knowledge import TagRecommender
+
+        recommender = TagRecommender()
+        sql = """
+        SELECT d_year, SUM(ss_sales_price) as total
+        FROM store_sales
+        JOIN date_dim ON ss_sold_date_sk = d_date_sk
+        WHERE d_year = 2002
+        GROUP BY d_year
+        """
+        examples = recommender.find_similar_examples(sql, dialect="duckdb", k=3)
+        assert isinstance(examples, list)
+
+
+class TestPrompterIntegration:
+    """Tests for prompter integration."""
+
+    def test_prompter_builds_prompt(self):
+        """Test Prompter builds a complete prompt."""
+        from qt_sql.prompter import Prompter
+        from qt_sql.dag import LogicalTreeBuilder, CostAnalyzer
+
+        sql = "SELECT id, name FROM users WHERE active = true"
+        dag = LogicalTreeBuilder(sql, dialect="duckdb").build()
+        costs = CostAnalyzer(dag).analyze()
+
+        prompter = Prompter()
+        prompt = prompter.build_prompt(
+            query_id="test_q",
+            full_sql=sql,
+            dag=dag,
+            costs=costs,
+            history=None,
+            dialect="duckdb",
         )
+        assert isinstance(prompt, str)
+        assert len(prompt) > 100  # Should be a substantial prompt
 
-        sql = "SELECT * FROM users WHERE UPPER(email) = 'TEST'"
-        payload = generate_sql_remediation_payload(sql)
+    def test_engine_profile_loads(self):
+        """Test engine profiles load correctly."""
+        from qt_sql.prompter import _load_engine_profile
 
-        assert payload is not None
-        assert isinstance(payload, dict)
-        assert "query" in payload
-        assert "query_graph" in payload
-
-    def test_remediation_payload_has_tables(self):
-        """Test remediation payload includes table information."""
-        from qt_sql.analyzers.sql_remediation_payload import (
-            generate_sql_remediation_payload,
-        )
-
-        sql = "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)"
-        payload = generate_sql_remediation_payload(sql)
-
-        assert payload is not None
-        assert "query_graph" in payload
-        # Should have detected the tables from the query
-        assert isinstance(payload["query_graph"], dict)
+        for engine in ["duckdb", "postgres"]:
+            profile = _load_engine_profile(engine)
+            if profile:
+                assert "gaps" in profile or "strengths" in profile
 
 
 class TestDialectIntegration:
-    """Tests for dialect-specific integration."""
+    """Tests for dialect-specific handling."""
 
-    def test_snowflake_specific_detection(self, snowflake_detector):
-        """Test Snowflake-specific rule detection."""
-        sql = "SELECT * FROM users SAMPLE (10)"
-        result = snowflake_detector.analyze(sql)
+    def test_duckdb_dag_parsing(self):
+        """Test DuckDB-specific SQL parsing."""
+        from qt_sql.dag import LogicalTreeBuilder
 
-        # Should work without error
-        assert result is not None
-        assert result.final_score >= 0
-
-    def test_postgres_specific_detection(self, postgres_detector):
-        """Test PostgreSQL-specific rule detection."""
-        sql = "SELECT * FROM users ORDER BY RANDOM() LIMIT 10"
-        result = postgres_detector.analyze(sql)
-
-        assert result is not None
-        assert result.final_score >= 0
-
-    def test_duckdb_specific_detection(self, duckdb_detector):
-        """Test DuckDB-specific rule detection."""
         sql = """
         SELECT * FROM (
             SELECT *, ROW_NUMBER() OVER (PARTITION BY category ORDER BY price) as rn
             FROM products
         ) WHERE rn = 1
         """
-        result = duckdb_detector.analyze(sql)
+        dag = LogicalTreeBuilder(sql, dialect="duckdb").build()
+        assert dag is not None
 
-        # Should detect QUALIFY suggestion
-        rule_ids = [i.rule_id for i in result.issues]
-        assert "SQL-DUCK-001" in rule_ids
+    def test_postgres_dag_parsing(self):
+        """Test PostgreSQL-specific SQL parsing."""
+        from qt_sql.dag import LogicalTreeBuilder
+
+        sql = "SELECT * FROM users ORDER BY RANDOM() LIMIT 10"
+        dag = LogicalTreeBuilder(sql, dialect="postgres").build()
+        assert dag is not None
 
 
 class TestErrorHandlingIntegration:
     """Tests for error handling across the pipeline."""
 
-    def test_parse_error_handling(self, detector):
-        """Test handling of SQL parse errors."""
-        sql = "SELEKT * FORM users WERE id = 1"
-        result = detector.analyze(sql)
+    def test_dag_handles_invalid_sql(self):
+        """Test DAG handles invalid SQL gracefully."""
+        from qt_sql.dag import LogicalTreeBuilder
 
-        # Should handle gracefully
-        assert result is not None
-        # May have parse error in issues
-        parse_issues = [i for i in result.issues if "PARSE" in i.rule_id]
-        # Could have parse error or could work with error tolerance
-        assert isinstance(result.final_score, int)
+        # Should not crash on invalid SQL
+        try:
+            dag = LogicalTreeBuilder("SELEKT * FORM users", dialect="duckdb").build()
+            # If it builds, it should still be valid
+            assert dag is not None
+        except Exception:
+            # Acceptable to raise on invalid SQL
+            pass
 
-    def test_empty_input_handling(self, detector):
-        """Test handling of empty input."""
-        result = detector.analyze("")
-        assert result is not None
+    def test_dag_handles_empty_input(self):
+        """Test DAG handles empty input."""
+        from qt_sql.dag import LogicalTreeBuilder
 
-    def test_very_complex_sql_handling(self, detector):
-        """Test handling of very complex SQL."""
-        # Generate complex SQL
-        ctes = "\n".join([
-            f"cte{i} AS (SELECT * FROM t{i})"
-            for i in range(20)
+        try:
+            dag = LogicalTreeBuilder("", dialect="duckdb").build()
+            assert dag is not None
+        except Exception:
+            pass  # Acceptable
+
+    def test_dag_handles_complex_sql(self):
+        """Test DAG handles complex SQL with many CTEs."""
+        from qt_sql.dag import LogicalTreeBuilder
+
+        ctes = ", ".join([
+            f"cte{i} AS (SELECT {i} AS val)"
+            for i in range(10)
         ])
         sql = f"WITH {ctes} SELECT * FROM cte0"
 
-        result = detector.analyze(sql)
-        assert result is not None
-        assert result.final_score >= 0
+        dag = LogicalTreeBuilder(sql, dialect="duckdb").build()
+        assert dag is not None
+        assert len(dag.nodes) >= 10
 
 
 class TestPerformanceIntegration:
     """Tests for performance characteristics."""
 
     @pytest.mark.slow
-    def test_analysis_performance(self, detector):
-        """Test that analysis completes in reasonable time."""
+    def test_dag_parsing_performance(self):
+        """Test that DAG parsing completes in reasonable time."""
         import time
+        from qt_sql.dag import LogicalTreeBuilder, CostAnalyzer
 
         sql = """
         WITH base AS (
@@ -301,16 +328,18 @@ class TestPerformanceIntegration:
         """
 
         start = time.time()
-        result = detector.analyze(sql)
+        dag = LogicalTreeBuilder(sql, dialect="duckdb").build()
+        costs = CostAnalyzer(dag).analyze()
         elapsed = time.time() - start
 
-        assert elapsed < 2.0  # Should complete in under 2 seconds
-        assert result is not None
+        assert elapsed < 2.0
+        assert dag is not None
 
     @pytest.mark.slow
-    def test_batch_analysis_performance(self, detector):
-        """Test analyzing multiple queries."""
+    def test_batch_dag_parsing_performance(self):
+        """Test parsing multiple queries."""
         import time
+        from qt_sql.dag import LogicalTreeBuilder
 
         queries = [
             "SELECT * FROM users",
@@ -319,8 +348,8 @@ class TestPerformanceIntegration:
         ]
 
         start = time.time()
-        results = [detector.analyze(q) for q in queries]
+        results = [LogicalTreeBuilder(q, dialect="duckdb").build() for q in queries]
         elapsed = time.time() - start
 
-        assert elapsed < 3.0  # Should complete quickly
+        assert elapsed < 3.0
         assert all(r is not None for r in results)

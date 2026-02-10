@@ -130,7 +130,7 @@ def build_logic_tree(
     Returns:
         Indented tree text string
     """
-    from .node_prompter import compute_depths
+    from .prompter import compute_depths
     from .analyst import _extract_node_metadata
 
     if node_intents is None:
@@ -235,7 +235,7 @@ def build_pipeline_logic_tree(
         Pipeline Logic Tree text
     """
     from .analyst import _extract_node_metadata
-    from .node_prompter import compute_depths
+    from .prompter import compute_depths
 
     lines: List[str] = []
     lines.append("PIPELINE: (multi-statement)")

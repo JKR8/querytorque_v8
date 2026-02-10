@@ -211,7 +211,7 @@ if overrides:
 else:
     examples_to_use = faiss_examples
 
-from ado.node_prompter import Prompter
+from ado.prompter import Prompter
 prompter = Prompter()
 rewrite_prompt = prompter.build_prompt(
     query_id=query_id,

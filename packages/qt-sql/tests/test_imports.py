@@ -1,10 +1,20 @@
-"""Smoke Tests - Import Validation for qt-sql.
+"""Smoke tests - import validation for qt-sql.
 
 Validates that all qt-sql modules can be imported correctly,
 including cross-package imports from qt-shared.
 """
 
+from pathlib import Path
+import sys
+
 import pytest
+
+# Ensure sibling package imports work when tests run from packages/qt-sql.
+QT_SQL_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = QT_SQL_ROOT.parents[1]
+QT_SHARED_PATH = REPO_ROOT / "packages" / "qt-shared"
+if QT_SHARED_PATH.exists():
+    sys.path.insert(0, str(QT_SHARED_PATH))
 
 
 class TestQtSqlCoreImports:
@@ -31,12 +41,6 @@ class TestQtSqlCoreImports:
         )
         assert OptimizationMode is not None
         assert WorkerResult is not None
-
-    def test_import_runner(self):
-        """Test runner import."""
-        from qt_sql.runner import ADORunner, ADOConfig
-        assert ADORunner is not None
-        assert ADOConfig is not None
 
     def test_import_dag(self):
         """Test query-structure module import."""

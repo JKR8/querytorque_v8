@@ -313,7 +313,7 @@ class SwarmSession(OptimizationSession):
         t_gen = time.time()
 
         # Extract output columns for column completeness contract
-        from ..node_prompter import Prompter
+        from ..prompter import Prompter
         output_columns = Prompter._extract_output_columns(dag)
         self._output_columns = output_columns
 
@@ -321,7 +321,7 @@ class SwarmSession(OptimizationSession):
         original_logic_tree = None
         try:
             from ..logic_tree import build_logic_tree
-            from ..node_prompter import _build_node_intent_map
+            from ..prompter import _build_node_intent_map
             node_intents = _build_node_intent_map(semantic_intents)
             if semantic_intents:
                 qi = semantic_intents.get("query_intent", "")
@@ -654,7 +654,7 @@ class SwarmSession(OptimizationSession):
             parse_snipe_response,
         )
         from ..generate import CandidateGenerator
-        from ..node_prompter import _load_constraint_files, _load_engine_profile, Prompter
+        from ..prompter import _load_constraint_files, _load_engine_profile, Prompter
 
         generator = CandidateGenerator(
             provider=self.pipeline.provider,

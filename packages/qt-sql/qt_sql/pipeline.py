@@ -71,7 +71,7 @@ class Pipeline:
         )
 
         # Initialize pipeline components
-        from .node_prompter import Prompter
+        from .prompter import Prompter
         self.prompter = Prompter()
         self.learner = Learner(
             journal_dir=self.benchmark_dir / "learning"
@@ -1466,7 +1466,7 @@ class Pipeline:
         example_id: str, engine_dir: str,
     ) -> Optional[Dict[str, Any]]:
         """Load a regression example JSON file."""
-        from .node_prompter import EXAMPLES_DIR
+        from .prompter import EXAMPLES_DIR
 
         regressions_dir = EXAMPLES_DIR / engine_dir / "regressions"
         if not regressions_dir.exists():
@@ -1549,7 +1549,7 @@ class Pipeline:
         regression_warnings, strategy_leaderboard, query_archetype,
         resource_envelope, exploit_algorithm_text.
         """
-        from .node_prompter import (
+        from .prompter import (
             _load_constraint_files,
             _load_engine_profile,
             load_exploit_algorithm,

@@ -157,7 +157,7 @@ def build_worker_prompt(
 def _section_examples(examples: List[Dict[str, Any]]) -> str:
     """Format reference examples with before/after SQL pairs.
 
-    Reuses the same format as node_prompter._section_examples() for
+    Reuses the same format as prompter._section_examples() for
     consistency, but without the generic preamble.
     """
     lines = [

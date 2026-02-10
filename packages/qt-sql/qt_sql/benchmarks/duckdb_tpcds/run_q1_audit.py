@@ -231,7 +231,7 @@ for attempt in range(1, MAX_ATTEMPTS + 1):
     else:
         examples_to_use = faiss_examples
 
-    from qt_sql.node_prompter import Prompter
+    from qt_sql.prompter import Prompter
     prompter = Prompter()
     rewrite_prompt = prompter.build_prompt(
         query_id=QUERY_ID,

@@ -926,11 +926,12 @@ class SQLRewriter:
                             self.original_sql, clean_sql, self.dialect
                         )
                         if not ast_check.valid:
-                            logger.warning(
-                                "AST check failed on rewrite_set %s: %s",
-                                rs.id, ast_check.errors,
-                            )
-                            continue
+                            if not self._allow_legacy_ast_mismatch(ast_check):
+                                logger.warning(
+                                    "AST check failed on rewrite_set %s: %s",
+                                    rs.id, ast_check.errors,
+                                )
+                                continue
 
                         return RewriteResult(
                             success=True,
@@ -962,6 +963,25 @@ class SQLRewriter:
             optimized_sql=self.original_sql,
             error="No valid DAP, rewrite_sets, or SQL found in LLM response",
         )
+
+    @staticmethod
+    def _allow_legacy_ast_mismatch(ast_check: ASTValidationResult) -> bool:
+        """Compatibility gate for legacy rewrite_sets.
+
+        Legacy rewrite_sets often emit only a rewritten `main_query` without
+        preserving original helper-table lineage (e.g., transforming a subquery
+        filter into a direct form). For backward compatibility, we allow this
+        narrow mismatch *only* when:
+        - all AST errors are missing-base-table errors, and
+        - output schema (column names/order) still matches exactly.
+        """
+        if not ast_check.errors:
+            return False
+        if not ast_check.original_columns or not ast_check.rewritten_columns:
+            return False
+        if ast_check.original_columns != ast_check.rewritten_columns:
+            return False
+        return all(err.startswith("Missing base tables in rewrite:") for err in ast_check.errors)
 
     def _apply_dap(self, dap: DAPPayload) -> RewriteResult:
         """Apply a DAP Component Payload to produce a RewriteResult.

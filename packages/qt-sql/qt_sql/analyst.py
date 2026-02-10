@@ -42,7 +42,7 @@ def _append_dag_analysis(
     """
     if node_intents is None:
         node_intents = {}
-    from .node_prompter import compute_depths
+    from .prompter import compute_depths
     depths = compute_depths(dag)
 
     max_depth = max(depths.values()) if depths else 0

@@ -308,7 +308,7 @@ class AnalystSession:
         example_ids = [e.get("id", "?") for e in examples]
 
         # Extract output columns for column completeness contract
-        from .node_prompter import Prompter
+        from .prompter import Prompter
         output_columns = Prompter._extract_output_columns(dag)
 
         # Build worker prompt (same as swarm workers use)

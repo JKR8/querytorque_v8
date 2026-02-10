@@ -164,7 +164,7 @@ def build_snipe_analyst_prompt(
         format_duckdb_explain_tree,
     )
     from ..analyst import _append_dag_analysis
-    from ..node_prompter import _build_node_intent_map
+    from ..prompter import _build_node_intent_map
 
     target = _normalize_speedup(target_speedup)
     lines: list[str] = []

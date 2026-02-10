@@ -3,6 +3,8 @@
 Engineering contract for the `qt_sql` SQL optimization pipeline.
 Read this before changing any module.
 
+**Scope:** This contract covers the `qt_sql` package only. The ADO batch runner (`ado/`) is a separate system with its own contracts and is not covered here. The ADO runner consumes `qt_sql` as a library but is not part of this pipeline.
+
 ---
 
 ## Master Flow
@@ -15,7 +17,7 @@ SQL + DSN
 │  Phase 1: Context Gathering  │  _parse_logical_tree(), _get_explain(), plan_analyzer, pg_tuning
 │  SQL → logical tree + EXPLAIN│
 └──────────┬───────────────────┘
-           │  logical_tree, costs, explain_result
+           │  logical_tree, costs, explain_result, context_confidence
            ▼
 ┌──────────────────────────────┐
 │  Phase 2: Knowledge          │  TagRecommender, _load_engine_profile(), _load_constraint_files()
@@ -23,11 +25,17 @@ SQL + DSN
 └──────────┬───────────────────┘
            │  matched_examples, intelligence_briefing_local/global, engine_profile, constraints, regression_warnings
            ▼
+┌──────────────────────────────────────┐
+│  Phase 2→3: Intelligence Handoff     │  gather_analyst_context() → context dict
+│  Required vs optional field contract │
+└──────────┬───────────────────────────┘
+           │  analyst_context dict (see handoff contract below)
+           ▼
 ┌──────────────────────────────┐
 │  Phase 3: Prompt Generation  │  build_analyst_briefing_prompt(), build_worker_prompt()
 │  Context → Prompt(s)         │
 └──────────┬───────────────────┘
-           │  prompt text(s) per worker
+           │  prompt text(s) per worker (within token budget)
            ▼
 ┌──────────────────────────────┐
 │  Phase 4: LLM Inference      │  CandidateGenerator._analyze()
@@ -45,7 +53,7 @@ SQL + DSN
 │  Phase 6: Validation &       │  Validator.validate(), EquivalenceChecker, QueryBenchmarker
 │  Benchmarking                │
 └──────────┬───────────────────┘
-           │  ValidationResult (status, speedup, error_category)
+           │  ValidationResult (status, speedup, speedup_type, error_category, validation_confidence)
            ▼
 ┌──────────────────────────────┐
 │  Phase 7: Outputs &          │  Store.save_candidate(), Learner, build_blackboard
@@ -57,9 +65,9 @@ SQL + DSN
 
 #### A) PostgreSQL Scanner Intelligence Flow
 
-`scanner (plan_scanner.py)`  
-`-> blackboard/findings artifacts (scanner_knowledge/*)`  
-`-> algorithm + query-specific finding`  
+`scanner (plan_scanner.py)`
+`-> blackboard/findings artifacts (scanner_knowledge/*)`
+`-> algorithm + query-specific finding`
 `-> analyst prompt section (plan_scanner_text / exploit algorithm context)`
 
 Contract:
@@ -69,10 +77,10 @@ Contract:
 
 #### B) Optimization Blackboard Intelligence Flow
 
-`optimization runs`  
-`-> optimization blackboard (build_blackboard.py)`  
-`-> findings/principles/anti-patterns`  
-`-> intelligence briefing (local + global)`  
+`optimization runs`
+`-> optimization blackboard (build_blackboard.py)`
+`-> findings/principles/anti-patterns`
+`-> intelligence briefing (local + global)`
 `-> prompt context + gold-example guidance`
 
 Contract:
@@ -84,22 +92,69 @@ Contract:
 - `SwarmSession` — 4-worker fan-out + snipe refinement
 - `ExpertSession` — iterative analyst + worker with failure analysis (default)
 - `OneshotSession` — single LLM call, no iteration
-- `ADORunner` / `Pipeline.run_query()` — batch harness wrapping any session
+
+---
+
+## Core Data Contract (`schemas.py`)
+
+`schemas.py` defines the data structures that flow between every phase. All consumers must respect these contracts.
+
+### Pipeline-Level Structures
+
+| Struct | Key Fields | Phase(s) |
+|--------|------------|----------|
+| `ValidationStatus` (Enum) | `PASS`, `FAIL`, `ERROR` | 6, 7 |
+| `ValidationResult` | `worker_id`, `status`, `speedup`, `speedup_type`, `error`, `errors: list[str]`, `error_category`, `optimized_sql`, `validation_confidence` | 6 → 7 |
+| `PipelineResult` | `query_id`, `status`, `speedup`, `original_sql`, `optimized_sql`, `nodes_rewritten`, `transforms_applied`, `prompt`, `response`, `analysis` | all → output |
+| `WorkerResult` | `worker_id`, `strategy`, `examples_used`, `optimized_sql`, `speedup`, `status`, `transforms`, `hint`, `error_messages: list[str]`, `error_category`, `exploratory: bool`, `set_local_config` | 4 → 7 |
+| `SessionResult` | `query_id`, `mode`, `best_speedup`, `best_sql`, `original_sql`, `best_transforms`, `status`, `n_iterations`, `n_api_calls` | session → output |
+| `RunMeta` | `run_id`, `model`, `provider`, `git_sha`, `queries_attempted`, `queries_improved`, `estimated_cost_usd` | output |
+
+### Required vs Optional Fields
+
+| Struct | Required (must be non-null) | Optional (may be None/empty) |
+|--------|----------------------------|------------------------------|
+| `ValidationResult` | `worker_id`, `status`, `speedup`, `optimized_sql` | `error`, `errors`, `error_category`, `speedup_type`, `validation_confidence` |
+| `PipelineResult` | `query_id`, `status`, `speedup`, `original_sql`, `optimized_sql` | `transforms_applied`, `prompt`, `response`, `analysis` |
+| `WorkerResult` | `worker_id`, `status`, `speedup`, `optimized_sql` | all others (empty list/string/None) |
+
+### Backward Compatibility Rules
+
+1. **Additive only** — new fields may be added with defaults; existing fields must not be removed or renamed without a migration.
+2. **No silent semantic changes** — if a field's meaning changes (e.g., `speedup` gains a `speedup_type` qualifier), both fields must coexist during transition.
+3. **Enum extension** — new `ValidationStatus` values may be added; consumers must handle unknown values gracefully (treat as `ERROR`).
 
 ---
 
 ## Phase 1: Context Gathering
 
-**Purpose:** Parse the input SQL into a logical tree, run EXPLAIN, extract plan signals.
+**Purpose:** Parse the input SQL into a logical tree, run EXPLAIN, extract plan signals. Emit a quality signal so downstream phases can adjust their gate strictness.
 
 | Field | Detail |
 |-------|--------|
 | CLI | `python3 -m qt_sql.plan_scanner`, `python3 -m qt_sql.scanner_knowledge.build_all` |
 | Entry Point | `Pipeline._parse_logical_tree()` in `pipeline.py` |
 | Input | SQL text (`str`) + DSN (`str`) + dialect (`str`) |
-| Output | `logical_tree` + `costs: dict` + `explain_result: dict` |
+| Output | `logical_tree` + `costs: dict` + `explain_result: dict` + `context_confidence: str` |
 | Success Condition | logical tree has >= 1 node; EXPLAIN returns valid plan or falls back gracefully |
-| Failure Handling | If EXPLAIN ANALYZE fails, falls back to EXPLAIN (no ANALYZE). If that fails, uses heuristic cost splitting. Never blocks pipeline. |
+| Failure Handling | Graceful degradation with quality signal (see below). Never blocks pipeline. |
+
+### Context Confidence Signal
+
+Phase 1 emits `context_confidence` so Phase 2 gates can be more nuanced than binary pass/fail:
+
+| Value | Meaning | When |
+|-------|---------|------|
+| `high` | Full EXPLAIN ANALYZE succeeded; real execution stats available | EXPLAIN ANALYZE returns valid plan with actual rows/times |
+| `degraded` | EXPLAIN (no ANALYZE) succeeded; cost estimates only, no actual execution stats | EXPLAIN ANALYZE failed, fell back to EXPLAIN |
+| `heuristic` | No EXPLAIN data; using heuristic cost splitting from AST only | Both EXPLAIN variants failed; costs derived from logical tree structure |
+
+**Contract:** Phase 2 intelligence gates **must** consult `context_confidence`:
+- `high` — standard gate behavior (hard fail on missing intelligence)
+- `degraded` — standard gate behavior, but prompt must include a note: "EXPLAIN plan is cost-estimate only (no actual execution stats)"
+- `heuristic` — gates remain active but Phase 3 prompt must include: "No EXPLAIN plan available. Cost percentages are heuristic estimates from AST structure. Treat bottleneck identification as approximate."
+
+This resolves the tension between Phase 1's "never blocks pipeline" philosophy and Phase 2's "hard gate" philosophy: Phase 1 never blocks, but it honestly reports its confidence level so downstream consumers can calibrate expectations.
 
 **Key Modules:**
 
@@ -126,13 +181,13 @@ Contract:
 
 ## Phase 2: Knowledge Retrieval
 
-**Purpose:** Find relevant gold examples and assemble intelligence briefing context (local + global), plus engine profiles, constraints, and regression warnings.
+**Purpose:** Find relevant gold examples and assemble intelligence briefing context (local + global), plus engine profiles, constraints, and regression warnings. Gate behavior adjusts based on Phase 1's `context_confidence`.
 
 | Field | Detail |
 |-------|--------|
 | CLI | `python3 -m qt_sql.tag_index [--stats\|--rebuild]` |
 | Entry Point | `Pipeline._find_examples()` in `pipeline.py`, `TagRecommender.find_similar_examples()` in `knowledge.py` |
-| Input | SQL text + dialect |
+| Input | SQL text + dialect + `context_confidence` from Phase 1 |
 | Output | `matched_examples: list[dict]`, `global_knowledge/intelligence_briefing_global`, `plan_scanner_text/intelligence_briefing_local` (PG), `engine_profile: dict`, `constraints: list[dict]`, `regression_warnings: list[dict]` |
 | Success Condition | >= 1 example returned; local + global intelligence briefings are loaded; for PG, scanner intelligence + exploit algorithm are loaded; engine profile loaded for dialect |
 | Failure Handling | Missing required intelligence inputs triggers hard failure via intelligence gates. Optional bootstrap override (`QT_ALLOW_INTELLIGENCE_BOOTSTRAP=1`) may downgrade to warning for controlled bootstrap/debug runs only. |
@@ -143,7 +198,7 @@ Contract:
 |--------|----------------|
 | `knowledge.py` | `TagRecommender` — tag-based similarity matching from `models/similarity_tags.json`. |
 | `tag_index.py` | `SQLNormalizer`, tag extraction, index builder. CLI: `python3 -m qt_sql.tag_index`. |
-| `node_prompter.py` | `_load_engine_profile()`, `_load_constraint_files()`, `load_exploit_algorithm()` — load JSON profiles and constraints. |
+| `prompter.py` | `_load_engine_profile()`, `_load_constraint_files()`, `load_exploit_algorithm()` — load JSON profiles and constraints. |
 | `models/similarity_tags.json` | Tag index for similarity matching (exact counts vary as the catalog evolves). |
 
 **Data Files:**
@@ -157,9 +212,41 @@ Contract:
 
 ---
 
+## Phase 2→3: Intelligence Handoff Contract
+
+`gather_analyst_context()` produces a context dict that is the sole interface between knowledge retrieval and prompt generation. This section specifies which fields are required vs optional and what happens when fields are missing.
+
+### Field Contract
+
+| Field | Required? | If Missing | Impact on Prompt |
+|-------|-----------|-----------|-----------------|
+| `explain_plan_text` | Optional | Prompt says "not available, use logical-tree cost percentages as proxy" | Degraded bottleneck identification |
+| `matched_examples` | **Required** | Intelligence gate hard fail (unless bootstrap override) | No prompt generated |
+| `all_available_examples` | Optional | Analyst uses only matched subset | Slightly less strategy diversity |
+| `global_knowledge` | **Required** | Intelligence gate hard fail (unless bootstrap override) | No prompt generated |
+| `plan_scanner_text` (PG only) | **Required for PG** | Gate fails for PG (unless bootstrap override) | No PG prompt generated |
+| `exploit_algorithm_text` (PG only) | **Required for PG** | Gate fails for PG (unless bootstrap override) | No PG prompt generated |
+| `engine_profile` | Optional | Section omitted from prompt; analyst proceeds without gap-hunting guidance | Reduced optimization quality |
+| `constraints` | Optional | No constraint sections in prompt | May produce known-bad patterns |
+| `regression_warnings` | Optional | Section omitted | May repeat known regressions |
+| `semantic_intents` | Optional | Analyst derives from SQL directly | Slightly more analyst work |
+| `resource_envelope` (PG only) | Optional | Workers skip SET LOCAL section | No per-worker tuning |
+| `strategy_leaderboard` | Optional | Omitted from prompt | Analyst picks strategies blind |
+| `query_archetype` | Optional | Omitted from prompt | No archetype-specific guidance |
+| `context_confidence` | **Required** | Defaults to `heuristic` (most conservative) | Prompt includes appropriate caveats |
+
+### Partial Intelligence Rules
+
+1. **Local present, global empty** — hard gate fail. Global intelligence is always required because it provides cross-query pattern knowledge.
+2. **Global present, local empty (non-PG)** — proceeds. Local intelligence is PG-specific (scanner findings).
+3. **Global present, local empty (PG)** — hard gate fail. PG requires scanner-derived local intelligence.
+4. **All present but `context_confidence=heuristic`** — proceeds with caveat text injected into prompt.
+
+---
+
 ## Phase 3: Prompt Generation
 
-**Purpose:** Assemble structured prompts for the analyst and workers from Phase 1+2 outputs, including intelligence briefings (local + global).
+**Purpose:** Assemble structured prompts for the analyst and workers from Phase 1+2 outputs, including intelligence briefings (local + global). Manage token budgets to prevent silent quality degradation from context overflow.
 
 | Field | Detail |
 |-------|--------|
@@ -167,8 +254,32 @@ Contract:
 | Entry Point | `build_analyst_briefing_prompt()` in `prompts/analyst_briefing.py`, `build_worker_prompt()` in `prompts/worker.py`, `build_sniper_prompt()` in `prompts/swarm_snipe.py` |
 | Input | Phase 1+2 context dict (from `Pipeline.gather_analyst_context()`): logical tree/EXPLAIN + matched examples + intelligence briefing local/global + constraints/profiles; mode; worker assignments |
 | Output | Prompt text(s) — one analyst prompt + one per worker |
-| Success Condition | All required sections present (semantic contract, target logical tree, examples, DAP output format) |
-| Failure Handling | Missing required intelligence or required analyst briefing sections is a hard failure (no synthetic fallback briefing generation). |
+| Success Condition | All required sections present (semantic contract, target logical tree, examples, DAP output format); total prompt within token budget |
+| Failure Handling | Missing required intelligence or required analyst briefing sections is a hard failure (no synthetic fallback briefing generation). Token budget overflow triggers truncation with warning. |
+
+### Token Budget Contract
+
+Generous limits (2x observed maximums) to avoid premature truncation while bounding degenerate cases:
+
+| Prompt Type | Observed Size | Budget Limit | Truncation Strategy |
+|-------------|---------------|--------------|---------------------|
+| Analyst briefing | ~3,500–5,000 tokens | 10,000 tokens | Truncate EXPLAIN plan (150-line cap already enforced), then trim least-relevant examples |
+| Worker briefing | ~2,000–2,500 tokens | 6,000 tokens | Truncate example SQL bodies first, then trim strategy context |
+| Sniper prompt | ~3,000–4,000 tokens | 8,000 tokens | Truncate per-worker result summaries, cap error messages at 60 chars (already enforced) |
+| PG tuner prompt | ~1,000 tokens | 3,000 tokens | Truncate resource envelope details |
+
+**Existing truncation points** (already implemented):
+- EXPLAIN plans: 150-line cap (`analyst_briefing.py`)
+- Filter expressions: 80-char cap
+- Join conditions: 60-char cap
+- Worker error messages in snipe: 60-char cap (`swarm_snipe.py`)
+- Semantic contract: validated to 80–150 tokens (`briefing_checks.py`)
+
+**Contract rules:**
+1. If a prompt exceeds its budget, log a warning with the prompt type and actual size.
+2. Truncate the largest variable-size section first (EXPLAIN plan > example SQL bodies > strategy text).
+3. Never truncate: semantic contract, output format spec, DAP instructions, constraint warnings.
+4. If truncation still exceeds budget by >50%, fail the prompt generation (degenerate input).
 
 **Key Modules:**
 
@@ -204,7 +315,7 @@ Contract:
 
 | Field | Detail |
 |-------|--------|
-| CLI | `POST /api/sql/optimize` (API), `ADORunner.run_query()` (programmatic) |
+| CLI | `POST /api/sql/optimize` (API), `Pipeline.run_query()` (programmatic) |
 | Entry Point | `CandidateGenerator._analyze()` in `generate.py` |
 | Input | Prompt text(s) |
 | Output | Raw LLM response strings per worker |
@@ -264,18 +375,41 @@ Contract:
 
 ## Phase 6: Validation & Benchmarking
 
-**Purpose:** Verify semantic equivalence and measure performance improvement.
+**Purpose:** Verify semantic equivalence and measure performance improvement. Validation strength varies by engine; all results carry a confidence tag.
 
 | Field | Detail |
 |-------|--------|
 | CLI | `POST /api/sql/validate` |
 | Entry Point | `Validator.validate()` in `validate.py` |
 | Input | Original SQL + candidate SQL + executor (DSN) |
-| Output | `ValidationResult` (`status`, `speedup`, `error_category`) |
-| Success Condition | sqlglot gate passes; row counts match; checksums match (DuckDB). Performance is measured and classified separately (WIN/IMPROVED/NEUTRAL/REGRESSION). |
+| Output | `ValidationResult` (`status`, `speedup`, `speedup_type`, `error_category`, `validation_confidence`) |
+| Success Condition | sqlglot gate passes; equivalence check passes (see per-engine rules below). Performance is measured and classified separately (WIN/IMPROVED/NEUTRAL/REGRESSION). |
 | Failure Handling | Returns structured `ValidationResult` with `ValidationStatus.ERROR` or `.FAIL`, `errors` list, and `error_category`. |
 
-**Speedup Thresholds:**
+### Equivalence Verification by Engine
+
+| Check | DuckDB | PostgreSQL |
+|-------|--------|------------|
+| Row count match | Yes | Yes |
+| Full result-set MD5 checksum | Yes | **No** (known gap — see compensating controls) |
+| Cost-rank pre-screening | Yes (`cost_rank_candidates()`) | **No** |
+| `validation_confidence` | `high` | `row_count_only` |
+
+**Contract:** Row counts alone are not sufficient for equivalence claims. Specific risks:
+- Queries returning 0 rows pass trivially on row count (both return 0) but may have completely different semantics.
+- Aggregation queries can return the correct number of rows with wrong values.
+- JOIN reorderings can produce duplicate/missing rows that happen to sum to the same count.
+
+### PostgreSQL Compensating Controls
+
+Since PG lacks checksum verification, the following compensating controls apply:
+
+1. **PG results carry lower confidence.** All PG `ValidationResult` objects must set `validation_confidence: "row_count_only"`. Downstream consumers (leaderboard, paper claims) must distinguish this from `"high"` confidence.
+2. **Post-hoc DuckDB SF100 verification.** For PG winners intended for publication or SOTA claims, re-run the original and optimized SQL on DuckDB SF100 with full checksum verification. This can be done after the fact and is the definitive equivalence check.
+3. **Zero-row query flag.** If both original and optimized return 0 rows, set `validation_confidence: "zero_row_unverified"`. These must be confirmed on DuckDB SF100 before any claims.
+4. **No silent pass.** PG validation must never report `PASS` without logging that it used row-count-only checking.
+
+### Speedup Classification
 
 | Label | Threshold |
 |-------|-----------|
@@ -284,7 +418,22 @@ Contract:
 | NEUTRAL | >= 0.95x |
 | REGRESSION | < 0.95x |
 
-**Timing Methods:**
+### Speedup Type Labeling
+
+Every `ValidationResult` must include `speedup_type` to prevent misleading ratios:
+
+| `speedup_type` | Meaning | When |
+|----------------|---------|------|
+| `measured` | Both original and optimized ran to completion; speedup is a real ratio of measured times | Default — both queries complete within timeout |
+| `vs_timeout_ceiling` | Original query timed out; baseline is the timeout ceiling (e.g., 300s). Speedup ratio is inflated and not comparable to measured ratios. | Original hits timeout; optimized completes |
+| `both_timeout` | Both original and optimized timed out | Neither completed — speedup is meaningless (set to 1.0) |
+
+**Contract rules:**
+1. `vs_timeout_ceiling` results must **never** be mixed with `measured` results in aggregate statistics (mean speedup, win rate, etc.) without explicit separation.
+2. Leaderboard displays must show `speedup_type` alongside the ratio. A "4428x" `vs_timeout_ceiling` win is real but categorically different from a "3.93x" `measured` win.
+3. Paper claims must report `vs_timeout_ceiling` results in a separate table or with explicit annotation.
+
+### Timing Methods
 
 | Method | Protocol | When |
 |--------|----------|------|
@@ -298,7 +447,7 @@ Contract:
 
 | Module | Responsibility |
 |--------|----------------|
-| `validate.py` | `Validator` — orchestrates validation. `benchmark_baseline()` → `OriginalBaseline`. `validate_against_baseline()` for batch mode. `cost_rank_candidates()` for cost-based pre-screening. `categorize_error()` for learning. |
+| `validate.py` | `Validator` — orchestrates validation. `benchmark_baseline()` → `OriginalBaseline`. `validate_against_baseline()` for batch mode. `cost_rank_candidates()` for cost-based pre-screening (DuckDB only). `categorize_error()` for learning. |
 | `validation/sql_validator.py` | `SQLValidator` — DuckDB validation engine: syntax check, benchmarking, equivalence. |
 | `validation/benchmarker.py` | `QueryBenchmarker` — timing harness (warmup + measurement pattern). |
 | `validation/equivalence_checker.py` | `EquivalenceChecker` — row count + MD5 checksum comparison (DuckDB). `ChecksumResult`, `RowCountResult`, `ValueComparisonResult`. |
@@ -308,8 +457,8 @@ Contract:
 
 | Struct | Location | Key Fields |
 |--------|----------|------------|
-| `ValidationResult` | `schemas.py` | `worker_id`, `status: ValidationStatus`, `speedup`, `error`, `errors`, `error_category` |
-| `OriginalBaseline` | `validate.py` | `measured_time_ms`, `row_count`, `rows`, `checksum` |
+| `ValidationResult` | `schemas.py` | `worker_id`, `status: ValidationStatus`, `speedup`, `speedup_type`, `error`, `errors`, `error_category`, `validation_confidence` |
+| `OriginalBaseline` | `validate.py` | `measured_time_ms`, `row_count`, `rows`, `checksum`, `is_timeout: bool` |
 
 ---
 
@@ -334,7 +483,6 @@ Contract:
 | `learn.py` | `Learner` — create `LearningRecord`, save to journal, `build_learning_summary()`, `generate_benchmark_history()`. |
 | `build_blackboard.py` | `BlackboardEntry` extraction from swarm batches. `KnowledgePrinciple`, `KnowledgeAntiPattern` collation. Global mode aggregates best-of-all-sources. No LLM calls. |
 | `session_logging.py` | Per-run file logging — `attach_session_handler()`, `detach_session_handler()`. |
-| `schemas.py` | `SessionResult` (per-session), `WorkerResult` (per-worker), `PipelineResult` (per-query), `RunMeta` (traceability). |
 
 **Key Data Structures:**
 
@@ -346,6 +494,113 @@ Contract:
 | `SessionResult` | `schemas.py` | `query_id`, `mode`, `best_speedup`, `best_sql`, `status`, `n_iterations`, `n_api_calls` |
 | `WorkerResult` | `schemas.py` | `worker_id`, `strategy`, `examples_used`, `speedup`, `status`, `transforms`, `set_local_config` |
 | `RunMeta` | `schemas.py` | `run_id`, `model`, `provider`, `git_sha`, `queries_attempted`, `queries_improved`, `estimated_cost_usd` |
+
+---
+
+## API Contract
+
+The FastAPI backend (`api/main.py`) serves the web UI and programmatic consumers. Version 2.0.0.
+
+### `POST /api/sql/optimize`
+
+Run the full optimization pipeline on a query.
+
+**Request:**
+
+```json
+{
+  "sql": "SELECT ... (required)",
+  "dsn": "duckdb:///path.db | postgres://user:pass@host:port/db (required)",
+  "mode": "swarm | expert | oneshot (optional, default: expert)",
+  "query_id": "string (optional, auto-generated if omitted)",
+  "max_iterations": 3,
+  "target_speedup": 1.10
+}
+```
+
+**Response (success):**
+
+```json
+{
+  "status": "WIN | IMPROVED | NEUTRAL | REGRESSION | ERROR",
+  "speedup": 1.45,
+  "speedup_type": "measured | vs_timeout_ceiling | both_timeout",
+  "validation_confidence": "high | row_count_only | zero_row_unverified",
+  "optimized_sql": "SELECT ...",
+  "original_sql": "SELECT ...",
+  "transforms": ["decorrelate", "date_cte_isolate"],
+  "workers": [ { "worker_id": 1, "strategy": "...", "speedup": 1.45, "status": "WIN", "transforms": [...] } ],
+  "query_id": "q88",
+  "n_iterations": 1,
+  "n_api_calls": 5
+}
+```
+
+**Response (error):**
+
+```json
+{
+  "status": "ERROR",
+  "error": "Intelligence gate failure: missing global_knowledge",
+  "query_id": "q88"
+}
+```
+
+**Contract:** The optimize endpoint must propagate `speedup_type` and `validation_confidence` from the pipeline's `SessionResult` / `ValidationResult`. These fields are defined in the response model but require the pipeline to populate them (see Phase 6 contract for field semantics).
+
+### `POST /api/sql/validate`
+
+Validate that optimized SQL is equivalent to original. Compares row counts, checksums, and values. Measures timing with warmup + measurement pattern.
+
+**Request:**
+
+```json
+{
+  "original_sql": "SELECT ... (required)",
+  "optimized_sql": "SELECT ... (required)",
+  "mode": "sample | full (default: sample)",
+  "schema_sql": "CREATE TABLE ... (optional, for in-memory validation)",
+  "session_id": "string (optional, existing DuckDB session)",
+  "limit_strategy": "add_order | remove_limit (default: add_order)"
+}
+```
+
+**Response:**
+
+```json
+{
+  "status": "pass | fail | warn | error",
+  "mode": "sample | full",
+  "row_counts": { "original": 100, "optimized": 100 },
+  "row_counts_match": true,
+  "timing": { "original_ms": 45.2, "optimized_ms": 31.1 },
+  "speedup": 1.45,
+  "cost": { "original": 120.0, "optimized": 85.0 },
+  "cost_reduction_pct": 29.17,
+  "values_match": true,
+  "checksum_match": true,
+  "value_differences": [],
+  "limit_detected": false,
+  "errors": [],
+  "warnings": []
+}
+```
+
+### Database Session Routes
+
+| Route | Method | Purpose |
+|-------|--------|---------|
+| `/api/database/connect/duckdb` | POST | Upload fixture file (SQL/CSV/Parquet) |
+| `/api/database/connect/duckdb/quick` | POST | Connect via server-side path |
+| `/api/database/status/{session_id}` | GET | Connection status |
+| `/api/database/disconnect/{session_id}` | DELETE | Disconnect and clean up |
+| `/api/database/execute/{session_id}` | POST | Execute SQL, return rows |
+| `/api/database/explain/{session_id}` | POST | EXPLAIN plan with analysis |
+| `/api/database/schema/{session_id}` | GET | Table + column schema |
+
+### `GET /health`
+
+Returns `{ "status": "ok", "version": "2.0.0", "llm_configured": true, "llm_provider": "deepseek" }`.
 
 ---
 
@@ -363,13 +618,6 @@ Contract:
 | `python3 -m qt_sql.build_blackboard --global` | Build global best-of-all-sources blackboard |
 | `python3 -m qt_sql.benchmarks.build_best` | Build best-of artifacts from leaderboard |
 | `python3 -m qt_sql.benchmarks.migrate_leaderboards` | Migrate leaderboard formats |
-
-**API Endpoints** (via `api/main.py`):
-
-| Endpoint | Method |
-|----------|--------|
-| `/api/sql/optimize` | POST — run optimization pipeline |
-| `/api/sql/validate` | POST — validate candidate SQL |
 
 **Environment:**
 
@@ -392,7 +640,7 @@ PYTHONPATH=packages/qt-shared:packages/qt-sql:.
 | `scanner_knowledge/` | 1 | Scanner findings → prompt text |
 | `knowledge.py` | 2 | Tag-based example matching |
 | `tag_index.py` | 2 | Example index builder |
-| `node_prompter.py` | 2, 3 | Load engine profiles, constraints; prompt utilities |
+| `prompter.py` | 2, 3 | Load engine profiles, constraints; prompt utilities |
 | `prompts/analyst_briefing.py` | 3 | Analyst briefing prompt builder |
 | `prompts/worker.py` | 3 | Worker rewrite prompt builder |
 | `prompts/swarm_snipe.py` | 3 | Snipe refinement prompt builder |
@@ -410,9 +658,8 @@ PYTHONPATH=packages/qt-shared:packages/qt-sql:.
 | `learn.py` | 7 | Learning records + analytics |
 | `build_blackboard.py` | 7 | Knowledge extraction from batches |
 | `session_logging.py` | 7 | Per-run file logging |
-| `schemas.py` | all | Shared data structures |
+| `schemas.py` | all | Shared data structures (see Core Data Contract) |
 | `pipeline.py` | all | Pipeline orchestrator (all phases) |
-| `runner.py` | all | `ADORunner` — batch harness |
 | `sessions/swarm_session.py` | all | Swarm session orchestrator |
 | `sessions/expert_session.py` | all | Expert session orchestrator |
 | `sessions/oneshot_session.py` | all | Oneshot session orchestrator |
@@ -424,12 +671,14 @@ PYTHONPATH=packages/qt-shared:packages/qt-sql:.
 
 ## Known Gaps
 
-1. **PG equivalence checking** — PostgreSQL path checks row counts only; checksum comparison not yet implemented. DuckDB path has full MD5 checksum verification.
+1. **PG equivalence checking** — PostgreSQL path checks row counts only; full result-set checksum comparison not yet implemented. DuckDB path has full MD5 checksum verification. **Compensating control:** PG results tagged `validation_confidence: "row_count_only"`; post-hoc DuckDB SF100 verification required for publication claims.
 
 2. **Formal SQL equivalence** — No formal prover handles CTEs + window functions (all TPC-DS queries use both). QED (VLDB 2024) and VeriEQL (OOPSLA 2024) both lack CTE support. We verify via result-set checksums.
 
-3. **Cost-rank pre-screening** — `cost_rank_candidates()` uses EXPLAIN cost estimates for DuckDB only. PG pre-screening is not implemented.
+3. **Cost-rank pre-screening** — `cost_rank_candidates()` uses EXPLAIN cost estimates for DuckDB only. PG pre-screening is not implemented. **Impact:** PG runs validate all candidates (slower but more thorough).
 
 4. **Bootstrap override risk** — `QT_ALLOW_INTELLIGENCE_BOOTSTRAP=1` intentionally bypasses intelligence hard gates for bootstrap/debug runs. This must stay off for performance-critical or SOTA claims.
 
-5. **Timeout baseline handling** — When the original query times out (PG), baseline is set to the timeout ceiling. This can inflate speedup ratios for queries that were previously timing out.
+5. **Timeout baseline handling** — When the original query times out (PG), baseline is set to the timeout ceiling. **Compensating control:** All such results labeled `speedup_type: "vs_timeout_ceiling"` and must be reported separately from measured speedups. See Phase 6 speedup type rules.
+
+6. **Zero-row queries** — Queries returning 0 rows pass row-count validation trivially. **Compensating control:** Tagged `validation_confidence: "zero_row_unverified"` and must be confirmed on DuckDB SF100 post-hoc.
