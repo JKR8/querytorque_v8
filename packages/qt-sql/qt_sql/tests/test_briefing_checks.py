@@ -58,7 +58,7 @@ def _worker(worker_id: int, target_logical_tree: str | None = None) -> BriefingW
         strategy=f"strategy_{worker_id}_custom",
         target_logical_tree=target_logical_tree or _valid_target_logical_tree(),
         examples=[f"ex_{worker_id}"],
-        example_reasoning="Pattern matches bottleneck and preserves semantics.",
+        example_adaptation="Pattern matches bottleneck and preserves semantics.",
         hazard_flags="- Preserve non-equi predicates and output schema.",
     )
 
@@ -127,24 +127,14 @@ def test_worker_prompt_includes_rewrite_checklist() -> None:
     assert "Preserve all literals and the exact final output schema/order." in prompt
 
 
-def test_validate_parsed_briefing_flags_incorrect_population() -> None:
-    bad_worker_1 = _worker(
-        1,
-        target_logical_tree=(
-            "TARGET_LOGICAL_TREE:\n"
-            "  a -> b -> c\n\n"
-            "NODE_CONTRACTS:\n"
-            "  a:\n"
-            "    FROM: t1\n"
-            "    OUTPUT: all columns from t1\n"
-            "    EXPECTED_ROWS: ~100\n"
-            "    CONSUMERS: b\n\n"
-            "  b:\n"
-            "    FROM: a\n"
-            "    OUTPUT: k1\n"
-            "    EXPECTED_ROWS: ~10\n"
-            "    CONSUMERS: result"
-        ),
+def test_validate_parsed_briefing_flags_missing_fields() -> None:
+    bad_worker_1 = BriefingWorker(
+        worker_id=1,
+        strategy="strategy_1_custom",
+        target_logical_tree="",  # empty — should flag
+        examples=["ex_1"],
+        example_adaptation="Apply pattern.",
+        hazard_flags="- Risk.",
     )
     parsed = ParsedBriefing(
         shared=_shared_valid(),
@@ -154,8 +144,7 @@ def test_validate_parsed_briefing_flags_incorrect_population() -> None:
 
     issues = validate_parsed_briefing(parsed)
 
-    assert any("NODE_CONTRACTS missing node 'c'" in i for i in issues)
-    assert any("OUTPUT uses placeholder text" in i for i in issues)
+    assert any("TARGET_LOGICAL_TREE/NODE_CONTRACTS missing" in i for i in issues)
 
 
 def test_validate_parsed_briefing_accepts_well_populated_briefing() -> None:

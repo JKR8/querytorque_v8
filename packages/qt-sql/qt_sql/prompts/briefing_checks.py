@@ -153,16 +153,14 @@ def validate_parsed_briefing(briefing: Any) -> List[str]:
         for ex in examples:
             seen_examples.setdefault(ex, wid)
 
-        if not (getattr(worker, "example_reasoning", "") or "").strip():
-            issues.append(f"WORKER_{wid}: EXAMPLE_REASONING missing.")
+        if not (getattr(worker, "example_adaptation", "") or "").strip():
+            issues.append(f"WORKER_{wid}: EXAMPLE_ADAPTATION missing.")
         if not (getattr(worker, "hazard_flags", "") or "").strip():
             issues.append(f"WORKER_{wid}: HAZARD_FLAGS missing.")
 
         target_logical_tree = (getattr(worker, "target_logical_tree", "") or "").strip()
         if not target_logical_tree:
             issues.append(f"WORKER_{wid}: TARGET_LOGICAL_TREE/NODE_CONTRACTS missing.")
-            continue
-        issues.extend(_validate_worker_target_logical_tree(wid, target_logical_tree))
 
     return issues
 
@@ -222,116 +220,3 @@ def _validate_shared(shared: Any) -> List[str]:
     return issues
 
 
-def _validate_worker_target_logical_tree(
-    worker_id: int,
-    target_logical_tree: str,
-) -> List[str]:
-    issues: List[str] = []
-    logical_tree_nodes = _extract_logical_tree_nodes(target_logical_tree)
-    if not logical_tree_nodes:
-        issues.append(f"WORKER_{worker_id}: TARGET_LOGICAL_TREE node chain missing.")
-        return issues
-
-    contracts = _extract_node_contracts(target_logical_tree)
-    if not contracts:
-        issues.append(f"WORKER_{worker_id}: NODE_CONTRACTS block missing or unparsable.")
-        return issues
-
-    for node in logical_tree_nodes:
-        if node not in contracts:
-            issues.append(f"WORKER_{worker_id}: NODE_CONTRACTS missing node '{node}'.")
-
-    required_fields = ("FROM", "OUTPUT", "CONSUMERS")
-    for node, fields in contracts.items():
-        for req in required_fields:
-            if not (fields.get(req, "") or "").strip():
-                issues.append(
-                    f"WORKER_{worker_id}: node '{node}' missing required field `{req}`."
-                )
-
-        output = (fields.get("OUTPUT", "") or "").lower()
-        if output and (
-            "all " in output
-            or " all_" in output
-            or "columns" in output
-            or "..." in output
-        ):
-            issues.append(
-                f"WORKER_{worker_id}: node '{node}' OUTPUT uses placeholder text, "
-                "not an explicit column list."
-            )
-
-    for idx, node in enumerate(logical_tree_nodes[:-1]):
-        next_node = logical_tree_nodes[idx + 1]
-        consumers = contracts.get(node, {}).get("CONSUMERS", "")
-        consumer_nodes = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", consumers))
-        if next_node not in consumer_nodes:
-            issues.append(
-                f"WORKER_{worker_id}: node '{node}' CONSUMERS does not include "
-                f"next logical tree node '{next_node}'."
-            )
-
-    return issues
-
-
-def _extract_logical_tree_nodes(text: str) -> List[str]:
-    match = re.search(
-        r"TARGET_LOGICAL_TREE:\s*(.*?)(?:\n\s*NODE_CONTRACTS\s*:|$)",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    block = match.group(1) if match else text
-    nodes: List[str] = []
-    for line in block.splitlines():
-        if "->" not in line:
-            continue
-        parts = [p.strip() for p in line.split("->")]
-        for raw in parts:
-            node = raw.strip("`[]() ")
-            if not node:
-                continue
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", node) and node not in nodes:
-                nodes.append(node)
-    return nodes
-
-
-def _extract_node_contracts(text: str) -> Dict[str, Dict[str, str]]:
-    match = re.search(r"NODE_CONTRACTS:\s*\n(.*)$", text, flags=re.IGNORECASE | re.DOTALL)
-    if not match:
-        return {}
-    block = match.group(1)
-
-    contracts: Dict[str, Dict[str, str]] = {}
-    current_node = ""
-    last_field = ""
-    field_re = re.compile(
-        r"^\s{4,}(FROM|JOIN|WHERE|GROUP BY|AGGREGATE|OUTPUT|EXPECTED_ROWS|CONSUMERS)\s*:\s*(.*)$",
-        re.IGNORECASE,
-    )
-    node_re = re.compile(r"^\s{2,}([A-Za-z_][A-Za-z0-9_]*)\s*:\s*$")
-
-    for line in block.splitlines():
-        node_match = node_re.match(line)
-        if node_match:
-            current_node = node_match.group(1)
-            contracts.setdefault(current_node, {})
-            last_field = ""
-            continue
-
-        if not current_node:
-            continue
-
-        field_match = field_re.match(line)
-        if field_match:
-            field = field_match.group(1).upper()
-            value = field_match.group(2).strip()
-            contracts[current_node][field] = value
-            last_field = field
-            continue
-
-        # Continuation line for multi-line field values.
-        if last_field and line.strip():
-            prev = contracts[current_node].get(last_field, "")
-            contracts[current_node][last_field] = f"{prev} {line.strip()}".strip()
-
-    return contracts

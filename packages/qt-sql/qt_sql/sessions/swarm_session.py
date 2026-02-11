@@ -289,6 +289,12 @@ class SwarmSession(OptimizationSession):
             f"{_fmt_elapsed(time.time() - t0)})"
         )
 
+        # Persist analyst prompt + response before validation (so failures are debuggable)
+        iter_dir = self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id / "iteration_00_fan_out"
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        (iter_dir / "analyst_prompt.txt").write_text(analyst_prompt, encoding="utf-8")
+        (iter_dir / "analyst_response.txt").write_text(analyst_response, encoding="utf-8")
+
         # ── Step 4: Parse briefing ──────────────────────────────────────
         briefing = parse_briefing_response(analyst_response)
         briefing_issues = validate_parsed_briefing(briefing)
@@ -506,7 +512,7 @@ class SwarmSession(OptimizationSession):
                 speedup=speedup,
                 status=status,
                 transforms=transforms,
-                hint=wb.example_reasoning[:80] if wb.example_reasoning else "",
+                hint=wb.example_adaptation[:80] if wb.example_adaptation else "",
                 error_message=" | ".join(error_msgs) if error_msgs else None,
                 error_messages=error_msgs or [],
                 error_category=error_cat,

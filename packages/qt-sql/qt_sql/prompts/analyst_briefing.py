@@ -12,7 +12,7 @@ The V2 analyst produces a structured briefing:
     4. REGRESSION_WARNINGS — causal rules, not just "this happened"
   Per-worker:
     5. TARGET_LOGICAL_TREE + NODE_CONTRACTS — CTE blueprint + column contracts
-    6. EXAMPLES + EXAMPLE_REASONING — why each example matches
+    6. EXAMPLES + EXAMPLE_ADAPTATION — what to apply/ignore per example
     7. HAZARD_FLAGS — strategy-specific risks for this query
 """
 
@@ -1281,22 +1281,19 @@ def build_analyst_briefing_prompt(
     ]
 
     if mode == "swarm":
-        lines.append("=== WORKER 1 BRIEFING ===")
-        lines.append("")
-        for tl in _WORKER_BRIEFING_TEMPLATE:
-            lines.append(tl)
-        lines.append("")
-        lines.append("=== WORKER 2 BRIEFING ===")
-        lines.append("[Same structure as Worker 1, DIFFERENT strategy]")
-        lines.append("")
-        lines.append("=== WORKER 3 BRIEFING ===")
-        lines.append("[Same structure as Worker 1, DIFFERENT strategy]")
-        lines.append("")
-        lines.append("=== WORKER 4 BRIEFING === (EXPLORATION WORKER)")
-        lines.append("[Same structure as Worker 1, DIFFERENT strategy]")
-        lines.append("CONSTRAINT_OVERRIDE: [CONSTRAINT_ID or 'None']")
-        lines.append("OVERRIDE_REASONING: [Why this query's structure differs from the observed failure, or 'N/A']")
-        lines.append("EXPLORATION_TYPE: [constraint_relaxation | compound_strategy | novel_combination]")
+        for wid in range(1, 5):
+            if wid == 4:
+                lines.append(f"=== WORKER {wid} BRIEFING === (EXPLORATION WORKER)")
+            else:
+                lines.append(f"=== WORKER {wid} BRIEFING ===")
+            lines.append("")
+            for tl in _WORKER_BRIEFING_TEMPLATE:
+                lines.append(tl)
+            if wid == 4:
+                lines.append("CONSTRAINT_OVERRIDE: [CONSTRAINT_ID or 'None']")
+                lines.append("OVERRIDE_REASONING: [Why this query's structure differs from the observed failure, or 'N/A']")
+                lines.append("EXPLORATION_TYPE: [constraint_relaxation | compound_strategy | novel_combination]")
+            lines.append("")
     elif mode == "expert":
         lines.append("=== WORKER 1 BRIEFING ===")
         lines.append("")

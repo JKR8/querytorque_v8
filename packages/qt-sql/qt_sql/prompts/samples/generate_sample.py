@@ -489,7 +489,7 @@ def build_q88_mock_briefing(ctx: PromptContext):
             "    EXPECTED_ROWS: 1"
         ),
         examples=["dimension_cte_isolate", "date_cte_isolate", "shared_dimension_multi_channel"],
-        example_reasoning=(
+        example_adaptation=(
             "dimension_cte_isolate:\n"
             "  APPLY: Pre-filter household_demographics and store into CTEs. "
             "Q88 joins these 8 times each — pre-filtering from 7.2K/1K rows "

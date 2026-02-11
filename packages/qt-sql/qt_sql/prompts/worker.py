@@ -124,11 +124,11 @@ def build_worker_prompt(
         )
 
     # ── [6] EXAMPLE ADAPTATION ─────────────────────────────────────────
-    if worker_briefing.example_reasoning:
+    if worker_briefing.example_adaptation:
         sections.append(
             "## Example Adaptation Notes\n\n"
             "For each example: what to apply to your rewrite, and what to ignore.\n\n"
-            + worker_briefing.example_reasoning
+            + worker_briefing.example_adaptation
         )
 
     if examples:

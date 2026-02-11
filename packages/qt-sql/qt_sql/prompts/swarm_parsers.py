@@ -148,7 +148,7 @@ class BriefingWorker:
     strategy: str = ""
     target_logical_tree: str = ""  # Logical tree topology + node contracts
     examples: List[str] = field(default_factory=list)
-    example_reasoning: str = ""
+    example_adaptation: str = ""
     hazard_flags: str = ""
 
 
@@ -180,7 +180,7 @@ def parse_briefing_response(response: str) -> ParsedBriefing:
         TARGET_LOGICAL_TREE: ...
         NODE_CONTRACTS: ...
         EXAMPLES: ...
-        EXAMPLE_REASONING: ...
+        EXAMPLE_ADAPTATION: ...
         HAZARD_FLAGS: ...
 
         === WORKER 2 BRIEFING ===
@@ -296,11 +296,11 @@ def _parse_single_worker(block: str, worker_id: int) -> BriefingWorker:
     # These are conceptually one unit — the CTE blueprint
     target_logical_tree = _extract_briefing_section(
         block, "TARGET_LOGICAL_TREE",
-        ["EXAMPLES", "EXAMPLE_REASONING", "HAZARD_FLAGS", "==="],
+        ["EXAMPLES", "EXAMPLE_ADAPTATION", "HAZARD_FLAGS", "==="],
     )
     node_contracts = _extract_briefing_section(
         block, "NODE_CONTRACTS",
-        ["EXAMPLES", "EXAMPLE_REASONING", "HAZARD_FLAGS", "==="],
+        ["EXAMPLES", "EXAMPLE_ADAPTATION", "HAZARD_FLAGS", "==="],
     )
     # Combine target logical tree and node contracts
     parts = []
@@ -310,9 +310,9 @@ def _parse_single_worker(block: str, worker_id: int) -> BriefingWorker:
         parts.append(f"NODE_CONTRACTS:\n{node_contracts}")
     w.target_logical_tree = "\n\n".join(parts)
 
-    # EXAMPLE_REASONING (multi-line)
-    w.example_reasoning = _extract_briefing_section(
-        block, "EXAMPLE_REASONING",
+    # EXAMPLE_ADAPTATION (multi-line)
+    w.example_adaptation = _extract_briefing_section(
+        block, "EXAMPLE_ADAPTATION",
         ["HAZARD_FLAGS", "===", "WORKER"],
     )
 
