@@ -17,11 +17,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Directory paths
-BASE_DIR = Path(__file__).resolve().parent
+# Directory paths — resolve relative to the qt_sql package root (parent of knowledge/)
+BASE_DIR = Path(__file__).resolve().parent.parent
 MODELS_DIR = BASE_DIR / "models"
-
-
 
 
 # =============================================================================
@@ -84,7 +82,7 @@ class TagRecommender:
         engine = "postgres" if dialect == "postgres" else "duckdb"
 
         try:
-            from .tag_index import extract_tags, classify_category
+            from qt_sql.tag_index import extract_tags, classify_category
 
             query_tags = extract_tags(sql, dialect=dialect)
             query_category = classify_category(query_tags)
@@ -140,7 +138,7 @@ class TagRecommender:
         engine = "postgres" if dialect == "postgres" else "duckdb"
 
         try:
-            from .tag_index import extract_tags, classify_category
+            from qt_sql.tag_index import extract_tags, classify_category
 
             query_tags = extract_tags(sql, dialect=dialect)
             query_category = classify_category(query_tags)
