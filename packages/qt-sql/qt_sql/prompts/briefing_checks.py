@@ -22,7 +22,7 @@ def build_analyst_section_checklist() -> str:
         "Use this checklist to verify content quality, not just section presence:",
         "",
         "### SHARED BRIEFING",
-        "- `SEMANTIC_CONTRACT`: 80-150 tokens and includes business intent, JOIN semantics, aggregation trap, and filter dependency.",
+        "- `SEMANTIC_CONTRACT`: 40-200 tokens and includes business intent, JOIN semantics, aggregation trap, and filter dependency.",
         "- `BOTTLENECK_DIAGNOSIS`: states dominant mechanism, bound type (`scan-bound`/`join-bound`/`aggregation-bound`), cardinality flow, and what optimizer already handles well.",
         "- `ACTIVE_CONSTRAINTS`: includes all 4 correctness IDs plus 1-3 active engine gaps with EXPLAIN evidence.",
         "- `REGRESSION_WARNINGS`: either `None applicable.` or numbered entries with both `CAUSE:` and `RULE:`.",
@@ -48,7 +48,7 @@ def build_expert_section_checklist() -> str:
         "Use this checklist to verify content quality, not just section presence:",
         "",
         "### SHARED BRIEFING",
-        "- `SEMANTIC_CONTRACT`: 80-150 tokens and includes business intent, JOIN semantics, aggregation trap, and filter dependency.",
+        "- `SEMANTIC_CONTRACT`: 40-200 tokens and includes business intent, JOIN semantics, aggregation trap, and filter dependency.",
         "- `BOTTLENECK_DIAGNOSIS`: states dominant mechanism, bound type (`scan-bound`/`join-bound`/`aggregation-bound`), cardinality flow, and what optimizer already handles well.",
         "- `ACTIVE_CONSTRAINTS`: includes all 4 correctness IDs plus 1-3 active engine gaps with EXPLAIN evidence.",
         "- `REGRESSION_WARNINGS`: either `None applicable.` or numbered entries with both `CAUSE:` and `RULE:`.",
@@ -70,7 +70,7 @@ def build_oneshot_section_checklist() -> str:
         "Use this checklist to verify content quality, not just section presence:",
         "",
         "### SHARED BRIEFING",
-        "- `SEMANTIC_CONTRACT`: 80-150 tokens and includes business intent, JOIN semantics, aggregation trap, and filter dependency.",
+        "- `SEMANTIC_CONTRACT`: 40-200 tokens and includes business intent, JOIN semantics, aggregation trap, and filter dependency.",
         "- `BOTTLENECK_DIAGNOSIS`: states dominant mechanism, bound type (`scan-bound`/`join-bound`/`aggregation-bound`), cardinality flow, and what optimizer already handles well.",
         "- `ACTIVE_CONSTRAINTS`: includes all 4 correctness IDs plus 1-3 active engine gaps with EXPLAIN evidence.",
         "- `REGRESSION_WARNINGS`: either `None applicable.` or numbered entries with both `CAUSE:` and `RULE:`.",
@@ -173,9 +173,9 @@ def _validate_shared(shared: Any) -> List[str]:
         issues.append("SHARED: SEMANTIC_CONTRACT missing.")
     else:
         token_count = len(semantic_contract.split())
-        if token_count < 80 or token_count > 150:
+        if token_count < 40 or token_count > 200:
             issues.append(
-                f"SHARED: SEMANTIC_CONTRACT token count {token_count} (expected 80-150)."
+                f"SHARED: SEMANTIC_CONTRACT token count {token_count} (expected 40-200)."
             )
 
     bottleneck = (getattr(shared, "bottleneck_diagnosis", "") or "").strip()
