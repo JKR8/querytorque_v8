@@ -60,6 +60,8 @@ class SwarmSession(OptimizationSession):
         self._regression_warnings: Optional[List[Dict]] = None
         self._snipe_analysis: Optional[Any] = None  # SnipeAnalysis from analyst
         self._sniper_result: Optional[WorkerResult] = None  # for retry
+        self._candidate_explains: Dict[int, str] = {}  # worker_id → explain_text
+        self._race_result: Optional[Any] = None  # RaceResult from fan-out race
 
     @staticmethod
     def _stage(query_id: str, msg: str):
@@ -400,58 +402,93 @@ class SwarmSession(OptimizationSession):
 
         self._stage(self.query_id, f"GENERATE: all 4 workers complete ({_fmt_elapsed(time.time() - t_gen)})")
 
-        # ── Step 5b: EXPLAIN cost pre-screening (DuckDB only) ───────────
+        # ── Step 6: Validation — Race first, fallback to sequential ─────
         sorted_wids = sorted(candidates_by_worker.keys())
         optimized_sqls = [
             candidates_by_worker[wid][1] for wid in sorted_wids
         ]
 
-        # Cost-rank candidates to only fully benchmark top 2 (saves ~6 executions)
-        cost_ranked_indices = None
-        if self.dialect == "duckdb":
-            try:
-                from ..validate import cost_rank_candidates
-                cost_ranked_indices = cost_rank_candidates(
-                    db_path=self.pipeline.config.db_path_or_dsn,
-                    original_sql=self.original_sql,
-                    candidate_sqls=optimized_sqls,
-                    top_k=2,
-                )
-                if cost_ranked_indices and len(cost_ranked_indices) < len(optimized_sqls):
-                    ranked_wids = [sorted_wids[i] for i in cost_ranked_indices]
-                    self._stage(
-                        self.query_id,
-                        f"COST SCREEN: Top 2 by EXPLAIN cost: W{ranked_wids[0]}, W{ranked_wids[1]}"
-                    )
-            except Exception as e:
-                logger.warning(f"[{self.query_id}] Cost pre-screening failed: {e}")
-                cost_ranked_indices = None
-
-        # ── Step 6: Batch validation ────────────────────────────────────
-        self._stage(self.query_id, f"VALIDATE: Timing original + candidates... | total {_fmt_elapsed(time.time() - t_session)}")
+        self._stage(self.query_id, f"VALIDATE: Racing original + 4 candidates... | total {_fmt_elapsed(time.time() - t_session)}")
         t_val = time.time()
 
-        if cost_ranked_indices is not None and len(cost_ranked_indices) < len(optimized_sqls):
-            # Only fully benchmark top-K candidates, mark rest as NEUTRAL 1.00x
-            benchmark_sqls = [optimized_sqls[i] for i in cost_ranked_indices]
-            real_results = self.pipeline._validate_batch(
-                self.original_sql, benchmark_sqls
+        # Try parallel race first (all 5 queries run simultaneously)
+        batch_results = None
+        from ..validate import race_candidates
+        try:
+            race_result = race_candidates(
+                db_path=self.pipeline.config.db_path_or_dsn,
+                original_sql=self.original_sql,
+                candidate_sqls=optimized_sqls,
+                worker_ids=sorted_wids,
+                min_runtime_ms=2000.0,
+                min_margin=0.05,
             )
+            if race_result is not None:
+                batch_results = race_result.verdicts
+                # Cache baseline and race result for snipe reuse
+                self._cached_baseline = race_result.baseline
+                self._race_result = race_result
 
-            # Build full results list: real for benchmarked, placeholder for skipped
-            batch_results = []
-            real_idx = 0
-            for i in range(len(optimized_sqls)):
-                if i in cost_ranked_indices:
-                    batch_results.append(real_results[real_idx])
-                    real_idx += 1
-                else:
-                    # Not benchmarked — mark as NEUTRAL with cost-screened flag
-                    batch_results.append(("NEUTRAL", 1.00, [], None))
-        else:
-            batch_results = self.pipeline._validate_batch(
-                self.original_sql, optimized_sqls
-            )
+                # Log race results
+                lane_tags = []
+                for cl in race_result.candidates:
+                    if not cl.finished:
+                        lane_tags.append(f"W{cl.lane_id}=DNF")
+                    elif cl.error:
+                        lane_tags.append(f"W{cl.lane_id}=ERR")
+                    else:
+                        lane_tags.append(f"W{cl.lane_id}={cl.elapsed_ms:.0f}ms")
+                winner_tag = "WINNER" if race_result.has_clear_winner else "NO WINNER"
+                self._stage(
+                    self.query_id,
+                    f"RACE [{winner_tag}]: original={race_result.original.elapsed_ms:.0f}ms | "
+                    + " | ".join(lane_tags)
+                )
+        except Exception as e:
+            logger.warning(f"[{self.query_id}] Race failed, falling back: {e}")
+
+        # Fallback: sequential validation (for fast queries < 2s)
+        if batch_results is None:
+            self._stage(self.query_id, f"VALIDATE: Sequential fallback (query < 2s)...")
+
+            # Cost-rank pre-screening (DuckDB only)
+            cost_ranked_indices = None
+            if self.dialect == "duckdb":
+                try:
+                    from ..validate import cost_rank_candidates
+                    cost_ranked_indices = cost_rank_candidates(
+                        db_path=self.pipeline.config.db_path_or_dsn,
+                        original_sql=self.original_sql,
+                        candidate_sqls=optimized_sqls,
+                        top_k=2,
+                    )
+                    if cost_ranked_indices and len(cost_ranked_indices) < len(optimized_sqls):
+                        ranked_wids = [sorted_wids[i] for i in cost_ranked_indices]
+                        self._stage(
+                            self.query_id,
+                            f"COST SCREEN: Top 2 by EXPLAIN cost: W{ranked_wids[0]}, W{ranked_wids[1]}"
+                        )
+                except Exception as e:
+                    logger.warning(f"[{self.query_id}] Cost pre-screening failed: {e}")
+                    cost_ranked_indices = None
+
+            if cost_ranked_indices is not None and len(cost_ranked_indices) < len(optimized_sqls):
+                benchmark_sqls = [optimized_sqls[i] for i in cost_ranked_indices]
+                real_results = self.pipeline._validate_batch(
+                    self.original_sql, benchmark_sqls
+                )
+                batch_results = []
+                real_idx = 0
+                for i in range(len(optimized_sqls)):
+                    if i in cost_ranked_indices:
+                        batch_results.append(real_results[real_idx])
+                        real_idx += 1
+                    else:
+                        batch_results.append(("NEUTRAL", 1.00, [], None))
+            else:
+                batch_results = self.pipeline._validate_batch(
+                    self.original_sql, optimized_sqls
+                )
 
         worker_results = []
         worker_prompts = {}
@@ -488,6 +525,10 @@ class SwarmSession(OptimizationSession):
                 self.query_id,
                 f" {marker} W{wr.worker_id} ({wr.strategy}){explore_tag}: {wr.status} {wr.speedup:.2f}x{err}"
             )
+
+        # ── Step 6.6: Collect candidate EXPLAIN plans for snipe ──────────
+        if self.max_iterations > 1:
+            self._candidate_explains = self._collect_candidate_explains(worker_results)
 
         # ── Step 6.5: Per-worker SET LOCAL config validation (PG only) ──
         pg_config_workers = []
@@ -640,6 +681,66 @@ class SwarmSession(OptimizationSession):
                     pass
         return None
 
+    def _collect_candidate_explains(
+        self,
+        worker_results: List[WorkerResult],
+    ) -> Dict[int, str]:
+        """Collect EXPLAIN ANALYZE plans for validated candidates.
+
+        Runs EXPLAIN ANALYZE on each passing candidate's optimized SQL so the
+        snipe analyst can see how the optimizer actually executes each rewrite.
+
+        Skips ERROR/FAIL workers and workers that fell back to original SQL.
+        Returns dict of worker_id → formatted explain text.
+        """
+        from ..execution.database_utils import run_explain_analyze
+        from ..prompts.analyst_briefing import format_pg_explain_tree
+
+        explains: Dict[int, str] = {}
+        dsn = self.pipeline.config.db_path_or_dsn
+        t0 = time.time()
+        collected = 0
+
+        for wr in worker_results:
+            # Skip broken candidates
+            if wr.status in ("ERROR", "FAIL"):
+                continue
+            # Skip candidates that fell back to original
+            if wr.optimized_sql.strip() == self.original_sql.strip():
+                continue
+
+            try:
+                result = run_explain_analyze(dsn, wr.optimized_sql)
+                if not result:
+                    continue
+
+                # Format to text
+                plan_text = result.get("plan_text")
+                if not plan_text:
+                    plan_json = result.get("plan_json")
+                    if plan_json:
+                        plan_text = format_pg_explain_tree(plan_json)
+
+                if plan_text:
+                    exec_ms = result.get("execution_time_ms")
+                    header = f"W{wr.worker_id} ({wr.strategy}) — {wr.speedup:.2f}x"
+                    if exec_ms is not None:
+                        header += f" — EXPLAIN exec: {exec_ms:.1f}ms"
+                    explains[wr.worker_id] = plan_text
+                    collected += 1
+            except Exception as e:
+                logger.warning(
+                    f"[{self.query_id}] EXPLAIN for W{wr.worker_id} failed: {e}"
+                )
+
+        elapsed = time.time() - t0
+        if collected:
+            self._stage(
+                self.query_id,
+                f"EXPLAIN candidates: {collected} collected ({_fmt_elapsed(elapsed)})"
+            )
+        return explains
+
     def _snipe_iteration(
         self, dag: Any, costs: Dict[str, Any], snipe_num: int, t_session: float,
     ) -> Dict[str, Any]:
@@ -749,6 +850,8 @@ class SwarmSession(OptimizationSession):
                 resource_envelope=self._resource_envelope,
                 target_speedup=self.target_speedup,
                 previous_sniper_result=self._sniper_result,
+                candidate_explains=self._candidate_explains,
+                original_explain_text=self._explain_plan_text,
             )
 
             # Generate, validate, update
@@ -784,6 +887,8 @@ class SwarmSession(OptimizationSession):
             resource_envelope=self._resource_envelope,
             dialect=self.dialect,
             dialect_version=self.pipeline._engine_version,
+            candidate_explains=self._candidate_explains,
+            race_timings=self._build_race_timings(),
         )
 
         # Step 2: Call analyst LLM
@@ -847,6 +952,8 @@ class SwarmSession(OptimizationSession):
             resource_envelope=self._resource_envelope,
             target_speedup=self.target_speedup,
             previous_sniper_result=None,  # first sniper attempt
+            candidate_explains=self._candidate_explains,
+            original_explain_text=self._explain_plan_text,
         )
 
         # Step 7: Generate, validate
@@ -973,6 +1080,31 @@ class SwarmSession(OptimizationSession):
             return None
         best = max(passing, key=lambda w: w.speedup)
         return best.optimized_sql
+
+    def _build_race_timings(self) -> Optional[Dict[str, Any]]:
+        """Build race timings dict for snipe analyst prompt.
+
+        Returns None if no race was run (fast queries used sequential validation).
+        """
+        rr = self._race_result
+        if rr is None:
+            return None
+
+        candidates = {}
+        for cl in rr.candidates:
+            candidates[cl.lane_id] = {
+                "elapsed_ms": cl.elapsed_ms,
+                "row_count": cl.row_count,
+                "finished": cl.finished,
+                "error": cl.error,
+            }
+
+        return {
+            "original_ms": rr.original.elapsed_ms,
+            "original_rows": rr.original.row_count,
+            "has_clear_winner": rr.has_clear_winner,
+            "candidates": candidates,
+        }
 
     def _build_worker_prompt(
         self,

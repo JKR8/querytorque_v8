@@ -7,9 +7,11 @@ infrastructure. It benchmarks performance and checks semantic equivalence.
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .schemas import ValidationStatus, ValidationResult
 
@@ -52,6 +54,278 @@ def categorize_error(error_msg: str) -> str:
         return "execution"
 
     return "unknown"
+
+
+@dataclass
+class RaceLane:
+    """Result from a single lane in the race."""
+    lane_id: int           # 0 = original, 1-4 = workers
+    sql: str
+    elapsed_ms: float = 0.0
+    row_count: int = 0
+    error: Optional[str] = None
+    finished: bool = True  # False if still running when race was called
+
+
+@dataclass
+class RaceResult:
+    """Result of a parallel race validation."""
+    original: RaceLane
+    candidates: List[RaceLane]
+    baseline: OriginalBaseline  # cached for snipe reuse
+    # Per-candidate: (status, speedup, error_messages, error_category)
+    verdicts: List[Tuple[str, float, List[str], Optional[str]]]
+    has_clear_winner: bool = False
+
+
+def race_candidates(
+    db_path: str,
+    original_sql: str,
+    candidate_sqls: List[str],
+    worker_ids: List[int],
+    min_runtime_ms: float = 2000.0,
+    min_margin: float = 0.05,
+    timeout_ms: int = 300_000,
+) -> Optional[RaceResult]:
+    """Run original + candidates in a parallel race.
+
+    All queries start simultaneously against the database, each on its own
+    connection. The race ends when the original finishes — any candidate
+    still running is marked DID_NOT_FINISH (slower than original by definition).
+
+    If no clear winner (no candidate beats original by min_margin), the race
+    still returns all collected timings so the analyst can diagnose.
+
+    Args:
+        db_path: Database path (DuckDB file) or DSN (PostgreSQL)
+        original_sql: The original query (lane 0)
+        candidate_sqls: Optimized candidates (lanes 1-N)
+        worker_ids: Worker IDs corresponding to candidate_sqls
+        min_runtime_ms: Minimum original runtime for race to be valid (default 2s)
+        min_margin: Minimum speedup margin to declare a win (default 5%)
+        timeout_ms: Per-query timeout in milliseconds
+
+    Returns:
+        RaceResult with all timings (even if no winner), or None if query < 2s.
+    """
+    from concurrent.futures import wait as futures_wait, FIRST_COMPLETED
+    from .execution.factory import create_executor_from_dsn
+
+    is_pg = db_path.lower().startswith("postgres://") or db_path.lower().startswith("postgresql://")
+
+    # ── Warmup: run original once to prime caches ──────────────────────
+    logger.info("Race: warmup run (original)")
+    try:
+        with create_executor_from_dsn(db_path) as warmup_exec:
+            warmup_exec.connect()
+            t0 = time.perf_counter()
+            if is_pg:
+                warmup_exec.execute(original_sql, timeout_ms=timeout_ms)
+            else:
+                warmup_exec.execute(original_sql)
+            warmup_ms = (time.perf_counter() - t0) * 1000
+    except Exception as e:
+        logger.warning(f"Race: warmup failed: {e}")
+        return None
+
+    if warmup_ms < min_runtime_ms:
+        logger.info(
+            f"Race: original too fast ({warmup_ms:.0f}ms < {min_runtime_ms:.0f}ms) "
+            f"— falling back to standard validation"
+        )
+        return None
+
+    logger.info(f"Race: warmup {warmup_ms:.0f}ms — proceeding with {len(candidate_sqls) + 1} lanes")
+
+    # ── Build lane list ───────────────────────────────────────────────
+    all_sqls = [original_sql] + list(candidate_sqls)
+    all_ids = [0] + list(worker_ids)  # 0 = original
+    n_lanes = len(all_sqls)
+
+    start_barrier = threading.Barrier(n_lanes)
+    original_done = threading.Event()
+    original_elapsed_box: List[float] = [0.0]  # mutable container for thread
+
+    def run_lane(lane_idx: int, sql: str, lane_id: int) -> RaceLane:
+        """Execute a single race lane."""
+        lane = RaceLane(lane_id=lane_id, sql=sql)
+        executor = None
+        try:
+            executor = create_executor_from_dsn(db_path)
+            executor.connect()
+
+            # Synchronize start — all lanes wait here
+            start_barrier.wait(timeout=30)
+
+            t0 = time.perf_counter()
+            if is_pg:
+                rows = executor.execute(sql, timeout_ms=timeout_ms)
+            else:
+                rows = executor.execute(sql)
+            lane.elapsed_ms = (time.perf_counter() - t0) * 1000
+            lane.row_count = len(rows) if rows else 0
+
+        except Exception as e:
+            lane.error = str(e)
+            lane.elapsed_ms = float(timeout_ms)  # treat errors as timeout
+        finally:
+            # Signal if this is the original lane
+            if lane_id == 0:
+                original_elapsed_box[0] = lane.elapsed_ms
+                original_done.set()
+            if executor is not None:
+                try:
+                    executor.close()
+                except Exception:
+                    pass
+        return lane
+
+    # ── Run all lanes in parallel ─────────────────────────────────────
+    lanes: List[Optional[RaceLane]] = [None] * n_lanes
+    pool = ThreadPoolExecutor(max_workers=n_lanes)
+    try:
+        futures = {
+            pool.submit(run_lane, idx, sql, lid): idx
+            for idx, (sql, lid) in enumerate(zip(all_sqls, all_ids))
+        }
+        idx_to_future = {v: k for k, v in futures.items()}
+
+        # Wait for the original to finish (lane 0) — this is the race clock
+        original_done.wait(timeout=timeout_ms / 1000)
+        orig_elapsed = original_elapsed_box[0]
+
+        # Grace period: 10% of original time or 500ms, whichever is larger
+        # Candidates that finish within this window still count
+        grace_s = max(orig_elapsed * 0.10 / 1000, 0.5)
+
+        # Collect the original's result
+        orig_future = idx_to_future[0]
+        try:
+            lanes[0] = orig_future.result(timeout=1.0)
+        except Exception as e:
+            lanes[0] = RaceLane(lane_id=0, sql=original_sql, error=str(e))
+
+        # Wait for remaining candidates with grace timeout
+        candidate_futures = {idx_to_future[i] for i in range(1, n_lanes)}
+        done, not_done = futures_wait(candidate_futures, timeout=grace_s)
+
+        # Collect finished candidates
+        for future in done:
+            idx = futures[future]
+            try:
+                lanes[idx] = future.result(timeout=0.1)
+            except Exception as e:
+                lanes[idx] = RaceLane(
+                    lane_id=all_ids[idx], sql=all_sqls[idx],
+                    elapsed_ms=orig_elapsed * 1.5, error=str(e),
+                )
+
+        # Mark unfinished candidates — slower than original by definition
+        for future in not_done:
+            idx = futures[future]
+            lanes[idx] = RaceLane(
+                lane_id=all_ids[idx],
+                sql=all_sqls[idx],
+                elapsed_ms=orig_elapsed,  # at least as slow as original
+                row_count=0,
+                error="DID_NOT_FINISH",
+                finished=False,
+            )
+    finally:
+        pool.shutdown(wait=False)
+
+    original_lane = lanes[0]
+    candidate_lanes = [l for l in lanes[1:] if l is not None]
+
+    # Backfill any None slots (shouldn't happen, but defensive)
+    while len(candidate_lanes) < len(candidate_sqls):
+        candidate_lanes.append(RaceLane(
+            lane_id=worker_ids[len(candidate_lanes)],
+            sql=candidate_sqls[len(candidate_lanes)],
+            error="DID_NOT_FINISH", finished=False,
+        ))
+
+    # Log race results
+    logger.info(
+        f"Race: original={original_lane.elapsed_ms:.0f}ms "
+        f"({original_lane.row_count} rows)"
+    )
+    for cl in candidate_lanes:
+        tag = "DNF" if not cl.finished else ("ERR" if cl.error else f"{cl.elapsed_ms:.0f}ms")
+        logger.info(f"Race: W{cl.lane_id}={tag} ({cl.row_count} rows)")
+
+    # ── Check original validity ───────────────────────────────────────
+    if original_lane.error:
+        logger.warning(f"Race: original failed — {original_lane.error}")
+        return None
+
+    if original_lane.elapsed_ms < min_runtime_ms:
+        logger.info(
+            f"Race: original too fast in race ({original_lane.elapsed_ms:.0f}ms) "
+            f"— falling back"
+        )
+        return None
+
+    # ── Build baseline for snipe reuse ────────────────────────────────
+    baseline = OriginalBaseline(
+        measured_time_ms=original_lane.elapsed_ms,
+        row_count=original_lane.row_count,
+        rows=None,
+        checksum=None,
+    )
+
+    # ── Score each candidate ──────────────────────────────────────────
+    orig_ms = original_lane.elapsed_ms
+    verdicts: List[Tuple[str, float, List[str], Optional[str]]] = []
+    has_clear_winner = False
+
+    for cl in candidate_lanes:
+        # DID_NOT_FINISH — slower than original, mark as regression
+        if not cl.finished:
+            verdicts.append(("REGRESSION", 0.0, ["DID_NOT_FINISH: slower than original"], None))
+            continue
+
+        if cl.error:
+            verdicts.append((
+                "ERROR", 0.0, [cl.error], categorize_error(cl.error)
+            ))
+            continue
+
+        # Correctness: row count must match
+        if cl.row_count != original_lane.row_count:
+            err = (
+                f"Row count mismatch: original={original_lane.row_count}, "
+                f"optimized={cl.row_count}"
+            )
+            verdicts.append(("FAIL", 0.0, [err], "semantic"))
+            continue
+
+        # Speedup
+        if cl.elapsed_ms <= 0:
+            cl.elapsed_ms = 0.1  # avoid division by zero
+        speedup = orig_ms / cl.elapsed_ms
+
+        # Apply margin: winner must beat original by min_margin
+        if speedup >= (1.0 + min_margin) and speedup >= 1.10:
+            status = "WIN"
+            has_clear_winner = True
+        elif speedup >= (1.0 + min_margin):
+            status = "IMPROVED"
+            has_clear_winner = True
+        elif speedup >= (1.0 - min_margin):
+            status = "NEUTRAL"
+        else:
+            status = "REGRESSION"
+
+        verdicts.append((status, speedup, [], None))
+
+    return RaceResult(
+        original=original_lane,
+        candidates=candidate_lanes,
+        baseline=baseline,
+        verdicts=verdicts,
+        has_clear_winner=has_clear_winner,
+    )
 
 
 def cost_rank_candidates(
