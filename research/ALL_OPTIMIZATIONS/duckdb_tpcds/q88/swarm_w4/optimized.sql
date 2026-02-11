@@ -1,0 +1,48 @@
+WITH filtered_store AS (
+    SELECT s_store_sk
+    FROM store
+    WHERE s_store_name = 'ese'
+),
+filtered_household AS (
+    SELECT hd_demo_sk
+    FROM household_demographics
+    WHERE (hd_dep_count = -1 AND hd_vehicle_count <= 1)
+       OR (hd_dep_count = 4 AND hd_vehicle_count <= 6)
+       OR (hd_dep_count = 3 AND hd_vehicle_count <= 5)
+),
+time_slices AS (
+    SELECT 
+        t_time_sk,
+        CASE 
+            WHEN t_hour = 8 AND t_minute >= 30 THEN 1
+            WHEN t_hour = 9 AND t_minute < 30 THEN 2
+            WHEN t_hour = 9 AND t_minute >= 30 THEN 3
+            WHEN t_hour = 10 AND t_minute < 30 THEN 4
+            WHEN t_hour = 10 AND t_minute >= 30 THEN 5
+            WHEN t_hour = 11 AND t_minute < 30 THEN 6
+            WHEN t_hour = 11 AND t_minute >= 30 THEN 7
+            WHEN t_hour = 12 AND t_minute < 30 THEN 8
+            ELSE 0
+        END AS slice_id
+    FROM time_dim
+    WHERE slice_id > 0
+),
+qualified_sales AS (
+    SELECT 
+        ss.ss_sold_time_sk,
+        ts.slice_id
+    FROM store_sales ss
+    JOIN filtered_store fs ON ss.ss_store_sk = fs.s_store_sk
+    JOIN filtered_household fh ON ss.ss_hdemo_sk = fh.hd_demo_sk
+    JOIN time_slices ts ON ss.ss_sold_time_sk = ts.t_time_sk
+)
+SELECT 
+    COUNT(CASE WHEN slice_id = 1 THEN 1 END) AS h8_30_to_9,
+    COUNT(CASE WHEN slice_id = 2 THEN 1 END) AS h9_to_9_30,
+    COUNT(CASE WHEN slice_id = 3 THEN 1 END) AS h9_30_to_10,
+    COUNT(CASE WHEN slice_id = 4 THEN 1 END) AS h10_to_10_30,
+    COUNT(CASE WHEN slice_id = 5 THEN 1 END) AS h10_30_to_11,
+    COUNT(CASE WHEN slice_id = 6 THEN 1 END) AS h11_to_11_30,
+    COUNT(CASE WHEN slice_id = 7 THEN 1 END) AS h11_30_to_12,
+    COUNT(CASE WHEN slice_id = 8 THEN 1 END) AS h12_to_12_30
+FROM qualified_sales;

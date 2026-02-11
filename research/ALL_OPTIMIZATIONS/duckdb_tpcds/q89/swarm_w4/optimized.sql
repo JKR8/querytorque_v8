@@ -1,0 +1,87 @@
+WITH filtered_dates AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year IN (1999)
+),
+filtered_stores AS (
+  SELECT s_store_sk, s_store_name, s_company_name
+  FROM store
+),
+items_condition1 AS (
+  SELECT i_item_sk, i_category, i_class, i_brand
+  FROM item
+  WHERE i_category IN ('Jewelry', 'Shoes', 'Electronics')
+    AND i_class IN ('semi-precious', 'athletic', 'portable')
+),
+items_condition2 AS (
+  SELECT i_item_sk, i_category, i_class, i_brand
+  FROM item
+  WHERE i_category IN ('Men', 'Music', 'Women')
+    AND i_class IN ('accessories', 'rock', 'maternity')
+),
+sales_condition1 AS (
+  SELECT
+    i.i_category,
+    i.i_class,
+    i.i_brand,
+    s.s_store_name,
+    s.s_company_name,
+    d.d_moy,
+    SUM(ss.ss_sales_price) AS sum_sales
+  FROM store_sales ss
+  JOIN items_condition1 i ON ss.ss_item_sk = i.i_item_sk
+  JOIN filtered_dates d ON ss.ss_sold_date_sk = d.d_date_sk
+  JOIN filtered_stores s ON ss.ss_store_sk = s.s_store_sk
+  GROUP BY
+    i.i_category,
+    i.i_class,
+    i.i_brand,
+    s.s_store_name,
+    s.s_company_name,
+    d.d_moy
+),
+sales_condition2 AS (
+  SELECT
+    i.i_category,
+    i.i_class,
+    i.i_brand,
+    s.s_store_name,
+    s.s_company_name,
+    d.d_moy,
+    SUM(ss.ss_sales_price) AS sum_sales
+  FROM store_sales ss
+  JOIN items_condition2 i ON ss.ss_item_sk = i.i_item_sk
+  JOIN filtered_dates d ON ss.ss_sold_date_sk = d.d_date_sk
+  JOIN filtered_stores s ON ss.ss_store_sk = s.s_store_sk
+  GROUP BY
+    i.i_category,
+    i.i_class,
+    i.i_brand,
+    s.s_store_name,
+    s.s_company_name,
+    d.d_moy
+),
+combined_sales AS (
+  SELECT * FROM sales_condition1
+  UNION ALL
+  SELECT * FROM sales_condition2
+),
+with_avg AS (
+  SELECT *,
+    AVG(sum_sales) OVER (
+      PARTITION BY i_category, i_brand, s_store_name, s_company_name
+    ) AS avg_monthly_sales
+  FROM combined_sales
+)
+SELECT *
+FROM with_avg
+WHERE
+  CASE
+    WHEN avg_monthly_sales <> 0
+    THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales
+    ELSE NULL
+  END > 0.1
+ORDER BY
+  sum_sales - avg_monthly_sales,
+  s_store_name
+LIMIT 100;

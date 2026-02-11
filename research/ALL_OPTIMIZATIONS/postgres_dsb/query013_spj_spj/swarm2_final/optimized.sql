@@ -1,0 +1,53 @@
+WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2001
+),
+filtered_store AS (
+    SELECT s_store_sk
+    FROM store
+),
+filtered_demographics AS (
+    SELECT 
+        cd_demo_sk,
+        hd_demo_sk
+    FROM customer_demographics
+    JOIN household_demographics ON TRUE
+    WHERE 
+        (cd_marital_status = 'U' AND cd_education_status = 'College' AND hd_dep_count = 3)
+        OR (cd_marital_status = 'W' AND cd_education_status = 'Secondary' AND hd_dep_count = 1)
+        OR (cd_marital_status = 'D' AND cd_education_status = 'Secondary' AND hd_dep_count = 1)
+),
+filtered_address AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_country = 'United States'
+        AND (
+            (ca_state IN ('IA', 'MO', 'TX'))
+            OR (ca_state IN ('GA', 'LA', 'SD'))
+            OR (ca_state IN ('TN', 'TX', 'VA'))
+        )
+)
+SELECT
+    MIN(ss_quantity),
+    MIN(ss_ext_sales_price),
+    MIN(ss_ext_wholesale_cost),
+    MIN(ss_ext_wholesale_cost)
+FROM store_sales ss
+JOIN filtered_date fd ON ss.ss_sold_date_sk = fd.d_date_sk
+JOIN filtered_store fs ON ss.ss_store_sk = fs.s_store_sk
+JOIN filtered_demographics fdemo ON ss.ss_cdemo_sk = fdemo.cd_demo_sk 
+    AND ss.ss_hdemo_sk = fdemo.hd_demo_sk
+JOIN filtered_address fa ON ss.ss_addr_sk = fa.ca_address_sk
+WHERE 
+    (
+        (ss.ss_sales_price BETWEEN 100.00 AND 150.00 AND fdemo.cd_marital_status = 'U' AND fdemo.cd_education_status = 'College' AND EXISTS (SELECT 1 FROM household_demographics hd WHERE hd.hd_demo_sk = fdemo.hd_demo_sk AND hd.hd_dep_count = 3))
+        OR (ss.ss_sales_price BETWEEN 50.00 AND 100.00 AND fdemo.cd_marital_status = 'W' AND fdemo.cd_education_status = 'Secondary' AND EXISTS (SELECT 1 FROM household_demographics hd WHERE hd.hd_demo_sk = fdemo.hd_demo_sk AND hd.hd_dep_count = 1))
+        OR (ss.ss_sales_price BETWEEN 150.00 AND 200.00 AND fdemo.cd_marital_status = 'D' AND fdemo.cd_education_status = 'Secondary' AND EXISTS (SELECT 1 FROM household_demographics hd WHERE hd.hd_demo_sk = fdemo.hd_demo_sk AND hd.hd_dep_count = 1))
+    )
+    AND
+    (
+        (ss.ss_net_profit BETWEEN 100 AND 200 AND EXISTS (SELECT 1 FROM customer_address ca WHERE ca.ca_address_sk = fa.ca_address_sk AND ca.ca_state IN ('IA', 'MO', 'TX')))
+        OR (ss.ss_net_profit BETWEEN 150 AND 300 AND EXISTS (SELECT 1 FROM customer_address ca WHERE ca.ca_address_sk = fa.ca_address_sk AND ca.ca_state IN ('GA', 'LA', 'SD')))
+        OR (ss.ss_net_profit BETWEEN 50 AND 250 AND EXISTS (SELECT 1 FROM customer_address ca WHERE ca.ca_address_sk = fa.ca_address_sk AND ca.ca_state IN ('TN', 'TX', 'VA')))
+    )

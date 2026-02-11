@@ -1,0 +1,62 @@
+WITH filtered_dates AS (
+  SELECT d_date_sk, d_year
+  FROM date_dim
+  WHERE d_year IN (1999, 2000)
+),
+store_sales_agg AS (
+  SELECT
+    c.c_customer_id AS customer_id,
+    c.c_first_name AS customer_first_name,
+    c.c_last_name AS customer_last_name,
+    c.c_birth_country AS customer_birth_country,
+    SUM(CASE WHEN fd.d_year = 1999 THEN ((ss_ext_list_price - ss_ext_wholesale_cost - ss_ext_discount_amt) + ss_ext_sales_price) / 2 ELSE 0 END) AS store_1999,
+    SUM(CASE WHEN fd.d_year = 2000 THEN ((ss_ext_list_price - ss_ext_wholesale_cost - ss_ext_discount_amt) + ss_ext_sales_price) / 2 ELSE 0 END) AS store_2000
+  FROM customer c
+  JOIN store_sales ss ON c.c_customer_sk = ss.ss_customer_sk
+  JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk
+  GROUP BY
+    c.c_customer_id,
+    c.c_first_name,
+    c.c_last_name,
+    c.c_birth_country
+),
+catalog_sales_agg AS (
+  SELECT
+    c.c_customer_id AS customer_id,
+    SUM(CASE WHEN fd.d_year = 1999 THEN ((cs_ext_list_price - cs_ext_wholesale_cost - cs_ext_discount_amt) + cs_ext_sales_price) / 2 ELSE 0 END) AS catalog_1999,
+    SUM(CASE WHEN fd.d_year = 2000 THEN ((cs_ext_list_price - cs_ext_wholesale_cost - cs_ext_discount_amt) + cs_ext_sales_price) / 2 ELSE 0 END) AS catalog_2000
+  FROM customer c
+  JOIN catalog_sales cs ON c.c_customer_sk = cs.cs_bill_customer_sk
+  JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk
+  GROUP BY c.c_customer_id
+),
+web_sales_agg AS (
+  SELECT
+    c.c_customer_id AS customer_id,
+    SUM(CASE WHEN fd.d_year = 1999 THEN ((ws_ext_list_price - ws_ext_wholesale_cost - ws_ext_discount_amt) + ws_ext_sales_price) / 2 ELSE 0 END) AS web_1999,
+    SUM(CASE WHEN fd.d_year = 2000 THEN ((ws_ext_list_price - ws_ext_wholesale_cost - ws_ext_discount_amt) + ws_ext_sales_price) / 2 ELSE 0 END) AS web_2000
+  FROM customer c
+  JOIN web_sales ws ON c.c_customer_sk = ws.ws_bill_customer_sk
+  JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk
+  GROUP BY c.c_customer_id
+)
+SELECT
+  s.customer_id,
+  s.customer_first_name,
+  s.customer_last_name,
+  s.customer_birth_country
+FROM store_sales_agg s
+JOIN catalog_sales_agg c ON s.customer_id = c.customer_id
+JOIN web_sales_agg w ON s.customer_id = w.customer_id
+WHERE
+  s.store_1999 > 0
+  AND c.catalog_1999 > 0
+  AND w.web_1999 > 0
+  AND c.catalog_2000 / c.catalog_1999 > s.store_2000 / s.store_1999
+  AND c.catalog_2000 / c.catalog_1999 > w.web_2000 / w.web_1999
+ORDER BY
+  s.customer_id,
+  s.customer_first_name,
+  s.customer_last_name,
+  s.customer_birth_country
+LIMIT 100

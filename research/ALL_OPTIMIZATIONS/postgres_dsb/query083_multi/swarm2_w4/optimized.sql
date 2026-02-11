@@ -1,0 +1,78 @@
+WITH date_filter AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_month_seq IN (
+        SELECT d_month_seq
+        FROM date_dim
+        WHERE d_date IN ('2002-02-01', '2002-04-11', '2002-07-17', '2002-10-09')
+    )
+),
+filtered_item AS (
+    SELECT i_item_sk, i_item_id
+    FROM item
+    WHERE i_category IN ('Jewelry', 'Music')
+      AND i_manager_id BETWEEN 16 AND 25
+),
+unioned_returns AS (
+    SELECT 
+        fi.i_item_id AS item_id,
+        SUM(sr_return_quantity) AS return_qty,
+        'store' AS channel
+    FROM store_returns sr
+    JOIN filtered_item fi ON sr.sr_item_sk = fi.i_item_sk
+    JOIN date_filter df ON sr.sr_returned_date_sk = df.d_date_sk
+    WHERE sr_return_amt / sr_return_quantity BETWEEN 184 AND 213
+      AND sr_reason_sk IN (26, 32, 40, 66, 73)
+    GROUP BY fi.i_item_id
+    
+    UNION ALL
+    
+    SELECT 
+        fi.i_item_id AS item_id,
+        SUM(cr_return_quantity) AS return_qty,
+        'catalog' AS channel
+    FROM catalog_returns cr
+    JOIN filtered_item fi ON cr.cr_item_sk = fi.i_item_sk
+    JOIN date_filter df ON cr.cr_returned_date_sk = df.d_date_sk
+    WHERE cr_return_amount / cr_return_quantity BETWEEN 184 AND 213
+      AND cr_reason_sk IN (26, 32, 40, 66, 73)
+    GROUP BY fi.i_item_id
+    
+    UNION ALL
+    
+    SELECT 
+        fi.i_item_id AS item_id,
+        SUM(wr_return_quantity) AS return_qty,
+        'web' AS channel
+    FROM web_returns wr
+    JOIN filtered_item fi ON wr.wr_item_sk = fi.i_item_sk
+    JOIN date_filter df ON wr.wr_returned_date_sk = df.d_date_sk
+    WHERE wr_return_amt / wr_return_quantity BETWEEN 184 AND 213
+      AND wr_reason_sk IN (26, 32, 40, 66, 73)
+    GROUP BY fi.i_item_id
+),
+aggregated_items AS (
+    SELECT 
+        item_id,
+        SUM(return_qty) FILTER (WHERE channel = 'store') AS sr_item_qty,
+        SUM(return_qty) FILTER (WHERE channel = 'catalog') AS cr_item_qty,
+        SUM(return_qty) FILTER (WHERE channel = 'web') AS wr_item_qty
+    FROM unioned_returns
+    GROUP BY item_id
+    HAVING 
+        SUM(return_qty) FILTER (WHERE channel = 'store') IS NOT NULL AND
+        SUM(return_qty) FILTER (WHERE channel = 'catalog') IS NOT NULL AND
+        SUM(return_qty) FILTER (WHERE channel = 'web') IS NOT NULL
+)
+SELECT
+    item_id,
+    sr_item_qty,
+    sr_item_qty / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0 * 100 AS sr_dev,
+    cr_item_qty,
+    cr_item_qty / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0 * 100 AS cr_dev,
+    wr_item_qty,
+    wr_item_qty / (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0 * 100 AS wr_dev,
+    (sr_item_qty + cr_item_qty + wr_item_qty) / 3.0 AS average
+FROM aggregated_items
+ORDER BY item_id, sr_item_qty
+LIMIT 100;

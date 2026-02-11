@@ -1,0 +1,60 @@
+WITH filtered_dates AS (
+    SELECT d_date_sk, d_date
+    FROM date_dim
+    WHERE d_date BETWEEN (
+        CAST('2001-04-02' AS DATE) - INTERVAL '30' DAY
+    ) AND (
+        CAST('2001-04-02' AS DATE) + INTERVAL '30' DAY
+    )
+),
+filtered_items AS (
+    SELECT i_item_sk, i_item_id
+    FROM item
+    WHERE i_current_price BETWEEN 0.99 AND 1.49
+),
+filtered_warehouse AS (
+    SELECT w_warehouse_sk, w_state
+    FROM warehouse
+),
+catalog_data AS (
+    SELECT
+        cs.cs_item_sk,
+        cs.cs_order_number,
+        cs.cs_sales_price,
+        cs.cs_warehouse_sk,
+        cs.cs_sold_date_sk,
+        cr.cr_refunded_cash
+    FROM catalog_sales cs
+    LEFT OUTER JOIN catalog_returns cr ON (
+        cs.cs_order_number = cr.cr_order_number 
+        AND cs.cs_item_sk = cr.cr_item_sk
+    )
+)
+SELECT
+    w.w_state,
+    i.i_item_id,
+    SUM(
+        CASE
+            WHEN (CAST(d.d_date AS DATE) < CAST('2001-04-02' AS DATE))
+            THEN cs.cs_sales_price - COALESCE(cs.cr_refunded_cash, 0)
+            ELSE 0
+        END
+    ) AS sales_before,
+    SUM(
+        CASE
+            WHEN (CAST(d.d_date AS DATE) >= CAST('2001-04-02' AS DATE))
+            THEN cs.cs_sales_price - COALESCE(cs.cr_refunded_cash, 0)
+            ELSE 0
+        END
+    ) AS sales_after
+FROM catalog_data cs
+JOIN filtered_dates d ON cs.cs_sold_date_sk = d.d_date_sk
+JOIN filtered_items i ON cs.cs_item_sk = i.i_item_sk
+JOIN filtered_warehouse w ON cs.cs_warehouse_sk = w.w_warehouse_sk
+GROUP BY
+    w.w_state,
+    i.i_item_id
+ORDER BY
+    w.w_state,
+    i.i_item_id
+LIMIT 100

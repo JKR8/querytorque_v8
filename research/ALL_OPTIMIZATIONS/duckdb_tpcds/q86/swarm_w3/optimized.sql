@@ -1,0 +1,42 @@
+WITH filtered_dates AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_month_seq BETWEEN 1224 AND 1224 + 11
+),
+filtered_sales AS (
+  SELECT ws_item_sk, ws_net_paid
+  FROM web_sales
+  JOIN filtered_dates ON ws_sold_date_sk = d_date_sk
+),
+joined_data AS (
+  SELECT 
+    i.i_category,
+    i.i_class,
+    s.ws_net_paid
+  FROM filtered_sales s
+  JOIN item i ON s.ws_item_sk = i.i_item_sk
+),
+aggregated AS (
+  SELECT
+    SUM(ws_net_paid) AS total_sum,
+    i_category,
+    i_class,
+    GROUPING(i_category) + GROUPING(i_class) AS lochierarchy
+  FROM joined_data
+  GROUP BY ROLLUP(i_category, i_class)
+)
+SELECT
+  total_sum,
+  i_category,
+  i_class,
+  lochierarchy,
+  RANK() OVER (
+    PARTITION BY lochierarchy, CASE WHEN lochierarchy = 0 THEN i_category END
+    ORDER BY total_sum DESC
+  ) AS rank_within_parent
+FROM aggregated
+ORDER BY
+  lochierarchy DESC,
+  CASE WHEN lochierarchy = 0 THEN i_category END,
+  rank_within_parent
+LIMIT 100

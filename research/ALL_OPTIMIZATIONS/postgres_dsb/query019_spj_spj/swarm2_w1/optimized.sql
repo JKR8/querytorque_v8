@@ -1,0 +1,33 @@
+WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2002
+      AND d_moy = 12
+),
+filtered_item AS (
+    SELECT i_item_sk, i_brand_id, i_manufact_id
+    FROM item
+    WHERE i_category = 'Home'
+),
+filtered_customer_address AS (
+    SELECT ca_address_sk, ca_zip
+    FROM customer_address
+    WHERE ca_state = 'TX'
+),
+filtered_customer AS (
+    SELECT c_customer_sk, c_current_addr_sk
+    FROM customer
+    WHERE c_birth_month = 1
+)
+SELECT
+    MIN(i_brand_id),
+    MIN(i_manufact_id),
+    MIN(ss_ext_sales_price)
+FROM store_sales
+JOIN filtered_date ON d_date_sk = ss_sold_date_sk
+JOIN filtered_item ON ss_item_sk = i_item_sk
+JOIN filtered_customer ON ss_customer_sk = c_customer_sk
+JOIN filtered_customer_address ON c_current_addr_sk = ca_address_sk
+JOIN store ON ss_store_sk = s_store_sk
+WHERE ss_wholesale_cost BETWEEN 34 AND 54
+  AND SUBSTRING(ca_zip FROM 1 FOR 5) <> SUBSTRING(s_zip FROM 1 FOR 5);

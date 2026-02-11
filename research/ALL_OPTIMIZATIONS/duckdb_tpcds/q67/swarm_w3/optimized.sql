@@ -1,0 +1,94 @@
+WITH filtered_dates AS (
+    SELECT 
+        d_date_sk,
+        d_year,
+        d_qoy,
+        d_moy
+    FROM date_dim
+    WHERE d_month_seq BETWEEN 1206 AND 1206 + 11
+),
+filtered_stores AS (
+    SELECT 
+        s_store_sk,
+        s_store_id
+    FROM store
+),
+filtered_items AS (
+    SELECT 
+        i_item_sk,
+        i_category,
+        i_class,
+        i_brand,
+        i_product_name
+    FROM item
+),
+joined_facts AS (
+    SELECT
+        it.i_category,
+        it.i_class,
+        it.i_brand,
+        it.i_product_name,
+        dt.d_year,
+        dt.d_qoy,
+        dt.d_moy,
+        st.s_store_id,
+        ss.ss_sales_price,
+        ss.ss_quantity
+    FROM store_sales ss
+    JOIN filtered_dates dt ON ss.ss_sold_date_sk = dt.d_date_sk
+    JOIN filtered_items it ON ss.ss_item_sk = it.i_item_sk
+    JOIN filtered_stores st ON ss.ss_store_sk = st.s_store_sk
+),
+aggregated AS (
+    SELECT
+        i_category,
+        i_class,
+        i_brand,
+        i_product_name,
+        d_year,
+        d_qoy,
+        d_moy,
+        s_store_id,
+        SUM(COALESCE(ss_sales_price * ss_quantity, 0)) AS sumsales
+    FROM joined_facts
+    GROUP BY ROLLUP (
+        i_category,
+        i_class,
+        i_brand,
+        i_product_name,
+        d_year,
+        d_qoy,
+        d_moy,
+        s_store_id
+    )
+)
+SELECT
+    i_category,
+    i_class,
+    i_brand,
+    i_product_name,
+    d_year,
+    d_qoy,
+    d_moy,
+    s_store_id,
+    sumsales,
+    rk
+FROM (
+    SELECT
+        *,
+        RANK() OVER (PARTITION BY i_category ORDER BY sumsales DESC) AS rk
+    FROM aggregated
+) ranked
+WHERE rk <= 100
+ORDER BY
+    i_category,
+    i_class,
+    i_brand,
+    i_product_name,
+    d_year,
+    d_qoy,
+    d_moy,
+    s_store_id,
+    sumsales,
+    rk
+LIMIT 100

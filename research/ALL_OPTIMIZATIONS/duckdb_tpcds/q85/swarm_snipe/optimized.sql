@@ -1,0 +1,203 @@
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 2000
+),
+filtered_reason AS (
+    SELECT r_reason_sk, SUBSTRING(r_reason_desc, 1, 20) AS reason_prefix, r_reason_desc
+    FROM reason
+),
+branch1 AS (
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r.reason_prefix, r.r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN filtered_dates fd ON ws_sold_date_sk = fd.d_date_sk
+    JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN customer_address ca ON ca_address_sk = wr_refunded_addr_sk
+    JOIN filtered_reason r ON r_reason_sk = wr_reason_sk
+    WHERE cd1.cd_marital_status = 'M'
+        AND cd1.cd_marital_status = cd2.cd_marital_status
+        AND cd1.cd_education_status = '4 yr Degree'
+        AND cd1.cd_education_status = cd2.cd_education_status
+        AND ws_sales_price BETWEEN 100.00 AND 150.00
+        AND ca_country = 'United States'
+        AND ca_state IN ('FL', 'TX', 'DE')
+        AND ws_net_profit BETWEEN 100 AND 200
+),
+branch2 AS (
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r.reason_prefix, r.r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN filtered_dates fd ON ws_sold_date_sk = fd.d_date_sk
+    JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN customer_address ca ON ca_address_sk = wr_refunded_addr_sk
+    JOIN filtered_reason r ON r_reason_sk = wr_reason_sk
+    WHERE cd1.cd_marital_status = 'M'
+        AND cd1.cd_marital_status = cd2.cd_marital_status
+        AND cd1.cd_education_status = '4 yr Degree'
+        AND cd1.cd_education_status = cd2.cd_education_status
+        AND ws_sales_price BETWEEN 100.00 AND 150.00
+        AND ca_country = 'United States'
+        AND ca_state IN ('IN', 'ND', 'ID')
+        AND ws_net_profit BETWEEN 150 AND 300
+),
+branch3 AS (
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r.reason_prefix, r.r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN filtered_dates fd ON ws_sold_date_sk = fd.d_date_sk
+    JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN customer_address ca ON ca_address_sk = wr_refunded_addr_sk
+    JOIN filtered_reason r ON r_reason_sk = wr_reason_sk
+    WHERE cd1.cd_marital_status = 'M'
+        AND cd1.cd_marital_status = cd2.cd_marital_status
+        AND cd1.cd_education_status = '4 yr Degree'
+        AND cd1.cd_education_status = cd2.cd_education_status
+        AND ws_sales_price BETWEEN 100.00 AND 150.00
+        AND ca_country = 'United States'
+        AND ca_state IN ('MT', 'IL', 'OH')
+        AND ws_net_profit BETWEEN 50 AND 250
+),
+branch4 AS (
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r.reason_prefix, r.r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN filtered_dates fd ON ws_sold_date_sk = fd.d_date_sk
+    JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN customer_address ca ON ca_address_sk = wr_refunded_addr_sk
+    JOIN filtered_reason r ON r_reason_sk = wr_reason_sk
+    WHERE cd1.cd_marital_status = 'S'
+        AND cd1.cd_marital_status = cd2.cd_marital_status
+        AND cd1.cd_education_status = 'Secondary'
+        AND cd1.cd_education_status = cd2.cd_education_status
+        AND ws_sales_price BETWEEN 50.00 AND 100.00
+        AND ca_country = 'United States'
+        AND ca_state IN ('FL', 'TX', 'DE')
+        AND ws_net_profit BETWEEN 100 AND 200
+),
+branch5 AS (
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r.reason_prefix, r.r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN filtered_dates fd ON ws_sold_date_sk = fd.d_date_sk
+    JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN customer_address ca ON ca_address_sk = wr_refunded_addr_sk
+    JOIN filtered_reason r ON r_reason_sk = wr_reason_sk
+    WHERE cd1.cd_marital_status = 'S'
+        AND cd1.cd_marital_status = cd2.cd_marital_status
+        AND cd1.cd_education_status = 'Secondary'
+        AND cd1.cd_education_status = cd2.cd_education_status
+        AND ws_sales_price BETWEEN 50.00 AND 100.00
+        AND ca_country = 'United States'
+        AND ca_state IN ('IN', 'ND', 'ID')
+        AND ws_net_profit BETWEEN 150 AND 300
+),
+branch6 AS (
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r.reason_prefix, r.r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN filtered_dates fd ON ws_sold_date_sk = fd.d_date_sk
+    JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN customer_address ca ON ca_address_sk = wr_refunded_addr_sk
+    JOIN filtered_reason r ON r_reason_sk = wr_reason_sk
+    WHERE cd1.cd_marital_status = 'S'
+        AND cd1.cd_marital_status = cd2.cd_marital_status
+        AND cd1.cd_education_status = 'Secondary'
+        AND cd1.cd_education_status = cd2.cd_education_status
+        AND ws_sales_price BETWEEN 50.00 AND 100.00
+        AND ca_country = 'United States'
+        AND ca_state IN ('MT', 'IL', 'OH')
+        AND ws_net_profit BETWEEN 50 AND 250
+),
+branch7 AS (
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r.reason_prefix, r.r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN filtered_dates fd ON ws_sold_date_sk = fd.d_date_sk
+    JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN customer_address ca ON ca_address_sk = wr_refunded_addr_sk
+    JOIN filtered_reason r ON r_reason_sk = wr_reason_sk
+    WHERE cd1.cd_marital_status = 'W'
+        AND cd1.cd_marital_status = cd2.cd_marital_status
+        AND cd1.cd_education_status = 'Advanced Degree'
+        AND cd1.cd_education_status = cd2.cd_education_status
+        AND ws_sales_price BETWEEN 150.00 AND 200.00
+        AND ca_country = 'United States'
+        AND ca_state IN ('FL', 'TX', 'DE')
+        AND ws_net_profit BETWEEN 100 AND 200
+),
+branch8 AS (
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r.reason_prefix, r.r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN filtered_dates fd ON ws_sold_date_sk = fd.d_date_sk
+    JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN customer_address ca ON ca_address_sk = wr_refunded_addr_sk
+    JOIN filtered_reason r ON r_reason_sk = wr_reason_sk
+    WHERE cd1.cd_marital_status = 'W'
+        AND cd1.cd_marital_status = cd2.cd_marital_status
+        AND cd1.cd_education_status = 'Advanced Degree'
+        AND cd1.cd_education_status = cd2.cd_education_status
+        AND ws_sales_price BETWEEN 150.00 AND 200.00
+        AND ca_country = 'United States'
+        AND ca_state IN ('IN', 'ND', 'ID')
+        AND ws_net_profit BETWEEN 150 AND 300
+),
+branch9 AS (
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r.reason_prefix, r.r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN filtered_dates fd ON ws_sold_date_sk = fd.d_date_sk
+    JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN customer_address ca ON ca_address_sk = wr_refunded_addr_sk
+    JOIN filtered_reason r ON r_reason_sk = wr_reason_sk
+    WHERE cd1.cd_marital_status = 'W'
+        AND cd1.cd_marital_status = cd2.cd_marital_status
+        AND cd1.cd_education_status = 'Advanced Degree'
+        AND cd1.cd_education_status = cd2.cd_education_status
+        AND ws_sales_price BETWEEN 150.00 AND 200.00
+        AND ca_country = 'United States'
+        AND ca_state IN ('MT', 'IL', 'OH')
+        AND ws_net_profit BETWEEN 50 AND 250
+),
+unioned_data AS (
+    SELECT * FROM branch1
+    UNION ALL
+    SELECT * FROM branch2
+    UNION ALL
+    SELECT * FROM branch3
+    UNION ALL
+    SELECT * FROM branch4
+    UNION ALL
+    SELECT * FROM branch5
+    UNION ALL
+    SELECT * FROM branch6
+    UNION ALL
+    SELECT * FROM branch7
+    UNION ALL
+    SELECT * FROM branch8
+    UNION ALL
+    SELECT * FROM branch9
+)
+SELECT 
+    reason_prefix,
+    AVG(ws_quantity) AS "AVG(ws_quantity)",
+    AVG(wr_refunded_cash) AS "AVG(wr_refunded_cash)",
+    AVG(wr_fee) AS "AVG(wr_fee)"
+FROM unioned_data
+GROUP BY r_reason_desc, reason_prefix
+ORDER BY 
+    reason_prefix,
+    AVG(ws_quantity),
+    AVG(wr_refunded_cash),
+    AVG(wr_fee)
+LIMIT 100

@@ -1,0 +1,62 @@
+WITH home_manufacturers AS (
+  SELECT DISTINCT i_manufact_id
+  FROM item
+  WHERE i_category IN ('Home')
+),
+filtered_date AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 2002
+    AND d_moy = 1
+),
+filtered_address AS (
+  SELECT ca_address_sk
+  FROM customer_address
+  WHERE ca_gmt_offset = -5
+),
+ss AS (
+  SELECT
+    i.i_manufact_id,
+    SUM(ss_ext_sales_price) AS total_sales
+  FROM store_sales
+  JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+  JOIN filtered_address ON ss_addr_sk = ca_address_sk
+  JOIN item i ON ss_item_sk = i.i_item_sk
+  JOIN home_manufacturers hm ON i.i_manufact_id = hm.i_manufact_id
+  GROUP BY i.i_manufact_id
+),
+cs AS (
+  SELECT
+    i.i_manufact_id,
+    SUM(cs_ext_sales_price) AS total_sales
+  FROM catalog_sales
+  JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+  JOIN filtered_address ON cs_bill_addr_sk = ca_address_sk
+  JOIN item i ON cs_item_sk = i.i_item_sk
+  JOIN home_manufacturers hm ON i.i_manufact_id = hm.i_manufact_id
+  GROUP BY i.i_manufact_id
+),
+ws AS (
+  SELECT
+    i.i_manufact_id,
+    SUM(ws_ext_sales_price) AS total_sales
+  FROM web_sales
+  JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+  JOIN filtered_address ON ws_bill_addr_sk = ca_address_sk
+  JOIN item i ON ws_item_sk = i.i_item_sk
+  JOIN home_manufacturers hm ON i.i_manufact_id = hm.i_manufact_id
+  GROUP BY i.i_manufact_id
+)
+SELECT
+  i_manufact_id,
+  SUM(total_sales) AS total_sales
+FROM (
+  SELECT * FROM ss
+  UNION ALL
+  SELECT * FROM cs
+  UNION ALL
+  SELECT * FROM ws
+) AS tmp1
+GROUP BY i_manufact_id
+ORDER BY total_sales
+LIMIT 100

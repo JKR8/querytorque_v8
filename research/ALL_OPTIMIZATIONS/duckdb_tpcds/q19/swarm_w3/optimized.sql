@@ -1,0 +1,47 @@
+WITH filtered_date AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_moy = 12
+      AND d_year = 1999
+),
+filtered_item AS (
+    SELECT i_item_sk, i_brand_id, i_brand, i_manufact_id, i_manufact
+    FROM item
+    WHERE i_manager_id = 2
+),
+filtered_sales AS (
+    SELECT
+        ss_ext_sales_price,
+        ss_customer_sk,
+        ss_store_sk,
+        i.i_brand_id,
+        i.i_brand,
+        i.i_manufact_id,
+        i.i_manufact
+    FROM store_sales
+    JOIN filtered_date d ON d.d_date_sk = ss_sold_date_sk
+    JOIN filtered_item i ON i.i_item_sk = ss_item_sk
+)
+SELECT
+    i_brand_id AS brand_id,
+    i_brand AS brand,
+    i_manufact_id,
+    i_manufact,
+    SUM(ss_ext_sales_price) AS ext_price
+FROM filtered_sales
+JOIN customer ON ss_customer_sk = c_customer_sk
+JOIN customer_address ON c_current_addr_sk = ca_address_sk
+JOIN store ON ss_store_sk = s_store_sk
+WHERE SUBSTRING(ca_zip, 1, 5) <> SUBSTRING(s_zip, 1, 5)
+GROUP BY
+    i_brand,
+    i_brand_id,
+    i_manufact_id,
+    i_manufact
+ORDER BY
+    ext_price DESC,
+    i_brand,
+    i_brand_id,
+    i_manufact_id,
+    i_manufact
+LIMIT 100

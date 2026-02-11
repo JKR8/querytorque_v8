@@ -1,0 +1,34 @@
+WITH filtered_store AS (
+    SELECT s_store_sk, s_store_name, s_company_id, s_street_number,
+           s_street_name, s_suite_number, s_city, s_zip
+    FROM store
+    WHERE s_state IN ('LA', 'TX', 'VA')
+),
+date_pairs AS (
+    SELECT d1.d_date_sk AS d1_date_sk, d2.d_date_sk AS d2_date_sk,
+           d1.d_date AS d1_date, d2.d_date AS d2_date
+    FROM date_dim d1
+    JOIN date_dim d2 ON d1.d_date BETWEEN (d2.d_date - INTERVAL '120 DAY') AND d2.d_date
+    WHERE d1.d_dow = 1
+      AND d2.d_moy = 12
+)
+SELECT MIN(s.s_store_name),
+       MIN(s.s_company_id),
+       MIN(s.s_street_number),
+       MIN(s.s_street_name),
+       MIN(s.s_suite_number),
+       MIN(s.s_city),
+       MIN(s.s_zip),
+       MIN(ss.ss_ticket_number),
+       MIN(ss.ss_sold_date_sk),
+       MIN(sr.sr_returned_date_sk),
+       MIN(ss.ss_item_sk),
+       MIN(dp.d1_date_sk)
+FROM date_pairs dp
+JOIN store_sales ss ON ss.ss_sold_date_sk = dp.d1_date_sk
+JOIN store_returns sr ON sr.sr_returned_date_sk = dp.d2_date_sk
+                     AND sr.sr_ticket_number = ss.ss_ticket_number
+                     AND sr.sr_item_sk = ss.ss_item_sk
+                     AND sr.sr_customer_sk = ss.ss_customer_sk
+JOIN filtered_store s ON s.s_store_sk = ss.ss_store_sk
+                      AND s.s_store_sk = sr.sr_store_sk;

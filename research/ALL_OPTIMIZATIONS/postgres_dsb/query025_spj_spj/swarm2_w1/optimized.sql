@@ -1,0 +1,38 @@
+WITH filtered_d1 AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_moy = 6
+      AND d_year = 2002
+), filtered_d2 AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_moy BETWEEN 6 AND 8
+      AND d_year = 2002
+), filtered_d3 AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_moy BETWEEN 6 AND 8
+      AND d_year = 2002
+)
+SELECT
+  MIN(i_item_id),
+  MIN(i_item_desc),
+  MIN(s_store_id),
+  MIN(s_store_name),
+  MIN(ss_net_profit),
+  MIN(sr_net_loss),
+  MIN(cs_net_profit),
+  MIN(ss_item_sk),
+  MIN(sr_ticket_number),
+  MIN(cs_order_number)
+FROM store_sales
+JOIN filtered_d1 ON store_sales.ss_sold_date_sk = filtered_d1.d_date_sk
+JOIN item ON store_sales.ss_item_sk = item.i_item_sk
+JOIN store ON store_sales.ss_store_sk = store.s_store_sk
+JOIN store_returns ON store_sales.ss_customer_sk = store_returns.sr_customer_sk
+                  AND store_sales.ss_item_sk = store_returns.sr_item_sk
+                  AND store_sales.ss_ticket_number = store_returns.sr_ticket_number
+JOIN filtered_d2 ON store_returns.sr_returned_date_sk = filtered_d2.d_date_sk
+JOIN catalog_sales ON store_returns.sr_customer_sk = catalog_sales.cs_bill_customer_sk
+                  AND store_returns.sr_item_sk = catalog_sales.cs_item_sk
+JOIN filtered_d3 ON catalog_sales.cs_sold_date_sk = filtered_d3.d_date_sk

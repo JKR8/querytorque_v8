@@ -1,0 +1,54 @@
+WITH filtered_dates AS (
+    SELECT d_date_sk, d_date
+    FROM date_dim
+    WHERE d_month_seq BETWEEN 1184 AND 1184 + 11
+),
+sales_combined AS (
+    -- Store sales
+    SELECT 
+        'store' AS channel,
+        ss_customer_sk AS customer_sk,
+        d_date
+    FROM store_sales
+    JOIN filtered_dates ON store_sales.ss_sold_date_sk = filtered_dates.d_date_sk
+    UNION ALL
+    -- Catalog sales
+    SELECT 
+        'catalog' AS channel,
+        cs_bill_customer_sk AS customer_sk,
+        d_date
+    FROM catalog_sales
+    JOIN filtered_dates ON catalog_sales.cs_sold_date_sk = filtered_dates.d_date_sk
+    UNION ALL
+    -- Web sales
+    SELECT 
+        'web' AS channel,
+        ws_bill_customer_sk AS customer_sk,
+        d_date
+    FROM web_sales
+    JOIN filtered_dates ON web_sales.ws_sold_date_sk = filtered_dates.d_date_sk
+),
+channel_presence AS (
+    SELECT 
+        customer_sk,
+        d_date,
+        BOOL_OR(channel = 'store') AS has_store,
+        BOOL_OR(channel = 'catalog') AS has_catalog,
+        BOOL_OR(channel = 'web') AS has_web
+    FROM sales_combined
+    GROUP BY customer_sk, d_date
+),
+store_only_customers AS (
+    SELECT 
+        channel_presence.customer_sk,
+        channel_presence.d_date,
+        customer.c_last_name,
+        customer.c_first_name
+    FROM channel_presence
+    JOIN customer ON channel_presence.customer_sk = customer.c_customer_sk
+    WHERE has_store = TRUE
+      AND has_catalog = FALSE
+      AND has_web = FALSE
+)
+SELECT COUNT(*)
+FROM store_only_customers

@@ -1,0 +1,63 @@
+WITH filtered_dates AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_month_seq BETWEEN 1213 AND 1213 + 11
+),
+filtered_store_sales AS (
+    SELECT
+        ss_store_sk,
+        ss_item_sk,
+        ss_sales_price,
+        ss_list_price
+    FROM store_sales
+    JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+    WHERE ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+),
+sc AS (
+    SELECT
+        ss_store_sk,
+        ss_item_sk,
+        SUM(ss_sales_price) AS revenue
+    FROM filtered_store_sales
+    GROUP BY
+        ss_store_sk,
+        ss_item_sk
+),
+sb AS (
+    SELECT
+        ss_store_sk,
+        AVG(revenue) AS ave
+    FROM sc
+    GROUP BY ss_store_sk
+),
+filtered_store AS (
+    SELECT s_store_sk, s_store_name
+    FROM store
+    WHERE s_state IN ('TN', 'TX', 'VA')
+),
+filtered_item AS (
+    SELECT
+        i_item_sk,
+        i_item_desc,
+        i_current_price,
+        i_wholesale_cost,
+        i_brand
+    FROM item
+    WHERE i_manager_id BETWEEN 32 AND 36
+)
+SELECT
+    s_store_name,
+    i_item_desc,
+    sc.revenue,
+    i_current_price,
+    i_wholesale_cost,
+    i_brand
+FROM sc
+JOIN sb ON sc.ss_store_sk = sb.ss_store_sk
+JOIN filtered_store ON sc.ss_store_sk = filtered_store.s_store_sk
+JOIN filtered_item ON sc.ss_item_sk = filtered_item.i_item_sk
+WHERE sc.revenue <= 0.1 * sb.ave
+ORDER BY
+    s_store_name,
+    i_item_desc
+LIMIT 100;

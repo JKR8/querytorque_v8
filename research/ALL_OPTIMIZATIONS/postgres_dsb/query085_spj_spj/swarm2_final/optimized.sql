@@ -1,0 +1,124 @@
+WITH date_filter AS (
+    SELECT d_date_sk FROM date_dim WHERE d_year = 1998
+)
+SELECT
+    MIN(ws_quantity),
+    MIN(wr_refunded_cash),
+    MIN(wr_fee),
+    MIN(ws_item_sk),
+    MIN(wr_order_number),
+    MIN(cd1_demo_sk),
+    MIN(cd2_demo_sk)
+FROM (
+    -- Branch 1: 'D' marital status, 'Secondary' education, price 100-150
+    SELECT
+        ws.ws_quantity,
+        wr.wr_refunded_cash,
+        wr.wr_fee,
+        ws.ws_item_sk,
+        wr.wr_order_number,
+        cd1.cd_demo_sk AS cd1_demo_sk,
+        cd2.cd_demo_sk AS cd2_demo_sk
+    FROM customer_demographics cd1
+    JOIN customer_demographics cd2 ON cd1.cd_marital_status = cd2.cd_marital_status
+        AND cd1.cd_education_status = cd2.cd_education_status
+    CROSS JOIN LATERAL (
+        SELECT ca_address_sk
+        FROM customer_address
+        WHERE ca_country = 'United States'
+            AND ca_state IN ('IA', 'PA', 'TX')
+    ) ca1
+    CROSS JOIN LATERAL (
+        SELECT ws_quantity, ws_item_sk, ws_order_number, ws_web_page_sk,
+               ws_sales_price, ws_net_profit, ws_sold_date_sk
+        FROM web_sales
+        WHERE ws_sales_price BETWEEN 100.00 AND 150.00
+            AND ws_net_profit BETWEEN 100 AND 200
+    ) ws
+    JOIN date_filter df ON ws.ws_sold_date_sk = df.d_date_sk
+    JOIN web_returns wr ON ws.ws_item_sk = wr.wr_item_sk
+        AND ws.ws_order_number = wr.wr_order_number
+        AND wr.wr_refunded_addr_sk = ca1.ca_address_sk
+        AND wr.wr_refunded_cdemo_sk = cd1.cd_demo_sk
+        AND wr.wr_returning_cdemo_sk = cd2.cd_demo_sk
+    JOIN web_page wp ON ws.ws_web_page_sk = wp.wp_web_page_sk
+    JOIN reason r ON wr.wr_reason_sk = r.r_reason_sk
+    WHERE cd1.cd_marital_status = 'D'
+        AND cd1.cd_education_status = 'Secondary'
+
+    UNION ALL
+
+    -- Branch 2: 'M' marital status, '4 yr Degree' education, price 50-100
+    SELECT
+        ws.ws_quantity,
+        wr.wr_refunded_cash,
+        wr.wr_fee,
+        ws.ws_item_sk,
+        wr.wr_order_number,
+        cd1.cd_demo_sk AS cd1_demo_sk,
+        cd2.cd_demo_sk AS cd2_demo_sk
+    FROM customer_demographics cd1
+    JOIN customer_demographics cd2 ON cd1.cd_marital_status = cd2.cd_marital_status
+        AND cd1.cd_education_status = cd2.cd_education_status
+    CROSS JOIN LATERAL (
+        SELECT ca_address_sk
+        FROM customer_address
+        WHERE ca_country = 'United States'
+            AND ca_state IN ('GA', 'MO', 'SD')
+    ) ca1
+    CROSS JOIN LATERAL (
+        SELECT ws_quantity, ws_item_sk, ws_order_number, ws_web_page_sk,
+               ws_sales_price, ws_net_profit, ws_sold_date_sk
+        FROM web_sales
+        WHERE ws_sales_price BETWEEN 50.00 AND 100.00
+            AND ws_net_profit BETWEEN 150 AND 300
+    ) ws
+    JOIN date_filter df ON ws.ws_sold_date_sk = df.d_date_sk
+    JOIN web_returns wr ON ws.ws_item_sk = wr.wr_item_sk
+        AND ws.ws_order_number = wr.wr_order_number
+        AND wr.wr_refunded_addr_sk = ca1.ca_address_sk
+        AND wr.wr_refunded_cdemo_sk = cd1.cd_demo_sk
+        AND wr.wr_returning_cdemo_sk = cd2.cd_demo_sk
+    JOIN web_page wp ON ws.ws_web_page_sk = wp.wp_web_page_sk
+    JOIN reason r ON wr.wr_reason_sk = r.r_reason_sk
+    WHERE cd1.cd_marital_status = 'M'
+        AND cd1.cd_education_status = '4 yr Degree'
+
+    UNION ALL
+
+    -- Branch 3: 'U' marital status, 'Unknown' education, price 150-200
+    SELECT
+        ws.ws_quantity,
+        wr.wr_refunded_cash,
+        wr.wr_fee,
+        ws.ws_item_sk,
+        wr.wr_order_number,
+        cd1.cd_demo_sk AS cd1_demo_sk,
+        cd2.cd_demo_sk AS cd2_demo_sk
+    FROM customer_demographics cd1
+    JOIN customer_demographics cd2 ON cd1.cd_marital_status = cd2.cd_marital_status
+        AND cd1.cd_education_status = cd2.cd_education_status
+    CROSS JOIN LATERAL (
+        SELECT ca_address_sk
+        FROM customer_address
+        WHERE ca_country = 'United States'
+            AND ca_state IN ('LA', 'TX', 'VA')
+    ) ca1
+    CROSS JOIN LATERAL (
+        SELECT ws_quantity, ws_item_sk, ws_order_number, ws_web_page_sk,
+               ws_sales_price, ws_net_profit, ws_sold_date_sk
+        FROM web_sales
+        WHERE ws_sales_price BETWEEN 150.00 AND 200.00
+            AND ws_net_profit BETWEEN 50 AND 250
+    ) ws
+    JOIN date_filter df ON ws.ws_sold_date_sk = df.d_date_sk
+    JOIN web_returns wr ON ws.ws_item_sk = wr.wr_item_sk
+        AND ws.ws_order_number = wr.wr_order_number
+        AND wr.wr_refunded_addr_sk = ca1.ca_address_sk
+        AND wr.wr_refunded_cdemo_sk = cd1.cd_demo_sk
+        AND wr.wr_returning_cdemo_sk = cd2.cd_demo_sk
+    JOIN web_page wp ON ws.ws_web_page_sk = wp.wp_web_page_sk
+    JOIN reason r ON wr.wr_reason_sk = r.r_reason_sk
+    WHERE cd1.cd_marital_status = 'U'
+        AND cd1.cd_education_status = 'Unknown'
+) combined;

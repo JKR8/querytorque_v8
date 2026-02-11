@@ -1,0 +1,218 @@
+WITH 
+-- Pre-filter date_dim for 1998
+date_filter AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year = 1998
+),
+-- Pre-filter reason for all rows (no predicate on reason)
+reason_filter AS (
+    SELECT r_reason_sk, r_reason_desc
+    FROM reason
+),
+-- Branch 1: cd1.cd_marital_status = 'D' AND cd1.cd_education_status = 'Secondary'
+cd1_d_secondary AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_marital_status = 'D'
+      AND cd_education_status = 'Secondary'
+),
+cd2_d_secondary AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_marital_status = 'D'
+      AND cd_education_status = 'Secondary'
+),
+-- Branch 2: cd1.cd_marital_status = 'M' AND cd1.cd_education_status = '4 yr Degree'
+cd1_m_degree AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_marital_status = 'M'
+      AND cd_education_status = '4 yr Degree'
+),
+cd2_m_degree AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_marital_status = 'M'
+      AND cd_education_status = '4 yr Degree'
+),
+-- Branch 3: cd1.cd_marital_status = 'U' AND cd1.cd_education_status = 'Unknown'
+cd1_u_unknown AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_marital_status = 'U'
+      AND cd_education_status = 'Unknown'
+),
+cd2_u_unknown AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_marital_status = 'U'
+      AND cd_education_status = 'Unknown'
+),
+-- Address filters: United States with specific states
+addr_ia_pa_tx AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_country = 'United States'
+      AND ca_state IN ('IA', 'PA', 'TX')
+),
+addr_ga_mo_sd AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_country = 'United States'
+      AND ca_state IN ('GA', 'MO', 'SD')
+),
+addr_la_tx_va AS (
+    SELECT ca_address_sk
+    FROM customer_address
+    WHERE ca_country = 'United States'
+      AND ca_state IN ('LA', 'TX', 'VA')
+),
+-- Combined branches using UNION ALL
+combined_sales AS (
+    -- Branch 1A: D/Secondary + IA/PA/TX + price 100-150 + profit 100-200
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN web_page ON ws_web_page_sk = wp_web_page_sk
+    JOIN date_filter ON ws_sold_date_sk = d_date_sk
+    JOIN cd1_d_secondary cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN cd2_d_secondary cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN addr_ia_pa_tx addr ON addr.ca_address_sk = wr_refunded_addr_sk
+    JOIN reason_filter ON r_reason_sk = wr_reason_sk
+    WHERE ws_sales_price BETWEEN 100.00 AND 150.00
+      AND ws_net_profit BETWEEN 100 AND 200
+    
+    UNION ALL
+    
+    -- Branch 1B: D/Secondary + GA/MO/SD + price 100-150 + profit 150-300
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN web_page ON ws_web_page_sk = wp_web_page_sk
+    JOIN date_filter ON ws_sold_date_sk = d_date_sk
+    JOIN cd1_d_secondary cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN cd2_d_secondary cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN addr_ga_mo_sd addr ON addr.ca_address_sk = wr_refunded_addr_sk
+    JOIN reason_filter ON r_reason_sk = wr_reason_sk
+    WHERE ws_sales_price BETWEEN 100.00 AND 150.00
+      AND ws_net_profit BETWEEN 150 AND 300
+    
+    UNION ALL
+    
+    -- Branch 1C: D/Secondary + LA/TX/VA + price 100-150 + profit 50-250
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN web_page ON ws_web_page_sk = wp_web_page_sk
+    JOIN date_filter ON ws_sold_date_sk = d_date_sk
+    JOIN cd1_d_secondary cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN cd2_d_secondary cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN addr_la_tx_va addr ON addr.ca_address_sk = wr_refunded_addr_sk
+    JOIN reason_filter ON r_reason_sk = wr_reason_sk
+    WHERE ws_sales_price BETWEEN 100.00 AND 150.00
+      AND ws_net_profit BETWEEN 50 AND 250
+    
+    UNION ALL
+    
+    -- Branch 2A: M/4yrDegree + IA/PA/TX + price 50-100 + profit 100-200
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN web_page ON ws_web_page_sk = wp_web_page_sk
+    JOIN date_filter ON ws_sold_date_sk = d_date_sk
+    JOIN cd1_m_degree cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN cd2_m_degree cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN addr_ia_pa_tx addr ON addr.ca_address_sk = wr_refunded_addr_sk
+    JOIN reason_filter ON r_reason_sk = wr_reason_sk
+    WHERE ws_sales_price BETWEEN 50.00 AND 100.00
+      AND ws_net_profit BETWEEN 100 AND 200
+    
+    UNION ALL
+    
+    -- Branch 2B: M/4yrDegree + GA/MO/SD + price 50-100 + profit 150-300
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN web_page ON ws_web_page_sk = wp_web_page_sk
+    JOIN date_filter ON ws_sold_date_sk = d_date_sk
+    JOIN cd1_m_degree cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN cd2_m_degree cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN addr_ga_mo_sd addr ON addr.ca_address_sk = wr_refunded_addr_sk
+    JOIN reason_filter ON r_reason_sk = wr_reason_sk
+    WHERE ws_sales_price BETWEEN 50.00 AND 100.00
+      AND ws_net_profit BETWEEN 150 AND 300
+    
+    UNION ALL
+    
+    -- Branch 2C: M/4yrDegree + LA/TX/VA + price 50-100 + profit 50-250
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN web_page ON ws_web_page_sk = wp_web_page_sk
+    JOIN date_filter ON ws_sold_date_sk = d_date_sk
+    JOIN cd1_m_degree cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN cd2_m_degree cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN addr_la_tx_va addr ON addr.ca_address_sk = wr_refunded_addr_sk
+    JOIN reason_filter ON r_reason_sk = wr_reason_sk
+    WHERE ws_sales_price BETWEEN 50.00 AND 100.00
+      AND ws_net_profit BETWEEN 50 AND 250
+    
+    UNION ALL
+    
+    -- Branch 3A: U/Unknown + IA/PA/TX + price 150-200 + profit 100-200
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN web_page ON ws_web_page_sk = wp_web_page_sk
+    JOIN date_filter ON ws_sold_date_sk = d_date_sk
+    JOIN cd1_u_unknown cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN cd2_u_unknown cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN addr_ia_pa_tx addr ON addr.ca_address_sk = wr_refunded_addr_sk
+    JOIN reason_filter ON r_reason_sk = wr_reason_sk
+    WHERE ws_sales_price BETWEEN 150.00 AND 200.00
+      AND ws_net_profit BETWEEN 100 AND 200
+    
+    UNION ALL
+    
+    -- Branch 3B: U/Unknown + GA/MO/SD + price 150-200 + profit 150-300
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN web_page ON ws_web_page_sk = wp_web_page_sk
+    JOIN date_filter ON ws_sold_date_sk = d_date_sk
+    JOIN cd1_u_unknown cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN cd2_u_unknown cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN addr_ga_mo_sd addr ON addr.ca_address_sk = wr_refunded_addr_sk
+    JOIN reason_filter ON r_reason_sk = wr_reason_sk
+    WHERE ws_sales_price BETWEEN 150.00 AND 200.00
+      AND ws_net_profit BETWEEN 150 AND 300
+    
+    UNION ALL
+    
+    -- Branch 3C: U/Unknown + LA/TX/VA + price 150-200 + profit 50-250
+    SELECT ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc
+    FROM web_sales
+    JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN web_page ON ws_web_page_sk = wp_web_page_sk
+    JOIN date_filter ON ws_sold_date_sk = d_date_sk
+    JOIN cd1_u_unknown cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+    JOIN cd2_u_unknown cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    JOIN addr_la_tx_va addr ON addr.ca_address_sk = wr_refunded_addr_sk
+    JOIN reason_filter ON r_reason_sk = wr_reason_sk
+    WHERE ws_sales_price BETWEEN 150.00 AND 200.00
+      AND ws_net_profit BETWEEN 50 AND 250
+)
+SELECT
+    SUBSTRING(r_reason_desc FROM 1 FOR 20),
+    AVG(ws_quantity),
+    AVG(wr_refunded_cash),
+    AVG(wr_fee)
+FROM combined_sales
+GROUP BY r_reason_desc
+ORDER BY
+    SUBSTRING(r_reason_desc FROM 1 FOR 20),
+    AVG(ws_quantity),
+    AVG(wr_refunded_cash),
+    AVG(wr_fee)
+LIMIT 100;

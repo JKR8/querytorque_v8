@@ -1,0 +1,90 @@
+WITH target_week AS (
+  SELECT d_week_seq
+  FROM date_dim
+  WHERE d_date = '2001-03-24'
+),
+target_dates AS (
+  SELECT d_date_sk
+  FROM date_dim, target_week
+  WHERE d_week_seq = target_week.d_week_seq
+),
+filtered_item AS (
+  SELECT i_item_sk, i_item_id
+  FROM item
+),
+ss_filtered AS (
+  SELECT ss_item_sk, ss_ext_sales_price
+  FROM store_sales
+  JOIN target_dates ON ss_sold_date_sk = target_dates.d_date_sk
+),
+cs_filtered AS (
+  SELECT cs_item_sk, cs_ext_sales_price
+  FROM catalog_sales
+  JOIN target_dates ON cs_sold_date_sk = target_dates.d_date_sk
+),
+ws_filtered AS (
+  SELECT ws_item_sk, ws_ext_sales_price
+  FROM web_sales
+  JOIN target_dates ON ws_sold_date_sk = target_dates.d_date_sk
+),
+ss_items AS (
+  SELECT
+    filtered_item.i_item_id AS item_id,
+    SUM(ss_filtered.ss_ext_sales_price) AS ss_item_rev
+  FROM ss_filtered
+  JOIN filtered_item ON ss_filtered.ss_item_sk = filtered_item.i_item_sk
+  GROUP BY filtered_item.i_item_id
+),
+cs_items AS (
+  SELECT
+    filtered_item.i_item_id AS item_id,
+    SUM(cs_filtered.cs_ext_sales_price) AS cs_item_rev
+  FROM cs_filtered
+  JOIN filtered_item ON cs_filtered.cs_item_sk = filtered_item.i_item_sk
+  GROUP BY filtered_item.i_item_id
+),
+ws_items AS (
+  SELECT
+    filtered_item.i_item_id AS item_id,
+    SUM(ws_filtered.ws_ext_sales_price) AS ws_item_rev
+  FROM ws_filtered
+  JOIN filtered_item ON ws_filtered.ws_item_sk = filtered_item.i_item_sk
+  GROUP BY filtered_item.i_item_id
+)
+SELECT
+  ss_items.item_id,
+  ss_item_rev,
+  ss_item_rev / (
+    (
+      ss_item_rev + cs_item_rev + ws_item_rev
+    ) / 3
+  ) * 100 AS ss_dev,
+  cs_item_rev,
+  cs_item_rev / (
+    (
+      ss_item_rev + cs_item_rev + ws_item_rev
+    ) / 3
+  ) * 100 AS cs_dev,
+  ws_item_rev,
+  ws_item_rev / (
+    (
+      ss_item_rev + cs_item_rev + ws_item_rev
+    ) / 3
+  ) * 100 AS ws_dev,
+  (
+    ss_item_rev + cs_item_rev + ws_item_rev
+  ) / 3 AS average
+FROM ss_items, cs_items, ws_items
+WHERE
+  ss_items.item_id = cs_items.item_id
+  AND ss_items.item_id = ws_items.item_id
+  AND ss_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev
+  AND ss_item_rev BETWEEN 0.9 * ws_item_rev AND 1.1 * ws_item_rev
+  AND cs_item_rev BETWEEN 0.9 * ss_item_rev AND 1.1 * ss_item_rev
+  AND cs_item_rev BETWEEN 0.9 * ws_item_rev AND 1.1 * ws_item_rev
+  AND ws_item_rev BETWEEN 0.9 * ss_item_rev AND 1.1 * ss_item_rev
+  AND ws_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev
+ORDER BY
+  ss_items.item_id,
+  ss_item_rev
+LIMIT 100

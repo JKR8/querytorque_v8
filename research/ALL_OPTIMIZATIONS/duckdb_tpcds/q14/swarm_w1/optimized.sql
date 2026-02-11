@@ -1,0 +1,130 @@
+WITH filtered_date AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year BETWEEN 2000 AND 2002
+),
+filtered_items AS (
+  SELECT DISTINCT i_brand_id, i_class_id, i_category_id
+  FROM (
+    SELECT iss.i_brand_id, iss.i_class_id, iss.i_category_id
+    FROM store_sales
+    JOIN item iss ON store_sales.ss_item_sk = iss.i_item_sk
+    JOIN filtered_date d1 ON store_sales.ss_sold_date_sk = d1.d_date_sk
+    INTERSECT
+    SELECT ics.i_brand_id, ics.i_class_id, ics.i_category_id
+    FROM catalog_sales
+    JOIN item ics ON catalog_sales.cs_item_sk = ics.i_item_sk
+    JOIN filtered_date d2 ON catalog_sales.cs_sold_date_sk = d2.d_date_sk
+    INTERSECT
+    SELECT iws.i_brand_id, iws.i_class_id, iws.i_category_id
+    FROM web_sales
+    JOIN item iws ON web_sales.ws_item_sk = iws.i_item_sk
+    JOIN filtered_date d3 ON web_sales.ws_sold_date_sk = d3.d_date_sk
+  )
+),
+cross_items AS (
+  SELECT i_item_sk AS ss_item_sk
+  FROM item
+  JOIN filtered_items ON item.i_brand_id = filtered_items.i_brand_id
+    AND item.i_class_id = filtered_items.i_class_id
+    AND item.i_category_id = filtered_items.i_category_id
+),
+avg_sales AS (
+  SELECT AVG(sales_value) AS average_sales
+  FROM (
+    SELECT ss_quantity * ss_list_price AS sales_value
+    FROM store_sales
+    JOIN filtered_date ON store_sales.ss_sold_date_sk = filtered_date.d_date_sk
+    UNION ALL
+    SELECT cs_quantity * cs_list_price AS sales_value
+    FROM catalog_sales
+    JOIN filtered_date ON catalog_sales.cs_sold_date_sk = filtered_date.d_date_sk
+    UNION ALL
+    SELECT ws_quantity * ws_list_price AS sales_value
+    FROM web_sales
+    JOIN filtered_date ON web_sales.ws_sold_date_sk = filtered_date.d_date_sk
+  ) AS x
+),
+nov2002_dates AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 2002 AND d_moy = 11
+)
+SELECT
+  channel,
+  i_brand_id,
+  i_class_id,
+  i_category_id,
+  SUM(sales) AS "SUM(sales)",
+  SUM(number_sales) AS "SUM(number_sales)"
+FROM (
+  SELECT
+    'store' AS channel,
+    item.i_brand_id,
+    item.i_class_id,
+    item.i_category_id,
+    SUM(store_sales.ss_quantity * store_sales.ss_list_price) AS sales,
+    COUNT(*) AS number_sales
+  FROM store_sales
+  JOIN cross_items ON store_sales.ss_item_sk = cross_items.ss_item_sk
+  JOIN item ON store_sales.ss_item_sk = item.i_item_sk
+  JOIN nov2002_dates ON store_sales.ss_sold_date_sk = nov2002_dates.d_date_sk
+  GROUP BY
+    item.i_brand_id,
+    item.i_class_id,
+    item.i_category_id
+  HAVING SUM(store_sales.ss_quantity * store_sales.ss_list_price) > (
+    SELECT average_sales FROM avg_sales
+  )
+  UNION ALL
+  SELECT
+    'catalog' AS channel,
+    item.i_brand_id,
+    item.i_class_id,
+    item.i_category_id,
+    SUM(catalog_sales.cs_quantity * catalog_sales.cs_list_price) AS sales,
+    COUNT(*) AS number_sales
+  FROM catalog_sales
+  JOIN cross_items ON catalog_sales.cs_item_sk = cross_items.ss_item_sk
+  JOIN item ON catalog_sales.cs_item_sk = item.i_item_sk
+  JOIN nov2002_dates ON catalog_sales.cs_sold_date_sk = nov2002_dates.d_date_sk
+  GROUP BY
+    item.i_brand_id,
+    item.i_class_id,
+    item.i_category_id
+  HAVING SUM(catalog_sales.cs_quantity * catalog_sales.cs_list_price) > (
+    SELECT average_sales FROM avg_sales
+  )
+  UNION ALL
+  SELECT
+    'web' AS channel,
+    item.i_brand_id,
+    item.i_class_id,
+    item.i_category_id,
+    SUM(web_sales.ws_quantity * web_sales.ws_list_price) AS sales,
+    COUNT(*) AS number_sales
+  FROM web_sales
+  JOIN cross_items ON web_sales.ws_item_sk = cross_items.ss_item_sk
+  JOIN item ON web_sales.ws_item_sk = item.i_item_sk
+  JOIN nov2002_dates ON web_sales.ws_sold_date_sk = nov2002_dates.d_date_sk
+  GROUP BY
+    item.i_brand_id,
+    item.i_class_id,
+    item.i_category_id
+  HAVING SUM(web_sales.ws_quantity * web_sales.ws_list_price) > (
+    SELECT average_sales FROM avg_sales
+  )
+) AS y
+GROUP BY
+  ROLLUP (
+    channel,
+    i_brand_id,
+    i_class_id,
+    i_category_id
+  )
+ORDER BY
+  channel,
+  i_brand_id,
+  i_class_id,
+  i_category_id
+LIMIT 100

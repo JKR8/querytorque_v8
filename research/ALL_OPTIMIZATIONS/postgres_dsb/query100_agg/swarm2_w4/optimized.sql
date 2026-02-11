@@ -1,0 +1,67 @@
+WITH 
+-- Pre-filter date dimension for the year range
+date_filter AS (
+    SELECT d_date_sk
+    FROM date_dim
+    WHERE d_year BETWEEN 2000 AND 2000 + 1
+),
+-- Pre-filter customer demographics for specific marital and education status
+cust_demo_filter AS (
+    SELECT cd_demo_sk
+    FROM customer_demographics
+    WHERE cd_marital_status = 'S'
+      AND cd_education_status = 'Secondary'
+),
+-- Pre-filter item1 for specific categories
+item1_filter AS (
+    SELECT i_item_sk, i_category
+    FROM item
+    WHERE i_category IN ('Electronics', 'Men')
+),
+-- Pre-filter item2 for specific manager ID range
+item2_filter AS (
+    SELECT i_item_sk, i_manager_id
+    FROM item
+    WHERE i_manager_id BETWEEN 81 AND 100
+),
+-- Pre-aggregate store_sales: filter by date, list price, and join to customer dimensions
+-- This reduces the self-join to a single scan of store_sales
+filtered_sales AS (
+    SELECT 
+        ss_ticket_number,
+        ss_item_sk,
+        ss_list_price,
+        ss_customer_sk
+    FROM store_sales
+    JOIN date_filter ON ss_sold_date_sk = d_date_sk
+    WHERE ss_list_price BETWEEN 16 AND 30
+      AND EXISTS (
+          SELECT 1
+          FROM customer
+          JOIN cust_demo_filter ON c_current_cdemo_sk = cd_demo_sk
+          JOIN customer_address ON c_current_addr_sk = ca_address_sk
+          WHERE ss_customer_sk = c_customer_sk
+      )
+),
+-- Join filtered sales to item1 and item2 filters
+paired_items AS (
+    SELECT 
+        f1.ss_ticket_number,
+        f1.ss_item_sk AS item1_sk,
+        f2.ss_item_sk AS item2_sk
+    FROM filtered_sales f1
+    JOIN filtered_sales f2 ON f1.ss_ticket_number = f2.ss_ticket_number
+    JOIN item1_filter i1 ON f1.ss_item_sk = i1.i_item_sk
+    JOIN item2_filter i2 ON f2.ss_item_sk = i2.i_item_sk
+    WHERE f1.ss_item_sk < f2.ss_item_sk
+)
+-- Final aggregation
+SELECT 
+    i1.i_item_sk AS i_item_sk,
+    i2.i_item_sk AS i_item_sk,
+    COUNT(*) AS cnt
+FROM paired_items p
+JOIN item i1 ON p.item1_sk = i1.i_item_sk
+JOIN item i2 ON p.item2_sk = i2.i_item_sk
+GROUP BY i1.i_item_sk, i2.i_item_sk
+ORDER BY cnt;
