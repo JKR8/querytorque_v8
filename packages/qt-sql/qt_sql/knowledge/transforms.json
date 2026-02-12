@@ -1,0 +1,691 @@
+[
+  {
+    "id": "channel_bitmap_aggregation",
+    "principle": "Consolidate repeated scans of the same fact table (one per time/channel bucket) into a single scan with CASE WHEN labels and conditional aggregation",
+    "precondition_features": [
+      "AGG_COUNT",
+      "SCALAR_SUB_5+",
+      "TABLE_REPEAT_8+"
+    ],
+    "contraindications": [],
+    "gap": "REDUNDANT_SCAN_ELIMINATION",
+    "notes": "The original query scans store_sales 8 times (once per time bucket), each with identical dimension joins. Consolidating into a single scan with CASE WHEN labels inside COUNT() reduces I/O from 8x to 1x. Dimension pre-filtering CTEs further reduce the join probe size. | Do not use when the number of distinct buckets exceeds 8 (diminishing returns from CASE evaluation overhead). Also not applicable when each subquery has structurally different joins or table references.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "composite_decorrelate_union",
+    "principle": "Composite Decorrelation: when multiple correlated EXISTS share common filters, extract shared dimensions into a single CTE and decorrelate the EXISTS checks into pre-materialized key sets joined via UNION.",
+    "precondition_features": [
+      "AGG_COUNT",
+      "AGG_SUM",
+      "DATE_DIM",
+      "EXISTS",
+      "GROUP_BY",
+      "MULTI_TABLE_5+",
+      "OR_BRANCH",
+      "SCALAR_SUB_2+",
+      "TABLE_REPEAT_3+"
+    ],
+    "contraindications": [],
+    "gap": "CORRELATED_SUBQUERY_PARALYSIS",
+    "notes": "Principle: Composite Decorrelation — when multiple correlated EXISTS share common filters, extract shared dimensions once, decorrelate each EXISTS into a DISTINCT CTE, and replace OR(EXISTS) with UNION at the set level. Here: (1) shared date filter CTE, (2) each EXISTS becomes SELECT DISTINCT customer_sk joined with filtered_dates, (3) OR(EXISTS web, EXISTS catalog) becomes UNION of key CTEs. Works because the query only checks membership, which DISTINCT + JOIN achieves.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "date_cte_isolate",
+    "principle": "Dimension Isolation: extract small dimension lookups into CTEs so they materialize once and subsequent joins probe a tiny hash table instead of rescanning.",
+    "precondition_features": [
+      "GROUP_BY",
+      "HAVING",
+      "AGG_AVG",
+      "AGG_COUNT",
+      "DATE_DIM",
+      "MULTI_TABLE_5+",
+      "SCALAR_SUB_2+"
+    ],
+    "contraindications": [
+      {
+        "id": "LOW_BASELINE",
+        "instruction": "Skip if baseline <100ms — CTE overhead exceeds filter savings",
+        "severity": "MEDIUM",
+        "worst_ratio": 0.5
+      },
+      {
+        "id": "ROLLUP_PRESENT",
+        "instruction": "CTE may prevent optimizer from pushing ROLLUP/window down through join tree",
+        "severity": "LOW",
+        "worst_ratio": 0.85
+      }
+    ],
+    "gap": "CROSS_CTE_PREDICATE_BLINDNESS",
+    "notes": "Principle: Dimension Isolation — extract small dimension lookups into CTEs so they materialize once and subsequent joins probe a tiny hash table. Here: extract date month_seq subquery into CTE, extract category average into separate CTE with GROUP BY, then JOIN instead of correlated subquery. Each CTE is scanned once. | Do not use when the optimizer already pushes date predicates effectively (e.g., simple equality filters on date columns in self-joins). Do not decompose an already-efficient existing CTE into sub-CTEs — this adds materialization overhead without reducing scans. Caused 0.49x regression on Q31 (DuckDB already optimized the date pushdown) and 0.71x on Q1 (decomposed a well-structured CTE into slower pieces).",
+    "min_baseline_ms": 100.0,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "decorrelate",
+    "principle": "Decorrelation: convert correlated subqueries to standalone CTEs with GROUP BY, then JOIN. Correlated subqueries re-execute per outer row; a pre-computed CTE executes once.",
+    "precondition_features": [
+      "AGG_AVG",
+      "AGG_SUM",
+      "CORRELATED_SUB",
+      "CTE",
+      "DATE_DIM",
+      "GROUP_BY"
+    ],
+    "contraindications": [
+      {
+        "id": "MISSING_FILTER",
+        "instruction": "Preserve ALL WHERE filters from original subquery — missing filter = cross-product",
+        "severity": "CRITICAL",
+        "worst_ratio": 0.34
+      },
+      {
+        "id": "ALREADY_DECORRELATED",
+        "instruction": "Check EXPLAIN — if hash join (not nested loop), optimizer already decorrelated",
+        "severity": "MEDIUM",
+        "worst_ratio": null
+      }
+    ],
+    "gap": "CORRELATED_SUBQUERY_PARALYSIS",
+    "notes": "Principle: Decorrelation — convert correlated subqueries to standalone CTEs with GROUP BY, then JOIN. Correlated subqueries re-execute per outer row; a pre-computed CTE executes once. Here: push s_state='SD' filter early into first CTE, compute average as separate CTE with GROUP BY (not window function), then JOIN on the average threshold.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": true,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "deferred_window_aggregation",
+    "principle": "Deferred Aggregation: delay expensive operations (window functions) until after joins reduce the dataset. Computing window functions inside individual CTEs then joining is more expensive than joining first and computing windows once on the combined result.",
+    "precondition_features": [
+      "AGG_SUM",
+      "BETWEEN",
+      "CASE_EXPR",
+      "CTE",
+      "DATE_DIM",
+      "GROUP_BY",
+      "WINDOW_FUNC"
+    ],
+    "contraindications": [],
+    "gap": null,
+    "notes": "Principle: Deferred Aggregation — delay expensive operations (window functions) until after joins reduce the dataset. Computing windows in CTEs before joining wastes work on rows that get filtered. Here: remove WINDOW from CTEs (keep only GROUP BY for daily totals), join the reduced results, then compute SUM() OVER() once on the joined output. Reduces 3 WINDOW passes to 1, and SUM() naturally skips NULLs from the FULL OUTER JOIN. | Do not use when the CTE window function is referenced by other consumers besides the final join (the cumulative value is needed elsewhere). Do not use when the window function is not a monotonically accumulating SUM - e.g., AVG, COUNT, or non-monotonic window functions require separate computation. Only applies when the join is FULL OUTER and the carry-forward window is MAX/LAST_VALUE over a cumulative sum.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "dimension_cte_isolate",
+    "principle": "Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.",
+    "precondition_features": [
+      "DATE_DIM",
+      "GROUP_BY",
+      "MULTI_TABLE_5+"
+    ],
+    "contraindications": [
+      {
+        "id": "CROSS_JOIN_3_DIMS",
+        "instruction": "NEVER cross-join 3+ dimension CTEs — Cartesian explosion",
+        "severity": "CRITICAL",
+        "worst_ratio": 0.0076
+      },
+      {
+        "id": "UNFILTERED_CTE",
+        "instruction": "Every CTE must have a WHERE clause — unfiltered CTE = pure overhead",
+        "severity": "HIGH",
+        "worst_ratio": null
+      }
+    ],
+    "gap": "CROSS_CTE_PREDICATE_BLINDNESS",
+    "notes": "Principle: Early Selection — pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each CTE creates a tiny hash table that the fact join probes against, reducing intermediate cardinality. Here: isolate date, demographics, and promotions into separate filtered CTEs, then join their keys with the fact table. Most effective when dimension filters are highly selective.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "early_filter",
+    "principle": "Early Selection: filter small dimension tables first, then join to large fact tables. This reduces the fact table scan to only rows matching the filter, rather than scanning all rows and filtering after the join.",
+    "precondition_features": [
+      "AGG_SUM",
+      "CASE_EXPR",
+      "GROUP_BY",
+      "LEFT_JOIN"
+    ],
+    "contraindications": [],
+    "gap": "CROSS_CTE_PREDICATE_BLINDNESS",
+    "notes": "Principle: Early Selection — filter small dimension tables first, then join to large fact tables. This reduces the fact table scan to only rows matching the filter, rather than scanning all rows and filtering after the join. Here: filter reason table to 'duplicate purchase' first, then join to store_returns, then to store_sales — dramatically reducing the rows entering the expensive fact join.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": true,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "early_filter_decorrelate",
+    "principle": "Early Selection + Decorrelation: push dimension filters into CTE definitions before materialization, and decorrelate correlated subqueries by pre-computing thresholds in separate CTEs. Filters reduce rows early; decorrelation replaces per-row subquery execution with a single pre-computed JOIN.",
+    "precondition_features": [
+      "AGG_AVG",
+      "AGG_SUM",
+      "BETWEEN",
+      "CTE",
+      "DATE_DIM",
+      "GROUP_BY"
+    ],
+    "contraindications": [],
+    "gap": "CORRELATED_SUBQUERY_PARALYSIS",
+    "notes": "Principle: Early Selection + Decorrelation — push dimension filters into CTE definitions before materialization, and decorrelate correlated subqueries by pre-computing thresholds in separate CTEs. Filters reduce rows early; decorrelation replaces per-row subquery execution with a single pre-computed JOIN. Here: dimension filters pushed into CTEs, AVG threshold pre-computed and JOINed.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "postgresql"
+    ]
+  },
+  {
+    "id": "inline_decorrelate_materialized",
+    "principle": "Inline Decorrelation with MATERIALIZED CTEs: When a WHERE clause contains a correlated scalar subquery (e.g., col > (SELECT 1.3 * avg(col) FROM ... WHERE correlated_key = outer.key)), PostgreSQL re-executes the subquery per outer row. Fix: decompose into 3 MATERIALIZED CTEs — (1) pre-filter dimension table, (2) pre-filter fact table by date range, (3) compute per-key aggregate threshold from filtered data — then JOIN the threshold CTE in the final query. MATERIALIZED keyword prevents PG from inlining the CTEs back into correlated form.",
+    "precondition_features": [
+      "AGG_AVG",
+      "AGG_SUM",
+      "BETWEEN",
+      "DATE_DIM"
+    ],
+    "contraindications": [],
+    "gap": "CORRELATED_SUBQUERY_PARALYSIS",
+    "notes": "Principle: Inline Decorrelation — when WHERE has a correlated scalar subquery that re-scans the fact table per outer row, decompose into 3 MATERIALIZED CTEs: (1) dimension filter, (2) date-filtered fact rows, (3) per-key aggregate threshold. The final query JOINs the threshold CTE, replacing O(N*M) correlated scans with a single hash join. CRITICAL: use AS MATERIALIZED on PostgreSQL to prevent the optimizer from inlining CTEs back into the original correlated form.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "postgresql"
+    ]
+  },
+  {
+    "id": "intersect_to_exists",
+    "principle": "Semi-Join Short-Circuit: replace INTERSECT with EXISTS to avoid full materialization and sorting. INTERSECT must compute complete result sets before intersecting; EXISTS stops at the first match per row, enabling semi-join optimizations.",
+    "precondition_features": [
+      "AGG_AVG",
+      "AGG_COUNT",
+      "AGG_SUM",
+      "BETWEEN",
+      "CTE",
+      "DATE_DIM",
+      "GROUP_BY",
+      "HAVING",
+      "INTERSECT",
+      "ROLLUP",
+      "UNION"
+    ],
+    "contraindications": [],
+    "gap": null,
+    "notes": "Principle: Semi-Join Short-Circuit — replace INTERSECT with EXISTS to avoid full materialization and sorting. INTERSECT must compute complete result sets before intersecting; EXISTS stops at the first match per row, enabling semi-join optimizations. Here: convert three INTERSECT subqueries to EXISTS clauses, allowing the optimizer to short-circuit and use index-based semi-joins.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "materialize_cte",
+    "principle": "Shared Materialization: extract repeated subquery patterns into CTEs to avoid recomputation. When the same logical check appears multiple times, compute it once and reference the result.",
+    "precondition_features": [
+      "AGG_COUNT",
+      "AGG_SUM",
+      "BETWEEN",
+      "CTE",
+      "DATE_DIM"
+    ],
+    "contraindications": [],
+    "gap": null,
+    "notes": "Principle: Shared Materialization — extract repeated subquery patterns into CTEs to avoid recomputation. When the same logical check appears in multiple places (EXISTS, WHERE, JOIN), computing it once as a CTE and referencing it is cheaper. Here: extract multi-warehouse order detection into one CTE, returned orders into another, then JOIN instead of nested EXISTS checks. | NEVER convert EXISTS or NOT EXISTS subqueries into materialized CTEs when the EXISTS is used as a filter (not a data source). EXISTS uses semi-join short-circuiting — the database stops scanning as soon as one match is found. Materializing into a CTE forces a full scan of the subquery table, destroying this optimization. Caused 0.14x on Q16 (7x slowdown — EXISTS on catalog_sales materialized into full CTE scan) and 0.54x on Q95 (EXISTS on web_sales forced full materialization).",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "multi_date_range_cte",
+    "principle": "Early Selection per Alias: when a query joins the same dimension table multiple times with different filters (d1, d2, d3), create separate CTEs for each filter and pre-join with fact tables to reduce rows entering the main join.",
+    "precondition_features": [
+      "AGG_AVG",
+      "BETWEEN",
+      "DATE_DIM",
+      "GROUP_BY",
+      "MULTI_TABLE_5+",
+      "TABLE_REPEAT_3+"
+    ],
+    "contraindications": [],
+    "gap": "CROSS_CTE_PREDICATE_BLINDNESS",
+    "notes": "Principle: Early Selection per Alias — when a query joins the same dimension table multiple times with different filters (d1, d2, d3 pattern), create separate filtered CTEs for each alias. Pre-join each date CTE with its corresponding fact table reference. This filters fact rows early before the expensive multi-way join, avoiding repeated full dimension scans.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "multi_dimension_prefetch",
+    "principle": "Multi-Dimension Prefetch: when multiple dimension tables have selective filters, pre-filter ALL of them into CTEs before the fact table join. Combined selectivity compounds — each dimension CTE reduces the fact scan further.",
+    "precondition_features": [
+      "AGG_SUM",
+      "CASE_EXPR",
+      "DATE_DIM",
+      "GROUP_BY"
+    ],
+    "contraindications": [],
+    "gap": "CROSS_CTE_PREDICATE_BLINDNESS",
+    "notes": "Principle: Multi-Dimension Prefetch — when multiple dimension tables have selective filters, pre-filter ALL of them into CTEs before the fact join. Each CTE creates a small hash table; the fact scan probes multiple tiny tables instead of large ones. Here: pre-filter both date_dim and store into separate CTEs with only the columns needed for join and grouping. | Do not create dimension CTEs without a WHERE clause that actually reduces rows — an unfiltered dimension CTE is pure overhead (full scan + materialization for zero selectivity benefit). Avoid on queries with 5+ tables and complex inter-table predicates where forcing join order via CTEs prevents the optimizer from choosing a better plan. Caused 0.85x on Q67 (unfiltered dimension CTEs added overhead) and 0.77x on Q72 (forced suboptimal join ordering on complex multi-table query).",
+    "min_baseline_ms": null,
+    "confirm_with_explain": true,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "multi_intersect_exists_cte",
+    "principle": "Convert cascading INTERSECT operations into correlated EXISTS subqueries with pre-materialized date and channel CTEs",
+    "precondition_features": [
+      "AGG_AVG",
+      "AGG_COUNT",
+      "AGG_SUM",
+      "BETWEEN",
+      "CTE",
+      "DATE_DIM",
+      "GROUP_BY",
+      "HAVING",
+      "INTERSECT",
+      "ROLLUP",
+      "UNION"
+    ],
+    "contraindications": [],
+    "gap": null,
+    "notes": "INTERSECT materializes full intermediate result sets (brand_id, class_id, category_id triples) from each channel before intersecting. EXISTS with correlated predicates short-circuits early — once a matching row is found for each channel, processing stops. Pre-filtering date_dim into a CTE avoids repeated scans of the 73K-row date table. | Do not use when the INTERSECT operates on small result sets (< 1000 rows) where materialization cost is negligible. Also not applicable when the EXISTS correlation would be on non-indexed columns, as the correlated probe could be slower than the hash-based INTERSECT.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "or_to_union",
+    "principle": "OR-to-UNION Decomposition: split OR conditions on different columns into separate UNION ALL branches, each with a focused predicate. The optimizer can use different access paths per branch instead of a single scan with a complex filter.",
+    "precondition_features": [
+      "AGG_SUM",
+      "DATE_DIM",
+      "GROUP_BY",
+      "OR_BRANCH"
+    ],
+    "contraindications": [
+      {
+        "id": "MAX_3_BRANCHES",
+        "instruction": "Max 3 UNION branches — 6+ is lethal (9 branches = 9x fact scans)",
+        "severity": "CRITICAL",
+        "worst_ratio": 0.23
+      },
+      {
+        "id": "SAME_COL_OR",
+        "instruction": "NEVER split same-column ORs — engine handles natively",
+        "severity": "HIGH",
+        "worst_ratio": 0.59
+      },
+      {
+        "id": "SELF_JOIN_PRESENT",
+        "instruction": "NEVER if self-join present — each branch re-does the self-join",
+        "severity": "HIGH",
+        "worst_ratio": 0.51
+      }
+    ],
+    "gap": "CROSS_COLUMN_OR_DECOMPOSITION",
+    "notes": "Principle: OR-to-UNION Decomposition — split OR conditions on different columns into separate UNION ALL branches, each with a focused predicate. The optimizer can use different access paths per branch instead of a single scan with a complex filter. Here: three OR branches (zip codes, states, price threshold) become three UNION ALL branches, each with its own focused predicate. Date filter extracted as shared CTE. | Do not split OR when all branches filter the SAME column on the same table (e.g., t_hour >= 8 OR t_hour <= 17). This duplicates the entire fact table scan for each branch with no selectivity benefit. Only apply when OR conditions span DIFFERENT tables or fundamentally different column families. Also never split into more than 3 UNION branches — each branch rescans the fact table. Caused 0.59x on Q90 (same-column time range split doubled fact scans) and historically 0.23x-0.41x on queries with 9+ UNION branches.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "pg_date_cte_explicit_join",
+    "principle": "Dimension Isolation + Explicit Joins: materialize selective dimension filters into CTEs to create tiny hash tables, AND convert comma-separated joins to explicit JOIN syntax. On PostgreSQL, the combination enables better hash join planning with a tiny probe table.",
+    "precondition_features": [
+      "AGG_SUM",
+      "BETWEEN",
+      "CASE_EXPR",
+      "DATE_DIM",
+      "GROUP_BY"
+    ],
+    "contraindications": [],
+    "gap": "COMMA_JOIN_WEAKNESS",
+    "notes": "Principle: Dimension Isolation + Explicit Joins — materialize selective dimension filters into CTEs to create tiny hash tables, AND convert comma joins to explicit JOIN syntax. On PostgreSQL, both are required: the CTE reduces probe size, while explicit JOINs give the optimizer join-order freedom. Here: date_dim (730 from 73K rows) becomes a CTE hash table that catalog_sales probes; comma joins converted to explicit INNER JOIN.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "postgresql"
+    ]
+  },
+  {
+    "id": "pg_dimension_prefetch_star",
+    "principle": "Multi-Dimension Prefetch (PG): pre-filter all selective dimensions into CTEs to create tiny hash tables, combined with explicit JOIN syntax. PostgreSQL's optimizer gets better cardinality estimates from pre-materialized small dimension results.",
+    "precondition_features": [
+      "AGG_SUM",
+      "BETWEEN",
+      "CTE",
+      "DATE_DIM",
+      "GROUP_BY",
+      "LEFT_JOIN",
+      "ROLLUP",
+      "UNION"
+    ],
+    "contraindications": [],
+    "gap": "COMMA_JOIN_WEAKNESS",
+    "notes": "Principle: Multi-Dimension Prefetch (PG) — pre-filter all selective dimensions into CTEs to create tiny hash tables, combined with explicit JOIN syntax for PostgreSQL optimizer join-order freedom. Even partial transformation helps when one branch dominates runtime. Here: date (30/73K), item (2 categories), promotion (5 filters) all become CTEs; comma joins converted to INNER JOIN.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "postgresql"
+    ]
+  },
+  {
+    "id": "pg_materialized_dimension_fact_prefilter",
+    "principle": "Staged Reduction for Non-Equi Joins: when queries have expensive non-equi joins, reduce BOTH dimension and fact table sizes via MATERIALIZED CTEs before the join. Combined selectivity dramatically cuts the search space for inequality predicates.",
+    "precondition_features": [
+      "AGG_COUNT",
+      "AGG_SUM",
+      "BETWEEN",
+      "CASE_EXPR",
+      "DATE_DIM",
+      "GROUP_BY",
+      "LEFT_JOIN"
+    ],
+    "contraindications": [],
+    "gap": "NON_EQUI_JOIN_INPUT_BLINDNESS",
+    "notes": "Principle: Staged Reduction for Non-Equi Joins — when queries have expensive non-equi joins, reduce BOTH dimension and fact table sizes via MATERIALIZED CTEs before the join to shrink the search space. MATERIALIZED on PG12+ forces early execution. Here: fact table CTE removes ~70% of catalog_sales rows, dimension CTEs reduce date (365/73K), item (3 categories), and demographics to tiny sets — all before the expensive inventory non-equi join.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "postgresql"
+    ]
+  },
+  {
+    "id": "pg_self_join_decomposition",
+    "principle": "Shared Materialization (PG): when the same fact+dimension scan appears multiple times in self-join patterns, materialize it once as a CTE and derive all needed aggregates from the same result. PostgreSQL materializes CTEs by default, making this extremely effective.",
+    "precondition_features": [
+      "AGG_AVG",
+      "AGG_SUM",
+      "BETWEEN",
+      "DATE_DIM",
+      "GROUP_BY"
+    ],
+    "contraindications": [],
+    "gap": "CROSS_CTE_PREDICATE_BLINDNESS",
+    "notes": "Principle: Shared Materialization (PG) — when the same fact+dimension scan appears multiple times, materialize it once as a CTE and reference it from each consumer. PostgreSQL CTE materialization guarantees single execution. Here: store_sales+date_dim scanned twice with identical predicates becomes one materialized CTE, reused for both per-item revenue and per-store averages. Combined with dimension pre-filtering to reduce I/O.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "postgresql"
+    ]
+  },
+  {
+    "id": "prefetch_fact_join",
+    "principle": "Staged Join Pipeline: build a CTE chain that progressively reduces data — first CTE filters the dimension, second CTE pre-joins filtered dimension keys with the fact table, subsequent CTEs join remaining dimensions against the already-reduced fact set.",
+    "precondition_features": [
+      "AGG_SUM",
+      "DATE_DIM",
+      "GROUP_BY",
+      "STAR_JOIN"
+    ],
+    "contraindications": [
+      {
+        "id": "MAX_2_CHAINS",
+        "instruction": "Max 2 cascading fact-table CTE chains — 3rd causes excessive materialization",
+        "severity": "MEDIUM",
+        "worst_ratio": 0.78
+      }
+    ],
+    "gap": "CROSS_CTE_PREDICATE_BLINDNESS",
+    "notes": "Principle: Staged Join Pipeline — build a CTE chain that progressively reduces data: first CTE filters the dimension, second CTE pre-joins the filtered dimension with the fact table to materialize a small intermediate result. Subsequent dimension joins then operate on this reduced dataset instead of the full fact table. Here: filter date_dim first, pre-join with store_sales, then join the smaller result with remaining dimensions. | Do not use on queries with baseline runtime under 50ms — CTE materialization overhead dominates on fast queries. Do not use on window-function-dominated queries where filtering is not the bottleneck. Avoid on queries with 5+ table joins and complex inter-table predicates where forcing join order via CTEs prevents the optimizer from choosing a better plan. Caused 0.50x on Q25 (fast baseline query), 0.87x on Q51 (window-function bottleneck), and 0.77x on Q72 (complex multi-table join reordering).",
+    "min_baseline_ms": null,
+    "confirm_with_explain": true,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "pushdown",
+    "principle": "Scan Consolidation: when multiple subqueries scan the same table with similar patterns, consolidate them into CTEs that compute all needed aggregates in fewer passes. Reduces N scans to fewer scans.",
+    "precondition_features": [
+      "AGG_AVG",
+      "AGG_COUNT",
+      "BETWEEN",
+      "CASE_EXPR",
+      "SCALAR_SUB_5+",
+      "TABLE_REPEAT_8+"
+    ],
+    "contraindications": [],
+    "gap": "CROSS_CTE_PREDICATE_BLINDNESS",
+    "notes": "Principle: Scan Consolidation — when multiple subqueries scan the same table with similar patterns, consolidate them into a single CTE that computes all needed aggregates in one pass. Reduces N scans to 1. Here: 15+ scalar subqueries with different quantity-range filters on store_sales become CTEs, each computing count, avg_ext_price, avg_net_profit in one scan per range.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": true,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "rollup_to_union_windowing",
+    "principle": "Replace GROUP BY ROLLUP with explicit UNION ALL of pre-aggregated CTEs at each hierarchy level, combined with window functions for ranking",
+    "precondition_features": [
+      "AGG_SUM",
+      "CASE_EXPR",
+      "DATE_DIM",
+      "GROUP_BY",
+      "ROLLUP",
+      "WINDOW_FUNC"
+    ],
+    "contraindications": [],
+    "gap": "UNION_CTE_SELF_JOIN_DECOMPOSITION",
+    "notes": "ROLLUP generates all grouping levels in a single pass, but the optimizer cannot specialize each level's aggregation. Breaking into explicit UNION ALL of pre-computed CTEs allows each level to use the already-aggregated item_aggregates CTE, and dimension filters are pushed into early CTEs. | Do not use when ROLLUP generates all levels efficiently (small dimension tables, few groups) or when the query genuinely needs all possible grouping set combinations. Only beneficial when specific levels need different optimization paths.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "shared_dimension_multi_channel",
+    "principle": "Shared Dimension Extraction: when multiple channel CTEs (store/catalog/web) apply identical dimension filters, extract those shared filters into one CTE and reference it from each channel. Avoids redundant dimension scans.",
+    "precondition_features": [
+      "AGG_SUM",
+      "BETWEEN",
+      "CTE",
+      "DATE_DIM",
+      "GROUP_BY",
+      "LEFT_JOIN",
+      "MULTI_CHANNEL",
+      "MULTI_TABLE_5+",
+      "ROLLUP",
+      "TABLE_REPEAT_3+",
+      "UNION"
+    ],
+    "contraindications": [],
+    "gap": "CROSS_CTE_PREDICATE_BLINDNESS",
+    "notes": "Principle: Shared Dimension Extraction — when multiple channel CTEs (store/catalog/web) apply identical dimension filters, extract those shared filters into common dimension CTEs and reference them from each channel. This eliminates redundant dimension scans across channels. Here: shared date, item, and promotion filters extracted once, then pre-joined with each channel's fact table. Only apply where join structure is straightforward.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "single_pass_aggregation",
+    "principle": "Single-Pass Aggregation: consolidate multiple scalar subqueries on the same table into one CTE using CASE expressions inside aggregate functions. Reduces N separate table scans to 1 pass.",
+    "precondition_features": [
+      "AGG_AVG",
+      "AGG_COUNT",
+      "SCALAR_SUB_2+",
+      "TABLE_REPEAT_3+"
+    ],
+    "contraindications": [],
+    "gap": "REDUNDANT_SCAN_ELIMINATION",
+    "notes": "Principle: Single-Pass Aggregation — consolidate multiple scalar subqueries on the same table into a single CTE using CASE expressions inside aggregate functions. Each CASE routes rows to the appropriate bucket without multiple scans. Reduces N separate table scans to 1 pass. Here: 15 scalar subqueries on store_sales (5 quantity ranges x 3 aggregates each) become one CTE with conditional COUNT/AVG.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": true,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "union_cte_split",
+    "principle": "CTE Specialization: when a generic CTE is scanned multiple times with different filters (e.g., by year), split it into specialized CTEs that embed the filter in their definition. Each specialized CTE processes only its relevant subset, eliminating redundant scans.",
+    "precondition_features": [
+      "CASE_EXPR",
+      "CTE",
+      "DATE_DIM",
+      "GROUP_BY",
+      "UNION"
+    ],
+    "contraindications": [
+      {
+        "id": "ORPHANED_UNION",
+        "instruction": "Original UNION must be eliminated — keeping both = double materialization",
+        "severity": "HIGH",
+        "worst_ratio": 0.49
+      }
+    ],
+    "gap": "UNION_CTE_SELF_JOIN_DECOMPOSITION",
+    "notes": "Principle: CTE Specialization — when a generic CTE is scanned multiple times with different filters (e.g., by year), split it into specialized CTEs that embed the filter in their definition. Each specialized CTE processes only its relevant subset, eliminating redundant scans and post-hoc filtering. Here: generic wswscs CTE scanned twice with year filters becomes wswscs_1998 and wswscs_1999, each joining date_dim once during aggregation.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "aggregate_pushdown",
+    "principle": "Push aggregation below joins: when a GROUP BY + aggregate operates on a single fact table joined with dimensions, pre-aggregate the fact table on the join key first, THEN join with dimensions. Reduces rows entering the join from millions to thousands.",
+    "precondition_features": [
+      "AGG_AVG",
+      "GROUP_BY",
+      "ROLLUP",
+      "MULTI_TABLE_5+"
+    ],
+    "contraindications": [
+      {
+        "id": "NO_GROUP_KEY_MATCH",
+        "instruction": "Only works when GROUP BY keys align with join keys — misaligned keys produce wrong results",
+        "severity": "CRITICAL",
+        "worst_ratio": null
+      }
+    ],
+    "gap": "AGGREGATE_BELOW_JOIN_BLINDNESS",
+    "notes": "Pre-aggregate fact rows by join key before dimension join. Q22: inventory joined date+item → pre-agg inv by item after date filter, then join item. 42.90x from 7M→150K rows entering join+ROLLUP. Guard: GROUP BY keys must be superset of join keys. Guard: ROLLUP/CUBE must still produce correct grouping sets after restructuring — verify CASE WHEN avg reconstruction from SUM/COUNT.",
+    "min_baseline_ms": 100.0,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "inner_join_conversion",
+    "principle": "When a LEFT JOIN is immediately followed by a WHERE filter on the right table that eliminates NULL rows, convert to INNER JOIN + early filter CTE. The WHERE clause already makes the LEFT JOIN behave as an INNER JOIN, but the optimizer keeps the LEFT JOIN semantics (preserving all left rows), wasting work on rows that are filtered out.",
+    "precondition_features": [
+      "LEFT_JOIN",
+      "LEFT_JOIN_RIGHT_FILTER",
+      "AGG_SUM",
+      "GROUP_BY"
+    ],
+    "contraindications": [
+      {
+        "id": "NULL_DEPENDENT_LOGIC",
+        "instruction": "Do NOT convert if CASE WHEN checks for sr_return_quantity IS NULL — the NULL branch is semantically meaningful",
+        "severity": "CRITICAL",
+        "worst_ratio": null
+      }
+    ],
+    "gap": "LEFT_JOIN_FILTER_ORDER_RIGIDITY",
+    "notes": "Q93: LEFT JOIN store_returns + WHERE sr_reason_sk = r_reason_sk (NULL rows eliminated). Converting to INNER JOIN + filtered reason CTE gave 3.44x. The optimizer cannot infer that the WHERE on the right-table column makes LEFT JOIN equivalent to INNER JOIN. Guard: Only valid when the WHERE fully eliminates NULL right-side rows. If CASE WHEN NULL handling exists, the LEFT JOIN is intentional.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "self_join_decomposition",
+    "principle": "When a CTE is self-joined with different filter values (e.g., inv1.d_moy=1 AND inv2.d_moy=2), split into separate CTEs each embedding their filter. The optimizer cannot push the outer WHERE filter into the CTE's GROUP BY, causing full materialization and post-filtering.",
+    "precondition_features": [
+      "CTE",
+      "GROUP_BY",
+      "AGG_AVG"
+    ],
+    "contraindications": [],
+    "gap": "CROSS_CTE_PREDICATE_BLINDNESS",
+    "notes": "Q39: CTE `inv` self-joined as inv1 (d_moy=1) and inv2 (d_moy=2). Original materializes inv for ALL months, then post-filters. Split into month1_stats (WHERE d_moy=1) and month2_stats (WHERE d_moy=2) → each CTE aggregates only its month's rows. 4.76x speedup. This is a specialization of union_cte_split for self-joins with discriminator predicates. Guard: Comma joins in self-join → convert to explicit JOIN ON.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "star_join_prefetch",
+    "principle": "In star-schema queries with 3+ dimension tables, prefetch the most selective dimension into a CTE, pre-join with fact table, then join remaining dimensions against the reduced result. This is a specialised form of prefetch_fact_join optimized for star schemas.",
+    "precondition_features": [
+      "GROUP_BY",
+      "MULTI_TABLE_5+",
+      "DATE_DIM",
+      "STAR_JOIN"
+    ],
+    "contraindications": [
+      {
+        "id": "LOW_SELECTIVITY",
+        "instruction": "Skip if dimension filter returns >20% of rows — prefetch overhead exceeds savings",
+        "severity": "MEDIUM",
+        "worst_ratio": 0.78
+      }
+    ],
+    "gap": "CROSS_CTE_PREDICATE_BLINDNESS",
+    "notes": "Used across Q22 (42.90x), Q65 (1.80x), Q72 (1.27x), Q18 (1.21x). Pattern: date_dim filter → CTE → pre-join fact → re-aggregate → join remaining dims. Most productive on queries with date_dim + large fact tables (inventory, store_sales). Guard: Most selective dimension first. Guard: Max 2 chained CTEs before main query.",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  },
+  {
+    "id": "semi_join_exists",
+    "principle": "When two large tables are joined just to check existence (the joined columns aren't used in output), replace the full JOIN with EXISTS. EXISTS enables semi-join short-circuit — the engine stops after the first match per row.",
+    "precondition_features": [
+      "CTE",
+      "GROUP_BY",
+      "MULTI_TABLE_5+"
+    ],
+    "contraindications": [
+      {
+        "id": "COLUMNS_USED",
+        "instruction": "Only valid when no columns from the right table appear in SELECT or GROUP BY",
+        "severity": "CRITICAL",
+        "worst_ratio": null
+      }
+    ],
+    "gap": null,
+    "notes": "Q95: Materialized a CTE for existence check when EXISTS would enable early termination. 1.67x. This is the inverse of our regression guard — here the pattern IS appropriate for EXISTS. Guard: Never materialize an existence check into a CTE (0.14x Q16, 0.54x Q95 from the old approach).",
+    "min_baseline_ms": null,
+    "confirm_with_explain": false,
+    "engines": [
+      "duckdb"
+    ]
+  }
+]

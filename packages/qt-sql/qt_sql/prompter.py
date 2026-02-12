@@ -59,27 +59,26 @@ def compute_depths(dag) -> Dict[str, int]:
 
 
 def load_exploit_algorithm(dialect: str = "duckdb") -> Optional[str]:
-    """Load exploit algorithm YAML text for the target dialect.
+    """Load the master distilled intelligence for the target dialect.
 
-    The exploit algorithm is a structured YAML file produced by the
-    frontier probe system. When available, it replaces the engine
-    profile in the analyst prompt.
+    Each engine has a single master intelligence document in
+    ``knowledge/{dialect}.md`` — the authoritative synthesis of all
+    benchmarking, transform detection, and evidence-based distillation.
 
-    Returns the raw YAML text or None if not available.
+    Returns the raw markdown text or None if not available.
     """
-    if not CONSTRAINTS_DIR.exists():
-        return None
+    KNOWLEDGE_DIR = Path(__file__).resolve().parent / "knowledge"
 
     norm = dialect.lower()
     if norm in ("postgres", "pg"):
         norm = "postgresql"
 
-    algo_path = CONSTRAINTS_DIR / f"exploit_algorithm_{norm}.yaml"
+    algo_path = KNOWLEDGE_DIR / f"{norm}.md"
     if algo_path.exists():
         try:
             return algo_path.read_text()
         except Exception as e:
-            logger.warning(f"Failed to load exploit algorithm {algo_path}: {e}")
+            logger.warning(f"Failed to load master intelligence {algo_path}: {e}")
     return None
 
 

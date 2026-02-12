@@ -1,13 +1,14 @@
-"""Swarm optimization session — multi-worker fan-out with snipe refinement.
+"""Swarm optimization session — multi-worker fan-out with self-directed retry.
 
 Workflow:
 1. Fan-out: Analyst distributes top 20 matched examples across 4 workers
    (3 each, no duplicates). Each worker gets a different strategy.
 2. Validate all 4 candidates. If any >= target_speedup, done.
-3. Snipe: If all fail, analyst synthesizes failures into 1 refined worker.
-4. Iterate snipe (not fan-out) up to max_iterations.
+3. Retry: Self-directed worker gets ALL raw evidence (previous results,
+   EXPLAIN plans, race timings) and diagnoses + rewrites in one LLM call.
+4. Iterate retry (not fan-out) up to max_iterations.
 
-Fan-out only happens ONCE (iteration 1). Subsequent iterations are snipes.
+Fan-out only happens ONCE (iteration 1). Subsequent iterations are retries.
 """
 
 from __future__ import annotations
@@ -56,12 +57,16 @@ class SwarmSession(OptimizationSession):
         self._semantic_intents: Optional[Dict] = None
         self._output_columns: List[str] = []
         self._matched_examples: List[Dict] = []
-        self._all_available_examples: List[Dict] = []
         self._regression_warnings: Optional[List[Dict]] = None
-        self._snipe_analysis: Optional[Any] = None  # SnipeAnalysis from analyst
         self._sniper_result: Optional[WorkerResult] = None  # for retry
         self._candidate_explains: Dict[int, str] = {}  # worker_id → explain_text
         self._race_result: Optional[Any] = None  # RaceResult from fan-out race
+        # Two-phase state (set by prepare_candidates, consumed by validate_and_finish)
+        self._gen_result: Optional[Dict[str, Any]] = None
+        self._dag: Optional[Any] = None
+        self._costs: Optional[Dict[str, Any]] = None
+        self._prepare_t_session: float = 0.0
+        self._generation_done: bool = False
 
     @staticmethod
     def _stage(query_id: str, msg: str):
@@ -145,22 +150,33 @@ class SwarmSession(OptimizationSession):
                 except Exception as e:
                     logger.warning(f"[{self.query_id}] Baseline caching failed: {e}")
 
-            # Iterations 2-N: Snipe phase
-            for snipe_num in range(1, self.max_iterations):
-                print(f"\n--- Snipe {snipe_num}/{self.max_iterations - 1} ---", flush=True)
-                t_snipe = time.time()
-                snipe_result = self._snipe_iteration(dag, costs, snipe_num, t_session)
-                self.iterations_data.append(snipe_result)
-                self._stage(self.query_id, f"SNIPE {snipe_num}: complete ({_fmt_elapsed(time.time() - t_snipe)}) | total {_fmt_elapsed(time.time() - t_session)}")
+            # Use baseline EXPLAIN as fallback for file-cached EXPLAIN
+            if (not self._explain_plan_text
+                    and self._cached_baseline is not None
+                    and self._cached_baseline.explain_text):
+                self._explain_plan_text = self._cached_baseline.explain_text
+                self._stage(self.query_id, "EXPLAIN: using baseline EXPLAIN (no cached file)")
 
-                best_wr = self._best_worker()
-                if best_wr and best_wr.speedup >= self.target_speedup:
-                    print(f"\n{'='*60}", flush=True)
-                    print(f"  DONE: {self.query_id} — {best_wr.status} {best_wr.speedup:.2f}x "
-                          f"(snipe {snipe_num}) | {_fmt_elapsed(time.time() - t_session)}", flush=True)
-                    print(f"{'='*60}\n", flush=True)
-                    self.save_session()
-                    return self._build_result()
+            # Iterations 2-N: Snipe phase (wrapped so API failures don't lose fan-out results)
+            try:
+                for snipe_num in range(1, self.max_iterations):
+                    print(f"\n--- Snipe {snipe_num}/{self.max_iterations - 1} ---", flush=True)
+                    t_snipe = time.time()
+                    snipe_result = self._snipe_iteration(dag, costs, snipe_num, t_session)
+                    self.iterations_data.append(snipe_result)
+                    self._stage(self.query_id, f"SNIPE {snipe_num}: complete ({_fmt_elapsed(time.time() - t_snipe)}) | total {_fmt_elapsed(time.time() - t_session)}")
+
+                    best_wr = self._best_worker()
+                    if best_wr and best_wr.speedup >= self.target_speedup:
+                        print(f"\n{'='*60}", flush=True)
+                        print(f"  DONE: {self.query_id} — {best_wr.status} {best_wr.speedup:.2f}x "
+                              f"(snipe {snipe_num}) | {_fmt_elapsed(time.time() - t_session)}", flush=True)
+                        print(f"{'='*60}\n", flush=True)
+                        self.save_session()
+                        return self._build_result()
+            except Exception as e:
+                logger.error(f"[{self.query_id}] Snipe failed (saving fan-out results): {e}")
+                self._stage(self.query_id, f"SNIPE FAILED: {e} — saving fan-out results")
 
             # Final summary
             best_wr = self._best_worker()
@@ -178,17 +194,444 @@ class SwarmSession(OptimizationSession):
                 logger.info(f"[{self.query_id}] Swarm log file saved: {self._run_log_path}")
             self._teardown_run_logging()
 
+    def prepare_candidates(self) -> "SwarmSession":
+        """Phase 1: Generate candidates (LLM calls only, no DB validation).
+
+        Parses the logical tree, runs analyst + 4 workers in parallel.
+        Stores generation result for later validate_and_finish().
+        Thread-safe for concurrent use across multiple sessions.
+
+        Returns self for chaining.
+        """
+        self._prepare_t_session = time.time()
+        session_dir = (
+            self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id
+        )
+        self._setup_run_logging(session_dir)
+
+        print(f"\n  GENERATE: {self.query_id}", flush=True)
+
+        # Parse logical tree
+        self._stage(self.query_id, "PARSE: Building logical tree...")
+        t0 = time.time()
+        self._dag, self._costs, _explain = self.pipeline._parse_logical_tree(
+            self.original_sql, dialect=self.dialect, query_id=self.query_id
+        )
+        self._stage(self.query_id, f"PARSE: done ({_fmt_elapsed(time.time() - t0)})")
+
+        # Generate candidates (Steps 1-5: analyst + 4 workers)
+        self._gen_result = self._generate_fan_out(
+            self._dag, self._costs, self._prepare_t_session
+        )
+        self._generation_done = True
+        self._stage(
+            self.query_id,
+            f"GENERATE: complete ({_fmt_elapsed(time.time() - self._prepare_t_session)})"
+        )
+        return self
+
+    def reload_candidates_from_disk(self) -> bool:
+        """Reload Phase 1 results from disk (no LLM calls).
+
+        Returns True if candidates were found and loaded, False otherwise.
+        Reconstructs _gen_result so validate_and_finish() can proceed.
+        """
+        from ..prompts.swarm_parsers import BriefingWorker, BriefingShared, ParsedBriefing
+
+        session_dir = self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id
+        iter_dir = session_dir / "iteration_00_fan_out"
+        if not iter_dir.exists():
+            return False
+
+        # Reload analyst prompt/response
+        analyst_prompt = ""
+        analyst_response = ""
+        ap = iter_dir / "analyst_prompt.txt"
+        ar = iter_dir / "analyst_response.txt"
+        if ap.exists():
+            analyst_prompt = ap.read_text(errors="replace")
+        if ar.exists():
+            analyst_response = ar.read_text(errors="replace")
+
+        # Reload per-worker candidates
+        candidates_by_worker: Dict[int, tuple] = {}
+        for w_dir in sorted(iter_dir.glob("worker_*")):
+            rj = w_dir / "result.json"
+            if not rj.exists():
+                continue
+            try:
+                data = json.loads(rj.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            wid = data.get("worker_id", 0)
+            sql_file = w_dir / "optimized.sql"
+            optimized_sql = sql_file.read_text(errors="replace") if sql_file.exists() else data.get("optimized_sql", self.original_sql)
+
+            # Reconstruct BriefingWorker stub (enough for validation)
+            wb = BriefingWorker(
+                worker_id=wid,
+                strategy=data.get("strategy", ""),
+                examples=data.get("examples_used", []),
+                example_adaptation=data.get("hint", ""),
+            )
+            transforms = data.get("transforms", [])
+            set_local_cmds = data.get("set_local_commands", [])
+            iface_warns = data.get("interface_warnings", [])
+
+            candidates_by_worker[wid] = (wb, optimized_sql, transforms, "", "", set_local_cmds, iface_warns)
+
+        if not candidates_by_worker:
+            return False
+
+        # Reconstruct minimal briefing (shared sections not needed for validation)
+        briefing = ParsedBriefing(
+            shared=BriefingShared(),
+            workers=[candidates_by_worker[wid][0] for wid in sorted(candidates_by_worker)],
+            raw=analyst_response,
+        )
+
+        # Parse logical tree (needed for snipe)
+        self._prepare_t_session = time.time()
+        self._dag, self._costs, _explain = self.pipeline._parse_logical_tree(
+            self.original_sql, dialect=self.dialect, query_id=self.query_id
+        )
+
+        self._gen_result = {
+            "_candidates_by_worker": candidates_by_worker,
+            "_analyst_prompt": analyst_prompt,
+            "_analyst_response": analyst_response,
+            "_briefing": briefing,
+            "_resource_envelope": "",
+        }
+        self._generation_done = True
+        self._setup_run_logging(session_dir)
+
+        self._stage(self.query_id, f"RELOAD: {len(candidates_by_worker)} candidates loaded from disk")
+        return True
+
+    def resume_from_analyst(self) -> bool:
+        """Resume from saved analyst response — skip analyst LLM, only run workers.
+
+        For sessions where analyst_response.txt exists on disk but worker
+        dirs were lost. Re-parses the briefing and generates 4 worker
+        candidates (4 LLM calls, no analyst call).
+
+        Returns True if analyst was recovered and workers generated.
+        """
+        from ..prompts.swarm_parsers import parse_briefing_response
+
+        session_dir = self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id
+        iter_dir = session_dir / "iteration_00_fan_out"
+        ar = iter_dir / "analyst_response.txt"
+        ap = iter_dir / "analyst_prompt.txt"
+
+        if not ar.exists():
+            return False
+
+        # Already have worker results? Use full reload instead
+        if any(iter_dir.glob("worker_*/result.json")):
+            return self.reload_candidates_from_disk()
+
+        analyst_response = ar.read_text(errors="replace")
+        analyst_prompt = ap.read_text(errors="replace") if ap.exists() else ""
+
+        # Re-parse analyst briefing
+        try:
+            briefing = parse_briefing_response(analyst_response)
+        except Exception as e:
+            logger.warning(f"[{self.query_id}] Failed to parse saved analyst response: {e}")
+            return False
+
+        if not briefing.workers or len(briefing.workers) < 2:
+            logger.warning(f"[{self.query_id}] Saved analyst response has {len(briefing.workers)} workers, skipping")
+            return False
+
+        self._stage(self.query_id, f"RESUME: Re-parsed analyst from disk ({len(briefing.workers)} workers)")
+
+        # Parse logical tree
+        self._prepare_t_session = time.time()
+        self._setup_run_logging(session_dir)
+
+        self._dag, self._costs, _explain = self.pipeline._parse_logical_tree(
+            self.original_sql, dialect=self.dialect, query_id=self.query_id
+        )
+
+        # Generate worker candidates (LLM calls — but analyst is skipped)
+        self._gen_result = self._generate_workers_from_briefing(
+            briefing, analyst_prompt, analyst_response, iter_dir
+        )
+        self._generation_done = True
+        return True
+
+    def _generate_workers_from_briefing(
+        self, briefing, analyst_prompt: str, analyst_response: str, iter_dir: Path,
+    ) -> Dict[str, Any]:
+        """Generate 4 worker candidates from a pre-parsed briefing (no analyst call).
+
+        Reuses the worker generation logic from _generate_fan_out but skips
+        the analyst LLM call entirely.
+        """
+        from ..prompts.worker import build_worker_prompt
+        from ..generate import CandidateGenerator
+        from ..logic_tree import build_logic_tree
+
+        t_gen = time.time()
+
+        # Load examples + resource envelope
+        # Build resource envelope for PG (same logic as pipeline._gather_context)
+        resource_envelope = ""
+        if self.dialect in ("postgresql", "postgres"):
+            try:
+                from ..pg_tuning import load_or_collect_profile, build_resource_envelope
+                profile = load_or_collect_profile(self.pipeline.config.db_path_or_dsn)
+                resource_envelope = build_resource_envelope(profile)
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] Resource envelope build failed: {e}")
+
+        # Build output columns
+        output_columns = ""
+        if self._dag:
+            try:
+                final_node = [n for n in self._dag.nodes() if self._dag.out_degree(n) == 0]
+                if final_node:
+                    cols = self._dag.nodes[final_node[0]].get("columns", [])
+                    if cols:
+                        output_columns = ", ".join(cols)
+            except Exception:
+                pass
+
+        # Build logic tree (same as _generate_fan_out)
+        original_logic_tree = ""
+        try:
+            from ..logic_tree import build_logic_tree
+            original_logic_tree = build_logic_tree(
+                self.original_sql, self._dag, self._costs, self.dialect, {}
+            )
+        except Exception as e:
+            logger.warning(f"[{self.query_id}] Logic tree build failed: {e}")
+
+        candidates_by_worker = {}
+        generator = CandidateGenerator()
+
+        def generate_worker(worker_briefing):
+            examples = self.pipeline._load_examples_by_id(
+                worker_briefing.examples, self.engine
+            )
+            prompt = build_worker_prompt(
+                worker_briefing=worker_briefing,
+                shared_briefing=briefing.shared,
+                examples=examples,
+                original_sql=self.original_sql,
+                output_columns=output_columns,
+                dialect=self.dialect,
+                engine_version=self.pipeline._engine_version,
+                resource_envelope=resource_envelope,
+                original_logic_tree=original_logic_tree,
+            )
+            example_ids = [e.get("id", "?") for e in examples]
+            candidate = generator.generate_one(
+                sql=self.original_sql,
+                prompt=prompt,
+                examples_used=example_ids,
+                worker_id=worker_briefing.worker_id,
+                dialect=self.dialect,
+            )
+            optimized_sql = candidate.optimized_sql
+            try:
+                import sqlglot
+                sqlglot.parse_one(optimized_sql, dialect=self.dialect)
+            except Exception:
+                optimized_sql = self.original_sql
+            return (worker_briefing, optimized_sql, candidate.transforms,
+                    candidate.prompt, candidate.response, candidate.set_local_commands,
+                    candidate.interface_warnings)
+
+        self._stage(self.query_id, f"GENERATE: 4 workers in parallel (analyst from disk)... | total {_fmt_elapsed(time.time() - self._prepare_t_session)}")
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(generate_worker, w): w for w in briefing.workers}
+            for future in as_completed(futures):
+                try:
+                    wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds, iface_warns = future.result()
+                    candidates_by_worker[wb.worker_id] = (
+                        wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds, iface_warns
+                    )
+                    self._stage(self.query_id, f"GENERATE: W{wb.worker_id} ({wb.strategy}) ready ({_fmt_elapsed(time.time() - t_gen)})")
+                except Exception as e:
+                    wb = futures[future]
+                    logger.error(f"[{self.query_id}] W{wb.worker_id} generation failed: {e}")
+                    candidates_by_worker[wb.worker_id] = (wb, self.original_sql, [], "", str(e), [], [])
+
+        self._stage(self.query_id, f"GENERATE: all {len(candidates_by_worker)} workers complete ({_fmt_elapsed(time.time() - t_gen)})")
+
+        # Write ALL worker outputs to disk immediately (same as _generate_fan_out)
+        for wid in sorted(candidates_by_worker.keys()):
+            wb, sql, transforms, w_prompt, w_response, slc, iw = candidates_by_worker[wid]
+            w_dir = iter_dir / f"worker_{wid:02d}"
+            w_dir.mkdir(parents=True, exist_ok=True)
+            if w_prompt:
+                (w_dir / "prompt.txt").write_text(w_prompt, encoding="utf-8")
+            if w_response:
+                (w_dir / "response.txt").write_text(w_response, encoding="utf-8")
+            (w_dir / "optimized.sql").write_text(sql, encoding="utf-8")
+            gen_result = {
+                "worker_id": wb.worker_id,
+                "strategy": wb.strategy,
+                "examples_used": wb.examples,
+                "optimized_sql": sql,
+                "transforms": transforms,
+                "hint": wb.example_adaptation[:80] if wb.example_adaptation else "",
+                "set_local_commands": slc or [],
+                "interface_warnings": iw or [],
+                "speedup": 0.0,
+                "status": "PENDING",
+            }
+            (w_dir / "result.json").write_text(
+                json.dumps(gen_result, indent=2, default=str), encoding="utf-8"
+            )
+
+        return {
+            "_candidates_by_worker": candidates_by_worker,
+            "_analyst_prompt": analyst_prompt,
+            "_analyst_response": analyst_response,
+            "_briefing": briefing,
+            "_generator": generator,
+            "_resource_envelope": resource_envelope,
+        }
+
+    def compact_gen_result(self) -> None:
+        """Free large text fields from generation result to reduce memory.
+
+        Call after Phase 1 before Phase 2 starts. Prompts/responses are
+        already saved to disk by _generate_fan_out.
+        """
+        if not self._gen_result:
+            return
+        # Drop the generator object (holds LLM client state)
+        self._gen_result.pop("_generator", None)
+        # Trim worker prompt/response text from candidates (already on disk)
+        cbw = self._gen_result.get("_candidates_by_worker", {})
+        for wid in cbw:
+            wb, sql, transforms, _prompt, _response, set_local, iface = cbw[wid]
+            # Keep sql, transforms, set_local, iface_warns — drop prompt/response text
+            cbw[wid] = (wb, sql, transforms, "", "", set_local, iface)
+
+    def validate_and_finish(self) -> SessionResult:
+        """Phase 2: Validate candidates and run snipe iterations.
+
+        Must be called after prepare_candidates(). Runs DB validation
+        (race or sequential), then snipe iterations if needed.
+
+        Returns SessionResult.
+        """
+        t_session = self._prepare_t_session
+        dag = self._dag
+        costs = self._costs
+
+        try:
+            print(f"\n  VALIDATE: {self.query_id}", flush=True)
+
+            # Validate fan-out candidates
+            t_val = time.time()
+            fan_out_result = self._validate_fan_out(
+                self._gen_result, dag, costs, t_session
+            )
+            self.iterations_data.append(fan_out_result)
+            self._stage(
+                self.query_id,
+                f"FAN-OUT: complete ({_fmt_elapsed(time.time() - t_val)}) | "
+                f"total {_fmt_elapsed(time.time() - t_session)}"
+            )
+
+            best_wr = self._best_worker()
+            if best_wr and best_wr.speedup >= self.target_speedup:
+                print(
+                    f"  DONE: {self.query_id} — {best_wr.status} {best_wr.speedup:.2f}x "
+                    f"(W{best_wr.worker_id} {best_wr.strategy}) | "
+                    f"{_fmt_elapsed(time.time() - t_session)}",
+                    flush=True,
+                )
+                self.save_session()
+                return self._build_result()
+
+            # Cache baseline for snipe iterations
+            if self._cached_baseline is None and self.max_iterations > 1:
+                try:
+                    self._cached_baseline = self.pipeline._benchmark_baseline(
+                        self.original_sql
+                    )
+                    self._stage(
+                        self.query_id,
+                        f"BASELINE: cached ({self._cached_baseline.measured_time_ms:.1f}ms, "
+                        f"{self._cached_baseline.row_count} rows)"
+                    )
+                except Exception as e:
+                    logger.warning(f"[{self.query_id}] Baseline caching failed: {e}")
+
+            if (not self._explain_plan_text
+                    and self._cached_baseline is not None
+                    and self._cached_baseline.explain_text):
+                self._explain_plan_text = self._cached_baseline.explain_text
+
+            # Snipe iterations
+            for snipe_num in range(1, self.max_iterations):
+                print(f"\n  --- Snipe {snipe_num}/{self.max_iterations - 1} [{self.query_id}] ---", flush=True)
+                t_snipe = time.time()
+                snipe_result = self._snipe_iteration(dag, costs, snipe_num, t_session)
+                self.iterations_data.append(snipe_result)
+                self._stage(
+                    self.query_id,
+                    f"SNIPE {snipe_num}: complete ({_fmt_elapsed(time.time() - t_snipe)}) | "
+                    f"total {_fmt_elapsed(time.time() - t_session)}"
+                )
+
+                best_wr = self._best_worker()
+                if best_wr and best_wr.speedup >= self.target_speedup:
+                    print(
+                        f"  DONE: {self.query_id} — {best_wr.status} {best_wr.speedup:.2f}x "
+                        f"(snipe {snipe_num}) | {_fmt_elapsed(time.time() - t_session)}",
+                        flush=True,
+                    )
+                    self.save_session()
+                    return self._build_result()
+
+            # Final
+            best_wr = self._best_worker()
+            if best_wr:
+                print(
+                    f"  DONE: {self.query_id} — {best_wr.status} {best_wr.speedup:.2f}x "
+                    f"(W{best_wr.worker_id} {best_wr.strategy}) | "
+                    f"{_fmt_elapsed(time.time() - t_session)}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  DONE: {self.query_id} — no valid results | "
+                    f"{_fmt_elapsed(time.time() - t_session)}",
+                    flush=True,
+                )
+            self.save_session()
+            return self._build_result()
+        finally:
+            if self._run_log_path:
+                logger.info(f"[{self.query_id}] Swarm log file saved: {self._run_log_path}")
+            self._teardown_run_logging()
+
     def _fan_out_iteration(
         self, dag: Any, costs: Dict[str, Any], t_session: float,
     ) -> Dict[str, Any]:
-        """Iteration 1: Analyst produces structured briefing, workers get precise specs.
+        """Iteration 1: Analyst + workers + validation (backward-compat wrapper)."""
+        gen_result = self._generate_fan_out(dag, costs, t_session)
+        return self._validate_fan_out(gen_result, dag, costs, t_session)
 
-        1. Gather all raw data (EXPLAIN, GlobalKnowledge, constraints, examples, etc.)
-        2. Build analyst prompt via build_analyst_briefing_prompt()
-        3. Call analyst LLM with explicit max_tokens
-        4. Parse via parse_briefing_response()
-        5. For each worker: load examples, build prompt, generate candidate
-        6. Validate all 4 (same _validate_batch)
+    def _generate_fan_out(
+        self, dag: Any, costs: Dict[str, Any], t_session: float,
+    ) -> Dict[str, Any]:
+        """Steps 1-5: Gather data, analyst LLM, parse briefing, generate 4 workers.
+
+        Returns a dict with all generation artifacts needed for validation.
+        Does NOT touch the database for benchmarking.
         """
         from ..prompts import (
             build_analyst_briefing_prompt,
@@ -221,6 +664,7 @@ class SwarmSession(OptimizationSession):
         query_archetype = ctx["query_archetype"]
         resource_envelope = ctx["resource_envelope"]
         exploit_algorithm_text = ctx["exploit_algorithm_text"]
+        detected_transforms = ctx.get("detected_transforms", [])
 
         self._stage(
             self.query_id,
@@ -238,7 +682,6 @@ class SwarmSession(OptimizationSession):
         self._constraints = constraints
         self._semantic_intents = semantic_intents
         self._matched_examples = matched_examples
-        self._all_available_examples = all_available
         self._regression_warnings = regression_warnings
         self._resource_envelope = resource_envelope
 
@@ -262,6 +705,7 @@ class SwarmSession(OptimizationSession):
             resource_envelope=resource_envelope,
             exploit_algorithm_text=exploit_algorithm_text,
             plan_scanner_text=plan_scanner_text,
+            detected_transforms=detected_transforms,
         )
 
         # ── Step 3: Call analyst LLM ─────────────────────────────────────
@@ -295,16 +739,55 @@ class SwarmSession(OptimizationSession):
         (iter_dir / "analyst_prompt.txt").write_text(analyst_prompt, encoding="utf-8")
         (iter_dir / "analyst_response.txt").write_text(analyst_response, encoding="utf-8")
 
-        # ── Step 4: Parse briefing ──────────────────────────────────────
+        # ── Step 4: Parse briefing (with retry on format errors) ────────
         briefing = parse_briefing_response(analyst_response)
         briefing_issues = validate_parsed_briefing(briefing)
+
         if briefing_issues:
+            # Retry once: feed error back to LLM
             for issue in briefing_issues[:8]:
                 self._stage(self.query_id, f"ANALYST BRIEFING ERROR: {issue}")
-            raise RuntimeError(
-                "Analyst briefing failed validation: "
-                + "; ".join(briefing_issues[:4])
+            self._stage(self.query_id, "ANALYST: Retrying with error feedback...")
+
+            error_feedback = "\n".join(briefing_issues[:8])
+            retry_prompt = (
+                analyst_prompt
+                + "\n\n--- FORMAT ERROR IN YOUR PREVIOUS RESPONSE ---\n"
+                + "Your response had the following validation errors:\n"
+                + error_feedback
+                + "\n\nPlease re-emit the COMPLETE briefing in the correct format. "
+                + "All sections (SHARED, WORKER_1 through WORKER_4) must be present "
+                + "with all required fields."
             )
+
+            t_retry = time.time()
+            try:
+                analyst_response = generator._analyze_with_max_tokens(
+                    retry_prompt, max_tokens=4096
+                )
+                self._stage(
+                    self.query_id,
+                    f"ANALYST: retry done ({len(analyst_response)} chars, "
+                    f"{_fmt_elapsed(time.time() - t_retry)})"
+                )
+                (iter_dir / "analyst_response_retry.txt").write_text(
+                    analyst_response, encoding="utf-8"
+                )
+
+                briefing = parse_briefing_response(analyst_response)
+                briefing_issues = validate_parsed_briefing(briefing)
+            except Exception as e:
+                self._stage(self.query_id, f"ANALYST: retry failed ({e})")
+                briefing_issues = briefing_issues or [str(e)]
+
+            if briefing_issues:
+                for issue in briefing_issues[:4]:
+                    self._stage(self.query_id, f"ANALYST RETRY ERROR: {issue}")
+                raise RuntimeError(
+                    "Analyst briefing failed validation (after retry): "
+                    + "; ".join(briefing_issues[:4])
+                )
+            self._stage(self.query_id, "ANALYST: retry succeeded")
 
         # Log parsed briefing
         for w in briefing.workers:
@@ -381,7 +864,8 @@ class SwarmSession(OptimizationSession):
                 optimized_sql = self.original_sql
 
             return (worker_briefing, optimized_sql, candidate.transforms,
-                    candidate.prompt, candidate.response, candidate.set_local_commands)
+                    candidate.prompt, candidate.response, candidate.set_local_commands,
+                    candidate.interface_warnings)
 
         # Parallel LLM generation
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -390,10 +874,15 @@ class SwarmSession(OptimizationSession):
             }
             for future in as_completed(futures):
                 try:
-                    wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds = future.result()
+                    wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds, iface_warns = future.result()
                     candidates_by_worker[wb.worker_id] = (
-                        wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds
+                        wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds, iface_warns
                     )
+                    if iface_warns:
+                        self._stage(
+                            self.query_id,
+                            f"GENERATE: W{wb.worker_id} interface warnings: {len(iface_warns)}"
+                        )
                     self._stage(
                         self.query_id,
                         f"GENERATE: W{wb.worker_id} ({wb.strategy}) ready "
@@ -403,10 +892,60 @@ class SwarmSession(OptimizationSession):
                     wb = futures[future]
                     logger.error(f"[{self.query_id}] W{wb.worker_id} generation failed: {e}")
                     candidates_by_worker[wb.worker_id] = (
-                        wb, self.original_sql, [], "", str(e), []
+                        wb, self.original_sql, [], "", str(e), [], []
                     )
 
         self._stage(self.query_id, f"GENERATE: all 4 workers complete ({_fmt_elapsed(time.time() - t_gen)})")
+
+        # Persist ALL worker outputs to disk immediately after generation.
+        # This ensures no LLM results are lost if the process is interrupted
+        # before validation completes.
+        for wid in sorted(candidates_by_worker.keys()):
+            wb, sql, transforms, w_prompt, w_response, slc, iw = candidates_by_worker[wid]
+            w_dir = iter_dir / f"worker_{wid:02d}"
+            w_dir.mkdir(parents=True, exist_ok=True)
+            if w_prompt:
+                (w_dir / "prompt.txt").write_text(w_prompt, encoding="utf-8")
+            if w_response:
+                (w_dir / "response.txt").write_text(w_response, encoding="utf-8")
+            # Save optimized SQL and generation metadata (pre-validation)
+            (w_dir / "optimized.sql").write_text(sql, encoding="utf-8")
+            gen_result = {
+                "worker_id": wb.worker_id,
+                "strategy": wb.strategy,
+                "examples_used": wb.examples,
+                "optimized_sql": sql,
+                "transforms": transforms,
+                "hint": wb.example_adaptation[:80] if wb.example_adaptation else "",
+                "set_local_commands": slc or [],
+                "interface_warnings": iw or [],
+                "speedup": 0.0,
+                "status": "PENDING",
+            }
+            (w_dir / "result.json").write_text(
+                json.dumps(gen_result, indent=2, default=str), encoding="utf-8"
+            )
+
+        return {
+            "_candidates_by_worker": candidates_by_worker,
+            "_analyst_prompt": analyst_prompt,
+            "_analyst_response": analyst_response,
+            "_briefing": briefing,
+            "_generator": generator,
+            "_resource_envelope": resource_envelope,
+        }
+
+    def _validate_fan_out(
+        self, gen_result: Dict[str, Any], dag: Any, costs: Dict[str, Any], t_session: float,
+    ) -> Dict[str, Any]:
+        """Steps 6+: Race/validate candidates, collect EXPLAINs, save learning records.
+
+        Takes the generation result from _generate_fan_out() and runs DB validation.
+        """
+        candidates_by_worker = gen_result["_candidates_by_worker"]
+        analyst_prompt = gen_result["_analyst_prompt"]
+        analyst_response = gen_result["_analyst_response"]
+        briefing = gen_result["_briefing"]
 
         # ── Step 6: Validation — Race first, fallback to sequential ─────
         sorted_wids = sorted(candidates_by_worker.keys())
@@ -450,6 +989,12 @@ class SwarmSession(OptimizationSession):
                     f"RACE [{winner_tag}]: original={race_result.original.elapsed_ms:.0f}ms | "
                     + " | ".join(lane_tags)
                 )
+
+                # Use race baseline EXPLAIN as fallback
+                if (not self._explain_plan_text
+                        and race_result.baseline.explain_text):
+                    self._explain_plan_text = race_result.baseline.explain_text
+                    self._stage(self.query_id, "EXPLAIN: captured from race baseline")
         except Exception as e:
             logger.warning(f"[{self.query_id}] Race failed, falling back: {e}")
 
@@ -480,8 +1025,8 @@ class SwarmSession(OptimizationSession):
 
             if cost_ranked_indices is not None and len(cost_ranked_indices) < len(optimized_sqls):
                 benchmark_sqls = [optimized_sqls[i] for i in cost_ranked_indices]
-                real_results = self.pipeline._validate_batch(
-                    self.original_sql, benchmark_sqls
+                real_results, seq_baseline = self.pipeline._validate_batch(
+                    self.original_sql, benchmark_sqls, return_baseline=True
                 )
                 batch_results = []
                 real_idx = 0
@@ -492,15 +1037,24 @@ class SwarmSession(OptimizationSession):
                     else:
                         batch_results.append(("NEUTRAL", 1.00, [], None))
             else:
-                batch_results = self.pipeline._validate_batch(
-                    self.original_sql, optimized_sqls
+                batch_results, seq_baseline = self.pipeline._validate_batch(
+                    self.original_sql, optimized_sqls, return_baseline=True
                 )
+
+            # Cache baseline from sequential validation (includes EXPLAIN)
+            if seq_baseline is not None and self._cached_baseline is None:
+                self._cached_baseline = seq_baseline
 
         worker_results = []
         worker_prompts = {}
         for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
-            wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds = candidates_by_worker[wid]
+            wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds, iface_warns = candidates_by_worker[wid]
             worker_prompts[wid] = (w_prompt, w_response)
+
+            # Prepend interface warnings to error messages so retry worker sees them
+            all_errors = list(error_msgs or [])
+            if iface_warns:
+                all_errors = [f"INTERFACE: {w}" for w in iface_warns] + all_errors
 
             # Tag Worker 4 as exploratory for separate tracking
             is_exploratory = (wb.worker_id == 4)
@@ -513,8 +1067,8 @@ class SwarmSession(OptimizationSession):
                 status=status,
                 transforms=transforms,
                 hint=wb.example_adaptation[:80] if wb.example_adaptation else "",
-                error_message=" | ".join(error_msgs) if error_msgs else None,
-                error_messages=error_msgs or [],
+                error_message=" | ".join(all_errors) if all_errors else None,
+                error_messages=all_errors,
                 error_category=error_cat,
                 exploratory=is_exploratory,
             )
@@ -542,7 +1096,7 @@ class SwarmSession(OptimizationSession):
             from ..pg_tuning import validate_tuning_config, build_set_local_sql
 
             for wid in sorted_wids:
-                wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds = candidates_by_worker[wid]
+                wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds, _iw = candidates_by_worker[wid]
                 if not set_local_cmds:
                     continue
 
@@ -691,15 +1245,16 @@ class SwarmSession(OptimizationSession):
         self,
         worker_results: List[WorkerResult],
     ) -> Dict[int, str]:
-        """Collect EXPLAIN ANALYZE plans for validated candidates.
+        """Collect execution plans for all candidates.
 
-        Runs EXPLAIN ANALYZE on each passing candidate's optimized SQL so the
-        snipe analyst can see how the optimizer actually executes each rewrite.
+        - PASS/WIN/IMPROVED: EXPLAIN ANALYZE (actual execution timings)
+        - ERROR/FAIL: EXPLAIN estimate (no execution) — if that also fails
+          (e.g. column reference errors), stores the error message so it's
+          co-located with the SQL in the retry prompt.
 
-        Skips ERROR/FAIL workers and workers that fell back to original SQL.
-        Returns dict of worker_id → formatted explain text.
+        Returns dict of worker_id → formatted explain text or error context.
         """
-        from ..execution.database_utils import run_explain_analyze
+        from ..execution.database_utils import run_explain_analyze, run_explain_text
         from ..prompts.analyst_briefing import format_pg_explain_tree
 
         explains: Dict[int, str] = {}
@@ -708,13 +1263,33 @@ class SwarmSession(OptimizationSession):
         collected = 0
 
         for wr in worker_results:
-            # Skip broken candidates
-            if wr.status in ("ERROR", "FAIL"):
-                continue
             # Skip candidates that fell back to original
             if wr.optimized_sql.strip() == self.original_sql.strip():
                 continue
 
+            if wr.status in ("ERROR", "FAIL"):
+                # ERROR candidates: try EXPLAIN (estimate only, no execution)
+                try:
+                    plan_text = run_explain_text(dsn, wr.optimized_sql)
+                    if plan_text:
+                        explains[wr.worker_id] = (
+                            f"[EXPLAIN estimate — query errored at execution]\n{plan_text}"
+                        )
+                        collected += 1
+                        continue
+                except Exception:
+                    pass
+
+                # EXPLAIN also failed — store the error message as context
+                err_msg = wr.error_message or "Unknown error"
+                explains[wr.worker_id] = (
+                    f"[EXPLAIN failed — planner rejected this SQL]\n"
+                    f"Error: {err_msg}"
+                )
+                collected += 1
+                continue
+
+            # PASS/WIN/IMPROVED: full EXPLAIN ANALYZE
             try:
                 result = run_explain_analyze(dsn, wr.optimized_sql)
                 if not result:
@@ -728,10 +1303,6 @@ class SwarmSession(OptimizationSession):
                         plan_text = format_pg_explain_tree(plan_json)
 
                 if plan_text:
-                    exec_ms = result.get("execution_time_ms")
-                    header = f"W{wr.worker_id} ({wr.strategy}) — {wr.speedup:.2f}x"
-                    if exec_ms is not None:
-                        header += f" — EXPLAIN exec: {exec_ms:.1f}ms"
                     explains[wr.worker_id] = plan_text
                     collected += 1
             except Exception as e:
@@ -750,16 +1321,13 @@ class SwarmSession(OptimizationSession):
     def _snipe_iteration(
         self, dag: Any, costs: Dict[str, Any], snipe_num: int, t_session: float,
     ) -> Dict[str, Any]:
-        """Snipe iteration with two paths.
+        """Self-directed retry iteration — single LLM call.
 
-        Path A (snipe_num == 1): analyst diagnosis + sniper deployment
-        Path B (snipe_num >= 2): sniper retry with compact failure digest
+        The retry worker gets all raw evidence (previous results, EXPLAIN plans,
+        race timings) plus standard worker context and self-directs through
+        diagnose → identify → rewrite in one pass. No analyst intermediary.
         """
-        from ..prompts import (
-            build_snipe_analyst_prompt,
-            build_sniper_prompt,
-            parse_snipe_response,
-        )
+        from ..prompts.swarm_snipe import build_retry_worker_prompt
         from ..generate import CandidateGenerator
         from ..prompter import _load_constraint_files, _load_engine_profile, Prompter
 
@@ -780,8 +1348,6 @@ class SwarmSession(OptimizationSession):
             self._matched_examples = self.pipeline._find_examples(
                 self.original_sql, engine=self.engine, k=20
             )
-        if not self._all_available_examples:
-            self._all_available_examples = self.pipeline._list_gold_examples(self.engine)
         if not self._output_columns:
             self._output_columns = Prompter._extract_output_columns(dag)
         if self._regression_warnings is None:
@@ -801,147 +1367,43 @@ class SwarmSession(OptimizationSession):
             except Exception:
                 pass
 
-        # ── Path B: Sniper retry (snipe_num >= 2) ────────────────────────
-        if snipe_num >= 2 and self._sniper_result is not None:
-            # Check retry_worthiness
-            if self._snipe_analysis and self._snipe_analysis.retry_worthiness:
-                worthiness = self._snipe_analysis.retry_worthiness.strip().lower()
-                if worthiness.startswith("low"):
-                    reason = self._snipe_analysis.retry_worthiness
-                    self._stage(
-                        self.query_id,
-                        f"SNIPER RETRY: SKIPPED — retry_worthiness=low ({reason})"
-                    )
-                    logger.info(f"[{self.query_id}] Sniper retry skipped: {reason}")
-                    return {
-                        "iteration": snipe_num,
-                        "phase": "snipe_retry_skipped",
-                        "retry_worthiness": reason,
-                        "worker_results": [],
-                        "best_speedup": 0.0,
-                    }
-
-            self._stage(
-                self.query_id,
-                f"SNIPER RETRY: Deploying sniper2... | total {_fmt_elapsed(time.time() - t_session)}"
+        # ── Step 1: Collect EXPLAIN plans if not already done ─────────────
+        if not self._candidate_explains and self.all_worker_results:
+            self._candidate_explains = self._collect_candidate_explains(
+                self.all_worker_results
             )
 
-            # Recover analysis from iter 1
-            analysis = self._snipe_analysis
-
-            # Find best worker SQL
-            best_worker_sql = self._find_best_worker_sql()
-
-            # Load examples from analyst's recommendations
-            examples = self.pipeline._load_examples_by_id(
-                analysis.examples if analysis else [], self.engine
-            )
-
-            # Build sniper prompt WITH previous_sniper_result
-            sniper_prompt = build_sniper_prompt(
-                snipe_analysis=analysis,
-                original_sql=self.original_sql,
-                worker_results=self.all_worker_results,
-                best_worker_sql=best_worker_sql,
-                examples=examples,
-                output_columns=self._output_columns,
-                dag=dag,
-                costs=costs,
-                engine_profile=self._engine_profile,
-                constraints=self._constraints,
-                semantic_intents=self._semantic_intents,
-                regression_warnings=self._regression_warnings,
-                dialect=self.dialect,
-                engine_version=self.pipeline._engine_version,
-                resource_envelope=self._resource_envelope,
-                target_speedup=self.target_speedup,
-                previous_sniper_result=self._sniper_result,
-                candidate_explains=self._candidate_explains,
-                original_explain_text=self._explain_plan_text,
-            )
-
-            # Generate, validate, update
-            return self._run_sniper(
-                generator, sniper_prompt, analysis, examples,
-                snipe_num, dag, costs, t_session,
-                phase="snipe_retry",
-            )
-
-        # ── Path A: Analyst2 + Sniper (snipe_num == 1) ───────────────────
-        # Step 1: Build analyst2 prompt
-        self._stage(
-            self.query_id,
-            f"SNIPE ANALYST: Diagnosing {len(self.all_worker_results)} results... "
-            f"| total {_fmt_elapsed(time.time() - t_session)}"
-        )
-        t0 = time.time()
-
-        analyst_prompt = build_snipe_analyst_prompt(
-            query_id=self.query_id,
-            original_sql=self.original_sql,
-            worker_results=self.all_worker_results,
-            target_speedup=self.target_speedup,
-            dag=dag,
-            costs=costs,
-            explain_plan_text=self._explain_plan_text,
-            engine_profile=self._engine_profile,
-            constraints=self._constraints,
-            matched_examples=self._matched_examples,
-            all_available_examples=self._all_available_examples,
-            semantic_intents=self._semantic_intents,
-            regression_warnings=self._regression_warnings,
-            resource_envelope=self._resource_envelope,
-            dialect=self.dialect,
-            dialect_version=self.pipeline._engine_version,
-            candidate_explains=self._candidate_explains,
-            race_timings=self._build_race_timings(),
-        )
-
-        # Step 2: Call analyst LLM
-        try:
-            analyst_response = generator._analyze_with_max_tokens(
-                analyst_prompt, max_tokens=4096
-            )
-        except Exception as e:
-            self._stage(self.query_id, f"SNIPE ANALYST: failed ({e})")
-            return {
-                "iteration": snipe_num,
-                "phase": "snipe",
-                "error": str(e),
-                "worker_results": [],
-                "best_speedup": 0.0,
-            }
-
-        self._stage(
-            self.query_id,
-            f"SNIPE ANALYST: done ({len(analyst_response)} chars, "
-            f"{_fmt_elapsed(time.time() - t0)})"
-        )
-
-        # Step 3: Parse analyst response
-        analysis = parse_snipe_response(analyst_response)
-        self._snipe_analysis = analysis  # persist for retry
-
-        self._stage(self.query_id, f"  Retry worthiness: {analysis.retry_worthiness or '?'}")
-        if analysis.strategy_guidance:
-            self._stage(self.query_id, f"  Strategy: {analysis.strategy_guidance[:80]}")
-
-        # Step 4: Find best worker SQL
+        # ── Step 2: Find best worker SQL + load matched examples ─────────
         best_worker_sql = self._find_best_worker_sql()
-
-        # Step 5: Load examples
         examples = self.pipeline._load_examples_by_id(
-            analysis.examples, self.engine
+            [e.get("id", "") for e in self._matched_examples[:6]],
+            self.engine,
         )
 
-        # Step 6: Build sniper prompt
+        # ── Step 3: Recover shared briefing from fan-out ─────────────────
+        shared_briefing = None
+        if self.iterations_data:
+            fan_out = self.iterations_data[0]
+            bs = fan_out.get("briefing_shared")
+            if bs:
+                from ..prompts.swarm_parsers import BriefingShared
+                shared_briefing = BriefingShared(
+                    semantic_contract=bs.get("semantic_contract", ""),
+                    bottleneck_diagnosis=bs.get("bottleneck_diagnosis", ""),
+                    active_constraints=bs.get("active_constraints", ""),
+                    regression_warnings=bs.get("regression_warnings", ""),
+                )
+
+        # ── Step 4: Build self-directed retry worker prompt ──────────────
         self._stage(
             self.query_id,
-            f"SNIPER: Deploying... | total {_fmt_elapsed(time.time() - t_session)}"
+            f"RETRY WORKER: Self-directed rewrite ({len(self.all_worker_results)} "
+            f"prior results) | total {_fmt_elapsed(time.time() - t_session)}"
         )
 
-        sniper_prompt = build_sniper_prompt(
-            snipe_analysis=analysis,
+        previous_retry = self._sniper_result if snipe_num >= 2 else None
+
+        retry_prompt = build_retry_worker_prompt(
             original_sql=self.original_sql,
             worker_results=self.all_worker_results,
             best_worker_sql=best_worker_sql,
@@ -949,60 +1411,48 @@ class SwarmSession(OptimizationSession):
             output_columns=self._output_columns,
             dag=dag,
             costs=costs,
+            explain_plan_text=self._explain_plan_text,
+            candidate_explains=self._candidate_explains,
+            race_timings=self._build_race_timings(),
             engine_profile=self._engine_profile,
             constraints=self._constraints,
             semantic_intents=self._semantic_intents,
             regression_warnings=self._regression_warnings,
+            shared_briefing=shared_briefing,
+            resource_envelope=self._resource_envelope,
             dialect=self.dialect,
             engine_version=self.pipeline._engine_version,
-            resource_envelope=self._resource_envelope,
             target_speedup=self.target_speedup,
-            previous_sniper_result=None,  # first sniper attempt
-            candidate_explains=self._candidate_explains,
-            original_explain_text=self._explain_plan_text,
+            previous_retry_result=previous_retry,
         )
 
-        # Step 7: Generate, validate
-        result = self._run_sniper(
-            generator, sniper_prompt, analysis, examples,
-            snipe_num, dag, costs, t_session,
-            phase="snipe",
+        # ── Step 5: Single LLM call ─────────────────────────────────────
+        return self._run_sniper(
+            generator, retry_prompt, examples,
+            snipe_num, t_session,
         )
-
-        # Attach analyst data to iteration
-        result["analyst_prompt"] = analyst_prompt
-        result["analyst_response"] = analyst_response
-        result["failure_synthesis"] = analysis.failure_synthesis
-        result["strategy_guidance"] = analysis.strategy_guidance
-        result["retry_worthiness"] = analysis.retry_worthiness
-
-        return result
 
     def _run_sniper(
         self,
         generator: Any,
-        sniper_prompt: str,
-        analysis: Any,  # SnipeAnalysis
+        retry_prompt: str,
         examples: List[Dict[str, Any]],
         snipe_num: int,
-        dag: Any,
-        costs: Dict[str, Any],
         t_session: float,
-        phase: str = "snipe",
     ) -> Dict[str, Any]:
-        """Run sniper: generate candidate, validate, save result."""
+        """Run self-directed retry worker: generate candidate, validate, save."""
         t_gen = time.time()
         example_ids = [e.get("id", "?") for e in examples]
         candidate = generator.generate_one(
             sql=self.original_sql,
-            prompt=sniper_prompt,
+            prompt=retry_prompt,
             examples_used=example_ids,
-            worker_id=5,  # sniper = worker 5
+            worker_id=5,  # retry worker = worker 5
             dialect=self.dialect,
         )
         self._stage(
             self.query_id,
-            f"SNIPER: generated ({_fmt_elapsed(time.time() - t_gen)})"
+            f"RETRY WORKER: generated ({_fmt_elapsed(time.time() - t_gen)})"
         )
 
         # Syntax check
@@ -1028,25 +1478,28 @@ class SwarmSession(OptimizationSession):
                 self.original_sql, optimized_sql
             )
 
-        strategy = f"sniper_{snipe_num}"
-        if phase == "snipe_retry":
-            strategy = f"sniper_retry_{snipe_num}"
+        strategy = f"retry_{snipe_num}"
+
+        # Prepend interface warnings to error messages
+        all_errors = list(val_errors or [])
+        if candidate.interface_warnings:
+            all_errors = [f"INTERFACE: {w}" for w in candidate.interface_warnings] + all_errors
 
         wr = WorkerResult(
             worker_id=5,
             strategy=strategy,
-            examples_used=analysis.examples if analysis else [],
+            examples_used=example_ids,
             optimized_sql=optimized_sql,
             speedup=speedup,
             status=status,
             transforms=candidate.transforms,
-            hint=analysis.strategy_guidance[:80] if analysis and analysis.strategy_guidance else "",
-            error_message=" | ".join(val_errors) if val_errors else None,
-            error_messages=val_errors or [],
+            hint="",
+            error_message=" | ".join(all_errors) if all_errors else None,
+            error_messages=all_errors,
             error_category=val_error_cat,
         )
         self.all_worker_results.append(wr)
-        self._sniper_result = wr  # persist for retry
+        self._sniper_result = wr  # persist for next retry
 
         err = f" — {val_errors[0][:60]}" if val_errors else ""
         self._stage(
@@ -1058,8 +1511,8 @@ class SwarmSession(OptimizationSession):
         try:
             lr = self.pipeline.learner.create_learning_record(
                 query_id=self.query_id,
-                examples_recommended=analysis.examples if analysis else [],
-                transforms_recommended=analysis.examples if analysis else [],
+                examples_recommended=example_ids,
+                transforms_recommended=example_ids,
                 status="pass" if status in ("WIN", "IMPROVED", "NEUTRAL") else "error",
                 speedup=speedup,
                 transforms_used=candidate.transforms,
@@ -1072,7 +1525,7 @@ class SwarmSession(OptimizationSession):
 
         return {
             "iteration": snipe_num,
-            "phase": phase,
+            "phase": "snipe",
             "worker_prompt": candidate.prompt,
             "worker_response": candidate.response,
             "worker_results": [wr.to_dict()],
@@ -1187,9 +1640,7 @@ class SwarmSession(OptimizationSession):
 
         Counts only LLM calls:
         - Fan-out iteration: 1 analyst + N worker generations
-        - Snipe (iter 1): 1 analyst + 1 sniper = 2
-        - Snipe retry: 0 analyst + 1 sniper = 1
-        - Snipe retry skipped: 0
+        - Snipe (retry): 1 self-directed worker per iteration
         """
         total = 0
         for it_data in self.iterations_data:
@@ -1198,11 +1649,7 @@ class SwarmSession(OptimizationSession):
                 total += 1  # analyst
                 total += len(it_data.get("worker_results", []))  # workers
             elif phase == "snipe":
-                total += 1  # analyst
-                total += 1  # sniper
-            elif phase == "snipe_retry":
-                total += 1  # sniper only (no analyst)
-            # snipe_retry_skipped: 0 calls
+                total += 1  # self-directed retry worker
         return total
 
     def save_session(self, output_dir: Optional[Path] = None) -> Path:

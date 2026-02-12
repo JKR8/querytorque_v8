@@ -672,6 +672,7 @@ def build_analyst_briefing_prompt(
     plan_scanner_text: Optional[str] = None,
     iteration_history: Optional[Dict[str, Any]] = None,
     mode: str = "swarm",
+    detected_transforms: Optional[List] = None,
 ) -> str:
     """Build the analyst briefing prompt for swarm, expert, or oneshot mode.
 
@@ -705,6 +706,8 @@ def build_analyst_briefing_prompt(
             iterative mode). Dict with 'attempts' list. None for first iteration or swarm.
         mode: Prompt mode — "swarm" (4 workers), "expert" (1 worker), or "oneshot"
             (analyze + produce SQL directly). Default "swarm".
+        detected_transforms: Top-N transforms ranked by precondition feature overlap
+            with this query (may be None). Each is a TransformMatch dataclass.
 
     Returns:
         Complete analyst prompt string (~3000-5000 tokens input)
@@ -1074,6 +1077,28 @@ def build_analyst_briefing_prompt(
         lines.append("")
         lines.append(resource_envelope)
         lines.append("")
+
+    # ── 10a2. Detected Transforms (structural feature match) ────────────
+    if detected_transforms:
+        lines.append("## Detected Transforms: Structural Feature Match")
+        lines.append("")
+        lines.append(
+            "Transforms ranked by precondition feature overlap with THIS query. "
+            "Higher overlap = more structurally applicable."
+        )
+        lines.append("")
+        for m in detected_transforms:
+            pct = f"{m.overlap_ratio:.0%}"
+            matched = ", ".join(m.matched_features)
+            gap_str = f" [{m.gap}]" if m.gap else ""
+            lines.append(f"- **{m.id}** ({pct} match){gap_str}")
+            lines.append(f"  Features: {matched}")
+            if m.missing_features:
+                lines.append(f"  Missing: {', '.join(m.missing_features)}")
+            if m.contraindications:
+                for ci in m.contraindications:
+                    lines.append(f"  ⚠ {ci['id']}: {ci['instruction']}")
+            lines.append("")
 
     # ── 10b. Correctness Constraints (non-negotiable validation gates) ────
     correctness_constraints = [

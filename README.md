@@ -1,5 +1,9 @@
 # QueryTorque
 
+## Mission
+
+QueryTorque gathers **generalised intelligence on database engine optimizers** — what they handle well, where their gaps are, and which SQL rewrites exploit those gaps for measurable speedup. Each engine has a **master intelligence document** (`knowledge/{engine}.md`) that is the single source of truth, continuously refined by automated benchmarking, transform detection, and evidence-based distillation.
+
 QueryTorque is a comprehensive query optimization platform for SQL and DAX. It analyzes queries, identifies performance issues, and provides actionable recommendations with AI-powered explanations.
 
 ## Architecture

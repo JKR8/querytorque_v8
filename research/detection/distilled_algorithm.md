@@ -1,0 +1,1 @@
+../../packages/qt-sql/qt_sql/knowledge/duckdb.md

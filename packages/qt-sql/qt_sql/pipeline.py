@@ -305,18 +305,29 @@ class Pipeline:
         self,
         original_sql: str,
         optimized_sqls: List[str],
-    ) -> List[tuple[str, float, list[str], str | None]]:
+        return_baseline: bool = False,
+    ) -> (
+        "List[tuple[str, float, list[str], str | None]] | "
+        "tuple[List[tuple[str, float, list[str], str | None]], Any]"
+    ):
         """Validate multiple optimized SQLs against a single original baseline.
 
         Times the original SQL ONCE, then validates each optimized SQL
         sequentially against the cached baseline.
 
+        Args:
+            original_sql: The original SQL query
+            optimized_sqls: List of optimized SQL candidates
+            return_baseline: If True, return (results, baseline) tuple
+
         Returns:
-            List of (status, speedup, error_messages, error_category) tuples
+            List of (status, speedup, error_messages, error_category) tuples.
+            If return_baseline=True, returns (results_list, OriginalBaseline).
         """
         from .validate import Validator
 
         validator = Validator(sample_db=self.config.db_path_or_dsn)
+        baseline = None
         try:
             # Step 1: Benchmark original once
             baseline = validator.benchmark_baseline(original_sql)
@@ -351,11 +362,16 @@ class Pipeline:
                 else:
                     results.append(("REGRESSION", speedup, [], None))
 
+            if return_baseline:
+                return results, baseline
             return results
 
         except Exception as e:
             logger.error(f"Batch validation failed: {e}")
-            return [("ERROR", 0.0, [str(e)], "execution")] * len(optimized_sqls)
+            error_results = [("ERROR", 0.0, [str(e)], "execution")] * len(optimized_sqls)
+            if return_baseline:
+                return error_results, baseline
+            return error_results
         finally:
             validator.close()
 
@@ -1547,7 +1563,7 @@ class Pipeline:
         global_knowledge, semantic_intents, matched_examples,
         all_available_examples, engine_profile, constraints,
         regression_warnings, strategy_leaderboard, query_archetype,
-        resource_envelope, exploit_algorithm_text.
+        resource_envelope, exploit_algorithm_text, detected_transforms.
         """
         from .prompter import (
             _load_constraint_files,
@@ -1638,6 +1654,17 @@ class Pipeline:
                     f"[{query_id}] Failed to load PG system profile: {e}"
                 )
 
+        # Detected transforms (top-5 by precondition feature overlap)
+        detected_transforms = []
+        try:
+            from .detection import detect_transforms, load_transforms
+            all_transforms = load_transforms()
+            engine_name = "duckdb" if dialect in ("duckdb",) else "postgresql"
+            detected = detect_transforms(sql, all_transforms, engine=engine_name, dialect=dialect)
+            detected_transforms = detected[:5]
+        except Exception as e:
+            logger.warning(f"[{query_id}] Failed to detect transforms: {e}")
+
         ctx = {
             "explain_plan_text": explain_plan_text,
             "plan_scanner_text": plan_scanner_text,
@@ -1652,6 +1679,7 @@ class Pipeline:
             "query_archetype": query_archetype,
             "resource_envelope": resource_envelope,
             "exploit_algorithm_text": exploit_algorithm_text,
+            "detected_transforms": detected_transforms,
         }
         self._enforce_intelligence_gates(query_id=query_id, dialect=dialect, ctx=ctx)
         return ctx
