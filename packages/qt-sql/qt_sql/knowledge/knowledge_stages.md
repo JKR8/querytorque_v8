@@ -1,8 +1,12 @@
 # Knowledge Stages
 
 How raw experimental data becomes actionable rewrite intelligence.
-Each stage distills the previous one — hundreds of trials compress to
-a handful of pathology cards that an LLM analyst can walk in seconds.
+
+> **Architecture Decision (Feb 2026):** Stages 1-3 were originally separate
+> artifacts. Stage 3 (pathology cards) has been **eliminated as a separate
+> layer** — its content is folded directly into the Stage 4 dialect files.
+> This reduces maintenance burden and eliminates synchronization bugs between
+> intermediate files. The distilled algorithm IS the pathology card now.
 
 ---
 
@@ -12,42 +16,49 @@ a handful of pathology cards that an LLM analyst can walk in seconds.
 
 **Status:** IMPLEMENTED — `knowledge/trials.jsonl` (25 gold), full corpus in benchmark learning dirs
 
+### Template: Trial Record
+
 ```json
 {
   "query_id": "Q39",
   "transform": "self_join_decomposition",
   "trial_round": "swarm_w2",
-  "original_sql": "WITH inv AS (...) SELECT ... FROM inv inv1, inv inv2 WHERE inv1.d_moy=1 AND inv2.d_moy=2",
-  "rewritten_sql": "WITH month1_stats AS (...), month2_stats AS (...) SELECT ... JOIN ...",
+  "original_sql": "<full SQL>",
+  "rewritten_sql": "<full SQL>",
   "baseline_ms": 142.3,
   "rewrite_ms": 29.9,
-  "speedup": "4.76x",
+  "speedup": 4.76,
   "rows_match": true,
-  "explain_before": { "..." : "..." },
-  "explain_after": { "..." : "..." },
-  "tags": ["self_join_cte", "discriminator_filter", "comma_join"],
-  "preconditions_matched": ["SELF_JOIN_CTE_DISCRIMINATOR"]
+  "tags": ["self_join_cte", "discriminator_filter", "comma_join"]
 }
 ```
 
-One per attempt. Hundreds of these. Most are noise — failed attempts,
-marginal wins, regressions.
+**Required fields:** query_id, transform, speedup, rows_match
+**One per attempt.** Hundreds of these. Most are noise — failed attempts,
+marginal wins, regressions. Never curate this layer — keep everything.
 
 ---
 
-## Stage 2: Gold Examples + Regressions
+## Stage 2: Gold Examples
 
 **Purpose:** Promoted specimens. Each is a verified win or an instructive
-failure, with the reasoning extracted.
+failure, with the reasoning extracted. These are loaded into worker prompts
+to show concrete before/after patterns.
 
-**Status:** IMPLEMENTED — `examples/duckdb/` (16 wins + 10 regressions), `examples/postgres/` (6 wins)
+**Status:** IMPLEMENTED — `examples/duckdb/` (22 files), `examples/postgres/` (14 files)
+
+### Template: Gold Example
+
+**File:** `examples/{dialect}/{transform_name}.json`
 
 ```json
 {
   "id": "self_join_decomposition",
   "type": "win",
   "verified_speedup": "4.76x",
+  "benchmark": "TPC-DS",
   "benchmark_queries": ["Q39"],
+  "engine": "duckdb",
 
   "example": {
     "input_slice": "CTE self-joined with inv1.d_moy=1 AND inv2.d_moy=2",
@@ -62,158 +73,119 @@ failure, with the reasoning extracted.
     "when_not_to_use": "Only when CTE is self-joined with different discriminator values. Same filter on both aliases = no benefit."
   },
 
-  "original_sql": "...",
-  "optimized_sql": "...",
+  "original_sql": "<full original SQL>",
+  "optimized_sql": "<full optimized SQL>",
   "explain_before_summary": "Sequential scan on inventory (7.2M rows) → GROUP BY → materialize → filter d_moy=1 (keeps 600K)",
   "explain_after_summary": "Sequential scan on inventory with d_moy=1 pushed (600K rows) → GROUP BY → hash join"
 }
 ```
 
-Curated. ~30 total. Each one is evidence for a specific pathology.
+**Required fields:** id, type, verified_speedup, example.input_slice, example.key_insight, example.when_not_to_use, original_sql, optimized_sql
+
+**What makes a good gold example:**
+- Verified speedup >= 1.10x on production benchmark (3-run validated)
+- Clear before/after SQL showing exactly what changed
+- `key_insight` explains WHY it's faster at the engine level (not just WHAT changed)
+- `when_not_to_use` documents the failure mode (every transform has one)
+- Regression examples are equally valuable — they prevent workers from repeating mistakes
+
+**Promotion criteria (trial → gold):**
+1. Speedup verified on SF10 (not just SF1)
+2. Row count matches (correctness proven)
+3. Transform is reusable (not query-specific hack)
+4. Key insight generalizes to other queries
 
 ---
 
-## Stage 3: Pathology Cards
+## ~~Stage 3: Pathology Cards~~ (ELIMINATED)
 
-**Purpose:** The reusable knowledge. Explains WHY something is expensive
-at the engine level, not just WHAT to do about it. This is where
-generalization lives — the IMPLICATION section connects individual gold
-examples to the underlying engine limitation and predicts novel
-manifestations.
-
-**Status:** IMPLEMENTED — `knowledge/decisions.md` (10 cards), `knowledge/decision_card_template.md`
-
-```yaml
-pathology: full_materialization_with_late_filter
-
-surface_cost: >
-  CTE materializes N rows, outer query filters to N/K afterward.
-  Work wasted: (K-1)/K of materialization is discarded.
-
-engine_gap: CROSS_CTE_PREDICATE_BLINDNESS
-engine_mechanism: >
-  DuckDB plans each CTE as an independent subplan. Predicates
-  from outer query (WHERE, JOIN ON, self-join discriminators)
-  cannot propagate backward into CTE definitions. The CTE
-  materializes blind to how its output will be consumed.
-
-implication: >
-  Same gap manifests as:
-  - Dimension filters not reaching fact table CTEs
-  - Self-join discriminator not reaching CTE GROUP BY
-  - Scalar subquery results not flowing into referencing CTEs
-  - HAVING thresholds not constraining CTE materialization
-  Any time information from one scope needs to constrain
-  another scope's materialization, this gap applies.
-
-detection:
-  explain_signals:
-    - CTE scan output >> post-filter output (ratio > 5:1)
-    - Filter node appears ABOVE materialization node
-    - Same CTE referenced 2+ times with different WHERE
-  sql_signals:
-    - CTE self-joined with different literal values
-    - WHERE on CTE alias column that could have been in CTE definition
-
-restructuring_principle: >
-  Move the discriminating predicate INTO the CTE definition.
-  If self-joined, split into N separate CTEs each embedding
-  their discriminator. Result: each CTE materializes only
-  the rows it needs.
-
-risk_calibration:
-  expected_range: "1.3x - 4.8x"
-  worst_regression: "0.85x (Q67 — ROLLUP blocked pushdown)"
-  regression_signals:
-    - ROLLUP or WINDOW in same query (blocks further pushdown)
-    - Baseline < 100ms (CTE overhead exceeds savings)
-    - 3+ fact tables (materializing early locks join order)
-
-gold_example_ids:
-  wins: [self_join_decomposition, date_cte_isolate, dimension_cte_isolate]
-  regressions: [regression_q25_date_cte_isolate, regression_q67]
-```
-
-~10 of these, one per engine gap. This is the layer that connects
-individual gold examples to the underlying engine limitation and
-predicts novel manifestations.
+> **MERGED INTO STAGE 4.** Pathology cards (engine gaps, detection signals,
+> restructuring principles, risk calibration, gold example routing) are now
+> embedded directly in the per-dialect distilled algorithm files. There is
+> no separate intermediate representation.
+>
+> **Rationale:** Maintaining pathology cards as separate YAML/JSON files
+> created a synchronization problem — the cards would drift from the
+> distilled algorithm, and neither the analyst nor workers ever saw the
+> raw cards. Folding them into Stage 4 means one file to update, one file
+> to review, one file loaded into the prompt.
+>
+> **Deleted files:** `decisions.md`, `decision_card_template.md`,
+> `duckdb_decision_tree.md` — all superseded by `{dialect}.md`.
 
 ---
 
-## Stage 4: Distilled Algorithm
+## Stage 4: Distilled Algorithm (THE ACTIVE LAYER)
 
-**Purpose:** What the analyst and workers actually see. Compressed from
-the pathology cards into a walkable tree with global guards, pathology
-detection, decision gates, and gold example routing.
+**Purpose:** What the analyst and workers actually see. Contains pathology
+detection, decision gates, risk calibration, gold example routing, global
+guards, verification checklist, pruning guide, and regression registry —
+all in a single walkable document per engine.
 
-**Status:** IMPLEMENTED — `knowledge/duckdb.md` (11KB), `knowledge/postgresql.md` (4KB)
+**Status:** IMPLEMENTED
+- `knowledge/duckdb.md` — 299 lines, 10 pathologies (P0-P9)
+- `knowledge/postgresql.md` — 356 lines, 7 pathologies (P1-P7)
+
+Loaded into the analyst prompt via `prompter.py::load_exploit_algorithm()`.
+This is the tip of the spear — every optimization session starts here.
+
+### Template: Pathology (inside {dialect}.md)
+
+A **pathology** is a recurring engine-level inefficiency that the optimizer
+cannot fix on its own. It has a root cause (the engine gap), observable
+symptoms (detection signals), a known fix (restructuring principle), and
+calibrated risk. Each pathology is a section in the dialect file:
 
 ```markdown
-# DuckDB Query Rewrite Decision Tree
-
-## GLOBAL GUARDS (check always, before any rewrite)
-- EXISTS/NOT EXISTS → never materialize (0.14x Q16)
-- Same-column OR → never split (0.23x Q13)
-- Baseline < 100ms → skip CTE-based rewrites
-- 3+ fact table joins → do not pre-materialize facts
-
-## PATHOLOGY DETECTION (read explain plan, identify expensive nodes)
-
-### P1: Repeated scan of same table
-  Explain signal: same table name appears N times in plan
-  → DECISION: Consolidate to single pass with CASE WHEN
-  → Gates: max 8 branches, all scans must share same join structure
-  → Expected: 1.3x-6.2x | Worst: no known regressions
-  → Workers get: Q88 (6.24x), Q9 (4.47x), Q90 (1.47x)
-
-### P2: CTE materialization >> post-filter output
-  Explain signal: materialize node rows >> WHERE-filtered rows
-  → DECISION A: Self-joined CTE? Split by discriminator
-    → Gates: 2-4 discriminator values, ratio > 5:1
-    → Expected: 1.3x-4.8x | Worst: 0.85x (ROLLUP present)
-    → Workers get: Q39 (4.76x), Q67 warning
-  → DECISION B: Dimension filter above join? Isolate into CTE
-    → Gates: selectivity < 10%, not 3+ fact joins
-    → Expected: 1.3x-4.0x | Worst: 0.0076x (dim cross-join)
-    → Workers get: Q6 (4.00x), Q43 (2.71x), Q80 warning
-
-### P3: Nested loop with high outer cardinality
-  Explain signal: nested loop, outer > 1000 rows, inner is scan
-  → DECISION: Decorrelate to CTE + GROUP BY + hash join
-  → Gates: not EXISTS, not already hash join, filter preserved
-  → Expected: 2.0x-2.9x | Worst: 0.34x (was already semi-join)
-  → Workers get: Q1 (2.92x), Q93 regression, Q35 (2.42x)
-
-### P4: Aggregation over large joined result
-  Explain signal: GROUP BY input rows >> distinct key count
-  → DECISION: Push aggregation below join
-  → Gates: GROUP BY keys ⊇ join keys, reconstruct AVG from SUM/COUNT
-  → Expected: 2x-43x | Worst: no known regressions
-  → Workers get: Q22 (42.90x)
-
-### P5: LEFT JOIN with NULL-eliminating WHERE
-  Explain signal: LEFT JOIN output ≈ INNER JOIN output
-  → DECISION: Convert to INNER JOIN
-  → Gates: WHERE references right-table column, no CASE WHEN IS NULL
-  → Expected: 2x-3.4x | Worst: no known regressions
-  → Workers get: Q93 (3.44x)
-
-### P6: Cross-column OR forcing full scan
-  Explain signal: sequential scan with complex OR, no index usage
-  → DECISION: Split to UNION ALL per branch
-  → Gates: max 3 branches, different columns, no self-join
-  → Expected: 1.5x-6.3x | Worst: 0.23x (9 branches from nested OR)
-  → Workers get: Q15 (3.17x), Q13 regression
-
-### NO MATCH
-  Record: which pathologies were checked, which gates failed
-  Nearest miss: closest pathology + why it didn't qualify
-  Features present: [list structural features for future pattern discovery]
-  → Workers get: broad gold example set, analyst's manual reasoning
+### P{N}: {Human-readable name}
+  Engine gap: {GAP_NAME} from engine_profile_{dialect}.json
+  Explain signal: {what to look for in EXPLAIN ANALYZE output}
+  SQL signal: {what to look for in the SQL text}
+  → DECISION: {what restructuring to apply}
+  → Gates: {conditions that MUST hold, or skip this pathology}
+  → Expected: {speedup range}x | Worst: {worst regression}x ({query + root cause})
+  → Gold examples: {which examples workers should see, with speedups}
 ```
 
-One document per engine. This replaces the old constraint files and
-engine profiles as the primary analyst intelligence.
+**Required sections per pathology:**
+1. **Engine gap** — links to the engine profile entry explaining WHY the optimizer fails
+2. **Detection signals** — EXPLAIN-based (preferred) and SQL-based (fallback)
+3. **Decision** — the specific restructuring principle to apply
+4. **Gates** — hard constraints; if any gate fails, skip this pathology entirely
+5. **Risk calibration** — expected speedup range AND worst known regression with root cause
+6. **Gold example routing** — specific example IDs + their speedups
+
+**What makes a pathology (vs just a transform):**
+- A pathology explains the ENGINE LIMITATION, not just the rewrite trick
+- It predicts NOVEL manifestations ("same gap shows up when...")
+- It has calibrated risk from real benchmark data
+- It routes to specific gold examples as evidence
+
+**What is NOT a pathology:**
+- A single transform with one example (that's just a gold example)
+- A general SQL best practice ("use EXISTS instead of IN")
+- A rewrite that only works on one specific query shape
+
+### Supporting sections in {dialect}.md
+
+Beyond the pathology list, each dialect file also contains:
+
+```markdown
+# HOW TO USE THIS DOCUMENT
+{Instructions for the analyst on how to walk the pathology list}
+
+# SAFETY RANKING
+{Pathologies ordered by risk, safest first}
+
+# VERIFICATION CHECKLIST
+{Post-rewrite checks that must pass before declaring a win}
+
+# PRUNING GUIDE
+{When to skip entire pathologies based on query structure}
+
+# REGRESSION REGISTRY
+{Every known regression with root cause and avoidance rule}
+```
 
 ---
 
@@ -222,64 +194,25 @@ engine profiles as the primary analyst intelligence.
 **Purpose:** At inference time, prune branches the analyst never needs
 to read. Based on what's actually in the EXPLAIN plan, not the SQL.
 
-**Status:** NOT IMPLEMENTED — requires EXPLAIN plan parsing infrastructure
-and dynamic prompt assembly. Significant engineering effort.
-
-```yaml
-pruning_rules:
-  # Explain-plan based (preferred — more reliable than SQL parsing)
-  - if: no nested_loop nodes in plan
-    prune: P3 (decorrelation)
-
-  - if: each table appears only once in plan
-    prune: P1 (repeated scans)
-
-  - if: no CTE materialization nodes in plan
-    prune: P2 (CTE materialization issues)
-
-  - if: no LEFT JOIN nodes in plan
-    prune: P5 (LEFT→INNER conversion)
-
-  - if: no OR predicates in plan filter nodes
-    prune: P6 (OR decomposition)
-
-  # SQL-based fallback (when explain plan isn't detailed enough)
-  - if: no GROUP BY in SQL
-    prune: P4 (aggregate pushdown)
-
-  - if: no WINDOW/OVER in SQL
-    prune: deferred_window_aggregation path
-
-  # Combined
-  - if: baseline_ms < 100
-    prune: ALL CTE-based rewrites (overhead exceeds savings)
-```
-
-Pruning is by EXPLAIN plan content first, SQL content as fallback.
-EXPLAIN is more reliable because it shows what the optimizer actually
-did, not what the SQL suggests. A query might have a correlated
-subquery in the SQL but the EXPLAIN shows a hash join — the optimizer
-already fixed it, so pruning P3 is correct.
-
-**Engineering required:** EXPLAIN plan parser (per engine), pruning
-rule evaluator, dynamic prompt assembler that emits only relevant
-branches + their gold examples.
+**Status:** PARTIALLY IMPLEMENTED — `tag_index.py::extract_explain_features()`
+extracts 6 structural features. Full dynamic pruning not yet wired into
+prompt assembly.
 
 ---
 
-## The Full Pipeline
+## The Actual Pipeline (as-built)
 
 ```
 Trial JSON (hundreds)
   → promote/curate →
-Gold Examples (20-40)
-  → extract engine mechanisms →
-Pathology Cards (7-10)
-  → compress to walkable tree →
-Distilled Algorithm (1 doc per engine)
-  → [future] prune at inference by EXPLAIN plan →
-Analyst sees only relevant branches
-  → analyst picks pathologies, routes gold examples →
+Gold Examples (~36)
+  → extract engine mechanisms, fold into dialect doc →
+Distilled Algorithm (1 doc per engine, includes pathologies)
+  → analyst reads, picks pathologies, routes gold examples →
 Workers produce rewrites
   → validate → new Trial JSON (loop)
 ```
+
+Note: no separate "pathology card" artifact exists. The distilled
+algorithm file IS the pathology card, the decision tree, the
+regression registry, and the pruning guide — all in one.
