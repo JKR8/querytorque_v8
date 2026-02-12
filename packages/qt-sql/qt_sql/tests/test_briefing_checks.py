@@ -105,9 +105,54 @@ def test_analyst_prompt_includes_section_validation_checklist() -> None:
     )
 
     assert "## Section Validation Checklist (MUST pass before final output)" in prompt
-    assert "`SEMANTIC_CONTRACT`: 80-150 tokens" in prompt
+    assert "`SEMANTIC_CONTRACT`: 40-200 tokens" in prompt
     assert "`NODE_CONTRACTS`: every logical tree node has a contract" in prompt
     assert "WORKER 4 EXPLORATION FIELDS" in prompt
+
+
+def test_analyst_prompt_exploit_algorithm_branch() -> None:
+    """Exploit algorithm text replaces engine profile and uses correct framing."""
+    dag = QueryLogicalTree(
+        nodes={
+            "main_query": LogicalTreeNode(
+                node_id="main_query",
+                node_type="main",
+                sql="SELECT 1",
+                tables=["t1"],
+                refs=[],
+                flags=[],
+            )
+        },
+        edges=[],
+        original_sql="SELECT 1",
+    )
+
+    fake_algo = "## Pathology P1: comma join\n\nSome exploit steps here."
+    prompt = build_analyst_briefing_prompt(
+        query_id="q_algo",
+        sql="SELECT 1",
+        explain_plan_text=None,
+        dag=dag,
+        costs={},
+        semantic_intents=None,
+        global_knowledge=None,
+        matched_examples=[],
+        all_available_examples=[],
+        constraints=[],
+        regression_warnings=None,
+        dialect="postgresql",
+        exploit_algorithm_text=fake_algo,
+        engine_profile={"briefing_note": "should not appear"},
+    )
+
+    # Exploit algorithm section present with correct framing (§4 header)
+    assert "## §4. Exploit Algorithm: Evidence-Based Gap Intelligence" in prompt
+    assert fake_algo in prompt
+    # Framing does NOT say "YAML"
+    assert "YAML" not in prompt
+    # Engine profile section NOT present (exploit algorithm replaces it)
+    assert "## §4. Engine Profile: Field Intelligence Briefing" not in prompt
+    assert "should not appear" not in prompt
 
 
 def test_worker_prompt_includes_rewrite_checklist() -> None:

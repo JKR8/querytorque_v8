@@ -596,7 +596,7 @@ def _section_strategy_leaderboard(
     if not arch_summary:
         return ""
 
-    lines.append(f"## Strategy Leaderboard (observed success rates)")
+    lines.append(f"### Strategy Leaderboard (observed success rates)")
     lines.append("")
     lines.append(
         f"Archetype: **{archetype}** ({arch_summary['query_count']} queries in pool, "
@@ -680,6 +680,15 @@ def build_analyst_briefing_prompt(
     etc.). What varies: role framing, output format, strategy rules, and
     exploration budget.
 
+    Prompt structure (7 sections):
+      §1. ROLE & MISSION — framing + information asymmetry
+      §2. INPUT PACKAGE — SQL, EXPLAIN, logic tree, semantic intent, iteration history
+      §3. CONSTRAINTS — correctness gates + aggregation rules
+      §4. ENGINE PROFILE — exploit algorithm / gap profiles, regressions, resources
+      §5. TRANSFORM CATALOG — transforms, example library, optimization principles
+      §6. REASONING PROCESS — reasoning steps + strategy selection rules
+      §7. OUTPUT SPECIFICATION — format, checklist, exploration rules, consumption spec
+
     Args:
         query_id: Query identifier (e.g., 'query_74')
         sql: Original SQL query
@@ -716,7 +725,11 @@ def build_analyst_briefing_prompt(
         raise ValueError(f"Invalid mode: {mode!r}. Must be 'swarm', 'expert', or 'oneshot'.")
     lines: list[str] = []
 
-    # ── 1. Role ──────────────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # §1. ROLE & MISSION
+    # ═══════════════════════════════════════════════════════════════════════
+    lines.append("## §1. ROLE & MISSION")
+    lines.append("")
     if mode == "swarm":
         lines.append(
             "You are a senior query optimization architect. Your job is to deeply "
@@ -757,12 +770,15 @@ def build_analyst_briefing_prompt(
         )
     lines.append("")
 
-    # ── 2. SQL with line numbers ─────────────────────────────────────────
-    lines.append(f"## Query: {query_id}")
+    # ═══════════════════════════════════════════════════════════════════════
+    # §2. INPUT PACKAGE
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── §2a. Original Query ──────────────────────────────────────────────
     dialect_str = dialect
     if dialect_version:
         dialect_str += f" v{dialect_version}"
-    lines.append(f"## Dialect: {dialect_str}")
+    lines.append(f"## §2a. Original Query: {query_id} ({dialect_str})")
     lines.append("")
     clean_sql = _strip_template_comments(sql)
     lines.append("```sql")
@@ -770,16 +786,16 @@ def build_analyst_briefing_prompt(
     lines.append("```")
     lines.append("")
 
-    # ── 3. EXPLAIN plan ─────────────────────────────────────────────────
+    # ── §2b. EXPLAIN Plan ────────────────────────────────────────────────
     is_estimate_plan = False  # hoisted for use in reasoning step 2
     if explain_plan_text:
         formatted_plan = format_duckdb_explain_tree(explain_plan_text)
         # Detect estimate-only plans (no actual timing data)
         is_estimate_plan = "est_rows=" in formatted_plan or "EXPLAIN only" in formatted_plan
         if is_estimate_plan:
-            lines.append("## EXPLAIN Plan (planner estimates)")
+            lines.append("## §2b. EXPLAIN Plan (planner estimates)")
         else:
-            lines.append("## EXPLAIN ANALYZE Plan")
+            lines.append("## §2b. EXPLAIN ANALYZE Plan")
         lines.append("")
         lines.append("```")
         # Truncate very long plans to ~150 lines
@@ -792,36 +808,27 @@ def build_analyst_briefing_prompt(
         lines.append("```")
         lines.append("")
         lines.append(
-            "**NOTE:** The EXPLAIN plan shows the PHYSICAL execution structure, which "
-            "may differ significantly from the logical tree below. The optimizer may have "
-            "already split CTEs, reordered joins, or pushed predicates. When the EXPLAIN "
-            "and the logical tree disagree, the EXPLAIN is ground truth for what the optimizer is "
-            "already doing."
+            "**NOTE:** EXPLAIN shows PHYSICAL execution — ground truth when it "
+            "disagrees with the logical tree (optimizer may already split CTEs, "
+            "push predicates, reorder joins)."
         )
-        lines.append("")
         if dialect == "duckdb":
             lines.append(
-                "DuckDB EXPLAIN ANALYZE reports **operator-exclusive** wall-clock time "
-                "per node (children's time is NOT included in the parent's reported time). "
-                "The percentage annotations are also exclusive. You can sum sibling nodes "
-                "to get pipeline cost. logical-tree cost percentages are derived metrics that may "
-                "not reflect actual execution time — use EXPLAIN timings as ground truth."
+                "DuckDB times are **operator-exclusive** (children excluded). "
+                "Sum siblings for pipeline cost. Use EXPLAIN timings, not logical-tree %."
             )
         elif is_estimate_plan:
             lines.append(
-                "This is a plan-only EXPLAIN (no ANALYZE). Row counts and costs are "
-                "planner predictions — use them directionally but flag your diagnosis as "
-                "lower-confidence. Fall back to schema-based reasoning (table sizes, index "
-                "selectivity, join fan-out) to validate planner estimates."
+                "Estimate-only plan — use directionally, cross-check against "
+                "schema knowledge (table sizes, index selectivity)."
             )
         else:
             lines.append(
-                "Use EXPLAIN ANALYZE timings as ground truth. logical-tree cost percentages are "
-                "derived metrics that may not reflect actual execution time."
+                "Use EXPLAIN ANALYZE timings as ground truth, not logical-tree %."
             )
         lines.append("")
     else:
-        lines.append("## EXPLAIN Plan")
+        lines.append("## §2b. EXPLAIN Plan")
         lines.append("")
         lines.append(
             "*EXPLAIN plan not available for this query. "
@@ -829,9 +836,9 @@ def build_analyst_briefing_prompt(
         )
         lines.append("")
 
-    # ── 3.5. Plan-Space Scanner Intelligence ─────────────────────────────
+    # Plan-Space Scanner Intelligence (appended to §2b)
     if plan_scanner_text:
-        lines.append("## Plan-Space Scanner Intelligence")
+        lines.append("### Plan-Space Scanner Intelligence")
         lines.append("")
         lines.append(plan_scanner_text)
         lines.append("")
@@ -840,7 +847,7 @@ def build_analyst_briefing_prompt(
             lines.append(algo_text)
             lines.append("")
 
-    # ── 4. Query Structure (Logic Tree + condensed node details) ─────────
+    # ── §2c. Query Structure (Logic Tree + condensed node details) ───────
     from ..logic_tree import build_logic_tree
     from ..analyst import _append_dag_analysis
     from ..prompter import _build_node_intent_map
@@ -851,8 +858,7 @@ def build_analyst_briefing_prompt(
         if query_intent and "main_query" not in node_intents:
             node_intents["main_query"] = query_intent
 
-    # Logic Tree overview
-    lines.append("## Query Structure (Logic Tree)")
+    lines.append("## §2c. Query Structure (Logic Tree)")
     lines.append("")
     tree = build_logic_tree(sql, dag, costs, dialect, node_intents)
     lines.append("```")
@@ -861,16 +867,16 @@ def build_analyst_briefing_prompt(
     lines.append("")
 
     # Condensed per-node detail cards (analyst needs join/filter details)
-    lines.append("## Node Details")
+    lines.append("### Node Details")
     lines.append("")
     _append_dag_analysis(lines, dag, costs, dialect=dialect, node_intents=node_intents)
     lines.append("")
 
-    # ── 5. Semantic intents (if available) ───────────────────────────────
+    # ── §2d. Semantic Intent (if available) ──────────────────────────────
     if semantic_intents:
         query_intent = semantic_intents.get("query_intent", "")
         if query_intent:
-            lines.append("## Pre-Computed Semantic Intent")
+            lines.append("## §2d. Pre-Computed Semantic Intent")
             lines.append("")
             lines.append(f"**Query intent:** {query_intent}")
             lines.append("")
@@ -884,8 +890,58 @@ def build_analyst_briefing_prompt(
     # When no pre-computed intents exist, omit this section entirely.
     # The analyst's task already requires producing SEMANTIC_CONTRACT output.
 
-    # ── 5b. Aggregation Semantics Check ───────────────────────────────
-    lines.append("## Aggregation Semantics Check")
+    # ── §2e. Iteration History (expert/oneshot iterative mode) ───────────
+    if iteration_history and iteration_history.get("attempts"):
+        lines.append("## §2e. Previous Optimization Attempts")
+        lines.append("")
+        lines.append(
+            "The following attempts have already been tried. "
+            "Do NOT repeat strategies that regressed or failed. "
+            "Build on what worked; avoid what didn't."
+        )
+        lines.append("")
+        for i, attempt in enumerate(iteration_history["attempts"]):
+            status = attempt.get("status", "unknown")
+            speedup = attempt.get("speedup", 0)
+            transforms = attempt.get("transforms", [])
+            t_str = ", ".join(transforms) if transforms else "unknown"
+            if status in ("error", "ERROR"):
+                error = attempt.get("error", "")
+                lines.append(f"- Attempt {i+1}: **{t_str}** → ERROR: {error}")
+            elif speedup < 0.95:
+                lines.append(f"- Attempt {i+1}: **{t_str}** → REGRESSION ({speedup:.2f}x)")
+            elif speedup >= 1.10:
+                lines.append(f"- Attempt {i+1}: **{t_str}** → WIN ({speedup:.2f}x)")
+            else:
+                lines.append(f"- Attempt {i+1}: **{t_str}** → NEUTRAL ({speedup:.2f}x)")
+            # Include failure analysis if present
+            failure_analysis = attempt.get("failure_analysis", "")
+            if failure_analysis and status not in ("WIN", "IMPROVED"):
+                preview = failure_analysis[:200] + "..." if len(failure_analysis) > 200 else failure_analysis
+                lines.append(f"  Analysis: {preview}")
+        lines.append("")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # §3. CONSTRAINTS (hard rules — check always)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── §3a. Correctness Constraints (non-negotiable validation gates) ───
+    correctness_constraints = [
+        c for c in constraints
+        if c.get("id") in (
+            "LITERAL_PRESERVATION", "SEMANTIC_EQUIVALENCE",
+            "COMPLETE_OUTPUT", "CTE_COLUMN_COMPLETENESS",
+        )
+    ]
+    if correctness_constraints:
+        lines.append(f"## §3a. Correctness Constraints ({len(correctness_constraints)} — NEVER violate)")
+        lines.append("")
+        for c in correctness_constraints:
+            lines.append(_format_constraint_for_analyst(c))
+            lines.append("")
+
+    # ── §3b. Aggregation Equivalence Rules ───────────────────────────────
+    lines.append("## §3b. Aggregation Equivalence Rules")
     lines.append("")
     lines.append(
         "You MUST verify aggregation equivalence for any proposed restructuring:"
@@ -919,77 +975,14 @@ def build_analyst_briefing_prompt(
     )
     lines.append("")
 
-    # ── 6. Tag-matched examples (specific to this query, shown first) ──
-    if matched_examples:
-        lines.append(f"## Top {len(matched_examples)} Tag-Matched Examples")
-        lines.append("")
-        for ex in matched_examples:
-            lines.append(_format_example_full(ex))
-            lines.append("")
-
-    # ── 7. Additional examples not in tag-matched set (compact) ──────────
-    if all_available_examples:
-        matched_ids = {ex.get("id") for ex in matched_examples} if matched_examples else set()
-        additional = [ex for ex in all_available_examples if ex.get("id") not in matched_ids]
-        if additional:
-            lines.append("## Additional Examples (not tag-matched to this query)")
-            lines.append("")
-            for ex in additional:
-                lines.append(_format_example_compact(ex))
-            lines.append("")
-
-    # ── 8. Global optimization principles ────────────────────────────────
-    if global_knowledge:
-        lines.append("## Optimization Principles (from benchmark history)")
-        lines.append("")
-        lines.append(_format_global_knowledge(global_knowledge))
-        lines.append("")
-
-    # ── 9. Regression examples (the ONLY anti-pattern section) ─────────
-    if regression_warnings:
-        lines.append("## Regression Examples")
-        lines.append("")
-        for reg in regression_warnings:
-            lines.append(_format_regression_for_analyst(reg))
-            lines.append("")
-
-    # ── 9b. Iteration History (expert/oneshot iterative mode) ────────────
-    if iteration_history and iteration_history.get("attempts"):
-        lines.append("## Previous Optimization Attempts on This Query")
-        lines.append("")
-        lines.append(
-            "The following attempts have already been tried. "
-            "Do NOT repeat strategies that regressed or failed. "
-            "Build on what worked; avoid what didn't."
-        )
-        lines.append("")
-        for i, attempt in enumerate(iteration_history["attempts"]):
-            status = attempt.get("status", "unknown")
-            speedup = attempt.get("speedup", 0)
-            transforms = attempt.get("transforms", [])
-            t_str = ", ".join(transforms) if transforms else "unknown"
-            if status in ("error", "ERROR"):
-                error = attempt.get("error", "")
-                lines.append(f"- Attempt {i+1}: **{t_str}** → ERROR: {error}")
-            elif speedup < 0.95:
-                lines.append(f"- Attempt {i+1}: **{t_str}** → REGRESSION ({speedup:.2f}x)")
-            elif speedup >= 1.10:
-                lines.append(f"- Attempt {i+1}: **{t_str}** → WIN ({speedup:.2f}x)")
-            else:
-                lines.append(f"- Attempt {i+1}: **{t_str}** → NEUTRAL ({speedup:.2f}x)")
-            # Include failure analysis if present
-            failure_analysis = attempt.get("failure_analysis", "")
-            if failure_analysis and status not in ("WIN", "IMPROVED"):
-                preview = failure_analysis[:200] + "..." if len(failure_analysis) > 200 else failure_analysis
-                lines.append(f"  Analysis: {preview}")
-        lines.append("")
-
-    # ── 10. Exploit Algorithm or Engine Profile ──────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # §4. ENGINE PROFILE (reference knowledge)
+    # ═══════════════════════════════════════════════════════════════════════
     if exploit_algorithm_text:
-        lines.append("## Exploit Algorithm: Evidence-Based Gap Intelligence")
+        lines.append("## §4. Exploit Algorithm: Evidence-Based Gap Intelligence")
         lines.append("")
         lines.append(
-            "The following YAML describes known optimizer gaps with detection rules, "
+            "The following describes known optimizer gaps with detection rules, "
             "procedural exploit steps, and evidence. Use DETECT rules to match "
             "structural features of the query, then follow EXPLOIT_STEPS."
         )
@@ -998,7 +991,7 @@ def build_analyst_briefing_prompt(
         lines.append("")
     elif engine_profile:
         briefing_note = engine_profile.get("briefing_note", "")
-        lines.append("## Engine Profile: Field Intelligence Briefing")
+        lines.append("## §4. Engine Profile: Field Intelligence Briefing")
         lines.append("")
         if briefing_note:
             lines.append(f"*{briefing_note}*")
@@ -1065,9 +1058,12 @@ def build_analyst_briefing_prompt(
             lines.append(f"**SCALE WARNING**: {scale_warn}")
             lines.append("")
 
-    # ── 10a. Resource Envelope (PostgreSQL only — passed through to workers) ──
+    # Regression examples: covered by REGRESSION REGISTRY table in the
+    # knowledge/{dialect}.md blob above. No separate narrative section needed.
+
+    # Resource Envelope (PostgreSQL only — passed through to workers)
     if dialect in ("postgresql", "postgres") and resource_envelope:
-        lines.append("## System Resource Envelope (PostgreSQL)")
+        lines.append("### System Resource Envelope (PostgreSQL)")
         lines.append("")
         lines.append(
             "Workers will use this to size SET LOCAL parameters for their rewrites. "
@@ -1078,9 +1074,9 @@ def build_analyst_briefing_prompt(
         lines.append(resource_envelope)
         lines.append("")
 
-    # ── 10a2. Detected Transforms (structural feature match) ────────────
+    # Detected Transforms (structural feature match, under §4)
     if detected_transforms:
-        lines.append("## Detected Transforms: Structural Feature Match")
+        lines.append("### Detected Transforms: Structural Feature Match")
         lines.append("")
         lines.append(
             "Transforms ranked by precondition feature overlap with THIS query. "
@@ -1100,23 +1096,148 @@ def build_analyst_briefing_prompt(
                     lines.append(f"  ⚠ {ci['id']}: {ci['instruction']}")
             lines.append("")
 
-    # ── 10b. Correctness Constraints (non-negotiable validation gates) ────
-    correctness_constraints = [
-        c for c in constraints
-        if c.get("id") in (
-            "LITERAL_PRESERVATION", "SEMANTIC_EQUIVALENCE",
-            "COMPLETE_OUTPUT", "CTE_COLUMN_COMPLETENESS",
+    # ═══════════════════════════════════════════════════════════════════════
+    # §5. TRANSFORM CATALOG (action vocabulary)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── §5a. Transforms by Category ──────────────────────────────────────
+    lines.append("## §5a. Transform Catalog")
+    lines.append("")
+    if mode == "swarm":
+        lines.append(
+            "Select 4 transforms that are applicable to THIS query, maximizing "
+            "structural diversity (each must attack a different part of the "
+            "execution plan)."
         )
-    ]
-    if correctness_constraints:
-        lines.append(f"## Correctness Constraints ({len(correctness_constraints)} — NEVER violate)")
-        lines.append("")
-        for c in correctness_constraints:
-            lines.append(_format_constraint_for_analyst(c))
+    else:
+        lines.append(
+            "Select the best transform (or compound strategy of 2-3 transforms) "
+            "that maximizes expected speedup for THIS query."
+        )
+    lines.append("")
+    lines.append("### Predicate Movement")
+    lines.append(
+        "- **global_predicate_pushdown**: Trace selective predicates from late "
+        "in the CTE chain back to the earliest scan via join equivalences. "
+        "Biggest win when a dimension filter is applied after a large "
+        "intermediate materialization.\n"
+        "  Maps to examples: pushdown, early_filter, date_cte_isolate"
+    )
+    lines.append(
+        "- **transitive_predicate_propagation**: Infer predicates through join "
+        "equivalence chains (A.key = B.key AND B.key = 5 -> A.key = 5). "
+        "Especially across CTE boundaries where optimizers stop propagating.\n"
+        "  Maps to examples: early_filter, dimension_cte_isolate"
+    )
+    lines.append(
+        "- **null_rejecting_join_simplification**: When downstream WHERE "
+        "rejects NULLs from the outer side of a LEFT JOIN, convert to INNER. "
+        "Enables reordering and predicate pushdown. CHECK: does the query "
+        "actually have LEFT/OUTER joins before assigning this.\n"
+        "  Maps to examples: (no direct gold example — novel transform)"
+    )
+    lines.append("")
+    lines.append("### Join Restructuring")
+    lines.append(
+        "- **self_join_elimination**: When a UNION ALL CTE is self-joined N "
+        "times with each join filtering to a different discriminator, split "
+        "into N pre-partitioned CTEs. Eliminates discriminator filtering "
+        "and repeated hash probes on rows that don't match.\n"
+        "  Maps to examples: union_cte_split, shared_dimension_multi_channel"
+    )
+    lines.append(
+        "- **decorrelation**: Convert correlated EXISTS/IN/scalar subqueries "
+        "to CTE + JOIN. CHECK: does the query actually have correlated "
+        "subqueries before assigning this.\n"
+        "  Maps to examples: decorrelate, composite_decorrelate_union"
+    )
+    lines.append(
+        "- **aggregate_pushdown**: When GROUP BY follows a multi-table join but "
+        "aggregation only uses columns from one side, push the GROUP BY below "
+        "the join. CHECK: verify the join doesn't change row multiplicity "
+        "for the aggregate (one-to-many breaks AVG/STDDEV).\n"
+        "  Maps to examples: (no direct gold example — novel transform)"
+    )
+    lines.append(
+        "- **late_attribute_binding**: When a dimension table is joined only to "
+        "resolve display columns (names, descriptions) that aren't used in "
+        "filters, aggregations, or join conditions, defer that join until after "
+        "all filtering and aggregation is complete. Join on the surrogate key "
+        "once against the final reduced result set. This eliminates N-1 "
+        "dimension scans when the CTE references the dimension N times. "
+        "CHECK: verify the deferred columns aren't used in WHERE, GROUP BY, "
+        "or JOIN ON — only in the final SELECT.\n"
+        "  Maps to examples: dimension_cte_isolate (partial pattern), early_filter"
+    )
+    lines.append("")
+    lines.append("### Scan Optimization")
+    lines.append(
+        "- **star_join_prefetch**: Pre-filter ALL dimension tables into CTEs, "
+        "then probe fact table with the combined key intersection.\n"
+        "  Maps to examples: dimension_cte_isolate, multi_dimension_prefetch, "
+        "prefetch_fact_join, date_cte_isolate"
+    )
+    lines.append(
+        "- **single_pass_aggregation**: Merge N subqueries on the same fact "
+        "table into 1 scan with CASE/FILTER inside aggregates. "
+        "CHECK: STDDEV_SAMP/VARIANCE are grouping-sensitive — FILTER "
+        "over a combined group != separate per-group computation.\n"
+        "  Maps to examples: single_pass_aggregation, channel_bitmap_aggregation"
+    )
+    lines.append(
+        "- **scan_consolidation_pivot**: When a CTE is self-joined N times "
+        "with each reference filtering to a different discriminator (e.g., year, "
+        "channel), consolidate into fewer scans that GROUP BY the discriminator, "
+        "then pivot rows to columns using MAX(CASE WHEN discriminator = X THEN "
+        "agg_value END). This halves the fact scans and dimension joins. "
+        "SAFE when GROUP BY includes the discriminator — each group is naturally "
+        "partitioned, so aggregates like STDDEV_SAMP are computed correctly "
+        "per-partition. The pivot MAX is just a row selector (one row per group), "
+        "not a real aggregation.\n"
+        "  Maps to examples: single_pass_aggregation, union_cte_split"
+    )
+    lines.append("")
+    lines.append("### Structural Transforms")
+    lines.append(
+        "- **union_consolidation**: Share dimension lookups across UNION ALL "
+        "branches that scan different fact tables with the same dim joins.\n"
+        "  Maps to examples: shared_dimension_multi_channel"
+    )
+    lines.append(
+        "- **window_optimization**: Push filters before window functions when "
+        "they don't affect the frame. Convert ROW_NUMBER + filter to LATERAL "
+        "+ LIMIT. Merge same-PARTITION windows into one sort pass.\n"
+        "  Maps to examples: deferred_window_aggregation"
+    )
+    lines.append(
+        "- **exists_restructuring**: Convert INTERSECT to EXISTS for semi-join "
+        "short-circuit, or restructure complex EXISTS with shared CTEs. "
+        "CHECK: does the query actually have INTERSECT or complex EXISTS.\n"
+        "  Maps to examples: intersect_to_exists, multi_intersect_exists_cte"
+    )
+    lines.append("")
+
+    # §5b. Example Library — examples are auto-matched to each worker's
+    # strategy by the system (tag overlap with transform category).
+    # The analyst does NOT need to see or select examples — each transform
+    # in §5a already lists its mapped examples.
+
+    # §5c. Optimization Principles — CUT. Same info is in Pathologies
+    # (win counts, avg speedups) and Transform Catalog (example mappings).
+
+    # ── §5c. Strategy Leaderboard (when available) ───────────────────────
+    if strategy_leaderboard and query_archetype:
+        leaderboard_section = _section_strategy_leaderboard(
+            strategy_leaderboard, query_archetype
+        )
+        if leaderboard_section:
+            lines.append(leaderboard_section)
             lines.append("")
 
-    # ── 11. Chain-of-thought instruction with reasoning checklist ────────
-    lines.append("## Your Task")
+    # ═══════════════════════════════════════════════════════════════════════
+    # §6. REASONING PROCESS (how to think)
+    # ═══════════════════════════════════════════════════════════════════════
+    lines.append("## §6. REASONING PROCESS")
     lines.append("")
     lines.append(
         "First, use a `<reasoning>` block for your internal analysis. "
@@ -1237,7 +1358,84 @@ def build_analyst_briefing_prompt(
         )
         lines.append("")
 
-    # ── 12. Output format specification ──────────────────────────────────
+    # Strategy Selection Rules (part of §6)
+    lines.append("### Strategy Selection Rules")
+    lines.append("")
+    lines.append(
+        "1. **CHECK APPLICABILITY**: Each transform has a structural prerequisite "
+        "(correlated subquery, UNION ALL CTE, LEFT JOIN, etc.). Verify the "
+        "query actually has the prerequisite before assigning a transform. "
+        "DO NOT assign decorrelation if there are no correlated subqueries."
+    )
+    lines.append(
+        "2. **CHECK OPTIMIZER OVERLAP**: Read the EXPLAIN plan. If the optimizer "
+        "already performs a transform (e.g., already splits a UNION CTE, "
+        "already pushes a predicate), that transform will have marginal "
+        "benefit. Note this in your reasoning and prefer transforms the "
+        "optimizer is NOT already doing."
+    )
+    if mode == "swarm":
+        lines.append(
+            "3. **MAXIMIZE DIVERSITY**: Each worker must attack a different part of "
+            "the execution plan. Do not assign 'pushdown variant A' and "
+            "'pushdown variant B'. Assign transforms from different categories above."
+        )
+    else:
+        lines.append(
+            "3. **MAXIMIZE EXPECTED VALUE**: Select the single strategy with the "
+            "highest expected speedup, considering both the magnitude of the "
+            "bottleneck it addresses and the historical success rate."
+        )
+    lines.append(
+        "4. **ASSESS RISK PER-QUERY**: Risk is a function of (transform x "
+        "query complexity), not an inherent property of the transform. "
+        "Decorrelation is low-risk on a simple EXISTS and high-risk on "
+        "nested correlation inside a CTE. Assess per-assignment."
+    )
+    lines.append(
+        "5. **COMPOSITION IS ALLOWED AND ENCOURAGED**: A strategy can "
+        "combine 2-3 transforms from different categories (e.g., "
+        "star_join_prefetch + scan_consolidation_pivot, or date_cte_isolate + "
+        "early_filter + decorrelate). The TARGET_LOGICAL_TREE should reflect the combined "
+        "structure. Compound strategies are often the source of the biggest wins."
+    )
+    if mode == "swarm":
+        lines.append(
+            "6. **MINIMAL-CHANGE BASELINE**: If the EXPLAIN shows the optimizer "
+            "already handles the primary bottleneck (e.g., already splits CTEs, "
+            "already pushes predicates), consider assigning one worker as a "
+            "minimal-change baseline: explicit JOINs only, no structural changes. "
+            "This provides a regression-safe fallback."
+        )
+    lines.append("")
+
+    if mode == "swarm":
+        lines.append(
+            "Each worker gets 1-3 examples from the 'Maps to examples' notes in "
+            "the Transform Catalog. The system auto-loads full before/after SQL "
+            "for each assigned example. Do NOT pad with irrelevant examples — "
+            "an irrelevant example is worse than no example."
+        )
+    else:
+        lines.append(
+            "Select 1-3 examples from the 'Maps to examples' notes that match "
+            "the strategy. The system auto-loads full before/after SQL."
+        )
+    lines.append("")
+    lines.append(
+        "For TARGET_LOGICAL_TREE: Define the CTE structure you want produced. "
+        "For NODE_CONTRACTS: Be exhaustive with OUTPUT columns — missing columns "
+        "cause semantic breaks."
+    )
+    lines.append("")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # §7. OUTPUT SPECIFICATION
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── §7a. Output Format ───────────────────────────────────────────────
+    lines.append("## §7a. Output Format")
+    lines.append("")
     lines.append("Then produce the structured briefing in EXACTLY this format:")
     lines.append("")
     lines.append("```")
@@ -1273,14 +1471,20 @@ def build_analyst_briefing_prompt(
     lines.append("")
 
     # Worker briefing format — varies per mode
+    # NODE_CONTRACTS instruction (stated once, applies to all workers):
+    if mode in ("swarm", "expert"):
+        lines.append(
+            "NODE_CONTRACTS: Write all fields as SQL fragments, not natural language. "
+            "Example: `WHERE: d_year IN (1999, 2000)` not `WHERE: filter to target years`. "
+            "Workers use these as specifications to code against."
+        )
+        lines.append("")
+
     _WORKER_BRIEFING_TEMPLATE = [
         "STRATEGY: [strategy_name]",
         "TARGET_LOGICAL_TREE:",
         "  [node] -> [node] -> [node]",
         "NODE_CONTRACTS:",
-        "(Write all fields as SQL fragments, not natural language.",
-        "Example: 'WHERE: d_year IN (1999, 2000)' not 'WHERE: filter to target years'.",
-        "The worker uses these as specifications to code against.)",
         "  [node_name]:",
         "    FROM: [tables/CTEs]",
         "    JOIN: [join conditions]",
@@ -1292,9 +1496,7 @@ def build_analyst_briefing_prompt(
         "    CONSUMERS: [downstream nodes]",
         "EXAMPLES: [ex1], [ex2], [ex3]",
         "EXAMPLE_ADAPTATION:",
-        "[For each example: what aspect to apply to THIS strategy,",
-        "and what to IGNORE (e.g., 'apply the date CTE pattern; ignore the",
-        "decorrelation — Q74 has no correlated subquery').]",
+        "  [For each: what to apply, what to IGNORE for this strategy.]",
         "HAZARD_FLAGS:",
         "- [Specific risk for this approach on this query]",
     ]
@@ -1368,7 +1570,7 @@ def build_analyst_briefing_prompt(
     lines.append("```")
     lines.append("")
 
-    # Section validation checklist — varies per mode
+    # ── §7b. Validation Checklist ────────────────────────────────────────
     if mode == "swarm":
         lines.append(build_analyst_section_checklist())
     elif mode == "expert":
@@ -1377,208 +1579,9 @@ def build_analyst_briefing_prompt(
         lines.append(build_oneshot_section_checklist())
     lines.append("")
 
-    # ── 13. Transform Catalog ─────────────────────────────────────────────
-    lines.append("## Transform Catalog")
-    lines.append("")
+    # ── §7c. Worker 4 Exploration Rules (swarm only) ─────────────────────
     if mode == "swarm":
-        lines.append(
-            "Select 4 transforms that are applicable to THIS query, maximizing "
-            "structural diversity (each must attack a different part of the "
-            "execution plan)."
-        )
-    else:
-        lines.append(
-            "Select the best transform (or compound strategy of 2-3 transforms) "
-            "that maximizes expected speedup for THIS query."
-        )
-    lines.append("")
-    lines.append("### Predicate Movement")
-    lines.append(
-        "- **global_predicate_pushdown**: Trace selective predicates from late "
-        "in the CTE chain back to the earliest scan via join equivalences. "
-        "Biggest win when a dimension filter is applied after a large "
-        "intermediate materialization.\n"
-        "  Maps to examples: pushdown, early_filter, date_cte_isolate"
-    )
-    lines.append(
-        "- **transitive_predicate_propagation**: Infer predicates through join "
-        "equivalence chains (A.key = B.key AND B.key = 5 -> A.key = 5). "
-        "Especially across CTE boundaries where optimizers stop propagating.\n"
-        "  Maps to examples: early_filter, dimension_cte_isolate"
-    )
-    lines.append(
-        "- **null_rejecting_join_simplification**: When downstream WHERE "
-        "rejects NULLs from the outer side of a LEFT JOIN, convert to INNER. "
-        "Enables reordering and predicate pushdown. CHECK: does the query "
-        "actually have LEFT/OUTER joins before assigning this.\n"
-        "  Maps to examples: (no direct gold example — novel transform)"
-    )
-    lines.append("")
-    lines.append("### Join Restructuring")
-    lines.append(
-        "- **self_join_elimination**: When a UNION ALL CTE is self-joined N "
-        "times with each join filtering to a different discriminator, split "
-        "into N pre-partitioned CTEs. Eliminates discriminator filtering "
-        "and repeated hash probes on rows that don't match.\n"
-        "  Maps to examples: union_cte_split, shared_dimension_multi_channel"
-    )
-    lines.append(
-        "- **decorrelation**: Convert correlated EXISTS/IN/scalar subqueries "
-        "to CTE + JOIN. CHECK: does the query actually have correlated "
-        "subqueries before assigning this.\n"
-        "  Maps to examples: decorrelate, composite_decorrelate_union"
-    )
-    lines.append(
-        "- **aggregate_pushdown**: When GROUP BY follows a multi-table join but "
-        "aggregation only uses columns from one side, push the GROUP BY below "
-        "the join. CHECK: verify the join doesn't change row multiplicity "
-        "for the aggregate (one-to-many breaks AVG/STDDEV).\n"
-        "  Maps to examples: (no direct gold example — novel transform)"
-    )
-    lines.append(
-        "- **late_attribute_binding**: When a dimension table is joined only to "
-        "resolve display columns (names, descriptions) that aren't used in "
-        "filters, aggregations, or join conditions, defer that join until after "
-        "all filtering and aggregation is complete. Join on the surrogate key "
-        "once against the final reduced result set. This eliminates N-1 "
-        "dimension scans when the CTE references the dimension N times. "
-        "CHECK: verify the deferred columns aren't used in WHERE, GROUP BY, "
-        "or JOIN ON — only in the final SELECT.\n"
-        "  Maps to examples: dimension_cte_isolate (partial pattern), early_filter"
-    )
-    lines.append("")
-    lines.append("### Scan Optimization")
-    lines.append(
-        "- **star_join_prefetch**: Pre-filter ALL dimension tables into CTEs, "
-        "then probe fact table with the combined key intersection.\n"
-        "  Maps to examples: dimension_cte_isolate, multi_dimension_prefetch, "
-        "prefetch_fact_join, date_cte_isolate"
-    )
-    lines.append(
-        "- **single_pass_aggregation**: Merge N subqueries on the same fact "
-        "table into 1 scan with CASE/FILTER inside aggregates. "
-        "CHECK: STDDEV_SAMP/VARIANCE are grouping-sensitive — FILTER "
-        "over a combined group != separate per-group computation.\n"
-        "  Maps to examples: single_pass_aggregation, channel_bitmap_aggregation"
-    )
-    lines.append(
-        "- **scan_consolidation_pivot**: When a CTE is self-joined N times "
-        "with each reference filtering to a different discriminator (e.g., year, "
-        "channel), consolidate into fewer scans that GROUP BY the discriminator, "
-        "then pivot rows to columns using MAX(CASE WHEN discriminator = X THEN "
-        "agg_value END). This halves the fact scans and dimension joins. "
-        "SAFE when GROUP BY includes the discriminator — each group is naturally "
-        "partitioned, so aggregates like STDDEV_SAMP are computed correctly "
-        "per-partition. The pivot MAX is just a row selector (one row per group), "
-        "not a real aggregation.\n"
-        "  Maps to examples: single_pass_aggregation, union_cte_split"
-    )
-    lines.append("")
-    lines.append("### Structural Transforms")
-    lines.append(
-        "- **union_consolidation**: Share dimension lookups across UNION ALL "
-        "branches that scan different fact tables with the same dim joins.\n"
-        "  Maps to examples: shared_dimension_multi_channel"
-    )
-    lines.append(
-        "- **window_optimization**: Push filters before window functions when "
-        "they don't affect the frame. Convert ROW_NUMBER + filter to LATERAL "
-        "+ LIMIT. Merge same-PARTITION windows into one sort pass.\n"
-        "  Maps to examples: deferred_window_aggregation"
-    )
-    lines.append(
-        "- **exists_restructuring**: Convert INTERSECT to EXISTS for semi-join "
-        "short-circuit, or restructure complex EXISTS with shared CTEs. "
-        "CHECK: does the query actually have INTERSECT or complex EXISTS.\n"
-        "  Maps to examples: intersect_to_exists, multi_intersect_exists_cte"
-    )
-    lines.append("")
-
-    # ── 13b. Strategy Leaderboard (observed success rates) ────────────────
-    if strategy_leaderboard and query_archetype:
-        leaderboard_section = _section_strategy_leaderboard(
-            strategy_leaderboard, query_archetype
-        )
-        if leaderboard_section:
-            lines.append(leaderboard_section)
-            lines.append("")
-
-    # ── 14. Strategy Selection Rules ──────────────────────────────────────
-    lines.append("## Strategy Selection Rules")
-    lines.append("")
-    lines.append(
-        "1. **CHECK APPLICABILITY**: Each transform has a structural prerequisite "
-        "(correlated subquery, UNION ALL CTE, LEFT JOIN, etc.). Verify the "
-        "query actually has the prerequisite before assigning a transform. "
-        "DO NOT assign decorrelation if there are no correlated subqueries."
-    )
-    lines.append(
-        "2. **CHECK OPTIMIZER OVERLAP**: Read the EXPLAIN plan. If the optimizer "
-        "already performs a transform (e.g., already splits a UNION CTE, "
-        "already pushes a predicate), that transform will have marginal "
-        "benefit. Note this in your reasoning and prefer transforms the "
-        "optimizer is NOT already doing."
-    )
-    if mode == "swarm":
-        lines.append(
-            "3. **MAXIMIZE DIVERSITY**: Each worker must attack a different part of "
-            "the execution plan. Do not assign 'pushdown variant A' and "
-            "'pushdown variant B'. Assign transforms from different categories above."
-        )
-    else:
-        lines.append(
-            "3. **MAXIMIZE EXPECTED VALUE**: Select the single strategy with the "
-            "highest expected speedup, considering both the magnitude of the "
-            "bottleneck it addresses and the historical success rate."
-        )
-    lines.append(
-        "4. **ASSESS RISK PER-QUERY**: Risk is a function of (transform x "
-        "query complexity), not an inherent property of the transform. "
-        "Decorrelation is low-risk on a simple EXISTS and high-risk on "
-        "nested correlation inside a CTE. Assess per-assignment."
-    )
-    lines.append(
-        "5. **COMPOSITION IS ALLOWED AND ENCOURAGED**: A strategy can "
-        "combine 2-3 transforms from different categories (e.g., "
-        "star_join_prefetch + scan_consolidation_pivot, or date_cte_isolate + "
-        "early_filter + decorrelate). The TARGET_LOGICAL_TREE should reflect the combined "
-        "structure. Compound strategies are often the source of the biggest wins."
-    )
-    if mode == "swarm":
-        lines.append(
-            "6. **MINIMAL-CHANGE BASELINE**: If the EXPLAIN shows the optimizer "
-            "already handles the primary bottleneck (e.g., already splits CTEs, "
-            "already pushes predicates), consider assigning one worker as a "
-            "minimal-change baseline: explicit JOINs only, no structural changes. "
-            "This provides a regression-safe fallback."
-        )
-    lines.append("")
-
-    if mode == "swarm":
-        lines.append(
-            "Each worker gets 1-3 examples. If fewer than 2 examples genuinely "
-            "match the worker's strategy, assign 1 and state 'No additional examples "
-            "apply.' Do NOT pad with irrelevant examples — an irrelevant example is "
-            "worse than no example because the worker will try to apply its pattern. "
-            "No duplicate examples across workers. Use example IDs from the catalog above."
-        )
-    else:
-        lines.append(
-            "Select 1-3 examples that genuinely match the strategy. "
-            "Do NOT pad with irrelevant examples — an irrelevant example is "
-            "worse than no example. Use example IDs from the catalog above."
-        )
-    lines.append("")
-    lines.append(
-        "For TARGET_LOGICAL_TREE: Define the CTE structure you want produced. "
-        "For NODE_CONTRACTS: Be exhaustive with OUTPUT columns — missing columns "
-        "cause semantic breaks."
-    )
-    lines.append("")
-
-    # ── 14b. Exploration Budget (swarm only) ──────────────────────────────
-    if mode == "swarm":
-        lines.append("## Exploration Budget (Worker 4)")
+        lines.append("## §7c. Worker 4 Exploration Rules")
         lines.append("")
         lines.append(
             "Workers 1-3 follow the engine profile's proven patterns. "
@@ -1616,22 +1619,14 @@ def build_analyst_briefing_prompt(
         )
         lines.append("")
 
-    # ── 15. Output Consumption Spec (swarm only) ─────────────────────────
+    # ── §7d. Output Consumption Spec (swarm only) ────────────────────────
     if mode == "swarm":
-        lines.append("## Output Consumption Spec")
+        lines.append("## §7d. Output Consumption Spec")
         lines.append("")
         lines.append(
-            "Each worker receives:\n"
-            "1. SHARED BRIEFING (SEMANTIC_CONTRACT + BOTTLENECK_DIAGNOSIS + "
-            "ACTIVE_CONSTRAINTS + REGRESSION_WARNINGS)\n"
-            "2. Their specific WORKER N BRIEFING (STRATEGY + TARGET_LOGICAL_TREE + "
-            "NODE_CONTRACTS + EXAMPLES + EXAMPLE_ADAPTATION + HAZARD_FLAGS)\n"
-            "3. Full before/after SQL for their assigned examples (retrieved by example ID)\n"
-            "4. The original query SQL (full, as reference)\n"
-            "5. Column completeness contract + output format spec\n\n"
-            "Workers do NOT see other workers' briefings.\n"
-            "Presentation order: briefing first (understanding), then examples "
-            "(patterns), then original SQL (source), then output format (mechanics)."
+            "Each worker receives: SHARED BRIEFING + their WORKER N BRIEFING + "
+            "full before/after SQL for assigned examples + original SQL + output format.\n"
+            "Workers do NOT see other workers' briefings."
         )
 
     return "\n".join(lines)
