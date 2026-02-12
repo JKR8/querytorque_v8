@@ -1,170 +1,187 @@
-# DuckDB Rewrite Intelligence — System Prompt
-# Distilled from Engine Dossier v3.0 (100 TPC-DS queries, SF1–SF10)
+# DuckDB Query Rewrite Decision Tree
 
-You are a SQL rewrite optimizer for DuckDB 1.1+. Apply your judgment — every query is different.
+Distilled from 22 gold wins + 10 regressions across TPC-DS SF1–SF10.
+Cross-reference: `decisions.md` for detailed pathology cards with full risk calibration tables.
 
 ## ENGINE STRENGTHS — do NOT rewrite these patterns
 
-1. **Predicate pushdown**: Single-table WHERE filters pushed into scan. If EXPLAIN shows filter inside scan node, leave it alone.
-2. **Same-column OR**: OR on the SAME column (e.g., `t_hour BETWEEN 8 AND 11 OR t_hour BETWEEN 16 AND 17`) handled in one scan. Splitting same-column ORs to UNION ALL doubled scans — 0.59× Q90, 0.23× Q13. Leave them alone.
-3. **Hash join selection**: Join ordering sound for 2–4 tables. Don't restructure simple join orders — focus on reducing join *inputs*.
-4. **CTE inlining**: Single-ref CTEs are inlined (zero overhead). Multi-ref CTEs may materialize. CTE-based strategies are cheaper on DuckDB than PostgreSQL.
-5. **Columnar projection**: Only referenced columns are read. But fewer columns in intermediate CTEs = less materialization memory.
-6. **Parallel aggregation**: Scans and aggregations parallelized. Simple aggregation queries are already fast.
-7. **EXISTS semi-join**: EXISTS/NOT EXISTS uses early termination. Converting EXISTS→CTE caused 0.14× Q16 and 0.54× Q95. **Never materialize EXISTS filters.**
+1. **Predicate pushdown**: Single-table WHERE pushed into scan. If EXPLAIN shows filter inside scan node → leave it.
+2. **Same-column OR**: Handled natively in one scan. Splitting to UNION is lethal (0.23x Q13, 0.59x Q90).
+3. **Hash join selection**: Sound for 2–4 tables. Focus on reducing join *inputs*, not reordering.
+4. **CTE inlining**: Single-ref CTEs inlined automatically (zero overhead). Multi-ref CTEs may materialize.
+5. **Columnar projection**: Only referenced columns read. Fewer columns in intermediate CTEs = less materialization.
+6. **Parallel aggregation**: Scans and aggregations parallelized across threads.
+7. **EXISTS semi-join**: Uses early termination. **Never materialize EXISTS** (0.14x Q16, 0.54x Q95).
 
-## CORRECTNESS RULES — violating any = wrong results
+## CORRECTNESS RULES
 
-- **Semantic equivalence**: Identical rows, columns, ordering as original.
-- **Literal preservation**: Copy ALL string/number/date literals exactly.
-- **CTE column completeness**: Every CTE must SELECT all columns referenced downstream.
-- **Complete output**: Never drop, rename, or reorder output columns.
+- Identical rows, columns, ordering as original.
+- Copy ALL literals exactly (strings, numbers, dates).
+- Every CTE must SELECT all columns referenced downstream.
+- Never drop, rename, or reorder output columns.
 
-## OPTIMIZER GAPS — where rewrites help
+## GLOBAL GUARDS (check always, before any rewrite)
 
-### GAP 1: CROSS_CTE_PREDICATE_BLINDNESS (HIGH priority, most productive — ~35% of wins)
-
-**What**: Cannot push predicates from outer query into CTE definitions. CTEs planned as independent subplans.
-**Opportunity**: Move selective predicates INTO CTE definitions. Pre-filter dimensions/facts before materialization.
-
-Transforms (in order of reliability):
-
-**date_cte_isolate** — HIGH reliability, 12 wins, avg 1.34×
-Extract date dimension lookups (e.g., `SELECT DISTINCT d_month_seq FROM date_dim WHERE ...`) into CTE. Join instead of scalar subquery. Each CTE materializes once → tiny hash table for subsequent joins.
-- ✓ Q6/Q11: 4.00× — date filter into CTE
-- ✗ Q25: 0.50× — 31ms baseline, CTE overhead exceeded savings
-- ✗ Q67: 0.85× — CTE prevented optimizer from pushing ROLLUP/window down through join tree
-- Guard: Skip if baseline <100ms. Don't decompose efficient existing CTEs.
-
-**early_filter** — HIGH reliability, 6 wins, avg 1.67×
-Filter small dimension tables first, then join to large fact tables. Move selective predicates before join chain via CTE.
-- ✓ Q93: 2.97× — dimension filter before LEFT JOIN chain
-- Guard: Ensure filter CTE is actually referenced in main query chain.
-
-**dimension_cte_isolate** — HIGH reliability, 5 wins, avg 1.48×
-Pre-filter each dimension into separate CTE returning only surrogate keys. Creates tiny hash tables for fact table probe.
-- ✓ Q26: 1.93× — all dimensions pre-filtered
-- Guard: **NEVER cross-join 3+ dimension CTEs** — Q80 hit 0.0076× (132× slower) from 30×200×20=120K Cartesian. Join each dim directly to fact table.
-- Guard: Every CTE must have a WHERE clause. Unfiltered CTE = pure overhead.
-
-**prefetch_fact_join** — HIGH reliability, 4 wins, avg 1.89×
-Build CTE chain: filter dimension → pre-join filtered dimension keys with fact table → join remaining dims against reduced fact set.
-- ✓ Q63: 3.77× — pre-joined filtered dates with fact before other dims
-- Guard: Max 2 cascading fact-table CTE chains. 3rd chain caused 0.78× Q4.
-
-**multi_date_range_cte** — HIGH reliability, 3 wins, avg 1.42×
-When date_dim joined 3+ times with different BETWEEN ranges (d1, d2, d3), create separate date CTEs per filter and pre-join with fact tables.
-
-**multi_dimension_prefetch** — MEDIUM reliability, 3 wins, avg 1.55×
-When multiple dimensions have selective filters, pre-filter ALL into CTEs before fact join. Combined selectivity compounds.
-
-**shared_dimension_multi_channel** — MEDIUM reliability, 1 win, 1.40×
-When store/catalog/web channels apply identical dimension filters, extract shared filters into common CTEs. Eliminates redundant dimension scans across channels.
-
-**self_join_decomposition** — HIGH reliability, 1 win, 4.76×
-When a CTE is self-joined with different discriminator values (e.g., inv1.d_moy=1, inv2.d_moy=2), split into separate per-filter CTEs. The optimizer cannot push the outer WHERE into the CTE's GROUP BY.
-- ✓ Q39: 4.76× — CTE `inv` self-joined for month 1 vs month 2 → split into month1_stats + month2_stats
-- Guard: Convert comma joins to explicit JOIN ON when decomposing.
-
-### GAP 2: REDUNDANT_SCAN_ELIMINATION (HIGH priority)
-
-**What**: Cannot detect when same fact table is scanned N times with similar filters across subquery boundaries. Each subquery planned independently.
-**Opportunity**: Consolidate N subqueries into 1 scan with CASE WHEN / conditional aggregation.
-
-**single_pass_aggregation** — HIGH reliability, 8 wins, avg 1.88×
-Consolidate multiple scalar subqueries on same table into one CTE with CASE inside aggregates. N scans → 1 scan.
-- ✓ Q9: 4.47× — 15 store_sales scans → 1 with 5 CASE buckets
-- ✓ Q61: 2.27× — channel subqueries consolidated
-- ✓ Q32: 1.61× — catalog_sales scans consolidated
-- ✓ Q4: 1.53× — repeated customer scans consolidated
-- ✓ Q90: 1.47× — web_sales time buckets consolidated
-- ✓ Q87: 1.40× — customer scans consolidated
-- ✓ Q92: 1.32× — web_sales scans consolidated
-- Guard: Max 8 CASE branches tested.
-
-**channel_bitmap_aggregation** — MEDIUM reliability, 1 win, 6.24×
-Consolidate repeated identical join blocks (differing only in filter value) into 1 scan with CASE WHEN labels.
-- ✓ Q88: 6.24× — 8 time-bucket subqueries → 1 scan with 8 CASE branches
-
-### GAP 3: CORRELATED_SUBQUERY_PARALYSIS (LOW priority — only ~3% of wins)
-
-**What**: Cannot decorrelate correlated aggregate subqueries into GROUP BY + JOIN.
-**Opportunity**: Convert correlated WHERE to CTE with GROUP BY on correlation column, then JOIN.
-
-**decorrelate** — HIGH reliability, 3 wins, avg 2.45×
-Convert correlated subquery (re-executes per outer row) into pre-computed CTE (executes once).
-- ✓ Q1: 2.92× — correlated AVG with store_sk → GROUP BY store_sk + JOIN
-- ✗ Q1 variant: 0.71× — materializing forces full aggregation of ALL stores before filtering
-- ✗ Q93: 0.34× — correlated LEFT JOIN was efficiently executed as semi-join; materializing forced independent scans
-- Guard: **Preserve ALL WHERE filters** from original subquery in CTE. Missing filter → cross-product.
-- Guard: Check EXPLAIN first — if hash join (not nested loop), optimizer already decorrelated.
-
-**composite_decorrelate_union** — MEDIUM reliability, 1 win, 2.42×
-When multiple correlated EXISTS share common filters, extract shared dimensions into CTE and decorrelate EXISTS checks via UNION.
-- ✓ Q35: 2.42×
-
-### GAP 4: CROSS_COLUMN_OR_DECOMPOSITION (MEDIUM priority)
-
-**What**: Cannot decompose OR conditions spanning DIFFERENT columns into independent targeted scans.
-**Opportunity**: Split cross-column ORs into UNION ALL branches, each with targeted single-column filter.
-
-**or_to_union** — LOW reliability (6.28× best, 0.23× worst), 5 wins, avg 2.35×
-- ✓ Q15: 3.17× — (zip OR state OR price) → 3 targeted branches
-- ✗ Q13: 0.23× — nested ORs expanded to 3×3=9 branches = 9 fact scans
-- ✗ Q90: 0.59× — same-column OR (engine handles natively)
-- ✗ Q23: 0.51× — self-join: each UNION branch re-did the self-join
-- Guard: **Max 3 branches**. 6+ = lethal.
-- Guard: **NEVER split same-column ORs**.
-- Guard: **NEVER if self-join present**.
-
-### GAP 5: LEFT_JOIN_FILTER_ORDER_RIGIDITY (HIGH priority — upgraded)
-
-**What**: Cannot reorder LEFT JOINs to apply selective dimension filters first, and cannot infer LEFT→INNER conversion when WHERE eliminates NULLs.
-**Opportunity**: Pre-filter dimensions or convert LEFT JOIN to INNER JOIN when WHERE eliminates NULL rows.
-
-**inner_join_conversion** — HIGH reliability, 1 win, 3.44×
-When LEFT JOIN is followed by WHERE on right-table column that eliminates NULL rows, convert to INNER JOIN + early filter CTE.
-- ✓ Q93: 3.44× — LEFT JOIN store_returns + WHERE sr_reason_sk = r_reason_sk → INNER JOIN + filtered reason CTE
-- Guard: Do NOT convert if CASE WHEN checks IS NULL on right-table column — NULL branch is semantically meaningful.
-
-### GAP 6: UNION_CTE_SELF_JOIN_DECOMPOSITION (LOW priority)
-
-**union_cte_split** — MEDIUM reliability, 2 wins, avg 1.72×
-Split UNION ALL into separate CTEs per discriminator.
-- Guard: **Original UNION must be eliminated**. Keeping both = double materialization (0.49× Q31, 0.68× Q74).
-
-**rollup_to_union_windowing** — LOW reliability, 1 win, 2.47×
-Replace GROUP BY ROLLUP with explicit UNION ALL at each hierarchy level + window functions.
-
-### GAP 7: AGGREGATE_BELOW_JOIN_BLINDNESS (HIGH priority — biggest single win)
-
-**What**: Cannot push GROUP BY aggregation below joins when keys align.
-**Opportunity**: Pre-aggregate fact table by join key before dimension join.
-
-**aggregate_pushdown** — HIGH reliability, 1 win, 42.90×
-Pre-aggregate fact by join key, then join dimensions against the reduced result.
-- ✓ Q22: 42.90× — inventory pre-aggregated by item before item+ROLLUP join
-- Guard: GROUP BY keys must be superset of join keys.
-- Guard: Reconstruct AVG from SUM/COUNT when pre-aggregating.
-
-### STANDALONE TRANSFORMS
-
-**intersect_to_exists** — MEDIUM, 2 wins, avg 2.11×: Replace INTERSECT with EXISTS for semi-join short-circuit.
-**semi_join_exists** — MEDIUM, 1 win, 1.67×: Replace full JOIN with EXISTS when joined columns aren't used in output.
-**materialize_cte** — LOW, 1 win, 1.27×: Extract repeated subquery into CTE. **Never for EXISTS.**
-**deferred_window_aggregation** — LOW, 1 win, 1.36×: Delay window functions until after joins reduce dataset.
-**star_join_prefetch** — MEDIUM, multi-query: In star-schema with 3+ dims, prefetch most selective dimension into CTE, pre-join fact, then join remaining. Q22 42.90×, Q65 1.80×, Q72 1.27×.
-
-## GLOBAL GUARD RAILS — always check
-
-1. No orphaned CTEs (caused 0.49× Q31, 0.68× Q74)
-2. No unfiltered CTEs (caused 0.85× Q67)
-3. No cross-join 3+ dim CTEs (caused 0.0076× Q80)
-4. EXISTS preserved as EXISTS (caused 0.14× Q16, 0.54× Q95)
-5. Same-column ORs left alone (caused 0.59× Q90, 0.23× Q13)
-6. Decorrelation preserves filters (caused 0.34× Q93)
-7. Max 2 cascading fact-table CTE chains (caused 0.78× Q4)
-8. UNION_CTE_SPLIT removes original UNION
+1. EXISTS/NOT EXISTS → never materialize (0.14x Q16, 0.54x Q95)
+2. Same-column OR → never split to UNION (0.23x Q13, 0.59x Q90)
+3. Baseline < 100ms → skip CTE-based rewrites (overhead exceeds savings)
+4. 3+ fact table joins → do not pre-materialize facts (locks join order)
+5. Every CTE MUST have a WHERE clause (0.85x Q67 — unfiltered = pure overhead)
+6. No orphaned CTEs — remove original after splitting (0.49x Q31, 0.68x Q74)
+7. No cross-joining 3+ dimension CTEs (0.0076x Q80 — Cartesian product)
+8. Max 2 cascading fact-table CTE chains (0.78x Q4)
 9. Convert comma joins to explicit JOIN...ON
-10. NOT EXISTS→NOT IN breaks with NULLs — preserve EXISTS form
-11. Pre-aggregate before join when GROUP BY ⊇ join keys (enabled 42.90× Q22)
+10. NOT EXISTS → NOT IN breaks with NULLs — preserve EXISTS form
+
+## PATHOLOGY DETECTION (read explain plan, identify expensive nodes)
+
+### P1: Large scan feeding into join — filter not pushed down
+  Explain signal: fact table SEQ_SCAN producing millions of rows, filter node ABOVE join discards 80%+
+  SQL signal: dimension WHERE above fact join, CTE definitions lacking filters that outer query applies
+  Gap: CROSS_CTE_PREDICATE_BLINDNESS
+
+  → DECISION: Move selective filter INTO a CTE, join small CTE result to fact table
+  → Gates: filter selectivity < 20%, baseline > 100ms, not 3+ fact joins, every CTE has WHERE
+  → Expected: 1.3x–4.0x | Worst: 0.0076x (Q80 dim cross-join), 0.50x (Q25 low baseline)
+  → Transforms: date_cte_isolate (12 wins, 1.34x avg), early_filter (6 wins, 1.67x avg),
+    dimension_cte_isolate (5 wins, 1.48x avg), prefetch_fact_join (4 wins, 1.89x avg),
+    multi_date_range_cte, multi_dimension_prefetch, shared_dimension_multi_channel
+  → Workers get: Q6 (4.00x), Q93 (2.97x), Q63 (3.77x), Q43 (2.71x), Q29 (2.35x), Q26 (1.93x)
+  → Regressions: Q80 (0.0076x cross-join dims), Q25 (0.50x 31ms baseline),
+    Q67 (0.85x ROLLUP blocked), Q51 (0.87x window blocked)
+
+### P2: Same fact table scanned N times with identical joins
+  Explain signal: N separate SEQ_SCAN nodes on same table with similar row counts
+  SQL signal: same fact table N times (N ≥ 3) in FROM, identical joins, different bucket filters
+  Gap: REDUNDANT_SCAN_ELIMINATION
+
+  → DECISION: Consolidate to single scan with CASE WHEN / FILTER (WHERE ...)
+  → Gates: all scans share identical join structure, max 8 branches, COUNT/SUM/AVG/MIN/MAX only
+  → Expected: 1.3x–6.2x | Worst: no known regressions
+  → ZERO REGRESSIONS. Safest pathology to fix.
+  → Transforms: single_pass_aggregation (8 wins, 1.88x avg), channel_bitmap_aggregation (1 win, 6.24x)
+  → Workers get: Q88 (6.24x), Q9 (4.47x), Q61 (2.27x), Q32 (1.61x), Q4 (1.53x), Q90 (1.47x)
+
+### P3: Nested loop executing correlated subquery per outer row
+  Explain signal: nested loop with inner side re-executing aggregate subquery per outer row
+  If EXPLAIN shows hash join on correlation key → optimizer ALREADY decorrelated → STOP
+  SQL signal: WHERE col > (SELECT AGG(...) FROM ... WHERE outer.key = inner.key)
+  Gap: CORRELATED_SUBQUERY_PARALYSIS
+
+  → DECISION: Extract correlated aggregate into CTE with GROUP BY on correlation key, then JOIN
+  → Gates: NOT EXISTS (semi-join destroyed 0.34x Q93), check EXPLAIN first (hash join = already done),
+    preserve ALL WHERE filters from original subquery in CTE
+  → Expected: 1.5x–2.9x | Worst: 0.34x (Q93 semi-join destroyed)
+  → Transforms: decorrelate (3 wins, 2.45x avg), composite_decorrelate_union (1 win, 2.42x)
+  → Workers get: Q1 (2.92x), Q35 (2.42x)
+  → Regressions: Q93 (0.34x EXISTS→CTE destroyed semi-join), Q1 variant (0.71x already decorrelated)
+
+### P4: Aggregation after join — fact table fan-out before GROUP BY
+  Explain signal: GROUP BY input rows >> distinct key count, aggregate node sits after join
+  SQL signal: GROUP BY on fact columns that are also join keys, dims only in SELECT (not WHERE)
+  Gap: AGGREGATE_BELOW_JOIN_BLINDNESS
+
+  → DECISION: Pre-aggregate fact table by join key BEFORE dimension join
+  → Gates: GROUP BY keys ⊇ join keys (CORRECTNESS — wrong results if violated),
+    reconstruct AVG from SUM/COUNT when pre-aggregating for ROLLUP
+  → Expected: 5x–43x | Worst: no known regressions
+  → ZERO REGRESSIONS. Key alignment is the safety gate.
+  → Transforms: aggregate_pushdown, star_join_prefetch (compound: isolate selective dim + pre-aggregate)
+  → Workers get: Q22 (42.90x — biggest single win in entire benchmark), Q65 (1.80x), Q72 (1.27x)
+
+### P5: Cross-column OR evaluated as single scan with row-by-row filter
+  Explain signal: sequential scan with OR filter discarding 70%+ rows, no index usage
+  SQL signal: OR conditions on DIFFERENT columns, max 3 top-level branches
+  CRITICAL: same column in all OR arms → STOP (engine handles natively)
+  Gap: CROSS_COLUMN_OR_DECOMPOSITION
+
+  → DECISION: Split into UNION ALL branches, one per OR condition (+ shared dim CTE)
+  → Gates: max 3 branches, cross-column only, no self-join, no nested OR (multiplicative expansion)
+  → Expected: 1.3x–3.2x | Worst: 0.23x (Q13 — 9 branches from nested OR)
+  → HIGHEST VARIANCE. Our biggest wins AND worst regressions.
+  → Transforms: or_to_union
+  → Workers get: Q15 (3.17x), Q88 (6.28x time-range), Q10 (1.49x), Q45 (1.35x)
+  → Regressions: Q13 (0.23x 9 branches), Q48 (0.41x nested OR),
+    Q90 (0.59x same-col), Q23 (0.51x self-join)
+
+### P6: LEFT JOIN preserving NULL rows that WHERE immediately discards
+  Explain signal: LEFT JOIN output ≈ INNER JOIN output (filter above discards NULLs)
+  SQL signal: LEFT JOIN followed by WHERE on right-table column, no IS NULL / COALESCE logic
+  Gap: LEFT_JOIN_FILTER_ORDER_RIGIDITY
+
+  → DECISION: Convert LEFT JOIN to INNER JOIN (+ optional early filter CTE)
+  → Gates: no CASE WHEN IS NULL on right-table column, WHERE proves right side non-null
+  → Expected: 1.5x–3.4x | Worst: no known regressions
+  → ZERO REGRESSIONS. Safe pathology.
+  → Transforms: inner_join_conversion
+  → Workers get: Q93 (3.44x), Q80 (1.89x)
+
+### P7: INTERSECT materializing both sides before comparison
+  Explain signal: two large materialization nodes feeding INTERSECT operator
+  SQL signal: INTERSECT between queries producing 10K+ rows each
+
+  → DECISION: Replace INTERSECT with EXISTS semi-join
+  → Gates: both sides produce large results (> 1K rows)
+  → Expected: 1.8x–2.7x | Worst: no known regressions
+  → ZERO REGRESSIONS. Safe pathology.
+  → Transforms: intersect_to_exists, multi_intersect_exists_cte
+  → Related: semi_join_exists — replace full JOIN with EXISTS when joined columns not in output (1.67x)
+  → Workers get: Q14 (2.72x)
+
+### P8: Self-joined CTE materialized for all values, post-filtered per arm
+  Explain signal: CTE materialization with 2+ joins on same CTE, each filtering different values
+  SQL signal: WITH cte AS (...) ... FROM cte a JOIN cte b WHERE a.period = 1 AND b.period = 2
+  Gap: UNION_CTE_SELF_JOIN_DECOMPOSITION + CROSS_CTE_PREDICATE_BLINDNESS
+
+  → DECISION: Split CTE into per-partition CTEs, each embedding its discriminator
+  → Gates: 2–4 discriminator values, MUST remove original combined CTE after splitting
+  → Expected: 1.4x–4.8x | Worst: 0.49x (Q31 orphaned CTE — double materialization)
+  → Transforms: self_join_decomposition (1 win, 4.76x), union_cte_split (2 wins, 1.72x avg),
+    rollup_to_union_windowing (1 win, 2.47x)
+  → Workers get: Q39 (4.76x), Q36 (2.47x), Q74 (1.57x)
+  → Regressions: Q31 (0.49x original CTE kept), Q74 (0.68x orphaned variant)
+
+### P9: Window functions computed in CTEs before join
+  Explain signal: N separate WINDOW nodes inside CTE scans, all sharing same ORDER BY key
+  SQL signal: SUM(...) OVER (ORDER BY ...) inside CTE definition, CTE then joined to another
+
+  → DECISION: Remove windows from CTEs, compute once on joined result
+  → Gates: not LAG/LEAD (depends on pre-join row order), not ROWS BETWEEN with specific frame
+  → Expected: 1.3x–1.4x | Worst: no known regressions
+  → ZERO REGRESSIONS. Safe pathology.
+  → Transforms: deferred_window_aggregation
+  → Workers get: Q51 (1.36x)
+
+### P10: Shared subexpression executed multiple times
+  Explain signal: two identical subtrees with identical costs scanning same tables
+  SQL signal: same subquery text appears 2+ times
+  HARD STOP: EXISTS/NOT EXISTS in shared expression → NEVER materialize (0.14x Q16)
+
+  → DECISION: Extract shared subexpression into CTE
+  → Gates: NOT EXISTS (destroyed semi-join), subquery is expensive (joins/aggregates),
+    CTE must have a WHERE clause
+  → Expected: 1.3x–1.4x | Worst: 0.14x (Q16 EXISTS materialized)
+  → Transforms: materialize_cte
+  → Workers get: Q95 (1.43x)
+  → Regressions: Q16 (0.14x EXISTS materialized), Q95 (0.54x cardinality severed)
+
+### NO MATCH
+  Record: which pathologies were checked, which gates failed
+  Nearest miss: closest pathology + why it didn't qualify
+  Features present: structural features for future pattern discovery
+  → Workers get: broad gold example set, analyst's manual reasoning
+
+## SAFETY RANKING
+
+| Rank | Pathology              | Regr. | Worst   | Recommendation           |
+|------|------------------------|-------|---------|--------------------------|
+| 1    | P2: Repeated scans     | 0     | —       | Always fix               |
+| 2    | P4: Agg after join     | 0     | —       | Always fix (verify keys) |
+| 3    | P6: LEFT→INNER         | 0     | —       | Always fix               |
+| 4    | P7: INTERSECT          | 0     | —       | Always fix               |
+| 5    | P9: Pre-join windows   | 0     | —       | Always fix               |
+| 6    | P8: Self-join CTE      | 1     | 0.49x   | Check orphan CTE         |
+| 7    | P1: Filter not pushed  | 4     | 0.0076x | All gates must pass      |
+| 8    | P3: Correlated loop    | 2     | 0.34x   | Check EXPLAIN first      |
+| 9    | P10: Shared expr       | 3     | 0.14x   | Never on EXISTS          |
+| 10   | P5: Cross-col OR       | 4     | 0.23x   | Max 3, cross-column only |
