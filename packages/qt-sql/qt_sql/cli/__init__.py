@@ -30,6 +30,18 @@ def main(ctx: click.Context, verbose: bool, quiet: bool) -> None:
 
 # --- Lazy command registration (keeps `qt --help` fast) ---
 
+@click.command()
+@click.argument("benchmark")
+@click.option("--port", default=8765, show_default=True, help="HTTP port for the dashboard.")
+def dashboard(benchmark: str, port: int) -> None:
+    """Open swarm session dashboard in browser."""
+    from ._common import resolve_benchmark
+    from .dashboard_cmd import serve_dashboard
+
+    bench_dir = resolve_benchmark(benchmark)
+    serve_dashboard(bench_dir, port)
+
+
 def _register_commands() -> None:
     """Import and register all sub-commands."""
     from .cmd_status import status
@@ -41,6 +53,7 @@ def _register_commands() -> None:
     from .cmd_blackboard import blackboard
     from .cmd_findings import findings
     from .cmd_leaderboard import leaderboard
+    from .cmd_config_boost import config_boost
 
     main.add_command(status)
     main.add_command(prepare)
@@ -51,6 +64,8 @@ def _register_commands() -> None:
     main.add_command(blackboard)
     main.add_command(findings)
     main.add_command(leaderboard)
+    main.add_command(dashboard)
+    main.add_command(config_boost)
 
 
 _register_commands()

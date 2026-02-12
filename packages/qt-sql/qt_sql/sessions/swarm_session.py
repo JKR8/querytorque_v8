@@ -53,7 +53,6 @@ class SwarmSession(OptimizationSession):
         self._explain_plan_text: Optional[str] = None
         self._engine_profile: Optional[Dict] = None
         self._constraints: List[Dict] = []
-        self._resource_envelope: Optional[str] = None
         self._semantic_intents: Optional[Dict] = None
         self._output_columns: List[str] = []
         self._matched_examples: List[Dict] = []
@@ -302,7 +301,6 @@ class SwarmSession(OptimizationSession):
             "_analyst_prompt": analyst_prompt,
             "_analyst_response": analyst_response,
             "_briefing": briefing,
-            "_resource_envelope": "",
         }
         self._generation_done = True
         self._setup_run_logging(session_dir)
@@ -378,17 +376,6 @@ class SwarmSession(OptimizationSession):
 
         t_gen = time.time()
 
-        # Load examples + resource envelope
-        # Build resource envelope for PG (same logic as pipeline._gather_context)
-        resource_envelope = ""
-        if self.dialect in ("postgresql", "postgres"):
-            try:
-                from ..pg_tuning import load_or_collect_profile, build_resource_envelope
-                profile = load_or_collect_profile(self.pipeline.config.db_path_or_dsn)
-                resource_envelope = build_resource_envelope(profile)
-            except Exception as e:
-                logger.warning(f"[{self.query_id}] Resource envelope build failed: {e}")
-
         # Build output columns
         output_columns = ""
         if self._dag:
@@ -426,7 +413,6 @@ class SwarmSession(OptimizationSession):
                 output_columns=output_columns,
                 dialect=self.dialect,
                 engine_version=self.pipeline._engine_version,
-                resource_envelope=resource_envelope,
                 original_logic_tree=original_logic_tree,
             )
             example_ids = [e.get("id", "?") for e in examples]
@@ -497,7 +483,6 @@ class SwarmSession(OptimizationSession):
             "_analyst_response": analyst_response,
             "_briefing": briefing,
             "_generator": generator,
-            "_resource_envelope": resource_envelope,
         }
 
     def compact_gen_result(self) -> None:
@@ -683,7 +668,6 @@ class SwarmSession(OptimizationSession):
         self._semantic_intents = semantic_intents
         self._matched_examples = matched_examples
         self._regression_warnings = regression_warnings
-        self._resource_envelope = resource_envelope
 
         # ── Step 2: Build analyst prompt ─────────────────────────────────
         analyst_prompt = build_analyst_briefing_prompt(
@@ -842,7 +826,6 @@ class SwarmSession(OptimizationSession):
                 output_columns=output_columns,
                 dialect=self.dialect,
                 engine_version=self.pipeline._engine_version,
-                resource_envelope=resource_envelope,
                 original_logic_tree=original_logic_tree,
             )
 
@@ -932,7 +915,6 @@ class SwarmSession(OptimizationSession):
             "_analyst_response": analyst_response,
             "_briefing": briefing,
             "_generator": generator,
-            "_resource_envelope": resource_envelope,
         }
 
     def _validate_fan_out(
@@ -1089,91 +1071,6 @@ class SwarmSession(OptimizationSession):
         # ── Step 6.6: Collect candidate EXPLAIN plans for snipe ──────────
         if self.max_iterations > 1:
             self._candidate_explains = self._collect_candidate_explains(worker_results)
-
-        # ── Step 6.5: Per-worker SET LOCAL config validation (PG only) ──
-        pg_config_workers = []
-        if self.dialect in ("postgresql", "postgres"):
-            from ..pg_tuning import validate_tuning_config, build_set_local_sql
-
-            for wid in sorted_wids:
-                wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds, _iw = candidates_by_worker[wid]
-                if not set_local_cmds:
-                    continue
-
-                # Find the matching WorkerResult
-                wr_match = [w for w in worker_results if w.worker_id == wid]
-                if not wr_match:
-                    continue
-                wr = wr_match[0]
-
-                # Only re-validate passing workers (not errors/regressions)
-                if wr.status not in ("WIN", "IMPROVED", "NEUTRAL", "PASS"):
-                    continue
-
-                # Parse SET LOCAL commands into param dict for validation
-                raw_params = {}
-                for cmd in set_local_cmds:
-                    import re as _re
-                    m = _re.match(
-                        r"SET\s+LOCAL\s+(\w+)\s*=\s*'?([^';\s]+)'?",
-                        cmd, _re.IGNORECASE,
-                    )
-                    if m:
-                        raw_params[m.group(1).lower()] = m.group(2)
-
-                validated_params = validate_tuning_config(raw_params)
-                if not validated_params:
-                    continue
-
-                pg_config_workers.append((wid, wr, optimized_sql, validated_params))
-
-        if pg_config_workers:
-            from ..validate import Validator
-
-            config_validator = Validator(sample_db=self.pipeline.config.db_path_or_dsn)
-            try:
-                baseline = config_validator.benchmark_baseline(self.original_sql)
-
-                for wid, wr, optimized_sql, validated_params in pg_config_workers:
-                    config_commands = build_set_local_sql(validated_params)
-                    self._stage(
-                        self.query_id,
-                        f"CONFIG W{wid}: SET LOCAL {len(validated_params)} params: "
-                        f"{', '.join(f'{k}={v}' for k, v in validated_params.items())}"
-                    )
-
-                    try:
-                        config_result = config_validator.validate_with_config(
-                            baseline=baseline,
-                            sql=optimized_sql,
-                            config_commands=config_commands,
-                            worker_id=wid,
-                        )
-                        if config_result.status.value != "error":
-                            config_speedup = config_result.speedup
-                            self._stage(
-                                self.query_id,
-                                f"CONFIG W{wid}: rewrite={wr.speedup:.2f}x → "
-                                f"rewrite+config={config_speedup:.2f}x"
-                            )
-                            # Attach config to worker result
-                            wr.set_local_config = {
-                                "params": validated_params,
-                                "commands": config_commands,
-                                "config_speedup": config_speedup,
-                                "rewrite_only_speedup": wr.speedup,
-                            }
-                            # Update speedup if config improved it
-                            if config_speedup > wr.speedup:
-                                wr.speedup = config_speedup
-                        else:
-                            err_msg = config_result.error or "unknown"
-                            self._stage(self.query_id, f"CONFIG W{wid}: validation error: {err_msg}")
-                    except Exception as e:
-                        self._stage(self.query_id, f"CONFIG W{wid}: validation failed: {e}")
-                        logger.warning(f"[{self.query_id}] Config validation W{wid} failed: {e}")
-            finally:
-                config_validator.close()
 
         # Learning records
         for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
@@ -1356,16 +1253,6 @@ class SwarmSession(OptimizationSession):
             )
         if not self._semantic_intents:
             self._semantic_intents = self.pipeline.get_semantic_intents(self.query_id)
-        if self._resource_envelope is None and self.dialect in ("postgresql", "postgres"):
-            try:
-                from ..pg_tuning import load_or_collect_profile, build_resource_envelope
-                profile = load_or_collect_profile(
-                    self.pipeline.config.db_path_or_dsn,
-                    self.pipeline.benchmark_dir,
-                )
-                self._resource_envelope = build_resource_envelope(profile)
-            except Exception:
-                pass
 
         # ── Step 1: Collect EXPLAIN plans if not already done ─────────────
         if not self._candidate_explains and self.all_worker_results:
@@ -1419,7 +1306,6 @@ class SwarmSession(OptimizationSession):
             semantic_intents=self._semantic_intents,
             regression_warnings=self._regression_warnings,
             shared_briefing=shared_briefing,
-            resource_envelope=self._resource_envelope,
             dialect=self.dialect,
             engine_version=self.pipeline._engine_version,
             target_speedup=self.target_speedup,

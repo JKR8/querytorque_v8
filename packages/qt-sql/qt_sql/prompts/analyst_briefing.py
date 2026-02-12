@@ -1237,12 +1237,6 @@ def build_analyst_briefing_prompt(
         )
         lines.append("")
 
-    # ── 11b. PG SET LOCAL config for oneshot (analyst IS the worker) ─────
-    if mode == "oneshot" and dialect in ("postgres", "postgresql") and resource_envelope:
-        from .worker import _section_set_local_config
-        lines.append(_section_set_local_config(resource_envelope))
-        lines.append("")
-
     # ── 12. Output format specification ──────────────────────────────────
     lines.append("Then produce the structured briefing in EXACTLY this format:")
     lines.append("")
@@ -1856,12 +1850,6 @@ def build_script_oneshot_prompt(
         "component payload in the output format below."
     )
     lines.append("")
-
-    # ── 7b. PG SET LOCAL config (script-level oneshot) ──────────────────
-    if dialect in ("postgres", "postgresql") and resource_envelope:
-        from .worker import _section_set_local_config
-        lines.append(_section_set_local_config(resource_envelope))
-        lines.append("")
 
     # ── 8. Output format (DAP multi-statement) ─────────────────────────
     lines.append("## Output Format")

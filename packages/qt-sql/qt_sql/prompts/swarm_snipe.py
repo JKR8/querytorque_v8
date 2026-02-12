@@ -1,12 +1,12 @@
 """Snipe prompts for swarm mode.
 
-After fan-out workers attempt the target, the snipe flow runs:
-  1. Analyst: Diagnosis-then-synthesis — sees ALL worker SQL, errors, speedups,
-     engine profile, EXPLAIN plans (original + all candidates). Emits strategy
-     for sniper + RETRY_WORTHINESS.
-  2. Sniper: High-level reasoner with full context, EXPLAIN plans for original
-     and best candidate, and full freedom.
-  3. Sniper retry (optional): Gets compact failure digest + EXPLAIN plans.
+Current flow (V2): Self-directed retry worker — single LLM call per retry
+iteration. The worker diagnoses failures, identifies unexplored angles, and
+produces optimized SQL in one pass.
+
+Deprecated flow (V1): Two-call analyst + sniper. Functions kept for reference:
+  - build_snipe_analyst_prompt() — DEPRECATED
+  - build_sniper_prompt() — DEPRECATED
 """
 
 from __future__ import annotations
@@ -122,10 +122,17 @@ def _build_worker_results_section(
                 lines.append(sql)
                 lines.append("```")
 
-            # EXPLAIN ANALYZE plan for this candidate (co-located with SQL)
+            # Execution plan or error context (co-located with SQL)
             explain_text = explains.get(wr.worker_id)
             if explain_text:
-                lines.append("- **Execution Plan (EXPLAIN ANALYZE):**")
+                # Detect whether this is an actual plan or error context
+                if explain_text.startswith("[EXPLAIN failed"):
+                    label = "Planner Diagnosis"
+                elif explain_text.startswith("[EXPLAIN estimate"):
+                    label = "Execution Plan (EXPLAIN estimate — query errored)"
+                else:
+                    label = "Execution Plan (EXPLAIN ANALYZE)"
+                lines.append(f"- **{label}:**")
                 lines.append("```")
                 plan_lines = explain_text.split("\n")
                 if len(plan_lines) > 80:
@@ -153,6 +160,278 @@ def _build_worker_results_section(
     return "\n".join(lines)
 
 
+def build_retry_worker_prompt(
+    original_sql: str,
+    worker_results: List[WorkerResult],
+    best_worker_sql: Optional[str],
+    examples: List[Dict[str, Any]],
+    output_columns: List[str],
+    dag: Any,
+    costs: Dict[str, Any],
+    explain_plan_text: Optional[str],
+    candidate_explains: Optional[Dict[int, str]],
+    race_timings: Optional[Dict[str, Any]],
+    engine_profile: Optional[Dict[str, Any]],
+    constraints: Optional[List[Dict[str, Any]]],
+    semantic_intents: Optional[Dict[str, Any]],
+    regression_warnings: Optional[List[Dict[str, Any]]],
+    shared_briefing: Optional[Any],
+    dialect: str,
+    engine_version: Optional[str],
+    target_speedup: float,
+    previous_retry_result: Optional[WorkerResult] = None,
+    resource_envelope: Optional[str] = None,  # deprecated, ignored
+) -> str:
+    """Build self-directed retry worker prompt — diagnose + rewrite in one pass.
+
+    Replaces the two-call analyst+sniper flow. The worker gets all raw evidence
+    (previous results, EXPLAIN plans, race timings) plus standard worker context
+    (engine profile, constraints, examples, semantic contract) and self-directs
+    through diagnose → identify → rewrite.
+
+    Args:
+        original_sql: The original SQL query
+        worker_results: ALL results from previous iterations
+        best_worker_sql: Full optimized SQL of the best result (if any > 1.0x)
+        examples: Loaded gold examples (full before/after SQL)
+        output_columns: Expected output columns for completeness contract
+        dag: Parsed logical tree
+        costs: Per-node cost analysis
+        explain_plan_text: EXPLAIN ANALYZE plan text for ORIGINAL query
+        candidate_explains: EXPLAIN ANALYZE plans for each candidate (worker_id → text)
+        race_timings: Raw race timing data
+        engine_profile: Engine profile JSON with optimizer strengths/gaps
+        constraints: Correctness constraints (4 gates)
+        semantic_intents: Pre-computed per-query semantic intents
+        regression_warnings: Regression examples
+        shared_briefing: BriefingShared from fan-out analyst (semantic contract, bottleneck, etc.)
+        dialect: SQL dialect
+        engine_version: Engine version string
+        target_speedup: Target speedup ratio
+        previous_retry_result: Previous retry worker result (for iteration 3+)
+        resource_envelope: Deprecated, ignored. Config tuning moved to config_boost phase.
+
+    Returns:
+        Complete self-directed retry worker prompt string
+    """
+    from .worker import _section_examples, _section_output_format
+    from .analyst_briefing import (
+        _format_regression_for_analyst,
+        _strip_template_comments,
+    )
+    from .briefing_checks import build_sniper_rewrite_checklist
+
+    target = _normalize_speedup(target_speedup)
+    sections: list[str] = []
+
+    # ── 1. Role ──────────────────────────────────────────────────────────
+    engine_names = {
+        "duckdb": "DuckDB",
+        "postgres": "PostgreSQL",
+        "postgresql": "PostgreSQL",
+    }
+    engine = engine_names.get(dialect, dialect)
+    ver = f" v{engine_version}" if engine_version else ""
+
+    sections.append(
+        f"You are a senior SQL optimization architect for {engine}{ver}. "
+        f"You have FULL FREEDOM to design your own approach — you are NOT "
+        f"constrained to any specific logical tree topology or CTE structure. "
+        f"Your job: diagnose WHY previous workers failed to reach {target}x, "
+        f"identify unexplored optimization angles, and produce an optimized SQL "
+        f"rewrite that reaches the target.\n\n"
+        f"Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN "
+        f"y/x END around a division, keep it — guards prevent silent breakage. "
+        f"Strip benchmark comments (-- start query, -- end query) from output."
+    )
+
+    # ── 2. Target ────────────────────────────────────────────────────────
+    sections.append(
+        f"## Target: >={target}x speedup\n\n"
+        f"Your target is >={target}x speedup on this query. This is the bar. "
+        f"Anything below {target}x is a miss."
+    )
+
+    # ── 3. Previous retry result (iteration 3+) ─────────────────────────
+    if previous_retry_result is not None:
+        retry_lines = [
+            "## PREVIOUS RETRY ATTEMPT — Learn from this",
+            "",
+        ]
+        prev_speedup = _normalize_speedup(previous_retry_result.speedup)
+        retry_lines.append(
+            f"Your previous retry achieved **{prev_speedup}x** "
+            f"against a target of **{target}x**."
+        )
+        if previous_retry_result.error_message:
+            retry_lines.append(f"**Error**: {previous_retry_result.error_message}")
+        if previous_retry_result.strategy:
+            retry_lines.append(f"**Strategy**: {previous_retry_result.strategy}")
+        retry_lines.append("")
+        retry_lines.append(
+            "Diagnose why this approach fell short and try a fundamentally "
+            "different angle."
+        )
+        sections.append("\n".join(retry_lines))
+
+    # ── 4. Previous Attempts (PRIMACY) — full SQL + EXPLAIN + race ──────
+    sections.append(_build_worker_results_section(
+        worker_results, target_speedup, full_sql=True,
+        candidate_explains=candidate_explains,
+        race_timings=race_timings,
+    ))
+
+    # ── 5. Best foundation SQL ──────────────────────────────────────────
+    if best_worker_sql:
+        sections.append(
+            "## Best Foundation SQL\n\n"
+            "The best previous result. You may build on this or start fresh.\n\n"
+            "```sql\n"
+            + best_worker_sql.strip() + "\n"
+            "```"
+        )
+
+    # ── 6. Original Execution Plan ─────────────────────────────────────
+    # NOTE: Candidate EXPLAINs are already co-located with each worker's SQL
+    # in section 4 via _build_worker_results_section(). Only the original
+    # plan needs a dedicated section so the worker can compare.
+    if explain_plan_text:
+        explain_lines = ["## Original Execution Plan (EXPLAIN ANALYZE)", ""]
+        explain_lines.append("Compare each candidate's plan (above) against this baseline.")
+        explain_lines.append("")
+        explain_lines.append("```")
+        orig_lines = explain_plan_text.split("\n")
+        if len(orig_lines) > 80:
+            explain_lines.extend(orig_lines[:80])
+            explain_lines.append(f"... ({len(orig_lines) - 80} more lines truncated)")
+        else:
+            explain_lines.extend(orig_lines)
+        explain_lines.append("```")
+        sections.append("\n".join(explain_lines))
+
+    # ── 7. Semantic contract + bottleneck (from fan-out analyst) ─────────
+    if shared_briefing:
+        sc = getattr(shared_briefing, "semantic_contract", "")
+        if sc:
+            sections.append(
+                "## Semantic Contract (MUST preserve)\n\n" + sc
+            )
+        bd = getattr(shared_briefing, "bottleneck_diagnosis", "")
+        if bd:
+            sections.append(
+                "## Bottleneck Diagnosis\n\n" + bd
+            )
+
+    # ── 8. Engine profile ───────────────────────────────────────────────
+    if engine_profile:
+        ep_lines = ["## Engine Profile"]
+        briefing_note = engine_profile.get("briefing_note", "")
+        if briefing_note:
+            ep_lines.append("")
+            ep_lines.append(f"*{briefing_note}*")
+
+        strengths = engine_profile.get("strengths", [])
+        if strengths:
+            ep_lines.append("")
+            ep_lines.append("### Optimizer Strengths (DO NOT fight these)")
+            for s in strengths:
+                ep_lines.append(f"- **{s.get('id', '')}**: {s.get('summary', '')}")
+
+        gaps = engine_profile.get("gaps", [])
+        if gaps:
+            ep_lines.append("")
+            ep_lines.append("### Optimizer Gaps (opportunities)")
+            for g in gaps:
+                gid = g.get("id", "")
+                what = g.get("what", "")
+                opportunity = g.get("opportunity", "")
+                ep_lines.append(f"- **{gid}**: {what}")
+                if opportunity:
+                    ep_lines.append(f"  Opportunity: {opportunity}")
+                what_worked = g.get("what_worked", [])
+                if what_worked:
+                    for w in what_worked[:3]:
+                        ep_lines.append(f"    + {w}")
+        sections.append("\n".join(ep_lines))
+
+    # ── 9. Reference examples ───────────────────────────────────────────
+    if examples:
+        sections.append(_section_examples(examples))
+
+    # ── 10. Correctness invariants (4 constraints — HARD STOPS) ─────────
+    correctness_ids = {
+        "LITERAL_PRESERVATION", "SEMANTIC_EQUIVALENCE",
+        "COMPLETE_OUTPUT", "CTE_COLUMN_COMPLETENESS",
+    }
+    if constraints:
+        cc = [c for c in constraints if c.get("id") in correctness_ids]
+        if cc:
+            ci_lines = [
+                "## Correctness Invariants (HARD STOPS — non-negotiable)",
+                "",
+                "These 4 constraints are absolute. Even with full creative freedom, "
+                "you may NEVER violate these:",
+                "",
+            ]
+            for c in cc:
+                cid = c.get("id", "?")
+                instruction = c.get("prompt_instruction", c.get("description", ""))
+                ci_lines.append(f"- **{cid}**: {instruction}")
+            sections.append("\n".join(ci_lines))
+
+    # ── 11. Aggregation semantics check ─────────────────────────────────
+    sections.append(
+        "## Aggregation Semantics Check (HARD STOP)\n\n"
+        "- STDDEV_SAMP/VARIANCE are grouping-sensitive — changing group "
+        "membership changes the result.\n"
+        "- AVG and STDDEV are NOT duplicate-safe.\n"
+        "- FILTER over a combined group != separate per-group computation.\n"
+        "- Verify aggregation equivalence for ANY proposed restructuring."
+    )
+
+    # ── 12. Regression warnings ─────────────────────────────────────────
+    if regression_warnings:
+        rw_lines = ["## Regression Warnings"]
+        rw_lines.append("")
+        for reg in regression_warnings:
+            rw_lines.append(_format_regression_for_analyst(reg))
+            rw_lines.append("")
+        sections.append("\n".join(rw_lines))
+
+    # ── 13. Original SQL ────────────────────────────────────────────────
+    clean_sql = _strip_template_comments(original_sql)
+    sections.append(
+        "## Original SQL\n\n"
+        "```sql\n"
+        + clean_sql + "\n"
+        "```"
+    )
+
+    # ── 14. Self-directed task ──────────────────────────────────────────
+    best_speedup = max((w.speedup for w in worker_results), default=0.0)
+    sections.append(
+        "## Your Task — Self-Directed Retry\n\n"
+        "Work through these 3 steps in a `<reasoning>` block, then output "
+        "your optimized SQL:\n\n"
+        f"1. **DIAGNOSE**: Why did the best worker achieve "
+        f"{_normalize_speedup(best_speedup)}x instead of the {target}x target? "
+        f"What do the EXPLAIN plans reveal about the actual execution bottleneck?\n"
+        "2. **IDENTIFY**: What optimization angles are still unexplored? "
+        "What did the empirical results reveal that couldn't have been known "
+        "before seeing the execution plans?\n"
+        "3. **REWRITE**: Produce optimized SQL that exploits the angles you "
+        "identified. You may build on the best foundation or start fresh."
+    )
+
+    # ── 16. Rewrite checklist ───────────────────────────────────────────
+    sections.append(build_sniper_rewrite_checklist())
+
+    # ── 17. Column completeness contract + output format ────────────────
+    sections.append(_section_output_format(output_columns, dialect=dialect))
+
+    return "\n\n".join(sections)
+
+
 def build_snipe_analyst_prompt(
     query_id: str,
     original_sql: str,
@@ -173,7 +452,9 @@ def build_snipe_analyst_prompt(
     candidate_explains: Optional[Dict[int, str]] = None,
     race_timings: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Build snipe analyst prompt — diagnosis-then-synthesis.
+    """DEPRECATED: Use build_retry_worker_prompt() instead.
+
+    Build snipe analyst prompt — diagnosis-then-synthesis.
 
     The analyst2 sees FULL consolidated info: all worker SQL, errors,
     speedups, engine profile, EXPLAIN plans (original + candidates),
@@ -450,7 +731,9 @@ def build_sniper_prompt(
     candidate_explains: Optional[Dict[int, str]] = None,
     original_explain_text: Optional[str] = None,
 ) -> str:
-    """Build the sniper's prompt — high-level reasoner with full context.
+    """DEPRECATED: Use build_retry_worker_prompt() instead.
+
+    Build the sniper's prompt — high-level reasoner with full context.
 
     The sniper has FULL FREEDOM to design its own approach. It gets the
     analyst's diagnosis as advisory guidance, not mandatory instructions,
@@ -480,7 +763,7 @@ def build_sniper_prompt(
     Returns:
         Complete sniper prompt string
     """
-    from .worker import _section_examples, _section_output_format, _section_set_local_config
+    from .worker import _section_examples, _section_output_format
     from .analyst_briefing import _format_regression_for_analyst
     from .briefing_checks import build_sniper_rewrite_checklist
 
@@ -714,11 +997,7 @@ def build_sniper_prompt(
         "```"
     )
 
-    # ── 16. SET LOCAL config (PG only) ──────────────────────────────────
-    if dialect in ("postgres", "postgresql") and resource_envelope:
-        sections.append(_section_set_local_config(resource_envelope))
-
-    # ── 17. Rewrite checklist (sniper-specific — no TARGET_LOGICAL_TREE ref) ────
+    # ── 16. Rewrite checklist (sniper-specific — no TARGET_LOGICAL_TREE ref) ────
     sections.append(build_sniper_rewrite_checklist())
 
     # ── 18. Column completeness contract + output format ────────────────
