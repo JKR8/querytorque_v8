@@ -1,0 +1,226 @@
+<reasoning>
+1. **CLASSIFY**: This is a "correlated-aggregate filter" query with star-join characteristics. A CTE computes aggregated returns per customer and state (from catalog_returns joined with date_dim and customer_address). The main query filters these aggregated rows to only those where the return is >1.2× the state average (correlated subquery on the same CTE), then joins with customer and customer_address (current address) filtered to 'IA'. The query has repeated pattern: the CTE is referenced twice (ctr1 and correlated ctr2), creating a self-join pattern.
+
+2. **EXPLAIN PLAN ANALYSIS**: No EXPLAIN plan provided. Using logical tree: CTE (~50% cost, ~1K rows) scans catalog_returns (large fact) joined with date_dim (small) and customer_address (medium). Main query (~50% cost) scans CTE twice (self-join), customer_address again, and customer. Key observations:
+   - CTE is materialized once (PostgreSQL default) and probed twice (ctr1 and ctr2). This is good - no duplicate scanning.
+   - The correlated subquery `ctr1.ctr_total_return > (SELECT avg(ctr_total_return)*1.2 FROM customer_total_return ctr2 WHERE ctr1.ctr_state = ctr2.ctr_state)` executes per row of ctr1, computing state averages repeatedly.
+   - Main query has filter `ca_state = 'IA'` on customer_address (current address), not on CTE's state. CTE includes all states.
+
+3. **GAP MATCHING**:
+   - **COMMA_JOIN_WEAKNESS**: Query uses comma-separated joins in CTE (lines 5-7) and main query (lines 16-18). Opportunity for explicit JOIN syntax.
+   - **CORRELATED_SUBQUERY_PARALYSIS**: Clear correlated subquery (lines 19-21). Subquery re-executes per outer row to compute per-state averages.
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: CTE referenced twice (self-join). Could pre-compute state averages separately.
+   - **NON_EQUI_JOIN_INPUT_BLINDNESS**: Not applicable (no non-equi joins).
+
+4. **AGGREGATION TRAP CHECK**: Only SUM in CTE and AVG in subquery. Both are grouping-insensitive to duplicates (though SUM changes with duplicates). The CTE's GROUP BY includes customer and state - each group is unique. The subquery's AVG is over state groups. No FILTER clauses. Safe to restructure.
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   - **Decorrelate correlated subquery** (HIGHEST): Replace per-row execution with pre-computed state averages JOIN.
+   - **Comma-join to explicit JOIN with dimension prefetch** (MEDIUM): Convert to explicit JOINs and pre-filter selective dimensions.
+   - **Self-join elimination via shared materialization** (MEDIUM): Compute state averages once in separate CTE.
+   - **Late attribute binding** (EXPLORATION): Defer customer_address (current address) join until after filtering.
+
+6. **LOGICAL TREE DESIGN**:
+   - All designs must preserve CTE column completeness: CTE outputs (ctr_customer_sk, ctr_state, ctr_total_return) are used downstream.
+   - Main query needs all customer and customer_address columns for output.
+
+Worker strategies (structurally diverse):
+1. **Decorrelate with explicit joins**: Convert comma joins to explicit JOINs, decorrelate subquery into separate CTE for state averages.
+2. **Dimension prefetch with explicit joins**: Pre-filter date_dim and customer_address (returning) into CTEs, use explicit JOIN syntax.
+3. **Self-join decomposition**: Materialize CTE once, compute state averages in separate CTE, join both in main query.
+4. **Exploration - late binding**: Push 'IA' filter early, defer customer_address join, use LATERAL for customer details.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Find customers in Iowa whose total catalog returns (tax-inclusive) in 2000 exceeded 120% of their returning state's average return, reporting customer and current address details. All joins are INNER (all sides must match). Aggregation uses SUM and AVG which are duplicate-sensitive but safe given GROUP BY uniqueness. Filter dependency: main query's 'IA' filter applies to customer's current address state, not the returning address state in the CTE.
+
+BOTTLENECK_DIAGNOSIS: Dominant cost is the correlated subquery re-executing per state to compute average returns. Scan-bound on catalog_returns (large fact table) with date filter reduces rows. CTE is materialized once (~1K rows) then probed twice. Optimizer already materializes CTE (good) but cannot decorrelate the AVG subquery. Logical tree's 50/50 cost split misleading - subquery execution overhead likely dominant.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output all 15 columns from customer and customer_address tables.
+- CTE_COLUMN_COMPLETENESS: CTEs must include cr_returning_customer_sk, ca_state, cr_return_amt_inc_tax for aggregation.
+- LITERAL_PRESERVATION: Must preserve d_year=2000, multiplier 1.2, ca_state='IA'.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows ordered by all output columns.
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated joins in CTE (catalog_returns, date_dim, customer_address) and main query.
+- CORRELATED_SUBQUERY_PARALYSIS: Subquery on lines 19-21 correlates by ctr_state, re-executes per outer row.
+- CROSS_CTE_PREDICATE_BLINDNESS: CTE referenced twice (ctr1 and ctr2) with same scan pattern.
+
+REGRESSION_WARNINGS:
+1. OR to UNION ALL (0.21x regression):
+   CAUSE: Splitting OR conditions into UNION ALL blocked bitmap index scans.
+   RULE: This query has no OR conditions - do not introduce UNION ALL.
+2. EXISTS to IN conversion (0.50x regression):
+   CAUSE: Converting EXISTS to IN blocked semi-join optimization.
+   RULE: This query has no EXISTS - do not introduce IN subqueries unnecessarily.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: decorrelate_explicit_joins
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_return_address -> returns_cte -> state_avg_cte -> main_explicit_join -> sort_limit
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 2000
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: ~365 (1 year)
+    CONSUMERS: filtered_return_address
+  filtered_return_address:
+    FROM: customer_address
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: ~1000 (all addresses)
+    CONSUMERS: returns_cte
+  returns_cte:
+    FROM: catalog_returns JOIN filtered_date ON cr_returned_date_sk = d_date_sk JOIN filtered_return_address ON cr_returning_addr_sk = ca_address_sk
+    GROUP BY: cr_returning_customer_sk, ca_state
+    AGGREGATE: SUM(cr_return_amt_inc_tax) AS ctr_total_return
+    OUTPUT: cr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, ctr_total_return
+    EXPECTED_ROWS: ~1000
+    CONSUMERS: state_avg_cte, main_explicit_join
+  state_avg_cte:
+    FROM: returns_cte
+    GROUP BY: ctr_state
+    AGGREGATE: AVG(ctr_total_return) AS state_avg
+    OUTPUT: ctr_state, state_avg
+    EXPECTED_ROWS: ~50 (states)
+    CONSUMERS: main_explicit_join
+  main_explicit_join:
+    FROM: returns_cte AS ctr1 JOIN state_avg_cte ON ctr1.ctr_state = state_avg_cte.ctr_state JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk JOIN customer_address ON ca_address_sk = c_current_addr_sk
+    WHERE: ctr1.ctr_total_return > state_avg_cte.state_avg * 1.2 AND ca_state = 'IA'
+    OUTPUT: c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr1.ctr_total_return
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final_sort
+  final_sort:
+    ORDER BY: c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return
+    LIMIT: 100
+EXAMPLES: early_filter_decorrelate, inline_decorrelate_materialized, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- early_filter_decorrelate: Apply pushing date filter into CTE and decorrelating subquery into separate CTE. Ignore that example's UNION ALL structure.
+- inline_decorrelate_materialized: Apply MATERIALIZED CTEs for decorrelation (use AS MATERIALIZED). Ignore the 3-CTE decomposition - we need only 2 CTEs.
+- pg_date_cte_explicit_join: Apply explicit JOIN syntax and date filter CTE. Ignore that example only has date CTE - we also need customer_address CTE.
+HAZARD_FLAGS:
+- Must ensure state_avg_cte uses same grouping as correlated subquery (per state).
+- MATERIALIZED CTEs may block parallelism - but CTEs are small.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: dimension_prefetch_explicit
+TARGET_LOGICAL_TREE:
+  date_cte -> return_addr_cte -> returns_cte -> main_prefetch -> sort_limit
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year = 2000
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: ~365
+    CONSUMERS: returns_cte
+  return_addr_cte:
+    FROM: customer_address
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: ~1000
+    CONSUMERS: returns_cte
+  returns_cte:
+    FROM: catalog_returns JOIN date_cte ON cr_returned_date_sk = d_date_sk JOIN return_addr_cte ON cr_returning_addr_sk = ca_address_sk
+    GROUP BY: cr_returning_customer_sk, ca_state
+    AGGREGATE: SUM(cr_return_amt_inc_tax) AS ctr_total_return
+    OUTPUT: cr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, ctr_total_return
+    EXPECTED_ROWS: ~1000
+    CONSUMERS: main_prefetch
+  main_prefetch:
+    FROM: returns_cte AS ctr1, returns_cte AS ctr2, customer, customer_address
+    WHERE: ctr1.ctr_state = ctr2.ctr_state AND ctr1.ctr_total_return > AVG(ctr2.ctr_total_return) * 1.2 AND ca_address_sk = c_current_addr_sk AND ca_state = 'IA' AND ctr1.ctr_customer_sk = c_customer_sk
+    GROUP BY: ctr1.ctr_customer_sk, ctr1.ctr_state, ctr1.ctr_total_return, all customer and customer_address output columns
+    OUTPUT: c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr1.ctr_total_return
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final_sort
+  final_sort: [same as Worker 1]
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering date and address dimensions into CTEs, convert comma joins to explicit JOINs. Ignore the multi-channel aspect.
+- pg_date_cte_explicit_join: Apply date CTE isolation and explicit JOIN syntax. Ignore that example doesn't handle correlated subquery.
+- early_filter_decorrelate: Apply early dimension filtering. Ignore the decorrelation - keep correlated subquery but with prefetched dimensions.
+HAZARD_FLAGS:
+- Correlated subquery remains - but with prefetched CTEs it may be faster.
+- Must use explicit JOIN syntax in returns_cte (not comma joins).
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: self_join_decomposition
+TARGET_LOGICAL_TREE:
+  returns_cte -> state_avg_cte -> main_decomposed -> sort_limit
+NODE_CONTRACTS:
+  returns_cte:
+    FROM: catalog_returns, date_dim, customer_address
+    WHERE: cr_returned_date_sk = d_date_sk AND d_year = 2000 AND cr_returning_addr_sk = ca_address_sk
+    GROUP BY: cr_returning_customer_sk, ca_state
+    AGGREGATE: SUM(cr_return_amt_inc_tax) AS ctr_total_return
+    OUTPUT: cr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, ctr_total_return
+    EXPECTED_ROWS: ~1000
+    CONSUMERS: state_avg_cte, main_decomposed
+  state_avg_cte:
+    FROM: returns_cte
+    GROUP BY: ctr_state
+    AGGREGATE: AVG(ctr_total_return) AS state_avg
+    OUTPUT: ctr_state, state_avg
+    EXPECTED_ROWS: ~50
+    CONSUMERS: main_decomposed
+  main_decomposed:
+    FROM: returns_cte AS ctr1 JOIN state_avg_cte ON ctr1.ctr_state = state_avg_cte.ctr_state AND ctr1.ctr_total_return > state_avg_cte.state_avg * 1.2 JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk JOIN customer_address ON ca_address_sk = c_current_addr_sk AND ca_state = 'IA'
+    OUTPUT: [same 15 columns as Worker 1]
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final_sort
+  final_sort: [same as Worker 1]
+EXAMPLES: pg_self_join_decomposition, early_filter_decorrelate, inline_decorrelate_materialized
+EXAMPLE_ADAPTATION:
+- pg_self_join_decomposition: Apply materializing the fact+dimension scan once (returns_cte) and deriving both per-customer aggregates and per-state averages from it. Ignore that example's store/customer channel split.
+- early_filter_decorrelate: Apply the decorrelation pattern. Ignore the early filter CTEs - we keep original WHERE in returns_cte.
+- inline_decorrelate_materialized: Apply MATERIALIZED keyword on returns_cte to ensure single computation. Ignore the 3-CTE decomposition.
+HAZARD_FLAGS:
+- PostgreSQL may inline returns_cte (non-materialized) causing duplicate execution. Use AS MATERIALIZED.
+- Must preserve comma joins in returns_cte if keeping original structure.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: late_binding_lateral
+TARGET_LOGICAL_TREE:
+  returns_cte -> state_avg_cte -> filtered_customers -> lateral_details -> sort_limit
+NODE_CONTRACTS:
+  returns_cte:
+    FROM: catalog_returns JOIN date_dim ON cr_returned_date_sk = d_date_sk JOIN customer_address AS returning_addr ON cr_returning_addr_sk = returning_addr.ca_address_sk
+    WHERE: d_year = 2000
+    GROUP BY: cr_returning_customer_sk, returning_addr.ca_state
+    AGGREGATE: SUM(cr_return_amt_inc_tax) AS ctr_total_return
+    OUTPUT: cr_returning_customer_sk AS ctr_customer_sk, returning_addr.ca_state AS ctr_state, ctr_total_return
+    EXPECTED_ROWS: ~1000
+    CONSUMERS: state_avg_cte, filtered_customers
+  state_avg_cte:
+    FROM: returns_cte
+    GROUP BY: ctr_state
+    AGGREGATE: AVG(ctr_total_return) AS state_avg
+    OUTPUT: ctr_state, state_avg
+    EXPECTED_ROWS: ~50
+    CONSUMERS: filtered_customers
+  filtered_customers:
+    FROM: returns_cte AS ctr1 JOIN state_avg_cte ON ctr1.ctr_state = state_avg_cte.ctr_state AND ctr1.ctr_total_return > state_avg_cte.state_avg * 1.2 JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+    WHERE: EXISTS (SELECT 1 FROM customer_address WHERE ca_address_sk = c_current_addr_sk AND ca_state = 'IA')
+    OUTPUT: c_customer_sk, ctr1.ctr_total_return
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: lateral_details
+  lateral_details:
+    FROM: filtered_customers JOIN LATERAL (SELECT * FROM customer_address WHERE ca_address_sk = c_current_addr_sk) AS ca ON true
+    OUTPUT: c_customer_id, c_salutation, c_first_name, c_last_name, ca.ca_street_number, ca.ca_street_name, ca.ca_street_type, ca.ca_suite_number, ca.ca_city, ca.ca_county, ca.ca_state, ca.ca_zip, ca.ca_country, ca.ca_gmt_offset, ca.ca_location_type, filtered_customers.ctr_total_return
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final_sort
+  final_sort: [same as Worker 1]
+EXAMPLES: pg_materialized_dimension_fact_prefilter, early_filter_decorrelate, inline_decorrelate_materialized
+EXAMPLE_ADAPTATION:
+- pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED CTEs and staged reduction. Ignore non-equi joins - we use for filtering.
+- early_filter_decorrelate: Apply decorrelation and early filtering. Ignore the UNION structure.
+- inline_decorrelate_materialized: Use MATERIALIZED CTEs to prevent inlining. Ignore the 3-CTE decomposition.
+HAZARD_FLAGS:
+- LATERAL may force nested loop on customer_address - but filtered to 'IA' and small row count.
+- EXISTS filter might be less efficient than JOIN. Test both.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines late attribute binding with decorrelation and LATERAL)

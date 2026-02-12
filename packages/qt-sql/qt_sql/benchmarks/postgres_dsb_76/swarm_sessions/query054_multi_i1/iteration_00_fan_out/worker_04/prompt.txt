@@ -1,0 +1,520 @@
+You are a SQL rewrite engine for PostgreSQL v16.11-0ubuntu0.24.04.1). Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+## Semantic Contract (MUST preserve)
+
+This query identifies customers who bought Electronics/personal items in Jan 1998 via catalog/web channels (wholesale cost 35-65, birth year 1928-1941), then calculates their store sales revenue in a 3-month window after Jan 1998 in 10 target states, finally grouping customers into $50 revenue segments. All joins are INNER (all sides must match). Aggregates are SUM and COUNT which are duplicate-safe. The date_dim subqueries for d_month_seq range are independent scalar values that must be computed exactly once.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+filtered_item -> filtered_date -> filtered_customer -> filtered_catalog_sales -> filtered_web_sales -> union_all -> my_customers -> my_revenue -> segments -> main_query
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: i_category = 'Electronics' AND i_class = 'personal'
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: 1,454
+    CONSUMERS: filtered_catalog_sales, filtered_web_sales
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 1998 AND d_moy = 1
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 10
+    CONSUMERS: filtered_catalog_sales, filtered_web_sales
+  filtered_customer:
+    FROM: customer
+    WHERE: c_birth_year BETWEEN 1928 AND 1941
+    OUTPUT: c_customer_sk
+    EXPECTED_ROWS: ~403
+    CONSUMERS: filtered_catalog_sales, filtered_web_sales
+  filtered_catalog_sales:
+    FROM: catalog_sales
+          INNER JOIN filtered_date ON catalog_sales.cs_sold_date_sk = filtered_date.d_date_sk
+          INNER JOIN filtered_item ON catalog_sales.cs_item_sk = filtered_item.i_item_sk
+          INNER JOIN filtered_customer ON catalog_sales.cs_bill_customer_sk = filtered_customer.c_customer_sk
+    WHERE: catalog_sales.cs_wholesale_cost BETWEEN 35 AND 65
+    OUTPUT: cs_bill_customer_sk as customer_sk
+    EXPECTED_ROWS: ~23 per worker
+    CONSUMERS: union_all
+  filtered_web_sales:
+    FROM: web_sales
+          INNER JOIN filtered_date ON web_sales.ws_sold_date_sk = filtered_date.d_date_sk
+          INNER JOIN filtered_item ON web_sales.ws_item_sk = filtered_item.i_item_sk
+          INNER JOIN filtered_customer ON web_sales.ws_bill_customer_sk = filtered_customer.c_customer_sk
+    WHERE: web_sales.ws_wholesale_cost BETWEEN 35 AND 65
+    OUTPUT: ws_bill_customer_sk as customer_sk
+    EXPECTED_ROWS: ~23 per worker
+    CONSUMERS: union_all
+  union_all:
+    FROM: filtered_catalog_sales UNION ALL filtered_web_sales
+    OUTPUT: customer_sk
+    EXPECTED_ROWS: 69
+    CONSUMERS: my_customers
+
+NODE_CONTRACTS:
+filtered_item:
+    FROM: item
+    WHERE: i_category = 'Electronics' AND i_class = 'personal'
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: 1,454
+    CONSUMERS: filtered_catalog_sales, filtered_web_sales
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 1998 AND d_moy = 1
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 10
+    CONSUMERS: filtered_catalog_sales, filtered_web_sales
+  filtered_customer:
+    FROM: customer
+    WHERE: c_birth_year BETWEEN 1928 AND 1941
+    OUTPUT: c_customer_sk
+    EXPECTED_ROWS: ~403
+    CONSUMERS: filtered_catalog_sales, filtered_web_sales
+  filtered_catalog_sales:
+    FROM: catalog_sales
+          INNER JOIN filtered_date ON catalog_sales.cs_sold_date_sk = filtered_date.d_date_sk
+          INNER JOIN filtered_item ON catalog_sales.cs_item_sk = filtered_item.i_item_sk
+          INNER JOIN filtered_customer ON catalog_sales.cs_bill_customer_sk = filtered_customer.c_customer_sk
+    WHERE: catalog_sales.cs_wholesale_cost BETWEEN 35 AND 65
+    OUTPUT: cs_bill_customer_sk as customer_sk
+    EXPECTED_ROWS: ~23 per worker
+    CONSUMERS: union_all
+  filtered_web_sales:
+    FROM: web_sales
+          INNER JOIN filtered_date ON web_sales.ws_sold_date_sk = filtered_date.d_date_sk
+          INNER JOIN filtered_item ON web_sales.ws_item_sk = filtered_item.i_item_sk
+          INNER JOIN filtered_customer ON web_sales.ws_bill_customer_sk = filtered_customer.c_customer_sk
+    WHERE: web_sales.ws_wholesale_cost BETWEEN 35 AND 65
+    OUTPUT: ws_bill_customer_sk as customer_sk
+    EXPECTED_ROWS: ~23 per worker
+    CONSUMERS: union_all
+  union_all:
+    FROM: filtered_catalog_sales UNION ALL filtered_web_sales
+    OUTPUT: customer_sk
+    EXPECTED_ROWS: 69
+    CONSUMERS: my_customers
+
+## Hazard Flags (avoid these specific risks)
+
+- May lose parallelism because CTE materialization is single-threaded
+- Need to ensure customer.c_current_addr_sk is preserved (currently missing from output)
+CONSTRAINT_OVERRIDE: CTE_COLUMN_COMPLETENESS
+OVERRIDE_REASONING: The current node contracts for filtered_catalog_sales and filtered_web_sales only output customer_sk, but my_customers needs c_current_addr_sk. This must be fixed by adding c_current_addr_sk to filtered_customer output and propagating through fact CTEs.
+EXPLORATION_TYPE: compound_strategy
+
+## Regression Warnings (observed failures on similar queries)
+
+1. Or To Union (0.21x regression on Q085):
+   CAUSE: Splitting OR conditions into UNION ALL when PostgreSQL's BITMAP_OR_SCAN handles them efficiently
+   RULE: Do NOT convert OR to UNION ALL - this query has no OR conditions to split
+2. EXISTS Restructuring (0.50x regression on Q069):
+   CAUSE: Converting EXISTS to IN/NOT IN or materializing CTEs when semi-join exists is optimal
+   RULE: Do NOT convert EXISTS patterns - this query has no EXISTS/IN subqueries
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Query outputs segment, num_customers, segment_base in that order
+- CTE_COLUMN_COMPLETENESS: my_customers must output c_customer_sk and c_current_addr_sk for my_revenue
+- LITERAL_PRESERVATION: Must preserve all filter values: 'Electronics', 'personal', 1, 1998, 35-65, 1928-1941, state list, etc.
+- SEMANTIC_EQUIVALENCE: Must return same rows as original
+- COMMA_JOIN_WEAKNESS: my_customers uses comma-separated joins (item, date_dim, customer) - EXPLAIN shows nested loops
+- CROSS_CTE_PREDICATE_BLINDNESS: date_dim scanned 3 times (my_customers + 2 subqueries) - EXPLAIN shows 3 separate Index Only Scans
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- pg_dimension_prefetch_star: Apply pre-filtering dimension tables into CTEs. Also apply explicit JOIN syntax.
+- prefetch_fact_join: Apply joining filtered dimensions with fact tables BEFORE UNION ALL. This is the core pattern.
+- star_join_prefetch: Apply pre-filtering ALL dimension tables and probing fact tables with combined key intersection. Ignore the non-equi join aspect.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. pg_dimension_prefetch_star (3.32x)
+
+**Principle:** Multi-Dimension Prefetch (PG): pre-filter all selective dimensions into CTEs to create tiny hash tables, combined with explicit JOIN syntax. PostgreSQL's optimizer gets better cardinality estimates from pre-materialized small dimension results.
+
+**BEFORE (slow):**
+```sql
+with ssr as
+ (select  s_store_id as store_id,
+          sum(ss_ext_sales_price) as sales,
+          sum(coalesce(sr_return_amt, 0)) as returns,
+          sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit
+  from store_sales left outer join store_returns on
+         (ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number),
+     date_dim,
+     store,
+     item,
+     promotion
+ where ss_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+       and ss_store_sk = s_store_sk
+       and ss_item_sk = i_item_sk
+       and i_current_price > 50
+       and ss_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and ss_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+ group by s_store_id)
+ ,
+ csr as
+ (select  cp_catalog_page_id as catalog_page_id,
+          sum(cs_ext_sales_price) as sales,
+          sum(coalesce(cr_return_amount, 0)) as returns,
+          sum(cs_net_profit - coalesce(cr_net_loss, 0)) as profit
+  from catalog_sales left outer join catalog_returns on
+         (cs_item_sk = cr_item_sk and cs_order_number = cr_order_number),
+     date_dim,
+     catalog_page,
+     item,
+     promotion
+ where cs_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+        and cs_catalog_page_sk = cp_catalog_page_sk
+       and cs_item_sk = i_item_sk
+       and i_current_price > 50
+       and cs_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and cs_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+group by cp_catalog_page_id)
+ ,
+ wsr as
+ (select  web_site_id,
+          sum(ws_ext_sales_price) as sales,
+          sum(coalesce(wr_return_amt, 0)) as returns,
+          sum(ws_net_profit - coalesce(wr_net_loss, 0)) as profit
+  from web_sales left outer join web_returns on
+         (ws_item_sk = wr_item_sk and ws_order_number = wr_order_number),
+     date_dim,
+     web_site,
+     item,
+     promotion
+ where ws_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+        and ws_web_site_sk = web_site_sk
+       and ws_item_sk = i_item_sk
+       and i_current_price > 50
+       and ws_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and ws_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+group by web_site_id)
+  select  channel
+        , id
+        , sum(sales) as sales
+        , sum(returns) as returns
+        , sum(profit) as profit
+ from
+ (select 'store channel' as channel
+        , 'store' || store_id as id
+        , sales
+        , returns
+        , profit
+ from   ssr
+ union all
+ select 'catalog channel' as channel
+        , 'catalog_page' || catalog_page_id as id
+        , sales
+        , returns
+        , profit
+ from  csr
+ union all
+ select 'web channel' as channel
+        , 'web_site' || web_site_id as id
+        , sales
+        , returns
+        , profit
+ from   wsr
+ ) x
+ group by rollup (channel, id)
+ order by channel
+         ,id
+ limit 100;
+```
+
+**AFTER (fast):**
+[filtered_date]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-23' AS DATE) AND CAST('1998-08-23' AS DATE) + INTERVAL '30 DAY'
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk FROM item WHERE i_current_price > 50 AND i_category IN ('Jewelry', 'Music')
+```
+[filtered_promotion]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'Y' AND p_channel_tv = 'Y' AND p_channel_radio = 'N' AND p_channel_press = 'N' AND p_channel_event = 'Y'
+```
+[ssr]:
+```sql
+SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS returns, SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit FROM store_sales LEFT OUTER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) INNER JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk INNER JOIN store ON ss_store_sk = s_store_sk INNER JOIN filtered_item ON ss_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ss_promo_sk = filtered_promotion.p_promo_sk WHERE ss_wholesale_cost BETWEEN 63 AND 78 GROUP BY s_store_id
+```
+[csr]:
+```sql
+SELECT cp_catalog_page_id AS catalog_page_id, SUM(cs_ext_sales_price) AS sales, SUM(COALESCE(cr_return_amount, 0)) AS returns, SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit FROM catalog_sales LEFT OUTER JOIN catalog_returns ON (cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number) INNER JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk INNER JOIN catalog_page ON cs_catalog_page_sk = cp_catalog_page_sk INNER JOIN filtered_item ON cs_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON cs_promo_sk = filtered_promotion.p_promo_sk WHERE cs_wholesale_cost BETWEEN 63 AND 78 GROUP BY cp_catalog_page_id
+```
+[wsr]:
+```sql
+SELECT web_site_id, SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS returns, SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit FROM web_sales LEFT OUTER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number) INNER JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk INNER JOIN web_site ON ws_web_site_sk = web_site_sk INNER JOIN filtered_item ON ws_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ws_promo_sk = filtered_promotion.p_promo_sk WHERE ws_wholesale_cost BETWEEN 63 AND 78 GROUP BY web_site_id
+```
+[main_query]:
+```sql
+SELECT channel, id, SUM(sales) AS sales, SUM(returns) AS returns, SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, returns, profit FROM ssr UNION ALL SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, returns, profit FROM csr UNION ALL SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, returns, profit FROM wsr) AS x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100
+```
+
+## Original SQL
+
+```sql
+with my_customers as (
+ select distinct c_customer_sk
+        , c_current_addr_sk
+ from
+        ( select cs_sold_date_sk sold_date_sk,
+                 cs_bill_customer_sk customer_sk,
+                 cs_item_sk item_sk,
+                 cs_wholesale_cost wholesale_cost
+          from   catalog_sales
+          union all
+          select ws_sold_date_sk sold_date_sk,
+                 ws_bill_customer_sk customer_sk,
+                 ws_item_sk item_sk,
+                 ws_wholesale_cost wholesale_cost
+          from   web_sales
+         ) cs_or_ws_sales,
+         item,
+         date_dim,
+         customer
+ where   sold_date_sk = d_date_sk
+         and item_sk = i_item_sk
+         and i_category = 'Electronics'
+         and i_class = 'personal'
+         and c_customer_sk = cs_or_ws_sales.customer_sk
+         and d_moy = 1
+         and d_year = 1998
+         and wholesale_cost BETWEEN 35 AND 65
+         and c_birth_year BETWEEN 1928 AND 1941
+ )
+ , my_revenue as (
+ select c_customer_sk,
+        sum(ss_ext_sales_price) as revenue
+ from   my_customers,
+        store_sales,
+        customer_address,
+        store,
+        date_dim
+ where  c_current_addr_sk = ca_address_sk
+        and ca_county = s_county
+        and ca_state = s_state
+        and ss_sold_date_sk = d_date_sk
+        and c_customer_sk = ss_customer_sk
+        and ss_wholesale_cost BETWEEN 35 AND 65
+        and s_state in ('AR','CO','IA'
+                    ,'IL','KY','NC'
+                    ,'NM','NY','PA'
+                    ,'TX')
+        and d_month_seq between (select distinct d_month_seq+1
+                                 from   date_dim where d_year = 1998 and d_moy = 1)
+                           and  (select distinct d_month_seq+3
+                                 from   date_dim where d_year = 1998 and d_moy = 1)
+ group by c_customer_sk
+ )
+ , segments as
+ (select cast((revenue/50) as int) as segment
+  from   my_revenue
+ )
+  select  segment, count(*) as num_customers, segment*50 as segment_base
+ from segments
+ group by segment
+ order by segment, num_customers
+ limit 100;
+```
+
+## Per-Rewrite Configuration (SET LOCAL)
+
+You have two optimization levers: SQL rewrite AND per-query configuration.
+After writing your rewrite, analyze its execution profile and emit SET LOCAL
+commands that fix planner-level bottlenecks specific to YOUR rewrite.
+
+Memory budget: shared_buffers=128MB, effective_cache_size=4GB
+Global work_mem: 4MB (per-operation)
+Active connections: ~1 (work_mem headroom: safe up to 16MB per-op)
+Storage: HDD (random_page_cost=4.0)
+Parallel capacity: max_parallel_workers=8, per_gather=2
+
+SET LOCAL permissions:
+  user-level (always available): effective_cache_size, enable_hashjoin, enable_mergejoin, enable_nestloop, enable_seqscan, from_collapse_limit, geqo_threshold, hash_mem_multiplier, jit, jit_above_cost, join_collapse_limit, max_parallel_workers_per_gather, parallel_setup_cost, parallel_tuple_cost, random_page_cost, work_mem
+
+### Tunable Parameters (whitelist — only these are allowed)
+
+- **effective_cache_size** (1024MB–65536MB): Advisory: how much OS cache to expect (MB). Safe to set aggressively.
+- **enable_hashjoin** (on | off): Enable hash join plan type.
+- **enable_mergejoin** (on | off): Enable merge join plan type.
+- **enable_nestloop** (on | off): Enable nested-loop join plan type.
+- **enable_seqscan** (on | off): Enable sequential scan plan type.
+- **from_collapse_limit** (1–20): Max FROM items before subqueries stop being flattened.
+- **geqo_threshold** (2–20): Number of FROM items that triggers genetic query optimizer.
+- **hash_mem_multiplier** (1.0–10.0): Multiplier applied to work_mem for hash-based operations.
+- **jit** (on | off): Enable JIT compilation.
+- **jit_above_cost** (0.0–1000000.0): Query cost above which JIT is activated.
+- **join_collapse_limit** (1–20): Max FROM items before planner stops trying all join orders.
+- **max_parallel_workers_per_gather** (0–8): Max parallel workers per Gather node.
+- **parallel_setup_cost** (0.0–10000.0): Planner estimate of cost to launch parallel workers.
+- **parallel_tuple_cost** (0.0–1.0): Planner estimate of cost to transfer a tuple to parallel worker.
+- **random_page_cost** (1.0–10.0): Planner estimate of cost of a random page fetch (1.0 = SSD, 4.0 = HDD).
+- **work_mem** (64MB–2048MB): Memory for sorts/hashes per operation (MB). Allocated PER-OPERATION, not per-query. Count hash/sort ops in EXPLAIN before sizing.
+
+### Rules
+- Every SET LOCAL MUST cite a specific EXPLAIN node your rewrite creates/changes
+- work_mem is PER-OPERATION: count hash/sort ops in your rewrite before sizing
+- random_page_cost: ONLY change if your rewrite creates index-favorable access patterns
+- Empty is valid: if your rewrite has no planner bottleneck, emit no SET LOCAL
+- Stay within the resource envelope bounds above
+
+### SET LOCAL Syntax
+Include SET LOCAL commands in the `runtime_config` array field of your JSON output.
+If no config changes help, omit the field or use an empty array.
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `segment`
+  2. `num_customers`
+  3. `segment_base`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] my_customers  [=]  Cost: 84%  Rows: ~31K
+│   ├── SCAN (catalog_sales, web_sales, item (join), date_dim (join), customer (join))
+│   ├── JOIN (sold_date_sk = d_date_sk)
+│   ├── JOIN (item_sk = i_item_sk)
+│   ├── JOIN (+1 more)
+│   ├── FILTER (i_category = 'Electronics')
+│   ├── FILTER (i_class = 'personal')
+│   ├── FILTER (+4 more)
+│   ├── UNION
+│   └── OUTPUT (c_customer_sk, c_current_addr_sk)
+├── [CTE] my_revenue  [=]  Cost: 9%  Rows: ~69
+│   ├── SCAN (my_customers, store_sales (join), customer_address (join), store (join), date_dim (join))
+│   ├── JOIN (c_current_addr_sk = ca_address_sk)
+│   ├── JOIN (ca_county = s_county)
+│   ├── JOIN (+3 more)
+│   ├── FILTER (ss_wholesale_cost BETWEEN 35 AND 65)
+│   ├── FILTER (s_state IN ('AR', 'CO', 'IA', 'IL', 'KY', 'NC', 'NM', 'NY', 'PA', 'TX'))
+│   ├── FILTER (+1 more)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (c_customer_sk, revenue)
+├── [CTE] segments  [=]  Cost: 0%  Rows: ~1K
+│   ├── SCAN (my_revenue)
+│   └── OUTPUT (segment)
+└── [MAIN] main_query  [=]  Cost: 6%
+    ├── SCAN (segments)
+    ├── AGG (GROUP BY)
+    ├── SORT (segment ASC, num_customers ASC)
+    └── OUTPUT (segment, num_customers, segment_base)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit or use empty array if not needed
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

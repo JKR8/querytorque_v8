@@ -1,0 +1,84 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1  — Rewritten to use CTE structure with dimension bitmaps
+    ├── [CTE] date_cte  [+]  Cost: 0%  Rows: 365  — Filter date_dim for 1999
+    ├── [CTE] store_cte  [+]  Cost: 0%  Rows: 100  — Filter store for s_store_sk <= 100
+    ├── [CTE] demographics_bitmap  [+]  Cost: 0%  Rows: ~1.9M  — Encode three demographic groups
+    ├── [CTE] address_bitmap  [+]  Cost: 0%  Rows: ~242K  — Encode three state groups
+    ├── [CTE] store_sales_enriched  [+]  Cost: 99%  Rows: ~5,806  — Join fact with all bitmaps, apply combined OR conditions
+    ├── [CTE] aggregation  [+]  Cost: 1%  Rows: 1  — Sum quantity
+    └── OUTPUT (SUM(ss_quantity) as total_quantity)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb_v1.4.3",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_bitmap_encoding", "description": "Replace dimension table joins with pre-filtered CTEs that encode OR groups as bitmap integers", "applied_to": ["demographics_bitmap", "address_bitmap"]},
+    {"id": "R2", "type": "single_pass_fact_scan", "description": "Join fact table once with all dimension bitmaps and apply OR conditions via bitmap labels", "applied_to": ["store_sales_enriched"]},
+    {"id": "R3", "type": "cte_structure", "description": "Reorganize query into explicit CTE pipeline matching target logical tree", "applied_to": ["date_cte", "store_cte", "demographics_bitmap", "address_bitmap", "store_sales_enriched", "aggregation"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "store_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_store_sk FROM store WHERE s_store_sk <= 100",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "demographics_bitmap": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cd_demo_sk, CASE WHEN cd_marital_status = 'U' AND cd_education_status = 'Primary' THEN 1 WHEN cd_marital_status = 'W' AND cd_education_status = 'College' THEN 2 WHEN cd_marital_status = 'D' AND cd_education_status = '2 yr Degree' THEN 3 END AS demo_group FROM customer_demographics WHERE (cd_marital_status = 'U' AND cd_education_status = 'Primary') OR (cd_marital_status = 'W' AND cd_education_status = 'College') OR (cd_marital_status = 'D' AND cd_education_status = '2 yr Degree')",
+        "interfaces": {"outputs": ["cd_demo_sk", "demo_group"], "consumes": []}
+      },
+      "address_bitmap": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk, CASE WHEN ca_state IN ('MD','MN','IA') THEN 1 WHEN ca_state IN ('VA','IL','TX') THEN 2 WHEN ca_state IN ('MI','WI','IN') THEN 3 END AS addr_group FROM customer_address WHERE ca_country = 'United States' AND ca_state IN ('MD','MN','IA','VA','IL','TX','MI','WI','IN')",
+        "interfaces": {"outputs": ["ca_address_sk", "addr_group"], "consumes": []}
+      },
+      "store_sales_enriched": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss.ss_quantity FROM store_sales ss INNER JOIN date_cte d ON ss.ss_sold_date_sk = d.d_date_sk INNER JOIN store_cte s ON ss.ss_store_sk = s.s_store_sk INNER JOIN demographics_bitmap cd ON ss.ss_cdemo_sk = cd.cd_demo_sk INNER JOIN address_bitmap ca ON ss.ss_addr_sk = ca.ca_address_sk WHERE ((cd.demo_group = 1 AND ss.ss_sales_price BETWEEN 100.00 AND 150.00) OR (cd.demo_group = 2 AND ss.ss_sales_price BETWEEN 50.00 AND 100.00) OR (cd.demo_group = 3 AND ss.ss_sales_price BETWEEN 150.00 AND 200.00)) AND ((ca.addr_group = 1 AND ss.ss_net_profit BETWEEN 0 AND 2000) OR (ca.addr_group = 2 AND ss.ss_net_profit BETWEEN 150 AND 3000) OR (ca.addr_group = 3 AND ss.ss_net_profit BETWEEN 50 AND 25000))",
+        "interfaces": {"outputs": ["ss_quantity"], "consumes": ["date_cte", "store_cte", "demographics_bitmap", "address_bitmap"]}
+      },
+      "aggregation": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT SUM(ss_quantity) AS total_quantity FROM store_sales_enriched",
+        "interfaces": {"outputs": ["total_quantity"], "consumes": ["store_sales_enriched"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT total_quantity AS \"sum(ss_quantity)\" FROM aggregation",
+        "interfaces": {"outputs": ["sum(ss_quantity)"], "consumes": ["aggregation"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "store_cte", "demographics_bitmap", "address_bitmap", "store_sales_enriched", "aggregation", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), store_cte AS ({store_cte}), demographics_bitmap AS ({demographics_bitmap}), address_bitmap AS ({address_bitmap}), store_sales_enriched AS ({store_sales_enriched}), aggregation AS ({aggregation}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Reorganized original multi-table join into explicit CTE pipeline with dimension bitmaps that encode OR groups as integer labels. This enables single fact scan with simplified join conditions while preserving exact OR logic through bitmap matching.
+
+**Expected speedup:** ~1.5-2× due to reduced join complexity and better predicate pushdown into pre-filtered dimension CTEs. The bitmap encoding avoids repeated evaluation of OR conditions per row.

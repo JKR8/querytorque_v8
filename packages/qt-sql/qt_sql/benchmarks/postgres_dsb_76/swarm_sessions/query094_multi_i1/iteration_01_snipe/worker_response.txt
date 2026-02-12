@@ -1,0 +1,115 @@
+<reasoning>
+**DIAGNOSE: Why 1.254x, not 2.0x?**
+The best attempt (W4) achieved only 1.254x because it still performed a heavy hash anti-join between filtered web_sales (903 rows) and the entire web_returns table filtered only by wr_reason_sk (50K rows). While it pre‑filtered web_returns via a CTE, the hash table was still built on 50K rows. The real bottleneck is that the anti‑join must scan the entire web_returns table for the given reasons, and the hash table is large relative to the filtered web_sales set.
+
+**IDENTIFY: Unexplored angles**
+1. **Aggressive dimension pre‑filtering + explicit JOIN syntax**: The original query uses comma‑joins, which PostgreSQL handles poorly. W4 already converted to explicit JOINs, but we can go further by materializing highly‑selective dimension filters (date_dim, customer_address, web_site) into tiny CTEs before joining with web_sales. This reduces the fact table probe size earlier.
+2. **Push anti‑join earlier via NOT IN with pre‑aggregated web_returns**: Instead of a hash anti‑join on 50K rows, we can pre‑aggregate web_returns by wr_order_number (for the given reasons) and use a NOT IN subquery. PostgreSQL can execute NOT IN with a hashed subplan, building a hash table on distinct order numbers only, which is much smaller.
+3. **Materialize the multi‑warehouse condition as a separate CTE**: The semi‑join (EXISTS with ws2) is cheap (index‑only scan) but still a nested loop per row. We can pre‑compute orders with multiple warehouses by grouping web_sales on ws_order_number (count distinct ws_warehouse_sk > 1) and then join. This is risky (W2 regressed due to full table scan), but we can restrict the grouping to orders that pass the dimension filters by first creating a filtered web_sales CTE.
+4. **Use MATERIALIZED CTEs strategically**: PostgreSQL materializes CTEs by default when referenced multiple times. We can force materialization of the filtered web_sales CTE to avoid re‑scanning the fact table for the anti‑join and semi‑join.
+
+**REWRITE Strategy**
+We’ll combine:
+- Explicit JOIN syntax (already done).
+- Materialized dimension CTEs for date_dim, customer_address, web_site.
+- A filtered web_sales CTE that joins these dimension CTEs and applies ws_list_price filter.
+- A pre‑aggregated web_returns CTE (distinct wr_order_number for the given reasons).
+- A multi‑warehouse CTE that groups the filtered web_sales by ws_order_number and counts distinct warehouses.
+- Then join the filtered web_sales with the multi‑warehouse CTE (inner) and anti‑join with the web_returns CTE via NOT IN.
+- Finally aggregate.
+
+This reduces the anti‑join hash table to distinct order numbers, pushes dimension filters early, and replaces the correlated semi‑join with a single hash join.
+</reasoning>
+
+## Modified Logic Tree
+
+```
+[=] original_query
+├── [+] date_cte (materialized) – filter date_dim by 60‑day range
+├── [+] ca_cte (materialized) – filter customer_address by 6 states
+├── [+] web_site_cte (materialized) – filter web_site by web_gmt_offset >= -5
+├── [+] filtered_ws (materialized) – join web_sales with the three dimension CTEs, add ws_list_price filter
+├── [+] bad_orders – distinct wr_order_number from web_returns where wr_reason_sk in (7,25,26,52,69)
+├── [+] multi_warehouse_orders – from filtered_ws, group by ws_order_number having count(distinct ws_warehouse_sk) > 1
+├── [+] final_set – join filtered_ws with multi_warehouse_orders (inner) and filter out orders in bad_orders via NOT IN
+└── [~] main_query – aggregate final_set (count distinct ws_order_number, sum ws_ext_ship_cost, sum ws_net_profit)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pg_dimension_prefetch_star", "description": "Materialize selective dimension filters into CTEs", "applied_to": ["date_cte", "ca_cte", "web_site_cte"]},
+    {"id": "R2", "type": "explicit_join_syntax", "description": "Convert comma-joins to explicit INNER JOIN", "applied_to": ["filtered_ws"]},
+    {"id": "R3", "type": "anti_join_aggregation", "description": "Pre-aggregate web_returns to distinct order numbers for NOT IN", "applied_to": ["bad_orders"]},
+    {"id": "R4", "type": "self_join_decomposition", "description": "Replace correlated EXISTS with grouped multi-warehouse CTE", "applied_to": ["multi_warehouse_orders"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY'",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "ca_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('CA','MI','OH','SD','TX','VA')",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "web_site_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT web_site_sk FROM web_site WHERE web_gmt_offset >= -5",
+        "interfaces": {"outputs": ["web_site_sk"], "consumes": []}
+      },
+      "filtered_ws": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk FROM web_sales ws1 INNER JOIN date_cte ON ws1.ws_ship_date_sk = date_cte.d_date_sk INNER JOIN ca_cte ON ws1.ws_ship_addr_sk = ca_cte.ca_address_sk INNER JOIN web_site_cte ON ws1.ws_web_site_sk = web_site_cte.web_site_sk WHERE ws1.ws_list_price BETWEEN 237 AND 266",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit", "ws_warehouse_sk"], "consumes": ["date_cte", "ca_cte", "web_site_cte"]}
+      },
+      "bad_orders": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT DISTINCT wr_order_number FROM web_returns WHERE wr_reason_sk IN (7,25,26,52,69)",
+        "interfaces": {"outputs": ["wr_order_number"], "consumes": []}
+      },
+      "multi_warehouse_orders": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws_order_number FROM filtered_ws GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk) > 1",
+        "interfaces": {"outputs": ["ws_order_number"], "consumes": ["filtered_ws"]}
+      },
+      "final_set": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT fws.ws_order_number, fws.ws_ext_ship_cost, fws.ws_net_profit FROM filtered_ws fws INNER JOIN multi_warehouse_orders mwo ON fws.ws_order_number = mwo.ws_order_number WHERE fws.ws_order_number NOT IN (SELECT wr_order_number FROM bad_orders)",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": ["filtered_ws", "multi_warehouse_orders", "bad_orders"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(DISTINCT ws_order_number) AS \"order count\", SUM(ws_ext_ship_cost) AS \"total shipping cost\", SUM(ws_net_profit) AS \"total net profit\" FROM final_set ORDER BY COUNT(DISTINCT ws_order_number) LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["final_set"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "ca_cte", "web_site_cte", "filtered_ws", "bad_orders", "multi_warehouse_orders", "final_set", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), ca_cte AS ({ca_cte}), web_site_cte AS ({web_site_cte}), filtered_ws AS ({filtered_ws}), bad_orders AS ({bad_orders}), multi_warehouse_orders AS ({multi_warehouse_orders}), final_set AS ({final_set}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '32MB'", "SET LOCAL hash_mem_multiplier = 2.0", "SET LOCAL enable_nestloop = off"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Materialized dimension CTEs to pre‑filter; converted anti‑join to NOT IN with pre‑aggregated web_returns; replaced correlated semi‑join with grouped multi‑warehouse CTE.
+
+**Expected speedup**: ~2.5x – reduces hash table size for anti‑join (distinct order numbers only) and replaces nested‑loop semi‑join with a hash join on grouped orders. The SET LOCAL settings ensure hash operations stay in memory and discourage nested loops for the semi‑join.

@@ -1,0 +1,590 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Estimate May 2000 cross-channel demand from high-value store customers by summing catalog and web sales for items that were frequently sold in stores during 2000-2003. All joins are INNER (intersection semantics) - rows must match on all sides. Aggregates are COUNT(*), SUM, and MAX which are duplicate-insensitive given the join patterns. Filter dependencies: frequent_ss_items and best_ss_customer CTEs must be computed over 2000-2003 store sales only; main query filters to May 2000 catalog/web sales; changing these temporal scopes breaks semantics.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+store_sales_unified_scan -> frequent_items_and_max_sales -> best_customers -> main_union
+NODE_CONTRACTS:
+  store_sales_unified_scan:
+    FROM: store_sales
+    JOIN: none
+    WHERE: none
+    GROUP BY: none
+    AGGREGATE: none
+    OUTPUT: ss_item_sk, ss_customer_sk, ss_quantity, ss_sales_price, ss_sold_date_sk
+    EXPECTED_ROWS: 345.6M (full scan)
+    CONSUMERS: frequent_items_and_max_sales
+  frequent_items_and_max_sales:
+    FROM: store_sales_unified_scan 
+         LEFT JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year >= 2000 AND d_year <= 2003
+         LEFT JOIN item ON ss_item_sk = i_item_sk
+         LEFT JOIN customer ON ss_customer_sk = c_customer_sk
+    JOIN: LEFT JOIN date_dim (with filter), LEFT JOIN item, LEFT JOIN customer
+    WHERE: none
+    GROUP BY: ss_item_sk, i_item_desc, ss_customer_sk, d_date
+    AGGREGATE: 
+        COUNT(CASE WHEN d_date_sk IS NOT NULL THEN 1 END) as cnt,
+        SUM(CASE WHEN d_date_sk IS NOT NULL THEN ss_quantity * ss_sales_price END) as csales
+    OUTPUT: ss_item_sk, substr(i_item_desc,1,30) as itemdesc, d_date, cnt, ss_customer_sk, csales
+    EXPECTED_ROWS: unknown (group by on large set)
+    CONSUMERS: frequent_items_filtered, max_sales_filtered
+  frequent_items_filtered:
+    FROM: frequent_items_and_max_sales
+    JOIN: none
+    WHERE: cnt > 4 AND d_date IS NOT NULL
+    GROUP BY: itemdesc, ss_item_sk, d_date
+    AGGREGATE: none
+    OUTPUT: itemdesc, ss_item_sk as item_sk, d_date as solddate, cnt
+    EXPECTED_ROWS: 4,202
+    CONSUMERS: main_union
+  max_sales_filtered:
+    FROM: frequent_items_and_max_sales
+    JOIN: none
+    WHERE: csales IS NOT NULL
+    GROUP BY: ss_customer_sk
+    AGGREGATE: SUM(csales) as csales_sum
+    OUTPUT: ss_customer_sk, csales_sum
+    EXPECTED_ROWS: 472K
+    CONSUMERS: max_store_sales_agg
+  max_store_sales_agg:
+    FROM: max_sales_filtered
+    JOIN: none
+    WHERE: none
+    GROUP BY: none
+    AGGREGATE: MAX(csales_sum) as tpcds_cmax
+    OUTPUT: tpcds_cmax
+    EXPECTED_ROWS: 1
+    CONSUMERS: best_customers
+  best_customers:
+    FROM: store_sales JOIN customer ON ss_customer_sk = c_customer_sk
+    JOIN: INNER on ss_customer_sk = c_customer_sk
+    WHERE: none
+    GROUP BY: c_customer_sk
+    AGGREGATE: SUM(ss_quantity * ss_sales_price) as ssales
+    HAVING: SUM(ss_quantity * ss_sales_price) > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales_agg)
+    OUTPUT: c_customer_sk, ssales
+    EXPECTED_ROWS: 171
+    CONSUMERS: main_union
+
+NODE_CONTRACTS:
+store_sales_unified_scan:
+    FROM: store_sales
+    JOIN: none
+    WHERE: none
+    GROUP BY: none
+    AGGREGATE: none
+    OUTPUT: ss_item_sk, ss_customer_sk, ss_quantity, ss_sales_price, ss_sold_date_sk
+    EXPECTED_ROWS: 345.6M (full scan)
+    CONSUMERS: frequent_items_and_max_sales
+  frequent_items_and_max_sales:
+    FROM: store_sales_unified_scan 
+         LEFT JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year >= 2000 AND d_year <= 2003
+         LEFT JOIN item ON ss_item_sk = i_item_sk
+         LEFT JOIN customer ON ss_customer_sk = c_customer_sk
+    JOIN: LEFT JOIN date_dim (with filter), LEFT JOIN item, LEFT JOIN customer
+    WHERE: none
+    GROUP BY: ss_item_sk, i_item_desc, ss_customer_sk, d_date
+    AGGREGATE: 
+        COUNT(CASE WHEN d_date_sk IS NOT NULL THEN 1 END) as cnt,
+        SUM(CASE WHEN d_date_sk IS NOT NULL THEN ss_quantity * ss_sales_price END) as csales
+    OUTPUT: ss_item_sk, substr(i_item_desc,1,30) as itemdesc, d_date, cnt, ss_customer_sk, csales
+    EXPECTED_ROWS: unknown (group by on large set)
+    CONSUMERS: frequent_items_filtered, max_sales_filtered
+  frequent_items_filtered:
+    FROM: frequent_items_and_max_sales
+    JOIN: none
+    WHERE: cnt > 4 AND d_date IS NOT NULL
+    GROUP BY: itemdesc, ss_item_sk, d_date
+    AGGREGATE: none
+    OUTPUT: itemdesc, ss_item_sk as item_sk, d_date as solddate, cnt
+    EXPECTED_ROWS: 4,202
+    CONSUMERS: main_union
+  max_sales_filtered:
+    FROM: frequent_items_and_max_sales
+    JOIN: none
+    WHERE: csales IS NOT NULL
+    GROUP BY: ss_customer_sk
+    AGGREGATE: SUM(csales) as csales_sum
+    OUTPUT: ss_customer_sk, csales_sum
+    EXPECTED_ROWS: 472K
+    CONSUMERS: max_store_sales_agg
+  max_store_sales_agg:
+    FROM: max_sales_filtered
+    JOIN: none
+    WHERE: none
+    GROUP BY: none
+    AGGREGATE: MAX(csales_sum) as tpcds_cmax
+    OUTPUT: tpcds_cmax
+    EXPECTED_ROWS: 1
+    CONSUMERS: best_customers
+  best_customers:
+    FROM: store_sales JOIN customer ON ss_customer_sk = c_customer_sk
+    JOIN: INNER on ss_customer_sk = c_customer_sk
+    WHERE: none
+    GROUP BY: c_customer_sk
+    AGGREGATE: SUM(ss_quantity * ss_sales_price) as ssales
+    HAVING: SUM(ss_quantity * ss_sales_price) > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales_agg)
+    OUTPUT: c_customer_sk, ssales
+    EXPECTED_ROWS: 171
+    CONSUMERS: main_union
+
+## Hazard Flags (avoid these specific risks)
+
+- LEFT JOIN with filter may not be equivalent to original INNER JOIN semantics (rows with no date match will have NULLs).
+- Aggregation on large GROUP BY (ss_item_sk, i_item_desc, ss_customer_sk, d_date) could be prohibitively expensive.
+- May change cardinality if date filter is not correctly applied.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This strategy attempts a novel single-scan approach but must ensure equivalence to original INNER JOIN semantics. The LEFT JOIN with filter may produce NULLs for non-matching date rows, but the CASE aggregates ignore NULLs, mimicking the original filter. However, the GROUP BY includes all rows, not just date-matched ones, which could affect counts. Need to verify COUNT(*) equivalence.
+EXPLORATION_TYPE: novel_combination
+
+## Regression Warnings (observed failures on similar queries)
+
+1. materialize_cte (observed regression in Q16):
+   CAUSE: Converting EXISTS to materialized CTE forced full scan, destroying semi-join short-circuit.
+   RULE: Do not convert EXISTS/NOT EXISTS filters to materialized CTEs. This query uses IN subqueries (already materializing), safe.
+2. prefetch_fact_join (observed regression in Q25):
+   CAUSE: Baseline runtime <50ms, CTE overhead dominated savings.
+   RULE: Skip if baseline <100ms. This query baseline is 15945ms, safe.
+3. union_cte_split (observed regression in Q74):
+   CAUSE: Kept both original UNION and specialized CTEs, causing redundant materialization.
+   RULE: When splitting CTEs, eliminate the original unfiltered version.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Query outputs single column sum(sales) - must preserve.
+- CTE_COLUMN_COMPLETENESS: Each CTE must output all columns referenced by downstream (item_sk, c_customer_sk, etc.).
+- LITERAL_PRESERVATION: Literals 2000, 2000+1, 2000+2, 2000+3, 5, 95/100.0 must be copied exactly.
+- SEMANTIC_EQUIVALENCE: Must return identical sum(sales).
+- ENGINE_GAP_ID: REDUNDANT_SCAN_ELIMINATION: store_sales scanned 4 times in EXPLAIN (16.6M, 16.2M, 27.5M, 27.5M rows).
+- ENGINE_GAP_ID: CROSS_CTE_PREDICATE_BLINDNESS: Same date filter (2000-2003) applied separately in frequent_ss_items and max_store_sales CTEs.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+single_pass_aggregation: Apply single scan with conditional aggregates for both frequent items and max sales; ignore the separate CTE structure - we combine in one CTE.
+  channel_bitmap_aggregation: Apply labeling via CASE in aggregates; ignore the bitmap aspect.
+  deferred_window_aggregation: Not applicable, but think of delaying joins until after aggregation - we do partial aggregation in unified scan.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. single_pass_aggregation (4.47x)
+
+**Principle:** Single-Pass Aggregation: consolidate multiple scalar subqueries on the same table into one CTE using CASE expressions inside aggregate functions. Reduces N separate table scans to 1 pass.
+
+**BEFORE (slow):**
+```sql
+select case when (select count(*) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) > 2972190
+            then (select avg(ss_ext_sales_price) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 1 and 20) end bucket1 ,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 21 and 40) > 4505785
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 21 and 40) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 21 and 40) end bucket2,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 41 and 60) > 1575726
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 41 and 60)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 41 and 60) end bucket3,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 61 and 80) > 3188917
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 61 and 80)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 61 and 80) end bucket4,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 81 and 100) > 3525216
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 81 and 100)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 81 and 100) end bucket5
+from reason
+where r_reason_sk = 1;
+```
+
+**AFTER (fast):**
+[store_sales_aggregates]:
+```sql
+SELECT SUM(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 ELSE 0 END) AS cnt1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_ext_discount_amt END) AS avg_disc1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_net_paid END) AS avg_paid1, SUM(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN 1 ELSE 0 END) AS cnt2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_ext_discount_amt END) AS avg_disc2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_net_paid END) AS avg_paid2, SUM(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN 1 ELSE 0 END) AS cnt3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_ext_discount_amt END) AS avg_disc3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_net_paid END) AS avg_paid3, SUM(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN 1 ELSE 0 END) AS cnt4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_ext_discount_amt END) AS avg_disc4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_net_paid END) AS avg_paid4, SUM(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN 1 ELSE 0 END) AS cnt5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_ext_discount_amt END) AS avg_disc5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_net_paid END) AS avg_paid5 FROM store_sales
+```
+[main_query]:
+```sql
+SELECT CASE WHEN cnt1 > 74129 THEN avg_disc1 ELSE avg_paid1 END AS bucket1, CASE WHEN cnt2 > 122840 THEN avg_disc2 ELSE avg_paid2 END AS bucket2, CASE WHEN cnt3 > 56580 THEN avg_disc3 ELSE avg_paid3 END AS bucket3, CASE WHEN cnt4 > 10097 THEN avg_disc4 ELSE avg_paid4 END AS bucket4, CASE WHEN cnt5 > 165306 THEN avg_disc5 ELSE avg_paid5 END AS bucket5 FROM store_sales_aggregates
+```
+
+### 2. channel_bitmap_aggregation (6.24x)
+
+**BEFORE (slow):**
+```sql
+select * from
+ (select count(*) h8_30_to_9
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 8 and time_dim.t_minute >= 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s1,
+ (select count(*) h9_to_9_30
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 9 and time_dim.t_minute < 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s2,
+ (select count(*) h9_30_to_10
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 9 and time_dim.t_minute >= 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s3,
+ (select count(*) h10_to_10_30
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 10 and time_dim.t_minute < 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s4,
+ (select count(*) h10_30_to_11
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 10 and time_dim.t_minute >= 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s5,
+ (select count(*) h11_to_11_30
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 11 and time_dim.t_minute < 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s6,
+ (select count(*) h11_30_to_12
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 11 and time_dim.t_minute >= 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s7,
+ (select count(*) h12_to_12_30
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 12 and time_dim.t_minute < 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s8;
+```
+
+**AFTER (fast):**
+[filtered_store]:
+```sql
+SELECT s_store_sk FROM store WHERE s_store_name = 'ese'
+```
+[filtered_hd]:
+```sql
+SELECT hd_demo_sk FROM household_demographics WHERE (hd_dep_count = -1 AND hd_vehicle_count <= 1) OR (hd_dep_count = 4 AND hd_vehicle_count <= 6) OR (hd_dep_count = 3 AND hd_vehicle_count <= 5)
+```
+[time_ranges]:
+```sql
+SELECT t_time_sk, CASE WHEN t_hour = 8 AND t_minute >= 30 THEN 1 WHEN t_hour = 9 AND t_minute < 30 THEN 2 WHEN t_hour = 9 AND t_minute >= 30 THEN 3 WHEN t_hour = 10 AND t_minute < 30 THEN 4 WHEN t_hour = 10 AND t_minute >= 30 THEN 5 WHEN t_hour = 11 AND t_minute < 30 THEN 6 WHEN t_hour = 11 AND t_minute >= 30 THEN 7 WHEN t_hour = 12 AND t_minute < 30 THEN 8 END AS time_window FROM time_dim WHERE (t_hour BETWEEN 8 AND 12)
+```
+[sales_with_time]:
+```sql
+SELECT tr.time_window FROM store_sales ss JOIN filtered_store fs ON ss.ss_store_sk = fs.s_store_sk JOIN filtered_hd fhd ON ss.ss_hdemo_sk = fhd.hd_demo_sk JOIN time_ranges tr ON ss.ss_sold_time_sk = tr.t_time_sk
+```
+[main_query]:
+```sql
+SELECT COUNT(CASE WHEN time_window = 1 THEN 1 END) AS h8_30_to_9, COUNT(CASE WHEN time_window = 2 THEN 1 END) AS h9_to_9_30, COUNT(CASE WHEN time_window = 3 THEN 1 END) AS h9_30_to_10, COUNT(CASE WHEN time_window = 4 THEN 1 END) AS h10_to_10_30, COUNT(CASE WHEN time_window = 5 THEN 1 END) AS h10_30_to_11, COUNT(CASE WHEN time_window = 6 THEN 1 END) AS h11_to_11_30, COUNT(CASE WHEN time_window = 7 THEN 1 END) AS h11_30_to_12, COUNT(CASE WHEN time_window = 8 THEN 1 END) AS h12_to_12_30 FROM sales_with_time
+```
+
+### 3. deferred_window_aggregation (1.36x)
+
+**Principle:** Deferred Aggregation: delay expensive operations (window functions) until after joins reduce the dataset. Computing window functions inside individual CTEs then joining is more expensive than joining first and computing windows once on the combined result.
+
+**BEFORE (slow):**
+```sql
+WITH web_v1 as (
+select
+  ws_item_sk item_sk, d_date,
+  sum(sum(ws_sales_price))
+      over (partition by ws_item_sk order by d_date rows between unbounded preceding and current row) cume_sales
+from web_sales
+    ,date_dim
+where ws_sold_date_sk=d_date_sk
+  and d_month_seq between 1216 and 1216+11
+  and ws_item_sk is not NULL
+group by ws_item_sk, d_date),
+store_v1 as (
+select
+  ss_item_sk item_sk, d_date,
+  sum(sum(ss_sales_price))
+      over (partition by ss_item_sk order by d_date rows between unbounded preceding and current row) cume_sales
+from store_sales
+    ,date_dim
+where ss_sold_date_sk=d_date_sk
+  and d_month_seq between 1216 and 1216+11
+  and ss_item_sk is not NULL
+group by ss_item_sk, d_date)
+ select *
+from (select item_sk
+     ,d_date
+     ,web_sales
+     ,store_sales
+     ,max(web_sales)
+         over (partition by item_sk order by d_date rows between unbounded preceding and current row) web_cumulative
+     ,max(store_sales)
+         over (partition by item_sk order by d_date rows between unbounded preceding and current row) store_cumulative
+     from (select case when web.item_sk is not null then web.item_sk else store.item_sk end item_sk
+                 ,case when web.d_date is not null then web.d_date else store.d_date end d_date
+                 ,web.cume_sales web_sales
+                 ,store.cume_sales store_sales
+           from web_v1 web full outer join store_v1 store on (web.item_sk = store.item_sk
+                                                          and web.d_date = store.d_date)
+          )x )y
+where web_cumulative > store_cumulative
+order by item_sk
+        ,d_date
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[web_daily]:
+```sql
+SELECT ws_item_sk AS item_sk, d_date, SUM(ws_sales_price) AS daily_sales FROM web_sales, date_dim WHERE ws_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ws_item_sk IS NOT NULL GROUP BY ws_item_sk, d_date
+```
+[store_daily]:
+```sql
+SELECT ss_item_sk AS item_sk, d_date, SUM(ss_sales_price) AS daily_sales FROM store_sales, date_dim WHERE ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ss_item_sk IS NOT NULL GROUP BY ss_item_sk, d_date
+```
+[main_query]:
+```sql
+SELECT * FROM (SELECT COALESCE(web.item_sk, store.item_sk) AS item_sk, COALESCE(web.d_date, store.d_date) AS d_date, SUM(web.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS web_cumulative, SUM(store.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS store_cumulative FROM web_daily web FULL OUTER JOIN store_daily store ON web.item_sk = store.item_sk AND web.d_date = store.d_date) y WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100
+```
+
+## Original SQL
+
+```sql
+with frequent_ss_items as 
+ (select substr(i_item_desc,1,30) itemdesc,i_item_sk item_sk,d_date solddate,count(*) cnt
+  from store_sales
+      ,date_dim 
+      ,item
+  where ss_sold_date_sk = d_date_sk
+    and ss_item_sk = i_item_sk 
+    and d_year in (2000,2000+1,2000+2,2000+3)
+  group by substr(i_item_desc,1,30),i_item_sk,d_date
+  having count(*) >4),
+ max_store_sales as
+ (select max(csales) tpcds_cmax 
+  from (select c_customer_sk,sum(ss_quantity*ss_sales_price) csales
+        from store_sales
+            ,customer
+            ,date_dim 
+        where ss_customer_sk = c_customer_sk
+         and ss_sold_date_sk = d_date_sk
+         and d_year in (2000,2000+1,2000+2,2000+3) 
+        group by c_customer_sk)),
+ best_ss_customer as
+ (select c_customer_sk,sum(ss_quantity*ss_sales_price) ssales
+  from store_sales
+      ,customer
+  where ss_customer_sk = c_customer_sk
+  group by c_customer_sk
+  having sum(ss_quantity*ss_sales_price) > (95/100.0) * (select
+  *
+from
+ max_store_sales))
+  select sum(sales)
+ from (select cs_quantity*cs_list_price sales
+       from catalog_sales
+           ,date_dim 
+       where d_year = 2000 
+         and d_moy = 5 
+         and cs_sold_date_sk = d_date_sk 
+         and cs_item_sk in (select item_sk from frequent_ss_items)
+         and cs_bill_customer_sk in (select c_customer_sk from best_ss_customer)
+      union all
+      select ws_quantity*ws_list_price sales
+       from web_sales 
+           ,date_dim 
+       where d_year = 2000 
+         and d_moy = 5 
+         and ws_sold_date_sk = d_date_sk 
+         and ws_item_sk in (select item_sk from frequent_ss_items)
+         and ws_bill_customer_sk in (select c_customer_sk from best_ss_customer))
+ LIMIT 100;
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `SUM(sales)`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] frequent_ss_items  [=]  Cost: 25%  Rows: ~1K  — Identify store items that sell more than four times per day/description slice during 2000-2003 to define the frequent-item set.
+│   ├── SCAN (store_sales, date_dim (join), item (join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── JOIN (ss_item_sk = i_item_sk)
+│   ├── FILTER (d_year IN (2000, 2000 + 1, 2000 + 2, 2000 + 3))
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (itemdesc, item_sk, solddate, cnt)
+├── [CTE] max_store_sales  [=]  Cost: 25%  Rows: ~1K  — Compute the maximum customer store-sales amount over 2000-2003 as the benchmark for top-customer selection.
+│   ├── SCAN (store_sales, customer, date_dim)
+│   ├── JOIN (ss_customer_sk = c_customer_sk)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_year IN (2000, 2000 + 1, 2000 + 2, 2000 + 3))
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (tpcds_cmax)
+├── [CTE] best_ss_customer  [=]  Cost: 25%  Rows: ~1K  — Select customers whose cumulative store sales exceed 95% of the maximum customer store-sales benchmark.
+│   ├── SCAN (store_sales, customer (join), max_store_sales (correlated subquery))
+│   ├── JOIN (ss_customer_sk = c_customer_sk)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (c_customer_sk, ssales)
+└── [MAIN] main_query  [=]  Cost: 25%  Rows: ~1K  — Union May 2000 catalog and web sales for frequent items purchased by top store customers, then sum the combined sales amount.
+    ├── SCAN (catalog_sales, date_dim, web_sales, best_ss_customer, frequent_ss_items)
+    ├── JOIN (cs_sold_date_sk = d_date_sk)
+    ├── FILTER (d_year = 2000)
+    ├── FILTER (d_moy = 5)
+    ├── FILTER (+2 more)
+    ├── AGG (GROUP BY)
+    └── OUTPUT (SUM(sales))
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

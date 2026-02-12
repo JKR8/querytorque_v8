@@ -96,14 +96,14 @@ def _rule_work_mem(
     peak_kb = max(int(m) for m in memory_matches)
     peak_mb = peak_kb / 1024
 
-    # Check for disk spill indicators
-    has_spill = bool(re.search(r'Batches:\s*(\d+)', explain))
-    batch_match = re.search(r'Batches:\s*(\d+)', explain)
-    batches = int(batch_match.group(1)) if batch_match else 1
+    # Check for disk spill indicators (find ALL batch counts, not just first)
+    batch_matches = re.findall(r'Batches:\s*(\d+)', explain)
+    max_batches = max((int(b) for b in batch_matches), default=1)
+    has_spill = max_batches > 1
 
     # Fire if peak memory is >= 50% of current work_mem or if spilling
     threshold_mb = current_mb * 0.5
-    if peak_mb >= threshold_mb or batches > 1:
+    if peak_mb >= threshold_mb or has_spill:
         # Propose 4x the peak memory, capped at 2048MB
         proposed_mb = min(2048, max(256, int(peak_mb * 4)))
         # Round up to nearest power of 2 for clean values
@@ -113,7 +113,7 @@ def _rule_work_mem(
             "rule": "increase_work_mem",
             "reason": (
                 f"Peak hash memory {peak_mb:.0f}MB "
-                f"{'+ disk spill' if batches > 1 else ''} "
+                f"{'+ disk spill (' + str(max_batches) + ' batches)' if has_spill else ''} "
                 f"vs current {current_mb}MB work_mem"
             ),
         }
@@ -427,14 +427,16 @@ def boost_benchmark(
     dsn: str,
     min_speedup: float = 1.05,
     dry_run: bool = False,
+    query_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Run config boost on all qualifying sessions in a benchmark.
+    """Run config boost on qualifying sessions in a benchmark.
 
     Args:
         benchmark_dir: Path to the benchmark directory
         dsn: PostgreSQL connection DSN
         min_speedup: Minimum rewrite speedup to attempt boost
         dry_run: If True, propose configs without benchmarking
+        query_ids: If provided, only boost these query IDs (respects -q filter)
 
     Returns:
         List of result dicts, one per session attempted
@@ -451,6 +453,11 @@ def boost_benchmark(
         d for d in sessions_dir.iterdir()
         if d.is_dir() and (d / "session.json").exists()
     )
+
+    # Filter to requested query IDs if provided
+    if query_ids is not None:
+        query_id_set = set(query_ids)
+        session_dirs = [d for d in session_dirs if d.name in query_id_set]
 
     for session_dir in session_dirs:
         try:
@@ -482,13 +489,12 @@ def _load_best_worker_sql(session_dir: Path, best_worker_id: Optional[int]) -> O
     if best_worker_id <= 4:
         sql_file = iter_dir / f"worker_{best_worker_id:02d}" / "optimized.sql"
     else:
-        # Snipe worker
+        # Snipe worker — take the last (most recent) match
+        sql_file = None
         for snipe_dir in sorted(session_dir.glob("iteration_*_snipe")):
-            sql_file = snipe_dir / f"worker_{best_worker_id:02d}" / "optimized.sql"
-            if sql_file.exists():
-                break
-        else:
-            sql_file = None
+            candidate = snipe_dir / f"worker_{best_worker_id:02d}" / "optimized.sql"
+            if candidate.exists():
+                sql_file = candidate
 
     if sql_file and sql_file.exists():
         return sql_file.read_text(errors="replace").strip()

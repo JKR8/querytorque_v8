@@ -1,0 +1,67 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Build ascending and descending item rankings from store-level average net profit, filter both to top 10 ranks, join on rank number, and map item keys to product names.
+    ├── [~] WITH combined_cte (new CTE embedding store baseline)
+    │   ├── SCAN store_sales
+    │   ├── SCALAR_SUBQUERY store baseline
+    │   └── AGG (GROUP BY ss_item_sk)
+    ├── [~] WITH ranked_pairs (single CTE with both ranks)
+    │   ├── FROM combined_cte
+    │   ├── WINDOW (RANK() ASC, RANK() DESC)
+    │   └── FILTER (item_avg > 0.9*store_avg)
+    ├── JOIN (asceding.rnk = descending.rnk)
+    │   ├── SUBQUERY asc (FROM ranked_pairs WHERE asc_rnk < 11)
+    │   └── SUBQUERY desc (FROM ranked_pairs WHERE desc_rnk < 11)
+    ├── JOIN (i1.i_item_sk = asc.item_sk)
+    ├── JOIN (i2.i_item_sk = desc.item_sk)
+    ├── SORT (asc.rnk ASC)
+    └── OUTPUT (rnk, best_performing, worst_performing)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "self_join_to_window", "description": "Replaced duplicated subqueries with single CTE computing both rankings", "applied_to": ["combined_cte", "ranked_pairs"]},
+    {"id": "R2", "type": "deferred_window_aggregation", "description": "Moved rank filtering outside window computation to single CTE", "applied_to": ["ranked_pairs"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "combined_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk AS item_sk, AVG(ss_net_profit) AS item_avg, (SELECT AVG(ss_net_profit) FROM store_sales WHERE ss_store_sk = 146 AND ss_addr_sk IS NULL GROUP BY ss_store_sk) AS store_avg FROM store_sales WHERE ss_store_sk = 146 GROUP BY ss_item_sk",
+        "interfaces": {"outputs": ["item_sk", "item_avg", "store_avg"], "consumes": []}
+      },
+      "ranked_pairs": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT item_sk, RANK() OVER (ORDER BY item_avg ASC) AS asc_rnk, RANK() OVER (ORDER BY item_avg DESC) AS desc_rnk FROM combined_cte WHERE item_avg > 0.9 * store_avg",
+        "interfaces": {"outputs": ["item_sk", "asc_rnk", "desc_rnk"], "consumes": ["combined_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT asc.rnk, i1.i_product_name AS best_performing, i2.i_product_name AS worst_performing FROM (SELECT item_sk, asc_rnk AS rnk FROM ranked_pairs WHERE asc_rnk < 11) AS asc JOIN (SELECT item_sk, desc_rnk AS rnk FROM ranked_pairs WHERE desc_rnk < 11) AS desc ON asc.rnk = desc.rnk JOIN item i1 ON asc.item_sk = i1.i_item_sk JOIN item i2 ON desc.item_sk = i2.i_item_sk ORDER BY asc.rnk LIMIT 100",
+        "interfaces": {"outputs": ["rnk", "best_performing", "worst_performing"], "consumes": ["ranked_pairs"]}
+      }
+    },
+    "reconstruction_order": ["combined_cte", "ranked_pairs", "main_query"],
+    "assembly_template": "WITH combined_cte AS ({combined_cte}), ranked_pairs AS ({ranked_pairs}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Consolidated duplicate subqueries into single CTEs (combined_cte for item averages + store baseline, ranked_pairs for both rankings). This eliminates redundant store_sales scans while preserving exact HAVING semantics via WHERE filter.
+
+**Expected speedup**: ~1.36x (similar to deferred_window_aggregation pattern) due to eliminating duplicate store_sales scans and redundant baseline computations.

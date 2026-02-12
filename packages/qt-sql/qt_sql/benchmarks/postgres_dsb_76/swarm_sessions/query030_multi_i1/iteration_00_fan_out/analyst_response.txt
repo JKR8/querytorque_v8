@@ -1,0 +1,287 @@
+<reasoning>
+1. **CLASSIFY**: This is a "correlated-aggregate filter" query with star-join characteristics. The main query filters rows from a CTE based on a correlated subquery comparing each row's total_return to 1.2x the state average. The CTE itself is a star-join (web_returns fact table joined to date_dim, customer_address, item dimensions).
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total runtime: 378.4ms
+   - CTE computation (customer_total_return): 377.2ms (99.7% of runtime)
+   - Main query processing: minimal (0.3ms)
+   - Key observations:
+     a. The CTE is materialized once and scanned twice (ctr1, ctr2) - good sharing.
+     b. The correlated subquery (SubPlan 2) executes 15 times (loops=15), each scanning the entire CTE (7 rows filtered from 252). This is NESTED LOOP correlation - the bottleneck.
+     c. The CTE itself shows:
+        - web_returns sequential scan: 362.7ms (95.8% of total runtime)
+        - Filter wr_return_amt/wr_return_quantity removes 474K rows, leaves 6,084
+        - date_dim index-only scan (365 rows) is efficient
+        - item index scan (0 rows per loop) is efficient
+        - customer_address index scan is efficient
+     d. Row count drops: 474K → 6,084 → 902 → 254 → 1 → 0 (in main query)
+     e. The optimizer already: pushes d_year=1999 to date_dim index scan; pushes i_manager_id filter to item index; performs CTE materialization.
+
+3. **GAP MATCHING**:
+   - **CORRELATED_SUBQUERY_PARALYSIS**: YES. The WHERE clause has `ctr1.ctr_total_return > (SELECT avg(ctr_total_return)*1.2 FROM customer_total_return ctr2 WHERE ctr1.ctr_state = ctr2.ctr_state)`. The EXPLAIN shows SubPlan 2 executed 15 times (loops=15).
+   - **COMMA_JOIN_WEAKNESS**: YES. The CTE uses comma-separated joins: `FROM web_returns, date_dim, customer_address, item`.
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: NO. The CTE is materialized once and shared - optimizer already handles this well.
+   - **NON_EQUI_JOIN_INPUT_BLINDNESS**: NO. All joins are equi-joins.
+
+4. **AGGREGATION TRAP CHECK**: The query uses SUM and AVG, which are grouping-insensitive to duplicates (as long as join doesn't change multiplicity). The CTE's GROUP BY includes wr_returning_customer_sk, ca_state, wr_reason_sk. The main query filters ctr_reason_sk IN (22,23) - this filter could be pushed into the CTE. The correlated subquery's AVG is computed per state - this is grouping-sensitive to state partitioning.
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   a. **Decorrelate the correlated subquery** (CORRELATED_SUBQUERY_PARALYSIS): Pre-compute state averages in a separate CTE and join instead of correlated subquery. Expected high win (24.7x historical).
+   b. **Convert comma joins to explicit JOINs with pre-filtered CTEs** (COMMA_JOIN_WEAKNESS): Pre-filter selective dimensions (date_dim, item) into CTEs, use explicit JOIN syntax. Expected medium win (2.28x-3.32x).
+   c. **Push main query filters into CTE** (predicate movement): Push ctr_reason_sk IN (22,23) and ca_state IN ('CA','MI','SD','VA') into CTE definition to reduce CTE size early.
+   d. **Exploration: Single-pass aggregation with pivot**: Since the CTE groups by reason_sk, and main query filters to only 2 reasons, we could compute both the per-state average (for all reasons) and the filtered result in one scan.
+
+6. **LOGICAL TREE DESIGN**:
+   - Worker 1 (Decorrelate): CTE1 = filtered dimensions; CTE2 = fact+dim join with aggregation; CTE3 = state averages; Main = join CTE2 with CTE3.
+   - Worker 2 (Explicit JOINs with prefetch): CTE_date, CTE_item = pre-filtered dimensions; explicit JOIN syntax in main CTE.
+   - Worker 3 (Pushdown): Modify original CTE to include main query filters (reason_sk, ca_state).
+   - Worker 4 (Exploration): Single CTE with GROUP BY state, reason_sk, then pivot to compute both per-state averages and filtered results.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+This query identifies customers born 1945-1951 living in CA/MI/SD/VA whose 1999 web returns (for items managed by managers 42-51 with return amount/quantity ratio 193-222) for reasons 22 or 23 exceed 120% of their state's average return amount for ALL reasons. INNER JOIN semantics: all dimension tables must match. Aggregation trap: AVG in correlated subquery is computed per state across ALL reason_sk values, while the outer query filters to reasons 22,23. Filter dependency: The state filter (CA/MI/SD/VA) appears in main query but could be pushed into CTE.
+
+BOTTLENECK_DIAGNOSIS:
+The CTE computation (star-join + aggregation) dominates cost (377.2ms, 99.7%). Specifically, scanning web_returns (362.7ms) and applying wr_return_amt/wr_return_quantity filter (removes 474K rows). The correlated subquery re-executes 15 times but scans tiny materialized CTE (7 rows each). Optimizer already: materializes CTE once (good sharing), pushes d_year to date_dim index, pushes i_manager_id to item index. Logical-tree cost (74% CTE) matches actual time.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output exactly 13 customer columns + ctr_total_return.
+- CTE_COLUMN_COMPLETENESS: CTE must output ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return for downstream joins and subquery.
+- LITERAL_PRESERVATION: All literal values (1999, 42-51, 193-222, 'CA','MI','SD','VA', 22-23, 1945-1951, 1.2) must be preserved exactly.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows ordered by 13 customer columns.
+- CORRELATED_SUBQUERY_PARALYSIS: EXPLAIN shows SubPlan 2 executed 15 times (loops=15), scanning entire CTE each time.
+- COMMA_JOIN_WEAKNESS: CTE uses comma-separated joins: `FROM web_returns, date_dim, customer_address, item`.
+
+REGRESSION_WARNINGS:
+1. Never split OR conditions into UNION ALL (0.21x on Q085): Query has no OR conditions, but avoid introducing UNION ALL.
+2. Never restructure INNER JOIN orders (optimizer handles reordering): Comma joins in CTE need explicit JOIN syntax but don't force order.
+3. Avoid CTEs for small dimension lookups (<10K rows): date_dim (365 rows) and item (small filtered set) are tiny; consider materializing.
+4. Use AS MATERIALIZED when decorrelating: Prevents optimizer from inlining CTEs back into correlated form.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: decorrelation_by_state_avg_cte
+TARGET_LOGICAL_TREE:
+  filtered_dates -> filtered_items -> joined_fact_dims -> aggregated_cte -> state_avg_cte -> main_join
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 1999
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: joined_fact_dims
+  filtered_items:
+    FROM: item
+    WHERE: i_manager_id BETWEEN 42 AND 51
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: ~10 (from EXPLAIN: 0 rows per loop, but index scan)
+    CONSUMERS: joined_fact_dims
+  joined_fact_dims:
+    FROM: web_returns
+    JOIN: INNER JOIN filtered_dates ON wr_returned_date_sk = d_date_sk
+           INNER JOIN customer_address ON wr_returning_addr_sk = ca_address_sk
+           INNER JOIN filtered_items ON wr_item_sk = i_item_sk
+    WHERE: wr_return_amt / wr_return_quantity BETWEEN 193 AND 222
+    OUTPUT: wr_returning_customer_sk, ca_state, wr_reason_sk, wr_return_amt
+    EXPECTED_ROWS: ~6,084 (from EXPLAIN)
+    CONSUMERS: aggregated_cte
+  aggregated_cte:
+    FROM: joined_fact_dims
+    GROUP BY: wr_returning_customer_sk, ca_state, wr_reason_sk
+    AGGREGATE: SUM(wr_return_amt) AS ctr_total_return
+    OUTPUT: ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return
+    EXPECTED_ROWS: ~252 (from EXPLAIN: CTE scan shows 251 rows removed by filter, 1 kept)
+    CONSUMERS: state_avg_cte, main_join
+  state_avg_cte:
+    FROM: aggregated_cte
+    GROUP BY: ctr_state
+    AGGREGATE: AVG(ctr_total_return) * 1.2 AS state_avg_threshold
+    OUTPUT: ctr_state, state_avg_threshold
+    EXPECTED_ROWS: ~15 (from EXPLAIN: SubPlan 2 loops=15)
+    CONSUMERS: main_join
+  main_join:
+    FROM: aggregated_cte AS ctr1
+          INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+          INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk
+          INNER JOIN state_avg_cte ON ctr1.ctr_state = state_avg_cte.ctr_state
+    WHERE: ctr1.ctr_reason_sk IN (22, 23)
+           AND ca_state IN ('CA', 'MI', 'SD', 'VA')
+           AND c_birth_year BETWEEN 1945 AND 1951
+           AND ctr1.ctr_total_return > state_avg_cte.state_avg_threshold
+    ORDER BY: (13 customer columns), ctr_total_return
+    LIMIT: 100
+    OUTPUT: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: inline_decorrelate_materialized, early_filter_decorrelate, pg_self_join_decomposition
+EXAMPLE_ADAPTATION:
+  - inline_decorrelate_materialized: Apply 3-CTE pattern: dimension filters, fact join, per-key aggregate. IGNORE: This query's correlation is on state, not a key.
+  - early_filter_decorrelate: Push dimension filters into CTE definitions and pre-compute thresholds. IGNORE: Limited benefit; focus on decorrelation pattern.
+  - pg_self_join_decomposition: Materialize fact+dimension scan once (aggregated_cte) and derive both per-row values and state averages from it. APPLY: This is the core pattern.
+HAZARD_FLAGS:
+  - Must ensure state_avg_cte computes AVG across ALL reason_sk values, not just 22,23.
+  - The JOIN between aggregated_cte and state_avg_cte on ctr_state may duplicate rows if aggregated_cte has multiple reason_sk per state (it does). This is correct: each row compares to same state average.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: explicit_join_prefetch_ctes
+TARGET_LOGICAL_TREE:
+  date_cte -> item_cte -> address_cte -> fact_cte -> aggregated_cte -> main_query
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year = 1999
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_cte
+  item_cte:
+    FROM: item
+    WHERE: i_manager_id BETWEEN 42 AND 51
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: ~10
+    CONSUMERS: fact_cte
+  address_cte:
+    FROM: customer_address
+    WHERE: ca_state IN ('CA', 'MI', 'SD', 'VA')  -- Push main query filter early
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: ~? (unknown, but selective)
+    CONSUMERS: fact_cte, main_query
+  fact_cte:
+    FROM: web_returns
+          INNER JOIN date_cte ON wr_returned_date_sk = d_date_sk
+          INNER JOIN address_cte ON wr_returning_addr_sk = ca_address_sk
+          INNER JOIN item_cte ON wr_item_sk = i_item_sk
+    WHERE: wr_return_amt / wr_return_quantity BETWEEN 193 AND 222
+    OUTPUT: wr_returning_customer_sk, ca_state, wr_reason_sk, wr_return_amt
+    EXPECTED_ROWS: <6,084 (reduced by address_cte filter)
+    CONSUMERS: aggregated_cte
+  aggregated_cte:
+    FROM: fact_cte
+    GROUP BY: wr_returning_customer_sk, ca_state, wr_reason_sk
+    AGGREGATE: SUM(wr_return_amt) AS ctr_total_return
+    OUTPUT: ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return
+    EXPECTED_ROWS: <252
+    CONSUMERS: main_query
+  main_query:
+    FROM: aggregated_cte AS ctr1
+          INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+          INNER JOIN address_cte ON address_cte.ca_address_sk = customer.c_current_addr_sk
+    WHERE: ctr1.ctr_reason_sk IN (22, 23)
+           AND c_birth_year BETWEEN 1945 AND 1951
+           AND ctr1.ctr_total_return > (SELECT AVG(ctr2.ctr_total_return) * 1.2
+                                        FROM aggregated_cte ctr2
+                                        WHERE ctr1.ctr_state = ctr2.ctr_state)
+    ORDER BY: (13 customer columns), ctr_total_return
+    LIMIT: 100
+    OUTPUT: (13 customer columns + ctr_total_return)
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+  - pg_dimension_prefetch_star: Pre-filter all selective dimensions (date, item, address) into CTEs and use explicit JOINs. APPLY: Exactly this pattern.
+  - pg_date_cte_explicit_join: Isolate date_dim filter into CTE and convert comma joins to explicit JOINs. APPLY: Do for date, item, address.
+  - pg_materialized_dimension_fact_prefilter: Use MATERIALIZED CTEs for dimensions and fact pre-filter. IGNORE: Non-equi join not present.
+HAZARD_FLAGS:
+  - address_cte filters ca_state early, but main query still needs address for customer join (c_current_addr_sk). Ensure address_cte includes all needed columns.
+  - The correlated subquery remains; this strategy focuses on improving CTE computation only.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: predicate_pushdown_into_cte
+TARGET_LOGICAL_TREE:
+  modified_cte -> main_simplified
+NODE_CONTRACTS:
+  modified_cte:
+    FROM: web_returns
+          INNER JOIN date_dim ON wr_returned_date_sk = d_date_sk
+          INNER JOIN customer_address ON wr_returning_addr_sk = ca_address_sk
+          INNER JOIN item ON wr_item_sk = i_item_sk
+    WHERE: d_year = 1999
+           AND i_manager_id BETWEEN 42 AND 51
+           AND wr_return_amt / wr_return_quantity BETWEEN 193 AND 222
+           AND ca_state IN ('CA', 'MI', 'SD', 'VA')        -- Pushed from main query
+           AND wr_reason_sk IN (22, 23)                    -- Pushed from main query
+    GROUP BY: wr_returning_customer_sk, ca_state, wr_reason_sk
+    AGGREGATE: SUM(wr_return_amt) AS ctr_total_return
+    OUTPUT: ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return
+    EXPECTED_ROWS: <<252 (much smaller due to pushed filters)
+    CONSUMERS: main_simplified
+  main_simplified:
+    FROM: modified_cte AS ctr1
+          INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+          INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk
+    WHERE: c_birth_year BETWEEN 1945 AND 1951
+           AND ctr1.ctr_total_return > (SELECT AVG(ctr2.ctr_total_return) * 1.2
+                                        FROM modified_cte ctr2
+                                        WHERE ctr1.ctr_state = ctr2.ctr_state)
+           -- Note: ca_state filter already in CTE, but need to ensure customer_address matches state
+    ORDER BY: (13 customer columns), ctr_total_return
+    LIMIT: 100
+    OUTPUT: (13 customer columns + ctr_total_return)
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: early_filter_decorrelate, pushdown, pg_dimension_prefetch_star
+EXAMPLE_ADAPTATION:
+  - early_filter_decorrelate: Push dimension filters into CTE definition. APPLY: Push ca_state and wr_reason_sk into CTE WHERE.
+  - pushdown: Push predicates closer to table scans. APPLY: Move main query filters into CTE.
+  - pg_dimension_prefetch_star: IGNORE: This strategy does not pre-filter dimensions into separate CTEs.
+HAZARD_FLAGS:
+  - Pushing wr_reason_sk IN (22,23) into CTE changes the CTE's semantics: the state average in correlated subquery must still be computed across ALL reasons, not just 22,23. This breaks correctness! Must keep two copies: one filtered for outer rows, one unfiltered for state averages.
+  - Need to create two CTEs: one with reason filter (for outer rows), one without (for state averages).
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: single_pass_state_avg_window
+TARGET_LOGICAL_TREE:
+  base_cte -> window_cte -> filtered_cte -> main_join
+NODE_CONTRACTS:
+  base_cte:
+    FROM: web_returns
+          INNER JOIN date_dim ON wr_returned_date_sk = d_date_sk AND d_year = 1999
+          INNER JOIN customer_address ON wr_returning_addr_sk = ca_address_sk
+          INNER JOIN item ON wr_item_sk = i_item_sk AND i_manager_id BETWEEN 42 AND 51
+    WHERE: wr_return_amt / wr_return_quantity BETWEEN 193 AND 222
+    GROUP BY: wr_returning_customer_sk, ca_state, wr_reason_sk
+    AGGREGATE: SUM(wr_return_amt) AS ctr_total_return
+    OUTPUT: ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return
+    EXPECTED_ROWS: ~252
+    CONSUMERS: window_cte
+  window_cte:
+    FROM: base_cte
+    WINDOW: state_window AS (PARTITION BY ctr_state)
+    OUTPUT: ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return,
+            AVG(ctr_total_return) OVER state_window * 1.2 AS state_avg_threshold
+    EXPECTED_ROWS: same as base_cte
+    CONSUMERS: filtered_cte
+  filtered_cte:
+    FROM: window_cte
+    WHERE: ctr_reason_sk IN (22, 23)
+           AND ctr_state IN ('CA', 'MI', 'SD', 'VA')
+           AND ctr_total_return > state_avg_threshold
+    OUTPUT: ctr_customer_sk, ctr_state, ctr_total_return
+    EXPECTED_ROWS: ~1
+    CONSUMERS: main_join
+  main_join:
+    FROM: filtered_cte
+          INNER JOIN customer ON ctr_customer_sk = c_customer_sk
+          INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk AND ca_state IN ('CA','MI','SD','VA')
+    WHERE: c_birth_year BETWEEN 1945 AND 1951
+    ORDER BY: (13 customer columns), ctr_total_return
+    LIMIT: 100
+    OUTPUT: (13 customer columns + ctr_total_return)
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: pg_self_join_decomposition, single_pass_aggregation, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+  - pg_self_join_decomposition: Materialize base aggregation once, derive multiple measures. APPLY: Use window function to compute state average without self-join.
+  - single_pass_aggregation: Compute multiple aggregates in one scan. APPLY: Use window function to get per-state average alongside each row.
+  - early_filter_decorrelate: IGNORE: This strategy uses window functions, not CTE decorrelation.
+HAZARD_FLAGS:
+  - Window function computes AVG over partition of base_cte, which includes only rows after GROUP BY. This matches original semantics (state average of aggregated sums).
+  - Must ensure window function computes average across ALL reason_sk values per state (correct, as partition is by state only).
+  - Window function may compute average for states not in ('CA','MI','SD','VA') - extra work but okay.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (window function for decorrelation + predicate pushdown)

@@ -1,0 +1,283 @@
+<reasoning>
+1. **CLASSIFY**: This is a "channel-comparison self-join" query with EXISTS/NOT EXISTS constraints across three sales channels (store, web, catalog) over the same time period (Jan-Mar 2000). The base joins are a star pattern (customer, address, demographics) with channel existence filters.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total runtime: 399ms
+   - Dominant costs: store_sales scan (188ms, 47%), web_sales scan (39.6ms, 10%), catalog_sales scan (15.2ms, 4%)
+   - Each channel fact table is scanned ONCE (store_sales 819K rows, web_sales 219K rows, catalog_sales 411K rows)
+   - date_dim is scanned 3 times (once per channel), each returning 91 rows
+   - Customer base after address/demographics join: 71K rows
+   - After store_sales EXISTS: 9,692 rows (semi-join reduction)
+   - After web_sales NOT EXISTS: still 9,375 rows (minor reduction)
+   - After catalog_sales NOT EXISTS: 4,337 rows (final before grouping)
+   - Optimizer already: decorrelates EXISTS into hash semi/anti joins, pushes predicates into scans (ca_state, d_year, d_moy)
+   - Opportunity: Same date filter (d_year=2000, d_moy 1-3) applied 3 times independently. Could pre-filter date_dim once.
+
+3. **GAP MATCHING**:
+   - CROSS_CTE_PREDICATE_BLINDNESS: date_dim filter repeated 3x → date_cte_isolate opportunity
+   - REDUNDANT_SCAN_ELIMINATION: Each fact table scanned once → no N-scan consolidation needed
+   - CORRELATED_SUBQUERY_PARALYSIS: Optimizer already decorrelates (hash semi/anti joins in EXPLAIN)
+   - CROSS_COLUMN_OR_DECOMPOSITION: No OR conditions
+
+4. **AGGREGATION TRAP CHECK**: Only COUNT(*) aggregates, insensitive to duplicates. EXISTS/NOT EXISTS use semi/anti joins which don't introduce duplicates.
+
+5. **TRANSFORM SELECTION** (ranked by impact):
+   1. **date_cte_isolate**: Pre-filter date_dim once, reuse for all 3 channel joins. High impact: reduces 3x date_dim scans to 1.
+   2. **prefetch_fact_join**: Filter date_dim first, pre-join with each fact table to reduce probe size. Medium impact: reduces fact table join cardinality.
+   3. **early_filter + dimension_cte_isolate**: Pre-filter ALL dimensions (date, address, demographics) before fact joins. Medium impact: reduces base customer set early.
+   4. **composite_decorrelate_union (exploration)**: Extract shared date filter, materialize customer keys per channel, use set operations. Novel: tests if set operations beat hash semi/anti joins.
+
+6. **LOGICAL TREE DESIGN**:
+   - Strategy 1: date CTE → three channel CTEs (pre-joined with date) → main join with EXISTS/NOT EXISTS replaced by joins
+   - Strategy 2: date CTE → three fact-date CTEs → progressive join chain
+   - Strategy 3: date, address, demographics CTEs → customer base CTE → channel joins
+   - Strategy 4: date CTE → three customer-key CTEs → INTERSECT/EXCEPT → main join
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Profile customers in TX/VA/MI who made store purchases Jan-Mar 2000 but had no web or catalog purchases in same period. INNER JOIN semantics require all three base tables (customer, address, demographics) to match. EXISTS/NOT EXISTS are semi/anti joins with early termination—do NOT materialize full result sets. Aggregation uses COUNT(*) only, duplicate-safe. Filter dependencies: date filter (d_year=2000, d_moy 1-3) must apply identically to all three channel subqueries; state filter applies before EXISTS checks.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: store_sales scan dominates (188ms, 47%), then web_sales (40ms). Cardinality flow: 71K customers → 9.7K after store_sales EXISTS → 4.3K after both NOT EXISTS. Optimizer already handles predicate pushdown (ca_state, date filters) and decorrelates EXISTS into hash semi/anti joins. Logical-tree cost percentages misleading: store_sales shows 47% exclusive time but drives overall pipeline.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3 in original order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (customer keys, demographic columns, date keys).
+- LITERAL_PRESERVATION: Must preserve d_year=2000, d_moy between 1 and 3, ca_state IN ('TX','VA','MI').
+- SEMANTIC_EQUIVALENCE: Must return exactly same rows as original query.
+- CROSS_CTE_PREDICATE_BLINDNESS: date_dim scanned 3 times with same filter (EXPLAIN shows 3 separate FILTER nodes on date_dim).
+- REDUNDANT_SCAN_ELIMINATION: date_dim scanned 3 times (opportunity to consolidate to 1 scan).
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (regression_q25_date_cte_isolate: 0.5x):
+   CAUSE: Pre-filtered and materialized fact table before 3-way fact join, preventing optimizer reordering.
+   RULE: Do NOT pre-join fact tables with date CTE if it forces join order; keep date CTE as dimension-only.
+2. materialize_cte (regression_q16_semantic_rewrite: 0.14x):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan instead of semi-join short-circuit.
+   RULE: Preserve EXISTS/NOT EXISTS as semi/anti joins; do NOT materialize channel existence checks.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: date_cte_isolate
+TARGET_LOGICAL_TREE:
+date_range -> store_sales_dated -> web_sales_dated -> catalog_sales_dated -> customer_base -> filtered_customers -> group_by
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_moy BETWEEN 1 AND 3
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: store_sales_dated, web_sales_dated, catalog_sales_dated
+  store_sales_dated:
+    FROM: store_sales JOIN date_range ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: 819K
+    CONSUMERS: filtered_customers
+  web_sales_dated:
+    FROM: web_sales JOIN date_range ON ws_sold_date_sk = d_date_sk
+    OUTPUT: ws_bill_customer_sk
+    EXPECTED_ROWS: 219K
+    CONSUMERS: filtered_customers
+  catalog_sales_dated:
+    FROM: catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk
+    OUTPUT: cs_ship_customer_sk
+    EXPECTED_ROWS: 411K
+    CONSUMERS: filtered_customers
+  customer_base:
+    FROM: customer c JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+    WHERE: ca.ca_state IN ('TX', 'VA', 'MI')
+    OUTPUT: c.c_customer_sk, cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating
+    EXPECTED_ROWS: 71K
+    CONSUMERS: filtered_customers
+  filtered_customers:
+    FROM: customer_base cb
+    WHERE: EXISTS (SELECT 1 FROM store_sales_dated ss WHERE ss.ss_customer_sk = cb.c_customer_sk)
+      AND NOT EXISTS (SELECT 1 FROM web_sales_dated ws WHERE ws.ws_bill_customer_sk = cb.c_customer_sk)
+      AND NOT EXISTS (SELECT 1 FROM catalog_sales_dated cs WHERE cs.cs_ship_customer_sk = cb.c_customer_sk)
+    OUTPUT: cb.c_customer_sk, cb.cd_gender, cb.cd_marital_status, cb.cd_education_status, cb.cd_purchase_estimate, cb.cd_credit_rating
+    EXPECTED_ROWS: 4,337
+    CONSUMERS: group_by
+  group_by:
+    FROM: filtered_customers
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    AGGREGATE: COUNT(*) AS cnt1, COUNT(*) AS cnt2, COUNT(*) AS cnt3
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3
+    EXPECTED_ROWS: 4,337
+    CONSUMERS: final_sort
+EXAMPLES: date_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+  date_cte_isolate: Apply the date CTE pattern; create date_range CTE with d_year=2000 AND d_moy BETWEEN 1 AND 3, join once per channel. Ignore the dimension pre-filtering — Q6/Q11 pre-filtered date only.
+  early_filter: Apply early filtering of customer_address by ca_state and customer_demographics by join; ignore the fact table pre-join aspect.
+HAZARD_FLAGS:
+- Do NOT materialize store_sales_dated as a CTE if it forces full scan; keep as inline view or let optimizer inline.
+- Preserve EXISTS/NOT EXISTS semantics; do NOT convert to INTERSECT/EXCEPT unless proven equivalent.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+date_range -> store_sales_with_date -> web_sales_with_date -> catalog_sales_with_date -> customer_base -> progressive_joins -> group_by
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_moy BETWEEN 1 AND 3
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: store_sales_with_date, web_sales_with_date, catalog_sales_with_date
+  store_sales_with_date:
+    FROM: store_sales JOIN date_range ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: 819K
+    CONSUMERS: progressive_joins
+  web_sales_with_date:
+    FROM: web_sales JOIN date_range ON ws_sold_date_sk = d_date_sk
+    OUTPUT: ws_bill_customer_sk
+    EXPECTED_ROWS: 219K
+    CONSUMERS: progressive_joins
+  catalog_sales_with_date:
+    FROM: catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk
+    OUTPUT: cs_ship_customer_sk
+    EXPECTED_ROWS: 411K
+    CONSUMERS: progressive_joins
+  customer_base:
+    FROM: customer c JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+    WHERE: ca.ca_state IN ('TX', 'VA', 'MI')
+    OUTPUT: c.c_customer_sk, cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating
+    EXPECTED_ROWS: 71K
+    CONSUMERS: progressive_joins
+  progressive_joins:
+    FROM: customer_base cb
+      LEFT SEMI JOIN store_sales_with_date ss ON cb.c_customer_sk = ss.ss_customer_sk
+      LEFT ANTI JOIN web_sales_with_date ws ON cb.c_customer_sk = ws.ws_bill_customer_sk
+      LEFT ANTI JOIN catalog_sales_with_date cs ON cb.c_customer_sk = cs.cs_ship_customer_sk
+    OUTPUT: cb.cd_gender, cb.cd_marital_status, cb.cd_education_status, cb.cd_purchase_estimate, cb.cd_credit_rating
+    EXPECTED_ROWS: 4,337
+    CONSUMERS: group_by
+  group_by:
+    FROM: progressive_joins
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    AGGREGATE: COUNT(*) AS cnt1, COUNT(*) AS cnt2, COUNT(*) AS cnt3
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3
+    EXPECTED_ROWS: 4,337
+    CONSUMERS: final_sort
+EXAMPLES: prefetch_fact_join, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+  prefetch_fact_join: Apply staged join pipeline: date_range CTE, then pre-join each fact table with date_range. Use explicit LEFT SEMI/ANTI JOIN syntax. Ignore the multi-dimension prefetch aspect — Q63 pre-joined date_dim with store_sales only.
+  dimension_cte_isolate: Apply early filtering of customer_address and customer_demographics into customer_base CTE. Ignore the promotion/item dimension filtering — Q26 had additional dimensions.
+HAZARD_FLAGS:
+- Explicit LEFT SEMI/ANTI JOIN may not be recognized by DuckDB; verify syntax or use EXISTS.
+- Ensure customer_base includes all demographic columns needed for GROUP BY.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: early_filter + dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+date_range -> address_filter -> demographics_filter -> customer_base -> channel_checks -> group_by
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_moy BETWEEN 1 AND 3
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: channel_checks
+  address_filter:
+    FROM: customer_address
+    WHERE: ca_state IN ('TX', 'VA', 'MI')
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 37K
+    CONSUMERS: customer_base
+  demographics_filter:
+    FROM: customer_demographics
+    OUTPUT: cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    EXPECTED_ROWS: 1.9M
+    CONSUMERS: customer_base
+  customer_base:
+    FROM: customer c JOIN address_filter a ON c.c_current_addr_sk = a.ca_address_sk JOIN demographics_filter d ON c.c_current_cdemo_sk = d.cd_demo_sk
+    OUTPUT: c.c_customer_sk, d.cd_gender, d.cd_marital_status, d.cd_education_status, d.cd_purchase_estimate, d.cd_credit_rating
+    EXPECTED_ROWS: 71K
+    CONSUMERS: channel_checks
+  channel_checks:
+    FROM: customer_base cb
+    WHERE: EXISTS (SELECT 1 FROM store_sales ss JOIN date_range dr ON ss.ss_sold_date_sk = dr.d_date_sk WHERE ss.ss_customer_sk = cb.c_customer_sk)
+      AND NOT EXISTS (SELECT 1 FROM web_sales ws JOIN date_range dr ON ws.ws_sold_date_sk = dr.d_date_sk WHERE ws.ws_bill_customer_sk = cb.c_customer_sk)
+      AND NOT EXISTS (SELECT 1 FROM catalog_sales cs JOIN date_range dr ON cs.cs_sold_date_sk = dr.d_date_sk WHERE cs.cs_ship_customer_sk = cb.c_customer_sk)
+    OUTPUT: cb.c_customer_sk, cb.cd_gender, cb.cd_marital_status, cb.cd_education_status, cb.cd_purchase_estimate, cb.cd_credit_rating
+    EXPECTED_ROWS: 4,337
+    CONSUMERS: group_by
+  group_by:
+    FROM: channel_checks
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    AGGREGATE: COUNT(*) AS cnt1, COUNT(*) AS cnt2, COUNT(*) AS cnt3
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3
+    EXPECTED_ROWS: 4,337
+    CONSUMERS: final_sort
+EXAMPLES: early_filter, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+  early_filter: Apply filter to customer_address first (ca_state IN) and join with customer. Ignore the reason table filter — Q11 filtered reason table.
+  dimension_cte_isolate: Pre-filter customer_demographics (no WHERE, but select only needed columns) and customer_address. Ignore the cross-join of 3+ dimension CTEs — Q26 regression warning.
+HAZARD_FLAGS:
+- Do NOT cross-join address_filter and demographics_filter; join through customer table.
+- Ensure date_range is referenced 3 times in channel_checks; DuckDB may inline it.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: composite_decorrelate_union
+TARGET_LOGICAL_TREE:
+date_range -> store_customers -> web_customers -> catalog_customers -> customer_set -> customer_join -> group_by
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_moy BETWEEN 1 AND 3
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: store_customers, web_customers, catalog_customers
+  store_customers:
+    FROM: store_sales JOIN date_range ON ss_sold_date_sk = d_date_sk
+    OUTPUT: DISTINCT ss_customer_sk
+    EXPECTED_ROWS: ~116K (distinct customers from store_sales in period)
+    CONSUMERS: customer_set
+  web_customers:
+    FROM: web_sales JOIN date_range ON ws_sold_date_sk = d_date_sk
+    OUTPUT: DISTINCT ws_bill_customer_sk
+    EXPECTED_ROWS: ~3,753 (distinct customers from web_sales in period)
+    CONSUMERS: customer_set
+  catalog_customers:
+    FROM: catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk
+    OUTPUT: DISTINCT cs_ship_customer_sk
+    EXPECTED_ROWS: ~7,620 (distinct customers from catalog_sales in period)
+    CONSUMERS: customer_set
+  customer_set:
+    FROM: store_customers sc
+    WHERE: sc.ss_customer_sk NOT IN (SELECT ws_bill_customer_sk FROM web_customers)
+      AND sc.ss_customer_sk NOT IN (SELECT cs_ship_customer_sk FROM catalog_customers)
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: ~4,337
+    CONSUMERS: customer_join
+  customer_join:
+    FROM: customer_set cs
+      JOIN customer c ON cs.ss_customer_sk = c.c_customer_sk
+      JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+      JOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk
+    WHERE: ca.ca_state IN ('TX', 'VA', 'MI')
+    OUTPUT: cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating
+    EXPECTED_ROWS: 4,337
+    CONSUMERS: group_by
+  group_by:
+    FROM: customer_join
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    AGGREGATE: COUNT(*) AS cnt1, COUNT(*) AS cnt2, COUNT(*) AS cnt3
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3
+    EXPECTED_ROWS: 4,337
+    CONSUMERS: final_sort
+EXAMPLES: composite_decorrelate_union, multi_intersect_exists_cte
+EXAMPLE_ADAPTATION:
+  composite_decorrelate_union: Extract shared date filter, create distinct customer key CTEs per channel, combine with set operations (NOT IN). Ignore the UNION aspect — Q35 used UNION for EXISTS with OR.
+  multi_intersect_exists_cte: Use NOT IN instead of INTERSECT for anti-join. Ignore the cascading INTERSECT — Q14 had INTERSECT.
+HAZARD_FLAGS:
+- NOT IN may have NULL handling issues; ensure customer keys are non-NULL.
+- Materializing distinct customer keys per channel may be larger than semi/anti join intermediate results.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (combines date_cte_isolate with distinct key materialization and set operations)

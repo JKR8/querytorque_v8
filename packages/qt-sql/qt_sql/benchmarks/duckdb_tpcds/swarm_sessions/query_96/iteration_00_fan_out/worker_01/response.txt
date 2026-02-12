@@ -1,0 +1,89 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Join store sales with household demographics, time, and store; apply hour/minute, dependent-count, and store-name filters; and return total qualifying row count.
+    ├── WITH filtered_time  [+]
+    │   ├── SCAN (time_dim)
+    │   └── FILTER (t_hour=8 AND t_minute>=30)
+    ├── WITH filtered_hd  [+]
+    │   ├── SCAN (household_demographics)
+    │   └── FILTER (hd_dep_count=3)
+    ├── WITH filtered_store  [+]
+    │   ├── SCAN (store)
+    │   └── FILTER (s_store_name='ese')
+    ├── WITH fact_join  [+]
+    │   ├── SCAN (store_sales)
+    │   ├── JOIN filtered_time (ss_sold_time_sk = t_time_sk)
+    │   ├── JOIN filtered_hd (ss_hdemo_sk = hd_demo_sk)
+    │   └── JOIN filtered_store (ss_store_sk = s_store_sk)
+    ├── WITH aggregate  [+]
+    │   └── AGGREGATE (COUNT(*) AS cnt)
+    ├── LIMIT (100)
+    └── OUTPUT (cnt)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "multi_dimension_prefetch", "description": "Pre-filter all three dimension tables into CTEs before joining to store_sales", "applied_to": ["filtered_time", "filtered_hd", "filtered_store"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Each dimension CTE outputs only surrogate key column to minimize hash table size", "applied_to": ["filtered_time", "filtered_hd", "filtered_store"]},
+    {"id": "R3", "type": "sequential_join", "description": "Join all three dimension CTEs directly to store_sales sequentially (not cross-joined)", "applied_to": ["fact_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_time": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT t_time_sk FROM time_dim WHERE t_hour = 8 AND t_minute >= 30",
+        "interfaces": {"outputs": ["t_time_sk"], "consumes": []}
+      },
+      "filtered_hd": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": []}
+      },
+      "filtered_store": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_sk FROM store WHERE s_store_name = 'ese'",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "fact_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT 1 FROM store_sales INNER JOIN filtered_time ON ss_sold_time_sk = t_time_sk INNER JOIN filtered_hd ON ss_hdemo_sk = hd_demo_sk INNER JOIN filtered_store ON ss_store_sk = s_store_sk",
+        "interfaces": {"outputs": [], "consumes": ["filtered_time", "filtered_hd", "filtered_store"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT COUNT(*) AS cnt FROM fact_join",
+        "interfaces": {"outputs": ["cnt"], "consumes": ["fact_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT cnt FROM aggregate ORDER BY cnt ASC LIMIT 100",
+        "interfaces": {"outputs": ["cnt"], "consumes": ["aggregate"]}
+      }
+    },
+    "reconstruction_order": ["filtered_time", "filtered_hd", "filtered_store", "fact_join", "aggregate", "main_query"],
+    "assembly_template": "WITH filtered_time AS ({filtered_time}), filtered_hd AS ({filtered_hd}), filtered_store AS ({filtered_store}), fact_join AS ({fact_join}), aggregate AS ({aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Isolated all three dimension filters into separate CTEs returning only surrogate keys, then joined them sequentially to the fact table. This creates small hash tables for the dimension lookups and applies all filters before scanning store_sales.
+
+Expected speedup: 1.5-2x (dimension tables are small: 1,800, 720, and 14 rows after filtering)

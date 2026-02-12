@@ -1,0 +1,99 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_filter [~] Cost: <1% Rows: 61 — Filter date dimension for 60-day range from 1999-02-01
+│   └── OUTPUT (d_date_sk)
+├── [CTE] ca_filter [~] Cost: <1% Rows: 7,827 — Filter NC customer addresses
+│   └── OUTPUT (ca_address_sk)
+├── [CTE] web_filter [~] Cost: <1% Rows: 7 — Filter 'pri' company web sites
+│   └── OUTPUT (web_site_sk)
+├── [CTE] prefetch_ws [+] Cost: ~5% Rows: 9,956 — Join web_sales with filtered dimensions
+│   ├── JOIN (ws1.ws_ship_date_sk = date_filter.d_date_sk)
+│   ├── JOIN (ws1.ws_ship_addr_sk = ca_filter.ca_address_sk)
+│   ├── JOIN (ws1.ws_web_site_sk = web_filter.web_site_sk)
+│   └── OUTPUT (ws_order_number, ws_ext_ship_cost, ws_net_profit)
+├── [CTE] ws_wh_grouped [~] Cost: ~45% Rows: ~1K — Orders with multiple warehouses
+│   ├── SCAN (web_sales)
+│   ├── GROUP BY (ws_order_number)
+│   ├── HAVING (MIN(ws_warehouse_sk) <> MAX(ws_warehouse_sk))
+│   └── OUTPUT (ws_order_number)
+└── [MAIN] main_query [~] Cost: ~50% Rows: 1 — Combined semi-join and aggregation
+    ├── CTE (prefetch_ws)
+    ├── SEMI-JOIN (ws_order_number IN (SELECT wr_order_number FROM web_returns WHERE wr_order_number IN (SELECT ws_order_number FROM ws_wh_grouped)))
+    ├── AGGREGATE (COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit))
+    ├── ORDER BY (COUNT(DISTINCT ws_order_number))
+    ├── LIMIT 100
+    └── OUTPUT (order count, total shipping cost, total net profit)
+```
+
+**Change Markers:**
+- `[~]` date_filter, ca_filter, web_filter: Changed from implicit filters in main query to explicit CTEs (dimension_cte_isolate)
+- `[+]` prefetch_ws: New CTE joining filtered dimensions with fact table (prefetch_fact_join)
+- `[~]` ws_wh_grouped: Changed from multi-way self-join to GROUP BY with MIN/MAX comparison (materialize_cte pattern)
+- `[~]` main_query: Now references prefetch_ws CTE and uses combined semi-join condition
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter dimension tables into CTEs before joining with fact table", "applied_to": ["date_filter", "ca_filter", "web_filter"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Join fact table with dimension CTEs in a separate CTE to reduce data early", "applied_to": ["prefetch_ws"]},
+    {"id": "R3", "type": "materialize_cte", "description": "Replace self-join with GROUP BY to identify multi-warehouse orders", "applied_to": ["ws_wh_grouped"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN DATE '1999-02-01' AND (DATE '1999-02-01' + INTERVAL 60 DAY)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "ca_filter": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_state = 'NC'",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "web_filter": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT web_site_sk FROM web_site WHERE web_company_name = 'pri'",
+        "interfaces": {"outputs": ["web_site_sk"], "consumes": []}
+      },
+      "prefetch_ws": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit FROM web_sales ws1, date_filter, ca_filter, web_filter WHERE ws1.ws_ship_date_sk = date_filter.d_date_sk AND ws1.ws_ship_addr_sk = ca_filter.ca_address_sk AND ws1.ws_web_site_sk = web_filter.web_site_sk",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": ["date_filter", "ca_filter", "web_filter"]}
+      },
+      "ws_wh_grouped": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_order_number FROM web_sales GROUP BY ws_order_number HAVING MIN(ws_warehouse_sk) <> MAX(ws_warehouse_sk)",
+        "interfaces": {"outputs": ["ws_order_number"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(DISTINCT ws_order_number) AS \"order count\", SUM(ws_ext_ship_cost) AS \"total shipping cost\", SUM(ws_net_profit) AS \"total net profit\" FROM prefetch_ws WHERE ws_order_number IN (SELECT wr_order_number FROM web_returns WHERE wr_order_number IN (SELECT ws_order_number FROM ws_wh_grouped)) ORDER BY COUNT(DISTINCT ws_order_number) LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["prefetch_ws", "ws_wh_grouped"]}
+      }
+    },
+    "reconstruction_order": ["date_filter", "ca_filter", "web_filter", "prefetch_ws", "ws_wh_grouped", "main_query"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), ca_filter AS ({ca_filter}), web_filter AS ({web_filter}), prefetch_ws AS ({prefetch_ws}), ws_wh_grouped AS ({ws_wh_grouped}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Applied three complementary transforms: (1) dimension CTE isolation creates small hash tables for dimension filters, (2) prefetch CTE joins these with the fact table to reduce data early, (3) GROUP BY replaces expensive self-join for multi-warehouse detection. The combined semi-join preserves original semantics: orders must be both multi-warehouse AND returned multi-warehouse orders.
+
+**Expected speedup:** ~2-3x due to reduced intermediate data volume (dimension CTEs filter first), cheaper multi-warehouse detection (GROUP BY vs self-join), and predicate pushdown opportunities through CTE chain.

@@ -1,0 +1,99 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] store_aggregates  [+]  Cost: 25%  Rows: ~400K  — Store sales aggregates per customer per year (2001,2002)
+│   ├── SCAN (customer, store_sales (join), date_dim (join))
+│   ├── JOIN (c_customer_sk = ss_customer_sk)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_year IN (2001,2002))
+│   ├── AGG (GROUP BY c_customer_id, c_first_name, c_last_name, c_birth_country, d_year)
+│   └── OUTPUT (customer_id, customer_first_name, customer_last_name, customer_birth_country, dyear, year_total, sale_type='s')
+├── [CTE] web_aggregates  [+]  Cost: 25%  Rows: ~200K  — Web sales aggregates per customer per year (2001,2002)
+│   ├── SCAN (customer, web_sales (join), date_dim (join))
+│   ├── JOIN (c_customer_sk = ws_bill_customer_sk)
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_year IN (2001,2002))
+│   ├── AGG (GROUP BY c_customer_id, c_first_name, c_last_name, c_birth_country, d_year)
+│   └── OUTPUT (customer_id, customer_first_name, customer_last_name, customer_birth_country, dyear, year_total, sale_type='w')
+└── [MAIN] main_self_join  [+]  Cost: 50%  Rows: ~100  — Self-join four aggregates to compute growth ratios and filter
+    ├── SCAN (store_aggregates AS s2001, store_aggregates AS s2002, web_aggregates AS w2001, web_aggregates AS w2002)
+    ├── JOIN (s2001.customer_id = s2002.customer_id = w2001.customer_id = w2002.customer_id)
+    ├── FILTER (s2001.dyear=2001 AND s2002.dyear=2002 AND w2001.dyear=2001 AND w2002.dyear=2002)
+    ├── FILTER (s2001.year_total>0 AND w2001.year_total>0)
+    ├── FILTER (ratio_comparison)
+    └── OUTPUT (customer_id, customer_first_name, customer_last_name, customer_birth_country)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "union_cte_split",
+      "description": "Split generic UNION CTE into separate channel-specific CTEs (store_aggregates, web_aggregates) to eliminate redundant scans and enable predicate pushdown",
+      "applied_to": ["store_aggregates", "web_aggregates"]
+    },
+    {
+      "id": "R2",
+      "type": "pushdown",
+      "description": "Push year filter (2001,2002) and channel filter into CTEs, consolidating 2+2 scans into 1+1 passes",
+      "applied_to": ["store_aggregates", "web_aggregates"]
+    },
+    {
+      "id": "R3",
+      "type": "column_pruning",
+      "description": "Remove unused columns (customer_preferred_cust_flag, customer_login, customer_email_address) from CTEs",
+      "applied_to": ["store_aggregates", "web_aggregates"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "store_aggregates": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, d.d_year AS dyear, SUM(ss.ss_ext_list_price - ss.ss_ext_discount_amt) AS year_total, 's' AS sale_type FROM customer c JOIN store_sales ss ON c.c_customer_sk = ss.ss_customer_sk JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk WHERE d.d_year IN (2001, 2002) GROUP BY c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country, d.d_year",
+          "interfaces": {
+            "outputs": ["customer_id", "customer_first_name", "customer_last_name", "customer_birth_country", "dyear", "year_total", "sale_type"],
+            "consumes": []
+          }
+        },
+        "web_aggregates": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, d.d_year AS dyear, SUM(ws.ws_ext_list_price - ws.ws_ext_discount_amt) AS year_total, 'w' AS sale_type FROM customer c JOIN web_sales ws ON c.c_customer_sk = ws.ws_bill_customer_sk JOIN date_dim d ON ws.ws_sold_date_sk = d.d_date_sk WHERE d.d_year IN (2001, 2002) GROUP BY c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country, d.d_year",
+          "interfaces": {
+            "outputs": ["customer_id", "customer_first_name", "customer_last_name", "customer_birth_country", "dyear", "year_total", "sale_type"],
+            "consumes": []
+          }
+        },
+        "main_self_join": {
+          "type": "main_query",
+          "change": "new",
+          "sql": "SELECT s2002.customer_id, s2002.customer_first_name, s2002.customer_last_name, s2002.customer_birth_country FROM store_aggregates s2001, store_aggregates s2002, web_aggregates w2001, web_aggregates w2002 WHERE s2001.customer_id = s2002.customer_id AND s2001.customer_id = w2001.customer_id AND s2001.customer_id = w2002.customer_id AND s2001.dyear = 2001 AND s2002.dyear = 2002 AND w2001.dyear = 2001 AND w2002.dyear = 2002 AND s2001.year_total > 0 AND w2001.year_total > 0 AND CASE WHEN w2001.year_total > 0 THEN w2002.year_total / w2001.year_total ELSE 0.0 END > CASE WHEN s2001.year_total > 0 THEN s2002.year_total / s2001.year_total ELSE 0.0 END ORDER BY s2002.customer_id, s2002.customer_first_name, s2002.customer_last_name, s2002.customer_birth_country LIMIT 100",
+          "interfaces": {
+            "outputs": ["customer_id", "customer_first_name", "customer_last_name", "customer_birth_country"],
+            "consumes": ["store_aggregates", "web_aggregates"]
+          }
+        }
+      },
+      "reconstruction_order": ["store_aggregates", "web_aggregates", "main_self_join"],
+      "assembly_template": "WITH store_aggregates AS ({store_aggregates}), web_aggregates AS ({web_aggregates}) {main_self_join}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Split the original UNION CTE into separate store and web CTEs, pushed year/channel filters into those CTEs, and preserved the exact 4-way self-join logic with defensive division guards. This consolidates 4 scans (2 store + 2 web) into 2 scans (1 store + 1 web) while maintaining semantic equivalence.
+
+**Expected speedup**: 2-3x reduction in I/O and CPU from eliminating redundant scans and enabling predicate pushdown.

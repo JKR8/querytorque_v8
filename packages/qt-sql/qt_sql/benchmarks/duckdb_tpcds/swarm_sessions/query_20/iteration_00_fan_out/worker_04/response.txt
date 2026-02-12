@@ -1,0 +1,115 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement with CTEs)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K — Transformed to CTE pipeline matching target logical tree
+    ├── [~] date_cte (NEW)  — Filter date_dim for 30-day window
+    │   ├── SCAN (date_dim)
+    │   └── FILTER (d_date BETWEEN '2002-01-26' AND '2002-01-26' + 30 DAY)
+    │
+    ├── [~] item_cte (NEW)  — Filter item for target categories
+    │   ├── SCAN (item)
+    │   └── FILTER (i_category IN ('Shoes', 'Books', 'Women'))
+    │
+    ├── [~] sales_join (NEW)  — Join filtered dimensions to catalog_sales
+    │   ├── SCAN (catalog_sales)
+    │   ├── JOIN (INNER JOIN date_cte ON cs_sold_date_sk = d_date_sk)
+    │   └── JOIN (INNER JOIN item_cte ON cs_item_sk = i_item_sk)
+    │
+    ├── [~] aggregated_with_class (NEW)  — Aggregate revenue and compute class totals via window
+    │   ├── FROM (sales_join)
+    │   ├── AGG (GROUP BY item attributes)
+    │   └── WINDOW (SUM OVER PARTITION BY i_class)
+    │
+    └── [~] final (NEW)  — Compute ratio and apply final ordering/limit
+        ├── PROJECT (itemrevenue * 100 / classrevenue AS revenueratio)
+        ├── SORT (i_category, i_class, i_item_id, i_item_desc, revenueratio)
+        └── LIMIT (100)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "prefetch_fact_join",
+      "description": "Staged pipeline: filter dimensions first (date_cte, item_cte), then join to fact table (sales_join) to reduce data before window computation",
+      "applied_to": ["date_cte", "item_cte", "sales_join", "aggregated_with_class", "final"]
+    },
+    {
+      "id": "R2",
+      "type": "deferred_window_aggregation",
+      "description": "Compute window function (classrevenue) during the same aggregation step that sums itemrevenue, avoiding separate pass over data",
+      "applied_to": ["aggregated_with_class"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "date_cte": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2002-01-26' AS DATE) AND (CAST('2002-01-26' AS DATE) + INTERVAL 30 DAY)",
+          "interfaces": {
+            "outputs": ["d_date_sk"],
+            "consumes": []
+          }
+        },
+        "item_cte": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT i_item_sk, i_item_id, i_item_desc, i_category, i_class, i_current_price FROM item WHERE i_category IN ('Shoes', 'Books', 'Women')",
+          "interfaces": {
+            "outputs": ["i_item_sk", "i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price"],
+            "consumes": []
+          }
+        },
+        "sales_join": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT i.i_item_id, i.i_item_desc, i.i_category, i.i_class, i.i_current_price, cs.cs_ext_sales_price FROM catalog_sales cs INNER JOIN date_cte d ON cs.cs_sold_date_sk = d.d_date_sk INNER JOIN item_cte i ON cs.cs_item_sk = i.i_item_sk",
+          "interfaces": {
+            "outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "cs_ext_sales_price"],
+            "consumes": ["date_cte", "item_cte"]
+          }
+        },
+        "aggregated_with_class": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT i_item_id, i_item_desc, i_category, i_class, i_current_price, SUM(cs_ext_sales_price) AS itemrevenue, SUM(SUM(cs_ext_sales_price)) OVER (PARTITION BY i_class) AS classrevenue FROM sales_join GROUP BY i_item_id, i_item_desc, i_category, i_class, i_current_price",
+          "interfaces": {
+            "outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue", "classrevenue"],
+            "consumes": ["sales_join"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, itemrevenue * 100 / classrevenue AS revenueratio FROM aggregated_with_class ORDER BY i_category, i_class, i_item_id, i_item_desc, revenueratio LIMIT 100",
+          "interfaces": {
+            "outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue", "revenueratio"],
+            "consumes": ["aggregated_with_class"]
+          }
+        }
+      },
+      "reconstruction_order": ["date_cte", "item_cte", "sales_join", "aggregated_with_class", "main_query"],
+      "assembly_template": "WITH date_cte AS ({date_cte}), item_cte AS ({item_cte}), sales_join AS ({sales_join}), aggregated_with_class AS ({aggregated_with_class}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Changes and Expected Speedup
+
+**Changes:** Transformed the original flat join into a staged CTE pipeline that first filters dimensions (date_dim, item), then joins the filtered results to the fact table (catalog_sales). The window function for class-level revenue is computed during the same aggregation step that calculates item revenue, avoiding a separate pass over the data.
+
+**Expected speedup:** 1.3–1.5x. The prefetch pattern reduces the fact table join cardinality early, and the window computation is performed on the already-aggregated data (~14K rows vs. original ~42K). This avoids the engine's window optimization gap while maintaining safe predicate pushdown boundaries.

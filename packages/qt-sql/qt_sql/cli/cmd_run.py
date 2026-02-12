@@ -153,7 +153,7 @@ def run(
             console.print(f"{'='*60}")
 
             from ..config_boost import boost_benchmark as _boost_benchmark
-            boost_results = _boost_benchmark(bench_dir, dsn, min_speedup=1.05)
+            boost_results = _boost_benchmark(bench_dir, dsn, min_speedup=1.05, query_ids=query_ids)
             boosted = sum(1 for r in boost_results if r.get("status") == "BOOSTED")
             no_gain = sum(1 for r in boost_results if r.get("status") == "NO_GAIN")
             console.print(
@@ -380,14 +380,18 @@ def _run_two_phase(
             session.compact_gen_result()
 
     # ── Phase 2: Validate with limited parallelism ─────────────────────
-    val_concurrency = min(4, gen_ok)
+    val_sessions = [(qid, s) for qid, s in sessions if qid not in error_qids]
+
+    if not val_sessions:
+        console.print("\n  No successful generations to validate.")
+        return
+
+    val_concurrency = min(4, len(val_sessions))
     console.print(
         f"\n{'='*60}\n"
-        f"  PHASE 2: Validate & snipe ({gen_ok} queries, {val_concurrency} parallel)\n"
+        f"  PHASE 2: Validate & snipe ({len(val_sessions)} queries, {val_concurrency} parallel)\n"
         f"{'='*60}",
     )
-
-    val_sessions = [(qid, s) for qid, s in sessions if qid not in error_qids]
 
     def _validate_one(qid_session):
         qid, session = qid_session

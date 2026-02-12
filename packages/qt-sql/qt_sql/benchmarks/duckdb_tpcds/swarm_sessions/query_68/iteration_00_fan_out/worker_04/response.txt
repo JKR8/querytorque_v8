@@ -1,0 +1,76 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K — Restructured into CTE pipeline per Target Logical Tree.
+    ├── [+] WITH dim_keys AS (SELECT ...) — Cross-join of filtered dimension keys
+    ├── [+] WITH fact_bloom AS (SELECT ...) — Join store_sales with dim_keys + customer_address for bought_city
+    ├── [+] WITH agg AS (SELECT ...) — Ticket-level aggregates
+    ├── [+] WITH join_customer AS (SELECT ...) — Join agg with customer for customer details
+    ├── [+] WITH join_current_addr AS (SELECT ...) — Join with current address, filter city mismatch
+    ├── [~] SORT (c_last_name ASC, ss_ticket_number ASC)
+    └── [~] OUTPUT (c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, extended_price, extended_tax, list_price)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_key_isolation", "description": "Replace star-join with dimension-key CTE cross-join to pre-filter store_sales via bloom-like composite key set.", "applied_to": ["dim_keys", "fact_bloom"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "dim_keys": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, s_store_sk, hd_demo_sk FROM (SELECT d_date_sk FROM date_dim WHERE d_dom BETWEEN 1 AND 2 AND d_year IN (1998, 1999, 2000)) d CROSS JOIN (SELECT s_store_sk FROM store WHERE s_city IN ('Pleasant Hill', 'Five Points')) s CROSS JOIN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 8 OR hd_vehicle_count = -1) h",
+        "interfaces": {"outputs": ["d_date_sk", "s_store_sk", "hd_demo_sk"], "consumes": []}
+      },
+      "fact_bloom": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, ca_city AS bought_city, ss_ext_sales_price, ss_ext_list_price, ss_ext_tax FROM store_sales JOIN dim_keys ON ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk AND ss_hdemo_sk = hd_demo_sk JOIN customer_address ON ss_addr_sk = ca_address_sk",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "bought_city", "ss_ext_sales_price", "ss_ext_list_price", "ss_ext_tax"], "consumes": ["dim_keys"]}
+      },
+      "agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, bought_city, SUM(ss_ext_sales_price) AS extended_price, SUM(ss_ext_list_price) AS list_price, SUM(ss_ext_tax) AS extended_tax FROM fact_bloom GROUP BY ss_ticket_number, ss_customer_sk, bought_city",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "bought_city", "extended_price", "list_price", "extended_tax"], "consumes": ["fact_bloom"]}
+      },
+      "join_customer": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_last_name, c_first_name, bought_city, ss_ticket_number, extended_price, extended_tax, list_price, c_current_addr_sk FROM agg JOIN customer ON ss_customer_sk = c_customer_sk",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "bought_city", "ss_ticket_number", "extended_price", "extended_tax", "list_price", "c_current_addr_sk"], "consumes": ["agg"]}
+      },
+      "join_current_addr": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, extended_price, extended_tax, list_price FROM join_customer JOIN customer_address current_addr ON c_current_addr_sk = ca_address_sk AND ca_city <> bought_city",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "ca_city", "bought_city", "ss_ticket_number", "extended_price", "extended_tax", "list_price"], "consumes": ["join_customer"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, extended_price, extended_tax, list_price FROM join_current_addr ORDER BY c_last_name ASC, ss_ticket_number ASC LIMIT 100",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "ca_city", "bought_city", "ss_ticket_number", "extended_price", "extended_tax", "list_price"], "consumes": ["join_current_addr"]}
+      }
+    },
+    "reconstruction_order": ["dim_keys", "fact_bloom", "agg", "join_customer", "join_current_addr", "main_query"],
+    "assembly_template": "WITH dim_keys AS ({dim_keys}), fact_bloom AS ({fact_bloom}), agg AS ({agg}), join_customer AS ({join_customer}), join_current_addr AS ({join_current_addr}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced star-join with explicit CTE pipeline isolating dimension keys into a cross-join (dim_keys) to create a composite filter set, then joined to store_sales (fact_bloom) and subsequent dimensions. This separates dimension filtering from fact table probing, potentially allowing better join ordering and vectorized filtering.
+
+**Expected speedup**: Moderate (0.5–2x) — The cross-join may explode intermediate rows (6M), but DuckDB’s vectorized execution and hash-join optimizations can mitigate overhead. The main benefit is reducing repeated dimension scans. Risk exists if dimension CTE materialization is expensive.

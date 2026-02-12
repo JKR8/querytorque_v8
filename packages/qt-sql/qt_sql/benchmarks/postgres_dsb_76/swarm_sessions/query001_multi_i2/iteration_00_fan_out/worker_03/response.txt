@@ -1,0 +1,121 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] transitive_filtered_returns  [~]  Cost: 4% → 2%  Rows: ~93K → ~3K
+│   ├── SCAN (store_returns, date_dim (join)) → [~] Added store/customer/demographics joins
+│   ├── JOIN (sr_returned_date_sk = d_date_sk) [=]
+│   ├── JOIN (s_store_sk = sr_store_sk)  [+]
+│   ├── JOIN (c_customer_sk = sr_customer_sk)  [+]
+│   ├── JOIN (cd_demo_sk = c_current_cdemo_sk)  [+]
+│   ├── FILTER (d_year = 2000) [=]
+│   ├── FILTER (sr_return_amt / sr_return_quantity BETWEEN 115 AND 174) [=]
+│   ├── FILTER (s_state IN ('IA', 'KY', 'NE'))  [+]
+│   ├── FILTER (cd_marital_status IN ('S', 'S'))  [+]
+│   ├── FILTER (cd_education_status IN ('4 yr Degree', '4 yr Degree'))  [+]
+│   ├── FILTER (cd_gender = 'M')  [+]
+│   ├── FILTER (c_birth_month = 4)  [+]
+│   ├── FILTER (c_birth_year BETWEEN 1987 AND 1993)  [+]
+│   ├── AGG (GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk) [=]
+│   └── OUTPUT (ctr_customer_sk, ctr_store_sk, ctr_reason_sk, ctr_total_return) [=]
+├── [CTE] store_averages  [+]  Cost: 1%  Rows: ~distinct stores
+│   ├── SCAN (transitive_filtered_returns) [=]
+│   ├── AGG (GROUP BY ctr_store_sk) [=]
+│   ├── COMPUTE (AVG(ctr_total_return) * 1.2) [=]
+│   └── OUTPUT (ctr_store_sk, store_threshold) [=]
+├── [CTE] dimension_joins  [+]  Cost: 2%  Rows: ~final rows
+│   ├── SCAN (transitive_filtered_returns r, store_averages s) [=]
+│   ├── JOIN (r.ctr_store_sk = s.ctr_store_sk) [=]
+│   ├── FILTER (r.ctr_total_return > s.store_threshold) [=]
+│   ├── FILTER (r.ctr_reason_sk BETWEEN 17 AND 20) [=]
+│   └── OUTPUT (r.ctr_customer_sk, r.ctr_store_sk, r.ctr_reason_sk, r.ctr_total_return) [=]
+└── [MAIN] final  [~]  Cost: 96% → 95%  Rows: ~21.1M → ~100
+    ├── SCAN (dimension_joins d, customer c)  [+]
+    ├── JOIN (d.ctr_customer_sk = c.c_customer_sk)  [+]
+    ├── SORT (c_customer_id ASC) [=]
+    ├── LIMIT (100) [=]
+    └── OUTPUT (c_customer_id) [=]
+```
+
+**Changes:**
+1. **transitive_filtered_returns**: Modified from original `customer_total_return` CTE by adding JOINs to store, customer, customer_demographics and pushing their filters into the CTE definition (early filtering).
+2. **store_averages**: New CTE that decorrelates the original subquery by pre-computing store thresholds.
+3. **dimension_joins**: New CTE that performs the threshold comparison and reason_sk filtering.
+4. **final**: Simplified main query that only joins dimension_joins back to customer to retrieve c_customer_id.
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "early_filter_decorrelate",
+      "description": "Pushed store/customer/demographics filters into CTE definition and decorrelated subquery via separate store_averages CTE",
+      "applied_to": ["transitive_filtered_returns", "store_averages", "dimension_joins"]
+    },
+    {
+      "id": "R2",
+      "type": "semantic_preservation",
+      "description": "Maintained all original filters and division guard, added back customer join for final output",
+      "applied_to": ["final"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "transitive_filtered_returns": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT sr_customer_sk AS ctr_customer_sk,\n       sr_store_sk AS ctr_store_sk,\n       sr_reason_sk AS ctr_reason_sk,\n       SUM(SR_RETURN_AMT_INC_TAX) AS ctr_total_return\nFROM store_returns sr\nJOIN date_dim ON sr_returned_date_sk = d_date_sk\nJOIN store ON s_store_sk = sr_store_sk\nJOIN customer ON c_customer_sk = sr_customer_sk\nJOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk\nWHERE d_year = 2000\n  AND sr_return_amt / sr_return_quantity BETWEEN 115 AND 174\n  AND s_state IN ('IA', 'KY', 'NE')\n  AND cd_marital_status IN ('S', 'S')\n  AND cd_education_status IN ('4 yr Degree', '4 yr Degree')\n  AND cd_gender = 'M'\n  AND c_birth_month = 4\n  AND c_birth_year BETWEEN 1987 AND 1993\nGROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk",
+          "interfaces": {
+            "outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return"],
+            "consumes": []
+          }
+        },
+        "store_averages": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ctr_store_sk,\n       AVG(ctr_total_return) * 1.2 AS store_threshold\nFROM transitive_filtered_returns\nGROUP BY ctr_store_sk",
+          "interfaces": {
+            "outputs": ["ctr_store_sk", "store_threshold"],
+            "consumes": ["transitive_filtered_returns"]
+          }
+        },
+        "dimension_joins": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT r.ctr_customer_sk,\n       r.ctr_store_sk,\n       r.ctr_reason_sk,\n       r.ctr_total_return\nFROM transitive_filtered_returns r\nJOIN store_averages s ON r.ctr_store_sk = s.ctr_store_sk\nWHERE r.ctr_total_return > s.store_threshold\n  AND r.ctr_reason_sk BETWEEN 17 AND 20",
+          "interfaces": {
+            "outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return"],
+            "consumes": ["transitive_filtered_returns", "store_averages"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT c_customer_id\nFROM dimension_joins d\nJOIN customer c ON d.ctr_customer_sk = c.c_customer_sk\nORDER BY c_customer_id\nLIMIT 100",
+          "interfaces": {
+            "outputs": ["c_customer_id"],
+            "consumes": ["dimension_joins"]
+          }
+        }
+      },
+      "reconstruction_order": ["transitive_filtered_returns", "store_averages", "dimension_joins", "main_query"],
+      "assembly_template": "WITH transitive_filtered_returns AS ({transitive_filtered_returns}),\n     store_averages AS ({store_averages}),\n     dimension_joins AS ({dimension_joins})\n{main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Structural decorrelation by pre-computing store thresholds in a separate CTE, with early dimension filtering to reduce rows before aggregation. The mechanism eliminates 8,834 correlated subquery executions by computing store averages once, then joining. All semantic invariants preserved: same filters, same division guard, same output columns and ordering.
+
+**Expected speedup:** 1.5-2x (eliminates correlated subquery paralysis while maintaining early row reduction)

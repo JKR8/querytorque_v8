@@ -1,0 +1,82 @@
+## Modified Logic Tree
+
+[=] filtered_dates: Unchanged from best foundation
+[=] filtered_ca: Unchanged from best foundation  
+[=] filtered_web: Unchanged from best foundation
+[~] base_sales: Modified to include only required columns and use explicit JOIN syntax
+[+] multi_warehouse_orders: New CTE computing orders with ≥2 distinct warehouses (decorrelated)
+[+] bad_returns: New CTE computing orders with bad return reasons (decorrelated, pre-filtered)
+[~] main_query: Modified to JOIN with decorrelated CTEs instead of correlated subqueries
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pg_dimension_prefetch_star", "description": "Pre-filter dimension tables into CTEs for tiny hash tables", "applied_to": ["filtered_dates", "filtered_ca", "filtered_web"]},
+    {"id": "R2", "type": "decorrelation_cte_anti", "description": "Decorrelate NOT EXISTS by precomputing bad return orders as CTE", "applied_to": ["bad_returns"]},
+    {"id": "R3", "type": "pg_self_join_decomposition", "description": "Decorrelate EXISTS by precomputing multi-warehouse orders as CTE", "applied_to": ["multi_warehouse_orders"]},
+    {"id": "R4", "type": "explicit_join_syntax", "description": "Convert comma-joins to explicit JOIN...ON syntax for better PG optimization", "applied_to": ["base_sales"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '1999-10-01' AND CAST('1999-10-01' AS DATE) + INTERVAL '60 DAY'",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_ca": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('MO','MT','OK','SC','TX','WI')",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "filtered_web": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "SELECT web_site_sk FROM web_site WHERE web_gmt_offset >= -5",
+        "interfaces": {"outputs": ["web_site_sk"], "consumes": []}
+      },
+      "base_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit FROM web_sales ws1 INNER JOIN filtered_dates ON ws1.ws_ship_date_sk = filtered_dates.d_date_sk INNER JOIN filtered_ca ON ws1.ws_ship_addr_sk = filtered_ca.ca_address_sk INNER JOIN filtered_web ON ws1.ws_web_site_sk = filtered_web.web_site_sk WHERE ws1.ws_list_price BETWEEN 253 AND 282",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": ["filtered_dates", "filtered_ca", "filtered_web"]}
+      },
+      "multi_warehouse_orders": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_order_number FROM web_sales GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk) >= 2",
+        "interfaces": {"outputs": ["ws_order_number"], "consumes": []}
+      },
+      "bad_returns": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT wr_order_number FROM web_returns WHERE wr_reason_sk IN (8,18,20,23,41) GROUP BY wr_order_number",
+        "interfaces": {"outputs": ["wr_order_number"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(DISTINCT bs.ws_order_number) AS \"order count\", SUM(bs.ws_ext_ship_cost) AS \"total shipping cost\", SUM(bs.ws_net_profit) AS \"total net profit\" FROM base_sales bs INNER JOIN multi_warehouse_orders mwo ON bs.ws_order_number = mwo.ws_order_number LEFT JOIN bad_returns br ON bs.ws_order_number = br.wr_order_number WHERE br.wr_order_number IS NULL ORDER BY 1 LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["base_sales", "multi_warehouse_orders", "bad_returns"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_ca", "filtered_web", "base_sales", "multi_warehouse_orders", "bad_returns", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), filtered_ca AS ({filtered_ca}), filtered_web AS ({filtered_web}), base_sales AS ({base_sales}), multi_warehouse_orders AS ({multi_warehouse_orders}), bad_returns AS ({bad_returns}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'", "SET LOCAL hash_mem_multiplier = 2.0", "SET LOCAL enable_mergejoin = off", "SET LOCAL enable_nestloop = off"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Decorrelated both EXISTS conditions via precomputed CTEs, using explicit JOIN syntax and LEFT JOIN + NULL check for anti-join. The multi-warehouse condition is computed once from the entire web_sales table, and bad returns are pre-grouped by order number to create a compact hash table for anti-join.
+
+**Expected speedup**: 2.5-3.0x. The original bottleneck was the large hash anti-join on web_returns (77K rows). By pre-grouping bad returns by order number, we reduce the hash table size. The EXISTS decorrelation replaces per-row nested loops with a single hash join. The explicit JOIN syntax helps PostgreSQL optimize join order with better cardinality estimates. Increased work_mem ensures hash operations stay in memory.

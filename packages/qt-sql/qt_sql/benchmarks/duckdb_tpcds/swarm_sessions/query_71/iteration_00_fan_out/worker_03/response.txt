@@ -1,0 +1,130 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K — Structured as CTE pipeline following Target Logical Tree
+    ├── [!] CTE filtered_date
+    │   ├── SCAN date_dim
+    │   └── FILTER (d_moy=12 AND d_year=1998)
+    ├── [!] CTE web_fact_prejoin
+    │   ├── SCAN web_sales
+    │   ├── JOIN filtered_date (ws_sold_date_sk = d_date_sk)
+    │   └── OUTPUT (ext_price, sold_item_sk, time_sk)
+    ├── [!] CTE catalog_fact_prejoin
+    │   ├── SCAN catalog_sales
+    │   ├── JOIN filtered_date (cs_sold_date_sk = d_date_sk)
+    │   └── OUTPUT (ext_price, sold_item_sk, time_sk)
+    ├── [!] CTE store_fact_prejoin
+    │   ├── SCAN store_sales
+    │   ├── JOIN filtered_date (ss_sold_date_sk = d_date_sk)
+    │   └── OUTPUT (ext_price, sold_item_sk, time_sk)
+    ├── [!] CTE union_all
+    │   └── UNION ALL (web_fact_prejoin, catalog_fact_prejoin, store_fact_prejoin)
+    ├── [!] CTE join_item_time
+    │   ├── JOIN union_all → item (sold_item_sk = i_item_sk AND i_manager_id=1)
+    │   ├── JOIN union_all → time_dim (time_sk = t_time_sk AND t_meal_time IN breakfast/dinner)
+    │   └── OUTPUT (ext_price, i_brand_id, i_brand, t_hour, t_minute)
+    ├── [!] CTE aggregate
+    │   ├── GROUP BY (i_brand_id, i_brand, t_hour, t_minute)
+    │   └── AGGREGATE SUM(ext_price) AS ext_price
+    ├── [!] CTE sort
+    │   ├── ORDER BY (ext_price DESC, i_brand_id)
+    │   └── OUTPUT (brand_id, brand, t_hour, t_minute, ext_price)
+    └── OUTPUT (brand_id, brand, t_hour, t_minute, ext_price)
+```
+
+Change markers:
+- `[!]` — Structural change: Original query restructured into explicit CTE pipeline per Target Logical Tree
+- `[~]` — Modified: Main query now assembles CTEs instead of direct UNION ALL with inline date joins
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "staged_cte_pipeline",
+      "description": "Decomposed original UNION ALL into explicit CTE chain: filtered_date → 3 fact pre-joins → union_all → join_item_time → aggregate → sort",
+      "applied_to": ["filtered_date", "web_fact_prejoin", "catalog_fact_prejoin", "store_fact_prejoin", "union_all", "join_item_time", "aggregate", "sort"]
+    },
+    {
+      "id": "R2",
+      "type": "pushdown",
+      "description": "Pushed date_dim filter (d_moy=12, d_year=1998) into filtered_date CTE, reducing each fact table scan",
+      "applied_to": ["filtered_date"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_moy = 12 AND d_year = 1998",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "web_fact_prejoin": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_ext_sales_price AS ext_price, ws_item_sk AS sold_item_sk, ws_sold_time_sk AS time_sk FROM web_sales JOIN filtered_date ON ws_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ext_price", "sold_item_sk", "time_sk"], "consumes": ["filtered_date"]}
+      },
+      "catalog_fact_prejoin": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cs_ext_sales_price AS ext_price, cs_item_sk AS sold_item_sk, cs_sold_time_sk AS time_sk FROM catalog_sales JOIN filtered_date ON cs_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ext_price", "sold_item_sk", "time_sk"], "consumes": ["filtered_date"]}
+      },
+      "store_fact_prejoin": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_ext_sales_price AS ext_price, ss_item_sk AS sold_item_sk, ss_sold_time_sk AS time_sk FROM store_sales JOIN filtered_date ON ss_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ext_price", "sold_item_sk", "time_sk"], "consumes": ["filtered_date"]}
+      },
+      "union_all": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ext_price, sold_item_sk, time_sk FROM web_fact_prejoin UNION ALL SELECT ext_price, sold_item_sk, time_sk FROM catalog_fact_prejoin UNION ALL SELECT ext_price, sold_item_sk, time_sk FROM store_fact_prejoin",
+        "interfaces": {"outputs": ["ext_price", "sold_item_sk", "time_sk"], "consumes": ["web_fact_prejoin", "catalog_fact_prejoin", "store_fact_prejoin"]}
+      },
+      "join_item_time": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT u.ext_price, i.i_brand_id, i.i_brand, t.t_hour, t.t_minute FROM union_all u JOIN item i ON u.sold_item_sk = i.i_item_sk AND i.i_manager_id = 1 JOIN time_dim t ON u.time_sk = t.t_time_sk AND (t.t_meal_time = 'breakfast' OR t.t_meal_time = 'dinner')",
+        "interfaces": {"outputs": ["ext_price", "i_brand_id", "i_brand", "t_hour", "t_minute"], "consumes": ["union_all"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_brand_id, i_brand, t_hour, t_minute, SUM(ext_price) AS ext_price FROM join_item_time GROUP BY i_brand_id, i_brand, t_hour, t_minute",
+        "interfaces": {"outputs": ["i_brand_id", "i_brand", "t_hour", "t_minute", "ext_price"], "consumes": ["join_item_time"]}
+      },
+      "sort": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_brand_id AS brand_id, i_brand AS brand, t_hour, t_minute, ext_price FROM aggregate ORDER BY ext_price DESC, i_brand_id",
+        "interfaces": {"outputs": ["brand_id", "brand", "t_hour", "t_minute", "ext_price"], "consumes": ["aggregate"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT brand_id, brand, t_hour, t_minute, ext_price FROM sort",
+        "interfaces": {"outputs": ["brand_id", "brand", "t_hour", "t_minute", "ext_price"], "consumes": ["sort"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "web_fact_prejoin", "catalog_fact_prejoin", "store_fact_prejoin", "union_all", "join_item_time", "aggregate", "sort", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), web_fact_prejoin AS ({web_fact_prejoin}), catalog_fact_prejoin AS ({catalog_fact_prejoin}), store_fact_prejoin AS ({store_fact_prejoin}), union_all AS ({union_all}), join_item_time AS ({join_item_time}), aggregate AS ({aggregate}), sort AS ({sort}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured the query into an explicit CTE pipeline following the Target Logical Tree, isolating the date filter into a reusable CTE and staging the fact table joins before union. This reduces repeated date_dim scans from 3 to 1 (via CTE materialization) and maintains predicate pushdown boundaries.
+
+**Expected speedup**: ~2-3x. The main gain comes from scanning date_dim once (31 rows) instead of three times, and DuckDB can better optimize the staged join order. Baseline was 421ms; expect ~150-200ms.

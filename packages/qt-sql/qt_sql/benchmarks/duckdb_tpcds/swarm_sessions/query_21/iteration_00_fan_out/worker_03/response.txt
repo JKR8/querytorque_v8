@@ -1,0 +1,78 @@
+## Modified Logic Tree
+
+```
+QUERY:
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K
+    ├── [~] filtered_dims  [NEW CTE]
+    │   ├── SCAN (date_dim) with filter d_date ±30 days
+    │   ├── SCAN (item) with filter i_current_price 0.99-1.49
+    │   ├── SCAN (warehouse)
+    │   └── CROSS JOIN (implicit Cartesian product)
+    ├── [~] inventory_join  [NEW CTE]
+    │   ├── SCAN (inventory)
+    │   └── HASH JOIN with filtered_dims ON (inv_date_sk, inv_item_sk, inv_warehouse_sk)
+    ├── [~] aggregate  [NEW CTE]
+    │   ├── FROM inventory_join
+    │   ├── GROUP BY (w_warehouse_name, i_item_id)
+    │   └── AGG: SUM(CASE) for inv_before/inv_after
+    ├── [~] ratio_filter  [NEW CTE]
+    │   └── FILTER (ratio BETWEEN 2/3 AND 3/2) with CASE guard
+    └── [=] order_limit (SORT + LIMIT 100)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_selection", "description": "Pre-filter all dimension tables (date_dim, item, warehouse) into a single CTE before joining with inventory fact table", "applied_to": ["filtered_dims"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dims": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_date, i_item_sk, i_item_id, w_warehouse_sk, w_warehouse_name FROM date_dim, item, warehouse WHERE d_date BETWEEN DATE '2002-02-27' - INTERVAL 30 DAY AND DATE '2002-02-27' + INTERVAL 30 DAY AND i_current_price BETWEEN 0.99 AND 1.49",
+        "interfaces": {"outputs": ["d_date_sk", "d_date", "i_item_sk", "i_item_id", "w_warehouse_sk", "w_warehouse_name"], "consumes": []}
+      },
+      "inventory_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT w_warehouse_name, i_item_id, inv_quantity_on_hand, d_date FROM inventory JOIN filtered_dims ON inv_date_sk = d_date_sk AND inv_item_sk = i_item_sk AND inv_warehouse_sk = w_warehouse_sk",
+        "interfaces": {"outputs": ["w_warehouse_name", "i_item_id", "inv_quantity_on_hand", "d_date"], "consumes": ["filtered_dims"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT w_warehouse_name, i_item_id, SUM(CASE WHEN d_date < DATE '2002-02-27' THEN inv_quantity_on_hand ELSE 0 END) AS inv_before, SUM(CASE WHEN d_date >= DATE '2002-02-27' THEN inv_quantity_on_hand ELSE 0 END) AS inv_after FROM inventory_join GROUP BY w_warehouse_name, i_item_id",
+        "interfaces": {"outputs": ["w_warehouse_name", "i_item_id", "inv_before", "inv_after"], "consumes": ["inventory_join"]}
+      },
+      "ratio_filter": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT w_warehouse_name, i_item_id, inv_before, inv_after FROM aggregate WHERE (CASE WHEN inv_before > 0 THEN inv_after / inv_before ELSE NULL END) BETWEEN (2.0/3.0) AND (3.0/2.0)",
+        "interfaces": {"outputs": ["w_warehouse_name", "i_item_id", "inv_before", "inv_after"], "consumes": ["aggregate"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT * FROM ratio_filter ORDER BY w_warehouse_name ASC, i_item_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["w_warehouse_name", "i_item_id", "inv_before", "inv_after"], "consumes": ["ratio_filter"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dims", "inventory_join", "aggregate", "ratio_filter", "main_query"],
+    "assembly_template": "WITH filtered_dims AS ({filtered_dims}), inventory_join AS ({inventory_join}), aggregate AS ({aggregate}), ratio_filter AS ({ratio_filter}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Restructured into CTEs that follow the exact target logical tree: first pre-filter all three dimension tables (date_dim, item, warehouse) into a single CTE, then join with inventory, aggregate, filter by ratio, and finally order/limit. This preserves all original semantics, guards, and column structure.
+
+Expected speedup: ~2-4x by reducing inventory scan to only matching dimension keys and enabling parallel dimension table filtering before the large fact table join.

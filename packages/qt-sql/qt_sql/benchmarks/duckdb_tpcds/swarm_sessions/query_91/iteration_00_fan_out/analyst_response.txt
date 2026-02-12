@@ -1,0 +1,372 @@
+<reasoning>
+Step 1: CLASSIFY
+This is a classic "star-join with late dim filter" archetype: a central fact table (catalog_returns) joined to multiple dimension tables (call_center, date_dim, customer, customer_address, customer_demographics, household_demographics) with filters on dimension attributes. The query aggregates net loss by call center (plus two demographic columns) for a specific month/year with customer demographic/address filters.
+
+Step 2: EXPLAIN PLAN ANALYSIS
+Total execution time: 49ms. Key nodes:
+- FILTER on customer_demographics (110K rows, 21.8ms, 45%): This is the OR condition ((M,Unknown) OR (W,Advanced Degree)). It's applied after scanning 1.9M rows (5.3ms). The OR condition is the dominant cost.
+- HASH_JOIN INNER on cd_demo_sk = c_current_cdemo_sk (444 rows, 5.1ms, 10%): Joins filtered customer_demographics to customer.
+- HASH_JOIN INNER on c_customer_sk = cr_returning_customer_sk (19K rows, 5.1ms, 10%): Joins customer to catalog_returns.
+- Other scans are cheap: catalog_returns scan (19K rows, 1.6ms), date_dim scan (30 rows), household_demographics scan (1,200 rows), customer_address scan (110K rows, 0.7ms).
+
+Cardinality flow:
+- date_dim: 73K -> 30 rows (d_year=2001, d_moy=11)
+- catalog_returns: 17.3M -> 19K rows (after date join)
+- customer_demographics: 23.0M -> 1.9M (range filter) -> 110K (OR filter)
+- customer: 2.5M -> 500K (scan) -> 8,433 (after address join) -> 444 (after demographics join)
+- Final aggregation: 77 rows -> 21 rows after group by.
+
+Optimizer already handles:
+- Predicate pushdown into scans (date_dim, customer_address, household_demographics)
+- Hash join selection and ordering (dimensions filtered early)
+- No correlated subqueries to decorrelate
+- No repeated fact table scans (catalog_returns scanned once)
+- No UNION or INTERSECT operations
+
+Step 3: GAP MATCHING
+- CROSS_COLUMN_OR_DECOMPOSITION: YES. The OR condition spans two different column combinations (marital_status+education). The engine uses a single scan with complex filter (45% cost). Splitting into UNION ALL branches could allow focused filtering.
+- CROSS_CTE_PREDICATE_BLINDNESS: PARTIAL. The optimizer pushes filters into scans, but the customer_demographics OR filter is applied late (after scanning 1.9M rows). Pre-filtering this dimension into a CTE might allow earlier reduction.
+- REDUNDANT_SCAN_ELIMINATION: NO. Each table scanned once.
+- CORRELATED_SUBQUERY_PARALYSIS: NO.
+
+Step 4: AGGREGATION TRAP CHECK
+The query uses SUM(cr_net_loss). SUM is duplicate-insensitive (if joins produce duplicates, sum changes). The current join pattern uses foreign-key relationships (surrogate keys) which should preserve one-to-many from customer to catalog_returns? Actually, one customer may have multiple returns, so customer join to catalog_returns is one-to-many, but that's correct for sum per call center. Any rewrite must maintain same row multiplicity.
+
+Step 5: TRANSFORM SELECTION
+Ranked opportunities:
+1. or_to_union (target: split OR on customer_demographics) - Directly attacks the 45% cost filter.
+2. dimension_cte_isolate (target: pre-filter all dimensions into CTEs before joining) - Could reduce customer_demographics scan earlier.
+3. prefetch_fact_join (target: pre-join filtered dimensions with fact table in stages) - May reduce probe size for customer join.
+4. star_join_prefetch (compound: pre-filter all dimensions, then intersect keys) - Alternative structural approach.
+
+Step 6: LOGICAL TREE DESIGN
+For each strategy, design CTE chains ensuring column completeness (all referenced columns in output).
+
+Worker 1: or_to_union
+- Split customer_demographics into two branches (M+Unknown, W+Advanced Degree)
+- Each branch joins to customer, address, household, date, catalog_returns, call_center
+- UNION ALL branches, then aggregate
+- Must include cd_marital_status, cd_education_status in output for GROUP BY.
+
+Worker 2: dimension_cte_isolate
+- Create CTEs for each dimension with filters and surrogate keys.
+- Join them via customer table, then to fact, then to call_center.
+- Ensure all dimension columns needed for GROUP BY are included.
+
+Worker 3: prefetch_fact_join
+- Stage 1: Filter date_dim, customer_address, household_demographics into CTEs.
+- Stage 2: Join customer to these CTEs, then filter customer_demographics (with OR) to get candidate customer keys.
+- Stage 3: Join catalog_returns to date and candidate customers.
+- Stage 4: Join to call_center and aggregate.
+
+Worker 4: Exploration - compound or_to_union + star_join_prefetch
+- Combine strategies: split customer_demographics into two CTEs, then for each branch pre-filter other dimensions and join to fact, union, aggregate.
+- This is a novel combination not in examples.
+
+Check CTE column completeness: Each CTE must output all columns referenced downstream (join keys, filter columns for WHERE, GROUP BY columns).
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+For November 2001 catalog returns, aggregate net loss by call center for customers in GMT offset -6 with specific marital/education and household buy-potential profiles. All joins are INNER (intersection), requiring matches across all seven tables. The SUM(cr_net_loss) is duplicate-sensitive; joins must preserve the same multiplicity between customer and catalog_returns as the original foreign-key relationships. The OR filter on customer_demographics (two column-pair combinations) must not be simplified; both branches contribute to the same aggregated groups.
+
+BOTTLENECK_DIAGNOSIS:
+The dominant cost (45%) is the FILTER on customer_demographics evaluating a complex OR condition on 110K rows after scanning 1.9M rows. This is a scan-bound bottleneck on the large dimension table. Cardinality drops sharply after this filter (1.9M→110K). The optimizer already pushes simple equality filters into scans (date, address, household) and selects efficient hash joins. Logical-tree cost percentages are misleading—the FILTER node's 45% is exclusive time, not inclusive of its child scan.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs cc_call_center_id, cc_name, cc_manager, sum(cr_net_loss). Must preserve column aliases and ordering.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream: join keys (surrogate keys), grouping columns (cd_marital_status, cd_education_status), and aggregated columns.
+- LITERAL_PRESERVATION: Must copy exact literal values: d_year=2001, d_moy=11, cd_marital_status='M'/'W', cd_education_status='Unknown'/'Advanced Degree', hd_buy_potential like '1001-5000%', ca_gmt_offset=-6.
+- SEMANTIC_EQUIVALENCE: Must return same 21 rows ordered by sum(cr_net_loss) desc.
+- CROSS_COLUMN_OR_DECOMPOSITION: OR condition on different column pairs (marital+education) prevents optimal scan path. EXPLAIN shows single FILTER node with complex expression.
+- CROSS_CTE_PREDICATE_BLINDNESS: Predicate on customer_demographics is applied after scanning 1.9M rows; pre-filtering into CTE could reduce scan size.
+
+REGRESSION_WARNINGS:
+1. or_to_union (observed regression 0.59x on Q90):
+   CAUSE: Split same-column time range OR into UNION ALL, duplicating fact table scans.
+   RULE: Only split OR on different columns/tables. This query's OR is on different column pairs (marital+education) within same table—acceptable.
+2. dimension_cte_isolate (observed regression 0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them through the fact or bridging table (customer). This query joins dimensions via customer, safe.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: or_to_union
+TARGET_LOGICAL_TREE:
+  cd_branch1 -> branch1_chain -> union_all -> aggregate -> sort
+  cd_branch2 -> branch2_chain ->
+NODE_CONTRACTS:
+  cd_branch1:
+    FROM: customer_demographics
+    WHERE: cd_marital_status = 'M' AND cd_education_status = 'Unknown'
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~55K (half of 110K)
+    CONSUMERS: branch1_chain
+  cd_branch2:
+    FROM: customer_demographics
+    WHERE: cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree'
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~55K
+    CONSUMERS: branch2_chain
+  branch1_chain:
+    FROM: cd_branch1
+    JOIN: customer ON cd_branch1.cd_demo_sk = customer.c_current_cdemo_sk
+    JOIN: customer_address ON customer.c_current_addr_sk = customer_address.ca_address_sk
+    JOIN: household_demographics ON customer.c_current_hdemo_sk = household_demographics.hd_demo_sk
+    JOIN: catalog_returns ON customer.c_customer_sk = catalog_returns.cr_returning_customer_sk
+    JOIN: date_dim ON catalog_returns.cr_returned_date_sk = date_dim.d_date_sk
+    JOIN: call_center ON catalog_returns.cr_call_center_sk = call_center.cc_call_center_sk
+    WHERE: customer_address.ca_gmt_offset = -6
+      AND household_demographics.hd_buy_potential LIKE '1001-5000%'
+      AND date_dim.d_year = 2001 AND date_dim.d_moy = 11
+    OUTPUT: call_center.cc_call_center_id, call_center.cc_name, call_center.cc_manager, cd_branch1.cd_marital_status, cd_branch1.cd_education_status, catalog_returns.cr_net_loss
+    EXPECTED_ROWS: ~39 (half of 77)
+    CONSUMERS: union_all
+  branch2_chain:
+    FROM: cd_branch2
+    JOIN: same as branch1_chain but with cd_branch2
+    WHERE: same as branch1_chain
+    OUTPUT: same columns as branch1_chain (with cd_branch2 values)
+    EXPECTED_ROWS: ~38
+    CONSUMERS: union_all
+  union_all:
+    FROM: branch1_chain UNION ALL branch2_chain
+    OUTPUT: all columns from branch1_chain
+    EXPECTED_ROWS: ~77
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: union_all
+    GROUP BY: cc_call_center_id, cc_name, cc_manager, cd_marital_status, cd_education_status
+    AGGREGATE: SUM(cr_net_loss) AS Returns_Loss
+    OUTPUT: cc_call_center_id AS Call_Center, cc_name AS Call_Center_Name, cc_manager AS Manager, SUM(cr_net_loss) AS Returns_Loss, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: 21
+    CONSUMERS: sort
+  sort:
+    FROM: aggregate
+    ORDER BY: Returns_Loss DESC
+    OUTPUT: Call_Center, Call_Center_Name, Manager, Returns_Loss
+    EXPECTED_ROWS: 21
+    CONSUMERS: final
+
+EXAMPLES: or_to_union, composite_decorrelate_union, union_cte_split
+EXAMPLE_ADAPTATION:
+- or_to_union: Apply the split of OR into two branches with focused predicates on customer_demographics. Ignore the self-join aspect (Q15 had three branches).
+- composite_decorrelate_union: Ignore the decorrelation of EXISTS; adapt the UNION of key sets after pre-filtering dimensions.
+- union_cte_split: Adapt splitting a generic CTE into specialized ones; here split customer_demographics into two CTEs by filter.
+HAZARD_FLAGS:
+- Risk of doubling customer and catalog_returns joins if not careful—ensure each branch joins independently but same tables.
+- Must include cd_marital_status, cd_education_status in outputs for GROUP BY.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+  date_cte -> addr_cte -> hd_cte -> cd_cte -> customer_cte -> fact_cte -> final_agg
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year = 2001 AND d_moy = 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 30
+    CONSUMERS: fact_cte
+  addr_cte:
+    FROM: customer_address
+    WHERE: ca_gmt_offset = -6
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 110K
+    CONSUMERS: customer_cte
+  hd_cte:
+    FROM: household_demographics
+    WHERE: hd_buy_potential LIKE '1001-5000%'
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1,200
+    CONSUMERS: customer_cte
+  cd_cte:
+    FROM: customer_demographics
+    WHERE: (cd_marital_status = 'M' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: 110K
+    CONSUMERS: customer_cte
+  customer_cte:
+    FROM: customer
+    JOIN: cd_cte ON customer.c_current_cdemo_sk = cd_cte.cd_demo_sk
+    JOIN: addr_cte ON customer.c_current_addr_sk = addr_cte.ca_address_sk
+    JOIN: hd_cte ON customer.c_current_hdemo_sk = hd_cte.hd_demo_sk
+    OUTPUT: customer.c_customer_sk, cd_cte.cd_marital_status, cd_cte.cd_education_status
+    EXPECTED_ROWS: 444
+    CONSUMERS: fact_cte
+  fact_cte:
+    FROM: catalog_returns
+    JOIN: date_cte ON catalog_returns.cr_returned_date_sk = date_cte.d_date_sk
+    JOIN: customer_cte ON catalog_returns.cr_returning_customer_sk = customer_cte.c_customer_sk
+    OUTPUT: catalog_returns.cr_call_center_sk, catalog_returns.cr_net_loss, customer_cte.cd_marital_status, customer_cte.cd_education_status
+    EXPECTED_ROWS: 77
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: fact_cte
+    JOIN: call_center ON fact_cte.cr_call_center_sk = call_center.cc_call_center_sk
+    GROUP BY: call_center.cc_call_center_id, call_center.cc_name, call_center.cc_manager, fact_cte.cd_marital_status, fact_cte.cd_education_status
+    AGGREGATE: SUM(cr_net_loss) AS Returns_Loss
+    ORDER BY: Returns_Loss DESC
+    OUTPUT: cc_call_center_id AS Call_Center, cc_name AS Call_Center_Name, cc_manager AS Manager, SUM(cr_net_loss) AS Returns_Loss
+    EXPECTED_ROWS: 21
+    CONSUMERS: final
+
+EXAMPLES: dimension_cte_isolate, date_cte_isolate, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering of all dimension tables into CTEs before joining. Ignore the cross-join risk; here dimensions join through customer.
+- date_cte_isolate: Adapt date filtering into a CTE; ignore that the original already pushes date filter—still beneficial for hash table size.
+- multi_dimension_prefetch: Adapt pre-filtering multiple dimensions (date, address, household, demographics) into separate CTEs. Ignore the fact table pre-join; here we join via customer.
+HAZARD_FLAGS:
+- Ensure customer_cte includes cd_marital_status, cd_education_status for GROUP BY.
+- Avoid materializing large CTEs unnecessarily; some CTEs may be inlined.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  filtered_dims -> candidate_customers -> fact_join -> final_agg
+NODE_CONTRACTS:
+  filtered_dims:
+    FROM: date_dim, customer_address, household_demographics
+    WHERE: date_dim.d_year = 2001 AND date_dim.d_moy = 11
+      AND customer_address.ca_gmt_offset = -6
+      AND household_demographics.hd_buy_potential LIKE '1001-5000%'
+    OUTPUT: date_dim.d_date_sk, customer_address.ca_address_sk, household_demographics.hd_demo_sk
+    EXPECTED_ROWS: 30 (date) * 110K (address) * 1,200 (household) but Cartesian product avoided via separate CTEs; better to create separate CTEs and join later.
+  (Revised: Use separate CTEs and join in candidate_customers)
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year = 2001 AND d_moy = 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 30
+    CONSUMERS: fact_join
+  addr_cte:
+    FROM: customer_address
+    WHERE: ca_gmt_offset = -6
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 110K
+    CONSUMERS: candidate_customers
+  hd_cte:
+    FROM: household_demographics
+    WHERE: hd_buy_potential LIKE '1001-5000%'
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1,200
+    CONSUMERS: candidate_customers
+  candidate_customers:
+    FROM: customer
+    JOIN: addr_cte ON customer.c_current_addr_sk = addr_cte.ca_address_sk
+    JOIN: hd_cte ON customer.c_current_hdemo_sk = hd_cte.hd_demo_sk
+    JOIN: customer_demographics ON customer.c_current_cdemo_sk = customer_demographics.cd_demo_sk
+    WHERE: (customer_demographics.cd_marital_status = 'M' AND customer_demographics.cd_education_status = 'Unknown')
+        OR (customer_demographics.cd_marital_status = 'W' AND customer_demographics.cd_education_status = 'Advanced Degree')
+    OUTPUT: customer.c_customer_sk, customer_demographics.cd_marital_status, customer_demographics.cd_education_status
+    EXPECTED_ROWS: 444
+    CONSUMERS: fact_join
+  fact_join:
+    FROM: catalog_returns
+    JOIN: date_cte ON catalog_returns.cr_returned_date_sk = date_cte.d_date_sk
+    JOIN: candidate_customers ON catalog_returns.cr_returning_customer_sk = candidate_customers.c_customer_sk
+    OUTPUT: catalog_returns.cr_call_center_sk, catalog_returns.cr_net_loss, candidate_customers.cd_marital_status, candidate_customers.cd_education_status
+    EXPECTED_ROWS: 77
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: fact_join
+    JOIN: call_center ON fact_join.cr_call_center_sk = call_center.cc_call_center_sk
+    GROUP BY: call_center.cc_call_center_id, call_center.cc_name, call_center.cc_manager, fact_join.cd_marital_status, fact_join.cd_education_status
+    AGGREGATE: SUM(cr_net_loss) AS Returns_Loss
+    ORDER BY: Returns_Loss DESC
+    OUTPUT: cc_call_center_id AS Call_Center, cc_name AS Call_Center_Name, cc_manager AS Manager, SUM(cr_net_loss) AS Returns_Loss
+    EXPECTED_ROWS: 21
+    CONSUMERS: final
+
+EXAMPLES: prefetch_fact_join, early_filter, pushdown
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply staged CTE chain: filter dimensions, join to customer, then join to fact. Ignore the multiple fact table scans (Q63 had date pre-join with store_sales).
+- early_filter: Adapt filtering small dimensions (address, household) first before joining to customer. Ignore the fact that original already does this; we enforce order.
+- pushdown: Adapt pushing filters from main query into CTEs (address, household, date). Ignore the consolidation of multiple subqueries.
+HAZARD_FLAGS:
+- Must keep cd_marital_status, cd_education_status through the chain for GROUP BY.
+- Risk that customer_demographics OR filter still scans large table; consider moving OR filter earlier.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: compound_or_union_prefetch
+TARGET_LOGICAL_TREE:
+  date_cte -> addr_cte -> hd_cte -> cd_branch1 -> branch1_chain -> union_all -> aggregate -> sort
+                            -> cd_branch2 -> branch2_chain ->
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year = 2001 AND d_moy = 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 30
+    CONSUMERS: branch1_chain, branch2_chain
+  addr_cte:
+    FROM: customer_address
+    WHERE: ca_gmt_offset = -6
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 110K
+    CONSUMERS: branch1_chain, branch2_chain
+  hd_cte:
+    FROM: household_demographics
+    WHERE: hd_buy_potential LIKE '1001-5000%'
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1,200
+    CONSUMERS: branch1_chain, branch2_chain
+  cd_branch1:
+    FROM: customer_demographics
+    WHERE: cd_marital_status = 'M' AND cd_education_status = 'Unknown'
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~55K
+    CONSUMERS: branch1_chain
+  cd_branch2:
+    FROM: customer_demographics
+    WHERE: cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree'
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~55K
+    CONSUMERS: branch2_chain
+  branch1_chain:
+    FROM: cd_branch1
+    JOIN: customer ON cd_branch1.cd_demo_sk = customer.c_current_cdemo_sk
+    JOIN: addr_cte ON customer.c_current_addr_sk = addr_cte.ca_address_sk
+    JOIN: hd_cte ON customer.c_current_hdemo_sk = hd_cte.hd_demo_sk
+    JOIN: catalog_returns ON customer.c_customer_sk = catalog_returns.cr_returning_customer_sk
+    JOIN: date_cte ON catalog_returns.cr_returned_date_sk = date_cte.d_date_sk
+    OUTPUT: catalog_returns.cr_call_center_sk, catalog_returns.cr_net_loss, cd_branch1.cd_marital_status, cd_branch1.cd_education_status
+    EXPECTED_ROWS: ~39
+    CONSUMERS: union_all
+  branch2_chain:
+    FROM: cd_branch2
+    JOIN: customer ON cd_branch2.cd_demo_sk = customer.c_current_cdemo_sk
+    JOIN: addr_cte, hd_cte, catalog_returns, date_cte (same as branch1_chain)
+    OUTPUT: catalog_returns.cr_call_center_sk, catalog_returns.cr_net_loss, cd_branch2.cd_marital_status, cd_branch2.cd_education_status
+    EXPECTED_ROWS: ~38
+    CONSUMERS: union_all
+  union_all:
+    FROM: branch1_chain UNION ALL branch2_chain
+    OUTPUT: cr_call_center_sk, cr_net_loss, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~77
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: union_all
+    JOIN: call_center ON union_all.cr_call_center_sk = call_center.cc_call_center_sk
+    GROUP BY: call_center.cc_call_center_id, call_center.cc_name, call_center.cc_manager, union_all.cd_marital_status, union_all.cd_education_status
+    AGGREGATE: SUM(cr_net_loss) AS Returns_Loss
+    ORDER BY: Returns_Loss DESC
+    OUTPUT: cc_call_center_id AS Call_Center, cc_name AS Call_Center_Name, cc_manager AS Manager, SUM(cr_net_loss) AS Returns_Loss
+    EXPECTED_ROWS: 21
+    CONSUMERS: final
+
+EXAMPLES: or_to_union, dimension_cte_isolate, prefetch_fact_join
+EXAMPLE_ADAPTATION:
+- or_to_union: Apply splitting OR into two branches (cd_branch1, cd_branch2).
+- dimension_cte_isolate: Adapt pre-filtering shared dimensions (date, address, household) into CTEs reused across branches.
+- prefetch_fact_join: Adapt staging: filtered dimensions -> candidate customers -> fact join; here per branch.
+HAZARD_FLAGS:
+- Complexity: multiple CTEs may increase planning overhead.
+- Must ensure shared dimension CTEs (date_cte, addr_cte, hd_cte) are referenced by both branches for reuse.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

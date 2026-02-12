@@ -1,0 +1,84 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~15K
+    ├── [~] filtered_date  [+]  CTE isolating date filter
+    │   └── SCAN (date_dim) with date filter
+    ├── [~] filtered_sales  [+]  CTE joining store_sales to filtered_date
+    │   └── JOIN (ss_sold_date_sk = d_date_sk)
+    ├── [~] aggregated_sales  [+]  CTE aggregating by ss_item_sk
+    │   └── AGG (GROUP BY ss_item_sk)
+    ├── [~] join_item_attrs  [+]  CTE joining aggregated_sales to item with category filter
+    │   └── JOIN (ss_item_sk = i_item_sk) with i_category filter
+    ├── [~] window  [+]  CTE computing window function
+    │   └── WINDOW (PARTITION BY i_class)
+    └── [~] order_by  [+]  Main query ordering results
+        └── SORT (i_category, i_class, i_item_id, i_item_desc, revenueratio)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Isolate date filter into CTE to reduce fact table join size", "applied_to": ["filtered_date"]},
+    {"id": "R2", "type": "early_filter", "description": "Filter fact table early using date CTE before aggregation", "applied_to": ["filtered_sales"]},
+    {"id": "R3", "type": "aggregate_before_join", "description": "Aggregate sales by item before joining to dimension table", "applied_to": ["aggregated_sales"]},
+    {"id": "R4", "type": "deferred_dimension_filter", "description": "Apply item category filter after aggregation to avoid filtering during aggregation", "applied_to": ["join_item_attrs"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2002-05-20' AS DATE) AND (CAST('2002-05-20' AS DATE) + INTERVAL 30 DAY)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk, ss_ext_sales_price FROM store_sales INNER JOIN filtered_date ON store_sales.ss_sold_date_sk = filtered_date.d_date_sk",
+        "interfaces": {"outputs": ["ss_item_sk", "ss_ext_sales_price"], "consumes": ["filtered_date"]}
+      },
+      "aggregated_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk, SUM(ss_ext_sales_price) AS itemrevenue FROM filtered_sales GROUP BY ss_item_sk",
+        "interfaces": {"outputs": ["ss_item_sk", "itemrevenue"], "consumes": ["filtered_sales"]}
+      },
+      "join_item_attrs": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_id, i_item_desc, i_category, i_class, i_current_price, aggregated_sales.itemrevenue FROM aggregated_sales INNER JOIN item ON aggregated_sales.ss_item_sk = item.i_item_sk WHERE i_category IN ('Sports', 'Music', 'Shoes')",
+        "interfaces": {"outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue"], "consumes": ["aggregated_sales"]}
+      },
+      "window": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, itemrevenue * 100.0 / SUM(itemrevenue) OVER (PARTITION BY i_class) AS revenueratio FROM join_item_attrs",
+        "interfaces": {"outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue", "revenueratio"], "consumes": ["join_item_attrs"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, revenueratio FROM window ORDER BY i_category, i_class, i_item_id, i_item_desc, revenueratio",
+        "interfaces": {"outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue", "revenueratio"], "consumes": ["window"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_sales", "aggregated_sales", "join_item_attrs", "window", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_sales AS ({filtered_sales}), aggregated_sales AS ({aggregated_sales}), join_item_attrs AS ({join_item_attrs}), window AS ({window}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured into sequential CTEs: filter date dimension first, join to store_sales, aggregate by item, join to item with category filter, compute window function, then order results. This isolates the date filter into a tiny CTE (31 rows) to reduce the fact table probe size, aggregates before the item join to reduce rows, and preserves all original semantics.
+
+**Expected speedup**: 1.5-2x due to early reduction of fact table scan via small date dimension hash table and reduced aggregation size before dimension join. The baseline 324ms suggests CTE overhead is acceptable.

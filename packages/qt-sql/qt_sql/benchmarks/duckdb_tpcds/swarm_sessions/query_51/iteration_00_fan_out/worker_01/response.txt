@@ -1,0 +1,107 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_filtered  [+]  Cost: 5%  Rows: 365 — Filter date_dim for target month sequence
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_month_seq BETWEEN 1216 AND 1216+11)
+│   └── OUTPUT (d_date_sk, d_date)
+├── [CTE] web_daily  [~]  Cost: 20%  Rows: 1.4M — Daily web sales aggregates (removed window function)
+│   ├── SCAN (web_sales)
+│   ├── JOIN (date_filtered)
+│   ├── FILTER (ws_item_sk IS NOT NULL)
+│   ├── AGG (GROUP BY ws_item_sk, d_date)
+│   └── OUTPUT (ws_item_sk, d_date, daily_web_sales)
+├── [CTE] store_daily  [~]  Cost: 25%  Rows: 4.6M — Daily store sales aggregates (removed window function)
+│   ├── SCAN (store_sales)
+│   ├── JOIN (date_filtered)
+│   ├── FILTER (ss_item_sk IS NOT NULL)
+│   ├── AGG (GROUP BY ss_item_sk, d_date)
+│   └── OUTPUT (ss_item_sk, d_date, daily_store_sales)
+├── [CTE] combined_daily  [+]  Cost: 20%  Rows: 5.5M — Full outer join of daily aggregates
+│   ├── SCAN (web_daily, store_daily)
+│   ├── JOIN (FULL OUTER)
+│   └── OUTPUT (item_sk, d_date, daily_web_sales, daily_store_sales)
+├── [CTE] cumulative_single_pass  [+]  Cost: 20%  Rows: 5.5M — Compute running totals once
+│   ├── SCAN (combined_daily)
+│   ├── WINDOW (SUM OVER PARTITION BY item_sk ORDER BY d_date)
+│   └── OUTPUT (item_sk, d_date, daily_web_sales, daily_store_sales, web_cumulative, store_cumulative)
+└── [MAIN] main_query  [~]  Cost: 10%  Rows: 100 — Filter and limit
+    ├── SCAN (cumulative_single_pass)
+    ├── FILTER (web_cumulative > store_cumulative)
+    ├── SORT (item_sk, d_date)
+    ├── LIMIT (100)
+    └── OUTPUT (*)
+```
+
+**Changes:**
+- Added `date_filtered` CTE to isolate date filter (avoids duplication)
+- `web_daily` and `store_daily` now compute only daily aggregates (no window functions)
+- Added `combined_daily` for full outer join
+- Added `cumulative_single_pass` to compute running totals once after join
+- `main_query` simplified to scan from cumulative CTE
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "deferred_window_aggregation", "description": "Move cumulative sum calculation after full outer join", "applied_to": ["web_daily", "store_daily", "cumulative_single_pass"]},
+    {"id": "R2", "type": "cte_isolate_date_filter", "description": "Extract date filter into reusable CTE", "applied_to": ["date_filtered"]},
+    {"id": "R3", "type": "remove_redundant_max_window", "description": "Original MAX OVER to carry forward cumulative values not needed when computing SUM OVER daily aggregates directly", "applied_to": ["cumulative_single_pass"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filtered": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1216 AND 1216+11",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "web_daily": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_item_sk, d_date, SUM(ws_sales_price) AS daily_web_sales FROM web_sales INNER JOIN date_filtered ON ws_sold_date_sk = d_date_sk WHERE ws_item_sk IS NOT NULL GROUP BY ws_item_sk, d_date",
+        "interfaces": {"outputs": ["ws_item_sk", "d_date", "daily_web_sales"], "consumes": ["date_filtered"]}
+      },
+      "store_daily": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk, d_date, SUM(ss_sales_price) AS daily_store_sales FROM store_sales INNER JOIN date_filtered ON ss_sold_date_sk = d_date_sk WHERE ss_item_sk IS NOT NULL GROUP BY ss_item_sk, d_date",
+        "interfaces": {"outputs": ["ss_item_sk", "d_date", "daily_store_sales"], "consumes": ["date_filtered"]}
+      },
+      "combined_daily": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT COALESCE(web_daily.ws_item_sk, store_daily.ss_item_sk) AS item_sk, COALESCE(web_daily.d_date, store_daily.d_date) AS d_date, daily_web_sales, daily_store_sales FROM web_daily FULL OUTER JOIN store_daily ON web_daily.ws_item_sk = store_daily.ss_item_sk AND web_daily.d_date = store_daily.d_date",
+        "interfaces": {"outputs": ["item_sk", "d_date", "daily_web_sales", "daily_store_sales"], "consumes": ["web_daily", "store_daily"]}
+      },
+      "cumulative_single_pass": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT item_sk, d_date, daily_web_sales, daily_store_sales, SUM(daily_web_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS web_cumulative, SUM(daily_store_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS store_cumulative FROM combined_daily",
+        "interfaces": {"outputs": ["item_sk", "d_date", "daily_web_sales", "daily_store_sales", "web_cumulative", "store_cumulative"], "consumes": ["combined_daily"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT item_sk, d_date, daily_web_sales AS web_sales, daily_store_sales AS store_sales, web_cumulative, store_cumulative FROM cumulative_single_pass WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100",
+        "interfaces": {"outputs": ["item_sk", "d_date", "web_sales", "store_sales", "web_cumulative", "store_cumulative"], "consumes": ["cumulative_single_pass"]}
+      }
+    },
+    "reconstruction_order": ["date_filtered", "web_daily", "store_daily", "combined_daily", "cumulative_single_pass", "main_query"],
+    "assembly_template": "WITH date_filtered AS ({date_filtered}), web_daily AS ({web_daily}), store_daily AS ({store_daily}), combined_daily AS ({combined_daily}), cumulative_single_pass AS ({cumulative_single_pass}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Mechanism:** The rewrite extracts the date filter into a reusable CTE, defers window aggregation (cumulative sums) until after the full outer join, and computes running totals in a single pass. This eliminates redundant window computations in the original CTEs and allows the optimizer to push filters earlier.
+
+**Expected speedup:** ~1.36x (based on reference example pattern).

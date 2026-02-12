@@ -1,0 +1,334 @@
+<reasoning>
+## 1. CLASSIFY
+This is a **correlated-aggregate filter** pattern: a CTE computes aggregated returns per customer/state/reason, then the main query filters rows where the total return exceeds 1.2× the state average (correlated subquery). It also has **star-join** characteristics (web_returns joined to 3 dimensions) and **late dimension filters** (customer_address state filter applied after CTE materialization).
+
+## 2. EXPLAIN PLAN ANALYSIS
+- **Total time**: 142.2ms. Main bottleneck: CTE scan + correlated subquery evaluation (141.4ms).
+- **Row flow**: 
+  - web_returns seq scan: 478K rows → 2,617 after filter (99.5% reduction from wr_return_amt/wr_return_quantity).
+  - Join with date_dim (365 rows) and item (filter on i_manager_id) reduces further.
+  - CTE groups to ~99 rows.
+  - Main query: CTE scan ctr1 (99 rows) → filtered to 1 row (removes 98) by ctr_reason_sk IN (20,36) and correlated subquery.
+  - Correlated subquery runs 6 times (once per distinct state in ctr1?), each scanning CTE (99 rows) and filtering to 4 rows.
+- **Scans per table**:
+  - web_returns: scanned once in CTE (good).
+  - date_dim, item, customer_address: each scanned once in CTE.
+  - CTE (customer_total_return): scanned 7 times total (1 for ctr1 + 6 for correlated subquery). This is the key multiplier.
+- **Optimizer already does**: 
+  - Pushes d_year=2002 into date_dim index-only scan.
+  - Pushes wr_return_amt/wr_return_quantity filter into web_returns seq scan.
+  - Materializes CTE (CTE Scan nodes show it's materialized).
+  - Does NOT decorrelate the subquery (still executes per outer row).
+  - Does NOT push ca_state IN ('OK','SC','TX','WI') into CTE (it's in main query, not CTE).
+  - Uses nested loops for dimension lookups (index scans).
+
+## 3. GAP MATCHING
+- **CORRELATED_SUBQUERY_PARALYSIS**: YES. Subquery `SELECT avg(ctr_total_return)*1.2 ... WHERE ctr1.ctr_state = ctr2.ctr_state` re-executes per outer row (6 times in plan). Opportunity: decorrelate via pre‑computed per‑state averages.
+- **COMMA_JOIN_WEAKNESS**: YES. CTE uses comma‑separated joins (web_returns, date_dim, customer_address, item). Opportunity: explicit JOINs + pre‑filtered dimension CTEs.
+- **CROSS_CTE_PREDICATE_BLINDNESS**: PARTIAL. CTE is materialized once and scanned 7 times (shared), but the correlated subquery re‑scans entire CTE each time. Opportunity: compute per‑state averages in a separate CTE.
+- **NON_EQUI_JOIN_INPUT_BLINDNESS**: NO. No non‑equi joins.
+- **BITMAP_OR_SCAN**: NOT APPLICABLE. No OR conditions on indexed columns.
+- **SEMI_JOIN_EXISTS**: NOT APPLICABLE. No EXISTS.
+
+## 4. AGGREGATION TRAP CHECK
+CTE uses `SUM(wr_return_amt)` — grouping‑insensitive. Main query uses `AVG(ctr_total_return)` — also grouping‑insensitive. No STDDEV_SAMP/VARIANCE/FILTER. Safe to restructure.
+
+## 5. TRANSFORM SELECTION
+Ranked by expected impact:
+1. **Decorrelate correlated subquery** (high impact, eliminates 6 CTE scans).
+2. **Star‑join prefetch with explicit JOINs** (medium impact, improves cardinality estimation).
+3. **Self‑join decomposition** (medium impact, shares CTE materialization but already done; focus on computing per‑state average once).
+4. **Exploration: combine decorrelation with late attribute binding** (novel combination: push customer_address state filter into CTE? Risk: CTE uses returning address, main uses current address — different tables).
+
+## 6. LOGICAL TREE DESIGN
+For each worker:
+- Worker 1: Decorrelate via pre‑computed per‑state averages CTE + explicit JOINs.
+- Worker 2: Star‑join prefetch: pre‑filter all dimensions into CTEs, explicit JOINs.
+- Worker 3: Self‑join decomposition: compute CTE once, derive per‑state averages in separate CTE.
+- Worker 4: Exploration: push customer_address state filter into CTE (if possible) + decorrelate.
+
+Verify column completeness: CTE must output ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return. Main query needs all customer columns + ctr_total_return.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+This query identifies customers with high return amounts in 2002 for specific item manager IDs and return‑amount‑per‑quantity ranges, comparing each customer's total return to 1.2× their state's average, and returns detailed customer info for those in states OK, SC, TX, WI with return reasons 20 or 36 and birth years 1985‑1991. All joins are INNER (all sides must match). Aggregates are SUM and AVG, which are duplicate‑safe. The correlated subquery depends on ctr_state equality; any rewrite must preserve per‑state averaging.
+
+BOTTLENECK_DIAGNOSIS:
+The dominant cost (99% of time) is the correlated subquery that re‑scans the entire CTE 6 times (once per distinct state in outer row). This is a **correlated‑subquery‑bound** bottleneck. Cardinality flow: web_returns 478K → 2,617 after expression filter → ~99 rows after grouping → 1 row after main filters. The optimizer already materializes the CTE and pushes filters into base table scans (date_dim index, web_returns expression). Logical‑tree cost percentages (73% CTE, 27% main) are misleading — actual timing shows main query dominates.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output all 13 customer columns plus ctr_total_return in exact original order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include wr_returning_customer_sk, ca_state, wr_reason_sk, and sum(wr_return_amt) as ctr_* columns, plus any join keys needed downstream.
+- LITERAL_PRESERVATION: Must preserve all literal values: d_year=2002, i_manager_id BETWEEN 68 AND 77, wr_return_amt/wr_return_quantity BETWEEN 242 AND 271, ca_state IN ('OK','SC','TX','WI'), ctr_reason_sk IN (20,36), c_birth_year BETWEEN 1985 AND 1991.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows with same ordering.
+- CORRELATED_SUBQUERY_PARALYSIS: EXPLAIN shows subquery runs 6 times, each scanning CTE (99 rows). Evidence: "Aggregate (rows=1 loops=6)" under CTE Scan ctr2.
+- COMMA_JOIN_WEAKNESS: CTE uses comma‑separated joins (web_returns, date_dim, customer_address, item). Evidence: logical tree shows implicit joins.
+- CROSS_CTE_PREDICATE_BLINDNESS: CTE scanned 7 times total (1 for ctr1, 6 for subquery). Evidence: CTE Scan ctr1 (rows=99) and CTE Scan ctr2 (rows=4 loops=6).
+
+REGRESSION_WARNINGS:
+1. Splitting OR to UNION ALL (observed regression 0.21x):
+   CAUSE: PostgreSQL's BITMAP_OR_SCAN already handles OR efficiently; splitting adds overhead.
+   RULE: Do not split OR conditions in this query (none present).
+2. Converting EXISTS to IN (observed regression 0.50x):
+   CAUSE: EXISTS uses semi‑join with early termination; IN materializes full set.
+   RULE: Do not convert EXISTS to IN (none present).
+3. Disabling nestloop (observed regression 184x):
+   CAUSE: Nested loops are optimal for dimension lookups with indexes.
+   RULE: Do not SET enable_nestloop=off; current plan uses nested loops for item and customer_address lookups.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: decorrelate_explicit_joins
+TARGET_LOGICAL_TREE:
+  filtered_dates -> filtered_items -> filtered_addresses -> web_returns_join -> cte_aggregated -> state_avg -> main_join
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 2002
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: web_returns_join
+  filtered_items:
+    FROM: item
+    WHERE: i_manager_id BETWEEN 68 AND 77
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: ~10 (from plan: 0 rows per loop, but total small)
+    CONSUMERS: web_returns_join
+  filtered_addresses:
+    FROM: customer_address
+    WHERE: ca_state IN ('OK','SC','TX','WI')
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: unknown (but selective)
+    CONSUMERS: web_returns_join
+  web_returns_join:
+    FROM: web_returns
+    JOIN: INNER JOIN filtered_dates ON wr_returned_date_sk = d_date_sk
+          INNER JOIN filtered_addresses ON wr_returning_addr_sk = ca_address_sk
+          INNER JOIN filtered_items ON wr_item_sk = i_item_sk
+    WHERE: wr_return_amt / wr_return_quantity BETWEEN 242 AND 271
+    OUTPUT: wr_returning_customer_sk, ca_state, wr_reason_sk, wr_return_amt
+    EXPECTED_ROWS: ~2,617 (from plan)
+    CONSUMERS: cte_aggregated
+  cte_aggregated:
+    FROM: web_returns_join
+    GROUP BY: wr_returning_customer_sk, ca_state, wr_reason_sk
+    AGGREGATE: SUM(wr_return_amt) AS ctr_total_return
+    OUTPUT: ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return
+    EXPECTED_ROWS: ~99
+    CONSUMERS: state_avg, main_join
+  state_avg:
+    FROM: cte_aggregated
+    GROUP BY: ctr_state
+    AGGREGATE: AVG(ctr_total_return) * 1.2 AS state_avg_threshold
+    OUTPUT: ctr_state, state_avg_threshold
+    EXPECTED_ROWS: number of distinct states in cte_aggregated (~6)
+    CONSUMERS: main_join
+  main_join:
+    FROM: cte_aggregated AS ctr1
+          INNER JOIN state_avg ON ctr1.ctr_state = state_avg.ctr_state
+          INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+          INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk
+    WHERE: ctr1.ctr_total_return > state_avg.state_avg_threshold
+      AND ctr1.ctr_reason_sk IN (20, 36)
+      AND c_birth_year BETWEEN 1985 AND 1991
+      AND customer_address.ca_state IN ('OK','SC','TX','WI')
+    ORDER BY: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    OUTPUT: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final limit
+EXAMPLES: inline_decorrelate_materialized, early_filter_decorrelate, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- inline_decorrelate_materialized: Apply the 3‑CTE decomposition (dimension filter, fact filter, per‑key aggregate) to compute state averages separately. IGNORE the fact‑filter CTE because our fact filter (wr_return_amt/quantity) is already in web_returns_join.
+- early_filter_decorrelate: Push dimension filters (date, item, address) into separate CTEs before joining. IGNORE the threshold‑pre‑compute aspect (we do that in state_avg).
+- pg_date_cte_explicit_join: Convert comma joins to explicit JOINs and isolate date filter into a CTE. Apply to all dimensions (date, item, address).
+HAZARD_FLAGS:
+- Risk: filtered_addresses uses ca_state filter, but CTE needs returning address state, not current address state. The main query also filters on customer_address.ca_state (current address). Must keep both separate.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  prefetch_dates -> prefetch_items -> prefetch_addresses -> web_returns_prejoined -> cte_grouped -> main_with_avg
+NODE_CONTRACTS:
+  prefetch_dates:
+    FROM: date_dim
+    WHERE: d_year = 2002
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: web_returns_prejoined
+  prefetch_items:
+    FROM: item
+    WHERE: i_manager_id BETWEEN 68 AND 77
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: ~10
+    CONSUMERS: web_returns_prejoined
+  prefetch_addresses:
+    FROM: customer_address
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: full table (no filter)
+    CONSUMERS: web_returns_prejoined
+  web_returns_prejoined:
+    FROM: web_returns
+          INNER JOIN prefetch_dates ON wr_returned_date_sk = d_date_sk
+          INNER JOIN prefetch_addresses ON wr_returning_addr_sk = ca_address_sk
+          INNER JOIN prefetch_items ON wr_item_sk = i_item_sk
+    WHERE: wr_return_amt / wr_return_quantity BETWEEN 242 AND 271
+    OUTPUT: wr_returning_customer_sk, ca_state, wr_reason_sk, wr_return_amt
+    EXPECTED_ROWS: ~2,617
+    CONSUMERS: cte_grouped
+  cte_grouped:
+    FROM: web_returns_prejoined
+    GROUP BY: wr_returning_customer_sk, ca_state, wr_reason_sk
+    AGGREGATE: SUM(wr_return_amt) AS ctr_total_return
+    OUTPUT: ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return
+    EXPECTED_ROWS: ~99
+    CONSUMERS: main_with_avg
+  main_with_avg:
+    FROM: cte_grouped AS ctr1
+          INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+          INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk
+          LEFT JOIN LATERAL (SELECT AVG(ctr2.ctr_total_return) * 1.2 AS avg_state
+                             FROM cte_grouped AS ctr2
+                             WHERE ctr2.ctr_state = ctr1.ctr_state) AS state_avg ON true
+    WHERE: ctr1.ctr_total_return > state_avg.avg_state
+      AND ctr1.ctr_reason_sk IN (20, 36)
+      AND c_birth_year BETWEEN 1985 AND 1991
+      AND customer_address.ca_state IN ('OK','SC','TX','WI')
+    ORDER BY: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    OUTPUT: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final limit
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Pre‑filter all selective dimensions (date, item) into CTEs, and include customer_address (even without filter) to create tiny hash tables. Use explicit JOIN syntax. IGNORE the promotion dimension (not present).
+- pg_date_cte_explicit_join: Isolate date filter into CTE and convert comma joins to explicit JOINs. Apply to all dimensions.
+- pg_materialized_dimension_fact_prefilter: Use MATERIALIZED on dimension CTEs to force early execution. IGNORE the fact‑table prefilter (we keep web_returns scan after dimension joins).
+HAZARD_FLAGS:
+- LATERAL may still cause per‑row execution; ensure state averages are computed efficiently (maybe use window functions).
+- Prefetching customer_address without filter may increase hash table size unnecessarily.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: self_join_decomposition
+TARGET_LOGICAL_TREE:
+  base_cte -> state_avg_cte -> main_filtered
+NODE_CONTRACTS:
+  base_cte:
+    FROM: web_returns, date_dim, customer_address, item
+    WHERE: wr_returned_date_sk = d_date_sk
+      AND d_year = 2002
+      AND wr_returning_addr_sk = ca_address_sk
+      AND wr_item_sk = i_item_sk
+      AND i_manager_id BETWEEN 68 AND 77
+      AND wr_return_amt / wr_return_quantity BETWEEN 242 AND 271
+    GROUP BY: wr_returning_customer_sk, ca_state, wr_reason_sk
+    AGGREGATE: SUM(wr_return_amt) AS ctr_total_return
+    OUTPUT: ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return
+    EXPECTED_ROWS: ~99
+    CONSUMERS: state_avg_cte, main_filtered
+  state_avg_cte:
+    FROM: base_cte
+    GROUP BY: ctr_state
+    AGGREGATE: AVG(ctr_total_return) * 1.2 AS state_avg_threshold
+    OUTPUT: ctr_state, state_avg_threshold
+    EXPECTED_ROWS: ~6
+    CONSUMERS: main_filtered
+  main_filtered:
+    FROM: base_cte AS ctr1
+          INNER JOIN state_avg_cte ON ctr1.ctr_state = state_avg_cte.ctr_state
+          INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+          INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk
+    WHERE: ctr1.ctr_total_return > state_avg_cte.state_avg_threshold
+      AND ctr1.ctr_reason_sk IN (20, 36)
+      AND c_birth_year BETWEEN 1985 AND 1991
+      AND customer_address.ca_state IN ('OK','SC','TX','WI')
+    ORDER BY: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    OUTPUT: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final limit
+EXAMPLES: pg_self_join_decomposition, inline_decorrelate_materialized, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_self_join_decomposition: Materialize the base CTE once and derive per‑state averages from it (state_avg_cte). IGNORE the per‑store vs per‑item split (not needed).
+- inline_decorrelate_materialized: Use MATERIALIZED on base_cte to ensure it's computed once. IGNORE the 3‑CTE decomposition (we use 2 CTEs).
+- early_filter_decorrelate: Push dimension filters into base_cte definition (already there). IGNORE the separate threshold CTE (we create state_avg_cte).
+HAZARD_FLAGS:
+- The base_cte still uses comma joins; optimizer may reorder but that's acceptable.
+- MATERIALIZED may prevent parallel execution of base_cte.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: push_state_filter_decorrelate
+TARGET_LOGICAL_TREE:
+  filtered_dates -> filtered_items -> filtered_addresses_current -> filtered_addresses_returning -> web_returns_joined -> cte_aggregated -> state_avg -> main_join
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 2002
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: web_returns_joined
+  filtered_items:
+    FROM: item
+    WHERE: i_manager_id BETWEEN 68 AND 77
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: ~10
+    CONSUMERS: web_returns_joined
+  filtered_addresses_current:
+    FROM: customer_address
+    WHERE: ca_state IN ('OK','SC','TX','WI')
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: selective
+    CONSUMERS: main_join
+  filtered_addresses_returning:
+    FROM: customer_address
+    WHERE: ca_state IN ('OK','SC','TX','WI')
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: same as above
+    CONSUMERS: web_returns_joined
+  web_returns_joined:
+    FROM: web_returns
+          INNER JOIN filtered_dates ON wr_returned_date_sk = d_date_sk
+          INNER JOIN filtered_addresses_returning ON wr_returning_addr_sk = ca_address_sk
+          INNER JOIN filtered_items ON wr_item_sk = i_item_sk
+    WHERE: wr_return_amt / wr_return_quantity BETWEEN 242 AND 271
+    OUTPUT: wr_returning_customer_sk, ca_state, wr_reason_sk, wr_return_amt
+    EXPECTED_ROWS: ≤2,617 (more selective due to address filter)
+    CONSUMERS: cte_aggregated
+  cte_aggregated:
+    FROM: web_returns_joined
+    GROUP BY: wr_returning_customer_sk, ca_state, wr_reason_sk
+    AGGREGATE: SUM(wr_return_amt) AS ctr_total_return
+    OUTPUT: ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return
+    EXPECTED_ROWS: ≤99
+    CONSUMERS: state_avg, main_join
+  state_avg:
+    FROM: cte_aggregated
+    GROUP BY: ctr_state
+    AGGREGATE: AVG(ctr_total_return) * 1.2 AS state_avg_threshold
+    OUTPUT: ctr_state, state_avg_threshold
+    EXPECTED_ROWS: ≤6
+    CONSUMERS: main_join
+  main_join:
+    FROM: cte_aggregated AS ctr1
+          INNER JOIN state_avg ON ctr1.ctr_state = state_avg.ctr_state
+          INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+          INNER JOIN filtered_addresses_current ON ca_address_sk = c_current_addr_sk
+    WHERE: ctr1.ctr_total_return > state_avg.state_avg_threshold
+      AND ctr1.ctr_reason_sk IN (20, 36)
+      AND c_birth_year BETWEEN 1985 AND 1991
+    ORDER BY: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    OUTPUT: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final limit
+EXAMPLES: pg_dimension_prefetch_star, inline_decorrelate_materialized, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Pre‑filter both current and returning address tables with the state filter. Use explicit JOINs. IGNORE the promotion dimension.
+- inline_decorrelate_materialized: Decorate via separate state_avg CTE. IGNORE the fact‑filter CTE.
+- pg_materialized_dimension_fact_prefilter: Use MATERIALIZED on dimension CTEs to force early filtering. IGNORE the fact‑table prefilter (we join after).
+HAZARD_FLAGS:
+- Pushing ca_state filter into returning address CTE changes semantics: original CTE included all states, main query filtered later. This may exclude rows where returning address state ≠ 'OK,SC,TX,WI' but current address state is in that list. Must verify if this is allowed: the business intent likely cares about current address state, not returning address state. Risky.
+CONSTRAINT_OVERRIDE: None (we are testing a semantic change—must verify if acceptable).
+OVERRIDE_REASONING: The original query filters on customer_address.ca_state (current address) in the main query, but the CTE uses returning address state (different column). Pushing the filter into the CTE on returning address state may exclude customers who returned from a different state but now live in OK/SC/TX/WI. This changes result set.
+EXPLORATION_TYPE: novel_combination (combining early state filter on returning address with decorrelation).

@@ -1,0 +1,458 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Compare customer-item coverage between store and catalog channels over month sequence 1214-1225 by counting store-only, catalog-only, and overlapping customer-item pairs. The FULL OUTER JOIN preserves all rows from both sides, with NULLs indicating absence in one channel; the three conditional sums count membership in each bucket. Aggregation uses SUM of 0/1 flags (duplicate-safe). The date filter (d_month_seq between 1214 and 1214+11) must be applied identically to both store_sales and catalog_sales before grouping.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+store_distinct -> store_only_count, overlap_count
+  catalog_distinct -> catalog_only_count
+  combine_counts
+NODE_CONTRACTS:
+  store_distinct:
+    FROM: store_sales, date_dim
+    WHERE: ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1214 AND 1214 + 11
+    GROUP BY: ss_customer_sk, ss_item_sk
+    OUTPUT: ss_customer_sk AS customer_sk, ss_item_sk AS item_sk
+    EXPECTED_ROWS: 5.4M
+    CONSUMERS: store_only_count, overlap_count
+  catalog_distinct:
+    FROM: catalog_sales, date_dim
+    WHERE: cs_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1214 AND 1214 + 11
+    GROUP BY: cs_bill_customer_sk, cs_item_sk
+    OUTPUT: cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk
+    EXPECTED_ROWS: 2.9M
+    CONSUMERS: catalog_only_count, overlap_count
+  store_only_count:
+    FROM: store_distinct s
+    WHERE: NOT EXISTS (SELECT 1 FROM catalog_distinct c WHERE c.customer_sk = s.customer_sk AND c.item_sk = s.item_sk)
+    AGGREGATE: COUNT(*) AS store_only
+    OUTPUT: store_only
+    EXPECTED_ROWS: 1
+    CONSUMERS: combine_counts
+  catalog_only_count:
+    FROM: catalog_distinct c
+    WHERE: NOT EXISTS (SELECT 1 FROM store_distinct s WHERE s.customer_sk = c.customer_sk AND c.item_sk = s.item_sk)
+    AGGREGATE: COUNT(*) AS catalog_only
+    OUTPUT: catalog_only
+    EXPECTED_ROWS: 1
+    CONSUMERS: combine_counts
+  overlap_count:
+    FROM: store_distinct s
+    WHERE: EXISTS (SELECT 1 FROM catalog_distinct c WHERE c.customer_sk = s.customer_sk AND c.item_sk = s.item_sk)
+    AGGREGATE: COUNT(*) AS store_and_catalog
+    OUTPUT: store_and_catalog
+    EXPECTED_ROWS: 1
+    CONSUMERS: combine_counts
+  combine_counts:
+    FROM: store_only_count, catalog_only_count, overlap_count
+    OUTPUT: store_only, catalog_only, store_and_catalog
+    EXPECTED_ROWS: 1
+    CONSUMERS: none
+
+NODE_CONTRACTS:
+store_distinct:
+    FROM: store_sales, date_dim
+    WHERE: ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1214 AND 1214 + 11
+    GROUP BY: ss_customer_sk, ss_item_sk
+    OUTPUT: ss_customer_sk AS customer_sk, ss_item_sk AS item_sk
+    EXPECTED_ROWS: 5.4M
+    CONSUMERS: store_only_count, overlap_count
+  catalog_distinct:
+    FROM: catalog_sales, date_dim
+    WHERE: cs_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1214 AND 1214 + 11
+    GROUP BY: cs_bill_customer_sk, cs_item_sk
+    OUTPUT: cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk
+    EXPECTED_ROWS: 2.9M
+    CONSUMERS: catalog_only_count, overlap_count
+  store_only_count:
+    FROM: store_distinct s
+    WHERE: NOT EXISTS (SELECT 1 FROM catalog_distinct c WHERE c.customer_sk = s.customer_sk AND c.item_sk = s.item_sk)
+    AGGREGATE: COUNT(*) AS store_only
+    OUTPUT: store_only
+    EXPECTED_ROWS: 1
+    CONSUMERS: combine_counts
+  catalog_only_count:
+    FROM: catalog_distinct c
+    WHERE: NOT EXISTS (SELECT 1 FROM store_distinct s WHERE s.customer_sk = c.customer_sk AND c.item_sk = s.item_sk)
+    AGGREGATE: COUNT(*) AS catalog_only
+    OUTPUT: catalog_only
+    EXPECTED_ROWS: 1
+    CONSUMERS: combine_counts
+  overlap_count:
+    FROM: store_distinct s
+    WHERE: EXISTS (SELECT 1 FROM catalog_distinct c WHERE c.customer_sk = s.customer_sk AND c.item_sk = s.item_sk)
+    AGGREGATE: COUNT(*) AS store_and_catalog
+    OUTPUT: store_and_catalog
+    EXPECTED_ROWS: 1
+    CONSUMERS: combine_counts
+  combine_counts:
+    FROM: store_only_count, catalog_only_count, overlap_count
+    OUTPUT: store_only, catalog_only, store_and_catalog
+    EXPECTED_ROWS: 1
+    CONSUMERS: none
+
+## Hazard Flags (avoid these specific risks)
+
+- Three separate EXISTS subqueries may rescan catalog_distinct/store_distinct multiple times; ensure they are CTEs to avoid recomputation.
+- Must preserve COUNT(*) semantics (counts distinct pairs, which matches original because inputs are already distinct).
+
+## Regression Warnings (observed failures on similar queries)
+
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline runtime <100ms, CTE overhead exceeded savings.
+   RULE: This query baseline is 2311ms, so CTE overhead acceptable.
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Pre-filtered fact table before multi-way join, preventing optimizer reordering.
+   RULE: This query has only two independent fact tables joined via FULL OUTER JOIN, no multi-way fact joins, so safe.
+3. or_to_union (0.59x on Q90):
+   CAUSE: Split same-column OR into UNION ALL, duplicating fact scans.
+   RULE: Not applicable; no OR conditions.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output exactly three columns: store_only, catalog_only, store_and_catalog.
+- CTE_COLUMN_COMPLETENESS: Any CTE must output customer_sk and item_sk for downstream join/aggregation.
+- LITERAL_PRESERVATION: Must preserve d_month_seq values 1214 and 1214+11.
+- SEMANTIC_EQUIVALENCE: Result must match original row counts for each bucket.
+- CROSS_CTE_PREDICATE_BLINDNESS: date_dim scanned twice (once per CTE) with same filter; opportunity to share.
+- REDUNDANT_SCAN_ELIMINATION: Not active; each fact table scanned once.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: Not active.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- intersect_to_exists: Apply the pattern of replacing set operations with EXISTS semi-joins. Ignore INTERSECT specific; we emulate FULL OUTER JOIN counts via EXISTS/ NOT EXISTS.
+- multi_intersect_exists_cte: Use separate EXISTS checks for each bucket, pre-materializing distinct sets. Ignore cascading INTERSECT.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. intersect_to_exists (1.83x)
+
+**Principle:** Semi-Join Short-Circuit: replace INTERSECT with EXISTS to avoid full materialization and sorting. INTERSECT must compute complete result sets before intersecting; EXISTS stops at the first match per row, enabling semi-join optimizations.
+
+**BEFORE (slow):**
+```sql
+with  cross_items as
+ (select i_item_sk ss_item_sk
+ from item,
+ (select iss.i_brand_id brand_id
+     ,iss.i_class_id class_id
+     ,iss.i_category_id category_id
+ from store_sales
+     ,item iss
+     ,date_dim d1
+ where ss_item_sk = iss.i_item_sk
+   and ss_sold_date_sk = d1.d_date_sk
+   and d1.d_year between 2000 AND 2000 + 2
+ intersect 
+ select ics.i_brand_id
+     ,ics.i_class_id
+     ,ics.i_category_id
+ from catalog_sales
+     ,item ics
+     ,date_dim d2
+ where cs_item_sk = ics.i_item_sk
+   and cs_sold_date_sk = d2.d_date_sk
+   and d2.d_year between 2000 AND 2000 + 2
+ intersect
+ select iws.i_brand_id
+     ,iws.i_class_id
+     ,iws.i_category_id
+ from web_sales
+     ,item iws
+     ,date_dim d3
+ where ws_item_sk = iws.i_item_sk
+   and ws_sold_date_sk = d3.d_date_sk
+   and d3.d_year between 2000 AND 2000 + 2)
+ where i_brand_id = brand_id
+      and i_class_id = class_id
+      and i_category_id = category_id
+),
+ avg_sales as
+ (select avg(quantity*list_price) average_sales
+  from (select ss_quantity quantity
+             ,ss_list_price list_price
+       from store_sales
+           ,date_dim
+       where ss_sold_date_sk = d_date_sk
+         and d_year between 2000 and 2000 + 2
+       union all 
+       select cs_quantity quantity 
+             ,cs_list_price list_price
+       from catalog_sales
+           ,date_dim
+       where cs_sold_date_sk = d_date_sk
+         and d_year between 2000 and 2000 + 2 
+       union all
+       select ws_quantity quantity
+             ,ws_list_price list_price
+       from web_sales
+           ,date_dim
+       where ws_sold_date_sk = d_date_sk
+         and d_year between 2000 and 2000 + 2) x)
+  select channel, i_brand_id,i_class_id,i_category_id,sum(sales), sum(number_sales)
+ from(
+       select 'store' channel, i_brand_id,i_class_id
+             ,i_category_id,sum(ss_quantity*ss_list_price) sales
+             , count(*) number_sales
+       from store_sales
+           ,item
+           ,date_dim
+       where ss_item_sk in (select ss_item_sk from cross_items)
+         and ss_item_sk = i_item_sk
+         and ss_sold_date_sk = d_date_sk
+         and d_year = 2000+2 
+         and d_moy = 11
+       group by i_brand_id,i_class_id,i_category_id
+       having sum(ss_quantity*ss_list_price) > (select average_sales from avg_sales)
+       union all
+       select 'catalog' channel, i_brand_id,i_class_id,i_category_id, sum(cs_quantity*cs_list_price) sales, count(*) number_sales
+       from catalog_sales
+           ,item
+           ,date_dim
+       where cs_item_sk in (select ss_item_sk from cross_items)
+         and cs_item_sk = i_item_sk
+         and cs_sold_date_sk = d_date_sk
+         and d_year = 2000+2 
+         and d_moy = 11
+       group by i_brand_id,i_class_id,i_category_id
+       having sum(cs_quantity*cs_list_price) > (select average_sales from avg_sales)
+       union all
+       select 'web' channel, i_brand_id,i_class_id,i_category_id, sum(ws_quantity*ws_list_price) sales , count(*) number_sales
+       from web_sales
+           ,item
+           ,date_dim
+       where ws_item_sk in (select ss_item_sk from cross_items)
+         and ws_item_sk = i_item_sk
+         and ws_sold_date_sk = d_date_sk
+         and d_year = 2000+2
+         and d_moy = 11
+       group by i_brand_id,i_class_id,i_category_id
+       having sum(ws_quantity*ws_list_price) > (select average_sales from avg_sales)
+ ) y
+ group by rollup (channel, i_brand_id,i_class_id,i_category_id)
+ order by channel,i_brand_id,i_class_id,i_category_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[cross_items_flat]:
+```sql
+SELECT i.i_item_sk AS ss_item_sk FROM item i WHERE EXISTS (SELECT 1 FROM store_sales, item iss, date_dim d1 WHERE ss_item_sk = iss.i_item_sk AND ss_sold_date_sk = d1.d_date_sk AND d1.d_year BETWEEN 1999 AND 2001 AND iss.i_brand_id = i.i_brand_id AND iss.i_class_id = i.i_class_id AND iss.i_category_id = i.i_category_id) AND EXISTS (SELECT 1 FROM catalog_sales, item ics, date_dim d2 WHERE cs_item_sk = ics.i_item_sk AND cs_sold_date_sk = d2.d_date_sk AND d2.d_year BETWEEN 1999 AND 2001 AND ics.i_brand_id = i.i_brand_id AND ics.i_class_id = i.i_class_id AND ics.i_category_id = i.i_category_id) AND EXISTS (SELECT 1 FROM web_sales, item iws, date_dim d3 WHERE ws_item_sk = iws.i_item_sk AND ws_sold_date_sk = d3.d_date_sk AND d3.d_year BETWEEN 1999 AND 2001 AND iws.i_brand_id = i.i_brand_id AND iws.i_class_id = i.i_class_id AND iws.i_category_id = i.i_category_id)
+```
+[main_query]:
+```sql
+SELECT ... FROM ... WHERE i_item_sk IN (SELECT ss_item_sk FROM cross_items_flat) ...
+```
+
+### 2. multi_intersect_exists_cte (2.39x)
+
+**BEFORE (slow):**
+```sql
+with cross_items as
+ (select i_item_sk ss_item_sk
+ from item,
+ (select iss.i_brand_id brand_id, iss.i_class_id class_id, iss.i_category_id category_id
+ from store_sales, item iss, date_dim d1
+ where ss_item_sk = iss.i_item_sk and ss_sold_date_sk = d1.d_date_sk
+   and d1.d_year between 2000 AND 2000 + 2
+ intersect
+ select ics.i_brand_id, ics.i_class_id, ics.i_category_id
+ from catalog_sales, item ics, date_dim d2
+ where cs_item_sk = ics.i_item_sk and cs_sold_date_sk = d2.d_date_sk
+   and d2.d_year between 2000 AND 2000 + 2
+ intersect
+ select iws.i_brand_id, iws.i_class_id, iws.i_category_id
+ from web_sales, item iws, date_dim d3
+ where ws_item_sk = iws.i_item_sk and ws_sold_date_sk = d3.d_date_sk
+   and d3.d_year between 2000 AND 2000 + 2)
+ where i_brand_id = brand_id and i_class_id = class_id and i_category_id = category_id),
+ avg_sales as
+ (select avg(quantity*list_price) average_sales
+  from (select ss_quantity quantity, ss_list_price list_price from store_sales, date_dim where ss_sold_date_sk = d_date_sk and d_year between 2000 and 2000 + 2
+   union all select cs_quantity, cs_list_price from catalog_sales, date_dim where cs_sold_date_sk = d_date_sk and d_year between 2000 and 2000 + 2
+   union all select ws_quantity, ws_list_price from web_sales, date_dim where ws_sold_date_sk = d_date_sk and d_year between 2000 and 2000 + 2) x)
+ select channel, i_brand_id, i_class_id, i_category_id, sum(sales), sum(number_sales)
+ from (
+  select 'store' channel, i_brand_id, i_class_id, i_category_id, sum(ss_quantity*ss_list_price) sales, count(*) number_sales
+  from store_sales, item, date_dim
+  where ss_item_sk in (select ss_item_sk from cross_items) and ss_item_sk = i_item_sk and ss_sold_date_sk = d_date_sk and d_year = 2000+2 and d_moy = 11
+  group by i_brand_id, i_class_id, i_category_id
+  having sum(ss_quantity*ss_list_price) > (select average_sales from avg_sales)
+  union all
+  select 'catalog' channel, i_brand_id, i_class_id, i_category_id, sum(cs_quantity*cs_list_price) sales, count(*) number_sales
+  from catalog_sales, item, date_dim
+  where cs_item_sk in (select ss_item_sk from cross_items) and cs_item_sk = i_item_sk and cs_sold_date_sk = d_date_sk and d_year = 2000+2 and d_moy = 11
+  group by i_brand_id, i_class_id, i_category_id
+  having sum(cs_quantity*cs_list_price) > (select average_sales from avg_sales)
+  union all
+  select 'web' channel, i_brand_id, i_class_id, i_category_id, sum(ws_quantity*ws_list_price) sales, count(*) number_sales
+  from web_sales, item, date_dim
+  where ws_item_sk in (select ss_item_sk from cross_items) and ws_item_sk = i_item_sk and ws_sold_date_sk = d_date_sk and d_year = 2000+2 and d_moy = 11
+  group by i_brand_id, i_class_id, i_category_id
+  having sum(ws_quantity*ws_list_price) > (select average_sales from avg_sales)
+ ) y
+ group by rollup (channel, i_brand_id, i_class_id, i_category_id)
+ order by channel, i_brand_id, i_class_id, i_category_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year BETWEEN 2000 AND 2002
+```
+[cross_items]:
+```sql
+SELECT i_item_sk AS ss_item_sk, i_brand_id, i_class_id, i_category_id FROM item WHERE EXISTS (SELECT 1 FROM store_sales JOIN item iss ON ss_item_sk = iss.i_item_sk JOIN filtered_dates d1 ON ss_sold_date_sk = d1.d_date_sk WHERE iss.i_brand_id = item.i_brand_id AND iss.i_class_id = item.i_class_id AND iss.i_category_id = item.i_category_id) AND EXISTS (SELECT 1 FROM catalog_sales JOIN item ics ON cs_item_sk = ics.i_item_sk JOIN filtered_dates d2 ON cs_sold_date_sk = d2.d_date_sk WHERE ics.i_brand_id = item.i_brand_id AND ics.i_class_id = item.i_class_id AND ics.i_category_id = item.i_category_id) AND EXISTS (SELECT 1 FROM web_sales JOIN item iws ON ws_item_sk = iws.i_item_sk JOIN filtered_dates d3 ON ws_sold_date_sk = d3.d_date_sk WHERE iws.i_brand_id = item.i_brand_id AND iws.i_class_id = item.i_class_id AND iws.i_category_id = item.i_category_id)
+```
+
+## Original SQL
+
+```sql
+-- start query 97 in stream 0 using template query97.tpl
+with ssci as (
+select ss_customer_sk customer_sk
+      ,ss_item_sk item_sk
+from store_sales,date_dim
+where ss_sold_date_sk = d_date_sk
+  and d_month_seq between 1214 and 1214 + 11
+group by ss_customer_sk
+        ,ss_item_sk),
+csci as(
+ select cs_bill_customer_sk customer_sk
+      ,cs_item_sk item_sk
+from catalog_sales,date_dim
+where cs_sold_date_sk = d_date_sk
+  and d_month_seq between 1214 and 1214 + 11
+group by cs_bill_customer_sk
+        ,cs_item_sk)
+ select sum(case when ssci.customer_sk is not null and csci.customer_sk is null then 1 else 0 end) store_only
+      ,sum(case when ssci.customer_sk is null and csci.customer_sk is not null then 1 else 0 end) catalog_only
+      ,sum(case when ssci.customer_sk is not null and csci.customer_sk is not null then 1 else 0 end) store_and_catalog
+from ssci full outer join csci on (ssci.customer_sk=csci.customer_sk
+                               and ssci.item_sk = csci.item_sk)
+ LIMIT 100;
+
+-- end query 97 in stream 0 using template query97.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `store_only`
+  2. `catalog_only`
+  3. `store_and_catalog`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] csci  [=]  Cost: 33%  Rows: ~1K  — Build distinct customer-item pairs from catalog sales in the same window.
+│   ├── SCAN (catalog_sales, date_dim (join))
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_month_seq BETWEEN 1214 AND 1214 + 11)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (customer_sk, item_sk)
+├── [CTE] ssci  [=]  Cost: 33%  Rows: ~1K  — Build distinct customer-item pairs from store sales in the 12-month window.
+│   ├── SCAN (store_sales, date_dim (join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_month_seq BETWEEN 1214 AND 1214 + 11)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (customer_sk, item_sk)
+└── [MAIN] main_query  [=]  Cost: 33%  Rows: ~1K  — Full-outer-join store and catalog pair sets on customer-item and count membership in each exclusive/overlap bucket.
+    ├── SCAN (ssci, csci (join))
+    ├── AGG (GROUP BY)
+    └── OUTPUT (store_only, catalog_only, store_and_catalog)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

@@ -1,0 +1,257 @@
+<reasoning>
+1. **CLASSIFY**: This is a multi-channel set intersection query using INTERSECT to find customer/date combinations that appear in all three sales channels (store, catalog, web). It's a set_operations archetype.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - **Total time**: 1507ms
+   - **Major bottlenecks**:
+     - `HASH_GROUP_BY [469K rows, 328.6ms, 22%]` on store sales distinct (most expensive)
+     - `SEQ_SCAN store_sales [5.4M of 345.6M rows, 228.1ms, 15%]` (largest scan)
+     - `HASH_GROUP_BY [312K rows, 175.5ms, 12%]` on catalog sales distinct
+     - `HASH_GROUP_BY [118K rows, 84.9ms, 6%]` on web sales distinct
+   - **Row count drops**:
+     - date_dim: 73K → 365 rows (filtered by d_month_seq)
+     - store_sales: 345.6M → 5.4M rows (after date join), then → 469K (after distinct)
+     - catalog_sales: 172.8M → 2.8M → 312K
+     - web_sales: 86.4M → 1.4M → 118K
+   - **Optimizer behavior**: Already converts INTERSECT to semi-joins (HASH_JOIN SEMI). Each subquery independently scans date_dim (3 times) and customer (3 times). No CTE sharing across subqueries.
+   - **Scans per table**:
+     - date_dim: 3 separate scans (365 rows each)
+     - customer: 3 separate scans (500K rows each)
+     - store_sales: 1 scan
+     - catalog_sales: 1 scan
+     - web_sales: 1 scan
+   - **CTE materialization**: No CTEs in original query; each subquery executed independently.
+
+3. **GAP MATCHING**:
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: Active. Same date_dim filter applied 3 times independently. Pre-filtering into shared CTE could eliminate 2 redundant scans.
+   - **REDUNDANT_SCAN_ELIMINATION**: Active. customer table scanned 3 times (500K rows each). Could pre-filter or share via CTE.
+   - **CORRELATED_SUBQUERY_PARALYSIS**: Not applicable (no correlated subqueries).
+   - **CROSS_COLUMN_OR_DECOMPOSITION**: Not applicable.
+   - **UNION_CTE_SELF_JOIN_DECOMPOSITION**: Not applicable.
+   - **Engine already handles**: Hash joins, semi-joins for INTERSECT, predicate pushdown into date_dim scans.
+
+4. **AGGREGATION TRAP CHECK**: Only COUNT(*) at end. DISTINCT inside subqueries is duplicate-elimination, not aggregation-sensitive. No STDDEV/AVG traps.
+
+5. **TRANSFORM SELECTION** (ranked by impact):
+   a. **shared_dimension_multi_channel**: Extract shared date_dim filter into CTE, share across all three channel subqueries. Addresses 3x date_dim scans.
+   b. **dimension_cte_isolate**: Pre-filter customer table to only customers who appear in any sales channel during the date range. Addresses 3x customer scans.
+   c. **intersect_to_exists**: Convert INTERSECT to EXISTS with smallest set (web) as driver. Could enable better join ordering and short-circuiting.
+   d. **single_pass_aggregation**: Consolidate three channel subqueries into single UNION ALL with channel labels, then use conditional aggregation to find intersections. Novel combination for this structure.
+
+6. **LOGICAL TREE DESIGN**:
+   - Worker 1: shared_dimension_multi_channel → CTE for filtered date_dim, reused in each channel subquery.
+   - Worker 2: dimension_cte_isolate → CTE for filtered customer keys (from all channels), then join back.
+   - Worker 3: intersect_to_exists → Start with web sales distinct set, probe others via EXISTS.
+   - Worker 4: single_pass_aggregation + shared_dimension → Single scan per channel? Actually still needs 3 scans but consolidates processing.
+
+Check column completeness: Each CTE must output all columns needed downstream: c_last_name, c_first_name, d_date, plus join keys (d_date_sk, c_customer_sk).
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Count distinct customer-name/date combinations that occur in all three sales channels within month sequence 1183-1194. INTERSECT requires exact matching of all three columns (including NULLs). All joins are INNER, requiring matches in all joined tables. No aggregation function traps (only COUNT(*)). The d_month_seq filter applies identically to all three channels; moving it earlier preserves semantics.
+
+BOTTLENECK_DIAGNOSIS:
+Dominant cost is three separate HASH_GROUP_BY operations (store: 328.6ms, catalog: 175.5ms, web: 84.9ms) after large fact-table scans. The query is aggregation-bound due to DISTINCT materialization before INTERSECT. Cardinality flow: date_dim reduces to 365 rows, but customer table (500K rows) is scanned 3 times. The optimizer already handles INTERSECT→semi-join conversion well but misses sharing dimension scans across channels.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output single column count(*).
+- CTE_COLUMN_COMPLETENESS: All CTEs must include c_last_name, c_first_name, d_date, and join keys.
+- LITERAL_PRESERVATION: d_month_seq values 1183 and 1183+11 must be preserved exactly.
+- SEMANTIC_EQUIVALENCE: INTERSECT must produce same set as original.
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows 3 separate date_dim scans (0.2ms each) with same filter.
+- REDUNDANT_SCAN_ELIMINATION: EXPLAIN shows 3 separate customer scans (500K rows each, ~10ms each).
+
+REGRESSION_WARNINGS:
+1. materialize_cte (regression_q16: 0.14x):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan instead of semi-join short-circuit.
+   RULE: Do not convert INTERSECT to materialized CTE that computes full distinct sets if EXISTS alternative exists.
+2. date_cte_isolate (regression_q25: 0.50x):
+   CAUSE: Pre-filtered fact table before multi-way join, preventing optimizer reordering.
+   RULE: Keep fact table joins together; only pre-filter dimensions.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: shared_dimension_multi_channel
+TARGET_LOGICAL_TREE:
+  filtered_dates -> store_channel -> catalog_channel -> web_channel -> intersect_sets -> count
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1183 AND 1183 + 11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 365
+    CONSUMERS: store_channel, catalog_channel, web_channel
+  store_channel:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_dates ON store_sales.ss_sold_date_sk = filtered_dates.d_date_sk
+          INNER JOIN customer ON store_sales.ss_customer_sk = customer.c_customer_sk
+    OUTPUT: DISTINCT customer.c_last_name, customer.c_first_name, filtered_dates.d_date
+    EXPECTED_ROWS: 469K
+    CONSUMERS: intersect_sets
+  catalog_channel:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_dates ON catalog_sales.cs_sold_date_sk = filtered_dates.d_date_sk
+          INNER JOIN customer ON catalog_sales.cs_bill_customer_sk = customer.c_customer_sk
+    OUTPUT: DISTINCT customer.c_last_name, customer.c_first_name, filtered_dates.d_date
+    EXPECTED_ROWS: 312K
+    CONSUMERS: intersect_sets
+  web_channel:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_dates ON web_sales.ws_sold_date_sk = filtered_dates.d_date_sk
+          INNER JOIN customer ON web_sales.ws_bill_customer_sk = customer.c_customer_sk
+    OUTPUT: DISTINCT customer.c_last_name, customer.c_first_name, filtered_dates.d_date
+    EXPECTED_ROWS: 118K
+    CONSUMERS: intersect_sets
+  intersect_sets:
+    FROM: store_channel
+    INTERSECT: catalog_channel
+    INTERSECT: web_channel
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: 499
+    CONSUMERS: count
+  count:
+    AGGREGATE: COUNT(*) as count
+    OUTPUT: count
+    EXPECTED_ROWS: 1
+EXAMPLES: shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+  Apply: Extract shared date filter into CTE reused by all three channel subqueries.
+  Ignore: The example also extracted item/promotion filters; we only have date dimension.
+HAZARD_FLAGS:
+  - Customer table still scanned 3 times (not addressed by this strategy).
+  - CTE may be inlined if referenced once per channel subquery (DuckDB may still materialize once).
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+  filtered_dates -> potential_customers -> store_channel -> catalog_channel -> web_channel -> intersect_sets -> count
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1183 AND 1183 + 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: potential_customers
+  potential_customers:
+    FROM: (
+      SELECT DISTINCT ss_customer_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+      UNION
+      SELECT DISTINCT cs_bill_customer_sk FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk
+      UNION
+      SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk
+    ) AS cust_keys
+    JOIN: INNER JOIN customer ON cust_keys.customer_sk = customer.c_customer_sk
+    OUTPUT: customer.c_customer_sk, customer.c_last_name, customer.c_first_name
+    EXPECTED_ROWS: <500K (customers who purchased in date range)
+    CONSUMERS: store_channel, catalog_channel, web_channel
+  store_channel:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_dates ON store_sales.ss_sold_date_sk = filtered_dates.d_date_sk
+          INNER JOIN potential_customers ON store_sales.ss_customer_sk = potential_customers.c_customer_sk
+    OUTPUT: DISTINCT potential_customers.c_last_name, potential_customers.c_first_name, filtered_dates.d_date
+    EXPECTED_ROWS: 469K
+    CONSUMERS: intersect_sets
+  catalog_channel: (similar with cs_bill_customer_sk)
+  web_channel: (similar with ws_bill_customer_sk)
+EXAMPLES: dimension_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+  Apply: Pre-filter customer table to only those appearing in any sales channel during date range.
+  Ignore: The example pre-filters multiple dimensions; we only pre-filter customer.
+HAZARD_FLAGS:
+  - UNION of customer keys from three large fact tables could be expensive.
+  - Must ensure all join keys (ss_customer_sk, cs_bill_customer_sk, ws_bill_customer_sk) map to c_customer_sk.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: intersect_to_exists
+TARGET_LOGICAL_TREE:
+  filtered_dates -> web_distinct -> exists_catalog -> exists_store -> count
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1183 AND 1183 + 11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 365
+    CONSUMERS: web_distinct, catalog_exists, store_exists
+  web_distinct:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_dates ON web_sales.ws_sold_date_sk = filtered_dates.d_date_sk
+          INNER JOIN customer ON web_sales.ws_bill_customer_sk = customer.c_customer_sk
+    OUTPUT: DISTINCT customer.c_last_name, customer.c_first_name, filtered_dates.d_date
+    EXPECTED_ROWS: 118K
+    CONSUMERS: exists_catalog
+  catalog_exists:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_dates ON catalog_sales.cs_sold_date_sk = filtered_dates.d_date_sk
+          INNER JOIN customer ON catalog_sales.cs_bill_customer_sk = customer.c_customer_sk
+    WHERE: EXISTS (correlated from web_distinct)
+    OUTPUT: (none, just EXISTS filter)
+    EXPECTED_ROWS: (probe per web_distinct row)
+    CONSUMERS: exists_store
+  store_exists: (similar for store_sales)
+  count:
+    FROM: web_distinct
+    WHERE: EXISTS (catalog_exists) AND EXISTS (store_exists)
+    AGGREGATE: COUNT(*) as count
+    OUTPUT: count
+    EXPECTED_ROWS: 499
+EXAMPLES: intersect_to_exists, multi_intersect_exists_cte
+EXAMPLE_ADAPTATION:
+  Apply: Convert INTERSECT to EXISTS with web sales as driver (smallest set).
+  Ignore: The example uses pre-materialized channel CTEs; we can keep joins inline.
+HAZARD_FLAGS:
+  - EXISTS correlation on three columns (c_last_name, c_first_name, d_date) may not be indexed.
+  - Must preserve DISTINCT in driver to avoid duplicate probes.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  filtered_dates -> all_sales_union -> channel_aggregation -> filter_all_channels -> count
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1183 AND 1183 + 11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 365
+    CONSUMERS: store_scan, catalog_scan, web_scan
+  store_scan:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_dates ON store_sales.ss_sold_date_sk = filtered_dates.d_date_sk
+          INNER JOIN customer ON store_sales.ss_customer_sk = customer.c_customer_sk
+    OUTPUT: customer.c_last_name, customer.c_first_name, filtered_dates.d_date, 'store' as channel
+    EXPECTED_ROWS: 5.4M
+    CONSUMERS: all_sales_union
+  catalog_scan: (similar, channel='catalog')
+  web_scan: (similar, channel='web')
+  all_sales_union:
+    FROM: store_scan UNION ALL catalog_scan UNION ALL web_scan
+    OUTPUT: c_last_name, c_first_name, d_date, channel
+    EXPECTED_ROWS: 5.4M + 2.8M + 1.4M = 9.6M
+    CONSUMERS: channel_aggregation
+  channel_aggregation:
+    FROM: all_sales_union
+    GROUP BY: c_last_name, c_first_name, d_date
+    AGGREGATE: COUNT(DISTINCT channel) as channel_count
+    OUTPUT: c_last_name, c_first_name, d_date, channel_count
+    EXPECTED_ROWS: ≤ (469K+312K+118K) distinct combos
+    CONSUMERS: filter_all_channels
+  filter_all_channels:
+    FROM: channel_aggregation
+    WHERE: channel_count = 3
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: 499
+    CONSUMERS: count
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+  Apply: Consolidate three channel scans into UNION ALL, then single GROUP BY with COUNT(DISTINCT channel).
+  Ignore: The example uses CASE aggregation for different buckets; we use COUNT(DISTINCT channel).
+HAZARD_FLAGS:
+  - UNION ALL of large fact tables (9.6M rows) may be more expensive than separate processing.
+  - COUNT(DISTINCT channel) must equal 3, not just presence flags.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

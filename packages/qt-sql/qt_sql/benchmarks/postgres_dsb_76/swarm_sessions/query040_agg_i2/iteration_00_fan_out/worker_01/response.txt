@@ -1,0 +1,87 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [~] CTE: date_filter
+│   └── SCAN (date_dim) with filter on d_date range
+├── [~] CTE: item_filter
+│   └── SCAN (item) with filter on i_category and i_manager_id
+├── [~] CTE: fact_join
+│   ├── JOIN (catalog_sales ⋈ date_filter ON cs_sold_date_sk)
+│   ├── JOIN (⋈ item_filter ON i_item_sk)
+│   ├── JOIN (⋈ warehouse ON cs_warehouse_sk)
+│   └── LEFT JOIN (catalog_returns ON cs_order_number AND cs_item_sk)
+│   └── FILTER (cs_wholesale_cost range AND (cr_reason_sk=40 OR NULL))
+├── [=] MAIN: aggregation
+│   ├── AGG (GROUP BY w_state, i_item_id)
+│   ├── SORT (w_state, i_item_id)
+│   └── OUTPUT (w_state, i_item_id, sales_before, sales_after)
+```
+
+**Changes:**
+- Added explicit CTEs for `date_filter` and `item_filter` to pre-filter dimension tables
+- Rewrote `fact_join` from comma-separated joins to explicit `INNER JOIN`/`LEFT JOIN` syntax
+- Preserved `LEFT JOIN` semantics with `(cr_reason_sk = 40 OR cr_reason_sk IS NULL)` filter
+- Maintained all original literals and defensive `COALESCE` guards
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefetch", "description": "Pre-filter date_dim and item into CTEs to create small hash tables", "applied_to": ["date_filter", "item_filter"]},
+    {"id": "R2", "type": "explicit_join_syntax", "description": "Convert comma-separated joins to explicit JOIN syntax for better cardinality estimation", "applied_to": ["fact_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN (CAST('2002-02-20' AS DATE) - INTERVAL '30 DAY') AND (CAST('2002-02-20' AS DATE) + INTERVAL '30 DAY')",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "item_filter": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_category = 'Shoes' AND i_manager_id BETWEEN 42 AND 81",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "fact_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT w.w_state, i.i_item_id, d.d_date, cs.cs_sales_price, cr.cr_refunded_cash FROM catalog_sales cs INNER JOIN date_filter d ON cs.cs_sold_date_sk = d.d_date_sk INNER JOIN item_filter i ON cs.cs_item_sk = i.i_item_sk INNER JOIN warehouse w ON cs.cs_warehouse_sk = w.w_warehouse_sk LEFT OUTER JOIN catalog_returns cr ON cs.cs_order_number = cr.cr_order_number AND cs.cs_item_sk = cr.cr_item_sk WHERE cs.cs_wholesale_cost BETWEEN 68 AND 87 AND (cr.cr_reason_sk = 40 OR cr.cr_reason_sk IS NULL)",
+        "interfaces": {"outputs": ["w_state", "i_item_id", "d_date", "cs_sales_price", "cr_refunded_cash"], "consumes": ["date_filter", "item_filter"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT w_state, i_item_id, SUM(CASE WHEN (CAST(d_date AS DATE) < CAST('2002-02-20' AS DATE)) THEN cs_sales_price - COALESCE(cr_refunded_cash, 0) ELSE 0 END) AS sales_before, SUM(CASE WHEN (CAST(d_date AS DATE) >= CAST('2002-02-20' AS DATE)) THEN cs_sales_price - COALESCE(cr_refunded_cash, 0) ELSE 0 END) AS sales_after FROM fact_join GROUP BY w_state, i_item_id ORDER BY w_state, i_item_id LIMIT 100",
+        "interfaces": {"outputs": ["w_state", "i_item_id", "sales_before", "sales_after"], "consumes": ["fact_join"]}
+      }
+    },
+    "reconstruction_order": ["date_filter", "item_filter", "fact_join", "main_query"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), item_filter AS ({item_filter}), fact_join AS ({fact_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL max_parallel_workers_per_gather = 2",
+    "SET LOCAL work_mem = '16MB'",
+    "SET LOCAL hash_mem_multiplier = 2.0"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes:** Pre-filtered dimensions into CTEs and converted to explicit JOIN syntax. This enables PostgreSQL to build small hash tables from the dimension CTEs (30 rows from date_dim, few from item) and use hash joins with accurate cardinality estimates, while preserving LEFT JOIN semantics for catalog_returns.
+
+**Expected speedup:** ~2.5-3x from better join planning and parallel execution enabled by avoiding CTE materialization fences.
+
+**Runtime config rationale:**
+- `max_parallel_workers_per_gather = 2`: Allows parallel scans of catalog_sales (large fact table)
+- `work_mem = '16MB'`: Sufficient for hash tables from small dimension CTEs and one hash aggregation
+- `hash_mem_multiplier = 2.0`: Gives hash joins extra headroom without overshooting memory budget

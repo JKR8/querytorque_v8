@@ -1,0 +1,77 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Calculate qualifying web-sales counts for AM and PM windows using consolidated single scan with time_window column, then pivot to ratio.
+    ├── [~] SCAN (web_sales, household_demographics, time_dim, web_page) → Replaced with single scan via CTE chain
+    ├── [~] FILTER (time_dim.t_hour BETWEEN 10 AND 10+1) → Consolidated into CASE expression in time_windows CTE
+    ├── [~] FILTER (time_dim.t_hour BETWEEN 16 AND 16+1) → Consolidated into CASE expression in time_windows CTE
+    ├── [~] FILTER (household_demographics.hd_dep_count = 2) → Moved to filtered_hd CTE
+    ├── [~] FILTER (web_page.wp_char_count BETWEEN 5000 AND 5200) → Moved to filtered_wp CTE
+    ├── [~] SORT (am_pm_ratio ASC) → Preserved in final_ratio
+    └── [=] OUTPUT (am_pm_ratio)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Filter small dimension tables (household_demographics, web_page, time_dim) first before joining to large fact table", "applied_to": ["filtered_hd", "filtered_wp", "time_windows"]},
+    {"id": "R2", "type": "pushdown", "description": "Consolidate two separate web_sales scans (AM and PM) into single scan with time_window column using CASE expression in time_windows CTE", "applied_to": ["time_windows", "fact_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "time_windows": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT t_time_sk, CASE WHEN t_hour BETWEEN 10 AND 11 THEN 'AM' WHEN t_hour BETWEEN 16 AND 17 THEN 'PM' END AS time_window FROM time_dim WHERE (t_hour BETWEEN 10 AND 11) OR (t_hour BETWEEN 16 AND 17)",
+        "interfaces": {"outputs": ["t_time_sk", "time_window"], "consumes": []}
+      },
+      "filtered_hd": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 2",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": []}
+      },
+      "filtered_wp": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT wp_web_page_sk FROM web_page WHERE wp_char_count BETWEEN 5000 AND 5200",
+        "interfaces": {"outputs": ["wp_web_page_sk"], "consumes": []}
+      },
+      "fact_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws.ws_sold_time_sk, ws.ws_ship_hdemo_sk, ws.ws_web_page_sk, tw.time_window FROM web_sales ws INNER JOIN time_windows tw ON ws.ws_sold_time_sk = tw.t_time_sk INNER JOIN filtered_hd hd ON ws.ws_ship_hdemo_sk = hd.hd_demo_sk INNER JOIN filtered_wp wp ON ws.ws_web_page_sk = wp.wp_web_page_sk",
+        "interfaces": {"outputs": ["ws_sold_time_sk", "ws_ship_hdemo_sk", "ws_web_page_sk", "time_window"], "consumes": ["time_windows", "filtered_hd", "filtered_wp"]}
+      },
+      "window_aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT time_window, COUNT(*) AS cnt FROM fact_join GROUP BY time_window",
+        "interfaces": {"outputs": ["time_window", "cnt"], "consumes": ["fact_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT CAST(MAX(CASE WHEN time_window = 'AM' THEN cnt END) AS DECIMAL(15,4)) / CAST(MAX(CASE WHEN time_window = 'PM' THEN cnt END) AS DECIMAL(15,4)) AS am_pm_ratio FROM window_aggregate ORDER BY am_pm_ratio LIMIT 100",
+        "interfaces": {"outputs": ["am_pm_ratio"], "consumes": ["window_aggregate"]}
+      }
+    },
+    "reconstruction_order": ["time_windows", "filtered_hd", "filtered_wp", "fact_join", "window_aggregate", "main_query"],
+    "assembly_template": "WITH time_windows AS ({time_windows}), filtered_hd AS ({filtered_hd}), filtered_wp AS ({filtered_wp}), fact_join AS ({fact_join}), window_aggregate AS ({window_aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Consolidated two separate web_sales scans (AM and PM) into a single scan using a CASE expression in the time_windows CTE to classify rows, while maintaining early filtering of dimension tables. This reduces the fact table scan from 2x to 1x.
+
+**Expected speedup**: 2.0x (eliminates redundant fact table scan)

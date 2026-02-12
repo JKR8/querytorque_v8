@@ -1,0 +1,110 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Split OR condition on promotion channels into two CTEs, joined independently, then union and aggregate.
+    ├── [+] promotion_email_cte  — Filter promotion where email disabled
+    │   └── SCAN promotion (p_channel_email = 'N')
+    ├── [+] promotion_event_cte  — Filter promotion where event disabled
+    │   └── SCAN promotion (p_channel_event = 'N' AND p_channel_email != 'N')
+    ├── [+] branch1_joined  — Join catalog_sales with email-disabled promotions + other dims
+    │   ├── SCAN catalog_sales
+    │   ├── JOIN promotion_email_cte
+    │   ├── JOIN date_dim (d_year = 2001)
+    │   ├── JOIN customer_demographics (cd_gender='M', cd_marital_status='S', cd_education_status='Unknown')
+    │   └── JOIN item
+    ├── [+] branch2_joined  — Join catalog_sales with event-disabled promotions + other dims
+    │   ├── SCAN catalog_sales
+    │   ├── JOIN promotion_event_cte
+    │   ├── JOIN date_dim (d_year = 2001)
+    │   ├── JOIN customer_demographics (cd_gender='M', cd_marital_status='S', cd_education_status='Unknown')
+    │   └── JOIN item
+    ├── [+] union_all  — UNION ALL of both branches
+    ├── [=] AGG (GROUP BY i_item_id)
+    ├── [=] SORT (i_item_id ASC)
+    └── [=] OUTPUT (i_item_id, agg1, agg2, agg3, agg4)
+```
+
+**Change markers:**
+- `[+]` — Added new CTEs for promotion filtering and two independent join branches
+- `[~]` — Modified main query structure from single join to CTE-based UNION ALL approach
+- `[=]` — Preserved original aggregation, sorting, and output columns
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "or_to_union",
+      "description": "Split OR condition on different promotion columns (p_channel_email='N' OR p_channel_event='N') into two UNION ALL branches, each with focused promotion filter",
+      "applied_to": ["promotion_email_cte", "promotion_event_cte", "branch1_joined", "branch2_joined", "union_all"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "promotion_email_cte": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N'",
+          "interfaces": {
+            "outputs": ["p_promo_sk"],
+            "consumes": []
+          }
+        },
+        "promotion_event_cte": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT p_promo_sk FROM promotion WHERE p_channel_event = 'N' AND p_channel_email != 'N'",
+          "interfaces": {
+            "outputs": ["p_promo_sk"],
+            "consumes": []
+          }
+        },
+        "branch1_joined": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT i.i_item_id, cs.cs_quantity, cs.cs_list_price, cs.cs_coupon_amt, cs.cs_sales_price FROM catalog_sales cs INNER JOIN date_dim d ON cs.cs_sold_date_sk = d.d_date_sk INNER JOIN customer_demographics cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk INNER JOIN item i ON cs.cs_item_sk = i.i_item_sk INNER JOIN promotion_email_cte p ON cs.cs_promo_sk = p.p_promo_sk WHERE cd.cd_gender = 'M' AND cd.cd_marital_status = 'S' AND cd.cd_education_status = 'Unknown' AND d.d_year = 2001",
+          "interfaces": {
+            "outputs": ["i_item_id", "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price"],
+            "consumes": ["promotion_email_cte"]
+          }
+        },
+        "branch2_joined": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT i.i_item_id, cs.cs_quantity, cs.cs_list_price, cs.cs_coupon_amt, cs.cs_sales_price FROM catalog_sales cs INNER JOIN date_dim d ON cs.cs_sold_date_sk = d.d_date_sk INNER JOIN customer_demographics cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk INNER JOIN item i ON cs.cs_item_sk = i.i_item_sk INNER JOIN promotion_event_cte p ON cs.cs_promo_sk = p.p_promo_sk WHERE cd.cd_gender = 'M' AND cd.cd_marital_status = 'S' AND cd.cd_education_status = 'Unknown' AND d.d_year = 2001",
+          "interfaces": {
+            "outputs": ["i_item_id", "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price"],
+            "consumes": ["promotion_event_cte"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM (SELECT * FROM branch1_joined UNION ALL SELECT * FROM branch2_joined) t GROUP BY i_item_id ORDER BY i_item_id LIMIT 100",
+          "interfaces": {
+            "outputs": ["i_item_id", "agg1", "agg2", "agg3", "agg4"],
+            "consumes": ["branch1_joined", "branch2_joined"]
+          }
+        }
+      },
+      "reconstruction_order": ["promotion_email_cte", "promotion_event_cte", "branch1_joined", "branch2_joined", "main_query"],
+      "assembly_template": "WITH promotion_email_cte AS ({promotion_email_cte}), promotion_event_cte AS ({promotion_event_cte}), branch1_joined AS ({branch1_joined}), branch2_joined AS ({branch2_joined}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Split the OR condition on different promotion columns (email vs event disabled) into two separate CTE-filtered branches using UNION ALL, avoiding a single complex OR filter that prevents predicate pushdown. The `promotion_event_cte` excludes rows already in `promotion_email_cte` to prevent duplication of promotions where both channels are disabled.
+
+**Expected speedup:** ~2-3x based on the `or_to_union` pattern, as DuckDB can push different promotion filters independently to each branch scan and use separate access paths.

@@ -1,0 +1,283 @@
+<reasoning>
+1. **CLASSIFY**: This is a "correlated-aggregate filter" pattern. The query computes per-store average revenue (sb) and per-store-item revenue (sc) over the same date range, then filters sc.revenue <= 0.1 * sb.ave. Both aggregates are derived from the same fact table (store_sales) with identical date filters. The structure has two independent subqueries scanning the same fact table with the same joins and filters, then joining their results.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total execution time: 3281ms.
+   - Two HASH_GROUP_BY nodes (1176.0ms + 1157.9ms) = 2333.9ms (71% of total). These are the per-store-item revenue (sc) and per-store average (sb) aggregations.
+   - Two separate store_sales SEQ_SCANs (259.0ms + 250.1ms) = 509.1ms (15.5% of total). Each scans 5.5M rows from 345.6M.
+   - Two date_dim scans (0.2ms each) are negligible.
+   - Row count drops: store_sales 345.6M → date join 5.5M → group by 2.7M → second group by 52 rows → final join 243K → top 100.
+   - The optimizer already splits the two subqueries (sc and sb) into separate pipelines. It does NOT share the common date-filtered store_sales scan.
+   - Base table scan count: store_sales scanned 2 times, date_dim 2 times, store 1 time, item 1 time.
+   - The CTE-like subqueries (sb and sc) are each referenced once, so they are inlined (no materialization benefit).
+
+3. **GAP MATCHING**:
+   - **REDUNDANT_SCAN_ELIMINATION**: YES. store_sales is scanned twice with identical filters (same date range). This matches "single_pass_aggregation" and "channel_bitmap_aggregation".
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: PARTIAL. The date filter is applied in each subquery independently. Could be isolated into a shared CTE (date_cte_isolate) to reduce date_dim scans, but date_dim is tiny (73K → 365 rows). The bigger win is consolidating the store_sales scans.
+   - **AGGREGATE_PUSHDOWN**: NOT APPLICABLE. No aggregate pushdown opportunity (both aggregates are on same fact table).
+   - **LATE_ATTRIBUTE_BINDING**: NOT APPLICABLE. store and item are joined late, but their columns are used in SELECT and ORDER BY, not filters. Could defer joins, but they're already cheap (store 100 rows, item 102K rows).
+   - **SELF_JOIN_ELIMINATION**: NOT APPLICABLE. No self-join.
+   - **DECORRELATION**: NOT APPLICABLE. No correlated subqueries.
+
+4. **AGGREGATION TRAP CHECK**: Only aggregates are SUM(ss_sales_price) and AVG(revenue). Both are duplicate-insensitive (SUM of duplicates changes value). The current query computes SUM per (store,item) then AVG over those sums per store. Any rewrite must preserve exact same grouping sets. Consolidating into a single scan with CASE aggregation would need to compute both aggregates in one pass, which is safe because AVG over SUMs is equivalent to AVG of per-item revenues.
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   a. **single_pass_aggregation**: Consolidate two store_sales scans into one. Expected high impact (4.47x historical). Directly addresses redundant scans.
+   b. **star_join_prefetch**: Pre-filter date_dim into CTE, pre-join with store_sales, then compute both aggregates. This combines date_cte_isolate with early fact join. Moderate impact (1.8-2.71x).
+   c. **window_function_aggregation**: Compute per-store average as window function over per-store-item revenue in a single group by. Eliminates second group by and join. Novel combination (no direct example). Moderate risk.
+   d. **deferred_attribute_binding**: Defer store and item joins until after filtering by revenue threshold. Reduces dimension join cardinality from 2.6M to 243K. Low risk, moderate gain.
+
+6. **LOGICAL TREE DESIGN**:
+   - For single_pass_aggregation: One CTE computes per-store-item revenue, another CTE computes per-store average from first CTE, then filter and join dimensions.
+   - For star_join_prefetch: date_filter CTE → fact_with_date CTE → two aggregate CTEs → filter → join dimensions.
+   - For window_function_aggregation: date_filter → fact_with_date → group by with window AVG → filter → join dimensions.
+   - For deferred_attribute_binding: Compute filtered store-item pairs first, then join store and item only for final output.
+
+All designs must preserve output columns: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Business intent: For month sequence 1221-1232, find store-item pairs whose revenue is at most 10% of that store's average item revenue, with store/item descriptive fields. JOIN semantics: All joins are INNER intersections (store_sales ↔ date_dim, store ↔ store_sales, item ↔ store_sales). Aggregation trap: The per-store average (sb.ave) is AVG over per-store-item revenues; changing row duplication (e.g., from join reordering) would alter the average. Filter dependencies: The date filter (d_month_seq 1221-1232) must be applied identically to both revenue computations; the revenue filter (<= 0.1 * ave) depends on the store-level average.
+
+BOTTLENECK_DIAGNOSIS:
+Dominant mechanism: Two identical full scans of store_sales (5.5M rows each) and two hash group bys (2.7M rows each) consume 71% of wall-clock time (2333.9ms). The query is scan-bound and aggregation-bound. Cardinality flow: store_sales 345.6M → date join 5.5M → group by 2.7M → second group by 52 rows → final join 243K → top 100. The optimizer already pushes date filters into scans and chooses hash joins/aggregates efficiently. Logical-tree cost percentages are misleading: the two group bys show 36% and 35% but together are 71% of actual time.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand in original order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced by downstream joins, filters, or output.
+- LITERAL_PRESERVATION: Must preserve literals 1221, 1221+11, 0.1 exactly.
+- SEMANTIC_EQUIVALENCE: Result set must be identical to original (100 rows ordered by s_store_name, i_item_desc).
+- REDUNDANT_SCAN_ELIMINATION: EXPLAIN shows two SEQ_SCAN on store_sales (259.0ms + 250.1ms) for identical date range.
+- CROSS_CTE_PREDICATE_BLINDNESS: Date filter repeated in two subqueries; could be shared.
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline runtime under 100ms, CTE materialization overhead dominated.
+   RULE: This query's baseline is 3281ms, so acceptable.
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Baseline under 50ms, CTE overhead dominated.
+   RULE: This query's baseline is 3281ms, acceptable.
+3. multi_dimension_prefetch (0.85x on Q67):
+   CAUSE: Unfiltered dimension CTEs added overhead.
+   RULE: Ensure every dimension CTE has a WHERE clause (date filter already selective).
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  date_filtered_sales -> store_item_revenue -> store_avg -> filtered_pairs -> join_store_item -> top_n
+NODE_CONTRACTS:
+  date_filtered_sales:
+    FROM: store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE: d_month_seq BETWEEN 1221 AND 1221+11
+    OUTPUT: ss_store_sk, ss_item_sk, ss_sales_price
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: store_item_revenue
+  store_item_revenue:
+    FROM: date_filtered_sales
+    GROUP BY: ss_store_sk, ss_item_sk
+    AGGREGATE: SUM(ss_sales_price) AS revenue
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: 2.7M
+    CONSUMERS: store_avg, filtered_pairs
+  store_avg:
+    FROM: store_item_revenue
+    GROUP BY: ss_store_sk
+    AGGREGATE: AVG(revenue) AS ave
+    OUTPUT: ss_store_sk, ave
+    EXPECTED_ROWS: 52
+    CONSUMERS: filtered_pairs
+  filtered_pairs:
+    FROM: store_item_revenue JOIN store_avg ON store_item_revenue.ss_store_sk = store_avg.ss_store_sk
+    WHERE: revenue <= 0.1 * ave
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: 243K
+    CONSUMERS: join_store_item
+  join_store_item:
+    FROM: filtered_pairs
+          JOIN store ON filtered_pairs.ss_store_sk = store.s_store_sk
+          JOIN item ON filtered_pairs.ss_item_sk = item.i_item_sk
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: 243K
+    CONSUMERS: top_n
+  top_n:
+    FROM: join_store_item
+    ORDER BY: s_store_name ASC, i_item_desc ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+  single_pass_aggregation: Apply consolidation of two store_sales scans into one CTE (date_filtered_sales) that feeds both aggregates. Ignore the CASE conditional aggregation aspect — we don't need per-channel labeling.
+  channel_bitmap_aggregation: Apply the principle of merging repeated fact scans into a single scan. Ignore the bitmap and channel-specific buckets.
+HAZARD_FLAGS:
+  - Ensure store_avg is computed from store_item_revenue (not directly from fact) to match original AVG over per-item sums.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_filter -> fact_with_date -> store_item_revenue -> store_avg -> filtered_pairs -> join_store_item -> top_n
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1221 AND 1221+11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_with_date
+  fact_with_date:
+    FROM: store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_store_sk, ss_item_sk, ss_sales_price
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: store_item_revenue
+  store_item_revenue:
+    FROM: fact_with_date
+    GROUP BY: ss_store_sk, ss_item_sk
+    AGGREGATE: SUM(ss_sales_price) AS revenue
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: 2.7M
+    CONSUMERS: store_avg, filtered_pairs
+  store_avg:
+    FROM: store_item_revenue
+    GROUP BY: ss_store_sk
+    AGGREGATE: AVG(revenue) AS ave
+    OUTPUT: ss_store_sk, ave
+    EXPECTED_ROWS: 52
+    CONSUMERS: filtered_pairs
+  filtered_pairs:
+    FROM: store_item_revenue JOIN store_avg ON store_item_revenue.ss_store_sk = store_avg.ss_store_sk
+    WHERE: revenue <= 0.1 * ave
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: 243K
+    CONSUMERS: join_store_item
+  join_store_item:
+    FROM: filtered_pairs
+          JOIN store ON filtered_pairs.ss_store_sk = store.s_store_sk
+          JOIN item ON filtered_pairs.ss_item_sk = item.i_item_sk
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: 243K
+    CONSUMERS: top_n
+  top_n:
+    FROM: join_store_item
+    ORDER BY: s_store_name ASC, i_item_desc ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: prefetch_fact_join, date_cte_isolate
+EXAMPLE_ADAPTATION:
+  prefetch_fact_join: Apply the CTE chain: filter date_dim first, pre-join with store_sales, then aggregate. Ignore the multiple dimension pre-filtering (only date is filtered).
+  date_cte_isolate: Extract date filter into a CTE to share across both revenue computations. Ignore the multi-date-range aspect (only one range).
+HAZARD_FLAGS:
+  - The date_filter CTE may be inlined by optimizer; still reduces date_dim scans from 2 to 1.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: deferred_attribute_binding
+TARGET_LOGICAL_TREE:
+  date_filtered_sales -> store_item_revenue -> store_avg -> filtered_pairs -> join_store_item -> top_n
+NODE_CONTRACTS:
+  date_filtered_sales:
+    FROM: store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE: d_month_seq BETWEEN 1221 AND 1221+11
+    OUTPUT: ss_store_sk, ss_item_sk, ss_sales_price
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: store_item_revenue
+  store_item_revenue:
+    FROM: date_filtered_sales
+    GROUP BY: ss_store_sk, ss_item_sk
+    AGGREGATE: SUM(ss_sales_price) AS revenue
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: 2.7M
+    CONSUMERS: store_avg, filtered_pairs
+  store_avg:
+    FROM: store_item_revenue
+    GROUP BY: ss_store_sk
+    AGGREGATE: AVG(revenue) AS ave
+    OUTPUT: ss_store_sk, ave
+    EXPECTED_ROWS: 52
+    CONSUMERS: filtered_pairs
+  filtered_pairs:
+    FROM: store_item_revenue JOIN store_avg ON store_item_revenue.ss_store_sk = store_avg.ss_store_sk
+    WHERE: revenue <= 0.1 * ave
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: 243K
+    CONSUMERS: join_store_item
+  join_store_item:
+    FROM: filtered_pairs
+          JOIN store ON filtered_pairs.ss_store_sk = store.s_store_sk
+          JOIN item ON filtered_pairs.ss_item_sk = item.i_item_sk
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: 243K
+    CONSUMERS: top_n
+  top_n:
+    FROM: join_store_item
+    ORDER BY: s_store_name ASC, i_item_desc ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: dimension_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+  dimension_cte_isolate: Apply the principle of deferring dimension joins until after filtering. Here, store and item are joined only after revenue threshold filter reduces rows from 2.7M to 243K. Ignore the pre-filtering of dimension tables (they have no filters).
+  early_filter: Apply early filtering of fact table via date join, then aggregate, then filter by revenue, then join dimensions. Ignore the dimension-first filtering.
+HAZARD_FLAGS:
+  - The store and item joins are cheap (store 100 rows, item 102K rows). Deferral may have marginal benefit.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: window_function_aggregation
+TARGET_LOGICAL_TREE:
+  date_filter -> fact_with_date -> store_item_revenue_window -> filtered_pairs -> join_store_item -> top_n
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1221 AND 1221+11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_with_date
+  fact_with_date:
+    FROM: store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_store_sk, ss_item_sk, ss_sales_price
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: store_item_revenue_window
+  store_item_revenue_window:
+    FROM: fact_with_date
+    GROUP BY: ss_store_sk, ss_item_sk
+    AGGREGATE: SUM(ss_sales_price) AS revenue,
+               AVG(SUM(ss_sales_price)) OVER (PARTITION BY ss_store_sk) AS ave
+    OUTPUT: ss_store_sk, ss_item_sk, revenue, ave
+    EXPECTED_ROWS: 2.7M
+    CONSUMERS: filtered_pairs
+  filtered_pairs:
+    FROM: store_item_revenue_window
+    WHERE: revenue <= 0.1 * ave
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: 243K
+    CONSUMERS: join_store_item
+  join_store_item:
+    FROM: filtered_pairs
+          JOIN store ON filtered_pairs.ss_store_sk = store.s_store_sk
+          JOIN item ON filtered_pairs.ss_item_sk = item.i_item_sk
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: 243K
+    CONSUMERS: top_n
+  top_n:
+    FROM: join_store_item
+    ORDER BY: s_store_name ASC, i_item_desc ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: deferred_window_aggregation, single_pass_aggregation
+EXAMPLE_ADAPTATION:
+  deferred_window_aggregation: Apply the principle of computing window function (AVG OVER) within the same CTE as the base aggregation, eliminating a separate group by. Ignore the FULL OUTER JOIN and carry-forward window aspects.
+  single_pass_aggregation: Apply consolidation of two group bys into one using window function. Ignore the CASE conditional aggregation.
+HAZARD_FLAGS:
+  - Window function computes AVG over 2.7M rows (partitioned by store_sk). May be more expensive than separate small group by (52 rows).
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: The window function AVG OVER (PARTITION BY ss_store_sk) computes exactly the same store average as the original separate group by, because the partition aligns with the original grouping.
+EXPLORATION_TYPE: novel_combination (combining date_cte_isolate with window function to eliminate a group by and join)

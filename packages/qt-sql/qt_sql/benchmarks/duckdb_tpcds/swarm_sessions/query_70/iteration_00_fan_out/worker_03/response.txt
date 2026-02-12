@@ -1,0 +1,109 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K — Restructured into CTE pipeline following Target Logical Tree
+    ├── [+] CTE filtered_dates  — Pre-filter date_dim for month sequence 1213-1224
+    │   ├── SCAN (date_dim)
+    │   └── FILTER (d_month_seq BETWEEN 1213 AND 1224)
+    ├── [+] CTE filtered_stores  — Pre-filter store for s_store_sk <= 100
+    │   ├── SCAN (store)
+    │   └── FILTER (s_store_sk <= 100)
+    ├── [+] CTE prefetched_fact  — Join fact with pre-filtered dimensions
+    │   ├── SCAN (store_sales)
+    │   ├── JOIN (INNER) filtered_dates ON ss_sold_date_sk = d_date_sk
+    │   └── JOIN (INNER) filtered_stores ON ss_store_sk = s_store_sk
+    ├── [+] CTE state_agg  — Aggregate by state with ranking
+    │   ├── SCAN (prefetched_fact)
+    │   ├── AGG (GROUP BY s_state)
+    │   └── WINDOW (RANK() OVER (ORDER BY SUM(ss_net_profit) DESC))
+    ├── [+] CTE county_agg  — Filter to top-5 states, aggregate by county
+    │   ├── SCAN (prefetched_fact)
+    │   ├── JOIN (INNER) state_agg ON s_state = state_agg.s_state
+    │   ├── FILTER (state_agg.ranking <= 5)
+    │   └── AGG (GROUP BY s_state, s_county)
+    ├── [+] CTE rollup_combined  — Apply ROLLUP on county aggregates
+    │   ├── SCAN (county_agg)
+    │   └── AGG (GROUP BY ROLLUP(s_state, s_county))
+    ├── [+] CTE windowed  — Compute final ranking within hierarchy levels
+    │   ├── SCAN (rollup_combined)
+    │   └── WINDOW (RANK() OVER (PARTITION BY ...))
+    └── OUTPUT (total_sum, s_state, s_county, lochierarchy, rank_within_parent) — Same columns, order preserved
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "staged_join_pipeline", "description": "Pre-filter dimensions into CTEs, then join with fact table in separate CTE to reduce early scan size", "applied_to": ["filtered_dates", "filtered_stores", "prefetched_fact"]},
+    {"id": "R2", "type": "materialize_subquery_as_cte", "description": "Convert top-5 state subquery into explicit CTE with ranking, enabling reuse in county aggregation", "applied_to": ["state_agg"]},
+    {"id": "R3", "type": "rollup_base_reduction", "description": "Perform ROLLUP on pre-aggregated county-level sums to avoid double-counting from original per-row rollup", "applied_to": ["rollup_combined"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1213 AND 1224",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_stores": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_store_sk, s_state, s_county FROM store WHERE s_store_sk <= 100",
+        "interfaces": {"outputs": ["s_store_sk", "s_state", "s_county"], "consumes": []}
+      },
+      "prefetched_fact": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_net_profit, filtered_stores.s_state, filtered_stores.s_county FROM store_sales INNER JOIN filtered_dates ON ss_sold_date_sk = filtered_dates.d_date_sk INNER JOIN filtered_stores ON ss_store_sk = filtered_stores.s_store_sk",
+        "interfaces": {"outputs": ["ss_net_profit", "s_state", "s_county"], "consumes": ["filtered_dates", "filtered_stores"]}
+      },
+      "state_agg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_state, SUM(ss_net_profit) AS state_sum, RANK() OVER (ORDER BY SUM(ss_net_profit) DESC) AS ranking FROM prefetched_fact GROUP BY s_state",
+        "interfaces": {"outputs": ["s_state", "state_sum", "ranking"], "consumes": ["prefetched_fact"]}
+      },
+      "county_agg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT prefetched_fact.s_state, prefetched_fact.s_county, SUM(ss_net_profit) AS county_sum FROM prefetched_fact INNER JOIN state_agg ON prefetched_fact.s_state = state_agg.s_state WHERE state_agg.ranking <= 5 GROUP BY prefetched_fact.s_state, prefetched_fact.s_county",
+        "interfaces": {"outputs": ["s_state", "s_county", "county_sum"], "consumes": ["prefetched_fact", "state_agg"]}
+      },
+      "rollup_combined": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT SUM(county_sum) AS total_sum, s_state, s_county, GROUPING(s_state) + GROUPING(s_county) AS lochierarchy FROM county_agg GROUP BY ROLLUP(s_state, s_county)",
+        "interfaces": {"outputs": ["total_sum", "s_state", "s_county", "lochierarchy"], "consumes": ["county_agg"]}
+      },
+      "windowed": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT total_sum, s_state, s_county, lochierarchy, RANK() OVER (PARTITION BY lochierarchy, CASE WHEN GROUPING(s_county) = 0 THEN s_state END ORDER BY total_sum DESC) AS rank_within_parent FROM rollup_combined",
+        "interfaces": {"outputs": ["total_sum", "s_state", "s_county", "lochierarchy", "rank_within_parent"], "consumes": ["rollup_combined"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT total_sum, s_state, s_county, lochierarchy, rank_within_parent FROM windowed ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN s_state END, rank_within_parent LIMIT 100",
+        "interfaces": {"outputs": ["total_sum", "s_state", "s_county", "lochierarchy", "rank_within_parent"], "consumes": ["windowed"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_stores", "prefetched_fact", "state_agg", "county_agg", "rollup_combined", "windowed", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), filtered_stores AS ({filtered_stores}), prefetched_fact AS ({prefetched_fact}), state_agg AS ({state_agg}), county_agg AS ({county_agg}), rollup_combined AS ({rollup_combined}), windowed AS ({windowed}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Converted the original single-block query with correlated subquery into a staged CTE pipeline that pre-filters dimensions, materializes the top‑5 state ranking, and performs rollup on pre‑aggregated county sums. This eliminates redundant scans of store_sales and allows predicate pushdown into early CTEs.
+
+**Expected speedup**: 2‑3× (based on similar patterns: multi‑dimension prefetch ~2.7×, staged join pipeline ~3.8×). The main gain comes from scanning store_sales only once instead of twice (original subquery + main query) and reducing the fact table early with selective dimension filters.

@@ -1,0 +1,291 @@
+<reasoning>
+CLASSIFY:
+This is a star-join aggregation query with selective dimension filters (date, item category, customer birth month, address state, store zip mismatch, wholesale cost range). All joins are INNER (equality), and the query aggregates sales by brand/manufacturer after filtering. No correlated subqueries, no UNION ALL, no self-joins, no window functions.
+
+EXPLAIN PLAN ANALYSIS:
+Total execution: 544.4 ms. Key nodes:
+1. Nested Loop Inner with Join Filter (zip substring inequality): 182.7ms (33.6% of total) - this is the top-level join combining filtered customer_address and store.
+2. Nested Loop Inner (customer join): 179.7ms (33.0%) - joins filtered customer to the fact chain.
+3. Hash Join (store_sales + store): 62.0ms (11.4%) - fact-store join.
+4. Index Only Scan on store_sales with Filter (ss_wholesale_cost): 5.5ms per loop × 28 loops = ~154ms total (28.3%) - fact table scan with cost filter removes ~85% of rows (4,465 kept vs 25K removed per loop).
+
+Cardinality flow:
+- date_dim: 9 rows → store_sales: 4,465 rows (after date join and wholesale cost filter) → store: 102 rows → item: ~0.1 rows (after category filter) → customer: ~0.1 rows (after birth month filter) → customer_address: ~0.1 rows (after state filter).
+- The zip substring inequality is applied last on ~433 rows (per worker) and filters further.
+
+Bottlenecks:
+- The wholesale cost filter on store_sales removes 85% of rows but is applied during the index scan (efficient).
+- Multiple nested loops with low selectivity filters (item category, customer birth month, address state) cause many index lookups (13167, 1299 loops) but each is fast (0.0ms).
+- The zip substring inequality is a join filter (not pushed to base tables) and requires computing substring on both sides for each row pair.
+
+Optimizer already handles:
+- Predicate pushdown: All dimension filters (date, item category, customer birth month, address state) are pushed to index scans.
+- Join reordering: The plan joins date→store_sales→store→item→customer→address (fact-first, dimensions later).
+- Parallel aggregation and sorting.
+
+GAP MATCHING:
+1. COMMA_JOIN_WEAKNESS: Query uses comma-separated implicit joins (FROM a,b,c). The optimizer reorders but may have estimation issues. Matches pg_dimension_prefetch_star and pg_date_cte_explicit_join patterns.
+2. NON_EQUI_JOIN_INPUT_BLINDNESS: The zip substring inequality is a non-equi join filter applied late. Could benefit from reducing both sides (customer_address and store) early via MATERIALIZED CTEs (pg_materialized_dimension_fact_prefilter pattern).
+3. No correlated subqueries, so CORRELATED_SUBQUERY_PARALYSIS doesn't apply.
+4. No repeated fact scans, so CROSS_CTE_PREDICATE_BLINDNESS doesn't apply.
+
+AGGREGATION TRAP CHECK:
+Aggregate is SUM(ss_ext_sales_price). SUM is duplicate-insensitive (if joins cause duplication, result changes). All joins are on foreign keys (one-to-many from fact to dimensions) - each store_sales row joins to exactly one row in each dimension (assuming referential integrity). So no duplication risk.
+
+TRANSFORM SELECTION:
+1. star_join_prefetch (COMMA_JOIN_WEAKNESS): Pre-filter all dimensions into CTEs, convert to explicit JOINs. Example: pg_dimension_prefetch_star.
+2. late_attribute_binding (JOIN restructuring): Defer store and customer_address joins (which are only used for zip inequality and state filter) until after aggregating fact+essential dimensions. Example: dimension_cte_isolate (partial).
+3. predicate_pushdown_consolidation (Predicate Movement): Push zip substring condition earlier by pre-computing substrings in CTEs and joining on inequality before main join. Novel combination.
+4. EXPLORATION: Pre-join customer_address and store on zip inequality in a CTE, then join to filtered fact chain. Tests early reduction of non-equi join.
+
+LOGICAL TREE DESIGN:
+For each strategy, define CTEs/materialized subqueries to reduce row flow early. Ensure column completeness.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Business: Sum sales of shoe items in February 1999 for Kansas customers born in February where customer and store zip codes differ, grouped by brand/manufacturer. Joins are all INNER (equality) requiring matches across all six tables. Aggregation uses SUM which is sensitive to row duplication from joins, but foreign-key joins preserve one-to-one mapping. The zip substring inequality filter depends on both customer_address and store tables and must be preserved.
+
+BOTTLENECK_DIAGNOSIS:
+Dominant cost is nested loop joins with late non-equi filter (zip substring inequality) consuming ~34% of time, followed by fact table scan with wholesale cost filter (~28%). The plan is join-bound due to many nested loops (13167, 1299 loops) despite fast index lookups. Cardinality drops sharply at date (9 rows) and wholesale cost filter (4,465 rows per loop), but dimension filters (item category, customer birth month, address state) have low selectivity (0.1 rows per loop). Optimizer already pushes predicates to index scans and uses parallel aggregation effectively. Logical-tree cost percentages misleading as nested loop overhead dominates.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output i_brand_id, i_brand, i_manufact_id, i_manufact, ext_price.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (e.g., join keys, group-by columns, aggregates).
+- LITERAL_PRESERVATION: Must preserve literal values: 'Shoes', 1999, 2, 'KS', 76, 96.
+- SEMANTIC_EQUIVALENCE: Must return same rows and ordering (ext_price desc, then brand, brand_id, manufact_id, manufact).
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated implicit joins (FROM a,b,c) - EXPLAIN shows optimizer reordered joins but explicit JOINs may improve estimation.
+- NON_EQUI_JOIN_INPUT_BLINDNESS: Zip substring inequality applied as join filter after most joins - opportunity to reduce both sides early.
+
+REGRESSION_WARNINGS:
+None applicable.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch_explicit_joins
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_item -> filtered_customer -> filtered_store -> filtered_address -> fact_prejoin -> final_aggregation
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy = 2
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 9
+    CONSUMERS: fact_prejoin
+  filtered_item:
+    FROM: item
+    WHERE: i_category = 'Shoes'
+    OUTPUT: i_item_sk, i_brand_id, i_brand, i_manufact_id, i_manufact
+    EXPECTED_ROWS: ~0.1 per loop (small)
+    CONSUMERS: fact_prejoin
+  filtered_customer:
+    FROM: customer
+    WHERE: c_birth_month = 2
+    OUTPUT: c_customer_sk, c_current_addr_sk
+    EXPECTED_ROWS: ~0.1 per loop (small)
+    CONSUMERS: fact_prejoin
+  filtered_store:
+    FROM: store
+    OUTPUT: s_store_sk, s_zip
+    EXPECTED_ROWS: 102
+    CONSUMERS: fact_prejoin, filtered_address (for zip)
+  filtered_address:
+    FROM: customer_address
+    WHERE: ca_state = 'KS'
+    OUTPUT: ca_address_sk, ca_zip
+    EXPECTED_ROWS: ~0.1 per loop (small)
+    CONSUMERS: fact_prejoin
+  fact_prejoin:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+           INNER JOIN filtered_item ON ss_item_sk = i_item_sk
+           INNER JOIN filtered_customer ON ss_customer_sk = c_customer_sk
+           INNER JOIN filtered_store ON ss_store_sk = s_store_sk
+           INNER JOIN filtered_address ON c_current_addr_sk = ca_address_sk
+    WHERE: ss_wholesale_cost BETWEEN 76 AND 96
+           AND substring(ca_zip,1,5) <> substring(s_zip,1,5)
+    OUTPUT: i_brand_id, i_brand, i_manufact_id, i_manufact, ss_ext_sales_price
+    EXPECTED_ROWS: ~12 per worker (aggregated to 31 total)
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: fact_prejoin
+    GROUP BY: i_brand, i_brand_id, i_manufact_id, i_manufact
+    AGGREGATE: SUM(ss_ext_sales_price) AS ext_price
+    ORDER BY: ext_price DESC, i_brand, i_brand_id, i_manufact_id, i_manufact
+    LIMIT: 100
+    OUTPUT: i_brand_id, i_brand, i_manufact_id, i_manufact, ext_price
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+pg_dimension_prefetch_star: Apply pre-filtering all dimensions (date, item, customer, address, store) into separate CTEs, then explicit JOINs. Ignore the UNION aspect (not needed).
+pg_date_cte_explicit_join: Apply date CTE isolation and explicit JOIN syntax. Ignore that example only does date_dim - we extend to all dimensions.
+early_filter_decorrelate: Apply early filtering of dimensions into CTEs before main join. Ignore decorrelation (no subqueries).
+HAZARD_FLAGS:
+- Multiple CTEs may be inlined by optimizer unless MATERIALIZED is used, potentially losing materialization benefit.
+- Explicit JOIN order may differ from optimizer's chosen order; may need to force order via join_collapse_limit=1.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: late_attribute_binding_defer_zip
+TARGET_LOGICAL_TREE:
+  filtered_fact -> early_aggregation -> late_zip_join -> final_output
+NODE_CONTRACTS:
+  filtered_fact:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 2
+           INNER JOIN item ON ss_item_sk = i_item_sk AND i_category = 'Shoes'
+           INNER JOIN customer ON ss_customer_sk = c_customer_sk AND c_birth_month = 2
+    WHERE: ss_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: ss_ext_sales_price, i_brand_id, i_brand, i_manufact_id, i_manufact, c_current_addr_sk, ss_store_sk
+    EXPECTED_ROWS: ~12 per worker (after aggregation)
+    CONSUMERS: early_aggregation
+  early_aggregation:
+    FROM: filtered_fact
+    GROUP BY: i_brand_id, i_brand, i_manufact_id, i_manufact, c_current_addr_sk, ss_store_sk
+    AGGREGATE: SUM(ss_ext_sales_price) AS ext_price
+    OUTPUT: i_brand_id, i_brand, i_manufact_id, i_manufact, ext_price, c_current_addr_sk, ss_store_sk
+    EXPECTED_ROWS: ~12 per worker (same as input due to group by added columns)
+    CONSUMERS: late_zip_join
+  late_zip_join:
+    FROM: early_aggregation AS agg
+    JOIN: INNER JOIN customer_address ON agg.c_current_addr_sk = ca_address_sk AND ca_state = 'KS'
+           INNER JOIN store ON agg.ss_store_sk = s_store_sk
+    WHERE: substring(ca_zip,1,5) <> substring(s_zip,1,5)
+    OUTPUT: i_brand_id, i_brand, i_manufact_id, i_manufact, ext_price
+    EXPECTED_ROWS: ≤12 per worker
+    CONSUMERS: final_output
+  final_output:
+    FROM: late_zip_join
+    GROUP BY: i_brand, i_brand_id, i_manufact_id, i_manufact
+    AGGREGATE: SUM(ext_price) AS ext_price  -- re-aggregate if zip join caused duplication (should not)
+    ORDER BY: ext_price DESC, i_brand, i_brand_id, i_manufact_id, i_manufact
+    LIMIT: 100
+    OUTPUT: i_brand_id, i_brand, i_manufact_id, i_manufact, ext_price
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: output
+EXAMPLES: dimension_cte_isolate, early_filter_decorrelate, pg_self_join_decomposition
+EXAMPLE_ADAPTATION:
+dimension_cte_isolate: Apply filtering dimensions early (date, item, customer) and join with fact before less selective dimensions (address, store). Ignore the CTE materialization aspect.
+early_filter_decorrelate: Push filters into joins early. Ignore decorrelation.
+pg_self_join_decomposition: Use aggregation before expensive join (like aggregating fact before self-join). Ignore self-join aspect.
+HAZARD_FLAGS:
+- Adding c_current_addr_sk and ss_store_sk to GROUP BY may increase group count (but they are needed for later join).
+- The late zip join could duplicate rows if multiple address/store pairs match, but foreign keys should prevent this.
+- Must re-aggregate after zip join if duplication occurs.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: predicate_pushdown_zip_early
+TARGET_LOGICAL_TREE:
+  filtered_store_zip -> filtered_address_zip -> precomputed_zip_pairs -> filtered_fact -> joined_fact -> aggregation
+NODE_CONTRACTS:
+  filtered_store_zip:
+    FROM: store
+    OUTPUT: s_store_sk, s_zip, substring(s_zip,1,5) AS s_zip_prefix
+    EXPECTED_ROWS: 102
+    CONSUMERS: precomputed_zip_pairs
+  filtered_address_zip:
+    FROM: customer_address
+    WHERE: ca_state = 'KS'
+    OUTPUT: ca_address_sk, ca_zip, substring(ca_zip,1,5) AS ca_zip_prefix
+    EXPECTED_ROWS: ~0.1 per loop (small)
+    CONSUMERS: precomputed_zip_pairs
+  precomputed_zip_pairs:
+    FROM: filtered_store_zip AS s, filtered_address_zip AS a
+    WHERE: s.s_zip_prefix <> a.ca_zip_prefix
+    OUTPUT: s.s_store_sk, a.ca_address_sk
+    EXPECTED_ROWS: ~433 per worker (as in EXPLAIN)
+    CONSUMERS: joined_fact
+  filtered_fact:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 2
+           INNER JOIN item ON ss_item_sk = i_item_sk AND i_category = 'Shoes'
+           INNER JOIN customer ON ss_customer_sk = c_customer_sk AND c_birth_month = 2
+    WHERE: ss_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: ss_ext_sales_price, i_brand_id, i_brand, i_manufact_id, i_manufact, c_current_addr_sk, ss_store_sk
+    EXPECTED_ROWS: ~12 per worker (after aggregation)
+    CONSUMERS: joined_fact
+  joined_fact:
+    FROM: filtered_fact AS f
+    JOIN: INNER JOIN precomputed_zip_pairs AS z ON f.ss_store_sk = z.s_store_sk AND f.c_current_addr_sk = z.ca_address_sk
+    OUTPUT: i_brand_id, i_brand, i_manufact_id, i_manufact, ss_ext_sales_price
+    EXPECTED_ROWS: ~12 per worker
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: joined_fact
+    GROUP BY: i_brand, i_brand_id, i_manufact_id, i_manufact
+    AGGREGATE: SUM(ss_ext_sales_price) AS ext_price
+    ORDER BY: ext_price DESC, i_brand, i_brand_id, i_manufact_id, i_manufact
+    LIMIT: 100
+    OUTPUT: i_brand_id, i_brand, i_manufact_id, i_manufact, ext_price
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: output
+EXAMPLES: pg_materialized_dimension_fact_prefilter, early_filter_decorrelate, pg_dimension_prefetch_star
+EXAMPLE_ADAPTATION:
+pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED CTEs for store and address to precompute zip inequality pairs before joining to fact. Ignore the fact table prefiltering (we filter fact separately).
+early_filter_decorrelate: Pre-compute zip prefixes in CTEs. Ignore decorrelation.
+pg_dimension_prefetch_star: Pre-filter dimensions (date, item, customer) into joins. Ignore the explicit JOIN aspect (we use it).
+HAZARD_FLAGS:
+- Precomputing zip pairs via cross join then inequality could produce large intermediate result (102 * ~0.1 = ~10 rows, small).
+- Must ensure substring computed once per row, not repeatedly.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: early_non_equi_join_reduction
+TARGET_LOGICAL_TREE:
+  filtered_store -> filtered_address -> zip_mismatch_pairs -> filtered_fact_chain -> join_with_pairs -> aggregation
+NODE_CONTRACTS:
+  filtered_store:
+    FROM: store
+    OUTPUT: s_store_sk, s_zip
+    EXPECTED_ROWS: 102
+    CONSUMERS: zip_mismatch_pairs
+  filtered_address:
+    FROM: customer_address
+    WHERE: ca_state = 'KS'
+    OUTPUT: ca_address_sk, ca_zip
+    EXPECTED_ROWS: ~0.1 per loop (small)
+    CONSUMERS: zip_mismatch_pairs
+  zip_mismatch_pairs:
+    FROM: filtered_store AS s, filtered_address AS a
+    WHERE: substring(s.s_zip,1,5) <> substring(a.ca_zip,1,5)
+    OUTPUT: s.s_store_sk, a.ca_address_sk
+    EXPECTED_ROWS: ~433 per worker
+    CONSUMERS: join_with_pairs
+  filtered_fact_chain:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 2
+           INNER JOIN item ON ss_item_sk = i_item_sk AND i_category = 'Shoes'
+           INNER JOIN customer ON ss_customer_sk = c_customer_sk AND c_birth_month = 2
+    WHERE: ss_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: ss_ext_sales_price, i_brand_id, i_brand, i_manufact_id, i_manufact, c_current_addr_sk, ss_store_sk
+    EXPECTED_ROWS: ~12 per worker
+    CONSUMERS: join_with_pairs
+  join_with_pairs:
+    FROM: filtered_fact_chain AS f
+    JOIN: INNER JOIN zip_mismatch_pairs AS z ON f.ss_store_sk = z.s_store_sk AND f.c_current_addr_sk = z.ca_address_sk
+    OUTPUT: i_brand_id, i_brand, i_manufact_id, i_manufact, ss_ext_sales_price
+    EXPECTED_ROWS: ~12 per worker
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: join_with_pairs
+    GROUP BY: i_brand, i_brand_id, i_manufact_id, i_manufact
+    AGGREGATE: SUM(ss_ext_sales_price) AS ext_price
+    ORDER BY: ext_price DESC, i_brand, i_brand_id, i_manufact_id, i_manufact
+    LIMIT: 100
+    OUTPUT: i_brand_id, i_brand, i_manufact_id, i_manufact, ext_price
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: output
+EXAMPLES: pg_materialized_dimension_fact_prefilter, inline_decorrelate_materialized, pg_dimension_prefetch_star
+EXAMPLE_ADAPTATION:
+pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED to zip_mismatch_pairs CTE to force early computation of non-equi join. Ignore fact table prefiltering.
+inline_decorrelate_materialized: Use MATERIALIZED CTE for zip mismatch pairs to prevent inlining and ensure early reduction. Ignore decorrelation.
+pg_dimension_prefetch_star: Pre-filter date, item, customer in filtered_fact_chain. Ignore explicit JOINs for store/address.
+HAZARD_FLAGS:
+- The zip_mismatch_pairs CTE is a cross join with inequality; could be large but estimates are small.
+- Must ensure join between filtered_fact_chain and zip_mismatch_pairs is efficient (hash join possible).
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (combining early non-equi join reduction with star-join prefetching)

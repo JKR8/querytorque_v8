@@ -1,0 +1,332 @@
+<reasoning>
+1. **CLASSIFY**: This is a multi-channel UNION ALL query with three independent CTEs (store, catalog, web) that share identical dimension filters (date, item, promotion). Each CTE left-joins a sales fact table with a returns fact table, then inner-joins with dimensions. The main query unions the CTEs and does a rollup aggregation. Structural archetype: multi-channel UNION ALL with shared dimension filters.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total time: 1551ms.
+   - Biggest costs: Left joins between sales and returns tables:
+        - store_sales left join store_returns: 568.8ms (37% of total)
+        - catalog_sales left join catalog_returns: 176.2ms (11%)
+        - web_sales left join web_returns: 117.4ms (8%)
+   - Fact table scans:
+        - store_sales: 592K rows (from 345.6M), scan time 395.7ms
+        - catalog_sales: 318K rows, scan time 8.0ms
+        - web_sales: 158K rows, scan time 100.0ms
+   - Dimension tables are small after filtering:
+        - date_dim: 31 rows each scan, ~1ms each
+        - item: 5,691 rows, ~0.5ms each
+        - promotion: 492 rows, negligible
+   - Row count drops sharply after date join (e.g., store_sales 592K -> after date join 583K, then after promotion join 583K, then after item join 32K, then after store join 32K). The biggest drop is after item join (583K to 32K for store channel). However, the left join happens BEFORE the item join, meaning the left join processes 592K sales rows and 2.9M returns rows, then later the item filter reduces to 32K. This is a missed opportunity: if we filter sales by item (and other dimensions) before the left join, the left join would be much smaller.
+   - The optimizer does NOT push dimension filters before the left join. The left join is performed on the raw sales scan (only limited by the partial scan of store_sales, which is a small fraction but still 592K rows) and then filtered. This is the primary bottleneck.
+   - Each fact table is scanned once per channel (total 3 scans). The dimension tables are scanned three times each (date_dim, item, promotion each scanned three times). This is redundant because the filters are identical across channels.
+   - The CTEs are not materialized and shared; each is computed independently (the EXPLAIN shows three separate subplans under the UNION). The optimizer does not common-subexpression-eliminate the repeated dimension scans.
+
+3. **GAP MATCHING**:
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: Predicates are not pushed across CTE boundaries, and each CTE repeats the same dimension scans. Opportunity: pre-filter dimensions into shared CTEs.
+   - **REDUNDANT_SCAN_ELIMINATION**: Each channel CTE scans the same dimension tables (date_dim, item, promotion) independently. Opportunity: consolidate into single scans.
+   - **ENGINE STRENGTHS**: DuckDB already does intra-scan predicate pushdown, but here the predicates are applied after joins. The optimizer does not reorder joins to push filters before the left join (likely due to the left join's two-key condition and the fact that returns are not directly filterable by dimensions). This is a gap.
+
+4. **AGGREGATION TRAP CHECK**: The aggregates are SUM and subtraction of SUMs. No STDDEV_SAMP, VARIANCE, etc. The left join introduces NULLs for non-returned sales, handled by COALESCE. If we change the join order or aggregation level, we must preserve the same NULL handling. Aggregating sales and returns separately and then joining at the aggregate level is safe because SUM is duplicate-insensitive and the left join at aggregate level preserves the same semantics (returns may be NULL for a store with no returns). However, we must ensure the same grouping (store_id, catalog_page_id, web_site_id) and that all filters are applied correctly.
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   a. **shared_dimension_multi_channel** (example: Q80, 1.30x) – directly matches this query's structure. Extract shared date, item, promotion filters into CTEs, reuse across channels.
+   b. **star_join_prefetch** (combining dimension_cte_isolate + prefetch_fact_join) – pre-filter all dimensions for each channel, then join with sales before left join with returns. This attacks the left-join bottleneck by reducing sales rows before the left join.
+   c. **single_pass_aggregation** (not directly applicable because three different fact tables) but a variant: consolidate the three channel CTEs into a single CTE that unions the three fact tables with a channel discriminator and then joins with shared dimensions? However, the channel-specific dimensions (store, catalog_page, web_site) are different, making a single join complex. Instead, we can assign a **scan_consolidation_pivot** strategy that uses shared dimensions and then processes each channel in a single pass via UNION ALL, but still with separate joins. Actually, we can create a single CTE that does all the work: shared dimensions, then three lateral joins for each channel? That's too complex. Better: assign a **union_consolidation** strategy that shares dimension lookups across the UNION ALL branches.
+   d. **early_filter** – push dimension filters as early as possible into each channel CTE, possibly by restructuring the join order to filter sales before the left join.
+
+   Given the need for structural diversity, we select:
+   1. Worker 1: shared_dimension_multi_channel
+   2. Worker 2: star_join_prefetch (dimension_cte_isolate + prefetch_fact_join per channel)
+   3. Worker 3: early_filter (push filters before left join via subqueries, no CTEs)
+   4. Worker 4 (exploration): compound strategy: shared dimensions + aggregate pushdown (aggregate sales and returns separately before joining) – this is novel for this query pattern and may reduce left join cost by aggregating before the join.
+
+6. **LOGICAL TREE DESIGN**:
+   - Worker 1: Create shared CTEs for date, item, promotion. Then for each channel, join sales with shared dimensions and channel-specific dimension, then left join returns, then aggregate.
+   - Worker 2: For each channel, create CTEs for filtered date, item, promotion, and channel-specific dimension. Then join sales with these filtered dimensions, then left join returns, then aggregate.
+   - Worker 3: No CTEs. Use subqueries to filter dimensions and join directly, ensuring the dimension filters are applied before the left join.
+   - Worker 4: Create shared CTEs for filtered dimensions. Then for each channel, compute aggregated sales (with dimensions) and aggregated returns (with dimensions) separately, then left join the aggregates at the store/catalog_page/web_site level.
+
+   Column completeness: Each CTE must output all columns needed downstream: surrogate keys for joins, and the aggregated columns.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+For a 30-day window from 1998-08-28 with non-TV promotions and items priced above 50, summarize sales, returns, and profit by store, catalog page, and web site with rollup totals. All joins are INNER except the left outer join between sales and returns (preserve all sales even without returns). Aggregates are SUM and COALESCE to handle NULL returns; profit is computed as ss_net_profit - COALESCE(sr_net_loss,0). Filters on date, item price, and promotion channel must be applied to sales before matching returns; returns are indirectly filtered via the sales they correspond to.
+
+BOTTLENECK_DIAGNOSIS:
+Dominant cost is the left join between large sales and returns fact tables (37% for store channel) because dimension filters (item, promotion, date) are applied AFTER the left join, causing the join to process 592K sales rows and 2.9M returns rows before filtering. The query is scan-bound and join-bound on the left join. Row counts drop sharply after item join (583K to 32K), indicating early filtering would reduce left join input by 20x. The optimizer already pushes filters into dimension scans but does not reorder joins to push filters before the left join. Logical-tree cost percentages are misleading; actual time is in the left joins.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output channel, id, sales, returns, profit in same order and with same aliases.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced by downstream joins, aggregates, and output.
+- LITERAL_PRESERVATION: Must preserve date '1998-08-28', interval 30 DAY, price > 50, p_channel_tv = 'N'.
+- SEMANTIC_EQUIVALENCE: Result set must match exactly.
+- CROSS_CTE_PREDICATE_BLINDNESS: Each channel CTE repeats identical dimension scans (date_dim, item, promotion) with same filters, not shared.
+- REDUNDANT_SCAN_ELIMINATION: date_dim, item, promotion scanned three times each; fact tables scanned once per channel but left join is oversized.
+
+REGRESSION_WARNINGS:
+1. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Pre-filtered and joined store_sales to date CTE before 3-way fact table join, preventing optimizer reordering.
+   RULE: Do not pre-join fact tables with dimensions when multiple fact tables are joined together; this query has no fact-to-fact joins.
+2. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially with fact table.
+3. materialize_cte (0.14x on Q16):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan.
+   RULE: This query has no EXISTS; safe to materialize dimension CTEs.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: shared_dimension_multi_channel
+TARGET_LOGICAL_TREE:
+  date_filter -> item_filter -> promo_filter -> 
+  (ssr_channel, csr_channel, wsr_channel) -> main_query
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: ssr_channel, csr_channel, wsr_channel
+  item_filter:
+    FROM: item
+    WHERE: i_current_price > 50
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: 5,691
+    CONSUMERS: ssr_channel, csr_channel, wsr_channel
+  promo_filter:
+    FROM: promotion
+    WHERE: p_channel_tv = 'N'
+    OUTPUT: p_promo_sk
+    EXPECTED_ROWS: 492
+    CONSUMERS: ssr_channel, csr_channel, wsr_channel
+  ssr_channel:
+    FROM: store_sales
+         LEFT JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number)
+         INNER JOIN date_filter ON ss_sold_date_sk = d_date_sk
+         INNER JOIN store ON ss_store_sk = s_store_sk
+         INNER JOIN item_filter ON ss_item_sk = i_item_sk
+         INNER JOIN promo_filter ON ss_promo_sk = p_promo_sk
+    GROUP BY: s_store_id
+    AGGREGATE: SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS "returns", SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit
+    OUTPUT: store_id (s_store_id), sales, "returns", profit
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  csr_channel:
+    FROM: catalog_sales
+         LEFT JOIN catalog_returns ON (cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number)
+         INNER JOIN date_filter ON cs_sold_date_sk = d_date_sk
+         INNER JOIN catalog_page ON cs_catalog_page_sk = cp_catalog_page_sk
+         INNER JOIN item_filter ON cs_item_sk = i_item_sk
+         INNER JOIN promo_filter ON cs_promo_sk = p_promo_sk
+    GROUP BY: cp_catalog_page_id
+    AGGREGATE: SUM(cs_ext_sales_price) AS sales, SUM(COALESCE(cr_return_amount, 0)) AS "returns", SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit
+    OUTPUT: catalog_page_id (cp_catalog_page_id), sales, "returns", profit
+    EXPECTED_ROWS: 444
+    CONSUMERS: main_query
+  wsr_channel:
+    FROM: web_sales
+         LEFT JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number)
+         INNER JOIN date_filter ON ws_sold_date_sk = d_date_sk
+         INNER JOIN web_site ON ws_web_site_sk = web_site_sk
+         INNER JOIN item_filter ON ws_item_sk = i_item_sk
+         INNER JOIN promo_filter ON ws_promo_sk = p_promo_sk
+    GROUP BY: web_site_id
+    AGGREGATE: SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS "returns", SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit
+    OUTPUT: web_site_id, sales, "returns", profit
+    EXPECTED_ROWS: 21
+    CONSUMERS: main_query
+  main_query:
+    FROM: (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, "returns", profit FROM ssr_channel
+           UNION ALL
+           SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, "returns", profit FROM csr_channel
+           UNION ALL
+           SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, "returns", profit FROM wsr_channel) x
+    GROUP BY: ROLLUP(channel, id)
+    OUTPUT: channel, id, SUM(sales) AS sales, SUM("returns") AS "returns", SUM(profit) AS profit
+    ORDER BY: channel, id
+    LIMIT: 100
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+Apply the shared dimension CTE pattern exactly: create CTEs for date, item, promotion with the same filters and join them into each channel CTE. Ignore the decorrelation aspect — this query has no correlated subqueries.
+HAZARD_FLAGS:
+- Must ensure date_filter, item_filter, promo_filter are referenced only once per channel CTE to avoid materialization overhead.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  (ssr_prefiltered, csr_prefiltered, wsr_prefiltered) -> main_query
+NODE_CONTRACTS:
+  ssr_prefiltered:
+    FROM: (SELECT ss_item_sk, ss_ticket_number, ss_store_sk, ss_ext_sales_price, ss_net_profit
+           FROM store_sales
+           WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY))
+             AND ss_item_sk IN (SELECT i_item_sk FROM item WHERE i_current_price > 50)
+             AND ss_promo_sk IN (SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N')) ss
+         LEFT JOIN store_returns sr ON (ss.ss_item_sk = sr.sr_item_sk AND ss.ss_ticket_number = sr.sr_ticket_number)
+         INNER JOIN store ON ss.ss_store_sk = s_store_sk
+    GROUP BY: s_store_id
+    AGGREGATE: SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS "returns", SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit
+    OUTPUT: store_id (s_store_id), sales, "returns", profit
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  csr_prefiltered:
+    FROM: (SELECT cs_item_sk, cs_order_number, cs_catalog_page_sk, cs_ext_sales_price, cs_net_profit
+           FROM catalog_sales
+           WHERE cs_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY))
+             AND cs_item_sk IN (SELECT i_item_sk FROM item WHERE i_current_price > 50)
+             AND cs_promo_sk IN (SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N')) cs
+         LEFT JOIN catalog_returns cr ON (cs.cs_item_sk = cr.cr_item_sk AND cs.cs_order_number = cr.cr_order_number)
+         INNER JOIN catalog_page ON cs.cs_catalog_page_sk = cp_catalog_page_sk
+    GROUP BY: cp_catalog_page_id
+    AGGREGATE: SUM(cs_ext_sales_price) AS sales, SUM(COALESCE(cr_return_amount, 0)) AS "returns", SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit
+    OUTPUT: catalog_page_id (cp_catalog_page_id), sales, "returns", profit
+    EXPECTED_ROWS: 444
+    CONSUMERS: main_query
+  wsr_prefiltered:
+    FROM: (SELECT ws_item_sk, ws_order_number, ws_web_site_sk, ws_ext_sales_price, ws_net_profit
+           FROM web_sales
+           WHERE ws_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY))
+             AND ws_item_sk IN (SELECT i_item_sk FROM item WHERE i_current_price > 50)
+             AND ws_promo_sk IN (SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N')) ws
+         LEFT JOIN web_returns wr ON (ws.ws_item_sk = wr.wr_item_sk AND ws.ws_order_number = wr.wr_order_number)
+         INNER JOIN web_site ON ws.ws_web_site_sk = web_site_sk
+    GROUP BY: web_site_id
+    AGGREGATE: SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS "returns", SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit
+    OUTPUT: web_site_id, sales, "returns", profit
+    EXPECTED_ROWS: 21
+    CONSUMERS: main_query
+  main_query:
+    FROM: (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, "returns", profit FROM ssr_prefiltered
+           UNION ALL
+           SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, "returns", profit FROM csr_prefiltered
+           UNION ALL
+           SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, "returns", profit FROM wsr_prefiltered) x
+    GROUP BY: ROLLUP(channel, id)
+    OUTPUT: channel, id, SUM(sales) AS sales, SUM("returns") AS "returns", SUM(profit) AS profit
+    ORDER BY: channel, id
+    LIMIT: 100
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: dimension_cte_isolate, prefetch_fact_join
+EXAMPLE_ADAPTATION:
+Apply the dimension pre-filtering via subqueries in the fact table scan to reduce rows before the left join. Ignore the CTE materialization aspect — use subqueries instead of CTEs for dimensions. This is a prefetch pattern without explicit CTEs.
+HAZARD_FLAGS:
+- Subqueries in WHERE clause (IN) may be less efficient than joins; ensure they are selective.
+- Must preserve left join semantics: all filtered sales rows must be kept.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: early_filter
+TARGET_LOGICAL_TREE:
+  (ssr_early, csr_early, wsr_early) -> main_query
+NODE_CONTRACTS:
+  ssr_early:
+    FROM: store_sales
+         INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY)
+         INNER JOIN item ON ss_item_sk = i_item_sk AND i_current_price > 50
+         INNER JOIN promotion ON ss_promo_sk = p_promo_sk AND p_channel_tv = 'N'
+         INNER JOIN store ON ss_store_sk = s_store_sk
+         LEFT JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number)
+    GROUP BY: s_store_id
+    AGGREGATE: SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS "returns", SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit
+    OUTPUT: store_id (s_store_id), sales, "returns", profit
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  csr_early:
+    FROM: catalog_sales
+         INNER JOIN date_dim ON cs_sold_date_sk = d_date_sk AND d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY)
+         INNER JOIN item ON cs_item_sk = i_item_sk AND i_current_price > 50
+         INNER JOIN promotion ON cs_promo_sk = p_promo_sk AND p_channel_tv = 'N'
+         INNER JOIN catalog_page ON cs_catalog_page_sk = cp_catalog_page_sk
+         LEFT JOIN catalog_returns ON (cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number)
+    GROUP BY: cp_catalog_page_id
+    AGGREGATE: SUM(cs_ext_sales_price) AS sales, SUM(COALESCE(cr_return_amount, 0)) AS "returns", SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit
+    OUTPUT: catalog_page_id (cp_catalog_page_id), sales, "returns", profit
+    EXPECTED_ROWS: 444
+    CONSUMERS: main_query
+  wsr_early:
+    FROM: web_sales
+         INNER JOIN date_dim ON ws_sold_date_sk = d_date_sk AND d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY)
+         INNER JOIN item ON ws_item_sk = i_item_sk AND i_current_price > 50
+         INNER JOIN promotion ON ws_promo_sk = p_promo_sk AND p_channel_tv = 'N'
+         INNER JOIN web_site ON ws_web_site_sk = web_site_sk
+         LEFT JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number)
+    GROUP BY: web_site_id
+    AGGREGATE: SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS "returns", SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit
+    OUTPUT: web_site_id, sales, "returns", profit
+    EXPECTED_ROWS: 21
+    CONSUMERS: main_query
+  main_query:
+    FROM: (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, "returns", profit FROM ssr_early
+           UNION ALL
+           SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, "returns", profit FROM csr_early
+           UNION ALL
+           SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, "returns", profit FROM wsr_early) x
+    GROUP BY: ROLLUP(channel, id)
+    OUTPUT: channel, id, SUM(sales) AS sales, SUM("returns") AS "returns", SUM(profit) AS profit
+    ORDER BY: channel, id
+    LIMIT: 100
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: early_filter
+EXAMPLE_ADAPTATION:
+Apply the early filter principle by moving dimension join conditions (including filters) directly into INNER JOINs before the LEFT JOIN. This forces the optimizer to filter sales by dimensions before joining with returns. Ignore the CTE creation — write as flat queries.
+HAZARD_FLAGS:
+- The optimizer may still choose to reorder joins; explicit join order may not be preserved. Use explicit JOIN syntax with ON clauses containing filters.
+- Must ensure left join is after all inner joins to preserve semantics.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: aggregate_pushdown_shared_dims
+TARGET_LOGICAL_TREE:
+  date_filter -> item_filter -> promo_filter ->
+  (ssr_sales_agg, ssr_returns_agg) -> ssr_join ->
+  (csr_sales_agg, csr_returns_agg) -> csr_join ->
+  (wsr_sales_agg, wsr_returns_agg) -> wsr_join ->
+  main_query
+NODE_CONTRACTS:
+  date_filter, item_filter, promo_filter: same as Worker 1.
+  ssr_sales_agg:
+    FROM: store_sales
+         INNER JOIN date_filter ON ss_sold_date_sk = d_date_sk
+         INNER JOIN item_filter ON ss_item_sk = i_item_sk
+         INNER JOIN promo_filter ON ss_promo_sk = p_promo_sk
+         INNER JOIN store ON ss_store_sk = s_store_sk
+    GROUP BY: s_store_id
+    AGGREGATE: SUM(ss_ext_sales_price) AS sales, SUM(ss_net_profit) AS net_profit
+    OUTPUT: store_id (s_store_id), sales, net_profit
+    EXPECTED_ROWS: 51
+    CONSUMERS: ssr_join
+  ssr_returns_agg:
+    FROM: store_sales
+         INNER JOIN date_filter ON ss_sold_date_sk = d_date_sk
+         INNER JOIN item_filter ON ss_item_sk = i_item_sk
+         INNER JOIN promo_filter ON ss_promo_sk = p_promo_sk
+         INNER JOIN store ON ss_store_sk = s_store_sk
+         INNER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number)
+    GROUP BY: s_store_id
+    AGGREGATE: SUM(sr_return_amt) AS returns_amt, SUM(sr_net_loss) AS net_loss
+    OUTPUT: store_id (s_store_id), returns_amt, net_loss
+    EXPECTED_ROWS: <=51
+    CONSUMERS: ssr_join
+  ssr_join:
+    FROM: ssr_sales_agg sales LEFT JOIN ssr_returns_agg rets USING (store_id)
+    OUTPUT: store_id, sales, COALESCE(returns_amt, 0) AS "returns", net_profit - COALESCE(net_loss, 0) AS profit
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  csr_sales_agg, csr_returns_agg, csr_join: similar for catalog channel.
+  wsr_sales_agg, wsr_returns_agg, wsr_join: similar for web channel.
+  main_query: same as Worker 1.
+EXAMPLES: single_pass_aggregation (partial), channel_bitmap_aggregation (partial)
+EXAMPLE_ADAPTATION:
+Apply the idea of aggregating sales and returns separately before joining, but ensure returns are filtered through sales dimensions. Use shared dimension CTEs to avoid repeated scans. Ignore the single-pass aspect across channels — we still have three separate channels.
+HAZARD_FLAGS:
+- Must ensure returns aggregation only includes returns that correspond to filtered sales (hence join sales with dimensions and then with returns). This may still involve a join between sales and returns at detail level, but aggregation reduces rows before the final left join.
+- The returns_agg CTE uses INNER JOIN with store_returns, which may lose stores with no returns; but the final left join with sales_agg will bring them back. This is correct.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (shared dimensions + aggregate pushdown)

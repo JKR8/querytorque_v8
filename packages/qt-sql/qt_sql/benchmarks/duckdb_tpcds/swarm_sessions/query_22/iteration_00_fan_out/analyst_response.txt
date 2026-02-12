@@ -1,0 +1,323 @@
+<reasoning>
+CLASSIFY:
+This is a star-join aggregation query with ROLLUP grouping across a product hierarchy. It joins one large fact table (inventory: 1.6B rows) with two dimension tables (date_dim, item), filters on a date range, then computes averages with hierarchical grouping. The structural archetype is "star-join with late dim filter" - though the date filter is applied early in the current plan.
+
+EXPLAIN PLAN ANALYSIS:
+- Total time: 43555ms
+- HASH_GROUP_BY (rollup): 42008.5ms (96% of runtime) - DOMINANT BOTTLENECK
+- Joins: HASH_JOIN inventory-date: 158.8ms, HASH_JOIN inventory-item: 156.2ms - FAST
+- Scans: SEQ_SCAN inventory: 1165.0ms (26.5M/1.6B rows), SEQ_SCAN date_dim: 0.1ms (365/73K), SEQ_SCAN item: 6.0ms (102K rows)
+
+Cardinality flow:
+1. inventory scan: 1.6B → filtered via join to 26.5M rows (1.6% selectivity via date join)
+2. After date join: 26.5M rows
+3. After item join: 26.5M rows (item join doesn't filter)
+4. After aggregation: 204K rows (grouping reduces 26.5M by ~130x)
+5. After TOP_N: 100 rows
+
+The optimizer already:
+- Pushes date filter into date_dim scan (d_month_seq>=1188 AND d_month_seq<=1199)
+- Uses efficient hash joins with the right build sides (small date_dim first, then item)
+- Reads only referenced columns (columnar projection)
+
+Missed opportunity: The rollup aggregation processes ALL 26.5M rows. The item dimension is unfiltered - we join all 102K items but only need those with inventory in the date range. The rollup could potentially be pushed below the item join since the grouping columns are all from item, but AVG is sensitive to row duplication if we push aggregation before the one-to-many join. However, inventory-to-item is one-to-one (inv_item_sk = i_item_sk), so pushing aggregation below the item join is safe.
+
+GAP MATCHING:
+1. CROSS_CTE_PREDICATE_BLINDNESS: The item dimension has no filter, but we could pre-filter to only items that appear in the inventory for the date range. This matches "dimension_cte_isolate" and "prefetch_fact_join".
+2. REDUNDANT_SCAN_ELIMINATION: Only one scan of each table, no repeated scans.
+3. UNION_CTE_SELF_JOIN_DECOMPOSITION: ROLLUP could be replaced with UNION ALL of explicit grouping levels ("rollup_to_union_windowing").
+4. AGGREGATE_PUSH_BELOW_JOIN: Since inventory→item is one-to-one, we can aggregate inventory by inv_item_sk before joining with item, reducing the 26.5M rows before the expensive item scan+join.
+
+AGGREGATION TRAP CHECK:
+- Only AVG(inv_quantity_on_hand). AVG is duplicate-sensitive, but inventory→item is one-to-one (primary key join), so pushing aggregation below the item join is safe. The ROLLUP creates multiple grouping levels, but AVG at each level must be computed as sum/count.
+
+TRANSFORM SELECTION (ranked by potential):
+1. **aggregate_pushdown**: Push aggregation of sum/count by inv_item_sk below the item join, then compute AVG and ROLLUP on reduced data. Historical evidence: "single_pass_aggregation" shows 4.47x wins for similar consolidation.
+2. **rollup_to_union_windowing**: Replace ROLLUP with explicit UNION ALL of grouping levels, allowing per-level optimization. Historical: 2.47x win.
+3. **star_join_prefetch**: Pre-filter date_dim and item dimensions into CTEs, then join with inventory. Historical: "dimension_cte_isolate" (1.93x) and "prefetch_fact_join" (3.77x).
+4. **late_attribute_binding**: Since item columns are only used for grouping/display (not filtering), we could join item after aggregating inventory by inv_item_sk. This is essentially aggregate_pushdown with a different structure.
+
+The optimizer is NOT doing aggregate_pushdown - it joins all tables first (26.5M rows) then aggregates. This is the key gap.
+
+LOGICAL TREE DESIGN:
+For Worker 1 (aggregate_pushdown): inventory_date → aggregate by inv_item_sk → join item → compute AVG and ROLLUP
+For Worker 2 (rollup_to_union_windowing): inventory_date_item → multiple UNION ALL branches with different GROUP BY levels
+For Worker 3 (star_join_prefetch): date_cte, item_cte, inventory join both
+For Worker 4 (exploration - compound): Combine aggregate_pushdown with rollup_to_union_windowing
+
+All designs must maintain output columns: i_product_name, i_brand, i_class, i_category, qoh (avg), with NULLs for rolled-up levels, ordered by qoh, i_product_name, i_brand, i_class, i_category, LIMIT 100.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compute average inventory on-hand quantity for dates in month sequence 1188-1199, aggregated hierarchically from product name down to category via ROLLUP. All joins are INNER (intersection), requiring matches in all three tables. AVG is duplicate-sensitive, but inventory→item is one-to-one via primary key, allowing safe aggregation pushdown. The date filter (d_month_seq) must remain applied before aggregation to ensure correct temporal scope.
+
+BOTTLENECK_DIAGNOSIS:
+The HASH_GROUP_BY (ROLLUP aggregation) dominates at 96% (42008.5ms), processing 26.5M rows from the joined fact-dimension tables. The query is aggregation-bound, not join-bound (joins take <1% each). Cardinality drops sharply after date filter (1.6B→26.5M) but remains high through item join (no item filter). The optimizer already pushes date predicates effectively and chooses optimal hash join orders. Logical-tree cost percentages are misleading - the 96% exclusive time for HASH_GROUP_BY is accurate ground truth.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output i_product_name, i_brand, i_class, i_category, qoh in same order
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (inv_item_sk, i_* columns, inv_quantity_on_hand)
+- LITERAL_PRESERVATION: Must preserve d_month_seq BETWEEN 1188 AND 1188 + 11 exactly
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows with identical qoh values and NULL placement in rollup
+- CROSS_CTE_PREDICATE_BLINDNESS: Date filter is pushed but item has no filter; opportunity to pre-filter item via fact table
+- AGGREGATE_PUSH_BELOW_JOIN: Aggregation processes 26.5M rows but could be pushed before item join (one-to-one relationship)
+
+REGRESSION_WARNINGS:
+1. dimension_cte_isolate (0.0076x regression):
+   CAUSE: Cross-joining 3+ dimension CTEs caused Cartesian explosion
+   RULE: Never cross-join multiple dimension CTEs; join them sequentially with fact table
+2. prefetch_fact_join (0.50x regression):
+   CAUSE: Baseline query <50ms; CTE overhead dominated savings
+   RULE: This query baseline is 43s, so CTE overhead negligible - proceed
+3. rollup_to_union_windowing (potential regression):
+   CAUSE: ROLLUP efficient when dimensions small and groups few; explicit UNION may add overhead
+   RULE: Verify 204K groups is large enough to benefit from per-level optimization
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: aggregate_pushdown
+TARGET_LOGICAL_TREE:
+  date_filtered -> inventory_date -> inventory_agg -> join_item -> rollup_aggregate -> order_limit
+NODE_CONTRACTS:
+  date_filtered:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1188 AND 1188 + 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: inventory_date
+  inventory_date:
+    FROM: inventory JOIN date_filtered ON inv_date_sk = d_date_sk
+    OUTPUT: inv_item_sk, inv_quantity_on_hand
+    EXPECTED_ROWS: 26.5M
+    CONSUMERS: inventory_agg
+  inventory_agg:
+    FROM: inventory_date
+    GROUP BY: inv_item_sk
+    AGGREGATE: SUM(inv_quantity_on_hand) as sum_qty, COUNT(inv_quantity_on_hand) as cnt
+    OUTPUT: inv_item_sk, sum_qty, cnt
+    EXPECTED_ROWS: ~102K (distinct items in inventory for date range)
+    CONSUMERS: join_item
+  join_item:
+    FROM: inventory_agg JOIN item ON inv_item_sk = i_item_sk
+    OUTPUT: i_product_name, i_brand, i_class, i_category, sum_qty, cnt
+    EXPECTED_ROWS: ~102K
+    CONSUMERS: rollup_aggregate
+  rollup_aggregate:
+    FROM: join_item
+    GROUP BY: ROLLUP(i_product_name, i_brand, i_class, i_category)
+    AGGREGATE: AVG(sum_qty/cnt) as qoh  -- Actually: SUM(sum_qty)/SUM(cnt) for correct average
+    OUTPUT: i_product_name, i_brand, i_class, i_category, qoh
+    EXPECTED_ROWS: 204K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: rollup_aggregate
+    ORDER BY: qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC
+    LIMIT: 100
+    OUTPUT: i_product_name, i_brand, i_class, i_category, qoh
+    EXPECTED_ROWS: 100
+EXAMPLES: single_pass_aggregation, prefetch_fact_join, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply the consolidation of multiple scans into one, but here we consolidate the 26.5M-row aggregation pushdown. Ignore the CASE WHEN branching - we have only one time period.
+- prefetch_fact_join: Apply the staged join pipeline: filter date first, join with fact, then join dimensions. Adapt by adding aggregation between fact and dimension joins.
+- dimension_cte_isolate: Apply pre-filtering of dimensions, but only date needs filtering; item will be filtered implicitly via join with inventory_agg.
+HAZARD_FLAGS:
+- Must compute average correctly as SUM(sum_qty)/SUM(cnt) at each rollup level, not AVG of averages
+- Ensure NULL handling in ROLLUP matches original (NULLs in rolled-up columns)
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: rollup_to_union_windowing
+TARGET_LOGICAL_TREE:
+  date_filtered -> inventory_date_item -> union_levels -> order_limit
+NODE_CONTRACTS:
+  date_filtered:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1188 AND 1188 + 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: inventory_date_item
+  inventory_date_item:
+    FROM: inventory 
+      JOIN date_filtered ON inv_date_sk = d_date_sk
+      JOIN item ON inv_item_sk = i_item_sk
+    OUTPUT: i_product_name, i_brand, i_class, i_category, inv_quantity_on_hand
+    EXPECTED_ROWS: 26.5M
+    CONSUMERS: union_levels (all branches)
+  union_levels:
+    FROM: (
+      -- Level 4: all four columns
+      SELECT i_product_name, i_brand, i_class, i_category, 
+             AVG(inv_quantity_on_hand) as qoh
+      FROM inventory_date_item
+      GROUP BY i_product_name, i_brand, i_class, i_category
+      UNION ALL
+      -- Level 3: roll up category
+      SELECT i_product_name, i_brand, i_class, NULL as i_category,
+             AVG(inv_quantity_on_hand) as qoh
+      FROM inventory_date_item
+      GROUP BY i_product_name, i_brand, i_class
+      UNION ALL
+      -- Level 2: roll up class
+      SELECT i_product_name, i_brand, NULL, NULL,
+             AVG(inv_quantity_on_hand) as qoh
+      FROM inventory_date_item
+      GROUP BY i_product_name, i_brand
+      UNION ALL
+      -- Level 1: roll up brand
+      SELECT i_product_name, NULL, NULL, NULL,
+             AVG(inv_quantity_on_hand) as qoh
+      FROM inventory_date_item
+      GROUP BY i_product_name
+      UNION ALL
+      -- Level 0: grand total
+      SELECT NULL, NULL, NULL, NULL,
+             AVG(inv_quantity_on_hand) as qoh
+      FROM inventory_date_item
+    )
+    OUTPUT: i_product_name, i_brand, i_class, i_category, qoh
+    EXPECTED_ROWS: 204K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: union_levels
+    ORDER BY: qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC
+    LIMIT: 100
+    OUTPUT: i_product_name, i_brand, i_class, i_category, qoh
+    EXPECTED_ROWS: 100
+EXAMPLES: rollup_to_union_windowing, union_cte_split
+EXAMPLE_ADAPTATION:
+- rollup_to_union_windowing: Apply exact pattern - replace ROLLUP with explicit UNION ALL branches per grouping level. Ignore window function aspect (ranking not needed).
+- union_cte_split: Apply splitting of a generic CTE into specialized ones, but here we split the ROLLUP into separate aggregation queries. Ignore year filter specialization.
+HAZARD_FLAGS:
+- UNION ALL branches all scan the same 26.5M-row CTE; ensure it's materialized once, not re-executed per branch
+- NULL placement must match ROLLUP semantics (NULL in rolled-up columns)
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_cte -> item_cte -> inventory_join -> rollup_aggregate -> order_limit
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1188 AND 1188 + 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: inventory_join
+  item_cte:
+    FROM: item
+    OUTPUT: i_item_sk, i_product_name, i_brand, i_class, i_category
+    EXPECTED_ROWS: 102K
+    CONSUMERS: inventory_join
+  inventory_join:
+    FROM: inventory 
+      JOIN date_cte ON inv_date_sk = d_date_sk
+      JOIN item_cte ON inv_item_sk = i_item_sk
+    OUTPUT: i_product_name, i_brand, i_class, i_category, inv_quantity_on_hand
+    EXPECTED_ROWS: 26.5M
+    CONSUMERS: rollup_aggregate
+  rollup_aggregate:
+    FROM: inventory_join
+    GROUP BY: ROLLUP(i_product_name, i_brand, i_class, i_category)
+    AGGREGATE: AVG(inv_quantity_on_hand) as qoh
+    OUTPUT: i_product_name, i_brand, i_class, i_category, qoh
+    EXPECTED_ROWS: 204K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: rollup_aggregate
+    ORDER BY: qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC
+    LIMIT: 100
+    OUTPUT: i_product_name, i_brand, i_class, i_category, qoh
+    EXPECTED_ROWS: 100
+EXAMPLES: dimension_cte_isolate, prefetch_fact_join, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering all dimension tables into CTEs. Adapt by creating both date_cte and item_cte. Ignore the cross-join warning - we join them sequentially with fact table.
+- prefetch_fact_join: Apply the CTE chain: filter dimensions first, then join with fact. Adapt exactly as shown.
+- date_cte_isolate: Apply date filtering into separate CTE. Adapt directly.
+HAZARD_FLAGS:
+- item_cte has no WHERE clause (unfiltered) - may add materialization overhead without selectivity benefit
+- Ensure item_cte includes all i_* columns needed for GROUP BY and SELECT
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_aggregate_pushdown_union
+TARGET_LOGICAL_TREE:
+  date_filtered -> inventory_agg -> join_item -> union_levels_with_sums -> order_limit
+NODE_CONTRACTS:
+  date_filtered:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1188 AND 1188 + 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: inventory_agg
+  inventory_agg:
+    FROM: inventory JOIN date_filtered ON inv_date_sk = d_date_sk
+    GROUP BY: inv_item_sk
+    AGGREGATE: SUM(inv_quantity_on_hand) as sum_qty, COUNT(inv_quantity_on_hand) as cnt
+    OUTPUT: inv_item_sk, sum_qty, cnt
+    EXPECTED_ROWS: ~102K
+    CONSUMERS: join_item
+  join_item:
+    FROM: inventory_agg JOIN item ON inv_item_sk = i_item_sk
+    OUTPUT: i_product_name, i_brand, i_class, i_category, sum_qty, cnt
+    EXPECTED_ROWS: ~102K
+    CONSUMERS: union_levels_with_sums
+  union_levels_with_sums:
+    FROM: (
+      -- Level 4
+      SELECT i_product_name, i_brand, i_class, i_category,
+             SUM(sum_qty) as total_sum, SUM(cnt) as total_cnt
+      FROM join_item
+      GROUP BY i_product_name, i_brand, i_class, i_category
+      UNION ALL
+      -- Level 3
+      SELECT i_product_name, i_brand, i_class, NULL,
+             SUM(sum_qty) as total_sum, SUM(cnt) as total_cnt
+      FROM join_item
+      GROUP BY i_product_name, i_brand, i_class
+      UNION ALL
+      -- Level 2
+      SELECT i_product_name, i_brand, NULL, NULL,
+             SUM(sum_qty) as total_sum, SUM(cnt) as total_cnt
+      FROM join_item
+      GROUP BY i_product_name, i_brand
+      UNION ALL
+      -- Level 1
+      SELECT i_product_name, NULL, NULL, NULL,
+             SUM(sum_qty) as total_sum, SUM(cnt) as total_cnt
+      FROM join_item
+      GROUP BY i_product_name
+      UNION ALL
+      -- Level 0
+      SELECT NULL, NULL, NULL, NULL,
+             SUM(sum_qty) as total_sum, SUM(cnt) as total_cnt
+      FROM join_item
+    )
+    OUTPUT: i_product_name, i_brand, i_class, i_category, total_sum, total_cnt
+    EXPECTED_ROWS: 204K
+    CONSUMERS: final_avg
+  final_avg:
+    FROM: union_levels_with_sums
+    SELECT: i_product_name, i_brand, i_class, i_category, 
+            total_sum / total_cnt as qoh
+    OUTPUT: i_product_name, i_brand, i_class, i_category, qoh
+    EXPECTED_ROWS: 204K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: final_avg
+    ORDER BY: qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC
+    LIMIT: 100
+    OUTPUT: i_product_name, i_brand, i_class, i_category, qoh
+    EXPECTED_ROWS: 100
+EXAMPLES: single_pass_aggregation, rollup_to_union_windowing, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply the consolidation principle but for aggregation pushdown. Ignore CASE WHEN.
+- rollup_to_union_windowing: Apply UNION ALL of grouping levels, but compute sum/cnt in each branch then compute average once. Adapt to use sum/cnt aggregates.
+- dimension_cte_isolate: Apply dimension pre-filtering, but only date is filtered; item join happens after aggregation.
+HAZARD_FLAGS:
+- Must handle division by zero (total_cnt will never be zero due to COUNT aggregation)
+- NULL placement in rolled-up columns must match original ROLLUP
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (aggregate_pushdown + rollup_to_union_windowing)

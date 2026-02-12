@@ -1,0 +1,92 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Replaced ROLLUP with explicit UNION ALL hierarchy levels; pre-filtered dimensions into CTEs; maintained semantic equivalence with explicit level numbering.
+    ├── [~] filtered_date  — Isolated date filter into CTE
+    ├── [~] filtered_store — Isolated store filter into CTE
+    ├── [+] base_join — CTE joining all tables after dimension filtering
+    ├── [+] level1_agg — Category/Class level aggregation (lochierarchy=0)
+    ├── [+] level2_agg — Category level aggregation (lochierarchy=1)
+    ├── [+] level3_agg — Overall aggregation (lochierarchy=2)
+    ├── [+] union_all — UNION ALL of three hierarchy levels
+    ├── [+] window_rank — Window function with partition by hierarchy level
+    └── OUTPUT (gross_margin, i_category, i_class, lochierarchy, rank_within_parent)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "rollup_to_union_windowing", "description": "Replaced GROUP BY ROLLUP with explicit UNION ALL of three hierarchy levels", "applied_to": ["level1_agg", "level2_agg", "level3_agg", "union_all"]},
+    {"id": "R2", "type": "cte_specialization", "description": "Isolated dimension filters into CTEs for predicate pushdown", "applied_to": ["filtered_date", "filtered_store"]},
+    {"id": "R3", "type": "join_reordering_barrier", "description": "Created base_join CTE to allow optimizer freedom within single fact table join", "applied_to": ["base_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2002",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_store": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s_store_sk FROM store WHERE s_state IN ('SD','TN','GA','SC','MO','AL','MI','OH')",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "base_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i.i_category, i.i_class, ss.ss_net_profit, ss.ss_ext_sales_price FROM store_sales ss INNER JOIN filtered_date fd ON ss.ss_sold_date_sk = fd.d_date_sk INNER JOIN filtered_store fs ON ss.ss_store_sk = fs.s_store_sk INNER JOIN item i ON ss.ss_item_sk = i.i_item_sk",
+        "interfaces": {"outputs": ["i_category", "i_class", "ss_net_profit", "ss_ext_sales_price"], "consumes": ["filtered_date", "filtered_store"]}
+      },
+      "level1_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_category, i_class, 0 as lochierarchy, SUM(ss_net_profit) as sum_net_profit, SUM(ss_ext_sales_price) as sum_sales_price FROM base_join GROUP BY i_category, i_class",
+        "interfaces": {"outputs": ["i_category", "i_class", "lochierarchy", "sum_net_profit", "sum_sales_price"], "consumes": ["base_join"]}
+      },
+      "level2_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_category, NULL as i_class, 1 as lochierarchy, SUM(ss_net_profit) as sum_net_profit, SUM(ss_ext_sales_price) as sum_sales_price FROM base_join GROUP BY i_category",
+        "interfaces": {"outputs": ["i_category", "i_class", "lochierarchy", "sum_net_profit", "sum_sales_price"], "consumes": ["base_join"]}
+      },
+      "level3_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT NULL as i_category, NULL as i_class, 2 as lochierarchy, SUM(ss_net_profit) as sum_net_profit, SUM(ss_ext_sales_price) as sum_sales_price FROM base_join",
+        "interfaces": {"outputs": ["i_category", "i_class", "lochierarchy", "sum_net_profit", "sum_sales_price"], "consumes": ["base_join"]}
+      },
+      "union_all": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT * FROM level1_agg UNION ALL SELECT * FROM level2_agg UNION ALL SELECT * FROM level3_agg",
+        "interfaces": {"outputs": ["i_category", "i_class", "lochierarchy", "sum_net_profit", "sum_sales_price"], "consumes": ["level1_agg", "level2_agg", "level3_agg"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT (sum_net_profit / sum_sales_price) as gross_margin, i_category, i_class, lochierarchy, RANK() OVER (PARTITION BY lochierarchy, CASE WHEN lochierarchy = 0 THEN i_category END ORDER BY (sum_net_profit / sum_sales_price) ASC) as rank_within_parent FROM union_all ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category END, rank_within_parent LIMIT 100",
+        "interfaces": {"outputs": ["gross_margin", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["union_all"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_store", "base_join", "level1_agg", "level2_agg", "level3_agg", "union_all", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_store AS ({filtered_store}), base_join AS ({base_join}), level1_agg AS ({level1_agg}), level2_agg AS ({level2_agg}), level3_agg AS ({level3_agg}), union_all AS ({union_all}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Replaced GROUP BY ROLLUP with explicit UNION ALL of three hierarchy levels (class/category, category only, overall). Isolated dimension filters into CTEs to allow predicate pushdown while maintaining single fact table scan via base_join CTE. This avoids the ROLLUP+window optimization barrier while preserving exact semantic equivalence.
+
+**Expected speedup:** 2.0-2.5x based on the reference example pattern. The primary gain comes from eliminating the ROLLUP computation pattern that DuckDB v1.4.3 optimizes poorly for window functions, and from allowing the optimizer to push date/store filters directly into the fact table join.

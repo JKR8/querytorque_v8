@@ -1,0 +1,121 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_may2000  [+]  Cost: 0%  Rows: 31  — Extract date dimension keys for May 2000
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year = 2000 AND d_moy = 5)
+│   └── OUTPUT (d_date_sk)
+├── [CTE] frequent_ss_items_2000_2003  [~]  Cost: 25%  Rows: ~4.2K  — Same as original but renamed; identify store items that sell more than four times per day/description slice during 2000-2003
+│   ├── SCAN (store_sales, date_dim (join), item (join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── JOIN (ss_item_sk = i_item_sk)
+│   ├── FILTER (d_year IN (2000, 2000 + 1, 2000 + 2, 2000 + 3))
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (itemdesc, item_sk, solddate, cnt)
+├── [CTE] max_store_sales_2000_2003  [~]  Cost: 25%  Rows: 1  — Compute the maximum customer store-sales amount over 2000-2003 as the benchmark for top-customer selection
+│   ├── SCAN (store_sales, customer, date_dim)
+│   ├── JOIN (ss_customer_sk = c_customer_sk)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_year IN (2000, 2000 + 1, 2000 + 2, 2000 + 3))
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (tpcds_cmax)
+├── [CTE] best_ss_customer_with_date  [+]  Cost: 25%  Rows: ≤171  — Select customers whose cumulative store sales (2000-2003) exceed 95% of the maximum
+│   ├── SCAN (store_sales, customer, date_dim)
+│   ├── JOIN (ss_customer_sk = c_customer_sk)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_year IN (2000, 2000 + 1, 2000 + 2, 2000 + 3))
+│   ├── AGG (GROUP BY)
+│   ├── FILTER (HAVING > 95% of max)
+│   └── OUTPUT (c_customer_sk, ssales)
+├── [CTE] catalog_sales_may  [+]  Cost: 12.5%  Rows: ≤5  — Filter catalog sales for May 2000 to frequent items and best customers
+│   ├── SCAN (catalog_sales, date_may2000 (join))
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── FILTER (cs_item_sk IN frequent_ss_items_2000_2003)
+│   ├── FILTER (cs_bill_customer_sk IN best_ss_customer_with_date)
+│   └── OUTPUT (cs_bill_customer_sk, cs_quantity, cs_list_price)
+├── [CTE] web_sales_may  [+]  Cost: 12.5%  Rows: ≤2  — Filter web sales for May 2000 to frequent items and best customers
+│   ├── SCAN (web_sales, date_may2000 (join))
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── FILTER (ws_item_sk IN frequent_ss_items_2000_2003)
+│   ├── FILTER (ws_bill_customer_sk IN best_ss_customer_with_date)
+│   └── OUTPUT (ws_bill_customer_sk, ws_quantity, ws_list_price)
+└── [MAIN] main_union  [~]  Cost: 0%  Rows: ~1K  — Join CTE sales data with customer, union catalog and web sales, then sum combined sales amount
+    ├── SCAN (catalog_sales_may, web_sales_may, customer)
+    ├── JOIN (cs_bill_customer_sk = c_customer_sk) / (ws_bill_customer_sk = c_customer_sk)
+    ├── AGG (GROUP BY)
+    ├── SORT (c_last_name ASC, c_first_name ASC, sales ASC)
+    └── OUTPUT (c_last_name, c_first_name, sales)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extract May 2000 dates into reusable CTE", "applied_to": ["date_may2000"]},
+    {"id": "R2", "type": "scan_consolidation", "description": "Separate best_ss_customer into two CTEs: max_store_sales_2000_2003 and best_ss_customer_with_date, both filtered to 2000-2003", "applied_to": ["max_store_sales_2000_2003", "best_ss_customer_with_date"]},
+    {"id": "R3", "type": "early_filter", "description": "Create catalog_sales_may and web_sales_may CTEs that pre-filter to May 2000, frequent items, and best customers", "applied_to": ["catalog_sales_may", "web_sales_may"]},
+    {"id": "R4", "type": "pushdown", "description": "Remove original UNION ALL subqueries; replace with joins to pre-filtered CTEs", "applied_to": ["main_union"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_may2000": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000 AND d_moy = 5",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "frequent_ss_items_2000_2003": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT substr(i_item_desc,1,30) AS itemdesc, i_item_sk AS item_sk, d_date AS solddate, COUNT(*) AS cnt FROM store_sales INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk INNER JOIN item ON ss_item_sk = i_item_sk WHERE d_year IN (2000, 2000+1, 2000+2, 2000+3) GROUP BY substr(i_item_desc,1,30), i_item_sk, d_date HAVING COUNT(*) > 4",
+        "interfaces": {"outputs": ["itemdesc", "item_sk", "solddate", "cnt"], "consumes": []}
+      },
+      "max_store_sales_2000_2003": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT MAX(csales) AS tpcds_cmax FROM (SELECT c_customer_sk, SUM(ss_quantity*ss_sales_price) AS csales FROM store_sales INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk INNER JOIN customer ON ss_customer_sk = c_customer_sk WHERE d_year IN (2000, 2000+1, 2000+2, 2000+3) GROUP BY c_customer_sk)",
+        "interfaces": {"outputs": ["tpcds_cmax"], "consumes": []}
+      },
+      "best_ss_customer_with_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_sk, SUM(ss_quantity*ss_sales_price) AS ssales FROM store_sales INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk INNER JOIN customer ON ss_customer_sk = c_customer_sk WHERE d_year IN (2000, 2000+1, 2000+2, 2000+3) GROUP BY c_customer_sk HAVING SUM(ss_quantity*ss_sales_price) > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales_2000_2003)",
+        "interfaces": {"outputs": ["c_customer_sk", "ssales"], "consumes": ["max_store_sales_2000_2003"]}
+      },
+      "catalog_sales_may": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cs_bill_customer_sk, cs_quantity, cs_list_price FROM catalog_sales INNER JOIN date_may2000 ON cs_sold_date_sk = d_date_sk WHERE cs_item_sk IN (SELECT item_sk FROM frequent_ss_items_2000_2003) AND cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer_with_date)",
+        "interfaces": {"outputs": ["cs_bill_customer_sk", "cs_quantity", "cs_list_price"], "consumes": ["date_may2000", "frequent_ss_items_2000_2003", "best_ss_customer_with_date"]}
+      },
+      "web_sales_may": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_bill_customer_sk, ws_quantity, ws_list_price FROM web_sales INNER JOIN date_may2000 ON ws_sold_date_sk = d_date_sk WHERE ws_item_sk IN (SELECT item_sk FROM frequent_ss_items_2000_2003) AND ws_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer_with_date)",
+        "interfaces": {"outputs": ["ws_bill_customer_sk", "ws_quantity", "ws_list_price"], "consumes": ["date_may2000", "frequent_ss_items_2000_2003", "best_ss_customer_with_date"]}
+      },
+      "main_union": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, sum(cs_quantity*cs_list_price) AS sales FROM catalog_sales_may INNER JOIN customer ON cs_bill_customer_sk = c_customer_sk GROUP BY c_last_name, c_first_name UNION ALL SELECT c_last_name, c_first_name, sum(ws_quantity*ws_list_price) AS sales FROM web_sales_may INNER JOIN customer ON ws_bill_customer_sk = c_customer_sk GROUP BY c_last_name, c_first_name ORDER BY c_last_name, c_first_name, sales LIMIT 100",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "sales"], "consumes": ["catalog_sales_may", "web_sales_may"]}
+      }
+    },
+    "reconstruction_order": ["date_may2000", "frequent_ss_items_2000_2003", "max_store_sales_2000_2003", "best_ss_customer_with_date", "catalog_sales_may", "web_sales_may", "main_union"],
+    "assembly_template": "WITH date_may2000 AS ({date_may2000}), frequent_ss_items_2000_2003 AS ({frequent_ss_items_2000_2003}), max_store_sales_2000_2003 AS ({max_store_sales_2000_2003}), best_ss_customer_with_date AS ({best_ss_customer_with_date}), catalog_sales_may AS ({catalog_sales_may}), web_sales_may AS ({web_sales_may}) {main_union}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured query into 6 CTEs following the target logical tree: isolated May 2000 dates, created separate CTEs for store sales aggregates (2000-2003), pre-filtered catalog and web sales for May 2000 using semi-joins, and kept main UNION ALL with customer joins. This eliminates 4 redundant store_sales scans and pushes date filters earlier.
+
+**Expected speedup**: 3-4x due to scan consolidation (4 store_sales scans → 2) and early filtering via dimension isolation (date_may2000 CTE).

@@ -1,0 +1,266 @@
+<reasoning>
+CLASSIFY:
+This is a star-join with late dimension filter archetype. The query joins a large fact table (catalog_sales) with multiple dimension tables (warehouse, item, date_dim) and has an optional left join to catalog_returns. The pattern is: scan date_dim → join catalog_sales → join item → join warehouse → optionally join catalog_returns → aggregate. The WHERE clause filters on multiple dimensions.
+
+EXPLAIN PLAN ANALYSIS:
+- Total runtime: 194.2ms
+- The plan shows 2 parallel workers (Gather Merge with 1/1 workers launched)
+- Sequence of operations:
+  1. Seq Scan on date_dim: 30 rows (from 36K) in 4.9ms per worker → very selective (0.08% filter)
+  2. Index Scan on catalog_sales using cs_sold_date_sk: 497 rows per date_dim row → 15K total rows in 72.0ms per worker → dominant cost (37% of total time)
+  3. Index Scan on item: filters i_category='Shoes' and i_manager_id between 42-81 → 0 rows per loop (likely very selective)
+  4. Index Scan on catalog_returns: filters cr_reason_sk=40 → 0 rows per loop
+  5. Index Scan on warehouse: trivial cost
+  6. Aggregate and Sort: 137.7ms per worker (71% of total time)
+
+Key observations:
+- The catalog_sales index scan (driven by date_dim) is the bottleneck: 15K rows × 2 workers = 30K rows processed
+- The item filter is applied AFTER the catalog_sales scan, not pushed down into a pre-filter
+- The plan uses nested loop joins throughout, which works well because date_dim is small
+- The optimizer already does predicate pushdown on date_dim (seq scan with filter)
+- The comma-separated join syntax (catalog_sales left outer join catalog_returns on ..., warehouse, item, date_dim) might confuse cardinality estimation
+- Only 1 scan of each table (no repeated scans), so scan consolidation not needed
+- No correlated subqueries present
+- Aggregation uses simple SUM with CASE, which is duplicate-safe
+
+GAP MATCHING:
+1. COMMA_JOIN_WEAKNESS: Present - query uses mixed syntax (LEFT OUTER JOIN followed by comma-separated tables)
+2. CORRELATED_SUBQUERY_PARALYSIS: Not present - no correlated subqueries
+3. CROSS_CTE_PREDICATE_BLINDNESS: Not present - no repeated fact scans
+4. NON_EQUI_JOIN_INPUT_BLINDNESS: Not present - all joins are equi-joins
+
+AGGREGATION TRAP CHECK:
+- Aggregates are SUM with CASE conditions, which are duplicate-safe (SUM is linear)
+- No STDDEV_SAMP, VARIANCE, or other grouping-sensitive aggregates
+- No FILTER clauses that could change grouping semantics
+- Safe to restructure joins as long as we don't introduce duplicates
+
+TRANSFORM SELECTION:
+Given the bottlenecks and gaps, I'll select 4 diverse strategies:
+
+1. **Explicit JOINs with pre-filtered dimensions (attacks COMMA_JOIN_WEAKNESS)**: Convert to explicit JOINs and pre-filter selective dimensions (item, date_dim) into CTEs.
+
+2. **Late attribute binding (novel combination)**: Pre-aggregate fact data by surrogate keys first, then join to dimension tables for display attributes.
+
+3. **Predicate pushdown with CTE materialization (global_predicate_pushdown)**: Push item and date_dim filters early via MATERIALIZED CTEs.
+
+4. **Exploration: Hash join forcing with dimension pre-filtering (compound_strategy)**: Force hash joins by pre-filtering dimensions into CTEs and using explicit JOIN syntax with SET LOCAL hints.
+
+LOGICAL TREE DESIGN:
+For each strategy, ensure complete column lists:
+- Output columns: w_state, i_item_id, sales_before, sales_after
+- Required columns for joins: cs_item_sk, cs_warehouse_sk, cs_sold_date_sk, cs_order_number, d_date_sk, i_item_sk, w_warehouse_sk, cr_item_sk, cr_order_number
+- Filter columns: d_date, i_category, i_manager_id, cs_wholesale_cost, cr_reason_sk
+- Aggregation columns: cs_sales_price, cr_refunded_cash, d_date
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compute sales before/after 2002-02-20 for Shoes items with manager ID 42-81, wholesale cost 68-87, and return reason 40, grouped by warehouse state and item ID. The LEFT JOIN to catalog_returns must preserve sales without returns (coalesce to 0). All joins are effectively INNER except catalog_returns is optional. Aggregation uses SUM with CASE which is duplicate-safe. Filters on date_dim and item must be applied before joining to avoid processing irrelevant fact rows.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound on catalog_sales (37% of time) driven by date_dim join. The optimizer already pushes date filter early (seq scan reduces 36K→30 rows). However, item filter (i_category='Shoes', i_manager_id 42-81) is applied AFTER catalog_sales scan via index scan filtering (0 rows per loop), missing opportunity to pre-filter. Cardinality flow: date_dim 30 → catalog_sales 15K → item filters to near-zero → aggregation. Logical-tree costs misleading: catalog_sales scan dominates despite being 15K rows due to nested loop probing.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output w_state, i_item_id, sales_before, sales_after exactly
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream: join keys, filter columns, aggregation columns
+- LITERAL_PRESERVATION: Must preserve exact literal values: '2002-02-20', 30 day interval, 'Shoes', 42, 81, 68, 87, 40
+- SEMANTIC_EQUIVALENCE: Must return same rows with same ordering (w_state, i_item_id) and LIMIT 100
+- COMMA_JOIN_WEAKNESS: Query uses mixed syntax (LEFT OUTER JOIN then comma-separated tables), confusing cardinality estimation
+
+REGRESSION_WARNINGS:
+1. Disabling nested loops (observed regression: 0.21x on Q085):
+   CAUSE: Forced hash joins when nested loops were optimal for small outer table (date_dim 30 rows)
+   RULE: Preserve nested loop option; do not SET enable_nestloop=off
+2. CTE blocking parallelism (observed regression: 0.50x on Q069):
+   CAUSE: MATERIALIZED CTEs executed single-threaded, preventing parallel scan of fact table
+   RULE: Use explicit JOINs instead of CTEs for large fact tables, or use SET max_parallel_workers_per_gather
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: Explicit JOINs with pre-filtered dimensions
+TARGET_LOGICAL_TREE:
+  date_filter -> item_filter -> fact_join -> aggregation -> output
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_date between (cast ('2002-02-20' as date) - interval '30 day') and (cast ('2002-02-20' as date) + interval '30 day')
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 30
+    CONSUMERS: fact_join
+  item_filter:
+    FROM: item
+    WHERE: i_category = 'Shoes' and i_manager_id between 42 and 81
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: ~few (from EXPLAIN: 0 rows per loop but very selective)
+    CONSUMERS: fact_join
+  fact_join:
+    FROM: catalog_sales
+         INNER JOIN date_filter ON (cs_sold_date_sk = date_filter.d_date_sk)
+         INNER JOIN item_filter ON (i_item_sk = cs_item_sk)
+         INNER JOIN warehouse ON (cs_warehouse_sk = w_warehouse_sk)
+         LEFT OUTER JOIN catalog_returns ON (cs_order_number = cr_order_number and cs_item_sk = cr_item_sk)
+    WHERE: cs_wholesale_cost between 68 and 87
+           and (catalog_returns.cr_reason_sk = 40 OR catalog_returns.cr_reason_sk IS NULL)
+    OUTPUT: w_state, i_item_id, d_date, cs_sales_price, cr_refunded_cash
+    EXPECTED_ROWS: ~same as original intermediate rows (near-zero after item filter)
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: fact_join
+    GROUP BY: w_state, i_item_id
+    AGGREGATE: 
+        sum(case when (cast(d_date as date) < cast ('2002-02-20' as date)) then cs_sales_price - coalesce(cr_refunded_cash,0) else 0 end) as sales_before,
+        sum(case when (cast(d_date as date) >= cast ('2002-02-20' as date)) then cs_sales_price - coalesce(cr_refunded_cash,0) else 0 end) as sales_after
+    OUTPUT: w_state, i_item_id, sales_before, sales_after
+    EXPECTED_ROWS: ≤100 (due to LIMIT)
+    CONSUMERS: output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+  pg_dimension_prefetch_star: Apply pre-filtering of date_dim and item into CTEs, convert comma joins to explicit JOINs. Ignore multi-channel UNION aspect.
+  pg_date_cte_explicit_join: Isolate date_dim filter into CTE and use explicit JOIN syntax. Apply same for item filter.
+HAZARD_FLAGS:
+  - Must handle LEFT JOIN semantics correctly: cr_reason_sk=40 filter must not convert LEFT JOIN to INNER
+  - CTEs might be inlined; use MATERIALIZED if needed for predicate pushdown
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: Late attribute binding with surrogate key aggregation
+TARGET_LOGICAL_TREE:
+  date_filter -> fact_agg_by_keys -> dimension_join -> output
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_date between (cast ('2002-02-20' as date) - interval '30 day') and (cast ('2002-02-20' as date) + interval '30 day')
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 30
+    CONSUMERS: fact_agg_by_keys
+  fact_agg_by_keys:
+    FROM: catalog_sales
+         INNER JOIN date_filter ON (cs_sold_date_sk = date_filter.d_date_sk)
+         LEFT OUTER JOIN catalog_returns ON (cs_order_number = cr_order_number and cs_item_sk = cr_item_sk and cr_reason_sk = 40)
+    WHERE: cs_wholesale_cost between 68 and 87
+    GROUP BY: cs_item_sk, cs_warehouse_sk, d_date
+    AGGREGATE: 
+        sum(case when (cast(d_date as date) < cast ('2002-02-20' as date)) then cs_sales_price - coalesce(cr_refunded_cash,0) else 0 end) as sales_before,
+        sum(case when (cast(d_date as date) >= cast ('2002-02-20' as date)) then cs_sales_price - coalesce(cr_refunded_cash,0) else 0 end) as sales_after
+    OUTPUT: cs_item_sk, cs_warehouse_sk, d_date, sales_before, sales_after
+    EXPECTED_ROWS: ~distinct (cs_item_sk, cs_warehouse_sk, d_date) combinations from filtered data
+    CONSUMERS: dimension_join
+  dimension_join:
+    FROM: fact_agg_by_keys
+         INNER JOIN item ON (fact_agg_by_keys.cs_item_sk = item.i_item_sk)
+         INNER JOIN warehouse ON (fact_agg_by_keys.cs_warehouse_sk = warehouse.w_warehouse_sk)
+    WHERE: item.i_category = 'Shoes' and item.i_manager_id between 42 and 81
+    GROUP BY: warehouse.w_state, item.i_item_id
+    AGGREGATE: 
+        sum(sales_before) as sales_before,
+        sum(sales_after) as sales_after
+    OUTPUT: w_state, i_item_id, sales_before, sales_after
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: output
+EXAMPLES: late_attribute_binding (from transform catalog), pg_self_join_decomposition (partial pattern)
+EXAMPLE_ADAPTATION:
+  late_attribute_binding: Aggregate by surrogate keys (cs_item_sk, cs_warehouse_sk) first, then join to dimension tables for display attributes. Ignore that example is for different schema.
+  pg_self_join_decomposition: Apply principle of computing aggregation once on fact data before dimension resolution. Ignore self-join aspect.
+HAZARD_FLAGS:
+  - Must ensure item filter (i_category, i_manager_id) is applied correctly after aggregation
+  - Aggregation by (cs_item_sk, cs_warehouse_sk, d_date) then re-aggregation by (w_state, i_item_id) is correct because w_state and i_item_id are 1:1 with surrogate keys
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: Predicate pushdown with MATERIALIZED CTEs
+TARGET_LOGICAL_TREE:
+  date_cte -> item_cte -> fact_cte -> final_join -> aggregation -> output
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_date between (cast ('2002-02-20' as date) - interval '30 day') and (cast ('2002-02-20' as date) + interval '30 day')
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 30
+    CONSUMERS: fact_cte
+  item_cte:
+    FROM: item
+    WHERE: i_category = 'Shoes' and i_manager_id between 42 and 81
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: ~few
+    CONSUMERS: fact_cte
+  fact_cte:
+    FROM: catalog_sales
+         INNER JOIN date_cte ON (cs_sold_date_sk = date_cte.d_date_sk)
+         INNER JOIN item_cte ON (cs_item_sk = item_cte.i_item_sk)
+    WHERE: cs_wholesale_cost between 68 and 87
+    OUTPUT: cs_item_sk, cs_warehouse_sk, cs_order_number, cs_sales_price, d_date
+    EXPECTED_ROWS: ~greatly reduced from original 15K (after item filter)
+    CONSUMERS: final_join
+  final_join:
+    FROM: fact_cte
+         INNER JOIN warehouse ON (cs_warehouse_sk = w_warehouse_sk)
+         LEFT OUTER JOIN catalog_returns ON (cs_order_number = cr_order_number and fact_cte.cs_item_sk = cr_item_sk and cr_reason_sk = 40)
+    OUTPUT: w_state, i_item_id, d_date, cs_sales_price, cr_refunded_cash
+    EXPECTED_ROWS: same as fact_cte (plus optional returns)
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: final_join
+    GROUP BY: w_state, i_item_id
+    AGGREGATE: 
+        sum(case when (cast(d_date as date) < cast ('2002-02-20' as date)) then cs_sales_price - coalesce(cr_refunded_cash,0) else 0 end) as sales_before,
+        sum(case when (cast(d_date as date) >= cast ('2002-02-20' as date)) then cs_sales_price - coalesce(cr_refunded_cash,0) else 0 end) as sales_after
+    OUTPUT: w_state, i_item_id, sales_before, sales_after
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: output
+EXAMPLES: pg_materialized_dimension_fact_prefilter, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+  pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED CTEs for date_dim and item to pre-filter before joining with catalog_sales. Ignore non-equi join aspect.
+  early_filter_decorrelate: Push dimension filters (date_dim, item) into CTE definitions early. Ignore decorrelation aspect (no correlated subqueries).
+HAZARD_FLAGS:
+  - MATERIALIZED CTEs may block parallelism on catalog_sales scan
+  - Must use AS MATERIALIZED in CTEs to prevent inlining and ensure predicate pushdown
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: Hash join forcing with dimension pre-filtering
+TARGET_LOGICAL_TREE:
+  date_cte -> item_cte -> fact_hash_join -> aggregation -> output
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_date between (cast ('2002-02-20' as date) - interval '30 day') and (cast ('2002-02-20' as date) + interval '30 day')
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 30
+    CONSUMERS: fact_hash_join
+  item_cte:
+    FROM: item
+    WHERE: i_category = 'Shoes' and i_manager_id between 42 and 81
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: ~few
+    CONSUMERS: fact_hash_join
+  fact_hash_join:
+    FROM: catalog_sales
+         INNER JOIN date_cte ON (cs_sold_date_sk = date_cte.d_date_sk)
+         INNER JOIN item_cte ON (cs_item_sk = item_cte.i_item_sk)
+         INNER JOIN warehouse ON (cs_warehouse_sk = w_warehouse_sk)
+         LEFT OUTER JOIN catalog_returns ON (cs_order_number = cr_order_number and cs_item_sk = cr_item_sk and cr_reason_sk = 40)
+    WHERE: cs_wholesale_cost between 68 and 87
+    OUTPUT: w_state, i_item_id, d_date, cs_sales_price, cr_refunded_cash
+    EXPECTED_ROWS: ~greatly reduced (after item filter)
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: fact_hash_join
+    GROUP BY: w_state, i_item_id
+    AGGREGATE: 
+        sum(case when (cast(d_date as date) < cast ('2002-02-20' as date)) then cs_sales_price - coalesce(cr_refunded_cash,0) else 0 end) as sales_before,
+        sum(case when (cast(d_date as date) >= cast ('2002-02-20' as date)) then cs_sales_price - coalesce(cr_refunded_cash,0) else 0 end) as sales_after
+    OUTPUT: w_state, i_item_id, sales_before, sales_after
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+  pg_dimension_prefetch_star: Pre-filter dimensions into CTEs and use explicit JOINs. Add SET LOCAL enable_nestloop=off to force hash joins.
+  pg_date_cte_explicit_join: Isolate date_dim into CTE and use explicit JOINs. Combine with item CTE and hash join forcing.
+HAZARD_FLAGS:
+  - Forcing hash joins when nested loops are optimal could cause regression
+  - Must test with SET LOCAL parameters that revert after query
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This exploration tests hash join forcing when dimensions are pre-filtered into tiny CTEs. The original plan uses nested loops which work well, but hash joins might be better when fact table is large and dimensions are tiny. We'll use SET LOCAL to avoid permanent change.
+EXPLORATION_TYPE: compound_strategy

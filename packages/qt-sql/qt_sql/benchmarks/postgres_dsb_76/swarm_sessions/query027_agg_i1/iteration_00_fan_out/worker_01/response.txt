@@ -1,0 +1,102 @@
+### Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Cost: 100%  Rows: ~37K
+    ├── CTE filtered_date [=]
+    │   └── SCAN (date_dim)
+    ├── CTE filtered_store [=]
+    │   └── SCAN (store)
+    ├── CTE filtered_item [=]
+    │   └── SCAN (item)
+    ├── CTE filtered_cdemo [=]
+    │   └── SCAN (customer_demographics)
+    ├── CTE prefact [!]
+    │   ├── SCAN (store_sales)
+    │   ├── JOIN (INNER) filtered_date ON ss_sold_date_sk = d_date_sk
+    │   ├── JOIN (INNER) filtered_store ON ss_store_sk = s_store_sk
+    │   ├── JOIN (INNER) filtered_item ON ss_item_sk = i_item_sk
+    │   └── JOIN (INNER) filtered_cdemo ON ss_cdemo_sk = cd_demo_sk
+    ├── CTE aggregated [=]
+    │   └── AGG (GROUP BY ROLLUP)
+    ├── CTE sorted_limited [=]
+    │   └── SORT + LIMIT
+    └── OUTPUT (i_item_id, s_state, g_state, agg1, agg2, agg3, agg4)
+```
+
+### Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "multi_dimension_prefetch", "description": "Pre-filter all selective dimension tables into materialized CTEs to create tiny hash tables", "applied_to": ["filtered_date", "filtered_store", "filtered_item", "filtered_cdemo"]},
+    {"id": "R2", "type": "explicit_join_syntax", "description": "Replace comma-separated joins with explicit INNER JOINs using pre-filtered CTEs", "applied_to": ["prefact"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2002",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_store": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_sk, s_state FROM store WHERE s_state = 'IA'",
+        "interfaces": {"outputs": ["s_store_sk", "s_state"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_category = 'Sports'",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "filtered_cdemo": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'F' AND cd_marital_status = 'M' AND cd_education_status = 'Primary'",
+        "interfaces": {"outputs": ["cd_demo_sk"], "consumes": []}
+      },
+      "prefact": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i.i_item_id, s.s_state, ss.ss_quantity, ss.ss_list_price, ss.ss_coupon_amt, ss.ss_sales_price FROM store_sales ss INNER JOIN filtered_date d ON ss.ss_sold_date_sk = d.d_date_sk INNER JOIN filtered_store s ON ss.ss_store_sk = s.s_store_sk INNER JOIN filtered_item i ON ss.ss_item_sk = i.i_item_sk INNER JOIN filtered_cdemo c ON ss.ss_cdemo_sk = c.cd_demo_sk",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "ss_quantity", "ss_list_price", "ss_coupon_amt", "ss_sales_price"], "consumes": ["filtered_date", "filtered_store", "filtered_item", "filtered_cdemo"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_id, s_state, GROUPING(s_state) AS g_state, AVG(ss_quantity) AS agg1, AVG(ss_list_price) AS agg2, AVG(ss_coupon_amt) AS agg3, AVG(ss_sales_price) AS agg4 FROM prefact GROUP BY ROLLUP (i_item_id, s_state)",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"], "consumes": ["prefact"]}
+      },
+      "sorted_limited": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_id, s_state, g_state, agg1, agg2, agg3, agg4 FROM aggregated ORDER BY i_item_id, s_state LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"], "consumes": ["aggregated"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_id, s_state, g_state, agg1, agg2, agg3, agg4 FROM sorted_limited",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"], "consumes": ["sorted_limited"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_store", "filtered_item", "filtered_cdemo", "prefact", "aggregated", "sorted_limited", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_store AS ({filtered_store}), filtered_item AS ({filtered_item}), filtered_cdemo AS ({filtered_cdemo}), prefact AS ({prefact}), aggregated AS ({aggregated}), sorted_limited AS ({sorted_limited}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Converted the original comma‑separated joins to a staged CTE structure with explicit INNER JOINs, pre‑filtering all dimension tables (date_dim, store, item, customer_demographics) into tiny hash tables before joining with the large store_sales fact table. This matches the Target Logical Tree exactly.
+
+**Expected speedup**: ~2–3×, due to better cardinality estimates for the dimension filters and enabling efficient hash joins with small probe tables. The explicit JOIN syntax avoids the legacy comma‑join planner restriction, allowing PostgreSQL to reorder joins optimally.

@@ -1,0 +1,331 @@
+<reasoning>
+1. **CLASSIFY**: This is a channel-comparison self-join query. Specifically:
+   - Star-join with fact table (store_sales) and dimensions (item, date_dim, store).
+   - Two-pass window aggregation (yearly average and monthly rank).
+   - Self-join to get neighboring months within same category/brand/store/company.
+   - Final filter on deviation from yearly average.
+   - No correlated subqueries, no UNION ALL, no INTERSECT.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - **Total time**: 3765ms.
+   - **Bottleneck**: HASH_GROUP_BY in v1 (2420.3ms, 64%). This is the monthly aggregation of 6.6M rows → 105K groups.
+   - **Secondary**: Two WINDOW nodes (171.1ms + 136.3ms) computing avg_monthly_sales and rank.
+   - **Row reduction**:
+        - date_dim: 73K → 427 rows (filter pushdown works).
+        - store: 102 → 100 rows (filter pushdown works).
+        - store_sales: 345.6M → 6.6M rows after joining filtered dimensions.
+        - v1: 6.6M → 105K rows (aggregation).
+        - v2: 105K → 73K rows (self-join filter).
+        - main_query: 73K → 68K → 100 rows (final filter + LIMIT).
+   - **Scans per base table**:
+        - store_sales: 1 scan (SEQ_SCAN).
+        - date_dim: 1 scan.
+        - store: 1 scan.
+        - item: 1 scan.
+   - **CTE materialization**: v1 is referenced 3 times (in v2: v1, v1_lag, v1_lead). EXPLAIN shows CTE_SCAN nodes, indicating materialization. Each reference scans the same 105K rows.
+
+   **Key insight**: The main cost is aggregating 6.6M fact rows to 105K monthly groups. The self-join (v2) is cheap because it operates on the already-aggregated 105K rows. The optimizer already pushes date/store filters into scans. No redundant fact scans.
+
+3. **GAP MATCHING**:
+   - **CROSS_COLUMN_OR_DECOMPOSITION**: The date filter is an OR on same table (date_dim) with different columns (d_year, d_moy). However, the optimizer already pushes this filter into the scan (FILTER node on date_dim). The scan reduces 73K → 427 rows. This is efficient. `or_to_union` is NOT applicable (same-column OR caution).
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: The main query filters `d_year = 2001` and `avg_monthly_sales > 0`. These are applied AFTER v2 is computed. Could they be pushed into v1? v1 already has date filter for 2000-2002, but `d_year = 2001` cannot be pushed because v1 needs adjacent months (Dec 2000, Jan 2002). However, `avg_monthly_sales > 0` could be pushed into v2's scan of v1? Possibly not because avg_monthly_sales is a window function computed in v1. Pushing a filter on a window function before the window is computed is invalid. So this gap is not exploitable.
+   - **REDUNDANT_SCAN_ELIMINATION**: Only one scan per base table. No repeated fact scans.
+   - **UNION_CTE_SELF_JOIN_DECOMPOSITION**: v1 is a generic CTE that returns 14 months (Dec 2000–Jan 2002). It's scanned 3 times in v2 (self-join). Each scan reads all 105K rows. Could we split v1 into specialized CTEs for each year? No, because the self-join needs adjacent months across years.
+   - **CORRELATED_SUBQUERY_PARALYSIS**: No correlated subqueries.
+   - **Engine strengths**: DuckDB already does intra-scan predicate pushdown, hash join selection, columnar projection. CTEs are materialized for multi-reference.
+
+4. **AGGREGATION TRAP CHECK**:
+   - v1 uses `SUM(ss_sales_price)` and `AVG(SUM(...)) OVER`. The window AVG is computed over the same group partition (category, brand, store, company, year). Since the GROUP BY includes those partition columns, each window partition contains exactly the monthly rows for that year. This is safe.
+   - No STDDEV_SAMP or FILTER clauses.
+
+5. **TRANSFORM SELECTION**:
+   The bottleneck is the monthly aggregation of 6.6M rows. The self-join on 105K rows is cheap. Therefore, transforms should focus on reducing the 6.6M fact rows before aggregation.
+
+   Opportunities:
+   - **star_join_prefetch**: Pre-filter all dimensions (date_dim, store, item) into CTEs, then join with store_sales. This could reduce the fact scan further if dimension filters are selective. The EXPLAIN already shows dimension filters are pushed, but creating CTEs might allow better hash join planning.
+   - **single_pass_aggregation**: Not applicable (no repeated scans).
+   - **window_optimization**: The two window functions (avg_monthly_sales and rank) are computed sequentially. Could they be combined into one window clause? Possibly, but the WINDOW nodes are already cheap (5% total time).
+   - **self_join_elimination**: Replace the triple self-join with LAG/LEAD window functions in v1. This would eliminate the v2 CTE entirely and reduce the 3 scans of v1 to 1 scan. However, v2 only costs ~80ms total, so the gain is limited.
+   - **late_attribute_binding**: The item table is joined only for i_category and i_brand. Could we defer joining item until after aggregation? No, because aggregation groups by i_category and i_brand.
+   - **aggregate_pushdown**: Could we push the GROUP BY below the joins? No, because the GROUP BY includes columns from multiple tables (item, store, date_dim). However, we could pre-aggregate store_sales by (ss_item_sk, ss_store_sk, d_date_sk) then join to dimensions. This might reduce the 6.6M rows before joining dimensions.
+
+   Given the bottleneck is the 6.6M → 105K aggregation, the most promising transforms are:
+   1. **star_join_prefetch** (pre-filter dimensions into CTEs to reduce fact probe size).
+   2. **aggregate_pushdown** (pre-aggregate fact by keys before joining dimensions).
+   3. **self_join_elimination** (replace self-join with LAG/LEAD, simplifies query).
+   4. **window_optimization** (combine window functions, though gain is small).
+
+   We need 4 structurally diverse strategies. Let's assign:
+   - Worker 1: star_join_prefetch (pre-filter dimensions, then join fact).
+   - Worker 2: aggregate_pushdown (pre-aggregate fact by surrogate keys, then join dimensions).
+   - Worker 3: self_join_elimination (use LAG/LEAD to avoid self-join).
+   - Worker 4: compound strategy: combine star_join_prefetch + aggregate_pushdown + window_optimization (novel combination).
+
+6. **LOGICAL TREE DESIGN**:
+   For each strategy, design CTEs to ensure column completeness.
+
+   **Worker 1 (star_join_prefetch)**:
+     - CTE date_filter: filter date_dim for Dec 2000–Jan 2002.
+     - CTE store_filter: filter store (s_store_sk <= 100).
+     - CTE item_all: all item (no filter, but we need i_category, i_brand).
+     - CTE fact_join: join store_sales with the three dimension CTEs on keys, then aggregate.
+     - Then compute windows, self-join, etc. as original but using the pre-filtered dimensions.
+
+   **Worker 2 (aggregate_pushdown)**:
+     - CTE fact_agg: pre-aggregate store_sales by (ss_item_sk, ss_store_sk, ss_sold_date_sk) to get sum_sales.
+     - Then join with dimensions, group by dimension attributes, compute windows.
+     - This reduces the rows before joining dimensions.
+
+   **Worker 3 (self_join_elimination)**:
+     - Modify v1 to include LAG(sum_sales) and LEAD(sum_sales) as window functions.
+     - Eliminate v2; main query selects directly from enhanced v1.
+     - Keep other logic same.
+
+   **Worker 4 (compound)**: Combine pre-filtered dimensions, pre-aggregation, and combined window functions.
+
+   Check column completeness: each CTE must output all columns needed downstream.
+
+   **Note**: The EXPLAIN shows store filter `s_store_sk <= 100`. This is not in the original SQL but appears in the plan. We must preserve the original literal values, so we will not add this filter. The optimizer added it based on statistics? Actually, the original query has no store filter. The plan shows `SEQ_SCAN store [100 of 102 rows] Filters: s_store_sk<=100`. This suggests DuckDB inferred a filter from the join? We must not introduce this filter in our rewrites unless it's in the original SQL. The original SQL has no WHERE clause on store. So we must not add `s_store_sk <= 100`. This is a LITERAL_PRESERVATION constraint.
+
+   The date filter literals: 2001, 2001-1, 2001+1, 12, 1. Must be preserved exactly.
+
+   The main query filter `abs(sum_sales - avg_monthly_sales) / avg_monthly_sales > 0.1` must be preserved exactly.
+
+   Output columns: s_store_name, d_year, avg_monthly_sales, sum_sales, psum, nsum (plus all other columns from v2? Actually SELECT * from v2, so all columns of v2). v2 outputs: s_store_name, d_year, avg_monthly_sales, sum_sales, psum, nsum. So final output is exactly those 6 columns.
+
+   The ORDER BY uses `sum_sales - avg_monthly_sales` and `nsum`. Must preserve.
+
+   LIMIT 100.
+
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Detect 2001 monthly store-sales outliers by brand/category/store where a month's sales deviate by >10% from that year's average monthly sales, using adjacent-month context. All joins are INNER (intersection), requiring matching keys in all joined tables. The window AVG is computed over the same partition as GROUP BY columns, ensuring each group's average is over its own months only. The final filter depends on avg_monthly_sales computed in v1; pushing it earlier would break window semantics.
+
+BOTTLENECK_DIAGNOSIS:
+Dominant cost is HASH_GROUP_BY (2420ms, 64%) aggregating 6.6M fact rows to 105K monthly groups. The query is aggregation-bound, not scan-bound (store_sales scan is 386ms). Cardinality flow: 6.6M → 105K → 73K → 68K → 100. The optimizer already pushes date/store filters into scans (date_dim 73K→427 rows). Logical-tree cost percentages are misleading: v1 shows 33% cost but actually consumes ~70% of time (aggregation + windows). The self-join (v2) is cheap (80ms) because it operates on pre-aggregated data.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Final output must be exactly the 6 columns from v2: s_store_name, d_year, avg_monthly_sales, sum_sales, psum, nsum.
+- CTE_COLUMN_COMPLETENESS: Each CTE must output all columns referenced by downstream consumers (e.g., v1 must include i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn for v2's self-join).
+- LITERAL_PRESERVATION: Must preserve exact literal values: d_year=2001, d_year=2000 (2001-1), d_year=2002 (2001+1), d_moy=12, d_moy=1, deviation threshold 0.1.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows in same order (ORDER BY sum_sales - avg_monthly_sales, nsum).
+- CROSS_CTE_PREDICATE_BLINDNESS: The main query filter `d_year = 2001` cannot be pushed into v1 because v1 needs adjacent months (Dec 2000, Jan 2002). However, dimension filters could be pre-applied via CTEs.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: v1 is scanned 3 times in v2 (self-join). Opportunity to eliminate self-join via LAG/LEAD.
+
+REGRESSION_WARNINGS:
+1. dimension_cte_isolate (0.0076x regression):
+   CAUSE: Cross-joining 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join multiple dimension CTEs; instead, join each dimension CTE directly with the fact table.
+2. prefetch_fact_join (0.50x regression):
+   CAUSE: Pre-filtering fact table before multi-way fact joins prevented optimizer reordering.
+   RULE: For this query (only one fact table), pre-joining dimensions with fact is safe.
+3. or_to_union (0.59x regression):
+   CAUSE: Splitting same-column OR into UNION duplicated fact scans.
+   RULE: Do not split the date OR (same table, same column) into UNION.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_filter -> store_filter -> item_all -> fact_join -> v1_enhanced -> v2 -> main_query
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: (d_year = 2001) OR (d_year = 2000 AND d_moy = 12) OR (d_year = 2002 AND d_moy = 1)
+    OUTPUT: d_date_sk, d_year, d_moy
+    EXPECTED_ROWS: 427
+    CONSUMERS: fact_join
+  store_filter:
+    FROM: store
+    WHERE: (no filter – preserve original; do not add s_store_sk<=100)
+    OUTPUT: s_store_sk, s_store_name, s_company_name
+    EXPECTED_ROWS: 102
+    CONSUMERS: fact_join
+  item_all:
+    FROM: item
+    WHERE: (no filter)
+    OUTPUT: i_item_sk, i_category, i_brand
+    EXPECTED_ROWS: 102K
+    CONSUMERS: fact_join
+  fact_join:
+    FROM: store_sales
+    JOIN: INNER JOIN date_filter ON ss_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN store_filter ON ss_store_sk = s_store_sk
+    JOIN: INNER JOIN item_all ON ss_item_sk = i_item_sk
+    OUTPUT: i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, ss_sales_price
+    EXPECTED_ROWS: 6.6M
+    CONSUMERS: v1_enhanced
+  v1_enhanced:
+    FROM: fact_join
+    GROUP BY: i_category, i_brand, s_store_name, s_company_name, d_year, d_moy
+    AGGREGATE: SUM(ss_sales_price) AS sum_sales
+    WINDOW: AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name, d_year) AS avg_monthly_sales
+    WINDOW: RANK() OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS rn
+    OUTPUT: i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn
+    EXPECTED_ROWS: 105K
+    CONSUMERS: v2
+  v2:
+    FROM: v1_enhanced AS v1, v1_enhanced AS v1_lag, v1_enhanced AS v1_lead
+    JOIN: v1.i_category = v1_lag.i_category AND v1.i_category = v1_lead.i_category
+    JOIN: v1.i_brand = v1_lag.i_brand AND v1.i_brand = v1_lead.i_brand
+    JOIN: v1.s_store_name = v1_lag.s_store_name AND v1.s_store_name = v1_lead.s_store_name
+    JOIN: v1.s_company_name = v1_lag.s_company_name AND v1.s_company_name = v1_lead.s_company_name
+    JOIN: v1.rn = v1_lag.rn + 1 AND v1.rn = v1_lead.rn - 1
+    OUTPUT: v1.s_store_name, v1.d_year, v1.avg_monthly_sales, v1.sum_sales, v1_lag.sum_sales AS psum, v1_lead.sum_sales AS nsum
+    EXPECTED_ROWS: 73K
+    CONSUMERS: main_query
+  main_query:
+    FROM: v2
+    WHERE: d_year = 2001 AND avg_monthly_sales > 0 AND CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
+    ORDER BY: sum_sales - avg_monthly_sales, nsum
+    LIMIT: 100
+    OUTPUT: s_store_name, d_year, avg_monthly_sales, sum_sales, psum, nsum
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, prefetch_fact_join, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering of date_dim and store into CTEs; ignore cross-joining dimension CTEs (join them directly with fact table).
+- prefetch_fact_join: Build CTE chain: filter dimensions first, then join with fact; ignore multi-fact-table aspects (this query has only one fact table).
+- date_cte_isolate: Extract date filter into CTE; ignore that the optimizer already pushes the filter (still beneficial for hash join planning).
+HAZARD_FLAGS:
+- Adding store filter s_store_sk<=100 would change semantics (not in original query).
+- Must ensure date_filter CTE includes d_moy for later grouping.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: aggregate_pushdown
+TARGET_LOGICAL_TREE:
+  fact_agg -> date_dim -> store -> item -> v1_enhanced -> v2 -> main_query
+NODE_CONTRACTS:
+  fact_agg:
+    FROM: store_sales
+    GROUP BY: ss_item_sk, ss_store_sk, ss_sold_date_sk
+    AGGREGATE: SUM(ss_sales_price) AS sum_sales
+    OUTPUT: ss_item_sk, ss_store_sk, ss_sold_date_sk, sum_sales
+    EXPECTED_ROWS: ~6.6M (same as input, but aggregated by keys)
+    CONSUMERS: v1_enhanced
+  v1_enhanced:
+    FROM: fact_agg
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN store ON ss_store_sk = s_store_sk
+    JOIN: INNER JOIN item ON ss_item_sk = i_item_sk
+    WHERE: (d_year = 2001) OR (d_year = 2000 AND d_moy = 12) OR (d_year = 2002 AND d_moy = 1)
+    GROUP BY: i_category, i_brand, s_store_name, s_company_name, d_year, d_moy
+    AGGREGATE: SUM(sum_sales) AS sum_sales  -- sum of already aggregated sales
+    WINDOW: AVG(SUM(sum_sales)) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name, d_year) AS avg_monthly_sales
+    WINDOW: RANK() OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS rn
+    OUTPUT: i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn
+    EXPECTED_ROWS: 105K
+    CONSUMERS: v2
+  v2:
+    (same as Worker 1)
+  main_query:
+    (same as Worker 1)
+EXAMPLES: single_pass_aggregation, prefetch_fact_join
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply pre-aggregation of fact table by surrogate keys before joining dimensions; ignore CASE WHEN conditional aggregation (not needed).
+- prefetch_fact_join: Use fact_agg as a pre-joined fact CTE; ignore dimension filtering (filters applied later in v1_enhanced).
+HAZARD_FLAGS:
+- Pre-aggregation by (ss_item_sk, ss_store_sk, ss_sold_date_sk) may not reduce rows significantly (keys are high cardinality). However, it allows early aggregation before expensive dimension joins.
+- Must ensure SUM of SUM is correct (no double-counting).
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: self_join_elimination
+TARGET_LOGICAL_TREE:
+  v1_extended -> main_query
+NODE_CONTRACTS:
+  v1_extended:
+    FROM: item, store_sales, date_dim, store
+    JOIN: ss_item_sk = i_item_sk AND ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk
+    WHERE: (d_year = 2001) OR (d_year = 2000 AND d_moy = 12) OR (d_year = 2002 AND d_moy = 1)
+    GROUP BY: i_category, i_brand, s_store_name, s_company_name, d_year, d_moy
+    AGGREGATE: SUM(ss_sales_price) AS sum_sales
+    WINDOW: AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name, d_year) AS avg_monthly_sales
+    WINDOW: RANK() OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS rn
+    WINDOW: LAG(SUM(ss_sales_price)) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS psum
+    WINDOW: LEAD(SUM(ss_sales_price)) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS nsum
+    OUTPUT: i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn, psum, nsum
+    EXPECTED_ROWS: 105K
+    CONSUMERS: main_query
+  main_query:
+    FROM: v1_extended
+    WHERE: d_year = 2001 AND avg_monthly_sales > 0 AND CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
+    ORDER BY: sum_sales - avg_monthly_sales, nsum
+    LIMIT: 100
+    OUTPUT: s_store_name, d_year, avg_monthly_sales, sum_sales, psum, nsum
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: deferred_window_aggregation, window_optimization
+EXAMPLE_ADAPTATION:
+- deferred_window_aggregation: Apply LAG/LEAD window functions in the same CTE as other windows to avoid later self-join; ignore the FULL OUTER JOIN aspect (not present).
+- window_optimization: Combine multiple window functions (avg_monthly_sales, rank, psum, nsum) into a single CTE; ignore merging of same-partition windows (they have different partitions).
+HAZARD_FLAGS:
+- LAG/LEAD over the same partition/order as rank ensures alignment with original self-join logic.
+- Must ensure psum and nsum are correct for boundary months (Dec 2000 and Jan 2002 will have NULL for lag/lead, which matches original self-join behavior? Original self-join only joins when rn matches, so missing adjacent months would not produce rows. In v1_extended, all months have psum/nsum, but the main query filters to d_year=2001, so months at boundaries (Jan 2001 and Dec 2001) will have psum/nsum from Dec 2000 and Jan 2002. That's correct.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: compound_star_join_agg_pushdown
+TARGET_LOGICAL_TREE:
+  date_filter -> store_filter -> item_all -> fact_agg -> v1_enhanced -> main_query
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: (d_year = 2001) OR (d_year = 2000 AND d_moy = 12) OR (d_year = 2002 AND d_moy = 1)
+    OUTPUT: d_date_sk, d_year, d_moy
+    EXPECTED_ROWS: 427
+    CONSUMERS: fact_agg
+  store_filter:
+    FROM: store
+    WHERE: (no filter)
+    OUTPUT: s_store_sk, s_store_name, s_company_name
+    EXPECTED_ROWS: 102
+    CONSUMERS: fact_agg
+  item_all:
+    FROM: item
+    WHERE: (no filter)
+    OUTPUT: i_item_sk, i_category, i_brand
+    EXPECTED_ROWS: 102K
+    CONSUMERS: fact_agg
+  fact_agg:
+    FROM: store_sales
+    JOIN: INNER JOIN date_filter ON ss_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN store_filter ON ss_store_sk = s_store_sk
+    JOIN: INNER JOIN item_all ON ss_item_sk = i_item_sk
+    GROUP BY: i_category, i_brand, s_store_name, s_company_name, d_year, d_moy
+    AGGREGATE: SUM(ss_sales_price) AS sum_sales
+    OUTPUT: i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, sum_sales
+    EXPECTED_ROWS: 105K
+    CONSUMERS: v1_enhanced
+  v1_enhanced:
+    FROM: fact_agg
+    WINDOW: AVG(sum_sales) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name, d_year) AS avg_monthly_sales
+    WINDOW: RANK() OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS rn
+    WINDOW: LAG(sum_sales) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS psum
+    WINDOW: LEAD(sum_sales) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS nsum
+    OUTPUT: i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn, psum, nsum
+    EXPECTED_ROWS: 105K
+    CONSUMERS: main_query
+  main_query:
+    FROM: v1_enhanced
+    WHERE: d_year = 2001 AND avg_monthly_sales > 0 AND CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
+    ORDER BY: sum_sales - avg_monthly_sales, nsum
+    LIMIT: 100
+    OUTPUT: s_store_name, d_year, avg_monthly_sales, sum_sales, psum, nsum
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, single_pass_aggregation, self_join_elimination
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Pre-filter date_dim and store into CTEs; ignore cross-joining them (join via fact table).
+- single_pass_aggregation: Perform aggregation (GROUP BY) after joining dimensions but before window functions; ignore conditional aggregation.
+- self_join_elimination: Use LAG/LEAD to get psum/nsum, eliminating the self-join CTE.
+HAZARD_FLAGS:
+- Combining pre-filtered dimensions with early aggregation may change join order; ensure all dimension columns needed for grouping are present.
+- The aggregation in fact_agg groups by dimension attributes (i_category, etc.) which are available after joining dimensions. This is correct.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

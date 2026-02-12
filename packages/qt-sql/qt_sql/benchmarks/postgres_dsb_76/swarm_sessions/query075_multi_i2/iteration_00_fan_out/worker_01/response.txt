@@ -1,0 +1,129 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY:
+├── [CTE] filtered_item [~] (now MATERIALIZED CTE)
+├── [CTE] filtered_date [~] (now MATERIALIZED CTE)
+├── [CTE] per_channel_net_sales [~] (restructured as UNION ALL of three explicit JOIN branches)
+│   ├── CATALOG BRANCH:
+│   │   ├── SCAN catalog_sales [=]
+│   │   ├── JOIN filtered_item [~] (explicit JOIN with materialized CTE)
+│   │   ├── JOIN filtered_date [~] (explicit JOIN with materialized CTE)
+│   │   ├── LEFT JOIN catalog_returns [=]
+│   │   ├── FILTER (cs_sales_price/cs_list_price BETWEEN...) [=]
+│   │   └── FILTER (cr_reason_sk IN...) [=]
+│   ├── STORE BRANCH:
+│   │   ├── SCAN store_sales [=]
+│   │   ├── JOIN filtered_item [~] (explicit JOIN with materialized CTE)
+│   │   ├── JOIN filtered_date [~] (explicit JOIN with materialized CTE)
+│   │   ├── LEFT JOIN store_returns [=]
+│   │   ├── FILTER (ss_sales_price/ss_list_price BETWEEN...) [=]
+│   │   └── FILTER (sr_reason_sk IN...) [=]
+│   └── WEB BRANCH:
+│       ├── SCAN web_sales [=]
+│       ├── JOIN filtered_item [~] (explicit JOIN with materialized CTE)
+│       ├── JOIN filtered_date [~] (explicit JOIN with materialized CTE)
+│       ├── LEFT JOIN web_returns [=]
+│       ├── FILTER (ws_sales_price/ws_list_price BETWEEN...) [=]
+│       └── FILTER (wr_reason_sk IN...) [=]
+├── [CTE] all_sales_agg [~] (GROUP BY on UNION ALL)
+└── [MAIN] main_query [~] (explicit JOIN syntax, literals preserved)
+    ├── JOIN all_sales_agg AS curr_yr [~]
+    ├── JOIN all_sales_agg AS prev_yr [~]
+    ├── FILTER (curr_yr.d_year=1999) [=]
+    ├── FILTER (prev_yr.d_year=1998) [=]
+    ├── FILTER (prev_yr.sales_cnt>0) [=]
+    ├── FILTER (CAST(...)/CAST(...)<0.9) [=]
+    ├── SORT (sales_cnt_diff, sales_amt_diff) [=]
+    └── LIMIT 100 [=]
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "dimension_prefetch",
+      "description": "Materialize selective dimension filters (item.category='Children', date_dim.year in (1998,1999)) into CTEs with MATERIALIZED keyword to create tiny hash tables for repeated use",
+      "applied_to": ["filtered_item", "filtered_date"]
+    },
+    {
+      "id": "R2",
+      "type": "explicit_join_with_prefiltered_dimensions",
+      "description": "Replace original comma-joins with explicit JOIN syntax using pre-materialized dimension CTEs, enabling better hash join planning",
+      "applied_to": ["per_channel_net_sales"]
+    },
+    {
+      "id": "R3",
+      "type": "union_all_restructure",
+      "description": "Convert original UNION (which implies DISTINCT) to UNION ALL of three separate branches, since grouping later makes duplicates irrelevant and UNION ALL is cheaper",
+      "applied_to": ["per_channel_net_sales"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_item": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id FROM item WHERE i_category = 'Children'",
+        "interfaces": {
+          "outputs": ["i_item_sk", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id"],
+          "consumes": []
+        }
+      },
+      "filtered_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk, d_year FROM date_dim WHERE d_year IN (1998, 1999)",
+        "interfaces": {
+          "outputs": ["d_date_sk", "d_year"],
+          "consumes": []
+        }
+      },
+      "per_channel_net_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, cs_quantity - COALESCE(cr_return_quantity,0) AS sales_cnt, cs_ext_sales_price - COALESCE(cr_return_amount,0.0) AS sales_amt FROM catalog_sales INNER JOIN filtered_item ON i_item_sk = cs_item_sk INNER JOIN filtered_date ON d_date_sk = cs_sold_date_sk LEFT JOIN catalog_returns ON (cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk) WHERE cs_sales_price / cs_list_price BETWEEN 69 * 0.01 AND 89 * 0.01 AND cr_reason_sk IN (8, 18, 20, 23, 41) UNION ALL SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ss_quantity - COALESCE(sr_return_quantity,0) AS sales_cnt, ss_ext_sales_price - COALESCE(sr_return_amt,0.0) AS sales_amt FROM store_sales INNER JOIN filtered_item ON i_item_sk = ss_item_sk INNER JOIN filtered_date ON d_date_sk = ss_sold_date_sk LEFT JOIN store_returns ON (ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk) WHERE ss_sales_price / ss_list_price BETWEEN 69 * 0.01 AND 89 * 0.01 AND sr_reason_sk IN (8, 18, 20, 23, 41) UNION ALL SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ws_quantity - COALESCE(wr_return_quantity,0) AS sales_cnt, ws_ext_sales_price - COALESCE(wr_return_amt,0.0) AS sales_amt FROM web_sales INNER JOIN filtered_item ON i_item_sk = ws_item_sk INNER JOIN filtered_date ON d_date_sk = ws_sold_date_sk LEFT JOIN web_returns ON (ws_order_number = wr_order_number AND ws_item_sk = wr_item_sk) WHERE ws_sales_price / ws_list_price BETWEEN 69 * 0.01 AND 89 * 0.01 AND wr_reason_sk IN (8, 18, 20, 23, 41)",
+        "interfaces": {
+          "outputs": ["d_year", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id", "sales_cnt", "sales_amt"],
+          "consumes": ["filtered_item", "filtered_date"]
+        }
+      },
+      "all_sales_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, SUM(sales_cnt) AS sales_cnt, SUM(sales_amt) AS sales_amt FROM per_channel_net_sales GROUP BY d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id",
+        "interfaces": {
+          "outputs": ["d_year", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id", "sales_cnt", "sales_amt"],
+          "consumes": ["per_channel_net_sales"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT prev_yr.d_year AS prev_year, curr_yr.d_year AS year, curr_yr.i_brand_id, curr_yr.i_class_id, curr_yr.i_category_id, curr_yr.i_manufact_id, prev_yr.sales_cnt AS prev_yr_cnt, curr_yr.sales_cnt AS curr_yr_cnt, curr_yr.sales_cnt - prev_yr.sales_cnt AS sales_cnt_diff, curr_yr.sales_amt - prev_yr.sales_amt AS sales_amt_diff FROM all_sales_agg curr_yr INNER JOIN all_sales_agg prev_yr ON curr_yr.i_brand_id = prev_yr.i_brand_id AND curr_yr.i_class_id = prev_yr.i_class_id AND curr_yr.i_category_id = prev_yr.i_category_id AND curr_yr.i_manufact_id = prev_yr.i_manufact_id WHERE curr_yr.d_year = 1999 AND prev_yr.d_year = 1998 AND prev_yr.sales_cnt > 0 AND CAST(curr_yr.sales_cnt AS DECIMAL(17,2)) / CAST(prev_yr.sales_cnt AS DECIMAL(17,2)) < 0.9 ORDER BY sales_cnt_diff, sales_amt_diff LIMIT 100",
+        "interfaces": {
+          "outputs": ["prev_year", "year", "i_brand_id", "i_class_id", "i_category_id", "i_manufact_id", "prev_yr_cnt", "curr_yr_cnt", "sales_cnt_diff", "sales_amt_diff"],
+          "consumes": ["all_sales_agg"]
+        }
+      }
+    },
+    "reconstruction_order": ["filtered_item", "filtered_date", "per_channel_net_sales", "all_sales_agg", "main_query"],
+    "assembly_template": "WITH filtered_item AS MATERIALIZED ({filtered_item}), filtered_date AS MATERIALIZED ({filtered_date}), per_channel_net_sales AS ({per_channel_net_sales}), all_sales_agg AS ({all_sales_agg}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured query with materialized dimension CTEs (item filtered by 'Children', date_dim filtered by years 1998-1999) and explicit JOINs in three UNION ALL branches, preserving all original filters and defensive guards.
+
+**Expected speedup:** 2-3x from eliminating redundant dimension scans (item scanned 3x → 1x, date_dim 3x → 1x) and enabling hash joins with tiny probe tables.

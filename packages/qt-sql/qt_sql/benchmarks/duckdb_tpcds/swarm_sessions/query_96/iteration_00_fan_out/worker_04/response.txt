@@ -1,0 +1,84 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K — Pre-filter dimension tables into CTEs, then use multi-column IN semi-join to filter store_sales.
+│   ├── [CTE] filtered_time  [+]  — Filter time_dim early
+│   ├── [CTE] filtered_hd  [+]  — Filter household_demographics early
+│   ├── [CTE] filtered_store  [+]  — Filter store early
+│   ├── [CTE] key_intersection  [+]  — Cartesian product of dimension keys (pre‑filtered)
+│   ├── [CTE] fact_semi_join  [+]  — Store sales filtered via multi‑column IN (ss_sold_time_sk, ss_hdemo_sk, ss_store_sk) IN key_intersection
+│   ├── [CTE] aggregate  [+]  — COUNT(*) from fact_semi_join
+│   └── [OUTPUT] LIMIT 100 ordering by count
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Isolate dimension filters into separate CTEs before joining", "applied_to": ["filtered_time", "filtered_hd", "filtered_store"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Pre-filter dimension tables into CTEs returning only surrogate keys, then combine via Cartesian product", "applied_to": ["key_intersection"]},
+    {"id": "R3", "type": "single_pass_aggregation", "description": "Filter fact table with multi-column IN subquery against pre‑filtered dimension keys", "applied_to": ["fact_semi_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_time": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT t_time_sk FROM time_dim WHERE t_hour = 8 AND t_minute >= 30",
+        "interfaces": {"outputs": ["t_time_sk"], "consumes": []}
+      },
+      "filtered_hd": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": []}
+      },
+      "filtered_store": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_sk FROM store WHERE s_store_name = 'ese'",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "key_intersection": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT t_time_sk, hd_demo_sk, s_store_sk FROM filtered_time, filtered_hd, filtered_store",
+        "interfaces": {"outputs": ["t_time_sk", "hd_demo_sk", "s_store_sk"], "consumes": ["filtered_time", "filtered_hd", "filtered_store"]}
+      },
+      "fact_semi_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT * FROM store_sales WHERE (ss_sold_time_sk, ss_hdemo_sk, ss_store_sk) IN (SELECT t_time_sk, hd_demo_sk, s_store_sk FROM key_intersection)",
+        "interfaces": {"outputs": ["*"], "consumes": ["key_intersection"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT COUNT(*) AS cnt FROM fact_semi_join",
+        "interfaces": {"outputs": ["cnt"], "consumes": ["fact_semi_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT cnt FROM aggregate ORDER BY cnt ASC LIMIT 100",
+        "interfaces": {"outputs": ["cnt"], "consumes": ["aggregate"]}
+      }
+    },
+    "reconstruction_order": ["filtered_time", "filtered_hd", "filtered_store", "key_intersection", "fact_semi_join", "aggregate", "main_query"],
+    "assembly_template": "WITH filtered_time AS ({filtered_time}), filtered_hd AS ({filtered_hd}), filtered_store AS ({filtered_store}), key_intersection AS ({key_intersection}), fact_semi_join AS ({fact_semi_join}), aggregate AS ({aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured original 4‑table join into dimension‑first CTEs, then a Cartesian product of filtered dimension keys, then a multi‑column IN semi‑join against the fact table. This pushes all dimension filters early and avoids scanning the fact table before applying the join conditions.
+
+**Expected speedup**: ~2‑4× (baseline 301ms). The dimension CTEs are tiny (1,800 + 720 + 14 rows), creating a small key set for the semi‑join. DuckDB’s IN with subquery should optimize to a hash‑join, avoiding the Cartesian explosion risk.

@@ -1,0 +1,87 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Structural change (CTE pipeline)
+    ├── [CTE] d2_filtered  [+]
+    │   └── SCAN (date_dim d2) with filter (d_year=1999, d_moy=7)
+    ├── [CTE] store_returns_filtered  [+]
+    │   ├── SCAN (store_returns)
+    │   └── HASH JOIN (sr_returned_date_sk = d2_filtered.d_date_sk)
+    ├── [CTE] sales_returns_store_joined  [+]
+    │   ├── SCAN (store_sales, store)
+    │   └── HASH JOIN (multi-key: ss_item_sk=sr_item_sk, ss_ticket_number=sr_ticket_number, ss_customer_sk=sr_customer_sk, ss_store_sk=s_store_sk)
+    ├── [CTE] d1_joined  [+]
+    │   ├── SCAN (date_dim d1)
+    │   └── HASH JOIN (ss_sold_date_sk = d1.d_date_sk) with correlated range filter
+    ├── [CTE] aggregated  [+]
+    │   └── HASH AGGREGATE (group by 10 store columns, conditional sums)
+    ├── SORT (10 store columns)  [=]
+    └── OUTPUT (10 store columns + 5 aggregates)  [=]
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL v16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_isolation", "description": "Extract selective date_dim filter (d2) into separate CTE to create tiny hash table", "applied_to": ["d2_filtered"]},
+    {"id": "R2", "type": "explicit_join_syntax", "description": "Convert all comma-separated joins to explicit JOIN syntax with clear join conditions", "applied_to": ["store_returns_filtered", "sales_returns_store_joined", "d1_joined"]},
+    {"id": "R3", "type": "cte_non_materialized", "description": "Use WITH without MATERIALIZED to allow CTE inlining and parallel execution", "applied_to": ["d2_filtered", "store_returns_filtered", "sales_returns_store_joined", "d1_joined", "aggregated"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "d2_filtered": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_year = 1999 AND d_moy = 7",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "store_returns_filtered": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT sr_item_sk, sr_ticket_number, sr_customer_sk, sr_returned_date_sk, d2.d_date FROM store_returns JOIN d2_filtered d2 ON sr_returned_date_sk = d2.d_date_sk",
+        "interfaces": {"outputs": ["sr_item_sk", "sr_ticket_number", "sr_customer_sk", "sr_returned_date_sk", "d_date"], "consumes": ["d2_filtered"]}
+      },
+      "sales_returns_store_joined": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s.s_store_name, s.s_company_id, s.s_street_number, s.s_street_name, s.s_street_type, s.s_suite_number, s.s_city, s.s_county, s.s_state, s.s_zip, ss.ss_sold_date_sk, sr.sr_returned_date_sk, sr.d_date FROM store_sales ss JOIN store_returns_filtered sr ON ss.ss_item_sk = sr.sr_item_sk AND ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_customer_sk = sr.sr_customer_sk JOIN store s ON ss.ss_store_sk = s.s_store_sk",
+        "interfaces": {"outputs": ["s_store_name", "s_company_id", "s_street_number", "s_street_name", "s_street_type", "s_suite_number", "s_city", "s_county", "s_state", "s_zip", "ss_sold_date_sk", "sr_returned_date_sk", "d_date"], "consumes": ["store_returns_filtered"]}
+      },
+      "d1_joined": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT j.s_store_name, j.s_company_id, j.s_street_number, j.s_street_name, j.s_street_type, j.s_suite_number, j.s_city, j.s_county, j.s_state, j.s_zip, j.ss_sold_date_sk, j.sr_returned_date_sk FROM sales_returns_store_joined j JOIN date_dim d1 ON j.ss_sold_date_sk = d1.d_date_sk WHERE d1.d_date BETWEEN (j.d_date - INTERVAL '120 DAY') AND j.d_date",
+        "interfaces": {"outputs": ["s_store_name", "s_company_id", "s_street_number", "s_street_name", "s_street_type", "s_suite_number", "s_city", "s_county", "s_state", "s_zip", "ss_sold_date_sk", "sr_returned_date_sk"], "consumes": ["sales_returns_store_joined"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS \"30 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 30) AND (sr_returned_date_sk - ss_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS \"31-60 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 60) AND (sr_returned_date_sk - ss_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS \"61-90 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 90) AND (sr_returned_date_sk - ss_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS \"91-120 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 120) THEN 1 ELSE 0 END) AS \">120 days\" FROM d1_joined GROUP BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip",
+        "interfaces": {"outputs": ["s_store_name", "s_company_id", "s_street_number", "s_street_name", "s_street_type", "s_suite_number", "s_city", "s_county", "s_state", "s_zip", "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"], "consumes": ["d1_joined"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, \"30 days\", \"31-60 days\", \"61-90 days\", \"91-120 days\", \">120 days\" FROM aggregated ORDER BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip LIMIT 100",
+        "interfaces": {"outputs": ["s_store_name", "s_company_id", "s_street_number", "s_street_name", "s_street_type", "s_suite_number", "s_city", "s_county", "s_state", "s_zip", "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"], "consumes": ["aggregated"]}
+      }
+    },
+    "reconstruction_order": ["d2_filtered", "store_returns_filtered", "sales_returns_store_joined", "d1_joined", "aggregated", "main_query"],
+    "assembly_template": "WITH d2_filtered AS ({d2_filtered}), store_returns_filtered AS ({store_returns_filtered}), sales_returns_store_joined AS ({sales_returns_store_joined}), d1_joined AS ({d1_joined}), aggregated AS ({aggregated}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+Changes: Isolated the highly selective date_dim filter (d2) into a separate CTE to create a tiny hash table, converted all comma joins to explicit JOIN syntax, and used non-materialized CTEs to allow PostgreSQL's optimizer to inline and parallelize the query.
+
+Expected speedup: 2-3x from better hash join planning with tiny probe tables and preserved parallel execution.

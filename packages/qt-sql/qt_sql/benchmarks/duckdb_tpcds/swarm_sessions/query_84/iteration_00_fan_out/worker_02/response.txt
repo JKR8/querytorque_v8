@@ -1,0 +1,96 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~100  — CTE pipeline following target logical tree
+    ├── [~] CTE ca_ib_filtered  [new] — Filter customer_address and income_band with Cartesian product
+    │   ├── SCAN customer_address (filter: ca_city = 'Oakwood')
+    │   ├── SCAN income_band (filter: ib_lower_bound >= 5806 AND ib_upper_bound <= 55806)
+    │   └── CROSS JOIN
+    ├── [~] CTE hd_join  [new] — Join household_demographics to filtered income bands
+    │   ├── SCAN household_demographics
+    │   └── JOIN ON hd_income_band_sk = ca_ib_filtered.ib_income_band_sk
+    ├── [~] CTE c_join  [new] — Join customer to filtered addresses and household demographics
+    │   ├── SCAN customer
+    │   ├── JOIN ON c_current_addr_sk = ca_ib_filtered.ca_address_sk
+    │   └── JOIN ON c_current_hdemo_sk = hd_join.hd_demo_sk
+    ├── [~] CTE cd_join  [new] — Join customer_demographics to filtered customers
+    │   ├── SCAN customer_demographics
+    │   └── JOIN ON cd_demo_sk = c_join.c_current_cdemo_sk
+    ├── [~] CTE sr_join  [new] — Join store_returns to filtered customer demographics
+    │   ├── SCAN store_returns
+    │   └── JOIN ON sr_cdemo_sk = cd_join.cd_demo_sk
+    ├── [~] SORT (c_customer_id ASC)  [moved to top_n]
+    └── [~] OUTPUT (customer_id, customername)  [from top_n CTE]
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Extracted dimension filters into separate CTEs to avoid Cartesian explosion and enable predicate pushdown", "applied_to": ["ca_ib_filtered", "hd_join", "c_join", "cd_join"]},
+    {"id": "R2", "type": "early_filter", "description": "Applied city and income band filters at earliest possible scan, reducing downstream join sizes", "applied_to": ["ca_ib_filtered"]},
+    {"id": "R3", "type": "fact_join_defer", "description": "Deferred store_returns join until after all dimension filtering completed", "applied_to": ["sr_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "ca_ib_filtered": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ca_address_sk, ib_income_band_sk FROM customer_address CROSS JOIN income_band WHERE ca_city = 'Oakwood' AND ib_lower_bound >= 5806 AND ib_upper_bound <= 55806",
+        "interfaces": {"outputs": ["ca_address_sk", "ib_income_band_sk"], "consumes": []}
+      },
+      "hd_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT hd_demo_sk, ca_ib_filtered.ca_address_sk FROM household_demographics JOIN ca_ib_filtered ON hd_income_band_sk = ca_ib_filtered.ib_income_band_sk",
+        "interfaces": {"outputs": ["hd_demo_sk", "ca_address_sk"], "consumes": ["ca_ib_filtered"]}
+      },
+      "c_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c.c_customer_id, c.c_first_name, c.c_last_name, c.c_current_cdemo_sk FROM customer c JOIN ca_ib_filtered ON c.c_current_addr_sk = ca_ib_filtered.ca_address_sk JOIN hd_join ON c.c_current_hdemo_sk = hd_join.hd_demo_sk",
+        "interfaces": {"outputs": ["c_customer_id", "c_first_name", "c_last_name", "c_current_cdemo_sk"], "consumes": ["ca_ib_filtered", "hd_join"]}
+      },
+      "cd_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cd.cd_demo_sk, c_join.c_customer_id, c_join.c_first_name, c_join.c_last_name FROM customer_demographics cd JOIN c_join ON cd.cd_demo_sk = c_join.c_current_cdemo_sk",
+        "interfaces": {"outputs": ["cd_demo_sk", "c_customer_id", "c_first_name", "c_last_name"], "consumes": ["c_join"]}
+      },
+      "sr_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cd_join.c_customer_id, COALESCE(cd_join.c_last_name,'') || ', ' || COALESCE(cd_join.c_first_name,'') AS customername FROM cd_join JOIN store_returns ON store_returns.sr_cdemo_sk = cd_join.cd_demo_sk",
+        "interfaces": {"outputs": ["c_customer_id", "customername"], "consumes": ["cd_join"]}
+      },
+      "top_n": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_customer_id AS customer_id, customername FROM sr_join ORDER BY c_customer_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["customer_id", "customername"], "consumes": ["sr_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT customer_id, customername FROM top_n",
+        "interfaces": {"outputs": ["customer_id", "customername"], "consumes": ["top_n"]}
+      }
+    },
+    "reconstruction_order": ["ca_ib_filtered", "hd_join", "c_join", "cd_join", "sr_join", "top_n", "main_query"],
+    "assembly_template": "WITH ca_ib_filtered AS ({ca_ib_filtered}), hd_join AS ({hd_join}), c_join AS ({c_join}), cd_join AS ({cd_join}), sr_join AS ({sr_join}), top_n AS ({top_n}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured original monolithic join into CTE pipeline isolating dimension filters first (customer_address, income_band) before progressing to household_demographics, customer, customer_demographics, and finally store_returns. This ensures selective predicates apply earliest and reduce intermediate join cardinalities.
+
+**Expected speedup**: 2-4x due to early reduction of dimension tables and deferred fact table join until after all filtering complete.

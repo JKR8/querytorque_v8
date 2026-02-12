@@ -1,0 +1,130 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_filter_cte  [+]  Cost: <1%  Rows: 4
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_date IN ('1999-01-10','1999-06-17','1999-08-04','1999-11-05'))
+│   └── OUTPUT (d_date_sk, d_date)
+├── [CTE] item_filter_cte  [+]  Cost: <1%  Rows: ~hundreds
+│   ├── SCAN (item)
+│   ├── FILTER (i_category IN ('Children','Electronics'))
+│   ├── FILTER (i_manager_id BETWEEN 15 AND 24)
+│   └── OUTPUT (i_item_sk, i_item_id)
+├── [CTE] unified_returns_cte  [!]  Cost: 99%  Rows: ~600
+│   ├── UNION ALL
+│   │   ├── BRANCH 1: store_returns
+│   │   │   ├── SCAN (store_returns)
+│   │   │   ├── FILTER (sr_reason_sk IN (7,18,19,22,36))
+│   │   │   ├── FILTER (sr_return_amt/sr_return_quantity BETWEEN 253 AND 282)
+│   │   │   └── PROJECT ('store', sr_item_sk, sr_returned_date_sk, sr_return_quantity)
+│   │   ├── BRANCH 2: catalog_returns
+│   │   │   ├── SCAN (catalog_returns)
+│   │   │   ├── FILTER (cr_reason_sk IN (7,18,19,22,36))
+│   │   │   ├── FILTER (cr_return_amount/cr_return_quantity BETWEEN 253 AND 282)
+│   │   │   └── PROJECT ('catalog', cr_item_sk, cr_returned_date_sk, cr_return_quantity)
+│   │   └── BRANCH 3: web_returns
+│   │       ├── SCAN (web_returns)
+│   │       ├── FILTER (wr_reason_sk IN (7,18,19,22,36))
+│   │       ├── FILTER (wr_return_amt/wr_return_quantity BETWEEN 253 AND 282)
+│   │       └── PROJECT ('web', wr_item_sk, wr_returned_date_sk, wr_return_quantity)
+│   ├── JOIN (returns.date_sk = date_filter_cte.d_date_sk)
+│   ├── JOIN (returns.item_sk = item_filter_cte.i_item_sk)
+│   └── OUTPUT (channel, i_item_id, qty)
+├── [CTE] pivoted_aggregates  [!]  Cost: <1%  Rows: ~100s
+│   ├── SCAN (unified_returns_cte)
+│   ├── AGG (GROUP BY i_item_id)
+│   ├── AGGREGATE:
+│   │   ├── SUM(CASE WHEN channel = 'store' THEN qty END) AS sr_item_qty
+│   │   ├── SUM(CASE WHEN channel = 'catalog' THEN qty END) AS cr_item_qty
+│   │   └── SUM(CASE WHEN channel = 'web' THEN qty END) AS wr_item_qty
+│   └── OUTPUT (item_id, sr_item_qty, cr_item_qty, wr_item_qty)
+├── [~] cr_items  [-]  (replaced by pivoted_aggregates)
+├── [~] sr_items  [-]  (replaced by pivoted_aggregates)
+├── [~] wr_items  [-]  (replaced by pivoted_aggregates)
+└── [MAIN] main_query  [~]  Cost: <1%  Rows: ~1K
+    ├── SCAN (pivoted_aggregates)
+    ├── PROJECT (calculations)
+    ├── FILTER (implicit - no JOIN conditions needed)
+    ├── SORT (item_id ASC, sr_item_qty ASC)
+    └── OUTPUT (item_id, sr_item_qty, sr_dev, cr_item_qty, cr_dev, wr_item_qty, wr_dev, average)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL 16.11",
+  "rewrite_rules": [
+    {"id": "R1", "type": "shared_dimension_ctes", "description": "Extract date and item filters into reusable CTEs", "applied_to": ["date_filter_cte", "item_filter_cte"]},
+    {"id": "R2", "type": "union_all_unified_returns", "description": "Combine three channel returns with UNION ALL and join with shared dimensions once", "applied_to": ["unified_returns_cte"]},
+    {"id": "R3", "type": "single_pass_pivot_aggregation", "description": "Replace three separate CTEs with one pivot using CASE in SUM", "applied_to": ["pivoted_aggregates"]},
+    {"id": "R4", "type": "simplify_date_filter", "description": "Replace nested month_seq subqueries with direct date equality to shared CTE", "applied_to": ["unified_returns_cte"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date IN ('1999-01-10','1999-06-17','1999-08-04','1999-11-05')",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "item_filter_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_category IN ('Children', 'Electronics') AND i_manager_id BETWEEN 15 AND 24",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "unified_returns_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT returns.channel, ifc.i_item_id, returns.qty FROM (SELECT 'store' AS channel, sr_item_sk AS item_sk, sr_returned_date_sk AS date_sk, sr_return_quantity AS qty FROM store_returns WHERE sr_reason_sk IN (7,18,19,22,36) AND sr_return_amt/sr_return_quantity BETWEEN 253 AND 282 UNION ALL SELECT 'catalog' AS channel, cr_item_sk AS item_sk, cr_returned_date_sk AS date_sk, cr_return_quantity AS qty FROM catalog_returns WHERE cr_reason_sk IN (7,18,19,22,36) AND cr_return_amount/cr_return_quantity BETWEEN 253 AND 282 UNION ALL SELECT 'web' AS channel, wr_item_sk AS item_sk, wr_returned_date_sk AS date_sk, wr_return_quantity AS qty FROM web_returns WHERE wr_reason_sk IN (7,18,19,22,36) AND wr_return_amt/wr_return_quantity BETWEEN 253 AND 282) AS returns INNER JOIN date_filter_cte dfc ON returns.date_sk = dfc.d_date_sk INNER JOIN item_filter_cte ifc ON returns.item_sk = ifc.i_item_sk",
+        "interfaces": {"outputs": ["channel", "i_item_id", "qty"], "consumes": ["date_filter_cte", "item_filter_cte"]}
+      },
+      "pivoted_aggregates": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_id AS item_id, SUM(CASE WHEN channel = 'store' THEN qty END) AS sr_item_qty, SUM(CASE WHEN channel = 'catalog' THEN qty END) AS cr_item_qty, SUM(CASE WHEN channel = 'web' THEN qty END) AS wr_item_qty FROM unified_returns_cte GROUP BY i_item_id",
+        "interfaces": {"outputs": ["item_id", "sr_item_qty", "cr_item_qty", "wr_item_qty"], "consumes": ["unified_returns_cte"]}
+      },
+      "cr_items": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": [], "consumes": []}
+      },
+      "sr_items": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": [], "consumes": []}
+      },
+      "wr_items": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": [], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT item_id, sr_item_qty, sr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0 * 100 AS sr_dev, cr_item_qty, cr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0 * 100 AS cr_dev, wr_item_qty, wr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0 * 100 AS wr_dev, (sr_item_qty+cr_item_qty+wr_item_qty)/3.0 AS average FROM pivoted_aggregates ORDER BY item_id, sr_item_qty LIMIT 100",
+        "interfaces": {"outputs": ["item_id", "sr_item_qty", "sr_dev", "cr_item_qty", "cr_dev", "wr_item_qty", "wr_dev", "average"], "consumes": ["pivoted_aggregates"]}
+      }
+    },
+    "reconstruction_order": ["date_filter_cte", "item_filter_cte", "unified_returns_cte", "pivoted_aggregates", "main_query"],
+    "assembly_template": "WITH date_filter_cte AS ({date_filter_cte}), item_filter_cte AS ({item_filter_cte}), unified_returns_cte AS ({unified_returns_cte}), pivoted_aggregates AS ({pivoted_aggregates}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+Changes: Replaced three separate CTEs with shared dimension filtering and unified returns processing via UNION ALL, then pivoted aggregation. This eliminates repeated dimension joins and allows single-pass aggregation.
+
+Expected speedup: 2-3x by reducing dimension table scans from 9 to 2 and eliminating the three-way Cartesian join in the final query.

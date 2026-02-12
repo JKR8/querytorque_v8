@@ -1,0 +1,88 @@
+## Diagnosis: Why 1.18x not 2.0x?
+The bottleneck is the nested-loop pattern with 719K fact rows × selective dimension lookups. W4's "staged reduction" helped but remained nested-loop bound because PostgreSQL's comma-join weakness prevented optimal hash‑join planning. The optimizer cannot reorder implicit joins effectively, keeping the nested‑loop access path.
+
+## Unexplored Angles:
+1. **Explicit JOIN syntax** – PostgreSQL's comma‑join weakness is documented; explicit JOINs unlock better hash‑join planning.
+2. **Strategic CTE materialization** – Pre‑filtering dimensions into tiny hash tables avoids nested‑loop scans.
+3. **OR‑to‑UNION transformation** – W2 failed due to incorrect column propagation, but the principle remains valid if implemented correctly.
+4. **Early fact‑table reduction** – Join fact with highly‑selective dimensions (date, call_center) before the bulky customer‑dimension joins.
+
+## Rewrite Strategy:
+- Convert comma‑joins to explicit JOINs.
+- Isolate selective dimensions (date, call_center) into non‑materialized CTEs.
+- Join fact with those dimensions first to reduce rows early.
+- Keep customer‑dimension filters in the main join to avoid CTE‑fence overhead.
+- Preserve the OR condition exactly; use UNION‑ALL only if we can guarantee correctness (here we keep OR for safety).
+- Add runtime tuning to boost hash‑join memory and parallelism.
+
+---
+
+<logic_tree>
+[=] call_center
+[=] catalog_returns
+[=] date_dim
+[=] customer
+[=] customer_address
+[=] customer_demographics
+[=] household_demographics
+[+] date_filter_cte (non‑materialized)
+[+] call_center_cte (non‑materialized)
+[~] FROM clause: original comma‑joins → explicit JOINs with strategic order
+[~] WHERE conditions: pushed into JOIN ON clauses where possible
+[=] GROUP BY unchanged
+[=] ORDER BY unchanged
+</logic_tree>
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "explicit_join_conversion", "description": "Convert comma‑joins to explicit JOIN syntax", "applied_to": ["main_query"]},
+    {"id": "R2", "type": "dimension_prefilter_cte", "description": "Isolate highly‑selective date and call_center filters into non‑materialized CTEs", "applied_to": ["date_filter_cte", "call_center_cte"]},
+    {"id": "R3", "type": "early_fact_reduction", "description": "Join fact table with filtered dimensions first, before bulky customer‑dimension joins", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_moy = 12",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "call_center_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cc_call_center_sk, cc_call_center_id, cc_name, cc_manager FROM call_center",
+        "interfaces": {"outputs": ["cc_call_center_sk", "cc_call_center_id", "cc_name", "cc_manager"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT cc_call_center_id AS Call_Center, cc_name AS Call_Center_Name, cc_manager AS Manager, SUM(cr_net_loss) AS Returns_Loss FROM catalog_returns INNER JOIN date_filter_cte ON cr_returned_date_sk = date_filter_cte.d_date_sk INNER JOIN call_center_cte ON cr_call_center_sk = call_center_cte.cc_call_center_sk INNER JOIN customer ON cr_returning_customer_sk = customer.c_customer_sk INNER JOIN customer_address ON customer.c_current_addr_sk = customer_address.ca_address_sk AND customer_address.ca_gmt_offset = -6 INNER JOIN customer_demographics ON customer.c_current_cdemo_sk = customer_demographics.cd_demo_sk AND ((customer_demographics.cd_marital_status = 'M' AND customer_demographics.cd_education_status = 'Unknown') OR (customer_demographics.cd_marital_status = 'W' AND customer_demographics.cd_education_status = 'Advanced Degree')) INNER JOIN household_demographics ON customer.c_current_hdemo_sk = household_demographics.hd_demo_sk AND household_demographics.hd_buy_potential LIKE '>10000%' GROUP BY cc_call_center_id, cc_name, cc_manager, customer_demographics.cd_marital_status, customer_demographics.cd_education_status ORDER BY SUM(cr_net_loss) DESC",
+        "interfaces": {"outputs": ["Call_Center", "Call_Center_Name", "Manager", "Returns_Loss"], "consumes": ["date_filter_cte", "call_center_cte"]}
+      }
+    },
+    "reconstruction_order": ["date_filter_cte", "call_center_cte", "main_query"],
+    "assembly_template": "WITH date_filter_cte AS ({date_filter_cte}), call_center_cte AS ({call_center_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL enable_nestloop = off",
+    "SET LOCAL work_mem = '32MB'",
+    "SET LOCAL max_parallel_workers_per_gather = 4",
+    "SET LOCAL parallel_tuple_cost = 0.001"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes:**  
+1. Explicit JOIN syntax replaces comma‑joins, allowing PostgreSQL to choose hash joins.  
+2. Pre‑filtered date and call_center CTEs create tiny hash tables for early fact‑table reduction.  
+3. Runtime settings disable nested loops, increase work_mem for hash joins, and boost parallelism.
+
+**Expected speedup:** ~2.5× – due to hash‑join‑based fact‑table reduction and better parallel execution.

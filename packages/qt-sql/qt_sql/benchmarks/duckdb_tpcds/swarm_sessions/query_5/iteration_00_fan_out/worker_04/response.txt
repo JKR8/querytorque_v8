@@ -1,0 +1,124 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_range  [+]  Cost: 0%  Rows: 14 — Extract date keys for 14-day window starting 2000-08-19
+│   └── OUTPUT (d_date_sk)
+├── [CTE] store_facts  [+]  Cost: 25%  Rows: ~1K — Combine store sales and returns for date window
+│   ├── SCAN (store_sales, store_returns, date_range)
+│   ├── JOIN (date_sk = d_date_sk)
+│   ├── FILTER (implicit via JOIN)
+│   └── OUTPUT (store_sk, date_sk, sales_price, profit, return_amt, net_loss)
+├── [CTE] ssr  [~]  Cost: 25%  Rows: ~1K — Aggregate store_facts by store_id (modified to use store_facts CTE)
+│   ├── SCAN (store_facts, store (join))
+│   ├── JOIN (store_sk = s_store_sk)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (s_store_id, sales, profit, returns, profit_loss)
+├── [CTE] catalog_facts  [+]  Cost: 25%  Rows: ~1K — Combine catalog sales and returns for date window
+│   ├── SCAN (catalog_sales, catalog_returns, date_range)
+│   ├── JOIN (date_sk = d_date_sk)
+│   ├── FILTER (implicit via JOIN)
+│   └── OUTPUT (page_sk, date_sk, sales_price, profit, return_amt, net_loss)
+├── [CTE] csr  [~]  Cost: 25%  Rows: ~1K — Aggregate catalog_facts by catalog_page_id (modified to use catalog_facts CTE)
+│   ├── SCAN (catalog_facts, catalog_page (join))
+│   ├── JOIN (page_sk = cp_catalog_page_sk)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (cp_catalog_page_id, sales, profit, returns, profit_loss)
+├── [CTE] web_consolidated  [+]  Cost: 25%  Rows: ~79K — Single scan of web_sales LEFT JOIN web_returns with date filter
+│   ├── SCAN (web_sales, web_returns, date_range)
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── LEFT JOIN (wr_item_sk = ws_item_sk AND wr_order_number = ws_order_number AND wr_returned_date_sk = d_date_sk)
+│   └── OUTPUT (ws_web_site_sk, ws_sold_date_sk, ws_ext_sales_price, ws_net_profit, wr_return_amt, wr_net_loss)
+├── [CTE] wsr  [~]  Cost: 25%  Rows: 21 — Aggregate web_consolidated by web_site_id (modified structure)
+│   ├── SCAN (web_consolidated, web_site (join))
+│   ├── UNION ALL (sales branch + returns branch)
+│   ├── JOIN (wsr_web_site_sk = web_site_sk)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (web_site_id, sales, profit, returns, profit_loss)
+└── [MAIN] main_query  [=]  Cost: 25%  Rows: ~1K — Union channel aggregates with rollup
+    ├── SCAN (wsr, ssr, csr)
+    ├── AGG (GROUP BY ROLLUP)
+    ├── SORT (channel ASC, id ASC)
+    └── OUTPUT (channel, id, sales, returns, profit)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extract date filter into reusable CTE to push predicate early", "applied_to": ["date_range"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Consolidate store sales/returns into single CTE with date filter applied", "applied_to": ["store_facts"]},
+    {"id": "R3", "type": "prefetch_fact_join", "description": "Consolidate catalog sales/returns into single CTE with date filter applied", "applied_to": ["catalog_facts"]},
+    {"id": "R4", "type": "single_pass_aggregation", "description": "Consolidate web sales and returns into one LEFT JOIN scan with date filter", "applied_to": ["web_consolidated"]},
+    {"id": "R5", "type": "cte_reference_update", "description": "Update ssr to consume store_facts CTE instead of raw tables", "applied_to": ["ssr"]},
+    {"id": "R6", "type": "cte_reference_update", "description": "Update csr to consume catalog_facts CTE instead of raw tables", "applied_to": ["csr"]},
+    {"id": "R7", "type": "cte_reference_update", "description": "Update wsr to consume web_consolidated CTE with UNION ALL split", "applied_to": ["wsr"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_range": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL 14 DAY)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "store_facts": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_store_sk AS store_sk, ss_sold_date_sk AS date_sk, ss_ext_sales_price AS sales_price, ss_net_profit AS profit, CAST(0 AS DECIMAL(7,2)) AS return_amt, CAST(0 AS DECIMAL(7,2)) AS net_loss FROM store_sales JOIN date_range ON ss_sold_date_sk = d_date_sk UNION ALL SELECT sr_store_sk AS store_sk, sr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7,2)) AS sales_price, CAST(0 AS DECIMAL(7,2)) AS profit, sr_return_amt AS return_amt, sr_net_loss AS net_loss FROM store_returns JOIN date_range ON sr_returned_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["store_sk", "date_sk", "sales_price", "profit", "return_amt", "net_loss"], "consumes": ["date_range"]}
+      },
+      "ssr": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s_store_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS \"returns\", SUM(net_loss) AS profit_loss FROM store_facts, store WHERE date_sk IS NOT NULL AND store_sk = s_store_sk GROUP BY s_store_id",
+        "interfaces": {"outputs": ["s_store_id", "sales", "profit", "returns", "profit_loss"], "consumes": ["store_facts"]}
+      },
+      "catalog_facts": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cs_catalog_page_sk AS page_sk, cs_sold_date_sk AS date_sk, cs_ext_sales_price AS sales_price, cs_net_profit AS profit, CAST(0 AS DECIMAL(7,2)) AS return_amt, CAST(0 AS DECIMAL(7,2)) AS net_loss FROM catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk UNION ALL SELECT cr_catalog_page_sk AS page_sk, cr_returned_date_sk AS date_sk, CAST(0 AS DECIMAL(7,2)) AS sales_price, CAST(0 AS DECIMAL(7,2)) AS profit, cr_return_amount AS return_amt, cr_net_loss AS net_loss FROM catalog_returns JOIN date_range ON cr_returned_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["page_sk", "date_sk", "sales_price", "profit", "return_amt", "net_loss"], "consumes": ["date_range"]}
+      },
+      "csr": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cp_catalog_page_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS \"returns\", SUM(net_loss) AS profit_loss FROM catalog_facts, catalog_page WHERE date_sk IS NOT NULL AND page_sk = cp_catalog_page_sk GROUP BY cp_catalog_page_id",
+        "interfaces": {"outputs": ["cp_catalog_page_id", "sales", "profit", "returns", "profit_loss"], "consumes": ["catalog_facts"]}
+      },
+      "web_consolidated": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws.ws_web_site_sk, ws.ws_sold_date_sk, ws.ws_ext_sales_price, ws.ws_net_profit, wr.wr_return_amt, wr.wr_net_loss FROM web_sales ws JOIN date_range dr ON ws.ws_sold_date_sk = dr.d_date_sk LEFT OUTER JOIN web_returns wr ON wr.wr_item_sk = ws.ws_item_sk AND wr.wr_order_number = ws.ws_order_number AND wr.wr_returned_date_sk = dr.d_date_sk",
+        "interfaces": {"outputs": ["ws_web_site_sk", "ws_sold_date_sk", "ws_ext_sales_price", "ws_net_profit", "wr_return_amt", "wr_net_loss"], "consumes": ["date_range"]}
+      },
+      "wsr": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT web_site_id, SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS \"returns\", SUM(net_loss) AS profit_loss FROM (SELECT ws_web_site_sk AS wsr_web_site_sk, ws_sold_date_sk, ws_ext_sales_price AS sales_price, ws_net_profit AS profit, CAST(0 AS DECIMAL(7,2)) AS return_amt, CAST(0 AS DECIMAL(7,2)) AS net_loss FROM web_consolidated UNION ALL SELECT ws_web_site_sk AS wsr_web_site_sk, ws_sold_date_sk, CAST(0 AS DECIMAL(7,2)) AS sales_price, CAST(0 AS DECIMAL(7,2)) AS profit, wr_return_amt AS return_amt, wr_net_loss AS net_loss FROM web_consolidated WHERE wr_return_amt IS NOT NULL) salesreturns, web_site WHERE wsr_web_site_sk = web_site_sk GROUP BY web_site_id",
+        "interfaces": {"outputs": ["web_site_id", "sales", "profit", "returns", "profit_loss"], "consumes": ["web_consolidated"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["channel", "id", "sales", "returns", "profit"], "consumes": ["ssr", "csr", "wsr"]}
+      }
+    },
+    "reconstruction_order": ["date_range", "store_facts", "ssr", "catalog_facts", "csr", "web_consolidated", "wsr", "main_query"],
+    "assembly_template": "WITH date_range AS ({date_range}), store_facts AS ({store_facts}), ssr AS ({ssr}), catalog_facts AS ({catalog_facts}), csr AS ({csr}), web_consolidated AS ({web_consolidated}), wsr AS ({wsr}) SELECT channel, id, SUM(sales) AS sales, SUM(\"returns\") AS \"returns\", SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, 'store' || s_store_id AS id, sales, \"returns\", (profit - profit_loss) AS profit FROM ssr UNION ALL SELECT 'catalog channel' AS channel, 'catalog_page' || cp_catalog_page_id AS id, sales, \"returns\", (profit - profit_loss) AS profit FROM csr UNION ALL SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, \"returns\", (profit - profit_loss) AS profit FROM wsr) x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured into a CTE pipeline that isolates date filtering, consolidates fact table scans per channel, and uses a single pass for web sales/returns with LEFT JOIN. The wsr CTE splits consolidated rows into sales and returns branches via UNION ALL to maintain exact semantics.
+
+**Expected speedup**: 2-3x reduction in table scans (date_dim from 3→1, web_sales from 2→1, store/catalog sales+returns from 2→1 each). Predicate pushdown into consolidated CTEs avoids post-join filtering. Overhead from CTE materialization acceptable given baseline 1138ms.

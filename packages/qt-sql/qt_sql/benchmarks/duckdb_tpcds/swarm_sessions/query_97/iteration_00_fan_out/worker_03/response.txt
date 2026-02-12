@@ -1,0 +1,88 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_filter  [+]  Cost: 0%  Rows: 365  — Date dimension filtered for month sequence 1214-1225
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_month_seq BETWEEN 1214 AND 1214 + 11)
+│   └── OUTPUT (d_date_sk)
+├── [CTE] store_agg  [~]  Cost: 33%  Rows: ~5.4M  — Build distinct customer-item pairs from store sales in date window
+│   ├── SCAN (store_sales)
+│   ├── JOIN (ss_sold_date_sk = date_filter.d_date_sk)
+│   ├── FILTER (via JOIN to date_filter)
+│   ├── AGG (GROUP BY ss_customer_sk, ss_item_sk)
+│   └── OUTPUT (customer_sk, item_sk)
+├── [CTE] catalog_agg  [~]  Cost: 33%  Rows: ~2.9M  — Build distinct customer-item pairs from catalog sales in same window
+│   ├── SCAN (catalog_sales)
+│   ├── JOIN (cs_sold_date_sk = date_filter.d_date_sk)
+│   ├── FILTER (via JOIN to date_filter)
+│   ├── AGG (GROUP BY cs_bill_customer_sk, cs_item_sk)
+│   └── OUTPUT (customer_sk, item_sk)
+└── [MAIN] main_select  [~]  Cost: 33%  Rows: 1  — Compute three counts via scalar subqueries instead of FULL OUTER JOIN
+    ├── SCALAR SUBQUERY (store_only)
+    ├── SCALAR SUBQUERY (catalog_only)
+    ├── SCALAR SUBQUERY (store_and_catalog)
+    └── OUTPUT (store_only, catalog_only, store_and_catalog)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "date_cte_isolate",
+      "description": "Extracted date filter into shared CTE to eliminate duplicate date_dim scans",
+      "applied_to": ["date_filter"]
+    },
+    {
+      "id": "R2",
+      "type": "pushdown",
+      "description": "Pushed date filtering into CTEs and restructured main query to use scalar subqueries with EXISTS/NOT EXISTS instead of FULL OUTER JOIN",
+      "applied_to": ["store_agg", "catalog_agg", "main_select"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1214 AND 1214 + 11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "store_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_customer_sk AS customer_sk, ss_item_sk AS item_sk FROM store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk GROUP BY ss_customer_sk, ss_item_sk",
+        "interfaces": {"outputs": ["customer_sk", "item_sk"], "consumes": ["date_filter"]}
+      },
+      "catalog_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk FROM catalog_sales JOIN date_filter ON cs_sold_date_sk = d_date_sk GROUP BY cs_bill_customer_sk, cs_item_sk",
+        "interfaces": {"outputs": ["customer_sk", "item_sk"], "consumes": ["date_filter"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT (SELECT COUNT(*) FROM store_agg s WHERE NOT EXISTS (SELECT 1 FROM catalog_agg c WHERE c.customer_sk = s.customer_sk AND c.item_sk = s.item_sk)) AS store_only, (SELECT COUNT(*) FROM catalog_agg c WHERE NOT EXISTS (SELECT 1 FROM store_agg s WHERE s.customer_sk = c.customer_sk AND s.item_sk = c.item_sk)) AS catalog_only, (SELECT COUNT(*) FROM store_agg s WHERE EXISTS (SELECT 1 FROM catalog_agg c WHERE c.customer_sk = s.customer_sk AND c.item_sk = s.item_sk)) AS store_and_catalog LIMIT 100",
+        "interfaces": {"outputs": ["store_only", "catalog_only", "store_and_catalog"], "consumes": ["store_agg", "catalog_agg"]}
+      }
+    },
+    "reconstruction_order": ["date_filter", "store_agg", "catalog_agg", "main_query"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), store_agg AS ({store_agg}), catalog_agg AS ({catalog_agg}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Restructured to follow target logical tree: extracted shared date filter CTE and replaced FULL OUTER JOIN with scalar subqueries using EXISTS/NOT EXISTS for the three counts.
+
+Expected speedup: Moderate (1.5-2x) due to shared date filter elimination and potential optimization of scalar subqueries into semi-joins by DuckDB optimizer.

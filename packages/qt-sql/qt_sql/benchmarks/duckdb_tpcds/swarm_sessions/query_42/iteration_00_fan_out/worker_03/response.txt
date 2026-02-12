@@ -1,0 +1,96 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (rewritten with CTEs)
+└── [MAIN] main_query  [!]  Cost: 100%  Rows: ~1K  — CTE-based pipeline following target logical tree
+    ├── [CTE] date_keys  [+]  — Filtered date dimension keys
+    │   ├── SCAN (date_dim)
+    │   ├── FILTER (d_moy = 11 AND d_year = 2002)
+    │   └── OUTPUT (d_date_sk)
+    ├── [CTE] item_keys  [+]  — Filtered item keys with category columns
+    │   ├── SCAN (item)
+    │   ├── FILTER (i_manager_id = 1)
+    │   └── OUTPUT (i_item_sk, i_category_id, i_category)
+    ├── [CTE] filtered_fact  [+]  — Fact rows matching filtered dimension keys
+    │   ├── SCAN (store_sales)
+    │   ├── FILTER (ss_sold_date_sk IN (date_keys) AND ss_item_sk IN (item_keys))
+    │   └── OUTPUT (ss_sold_date_sk, ss_item_sk, ss_ext_sales_price)
+    ├── [CTE] enriched_fact  [+]  — Rejoin dimensions for grouping columns with defensive guards
+    │   ├── JOIN (filtered_fact → date_dim ON ss_sold_date_sk = d_date_sk)
+    │   ├── JOIN (filtered_fact → item ON ss_item_sk = i_item_sk)
+    │   ├── FILTER (d_moy=11 AND d_year=2002 AND i_manager_id=1) [defensive]
+    │   └── OUTPUT (d_year, i_category_id, i_category, ss_ext_sales_price)
+    ├── [CTE] aggregate  [+]  — Group by category and year
+    │   ├── GROUP BY (d_year, i_category_id, i_category)
+    │   ├── AGGREGATE (SUM(ss_ext_sales_price) AS sum_sales)
+    │   └── OUTPUT (d_year, i_category_id, i_category, sum_sales)
+    └── [CTE] top_n (main_query)  [+]  — Order and limit
+        ├── ORDER BY (sum_sales DESC, d_year, i_category_id, i_category)
+        ├── LIMIT 100
+        └── OUTPUT (d_year, i_category_id, i_category, sum_sales)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb_v1.4.3",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Filter dimension tables first to reduce fact scan", "applied_to": ["date_keys", "item_keys"]},
+    {"id": "R2", "type": "pushdown", "description": "Push dimension key filters into fact table via IN subqueries", "applied_to": ["filtered_fact"]},
+    {"id": "R3", "type": "defensive_guards", "description": "Preserve redundant filters in enriched_fact for safety", "applied_to": ["enriched_fact"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_keys": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_moy = 11 AND d_year = 2002",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "item_keys": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_category_id, i_category FROM item WHERE i_manager_id = 1",
+        "interfaces": {"outputs": ["i_item_sk", "i_category_id", "i_category"], "consumes": []}
+      },
+      "filtered_fact": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_sold_date_sk, ss_item_sk, ss_ext_sales_price FROM store_sales WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM date_keys) AND ss_item_sk IN (SELECT i_item_sk FROM item_keys)",
+        "interfaces": {"outputs": ["ss_sold_date_sk", "ss_item_sk", "ss_ext_sales_price"], "consumes": ["date_keys", "item_keys"]}
+      },
+      "enriched_fact": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT dt.d_year, item.i_category_id, item.i_category, ff.ss_ext_sales_price FROM filtered_fact ff INNER JOIN date_dim dt ON ff.ss_sold_date_sk = dt.d_date_sk INNER JOIN item ON ff.ss_item_sk = item.i_item_sk WHERE dt.d_moy = 11 AND dt.d_year = 2002 AND item.i_manager_id = 1",
+        "interfaces": {"outputs": ["d_year", "i_category_id", "i_category", "ss_ext_sales_price"], "consumes": ["filtered_fact"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_year, i_category_id, i_category, SUM(ss_ext_sales_price) AS sum_sales FROM enriched_fact GROUP BY d_year, i_category_id, i_category",
+        "interfaces": {"outputs": ["d_year", "i_category_id", "i_category", "sum_sales"], "consumes": ["enriched_fact"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT d_year, i_category_id, i_category, sum_sales FROM aggregate ORDER BY sum_sales DESC, d_year, i_category_id, i_category LIMIT 100",
+        "interfaces": {"outputs": ["d_year", "i_category_id", "i_category", "sum_sales"], "consumes": ["aggregate"]}
+      }
+    },
+    "reconstruction_order": ["date_keys", "item_keys", "filtered_fact", "enriched_fact", "aggregate", "main_query"],
+    "assembly_template": "WITH date_keys AS ({date_keys}), item_keys AS ({item_keys}), filtered_fact AS ({filtered_fact}), enriched_fact AS ({enriched_fact}), aggregate AS ({aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Converted single-block join to CTE pipeline with early dimension filtering, preserving semantic equivalence and defensive guards.
+
+**Expected speedup:** ~1.5-2x due to reduced fact table scan from early filtering and columnar efficiency (selecting only needed columns in each CTE).

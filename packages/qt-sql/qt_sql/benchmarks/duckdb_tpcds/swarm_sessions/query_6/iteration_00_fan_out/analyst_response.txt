@@ -1,0 +1,234 @@
+<reasoning>
+CLASSIFICATION: This is a star-join query with two correlated subqueries (date sequence lookup and per-category average price). It's a classic "correlated-aggregate filter" archetype where the main bottleneck is scanning the massive store_sales fact table (345.6M rows) and applying late filtering via correlated subqueries.
+
+EXPLAIN PLAN ANALYSIS:
+- Store_sales SEQ_SCAN: 173.1ms (58% of total runtime) - scanning 260K of 345.6M rows (0.075% selectivity). This is the dominant cost.
+- The optimizer already decorrelates the date_dim subquery (HASH_JOIN INNER on d_month_seq = SUBQUERY).
+- The item price correlation (LEFT_DELIM_JOIN) is still correlated and executes per outer row.
+- Row reduction:
+  - store_sales: 260K rows after date join
+  - After customer joins: 254K rows
+  - After item price filter: 25K rows (10x reduction)
+  - Final groups: 51 rows
+- The date_dim subquery is executed once (UNGROUPED_AGGREGATE), but the item average subquery appears to be re-executed per outer row (LEFT_DELIM_JOIN).
+- Only 1 scan of each base table, but store_sales scan is the bottleneck.
+
+GAP MATCHING:
+1. CORRELATED_SUBQUERY_PARALYSIS: Present - item average subquery is correlated (i_category = i.category). The optimizer uses LEFT_DELIM_JOIN which suggests it's still executing per outer row.
+2. CROSS_CTE_PREDICATE_BLINDNESS: Present - date filter is pushed via subquery but could be materialized as CTE for clarity and potential join reordering.
+3. REDUNDANT_SCAN_ELIMINATION: Not present - each table scanned only once.
+4. The query has no OR conditions, UNION, INTERSECT, or window functions.
+
+AGGREGATION TRAP CHECK:
+- Only COUNT(*) aggregate, which is duplicate-safe. No STDDEV_SAMP or FILTER clauses to worry about.
+- The correlated subquery uses AVG(j.i_current_price) which is computed per category and then compared. This is grouping-sensitive but decorrelation via pre-computed category averages preserves semantics.
+
+TRANSFORM SELECTION (ranked by expected impact):
+1. **decorrelate** (item average subquery) - High impact, addresses the correlated execution per row.
+2. **date_cte_isolate** - Medium impact, though optimizer already handles date filter efficiently via subquery.
+3. **star_join_prefetch** (combine date_cte_isolate + early_filter + dimension_cte_isolate) - High potential by pre-filtering all dimensions before joining to store_sales.
+4. **single_pass_aggregation** (novel application: consolidate the two subqueries into one CTE) - Exploration opportunity.
+
+LOGICAL TREE DESIGN:
+We need 4 distinct strategies:
+1. Decorrelate item average only
+2. Date CTE isolate + early filtering
+3. Star-join prefetch with all dimension CTEs
+4. Exploration: Single-pass consolidation with category average pre-join
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Count March 2002 store sales by customer state for items priced >120% of their category average, outputting states with ≥10 qualifying rows. All joins are INNER (intersection) requiring matches across all 5 tables. The COUNT(*) aggregate is duplicate-safe but the correlated AVG per category must preserve exact category boundaries. The HAVING filter depends on the count after all joins and filters.
+
+BOTTLENECK_DIAGNOSIS:
+Store_sales SEQ_SCAN dominates (173.1ms, 58%) - scan-bound on 345.6M rows reduced to 260K via date join. The optimizer already decorrelates the date subquery efficiently (hash join). Logical-tree costs are misleading - the item price filter (LEFT_DELIM_JOIN) shows 0 rows but processes 254K rows upstream. Cardinality flow: store_sales 260K → after customer joins 254K → after item filter 25K → groups 51 → HAVING 51 → TOP_N 51.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output state and cnt columns exactly.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (ca_state, ca_address_sk, i_category, etc.).
+- LITERAL_PRESERVATION: Must preserve 2002, 3, 1.2, 10, 100 exactly.
+- SEMANTIC_EQUIVALENCE: Result rows, columns, and ordering must match original.
+- CORRELATED_SUBQUERY_PARALYSIS: LEFT_DELIM_JOIN in EXPLAIN shows item average subquery still correlated.
+- CROSS_CTE_PREDICATE_BLINDNESS: Date filter applied via subquery could be pushed earlier via CTE.
+
+REGRESSION_WARNINGS:
+1. regression_q1_decorrelate (0.71x):
+   CAUSE: Pre-aggregating GROUP BY into CTEs lost optimizer's incremental computation with filter pushdown.
+   RULE: When decorrelating item average, keep the AVG computation as a simple CTE without extra GROUP BY columns.
+2. regression_q25_date_cte_isolate (0.5x):
+   CAUSE: Pre-filtering fact table before multi-way join prevented optimizer reordering.
+   RULE: Avoid forcing join order when query has multiple fact tables (not applicable here - only store_sales).
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: decorrelate
+TARGET_LOGICAL_TREE:
+item_avg_cte -> main_query_with_join
+NODE_CONTRACTS:
+  item_avg_cte:
+    FROM: item AS j
+    WHERE: (none)
+    GROUP BY: j.i_category
+    AGGREGATE: AVG(j.i_current_price) AS avg_price
+    OUTPUT: j.i_category, AVG(j.i_current_price) AS avg_price
+    EXPECTED_ROWS: ~10 (from EXPLAIN's HASH_GROUP_BY [11 rows])
+    CONSUMERS: main_query
+  main_query:
+    FROM: customer_address a, customer c, store_sales s, date_dim d, item i, item_avg_cte ia
+    JOIN: a.ca_address_sk = c.c_current_addr_sk, c.c_customer_sk = s.ss_customer_sk, s.ss_sold_date_sk = d.d_date_sk, s.ss_item_sk = i.i_item_sk, i.i_category = ia.i_category
+    WHERE: d.d_month_seq = (SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2002 AND d_moy = 3)
+           AND i.i_current_price > 1.2 * ia.avg_price
+    GROUP BY: a.ca_state
+    AGGREGATE: COUNT(*) AS cnt
+    HAVING: cnt >= 10
+    OUTPUT: a.ca_state AS state, cnt
+    ORDER BY: cnt, a.ca_state
+    LIMIT: 100
+    EXPECTED_ROWS: 51
+    CONSUMERS: (output)
+EXAMPLES: decorrelate, composite_decorrelate_union
+EXAMPLE_ADAPTATION:
+- decorrelate: Apply the pattern of converting correlated AVG subquery to CTE+JOIN. Ignore the s_state filter pushdown (not present here).
+- composite_decorrelate_union: Ignore the UNION/EXISTS aspects; focus on extracting shared dimension filters.
+HAZARD_FLAGS:
+- Must preserve the original date subquery structure (SELECT DISTINCT d_month_seq).
+- JOIN condition i.i_category = ia.i_category must handle NULL categories correctly (original uses IS NOT DISTINCT FROM).
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: date_cte_isolate
+TARGET_LOGICAL_TREE:
+date_seq_cte -> main_query_with_date_cte
+NODE_CONTRACTS:
+  date_seq_cte:
+    FROM: date_dim
+    WHERE: d_year = 2002 AND d_moy = 3
+    OUTPUT: DISTINCT d_month_seq
+    EXPECTED_ROWS: 1 (EXPLAIN shows UNGROUPED_AGGREGATE [1 row])
+    CONSUMERS: main_query
+  main_query:
+    FROM: customer_address a, customer c, store_sales s, date_dim d, item i, date_seq_cte ds
+    JOIN: a.ca_address_sk = c.c_current_addr_sk, c.c_customer_sk = s.ss_customer_sk, s.ss_sold_date_sk = d.d_date_sk, s.ss_item_sk = i.i_item_sk, d.d_month_seq = ds.d_month_seq
+    WHERE: i.i_current_price > 1.2 * (SELECT AVG(j.i_current_price) FROM item j WHERE j.i_category = i.i_category)
+    GROUP BY: a.ca_state
+    AGGREGATE: COUNT(*) AS cnt
+    HAVING: cnt >= 10
+    OUTPUT: a.ca_state AS state, cnt
+    ORDER BY: cnt, a.ca_state
+    LIMIT: 100
+    EXPECTED_ROWS: 51
+    CONSUMERS: (output)
+EXAMPLES: date_cte_isolate, early_filter, prefetch_fact_join
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: Extract date filter into CTE exactly as shown. Ignore the multiple date alias aspect.
+- early_filter: Apply the principle of filtering date_dim first, but keep the correlated item subquery.
+- prefetch_fact_join: Ignore the fact table pre-join chain; focus only on date dimension isolation.
+HAZARD_FLAGS:
+- The date CTE returns DISTINCT d_month_seq; must join on d.d_month_seq = ds.d_month_seq.
+- Keep the correlated item subquery unchanged.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+date_seq_cte -> item_avg_cte -> filtered_item_cte -> prefetch_core -> final_agg
+NODE_CONTRACTS:
+  date_seq_cte:
+    FROM: date_dim
+    WHERE: d_year = 2002 AND d_moy = 3
+    OUTPUT: DISTINCT d_month_seq
+    EXPECTED_ROWS: 1
+    CONSUMERS: filtered_dates
+  filtered_dates:
+    FROM: date_dim d, date_seq_cte ds
+    JOIN: d.d_month_seq = ds.d_month_seq
+    OUTPUT: d.d_date_sk
+    EXPECTED_ROWS: ~31 (EXPLAIN shows 31 rows)
+    CONSUMERS: prefetch_core
+  item_avg_cte:
+    FROM: item j
+    GROUP BY: j.i_category
+    AGGREGATE: AVG(j.i_current_price) AS avg_price
+    OUTPUT: j.i_category, AVG(j.i_current_price) AS avg_price
+    EXPECTED_ROWS: ~10
+    CONSUMERS: filtered_items
+  filtered_items:
+    FROM: item i, item_avg_cte ia
+    JOIN: i.i_category = ia.i_category
+    WHERE: i.i_current_price > 1.2 * ia.avg_price
+    OUTPUT: i.i_item_sk, i.i_category
+    EXPECTED_ROWS: ~25K (from EXPLAIN FILTER [25K rows])
+    CONSUMERS: prefetch_core
+  prefetch_core:
+    FROM: store_sales s, filtered_dates fd, filtered_items fi
+    JOIN: s.ss_sold_date_sk = fd.d_date_sk AND s.ss_item_sk = fi.i_item_sk
+    OUTPUT: s.ss_customer_sk, fi.i_category
+    EXPECTED_ROWS: ~25K
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: prefetch_core pc, customer c, customer_address a
+    JOIN: pc.ss_customer_sk = c.c_customer_sk AND c.c_current_addr_sk = a.ca_address_sk
+    GROUP BY: a.ca_state
+    AGGREGATE: COUNT(*) AS cnt
+    HAVING: cnt >= 10
+    OUTPUT: a.ca_state AS state, cnt
+    ORDER BY: cnt, a.ca_state
+    LIMIT: 100
+    EXPECTED_ROWS: 51
+    CONSUMERS: (output)
+EXAMPLES: dimension_cte_isolate, multi_dimension_prefetch, prefetch_fact_join
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering of date_dim and item into CTEs. Ignore promotion/demographics filters.
+- multi_dimension_prefetch: Pre-filter both date and item dimensions before joining with store_sales.
+- prefetch_fact_join: Use staged CTE chain: date filter → date keys → join with store_sales.
+HAZARD_FLAGS:
+- Must ensure all CTEs output necessary join keys (d_date_sk, i_item_sk, ss_customer_sk).
+- JOIN conditions must handle NULL categories correctly (IS NOT DISTINCT FROM).
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+item_category_avg_cte -> consolidated_core -> final_agg
+NODE_CONTRACTS:
+  item_category_avg_cte:
+    FROM: item j
+    GROUP BY: j.i_category
+    AGGREGATE: AVG(j.i_current_price) AS avg_price
+    OUTPUT: j.i_category, AVG(j.i_current_price) AS avg_price
+    EXPECTED_ROWS: ~10
+    CONSUMERS: consolidated_core
+  consolidated_core:
+    FROM: store_sales s
+    JOIN: date_dim d ON s.ss_sold_date_sk = d.d_date_sk
+    JOIN: item i ON s.ss_item_sk = i.i_item_sk
+    JOIN: item_category_avg_cte ia ON i.i_category = ia.i_category
+    JOIN: customer c ON s.ss_customer_sk = c.c_customer_sk
+    JOIN: customer_address a ON c.c_current_addr_sk = a.ca_address_sk
+    WHERE: d.d_month_seq = (SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2002 AND d_moy = 3)
+           AND i.i_current_price > 1.2 * ia.avg_price
+    OUTPUT: a.ca_state, i.i_item_sk, s.ss_customer_sk, c.c_current_addr_sk
+    EXPECTED_ROWS: ~25K
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: consolidated_core
+    GROUP BY: ca_state
+    AGGREGATE: COUNT(*) AS cnt
+    HAVING: cnt >= 10
+    OUTPUT: ca_state AS state, cnt
+    ORDER BY: cnt, ca_state
+    LIMIT: 100
+    EXPECTED_ROWS: 51
+    CONSUMERS: (output)
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Consolidate all joins into a single FROM clause while keeping the date subquery. Ignore the CASE WHEN aggregation aspect.
+- channel_bitmap_aggregation: Ignore the multiple bucket labeling; focus on single-pass scan principle.
+HAZARD_FLAGS:
+- This may prevent optimizer from choosing optimal join order.
+- Must preserve the exact date subquery structure.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This exploration tests whether explicit join ordering with all tables in one FROM clause outperforms CTE-based staged joins, despite potential optimizer restrictions.
+EXPLORATION_TYPE: novel_combination

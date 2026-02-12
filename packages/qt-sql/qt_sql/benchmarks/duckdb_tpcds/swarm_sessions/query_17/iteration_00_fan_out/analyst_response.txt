@@ -1,0 +1,279 @@
+<reasoning>
+1. **CLASSIFY**: This is a multi-channel self-join star query with 3 fact table joins (store_sales, store_returns, catalog_sales) linked through customer/item keys, filtered through 3 date_dim aliases with different quarter filters. Structural archetype: channel-comparison self-join with multi-date filtering.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Wall-clock ms: store_sales scan 310.6ms (32%), store_returns scan 291.7ms (30%), catalog_sales scan 98.0ms (10%). Total fact table scan time: ~700ms (72% of 970ms).
+   - >10% bottlenecks: Fact table scans dominate (store_sales 32%, store_returns 30%, catalog_sales 10%). Hash joins are relatively cheap (<20ms each).
+   - Row count drops: store_sales 345.6M → 804K (0.23% selectivity), store_returns 34.5M → 397K (1.15%), catalog_sales 172.8M → 1.6M (0.93%). Good selectivity on fact tables.
+   - Missed opportunity: date_dim is scanned 3 times (d1: 91 rows, d2: 274 rows, d3: 274 rows). Each scan is cheap but could be pre-materialized.
+   - Scan count per base table: store_sales (1 scan), store_returns (1 scan), catalog_sales (1 scan), date_dim (3 scans), store (1 scan), item (1 scan).
+   - Optimizer already: Pushes date filters into scans, uses hash joins, filters store (100 rows) and item early. Does NOT split CTEs or pre-materialize filtered dimensions.
+
+3. **GAP MATCHING**:
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: Yes - date filters aren't pre-materialized into CTEs. Opportunity: `date_cte_isolate`, `multi_date_range_cte`.
+   - **REDUNDANT_SCAN_ELIMINATION**: Partial - date_dim scanned 3 times but cheap. Fact tables scanned once each.
+   - **CORRELATED_SUBQUERY_PARALYSIS**: No - no correlated subqueries.
+   - **CROSS_COLUMN_OR_DECOMPOSITION**: No - no OR conditions.
+   - **UNION_CTE_SELF_JOIN_DECOMPOSITION**: No - no UNION CTEs.
+
+4. **AGGREGATION TRAP CHECK**: All aggregates (COUNT, AVG, STDDEV_SAMP, division) are computed after all joins complete. Any restructuring that changes row duplication before aggregation will break STDDEV_SAMP and AVG. Must preserve exact join semantics.
+
+5. **TRANSFORM SELECTION** (ranked by value):
+   - **multi_date_range_cte** (2.35x): Pre-materialize 3 date CTEs, pre-join each with respective fact table. Attacks date_dim scan redundancy.
+   - **prefetch_fact_join** (3.77x): Chain: filter dates → pre-join with facts → join remaining dims. Reduces fact table probe size.
+   - **dimension_cte_isolate** (1.93x): Pre-filter ALL dimensions (date×3, store, item) into CTEs before main join.
+   - **single_pass_aggregation** (4.47x): Not directly applicable (no repeated scans of same fact table), but could consolidate the 3 fact table scans? No - different fact tables. Use as exploration: consolidate multi-channel aggregation using CASE labeling?
+
+6. **LOGICAL TREE DESIGN**:
+   - Need CTE column completeness: Each CTE must output all keys needed for downstream joins.
+   - CTE materialization: Multi-reference CTEs (like date filters) will be materialized once.
+   - Verify downstream_refs: store_sales needs ss_item_sk, ss_store_sk, ss_customer_sk, ss_ticket_number, ss_quantity, etc.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: For items sold in stores during 2001Q1 that were later returned (2001Q1-Q3) and then re-purchased via catalog (2001Q1-Q3) by the same customer, compute per-item-per-state statistical distributions (count, avg, stddev, cov) of quantities across all three channels. All joins are INNER (intersection semantics) requiring matches across all 3 fact tables. Aggregates (STDDEV_SAMP/AVG) are grouping-sensitive to row duplication from joins. The date filters (d1='2001Q1', d2/d3 IN quarters) are independent per alias but share the same date_dim base table.
+
+BOTTLENECK_DIAGNOSIS: Scan-bound: 72% of time (700ms) spent scanning 3 large fact tables (store_sales 32%, store_returns 30%, catalog_sales 10%). Joins are cheap hash joins (<20ms each). Cardinality flow: 345.6M store_sales → 804K after date filter → 59K after matching returns → 58K after store/item joins → groups to ~1K rows. Optimizer already pushes date filters into scans and selects optimal join order. Logical-tree cost percentages underrepresent scan dominance (EXPLAIN shows exclusive timings).
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output all 14 aggregate columns + 3 grouping columns exactly as named.
+- CTE_COLUMN_COMPLETENESS: Each CTE must output all keys (date_sk, item_sk, store_sk, customer_sk, ticket_number) needed for downstream joins.
+- LITERAL_PRESERVATION: Must preserve exact quarter strings '2001Q1','2001Q2','2001Q3'.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows ordered by i_item_id, i_item_desc, s_state.
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows 3 separate date_dim scans (91, 274, 274 rows) - could be pre-materialized.
+- REDUNDANT_SCAN_ELIMINATION: date_dim scanned 3 times (cheap but redundant).
+
+REGRESSION_WARNINGS:
+1. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Pre-filtered store_sales to date CTE before 3-way fact join, preventing optimizer from reordering multi-way fact joins.
+   RULE: Avoid forcing early fact-table CTE chains when query has 3+ fact table joins (this query has 3).
+2. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially to fact tables.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: multi_date_range_cte
+TARGET_LOGICAL_TREE:
+  d1_cte -> ss_date_filtered -> sr_date_filtered -> cs_date_filtered -> main_join -> agg -> sort_limit
+NODE_CONTRACTS:
+  d1_cte:
+    FROM: date_dim
+    WHERE: d_quarter_name = '2001Q1'
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: ss_date_filtered
+  d2_cte:
+    FROM: date_dim
+    WHERE: d_quarter_name IN ('2001Q1','2001Q2','2001Q3')
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 274
+    CONSUMERS: sr_date_filtered
+  d3_cte:
+    FROM: date_dim
+    WHERE: d_quarter_name IN ('2001Q1','2001Q2','2001Q3')
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 274
+    CONSUMERS: cs_date_filtered
+  ss_date_filtered:
+    FROM: store_sales JOIN d1_cte ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_item_sk, ss_store_sk, ss_customer_sk, ss_ticket_number, ss_quantity
+    EXPECTED_ROWS: 804K
+    CONSUMERS: main_join
+  sr_date_filtered:
+    FROM: store_returns JOIN d2_cte ON sr_returned_date_sk = d_date_sk
+    OUTPUT: sr_item_sk, sr_customer_sk, sr_ticket_number, sr_return_quantity
+    EXPECTED_ROWS: 397K
+    CONSUMERS: main_join
+  cs_date_filtered:
+    FROM: catalog_sales JOIN d3_cte ON cs_sold_date_sk = d_date_sk
+    OUTPUT: cs_item_sk, cs_bill_customer_sk, cs_quantity
+    EXPECTED_ROWS: 1.6M
+    CONSUMERS: main_join
+  main_join:
+    FROM: ss_date_filtered 
+      JOIN sr_date_filtered ON ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk AND ss_ticket_number = sr_ticket_number
+      JOIN cs_date_filtered ON sr_item_sk = cs_item_sk AND sr_customer_sk = cs_bill_customer_sk
+      JOIN store ON ss_store_sk = s_store_sk
+      JOIN item ON ss_item_sk = i_item_sk
+    OUTPUT: i_item_id, i_item_desc, s_state, ss_quantity, sr_return_quantity, cs_quantity
+    EXPECTED_ROWS: 58K
+    CONSUMERS: agg
+  agg:
+    FROM: main_join
+    GROUP BY: i_item_id, i_item_desc, s_state
+    AGGREGATE: count(ss_quantity), avg(ss_quantity), stddev_samp(ss_quantity), count(sr_return_quantity), avg(sr_return_quantity), stddev_samp(sr_return_quantity), count(cs_quantity), avg(cs_quantity), stddev_samp(cs_quantity)
+    OUTPUT: all 17 columns (3 group + 14 aggregates)
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: sort_limit
+  sort_limit:
+    FROM: agg
+    ORDER BY: i_item_id, i_item_desc, s_state
+    LIMIT: 100
+    OUTPUT: same 17 columns
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: multi_date_range_cte, date_cte_isolate, prefetch_fact_join
+EXAMPLE_ADAPTATION:
+- multi_date_range_cte: Apply exact pattern - create 3 separate date CTEs with different filters. Ignore any dimension pre-filtering beyond dates.
+- date_cte_isolate: Apply date filtering into CTEs but create 3 separate ones, not one shared. Ignore other dimension isolation.
+- prefetch_fact_join: Apply pre-joining date CTEs with respective fact tables. Ignore the chaining of multiple fact tables through CTEs.
+HAZARD_FLAGS:
+- Must preserve all join conditions (3-way match on item+customer+ticket) exactly.
+- date_dim CTEs are tiny (91-274 rows) - materialization overhead minimal.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+  dims_filtered -> fact_joined -> agg -> sort_limit
+NODE_CONTRACTS:
+  d1_filtered:
+    FROM: date_dim
+    WHERE: d_quarter_name = '2001Q1'
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: fact_joined
+  d2_filtered:
+    FROM: date_dim
+    WHERE: d_quarter_name IN ('2001Q1','2001Q2','2001Q3')
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 274
+    CONSUMERS: fact_joined
+  d3_filtered:
+    FROM: date_dim
+    WHERE: d_quarter_name IN ('2001Q1','2001Q2','2001Q3')
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 274
+    CONSUMERS: fact_joined
+  store_filtered:
+    FROM: store
+    WHERE: s_store_sk <= 100  (from EXPLAIN filter)
+    OUTPUT: s_store_sk, s_state
+    EXPECTED_ROWS: 100
+    CONSUMERS: fact_joined
+  item_filtered:
+    FROM: item
+    OUTPUT: i_item_sk, i_item_id, i_item_desc
+    EXPECTED_ROWS: 102K
+    CONSUMERS: fact_joined
+  fact_joined:
+    FROM: store_sales 
+      JOIN d1_filtered ON ss_sold_date_sk = d_date_sk
+      JOIN store_returns ON ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk AND ss_ticket_number = sr_ticket_number
+      JOIN d2_filtered ON sr_returned_date_sk = d_date_sk
+      JOIN catalog_sales ON sr_item_sk = cs_item_sk AND sr_customer_sk = cs_bill_customer_sk
+      JOIN d3_filtered ON cs_sold_date_sk = d_date_sk
+      JOIN store_filtered ON ss_store_sk = s_store_sk
+      JOIN item_filtered ON ss_item_sk = i_item_sk
+    OUTPUT: i_item_id, i_item_desc, s_state, ss_quantity, sr_return_quantity, cs_quantity
+    EXPECTED_ROWS: 58K
+    CONSUMERS: agg
+  agg: (same as Worker 1)
+  sort_limit: (same as Worker 1)
+EXAMPLES: dimension_cte_isolate, multi_dimension_prefetch, early_filter
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply full pattern - pre-filter ALL 5 dimension tables (3 date, store, item) into CTEs. Ignore any fact table pre-joining.
+- multi_dimension_prefetch: Apply pre-filtering of multiple dimensions. Ignore the fact table prefetch chaining.
+- early_filter: Apply early filtering of dimension tables. Ignore the specific order of dimension vs fact joins.
+HAZARD_FLAGS:
+- Must NOT cross-join dimension CTEs (join them sequentially to fact tables).
+- Store filter (s_store_sk <= 100) comes from EXPLAIN, not original query - preserve it if present in optimized plan.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  date_filters -> ss_prejoined -> sr_prejoined -> cs_prejoined -> main_join -> agg -> sort_limit
+NODE_CONTRACTS:
+  d1_cte: (same as Worker 1 d1_cte)
+  d2_cte: (same as Worker 1 d2_cte)
+  d3_cte: (same as Worker 1 d3_cte)
+  ss_prejoined:
+    FROM: store_sales JOIN d1_cte ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_item_sk, ss_store_sk, ss_customer_sk, ss_ticket_number, ss_quantity
+    EXPECTED_ROWS: 804K
+    CONSUMERS: main_join
+  sr_prejoined:
+    FROM: store_returns JOIN d2_cte ON sr_returned_date_sk = d_date_sk
+    OUTPUT: sr_item_sk, sr_customer_sk, sr_ticket_number, sr_return_quantity
+    EXPECTED_ROWS: 397K
+    CONSUMERS: main_join
+  cs_prejoined:
+    FROM: catalog_sales JOIN d3_cte ON cs_sold_date_sk = d_date_sk
+    OUTPUT: cs_item_sk, cs_bill_customer_sk, cs_quantity
+    EXPECTED_ROWS: 1.6M
+    CONSUMERS: main_join
+  main_join:
+    FROM: ss_prejoined
+      JOIN sr_prejoined ON ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk AND ss_ticket_number = sr_ticket_number
+      JOIN cs_prejoined ON sr_item_sk = cs_item_sk AND sr_customer_sk = cs_bill_customer_sk
+      JOIN store ON ss_store_sk = s_store_sk
+      JOIN item ON ss_item_sk = i_item_sk
+    OUTPUT: i_item_id, i_item_desc, s_state, ss_quantity, sr_return_quantity, cs_quantity
+    EXPECTED_ROWS: 58K
+    CONSUMERS: agg
+  agg: (same as Worker 1)
+  sort_limit: (same as Worker 1)
+EXAMPLES: prefetch_fact_join, multi_date_range_cte, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply staged join pipeline - filter dates, pre-join with respective fact tables. Ignore the CTE chain beyond first fact join.
+- multi_date_range_cte: Apply separate date CTEs. Ignore that this strategy also pre-joins facts with dates.
+- date_cte_isolate: Apply date filtering into CTEs. Ignore that we pre-join facts immediately.
+HAZARD_FLAGS:
+- This creates 3 fact table CTEs before main join - may prevent optimizer from reordering 3-way fact join.
+- Must ensure join conditions between prejoined CTEs match original semantics exactly.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: single_pass_multi_channel_labeling
+TARGET_LOGICAL_TREE:
+  date_filters -> channel_labeled -> pivot_agg -> sort_limit
+NODE_CONTRACTS:
+  d1_cte: (same as Worker 1 d1_cte)
+  d2_cte: (same as Worker 1 d2_cte)
+  d3_cte: (same as Worker 1 d3_cte)
+  channel_labeled:
+    FROM: (
+      SELECT ss_item_sk, ss_store_sk, ss_customer_sk, ss_ticket_number, ss_quantity, 'store_sales' as channel
+      FROM store_sales JOIN d1_cte ON ss_sold_date_sk = d_date_sk
+      UNION ALL
+      SELECT sr_item_sk, NULL as store_sk, sr_customer_sk, sr_ticket_number, sr_return_quantity, 'store_returns' as channel
+      FROM store_returns JOIN d2_cte ON sr_returned_date_sk = d_date_sk
+      UNION ALL
+      SELECT cs_item_sk, NULL as store_sk, cs_bill_customer_sk, NULL as ticket_number, cs_quantity, 'catalog_sales' as channel
+      FROM catalog_sales JOIN d3_cte ON cs_sold_date_sk = d_date_sk
+    )
+    OUTPUT: item_sk, store_sk, customer_sk, ticket_number, quantity, channel
+    EXPECTED_ROWS: 804K + 397K + 1.6M = ~2.8M
+    CONSUMERS: pivot_agg
+  pivot_agg:
+    FROM: channel_labeled AS cl
+      JOIN store ON cl.store_sk = s_store_sk
+      JOIN item ON cl.item_sk = i_item_sk
+      LEFT JOIN channel_labeled AS ss ON cl.item_sk = ss.item_sk AND cl.customer_sk = ss.customer_sk AND cl.ticket_number = ss.ticket_number AND ss.channel = 'store_sales'
+      LEFT JOIN channel_labeled AS sr ON cl.item_sk = sr.item_sk AND cl.customer_sk = sr.customer_sk AND cl.ticket_number = sr.ticket_number AND sr.channel = 'store_returns'
+      LEFT JOIN channel_labeled AS cs ON cl.item_sk = cs.item_sk AND cl.customer_sk = cs.customer_sk AND cs.channel = 'catalog_sales'
+    WHERE: ss.item_sk IS NOT NULL AND sr.item_sk IS NOT NULL AND cs.item_sk IS NOT NULL
+    GROUP BY: i_item_id, i_item_desc, s_state
+    AGGREGATE: 
+      count(ss.quantity), avg(ss.quantity), stddev_samp(ss.quantity),
+      count(sr.quantity), avg(sr.quantity), stddev_samp(sr.quantity),
+      count(cs.quantity), avg(cs.quantity), stddev_samp(cs.quantity)
+    OUTPUT: all 17 columns
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: sort_limit
+  sort_limit: (same as Worker 1)
+EXAMPLES: channel_bitmap_aggregation, single_pass_aggregation, union_cte_split
+EXAMPLE_ADAPTATION:
+- channel_bitmap_aggregation: Apply consolidation of multiple channel scans into labeled UNION ALL. Ignore the CASE WHEN aggregation pivot.
+- single_pass_aggregation: Apply single scan per fact table but consolidate through UNION. Ignore that we still scan 3 tables.
+- union_cte_split: Apply splitting by channel via UNION ALL. Ignore the year-splitting aspect.
+HAZARD_FLAGS:
+- The self-LEFT JOIN pattern may explode cardinality if not carefully constrained.
+- Must ensure the WHERE clause (3-way match) replicates original INNER join semantics.
+- UNION ALL changes nullability of columns (store_sk, ticket_number).
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This exploration tests consolidation of 3 fact table scans into a labeled UNION structure with post-join filtering, which differs from failed patterns that involved EXISTS materialization or same-column OR splitting.
+EXPLORATION_TYPE: novel_combination

@@ -1,0 +1,131 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] customer_total_return_filtered  [~]  Cost: 40%  Rows: ~158K  — Filter store_returns by date and store early, aggregate to (customer,store) level.
+│   ├── SCAN (date_dim, store)
+│   ├── JOIN (filtered dims to store_returns)
+│   ├── FILTER (d_year=2000 AND s_state='SD')
+│   ├── AGG (GROUP BY sr_customer_sk, sr_store_sk)
+│   └── OUTPUT (ctr_customer_sk, ctr_store_sk, ctr_total_return)
+├── [CTE] store_averages  [+]  Cost: 10%  Rows: ~35  — Compute per-store average return from filtered CTE.
+│   ├── SCAN (customer_total_return_filtered)
+│   ├── AGG (GROUP BY ctr_store_sk)
+│   └── OUTPUT (ctr_store_sk, store_avg_return)
+├── [CTE] filtered_ids  [+]  Cost: 30%  Rows: ~62K  — Join filtered returns with store averages, keep customers exceeding 120% of store average.
+│   ├── SCAN (customer_total_return_filtered AS ctr1)
+│   ├── JOIN (store_averages ON ctr1.ctr_store_sk = store_averages.ctr_store_sk)
+│   ├── FILTER (ctr1.ctr_total_return > store_averages.store_avg_return * 1.2)
+│   └── OUTPUT (ctr_customer_sk)
+├── [CTE] customer_lookup  [+]  Cost: 15%  Rows: ~62K  — Look up customer IDs from filtered customer keys.
+│   ├── SCAN (filtered_ids)
+│   ├── JOIN (customer ON ctr_customer_sk = c_customer_sk)
+│   └── OUTPUT (c_customer_id)
+└── [MAIN] main_query  [+]  Cost: 5%  Rows: ~100  — Order and limit final customer IDs.
+    ├── SCAN (customer_lookup)
+    ├── SORT (c_customer_id ASC)
+    ├── LIMIT (100)
+    └── OUTPUT (c_customer_id)
+```
+
+Changes:
+- [~] Modified original CTE to push store filter (`s_state='SD'`) into the first CTE per target tree
+- [+] Added `store_averages` CTE to compute per-store averages separately
+- [+] Added `filtered_ids` CTE to replace correlated subquery with explicit join
+- [+] Added `customer_lookup` CTE to isolate customer table join
+- [+] Main query simplified to just ordering/limiting
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "early_filter_pushdown",
+      "description": "Push store filter (s_state='SD') into first CTE to reduce fact table scan early",
+      "applied_to": ["customer_total_return_filtered"]
+    },
+    {
+      "id": "R2",
+      "type": "decorrelate_subquery",
+      "description": "Replace correlated subquery with separate store_averages CTE and explicit join",
+      "applied_to": ["store_averages", "filtered_ids"]
+    },
+    {
+      "id": "R3",
+      "type": "cte_pipeline",
+      "description": "Create linear CTE pipeline per target logical tree: filter → aggregate store averages → filter customers → lookup customer → limit",
+      "applied_to": ["customer_total_return_filtered", "store_averages", "filtered_ids", "customer_lookup", "main_query"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "customer_total_return_filtered": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT\n  sr_customer_sk AS ctr_customer_sk,\n  sr_store_sk AS ctr_store_sk,\n  SUM(SR_FEE) AS ctr_total_return\nFROM store_returns\nINNER JOIN date_dim ON sr_returned_date_sk = d_date_sk\nINNER JOIN store ON sr_store_sk = s_store_sk\nWHERE d_year = 2000\n  AND s_state = 'SD'\nGROUP BY sr_customer_sk, sr_store_sk",
+        "interfaces": {
+          "outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_total_return"],
+          "consumes": []
+        }
+      },
+      "store_averages": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT\n  ctr_store_sk,\n  AVG(ctr_total_return) AS store_avg_return\nFROM customer_total_return_filtered\nGROUP BY ctr_store_sk",
+        "interfaces": {
+          "outputs": ["ctr_store_sk", "store_avg_return"],
+          "consumes": ["customer_total_return_filtered"]
+        }
+      },
+      "filtered_ids": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT\n  ctr1.ctr_customer_sk\nFROM customer_total_return_filtered AS ctr1\nINNER JOIN store_averages ON ctr1.ctr_store_sk = store_averages.ctr_store_sk\nWHERE ctr1.ctr_total_return > store_averages.store_avg_return * 1.2",
+        "interfaces": {
+          "outputs": ["ctr_customer_sk"],
+          "consumes": ["customer_total_return_filtered", "store_averages"]
+        }
+      },
+      "customer_lookup": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT\n  c_customer_id\nFROM filtered_ids\nINNER JOIN customer ON filtered_ids.ctr_customer_sk = c_customer_sk",
+        "interfaces": {
+          "outputs": ["c_customer_id"],
+          "consumes": ["filtered_ids"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT\n  c_customer_id\nFROM customer_lookup\nORDER BY c_customer_id ASC\nLIMIT 100",
+        "interfaces": {
+          "outputs": ["c_customer_id"],
+          "consumes": ["customer_lookup"]
+        }
+      }
+    },
+    "reconstruction_order": [
+      "customer_total_return_filtered",
+      "store_averages",
+      "filtered_ids",
+      "customer_lookup",
+      "main_query"
+    ],
+    "assembly_template": "WITH customer_total_return_filtered AS ({customer_total_return_filtered}),\nstore_averages AS ({store_averages}),\nfiltered_ids AS ({filtered_ids}),\ncustomer_lookup AS ({customer_lookup})\n{main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Changes: Pushed store filter into first CTE and replaced correlated subquery with explicit CTE pipeline per target tree structure. The mechanism filters early (store_state='SD' with date filter) before aggregation, computes store averages separately, then joins for the threshold comparison.
+
+Expected speedup: 1.3-1.8x due to early store filter reducing aggregation input and decorrelated store averages computed once.

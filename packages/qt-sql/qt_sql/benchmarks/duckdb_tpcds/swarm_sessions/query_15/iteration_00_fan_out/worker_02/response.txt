@@ -1,0 +1,95 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: ~100%  Rows: 100
+    ├── [CTE] filtered_address  [+]  — Early filter on customer_address by ZIP/state
+    │   └── SCAN customer_address + FILTER (substr(ca_zip,1,5) IN (...) OR ca_state IN (...))
+    ├── [CTE] branch_address  [+]  — Sales matching filtered addresses (Q1 2001)
+    │   └── JOIN catalog_sales ⟖ customer ⟖ filtered_address ⟖ date_dim
+    │       ├── JOIN (cs_bill_customer_sk = c_customer_sk)
+    │       ├── JOIN (c_current_addr_sk = ca_address_sk)
+    │       ├── JOIN (cs_sold_date_sk = d_date_sk)
+    │       └── FILTER (d_qoy = 1 AND d_year = 2001)
+    ├── [CTE] branch_price  [+]  — High-value sales (>500, Q1 2001)
+    │   └── JOIN catalog_sales ⟖ customer ⟖ customer_address ⟖ date_dim
+    │       ├── JOIN (cs_bill_customer_sk = c_customer_sk)
+    │       ├── JOIN (c_current_addr_sk = ca_address_sk)
+    │       ├── JOIN (cs_sold_date_sk = d_date_sk)
+    │       ├── FILTER (cs_sales_price > 500)
+    │       └── FILTER (d_qoy = 1 AND d_year = 2001)
+    ├── [CTE] union_all  [+]  — Combine both branches (UNION removes duplicates)
+    │   └── UNION ALL branch_address + branch_price
+    ├── [CTE] aggregate  [+]  — Group by ZIP and sum sales
+    │   └── AGG (GROUP BY ca_zip, SUM(cs_sales_price))
+    └── [CTE] top_n  [+]  — Final ordering and limit
+        ├── SORT (ca_zip ASC)
+        └── LIMIT 100
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter customer_address into a small CTE to reduce hash join size", "applied_to": ["filtered_address"]},
+    {"id": "R2", "type": "or_to_union", "description": "Split OR across address and price columns into separate branches, then union to deduplicate", "applied_to": ["branch_address", "branch_price", "union_all"]},
+    {"id": "R3", "type": "early_filter", "description": "Push date filters directly into each branch before joining fact tables", "applied_to": ["branch_address", "branch_price"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_address": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk, ca_zip FROM customer_address WHERE substr(ca_zip,1,5) IN ('85669','86197','88274','83405','86475','85392','85460','80348','81792') OR ca_state IN ('CA','WA','GA')",
+        "interfaces": {"outputs": ["ca_address_sk", "ca_zip"], "consumes": []}
+      },
+      "branch_address": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs.cs_sales_price, fa.ca_zip FROM catalog_sales cs INNER JOIN customer c ON cs.cs_bill_customer_sk = c.c_customer_sk INNER JOIN filtered_address fa ON c.c_current_addr_sk = fa.ca_address_sk INNER JOIN date_dim d ON cs.cs_sold_date_sk = d.d_date_sk WHERE d.d_qoy = 1 AND d.d_year = 2001",
+        "interfaces": {"outputs": ["cs_sales_price", "ca_zip"], "consumes": ["filtered_address"]}
+      },
+      "branch_price": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs.cs_sales_price, ca.ca_zip FROM catalog_sales cs INNER JOIN customer c ON cs.cs_bill_customer_sk = c.c_customer_sk INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk INNER JOIN date_dim d ON cs.cs_sold_date_sk = d.d_date_sk WHERE cs.cs_sales_price > 500 AND d.d_qoy = 1 AND d.d_year = 2001",
+        "interfaces": {"outputs": ["cs_sales_price", "ca_zip"], "consumes": []}
+      },
+      "union_all": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_sales_price, ca_zip FROM branch_address UNION SELECT cs_sales_price, ca_zip FROM branch_price",
+        "interfaces": {"outputs": ["cs_sales_price", "ca_zip"], "consumes": ["branch_address", "branch_price"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_zip, SUM(cs_sales_price) AS sum_cs_sales_price FROM union_all GROUP BY ca_zip",
+        "interfaces": {"outputs": ["ca_zip", "sum_cs_sales_price"], "consumes": ["union_all"]}
+      },
+      "top_n": {
+        "type": "main_query",
+        "change": "added",
+        "sql": "SELECT ca_zip, sum_cs_sales_price FROM aggregate ORDER BY ca_zip ASC LIMIT 100",
+        "interfaces": {"outputs": ["ca_zip", "sum_cs_sales_price"], "consumes": ["aggregate"]}
+      }
+    },
+    "reconstruction_order": ["filtered_address", "branch_address", "branch_price", "union_all", "aggregate", "top_n"],
+    "assembly_template": "WITH filtered_address AS ({filtered_address}), branch_address AS ({branch_address}), branch_price AS ({branch_price}), union_all AS ({union_all}), aggregate AS ({aggregate}) {top_n}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Mechanism Explanation
+
+**Changes:** The original monolithic query with an OR spanning address and price columns is decomposed into two independent branches (address‑filtered and price‑filtered) that are unioned to deduplicate, plus an early‑filtered dimension CTE for customer_address. This allows each branch to exploit predicate pushdown and efficient hash joins on reduced data sets.
+
+**Expected speedup:** ~2‑4× from reduced fact‑table scanning (price branch) and smaller dimension hash tables (address branch). The UNION deduplication overhead is minimal because duplicates are expected to be few.

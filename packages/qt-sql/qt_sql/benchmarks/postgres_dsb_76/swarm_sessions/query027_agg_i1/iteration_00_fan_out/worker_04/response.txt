@@ -1,0 +1,71 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query [!] Structural change: CTE-based decomposition
+    ├── WITH
+    │   ├── dim_combos [=] CTE for filtered dimension cross join
+    │   │   └── CROSS JOIN of 4 filtered dimension subqueries
+    │   ├── lateral_fact [=] CTE for LATERAL fact table lookup
+    │   │   └── LATERAL join from dim_combos to store_sales
+    │   ├── aggregated [=] CTE for ROLLUP aggregation
+    │   │   └── GROUP BY ROLLUP(i_item_id, s_state)
+    │   └── sorted_limited [=] CTE for final ordering/limit
+    │       └── ORDER BY i_item_id, s_state LIMIT 100
+    └── OUTPUT (i_item_id, s_state, g_state, agg1, agg2, agg3, agg4)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pg_self_join_decomposition", "description": "Materialize filtered dimension combinations once then probe fact table via LATERAL", "applied_to": ["dim_combos", "lateral_fact"]},
+    {"id": "R2", "type": "inline_decorrelate_materialized", "description": "Use LATERAL to decorrelate fact table lookup from dimension cross product", "applied_to": ["lateral_fact"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "dim_combos": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d.d_date_sk, s.s_store_sk, s.s_state, i.i_item_sk, i.i_item_id, c.cd_demo_sk FROM (SELECT d_date_sk FROM date_dim WHERE d_year = 2002) d CROSS JOIN (SELECT s_store_sk, s_state FROM store WHERE s_state = 'IA') s CROSS JOIN (SELECT i_item_sk, i_item_id FROM item WHERE i_category = 'Sports') i CROSS JOIN (SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'F' AND cd_marital_status = 'M' AND cd_education_status = 'Primary') c",
+        "interfaces": {"outputs": ["d_date_sk", "s_store_sk", "s_state", "i_item_sk", "i_item_id", "cd_demo_sk"], "consumes": []}
+      },
+      "lateral_fact": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT dc.i_item_id, dc.s_state, f.ss_quantity, f.ss_list_price, f.ss_coupon_amt, f.ss_sales_price FROM dim_combos dc, LATERAL (SELECT ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price FROM store_sales WHERE ss_sold_date_sk = dc.d_date_sk AND ss_store_sk = dc.s_store_sk AND ss_item_sk = dc.i_item_sk AND ss_cdemo_sk = dc.cd_demo_sk) f",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "ss_quantity", "ss_list_price", "ss_coupon_amt", "ss_sales_price"], "consumes": ["dim_combos"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_id, s_state, GROUPING(s_state) AS g_state, AVG(ss_quantity) AS agg1, AVG(ss_list_price) AS agg2, AVG(ss_coupon_amt) AS agg3, AVG(ss_sales_price) AS agg4 FROM lateral_fact GROUP BY ROLLUP (i_item_id, s_state)",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"], "consumes": ["lateral_fact"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_id, s_state, g_state, agg1, agg2, agg3, agg4 FROM aggregated ORDER BY i_item_id, s_state LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"], "consumes": ["aggregated"]}
+      }
+    },
+    "reconstruction_order": ["dim_combos", "lateral_fact", "aggregated", "main_query"],
+    "assembly_template": "WITH dim_combos AS ({dim_combos}), lateral_fact AS ({lateral_fact}), aggregated AS ({aggregated}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+## Changes
+
+The rewrite decomposes the original 5-table join into a three-stage CTE pipeline: first compute the small Cartesian product of pre-filtered dimension keys, then probe the fact table via LATERAL for matching rows, then aggregate with ROLLUP. This eliminates the large intermediate join of all tables while preserving exact semantic equivalence.
+
+Expected speedup: Moderate (2-3x) due to eliminating the large intermediate join result and enabling better join order optimization. The LATERAL may still force nested loops, but the dimension cross product is small, making this acceptable.

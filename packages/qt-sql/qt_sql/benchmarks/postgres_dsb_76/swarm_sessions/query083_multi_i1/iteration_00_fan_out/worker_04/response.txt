@@ -1,0 +1,80 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_keys  [!]  Structural change: New CTE for date filtering
+│   ├── SCAN date_dim d1
+│   ├── JOIN date_dim d2 (d1.d_month_seq = d2.d_month_seq)
+│   ├── FILTER (d2.d_date IN ('2002-02-26','2002-05-03','2002-08-19','2002-11-18'))
+│   └── OUTPUT (d_date_sk, d_date)
+├── [CTE] all_returns_sk  [!]  Structural change: Consolidated UNION ALL with early date join
+│   ├── SCAN (store_returns UNION ALL catalog_returns UNION ALL web_returns)
+│   ├── JOIN date_keys (return_date_sk = d_date_sk)
+│   ├── FILTER ((channel='store' AND return_amt/return_qty BETWEEN 237 AND 266 AND reason_sk IN (6,7,25,45,51)) OR ...)
+│   └── OUTPUT (item_sk, channel, return_qty)
+├── [CTE] aggregated_by_sk  [!]  Structural change: Pre-aggregation before item join
+│   ├── SCAN all_returns_sk
+│   ├── AGG (GROUP BY item_sk, channel, SUM(return_qty) as item_qty)
+│   └── OUTPUT (item_sk, channel, item_qty)
+└── [MAIN] main_with_late_item_join  [!]  Structural change: Single item join with pivoting
+    ├── JOIN aggregated_by_sk with item (item_sk = i_item_sk)
+    ├── FILTER (i_category IN ('Home','Men') AND i_manager_id BETWEEN 8 AND 17)
+    ├── AGG (GROUP BY i_item_id, pivoting via MAX(CASE...))
+    ├── FILTER HAVING (COUNT(DISTINCT channel) = 3)
+    ├── SORT (i_item_id, sr_item_qty)
+    └── OUTPUT (item_id, sr_item_qty, cr_item_qty, wr_item_qty, sr_dev, cr_dev, wr_dev, average)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL 16.11",
+  "rewrite_rules": [
+    {"id": "R1", "type": "materialized_dimension", "description": "Extract date dimension keys via MATERIALIZED CTE to prevent re-execution", "applied_to": ["date_keys"]},
+    {"id": "R2", "type": "consolidate_union_all", "description": "Combine three separate CTEs into single UNION ALL with early date join", "applied_to": ["all_returns_sk"]},
+    {"id": "R3", "type": "late_attribute_binding", "description": "Defer item table join until after aggregation, reducing item scans from 3 to 1", "applied_to": ["aggregated_by_sk", "main_with_late_item_join"]},
+    {"id": "R4", "type": "preserve_or_condition", "description": "Keep OR conditions intact to allow bitmap index scan optimization", "applied_to": ["all_returns_sk"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_keys": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d1.d_date_sk, d1.d_date FROM date_dim d1 INNER JOIN date_dim d2 ON d1.d_month_seq = d2.d_month_seq WHERE d2.d_date IN ('2002-02-26','2002-05-03','2002-08-19','2002-11-18')",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "all_returns_sk": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT returns.item_sk, returns.channel, returns.return_qty FROM (SELECT sr_item_sk AS item_sk, sr_returned_date_sk AS return_date_sk, sr_return_quantity AS return_qty, sr_return_amt AS return_amt, sr_reason_sk AS reason_sk, 'store' AS channel FROM store_returns UNION ALL SELECT cr_item_sk, cr_returned_date_sk, cr_return_quantity, cr_return_amount, cr_reason_sk, 'catalog' FROM catalog_returns UNION ALL SELECT wr_item_sk, wr_returned_date_sk, wr_return_quantity, wr_return_amt, wr_reason_sk, 'web' FROM web_returns) returns INNER JOIN date_keys ON returns.return_date_sk = date_keys.d_date_sk WHERE (returns.channel = 'store' AND returns.return_amt / returns.return_qty BETWEEN 237 AND 266 AND returns.reason_sk IN (6,7,25,45,51)) OR (returns.channel = 'catalog' AND returns.return_amt / returns.return_qty BETWEEN 237 AND 266 AND returns.reason_sk IN (6,7,25,45,51)) OR (returns.channel = 'web' AND returns.return_amt / returns.return_qty BETWEEN 237 AND 266 AND returns.reason_sk IN (6,7,25,45,51))",
+        "interfaces": {"outputs": ["item_sk", "channel", "return_qty"], "consumes": ["date_keys"]}
+      },
+      "aggregated_by_sk": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT item_sk, channel, SUM(return_qty) AS item_qty FROM all_returns_sk GROUP BY item_sk, channel",
+        "interfaces": {"outputs": ["item_sk", "channel", "item_qty"], "consumes": ["all_returns_sk"]}
+      },
+      "main_with_late_item_join": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT item.i_item_id AS item_id, MAX(CASE WHEN channel = 'store' THEN item_qty END) AS sr_item_qty, MAX(CASE WHEN channel = 'catalog' THEN item_qty END) AS cr_item_qty, MAX(CASE WHEN channel = 'web' THEN item_qty END) AS wr_item_qty, MAX(CASE WHEN channel = 'store' THEN item_qty END)/(MAX(CASE WHEN channel = 'store' THEN item_qty END)+MAX(CASE WHEN channel = 'catalog' THEN item_qty END)+MAX(CASE WHEN channel = 'web' THEN item_qty END))/3.0*100 AS sr_dev, MAX(CASE WHEN channel = 'catalog' THEN item_qty END)/(MAX(CASE WHEN channel = 'store' THEN item_qty END)+MAX(CASE WHEN channel = 'catalog' THEN item_qty END)+MAX(CASE WHEN channel = 'web' THEN item_qty END))/3.0*100 AS cr_dev, MAX(CASE WHEN channel = 'web' THEN item_qty END)/(MAX(CASE WHEN channel = 'store' THEN item_qty END)+MAX(CASE WHEN channel = 'catalog' THEN item_qty END)+MAX(CASE WHEN channel = 'web' THEN item_qty END))/3.0*100 AS wr_dev, (MAX(CASE WHEN channel = 'store' THEN item_qty END)+MAX(CASE WHEN channel = 'catalog' THEN item_qty END)+MAX(CASE WHEN channel = 'web' THEN item_qty END))/3.0 AS average FROM aggregated_by_sk INNER JOIN item ON aggregated_by_sk.item_sk = item.i_item_sk WHERE item.i_category IN ('Home','Men') AND item.i_manager_id BETWEEN 8 AND 17 GROUP BY item.i_item_id HAVING COUNT(DISTINCT channel) = 3 ORDER BY item.i_item_id, MAX(CASE WHEN channel = 'store' THEN item_qty END) LIMIT 100",
+        "interfaces": {"outputs": ["item_id", "sr_item_qty", "cr_item_qty", "wr_item_qty", "sr_dev", "cr_dev", "wr_dev", "average"], "consumes": ["aggregated_by_sk"]}
+      }
+    },
+    "reconstruction_order": ["date_keys", "all_returns_sk", "aggregated_by_sk", "main_with_late_item_join"],
+    "assembly_template": "WITH date_keys AS MATERIALIZED ({date_keys}), all_returns_sk AS ({all_returns_sk}), aggregated_by_sk AS ({aggregated_by_sk}) {main_with_late_item_join}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Consolidated three separate channel CTEs into single UNION ALL with early date join, deferred item table join until after aggregation, and added MATERIALIZED hint to date_keys CTE to prevent re-execution.  
+**Expected speedup**: ~2.5-3x from reduced item table scans (3→1) and consolidated date filtering (3→1) while preserving original INNER JOIN semantics via HAVING COUNT(DISTINCT channel)=3.

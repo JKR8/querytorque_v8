@@ -1,0 +1,382 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Compute the ratio of AM to PM web order counts for households with two dependents viewing medium-length pages, comparing 10:00-11:59 versus 16:00-17:59 time windows. All joins are INNER (intersection semantics), requiring matching rows in all four tables. The only aggregates are COUNT(*), which are duplicate-insensitive. The time windows are disjoint (a sale cannot be in both), allowing safe consolidation with conditional aggregation.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+time_windows -> filtered_dims -> fact_join -> window_aggregate -> final_ratio
+NODE_CONTRACTS:
+  time_windows:
+    FROM: time_dim
+    WHERE: t_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17
+    OUTPUT: t_time_sk, 
+            CASE WHEN t_hour BETWEEN 10 AND 11 THEN 'AM' 
+                 WHEN t_hour BETWEEN 16 AND 17 THEN 'PM' END AS time_window
+    EXPECTED_ROWS: ~14,400
+    CONSUMERS: fact_join
+  filtered_hd:
+    FROM: household_demographics
+    WHERE: hd_dep_count = 2
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 720
+    CONSUMERS: fact_join
+  filtered_wp:
+    FROM: web_page
+    WHERE: wp_char_count BETWEEN 5000 AND 5200
+    OUTPUT: wp_web_page_sk
+    EXPECTED_ROWS: 3
+    CONSUMERS: fact_join
+  fact_join:
+    FROM: web_sales
+    JOIN: INNER JOIN time_windows ON ws_sold_time_sk = t_time_sk
+          INNER JOIN filtered_hd ON ws_ship_hdemo_sk = hd_demo_sk
+          INNER JOIN filtered_wp ON ws_web_page_sk = wp_web_page_sk
+    OUTPUT: ws_sold_time_sk, ws_ship_hdemo_sk, ws_web_page_sk, time_window
+    EXPECTED_ROWS: ~2,532
+    CONSUMERS: window_aggregate
+  window_aggregate:
+    FROM: fact_join
+    GROUP BY: time_window
+    AGGREGATE: COUNT(*) AS cnt
+    OUTPUT: time_window, cnt
+    EXPECTED_ROWS: 2
+    CONSUMERS: final_ratio
+  final_ratio:
+    FROM: window_aggregate
+    AGGREGATE: (none)
+    OUTPUT: CAST(MAX(CASE WHEN time_window = 'AM' THEN cnt END) AS DECIMAL(15,4)) /
+            CAST(MAX(CASE WHEN time_window = 'PM' THEN cnt END) AS DECIMAL(15,4)) AS am_pm_ratio
+    ORDER BY: am_pm_ratio
+    LIMIT: 100
+    EXPECTED_ROWS: 1
+    CONSUMERS: output
+
+NODE_CONTRACTS:
+time_windows:
+    FROM: time_dim
+    WHERE: t_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17
+    OUTPUT: t_time_sk, 
+            CASE WHEN t_hour BETWEEN 10 AND 11 THEN 'AM' 
+                 WHEN t_hour BETWEEN 16 AND 17 THEN 'PM' END AS time_window
+    EXPECTED_ROWS: ~14,400
+    CONSUMERS: fact_join
+  filtered_hd:
+    FROM: household_demographics
+    WHERE: hd_dep_count = 2
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 720
+    CONSUMERS: fact_join
+  filtered_wp:
+    FROM: web_page
+    WHERE: wp_char_count BETWEEN 5000 AND 5200
+    OUTPUT: wp_web_page_sk
+    EXPECTED_ROWS: 3
+    CONSUMERS: fact_join
+  fact_join:
+    FROM: web_sales
+    JOIN: INNER JOIN time_windows ON ws_sold_time_sk = t_time_sk
+          INNER JOIN filtered_hd ON ws_ship_hdemo_sk = hd_demo_sk
+          INNER JOIN filtered_wp ON ws_web_page_sk = wp_web_page_sk
+    OUTPUT: ws_sold_time_sk, ws_ship_hdemo_sk, ws_web_page_sk, time_window
+    EXPECTED_ROWS: ~2,532
+    CONSUMERS: window_aggregate
+  window_aggregate:
+    FROM: fact_join
+    GROUP BY: time_window
+    AGGREGATE: COUNT(*) AS cnt
+    OUTPUT: time_window, cnt
+    EXPECTED_ROWS: 2
+    CONSUMERS: final_ratio
+  final_ratio:
+    FROM: window_aggregate
+    AGGREGATE: (none)
+    OUTPUT: CAST(MAX(CASE WHEN time_window = 'AM' THEN cnt END) AS DECIMAL(15,4)) /
+            CAST(MAX(CASE WHEN time_window = 'PM' THEN cnt END) AS DECIMAL(15,4)) AS am_pm_ratio
+    ORDER BY: am_pm_ratio
+    LIMIT: 100
+    EXPECTED_ROWS: 1
+    CONSUMERS: output
+
+## Hazard Flags (avoid these specific risks)
+
+- The GROUP BY time_window produces two rows; must pivot to one row for the ratio.
+- The MAX() pivot is safe because each time_window appears at most once.
+
+## Regression Warnings (observed failures on similar queries)
+
+1. or_to_union (0.59x regression on Q90):
+   CAUSE: Split same-column time range (t_hour BETWEEN ... OR ...) into UNION ALL, doubling fact table scans.
+   RULE: Never split same-column ORs on time ranges into UNION ALL for this query.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output exactly am_pm_ratio column.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (e.g., time keys for joins).
+- LITERAL_PRESERVATION: Must preserve literal values: t_hour 10/11/16/17, hd_dep_count=2, wp_char_count 5000-5200.
+- SEMANTIC_EQUIVALENCE: Must return identical ratio value.
+- REDUNDANT_SCAN_ELIMINATION: Two web_sales scans present (evidence: EXPLAIN shows SEQ_SCAN web_sales twice, 44.2ms + 290.3ms).
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- early_filter (Q11): Apply filtering of dimension tables first, then join with fact. Ignore the specific fact table (store_sales vs web_sales).
+- pushdown (Q9): Apply consolidation of multiple subqueries into one by pushing filters into a single scan. Ignore the complex scalar subquery pattern.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. early_filter (4.00x)
+
+**Principle:** Early Selection: filter small dimension tables first, then join to large fact tables. This reduces the fact table scan to only rows matching the filter, rather than scanning all rows and filtering after the join.
+
+**BEFORE (slow):**
+```sql
+select ss_customer_sk
+            ,sum(act_sales) sumsales
+      from (select ss_item_sk
+                  ,ss_ticket_number
+                  ,ss_customer_sk
+                  ,case when sr_return_quantity is not null then (ss_quantity-sr_return_quantity)*ss_sales_price
+                                                            else (ss_quantity*ss_sales_price) end act_sales
+            from store_sales left outer join store_returns on (sr_item_sk = ss_item_sk
+                                                               and sr_ticket_number = ss_ticket_number)
+                ,reason
+            where sr_reason_sk = r_reason_sk
+              and r_reason_desc = 'duplicate purchase') t
+      group by ss_customer_sk
+      order by sumsales, ss_customer_sk
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_reason]:
+```sql
+SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'
+```
+[filtered_returns]:
+```sql
+SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+```
+[main_query]:
+```sql
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
+```
+
+### 2. pushdown (2.11x)
+
+**Principle:** Scan Consolidation: when multiple subqueries scan the same table with similar patterns, consolidate them into CTEs that compute all needed aggregates in fewer passes. Reduces N scans to fewer scans.
+
+**BEFORE (slow):**
+```sql
+select case when (select count(*) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) > 2972190
+            then (select avg(ss_ext_sales_price) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 1 and 20) end bucket1 ,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 21 and 40) > 4505785
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 21 and 40) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 21 and 40) end bucket2,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 41 and 60) > 1575726
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 41 and 60)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 41 and 60) end bucket3,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 61 and 80) > 3188917
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 61 and 80)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 61 and 80) end bucket4,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 81 and 100) > 3525216
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 81 and 100)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 81 and 100) end bucket5
+from reason
+where r_reason_sk = 1;
+```
+
+**AFTER (fast):**
+[quantity_1_20_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20
+```
+[quantity_21_40_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40
+```
+[quantity_41_60_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 41 AND 60
+```
+[quantity_61_80_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 61 AND 80
+```
+[quantity_81_100_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 81 AND 100
+```
+[main_query]:
+```sql
+SELECT CASE WHEN q1.cnt > 2972190 THEN q1.avg_ext_price ELSE q1.avg_net_profit END AS bucket1, CASE WHEN q2.cnt > 4505785 THEN q2.avg_ext_price ELSE q2.avg_net_profit END AS bucket2, CASE WHEN q3.cnt > 1575726 THEN q3.avg_ext_price ELSE q3.avg_net_profit END AS bucket3, CASE WHEN q4.cnt > 3188917 THEN q4.avg_ext_price ELSE q4.avg_net_profit END AS bucket4, CASE WHEN q5.cnt > 3525216 THEN q5.avg_ext_price ELSE q5.avg_net_profit END AS bucket5 FROM reason CROSS JOIN quantity_1_20_stats AS q1 CROSS JOIN quantity_21_40_stats AS q2 CROSS JOIN quantity_41_60_stats AS q3 CROSS JOIN quantity_61_80_stats AS q4 CROSS JOIN quantity_81_100_stats AS q5 WHERE r_reason_sk = 1
+```
+
+## Original SQL
+
+```sql
+-- start query 90 in stream 0 using template query90.tpl
+select cast(amc as decimal(15,4))/cast(pmc as decimal(15,4)) am_pm_ratio
+ from ( select count(*) amc
+       from web_sales, household_demographics , time_dim, web_page
+       where ws_sold_time_sk = time_dim.t_time_sk
+         and ws_ship_hdemo_sk = household_demographics.hd_demo_sk
+         and ws_web_page_sk = web_page.wp_web_page_sk
+         and time_dim.t_hour between 10 and 10+1
+         and household_demographics.hd_dep_count = 2
+         and web_page.wp_char_count between 5000 and 5200) at_tbl,
+      ( select count(*) pmc
+       from web_sales, household_demographics , time_dim, web_page
+       where ws_sold_time_sk = time_dim.t_time_sk
+         and ws_ship_hdemo_sk = household_demographics.hd_demo_sk
+         and ws_web_page_sk = web_page.wp_web_page_sk
+         and time_dim.t_hour between 16 and 16+1
+         and household_demographics.hd_dep_count = 2
+         and web_page.wp_char_count between 5000 and 5200) pt
+ order by am_pm_ratio
+ LIMIT 100;
+
+-- end query 90 in stream 0 using template query90.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `am_pm_ratio`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K  — Calculate qualifying web-sales counts for the AM and PM windows in two aggregate subqueries and divide AM count by PM count to produce am_pm_ratio.
+    ├── SCAN (web_sales, household_demographics, time_dim, web_page)
+    ├── JOIN (ws_sold_time_sk = time_dim.t_time_sk)
+    ├── JOIN (ws_ship_hdemo_sk = household_demographics.hd_demo_sk)
+    ├── JOIN (+1 more)
+    ├── FILTER (time_dim.t_hour BETWEEN 10 AND 10 + 1)
+    ├── FILTER (household_demographics.hd_dep_count = 2)
+    ├── FILTER (+1 more)
+    ├── SORT (am_pm_ratio ASC)
+    └── OUTPUT (am_pm_ratio)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

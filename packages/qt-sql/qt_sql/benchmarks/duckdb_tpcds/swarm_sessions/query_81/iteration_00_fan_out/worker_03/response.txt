@@ -1,0 +1,80 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] ctr_all [=] Cost: 50% Rows: ~276K — Aggregate 2002 catalog return amounts by returning customer and return-address state.
+│   ├── SCAN (catalog_returns, date_dim, customer_address (return address))
+│   ├── JOIN (cr_returned_date_sk = d_date_sk)
+│   ├── JOIN (cr_returning_addr_sk = ca_address_sk)
+│   ├── FILTER (d_year = 2002)
+│   ├── AGG (GROUP BY cr_returning_customer_sk, ca_state)
+│   └── OUTPUT (ctr_customer_sk, ctr_state, ctr_total_return)
+├── [CTE] ctr_state_avg [+] Cost: 1% Rows: 51 — State-level averages from ctr_all.
+│   ├── SCAN (ctr_all)
+│   ├── AGG (GROUP BY ctr_state)
+│   └── OUTPUT (ctr_state, state_avg)
+├── [CTE] ctr_ca [+] Cost: 48% Rows: 5,054 — Filter to CA customers and enrich with current address/customer details.
+│   ├── SCAN (ctr_all, customer, customer_address (current))
+│   ├── JOIN (ctr_all.ctr_customer_sk = c_customer_sk)
+│   ├── JOIN (c_current_addr_sk = ca_address_sk)
+│   ├── FILTER (ca_state = 'CA')
+│   └── OUTPUT (ctr_customer_sk, ctr_state, ctr_total_return, c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type)
+└── [MAIN] main_query [~] Cost: 1% Rows: 100 — Join state averages, apply 1.2x filter, order, limit.
+    ├── SCAN (ctr_ca, ctr_state_avg)
+    ├── JOIN (ctr_ca.ctr_state = ctr_state_avg.ctr_state)
+    ├── FILTER (ctr_total_return > state_avg * 1.2)
+    ├── SORT (c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return)
+    └── OUTPUT (16 columns per contract)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "union_cte_split", "description": "Split original correlated subquery into separate CTEs for row source (ctr_ca) and state averages (ctr_state_avg).", "applied_to": ["ctr_state_avg", "ctr_ca"]},
+    {"id": "R2", "type": "decorrelate", "description": "Replace correlated subquery with explicit CTE and hash join on ctr_state.", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "ctr_all": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_state", "ctr_total_return"], "consumes": []}
+      },
+      "ctr_state_avg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ctr_state, AVG(ctr_total_return) AS state_avg FROM ctr_all GROUP BY ctr_state",
+        "interfaces": {"outputs": ["ctr_state", "state_avg"], "consumes": ["ctr_all"]}
+      },
+      "ctr_ca": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ctr_all.ctr_customer_sk, ctr_all.ctr_state, ctr_all.ctr_total_return, c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type FROM ctr_all, customer, customer_address WHERE ctr_all.ctr_customer_sk = c_customer_sk AND c_current_addr_sk = ca_address_sk AND ca_state = 'CA'",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_state", "ctr_total_return", "c_customer_id", "c_salutation", "c_first_name", "c_last_name", "ca_street_number", "ca_street_name", "ca_street_type", "ca_suite_number", "ca_city", "ca_county", "ca_state", "ca_zip", "ca_country", "ca_gmt_offset", "ca_location_type"], "consumes": ["ctr_all"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return FROM ctr_ca JOIN ctr_state_avg ON ctr_ca.ctr_state = ctr_state_avg.ctr_state WHERE ctr_ca.ctr_total_return > ctr_state_avg.state_avg * 1.2 ORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return LIMIT 100",
+        "interfaces": {"outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "ca_street_number", "ca_street_name", "ca_street_type", "ca_suite_number", "ca_city", "ca_county", "ca_state", "ca_zip", "ca_country", "ca_gmt_offset", "ca_location_type", "ctr_total_return"], "consumes": ["ctr_ca", "ctr_state_avg"]}
+      }
+    },
+    "reconstruction_order": ["ctr_all", "ctr_state_avg", "ctr_ca", "main_query"],
+    "assembly_template": "WITH ctr_all AS (SELECT cr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, SUM(cr_return_amt_inc_tax) AS ctr_total_return FROM catalog_returns, date_dim, customer_address WHERE cr_returned_date_sk = d_date_sk AND d_year = 2002 AND cr_returning_addr_sk = ca_address_sk GROUP BY cr_returning_customer_sk, ca_state), ctr_state_avg AS ({ctr_state_avg}), ctr_ca AS ({ctr_ca}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** The rewrite splits the original correlated subquery into two CTEs—one for per-state averages (`ctr_state_avg`) and one for California customers with current address details (`ctr_ca`). The main query then joins these explicitly, replacing the correlated filter with a hash join.
+
+**Expected speedup:** 1.2–1.4x (decorrelation eliminates per-row subquery execution; CTE specialization reduces redundant scanning of the base aggregate).

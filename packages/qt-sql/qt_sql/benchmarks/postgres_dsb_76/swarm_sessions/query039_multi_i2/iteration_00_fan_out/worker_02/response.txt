@@ -1,0 +1,77 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_star  [!]  Changed from inline join to explicit CTE
+│   ├── SCAN (inventory, item, warehouse, date_dim)
+│   ├── JOIN (explicit INNER JOIN syntax)
+│   └── OUTPUT (w_warehouse_sk, w_warehouse_name, i_item_sk, d_moy, inv_quantity_on_hand)
+├── [CTE] aggregated_both_months  [!]  Changed from subquery to CTE
+│   ├── FROM filtered_star
+│   ├── AGG (GROUP BY w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy)
+│   └── OUTPUT (w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean)
+├── [CTE] pivoted  [!]  Changed from WHERE filter to explicit CTE with pivot
+│   ├── FROM aggregated_both_months
+│   ├── FILTER (CASE mean WHEN 0 THEN 0 ELSE stdev/mean END > 1)
+│   ├── AGG (GROUP BY w_warehouse_sk, i_item_sk with MAX(CASE) pivoting)
+│   └── OUTPUT (w_warehouse_sk, i_item_sk, mean_5, cov_5, mean_6, cov_6)
+└── [MAIN] main_no_join  [!]  Changed from self-join to single-table selection
+    ├── FROM pivoted
+    ├── FILTER (cov_5 IS NOT NULL AND cov_6 IS NOT NULL)
+    ├── SORT (w_warehouse_sk, i_item_sk, 5, mean_5, cov_5, 6, mean_6, cov_6)
+    └── OUTPUT (10 columns as specified)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pg_self_join_decomposition", "description": "Replace self-join with single materialization and pivoting", "applied_to": ["pivoted", "main_no_join"]},
+    {"id": "R2", "type": "single_pass_aggregation", "description": "Use CASE pivoting instead of separate month scans", "applied_to": ["pivoted"]},
+    {"id": "R3", "type": "pg_materialized_dimension_fact_prefilter", "description": "Stage dimension filtering in initial CTE", "applied_to": ["filtered_star"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_star": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT w.w_warehouse_sk, w.w_warehouse_name, i.i_item_sk, d.d_moy, inv.inv_quantity_on_hand FROM inventory inv INNER JOIN date_dim d ON inv.inv_date_sk = d.d_date_sk INNER JOIN item i ON inv.inv_item_sk = i.i_item_sk INNER JOIN warehouse w ON inv.inv_warehouse_sk = w.w_warehouse_sk WHERE d.d_year = 2002 AND i.i_category IN ('Shoes', 'Sports') AND i.i_manager_id BETWEEN 42 AND 61 AND inv.inv_quantity_on_hand BETWEEN 791 AND 991 AND d.d_moy IN (5, 6)",
+        "interfaces": {"outputs": ["w_warehouse_sk", "w_warehouse_name", "i_item_sk", "d_moy", "inv_quantity_on_hand"], "consumes": []}
+      },
+      "aggregated_both_months": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, STDDEV_SAMP(inv_quantity_on_hand) AS stdev, AVG(inv_quantity_on_hand) AS mean FROM filtered_star GROUP BY w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy",
+        "interfaces": {"outputs": ["w_warehouse_name", "w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean"], "consumes": ["filtered_star"]}
+      },
+      "pivoted": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT w_warehouse_sk, i_item_sk, MAX(CASE WHEN d_moy = 5 THEN mean END) AS mean_5, MAX(CASE WHEN d_moy = 5 THEN CASE mean WHEN 0 THEN NULL ELSE stdev/mean END END) AS cov_5, MAX(CASE WHEN d_moy = 6 THEN mean END) AS mean_6, MAX(CASE WHEN d_moy = 6 THEN CASE mean WHEN 0 THEN NULL ELSE stdev/mean END END) AS cov_6 FROM aggregated_both_months WHERE CASE mean WHEN 0 THEN 0 ELSE stdev/mean END > 1 GROUP BY w_warehouse_sk, i_item_sk",
+        "interfaces": {"outputs": ["w_warehouse_sk", "i_item_sk", "mean_5", "cov_5", "mean_6", "cov_6"], "consumes": ["aggregated_both_months"]}
+      },
+      "main_no_join": {
+        "type": "main_query",
+        "change": "new",
+        "sql": "SELECT w_warehouse_sk AS inv1_warehouse_sk, i_item_sk AS inv1_item_sk, 5 AS inv1_d_moy, mean_5 AS inv1_mean, cov_5 AS inv1_cov, w_warehouse_sk AS inv2_warehouse_sk, i_item_sk AS inv2_item_sk, 6 AS inv2_d_moy, mean_6 AS inv2_mean, cov_6 AS inv2_cov FROM pivoted WHERE cov_5 IS NOT NULL AND cov_6 IS NOT NULL ORDER BY w_warehouse_sk, i_item_sk, 5, mean_5, cov_5, 6, mean_6, cov_6",
+        "interfaces": {"outputs": ["inv1_warehouse_sk", "inv1_item_sk", "inv1_d_moy", "inv1_mean", "inv1_cov", "inv2_warehouse_sk", "inv2_item_sk", "inv2_d_moy", "inv2_mean", "inv2_cov"], "consumes": ["pivoted"]}
+      }
+    },
+    "reconstruction_order": ["filtered_star", "aggregated_both_months", "pivoted", "main_no_join"],
+    "assembly_template": "WITH filtered_star AS ({filtered_star}), aggregated_both_months AS ({aggregated_both_months}), pivoted AS ({pivoted}) {main_no_join}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced self-join with single materialization using month pivoting. The original CTE that scanned inventory once is now decomposed into three CTEs: filtered_star (fact+dimensions), aggregated_both_months (per-month aggregates), and pivoted (coalesces both months into one row). This eliminates the costly self-join while preserving exact semantics.
+
+**Expected speedup**: 2-4x from eliminating self-join and enabling parallel scans on filtered_star (no materialized CTE blocking parallelism).

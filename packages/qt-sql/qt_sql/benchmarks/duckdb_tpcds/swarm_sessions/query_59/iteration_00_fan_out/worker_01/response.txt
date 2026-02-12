@@ -1,0 +1,71 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY:
+├── [CTE] date_periods_cte  [+]  Cost: 10%  Rows: ~731  — Filter date_dim to 24 months (1196-1219) and label each row with period 1 (months 1196-1207) or 2 (1208-1219).
+├── [CTE] sales_aggregates_cte  [~]  Cost: 40%  Rows: ~14K  — Replace original wss CTE: join store_sales with date_periods_cte, aggregate by week/store/period with CASE per day-of-week.
+│   ├── SCAN (store_sales, date_periods_cte (join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── AGG (GROUP BY d_week_seq, ss_store_sk, period)
+│   └── OUTPUT (d_week_seq, ss_store_sk, period, sun_sales..sat_sales)
+├── [CTE] period_pivot_cte  [+]  Cost: 45%  Rows: ~129K  — Join two instances of sales_aggregates_cte (period1=1, period2=2) on store and week offset (-52), then join store dimension.
+│   ├── SCAN (sales_aggregates_cte AS period1, sales_aggregates_cte AS period2 (join), store (join))
+│   ├── JOIN (period1.ss_store_sk = period2.ss_store_sk AND period1.d_week_seq = period2.d_week_seq - 52 AND period1.period=1 AND period2.period=2)
+│   ├── JOIN (period1.ss_store_sk = s_store_sk)
+│   └── OUTPUT (s_store_name, s_store_id, d_week_seq1, sun_sales1..sat_sales1, sun_sales2..sat_sales2)
+└── [MAIN] final_select  [~]  Cost: 5%  Rows: 100  — Compute day-of-week ratios with NULLIF guards, order by store name/id/week, limit 100.
+    ├── SCAN (period_pivot_cte)
+    ├── SORT (s_store_name ASC, s_store_id ASC, d_week_seq1 ASC)
+    └── OUTPUT (s_store_name1, s_store_id1, d_week_seq1, sun_sales1/NULLIF(sun_sales2,0), ..., sat_sales1/NULLIF(sat_sales2,0))
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_aggregation", "description": "Consolidate two period scans into one CTE with period discriminator, then self-join with week offset.", "applied_to": ["sales_aggregates_cte", "period_pivot_cte"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_periods_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_week_seq, d_month_seq, d_day_name, CASE WHEN d_month_seq BETWEEN 1196 AND 1196 + 11 THEN 1 ELSE 2 END AS period FROM date_dim WHERE d_month_seq BETWEEN 1196 AND 1196 + 23",
+        "interfaces": {"outputs": ["d_date_sk", "d_week_seq", "d_month_seq", "d_day_name", "period"], "consumes": []}
+      },
+      "sales_aggregates_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_week_seq, ss_store_sk, period, SUM(CASE WHEN d_day_name = 'Sunday' THEN ss_sales_price END) AS sun_sales, SUM(CASE WHEN d_day_name = 'Monday' THEN ss_sales_price END) AS mon_sales, SUM(CASE WHEN d_day_name = 'Tuesday' THEN ss_sales_price END) AS tue_sales, SUM(CASE WHEN d_day_name = 'Wednesday' THEN ss_sales_price END) AS wed_sales, SUM(CASE WHEN d_day_name = 'Thursday' THEN ss_sales_price END) AS thu_sales, SUM(CASE WHEN d_day_name = 'Friday' THEN ss_sales_price END) AS fri_sales, SUM(CASE WHEN d_day_name = 'Saturday' THEN ss_sales_price END) AS sat_sales FROM store_sales JOIN date_periods_cte ON ss_sold_date_sk = d_date_sk GROUP BY d_week_seq, ss_store_sk, period",
+        "interfaces": {"outputs": ["d_week_seq", "ss_store_sk", "period", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"], "consumes": ["date_periods_cte"]}
+      },
+      "period_pivot_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_name, s_store_id, period1.d_week_seq AS d_week_seq1, period1.sun_sales AS sun_sales1, period1.mon_sales AS mon_sales1, period1.tue_sales AS tue_sales1, period1.wed_sales AS wed_sales1, period1.thu_sales AS thu_sales1, period1.fri_sales AS fri_sales1, period1.sat_sales AS sat_sales1, period2.sun_sales AS sun_sales2, period2.mon_sales AS mon_sales2, period2.tue_sales AS tue_sales2, period2.wed_sales AS wed_sales2, period2.thu_sales AS thu_sales2, period2.fri_sales AS fri_sales2, period2.sat_sales AS sat_sales2 FROM sales_aggregates_cte AS period1 JOIN sales_aggregates_cte AS period2 ON period1.ss_store_sk = period2.ss_store_sk AND period1.d_week_seq = period2.d_week_seq - 52 AND period1.period = 1 AND period2.period = 2 JOIN store ON period1.ss_store_sk = s_store_sk",
+        "interfaces": {"outputs": ["s_store_name", "s_store_id", "d_week_seq1", "sun_sales1", "mon_sales1", "tue_sales1", "wed_sales1", "thu_sales1", "fri_sales1", "sat_sales1", "sun_sales2", "mon_sales2", "tue_sales2", "wed_sales2", "thu_sales2", "fri_sales2", "sat_sales2"], "consumes": ["sales_aggregates_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s_store_name AS s_store_name1, s_store_id AS s_store_id1, d_week_seq1, sun_sales1 / NULLIF(sun_sales2, 0) AS \"sun_sales1/sun_sales2\", mon_sales1 / NULLIF(mon_sales2, 0) AS \"mon_sales1/mon_sales2\", tue_sales1 / NULLIF(tue_sales2, 0) AS \"tue_sales1/tue_sales2\", wed_sales1 / NULLIF(wed_sales2, 0) AS \"wed_sales1/wed_sales2\", thu_sales1 / NULLIF(thu_sales2, 0) AS \"thu_sales1/thu_sales2\", fri_sales1 / NULLIF(fri_sales2, 0) AS \"fri_sales1/fri_sales2\", sat_sales1 / NULLIF(sat_sales2, 0) AS \"sat_sales1/sat_sales2\" FROM period_pivot_cte ORDER BY s_store_name ASC, s_store_id ASC, d_week_seq1 ASC LIMIT 100",
+        "interfaces": {"outputs": ["s_store_name1", "s_store_id1", "d_week_seq1", "sun_sales1/sun_sales2", "mon_sales1/mon_sales2", "tue_sales1/tue_sales2", "wed_sales1/wed_sales2", "thu_sales1/thu_sales2", "fri_sales1/fri_sales2", "sat_sales1/sat_sales2"], "consumes": ["period_pivot_cte"]}
+      }
+    },
+    "reconstruction_order": ["date_periods_cte", "sales_aggregates_cte", "period_pivot_cte", "main_query"],
+    "assembly_template": "WITH date_periods_cte AS ({date_periods_cte}), sales_aggregates_cte AS ({sales_aggregates_cte}), period_pivot_cte AS ({period_pivot_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced original two‑pass period aggregation (via subqueries y and x) with a single CTE that labels each date row with period 1 or 2, then aggregates once. The self‑join on week offset (‑52) and period filter (1→2) preserves exact week‑aligned matching. Expected speedup due to eliminating duplicate scanning of store_sales and date_dim for the two periods.
+
+**Expected speedup**: ~2‑3× from reducing store_sales scans from two to one and avoiding redundant date_dim scans.

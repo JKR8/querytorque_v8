@@ -1,0 +1,369 @@
+<reasoning>
+CLASSIFY:
+This is a star-join aggregation query with a correlated filter (subquery to select top 5 states) and a ROLLUP for hierarchical grouping. It has:
+- Fact table: store_sales
+- Dimension tables: date_dim (filtered by d_month_seq), store (filtered by s_store_sk<=100)
+- Subquery: same star-join pattern with ranking to select top 5 states
+- Main query: ROLLUP(s_state, s_county) with window ranking per hierarchy level
+
+EXPLAIN PLAN ANALYSIS:
+Total: 1465ms
+
+Key cost centers:
+1. Main HASH_GROUP_BY (ROLLUP aggregation): 525.3ms (36%)
+2. Subquery HASH_GROUP_BY (state aggregation): 158.3ms (11%)
+3. Two store_sales SEQ_SCANs: 243.9ms + 236.7ms = 480.6ms (33%)
+4. Two hash joins (subquery): 96.9ms + 103.3ms = 200.2ms (14%)
+5. Two hash joins (main): 37.1ms + 38.1ms = 75.2ms (5%)
+
+Row count flow:
+- store_sales scans: 5.4M rows each (out of 345.6M) → 1.5% selectivity from date join
+- date_dim: 365 rows each (out of 73K)
+- store: 100 rows each (out of 102)
+- Subquery aggregates to 4 rows (states)
+- Main query aggregates to 7 rows total
+
+Observations:
+1. The same fact table (store_sales) is scanned TWICE with identical date joins → 480.6ms of I/O
+2. The optimizer already pushes date filters into scans (FILTER nodes show d_month_seq predicates)
+3. The subquery computes state-level aggregates, then main query recomputes state+county aggregates → redundant work
+4. The ROLLUP aggregation (525.3ms) is the single largest cost center
+5. The window function (1.2ms) is negligible
+
+GAP MATCHING:
+1. REDUNDANT_SCAN_ELIMINATION: store_sales scanned twice → apply single_pass_aggregation
+2. CROSS_CTE_PREDICATE_BLINDNESS: Subquery and main query share same filters but computed separately → could pre-filter dimensions once
+3. UNION_CTE_SELF_JOIN_DECOMPOSITION: ROLLUP could be split into explicit UNION ALL levels for per-level optimization
+
+AGGREGATION TRAP CHECK:
+- Only SUM(ss_net_profit) → grouping-insensitive, safe to restructure
+- RANK() window depends on aggregated sums, but window computed after aggregation → safe
+
+TRANSFORM SELECTION (ranked by potential):
+1. single_pass_aggregation: Consolidate two store_sales scans into one (480ms → 240ms)
+2. rollup_to_union_windowing: Replace ROLLUP with UNION ALL levels to optimize each level separately (target 525ms aggregation)
+3. prefetch_fact_join: Pre-filter date and store, pre-join with store_sales once, then compute both aggregates
+4. Exploration: novel combination of single-pass with early state filtering to avoid redundant aggregation
+
+LOGICAL TREE DESIGN:
+Worker 1 (single_pass_aggregation): Single CTE with store_sales joined to date+store, aggregated by s_state, s_county with GROUPING SETS ((s_state, s_county), (s_state), ()) to emulate ROLLUP in one pass
+Worker 2 (rollup_to_union_windowing): Three CTEs for (state,county), (state), () levels, UNION ALL, then window
+Worker 3 (prefetch_fact_join): CTE chain: filtered_date → filtered_store → pre_joined_fact → aggregated_base
+Worker 4 (exploration): Single CTE with state+county aggregates, then derive state-level aggregates from same CTE for top-5 filter, avoiding re-scan
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Rank state and county net profit over month sequence 1213-1224 for top-performing states, using hierarchy-aware rollups and within-parent ranking. INNER joins require all three tables (store_sales, date_dim, store) to match. Aggregation uses SUM(ss_net_profit) which is duplicate-sensitive but safe if join multiplicity preserved. The subquery's top-5 state filter depends on the same date range and store filter as main query.
+
+BOTTLENECK_DIAGNOSIS:
+Aggregation-bound: ROLLUP aggregation consumes 525ms (36%). Fact table scanned twice (480ms, 33%) due to separate subquery. Cardinality: 5.4M fact rows → 4 subquery states → 7 final rows. Optimizer already pushes date filters effectively (FILTER nodes). Logical-tree cost percentages misleading: HASH_GROUP_BY shows 36% but total aggregation (main+subquery) is 683ms (47%).
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output total_sum, s_state, s_county, lochierarchy, rank_within_parent exactly
+- CTE_COLUMN_COMPLETENESS: Any CTE must include ss_net_profit, s_state, s_county, and grouping indicators
+- LITERAL_PRESERVATION: d_month_seq BETWEEN 1213 AND 1224, s_store_sk<=100, ranking<=5 must be preserved
+- SEMANTIC_EQUIVALENCE: Same rows and ordering (lochierarchy desc, case when, rank_within_parent)
+- REDUNDANT_SCAN_ELIMINATION: store_sales scanned twice in EXPLAIN
+- CROSS_CTE_PREDICATE_BLINDNESS: Subquery and main query share filters but computed separately
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: ROLLUP aggregation is expensive single operation
+
+REGRESSION_WARNINGS:
+1. materialize_cte (0.14x on Q16):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan instead of semi-join short-circuit
+   RULE: Do not convert IN subquery to materialized CTE if it can remain as semi-join
+2. or_to_union (0.59x on Q90):
+   CAUSE: Split same-column time range OR into UNION branches, duplicating fact scans
+   RULE: Do not split OR on same column (d_month_seq range is single predicate)
+3. date_cte_isolate (0.50x on Q25):
+   CAUSE: Baseline <100ms, CTE overhead dominated savings
+   RULE: This query baseline is 1465ms, CTE overhead acceptable
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+filtered_dates -> filtered_stores -> joined_fact -> aggregated_base -> top_states -> final_rollup -> windowed
+NODE_CONTRACTS:
+filtered_dates:
+  FROM: date_dim
+  WHERE: d_month_seq BETWEEN 1213 AND 1224
+  OUTPUT: d_date_sk
+  EXPECTED_ROWS: 365
+  CONSUMERS: joined_fact
+filtered_stores:
+  FROM: store
+  WHERE: s_store_sk <= 100
+  OUTPUT: s_store_sk, s_state, s_county
+  EXPECTED_ROWS: 100
+  CONSUMERS: joined_fact
+joined_fact:
+  FROM: store_sales
+  JOIN: INNER JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+         INNER JOIN filtered_stores ON ss_store_sk = s_store_sk
+  OUTPUT: ss_net_profit, s_state, s_county
+  EXPECTED_ROWS: 5.4M
+  CONSUMERS: aggregated_base
+aggregated_base:
+  FROM: joined_fact
+  GROUP BY: s_state, s_county
+  AGGREGATE: SUM(ss_net_profit) AS state_county_sum
+  OUTPUT: s_state, s_county, state_county_sum
+  EXPECTED_ROWS: ~2000 (county-level groups)
+  CONSUMERS: top_states, final_rollup
+top_states:
+  FROM: aggregated_base
+  GROUP BY: s_state
+  AGGREGATE: SUM(state_county_sum) AS state_sum
+  WINDOW: RANK() OVER (ORDER BY SUM(state_county_sum) DESC) AS ranking
+  OUTPUT: s_state, state_sum, ranking
+  EXPECTED_ROWS: ~50 (states)
+  CONSUMERS: final_rollup
+final_rollup:
+  FROM: aggregated_base
+  JOIN: INNER JOIN top_states ON aggregated_base.s_state = top_states.s_state
+  WHERE: top_states.ranking <= 5
+  GROUP BY: ROLLUP(s_state, s_county)
+  AGGREGATE: SUM(state_county_sum) AS total_sum
+  OUTPUT: total_sum, s_state, s_county, GROUPING(s_state)+GROUPING(s_county) AS lochierarchy
+  EXPECTED_ROWS: ~7
+  CONSUMERS: windowed
+windowed:
+  FROM: final_rollup
+  WINDOW: RANK() OVER (PARTITION BY lochierarchy, CASE WHEN GROUPING(s_county)=0 THEN s_state END ORDER BY total_sum DESC) AS rank_within_parent
+  OUTPUT: total_sum, s_state, s_county, lochierarchy, rank_within_parent
+  EXPECTED_ROWS: 7
+  CONSUMERS: main output
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+single_pass_aggregation: Apply the CASE WHEN pattern to compute both state and county aggregates in one pass; but here we need separate levels so use GROUPING SETS instead of CASE. Ignore the scalar subquery consolidation aspect.
+channel_bitmap_aggregation: Apply the single scan principle; ignore the bucket labeling since we have only one channel.
+HAZARD_FLAGS:
+- Must ensure joined_fact outputs s_state, s_county for aggregation
+- ROLLUP in final_rollup must compute correct lochierarchy values (0,1,2)
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: rollup_to_union_windowing
+TARGET_LOGICAL_TREE:
+filtered_dates -> filtered_stores -> joined_fact -> state_county_agg -> top_states -> level0 -> level1 -> level2 -> union_all -> windowed
+NODE_CONTRACTS:
+filtered_dates:
+  FROM: date_dim
+  WHERE: d_month_seq BETWEEN 1213 AND 1224
+  OUTPUT: d_date_sk
+  EXPECTED_ROWS: 365
+  CONSUMERS: joined_fact
+filtered_stores:
+  FROM: store
+  WHERE: s_store_sk <= 100
+  OUTPUT: s_store_sk, s_state, s_county
+  EXPECTED_ROWS: 100
+  CONSUMERS: joined_fact
+joined_fact:
+  FROM: store_sales
+  JOIN: INNER JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+         INNER JOIN filtered_stores ON ss_store_sk = s_store_sk
+  OUTPUT: ss_net_profit, s_state, s_county
+  EXPECTED_ROWS: 5.4M
+  CONSUMERS: state_county_agg
+state_county_agg:
+  FROM: joined_fact
+  GROUP BY: s_state, s_county
+  AGGREGATE: SUM(ss_net_profit) AS state_county_sum
+  OUTPUT: s_state, s_county, state_county_sum
+  EXPECTED_ROWS: ~2000
+  CONSUMERS: top_states, level0
+top_states:
+  FROM: state_county_agg
+  GROUP BY: s_state
+  AGGREGATE: SUM(state_county_sum) AS state_sum
+  WINDOW: RANK() OVER (ORDER BY SUM(state_county_sum) DESC) AS ranking
+  OUTPUT: s_state, state_sum, ranking
+  EXPECTED_ROWS: ~50
+  CONSUMERS: level0, level1, level2
+level0:
+  FROM: state_county_agg
+  JOIN: INNER JOIN top_states ON state_county_agg.s_state = top_states.s_state
+  WHERE: top_states.ranking <= 5
+  GROUP BY: s_state, s_county
+  AGGREGATE: SUM(state_county_sum) AS total_sum
+  OUTPUT: total_sum, s_state, s_county, 0 AS lochierarchy
+  EXPECTED_ROWS: ~200
+  CONSUMERS: union_all
+level1:
+  FROM: state_county_agg
+  JOIN: INNER JOIN top_states ON state_county_agg.s_state = top_states.s_state
+  WHERE: top_states.ranking <= 5
+  GROUP BY: s_state
+  AGGREGATE: SUM(state_county_sum) AS total_sum
+  OUTPUT: total_sum, s_state, NULL AS s_county, 1 AS lochierarchy
+  EXPECTED_ROWS: 5
+  CONSUMERS: union_all
+level2:
+  FROM: state_county_agg
+  JOIN: INNER JOIN top_states ON state_county_agg.s_state = top_states.s_state
+  WHERE: top_states.ranking <= 5
+  GROUP BY: ()
+  AGGREGATE: SUM(state_county_sum) AS total_sum
+  OUTPUT: total_sum, NULL AS s_state, NULL AS s_county, 2 AS lochierarchy
+  EXPECTED_ROWS: 1
+  CONSUMERS: union_all
+union_all:
+  FROM: level0 UNION ALL level1 UNION ALL level2
+  OUTPUT: total_sum, s_state, s_county, lochierarchy
+  EXPECTED_ROWS: ~206
+  CONSUMERS: windowed
+windowed:
+  FROM: union_all
+  WINDOW: RANK() OVER (PARTITION BY lochierarchy, CASE WHEN lochierarchy=0 THEN s_state END ORDER BY total_sum DESC) AS rank_within_parent
+  OUTPUT: total_sum, s_state, s_county, lochierarchy, rank_within_parent
+  EXPECTED_ROWS: ~206
+  CONSUMERS: main output
+EXAMPLES: rollup_to_union_windowing, union_cte_split
+EXAMPLE_ADAPTATION:
+rollup_to_union_windowing: Apply explicit UNION ALL of three aggregation levels; ignore the window function placement (keep at end).
+union_cte_split: Apply splitting of generic aggregation into specialized CTEs per level; ignore the year filter aspect.
+HAZARD_FLAGS:
+- Must handle NULLs in s_state/s_county for levels 1 and 2 correctly
+- UNION ALL may change row order; must maintain ORDER BY as in original
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+filtered_dates -> filtered_stores -> prefetched_fact -> state_agg -> county_agg -> rollup_combined -> windowed
+NODE_CONTRACTS:
+filtered_dates:
+  FROM: date_dim
+  WHERE: d_month_seq BETWEEN 1213 AND 1224
+  OUTPUT: d_date_sk
+  EXPECTED_ROWS: 365
+  CONSUMERS: prefetched_fact
+filtered_stores:
+  FROM: store
+  WHERE: s_store_sk <= 100
+  OUTPUT: s_store_sk, s_state, s_county
+  EXPECTED_ROWS: 100
+  CONSUMERS: prefetched_fact
+prefetched_fact:
+  FROM: store_sales
+  JOIN: INNER JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+         INNER JOIN filtered_stores ON ss_store_sk = s_store_sk
+  OUTPUT: ss_net_profit, s_state, s_county
+  EXPECTED_ROWS: 5.4M
+  CONSUMERS: state_agg, county_agg
+state_agg:
+  FROM: prefetched_fact
+  GROUP BY: s_state
+  AGGREGATE: SUM(ss_net_profit) AS state_sum
+  WINDOW: RANK() OVER (ORDER BY SUM(ss_net_profit) DESC) AS ranking
+  OUTPUT: s_state, state_sum, ranking
+  EXPECTED_ROWS: ~50
+  CONSUMERS: county_agg
+county_agg:
+  FROM: prefetched_fact
+  JOIN: INNER JOIN state_agg ON prefetched_fact.s_state = state_agg.s_state
+  WHERE: state_agg.ranking <= 5
+  GROUP BY: prefetched_fact.s_state, s_county
+  AGGREGATE: SUM(ss_net_profit) AS county_sum
+  OUTPUT: s_state, s_county, county_sum
+  EXPECTED_ROWS: ~200
+  CONSUMERS: rollup_combined
+rollup_combined:
+  FROM: county_agg
+  GROUP BY: ROLLUP(s_state, s_county)
+  AGGREGATE: SUM(county_sum) AS total_sum
+  OUTPUT: total_sum, s_state, s_county, GROUPING(s_state)+GROUPING(s_county) AS lochierarchy
+  EXPECTED_ROWS: ~7
+  CONSUMERS: windowed
+windowed:
+  FROM: rollup_combined
+  WINDOW: RANK() OVER (PARTITION BY lochierarchy, CASE WHEN GROUPING(s_county)=0 THEN s_state END ORDER BY total_sum DESC) AS rank_within_parent
+  OUTPUT: total_sum, s_state, s_county, lochierarchy, rank_within_parent
+  EXPECTED_ROWS: 7
+  CONSUMERS: main output
+EXAMPLES: prefetch_fact_join, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+prefetch_fact_join: Apply the CTE chain: filter dimensions first, then join with fact; ignore the multiple channel aspect.
+multi_dimension_prefetch: Apply pre-filtering of both date_dim and store; ignore the multiple date range aspect.
+HAZARD_FLAGS:
+- state_agg must include ranking for top-5 filter
+- rollup_combined must use county_agg as base to avoid double-counting
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: shared_subquery_aggregation
+TARGET_LOGICAL_TREE:
+filtered_dates -> filtered_stores -> joined_fact -> county_base -> state_derived -> top_states -> filtered_county -> rollup_from_county -> windowed
+NODE_CONTRACTS:
+filtered_dates:
+  FROM: date_dim
+  WHERE: d_month_seq BETWEEN 1213 AND 1224
+  OUTPUT: d_date_sk
+  EXPECTED_ROWS: 365
+  CONSUMERS: joined_fact
+filtered_stores:
+  FROM: store
+  WHERE: s_store_sk <= 100
+  OUTPUT: s_store_sk, s_state, s_county
+  EXPECTED_ROWS: 100
+  CONSUMERS: joined_fact
+joined_fact:
+  FROM: store_sales
+  JOIN: INNER JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+         INNER JOIN filtered_stores ON ss_store_sk = s_store_sk
+  OUTPUT: ss_net_profit, s_state, s_county
+  EXPECTED_ROWS: 5.4M
+  CONSUMERS: county_base
+county_base:
+  FROM: joined_fact
+  GROUP BY: s_state, s_county
+  AGGREGATE: SUM(ss_net_profit) AS county_sum
+  OUTPUT: s_state, s_county, county_sum
+  EXPECTED_ROWS: ~2000
+  CONSUMERS: state_derived
+state_derived:
+  FROM: county_base
+  GROUP BY: s_state
+  AGGREGATE: SUM(county_sum) AS state_sum
+  OUTPUT: s_state, state_sum
+  EXPECTED_ROWS: ~50
+  CONSUMERS: top_states
+top_states:
+  FROM: state_derived
+  WINDOW: RANK() OVER (ORDER BY state_sum DESC) AS ranking
+  OUTPUT: s_state, state_sum, ranking
+  EXPECTED_ROWS: ~50
+  CONSUMERS: filtered_county
+filtered_county:
+  FROM: county_base
+  JOIN: INNER JOIN top_states ON county_base.s_state = top_states.s_state
+  WHERE: top_states.ranking <= 5
+  OUTPUT: s_state, s_county, county_sum
+  EXPECTED_ROWS: ~200
+  CONSUMERS: rollup_from_county
+rollup_from_county:
+  FROM: filtered_county
+  GROUP BY: ROLLUP(s_state, s_county)
+  AGGREGATE: SUM(county_sum) AS total_sum
+  OUTPUT: total_sum, s_state, s_county, GROUPING(s_state)+GROUPING(s_county) AS lochierarchy
+  EXPECTED_ROWS: ~7
+  CONSUMERS: windowed
+windowed:
+  FROM: rollup_from_county
+  WINDOW: RANK() OVER (PARTITION BY lochierarchy, CASE WHEN GROUPING(s_county)=0 THEN s_state END ORDER BY total_sum DESC) AS rank_within_parent
+  OUTPUT: total_sum, s_state, s_county, lochierarchy, rank_within_parent
+  EXPECTED_ROWS: 7
+  CONSUMERS: main output
+EXAMPLES: single_pass_aggregation, decorrelate
+EXAMPLE_ADAPTATION:
+single_pass_aggregation: Apply the single scan of store_sales; ignore the CASE WHEN conditional aggregation.
+decorrelate: Apply the decorrelation of the IN subquery by pre-computing top states; ignore the EXISTS pattern.
+HAZARD_FLAGS:
+- Must ensure state_derived aggregates from county_base, not from joined_fact directly (to avoid double work)
+- ranking computed on state_sum must match original subquery logic
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines single-pass scanning with early state aggregation derivation)

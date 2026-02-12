@@ -1,0 +1,315 @@
+<reasoning>
+**1. CLASSIFY**
+This is a classic **star-join with late dim filter** archetype. It joins two fact tables (web_sales, web_returns) with six dimension tables (web_page, customer_demographics×2, customer_address, date_dim, reason). The query has two independent OR-based filter groups: (1) demographic/price conditions spanning cd1, cd2, and ws_sales_price; (2) address/profit conditions spanning ca_country, ca_state, and ws_net_profit. These OR conditions are applied after most joins, causing a large intermediate result that's then filtered. The query then aggregates by reason description.
+
+**2. EXPLAIN PLAN ANALYSIS**
+- **Total runtime**: 487 ms.
+- **Major cost centers**:
+  1. Hash join between web_returns and web_sales (215.2 ms, 44%). This is the largest fact-to-fact join.
+  2. Scan of web_returns (88.7 ms, 18%) and web_sales (82.8 ms, 17%). Together ~35% of runtime.
+  3. Filter on OR conditions (14.8 ms, 3%) – relatively small because most filtering happens late after joins.
+- **Cardinality flow**:
+  - date_dim scan: 73K → 366 rows (d_year=2000). Excellent selectivity.
+  - web_sales scan: 86.4M → 1.4M rows (after date join). Still large.
+  - web_returns scan: 4.3M → 687K rows (no early filter).
+  - customer_address scan: 750K → 242K rows (ca_country='United States').
+  - customer_demographics scans: 23M → 685K (cd1) and 1.9M (cd2) – minimal filtering.
+  - After joins: 1.4M web_sales rows join with 666K web_returns rows → 134K rows. Then filtered to 1,526 rows, then to 17 rows after demographic filters. Final aggregation yields 13 rows.
+- **Optimizer behavior**: Already pushes date filter into scan. Pushes ca_country filter. Does NOT push OR conditions on ws_sales_price or ws_net_profit into web_sales scan – these appear as late FILTER nodes. Does NOT split OR conditions into separate access paths. Uses hash joins throughout.
+- **Scan counts**: Each base table scanned exactly once. No repeated scans.
+- **CTE materialization**: No CTEs in original query – all joins in single block.
+
+**3. GAP MATCHING**
+- **CROSS_COLUMN_OR_DECOMPOSITION**: Present. OR conditions span different columns (cd_marital_status, cd_education_status, ws_sales_price, ca_state, ws_net_profit). The OR branches have different selective predicates that could benefit from separate access paths. **Applicable**: or_to_union.
+- **CROSS_CTE_PREDICATE_BLINDNESS**: Present. Filters on ws_sales_price and ws_net_profit are not pushed into web_sales scan – they appear as late FILTER nodes. Pre-filtering dimensions could reduce fact table join input. **Applicable**: dimension_cte_isolate, prefetch_fact_join, date_cte_isolate (already optimized), early_filter.
+- **REDUNDANT_SCAN_ELIMINATION**: NOT present. Each table scanned only once.
+- **CORRELATED_SUBQUERY_PARALYSIS**: NOT present. No correlated subqueries.
+- **UNION_CTE_SELF_JOIN_DECOMPOSITION**: NOT present. No UNION CTEs.
+
+**4. AGGREGATION TRAP CHECK**
+Query uses AVG() on three columns. AVG is duplicate-sensitive – if join introduces extra rows, averages change. However, all joins are INNER on foreign keys, preserving original web_sales ↔ web_returns relationship. Any restructuring must maintain same join semantics. No FILTER clauses or STDDEV.
+
+**5. TRANSFORM SELECTION**
+Ranked by potential impact:
+1. **or_to_union**: Split OR conditions into UNION ALL branches. Each branch can have focused predicates, potentially pushing ws_sales_price and ws_net_profit ranges into web_sales scan. Expected high impact (3.17x historical). Diverse: restructures query flow.
+2. **dimension_cte_isolate**: Pre-filter all dimension tables into CTEs, then join. Reduces hash table sizes and enables early fact table filtering via key intersection. Expected medium impact (1.93x historical). Diverse: changes join order.
+3. **prefetch_fact_join**: Build CTE chain: filter dimensions, pre-join with fact tables, then apply remaining filters. Could push profit/price filters earlier. Expected medium impact (3.77x historical but baseline >50ms). Diverse: staged pipeline.
+4. **compound_strategy** (exploration): Combine dimension pre-filtering with OR splitting. Novel combination not in catalog. High risk/reward.
+
+**6. LOGICAL TREE DESIGN**
+For each strategy, design CTE structure ensuring column completeness. Verify all downstream references.
+
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: 
+For web returns in year 2000 with matched refunded/returning customer demographics, compute reason-level averages of quantity, refunded cash, and fee under specific marital/education/price profiles and US state/profit ranges. All joins are INNER (intersection) requiring matches from all eight tables. AVG aggregates are duplicate-sensitive but joins preserve original web_sales↔web_returns cardinality. Filter dependencies: ws_sales_price and ws_net_profit filters depend on web_sales table; cd1 and cd2 filters must match exactly; ca_state filters depend on customer_address table.
+
+BOTTLENECK_DIAGNOSIS:
+Join-bound: The hash join between web_returns and web_sales consumes 44% of runtime (215ms) because both tables are large (687K and 1.4M rows). OR filters on ws_sales_price and ws_net_profit are applied late after joins, preventing predicate pushdown into web_sales scan. Cardinality drops from 134K to 1.5K after OR filters, showing high selectivity but late application. Optimizer already pushes date and country filters effectively; does NOT push cross-column ORs.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output substr(r_reason_desc,1,20), avg(ws_quantity), avg(wr_refunded_cash), avg(wr_fee) in same order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream: join keys, filter columns, and output columns.
+- LITERAL_PRESERVATION: Must preserve all literal values: 'M', '4 yr Degree', 100.00, 150.00, 'S', 'Secondary', 50.00, 100.00, 'W', 'Advanced Degree', 150.00, 200.00, 'United States', state lists, profit ranges, d_year=2000.
+- SEMANTIC_EQUIVALENCE: Must return same 13 rows with same averages and ordering.
+- CROSS_COLUMN_OR_DECOMPOSITION: OR conditions span cd_marital_status, cd_education_status, ws_sales_price, ca_state, ws_net_profit – prevents optimal scan path.
+- CROSS_CTE_PREDICATE_BLINDNESS: ws_sales_price and ws_net_profit filters appear as late FILTER nodes, not pushed into web_sales scan.
+
+REGRESSION_WARNINGS:
+1. or_to_union (0.59x on Q90):
+   CAUSE: Split same-column time range OR into UNION branches, duplicating fact table scans with no selectivity benefit.
+   RULE: Only split ORs that span DIFFERENT columns/tables. Here, OR branches involve different marital/education values AND different price ranges – valid for splitting.
+2. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially with fact table. Ensure each CTE has WHERE clause.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: or_to_union
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_address -> filtered_reason -> filtered_web_page -> 
+  UNION_ALL(branch1, branch2, branch3) -> main_agg -> final_sort
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 2000
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 366
+    CONSUMERS: branch1, branch2, branch3
+  filtered_address:
+    FROM: customer_address
+    WHERE: ca_country = 'United States'
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: 242K
+    CONSUMERS: branch1, branch2, branch3
+  filtered_reason:
+    FROM: reason
+    OUTPUT: r_reason_sk, r_reason_desc
+    EXPECTED_ROWS: 45
+    CONSUMERS: main_agg
+  filtered_web_page:
+    FROM: web_page
+    OUTPUT: wp_web_page_sk
+    EXPECTED_ROWS: 200
+    CONSUMERS: branch1, branch2, branch3
+  branch1:
+    FROM: web_sales JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+           JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+           JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+           JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+           JOIN filtered_address ON ca_address_sk = wr_refunded_addr_sk
+           JOIN filtered_web_page ON ws_web_page_sk = wp_web_page_sk
+    WHERE: cd1.cd_marital_status = 'M' AND cd1.cd_marital_status = cd2.cd_marital_status
+           AND cd1.cd_education_status = '4 yr Degree' AND cd1.cd_education_status = cd2.cd_education_status
+           AND ws_sales_price BETWEEN 100.00 AND 150.00
+           AND ((ca_state IN ('FL', 'TX', 'DE') AND ws_net_profit BETWEEN 100 AND 200)
+                OR (ca_state IN ('IN', 'ND', 'ID') AND ws_net_profit BETWEEN 150 AND 300)
+                OR (ca_state IN ('MT', 'IL', 'OH') AND ws_net_profit BETWEEN 50 AND 250))
+    OUTPUT: wr_reason_sk, ws_quantity, wr_refunded_cash, wr_fee, r_reason_desc (via later join)
+    EXPECTED_ROWS: ~500
+    CONSUMERS: UNION_ALL
+  branch2: (similar with 'S', 'Secondary', 50-100 price)
+  branch3: (similar with 'W', 'Advanced Degree', 150-200 price)
+  main_agg:
+    FROM: UNION_ALL of branches JOIN filtered_reason ON wr_reason_sk = r_reason_sk
+    GROUP BY: r_reason_desc
+    AGGREGATE: avg(ws_quantity), avg(wr_refunded_cash), avg(wr_fee)
+    OUTPUT: substr(r_reason_desc,1,20), avg(ws_quantity), avg(wr_refunded_cash), avg(wr_fee)
+    EXPECTED_ROWS: 13
+    CONSUMERS: final_sort
+  final_sort:
+    FROM: main_agg
+    ORDER BY: substr(r_reason_desc,1,20), avg(ws_quantity), avg(wr_refunded_cash), avg(wr_fee)
+    LIMIT: 100
+    OUTPUT: same as main_agg
+    EXPECTED_ROWS: 13
+    CONSUMERS: output
+EXAMPLES: or_to_union, early_filter, date_cte_isolate
+EXAMPLE_ADAPTATION:
+  or_to_union: Apply three-branch split for marital/education/price OR; keep address/profit OR inside each branch. Ignore same-column OR warning – our OR spans different columns.
+  early_filter: Apply pre-filtering of date_dim and customer_address into CTEs; ignore dimension pre-filtering for cd1/cd2 – they are branch-specific.
+  date_cte_isolate: Apply date filter CTE; ignore decorrelation – no correlated subqueries.
+HAZARD_FLAGS:
+- Each branch rescans web_sales and web_returns – total 3 scans of each fact table. Must ensure selectivity per branch justifies duplication.
+- Must ensure UNION ALL doesn't create duplicate rows (branches are mutually exclusive).
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_address -> filtered_cd1 -> filtered_cd2 -> filtered_reason -> filtered_web_page ->
+  fact_join -> filtered_facts -> main_agg -> final_sort
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 2000
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 366
+    CONSUMERS: fact_join
+  filtered_address:
+    FROM: customer_address
+    WHERE: ca_country = 'United States'
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: 242K
+    CONSUMERS: fact_join
+  filtered_cd1:
+    FROM: customer_demographics
+    WHERE: cd_marital_status IN ('M','S','W') AND cd_education_status IN ('4 yr Degree','Secondary','Advanced Degree')
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~1.5M
+    CONSUMERS: fact_join
+  filtered_cd2:
+    FROM: customer_demographics
+    WHERE: cd_marital_status IN ('M','S','W') AND cd_education_status IN ('4 yr Degree','Secondary','Advanced Degree')
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~1.5M
+    CONSUMERS: fact_join
+  filtered_reason:
+    FROM: reason
+    OUTPUT: r_reason_sk, r_reason_desc
+    EXPECTED_ROWS: 45
+    CONSUMERS: filtered_facts
+  filtered_web_page:
+    FROM: web_page
+    OUTPUT: wp_web_page_sk
+    EXPECTED_ROWS: 200
+    CONSUMERS: fact_join
+  fact_join:
+    FROM: web_sales 
+          JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+          JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+          JOIN filtered_cd1 cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+          JOIN filtered_cd2 cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+          JOIN filtered_address ON ca_address_sk = wr_refunded_addr_sk
+          JOIN filtered_web_page ON ws_web_page_sk = wp_web_page_sk
+    OUTPUT: ws_quantity, wr_refunded_cash, wr_fee, wr_reason_sk, ws_sales_price, ws_net_profit, cd1.cd_marital_status, cd1.cd_education_status, ca_state
+    EXPECTED_ROWS: ~134K
+    CONSUMERS: filtered_facts
+  filtered_facts:
+    FROM: fact_join JOIN filtered_reason ON wr_reason_sk = r_reason_sk
+    WHERE: ((cd_marital_status = 'M' AND cd_education_status = '4 yr Degree' AND ws_sales_price BETWEEN 100.00 AND 150.00)
+            OR (cd_marital_status = 'S' AND cd_education_status = 'Secondary' AND ws_sales_price BETWEEN 50.00 AND 100.00)
+            OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree' AND ws_sales_price BETWEEN 150.00 AND 200.00))
+           AND ((ca_state IN ('FL','TX','DE') AND ws_net_profit BETWEEN 100 AND 200)
+                OR (ca_state IN ('IN','ND','ID') AND ws_net_profit BETWEEN 150 AND 300)
+                OR (ca_state IN ('MT','IL','OH') AND ws_net_profit BETWEEN 50 AND 250))
+           AND cd1.cd_marital_status = cd2.cd_marital_status
+           AND cd1.cd_education_status = cd2.cd_education_status
+    OUTPUT: r_reason_desc, ws_quantity, wr_refunded_cash, wr_fee
+    EXPECTED_ROWS: ~1.5K
+    CONSUMERS: main_agg
+  main_agg: (same as Worker 1)
+  final_sort: (same as Worker 1)
+EXAMPLES: dimension_cte_isolate, early_filter, prefetch_fact_join
+EXAMPLE_ADAPTATION:
+  dimension_cte_isolate: Apply pre-filtering of all dimension tables (date, address, cd1, cd2, reason, web_page) into CTEs; ignore cross-join warning – join sequentially via fact table.
+  early_filter: Apply early filtering of date and address; ignore OR splitting – keep OR conditions intact.
+  prefetch_fact_join: Apply staged join chain (dimensions → fact join); ignore consolidation of multiple fact scans – only one scan needed.
+HAZARD_FLAGS:
+- Must include cd_marital_status and cd_education_status in filtered_cd1/cd2 outputs for later equality checks.
+- OR conditions still evaluated late after fact join; may not push profit/price filters into scans.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_address -> filtered_cd1 -> filtered_cd2 -> 
+  prefetched_sales -> filtered_prefetch -> joined_dims -> main_agg -> final_sort
+NODE_CONTRACTS:
+  filtered_date: (same as Worker 2)
+  filtered_address: (same as Worker 2)
+  filtered_cd1: (same as Worker 2)
+  filtered_cd2: (same as Worker 2)
+  prefetched_sales:
+    FROM: web_sales 
+          JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+          JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+          JOIN filtered_address ON ca_address_sk = wr_refunded_addr_sk
+    WHERE: ((ca_state IN ('FL','TX','DE') AND ws_net_profit BETWEEN 100 AND 200)
+            OR (ca_state IN ('IN','ND','ID') AND ws_net_profit BETWEEN 150 AND 300)
+            OR (ca_state IN ('MT','IL','OH') AND ws_net_profit BETWEEN 50 AND 250))
+    OUTPUT: ws_quantity, wr_refunded_cash, wr_fee, wr_reason_sk, ws_sales_price, wr_refunded_cdemo_sk, wr_returning_cdemo_sk, ws_web_page_sk
+    EXPECTED_ROWS: ~? (reduces from 134K by address/profit filter)
+    CONSUMERS: filtered_prefetch
+  filtered_prefetch:
+    FROM: prefetched_sales
+          JOIN filtered_cd1 cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+          JOIN filtered_cd2 cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+    WHERE: ((cd1.cd_marital_status = 'M' AND cd1.cd_education_status = '4 yr Degree' AND ws_sales_price BETWEEN 100.00 AND 150.00)
+            OR (cd1.cd_marital_status = 'S' AND cd1.cd_education_status = 'Secondary' AND ws_sales_price BETWEEN 50.00 AND 100.00)
+            OR (cd1.cd_marital_status = 'W' AND cd1.cd_education_status = 'Advanced Degree' AND ws_sales_price BETWEEN 150.00 AND 200.00))
+           AND cd1.cd_marital_status = cd2.cd_marital_status
+           AND cd1.cd_education_status = cd2.cd_education_status
+    OUTPUT: wr_reason_sk, ws_quantity, wr_refunded_cash, wr_fee, ws_web_page_sk
+    EXPECTED_ROWS: ~1.5K
+    CONSUMERS: joined_dims
+  joined_dims:
+    FROM: filtered_prefetch
+          JOIN web_page ON ws_web_page_sk = wp_web_page_sk
+          JOIN reason ON wr_reason_sk = r_reason_sk
+    OUTPUT: r_reason_desc, ws_quantity, wr_refunded_cash, wr_fee
+    EXPECTED_ROWS: ~1.5K
+    CONSUMERS: main_agg
+  main_agg: (same as Worker 1)
+  final_sort: (same as Worker 1)
+EXAMPLES: prefetch_fact_join, multi_dimension_prefetch, pushdown
+EXAMPLE_ADAPTATION:
+  prefetch_fact_join: Apply CTE chain: filter date/address, pre-join with sales/returns, then filter demographics. Ignore multiple fact scans – only one chain.
+  multi_dimension_prefetch: Apply parallel pre-filtering of date and address; ignore unfiltered dimension CTEs – ensure WHERE clauses.
+  pushdown: Apply consolidation of address/profit filter into prefetched_sales CTE; ignore scalar subqueries – none present.
+HAZARD_FLAGS:
+- Profit/price filters may still not push into web_sales scan if OR condition remains.
+- Must include ws_web_page_sk in prefetched_sales output for later join.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: compound_or_prefilter
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_address -> filtered_cd1 -> filtered_cd2 -> filtered_reason -> filtered_web_page ->
+  UNION_ALL(branch1, branch2, branch3) -> main_agg -> final_sort
+  (Where each branch uses pre-filtered dimensions and applies focused price/profit filters)
+NODE_CONTRACTS:
+  filtered_date: (same as Worker 2)
+  filtered_address: (same as Worker 2)
+  filtered_cd1:
+    FROM: customer_demographics
+    WHERE: (cd_marital_status = 'M' AND cd_education_status = '4 yr Degree')
+           OR (cd_marital_status = 'S' AND cd_education_status = 'Secondary')
+           OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree')
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~? (subset of 1.5M)
+    CONSUMERS: branch1, branch2, branch3
+  filtered_cd2: (same as filtered_cd1)
+  filtered_reason: (same as Worker 2)
+  filtered_web_page: (same as Worker 2)
+  branch1:
+    FROM: web_sales JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+          JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+          JOIN filtered_cd1 cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk AND cd1.cd_marital_status = 'M' AND cd1.cd_education_status = '4 yr Degree'
+          JOIN filtered_cd2 cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk AND cd2.cd_marital_status = 'M' AND cd2.cd_education_status = '4 yr Degree'
+          JOIN filtered_address ON ca_address_sk = wr_refunded_addr_sk
+          JOIN filtered_web_page ON ws_web_page_sk = wp_web_page_sk
+    WHERE: ws_sales_price BETWEEN 100.00 AND 150.00
+           AND ((ca_state IN ('FL','TX','DE') AND ws_net_profit BETWEEN 100 AND 200)
+                OR (ca_state IN ('IN','ND','ID') AND ws_net_profit BETWEEN 150 AND 300)
+                OR (ca_state IN ('MT','IL','OH') AND ws_net_profit BETWEEN 50 AND 250))
+    OUTPUT: wr_reason_sk, ws_quantity, wr_refunded_cash, wr_fee
+    EXPECTED_ROWS: ~500
+    CONSUMERS: UNION_ALL
+  branch2: (with 'S', 'Secondary', price 50-100)
+  branch3: (with 'W', 'Advanced Degree', price 150-200)
+  main_agg: (same as Worker 1)
+  final_sort: (same as Worker 1)
+EXAMPLES: composite_decorrelate_union, single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+  composite_decorrelate_union: Apply shared dimension CTEs (date, address) across multiple UNION branches; ignore EXISTS decorrelation – no correlated subqueries.
+  single_pass_aggregation: Apply consolidation of demographic filters into filtered_cd1/cd2 CTEs; ignore CASE aggregation – not needed.
+  channel_bitmap_aggregation: Apply branch-specific filtering in separate scans; ignore bitmap technique – use UNION ALL.
+HAZARD_FLAGS:
+- Each branch still rescans web_sales and web_returns (3 scans each).
+- filtered_cd1/cd2 CTEs are shared but each branch filters further – may cause redundant materialization.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines dimension_cte_isolate + or_to_union)

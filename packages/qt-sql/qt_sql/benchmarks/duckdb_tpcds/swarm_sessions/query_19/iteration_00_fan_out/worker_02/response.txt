@@ -1,0 +1,70 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  — Restructured with CTEs per Target Logical Tree
+    ├── [CTE] date_item_fact  [+]  — Isolate early date+item+store_sales join
+    ├── [CTE] early_agg  [+]  — Aggregate by brand+manufacturer+customer+store
+    ├── [CTE] late_join_customer_store  [+]  — Join customer/address/store after aggregation
+    ├── FILTER (substr(ca_zip,1,5) <> substr(s_zip,1,5))  [~]  — Moved from original WHERE to separate step
+    ├── AGG (implicit: ext_price already aggregated per brand/manufacturer) [=]
+    ├── SORT (ext_price DESC, i_brand ASC, i_brand_id ASC, i_manufact_id ASC, i_manufact ASC) [=]
+    └── OUTPUT (brand_id, brand, i_manufact_id, i_manufact, ext_price) [=]
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Isolate date_dim and item filters early, reducing store_sales probe size", "applied_to": ["date_item_fact"]},
+    {"id": "R2", "type": "deferred_window_aggregation", "description": "Aggregate before expensive customer/store joins (ZIP mismatch filter)", "applied_to": ["early_agg"]},
+    {"id": "R3", "type": "late_attribute_binding", "description": "Delay customer/address/store joins until after aggregation, binding ZIP attributes only for final filter", "applied_to": ["late_join_customer_store"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_item_fact": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss.ss_customer_sk, ss.ss_store_sk, ss.ss_ext_sales_price, i.i_brand_id, i.i_brand, i.i_manufact_id, i.i_manufact FROM date_dim d JOIN store_sales ss ON d.d_date_sk = ss.ss_sold_date_sk JOIN item i ON ss.ss_item_sk = i.i_item_sk WHERE d.d_moy = 12 AND d.d_year = 1999 AND i.i_manager_id = 2",
+        "interfaces": {"outputs": ["ss_customer_sk", "ss_store_sk", "ss_ext_sales_price", "i_brand_id", "i_brand", "i_manufact_id", "i_manufact"], "consumes": []}
+      },
+      "early_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_brand_id, i_brand, i_manufact_id, i_manufact, ss_customer_sk, ss_store_sk, SUM(ss_ext_sales_price) AS ext_price FROM date_item_fact GROUP BY i_brand_id, i_brand, i_manufact_id, i_manufact, ss_customer_sk, ss_store_sk",
+        "interfaces": {"outputs": ["i_brand_id", "i_brand", "i_manufact_id", "i_manufact", "ss_customer_sk", "ss_store_sk", "ext_price"], "consumes": ["date_item_fact"]}
+      },
+      "late_join_customer_store": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT a.i_brand_id, a.i_brand, a.i_manufact_id, a.i_manufact, a.ext_price, ca.ca_zip, s.s_zip FROM early_agg a JOIN customer c ON a.ss_customer_sk = c.c_customer_sk JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN store s ON a.ss_store_sk = s.s_store_sk",
+        "interfaces": {"outputs": ["i_brand_id", "i_brand", "i_manufact_id", "i_manufact", "ext_price", "ca_zip", "s_zip"], "consumes": ["early_agg"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_brand_id AS brand_id, i_brand AS brand, i_manufact_id, i_manufact, SUM(ext_price) AS ext_price FROM late_join_customer_store WHERE substr(ca_zip, 1, 5) <> substr(s_zip, 1, 5) GROUP BY i_brand_id, i_brand, i_manufact_id, i_manufact ORDER BY ext_price DESC, i_brand, i_brand_id, i_manufact_id, i_manufact LIMIT 100",
+        "interfaces": {"outputs": ["brand_id", "brand", "i_manufact_id", "i_manufact", "ext_price"], "consumes": ["late_join_customer_store"]}
+      }
+    },
+    "reconstruction_order": ["date_item_fact", "early_agg", "late_join_customer_store", "main_query"],
+    "assembly_template": "WITH date_item_fact AS ({date_item_fact}), early_agg AS ({early_agg}), late_join_customer_store AS ({late_join_customer_store}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Changes Explanation
+
+**Structural change**: Decomposed the monolithic six-table join into a pipeline of three CTEs that isolate fact-table joins from dimension-table joins, following the Target Logical Tree.
+
+**Expected mechanism**: The `date_item_fact` CTE applies date and item filters early, reducing the store_sales probe from full scan to ~17K rows. Aggregation happens before the customer/store joins, computing revenue at the granularity of (brand, customer, store). Only then do we join customer and store tables to fetch ZIP codes for the final mismatch filter. This avoids inflating the intermediate dataset with customer/store attributes during aggregation.
+
+**Expected speedup**: 1.8–2.5x, based on similar patterns where early aggregation reduces join cardinality before expensive dimension-table lookups.

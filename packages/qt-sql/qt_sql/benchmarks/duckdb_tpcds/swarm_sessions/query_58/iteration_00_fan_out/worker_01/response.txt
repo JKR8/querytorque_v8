@@ -1,0 +1,93 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_week_cte [+] — Extract week dates once, materialized for reuse
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_week_seq = scalar subquery)
+│   └── OUTPUT (d_date_sk, d_date)
+├── [CTE] store_agg_cte [~] — Changed: join date_week_cte instead of date_dim subquery
+│   ├── SCAN (store_sales, item, date_week_cte)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── JOIN (ss_item_sk = i_item_sk)
+│   ├── AGG (GROUP BY i_item_id)
+│   └── OUTPUT (item_id, ss_item_rev)
+├── [CTE] catalog_agg_cte [~] — Changed: join date_week_cte instead of date_dim subquery
+│   ├── SCAN (catalog_sales, item, date_week_cte)
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── JOIN (cs_item_sk = i_item_sk)
+│   ├── AGG (GROUP BY i_item_id)
+│   └── OUTPUT (item_id, cs_item_rev)
+├── [CTE] web_agg_cte [~] — Changed: join date_week_cte instead of date_dim subquery
+│   ├── SCAN (web_sales, item, date_week_cte)
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── JOIN (ws_item_sk = i_item_sk)
+│   ├── AGG (GROUP BY i_item_id)
+│   └── OUTPUT (item_id, ws_item_rev)
+└── [MAIN] main_query [=] — Unchanged triple join with pairwise ±10% filters
+    ├── SCAN (store_agg_cte, catalog_agg_cte, web_agg_cte)
+    ├── JOIN (item_id = item_id)
+    ├── JOIN (item_id = item_id)
+    ├── FILTER (6 pairwise BETWEEN conditions)
+    ├── SORT (item_id ASC, ss_item_rev ASC)
+    └── OUTPUT (8 columns as specified)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extract repeated date filter into shared CTE to eliminate redundant scalar subqueries", "applied_to": ["date_week_cte"]},
+    {"id": "R2", "type": "early_filter", "description": "Push small dimension filter (date_dim) into CTE before joining with large fact tables", "applied_to": ["date_week_cte"]},
+    {"id": "R3", "type": "pushdown", "description": "Consolidate 9 identical date_dim scans (3 channels × 3 scans each) into 1 CTE scan", "applied_to": ["store_agg_cte", "catalog_agg_cte", "web_agg_cte"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_week_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "store_agg_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_id AS item_id, SUM(ss_ext_sales_price) AS ss_item_rev FROM store_sales JOIN date_week_cte ON ss_sold_date_sk = d_date_sk JOIN item ON ss_item_sk = i_item_sk GROUP BY i_item_id",
+        "interfaces": {"outputs": ["item_id", "ss_item_rev"], "consumes": ["date_week_cte"]}
+      },
+      "catalog_agg_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_id AS item_id, SUM(cs_ext_sales_price) AS cs_item_rev FROM catalog_sales JOIN date_week_cte ON cs_sold_date_sk = d_date_sk JOIN item ON cs_item_sk = i_item_sk GROUP BY i_item_id",
+        "interfaces": {"outputs": ["item_id", "cs_item_rev"], "consumes": ["date_week_cte"]}
+      },
+      "web_agg_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_id AS item_id, SUM(ws_ext_sales_price) AS ws_item_rev FROM web_sales JOIN date_week_cte ON ws_sold_date_sk = d_date_sk JOIN item ON ws_item_sk = i_item_sk GROUP BY i_item_id",
+        "interfaces": {"outputs": ["item_id", "ws_item_rev"], "consumes": ["date_week_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["item_id", "ss_item_rev", "ss_dev", "cs_item_rev", "cs_dev", "ws_item_rev", "ws_dev", "average"], "consumes": ["store_agg_cte", "catalog_agg_cte", "web_agg_cte"]}
+      }
+    },
+    "reconstruction_order": ["date_week_cte", "store_agg_cte", "catalog_agg_cte", "web_agg_cte", "main_query"],
+    "assembly_template": "WITH date_week_cte AS ({date_week_cte}), store_agg_cte AS ({store_agg_cte}), catalog_agg_cte AS ({catalog_agg_cte}), web_agg_cte AS ({web_agg_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Isolated the date filter into a shared CTE (`date_week_cte`) that's reused across all three channel aggregations, eliminating 9 redundant date_dim scans (3 channels × 3 subqueries each) while preserving exact week semantics.
+
+**Expected speedup:** 2.5-3x from eliminating redundant date_dim scans and scalar subquery evaluations. The date_week_cte materializes only 7 rows, creating tiny hash tables for subsequent joins.

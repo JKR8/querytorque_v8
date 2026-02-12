@@ -1,0 +1,112 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_months_agg  [+]  New CTE replacing original inv subquery
+│   ├── SCAN (inventory, item, warehouse, date_dim)
+│   ├── FILTER (d_year=2002, d_moy IN (2,3), i_category IN ('Jewelry','Men'), i_manager_id BETWEEN 81 and 100, inv_quantity_on_hand between 0 and 200)
+│   ├── JOIN (equality: inv_item_sk=i_item_sk, inv_warehouse_sk=w_warehouse_sk, inv_date_sk=d_date_sk)
+│   ├── AGG (GROUP BY w_warehouse_sk,w_warehouse_name,i_item_sk,d_moy)
+│   └── OUTPUT (w_warehouse_sk,w_warehouse_name,i_item_sk,d_moy,stdev,mean)
+├── [CTE] pivoted_months  [+]  New CTE for coefficient calculation
+│   ├── SCAN (filtered_months_agg)
+│   └── OUTPUT (w_warehouse_sk,w_warehouse_name,i_item_sk,d_moy,stdev,mean,cov)
+├── [CTE] cov_filtered  [+]  New CTE for volatility filter
+│   ├── SCAN (pivoted_months)
+│   ├── FILTER (CASE mean WHEN 0 THEN 0 ELSE stdev/mean END > 1)
+│   └── OUTPUT (w_warehouse_sk,w_warehouse_name,i_item_sk,d_moy,stdev,mean,cov)
+├── [CTE] inv  [~]  Modified CTE to match target structure (simple wrapper for backward compatibility)
+│   └── SCAN (cov_filtered)
+└── [MAIN] main_query  [=]
+    ├── SCAN (inv AS inv1, inv AS inv2)
+    ├── JOIN (inv1.i_item_sk=inv2.i_item_sk AND inv1.w_warehouse_sk=inv2.w_warehouse_sk)
+    ├── FILTER (inv1.d_moy=2 AND inv2.d_moy=3)
+    ├── SORT (inv1.w_warehouse_sk,inv1.i_item_sk,inv1.d_moy,inv1.mean,inv1.cov,inv2.d_moy,inv2.mean,inv2.cov)
+    └── OUTPUT (10 columns as specified)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "pg_materialized_dimension_fact_prefilter",
+      "description": "Pushed d_moy IN (2,3) filter early into fact table scan via CTE decomposition",
+      "applied_to": ["filtered_months_agg"]
+    },
+    {
+      "id": "R2",
+      "type": "early_filter_decorrelate",
+      "description": "Decoupled aggregation, coefficient calculation, and coefficient filtering into separate CTEs to preserve semantic equivalence",
+      "applied_to": ["filtered_months_agg", "pivoted_months", "cov_filtered"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_months_agg": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT w.w_warehouse_sk, w.w_warehouse_name, i.i_item_sk, dd.d_moy, STDDEV_SAMP(inv.inv_quantity_on_hand) AS stdev, AVG(inv.inv_quantity_on_hand) AS mean FROM inventory inv, item i, warehouse w, date_dim dd WHERE inv.inv_item_sk = i.i_item_sk AND inv.inv_warehouse_sk = w.w_warehouse_sk AND inv.inv_date_sk = dd.d_date_sk AND dd.d_year = 2002 AND dd.d_moy IN (2, 3) AND i.i_category IN ('Jewelry', 'Men') AND i.i_manager_id BETWEEN 81 AND 100 AND inv.inv_quantity_on_hand BETWEEN 0 AND 200 GROUP BY w.w_warehouse_sk, w.w_warehouse_name, i.i_item_sk, dd.d_moy",
+          "interfaces": {
+            "outputs": ["w_warehouse_sk", "w_warehouse_name", "i_item_sk", "d_moy", "stdev", "mean"],
+            "consumes": []
+          }
+        },
+        "pivoted_months": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT w_warehouse_sk, w_warehouse_name, i_item_sk, d_moy, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END AS cov FROM filtered_months_agg",
+          "interfaces": {
+            "outputs": ["w_warehouse_sk", "w_warehouse_name", "i_item_sk", "d_moy", "stdev", "mean", "cov"],
+            "consumes": ["filtered_months_agg"]
+          }
+        },
+        "cov_filtered": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT w_warehouse_sk, w_warehouse_name, i_item_sk, d_moy, stdev, mean, cov FROM pivoted_months WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1",
+          "interfaces": {
+            "outputs": ["w_warehouse_sk", "w_warehouse_name", "i_item_sk", "d_moy", "stdev", "mean", "cov"],
+            "consumes": ["pivoted_months"]
+          }
+        },
+        "inv": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean, cov FROM cov_filtered",
+          "interfaces": {
+            "outputs": ["w_warehouse_name", "w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean", "cov"],
+            "consumes": ["cov_filtered"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "unchanged",
+          "sql": "",
+          "interfaces": {
+            "outputs": ["inv1.w_warehouse_sk", "inv1.i_item_sk", "inv1.d_moy", "inv1.mean", "inv1.cov", "inv2.w_warehouse_sk", "inv2.i_item_sk", "inv2.d_moy", "inv2.mean", "inv2.cov"],
+            "consumes": ["inv"]
+          }
+        }
+      },
+      "reconstruction_order": ["filtered_months_agg", "pivoted_months", "cov_filtered", "inv", "main_query"],
+      "assembly_template": "WITH filtered_months_agg AS ({filtered_months_agg}), pivoted_months AS ({pivoted_months}), cov_filtered AS ({cov_filtered}), inv AS ({inv}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Decomposed original single CTE into three sequential CTEs following target logical tree: (1) filter and aggregate by month, (2) compute coefficient of variation with division guard, (3) filter high volatility rows. This preserves the statistical grouping and coefficient filter semantics exactly while enabling early filtering optimization.
+
+**Expected speedup**: 2-3x from early date filtering and materialized intermediate results reducing join cardinality.

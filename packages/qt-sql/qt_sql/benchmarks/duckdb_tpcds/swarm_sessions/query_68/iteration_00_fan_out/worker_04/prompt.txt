@@ -1,0 +1,276 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Return ticket-level extended sales/tax/list totals for selected stores and household conditions over 1998-2000 where the customer's current city differs from the purchase city. All joins are INNER (intersection), requiring matches on all sides. Aggregates are SUMs over store_sales columns, insensitive to duplication from dimension joins (1:1 or N:1 relationships). The filter `current_addr.ca_city <> bought_city` depends on two customer_address instances and cannot be pushed below the customer join.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+dim_keys -> fact_bloom -> agg -> join_customer -> join_current_addr -> top_n
+NODE_CONTRACTS:
+  dim_keys:
+    FROM: (SELECT d_date_sk FROM date_dim WHERE d_dom BETWEEN 1 AND 2 AND d_year IN (1998, 1999, 2000)) d
+         CROSS JOIN (SELECT s_store_sk FROM store WHERE s_city IN ('Pleasant Hill', 'Five Points')) s
+         CROSS JOIN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 8 OR hd_vehicle_count = -1) h
+    OUTPUT: d_date_sk, s_store_sk, hd_demo_sk
+    EXPECTED_ROWS: 72 * 46 * 1800 = ~6M
+    CONSUMERS: fact_bloom
+  fact_bloom:
+    FROM: store_sales
+         JOIN dim_keys ON ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk AND ss_hdemo_sk = hd_demo_sk
+         JOIN customer_address ON ss_addr_sk = ca_address_sk
+    OUTPUT: ss_ticket_number, ss_customer_sk, ca_city AS bought_city, ss_ext_sales_price, ss_ext_list_price, ss_ext_tax
+    EXPECTED_ROWS: ~102K
+    CONSUMERS: agg
+  agg:
+    FROM: fact_bloom
+    GROUP BY: ss_ticket_number, ss_customer_sk, bought_city
+    AGGREGATE: SUM(ss_ext_sales_price) AS extended_price, SUM(ss_ext_list_price) AS list_price, SUM(ss_ext_tax) AS extended_tax
+    OUTPUT: ss_ticket_number, ss_customer_sk, bought_city, extended_price, list_price, extended_tax
+    EXPECTED_ROWS: 9619
+    CONSUMERS: join_customer
+  join_customer:
+    FROM: agg JOIN customer ON ss_customer_sk = c_customer_sk
+    OUTPUT: c_last_name, c_first_name, bought_city, ss_ticket_number, extended_price, extended_tax, list_price, c_current_addr_sk
+    EXPECTED_ROWS: ~9306
+    CONSUMERS: join_current_addr
+  join_current_addr:
+    FROM: join_customer JOIN customer_address current_addr ON c_current_addr_sk = ca_address_sk AND ca_city <> bought_city
+    OUTPUT: c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, extended_price, extended_tax, list_price
+    EXPECTED_ROWS: ~8679
+    CONSUMERS: top_n
+  top_n:
+    ORDER BY: c_last_name ASC, ss_ticket_number ASC
+    LIMIT: 100
+    OUTPUT: c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, extended_price, extended_tax, list_price
+
+NODE_CONTRACTS:
+dim_keys:
+    FROM: (SELECT d_date_sk FROM date_dim WHERE d_dom BETWEEN 1 AND 2 AND d_year IN (1998, 1999, 2000)) d
+         CROSS JOIN (SELECT s_store_sk FROM store WHERE s_city IN ('Pleasant Hill', 'Five Points')) s
+         CROSS JOIN (SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 8 OR hd_vehicle_count = -1) h
+    OUTPUT: d_date_sk, s_store_sk, hd_demo_sk
+    EXPECTED_ROWS: 72 * 46 * 1800 = ~6M
+    CONSUMERS: fact_bloom
+  fact_bloom:
+    FROM: store_sales
+         JOIN dim_keys ON ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk AND ss_hdemo_sk = hd_demo_sk
+         JOIN customer_address ON ss_addr_sk = ca_address_sk
+    OUTPUT: ss_ticket_number, ss_customer_sk, ca_city AS bought_city, ss_ext_sales_price, ss_ext_list_price, ss_ext_tax
+    EXPECTED_ROWS: ~102K
+    CONSUMERS: agg
+  agg:
+    FROM: fact_bloom
+    GROUP BY: ss_ticket_number, ss_customer_sk, bought_city
+    AGGREGATE: SUM(ss_ext_sales_price) AS extended_price, SUM(ss_ext_list_price) AS list_price, SUM(ss_ext_tax) AS extended_tax
+    OUTPUT: ss_ticket_number, ss_customer_sk, bought_city, extended_price, list_price, extended_tax
+    EXPECTED_ROWS: 9619
+    CONSUMERS: join_customer
+  join_customer:
+    FROM: agg JOIN customer ON ss_customer_sk = c_customer_sk
+    OUTPUT: c_last_name, c_first_name, bought_city, ss_ticket_number, extended_price, extended_tax, list_price, c_current_addr_sk
+    EXPECTED_ROWS: ~9306
+    CONSUMERS: join_current_addr
+  join_current_addr:
+    FROM: join_customer JOIN customer_address current_addr ON c_current_addr_sk = ca_address_sk AND ca_city <> bought_city
+    OUTPUT: c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, extended_price, extended_tax, list_price
+    EXPECTED_ROWS: ~8679
+    CONSUMERS: top_n
+  top_n:
+    ORDER BY: c_last_name ASC, ss_ticket_number ASC
+    LIMIT: 100
+    OUTPUT: c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, extended_price, extended_tax, list_price
+
+## Hazard Flags (avoid these specific risks)
+
+- dim_keys CTE cross-joins three dimension key sets, potentially huge (6M rows). May be slower than original.
+- The cross join may explode memory/CPU.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This is a novel technique not covered by existing regression examples. The risk is high due to cross-join explosion.
+EXPLORATION_TYPE: novel_combination
+
+## Regression Warnings (observed failures on similar queries)
+
+1. or_to_union (0.59x on Q90):
+   CAUSE: Split same-column time range OR, duplicating fact scans.
+   RULE: Only split OR on different columns, max 3 UNION branches. Not applicable to same-column OR.
+2. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join 3+ dimension CTEs; join each dimension directly with fact table.
+3. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Baseline <50ms, CTE overhead dominated savings.
+   RULE: Not applicable here (baseline 1463ms >> 100ms).
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, extended_price, extended_tax, list_price in same order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream, especially join keys and aggregated columns.
+- LITERAL_PRESERVATION: Must preserve literal values: d_dom between 1 and 2, d_year in (1998,1998+1,1998+2), s_city in ('Pleasant Hill','Five Points'), hd_dep_count=8, hd_vehicle_count=-1.
+- SEMANTIC_EQUIVALENCE: Must return same rows, columns, ordering.
+- CROSS_CTE_PREDICATE_BLINDNESS: The optimizer already pushes filters into scans, but creating CTEs for filtered dimensions could reduce hash table build cost and enable better join ordering.
+- CROSS_COLUMN_OR_DECOMPOSITION: OR condition on different columns (hd_dep_count, hd_vehicle_count) in household_demographics.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- No direct examples; inspired by bloom filter technique: pre-compute all possible dimension key combinations to create a "filter set" for store_sales.
+
+## Original SQL
+
+```sql
+-- start query 68 in stream 0 using template query68.tpl
+select c_last_name
+       ,c_first_name
+       ,ca_city
+       ,bought_city
+       ,ss_ticket_number
+       ,extended_price
+       ,extended_tax
+       ,list_price
+ from (select ss_ticket_number
+             ,ss_customer_sk
+             ,ca_city bought_city
+             ,sum(ss_ext_sales_price) extended_price 
+             ,sum(ss_ext_list_price) list_price
+             ,sum(ss_ext_tax) extended_tax 
+       from store_sales
+           ,date_dim
+           ,store
+           ,household_demographics
+           ,customer_address 
+       where store_sales.ss_sold_date_sk = date_dim.d_date_sk
+         and store_sales.ss_store_sk = store.s_store_sk  
+        and store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk
+        and store_sales.ss_addr_sk = customer_address.ca_address_sk
+        and date_dim.d_dom between 1 and 2 
+        and (household_demographics.hd_dep_count = 8 or
+             household_demographics.hd_vehicle_count= -1)
+        and date_dim.d_year in (1998,1998+1,1998+2)
+        and store.s_city in ('Pleasant Hill','Five Points')
+       group by ss_ticket_number
+               ,ss_customer_sk
+               ,ss_addr_sk,ca_city) dn
+      ,customer
+      ,customer_address current_addr
+ where ss_customer_sk = c_customer_sk
+   and customer.c_current_addr_sk = current_addr.ca_address_sk
+   and current_addr.ca_city <> bought_city
+ order by c_last_name
+         ,ss_ticket_number
+ LIMIT 100;
+
+-- end query 68 in stream 0 using template query68.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `c_last_name`
+  2. `c_first_name`
+  3. `ca_city`
+  4. `bought_city`
+  5. `ss_ticket_number`
+  6. `extended_price`
+  7. `extended_tax`
+  8. `list_price`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K  — Aggregate ticket measures by customer and bought city under day/month/year/store/household filters, join to customer current address, filter city mismatch, and output customer/ticket details.
+    ├── SCAN (store_sales, date_dim, store, household_demographics, customer_address, customer (join), customer_address AS current_addr (join))
+    ├── JOIN (ss_customer_sk = c_customer_sk)
+    ├── JOIN (customer.c_current_addr_sk = current_addr.ca_address_sk)
+    ├── FILTER (current_addr.ca_city <> bought_city)
+    ├── AGG (GROUP BY)
+    ├── SORT (c_last_name ASC, ss_ticket_number ASC)
+    └── OUTPUT (c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, extended_price, extended_tax, list_price)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

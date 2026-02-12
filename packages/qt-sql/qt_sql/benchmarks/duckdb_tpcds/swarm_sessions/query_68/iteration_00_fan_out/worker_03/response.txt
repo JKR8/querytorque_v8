@@ -1,0 +1,93 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Aggregate ticket measures by customer and bought city under day/month/year/store/household filters, join to customer current address, filter city mismatch, and output customer/ticket details.
+    ├── [~] filtered_dims  — CTE containing pre-filtered dimension surrogate keys via cross join
+    │   ├── SCAN (date_dim) with filter: d_dom BETWEEN 1 AND 2 AND d_year IN (1998, 1999, 2000)
+    │   ├── SCAN (store) with filter: s_city IN ('Pleasant Hill', 'Five Points')
+    │   ├── SCAN (household_demographics) with filter: hd_dep_count = 8 OR hd_vehicle_count = -1
+    │   └── CROSS JOIN (date_dim × store × household_demographics)
+    ├── [~] fact_prejoin  — CTE joining store_sales with filtered_dims and customer_address for sale address
+    │   ├── SCAN (store_sales)
+    │   ├── JOIN filtered_dims ON ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk AND ss_hdemo_sk = hd_demo_sk
+    │   └── JOIN customer_address ON ss_addr_sk = ca_address_sk
+    ├── [~] agg  — CTE aggregating ticket-level extended sales/tax/list totals
+    │   ├── FROM fact_prejoin
+    │   ├── GROUP BY ss_ticket_number, ss_customer_sk, bought_city
+    │   └── AGGREGATE: SUM(ss_ext_sales_price), SUM(ss_ext_list_price), SUM(ss_ext_tax)
+    ├── [~] join_customer  — CTE joining aggregated tickets with customer dimension
+    │   ├── FROM agg
+    │   └── JOIN customer ON ss_customer_sk = c_customer_sk
+    ├── [~] join_current_addr  — CTE joining customer current address and filtering city mismatch
+    │   ├── FROM join_customer
+    │   └── JOIN customer_address current_addr ON c_current_addr_sk = ca_address_sk AND ca_city <> bought_city
+    └── [~] top_n  — main query performing final ordering and limit
+        ├── FROM join_current_addr
+        ├── ORDER BY c_last_name ASC, ss_ticket_number ASC
+        └── LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "prefetch_fact_join", "description": "Staged CTE pipeline: first filter dimensions, then join to fact, then aggregate, then join remaining dimensions progressively", "applied_to": ["filtered_dims", "fact_prejoin", "agg", "join_customer", "join_current_addr", "top_n"]},
+    {"id": "R2", "type": "early_filter", "description": "Pre-filter dimension tables (date_dim, store, household_demographics) before joining to fact table", "applied_to": ["filtered_dims"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dims": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT date_dim.d_date_sk, store.s_store_sk, household_demographics.hd_demo_sk FROM date_dim, store, household_demographics WHERE date_dim.d_dom BETWEEN 1 AND 2 AND date_dim.d_year IN (1998, 1999, 2000) AND store.s_city IN ('Pleasant Hill', 'Five Points') AND (household_demographics.hd_dep_count = 8 OR household_demographics.hd_vehicle_count = -1)",
+        "interfaces": {"outputs": ["d_date_sk", "s_store_sk", "hd_demo_sk"], "consumes": []}
+      },
+      "fact_prejoin": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, ca_city AS bought_city, ss_ext_sales_price, ss_ext_list_price, ss_ext_tax FROM store_sales JOIN filtered_dims ON store_sales.ss_sold_date_sk = filtered_dims.d_date_sk AND store_sales.ss_store_sk = filtered_dims.s_store_sk AND store_sales.ss_hdemo_sk = filtered_dims.hd_demo_sk JOIN customer_address ON store_sales.ss_addr_sk = customer_address.ca_address_sk",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "bought_city", "ss_ext_sales_price", "ss_ext_list_price", "ss_ext_tax"], "consumes": ["filtered_dims"]}
+      },
+      "agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, bought_city, SUM(ss_ext_sales_price) AS extended_price, SUM(ss_ext_list_price) AS list_price, SUM(ss_ext_tax) AS extended_tax FROM fact_prejoin GROUP BY ss_ticket_number, ss_customer_sk, bought_city",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "bought_city", "extended_price", "list_price", "extended_tax"], "consumes": ["fact_prejoin"]}
+      },
+      "join_customer": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, agg.bought_city, agg.ss_ticket_number, agg.extended_price, agg.extended_tax, agg.list_price, c_current_addr_sk FROM agg JOIN customer ON agg.ss_customer_sk = customer.c_customer_sk",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "bought_city", "ss_ticket_number", "extended_price", "extended_tax", "list_price", "c_current_addr_sk"], "consumes": ["agg"]}
+      },
+      "join_current_addr": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT join_customer.c_last_name, join_customer.c_first_name, current_addr.ca_city, join_customer.bought_city, join_customer.ss_ticket_number, join_customer.extended_price, join_customer.extended_tax, join_customer.list_price FROM join_customer JOIN customer_address AS current_addr ON join_customer.c_current_addr_sk = current_addr.ca_address_sk AND current_addr.ca_city <> join_customer.bought_city",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "ca_city", "bought_city", "ss_ticket_number", "extended_price", "extended_tax", "list_price"], "consumes": ["join_customer"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, extended_price, extended_tax, list_price FROM join_current_addr ORDER BY c_last_name ASC, ss_ticket_number ASC LIMIT 100",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "ca_city", "bought_city", "ss_ticket_number", "extended_price", "extended_tax", "list_price"], "consumes": ["join_current_addr"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dims", "fact_prejoin", "agg", "join_customer", "join_current_addr", "main_query"],
+    "assembly_template": "WITH filtered_dims AS ({filtered_dims}), fact_prejoin AS ({fact_prejoin}), agg AS ({agg}), join_customer AS ({join_customer}), join_current_addr AS ({join_current_addr}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Restructured the original flat join into a staged CTE pipeline where dimension filters are applied early in `filtered_dims`, then joined to the fact table in `fact_prejoin`, then aggregated in `agg`, followed by progressive dimension joins (`join_customer`, `join_current_addr`). This reduces the hash table build cost for dimension tables and enables better join ordering.
+
+Expected speedup: ~3-4x due to early filtering of dimensions and staged reduction of fact rows before expensive joins.

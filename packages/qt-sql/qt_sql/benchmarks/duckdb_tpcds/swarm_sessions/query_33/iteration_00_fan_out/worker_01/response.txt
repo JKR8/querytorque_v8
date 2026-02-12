@@ -1,0 +1,93 @@
+**Part 1: Modified Logic Tree**
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_date  [+]  Cost: 0%  Rows: 31 — Filter date_dim to January 2002 dates
+├── [CTE] filtered_address  [+]  Cost: 0%  Rows: 91K — Filter customer_address to GMT offset -5
+├── [CTE] filtered_item  [+]  Cost: 0%  Rows: 10K — Filter item to Home category
+├── [CTE] store_sales_join  [+]  Cost: 25%  Rows: 114K — Join store_sales with filtered dimensions
+├── [CTE] catalog_sales_join  [+]  Cost: 25%  Rows: 51K — Join catalog_sales with filtered dimensions
+├── [CTE] web_sales_join  [+]  Cost: 25%  Rows: 31K — Join web_sales with filtered dimensions
+├── [CTE] union_all  [+]  Cost: 25%  Rows: 196K — Union all channel sales
+└── [MAIN] final_agg  [~]  Cost: 25%  Rows: 100 — Aggregate by manufacturer, sum sales, order, and limit
+    ├── SCAN (union_all)
+    ├── AGG (GROUP BY i_manufact_id)
+    ├── SORT (total_sales ASC)
+    └── OUTPUT (i_manufact_id, total_sales)
+```
+
+**Part 2: Component Payload JSON**
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Extract filtered date, address, and item into separate CTEs for reuse across channels", "applied_to": ["filtered_date", "filtered_address", "filtered_item"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Replace original channel CTEs (with aggregation) with simple joins to filtered dimension CTEs, moving aggregation to final stage", "applied_to": ["store_sales_join", "catalog_sales_join", "web_sales_join", "union_all", "final_agg"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2002 AND d_moy = 1",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_address": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_gmt_offset = -5",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_manufact_id FROM item WHERE i_category = 'Home'",
+        "interfaces": {"outputs": ["i_item_sk", "i_manufact_id"], "consumes": []}
+      },
+      "store_sales_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT filtered_item.i_manufact_id, ss_ext_sales_price AS sales_price FROM store_sales INNER JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk INNER JOIN filtered_address ON ss_addr_sk = filtered_address.ca_address_sk INNER JOIN filtered_item ON ss_item_sk = filtered_item.i_item_sk",
+        "interfaces": {"outputs": ["i_manufact_id", "sales_price"], "consumes": ["filtered_date", "filtered_address", "filtered_item"]}
+      },
+      "catalog_sales_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT filtered_item.i_manufact_id, cs_ext_sales_price AS sales_price FROM catalog_sales INNER JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk INNER JOIN filtered_address ON cs_bill_addr_sk = filtered_address.ca_address_sk INNER JOIN filtered_item ON cs_item_sk = filtered_item.i_item_sk",
+        "interfaces": {"outputs": ["i_manufact_id", "sales_price"], "consumes": ["filtered_date", "filtered_address", "filtered_item"]}
+      },
+      "web_sales_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT filtered_item.i_manufact_id, ws_ext_sales_price AS sales_price FROM web_sales INNER JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk INNER JOIN filtered_address ON ws_bill_addr_sk = filtered_address.ca_address_sk INNER JOIN filtered_item ON ws_item_sk = filtered_item.i_item_sk",
+        "interfaces": {"outputs": ["i_manufact_id", "sales_price"], "consumes": ["filtered_date", "filtered_address", "filtered_item"]}
+      },
+      "union_all": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_manufact_id, sales_price FROM store_sales_join UNION ALL SELECT i_manufact_id, sales_price FROM catalog_sales_join UNION ALL SELECT i_manufact_id, sales_price FROM web_sales_join",
+        "interfaces": {"outputs": ["i_manufact_id", "sales_price"], "consumes": ["store_sales_join", "catalog_sales_join", "web_sales_join"]}
+      },
+      "final_agg": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_manufact_id, SUM(sales_price) AS total_sales FROM union_all GROUP BY i_manufact_id ORDER BY total_sales ASC LIMIT 100",
+        "interfaces": {"outputs": ["i_manufact_id", "total_sales"], "consumes": ["union_all"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_address", "filtered_item", "store_sales_join", "catalog_sales_join", "web_sales_join", "union_all", "final_agg"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_address AS ({filtered_address}), filtered_item AS ({filtered_item}), store_sales_join AS ({store_sales_join}), catalog_sales_join AS ({catalog_sales_join}), web_sales_join AS ({web_sales_join}), union_all AS ({union_all}) {final_agg}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Isolated dimension filters (date, address, item) into separate CTEs, then built channel-specific fact joins that consume those CTEs, followed by a union of raw sales (not pre-aggregated) and a final aggregation. This allows predicate pushdown into small dimension CTEs and avoids cross-joining dimension tables.
+
+**Expected speedup:** ~2x–4x due to dimension isolation (small hash tables for joins) and elimination of redundant aggregations.

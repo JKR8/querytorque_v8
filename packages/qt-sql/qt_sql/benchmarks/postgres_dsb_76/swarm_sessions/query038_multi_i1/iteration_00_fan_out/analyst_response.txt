@@ -1,0 +1,260 @@
+<reasoning>
+CLASSIFY: This is a multi-channel set intersection query. It finds customers (by name and date) who made purchases in all three sales channels (store, catalog, web) within a specific 12-month period, with specific price and birth month filters. The structure involves three independent subqueries on different fact tables joined to the same dimension tables, combined via INTERSECT.
+
+EXPLAIN PLAN ANALYSIS:
+- Total execution: 992.2ms, dominated by three sequential subquery executions:
+  1. store_sales subquery: 574.8ms (58% of total)
+  2. catalog_sales subquery: 248.8ms (25%)
+  3. web_sales subquery: 168.6ms (17%)
+- Each subquery follows the same pattern: sequential scan on date_dim (filtered to 183 rows), index scan on fact table (store_sales: 16K rows filtered out, catalog_sales: 6,245, web_sales: 3,673), then index scan on customer.
+- Critical observations:
+  - date_dim is scanned THREE times (once per subquery), each returning 183 rows.
+  - customer table is scanned THREE times via index scans.
+  - The optimizer is already using parallel workers within each subquery (Gather Merge).
+  - No CTE materialization sharing occurs between subqueries - each is independent.
+  - The SetOp (INTERSECT) happens after all three subqueries complete.
+  - All three fact table scans are expensive (store_sales being the largest).
+  - Cardinality flow: date_dim 183 rows → fact table ~hundreds of matching rows → customer lookup.
+  - The optimizer already pushes filters into scans (date_dim filter applied early).
+
+GAP MATCHING:
+1. COMMA_JOIN_WEAKNESS: Present. The query uses comma-separated implicit joins in each subquery. This can confuse cardinality estimation.
+2. CROSS_CTE_PREDICATE_BLINDNESS: Present. The same dimension tables (date_dim, customer) are scanned three times independently with identical filters.
+3. CORRELATED_SUBQUERY_PARALYSIS: NOT present. No correlated subqueries.
+4. NON_EQUI_JOIN_INPUT_BLINDNESS: NOT present. All joins are equi-joins.
+
+The optimizer is NOT sharing dimension scans across subqueries, representing a clear gap.
+
+AGGREGATION TRAP CHECK: The query uses COUNT(*) at the outermost level, which is duplicate-insensitive. No aggregate functions with grouping sensitivity.
+
+TRANSFORM SELECTION (ranked by expected value):
+1. **star_join_prefetch + union_consolidation**: Pre-filter date_dim and customer once into CTEs, then join each fact table with these shared CTEs. This eliminates 2/3 of dimension scans.
+2. **scan_consolidation_pivot**: Combine the three fact table scans into a single UNION ALL with channel discriminator, then aggregate to find triples present in all channels. Reduces fact table scans from 3 to 1.
+3. **exists_restructuring**: Convert INTERSECT to EXISTS semi-joins, which could short-circuit evaluation.
+4. **minimal-change baseline**: Convert comma joins to explicit JOINs with pre-filtered dimension CTEs (proven pattern from examples).
+
+These four are structurally diverse: (1) shared dimension CTEs, (2) consolidated fact scans, (3) set operation rewrite, (4) explicit join syntax.
+
+LOGICAL TREE DESIGN:
+For Worker 1 (star_join_prefetch): 
+  filtered_dates CTE → filtered_customers CTE → three separate joins with fact tables → INTERSECT
+For Worker 2 (scan_consolidation_pivot):
+  all_sales CTE (UNION ALL of three channels with discriminator) → join with dimensions → group by (name, date) with count distinct channels → filter count=3
+For Worker 3 (exists_restructuring):
+  Take one channel as base (e.g., store_sales), check EXISTS in other two channels.
+For Worker 4 (minimal-change): 
+  filtered_dates CTE, filtered_customers CTE, explicit JOIN syntax for each subquery.
+
+All CTEs must include all columns needed downstream: d_date_sk, d_date, c_customer_sk, c_last_name, c_first_name, plus fact table keys and price columns.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Find customers (by name and purchase date) who made purchases in all three sales channels during a specific 12-month period, with specific price ranges and birth months. All joins are INNER (intersection semantics). The final COUNT(*) is duplicate-insensitive. Filters on date_dim.d_month_seq and customer.c_birth_month must be preserved across all three subqueries.
+
+BOTTLENECK_DIAGNOSIS: The query is scan-bound and join-bound, with three independent subqueries sequentially scanning date_dim (3×183 rows) and customer (3×index scans) with identical filters. store_sales subquery dominates (574.8ms, 58% of total) due to largest fact table scan. The optimizer already pushes filters into scans and uses parallel workers within each subquery, but misses the opportunity to share dimension scans across subqueries. Logical-tree cost percentages are misleading as they show equal cost distribution, but actual timings show store_sales is 3.4× slower than web_sales.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs COUNT(*), must preserve single numeric result.
+- CTE_COLUMN_COMPLETENESS: Any CTEs must include d_date_sk, d_date, c_customer_sk, c_last_name, c_first_name for downstream joins.
+- LITERAL_PRESERVATION: Must preserve literal values: d_month_seq 1200-1211, c_birth_month {1,2,5,12}, price ranges 193-252 and 35-55.
+- SEMANTIC_EQUIVALENCE: Must return identical count of distinct (c_last_name, c_first_name, d_date) triples present in all three channels.
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated joins in all three subqueries (store_sales, date_dim, customer).
+- CROSS_CTE_PREDICATE_BLINDNESS: Same date_dim and customer filters applied three times independently.
+
+REGRESSION_WARNINGS:
+1. OR to UNION ALL (0.21x regression on Q085):
+   CAUSE: Splitting OR conditions when optimizer could use bitmap scan.
+   RULE: Do not split the c_birth_month IN list into UNION ALL branches.
+2. EXISTS to IN/NOT IN (0.50x regression on Q069):
+   CAUSE: Converting EXISTS to IN blocks hash semi-joins.
+   RULE: If converting INTERSECT to EXISTS, use EXISTS not IN.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch + union_consolidation
+TARGET_LOGICAL_TREE:
+  filtered_dates CTE -> filtered_customers CTE -> store_sales_join CTE -> catalog_sales_join CTE -> web_sales_join CTE -> INTERSECT -> COUNT
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1200 AND 1200 + 11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 183
+    CONSUMERS: store_sales_join, catalog_sales_join, web_sales_join
+  filtered_customers:
+    FROM: customer
+    WHERE: c_birth_month IN (1, 2, 5, 12)
+    OUTPUT: c_customer_sk, c_last_name, c_first_name
+    EXPECTED_ROWS: ~25% of customer table
+    CONSUMERS: store_sales_join, catalog_sales_join, web_sales_join
+  store_sales_join:
+    FROM: filtered_dates d JOIN store_sales ss ON ss.ss_sold_date_sk = d.d_date_sk
+          JOIN filtered_customers c ON ss.ss_customer_sk = c.c_customer_sk
+    WHERE: ss_list_price BETWEEN 193 AND 252 AND ss_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: ~hundreds
+    CONSUMERS: INTERSECT operation
+  catalog_sales_join:
+    FROM: filtered_dates d JOIN catalog_sales cs ON cs.cs_sold_date_sk = d.d_date_sk
+          JOIN filtered_customers c ON cs.cs_bill_customer_sk = c.c_customer_sk
+    WHERE: cs_list_price BETWEEN 193 AND 252 AND cs_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: ~hundreds
+    CONSUMERS: INTERSECT operation
+  web_sales_join:
+    FROM: filtered_dates d JOIN web_sales ws ON ws.ws_sold_date_sk = d.d_date_sk
+          JOIN filtered_customers c ON ws.ws_bill_customer_sk = c.c_customer_sk
+    WHERE: ws_list_price BETWEEN 193 AND 252 AND ws_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: ~hundreds
+    CONSUMERS: INTERSECT operation
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering of date_dim and customer into CTEs, convert comma joins to explicit JOIN syntax. Ignore the promotion dimension filtering (not present here).
+- pg_date_cte_explicit_join: Apply date_dim CTE isolation and explicit JOINs. Ignore the single-channel focus (we have three channels).
+- shared_dimension_multi_channel: Apply shared dimension CTEs across multiple sales channels. Ignore any UNION ALL restructuring (we keep INTERSECT).
+HAZARD_FLAGS:
+- Materializing filtered_customers CTE may be larger than expected if birth month filter is not selective.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: scan_consolidation_pivot
+TARGET_LOGICAL_TREE:
+  all_sales CTE -> joined_sales CTE -> grouped_sales CTE -> filter_count_3 -> COUNT
+NODE_CONTRACTS:
+  all_sales:
+    FROM: (SELECT 'store' as channel, ss_sold_date_sk, ss_customer_sk, ss_list_price, ss_wholesale_cost FROM store_sales
+           UNION ALL
+           SELECT 'catalog', cs_sold_date_sk, cs_bill_customer_sk, cs_list_price, cs_wholesale_cost FROM catalog_sales
+           UNION ALL
+           SELECT 'web', ws_sold_date_sk, ws_bill_customer_sk, ws_list_price, ws_wholesale_cost FROM web_sales) sales
+    WHERE: (channel='store' AND ss_list_price BETWEEN 193 AND 252 AND ss_wholesale_cost BETWEEN 35 AND 55)
+           OR (channel='catalog' AND cs_list_price BETWEEN 193 AND 252 AND cs_wholesale_cost BETWEEN 35 AND 55)
+           OR (channel='web' AND ws_list_price BETWEEN 193 AND 252 AND ws_wholesale_cost BETWEEN 35 AND 55)
+    OUTPUT: channel, sold_date_sk, customer_sk, list_price, wholesale_cost
+    EXPECTED_ROWS: sum of all three fact table filtered rows
+    CONSUMERS: joined_sales
+  joined_sales:
+    FROM: all_sales s JOIN date_dim d ON s.sold_date_sk = d.d_date_sk
+          JOIN customer c ON s.customer_sk = c.c_customer_sk
+    WHERE: d_month_seq BETWEEN 1200 AND 1200 + 11 AND c_birth_month IN (1, 2, 5, 12)
+    OUTPUT: c_last_name, c_first_name, d_date, channel
+    EXPECTED_ROWS: ~hundreds per channel
+    CONSUMERS: grouped_sales
+  grouped_sales:
+    FROM: joined_sales
+    GROUP BY: c_last_name, c_first_name, d_date
+    AGGREGATE: COUNT(DISTINCT channel) as channel_count
+    OUTPUT: c_last_name, c_first_name, d_date, channel_count
+    EXPECTED_ROWS: distinct triples across all channels
+    CONSUMERS: filter_count_3
+  filter_count_3:
+    FROM: grouped_sales
+    WHERE: channel_count = 3
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: triples present in all three channels
+    CONSUMERS: final COUNT
+EXAMPLES: single_pass_aggregation, union_cte_split, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply consolidation of multiple fact table scans into a single UNION ALL with channel discriminator. Ignore any CASE-based aggregation (we use COUNT DISTINCT).
+- union_cte_split: Apply UNION ALL to combine channels. Ignore splitting into separate CTEs (we consolidate).
+- channel_bitmap_aggregation: Apply channel counting via aggregation. Ignore bitmap operations (not needed).
+HAZARD_FLAGS:
+- UNION ALL may prevent partition pruning if tables are partitioned.
+- COUNT(DISTINCT channel) may be less efficient than INTERSECT for highly selective results.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: exists_restructuring
+TARGET_LOGICAL_TREE:
+  store_sales_base CTE -> EXISTS with catalog_sales -> EXISTS with web_sales -> COUNT
+NODE_CONTRACTS:
+  store_sales_base:
+    FROM: store_sales ss JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk
+          JOIN customer c ON ss.ss_customer_sk = c.c_customer_sk
+    WHERE: d_month_seq BETWEEN 1200 AND 1200 + 11
+           AND c_birth_month IN (1, 2, 5, 12)
+           AND ss_list_price BETWEEN 193 AND 252
+           AND ss_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: ~hundreds
+    CONSUMERS: EXISTS checks
+  catalog_sales_exists:
+    FROM: catalog_sales cs JOIN date_dim d ON cs.cs_sold_date_sk = d.d_date_sk
+          JOIN customer c ON cs.cs_bill_customer_sk = c.c_customer_sk
+    WHERE: d_month_seq BETWEEN 1200 AND 1200 + 11
+           AND c_birth_month IN (1, 2, 5, 12)
+           AND cs_list_price BETWEEN 193 AND 252
+           AND cs_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: ~hundreds
+    CONSUMERS: EXISTS subquery
+  web_sales_exists:
+    FROM: web_sales ws JOIN date_dim d ON ws.ws_sold_date_sk = d.d_date_sk
+          JOIN customer c ON ws.ws_bill_customer_sk = c.c_customer_sk
+    WHERE: d_month_seq BETWEEN 1200 AND 1200 + 11
+           AND c_birth_month IN (1, 2, 5, 12)
+           AND ws_list_price BETWEEN 193 AND 252
+           AND ws_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: ~hundreds
+    CONSUMERS: EXISTS subquery
+EXAMPLES: intersect_to_exists, multi_intersect_exists_cte, decorrelate
+EXAMPLE_ADAPTATION:
+- intersect_to_exists: Convert INTERSECT to EXISTS semi-joins. Ignore any NOT EXISTS conversion (we need INTERSECT, not EXCEPT).
+- multi_intersect_exists_cte: Apply EXISTS with multiple subqueries. Ignore any CTE materialization of the base (we can use subqueries).
+- decorrelate: Not applicable (no correlation). Ignore this pattern.
+HAZARD_FLAGS:
+- EXISTS may re-execute dimension joins for each row if not properly optimized.
+- Must ensure DISTINCT semantics are preserved (base query already has DISTINCT).
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: minimal-change_explicit_joins
+TARGET_LOGICAL_TREE:
+  filtered_dates CTE -> filtered_customers CTE -> three explicit join subqueries -> INTERSECT -> COUNT
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1200 AND 1200 + 11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 183
+    CONSUMERS: three subqueries
+  filtered_customers:
+    FROM: customer
+    WHERE: c_birth_month IN (1, 2, 5, 12)
+    OUTPUT: c_customer_sk, c_last_name, c_first_name
+    EXPECTED_ROWS: ~25% of customer
+    CONSUMERS: three subqueries
+  store_subquery:
+    FROM: filtered_dates d JOIN store_sales ss ON ss.ss_sold_date_sk = d.d_date_sk
+          JOIN filtered_customers c ON ss.ss_customer_sk = c.c_customer_sk
+    WHERE: ss_list_price BETWEEN 193 AND 252 AND ss_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: ~hundreds
+    CONSUMERS: INTERSECT
+  catalog_subquery:
+    FROM: filtered_dates d JOIN catalog_sales cs ON cs.cs_sold_date_sk = d.d_date_sk
+          JOIN filtered_customers c ON cs.cs_bill_customer_sk = c.c_customer_sk
+    WHERE: cs_list_price BETWEEN 193 AND 252 AND cs_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: ~hundreds
+    CONSUMERS: INTERSECT
+  web_subquery:
+    FROM: filtered_dates d JOIN web_sales ws ON ws.ws_sold_date_sk = d.d_date_sk
+          JOIN filtered_customers c ON ws.ws_bill_customer_sk = c.c_customer_sk
+    WHERE: ws_list_price BETWEEN 193 AND 252 AND ws_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: ~hundreds
+    CONSUMERS: INTERSECT
+EXAMPLES: pg_date_cte_explicit_join, pg_dimension_prefetch_star, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_date_cte_explicit_join: Apply date_dim CTE isolation and explicit JOIN syntax. Ignore single-channel focus.
+- pg_dimension_prefetch_star: Apply pre-filtering of both dimensions. Ignore promotion dimension.
+- early_filter_decorrelate: Apply early filtering into CTEs. Ignore decorrelation (no correlated subqueries).
+HAZARD_FLAGS:
+- Minimal change may not yield significant improvement if optimizer already handles comma joins well.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (combining proven pg_date_cte_explicit_join and pg_dimension_prefetch_star patterns with minimal structural change)

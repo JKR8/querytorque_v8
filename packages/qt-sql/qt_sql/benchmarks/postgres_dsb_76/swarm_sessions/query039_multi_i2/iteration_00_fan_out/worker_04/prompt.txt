@@ -1,0 +1,580 @@
+You are a SQL rewrite engine for PostgreSQL v16.11-0ubuntu0.24.04.1). Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+## Semantic Contract (MUST preserve)
+
+This query analyzes inventory variability, comparing coefficient of variation between consecutive months (May vs June 2002) for Sports/Shoes items managed by specific managers. The business intent is to identify items with high inventory volatility. JOIN semantics are INNER throughout—all dimension tables must match the fact table, and the self-join requires matching warehouse and item. Aggregation trap: STDDEV_SAMP requires ≥2 values per group; NULL groups are filtered out by CASE mean WHEN 0 THEN NULL. Filter dependencies: The cov>1 filter in CTE must be applied BEFORE the self-join; the d_moy=5/6 filters in main query are independent per side.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+dim_ctes -> lateral_union_months -> main_join
+NODE_CONTRACTS:
+  dim_date:
+    FROM: date_dim
+    WHERE: d_year = 2002 AND d_moy IN (5, 6)
+    OUTPUT: d_date_sk, d_moy
+    EXPECTED_ROWS: ~60
+    CONSUMERS: lateral_union_months
+  dim_item:
+    FROM: item
+    WHERE: i_category IN ('Shoes', 'Sports') AND i_manager_id BETWEEN 42 AND 61
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: ~100s
+    CONSUMERS: lateral_union_months
+  dim_warehouse:
+    FROM: warehouse
+    OUTPUT: w_warehouse_sk, w_warehouse_name
+    EXPECTED_ROWS: ~100s
+    CONSUMERS: lateral_union_months
+  lateral_union_months:
+    FROM: dim_warehouse, dim_item, LATERAL (
+      SELECT d_moy, STDDEV_SAMP(inv_quantity_on_hand) AS stdev, AVG(inv_quantity_on_hand) AS mean
+      FROM inventory
+      JOIN dim_date ON inv_date_sk = d_date_sk
+      WHERE inv_warehouse_sk = w_warehouse_sk AND inv_item_sk = i_item_sk 
+        AND inv_quantity_on_hand BETWEEN 791 AND 991
+      GROUP BY d_moy
+      HAVING CASE AVG(inv_quantity_on_hand) WHEN 0 THEN 0 ELSE STDDEV_SAMP(inv_quantity_on_hand)/AVG(inv_quantity_on_hand) END > 1
+    ) AS month_stats
+    OUTPUT: w_warehouse_sk, i_item_sk, d_moy, mean, stdev/mean AS cov
+    EXPECTED_ROWS: ~100s
+    CONSUMERS: main_join
+  main_join:
+    FROM: lateral_union_months AS m5 INNER JOIN lateral_union_months AS m6 
+          ON m5.w_warehouse_sk = m6.w_warehouse_sk AND m5.i_item_sk = m6.i_item_sk
+    WHERE: m5.d_moy = 5 AND m6.d_moy = 6
+    ORDER BY: m5.w_warehouse_sk, m5.i_item_sk, m5.d_moy, m5.mean, m5.cov, m6.d_moy, m6.mean, m6.cov
+    OUTPUT: m5.w_warehouse_sk, m5.i_item_sk, m5.d_moy, m5.mean, m5.cov, m6.w_warehouse_sk, m6.i_item_sk, m6.d_moy, m6.mean, m6.cov
+    EXPECTED_ROWS: ~10s
+    CONSUMERS: final
+
+NODE_CONTRACTS:
+dim_date:
+    FROM: date_dim
+    WHERE: d_year = 2002 AND d_moy IN (5, 6)
+    OUTPUT: d_date_sk, d_moy
+    EXPECTED_ROWS: ~60
+    CONSUMERS: lateral_union_months
+  dim_item:
+    FROM: item
+    WHERE: i_category IN ('Shoes', 'Sports') AND i_manager_id BETWEEN 42 AND 61
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: ~100s
+    CONSUMERS: lateral_union_months
+  dim_warehouse:
+    FROM: warehouse
+    OUTPUT: w_warehouse_sk, w_warehouse_name
+    EXPECTED_ROWS: ~100s
+    CONSUMERS: lateral_union_months
+  lateral_union_months:
+    FROM: dim_warehouse, dim_item, LATERAL (
+      SELECT d_moy, STDDEV_SAMP(inv_quantity_on_hand) AS stdev, AVG(inv_quantity_on_hand) AS mean
+      FROM inventory
+      JOIN dim_date ON inv_date_sk = d_date_sk
+      WHERE inv_warehouse_sk = w_warehouse_sk AND inv_item_sk = i_item_sk 
+        AND inv_quantity_on_hand BETWEEN 791 AND 991
+      GROUP BY d_moy
+      HAVING CASE AVG(inv_quantity_on_hand) WHEN 0 THEN 0 ELSE STDDEV_SAMP(inv_quantity_on_hand)/AVG(inv_quantity_on_hand) END > 1
+    ) AS month_stats
+    OUTPUT: w_warehouse_sk, i_item_sk, d_moy, mean, stdev/mean AS cov
+    EXPECTED_ROWS: ~100s
+    CONSUMERS: main_join
+  main_join:
+    FROM: lateral_union_months AS m5 INNER JOIN lateral_union_months AS m6 
+          ON m5.w_warehouse_sk = m6.w_warehouse_sk AND m5.i_item_sk = m6.i_item_sk
+    WHERE: m5.d_moy = 5 AND m6.d_moy = 6
+    ORDER BY: m5.w_warehouse_sk, m5.i_item_sk, m5.d_moy, m5.mean, m5.cov, m6.d_moy, m6.mean, m6.cov
+    OUTPUT: m5.w_warehouse_sk, m5.i_item_sk, m5.d_moy, m5.mean, m5.cov, m6.w_warehouse_sk, m6.i_item_sk, m6.d_moy, m6.mean, m6.cov
+    EXPECTED_ROWS: ~10s
+    CONSUMERS: final
+
+## Hazard Flags (avoid these specific risks)
+
+- LATERAL may prevent parallel execution of inventory scan
+- Complex HAVING clause with aggregates in CASE expression
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination
+
+## Regression Warnings (observed failures on similar queries)
+
+1. CTE blocking parallelism (observed regression in Q045):
+   CAUSE: Materialized CTE prevents parallel table scan on inventory
+   RULE: Use LATERAL or subquery instead of CTE for fact table scan when parallel execution is needed
+2. UNION ALL over-splitting (observed 0.21x on Q085):
+   CAUSE: Splitting OR conditions into UNION ALL when PostgreSQL's bitmap scan handles it better
+   RULE: Do NOT convert OR to UNION ALL—this query has no OR conditions requiring split
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output 10 columns in exact order: inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov
+- CTE_COLUMN_COMPLETENESS: Any CTE must include w_warehouse_sk, i_item_sk, d_moy, mean, cov for downstream self-join and SELECT
+- LITERAL_PRESERVATION: Must preserve literal values: 2002, 'Shoes','Sports', 42, 61, 791, 991, 5, 1, 1.5 (second query)
+- SEMANTIC_EQUIVALENCE: Must return same rows—cov>1 filter in CTE and month filters in main query are critical
+- COMMA_JOIN_WEAKNESS: CTE uses comma-separated joins (inventory, item, warehouse, date_dim)
+- CROSS_CTE_PREDICATE_BLINDNESS: CTE contains all months, filtered late in main query (d_moy=5/6)
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- pg_dimension_prefetch_star: Apply dimension CTEs; ignore explicit JOIN syntax in main query
+- pg_materialized_dimension_fact_prefilter: Apply staged dimension reduction; ignore materialized fact CTE
+- early_filter_decorrelate: Apply early dimension filtering; ignore decorrelation
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. pg_dimension_prefetch_star (3.32x)
+
+**Principle:** Multi-Dimension Prefetch (PG): pre-filter all selective dimensions into CTEs to create tiny hash tables, combined with explicit JOIN syntax. PostgreSQL's optimizer gets better cardinality estimates from pre-materialized small dimension results.
+
+**BEFORE (slow):**
+```sql
+with ssr as
+ (select  s_store_id as store_id,
+          sum(ss_ext_sales_price) as sales,
+          sum(coalesce(sr_return_amt, 0)) as returns,
+          sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit
+  from store_sales left outer join store_returns on
+         (ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number),
+     date_dim,
+     store,
+     item,
+     promotion
+ where ss_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+       and ss_store_sk = s_store_sk
+       and ss_item_sk = i_item_sk
+       and i_current_price > 50
+       and ss_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and ss_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+ group by s_store_id)
+ ,
+ csr as
+ (select  cp_catalog_page_id as catalog_page_id,
+          sum(cs_ext_sales_price) as sales,
+          sum(coalesce(cr_return_amount, 0)) as returns,
+          sum(cs_net_profit - coalesce(cr_net_loss, 0)) as profit
+  from catalog_sales left outer join catalog_returns on
+         (cs_item_sk = cr_item_sk and cs_order_number = cr_order_number),
+     date_dim,
+     catalog_page,
+     item,
+     promotion
+ where cs_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+        and cs_catalog_page_sk = cp_catalog_page_sk
+       and cs_item_sk = i_item_sk
+       and i_current_price > 50
+       and cs_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and cs_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+group by cp_catalog_page_id)
+ ,
+ wsr as
+ (select  web_site_id,
+          sum(ws_ext_sales_price) as sales,
+          sum(coalesce(wr_return_amt, 0)) as returns,
+          sum(ws_net_profit - coalesce(wr_net_loss, 0)) as profit
+  from web_sales left outer join web_returns on
+         (ws_item_sk = wr_item_sk and ws_order_number = wr_order_number),
+     date_dim,
+     web_site,
+     item,
+     promotion
+ where ws_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+        and ws_web_site_sk = web_site_sk
+       and ws_item_sk = i_item_sk
+       and i_current_price > 50
+       and ws_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and ws_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+group by web_site_id)
+  select  channel
+        , id
+        , sum(sales) as sales
+        , sum(returns) as returns
+        , sum(profit) as profit
+ from
+ (select 'store channel' as channel
+        , 'store' || store_id as id
+        , sales
+        , returns
+        , profit
+ from   ssr
+ union all
+ select 'catalog channel' as channel
+        , 'catalog_page' || catalog_page_id as id
+        , sales
+        , returns
+        , profit
+ from  csr
+ union all
+ select 'web channel' as channel
+        , 'web_site' || web_site_id as id
+        , sales
+        , returns
+        , profit
+ from   wsr
+ ) x
+ group by rollup (channel, id)
+ order by channel
+         ,id
+ limit 100;
+```
+
+**AFTER (fast):**
+[filtered_date]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-23' AS DATE) AND CAST('1998-08-23' AS DATE) + INTERVAL '30 DAY'
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk FROM item WHERE i_current_price > 50 AND i_category IN ('Jewelry', 'Music')
+```
+[filtered_promotion]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'Y' AND p_channel_tv = 'Y' AND p_channel_radio = 'N' AND p_channel_press = 'N' AND p_channel_event = 'Y'
+```
+[ssr]:
+```sql
+SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS returns, SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit FROM store_sales LEFT OUTER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) INNER JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk INNER JOIN store ON ss_store_sk = s_store_sk INNER JOIN filtered_item ON ss_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ss_promo_sk = filtered_promotion.p_promo_sk WHERE ss_wholesale_cost BETWEEN 63 AND 78 GROUP BY s_store_id
+```
+[csr]:
+```sql
+SELECT cp_catalog_page_id AS catalog_page_id, SUM(cs_ext_sales_price) AS sales, SUM(COALESCE(cr_return_amount, 0)) AS returns, SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit FROM catalog_sales LEFT OUTER JOIN catalog_returns ON (cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number) INNER JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk INNER JOIN catalog_page ON cs_catalog_page_sk = cp_catalog_page_sk INNER JOIN filtered_item ON cs_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON cs_promo_sk = filtered_promotion.p_promo_sk WHERE cs_wholesale_cost BETWEEN 63 AND 78 GROUP BY cp_catalog_page_id
+```
+[wsr]:
+```sql
+SELECT web_site_id, SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS returns, SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit FROM web_sales LEFT OUTER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number) INNER JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk INNER JOIN web_site ON ws_web_site_sk = web_site_sk INNER JOIN filtered_item ON ws_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ws_promo_sk = filtered_promotion.p_promo_sk WHERE ws_wholesale_cost BETWEEN 63 AND 78 GROUP BY web_site_id
+```
+[main_query]:
+```sql
+SELECT channel, id, SUM(sales) AS sales, SUM(returns) AS returns, SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, returns, profit FROM ssr UNION ALL SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, returns, profit FROM csr UNION ALL SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, returns, profit FROM wsr) AS x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100
+```
+
+### 2. pg_materialized_dimension_fact_prefilter (2.68x)
+
+**Principle:** Staged Reduction for Non-Equi Joins: when queries have expensive non-equi joins, reduce BOTH dimension and fact table sizes via MATERIALIZED CTEs before the join. Combined selectivity dramatically cuts the search space for inequality predicates.
+
+**BEFORE (slow):**
+```sql
+select  i_item_desc
+      ,w_warehouse_name
+      ,d1.d_week_seq
+      ,sum(case when p_promo_sk is null then 1 else 0 end) no_promo
+      ,sum(case when p_promo_sk is not null then 1 else 0 end) promo
+      ,count(*) total_cnt
+from catalog_sales
+join inventory on (cs_item_sk = inv_item_sk)
+join warehouse on (w_warehouse_sk=inv_warehouse_sk)
+join item on (i_item_sk = cs_item_sk)
+join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk)
+join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk)
+join date_dim d1 on (cs_sold_date_sk = d1.d_date_sk)
+join date_dim d2 on (inv_date_sk = d2.d_date_sk)
+join date_dim d3 on (cs_ship_date_sk = d3.d_date_sk)
+left outer join promotion on (cs_promo_sk=p_promo_sk)
+left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number)
+where d1.d_week_seq = d2.d_week_seq
+  and inv_quantity_on_hand < cs_quantity
+  and d3.d_date > d1.d_date + interval '3 day'
+  and hd_buy_potential = '501-1000'
+  and d1.d_year = 1998
+  and cd_marital_status = 'M'
+  and cd_dep_count between 9 and 11
+  and i_category IN ('Home', 'Men', 'Music')
+  and cs_wholesale_cost BETWEEN 34 AND 54
+group by i_item_desc,w_warehouse_name,d1.d_week_seq
+order by total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq
+limit 100;
+```
+
+**AFTER (fast):**
+[filtered_date]:
+```sql
+SELECT d_date_sk, d_date, d_week_seq FROM date_dim WHERE d_year = 1998
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk, i_item_desc FROM item WHERE i_category IN ('Home', 'Men', 'Music')
+```
+[filtered_cd]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_marital_status = 'M' AND cd_dep_count BETWEEN 9 AND 11
+```
+[filtered_hd]:
+```sql
+SELECT hd_demo_sk FROM household_demographics WHERE hd_buy_potential = '501-1000'
+```
+[cs_filtered]:
+```sql
+SELECT cs_item_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk, cs_quantity, cs_wholesale_cost, cs_order_number FROM catalog_sales WHERE cs_wholesale_cost BETWEEN 34 AND 54
+```
+[main_query]:
+```sql
+SELECT i.i_item_desc, w.w_warehouse_name, d1.d_week_seq, SUM(CASE WHEN p.p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN p.p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt FROM cs_filtered cs JOIN inventory inv ON cs.cs_item_sk = inv.inv_item_sk JOIN warehouse w ON w.w_warehouse_sk = inv.inv_warehouse_sk JOIN filtered_item i ON i.i_item_sk = cs.cs_item_sk JOIN filtered_cd cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk JOIN filtered_hd hd ON cs.cs_bill_hdemo_sk = hd.hd_demo_sk JOIN filtered_date d1 ON cs.cs_sold_date_sk = d1.d_date_sk JOIN date_dim d2 ON inv.inv_date_sk = d2.d_date_sk JOIN date_dim d3 ON cs.cs_ship_date_sk = d3.d_date_sk LEFT OUTER JOIN promotion p ON cs.cs_promo_sk = p.p_promo_sk LEFT OUTER JOIN catalog_returns cr ON cr.cr_item_sk = cs.cs_item_sk AND cr.cr_order_number = cs.cs_order_number WHERE d1.d_week_seq = d2.d_week_seq AND inv.inv_quantity_on_hand < cs.cs_quantity AND d3.d_date > d1.d_date + INTERVAL '3 day' GROUP BY i.i_item_desc, w.w_warehouse_name, d1.d_week_seq ORDER BY total_cnt DESC, i.i_item_desc, w.w_warehouse_name, d1.d_week_seq LIMIT 100
+```
+
+### 3. early_filter_decorrelate (1.13x)
+
+**Principle:** Early Selection + Decorrelation: push dimension filters into CTE definitions before materialization, and decorrelate correlated subqueries by pre-computing thresholds in separate CTEs. Filters reduce rows early; decorrelation replaces per-row subquery execution with a single pre-computed JOIN.
+
+**BEFORE (slow):**
+```sql
+WITH customer_total_return AS (
+  SELECT sr_customer_sk AS ctr_customer_sk,
+         sr_store_sk AS ctr_store_sk,
+         sr_reason_sk AS ctr_reason_sk,
+         SUM(SR_REFUNDED_CASH) AS ctr_total_return
+  FROM store_returns, date_dim
+  WHERE sr_returned_date_sk = d_date_sk
+    AND d_year = 2001
+    AND sr_return_amt / sr_return_quantity BETWEEN 236 AND 295
+  GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk
+)
+SELECT c_customer_id
+FROM customer_total_return ctr1, store, customer, customer_demographics
+WHERE ctr1.ctr_total_return > (
+    SELECT AVG(ctr_total_return) * 1.2
+    FROM customer_total_return ctr2
+    WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk
+  )
+  AND ctr1.ctr_reason_sk BETWEEN 28 AND 31
+  AND s_store_sk = ctr1.ctr_store_sk
+  AND s_state IN ('MI', 'NC', 'WI')
+  AND ctr1.ctr_customer_sk = c_customer_sk
+  AND c_current_cdemo_sk = cd_demo_sk
+  AND cd_marital_status IN ('W', 'W')
+  AND cd_education_status IN ('4 yr Degree', 'College')
+  AND cd_gender = 'M'
+  AND c_birth_month = 5
+  AND c_birth_year BETWEEN 1950 AND 1956
+ORDER BY c_customer_id
+LIMIT 100
+```
+
+**AFTER (fast):**
+```sql
+WITH customer_total_return AS (
+    SELECT sr_customer_sk AS ctr_customer_sk,
+           sr_store_sk AS ctr_store_sk,
+           sr_reason_sk AS ctr_reason_sk,
+           SUM(SR_REFUNDED_CASH) AS ctr_total_return
+    FROM store_returns
+    JOIN date_dim ON sr_returned_date_sk = d_date_sk
+    JOIN store ON sr_store_sk = s_store_sk
+    WHERE d_year = 2001
+      AND s_state IN ('MI', 'NC', 'WI')
+      AND sr_return_amt / sr_return_quantity BETWEEN 236 AND 295
+    GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk
+),
+store_thresholds AS (
+    SELECT ctr_store_sk,
+           AVG(ctr_total_return) * 1.2 AS avg_limit
+    FROM customer_total_return
+    GROUP BY ctr_store_sk
+)
+SELECT c_customer_id
+FROM customer_total_return ctr1
+JOIN store_thresholds st ON ctr1.ctr_store_sk = st.ctr_store_sk
+JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk
+JOIN store s ON ctr1.ctr_store_sk = s.s_store_sk
+WHERE ctr1.ctr_total_return > st.avg_limit
+  AND ctr1.ctr_reason_sk BETWEEN 28 AND 31
+  AND s.s_state IN ('MI', 'NC', 'WI')
+  AND cd_marital_status = 'W'
+  AND cd_education_status IN ('4 yr Degree', 'College')
+  AND cd_gender = 'M'
+  AND c_birth_month = 5
+  AND c_birth_year BETWEEN 1950 AND 1956
+ORDER BY c_customer_id
+LIMIT 100
+```
+
+## Original SQL
+
+```sql
+with inv as
+(select w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy
+       ,stdev,mean, case mean when 0 then null else stdev/mean end cov
+ from(select w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy
+            ,stddev_samp(inv_quantity_on_hand) stdev,avg(inv_quantity_on_hand) mean
+      from inventory
+          ,item
+          ,warehouse
+          ,date_dim
+      where inv_item_sk = i_item_sk
+        and inv_warehouse_sk = w_warehouse_sk
+        and inv_date_sk = d_date_sk
+        and d_year =2002
+        and i_category IN ('Shoes', 'Sports')
+        and i_manager_id BETWEEN 42 and 61
+        and inv_quantity_on_hand between 791 and 991
+      group by w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy) foo
+ where case mean when 0 then 0 else stdev/mean end > 1)
+select inv1.w_warehouse_sk,inv1.i_item_sk,inv1.d_moy,inv1.mean, inv1.cov
+        ,inv2.w_warehouse_sk,inv2.i_item_sk,inv2.d_moy,inv2.mean, inv2.cov
+from inv inv1,inv inv2
+where inv1.i_item_sk = inv2.i_item_sk
+  and inv1.w_warehouse_sk =  inv2.w_warehouse_sk
+  and inv1.d_moy=5
+  and inv2.d_moy=5+1
+order by inv1.w_warehouse_sk,inv1.i_item_sk,inv1.d_moy,inv1.mean,inv1.cov
+        ,inv2.d_moy,inv2.mean, inv2.cov
+;
+with inv as
+(select w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy
+       ,stdev,mean, case mean when 0 then null else stdev/mean end cov
+ from(select w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy
+            ,stddev_samp(inv_quantity_on_hand) stdev,avg(inv_quantity_on_hand) mean
+      from inventory
+          ,item
+          ,warehouse
+          ,date_dim
+      where inv_item_sk = i_item_sk
+        and inv_warehouse_sk = w_warehouse_sk
+        and inv_date_sk = d_date_sk
+        and d_year =2002
+        and i_category IN ('Shoes', 'Sports')
+        and i_manager_id BETWEEN 42 and 61
+        and inv_quantity_on_hand between 791 and 991
+      group by w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy) foo
+ where case mean when 0 then 0 else stdev/mean end > 1)
+select inv1.w_warehouse_sk,inv1.i_item_sk,inv1.d_moy,inv1.mean, inv1.cov
+        ,inv2.w_warehouse_sk,inv2.i_item_sk,inv2.d_moy,inv2.mean, inv2.cov
+from inv inv1,inv inv2
+where inv1.i_item_sk = inv2.i_item_sk
+  and inv1.w_warehouse_sk =  inv2.w_warehouse_sk
+  and inv1.d_moy=5
+  and inv2.d_moy=5+1
+  and inv1.cov > 1.5
+order by inv1.w_warehouse_sk,inv1.i_item_sk,inv1.d_moy,inv1.mean,inv1.cov
+        ,inv2.d_moy,inv2.mean, inv2.cov
+;
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] inv  [=]  Cost: 50%  Rows: ~1K
+│   ├── SCAN (inventory, item, warehouse, date_dim)
+│   ├── FILTER (CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean, cov)
+└── [MAIN] main_query  [=]  Cost: 50%  Rows: ~1K
+    ├── SCAN (inv AS inv1 (join), inv AS inv2 (join))
+    ├── JOIN (inv1.i_item_sk = inv2.i_item_sk)
+    ├── JOIN (inv1.w_warehouse_sk = inv2.w_warehouse_sk)
+    ├── FILTER (inv1.d_moy = 5)
+    ├── FILTER (inv2.d_moy = 5 + 1)
+    ├── AGG (GROUP BY)
+    ├── SORT (inv1.w_warehouse_sk ASC, inv1.i_item_sk ASC, inv1.d_moy ASC, inv1.mean ASC, inv1.cov ASC, inv2.d_moy ASC, inv2.mean ASC, inv2.cov ASC)
+    └── OUTPUT (w_warehouse_sk, i_item_sk, d_moy, mean, cov, w_warehouse_sk, i_item_sk, d_moy, ...)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit or use empty array if not needed
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

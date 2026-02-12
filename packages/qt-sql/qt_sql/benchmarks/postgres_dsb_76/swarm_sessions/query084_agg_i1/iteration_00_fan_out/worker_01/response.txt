@@ -1,0 +1,99 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]
+    ├── WITH CTEs: filtered_customer_address, filtered_income_band, filtered_household_demographics, filtered_customer_demographics, customer_join, store_returns_join
+    ├── FILTERED_CUSTOMER_ADDRESS: [~] Added CTE with ca_city filter
+    │   └── FILTER (ca_city = 'Jackson')
+    ├── FILTERED_INCOME_BAND: [~] Added CTE with ib_lower_bound/ib_upper_bound filters
+    │   ├── FILTER (ib_lower_bound >= 23567)
+    │   └── FILTER (ib_upper_bound <= 73567)
+    ├── FILTERED_HOUSEHOLD_DEMOGRAPHICS: [+] New CTE joining household_demographics with filtered_income_band
+    │   ├── JOIN (hd_income_band_sk = ib_income_band_sk)
+    │   └── OUTPUT (hd_demo_sk, hd_income_band_sk, all columns)
+    ├── FILTERED_CUSTOMER_DEMOGRAPHICS: [+] New CTE (full table scan)
+    │   └── OUTPUT (cd_demo_sk, all columns)
+    ├── CUSTOMER_JOIN: [~] Modified to use CTEs with explicit JOIN syntax
+    │   ├── JOIN (c_current_addr_sk = filtered_customer_address.ca_address_sk)
+    │   ├── JOIN (c_current_hdemo_sk = filtered_household_demographics.hd_demo_sk)
+    │   ├── JOIN (c_current_cdemo_sk = filtered_customer_demographics.cd_demo_sk)
+    │   └── OUTPUT (c_customer_id, c_first_name, c_last_name, c_current_cdemo_sk, all columns)
+    ├── STORE_RETURNS_JOIN: [~] Modified to use customer_join CTE
+    │   ├── JOIN (sr_cdemo_sk = customer_join.c_current_cdemo_sk)
+    │   └── OUTPUT (c_customer_id, customername)
+    ├── SORT (customer_id ASC)
+    └── OUTPUT (customer_id, customername)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL v16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefiltering", "description": "Extracted selective dimension filters (customer_address.city, income_band range) into separate CTEs", "applied_to": ["filtered_customer_address", "filtered_income_band", "filtered_household_demographics"]},
+    {"id": "R2", "type": "explicit_join_conversion", "description": "Converted comma-separated joins to explicit INNER JOIN syntax with pre-filtered CTEs", "applied_to": ["customer_join", "store_returns_join"]},
+    {"id": "R3", "type": "cte_structural_decomposition", "description": "Created CTEs for each logical node in target tree to isolate dimension filtering", "applied_to": ["filtered_customer_demographics", "customer_join", "store_returns_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_customer_address": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT * FROM customer_address WHERE ca_city = 'Jackson'",
+        "interfaces": {"outputs": ["ca_address_sk", "*"], "consumes": []}
+      },
+      "filtered_income_band": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT * FROM income_band WHERE ib_lower_bound >= 23567 AND ib_upper_bound <= 73567",
+        "interfaces": {"outputs": ["ib_income_band_sk", "*"], "consumes": []}
+      },
+      "filtered_household_demographics": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT hd.* FROM household_demographics hd INNER JOIN filtered_income_band fib ON hd.hd_income_band_sk = fib.ib_income_band_sk",
+        "interfaces": {"outputs": ["hd_demo_sk", "hd_income_band_sk", "*"], "consumes": ["filtered_income_band"]}
+      },
+      "filtered_customer_demographics": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT * FROM customer_demographics",
+        "interfaces": {"outputs": ["cd_demo_sk", "*"], "consumes": []}
+      },
+      "customer_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c.* FROM customer c INNER JOIN filtered_customer_address fca ON c.c_current_addr_sk = fca.ca_address_sk INNER JOIN filtered_household_demographics fhd ON c.c_current_hdemo_sk = fhd.hd_demo_sk INNER JOIN filtered_customer_demographics fcd ON c.c_current_cdemo_sk = fcd.cd_demo_sk",
+        "interfaces": {"outputs": ["c_customer_id", "c_first_name", "c_last_name", "c_current_cdemo_sk", "*"], "consumes": ["filtered_customer_address", "filtered_household_demographics", "filtered_customer_demographics"]}
+      },
+      "store_returns_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cj.c_customer_id, COALESCE(cj.c_last_name, '') || ', ' || COALESCE(cj.c_first_name, '') AS customername FROM customer_join cj INNER JOIN store_returns sr ON sr.sr_cdemo_sk = cj.c_current_cdemo_sk",
+        "interfaces": {"outputs": ["c_customer_id", "customername"], "consumes": ["customer_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id AS customer_id, customername FROM store_returns_join ORDER BY c_customer_id LIMIT 100",
+        "interfaces": {"outputs": ["customer_id", "customername"], "consumes": ["store_returns_join"]}
+      }
+    },
+    "reconstruction_order": ["filtered_customer_address", "filtered_income_band", "filtered_household_demographics", "filtered_customer_demographics", "customer_join", "store_returns_join", "main_query"],
+    "assembly_template": "WITH filtered_customer_address AS ({filtered_customer_address}), filtered_income_band AS ({filtered_income_band}), filtered_household_demographics AS ({filtered_household_demographics}), filtered_customer_demographics AS ({filtered_customer_demographics}), customer_join AS ({customer_join}), store_returns_join AS ({store_returns_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured original comma-joins into explicit CTE-based joins with pre-filtered dimension tables (customer_address, income_band). This creates tiny hash tables for selective filters before joining to large fact tables, improving PostgreSQL's cardinality estimation and join ordering.
+
+**Expected speedup**: 2-3x from better join planning and reduced intermediate result sizes. The main gains come from: 1) Early filtering of 33 Jackson addresses vs scanning 6M customer_address rows, 2) Pre-joining income_band (4 rows) with household_demographics to create a small filtered set before customer joins.

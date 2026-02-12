@@ -1,0 +1,351 @@
+<reasoning>
+1. **CLASSIFY**: This query is a **channel-comparison self-join** archetype. Two CTEs (store and web) aggregate sales by county, quarter, and year. The main query performs a 6-way self-join (three instances of each CTE) to align Q1, Q2, Q3 rows for the same county in 2000, then computes quarter-over-quarter growth ratios and filters counties where web growth exceeds store growth in both transitions.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - **Total execution time**: 939ms.
+   - **Store_sales CTE (ss)**: 231ms scan (25%) + 33.5ms join + 33.4ms join + 233.8ms aggregation = ~532ms total (majority). Output 5,541 rows.
+   - **Web_sales CTE (ws)**: 242ms scan (26%) + 10ms join + 20.8ms join + 77.8ms aggregation = ~351ms total. Output 5,535 rows.
+   - **Main query**: Only 2.3ms for joins + 0.6ms order by = ~3ms.
+   - **Row count drops**: 
+     - store_sales scan: 3.0M rows (from 345.6M) after date filter (1,827 date rows) and customer_address join (250K rows).
+     - web_sales scan: 812K rows (from 86.4M) after same date filter and customer_address join.
+     - Aggregation reduces to ~5.5K rows per CTE.
+     - Main query self-join reduces to 307 rows.
+   - **Optimizer behavior**: 
+     - The optimizer already pushes date predicates into the CTE scans (date_dim filtered to 1,827 rows via d_date_sk range).
+     - The CTEs are materialized (since referenced 3x each) and then filtered for specific quarters in the main query (FILTER nodes on d_qoy and d_year).
+     - The self-joins are implemented as hash joins on ca_county.
+   - **Scans per base table**:
+     - store_sales: scanned once (3.0M rows).
+     - web_sales: scanned once (812K rows).
+     - date_dim: scanned twice (once per CTE) but each scan is filtered to 1,827 rows.
+     - customer_address: scanned twice (once per CTE) with 250K rows each.
+   - **CTE materialization**: Each CTE is materialized once and probed three times (good).
+
+3. **GAP MATCHING**:
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: The optimizer pushes date filters into the CTE scans, but the CTEs still compute aggregates for all quarters in 2000 (since no WHERE clause on d_qoy). The main query then filters each CTE scan for a specific quarter (Q1, Q2, Q3). This is a missed opportunity: we could push the quarter filter into the CTE definition, but that would break the multiple references (each reference needs a different quarter). This matches the **union_cte_split** gap: generic CTE scanned multiple times with different filters (by quarter). The optimizer does not split the CTE internally.
+   - **REDUNDANT_SCAN_ELIMINATION**: The fact tables are scanned only once per channel, which is optimal. However, the date_dim and customer_address tables are scanned twice (once per channel). This is a candidate for **shared_dimension_multi_channel** if we can share the filtered dimension lookups across store and web channels.
+   - **SINGLE_PASS_AGGREGATION**: The query has two separate CTEs scanning different fact tables (store_sales and web_sales). They cannot be merged into a single scan because they are different tables. However, within each channel, the CTE is aggregated by (ca_county, d_qoy, d_year) and then self-joined three times. This could be transformed into a **pivot** where each county has one row with three quarter columns, eliminating the self-joins. This is a form of **scan_consolidation_pivot**.
+   - **CROSS_COLUMN_OR_DECOMPOSITION**: Not applicable (no OR conditions).
+   - **CORRELATED_SUBQUERY_PARALYSIS**: Not applicable (no correlated subqueries).
+
+4. **AGGREGATION TRAP CHECK**:
+   - Aggregates are SUM(ss_ext_sales_price) and SUM(ws_ext_sales_price). These are duplicate-insensitive (SUM of a column). The joins before aggregation are on date and address keys; there is no duplication because the joins are many-to-one (fact to dimension). The grouping is by county, quarter, year. Any restructuring that preserves the same groups (same county, quarter, year) and does not introduce duplicates is safe. Pivoting using MAX(CASE WHEN d_qoy=1 THEN store_sales END) is safe because the GROUP BY already guarantees one row per (county, quarter, year) — the MAX is just a row selector.
+
+5. **TRANSFORM SELECTION** (ranked by potential):
+   a. **union_cte_split** (high potential): Split the generic ss and ws CTEs into three specialized CTEs each (ss_q1, ss_q2, ss_q3; ws_q1, ws_q2, ws_q3) that filter by d_qoy and d_year=2000. The main query then becomes a simple 6-way join on ca_county (no quarter filters). This eliminates the repeated filtering of the same materialized CTE and reduces the size of each specialized CTE to ~1,847 rows (vs 5,541). Historical: 1.36x on Q74 (but caution: must remove original CTEs).
+   b. **shared_dimension_multi_channel** (medium potential): Extract the filtered date_dim (d_year=2000, d_qoy IN (1,2,3)) and customer_address (all) into shared CTEs. Then join these once with store_sales and web_sales respectively. This reduces the date_dim and customer_address scans from 2 each to 1 each. Historical: 1.30x on Q80.
+   c. **scan_consolidation_pivot** (high potential): Replace the self-joins with a pivot within each channel. Create two CTEs: store_agg that returns one row per county with columns store_sales_q1, store_sales_q2, store_sales_q3; similarly web_agg. Then join them on county and compute ratios. This eliminates the 6-way self-join and reduces the main query complexity. This is a novel combination of single_pass_aggregation (but across quarters, not across channels) and self_join_elimination.
+   d. **exploration: compound strategy** (high potential): Combine union_cte_split and shared_dimension_multi_channel. Create shared filtered date and address CTEs, then build six specialized CTEs (store_q1, store_q2, store_q3, web_q1, web_q2, web_q3) that join these dimensions with the fact tables and aggregate. Then join the six on county. This attacks both the dimension scan redundancy and the CTE filtering redundancy.
+
+6. **LOGICAL TREE DESIGN**:
+   - For union_cte_split: Six specialized CTEs -> main join.
+   - For shared_dimension_multi_channel: Two dimension CTEs -> two channel CTEs (store and web) -> main self-join (as original).
+   - For scan_consolidation_pivot: Two pivoted CTEs (store_pivot, web_pivot) -> main join.
+   - For compound: Two dimension CTEs -> six specialized CTEs -> main join.
+
+   Need to ensure column completeness: Each CTE must output ca_county, and for pivoted versions, the quarter sales columns.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compare county-level quarter-over-quarter growth in 2000 web sales versus store sales, returning counties where web growth beats store growth from Q1->Q2 and again from Q2->Q3. All joins are INNER (intersection) requiring matching county and quarter/year. Aggregates are SUMs, safe for restructuring. Filter dependencies: quarter and year filters (d_qoy, d_year) must be preserved; growth ratio filters must compare web to store and must handle division by zero via NULL.
+
+BOTTLENECK_DIAGNOSIS:
+The query is scan-bound and aggregation-bound: scanning store_sales (231ms, 25%) and web_sales (242ms, 26%) dominates, followed by aggregating these scans (234ms and 78ms). The main query's self-joins are cheap (3ms). Cardinality flow: store_sales scan → 3.0M rows → join with date (1,827 rows) and address (250K) → aggregate → 5,541 rows; web similar → 5,535 rows; main query reduces to 307 rows. The optimizer already pushes date predicates into the CTE scans and materializes CTEs for multiple probes. Logical-tree cost percentages (33% each) are misleading — actual time is ~56% for store CTE, ~37% for web CTE, ~0.3% for main query.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output exactly the six columns in the original SELECT, ordered by web_q1_q2_increase.
+- CTE_COLUMN_COMPLETENESS: Any new CTE must include all columns referenced downstream: ca_county, d_year, d_qoy, store_sales/web_sales.
+- LITERAL_PRESERVATION: Must preserve literal values: d_year=2000, d_qoy values 1,2,3, and NULL handling in CASE.
+- SEMANTIC_EQUIVALENCE: Must return same 307 rows with same ordering.
+- ENGINE_GAP: CROSS_CTE_PREDICATE_BLINDNESS — CTEs are scanned multiple times with different quarter filters; predicates not pushed into CTE definition.
+- ENGINE_GAP: REDUNDANT_SCAN_ELIMINATION — date_dim and customer_address scanned twice (once per channel).
+- ENGINE_GAP: UNION_CTE_SELF_JOIN_DECOMPOSITION — generic CTE self-joined three times with different quarter filters.
+
+REGRESSION_WARNINGS:
+1. regression_q31_pushdown (0.49x):
+   CAUSE: Created filtered CTEs (store_sales_agg, web_sales_agg) but kept original (ss, ws) versions, causing redundant materialization and cardinality misestimates on self-joins.
+   RULE: When splitting a CTE by quarter, REMOVE the original unfiltered CTEs entirely.
+2. regression_q74_pushdown (0.68x):
+   CAUSE: Kept both original UNION CTE and specialized year-specific CTEs, causing redundant computation.
+   RULE: When splitting a CTE by discriminator (year/quarter), replace the original CTE — do not keep both.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: union_cte_split
+TARGET_LOGICAL_TREE:
+  date_filter -> store_q1 -> store_q2 -> store_q3 -> web_q1 -> web_q2 -> web_q3 -> main_join
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_qoy IN (1, 2, 3)
+    OUTPUT: d_date_sk, d_qoy, d_year
+    EXPECTED_ROWS: 1,827
+    CONSUMERS: store_q1, store_q2, store_q3, web_q1, web_q2, web_q3
+  store_q1:
+    FROM: store_sales, date_filter, customer_address
+    JOIN: ss_sold_date_sk = date_filter.d_date_sk AND ss_addr_sk = ca_address_sk
+    WHERE: date_filter.d_qoy = 1
+    GROUP BY: ca_county
+    AGGREGATE: SUM(ss_ext_sales_price) AS store_sales
+    OUTPUT: ca_county, store_sales
+    EXPECTED_ROWS: ~1,847
+    CONSUMERS: main_join
+  store_q2:
+    FROM: store_sales, date_filter, customer_address
+    JOIN: ss_sold_date_sk = date_filter.d_date_sk AND ss_addr_sk = ca_address_sk
+    WHERE: date_filter.d_qoy = 2
+    GROUP BY: ca_county
+    AGGREGATE: SUM(ss_ext_sales_price) AS store_sales
+    OUTPUT: ca_county, store_sales
+    EXPECTED_ROWS: ~1,847
+    CONSUMERS: main_join
+  store_q3:
+    FROM: store_sales, date_filter, customer_address
+    JOIN: ss_sold_date_sk = date_filter.d_date_sk AND ss_addr_sk = ca_address_sk
+    WHERE: date_filter.d_qoy = 3
+    GROUP BY: ca_county
+    AGGREGATE: SUM(ss_ext_sales_price) AS store_sales
+    OUTPUT: ca_county, store_sales
+    EXPECTED_ROWS: ~1,847
+    CONSUMERS: main_join
+  web_q1:
+    FROM: web_sales, date_filter, customer_address
+    JOIN: ws_sold_date_sk = date_filter.d_date_sk AND ws_bill_addr_sk = ca_address_sk
+    WHERE: date_filter.d_qoy = 1
+    GROUP BY: ca_county
+    AGGREGATE: SUM(ws_ext_sales_price) AS web_sales
+    OUTPUT: ca_county, web_sales
+    EXPECTED_ROWS: ~1,845
+    CONSUMERS: main_join
+  web_q2:
+    FROM: web_sales, date_filter, customer_address
+    JOIN: ws_sold_date_sk = date_filter.d_date_sk AND ws_bill_addr_sk = ca_address_sk
+    WHERE: date_filter.d_qoy = 2
+    GROUP BY: ca_county
+    AGGREGATE: SUM(ws_ext_sales_price) AS web_sales
+    OUTPUT: ca_county, web_sales
+    EXPECTED_ROWS: ~1,845
+    CONSUMERS: main_join
+  web_q3:
+    FROM: web_sales, date_filter, customer_address
+    JOIN: ws_sold_date_sk = date_filter.d_date_sk AND ws_bill_addr_sk = ca_address_sk
+    WHERE: date_filter.d_qoy = 3
+    GROUP BY: ca_county
+    AGGREGATE: SUM(ws_ext_sales_price) AS web_sales
+    OUTPUT: ca_county, web_sales
+    EXPECTED_ROWS: ~1,845
+    CONSUMERS: main_join
+  main_join:
+    FROM: store_q1, store_q2, store_q3, web_q1, web_q2, web_q3
+    JOIN: store_q1.ca_county = store_q2.ca_county = store_q3.ca_county = web_q1.ca_county = web_q2.ca_county = web_q3.ca_county
+    WHERE: (web_q2.web_sales / NULLIF(web_q1.web_sales, 0)) > (store_q2.store_sales / NULLIF(store_q1.store_sales, 0))
+      AND (web_q3.web_sales / NULLIF(web_q2.web_sales, 0)) > (store_q3.store_sales / NULLIF(store_q2.store_sales, 0))
+    OUTPUT: store_q1.ca_county, 2000 AS d_year, web_q2.web_sales / web_q1.web_sales AS web_q1_q2_increase, store_q2.store_sales / store_q1.store_sales AS store_q1_q2_increase, web_q3.web_sales / web_q2.web_sales AS web_q2_q3_increase, store_q3.store_sales / store_q2.store_sales AS store_q2_q3_increase
+    ORDER BY: web_q1_q2_increase
+    EXPECTED_ROWS: 307
+    CONSUMERS: final output
+EXAMPLES: union_cte_split, multi_date_range_cte
+EXAMPLE_ADAPTATION:
+- union_cte_split: Apply splitting of generic CTE (ss, ws) into quarter-specific CTEs. Ignore the year splitting aspect — we only have one year (2000).
+- multi_date_range_cte: Apply separate date filtering per quarter alias (d1, d2, d3) but we use a single date_filter CTE with a WHERE clause per quarter branch. Ignore the fact that we don't create separate date CTEs for each quarter — we filter inside each channel CTE.
+HAZARD_FLAGS:
+- Must remove original ss and ws CTEs completely to avoid regression.
+- Ensure each quarter-specific CTE includes the date_filter join to get d_qoy filter.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: shared_dimension_multi_channel
+TARGET_LOGICAL_TREE:
+  date_filter -> addr_all -> store_agg -> web_agg -> main_self_join
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_qoy IN (1, 2, 3)
+    OUTPUT: d_date_sk, d_qoy, d_year
+    EXPECTED_ROWS: 1,827
+    CONSUMERS: store_agg, web_agg
+  addr_all:
+    FROM: customer_address
+    OUTPUT: ca_address_sk, ca_county
+    EXPECTED_ROWS: 750K
+    CONSUMERS: store_agg, web_agg
+  store_agg:
+    FROM: store_sales, date_filter, addr_all
+    JOIN: ss_sold_date_sk = date_filter.d_date_sk AND ss_addr_sk = addr_all.ca_address_sk
+    GROUP BY: addr_all.ca_county, date_filter.d_qoy, date_filter.d_year
+    AGGREGATE: SUM(ss_ext_sales_price) AS store_sales
+    OUTPUT: ca_county, d_qoy, d_year, store_sales
+    EXPECTED_ROWS: 5,541
+    CONSUMERS: main_self_join (as ss1, ss2, ss3)
+  web_agg:
+    FROM: web_sales, date_filter, addr_all
+    JOIN: ws_sold_date_sk = date_filter.d_date_sk AND ws_bill_addr_sk = addr_all.ca_address_sk
+    GROUP BY: addr_all.ca_county, date_filter.d_qoy, date_filter.d_year
+    AGGREGATE: SUM(ws_ext_sales_price) AS web_sales
+    OUTPUT: ca_county, d_qoy, d_year, web_sales
+    EXPECTED_ROWS: 5,535
+    CONSUMERS: main_self_join (as ws1, ws2, ws3)
+  main_self_join:
+    FROM: store_agg AS ss1, store_agg AS ss2, store_agg AS ss3, web_agg AS ws1, web_agg AS ws2, web_agg AS ws3
+    JOIN: ss1.ca_county = ss2.ca_county AND ss2.ca_county = ss3.ca_county AND ss1.ca_county = ws1.ca_county AND ws1.ca_county = ws2.ca_county AND ws1.ca_county = ws3.ca_county
+    WHERE: ss1.d_qoy = 1 AND ss1.d_year = 2000 AND ss2.d_qoy = 2 AND ss2.d_year = 2000 AND ss3.d_qoy = 3 AND ss3.d_year = 2000
+      AND ws1.d_qoy = 1 AND ws1.d_year = 2000 AND ws2.d_qoy = 2 AND ws2.d_year = 2000 AND ws3.d_qoy = 3 AND ws3.d_year = 2000
+      AND (ws2.web_sales / NULLIF(ws1.web_sales, 0)) > (ss2.store_sales / NULLIF(ss1.store_sales, 0))
+      AND (ws3.web_sales / NULLIF(ws2.web_sales, 0)) > (ss3.store_sales / NULLIF(ss2.store_sales, 0))
+    OUTPUT: ss1.ca_county, ss1.d_year, ws2.web_sales / ws1.web_sales AS web_q1_q2_increase, ss2.store_sales / ss1.store_sales AS store_q1_q2_increase, ws3.web_sales / ws2.web_sales AS web_q2_q3_increase, ss3.store_sales / ss2.store_sales AS store_q2_q3_increase
+    ORDER BY: web_q1_q2_increase
+    EXPECTED_ROWS: 307
+    CONSUMERS: final output
+EXAMPLES: shared_dimension_multi_channel, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- shared_dimension_multi_channel: Apply extracting shared date and address filters into CTEs referenced by both store and web aggregates. Ignore the fact that the original query already filters date_dim — we are just moving the filter into a shared CTE.
+- dimension_cte_isolate: Apply pre-filtering of dimension tables (date_dim, customer_address) into CTEs before joining with fact tables. Ignore the cross-join hazard — we are not cross-joining multiple dimension CTEs.
+HAZARD_FLAGS:
+- The addr_all CTE is unfiltered (750K rows). This may not reduce scan cost but reduces duplicate scans. Ensure it does not cause Cartesian explosion.
+- The store_agg and web_agg CTEs are still generic (all quarters) and will be self-joined three times. This does not solve the quarter-filtering redundancy.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: scan_consolidation_pivot
+TARGET_LOGICAL_TREE:
+  date_filter -> store_pivot -> web_pivot -> main_join
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_qoy IN (1, 2, 3)
+    OUTPUT: d_date_sk, d_qoy, d_year
+    EXPECTED_ROWS: 1,827
+    CONSUMERS: store_pivot, web_pivot
+  store_pivot:
+    FROM: store_sales, date_filter, customer_address
+    JOIN: ss_sold_date_sk = date_filter.d_date_sk AND ss_addr_sk = ca_address_sk
+    GROUP BY: ca_county
+    AGGREGATE: 
+      SUM(CASE WHEN date_filter.d_qoy = 1 THEN ss_ext_sales_price END) AS store_sales_q1,
+      SUM(CASE WHEN date_filter.d_qoy = 2 THEN ss_ext_sales_price END) AS store_sales_q2,
+      SUM(CASE WHEN date_filter.d_qoy = 3 THEN ss_ext_sales_price END) AS store_sales_q3
+    OUTPUT: ca_county, store_sales_q1, store_sales_q2, store_sales_q3
+    EXPECTED_ROWS: ~1,847 (distinct counties)
+    CONSUMERS: main_join
+  web_pivot:
+    FROM: web_sales, date_filter, customer_address
+    JOIN: ws_sold_date_sk = date_filter.d_date_sk AND ws_bill_addr_sk = ca_address_sk
+    GROUP BY: ca_county
+    AGGREGATE:
+      SUM(CASE WHEN date_filter.d_qoy = 1 THEN ws_ext_sales_price END) AS web_sales_q1,
+      SUM(CASE WHEN date_filter.d_qoy = 2 THEN ws_ext_sales_price END) AS web_sales_q2,
+      SUM(CASE WHEN date_filter.d_qoy = 3 THEN ws_ext_sales_price END) AS web_sales_q3
+    OUTPUT: ca_county, web_sales_q1, web_sales_q2, web_sales_q3
+    EXPECTED_ROWS: ~1,845
+    CONSUMERS: main_join
+  main_join:
+    FROM: store_pivot, web_pivot
+    JOIN: store_pivot.ca_county = web_pivot.ca_county
+    WHERE: (web_pivot.web_sales_q2 / NULLIF(web_pivot.web_sales_q1, 0)) > (store_pivot.store_sales_q2 / NULLIF(store_pivot.store_sales_q1, 0))
+      AND (web_pivot.web_sales_q3 / NULLIF(web_pivot.web_sales_q2, 0)) > (store_pivot.store_sales_q3 / NULLIF(store_pivot.store_sales_q2, 0))
+    OUTPUT: store_pivot.ca_county, 2000 AS d_year, web_pivot.web_sales_q2 / web_pivot.web_sales_q1 AS web_q1_q2_increase, store_pivot.store_sales_q2 / store_pivot.store_sales_q1 AS store_q1_q2_increase, web_pivot.web_sales_q3 / web_pivot.web_sales_q2 AS web_q2_q3_increase, store_pivot.store_sales_q3 / store_pivot.store_sales_q2 AS store_q2_q3_increase
+    ORDER BY: web_q1_q2_increase
+    EXPECTED_ROWS: 307
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply consolidation of multiple quarter aggregates into a single scan using CASE expressions. Ignore the fact that we are not consolidating across different fact tables — we do store and web separately.
+- channel_bitmap_aggregation: Apply the pattern of labeling rows by quarter within a single scan and then pivoting via conditional aggregation. Ignore the bitmap aspect — we are not using bitmaps.
+HAZARD_FLAGS:
+- The pivot aggregation must use SUM over CASE (not MAX) because the original aggregation is SUM. Ensure division by zero is handled with NULLIF.
+- The date_filter CTE is used in both store_pivot and web_pivot, but it's scanned twice (once per channel). This could be shared but is out of scope for this strategy.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_union_split_shared_dims
+TARGET_LOGICAL_TREE:
+  date_filter -> addr_all -> store_q1, store_q2, store_q3, web_q1, web_q2, web_q3 -> main_join
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_qoy IN (1, 2, 3)
+    OUTPUT: d_date_sk, d_qoy, d_year
+    EXPECTED_ROWS: 1,827
+    CONSUMERS: store_q1, store_q2, store_q3, web_q1, web_q2, web_q3
+  addr_all:
+    FROM: customer_address
+    OUTPUT: ca_address_sk, ca_county
+    EXPECTED_ROWS: 750K
+    CONSUMERS: store_q1, store_q2, store_q3, web_q1, web_q2, web_q3
+  store_q1:
+    FROM: store_sales, date_filter, addr_all
+    JOIN: ss_sold_date_sk = date_filter.d_date_sk AND ss_addr_sk = addr_all.ca_address_sk
+    WHERE: date_filter.d_qoy = 1
+    GROUP BY: addr_all.ca_county
+    AGGREGATE: SUM(ss_ext_sales_price) AS store_sales
+    OUTPUT: ca_county, store_sales
+    EXPECTED_ROWS: ~1,847
+    CONSUMERS: main_join
+  store_q2:
+    FROM: store_sales, date_filter, addr_all
+    JOIN: ss_sold_date_sk = date_filter.d_date_sk AND ss_addr_sk = addr_all.ca_address_sk
+    WHERE: date_filter.d_qoy = 2
+    GROUP BY: addr_all.ca_county
+    AGGREGATE: SUM(ss_ext_sales_price) AS store_sales
+    OUTPUT: ca_county, store_sales
+    EXPECTED_ROWS: ~1,847
+    CONSUMERS: main_join
+  store_q3:
+    FROM: store_sales, date_filter, addr_all
+    JOIN: ss_sold_date_sk = date_filter.d_date_sk AND ss_addr_sk = addr_all.ca_address_sk
+    WHERE: date_filter.d_qoy = 3
+    GROUP BY: addr_all.ca_county
+    AGGREGATE: SUM(ss_ext_sales_price) AS store_sales
+    OUTPUT: ca_county, store_sales
+    EXPECTED_ROWS: ~1,847
+    CONSUMERS: main_join
+  web_q1:
+    FROM: web_sales, date_filter, addr_all
+    JOIN: ws_sold_date_sk = date_filter.d_date_sk AND ws_bill_addr_sk = addr_all.ca_address_sk
+    WHERE: date_filter.d_qoy = 1
+    GROUP BY: addr_all.ca_county
+    AGGREGATE: SUM(ws_ext_sales_price) AS web_sales
+    OUTPUT: ca_county, web_sales
+    EXPECTED_ROWS: ~1,845
+    CONSUMERS: main_join
+  web_q2:
+    FROM: web_sales, date_filter, addr_all
+    JOIN: ws_sold_date_sk = date_filter.d_date_sk AND ws_bill_addr_sk = addr_all.ca_address_sk
+    WHERE: date_filter.d_qoy = 2
+    GROUP BY: addr_all.ca_county
+    AGGREGATE: SUM(ws_ext_sales_price) AS web_sales
+    OUTPUT: ca_county, web_sales
+    EXPECTED_ROWS: ~1,845
+    CONSUMERS: main_join
+  web_q3:
+    FROM: web_sales, date_filter, addr_all
+    JOIN: ws_sold_date_sk = date_filter.d_date_sk AND ws_bill_addr_sk = addr_all.ca_address_sk
+    WHERE: date_filter.d_qoy = 3
+    GROUP BY: addr_all.ca_county
+    AGGREGATE: SUM(ws_ext_sales_price) AS web_sales
+    OUTPUT: ca_county, web_sales
+    EXPECTED_ROWS: ~1,845
+    CONSUMERS: main_join
+  main_join:
+    FROM: store_q1, store_q2, store_q3, web_q1, web_q2, web_q3
+    JOIN: store_q1.ca_county = store_q2.ca_county = store_q3.ca_county = web_q1.ca_county = web_q2.ca_county = web_q3.ca_county
+    WHERE: (web_q2.web_sales / NULLIF(web_q1.web_sales, 0)) > (store_q2.store_sales / NULLIF(store_q1.store_sales, 0))
+      AND (web_q3.web_sales / NULLIF(web_q2.web_sales, 0)) > (store_q3.store_sales / NULLIF(store_q2.store_sales, 0))
+    OUTPUT: store_q1.ca_county, 2000 AS d_year, web_q2.web_sales / web_q1.web_sales AS web_q1_q2_increase, store_q2.store_sales / store_q1.store_sales AS store_q1_q2_increase, web_q3.web_sales / web_q2.web_sales AS web_q2_q3_increase, store_q3.store_sales / store_q2.store_sales AS store_q2_q3_increase
+    ORDER BY: web_q1_q2_increase
+    EXPECTED_ROWS: 307
+    CONSUMERS: final output
+EXAMPLES: union_cte_split, shared_dimension_multi_channel, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- union_cte_split: Apply splitting by quarter to eliminate generic CTE self-joins. Ignore the year splitting — we focus on quarters.
+- shared_dimension_multi_channel: Apply shared dimension CTEs (date_filter, addr_all) to reduce duplicate dimension scans. Ignore the fact that addr_all is unfiltered — it still reduces scans.
+- multi_dimension_prefetch: Apply pre-filtering of multiple dimension tables (date and address) before joining with fact tables. Ignore the cross-join hazard — we join dimensions independently with fact tables.
+HAZARD_FLAGS:
+- This creates six CTEs, each scanning the fact table with a different quarter filter. This may increase total fact table scan cost if the optimizer cannot push the quarter filter into the scan (but it should via date_filter). However, each fact table scan will be smaller because it's filtered to one quarter.
+- Must ensure the date_filter CTE is referenced by all six CTEs and is not materialized multiple times.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

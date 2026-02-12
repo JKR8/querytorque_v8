@@ -1,0 +1,359 @@
+<reasoning>
+CLASSIFY: This is a multi-channel UNION ALL query (web_sales, catalog_sales, store_sales) with shared dimension filters (date_dim for Dec-1998, item for manager_id=1, time_dim for meal_time). It's a star-join pattern where three fact tables share the same dimension filters, followed by aggregation.
+
+EXPLAIN PLAN ANALYSIS:
+- Total time: 421ms
+- Dominant costs:
+  1. store_sales SEQ_SCAN: 256.2ms (61% of total) - scanning 931K of 345.6M rows
+  2. web_sales SEQ_SCAN: 56.2ms (13%)
+  3. catalog_sales SEQ_SCAN: 4.9ms (1%)
+  4. HASH_JOIN store_sales with date_dim: 37.7ms (9%)
+- Row count flow:
+  - date_dim filters to 31 rows (3 scans, each ~0.5ms)
+  - item filters to 1,847 rows
+  - time_dim filters to 25K rows (from 86K)
+  - UNION ALL combines: 244K + 485K + 931K = ~1.66M rows
+  - After item join: 31K rows
+  - After time_dim join: 12K rows
+  - After aggregation: 10K rows
+- The optimizer already pushes date_dim filters into each UNION branch (d_moy=12, d_year=1998).
+- Each fact table is scanned ONCE per channel (3 total scans). No repeated scans of same table.
+- The CTE (tmp) is NOT materialized - it's a subquery that gets inlined (UNION [0 rows] in EXPLAIN shows it's not a separate materialization).
+
+GAP MATCHING:
+1. CROSS_CTE_PREDICATE_BLINDNESS: Potentially active. The date_dim filter is applied 3 times independently. Could pre-filter once.
+2. REDUNDANT_SCAN_ELIMINATION: NOT active - each fact table is different, scanned once each.
+3. CORRELATED_SUBQUERY_PARALYSIS: NOT active - no correlated subqueries.
+4. CROSS_COLUMN_OR_DECOMPOSITION: NOT active - OR is on same column (t_meal_time).
+5. UNION_CTE_SELF_JOIN_DECOMPOSITION: NOT active - CTE not scanned multiple times.
+
+Engine strengths already handling:
+- INTRA_SCAN_PREDICATE_PUSHDOWN: date_dim filters pushed into scans
+- SAME_COLUMN_OR: t_meal_time OR handled in single scan
+- HASH_JOIN_SELECTION: using hash joins appropriately
+- CTE_INLINING: CTE is inlined, not materialized
+
+AGGREGATION TRAP CHECK:
+- Only SUM(ext_price) - duplicate-insensitive
+- No FILTER clauses or conditional aggregation
+- No STDDEV_SAMP, VARIANCE, etc.
+
+TRANSFORM SELECTION:
+1. **date_cte_isolate** (4.00x avg): Pre-filter date_dim once, join with each fact table. Addresses 3 redundant date_dim scans.
+2. **prefetch_fact_join** (3.77x avg): Chain: filtered date_dim → pre-join with each fact table → then join item/time. Could reduce fact table probe sizes.
+3. **single_pass_aggregation** (4.47x avg): NOT directly applicable - different fact tables, not repeated scans of same table.
+4. **channel_bitmap_aggregation** (6.24x avg): NOT applicable - different fact tables, can't consolidate into single scan.
+5. **dimension_cte_isolate** (1.93x avg): Pre-filter ALL dimensions (date_dim, item, time_dim) before fact joins.
+6. **shared_dimension_multi_channel** (1.30x avg): Extract shared date_dim filter into common CTE for all channels.
+7. **or_to_union**: NOT applicable - OR is on same column.
+8. **union_cte_split**: NOT applicable - CTE not scanned multiple times.
+
+Best 4 with structural diversity:
+1. **date_cte_isolate**: Pre-filter date_dim once
+2. **dimension_cte_isolate**: Pre-filter ALL dimensions (date, item, time)
+3. **prefetch_fact_join**: Staged join pipeline
+4. **EXPLORATION**: compound_strategy combining date_cte_isolate with channel-specific aggregation pushdown
+
+LOGICAL TREE DESIGN:
+Need to ensure CTE_COLUMN_COMPLETENESS: Each CTE must output all columns needed by downstream consumers.
+
+Check downstream references:
+- FROM item: needs i_item_sk, i_brand_id, i_brand, i_manager_id
+- FROM time_dim: needs t_time_sk, t_hour, t_minute, t_meal_time  
+- FROM fact tables: need *_ext_sales_price, *_sold_date_sk, *_item_sk, *_sold_time_sk
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Business: Report brand revenue by time for manager_id=1 items sold in Dec-1998 during breakfast/dinner. JOIN: All INNER joins - intersection semantics (all dimension matches required). Aggregation: Only SUM(ext_price), duplicate-insensitive. Filter dependencies: date_dim filter (d_moy=12,d_year=1998) applies to all 3 channels; item filter (i_manager_id=1) and time filter (t_meal_time IN breakfast/dinner) apply after UNION.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: store_sales scan dominates (256ms, 61%). Cardinality: 31 date rows → 1.66M fact rows → 31K after item join → 12K after time join → 10K after aggregation. Optimizer already handles: predicate pushdown into scans, hash join selection, CTE inlining, same-column OR. Logical-tree costs misleading: store_sales scan is 61% of real time, not 8% as in logical tree.
+
+ACTIVE_CONSTRAINTS:
+- LITERAL_PRESERVATION: Must preserve d_moy=12, d_year=1998, i_manager_id=1, t_meal_time values exactly.
+- SEMANTIC_EQUIVALENCE: Must return same 10K rows with same columns and ordering.
+- COMPLETE_OUTPUT: Must output i_brand_id, i_brand, t_hour, t_minute, ext_price ordered by ext_price DESC, i_brand_id.
+- CTE_COLUMN_COMPLETENESS: Each CTE must output all columns referenced downstream.
+- ENGINE_GAP_ID: CROSS_CTE_PREDICATE_BLINDNESS: date_dim scanned 3 times (31 rows each) - could pre-filter once.
+- ENGINE_GAP_ID: CROSS_CTE_PREDICATE_BLINDNESS: dimension filters could be pushed earlier via staged CTEs.
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline <100ms, CTE overhead dominated savings.
+   RULE: This query is 421ms, so acceptable to try.
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Baseline <50ms, CTE overhead dominated; also forced suboptimal join order on 3+ fact table joins.
+   RULE: This query has 421ms baseline and only 3 independent fact tables (no multi-way fact joins).
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: date_cte_isolate
+TARGET_LOGICAL_TREE:
+filtered_date -> web_sales_with_date -> catalog_sales_with_date -> store_sales_with_date -> union_all_channels -> join_item -> join_time -> aggregate -> sort
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_moy=12 AND d_year=1998
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: web_sales_with_date, catalog_sales_with_date, store_sales_with_date
+  web_sales_with_date:
+    FROM: web_sales JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+    OUTPUT: ws_ext_sales_price AS ext_price, ws_item_sk AS sold_item_sk, ws_sold_time_sk AS time_sk
+    EXPECTED_ROWS: 244K
+    CONSUMERS: union_all_channels
+  catalog_sales_with_date:
+    FROM: catalog_sales JOIN filtered_date ON cs_sold_date_sk = d_date_sk  
+    OUTPUT: cs_ext_sales_price AS ext_price, cs_item_sk AS sold_item_sk, cs_sold_time_sk AS time_sk
+    EXPECTED_ROWS: 485K
+    CONSUMERS: union_all_channels
+  store_sales_with_date:
+    FROM: store_sales JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_ext_sales_price AS ext_price, ss_item_sk AS sold_item_sk, ss_sold_time_sk AS time_sk
+    EXPECTED_ROWS: 931K
+    CONSUMERS: union_all_channels
+  union_all_channels:
+    FROM: web_sales_with_date UNION ALL catalog_sales_with_date UNION ALL store_sales_with_date
+    OUTPUT: ext_price, sold_item_sk, time_sk
+    EXPECTED_ROWS: 1.66M
+    CONSUMERS: join_item
+  join_item:
+    FROM: union_all_channels JOIN item ON sold_item_sk = i_item_sk
+    WHERE: i_manager_id=1
+    OUTPUT: ext_price, i_brand_id, i_brand, time_sk
+    EXPECTED_ROWS: 31K
+    CONSUMERS: join_time
+  join_time:
+    FROM: join_item JOIN time_dim ON time_sk = t_time_sk
+    WHERE: t_meal_time = 'breakfast' OR t_meal_time = 'dinner'
+    OUTPUT: ext_price, i_brand_id, i_brand, t_hour, t_minute
+    EXPECTED_ROWS: 12K
+    CONSUMERS: aggregate
+  aggregate:
+    GROUP BY: i_brand_id, i_brand, t_hour, t_minute
+    AGGREGATE: SUM(ext_price) AS ext_price
+    OUTPUT: i_brand_id, i_brand, t_hour, t_minute, ext_price
+    EXPECTED_ROWS: 10K
+    CONSUMERS: sort
+  sort:
+    ORDER BY: ext_price DESC, i_brand_id
+    OUTPUT: i_brand_id AS brand_id, i_brand AS brand, t_hour, t_minute, ext_price
+    EXPECTED_ROWS: 10K
+    CONSUMERS: final
+EXAMPLES: date_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: Apply the pattern of extracting date_dim filter into CTE; ignore the scalar subquery conversion (this query has no scalar subquery).
+- early_filter: Apply filtering small dimension (date_dim) first; ignore the reason table pattern (not present).
+HAZARD_FLAGS:
+- filtered_date CTE might be inlined (single reference) losing materialization benefit
+- Must ensure date_dim filter (d_moy=12,d_year=1998) copied exactly
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+filtered_date -> filtered_item -> filtered_time -> web_sales_joined -> catalog_sales_joined -> store_sales_joined -> union_all -> aggregate -> sort
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_moy=12 AND d_year=1998
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: web_sales_joined, catalog_sales_joined, store_sales_joined
+  filtered_item:
+    FROM: item
+    WHERE: i_manager_id=1
+    OUTPUT: i_item_sk, i_brand_id, i_brand
+    EXPECTED_ROWS: 1,847
+    CONSUMERS: web_sales_joined, catalog_sales_joined, store_sales_joined
+  filtered_time:
+    FROM: time_dim
+    WHERE: t_meal_time = 'breakfast' OR t_meal_time = 'dinner'
+    OUTPUT: t_time_sk, t_hour, t_minute
+    EXPECTED_ROWS: 25K
+    CONSUMERS: web_sales_joined, catalog_sales_joined, store_sales_joined
+  web_sales_joined:
+    FROM: web_sales 
+      JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+      JOIN filtered_item ON ws_item_sk = i_item_sk
+      JOIN filtered_time ON ws_sold_time_sk = t_time_sk
+    OUTPUT: ws_ext_sales_price AS ext_price, i_brand_id, i_brand, t_hour, t_minute
+    EXPECTED_ROWS: ~8K (244K × selectivity)
+    CONSUMERS: union_all
+  catalog_sales_joined:
+    FROM: catalog_sales
+      JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+      JOIN filtered_item ON cs_item_sk = i_item_sk  
+      JOIN filtered_time ON cs_sold_time_sk = t_time_sk
+    OUTPUT: cs_ext_sales_price AS ext_price, i_brand_id, i_brand, t_hour, t_minute
+    EXPECTED_ROWS: ~16K
+    CONSUMERS: union_all
+  store_sales_joined:
+    FROM: store_sales
+      JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+      JOIN filtered_item ON ss_item_sk = i_item_sk
+      JOIN filtered_time ON ss_sold_time_sk = t_time_sk
+    OUTPUT: ss_ext_sales_price AS ext_price, i_brand_id, i_brand, t_hour, t_minute
+    EXPECTED_ROWS: ~31K
+    CONSUMERS: union_all
+  union_all:
+    FROM: web_sales_joined UNION ALL catalog_sales_joined UNION ALL store_sales_joined
+    OUTPUT: ext_price, i_brand_id, i_brand, t_hour, t_minute
+    EXPECTED_ROWS: ~55K
+    CONSUMERS: aggregate
+  aggregate:
+    GROUP BY: i_brand_id, i_brand, t_hour, t_minute
+    AGGREGATE: SUM(ext_price) AS ext_price
+    OUTPUT: i_brand_id, i_brand, t_hour, t_minute, ext_price
+    EXPECTED_ROWS: 10K
+    CONSUMERS: sort
+  sort:
+    ORDER BY: ext_price DESC, i_brand_id
+    OUTPUT: i_brand_id AS brand_id, i_brand AS brand, t_hour, t_minute, ext_price
+    EXPECTED_ROWS: 10K
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering ALL dimensions; ignore the cross-join warning (we join dimensions with facts, not cross-join dimensions).
+- multi_dimension_prefetch: Apply pre-filtering multiple dimensions; ignore the complex inter-table predicate reordering (this query has simple star joins).
+HAZARD_FLAGS:
+- filtered_time CTE (25K rows) might be large for hash table in each branch
+- Must ensure all dimension CTEs have WHERE clauses (they do)
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+filtered_date -> web_fact_prejoin -> catalog_fact_prejoin -> store_fact_prejoin -> union_all -> join_item_time -> aggregate -> sort
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_moy=12 AND d_year=1998
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: web_fact_prejoin, catalog_fact_prejoin, store_fact_prejoin
+  web_fact_prejoin:
+    FROM: web_sales JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+    OUTPUT: ws_ext_sales_price AS ext_price, ws_item_sk AS sold_item_sk, ws_sold_time_sk AS time_sk
+    EXPECTED_ROWS: 244K
+    CONSUMERS: union_all
+  catalog_fact_prejoin:
+    FROM: catalog_sales JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    OUTPUT: cs_ext_sales_price AS ext_price, cs_item_sk AS sold_item_sk, cs_sold_time_sk AS time_sk
+    EXPECTED_ROWS: 485K
+    CONSUMERS: union_all
+  store_fact_prejoin:
+    FROM: store_sales JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_ext_sales_price AS ext_price, ss_item_sk AS sold_item_sk, ss_sold_time_sk AS time_sk
+    EXPECTED_ROWS: 931K
+    CONSUMERS: union_all
+  union_all:
+    FROM: web_fact_prejoin UNION ALL catalog_fact_prejoin UNION ALL store_fact_prejoin
+    OUTPUT: ext_price, sold_item_sk, time_sk
+    EXPECTED_ROWS: 1.66M
+    CONSUMERS: join_item_time
+  join_item_time:
+    FROM: union_all 
+      JOIN item ON sold_item_sk = i_item_sk AND i_manager_id=1
+      JOIN time_dim ON time_sk = t_time_sk AND (t_meal_time = 'breakfast' OR t_meal_time = 'dinner')
+    OUTPUT: ext_price, i_brand_id, i_brand, t_hour, t_minute
+    EXPECTED_ROWS: 12K
+    CONSUMERS: aggregate
+  aggregate:
+    GROUP BY: i_brand_id, i_brand, t_hour, t_minute
+    AGGREGATE: SUM(ext_price) AS ext_price
+    OUTPUT: i_brand_id, i_brand, t_hour, t_minute, ext_price
+    EXPECTED_ROWS: 10K
+    CONSUMERS: sort
+  sort:
+    ORDER BY: ext_price DESC, i_brand_id
+    OUTPUT: i_brand_id AS brand_id, i_brand AS brand, t_hour, t_minute, ext_price
+    EXPECTED_ROWS: 10K
+    CONSUMERS: final
+EXAMPLES: prefetch_fact_join, pushdown
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply staged CTE chain (filter dimension, pre-join with fact); ignore the multi-way fact join warning (this query has independent fact tables).
+- pushdown: Apply pushing filters from outer query into CTEs; ignore the scalar subquery consolidation (not present).
+HAZARD_FLAGS:
+- join_item_time combines two dimensions in one join - optimizer might reorder poorly
+- filtered_date might be inlined losing materialization benefit
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: channel_aggregation_pushdown
+TARGET_LOGICAL_TREE:
+filtered_date -> filtered_item -> web_channel_agg -> catalog_channel_agg -> store_channel_agg -> union_all -> join_time -> final_union -> sort
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_moy=12 AND d_year=1998
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: web_channel_agg, catalog_channel_agg, store_channel_agg
+  filtered_item:
+    FROM: item
+    WHERE: i_manager_id=1
+    OUTPUT: i_item_sk, i_brand_id, i_brand
+    EXPECTED_ROWS: 1,847
+    CONSUMERS: web_channel_agg, catalog_channel_agg, store_channel_agg
+  web_channel_agg:
+    FROM: web_sales 
+      JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+      JOIN filtered_item ON ws_item_sk = i_item_sk
+    GROUP BY: i_brand_id, i_brand, ws_sold_time_sk
+    AGGREGATE: SUM(ws_ext_sales_price) AS ext_price
+    OUTPUT: i_brand_id, i_brand, ws_sold_time_sk AS time_sk, ext_price
+    EXPECTED_ROWS: ~8K
+    CONSUMERS: union_all
+  catalog_channel_agg:
+    FROM: catalog_sales
+      JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+      JOIN filtered_item ON cs_item_sk = i_item_sk
+    GROUP BY: i_brand_id, i_brand, cs_sold_time_sk
+    AGGREGATE: SUM(cs_ext_sales_price) AS ext_price
+    OUTPUT: i_brand_id, i_brand, cs_sold_time_sk AS time_sk, ext_price
+    EXPECTED_ROWS: ~16K
+    CONSUMERS: union_all
+  store_channel_agg:
+    FROM: store_sales
+      JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+      JOIN filtered_item ON ss_item_sk = i_item_sk
+    GROUP BY: i_brand_id, i_brand, ss_sold_time_sk
+    AGGREGATE: SUM(ss_ext_sales_price) AS ext_price
+    OUTPUT: i_brand_id, i_brand, ss_sold_time_sk AS time_sk, ext_price
+    EXPECTED_ROWS: ~31K
+    CONSUMERS: union_all
+  union_all:
+    FROM: web_channel_agg UNION ALL catalog_channel_agg UNION ALL store_channel_agg
+    OUTPUT: i_brand_id, i_brand, time_sk, ext_price
+    EXPECTED_ROWS: ~55K
+    CONSUMERS: join_time
+  join_time:
+    FROM: union_all JOIN time_dim ON time_sk = t_time_sk
+    WHERE: t_meal_time = 'breakfast' OR t_meal_time = 'dinner'
+    OUTPUT: i_brand_id, i_brand, t_hour, t_minute, ext_price
+    EXPECTED_ROWS: ~12K
+    CONSUMERS: final_union
+  final_union:
+    GROUP BY: i_brand_id, i_brand, t_hour, t_minute
+    AGGREGATE: SUM(ext_price) AS ext_price
+    OUTPUT: i_brand_id, i_brand, t_hour, t_minute, ext_price
+    EXPECTED_ROWS: 10K
+    CONSUMERS: sort
+  sort:
+    ORDER BY: ext_price DESC, i_brand_id
+    OUTPUT: i_brand_id AS brand_id, i_brand AS brand, t_hour, t_minute, ext_price
+    EXPECTED_ROWS: 10K
+    CONSUMERS: final
+EXAMPLES: single_pass_aggregation, pushdown
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply early aggregation per channel; ignore the CASE WHEN consolidation (different fact tables).
+- pushdown: Apply pushing aggregation earlier; ignore the scalar subquery pattern.
+HAZARD_FLAGS:
+- Early aggregation changes join order (aggregate before time_dim join) - must verify SUM equivalence
+- time_dim filter applied after aggregation might miss some rows that would be filtered before aggregation in original
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

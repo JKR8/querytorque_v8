@@ -1,0 +1,87 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_cte  [+]  Cost: 5%  Rows: ~365
+│   └── SCAN (date_dim) FILTER (d_year = 2000) OUTPUT (d_date_sk)
+├── [CTE] return_addr_cte  [+]  Cost: 10%  Rows: ~1000
+│   └── SCAN (customer_address) OUTPUT (ca_address_sk, ca_state)
+├── [CTE] returns_cte  [~]  Cost: 35%  Rows: ~1000
+│   ├── SCAN (catalog_returns)  [=]
+│   ├── JOIN (catalog_returns × date_cte) ON (cr_returned_date_sk = d_date_sk)  [!]
+│   ├── JOIN (catalog_returns × return_addr_cte) ON (cr_returning_addr_sk = ca_address_sk)  [!]
+│   ├── FILTER (d_year = 2000)  [=]
+│   ├── AGG (GROUP BY cr_returning_customer_sk, ca_state)  [=]
+│   └── OUTPUT (ctr_customer_sk, ctr_state, ctr_total_return)  [=]
+├── [CTE] main_prefetch  [~]  Cost: 40%  Rows: ≤100
+│   ├── SCAN (returns_cte AS ctr1, returns_cte AS ctr2, customer, customer_address)  [!]
+│   ├── JOIN (ctr1 × ctr2) ON (ctr1.ctr_state = ctr2.ctr_state)  [!]
+│   ├── JOIN (ctr1 × customer) ON (ctr1.ctr_customer_sk = c_customer_sk)  [!]
+│   ├── JOIN (customer × customer_address) ON (ca_address_sk = c_current_addr_sk)  [!]
+│   ├── FILTER (ctr1.ctr_total_return > AVG(ctr2.ctr_total_return) * 1.2)  [!]
+│   ├── FILTER (ca_state = 'IA')  [=]
+│   ├── AGG (GROUP BY ctr1.ctr_customer_sk, ctr1.ctr_state, ctr1.ctr_total_return, ...)  [!]
+│   └── OUTPUT (c_customer_id, c_salutation, c_first_name, c_last_name, ..., ctr_total_return)  [=]
+└── [MAIN] final_sort  [=]  Cost: 10%  Rows: ≤100
+    └── SORT+LIMIT (ORDER BY all 16 columns, LIMIT 100)  [=]
+```
+
+**Changes:**
+- `date_cte` and `return_addr_cte`: Added as prefetched dimension CTEs
+- `returns_cte`: Changed comma joins to explicit JOIN syntax with CTEs
+- `main_prefetch`: Changed comma joins to explicit JOIN syntax, moved correlated subquery logic to GROUP BY/HAVING
+- Structural: Converted correlated subquery to self-join with aggregation
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefetch", "description": "Filter date_dim and customer_address into separate CTEs before joining", "applied_to": ["date_cte", "return_addr_cte"]},
+    {"id": "R2", "type": "explicit_join_syntax", "description": "Convert comma joins to explicit INNER JOIN syntax", "applied_to": ["returns_cte", "main_prefetch"]},
+    {"id": "R3", "type": "correlated_to_selfjoin", "description": "Convert correlated subquery to self-join with GROUP BY/HAVING", "applied_to": ["main_prefetch"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "return_addr_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk, ca_state FROM customer_address",
+        "interfaces": {"outputs": ["ca_address_sk", "ca_state"], "consumes": []}
+      },
+      "returns_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cr_returning_customer_sk AS ctr_customer_sk, return_addr_cte.ca_state AS ctr_state, SUM(cr_return_amt_inc_tax) AS ctr_total_return FROM catalog_returns INNER JOIN date_cte ON cr_returned_date_sk = date_cte.d_date_sk INNER JOIN return_addr_cte ON cr_returning_addr_sk = return_addr_cte.ca_address_sk GROUP BY cr_returning_customer_sk, return_addr_cte.ca_state",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_state", "ctr_total_return"], "consumes": ["date_cte", "return_addr_cte"]}
+      },
+      "main_prefetch": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr1.ctr_total_return FROM returns_cte ctr1 INNER JOIN returns_cte ctr2 ON ctr1.ctr_state = ctr2.ctr_state INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk WHERE ca_state = 'IA' GROUP BY ctr1.ctr_customer_sk, ctr1.ctr_state, ctr1.ctr_total_return, c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type HAVING ctr1.ctr_total_return > AVG(ctr2.ctr_total_return) * 1.2",
+        "interfaces": {"outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "ca_street_number", "ca_street_name", "ca_street_type", "ca_suite_number", "ca_city", "ca_county", "ca_state", "ca_zip", "ca_country", "ca_gmt_offset", "ca_location_type", "ctr_total_return"], "consumes": ["returns_cte"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "return_addr_cte", "returns_cte", "main_prefetch"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), return_addr_cte AS ({return_addr_cte}), returns_cte AS ({returns_cte}), main_prefetch AS ({main_prefetch}) SELECT * FROM main_prefetch ORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return LIMIT 100"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** The rewrite pre-filters dimension tables into CTEs (date_dim for year 2000, all customer addresses) and converts all joins to explicit INNER JOIN syntax. The correlated subquery is transformed into a self-join between two instances of the returns CTE with GROUP BY/HAVING to compute state averages. This preserves the exact semantics while enabling better join planning with small dimension hash tables.
+
+**Expected speedup:** ~2-3x from dimension prefetching and explicit join syntax, similar to pg_dimension_prefetch_star (3.32x) pattern. The correlated subquery elimination should help, though some overhead remains from the self-join aggregation.

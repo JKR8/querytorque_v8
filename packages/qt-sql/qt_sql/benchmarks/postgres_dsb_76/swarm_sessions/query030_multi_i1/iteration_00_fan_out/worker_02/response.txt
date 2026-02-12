@@ -1,0 +1,97 @@
+### Part 1: Modified Logic Tree
+```
+QUERY: (single statement)
+├── [CTE] date_cte  [+]  (new CTE for dimension prefetch)
+│   ├── SCAN (date_dim)
+│   └── FILTER (d_year = 1999)
+├── [CTE] item_cte  [+]  (new CTE for dimension prefetch)
+│   ├── SCAN (item)
+│   └── FILTER (i_manager_id BETWEEN 42 AND 51)
+├── [CTE] address_cte  [+]  (new CTE for dimension prefetch with early state filter)
+│   ├── SCAN (customer_address)
+│   └── FILTER (ca_state IN ('CA','MI','SD','VA'))
+├── [CTE] fact_cte  [+]  (explicit JOINs replacing comma joins)
+│   ├── SCAN (web_returns)
+│   ├── JOIN (INNER) date_cte ON wr_returned_date_sk = d_date_sk
+│   ├── JOIN (INNER) address_cte ON wr_returning_addr_sk = ca_address_sk
+│   ├── JOIN (INNER) item_cte ON wr_item_sk = i_item_sk
+│   └── FILTER (wr_return_amt / wr_return_quantity BETWEEN 193 AND 222)
+├── [CTE] aggregated_cte  [+]  (renamed from original CTE, same aggregation)
+│   ├── SCAN (fact_cte)
+│   ├── AGG (GROUP BY wr_returning_customer_sk, ca_state, wr_reason_sk)
+│   └── OUTPUT (ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return)
+└── [MAIN] main_query  [~]  (uses new CTEs, preserves original filters/ordering)
+    ├── SCAN (aggregated_cte AS ctr1)
+    ├── JOIN (INNER) customer ON ctr1.ctr_customer_sk = c_customer_sk
+    ├── JOIN (INNER) address_cte ON address_cte.ca_address_sk = customer.c_current_addr_sk
+    ├── FILTER (ctr1.ctr_reason_sk IN (22, 23))
+    ├── FILTER (c_birth_year BETWEEN 1945 AND 1951)
+    ├── FILTER (ctr1.ctr_total_return > correlated subquery)
+    ├── SORT (13 customer columns, ctr_total_return)
+    └── LIMIT (100)
+```
+
+### Part 2: Component Payload JSON
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefetch", "description": "Pre-filter selective dimensions (date, item, address) into CTEs before joining with fact table", "applied_to": ["date_cte", "item_cte", "address_cte"]},
+    {"id": "R2", "type": "explicit_join_conversion", "description": "Convert comma-separated joins to explicit INNER JOIN syntax for better cardinality estimation", "applied_to": ["fact_cte"]},
+    {"id": "R3", "type": "cte_staging", "description": "Stage fact aggregation in separate CTE (aggregated_cte) to maintain original correlated subquery semantics", "applied_to": ["aggregated_cte", "main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk FROM item WHERE i_manager_id BETWEEN 42 AND 51",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "address_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ca_address_sk, ca_state FROM customer_address WHERE ca_state IN ('CA', 'MI', 'SD', 'VA')",
+        "interfaces": {"outputs": ["ca_address_sk", "ca_state"], "consumes": []}
+      },
+      "fact_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT wr.wr_returning_customer_sk, a.ca_state, wr.wr_reason_sk, wr.wr_return_amt FROM web_returns wr INNER JOIN date_cte d ON wr.wr_returned_date_sk = d.d_date_sk INNER JOIN address_cte a ON wr.wr_returning_addr_sk = a.ca_address_sk INNER JOIN item_cte i ON wr.wr_item_sk = i.i_item_sk WHERE wr.wr_return_amt / wr.wr_return_quantity BETWEEN 193 AND 222",
+        "interfaces": {"outputs": ["wr_returning_customer_sk", "ca_state", "wr_reason_sk", "wr_return_amt"], "consumes": ["date_cte", "address_cte", "item_cte"]}
+      },
+      "aggregated_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT wr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, wr_reason_sk AS ctr_reason_sk, SUM(wr_return_amt) AS ctr_total_return FROM fact_cte GROUP BY wr_returning_customer_sk, ca_state, wr_reason_sk",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_state", "ctr_reason_sk", "ctr_total_return"], "consumes": ["fact_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c.c_customer_id, c.c_salutation, c.c_first_name, c.c_last_name, c.c_preferred_cust_flag, c.c_birth_day, c.c_birth_month, c.c_birth_year, c.c_birth_country, c.c_login, c.c_email_address, c.c_last_review_date_sk, ctr1.ctr_total_return FROM aggregated_cte ctr1 INNER JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk INNER JOIN address_cte a ON a.ca_address_sk = c.c_current_addr_sk WHERE ctr1.ctr_reason_sk IN (22, 23) AND c.c_birth_year BETWEEN 1945 AND 1951 AND ctr1.ctr_total_return > (SELECT AVG(ctr2.ctr_total_return) * 1.2 FROM aggregated_cte ctr2 WHERE ctr1.ctr_state = ctr2.ctr_state) ORDER BY c.c_customer_id, c.c_salutation, c.c_first_name, c.c_last_name, c.c_preferred_cust_flag, c.c_birth_day, c.c_birth_month, c.c_birth_year, c.c_birth_country, c.c_login, c.c_email_address, c.c_last_review_date_sk, ctr1.ctr_total_return LIMIT 100",
+        "interfaces": {"outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag", "c_birth_day", "c_birth_month", "c_birth_year", "c_birth_country", "c_login", "c_email_address", "c_last_review_date_sk", "ctr_total_return"], "consumes": ["aggregated_cte", "address_cte"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "item_cte", "address_cte", "fact_cte", "aggregated_cte", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), item_cte AS ({item_cte}), address_cte AS ({address_cte}), fact_cte AS ({fact_cte}), aggregated_cte AS ({aggregated_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: The rewrite prefetches three selective dimensions (date_dim, item, customer_address) into materialized CTEs, replaces comma joins with explicit INNER JOINs, and stages the fact aggregation in `aggregated_cte` to preserve the original correlated subquery semantics while improving early filtering.
+
+**Expected speedup**: ~2.5-3x via better cardinality estimates from pre-materialized dimension tables and explicit join ordering control.

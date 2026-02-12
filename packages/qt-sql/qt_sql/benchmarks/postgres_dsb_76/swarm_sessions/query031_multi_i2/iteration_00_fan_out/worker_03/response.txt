@@ -1,0 +1,91 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_dims  [+]
+│   ├── SCAN (date_dim, item, customer_address) [cross join]
+│   ├── FILTER (d_year=1999 AND d_qoy IN (1,2,3))
+│   ├── FILTER (i_color IN ('dark','puff') AND i_manager_id BETWEEN 15 AND 34)
+│   ├── FILTER (ca_state IN ('KS','OH'))
+│   └── OUTPUT (d_date_sk, d_qoy, d_year, i_item_sk, ca_address_sk, ca_county)
+├── [CTE] combined_sales  [~] replaces ss/ws CTEs
+│   ├── SCAN (store_sales [list_price filter], web_sales [list_price filter])
+│   ├── UNION ALL (channel discriminator)
+│   ├── JOIN filtered_dims (date: sold_date_sk = d_date_sk)
+│   ├── JOIN filtered_dims (item: item_sk = i_item_sk)
+│   ├── JOIN filtered_dims (addr: OR condition for store/web keys)
+│   └── OUTPUT (channel, ca_county, d_qoy, d_year, sales)
+├── [CTE] channel_quarter_agg  [+]
+│   ├── SCAN combined_sales
+│   ├── AGG (GROUP BY channel, ca_county, d_qoy, d_year)
+│   ├── AGG (SUM(sales) AS total_sales)
+│   └── OUTPUT (channel, ca_county, d_qoy, d_year, total_sales)
+└── [MAIN] main_query  [~] replaces 6-way self-join with pivot
+    ├── SCAN channel_quarter_agg
+    ├── PIVOT (MAX(CASE) for web/store quarters 1-3)
+    ├── FILTER (web_q1_q2_increase > store_q1_q2_increase AND web_q2_q3_increase > store_q2_q3_increase)
+    ├── SORT (d_year ASC)
+    └── OUTPUT (ca_county, d_year, web_q1_q2_increase, store_q1_q2_increase, web_q2_q3_increase, store_q2_q3_increase)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_sharing", "description": "Replace duplicate dimension scans in ss/ws CTEs with single filtered_dims CTE", "applied_to": ["filtered_dims"]},
+    {"id": "R2", "type": "channel_union", "description": "Merge store_sales and web_sales scans via UNION ALL with channel discriminator", "applied_to": ["combined_sales"]},
+    {"id": "R3", "type": "aggregation_consolidation", "description": "Replace separate ss/ws aggregations with single channel_quarter_agg CTE", "applied_to": ["channel_quarter_agg"]},
+    {"id": "R4", "type": "pivot_transform", "description": "Replace 6-way self-join with conditional aggregation pivot", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dims": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk, d_qoy, d_year, i_item_sk, ca_address_sk, ca_county FROM date_dim, item, customer_address WHERE d_year = 1999 AND d_qoy IN (1, 2, 3) AND i_color IN ('dark', 'puff') AND i_manager_id BETWEEN 15 AND 34 AND ca_state IN ('KS', 'OH')",
+        "interfaces": {"outputs": ["d_date_sk", "d_qoy", "d_year", "i_item_sk", "ca_address_sk", "ca_county"], "consumes": []}
+      },
+      "combined_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT sales.channel, addr.ca_county, date.d_qoy, date.d_year, sales.sales FROM (SELECT 'store' AS channel, ss_ext_sales_price AS sales, ss_sold_date_sk, ss_item_sk, ss_addr_sk, ss_list_price FROM store_sales WHERE ss_list_price BETWEEN 244 AND 258 UNION ALL SELECT 'web' AS channel, ws_ext_sales_price AS sales, ws_sold_date_sk, ws_item_sk, ws_bill_addr_sk, ws_list_price FROM web_sales WHERE ws_list_price BETWEEN 244 AND 258) sales JOIN filtered_dims date ON sales.sold_date_sk = date.d_date_sk JOIN filtered_dims item ON sales.item_sk = item.i_item_sk JOIN filtered_dims addr ON (sales.channel = 'store' AND sales.addr_sk = addr.ca_address_sk) OR (sales.channel = 'web' AND sales.bill_addr_sk = addr.ca_address_sk)",
+        "interfaces": {"outputs": ["channel", "ca_county", "d_qoy", "d_year", "sales"], "consumes": ["filtered_dims"]}
+      },
+      "channel_quarter_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT channel, ca_county, d_qoy, d_year, SUM(sales) AS total_sales FROM combined_sales GROUP BY channel, ca_county, d_qoy, d_year",
+        "interfaces": {"outputs": ["channel", "ca_county", "d_qoy", "d_year", "total_sales"], "consumes": ["combined_sales"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "WITH pivoted AS (SELECT ca_county, d_year, MAX(CASE WHEN channel = 'web' AND d_qoy = 1 THEN total_sales END) AS web_q1, MAX(CASE WHEN channel = 'web' AND d_qoy = 2 THEN total_sales END) AS web_q2, MAX(CASE WHEN channel = 'web' AND d_qoy = 3 THEN total_sales END) AS web_q3, MAX(CASE WHEN channel = 'store' AND d_qoy = 1 THEN total_sales END) AS store_q1, MAX(CASE WHEN channel = 'store' AND d_qoy = 2 THEN total_sales END) AS store_q2, MAX(CASE WHEN channel = 'store' AND d_qoy = 3 THEN total_sales END) AS store_q3 FROM channel_quarter_agg GROUP BY ca_county, d_year) SELECT ca_county, d_year, CASE WHEN web_q1 > 0 THEN web_q2 / web_q1 ELSE NULL END AS web_q1_q2_increase, CASE WHEN store_q1 > 0 THEN store_q2 / store_q1 ELSE NULL END AS store_q1_q2_increase, CASE WHEN web_q2 > 0 THEN web_q3 / web_q2 ELSE NULL END AS web_q2_q3_increase, CASE WHEN store_q2 > 0 THEN store_q3 / store_q2 ELSE NULL END AS store_q2_q3_increase FROM pivoted WHERE CASE WHEN web_q1 > 0 THEN web_q2 / web_q1 ELSE NULL END > CASE WHEN store_q1 > 0 THEN store_q2 / store_q1 ELSE NULL END AND CASE WHEN web_q2 > 0 THEN web_q3 / web_q2 ELSE NULL END > CASE WHEN store_q2 > 0 THEN store_q3 / store_q2 ELSE NULL END ORDER BY d_year",
+        "interfaces": {"outputs": ["ca_county", "d_year", "web_q1_q2_increase", "store_q1_q2_increase", "web_q2_q3_increase", "store_q2_q3_increase"], "consumes": ["channel_quarter_agg"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dims", "combined_sales", "channel_quarter_agg", "main_query"],
+    "assembly_template": "WITH filtered_dims AS ({filtered_dims}), combined_sales AS ({combined_sales}), channel_quarter_agg AS ({channel_quarter_agg}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'", "SET LOCAL enable_hashjoin = on", "SET LOCAL enable_mergejoin = off", "SET LOCAL enable_nestloop = off", "SET LOCAL hash_mem_multiplier = 2.0"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced duplicate dimension scans with single filtered_dims CTE, merged store/web sales via UNION ALL, consolidated aggregations, and replaced 6-way self-join with conditional aggregation pivot. Preserved division guards and exact output schema.
+
+**Expected speedup**: 1.8-2.5x due to single dimension scan, elimination of 6-way self-join O(n²) explosion, and hash aggregation efficiency. The pivot reduces join cardinality from O(n²) to O(n) where n=counties.
+
+**Runtime config rationale**: 
+- `work_mem = '512MB'`: Supports hash aggregates in channel_quarter_agg (grouping by 4 columns) and pivot aggregation
+- `enable_hashjoin = on`: Hash joins optimal for filtered_dims joins
+- `enable_mergejoin = off`: No sorted data benefits
+- `enable_nestloop = off`: Prevents nested loops on large fact tables
+- `hash_mem_multiplier = 2.0`: Extra headroom for hash tables on UNION ALL results

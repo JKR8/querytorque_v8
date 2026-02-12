@@ -1,0 +1,75 @@
+## Part 1: Modified Logic Tree
+
+```
+[=] Original query structure
+    [~] FROM clause: Convert comma-separated joins to explicit JOIN...ON syntax
+        [+] date_cte: MATERIALIZED CTE for filtered date_dim (d_year = 1999)
+        [+] store_cte: MATERIALIZED CTE for filtered store (s_state = 'OH')
+        [+] item_cte: MATERIALIZED CTE for filtered item (i_category = 'Music')
+        [+] cd_cte: MATERIALIZED CTE for filtered customer_demographics (gender='M', marital='W', education='Secondary')
+    [~] JOIN order: Reorder to put smallest filtered CTEs first (store → date → item → cd → store_sales)
+        [~] Use hash joins enabled, nested loops discouraged
+    [~] Aggregation: Direct GROUP BY ROLLUP on joined result
+    [=] ORDER BY and LIMIT preserved
+    [+] Runtime configuration: Enable parallel workers, adjust work_mem for hash joins
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "comma_join_conversion", "description": "Convert implicit comma-joins to explicit JOIN...ON syntax", "applied_to": ["main_query"]},
+    {"id": "R2", "type": "dimension_prefetch_materialized", "description": "Pre-filter selective dimensions into MATERIALIZED CTEs to create tiny hash tables", "applied_to": ["date_cte", "store_cte", "item_cte", "cd_cte"]},
+    {"id": "R3", "type": "join_reorder_small_first", "description": "Reorder joins to put smallest filtered CTEs first, enabling hash join optimization", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "store_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_store_sk, s_state FROM store WHERE s_state = 'OH'",
+        "interfaces": {"outputs": ["s_store_sk", "s_state"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_category = 'Music'",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "cd_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'W' AND cd_education_status = 'Secondary'",
+        "interfaces": {"outputs": ["cd_demo_sk"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_id, s_state, grouping(s_state) g_state, avg(ss_quantity) agg1, avg(ss_list_price) agg2, avg(ss_coupon_amt) agg3, avg(ss_sales_price) agg4 FROM store_cte INNER JOIN store_sales ON store_sales.ss_store_sk = store_cte.s_store_sk INNER JOIN date_cte ON store_sales.ss_sold_date_sk = date_cte.d_date_sk INNER JOIN item_cte ON store_sales.ss_item_sk = item_cte.i_item_sk INNER JOIN cd_cte ON store_sales.ss_cdemo_sk = cd_cte.cd_demo_sk GROUP BY ROLLUP (i_item_id, s_state) ORDER BY i_item_id, s_state LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"], "consumes": ["date_cte", "store_cte", "item_cte", "cd_cte"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "store_cte", "item_cte", "cd_cte", "main_query"],
+    "assembly_template": "WITH date_cte AS MATERIALIZED ({date_cte}), store_cte AS MATERIALIZED ({store_cte}), item_cte AS MATERIALIZED ({item_cte}), cd_cte AS MATERIALIZED ({cd_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL enable_nestloop = off", "SET LOCAL max_parallel_workers_per_gather = 4", "SET LOCAL work_mem = '64MB'"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Converted comma-joins to explicit JOIN syntax with MATERIALIZED CTEs for selective dimensions, reordered joins to put smallest CTEs first, and configured planner to favor hash joins over nested loops.
+
+**Expected speedup**: 2.5x–3.0x. The combination of explicit JOIN syntax with MATERIALIZED CTEs addresses PostgreSQL's comma-join weakness, while the CTE materialization creates tiny hash tables that can be joined efficiently. The runtime configuration nudges the planner toward parallel hash joins instead of nested-loop probing.

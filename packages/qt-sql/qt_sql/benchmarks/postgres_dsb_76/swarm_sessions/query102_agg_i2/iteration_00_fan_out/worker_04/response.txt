@@ -1,0 +1,94 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE-based)
+├── [MAIN] main_query [!]  Cost: 100%  Rows: 0
+│   ├── [CTE] dim_item [+]  (Materialized CTE for item dimension)
+│   ├── [CTE] dim_customer [+]  (Materialized CTE for customer dimension)
+│   ├── [CTE] dim_date_1998 [+]  (Materialized CTE for 1998 dates)
+│   ├── [CTE] consolidated_facts [+]  (Union of store/web sales with dimension joins)
+│   ├── [CTE] pivoted_joins [+]  (Self-join for store/web pairs with inventory/warehouse constraints)
+│   ├── [AGG] final_aggregation [+]  (Count by demographics)
+│   └── [SORT] ORDER BY cnt ASC
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL v16.11-0ubuntu0.24.04.1",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "dimension_prefetch_cte",
+      "description": "Materialize selective dimensions (item, customer, date) into CTEs for better selectivity estimates",
+      "applied_to": ["dim_item", "dim_customer", "dim_date_1998"]
+    },
+    {
+      "id": "R2",
+      "type": "fact_consolidation",
+      "description": "Unify store_sales and filtered web_sales into single UNION ALL with channel discriminator",
+      "applied_to": ["consolidated_facts"]
+    },
+    {
+      "id": "R3",
+      "type": "self_join_pivot",
+      "description": "Replace multi-table comma joins with explicit self-join on item/customer keys between store and web channels",
+      "applied_to": ["pivoted_joins"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "dim_item": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk FROM item WHERE i_category IN ('Men', 'Shoes', 'Sports') AND i_manager_id IN (6, 11, 16, 17, 19, 28, 47, 82, 88, 98)",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "dim_customer": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_customer_sk, cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count FROM customer JOIN customer_address ON c_current_addr_sk = ca_address_sk JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk WHERE ca_state IN ('AR', 'CA', 'KS', 'NY', 'VA')",
+        "interfaces": {"outputs": ["c_customer_sk", "cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count"], "consumes": []}
+      },
+      "dim_date_1998": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_year = 1998",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "consolidated_facts": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT sales.item_sk, sales.customer_sk, sales.sold_date_sk, sales.quantity, sales.channel, sales.warehouse_sk, dim_customer.cd_gender, dim_customer.cd_marital_status, dim_customer.cd_education_status, dim_customer.hd_vehicle_count, d1.d_date AS store_date FROM (SELECT ss_item_sk AS item_sk, ss_customer_sk AS customer_sk, ss_sold_date_sk AS sold_date_sk, ss_quantity AS quantity, 'store' AS channel, CAST(NULL AS integer) AS warehouse_sk FROM store_sales UNION ALL SELECT ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk, CAST(NULL AS integer), 'web', ws_warehouse_sk FROM web_sales WHERE ws_wholesale_cost BETWEEN 76 AND 96) sales JOIN dim_item ON sales.item_sk = dim_item.i_item_sk JOIN dim_customer ON sales.customer_sk = dim_customer.c_customer_sk LEFT JOIN dim_date_1998 d1 ON sales.channel = 'store' AND sales.sold_date_sk = d1.d_date_sk WHERE (sales.channel = 'store') OR (sales.channel = 'web')",
+        "interfaces": {"outputs": ["item_sk", "customer_sk", "sold_date_sk", "quantity", "channel", "warehouse_sk", "cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count", "store_date"], "consumes": ["dim_item", "dim_customer", "dim_date_1998"]}
+      },
+      "pivoted_joins": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT store.cd_gender, store.cd_marital_status, store.cd_education_status, store.hd_vehicle_count FROM consolidated_facts store JOIN consolidated_facts web ON store.item_sk = web.item_sk AND store.customer_sk = web.customer_sk AND web.channel = 'web' JOIN date_dim d2 ON web.sold_date_sk = d2.d_date_sk JOIN warehouse ON web.warehouse_sk = w_warehouse_sk JOIN store_table ON s_state = w_state JOIN inventory ON inv_warehouse_sk = web.warehouse_sk AND inv_item_sk = store.item_sk AND inv_date_sk = store.sold_date_sk WHERE store.channel = 'store' AND d2.d_date BETWEEN store.store_date AND (store.store_date + INTERVAL '30 day') AND inv_quantity_on_hand >= store.quantity",
+        "interfaces": {"outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count"], "consumes": ["consolidated_facts"]}
+      },
+      "final_aggregation": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, COUNT(*) AS cnt FROM pivoted_joins GROUP BY cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count ORDER BY cnt",
+        "interfaces": {"outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count", "cnt"], "consumes": ["pivoted_joins"]}
+      }
+    },
+    "reconstruction_order": ["dim_item", "dim_customer", "dim_date_1998", "consolidated_facts", "pivoted_joins", "final_aggregation"],
+    "assembly_template": "WITH dim_item AS ({dim_item}), dim_customer AS ({dim_customer}), dim_date_1998 AS ({dim_date_1998}), consolidated_facts AS ({consolidated_facts}), pivoted_joins AS ({pivoted_joins}) {final_aggregation}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced original multi-table comma joins with explicit CTE-based structure. The three dimensions (item, customer, 1998 dates) are pre-filtered into small hash tables. Store and web sales are unified with a UNION ALL, then self-joined on item/customer keys to find pairs where the same customer bought the same item through both channels within 30 days. Inventory and warehouse constraints are applied in the pivoted_joins CTE.
+
+**Expected speedup**: Moderate (2-3x) due to better dimension filtering and elimination of cross-CTE predicate blindness. However, the self-join on consolidated_facts could still be expensive if not properly indexed. The rewrite enables parallel scans of store_sales and web_sales (avoiding CTE materialization on the large fact tables).

@@ -28,10 +28,13 @@ class Candidate:
     style: Optional[str] = None
     error: Optional[str] = None
     set_local_commands: list[str] = None
+    interface_warnings: list[str] = None
 
     def __post_init__(self):
         if self.set_local_commands is None:
             self.set_local_commands = []
+        if self.interface_warnings is None:
+            self.interface_warnings = []
 
 
 class CandidateGenerator:
@@ -187,6 +190,7 @@ class CandidateGenerator:
                 transforms=transforms,
                 error=result.error if not result.success else None,
                 set_local_commands=result.set_local_commands,
+                interface_warnings=result.warnings,
             )
 
         except Exception as e:

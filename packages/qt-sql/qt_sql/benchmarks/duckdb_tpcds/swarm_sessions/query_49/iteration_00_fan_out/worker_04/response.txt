@@ -1,0 +1,91 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~100
+    ├── [~] CTE: filtered_dates [new - isolates date filter]
+    │   └── SCAN date_dim WHERE d_year=1999 AND d_moy=12
+    ├── [~] CTE: all_sales_returns [consolidated UNION ALL with date join]
+    │   ├── UNION ALL 3 branches (web, catalog, store)
+    │   │   ├── [~] web: web_sales LEFT JOIN web_returns with return_amt>10000 filter
+    │   │   ├── [~] catalog: catalog_sales LEFT JOIN catalog_returns with return_amt>10000 filter  
+    │   │   ├── [~] store: store_sales LEFT JOIN store_returns with return_amt>10000 filter
+    │   └── INNER JOIN filtered_dates ON sold_date_sk = d_date_sk
+    │   └── FILTER (channel-specific net_profit>1 AND net_paid>0 AND quantity>0)
+    ├── [~] CTE: channel_aggregates [GROUP BY channel, item_sk with COALESCE aggregates]
+    │   └── AGG (GROUP BY channel, item_sk)
+    ├── [~] CTE: channel_ranks [compute ratios and window ranks per channel]
+    │   ├── COMPUTE return_ratio, currency_ratio
+    │   ├── WINDOW return_rank PARTITION BY channel ORDER BY return_ratio
+    │   └── WINDOW currency_rank PARTITION BY channel ORDER BY currency_ratio
+    ├── [~] CTE: filter_ranks [WHERE return_rank≤10 OR currency_rank≤10]
+    │   └── FILTER (return_rank <= 10 OR currency_rank <= 10)
+    └── [~] ORDER BY 1,4,5,2 LIMIT 100
+        └── OUTPUT (channel, item, return_ratio, return_rank, currency_rank)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "cte_consolidation", "description": "Consolidated three separate channel queries into single UNION ALL with shared date_dim CTE", "applied_to": ["filtered_dates", "all_sales_returns"]},
+    {"id": "R2", "type": "single_pass_aggregation", "description": "Moved per-channel aggregation to single GROUP BY after UNION, eliminating duplicate aggregation logic", "applied_to": ["channel_aggregates"]},
+    {"id": "R3", "type": "window_consolidation", "description": "Applied window functions once over consolidated aggregates instead of per-channel subqueries", "applied_to": ["channel_ranks"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy = 12",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "all_sales_returns": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT channel, item_sk, order_number, ticket_number, quantity, net_paid, return_quantity, return_amt FROM (SELECT 'web' AS channel, ws_item_sk AS item_sk, ws_order_number AS order_number, ws_quantity AS quantity, ws_net_paid AS net_paid, ws_sold_date_sk AS sold_date_sk, NULL AS ticket_number, wr_return_quantity AS return_quantity, wr_return_amt AS return_amt FROM web_sales LEFT JOIN web_returns ON ws_order_number = wr_order_number AND ws_item_sk = wr_item_sk WHERE (wr_return_amt > 10000 OR wr_return_amt IS NULL) AND ws_net_profit > 1 AND ws_net_paid > 0 AND ws_quantity > 0 UNION ALL SELECT 'catalog' AS channel, cs_item_sk AS item_sk, cs_order_number AS order_number, cs_quantity AS quantity, cs_net_paid AS net_paid, cs_sold_date_sk AS sold_date_sk, NULL AS ticket_number, cr_return_quantity AS return_quantity, cr_return_amount AS return_amt FROM catalog_sales LEFT JOIN catalog_returns ON cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk WHERE (cr_return_amount > 10000 OR cr_return_amount IS NULL) AND cs_net_profit > 1 AND cs_net_paid > 0 AND cs_quantity > 0 UNION ALL SELECT 'store' AS channel, ss_item_sk AS item_sk, NULL AS order_number, ss_quantity AS quantity, ss_net_paid AS net_paid, ss_sold_date_sk AS sold_date_sk, ss_ticket_number AS ticket_number, sr_return_quantity AS return_quantity, sr_return_amt AS return_amt FROM store_sales LEFT JOIN store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk WHERE (sr_return_amt > 10000 OR sr_return_amt IS NULL) AND ss_net_profit > 1 AND ss_net_paid > 0 AND ss_quantity > 0) all_data INNER JOIN filtered_dates fd ON all_data.sold_date_sk = fd.d_date_sk",
+        "interfaces": {"outputs": ["channel", "item_sk", "order_number", "ticket_number", "quantity", "net_paid", "return_quantity", "return_amt"], "consumes": ["filtered_dates"]}
+      },
+      "channel_aggregates": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT channel, item_sk, SUM(COALESCE(return_quantity, 0)) AS sum_return_qty, SUM(COALESCE(quantity, 0)) AS sum_qty, SUM(COALESCE(return_amt, 0)) AS sum_return_amt, SUM(COALESCE(net_paid, 0)) AS sum_net_paid FROM all_sales_returns GROUP BY channel, item_sk",
+        "interfaces": {"outputs": ["channel", "item_sk", "sum_return_qty", "sum_qty", "sum_return_amt", "sum_net_paid"], "consumes": ["all_sales_returns"]}
+      },
+      "channel_ranks": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT channel, item_sk AS item, CAST(sum_return_qty AS DECIMAL(15,4)) / CAST(sum_qty AS DECIMAL(15,4)) AS return_ratio, RANK() OVER (PARTITION BY channel ORDER BY CAST(sum_return_qty AS DECIMAL(15,4)) / CAST(sum_qty AS DECIMAL(15,4))) AS return_rank, RANK() OVER (PARTITION BY channel ORDER BY CAST(sum_return_amt AS DECIMAL(15,4)) / CAST(sum_net_paid AS DECIMAL(15,4))) AS currency_rank FROM channel_aggregates",
+        "interfaces": {"outputs": ["channel", "item", "return_ratio", "return_rank", "currency_rank"], "consumes": ["channel_aggregates"]}
+      },
+      "filter_ranks": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT channel, item, return_ratio, return_rank, currency_rank FROM channel_ranks WHERE return_rank <= 10 OR currency_rank <= 10",
+        "interfaces": {"outputs": ["channel", "item", "return_ratio", "return_rank", "currency_rank"], "consumes": ["channel_ranks"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT channel, item, return_ratio, return_rank, currency_rank FROM filter_ranks ORDER BY 1, 4, 5, 2 LIMIT 100",
+        "interfaces": {"outputs": ["channel", "item", "return_ratio", "return_rank", "currency_rank"], "consumes": ["filter_ranks"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "all_sales_returns", "channel_aggregates", "channel_ranks", "filter_ranks", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), all_sales_returns AS ({all_sales_returns}), channel_aggregates AS ({channel_aggregates}), channel_ranks AS ({channel_ranks}), filter_ranks AS ({filter_ranks}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Changes
+Consolidated three separate channel queries (web, catalog, store) into a single UNION ALL with shared date_dim CTE, moving per-channel aggregation and ranking to operate on the combined dataset. This eliminates 3 separate date_dim scans and redundant aggregation logic while preserving exact semantics including LEFT JOIN behavior with return amount filters.
+
+**Expected speedup:** 3-5x due to elimination of duplicate date_dim scans and consolidated single-pass aggregation over UNION ALL data.

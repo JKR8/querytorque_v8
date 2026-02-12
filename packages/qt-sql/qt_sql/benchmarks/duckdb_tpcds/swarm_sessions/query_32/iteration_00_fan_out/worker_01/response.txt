@@ -1,0 +1,74 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Replaced correlated subquery with window function, consolidated scans into CTE structure.
+    ├── CTE filtered_dates  [+]  Scan date_dim with date window
+    ├── CTE filtered_items  [+]  Scan item with manufacturer filter
+    ├── CTE consolidated_sales  [~]  Single catalog_sales scan with window function
+    │   ├── JOIN filtered_dates (INNER)
+    │   ├── JOIN filtered_items (INNER)
+    │   ├── WINDOW AVG(cs_ext_discount_amt) PARTITION BY cs_item_sk
+    │   └── OUTPUT: cs_item_sk, cs_sold_date_sk, cs_ext_discount_amt, item_avg_discount
+    └── CTE final_aggregation  [~]  Filter and aggregate from consolidated_sales
+        ├── FILTER (cs_ext_discount_amt > 1.3 * item_avg_discount)
+        └── AGGREGATE: SUM(cs_ext_discount_amt) AS "excess discount amount"
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_aggregation", "description": "Replaced correlated subquery with window function to compute per-item average in same scan", "applied_to": ["consolidated_sales"]},
+    {"id": "R2", "type": "pushdown", "description": "Consolidated two catalog_sales scans (outer + subquery) into one CTE with filtered joins", "applied_to": ["consolidated_sales"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN DATE '1999-01-07' AND (DATE '1999-01-07' + INTERVAL 90 DAY)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_items": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk FROM item WHERE i_manufact_id = 29",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "consolidated_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cs.cs_item_sk, cs.cs_sold_date_sk, cs.cs_ext_discount_amt, AVG(cs.cs_ext_discount_amt) OVER (PARTITION BY cs.cs_item_sk) AS item_avg_discount FROM catalog_sales cs INNER JOIN filtered_dates d ON cs.cs_sold_date_sk = d.d_date_sk INNER JOIN filtered_items i ON cs.cs_item_sk = i.i_item_sk",
+        "interfaces": {"outputs": ["cs_item_sk", "cs_sold_date_sk", "cs_ext_discount_amt", "item_avg_discount"], "consumes": ["filtered_dates", "filtered_items"]}
+      },
+      "final_aggregation": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT SUM(cs_ext_discount_amt) AS \"excess discount amount\" FROM consolidated_sales WHERE cs_ext_discount_amt > 1.3 * item_avg_discount",
+        "interfaces": {"outputs": ["excess discount amount"], "consumes": ["consolidated_sales"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT \"excess discount amount\" FROM final_aggregation LIMIT 100",
+        "interfaces": {"outputs": ["excess discount amount"], "consumes": ["final_aggregation"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_items", "consolidated_sales", "final_aggregation", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), filtered_items AS ({filtered_items}), consolidated_sales AS ({consolidated_sales}), final_aggregation AS ({final_aggregation}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Replaced the correlated subquery with a window function that computes per-item average discount within the same date-manufacturer filtered scan, eliminating duplicate catalog_sales scans.
+
+Expected speedup: ~2-4x from eliminating the second catalog_sales scan and enabling single-pass computation of the per-item average via window function.

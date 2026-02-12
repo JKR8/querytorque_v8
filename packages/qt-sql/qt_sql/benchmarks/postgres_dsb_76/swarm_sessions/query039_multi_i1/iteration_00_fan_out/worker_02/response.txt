@@ -1,0 +1,80 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] base_scan_agg [+]  (was part of original 'inv' CTE, now separated)
+│   ├── SCAN (inventory, item, warehouse, date_dim) [=]
+│   ├── JOIN (implicit, inv_item_sk = i_item_sk) [=]
+│   ├── JOIN (implicit, inv_warehouse_sk = w_warehouse_sk) [=]
+│   ├── JOIN (implicit, inv_date_sk = d_date_sk) [=]
+│   ├── FILTER (d_year = 2002, i_category IN ('Jewelry','Men'), i_manager_id 81-100, inv_quantity_on_hand 0-200) [=]
+│   ├── AGG (GROUP BY w_warehouse_sk, w_warehouse_name, i_item_sk, d_moy) [~] (no covariance filter)
+│   └── OUTPUT (w_warehouse_sk, w_warehouse_name, i_item_sk, d_moy, stdev, mean)
+├── [CTE] month2_cte [+]  (replaces filter within original CTE)
+│   ├── SCAN (base_scan_agg) [=]
+│   ├── FILTER (d_moy = 2 AND CASE mean WHEN 0 THEN 0 ELSE stdev/mean END > 1) [~] (moved from main query)
+│   └── OUTPUT (w_warehouse_sk, w_warehouse_name, i_item_sk, d_moy, stdev, mean, cov)
+├── [CTE] month3_cte [+]  (replaces filter within original CTE)
+│   ├── SCAN (base_scan_agg) [=]
+│   ├── FILTER (d_moy = 3 AND CASE mean WHEN 0 THEN 0 ELSE stdev/mean END > 1) [~] (moved from main query)
+│   └── OUTPUT (w_warehouse_sk, w_warehouse_name, i_item_sk, d_moy, stdev, mean, cov)
+└── [MAIN] joined_months_main [~]
+    ├── SCAN (month2_cte AS inv1, month3_cte AS inv2) [~] (was 'inv' CTE)
+    ├── JOIN (inv1.i_item_sk = inv2.i_item_sk AND inv1.w_warehouse_sk = inv2.w_warehouse_sk) [=]
+    ├── FILTER (removed: inv1.d_moy=2, inv2.d_moy=2+1) [-] (now in CTEs)
+    ├── SORT (ORDER BY inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, inv2.d_moy, inv2.mean, inv2.cov) [=]
+    └── OUTPUT (inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov) [=]
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL 16.11",
+  "rewrite_rules": [
+    {"id": "R1", "type": "shared_materialization", "description": "Separate base aggregation from month filtering into distinct CTEs", "applied_to": ["base_scan_agg", "month2_cte", "month3_cte"]},
+    {"id": "R2", "type": "predicate_pushdown", "description": "Move month filters (d_moy=2, d_moy=3) and covariance filter from main query into respective CTEs", "applied_to": ["month2_cte", "month3_cte", "joined_months_main"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "base_scan_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT w_warehouse_sk, w_warehouse_name, i_item_sk, d_moy, STDDEV_SAMP(inv_quantity_on_hand) AS stdev, AVG(inv_quantity_on_hand) AS mean FROM inventory, item, warehouse, date_dim WHERE inv_item_sk = i_item_sk AND inv_warehouse_sk = w_warehouse_sk AND inv_date_sk = d_date_sk AND d_year = 2002 AND i_category IN ('Jewelry', 'Men') AND i_manager_id BETWEEN 81 AND 100 AND inv_quantity_on_hand BETWEEN 0 AND 200 GROUP BY w_warehouse_sk, w_warehouse_name, i_item_sk, d_moy",
+        "interfaces": {"outputs": ["w_warehouse_sk", "w_warehouse_name", "i_item_sk", "d_moy", "stdev", "mean"], "consumes": []}
+      },
+      "month2_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT w_warehouse_sk, w_warehouse_name, i_item_sk, d_moy, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END AS cov FROM base_scan_agg WHERE d_moy = 2 AND CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1",
+        "interfaces": {"outputs": ["w_warehouse_sk", "w_warehouse_name", "i_item_sk", "d_moy", "stdev", "mean", "cov"], "consumes": ["base_scan_agg"]}
+      },
+      "month3_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT w_warehouse_sk, w_warehouse_name, i_item_sk, d_moy, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END AS cov FROM base_scan_agg WHERE d_moy = 3 AND CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1",
+        "interfaces": {"outputs": ["w_warehouse_sk", "w_warehouse_name", "i_item_sk", "d_moy", "stdev", "mean", "cov"], "consumes": ["base_scan_agg"]}
+      },
+      "joined_months_main": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov FROM month2_cte AS inv1, month3_cte AS inv2 WHERE inv1.i_item_sk = inv2.i_item_sk AND inv1.w_warehouse_sk = inv2.w_warehouse_sk ORDER BY inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, inv2.d_moy, inv2.mean, inv2.cov",
+        "interfaces": {"outputs": ["inv1.w_warehouse_sk", "inv1.i_item_sk", "inv1.d_moy", "inv1.mean", "inv1.cov", "inv2.w_warehouse_sk", "inv2.i_item_sk", "inv2.d_moy", "inv2.mean", "inv2.cov"], "consumes": ["month2_cte", "month3_cte"]}
+      }
+    },
+    "reconstruction_order": ["base_scan_agg", "month2_cte", "month3_cte", "joined_months_main"],
+    "assembly_template": "WITH base_scan_agg AS ({base_scan_agg}), month2_cte AS ({month2_cte}), month3_cte AS ({month3_cte}) {joined_months_main}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured the original CTE into three CTEs: `base_scan_agg` computes aggregates for all months, `month2_cte` and `month3_cte` filter to specific months and apply covariance filter. This eliminates redundant scanning of the base tables for each month and moves month filtering earlier in the pipeline.
+
+**Expected speedup**: 2-3x by computing base aggregates once instead of twice, reducing I/O and computation for months not needed.

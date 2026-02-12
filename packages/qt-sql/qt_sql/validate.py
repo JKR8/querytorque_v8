@@ -28,6 +28,7 @@ class OriginalBaseline:
     row_count: int
     rows: Optional[List[Any]] = None
     checksum: Optional[str] = None
+    explain_text: Optional[str] = None  # EXPLAIN ANALYZE plan text for original query
 
 
 def categorize_error(error_msg: str) -> str:
@@ -267,11 +268,15 @@ def race_candidates(
         return None
 
     # ── Build baseline for snipe reuse ────────────────────────────────
+    # Collect EXPLAIN ANALYZE on original (after race, non-blocking)
+    original_explain = _collect_explain_text(db_path, original_sql)
+
     baseline = OriginalBaseline(
         measured_time_ms=original_lane.elapsed_ms,
         row_count=original_lane.row_count,
         rows=None,
         checksum=None,
+        explain_text=original_explain,
     )
 
     # ── Score each candidate ──────────────────────────────────────────
@@ -379,6 +384,31 @@ def cost_rank_candidates(
     except Exception as e:
         logger.warning(f"Cost ranking failed, returning all: {e}")
         return list(range(len(candidate_sqls)))
+
+
+def _collect_explain_text(db_path: str, sql: str) -> Optional[str]:
+    """Collect EXPLAIN ANALYZE plan text for a query. Never raises.
+
+    Returns plan text string or None if collection fails.
+    Used after timing runs to capture execution plan without affecting benchmarks.
+    """
+    try:
+        from .execution.database_utils import run_explain_analyze
+        result = run_explain_analyze(db_path, sql)
+        if not result:
+            return None
+        plan_text = result.get("plan_text")
+        if plan_text:
+            return plan_text
+        # Fall back to building text from JSON plan
+        plan_json = result.get("plan_json")
+        if plan_json:
+            from .execution.database_utils import _plan_to_text
+            return _plan_to_text(plan_json)
+        return None
+    except Exception as e:
+        logger.debug(f"EXPLAIN collection failed (non-fatal): {e}")
+        return None
 
 
 class Validator:
@@ -545,10 +575,14 @@ class Validator:
                 avg_ms = (t1 + t2) / 2
                 logger.info(f"Baseline (PG): {avg_ms:.1f}ms ({len(rows)} rows)")
 
+                # Collect EXPLAIN ANALYZE (non-blocking, after timing)
+                explain_text = _collect_explain_text(self.sample_db, original_sql)
+
                 return OriginalBaseline(
                     measured_time_ms=avg_ms,
                     row_count=len(rows),
                     rows=rows,
+                    explain_text=explain_text,
                 )
             except Exception as e:
                 # Timeout or error — create timeout baseline
@@ -590,11 +624,15 @@ class Validator:
                 f"({result.row_count} rows)"
             )
 
+            # Collect EXPLAIN ANALYZE (non-blocking, after timing)
+            explain_text = _collect_explain_text(self.sample_db, original_sql)
+
             return OriginalBaseline(
                 measured_time_ms=result.timing.measured_time_ms,
                 row_count=result.row_count,
                 rows=result.rows,
                 checksum=checksum,
+                explain_text=explain_text,
             )
 
     def validate_against_baseline(
@@ -737,6 +775,11 @@ class Validator:
         error_msg = " | ".join(errors) if errors else None
         error_category = categorize_error(errors[0]) if errors else None
 
+        # Collect EXPLAIN ANALYZE on candidate (non-blocking, after timing)
+        candidate_explain = None
+        if ado_status == ValidationStatus.PASS:
+            candidate_explain = _collect_explain_text(self.sample_db, candidate_sql)
+
         return ValidationResult(
             worker_id=worker_id,
             status=ado_status,
@@ -745,6 +788,7 @@ class Validator:
             optimized_sql=candidate_sql,
             errors=errors,
             error_category=error_category,
+            explain_plan=candidate_explain,
         )
 
     def _validate_against_baseline_pg(
@@ -819,6 +863,11 @@ class Validator:
         error_msg = " | ".join(errors) if errors else None
         error_category = categorize_error(errors[0]) if errors else None
 
+        # Collect EXPLAIN ANALYZE on candidate (non-blocking, after timing)
+        candidate_explain = None
+        if ado_status == ValidationStatus.PASS:
+            candidate_explain = _collect_explain_text(self.sample_db, candidate_sql)
+
         return ValidationResult(
             worker_id=worker_id,
             status=ado_status,
@@ -827,6 +876,7 @@ class Validator:
             optimized_sql=candidate_sql,
             errors=errors,
             error_category=error_category,
+            explain_plan=candidate_explain,
         )
 
     def validate_with_config(

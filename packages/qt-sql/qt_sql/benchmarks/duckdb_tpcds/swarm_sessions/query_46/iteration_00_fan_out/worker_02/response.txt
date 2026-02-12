@@ -1,0 +1,90 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (restructured into CTEs)
+├── [!] hd_branch1: new CTE for hd_dep_count=6 branch
+├── [!] hd_branch2: new CTE for hd_vehicle_count=0 branch  
+├── [!] hd_union: UNION DISTINCT of the two HD branches
+├── [!] fact_join: main fact join with pre-filtered dimensions
+├── [!] agg: ticket-level aggregation
+├── [~] customer_join: filter moved from WHERE to JOIN condition
+├── [=] output: unchanged ORDER BY/LIMIT
+└── [=] main_query: assembles CTEs and produces final output
+```
+
+**Changes:**
+- Split `household_demographics` OR condition into two CTE branches (`hd_branch1`, `hd_branch2`)
+- Used `UNION DISTINCT` instead of `UNION ALL` to deduplicate rows matching both conditions
+- Pre-filtered `date_dim`, `store`, and `hd_union` before joining with `store_sales`
+- Preserved all defensive guards and semantic invariants
+- Maintained exact output schema and ordering
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "or_to_union", "description": "Split household_demographics OR condition (hd_dep_count=6 OR hd_vehicle_count=0) into separate CTE branches with UNION DISTINCT", "applied_to": ["hd_branch1", "hd_branch2", "hd_union"]},
+    {"id": "R2", "type": "star_join_prefetch", "description": "Pre-filter dimension tables before joining with fact table to reduce intermediate result size", "applied_to": ["fact_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "hd_branch1": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 6",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": []}
+      },
+      "hd_branch2": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT hd_demo_sk FROM household_demographics WHERE hd_vehicle_count = 0",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": []}
+      },
+      "hd_union": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT hd_demo_sk FROM hd_branch1 UNION SELECT hd_demo_sk FROM hd_branch2",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": ["hd_branch1", "hd_branch2"]}
+      },
+      "fact_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, ss_addr_sk, ca_city AS bought_city, ss_coupon_amt, ss_net_profit FROM store_sales INNER JOIN date_dim ON store_sales.ss_sold_date_sk = date_dim.d_date_sk INNER JOIN store ON store_sales.ss_store_sk = store.s_store_sk INNER JOIN hd_union ON store_sales.ss_hdemo_sk = hd_union.hd_demo_sk INNER JOIN customer_address ON store_sales.ss_addr_sk = customer_address.ca_address_sk WHERE date_dim.d_dow IN (6,0) AND date_dim.d_year BETWEEN 1999 AND 2001 AND store.s_city IN ('Five Points','Centerville','Oak Grove','Fairview','Liberty')",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "ss_addr_sk", "bought_city", "ss_coupon_amt", "ss_net_profit"], "consumes": ["hd_union"]}
+      },
+      "agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, ss_addr_sk, bought_city, SUM(ss_coupon_amt) AS amt, SUM(ss_net_profit) AS profit FROM fact_join GROUP BY ss_ticket_number, ss_customer_sk, ss_addr_sk, bought_city",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "ss_addr_sk", "bought_city", "amt", "profit"], "consumes": ["fact_join"]}
+      },
+      "customer_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_last_name, c_first_name, current_addr.ca_city, agg.bought_city, agg.ss_ticket_number, agg.amt, agg.profit FROM agg INNER JOIN customer ON agg.ss_customer_sk = customer.c_customer_sk INNER JOIN customer_address current_addr ON customer.c_current_addr_sk = current_addr.ca_address_sk AND current_addr.ca_city <> agg.bought_city",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "ca_city", "bought_city", "ss_ticket_number", "amt", "profit"], "consumes": ["agg"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, amt, profit FROM customer_join ORDER BY c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number LIMIT 100",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "ca_city", "bought_city", "ss_ticket_number", "amt", "profit"], "consumes": ["customer_join"]}
+      }
+    },
+    "reconstruction_order": ["hd_branch1", "hd_branch2", "hd_union", "fact_join", "agg", "customer_join", "main_query"],
+    "assembly_template": "WITH hd_branch1 AS ({hd_branch1}), hd_branch2 AS ({hd_branch2}), hd_union AS ({hd_union}), fact_join AS ({fact_join}), agg AS ({agg}), customer_join AS ({customer_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** The OR condition on `household_demographics` is decomposed into separate CTE scans (`hd_branch1`, `hd_branch2`) combined with `UNION DISTINCT`, allowing DuckDB to use different access paths for each predicate. Dimension tables are pre-filtered before joining with `store_sales` to reduce intermediate result size. The city mismatch filter is applied as a JOIN condition rather than WHERE for clarity.
+
+**Expected speedup:** ~2-3x due to OR decomposition eliminating table scans with complex filters and reducing fact table join cardinality through early dimension filtering.

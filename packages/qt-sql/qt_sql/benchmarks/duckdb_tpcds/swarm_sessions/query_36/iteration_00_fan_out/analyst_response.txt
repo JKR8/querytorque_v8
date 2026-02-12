@@ -1,0 +1,359 @@
+<reasoning>
+CLASSIFY:
+This is a star-join aggregation query with ROLLUP and window ranking. It joins a large fact table (store_sales) with three dimension tables (date_dim, store, item) using foreign key joins, filters on date year and store state, then computes gross margin aggregates grouped by item category/class hierarchy with ROLLUP, and finally ranks within each hierarchy level.
+
+EXPLAIN PLAN ANALYSIS:
+- Total time: 1292ms
+- Largest cost nodes:
+  1. HASH_JOIN INNER on i_item_sk = ss_item_sk: 558.5ms (43%) - processes 5.3M rows
+  2. SEQ_SCAN store_sales: 335.5ms (26%) - reads 5.4M of 345.6M rows
+  3. HASH_GROUP_BY: 273.1ms (21%) - aggregates 5.3M rows to 164 rows
+  4. HASH_JOIN INNER on ss_sold_date_sk = d_date_sk: 58.0ms (4%)
+  5. HASH_JOIN INNER on ss_store_sk = s_store_sk: 40.7ms (3%)
+
+Cardinality flow:
+- date_dim: 73K → 365 rows (d_year=2002 filter)
+- store: 102 → 101 rows (state filter + s_store_sk≤100)
+- store_sales: 345.6M → 5.4M rows (after date+store joins)
+- item: 102K rows (full scan)
+- After item join: 5.3M rows
+- After aggregation: 164 rows
+
+Optimizer already handles:
+- Predicate pushdown into scans (date_dim filter, store filter)
+- Hash join selection and ordering (date→store→item)
+- Columnar projection (only needed columns)
+- Single pass through store_sales
+
+Gap matching:
+1. CROSS_CTE_PREDICATE_BLINDNESS: The optimizer joins dimensions sequentially but doesn't push aggregation below joins. Pre-filtering dimensions into CTEs could reduce fact table scan size.
+2. REDUNDANT_SCAN_ELIMINATION: Only one store_sales scan, so no redundant scans to eliminate.
+3. UNION_CTE_SELF_JOIN_DECOMPOSITION: ROLLUP creates implicit hierarchy levels that could be made explicit with UNION ALL for per-level optimization.
+4. AGGREGATION_TRAP: The query uses SUM/division, which are duplicate-insensitive. Pre-aggregation before joins is safe if we preserve grouping columns.
+
+AGGREGATION TRAP CHECK:
+- SUM(ss_net_profit) and SUM(ss_ext_sales_price) are duplicate-insensitive.
+- Division of sums is also duplicate-insensitive.
+- GROUP BY ROLLUP(i_category,i_class) - pre-aggregating by item key before joining with item is safe because each item has exactly one (i_category,i_class).
+- The window function RANK() uses the aggregate results, so pre-aggregation doesn't affect ranking.
+
+TRANSFORM SELECTION:
+1. **prefetch_fact_join** (tag-matched example): Pre-filter date and store into CTEs, pre-join with store_sales to reduce rows before item join. Attack: CROSS_CTE_PREDICATE_BLINDNESS.
+2. **rollup_to_union_windowing** (tag-matched example): Replace ROLLUP with explicit UNION ALL of hierarchy levels. Attack: UNION_CTE_SELF_JOIN_DECOMPOSITION.
+3. **dimension_cte_isolate**: Pre-filter all dimension tables (date, store, item) into CTEs before joining. Attack: CROSS_CTE_PREDICATE_BLINDNESS (different approach).
+4. **compound_preagg_union** (exploration): Combine pre-aggregation with explicit hierarchy levels for maximal reduction.
+
+Structural diversity: Each attacks different part - #1 reduces fact rows early, #2 restructures aggregation, #3 isolates dimensions, #4 combines techniques.
+
+LOGICAL TREE DESIGN:
+Verify column completeness for each CTE:
+- Need ss_item_sk for item join
+- Need i_category, i_class for grouping
+- Need ss_net_profit, ss_ext_sales_price for aggregation
+- Need d_date_sk, s_store_sk for joins
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Compute gross margin (sum of net profit / sum of extended sales price) for 2002 store sales in 8 selected states at category/class hierarchy levels, and rank classes within each hierarchy parent by ascending margin. All joins are INNER, requiring matches on all dimension tables. Aggregation uses SUM which is duplicate-insensitive, allowing safe pre-aggregation by item key. Filters on d_year and s_state must be preserved; changing join order must not affect filter application.
+
+BOTTLENECK_DIAGNOSIS: The query is join-bound and aggregation-bound. The hash join between item and the pre-joined fact table dominates (43%, 558.5ms) processing 5.3M rows. The store_sales scan (26%, 335.5ms) reads 5.4M of 345.6M rows after date+store filters. Aggregation (21%, 273.1ms) compresses 5.3M rows to 164. The optimizer already pushes predicates into scans and chooses efficient hash joins. Logical-tree costs are misleading - the item join is the true bottleneck despite being only 43% of exclusive time.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output gross_margin, i_category, i_class, lochierarchy, rank_within_parent.
+- CTE_COLUMN_COMPLETENESS: Each CTE must include all columns referenced downstream (especially ss_item_sk, i_category, i_class, aggregate sums).
+- LITERAL_PRESERVATION: Must use exact literals: d_year=2002, s_state IN ('SD','TN','GA','SC','MO','AL','MI','OH').
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows with identical ordering (lochierarchy DESC, case, rank_within_parent ASC).
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows sequential dimension joins; pre-filtering dimensions into CTEs could reduce fact scan earlier.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: ROLLUP creates implicit hierarchy levels that could be optimized separately.
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (regression_q67):
+   CAUSE: Materialized dimension filters into CTEs before ROLLUP aggregation with window functions, creating barriers that prevent optimizer pushdown.
+   RULE: Avoid creating CTE chains that block aggregation pushdown for ROLLUP+window queries.
+2. prefetch_fact_join (regression_q25):
+   CAUSE: Pre-filtered fact table before multi-way fact joins, losing optimizer's ability to reorder joins and push filters.
+   RULE: Avoid pre-joining fact tables when query has multiple fact table joins (not applicable here - single fact table).
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+filtered_date -> filtered_store -> fact_prejoin -> item_join -> rollup_agg -> window_rank -> final_sort
+
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 2002
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_prejoin
+
+  filtered_store:
+    FROM: store
+    WHERE: s_state IN ('SD','TN','GA','SC','MO','AL','MI','OH')
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 101
+    CONSUMERS: fact_prejoin
+
+  fact_prejoin:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+          INNER JOIN filtered_store ON ss_store_sk = s_store_sk
+    OUTPUT: ss_item_sk, ss_net_profit, ss_ext_sales_price
+    EXPECTED_ROWS: 5.4M
+    CONSUMERS: item_join
+
+  item_join:
+    FROM: fact_prejoin
+    JOIN: INNER JOIN item ON i_item_sk = ss_item_sk
+    OUTPUT: i_category, i_class, ss_net_profit, ss_ext_sales_price
+    EXPECTED_ROWS: 5.3M
+    CONSUMERS: rollup_agg
+
+  rollup_agg:
+    FROM: item_join
+    GROUP BY: ROLLUP(i_category, i_class)
+    AGGREGATE: SUM(ss_net_profit) as sum_net_profit, SUM(ss_ext_sales_price) as sum_sales_price
+    OUTPUT: i_category, i_class, GROUPING(i_category) as g_cat, GROUPING(i_class) as g_cls, sum_net_profit, sum_sales_price
+    EXPECTED_ROWS: 164
+    CONSUMERS: window_rank
+
+  window_rank:
+    FROM: rollup_agg
+    WINDOW: PARTITION BY (g_cat + g_cls), CASE WHEN g_cls = 0 THEN i_category END
+            ORDER BY (sum_net_profit / sum_sales_price) ASC
+    OUTPUT: (sum_net_profit / sum_sales_price) as gross_margin, i_category, i_class, (g_cat + g_cls) as lochierarchy,
+            RANK() OVER (partition by (g_cat + g_cls), case when g_cls = 0 then i_category end order by (sum_net_profit / sum_sales_price) asc) as rank_within_parent
+    EXPECTED_ROWS: 164
+    CONSUMERS: final_sort
+
+  final_sort:
+    FROM: window_rank
+    ORDER BY: lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category END, rank_within_parent
+    LIMIT: 100
+    OUTPUT: gross_margin, i_category, i_class, lochierarchy, rank_within_parent
+    EXPECTED_ROWS: 100
+    CONSUMERS: output
+
+EXAMPLES: prefetch_fact_join, date_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply staged join pipeline - filter dimensions first, pre-join with fact table, then join remaining dimensions. Ignore multi-fact table aspects.
+- date_cte_isolate: Extract date filter into CTE for early reduction. Ignore decomposition of existing CTEs.
+- early_filter: Filter small dimension tables first before fact join. Apply exactly as described.
+HAZARD_FLAGS:
+- Materializing fact_prejoin CTE may create optimization barrier for aggregation pushdown.
+- Must preserve all original join conditions and filters.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: rollup_to_union_windowing
+TARGET_LOGICAL_TREE:
+filtered_date -> filtered_store -> base_join -> level1_agg -> level2_agg -> level3_agg -> union_all -> window_rank -> final_sort
+
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 2002
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: base_join
+
+  filtered_store:
+    FROM: store
+    WHERE: s_state IN ('SD','TN','GA','SC','MO','AL','MI','OH')
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 101
+    CONSUMERS: base_join
+
+  base_join:
+    FROM: store_sales, filtered_date, filtered_store, item
+    JOIN: store_sales.ss_sold_date_sk = filtered_date.d_date_sk
+          AND store_sales.ss_store_sk = filtered_store.s_store_sk
+          AND store_sales.ss_item_sk = item.i_item_sk
+    OUTPUT: i_category, i_class, ss_net_profit, ss_ext_sales_price
+    EXPECTED_ROWS: 5.3M
+    CONSUMERS: level1_agg, level2_agg, level3_agg
+
+  level1_agg:
+    FROM: base_join
+    GROUP BY: i_category, i_class
+    AGGREGATE: SUM(ss_net_profit) as sum_net_profit, SUM(ss_ext_sales_price) as sum_sales_price
+    OUTPUT: i_category, i_class, 0 as lochierarchy, sum_net_profit, sum_sales_price
+    EXPECTED_ROWS: ~150
+    CONSUMERS: union_all
+
+  level2_agg:
+    FROM: base_join
+    GROUP BY: i_category
+    AGGREGATE: SUM(ss_net_profit) as sum_net_profit, SUM(ss_ext_sales_price) as sum_sales_price
+    OUTPUT: i_category, NULL as i_class, 1 as lochierarchy, sum_net_profit, sum_sales_price
+    EXPECTED_ROWS: ~10
+    CONSUMERS: union_all
+
+  level3_agg:
+    FROM: base_join
+    GROUP BY: (empty)
+    AGGREGATE: SUM(ss_net_profit) as sum_net_profit, SUM(ss_ext_sales_price) as sum_sales_price
+    OUTPUT: NULL as i_category, NULL as i_class, 2 as lochierarchy, sum_net_profit, sum_sales_price
+    EXPECTED_ROWS: 1
+    CONSUMERS: union_all
+
+  union_all:
+    FROM: level1_agg UNION ALL level2_agg UNION ALL level3_agg
+    OUTPUT: i_category, i_class, lochierarchy, sum_net_profit, sum_sales_price
+    EXPECTED_ROWS: 164
+    CONSUMERS: window_rank
+
+  window_rank:
+    FROM: union_all
+    WINDOW: PARTITION BY lochierarchy, CASE WHEN lochierarchy = 0 THEN i_category END
+            ORDER BY (sum_net_profit / sum_sales_price) ASC
+    OUTPUT: (sum_net_profit / sum_sales_price) as gross_margin, i_category, i_class, lochierarchy,
+            RANK() OVER (partition by lochierarchy, case when lochierarchy = 0 then i_category end order by (sum_net_profit / sum_sales_price) asc) as rank_within_parent
+    EXPECTED_ROWS: 164
+    CONSUMERS: final_sort
+
+  final_sort: (same as Worker 1)
+
+EXAMPLES: rollup_to_union_windowing, union_cte_split
+EXAMPLE_ADAPTATION:
+- rollup_to_union_windowing: Replace GROUP BY ROLLUP with explicit UNION ALL of pre-aggregated CTEs at each hierarchy level. Apply exactly.
+- union_cte_split: Split implicit ROLLUP into explicit levels. Ignore year-based splitting.
+HAZARD_FLAGS:
+- Triples store_sales scan if base_join is materialized (3 references).
+- Window function must handle NULL i_category/i_class correctly.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+filtered_date -> filtered_store -> filtered_item -> fact_join -> rollup_agg -> window_rank -> final_sort
+
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 2002
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_join
+
+  filtered_store:
+    FROM: store
+    WHERE: s_state IN ('SD','TN','GA','SC','MO','AL','MI','OH')
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 101
+    CONSUMERS: fact_join
+
+  filtered_item:
+    FROM: item
+    WHERE: (no filter - include all)
+    OUTPUT: i_item_sk, i_category, i_class
+    EXPECTED_ROWS: 102K
+    CONSUMERS: fact_join
+
+  fact_join:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+          INNER JOIN filtered_store ON ss_store_sk = s_store_sk
+          INNER JOIN filtered_item ON ss_item_sk = i_item_sk
+    OUTPUT: i_category, i_class, ss_net_profit, ss_ext_sales_price
+    EXPECTED_ROWS: 5.3M
+    CONSUMERS: rollup_agg
+
+  rollup_agg:
+    FROM: fact_join
+    GROUP BY: ROLLUP(i_category, i_class)
+    AGGREGATE: SUM(ss_net_profit) as sum_net_profit, SUM(ss_ext_sales_price) as sum_sales_price
+    OUTPUT: i_category, i_class, GROUPING(i_category) as g_cat, GROUPING(i_class) as g_cls, sum_net_profit, sum_sales_price
+    EXPECTED_ROWS: 164
+    CONSUMERS: window_rank
+
+  window_rank: (same as Worker 1)
+  final_sort: (same as Worker 1)
+
+EXAMPLES: dimension_cte_isolate, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Pre-filter ALL dimension tables into CTEs before joining with fact table. Apply exactly.
+- multi_dimension_prefetch: Pre-filter multiple dimension tables (date+store+item) into separate CTEs. Ignore unfiltered dimension warning - item has no filter but needed for columns.
+HAZARD_FLAGS:
+- Unfiltered item CTE adds materialization overhead (102K rows).
+- May block optimizer from pushing aggregation through joins.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_preagg_union
+TARGET_LOGICAL_TREE:
+filtered_date -> filtered_store -> fact_preagg -> item_join -> level1_agg -> level2_agg -> level3_agg -> union_all -> window_rank -> final_sort
+
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 2002
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_preagg
+
+  filtered_store:
+    FROM: store
+    WHERE: s_state IN ('SD','TN','GA','SC','MO','AL','MI','OH')
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 101
+    CONSUMERS: fact_preagg
+
+  fact_preagg:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+          INNER JOIN filtered_store ON ss_store_sk = s_store_sk
+    GROUP BY: ss_item_sk
+    AGGREGATE: SUM(ss_net_profit) as profit_sum, SUM(ss_ext_sales_price) as sales_sum
+    OUTPUT: ss_item_sk, profit_sum, sales_sum
+    EXPECTED_ROWS: ~100K (distinct items in filtered sales)
+    CONSUMERS: item_join
+
+  item_join:
+    FROM: fact_preagg
+    JOIN: INNER JOIN item ON i_item_sk = ss_item_sk
+    OUTPUT: i_category, i_class, profit_sum, sales_sum
+    EXPECTED_ROWS: ~100K
+    CONSUMERS: level1_agg, level2_agg, level3_agg
+
+  level1_agg:
+    FROM: item_join
+    GROUP BY: i_category, i_class
+    AGGREGATE: SUM(profit_sum) as sum_net_profit, SUM(sales_sum) as sum_sales_price
+    OUTPUT: i_category, i_class, 0 as lochierarchy, sum_net_profit, sum_sales_price
+    EXPECTED_ROWS: ~150
+    CONSUMERS: union_all
+
+  level2_agg:
+    FROM: item_join
+    GROUP BY: i_category
+    AGGREGATE: SUM(profit_sum) as sum_net_profit, SUM(sales_sum) as sum_sales_price
+    OUTPUT: i_category, NULL as i_class, 1 as lochierarchy, sum_net_profit, sum_sales_price
+    EXPECTED_ROWS: ~10
+    CONSUMERS: union_all
+
+  level3_agg:
+    FROM: item_join
+    GROUP BY: (empty)
+    AGGREGATE: SUM(profit_sum) as sum_net_profit, SUM(sales_sum) as sum_sales_price
+    OUTPUT: NULL as i_category, NULL as i_class, 2 as lochierarchy, sum_net_profit, sum_sales_price
+    EXPECTED_ROWS: 1
+    CONSUMERS: union_all
+
+  union_all: (same as Worker 2)
+  window_rank: (same as Worker 2)
+  final_sort: (same as Worker 1)
+
+EXAMPLES: prefetch_fact_join, rollup_to_union_windowing, single_pass_aggregation
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply pre-filtering and pre-joining of fact table with dimensions. Ignore single CTE chain.
+- rollup_to_union_windowing: Apply explicit UNION ALL of hierarchy levels. Ignore triple fact scan.
+- single_pass_aggregation: Consolidate aggregation into single pre-aggregation pass. Apply CASE aggregation pattern not needed here.
+HAZARD_FLAGS:
+- Complex CTE chain may confuse optimizer.
+- Pre-aggregation by ss_item_sk must preserve all needed columns for later grouping.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

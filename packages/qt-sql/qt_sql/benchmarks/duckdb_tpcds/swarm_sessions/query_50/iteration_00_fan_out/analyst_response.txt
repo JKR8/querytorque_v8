@@ -1,0 +1,427 @@
+<reasoning>
+1. **CLASSIFY**: This is a star-join query with two date_dim instances (d1 for sale date, d2 for return date) joining to a fact table (store_sales) and its returns counterpart (store_returns), with a final dimension (store). The query computes conditional aggregates (SUM of CASE) based on date differences, grouped by store attributes. No correlated subqueries, no UNION, no INTERSECT, no window functions, no ROLLUP. Structure: multi-table star join with late dimension filtering (date_dim d2 has selective filter).
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total execution: 1095ms.
+   - Dominant cost: HASH_JOIN INNER between store_sales and store_returns (528.8ms, 48% exclusive). This join processes 21K rows but takes half the total time because it's joining large intermediate results.
+   - store_sales SEQ_SCAN: 526.2ms (48%), reading 26.5M of 345.6M rows. Filter: ss_ticket_number<=2399999 (likely a data distribution filter, not query-related).
+   - store_returns SEQ_SCAN: 22.2ms (2%), reading 29K of 34.5M rows. This is after joining with filtered d2 (31 rows). Good selectivity.
+   - date_dim d2 FILTER: 0.2ms, 31 rows.
+   - date_dim d1 SEQ_SCAN: 0.1ms, 1,827 rows (filtered by range 2450816-2452642).
+   - store SEQ_SCAN: 0.1ms, 100 rows.
+   - HASH_GROUP_BY: 7.9ms.
+   - TOP_N: 0.4ms.
+
+   Cardinality flow:
+   - store_sales: 26.5M rows → after join with store_returns: 21K rows (massive reduction).
+   - store_returns: 29K rows (after d2 filter) → after join with store_sales: 21K rows.
+   - d1: 1,827 rows.
+   - d2: 31 rows.
+   - store: 100 rows.
+   - Final groups: ~51 rows.
+
+   The optimizer already pushes d2 filter early into store_returns scan (good). The d1 scan has a range filter derived from join with store_sales? Actually, the EXPLAIN shows d1 scan filtered by d_date_sk BETWEEN 2450820 AND 2452822. This is likely from the join with store_sales, but the filter appears in the scan (predicate pushdown). The store_sales scan has a filter ss_ticket_number<=2399999, which is not from the query but from data distribution.
+
+   Scans per base table:
+   - store_sales: 1 scan (26.5M rows)
+   - store_returns: 1 scan (29K rows)
+   - date_dim d1: 1 scan (1,827 rows)
+   - date_dim d2: 1 scan (31 rows)
+   - store: 1 scan (100 rows)
+
+   No repeated scans. The main bottleneck is the hash join between the two large fact tables (store_sales and store_returns). The join reduces rows dramatically (26.5M → 21K), but the join cost is high because both sides are large (store_sales 26.5M, store_returns 29K). The optimizer already uses hash join.
+
+   CTE materialization: Not applicable (no CTEs in original). The optimizer is already doing early filtering on dimensions.
+
+3. **GAP MATCHING**:
+   - CORRELATED_SUBQUERY_PARALYSIS: Not present.
+   - CROSS_COLUMN_OR_DECOMPOSITION: No OR conditions.
+   - CROSS_CTE_PREDICATE_BLINDNESS: No CTEs. However, the query joins date_dim twice with different filters (d1 no filter, d2 filtered). This matches multi_date_range_cte pattern. The optimizer already pushes d2 filter. But d1 has no explicit filter; the range filter is derived from store_sales join. Could pre-filter d1? Not without knowing the range.
+   - REDUNDANT_SCAN_ELIMINATION: No repeated scans.
+   - UNION_CTE_SELF_JOIN_DECOMPOSITION: No UNION.
+
+   Engine strengths:
+   - INTRA_SCAN_PREDICATE_PUSHDOWN: Already pushing d2 filter into store_returns scan.
+   - SAME_COLUMN_OR: N/A.
+   - HASH_JOIN_SELECTION: Already using hash joins.
+   - CTE_INLINING: N/A.
+   - COLUMNAR_PROJECTION: Only referenced columns are read.
+   - PARALLEL_AGGREGATION: Likely parallel.
+   - EXISTS_SEMI_JOIN: N/A.
+
+   Potential gaps: The join order is store_sales ↔ store_returns ↔ d2, then d1, then store. Could we pre-filter store_sales using d1? Not directly, because d1 has no filter. Could we pre-join store_sales with d1 to reduce rows before joining store_returns? The current plan joins store_sales with store_returns first, then d1. But d1 join might not reduce rows much (1,827 rows). The biggest reduction is from store_returns filter (d2). The store_sales scan is large (26.5M). Could we reduce store_sales rows by pre-joining with d2? No, because d2 is for return date, not sale date.
+
+   The multi_date_range_cte pattern suggests creating separate CTEs for each date alias. Here, d2 is filtered, d1 is not. Could create a CTE for filtered d2 and pre-join with store_returns, and another CTE for d1 (unfiltered) and pre-join with store_sales. This might allow better join ordering? But the optimizer already does this: it creates filtered d2 and joins with store_returns, then joins with store_sales.
+
+   Another gap: The store_sales scan has a filter ss_ticket_number<=2399999 that is not from the query. This might be a data distribution filter. Could we push additional filters? No.
+
+   The dimension_cte_isolate pattern: pre-filter all dimensions into CTEs before joining with fact tables. Here, dimensions are d2 (filtered), d1 (unfiltered), store (unfiltered). Could pre-filter store? Not selective (100 rows). Could pre-filter d1? Not without filter.
+
+   The prefetch_fact_join pattern: filter dimension (d2), pre-join with fact (store_returns), then join with other fact (store_sales). This is what the optimizer does.
+
+   The single_pass_aggregation pattern: Not applicable (no repeated scans).
+
+   The channel_bitmap_aggregation pattern: Not applicable.
+
+   The early_filter pattern: Filter dimension tables first. Already done.
+
+   The pushdown pattern: Consolidate multiple subqueries. Not applicable.
+
+   The decorrelate pattern: Not applicable.
+
+   The or_to_union pattern: Not applicable.
+
+   The intersect_to_exists pattern: Not applicable.
+
+   The materialize_cte pattern: Not applicable.
+
+   The union_cte_split pattern: Not applicable.
+
+   The deferred_window_aggregation pattern: Not applicable.
+
+   The rollup_to_union_windowing pattern: Not applicable.
+
+   Given the EXPLAIN, the optimizer already performs many optimizations. The remaining bottleneck is the hash join between store_sales and store_returns. This join is expensive because store_sales is large (26.5M rows). Can we reduce the store_sales rows earlier? Possibly by joining with store first? store is small (100 rows). If we join store_sales with store early, we might reduce store_sales rows to those matching stores (but all stores are included? store scan shows 100 of 102 rows, so almost all). Not much reduction.
+
+   Another idea: Since the query groups by store attributes, could we aggregate early? Not possible because we need date difference from two dates.
+
+   However, note that the join between store_sales and store_returns is on three columns: ss_ticket_number = sr_ticket_number, ss_item_sk = sr_item_sk, ss_customer_sk = sr_customer_sk. This is a composite key. The store_returns after d2 filter is 29K rows. Could we create a composite key index? Not in our control.
+
+   The EXPLAIN shows that the store_sales scan filter is ss_ticket_number<=2399999. This is not from the query. Could it be that the join condition implicitly filters store_sales? The store_returns table has ticket numbers within some range? Possibly the join reduces store_sales rows dramatically (26.5M to 21K). The hash join builds a hash table on store_returns (29K rows) and probes store_sales (26.5M rows). The probe cost is high.
+
+   Could we flip the join order? Make store_sales the build side? Not likely because store_sales is larger.
+
+   Perhaps we can pre-join store_sales with d1 to reduce columns? Not helpful.
+
+   Given the above, the optimizer seems to have a good plan. However, we can still try strategies that restructure the query to potentially improve join order or reduce intermediate results.
+
+4. **AGGREGATION TRAP CHECK**:
+   - Aggregates are SUM(CASE ...). These are not duplicate-sensitive because they are counts of rows. If joins introduce duplicates, counts would change. But all joins are INNER and on unique keys? Not necessarily. The join between store_sales and store_returns is on composite key; there could be one-to-many? Possibly one sale could have multiple returns? The query groups by store, so duplicates per store would affect counts. We must preserve join semantics.
+
+5. **TRANSFORM SELECTION**:
+   We need 4 diverse strategies. Since the optimizer already does many things, we need to choose strategies that might still help or are safe.
+
+   Strategy 1: **multi_date_range_cte** - Create separate CTEs for d1 and d2, pre-join with respective fact tables. This is similar to the optimizer's plan, but making it explicit might give the optimizer more flexibility? The pattern has 2.35x win on Q29. Applicable because query uses two date_dim aliases.
+
+   Strategy 2: **dimension_cte_isolate** - Pre-filter all dimension tables into CTEs (d1, d2, store) before joining with fact tables. This might allow better join ordering? The pattern has 1.93x win on Q26, but risk of Cartesian explosion if cross-joining 3+ dimension CTEs. Here we have 3 dimensions, but we will join them with facts, not cross-join.
+
+   Strategy 3: **prefetch_fact_join** - Build a CTE chain: filter d2, join with store_returns, then join with store_sales, then join with d1 and store. This is similar to the current plan, but explicit CTEs might materialize intermediate results and change join order? The pattern has 3.77x win on Q63.
+
+   Strategy 4: **early_filter** (exploration) - Filter dimension tables first, then join with fact tables. This is similar to dimension_cte_isolate but simpler. The pattern has 4.00x win on Q11/Q93.
+
+   However, these are all similar. Need more diversity.
+
+   Another idea: **late_attribute_binding** (novel) - Defer the store join until after aggregation, since store columns are only used for grouping and output, not for filters or joins with other tables. The join between store_sales and store is on ss_store_sk = s_store_sk. We could first join store_sales, store_returns, d1, d2, compute aggregates grouped by ss_store_sk, then join with store to get store attributes. This reduces the number of columns carried through the joins. This is a novel transform not in the catalog. Could be exploration.
+
+   Also, **single_pass_aggregation** is not applicable.
+
+   Given the need for diversity, I'll choose:
+   1. multi_date_range_cte
+   2. dimension_cte_isolate
+   3. prefetch_fact_join
+   4. late_attribute_binding (exploration)
+
+6. **LOGICAL TREE DESIGN**:
+   For each strategy, define CTEs and joins.
+
+   Strategy 1 (multi_date_range_cte):
+     CTE d1_range: date_dim (all, but maybe we can filter by range? Not from query)
+     CTE d2_filtered: date_dim filtered by d_year=2001, d_moy=8
+     Then join store_sales with d1_range, store_returns with d2_filtered, then join those results, then join store.
+
+   But d1_range is unfiltered. Could we filter d1 by the same date range as in EXPLAIN? Not safe.
+
+   Strategy 2 (dimension_cte_isolate):
+     CTE d1_all: date_dim (maybe with range filter from EXPLAIN? Not safe)
+     CTE d2_filtered: date_dim filtered
+     CTE store_all: store (maybe with filter s_store_sk<=100 from EXPLAIN)
+     Then join store_sales with d1_all, store_returns with d2_filtered, then join those, then join store_all.
+
+   Strategy 3 (prefetch_fact_join):
+     CTE d2_filtered: date_dim filtered
+     CTE returns_filtered: store_returns JOIN d2_filtered
+     CTE sales_returns: store_sales JOIN returns_filtered ON (ticket, item, customer)
+     Then join sales_returns with date_dim d1 and store.
+
+   Strategy 4 (late_attribute_binding):
+     CTE d2_filtered: date_dim filtered
+     CTE returns_filtered: store_returns JOIN d2_filtered
+     CTE sales_returns: store_sales JOIN returns_filtered ON (ticket, item, customer)
+     CTE sales_returns_dates: sales_returns JOIN date_dim d1 ON ss_sold_date_sk = d1.d_date_sk
+     CTE aggregated: GROUP BY ss_store_sk with aggregates
+     Then join aggregated with store.
+
+   For each, ensure column completeness.
+
+   Check constraints:
+   - COMPLETE_OUTPUT: Must output all store columns and aggregates.
+   - CTE_COLUMN_COMPLETENESS: Each CTE must include columns needed downstream.
+   - LITERAL_PRESERVATION: Keep d_year=2001, d_moy=8.
+   - SEMANTIC_EQUIVALENCE: Same results.
+
+   Regression warnings:
+   - prefetch_fact_join caused regression on Q25 because of forced join order. This query has only two fact tables (store_sales, store_returns). Might be safe.
+   - dimension_cte_isolate caused regression on Q26 due to cross-join of 3+ dimension CTEs. We will not cross-join dimensions; we'll join them with facts.
+   - date_cte_isolate caused regression on Q31 (baseline <100ms). This query baseline is 1095ms, so might be safe.
+   - pushdown caused regression on Q74 due to keeping original UNION. Not applicable.
+
+   Given the query's high baseline, CTE overhead might be acceptable.
+
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Business intent: For returns processed in August 2001, bucket store return latency (days between sale and return) into five ranges and report counts per store identity/address.
+JOIN semantics: All joins are INNER; each store_sales row must match a store_returns row (on ticket, item, customer) and both date dimensions (sale date and return date) and store.
+Aggregation traps: Aggregates are SUM of CASE expressions counting rows; duplicates from joins would inflate counts, but INNER joins on composite key likely preserve 1:1.
+Filter dependencies: The filter d2.d_year=2001 AND d2.d_moy=8 must be applied to store_returns via d2; d1 has no explicit filter but joins on ss_sold_date_sk.
+
+BOTTLENECK_DIAGNOSIS:
+Dominant cost is the hash join between store_sales (26.5M rows) and store_returns (29K rows) at 528.8ms (48% exclusive), making the query join-bound. The store_sales scan (526.2ms) is also costly. Cardinality flows: store_sales 26.5M → after join with store_returns 21K rows (massive reduction). The optimizer already pushes d2 filter early into store_returns scan and uses hash joins efficiently. Logical-tree cost percentages are misleading; the hash join is the bottleneck.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output 10 store columns and 5 aggregate columns.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream.
+- LITERAL_PRESERVATION: Keep d_year=2001 and d_moy=8 exactly.
+- SEMANTIC_EQUIVALENCE: Result set must match exactly.
+- ENGINE_GAP_CROSS_CTE_PREDICATE_BLINDNESS: The optimizer already pushes d2 filter, but explicit CTEs may allow better join ordering.
+- ENGINE_GAP_REDUNDANT_SCAN_ELIMINATION: No repeated scans, but CTE materialization may reduce rescanning of dimensions.
+
+REGRESSION_WARNINGS:
+1. prefetch_fact_join (regression_q25_prefetch_fact_join):
+   CAUSE: Pre-joining fact tables with dimension CTEs before multi-way fact joins prevented optimizer reordering.
+   RULE: Avoid pre-joining fact tables when multiple fact tables exist; this query has only two fact tables (store_sales, store_returns) so may be safe.
+2. dimension_cte_isolate (regression_q26_dimension_cte_isolate):
+   CAUSE: Cross-joining 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join each dimension with facts separately.
+3. date_cte_isolate (regression_q31_date_cte_isolate):
+   CAUSE: Baseline <100ms, CTE overhead dominated.
+   RULE: This query baseline is 1095ms, so CTE overhead likely acceptable.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: multi_date_range_cte
+TARGET_LOGICAL_TREE:
+  d2_filtered -> returns_filtered -> sales_returns -> d1_all -> store_all -> aggregation -> sort_limit
+NODE_CONTRACTS:
+  d2_filtered:
+    FROM: date_dim
+    WHERE: d_year = 2001 AND d_moy = 8
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: returns_filtered
+  returns_filtered:
+    FROM: store_returns JOIN d2_filtered ON sr_returned_date_sk = d2_filtered.d_date_sk
+    OUTPUT: sr_ticket_number, sr_item_sk, sr_customer_sk, sr_returned_date_sk
+    EXPECTED_ROWS: 29K
+    CONSUMERS: sales_returns
+  d1_all:
+    FROM: date_dim
+    WHERE: (no filter)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 73K
+    CONSUMERS: sales_returns
+  sales_returns:
+    FROM: store_sales
+          JOIN returns_filtered ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk
+          JOIN d1_all ON ss_sold_date_sk = d1_all.d_date_sk
+    OUTPUT: ss_store_sk, ss_sold_date_sk, sr_returned_date_sk
+    EXPECTED_ROWS: 21K
+    CONSUMERS: store_all, aggregation
+  store_all:
+    FROM: store
+    WHERE: (no filter)
+    OUTPUT: s_store_sk, s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    EXPECTED_ROWS: 102
+    CONSUMERS: sales_returns (as join)
+  aggregation:
+    FROM: sales_returns JOIN store_all ON ss_store_sk = s_store_sk
+    GROUP BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    AGGREGATE: SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 30 AND sr_returned_date_sk - ss_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS "31-60 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 60 AND sr_returned_date_sk - ss_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS "61-90 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 90 AND sr_returned_date_sk - ss_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS "91-120 days", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 120) THEN 1 ELSE 0 END) AS ">120 days"
+    OUTPUT: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"
+    EXPECTED_ROWS: ~51
+    CONSUMERS: sort_limit
+  sort_limit:
+    FROM: aggregation
+    ORDER BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    LIMIT: 100
+    OUTPUT: same as aggregation
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final
+EXAMPLES: multi_date_range_cte
+EXAMPLE_ADAPTATION:
+  Apply the pattern of separate CTEs for each date_dim alias (d1 and d2). Create d2_filtered CTE with return date filter, d1_all CTE without filter (since no query filter on d1). Pre-join store_returns with d2_filtered, then join with store_sales and d1. Ignore any decorrelation or UNION aspects.
+HAZARD_FLAGS:
+  - d1_all CTE scans entire date_dim (73K rows) which may add overhead.
+  - The join order might differ from optimizer's choice.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+  d2_filtered -> returns_filtered -> d1_all -> store_all -> sales_joined -> aggregation -> sort_limit
+NODE_CONTRACTS:
+  d2_filtered:
+    FROM: date_dim
+    WHERE: d_year = 2001 AND d_moy = 8
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: returns_filtered
+  returns_filtered:
+    FROM: store_returns JOIN d2_filtered ON sr_returned_date_sk = d2_filtered.d_date_sk
+    OUTPUT: sr_ticket_number, sr_item_sk, sr_customer_sk, sr_returned_date_sk
+    EXPECTED_ROWS: 29K
+    CONSUMERS: sales_joined
+  d1_all:
+    FROM: date_dim
+    WHERE: (no filter)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 73K
+    CONSUMERS: sales_joined
+  store_all:
+    FROM: store
+    WHERE: (no filter)
+    OUTPUT: s_store_sk, s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    EXPECTED_ROWS: 102
+    CONSUMERS: sales_joined
+  sales_joined:
+    FROM: store_sales
+          JOIN returns_filtered ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk
+          JOIN d1_all ON ss_sold_date_sk = d1_all.d_date_sk
+          JOIN store_all ON ss_store_sk = s_store_sk
+    OUTPUT: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, ss_sold_date_sk, sr_returned_date_sk
+    EXPECTED_ROWS: 21K
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: sales_joined
+    GROUP BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    AGGREGATE: same 5 CASE sums as original
+    OUTPUT: same 10 store columns + 5 aggregates
+    EXPECTED_ROWS: ~51
+    CONSUMERS: sort_limit
+  sort_limit:
+    FROM: aggregation
+    ORDER BY: same 10 store columns
+    LIMIT: 100
+    OUTPUT: same as aggregation
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+  Apply pre-filtering of all dimension tables into CTEs (d2_filtered, d1_all, store_all). Then join fact tables with these CTEs. Ignore the cross-join risk; we will join dimensions with facts, not cross-join dimensions.
+HAZARD_FLAGS:
+  - Scanning entire date_dim for d1_all may add overhead.
+  - The join order may force store_sales to be joined last, which might be suboptimal.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  d2_filtered -> returns_filtered -> sales_returns -> d1_all -> store_all -> aggregation -> sort_limit
+NODE_CONTRACTS:
+  d2_filtered:
+    FROM: date_dim
+    WHERE: d_year = 2001 AND d_moy = 8
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: returns_filtered
+  returns_filtered:
+    FROM: store_returns JOIN d2_filtered ON sr_returned_date_sk = d2_filtered.d_date_sk
+    OUTPUT: sr_ticket_number, sr_item_sk, sr_customer_sk, sr_returned_date_sk
+    EXPECTED_ROWS: 29K
+    CONSUMERS: sales_returns
+  sales_returns:
+    FROM: store_sales JOIN returns_filtered ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk
+    OUTPUT: ss_store_sk, ss_sold_date_sk, sr_returned_date_sk
+    EXPECTED_ROWS: 21K
+    CONSUMERS: d1_all, store_all
+  d1_all:
+    FROM: date_dim
+    WHERE: (no filter)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 73K
+    CONSUMERS: sales_returns (as join)
+  store_all:
+    FROM: store
+    WHERE: (no filter)
+    OUTPUT: s_store_sk, s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    EXPECTED_ROWS: 102
+    CONSUMERS: sales_returns (as join)
+  aggregation:
+    FROM: sales_returns JOIN d1_all ON ss_sold_date_sk = d1_all.d_date_sk
+          JOIN store_all ON ss_store_sk = s_store_sk
+    GROUP BY: same 10 store columns
+    AGGREGATE: same 5 CASE sums
+    OUTPUT: same 10 store columns + 5 aggregates
+    EXPECTED_ROWS: ~51
+    CONSUMERS: sort_limit
+  sort_limit:
+    FROM: aggregation
+    ORDER BY: same 10 store columns
+    LIMIT: 100
+    OUTPUT: same as aggregation
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final
+EXAMPLES: prefetch_fact_join
+EXAMPLE_ADAPTATION:
+  Apply the staged join pipeline: filter dimension (d2), pre-join with fact (store_returns), then join with other fact (store_sales), then join remaining dimensions (d1, store). Ignore any multi-fact join reordering warnings; this query has only two fact tables.
+HAZARD_FLAGS:
+  - The join order may force store_sales to be joined after store_returns, which is already the optimizer's choice.
+  - Materializing intermediate CTEs may add overhead.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+  d2_filtered -> returns_filtered -> sales_returns -> d1_all -> aggregated -> store_attach -> sort_limit
+NODE_CONTRACTS:
+  d2_filtered:
+    FROM: date_dim
+    WHERE: d_year = 2001 AND d_moy = 8
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: returns_filtered
+  returns_filtered:
+    FROM: store_returns JOIN d2_filtered ON sr_returned_date_sk = d2_filtered.d_date_sk
+    OUTPUT: sr_ticket_number, sr_item_sk, sr_customer_sk, sr_returned_date_sk
+    EXPECTED_ROWS: 29K
+    CONSUMERS: sales_returns
+  sales_returns:
+    FROM: store_sales JOIN returns_filtered ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk
+    OUTPUT: ss_store_sk, ss_sold_date_sk, sr_returned_date_sk
+    EXPECTED_ROWS: 21K
+    CONSUMERS: d1_all
+  d1_all:
+    FROM: date_dim
+    WHERE: (no filter)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 73K
+    CONSUMERS: sales_returns (as join)
+  aggregated:
+    FROM: sales_returns JOIN d1_all ON ss_sold_date_sk = d1_all.d_date_sk
+    GROUP BY: ss_store_sk
+    AGGREGATE: same 5 CASE sums
+    OUTPUT: ss_store_sk, "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"
+    EXPECTED_ROWS: ~51
+    CONSUMERS: store_attach
+  store_attach:
+    FROM: aggregated JOIN store ON aggregated.ss_store_sk = store.s_store_sk
+    OUTPUT: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"
+    EXPECTED_ROWS: ~51
+    CONSUMERS: sort_limit
+  sort_limit:
+    FROM: store_attach
+    ORDER BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    LIMIT: 100
+    OUTPUT: same as store_attach
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+  Apply the idea of deferring store join until after aggregation. This reduces the number of columns carried through joins. Use dimension CTEs for d1 and d2. Ignore any cross-join risks.
+HAZARD_FLAGS:
+  - Aggregation on ss_store_sk assumes each ss_store_sk maps to a unique store row (true if s_store_sk is primary key). This must hold for semantic equivalence.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: The aggregation groups by ss_store_sk, which is a surrogate key for store. Since store join is one-to-one, grouping by ss_store_sk is equivalent to grouping by store columns. The final join adds store columns without changing row counts.
+EXPLORATION_TYPE: novel_combination

@@ -1,0 +1,383 @@
+<reasoning>
+1. **CLASSIFY**: This is a multi-channel UNION ALL query with pre-filtered dimension sets (frequent items, top customers). It has:
+   - 3 CTEs that compute derived sets from store_sales
+   - Main query that UNIONs catalog_sales and web_sales for May 2000
+   - Filters on both fact tables using IN subqueries against the CTEs
+   - No window functions, no INTERSECT, no correlated EXISTS (the subquery in best_ss_customer is scalar, not correlated per row)
+   - Structural archetype: dimension-set prefiltering with multi-channel aggregation
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total time: 16199ms
+   - Biggest costs:
+     - frequent_ss_items HASH_GROUP_BY: 7580.6ms (47%) on 13.8M rows
+     - best_ss_customer condition evaluation (NESTED_LOOP_JOIN): appears twice (once per branch) ~29ms total
+     - store_sales scans: 4 separate scans totaling ~1.2 seconds
+       - CTE 1: 16.6M rows (281.4ms)
+       - CTE 2: 16.2M rows (327.4ms)  
+       - best_ss_customer branch 1: 27.5M rows (230.4ms)
+       - best_ss_customer branch 2: 27.5M rows (378.3ms)
+   - Row count drops:
+     - date_dim filters work well (73K → ~1,098 rows for 4-year range, 31 rows for May 2000)
+     - frequent_ss_items: 13.8M grouped → 4,202 rows after HAVING
+     - But store_sales scans don't benefit from early filtering on customer/item
+   - Optimizer already:
+     - Pushes date filters into scans
+     - Uses hash joins, semi-joins for IN subqueries
+     - Materializes CTEs (CTE_SCAN nodes show reuse)
+   - Scans per table:
+     - store_sales: 4 scans (biggest table at 345.6M rows)
+     - catalog_sales: 1 scan (172.8M rows)
+     - web_sales: 1 scan (86.4M rows)
+     - date_dim: 4 scans (but small table)
+   - CTE materialization: frequent_ss_items and max_store_sales are materialized (CTE_SCAN). best_ss_customer is NOT materialized - expanded inline with NESTED_LOOP_JOIN to max_store_sales CTE.
+
+3. **GAP MATCHING**:
+   - CORRELATED_SUBQUERY_PARALYSIS: NO - the subquery in best_ss_customer is scalar (select * from max_store_sales), not correlated per row. Already optimized as CTE + NESTED_LOOP.
+   - CROSS_COLUMN_OR_DECOMPOSITION: NO - no OR conditions.
+   - CROSS_CTE_PREDICATE_BLINDNESS: YES - predicates aren't pushed from main query into CTEs. The best_ss_customer CTE computes over ALL store_sales time, but main query only needs customers who are "best" - no pushdown.
+   - REDUNDANT_SCAN_ELIMINATION: YES - store_sales scanned 4 times with overlapping filters (date ranges differ: CTEs use 2000-2003, best_ss_customer uses all time).
+   - UNION_CTE_SELF_JOIN_DECOMPOSITION: NO - no self-joins on CTEs.
+
+4. **AGGREGATION TRAP CHECK**:
+   - Only SUM and COUNT aggregates, which are grouping-insensitive (modulo duplicates). No STDDEV, VARIANCE, etc.
+   - The HAVING COUNT(*) > 4 in frequent_ss_items is safe to restructure.
+   - The 95% threshold in best_ss_customer compares to a scalar max - safe.
+
+5. **TRANSFORM SELECTION** (4 diverse approaches):
+   a. **star_join_prefetch**: Pre-filter date_dim, customer, item into CTEs before store_sales joins. Attack: multiple store_sales scans.
+   b. **single_pass_aggregation**: Consolidate the 4 store_sales scans into 1-2 scans with conditional aggregation. Attack: redundant scan elimination.
+   c. **pushdown**: Push main query filters (May 2000) into the CTEs where possible. Attack: predicate blindness.
+   d. **late_attribute_binding**: Defer customer table join (for c_last_name, c_first_name) until after aggregations. Attack: dimension scan reduction.
+
+6. **LOGICAL TREE DESIGN**:
+   Need to ensure CTE column completeness:
+   - frequent_ss_items outputs: itemdesc, item_sk, solddate, cnt (used via item_sk)
+   - max_store_sales outputs: tpcds_cmax (scalar)
+   - best_ss_customer outputs: c_customer_sk, ssales
+   Main query needs: c_last_name, c_first_name from customer, sales from SUM.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Estimate May 2000 cross-channel demand from high-value store customers by summing catalog and web sales for items that were frequently sold in stores during 2000-2003. All joins are INNER (intersection) - rows must match across all joined tables. Aggregation uses only SUM and COUNT which are duplicate-insensitive, but HAVING COUNT(*) > 4 must be preserved. Filter dependencies: main query filters to d_year=2000 AND d_moy=5; CTEs filter to d_year IN (2000,2001,2002,2003); customer joins use c_customer_sk across all tables.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound on store_sales (4 scans totaling ~1.2s) and aggregation-bound on frequent_ss_items GROUP BY (7.6s on 13.8M rows). Cardinality: store_sales scans produce 16-27M rows each, filtered date_dim reduces to ~1k rows, frequent_ss_items reduces to 4k rows. Optimizer already pushes date filters into scans and uses efficient hash joins. Logical-tree costs are misleading - frequent_ss_items shows 25% but consumes 47% actual time; store_sales scans show 1-2% each but collectively dominate I/O.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output c_last_name, c_first_name, sales in same order
+- CTE_COLUMN_COMPLETENESS: Each CTE must include all columns referenced downstream
+- LITERAL_PRESERVATION: Must preserve d_year=2000, d_moy=5, year range 2000-2003, 95/100.0 threshold
+- SEMANTIC_EQUIVALENCE: Must return identical rows and ordering
+- CROSS_CTE_PREDICATE_BLINDNESS: Predicates not pushed from main query into CTEs (EXPLAIN shows best_ss_customer scans ALL store_sales time, not just 2000-2003)
+- REDUNDANT_SCAN_ELIMINATION: store_sales scanned 4 times with overlapping date filters (EXPLAIN shows separate SEQ_SCAN nodes)
+
+REGRESSION_WARNINGS:
+1. materialize_cte (0.14x on Q16):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan instead of semi-join short-circuit
+   RULE: Do NOT convert IN subqueries to materialized CTEs if they're used as filters - keep as SEMI JOIN
+2. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion
+   RULE: Never cross-join 3+ dimension CTEs; ensure each has WHERE clause
+3. pushdown (0.68x on Q74):
+   CAUSE: Kept both original UNION and specialized CTEs, causing redundant materialization
+   RULE: When splitting CTEs, eliminate the original unfiltered version
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_filter_4year -> date_filter_may2000 -> customer_all -> item_all -> store_sales_base -> frequent_ss_items -> max_store_sales -> best_ss_customer -> main_union
+NODE_CONTRACTS:
+  date_filter_4year:
+    FROM: date_dim
+    WHERE: d_year IN (2000, 2001, 2002, 2003)
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 1,098
+    CONSUMERS: store_sales_base
+  date_filter_may2000:
+    FROM: date_dim  
+    WHERE: d_year = 2000 AND d_moy = 5
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 31
+    CONSUMERS: catalog_sales_filtered, web_sales_filtered
+  customer_all:
+    FROM: customer
+    OUTPUT: c_customer_sk, c_last_name, c_first_name
+    EXPECTED_ROWS: 500K
+    CONSUMERS: store_sales_base, best_ss_customer, main_union
+  item_all:
+    FROM: item
+    OUTPUT: i_item_sk, i_item_desc
+    EXPECTED_ROWS: 102K
+    CONSUMERS: store_sales_base, frequent_ss_items
+  store_sales_base:
+    FROM: store_sales
+    JOIN: INNER JOIN date_filter_4year ON ss_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN customer_all ON ss_customer_sk = c_customer_sk
+    JOIN: INNER JOIN item_all ON ss_item_sk = i_item_sk
+    WHERE: (none beyond joins)
+    OUTPUT: ss_item_sk, i_item_desc, ss_customer_sk, ss_quantity, ss_sales_price, d_date
+    EXPECTED_ROWS: 16.6M
+    CONSUMERS: frequent_ss_items, max_store_sales
+  frequent_ss_items:
+    FROM: store_sales_base
+    GROUP BY: SUBSTR(i_item_desc,1,30), ss_item_sk, d_date
+    AGGREGATE: COUNT(*) as cnt
+    HAVING: COUNT(*) > 4
+    OUTPUT: SUBSTR(i_item_desc,1,30) as itemdesc, ss_item_sk as item_sk, d_date as solddate, cnt
+    EXPECTED_ROWS: 4,202
+    CONSUMERS: main_union
+  max_store_sales:
+    FROM: store_sales_base
+    GROUP BY: ss_customer_sk
+    AGGREGATE: SUM(ss_quantity * ss_sales_price) as csales
+    OUTPUT: MAX(csales) as tpcds_cmax
+    EXPECTED_ROWS: 1
+    CONSUMERS: best_ss_customer
+  best_ss_customer:
+    FROM: store_sales_base
+    GROUP BY: ss_customer_sk
+    AGGREGATE: SUM(ss_quantity * ss_sales_price) as ssales
+    HAVING: SUM(ss_quantity * ss_sales_price) > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales)
+    OUTPUT: ss_customer_sk as c_customer_sk, ssales
+    EXPECTED_ROWS: 171
+    CONSUMERS: main_union
+  catalog_sales_filtered:
+    FROM: catalog_sales
+    JOIN: INNER JOIN date_filter_may2000 ON cs_sold_date_sk = d_date_sk
+    WHERE: cs_item_sk IN (SELECT item_sk FROM frequent_ss_items)
+      AND cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer)
+    OUTPUT: cs_bill_customer_sk, cs_quantity, cs_list_price
+    EXPECTED_ROWS: 5
+    CONSUMERS: main_union
+  web_sales_filtered:
+    FROM: web_sales
+    JOIN: INNER JOIN date_filter_may2000 ON ws_sold_date_sk = d_date_sk
+    WHERE: ws_item_sk IN (SELECT item_sk FROM frequent_ss_items)
+      AND ws_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer)
+    OUTPUT: ws_bill_customer_sk, ws_quantity, ws_list_price
+    EXPECTED_ROWS: 2
+    CONSUMERS: main_union
+  main_union:
+    FROM: (SELECT c_last_name, c_first_name, SUM(cs_quantity * cs_list_price) as sales FROM catalog_sales_filtered JOIN customer_all ON cs_bill_customer_sk = c_customer_sk GROUP BY c_last_name, c_first_name
+           UNION ALL
+           SELECT c_last_name, c_first_name, SUM(ws_quantity * ws_list_price) as sales FROM web_sales_filtered JOIN customer_all ON ws_bill_customer_sk = c_customer_sk GROUP BY c_last_name, c_first_name)
+    ORDER BY: c_last_name, c_first_name, sales
+    LIMIT: 100
+    OUTPUT: c_last_name, c_first_name, sales
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final output
+EXAMPLES: dimension_cte_isolate, prefetch_fact_join, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering of date_dim and customer into CTEs before fact joins. Ignore the cross-join hazard - we join them sequentially, not cross-joined.
+- prefetch_fact_join: Apply staged join pipeline: date_filter_4year CTE → store_sales_base CTE. Ignore the multi-CTE chain limit - we need 2 stages.
+- multi_dimension_prefetch: Apply pre-filtering of multiple dimensions (date, customer, item) before store_sales join. Ensure each CTE has WHERE clause.
+HAZARD_FLAGS:
+- store_sales_base CTE may be large (16.6M rows) - materialization overhead
+- Must ensure customer CTE includes c_last_name, c_first_name for final output
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  store_sales_single_scan -> frequent_ss_items_and_customer_aggs -> max_store_sales -> best_ss_customer -> (rest as original)
+NODE_CONTRACTS:
+  store_sales_single_scan:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year IN (2000, 2001, 2002, 2003)
+    JOIN: INNER JOIN item ON ss_item_sk = i_item_sk
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+    WHERE: (none beyond joins)
+    OUTPUT: ss_item_sk, i_item_desc, ss_customer_sk, ss_quantity, ss_sales_price, d_date
+    EXPECTED_ROWS: 16.6M
+    CONSUMERS: frequent_ss_items_and_customer_aggs
+  frequent_ss_items_and_customer_aggs:
+    FROM: store_sales_single_scan
+    GROUP BY: SUBSTR(i_item_desc,1,30), ss_item_sk, d_date, ss_customer_sk
+    AGGREGATE: COUNT(*) as cnt, SUM(ss_quantity * ss_sales_price) as customer_daily_sales
+    OUTPUT: SUBSTR(i_item_desc,1,30) as itemdesc, ss_item_sk as item_sk, d_date as solddate, cnt, ss_customer_sk, customer_daily_sales
+    EXPECTED_ROWS: ≤13.8M
+    CONSUMERS: frequent_ss_items_filtered, customer_aggs
+  frequent_ss_items_filtered:
+    FROM: frequent_ss_items_and_customer_aggs
+    WHERE: cnt > 4
+    GROUP BY: itemdesc, item_sk, solddate
+    AGGREGATE: (none - just filter)
+    OUTPUT: itemdesc, item_sk, solddate, cnt
+    EXPECTED_ROWS: 4,202
+    CONSUMERS: main_query
+  customer_aggs:
+    FROM: frequent_ss_items_and_customer_aggs
+    GROUP BY: ss_customer_sk
+    AGGREGATE: SUM(customer_daily_sales) as total_sales
+    OUTPUT: ss_customer_sk, total_sales
+    EXPECTED_ROWS: 472K
+    CONSUMERS: max_store_sales, best_ss_customer
+  max_store_sales:
+    FROM: customer_aggs
+    OUTPUT: MAX(total_sales) as tpcds_cmax
+    EXPECTED_ROWS: 1
+    CONSUMERS: best_ss_customer
+  best_ss_customer:
+    FROM: customer_aggs
+    WHERE: total_sales > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales)
+    OUTPUT: ss_customer_sk as c_customer_sk, total_sales as ssales
+    EXPECTED_ROWS: 171
+    CONSUMERS: main_query
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation, pushdown
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply consolidation of multiple aggregations into one scan with pre-aggregation. Ignore CASE WHEN labeling - we use GROUP BY on all needed dimensions.
+- channel_bitmap_aggregation: Apply single scan with multiple aggregations concept. Ignore the bucket limit - we have 2 aggregations (cnt and customer_daily_sales).
+- pushdown: Apply consolidation of store_sales scans. Ensure we compute both frequent items and customer aggregates in same pass.
+HAZARD_FLAGS:
+- Grouping by (itemdesc, item_sk, date, customer_sk) may produce many groups (up to 13.8M)
+- Must preserve HAVING cnt > 4 after initial aggregation
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: pushdown
+TARGET_LOGICAL_TREE:
+  date_may2000 -> frequent_ss_items_2000_2003 -> max_store_sales_2000_2003 -> best_ss_customer_with_date -> catalog_sales_may -> web_sales_may -> main_union
+NODE_CONTRACTS:
+  date_may2000:
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_moy = 5
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: catalog_sales_may, web_sales_may
+  frequent_ss_items_2000_2003:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year IN (2000, 2001, 2002, 2003)
+    JOIN: INNER JOIN item ON ss_item_sk = i_item_sk
+    GROUP BY: SUBSTR(i_item_desc,1,30), i_item_sk, d_date
+    AGGREGATE: COUNT(*) as cnt
+    HAVING: COUNT(*) > 4
+    OUTPUT: SUBSTR(i_item_desc,1,30) as itemdesc, i_item_sk as item_sk, d_date as solddate, cnt
+    EXPECTED_ROWS: 4,202
+    CONSUMERS: catalog_sales_may, web_sales_may
+  max_store_sales_2000_2003:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year IN (2000, 2001, 2002, 2003)
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+    GROUP BY: c_customer_sk
+    AGGREGATE: SUM(ss_quantity * ss_sales_price) as csales
+    OUTPUT: MAX(csales) as tpcds_cmax
+    EXPECTED_ROWS: 1
+    CONSUMERS: best_ss_customer_with_date
+  best_ss_customer_with_date:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year IN (2000, 2001, 2002, 2003)
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+    GROUP BY: c_customer_sk
+    AGGREGATE: SUM(ss_quantity * ss_sales_price) as ssales
+    HAVING: SUM(ss_quantity * ss_sales_price) > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales_2000_2003)
+    OUTPUT: c_customer_sk, ssales
+    EXPECTED_ROWS: ≤171 (same logic but filtered to 2000-2003)
+    CONSUMERS: catalog_sales_may, web_sales_may
+  catalog_sales_may:
+    FROM: catalog_sales
+    JOIN: INNER JOIN date_may2000 ON cs_sold_date_sk = d_date_sk
+    WHERE: cs_item_sk IN (SELECT item_sk FROM frequent_ss_items_2000_2003)
+      AND cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer_with_date)
+    OUTPUT: cs_bill_customer_sk, cs_quantity, cs_list_price
+    EXPECTED_ROWS: ≤5
+    CONSUMERS: main_union
+  web_sales_may:
+    FROM: web_sales
+    JOIN: INNER JOIN date_may2000 ON ws_sold_date_sk = d_date_sk
+    WHERE: ws_item_sk IN (SELECT item_sk FROM frequent_ss_items_2000_2003)
+      AND ws_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer_with_date)
+    OUTPUT: ws_bill_customer_sk, ws_quantity, ws_list_price
+    EXPECTED_ROWS: ≤2
+    CONSUMERS: main_union
+EXAMPLES: pushdown, early_filter, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- pushdown: Apply consolidation of date filters into CTEs. Ensure we don't keep original unfiltered versions.
+- early_filter: Apply date filtering first in each CTE. Ignore the dimension table filtering - we already filter date_dim.
+- date_cte_isolate: Apply date filtering into separate CTEs. Create date_may2000 CTE for main query.
+HAZARD_FLAGS:
+- Changing best_ss_customer to 2000-2003 may affect results (customers might be "best" only in full history)
+- Must verify semantic equivalence: original best_ss_customer uses ALL store_sales time
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+  frequent_ss_items -> max_store_sales -> best_ss_customer_keys -> catalog_sales_agg -> web_sales_agg -> combined_aggs -> final_customer_join
+NODE_CONTRACTS:
+  frequent_ss_items:
+    FROM: store_sales, date_dim, item
+    WHERE: ss_sold_date_sk = d_date_sk AND ss_item_sk = i_item_sk AND d_year IN (2000, 2001, 2002, 2003)
+    GROUP BY: SUBSTR(i_item_desc,1,30), i_item_sk, d_date
+    AGGREGATE: COUNT(*) as cnt
+    HAVING: COUNT(*) > 4
+    OUTPUT: i_item_sk as item_sk
+    EXPECTED_ROWS: 4,202
+    CONSUMERS: catalog_sales_agg, web_sales_agg
+  max_store_sales:
+    FROM: store_sales, date_dim, customer
+    WHERE: ss_sold_date_sk = d_date_sk AND ss_customer_sk = c_customer_sk AND d_year IN (2000, 2001, 2002, 2003)
+    GROUP BY: c_customer_sk
+    AGGREGATE: SUM(ss_quantity * ss_sales_price) as csales
+    OUTPUT: MAX(csales) as tpcds_cmax
+    EXPECTED_ROWS: 1
+    CONSUMERS: best_ss_customer_keys
+  best_ss_customer_keys:
+    FROM: store_sales, customer
+    WHERE: ss_customer_sk = c_customer_sk
+    GROUP BY: c_customer_sk
+    AGGREGATE: SUM(ss_quantity * ss_sales_price) as ssales
+    HAVING: SUM(ss_quantity * ss_sales_price) > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales)
+    OUTPUT: c_customer_sk
+    EXPECTED_ROWS: 171
+    CONSUMERS: catalog_sales_agg, web_sales_agg
+  catalog_sales_agg:
+    FROM: catalog_sales, date_dim
+    WHERE: cs_sold_date_sk = d_date_sk AND d_year = 2000 AND d_moy = 5
+      AND cs_item_sk IN (SELECT item_sk FROM frequent_ss_items)
+      AND cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer_keys)
+    GROUP BY: cs_bill_customer_sk
+    AGGREGATE: SUM(cs_quantity * cs_list_price) as sales
+    OUTPUT: cs_bill_customer_sk, sales
+    EXPECTED_ROWS: ≤5
+    CONSUMERS: combined_aggs
+  web_sales_agg:
+    FROM: web_sales, date_dim
+    WHERE: ws_sold_date_sk = d_date_sk AND d_year = 2000 AND d_moy = 5
+      AND ws_item_sk IN (SELECT item_sk FROM frequent_ss_items)
+      AND ws_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer_keys)
+    GROUP BY: ws_bill_customer_sk
+    AGGREGATE: SUM(ws_quantity * ws_list_price) as sales
+    OUTPUT: ws_bill_customer_sk, sales
+    EXPECTED_ROWS: ≤2
+    CONSUMERS: combined_aggs
+  combined_aggs:
+    FROM: (SELECT cs_bill_customer_sk as customer_sk, sales FROM catalog_sales_agg
+           UNION ALL
+           SELECT ws_bill_customer_sk as customer_sk, sales FROM web_sales_agg)
+    GROUP BY: customer_sk
+    AGGREGATE: SUM(sales) as total_sales
+    OUTPUT: customer_sk, total_sales
+    EXPECTED_ROWS: ≤7
+    CONSUMERS: final_customer_join
+  final_customer_join:
+    FROM: combined_aggs
+    JOIN: INNER JOIN customer ON customer_sk = c_customer_sk
+    ORDER BY: c_last_name, c_first_name, total_sales
+    LIMIT: 100
+    OUTPUT: c_last_name, c_first_name, total_sales as sales
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final output
+EXAMPLES: dimension_cte_isolate, deferred_window_aggregation, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply deferred customer join concept. Ignore pre-filtering - we join customer last.
+- deferred_window_aggregation: Apply delaying expensive operations (customer join) until after aggregation. Ignore window functions - we use GROUP BY.
+- shared_dimension_multi_channel: Apply sharing of dimension filters (frequent_ss_items, best_ss_customer_keys) across channels.
+HAZARD_FLAGS:
+- Must ensure customer table isn't needed earlier for other joins (it's only for final output)
+- Combined_aggs may lose per-channel sales detail, but final output sums across channels anyway
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

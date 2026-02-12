@@ -1,0 +1,299 @@
+<reasoning>
+**1. CLASSIFY**
+This is a multi-channel comparison query with three independent CTEs (store, catalog, web returns) that share identical dimension filters (date_dim, item). Each CTE aggregates return quantities by item for the same set of weeks. The main query joins the three CTEs on item_id and computes percentage deviations. Structural archetype: repeated fact scan with shared dimension filters (star-join with late dim filter across multiple channels).
+
+**2. EXPLAIN PLAN ANALYSIS**
+Total time: 79ms. Breakdown:
+- store_returns scan: 17.6ms (22% of total, largest single operator)
+- catalog_returns scan: 4.7ms (6%)
+- web_returns scan: 4.2ms (5%)
+- Aggregate group-by times: sr_items 11.5ms, cr_items 8.5ms, wr_items 2.6ms
+- Joins between returns and date_dim: sr_items 4.5ms, cr_items 1.6ms, wr_items 1.2ms
+- Joins between returns and item: sr_items 3.5ms, cr_items 3.6ms, wr_items 2.7ms
+- Main query joins: 1.3ms + 2.0ms = 3.3ms
+
+Cardinality flow:
+- date_dim base scan: 73K rows → filtered to 3 rows (the three literal dates) → week sequence filter → 21 rows (dates in those weeks)
+- Each returns table filtered via join: store_returns 176K rows, catalog_returns 97K rows, web_returns 57K rows
+- After join with item and aggregation: sr_items ~20K rows, cr_items ~12K rows, wr_items ~6.8K rows
+- Final join reduces to 633 rows, limit 100
+
+Scan counts per base table:
+- date_dim: scanned 9 times (3x for each CTE: outer scan, inner week_seq scan, inner date scan)
+- item: scanned 3 times (once per CTE)
+- store_returns: 1 scan
+- catalog_returns: 1 scan  
+- web_returns: 1 scan
+
+The optimizer already:
+- Splits CTEs (each CTE executed independently)
+- Pushes date predicates into scans (filters on d_date_sk ranges)
+- Uses hash joins and semi-joins efficiently
+- Does NOT share the date filter computation across CTEs (each CTE recomputes the same 21-row date set)
+
+**3. GAP MATCHING**
+- **CROSS_CTE_PREDICATE_BLINDNESS**: Active. Each CTE independently computes the same date filter (21 rows). Opportunity: extract shared date filter into a common CTE.
+- **REDUNDANT_SCAN_ELIMINATION**: Partially active. date_dim scanned 9 times, item scanned 3 times. Opportunity: pre-filter date_dim once, pre-join item once with returns via single-pass aggregation?
+- **SINGLE_PASS_AGGREGATION**: Not directly applicable because returns are in separate tables. However, could use UNION ALL to consolidate scans of different returns tables? But they're different tables.
+- **CHANNEL_BITMAP_AGGREGATION**: Not applicable (different fact tables, not repeated scans of same table).
+
+**4. AGGREGATION TRAP CHECK**
+Only SUM aggregation used. No FILTER clauses. All aggregates are over base fact tables, no window functions. Grouping is by item_id only. Changing join order could affect multiplicities if many-to-many joins introduced, but current joins are fact→dimension (one-to-many from item to returns? Actually, one item can have many returns, but we're aggregating returns by item, so join with item doesn't change aggregation groups because we group on item_id after the join. Safe.
+
+**5. TRANSFORM SELECTION**
+Ranked opportunities:
+1. **date_cte_isolate** (4.00x historical): Extract date filter into shared CTE to avoid 9 date_dim scans.
+2. **shared_dimension_multi_channel** (1.30x): Extract shared date + item filters? Item not filtered but could pre-join.
+3. **single_pass_aggregation** variant: Consolidate three CTEs into one UNION ALL scan of all returns tables, then join with date and item once, then conditional aggregation by channel.
+4. **prefetch_fact_join** (3.77x): Build CTE chain: filtered dates → pre-join with each returns table → then join with item.
+
+But need structural diversity:
+- Worker 1: date_cte_isolate (predicate movement)
+- Worker 2: shared_dimension_multi_channel + dimension_cte_isolate (star-join prefetch)
+- Worker 3: single_pass_aggregation via UNION ALL (scan consolidation)
+- Worker 4: Exploration: compound strategy combining date CTE with late attribute binding (defer item join until after aggregation)
+
+**6. LOGICAL TREE DESIGN**
+For each strategy, define CTEs that ensure column completeness.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compare item return quantities across store, catalog, and web channels for weeks containing three reference dates in 2001, reporting each channel's deviation from the cross-channel average. All three CTEs must match on item_id (INNER JOIN intersection). Only SUM aggregates are used, with no FILTER clauses or window functions. The date filter (weeks containing 2001-06-06, 2001-09-02, 2001-11-11) is identical across all three channels and must be preserved exactly.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound on store_returns (17.6ms, 22% of total). The three CTEs independently scan date_dim 9 times and item 3 times, recomputing the same 21-row date filter each time. The optimizer already pushes date predicates into scans and uses efficient hash joins, but does NOT share the date filter computation across CTEs. Cardinality flows: date filter reduces to 21 rows, each returns table filtered to 57K-176K rows, aggregated to 6K-20K rows per channel, final join to 633 rows. Logical-tree cost percentages are misleading: sr_items shows 25% but consumes ~40ms in wall time.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must preserve all 8 output columns exactly as named.
+- CTE_COLUMN_COMPLETENESS: Each CTE must output all columns referenced by downstream joins (item_id, return quantities).
+- LITERAL_PRESERVATION: Must keep date literals '2001-06-06','2001-09-02','2001-11-11' unchanged.
+- SEMANTIC_EQUIVALENCE: Result set must match original exactly (same rows, order, columns).
+- CROSS_CTE_PREDICATE_BLINDNESS: Each CTE independently computes same date filter (21 rows) - evident from 9 date_dim scans in EXPLAIN.
+- REDUNDANT_SCAN_ELIMINATION: date_dim scanned 9 times, item scanned 3 times - opportunity to reduce.
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline <100ms, CTE overhead exceeded savings.
+   RULE: This query is 79ms - borderline. Ensure date CTE is small (<100 rows) and referenced multiple times.
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Baseline <50ms, CTE materialization overhead dominated.
+   RULE: This query is 79ms - may still benefit but keep CTE chain minimal.
+3. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join multiple dimension CTEs; keep joins sequential.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: date_cte_isolate
+TARGET_LOGICAL_TREE:
+  filtered_dates -> sr_items -> cr_items -> wr_items -> main_query
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_week_seq IN (SELECT d_week_seq FROM date_dim WHERE d_date IN ('2001-06-06','2001-09-02','2001-11-11'))
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 21
+    CONSUMERS: sr_items, cr_items, wr_items
+  sr_items:
+    FROM: store_returns JOIN filtered_dates ON sr_returned_date_sk = d_date_sk JOIN item ON sr_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(sr_return_quantity) AS sr_item_qty
+    OUTPUT: i_item_id AS item_id, sr_item_qty
+    EXPECTED_ROWS: ~20K
+    CONSUMERS: main_query
+  cr_items:
+    FROM: catalog_returns JOIN filtered_dates ON cr_returned_date_sk = d_date_sk JOIN item ON cr_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(cr_return_quantity) AS cr_item_qty
+    OUTPUT: i_item_id AS item_id, cr_item_qty
+    EXPECTED_ROWS: ~12K
+    CONSUMERS: main_query
+  wr_items:
+    FROM: web_returns JOIN filtered_dates ON wr_returned_date_sk = d_date_sk JOIN item ON wr_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(wr_return_quantity) AS wr_item_qty
+    OUTPUT: i_item_id AS item_id, wr_item_qty
+    EXPECTED_ROWS: ~6.8K
+    CONSUMERS: main_query
+  main_query:
+    FROM: sr_items JOIN cr_items ON sr_items.item_id = cr_items.item_id JOIN wr_items ON sr_items.item_id = wr_items.item_id
+    WHERE: (none beyond joins)
+    OUTPUT: sr_items.item_id, sr_item_qty, sr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0*100 AS sr_dev, cr_item_qty, cr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0*100 AS cr_dev, wr_item_qty, wr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0*100 AS wr_dev, (sr_item_qty+cr_item_qty+wr_item_qty)/3.0 AS average
+    ORDER BY: sr_items.item_id, sr_item_qty
+    LIMIT: 100
+    EXPECTED_ROWS: 100
+    CONSUMERS: (output)
+EXAMPLES: date_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: Apply the pattern of extracting the date filter into a CTE that returns d_date_sk and d_date, then join in each channel CTE. Ignore the multi-date-range aspect (this query has only one date range).
+- early_filter: Apply the principle of filtering the dimension (date_dim) first, then joining to fact tables. Ignore the multi-dimension aspect (this query only has date_dim as filtered dimension).
+HAZARD_FLAGS:
+- CTE overhead may not justify gain given 79ms baseline.
+- Must ensure filtered_dates CTE outputs both d_date_sk (for joins) and d_date (if needed for debugging, though not referenced downstream).
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: shared_dimension_multi_channel
+TARGET_LOGICAL_TREE:
+  filtered_dates -> all_returns_union -> item_join -> channel_aggregation -> main_query
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_week_seq IN (SELECT d_week_seq FROM date_dim WHERE d_date IN ('2001-06-06','2001-09-02','2001-11-11'))
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 21
+    CONSUMERS: all_returns_union
+  all_returns_union:
+    FROM: (
+      SELECT sr_item_sk AS item_sk, sr_returned_date_sk AS returned_date_sk, sr_return_quantity AS return_qty, 'store' AS channel FROM store_returns
+      UNION ALL
+      SELECT cr_item_sk, cr_returned_date_sk, cr_return_quantity, 'catalog' FROM catalog_returns
+      UNION ALL
+      SELECT wr_item_sk, wr_returned_date_sk, wr_return_quantity, 'web' FROM web_returns
+    ) AS returns
+    JOIN filtered_dates ON returns.returned_date_sk = filtered_dates.d_date_sk
+    OUTPUT: item_sk, return_qty, channel
+    EXPECTED_ROWS: ~176K+97K+57K = 330K
+    CONSUMERS: item_join
+  item_join:
+    FROM: all_returns_union JOIN item ON item_sk = i_item_sk
+    OUTPUT: i_item_id AS item_id, return_qty, channel
+    EXPECTED_ROWS: ~330K
+    CONSUMERS: channel_aggregation
+  channel_aggregation:
+    FROM: item_join
+    GROUP BY: item_id, channel
+    AGGREGATE: SUM(return_qty) AS channel_qty
+    OUTPUT: item_id, channel, channel_qty
+    EXPECTED_ROWS: ~20K+12K+6.8K = ~38.8K
+    CONSUMERS: main_query
+  main_query:
+    FROM: channel_aggregation
+    PIVOT: Use MAX(CASE WHEN channel='store' THEN channel_qty END) AS sr_item_qty, similarly for catalog, web
+    THEN: same calculations as original
+    WHERE: (none)
+    OUTPUT: (same 8 columns as original)
+    ORDER BY: item_id, sr_item_qty
+    LIMIT: 100
+    EXPECTED_ROWS: 100
+    CONSUMERS: (output)
+EXAMPLES: shared_dimension_multi_channel, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- shared_dimension_multi_channel: Apply the pattern of extracting shared dimension filters (date) into a common CTE. Ignore the promotion/item filters (not present).
+- channel_bitmap_aggregation: Apply the pattern of consolidating multiple fact table scans into a single UNION ALL with a channel discriminator, then conditional aggregation. Ignore the CASE WHEN aggregation inside a single scan (here we have separate tables, so UNION ALL is required).
+HAZARD_FLAGS:
+- UNION ALL of three large tables may increase memory/IO.
+- Pivoting via MAX(CASE) requires ensuring one row per (item_id, channel) which GROUP BY guarantees.
+- Must preserve all three channels even if some items missing in a channel (INNER JOIN in main query will filter out items not present in all three channels).
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  filtered_dates -> sr_prejoin -> cr_prejoin -> wr_prejoin -> sr_items -> cr_items -> wr_items -> main_query
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_week_seq IN (SELECT d_week_seq FROM date_dim WHERE d_date IN ('2001-06-06','2001-09-02','2001-11-11'))
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 21
+    CONSUMERS: sr_prejoin, cr_prejoin, wr_prejoin
+  sr_prejoin:
+    FROM: store_returns JOIN filtered_dates ON sr_returned_date_sk = d_date_sk
+    OUTPUT: sr_item_sk, sr_return_quantity
+    EXPECTED_ROWS: ~176K
+    CONSUMERS: sr_items
+  cr_prejoin:
+    FROM: catalog_returns JOIN filtered_dates ON cr_returned_date_sk = d_date_sk
+    OUTPUT: cr_item_sk, cr_return_quantity
+    EXPECTED_ROWS: ~97K
+    CONSUMERS: cr_items
+  wr_prejoin:
+    FROM: web_returns JOIN filtered_dates ON wr_returned_date_sk = d_date_sk
+    OUTPUT: wr_item_sk, wr_return_quantity
+    EXPECTED_ROWS: ~57K
+    CONSUMERS: wr_items
+  sr_items:
+    FROM: sr_prejoin JOIN item ON sr_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(sr_return_quantity) AS sr_item_qty
+    OUTPUT: i_item_id AS item_id, sr_item_qty
+    EXPECTED_ROWS: ~20K
+    CONSUMERS: main_query
+  cr_items:
+    FROM: cr_prejoin JOIN item ON cr_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(cr_return_quantity) AS cr_item_qty
+    OUTPUT: i_item_id AS item_id, cr_item_qty
+    EXPECTED_ROWS: ~12K
+    CONSUMERS: main_query
+  wr_items:
+    FROM: wr_prejoin JOIN item ON wr_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(wr_return_quantity) AS wr_item_qty
+    OUTPUT: i_item_id AS item_id, wr_item_qty
+    EXPECTED_ROWS: ~6.8K
+    CONSUMERS: main_query
+  main_query: (same as original)
+EXAMPLES: prefetch_fact_join, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply the pattern of building a CTE chain: filter dimension first, then pre-join with fact table, then join remaining dimensions. Here, filtered_dates is the dimension, pre-join with returns tables, then join item. Ignore the multiple dimension tables (only date).
+- multi_dimension_prefetch: Apply the principle of pre-filtering multiple dimension tables, but here only date_dim is filtered. Ignore the store dimension (not present).
+HAZARD_FLAGS:
+- Increased CTE count may add materialization overhead.
+- Must ensure each prejoin CTE outputs all columns needed downstream (item_sk and return quantity).
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+  filtered_dates -> sr_agg -> cr_agg -> wr_agg -> main_query
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_week_seq IN (SELECT d_week_seq FROM date_dim WHERE d_date IN ('2001-06-06','2001-09-02','2001-11-11'))
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 21
+    CONSUMERS: sr_agg, cr_agg, wr_agg
+  sr_agg:
+    FROM: store_returns JOIN filtered_dates ON sr_returned_date_sk = d_date_sk
+    GROUP BY: sr_item_sk
+    AGGREGATE: SUM(sr_return_quantity) AS sr_qty
+    OUTPUT: sr_item_sk AS item_sk, sr_qty
+    EXPECTED_ROWS: ~? (distinct items in store returns for those dates)
+    CONSUMERS: main_query
+  cr_agg:
+    FROM: catalog_returns JOIN filtered_dates ON cr_returned_date_sk = d_date_sk
+    GROUP BY: cr_item_sk
+    AGGREGATE: SUM(cr_return_quantity) AS cr_qty
+    OUTPUT: cr_item_sk AS item_sk, cr_qty
+    EXPECTED_ROWS: ~?
+    CONSUMERS: main_query
+  wr_agg:
+    FROM: web_returns JOIN filtered_dates ON wr_returned_date_sk = d_date_sk
+    GROUP BY: wr_item_sk
+    AGGREGATE: SUM(wr_return_quantity) AS wr_qty
+    OUTPUT: wr_item_sk AS item_sk, wr_qty
+    EXPECTED_ROWS: ~?
+    CONSUMERS: main_query
+  main_query:
+    FROM: sr_agg JOIN cr_agg ON sr_agg.item_sk = cr_agg.item_sk JOIN wr_agg ON sr_agg.item_sk = wr_agg.item_sk
+    JOIN item ON sr_agg.item_sk = i_item_sk
+    OUTPUT: i_item_id AS item_id, sr_qty AS sr_item_qty, ... (same calculations)
+    ORDER BY: i_item_id, sr_qty
+    LIMIT: 100
+    EXPECTED_ROWS: 100
+    CONSUMERS: (output)
+EXAMPLES: dimension_cte_isolate, late_attribute_binding (novel)
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply the pattern of pre-filtering dimension tables into CTEs. Here, we pre-filter date_dim and defer the item join until after aggregation. Ignore the cross-joining of multiple dimension CTEs.
+- late_attribute_binding: This is a novel combination: aggregate returns by item_sk first (without joining item), then join with item only for the final SELECT to resolve i_item_id. This reduces the item table scan to one join at the end.
+HAZARD_FLAGS:
+- Aggregating by item_sk instead of i_item_id changes group key (but they are 1:1 via join).
+- Must ensure item join doesn't filter out any rows (should be INNER JOIN on same sk).
+- The three aggregated CTEs may have different sets of item_sk; final join must be INNER (matching original semantics).
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This strategy does not violate any correctness constraints; it merely changes the order of joins and aggregation.
+EXPLORATION_TYPE: novel_combination

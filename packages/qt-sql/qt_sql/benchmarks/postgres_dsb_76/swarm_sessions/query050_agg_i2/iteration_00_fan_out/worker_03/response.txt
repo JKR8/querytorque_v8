@@ -1,0 +1,113 @@
+## Modified Logic Tree
+
+```
+QUERY: (CTE-based decomposition)
+├── [~] d2_filtered
+│   ├── FROM: date_dim d2
+│   ├── FILTER: d_year = 1999 AND d_moy = 7
+│   └── OUTPUT: d_date_sk, d_date
+├── [~] store_returns_filtered  
+│   ├── FROM: store_returns, d2_filtered
+│   ├── JOIN: sr_returned_date_sk = d2_filtered.d_date_sk
+│   └── OUTPUT: sr_item_sk, sr_ticket_number, sr_customer_sk, sr_returned_date_sk, d2_filtered.d_date
+├── [~] sales_returns_joined
+│   ├── FROM: store_sales, store_returns_filtered
+│   ├── JOIN: ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number AND ss_customer_sk = sr_customer_sk
+│   └── OUTPUT: ss_store_sk, ss_sold_date_sk, sr_returned_date_sk, d2_filtered.d_date
+├── [~] d1_joined
+│   ├── FROM: sales_returns_joined, date_dim d1
+│   ├── JOIN: ss_sold_date_sk = d1.d_date_sk
+│   ├── FILTER: d1.d_date BETWEEN (d2_filtered.d_date - INTERVAL '120 DAY') AND d2_filtered.d_date
+│   └── OUTPUT: ss_store_sk, sr_returned_date_sk, ss_sold_date_sk
+├── [~] pre_aggregated
+│   ├── FROM: d1_joined
+│   ├── GROUP BY: ss_store_sk
+│   ├── AGGREGATE: conditional bucket sums (5 buckets)
+│   └── OUTPUT: ss_store_sk, "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"
+├── [~] store_joined
+│   ├── FROM: pre_aggregated, store
+│   ├── JOIN: ss_store_sk = s_store_sk
+│   └── OUTPUT: 10 store columns + 5 bucket columns
+├── [~] sorted
+│   ├── ORDER BY: 10 store columns (same order as original)
+│   └── OUTPUT: same columns as store_joined
+└── [=] limited
+    └── LIMIT: 100
+```
+
+Changes:
+- `[~]` All nodes modified from implicit comma joins to explicit CTEs with exact output columns
+- `[~]` Pre-aggregation groups by ss_store_sk only (store columns deferred to final join)
+- `[=]` Final limit unchanged
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL 16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "cte_decomposition", "description": "Replace implicit comma joins with explicit CTE pipeline matching Target Logical Tree", "applied_to": ["d2_filtered", "store_returns_filtered", "sales_returns_joined", "d1_joined", "pre_aggregated", "store_joined"]},
+    {"id": "R2", "type": "late_attribute_binding", "description": "Defer store column expansion until after aggregation (ss_store_sk → store 1:1)", "applied_to": ["pre_aggregated"]},
+    {"id": "R3", "type": "without_materialized", "description": "Use non-materialized CTEs to preserve parallelism", "applied_to": ["d2_filtered", "store_returns_filtered", "sales_returns_joined", "d1_joined", "pre_aggregated"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "d2_filtered": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_year = 1999 AND d_moy = 7",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "store_returns_filtered": {
+        "type": "cte",
+        "change": "modified", 
+        "sql": "SELECT sr_item_sk, sr_ticket_number, sr_customer_sk, sr_returned_date_sk, d2.d_date FROM store_returns JOIN d2_filtered d2 ON sr_returned_date_sk = d2.d_date_sk",
+        "interfaces": {"outputs": ["sr_item_sk", "sr_ticket_number", "sr_customer_sk", "sr_returned_date_sk", "d_date"], "consumes": ["d2_filtered"]}
+      },
+      "sales_returns_joined": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_store_sk, ss_sold_date_sk, srf.sr_returned_date_sk, srf.d_date FROM store_sales JOIN store_returns_filtered srf ON ss_item_sk = srf.sr_item_sk AND ss_ticket_number = srf.sr_ticket_number AND ss_customer_sk = srf.sr_customer_sk",
+        "interfaces": {"outputs": ["ss_store_sk", "ss_sold_date_sk", "sr_returned_date_sk", "d_date"], "consumes": ["store_returns_filtered"]}
+      },
+      "d1_joined": {
+        "type": "cte", 
+        "change": "modified",
+        "sql": "SELECT srj.ss_store_sk, srj.sr_returned_date_sk, srj.ss_sold_date_sk FROM sales_returns_joined srj JOIN date_dim d1 ON srj.ss_sold_date_sk = d1.d_date_sk WHERE d1.d_date BETWEEN (srj.d_date - INTERVAL '120 DAY') AND srj.d_date",
+        "interfaces": {"outputs": ["ss_store_sk", "sr_returned_date_sk", "ss_sold_date_sk"], "consumes": ["sales_returns_joined"]}
+      },
+      "pre_aggregated": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_store_sk, SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS \"30 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 30) AND (sr_returned_date_sk - ss_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS \"31-60 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 60) AND (sr_returned_date_sk - ss_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS \"61-90 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 90) AND (sr_returned_date_sk - ss_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS \"91-120 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 120) THEN 1 ELSE 0 END) AS \">120 days\" FROM d1_joined GROUP BY ss_store_sk",
+        "interfaces": {"outputs": ["ss_store_sk", "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"], "consumes": ["d1_joined"]}
+      },
+      "store_joined": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, pa.\"30 days\", pa.\"31-60 days\", pa.\"61-90 days\", pa.\"91-120 days\", pa.\">120 days\" FROM pre_aggregated pa JOIN store ON pa.ss_store_sk = store.s_store_sk",
+        "interfaces": {"outputs": ["s_store_name", "s_company_id", "s_street_number", "s_street_name", "s_street_type", "s_suite_number", "s_city", "s_county", "s_state", "s_zip", "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"], "consumes": ["pre_aggregated"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT * FROM store_joined ORDER BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip LIMIT 100",
+        "interfaces": {"outputs": ["s_store_name", "s_company_id", "s_street_number", "s_street_name", "s_street_type", "s_suite_number", "s_city", "s_county", "s_state", "s_zip", "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"], "consumes": ["store_joined"]}
+      }
+    },
+    "reconstruction_order": ["d2_filtered", "store_returns_filtered", "sales_returns_joined", "d1_joined", "pre_aggregated", "store_joined", "main_query"],
+    "assembly_template": "WITH d2_filtered AS ({d2_filtered}), store_returns_filtered AS ({store_returns_filtered}), sales_returns_joined AS ({sales_returns_joined}), d1_joined AS ({d1_joined}), pre_aggregated AS ({pre_aggregated}), store_joined AS ({store_joined}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Structural decomposition into CTEs following the target logical tree, with late binding of store attributes after aggregation. This enables early filtering and reduces the group-by cardinality.
+
+**Expected speedup:** 2-3x due to reduced intermediate row counts and preserved parallelism from non-materialized CTEs.

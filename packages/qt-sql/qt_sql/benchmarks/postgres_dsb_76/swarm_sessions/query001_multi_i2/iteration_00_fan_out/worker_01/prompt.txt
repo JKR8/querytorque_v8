@@ -1,0 +1,392 @@
+You are a SQL rewrite engine for PostgreSQL v16.11-0ubuntu0.24.04.1). Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+## Semantic Contract (MUST preserve)
+
+Find customers with high return amounts in 2000 compared to their store average, filtering for specific demographics and locations. All joins are INNER (all sides must match). The correlated subquery computes average returns PER STORE (grouping by ctr_store_sk), comparing individual customer returns against 1.2× that store average. The AVG must include ALL customers/reasons for that store, not just those matching the outer row's reason_sk filter. The ratio filter (sr_return_amt/sr_return_quantity BETWEEN 115 AND 174) must be applied BEFORE aggregation.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+filtered_store_returns -> store_averages -> customer_returns -> dimension_joins -> final
+NODE_CONTRACTS:
+  filtered_store_returns:
+    FROM: store_returns JOIN date_dim ON sr_returned_date_sk = d_date_sk
+    WHERE: d_year = 2000 AND sr_return_amt / sr_return_quantity BETWEEN 115 AND 174
+    OUTPUT: sr_customer_sk, sr_store_sk, sr_reason_sk, SR_RETURN_AMT_INC_TAX
+    EXPECTED_ROWS: ~93K
+    CONSUMERS: store_averages, customer_returns
+  store_averages:
+    FROM: filtered_store_returns
+    GROUP BY: sr_store_sk
+    AGGREGATE: AVG(SR_RETURN_AMT_INC_TAX) * 1.2 AS store_avg_threshold
+    OUTPUT: sr_store_sk, store_avg_threshold
+    EXPECTED_ROWS: ~number of distinct stores in filtered data
+    CONSUMERS: customer_returns
+  customer_returns:
+    FROM: filtered_store_returns
+    GROUP BY: sr_customer_sk, sr_store_sk, sr_reason_sk
+    AGGREGATE: SUM(SR_RETURN_AMT_INC_TAX) AS ctr_total_return
+    OUTPUT: sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, sr_reason_sk AS ctr_reason_sk, ctr_total_return
+    EXPECTED_ROWS: ~93K (same groups as original CTE)
+    CONSUMERS: dimension_joins
+  dimension_joins:
+    FROM: customer_returns cr JOIN store_averages sa ON cr.ctr_store_sk = sa.sr_store_sk
+          JOIN store ON s_store_sk = cr.ctr_store_sk
+          JOIN customer ON c_customer_sk = cr.ctr_customer_sk
+          JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk
+    WHERE: cr.ctr_total_return > sa.store_avg_threshold
+           AND cr.ctr_reason_sk BETWEEN 17 AND 20
+           AND s_state IN ('IA', 'KY', 'NE')
+           AND cd_marital_status IN ('S', 'S')
+           AND cd_education_status IN ('4 yr Degree', '4 yr Degree')
+           AND cd_gender = 'M'
+           AND c_birth_month = 4
+           AND c_birth_year BETWEEN 1987 AND 1993
+    OUTPUT: c_customer_id
+    EXPECTED_ROWS: ~final rows
+    CONSUMERS: final
+
+NODE_CONTRACTS:
+filtered_store_returns:
+    FROM: store_returns JOIN date_dim ON sr_returned_date_sk = d_date_sk
+    WHERE: d_year = 2000 AND sr_return_amt / sr_return_quantity BETWEEN 115 AND 174
+    OUTPUT: sr_customer_sk, sr_store_sk, sr_reason_sk, SR_RETURN_AMT_INC_TAX
+    EXPECTED_ROWS: ~93K
+    CONSUMERS: store_averages, customer_returns
+  store_averages:
+    FROM: filtered_store_returns
+    GROUP BY: sr_store_sk
+    AGGREGATE: AVG(SR_RETURN_AMT_INC_TAX) * 1.2 AS store_avg_threshold
+    OUTPUT: sr_store_sk, store_avg_threshold
+    EXPECTED_ROWS: ~number of distinct stores in filtered data
+    CONSUMERS: customer_returns
+  customer_returns:
+    FROM: filtered_store_returns
+    GROUP BY: sr_customer_sk, sr_store_sk, sr_reason_sk
+    AGGREGATE: SUM(SR_RETURN_AMT_INC_TAX) AS ctr_total_return
+    OUTPUT: sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, sr_reason_sk AS ctr_reason_sk, ctr_total_return
+    EXPECTED_ROWS: ~93K (same groups as original CTE)
+    CONSUMERS: dimension_joins
+  dimension_joins:
+    FROM: customer_returns cr JOIN store_averages sa ON cr.ctr_store_sk = sa.sr_store_sk
+          JOIN store ON s_store_sk = cr.ctr_store_sk
+          JOIN customer ON c_customer_sk = cr.ctr_customer_sk
+          JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk
+    WHERE: cr.ctr_total_return > sa.store_avg_threshold
+           AND cr.ctr_reason_sk BETWEEN 17 AND 20
+           AND s_state IN ('IA', 'KY', 'NE')
+           AND cd_marital_status IN ('S', 'S')
+           AND cd_education_status IN ('4 yr Degree', '4 yr Degree')
+           AND cd_gender = 'M'
+           AND c_birth_month = 4
+           AND c_birth_year BETWEEN 1987 AND 1993
+    OUTPUT: c_customer_id
+    EXPECTED_ROWS: ~final rows
+    CONSUMERS: final
+
+## Hazard Flags (avoid these specific risks)
+
+- Must ensure store_averages includes ALL rows from filtered_store_returns, not just those with reason_sk 17-20.
+- The AVG must be computed per store across ALL customers/reasons, matching original correlation semantics.
+
+## Regression Warnings (observed failures on similar queries)
+
+None applicable.
+
+## Constraints (analyst-filtered for this query)
+
+- CORRECTNESS_CONSTRAINT_ID: COMPLETE_OUTPUT: Must output exactly c_customer_id ordered ascending.
+- CORRECTNESS_CONSTRAINT_ID: CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (ctr_customer_sk, ctr_store_sk, ctr_reason_sk, ctr_total_return, plus join keys for dimensions).
+- CORRECTNESS_CONSTRAINT_ID: LITERAL_PRESERVATION: All filter values (2000, 115, 174, 17, 20, 'IA', 'KY', 'NE', 'S', '4 yr Degree', 'M', 4, 1987, 1993) must be preserved exactly.
+- CORRECTNESS_CONSTRAINT_ID: SEMANTIC_EQUIVALENCE: Must return same 100 customer IDs in same order.
+- ENGINE_GAP_ID: CORRELATED_SUBQUERY_PARALYSIS: EXPLAIN shows SubPlan executed 8,834 times (4.9ms each), scanning entire CTE each time.
+- ENGINE_GAP_ID: COMMA_JOIN_WEAKNESS: Query uses comma-separated implicit joins in CTE and main query, confusing cardinality estimation.
+- ENGINE_GAP_ID: CROSS_CTE_PREDICATE_BLINDNESS: Same CTE scanned twice (ctr1, ctr2) with predicate ctr1.ctr_store_sk = ctr2.ctr_store_sk applied late.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- inline_decorrelate_materialized: Apply the 3-CTE structure (filtered facts, pre-aggregated thresholds, main aggregates). Use AS MATERIALIZED on CTEs. Ignore the dimension pre-filtering aspect - we handle dimensions in main join.
+- pg_self_join_decomposition: Apply the principle of computing store averages ONCE from the filtered fact data. Ignore the UNION ALL aspect - this query has no UNION.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. inline_decorrelate_materialized (timeout_rescue)
+
+**Principle:** Inline Decorrelation with MATERIALIZED CTEs: When a WHERE clause contains a correlated scalar subquery (e.g., col > (SELECT 1.3 * avg(col) FROM ... WHERE correlated_key = outer.key)), PostgreSQL re-executes the subquery per outer row. Fix: decompose into 3 MATERIALIZED CTEs — (1) pre-filter dimension table, (2) pre-filter fact table by date range, (3) compute per-key aggregate threshold from filtered data — then JOIN the threshold CTE in the final query. MATERIALIZED keyword prevents PG from inlining the CTEs back into correlated form.
+
+**BEFORE (slow):**
+```sql
+select  sum(cs_ext_discount_amt)  as "excess discount amount"
+from
+   catalog_sales
+   ,item
+   ,date_dim
+where
+(i_manufact_id in (1, 78, 97, 516, 521)
+or i_manager_id BETWEEN 25 and 54)
+and i_item_sk = cs_item_sk
+and d_date between '1999-03-07' and
+        cast('1999-03-07' as date) + interval '90 day'
+and d_date_sk = cs_sold_date_sk
+and cs_ext_discount_amt
+     > (
+         select
+            1.3 * avg(cs_ext_discount_amt)
+         from
+            catalog_sales
+           ,date_dim
+         where
+              cs_item_sk = i_item_sk
+          and d_date between '1999-03-07' and
+                             cast('1999-03-07' as date) + interval '90 day'
+          and d_date_sk = cs_sold_date_sk
+          and cs_list_price between 16 and 45
+          and cs_sales_price / cs_list_price BETWEEN 63 * 0.01 AND 83 * 0.01
+      )
+order by sum(cs_ext_discount_amt)
+limit 100;
+```
+
+**AFTER (fast):**
+```sql
+WITH filtered_items AS MATERIALIZED (
+    SELECT i_item_sk
+    FROM item
+    WHERE i_manufact_id IN (1, 78, 97, 516, 521)
+       OR i_manager_id BETWEEN 25 AND 54
+),
+date_filtered_sales AS MATERIALIZED (
+    SELECT cs.cs_item_sk, cs.cs_ext_discount_amt,
+           cs.cs_list_price, cs.cs_sales_price
+    FROM catalog_sales cs
+    JOIN date_dim d ON d.d_date_sk = cs.cs_sold_date_sk
+    WHERE d.d_date BETWEEN '1999-03-07' AND cast('1999-03-07' as date) + interval '90 day'
+),
+item_avg_discount AS MATERIALIZED (
+    SELECT dfs.cs_item_sk,
+           1.3 * avg(dfs.cs_ext_discount_amt) AS threshold
+    FROM date_filtered_sales dfs
+    JOIN filtered_items fi ON fi.i_item_sk = dfs.cs_item_sk
+    WHERE dfs.cs_list_price BETWEEN 16 AND 45
+      AND dfs.cs_sales_price / dfs.cs_list_price BETWEEN 63 * 0.01 AND 83 * 0.01
+    GROUP BY dfs.cs_item_sk
+)
+SELECT sum(dfs.cs_ext_discount_amt) AS "excess discount amount"
+FROM date_filtered_sales dfs
+JOIN item_avg_discount iad ON iad.cs_item_sk = dfs.cs_item_sk
+WHERE dfs.cs_ext_discount_amt > iad.threshold
+ORDER BY 1
+LIMIT 100;
+```
+
+### 2. pg_self_join_decomposition (3.93x)
+
+**Principle:** Shared Materialization (PG): when the same fact+dimension scan appears multiple times in self-join patterns, materialize it once as a CTE and derive all needed aggregates from the same result. PostgreSQL materializes CTEs by default, making this extremely effective.
+
+**BEFORE (slow):**
+```sql
+select 
+	s_store_name,
+	i_item_desc,
+	sc.revenue,
+	i_current_price,
+	i_wholesale_cost,
+	i_brand
+ from store, item,
+     (select ss_store_sk, avg(revenue) as ave
+	from
+	    (select  ss_store_sk, ss_item_sk,
+		     sum(ss_sales_price) as revenue
+		from store_sales, date_dim
+		where ss_sold_date_sk = d_date_sk and d_month_seq between 1213 and 1213+11
+   and ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+		group by ss_store_sk, ss_item_sk) sa
+	group by ss_store_sk) sb,
+     (select  ss_store_sk, ss_item_sk, sum(ss_sales_price) as revenue
+	from store_sales, date_dim
+	where ss_sold_date_sk = d_date_sk and d_month_seq between 1213 and 1213+11
+  and ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+	group by ss_store_sk, ss_item_sk) sc
+ where sb.ss_store_sk = sc.ss_store_sk and
+       sc.revenue <= 0.1 * sb.ave and
+       s_store_sk = sc.ss_store_sk and
+       i_item_sk = sc.ss_item_sk
+       and i_manager_id BETWEEN 32 and 36
+       and s_state in ('TN','TX','VA')
+ order by s_store_name, i_item_desc
+limit 100;
+```
+
+**AFTER (fast):**
+[date_filter]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1213 AND 1224
+```
+[store_sales_revenue]:
+```sql
+SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk WHERE ss_sales_price / ss_list_price BETWEEN 0.38 AND 0.48 GROUP BY ss_store_sk, ss_item_sk
+```
+[store_avg_revenue]:
+```sql
+SELECT ss_store_sk, AVG(revenue) AS ave FROM store_sales_revenue GROUP BY ss_store_sk
+```
+[filtered_store]:
+```sql
+SELECT s_store_sk, s_store_name FROM store WHERE s_state IN ('TN', 'TX', 'VA')
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk, i_item_desc, i_current_price, i_wholesale_cost, i_brand FROM item WHERE i_manager_id BETWEEN 32 AND 36
+```
+[main_query]:
+```sql
+SELECT s_store_name, i_item_desc, sc.revenue, i_current_price, i_wholesale_cost, i_brand FROM store_avg_revenue AS sb JOIN store_sales_revenue AS sc ON sb.ss_store_sk = sc.ss_store_sk JOIN filtered_store AS s ON sc.ss_store_sk = s.s_store_sk JOIN filtered_item AS i ON sc.ss_item_sk = i.i_item_sk WHERE sc.revenue <= 0.1 * sb.ave ORDER BY s_store_name, i_item_desc LIMIT 100
+```
+
+## Original SQL
+
+```sql
+with customer_total_return as
+(select sr_customer_sk as ctr_customer_sk
+,sr_store_sk as ctr_store_sk
+,sr_reason_sk as ctr_reason_sk
+,sum(SR_RETURN_AMT_INC_TAX) as ctr_total_return
+from store_returns
+,date_dim
+where sr_returned_date_sk = d_date_sk
+and d_year =2000
+and sr_return_amt / sr_return_quantity between 115 and 174
+group by sr_customer_sk
+,sr_store_sk, sr_reason_sk)
+ select  c_customer_id
+from customer_total_return ctr1
+,store
+,customer
+,customer_demographics
+where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2
+from customer_total_return ctr2
+where ctr1.ctr_store_sk = ctr2.ctr_store_sk
+)
+and ctr1.ctr_reason_sk BETWEEN 17 AND 20
+and s_store_sk = ctr1.ctr_store_sk
+and s_state IN ('IA', 'KY', 'NE')
+and ctr1.ctr_customer_sk = c_customer_sk
+and c_current_cdemo_sk = cd_demo_sk
+and cd_marital_status IN ('S', 'S')
+and cd_education_status IN ('4 yr Degree', '4 yr Degree')
+and cd_gender = 'M'
+and c_birth_month = 4
+and c_birth_year BETWEEN 1987 AND 1993
+order by c_customer_id
+limit 100;
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] customer_total_return  [=]  Cost: 4%  Rows: ~93K
+│   ├── SCAN (store_returns, date_dim (join))
+│   ├── JOIN (sr_returned_date_sk = d_date_sk)
+│   ├── FILTER (d_year = 2000)
+│   ├── FILTER (sr_return_amt / sr_return_quantity BETWEEN 115 AND 174)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (ctr_customer_sk, ctr_store_sk, ctr_reason_sk, ctr_total_return)
+└── [MAIN] main_query  [=]  Cost: 96%  Rows: ~21.1M
+    ├── SCAN (customer_total_return AS ctr1 (join), store (join), customer (join), customer_demographics (join), customer_total_return AS ctr2 (correlated subquery))
+    ├── JOIN (s_store_sk = ctr1.ctr_store_sk)
+    ├── JOIN (ctr1.ctr_customer_sk = c_customer_sk)
+    ├── JOIN (+1 more)
+    ├── FILTER (ctr1.ctr_total_return > AVG(ctr_total_return) * 1.2 (per store_sk))
+    ├── FILTER (ctr1.ctr_reason_sk BETWEEN 17 AND 20)
+    ├── FILTER (+6 more)
+    ├── AGG (GROUP BY)
+    ├── SORT (c_customer_id ASC)
+    └── OUTPUT (c_customer_id)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit or use empty array if not needed
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

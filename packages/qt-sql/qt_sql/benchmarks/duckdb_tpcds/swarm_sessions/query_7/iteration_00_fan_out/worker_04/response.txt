@@ -1,0 +1,98 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE chain then final SELECT)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: 100 — Same logic but restructured as CTE pipeline
+    ├── [CTE] date_cte  [+]  Rows: 365 — Pre-filter date_dim for 2001
+    │   └── SCAN date_dim WHERE d_year=2001 → d_date_sk
+    ├── [CTE] customer_demo_cte  [+]  Rows: 27K — Pre-filter demographics for F/W/College
+    │   └── SCAN customer_demographics → cd_demo_sk
+    ├── [CTE] promotion_cte  [+]  Rows: 500 — Pre-filter promotions with email/event disabled
+    │   └── SCAN promotion WHERE (p_channel_email='N' OR p_channel_event='N') → p_promo_sk
+    ├── [CTE] filtered_sales  [+]  Rows: 5.3M — Join fact table with three dimension CTEs
+    │   ├── SCAN store_sales
+    │   ├── JOIN INNER date_cte ON ss_sold_date_sk = d_date_sk
+    │   ├── JOIN INNER customer_demo_cte ON ss_cdemo_sk = cd_demo_sk
+    │   └── JOIN INNER promotion_cte ON ss_promo_sk = p_promo_sk
+    ├── [CTE] item_join_aggregate  [+]  Rows: 39K — Join items, group by i_item_id, compute averages
+    │   ├── SCAN filtered_sales
+    │   ├── JOIN INNER item ON ss_item_sk = i_item_sk
+    │   └── AGG GROUP BY i_item_id → AVG(ss_quantity), AVG(ss_list_price), AVG(ss_coupon_amt), AVG(ss_sales_price)
+    └── [CTE] top_n  [+]  Rows: 100 — Order by i_item_id and limit 100
+        ├── SCAN item_join_aggregate
+        ├── SORT i_item_id ASC
+        └── LIMIT 100
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter dimension tables into CTEs before joining with fact table", "applied_to": ["date_cte", "customer_demo_cte", "promotion_cte"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Join fact table with filtered dimension CTEs sequentially in a pipeline", "applied_to": ["filtered_sales"]},
+    {"id": "R3", "type": "aggregate_pushdown", "description": "Perform aggregation after joining with item dimension (no pushdown earlier due to group by item)", "applied_to": ["item_join_aggregate"]},
+    {"id": "R4", "type": "top_n_isolation", "description": "Separate final ordering/limiting into distinct CTE for clarity", "applied_to": ["top_n"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "customer_demo_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'F' AND cd_marital_status = 'W' AND cd_education_status = 'College'",
+        "interfaces": {"outputs": ["cd_demo_sk"], "consumes": []}
+      },
+      "promotion_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'",
+        "interfaces": {"outputs": ["p_promo_sk"], "consumes": []}
+      },
+      "filtered_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_item_sk, ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price FROM store_sales INNER JOIN date_cte ON ss_sold_date_sk = date_cte.d_date_sk INNER JOIN customer_demo_cte ON ss_cdemo_sk = customer_demo_cte.cd_demo_sk INNER JOIN promotion_cte ON ss_promo_sk = promotion_cte.p_promo_sk",
+        "interfaces": {"outputs": ["ss_item_sk", "ss_quantity", "ss_list_price", "ss_coupon_amt", "ss_sales_price"], "consumes": ["date_cte", "customer_demo_cte", "promotion_cte"]}
+      },
+      "item_join_aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_id, AVG(ss_quantity) AS agg1, AVG(ss_list_price) AS agg2, AVG(ss_coupon_amt) AS agg3, AVG(ss_sales_price) AS agg4 FROM filtered_sales INNER JOIN item ON ss_item_sk = i_item_sk GROUP BY i_item_id",
+        "interfaces": {"outputs": ["i_item_id", "agg1", "agg2", "agg3", "agg4"], "consumes": ["filtered_sales"]}
+      },
+      "top_n": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_id, agg1, agg2, agg3, agg4 FROM item_join_aggregate ORDER BY i_item_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "agg1", "agg2", "agg3", "agg4"], "consumes": ["item_join_aggregate"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_id, agg1, agg2, agg3, agg4 FROM top_n",
+        "interfaces": {"outputs": ["i_item_id", "agg1", "agg2", "agg3", "agg4"], "consumes": ["top_n"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "customer_demo_cte", "promotion_cte", "filtered_sales", "item_join_aggregate", "top_n", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), customer_demo_cte AS ({customer_demo_cte}), promotion_cte AS ({promotion_cte}), filtered_sales AS ({filtered_sales}), item_join_aggregate AS ({item_join_aggregate}), top_n AS ({top_n}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Changes
+Structural change: Converted the original monolithic join into a CTE pipeline that isolates dimension filtering first, then joins with the fact table, then aggregates, and finally applies ordering/limit. This follows the prefetch_fact_join pattern and avoids Cartesian explosion by joining dimension CTEs sequentially with the fact table.
+
+Expected speedup: 2-4x due to smaller hash tables for dimension lookups and better predicate pushdown into CTEs (though DuckDB may inline). The baseline is 707ms, so we expect 200-350ms.

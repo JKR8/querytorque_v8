@@ -1,0 +1,99 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_returns_cte  [~]  Added MATERIALIZED, changed comma join to explicit JOIN
+│   ├── SCAN (store_returns, date_dim (explicit JOIN))
+│   ├── FILTER (d_year = 2002)
+│   ├── FILTER (sr_return_amt / sr_return_quantity BETWEEN 108 AND 167)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (ctr_customer_sk, ctr_store_sk, ctr_reason_sk, ctr_total_return)
+├── [CTE] store_avg_threshold_cte  [+]  New CTE to precompute store thresholds
+│   ├── SCAN (filtered_returns_cte)
+│   ├── AGG (GROUP BY ctr_store_sk)
+│   └── OUTPUT (ctr_store_sk, store_avg_threshold)
+└── [MAIN] main_query  [~]  Changed from comma joins to explicit JOINs, replaced correlated subquery with CTE join
+    ├── SCAN (filtered_returns_cte AS ctr1, store_avg_threshold_cte AS th, store, customer, customer_demographics)
+    ├── JOIN (explicit: ctr1.ctr_store_sk = th.ctr_store_sk)
+    ├── JOIN (explicit: s_store_sk = ctr1.ctr_store_sk)
+    ├── JOIN (explicit: c_customer_sk = ctr1.ctr_customer_sk)
+    ├── JOIN (explicit: cd_demo_sk = c_current_cdemo_sk)
+    ├── FILTER (ctr1.ctr_total_return > th.store_avg_threshold)
+    ├── FILTER (ctr1.ctr_reason_sk BETWEEN 43 AND 46)
+    ├── FILTER (s_state IN ('IL', 'KY', 'TX'))
+    ├── FILTER (cd_marital_status IN ('M', 'M'))
+    ├── FILTER (cd_education_status IN ('Advanced Degree', 'College'))
+    ├── FILTER (cd_gender = 'F')
+    ├── FILTER (c_birth_month = 2)
+    ├── FILTER (c_birth_year BETWEEN 1965 AND 1971)
+    ├── SORT (c_customer_id ASC)
+    └── OUTPUT (c_customer_id)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "inline_decorrelate_materialized",
+      "description": "Replace correlated subquery with MATERIALIZED CTE that precomputes store thresholds from filtered returns",
+      "applied_to": ["filtered_returns_cte", "store_avg_threshold_cte", "main_query"]
+    },
+    {
+      "id": "R2",
+      "type": "explicit_join_conversion",
+      "description": "Convert comma-separated joins to explicit JOIN syntax for clarity and planner control",
+      "applied_to": ["filtered_returns_cte", "main_query"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_returns_cte": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, sr_reason_sk AS ctr_reason_sk, SUM(SR_RETURN_AMT_INC_TAX) AS ctr_total_return FROM store_returns JOIN date_dim ON sr_returned_date_sk = d_date_sk WHERE d_year = 2002 AND sr_return_amt / sr_return_quantity BETWEEN 108 AND 167 GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk",
+          "interfaces": {
+            "outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return"],
+            "consumes": []
+          }
+        },
+        "store_avg_threshold_cte": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS store_avg_threshold FROM filtered_returns_cte GROUP BY ctr_store_sk",
+          "interfaces": {
+            "outputs": ["ctr_store_sk", "store_avg_threshold"],
+            "consumes": ["filtered_returns_cte"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT c_customer_id FROM filtered_returns_cte AS ctr1 JOIN store_avg_threshold_cte AS th ON ctr1.ctr_store_sk = th.ctr_store_sk JOIN store ON s_store_sk = ctr1.ctr_store_sk JOIN customer ON c_customer_sk = ctr1.ctr_customer_sk JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk WHERE ctr1.ctr_total_return > th.store_avg_threshold AND ctr1.ctr_reason_sk BETWEEN 43 AND 46 AND s_state IN ('IL', 'KY', 'TX') AND cd_marital_status IN ('M', 'M') AND cd_education_status IN ('Advanced Degree', 'College') AND cd_gender = 'F' AND c_birth_month = 2 AND c_birth_year BETWEEN 1965 AND 1971 ORDER BY c_customer_id LIMIT 100",
+          "interfaces": {
+            "outputs": ["c_customer_id"],
+            "consumes": ["filtered_returns_cte", "store_avg_threshold_cte"]
+          }
+        }
+      },
+      "reconstruction_order": ["filtered_returns_cte", "store_avg_threshold_cte", "main_query"],
+      "assembly_template": "WITH filtered_returns_cte AS MATERIALIZED ({filtered_returns_cte}), store_avg_threshold_cte AS MATERIALIZED ({store_avg_threshold_cte}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced correlated subquery (executed 1,845 times) with MATERIALIZED CTEs that compute store thresholds once. The first CTE filters 2002 returns with per-unit price guard, the second CTE computes 1.2× average per store from all reasons, and the main query joins both CTEs and applies remaining filters.
+
+**Expected speedup**: 10-100× by eliminating repeated subquery execution and enabling hash joins between pre-materialized results.

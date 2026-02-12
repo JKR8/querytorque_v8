@@ -1,0 +1,346 @@
+You are a SQL rewrite engine for PostgreSQL v16.11-0ubuntu0.24.04.1). Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+## Semantic Contract (MUST preserve)
+
+This query finds customers who made store purchases and returns, then web purchases within 90 days, for items in specific categories, with specific discount ranges, living in certain states and demographic bands. It counts qualifying transaction combinations per customer. All joins are INNER (must match all sides). Aggregation uses COUNT(*) which is sensitive to row duplication from joins. The date range filter (d2 between d1 and d1+90) creates a temporal dependency between store returns and web sales.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+unified_facts -> conditional_aggregation -> dimensions -> sort
+NODE_CONTRACTS:
+  filtered_d1:
+    FROM: date_dim d1
+    WHERE: d1.d_year = 2000
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 122
+    CONSUMERS: date_range
+  date_range:
+    FROM: date_dim d2
+    JOIN: CROSS JOIN filtered_d1
+    WHERE: d2.d_date BETWEEN d1.d_date AND (d1.d_date + interval '90 day')
+    OUTPUT: d1.d_date_sk as d1_date_sk, d1.d_date as d1_date, d2.d_date_sk as d2_date_sk
+    EXPECTED_ROWS: ~44,730 (122 * 365 approximate)
+    CONSUMERS: unified_facts
+  unified_facts:
+    FROM: store_sales
+    JOIN: INNER JOIN store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+          INNER JOIN web_sales ON sr_item_sk = ws_item_sk AND ss_customer_sk = ws_bill_customer_sk
+          INNER JOIN item ON ss_item_sk = i_item_sk
+          INNER JOIN date_range ON sr_returned_date_sk = d1_date_sk AND ws_sold_date_sk = d2_date_sk
+    WHERE: i_category IN ('Children', 'Home', 'Women')
+          AND ss_sales_price / ss_list_price BETWEEN 76 * 0.01 AND 96 * 0.01
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: same as original qualifying rows
+    CONSUMERS: conditional_aggregation
+  conditional_aggregation:
+    FROM: unified_facts
+    GROUP BY: ss_customer_sk
+    AGGREGATE: COUNT(*) as cnt
+    OUTPUT: ss_customer_sk, cnt
+    EXPECTED_ROWS: same as original groups
+    CONSUMERS: customer_dimensions
+  customer_dimensions:
+    FROM: conditional_aggregation
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+          INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk
+          INNER JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk
+    WHERE: ca_state IN ('AR', 'GA', 'IN', 'KY', 'VA')
+          AND hd_income_band_sk BETWEEN 8 AND 14
+          AND hd_buy_potential = '501-1000'
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, cnt
+    EXPECTED_ROWS: filtered by state/demographics
+    CONSUMERS: sort
+  sort:
+    FROM: customer_dimensions
+    ORDER BY: cnt
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, cnt
+    EXPECTED_ROWS: same as original
+    CONSUMERS: final output
+
+NODE_CONTRACTS:
+filtered_d1:
+    FROM: date_dim d1
+    WHERE: d1.d_year = 2000
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 122
+    CONSUMERS: date_range
+  date_range:
+    FROM: date_dim d2
+    JOIN: CROSS JOIN filtered_d1
+    WHERE: d2.d_date BETWEEN d1.d_date AND (d1.d_date + interval '90 day')
+    OUTPUT: d1.d_date_sk as d1_date_sk, d1.d_date as d1_date, d2.d_date_sk as d2_date_sk
+    EXPECTED_ROWS: ~44,730 (122 * 365 approximate)
+    CONSUMERS: unified_facts
+  unified_facts:
+    FROM: store_sales
+    JOIN: INNER JOIN store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+          INNER JOIN web_sales ON sr_item_sk = ws_item_sk AND ss_customer_sk = ws_bill_customer_sk
+          INNER JOIN item ON ss_item_sk = i_item_sk
+          INNER JOIN date_range ON sr_returned_date_sk = d1_date_sk AND ws_sold_date_sk = d2_date_sk
+    WHERE: i_category IN ('Children', 'Home', 'Women')
+          AND ss_sales_price / ss_list_price BETWEEN 76 * 0.01 AND 96 * 0.01
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: same as original qualifying rows
+    CONSUMERS: conditional_aggregation
+  conditional_aggregation:
+    FROM: unified_facts
+    GROUP BY: ss_customer_sk
+    AGGREGATE: COUNT(*) as cnt
+    OUTPUT: ss_customer_sk, cnt
+    EXPECTED_ROWS: same as original groups
+    CONSUMERS: customer_dimensions
+  customer_dimensions:
+    FROM: conditional_aggregation
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+          INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk
+          INNER JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk
+    WHERE: ca_state IN ('AR', 'GA', 'IN', 'KY', 'VA')
+          AND hd_income_band_sk BETWEEN 8 AND 14
+          AND hd_buy_potential = '501-1000'
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, cnt
+    EXPECTED_ROWS: filtered by state/demographics
+    CONSUMERS: sort
+  sort:
+    FROM: customer_dimensions
+    ORDER BY: cnt
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, cnt
+    EXPECTED_ROWS: same as original
+    CONSUMERS: final output
+
+## Hazard Flags (avoid these specific risks)
+
+- Cross join between d1 and d2 may produce large intermediate result (~44K rows)
+- May lose parallel execution on large CTE
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines date_range precomputation with unified fact join)
+
+## Regression Warnings (observed failures on similar queries)
+
+1. CTE blocking parallelism (observed regression: 0.50x on Q069):
+   CAUSE: MATERIALIZED CTEs executed single-threaded prevent parallel table scans
+   RULE: Use non-materialized CTEs or inline subqueries for large fact tables when parallel scans are beneficial
+2. Nestloop disable on lookups (observed regression: 184x):
+   CAUSE: SET enable_nestloop=off forces hash/merge joins on selective index lookups
+   RULE: Never disable nestloop globally; allow optimizer to choose for point lookups
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Query outputs c_customer_sk, c_first_name, c_last_name, cnt
+- CTE_COLUMN_COMPLETENESS: All CTEs must include columns referenced downstream: ss_customer_sk, ss_item_sk, ss_ticket_number, sr_item_sk, sr_ticket_number, ws_bill_customer_sk, ws_item_sk, plus dimension keys
+- LITERAL_PRESERVATION: Must preserve exact filter values: i_category IN ('Children','Home','Women'), ca_state IN ('AR','GA','IN','KY','VA'), d_year=2000, etc.
+- SEMANTIC_EQUIVALENCE: Must return same rows, columns, ordering
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated implicit joins (evidence from original SQL)
+- NON_EQUI_JOIN_INPUT_BLINDNESS: Range join d2.d_date BETWEEN d1.d_date AND (d1.d_date + interval '90 day')
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- pg_self_join_decomposition: Apply materialization of the fact join pattern once, but adapt by joining all three fact tables in one CTE rather than reusing same scan.
+- single_pass_aggregation: Compute count from unified fact join in single pass. Ignore CASE/FILTER complexity since simple COUNT(*).
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. pg_self_join_decomposition (3.93x)
+
+**Principle:** Shared Materialization (PG): when the same fact+dimension scan appears multiple times in self-join patterns, materialize it once as a CTE and derive all needed aggregates from the same result. PostgreSQL materializes CTEs by default, making this extremely effective.
+
+**BEFORE (slow):**
+```sql
+select 
+	s_store_name,
+	i_item_desc,
+	sc.revenue,
+	i_current_price,
+	i_wholesale_cost,
+	i_brand
+ from store, item,
+     (select ss_store_sk, avg(revenue) as ave
+	from
+	    (select  ss_store_sk, ss_item_sk,
+		     sum(ss_sales_price) as revenue
+		from store_sales, date_dim
+		where ss_sold_date_sk = d_date_sk and d_month_seq between 1213 and 1213+11
+   and ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+		group by ss_store_sk, ss_item_sk) sa
+	group by ss_store_sk) sb,
+     (select  ss_store_sk, ss_item_sk, sum(ss_sales_price) as revenue
+	from store_sales, date_dim
+	where ss_sold_date_sk = d_date_sk and d_month_seq between 1213 and 1213+11
+  and ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+	group by ss_store_sk, ss_item_sk) sc
+ where sb.ss_store_sk = sc.ss_store_sk and
+       sc.revenue <= 0.1 * sb.ave and
+       s_store_sk = sc.ss_store_sk and
+       i_item_sk = sc.ss_item_sk
+       and i_manager_id BETWEEN 32 and 36
+       and s_state in ('TN','TX','VA')
+ order by s_store_name, i_item_desc
+limit 100;
+```
+
+**AFTER (fast):**
+[date_filter]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1213 AND 1224
+```
+[store_sales_revenue]:
+```sql
+SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk WHERE ss_sales_price / ss_list_price BETWEEN 0.38 AND 0.48 GROUP BY ss_store_sk, ss_item_sk
+```
+[store_avg_revenue]:
+```sql
+SELECT ss_store_sk, AVG(revenue) AS ave FROM store_sales_revenue GROUP BY ss_store_sk
+```
+[filtered_store]:
+```sql
+SELECT s_store_sk, s_store_name FROM store WHERE s_state IN ('TN', 'TX', 'VA')
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk, i_item_desc, i_current_price, i_wholesale_cost, i_brand FROM item WHERE i_manager_id BETWEEN 32 AND 36
+```
+[main_query]:
+```sql
+SELECT s_store_name, i_item_desc, sc.revenue, i_current_price, i_wholesale_cost, i_brand FROM store_avg_revenue AS sb JOIN store_sales_revenue AS sc ON sb.ss_store_sk = sc.ss_store_sk JOIN filtered_store AS s ON sc.ss_store_sk = s.s_store_sk JOIN filtered_item AS i ON sc.ss_item_sk = i.i_item_sk WHERE sc.revenue <= 0.1 * sb.ave ORDER BY s_store_name, i_item_desc LIMIT 100
+```
+
+## Original SQL
+
+```sql
+select  c_customer_sk, c_first_name, c_last_name, count(*) as cnt
+FROM
+store_sales,
+store_returns,
+web_sales,
+date_dim d1,
+date_dim d2,
+item,
+customer,
+customer_address,
+household_demographics
+WHERE
+ss_ticket_number = sr_ticket_number
+AND ss_customer_sk = ws_bill_customer_sk
+AND ss_customer_sk = c_customer_sk
+AND c_current_addr_sk = ca_address_sk
+AND c_current_hdemo_sk = hd_demo_sk
+AND ss_item_sk = sr_item_sk
+AND sr_item_sk = ws_item_sk
+AND i_item_sk = ss_item_sk
+AND i_category IN ('Children', 'Home', 'Women')
+AND sr_returned_date_sk = d1.d_date_sk
+AND ws_sold_date_sk = d2.d_date_sk
+AND d2.d_date between d1.d_date AND (d1.d_date + interval '90 day')
+AND ca_state in ('AR', 'GA', 'IN', 'KY', 'VA')
+AND d1.d_year = 2000
+AND hd_income_band_sk BETWEEN 8 AND 14
+AND hd_buy_potential = '501-1000'
+AND ss_sales_price / ss_list_price BETWEEN 76 * 0.01 AND 96 * 0.01
+GROUP BY c_customer_sk, c_first_name, c_last_name
+ORDER BY cnt
+;
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 99%  Rows: ~1.2M
+    ├── SCAN (store_sales, store_returns (join), web_sales (join), date_dim AS d1 (join), date_dim AS d2 (join), item (join), customer (join), customer_address (join), household_demographics (join))
+    ├── JOIN (ss_ticket_number = sr_ticket_number)
+    ├── JOIN (ss_customer_sk = ws_bill_customer_sk)
+    ├── JOIN (+8 more)
+    ├── FILTER (i_category IN ('Children', 'Home', 'Women'))
+    ├── FILTER (d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '90 DAY'))
+    ├── FILTER (+5 more)
+    ├── AGG (GROUP BY)
+    ├── SORT (cnt ASC)
+    └── OUTPUT (c_customer_sk, c_first_name, c_last_name, cnt)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit or use empty array if not needed
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

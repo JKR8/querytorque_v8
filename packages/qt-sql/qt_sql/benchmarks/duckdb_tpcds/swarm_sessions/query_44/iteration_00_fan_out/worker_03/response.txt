@@ -1,0 +1,81 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE chain)
+└── [MAIN] main_query [~] — Rewritten as CTE chain matching Target Logical Tree
+    ├── [CTE] store_baseline_cte [+] — New CTE computing baseline avg profit for store 146 with null address
+    ├── [CTE] item_aggregates_cte [+] — New CTE aggregating avg profit per item for store 146
+    ├── [CTE] item_cte [+] — New CTE pre-filtering item table to items in aggregates
+    ├── [CTE] asc_ranked [+] — New CTE ranking filtered items by ascending avg profit
+    ├── [CTE] desc_ranked [+] — New CTE ranking filtered items by descending avg profit
+    └── [~] final_join — Modified to join CTEs instead of original subqueries
+        ├── JOIN (asc_ranked.rnk = desc_ranked.rnk)
+        ├── JOIN (item_cte i1 ON asc_ranked.item_sk = i1.i_item_sk)
+        ├── JOIN (item_cte i2 ON desc_ranked.item_sk = i2.i_item_sk)
+        └── WHERE (asc_ranked.rnk < 11 AND desc_ranked.rnk < 11)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter item table to only items appearing in aggregates to avoid double scan", "applied_to": ["item_cte"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Chain CTEs to progressively reduce data: store baseline → item aggregates → item lookup → ranking", "applied_to": ["store_baseline_cte", "item_aggregates_cte", "item_cte", "asc_ranked", "desc_ranked"]},
+    {"id": "R3", "type": "early_filter", "description": "Apply store filter early in fact table CTEs and push baseline comparison to WHERE clause", "applied_to": ["store_baseline_cte", "item_aggregates_cte", "asc_ranked", "desc_ranked"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "store_baseline_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT AVG(ss_net_profit) AS store_avg FROM store_sales WHERE ss_store_sk = 146 AND ss_addr_sk IS NULL GROUP BY ss_store_sk",
+        "interfaces": {"outputs": ["store_avg"], "consumes": []}
+      },
+      "item_aggregates_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk AS item_sk, AVG(ss_net_profit) AS item_avg FROM store_sales WHERE ss_store_sk = 146 GROUP BY ss_item_sk",
+        "interfaces": {"outputs": ["item_sk", "item_avg"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk, i_product_name FROM item WHERE i_item_sk IN (SELECT item_sk FROM item_aggregates_cte)",
+        "interfaces": {"outputs": ["i_item_sk", "i_product_name"], "consumes": ["item_aggregates_cte"]}
+      },
+      "asc_ranked": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ia.item_sk, RANK() OVER (ORDER BY ia.item_avg ASC) AS rnk FROM item_aggregates_cte ia CROSS JOIN store_baseline_cte sb WHERE ia.item_avg > 0.9 * sb.store_avg",
+        "interfaces": {"outputs": ["item_sk", "rnk"], "consumes": ["item_aggregates_cte", "store_baseline_cte"]}
+      },
+      "desc_ranked": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ia.item_sk, RANK() OVER (ORDER BY ia.item_avg DESC) AS rnk FROM item_aggregates_cte ia CROSS JOIN store_baseline_cte sb WHERE ia.item_avg > 0.9 * sb.store_avg",
+        "interfaces": {"outputs": ["item_sk", "rnk"], "consumes": ["item_aggregates_cte", "store_baseline_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT asc_r.rnk AS rnk, i1.i_product_name AS best_performing, i2.i_product_name AS worst_performing FROM asc_ranked asc_r JOIN desc_ranked desc_r ON asc_r.rnk = desc_r.rnk JOIN item_cte i1 ON asc_r.item_sk = i1.i_item_sk JOIN item_cte i2 ON desc_r.item_sk = i2.i_item_sk WHERE asc_r.rnk < 11 AND desc_r.rnk < 11 ORDER BY asc_r.rnk LIMIT 100",
+        "interfaces": {"outputs": ["rnk", "best_performing", "worst_performing"], "consumes": ["asc_ranked", "desc_ranked", "item_cte"]}
+      }
+    },
+    "reconstruction_order": ["store_baseline_cte", "item_aggregates_cte", "item_cte", "asc_ranked", "desc_ranked", "main_query"],
+    "assembly_template": "WITH store_baseline_cte AS ({store_baseline_cte}), item_aggregates_cte AS ({item_aggregates_cte}), item_cte AS ({item_cte}), asc_ranked AS ({asc_ranked}), desc_ranked AS ({desc_ranked}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Rewrote original nested subqueries into explicit CTE chain following the Target Logical Tree structure, isolating dimension table (item) early, and preserving all original filters and join semantics.
+
+**Expected speedup:** ~2-4x from reduced duplicate scans and better join ordering (store_sales scanned twice instead of four times, item table scanned once then reused via CTE).

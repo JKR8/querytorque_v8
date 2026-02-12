@@ -1,0 +1,82 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K
+    ├── [~] filtered_items CTE (early item filter) [FROM item, WHERE i_manufact_id IN... OR i_manager_id BETWEEN]
+    ├── [~] filtered_dates CTE (date dimension filter) [FROM date_dim, WHERE d_date BETWEEN range]
+    ├── [+] sales_agg CTE (single-pass aggregation) [FROM catalog_sales JOIN filtered_dates, GROUP BY cs_item_sk]
+    ├── [+] threshold_derive CTE (compute 1.3*average) [FROM sales_agg WHERE qualifying_count > 0]
+    ├── [+] excess_filter CTE (join filtered_items, apply threshold) [JOIN threshold_derive + filtered_items, WHERE total_discount > threshold]
+    ├── [+] final_sum CTE (aggregate excess amounts) [FROM excess_filter, SUM(excess_amount)]
+    ├── SORT (SUM(excess_amount) ASC)  [=]
+    └── OUTPUT (excess discount amount)  [=]
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL v16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "decorrelate", "description": "Replace correlated subquery with pre-computed thresholds in CTEs", "applied_to": ["threshold_derive"]},
+    {"id": "R2", "type": "early_filter", "description": "Push item and date filters into dedicated CTEs before joins", "applied_to": ["filtered_items", "filtered_dates"]},
+    {"id": "R3", "type": "single_pass_aggregation", "description": "Compute qualifying average components (sum and count) in one aggregation pass", "applied_to": ["sales_agg"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_items": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk, i_manufact_id, i_manager_id FROM item WHERE i_manufact_id IN (47, 226, 612, 676, 818) OR i_manager_id BETWEEN 71 AND 100",
+        "interfaces": {"outputs": ["i_item_sk", "i_manufact_id", "i_manager_id"], "consumes": []}
+      },
+      "filtered_dates": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN '1998-01-06' AND cast('1998-01-06' as date) + interval '90 day'",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "sales_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cs_item_sk, SUM(cs_ext_discount_amt) AS total_discount, COUNT(CASE WHEN cs_list_price BETWEEN 108 AND 137 AND cs_sales_price / cs_list_price BETWEEN 0.23 AND 0.43 THEN cs_ext_discount_amt END) AS qualifying_count, SUM(CASE WHEN cs_list_price BETWEEN 108 AND 137 AND cs_sales_price / cs_list_price BETWEEN 0.23 AND 0.43 THEN cs_ext_discount_amt END) AS qualifying_sum FROM catalog_sales JOIN filtered_dates ON d_date_sk = cs_sold_date_sk GROUP BY cs_item_sk",
+        "interfaces": {"outputs": ["cs_item_sk", "total_discount", "qualifying_count", "qualifying_sum"], "consumes": ["filtered_dates"]}
+      },
+      "threshold_derive": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cs_item_sk, total_discount, 1.3 * qualifying_sum / qualifying_count AS threshold FROM sales_agg WHERE qualifying_count > 0",
+        "interfaces": {"outputs": ["cs_item_sk", "total_discount", "threshold"], "consumes": ["sales_agg"]}
+      },
+      "excess_filter": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT (total_discount - threshold) AS excess_amount FROM threshold_derive JOIN filtered_items ON i_item_sk = cs_item_sk WHERE total_discount > threshold",
+        "interfaces": {"outputs": ["excess_amount"], "consumes": ["threshold_derive", "filtered_items"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT SUM(excess_amount) AS \"excess discount amount\" FROM excess_filter ORDER BY SUM(excess_amount) ASC LIMIT 100",
+        "interfaces": {"outputs": ["excess discount amount"], "consumes": ["excess_filter"]}
+      }
+    },
+    "reconstruction_order": ["filtered_items", "filtered_dates", "sales_agg", "threshold_derive", "excess_filter", "main_query"],
+    "assembly_template": "WITH filtered_items AS ({filtered_items}), filtered_dates AS ({filtered_dates}), sales_agg AS ({sales_agg}), threshold_derive AS ({threshold_derive}), excess_filter AS ({excess_filter}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+## Changes & Expected Speedup
+
+**Changes**: Decorrelated the subquery by computing qualifying discounts per item in a single aggregation pass (`sales_agg`), then deriving the 1.3× average threshold (`threshold_derive`), and finally filtering items where total discount exceeds threshold (`excess_filter`). Preserved all original filters, joins, and defensive division guards.
+
+**Expected speedup**: ~1.3-1.5x from eliminating correlated subquery execution per row and enabling parallel aggregation on the fact table. The CTE structure allows PostgreSQL to push filters and use bitmap scans on dimension tables while avoiding the comma-join cardinality estimation issue.

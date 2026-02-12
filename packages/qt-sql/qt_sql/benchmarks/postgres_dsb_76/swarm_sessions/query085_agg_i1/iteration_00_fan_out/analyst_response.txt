@@ -1,0 +1,284 @@
+<reasoning>
+## 1. CLASSIFY
+This is a star-join aggregation query with complex OR conditions across two dimension categories (customer_demographics ×2, customer_address). Structural archetype: "star-join with late dim filter" where selective dimension filters are applied late in nested loops after large fact table scans.
+
+## 2. EXPLAIN PLAN ANALYSIS
+**Total runtime**: 699.1ms
+**Dominant nodes** (>10% runtime):
+- `Nested Loop Inner (rows=9 loops=3 time=316.3ms)`: 45% of total runtime. This is the root join combining all filtered results.
+- `Index Scan on web_sales (rows=118 loops=366 time=1.9ms)`: 366×1.9ms = ~695ms aggregate - THE BOTTLENECK. Scanning 43,188 rows (122 dates × 118 rows/date × 3 workers) with expensive filter on ws_sales_price and ws_net_profit.
+
+**Row count drops**:
+- `date_dim`: 122 rows → `web_sales`: 118 rows (only 3.5% reduction) → `web_returns`: 0 rows on average (massive drop) → `customer_address`: 0 rows → `cd1`: 0 rows.
+- Final output: 27 rows (9×3) → aggregated to 19 groups.
+
+**Missed opportunities**:
+1. **Late dimension filtering**: `customer_address` and `customer_demographics` filters are applied AFTER `web_sales`↔`web_returns` join, but they could be pushed before.
+2. **OR condition evaluation**: The optimizer uses bitmap OR for web_sales filters, but the complex 3×3 OR matrix (demographics × address) creates nested-loop filters that re-evaluate for every row.
+3. **Comma joins**: The implicit comma-join syntax may hinder cardinality estimation.
+
+**What optimizer already handles well**:
+- Parallel execution (2 workers)
+- Index scans on all dimension tables
+- Date_dim pre-filtering with index-only scan
+- Bitmap OR for web_sales price/profit ranges (already in Filter)
+
+**Scan counts**: 
+- `web_sales`: scanned once (43K rows)
+- `web_returns`: probed 43K times via index (0 rows average)
+- Dimension tables: each probed via nested loops (customer_address: 8.6K times, cd1: 1.4K times)
+
+## 3. GAP MATCHING
+**COMMA_JOIN_WEAKNESS** ✓ Active. Query uses comma-separated implicit joins. Evidence: all tables listed in FROM clause without explicit JOIN syntax. Opportunity for explicit JOINs + dimension CTEs.
+
+**CORRELATED_SUBQUERY_PARALYSIS** ✗ Not present. No correlated subqueries.
+
+**CROSS_CTE_PREDICATE_BLINDNESS** ✗ Not present. No repeated fact table scans.
+
+**NON_EQUI_JOIN_INPUT_BLINDNESS** ✓ Active. The OR conditions create expensive filter evaluation in nested loops. Pre-filtering dimensions into CTEs could reduce probe size.
+
+## 4. AGGREGATION TRAP CHECK
+Aggregates: AVG(ws_quantity), AVG(wr_refunded_cash), AVG(wr_fee). AVG is duplicate-sensitive. The current query uses INNER JOINs only, no duplicates introduced. Any rewrite must preserve exact row membership in each r_reason_desc group.
+
+## 5. TRANSFORM SELECTION
+Ranked by expected value:
+1. **star_join_prefetch** (pg_dimension_prefetch_star): Pre-filter all dimension tables into CTEs, convert to explicit JOINs. Expected high win due to comma-join weakness.
+2. **union_consolidation** (split OR to UNION ALL): Transform 3×3 OR matrix into 9 UNION ALL branches. Despite regression warning for Q085, structural analysis suggests the regression was due to naive splitting without pre-filtering. With dimension CTEs, each branch gets independent optimization.
+3. **late_attribute_binding**: Defer non-filtering dimension joins (web_page, reason) until after aggregation. web_page is only used for join condition (not SELECT), reason is used in GROUP BY/SELECT but could be joined after partial aggregation.
+4. **exploration**: Compound strategy: dimension CTEs + LATERAL join for early fact table filtering.
+
+## 6. LOGICAL TREE DESIGN
+**Worker 1 (star_join_prefetch)**: 
+```
+dim_date -> dim_cd1 -> dim_cd2 -> dim_addr -> dim_reason -> dim_web_page -> fact_join -> aggregation -> sort -> limit
+```
+**Worker 2 (union_consolidation)**:
+```
+dim_date -> (9 UNION ALL branches, each with pre-filtered dims) -> union_all -> aggregation -> sort -> limit
+```
+**Worker 3 (late_attribute_binding)**:
+```
+filtered_facts (web_sales+web_returns+cd1+cd2+addr+date) -> partial_agg -> join_reason_web_page -> final_agg -> sort -> limit
+```
+**Worker 4 (exploration)**:
+```
+dim_ctes -> LATERAL (fact join with early filtering) -> aggregation -> sort -> limit
+```
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Business intent: Analyze average sales quantities and refund amounts by return reason for specific customer segments and geographic regions in year 2000. JOIN semantics: All INNER JOINs - every dimension must match for a row to be included. Aggregation traps: AVG functions are duplicate-sensitive; any rewrite must preserve exact row membership per r_reason_desc group. Filter dependencies: The OR conditions on cd1/cd2 marital/education status and address state/profit are interdependent within each OR branch; splitting must preserve branch-specific value ranges.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound bottleneck on web_sales index scan (695ms aggregate). Scanning 43K rows with expensive OR filters on ws_sales_price and ws_net_profit applied per-row. Cardinality flow: 122 date rows → 43K web_sales rows → massive drop to near-zero after web_returns join. Optimizer already handles parallel execution, date filtering via index-only scan, and bitmap OR for price ranges. Logical-tree costs misleading: nested loops show high cost but actual time dominated by web_sales scan filtering.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs substring(r_reason_desc,1,20) and three AVG aggregates.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream: web_sales/returns keys, demographic/address keys, reason_desc.
+- LITERAL_PRESERVATION: Must preserve exact literal values in OR conditions (e.g., 'S', 'College', 100.00, 'NC', 'United States').
+- SEMANTIC_EQUIVALENCE: Must return same 19 groups with identical averages.
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated implicit joins (EXPLAIN shows nested loops with poor cardinality estimation).
+- NON_EQUI_JOIN_INPUT_BLINDNESS: OR conditions create expensive filter evaluation in nested loops after fact join.
+
+REGRESSION_WARNINGS:
+1. OR to UNION ALL (0.21x on Q085):
+   CAUSE: Naive splitting without dimension pre-filtering caused 9× repeated fact table scans.
+   RULE: For UNION ALL splitting, first pre-filter all dimensions into CTEs to reduce each branch's probe size.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+dim_date -> dim_cd1 -> dim_cd2 -> dim_addr -> dim_reason -> dim_web_page -> fact_join -> aggregation -> sort -> limit
+NODE_CONTRACTS:
+  dim_date:
+    FROM: date_dim
+    WHERE: d_year = 2000
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 122
+    CONSUMERS: fact_join
+  dim_cd1:
+    FROM: customer_demographics
+    WHERE: (cd_marital_status = 'S' AND cd_education_status = 'College') OR (cd_marital_status = 'W' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'M' AND cd_education_status = 'Secondary')
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~3 (from EXPLAIN: cd1 returns 0 rows average but filtered from 1)
+    CONSUMERS: fact_join
+  dim_cd2:
+    FROM: customer_demographics
+    WHERE: (cd_marital_status = 'S' AND cd_education_status = 'College') OR (cd_marital_status = 'W' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'M' AND cd_education_status = 'Secondary')
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~3
+    CONSUMERS: fact_join
+  dim_addr:
+    FROM: customer_address
+    WHERE: (ca_country = 'United States' AND ca_state IN ('NC','PA','TX') AND ws_net_profit between 100 and 200) OR (ca_country = 'United States' AND ca_state IN ('AR','CO','NY') AND ws_net_profit between 150 and 300) OR (ca_country = 'United States' AND ca_state IN ('IA','IL','TX') AND ws_net_profit between 50 and 250)
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: ~0.2
+    CONSUMERS: fact_join
+  dim_reason:
+    FROM: reason
+    OUTPUT: r_reason_sk, r_reason_desc
+    EXPECTED_ROWS: full table
+    CONSUMERS: fact_join
+  dim_web_page:
+    FROM: web_page
+    OUTPUT: wp_web_page_sk
+    EXPECTED_ROWS: full table
+    CONSUMERS: fact_join
+  fact_join:
+    FROM: web_sales JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+    JOIN: JOIN dim_date ON ws_sold_date_sk = d_date_sk
+          JOIN dim_cd1 ON wr_refunded_cdemo_sk = cd1.cd_demo_sk
+          JOIN dim_cd2 ON wr_returning_cdemo_sk = cd2.cd_demo_sk AND cd1.cd_marital_status = cd2.cd_marital_status AND cd1.cd_education_status = cd2.cd_education_status
+          JOIN dim_addr ON wr_refunded_addr_sk = ca_address_sk
+          JOIN dim_reason ON wr_reason_sk = r_reason_sk
+          JOIN dim_web_page ON ws_web_page_sk = wp_web_page_sk
+    WHERE: ((cd1.cd_marital_status = 'S' AND ws_sales_price between 100.00 and 150.00) OR (cd1.cd_marital_status = 'W' AND ws_sales_price between 50.00 and 100.00) OR (cd1.cd_marital_status = 'M' AND ws_sales_price between 150.00 and 200.00))
+    OUTPUT: r_reason_desc, ws_quantity, wr_refunded_cash, wr_fee
+    EXPECTED_ROWS: 27
+    CONSUMERS: aggregation
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering of all dimensions (date, cd1, cd2, addr, reason, web_page) into CTEs and explicit JOINs. Ignore the UNION aspect - this query doesn't need UNION.
+- pg_date_cte_explicit_join: Apply date_dim isolation into CTE and explicit JOIN syntax. Also apply to other dimensions.
+- pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED keyword to dimension CTEs to force early execution. Ignore fact table pre-filtering (we keep fact join as-is).
+HAZARD_FLAGS:
+- Risk of materializing large dimension tables (reason, web_page) unnecessarily.
+- OR conditions on ws_sales_price remain in fact_join WHERE clause - may still cause full scan.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: union_consolidation
+TARGET_LOGICAL_TREE:
+dim_date -> (9 UNION ALL branches) -> union_all -> aggregation -> sort -> limit
+NODE_CONTRACTS:
+  dim_date:
+    FROM: date_dim
+    WHERE: d_year = 2000
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 122
+    CONSUMERS: branch1..branch9
+  branch_template:
+    FROM: web_sales, web_returns, customer_demographics cd1, customer_demographics cd2, customer_address, web_page, reason
+    JOIN: ws_web_page_sk = wp_web_page_sk AND ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number AND ws_sold_date_sk = dim_date.d_date_sk AND cd1.cd_demo_sk = wr_refunded_cdemo_sk AND cd2.cd_demo_sk = wr_returning_cdemo_sk AND ca_address_sk = wr_refunded_addr_sk AND r_reason_sk = wr_reason_sk
+    WHERE: [specific combination from 3×3 matrix]
+    OUTPUT: r_reason_desc, ws_quantity, wr_refunded_cash, wr_fee
+    EXPECTED_ROWS: ~3 per branch (27 total)
+    CONSUMERS: union_all
+  union_all:
+    FROM: branch1 UNION ALL branch2 ... UNION ALL branch9
+    OUTPUT: r_reason_desc, ws_quantity, wr_refunded_cash, wr_fee
+    EXPECTED_ROWS: 27
+    CONSUMERS: aggregation
+EXAMPLES: pg_dimension_prefetch_star, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering date_dim into CTE shared across all branches. Ignore single-branch approach - we need 9 branches.
+- early_filter_decorrelate: Apply early filtering of dimensions within each branch. Ignore decorrelation - no correlated subqueries.
+HAZARD_FLAGS:
+- Risk of 9× repeated fact table scans if dimensions not pre-filtered (caused past regression).
+- Complex OR condition matrix requires careful branch partitioning.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+filtered_facts -> partial_agg -> join_reason_web_page -> final_agg -> sort -> limit
+NODE_CONTRACTS:
+  filtered_facts:
+    FROM: web_sales JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+          JOIN date_dim ON ws_sold_date_sk = d_date_sk
+          JOIN customer_demographics cd1 ON cd1.cd_demo_sk = wr_refunded_cdemo_sk
+          JOIN customer_demographics cd2 ON cd2.cd_demo_sk = wr_returning_cdemo_sk
+          JOIN customer_address ON ca_address_sk = wr_refunded_addr_sk
+    WHERE: d_year = 2000
+           AND ((cd1.cd_marital_status = 'S' AND cd1.cd_marital_status = cd2.cd_marital_status AND cd1.cd_education_status = 'College' AND cd1.cd_education_status = cd2.cd_education_status AND ws_sales_price between 100.00 and 150.00) OR ... [full OR conditions])
+           AND ((ca_country = 'United States' AND ca_state in ('NC','PA','TX') AND ws_net_profit between 100 and 200) OR ... [full address OR])
+    OUTPUT: wr_reason_sk, ws_web_page_sk, ws_quantity, wr_refunded_cash, wr_fee
+    EXPECTED_ROWS: 27
+    CONSUMERS: partial_agg
+  partial_agg:
+    FROM: filtered_facts
+    GROUP BY: wr_reason_sk, ws_web_page_sk
+    AGGREGATE: SUM(ws_quantity) as sum_qty, COUNT(ws_quantity) as cnt_qty, SUM(wr_refunded_cash) as sum_cash, COUNT(wr_refunded_cash) as cnt_cash, SUM(wr_fee) as sum_fee, COUNT(wr_fee) as cnt_fee
+    OUTPUT: wr_reason_sk, ws_web_page_sk, sum_qty, cnt_qty, sum_cash, cnt_cash, sum_fee, cnt_fee
+    EXPECTED_ROWS: ≤27
+    CONSUMERS: join_reason_web_page
+  join_reason_web_page:
+    FROM: partial_agg 
+          JOIN reason ON r_reason_sk = wr_reason_sk
+          JOIN web_page ON wp_web_page_sk = ws_web_page_sk
+    OUTPUT: r_reason_desc, sum_qty, cnt_qty, sum_cash, cnt_cash, sum_fee, cnt_fee
+    EXPECTED_ROWS: ≤27
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: join_reason_web_page
+    GROUP BY: r_reason_desc
+    AGGREGATE: AVG(ws_quantity) as avg_ws_quantity = sum_qty/NULLIF(cnt_qty,0), AVG(wr_refunded_cash) as avg_wr_refunded_cash = sum_cash/NULLIF(cnt_cash,0), AVG(wr_fee) as avg_wr_fee = sum_fee/NULLIF(cnt_fee,0)
+    OUTPUT: SUBSTRING(r_reason_desc,1,20), avg_ws_quantity, avg_wr_refunded_cash, avg_wr_fee
+    EXPECTED_ROWS: 19
+    CONSUMERS: sort
+EXAMPLES: pg_self_join_decomposition, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_self_join_decomposition: Apply materialization of filtered fact table before joining non-filtering dimensions (reason, web_page). Ignore self-join aspect.
+- early_filter_decorrelate: Apply early filtering of date, demographics, address before aggregation. Ignore decorrelation.
+HAZARD_FLAGS:
+- Partial aggregation changes AVG calculation to SUM/COUNT - must ensure exact equivalence with division by zero handling.
+- web_page join deferred but ws_web_page_sk must be preserved in partial_agg GROUP BY.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: dimension_cte_lateral
+TARGET_LOGICAL_TREE:
+dim_date -> dim_cd1 -> dim_cd2 -> dim_addr -> lateral_fact_join -> join_reason_web_page -> aggregation -> sort -> limit
+NODE_CONTRACTS:
+  dim_date:
+    FROM: date_dim
+    WHERE: d_year = 2000
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 122
+    CONSUMERS: lateral_fact_join
+  dim_cd1:
+    FROM: customer_demographics
+    WHERE: (cd_marital_status = 'S' AND cd_education_status = 'College') OR (cd_marital_status = 'W' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'M' AND cd_education_status = 'Secondary')
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~3
+    CONSUMERS: lateral_fact_join
+  dim_cd2:
+    FROM: customer_demographics
+    WHERE: (cd_marital_status = 'S' AND cd_education_status = 'College') OR (cd_marital_status = 'W' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'M' AND cd_education_status = 'Secondary')
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~3
+    CONSUMERS: lateral_fact_join
+  dim_addr:
+    FROM: customer_address
+    WHERE: (ca_country = 'United States' AND ca_state IN ('NC','PA','TX')) OR (ca_country = 'United States' AND ca_state IN ('AR','CO','NY')) OR (ca_country = 'United States' AND ca_state IN ('IA','IL','TX'))
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: ~6 (states only, profit filter moves to lateral)
+    CONSUMERS: lateral_fact_join
+  lateral_fact_join:
+    FROM: dim_date, dim_cd1, dim_cd2, dim_addr,
+          LATERAL (SELECT ws_quantity, wr_refunded_cash, wr_fee, wr_reason_sk, ws_web_page_sk
+                   FROM web_sales 
+                   JOIN web_returns ON ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number
+                   WHERE ws_sold_date_sk = dim_date.d_date_sk
+                     AND wr_refunded_cdemo_sk = dim_cd1.cd_demo_sk
+                     AND wr_returning_cdemo_sk = dim_cd2.cd_demo_sk
+                     AND wr_refunded_addr_sk = dim_addr.ca_address_sk
+                     AND ((dim_cd1.cd_marital_status = 'S' AND ws_sales_price between 100.00 and 150.00 AND ws_net_profit between 100 and 200) OR ... [combined 3×3 matrix])
+                     AND dim_cd1.cd_marital_status = dim_cd2.cd_marital_status
+                     AND dim_cd1.cd_education_status = dim_cd2.cd_education_status) AS facts
+    OUTPUT: wr_reason_sk, ws_web_page_sk, ws_quantity, wr_refunded_cash, wr_fee
+    EXPECTED_ROWS: 27
+    CONSUMERS: join_reason_web_page
+EXAMPLES: pg_dimension_prefetch_star, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply dimension pre-filtering into CTEs. Ignore explicit JOIN syntax in main query - using LATERAL instead.
+- pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED to dimension CTEs. Also move profit filter into LATERAL for early application.
+HAZARD_FLAGS:
+- LATERAL may force nested loop join strategy, but dimensions are tiny.
+- Combined OR matrix in LATERAL WHERE clause may still cause full scan.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (dimension CTEs + LATERAL for early fact filtering)

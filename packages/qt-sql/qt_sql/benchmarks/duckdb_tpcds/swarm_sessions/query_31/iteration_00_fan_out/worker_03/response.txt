@@ -1,0 +1,82 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_filter  [+]  Cost: 10%  Rows: 1,827  — Filter date dimension to 2000 quarters 1-3
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year = 2000 AND d_qoy IN (1,2,3))
+│   └── OUTPUT (d_date_sk, d_qoy, d_year)
+├── [CTE] store_pivot  [~]  Cost: 30%  Rows: ~1,847  — Pivot store sales by quarter using single-pass aggregation
+│   ├── SCAN (store_sales)
+│   ├── JOIN (ss_sold_date_sk = date_filter.d_date_sk)
+│   ├── JOIN (ss_addr_sk = ca_address_sk)
+│   ├── AGG (GROUP BY ca_county) with CASE quarters in SUM
+│   └── OUTPUT (ca_county, store_sales_q1, store_sales_q2, store_sales_q3)
+├── [CTE] web_pivot  [~]  Cost: 30%  Rows: ~1,845  — Pivot web sales by quarter using single-pass aggregation
+│   ├── SCAN (web_sales)
+│   ├── JOIN (ws_sold_date_sk = date_filter.d_date_sk)
+│   ├── JOIN (ws_bill_addr_sk = ca_address_sk)
+│   ├── AGG (GROUP BY ca_county) with CASE quarters in SUM
+│   └── OUTPUT (ca_county, web_sales_q1, web_sales_q2, web_sales_q3)
+└── [MAIN] main_query  [~]  Cost: 30%  Rows: 307  — Join pivoted aggregates, compute growth ratios with NULLIF, filter and order
+    ├── SCAN (store_pivot, web_pivot)
+    ├── JOIN (store_pivot.ca_county = web_pivot.ca_county)
+    ├── FILTER (web_q1_q2_increase > store_q1_q2_increase AND web_q2_q3_increase > store_q2_q3_increase)
+    ├── SORT (web_q1_q2_increase ASC)
+    └── OUTPUT (ca_county, d_year, web_q1_q2_increase, store_q1_q2_increase, web_q2_q3_increase, store_q2_q3_increase)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_aggregation", "description": "Replaced self-join pattern with conditional aggregation in store_pivot and web_pivot", "applied_to": ["store_pivot", "web_pivot"]},
+    {"id": "R2", "type": "predicate_pushdown", "description": "Pushed year and quarter filters into date_filter CTE", "applied_to": ["date_filter"]},
+    {"id": "R3", "type": "division_safety_preservation", "description": "Preserved NULLIF guards for division by zero in main_query", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_qoy, d_year FROM date_dim WHERE d_year = 2000 AND d_qoy IN (1, 2, 3)",
+        "interfaces": {"outputs": ["d_date_sk", "d_qoy", "d_year"], "consumes": []}
+      },
+      "store_pivot": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ca.ca_county, SUM(CASE WHEN df.d_qoy = 1 THEN ss.ss_ext_sales_price END) AS store_sales_q1, SUM(CASE WHEN df.d_qoy = 2 THEN ss.ss_ext_sales_price END) AS store_sales_q2, SUM(CASE WHEN df.d_qoy = 3 THEN ss.ss_ext_sales_price END) AS store_sales_q3 FROM store_sales ss JOIN date_filter df ON ss.ss_sold_date_sk = df.d_date_sk JOIN customer_address ca ON ss.ss_addr_sk = ca.ca_address_sk GROUP BY ca.ca_county",
+        "interfaces": {"outputs": ["ca_county", "store_sales_q1", "store_sales_q2", "store_sales_q3"], "consumes": ["date_filter"]}
+      },
+      "web_pivot": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ca.ca_county, SUM(CASE WHEN df.d_qoy = 1 THEN ws.ws_ext_sales_price END) AS web_sales_q1, SUM(CASE WHEN df.d_qoy = 2 THEN ws.ws_ext_sales_price END) AS web_sales_q2, SUM(CASE WHEN df.d_qoy = 3 THEN ws.ws_ext_sales_price END) AS web_sales_q3 FROM web_sales ws JOIN date_filter df ON ws.ws_sold_date_sk = df.d_date_sk JOIN customer_address ca ON ws.ws_bill_addr_sk = ca.ca_address_sk GROUP BY ca.ca_county",
+        "interfaces": {"outputs": ["ca_county", "web_sales_q1", "web_sales_q2", "web_sales_q3"], "consumes": ["date_filter"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT sp.ca_county, 2000 AS d_year, wp.web_sales_q2 / wp.web_sales_q1 AS web_q1_q2_increase, sp.store_sales_q2 / sp.store_sales_q1 AS store_q1_q2_increase, wp.web_sales_q3 / wp.web_sales_q2 AS web_q2_q3_increase, sp.store_sales_q3 / sp.store_sales_q2 AS store_q2_q3_increase FROM store_pivot sp JOIN web_pivot wp ON sp.ca_county = wp.ca_county WHERE (wp.web_sales_q2 / NULLIF(wp.web_sales_q1, 0)) > (sp.store_sales_q2 / NULLIF(sp.store_sales_q1, 0)) AND (wp.web_sales_q3 / NULLIF(wp.web_sales_q2, 0)) > (sp.store_sales_q3 / NULLIF(sp.store_sales_q2, 0)) ORDER BY web_q1_q2_increase",
+        "interfaces": {"outputs": ["ca_county", "d_year", "web_q1_q2_increase", "store_q1_q2_increase", "web_q2_q3_increase", "store_q2_q3_increase"], "consumes": ["store_pivot", "web_pivot"]}
+      }
+    },
+    "reconstruction_order": ["date_filter", "store_pivot", "web_pivot", "main_query"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), store_pivot AS ({store_pivot}), web_pivot AS ({web_pivot}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Changes
+
+Replaced the original self-join pattern (six instances of ss/ws CTEs) with single-pass conditional aggregations for each channel, using a shared date_filter CTE. This eliminates 5 self-joins and reduces table scans from 12 to 4 while preserving exact semantics and division safety guards.
+
+Expected speedup: 3-5x from eliminating redundant scans and self-joins.

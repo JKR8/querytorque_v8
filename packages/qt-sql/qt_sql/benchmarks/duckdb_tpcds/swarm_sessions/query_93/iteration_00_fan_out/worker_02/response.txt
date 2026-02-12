@@ -1,0 +1,79 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~100  — Convert to CTE structure with early filtering and join simplification
+    ├── CTE filtered_reason  [+]  Filter reason table early
+    │   ├── SCAN reason
+    │   └── FILTER r_reason_desc = 'duplicate purchase'
+    ├── CTE joined_returns_sales  [+]  Inner join chain with early reduction
+    │   ├── SCAN store_sales
+    │   ├── JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number)
+    │   └── JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+    ├── CTE aggregated  [+]  Compute adjusted sales per customer
+    │   ├── SCAN joined_returns_sales
+    │   └── AGG GROUP BY ss_customer_sk
+    └── CTE top_n  [+]  Final ordering and limit
+        ├── SCAN aggregated
+        ├── SORT sumsales ASC, ss_customer_sk ASC
+        └── LIMIT 100
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "cte_materialization", "description": "Push reason filter into separate CTE for early reduction", "applied_to": ["filtered_reason"]},
+    {"id": "R2", "type": "join_simplification", "description": "Convert left join + null-rejecting filter to inner join chain", "applied_to": ["joined_returns_sales"]},
+    {"id": "R3", "type": "predicate_pushdown", "description": "Apply reason filter before joining with store_sales", "applied_to": ["joined_returns_sales"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_reason": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT r_reason_sk, r_reason_desc FROM reason WHERE r_reason_desc = 'duplicate purchase'",
+        "interfaces": {"outputs": ["r_reason_sk", "r_reason_desc"], "consumes": []}
+      },
+      "joined_returns_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss.ss_customer_sk, ss.ss_quantity, ss.ss_sales_price, sr.sr_return_quantity FROM store_sales ss INNER JOIN store_returns sr ON (ss.ss_item_sk = sr.sr_item_sk AND ss.ss_ticket_number = sr.sr_ticket_number) INNER JOIN filtered_reason fr ON sr.sr_reason_sk = fr.r_reason_sk",
+        "interfaces": {"outputs": ["ss_customer_sk", "ss_quantity", "ss_sales_price", "sr_return_quantity"], "consumes": ["filtered_reason"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_customer_sk, SUM((ss_quantity - sr_return_quantity) * ss_sales_price) AS sumsales FROM joined_returns_sales GROUP BY ss_customer_sk",
+        "interfaces": {"outputs": ["ss_customer_sk", "sumsales"], "consumes": ["joined_returns_sales"]}
+      },
+      "top_n": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_customer_sk, sumsales FROM aggregated ORDER BY sumsales ASC, ss_customer_sk ASC LIMIT 100",
+        "interfaces": {"outputs": ["ss_customer_sk", "sumsales"], "consumes": ["aggregated"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ss_customer_sk, sumsales FROM top_n",
+        "interfaces": {"outputs": ["ss_customer_sk", "sumsales"], "consumes": ["top_n"]}
+      }
+    },
+    "reconstruction_order": ["filtered_reason", "joined_returns_sales", "aggregated", "top_n", "main_query"],
+    "assembly_template": "WITH filtered_reason AS ({filtered_reason}), joined_returns_sales AS ({joined_returns_sales}), aggregated AS ({aggregated}), top_n AS ({top_n}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Converted to CTE structure with early reason filtering, simplified left join + null-rejecting filter to inner join chain, and preserved exact output schema.
+
+**Expected speedup:** ~2-4x from early reduction of store_returns via reason filter and join simplification.

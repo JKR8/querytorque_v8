@@ -1,0 +1,538 @@
+We are given a query (query072_agg_i2) and its EXPLAIN plan. We are to analyze and produce structured briefings for 4 specialist workers to write optimized versions.
+
+First, let's understand the query and the plan.
+
+The query is a star-join aggregation from the TPC-DS benchmark. It joins a fact table (catalog_sales) with multiple dimension tables (inventory, warehouse, item, customer_demographics, household_demographics, date_dim (three times), promotion, and catalog_returns). There are multiple filters and a GROUP BY with ORDER BY and LIMIT.
+
+From the EXPLAIN plan, we see:
+
+Total execution time: 492.9ms, which is relatively fast. However, we are to optimize.
+
+The plan shows:
+
+- A Nested Loop Inner with a Join Filter (d3.d_date > d1.d_date + interval) at the top.
+- Then a Gather Merge (parallel) with one worker launched.
+- Then a Sort (quicksort in memory).
+- Then a Nested Loop Left (for promotion and catalog_returns) and Nested Loop Inner for the other joins.
+
+The main cost drivers (from the plan times) are:
+
+- The Hash Join (Hash Cond: d2.d_week_seq = d1.d_week_seq) and the subsequent Nested Loop Inner (with catalog_sales and household_demographics) and the Nested Loop for customer_demographics.
+
+Specifically, the Hash step (rows=0 loops=2 time=486.6ms) and the Nested Loop Inner (rows=24K loops=2 time=233.4ms) are heavy.
+
+The plan shows that the date_dim d1 is filtered by d_year=1999, reducing 36K rows to 182 rows. Then catalog_sales is accessed via index scan (using cs_sold_date_sk) and then filtered by cs_wholesale_cost (from 76 to 96). This returns 622 rows per d1 row (so about 182 * 622 = 113K rows). Then household_demographics is filtered by hd_buy_potential = '>10000' (reducing 6K to 1.2K rows). The hash join with household_demographics is on cs_bill_hdemo_sk.
+
+Then customer_demographics is joined via index scan (on cd_demo_sk) with filters on cd_marital_status and cd_dep_count.
+
+Then inventory is joined via index scan (on inv_date_sk and inv_item_sk) with a filter on inv_quantity_on_hand < cs_quantity.
+
+Then warehouse, item, promotion, and date_dim d3 are joined.
+
+The plan also shows a join condition d1.d_week_seq = d2.d_week_seq (through a hash join with d2).
+
+Now, let's classify the query:
+
+- This is a star-join aggregation with multiple dimension filters and a non-equi join (inv_quantity_on_hand < cs_quantity) and a correlated date condition (d3.d_date > d1.d_date + interval).
+
+Now, let's check for optimization opportunities:
+
+1. The query has a LEFT OUTER JOIN to promotion and catalog_returns, but the aggregation uses conditional sums on p_promo_sk (from promotion) and counts the total. However, note that catalog_returns is left joined but never used in the SELECT or GROUP BY. It is only used in the ON clause (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number). This join does not affect the result because it doesn't change the row count (since it's a left join and we don't use any columns from catalog_returns). However, it might affect the result if there are multiple returns per sale? But note that the join condition is on both item and order number, so it's a one-to-at-most-one join. But the aggregation counts rows from the left side (catalog_sales) and conditionally on promotion. So the left join to catalog_returns is redundant and can be removed without changing the result? Actually, it might change the result if there are multiple returns (but the condition is on both keys, so it's a unique join). However, the query does not use any column from catalog_returns, so it's safe to remove. But note: the left join might cause duplication if there are multiple returns? The condition is on the composite key (item, order) so it should be at most one. But let's check: if there are multiple returns for the same item and order? That would be unusual. However, the left join is not used, so we can remove it. But the optimizer might have already removed it? Let's see the plan: in the plan, we see a Nested Loop Left (for promotion and catalog_returns). So it's still there.
+
+   However, note that the catalog_returns join is a left join and the condition is in the ON clause, so it doesn't filter the rows. But if there are multiple returns, it might cause duplication. But the aggregation is on the catalog_sales rows, so we don't want duplication. The left join is safe because it doesn't change the row count (if the join is one-to-one). But if there are multiple returns, then it would cause duplication and change the counts. So we must be cautious. The business intent might be to count sales that have returns? But the query doesn't use the returns. Alternatively, the left join might be a mistake. Given the TPC-DS benchmark, this query is likely to be correct as is. We cannot remove the join without verifying semantic equivalence. Since we are not sure, we should leave it.
+
+2. The query has a non-equi join (inv_quantity_on_hand < cs_quantity). This is expensive because it's a join condition that cannot be indexed efficiently. However, the plan shows an index scan on inventory (using inv_date_sk and inv_item_sk) and then a filter on inv_quantity_on_hand. The filter is applied after the index scan.
+
+3. The query has a condition d1.d_week_seq = d2.d_week_seq, which is a join between two date_dim instances. This condition is currently handled by a hash join (d2 is scanned sequentially). However, note that d2 is also joined on inv_date_sk = d2.d_date_sk. So we have a chain: inventory -> d2 -> d1 (week_seq). The plan does a hash join between d1 and d2 on week_seq and then joins inventory to d2.
+
+4. The condition on d3 (cs_ship_date_sk = d3.d_date_sk and d3.d_date > d1.d_date + interval) is applied as a join filter in a nested loop. This might be expensive because it's a non-equi condition.
+
+Now, let's look at the optimization principles and examples:
+
+We have examples:
+
+- pg_materialized_dimension_fact_prefilter (2.68x): Pre-filter dimension and fact tables into MATERIALIZED CTEs, then join. This is for non-equi joins.
+
+- pg_dimension_prefetch_star (3.32x): Pre-filter selective dimensions into CTEs and convert to explicit JOINs.
+
+- inline_decorrelate_materialized (timeout_rescuex): For correlated subqueries.
+
+- pg_self_join_decomposition (3.93x): For self-joins.
+
+- pg_date_cte_explicit_join (2.28x): Isolate date filter into CTE and use explicit joins.
+
+- early_filter_decorrelate (1.13x): Early filter and decorrelate.
+
+Our query does not have a correlated subquery, so we can ignore decorrelation examples.
+
+The query has a star-join with multiple dimensions and a non-equi join (inventory quantity < sales quantity). So the pg_materialized_dimension_fact_prefilter example is relevant.
+
+Also, the query uses explicit JOINs already, so we don't need to convert from comma joins. However, note that the plan shows that the optimizer is already doing a lot of work. The baseline plan is already using indexes and parallel execution.
+
+But note: the plan shows a sequential scan on warehouse (rows=0). That's because warehouse is small and has no filter. It's joined via w_warehouse_sk = inv_warehouse_sk. We might pre-filter warehouse? But there's no filter on warehouse.
+
+Now, let's consider the bottleneck:
+
+The plan shows that the hash join between d1 and d2 (on week_seq) is done on the entire d2 table (sequential scan) and then hashed. However, d2 is also joined to inventory. Alternatively, we could pre-filter d2 by the inventory join? But inventory is large.
+
+Alternatively, we can pre-filter d1 (by year) and d2 (by week_seq) and then join. But note that the condition is d1.d_week_seq = d2.d_week_seq. We are already filtering d1 by year=1999. This reduces d1 to 182 rows. Then we are joining to d2 on week_seq. Since d2 is not filtered, we are scanning all of d2 (73K rows). But if we pre-filter d2 by the inventory join, that might be large too.
+
+Alternatively, we can try to pre-filter both d1 and d2 by the week_seq condition and then join. But note that the week_seq condition is an equality, so we can use a hash join.
+
+Another idea: since d1 is filtered by year=1999, and d2 is not filtered, we can try to push the year condition to d2? But d2 doesn't have a year condition. However, note that d1 and d2 are both date_dim, and the condition is on week_seq. The week_seq is the same for the same week in different years? Actually, week_seq is a sequential number across years. So filtering d1 by year=1999 gives a set of week_seq values (the weeks in 1999). Then we can use that set to filter d2. So we can pre-filter d2 by joining with d1 on week_seq. But the plan already does that.
+
+Wait, the plan does a hash join between d1 and d2 on week_seq. But note that d2 is scanned sequentially (no filter). Then the hash is built on d1 (182 rows) and then d2 is probed. That seems efficient.
+
+But the plan shows that the hash step (building the hash on d1) takes 486.6ms. That's the majority of the time. Why? Because it's building a hash table on d1 (182 rows) and then probing with d2 (73K rows). That should be fast. But note that the plan says "Hash (rows=0 loops=2 time=486.6ms)". That's the time for building the hash? Actually, the plan is a bit confusing. It says:
+
+```
+-> Hash  (rows=0 loops=2 time=486.6ms)
+   -> Nested Loop Inner  (rows=24K loops=2 time=305.2ms)
+```
+
+So the Hash step is building a hash table from the result of the Nested Loop Inner (which returns 24K rows). So the hash is built on 24K rows (the result of joining catalog_sales, household_demographics, customer_demographics, and d1). Then it's used to join with d2 (which is scanned sequentially). So the hash table is 24K rows, not 182.
+
+So the bottleneck is the hash join between the result of the nested loop (24K rows) and d2 (73K rows). The hash table is built on the 24K rows.
+
+Now, note that the nested loop (that produces 24K rows) is itself a join of catalog_sales (filtered by year and wholesale_cost) with household_demographics and customer_demographics.
+
+So the plan is:
+
+1. Filter d1 by year=1999 -> 182 rows.
+2. For each d1 row, index scan on catalog_sales (on cs_sold_date_sk) and filter by wholesale_cost -> 622 rows per d1 -> 113K rows total.
+3. Hash join with household_demographics (on hd_demo_sk) -> 24K rows (so household_demographics filters a lot).
+4. Nested loop with customer_demographics (on cd_demo_sk) -> 24K rows (the customer_demographics filter is applied here).
+5. Then build a hash table on these 24K rows (with d1.d_week_seq) and join with d2 (73K rows) on week_seq.
+
+Then join with inventory, warehouse, item, promotion, and d3.
+
+So the hash join with d2 is the bottleneck.
+
+Now, note that the condition d1.d_week_seq = d2.d_week_seq is used to join the 24K rows (which already have d1.d_week_seq) with d2. Then d2 is joined to inventory on inv_date_sk = d2.d_date_sk.
+
+We might try to pre-filter d2 by the inventory join? But inventory is large.
+
+Alternatively, we can try to push the condition on d1.d_week_seq to d2 earlier. But the plan already does that via the hash join.
+
+Another idea: since the inventory join is on inv_date_sk = d2.d_date_sk, and we have a condition inv_quantity_on_hand < cs_quantity, we might pre-filter inventory by that condition and then join with d2. But the condition involves cs_quantity from catalog_sales, so it's a correlated condition.
+
+Alternatively, we can try to restructure the query to reduce the size of the hash table (the 24K rows). How? By pushing the inventory join earlier? But the inventory join is after the hash join with d2.
+
+Wait, the plan does:
+
+- First, the nested loop (catalog_sales, household_demographics, customer_demographics, d1) produces 24K rows.
+- Then hash join with d2 (on week_seq) -> now we have 24K rows (each row now has d2.d_date_sk? Actually, we are joining on week_seq, so we get d2.d_date_sk for each row? The SELECT list of the hash join includes both d1 and d2 columns? The plan doesn't show, but we need d2.d_date_sk for the inventory join.
+
+Then we join with inventory (on inv_date_sk = d2.d_date_sk and inv_item_sk = cs_item_sk) and filter by inv_quantity_on_hand < cs_quantity.
+
+So the inventory join is after the hash join.
+
+We could try to pre-filter inventory by the condition inv_quantity_on_hand < cs_quantity, but cs_quantity is from catalog_sales, which is in the 24K rows. So we cannot pre-filter without joining.
+
+Now, note that the inventory join is on two columns (inv_date_sk and inv_item_sk). We have an index on (inv_date_sk, inv_item_sk). The plan uses an index scan and then a filter on inv_quantity_on_hand.
+
+Given the above, let's consider the following strategies:
+
+1. Pre-filter dimensions (d1, household_demographics, customer_demographics, item) into CTEs and then join with catalog_sales, inventory, d2, etc. This is the star-join prefetch strategy.
+
+2. Since the hash join with d2 is expensive, we might try to pre-filter d2 by the inventory join? But inventory is large and the condition inv_quantity_on_hand < cs_quantity is correlated.
+
+3. We can try to pre-filter catalog_sales by the wholesale_cost and the date (year=1999) and then join with the dimensions. But the plan already does that.
+
+4. We can try to push the condition on d3 (d3.d_date > d1.d_date + interval) earlier. But it's a nested loop join with d3, and the condition is a range.
+
+5. We can try to remove the left join to catalog_returns if it's safe.
+
+Now, let's look at the examples and match:
+
+- pg_materialized_dimension_fact_prefilter: This example pre-filters both dimension and fact tables into CTEs and then joins. It is for non-equi joins. Our query has a non-equi join (inventory quantity < sales quantity). So we can try to pre-filter the fact table (catalog_sales) and the dimension tables (d1, household_demographics, customer_demographics, item) and then join with inventory and d2, d3, etc.
+
+- pg_dimension_prefetch_star: Pre-filter selective dimensions into CTEs and use explicit joins. Our query already uses explicit joins, but we can pre-filter the dimensions (date_dim d1, household_demographics, customer_demographics, item) into CTEs and then join with the fact table.
+
+- pg_date_cte_explicit_join: Isolate date filter into CTE and use explicit joins. We can do that for d1 (year=1999) and also for d2 (week_seq) and d3.
+
+- early_filter_decorrelate: Not applicable because no correlated subquery.
+
+Given the above, we can assign the following strategies:
+
+1. Worker 1: Use pg_materialized_dimension_fact_prefilter. Pre-filter all dimensions and the fact table (catalog_sales) into CTEs, then perform the joins. This is the most aggressive.
+
+2. Worker 2: Use pg_dimension_prefetch_star. Pre-filter only the dimensions (d1, household_demographics, customer_demographics, item) into CTEs and then join with the fact table and the rest.
+
+3. Worker 3: Use pg_date_cte_explicit_join. Isolate the date dimensions (d1, d2, d3) into CTEs and then join with the fact table and other dimensions.
+
+4. Worker 4: Exploration worker. Try a novel combination: pre-filter dimensions and fact table, and also try to push the non-equi join condition earlier? Or try to remove the left join to catalog_returns.
+
+Now, we must be cautious about the aggregation. The query uses conditional aggregation on p_promo_sk. The left join to promotion is necessary. We must preserve the left join semantics.
+
+Also, note that the catalog_returns left join is not used in the SELECT, so we might remove it. But we must verify semantic equivalence. Let's check: the left join to catalog_returns is on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number). This join does not affect the row count because it's a left join and we don't use any column from it. However, if there are multiple returns for the same sale, it would cause duplication. But the join condition is on the composite key, so it should be at most one. So it's safe to remove? Actually, the left join might cause duplication if there are multiple returns? The condition is on the composite key, so if there are multiple returns with the same item and order, then the join would produce multiple rows. But in TPC-DS, the catalog_returns table has a primary key on (cr_item_sk, cr_order_number)? Actually, the TPC-DS schema for catalog_returns has (cr_item_sk, cr_order_number) as the primary key? Let me check: in TPC-DS, catalog_returns has a composite primary key (cr_item_sk, cr_order_number). So there is at most one return per item and order. Therefore, the left join is one-to-one and doesn't change the row count. So we can remove it without affecting the result.
+
+But note: the left join is in the original query. Removing it might change the plan and potentially the performance. We can try.
+
+Now, let's design the logical tree for each worker.
+
+We'll write the shared briefing first.
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+This query analyzes catalog sales in 1999 for specific demographics and item categories, comparing promoted vs non-promoted sales and checking inventory availability. It joins catalog_sales with inventory (matching item and date week) and multiple dimensions (date, customer, household, item, warehouse, promotion, and catalog_returns). The left join to promotion is used to distinguish promoted sales, and the left join to catalog_returns is for potential future use but does not affect the result. The non-equi join condition (inv_quantity_on_hand < cs_quantity) must be preserved. The aggregation is conditional on p_promo_sk and counts rows, so duplication from joins must be avoided.
+
+BOTTLENECK_DIAGNOSIS:
+The dominant cost is the hash join between the filtered catalog_sales (24K rows) and date_dim d2 (73K rows) on week_seq, taking ~486ms. The plan is join-bound (hash join and nested loops) with moderate scan costs. The optimizer already pushes the date filter on d1 and uses indexes for catalog_sales and inventory. The logical-tree cost percentages are misleading because the hash join is the main bottleneck.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output i_item_desc, w_warehouse_name, d_week_seq, no_promo, promo, total_cnt in the same order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns needed by downstream joins and the final SELECT.
+- LITERAL_PRESERVATION: All literal values (1999, '>10000', 'S', 9, 11, 'Men', 'Shoes', 'Sports', 76, 96) must be preserved.
+- SEMANTIC_EQUIVALENCE: The result must be identical to the original query.
+
+REGRESSION_WARNINGS:
+1. Removing catalog_returns left join (observed in Q072):
+   CAUSE: The left join is on a composite key that is unique in catalog_returns, so removal does not change row counts.
+   RULE: Can remove the left join to catalog_returns if it is not used in SELECT or GROUP BY, but must verify uniqueness.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: pg_materialized_dimension_fact_prefilter
+TARGET_LOGICAL_TREE:
+  filtered_d1 -> filtered_hd -> filtered_cd -> filtered_item -> filtered_catalog_sales -> filtered_inventory -> filtered_d2 -> filtered_d3 -> filtered_promotion -> aggregated_result
+NODE_CONTRACTS:
+  filtered_d1:
+    FROM: date_dim d1
+    WHERE: d_year = 1999
+    OUTPUT: d_date_sk, d_week_seq, d_date
+    EXPECTED_ROWS: 182
+    CONSUMERS: filtered_catalog_sales, filtered_d2, filtered_d3
+  filtered_hd:
+    FROM: household_demographics
+    WHERE: hd_buy_potential = '>10000'
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1200
+    CONSUMERS: filtered_catalog_sales
+  filtered_cd:
+    FROM: customer_demographics
+    WHERE: cd_marital_status = 'S' AND cd_dep_count BETWEEN 9 AND 11
+    OUTPUT: cd_demo_sk
+    EXPECTED_ROWS: ? (from plan, about 0 rows per row of catalog_sales? Actually, the plan shows 0 rows per loop, but we can expect a small number)
+    CONSUMERS: filtered_catalog_sales
+  filtered_item:
+    FROM: item
+    WHERE: i_category IN ('Men', 'Shoes', 'Sports')
+    OUTPUT: i_item_sk, i_item_desc
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: filtered_catalog_sales, filtered_inventory
+  filtered_catalog_sales:
+    FROM: catalog_sales
+    JOIN: filtered_d1 ON cs_sold_date_sk = filtered_d1.d_date_sk
+    JOIN: filtered_hd ON cs_bill_hdemo_sk = filtered_hd.hd_demo_sk
+    JOIN: filtered_cd ON cs_bill_cdemo_sk = filtered_cd.cd_demo_sk
+    JOIN: filtered_item ON i_item_sk = cs_item_sk
+    WHERE: cs_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: cs_item_sk, cs_quantity, cs_promo_sk, cs_order_number, cs_ship_date_sk, cs_wholesale_cost
+    EXPECTED_ROWS: 113K (from plan)
+    CONSUMERS: filtered_inventory, filtered_d3, filtered_promotion, aggregated_result
+  filtered_inventory:
+    FROM: inventory
+    JOIN: filtered_item ON inv_item_sk = filtered_item.i_item_sk
+    WHERE: inv_quantity_on_hand < (cs_quantity from filtered_catalog_sales)  -- This is a non-equi join condition that will be applied during the join.
+    OUTPUT: inv_warehouse_sk, inv_date_sk, inv_item_sk
+    EXPECTED_ROWS: ? (from plan, about 0 per row of catalog_sales)
+    CONSUMERS: filtered_d2, warehouse
+  filtered_d2:
+    FROM: date_dim d2
+    JOIN: filtered_d1 ON d2.d_week_seq = filtered_d1.d_week_seq
+    OUTPUT: d_date_sk, d_week_seq
+    EXPECTED_ROWS: ? (about 73K? but filtered by week_seq from filtered_d1)
+    CONSUMERS: filtered_inventory
+  filtered_d3:
+    FROM: date_dim d3
+    JOIN: filtered_catalog_sales ON cs_ship_date_sk = d3.d_date_sk
+    WHERE: d3.d_date > filtered_d1.d_date + interval '3 day'
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: aggregated_result
+  filtered_promotion:
+    FROM: promotion
+    LEFT JOIN: filtered_catalog_sales ON cs_promo_sk = p_promo_sk
+    OUTPUT: p_promo_sk
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: aggregated_result
+  aggregated_result:
+    FROM: filtered_catalog_sales
+    JOIN: filtered_inventory ON ... (as above)
+    JOIN: warehouse ON w_warehouse_sk = inv_warehouse_sk
+    JOIN: filtered_item ON ... (already joined)
+    LEFT JOIN: filtered_promotion ON ... (already done)
+    LEFT JOIN: catalog_returns ON cr_item_sk = cs_item_sk AND cr_order_number = cs_order_number
+    GROUP BY: i_item_desc, w_warehouse_name, d_week_seq
+    AGGREGATE: SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN p_promo_sk IS NOT NULL THEN 1 ELSE 0 END), COUNT(*)
+    OUTPUT: i_item_desc, w_warehouse_name, d_week_seq, no_promo, promo, total_cnt
+    EXPECTED_ROWS: up to 100 (due to limit)
+    CONSUMERS: final output
+
+EXAMPLES: pg_materialized_dimension_fact_prefilter, pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- pg_materialized_dimension_fact_prefilter: Apply the pattern of pre-filtering both dimension and fact tables into CTEs. Ignore the fact that the example uses a different fact table (store_sales) and different dimensions.
+- pg_dimension_prefetch_star: Use the idea of pre-filtering dimensions into CTEs, but also pre-filter the fact table (catalog_sales) as in the first example.
+- pg_date_cte_explicit_join: Use the idea of isolating date filters into CTEs, but apply to all three date dimensions (d1, d2, d3).
+
+HAZARD_FLAGS:
+- The non-equi join condition (inv_quantity_on_hand < cs_quantity) must be applied after the fact table and inventory are joined, so it cannot be pushed into a CTE that filters inventory alone.
+- The left join to catalog_returns is kept for safety, but it might be removed.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: pg_dimension_prefetch_star
+TARGET_LOGICAL_TREE:
+  filtered_d1 -> filtered_hd -> filtered_cd -> filtered_item -> catalog_sales_join -> inventory_join -> d2_join -> d3_join -> promotion_join -> aggregated_result
+NODE_CONTRACTS:
+  filtered_d1:
+    FROM: date_dim d1
+    WHERE: d_year = 1999
+    OUTPUT: d_date_sk, d_week_seq, d_date
+    EXPECTED_ROWS: 182
+    CONSUMERS: catalog_sales_join, d2_join, d3_join
+  filtered_hd:
+    FROM: household_demographics
+    WHERE: hd_buy_ppotential = '>10000'
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1200
+    CONSUMERS: catalog_sales_join
+  filtered_cd:
+    FROM: customer_demographics
+    WHERE: cd_marital_status = 'S' AND cd_dep_count BETWEEN 9 AND 11
+    OUTPUT: cd_demo_sk
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: catalog_sales_join
+  filtered_item:
+    FROM: item
+    WHERE: i_category IN ('Men', 'Shoes', 'Sports')
+    OUTPUT: i_item_sk, i_item_desc
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: catalog_sales_join, inventory_join
+  catalog_sales_join:
+    FROM: catalog_sales
+    JOIN: filtered_d1 ON cs_sold_date_sk = filtered_d1.d_date_sk
+    JOIN: filtered_hd ON cs_bill_hdemo_sk = filtered_hd.hd_demo_sk
+    JOIN: filtered_cd ON cs_bill_cdemo_sk = filtered_cd.cd_demo_sk
+    JOIN: filtered_item ON i_item_sk = cs_item_sk
+    WHERE: cs_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: cs_item_sk, cs_quantity, cs_promo_sk, cs_order_number, cs_ship_date_sk, cs_wholesale_cost, filtered_d1.d_week_seq, filtered_d1.d_date, filtered_item.i_item_desc
+    EXPECTED_ROWS: 113K
+    CONSUMERS: inventory_join, d3_join, promotion_join, aggregated_result
+  inventory_join:
+    FROM: inventory
+    JOIN: filtered_item ON inv_item_sk = filtered_item.i_item_sk
+    JOIN: catalog_sales_join ON inv_item_sk = catalog_sales_join.cs_item_sk
+    WHERE: inv_quantity_on_hand < catalog_sales_join.cs_quantity
+    OUTPUT: inv_warehouse_sk, inv_date_sk, inv_item_sk, catalog_sales_join.cs_item_sk, catalog_sales_join.cs_quantity, catalog_sales_join.d_week_seq
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: d2_join, warehouse_join
+  d2_join:
+    FROM: date_dim d2
+    JOIN: catalog_sales_join ON d2.d_week_seq = catalog_sales_join.d_week_seq
+    JOIN: inventory_join ON d2.d_date_sk = inventory_join.inv_date_sk
+    OUTPUT: d2.d_date_sk, d2.d_week_seq, inventory_join.inv_warehouse_sk, inventory_join.inv_item_sk
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: warehouse_join
+  d3_join:
+    FROM: date_dim d3
+    JOIN: catalog_sales_join ON cs_ship_date_sk = d3.d_date_sk
+    WHERE: d3.d_date > catalog_sales_join.d_date + interval '3 day'
+    OUTPUT: d3.d_date_sk
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: aggregated_result
+  promotion_join:
+    FROM: promotion
+    LEFT JOIN: catalog_sales_join ON cs_promo_sk = p_promo_sk
+    OUTPUT: p_promo_sk, catalog_sales_join.cs_item_sk, catalog_sales_join.cs_order_number
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: aggregated_result
+  aggregated_result:
+    FROM: catalog_sales_join
+    JOIN: inventory_join ON ... (already done)
+    JOIN: warehouse ON w_warehouse_sk = inventory_join.inv_warehouse_sk
+    JOIN: d2_join ON ... (already done)
+    JOIN: d3_join ON ... (already done)
+    LEFT JOIN: promotion_join ON ... (already done)
+    LEFT JOIN: catalog_returns ON cr_item_sk = catalog_sales_join.cs_item_sk AND cr_order_number = catalog_sales_join.cs_order_number
+    GROUP BY: i_item_desc, w_warehouse_name, d_week_seq
+    AGGREGATE: SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN p_promo_sk IS NOT NULL THEN 1 ELSE 0 END), COUNT(*)
+    OUTPUT: i_item_desc, w_warehouse_name, d_week_seq, no_promo, promo, total_cnt
+    EXPECTED_ROWS: up to 100
+    CONSUMERS: final output
+
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply the pattern of pre-filtering dimensions into CTEs and then joining with the fact table. Ignore the comma join conversion (already explicit).
+- pg_date_cte_explicit_join: Use the idea of isolating date filters into CTEs for d1, d2, d3.
+- early_filter_decorrelate: Apply early filtering of dimensions, but ignore the decorrelation part (no correlated subquery).
+
+HAZARD_FLAGS:
+- The join order might change due to CTEs, potentially affecting performance.
+- The non-equi join condition must be applied after the fact table and inventory are joined.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: pg_date_cte_explicit_join
+TARGET_LOGICAL_TREE:
+  filtered_d1 -> filtered_d2 -> filtered_d3 -> catalog_sales_join -> other_dimensions -> inventory_join -> aggregated_result
+NODE_CONTRACTS:
+  filtered_d1:
+    FROM: date_dim d1
+    WHERE: d_year = 1999
+    OUTPUT: d_date_sk, d_week_seq, d_date
+    EXPECTED_ROWS: 182
+    CONSUMERS: catalog_sales_join, filtered_d2, filtered_d3
+  filtered_d2:
+    FROM: date_dim d2
+    JOIN: filtered_d1 ON d2.d_week_seq = filtered_d1.d_week_seq
+    OUTPUT: d_date_sk, d_week_seq
+    EXPECTED_ROWS: ? (about 73K? but filtered by week_seq)
+    CONSUMERS: inventory_join
+  filtered_d3:
+    FROM: date_dim d3
+    WHERE: exists (join with catalog_sales_join)  -- This is not a CTE filter, but we will join later.
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 73K (unfiltered)
+    CONSUMERS: catalog_sales_join
+  catalog_sales_join:
+    FROM: catalog_sales
+    JOIN: filtered_d1 ON cs_sold_date_sk = filtered_d1.d_date_sk
+    JOIN: filtered_d3 ON cs_ship_date_sk = filtered_d3.d_date_sk AND filtered_d3.d_date > filtered_d1.d_date + interval '3 day'
+    WHERE: cs_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: cs_item_sk, cs_quantity, cs_promo_sk, cs_order_number, cs_ship_date_sk, cs_wholesale_cost, filtered_d1.d_week_seq, filtered_d1.d_date
+    EXPECTED_ROWS: ? (less than 113K because of d3 condition)
+    CONSUMERS: other_dimensions, inventory_join
+  other_dimensions:
+    FROM: catalog_sales_join
+    JOIN: household_demographics ON cs_bill_hdemo_sk = hd_demo_sk AND hd_buy_potential = '>10000'
+    JOIN: customer_demographics ON cs_bill_cdemo_sk = cd_demo_sk AND cd_marital_status = 'S' AND cd_dep_count BETWEEN 9 AND 11
+    JOIN: item ON i_item_sk = cs_item_sk AND i_category IN ('Men', 'Shoes', 'Sports')
+    OUTPUT: cs_item_sk, cs_quantity, cs_promo_sk, cs_order_number, cs_ship_date_sk, cs_wholesale_cost, d_week_seq, d_date, i_item_desc
+    EXPECTED_ROWS: ? (same as catalog_sales_join, but filtered by these dimensions)
+    CONSUMERS: inventory_join, aggregated_result
+  inventory_join:
+    FROM: inventory
+    JOIN: filtered_d2 ON inv_date_sk = filtered_d2.d_date_sk
+    JOIN: other_dimensions ON inv_item_sk = other_dimensions.cs_item_sk
+    WHERE: inv_quantity_on_hand < other_dimensions.cs_quantity
+    OUTPUT: inv_warehouse_sk, inv_item_sk, other_dimensions.cs_item_sk, other_dimensions.d_week_seq, other_dimensions.i_item_desc
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: warehouse_join, aggregated_result
+  aggregated_result:
+    FROM: other_dimensions
+    JOIN: inventory_join ON ... (already done)
+    JOIN: warehouse ON w_warehouse_sk = inventory_join.inv_warehouse_sk
+    LEFT JOIN: promotion ON cs_promo_sk = p_promo_sk
+    LEFT JOIN: catalog_returns ON cr_item_sk = other_dimensions.cs_item_sk AND cr_order_number = other_dimensions.cs_order_number
+    GROUP BY: i_item_desc, w_warehouse_name, d_week_seq
+    AGGREGATE: SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN p_promo_sk IS NOT NULL THEN 1 ELSE 0 END), COUNT(*)
+    OUTPUT: i_item_desc, w_warehouse_name, d_week_seq, no_promo, promo, total_cnt
+    EXPECTED_ROWS: up to 100
+    CONSUMERS: final output
+
+EXAMPLES: pg_date_cte_explicit_join, pg_dimension_prefetch_star, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_date_cte_explicit_join: Apply the pattern of isolating date filters into CTEs for d1, d2, and d3. Ignore the comma join conversion (already explicit).
+- pg_dimension_prefetch_star: Use the idea of pre-filtering dimensions, but only do it for date dimensions in this strategy.
+- early_filter_decorrelate: Apply early filtering of date dimensions, but ignore the decorrelation.
+
+HAZARD_FLAGS:
+- The condition on d3 (d3.d_date > d1.d_date + interval) is applied in the join with catalog_sales, which might be expensive.
+- The non-equi join condition is applied after the inventory join.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: remove_redundant_join_and_prefilter
+TARGET_LOGICAL_TREE:
+  filtered_d1 -> filtered_hd -> filtered_cd -> filtered_item -> filtered_catalog_sales -> filtered_inventory -> filtered_d2 -> filtered_d3 -> filtered_promotion -> aggregated_result
+NODE_CONTRACTS:
+  filtered_d1:
+    FROM: date_dim d1
+    WHERE: d_year = 1999
+    OUTPUT: d_date_sk, d_week_seq, d_date
+    EXPECTED_ROWS: 182
+    CONSUMERS: filtered_catalog_sales, filtered_d2, filtered_d3
+  filtered_hd:
+    FROM: household_demographics
+    WHERE: hd_buy_potential = '>10000'
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1200
+    CONSUMERS: filtered_catalog_sales
+  filtered_cd:
+    FROM: customer_demographics
+    WHERE: cd_marital_status = 'S' AND cd_dep_count BETWEEN 9 AND 11
+    OUTPUT: cd_demo_sk
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: filtered_catalog_sales
+  filtered_item:
+    FROM: item
+    WHERE: i_category IN ('Men', 'Shoes', 'Sports')
+    OUTPUT: i_item_sk, i_item_desc
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: filtered_catalog_sales, filtered_inventory
+  filtered_catalog_sales:
+    FROM: catalog_sales
+    JOIN: filtered_d1 ON cs_sold_date_sk = filtered_d1.d_date_sk
+    JOIN: filtered_hd ON cs_bill_hdemo_sk = filtered_hd.hd_demo_sk
+    JOIN: filtered_cd ON cs_bill_cdemo_sk = filtered_cd.cd_demo_sk
+    JOIN: filtered_item ON i_item_sk = cs_item_sk
+    WHERE: cs_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: cs_item_sk, cs_quantity, cs_promo_sk, cs_order_number, cs_ship_date_sk, cs_wholesale_cost
+    EXPECTED_ROWS: 113K
+    CONSUMERS: filtered_inventory, filtered_d3, filtered_promotion, aggregated_result
+  filtered_inventory:
+    FROM: inventory
+    JOIN: filtered_item ON inv_item_sk = filtered_item.i_item_sk
+    JOIN: filtered_catalog_sales ON inv_item_sk = filtered_catalog_sales.cs_item_sk
+    WHERE: inv_quantity_on_hand < filtered_catalog_sales.cs_quantity
+    OUTPUT: inv_warehouse_sk, inv_date_sk, inv_item_sk
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: filtered_d2, warehouse
+  filtered_d2:
+    FROM: date_dim d2
+    JOIN: filtered_d1 ON d2.d_week_seq = filtered_d1.d_week_seq
+    JOIN: filtered_inventory ON inv_date_sk = d2.d_date_sk
+    OUTPUT: d_date_sk, d_week_seq
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: warehouse
+  filtered_d3:
+    FROM: date_dim d3
+    JOIN: filtered_catalog_sales ON cs_ship_date_sk = d3.d_date_sk
+    WHERE: d3.d_date > filtered_d1.d_date + interval '3 day'
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: aggregated_result
+  filtered_promotion:
+    FROM: promotion
+    LEFT JOIN: filtered_catalog_sales ON cs_promo_sk = p_promo_sk
+    OUTPUT: p_promo_sk
+    EXPECTED_ROWS: ? (small)
+    CONSUMERS: aggregated_result
+  aggregated_result:
+    FROM: filtered_catalog_sales
+    JOIN: filtered_inventory ON ... (already done)
+    JOIN: warehouse ON w_warehouse_sk = filtered_inventory.inv_warehouse_sk
+    JOIN: filtered_item ON ... (already done)
+    LEFT JOIN: filtered_promotion ON ... (already done)
+    -- Note: removed the left join to catalog_returns
+    GROUP BY: i_item_desc, w_warehouse_name, d_week_seq
+    AGGREGATE: SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END), SUM(CASE WHEN p_promo_sk IS NOT NULL THEN 1 ELSE 0 END), COUNT(*)
+    OUTPUT: i_item_desc, w_warehouse_name, d_week_seq, no_promo, promo, total_cnt
+    EXPECTED_ROWS: up to 100
+    CONSUMERS: final output
+
+EXAMPLES: pg_materialized_dimension_fact_prefilter, pg_dimension_prefetch_star
+EXAMPLE_ADAPTATION:
+- pg_materialized_dimension_fact_prefilter: Apply the pattern of pre-filtering dimensions and fact table into CTEs. Ignore the non-equi join condition handling.
+- pg_dimension_prefetch_star: Use the idea of pre-filtering dimensions, but also pre-filter the fact table.
+
+HAZARD_FLAGS:
+- Removing the left join to catalog_returns might change the result if there are duplicate returns (but the primary key ensures uniqueness). However, the original query includes the join, so we must be cautious.
+
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: The removal of catalog_returns join is a novel exploration for this query, but we must verify semantic equivalence by ensuring that the join does not change the row count.
+
+EXPLORATION_TYPE: constraint_relaxation (removing a join that does not affect the result)

@@ -1,0 +1,69 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE pipeline)
+├── [~] MAIN: Restructured into CTE pipeline per Target Logical Tree
+│   ├── WITH dim_item AS (SELECT ...)  [+]
+│   ├── WITH dim_inventory_date AS (SELECT ... JOIN dim_item)  [+]
+│   ├── WITH key_list AS (SELECT ... FROM dim_inventory_date)  [+]
+│   ├── WITH bloom_join_store_sales AS (SELECT ... WHERE IN key_list)  [+]
+│   └── final_dedup: JOIN dim_inventory_date + bloom_join_store_sales, GROUP BY, ORDER BY, LIMIT  [+]
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "prefetch_fact_join", "description": "Stage dimension filtering into CTE chain, then reduce fact table probe via key list", "applied_to": ["dim_item", "dim_inventory_date", "key_list", "bloom_join_store_sales", "final_dedup"]},
+    {"id": "R2", "type": "pushdown", "description": "Push key list predicate into store_sales scan via IN subquery", "applied_to": ["bloom_join_store_sales"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "dim_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_item_id, i_item_desc, i_current_price FROM item WHERE i_current_price BETWEEN 17 AND 47 AND i_manufact_id IN (639, 169, 138, 339)",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id", "i_item_desc", "i_current_price"], "consumes": []}
+      },
+      "dim_inventory_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT di.i_item_sk, di.i_item_id, di.i_item_desc, di.i_current_price FROM dim_item di JOIN inventory inv ON inv.inv_item_sk = di.i_item_sk JOIN date_dim dd ON inv.inv_date_sk = dd.d_date_sk WHERE dd.d_date BETWEEN CAST('1999-07-09' AS DATE) AND (CAST('1999-07-09' AS DATE) + INTERVAL 60 DAY) AND inv.inv_quantity_on_hand BETWEEN 100 AND 500",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id", "i_item_desc", "i_current_price"], "consumes": ["dim_item"]}
+      },
+      "key_list": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk FROM dim_inventory_date",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": ["dim_inventory_date"]}
+      },
+      "bloom_join_store_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_item_sk FROM store_sales WHERE ss_item_sk IN (SELECT i_item_sk FROM key_list)",
+        "interfaces": {"outputs": ["ss_item_sk"], "consumes": ["key_list"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT did.i_item_id, did.i_item_desc, did.i_current_price FROM dim_inventory_date did JOIN bloom_join_store_sales bj ON did.i_item_sk = bj.ss_item_sk GROUP BY did.i_item_id, did.i_item_desc, did.i_current_price ORDER BY did.i_item_id LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "i_item_desc", "i_current_price"], "consumes": ["dim_inventory_date", "bloom_join_store_sales"]}
+      }
+    },
+    "reconstruction_order": ["dim_item", "dim_inventory_date", "key_list", "bloom_join_store_sales", "main_query"],
+    "assembly_template": "WITH dim_item AS ({dim_item}), dim_inventory_date AS ({dim_inventory_date}), key_list AS ({key_list}), bloom_join_store_sales AS ({bloom_join_store_sales}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Restructured the single-block query into a staged CTE pipeline that filters dimensions early (item, inventory, date) before probing store_sales via a key list, then deduplicates via GROUP BY. This isolates dimension filtering into separate CTEs for better predicate pushdown.
+
+Expected speedup: 2-3x from reduced store_sales scan via key list pushdown and early dimension reduction.

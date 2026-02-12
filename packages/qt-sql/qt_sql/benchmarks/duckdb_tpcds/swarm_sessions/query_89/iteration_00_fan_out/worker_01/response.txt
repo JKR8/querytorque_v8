@@ -1,0 +1,91 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY:
+└── [MAIN] main_query
+    ├── [CTE] filtered_date
+    ├── [CTE] filtered_item  
+    ├── [CTE] filtered_store
+    ├── [CTE] prefetched_fact
+    ├── [CTE] aggregated
+    ├── [CTE] windowed
+    ├── [CTE] filtered
+    └── [CTE] ordered (contains ORDER BY + LIMIT)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter date, item, and store dimensions into separate CTEs before joining with fact table", "applied_to": ["filtered_date", "filtered_item", "filtered_store"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Staged join pipeline: join three filtered dimension CTEs with store_sales in a single CTE", "applied_to": ["prefetched_fact"]},
+    {"id": "R3", "type": "multi_dimension_prefetch", "description": "Apply multiple dimension pre-filtering (date, item, store) to reduce fact table scan", "applied_to": ["filtered_date", "filtered_item", "filtered_store", "prefetched_fact"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte", 
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_category, i_class, i_brand FROM item WHERE ((i_category IN ('Jewelry','Shoes','Electronics') AND i_class IN ('semi-precious','athletic','portable')) OR (i_category IN ('Men','Music','Women') AND i_class IN ('accessories','rock','maternity')))",
+        "interfaces": {"outputs": ["i_item_sk", "i_category", "i_class", "i_brand"], "consumes": []}
+      },
+      "filtered_store": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_store_sk, s_store_name, s_company_name FROM store WHERE s_store_sk <= 100",
+        "interfaces": {"outputs": ["s_store_sk", "s_store_name", "s_company_name"], "consumes": []}
+      },
+      "prefetched_fact": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i.i_category, i.i_class, i.i_brand, s.s_store_name, s.s_company_name, d.d_moy, ss.ss_sales_price FROM store_sales ss INNER JOIN filtered_date fd ON ss.ss_sold_date_sk = fd.d_date_sk INNER JOIN filtered_item i ON ss.ss_item_sk = i.i_item_sk INNER JOIN filtered_store s ON ss.ss_store_sk = s.s_store_sk",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "s_store_name", "s_company_name", "d_moy", "ss_sales_price"], "consumes": ["filtered_date", "filtered_item", "filtered_store"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_category, i_class, i_brand, s_store_name, s_company_name, d_moy, SUM(ss_sales_price) AS sum_sales FROM prefetched_fact GROUP BY i_category, i_class, i_brand, s_store_name, s_company_name, d_moy",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "s_store_name", "s_company_name", "d_moy", "sum_sales"], "consumes": ["prefetched_fact"]}
+      },
+      "windowed": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_category, i_class, i_brand, s_store_name, s_company_name, d_moy, sum_sales, AVG(sum_sales) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name) AS avg_monthly_sales FROM aggregated",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "s_store_name", "s_company_name", "d_moy", "sum_sales", "avg_monthly_sales"], "consumes": ["aggregated"]}
+      },
+      "filtered": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_category, i_class, i_brand, s_store_name, s_company_name, d_moy, sum_sales, avg_monthly_sales FROM windowed WHERE CASE WHEN avg_monthly_sales <> 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "s_store_name", "s_company_name", "d_moy", "sum_sales", "avg_monthly_sales"], "consumes": ["windowed"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_category, i_class, i_brand, s_store_name, s_company_name, d_moy, sum_sales, avg_monthly_sales FROM filtered ORDER BY (sum_sales - avg_monthly_sales) ASC, s_store_name ASC LIMIT 100",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "s_store_name", "s_company_name", "d_moy", "sum_sales", "avg_monthly_sales"], "consumes": ["filtered"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "filtered_store", "prefetched_fact", "aggregated", "windowed", "filtered", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), filtered_store AS ({filtered_store}), prefetched_fact AS ({prefetched_fact}), aggregated AS ({aggregated}), windowed AS ({windowed}), filtered AS ({filtered}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Applied multi-dimension prefetching by isolating all three dimension filters (date, item, store) into separate CTEs before joining with the fact table, creating a staged join pipeline that reduces the fact scan early.
+
+**Expected speedup:** 2.5-3.0x due to compound selectivity from three pre-filtered dimension hash tables reducing the 593K fact rows early in the pipeline.

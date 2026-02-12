@@ -1,0 +1,89 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [+] date_range (CTE) — Isolate date dimension filter for Jan-Mar 2000.
+├── [+] store_sales_dated (CTE) — Store sales in date range.
+├── [+] web_sales_dated (CTE) — Web sales in date range.
+├── [+] catalog_sales_dated (CTE) — Catalog sales in date range.
+├── [+] customer_base (CTE) — Customers in TX/VA/MI with demographics.
+├── [+] filtered_customers (CTE) — Apply EXISTS/NOT EXISTS with dated sales.
+├── [~] main_query — Now references CTEs instead of original joins.
+    ├── SCAN (filtered_customers)
+    ├── AGG (GROUP BY)
+    ├── SORT (cd_gender ASC, cd_marital_status ASC, cd_education_status ASC, cd_purchase_estimate ASC, cd_credit_rating ASC)
+    └── OUTPUT (cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extract date filter into reusable CTE to avoid 3 separate scans of date_dim.", "applied_to": ["date_range", "store_sales_dated", "web_sales_dated", "catalog_sales_dated"]},
+    {"id": "R2", "type": "early_filter", "description": "Filter customer_address by state and join demographics before EXISTS checks.", "applied_to": ["customer_base"]},
+    {"id": "R3", "type": "preserve_semijoins", "description": "Keep EXISTS/NOT EXISTS as semi/anti joins, do not materialize full result sets.", "applied_to": ["filtered_customers"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_range": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000 AND d_moy BETWEEN 1 AND 3",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "store_sales_dated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_customer_sk FROM store_sales JOIN date_range ON ss_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ss_customer_sk"], "consumes": ["date_range"]}
+      },
+      "web_sales_dated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws_bill_customer_sk FROM web_sales JOIN date_range ON ws_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ws_bill_customer_sk"], "consumes": ["date_range"]}
+      },
+      "catalog_sales_dated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_ship_customer_sk FROM catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["cs_ship_customer_sk"], "consumes": ["date_range"]}
+      },
+      "customer_base": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT c.c_customer_sk, cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating FROM customer c JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk WHERE ca.ca_state IN ('TX', 'VA', 'MI')",
+        "interfaces": {"outputs": ["c_customer_sk", "cd_gender", "cd_marital_status", "cd_education_status", "cd_purchase_estimate", "cd_credit_rating"], "consumes": []}
+      },
+      "filtered_customers": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT c_customer_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating FROM customer_base cb WHERE EXISTS (SELECT 1 FROM store_sales_dated ss WHERE ss.ss_customer_sk = cb.c_customer_sk) AND NOT EXISTS (SELECT 1 FROM web_sales_dated ws WHERE ws.ws_bill_customer_sk = cb.c_customer_sk) AND NOT EXISTS (SELECT 1 FROM catalog_sales_dated cs WHERE cs.cs_ship_customer_sk = cb.c_customer_sk)",
+        "interfaces": {"outputs": ["c_customer_sk", "cd_gender", "cd_marital_status", "cd_education_status", "cd_purchase_estimate", "cd_credit_rating"], "consumes": ["customer_base", "store_sales_dated", "web_sales_dated", "catalog_sales_dated"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3 FROM filtered_customers GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating LIMIT 100",
+        "interfaces": {"outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "cnt1", "cd_purchase_estimate", "cnt2", "cd_credit_rating", "cnt3"], "consumes": ["filtered_customers"]}
+      }
+    },
+    "reconstruction_order": ["date_range", "store_sales_dated", "web_sales_dated", "catalog_sales_dated", "customer_base", "filtered_customers", "main_query"],
+    "assembly_template": "WITH date_range AS ({date_range}), store_sales_dated AS ({store_sales_dated}), web_sales_dated AS ({web_sales_dated}), catalog_sales_dated AS ({catalog_sales_dated}), customer_base AS ({customer_base}), filtered_customers AS ({filtered_customers}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Changes & Mechanism
+
+**Structural change**: Introduced CTE pipeline isolating date filtering (once) and channel-specific sales, then applying EXISTS/NOT EXISTS as semi/anti joins.  
+
+**Expected speedup**: 3–4× from eliminating 3 separate date_dim scans and enabling predicate pushdown into each channel subquery. The date CTE materializes only 91 rows, creating small hash tables for each sales join. EXISTS/NOT EXISTS preserve short-circuit evaluation.

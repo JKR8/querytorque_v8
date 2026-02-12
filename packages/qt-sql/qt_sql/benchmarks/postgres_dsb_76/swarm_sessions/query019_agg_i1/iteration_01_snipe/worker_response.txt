@@ -1,0 +1,105 @@
+<reasoning>
+I'll analyze why previous attempts failed to reach 2.0x speedup and identify unexplored optimization angles.
+
+## 1. DIAGNOSE: Why previous attempts failed
+
+Looking at the execution plans, all attempts show similar nested-loop join patterns with high costs in:
+- Hash Join between store_sales and store (~15ms)
+- Nested Loop between date_dim and store_sales (~13-15ms)
+- Multiple index scans on item, customer, customer_address
+
+The fundamental bottleneck is that PostgreSQL's optimizer cannot effectively reorder joins when the original query uses comma-separated FROM syntax (comma_join_weakness). All previous attempts kept either comma joins or used CTEs that created optimization fences, preventing the planner from finding optimal join orders.
+
+The best attempt (W2: 1.086x) still shows a Nested Loop structure where store is joined early via Hash Join, then item/customer/customer_address are joined via index scans in nested loops. The zip inequality filter is applied late in the plan.
+
+Key observations:
+1. **Comma join weakness**: Original uses `FROM date_dim, store_sales, item, customer, customer_address, store`
+2. **CTE materialization fences**: Previous attempts used CTEs that prevent predicate pushdown and join reordering
+3. **Non-equi join blindness**: The zip inequality `substring(ca_zip,1,5) <> substring(s_zip,1,5)` cannot be pushed down early
+4. **Late application of selective filters**: Customer (c_birth_month=1) and item (i_category='Jewelry') filters are applied in nested loops after joining with store_sales
+
+## 2. IDENTIFY: Unexplored optimization angles
+
+From the engine profile, I see several powerful techniques not yet applied:
+
+1. **Comma join to explicit JOIN conversion**: This alone unlocked 2-3x improvements in reference examples (Q080: 3.32x, Q099: 2.28x)
+2. **Dimension isolation without CTE fences**: Pre-filter dimensions but avoid materialization fences
+3. **Early reduction of fact table**: Apply date filter immediately to reduce store_sales rows
+4. **Strategic join reordering**: Place most selective dimensions (item, customer) earlier in the join order
+
+Unexplored angles specific to this query:
+- The `ss_wholesale_cost BETWEEN 35 AND 55` filter can be applied directly to store_sales during the date join
+- Customer_address (ca_state='IL') is highly selective and should be joined early
+- Store table has no filters but is needed for zip comparison - should be joined last
+
+## 3. REWRITE: Strategy
+
+I'll build on the best foundation but:
+1. Convert all comma joins to explicit JOIN syntax
+2. Remove CTEs that create optimization fences
+3. Reorder joins to apply most selective filters first
+4. Keep the zip inequality filter at the final stage
+
+Expected mechanism: By converting to explicit JOINs, PostgreSQL's cost model can properly estimate join selectivity and choose better join orders (likely hash joins instead of nested loops). The date filter will drastically reduce store_sales rows early.
+
+</reasoning>
+
+## Part 1: Modified Logic Tree
+
+```
+[=] Original query structure preserved
+[!] Comma joins converted to explicit INNER JOIN syntax
+[!] Join order reorganized for early filtering
+[!] Removed all CTE fences to allow full optimizer freedom
+[=] All original filters preserved exactly
+[=] GROUP BY and ORDER BY preserved exactly
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "comma_join_to_explicit", "description": "Convert comma-separated FROM to explicit INNER JOIN syntax", "applied_to": ["main_query"]},
+    {"id": "R2", "type": "join_reordering", "description": "Reorder joins to apply most selective filters first: date_dim -> store_sales -> item -> customer -> customer_address -> store", "applied_to": ["main_query"]},
+    {"id": "R3", "type": "cte_fence_removal", "description": "Remove all CTE materialization fences to allow full optimizer join reordering", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_brand_id AS brand_id, i_brand AS brand, i_manufact_id, i_manufact, SUM(ss_ext_sales_price) AS ext_price FROM date_dim INNER JOIN store_sales ON d_date_sk = ss_sold_date_sk INNER JOIN item ON ss_item_sk = i_item_sk INNER JOIN customer ON ss_customer_sk = c_customer_sk INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk INNER JOIN store ON ss_store_sk = s_store_sk WHERE i_category = 'Jewelry' AND d_year = 2002 AND d_moy = 4 AND substring(ca_zip,1,5) <> substring(s_zip,1,5) AND ca_state = 'IL' AND c_birth_month = 1 AND ss_wholesale_cost BETWEEN 35 AND 55 GROUP BY i_brand, i_brand_id, i_manufact_id, i_manufact ORDER BY ext_price DESC, i_brand, i_brand_id, i_manufact_id, i_manufact LIMIT 100",
+        "interfaces": {"outputs": ["brand_id", "brand", "i_manufact_id", "i_manufact", "ext_price"], "consumes": []}
+      }
+    },
+    "reconstruction_order": ["main_query"],
+    "assembly_template": "{main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL join_collapse_limit = 20",
+    "SET LOCAL from_collapse_limit = 20",
+    "SET LOCAL work_mem = '64MB'",
+    "SET LOCAL max_parallel_workers_per_gather = 4",
+    "SET LOCAL enable_nestloop = off",
+    "SET LOCAL enable_hashjoin = on",
+    "SET LOCAL hash_mem_multiplier = 2.0"
+  ],
+  "validation_checks": [
+    "Output columns match original: brand_id, brand, i_manufact_id, i_manufact, ext_price",
+    "All original filters preserved exactly",
+    "Explicit JOIN syntax enables better PostgreSQL optimizer",
+    "No CTE fences allow full join reordering"
+  ]
+}
+```
+
+**Changes**: Converted comma joins to explicit INNER JOIN syntax and removed CTE fences, allowing PostgreSQL's optimizer to freely reorder joins and apply selective filters early. Added runtime configuration to encourage hash joins and parallel execution.
+
+**Expected speedup**: 2.0x+ (Reference examples show 2.28x-3.32x for similar comma-join conversions on PostgreSQL)

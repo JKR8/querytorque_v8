@@ -1,0 +1,322 @@
+<reasoning>
+First, I need to analyze the provided SQL query. It appears to be two separate queries concatenated with a semicolon (lines 1-101 and 102-207). The EXPLAIN plan and logical tree provided seem to describe the first query only (lines 1-101). I will focus on optimizing the first query.
+
+**1. CLASSIFY**
+This query is a **multi-channel UNION ALL with set operations and shared dimension filters**. It:
+- Uses INTERSECT to find items sold across three channels (store, catalog, web) over a 3-year period.
+- Computes a cross-channel average sales threshold over the same 3-year period.
+- For each channel, aggregates November 2002 sales for those intersected items, filtering groups where sales exceed the average threshold.
+- Finally, performs a ROLLUP aggregation across channels and product hierarchy.
+
+Structural archetype: **set_operations (INTERSECT) + multi-channel UNION ALL + shared scalar aggregate filter**.
+
+**2. EXPLAIN PLAN ANALYSIS**
+The EXPLAIN plan provided is minimal (just numbers). Without detailed timing, I must rely on the logical tree cost percentages (33% each for cross_items, avg_sales, main_query). Given the structure, the biggest costs likely come from:
+- **Multiple scans of large fact tables**: store_sales, catalog_sales, web_sales are each scanned:
+  1. In cross_items CTE (3 scans, one per channel, for 2000-2002)
+  2. In avg_sales CTE (3 scans, one per channel, for 2000-2002)
+  3. In main query (3 scans, one per channel, for Nov 2002)
+  That's ~9 fact table scans total.
+- **INTERSECT operations**: These require deduplication and comparison of three sets, potentially materializing large intermediate results.
+- **IN subqueries**: The main query uses `ws_item_sk IN (SELECT ss_item_sk FROM cross_items)`. This may force re-execution or materialization.
+
+The optimizer likely materializes CTEs since they're referenced multiple times. The logical tree shows each CTE at 33% cost, indicating they're significant.
+
+**3. GAP MATCHING**
+- **CROSS_CTE_PREDICATE_BLINDNESS**: Yes. The same date filters (d_year between 2000 and 2002) appear in multiple CTEs (cross_items and avg_sales). The optimizer may not push these predicates across CTE boundaries efficiently. Also, the November 2002 filter is applied late in the main query after joining with cross_items.
+- **REDUNDANT_SCAN_ELIMINATION**: Yes. Each fact table is scanned 3 times (once per CTE/channel combination). Opportunity to consolidate scans.
+- **CORRELATED_SUBQUERY_PARALYSIS**: No explicit correlated subqueries, but the IN subquery might be treated as a semi-join. The optimizer likely decorrelates it already.
+- **UNION_CTE_SELF_JOIN_DECOMPOSITION**: The avg_sales CTE is a UNION ALL of three channel scans, but it's only referenced once (scalar). No self-join.
+
+**Specific transforms applicable:**
+- **multi_intersect_exists_cte** (2.39x): Replace INTERSECT with EXISTS to avoid full materialization.
+- **intersect_to_exists** (1.83x): Similar but simpler.
+- **single_pass_aggregation** (4.47x): Could consolidate the three channel scans in avg_sales and main query? But they're on different fact tables. However, we could consolidate the three year scans within cross_items? Not directly.
+- **channel_bitmap_aggregation** (6.24x): Could consolidate the three channel scans in the main query (Nov 2002) into a single scan with CASE? But they're different fact tables.
+- **date_cte_isolate** (4.00x): Extract date filters into CTEs to reduce dimension scans.
+- **shared_dimension_multi_channel** (1.30x): Extract shared date/item filters across channels.
+- **prefetch_fact_join** (3.77x): Pre-join filtered dimensions with fact tables.
+- **pushdown** (2.11x): Consolidate multiple subqueries scanning same table.
+
+Given the structure, the highest leverage is likely replacing INTERSECT with EXISTS (biggest known win for this query pattern) and consolidating redundant fact table scans.
+
+**4. AGGREGATION TRAP CHECK**
+The query uses SUM and COUNT, which are duplicate-safe. The HAVING clause uses a scalar subquery (avg_sales), which is safe. No window functions or STDDEV.
+
+**5. TRANSFORM SELECTION**
+I'll select 4 structurally diverse strategies:
+1. **Replace INTERSECT with EXISTS** (multi_intersect_exists_cte) - targets set operation bottleneck.
+2. **Consolidate fact scans via single-pass aggregation** (channel_bitmap_aggregation adapted) - targets redundant scans by merging channel scans in main query using UNION ALL with early filtering.
+3. **Push down filters and pre-join dimensions** (prefetch_fact_join + date_cte_isolate) - targets predicate blindness by creating filtered dimension CTEs and pre-joining with facts.
+4. **Exploration: Combine INTERSECT replacement with consolidated fact scans and early filtering** - novel compound strategy.
+
+**6. LOGICAL TREE DESIGN**
+For each strategy, I'll design a CTE structure that reduces fact table scans and pushes filters early.
+
+**Check column completeness**: Each CTE must output all columns needed downstream (e.g., item keys, brand/class/category IDs, sales amounts).
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Identify items sold across all three channels (store, catalog, web) during 2000-2002, then report November 2002 sales per channel for those items where channel sales exceed the 3-year cross-channel average. All joins are INNER (intersection semantics). Aggregates are SUM and COUNT, which are duplicate-safe, but ensure the IN subquery doesn't introduce duplicates. The HAVING filter depends on the scalar avg_sales CTE, which must be computed exactly once.
+
+BOTTLENECK_DIAGNOSIS:
+The query is scan-bound due to 9 full fact table scans (3 channels × 3 CTEs). The INTERSECT operations force materialization of large intermediate sets. The optimizer likely materializes CTEs but doesn't push November 2002 filters into the cross_items CTE (different intent). Cardinality drops sharply after date filters (2000-2002 reduces fact rows), but the INTERSECT may still process many rows. The optimizer already handles IN-to-semi-join conversion.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output channel, i_brand_id, i_class_id, i_category_id, sum(sales), sum(number_sales) with ROLLUP.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (item keys, brand/class/category IDs, sales aggregates).
+- LITERAL_PRESERVATION: Must keep all literal values (2000, 2002, 11, etc.).
+- SEMANTIC_EQUIVALENCE: Must return identical rows.
+- CROSS_CTE_PREDICATE_BLINDNESS: Date filters repeated across CTEs; November filter applied late.
+- REDUNDANT_SCAN_ELIMINATION: Each fact table scanned 3 times.
+
+REGRESSION_WARNINGS:
+1. materialize_cte (0.14x regression):
+   CAUSE: Converting EXISTS to materialized CTE forced full scan instead of semi-join short-circuit.
+   RULE: Do not convert EXISTS subqueries to materialized CTEs; keep as EXISTS.
+2. date_cte_isolate (0.49x regression):
+   CAUSE: Baseline <100ms, CTE overhead exceeded savings.
+   RULE: Skip if baseline is fast (<100ms), but we lack timing data; assume baseline is large given 9 fact scans.
+3. union_cte_split (0.49x regression):
+   CAUSE: Kept both original UNION and specialized CTEs, causing redundant materialization.
+   RULE: When splitting a CTE, eliminate the original UNION.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: intersect_to_exists
+TARGET_LOGICAL_TREE:
+  filtered_dates -> channel_sales_keys -> cross_items -> avg_sales -> main_query
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year BETWEEN 2000 AND 2002
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: ~1095 (3 years * 365)
+    CONSUMERS: channel_sales_keys
+  channel_sales_keys:
+    FROM: store_sales JOIN item iss ON ss_item_sk = iss.i_item_sk JOIN filtered_dates d1 ON ss_sold_date_sk = d1.d_date_sk
+    WHERE: (exists for store channel)
+    OUTPUT: iss.i_brand_id, iss.i_class_id, iss.i_category_id
+    EXPECTED_ROWS: ~? (large)
+    CONSUMERS: cross_items
+  cross_items:
+    FROM: item
+    WHERE: EXISTS (SELECT 1 FROM channel_sales_keys s WHERE s.i_brand_id = item.i_brand_id AND s.i_class_id = item.i_class_id AND s.i_category_id = item.i_category_id)
+      AND EXISTS (SELECT 1 FROM catalog_sales JOIN item ics ON cs_item_sk = ics.i_item_sk JOIN filtered_dates d2 ON cs_sold_date_sk = d2.d_date_sk WHERE ics.i_brand_id = item.i_brand_id AND ics.i_class_id = item.i_class_id AND ics.i_category_id = item.i_category_id)
+      AND EXISTS (SELECT 1 FROM web_sales JOIN item iws ON ws_item_sk = iws.i_item_sk JOIN filtered_dates d3 ON ws_sold_date_sk = d3.d_date_sk WHERE iws.i_brand_id = item.i_brand_id AND iws.i_class_id = item.i_class_id AND iws.i_category_id = item.i_category_id)
+    OUTPUT: i_item_sk AS ss_item_sk
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: main_query store, catalog, web branches
+  avg_sales:
+    FROM: (SELECT ss_quantity quantity, ss_list_price list_price FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk UNION ALL ... similar for catalog, web)
+    AGGREGATE: AVG(quantity * list_price) AS average_sales
+    OUTPUT: average_sales
+    EXPECTED_ROWS: 1
+    CONSUMERS: main_query store, catalog, web branches
+  main_query:
+    FROM: (SELECT 'store' channel, ... FROM store_sales JOIN item ON ss_item_sk = i_item_sk JOIN date_dim ON ss_sold_date_sk = d_date_sk WHERE d_year = 2002 AND d_moy = 11 AND ss_item_sk IN (SELECT ss_item_sk FROM cross_items) GROUP BY ... HAVING sum(...) > (SELECT average_sales FROM avg_sales) UNION ALL ...)
+    GROUP BY ROLLUP (channel, i_brand_id, i_class_id, i_category_id)
+    ORDER BY channel, i_brand_id, i_class_id, i_category_id
+    LIMIT 100
+    OUTPUT: channel, i_brand_id, i_class_id, i_category_id, sum(sales), sum(number_sales)
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: intersect_to_exists, multi_intersect_exists_cte
+EXAMPLE_ADAPTATION:
+- intersect_to_exists: Replace the INTERSECT with EXISTS subqueries as shown in node contracts.
+- multi_intersect_exists_cte: Use a shared filtered_dates CTE for all three channels; create separate EXISTS conditions per channel.
+HAZARD_FLAGS:
+- EXISTS conditions must check brand/class/category combination, not just item key, to match INTERSECT semantics.
+- Ensure the filtered_dates CTE includes d_date_sk for joins.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  nov_2002_dates -> cross_items -> consolidated_sales -> avg_sales -> main_aggregation
+NODE_CONTRACTS:
+  nov_2002_dates:
+    FROM: date_dim
+    WHERE: d_year = 2002 AND d_moy = 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: ~30
+    CONSUMERS: consolidated_sales
+  cross_items:
+    FROM: (original INTERSECT CTE, unchanged)
+    OUTPUT: ss_item_sk
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: consolidated_sales
+  consolidated_sales:
+    FROM: (
+        SELECT 'store' AS channel, ss_item_sk, ss_quantity, ss_list_price FROM store_sales JOIN nov_2002_dates ON ss_sold_date_sk = d_date_sk WHERE ss_item_sk IN (SELECT ss_item_sk FROM cross_items)
+        UNION ALL
+        SELECT 'catalog', cs_item_sk, cs_quantity, cs_list_price FROM catalog_sales JOIN nov_2002_dates ON cs_sold_date_sk = d_date_sk WHERE cs_item_sk IN (SELECT ss_item_sk FROM cross_items)
+        UNION ALL
+        SELECT 'web', ws_item_sk, ws_quantity, ws_list_price FROM web_sales JOIN nov_2002_dates ON ws_sold_date_sk = d_date_sk WHERE ws_item_sk IN (SELECT ss_item_sk FROM cross_items)
+      ) sales
+      JOIN item ON sales.ss_item_sk = item.i_item_sk
+    OUTPUT: channel, i_brand_id, i_class_id, i_category_id, ss_quantity * ss_list_price AS sales_amount, 1 AS cnt
+    EXPECTED_ROWS: ~? (November sales for cross_items)
+    CONSUMERS: main_aggregation
+  avg_sales:
+    FROM: (original avg_sales CTE, unchanged)
+    OUTPUT: average_sales
+    EXPECTED_ROWS: 1
+    CONSUMERS: main_aggregation
+  main_aggregation:
+    FROM: consolidated_sales
+    GROUP BY channel, i_brand_id, i_class_id, i_category_id
+    HAVING SUM(sales_amount) > (SELECT average_sales FROM avg_sales)
+    GROUP BY ROLLUP (channel, i_brand_id, i_class_id, i_category_id)
+    ORDER BY channel, i_brand_id, i_class_id, i_category_id
+    LIMIT 100
+    OUTPUT: channel, i_brand_id, i_class_id, i_category_id, SUM(sales_amount) AS sales, SUM(cnt) AS number_sales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Consolidate the three channel scans for November 2002 into a single UNION ALL before joining with item and aggregating.
+- channel_bitmap_aggregation: Use CASE to label channels, but here we keep separate UNION branches because different fact tables.
+HAZARD_FLAGS:
+- Must ensure the IN subquery with cross_items is efficient (semi-join).
+- The consolidated_sales CTE must include all columns needed for aggregation and grouping.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  filtered_dates_3year -> filtered_dates_nov2002 -> cross_items -> prefetched_store_sales -> prefetched_catalog_sales -> prefetched_web_sales -> avg_sales -> main_union
+NODE_CONTRACTS:
+  filtered_dates_3year:
+    FROM: date_dim
+    WHERE: d_year BETWEEN 2000 AND 2002
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: ~1095
+    CONSUMERS: cross_items, avg_sales
+  filtered_dates_nov2002:
+    FROM: date_dim
+    WHERE: d_year = 2002 AND d_moy = 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: ~30
+    CONSUMERS: prefetched_store_sales, prefetched_catalog_sales, prefetched_web_sales
+  cross_items:
+    FROM: (original INTERSECT CTE, but use filtered_dates_3year for date joins)
+    OUTPUT: ss_item_sk
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: prefetched_store_sales, prefetched_catalog_sales, prefetched_web_sales
+  prefetched_store_sales:
+    FROM: store_sales JOIN filtered_dates_nov2002 ON ss_sold_date_sk = d_date_sk
+    WHERE: ss_item_sk IN (SELECT ss_item_sk FROM cross_items)
+    OUTPUT: ss_item_sk, ss_quantity, ss_list_price
+    EXPECTED_ROWS: ~? (November sales for cross_items)
+    CONSUMERS: main_union store branch
+  prefetched_catalog_sales:
+    FROM: catalog_sales JOIN filtered_dates_nov2002 ON cs_sold_date_sk = d_date_sk
+    WHERE: cs_item_sk IN (SELECT ss_item_sk FROM cross_items)
+    OUTPUT: cs_item_sk, cs_quantity, cs_list_price
+    EXPECTED_ROWS: ~?
+    CONSUMERS: main_union catalog branch
+  prefetched_web_sales:
+    FROM: web_sales JOIN filtered_dates_nov2002 ON ws_sold_date_sk = d_date_sk
+    WHERE: ws_item_sk IN (SELECT ss_item_sk FROM cross_items)
+    OUTPUT: ws_item_sk, ws_quantity, ws_list_price
+    EXPECTED_ROWS: ~?
+    CONSUMERS: main_union web branch
+  avg_sales:
+    FROM: (use filtered_dates_3year for date joins, same as original)
+    OUTPUT: average_sales
+    EXPECTED_ROWS: 1
+    CONSUMERS: main_union
+  main_union:
+    FROM: (
+        SELECT 'store' channel, i_brand_id, i_class_id, i_category_id, SUM(ss_quantity * ss_list_price) sales, COUNT(*) number_sales FROM prefetched_store_sales JOIN item ON ss_item_sk = i_item_sk GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(ss_quantity * ss_list_price) > (SELECT average_sales FROM avg_sales)
+        UNION ALL ... for catalog and web
+      )
+    GROUP BY ROLLUP (channel, i_brand_id, i_class_id, i_category_id)
+    ORDER BY channel, i_brand_id, i_class_id, i_category_id
+    LIMIT 100
+    OUTPUT: channel, i_brand_id, i_class_id, i_category_id, sum(sales), sum(number_sales)
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: prefetch_fact_join, date_cte_isolate, multi_date_range_cte
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Create CTEs that pre-join fact tables with filtered dates and cross_items before aggregation.
+- date_cte_isolate: Create separate date CTEs for 3-year and November 2002 filters.
+- multi_date_range_cte: Use different date CTEs for different date ranges (d1, d2, d3 in cross_items).
+HAZARD_FLAGS:
+- Ensure the cross_items CTE uses the 3-year date CTE, not the November CTE.
+- Prefetched sales CTEs must output all columns needed for aggregation.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_intersect_consolidate
+TARGET_LOGICAL_TREE:
+  filtered_dates_3year -> filtered_dates_nov2002 -> cross_items_exists -> avg_sales_consolidated -> nov_sales_consolidated -> final_aggregation
+NODE_CONTRACTS:
+  filtered_dates_3year:
+    FROM: date_dim
+    WHERE: d_year BETWEEN 2000 AND 2002
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: ~1095
+    CONSUMERS: cross_items_exists, avg_sales_consolidated
+  filtered_dates_nov2002:
+    FROM: date_dim
+    WHERE: d_year = 2002 AND d_moy = 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: ~30
+    CONSUMERS: nov_sales_consolidated
+  cross_items_exists:
+    FROM: item
+    WHERE: EXISTS (SELECT 1 FROM store_sales JOIN item iss ON ss_item_sk = iss.i_item_sk JOIN filtered_dates_3year d1 ON ss_sold_date_sk = d1.d_date_sk WHERE iss.i_brand_id = item.i_brand_id AND iss.i_class_id = item.i_class_id AND iss.i_category_id = item.i_category_id)
+      AND EXISTS (SELECT 1 FROM catalog_sales JOIN item ics ON cs_item_sk = ics.i_item_sk JOIN filtered_dates_3year d2 ON cs_sold_date_sk = d2.d_date_sk WHERE ics.i_brand_id = item.i_brand_id AND ics.i_class_id = item.i_class_id AND ics.i_category_id = item.i_category_id)
+      AND EXISTS (SELECT 1 FROM web_sales JOIN item iws ON ws_item_sk = iws.i_item_sk JOIN filtered_dates_3year d3 ON ws_sold_date_sk = d3.d_date_sk WHERE iws.i_brand_id = item.i_brand_id AND iws.i_class_id = item.i_class_id AND iws.i_category_id = item.i_category_id)
+    OUTPUT: i_item_sk AS ss_item_sk
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: nov_sales_consolidated
+  avg_sales_consolidated:
+    FROM: (
+        SELECT 'store' channel, ss_quantity quantity, ss_list_price list_price FROM store_sales JOIN filtered_dates_3year ON ss_sold_date_sk = d_date_sk
+        UNION ALL
+        SELECT 'catalog', cs_quantity, cs_list_price FROM catalog_sales JOIN filtered_dates_3year ON cs_sold_date_sk = d_date_sk
+        UNION ALL
+        SELECT 'web', ws_quantity, ws_list_price FROM web_sales JOIN filtered_dates_3year ON ws_sold_date_sk = d_date_sk
+      )
+    AGGREGATE: AVG(quantity * list_price) AS average_sales
+    OUTPUT: average_sales
+    EXPECTED_ROWS: 1
+    CONSUMERS: final_aggregation
+  nov_sales_consolidated:
+    FROM: (
+        SELECT 'store' channel, ss_item_sk, ss_quantity, ss_list_price FROM store_sales JOIN filtered_dates_nov2002 ON ss_sold_date_sk = d_date_sk WHERE ss_item_sk IN (SELECT ss_item_sk FROM cross_items_exists)
+        UNION ALL
+        SELECT 'catalog', cs_item_sk, cs_quantity, cs_list_price FROM catalog_sales JOIN filtered_dates_nov2002 ON cs_sold_date_sk = d_date_sk WHERE cs_item_sk IN (SELECT ss_item_sk FROM cross_items_exists)
+        UNION ALL
+        SELECT 'web', ws_item_sk, ws_quantity, ws_list_price FROM web_sales JOIN filtered_dates_nov2002 ON ws_sold_date_sk = d_date_sk WHERE ws_item_sk IN (SELECT ss_item_sk FROM cross_items_exists)
+      ) sales
+      JOIN item ON sales.ss_item_sk = i_item_sk
+    OUTPUT: channel, i_brand_id, i_class_id, i_category_id, ss_quantity * ss_list_price AS sales_amount, 1 AS cnt
+    EXPECTED_ROWS: ~? (November sales for cross_items)
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: nov_sales_consolidated
+    GROUP BY channel, i_brand_id, i_class_id, i_category_id
+    HAVING SUM(sales_amount) > (SELECT average_sales FROM avg_sales_consolidated)
+    GROUP BY ROLLUP (channel, i_brand_id, i_class_id, i_category_id)
+    ORDER BY channel, i_brand_id, i_class_id, i_category_id
+    LIMIT 100
+    OUTPUT: channel, i_brand_id, i_class_id, i_category_id, SUM(sales_amount) AS sales, SUM(cnt) AS number_sales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: multi_intersect_exists_cte, single_pass_aggregation, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- multi_intersect_exists_cte: Use EXISTS to replace INTERSECT, with shared filtered_dates_3year CTE.
+- single_pass_aggregation: Consolidate November sales scans into a single UNION ALL before joining with item.
+- date_cte_isolate: Separate date CTEs for 3-year and November 2002 filters.
+HAZARD_FLAGS:
+- Combining multiple transforms may increase complexity; ensure column completeness across CTEs.
+- The EXISTS conditions must match the INTERSECT semantics exactly (brand/class/category).
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

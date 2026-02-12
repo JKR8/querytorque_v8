@@ -1,0 +1,104 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] shared_store_sales  [+]  (new materialized scan)
+│   ├── JOIN (store_sales, date_dim, item)
+│   ├── FILTER (d_year, ss_wholesale_cost, i_category, i_manager_id)
+│   └── OUTPUT (ss_item_sk, i_brand_id, i_class_id, i_category_id, ss_quantity, ss_list_price, d_date_sk, d_week_seq)
+├── [CTE] shared_catalog_sales  [+]  (new materialized scan)
+│   ├── JOIN (catalog_sales, date_dim, item)
+│   ├── FILTER (same as store branch)
+│   └── OUTPUT (i_brand_id, i_class_id, i_category_id)
+├── [CTE] shared_web_sales  [+]  (new materialized scan)
+│   ├── JOIN (web_sales, date_dim, item)
+│   ├── FILTER (same as store branch)
+│   └── OUTPUT (i_brand_id, i_class_id, i_category_id)
+├── [CTE] cross_items  [~]  (now uses shared CTEs)
+│   ├── FROM (shared_store_sales, shared_catalog_sales, shared_web_sales via INTERSECT)
+│   ├── JOIN item (to get ss_item_sk)
+│   └── OUTPUT (ss_item_sk)
+├── [CTE] avg_sales  [~]  (now uses independent UNION ALL scans without item filters)
+│   ├── FROM (store_sales+date_dim UNION ALL catalog_sales+date_dim UNION ALL web_sales+date_dim)
+│   └── OUTPUT (average_sales)
+└── [MAIN] main_query  [~]  (uses shared_store_sales, cross_items, avg_sales)
+    ├── SCAN (shared_store_sales, cross_items, avg_sales, date_dim subqueries)
+    ├── FILTER (d_week_seq via correlated subquery per year)
+    ├── AGG (GROUP BY i_brand_id, i_class_id, i_category_id)
+    ├── HAVING (sum > average_sales)
+    ├── JOIN (this_year, last_year on brand/class/category)
+    ├── SORT (channel, brand, class, category)
+    └── OUTPUT (12 original columns)
+```
+
+**Changes:**
+- Added `shared_store_sales` CTE to materialize the filtered store sales scan once.
+- Added `shared_catalog_sales` and `shared_web_sales` CTEs to materialize catalog/web scans for the INTERSECT.
+- Modified `cross_items` to use the three shared CTEs instead of repeating joins.
+- Modified `avg_sales` to keep original UNION ALL structure but without item filters (semantic equivalence).
+- Modified `main_query` to use `shared_store_sales` CTE and apply year-specific week_seq filters.
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pg_self_join_decomposition", "description": "Materialize shared store sales scan once for reuse in cross_items and main_query", "applied_to": ["shared_store_sales", "cross_items", "main_query"]},
+    {"id": "R2", "type": "pg_materialized_dimension_fact_prefilter", "description": "Materialize catalog/web sales scans for cross_items INTERSECT", "applied_to": ["shared_catalog_sales", "shared_web_sales"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "shared_store_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk, i_brand_id, i_class_id, i_category_id, ss_quantity, ss_list_price, d_date_sk, d_week_seq FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk JOIN item ON ss_item_sk = i_item_sk WHERE d_year BETWEEN 1999 AND 2001 AND ss_wholesale_cost BETWEEN 35 AND 55 AND i_category IN ('Electronics','Jewelry','Men') AND i_manager_id BETWEEN 91 AND 100",
+        "interfaces": {"outputs": ["ss_item_sk", "i_brand_id", "i_class_id", "i_category_id", "ss_quantity", "ss_list_price", "d_date_sk", "d_week_seq"], "consumes": []}
+      },
+      "shared_catalog_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_brand_id, i_class_id, i_category_id FROM catalog_sales JOIN date_dim ON cs_sold_date_sk = d_date_sk JOIN item ON cs_item_sk = i_item_sk WHERE d_year BETWEEN 1999 AND 2001 AND cs_wholesale_cost BETWEEN 35 AND 55 AND i_category IN ('Electronics','Jewelry','Men') AND i_manager_id BETWEEN 91 AND 100",
+        "interfaces": {"outputs": ["i_brand_id", "i_class_id", "i_category_id"], "consumes": []}
+      },
+      "shared_web_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_brand_id, i_class_id, i_category_id FROM web_sales JOIN date_dim ON ws_sold_date_sk = d_date_sk JOIN item ON ws_item_sk = i_item_sk WHERE d_year BETWEEN 1999 AND 2001 AND ws_wholesale_cost BETWEEN 35 AND 55 AND i_category IN ('Electronics','Jewelry','Men') AND i_manager_id BETWEEN 91 AND 100",
+        "interfaces": {"outputs": ["i_brand_id", "i_class_id", "i_category_id"], "consumes": []}
+      },
+      "cross_items": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk AS ss_item_sk FROM item WHERE (i_brand_id, i_class_id, i_category_id) IN (SELECT i_brand_id, i_class_id, i_category_id FROM shared_store_sales INTERSECT SELECT i_brand_id, i_class_id, i_category_id FROM shared_catalog_sales INTERSECT SELECT i_brand_id, i_class_id, i_category_id FROM shared_web_sales) AND i_category IN ('Electronics','Jewelry','Men') AND i_manager_id BETWEEN 91 AND 100",
+        "interfaces": {"outputs": ["ss_item_sk"], "consumes": ["shared_store_sales", "shared_catalog_sales", "shared_web_sales"]}
+      },
+      "avg_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT AVG(quantity * list_price) AS average_sales FROM (SELECT ss_quantity AS quantity, ss_list_price AS list_price FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk WHERE d_year BETWEEN 1999 AND 2001 AND ss_wholesale_cost BETWEEN 35 AND 55 UNION ALL SELECT cs_quantity AS quantity, cs_list_price AS list_price FROM catalog_sales JOIN date_dim ON cs_sold_date_sk = d_date_sk WHERE d_year BETWEEN 1999 AND 2001 AND cs_wholesale_cost BETWEEN 35 AND 55 UNION ALL SELECT ws_quantity AS quantity, ws_list_price AS list_price FROM web_sales JOIN date_dim ON ws_sold_date_sk = d_date_sk WHERE d_year BETWEEN 1999 AND 2001 AND ws_wholesale_cost BETWEEN 35 AND 55) AS t",
+        "interfaces": {"outputs": ["average_sales"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT this_year.channel AS ty_channel, this_year.i_brand_id AS ty_brand, this_year.i_class_id AS ty_class, this_year.i_category_id AS ty_category, this_year.sales AS ty_sales, this_year.number_sales AS ty_number_sales, last_year.channel AS ly_channel, last_year.i_brand_id AS ly_brand, last_year.i_class_id AS ly_class, last_year.i_category_id AS ly_category, last_year.sales AS ly_sales, last_year.number_sales AS ly_number_sales FROM (SELECT 'store' AS channel, i_brand_id, i_class_id, i_category_id, SUM(ss_quantity * ss_list_price) AS sales, COUNT(*) AS number_sales FROM shared_store_sales JOIN item ON shared_store_sales.ss_item_sk = item.i_item_sk WHERE shared_store_sales.d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 12 AND d_dom = 20) AND shared_store_sales.ss_item_sk IN (SELECT ss_item_sk FROM cross_items) GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(ss_quantity * ss_list_price) > (SELECT average_sales FROM avg_sales)) AS this_year, (SELECT 'store' AS channel, i_brand_id, i_class_id, i_category_id, SUM(ss_quantity * ss_list_price) AS sales, COUNT(*) AS number_sales FROM shared_store_sales JOIN item ON shared_store_sales.ss_item_sk = item.i_item_sk WHERE shared_store_sales.d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_year = 1999 AND d_moy = 12 AND d_dom = 20) AND shared_store_sales.ss_item_sk IN (SELECT ss_item_sk FROM cross_items) GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(ss_quantity * ss_list_price) > (SELECT average_sales FROM avg_sales)) AS last_year WHERE this_year.i_brand_id = last_year.i_brand_id AND this_year.i_class_id = last_year.i_class_id AND this_year.i_category_id = last_year.i_category_id ORDER BY this_year.channel, this_year.i_brand_id, this_year.i_class_id, this_year.i_category_id LIMIT 100",
+        "interfaces": {"outputs": ["ty_channel", "ty_brand", "ty_class", "ty_category", "ty_sales", "ty_number_sales", "ly_channel", "ly_brand", "ly_class", "ly_category", "ly_sales", "ly_number_sales"], "consumes": ["shared_store_sales", "cross_items", "avg_sales"]}
+      }
+    },
+    "reconstruction_order": ["shared_store_sales", "shared_catalog_sales", "shared_web_sales", "cross_items", "avg_sales", "main_query"],
+    "assembly_template": "WITH shared_store_sales AS ({shared_store_sales}), shared_catalog_sales AS ({shared_catalog_sales}), shared_web_sales AS ({shared_web_sales}), cross_items AS ({cross_items}), avg_sales AS ({avg_sales}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL random_page_cost = 1.0", "SET LOCAL work_mem = '32MB'", "SET LOCAL max_parallel_workers_per_gather = 0"],
+  "validation_checks": []
+}
+```
+
+**Changes:** Structural change from repeated fact-table scans to materialized shared CTEs, plus separate catalog/web CTEs for the INTERSECT. The mechanism eliminates 4 redundant store_sales scans and 2 redundant catalog/web scans while preserving exact INTERSECT/UNION semantics.
+
+**Expected speedup:** 3-4x due to reduced I/O and join repetition.

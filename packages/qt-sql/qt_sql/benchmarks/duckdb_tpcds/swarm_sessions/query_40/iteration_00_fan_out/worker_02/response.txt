@@ -1,0 +1,81 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Now uses CTE structure
+    ├── [+] filtered_date (CTE)  — Pre-filtered date dimension
+    ├── [+] filtered_item (CTE)  — Pre-filtered items with price range
+    ├── [+] filtered_warehouse (CTE) — Warehouse dimension
+    ├── [+] sales_with_all_dims (CTE) — Fact table joined with all dimensions
+    ├── [+] sales_with_returns (CTE) — Left join with returns
+    ├── [+] final_aggregation (CTE) — Main aggregation
+    ├── AGG (GROUP BY) [=]
+    ├── SORT (w_state ASC, i_item_id ASC) [=]
+    └── OUTPUT (w_state, i_item_id, sales_before, sales_after) [=]
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb_1.4.3",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Extract date, item, and warehouse filters into separate CTEs before joining with fact table", "applied_to": ["filtered_date", "filtered_item", "filtered_warehouse"]},
+    {"id": "R2", "type": "prefiltered_fact_join", "description": "Join catalog_sales sequentially with dimension CTEs instead of cross-joining dimensions", "applied_to": ["sales_with_all_dims"]},
+    {"id": "R3", "type": "optional_join_isolation", "description": "Isolate LEFT JOIN with catalog_returns in separate CTE to preserve semantics", "applied_to": ["sales_with_returns"]},
+    {"id": "R4", "type": "column_propagation", "description": "Added d_date to filtered_date output and propagated through joins for CASE expression", "applied_to": ["filtered_date", "sales_with_all_dims", "sales_with_returns"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN (CAST('2001-04-02' AS DATE) - INTERVAL 30 DAY) AND (CAST('2001-04-02' AS DATE) + INTERVAL 30 DAY)",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_current_price BETWEEN 0.99 AND 1.49",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "filtered_warehouse": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT w_warehouse_sk, w_state FROM warehouse",
+        "interfaces": {"outputs": ["w_warehouse_sk", "w_state"], "consumes": []}
+      },
+      "sales_with_all_dims": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs.cs_order_number, cs.cs_item_sk, cs.cs_sales_price, fw.w_state, fi.i_item_id, fd.d_date FROM catalog_sales cs INNER JOIN filtered_date fd ON cs.cs_sold_date_sk = fd.d_date_sk INNER JOIN filtered_item fi ON cs.cs_item_sk = fi.i_item_sk INNER JOIN filtered_warehouse fw ON cs.cs_warehouse_sk = fw.w_warehouse_sk",
+        "interfaces": {"outputs": ["cs_order_number", "cs_item_sk", "cs_sales_price", "w_state", "i_item_id", "d_date"], "consumes": ["filtered_date", "filtered_item", "filtered_warehouse"]}
+      },
+      "sales_with_returns": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT swd.w_state, swd.i_item_id, swd.cs_sales_price, COALESCE(cr.cr_refunded_cash, 0) AS cr_refunded_cash, swd.d_date FROM sales_with_all_dims swd LEFT JOIN catalog_returns cr ON swd.cs_order_number = cr.cr_order_number AND swd.cs_item_sk = cr.cr_item_sk",
+        "interfaces": {"outputs": ["w_state", "i_item_id", "cs_sales_price", "cr_refunded_cash", "d_date"], "consumes": ["sales_with_all_dims"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT w_state, i_item_id, SUM(CASE WHEN d_date < CAST('2001-04-02' AS DATE) THEN cs_sales_price - cr_refunded_cash ELSE 0 END) AS sales_before, SUM(CASE WHEN d_date >= CAST('2001-04-02' AS DATE) THEN cs_sales_price - cr_refunded_cash ELSE 0 END) AS sales_after FROM sales_with_returns GROUP BY w_state, i_item_id ORDER BY w_state, i_item_id LIMIT 100",
+        "interfaces": {"outputs": ["w_state", "i_item_id", "sales_before", "sales_after"], "consumes": ["sales_with_returns"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "filtered_warehouse", "sales_with_all_dims", "sales_with_returns", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), filtered_warehouse AS ({filtered_warehouse}), sales_with_all_dims AS ({sales_with_all_dims}), sales_with_returns AS ({sales_with_returns}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured original implicit joins into explicit CTE-based pipeline. Extracted date, item, and warehouse filters into separate CTEs, then joined sequentially with catalog_sales. Isolated the optional catalog_returns join in its own CTE. Propagated d_date through the pipeline for correct CASE evaluation.
+
+**Expected speedup**: ~2.0x (based on similar pattern performance: dimension_cte_isolate 1.93x, multi_dimension_prefetch 2.71x). Pre-filtering three dimensions creates small hash tables and reduces fact table scan early.

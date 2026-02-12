@@ -1,0 +1,91 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_2000  [+]  Cost: 0%  Rows: 366 — Filter date_dim for year 2000 only
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year = 2000)
+│   └── OUTPUT (d_date_sk, d_year)
+├── [CTE] ws  [~] → ws_pre  Cost: 25%  Rows: 1.3M — Aggregate yearly non-returned web sales
+│   ├── SCAN (web_sales, web_returns (left join))
+│   ├── JOIN (date_2000)
+│   ├── FILTER (wr_order_number IS NULL)
+│   ├── AGG (GROUP BY d_year, ws_item_sk, ws_bill_customer_sk)
+│   └── OUTPUT (ws_sold_year, ws_item_sk, ws_customer_sk, ws_qty, ws_wc, ws_sp)
+├── [CTE] cs  [~] → cs_pre  Cost: 25%  Rows: 2.6M — Aggregate yearly non-returned catalog sales
+│   ├── SCAN (catalog_sales, catalog_returns (left join))
+│   ├── JOIN (date_2000)
+│   ├── FILTER (cr_order_number IS NULL)
+│   ├── AGG (GROUP BY d_year, cs_item_sk, cs_bill_customer_sk)
+│   └── OUTPUT (cs_sold_year, cs_item_sk, cs_customer_sk, cs_qty, cs_wc, cs_sp)
+├── [CTE] ss  [~] → ss_pre  Cost: 25%  Rows: 4.9M — Aggregate yearly non-returned store sales
+│   ├── SCAN (store_sales, store_returns (left join))
+│   ├── JOIN (date_2000)
+│   ├── FILTER (sr_ticket_number IS NULL)
+│   ├── AGG (GROUP BY d_year, ss_item_sk, ss_customer_sk)
+│   └── OUTPUT (ss_sold_year, ss_item_sk, ss_customer_sk, ss_qty, ss_wc, ss_sp)
+└── [MAIN] main_query  [~]  Cost: 25%  Rows: 735 → 100 — Join store aggregates with web/catalog aggregates, filter, order, limit
+    ├── SCAN (ss_pre, ws_pre (left join), cs_pre (left join))
+    ├── FILTER ((COALESCE(ws_qty,0) > 0 OR COALESCE(cs_qty,0) > 0))
+    ├── SORT (8-column ORDER BY as specified)
+    └── OUTPUT (ss_item_sk, ratio, store_qty, store_wholesale_cost, store_sales_price, other_chan_qty, other_chan_wholesale_cost, other_chan_sales_price)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb_v1.4.3",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Extract date_dim filter for year=2000 into shared CTE to avoid redundant scans", "applied_to": ["date_2000"]},
+    {"id": "R2", "type": "cte_refactor", "description": "Replace direct date_dim joins in channel CTEs with reference to date_2000 CTE", "applied_to": ["ws_pre", "cs_pre", "ss_pre"]},
+    {"id": "R3", "type": "predicate_propagation", "description": "Remove redundant ss_sold_year=2000 filter from main query (already enforced via date_2000 CTE)", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_2000": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_year FROM date_dim WHERE d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk", "d_year"], "consumes": []}
+      },
+      "ws_pre": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_year AS ws_sold_year, ws_item_sk, ws_bill_customer_sk AS ws_customer_sk, SUM(ws_quantity) AS ws_qty, SUM(ws_wholesale_cost) AS ws_wc, SUM(ws_sales_price) AS ws_sp FROM web_sales LEFT JOIN web_returns ON wr_order_number = ws_order_number AND ws_item_sk = wr_item_sk JOIN date_2000 ON ws_sold_date_sk = d_date_sk WHERE wr_order_number IS NULL GROUP BY d_year, ws_item_sk, ws_bill_customer_sk",
+        "interfaces": {"outputs": ["ws_sold_year", "ws_item_sk", "ws_customer_sk", "ws_qty", "ws_wc", "ws_sp"], "consumes": ["date_2000"]}
+      },
+      "cs_pre": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_year AS cs_sold_year, cs_item_sk, cs_bill_customer_sk AS cs_customer_sk, SUM(cs_quantity) AS cs_qty, SUM(cs_wholesale_cost) AS cs_wc, SUM(cs_sales_price) AS cs_sp FROM catalog_sales LEFT JOIN catalog_returns ON cr_order_number = cs_order_number AND cs_item_sk = cr_item_sk JOIN date_2000 ON cs_sold_date_sk = d_date_sk WHERE cr_order_number IS NULL GROUP BY d_year, cs_item_sk, cs_bill_customer_sk",
+        "interfaces": {"outputs": ["cs_sold_year", "cs_item_sk", "cs_customer_sk", "cs_qty", "cs_wc", "cs_sp"], "consumes": ["date_2000"]}
+      },
+      "ss_pre": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_year AS ss_sold_year, ss_item_sk, ss_customer_sk, SUM(ss_quantity) AS ss_qty, SUM(ss_wholesale_cost) AS ss_wc, SUM(ss_sales_price) AS ss_sp FROM store_sales LEFT JOIN store_returns ON sr_ticket_number = ss_ticket_number AND ss_item_sk = sr_item_sk JOIN date_2000 ON ss_sold_date_sk = d_date_sk WHERE sr_ticket_number IS NULL GROUP BY d_year, ss_item_sk, ss_customer_sk",
+        "interfaces": {"outputs": ["ss_sold_year", "ss_item_sk", "ss_customer_sk", "ss_qty", "ss_wc", "ss_sp"], "consumes": ["date_2000"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk, ROUND(ss_qty/(COALESCE(ws_qty,0)+COALESCE(cs_qty,0)),2) AS ratio, ss_qty AS store_qty, ss_wc AS store_wholesale_cost, ss_sp AS store_sales_price, COALESCE(ws_qty,0)+COALESCE(cs_qty,0) AS other_chan_qty, COALESCE(ws_wc,0)+COALESCE(cs_wc,0) AS other_chan_wholesale_cost, COALESCE(ws_sp,0)+COALESCE(cs_sp,0) AS other_chan_sales_price FROM ss_pre LEFT JOIN ws_pre ON (ws_sold_year = ss_sold_year AND ws_item_sk = ss_item_sk AND ws_customer_sk = ss_customer_sk) LEFT JOIN cs_pre ON (cs_sold_year = ss_sold_year AND cs_item_sk = ss_item_sk AND cs_customer_sk = ss_customer_sk) WHERE (COALESCE(ws_qty,0) > 0 OR COALESCE(cs_qty,0) > 0) ORDER BY ss_item_sk ASC, ss_qty DESC, ss_wc DESC, ss_sp DESC, (COALESCE(ws_qty,0)+COALESCE(cs_qty,0)) ASC, (COALESCE(ws_wc,0)+COALESCE(cs_wc,0)) ASC, (COALESCE(ws_sp,0)+COALESCE(cs_sp,0)) ASC, ROUND(ss_qty/(COALESCE(ws_qty,0)+COALESCE(cs_qty,0)),2) ASC LIMIT 100",
+        "interfaces": {"outputs": ["ss_item_sk", "ratio", "store_qty", "store_wholesale_cost", "store_sales_price", "other_chan_qty", "other_chan_wholesale_cost", "other_chan_sales_price"], "consumes": ["ss_pre", "ws_pre", "cs_pre"]}
+      }
+    },
+    "reconstruction_order": ["date_2000", "ws_pre", "cs_pre", "ss_pre", "main_query"],
+    "assembly_template": "WITH date_2000 AS ({date_2000}), ws_pre AS ({ws_pre}), cs_pre AS ({cs_pre}), ss_pre AS ({ss_pre}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Isolated the date_dim filter for year=2000 into a shared CTE that all three channel CTEs reference, eliminating 3 redundant scans of the full date_dim table. This follows the dimension_cte_isolate pattern while maintaining exact semantic equivalence.
+
+**Expected speedup**: ~1.5-2x from eliminating redundant date_dim scans and creating a small hash table (366 rows) for fast probing by all channel CTEs.

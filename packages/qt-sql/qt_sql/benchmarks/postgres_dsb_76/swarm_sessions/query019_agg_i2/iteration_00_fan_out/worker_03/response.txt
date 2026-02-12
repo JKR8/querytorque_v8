@@ -1,0 +1,102 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]
+    ├── [=] CTE filtered_store_zip
+    │   └── SCAN store (full scan)
+    ├── [=] CTE filtered_address_zip  
+    │   └── SCAN customer_address (filter: ca_state='KS')
+    ├── [~] CTE precomputed_zip_pairs
+    │   ├── JOIN (cross) filtered_store_zip × filtered_address_zip
+    │   └── FILTER (s_zip_prefix <> ca_zip_prefix)
+    ├── [~] CTE filtered_fact
+    │   ├── SCAN store_sales (filter: ss_wholesale_cost BETWEEN 76 AND 96)
+    │   ├── JOIN (inner) date_dim (filter: d_year=1999 AND d_moy=2)
+    │   ├── JOIN (inner) item (filter: i_category='Shoes')
+    │   └── JOIN (inner) customer (filter: c_birth_month=2)
+    ├── [~] CTE joined_fact
+    │   └── JOIN (inner) filtered_fact × precomputed_zip_pairs
+    │       ├── ON (ss_store_sk = s_store_sk)
+    │       └── ON (c_current_addr_sk = ca_address_sk)
+    └── [~] aggregation
+        ├── AGG (GROUP BY: i_brand, i_brand_id, i_manufact_id, i_manufact)
+        ├── AGGREGATE (SUM(ss_ext_sales_price) AS ext_price)
+        ├── SORT (ext_price DESC, i_brand, i_brand_id, i_manufact_id, i_manufact)
+        └── LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "staged_reduction_for_non_equi_joins",
+      "description": "Precompute store/address zip pairs with inequality filter before joining to large fact table",
+      "applied_to": ["filtered_store_zip", "filtered_address_zip", "precomputed_zip_pairs"]
+    },
+    {
+      "id": "R2", 
+      "type": "multi_dimension_prefetch",
+      "description": "Pre-filter dimensions (date, item, customer) and fact table before final join with zip pairs",
+      "applied_to": ["filtered_fact"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_store_zip": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s_store_sk, s_zip, substring(s_zip, 1, 5) AS s_zip_prefix FROM store",
+        "interfaces": {"outputs": ["s_store_sk", "s_zip", "s_zip_prefix"], "consumes": []}
+      },
+      "filtered_address_zip": {
+        "type": "cte", 
+        "change": "modified",
+        "sql": "SELECT ca_address_sk, ca_zip, substring(ca_zip, 1, 5) AS ca_zip_prefix FROM customer_address WHERE ca_state = 'KS'",
+        "interfaces": {"outputs": ["ca_address_sk", "ca_zip", "ca_zip_prefix"], "consumes": []}
+      },
+      "precomputed_zip_pairs": {
+        "type": "cte",
+        "change": "modified", 
+        "sql": "SELECT s.s_store_sk, a.ca_address_sk FROM filtered_store_zip s, filtered_address_zip a WHERE s.s_zip_prefix <> a.ca_zip_prefix",
+        "interfaces": {"outputs": ["s_store_sk", "ca_address_sk"], "consumes": ["filtered_store_zip", "filtered_address_zip"]}
+      },
+      "filtered_fact": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_ext_sales_price, i_brand_id, i_brand, i_manufact_id, i_manufact, c_current_addr_sk, ss_store_sk FROM store_sales INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999 AND d_moy = 2 INNER JOIN item ON ss_item_sk = i_item_sk AND i_category = 'Shoes' INNER JOIN customer ON ss_customer_sk = c_customer_sk AND c_birth_month = 2 WHERE ss_wholesale_cost BETWEEN 76 AND 96",
+        "interfaces": {"outputs": ["ss_ext_sales_price", "i_brand_id", "i_brand", "i_manufact_id", "i_manufact", "c_current_addr_sk", "ss_store_sk"], "consumes": []}
+      },
+      "joined_fact": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT f.i_brand_id, f.i_brand, f.i_manufact_id, f.i_manufact, f.ss_ext_sales_price FROM filtered_fact f INNER JOIN precomputed_zip_pairs z ON f.ss_store_sk = z.s_store_sk AND f.c_current_addr_sk = z.ca_address_sk",
+        "interfaces": {"outputs": ["i_brand_id", "i_brand", "i_manufact_id", "i_manufact", "ss_ext_sales_price"], "consumes": ["filtered_fact", "precomputed_zip_pairs"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_brand_id AS brand_id, i_brand AS brand, i_manufact_id, i_manufact, SUM(ss_ext_sales_price) AS ext_price FROM joined_fact GROUP BY i_brand, i_brand_id, i_manufact_id, i_manufact ORDER BY ext_price DESC, i_brand, i_brand_id, i_manufact_id, i_manufact LIMIT 100",
+        "interfaces": {"outputs": ["brand_id", "brand", "i_manufact_id", "i_manufact", "ext_price"], "consumes": ["joined_fact"]}
+      }
+    },
+    "reconstruction_order": ["filtered_store_zip", "filtered_address_zip", "precomputed_zip_pairs", "filtered_fact", "joined_fact", "main_query"],
+    "assembly_template": "WITH filtered_store_zip AS ( {filtered_store_zip} ), filtered_address_zip AS ( {filtered_address_zip} ), precomputed_zip_pairs AS ( {precomputed_zip_pairs} ), filtered_fact AS ( {filtered_fact} ), joined_fact AS ( {joined_fact} ) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '16MB'", "SET LOCAL enable_nestloop = off"],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured original implicit joins into explicit staged CTEs, precomputing zip inequality pairs before joining to fact table to reduce search space for non-equi join. Maintains exact semantic equivalence while enabling better join ordering and early filtering.
+
+**Expected speedup:** 2-3× via staged reduction of both sides of non-equi join before final fact table join, plus CTE materialization benefits.

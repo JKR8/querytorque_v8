@@ -1,0 +1,110 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]
+    ├── [~] base_scan (CTE)  [=]
+    │   ├── SCAN (web_sales)
+    │   ├── JOIN (date_dim ON d_date_sk = ws_sold_date_sk)
+    │   ├── JOIN (item ON i_item_sk = ws_item_sk)
+    │   ├── FILTER (d_date BETWEEN '2002-03-06' AND '2002-03-06' + INTERVAL '90 day')
+    │   ├── FILTER (i_manufact_id BETWEEN 566 AND 765 OR i_category IN ('Children','Jewelry','Men'))
+    │   └── FILTER (ws_wholesale_cost BETWEEN 16 AND 36)
+    ├── [+] main_data (CTE)  [=]
+    │   └── PROJECT (ws_item_sk, ws_ext_discount_amt)
+    ├── [+] subquery_data (CTE)  [!]
+    │   ├── FROM (base_scan)
+    │   └── FILTER (ws_sales_price/ws_list_price BETWEEN 0.35 AND 0.50)
+    ├── [+] compute_avg (CTE)  [!]
+    │   ├── FROM (subquery_data)
+    │   └── AGGREGATE (GROUP BY ws_item_sk, 1.3*AVG(ws_ext_discount_amt) AS threshold)
+    ├── [+] final_join (CTE)  [!]
+    │   ├── FROM (main_data)
+    │   ├── JOIN (INNER JOIN compute_avg ON ws_item_sk)
+    │   └── FILTER (ws_ext_discount_amt > threshold)
+    └── [~] aggregation  [=]
+        ├── AGGREGATE (SUM(ws_ext_discount_amt) AS "Excess Discount Amount")
+        ├── SORT (SUM(ws_ext_discount_amt) ASC)
+        └── LIMIT (100)
+```
+
+**Change markers:**
+- `[!]` in main_query: Changed from single SELECT to CTE-driven decomposition
+- `[+]` main_data, subquery_data, compute_avg, final_join: New CTEs per target logical tree
+- `[~]` aggregation: Now consumes from final_join CTE instead of base tables
+- `[=]` base_scan: Unchanged scan logic but now isolated as CTE
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "pg_self_join_decomposition",
+      "description": "Materialize shared fact+dimension scan once, derive main and subquery data from same CTE",
+      "applied_to": ["base_scan", "main_data", "subquery_data"]
+    },
+    {
+      "id": "R2",
+      "type": "correlated_subquery_decorrelation",
+      "description": "Convert correlated subquery to grouped CTE with per-item threshold",
+      "applied_to": ["compute_avg", "final_join"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "base_scan": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_item_sk, ws_ext_discount_amt, ws_sales_price, ws_list_price, i_item_sk FROM web_sales INNER JOIN date_dim ON d_date_sk = ws_sold_date_sk INNER JOIN item ON i_item_sk = ws_item_sk WHERE d_date BETWEEN '2002-03-06' AND CAST('2002-03-06' AS DATE) + INTERVAL '90 day' AND (i_manufact_id BETWEEN 566 AND 765 OR i_category IN ('Children', 'Jewelry', 'Men')) AND ws_wholesale_cost BETWEEN 16 AND 36",
+        "interfaces": {"outputs": ["ws_item_sk", "ws_ext_discount_amt", "ws_sales_price", "ws_list_price", "i_item_sk"], "consumes": []}
+      },
+      "main_data": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_item_sk, ws_ext_discount_amt FROM base_scan",
+        "interfaces": {"outputs": ["ws_item_sk", "ws_ext_discount_amt"], "consumes": ["base_scan"]}
+      },
+      "subquery_data": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_item_sk, ws_ext_discount_amt FROM base_scan WHERE ws_sales_price / ws_list_price BETWEEN 35 * 0.01 AND 50 * 0.01",
+        "interfaces": {"outputs": ["ws_item_sk", "ws_ext_discount_amt"], "consumes": ["base_scan"]}
+      },
+      "compute_avg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_item_sk, 1.3 * AVG(ws_ext_discount_amt) AS threshold FROM subquery_data GROUP BY ws_item_sk",
+        "interfaces": {"outputs": ["ws_item_sk", "threshold"], "consumes": ["subquery_data"]}
+      },
+      "final_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT m.ws_ext_discount_amt FROM main_data m INNER JOIN compute_avg c ON m.ws_item_sk = c.ws_item_sk WHERE m.ws_ext_discount_amt > c.threshold",
+        "interfaces": {"outputs": ["ws_ext_discount_amt"], "consumes": ["main_data", "compute_avg"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT SUM(ws_ext_discount_amt) AS \"Excess Discount Amount\" FROM final_join ORDER BY SUM(ws_ext_discount_amt) ASC LIMIT 100",
+        "interfaces": {"outputs": ["Excess Discount Amount"], "consumes": ["final_join"]}
+      }
+    },
+    "reconstruction_order": ["base_scan", "main_data", "subquery_data", "compute_avg", "final_join", "main_query"],
+    "assembly_template": "WITH base_scan AS ({base_scan}), main_data AS ({main_data}), subquery_data AS ({subquery_data}), compute_avg AS ({compute_avg}), final_join AS ({final_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Converted correlated subquery with implicit joins to explicit CTE decomposition. The base_scan CTE materializes the shared fact+dimension scan once, then main_data and subquery_data derive from it with their respective filters. The compute_avg CTE decorrelates the per-item average calculation, enabling hash join in final_join.
+
+**Expected speedup:** 3-4x from eliminating repeated correlated execution and enabling hash joins between pre-aggregated thresholds and main data.

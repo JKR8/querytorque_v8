@@ -1,0 +1,73 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~37K
+    ├── [~] joined (CTE)  
+    │   ├── SCAN (store_sales)
+    │   ├── JOIN (INNER date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 2002)
+    │   ├── JOIN (INNER store ON ss_store_sk = s_store_sk AND s_state = 'IA')
+    │   ├── JOIN (INNER item ON ss_item_sk = i_item_sk AND i_category = 'Sports')
+    │   └── JOIN (INNER customer_demographics ON ss_cdemo_sk = cd_demo_sk AND cd_gender = 'F' AND cd_marital_status = 'M' AND cd_education_status = 'Primary')
+    ├── [~] aggregated (CTE)
+    │   ├── FROM joined
+    │   ├── GROUP BY ROLLUP (i_item_id, s_state)
+    │   └── AGGREGATE (AVG(ss_quantity), AVG(ss_list_price), AVG(ss_coupon_amt), AVG(ss_sales_price))
+    ├── [~] sorted_limited (MAIN)
+    │   ├── FROM aggregated
+    │   ├── ORDER BY i_item_id, s_state
+    │   └── LIMIT 100
+    └── OUTPUT (i_item_id, s_state, g_state, agg1, agg2, agg3, agg4)
+```
+
+**Change markers:**
+- `[~] joined`: Modified from implicit comma joins to explicit INNER JOINs with filters pushed into ON clauses where possible
+- `[~] aggregated`: Now references CTE instead of base tables, no semantic change
+- `[~] sorted_limited`: Now references CTE instead of base tables, no semantic change
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pushdown", "description": "Convert comma joins to explicit INNER JOINs with predicate pushdown to enable early filtering", "applied_to": ["joined"]},
+    {"id": "R2", "type": "cte_modularization", "description": "Structure query following target logical tree with CTEs for joined, aggregated, sorted_limited phases", "applied_to": ["joined", "aggregated", "sorted_limited"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "joined": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss.i_item_id, s.s_state, ss.ss_quantity, ss.ss_list_price, ss.ss_coupon_amt, ss.ss_sales_price FROM store_sales ss INNER JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk AND d.d_year = 2002 INNER JOIN store s ON ss.ss_store_sk = s.s_store_sk AND s.s_state = 'IA' INNER JOIN item i ON ss.ss_item_sk = i.i_item_sk AND i.i_category = 'Sports' INNER JOIN customer_demographics cd ON ss.ss_cdemo_sk = cd.cd_demo_sk AND cd.cd_gender = 'F' AND cd.cd_marital_status = 'M' AND cd.cd_education_status = 'Primary'",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "ss_quantity", "ss_list_price", "ss_coupon_amt", "ss_sales_price"], "consumes": []}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_id, s_state, GROUPING(s_state) AS g_state, AVG(ss_quantity) AS agg1, AVG(ss_list_price) AS agg2, AVG(ss_coupon_amt) AS agg3, AVG(ss_sales_price) AS agg4 FROM joined GROUP BY ROLLUP (i_item_id, s_state)",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"], "consumes": ["joined"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_id, s_state, g_state, agg1, agg2, agg3, agg4 FROM aggregated ORDER BY i_item_id, s_state LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"], "consumes": ["aggregated"]}
+      }
+    },
+    "reconstruction_order": ["joined", "aggregated", "main_query"],
+    "assembly_template": "WITH joined AS ({joined}), aggregated AS ({aggregated}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Converted implicit comma joins to explicit INNER JOIN syntax and pushed dimension table filters (d_year, s_state, i_category, cd_*) into the respective ON clauses. This maintains semantic equivalence while enabling the optimizer to filter early in join order planning.
+
+**Expected speedup:** Moderate (1.05-1.15x). Explicit JOINs with pushed-down filters can help the optimizer choose better join orders and apply filters earlier, reducing intermediate result sizes. The CTE structure may materialize intermediate results, which could help or hurt depending on data distribution; PostgreSQL's optimizer can inline CTEs when beneficial.

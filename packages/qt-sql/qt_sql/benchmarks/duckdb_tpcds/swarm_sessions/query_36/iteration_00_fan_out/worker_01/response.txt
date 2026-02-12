@@ -1,0 +1,84 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K  — Join store sales with date, item, and store; filter by year and state list; aggregate gross margin under ROLLUP(i_category, i_class); then apply window ranking within hierarchy levels.
+    ├── [~] filtered_date  [=]  Cost: <1%  Rows: 365  — Isolated dimension filter for date_dim (d_year=2002)
+    ├── [~] filtered_store  [=]  Cost: <1%  Rows: 101  — Isolated dimension filter for store (s_state IN list)
+    ├── [~] fact_prejoin  [+]  Cost: 60%  Rows: 5.4M  — Pre-join store_sales with filtered dimensions to reduce early fact scan
+    ├── [~] item_join  [+]  Cost: 30%  Rows: 5.3M  — Join reduced fact set with item dimension
+    ├── [~] rollup_agg  [+]  Cost: 5%  Rows: 164  — ROLLUP aggregation on category/class
+    ├── [~] window_rank  [+]  Cost: 4%  Rows: 164  — Window ranking with hierarchy partitioning
+    └── [=] final_sort  [=]  Cost: <1%  Rows: 100  — Final ordering and limit
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extracted date filter into CTE for early reduction", "applied_to": ["filtered_date"]},
+    {"id": "R2", "type": "early_filter", "description": "Filtered store dimension first before fact join", "applied_to": ["filtered_store"]},
+    {"id": "R3", "type": "prefetch_fact_join", "description": "Staged join pipeline: pre-join filtered dimensions with fact table before item dimension", "applied_to": ["fact_prejoin", "item_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2002",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_store": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s_store_sk FROM store WHERE s_state IN ('SD','TN','GA','SC','MO','AL','MI','OH')",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "fact_prejoin": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk, ss_net_profit, ss_ext_sales_price FROM store_sales INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk INNER JOIN filtered_store ON ss_store_sk = s_store_sk",
+        "interfaces": {"outputs": ["ss_item_sk", "ss_net_profit", "ss_ext_sales_price"], "consumes": ["filtered_date", "filtered_store"]}
+      },
+      "item_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i.i_category, i.i_class, fp.ss_net_profit, fp.ss_ext_sales_price FROM fact_prejoin fp INNER JOIN item i ON i.i_item_sk = fp.ss_item_sk",
+        "interfaces": {"outputs": ["i_category", "i_class", "ss_net_profit", "ss_ext_sales_price"], "consumes": ["fact_prejoin"]}
+      },
+      "rollup_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_category, i_class, GROUPING(i_category) as g_cat, GROUPING(i_class) as g_cls, SUM(ss_net_profit) as sum_net_profit, SUM(ss_ext_sales_price) as sum_sales_price FROM item_join GROUP BY ROLLUP(i_category, i_class)",
+        "interfaces": {"outputs": ["i_category", "i_class", "g_cat", "g_cls", "sum_net_profit", "sum_sales_price"], "consumes": ["item_join"]}
+      },
+      "window_rank": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT (sum_net_profit / sum_sales_price) as gross_margin, i_category, i_class, (g_cat + g_cls) as lochierarchy, RANK() OVER (PARTITION BY (g_cat + g_cls), CASE WHEN g_cls = 0 THEN i_category END ORDER BY (sum_net_profit / sum_sales_price) ASC) as rank_within_parent FROM rollup_agg",
+        "interfaces": {"outputs": ["gross_margin", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["rollup_agg"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT gross_margin, i_category, i_class, lochierarchy, rank_within_parent FROM window_rank ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category END, rank_within_parent LIMIT 100",
+        "interfaces": {"outputs": ["gross_margin", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["window_rank"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_store", "fact_prejoin", "item_join", "rollup_agg", "window_rank", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_store AS ({filtered_store}), fact_prejoin AS ({fact_prejoin}), item_join AS ({item_join}), rollup_agg AS ({rollup_agg}), window_rank AS ({window_rank}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Applied staged join pipeline: isolated dimension filters into CTEs (date_dim, store), pre-joined them with the fact table (store_sales) in `fact_prejoin`, then joined the reduced fact set with item dimension. This reduces the fact table scan early while preserving the exact ROLLUP aggregation and window function semantics.
+
+**Expected speedup**: 3-4x due to early fact scan reduction and dimension filter materialization.

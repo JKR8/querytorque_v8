@@ -1,0 +1,94 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~100  — CTE pipeline with staged joins
+    ├── [CTE] date_filter  [+]  Cost: 0%  Rows: ~365  — Filter date_dim once
+    │   └── SCAN (date_dim) WHERE d_month_seq BETWEEN 1221 AND 1232
+    ├── [CTE] fact_with_date  [+]  Cost: 20%  Rows: ~5.5M  — Pre-join store_sales with filtered dates
+    │   └── JOIN (store_sales ↔ date_filter) ON ss_sold_date_sk = d_date_sk
+    ├── [CTE] store_item_revenue  [+]  Cost: 30%  Rows: ~2.7M  — First aggregation
+    │   └── AGG (GROUP BY ss_store_sk, ss_item_sk) SUM(ss_sales_price)
+    ├── [CTE] store_avg  [+]  Cost: 5%  Rows: ~52  — Second aggregation (per-store average)
+    │   └── AGG (GROUP BY ss_store_sk) AVG(revenue)
+    ├── [CTE] filtered_pairs  [+]  Cost: 25%  Rows: ~243K  — Filter revenue <= 0.1 * ave
+    │   └── JOIN (store_item_revenue ↔ store_avg) ON ss_store_sk
+    ├── [CTE] join_store_item  [+]  Cost: 15%  Rows: ~243K  — Join dimensions
+    │   ├── JOIN (filtered_pairs ↔ store) ON ss_store_sk = s_store_sk
+    │   └── JOIN (+ item) ON ss_item_sk = i_item_sk
+    └── [TOP] top_n  [+]  Cost: 5%  Rows: ~100  — Order and limit
+        ├── SORT (s_store_name ASC, i_item_desc ASC)
+        └── LIMIT 100
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "prefetch_fact_join", "description": "Stage joins: filter date_dim first, then join store_sales once", "applied_to": ["date_filter", "fact_with_date"]},
+    {"id": "R2", "type": "date_cte_isolate", "description": "Shared date filter CTE eliminates duplicate store_sales-date_dim joins", "applied_to": ["date_filter"]},
+    {"id": "R3", "type": "cte_pipeline", "description": "CTE chain follows target logical tree exactly", "applied_to": ["store_item_revenue", "store_avg", "filtered_pairs", "join_store_item", "top_n"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1221 AND 1221+11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "fact_with_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_store_sk, ss_item_sk, ss_sales_price FROM store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ss_store_sk", "ss_item_sk", "ss_sales_price"], "consumes": ["date_filter"]}
+      },
+      "store_item_revenue": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM fact_with_date GROUP BY ss_store_sk, ss_item_sk",
+        "interfaces": {"outputs": ["ss_store_sk", "ss_item_sk", "revenue"], "consumes": ["fact_with_date"]}
+      },
+      "store_avg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_store_sk, AVG(revenue) AS ave FROM store_item_revenue GROUP BY ss_store_sk",
+        "interfaces": {"outputs": ["ss_store_sk", "ave"], "consumes": ["store_item_revenue"]}
+      },
+      "filtered_pairs": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT sir.ss_store_sk, sir.ss_item_sk, sir.revenue FROM store_item_revenue sir JOIN store_avg sa ON sir.ss_store_sk = sa.ss_store_sk WHERE sir.revenue <= 0.1 * sa.ave",
+        "interfaces": {"outputs": ["ss_store_sk", "ss_item_sk", "revenue"], "consumes": ["store_item_revenue", "store_avg"]}
+      },
+      "join_store_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s.s_store_name, i.i_item_desc, fp.revenue, i.i_current_price, i.i_wholesale_cost, i.i_brand FROM filtered_pairs fp JOIN store s ON fp.ss_store_sk = s.s_store_sk JOIN item i ON fp.ss_item_sk = i.i_item_sk",
+        "interfaces": {"outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"], "consumes": ["filtered_pairs"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand FROM join_store_item ORDER BY s_store_name ASC, i_item_desc ASC LIMIT 100",
+        "interfaces": {"outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"], "consumes": ["join_store_item"]}
+      }
+    },
+    "reconstruction_order": ["date_filter", "fact_with_date", "store_item_revenue", "store_avg", "filtered_pairs", "join_store_item", "main_query"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), fact_with_date AS ({fact_with_date}), store_item_revenue AS ({store_item_revenue}), store_avg AS ({store_avg}), filtered_pairs AS ({filtered_pairs}), join_store_item AS ({join_store_item}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Changes & Expected Speedup
+**Changes**: Restructured into a CTE pipeline that filters `date_dim` once, pre-joins with `store_sales`, then performs aggregations and dimension joins in stages—eliminating the duplicate store_sales-date_dim scan from the original.
+
+**Expected speedup**: ~3-4x based on similar patterns (prefetch_fact_join + date_cte_isolate). The original query scanned `store_sales` twice for the same date range; this rewrite reduces that to a single scan with a hash join against a small date filter CTE.

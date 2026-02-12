@@ -1,0 +1,69 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Decoupled correlated category average into CTE, kept same join structure and filters.
+    ├── [+] WITH item_avg_cte AS (SELECT j.i_category, AVG(j.i_current_price) AS avg_price FROM item j GROUP BY j.i_category)
+    ├── [=] SCAN (customer_address AS a (join), customer AS c (join), store_sales AS s (join), date_dim AS d (join), item AS i (join), date_dim (subquery), item_avg_cte)
+    ├── [=] JOIN (a.ca_address_sk = c.c_current_addr_sk)
+    ├── [=] JOIN (c.c_customer_sk = s.ss_customer_sk)
+    ├── [=] JOIN (s.ss_sold_date_sk = d.d_date_sk)
+    ├── [=] JOIN (s.ss_item_sk = i.i_item_sk)
+    ├── [~] JOIN (i.i_category = ia.i_category)  -- was correlated subquery, now explicit JOIN
+    ├── [=] FILTER (d.d_month_seq = (SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2002 AND d_moy = 3))
+    ├── [~] FILTER (i.i_current_price > 1.2 * ia.avg_price)  -- was correlated subquery expression
+    ├── [=] AGG (GROUP BY)
+    ├── [=] SORT (cnt ASC, a.ca_state ASC)
+    └── [=] OUTPUT (state, cnt)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "decorrelate",
+      "description": "Convert correlated AVG subquery over item category into standalone CTE with JOIN",
+      "applied_to": ["item_avg_cte", "main_query"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "item_avg_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT j.i_category, AVG(j.i_current_price) AS avg_price FROM item AS j GROUP BY j.i_category",
+        "interfaces": {"outputs": ["i_category", "avg_price"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT a.ca_state AS state, COUNT(*) AS cnt FROM customer_address AS a, customer AS c, store_sales AS s, date_dim AS d, item AS i, item_avg_cte AS ia WHERE a.ca_address_sk = c.c_current_addr_sk AND c.c_customer_sk = s.ss_customer_sk AND s.ss_sold_date_sk = d.d_date_sk AND s.ss_item_sk = i.i_item_sk AND i.i_category = ia.i_category AND d.d_month_seq = (SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2002 AND d_moy = 3) AND i.i_current_price > 1.2 * ia.avg_price GROUP BY a.ca_state HAVING COUNT(*) >= 10 ORDER BY cnt, a.ca_state LIMIT 100",
+        "interfaces": {"outputs": ["state", "cnt"], "consumes": ["item_avg_cte"]}
+      }
+    },
+    "reconstruction_order": ["item_avg_cte", "main_query"],
+    "assembly_template": "WITH item_avg_cte AS ({item_avg_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": [
+    "Original date subquery preserved (SELECT DISTINCT d_month_seq)",
+    "Category join uses equality (NULL handling same as original)",
+    "All joins remain INNER via comma syntax",
+    "HAVING filter on COUNT(*) >= 10",
+    "ORDER BY cnt, a.ca_state with LIMIT 100",
+    "Output columns exactly: state, cnt"
+  ]
+}
+```
+
+**Changes**: Converted the correlated `(SELECT AVG(j.i_current_price) FROM item j WHERE j.i_category = i.i_category)` subquery into a standalone CTE `item_avg_cte` grouping by category, then joined via `i.i_category = ia.i_category`. This eliminates per-row re-execution while preserving the same category-based average calculation.
+
+**Expected speedup**: ~2.9x (similar to decorrelate pattern example) by computing category averages once instead of per outer row.

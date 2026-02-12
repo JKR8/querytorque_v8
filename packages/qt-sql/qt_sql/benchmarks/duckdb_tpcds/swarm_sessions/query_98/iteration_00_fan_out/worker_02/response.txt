@@ -1,0 +1,117 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  — Restructured with CTEs to match Target Logical Tree
+    ├── [CTE] filtered_date  [+]
+    │   ├── SCAN date_dim
+    │   └── FILTER (d_date BETWEEN CAST('2002-05-20' AS DATE) AND (CAST('2002-05-20' AS DATE) + INTERVAL 30 DAY))
+    ├── [CTE] filtered_item  [+]
+    │   ├── SCAN item
+    │   └── FILTER (i_category IN ('Sports', 'Music', 'Shoes'))
+    ├── [CTE] joined_fact  [+]
+    │   ├── SCAN store_sales
+    │   ├── JOIN filtered_date (ss_sold_date_sk = d_date_sk)
+    │   └── JOIN filtered_item (ss_item_sk = i_item_sk)
+    ├── [CTE] aggregation  [+]
+    │   ├── FROM joined_fact
+    │   └── AGG (GROUP BY i_item_id, i_item_desc, i_category, i_class, i_current_price)
+    ├── [CTE] window  [+]
+    │   ├── FROM aggregation
+    │   └── WINDOW (PARTITION BY i_class)
+    └── OUTPUT (i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, revenueratio)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "early_filter",
+      "description": "Filter dimension tables date_dim and item first to reduce join cardinality",
+      "applied_to": ["filtered_date", "filtered_item"]
+    },
+    {
+      "id": "R2",
+      "type": "pushdown",
+      "description": "Push date and category filters into isolated CTEs to enable predicate pushdown",
+      "applied_to": ["filtered_date", "filtered_item"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_date": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2002-05-20' AS DATE) AND (CAST('2002-05-20' AS DATE) + INTERVAL 30 DAY)",
+          "interfaces": {
+            "outputs": ["d_date_sk"],
+            "consumes": []
+          }
+        },
+        "filtered_item": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT i_item_sk, i_item_id, i_item_desc, i_category, i_class, i_current_price FROM item WHERE i_category IN ('Sports', 'Music', 'Shoes')",
+          "interfaces": {
+            "outputs": ["i_item_sk", "i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price"],
+            "consumes": []
+          }
+        },
+        "joined_fact": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT fi.i_item_id, fi.i_item_desc, fi.i_category, fi.i_class, fi.i_current_price, ss.ss_ext_sales_price FROM store_sales ss INNER JOIN filtered_date fd ON ss.ss_sold_date_sk = fd.d_date_sk INNER JOIN filtered_item fi ON ss.ss_item_sk = fi.i_item_sk",
+          "interfaces": {
+            "outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "ss_ext_sales_price"],
+            "consumes": ["filtered_date", "filtered_item"]
+          }
+        },
+        "aggregation": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT i_item_id, i_item_desc, i_category, i_class, i_current_price, SUM(ss_ext_sales_price) AS itemrevenue FROM joined_fact GROUP BY i_item_id, i_item_desc, i_category, i_class, i_current_price",
+          "interfaces": {
+            "outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue"],
+            "consumes": ["joined_fact"]
+          }
+        },
+        "window": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, itemrevenue * 100 / SUM(itemrevenue) OVER (PARTITION BY i_class) AS revenueratio FROM aggregation",
+          "interfaces": {
+            "outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue", "revenueratio"],
+            "consumes": ["aggregation"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, revenueratio FROM window ORDER BY i_category, i_class, i_item_id, i_item_desc, revenueratio",
+          "interfaces": {
+            "outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue", "revenueratio"],
+            "consumes": ["window"]
+          }
+        }
+      },
+      "reconstruction_order": ["filtered_date", "filtered_item", "joined_fact", "aggregation", "window", "main_query"],
+      "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), joined_fact AS ({joined_fact}), aggregation AS ({aggregation}), window AS ({window}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured the query to match the target logical tree using CTEs for early filtering of dimension tables (date_dim, item) before joining to the fact table. This preserves exact semantics while allowing DuckDB to push predicates into dimension scans and reduce the fact table join cardinality.
+
+**Expected speedup**: 2-3x due to reduced fact table scan through early dimension filtering and predicate pushdown opportunities.

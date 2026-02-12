@@ -1,0 +1,86 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query [~] Cost: 100% Rows: ~4.5K — Rewritten with dimension pre-filtering CTEs per Target Logical Tree
+    ├── [~] date_filtered [=] CTE that filters date_dim
+    ├── [~] store_filtered [=] CTE that filters store
+    ├── [~] hh_filtered [=] CTE that filters household_demographics with defensive CASE guard
+    ├── [~] fact_join [=] CTE joining store_sales with three dimension CTEs
+    ├── [~] aggregation [=] CTE grouping by ticket/customer with COUNT(*)
+    ├── [~] customer_join [=] CTE joining aggregation with customer and filtering cnt
+    └── [~] order_by [=] Main query orders final results
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Isolate dimension filters into separate CTEs for early filtering before fact join", "applied_to": ["date_filtered", "store_filtered", "hh_filtered"]},
+    {"id": "R2", "type": "predicate_pushdown_precompute", "description": "Precompute dimension filters in CTEs to guarantee early evaluation", "applied_to": ["date_filtered", "store_filtered", "hh_filtered"]},
+    {"id": "R3", "type": "structural_alignment", "description": "Align query structure exactly with Target Logical Tree node contracts", "applied_to": ["fact_join", "aggregation", "customer_join", "order_by"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filtered": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE (d_dom BETWEEN 1 AND 3 OR d_dom BETWEEN 25 AND 28) AND d_year IN (1998, 1999, 2000)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "store_filtered": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s_store_sk FROM store WHERE s_county IN ('Ziebach County', 'Daviess County', 'Walker County', 'Richland County', 'Barrow County', 'Franklin Parish', 'Williamson County', 'Luce County')",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "hh_filtered": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT hd_demo_sk FROM household_demographics WHERE (hd_buy_potential = '1001-5000' OR hd_buy_potential = '0-500') AND hd_vehicle_count > 0 AND (CASE WHEN hd_vehicle_count > 0 THEN hd_dep_count / hd_vehicle_count ELSE NULL END) > 1.2",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": []}
+      },
+      "fact_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk FROM store_sales INNER JOIN date_filtered ON ss_sold_date_sk = d_date_sk INNER JOIN store_filtered ON ss_store_sk = s_store_sk INNER JOIN hh_filtered ON ss_hdemo_sk = hd_demo_sk",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk"], "consumes": ["date_filtered", "store_filtered", "hh_filtered"]}
+      },
+      "aggregation": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, COUNT(*) AS cnt FROM fact_join GROUP BY ss_ticket_number, ss_customer_sk",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "cnt"], "consumes": ["fact_join"]}
+      },
+      "customer_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt FROM aggregation INNER JOIN customer ON ss_customer_sk = c_customer_sk WHERE cnt BETWEEN 15 AND 20",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "c_salutation", "c_preferred_cust_flag", "ss_ticket_number", "cnt"], "consumes": ["aggregation"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt FROM customer_join ORDER BY c_last_name, c_first_name, c_salutation, c_preferred_cust_flag DESC, ss_ticket_number",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "c_salutation", "c_preferred_cust_flag", "ss_ticket_number", "cnt"], "consumes": ["customer_join"]}
+      }
+    },
+    "reconstruction_order": ["date_filtered", "store_filtered", "hh_filtered", "fact_join", "aggregation", "customer_join", "main_query"],
+    "assembly_template": "WITH date_filtered AS ({date_filtered}), store_filtered AS ({store_filtered}), hh_filtered AS ({hh_filtered}), fact_join AS ({fact_join}), aggregation AS ({aggregation}), customer_join AS ({customer_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Changes & Expected Speedup
+
+Changes: Restructured original implicit-join subquery into explicit CTE pipeline that isolates dimension filters early (date, store, household_demographics) before joining with the large fact table. This guarantees predicate pushdown stops at CTE boundaries but ensures dimension filtering happens before the expensive fact join, reducing intermediate row counts.
+
+Expected speedup: Moderate (1.2-1.5x) due to reduced fact-table join cardinality from pre-filtered dimension keys. CTE overhead is acceptable given baseline 557ms, and we avoid known regression patterns (no OR-to-UNION splits, no dimension CTE cross-joins).

@@ -1,0 +1,109 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [~] CTE date_cte
+│   └── SCAN date_dim [=]
+├── [~] CTE customer_address_cte
+│   └── SCAN customer_address [=]
+├── [~] CTE web_site_cte
+│   └── SCAN web_site [=]
+├── [~] filtered_ws1
+│   ├── JOIN (INNER) web_sales ws1 [=]
+│   ├── JOIN (INNER) date_cte [=]
+│   ├── JOIN (INNER) customer_address_cte [=]
+│   └── JOIN (INNER) web_site_cte [=]
+├── [~] anti_join
+│   └── WHERE NOT EXISTS web_returns [=]
+├── [~] semi_join
+│   └── WHERE EXISTS web_sales ws2 [=]
+└── [~] aggregate
+    ├── AGGREGATE [=]
+    └── OUTPUT [=]
+```
+
+**Change markers:**
+- `[~] CTE date_cte`: New CTE isolating date filter
+- `[~] CTE customer_address_cte`: New CTE isolating state filter  
+- `[~] CTE web_site_cte`: New CTE isolating GMT offset filter
+- `[~] filtered_ws1`: Changed from comma joins to explicit INNER JOINs with CTEs
+- `[~] anti_join`: Moved NOT EXISTS to separate filtering step
+- `[~] semi_join`: Moved EXISTS to separate filtering step
+- `[~] aggregate`: No structural change, just consumes semi_join
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefetch", "description": "Pre-filter selective dimensions into CTEs to create tiny hash tables", "applied_to": ["date_cte", "customer_address_cte", "web_site_cte"]},
+    {"id": "R2", "type": "explicit_join_syntax", "description": "Convert comma-separated joins to explicit INNER JOIN syntax", "applied_to": ["filtered_ws1"]},
+    {"id": "R3", "type": "stepwise_join_elimination", "description": "Separate EXISTS/NOT EXISTS into sequential filtering steps for clarity", "applied_to": ["anti_join", "semi_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY'",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "customer_address_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('CA','MI','OH','SD','TX','VA')",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "web_site_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT web_site_sk FROM web_site WHERE web_gmt_offset >= -5",
+        "interfaces": {"outputs": ["web_site_sk"], "consumes": []}
+      },
+      "filtered_ws1": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit, ws1.ws_warehouse_sk FROM web_sales ws1 INNER JOIN date_cte ON ws1.ws_ship_date_sk = date_cte.d_date_sk INNER JOIN customer_address_cte ON ws1.ws_ship_addr_sk = customer_address_cte.ca_address_sk INNER JOIN web_site_cte ON ws1.ws_web_site_sk = web_site_cte.web_site_sk WHERE ws1.ws_list_price BETWEEN 237 AND 266",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit", "ws_warehouse_sk"], "consumes": ["date_cte", "customer_address_cte", "web_site_cte"]}
+      },
+      "anti_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk FROM filtered_ws1 WHERE NOT EXISTS (SELECT 1 FROM web_returns wr1 WHERE wr1.wr_order_number = filtered_ws1.ws_order_number AND wr1.wr_reason_sk IN (7,25,26,52,69))",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit", "ws_warehouse_sk"], "consumes": ["filtered_ws1"]}
+      },
+      "semi_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_order_number, ws_ext_ship_cost, ws_net_profit FROM anti_join WHERE EXISTS (SELECT 1 FROM web_sales ws2 WHERE ws2.ws_order_number = anti_join.ws_order_number AND ws2.ws_warehouse_sk <> anti_join.ws_warehouse_sk)",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": ["anti_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(DISTINCT ws_order_number) AS \"order count\", SUM(ws_ext_ship_cost) AS \"total shipping cost\", SUM(ws_net_profit) AS \"total net profit\" FROM semi_join ORDER BY COUNT(DISTINCT ws_order_number) LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["semi_join"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "customer_address_cte", "web_site_cte", "filtered_ws1", "anti_join", "semi_join", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), customer_address_cte AS ({customer_address_cte}), web_site_cte AS ({web_site_cte}), filtered_ws1 AS ({filtered_ws1}), anti_join AS ({anti_join}), semi_join AS ({semi_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+## Changes
+
+Restructured the original comma-separated implicit joins into explicit INNER JOINs with pre-filtered dimension CTEs, then applied EXISTS/NOT EXISTS filters sequentially. This follows the PostgreSQL optimization pattern where pre-materializing selective dimension filters into CTEs provides better cardinality estimates for the hash joins.
+
+**Expected speedup:** 2-3x based on similar pattern improvements (pg_dimension_prefetch_star 3.32x, pg_date_cte_explicit_join 2.28x). The main gains come from:
+1. Early reduction of dimension tables to tiny hash tables
+2. Explicit JOIN syntax enabling optimal join order planning
+3. Sequential filtering preventing row duplication before aggregation

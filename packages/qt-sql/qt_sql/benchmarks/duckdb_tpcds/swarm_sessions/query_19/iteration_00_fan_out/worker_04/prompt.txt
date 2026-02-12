@@ -1,0 +1,395 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Rank December 1999 store-sales revenue by brand/manufacturer for manager_id=2 items purchased by customers whose current ZIP differs from the selling store ZIP prefix. All joins are INNER (intersection), so all tables must match. Aggregation uses SUM which is duplicate-sensitive but safe because grouping is at item brand level. The ZIP mismatch filter depends on both customer_address and store tables; moving it earlier could break join semantics.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+date_item_cte -> store_sales_filtered -> agg -> late_zip_check -> sort -> limit
+NODE_CONTRACTS:
+  date_item_cte:
+    FROM: date_dim d CROSS JOIN item i
+    WHERE: d.d_moy=12 AND d.d_year=1999 AND i.i_manager_id=2
+    OUTPUT: d.d_date_sk, i.i_item_sk, i.i_brand_id, i.i_brand, i.i_manufact_id, i.i_manufact
+    EXPECTED_ROWS: 31 * 1,793 = 55,583
+    CONSUMERS: store_sales_filtered
+  store_sales_filtered:
+    FROM: store_sales ss
+    WHERE: EXISTS (SELECT 1 FROM date_item_cte k WHERE k.d_date_sk = ss.ss_sold_date_sk AND k.i_item_sk = ss.ss_item_sk)
+    OUTPUT: ss.ss_item_sk, ss.ss_customer_sk, ss.ss_store_sk, ss.ss_ext_sales_price
+    EXPECTED_ROWS: 933K (same as original)
+    CONSUMERS: agg
+  agg:
+    FROM: store_sales_filtered f JOIN date_item_cte k ON f.ss_item_sk = k.i_item_sk AND f.ss_sold_date_sk = k.d_date_sk
+    GROUP BY: k.i_brand, k.i_brand_id, k.i_manufact_id, k.i_manufact, f.ss_customer_sk, f.ss_store_sk
+    AGGREGATE: SUM(f.ss_ext_sales_price) AS ext_price
+    OUTPUT: k.i_brand_id, k.i_brand, k.i_manufact_id, k.i_manufact, f.ss_customer_sk, f.ss_store_sk, ext_price
+    EXPECTED_ROWS: ~15K
+    CONSUMERS: late_zip_check
+  late_zip_check:
+    FROM: agg a JOIN customer c ON a.ss_customer_sk = c.c_customer_sk JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN store s ON a.ss_store_sk = s.s_store_sk
+    WHERE: substr(ca.ca_zip,1,5) <> substr(s.s_zip,1,5)
+    OUTPUT: a.i_brand_id, a.i_brand, a.i_manufact_id, a.i_manufact, a.ext_price
+    EXPECTED_ROWS: 15K
+    CONSUMERS: sort
+
+NODE_CONTRACTS:
+date_item_cte:
+    FROM: date_dim d CROSS JOIN item i
+    WHERE: d.d_moy=12 AND d.d_year=1999 AND i.i_manager_id=2
+    OUTPUT: d.d_date_sk, i.i_item_sk, i.i_brand_id, i.i_brand, i.i_manufact_id, i.i_manufact
+    EXPECTED_ROWS: 31 * 1,793 = 55,583
+    CONSUMERS: store_sales_filtered
+  store_sales_filtered:
+    FROM: store_sales ss
+    WHERE: EXISTS (SELECT 1 FROM date_item_cte k WHERE k.d_date_sk = ss.ss_sold_date_sk AND k.i_item_sk = ss.ss_item_sk)
+    OUTPUT: ss.ss_item_sk, ss.ss_customer_sk, ss.ss_store_sk, ss.ss_ext_sales_price
+    EXPECTED_ROWS: 933K (same as original)
+    CONSUMERS: agg
+  agg:
+    FROM: store_sales_filtered f JOIN date_item_cte k ON f.ss_item_sk = k.i_item_sk AND f.ss_sold_date_sk = k.d_date_sk
+    GROUP BY: k.i_brand, k.i_brand_id, k.i_manufact_id, k.i_manufact, f.ss_customer_sk, f.ss_store_sk
+    AGGREGATE: SUM(f.ss_ext_sales_price) AS ext_price
+    OUTPUT: k.i_brand_id, k.i_brand, k.i_manufact_id, k.i_manufact, f.ss_customer_sk, f.ss_store_sk, ext_price
+    EXPECTED_ROWS: ~15K
+    CONSUMERS: late_zip_check
+  late_zip_check:
+    FROM: agg a JOIN customer c ON a.ss_customer_sk = c.c_customer_sk JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN store s ON a.ss_store_sk = s.s_store_sk
+    WHERE: substr(ca.ca_zip,1,5) <> substr(s.s_zip,1,5)
+    OUTPUT: a.i_brand_id, a.i_brand, a.i_manufact_id, a.i_manufact, a.ext_price
+    EXPECTED_ROWS: 15K
+    CONSUMERS: sort
+
+## Hazard Flags (avoid these specific risks)
+
+- EXISTS may force nested loop join; DuckDB might convert to hash join automatically.
+- Aggregation before ZIP check includes extra groups that will be filtered out.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines star_join_prefetch, late_attribute_binding, and semi-join filter)
+
+## Regression Warnings (observed failures on similar queries)
+
+1. dimension_cte_isolate (0.0076x regression):
+   CAUSE: Cross-joining 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join 3+ dimension CTEs; join them sequentially with fact table.
+2. prefetch_fact_join (0.50x regression):
+   CAUSE: Baseline runtime <100ms, CTE overhead dominated.
+   RULE: This query's baseline is 388ms (>100ms), so transform is acceptable.
+3. materialize_cte (0.14x regression):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan.
+   RULE: No EXISTS in this query, but avoid materializing filters that could stay as semi-joins.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output i_brand_id, i_brand, i_manufact_id, i_manufact, ext_price in same order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (join keys, grouping columns, filters like ca_zip, s_zip).
+- LITERAL_PRESERVATION: Must keep d_moy=12, d_year=1999, i_manager_id=2 exactly.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows ordered by ext_price DESC, i_brand, i_brand_id, i_manufact_id, i_manufact.
+- CROSS_CTE_PREDICATE_BLINDNESS: Optimizer pushes predicates into scans but not across CTE boundaries. Creating dimension CTEs can reduce fact probe size.
+- LATE_ATTRIBUTE_BINDING_OPPORTUNITY: Customer and customer_address columns only used in ZIP mismatch filter and final output, not in WHERE/GROUP BY.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- decorrelate: Apply converting EXISTS to JOIN; but here we use EXISTS for semi-join filter, keep it.
+- single_pass_aggregation: Apply consolidating filters into single scan; ignore CASE aggregation.
+- early_filter: Apply early date/item filtering; ignore that EXISTS is used for fact filter.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. decorrelate (2.92x)
+
+**Principle:** Decorrelation: convert correlated subqueries to standalone CTEs with GROUP BY, then JOIN. Correlated subqueries re-execute per outer row; a pre-computed CTE executes once.
+
+**BEFORE (slow):**
+```sql
+with customer_total_return as
+(select sr_customer_sk as ctr_customer_sk
+,sr_store_sk as ctr_store_sk
+,sum(SR_FEE) as ctr_total_return
+from store_returns
+,date_dim
+where sr_returned_date_sk = d_date_sk
+and d_year =2000
+group by sr_customer_sk
+,sr_store_sk)
+ select c_customer_id
+from customer_total_return ctr1
+,store
+,customer
+where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2
+from customer_total_return ctr2
+where ctr1.ctr_store_sk = ctr2.ctr_store_sk)
+and s_store_sk = ctr1.ctr_store_sk
+and s_state = 'SD'
+and ctr1.ctr_customer_sk = c_customer_sk
+order by c_customer_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_returns]:
+```sql
+SELECT sr.sr_customer_sk, sr.sr_store_sk, sr.sr_fee FROM store_returns sr JOIN date_dim d ON sr.sr_returned_date_sk = d.d_date_sk JOIN store s ON sr.sr_store_sk = s.s_store_sk WHERE d.d_year = 2000 AND s.s_state = 'SD'
+```
+[customer_total_return]:
+```sql
+SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(sr_fee) AS ctr_total_return FROM filtered_returns GROUP BY sr_customer_sk, sr_store_sk
+```
+[store_avg_return]:
+```sql
+SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk
+```
+[main_query]:
+```sql
+SELECT c.c_customer_id FROM customer_total_return ctr1 JOIN store_avg_return sar ON ctr1.ctr_store_sk = sar.ctr_store_sk JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk WHERE ctr1.ctr_total_return > sar.avg_return_threshold ORDER BY c.c_customer_id LIMIT 100
+```
+
+### 2. single_pass_aggregation (4.47x)
+
+**Principle:** Single-Pass Aggregation: consolidate multiple scalar subqueries on the same table into one CTE using CASE expressions inside aggregate functions. Reduces N separate table scans to 1 pass.
+
+**BEFORE (slow):**
+```sql
+select case when (select count(*) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) > 2972190
+            then (select avg(ss_ext_sales_price) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 1 and 20) end bucket1 ,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 21 and 40) > 4505785
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 21 and 40) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 21 and 40) end bucket2,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 41 and 60) > 1575726
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 41 and 60)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 41 and 60) end bucket3,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 61 and 80) > 3188917
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 61 and 80)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 61 and 80) end bucket4,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 81 and 100) > 3525216
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 81 and 100)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 81 and 100) end bucket5
+from reason
+where r_reason_sk = 1;
+```
+
+**AFTER (fast):**
+[store_sales_aggregates]:
+```sql
+SELECT SUM(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 ELSE 0 END) AS cnt1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_ext_discount_amt END) AS avg_disc1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_net_paid END) AS avg_paid1, SUM(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN 1 ELSE 0 END) AS cnt2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_ext_discount_amt END) AS avg_disc2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_net_paid END) AS avg_paid2, SUM(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN 1 ELSE 0 END) AS cnt3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_ext_discount_amt END) AS avg_disc3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_net_paid END) AS avg_paid3, SUM(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN 1 ELSE 0 END) AS cnt4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_ext_discount_amt END) AS avg_disc4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_net_paid END) AS avg_paid4, SUM(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN 1 ELSE 0 END) AS cnt5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_ext_discount_amt END) AS avg_disc5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_net_paid END) AS avg_paid5 FROM store_sales
+```
+[main_query]:
+```sql
+SELECT CASE WHEN cnt1 > 74129 THEN avg_disc1 ELSE avg_paid1 END AS bucket1, CASE WHEN cnt2 > 122840 THEN avg_disc2 ELSE avg_paid2 END AS bucket2, CASE WHEN cnt3 > 56580 THEN avg_disc3 ELSE avg_paid3 END AS bucket3, CASE WHEN cnt4 > 10097 THEN avg_disc4 ELSE avg_paid4 END AS bucket4, CASE WHEN cnt5 > 165306 THEN avg_disc5 ELSE avg_paid5 END AS bucket5 FROM store_sales_aggregates
+```
+
+### 3. early_filter (4.00x)
+
+**Principle:** Early Selection: filter small dimension tables first, then join to large fact tables. This reduces the fact table scan to only rows matching the filter, rather than scanning all rows and filtering after the join.
+
+**BEFORE (slow):**
+```sql
+select ss_customer_sk
+            ,sum(act_sales) sumsales
+      from (select ss_item_sk
+                  ,ss_ticket_number
+                  ,ss_customer_sk
+                  ,case when sr_return_quantity is not null then (ss_quantity-sr_return_quantity)*ss_sales_price
+                                                            else (ss_quantity*ss_sales_price) end act_sales
+            from store_sales left outer join store_returns on (sr_item_sk = ss_item_sk
+                                                               and sr_ticket_number = ss_ticket_number)
+                ,reason
+            where sr_reason_sk = r_reason_sk
+              and r_reason_desc = 'duplicate purchase') t
+      group by ss_customer_sk
+      order by sumsales, ss_customer_sk
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_reason]:
+```sql
+SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'
+```
+[filtered_returns]:
+```sql
+SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+```
+[main_query]:
+```sql
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
+```
+
+## Original SQL
+
+```sql
+-- start query 19 in stream 0 using template query19.tpl
+select i_brand_id brand_id, i_brand brand, i_manufact_id, i_manufact,
+ 	sum(ss_ext_sales_price) ext_price
+ from date_dim, store_sales, item,customer,customer_address,store
+ where d_date_sk = ss_sold_date_sk
+   and ss_item_sk = i_item_sk
+   and i_manager_id=2
+   and d_moy=12
+   and d_year=1999
+   and ss_customer_sk = c_customer_sk 
+   and c_current_addr_sk = ca_address_sk
+   and substr(ca_zip,1,5) <> substr(s_zip,1,5) 
+   and ss_store_sk = s_store_sk 
+ group by i_brand
+      ,i_brand_id
+      ,i_manufact_id
+      ,i_manufact
+ order by ext_price desc
+         ,i_brand
+         ,i_brand_id
+         ,i_manufact_id
+         ,i_manufact
+ LIMIT 100;
+
+-- end query 19 in stream 0 using template query19.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `brand_id`
+  2. `brand`
+  3. `i_manufact_id`
+  4. `i_manufact`
+  5. `ext_price`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K  — Join store sales with date, item, customer, address, and store; filter by month/year, manager id, and ZIP-prefix mismatch; aggregate extended sales price by brand/manufacturer attributes; and order by descending revenue.
+    ├── SCAN (date_dim, store_sales (join), item (join), customer (join), customer_address (join), store (join))
+    ├── JOIN (d_date_sk = ss_sold_date_sk)
+    ├── JOIN (ss_item_sk = i_item_sk)
+    ├── JOIN (+3 more)
+    ├── FILTER (i_manager_id = 2)
+    ├── FILTER (d_moy = 12)
+    ├── FILTER (+2 more)
+    ├── AGG (GROUP BY)
+    ├── SORT (ext_price DESC, i_brand ASC, i_brand_id ASC, i_manufact_id ASC, i_manufact ASC)
+    └── OUTPUT (brand_id, brand, i_manufact_id, i_manufact, ext_price)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

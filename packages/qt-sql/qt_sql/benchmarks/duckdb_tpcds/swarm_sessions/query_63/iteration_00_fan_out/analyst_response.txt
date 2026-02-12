@@ -1,0 +1,391 @@
+<reasoning>
+1. **CLASSIFY**: This is a star-join aggregation with a window function and late post-aggregation filter. It joins one large fact table (store_sales) with three dimension tables (date_dim, item, store), applies dimension filters, aggregates by manager and month, computes a manager-level average via window function, then filters rows where the monthly deviation exceeds 10%.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Wall-clock times: store_sales SEQ_SCAN (311ms, 71%), HASH_JOIN with item (62.9ms, 14%), HASH_JOIN with date_dim (41.7ms, 10%), item FILTER (3.4ms), remaining operations <10ms each.
+   - Dominant cost: store_sales table scan (311ms). This is scan-bound.
+   - Row count drops: date_dim scan: 73K → 365 rows (0.5% selectivity). item scan: 102K → 5,279 rows (5% selectivity). store scan: 102 → 100 rows. After joins: store_sales 5.4M rows → after date_dim join 5.4M rows (no reduction because join is on date key, but date filter already applied) → after item join 373K rows (93% reduction) → after store join 373K rows (no further reduction). Aggregation reduces to 1,200 rows. Window function on 1,200 rows is cheap.
+   - The optimizer already pushes filters into dimension scans (date_dim, item, store). It uses hash joins and perfect hash group by. The plan shows a typical star-join order: fact table scanned first, then joined to filtered dimensions. This is suboptimal because the fact table scan isn't reduced by dimension filters.
+   - Scans per base table: store_sales (1), date_dim (1), item (1), store (1). No repeated scans.
+   - No CTEs in original query; all joins are in main FROM clause.
+
+3. **GAP MATCHING**:
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: The optimizer scans store_sales first (5.4M rows) before applying dimension filters. This is a classic star-join optimization gap. Pre-filtering dimensions into CTEs and then joining with fact table could reduce fact table probe size.
+   - **CROSS_COLUMN_OR_DECOMPOSITION**: The item filter has OR conditions spanning different categories/classes/brands. This is OR on same table (item) but different column values. The engine handles same-column OR natively (per EXPLAIN, item filter applied in single scan). OR-to-UNION is contraindicated (same-table OR, risk 0.59x).
+   - **REDUNDANT_SCAN_ELIMINATION**: No repeated scans.
+   - **CORRELATED_SUBQUERY_PARALYSIS**: No correlated subqueries.
+   - **UNION_CTE_SELF_JOIN_DECOMPOSITION**: No UNION ALL CTE.
+
+4. **AGGREGATION TRAP CHECK**: The query uses SUM and AVG(SUM(...)) OVER. AVG over a window partition is grouping-sensitive, but the window partitions by i_manager_id which is also in GROUP BY (i_manager_id, d_moy). This is safe: each (i_manager_id, d_moy) group contributes one row to the window partition. Restructuring that preserves the same grouping columns and row set will keep AVG correct.
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   - **star_join_prefetch** (prefetch_fact_join, date_cte_isolate, multi_dimension_prefetch, dimension_cte_isolate): Pre-filter all dimension tables into CTEs, then join with fact table. This attacks the main bottleneck (full fact scan). Historical speedup 1.8x-4.0x.
+   - **or_to_union**: Not applicable (same-column OR, risk 0.59x). Avoid.
+   - **single_pass_aggregation**: No repeated fact scans.
+   - **decorrelation**: No correlated subqueries.
+   - **window_optimization**: The window function is cheap (9.6ms). Deferring window won't help.
+   - **late_attribute_binding**: All dimension columns are used in filters or joins, not just display.
+   - **scan_consolidation_pivot**: No repeated scans with different discriminators.
+
+   Selected transforms (structurally diverse):
+   1. **prefetch_fact_join**: Pre-filter date_dim, item, store into CTEs, pre-join with store_sales.
+   2. **date_cte_isolate**: Isolate date filter into CTE, join with fact, then other dims.
+   3. **multi_dimension_prefetch**: Pre-filter date_dim and store into CTEs, then join with fact and item.
+   4. **EXPLORATION**: Compound strategy: pre-filter all dimensions + push aggregation below join? Actually, aggregation uses columns from multiple tables (i_manager_id from item, d_moy from date_dim, ss_sales_price from store_sales). Cannot push aggregation below joins without changing semantics. Instead, explore **early_filter** + **date_cte_isolate** + **materialize_cte** for the OR condition? But materialize_cte risk with OR? Better: explore **or_to_union** despite risk, but with structural difference: the OR is on item table, not fact table. Splitting item into two CTEs and then UNION ALL joining with fact could allow separate join paths. However, the fact table would be scanned twice. Not good. Alternative exploration: **deferred_window_aggregation**? Window is cheap. Instead, explore **star_join_prefetch** with **transitive_predicate_propagation**: pre-filter dimensions, then use surrogate keys to filter fact table via semi-join before full join? Actually, we can create a CTE with distinct composite key (item_sk, date_sk, store_sk) from filtered dimensions, then join with fact table. This reduces fact table to only rows matching all dimension filters. This is a novel technique not in catalog: **dimension_key_intersection**.
+
+6. **LOGICAL TREE DESIGN**:
+   - For prefetch_fact_join: CTE1: filtered date_dim; CTE2: filtered item; CTE3: filtered store; CTE4: join CTE1-3 with store_sales; then aggregate, window, filter.
+   - Ensure each CTE outputs all columns needed downstream: surrogate keys and any grouping columns (i_manager_id, d_moy).
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Find item managers with monthly sales volatility over month sequence 1181-1192 for selected item attribute bundles by flagging months that differ more than 10% from the manager's average monthly sales. All joins are INNER (intersection), requiring matches in all four tables. The AVG(SUM(...)) OVER window function is grouping-sensitive but safe because partition column (i_manager_id) is in GROUP BY; any rewrite must preserve exact (i_manager_id, d_moy) groups and row membership. The outer filter depends on avg_monthly_sales being computed per i_manager_id; splitting the window function incorrectly would break the deviation calculation.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: store_sales table scan dominates (311ms, 71% of total). The optimizer scans store_sales first (5.4M rows) before joining with filtered dimensions, missing opportunity to reduce fact table I/O via early dimension filtering. Cardinality flow: date_dim (365 rows), item (5,279 rows), store (100 rows) are highly selective; joining them first could drastically reduce fact table probe. The optimizer already pushes filters into dimension scans and uses efficient hash joins, but the join order (fact-first) is suboptimal for star schema.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output all columns from original SELECT (*) which expands to i_manager_id, sum_sales, avg_monthly_sales.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream: ss_item_sk, ss_sold_date_sk, ss_store_sk, i_item_sk, i_manager_id, d_date_sk, d_moy, s_store_sk, ss_sales_price.
+- LITERAL_PRESERVATION: Must preserve exact literal values in d_month_seq (1181..1192) and item category/class/brand strings.
+- SEMANTIC_EQUIVALENCE: Must return same rows, columns, and ordering.
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows store_sales scanned fully before dimension filters applied; pre-filtering dimensions into CTEs can push predicates earlier.
+- REDUNDANT_SCAN_ELIMINATION: Single fact scan; no redundancy.
+
+REGRESSION_WARNINGS:
+1. or_to_union (observed regression 0.59x):
+   CAUSE: Splitting same-column OR conditions (time range) duplicated fact table scans with no selectivity benefit.
+   RULE: Do NOT split OR on same table (item) into UNION ALL for this query; keep original OR.
+2. date_cte_isolate (observed regression 0.5x):
+   CAUSE: Baseline query <100ms, CTE materialization overhead dominated savings.
+   RULE: This query baseline is 438ms (>100ms), so CTE overhead acceptable.
+3. prefetch_fact_join (observed regression 0.5x):
+   CAUSE: Baseline <50ms, CTE overhead dominated.
+   RULE: Baseline 438ms, safe to apply.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_item -> filtered_store -> prefetched_sales -> aggregated_sales -> windowed -> filtered -> ordered -> limited
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_month_seq IN (1181,1182,1183,1184,1185,1186,1187,1188,1189,1190,1191,1192)
+    OUTPUT: d_date_sk, d_moy
+    EXPECTED_ROWS: 365
+    CONSUMERS: prefetched_sales
+  filtered_item:
+    FROM: item
+    WHERE: ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN ('scholaramalgamalg #14','scholaramalgamalg #7','exportiunivamalg #9','scholaramalgamalg #9')) OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN ('amalgimporto #1','edu packscholar #1','exportiimporto #1','importoamalg #1')))
+    OUTPUT: i_item_sk, i_manager_id
+    EXPECTED_ROWS: 5,279
+    CONSUMERS: prefetched_sales
+  filtered_store:
+    FROM: store
+    WHERE: s_store_sk <= 100
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 100
+    CONSUMERS: prefetched_sales
+  prefetched_sales:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+          INNER JOIN filtered_item ON ss_item_sk = i_item_sk
+          INNER JOIN filtered_store ON ss_store_sk = s_store_sk
+    OUTPUT: i_manager_id, d_moy, ss_sales_price
+    EXPECTED_ROWS: 373K
+    CONSUMERS: aggregated_sales
+  aggregated_sales:
+    FROM: prefetched_sales
+    GROUP BY: i_manager_id, d_moy
+    AGGREGATE: sum(ss_sales_price) AS sum_sales
+    OUTPUT: i_manager_id, d_moy, sum_sales
+    EXPECTED_ROWS: 1,200
+    CONSUMERS: windowed
+  windowed:
+    FROM: aggregated_sales
+    WINDOW: AVG(sum_sales) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales, d_moy
+    EXPECTED_ROWS: 1,200
+    CONSUMERS: filtered
+  filtered:
+    FROM: windowed
+    WHERE: CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: ordered
+  ordered:
+    FROM: filtered
+    ORDER BY: i_manager_id ASC, avg_monthly_sales ASC, sum_sales ASC
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: limited
+  limited:
+    FROM: ordered
+    LIMIT: 100
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: prefetch_fact_join (Q63)
+EXAMPLE_ADAPTATION:
+- Apply the prefetch_fact_join pattern exactly as in Q63: create CTEs for filtered dimensions, then join with fact table. Ignore that Q63 already is this query; use the pattern from the example's structure.
+HAZARD_FLAGS:
+- Overhead of materializing three dimension CTEs may not outweigh benefit if fact table join is already fast.
+- Must preserve original OR condition in filtered_item CTE exactly.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: date_cte_isolate
+TARGET_LOGICAL_TREE:
+  filtered_date -> joined_fact_date -> join_item -> join_store -> aggregated_sales -> windowed -> filtered -> ordered -> limited
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_month_seq IN (1181,1182,1183,1184,1185,1186,1187,1188,1189,1190,1191,1192)
+    OUTPUT: d_date_sk, d_moy
+    EXPECTED_ROWS: 365
+    CONSUMERS: joined_fact_date
+  joined_fact_date:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_item_sk, ss_store_sk, ss_sales_price, d_moy
+    EXPECTED_ROWS: 5.4M
+    CONSUMERS: join_item
+  join_item:
+    FROM: joined_fact_date
+    JOIN: INNER JOIN item ON ss_item_sk = i_item_sk
+    WHERE: ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN ('scholaramalgamalg #14','scholaramalgamalg #7','exportiunivamalg #9','scholaramalgamalg #9')) OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN ('amalgimporto #1','edu packscholar #1','exportiimporto #1','importoamalg #1')))
+    OUTPUT: i_manager_id, ss_store_sk, ss_sales_price, d_moy
+    EXPECTED_ROWS: 373K
+    CONSUMERS: join_store
+  join_store:
+    FROM: join_item
+    JOIN: INNER JOIN store ON ss_store_sk = s_store_sk
+    WHERE: s_store_sk <= 100
+    OUTPUT: i_manager_id, d_moy, ss_sales_price
+    EXPECTED_ROWS: 373K
+    CONSUMERS: aggregated_sales
+  aggregated_sales:
+    FROM: join_store
+    GROUP BY: i_manager_id, d_moy
+    AGGREGATE: sum(ss_sales_price) AS sum_sales
+    OUTPUT: i_manager_id, d_moy, sum_sales
+    EXPECTED_ROWS: 1,200
+    CONSUMERS: windowed
+  windowed:
+    FROM: aggregated_sales
+    WINDOW: AVG(sum_sales) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales, d_moy
+    EXPECTED_ROWS: 1,200
+    CONSUMERS: filtered
+  filtered:
+    FROM: windowed
+    WHERE: CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: ordered
+  ordered:
+    FROM: filtered
+    ORDER BY: i_manager_id ASC, avg_monthly_sales ASC, sum_sales ASC
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: limited
+  limited:
+    FROM: ordered
+    LIMIT: 100
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: date_cte_isolate (Q6, Q11)
+EXAMPLE_ADAPTATION:
+- Apply the date_cte_isolate pattern: create a CTE for filtered date_dim, then join with fact table first. Ignore that Q6/Q11 have scalar subqueries; this query uses date_dim directly in join.
+HAZARD_FLAGS:
+- Still scans full store_sales (5.4M rows) before applying item and store filters, may not reduce fact I/O.
+- Must ensure join_item WHERE clause matches original item filter exactly.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: multi_dimension_prefetch
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_store -> prefetched_sales -> join_item -> aggregated_sales -> windowed -> filtered -> ordered -> limited
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_month_seq IN (1181,1182,1183,1184,1185,1186,1187,1188,1189,1190,1191,1192)
+    OUTPUT: d_date_sk, d_moy
+    EXPECTED_ROWS: 365
+    CONSUMERS: prefetched_sales
+  filtered_store:
+    FROM: store
+    WHERE: s_store_sk <= 100
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 100
+    CONSUMERS: prefetched_sales
+  prefetched_sales:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+          INNER JOIN filtered_store ON ss_store_sk = s_store_sk
+    OUTPUT: ss_item_sk, ss_sales_price, d_moy
+    EXPECTED_ROWS: ~5.4M (no reduction from store filter because store_sales not filtered by store_sk? Actually join reduces rows)
+    CONSUMERS: join_item
+  join_item:
+    FROM: prefetched_sales
+    JOIN: INNER JOIN item ON ss_item_sk = i_item_sk
+    WHERE: ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN ('scholaramalgamalg #14','scholaramalgamalg #7','exportiunivamalg #9','scholaramalgamalg #9')) OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN ('amalgimporto #1','edu packscholar #1','exportiimporto #1','importoamalg #1')))
+    OUTPUT: i_manager_id, d_moy, ss_sales_price
+    EXPECTED_ROWS: 373K
+    CONSUMERS: aggregated_sales
+  aggregated_sales:
+    FROM: join_item
+    GROUP BY: i_manager_id, d_moy
+    AGGREGATE: sum(ss_sales_price) AS sum_sales
+    OUTPUT: i_manager_id, d_moy, sum_sales
+    EXPECTED_ROWS: 1,200
+    CONSUMERS: windowed
+  windowed:
+    FROM: aggregated_sales
+    WINDOW: AVG(sum_sales) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales, d_moy
+    EXPECTED_ROWS: 1,200
+    CONSUMERS: filtered
+  filtered:
+    FROM: windowed
+    WHERE: CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: ordered
+  ordered:
+    FROM: filtered
+    ORDER BY: i_manager_id ASC, avg_monthly_sales ASC, sum_sales ASC
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: limited
+  limited:
+    FROM: ordered
+    LIMIT: 100
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: multi_dimension_prefetch (Q43)
+EXAMPLE_ADAPTATION:
+- Apply the multi_dimension_prefetch pattern: create CTEs for filtered date_dim and filtered store, then join with fact table before joining item. Ignore that Q43 may have different dimension tables; the principle of pre-filtering multiple dimensions applies.
+HAZARD_FLAGS:
+- Prefiltering store may not reduce fact rows significantly (store filter already low selectivity).
+- Still scans store_sales before item filter, which is most selective (5,279 rows).
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: dimension_key_intersection (novel compound: star_join_prefetch + transitive_predicate_propagation)
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_item -> filtered_store -> dimension_keys -> filtered_fact -> aggregated_sales -> windowed -> filtered -> ordered -> limited
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_month_seq IN (1181,1182,1183,1184,1185,1186,1187,1188,1189,1190,1191,1192)
+    OUTPUT: d_date_sk, d_moy
+    EXPECTED_ROWS: 365
+    CONSUMERS: dimension_keys
+  filtered_item:
+    FROM: item
+    WHERE: ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN ('scholaramalgamalg #14','scholaramalgamalg #7','exportiunivamalg #9','scholaramalgamalg #9')) OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN ('amalgimporto #1','edu packscholar #1','exportiimporto #1','importoamalg #1')))
+    OUTPUT: i_item_sk, i_manager_id
+    EXPECTED_ROWS: 5,279
+    CONSUMERS: dimension_keys
+  filtered_store:
+    FROM: store
+    WHERE: s_store_sk <= 100
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 100
+    CONSUMERS: dimension_keys
+  dimension_keys:
+    FROM: filtered_date, filtered_item, filtered_store
+    CROSS JOIN: (implicit cross join of three CTEs to get all possible key combinations)
+    OUTPUT: d_date_sk, i_item_sk, s_store_sk, i_manager_id, d_moy
+    EXPECTED_ROWS: 365 * 5,279 * 100 ≈ 193M (too large!) Actually we need distinct keys? This is Cartesian product, wrong.
+    CONSUMERS: filtered_fact
+  filtered_fact:
+    FROM: store_sales
+    JOIN: INNER JOIN dimension_keys ON ss_sold_date_sk = d_date_sk AND ss_item_sk = i_item_sk AND ss_store_sk = s_store_sk
+    OUTPUT: i_manager_id, d_moy, ss_sales_price
+    EXPECTED_ROWS: 373K
+    CONSUMERS: aggregated_sales
+  aggregated_sales:
+    FROM: filtered_fact
+    GROUP BY: i_manager_id, d_moy
+    AGGREGATE: sum(ss_sales_price) AS sum_sales
+    OUTPUT: i_manager_id, d_moy, sum_sales
+    EXPECTED_ROWS: 1,200
+    CONSUMERS: windowed
+  windowed:
+    FROM: aggregated_sales
+    WINDOW: AVG(sum_sales) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales, d_moy
+    EXPECTED_ROWS: 1,200
+    CONSUMERS: filtered
+  filtered:
+    FROM: windowed
+    WHERE: CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: ordered
+  ordered:
+    FROM: filtered
+    ORDER BY: i_manager_id ASC, avg_monthly_sales ASC, sum_sales ASC
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: limited
+  limited:
+    FROM: ordered
+    LIMIT: 100
+    OUTPUT: i_manager_id, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: prefetch_fact_join (Q63), dimension_cte_isolate (Q26)
+EXAMPLE_ADAPTATION:
+- From prefetch_fact_join: apply pre-filtering of all dimensions.
+- From dimension_cte_isolate: use dimension CTEs to reduce fact table via join on surrogate keys.
+- IGNORE: the Cartesian product in dimension_keys; instead, use a semi-join approach: create a CTE with distinct composite key from filtered dimensions, then join with fact.
+HAZARD_FLAGS:
+- Cartesian product of dimension CTEs could explode (193M rows). Must instead use fact table as driver and semi-join on dimension keys? Actually, we want to reduce fact table by dimension keys. Better: create a CTE that is the set of distinct (date_sk, item_sk, store_sk) from the join of filtered dimensions? But dimensions are independent; their keys are independent. The intersection is the fact table rows that match all three. Could use INTERSECT of three subqueries? Too complex.
+- Alternative: use a WHERE EXISTS chain. Simpler: use the prefetch_fact_join pattern (Worker 1) but with a twist: create a single CTE that joins all three filtered dimensions together (cross join) to produce all possible key combos, then join with fact. But cross join may be huge.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination
+
+--- Revised Worker 4 strategy after reasoning: Use **early_filter** + **dimension_cte_isolate** but with a **semi-join** approach to reduce fact table scan. Actually, the prefetch_fact_join already does that. For exploration, try a different ordering: filter item first (most selective), then date, then store, and join with fact. That's similar to Worker 1 but with different CTE chain order. Or try **or_to_union** on item condition? Too risky. Instead, explore **deferred_window_aggregation** even though window is cheap, to see if separating window computation changes performance.
+
+Let's change Worker 4 to:
+
+STRATEGY: deferred_window_aggregation
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_item -> filtered_store -> prefetched_sales -> aggregated_sales -> manager_avg -> joined_avg -> filtered -> ordered -> limited
+NODE_CONTRACTS:
+  filtered_date, filtered_item, filtered_store: same as Worker 1.
+  prefetched_sales: same as Worker 1.
+  aggregated_sales: same as Worker 1 (output i_manager_id, d_moy, sum_sales).
+  manager_avg:
+    FROM: aggregated_sales
+    GROUP BY: i_manager_id
+    AGGREGATE: avg(sum_sales) AS avg_monthly_sales
+    OUTPUT: i_manager_id, avg_monthly_sales
+    EXPECTED_ROWS: number of distinct i_manager_id (~small)
+    CONSUMERS: joined_avg
+  joined_avg:
+    FROM: aggregated_sales
+    JOIN: INNER JOIN manager_avg USING (i_manager_id)
+    OUTPUT: i_manager_id, d_moy, sum_sales, avg_monthly_sales
+    EXPECTED_ROWS: 1,200
+    CONSUMERS: filtered
+  filtered, ordered, limited: same as Worker 1.
+
+EXAMPLES: deferred_window_aggregation (Q51)
+EXAMPLE_ADAPTATION:
+- Apply the deferred_window_aggregation pattern: compute window function (AVG) as a separate aggregation and join back, instead of using window function. Ignore that Q51 has FULL OUTER JOIN and cumulative sums; the principle of deferring window computation applies.
+HAZARD_FLAGS:
+- Adds an extra join and aggregation step; may be slower if window computation is cheap.
+- Must ensure manager_avg is computed from same aggregated_sales data as original window partition.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: The original query uses AVG(SUM(...)) OVER which is equivalent to AVG(sum_sales) per manager over the grouped rows. Splitting into two aggregations is semantically equivalent because the window partition and group by are aligned (i_manager_id is in GROUP BY). The window function over the grouped result is just an aggregation over the same groups.
+EXPLORATION_TYPE: compound_strategy (prefetch_fact_join + deferred_window_aggregation)

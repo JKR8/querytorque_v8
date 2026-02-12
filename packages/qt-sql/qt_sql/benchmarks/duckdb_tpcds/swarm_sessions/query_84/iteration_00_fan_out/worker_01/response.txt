@@ -1,0 +1,136 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  — CTE chain with staged dimension pre-filtering, final sort/limit
+    ├── [CTE] filtered_ca  [+]  Cost: 1%  Rows: 2,046  — Pre-filter customer_address by city
+    │   ├── SCAN customer_address
+    │   └── FILTER ca_city = 'Oakwood'
+    ├── [CTE] filtered_ib  [+]  Cost: 0%  Rows: 4  — Pre-filter income_band by bounds
+    │   ├── SCAN income_band
+    │   └── FILTER ib_lower_bound >= 5806 AND ib_upper_bound <= 55806
+    ├── [CTE] filtered_hd  [+]  Cost: 1%  Rows: ~1,440  — Join household_demographics to filtered income band keys
+    │   ├── SCAN household_demographics
+    │   ├── JOIN filtered_ib (hd_income_band_sk = ib_income_band_sk)
+    │   └── OUTPUT hd_demo_sk
+    ├── [CTE] filtered_c  [+]  Cost: 4%  Rows: ~795  — Join customer to filtered address and household demographics
+    │   ├── SCAN customer
+    │   ├── JOIN filtered_ca (c_current_addr_sk = ca_address_sk)
+    │   ├── JOIN filtered_hd (c_current_hdemo_sk = hd_demo_sk)
+    │   └── OUTPUT c_customer_id, c_first_name, c_last_name, c_current_cdemo_sk
+    ├── [CTE] filtered_cd  [+]  Cost: 4%  Rows: ~783  — Join customer_demographics to filtered customer
+    │   ├── SCAN customer_demographics
+    │   ├── JOIN filtered_c (cd_demo_sk = c_current_cdemo_sk)
+    │   └── OUTPUT cd_demo_sk, c_customer_id, c_first_name, c_last_name
+    ├── [CTE] sr_join  [+]  Cost: 90%  Rows: 1,158  — Join store_returns to filtered customer demographics
+    │   ├── SCAN filtered_cd
+    │   ├── SCAN store_returns
+    │   ├── JOIN sr_cdemo_sk = cd_demo_sk
+    │   └── OUTPUT c_customer_id, COALESCE(c_last_name,'') || ', ' || COALESCE(c_first_name,'') AS customername
+    ├── SORT (c_customer_id ASC)
+    ├── LIMIT 100
+    └── OUTPUT (customer_id, customername)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "dimension_cte_isolate",
+      "description": "Pre-filter dimension tables (customer_address, income_band, household_demographics, customer_demographics) into separate CTEs before fact table join",
+      "applied_to": ["filtered_ca", "filtered_ib", "filtered_hd", "filtered_c", "filtered_cd"]
+    },
+    {
+      "id": "R2",
+      "type": "prefetch_fact_join",
+      "description": "Build staged CTE chain that progressively reduces data before joining fact table (store_returns)",
+      "applied_to": ["sr_join", "main_query"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_ca": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_city = 'Oakwood'",
+          "interfaces": {
+            "outputs": ["ca_address_sk"],
+            "consumes": []
+          }
+        },
+        "filtered_ib": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ib_income_band_sk FROM income_band WHERE ib_lower_bound >= 5806 AND ib_upper_bound <= 55806",
+          "interfaces": {
+            "outputs": ["ib_income_band_sk"],
+            "consumes": []
+          }
+        },
+        "filtered_hd": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT hd_demo_sk FROM household_demographics hd INNER JOIN filtered_ib ib ON hd.hd_income_band_sk = ib.ib_income_band_sk",
+          "interfaces": {
+            "outputs": ["hd_demo_sk"],
+            "consumes": ["filtered_ib"]
+          }
+        },
+        "filtered_c": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT c_customer_id, c_first_name, c_last_name, c_current_cdemo_sk FROM customer c INNER JOIN filtered_ca ca ON c.c_current_addr_sk = ca.ca_address_sk INNER JOIN filtered_hd hd ON c.c_current_hdemo_sk = hd.hd_demo_sk",
+          "interfaces": {
+            "outputs": ["c_customer_id", "c_first_name", "c_last_name", "c_current_cdemo_sk"],
+            "consumes": ["filtered_ca", "filtered_hd"]
+          }
+        },
+        "filtered_cd": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT cd.cd_demo_sk, c.c_customer_id, c.c_first_name, c.c_last_name FROM customer_demographics cd INNER JOIN filtered_c c ON cd.cd_demo_sk = c.c_current_cdemo_sk",
+          "interfaces": {
+            "outputs": ["cd_demo_sk", "c_customer_id", "c_first_name", "c_last_name"],
+            "consumes": ["filtered_c"]
+          }
+        },
+        "sr_join": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT cd.c_customer_id, COALESCE(cd.c_last_name, '') || ', ' || COALESCE(cd.c_first_name, '') AS customername FROM filtered_cd cd INNER JOIN store_returns sr ON sr.sr_cdemo_sk = cd.cd_demo_sk",
+          "interfaces": {
+            "outputs": ["c_customer_id", "customername"],
+            "consumes": ["filtered_cd"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT c_customer_id AS customer_id, customername FROM sr_join ORDER BY c_customer_id ASC LIMIT 100",
+          "interfaces": {
+            "outputs": ["customer_id", "customername"],
+            "consumes": ["sr_join"]
+          }
+        }
+      },
+      "reconstruction_order": ["filtered_ca", "filtered_ib", "filtered_hd", "filtered_c", "filtered_cd", "sr_join", "main_query"],
+      "assembly_template": "WITH filtered_ca AS ({filtered_ca}), filtered_ib AS ({filtered_ib}), filtered_hd AS ({filtered_hd}), filtered_c AS ({filtered_c}), filtered_cd AS ({filtered_cd}), sr_join AS ({sr_join}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Structural change from single-query to staged CTE chain. Each dimension is pre-filtered in isolation before joining sequentially via foreign keys, creating small hash tables for the next join. The final fact table join (store_returns) probes only the filtered demographic keys from the preceding CTE.
+
+Expected speedup: ~1.5-2.0x. The baseline is 174ms; CTE overhead is minimal because each intermediate result is small (≤2k rows). The main gain comes from reducing the store_returns scan via precise cd_demo_sk list from filtered_cd, avoiding cross-CTE predicate blindness.

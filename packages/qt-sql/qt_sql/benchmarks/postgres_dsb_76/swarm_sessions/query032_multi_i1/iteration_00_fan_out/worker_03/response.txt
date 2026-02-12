@@ -1,0 +1,86 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE-structured rewrite)
+└── [~] main_query
+    ├── [+] filtered_dates
+    │   ├── SCAN date_dim
+    │   └── FILTER d_date BETWEEN '1998-01-06' AND '1998-01-06'::date + interval '90 day'
+    ├── [+] sales_date_join
+    │   ├── JOIN catalog_sales ↔ filtered_dates ON d_date_sk = cs_sold_date_sk
+    │   └── OUTPUT cs_item_sk, cs_ext_discount_amt, cs_sold_date_sk, cs_list_price, cs_sales_price
+    ├── [+] threshold_compute
+    │   ├── FROM sales_date_join
+    │   ├── FILTER cs_list_price BETWEEN 108 AND 137 AND cs_sales_price/cs_list_price BETWEEN 0.23 AND 0.43
+    │   ├── GROUP BY cs_item_sk
+    │   └── AGGREGATE threshold = 1.3 * avg(cs_ext_discount_amt)
+    ├── [+] main_join
+    │   ├── JOIN sales_date_join ↔ item ON i_item_sk = cs_item_sk
+    │   ├── JOIN sales_date_join ↔ threshold_compute ON cs_item_sk
+    │   ├── FILTER (i_manufact_id IN (47, 226, 612, 676, 818) OR i_manager_id BETWEEN 71 AND 100)
+    │   └── FILTER cs_ext_discount_amt > threshold
+    └── [+] final_aggregate
+        ├── AGGREGATE sum(cs_ext_discount_amt)
+        ├── ORDER BY sum(cs_ext_discount_amt) ASC
+        └── LIMIT 100
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "shared_materialization", "description": "Materialize shared catalog_sales+date_dim scan once in CTE", "applied_to": ["sales_date_join"]},
+    {"id": "R2", "type": "decorrelation", "description": "Replace correlated subquery with CTE-based threshold per item", "applied_to": ["threshold_compute"]},
+    {"id": "R3", "type": "logical_reordering", "description": "Apply item filter after threshold join to preserve semantics", "applied_to": ["main_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN '1998-01-06' AND cast('1998-01-06' as date) + interval '90 day'",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "sales_date_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cs_item_sk, cs_ext_discount_amt, cs_sold_date_sk, cs_list_price, cs_sales_price FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["cs_item_sk", "cs_ext_discount_amt", "cs_sold_date_sk", "cs_list_price", "cs_sales_price"], "consumes": ["filtered_dates"]}
+      },
+      "threshold_compute": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cs_item_sk, 1.3 * avg(cs_ext_discount_amt) AS threshold FROM sales_date_join WHERE cs_list_price BETWEEN 108 AND 137 AND cs_sales_price / cs_list_price BETWEEN 23 * 0.01 AND 43 * 0.01 GROUP BY cs_item_sk",
+        "interfaces": {"outputs": ["cs_item_sk", "threshold"], "consumes": ["sales_date_join"]}
+      },
+      "main_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s.cs_ext_discount_amt FROM sales_date_join s JOIN item ON i_item_sk = s.cs_item_sk JOIN threshold_compute t ON s.cs_item_sk = t.cs_item_sk WHERE (i_manufact_id IN (47, 226, 612, 676, 818) OR i_manager_id BETWEEN 71 AND 100) AND s.cs_ext_discount_amt > t.threshold",
+        "interfaces": {"outputs": ["cs_ext_discount_amt"], "consumes": ["sales_date_join", "threshold_compute"]}
+      },
+      "final_aggregate": {
+        "type": "main_query",
+        "change": "new",
+        "sql": "SELECT SUM(cs_ext_discount_amt) AS \"excess discount amount\" FROM main_join ORDER BY SUM(cs_ext_discount_amt) ASC LIMIT 100",
+        "interfaces": {"outputs": ["excess discount amount"], "consumes": ["main_join"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "sales_date_join", "threshold_compute", "main_join", "final_aggregate"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), sales_date_join AS ({sales_date_join}), threshold_compute AS ({threshold_compute}), main_join AS ({main_join}) {final_aggregate}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Decomposed original comma-join query into explicit CTEs that materialize the shared date range scan once, computed the threshold per item in a separate CTE, and applied item filters after threshold join to match original semantics.
+
+**Expected speedup**: 2-3x from eliminating redundant scans and enabling parallel plans (though CTE materialization may limit parallelism). The main gain is from computing the threshold once per item instead of per-row correlated execution.

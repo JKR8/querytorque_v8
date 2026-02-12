@@ -1,0 +1,92 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Rewritten to use CTE structure matching target logical tree
+    ├── [CTE] filtered_dates  [+]
+    ├── [CTE] filtered_stores  [+]
+    ├── [CTE] joined_fact  [+]
+    ├── [CTE] aggregated_base  [+]
+    ├── [CTE] top_states  [+]
+    ├── [CTE] final_rollup  [+]
+    ├── [CTE] windowed  [+]
+    ├── SORT (lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN s_state END ASC, rank_within_parent ASC)
+    └── OUTPUT (total_sum, s_state, s_county, lochierarchy, rank_within_parent)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "cte_decomposition", "description": "Decomposed original query into CTEs following target logical tree", "applied_to": ["filtered_dates", "filtered_stores", "joined_fact", "aggregated_base", "top_states", "final_rollup", "windowed"]},
+    {"id": "R2", "type": "single_pass_aggregation", "description": "Consolidated top states subquery into CTE that shares same filtered fact data", "applied_to": ["top_states"]},
+    {"id": "R3", "type": "predicate_pushdown", "description": "Pushed date and store filters early into CTEs for columnar scan efficiency", "applied_to": ["filtered_dates", "filtered_stores"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1213 AND 1224",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_stores": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_store_sk, s_state, s_county FROM store",
+        "interfaces": {"outputs": ["s_store_sk", "s_state", "s_county"], "consumes": []}
+      },
+      "joined_fact": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss.ss_net_profit, fs.s_state, fs.s_county FROM store_sales ss INNER JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk INNER JOIN filtered_stores fs ON ss.ss_store_sk = fs.s_store_sk",
+        "interfaces": {"outputs": ["ss_net_profit", "s_state", "s_county"], "consumes": ["filtered_dates", "filtered_stores"]}
+      },
+      "aggregated_base": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_state, s_county, SUM(ss_net_profit) AS state_county_sum FROM joined_fact GROUP BY s_state, s_county",
+        "interfaces": {"outputs": ["s_state", "s_county", "state_county_sum"], "consumes": ["joined_fact"]}
+      },
+      "top_states": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_state, SUM(state_county_sum) AS state_sum, RANK() OVER (ORDER BY SUM(state_county_sum) DESC) AS ranking FROM aggregated_base GROUP BY s_state",
+        "interfaces": {"outputs": ["s_state", "state_sum", "ranking"], "consumes": ["aggregated_base"]}
+      },
+      "final_rollup": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT SUM(ab.state_county_sum) AS total_sum, ab.s_state, ab.s_county, GROUPING(ab.s_state) + GROUPING(ab.s_county) AS lochierarchy FROM aggregated_base ab INNER JOIN top_states ts ON ab.s_state = ts.s_state WHERE ts.ranking <= 5 GROUP BY ROLLUP(ab.s_state, ab.s_county)",
+        "interfaces": {"outputs": ["total_sum", "s_state", "s_county", "lochierarchy"], "consumes": ["aggregated_base", "top_states"]}
+      },
+      "windowed": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT total_sum, s_state, s_county, lochierarchy, RANK() OVER (PARTITION BY lochierarchy, CASE WHEN GROUPING(s_county) = 0 THEN s_state END ORDER BY total_sum DESC) AS rank_within_parent FROM final_rollup",
+        "interfaces": {"outputs": ["total_sum", "s_state", "s_county", "lochierarchy", "rank_within_parent"], "consumes": ["final_rollup"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT total_sum, s_state, s_county, lochierarchy, rank_within_parent FROM windowed ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN s_state END, rank_within_parent LIMIT 100",
+        "interfaces": {"outputs": ["total_sum", "s_state", "s_county", "lochierarchy", "rank_within_parent"], "consumes": ["windowed"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_stores", "joined_fact", "aggregated_base", "top_states", "final_rollup", "windowed", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), filtered_stores AS ({filtered_stores}), joined_fact AS ({joined_fact}), aggregated_base AS ({aggregated_base}), top_states AS ({top_states}), final_rollup AS ({final_rollup}), windowed AS ({windowed}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Decomposed original query into CTEs matching target logical tree, pushing date/store filters early and sharing aggregated_base between top_states and final_rollup to eliminate redundant fact table scans.
+
+**Expected speedup**: ~2-3x from predicate pushdown and single fact table scan (original had store_sales scanned twice - once in main query, once in subquery).

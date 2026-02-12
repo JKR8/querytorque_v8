@@ -1,0 +1,117 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_cte  [+]
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_month_seq BETWEEN 1216 AND 1216+11)
+│   └── OUTPUT (d_date_sk, d_date)
+├── [CTE] web_prejoin  [+]
+│   ├── SCAN (web_sales, date_cte (join))
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── FILTER (NOT ws_item_sk IS NULL)
+│   └── OUTPUT (ws_item_sk, d_date, ws_sales_price)
+├── [CTE] web_daily  [+]
+│   ├── SCAN (web_prejoin)
+│   ├── AGG (GROUP BY ws_item_sk, d_date)
+│   └── OUTPUT (ws_item_sk, d_date, daily_web)
+├── [CTE] store_prejoin  [+]
+│   ├── SCAN (store_sales, date_cte (join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (NOT ss_item_sk IS NULL)
+│   └── OUTPUT (ss_item_sk, d_date, ss_sales_price)
+├── [CTE] store_daily  [+]
+│   ├── SCAN (store_prejoin)
+│   ├── AGG (GROUP BY ss_item_sk, d_date)
+│   └── OUTPUT (ss_item_sk, d_date, daily_store)
+├── [CTE] combined  [+]
+│   ├── SCAN (web_daily, store_daily (join))
+│   ├── JOIN FULL OUTER (ws_item_sk = ss_item_sk AND d_date = d_date)
+│   └── OUTPUT (item_sk, d_date, daily_web, daily_store)
+├── [CTE] cumulative  [+]
+│   ├── SCAN (combined)
+│   ├── WINDOW (PARTITION BY item_sk ORDER BY d_date)
+│   └── OUTPUT (item_sk, d_date, web_sales, store_sales, web_cumulative, store_cumulative)
+└── [MAIN] main_query  [~]
+    ├── SCAN (cumulative)
+    ├── FILTER (web_cumulative > store_cumulative)
+    ├── SORT (item_sk ASC, d_date ASC)
+    └── OUTPUT (*)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "prefetch_fact_join", "description": "Isolate filtered date dimension first, then pre-join with fact tables before aggregation", "applied_to": ["date_cte", "web_prejoin", "store_prejoin"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Pre-filter date_dim into tiny CTE before joining with large fact tables", "applied_to": ["date_cte"]},
+    {"id": "R3", "type": "early_filter", "description": "Apply date filter to dimension table first to reduce fact table scans", "applied_to": ["date_cte"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1216 AND 1216+11",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "web_prejoin": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_item_sk, d_date, ws_sales_price FROM web_sales INNER JOIN date_cte ON ws_sold_date_sk = d_date_sk WHERE ws_item_sk IS NOT NULL",
+        "interfaces": {"outputs": ["ws_item_sk", "d_date", "ws_sales_price"], "consumes": ["date_cte"]}
+      },
+      "web_daily": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_item_sk, d_date, SUM(ws_sales_price) AS daily_web FROM web_prejoin GROUP BY ws_item_sk, d_date",
+        "interfaces": {"outputs": ["ws_item_sk", "d_date", "daily_web"], "consumes": ["web_prejoin"]}
+      },
+      "store_prejoin": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk, d_date, ss_sales_price FROM store_sales INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk WHERE ss_item_sk IS NOT NULL",
+        "interfaces": {"outputs": ["ss_item_sk", "d_date", "ss_sales_price"], "consumes": ["date_cte"]}
+      },
+      "store_daily": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk, d_date, SUM(ss_sales_price) AS daily_store FROM store_prejoin GROUP BY ss_item_sk, d_date",
+        "interfaces": {"outputs": ["ss_item_sk", "d_date", "daily_store"], "consumes": ["store_prejoin"]}
+      },
+      "combined": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT COALESCE(w.ws_item_sk, s.ss_item_sk) AS item_sk, COALESCE(w.d_date, s.d_date) AS d_date, w.daily_web, s.daily_store FROM web_daily w FULL OUTER JOIN store_daily s ON w.ws_item_sk = s.ss_item_sk AND w.d_date = s.d_date",
+        "interfaces": {"outputs": ["item_sk", "d_date", "daily_web", "daily_store"], "consumes": ["web_daily", "store_daily"]}
+      },
+      "cumulative": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT item_sk, d_date, daily_web AS web_sales, daily_store AS store_sales, SUM(daily_web) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS web_cumulative, SUM(daily_store) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS store_cumulative FROM combined",
+        "interfaces": {"outputs": ["item_sk", "d_date", "web_sales", "store_sales", "web_cumulative", "store_cumulative"], "consumes": ["combined"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT * FROM cumulative WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100",
+        "interfaces": {"outputs": ["item_sk", "d_date", "web_sales", "store_sales", "web_cumulative", "store_cumulative"], "consumes": ["cumulative"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "web_prejoin", "web_daily", "store_prejoin", "store_daily", "combined", "cumulative", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), web_prejoin AS ({web_prejoin}), web_daily AS ({web_daily}), store_prejoin AS ({store_prejoin}), store_daily AS ({store_daily}), combined AS ({combined}), cumulative AS ({cumulative}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured from two monolithic cumulative CTEs to a staged pipeline: filter dates first, pre-join with fact tables, compute daily aggregates, then compute running totals. This applies prefetch_fact_join, dimension_cte_isolate, and early_filter patterns.
+
+**Expected speedup**: ~3-4x (by reducing fact table scans via early date filtering and avoiding materialization of window aggregates before the join).

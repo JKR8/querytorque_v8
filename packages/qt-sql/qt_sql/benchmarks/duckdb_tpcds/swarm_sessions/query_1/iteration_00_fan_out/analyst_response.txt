@@ -1,0 +1,303 @@
+<reasoning>
+1. **CLASSIFY**: This query is a "correlated-aggregate filter" archetype. It has:
+   - A CTE aggregating fact data (store_returns) filtered by dimension (date_dim)
+   - A main query with a correlated subquery computing per-store averages
+   - Late dimension filtering (store.s_state='SD') applied after the CTE
+   - Multiple references to the same CTE (ctr1 and ctr2)
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - **Total runtime**: 0.113s
+   - **Bottlenecks**:
+     1. `TABLE_SCAN store_returns`: 0.71s (63% of total) → 557,705 rows
+     2. `HASH_GROUP_BY` in CTE: 0.19s (17% of total) → 539,331 rows
+     3. `HASH_JOIN` with customer: 0.02s → 157,785 rows
+   - **Row count drops**:
+     - store_returns scan: 557,705 rows
+     - After date_dim filter: 557,705 rows (no reduction before join)
+     - After CTE aggregation: 539,331 rows
+     - After store filter (s_state='SD'): 157,800 rows (70% reduction)
+     - After subquery filter: 61,974 rows (60% reduction)
+     - After customer join: 157,785 rows (wait, this increases? Must be EXPLAIN display order)
+   - **Optimizer already does**:
+     - Decorrelates the subquery into `LEFT_DELIM_JOIN` with pre-computed store averages
+     - Materializes the CTE (referenced twice)
+     - Pushes date filter into date_dim scan
+   - **Scans per table**:
+     - store_returns: 1 scan (in CTE)
+     - date_dim: 1 scan (in CTE)
+     - store: 1 scan (filtered by s_state='SD')
+     - customer: 1 scan
+   - **CTE materialization**: CTE is materialized once (CTE_SCAN appears twice in plan)
+
+3. **GAP MATCHING**:
+   - **CORRELATED_SUBQUERY_PARALYSIS**: Already decorrelated by optimizer (LEFT_DELIM_JOIN)
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: Store filter (s_state='SD') applied AFTER CTE computation. The CTE processes ALL stores, then 70% are filtered out. This is the main gap.
+   - **REDUNDANT_SCAN_ELIMINATION**: Only 1 scan per table, no redundancy.
+   - **Engine Strengths already handle**: Intra-scan predicate pushdown (date filter), CTE inlining (materialized for multi-reference), hash join selection.
+
+4. **AGGREGATION TRAP CHECK**: Only SUM and AVG aggregates. Both are grouping-insensitive to duplicates. The CTE groups by (customer,store). The subquery groups by store. No FILTER clauses. Safe to restructure.
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   a. **star_join_prefetch** (multi_dimension_prefetch): Pre-filter store by s_state='SD' and date_dim by d_year=2000 BEFORE the fact table join. Expected high value because store filter removes 70% of CTE rows.
+   b. **decorrelation** (decorrelate): Already done by optimizer, but we can make it explicit with a separate store_averages CTE. Low risk.
+   c. **late_attribute_binding**: Defer customer join until after all filtering (customer only provides c_customer_id for output). Medium value.
+   d. **novel combination**: Combine pre-filtering with window function to compute store averages in single pass.
+
+6. **LOGICAL TREE DESIGN**:
+   For star_join_prefetch: Create filtered dimension CTEs (store_sd, date_2000), pre-join with store_returns, then aggregate, then compute store averages, then filter.
+   Must ensure CTE column completeness: store_sd must output s_store_sk; date_2000 must output d_date_sk; etc.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Find South Dakota customers whose total 2000 store-return fees at a given store exceed 120% of that store's average customer return total. All joins are INNER (intersection) requiring matches on both sides. Aggregates are SUM and AVG without FILTER clauses, safe to restructure. The store filter (s_state='SD') depends only on store table and can be pushed before fact table joins.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: store_returns table scan dominates (0.71s, 63% runtime). The CTE processes 557,705 rows from store_returns, aggregates to 539,331 rows, then 70% are discarded by the late store filter (s_state='SD'). Cardinality flow: store_returns 557k → CTE 539k → store filter 158k → subquery filter 62k → customer join → limit 100. Optimizer already decorrelates subquery (LEFT_DELIM_JOIN) and materializes CTE for multi-reference. Logical-tree cost percentages misleading: CTE shows 50% cost but actual time is 0.19s vs store_returns scan 0.71s.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output exactly c_customer_id ordered ascending.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (store_sk, customer_sk, total_return).
+- LITERAL_PRESERVATION: Must preserve d_year=2000, s_state='SD', multiplier 1.2.
+- SEMANTIC_EQUIVALENCE: Must return same 100 customer IDs in same order.
+- CROSS_CTE_PREDICATE_BLINDNESS: Store filter applied after CTE materialization (EXPLAIN shows store filter in separate HASH_JOIN after CTE_SCAN).
+- GLOBAL GUARD RAIL #5: Baseline 0.113s (<100ms) suggests CTE overhead could dominate; but store filter reduces CTE rows 70%, worth testing.
+
+REGRESSION_WARNINGS:
+1. regression_q1_decorrelate (0.71x):
+   CAUSE: Pre-aggregating GROUP BY into CTEs when query uses correlated comparison loses incremental filter pushdown.
+   RULE: Do NOT create separate store_averages CTE unless we also push store filter into the CTE to reduce aggregation input.
+2. regression_q25_date_cte_isolate (0.5x):
+   CAUSE: Pre-filtering fact table before multi-way joins prevents optimizer reordering.
+   RULE: This query has only one fact table (store_returns), so pre-filtering safe.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  store_sd -> date_2000 -> prefiltered_returns -> customer_store_totals -> store_averages -> filtered_totals -> customer_join -> limit
+NODE_CONTRACTS:
+  store_sd:
+    FROM: store
+    WHERE: s_state = 'SD'
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 35
+    CONSUMERS: prefiltered_returns
+  date_2000:
+    FROM: date_dim
+    WHERE: d_year = 2000
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 366
+    CONSUMERS: prefiltered_returns
+  prefiltered_returns:
+    FROM: store_returns
+    JOIN: sr_returned_date_sk = date_2000.d_date_sk AND sr_store_sk = store_sd.s_store_sk
+    OUTPUT: sr_customer_sk, sr_store_sk, sr_fee
+    EXPECTED_ROWS: ~19,500 (est. 3.5% of 557,705)
+    CONSUMERS: customer_store_totals
+  customer_store_totals:
+    FROM: prefiltered_returns
+    GROUP BY: sr_customer_sk, sr_store_sk
+    AGGREGATE: SUM(sr_fee) AS ctr_total_return
+    OUTPUT: sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, ctr_total_return
+    EXPECTED_ROWS: ~19,000
+    CONSUMERS: store_averages, filtered_totals
+  store_averages:
+    FROM: customer_store_totals
+    GROUP BY: ctr_store_sk
+    AGGREGATE: AVG(ctr_total_return) AS store_avg_return
+    OUTPUT: ctr_store_sk, store_avg_return
+    EXPECTED_ROWS: ~35
+    CONSUMERS: filtered_totals
+  filtered_totals:
+    FROM: customer_store_totals AS ctr1
+    JOIN: store_averages ON ctr1.ctr_store_sk = store_averages.ctr_store_sk
+    WHERE: ctr1.ctr_total_return > store_averages.store_avg_return * 1.2
+    OUTPUT: ctr_customer_sk, ctr_store_sk
+    EXPECTED_ROWS: ~7,500 (est. 40% of 19,000)
+    CONSUMERS: customer_join
+  customer_join:
+    FROM: filtered_totals
+    JOIN: customer ON ctr_customer_sk = c_customer_sk
+    OUTPUT: c_customer_id
+    EXPECTED_ROWS: ~7,500
+    CONSUMERS: limit
+  limit:
+    FROM: customer_join
+    ORDER BY: c_customer_id ASC
+    LIMIT: 100
+    OUTPUT: c_customer_id
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: multi_dimension_prefetch, prefetch_fact_join, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- multi_dimension_prefetch: Apply pre-filtering of both store and date dimensions before fact table join; ignore the multi-channel aspect.
+- prefetch_fact_join: Build CTE chain filtering dimensions first, then join with fact; ignore the cascading fact-table chains (this query has one fact).
+- date_cte_isolate: Extract date filter into CTE; ignore warning about baseline <100ms (store filter reduction justifies).
+HAZARD_FLAGS:
+- Overhead of multiple CTEs may outweigh benefit on small dataset (0.113s baseline).
+- Must ensure store_sd CTE includes s_store_sk for join with store_returns.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: decorrelation_explicit
+TARGET_LOGICAL_TREE:
+  customer_total_return -> store_averages -> main_join -> customer -> limit
+NODE_CONTRACTS:
+  customer_total_return:
+    FROM: store_returns, date_dim
+    JOIN: sr_returned_date_sk = d_date_sk
+    WHERE: d_year = 2000
+    GROUP BY: sr_customer_sk, sr_store_sk
+    AGGREGATE: SUM(sr_fee) AS ctr_total_return
+    OUTPUT: sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, ctr_total_return
+    EXPECTED_ROWS: 539,331
+    CONSUMERS: store_averages, main_join
+  store_averages:
+    FROM: customer_total_return
+    GROUP BY: ctr_store_sk
+    AGGREGATE: AVG(ctr_total_return) AS store_avg_return
+    OUTPUT: ctr_store_sk, store_avg_return
+    EXPECTED_ROWS: 15
+    CONSUMERS: main_join
+  main_join:
+    FROM: customer_total_return AS ctr1, store, store_averages
+    JOIN: s_store_sk = ctr1.ctr_store_sk AND ctr1.ctr_store_sk = store_averages.ctr_store_sk
+    WHERE: s_state = 'SD' AND ctr1.ctr_total_return > store_averages.store_avg_return * 1.2
+    OUTPUT: ctr_customer_sk
+    EXPECTED_ROWS: 61,974
+    CONSUMERS: customer
+  customer:
+    FROM: main_join
+    JOIN: customer ON ctr_customer_sk = c_customer_sk
+    OUTPUT: c_customer_id
+    EXPECTED_ROWS: 61,974
+    CONSUMERS: limit
+  limit:
+    FROM: customer
+    ORDER BY: c_customer_id ASC
+    LIMIT: 100
+    OUTPUT: c_customer_id
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: decorrelate, materialize_cte
+EXAMPLE_ADAPTATION:
+- decorrelate: Convert correlated subquery to separate CTE with GROUP BY, then JOIN; must preserve store filter in main join (not in CTE).
+- materialize_cte: Extract repeated subquery pattern (store average) into CTE; ignore warning about EXISTS (this is aggregate, not EXISTS).
+HAZARD_FLAGS:
+- Does not reduce CTE size (still processes all stores). May regress like regression_q1_decorrelate.
+- Must ensure store filter (s_state='SD') stays in main_join, not pushed into CTE (preserves semantics).
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+  customer_total_return_filtered -> store_averages -> filtered_ids -> customer_lookup -> limit
+NODE_CONTRACTS:
+  customer_total_return_filtered:
+    FROM: store_returns, date_dim, store
+    JOIN: sr_returned_date_sk = d_date_sk AND sr_store_sk = s_store_sk
+    WHERE: d_year = 2000 AND s_state = 'SD'
+    GROUP BY: sr_customer_sk, sr_store_sk
+    AGGREGATE: SUM(sr_fee) AS ctr_total_return
+    OUTPUT: sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, ctr_total_return
+    EXPECTED_ROWS: 157,800
+    CONSUMERS: store_averages, filtered_ids
+  store_averages:
+    FROM: customer_total_return_filtered
+    GROUP BY: ctr_store_sk
+    AGGREGATE: AVG(ctr_total_return) AS store_avg_return
+    OUTPUT: ctr_store_sk, store_avg_return
+    EXPECTED_ROWS: 35
+    CONSUMERS: filtered_ids
+  filtered_ids:
+    FROM: customer_total_return_filtered AS ctr1
+    JOIN: store_averages ON ctr1.ctr_store_sk = store_averages.ctr_store_sk
+    WHERE: ctr1.ctr_total_return > store_averages.store_avg_return * 1.2
+    OUTPUT: ctr_customer_sk
+    EXPECTED_ROWS: 61,974
+    CONSUMERS: customer_lookup
+  customer_lookup:
+    FROM: filtered_ids
+    JOIN: customer ON ctr_customer_sk = c_customer_sk
+    OUTPUT: c_customer_id
+    EXPECTED_ROWS: 61,974
+    CONSUMERS: limit
+  limit:
+    FROM: customer_lookup
+    ORDER BY: c_customer_id ASC
+    LIMIT: 100
+    OUTPUT: c_customer_id
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Pre-filter store and date dimensions, but combine them into single CTE with fact join; ignore warning about cross-joining dimension CTEs.
+- early_filter: Filter dimension tables (store, date_dim) first, then join to fact table; apply to both dimensions simultaneously.
+HAZARD_FLAGS:
+- Combining store filter into CTE reduces rows but may prevent optimizer from reordering joins (only one fact table, safe).
+- Must ensure date_dim join remains in CTE (required for d_year filter).
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: window_single_pass
+TARGET_LOGICAL_TREE:
+  store_sd -> date_2000 -> prefiltered_returns -> window_aggregates -> filtered_customers -> customer_lookup -> limit
+NODE_CONTRACTS:
+  store_sd:
+    FROM: store
+    WHERE: s_state = 'SD'
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 35
+    CONSUMERS: prefiltered_returns
+  date_2000:
+    FROM: date_dim
+    WHERE: d_year = 2000
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 366
+    CONSUMERS: prefiltered_returns
+  prefiltered_returns:
+    FROM: store_returns
+    JOIN: sr_returned_date_sk = date_2000.d_date_sk AND sr_store_sk = store_sd.s_store_sk
+    OUTPUT: sr_customer_sk, sr_store_sk, sr_fee
+    EXPECTED_ROWS: ~19,500
+    CONSUMERS: window_aggregates
+  window_aggregates:
+    FROM: prefiltered_returns
+    GROUP BY: sr_customer_sk, sr_store_sk
+    AGGREGATE: 
+      SUM(sr_fee) AS ctr_total_return,
+      AVG(SUM(sr_fee)) OVER (PARTITION BY sr_store_sk) AS store_avg_return
+    OUTPUT: sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, ctr_total_return, store_avg_return
+    EXPECTED_ROWS: ~19,000
+    CONSUMERS: filtered_customers
+  filtered_customers:
+    FROM: window_aggregates
+    WHERE: ctr_total_return > store_avg_return * 1.2
+    OUTPUT: ctr_customer_sk
+    EXPECTED_ROWS: ~7,500
+    CONSUMERS: customer_lookup
+  customer_lookup:
+    FROM: filtered_customers
+    JOIN: customer ON ctr_customer_sk = c_customer_sk
+    OUTPUT: c_customer_id
+    EXPECTED_ROWS: ~7,500
+    CONSUMERS: limit
+  limit:
+    FROM: customer_lookup
+    ORDER BY: c_customer_id ASC
+    LIMIT: 100
+    OUTPUT: c_customer_id
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: single_pass_aggregation, deferred_window_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Consolidate aggregation and store average computation into single GROUP BY with window function; ignore the multiple subquery consolidation (this query has one).
+- deferred_window_aggregation: Compute window function (store average) after filtering; but here window is computed in same step as aggregation (cannot defer).
+HAZARD_FLAGS:
+- Window function computed per store may add overhead for large groups.
+- Must ensure window function AVG(SUM(...)) OVER is correct semantically (same as separate GROUP BY).
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (combines star_join_prefetch with window function for single-pass store average computation)

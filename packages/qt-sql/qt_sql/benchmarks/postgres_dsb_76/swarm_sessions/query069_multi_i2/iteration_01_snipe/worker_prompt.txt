@@ -1,0 +1,987 @@
+You are a senior SQL optimization architect for PostgreSQL v16.11-0ubuntu0.24.04.1). You have FULL FREEDOM to design your own approach — you are NOT constrained to any specific logical tree topology or CTE structure. Your job: diagnose WHY previous workers failed to reach 2.0x, identify unexplored optimization angles, and produce an optimized SQL rewrite that reaches the target.
+
+Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — guards prevent silent breakage. Strip benchmark comments (-- start query, -- end query) from output.
+
+## Target: >=2.0x speedup
+
+Your target is >=2.0x speedup on this query. This is the bar. Anything below 2.0x is a miss.
+
+## Previous Optimization Attempts
+Target: **>=2.0x** | 4 workers tried | none reached target
+
+### W1: star_join_prefetch → 0.7485842061264555x ★ BEST [ERROR]
+- **Examples**: pg_dimension_prefetch_star, pg_date_cte_explicit_join, early_filter_decorrelate
+- **Transforms**: date_cte_isolate
+- **Approach**: - pg_dimension_prefetch_star: Apply pre-filtering of address and demographics in
+- **Error**: INTERFACE: [store_exists] declares outputs ['c_customer_sk', 'cd_credit_rating', 'cd_education_status', 'cd_gender', 'cd_marital_status', 'cd_purchase_estimate'] but SELECT only produces ['*'] | INTERFACE: [store_exists] SELECT produces ['*'] not declared in outputs | INTERFACE: [web_not_exists] declares outputs ['c_customer_sk', 'cd_credit_rating', 'cd_education_status', 'cd_gender', 'cd_marital_status', 'cd_purchase_estimate'] but SELECT only produces ['*'] | INTERFACE: [web_not_exists] SELECT produces ['*'] not declared in outputs | INTERFACE: [catalog_not_exists] declares outputs ['c_customer_sk', 'cd_credit_rating', 'cd_education_status', 'cd_gender', 'cd_marital_status', 'cd_purchase_estimate'] but SELECT only produces ['*'] | INTERFACE: [catalog_not_exists] SELECT produces ['*'] not declared in outputs
+- **Optimized SQL:**
+```sql
+WITH filtered_address AS (SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('GA','KY','SD')), filtered_demo AS (SELECT cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating FROM customer_demographics WHERE cd_marital_status IN ('D','W','U') AND cd_education_status IN ('Primary','College')), filtered_date AS (SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy BETWEEN 3 AND 5), customer_base AS (SELECT c.c_customer_sk, fd.cd_gender, fd.cd_marital_status, fd.cd_education_status, fd.cd_purchase_estimate, fd.cd_credit_rating FROM customer c INNER JOIN filtered_address fa ON c.c_current_addr_sk = fa.ca_address_sk INNER JOIN filtered_demo fd ON c.c_current_cdemo_sk = fd.cd_demo_sk), store_sales_filtered AS (SELECT ss_customer_sk FROM store_sales INNER JOIN filtered_date fd ON ss_sold_date_sk = fd.d_date_sk WHERE ss_list_price BETWEEN 52 AND 141), store_exists AS (SELECT cb.* FROM customer_base cb WHERE EXISTS (SELECT 1 FROM store_sales_filtered ssf WHERE ssf.ss_customer_sk = cb.c_customer_sk)), web_sales_filtered AS (SELECT ws_bill_customer_sk FROM web_sales INNER JOIN filtered_date fd ON ws_sold_date_sk = fd.d_date_sk WHERE ws_list_price BETWEEN 52 AND 141), web_not_exists AS (SELECT se.* FROM store_exists se WHERE NOT EXISTS (SELECT 1 FROM web_sales_filtered wsf WHERE wsf.ws_bill_customer_sk = se.c_customer_sk)), catalog_sales_filtered AS (SELECT cs_ship_customer_sk FROM catalog_sales INNER JOIN filtered_date fd ON cs_sold_date_sk = fd.d_date_sk WHERE cs_list_price BETWEEN 52 AND 141), catalog_not_exists AS (SELECT wne.* FROM web_not_exists wne WHERE NOT EXISTS (SELECT 1 FROM catalog_sales_filtered csf WHERE csf.cs_ship_customer_sk = wne.c_customer_sk)) SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3 FROM catalog_not_exists GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating LIMIT 100
+```
+- **Execution Plan (EXPLAIN ANALYZE):**
+```
+Limit  (rows=80, time=538.163)
+  Index Only Scan on date_dim  (rows=92, time=0.126)
+  Aggregate  (rows=80, time=538.158)
+    Sort  (rows=914, time=538.06)
+      Hash Join  (rows=914, time=537.439)
+        Hash Join  (rows=986, time=412.019)
+          Hash Join  (rows=1011, time=349.3)
+            Gather  (rows=13551, time=95.959)
+              Hash Join  (rows=4517, time=102.841)
+                Seq Scan on customer_demographics  (rows=109760, time=54.572)
+                Hash  (rows=18082, time=37.101)
+                  Hash Join  (rows=18082, time=34.639)
+                    Seq Scan on customer (c)  (rows=166667, time=12.627)
+                    Hash  (rows=9018, time=10.05)
+                      Seq Scan on customer_address  (rows=9018, time=9.065)
+            Hash  (rows=487842, time=237.963)
+              Nested Loop  (rows=493555, time=202.171)
+                CTE Scan (fd)  (rows=92, time=0.217)
+                Index Only Scan on store_sales  (rows=5365, time=1.992)
+          Hash  (rows=91169, time=60.646)
+            Nested Loop  (rows=91174, time=53.61)
+              CTE Scan (fd_1)  (rows=92, time=0.026)
+              Index Scan on web_sales  (rows=991, time=0.545)
+        Hash  (rows=214665, time=120.032)
+          Nested Loop  (rows=214907, time=103.804)
+            CTE Scan (fd_2)  (rows=92, time=0.037)
+            Index Scan on catalog_sales  (rows=2336, time=1.037)
+```
+
+### W2: decorrelation_consolidation → 0.645399265264245x [ERROR]
+- **Examples**: decorrelate, single_pass_aggregation, pg_materialized_dimension_fact_prefilter
+- **Transforms**: date_cte_isolate
+- **Approach**: - decorrelate: Decouple correlated subqueries by pre-computing customer sets per
+- **Error**: INTERFACE: [channel_joins] declares outputs ['c_customer_sk', 'cd_credit_rating', 'cd_education_status', 'cd_gender', 'cd_marital_status', 'cd_purchase_estimate'] but SELECT only produces ['*', 'has_catalog', 'has_store', 'has_web'] | INTERFACE: [channel_joins] SELECT produces ['*'] not declared in outputs | INTERFACE: [channel_joins] references 'customer_base.*' but [customer_base] only provides ['c_customer_sk', 'cd_credit_rating', 'cd_education_status', 'cd_gender', 'cd_marital_status', 'cd_purchase_estimate'] | INTERFACE: [channel_joins] references customer_base.* but [customer_base] only provides ['c_customer_sk', 'cd_credit_rating', 'cd_education_status', 'cd_gender', 'cd_marital_status', 'cd_purchase_estimate']
+- **Optimized SQL:**
+```sql
+WITH filtered_date AS (SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy BETWEEN 3 AND 5), store_customers AS (SELECT DISTINCT ss_customer_sk FROM store_sales JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk WHERE ss_list_price BETWEEN 52 AND 141), web_customers AS (SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk WHERE ws_list_price BETWEEN 52 AND 141), catalog_customers AS (SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk WHERE cs_list_price BETWEEN 52 AND 141), filtered_address AS (SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('GA','KY','SD')), filtered_demo AS (SELECT cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating FROM customer_demographics WHERE cd_marital_status IN ('D','W','U') AND cd_education_status IN ('Primary','College')), customer_base AS (SELECT c.c_customer_sk, filtered_demo.cd_gender, filtered_demo.cd_marital_status, filtered_demo.cd_education_status, filtered_demo.cd_purchase_estimate, filtered_demo.cd_credit_rating FROM customer c JOIN filtered_address ON c.c_current_addr_sk = filtered_address.ca_address_sk JOIN filtered_demo ON c.c_current_cdemo_sk = filtered_demo.cd_demo_sk), channel_joins AS (SELECT customer_base.*, store_customers.ss_customer_sk AS has_store, web_customers.ws_bill_customer_sk AS has_web, catalog_customers.cs_ship_customer_sk AS has_catalog FROM customer_base LEFT JOIN store_customers ON customer_base.c_customer_sk = store_customers.ss_customer_sk LEFT JOIN web_customers ON customer_base.c_customer_sk = web_customers.ws_bill_customer_sk LEFT JOIN catalog_customers ON customer_base.c_customer_sk = catalog_customers.cs_ship_customer_sk), filter AS (SELECT c_customer_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating FROM channel_joins WHERE has_store IS NOT NULL AND has_web IS NULL AND has_catalog IS NULL) SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3 FROM filter GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating LIMIT 100
+```
+- **Execution Plan (EXPLAIN ANALYZE):**
+```
+Limit  (rows=80, time=642.235)
+  Index Only Scan on date_dim  (rows=92, time=0.113)
+  Aggregate  (rows=80, time=642.229)
+    Sort  (rows=914, time=642.133)
+      Nested Loop  (rows=914, time=641.428)
+        Hash Join  (rows=3921, time=616.426)
+          Hash Join  (rows=4201, time=471.434)
+            Hash Join  (rows=4341, time=400.06)
+              Hash Join  (rows=54247, time=115.786)
+                Seq Scan on customer (c)  (rows=500000, time=37.714)
+                Hash  (rows=27053, time=34.992)
+                  Seq Scan on customer_address  (rows=27053, time=31.978)
+              Hash  (rows=76612, time=269.816)
+                Aggregate  (rows=76612, time=263.395)
+                  Nested Loop  (rows=487842, time=195.608)
+                    CTE Scan (filtered_date)  (rows=92, time=0.193)
+                    Index Only Scan on store_sales  (rows=5303, time=1.929)
+            Hash  (rows=20061, time=69.695)
+              Aggregate  (rows=20062, time=67.448)
+                Nested Loop  (rows=91174, time=54.922)
+                  CTE Scan (filtered_date_1)  (rows=92, time=0.034)
+                  Index Scan on web_sales  (rows=991, time=0.557)
+          Hash  (rows=49354, time=141.984)
+            Aggregate  (rows=49355, time=138.161)
+              Nested Loop  (rows=214907, time=105.671)
+                CTE Scan (filtered_date_2)  (rows=92, time=0.047)
+                Index Scan on catalog_sales  (rows=2336, time=1.057)
+        Index Scan on customer_demographics  (rows=0, time=0.006)
+```
+
+### W3: explicit_anti_join → 0.0x [ERROR]
+- **Examples**: exists_restructuring, intersect_to_exists, pg_self_join_decomposition
+- **Transforms**: date_cte_isolate
+- **Approach**: - exists_restructuring: Convert EXISTS to INNER JOIN, NOT EXISTS to LEFT JOIN + 
+- **Error**: INTERFACE: [store_join] declares outputs ['c_customer_sk', 'cd_credit_rating', 'cd_education_status', 'cd_gender', 'cd_marital_status', 'cd_purchase_estimate'] but SELECT only produces ['*'] | INTERFACE: [store_join] SELECT produces ['*'] not declared in outputs | INTERFACE: [web_anti_join] declares outputs ['c_customer_sk', 'cd_credit_rating', 'cd_education_status', 'cd_gender', 'cd_marital_status', 'cd_purchase_estimate'] but SELECT only produces ['*'] | INTERFACE: [web_anti_join] SELECT produces ['*'] not declared in outputs | INTERFACE: [catalog_anti_join] declares outputs ['c_customer_sk', 'cd_credit_rating', 'cd_education_status', 'cd_gender', 'cd_marital_status', 'cd_purchase_estimate'] but SELECT only produces ['*'] | INTERFACE: [catalog_anti_join] SELECT produces ['*'] not declared in outputs | Value mismatch: rows differ between original and optimized
+- **Optimized SQL:**
+```sql
+WITH filtered_address AS (SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('GA', 'KY', 'SD')), filtered_demo AS (SELECT cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating FROM customer_demographics WHERE cd_marital_status IN ('D', 'W', 'U') AND cd_education_status IN ('Primary', 'College')), filtered_date AS (SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy BETWEEN 3 AND 5), customer_base AS (SELECT c.c_customer_sk, fd.cd_gender, fd.cd_marital_status, fd.cd_education_status, fd.cd_purchase_estimate, fd.cd_credit_rating FROM customer c INNER JOIN filtered_address fa ON c.c_current_addr_sk = fa.ca_address_sk INNER JOIN filtered_demo fd ON c.c_current_cdemo_sk = fd.cd_demo_sk), store_sales_filtered AS (SELECT ss_customer_sk FROM store_sales INNER JOIN filtered_date fd ON ss_sold_date_sk = fd.d_date_sk WHERE ss_list_price BETWEEN 52 AND 141), store_join AS (SELECT cb.* FROM customer_base cb INNER JOIN store_sales_filtered ssf ON cb.c_customer_sk = ssf.ss_customer_sk), web_sales_filtered AS (SELECT ws_bill_customer_sk FROM web_sales INNER JOIN filtered_date fd ON ws_sold_date_sk = fd.d_date_sk WHERE ws_list_price BETWEEN 52 AND 141), web_anti_join AS (SELECT sj.* FROM store_join sj LEFT JOIN web_sales_filtered wsf ON sj.c_customer_sk = wsf.ws_bill_customer_sk WHERE wsf.ws_bill_customer_sk IS NULL), catalog_sales_filtered AS (SELECT cs_ship_customer_sk FROM catalog_sales INNER JOIN filtered_date fd ON cs_sold_date_sk = fd.d_date_sk WHERE cs_list_price BETWEEN 52 AND 141), catalog_anti_join AS (SELECT waj.* FROM web_anti_join waj LEFT JOIN catalog_sales_filtered csf ON waj.c_customer_sk = csf.cs_ship_customer_sk WHERE csf.cs_ship_customer_sk IS NULL) SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3 FROM catalog_anti_join GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating LIMIT 100
+```
+- **Execution Plan (EXPLAIN estimate — query errored):**
+```
+[EXPLAIN estimate — query errored at execution]
+Limit  (cost=301221.44..301224.46 rows=100 width=64)
+  CTE filtered_date
+    ->  Index Only Scan using _dta_index_date_dim_6_661577395__k7_k9_k1 on date_dim  (cost=0.42..6.49 rows=92 width=4)
+          Index Cond: ((d_year = 1999) AND (d_moy >= 3) AND (d_moy <= 5))
+  ->  GroupAggregate  (cost=301214.95..301384.04 rows=5600 width=64)
+        Group Key: customer_demographics.cd_gender, customer_demographics.cd_marital_status, customer_demographics.cd_education_status, customer_demographics.cd_purchase_estimate, customer_demographics.cd_credit_rating
+        ->  Sort  (cost=301214.95..301231.11 rows=6462 width=40)
+              Sort Key: customer_demographics.cd_gender, customer_demographics.cd_marital_status, customer_demographics.cd_education_status, customer_demographics.cd_purchase_estimate, customer_demographics.cd_credit_rating
+              ->  Hash Anti Join  (cost=198736.10..300805.98 rows=6462 width=40)
+                    Hash Cond: (c.c_customer_sk = catalog_sales.cs_ship_customer_sk)
+                    ->  Hash Join  (cost=108700.35..209304.51 rows=7852 width=44)
+                          Hash Cond: (store_sales.ss_customer_sk = c.c_customer_sk)
+                          ->  Nested Loop  (cost=0.56..98454.82 rows=552369 width=4)
+                                ->  CTE Scan on filtered_date fd  (cost=0.00..1.84 rows=92 width=4)
+                                ->  Index Only Scan using _dta_index_store_sales_6_1333579789__k1_k23_k14_k6_k8_k5_k7_3_4 on store_sales  (cost=0.56..1010.10 rows=6004 width=8)
+                                      Index Cond: (ss_sold_date_sk = fd.d_date_sk)
+                                      Filter: ((ss_list_price >= '52'::numeric) AND (ss_list_price <= '141'::numeric))
+                          ->  Hash  (cost=108606.75..108606.75 rows=7443 width=44)
+                                ->  Hash Anti Join  (cost=71467.40..108606.75 rows=7443 width=44)
+                                      Hash Cond: (c.c_customer_sk = web_sales.ws_bill_customer_sk)
+                                      ->  Gather  (cost=24713.32..60953.31 rows=8723 width=44)
+                                            Workers Planned: 2
+                                            ->  Parallel Hash Join  (cost=23713.32..59081.01 rows=3635 width=44)
+                                                  Hash Cond: (customer_demographics.cd_demo_sk = c.c_current_cdemo_sk)
+                                                  ->  Parallel Seq Scan on customer_demographics  (cost=0.00..34833.42 rows=138435 width=44)
+                                                        Filter: ((cd_education_status = ANY ('{Primary,College}'::bpchar[])) AND (cd_marital_status = ANY ('{D,W,U}'::bpchar[])))
+                                                  ->  Parallel Hash  (cost=23441.45..23441.45 rows=21750 width=8)
+                                                        ->  Parallel Hash Join  (cost=6984.23..23441.45 rows=21750 width=8)
+                                                              Hash Cond: (c.c_current_addr_sk = customer_address.ca_address_sk)
+                                                              ->  Parallel Seq Scan on customer c  (cost=0.00..15910.33 rows=208333 width=12)
+                                                              ->  Parallel Hash  (cost=6848.29..6848.29 rows=10875 width=4)
+                                                                    ->  Parallel Seq Scan on customer_address  (cost=0.00..6848.29 rows=10875 width=4)
+                                                                          Filter: (ca_state = ANY ('{GA,KY,SD}'::bpchar[]))
+                                      ->  Hash  (cost=44920.71..44920.71 rows=111709 width=4)
+                                            ->  Nested Loop  (cost=0.43..44920.71 rows=111709 width=4)
+                                                  ->  CTE Scan on filtered_date fd_1  (cost=0.00..1.84 rows=92 width=4)
+                                                  ->  Index Scan using _dta_index_web_sales_6_1269579561__k1_8_24 on web_sales  (cost=0.43..476.11 rows=1214 width=8)
+                                                        Index Cond: (ws_sold_date_sk = fd_1.d_date_sk)
+                                                        Filter: ((ws_list_price >= '52'::numeric) AND (ws_list_price <= '141'::numeric))
+                    ->  Hash  (cost=85752.06..85752.06 rows=261095 width=4)
+                          ->  Nested Loop  (cost=0.43..85752.06 rows=261095 width=4)
+                                ->  CTE Scan on filtered_date fd_2  (cost=0.00..1.84 rows=92 width=4)
+                                ->  Index Scan using _dta_index_catalog_sales_6_1301579675__k1_4 on catalog_sales  (cost=0.43..903.69 rows=2838 width=8)
+                                      Index Cond: (cs_sold_date_sk = fd_2.d_date_sk)
+                                      Filter: ((cs_list_price >= '52'::numeric) AND (cs_list_price <= '141'::numeric))
+```
+
+### W4: pivot_consolidation → 0.0x [ERROR]
+- **Examples**: scan_consolidation_pivot, union_consolidation, single_pass_aggregation
+- **Transforms**: or_to_union
+- **Approach**: - scan_consolidation_pivot: Consolidate three fact scans into one UNION ALL with
+- **Error**: INTERFACE: [pivot_join] declares outputs ['c_customer_sk', 'cd_credit_rating', 'cd_education_status', 'cd_gender', 'cd_marital_status', 'cd_purchase_estimate'] but SELECT only produces ['*', 'has_catalog', 'has_store', 'has_web'] | INTERFACE: [pivot_join] SELECT produces ['*'] not declared in outputs | INTERFACE: [filter] SELECT produces ['c_customer_sk'] not declared in outputs | Value mismatch: rows differ between original and optimized
+- **Optimized SQL:**
+```sql
+WITH filtered_date AS (SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy BETWEEN 3 AND 5), all_sales_unified AS (SELECT ss_customer_sk AS customer_sk, 'store' AS channel FROM store_sales JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk WHERE ss_list_price BETWEEN 52 AND 141 UNION ALL SELECT ws_bill_customer_sk AS customer_sk, 'web' AS channel FROM web_sales JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk WHERE ws_list_price BETWEEN 52 AND 141 UNION ALL SELECT cs_ship_customer_sk AS customer_sk, 'catalog' AS channel FROM catalog_sales JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk WHERE cs_list_price BETWEEN 52 AND 141), filtered_address AS (SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('GA','KY','SD')), filtered_demo AS (SELECT cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating FROM customer_demographics WHERE cd_marital_status IN ('D','W','U') AND cd_education_status IN ('Primary','College')), customer_base AS (SELECT c.c_customer_sk, d.cd_gender, d.cd_marital_status, d.cd_education_status, d.cd_purchase_estimate, d.cd_credit_rating FROM customer c INNER JOIN filtered_address a ON c.c_current_addr_sk = a.ca_address_sk INNER JOIN filtered_demo d ON c.c_current_cdemo_sk = d.cd_demo_sk), pivot_join AS (SELECT cb.*, store.customer_sk AS has_store, web.customer_sk AS has_web, catalog.customer_sk AS has_catalog FROM customer_base cb LEFT JOIN all_sales_unified store ON cb.c_customer_sk = store.customer_sk AND store.channel = 'store' LEFT JOIN all_sales_unified web ON cb.c_customer_sk = web.customer_sk AND web.channel = 'web' LEFT JOIN all_sales_unified catalog ON cb.c_customer_sk = catalog.customer_sk AND catalog.channel = 'catalog'), filter AS (SELECT c_customer_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating FROM pivot_join WHERE has_store IS NOT NULL AND has_web IS NULL AND has_catalog IS NULL), group_by AS (SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3 FROM filter GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating) SELECT cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3 FROM group_by ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating LIMIT 100
+```
+- **Execution Plan (EXPLAIN estimate — query errored):**
+```
+[EXPLAIN estimate — query errored at execution]
+Limit  (cost=331468.54..331471.47 rows=78 width=64)
+  CTE filtered_date
+    ->  Index Only Scan using _dta_index_date_dim_6_661577395__k7_k9_k1 on date_dim  (cost=0.42..6.49 rows=92 width=4)
+          Index Cond: ((d_year = 1999) AND (d_moy >= 3) AND (d_moy <= 5))
+  CTE all_sales_unified
+    ->  Append  (cost=0.56..243005.10 rows=925173 width=36)
+          ->  Nested Loop  (cost=0.56..98454.82 rows=552369 width=36)
+                ->  CTE Scan on filtered_date  (cost=0.00..1.84 rows=92 width=4)
+                ->  Index Only Scan using _dta_index_store_sales_6_1333579789__k1_k23_k14_k6_k8_k5_k7_3_4 on store_sales  (cost=0.56..1010.10 rows=6004 width=8)
+                      Index Cond: (ss_sold_date_sk = filtered_date.d_date_sk)
+                      Filter: ((ss_list_price >= '52'::numeric) AND (ss_list_price <= '141'::numeric))
+          ->  Nested Loop  (cost=0.43..44920.63 rows=111709 width=36)
+                ->  CTE Scan on filtered_date filtered_date_1  (cost=0.00..1.84 rows=92 width=4)
+                ->  Index Scan using _dta_index_web_sales_6_1269579561__k1_8_24 on web_sales  (cost=0.43..476.11 rows=1214 width=8)
+                      Index Cond: (ws_sold_date_sk = filtered_date_1.d_date_sk)
+                      Filter: ((ws_list_price >= '52'::numeric) AND (ws_list_price <= '141'::numeric))
+          ->  Nested Loop  (cost=0.43..85752.06 rows=261095 width=36)
+                ->  CTE Scan on filtered_date filtered_date_2  (cost=0.00..1.84 rows=92 width=4)
+                ->  Index Scan using _dta_index_catalog_sales_6_1301579675__k1_4 on catalog_sales  (cost=0.43..903.69 rows=2838 width=8)
+                      Index Cond: (cs_sold_date_sk = filtered_date_2.d_date_sk)
+                      Filter: ((cs_list_price >= '52'::numeric) AND (cs_list_price <= '141'::numeric))
+  ->  GroupAggregate  (cost=88456.95..88459.10 rows=78 width=64)
+        Group Key: customer_demographics.cd_gender, customer_demographics.cd_marital_status, customer_demographics.cd_education_status, customer_demographics.cd_purchase_estimate, customer_demographics.cd_credit_rating
+        ->  Sort  (cost=88456.95..88457.15 rows=78 width=40)
+              Sort Key: customer_demographics.cd_gender, customer_demographics.cd_marital_status, customer_demographics.cd_education_status, customer_demographics.cd_purchase_estimate, customer_demographics.cd_credit_rating
+              ->  Hash Anti Join  (cost=41749.70..88454.50 rows=78 width=40)
+                    Hash Cond: (c.c_customer_sk = catalog.customer_sk)
+                    ->  Hash Anti Join  (cost=20875.49..67578.72 rows=79 width=44)
+                          Hash Cond: (c.c_customer_sk = web.customer_sk)
+                          ->  Nested Loop  (cost=1.27..46702.92 rows=80 width=44)
+                                ->  Nested Loop  (cost=0.84..46381.60 rows=481 width=8)
+                                      ->  Nested Loop  (cost=0.42..44125.71 rows=4603 width=12)
+                                            ->  CTE Scan on all_sales_unified store  (cost=0.00..20816.39 rows=4603 width=4)
+                                                  Filter: ((customer_sk IS NOT NULL) AND (channel = 'store'::text))
+                                            ->  Index Scan using _dta_index_customer_6_949578421__k1_k5 on customer c  (cost=0.42..5.06 rows=1 width=12)
+                                                  Index Cond: (c_customer_sk = store.customer_sk)
+                                      ->  Index Scan using customer_address_pkey on customer_address  (cost=0.42..0.49 rows=1 width=4)
+                                            Index Cond: (ca_address_sk = c.c_current_addr_sk)
+                                            Filter: (ca_state = ANY ('{GA,KY,SD}'::bpchar[]))
+                                ->  Index Scan using customer_demographics_pkey on customer_demographics  (cost=0.43..0.67 rows=1 width=44)
+                                      Index Cond: (cd_demo_sk = c.c_current_cdemo_sk)
+                                      Filter: ((cd_education_status = ANY ('{Primary,College}'::bpchar[])) AND (cd_marital_status = ANY ('{D,W,U}'::bpchar[])))
+                          ->  Hash  (cost=20816.39..20816.39 rows=4626 width=4)
+                                ->  CTE Scan on all_sales_unified web  (cost=0.00..20816.39 rows=4626 width=4)
+                                      Filter: (channel = 'web'::text)
+                    ->  Hash  (cost=20816.39..20816.39 rows=4626 width=4)
+                          ->  CTE Scan on all_sales_unified catalog  (cost=0.00..20816.39 rows=4626 width=4)
+                                Filter: (channel = 'catalog'::text)
+```
+
+
+## Original Execution Plan (EXPLAIN ANALYZE)
+
+Compare each candidate's plan (above) against this baseline.
+
+```
+Limit  (rows=80, time=415.455)
+  Aggregate  (rows=80, time=415.45)
+    Gather Merge  (rows=237, time=415.412)
+      Aggregate  (rows=79, time=402.72)
+        Sort  (rows=305, time=402.673)
+          Hash Join  (rows=305, time=402.401)
+            Nested Loop  (rows=329, time=275.448)
+              Hash Join  (rows=1400, time=264.182)
+                Hash Join  (rows=1447, time=212.188)
+                  Hash Join  (rows=18082, time=37.029)
+                    Seq Scan on customer (c)  (rows=166667, time=14.052)
+                    Hash  (rows=9018, time=10.75)
+                      Seq Scan on customer_address (ca)  (rows=9018, time=9.945)
+                  Hash  (rows=164518, time=163.357)
+                    Nested Loop  (rows=164518, time=71.785)
+                      Index Only Scan on date_dim  (rows=31, time=1.539)
+                      Index Only Scan on store_sales  (rows=5365, time=2.086)
+                Hash  (rows=30391, time=50.976)
+                  Nested Loop  (rows=30391, time=23.906)
+                    Index Only Scan on date_dim (date_dim_1)  (rows=31, time=1.78)
+                    Index Scan on web_sales  (rows=991, time=0.682)
+              Index Scan on customer_demographics  (rows=0, time=0.008)
+            Hash  (rows=71636, time=126.158)
+              Nested Loop  (rows=71636, time=42.849)
+                Index Only Scan on date_dim (date_dim_2)  (rows=31, time=0.592)
+                Index Scan on catalog_sales  (rows=2336, time=1.287)
+```
+
+## Semantic Contract (MUST preserve)
+
+This query identifies customers in specific states with certain demographics who purchased via stores in Q2 1999 but did NOT purchase via web or catalog in the same period, then counts them by demographic attributes. JOIN semantics are INNER between customer, address, demographics; EXISTS requires at least one matching store_sales row; NOT EXISTS requires NO matching web_sales or catalog_sales rows (anti-join). Aggregation uses COUNT(*) which is duplicate-sensitive but grouping-insensitive. Filter dependencies: address state, demographic statuses, date range (1999, months 3-5), price ranges (52-141) must all be preserved exactly.
+
+## Bottleneck Diagnosis
+
+The query is join-bound with dominant cost in nested loop anti-joins for web_sales (7.2s) and catalog_sales (22.5s total), each materializing large inner tables (90K/207K rows) and probing them hundreds of times. Row flow: 18K customers after address/demo filters → 337 after store_sales EXISTS → 986 after web_sales NOT EXISTS → 914 after catalog_sales NOT EXISTS. The optimizer already handles store_sales EXISTS efficiently via parallel hash semi-join and uses index-only scans for date_dim. Logical-tree costs misleading: anti-joins dominate but appear as small percentage.
+
+## Engine Profile
+
+*This is field intelligence gathered from 53 DSB queries at SF5-SF10. PostgreSQL is a fundamentally different optimizer than DuckDB — it has bitmap index scans, JIT compilation, and aggressive CTE materialization. Techniques that work on DuckDB often regress here. Use this to guide your analysis but apply your own judgment — every query is different. Add to this knowledge if you observe something new.*
+
+### Optimizer Strengths (DO NOT fight these)
+- **BITMAP_OR_SCAN**: Multi-branch OR conditions on indexed columns are handled via BitmapOr — a single fact table scan with bitmap combination. Extremely efficient.
+- **SEMI_JOIN_EXISTS**: EXISTS/NOT EXISTS uses semi-join with early termination. Stops scanning after the first match per outer row.
+- **INNER_JOIN_REORDERING**: PostgreSQL freely reorders INNER JOINs based on estimated selectivity. The cost model works well for explicit JOIN...ON syntax.
+- **INDEX_ONLY_SCAN**: When an index covers all requested columns, PostgreSQL reads only the index without touching the heap.
+- **PARALLEL_QUERY_EXECUTION**: PostgreSQL parallelizes large scans and aggregations across worker processes with partial aggregation finalization.
+- **JIT_COMPILATION**: PostgreSQL JIT-compiles complex expressions and tuple deforming for long-running queries.
+
+### Optimizer Gaps (opportunities)
+- **COMMA_JOIN_WEAKNESS**: Implicit comma-separated FROM tables (FROM t1, t2, t3 WHERE t1.id = t2.id) are treated as cross products initially. The cost model is significantly weaker on comma-joins than on explicit JOIN...ON syntax.
+  Opportunity: Convert comma-joins to explicit JOIN...ON syntax. This alone can unlock 2-3x improvements. Best when combined with date_cte_isolate.
+    + Q080: 3.32x — comma-joins to explicit JOINs + date CTE on multi-channel UNION query
+    + Q099: 2.28x — same pattern on star schema
+    + Q054: 1.14x — JOIN conversion alone
+- **CORRELATED_SUBQUERY_PARALYSIS**: Cannot automatically decorrelate complex correlated subqueries. Correlated scalar subqueries with aggregates are executed as nested-loop with repeated evaluation.
+  Opportunity: Convert correlated WHERE to explicit CTE with GROUP BY + JOIN.
+    + Q092: 4428x — timeout recovery. Unbounded correlated subquery converted to explicit JOIN.
+    + Q032: 391x — same pattern, timeout to sub-second.
+- **NON_EQUI_JOIN_INPUT_BLINDNESS**: Cannot pre-filter fact tables before non-equi join operations (date arithmetic, range comparisons, quantity < quantity). Non-equi joins fall back to nested-loop, which is O(N*M).
+  Opportunity: Reduce fact table input size via filtered CTE before the non-equi join.
+    + Q072: 2.68x — pre-filtered catalog_sales by wholesale_cost range before non-equi quantity comparison with inventory. Reduced nested-loop input by ~70%.
+- **CTE_MATERIALIZATION_FENCE**: PostgreSQL materializes CTEs by default (multi-referenced) or by choice (AS MATERIALIZED). This creates a hard optimization fence — no predicate pushdown from outer query into CTE. This makes CTE-based strategies a double-edged sword on PG.
+  Opportunity: Use materialization STRATEGICALLY: materialize when the CTE is expensive and reused multiple times. Avoid CTEs that fence off predicate pushdown for single-use cases.
+    + Q065: 1.95x — strategic materialization prevented redundant fact table scan multiplication
+- **CROSS_CTE_PREDICATE_BLINDNESS**: Same gap as DuckDB but WORSE on PostgreSQL because CTE materialization fence makes it more impactful. Predicates in the outer WHERE cannot propagate into materialized CTEs.
+  Opportunity: Same as DuckDB: pre-filter into CTE definition. But be more cautious — only when the CTE is clearly suboptimal.
+    + Q080: 3.32x — date filter + comma-join conversion (the combo is key)
+    + Q099: 2.28x — date CTE with explicit JOIN
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. pg_dimension_prefetch_star (3.32x)
+
+**Principle:** Multi-Dimension Prefetch (PG): pre-filter all selective dimensions into CTEs to create tiny hash tables, combined with explicit JOIN syntax. PostgreSQL's optimizer gets better cardinality estimates from pre-materialized small dimension results.
+
+**BEFORE (slow):**
+```sql
+with ssr as
+ (select  s_store_id as store_id,
+          sum(ss_ext_sales_price) as sales,
+          sum(coalesce(sr_return_amt, 0)) as returns,
+          sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit
+  from store_sales left outer join store_returns on
+         (ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number),
+     date_dim,
+     store,
+     item,
+     promotion
+ where ss_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+       and ss_store_sk = s_store_sk
+       and ss_item_sk = i_item_sk
+       and i_current_price > 50
+       and ss_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and ss_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+ group by s_store_id)
+ ,
+ csr as
+ (select  cp_catalog_page_id as catalog_page_id,
+          sum(cs_ext_sales_price) as sales,
+          sum(coalesce(cr_return_amount, 0)) as returns,
+          sum(cs_net_profit - coalesce(cr_net_loss, 0)) as profit
+  from catalog_sales left outer join catalog_returns on
+         (cs_item_sk = cr_item_sk and cs_order_number = cr_order_number),
+     date_dim,
+     catalog_page,
+     item,
+     promotion
+ where cs_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+        and cs_catalog_page_sk = cp_catalog_page_sk
+       and cs_item_sk = i_item_sk
+       and i_current_price > 50
+       and cs_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and cs_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+group by cp_catalog_page_id)
+ ,
+ wsr as
+ (select  web_site_id,
+          sum(ws_ext_sales_price) as sales,
+          sum(coalesce(wr_return_amt, 0)) as returns,
+          sum(ws_net_profit - coalesce(wr_net_loss, 0)) as profit
+  from web_sales left outer join web_returns on
+         (ws_item_sk = wr_item_sk and ws_order_number = wr_order_number),
+     date_dim,
+     web_site,
+     item,
+     promotion
+ where ws_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+        and ws_web_site_sk = web_site_sk
+       and ws_item_sk = i_item_sk
+       and i_current_price > 50
+       and ws_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and ws_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+group by web_site_id)
+  select  channel
+        , id
+        , sum(sales) as sales
+        , sum(returns) as returns
+        , sum(profit) as profit
+ from
+ (select 'store channel' as channel
+        , 'store' || store_id as id
+        , sales
+        , returns
+        , profit
+ from   ssr
+ union all
+ select 'catalog channel' as channel
+        , 'catalog_page' || catalog_page_id as id
+        , sales
+        , returns
+        , profit
+ from  csr
+ union all
+ select 'web channel' as channel
+        , 'web_site' || web_site_id as id
+        , sales
+        , returns
+        , profit
+ from   wsr
+ ) x
+ group by rollup (channel, id)
+ order by channel
+         ,id
+ limit 100;
+```
+
+**AFTER (fast):**
+[filtered_date]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-23' AS DATE) AND CAST('1998-08-23' AS DATE) + INTERVAL '30 DAY'
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk FROM item WHERE i_current_price > 50 AND i_category IN ('Jewelry', 'Music')
+```
+[filtered_promotion]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'Y' AND p_channel_tv = 'Y' AND p_channel_radio = 'N' AND p_channel_press = 'N' AND p_channel_event = 'Y'
+```
+[ssr]:
+```sql
+SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS returns, SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit FROM store_sales LEFT OUTER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) INNER JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk INNER JOIN store ON ss_store_sk = s_store_sk INNER JOIN filtered_item ON ss_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ss_promo_sk = filtered_promotion.p_promo_sk WHERE ss_wholesale_cost BETWEEN 63 AND 78 GROUP BY s_store_id
+```
+[csr]:
+```sql
+SELECT cp_catalog_page_id AS catalog_page_id, SUM(cs_ext_sales_price) AS sales, SUM(COALESCE(cr_return_amount, 0)) AS returns, SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit FROM catalog_sales LEFT OUTER JOIN catalog_returns ON (cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number) INNER JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk INNER JOIN catalog_page ON cs_catalog_page_sk = cp_catalog_page_sk INNER JOIN filtered_item ON cs_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON cs_promo_sk = filtered_promotion.p_promo_sk WHERE cs_wholesale_cost BETWEEN 63 AND 78 GROUP BY cp_catalog_page_id
+```
+[wsr]:
+```sql
+SELECT web_site_id, SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS returns, SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit FROM web_sales LEFT OUTER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number) INNER JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk INNER JOIN web_site ON ws_web_site_sk = web_site_sk INNER JOIN filtered_item ON ws_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ws_promo_sk = filtered_promotion.p_promo_sk WHERE ws_wholesale_cost BETWEEN 63 AND 78 GROUP BY web_site_id
+```
+[main_query]:
+```sql
+SELECT channel, id, SUM(sales) AS sales, SUM(returns) AS returns, SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, returns, profit FROM ssr UNION ALL SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, returns, profit FROM csr UNION ALL SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, returns, profit FROM wsr) AS x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100
+```
+
+### 2. pg_materialized_dimension_fact_prefilter (2.68x)
+
+**Principle:** Staged Reduction for Non-Equi Joins: when queries have expensive non-equi joins, reduce BOTH dimension and fact table sizes via MATERIALIZED CTEs before the join. Combined selectivity dramatically cuts the search space for inequality predicates.
+
+**BEFORE (slow):**
+```sql
+select  i_item_desc
+      ,w_warehouse_name
+      ,d1.d_week_seq
+      ,sum(case when p_promo_sk is null then 1 else 0 end) no_promo
+      ,sum(case when p_promo_sk is not null then 1 else 0 end) promo
+      ,count(*) total_cnt
+from catalog_sales
+join inventory on (cs_item_sk = inv_item_sk)
+join warehouse on (w_warehouse_sk=inv_warehouse_sk)
+join item on (i_item_sk = cs_item_sk)
+join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk)
+join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk)
+join date_dim d1 on (cs_sold_date_sk = d1.d_date_sk)
+join date_dim d2 on (inv_date_sk = d2.d_date_sk)
+join date_dim d3 on (cs_ship_date_sk = d3.d_date_sk)
+left outer join promotion on (cs_promo_sk=p_promo_sk)
+left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number)
+where d1.d_week_seq = d2.d_week_seq
+  and inv_quantity_on_hand < cs_quantity
+  and d3.d_date > d1.d_date + interval '3 day'
+  and hd_buy_potential = '501-1000'
+  and d1.d_year = 1998
+  and cd_marital_status = 'M'
+  and cd_dep_count between 9 and 11
+  and i_category IN ('Home', 'Men', 'Music')
+  and cs_wholesale_cost BETWEEN 34 AND 54
+group by i_item_desc,w_warehouse_name,d1.d_week_seq
+order by total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq
+limit 100;
+```
+
+**AFTER (fast):**
+[filtered_date]:
+```sql
+SELECT d_date_sk, d_date, d_week_seq FROM date_dim WHERE d_year = 1998
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk, i_item_desc FROM item WHERE i_category IN ('Home', 'Men', 'Music')
+```
+[filtered_cd]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_marital_status = 'M' AND cd_dep_count BETWEEN 9 AND 11
+```
+[filtered_hd]:
+```sql
+SELECT hd_demo_sk FROM household_demographics WHERE hd_buy_potential = '501-1000'
+```
+[cs_filtered]:
+```sql
+SELECT cs_item_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk, cs_quantity, cs_wholesale_cost, cs_order_number FROM catalog_sales WHERE cs_wholesale_cost BETWEEN 34 AND 54
+```
+[main_query]:
+```sql
+SELECT i.i_item_desc, w.w_warehouse_name, d1.d_week_seq, SUM(CASE WHEN p.p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN p.p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt FROM cs_filtered cs JOIN inventory inv ON cs.cs_item_sk = inv.inv_item_sk JOIN warehouse w ON w.w_warehouse_sk = inv.inv_warehouse_sk JOIN filtered_item i ON i.i_item_sk = cs.cs_item_sk JOIN filtered_cd cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk JOIN filtered_hd hd ON cs.cs_bill_hdemo_sk = hd.hd_demo_sk JOIN filtered_date d1 ON cs.cs_sold_date_sk = d1.d_date_sk JOIN date_dim d2 ON inv.inv_date_sk = d2.d_date_sk JOIN date_dim d3 ON cs.cs_ship_date_sk = d3.d_date_sk LEFT OUTER JOIN promotion p ON cs.cs_promo_sk = p.p_promo_sk LEFT OUTER JOIN catalog_returns cr ON cr.cr_item_sk = cs.cs_item_sk AND cr.cr_order_number = cs.cs_order_number WHERE d1.d_week_seq = d2.d_week_seq AND inv.inv_quantity_on_hand < cs.cs_quantity AND d3.d_date > d1.d_date + INTERVAL '3 day' GROUP BY i.i_item_desc, w.w_warehouse_name, d1.d_week_seq ORDER BY total_cnt DESC, i.i_item_desc, w.w_warehouse_name, d1.d_week_seq LIMIT 100
+```
+
+### 3. early_filter_decorrelate (1.13x)
+
+**Principle:** Early Selection + Decorrelation: push dimension filters into CTE definitions before materialization, and decorrelate correlated subqueries by pre-computing thresholds in separate CTEs. Filters reduce rows early; decorrelation replaces per-row subquery execution with a single pre-computed JOIN.
+
+**BEFORE (slow):**
+```sql
+WITH customer_total_return AS (
+  SELECT sr_customer_sk AS ctr_customer_sk,
+         sr_store_sk AS ctr_store_sk,
+         sr_reason_sk AS ctr_reason_sk,
+         SUM(SR_REFUNDED_CASH) AS ctr_total_return
+  FROM store_returns, date_dim
+  WHERE sr_returned_date_sk = d_date_sk
+    AND d_year = 2001
+    AND sr_return_amt / sr_return_quantity BETWEEN 236 AND 295
+  GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk
+)
+SELECT c_customer_id
+FROM customer_total_return ctr1, store, customer, customer_demographics
+WHERE ctr1.ctr_total_return > (
+    SELECT AVG(ctr_total_return) * 1.2
+    FROM customer_total_return ctr2
+    WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk
+  )
+  AND ctr1.ctr_reason_sk BETWEEN 28 AND 31
+  AND s_store_sk = ctr1.ctr_store_sk
+  AND s_state IN ('MI', 'NC', 'WI')
+  AND ctr1.ctr_customer_sk = c_customer_sk
+  AND c_current_cdemo_sk = cd_demo_sk
+  AND cd_marital_status IN ('W', 'W')
+  AND cd_education_status IN ('4 yr Degree', 'College')
+  AND cd_gender = 'M'
+  AND c_birth_month = 5
+  AND c_birth_year BETWEEN 1950 AND 1956
+ORDER BY c_customer_id
+LIMIT 100
+```
+
+**AFTER (fast):**
+```sql
+WITH customer_total_return AS (
+    SELECT sr_customer_sk AS ctr_customer_sk,
+           sr_store_sk AS ctr_store_sk,
+           sr_reason_sk AS ctr_reason_sk,
+           SUM(SR_REFUNDED_CASH) AS ctr_total_return
+    FROM store_returns
+    JOIN date_dim ON sr_returned_date_sk = d_date_sk
+    JOIN store ON sr_store_sk = s_store_sk
+    WHERE d_year = 2001
+      AND s_state IN ('MI', 'NC', 'WI')
+      AND sr_return_amt / sr_return_quantity BETWEEN 236 AND 295
+    GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk
+),
+store_thresholds AS (
+    SELECT ctr_store_sk,
+           AVG(ctr_total_return) * 1.2 AS avg_limit
+    FROM customer_total_return
+    GROUP BY ctr_store_sk
+)
+SELECT c_customer_id
+FROM customer_total_return ctr1
+JOIN store_thresholds st ON ctr1.ctr_store_sk = st.ctr_store_sk
+JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk
+JOIN store s ON ctr1.ctr_store_sk = s.s_store_sk
+WHERE ctr1.ctr_total_return > st.avg_limit
+  AND ctr1.ctr_reason_sk BETWEEN 28 AND 31
+  AND s.s_state IN ('MI', 'NC', 'WI')
+  AND cd_marital_status = 'W'
+  AND cd_education_status IN ('4 yr Degree', 'College')
+  AND cd_gender = 'M'
+  AND c_birth_month = 5
+  AND c_birth_year BETWEEN 1950 AND 1956
+ORDER BY c_customer_id
+LIMIT 100
+```
+
+### 4. pg_self_join_decomposition (3.93x)
+
+**Principle:** Shared Materialization (PG): when the same fact+dimension scan appears multiple times in self-join patterns, materialize it once as a CTE and derive all needed aggregates from the same result. PostgreSQL materializes CTEs by default, making this extremely effective.
+
+**BEFORE (slow):**
+```sql
+select 
+	s_store_name,
+	i_item_desc,
+	sc.revenue,
+	i_current_price,
+	i_wholesale_cost,
+	i_brand
+ from store, item,
+     (select ss_store_sk, avg(revenue) as ave
+	from
+	    (select  ss_store_sk, ss_item_sk,
+		     sum(ss_sales_price) as revenue
+		from store_sales, date_dim
+		where ss_sold_date_sk = d_date_sk and d_month_seq between 1213 and 1213+11
+   and ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+		group by ss_store_sk, ss_item_sk) sa
+	group by ss_store_sk) sb,
+     (select  ss_store_sk, ss_item_sk, sum(ss_sales_price) as revenue
+	from store_sales, date_dim
+	where ss_sold_date_sk = d_date_sk and d_month_seq between 1213 and 1213+11
+  and ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+	group by ss_store_sk, ss_item_sk) sc
+ where sb.ss_store_sk = sc.ss_store_sk and
+       sc.revenue <= 0.1 * sb.ave and
+       s_store_sk = sc.ss_store_sk and
+       i_item_sk = sc.ss_item_sk
+       and i_manager_id BETWEEN 32 and 36
+       and s_state in ('TN','TX','VA')
+ order by s_store_name, i_item_desc
+limit 100;
+```
+
+**AFTER (fast):**
+[date_filter]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1213 AND 1224
+```
+[store_sales_revenue]:
+```sql
+SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk WHERE ss_sales_price / ss_list_price BETWEEN 0.38 AND 0.48 GROUP BY ss_store_sk, ss_item_sk
+```
+[store_avg_revenue]:
+```sql
+SELECT ss_store_sk, AVG(revenue) AS ave FROM store_sales_revenue GROUP BY ss_store_sk
+```
+[filtered_store]:
+```sql
+SELECT s_store_sk, s_store_name FROM store WHERE s_state IN ('TN', 'TX', 'VA')
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk, i_item_desc, i_current_price, i_wholesale_cost, i_brand FROM item WHERE i_manager_id BETWEEN 32 AND 36
+```
+[main_query]:
+```sql
+SELECT s_store_name, i_item_desc, sc.revenue, i_current_price, i_wholesale_cost, i_brand FROM store_avg_revenue AS sb JOIN store_sales_revenue AS sc ON sb.ss_store_sk = sc.ss_store_sk JOIN filtered_store AS s ON sc.ss_store_sk = s.s_store_sk JOIN filtered_item AS i ON sc.ss_item_sk = i.i_item_sk WHERE sc.revenue <= 0.1 * sb.ave ORDER BY s_store_name, i_item_desc LIMIT 100
+```
+
+### 5. inline_decorrelate_materialized (timeout_rescue)
+
+**Principle:** Inline Decorrelation with MATERIALIZED CTEs: When a WHERE clause contains a correlated scalar subquery (e.g., col > (SELECT 1.3 * avg(col) FROM ... WHERE correlated_key = outer.key)), PostgreSQL re-executes the subquery per outer row. Fix: decompose into 3 MATERIALIZED CTEs — (1) pre-filter dimension table, (2) pre-filter fact table by date range, (3) compute per-key aggregate threshold from filtered data — then JOIN the threshold CTE in the final query. MATERIALIZED keyword prevents PG from inlining the CTEs back into correlated form.
+
+**BEFORE (slow):**
+```sql
+select  sum(cs_ext_discount_amt)  as "excess discount amount"
+from
+   catalog_sales
+   ,item
+   ,date_dim
+where
+(i_manufact_id in (1, 78, 97, 516, 521)
+or i_manager_id BETWEEN 25 and 54)
+and i_item_sk = cs_item_sk
+and d_date between '1999-03-07' and
+        cast('1999-03-07' as date) + interval '90 day'
+and d_date_sk = cs_sold_date_sk
+and cs_ext_discount_amt
+     > (
+         select
+            1.3 * avg(cs_ext_discount_amt)
+         from
+            catalog_sales
+           ,date_dim
+         where
+              cs_item_sk = i_item_sk
+          and d_date between '1999-03-07' and
+                             cast('1999-03-07' as date) + interval '90 day'
+          and d_date_sk = cs_sold_date_sk
+          and cs_list_price between 16 and 45
+          and cs_sales_price / cs_list_price BETWEEN 63 * 0.01 AND 83 * 0.01
+      )
+order by sum(cs_ext_discount_amt)
+limit 100;
+```
+
+**AFTER (fast):**
+```sql
+WITH filtered_items AS MATERIALIZED (
+    SELECT i_item_sk
+    FROM item
+    WHERE i_manufact_id IN (1, 78, 97, 516, 521)
+       OR i_manager_id BETWEEN 25 AND 54
+),
+date_filtered_sales AS MATERIALIZED (
+    SELECT cs.cs_item_sk, cs.cs_ext_discount_amt,
+           cs.cs_list_price, cs.cs_sales_price
+    FROM catalog_sales cs
+    JOIN date_dim d ON d.d_date_sk = cs.cs_sold_date_sk
+    WHERE d.d_date BETWEEN '1999-03-07' AND cast('1999-03-07' as date) + interval '90 day'
+),
+item_avg_discount AS MATERIALIZED (
+    SELECT dfs.cs_item_sk,
+           1.3 * avg(dfs.cs_ext_discount_amt) AS threshold
+    FROM date_filtered_sales dfs
+    JOIN filtered_items fi ON fi.i_item_sk = dfs.cs_item_sk
+    WHERE dfs.cs_list_price BETWEEN 16 AND 45
+      AND dfs.cs_sales_price / dfs.cs_list_price BETWEEN 63 * 0.01 AND 83 * 0.01
+    GROUP BY dfs.cs_item_sk
+)
+SELECT sum(dfs.cs_ext_discount_amt) AS "excess discount amount"
+FROM date_filtered_sales dfs
+JOIN item_avg_discount iad ON iad.cs_item_sk = dfs.cs_item_sk
+WHERE dfs.cs_ext_discount_amt > iad.threshold
+ORDER BY 1
+LIMIT 100;
+```
+
+### 6. pg_date_cte_explicit_join (2.28x)
+
+**Principle:** Dimension Isolation + Explicit Joins: materialize selective dimension filters into CTEs to create tiny hash tables, AND convert comma-separated joins to explicit JOIN syntax. On PostgreSQL, the combination enables better hash join planning with a tiny probe table.
+
+**BEFORE (slow):**
+```sql
+select 
+   substring(w_warehouse_name,1,20)
+  ,sm_type
+  ,cc_name
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk <= 30 ) then 1 else 0 end)  as "30 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 30) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 60) then 1 else 0 end )  as "31-60 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 60) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 90) then 1 else 0 end)  as "61-90 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 90) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 120) then 1 else 0 end)  as "91-120 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk  > 120) then 1 else 0 end)  as ">120 days"
+from
+   catalog_sales
+  ,warehouse
+  ,ship_mode
+  ,call_center
+  ,date_dim
+where
+d_month_seq between 1193 and 1193 + 23
+and cs_ship_date_sk   = d_date_sk
+and cs_warehouse_sk   = w_warehouse_sk
+and cs_ship_mode_sk   = sm_ship_mode_sk
+and cs_call_center_sk = cc_call_center_sk
+and cs_list_price between 271 and 300
+and sm_type = 'REGULAR'
+and cc_class = 'small'
+and w_gmt_offset = -5
+group by
+   substring(w_warehouse_name,1,20)
+  ,sm_type
+  ,cc_name
+order by substring(w_warehouse_name,1,20)
+        ,sm_type
+        ,cc_name
+limit 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1193 AND 1216
+```
+[main_query]:
+```sql
+SELECT SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name, SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", ... FROM catalog_sales JOIN filtered_dates ON cs_ship_date_sk = d_date_sk JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk JOIN call_center ON cs_call_center_sk = cc_call_center_sk WHERE cs_list_price BETWEEN 271 AND 300 AND sm_type = 'REGULAR' AND cc_class = 'small' AND w_gmt_offset = -5 GROUP BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name ORDER BY 1, 2, 3 LIMIT 100
+```
+
+## Correctness Invariants (HARD STOPS — non-negotiable)
+
+These 4 constraints are absolute. Even with full creative freedom, you may NEVER violate these:
+
+- **COMPLETE_OUTPUT**: The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original.
+- **CTE_COLUMN_COMPLETENESS**: CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+- **LITERAL_PRESERVATION**: CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+- **SEMANTIC_EQUIVALENCE**: The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set — even by one row, one column, or a different sort order — is WRONG and will be REJECTED.
+
+## Aggregation Semantics Check (HARD STOP)
+
+- STDDEV_SAMP/VARIANCE are grouping-sensitive — changing group membership changes the result.
+- AVG and STDDEV are NOT duplicate-safe.
+- FILTER over a combined group != separate per-group computation.
+- Verify aggregation equivalence for ANY proposed restructuring.
+
+## Original SQL
+
+```sql
+select 
+  cd_gender,
+  cd_marital_status,
+  cd_education_status,
+  count(*) cnt1,
+  cd_purchase_estimate,
+  count(*) cnt2,
+  cd_credit_rating,
+  count(*) cnt3
+ from
+  customer c,customer_address ca,customer_demographics
+ where
+  c.c_current_addr_sk = ca.ca_address_sk and
+  ca_state in ('GA','KY','SD') and
+  cd_demo_sk = c.c_current_cdemo_sk
+  and cd_marital_status in ('D', 'W', 'U')
+  and cd_education_status in ('Primary', 'College') and
+  exists (select *
+          from store_sales,date_dim
+          where c.c_customer_sk = ss_customer_sk and
+                ss_sold_date_sk = d_date_sk and
+                d_year = 1999 and
+                d_moy between 3 and 3+2
+                and ss_list_price between 52 and 141
+          ) and
+   (not exists (select *
+            from web_sales,date_dim
+            where c.c_customer_sk = ws_bill_customer_sk and
+                  ws_sold_date_sk = d_date_sk and
+                  d_year = 1999 and
+                  d_moy between 3 and 3+2
+                  and ws_list_price between 52 and 141
+            ) and
+    not exists (select *
+            from catalog_sales,date_dim
+            where c.c_customer_sk = cs_ship_customer_sk and
+                  cs_sold_date_sk = d_date_sk and
+                  d_year = 1999 and
+                  d_moy between 3 and 3+2
+                  and cs_list_price between 52 and 141)
+            )
+ group by cd_gender,
+          cd_marital_status,
+          cd_education_status,
+          cd_purchase_estimate,
+          cd_credit_rating
+ order by cd_gender,
+          cd_marital_status,
+          cd_education_status,
+          cd_purchase_estimate,
+          cd_credit_rating
+ limit 100;
+```
+
+## Per-Rewrite Configuration (SET LOCAL)
+
+You have two optimization levers: SQL rewrite AND per-query configuration.
+After writing your rewrite, analyze its execution profile and emit SET LOCAL
+commands that fix planner-level bottlenecks specific to YOUR rewrite.
+
+Memory budget: shared_buffers=128MB, effective_cache_size=4GB
+Global work_mem: 4MB (per-operation)
+Active connections: ~1 (work_mem headroom: safe up to 16MB per-op)
+Storage: HDD (random_page_cost=4.0)
+Parallel capacity: max_parallel_workers=8, per_gather=2
+
+SET LOCAL permissions:
+  user-level (always available): effective_cache_size, enable_hashjoin, enable_mergejoin, enable_nestloop, enable_seqscan, from_collapse_limit, geqo_threshold, hash_mem_multiplier, jit, jit_above_cost, join_collapse_limit, max_parallel_workers_per_gather, parallel_setup_cost, parallel_tuple_cost, random_page_cost, work_mem
+
+### Tunable Parameters (whitelist — only these are allowed)
+
+- **effective_cache_size** (1024MB–65536MB): Advisory: how much OS cache to expect (MB). Safe to set aggressively.
+- **enable_hashjoin** (on | off): Enable hash join plan type.
+- **enable_mergejoin** (on | off): Enable merge join plan type.
+- **enable_nestloop** (on | off): Enable nested-loop join plan type.
+- **enable_seqscan** (on | off): Enable sequential scan plan type.
+- **from_collapse_limit** (1–20): Max FROM items before subqueries stop being flattened.
+- **geqo_threshold** (2–20): Number of FROM items that triggers genetic query optimizer.
+- **hash_mem_multiplier** (1.0–10.0): Multiplier applied to work_mem for hash-based operations.
+- **jit** (on | off): Enable JIT compilation.
+- **jit_above_cost** (0.0–1000000.0): Query cost above which JIT is activated.
+- **join_collapse_limit** (1–20): Max FROM items before planner stops trying all join orders.
+- **max_parallel_workers_per_gather** (0–8): Max parallel workers per Gather node.
+- **parallel_setup_cost** (0.0–10000.0): Planner estimate of cost to launch parallel workers.
+- **parallel_tuple_cost** (0.0–1.0): Planner estimate of cost to transfer a tuple to parallel worker.
+- **random_page_cost** (1.0–10.0): Planner estimate of cost of a random page fetch (1.0 = SSD, 4.0 = HDD).
+- **work_mem** (64MB–2048MB): Memory for sorts/hashes per operation (MB). Allocated PER-OPERATION, not per-query. Count hash/sort ops in EXPLAIN before sizing.
+
+### Rules
+- Every SET LOCAL MUST cite a specific EXPLAIN node your rewrite creates/changes
+- work_mem is PER-OPERATION: count hash/sort ops in your rewrite before sizing
+- random_page_cost: ONLY change if your rewrite creates index-favorable access patterns
+- Empty is valid: if your rewrite has no planner bottleneck, emit no SET LOCAL
+- Stay within the resource envelope bounds above
+
+### SET LOCAL Syntax
+Include SET LOCAL commands in the `runtime_config` array field of your JSON output.
+If no config changes help, omit the field or use an empty array.
+
+## Your Task — Self-Directed Retry
+
+Work through these 3 steps in a `<reasoning>` block, then output your optimized SQL:
+
+1. **DIAGNOSE**: Why did the best worker achieve 0.7485842061264555x instead of the 2.0x target? What do the EXPLAIN plans reveal about the actual execution bottleneck?
+2. **IDENTIFY**: What optimization angles are still unexplored? What did the empirical results reveal that couldn't have been known before seeing the execution plans?
+3. **REWRITE**: Produce optimized SQL that exploits the angles you identified. You may build on the best foundation or start fresh.
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Verify output schema matches the Column Completeness Contract (same columns, same names, same order).
+- Keep all semantic invariants from `Correctness Invariants` (including join/null behavior).
+- Verify aggregation equivalence: same rows participate in each group, same aggregate semantics.
+- Preserve all literals exactly (numbers, strings, date values).
+- Apply `Hazard Flags` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `cd_gender`
+  2. `cd_marital_status`
+  3. `cd_education_status`
+  4. `cnt1`
+  5. `cd_purchase_estimate`
+  6. `cnt2`
+  7. `cd_credit_rating`
+  8. `cnt3`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit or use empty array if not needed
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

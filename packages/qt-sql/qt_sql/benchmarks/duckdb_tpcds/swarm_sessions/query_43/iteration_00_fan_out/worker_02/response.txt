@@ -1,0 +1,72 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE chain)
+├── [~] filtered_date [=] Cost: 0% Rows: 366 — Filter date_dim to year 2000
+│   └── SCAN date_dim
+│       └── FILTER (d_year = 2000)
+├── [+] date_filtered_sales [=] Cost: 0% Rows: 5.1M — Join store_sales with filtered_date
+│   ├── SCAN store_sales
+│   └── JOIN (ss_sold_date_sk = d_date_sk) INNER
+├── [+] filtered_store_join [=] Cost: 0% Rows: 1.9M — Join with store filtered by GMT offset
+│   ├── SCAN store
+│   └── JOIN (ss_store_sk = s_store_sk AND s_gmt_offset = -5) INNER
+└── [~] main_aggregation [=] Cost: 100% Rows: 18 — Group by store and pivot day-of-week sales
+    ├── AGG (GROUP BY s_store_name, s_store_id)
+    │   └── SUM(CASE...) for each day
+    ├── SORT (s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales)
+    └── LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "prefetch_fact_join", "description": "Staged join pipeline: filter date_dim first, pre-join with fact, then join store dimension", "applied_to": ["filtered_date", "date_filtered_sales", "filtered_store_join"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Isolate date filter into CTE to materialize small dimension lookup", "applied_to": ["filtered_date"]},
+    {"id": "R3", "type": "semantic_preservation", "description": "Preserve exact join conditions, literals, and CASE-WHEN guards", "applied_to": ["all"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_day_name FROM date_dim WHERE d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk", "d_day_name"], "consumes": []}
+      },
+      "date_filtered_sales": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_store_sk, d_day_name, ss_sales_price FROM store_sales INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ss_store_sk", "d_day_name", "ss_sales_price"], "consumes": ["filtered_date"]}
+      },
+      "filtered_store_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_name, s_store_id, d_day_name, ss_sales_price FROM date_filtered_sales INNER JOIN store ON ss_store_sk = s_store_sk AND s_gmt_offset = -5",
+        "interfaces": {"outputs": ["s_store_name", "s_store_id", "d_day_name", "ss_sales_price"], "consumes": ["date_filtered_sales"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s_store_name, s_store_id, SUM(CASE WHEN d_day_name='Sunday' THEN ss_sales_price END) AS sun_sales, SUM(CASE WHEN d_day_name='Monday' THEN ss_sales_price END) AS mon_sales, SUM(CASE WHEN d_day_name='Tuesday' THEN ss_sales_price END) AS tue_sales, SUM(CASE WHEN d_day_name='Wednesday' THEN ss_sales_price END) AS wed_sales, SUM(CASE WHEN d_day_name='Thursday' THEN ss_sales_price END) AS thu_sales, SUM(CASE WHEN d_day_name='Friday' THEN ss_sales_price END) AS fri_sales, SUM(CASE WHEN d_day_name='Saturday' THEN ss_sales_price END) AS sat_sales FROM filtered_store_join GROUP BY s_store_name, s_store_id ORDER BY s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales LIMIT 100",
+        "interfaces": {"outputs": ["s_store_name", "s_store_id", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"], "consumes": ["filtered_store_join"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "date_filtered_sales", "filtered_store_join", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), date_filtered_sales AS ({date_filtered_sales}), filtered_store_join AS ({filtered_store_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Transformed the original single-block query into a staged CTE pipeline that first filters date_dim, pre-joins with store_sales, then joins with store, preserving exact semantics and defensive guards.
+
+Expected speedup: 2-3x from reduced fact table probing via pre-filtered dimension keys and materialized small dimension CTEs.

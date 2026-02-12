@@ -1,0 +1,99 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Cost: 100%  Rows: ~1K
+    ├── [CTE] common_scan  [+]  (SCAN + JOIN date_dim)
+    │   ├── FROM: web_sales
+    │   ├── JOIN: INNER JOIN date_dim ON d_date_sk = ws_sold_date_sk
+    │   └── WHERE: d_date between '1999-01-29' AND '1999-01-29'::date + INTERVAL '90 day' AND ws_wholesale_cost BETWEEN 35 AND 55
+    ├── [CTE] threshold_computation  [+]  (FROM common_scan, filter price ratio, group by item, compute 1.3*avg)
+    ├── [CTE] outer_rows  [+]  (FROM common_scan JOIN item, apply item filters)
+    ├── [CTE] join_filter  [+]  (JOIN outer_rows with threshold_computation, filter ws_ext_discount_amt > threshold)
+    ├── [=] SORT (SUM(ws_ext_discount_amt) ASC)
+    └── [=] OUTPUT (Excess Discount Amount)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "shared_materialization",
+      "description": "Replace correlated subquery with CTE-based shared scan to avoid repeated fact table scans and comma join cardinality issues",
+      "applied_to": ["common_scan", "threshold_computation", "outer_rows", "join_filter"]
+    },
+    {
+      "id": "R2",
+      "type": "explicit_join",
+      "description": "Convert comma joins to explicit INNER JOIN syntax for better cardinality estimation",
+      "applied_to": ["common_scan", "outer_rows"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "common_scan": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws_item_sk, ws_sold_date_sk, ws_ext_discount_amt, ws_wholesale_cost, ws_sales_price, ws_list_price, d_date_sk FROM web_sales INNER JOIN date_dim ON d_date_sk = ws_sold_date_sk WHERE d_date BETWEEN '1999-01-29' AND CAST('1999-01-29' AS DATE) + INTERVAL '90 DAY' AND ws_wholesale_cost BETWEEN 35 AND 55",
+        "interfaces": {
+          "outputs": ["ws_item_sk", "ws_sold_date_sk", "ws_ext_discount_amt", "ws_wholesale_cost", "ws_sales_price", "ws_list_price", "d_date_sk"],
+          "consumes": []
+        }
+      },
+      "threshold_computation": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws_item_sk, 1.3 * AVG(ws_ext_discount_amt) AS threshold FROM common_scan WHERE ws_sales_price / ws_list_price BETWEEN 76 * 0.01 AND 91 * 0.01 GROUP BY ws_item_sk",
+        "interfaces": {
+          "outputs": ["ws_item_sk", "threshold"],
+          "consumes": ["common_scan"]
+        }
+      },
+      "outer_rows": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs.ws_item_sk, cs.ws_ext_discount_amt FROM common_scan cs INNER JOIN item ON i_item_sk = cs.ws_item_sk WHERE (i_manufact_id BETWEEN 797 AND 996 OR i_category IN ('Men', 'Shoes', 'Sports'))",
+        "interfaces": {
+          "outputs": ["ws_item_sk", "ws_ext_discount_amt"],
+          "consumes": ["common_scan"]
+        }
+      },
+      "join_filter": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT o.ws_ext_discount_amt FROM outer_rows o INNER JOIN threshold_computation t ON o.ws_item_sk = t.ws_item_sk WHERE o.ws_ext_discount_amt > t.threshold",
+        "interfaces": {
+          "outputs": ["ws_ext_discount_amt"],
+          "consumes": ["outer_rows", "threshold_computation"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT SUM(ws_ext_discount_amt) AS \"Excess Discount Amount\" FROM join_filter ORDER BY SUM(ws_ext_discount_amt) LIMIT 100",
+        "interfaces": {
+          "outputs": ["Excess Discount Amount"],
+          "consumes": ["join_filter"]
+        }
+      }
+    },
+    "reconstruction_order": ["common_scan", "threshold_computation", "outer_rows", "join_filter", "main_query"],
+    "assembly_template": "WITH common_scan AS ({common_scan}), threshold_computation AS ({threshold_computation}), outer_rows AS ({outer_rows}), join_filter AS ({join_filter}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced the original correlated subquery with a CTE-based decomposition that shares the `web_sales` + `date_dim` scan between both branches. The `threshold_computation` CTE computes per-item thresholds using only rows meeting the price ratio filter (76-91%), while the `outer_rows` CTE applies item criteria independently. These are then joined to filter rows where the discount exceeds the threshold. The mechanism eliminates the correlated subquery execution per outer row and the comma-join cardinality estimation issues.
+
+**Expected speedup**: 3-4x (based on pattern reference examples showing 3.93x improvement for similar self-join decomposition with shared materialization).

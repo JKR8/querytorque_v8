@@ -1,0 +1,111 @@
+<reasoning>
+**1. DIAGNOSE - Why 1.04x instead of 2.0x?**
+
+The best previous attempt (W2) achieved only 1.04x because it failed to address the core bottleneck: the **massive hash join between 166,667 customer rows and 99 filtered customer_address rows (33.4ms, 67% of runtime)**. While W2 correctly pre-filtered dimensions, it kept the same logical join order: starting with customer→customer_address hash join. PostgreSQL's cost model correctly estimates this join as expensive but lacks an alternative path.
+
+The execution plan reveals:
+- The optimizer already pushes filters to base scans (customer_address on ca_city, income_band on bounds)
+- It uses efficient index scans for dimension lookups (household_demographics, customer_demographics, store_returns)
+- The bottleneck is NOT the dimension joins themselves, but the initial customer-customer_address hash join
+
+**2. IDENTIFY - Unexplored optimization angles:**
+
+From empirical results and PostgreSQL optimizer gaps:
+- **Comma-join weakness**: The original uses comma-joins (FROM a,b,c). PostgreSQL treats these as cross products initially. W1's explicit JOIN syntax actually regressed (0.94x), but that's likely due to other factors. The real issue: we haven't exploited **inner join reordering** properly.
+- **CTE materialization fence**: W2's CTEs create optimization fences that prevent predicate pushdown. However, this could be used STRATEGICALLY to force a better join order.
+- **Fact-first approach**: W3 attempted starting from store_returns but failed due to interface error. This is a valid unexplored angle: start from the smallest fact table (store_returns has only rows matching the join) and work outward.
+- **Selectivity mismatch**: customer_address filter (99 rows) is highly selective, but we join it against ALL customers first. Better: join filtered customer_address with household_demographics+income_band FIRST to create a tiny dimension composite, THEN find matching customers.
+
+**Key insight from plans**: The final result is only 186 rows. Yet we're scanning 166,667 customer rows upfront. The optimal path should: start with the most selective dimension combinations → find matching customers → verify store returns.
+
+**3. REWRITE - Strategy:**
+
+I'll implement a **multi-stage dimension reduction** approach:
+1. Pre-filter ALL selective dimensions (customer_address + income_band) into tiny CTEs
+2. Create a composite dimension key by joining these with household_demographics
+3. Start from **store_returns** (fact table) and join inward to customer_demographics
+4. Join this result with the composite dimension to find matching customers
+5. Force explicit JOIN syntax for better PostgreSQL cost estimation
+6. Use CTEs strategically but NOT as optimization fences (use LATERAL where appropriate)
+
+This creates a **fact-first** flow: store_returns → customer_demographics → dimension composite → customers. The hash join between large tables (customer-customer_address) is eliminated by pushing it later in the pipeline after significant reduction.
+
+I'll preserve all defensive guards and literal values exactly.
+</reasoning>
+
+**Part 1: Modified Logic Tree**
+
+```
+[~] Original query structure
+  [=] FROM customer, customer_address, customer_demographics, household_demographics, income_band, store_returns
+  [=] WHERE conditions as cross-product filters
+  [=] ORDER BY c_customer_id LIMIT 100
+
+[!] Restructured as fact-first dimension reduction
+  [+] filtered_customer_address CTE: SELECT * FROM customer_address WHERE ca_city = 'Mount Vernon'
+  [+] filtered_income_band CTE: SELECT * FROM income_band WHERE ib_lower_bound >= 40374 AND ib_upper_bound <= 90374
+  [+] composite_dimension CTE: JOIN filtered_customer_address, filtered_income_band, household_demographics
+  [+] store_returns_with_cdemo: JOIN store_returns + customer_demographics (early fact-dimension join)
+  [+] main_query: JOIN store_returns_with_cdemo → composite_dimension → customer (explicit JOIN syntax)
+  [=] ORDER BY c_customer_id LIMIT 100 preserved
+```
+
+**Part 2: Component Payload JSON**
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "fact_first_dimension_reduction", "description": "Start from fact table (store_returns) and join inward through dimensions", "applied_to": ["main_query"]},
+    {"id": "R2", "type": "explicit_join_syntax", "description": "Convert comma-joins to explicit INNER JOIN for better PostgreSQL cost estimation", "applied_to": ["main_query"]},
+    {"id": "R3", "type": "strategic_cte_materialization", "description": "Pre-filter selective dimensions into CTEs to create tiny hash tables", "applied_to": ["filtered_customer_address", "filtered_income_band", "composite_dimension"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_customer_address": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_city = 'Mount Vernon'",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "filtered_income_band": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ib_income_band_sk FROM income_band WHERE ib_lower_bound >= 40374 AND ib_upper_bound <= 90374",
+        "interfaces": {"outputs": ["ib_income_band_sk"], "consumes": []}
+      },
+      "composite_dimension": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT hd.hd_demo_sk, fca.ca_address_sk FROM filtered_customer_address fca INNER JOIN household_demographics hd ON 1=1 INNER JOIN filtered_income_band fib ON hd.hd_income_band_sk = fib.ib_income_band_sk",
+        "interfaces": {"outputs": ["hd_demo_sk", "ca_address_sk"], "consumes": ["filtered_customer_address", "filtered_income_band"]}
+      },
+      "store_returns_with_cdemo": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT sr.sr_cdemo_sk, cd.cd_demo_sk FROM store_returns sr INNER JOIN customer_demographics cd ON sr.sr_cdemo_sk = cd.cd_demo_sk",
+        "interfaces": {"outputs": ["sr_cdemo_sk", "cd_demo_sk"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c.c_customer_id AS customer_id, COALESCE(c.c_last_name, '') || ', ' || COALESCE(c.c_first_name, '') AS customername FROM store_returns_with_cdemo srcd INNER JOIN composite_dimension cd ON srcd.cd_demo_sk = cd.cd_demo_sk INNER JOIN customer c ON c.c_current_addr_sk = cd.ca_address_sk AND c.c_current_hdemo_sk = cd.hd_demo_sk AND c.c_current_cdemo_sk = srcd.cd_demo_sk ORDER BY c.c_customer_id LIMIT 100",
+        "interfaces": {"outputs": ["customer_id", "customername"], "consumes": ["store_returns_with_cdemo", "composite_dimension"]}
+      }
+    },
+    "reconstruction_order": ["filtered_customer_address", "filtered_income_band", "composite_dimension", "store_returns_with_cdemo", "main_query"],
+    "assembly_template": "WITH filtered_customer_address AS ({filtered_customer_address}), filtered_income_band AS ({filtered_income_band}), composite_dimension AS ({composite_dimension}), store_returns_with_cdemo AS ({store_returns_with_cdemo}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '32MB'", "SET LOCAL enable_nestloop = off", "SET LOCAL enable_hashjoin = on"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured to start from store_returns (fact table) and join inward through dimensions, using strategic CTEs to pre-filter selective dimensions (customer_address on city, income_band on bounds) and create a tiny composite dimension hash table. This avoids the expensive customer-customer_address hash join by pushing it later after significant row reduction.
+
+**Expected speedup**: 2.5-3.0x. By starting from store_returns (~5 rows per customer_demographics in the plan) and joining to pre-filtered dimensions, we eliminate the 33ms hash join that dominated runtime. The composite dimension CTE creates a tiny hash table (<< 100 rows) for fast probing.

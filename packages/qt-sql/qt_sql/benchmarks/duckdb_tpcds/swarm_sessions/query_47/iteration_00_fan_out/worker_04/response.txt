@@ -1,0 +1,138 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_filter  [+]  Cost: 1%  Rows: ~0.4K  — Filter date_dim for 2001 + Dec 2000 + Jan 2002
+│   ├── SCAN (date_dim)
+│   ├── FILTER ((d_year = 2001) OR (d_year = 2000 AND d_moy = 12) OR (d_year = 2002 AND d_moy = 1))
+│   └── OUTPUT (d_date_sk, d_year, d_moy)
+├── [CTE] store_filter  [+]  Cost: 0%  Rows: ~0.1K  — Full store dimension
+│   ├── SCAN (store)
+│   └── OUTPUT (s_store_sk, s_store_name, s_company_name)
+├── [CTE] item_all  [+]  Cost: 1%  Rows: ~100K  — Full item dimension
+│   ├── SCAN (item)
+│   └── OUTPUT (i_item_sk, i_category, i_brand)
+├── [CTE] fact_agg  [+]  Cost: 60%  Rows: ~100K  — Aggregate store_sales joined with filtered dimensions
+│   ├── SCAN (store_sales)
+│   ├── JOIN (INNER) date_filter ON ss_sold_date_sk = d_date_sk
+│   ├── JOIN (INNER) store_filter ON ss_store_sk = s_store_sk
+│   ├── JOIN (INNER) item_all ON ss_item_sk = i_item_sk
+│   ├── AGG (GROUP BY i_category, i_brand, s_store_name, s_company_name, d_year, d_moy)
+│   └── OUTPUT (i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, sum_sales)
+├── [CTE] v1_enhanced  [+]  Cost: 30%  Rows: ~100K  — Compute window functions (AVG, RANK, LAG, LEAD) in single pass
+│   ├── SCAN (fact_agg)
+│   ├── WINDOW (AVG over partition by i_category, i_brand, s_store_name, s_company_name, d_year)
+│   ├── WINDOW (RANK over partition by i_category, i_brand, s_store_name, s_company_name order by d_year, d_moy)
+│   ├── WINDOW (LAG over partition by i_category, i_brand, s_store_name, s_company_name order by d_year, d_moy)
+│   ├── WINDOW (LEAD over partition by i_category, i_brand, s_store_name, s_company_name order by d_year, d_moy)
+│   └── OUTPUT (i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn, psum, nsum)
+├── [- CTE v1]  — Replaced by v1_enhanced (single-pass window functions)
+├── [- CTE v2]  — Eliminated (self-join replaced by LAG/LEAD)
+└── [MAIN] main_query  [~]  Cost: 8%  Rows: ~100  — Filter 2001 outliers, using psum/nsum directly from v1_enhanced
+    ├── SCAN (v1_enhanced)
+    ├── FILTER (d_year = 2001)
+    ├── FILTER (avg_monthly_sales > 0)
+    ├── FILTER (CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1)
+    ├── SORT (sum_sales - avg_monthly_sales ASC, nsum ASC)
+    └── OUTPUT (s_store_name, d_year, avg_monthly_sales, sum_sales, psum, nsum)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "dimension_cte_isolate",
+      "description": "Pre-filter date_dim into CTE; extract store and item dimensions separately to avoid Cartesian product",
+      "applied_to": ["date_filter", "store_filter", "item_all"]
+    },
+    {
+      "id": "R2",
+      "type": "single_pass_aggregation",
+      "description": "Join filtered dimensions with fact table then aggregate by category/brand/store/year/month",
+      "applied_to": ["fact_agg"]
+    },
+    {
+      "id": "R3",
+      "type": "self_join_elimination",
+      "description": "Replace v1 self-join with LAG/LEAD window functions to compute psum/nsum in single pass",
+      "applied_to": ["v1_enhanced"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "date_filter": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT d_date_sk, d_year, d_moy FROM date_dim WHERE (d_year = 2001) OR (d_year = 2000 AND d_moy = 12) OR (d_year = 2002 AND d_moy = 1)",
+          "interfaces": {
+            "outputs": ["d_date_sk", "d_year", "d_moy"],
+            "consumes": []
+          }
+        },
+        "store_filter": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT s_store_sk, s_store_name, s_company_name FROM store",
+          "interfaces": {
+            "outputs": ["s_store_sk", "s_store_name", "s_company_name"],
+            "consumes": []
+          }
+        },
+        "item_all": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT i_item_sk, i_category, i_brand FROM item",
+          "interfaces": {
+            "outputs": ["i_item_sk", "i_category", "i_brand"],
+            "consumes": []
+          }
+        },
+        "fact_agg": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT i.i_category, i.i_brand, s.s_store_name, s.s_company_name, d.d_year, d.d_moy, SUM(ss.ss_sales_price) AS sum_sales FROM store_sales ss INNER JOIN date_filter d ON ss.ss_sold_date_sk = d.d_date_sk INNER JOIN store_filter s ON ss.ss_store_sk = s.s_store_sk INNER JOIN item_all i ON ss.ss_item_sk = i.i_item_sk GROUP BY i.i_category, i.i_brand, s.s_store_name, s.s_company_name, d.d_year, d.d_moy",
+          "interfaces": {
+            "outputs": ["i_category", "i_brand", "s_store_name", "s_company_name", "d_year", "d_moy", "sum_sales"],
+            "consumes": ["date_filter", "store_filter", "item_all"]
+          }
+        },
+        "v1_enhanced": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, sum_sales, AVG(sum_sales) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name, d_year) AS avg_monthly_sales, RANK() OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS rn, LAG(sum_sales) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS psum, LEAD(sum_sales) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS nsum FROM fact_agg",
+          "interfaces": {
+            "outputs": ["i_category", "i_brand", "s_store_name", "s_company_name", "d_year", "d_moy", "sum_sales", "avg_monthly_sales", "rn", "psum", "nsum"],
+            "consumes": ["fact_agg"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT s_store_name, d_year, avg_monthly_sales, sum_sales, psum, nsum FROM v1_enhanced WHERE d_year = 2001 AND avg_monthly_sales > 0 AND CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY sum_sales - avg_monthly_sales, nsum LIMIT 100",
+          "interfaces": {
+            "outputs": ["s_store_name", "d_year", "avg_monthly_sales", "sum_sales", "psum", "nsum"],
+            "consumes": ["v1_enhanced"]
+          }
+        }
+      },
+      "reconstruction_order": ["date_filter", "store_filter", "item_all", "fact_agg", "v1_enhanced", "main_query"],
+      "assembly_template": "WITH date_filter AS ({date_filter}), store_filter AS ({store_filter}), item_all AS ({item_all}), fact_agg AS ({fact_agg}), v1_enhanced AS ({v1_enhanced}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced original v1/v2 CTEs with isolated dimension CTEs + fact aggregation + single-pass window functions using LAG/LEAD to eliminate the expensive self-join. Preserved all original filters, guards, and output columns.
+
+**Expected speedup**: 2-4x (eliminates Cartesian explosion risk from cross-joining dimension CTEs and removes 3-way self-join via LAG/LEAD optimization).

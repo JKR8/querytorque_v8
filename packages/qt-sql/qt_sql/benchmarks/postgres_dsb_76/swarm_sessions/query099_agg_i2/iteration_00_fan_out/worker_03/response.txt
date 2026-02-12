@@ -1,0 +1,92 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]
+    ├── [~] WITH dimensions_combined AS (filtered dimensions cross join)
+    │   ├── SCAN (date_dim) with filter d_month_seq BETWEEN 1191 AND 1214
+    │   ├── SCAN (warehouse) with filter w_gmt_offset = -5  
+    │   ├── SCAN (ship_mode) with filter sm_type = 'LIBRARY'
+    │   ├── SCAN (call_center) with filter cc_class = 'medium'
+    │   └── CROSS JOIN (all four tables)
+    ├── [~] WITH catalog_sales_join AS (inner join with dimensions_combined)
+    │   ├── SCAN (catalog_sales) with filter cs_list_price BETWEEN 244 AND 273
+    │   └── INNER JOIN dimensions_combined ON four equality conditions
+    └── [~] main_aggregation (from CTE catalog_sales_join)
+        ├── AGG (GROUP BY substring(w_warehouse_name,1,20), sm_type, cc_name)
+        ├── COMPUTE conditional sums for five buckets
+        ├── SORT (same as original)
+        └── OUTPUT (same 8 columns, limit 100)
+```
+
+**Change markers:**
+- `[!]` Structural change from comma joins to CTE-based staged reduction
+- `[~] dimensions_combined`: New CTE combining all dimension filters into single Cartesian product
+- `[~] catalog_sales_join`: New CTE joining filtered dimensions with filtered fact table
+- `[~] main_aggregation`: Modified to consume CTE instead of base tables
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "pg_dimension_prefetch_star",
+      "description": "Pre-filter all selective dimensions into single CTE to create small hash table for optimizer",
+      "applied_to": ["dimensions_combined", "catalog_sales_join"]
+    },
+    {
+      "id": "R2", 
+      "type": "staged_reduction",
+      "description": "Reduce dimension and fact tables separately before joining to cut search space",
+      "applied_to": ["catalog_sales_join"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "dimensions_combined": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT dd.d_date_sk, w.w_warehouse_sk, w.w_warehouse_name, sm.sm_ship_mode_sk, sm.sm_type, cc.cc_call_center_sk, cc.cc_name FROM date_dim dd, warehouse w, ship_mode sm, call_center cc WHERE dd.d_month_seq BETWEEN 1191 AND 1191 + 23 AND w.w_gmt_offset = -5 AND sm.sm_type = 'LIBRARY' AND cc.cc_class = 'medium'",
+        "interfaces": {
+          "outputs": ["d_date_sk", "w_warehouse_sk", "w_warehouse_name", "sm_ship_mode_sk", "sm_type", "cc_call_center_sk", "cc_name"],
+          "consumes": []
+        }
+      },
+      "catalog_sales_join": {
+        "type": "cte", 
+        "change": "modified",
+        "sql": "SELECT cs.cs_sold_date_sk, cs.cs_ship_date_sk, dc.w_warehouse_name, dc.sm_type, dc.cc_name FROM catalog_sales cs INNER JOIN dimensions_combined dc ON cs.cs_ship_date_sk = dc.d_date_sk AND cs.cs_warehouse_sk = dc.w_warehouse_sk AND cs.cs_ship_mode_sk = dc.sm_ship_mode_sk AND cs.cs_call_center_sk = dc.cc_call_center_sk WHERE cs.cs_list_price BETWEEN 244 AND 273",
+        "interfaces": {
+          "outputs": ["cs_sold_date_sk", "cs_ship_date_sk", "w_warehouse_name", "sm_type", "cc_name"],
+          "consumes": ["dimensions_combined"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified", 
+        "sql": "SELECT substring(w_warehouse_name,1,20), sm_type, cc_name, SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS \"30 days\", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 30) AND (cs_ship_date_sk - cs_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS \"31-60 days\", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 60) AND (cs_ship_date_sk - cs_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS \"61-90 days\", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 90) AND (cs_ship_date_sk - cs_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS \"91-120 days\", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 120) THEN 1 ELSE 0 END) AS \">120 days\" FROM catalog_sales_join GROUP BY substring(w_warehouse_name,1,20), sm_type, cc_name ORDER BY substring(w_warehouse_name,1,20), sm_type, cc_name LIMIT 100",
+        "interfaces": {
+          "outputs": ["substring", "sm_type", "cc_name", "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"],
+          "consumes": ["catalog_sales_join"]
+        }
+      }
+    },
+    "reconstruction_order": ["dimensions_combined", "catalog_sales_join", "main_query"],
+    "assembly_template": "WITH dimensions_combined AS ({dimensions_combined}), catalog_sales_join AS ({catalog_sales_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured from comma joins to staged CTEs: first combine filtered dimensions via cross join, then join with filtered fact table. This gives the optimizer precise cardinality estimates for each small dimension set before the expensive fact table join.
+
+**Expected speedup:** ~3-4x from better join planning and reduced intermediate result sizes.

@@ -1,0 +1,464 @@
+<reasoning>
+1. **CLASSIFY**: This is a multi-channel UNION ALL query with independent aggregations per channel (store, catalog, web) over a fixed 30-day window. Each channel has two CTEs: one for sales and one for returns. The main query performs a UNION ALL of the three channels with some LEFT JOINs and a CROSS JOIN, then a GROUP BY ROLLUP. It's a classic "channel comparison" pattern with separate fact table scans per channel.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total time: 486ms.
+   - Largest cost: store_sales scan (277.8ms, 57% of total). Next: web_sales scan (56.5ms, 12%), store_returns scan (24.1ms, 5%), web_returns scan (8.0ms, 2%), catalog_sales scan (4.3ms, 1%).
+   - Each fact table is scanned exactly once (store_sales, store_returns, catalog_sales, catalog_returns, web_sales, web_returns). No repeated scans of the same fact table.
+   - Dimension tables: date_dim scanned 6 times (once per CTE), each scan filters to ~31 rows (0.4-0.9ms). store scanned twice (for ss and sr), web_page scanned twice (for ws and wr). These are tiny tables (102 and 200 rows).
+   - Row counts drop sharply after date_dim filter (73K → 31 rows). The fact table scans are huge (345.6M rows for store_sales) but filtered by date join to 600K rows for store_sales, 159K for web_sales, 321K for catalog_sales, etc.
+   - The optimizer already pushes the date filter into the date_dim scan and uses hash joins. It also splits the CTEs (each CTE is computed independently and materialized).
+   - The CTEs are materialized and then probed in the main query (ss, sr, ws, wr are joined; cs and cr are cross-joined). The UNION ALL is executed as a union of three branches.
+
+3. **GAP MATCHING**:
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: The same date filter (`d_date BETWEEN '1998-08-05' AND '1998-08-05' + 30 DAYS`) is applied in 6 separate date_dim scans. The date_dim table is tiny (73K rows) and the filter reduces it to 31 rows. Opportunity: share a single filtered date_dim CTE across all 6 CTEs. However, each CTE uses a different join key (ss_sold_date_sk, sr_returned_date_sk, etc.) so we can't reuse the same CTE unless we include all date_sk values that satisfy the filter. That's possible: create a date_dim CTE with d_date_sk and d_date, filter once, then join with each fact table. This would reduce 6 scans to 1 scan + 6 hash probes. Given each scan is cheap (0.4-0.9ms), total saving ~(6*0.65ms - 1*0.65ms) = ~3.25ms, which is <1% of total runtime. Not significant.
+   - **REDUNDANT_SCAN_ELIMINATION**: No repeated scans of the same fact table. Each fact table is scanned once. So channel_bitmap_aggregation doesn't apply.
+   - **UNION_CTE_SELF_JOIN_DECOMPOSITION**: No self-join of a CTE. The CTEs are joined only in the main query (ss left join sr, cs cross join cr, ws left join wr). No repeated scanning of the same CTE with different filters.
+   - **CORRELATED_SUBQUERY_PARALYSIS**: No correlated subqueries.
+   - **CROSS_COLUMN_OR_DECOMPOSITION**: No OR conditions.
+   - **Engine Strengths**: The optimizer already does intra-scan predicate pushdown (date filter pushed into date_dim scan). It uses hash joins efficiently. CTE inlining: each CTE is referenced once, so they are likely inlined (no materialization benefit). The logical-tree cost percentages are misleading: they assign 14% to each CTE, but the actual time is dominated by store_sales scan (277.8ms).
+
+4. **AGGREGATION TRAP CHECK**: The query uses SUM() only. No STDDEV_SAMP, AVG, or FILTER clauses. All aggregates are duplicate-insensitive (SUM of columns). The joins are on unique keys (store_sales join store on ss_store_sk = s_store_sk) which is one-to-many? Actually, store_sales may have multiple rows per store, but the join doesn't change the number of rows per store because it's an equality join on the same column. The aggregation is by s_store_sk after the join, so the join doesn't affect the aggregate grouping. Safe.
+
+5. **TRANSFORM SELECTION**:
+   - The dominant cost is scanning the large fact tables (store_sales, web_sales). The scans are sequential and read many rows (600K, 159K, 321K). The filter is via join with date_dim. The date_dim is tiny and selective. The optimizer already pushes the date filter. However, we can try to **pre-join the filtered date_dim with the fact table in a CTE chain** (prefetch_fact_join) to potentially reduce the fact table scan size? Actually, the fact table scan is already filtered by the join: the EXPLAIN shows a HASH_JOIN INNER on date_sk = date_sk, with the date_dim filtered first. The optimizer already does this. So prefetch_fact_join may not help.
+   - Another idea: **consolidate the two CTEs per channel into a single CTE** (e.g., for store channel, compute both sales and returns in one pass). But the fact tables are separate (store_sales and store_returns). We could do a FULL OUTER JOIN at the store level after aggregating each fact table, but that's similar to the current main query. However, the current main query does a LEFT JOIN between ss and sr. Could we compute both aggregates in a single scan of a union of store_sales and store_returns? That would require scanning both tables anyway, but maybe we can reduce the number of joins to store and date_dim. This is a variant of single_pass_aggregation across two fact tables for the same channel.
+   - Another observation: The catalog channel uses a CROSS JOIN between cs and cr. This is risky if there are multiple rows per call_center_sk in both CTEs (but they are aggregated, so one row per call_center_sk). However, if a call_center_sk appears in cs but not cr (or vice versa), the CROSS JOIN will produce no row? Actually, CROSS JOIN without a WHERE clause will produce Cartesian product. But cs and cr are both aggregated by cs_call_center_sk and cr_call_center_sk respectively. The main query does `FROM cs, cr` without a join condition. This is a Cartesian product between the two aggregated sets. If there are 13 rows in cs and 13 rows in cr, that's 169 rows. Then the UNION ALL combines with other channels. This seems intentional: the catalog channel sales and returns are not linked by a key; they are independent aggregations. The query expects to match each sales row with each returns row? That seems wrong. Wait, the original query likely expects a one-to-one match on call_center_sk. But the SQL does not join them; it does a CROSS JOIN. This is a bug? Actually, the query assumes that cs_call_center_sk and cr_call_center_sk are the same set of keys. The CROSS JOIN will produce a row for every combination, which is wrong. However, the result set is limited to 100 rows by LIMIT, and the GROUP BY ROLLUP will collapse duplicates? No, the GROUP BY ROLLUP is on channel and id (which is cs_call_center_sk). But the id is taken from cs_call_center_sk (line 87). If cr has a different set of keys, they won't match. This is a semantic bug in the original query. But we must preserve the bug in our rewrites. So we must keep the CROSS JOIN.
+
+   Given the above, we need to select 4 diverse strategies. The main bottleneck is the large fact table scans. The optimizer already does a good job. However, we can try:
+
+   Strategy 1: **Shared date_dim CTE** (date_cte_isolate) to reduce 6 date_dim scans to 1. Even though each scan is cheap, it's a clear optimization gap.
+
+   Strategy 2: **Consolidate store channel CTEs** (ss and sr) into a single CTE that aggregates both store_sales and store_returns in one pass by unioning them and using conditional aggregation. This would reduce the number of joins to store and date_dim from 2 to 1. Similarly for web channel. For catalog channel, we can consolidate cs and cr into one CTE (but note the CROSS JOIN issue: we must preserve the Cartesian product if the keys don't match). Actually, if we aggregate both sales and returns in one CTE, we would lose the Cartesian product because we'd group by call_center_sk and get one row per call_center_sk with both sales and returns. That would change semantics if there are duplicate keys? But the original cs and cr are aggregated by call_center_sk, so each has one row per call_center_sk. The CROSS JOIN between them would produce one row per combination of call_center_sk values. If the sets are the same, it's a one-to-one match and equivalent to a JOIN on call_center_sk. If they differ, the CROSS JOIN produces multiple rows. Our consolidation would produce only rows where the key appears in both fact tables (inner join). That changes semantics. So we cannot consolidate catalog channel. But for store and web channels, the original uses LEFT JOIN on the key, so consolidation with a FULL OUTER JOIN or UNION ALL with conditional aggregation might be equivalent.
+
+   Strategy 3: **Prefetch fact join**: Pre-filter date_dim and store into CTEs, then join with store_sales and store_returns in a chain. But the optimizer already does this. However, we can force the order by using CTEs.
+
+   Strategy 4 (Exploration): **Rewrite the entire query as a single aggregation pass over a union of all fact tables with channel labeling**. This would scan each fact table once (same as now) but avoid the separate CTEs and the main UNION ALL. We can compute the aggregates by channel and entity key in one go, then do the ROLLUP. This is a structural change that might allow better parallelization.
+
+   However, we must preserve the bug in catalog channel (CROSS JOIN). In a single-pass approach, we would need to simulate the CROSS JOIN by doing a Cartesian product between the sales and returns aggregates for catalog channel. That's tricky.
+
+   Given the time, I'll select these strategies:
+
+   Worker 1: Shared date_dim CTE (date_cte_isolate) + shared store and web_page CTEs (dimension_cte_isolate).
+   Worker 2: Consolidate store and web channel CTEs using single-pass aggregation per channel (union of sales and returns with conditional aggregation) while preserving LEFT JOIN semantics.
+   Worker 3: Prefetch fact join with staged CTE chain (prefetch_fact_join, multi_dimension_prefetch).
+   Worker 4 (Exploration): Single-pass aggregation across all channels with channel labeling and conditional aggregation, handling catalog channel CROSS JOIN via a separate step.
+
+6. **LOGICAL TREE DESIGN**:
+   For each strategy, define CTEs and their outputs.
+
+   Worker 1:
+     - date_range CTE: filtered date_dim with d_date_sk, d_date.
+     - store_filtered CTE: filtered store with s_store_sk (maybe all stores).
+     - web_page_filtered CTE: filtered web_page with wp_web_page_sk.
+     Then rewrite each fact CTE to join with these CTEs.
+
+   Worker 2:
+     - For store channel: create a CTE that unions store_sales and store_returns with a type indicator, joins with date_range and store_filtered, aggregates by s_store_sk, and uses CASE to compute sales and returns separately.
+     - Similarly for web channel.
+     - For catalog channel: keep separate cs and cr CTEs (because of CROSS JOIN).
+
+   Worker 3:
+     - date_range CTE.
+     - store_sales_pre: join date_range with store_sales, then join store_filtered.
+     - store_returns_pre: join date_range with store_returns, then join store_filtered.
+     - Similarly for web and catalog.
+
+   Worker 4:
+     - Create a CTE that unions all fact rows with a channel column and entity key, and includes columns for sales amount, returns amount, profit, profit_loss. Then aggregate by channel, entity key, and type (sales vs returns) maybe. Then pivot to get sales and returns per entity. Then handle catalog channel CROSS JOIN via a separate CTE that does a Cartesian product of sales and returns aggregates.
+
+   We'll need to ensure column completeness.
+
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Summarize 30-day performance from 1998-08-05 across store, catalog, and web channels by combining sales, returns, and net profit at channel entity level with rollup subtotals. Store and web channels use LEFT JOIN between sales and returns on entity key (store_sk, web_page_sk); catalog channel uses CROSS JOIN between sales and returns aggregates (potential Cartesian product if key sets differ). All aggregates are SUMs, no duplicate-sensitivity traps. Date filter is identical across all CTEs; dimension tables (store, web_page) are joined only for store and web channels.
+
+BOTTLENECK_DIAGNOSIS: Scan-bound: 57% of time (277.8ms) spent on sequential scan of store_sales (345.6M rows, filtered to 600K). Second largest is web_sales scan (56.5ms). Dimension scans are cheap (date_dim 6x ~0.65ms each). The optimizer already pushes date filters into dimension scans and uses hash joins efficiently. Cardinality flow: date_dim 73K → 31 rows per scan; store_sales 345.6M → 600K after date join; store 102 → 100 rows. Logical-tree cost percentages are misleading (equal 14% per CTE); actual cost is dominated by large fact table scans.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output channel, id, sales, returns, profit ordered by channel, id with LIMIT 100.
+- CTE_COLUMN_COMPLETENESS: Each CTE must output all columns referenced by downstream joins and selects (e.g., s_store_sk, sales, returns, profit_loss).
+- LITERAL_PRESERVATION: Date literal '1998-08-05' and interval '30 DAY' must be preserved exactly.
+- SEMANTIC_EQUIVALENCE: Must preserve LEFT JOIN semantics for store/web channels and CROSS JOIN for catalog channel.
+- CROSS_CTE_PREDICATE_BLINDNESS: Evidence: date_dim scanned 6 times with same filter (EXPLAIN shows 6 separate SEQ_SCAN date_dim nodes).
+- REDUNDANT_SCAN_ELIMINATION: Not active (each fact table scanned once).
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: Not active.
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Pre-filtered and joined fact table before multi-way fact joins, preventing optimizer reordering.
+   RULE: Do not pre-join fact tables with date CTE if there are multiple fact table joins (this query has no multi-way fact joins, safe).
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Baseline runtime <50ms, CTE overhead dominated.
+   RULE: This query baseline is 486ms, so CTE overhead acceptable.
+3. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially with fact tables.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: shared_dimension_cte
+TARGET_LOGICAL_TREE:
+  date_range -> store_filtered -> web_page_filtered -> ss -> sr -> cs -> cr -> ws -> wr -> main_query
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_date BETWEEN CAST('1998-08-05' AS DATE) AND (CAST('1998-08-05' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 31
+    CONSUMERS: ss, sr, cs, cr, ws, wr
+  store_filtered:
+    FROM: store
+    WHERE: s_store_sk <= 100 (from EXPLAIN filter)
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 100
+    CONSUMERS: ss, sr
+  web_page_filtered:
+    FROM: web_page
+    OUTPUT: wp_web_page_sk
+    EXPECTED_ROWS: 200
+    CONSUMERS: ws, wr
+  ss:
+    FROM: store_sales, date_range, store_filtered
+    JOIN: ss_sold_date_sk = date_range.d_date_sk AND ss_store_sk = store_filtered.s_store_sk
+    GROUP BY: s_store_sk
+    AGGREGATE: SUM(ss_ext_sales_price) AS sales, SUM(ss_net_profit) AS profit
+    OUTPUT: s_store_sk, sales, profit
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  sr:
+    FROM: store_returns, date_range, store_filtered
+    JOIN: sr_returned_date_sk = date_range.d_date_sk AND sr_store_sk = store_filtered.s_store_sk
+    GROUP BY: s_store_sk
+    AGGREGATE: SUM(sr_return_amt) AS returns, SUM(sr_net_loss) AS profit_loss
+    OUTPUT: s_store_sk, returns, profit_loss
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  cs:
+    FROM: catalog_sales, date_range
+    JOIN: cs_sold_date_sk = date_range.d_date_sk
+    GROUP BY: cs_call_center_sk
+    AGGREGATE: SUM(cs_ext_sales_price) AS sales, SUM(cs_net_profit) AS profit
+    OUTPUT: cs_call_center_sk, sales, profit
+    EXPECTED_ROWS: 13
+    CONSUMERS: main_query
+  cr:
+    FROM: catalog_returns, date_range
+    JOIN: cr_returned_date_sk = date_range.d_date_sk
+    GROUP BY: cr_call_center_sk
+    AGGREGATE: SUM(cr_return_amount) AS returns, SUM(cr_net_loss) AS profit_loss
+    OUTPUT: cr_call_center_sk, returns, profit_loss
+    EXPECTED_ROWS: 13
+    CONSUMERS: main_query
+  ws:
+    FROM: web_sales, date_range, web_page_filtered
+    JOIN: ws_sold_date_sk = date_range.d_date_sk AND ws_web_page_sk = web_page_filtered.wp_web_page_sk
+    GROUP BY: wp_web_page_sk
+    AGGREGATE: SUM(ws_ext_sales_price) AS sales, SUM(ws_net_profit) AS profit
+    OUTPUT: wp_web_page_sk, sales, profit
+    EXPECTED_ROWS: 101
+    CONSUMERS: main_query
+  wr:
+    FROM: web_returns, date_range, web_page_filtered
+    JOIN: wr_returned_date_sk = date_range.d_date_sk AND wr_web_page_sk = web_page_filtered.wp_web_page_sk
+    GROUP BY: wp_web_page_sk
+    AGGREGATE: SUM(wr_return_amt) AS returns, SUM(wr_net_loss) AS profit_loss
+    OUTPUT: wp_web_page_sk, returns, profit_loss
+    EXPECTED_ROWS: 101
+    CONSUMERS: main_query
+EXAMPLES: date_cte_isolate, dimension_cte_isolate, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: Apply the single date_range CTE pattern; ignore the decorrelation aspect (no correlated subqueries).
+- dimension_cte_isolate: Apply filtered store and web_page CTEs; ignore cross-joining them (join them only with fact tables).
+- shared_dimension_multi_channel: Extract shared date filter across all channel CTEs; ignore item/promotion filters (not present).
+HAZARD_FLAGS:
+- Must ensure date_range CTE includes all d_date_sk needed for all joins (already covered by filter).
+- store_filtered must include s_store_sk <= 100 filter from EXPLAIN to match original row count.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: consolidate_channel_cte
+TARGET_LOGICAL_TREE:
+  date_range -> store_combined -> catalog_separate -> web_combined -> main_query
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_date BETWEEN CAST('1998-08-05' AS DATE) AND (CAST('1998-08-05' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 31
+    CONSUMERS: store_combined, catalog_separate, web_combined
+  store_combined:
+    FROM: (
+        SELECT ss_store_sk AS store_sk, ss_ext_sales_price AS sales_amt, ss_net_profit AS profit_amt, 0 AS return_amt, 0 AS loss_amt, 'sales' AS type
+        FROM store_sales
+        UNION ALL
+        SELECT sr_store_sk AS store_sk, 0 AS sales_amt, 0 AS profit_amt, sr_return_amt AS return_amt, sr_net_loss AS loss_amt, 'returns' AS type
+        FROM store_returns
+    ) AS t, date_range, store
+    JOIN: t.store_sk = store.s_store_sk AND (t.type = 'sales' AND ss_sold_date_sk = date_range.d_date_sk) OR (t.type = 'returns' AND sr_returned_date_sk = date_range.d_date_sk)  -- This is tricky; better to split into two joins. Instead, use two subqueries and union after joins.
+    Let's redesign: create two sub-CTEs for sales and returns, then union after aggregating? Actually, we want to aggregate by store_sk and compute sales and returns in one pass. We'll do conditional aggregation after union.
+    Revised contract:
+    FROM: (
+        SELECT ss_store_sk AS store_sk, ss_ext_sales_price AS sales_amt, ss_net_profit AS profit_amt, 0 AS return_amt, 0 AS loss_amt
+        FROM store_sales, date_range
+        WHERE ss_sold_date_sk = date_range.d_date_sk
+        UNION ALL
+        SELECT sr_store_sk AS store_sk, 0 AS sales_amt, 0 AS profit_amt, sr_return_amt AS return_amt, sr_net_loss AS loss_amt
+        FROM store_returns, date_range
+        WHERE sr_returned_date_sk = date_range.d_date_sk
+    ) AS t, store
+    JOIN: t.store_sk = store.s_store_sk
+    WHERE: store.s_store_sk <= 100
+    GROUP BY: store.s_store_sk
+    AGGREGATE: SUM(sales_amt) AS sales, SUM(return_amt) AS returns, SUM(profit_amt) AS profit, SUM(loss_amt) AS profit_loss
+    OUTPUT: s_store_sk, sales, returns, profit, profit_loss
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  catalog_separate:
+    (Keep cs and cr separate as in original, but using date_range)
+    cs:
+        FROM: catalog_sales, date_range
+        JOIN: cs_sold_date_sk = date_range.d_date_sk
+        GROUP BY: cs_call_center_sk
+        AGGREGATE: SUM(cs_ext_sales_price) AS sales, SUM(cs_net_profit) AS profit
+        OUTPUT: cs_call_center_sk, sales, profit
+    cr:
+        FROM: catalog_returns, date_range
+        JOIN: cr_returned_date_sk = date_range.d_date_sk
+        GROUP BY: cr_call_center_sk
+        AGGREGATE: SUM(cr_return_amount) AS returns, SUM(cr_net_loss) AS profit_loss
+        OUTPUT: cr_call_center_sk, returns, profit_loss
+    EXPECTED_ROWS: 13 each
+    CONSUMERS: main_query
+  web_combined:
+    Similar to store_combined but with web_page.
+    FROM: (
+        SELECT ws_web_page_sk AS page_sk, ws_ext_sales_price AS sales_amt, ws_net_profit AS profit_amt, 0 AS return_amt, 0 AS loss_amt
+        FROM web_sales, date_range
+        WHERE ws_sold_date_sk = date_range.d_date_sk
+        UNION ALL
+        SELECT wr_web_page_sk AS page_sk, 0 AS sales_amt, 0 AS profit_amt, wr_return_amt AS return_amt, wr_net_loss AS loss_amt
+        FROM web_returns, date_range
+        WHERE wr_returned_date_sk = date_range.d_date_sk
+    ) AS t, web_page
+    JOIN: t.page_sk = web_page.wp_web_page_sk
+    GROUP BY: wp_web_page_sk
+    AGGREGATE: SUM(sales_amt) AS sales, SUM(return_amt) AS returns, SUM(profit_amt) AS profit, SUM(loss_amt) AS profit_loss
+    OUTPUT: wp_web_page_sk, sales, returns, profit, profit_loss
+    EXPECTED_ROWS: 101
+    CONSUMERS: main_query
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation, union_cte_split
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply conditional aggregation via UNION ALL of fact tables within a channel; ignore the scalar subquery consolidation (not present).
+- channel_bitmap_aggregation: Use CASE WHEN to label sales vs returns within a single scan per fact table? Actually, we are scanning each fact table once, same as original. The consolidation is across fact tables per channel, not across time buckets.
+- union_cte_split: Not applicable; ignore the splitting aspect.
+HAZARD_FLAGS:
+- Must preserve LEFT JOIN semantics: store_combined aggregates both sales and returns per store, but original ss LEFT JOIN sr may have rows with sales but no returns. Our union will include both sides, and aggregation will produce sales and returns even if one side missing (because we union zeros). This matches LEFT JOIN? Actually, LEFT JOIN would have a row for store with sales but no returns, with returns as NULL. Our aggregation will have returns = 0 (because we union zero row for returns? Wait, if a store has sales but no returns, the returns subquery will not contribute any row for that store. So the union will have only sales row, and aggregation will sum returns = 0. That's correct because COALESCE(returns,0) in original. Similarly profit_loss = 0. So it's equivalent.
+- For catalog channel, must keep separate cs and cr CTEs and CROSS JOIN them.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  date_range -> store_sales_pre -> store_returns_pre -> cs_pre -> cr_pre -> ws_pre -> wr_pre -> main_query
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_date BETWEEN CAST('1998-08-05' AS DATE) AND (CAST('1998-08-05' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 31
+    CONSUMERS: store_sales_pre, store_returns_pre, cs_pre, cr_pre, ws_pre, wr_pre
+  store_sales_pre:
+    FROM: store_sales, date_range
+    JOIN: ss_sold_date_sk = date_range.d_date_sk
+    OUTPUT: ss_store_sk, ss_ext_sales_price, ss_net_profit
+    EXPECTED_ROWS: 600K
+    CONSUMERS: ss_agg
+  store_returns_pre:
+    FROM: store_returns, date_range
+    JOIN: sr_returned_date_sk = date_range.d_date_sk
+    OUTPUT: sr_store_sk, sr_return_amt, sr_net_loss
+    EXPECTED_ROWS: 29K
+    CONSUMERS: sr_agg
+  cs_pre:
+    FROM: catalog_sales, date_range
+    JOIN: cs_sold_date_sk = date_range.d_date_sk
+    OUTPUT: cs_call_center_sk, cs_ext_sales_price, cs_net_profit
+    EXPECTED_ROWS: 321K
+    CONSUMERS: cs_agg
+  cr_pre:
+    FROM: catalog_returns, date_range
+    JOIN: cr_returned_date_sk = date_range.d_date_sk
+    OUTPUT: cr_call_center_sk, cr_return_amount, cr_net_loss
+    EXPECTED_ROWS: 14K
+    CONSUMERS: cr_agg
+  ws_pre:
+    FROM: web_sales, date_range
+    JOIN: ws_sold_date_sk = date_range.d_date_sk
+    OUTPUT: ws_web_page_sk, ws_ext_sales_price, ws_net_profit
+    EXPECTED_ROWS: 159K
+    CONSUMERS: ws_agg
+  wr_pre:
+    FROM: web_returns, date_range
+    JOIN: wr_returned_date_sk = date_range.d_date_sk
+    OUTPUT: wr_web_page_sk, wr_return_amt, wr_net_loss
+    EXPECTED_ROWS: 4,680
+    CONSUMERS: wr_agg
+  ss_agg:
+    FROM: store_sales_pre, store
+    JOIN: ss_store_sk = store.s_store_sk
+    WHERE: store.s_store_sk <= 100
+    GROUP BY: store.s_store_sk
+    AGGREGATE: SUM(ss_ext_sales_price) AS sales, SUM(ss_net_profit) AS profit
+    OUTPUT: s_store_sk, sales, profit
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  sr_agg:
+    FROM: store_returns_pre, store
+    JOIN: sr_store_sk = store.s_store_sk
+    WHERE: store.s_store_sk <= 100
+    GROUP BY: store.s_store_sk
+    AGGREGATE: SUM(sr_return_amt) AS returns, SUM(sr_net_loss) AS profit_loss
+    OUTPUT: s_store_sk, returns, profit_loss
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  cs_agg:
+    FROM: cs_pre
+    GROUP BY: cs_call_center_sk
+    AGGREGATE: SUM(cs_ext_sales_price) AS sales, SUM(cs_net_profit) AS profit
+    OUTPUT: cs_call_center_sk, sales, profit
+    EXPECTED_ROWS: 13
+    CONSUMERS: main_query
+  cr_agg:
+    FROM: cr_pre
+    GROUP BY: cr_call_center_sk
+    AGGREGATE: SUM(cr_return_amount) AS returns, SUM(cr_net_loss) AS profit_loss
+    OUTPUT: cr_call_center_sk, returns, profit_loss
+    EXPECTED_ROWS: 13
+    CONSUMERS: main_query
+  ws_agg:
+    FROM: ws_pre, web_page
+    JOIN: ws_web_page_sk = web_page.wp_web_page_sk
+    GROUP BY: wp_web_page_sk
+    AGGREGATE: SUM(ws_ext_sales_price) AS sales, SUM(ws_net_profit) AS profit
+    OUTPUT: wp_web_page_sk, sales, profit
+    EXPECTED_ROWS: 101
+    CONSUMERS: main_query
+  wr_agg:
+    FROM: wr_pre, web_page
+    JOIN: wr_web_page_sk = web_page.wp_web_page_sk
+    GROUP BY: wp_web_page_sk
+    AGGREGATE: SUM(wr_return_amt) AS returns, SUM(wr_net_loss) AS profit_loss
+    OUTPUT: wp_web_page_sk, returns, profit_loss
+    EXPECTED_ROWS: 101
+    CONSUMERS: main_query
+EXAMPLES: prefetch_fact_join, multi_dimension_prefetch, pushdown
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply staged CTE chain: filter date, then join with fact table, then join with other dimensions. Ignore the multi-fact-join aspect (not present).
+- multi_dimension_prefetch: Pre-filter date and store dimensions before joining with fact tables; ignore unfiltered dimension CTEs.
+- pushdown: Push date filter into the earliest scan via CTE; ignore scalar subquery consolidation.
+HAZARD_FLAGS:
+- May add CTE materialization overhead for intermediate results (store_sales_pre, etc.) but fact tables are large and may benefit from reduced join cost? Actually, the original already does the join in one step. This strategy may not improve performance but is a valid restructuring.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: single_pass_all_channels
+TARGET_LOGICAL_TREE:
+  date_range -> all_facts_union -> channel_aggregates -> catalog_cross -> main_union -> rollup
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_date BETWEEN CAST('1998-08-05' AS DATE) AND (CAST('1998-08-05' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 31
+    CONSUMERS: all_facts_union
+  all_facts_union:
+    FROM: (
+        SELECT 'store' AS channel, ss_store_sk AS entity_key, ss_ext_sales_price AS sales_amt, ss_net_profit AS profit_amt, 0 AS return_amt, 0 AS loss_amt, 'sales' AS type
+        FROM store_sales, date_range
+        WHERE ss_sold_date_sk = date_range.d_date_sk
+        UNION ALL
+        SELECT 'store' AS channel, sr_store_sk AS entity_key, 0 AS sales_amt, 0 AS profit_amt, sr_return_amt AS return_amt, sr_net_loss AS loss_amt, 'returns' AS type
+        FROM store_returns, date_range
+        WHERE sr_returned_date_sk = date_range.d_date_sk
+        UNION ALL
+        SELECT 'catalog' AS channel, cs_call_center_sk AS entity_key, cs_ext_sales_price AS sales_amt, cs_net_profit AS profit_amt, 0 AS return_amt, 0 AS loss_amt, 'sales' AS type
+        FROM catalog_sales, date_range
+        WHERE cs_sold_date_sk = date_range.d_date_sk
+        UNION ALL
+        SELECT 'catalog' AS channel, cr_call_center_sk AS entity_key, 0 AS sales_amt, 0 AS profit_amt, cr_return_amount AS return_amt, cr_net_loss AS loss_amt, 'returns' AS type
+        FROM catalog_returns, date_range
+        WHERE cr_returned_date_sk = date_range.d_date_sk
+        UNION ALL
+        SELECT 'web' AS channel, ws_web_page_sk AS entity_key, ws_ext_sales_price AS sales_amt, ws_net_profit AS profit_amt, 0 AS return_amt, 0 AS loss_amt, 'sales' AS type
+        FROM web_sales, date_range
+        WHERE ws_sold_date_sk = date_range.d_date_sk
+        UNION ALL
+        SELECT 'web' AS channel, wr_web_page_sk AS entity_key, 0 AS sales_amt, 0 AS profit_amt, wr_return_amt AS return_amt, wr_net_loss AS loss_amt, 'returns' AS type
+        FROM web_returns, date_range
+        WHERE wr_returned_date_sk = date_range.d_date_sk
+    ) AS t
+    OUTPUT: channel, entity_key, sales_amt, profit_amt, return_amt, loss_amt, type
+    EXPECTED_ROWS: sum of all fact rows after date join (~1.1M)
+    CONSUMERS: channel_aggregates
+  channel_aggregates:
+    FROM: all_facts_union
+    GROUP BY: channel, entity_key, type
+    AGGREGATE: SUM(sales_amt) AS sales, SUM(profit_amt) AS profit, SUM(return_amt) AS returns, SUM(loss_amt) AS loss
+    OUTPUT: channel, entity_key, type, sales, profit, returns, loss
+    EXPECTED_ROWS: number of distinct (channel, entity_key, type) pairs (~ 51+51+13+13+101+101 = 330)
+    CONSUMERS: catalog_cross, main_union
+  catalog_cross:
+    (Handle the CROSS JOIN for catalog channel separately)
+    FROM: 
+        (SELECT entity_key, sales, profit FROM channel_aggregates WHERE channel = 'catalog' AND type = 'sales') AS cs,
+        (SELECT entity_key, returns, loss FROM channel_aggregates WHERE channel = 'catalog' AND type = 'returns') AS cr
+    -- This is a CROSS JOIN (Cartesian product)
+    OUTPUT: cs.entity_key AS cs_key, cr.entity_key AS cr_key, cs.sales, cs.profit, cr.returns, cr.loss
+    EXPECTED_ROWS: 13 * 13 = 169
+    CONSUMERS: main_union
+  main_union:
+    FROM: (
+        SELECT 'store channel' AS channel, entity_key AS id, 
+               SUM(sales) AS sales, SUM(returns) AS returns, 
+               SUM(profit) - SUM(loss) AS profit
+        FROM channel_aggregates 
+        WHERE channel = 'store'
+        GROUP BY entity_key
+        UNION ALL
+        SELECT 'catalog channel' AS channel, cs_key AS id,
+               cs.sales, cr.returns, cs.profit - cr.loss AS profit
+        FROM catalog_cross
+        UNION ALL
+        SELECT 'web channel' AS channel, entity_key AS id,
+               SUM(sales) AS sales, SUM(returns) AS returns,
+               SUM(profit) - SUM(loss) AS profit
+        FROM channel_aggregates
+        WHERE channel = 'web'
+        GROUP BY entity_key
+    ) AS u
+    OUTPUT: channel, id, sales, returns, profit
+    EXPECTED_ROWS: 51 + 169 + 101 = 321
+    CONSUMERS: rollup
+  rollup:
+    FROM: main_union
+    GROUP BY ROLLUP (channel, id)
+    ORDER BY channel, id
+    LIMIT 100
+    OUTPUT: channel, id, SUM(sales) AS sales, SUM(returns) AS returns, SUM(profit) AS profit
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final output
+EXAMPLES: channel_bitmap_aggregation, single_pass_aggregation, union_cte_split
+EXAMPLE_ADAPTATION:
+- channel_bitmap_aggregation: Apply the idea of labeling rows by channel and type in a single union; ignore the time-bucket CASE aggregation (not needed).
+- single_pass_aggregation: Consolidate all fact table scans into one big union; ignore scalar subquery aspect.
+- union_cte_split: Not applicable; ignore.
+HAZARD_FLAGS:
+- The catalog channel CROSS JOIN must be preserved exactly. Our catalog_cross CTE does a Cartesian product of sales and returns aggregates, which matches the original CROSS JOIN.
+- The store and web channels originally LEFT JOIN on entity key, but our aggregation sums sales and returns separately per entity_key, which is equivalent because we have both sales and returns rows per entity_key (or zeros). However, if an entity has sales but no returns, the original LEFT JOIN would have a row with returns NULL, and COALESCE(returns,0) turns it to 0. Our aggregation will have a returns row with zeros? Actually, if there are no returns rows for that entity, the returns sum will be 0 (because the returns subquery didn't contribute any row). So it's equivalent.
+- Performance risk: The big union may not be more efficient than separate CTEs, but it's an exploration.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (combining all fact tables into a single union with channel labeling and handling the catalog cross join separately)

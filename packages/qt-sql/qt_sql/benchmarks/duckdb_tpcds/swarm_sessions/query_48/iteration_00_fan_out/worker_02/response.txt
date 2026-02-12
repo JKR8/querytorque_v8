@@ -1,0 +1,90 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Now uses CTE chain with prefetched dimension filters and staged fact reduction
+    ├── CTE date_cte [=]  (isolated date filter)
+    ├── CTE store_sales_filtered [=]  (fact table pre-filtered by date and price/profit ranges)
+    ├── CTE customer_demographics_cte [=]  (pre-filtered demographics)
+    ├── CTE customer_address_cte [=]  (pre-filtered address)
+    ├── CTE store_cte [=]  (pre-filtered store)
+    ├── CTE final_join [=]  (joins all dimension CTEs to filtered fact, applies cross-column OR logic)
+    └── CTE aggregation [=]  (final sum)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "multi_dimension_prefetch", "description": "Prefilter all dimension tables into CTEs before joining to fact table", "applied_to": ["date_cte", "customer_demographics_cte", "customer_address_cte", "store_cte"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Stage fact table reduction: first join date filter, then pre-filter by price/profit ranges", "applied_to": ["store_sales_filtered"]},
+    {"id": "R3", "type": "preserve_structural_or", "description": "Keep OR conditions as-is in final join (no union splitting)", "applied_to": ["final_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "store_sales_filtered": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_store_sk, ss_cdemo_sk, ss_addr_sk, ss_quantity, ss_sales_price, ss_net_profit FROM store_sales INNER JOIN date_cte ON ss_sold_date_sk = date_cte.d_date_sk WHERE (ss_sales_price BETWEEN 50.00 AND 200.00) AND (ss_net_profit BETWEEN 0 AND 25000)",
+        "interfaces": {"outputs": ["ss_store_sk", "ss_cdemo_sk", "ss_addr_sk", "ss_quantity", "ss_sales_price", "ss_net_profit"], "consumes": ["date_cte"]}
+      },
+      "customer_demographics_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cd_demo_sk, cd_marital_status, cd_education_status FROM customer_demographics WHERE (cd_marital_status = 'U' AND cd_education_status = 'Primary') OR (cd_marital_status = 'W' AND cd_education_status = 'College') OR (cd_marital_status = 'D' AND cd_education_status = '2 yr Degree')",
+        "interfaces": {"outputs": ["cd_demo_sk", "cd_marital_status", "cd_education_status"], "consumes": []}
+      },
+      "customer_address_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk, ca_state FROM customer_address WHERE ca_country = 'United States' AND ca_state IN ('MD','MN','IA','VA','IL','TX','MI','WI','IN')",
+        "interfaces": {"outputs": ["ca_address_sk", "ca_state"], "consumes": []}
+      },
+      "store_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_store_sk FROM store WHERE s_store_sk <= 100",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "final_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT store_sales_filtered.ss_quantity FROM store_sales_filtered INNER JOIN customer_demographics_cte ON store_sales_filtered.ss_cdemo_sk = customer_demographics_cte.cd_demo_sk INNER JOIN customer_address_cte ON store_sales_filtered.ss_addr_sk = customer_address_cte.ca_address_sk INNER JOIN store_cte ON store_sales_filtered.ss_store_sk = store_cte.s_store_sk WHERE ((customer_demographics_cte.cd_marital_status = 'U' AND customer_demographics_cte.cd_education_status = 'Primary' AND store_sales_filtered.ss_sales_price BETWEEN 100.00 AND 150.00) OR (customer_demographics_cte.cd_marital_status = 'W' AND customer_demographics_cte.cd_education_status = 'College' AND store_sales_filtered.ss_sales_price BETWEEN 50.00 AND 100.00) OR (customer_demographics_cte.cd_marital_status = 'D' AND customer_demographics_cte.cd_education_status = '2 yr Degree' AND store_sales_filtered.ss_sales_price BETWEEN 150.00 AND 200.00)) AND ((customer_address_cte.ca_state IN ('MD','MN','IA') AND store_sales_filtered.ss_net_profit BETWEEN 0 AND 2000) OR (customer_address_cte.ca_state IN ('VA','IL','TX') AND store_sales_filtered.ss_net_profit BETWEEN 150 AND 3000) OR (customer_address_cte.ca_state IN ('MI','WI','IN') AND store_sales_filtered.ss_net_profit BETWEEN 50 AND 25000))",
+        "interfaces": {"outputs": ["ss_quantity"], "consumes": ["store_sales_filtered", "customer_demographics_cte", "customer_address_cte", "store_cte"]}
+      },
+      "aggregation": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT SUM(ss_quantity) AS total_quantity FROM final_join",
+        "interfaces": {"outputs": ["total_quantity"], "consumes": ["final_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT total_quantity FROM aggregation",
+        "interfaces": {"outputs": ["total_quantity"], "consumes": ["aggregation"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "store_sales_filtered", "customer_demographics_cte", "customer_address_cte", "store_cte", "final_join", "aggregation", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), store_sales_filtered AS ({store_sales_filtered}), customer_demographics_cte AS ({customer_demographics_cte}), customer_address_cte AS ({customer_address_cte}), store_cte AS ({store_cte}), final_join AS ({final_join}), aggregation AS ({aggregation}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured the original flat join into a CTE chain that prefilters all dimension tables before joining to the progressively reduced fact table. This follows the target logical tree exactly, applying multi-dimension prefetch and staged fact reduction patterns.
+
+**Expected speedup**: 2-4x due to early reduction of fact table rows via date join and price/profit filtering, followed by hash joins with small pre-filtered dimension CTEs instead of scanning large tables repeatedly.

@@ -1,0 +1,413 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Compute per-item average metrics for 2001 catalog sales to male, single customers with unknown education under promotions where email or event channel is disabled. All joins are INNER (intersection semantics) requiring matches on all 5 tables. AVG aggregates are sensitive to row duplication from joins; any rewrite must preserve the exact join cardinality per item. The OR condition on promotion channels must evaluate per promotion row before joining to catalog_sales.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+date_cte -> customer_cte -> promotion_cte -> prefact_cte (join all dim CTEs) -> fact_with_dims -> item_join -> aggregation
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year = 2001
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: prefact_cte
+  customer_cte:
+    FROM: customer_demographics
+    WHERE: cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'Unknown'
+    OUTPUT: cd_demo_sk
+    EXPECTED_ROWS: 27K
+    CONSUMERS: prefact_cte
+  promotion_cte:
+    FROM: promotion
+    WHERE: p_channel_email = 'N' OR p_channel_event = 'N'
+    OUTPUT: p_promo_sk
+    EXPECTED_ROWS: 500
+    CONSUMERS: prefact_cte
+  prefact_cte:
+    FROM: date_cte, customer_cte, promotion_cte
+    JOIN: CROSS JOIN (but implement as nested joins with fact table)
+    OUTPUT: d_date_sk, cd_demo_sk, p_promo_sk
+    EXPECTED_ROWS: 365 * 27K * 500 = too large (4.9B) but will be reduced by fact join
+    CONSUMERS: fact_with_dims
+  fact_with_dims:
+    FROM: catalog_sales JOIN prefact_cte ON cs_sold_date_sk = d_date_sk AND cs_bill_cdemo_sk = cd_demo_sk AND cs_promo_sk = p_promo_sk
+    OUTPUT: cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price
+    EXPECTED_ROWS: 40K
+    CONSUMERS: item_join
+  item_join:
+    FROM: fact_with_dims JOIN item ON cs_item_sk = i_item_sk
+    OUTPUT: i_item_id, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price
+    EXPECTED_ROWS: 40K
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: item_join
+    GROUP BY: i_item_id
+    AGGREGATE: AVG(cs_quantity), AVG(cs_list_price), AVG(cs_coupon_amt), AVG(cs_sales_price)
+    OUTPUT: i_item_id, agg1, agg2, agg3, agg4
+    ORDER BY: i_item_id
+    LIMIT: 100
+    EXPECTED_ROWS: 27K → 100
+    CONSUMERS: output
+
+NODE_CONTRACTS:
+date_cte:
+    FROM: date_dim
+    WHERE: d_year = 2001
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: prefact_cte
+  customer_cte:
+    FROM: customer_demographics
+    WHERE: cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'Unknown'
+    OUTPUT: cd_demo_sk
+    EXPECTED_ROWS: 27K
+    CONSUMERS: prefact_cte
+  promotion_cte:
+    FROM: promotion
+    WHERE: p_channel_email = 'N' OR p_channel_event = 'N'
+    OUTPUT: p_promo_sk
+    EXPECTED_ROWS: 500
+    CONSUMERS: prefact_cte
+  prefact_cte:
+    FROM: date_cte, customer_cte, promotion_cte
+    JOIN: CROSS JOIN (but implement as nested joins with fact table)
+    OUTPUT: d_date_sk, cd_demo_sk, p_promo_sk
+    EXPECTED_ROWS: 365 * 27K * 500 = too large (4.9B) but will be reduced by fact join
+    CONSUMERS: fact_with_dims
+  fact_with_dims:
+    FROM: catalog_sales JOIN prefact_cte ON cs_sold_date_sk = d_date_sk AND cs_bill_cdemo_sk = cd_demo_sk AND cs_promo_sk = p_promo_sk
+    OUTPUT: cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price
+    EXPECTED_ROWS: 40K
+    CONSUMERS: item_join
+  item_join:
+    FROM: fact_with_dims JOIN item ON cs_item_sk = i_item_sk
+    OUTPUT: i_item_id, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price
+    EXPECTED_ROWS: 40K
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: item_join
+    GROUP BY: i_item_id
+    AGGREGATE: AVG(cs_quantity), AVG(cs_list_price), AVG(cs_coupon_amt), AVG(cs_sales_price)
+    OUTPUT: i_item_id, agg1, agg2, agg3, agg4
+    ORDER BY: i_item_id
+    LIMIT: 100
+    EXPECTED_ROWS: 27K → 100
+    CONSUMERS: output
+
+## Hazard Flags (avoid these specific risks)
+
+- Cross-joining 3 dimension CTEs could cause Cartesian explosion if not properly joined with fact table
+- Must join dimensions sequentially to fact table, not cross-join them first
+
+## Regression Warnings (observed failures on similar queries)
+
+1. dimension_cte_isolate (0.0076x):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion
+   RULE: Never cross-join 3+ dimension CTEs; join dimensions sequentially to fact table
+2. or_to_union (0.59x):
+   CAUSE: Split same-column time range OR, duplicating fact scans
+   RULE: Only split OR on different columns/tables, not same-column ranges
+3. prefetch_fact_join (0.50x):
+   CAUSE: Baseline <50ms, CTE overhead dominated savings
+   RULE: This query baseline is 654ms, so CTE overhead acceptable
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output i_item_id, agg1, agg2, agg3, agg4 in same order
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (join keys, grouping columns, aggregates)
+- LITERAL_PRESERVATION: Must preserve 'M', 'S', 'Unknown', 'N', 2001 exactly
+- SEMANTIC_EQUIVALENCE: Must return same rows with same averages
+- CROSS_COLUMN_OR_DECOMPOSITION: OR on p_channel_email and p_channel_event in promotion table
+- CROSS_CTE_PREDICATE_BLINDNESS: No CTEs in original, opportunity to create filtered dimension CTEs
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- dimension_cte_isolate: Apply pre-filtering all dimension tables into CTEs; ignore the cross-join warning (we'll join sequentially)
+- multi_dimension_prefetch: Apply pre-filtering date, customer, promotion; ensure each CTE has WHERE clause
+- date_cte_isolate: Apply date filtering into CTE; ignore the scalar subquery pattern
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. dimension_cte_isolate (1.93x)
+
+**Principle:** Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
+
+**BEFORE (slow):**
+```sql
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year = 2000
+```
+[filtered_customer_demographics]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'
+```
+[filtered_promotions]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+```
+[joined_facts]:
+```sql
+SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales AS cs JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk
+```
+[main_query]:
+```sql
+SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM joined_facts AS jf JOIN item AS i ON jf.cs_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
+```
+
+### 2. multi_dimension_prefetch (2.71x)
+
+**Principle:** Multi-Dimension Prefetch: when multiple dimension tables have selective filters, pre-filter ALL of them into CTEs before the fact table join. Combined selectivity compounds — each dimension CTE reduces the fact scan further.
+
+**BEFORE (slow):**
+```sql
+select s_store_name, s_store_id,
+        sum(case when (d_day_name='Sunday') then ss_sales_price else null end) sun_sales,
+        sum(case when (d_day_name='Monday') then ss_sales_price else null end) mon_sales,
+        sum(case when (d_day_name='Tuesday') then ss_sales_price else  null end) tue_sales,
+        sum(case when (d_day_name='Wednesday') then ss_sales_price else null end) wed_sales,
+        sum(case when (d_day_name='Thursday') then ss_sales_price else null end) thu_sales,
+        sum(case when (d_day_name='Friday') then ss_sales_price else null end) fri_sales,
+        sum(case when (d_day_name='Saturday') then ss_sales_price else null end) sat_sales
+ from date_dim, store_sales, store
+ where d_date_sk = ss_sold_date_sk and
+       s_store_sk = ss_store_sk and
+       s_gmt_offset = -5 and
+       d_year = 2000 
+ group by s_store_name, s_store_id
+ order by s_store_name, s_store_id,sun_sales,mon_sales,tue_sales,wed_sales,thu_sales,fri_sales,sat_sales
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk, d_day_name FROM date_dim WHERE d_year = 2000
+```
+[filtered_stores]:
+```sql
+SELECT s_store_sk, s_store_name, s_store_id FROM store WHERE s_gmt_offset = -5
+```
+[main_query]:
+```sql
+SELECT s_store_name, s_store_id, SUM(CASE WHEN (d_day_name = 'Sunday') THEN ss_sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN ss_sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN ss_sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN ss_sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN ss_sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN ss_sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN ss_sales_price ELSE NULL END) AS sat_sales FROM store_sales JOIN filtered_dates ON d_date_sk = ss_sold_date_sk JOIN filtered_stores ON s_store_sk = ss_store_sk GROUP BY s_store_name, s_store_id ORDER BY s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales LIMIT 100
+```
+
+### 3. date_cte_isolate (4.00x)
+
+**Principle:** Dimension Isolation: extract small dimension lookups into CTEs so they materialize once and subsequent joins probe a tiny hash table instead of rescanning.
+
+**BEFORE (slow):**
+```sql
+select a.ca_state state, count(*) cnt
+ from customer_address a
+     ,customer c
+     ,store_sales s
+     ,date_dim d
+     ,item i
+ where       a.ca_address_sk = c.c_current_addr_sk
+ 	and c.c_customer_sk = s.ss_customer_sk
+ 	and s.ss_sold_date_sk = d.d_date_sk
+ 	and s.ss_item_sk = i.i_item_sk
+ 	and d.d_month_seq = 
+ 	     (select distinct (d_month_seq)
+ 	      from date_dim
+               where d_year = 2002
+ 	        and d_moy = 3 )
+ 	and i.i_current_price > 1.2 * 
+             (select avg(j.i_current_price) 
+ 	     from item j 
+ 	     where j.i_category = i.i_category)
+ group by a.ca_state
+ having count(*) >= 10
+ order by cnt, a.ca_state
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[target_month]:
+```sql
+SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1
+```
+[category_avg_price]:
+```sql
+SELECT i_category, AVG(i_current_price) * 1.2 AS avg_threshold FROM item GROUP BY i_category
+```
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim JOIN target_month ON d_month_seq = target_month.d_month_seq
+```
+[filtered_sales]:
+```sql
+SELECT ss_customer_sk, ss_item_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+```
+[main_query]:
+```sql
+SELECT a.ca_state AS state, COUNT(*) AS cnt FROM customer_address a JOIN customer c ON a.ca_address_sk = c.c_current_addr_sk JOIN filtered_sales s ON c.c_customer_sk = s.ss_customer_sk JOIN item i ON s.ss_item_sk = i.i_item_sk JOIN category_avg_price cap ON i.i_category = cap.i_category WHERE i.i_current_price > cap.avg_threshold GROUP BY a.ca_state HAVING COUNT(*) >= 10 ORDER BY cnt, a.ca_state LIMIT 100
+```
+
+## Original SQL
+
+```sql
+-- start query 26 in stream 0 using template query26.tpl
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
+ LIMIT 100;
+
+-- end query 26 in stream 0 using template query26.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `i_item_id`
+  2. `agg1`
+  3. `agg2`
+  4. `agg3`
+  5. `agg4`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K  — Join catalog sales with customer demographics, date, item, and promotion; apply demographic and promotion filters; then aggregate item-level averages and return ordered item ids.
+    ├── SCAN (catalog_sales, customer_demographics (join), date_dim (join), item (join), promotion (join))
+    ├── JOIN (cs_sold_date_sk = d_date_sk)
+    ├── JOIN (cs_item_sk = i_item_sk)
+    ├── JOIN (+2 more)
+    ├── FILTER (cd_gender = 'M')
+    ├── FILTER (cd_marital_status = 'S')
+    ├── FILTER (+3 more)
+    ├── AGG (GROUP BY)
+    ├── SORT (i_item_id ASC)
+    └── OUTPUT (i_item_id, agg1, agg2, agg3, agg4)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

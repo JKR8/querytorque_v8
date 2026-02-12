@@ -1,0 +1,105 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] store_sd  [+]
+│   ├── SCAN store
+│   ├── FILTER (s_state = 'SD')
+│   └── OUTPUT (s_store_sk)
+├── [CTE] date_2000  [+]
+│   ├── SCAN date_dim
+│   ├── FILTER (d_year = 2000)
+│   └── OUTPUT (d_date_sk)
+├── [CTE] prefiltered_returns  [+]
+│   ├── SCAN store_returns
+│   ├── JOIN date_2000 (sr_returned_date_sk = d_date_sk)
+│   ├── JOIN store_sd (sr_store_sk = s_store_sk)
+│   └── OUTPUT (sr_customer_sk, sr_store_sk, sr_fee)
+├── [CTE] window_aggregates  [+]
+│   ├── SCAN prefiltered_returns
+│   ├── AGG GROUP BY (sr_customer_sk, sr_store_sk)
+│   ├── WINDOW (AVG(SUM(sr_fee)) OVER PARTITION BY sr_store_sk)
+│   └── OUTPUT (ctr_customer_sk, ctr_store_sk, ctr_total_return, store_avg_return)
+├── [CTE] filtered_customers  [+]
+│   ├── SCAN window_aggregates
+│   ├── FILTER (ctr_total_return > store_avg_return * 1.2)
+│   └── OUTPUT (ctr_customer_sk)
+├── [CTE] customer_lookup  [+]
+│   ├── SCAN filtered_customers
+│   ├── JOIN customer (ctr_customer_sk = c_customer_sk)
+│   └── OUTPUT (c_customer_id)
+└── [MAIN] main_query  [~]
+    ├── SCAN customer_lookup
+    ├── SORT (c_customer_id ASC)
+    ├── LIMIT 100
+    └── OUTPUT (c_customer_id)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "star_join_prefetch", "description": "Pre-filter dimension tables before fact table join to reduce fact scan rows", "applied_to": ["store_sd", "date_2000"]},
+    {"id": "R2", "type": "decorrelate_via_window", "description": "Replace correlated subquery with window function to compute per-store average in single pass", "applied_to": ["window_aggregates"]},
+    {"id": "R3", "type": "cte_pipeline", "description": "Structure as linear pipeline of filtered CTEs with exact output columns needed downstream", "applied_to": ["prefiltered_returns", "window_aggregates", "filtered_customers", "customer_lookup"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "store_sd": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_sk FROM store WHERE s_state = 'SD'",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "date_2000": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "prefiltered_returns": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT sr_customer_sk, sr_store_sk, sr_fee FROM store_returns INNER JOIN date_2000 ON sr_returned_date_sk = d_date_sk INNER JOIN store_sd ON sr_store_sk = s_store_sk",
+        "interfaces": {"outputs": ["sr_customer_sk", "sr_store_sk", "sr_fee"], "consumes": ["date_2000", "store_sd"]}
+      },
+      "window_aggregates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(sr_fee) AS ctr_total_return, AVG(SUM(sr_fee)) OVER (PARTITION BY sr_store_sk) AS store_avg_return FROM prefiltered_returns GROUP BY sr_customer_sk, sr_store_sk",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_total_return", "store_avg_return"], "consumes": ["prefiltered_returns"]}
+      },
+      "filtered_customers": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ctr_customer_sk FROM window_aggregates WHERE ctr_total_return > store_avg_return * 1.2",
+        "interfaces": {"outputs": ["ctr_customer_sk"], "consumes": ["window_aggregates"]}
+      },
+      "customer_lookup": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_customer_id FROM filtered_customers INNER JOIN customer ON ctr_customer_sk = c_customer_sk",
+        "interfaces": {"outputs": ["c_customer_id"], "consumes": ["filtered_customers"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id FROM customer_lookup ORDER BY c_customer_id LIMIT 100",
+        "interfaces": {"outputs": ["c_customer_id"], "consumes": ["customer_lookup"]}
+      }
+    },
+    "reconstruction_order": ["store_sd", "date_2000", "prefiltered_returns", "window_aggregates", "filtered_customers", "customer_lookup", "main_query"],
+    "assembly_template": "WITH store_sd AS ({store_sd}), date_2000 AS ({date_2000}), prefiltered_returns AS ({prefiltered_returns}), window_aggregates AS ({window_aggregates}), filtered_customers AS ({filtered_customers}), customer_lookup AS ({customer_lookup}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: The rewrite transforms the original correlated subquery into a window function that computes store averages in a single pass alongside customer aggregates, while pre-filtering dimension tables (store, date) before joining to the fact table. Expected speedup: 2-3x due to reduced fact table scan volume and elimination of correlated execution.

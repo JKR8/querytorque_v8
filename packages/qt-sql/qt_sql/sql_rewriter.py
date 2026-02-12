@@ -88,6 +88,7 @@ class RewriteResult:
     error: Optional[str] = None
     rewrite_set: Optional[RewriteSet] = None
     set_local_commands: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
 
 
 # =============================================================================
@@ -125,6 +126,246 @@ class DAPPayload:
     frozen_blocks: List[Dict[str, Any]] = field(default_factory=list)
     runtime_config: List[str] = field(default_factory=list)    # SET LOCAL commands
     validation_checks: List[Dict[str, Any]] = field(default_factory=list)
+
+
+# =============================================================================
+# DAP Interface Validation
+# =============================================================================
+
+def validate_dap_interfaces(dap: DAPPayload) -> List[str]:
+    """Validate DAP interface declarations against actual component SQL.
+
+    Checks:
+    1. Each component's SELECT columns match its declared outputs
+    2. Consumer components only reference columns that exist in consumed CTEs' outputs
+
+    Returns list of warning strings (empty = clean).
+    """
+    warnings: List[str] = []
+
+    for stmt in dap.statements:
+        # Build output map: component_id → set of declared output columns
+        output_map: Dict[str, Set[str]] = {}
+        for comp_id, comp in stmt.components.items():
+            if comp.interfaces and "outputs" in comp.interfaces:
+                output_map[comp_id] = {
+                    c.lower() for c in comp.interfaces["outputs"]
+                }
+
+        # Check 1: SELECT columns match declared outputs
+        for comp_id, comp in stmt.components.items():
+            if not comp.sql or not comp.interfaces:
+                continue
+            declared = comp.interfaces.get("outputs", [])
+            if not declared:
+                continue
+
+            actual = _extract_select_columns(comp.sql)
+            if not actual:
+                continue  # couldn't parse — skip silently
+
+            declared_set = {c.lower() for c in declared}
+            actual_set = {c.lower() for c in actual}
+
+            # Columns declared but missing from SELECT
+            missing = declared_set - actual_set
+            if missing:
+                warnings.append(
+                    f"[{comp_id}] declares outputs {sorted(missing)} "
+                    f"but SELECT only produces {sorted(actual_set)}"
+                )
+
+            # Columns in SELECT but not declared
+            extra = actual_set - declared_set
+            if extra:
+                warnings.append(
+                    f"[{comp_id}] SELECT produces {sorted(extra)} "
+                    f"not declared in outputs"
+                )
+
+        # Check 2: Consumer references match producer outputs
+        for comp_id, comp in stmt.components.items():
+            if not comp.sql or not comp.interfaces:
+                continue
+            consumes = comp.interfaces.get("consumes", [])
+            if not consumes:
+                continue
+
+            # Find qualified column references (e.g. date_1998.d_date)
+            refs = _extract_qualified_column_refs(comp.sql)
+            for table_ref, col_name in refs:
+                table_lower = table_ref.lower()
+                col_lower = col_name.lower()
+                if table_lower in output_map:
+                    producer_outputs = output_map[table_lower]
+                    if col_lower not in producer_outputs:
+                        warnings.append(
+                            f"[{comp_id}] references '{table_ref}.{col_name}' "
+                            f"but [{table_lower}] only provides "
+                            f"{sorted(producer_outputs)}"
+                        )
+
+    return warnings
+
+
+def _extract_select_columns(sql: str) -> List[str]:
+    """Extract output column names/aliases from a SELECT statement."""
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        parsed = sqlglot.parse_one(sql, error_level=sqlglot.ErrorLevel.IGNORE)
+        if parsed is None:
+            return []
+
+        # Get top-level SELECT expressions
+        select = parsed.find(exp.Select)
+        if select is None:
+            return []
+
+        columns = []
+        for expr in select.expressions:
+            if isinstance(expr, exp.Alias):
+                columns.append(expr.alias)
+            elif isinstance(expr, exp.Column):
+                columns.append(expr.name)
+            elif hasattr(expr, "alias") and expr.alias:
+                columns.append(expr.alias)
+            elif isinstance(expr, exp.Star):
+                columns.append("*")
+            else:
+                # Function calls without alias, etc — use output_name
+                name = expr.output_name
+                if name:
+                    columns.append(name)
+        return columns
+    except Exception:
+        return []
+
+
+def _extract_qualified_column_refs(sql: str) -> List[tuple]:
+    """Extract qualified column references like 'table.column' from SQL.
+
+    Returns list of (table_name, column_name) tuples.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        parsed = sqlglot.parse_one(sql, error_level=sqlglot.ErrorLevel.IGNORE)
+        if parsed is None:
+            return []
+
+        refs = []
+        for col in parsed.find_all(exp.Column):
+            if col.table:
+                refs.append((col.table, col.name))
+        return refs
+    except Exception:
+        return []
+
+
+def validate_assembled_cte_columns(assembled_sql: str) -> List[str]:
+    """Check assembled SQL for CTE column reference mismatches.
+
+    Parses the full WITH...SELECT, extracts each CTE's actual output columns,
+    then checks downstream CTEs for:
+    1. Qualified refs to columns a CTE doesn't provide (e.g. date_1998.d_date)
+    2. Near-miss unqualified refs (e.g. d_date when CTE provides d_date_sk)
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:
+        return []
+
+    warnings: List[str] = []
+
+    try:
+        parsed = sqlglot.parse_one(
+            assembled_sql, error_level=sqlglot.ErrorLevel.IGNORE
+        )
+        if parsed is None:
+            return []
+
+        # Step 1: Extract CTE definitions and their actual output columns
+        cte_outputs: Dict[str, Set[str]] = {}
+        for cte in parsed.find_all(exp.CTE):
+            cte_name = cte.alias
+            if not cte_name:
+                continue
+            select = cte.this.find(exp.Select)
+            if not select:
+                continue
+            cols: Set[str] = set()
+            for e in select.expressions:
+                if isinstance(e, exp.Alias):
+                    cols.add(e.alias.lower())
+                elif isinstance(e, exp.Column):
+                    cols.add(e.name.lower())
+                else:
+                    name = e.output_name
+                    if name:
+                        cols.add(name.lower())
+            cte_outputs[cte_name.lower()] = cols
+
+        if not cte_outputs:
+            return []
+
+        # Step 2: For each CTE body, check column references
+        seen: Set[str] = set()
+        for cte in parsed.find_all(exp.CTE):
+            cte_name = cte.alias
+            if not cte_name:
+                continue
+            body = cte.this
+
+            # Which CTEs are referenced in this CTE's FROM/JOIN?
+            referenced_ctes: Set[str] = set()
+            for table in body.find_all(exp.Table):
+                tname = table.name.lower()
+                if tname in cte_outputs:
+                    referenced_ctes.add(tname)
+
+            if not referenced_ctes:
+                continue
+
+            for col in body.find_all(exp.Column):
+                # Check 1: qualified refs to CTE columns that don't exist
+                if col.table:
+                    tbl = col.table.lower()
+                    if tbl in cte_outputs and col.name.lower() not in cte_outputs[tbl]:
+                        key = f"{cte_name}:{tbl}.{col.name}"
+                        if key not in seen:
+                            seen.add(key)
+                            warnings.append(
+                                f"[{cte_name}] references {col.table}.{col.name} "
+                                f"but [{tbl}] only provides "
+                                f"{sorted(cte_outputs[tbl])}"
+                            )
+                else:
+                    # Check 2: unqualified near-misses with CTE columns
+                    col_lower = col.name.lower()
+                    for ref_cte in referenced_ctes:
+                        for cte_col in cte_outputs[ref_cte]:
+                            if col_lower != cte_col and (
+                                col_lower.startswith(cte_col)
+                                or cte_col.startswith(col_lower)
+                            ):
+                                key = f"{cte_name}:{col.name}~{cte_col}"
+                                if key not in seen:
+                                    seen.add(key)
+                                    warnings.append(
+                                        f"[{cte_name}] uses \"{col.name}\" — "
+                                        f"did you mean \"{cte_col}\" from "
+                                        f"[{ref_cte}]? [{ref_cte}] only provides "
+                                        f"{sorted(cte_outputs[ref_cte])}"
+                                    )
+
+    except Exception as e:
+        logger.debug(f"CTE column check failed: {e}")
+
+    return warnings
 
 
 # =============================================================================
@@ -880,6 +1121,7 @@ class SQLRewriter:
         """
         # Extract JSON from response
         json_str = self.parser.extract_json(llm_response)
+        dap_warnings: List[str] = []  # carry interface warnings across fallback paths
 
         if json_str:
             fmt = self.parser.detect_format(json_str)
@@ -891,6 +1133,8 @@ class SQLRewriter:
                     result = self._apply_dap(dap)
                     if result.success:
                         return result
+                    # Carry warnings to fallback paths
+                    dap_warnings = result.warnings
                     # DAP parse succeeded but assembly/validation failed —
                     # fall through to legacy paths
 
@@ -939,6 +1183,7 @@ class SQLRewriter:
                             transform=rs.transform,
                             rewrite_set=rs,
                             set_local_commands=set_local_cmds,
+                            warnings=dap_warnings,
                         )
                     except Exception:
                         continue
@@ -956,12 +1201,14 @@ class SQLRewriter:
                     optimized_sql=clean_sql,
                     transform=transforms[0] if transforms else "semantic_rewrite",
                     set_local_commands=set_local_cmds,
+                    warnings=dap_warnings,
                 )
 
         return RewriteResult(
             success=False,
             optimized_sql=self.original_sql,
             error="No valid DAP, rewrite_sets, or SQL found in LLM response",
+            warnings=dap_warnings,
         )
 
     @staticmethod
@@ -987,11 +1234,18 @@ class SQLRewriter:
         """Apply a DAP Component Payload to produce a RewriteResult.
 
         Steps:
-        1. Assemble SQL via DAPAssembler
-        2. Run AST equivalence check
-        3. Extract transforms from rewrite_rules
-        4. Extract SET LOCAL from runtime_config
+        1. Validate DAP interfaces (warn, don't reject)
+        2. Assemble SQL via DAPAssembler
+        3. Run AST equivalence check
+        4. Extract transforms from rewrite_rules
+        5. Extract SET LOCAL from runtime_config
         """
+        # Interface validation — warnings only, never blocks assembly
+        interface_warnings = validate_dap_interfaces(dap)
+        if interface_warnings:
+            for w in interface_warnings:
+                logger.warning(f"DAP interface: {w}")
+
         try:
             assembled = self.dap_assembler.assemble(self.original_sql, dap)
         except Exception as e:
@@ -999,6 +1253,7 @@ class SQLRewriter:
                 success=False,
                 optimized_sql=self.original_sql,
                 error=f"DAP assembly failed: {e}",
+                warnings=interface_warnings,
             )
 
         if not assembled or not assembled.strip():
@@ -1006,7 +1261,15 @@ class SQLRewriter:
                 success=False,
                 optimized_sql=self.original_sql,
                 error="DAP assembly produced empty SQL",
+                warnings=interface_warnings,
             )
+
+        # Post-assembly CTE column check (catches near-miss column refs)
+        cte_warnings = validate_assembled_cte_columns(assembled)
+        if cte_warnings:
+            for w in cte_warnings:
+                logger.warning(f"DAP CTE column: {w}")
+            interface_warnings.extend(cte_warnings)
 
         # Handle SET LOCAL from runtime_config
         set_local_cmds: List[str] = []
@@ -1031,6 +1294,7 @@ class SQLRewriter:
                 success=False,
                 optimized_sql=self.original_sql,
                 error="DAP assembled SQL does not parse",
+                warnings=interface_warnings,
             )
 
         # AST equivalence check
@@ -1042,6 +1306,7 @@ class SQLRewriter:
                 success=False,
                 optimized_sql=self.original_sql,
                 error=f"DAP AST validation failed: {ast_check.errors[0]}",
+                warnings=interface_warnings,
             )
 
         # Extract transforms from rewrite_rules
@@ -1083,6 +1348,7 @@ class SQLRewriter:
             optimized_sql=clean_sql,
             transform=transform_name,
             set_local_commands=set_local_cmds,
+            warnings=interface_warnings,
         )
 
     def _validate_sql(self, sql: str) -> bool:

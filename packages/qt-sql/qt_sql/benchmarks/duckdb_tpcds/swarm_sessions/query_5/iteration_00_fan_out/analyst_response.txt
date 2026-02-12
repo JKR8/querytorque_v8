@@ -1,0 +1,288 @@
+<reasoning>
+Step 1: CLASSIFY
+This is a multi-channel UNION ALL query with parallel structure across store, catalog, and web channels. Each channel CTE combines sales and returns via UNION ALL, joins with date_dim and the channel's dimension table, and aggregates. The main query then unions the channel results and performs a rollup aggregation.
+
+Step 2: EXPLAIN PLAN ANALYSIS
+Total execution: 1138ms. Key observations:
+- The most expensive operations are scans of large fact tables: store_sales (234.9ms, 21%), web_sales (269.3ms + 66.6ms = 335.9ms, 30%), and the hash join between web_sales and web_returns in wsr CTE (293.0ms, 26%).
+- Each channel CTE independently scans date_dim (3 scans, each ~0.7ms, total ~2.1ms) and returns only 15 rows each. The date filter is selective but applied late after joining with large fact tables.
+- Row counts: fact tables are scanned in full (or large portions) before date filtering. For example, store_sales scans 289K of 345.6M rows (0.08% selectivity) but the scan still processes 289K rows because the date filter is applied after the join.
+- The optimizer already pushes the date filter into date_dim scans (SEQ_SCAN with filter). However, it does NOT push the date filter into the fact table scans—each fact table is scanned without any date predicate.
+- CTEs appear to be inlined (each referenced once) based on EXPLAIN structure (no materialization nodes). So CTEs are optimization fences but not materialized.
+- The wsr CTE has a problematic LEFT OUTER JOIN pattern causing a second scan of web_sales (7.2M rows) and a large hash join (293ms).
+
+Step 3: GAP MATCHING
+- **CROSS_CTE_PREDICATE_BLINDNESS**: Each channel CTE joins fact tables with date_dim after the UNION. The date filter (d_date between ...) is not pushed into the fact table scans. This is the primary gap.
+- **REDUNDANT_SCAN_ELIMINATION**: date_dim is scanned 3 times (once per channel). While each scan is cheap, they're redundant. Also, web_sales is scanned twice in wsr CTE.
+- **UNION_CTE_SELF_JOIN_DECOMPOSITION**: Not applicable—no self-joins of CTEs.
+- **CORRELATED_SUBQUERY_PARALYSIS**: Not applicable—no correlated subqueries.
+- **CROSS_COLUMN_OR_DECOMPOSITION**: Not applicable—no OR conditions.
+
+Step 4: AGGREGATION TRAP CHECK
+Aggregations are SUMs only, which are duplicate-insensitive. The UNION ALL branches are disjoint by construction (zero columns). Restructuring that changes row duplication could affect sums if joins multiply rows, but that's not the case here. The main risk is changing the grouping sets.
+
+Step 5: TRANSFORM SELECTION
+Ranked opportunities:
+1. **date_cte_isolate** (star_join_prefetch): Pre-filter date_dim into a shared CTE and join it with fact tables early. This could reduce fact table scans by pushing date predicate. Historical avg 4.00x. APPLICABLE because date filter is repeated across channels and not pushed into fact scans.
+2. **single_pass_aggregation** (scan_consolidation_pivot): The three channel CTEs scan different fact tables, but within each channel, sales and returns are separate scans of different tables. However, we could consolidate the two scans in wsr CTE? That's complex due to LEFT OUTER JOIN. Instead, consider consolidating date_dim scans across channels (shared_dimension_multi_channel). APPLICABLE for date_dim.
+3. **prefetch_fact_join**: Build a CTE chain: filter date_dim, pre-join with fact tables, then join dimension tables. This could reduce rows before dimension joins. APPLICABLE.
+4. **dimension_cte_isolate**: Pre-filter all dimension tables (date_dim, store, catalog_page, web_site) into CTEs. APPLICABLE but store and web_site are tiny; catalog_page is 10K rows. Main benefit is date_dim.
+
+Given structural diversity:
+- Worker 1: **date_cte_isolate** (focus on pushing date filter early via shared date CTE)
+- Worker 2: **prefetch_fact_join** (CTE chain: date filter -> fact join -> dimension join)
+- Worker 3: **shared_dimension_multi_channel** (extract shared date filter into CTE reused across channels)
+- Worker 4: **compound strategy** (date_cte_isolate + restructuring wsr CTE to eliminate duplicate web_sales scan) — exploration.
+
+Step 6: LOGICAL TREE DESIGN
+For each strategy, design CTEs with exhaustive output columns.
+
+Worker 1 (date_cte_isolate):
+- date_range CTE: d_date_sk for the 14-day window.
+- Modify each channel CTE to join fact tables with date_range CTE early (before UNION), removing the join to date_dim.
+
+Worker 2 (prefetch_fact_join):
+- date_range CTE as above.
+- For each channel, create a CTE that joins fact tables (sales and returns) with date_range CTE, then unions, then joins with dimension table and aggregates.
+
+Worker 3 (shared_dimension_multi_channel):
+- date_range CTE as above.
+- Keep channel CTEs but replace date_dim join with date_range CTE.
+
+Worker 4 (compound strategy):
+- date_range CTE.
+- Restructure wsr CTE to avoid scanning web_sales twice by merging the two branches (sales and returns) into a single scan of web_sales with a LEFT JOIN to web_returns, then using conditional aggregation or UNION ALL with deduplication? This is risky due to semantics of LEFT OUTER JOIN. We'll attempt a safe rewrite: pre-join web_sales with date_range, then left join web_returns, then generate two sets of rows (sales and returns) via CASE or UNION ALL, ensuring no duplication.
+
+Check column completeness: Each CTE must output all columns needed by downstream joins and aggregates.
+</reasoning>
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Summarize a 14-day window starting 2000-08-19 by channel and channel entity (store, catalog page, web site), reporting sales, returns, and net profit after losses, with rollup subtotals. All joins are INNER (intersection) except the LEFT OUTER JOIN in wsr's returns branch which must preserve all web_returns rows even without matching web_sales (though TPC-DS referential integrity ensures matches). Aggregations are SUM only, duplicate-insensitive. The date filter is identical across three independent channel CTEs and must be applied to both sales and returns date keys.
+
+BOTTLENECK_DIAGNOSIS: Scan-bound: 21% of time on store_sales scan (234.9ms), 30% on web_sales scans (335.9ms), 26% on web_sales-web_returns hash join (293ms). Cardinality flow: fact tables scan hundreds of thousands of rows before date filtering reduces to ~15 date rows per channel. The optimizer already pushes date filter into date_dim scans but cannot push it into fact tables because the date key is not directly filterable—it's joined via date_sk. Logical-tree cost percentages mislead: csr shows 25% cost but only 11.9ms actual, while wsr shows 25% cost but dominates runtime.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output channel, id, sales, returns, profit ordered by channel, id with LIMIT 100.
+- CTE_COLUMN_COMPLETENESS: Each channel CTE must output dimension key (s_store_id, cp_catalog_page_id, web_site_id) and aggregates (sales, profit, returns, profit_loss) for main query.
+- LITERAL_PRESERVATION: Date literal '2000-08-19' and interval 14 days must be preserved exactly.
+- SEMANTIC_EQUIVALENCE: Result set must match exactly, including rollup rows.
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows date filter applied after fact table joins, not pushed into fact scans.
+- REDUNDANT_SCAN_ELIMINATION: date_dim scanned 3 times (0.6ms, 0.7ms, 0.8ms). web_sales scanned twice in wsr.
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (observed regression 0.49x on Q31):
+   CAUSE: Baseline <100ms, CTE overhead exceeded savings.
+   RULE: Skip if baseline <100ms; this query is 1138ms, so applicable.
+2. prefetch_fact_join (observed regression 0.50x on Q25):
+   CAUSE: Baseline <50ms, CTE overhead dominated.
+   RULE: This query is 1138ms, so applicable but limit to 2 cascading fact-table CTE chains.
+3. dimension_cte_isolate (observed regression 0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join 3+ dimension CTEs; each CTE must have a WHERE clause.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: date_cte_isolate
+TARGET_LOGICAL_TREE:
+  date_range -> store_facts -> ssr -> main_query
+  date_range -> catalog_facts -> csr -> main_query
+  date_range -> web_facts -> wsr -> main_query
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL 14 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 15
+    CONSUMERS: store_facts, catalog_facts, web_facts
+  store_facts:
+    FROM: (SELECT ss_store_sk, ss_sold_date_sk, ss_ext_sales_price, ss_net_profit, CAST(0 AS DECIMAL(7,2)) AS return_amt, CAST(0 AS DECIMAL(7,2)) AS net_loss FROM store_sales JOIN date_range ON ss_sold_date_sk = d_date_sk UNION ALL SELECT sr_store_sk, sr_returned_date_sk, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)), sr_return_amt, sr_net_loss FROM store_returns JOIN date_range ON sr_returned_date_sk = d_date_sk) AS salesreturns
+    OUTPUT: store_sk, date_sk, sales_price, profit, return_amt, net_loss
+    EXPECTED_ROWS: 304K
+    CONSUMERS: ssr
+  ssr:
+    FROM: store_facts JOIN store ON store_sk = s_store_sk
+    GROUP BY: s_store_id
+    AGGREGATE: SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS returns, SUM(net_loss) AS profit_loss
+    OUTPUT: s_store_id, sales, profit, returns, profit_loss
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  catalog_facts:
+    FROM: (SELECT cs_catalog_page_sk, cs_sold_date_sk, cs_ext_sales_price, cs_net_profit, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)) FROM catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk UNION ALL SELECT cr_catalog_page_sk, cr_returned_date_sk, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)), cr_return_amount, cr_net_loss FROM catalog_returns JOIN date_range ON cr_returned_date_sk = d_date_sk) AS salesreturns
+    OUTPUT: page_sk, date_sk, sales_price, profit, return_amt, net_loss
+    EXPECTED_ROWS: 162K
+    CONSUMERS: csr
+  csr:
+    FROM: catalog_facts JOIN catalog_page ON page_sk = cp_catalog_page_sk
+    GROUP BY: cp_catalog_page_id
+    AGGREGATE: SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS returns, SUM(net_loss) AS profit_loss
+    OUTPUT: cp_catalog_page_id, sales, profit, returns, profit_loss
+    EXPECTED_ROWS: 1133
+    CONSUMERS: main_query
+  web_facts:
+    FROM: (SELECT ws_web_site_sk, ws_sold_date_sk, ws_ext_sales_price, ws_net_profit, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)) FROM web_sales JOIN date_range ON ws_sold_date_sk = d_date_sk UNION ALL SELECT ws_web_site_sk, wr_returned_date_sk, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)), wr_return_amt, wr_net_loss FROM web_returns LEFT OUTER JOIN web_sales ON wr_item_sk = ws_item_sk AND wr_order_number = ws_order_number JOIN date_range ON wr_returned_date_sk = d_date_sk) AS salesreturns
+    OUTPUT: wsr_web_site_sk, date_sk, sales_price, profit, return_amt, net_loss
+    EXPECTED_ROWS: 84K
+    CONSUMERS: wsr
+  wsr:
+    FROM: web_facts JOIN web_site ON wsr_web_site_sk = web_site_sk
+    GROUP BY: web_site_id
+    AGGREGATE: SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS returns, SUM(net_loss) AS profit_loss
+    OUTPUT: web_site_id, sales, profit, returns, profit_loss
+    EXPECTED_ROWS: 21
+    CONSUMERS: main_query
+  main_query:
+    FROM: (SELECT 'store channel', 'store' || s_store_id, sales, returns, (profit - profit_loss) FROM ssr UNION ALL SELECT 'catalog channel', 'catalog_page' || cp_catalog_page_id, sales, returns, (profit - profit_loss) FROM csr UNION ALL SELECT 'web channel', 'web_site' || web_site_id, sales, returns, (profit - profit_loss) FROM wsr) AS x
+    GROUP BY: ROLLUP(channel, id)
+    ORDER BY: channel, id
+    LIMIT: 100
+    OUTPUT: channel, id, sales, returns, profit
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: date_cte_isolate, early_filter, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: Apply the pattern of extracting date filter into a CTE and joining early; ignore the decorrelation aspect (no correlated subqueries).
+- early_filter: Filter date_dim first, then join to fact tables; ignore the fact that early_filter example may filter other dimensions.
+- dimension_cte_isolate: Pre-filter date_dim into CTE; ignore pre-filtering other dimensions.
+HAZARD_FLAGS:
+- The LEFT OUTER JOIN in web_facts must preserve web_returns rows without matching web_sales; ensure date_range join does not filter them out incorrectly.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  date_range -> store_prejoin -> ssr -> main_query
+  date_range -> catalog_prejoin -> csr -> main_query
+  date_range -> web_prejoin -> wsr -> main_query
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL 14 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 15
+    CONSUMERS: store_prejoin, catalog_prejoin, web_prejoin
+  store_prejoin:
+    FROM: (SELECT ss_store_sk, ss_ext_sales_price, ss_net_profit, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)) FROM store_sales JOIN date_range ON ss_sold_date_sk = d_date_sk UNION ALL SELECT sr_store_sk, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)), sr_return_amt, sr_net_loss FROM store_returns JOIN date_range ON sr_returned_date_sk = d_date_sk) AS salesreturns
+    OUTPUT: store_sk, sales_price, profit, return_amt, net_loss
+    EXPECTED_ROWS: 304K
+    CONSUMERS: ssr
+  ssr:
+    FROM: store_prejoin JOIN store ON store_sk = s_store_sk
+    GROUP BY: s_store_id
+    AGGREGATE: SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS returns, SUM(net_loss) AS profit_loss
+    OUTPUT: s_store_id, sales, profit, returns, profit_loss
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  catalog_prejoin:
+    FROM: (SELECT cs_catalog_page_sk, cs_ext_sales_price, cs_net_profit, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)) FROM catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk UNION ALL SELECT cr_catalog_page_sk, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)), cr_return_amount, cr_net_loss FROM catalog_returns JOIN date_range ON cr_returned_date_sk = d_date_sk) AS salesreturns
+    OUTPUT: page_sk, sales_price, profit, return_amt, net_loss
+    EXPECTED_ROWS: 162K
+    CONSUMERS: csr
+  csr:
+    FROM: catalog_prejoin JOIN catalog_page ON page_sk = cp_catalog_page_sk
+    GROUP BY: cp_catalog_page_id
+    AGGREGATE: SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS returns, SUM(net_loss) AS profit_loss
+    OUTPUT: cp_catalog_page_id, sales, profit, returns, profit_loss
+    EXPECTED_ROWS: 1133
+    CONSUMERS: main_query
+  web_prejoin:
+    FROM: (SELECT ws_web_site_sk, ws_ext_sales_price, ws_net_profit, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)) FROM web_sales JOIN date_range ON ws_sold_date_sk = d_date_sk UNION ALL SELECT ws_web_site_sk, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)), wr_return_amt, wr_net_loss FROM web_returns LEFT OUTER JOIN web_sales ON wr_item_sk = ws_item_sk AND wr_order_number = ws_order_number JOIN date_range ON wr_returned_date_sk = d_date_sk) AS salesreturns
+    OUTPUT: wsr_web_site_sk, sales_price, profit, return_amt, net_loss
+    EXPECTED_ROWS: 84K
+    CONSUMERS: wsr
+  wsr:
+    FROM: web_prejoin JOIN web_site ON wsr_web_site_sk = web_site_sk
+    GROUP BY: web_site_id
+    AGGREGATE: SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS returns, SUM(net_loss) AS profit_loss
+    OUTPUT: web_site_id, sales, profit, returns, profit_loss
+    EXPECTED_ROWS: 21
+    CONSUMERS: main_query
+  main_query: (same as Worker 1)
+EXAMPLES: prefetch_fact_join, multi_dimension_prefetch, pushdown
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply the CTE chain: filter date, pre-join with fact tables, then join dimension; ignore the multi-dimension aspect (only date).
+- multi_dimension_prefetch: Pre-filter date_dim; ignore pre-filtering other dimensions.
+- pushdown: Push date filter into fact table scans via early join; ignore consolidation of multiple subqueries.
+HAZARD_FLAGS:
+- Ensure web_prejoin's LEFT OUTER JOIN correctly filters web_returns by date_range on wr_returned_date_sk, not on ws_sold_date_sk.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: shared_dimension_multi_channel
+TARGET_LOGICAL_TREE:
+  date_range -> ssr -> main_query
+  date_range -> csr -> main_query
+  date_range -> wsr -> main_query
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_date BETWEEN CAST('2000-08-19' AS DATE) AND (CAST('2000-08-19' AS DATE) + INTERVAL 14 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 15
+    CONSUMERS: ssr, csr, wsr
+  ssr:
+    FROM: (SELECT ss_store_sk, ss_sold_date_sk, ss_ext_sales_price, ss_net_profit, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)) FROM store_sales UNION ALL SELECT sr_store_sk, sr_returned_date_sk, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)), sr_return_amt, sr_net_loss FROM store_returns) AS salesreturns JOIN date_range ON salesreturns.date_sk = date_range.d_date_sk JOIN store ON store_sk = s_store_sk
+    GROUP BY: s_store_id
+    AGGREGATE: SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS returns, SUM(net_loss) AS profit_loss
+    OUTPUT: s_store_id, sales, profit, returns, profit_loss
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  csr:
+    FROM: (SELECT cs_catalog_page_sk, cs_sold_date_sk, cs_ext_sales_price, cs_net_profit, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)) FROM catalog_sales UNION ALL SELECT cr_catalog_page_sk, cr_returned_date_sk, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)), cr_return_amount, cr_net_loss FROM catalog_returns) AS salesreturns JOIN date_range ON salesreturns.date_sk = date_range.d_date_sk JOIN catalog_page ON page_sk = cp_catalog_page_sk
+    GROUP BY: cp_catalog_page_id
+    AGGREGATE: SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS returns, SUM(net_loss) AS profit_loss
+    OUTPUT: cp_catalog_page_id, sales, profit, returns, profit_loss
+    EXPECTED_ROWS: 1133
+    CONSUMERS: main_query
+  wsr:
+    FROM: (SELECT ws_web_site_sk, ws_sold_date_sk, ws_ext_sales_price, ws_net_profit, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)) FROM web_sales UNION ALL SELECT ws_web_site_sk, wr_returned_date_sk, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)), wr_return_amt, wr_net_loss FROM web_returns LEFT OUTER JOIN web_sales ON wr_item_sk = ws_item_sk AND wr_order_number = ws_order_number) AS salesreturns JOIN date_range ON salesreturns.date_sk = date_range.d_date_sk JOIN web_site ON wsr_web_site_sk = web_site_sk
+    GROUP BY: web_site_id
+    AGGREGATE: SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS returns, SUM(net_loss) AS profit_loss
+    OUTPUT: web_site_id, sales, profit, returns, profit_loss
+    EXPECTED_ROWS: 21
+    CONSUMERS: main_query
+  main_query: (same as Worker 1)
+EXAMPLES: shared_dimension_multi_channel, date_cte_isolate, pushdown
+EXAMPLE_ADAPTATION:
+- shared_dimension_multi_channel: Extract shared date filter into CTE and reuse across channel CTEs; ignore the item/promotion filters.
+- date_cte_isolate: Same as above; ignore the early join aspect.
+- pushdown: Push date filter into CTEs; ignore consolidation of subqueries.
+HAZARD_FLAGS:
+- Ensure the join order doesn't change semantics: date_range join must happen after UNION ALL but before dimension join.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: compound_strategy_date_isolate_wsr_restructure
+TARGET_LOGICAL_TREE:
+  date_range -> store_facts -> ssr -> main_query
+  date_range -> catalog_facts -> csr -> main_query
+  date_range -> web_consolidated -> wsr -> main_query
+NODE_CONTRACTS:
+  date_range: (same as Worker 1)
+  store_facts: (same as Worker 1)
+  ssr: (same as Worker 1)
+  catalog_facts: (same as Worker 1)
+  csr: (same as Worker 1)
+  web_consolidated:
+    FROM: web_sales JOIN date_range ON ws_sold_date_sk = d_date_sk LEFT OUTER JOIN web_returns ON wr_item_sk = ws_item_sk AND wr_order_number = ws_order_number AND wr_returned_date_sk = d_date_sk
+    OUTPUT: ws_web_site_sk, ws_sold_date_sk, ws_ext_sales_price, ws_net_profit, wr_return_amt, wr_net_loss
+    EXPECTED_ROWS: 79K (sales) + ? (returns) but aim to reduce scans
+    CONSUMERS: wsr
+  wsr:
+    FROM: (SELECT ws_web_site_sk, ws_sold_date_sk, ws_ext_sales_price, ws_net_profit, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)) FROM web_consolidated UNION ALL SELECT ws_web_site_sk, ws_sold_date_sk, CAST(0 AS DECIMAL(7,2)), CAST(0 AS DECIMAL(7,2)), wr_return_amt, wr_net_loss FROM web_consolidated WHERE wr_return_amt IS NOT NULL) AS salesreturns JOIN web_site ON wsr_web_site_sk = web_site_sk
+    GROUP BY: web_site_id
+    AGGREGATE: SUM(sales_price) AS sales, SUM(profit) AS profit, SUM(return_amt) AS returns, SUM(net_loss) AS profit_loss
+    OUTPUT: web_site_id, sales, profit, returns, profit_loss
+    EXPECTED_ROWS: 21
+    CONSUMERS: main_query
+  main_query: (same as Worker 1)
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Consolidate web_sales and web_returns scans into one scan with LEFT JOIN; ignore CASE aggregation (use UNION ALL).
+- channel_bitmap_aggregation: Use a single scan of web_sales with LEFT JOIN to web_returns; ignore bitmap labeling.
+- date_cte_isolate: Apply date filtering early via date_range CTE; ignore other channels.
+HAZARD_FLAGS:
+- The consolidated scan may duplicate web_sales rows if multiple returns per sale, causing overcounting in sales branch. Must deduplicate sales branch by using DISTINCT or aggregating by web_sales key (not available). Risky.
+- LEFT JOIN condition must include date filter on wr_returned_date_sk to match original semantics.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: The regression warnings for date_cte_isolate and prefetch_fact_join are based on fast baseline queries; this query is slow (1138ms) so overhead is acceptable. The wsr restructuring is novel but must ensure no row duplication.
+EXPLORATION_TYPE: compound_strategy

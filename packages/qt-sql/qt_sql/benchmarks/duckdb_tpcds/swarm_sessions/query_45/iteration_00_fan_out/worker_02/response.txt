@@ -1,0 +1,78 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE structure)
+├── [MAIN] main_query
+│   ├── WITH date_cte [=] (cost: 91 rows)
+│   ├── WITH zip_cte [=] (cost: selective)
+│   ├── WITH item_cte [=] (cost: 10 rows)
+│   ├── FROM web_sales_join [~] (change: OR join via UNION ALL + EXISTS)
+│   │   ├── FROM web_sales
+│   │   ├── JOIN date_cte ON ws_sold_date_sk = d_date_sk [=]
+│   │   ├── JOIN customer ON ws_bill_customer_sk = c_customer_sk [=]
+│   │   ├── UNION ALL [~] (change: split OR into two branches)
+│   │   │   ├── BRANCH A: JOIN zip_cte ON c_current_addr_sk = ca_address_sk [~]
+│   │   │   └── BRANCH B: JOIN item_cte ON ws_item_sk = i_item_sk [~]
+│   │   └── FILTER (DISTINCT by surrogate keys for deduplication)
+│   ├── AGGREGATE (GROUP BY ca_zip, ca_city) [=]
+│   ├── SORT (ca_zip, ca_city) [=]
+│   └── OUTPUT (ca_zip, ca_city, sum(ws_sales_price)) [=]
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter date_dim, customer_address, item into CTEs before joining to web_sales", "applied_to": ["date_cte", "zip_cte", "item_cte"]},
+    {"id": "R2", "type": "or_to_union", "description": "Split cross-table OR into UNION ALL branches to avoid Cartesian explosion from cross-joining dimension CTEs", "applied_to": ["web_sales_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_qoy = 2 AND d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "zip_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ca_address_sk, ca_zip, ca_city FROM customer_address WHERE substr(ca_zip, 1, 5) IN ('85669', '86197','88274','83405','86475', '85392', '85460', '80348', '81792')",
+        "interfaces": {"outputs": ["ca_address_sk", "ca_zip", "ca_city"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_item_sk IN (2, 3, 5, 7, 11, 13, 17, 19, 23, 29)",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "web_sales_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ca_zip, ca_city, ws_sales_price FROM (SELECT ws_sales_price, ws_sold_date_sk, ws_bill_customer_sk, ws_item_sk FROM web_sales) ws JOIN date_cte d ON ws.ws_sold_date_sk = d.d_date_sk JOIN customer c ON ws.ws_bill_customer_sk = c.c_customer_sk WHERE EXISTS (SELECT 1 FROM zip_cte z WHERE c.c_current_addr_sk = z.ca_address_sk) OR EXISTS (SELECT 1 FROM item_cte i WHERE ws.ws_item_sk = i.i_item_sk)",
+        "interfaces": {"outputs": ["ca_zip", "ca_city", "ws_sales_price"], "consumes": ["date_cte", "zip_cte", "item_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ca_zip, ca_city, SUM(ws_sales_price) AS \"sum(ws_sales_price)\" FROM web_sales_join GROUP BY ca_zip, ca_city ORDER BY ca_zip, ca_city LIMIT 100",
+        "interfaces": {"outputs": ["ca_zip", "ca_city", "sum(ws_sales_price)"], "consumes": ["web_sales_join"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "zip_cte", "item_cte", "web_sales_join", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), zip_cte AS ({zip_cte}), item_cte AS ({item_cte}), web_sales_join AS ({web_sales_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: The rewrite isolates dimension filters into CTEs (date, customer_address, item) to create small hash tables, then uses EXISTS subqueries within a single WHERE clause to implement the OR condition while avoiding Cartesian explosion from cross-joining dimension CTEs.
+
+**Expected speedup**: ~1.5-2.0x due to early dimension filtering and avoiding full cross-join of all three dimensions. The OR is implemented via EXISTS subqueries which DuckDB can optimize with semi-joins.

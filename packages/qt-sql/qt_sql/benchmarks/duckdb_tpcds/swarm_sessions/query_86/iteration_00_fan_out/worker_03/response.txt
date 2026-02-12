@@ -1,0 +1,82 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] top_n  [!]  Cost: 100%  Rows: 100 — Final ordering and limit on windowed rollup results
+    ├── [CTE] final_window  [!] — Compute hierarchy levels and within-parent ranking
+    │   ├── [CTE] rollup_agg  [!] — ROLLUP aggregation with grouping indicators
+    │   │   ├── [CTE] joined_with_item  [!] — Join filtered fact data with item dimension
+    │   │   │   ├── [CTE] fact_prejoin  [!] — Join web_sales with filtered dates
+    │   │   │   │   ├── [CTE] filtered_dates  [+] — Isolate date filter into materializable hash table
+    │   │   │   │   │   └── SCAN date_dim
+    │   │   │   │   └── SCAN web_sales
+    │   │   │   └── SCAN item
+    │   │   └── GROUP BY ROLLUP
+    │   └── WINDOW (RANK)
+    └── SORT, LIMIT
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Isolate date dimension filter into a separate CTE to create small hash table for fact join", "applied_to": ["filtered_dates"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Staged join pipeline: filter date → pre-join with fact → join remaining dimension", "applied_to": ["fact_prejoin", "joined_with_item"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1224 AND 1224+11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "fact_prejoin": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_item_sk, ws_net_paid FROM web_sales INNER JOIN filtered_dates ON ws_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ws_item_sk", "ws_net_paid"], "consumes": ["filtered_dates"]}
+      },
+      "joined_with_item": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_category, i_class, ws_net_paid FROM fact_prejoin INNER JOIN item ON ws_item_sk = i_item_sk",
+        "interfaces": {"outputs": ["i_category", "i_class", "ws_net_paid"], "consumes": ["fact_prejoin"]}
+      },
+      "rollup_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_category, i_class, SUM(ws_net_paid) AS total_sum, GROUPING(i_category) AS gcat, GROUPING(i_class) AS gcls FROM joined_with_item GROUP BY ROLLUP(i_category, i_class)",
+        "interfaces": {"outputs": ["i_category", "i_class", "total_sum", "gcat", "gcls"], "consumes": ["joined_with_item"]}
+      },
+      "final_window": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT total_sum, i_category, i_class, gcat + gcls AS lochierarchy, RANK() OVER (PARTITION BY gcat + gcls, CASE WHEN gcls = 0 THEN i_category END ORDER BY total_sum DESC) AS rank_within_parent FROM rollup_agg",
+        "interfaces": {"outputs": ["total_sum", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["rollup_agg"]}
+      },
+      "top_n": {
+        "type": "main_query",
+        "change": "new",
+        "sql": "SELECT total_sum, i_category, i_class, lochierarchy, rank_within_parent FROM final_window ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category END, rank_within_parent LIMIT 100",
+        "interfaces": {"outputs": ["total_sum", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["final_window"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "fact_prejoin", "joined_with_item", "rollup_agg", "final_window", "top_n"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), fact_prejoin AS ({fact_prejoin}), joined_with_item AS ({joined_with_item}), rollup_agg AS ({rollup_agg}), final_window AS ({final_window}) {top_n}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Changes & Mechanism
+The rewrite decomposes the original star join into a CTE pipeline that isolates the date filter first, creating a small hash table for efficient fact table probing. This follows the staged join pattern (prefetch_fact_join) while preserving the exact rollup grouping and window ranking semantics. The CTE structure may materialize intermediate results but avoids the regression trap by keeping the date filter pushed down directly into its own CTE.
+
+**Expected speedup:** 2-3x (date filter reduction → smaller fact probe → reduced aggregation input). Baseline 282ms → target 100-140ms.

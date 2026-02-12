@@ -1,0 +1,90 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_date [~] (was customer_total_return CTE date part)
+│   └── SCAN date_dim → WHERE d_year=2000 → OUTPUT d_date_sk
+├── [CTE] filtered_return_address [+]
+│   └── SCAN customer_address → OUTPUT ca_address_sk, ca_state
+├── [CTE] returns_cte [~] (was customer_total_return)
+│   ├── SCAN catalog_returns
+│   ├── JOIN filtered_date ON cr_returned_date_sk = d_date_sk
+│   ├── JOIN filtered_return_address ON cr_returning_addr_sk = ca_address_sk
+│   ├── AGG GROUP BY (cr_returning_customer_sk, ca_state)
+│   └── OUTPUT ctr_customer_sk, ctr_state, ctr_total_return
+├── [CTE] state_avg_cte [+]
+│   ├── SCAN returns_cte
+│   ├── AGG GROUP BY ctr_state
+│   └── OUTPUT ctr_state, state_avg
+├── [MAIN] main_explicit_join [~] (decorrelated)
+│   ├── SCAN returns_cte AS ctr1
+│   ├── JOIN state_avg_cte ON ctr1.ctr_state = state_avg_cte.ctr_state
+│   ├── JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+│   ├── JOIN customer_address ON ca_address_sk = c_current_addr_sk
+│   ├── FILTER ctr1.ctr_total_return > state_avg*1.2
+│   ├── FILTER ca_state='IA'
+│   └── OUTPUT 15 columns
+└── [MAIN] final_sort [=]
+    ├── ORDER BY 15 columns
+    └── LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "decorrelate_subquery", "description": "Extract correlated state average subquery into separate CTE", "applied_to": ["state_avg_cte", "main_explicit_join"]},
+    {"id": "R2", "type": "dimension_isolation", "description": "Push date filter into dedicated CTE for early filtering", "applied_to": ["filtered_date"]},
+    {"id": "R3", "type": "dimension_isolation", "description": "Extract customer_address columns needed for joins into CTE", "applied_to": ["filtered_return_address"]},
+    {"id": "R4", "type": "explicit_join_syntax", "description": "Convert comma joins to explicit JOIN syntax", "applied_to": ["returns_cte", "main_explicit_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_return_address": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk, ca_state FROM customer_address",
+        "interfaces": {"outputs": ["ca_address_sk", "ca_state"], "consumes": []}
+      },
+      "returns_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, SUM(cr_return_amt_inc_tax) AS ctr_total_return FROM catalog_returns JOIN filtered_date ON cr_returned_date_sk = d_date_sk JOIN filtered_return_address ON cr_returning_addr_sk = ca_address_sk GROUP BY cr_returning_customer_sk, ca_state",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_state", "ctr_total_return"], "consumes": ["filtered_date", "filtered_return_address"]}
+      },
+      "state_avg_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ctr_state, AVG(ctr_total_return) AS state_avg FROM returns_cte GROUP BY ctr_state",
+        "interfaces": {"outputs": ["ctr_state", "state_avg"], "consumes": ["returns_cte"]}
+      },
+      "main_explicit_join": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr1.ctr_total_return FROM returns_cte ctr1 JOIN state_avg_cte ON ctr1.ctr_state = state_avg_cte.ctr_state JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk JOIN customer_address ON ca_address_sk = c_current_addr_sk WHERE ctr1.ctr_total_return > state_avg_cte.state_avg * 1.2 AND ca_state = 'IA'",
+        "interfaces": {"outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "ca_street_number", "ca_street_name", "ca_street_type", "ca_suite_number", "ca_city", "ca_county", "ca_state", "ca_zip", "ca_country", "ca_gmt_offset", "ca_location_type", "ctr_total_return"], "consumes": ["returns_cte", "state_avg_cte"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_return_address", "returns_cte", "state_avg_cte", "main_explicit_join"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_return_address AS ({filtered_return_address}), returns_cte AS ({returns_cte}), state_avg_cte AS ({state_avg_cte}) {main_explicit_join} ORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return LIMIT 100"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+Changes: Decorrelated the correlated subquery by extracting state averages into separate CTE, isolated dimension filters into CTEs for early reduction, converted to explicit JOIN syntax.
+Expected speedup: ~2x (decorrelation eliminates per-row subquery execution, dimension isolation creates tiny hash tables for probing)

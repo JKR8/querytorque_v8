@@ -1,0 +1,396 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Rank web net paid totals over month sequence 1224-1235 by item category/class hierarchy, producing rollup-level totals and within-parent rank. All joins are INNER (intersection semantics), requiring matches in all three tables. SUM(ws_net_paid) is duplicate-sensitive; any restructuring must preserve exact row participation in each grouping set. The window function partitions by hierarchy level and category (when class is grouped), with ranking based on descending total_sum within each partition.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+filtered_dates -> filtered_items -> fact_with_dates -> joined_all -> rollup_agg -> final_window -> top_n
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1224 AND 1224+11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_with_dates
+  filtered_items:
+    FROM: item
+    WHERE: 1=1 (no filter, but included for consistency)
+    OUTPUT: i_item_sk, i_category, i_class
+    EXPECTED_ROWS: 102K
+    CONSUMERS: joined_all
+  fact_with_dates:
+    FROM: web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk
+    OUTPUT: ws_item_sk, ws_net_paid
+    EXPECTED_ROWS: 1.4M
+    CONSUMERS: joined_all
+  joined_all:
+    FROM: fact_with_dates JOIN filtered_items ON ws_item_sk = i_item_sk
+    OUTPUT: i_category, i_class, ws_net_paid
+    EXPECTED_ROWS: 1.4M
+    CONSUMERS: rollup_agg
+  rollup_agg:
+    FROM: joined_all
+    GROUP BY: ROLLUP(i_category, i_class)
+    AGGREGATE: SUM(ws_net_paid) AS total_sum
+    OUTPUT: i_category, i_class, total_sum, GROUPING(i_category) AS gcat, GROUPING(i_class) AS gcls
+    EXPECTED_ROWS: 164
+    CONSUMERS: final_window
+  final_window:
+    FROM: rollup_agg
+    WINDOW: lochierarchy = gcat + gcls, rank_within_parent = RANK() OVER (PARTITION BY gcat + gcls, CASE WHEN gcls = 0 THEN i_category END ORDER BY total_sum DESC)
+    OUTPUT: total_sum, i_category, i_class, lochierarchy, rank_within_parent
+    EXPECTED_ROWS: 164
+    CONSUMERS: top_n
+  top_n:
+    FROM: final_window
+    ORDER BY: lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category END, rank_within_parent
+    LIMIT: 100
+    OUTPUT: total_sum, i_category, i_class, lochierarchy, rank_within_parent
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+
+NODE_CONTRACTS:
+filtered_dates:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1224 AND 1224+11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_with_dates
+  filtered_items:
+    FROM: item
+    WHERE: 1=1 (no filter, but included for consistency)
+    OUTPUT: i_item_sk, i_category, i_class
+    EXPECTED_ROWS: 102K
+    CONSUMERS: joined_all
+  fact_with_dates:
+    FROM: web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk
+    OUTPUT: ws_item_sk, ws_net_paid
+    EXPECTED_ROWS: 1.4M
+    CONSUMERS: joined_all
+  joined_all:
+    FROM: fact_with_dates JOIN filtered_items ON ws_item_sk = i_item_sk
+    OUTPUT: i_category, i_class, ws_net_paid
+    EXPECTED_ROWS: 1.4M
+    CONSUMERS: rollup_agg
+  rollup_agg:
+    FROM: joined_all
+    GROUP BY: ROLLUP(i_category, i_class)
+    AGGREGATE: SUM(ws_net_paid) AS total_sum
+    OUTPUT: i_category, i_class, total_sum, GROUPING(i_category) AS gcat, GROUPING(i_class) AS gcls
+    EXPECTED_ROWS: 164
+    CONSUMERS: final_window
+  final_window:
+    FROM: rollup_agg
+    WINDOW: lochierarchy = gcat + gcls, rank_within_parent = RANK() OVER (PARTITION BY gcat + gcls, CASE WHEN gcls = 0 THEN i_category END ORDER BY total_sum DESC)
+    OUTPUT: total_sum, i_category, i_class, lochierarchy, rank_within_parent
+    EXPECTED_ROWS: 164
+    CONSUMERS: top_n
+  top_n:
+    FROM: final_window
+    ORDER BY: lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category END, rank_within_parent
+    LIMIT: 100
+    OUTPUT: total_sum, i_category, i_class, lochierarchy, rank_within_parent
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+
+## Hazard Flags (avoid these specific risks)
+
+- Item table has no filter, so filtered_items CTE provides no selectivity benefit (still 102K rows).
+- Must ensure all necessary columns (i_category, i_class) are propagated from filtered_items.
+- Risk of materialization barrier between filtered CTEs and rollup (regression_q67).
+
+## Regression Warnings (observed failures on similar queries)
+
+1. regression_q67_date_cte_isolate (0.85x):
+   CAUSE: Materialized dimension filters into CTEs before ROLLUP aggregation with window functions, creating materialization barriers that prevented optimizer pushdown.
+   RULE: Avoid materializing CTEs between dimension filters and ROLLUP aggregation when window functions are computed on the aggregated result.
+2. regression_q25_date_cte_isolate (0.5x):
+   CAUSE: Pre-filtered and joined fact table to date CTE before multi-way fact joins, losing optimizer reordering freedom.
+   RULE: For simple 3-table star joins (fact + 2 dims), avoid forced CTE join ordering that prevents optimizer from choosing optimal plan.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output total_sum, i_category, i_class, lochierarchy, rank_within_parent in original order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream: ws_net_paid, i_category, i_class, d_date_sk, ws_sold_date_sk, i_item_sk, ws_item_sk.
+- LITERAL_PRESERVATION: Must preserve d_month_seq BETWEEN 1224 AND 1224+11 exactly.
+- SEMANTIC_EQUIVALENCE: Must produce identical rows, grouping sets, and ranking as original ROLLUP.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: ROLLUP creates multiple grouping levels that could be split into UNION ALL branches for per-level optimization.
+- CROSS_CTE_PREDICATE_BLINDNESS: Date filter is already pushed down; opportunity for dimension pre-filtering CTEs exists.
+- REDUNDANT_SCAN_ELIMINATION: Only one web_sales scan, but could pre-aggregate to reduce 1.4M input to aggregation.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- dimension_cte_isolate: Apply pre-filtering of both date_dim and item into CTEs before joining with fact table. Ignore any promotion or demographics filtering as not present.
+- multi_dimension_prefetch: Adapt the concept of pre-filtering multiple dimensions (date and item) into separate CTEs before the fact join. Ignore store dimension.
+- early_filter: Use the principle of filtering date_dim first (already done), but explicitly isolate it in a CTE.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. dimension_cte_isolate (1.93x)
+
+**Principle:** Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
+
+**BEFORE (slow):**
+```sql
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year = 2000
+```
+[filtered_customer_demographics]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'
+```
+[filtered_promotions]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+```
+[joined_facts]:
+```sql
+SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales AS cs JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk
+```
+[main_query]:
+```sql
+SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM joined_facts AS jf JOIN item AS i ON jf.cs_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
+```
+
+### 2. multi_dimension_prefetch (2.71x)
+
+**Principle:** Multi-Dimension Prefetch: when multiple dimension tables have selective filters, pre-filter ALL of them into CTEs before the fact table join. Combined selectivity compounds — each dimension CTE reduces the fact scan further.
+
+**BEFORE (slow):**
+```sql
+select s_store_name, s_store_id,
+        sum(case when (d_day_name='Sunday') then ss_sales_price else null end) sun_sales,
+        sum(case when (d_day_name='Monday') then ss_sales_price else null end) mon_sales,
+        sum(case when (d_day_name='Tuesday') then ss_sales_price else  null end) tue_sales,
+        sum(case when (d_day_name='Wednesday') then ss_sales_price else null end) wed_sales,
+        sum(case when (d_day_name='Thursday') then ss_sales_price else null end) thu_sales,
+        sum(case when (d_day_name='Friday') then ss_sales_price else null end) fri_sales,
+        sum(case when (d_day_name='Saturday') then ss_sales_price else null end) sat_sales
+ from date_dim, store_sales, store
+ where d_date_sk = ss_sold_date_sk and
+       s_store_sk = ss_store_sk and
+       s_gmt_offset = -5 and
+       d_year = 2000 
+ group by s_store_name, s_store_id
+ order by s_store_name, s_store_id,sun_sales,mon_sales,tue_sales,wed_sales,thu_sales,fri_sales,sat_sales
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk, d_day_name FROM date_dim WHERE d_year = 2000
+```
+[filtered_stores]:
+```sql
+SELECT s_store_sk, s_store_name, s_store_id FROM store WHERE s_gmt_offset = -5
+```
+[main_query]:
+```sql
+SELECT s_store_name, s_store_id, SUM(CASE WHEN (d_day_name = 'Sunday') THEN ss_sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN ss_sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN ss_sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN ss_sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN ss_sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN ss_sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN ss_sales_price ELSE NULL END) AS sat_sales FROM store_sales JOIN filtered_dates ON d_date_sk = ss_sold_date_sk JOIN filtered_stores ON s_store_sk = ss_store_sk GROUP BY s_store_name, s_store_id ORDER BY s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales LIMIT 100
+```
+
+### 3. early_filter (4.00x)
+
+**Principle:** Early Selection: filter small dimension tables first, then join to large fact tables. This reduces the fact table scan to only rows matching the filter, rather than scanning all rows and filtering after the join.
+
+**BEFORE (slow):**
+```sql
+select ss_customer_sk
+            ,sum(act_sales) sumsales
+      from (select ss_item_sk
+                  ,ss_ticket_number
+                  ,ss_customer_sk
+                  ,case when sr_return_quantity is not null then (ss_quantity-sr_return_quantity)*ss_sales_price
+                                                            else (ss_quantity*ss_sales_price) end act_sales
+            from store_sales left outer join store_returns on (sr_item_sk = ss_item_sk
+                                                               and sr_ticket_number = ss_ticket_number)
+                ,reason
+            where sr_reason_sk = r_reason_sk
+              and r_reason_desc = 'duplicate purchase') t
+      group by ss_customer_sk
+      order by sumsales, ss_customer_sk
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_reason]:
+```sql
+SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'
+```
+[filtered_returns]:
+```sql
+SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+```
+[main_query]:
+```sql
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
+```
+
+## Original SQL
+
+```sql
+-- start query 86 in stream 0 using template query86.tpl
+select  
+    sum(ws_net_paid) as total_sum
+   ,i_category
+   ,i_class
+   ,grouping(i_category)+grouping(i_class) as lochierarchy
+   ,rank() over (
+ 	partition by grouping(i_category)+grouping(i_class),
+ 	case when grouping(i_class) = 0 then i_category end 
+ 	order by sum(ws_net_paid) desc) as rank_within_parent
+ from
+    web_sales
+   ,date_dim       d1
+   ,item
+ where
+    d1.d_month_seq between 1224 and 1224+11
+ and d1.d_date_sk = ws_sold_date_sk
+ and i_item_sk  = ws_item_sk
+ group by rollup(i_category,i_class)
+ order by
+   lochierarchy desc,
+   case when lochierarchy = 0 then i_category end,
+   rank_within_parent
+ LIMIT 100;
+
+-- end query 86 in stream 0 using template query86.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `total_sum`
+  2. `i_category`
+  3. `i_class`
+  4. `lochierarchy`
+  5. `rank_within_parent`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K  — Join web sales with date and item, aggregate ws_net_paid under ROLLUP(i_category, i_class), and apply hierarchy-aware ranking by descending total_sum.
+    ├── SCAN (web_sales, date_dim AS d1 (join), item (join))
+    ├── JOIN (d1.d_date_sk = ws_sold_date_sk)
+    ├── JOIN (i_item_sk = ws_item_sk)
+    ├── FILTER (d1.d_month_seq BETWEEN 1224 AND 1224 + 11)
+    ├── AGG (GROUP BY)
+    ├── SORT (lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category END ASC, rank_within_parent ASC)
+    └── OUTPUT (total_sum, i_category, i_class, lochierarchy, rank_within_parent)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

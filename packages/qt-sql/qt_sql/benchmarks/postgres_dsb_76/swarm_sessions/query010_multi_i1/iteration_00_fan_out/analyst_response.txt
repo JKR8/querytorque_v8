@@ -1,0 +1,359 @@
+<thinking>
+I need to analyze this query thoroughly first.
+
+## 1. CLASSIFY
+Looking at the query structure:
+- It's a multi-channel customer analysis query
+- Has EXISTS subqueries for store_sales, web_sales, and catalog_sales
+- Uses OR condition between web_sales and catalog_sales EXISTS
+- Groups by customer_demographics attributes
+- Filters on date (1999, months 8-11), item category, manager_id, and sale price ratio
+
+This is a "multi-channel UNION ALL" archetype where the same condition pattern is applied to three different sales channels, but with OR logic between two of them.
+
+## 2. EXPLAIN PLAN ANALYSIS
+From the EXPLAIN ANALYZE:
+- Total time: 1643.7ms
+- Main expensive operations:
+  1. Store_sales subquery: 909.8ms (55% of total)
+  2. Catalog_sales subquery: 682.2ms (42% of total)
+  3. Web_sales subquery: minor cost
+
+Row counts:
+- date_dim scans: 41 rows each (3 scans total)
+- store_sales: 997 rows per date_dim row, but filtered from ~11K to 997 (90% filtered)
+- catalog_sales: 814 rows per date_dim row, filtered from ~6,638 to 814 (88% filtered)
+- web_sales: minimal rows
+
+Key observations:
+1. Same date_dim filter (d_year=1999, d_moy 8-11) is scanned 3 times (store_sales, web_sales, catalog_sales)
+2. Same item filter (i_category in 3 values, i_manager_id 66-75) is applied 3 times
+3. The price ratio filter (ss_sales_price/ss_list_price BETWEEN 0.2 AND 0.3) filters heavily (90% reduction)
+4. The plan shows nested loops, not hash joins
+5. The optimizer is already using parallel execution (workers: 2/2 launched)
+
+Scan counts per table:
+- date_dim: 3 scans
+- item: 3 scans  
+- store_sales: 1 scan
+- web_sales: 1 scan  
+- catalog_sales: 1 scan
+- customer: scanned after store_sales join
+- customer_address: scanned after customer filter
+- customer_demographics: scanned last
+
+## 3. GAP MATCHING
+
+Checking against engine gaps:
+
+### COMMA_JOIN_WEAKNESS
+Yes, query uses comma-separated implicit joins (line 17: "from customer c,customer_address ca,customer_demographics"). This matches the gap.
+
+### CORRELATED_SUBQUERY_PARALYSIS
+The EXISTS subqueries are correlated (reference c.c_customer_sk). But the EXPLAIN shows they're already being handled as semi-joins, not re-executed per row. The optimizer seems to handle these well.
+
+### CROSS_CTE_PREDICATE_BLINDNESS  
+Same date_dim and item filters are applied 3 times independently. This matches the gap - we could materialize these once and reuse.
+
+### NON_EQUI_JOIN_INPUT_BLINDNESS
+The price ratio filter (ss_sales_price/ss_list_price BETWEEN 0.2 AND 0.3) is a non-equi join condition applied after the join. This could benefit from pre-filtering.
+
+## 4. AGGREGATION TRAP CHECK
+The query uses COUNT(*) only, which is grouping-insensitive (duplicate-safe). No STDDEV_SAMP, VARIANCE, etc. This is safe for restructuring.
+
+## 5. TRANSFORM SELECTION
+
+Based on gaps and plan analysis:
+
+1. **COMMA_JOIN_WEAKNESS** → Convert to explicit JOINs with dimension prefetch (pg_dimension_prefetch_star)
+2. **CROSS_CTE_PREDICATE_BLINDNESS** → Materialize date_dim and item filters once (pg_self_join_decomposition)  
+3. **NON_EQUI_JOIN_INPUT_BLINDNESS** → Pre-filter fact tables with price ratio (pg_materialized_dimension_fact_prefilter)
+4. **Exploration**: Combine all three channels into single scan with UNION ALL
+
+## 6. LOGICAL TREE DESIGN
+
+For Worker 1 (explicit JOINs):
+- Pre-filter date_dim, item into CTEs
+- Convert comma joins to explicit JOIN syntax
+- Keep EXISTS structure
+
+For Worker 2 (shared materialization):
+- Materialize filtered date_dim and item once
+- Reuse for all three sales channel subqueries
+- Single scan of each dimension
+
+For Worker 3 (fact pre-filtering):
+- Pre-filter store_sales, web_sales, catalog_sales with price ratio
+- Then join with filtered dimensions
+
+For Worker 4 (exploration - channel consolidation):
+- Convert OR to UNION ALL of web_sales and catalog_sales
+- Try single scan approach with CASE aggregation
+
+Now I need to produce the structured briefing.
+</thinking>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: This query analyzes male customers with specific demographic characteristics who made purchases in Q3 1999 across three sales channels, counting purchases that met discount criteria. All joins are INNER (must match) and the OR between web_sales and catalog_sales creates a union of customers from either channel. Aggregation uses only COUNT(*) which is duplicate-safe. The EXISTS subqueries must preserve semi-join semantics (no row duplication).
+
+BOTTLENECK_DIAGNOSIS: The query is join-bound with three independent fact table scans (store_sales 909.8ms, catalog_sales 682.2ms, web_sales minimal). Each scans the same date_dim (41 rows) and item filters 3 times, and applies expensive price ratio filters post-join (90% row reduction). The optimizer already handles EXISTS as semi-joins and uses parallelism effectively. Logical tree costs are misleading - store_sales appears as 55% but catalog_sales is 42%, indicating both are major bottlenecks.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs 14 columns including 6 COUNT aggregates
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (customer keys, demographic attributes)
+- LITERAL_PRESERVATION: Must preserve exact literal values for counties, birth months, marital status, education, gender, year, month range, categories, manager IDs, price ratios
+- SEMANTIC_EQUIVALENCE: Must return same rows and ordering (GROUP BY + ORDER BY on 8 columns)
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated implicit joins (line 17)
+- CROSS_CTE_PREDICATE_BLINDNESS: Same date_dim and item filters scanned 3 times independently
+- NON_EQUI_JOIN_INPUT_BLINDNESS: Price ratio filters applied after fact table joins filter 90% of rows
+
+REGRESSION_WARNINGS:
+1. EXISTS to IN conversion (observed 0.50x regression on Q069):
+   CAUSE: Converting EXISTS to IN/NOT IN changes NULL semantics and can block hash semi-joins
+   RULE: Preserve EXISTS structure for all three sales channel subqueries
+2. OR to UNION ALL splitting (observed 0.21x regression on Q085):
+   CAUSE: Splitting OR conditions into UNION ALL branches when BITMAP_OR_SCAN is more efficient
+   RULE: Keep OR between web_sales and catalog_sales EXISTS subqueries intact
+3. CTE blocking parallelism (observed in benchmark):
+   CAUSE: MATERIALIZED CTEs execute single-threaded, blocking parallel table scans
+   RULE: Avoid materializing large fact table CTEs; use inline subqueries for parallelizable scans
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: explicit_join_dimension_prefetch
+TARGET_LOGICAL_TREE:
+  date_filter_cte -> item_filter_cte -> store_sales_subquery -> web_sales_subquery -> catalog_sales_subquery -> customer_join -> address_join -> demographics_join -> aggregation -> sort -> limit
+NODE_CONTRACTS:
+  date_filter_cte:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy BETWEEN 8 AND 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 41
+    CONSUMERS: store_sales_subquery, web_sales_subquery, catalog_sales_subquery
+  item_filter_cte:
+    FROM: item
+    WHERE: i_category IN ('Children', 'Electronics', 'Music') AND i_manager_id BETWEEN 66 AND 75
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: unknown (but selective)
+    CONSUMERS: store_sales_subquery, web_sales_subquery, catalog_sales_subquery
+  store_sales_subquery:
+    FROM: store_sales JOIN date_filter_cte ON ss_sold_date_sk = d_date_sk JOIN item_filter_cte ON ss_item_sk = i_item_sk
+    WHERE: ss_sales_price / ss_list_price BETWEEN 20 * 0.01 AND 30 * 0.01
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: 671 per worker (from EXPLAIN)
+    CONSUMERS: customer_join
+  web_sales_subquery:
+    FROM: web_sales JOIN date_filter_cte ON ws_sold_date_sk = d_date_sk JOIN item_filter_cte ON ws_item_sk = i_item_sk
+    WHERE: ws_sales_price / ws_list_price BETWEEN 20 * 0.01 AND 30 * 0.01
+    OUTPUT: ws_bill_customer_sk
+    EXPECTED_ROWS: minimal
+    CONSUMERS: customer_join
+  catalog_sales_subquery:
+    FROM: catalog_sales JOIN date_filter_cte ON cs_sold_date_sk = d_date_sk JOIN item_filter_cte ON cs_item_sk = i_item_sk
+    WHERE: cs_sales_price / cs_list_price BETWEEN 20 * 0.01 AND 30 * 0.01
+    OUTPUT: cs_ship_customer_sk
+    EXPECTED_ROWS: 543 per worker (from EXPLAIN)
+    CONSUMERS: customer_join
+  customer_join:
+    FROM: customer c 
+      JOIN store_sales_subquery ON c.c_customer_sk = ss_customer_sk
+      LEFT JOIN web_sales_subquery ON c.c_customer_sk = ws_bill_customer_sk
+      LEFT JOIN catalog_sales_subquery ON c.c_customer_sk = cs_ship_customer_sk
+    WHERE: c.c_birth_month IN (1, 5) 
+      AND (ws_bill_customer_sk IS NOT NULL OR cs_ship_customer_sk IS NOT NULL)
+    OUTPUT: c.c_current_addr_sk, c.c_current_cdemo_sk, c.c_customer_sk
+    EXPECTED_ROWS: unknown (filtered from 1942)
+    CONSUMERS: address_join, demographics_join
+  address_join:
+    FROM: customer_join JOIN customer_address ca ON c_current_addr_sk = ca_address_sk
+    WHERE: ca_county IN ('Grays Harbor County','Kootenai County','Pike County','Thomas County','Uinta County')
+    OUTPUT: c.c_current_cdemo_sk, c.c_customer_sk plus all demographic columns needed
+    EXPECTED_ROWS: filtered
+    CONSUMERS: demographics_join
+  demographics_join:
+    FROM: address_join JOIN customer_demographics cd ON cd_demo_sk = c_current_cdemo_sk
+    WHERE: cd_marital_status IN ('U', 'U', 'M') 
+      AND cd_education_status IN ('College', 'Primary', '2 yr Degree')
+      AND cd_gender = 'M'
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count
+    EXPECTED_ROWS: final grouped rows
+    CONSUMERS: aggregation
+  aggregation:
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count
+    AGGREGATE: COUNT(*) as cnt1, COUNT(*) as cnt2, COUNT(*) as cnt3, COUNT(*) as cnt4, COUNT(*) as cnt5, COUNT(*) as cnt6
+    OUTPUT: all 14 columns in SELECT
+    EXPECTED_ROWS: up to 100 (LIMIT)
+    CONSUMERS: sort
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering of date_dim and item into CTEs and convert comma joins to explicit JOIN syntax. Ignore the promotion dimension since this query doesn't have one.
+- pg_date_cte_explicit_join: Apply date_dim CTE isolation and explicit JOIN conversion. Ignore that this example only has date_dim CTE - we need both date_dim and item CTEs.
+HAZARD_FLAGS:
+- CTEs may block parallelism if materialized
+- Converting EXISTS to JOIN may change semi-join semantics if not careful with duplicates
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: shared_dimension_materialization
+TARGET_LOGICAL_TREE:
+  filtered_dimensions_cte -> store_sales_join -> web_sales_join -> catalog_sales_join -> customer_filter -> address_filter -> demographics_filter -> aggregation -> sort -> limit
+NODE_CONTRACTS:
+  filtered_dimensions_cte:
+    FROM: date_dim d JOIN item i ON 1=1
+    WHERE: d.d_year = 1999 AND d.d_moy BETWEEN 8 AND 11 
+      AND i.i_category IN ('Children', 'Electronics', 'Music') AND i.i_manager_id BETWEEN 66 AND 75
+    OUTPUT: d.d_date_sk, i.i_item_sk
+    EXPECTED_ROWS: 41 * item_count (cartesian but filtered)
+    CONSUMERS: store_sales_join, web_sales_join, catalog_sales_join
+  store_sales_join:
+    FROM: store_sales ss JOIN filtered_dimensions_cte f ON ss.ss_sold_date_sk = f.d_date_sk AND ss.ss_item_sk = f.i_item_sk
+    WHERE: ss.ss_sales_price / ss.ss_list_price BETWEEN 20 * 0.01 AND 30 * 0.01
+    OUTPUT: ss.ss_customer_sk
+    EXPECTED_ROWS: 671 per worker
+    CONSUMERS: customer_filter
+  web_sales_join:
+    FROM: web_sales ws JOIN filtered_dimensions_cte f ON ws.ws_sold_date_sk = f.d_date_sk AND ws.ws_item_sk = f.i_item_sk
+    WHERE: ws.ws_sales_price / ws.ws_list_price BETWEEN 20 * 0.01 AND 30 * 0.01
+    OUTPUT: ws.ws_bill_customer_sk
+    EXPECTED_ROWS: minimal
+    CONSUMERS: customer_filter
+  catalog_sales_join:
+    FROM: catalog_sales cs JOIN filtered_dimensions_cte f ON cs.cs_sold_date_sk = f.d_date_sk AND cs.cs_item_sk = f.i_item_sk
+    WHERE: cs.cs_sales_price / cs.cs_list_price BETWEEN 20 * 0.01 AND 30 * 0.01
+    OUTPUT: cs.cs_ship_customer_sk
+    EXPECTED_ROWS: 543 per worker
+    CONSUMERS: customer_filter
+  customer_filter:
+    FROM: customer c 
+      JOIN store_sales_join ON c.c_customer_sk = ss_customer_sk
+      LEFT JOIN web_sales_join ON c.c_customer_sk = ws_bill_customer_sk  
+      LEFT JOIN catalog_sales_join ON c.c_customer_sk = cs_ship_customer_sk
+    WHERE: c.c_birth_month IN (1, 5)
+      AND (ws_bill_customer_sk IS NOT NULL OR cs_ship_customer_sk IS NOT NULL)
+    OUTPUT: c.c_current_addr_sk, c.c_current_cdemo_sk
+    EXPECTED_ROWS: filtered
+    CONSUMERS: address_filter
+  address_filter:
+    FROM: customer_filter JOIN customer_address ca ON c_current_addr_sk = ca_address_sk
+    WHERE: ca_county IN ('Grays Harbor County','Kootenai County','Pike County','Thomas County','Uinta County')
+    OUTPUT: c.c_current_cdemo_sk
+    EXPECTED_ROWS: filtered
+    CONSUMERS: demographics_filter
+  demographics_filter:
+    FROM: address_filter JOIN customer_demographics cd ON cd_demo_sk = c_current_cdemo_sk
+    WHERE: cd_marital_status IN ('U', 'U', 'M')
+      AND cd_education_status IN ('College', 'Primary', '2 yr Degree')
+      AND cd_gender = 'M'
+    OUTPUT: all 8 GROUP BY columns
+    EXPECTED_ROWS: final groups
+    CONSUMERS: aggregation
+EXAMPLES: pg_self_join_decomposition, pg_dimension_prefetch_star
+EXAMPLE_ADAPTATION:
+- pg_self_join_decomposition: Apply shared materialization of date_dim and item filters used across all three sales channels. Ignore the aggregation reuse pattern - we're reusing dimension filters, not fact aggregations.
+- pg_dimension_prefetch_star: Apply dimension prefetching but combine date_dim and item into single CTE. Ignore separate CTEs per dimension.
+HAZARD_FLAGS:
+- Cartesian join in filtered_dimensions_cte could explode if item filter isn't selective
+- Materialized CTE may block parallel execution of fact table scans
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: fact_prefilter_materialized
+TARGET_LOGICAL_TREE:
+  filtered_store_sales_cte -> filtered_web_sales_cte -> filtered_catalog_sales_cte -> customer_join -> address_join -> demographics_join -> aggregation -> sort -> limit
+NODE_CONTRACTS:
+  filtered_store_sales_cte:
+    FROM: store_sales ss JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk JOIN item i ON ss.ss_item_sk = i.i_item_sk
+    WHERE: d.d_year = 1999 AND d.d_moy BETWEEN 8 AND 11
+      AND i.i_category IN ('Children', 'Electronics', 'Music') AND i.i_manager_id BETWEEN 66 AND 75
+      AND ss.ss_sales_price / ss.ss_list_price BETWEEN 20 * 0.01 AND 30 * 0.01
+    OUTPUT: ss.ss_customer_sk
+    EXPECTED_ROWS: 671 per worker
+    CONSUMERS: customer_join
+  filtered_web_sales_cte:
+    FROM: web_sales ws JOIN date_dim d ON ws.ws_sold_date_sk = d.d_date_sk JOIN item i ON ws.ws_item_sk = i.i_item_sk
+    WHERE: d.d_year = 1999 AND d.d_moy BETWEEN 8 AND 11
+      AND i.i_category IN ('Children', 'Electronics', 'Music') AND i.i_manager_id BETWEEN 66 AND 75  
+      AND ws.ws_sales_price / ws.ws_list_price BETWEEN 20 * 0.01 AND 30 * 0.01
+    OUTPUT: ws.ws_bill_customer_sk
+    EXPECTED_ROWS: minimal
+    CONSUMERS: customer_join
+  filtered_catalog_sales_cte:
+    FROM: catalog_sales cs JOIN date_dim d ON cs.cs_sold_date_sk = d.d_date_sk JOIN item i ON cs.cs_item_sk = i.i_item_sk
+    WHERE: d.d_year = 1999 AND d.d_moy BETWEEN 8 AND 11
+      AND i.i_category IN ('Children', 'Electronics', 'Music') AND i.i_manager_id BETWEEN 66 AND 75
+      AND cs.cs_sales_price / cs.cs_list_price BETWEEN 20 * 0.01 AND 30 * 0.01
+    OUTPUT: cs.cs_ship_customer_sk
+    EXPECTED_ROWS: 543 per worker
+    CONSUMERS: customer_join
+  customer_join:
+    FROM: customer c 
+      JOIN filtered_store_sales_cte ON c.c_customer_sk = ss_customer_sk
+      LEFT JOIN filtered_web_sales_cte ON c.c_customer_sk = ws_bill_customer_sk
+      LEFT JOIN filtered_catalog_sales_cte ON c.c_customer_sk = cs_ship_customer_sk
+    WHERE: c.c_birth_month IN (1, 5)
+      AND (ws_bill_customer_sk IS NOT NULL OR cs_ship_customer_sk IS NOT NULL)
+    OUTPUT: c.c_current_addr_sk, c.c_current_cdemo_sk
+    EXPECTED_ROWS: filtered
+    CONSUMERS: address_join
+EXAMPLES: pg_materialized_dimension_fact_prefilter, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_materialized_dimension_fact_prefilter: Apply staged reduction by pre-filtering fact tables with all dimension filters and price ratio. Ignore the non-equi join aspect - we have ratio filter but not inequality join.
+- early_filter_decorrelate: Apply early filtering of fact tables before customer join. Ignore the decorrelation aspect - our EXISTS are already handled as semi-joins.
+HAZARD_FLAGS:
+- Materializing large fact table CTEs blocks parallelism
+- Triple repetition of same date_dim and item joins in each CTE
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: channel_consolidation_union
+TARGET_LOGICAL_TREE:
+  date_filter_cte -> item_filter_cte -> all_sales_union_cte -> customer_join -> address_join -> demographics_join -> aggregation -> sort -> limit
+NODE_CONTRACTS:
+  date_filter_cte:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy BETWEEN 8 AND 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 41
+    CONSUMERS: all_sales_union_cte
+  item_filter_cte:
+    FROM: item
+    WHERE: i_category IN ('Children', 'Electronics', 'Music') AND i_manager_id BETWEEN 66 AND 75
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: selective
+    CONSUMERS: all_sales_union_cte
+  all_sales_union_cte:
+    FROM: (
+      SELECT ss_customer_sk as customer_sk, 'store' as channel
+      FROM store_sales ss JOIN date_filter_cte d ON ss.ss_sold_date_sk = d.d_date_sk JOIN item_filter_cte i ON ss.ss_item_sk = i.i_item_sk
+      WHERE ss.ss_sales_price / ss.ss_list_price BETWEEN 20 * 0.01 AND 30 * 0.01
+      UNION ALL
+      SELECT ws_bill_customer_sk as customer_sk, 'web' as channel  
+      FROM web_sales ws JOIN date_filter_cte d ON ws.ws_sold_date_sk = d.d_date_sk JOIN item_filter_cte i ON ws.ws_item_sk = i.i_item_sk
+      WHERE ws.ws_sales_price / ws.ws_list_price BETWEEN 20 * 0.01 AND 30 * 0.01
+      UNION ALL
+      SELECT cs_ship_customer_sk as customer_sk, 'catalog' as channel
+      FROM catalog_sales cs JOIN date_filter_cte d ON cs.cs_sold_date_sk = d.d_date_sk JOIN item_filter_cte i ON cs.cs_item_sk = i.i_item_sk
+      WHERE cs.cs_sales_price / cs.cs_list_price BETWEEN 20 * 0.01 AND 30 * 0.01
+    ) sales
+    OUTPUT: customer_sk, channel
+    EXPECTED_ROWS: store(671) + web(minimal) + catalog(543) per worker
+    CONSUMERS: customer_join
+  customer_join:
+    FROM: customer c JOIN all_sales_union_cte s ON c.c_customer_sk = s.customer_sk
+    WHERE: c.c_birth_month IN (1, 5)
+      AND EXISTS (SELECT 1 FROM all_sales_union_cte s2 WHERE s2.customer_sk = c.c_customer_sk AND s2.channel = 'store')
+      AND EXISTS (SELECT 1 FROM all_sales_union_cte s3 WHERE s3.customer_sk = c.c_customer_sk AND s3.channel IN ('web', 'catalog'))
+    OUTPUT: c.c_current_addr_sk, c.c_current_cdemo_sk
+    EXPECTED_ROWS: filtered
+    CONSUMERS: address_join
+EXAMPLES: or_to_union, single_pass_aggregation
+EXAMPLE_ADAPTATION:
+- or_to_union: Convert OR between web_sales and catalog_sales to UNION ALL, but preserve store_sales as mandatory. Ignore the warning about BITMAP_OR_SCAN - we're not splitting OR on indexed columns but consolidating separate fact tables.
+- single_pass_aggregation: Apply consolidation of multiple fact table scans into single UNION ALL structure. Ignore the aggregation aspect - we're consolidating scans not aggregates.
+HAZARD_FLAGS:
+- Changing EXISTS to UNION ALL + EXISTS may change performance characteristics
+- Multiple EXISTS checks on same CTE may cause repeated scans
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combining dimension prefetch with channel consolidation via UNION ALL)

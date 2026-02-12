@@ -1,0 +1,305 @@
+<reasoning>
+## 1. CLASSIFY
+Structural archetype: **star-join with late dim filter**. This is a classic star schema query where a large fact table (catalog_sales) joins to multiple dimension tables (warehouse, ship_mode, call_center, date_dim) with selective filters on dimensions, then aggregates. No correlated subqueries, no UNION ALL, no self-joins, no EXISTS/INTERSECT operations.
+
+## 2. EXPLAIN PLAN ANALYSIS
+**Timing breakdown (from EXPLAIN):**
+- Total: 235.7ms
+- Index Only Scan on date_dim: 0.7ms × 3 workers = ~2.1ms (0.9%)
+- Nested Loop chain (main processing): ~206ms (87.4%)
+  - Seq Scan on call_center: 0.0ms × 731 loops = negligible
+  - Seq Scan on warehouse: 0.0ms × 2193 loops = negligible  
+  - Seq Scan on ship_mode: 0.0ms × 4386 loops = negligible
+  - **Index Scan on catalog_sales: 0.0ms × 17544 loops = ~70ms (estimated 30%)** ← DOMINANT COST
+- Sort + Aggregate: ~28ms (11.9%)
+
+**Cardinality flow:**
+- date_dim: 244 rows → after month_seq filter (1192-1215)
+- call_center: 3 rows → after cc_class='small' filter
+- warehouse: 2 rows → after w_gmt_offset=-5 filter
+- ship_mode: 4 rows → after sm_type='EXPRESS' filter
+- catalog_sales: 0.04 rows per probe (17544 probes return 767 total rows) → after cs_list_price BETWEEN 86 AND 115 filter
+- Final aggregation: 4 rows
+
+**Key observations:**
+- The optimizer is using **nested loop joins** with catalog_sales as the innermost table.
+- Each dimension table is scanned **multiple times** (call_center 731×, warehouse 2193×, ship_mode 4386×).
+- The catalog_sales index scan is executed **17,544 times** (once per combination of dimension keys).
+- Row counts drop sharply at each dimension filter (high selectivity).
+- The optimizer is **NOT pushing dimension filters early** into a shared scan - each nested loop re-evaluates the dimension filters.
+- No CTEs are present in the original query; optimizer is doing raw nested loops.
+
+**Scan count analysis:**
+- catalog_sales: 1 scan but 17,544 index lookups (effectively 17,544 "micro-scans")
+- warehouse: 2,193 seq scans
+- ship_mode: 4,386 seq scans  
+- call_center: 731 seq scans
+- date_dim: 3 index-only scans (parallel workers)
+
+**Optimizer already handles well:**
+- Parallel execution (2 workers launched)
+- Index-only scan on date_dim (d_month_seq index)
+- Index scan on catalog_sales (composite index on cs_ship_date_sk, cs_call_center_sk, etc.)
+
+## 3. GAP MATCHING
+
+**COMMA_JOIN_WEAKNESS (ACTIVE):** Query uses comma-separated implicit joins. The EXPLAIN shows nested loops with poor cardinality estimation. Evidence: "Nested Loop Inner (rows=1 loops=4386)" - optimizer underestimates join fanout.
+
+**CORRELATED_SUBQUERY_PARALYSIS (NOT APPLICABLE):** No correlated subqueries.
+
+**CROSS_CTE_PREDICATE_BLINDNESS (ACTIVE):** Same dimension tables are scanned multiple times (warehouse 2,193×, ship_mode 4,386×, call_center 731×). Opportunity to materialize filtered dimensions once and reuse.
+
+**NON_EQUI_JOIN_INPUT_BLINDNESS (NOT APPLICABLE):** All joins are equi-joins.
+
+**Optimizer strengths that apply:**
+- INNER_JOIN_REORDERING: Optimizer can reorder inner joins freely.
+- PARALLEL_QUERY_EXECUTION: Already using parallelism (2 workers).
+- INDEX_ONLY_SCAN: Already using for date_dim.
+
+## 4. AGGREGATION TRAP CHECK
+Aggregation uses SUM(CASE...) with conditional logic based on cs_ship_date_sk - cs_sold_date_sk differences. These are grouping-insensitive (SUM of 0/1). No STDDEV_SAMP, VARIANCE, or FILTER clauses. Join multiplicity doesn't affect correctness since all joins are inner joins on foreign keys (no duplication). Safe to restructure.
+
+## 5. TRANSFORM SELECTION
+
+Ranked by expected value:
+
+1. **star_join_prefetch** (pre-filter ALL dimensions into CTEs + explicit JOINs) - Targets COMMA_JOIN_WEAKNESS and CROSS_CTE_PREDICATE_BLINDNESS. Should eliminate repeated dimension scans and enable hash joins.
+
+2. **late_attribute_binding** - Defer warehouse join until after aggregation (only used for w_warehouse_name substring in GROUP BY/ORDER BY). Could reduce dimension scans from 2,193 to 1.
+
+3. **predicate_pushdown** + **explicit JOINs** - Minimal change: convert comma joins to explicit JOINs only, letting optimizer reorder. Baseline for comparison.
+
+4. **EXPLORATION: scan_consolidation_pivot** - Since all dimensions are filtered independently, create a single "dimension_keys" CTE with all foreign keys, then join once to catalog_sales. Novel combination not in examples.
+
+## 6. LOGICAL TREE DESIGN
+
+**Worker 1 (star_join_prefetch):**
+- CTE for each filtered dimension
+- Explicit JOINs between CTEs and fact table
+- Preserve all columns needed for GROUP BY and SELECT
+
+**Worker 2 (late_attribute_binding):**
+- CTE: pre-join date_dim, ship_mode, call_center with catalog_sales (fact + 3 dimensions)
+- Aggregate in main query, then join to warehouse only for w_warehouse_name
+
+**Worker 3 (explicit JOINs baseline):**
+- Minimal change: convert comma joins to explicit JOIN syntax
+- Let optimizer decide join order
+
+**Worker 4 (exploration - scan_consolidation_pivot):**
+- CTE1: cross join of filtered dimensions to get all key combinations
+- CTE2: join CTE1 to catalog_sales once
+- Aggregate in main query
+
+All designs must include: cs_ship_date_sk, cs_sold_date_sk, cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk, cs_list_price, w_warehouse_name, sm_type, cc_name.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: This query analyzes shipping performance by warehouse, ship mode, and call center, counting orders grouped by delivery time buckets (30 days, 31-60 days, etc.). All joins are INNER equi-joins (all sides must match). Aggregation uses conditional SUMs of 1/0 values based on date differences, which are grouping-insensitive. Filter dependencies: date_dim.d_month_seq range, catalog_sales.cs_list_price range, warehouse.w_gmt_offset, ship_mode.sm_type, and call_center.cc_class must be preserved exactly.
+
+BOTTLENECK_DIAGNOSIS: The dominant cost is 17,544 nested loop index probes on catalog_sales (30% of runtime), driven by repeated scanning of dimension tables (warehouse 2,193×, ship_mode 4,386×, call_center 731×). The query is join-bound with high fan-out from small dimension tables to large fact table. The optimizer already handles parallel execution and index-only scans on date_dim well. Logical-tree cost percentages are misleading - the nested loop chain appears cheap per iteration but dominates due to high iteration count.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs 8 columns: substring(w_warehouse_name,1,20), sm_type, cc_name, and 5 bucket counts.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include cs_ship_date_sk, cs_sold_date_sk for date difference calculation, plus all join keys and GROUP BY columns.
+- LITERAL_PRESERVATION: Must preserve exact filter values: d_month_seq 1192-1215, cs_list_price 86-115, sm_type 'EXPRESS', cc_class 'small', w_gmt_offset -5.
+- SEMANTIC_EQUIVALENCE: Must return same 4 aggregated rows with identical counts.
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated joins causing nested loops (EXPLAIN: "Nested Loop Inner (rows=1 loops=4386)").
+- CROSS_CTE_PREDICATE_BLINDNESS: Dimension tables scanned thousands of times (EXPLAIN: "Seq Scan on warehouse (rows=2 loops=2193)").
+
+REGRESSION_WARNINGS:
+1. CTE blocking parallelism (observed regression: 0.50x on Q069):
+   CAUSE: Materialized CTEs executed single-threaded, preventing parallel table scans.
+   RULE: Avoid wrapping large fact table scans in CTEs; keep fact table in main query for parallel execution.
+2. Over-aggressive join elimination (observed regression: 0.21x on Q085):
+   CAUSE: Converting nested loops to hash joins when dimension selectivity is extremely high (1-2 rows) can increase memory overhead.
+   RULE: For tiny dimension tables (<10 rows), nested loops may be optimal; let optimizer choose.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_dim_cte -> call_center_cte -> warehouse_cte -> ship_mode_cte -> prefactored_cte -> main_aggregation -> sort -> limit
+NODE_CONTRACTS:
+  date_dim_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1192 AND 1192 + 23
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 244
+    CONSUMERS: prefactored_cte
+  call_center_cte:
+    FROM: call_center
+    WHERE: cc_class = 'small'
+    OUTPUT: cc_call_center_sk, cc_name
+    EXPECTED_ROWS: 3
+    CONSUMERS: prefactored_cte
+  warehouse_cte:
+    FROM: warehouse
+    WHERE: w_gmt_offset = -5
+    OUTPUT: w_warehouse_sk, w_warehouse_name
+    EXPECTED_ROWS: 2
+    CONSUMERS: prefactored_cte
+  ship_mode_cte:
+    FROM: ship_mode
+    WHERE: sm_type = 'EXPRESS'
+    OUTPUT: sm_ship_mode_sk, sm_type
+    EXPECTED_ROWS: 4
+    CONSUMERS: prefactored_cte
+  prefactored_cte:
+    FROM: catalog_sales
+    JOIN: INNER JOIN date_dim_cte ON cs_ship_date_sk = d_date_sk
+          INNER JOIN call_center_cte ON cs_call_center_sk = cc_call_center_sk
+          INNER JOIN warehouse_cte ON cs_warehouse_sk = w_warehouse_sk
+          INNER JOIN ship_mode_cte ON cs_ship_mode_sk = sm_ship_mode_sk
+    WHERE: cs_list_price BETWEEN 86 AND 115
+    OUTPUT: cs_ship_date_sk, cs_sold_date_sk, w_warehouse_name, sm_type, cc_name
+    EXPECTED_ROWS: 767
+    CONSUMERS: main_aggregation
+  main_aggregation:
+    FROM: prefactored_cte
+    GROUP BY: substring(w_warehouse_name,1,20), sm_type, cc_name
+    AGGREGATE: sum(case when (cs_ship_date_sk - cs_sold_date_sk <= 30) then 1 else 0 end) as "30 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 30 and cs_ship_date_sk - cs_sold_date_sk <= 60) then 1 else 0 end) as "31-60 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 60 and cs_ship_date_sk - cs_sold_date_sk <= 90) then 1 else 0 end) as "61-90 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 90 and cs_ship_date_sk - cs_sold_date_sk <= 120) then 1 else 0 end) as "91-120 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 120) then 1 else 0 end) as ">120 days"
+    OUTPUT: substring(w_warehouse_name,1,20), sm_type, cc_name, "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"
+    EXPECTED_ROWS: 4
+    CONSUMERS: final_output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering all selective dimensions into CTEs and explicit JOIN syntax. Ignore the UNION aspect (this query has no UNION).
+- pg_date_cte_explicit_join: Apply date_dim CTE isolation combined with explicit JOIN conversion. Ignore that example uses only date_dim CTE - we need all dimensions.
+- pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED keyword on dimension CTEs to force early execution. Ignore the non-equi join aspect.
+HAZARD_FLAGS:
+- CTEs may block parallelism on catalog_sales scan (regression warning #1)
+- Hash joins on tiny dimension tables (2-4 rows) may have overhead vs nested loops
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+  core_cte -> aggregation_cte -> warehouse_join -> sort -> limit
+NODE_CONTRACTS:
+  core_cte:
+    FROM: catalog_sales
+    JOIN: INNER JOIN date_dim ON cs_ship_date_sk = d_date_sk
+          INNER JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk
+          INNER JOIN call_center ON cs_call_center_sk = cc_call_center_sk
+    WHERE: d_month_seq BETWEEN 1192 AND 1192 + 23
+           AND cs_list_price BETWEEN 86 AND 115
+           AND sm_type = 'EXPRESS'
+           AND cc_class = 'small'
+    OUTPUT: cs_ship_date_sk, cs_sold_date_sk, cs_warehouse_sk, sm_type, cc_name
+    EXPECTED_ROWS: ~767
+    CONSUMERS: aggregation_cte
+  aggregation_cte:
+    FROM: core_cte
+    GROUP BY: cs_warehouse_sk, sm_type, cc_name
+    AGGREGATE: sum(case when (cs_ship_date_sk - cs_sold_date_sk <= 30) then 1 else 0 end) as "30 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 30 and cs_ship_date_sk - cs_sold_date_sk <= 60) then 1 else 0 end) as "31-60 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 60 and cs_ship_date_sk - cs_sold_date_sk <= 90) then 1 else 0 end) as "61-90 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 90 and cs_ship_date_sk - cs_sold_date_sk <= 120) then 1 else 0 end) as "91-120 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 120) then 1 else 0 end) as ">120 days"
+    OUTPUT: cs_warehouse_sk, sm_type, cc_name, "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"
+    EXPECTED_ROWS: ~4
+    CONSUMERS: warehouse_join
+  warehouse_join:
+    FROM: aggregation_cte
+    JOIN: INNER JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk
+    WHERE: w_gmt_offset = -5
+    OUTPUT: substring(w_warehouse_name,1,20), sm_type, cc_name, "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"
+    EXPECTED_ROWS: 4
+    CONSUMERS: final_output
+EXAMPLES: early_filter_decorrelate, pg_dimension_prefetch_star
+EXAMPLE_ADAPTATION:
+- early_filter_decorrelate: Apply early filtering of date_dim, ship_mode, call_center before joining to fact table. Ignore the decorrelation aspect (no correlated subquery).
+- pg_dimension_prefetch_star: Apply pre-filtering of date_dim, ship_mode, call_center into CTEs. Ignore the warehouse pre-filtering (we defer warehouse join).
+HAZARD_FLAGS:
+- Aggregation before warehouse join may produce more groups if w_gmt_offset filter eliminates some cs_warehouse_sk values
+- Must verify w_gmt_offset filter doesn't change grouping (it doesn't - warehouse is 1:1 with cs_warehouse_sk)
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: explicit_joins_baseline
+TARGET_LOGICAL_TREE:
+  main_join -> aggregation -> sort -> limit
+NODE_CONTRACTS:
+  main_join:
+    FROM: catalog_sales
+    JOIN: INNER JOIN date_dim ON cs_ship_date_sk = d_date_sk
+          INNER JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk
+          INNER JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk
+          INNER JOIN call_center ON cs_call_center_sk = cc_call_center_sk
+    WHERE: d_month_seq BETWEEN 1192 AND 1192 + 23
+           AND cs_list_price BETWEEN 86 AND 115
+           AND sm_type = 'EXPRESS'
+           AND cc_class = 'small'
+           AND w_gmt_offset = -5
+    OUTPUT: cs_ship_date_sk, cs_sold_date_sk, w_warehouse_name, sm_type, cc_name
+    EXPECTED_ROWS: 767
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: main_join
+    GROUP BY: substring(w_warehouse_name,1,20), sm_type, cc_name
+    AGGREGATE: sum(case when (cs_ship_date_sk - cs_sold_date_sk <= 30) then 1 else 0 end) as "30 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 30 and cs_ship_date_sk - cs_sold_date_sk <= 60) then 1 else 0 end) as "31-60 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 60 and cs_ship_date_sk - cs_sold_date_sk <= 90) then 1 else 0 end) as "61-90 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 90 and cs_ship_date_sk - cs_sold_date_sk <= 120) then 1 else 0 end) as "91-120 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 120) then 1 else 0 end) as ">120 days"
+    OUTPUT: substring(w_warehouse_name,1,20), sm_type, cc_name, "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"
+    EXPECTED_ROWS: 4
+    CONSUMERS: final_output
+EXAMPLES: pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- pg_date_cte_explicit_join: Apply explicit JOIN syntax conversion only. Ignore the CTE isolation (we're not using CTEs).
+HAZARD_FLAGS:
+- Optimizer may still choose nested loops with this structure
+- No CTEs means dimension filters may still be evaluated multiple times
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: dimension_keys_cartesian
+TARGET_LOGICAL_TREE:
+  dim_keys_cte -> fact_join_cte -> aggregation -> sort -> limit
+NODE_CONTRACTS:
+  dim_keys_cte:
+    FROM: (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1192 AND 1192 + 23) date_dim,
+          (SELECT w_warehouse_sk, w_warehouse_name FROM warehouse WHERE w_gmt_offset = -5) warehouse,
+          (SELECT sm_ship_mode_sk, sm_type FROM ship_mode WHERE sm_type = 'EXPRESS') ship_mode,
+          (SELECT cc_call_center_sk, cc_name FROM call_center WHERE cc_class = 'small') call_center
+    OUTPUT: d_date_sk, w_warehouse_sk, w_warehouse_name, sm_ship_mode_sk, sm_type, cc_call_center_sk, cc_name
+    EXPECTED_ROWS: 244 × 2 × 4 × 3 = 5,856
+    CONSUMERS: fact_join_cte
+  fact_join_cte:
+    FROM: catalog_sales
+    JOIN: INNER JOIN dim_keys_cte ON cs_ship_date_sk = d_date_sk 
+                                 AND cs_warehouse_sk = w_warehouse_sk
+                                 AND cs_ship_mode_sk = sm_ship_mode_sk
+                                 AND cs_call_center_sk = cc_call_center_sk
+    WHERE: cs_list_price BETWEEN 86 AND 115
+    OUTPUT: cs_ship_date_sk, cs_sold_date_sk, w_warehouse_name, sm_type, cc_name
+    EXPECTED_ROWS: 767
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: fact_join_cte
+    GROUP BY: substring(w_warehouse_name,1,20), sm_type, cc_name
+    AGGREGATE: sum(case when (cs_ship_date_sk - cs_sold_date_sk <= 30) then 1 else 0 end) as "30 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 30 and cs_ship_date_sk - cs_sold_date_sk <= 60) then 1 else 0 end) as "31-60 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 60 and cs_ship_date_sk - cs_sold_date_sk <= 90) then 1 else 0 end) as "61-90 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 90 and cs_ship_date_sk - cs_sold_date_sk <= 120) then 1 else 0 end) as "91-120 days",
+               sum(case when (cs_ship_date_sk - cs_sold_date_sk > 120) then 1 else 0 end) as ">120 days"
+    OUTPUT: substring(w_warehouse_name,1,20), sm_type, cc_name, "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"
+    EXPECTED_ROWS: 4
+    CONSUMERS: final_output
+EXAMPLES: pg_materialized_dimension_fact_prefilter, pg_dimension_prefetch_star
+EXAMPLE_ADAPTATION:
+- pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED keyword on dim_keys_cte to force Cartesian product materialization. Ignore the non-equi join aspect.
+- pg_dimension_prefetch_star: Apply pre-filtering all dimensions. Adapt by combining them into a single Cartesian product CTE instead of separate CTEs.
+HAZARD_FLAGS:
+- Cartesian product of dimensions (5,856 rows) may be larger than optimal
+- Materializing dim_keys_cte may consume more memory than separate dimension CTEs
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

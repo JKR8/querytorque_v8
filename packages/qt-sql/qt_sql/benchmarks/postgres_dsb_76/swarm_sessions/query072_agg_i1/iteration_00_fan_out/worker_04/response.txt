@@ -1,0 +1,121 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE-based staged reduction)
+├── [!] main_query [modified structure - replaces single block with CTE chain]
+├── [+] prefiltered_dims [new CTE]
+│   ├── SCAN date_dim d1 (filtered: d_year=1998)
+│   ├── SCAN date_dim d2 (joined: d1.d_week_seq = d2.d_week_seq)
+│   ├── SCAN date_dim d3 (unfiltered)
+│   ├── SCAN customer_demographics (filtered: cd_marital_status='U', cd_dep_count 9-11)
+│   ├── SCAN household_demographics (filtered: hd_buy_potential='>10000')
+│   ├── JOIN (cross)
+│   └── OUTPUT (d1.d_date_sk, d1.d_date, d1.d_week_seq, d2.d_date_sk, d3.d_date_sk, d3.d_date, cd_demo_sk, hd_demo_sk)
+├── [+] sales_inventory_pair [new CTE]
+│   ├── SCAN catalog_sales (filtered: cs_wholesale_cost 35-55)
+│   ├── SCAN inventory
+│   ├── JOIN catalog_sales × prefiltered_dims (equi: cs_sold_date_sk=d1.d_date_sk, cs_bill_cdemo_sk=cd_demo_sk, cs_bill_hdemo_sk=hd_demo_sk)
+│   ├── JOIN inventory (equi: inv_item_sk=cs_item_sk, inv_date_sk=d2.d_date_sk)
+│   ├── FILTER (inv_quantity_on_hand < cs_quantity) [non-equi pushed early]
+│   └── OUTPUT (cs_item_sk, cs_quantity, cs_ship_date_sk, cs_promo_sk, cs_order_number, d1.d_date, d1.d_week_seq, d3.d_date_sk, d3.d_date, inv_warehouse_sk)
+├── [+] filtered_pair [new CTE]
+│   ├── SCAN item (filtered: i_category IN ('Children','Jewelry','Men'))
+│   ├── SCAN warehouse
+│   ├── SCAN promotion (left outer)
+│   ├── SCAN catalog_returns (left outer: cr_item_sk=cs_item_sk AND cr_order_number=cs_order_number)
+│   ├── JOIN item (equi: i_item_sk=cs_item_sk)
+│   ├── JOIN warehouse (equi: w_warehouse_sk=inv_warehouse_sk)
+│   ├── JOIN promotion (equi: p_promo_sk=cs_promo_sk)
+│   ├── FILTER (d3.d_date > d1.d_date + interval '3 day')
+│   └── OUTPUT (i_item_desc, w_warehouse_name, d1.d_week_seq, cs_promo_sk)
+└── [=] final_aggregation
+    ├── AGG (GROUP BY i_item_desc, w_warehouse_name, d_week_seq)
+    │   ├── SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo
+    │   ├── SUM(CASE WHEN p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo
+    │   └── COUNT(*) AS total_cnt
+    ├── SORT (total_cnt DESC, i_item_desc ASC, w_warehouse_name ASC, d_week_seq ASC)
+    └── OUTPUT (i_item_desc, w_warehouse_name, d_week_seq, no_promo, promo, total_cnt) LIMIT 100
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "pg_materialized_dimension_fact_prefilter",
+      "description": "Push dimension filters into CTEs before large fact joins, apply non-equi condition early",
+      "applied_to": ["prefiltered_dims", "sales_inventory_pair", "filtered_pair"]
+    },
+    {
+      "id": "R2",
+      "type": "pg_dimension_prefetch_star",
+      "description": "Materialize selective dimension rows as small hash tables for better cardinality estimation",
+      "applied_to": ["prefiltered_dims"]
+    },
+    {
+      "id": "R3",
+      "type": "join_order_trap_mitigation",
+      "description": "Explicit join order with filtered CTEs prevents optimizer from choosing inefficient nested loops",
+      "applied_to": ["sales_inventory_pair", "filtered_pair"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "prefiltered_dims": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT \n  d1.d_date_sk AS d1_date_sk,\n  d1.d_date AS d1_date,\n  d1.d_week_seq AS d1_week_seq,\n  d2.d_date_sk AS d2_date_sk,\n  d3.d_date_sk AS d3_date_sk,\n  d3.d_date AS d3_date,\n  cd.cd_demo_sk,\n  hd.hd_demo_sk\nFROM date_dim d1\nJOIN date_dim d2 ON d1.d_week_seq = d2.d_week_seq\nCROSS JOIN date_dim d3\nCROSS JOIN customer_demographics cd\nCROSS JOIN household_demographics hd\nWHERE d1.d_year = 1998\n  AND hd.hd_buy_potential = '>10000'\n  AND cd.cd_marital_status = 'U'\n  AND cd.cd_dep_count BETWEEN 9 AND 11",
+          "interfaces": {
+            "outputs": ["d1_date_sk", "d1_date", "d1_week_seq", "d2_date_sk", "d3_date_sk", "d3_date", "cd_demo_sk", "hd_demo_sk"],
+            "consumes": []
+          }
+        },
+        "sales_inventory_pair": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT \n  cs.cs_item_sk,\n  cs.cs_quantity,\n  cs.cs_ship_date_sk,\n  cs.cs_promo_sk,\n  cs.cs_order_number,\n  pd.d1_date,\n  pd.d1_week_seq,\n  pd.d3_date_sk,\n  pd.d3_date,\n  inv.inv_warehouse_sk\nFROM catalog_sales cs\nJOIN inventory inv ON inv.inv_item_sk = cs.cs_item_sk\nJOIN prefiltered_dims pd ON cs.cs_sold_date_sk = pd.d1_date_sk\n  AND cs.cs_bill_cdemo_sk = pd.cd_demo_sk\n  AND cs.cs_bill_hdemo_sk = pd.hd_demo_sk\n  AND inv.inv_date_sk = pd.d2_date_sk\nWHERE cs.cs_wholesale_cost BETWEEN 35 AND 55\n  AND inv.inv_quantity_on_hand < cs.cs_quantity",
+          "interfaces": {
+            "outputs": ["cs_item_sk", "cs_quantity", "cs_ship_date_sk", "cs_promo_sk", "cs_order_number", "d1_date", "d1_week_seq", "d3_date_sk", "d3_date", "inv_warehouse_sk"],
+            "consumes": ["prefiltered_dims"]
+          }
+        },
+        "filtered_pair": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT \n  i.i_item_desc,\n  w.w_warehouse_name,\n  sip.d1_week_seq,\n  sip.cs_promo_sk\nFROM sales_inventory_pair sip\nJOIN item i ON i.i_item_sk = sip.cs_item_sk\nJOIN warehouse w ON w.w_warehouse_sk = sip.inv_warehouse_sk\nLEFT OUTER JOIN promotion p ON p.p_promo_sk = sip.cs_promo_sk\nLEFT OUTER JOIN catalog_returns cr ON cr.cr_item_sk = sip.cs_item_sk AND cr.cr_order_number = sip.cs_order_number\nWHERE i.i_category IN ('Children', 'Jewelry', 'Men')\n  AND sip.d3_date > sip.d1_date + INTERVAL '3 day'",
+          "interfaces": {
+            "outputs": ["i_item_desc", "w_warehouse_name", "d1_week_seq", "cs_promo_sk"],
+            "consumes": ["sales_inventory_pair"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT \n  fp.i_item_desc,\n  fp.w_warehouse_name,\n  fp.d1_week_seq,\n  SUM(CASE WHEN fp.cs_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo,\n  SUM(CASE WHEN fp.cs_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo,\n  COUNT(*) AS total_cnt\nFROM filtered_pair fp\nGROUP BY fp.i_item_desc, fp.w_warehouse_name, fp.d1_week_seq\nORDER BY total_cnt DESC, fp.i_item_desc, fp.w_warehouse_name, fp.d1_week_seq\nLIMIT 100",
+          "interfaces": {
+            "outputs": ["i_item_desc", "w_warehouse_name", "d1_week_seq", "no_promo", "promo", "total_cnt"],
+            "consumes": ["filtered_pair"]
+          }
+        }
+      },
+      "reconstruction_order": ["prefiltered_dims", "sales_inventory_pair", "filtered_pair", "main_query"],
+      "assembly_template": "WITH prefiltered_dims AS ({prefiltered_dims}),\n     sales_inventory_pair AS ({sales_inventory_pair}),\n     filtered_pair AS ({filtered_pair})\n{main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Staged reduction via CTEs: prefiltered_dims reduces 3 date_dim instances and demographics to tiny hash tables; sales_inventory_pair applies non-equi filter (inv_quantity_on_hand < cs_quantity) immediately after joining with catalog_sales and inventory, preventing combinatorial explosion; filtered_pair preserves LEFT OUTER joins and applies remaining filters. This follows the target logical tree exactly while implementing pg_materialized_dimension_fact_prefilter pattern.
+
+**Expected speedup**: 2.5-3.5x (based on similar patterns from reference examples pg_materialized_dimension_fact_prefilter [2.68x] and pg_dimension_prefetch_star [3.32x])

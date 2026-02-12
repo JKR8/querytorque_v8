@@ -1,0 +1,284 @@
+<reasoning>
+CLASSIFY:
+This is a classic star-join aggregation query: fact table (store_sales) joined to two dimension tables (item, date_dim) with selective filters on both dimensions, followed by aggregation and a window function. No correlated subqueries, no UNION ALL, no INTERSECT, no self-joins.
+
+EXPLAIN PLAN ANALYSIS:
+- Total time: 324ms
+- Breakdown:
+  - SEQ_SCAN store_sales: 178.4ms (55%) - scans 345.6M rows, returns 267K rows (0.077% selectivity). This is the dominant bottleneck.
+  - HASH_JOIN (store_sales × date_dim): 32.2ms (10%) - returns 267K rows (all store_sales rows match filtered date_dim)
+  - FILTER on item: 1.3ms - filters 102K rows to 31K rows
+  - HASH_JOIN (result × item): 6.5ms (2%) - returns 80K rows
+  - HASH_GROUP_BY: 56.7ms (17%) - reduces 80K to 15K rows
+  - WINDOW: 30.1ms (9%) - operates on 15K rows
+  - ORDER_BY: 4.2ms (1%) - sorts 15K rows
+
+Cardinality flow:
+store_sales (345.6M scanned) → 267K (after date join) → 80K (after item join) → 15K (after aggregation) → 15K (window) → 15K (order)
+
+The optimizer already:
+- Pushes date filter into date_dim scan (31 rows)
+- Pushes item category filter into item scan (31K rows)
+- Uses hash joins effectively
+- Filters store_sales by joining with date_dim first (267K rows match)
+
+Opportunity: The store_sales scan is the bottleneck (55% of time). It scans the entire table (345.6M rows) to get 267K matching rows. The date filter is applied via join, not pushed into the store_sales scan. There's potential to reduce the store_sales scan by pre-filtering with date keys.
+
+GAP MATCHING:
+1. CROSS_CTE_PREDICATE_BLINDNESS: Yes. The date filter isn't pushed into store_sales scan. Creating a CTE with filtered date keys could enable early reduction.
+2. REDUNDANT_SCAN_ELIMINATION: No repeated scans of same table.
+3. CORRELATED_SUBQUERY_PARALYSIS: No correlated subqueries.
+4. CROSS_COLUMN_OR_DECOMPOSITION: OR is on same column (i_category), engine handles natively.
+
+AGGREGATION TRAP CHECK:
+- SUM(ss_ext_sales_price): duplicate-safe (if joins introduce duplicates, SUM is additive)
+- Window function SUM(SUM(...)) OVER: uses same aggregate, safe as long as group membership unchanged
+- No STDDEV_SAMP, VARIANCE, etc.
+
+TRANSFORM SELECTION (ranked by expected value):
+1. star_join_prefetch (dimension_cte_isolate + prefetch_fact_join) - Attack store_sales scan bottleneck by pre-filtering both dimensions and pre-joining with fact table.
+2. early_filter - Simpler version: filter dimensions first, then join to fact.
+3. aggregate_pushdown - Pre-aggregate store_sales by item/date before joining dimensions to reduce join cardinality.
+4. late_attribute_binding (exploration) - Defer item join (for display columns) until after filtering and aggregation.
+
+LOGICAL TREE DESIGN:
+All strategies must preserve complete output columns. Check CTE column completeness carefully.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compute store-sales revenue per item within a 30-day window starting 2002-05-20 for Sports, Music, and Shoes categories, then calculate each item's percentage contribution within its item class. All joins are INNER (intersection semantics) requiring matches in all three tables. The window function SUM(SUM(...)) OVER uses the same underlying aggregate as the main aggregation; any restructuring must preserve group membership for the window partition. The date filter depends only on date_dim; the category filter depends only on item; breaking these dependencies would change results.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: store_sales sequential scan (178.4ms, 55%) dominates. The scan reads 345.6M rows but returns only 267K rows (0.077% selectivity) because date filtering happens via join, not predicate pushdown. Cardinality drops sharply after date join (267K) and item join (80K). The optimizer already pushes filters into dimension scans (date_dim to 31 rows, item to 31K rows) and uses efficient hash joins. Logical-tree cost percentages are misleading: store_sales scan is 55% exclusive time, but its cost in logical tree is only 2%.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, revenueratio in original order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (especially item attributes and join keys).
+- LITERAL_PRESERVATION: Must preserve date '2002-05-20', interval 30 DAY, categories 'Sports','Music','Shoes'.
+- SEMANTIC_EQUIVALENCE: Must return identical 15K rows with same ordering.
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows date filter not pushed into store_sales scan (345.6M rows scanned).
+- REDUNDANT_SCAN_ELIMINATION: Single fact table scan already; no consolidation opportunity.
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline <100ms, CTE materialization overhead dominated savings.
+   RULE: This query's baseline is 324ms (>100ms), so CTE overhead acceptable.
+2. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joining 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially to fact table.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_item -> prefetched_sales -> main_aggregation -> window_computation -> order_by
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN CAST('2002-05-20' AS DATE) AND (CAST('2002-05-20' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: prefetched_sales
+  filtered_item:
+    FROM: item
+    WHERE: i_category IN ('Sports', 'Music', 'Shoes')
+    OUTPUT: i_item_sk, i_item_id, i_item_desc, i_category, i_class, i_current_price
+    EXPECTED_ROWS: 31K
+    CONSUMERS: prefetched_sales
+  prefetched_sales:
+    FROM: store_sales
+         INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+         INNER JOIN filtered_item ON ss_item_sk = i_item_sk
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, ss_ext_sales_price
+    EXPECTED_ROWS: 80K
+    CONSUMERS: main_aggregation
+  main_aggregation:
+    FROM: prefetched_sales
+    GROUP BY: i_item_id, i_item_desc, i_category, i_class, i_current_price
+    AGGREGATE: SUM(ss_ext_sales_price) AS itemrevenue
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue
+    EXPECTED_ROWS: 15K
+    CONSUMERS: window_computation
+  window_computation:
+    FROM: main_aggregation
+    WINDOW: PARTITION BY i_class
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, itemrevenue * 100 / SUM(itemrevenue) OVER (PARTITION BY i_class) AS revenueratio
+    EXPECTED_ROWS: 15K
+    CONSUMERS: order_by
+  order_by:
+    FROM: window_computation
+    ORDER BY: i_category, i_class, i_item_id, i_item_desc, revenueratio
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, revenueratio
+    EXPECTED_ROWS: 15K
+EXAMPLES: dimension_cte_isolate, prefetch_fact_join, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering of both date_dim and item into separate CTEs; ignore the promotion/demographics dimensions (not present).
+- prefetch_fact_join: Apply CTE chain: filter dimensions first, then pre-join with fact table; ignore the multiple fact tables (only store_sales).
+- date_cte_isolate: Apply date filtering into CTE; ignore the multiple date aliases (only one date range).
+HAZARD_FLAGS:
+- Over-materialization if CTEs are inlined (single-reference).
+- Must include all item attributes in filtered_item output.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: early_filter
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_item -> joined_fact -> aggregation -> window -> order_by
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN CAST('2002-05-20' AS DATE) AND (CAST('2002-05-20' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: joined_fact
+  filtered_item:
+    FROM: item
+    WHERE: i_category IN ('Sports', 'Music', 'Shoes')
+    OUTPUT: i_item_sk, i_item_id, i_item_desc, i_category, i_class, i_current_price
+    EXPECTED_ROWS: 31K
+    CONSUMERS: joined_fact
+  joined_fact:
+    FROM: store_sales
+         INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+         INNER JOIN filtered_item ON ss_item_sk = i_item_sk
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, ss_ext_sales_price
+    EXPECTED_ROWS: 80K
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: joined_fact
+    GROUP BY: i_item_id, i_item_desc, i_category, i_class, i_current_price
+    AGGREGATE: SUM(ss_ext_sales_price) AS itemrevenue
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue
+    EXPECTED_ROWS: 15K
+    CONSUMERS: window
+  window:
+    FROM: aggregation
+    WINDOW: PARTITION BY i_class
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, itemrevenue * 100 / SUM(itemrevenue) OVER (PARTITION BY i_class) AS revenueratio
+    EXPECTED_ROWS: 15K
+    CONSUMERS: order_by
+  order_by:
+    FROM: window
+    ORDER BY: i_category, i_class, i_item_id, i_item_desc, revenueratio
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, revenueratio
+    EXPECTED_ROWS: 15K
+EXAMPLES: early_filter, pushdown
+EXAMPLE_ADAPTATION:
+- early_filter: Apply "filter dimension tables first" principle; ignore the reason table (use date_dim and item).
+- pushdown: Push date and category filters into dimension CTEs; ignore the scalar subqueries (not present).
+HAZARD_FLAGS:
+- Similar to Worker 1 but with less explicit CTE chaining.
+- Risk of missing column in filtered_item if not including all item attributes.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: aggregate_pushdown
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_item -> daily_agg -> joined_dims -> final_agg -> window -> order_by
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN CAST('2002-05-20' AS DATE) AND (CAST('2002-05-20' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: joined_dims
+  filtered_item:
+    FROM: item
+    WHERE: i_category IN ('Sports', 'Music', 'Shoes')
+    OUTPUT: i_item_sk, i_item_id, i_item_desc, i_category, i_class, i_current_price
+    EXPECTED_ROWS: 31K
+    CONSUMERS: joined_dims
+  daily_agg:
+    FROM: store_sales
+    GROUP BY: ss_item_sk, ss_sold_date_sk
+    AGGREGATE: SUM(ss_ext_sales_price) AS daily_revenue
+    OUTPUT: ss_item_sk, ss_sold_date_sk, daily_revenue
+    EXPECTED_ROWS: ≤267K (distinct item/date pairs)
+    CONSUMERS: joined_dims
+  joined_dims:
+    FROM: daily_agg
+         INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+         INNER JOIN filtered_item ON ss_item_sk = i_item_sk
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, daily_revenue
+    EXPECTED_ROWS: ≤80K
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: joined_dims
+    GROUP BY: i_item_id, i_item_desc, i_category, i_class, i_current_price
+    AGGREGATE: SUM(daily_revenue) AS itemrevenue
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue
+    EXPECTED_ROWS: 15K
+    CONSUMERS: window
+  window:
+    FROM: final_agg
+    WINDOW: PARTITION BY i_class
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, itemrevenue * 100 / SUM(itemrevenue) OVER (PARTITION BY i_class) AS revenueratio
+    EXPECTED_ROWS: 15K
+    CONSUMERS: order_by
+  order_by:
+    FROM: window
+    ORDER BY: i_category, i_class, i_item_id, i_item_desc, revenueratio
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, revenueratio
+    EXPECTED_ROWS: 15K
+EXAMPLES: single_pass_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply consolidation of aggregation before joins; ignore the CASE WHEN branching (not needed).
+HAZARD_FLAGS:
+- Pre-aggregation by (item, date) must preserve all necessary dimensions for later joins.
+- Verify that SUM(daily_revenue) equals original SUM(ss_ext_sales_price) after joins.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_sales -> aggregated_sales -> join_item_attrs -> window -> order_by
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN CAST('2002-05-20' AS DATE) AND (CAST('2002-05-20' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: filtered_sales
+  filtered_sales:
+    FROM: store_sales
+         INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_item_sk, ss_ext_sales_price
+    EXPECTED_ROWS: 267K
+    CONSUMERS: aggregated_sales
+  aggregated_sales:
+    FROM: filtered_sales
+    GROUP BY: ss_item_sk
+    AGGREGATE: SUM(ss_ext_sales_price) AS itemrevenue
+    OUTPUT: ss_item_sk, itemrevenue
+    EXPECTED_ROWS: ≤80K (distinct items in date range)
+    CONSUMERS: join_item_attrs
+  join_item_attrs:
+    FROM: aggregated_sales
+         INNER JOIN item ON ss_item_sk = i_item_sk
+    WHERE: i_category IN ('Sports', 'Music', 'Shoes')
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue
+    EXPECTED_ROWS: 15K
+    CONSUMERS: window
+  window:
+    FROM: join_item_attrs
+    WINDOW: PARTITION BY i_class
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, itemrevenue * 100 / SUM(itemrevenue) OVER (PARTITION BY i_class) AS revenueratio
+    EXPECTED_ROWS: 15K
+    CONSUMERS: order_by
+  order_by:
+    FROM: window
+    ORDER BY: i_category, i_class, i_item_id, i_item_desc, revenueratio
+    OUTPUT: i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, revenueratio
+    EXPECTED_ROWS: 15K
+EXAMPLES: dimension_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply date filtering into CTE; ignore pre-filtering item (item filter applied later).
+- early_filter: Filter date first; ignore filtering item early (item filter is deferred).
+HAZARD_FLAGS:
+- Must apply item category filter AFTER aggregation, which could increase aggregation rows if many items not in target categories.
+- Verify that aggregation before item join doesn't change results (item filter is on category, not affecting sum per item).
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

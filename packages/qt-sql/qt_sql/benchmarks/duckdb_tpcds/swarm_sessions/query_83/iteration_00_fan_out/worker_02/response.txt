@@ -1,0 +1,83 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_dates  [+]  — Extract date keys for weeks containing three reference dates
+│   └── OUTPUT: d_date_sk
+├── [CTE] all_returns_union  [+]  — Combine all returns from three channels, filtered by dates
+│   ├── UNION ALL (store_returns, catalog_returns, web_returns)
+│   ├── JOIN filtered_dates
+│   └── OUTPUT: item_sk, return_qty, channel
+├── [CTE] item_join  [+]  — Join returns with item dimension
+│   ├── JOIN item ON item_sk = i_item_sk
+│   └── OUTPUT: item_id, return_qty, channel
+├── [CTE] channel_aggregation  [+]  — Aggregate returns by item and channel
+│   ├── GROUP BY item_id, channel
+│   └── OUTPUT: item_id, channel, channel_qty
+└── [MAIN] main_query  [~]  — Pivot channel quantities and compute deviations
+    ├── FROM channel_aggregation
+    ├── PIVOT via MAX(CASE WHEN channel=...)
+    ├── COMPUTE same 8 output columns as original
+    ├── SORT item_id, sr_item_qty
+    └── LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb_v1.4.3",
+  "rewrite_rules": [
+    {"id": "R1", "type": "shared_dimension_extraction", "description": "Extract date filter into reusable CTE to avoid 9 redundant date_dim scans", "applied_to": ["filtered_dates"]},
+    {"id": "R2", "type": "channel_bitmap_aggregation", "description": "Consolidate three channel fact table scans into single UNION ALL with channel discriminator", "applied_to": ["all_returns_union"]},
+    {"id": "R3", "type": "sequential_dimension_join", "description": "Join item dimension once after UNION ALL instead of three separate joins", "applied_to": ["item_join"]},
+    {"id": "R4", "type": "conditional_aggregation", "description": "Pivot via MAX(CASE WHEN channel=...) instead of three separate CTEs with cross join", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_week_seq IN (SELECT d_week_seq FROM date_dim WHERE d_date IN ('2001-06-06', '2001-09-02', '2001-11-11'))",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "all_returns_union": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT returns.item_sk, returns.return_qty, returns.channel FROM (SELECT sr_item_sk AS item_sk, sr_returned_date_sk AS returned_date_sk, sr_return_quantity AS return_qty, 'store' AS channel FROM store_returns UNION ALL SELECT cr_item_sk, cr_returned_date_sk, cr_return_quantity, 'catalog' FROM catalog_returns UNION ALL SELECT wr_item_sk, wr_returned_date_sk, wr_return_quantity, 'web' FROM web_returns) AS returns JOIN filtered_dates ON returns.returned_date_sk = filtered_dates.d_date_sk",
+        "interfaces": {"outputs": ["item_sk", "return_qty", "channel"], "consumes": ["filtered_dates"]}
+      },
+      "item_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i.i_item_id AS item_id, a.return_qty, a.channel FROM all_returns_union a JOIN item i ON a.item_sk = i.i_item_sk",
+        "interfaces": {"outputs": ["item_id", "return_qty", "channel"], "consumes": ["all_returns_union"]}
+      },
+      "channel_aggregation": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT item_id, channel, SUM(return_qty) AS channel_qty FROM item_join GROUP BY item_id, channel",
+        "interfaces": {"outputs": ["item_id", "channel", "channel_qty"], "consumes": ["item_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT item_id, sr_item_qty, sr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0 * 100 AS sr_dev, cr_item_qty, cr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0 * 100 AS cr_dev, wr_item_qty, wr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0 * 100 AS wr_dev, (sr_item_qty+cr_item_qty+wr_item_qty)/3.0 AS average FROM (SELECT item_id, MAX(CASE WHEN channel = 'store' THEN channel_qty END) AS sr_item_qty, MAX(CASE WHEN channel = 'catalog' THEN channel_qty END) AS cr_item_qty, MAX(CASE WHEN channel = 'web' THEN channel_qty END) AS wr_item_qty FROM channel_aggregation GROUP BY item_id HAVING COUNT(DISTINCT channel) = 3) AS pivot ORDER BY item_id, sr_item_qty LIMIT 100",
+        "interfaces": {"outputs": ["item_id", "sr_item_qty", "sr_dev", "cr_item_qty", "cr_dev", "wr_item_qty", "wr_dev", "average"], "consumes": ["channel_aggregation"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "all_returns_union", "item_join", "channel_aggregation", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), all_returns_union AS ({all_returns_union}), item_join AS ({item_join}), channel_aggregation AS ({channel_aggregation}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured from three separate channel CTEs with redundant dimension scans into a single shared date filter CTE + consolidated UNION ALL of fact tables + single item dimension join + conditional aggregation pivot. This eliminates 8 redundant date_dim scans and 2 redundant item table scans while preserving the same semantic intersection of items across all three channels.
+
+**Expected speedup**: ~2-3x due to elimination of redundant dimension table scans and better predicate pushdown through the consolidated fact table scan pattern. The 79ms baseline should drop to ~30-40ms, avoiding the date_cte_isolate regression risk since the date CTE is small (21 rows) and referenced once.

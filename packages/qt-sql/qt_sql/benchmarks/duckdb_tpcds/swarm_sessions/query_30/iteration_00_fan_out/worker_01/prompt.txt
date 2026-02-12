@@ -1,0 +1,409 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Find Indiana customers whose total web return amount in 2002 (based on return-address state) exceeds 120% of the average return amount for that same return state. The query uses INNER JOINs (all sides must match) for the CTE (web_returns, date_dim, customer_address return) and main query (CTE, customer, customer_address current). The aggregate AVG is duplicate-sensitive; the CTE groups by (customer, return state) and joins on customer key (one-to-one). The filter `ca_state = 'IN'` applies to the customer's current address, not the return address, so cannot be pushed into the CTE.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+ctr_aggregate -> state_avg -> main_join -> top_n
+NODE_CONTRACTS:
+  ctr_aggregate:
+    FROM: web_returns, date_dim, customer_address
+    JOIN: wr_returned_date_sk = d_date_sk AND wr_returning_addr_sk = ca_address_sk
+    WHERE: d_year = 2002
+    GROUP BY: wr_returning_customer_sk, ca_state
+    AGGREGATE: sum(wr_return_amt) AS ctr_total_return
+    OUTPUT: wr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, ctr_total_return
+    EXPECTED_ROWS: 132K
+    CONSUMERS: state_avg, main_join
+  state_avg:
+    FROM: ctr_aggregate
+    GROUP BY: ctr_state
+    AGGREGATE: avg(ctr_total_return) * 1.2 AS avg_state_return
+    OUTPUT: ctr_state, avg_state_return
+    EXPECTED_ROWS: 51 (from EXPLAIN)
+    CONSUMERS: main_join
+  main_join:
+    FROM: ctr_aggregate AS ctr1, state_avg, customer, customer_address
+    JOIN: ctr1.ctr_customer_sk = c_customer_sk AND ca_address_sk = c_current_addr_sk AND ctr1.ctr_state = state_avg.ctr_state
+    WHERE: ca_state = 'IN' AND ctr1.ctr_total_return > state_avg.avg_state_return
+    OUTPUT: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    EXPECTED_ROWS: 913
+    CONSUMERS: top_n
+  top_n:
+    FROM: main_join
+    ORDER BY: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    LIMIT: 100
+    OUTPUT: same as main_join
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+
+NODE_CONTRACTS:
+ctr_aggregate:
+    FROM: web_returns, date_dim, customer_address
+    JOIN: wr_returned_date_sk = d_date_sk AND wr_returning_addr_sk = ca_address_sk
+    WHERE: d_year = 2002
+    GROUP BY: wr_returning_customer_sk, ca_state
+    AGGREGATE: sum(wr_return_amt) AS ctr_total_return
+    OUTPUT: wr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, ctr_total_return
+    EXPECTED_ROWS: 132K
+    CONSUMERS: state_avg, main_join
+  state_avg:
+    FROM: ctr_aggregate
+    GROUP BY: ctr_state
+    AGGREGATE: avg(ctr_total_return) * 1.2 AS avg_state_return
+    OUTPUT: ctr_state, avg_state_return
+    EXPECTED_ROWS: 51 (from EXPLAIN)
+    CONSUMERS: main_join
+  main_join:
+    FROM: ctr_aggregate AS ctr1, state_avg, customer, customer_address
+    JOIN: ctr1.ctr_customer_sk = c_customer_sk AND ca_address_sk = c_current_addr_sk AND ctr1.ctr_state = state_avg.ctr_state
+    WHERE: ca_state = 'IN' AND ctr1.ctr_total_return > state_avg.avg_state_return
+    OUTPUT: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    EXPECTED_ROWS: 913
+    CONSUMERS: top_n
+  top_n:
+    FROM: main_join
+    ORDER BY: c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return
+    LIMIT: 100
+    OUTPUT: same as main_join
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+
+## Hazard Flags (avoid these specific risks)
+
+- Must ensure ctr_aggregate includes ca_state (as ctr_state) for join with state_avg.
+- The join between ctr1 and state_avg must be on ctr_state, and filter uses >.
+
+## Regression Warnings (observed failures on similar queries)
+
+1. decorrelate on q1 (0.71x):
+   CAUSE: Pre-aggregating GROUP BY into CTEs for correlated comparison lost incremental filter pushdown.
+   RULE: When decorrelating, ensure filters (ca_state='IN') are pushed early into the CTEs where applicable.
+2. materialize_cte on q16 (0.14x):
+   CAUSE: Converted EXISTS filter to materialized CTE, forcing full scan instead of semi-join short-circuit.
+   RULE: Do not convert EXISTS subqueries to materialized CTEs; this query has no EXISTS.
+3. dimension_cte_isolate on q26 (0.0076x):
+   CAUSE: Cross-joined 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join multiple dimension CTEs; use staged join pipeline.
+
+## Constraints (analyst-filtered for this query)
+
+- LITERAL_PRESERVATION: Must keep d_year=2002, ca_state='IN', multiplier 1.2.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows ordered by same 13 columns.
+- COMPLETE_OUTPUT: Must output all customer profile columns and ctr_total_return.
+- CTE_COLUMN_COMPLETENESS: Each CTE must include all columns referenced downstream.
+- CORRELATED_SUBQUERY_PARALYSIS: Correlated subquery on ctr_state re-executes per outer row (delim join).
+- CROSS_CTE_PREDICATE_BLINDNESS: Filter ca_state='IN' on current address applied late after large joins.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- decorrelate: Apply the pattern of converting correlated subquery to standalone CTE (state_avg). Ignore the date filter pushdown (already done).
+- date_cte_isolate: Not needed; date filter already pushed. Ignore.
+- early_filter: Not directly applicable; but consider pushing ca_state='IN' earlier (but caution: different address). Ignore.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. decorrelate (2.92x)
+
+**Principle:** Decorrelation: convert correlated subqueries to standalone CTEs with GROUP BY, then JOIN. Correlated subqueries re-execute per outer row; a pre-computed CTE executes once.
+
+**BEFORE (slow):**
+```sql
+with customer_total_return as
+(select sr_customer_sk as ctr_customer_sk
+,sr_store_sk as ctr_store_sk
+,sum(SR_FEE) as ctr_total_return
+from store_returns
+,date_dim
+where sr_returned_date_sk = d_date_sk
+and d_year =2000
+group by sr_customer_sk
+,sr_store_sk)
+ select c_customer_id
+from customer_total_return ctr1
+,store
+,customer
+where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2
+from customer_total_return ctr2
+where ctr1.ctr_store_sk = ctr2.ctr_store_sk)
+and s_store_sk = ctr1.ctr_store_sk
+and s_state = 'SD'
+and ctr1.ctr_customer_sk = c_customer_sk
+order by c_customer_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_returns]:
+```sql
+SELECT sr.sr_customer_sk, sr.sr_store_sk, sr.sr_fee FROM store_returns sr JOIN date_dim d ON sr.sr_returned_date_sk = d.d_date_sk JOIN store s ON sr.sr_store_sk = s.s_store_sk WHERE d.d_year = 2000 AND s.s_state = 'SD'
+```
+[customer_total_return]:
+```sql
+SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(sr_fee) AS ctr_total_return FROM filtered_returns GROUP BY sr_customer_sk, sr_store_sk
+```
+[store_avg_return]:
+```sql
+SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk
+```
+[main_query]:
+```sql
+SELECT c.c_customer_id FROM customer_total_return ctr1 JOIN store_avg_return sar ON ctr1.ctr_store_sk = sar.ctr_store_sk JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk WHERE ctr1.ctr_total_return > sar.avg_return_threshold ORDER BY c.c_customer_id LIMIT 100
+```
+
+### 2. date_cte_isolate (4.00x)
+
+**Principle:** Dimension Isolation: extract small dimension lookups into CTEs so they materialize once and subsequent joins probe a tiny hash table instead of rescanning.
+
+**BEFORE (slow):**
+```sql
+select a.ca_state state, count(*) cnt
+ from customer_address a
+     ,customer c
+     ,store_sales s
+     ,date_dim d
+     ,item i
+ where       a.ca_address_sk = c.c_current_addr_sk
+ 	and c.c_customer_sk = s.ss_customer_sk
+ 	and s.ss_sold_date_sk = d.d_date_sk
+ 	and s.ss_item_sk = i.i_item_sk
+ 	and d.d_month_seq = 
+ 	     (select distinct (d_month_seq)
+ 	      from date_dim
+               where d_year = 2002
+ 	        and d_moy = 3 )
+ 	and i.i_current_price > 1.2 * 
+             (select avg(j.i_current_price) 
+ 	     from item j 
+ 	     where j.i_category = i.i_category)
+ group by a.ca_state
+ having count(*) >= 10
+ order by cnt, a.ca_state
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[target_month]:
+```sql
+SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1
+```
+[category_avg_price]:
+```sql
+SELECT i_category, AVG(i_current_price) * 1.2 AS avg_threshold FROM item GROUP BY i_category
+```
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim JOIN target_month ON d_month_seq = target_month.d_month_seq
+```
+[filtered_sales]:
+```sql
+SELECT ss_customer_sk, ss_item_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+```
+[main_query]:
+```sql
+SELECT a.ca_state AS state, COUNT(*) AS cnt FROM customer_address a JOIN customer c ON a.ca_address_sk = c.c_current_addr_sk JOIN filtered_sales s ON c.c_customer_sk = s.ss_customer_sk JOIN item i ON s.ss_item_sk = i.i_item_sk JOIN category_avg_price cap ON i.i_category = cap.i_category WHERE i.i_current_price > cap.avg_threshold GROUP BY a.ca_state HAVING COUNT(*) >= 10 ORDER BY cnt, a.ca_state LIMIT 100
+```
+
+### 3. early_filter (4.00x)
+
+**Principle:** Early Selection: filter small dimension tables first, then join to large fact tables. This reduces the fact table scan to only rows matching the filter, rather than scanning all rows and filtering after the join.
+
+**BEFORE (slow):**
+```sql
+select ss_customer_sk
+            ,sum(act_sales) sumsales
+      from (select ss_item_sk
+                  ,ss_ticket_number
+                  ,ss_customer_sk
+                  ,case when sr_return_quantity is not null then (ss_quantity-sr_return_quantity)*ss_sales_price
+                                                            else (ss_quantity*ss_sales_price) end act_sales
+            from store_sales left outer join store_returns on (sr_item_sk = ss_item_sk
+                                                               and sr_ticket_number = ss_ticket_number)
+                ,reason
+            where sr_reason_sk = r_reason_sk
+              and r_reason_desc = 'duplicate purchase') t
+      group by ss_customer_sk
+      order by sumsales, ss_customer_sk
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_reason]:
+```sql
+SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'
+```
+[filtered_returns]:
+```sql
+SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+```
+[main_query]:
+```sql
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
+```
+
+## Original SQL
+
+```sql
+-- start query 30 in stream 0 using template query30.tpl
+with customer_total_return as
+ (select wr_returning_customer_sk as ctr_customer_sk
+        ,ca_state as ctr_state, 
+ 	sum(wr_return_amt) as ctr_total_return
+ from web_returns
+     ,date_dim
+     ,customer_address
+ where wr_returned_date_sk = d_date_sk 
+   and d_year =2002
+   and wr_returning_addr_sk = ca_address_sk 
+ group by wr_returning_customer_sk
+         ,ca_state)
+  select c_customer_id,c_salutation,c_first_name,c_last_name,c_preferred_cust_flag
+       ,c_birth_day,c_birth_month,c_birth_year,c_birth_country,c_login,c_email_address
+       ,c_last_review_date_sk,ctr_total_return
+ from customer_total_return ctr1
+     ,customer_address
+     ,customer
+ where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2
+ 			  from customer_total_return ctr2 
+                  	  where ctr1.ctr_state = ctr2.ctr_state)
+       and ca_address_sk = c_current_addr_sk
+       and ca_state = 'IN'
+       and ctr1.ctr_customer_sk = c_customer_sk
+ order by c_customer_id,c_salutation,c_first_name,c_last_name,c_preferred_cust_flag
+                  ,c_birth_day,c_birth_month,c_birth_year,c_birth_country,c_login,c_email_address
+                  ,c_last_review_date_sk,ctr_total_return
+ LIMIT 100;
+
+-- end query 30 in stream 0 using template query30.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `c_customer_id`
+  2. `c_salutation`
+  3. `c_first_name`
+  4. `c_last_name`
+  5. `c_preferred_cust_flag`
+  6. `c_birth_day`
+  7. `c_birth_month`
+  8. `c_birth_year`
+  9. `c_birth_country`
+  10. `c_login`
+  11. `c_email_address`
+  12. `c_last_review_date_sk`
+  13. `ctr_total_return`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] customer_total_return  [=]  Cost: 50%  Rows: ~1K  — Aggregate 2002 web return amounts by returning customer and return-address state.
+│   ├── SCAN (web_returns, date_dim (join), customer_address (join))
+│   ├── JOIN (wr_returned_date_sk = d_date_sk)
+│   ├── JOIN (wr_returning_addr_sk = ca_address_sk)
+│   ├── FILTER (d_year = 2002)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (ctr_customer_sk, ctr_state, ctr_total_return)
+└── [MAIN] main_query  [=]  Cost: 50%  Rows: ~1K  — Compare each customer-state return total to 1.2x the state average, join to customer and current address, restrict output to customers currently in Indiana, and return sorted profile records.
+    ├── SCAN (customer_total_return AS ctr1 (join), customer_address (join), customer (join), customer_total_return AS ctr2 (correlated subquery))
+    ├── JOIN (ca_address_sk = c_current_addr_sk)
+    ├── JOIN (ctr1.ctr_customer_sk = c_customer_sk)
+    ├── FILTER (ctr1.ctr_total_return > AVG(ctr_total_return) * 1.2 (per state))
+    ├── FILTER (ca_state = 'IN')
+    ├── AGG (GROUP BY)
+    ├── SORT (c_customer_id ASC, c_salutation ASC, c_first_name ASC, c_last_name ASC, c_preferred_cust_flag ASC, c_birth_day ASC, c_birth_month ASC, c_birth_year ASC, c_birth_country ASC, c_login ASC, c_email_address ASC, c_last_review_date_sk ASC, ctr_total_return ASC)
+    └── OUTPUT (c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, ...)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

@@ -1,0 +1,85 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~500K
+    ├── [CTE] jackson_customers  [+]  
+    │   ├── SCAN (customer)
+    │   ├── JOIN (INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk)
+    │   └── FILTER (ca_city = 'Jackson')
+    ├── [CTE] income_household  [+]  
+    │   ├── FROM (jackson_customers)
+    │   ├── JOIN (INNER JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk)
+    │   ├── JOIN (INNER JOIN income_band ON hd_income_band_sk = ib_income_band_sk)
+    │   └── FILTER (ib_lower_bound >= 23567 AND ib_upper_bound <= 73567)
+    ├── [CTE] customer_demographics_join  [+]  
+    │   ├── FROM (income_household)
+    │   └── JOIN (INNER JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk)
+    ├── [CTE] store_returns_join  [+]  
+    │   ├── FROM (customer_demographics_join)
+    │   └── JOIN (INNER JOIN store_returns ON sr_cdemo_sk = cd_demo_sk)
+    ├── SORT (c_customer_id ASC)  [=]
+    └── OUTPUT (customer_id, customername)  [=]
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter_decorrelate", "description": "Push city filter into first CTE to reduce customer scan early", "applied_to": ["jackson_customers"]},
+    {"id": "R2", "type": "structural_transform", "description": "Convert comma joins to explicit INNER JOINs in CTE structure", "applied_to": ["jackson_customers", "income_household", "customer_demographics_join", "store_returns_join"]},
+    {"id": "R3", "type": "pushdown", "description": "Push income band filter into second CTE after household_demographics join", "applied_to": ["income_household"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "jackson_customers": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c.*, ca.ca_address_sk FROM customer c INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk WHERE ca.ca_city = 'Jackson'",
+        "interfaces": {"outputs": ["c_customer_id", "c_first_name", "c_last_name", "c_current_cdemo_sk", "c_current_hdemo_sk", "ca_address_sk"], "consumes": []}
+      },
+      "income_household": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT jc.c_customer_id, jc.c_first_name, jc.c_last_name, jc.c_current_cdemo_sk FROM jackson_customers jc INNER JOIN household_demographics hd ON jc.c_current_hdemo_sk = hd.hd_demo_sk INNER JOIN income_band ib ON hd.hd_income_band_sk = ib.ib_income_band_sk WHERE ib.ib_lower_bound >= 23567 AND ib.ib_upper_bound <= 73567",
+        "interfaces": {"outputs": ["c_customer_id", "c_first_name", "c_last_name", "c_current_cdemo_sk"], "consumes": ["jackson_customers"]}
+      },
+      "customer_demographics_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ih.c_customer_id, ih.c_first_name, ih.c_last_name, cd.cd_demo_sk FROM income_household ih INNER JOIN customer_demographics cd ON ih.c_current_cdemo_sk = cd.cd_demo_sk",
+        "interfaces": {"outputs": ["c_customer_id", "c_first_name", "c_last_name", "cd_demo_sk"], "consumes": ["income_household"]}
+      },
+      "store_returns_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cdj.c_customer_id, COALESCE(cdj.c_last_name, '') || ', ' || COALESCE(cdj.c_first_name, '') AS customername FROM customer_demographics_join cdj INNER JOIN store_returns sr ON sr.sr_cdemo_sk = cdj.cd_demo_sk",
+        "interfaces": {"outputs": ["c_customer_id", "customername"], "consumes": ["customer_demographics_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id AS customer_id, customername FROM store_returns_join ORDER BY c_customer_id LIMIT 100",
+        "interfaces": {"outputs": ["customer_id", "customername"], "consumes": ["store_returns_join"]}
+      }
+    },
+    "reconstruction_order": ["jackson_customers", "income_household", "customer_demographics_join", "store_returns_join", "main_query"],
+    "assembly_template": "WITH jackson_customers AS ({jackson_customers}), income_household AS ({income_household}), customer_demographics_join AS ({customer_demographics_join}), store_returns_join AS ({store_returns_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+## Explanation
+
+**Changes:** Converted the original comma-joined query into a CTE-based structure following the target logical tree, pushing the Jackson city filter into the first CTE and the income band filter into the second CTE. All joins are explicit INNER JOINs.
+
+**Expected speedup:** ~1.1-1.3x due to early filtering reducing the customer scan and better cardinality estimation from explicit joins. The optimizer can now plan each CTE independently with known row counts.

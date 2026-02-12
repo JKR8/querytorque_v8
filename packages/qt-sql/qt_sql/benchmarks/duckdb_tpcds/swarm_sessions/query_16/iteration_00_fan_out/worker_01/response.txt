@@ -1,0 +1,84 @@
+**Modified Logic Tree**
+
+```
+QUERY: (single statement)
+└── [~] main_query  [~]  Cost: 100%  Rows: ~1K  — Restructured into CTE pipeline with dimension pre-filters
+    ├── [+] CTE date_cte: Filter date_dim for 61-day range
+    ├── [+] CTE addr_cte: Filter customer_address for WV
+    ├── [+] CTE call_cte: Filter call_center for 5 counties
+    ├── [+] CTE prefetch_cte: Join catalog_sales with three dimension CTEs
+    ├── [+] CTE multi_warehouse_filter: EXISTS semi-join for multi-warehouse orders
+    ├── [+] CTE no_returns_filter: NOT EXISTS anti-join for non-returned orders
+    └── [+] CTE final_agg: Aggregate with final metrics
+```
+
+**Component Payload JSON**
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_isolation", "description": "Extracted date, address, and call-center filters into materialized CTEs before fact join", "applied_to": ["date_cte", "addr_cte", "call_cte"]},
+    {"id": "R2", "type": "staged_join_pipeline", "description": "Sequential CTE chain: filtered dimensions → fact join → EXISTS filter → NOT EXISTS filter → aggregation", "applied_to": ["prefetch_cte", "multi_warehouse_filter", "no_returns_filter", "final_agg"]},
+    {"id": "R3", "type": "multi_dimension_prefetch", "description": "All three dimension tables pre-filtered with WHERE clauses before joining to catalog_sales", "applied_to": ["date_cte", "addr_cte", "call_cte", "prefetch_cte"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN DATE '2002-4-01' AND (DATE '2002-4-01' + INTERVAL 60 DAY)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "addr_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_state = 'WV'",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "call_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cc_call_center_sk FROM call_center WHERE cc_county IN ('Ziebach County','Luce County','Richland County','Daviess County','Barrow County')",
+        "interfaces": {"outputs": ["cc_call_center_sk"], "consumes": []}
+      },
+      "prefetch_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs1.cs_order_number, cs1.cs_ext_ship_cost, cs1.cs_net_profit, cs1.cs_warehouse_sk FROM catalog_sales cs1 INNER JOIN date_cte ON cs1.cs_ship_date_sk = date_cte.d_date_sk INNER JOIN addr_cte ON cs1.cs_ship_addr_sk = addr_cte.ca_address_sk INNER JOIN call_cte ON cs1.cs_call_center_sk = call_cte.cc_call_center_sk",
+        "interfaces": {"outputs": ["cs_order_number", "cs_ext_ship_cost", "cs_net_profit", "cs_warehouse_sk"], "consumes": ["date_cte", "addr_cte", "call_cte"]}
+      },
+      "multi_warehouse_filter": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_order_number, cs_ext_ship_cost, cs_net_profit FROM prefetch_cte cs1 WHERE EXISTS (SELECT 1 FROM catalog_sales cs2 WHERE cs1.cs_order_number = cs2.cs_order_number AND cs1.cs_warehouse_sk <> cs2.cs_warehouse_sk)",
+        "interfaces": {"outputs": ["cs_order_number", "cs_ext_ship_cost", "cs_net_profit"], "consumes": ["prefetch_cte"]}
+      },
+      "no_returns_filter": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_order_number, cs_ext_ship_cost, cs_net_profit FROM multi_warehouse_filter cs1 WHERE NOT EXISTS (SELECT 1 FROM catalog_returns cr1 WHERE cs1.cs_order_number = cr1.cr_order_number)",
+        "interfaces": {"outputs": ["cs_order_number", "cs_ext_ship_cost", "cs_net_profit"], "consumes": ["multi_warehouse_filter"]}
+      },
+      "final_agg": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(DISTINCT cs_order_number) AS \"order count\", SUM(cs_ext_ship_cost) AS \"total shipping cost\", SUM(cs_net_profit) AS \"total net profit\" FROM no_returns_filter ORDER BY COUNT(DISTINCT cs_order_number) LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["no_returns_filter"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "addr_cte", "call_cte", "prefetch_cte", "multi_warehouse_filter", "no_returns_filter", "final_agg"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), addr_cte AS ({addr_cte}), call_cte AS ({call_cte}), prefetch_cte AS ({prefetch_cte}), multi_warehouse_filter AS ({multi_warehouse_filter}), no_returns_filter AS ({no_returns_filter}) {final_agg}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured the flat join into a staged CTE pipeline that pre-filters all three dimension tables (date, address, call-center) before joining to the fact table. This isolates dimension filters into small hash tables that can be probed efficiently. The EXISTS and NOT EXISTS filters remain as semi/anti-joins after the initial join to preserve short-circuit evaluation.
+
+**Expected speedup**: 2.5–3.0× reduction in fact-table scan cost via dimension pre-filtering; maintains existing join semantics and guard conditions.

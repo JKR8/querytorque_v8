@@ -1,0 +1,101 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_range  [+]  Cost: 2%  Rows: 31 — Single scan for May 1998 month sequence(s)
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year = 1998 AND d_moy = 5)
+│   └── OUTPUT (d_month_seq)
+├── [CTE] store_sales_with_date  [+]  Cost: 10%  Rows: 1.1M — Store sales in next 3 month sequences
+│   ├── SCAN (store_sales, date_range, date_dim d)
+│   ├── JOIN (ss_sold_date_sk = d.d_date_sk)
+│   ├── FILTER (d.d_month_seq BETWEEN scalar_subquery AND scalar_subquery)
+│   └── OUTPUT (ss_customer_sk, ss_ext_sales_price)
+├── [CTE] my_customers  [~]  Cost: 25%  Rows: 5,270 — Changed: No date_dim scan (uses existing date_dim filter)
+│   ├── SCAN (catalog_sales, web_sales, item, date_dim, customer)
+│   ├── JOIN (sold_date_sk = d_date_sk)
+│   ├── JOIN (item_sk = i_item_sk)
+│   ├── JOIN (c_customer_sk = customer_sk)
+│   ├── FILTER (i_category = 'Women', i_class = 'maternity', d_moy = 5, d_year = 1998)
+│   ├── UNION ALL
+│   └── OUTPUT (c_customer_sk, c_current_addr_sk)
+├── [CTE] my_revenue  [~]  Cost: 25%  Rows: 4,605 — Changed: Uses store_sales_with_date CTE
+│   ├── SCAN (my_customers, store_sales_with_date, customer_address, store)
+│   ├── JOIN (c_current_addr_sk = ca_address_sk)
+│   ├── JOIN (ca_county = s_county AND ca_state = s_state)
+│   ├── JOIN (c_customer_sk = ss_customer_sk)
+│   ├── AGG (GROUP BY c_customer_sk)
+│   └── OUTPUT (c_customer_sk, revenue)
+├── [CTE] segments  [=]  Cost: 25%  Rows: 4,605
+│   ├── SCAN (my_revenue)
+│   └── OUTPUT (segment)
+└── [MAIN] main_query  [=]  Cost: 25%  Rows: ≤100
+    ├── SCAN (segments)
+    ├── AGG (GROUP BY segment)
+    ├── SORT (segment ASC, num_customers ASC)
+    └── OUTPUT (segment, num_customers, segment_base)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_aggregation", "description": "Consolidate repeated date_dim subqueries into single CTE with distinct month sequence", "applied_to": ["date_range"]},
+    {"id": "R2", "type": "pushdown", "description": "Pre-join store_sales with date filter in CTE to reduce duplicate scans", "applied_to": ["store_sales_with_date"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_range": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 1998 AND d_moy = 5",
+        "interfaces": {"outputs": ["d_month_seq"], "consumes": []}
+      },
+      "store_sales_with_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_customer_sk, ss_ext_sales_price FROM store_sales JOIN date_dim d ON ss_sold_date_sk = d.d_date_sk WHERE d.d_month_seq BETWEEN (SELECT DISTINCT d_month_seq + 1 FROM date_range) AND (SELECT DISTINCT d_month_seq + 3 FROM date_range)",
+        "interfaces": {"outputs": ["ss_customer_sk", "ss_ext_sales_price"], "consumes": ["date_range"]}
+      },
+      "my_customers": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["c_customer_sk", "c_current_addr_sk"], "consumes": []}
+      },
+      "my_revenue": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_sk, SUM(ss_ext_sales_price) AS revenue FROM my_customers JOIN store_sales_with_date ON c_customer_sk = ss_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk JOIN store ON ca_county = s_county AND ca_state = s_state GROUP BY c_customer_sk",
+        "interfaces": {"outputs": ["c_customer_sk", "revenue"], "consumes": ["my_customers", "store_sales_with_date"]}
+      },
+      "segments": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT CAST((revenue/50) AS INTEGER) AS segment FROM my_revenue",
+        "interfaces": {"outputs": ["segment"], "consumes": ["my_revenue"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT segment, COUNT(*) AS num_customers, segment * 50 AS segment_base FROM segments GROUP BY segment ORDER BY segment, num_customers LIMIT 100",
+        "interfaces": {"outputs": ["segment", "num_customers", "segment_base"], "consumes": ["segments"]}
+      }
+    },
+    "reconstruction_order": ["date_range", "store_sales_with_date", "my_customers", "my_revenue", "segments", "main_query"],
+    "assembly_template": "WITH date_range AS ({date_range}), store_sales_with_date AS ({store_sales_with_date}), my_customers AS ({my_customers}), my_revenue AS ({my_revenue}), segments AS ({segments}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Introduced date_range CTE to consolidate repeated date_dim subqueries into a single scan, and created store_sales_with_date CTE to pre-join store_sales with the date filter, reducing duplicate table scans.
+
+Expected speedup: 2-3x from eliminating 2 redundant date_dim scans and enabling better predicate pushdown on store_sales join.

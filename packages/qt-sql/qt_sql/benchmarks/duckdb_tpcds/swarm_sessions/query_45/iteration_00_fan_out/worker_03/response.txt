@@ -1,0 +1,97 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Restructured into CTE chain following Target Logical Tree
+    ├── [CTE] date_cte  [+]
+    │   ├── SCAN date_dim
+    │   └── FILTER d_qoy=2 AND d_year=2000
+    ├── [CTE] fact_date_join  [+]
+    │   ├── SCAN web_sales
+    │   └── JOIN date_cte ON ws_sold_date_sk = d_date_sk
+    ├── [CTE] zip_customers  [+]
+    │   ├── SCAN customer
+    │   ├── JOIN customer_address ON c_current_addr_sk = ca_address_sk
+    │   └── FILTER substr(ca_zip,1,5) IN ('85669','86197','88274','83405','86475','85392','85460','80348','81792')
+    ├── [CTE] item_filtered  [+]
+    │   ├── SCAN item
+    │   └── FILTER i_item_sk IN (2,3,5,7,11,13,17,19,23,29)
+    ├── [CTE] or_join  [+]
+    │   ├── FROM fact_date_join
+    │   ├── LEFT JOIN zip_customers ON ws_bill_customer_sk = c_customer_sk
+    │   ├── LEFT JOIN item_filtered ON ws_item_sk = i_item_sk
+    │   └── FILTER zip_customers.c_customer_sk IS NOT NULL OR item_filtered.i_item_sk IS NOT NULL
+    ├── [AGG] aggregate  [+]
+    │   ├── FROM or_join
+    │   ├── GROUP BY ca_zip, ca_city
+    │   └── AGGREGATE sum(ws_sales_price)
+    ├── [SORT] sort  [~]  Preserved from original
+    └── [OUTPUT]  [=]  ca_zip, ca_city, SUM(ws_sales_price)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "prefetch_fact_join", "description": "Stage join pipeline with early dimension filtering", "applied_to": ["date_cte", "fact_date_join", "zip_customers", "item_filtered"]},
+    {"id": "R2", "type": "early_filter", "description": "Filter small dimension tables before joining to fact", "applied_to": ["date_cte", "zip_customers", "item_filtered"]},
+    {"id": "R3", "type": "cross_column_or_decomposition", "description": "Handle OR across different tables via LEFT JOIN + IS NOT NULL filter", "applied_to": ["or_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_qoy = 2 AND d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "fact_date_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_sales_price, ws_bill_customer_sk, ws_item_sk FROM web_sales JOIN date_cte ON ws_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ws_sales_price", "ws_bill_customer_sk", "ws_item_sk"], "consumes": ["date_cte"]}
+      },
+      "zip_customers": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_customer_sk, ca_zip, ca_city FROM customer JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE substr(ca_zip, 1, 5) IN ('85669', '86197', '88274', '83405', '86475', '85392', '85460', '80348', '81792')",
+        "interfaces": {"outputs": ["c_customer_sk", "ca_zip", "ca_city"], "consumes": []}
+      },
+      "item_filtered": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk FROM item WHERE i_item_sk IN (2, 3, 5, 7, 11, 13, 17, 19, 23, 29)",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "or_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT COALESCE(zip_customers.ca_zip, '') AS ca_zip, COALESCE(zip_customers.ca_city, '') AS ca_city, fact_date_join.ws_sales_price FROM fact_date_join LEFT JOIN zip_customers ON fact_date_join.ws_bill_customer_sk = zip_customers.c_customer_sk LEFT JOIN item_filtered ON fact_date_join.ws_item_sk = item_filtered.i_item_sk WHERE zip_customers.c_customer_sk IS NOT NULL OR item_filtered.i_item_sk IS NOT NULL",
+        "interfaces": {"outputs": ["ca_zip", "ca_city", "ws_sales_price"], "consumes": ["fact_date_join", "zip_customers", "item_filtered"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ca_zip, ca_city, SUM(ws_sales_price) FROM or_join GROUP BY ca_zip, ca_city ORDER BY ca_zip, ca_city LIMIT 100",
+        "interfaces": {"outputs": ["ca_zip", "ca_city", "SUM(ws_sales_price)"], "consumes": ["or_join"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "fact_date_join", "zip_customers", "item_filtered", "or_join", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), fact_date_join AS ({fact_date_join}), zip_customers AS ({zip_customers}), item_filtered AS ({item_filtered}), or_join AS ({or_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Explanation
+
+**Changes**: Restructured into staged CTE pipeline: first filter date dimension, then pre-join dates to fact table, independently filter customer/address and item dimensions, then combine via LEFT JOINs with OR filter to preserve original OR semantics while allowing early filtering.
+
+**Expected speedup**: ~2-3x due to early reduction of fact rows via date join, small hash tables for filtered dimensions, and avoidance of Cartesian explosion from cross-joining dimensions.

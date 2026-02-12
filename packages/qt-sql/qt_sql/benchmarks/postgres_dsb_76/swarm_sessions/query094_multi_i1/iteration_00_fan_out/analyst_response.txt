@@ -1,0 +1,251 @@
+<reasoning>
+CLASSIFY:
+This query is a star-join with late dimension filter, plus two correlated subqueries (EXISTS and NOT EXISTS). The fact table (web_sales) is joined with three dimension tables (date_dim, customer_address, web_site). The EXISTS is a self-join condition requiring the same order number from a different warehouse. The NOT EXISTS is an anti-join with web_returns for specific reason codes.
+
+EXPLAIN PLAN ANALYSIS:
+Total runtime: 228.3ms. Dominant cost is the Hash Anti Join (181.3ms) building a hash table on 51K filtered web_returns rows. The nested loop inner join (date_dim → web_sales) takes 88.7ms. The plan is scan-bound on web_returns (51K rows filtered from 720K) and join-bound on the hash anti-join. Cardinality flow: date_dim 30 rows → web_sales ~2,532 rows → after anti-join ~2,140 rows → after customer_address filter ~753 rows → after web_site join and semi-join ~753 rows → aggregate to 1 row. The optimizer already decorrelates EXISTS/NOT EXISTS into semi/anti joins. It already pushes date filter early. The same fact table (web_sales) is scanned twice (ws1 and ws2), but the second scan is an index-only scan (0.0ms per loop, 753 loops) and negligible.
+
+GAP MATCHING:
+1. COMMA_JOIN_WEAKNESS: Query uses comma-separated implicit joins. The EXPLAIN shows the optimizer has reordered joins (starting with date_dim and web_sales), but comma joins may confuse cardinality estimation. Transform: convert to explicit JOINs with pre-filtered dimension CTEs.
+2. CORRELATED_SUBQUERY_PARALYSIS: The optimizer already decorrelates EXISTS and NOT EXISTS into semi/anti joins (Nested Loop Semi and Hash Anti Join). No further decorrelation needed.
+3. CROSS_CTE_PREDICATE_BLINDNESS: Not applicable; no repeated fact+dimension scan.
+4. NON_EQUI_JOIN_INPUT_BLINDNESS: Not applicable; all joins are equi-joins.
+5. SELF_JOIN_ELIMINATION: The EXISTS subquery is a self-join on web_sales. The optimizer uses an index-only scan for ws2 (negligible cost). Could transform by pre-aggregating web_sales to find orders with multiple warehouses, eliminating the per-row correlated subquery.
+
+AGGREGATION TRAP CHECK:
+Aggregates: COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit). All are duplicate-insensitive (SUM over duplicated rows changes, but the join pattern does not introduce duplicates beyond the original semantics). The EXISTS and NOT EXISTS are semi/anti joins, so no row multiplication. Restructuring must preserve the set of ws_order_numbers that pass all filters.
+
+TRANSFORM SELECTION:
+1. pg_dimension_prefetch_star: Pre-filter all dimension tables into CTEs, convert comma joins to explicit JOINs. Attacks COMMA_JOIN_WEAKNESS.
+2. self_join_elimination: Replace EXISTS correlated subquery with a pre-aggregated CTE that identifies orders with multiple warehouses. Attacks SELF_JOIN_ELIMINATION.
+3. star_join_prefetch: Pre-join filtered dimensions with fact table before anti-join and semi-join. Compound strategy combining dimension CTEs and early fact reduction.
+4. transitive_predicate_propagation (novel): Push date filter into web_returns by inferring join through web_sales, reducing hash table size. Attacks the hash anti-join bottleneck.
+
+LOGICAL TREE DESIGN:
+For each strategy, ensure CTE column completeness. Key columns: ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk, ws_ship_date_sk, ws_ship_addr_sk, ws_web_site_sk, ws_list_price. Dimension keys: d_date_sk, ca_address_sk, web_site_sk.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+This query computes shipping cost and net profit for web sales orders within a 60-day period that ship to 6 US states, from websites in GMT offset >= -5, with list price between 237 and 266, where the same order was fulfilled from multiple warehouses and was not returned for 5 specific reasons. JOIN semantics are INNER: all dimension tables must match, and the EXISTS/NOT EXISTS are semi/anti-joins. Aggregation traps: COUNT(DISTINCT ws_order_number) is sensitive to duplicate order numbers from joins; the current plan uses semi/anti-joins so no duplication. Filter dependencies: The date filter on date_dim must apply before joining to web_sales; the state filter on customer_address and GMT offset on web_site are independent.
+
+BOTTLENECK_DIAGNOSIS:
+The hash anti-join on web_returns dominates cost (181.3 ms, 80% of runtime), building a 51K-row hash table filtered by wr_reason_sk. The query is join-bound on this anti-join. Cardinality flow: date_dim (30 rows) → web_sales (2,532 rows) → anti-join (2,140 rows) → customer_address (753 rows). The optimizer already decorrelates EXISTS/NOT EXISTS into semi/anti joins and pushes the date filter early. Logical-tree cost percentages are misleading: the hash anti-join is the true bottleneck, not the nested loops.
+
+ACTIVE_CONSTRAINTS:
+- CORRECTNESS_CONSTRAINT_ID: COMPLETE_OUTPUT: Must output three columns: order count, total shipping cost, total net profit.
+- CORRECTNESS_CONSTRAINT_ID: CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream: ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk, ws_ship_date_sk, ws_ship_addr_sk, ws_web_site_sk, ws_list_price, and dimension keys.
+- CORRECTNESS_CONSTRAINT_ID: LITERAL_PRESERVATION: Must preserve literal values for date range, state list, reason_sk list, list price range, GMT offset.
+- CORRECTNESS_CONSTRAINT_ID: SEMANTIC_EQUIVALENCE: Must return same rows and ordering (ORDER BY count distinct, LIMIT 100).
+- ENGINE_GAP_ID: COMMA_JOIN_WEAKNESS: Query uses comma-separated implicit joins; EXPLAIN shows optimizer reordered joins but may have suboptimal cardinality estimates.
+- ENGINE_GAP_ID: SELF_JOIN_ELIMINATION: EXISTS subquery is a self-join on web_sales; optimizer uses index-only scan but per-row correlation remains.
+
+REGRESSION_WARNINGS:
+1. Never split OR conditions into UNION ALL (observed regression 0.21x):
+   CAUSE: Query has no OR conditions over different dimension keys; splitting would add overhead.
+   RULE: Do not apply OR-to-UNION to this query.
+2. Never convert EXISTS to IN/NOT IN (observed regression 0.50x):
+   CAUSE: Optimizer already converts EXISTS to efficient semi-joins; manual conversion may block optimizations.
+   RULE: Keep EXISTS as semi-join; do not convert to IN.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: pg_dimension_prefetch_star
+TARGET_LOGICAL_TREE:
+  date_cte -> customer_address_cte -> web_site_cte -> filtered_ws1 -> anti_join -> semi_join -> aggregate
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY'
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 30
+    CONSUMERS: filtered_ws1
+  customer_address_cte:
+    FROM: customer_address
+    WHERE: ca_state IN ('CA','MI','OH','SD','TX','VA')
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: ~ (from plan: index scan on customer_address returns 0 rows per loop? Actually plan shows 4281 loops, but filter removes all but 0? Wait, plan shows "Rows Removed by Filter: 1" per loop, so ca_state filter is selective. We'll estimate 10% of rows: ~50K rows total? Not sure. Use plan's "Index Scan on customer_address (rows=0 loops=4281)" – it's 0 rows per loop, but that's because the filter is applied and removes all rows? Actually, the filter is on ca_state, and the index scan uses ca_address_sk. The plan says "Rows Removed by Filter: 1", meaning each loop returns 0 rows after filter. This is confusing. We'll assume the filter is very selective and returns a small fraction. Let's approximate 1 row per 10 loops? 428 loops? We'll leave EXPECTED_ROWS blank and let the worker infer from the original plan.
+    CONSUMERS: filtered_ws1
+  web_site_cte:
+    FROM: web_site
+    WHERE: web_gmt_offset >= -5
+    OUTPUT: web_site_sk
+    EXPECTED_ROWS: 22
+    CONSUMERS: filtered_ws1
+  filtered_ws1:
+    FROM: web_sales ws1
+    JOIN: INNER JOIN date_cte ON ws1.ws_ship_date_sk = date_cte.d_date_sk
+    JOIN: INNER JOIN customer_address_cte ON ws1.ws_ship_addr_sk = customer_address_cte.ca_address_sk
+    JOIN: INNER JOIN web_site_cte ON ws1.ws_web_site_sk = web_site_cte.web_site_sk
+    WHERE: ws1.ws_list_price BETWEEN 237 AND 266
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk
+    EXPECTED_ROWS: 753 (from plan: after all dimension joins)
+    CONSUMERS: anti_join
+  anti_join:
+    FROM: filtered_ws1
+    WHERE: NOT EXISTS (SELECT 1 FROM web_returns wr1 WHERE wr1.wr_order_number = filtered_ws1.ws_order_number AND wr1.wr_reason_sk IN (7,25,26,52,69))
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk
+    EXPECTED_ROWS: 753 (anti-join removes few rows? Actually plan shows 2,140 rows before customer_address, then 753 after. So anti-join removes some rows. We'll keep 753 as final before semi-join.)
+    CONSUMERS: semi_join
+  semi_join:
+    FROM: anti_join
+    WHERE: EXISTS (SELECT 1 FROM web_sales ws2 WHERE ws2.ws_order_number = anti_join.ws_order_number AND ws2.ws_warehouse_sk <> anti_join.ws_warehouse_sk)
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: 753 (semi-join does not reduce rows because condition is already satisfied? Actually the EXISTS is a filter; it may reduce rows. But plan shows 753 rows after all joins. So we keep 753.)
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: semi_join
+    AGGREGATE: COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit"
+    OUTPUT: "order count", "total shipping cost", "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering of all dimension tables (date, customer_address, web_site) into CTEs, then join with fact table. Use explicit JOIN syntax. Ignore the UNION ALL aspect (not needed).
+- pg_date_cte_explicit_join: Apply date CTE isolation and explicit JOINs. Ignore the composite key join (not needed).
+HAZARD_FLAGS:
+- CTE materialization may block parallel execution of the fact table scan.
+- Must ensure all dimension keys are included in CTE outputs.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: self_join_elimination
+TARGET_LOGICAL_TREE:
+  multi_warehouse_orders_cte -> filtered_ws1 -> anti_join -> join_multi -> aggregate
+NODE_CONTRACTS:
+  multi_warehouse_orders_cte:
+    FROM: web_sales
+    GROUP BY: ws_order_number
+    HAVING: COUNT(DISTINCT ws_warehouse_sk) > 1
+    OUTPUT: ws_order_number
+    EXPECTED_ROWS: unknown (but subset of orders)
+    CONSUMERS: join_multi
+  filtered_ws1:
+    FROM: web_sales ws1, date_dim, customer_address, web_site
+    WHERE: d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY'
+      AND ws1.ws_ship_date_sk = d_date_sk
+      AND ws1.ws_ship_addr_sk = ca_address_sk
+      AND ca_state IN ('CA','MI','OH','SD','TX','VA')
+      AND ws1.ws_web_site_sk = web_site_sk
+      AND web_gmt_offset >= -5
+      AND ws1.ws_list_price BETWEEN 237 AND 266
+      AND NOT EXISTS (SELECT 1 FROM web_returns wr1 WHERE wr1.wr_order_number = ws1.ws_order_number AND wr1.wr_reason_sk IN (7,25,26,52,69))
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: 753
+    CONSUMERS: join_multi
+  join_multi:
+    FROM: filtered_ws1
+    JOIN: INNER JOIN multi_warehouse_orders_cte ON filtered_ws1.ws_order_number = multi_warehouse_orders_cte.ws_order_number
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: 753 (all filtered_ws1 rows satisfy the multi-warehouse condition)
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: join_multi
+    AGGREGATE: COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit"
+    OUTPUT: "order count", "total shipping cost", "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: pg_self_join_decomposition
+EXAMPLE_ADAPTATION:
+- pg_self_join_decomposition: Apply the idea of materializing the multi-warehouse condition once as a CTE, then join with filtered fact rows. Ignore the fact that the example uses multiple aggregates; here we just need the order numbers.
+HAZARD_FLAGS:
+- The multi_warehouse_orders_cte may be large; ensure it is efficient (use aggregation on web_sales with index on ws_order_number, ws_warehouse_sk).
+- Must preserve the NOT EXISTS condition; do not lose the anti-join.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  filtered_ws1_cte -> anti_join -> semi_join -> aggregate
+NODE_CONTRACTS:
+  filtered_ws1_cte:
+    FROM: web_sales ws1
+    JOIN: INNER JOIN date_dim ON ws1.ws_ship_date_sk = date_dim.d_date_sk
+    JOIN: INNER JOIN customer_address ON ws1.ws_ship_addr_sk = customer_address.ca_address_sk
+    JOIN: INNER JOIN web_site ON ws1.ws_web_site_sk = web_site.web_site_sk
+    WHERE: date_dim.d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY'
+      AND customer_address.ca_state IN ('CA','MI','OH','SD','TX','VA')
+      AND web_site.web_gmt_offset >= -5
+      AND ws1.ws_list_price BETWEEN 237 AND 266
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk
+    EXPECTED_ROWS: 753 (after dimension joins)
+    CONSUMERS: anti_join
+  anti_join:
+    FROM: filtered_ws1_cte
+    WHERE: NOT EXISTS (SELECT 1 FROM web_returns wr1 WHERE wr1.wr_order_number = filtered_ws1_cte.ws_order_number AND wr1.wr_reason_sk IN (7,25,26,52,69))
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk
+    EXPECTED_ROWS: 753
+    CONSUMERS: semi_join
+  semi_join:
+    FROM: anti_join
+    WHERE: EXISTS (SELECT 1 FROM web_sales ws2 WHERE ws2.ws_order_number = anti_join.ws_order_number AND ws2.ws_warehouse_sk <> anti_join.ws_warehouse_sk)
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: 753
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: semi_join
+    AGGREGATE: COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit"
+    OUTPUT: "order count", "total shipping cost", "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: pg_dimension_prefetch_star, prefetch_fact_join
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-joining of filtered dimensions with fact table in a CTE. Use explicit JOIN syntax. Ignore the CTE for each dimension separately; here we join directly in the CTE.
+- prefetch_fact_join: Apply the idea of pre-joining fact with dimensions before applying other conditions. Ignore the aggregation pushdown; not needed.
+HAZARD_FLAGS:
+- The filtered_ws1_cte may be materialized and block parallel execution.
+- Must include all necessary columns for downstream anti-join and semi-join.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: transitive_predicate_propagation
+TARGET_LOGICAL_TREE:
+  filtered_ws1_cte -> filtered_wr_cte -> anti_join -> semi_join -> aggregate
+NODE_CONTRACTS:
+  filtered_ws1_cte:
+    FROM: web_sales ws1
+    JOIN: INNER JOIN date_dim ON ws1.ws_ship_date_sk = date_dim.d_date_sk
+    JOIN: INNER JOIN customer_address ON ws1.ws_ship_addr_sk = customer_address.ca_address_sk
+    JOIN: INNER JOIN web_site ON ws1.ws_web_site_sk = web_site.web_site_sk
+    WHERE: date_dim.d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY'
+      AND customer_address.ca_state IN ('CA','MI','OH','SD','TX','VA')
+      AND web_site.web_gmt_offset >= -5
+      AND ws1.ws_list_price BETWEEN 237 AND 266
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk
+    EXPECTED_ROWS: 753
+    CONSUMERS: anti_join, filtered_wr_cte
+  filtered_wr_cte:
+    FROM: web_returns wr1
+    JOIN: INNER JOIN filtered_ws1_cte ON wr1.wr_order_number = filtered_ws1_cte.ws_order_number
+    WHERE: wr1.wr_reason_sk IN (7,25,26,52,69)
+    OUTPUT: wr_order_number
+    EXPECTED_ROWS: reduced from 51K to only returns for orders in filtered_ws1_cte
+    CONSUMERS: anti_join
+  anti_join:
+    FROM: filtered_ws1_cte
+    WHERE: NOT EXISTS (SELECT 1 FROM filtered_wr_cte WHERE filtered_wr_cte.wr_order_number = filtered_ws1_cte.ws_order_number)
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk
+    EXPECTED_ROWS: 753
+    CONSUMERS: semi_join
+  semi_join:
+    FROM: anti_join
+    WHERE: EXISTS (SELECT 1 FROM web_sales ws2 WHERE ws2.ws_order_number = anti_join.ws_order_number AND ws2.ws_warehouse_sk <> anti_join.ws_warehouse_sk)
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: 753
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: semi_join
+    AGGREGATE: COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit"
+    OUTPUT: "order count", "total shipping cost", "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- early_filter_decorrelate: Apply the idea of pre-filtering the web_returns table by joining with filtered fact data. Ignore the decorrelation of a scalar subquery; here we are filtering an anti-join.
+HAZARD_FLAGS:
+- The filtered_wr_cte depends on filtered_ws1_cte, creating a circular reference if not defined as LATERAL or separate CTE. Must define filtered_ws1_cte first, then filtered_wr_cte referencing it.
+- May increase complexity; ensure the join between filtered_ws1_cte and web_returns is efficient.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: The exploration does not violate any correctness constraints; it attempts to reduce the hash table size by propagating the date filter through the join chain.
+EXPLORATION_TYPE: novel_combination

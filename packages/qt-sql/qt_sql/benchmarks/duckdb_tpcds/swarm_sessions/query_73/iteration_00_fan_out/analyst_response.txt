@@ -1,0 +1,472 @@
+<thinking>
+Let me go through the steps systematically.
+
+1. **CLASSIFY**: This query is a star-join with late dimension filter. It joins a fact table (store_sales) with three dimension tables (date_dim, store, household_demographics), filters on those dimensions, aggregates by ticket and customer, then joins to customer for customer attributes, and filters on the count. It's a classic star schema query.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total time: 475ms
+   - Breakdown:
+     - store_sales SEQ_SCAN: 361.8ms (76% of total)
+     - HASH_JOIN ss_hdemo_sk = hd_demo_sk: 51.7ms (11%)
+     - HASH_JOIN ss_sold_date_sk = d_date_sk: 41.3ms (9%)
+     - Rest: < 20ms each
+   
+   - Row count flow:
+     - store_sales: 8.6M rows scanned (out of 345.6M)
+     - household_demographics: 4,800 → 1,040 after filter
+     - date_dim: 72 rows after filter
+     - store: 102 rows after filter
+     - After all joins: 52K rows
+     - After aggregation: 5,044 rows
+     - After cnt filter: 308 rows
+     - After customer join: 15 rows
+   
+   - Observations:
+     - store_sales scan dominates (361.8ms)
+     - Dimension filters are already pushed into scans (optimizer handles this well)
+     - Only one scan of store_sales (good)
+     - The bottleneck is scanning 8.6M rows from store_sales and joining them with dimensions
+     - The optimizer is already doing hash joins and pushing filters
+
+3. **GAP MATCHING**:
+   - CROSS_CTE_PREDICATE_BLINDNESS: Yes, dimension filters aren't pushed into fact table scan. The fact table is scanned fully (8.6M rows) then joined.
+   - CROSS_COLUMN_OR_DECOMPOSITION: No, OR is on same column (hd_buy_potential).
+   - CORRELATED_SUBQUERY_PARALYSIS: No correlated subqueries.
+   - REDUNDANT_SCAN_ELIMINATION: No repeated scans.
+   - UNION_CTE_SELF_JOIN_DECOMPOSITION: No UNION CTEs.
+
+   The key gap is that dimension filters aren't used to reduce the fact table scan size. The optimizer scans 8.6M rows from store_sales and joins them, rather than using the filtered dimension keys to restrict the fact scan.
+
+4. **AGGREGATION TRAP CHECK**:
+   - Only COUNT(*), no sensitive aggregates.
+   - Aggregation is after joins, which could be pushed down if safe.
+
+5. **TRANSFORM SELECTION**:
+   Given the star schema and dominant fact table scan, transforms that pre-filter dimensions and probe fact table are promising:
+   
+   a) **star_join_prefetch** (dimension_cte_isolate + prefetch_fact_join): Pre-filter all dimensions, then join with fact
+   b) **early_filter** with dimension CTEs: Filter dimensions first, then join
+   c) **or_to_union** for the CASE/OR conditions? Not applicable - OR is same column
+   d) **decorrelation**: Not applicable
+   
+   Need 4 diverse strategies:
+   1. star_join_prefetch (multi-dimension prefiltering)
+   2. early_filter with staged join (prefetch_fact_join pattern)
+   3. aggregate_pushdown (push GROUP BY below some joins if safe)
+   4. exploration: single_pass_aggregation with dimension key prefiltering
+
+6. **LOGICAL TREE DESIGN**:
+   For each strategy, need to design CTEs with complete column outputs.
+   Check column completeness: Need ss_ticket_number, ss_customer_sk for aggregation; need all dimension keys for joins; need customer columns for final output.
+
+Let me analyze the query structure more:
+
+Original logical flow:
+1. Join store_sales with 3 dimensions (date_dim, store, household_demographics)
+2. Filter on dimension attributes
+3. GROUP BY ss_ticket_number, ss_customer_sk, COUNT(*) as cnt
+4. Filter cnt BETWEEN 1 AND 5
+5. Join with customer on ss_customer_sk = c_customer_sk
+6. Order by cnt DESC, c_last_name ASC
+
+Potential optimizations:
+- Pre-filter dimensions to get surrogate keys, then probe fact table only for matching keys
+- Push aggregation earlier if safe (aggregation only uses ss_ticket_number, ss_customer_sk from store_sales)
+- The CASE expression in household_demographics filter might be optimized
+
+From EXPLAIN: The optimizer already filters dimensions first (good), but still scans 8.6M rows from store_sales. The opportunity is to use the filtered dimension keys (date_dim: 72 rows, store: 102 rows, household_demographics: 1,040 rows) to restrict the store_sales scan.
+
+Check if aggregation can be pushed: The GROUP BY uses ss_ticket_number and ss_customer_sk, both from store_sales. The join with dimensions could duplicate rows if it's many-to-many, but since we're joining on surrogate keys (foreign keys), it should be one-to-many from store_sales to dimensions. Actually, store_sales has one date per sale, one store per sale, one household_demographic per sale. So joining store_sales with dimensions shouldn't change the row count for a given store_sales row. Therefore, pushing aggregation before dimension joins might be safe.
+
+Wait: The EXPLAIN shows after joining store_sales with household_demographics: 2.0M rows, but store_sales scan was 8.6M rows. So the join reduces rows. This suggests the foreign key join has selectivity.
+
+Actually, let me trace the row counts:
+- store_sales: 8.6M rows scanned
+- After join with household_demographics (1,040 rows): 2.0M rows (so many store_sales rows don't match the household filter)
+- After join with date_dim (72 rows): 135K rows
+- After join with store (102 rows): 52K rows
+
+So dimension filters are applied through joins, not by restricting the store_sales scan.
+
+The opportunity: Instead of scanning 8.6M store_sales rows and filtering through joins, we could:
+1. Get filtered dimension keys (date_dim keys, store keys, hd keys)
+2. Use these to filter store_sales: WHERE ss_sold_date_sk IN (...), ss_store_sk IN (...), ss_hdemo_sk IN (...)
+3. This might use semi-joins or bloom filters to reduce the scan
+
+But the optimizer is already doing hash joins which should achieve similar effect. However, 361.8ms for 8.6M row scan suggests this is the bottleneck.
+
+Alternative: Could we create a composite key index or use a different join order? The query forces all dimension joins before aggregation.
+
+Let me look at the Strategy Leaderboard for aggregation_rewrite archetype:
+- date_cte_isolate: 46% win rate, 1.48x avg
+- single_pass_aggregation: 30% win rate, 1.32x avg  
+- prefetch_fact_join: 28% win rate, 1.22x avg
+- multi_dimension_prefetch: 26% win rate, 1.15x avg
+- dimension_cte_isolate: 24% win rate, 1.07x avg
+
+Given the query has 3 dimension tables with selective filters, multi-dimension prefetch seems promising.
+
+Also check regression warnings:
+- Don't cross-join 3+ dimension CTEs (caused 0.0076x on Q26)
+- Every dimension CTE must have WHERE clause
+- Skip if baseline <100ms (475ms > 100ms, OK)
+
+For Worker 4 exploration, could try a novel combination: prefetch with IN clauses instead of joins, or use a bloom filter technique.
+
+Now design the 4 strategies:
+
+Worker 1: star_join_prefetch (multi_dimension_prefetch)
+  - Create CTEs for filtered date_dim, store, household_demographics
+  - Join all 3 CTEs with store_sales
+  - Then aggregate
+
+Worker 2: early_filter with staged pipeline (prefetch_fact_join)  
+  - Filter date_dim first (most selective: 72 rows)
+  - Join with store_sales
+  - Then join with other dimensions
+
+Worker 3: aggregate_pushdown
+  - Push GROUP BY to store_sales first (group by ss_ticket_number, ss_customer_sk)
+  - Then join with filtered dimensions
+  - Need to check if this changes semantics (joins could affect count)
+
+Worker 4: exploration - single_pass with dimension key restriction
+  - Get dimension keys in CTEs
+  - Use WHERE store_sales.ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_date) etc.
+  - Or use EXISTS semi-joins
+
+Check aggregation safety: The original query does COUNT(*) after joins. If we push aggregation before joins, we need to ensure the join doesn't change the count. Since we're joining on foreign keys and each store_sales row has exactly one matching row in each dimension table (if it matches the filter), then COUNT(*) on store_sales alone for matching keys should equal COUNT(*) after join. But wait: The GROUP BY is on ss_ticket_number, ss_customer_sk. A ticket could have multiple line items (multiple store_sales rows). Joining with dimensions doesn't change the number of rows per ticket if each store_sales row joins to exactly one dimension row. So pushing aggregation might be safe.
+
+Actually, let me think: If we GROUP BY ss_ticket_number, ss_customer_sk on store_sales alone, we get count of line items per ticket. Then joining with dimensions: each store_sales row in the group would join to dimension rows. But if we've already aggregated, we lose the individual store_sales rows. We can't join aggregated results with dimensions unless we keep the join keys. We need to keep ss_sold_date_sk, ss_store_sk, ss_hdemo_sk in the aggregation output to join with dimensions.
+
+Alternative: Aggregate at store_sales level with all dimension keys in GROUP BY, then join dimensions for display. But we need dimension attributes for filtering, not display. The filters are on dimension attributes (d_dom, s_county, hd_buy_potential). So we need dimension tables for filtering, not just for display.
+
+So aggregate_pushdown might not work unless we keep all dimension foreign keys and join after aggregation.
+
+Better approach: Pre-filter dimensions, get their keys, then join with store_sales, then aggregate.
+
+Now, design node contracts carefully. Need to ensure all columns needed downstream are included.
+
+Final output needs: c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt
+
+The subquery produces: ss_ticket_number, ss_customer_sk, cnt
+Then joined with customer on ss_customer_sk = c_customer_sk
+
+So we need to preserve ss_customer_sk throughout.
+
+Let me design the strategies:
+
+Worker 1: multi_dimension_prefetch
+  CTE1: filtered_date - d_date_sk WHERE d_dom 1-2, d_year 2000-2002
+  CTE2: filtered_store - s_store_sk WHERE s_county in (...)
+  CTE3: filtered_hd - hd_demo_sk WHERE hd_buy_potential in (...), hd_vehicle_count > 0, CASE...
+  Then join store_sales with all 3 CTEs
+  Group by ss_ticket_number, ss_customer_sk
+  Filter cnt 1-5
+  Join customer
+  Order by
+
+Worker 2: prefetch_fact_join  
+  CTE1: filtered_date (as above)
+  CTE2: date_sales - join filtered_date with store_sales on d_date_sk
+  CTE3: date_sales_store - join CTE2 with store on ss_store_sk = s_store_sk AND s_county in (...)
+  CTE4: date_sales_store_hd - join CTE3 with household_demographics on ss_hdemo_sk = hd_demo_sk AND hd filters
+  Then group, filter cnt, join customer, order
+
+Worker 3: early_filter with dimension CTEs joined to fact
+  Similar to Worker 1 but maybe different join order
+
+Worker 4: exploration - use IN clauses or EXISTS
+  Get dimension keys in CTEs
+  Filter store_sales WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_date) AND ss_store_sk IN (SELECT s_store_sk FROM filtered_store) AND ss_hdemo_sk IN (SELECT hd_demo_sk FROM filtered_hd)
+  This might allow better pushdown
+
+Check hazards:
+- Don't cross-join dimension CTEs (Worker 1 joins them all with fact, not with each other, so OK)
+- Ensure all CTEs have WHERE clauses
+- Ensure column completeness
+
+Now write the structured briefing.
+</thinking>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Find customers with 1-5 store sale line items per ticket under specific household demographics (buy potential 501-1000 or Unknown, vehicle count > 0, dep/vehicle ratio > 1), date filters (day-of-month 1-2, years 2000-2002), and store county filters. INNER JOIN semantics require all dimension and customer matches. Aggregation uses COUNT(*) which is duplicate-sensitive if joins multiply rows, but foreign key joins should preserve row counts. Filter on cnt depends on complete grouping after all dimension filters are applied.
+
+BOTTLENECK_DIAGNOSIS: Scan-bound on store_sales (361.8ms, 76% of total) scanning 8.6M rows then filtering through hash joins. Dimension filters are selective (date_dim: 72 rows, store: 102 rows, household_demographics: 1,040 rows) but not used to restrict fact table scan. Cardinality flow: 8.6M store_sales → 2.0M after hd join → 135K after date join → 52K after store join → 5,044 after aggregation → 308 after cnt filter → 15 after customer join. Optimizer already pushes filters into dimension scans and uses efficient hash joins, but misses opportunity to use filtered dimension keys to reduce fact scan.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt ordered by cnt DESC, c_last_name ASC.
+- CTE_COLUMN_COMPLETENESS: All CTEs must include surrogate keys (d_date_sk, s_store_sk, hd_demo_sk) for joins and ss_ticket_number, ss_customer_sk for aggregation.
+- LITERAL_PRESERVATION: Must preserve exact filter values: d_dom 1-2, d_year 2000-2002, s_county list, hd_buy_potential values, hd_vehicle_count > 0, CASE expression.
+- SEMANTIC_EQUIVALENCE: Must return identical 15 rows with same ordering.
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows dimension filters applied after fact scan, not used to restrict it.
+- DIMENSION_CTE_CROSS_JOIN_HAZARD: Multiple dimension CTEs must not be cross-joined before fact table.
+
+REGRESSION_WARNINGS:
+1. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion
+   RULE: Never cross-join dimension CTEs with each other; join each independently with fact table
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Baseline runtime <50ms, CTE materialization overhead dominated
+   RULE: Acceptable here (baseline 475ms > 100ms threshold)
+3. or_to_union (0.59x on Q90):
+   CAUSE: Split same-column OR conditions, duplicating fact scans
+   RULE: Do NOT split hd_buy_potential OR (same column)
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_store -> filtered_hd -> prefetched_sales -> aggregated_sales -> filtered_counts -> final_result
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_dom BETWEEN 1 AND 2 AND d_year IN (2000, 2001, 2002)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 72
+    CONSUMERS: prefetched_sales
+  filtered_store:
+    FROM: store  
+    WHERE: s_county IN ('Fairfield County','Walker County','Daviess County','Barrow County')
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 102
+    CONSUMERS: prefetched_sales
+  filtered_hd:
+    FROM: household_demographics
+    WHERE: (hd_buy_potential = '501-1000' OR hd_buy_potential = 'Unknown') AND hd_vehicle_count > 0 AND CASE WHEN hd_vehicle_count > 0 THEN hd_dep_count/hd_vehicle_count ELSE NULL END > 1
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1,040
+    CONSUMERS: prefetched_sales
+  prefetched_sales:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+           INNER JOIN filtered_store ON ss_store_sk = s_store_sk  
+           INNER JOIN filtered_hd ON ss_hdemo_sk = hd_demo_sk
+    OUTPUT: ss_ticket_number, ss_customer_sk
+    EXPECTED_ROWS: 52K
+    CONSUMERS: aggregated_sales
+  aggregated_sales:
+    FROM: prefetched_sales
+    GROUP BY: ss_ticket_number, ss_customer_sk
+    AGGREGATE: COUNT(*) as cnt
+    OUTPUT: ss_ticket_number, ss_customer_sk, cnt
+    EXPECTED_ROWS: 5,044
+    CONSUMERS: filtered_counts
+  filtered_counts:
+    FROM: aggregated_sales
+    WHERE: cnt BETWEEN 1 AND 5
+    OUTPUT: ss_ticket_number, ss_customer_sk, cnt
+    EXPECTED_ROWS: 308
+    CONSUMERS: final_result
+  final_result:
+    FROM: filtered_counts
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+    OUTPUT: c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt
+    ORDER BY: cnt DESC, c_last_name ASC
+    EXPECTED_ROWS: 15
+    CONSUMERS: output
+EXAMPLES: multi_dimension_prefetch, dimension_cte_isolate, prefetch_fact_join
+EXAMPLE_ADAPTATION:
+  multi_dimension_prefetch (Q43): Apply pre-filtering of date_dim and store into CTEs before fact join; ignore the third dimension pattern (we have 3 dimensions).
+  dimension_cte_isolate (Q26): Apply isolation of all dimension tables into CTEs with WHERE clauses; ignore the cross-join hazard warning by joining each CTE independently with fact table.
+  prefetch_fact_join (Q63): Apply staged CTE chain pattern; adapt to use all three dimensions instead of just date.
+HAZARD_FLAGS:
+  - Risk of Cartesian explosion if dimension CTEs are cross-joined before fact table
+  - Must ensure all dimension CTEs have WHERE clauses (no unfiltered CTEs)
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: early_filter_staged
+TARGET_LOGICAL_TREE:
+  filtered_date -> date_sales -> date_sales_store -> date_sales_store_hd -> aggregated -> filtered -> final_result
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_dom BETWEEN 1 AND 2 AND d_year IN (2000, 2001, 2002)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 72
+    CONSUMERS: date_sales
+  date_sales:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_ticket_number, ss_customer_sk, ss_store_sk, ss_hdemo_sk
+    EXPECTED_ROWS: 135K
+    CONSUMERS: date_sales_store
+  date_sales_store:
+    FROM: date_sales
+    JOIN: INNER JOIN store ON ss_store_sk = s_store_sk
+    WHERE: s_county IN ('Fairfield County','Walker County','Daviess County','Barrow County')
+    OUTPUT: ss_ticket_number, ss_customer_sk, ss_hdemo_sk
+    EXPECTED_ROWS: 52K
+    CONSUMERS: date_sales_store_hd
+  date_sales_store_hd:
+    FROM: date_sales_store
+    JOIN: INNER JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk
+    WHERE: (hd_buy_potential = '501-1000' OR hd_buy_potential = 'Unknown') AND hd_vehicle_count > 0 AND CASE WHEN hd_vehicle_count > 0 THEN hd_dep_count/hd_vehicle_count ELSE NULL END > 1
+    OUTPUT: ss_ticket_number, ss_customer_sk
+    EXPECTED_ROWS: 52K
+    CONSUMERS: aggregated
+  aggregated:
+    FROM: date_sales_store_hd
+    GROUP BY: ss_ticket_number, ss_customer_sk
+    AGGREGATE: COUNT(*) as cnt
+    OUTPUT: ss_ticket_number, ss_customer_sk, cnt
+    EXPECTED_ROWS: 5,044
+    CONSUMERS: filtered
+  filtered:
+    FROM: aggregated
+    WHERE: cnt BETWEEN 1 AND 5
+    OUTPUT: ss_ticket_number, ss_customer_sk, cnt
+    EXPECTED_ROWS: 308
+    CONSUMERS: final_result
+  final_result:
+    FROM: filtered
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+    OUTPUT: c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt
+    ORDER BY: cnt DESC, c_last_name ASC
+    EXPECTED_ROWS: 15
+    CONSUMERS: output
+EXAMPLES: prefetch_fact_join, early_filter, date_cte_isolate
+EXAMPLE_ADAPTATION:
+  prefetch_fact_join (Q63): Apply the staged pipeline: filter date first, join with fact, then join other dimensions; ignore that Q63 only had date dimension.
+  early_filter (Q11): Apply principle of filtering small dimension tables first; adapt to three dimensions instead of one.
+  date_cte_isolate (Q6): Apply date filtering into CTE; ignore that Q6 had simpler structure.
+HAZARD_FLAGS:
+  - Join order fixed by CTE chain may prevent optimizer from choosing better order
+  - Must preserve all filter conditions when moving between CTEs
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: aggregate_pushdown
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_store -> filtered_hd -> sales_with_keys -> early_aggregation -> filtered_agg -> dimension_join_check -> final_result
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_dom BETWEEN 1 AND 2 AND d_year IN (2000, 2001, 2002)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 72
+    CONSUMERS: sales_with_keys
+  filtered_store:
+    FROM: store
+    WHERE: s_county IN ('Fairfield County','Walker County','Daviess County','Barrow County')
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 102
+    CONSUMERS: sales_with_keys
+  filtered_hd:
+    FROM: household_demographics
+    WHERE: (hd_buy_potential = '501-1000' OR hd_buy_potential = 'Unknown') AND hd_vehicle_count > 0 AND CASE WHEN hd_vehicle_count > 0 THEN hd_dep_count/hd_vehicle_count ELSE NULL END > 1
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1,040
+    CONSUMERS: sales_with_keys
+  sales_with_keys:
+    FROM: store_sales
+    WHERE: ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_date)
+      AND ss_store_sk IN (SELECT s_store_sk FROM filtered_store)
+      AND ss_hdemo_sk IN (SELECT hd_demo_sk FROM filtered_hd)
+    OUTPUT: ss_ticket_number, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_hdemo_sk
+    EXPECTED_ROWS: 52K
+    CONSUMERS: early_aggregation
+  early_aggregation:
+    FROM: sales_with_keys
+    GROUP BY: ss_ticket_number, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_hdemo_sk
+    AGGREGATE: COUNT(*) as cnt
+    OUTPUT: ss_ticket_number, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_hdemo_sk, cnt
+    EXPECTED_ROWS: 5,044
+    CONSUMERS: filtered_agg
+  filtered_agg:
+    FROM: early_aggregation
+    WHERE: cnt BETWEEN 1 AND 5
+    OUTPUT: ss_ticket_number, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_hdemo_sk, cnt
+    EXPECTED_ROWS: 308
+    CONSUMERS: dimension_join_check
+  dimension_join_check:
+    FROM: filtered_agg
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN filtered_store ON ss_store_sk = s_store_sk
+    JOIN: INNER JOIN filtered_hd ON ss_hdemo_sk = hd_demo_sk
+    OUTPUT: ss_ticket_number, ss_customer_sk, cnt
+    EXPECTED_ROWS: 308
+    CONSUMERS: final_result
+  final_result:
+    FROM: dimension_join_check
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+    OUTPUT: c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt
+    ORDER BY: cnt DESC, c_last_name ASC
+    EXPECTED_ROWS: 15
+    CONSUMERS: output
+EXAMPLES: single_pass_aggregation, pushdown, early_filter
+EXAMPLE_ADAPTATION:
+  single_pass_aggregation (Q9): Apply consolidation of filtering into single scan with IN clauses; ignore the CASE aggregation pattern.
+  pushdown (Q9): Apply predicate pushdown using IN clauses; adapt from scalar subqueries to dimension key filters.
+  early_filter (Q93): Apply early filtering principle; adapt to use IN clauses instead of direct joins.
+HAZARD_FLAGS:
+  - IN clauses may not be as efficient as joins for large result sets
+  - Early aggregation with dimension keys in GROUP BY increases group cardinality
+  - Must verify COUNT(*) semantics preserved when aggregating before dimension attribute verification
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: semi_join_bloom
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_store -> filtered_hd -> bloom_sales -> aggregated -> filtered -> final_result
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_dom BETWEEN 1 AND 2 AND d_year IN (2000, 2001, 2002)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 72
+    CONSUMERS: bloom_sales
+  filtered_store:
+    FROM: store
+    WHERE: s_county IN ('Fairfield County','Walker County','Daviess County','Barrow County')
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 102
+    CONSUMERS: bloom_sales
+  filtered_hd:
+    FROM: household_demographics
+    WHERE: (hd_buy_potential = '501-1000' OR hd_buy_potential = 'Unknown') AND hd_vehicle_count > 0 AND CASE WHEN hd_vehicle_count > 0 THEN hd_dep_count/hd_vehicle_count ELSE NULL END > 1
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1,040
+    CONSUMERS: bloom_sales
+  bloom_sales:
+    FROM: store_sales
+    WHERE: EXISTS (SELECT 1 FROM filtered_date WHERE d_date_sk = ss_sold_date_sk)
+      AND EXISTS (SELECT 1 FROM filtered_store WHERE s_store_sk = ss_store_sk)
+      AND EXISTS (SELECT 1 FROM filtered_hd WHERE hd_demo_sk = ss_hdemo_sk)
+    OUTPUT: ss_ticket_number, ss_customer_sk
+    EXPECTED_ROWS: 52K
+    CONSUMERS: aggregated
+  aggregated:
+    FROM: bloom_sales
+    GROUP BY: ss_ticket_number, ss_customer_sk
+    AGGREGATE: COUNT(*) as cnt
+    OUTPUT: ss_ticket_number, ss_customer_sk, cnt
+    EXPECTED_ROWS: 5,044
+    CONSUMERS: filtered
+  filtered:
+    FROM: aggregated
+    WHERE: cnt BETWEEN 1 AND 5
+    OUTPUT: ss_ticket_number, ss_customer_sk, cnt
+    EXPECTED_ROWS: 308
+    CONSUMERS: final_result
+  final_result:
+    FROM: filtered
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+    OUTPUT: c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt
+    ORDER BY: cnt DESC, c_last_name ASC
+    EXPECTED_ROWS: 15
+    CONSUMERS: output
+EXAMPLES: intersect_to_exists, decorrelate, early_filter
+EXAMPLE_ADAPTATION:
+  intersect_to_exists (Q14): Apply EXISTS pattern for filtering; ignore INTERSECT-specific aspects.
+  decorrelate (Q1): Apply decorrelation pattern but in reverse - using correlated EXISTS for filtering instead of removing correlation.
+  early_filter (Q11): Apply early filtering principle via EXISTS semi-joins.
+HAZARD_FLAGS:
+  - EXISTS may force nested loop joins instead of hash joins
+  - DuckDB may not optimize multiple correlated EXISTS efficiently
+  - Semi-joins might not push predicates into store_sales scan
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (combining EXISTS semi-joins with dimension pre-filtering for potential bloom-filter-like optimization)

@@ -1,0 +1,301 @@
+You are a SQL rewrite engine for PostgreSQL v16.11-0ubuntu0.24.04.1). Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+## Semantic Contract (MUST preserve)
+
+Find pairs of items (item1 < item2) sold together in the same transaction (ticket) during 1999-2000, where item1 is Electronics/Men, item2 has manager_id 44-63, both items priced 115-129, bought by divorced college-educated customers, and count transaction frequency. All joins are INNER (all sides must match). COUNT(*) is duplicate-safe. The non-equi join (item1 < item2) must be preserved to avoid duplicate pairs.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+ticket_items_cte -> item_pairs_cte -> final_aggregate
+NODE_CONTRACTS:
+  ticket_items_cte:
+    FROM: store_sales s, date_dim d
+    JOIN: s.ss_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year BETWEEN 1999 AND 2000
+      AND s.ss_list_price BETWEEN 115 AND 129
+    OUTPUT: ss_ticket_number, ss_item_sk, ss_customer_sk
+    EXPECTED_ROWS: 248K
+    CONSUMERS: item_pairs_cte
+  item_pairs_cte:
+    FROM: ticket_items_cte t1, ticket_items_cte t2, item i1, item i2, customer c, customer_address ca, customer_demographics cd
+    JOIN: t1.ss_ticket_number = t2.ss_ticket_number
+      AND t1.ss_item_sk = i1.i_item_sk
+      AND t2.ss_item_sk = i2.i_item_sk
+      AND t1.ss_customer_sk = c.c_customer_sk
+      AND c.c_current_addr_sk = ca.ca_address_sk
+      AND c.c_current_cdemo_sk = cd.cd_demo_sk
+      AND i1.i_item_sk < i2.i_item_sk
+    WHERE: i1.i_category IN ('Electronics', 'Men')
+      AND i2.i_manager_id BETWEEN 44 AND 63
+      AND cd.cd_marital_status = 'D'
+      AND cd.cd_education_status = 'College'
+    OUTPUT: i1.i_item_sk, i2.i_item_sk
+    EXPECTED_ROWS: 838
+    CONSUMERS: final_aggregate
+  final_aggregate:
+    FROM: item_pairs_cte
+    GROUP BY: i_item_sk, i_item_sk
+    AGGREGATE: COUNT(*) AS cnt
+    ORDER BY: cnt
+    OUTPUT: i_item_sk, i_item_sk, cnt
+    EXPECTED_ROWS: 368
+    CONSUMERS: output
+
+NODE_CONTRACTS:
+ticket_items_cte:
+    FROM: store_sales s, date_dim d
+    JOIN: s.ss_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year BETWEEN 1999 AND 2000
+      AND s.ss_list_price BETWEEN 115 AND 129
+    OUTPUT: ss_ticket_number, ss_item_sk, ss_customer_sk
+    EXPECTED_ROWS: 248K
+    CONSUMERS: item_pairs_cte
+  item_pairs_cte:
+    FROM: ticket_items_cte t1, ticket_items_cte t2, item i1, item i2, customer c, customer_address ca, customer_demographics cd
+    JOIN: t1.ss_ticket_number = t2.ss_ticket_number
+      AND t1.ss_item_sk = i1.i_item_sk
+      AND t2.ss_item_sk = i2.i_item_sk
+      AND t1.ss_customer_sk = c.c_customer_sk
+      AND c.c_current_addr_sk = ca.ca_address_sk
+      AND c.c_current_cdemo_sk = cd.cd_demo_sk
+      AND i1.i_item_sk < i2.i_item_sk
+    WHERE: i1.i_category IN ('Electronics', 'Men')
+      AND i2.i_manager_id BETWEEN 44 AND 63
+      AND cd.cd_marital_status = 'D'
+      AND cd.cd_education_status = 'College'
+    OUTPUT: i1.i_item_sk, i2.i_item_sk
+    EXPECTED_ROWS: 838
+    CONSUMERS: final_aggregate
+  final_aggregate:
+    FROM: item_pairs_cte
+    GROUP BY: i_item_sk, i_item_sk
+    AGGREGATE: COUNT(*) AS cnt
+    ORDER BY: cnt
+    OUTPUT: i_item_sk, i_item_sk, cnt
+    EXPECTED_ROWS: 368
+    CONSUMERS: output
+
+## Hazard Flags (avoid these specific risks)
+
+- Deferring dimension filters (cd_marital_status, cd_education_status) until after pair formation may explode intermediate rows
+- May lose predicate pushdown benefits for highly selective dimension filters
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy
+
+## Regression Warnings (observed failures on similar queries)
+
+1. Avoid CTEs that block parallel execution (observed regression: 0.21x):
+   CAUSE: MATERIALIZED CTEs execute single-threaded, preventing parallel scan of large fact tables
+   RULE: For store_sales CTEs >100K rows, avoid MATERIALIZED unless proven beneficial
+2. Never split OR conditions into UNION ALL (observed regression: 0.21x):
+   CAUSE: PostgreSQL's BITMAP_OR_SCAN already optimizes multi-branch ORs
+   RULE: Keep item1.i_category IN ('Electronics', 'Men') as single condition
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output item1.i_item_sk, item2.i_item_sk, cnt
+- CTE_COLUMN_COMPLETENESS: All CTEs must include ss_ticket_number, ss_item_sk, ss_customer_sk, ss_list_price, d_date_sk, c_current_addr_sk, c_current_cdemo_sk for downstream joins
+- LITERAL_PRESERVATION: Must preserve all filter values: 1999, 1999+1, 'Electronics', 'Men', 44, 63, 'D', 'College', 115, 129
+- SEMANTIC_EQUIVALENCE: Must return same pairs with same counts
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated implicit joins (EXPLAIN shows optimizer already using explicit join types but cardinality estimation may suffer)
+- CROSS_CTE_PREDICATE_BLINDNESS: store_sales scanned twice (EXPLAIN shows s1 and s2 as separate scans)
+- NON_EQUI_JOIN_INPUT_BLINDNESS: item1.i_item_sk < item2.i_item_sk applied late after all dimension joins (EXPLAIN shows "Join Filter" in Nested Loop)
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- pg_date_cte_explicit_join: Apply date CTE isolation; but defer all other dimension filters to final join.
+- late_attribute_binding: Apply dimension join deferral - join customer/demographics/address only after pair formation; ignore the display column aspect (all dimensions used in filters).
+- single_pass_aggregation: Apply single scan for ticket-items; but use self-join rather than pivot aggregation.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. pg_date_cte_explicit_join (2.28x)
+
+**Principle:** Dimension Isolation + Explicit Joins: materialize selective dimension filters into CTEs to create tiny hash tables, AND convert comma-separated joins to explicit JOIN syntax. On PostgreSQL, the combination enables better hash join planning with a tiny probe table.
+
+**BEFORE (slow):**
+```sql
+select 
+   substring(w_warehouse_name,1,20)
+  ,sm_type
+  ,cc_name
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk <= 30 ) then 1 else 0 end)  as "30 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 30) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 60) then 1 else 0 end )  as "31-60 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 60) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 90) then 1 else 0 end)  as "61-90 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 90) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 120) then 1 else 0 end)  as "91-120 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk  > 120) then 1 else 0 end)  as ">120 days"
+from
+   catalog_sales
+  ,warehouse
+  ,ship_mode
+  ,call_center
+  ,date_dim
+where
+d_month_seq between 1193 and 1193 + 23
+and cs_ship_date_sk   = d_date_sk
+and cs_warehouse_sk   = w_warehouse_sk
+and cs_ship_mode_sk   = sm_ship_mode_sk
+and cs_call_center_sk = cc_call_center_sk
+and cs_list_price between 271 and 300
+and sm_type = 'REGULAR'
+and cc_class = 'small'
+and w_gmt_offset = -5
+group by
+   substring(w_warehouse_name,1,20)
+  ,sm_type
+  ,cc_name
+order by substring(w_warehouse_name,1,20)
+        ,sm_type
+        ,cc_name
+limit 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1193 AND 1216
+```
+[main_query]:
+```sql
+SELECT SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name, SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", ... FROM catalog_sales JOIN filtered_dates ON cs_ship_date_sk = d_date_sk JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk JOIN call_center ON cs_call_center_sk = cc_call_center_sk WHERE cs_list_price BETWEEN 271 AND 300 AND sm_type = 'REGULAR' AND cc_class = 'small' AND w_gmt_offset = -5 GROUP BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name ORDER BY 1, 2, 3 LIMIT 100
+```
+
+## Original SQL
+
+```sql
+select  item1.i_item_sk, item2.i_item_sk, count(*) as cnt
+FROM item AS item1,
+item AS item2,
+store_sales AS s1,
+store_sales AS s2,
+date_dim,
+customer,
+customer_address,
+customer_demographics
+WHERE
+item1.i_item_sk < item2.i_item_sk
+AND s1.ss_ticket_number = s2.ss_ticket_number
+AND s1.ss_item_sk = item1.i_item_sk and s2.ss_item_sk = item2.i_item_sk
+AND s1.ss_customer_sk = c_customer_sk
+and c_current_addr_sk = ca_address_sk
+and c_current_cdemo_sk = cd_demo_sk
+AND d_year between 1999 and 1999 + 1
+and d_date_sk = s1.ss_sold_date_sk
+and item1.i_category in ('Electronics', 'Men')
+and item2.i_manager_id between 44 and 63
+and cd_marital_status = 'D'
+and cd_education_status = 'College'
+and s1.ss_list_price between 115 and 129
+and s2.ss_list_price between 115 and 129
+GROUP BY item1.i_item_sk, item2.i_item_sk
+ORDER BY cnt
+;
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~744K
+    ├── SCAN (item AS item1 (join), item AS item2 (join), store_sales AS s1 (join), store_sales AS s2 (join), date_dim (join), customer (join), customer_address (join), customer_demographics (join))
+    ├── JOIN (s1.ss_ticket_number = s2.ss_ticket_number)
+    ├── JOIN (s1.ss_item_sk = item1.i_item_sk)
+    ├── JOIN (+5 more)
+    ├── FILTER (item1.i_item_sk < item2.i_item_sk)
+    ├── FILTER (d_year BETWEEN 1999 AND 1999 + 1)
+    ├── FILTER (+6 more)
+    ├── AGG (GROUP BY)
+    ├── SORT (cnt ASC)
+    └── OUTPUT (i_item_sk, i_item_sk, cnt)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit or use empty array if not needed
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

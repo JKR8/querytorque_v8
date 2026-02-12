@@ -1,0 +1,86 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [MAIN] main_query [~] — Replace single-block query with CTE-based join structure
+│   ├── WITH date_cte [=]
+│   │   └── SCAN date_dim
+│   ├── WITH customer_cte [=]
+│   │   └── SCAN customer_demographics
+│   ├── WITH promotion_cte [=]
+│   │   └── SCAN promotion
+│   ├── WITH fact_with_dims [+] — Join fact table with all dimension CTEs
+│   │   ├── SCAN catalog_sales
+│   │   ├── JOIN date_cte ON cs_sold_date_sk = d_date_sk
+│   │   ├── JOIN customer_cte ON cs_bill_cdemo_sk = cd_demo_sk
+│   │   └── JOIN promotion_cte ON cs_promo_sk = p_promo_sk
+│   ├── WITH item_join [~] — Replace single join with filtered fact CTE
+│   │   ├── SCAN fact_with_dims
+│   │   └── JOIN item ON cs_item_sk = i_item_sk
+│   └── AGG (GROUP BY) [=]
+└── OUTPUT [=]
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter dimension tables into separate CTEs before joining with fact table", "applied_to": ["date_cte", "customer_cte", "promotion_cte"]},
+    {"id": "R2", "type": "multi_dimension_prefetch", "description": "Create filtered CTEs for all three dimension tables to reduce fact table probe size", "applied_to": ["fact_with_dims"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "customer_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'Unknown'",
+        "interfaces": {"outputs": ["cd_demo_sk"], "consumes": []}
+      },
+      "promotion_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'",
+        "interfaces": {"outputs": ["p_promo_sk"], "consumes": []}
+      },
+      "fact_with_dims": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs.cs_item_sk, cs.cs_quantity, cs.cs_list_price, cs.cs_coupon_amt, cs.cs_sales_price FROM catalog_sales cs JOIN date_cte d ON cs.cs_sold_date_sk = d.d_date_sk JOIN customer_cte c ON cs.cs_bill_cdemo_sk = c.cd_demo_sk JOIN promotion_cte p ON cs.cs_promo_sk = p.p_promo_sk",
+        "interfaces": {"outputs": ["cs_item_sk", "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price"], "consumes": ["date_cte", "customer_cte", "promotion_cte"]}
+      },
+      "item_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i.i_item_id, fd.cs_quantity, fd.cs_list_price, fd.cs_coupon_amt, fd.cs_sales_price FROM fact_with_dims fd JOIN item i ON fd.cs_item_sk = i.i_item_sk",
+        "interfaces": {"outputs": ["i_item_id", "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price"], "consumes": ["fact_with_dims"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM item_join GROUP BY i_item_id ORDER BY i_item_id LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "agg1", "agg2", "agg3", "agg4"], "consumes": ["item_join"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "customer_cte", "promotion_cte", "fact_with_dims", "item_join", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), customer_cte AS ({customer_cte}), promotion_cte AS ({promotion_cte}), fact_with_dims AS ({fact_with_dims}), item_join AS ({item_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced monolithic 5-table join with filtered dimension CTEs and sequential fact table joins. This creates small hash tables from pre-filtered dimensions (date, customer, promotion) before probing the large fact table, reducing join cardinality early.
+
+**Expected speedup**: 2.0-3.0x (based on dimension_cte_isolate and multi_dimension_prefetch patterns with similar selectivity). The baseline is 654ms, so CTE overhead is acceptable. Avoids Cartesian explosion by joining dimensions sequentially to fact table instead of cross-joining CTEs.

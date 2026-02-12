@@ -1,0 +1,84 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE chain)
+├── [=] date_cte
+│   ├── SCAN date_dim
+│   ├── FILTER (d_month_seq BETWEEN 1188 AND 1188 + 11)
+│   └── OUTPUT (d_date_sk)
+├── [=] item_cte
+│   ├── SCAN item
+│   └── OUTPUT (i_item_sk, i_product_name, i_brand, i_class, i_category)
+├── [=] inventory_join
+│   ├── SCAN inventory
+│   ├── JOIN (INNER) date_cte ON inv_date_sk = d_date_sk
+│   ├── JOIN (INNER) item_cte ON inv_item_sk = i_item_sk
+│   └── OUTPUT (i_product_name, i_brand, i_class, i_category, inv_quantity_on_hand)
+├── [=] rollup_aggregate
+│   ├── SCAN inventory_join
+│   ├── AGG (GROUP BY ROLLUP(i_product_name, i_brand, i_class, i_category))
+│   └── OUTPUT (i_product_name, i_brand, i_class, i_category, qoh)
+└── [~] main_query
+    ├── SCAN rollup_aggregate
+    ├── SORT (qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC)
+    └── LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Isolate date_dim filter into separate CTE", "applied_to": ["date_cte"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Isolate item columns into separate CTE", "applied_to": ["item_cte"]},
+    {"id": "R3", "type": "prefetch_fact_join", "description": "Stage joins: filtered date and item CTEs joined with inventory fact table", "applied_to": ["inventory_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1188 AND 1188 + 11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_product_name, i_brand, i_class, i_category FROM item",
+        "interfaces": {"outputs": ["i_item_sk", "i_product_name", "i_brand", "i_class", "i_category"], "consumes": []}
+      },
+      "inventory_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i.i_product_name, i.i_brand, i.i_class, i.i_category, inv.inv_quantity_on_hand FROM inventory inv JOIN date_cte d ON inv.inv_date_sk = d.d_date_sk JOIN item_cte i ON inv.inv_item_sk = i.i_item_sk",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "inv_quantity_on_hand"], "consumes": ["date_cte", "item_cte"]}
+      },
+      "rollup_aggregate": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_product_name, i_brand, i_class, i_category, AVG(inv_quantity_on_hand) AS qoh FROM inventory_join GROUP BY ROLLUP(i_product_name, i_brand, i_class, i_category)",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "qoh"], "consumes": ["inventory_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_product_name, i_brand, i_class, i_category, qoh FROM rollup_aggregate ORDER BY qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC LIMIT 100",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "qoh"], "consumes": ["rollup_aggregate"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "item_cte", "inventory_join", "rollup_aggregate", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), item_cte AS ({item_cte}), inventory_join AS ({inventory_join}), rollup_aggregate AS ({rollup_aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured original single SELECT into staged CTE chain per target logical tree: isolated dimension filters (date_cte, item_cte), joined them sequentially with fact table (inventory_join), then aggregated with ROLLUP.
+
+**Expected speedup:** 1.8-2.2x from reduced dimension table scanning and hash table size optimization. Baseline is 43s, so CTE overhead is negligible.

@@ -1,0 +1,281 @@
+<reasoning>
+CLASSIFY:
+This is a star-join query with a large fact table (catalog_sales) joined to dimension tables (warehouse, item, date_dim) and an optional fact table (catalog_returns). The query uses conditional aggregation (CASE inside SUM) to split net sales into before/after buckets. Structural archetype: star-join with late dimension filtering and optional fact join.
+
+EXPLAIN PLAN ANALYSIS:
+- Total time: 421ms
+- Dominant cost: catalog_returns SEQ_SCAN (228.6ms, 54%) + LEFT JOIN with catalog_returns (166.9ms, 40%) = 395.6ms (94% total)
+- Row flow: catalog_sales scan → 277K rows → LEFT JOIN with catalog_returns (1.4M rows) → 277K rows → date_dim filter (61 rows) → 277K rows → item filter (6,464 rows) → 18K rows → warehouse (10 rows) → group by (5,419 rows) → top 100
+- The optimizer already pushes date filter into date_dim scan (61/73K rows). Item filter is also pushed (6,464/102K rows).
+- Single scan of catalog_sales (277K/172.8M = 0.16% selectivity due to date join)
+- Single scan of catalog_returns (1.4M/17.3M = 8% selectivity - no filtering)
+- The LEFT JOIN is expensive because catalog_returns is large and unfiltered
+- Warehouse is tiny (10 rows) - negligible
+- GROUP BY is cheap (11.8ms)
+
+Bottleneck: The LEFT JOIN with catalog_returns dominates cost (94%). This is join-bound, specifically the right side (catalog_returns) is large and unfiltered. The optimizer cannot push date/item filters into catalog_returns because the join condition doesn't include date columns.
+
+GAP MATCHING:
+1. CROSS_CTE_PREDICATE_BLINDNESS: Date/item filters aren't pushed into catalog_returns CTE. Catalog_returns scan is unfiltered (1.4M rows). Opportunity: pre-filter catalog_returns by joining with date_dim/item on shared keys if possible.
+2. REDUNDANT_SCAN_ELIMINATION: Only one scan of each fact table, but catalog_returns is large and unfiltered.
+3. No correlated subqueries, no UNION, no INTERSECT, no window functions, no EXISTS.
+4. Engine already handles: predicate pushdown into dimension scans, hash join selection, columnar projection.
+
+AGGREGATION TRAP CHECK:
+- SUM with CASE expressions: grouping-insensitive to duplicates
+- COALESCE(cr_refunded_cash,0) handles NULLs from LEFT JOIN
+- No STDDEV_SAMP/VARIANCE/AVG that are duplicate-sensitive
+- If we pre-aggregate catalog_returns by (cr_order_number, cr_item_sk), it's safe because:
+  a) The LEFT JOIN is on these exact columns
+  b) If multiple returns per sale, SUM(cr_refunded_cash) preserves total refund
+  c) The original query would duplicate cs_sales_price for multiple returns, but SUM of duplicated cs_sales_price would be wrong. However, business logic suggests one return per sale? Need to preserve exact semantics.
+
+TRANSFORM SELECTION (ranked by potential):
+1. **prefetch_fact_join** (3.77x historical): Pre-filter date_dim/item into CTEs, pre-join with catalog_sales before LEFT JOIN with catalog_returns. Could reduce catalog_sales rows before expensive LEFT JOIN.
+2. **dimension_cte_isolate** (1.93x historical): Pre-filter ALL dimensions (date_dim, item, warehouse) into CTEs before joining with fact tables. Warehouse is tiny but included for completeness.
+3. **single_pass_aggregation** (4.47x historical): Not directly applicable - no repeated scans. But could pre-aggregate catalog_returns by (order,item) to reduce LEFT JOIN cardinality.
+4. **early_filter** (4.00x historical): Filter small dimension tables first, then join to fact tables. Already happening but could be structured via CTEs.
+5. **date_cte_isolate** (4.00x historical): Extract date filtering into CTE. Already optimized but could combine with other dimensions.
+
+Structural diversity:
+1. Worker 1: prefetch_fact_join - staged join pipeline
+2. Worker 2: dimension_cte_isolate - pre-filter all dimensions
+3. Worker 3: early_filter + pre-aggregation - filter dimensions and pre-aggregate catalog_returns
+4. Worker 4: Exploration: novel combination - push date filter into catalog_returns via self-join on date_dim? Risky but could filter catalog_returns.
+
+LOGICAL TREE DESIGN:
+For prefetch_fact_join: date_cte → item_cte → sales_with_dims_cte (join catalog_sales with date_cte, item_cte) → then LEFT JOIN with catalog_returns → then join warehouse → aggregate.
+Must preserve all columns: w_state, i_item_id, d_date, cs_sales_price, cr_refunded_cash.
+
+Check CTE column completeness carefully!
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compare net catalog sales before/after 2001-04-02 for low-priced items (0.99-1.49) by warehouse state and item over ±30 days, netting refunded cash. LEFT JOIN preserves all catalog_sales rows even without matching returns (NULL refunds become 0). SUM with CASE is duplicate-insensitive but must preserve exact net calculation: cs_sales_price - COALESCE(cr_refunded_cash,0). Date filter depends only on cs_sold_date_sk, not cr_returned_date_sk.
+
+BOTTLENECK_DIAGNOSIS:
+Join-bound: LEFT JOIN between catalog_sales (277K rows) and catalog_returns (1.4M rows) consumes 94% of runtime (395.6ms). catalog_returns is scanned unfiltered (no date/item constraints). Cardinality flow: 277K → LEFT JOIN → 277K → date filter → 277K → item filter → 18K → warehouse → 5,419 groups. Optimizer already pushes date/item filters into dimension scans (61 and 6,464 rows). Logical-tree cost percentages misleading: 40% LEFT JOIN + 54% catalog_returns scan = 94% actual cost.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output w_state, i_item_id, sales_before, sales_after in same order.
+- CTE_COLUMN_COMPLETENESS: All CTEs must include cs_item_sk, cs_order_number, cs_warehouse_sk, cs_sales_price, d_date, w_state, i_item_id, cr_refunded_cash as needed downstream.
+- LITERAL_PRESERVATION: Keep exact values: '2001-04-02', 0.99, 1.49, INTERVAL 30 DAY.
+- SEMANTIC_EQUIVALENCE: Same rows and ordering (w_state, i_item_id).
+- CROSS_CTE_PREDICATE_BLINDNESS: Date/item filters not pushed into catalog_returns CTE (1.4M unfiltered rows).
+- REDUNDANT_SCAN_ELIMINATION: catalog_returns scanned once but unfiltered.
+
+REGRESSION_WARNINGS:
+1. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Pre-filtered and joined store_sales to date CTE BEFORE 3-way fact table join, losing optimizer reordering freedom.
+   RULE: This query has only one fact table (catalog_sales) plus optional returns, so safe to pre-join.
+2. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially with fact table.
+3. materialize_cte (0.14x on Q16):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan instead of semi-join short-circuit.
+   RULE: No EXISTS in this query, but avoid materializing optional joins unnecessarily.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+filtered_date → filtered_item → sales_with_dims → sales_with_returns → final_aggregation
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN (CAST('2001-04-02' AS DATE) - INTERVAL 30 DAY) AND (CAST('2001-04-02' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 61
+    CONSUMERS: sales_with_dims
+  filtered_item:
+    FROM: item
+    WHERE: i_current_price BETWEEN 0.99 AND 1.49
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: 6,464
+    CONSUMERS: sales_with_dims
+  sales_with_dims:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN filtered_item ON cs_item_sk = i_item_sk
+    OUTPUT: cs_order_number, cs_item_sk, cs_warehouse_sk, cs_sales_price, d_date, i_item_id
+    EXPECTED_ROWS: 18K
+    CONSUMERS: sales_with_returns
+  sales_with_returns:
+    FROM: sales_with_dims
+    JOIN: LEFT JOIN catalog_returns ON cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk
+    OUTPUT: cs_warehouse_sk, i_item_id, d_date, cs_sales_price, COALESCE(cr_refunded_cash,0) AS cr_refunded_cash
+    EXPECTED_ROWS: 18K
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: sales_with_returns
+    JOIN: INNER JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk
+    GROUP BY: w_state, i_item_id
+    AGGREGATE: SUM(CASE WHEN d_date < CAST('2001-04-02' AS DATE) THEN cs_sales_price - cr_refunded_cash ELSE 0 END) AS sales_before, SUM(CASE WHEN d_date >= CAST('2001-04-02' AS DATE) THEN cs_sales_price - cr_refunded_cash ELSE 0 END) AS sales_after
+    OUTPUT: w_state, i_item_id, sales_before, sales_after
+    EXPECTED_ROWS: 5,419
+    CONSUMERS: output
+EXAMPLES: prefetch_fact_join, date_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply the staged CTE chain (filter date/item → join with catalog_sales → then optional join). Ignore the multi-fact-table aspect (Q63 had store_sales+store_returns).
+- date_cte_isolate: Apply date filtering into separate CTE. Ignore the scalar subquery pattern (Q6 used scalar subquery).
+- early_filter: Apply dimension filtering first. Ignore the reason table filter (Q11 filtered reason table).
+HAZARD_FLAGS:
+- Must include cs_order_number in sales_with_dims output for LEFT JOIN with catalog_returns.
+- COALESCE must be applied after LEFT JOIN to preserve NULL semantics.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+filtered_date → filtered_item → filtered_warehouse → sales_with_all_dims → sales_with_returns → final_aggregation
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN (CAST('2001-04-02' AS DATE) - INTERVAL 30 DAY) AND (CAST('2001-04-02' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 61
+    CONSUMERS: sales_with_all_dims
+  filtered_item:
+    FROM: item
+    WHERE: i_current_price BETWEEN 0.99 AND 1.49
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: 6,464
+    CONSUMERS: sales_with_all_dims
+  filtered_warehouse:
+    FROM: warehouse
+    OUTPUT: w_warehouse_sk, w_state
+    EXPECTED_ROWS: 10
+    CONSUMERS: sales_with_all_dims
+  sales_with_all_dims:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN filtered_item ON cs_item_sk = i_item_sk
+    JOIN: INNER JOIN filtered_warehouse ON cs_warehouse_sk = w_warehouse_sk
+    OUTPUT: cs_order_number, cs_item_sk, cs_sales_price, w_state, i_item_id
+    EXPECTED_ROWS: 18K
+    CONSUMERS: sales_with_returns
+  sales_with_returns:
+    FROM: sales_with_all_dims
+    JOIN: LEFT JOIN catalog_returns ON cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk
+    OUTPUT: w_state, i_item_id, cs_sales_price, COALESCE(cr_refunded_cash,0) AS cr_refunded_cash
+    EXPECTED_ROWS: 18K
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: sales_with_returns
+    GROUP BY: w_state, i_item_id
+    AGGREGATE: SUM(CASE WHEN d_date < CAST('2001-04-02' AS DATE) THEN cs_sales_price - cr_refunded_cash ELSE 0 END) AS sales_before, SUM(CASE WHEN d_date >= CAST('2001-04-02' AS DATE) THEN cs_sales_price - cr_refunded_cash ELSE 0 END) AS sales_after
+    OUTPUT: w_state, i_item_id, sales_before, sales_after
+    EXPECTED_ROWS: 5,419
+    CONSUMERS: output
+EXAMPLES: dimension_cte_isolate, multi_dimension_prefetch, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering of all dimensions into CTEs. Ignore the promotions/demographics filters (Q26 had additional dimensions).
+- multi_dimension_prefetch: Apply parallel dimension filtering (date+item+warehouse). Ignore the store dimension (Q43 had store).
+- shared_dimension_multi_channel: Not applicable (no multi-channel), but use the principle of extracting shared filters.
+HAZARD_FLAGS:
+- Missing d_date in output breaks CASE expressions. Need to add d_date to filtered_date output and propagate through joins.
+- Do NOT cross-join the three dimension CTEs - join them sequentially with catalog_sales.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: early_filter_with_returns_aggregation
+TARGET_LOGICAL_TREE:
+filtered_date → filtered_item → aggregated_returns → sales_with_dims_and_returns → final_aggregation
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN (CAST('2001-04-02' AS DATE) - INTERVAL 30 DAY) AND (CAST('2001-04-02' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 61
+    CONSUMERS: sales_with_dims_and_returns
+  filtered_item:
+    FROM: item
+    WHERE: i_current_price BETWEEN 0.99 AND 1.49
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: 6,464
+    CONSUMERS: sales_with_dims_and_returns
+  aggregated_returns:
+    FROM: catalog_returns
+    GROUP BY: cr_order_number, cr_item_sk
+    AGGREGATE: SUM(cr_refunded_cash) AS cr_refunded_cash
+    OUTPUT: cr_order_number, cr_item_sk, cr_refunded_cash
+    EXPECTED_ROWS: ≤1.4M (potentially less if duplicates)
+    CONSUMERS: sales_with_dims_and_returns
+  sales_with_dims_and_returns:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN filtered_item ON cs_item_sk = i_item_sk
+    JOIN: LEFT JOIN aggregated_returns ON cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk
+    JOIN: INNER JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk
+    OUTPUT: w_state, i_item_id, d_date, cs_sales_price, COALESCE(cr_refunded_cash,0) AS cr_refunded_cash
+    EXPECTED_ROWS: 18K
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: sales_with_dims_and_returns
+    GROUP BY: w_state, i_item_id
+    AGGREGATE: SUM(CASE WHEN d_date < CAST('2001-04-02' AS DATE) THEN cs_sales_price - cr_refunded_cash ELSE 0 END) AS sales_before, SUM(CASE WHEN d_date >= CAST('2001-04-02' AS DATE) THEN cs_sales_price - cr_refunded_cash ELSE 0 END) AS sales_after
+    OUTPUT: w_state, i_item_id, sales_before, sales_after
+    EXPECTED_ROWS: 5,419
+    CONSUMERS: output
+EXAMPLES: single_pass_aggregation, pushdown, early_filter
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply pre-aggregation of catalog_returns to reduce join cardinality. Ignore the multiple subquery consolidation (Q9 had 15 subqueries).
+- pushdown: Push filtering into CTEs. Ignore the scalar subquery consolidation.
+- early_filter: Filter dimensions first. Ignore the reason table filter.
+HAZARD_FLAGS:
+- Pre-aggregating catalog_returns changes semantics if multiple returns per sale exist? Original query would duplicate cs_sales_price. Business assumption: one return per sale. If multiple returns, SUM(cr_refunded_cash) correct but cs_sales_price not duplicated - this is correct semantics.
+- Must verify COALESCE handles NULL from LEFT JOIN after aggregation.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: date_filter_push_to_returns
+TARGET_LOGICAL_TREE:
+filtered_date → filtered_item → returns_with_date → sales_with_filtered_returns → final_aggregation
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN (CAST('2001-04-02' AS DATE) - INTERVAL 30 DAY) AND (CAST('2001-04-02' AS DATE) + INTERVAL 30 DAY)
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 61
+    CONSUMERS: sales_with_filtered_returns, returns_with_date
+  filtered_item:
+    FROM: item
+    WHERE: i_current_price BETWEEN 0.99 AND 1.49
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: 6,464
+    CONSUMERS: sales_with_filtered_returns
+  returns_with_date:
+    FROM: catalog_returns
+    JOIN: INNER JOIN filtered_date ON cr_returned_date_sk = d_date_sk
+    OUTPUT: cr_order_number, cr_item_sk, cr_refunded_cash
+    EXPECTED_ROWS: ≤1.4M (filtered by return date)
+    CONSUMERS: sales_with_filtered_returns
+  sales_with_filtered_returns:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN filtered_item ON cs_item_sk = i_item_sk
+    JOIN: LEFT JOIN returns_with_date ON cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk
+    JOIN: INNER JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk
+    OUTPUT: w_state, i_item_id, d_date, cs_sales_price, COALESCE(cr_refunded_cash,0) AS cr_refunded_cash
+    EXPECTED_ROWS: 18K
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: sales_with_filtered_returns
+    GROUP BY: w_state, i_item_id
+    AGGREGATE: SUM(CASE WHEN d_date < CAST('2001-04-02' AS DATE) THEN cs_sales_price - cr_refunded_cash ELSE 0 END) AS sales_before, SUM(CASE WHEN d_date >= CAST('2001-04-02' AS DATE) THEN cs_sales_price - cr_refunded_cash ELSE 0 END) AS sales_after
+    OUTPUT: w_state, i_item_id, sales_before, sales_after
+    EXPECTED_ROWS: 5,419
+    CONSUMERS: output
+EXAMPLES: multi_date_range_cte, prefetch_fact_join, early_filter
+EXAMPLE_ADAPTATION:
+- multi_date_range_cte: Apply separate date filtering for sales date vs returns date. Ignore the multiple date aliases (Q29 had d1,d2,d3).
+- prefetch_fact_join: Apply staged filtering. Ignore the single date CTE pattern.
+- early_filter: Filter dimensions early. Ignore the reason table.
+HAZARD_FLAGS:
+- Filtering catalog_returns by return date changes semantics! Original query joins on order/item regardless of return date. This may exclude returns outside the ±30 day window, changing results.
+- Must evaluate if business logic allows filtering returns by return date.
+CONSTRAINT_OVERRIDE: SEMANTIC_EQUIVALENCE
+OVERRIDE_REASONING: This strategy intentionally changes semantics to filter returns by return date within the same window as sales. This explores whether the optimizer can leverage return date filtering if business logic permits. The original query doesn't filter returns by date, but real-world returns might occur within similar timeframe.
+EXPLORATION_TYPE: novel_combination

@@ -1,0 +1,384 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Business intent: For month sequence 1221-1232, find store-item pairs whose revenue is at most 10% of that store's average item revenue, with store/item descriptive fields. JOIN semantics: All joins are INNER intersections (store_sales ↔ date_dim, store ↔ store_sales, item ↔ store_sales). Aggregation trap: The per-store average (sb.ave) is AVG over per-store-item revenues; changing row duplication (e.g., from join reordering) would alter the average. Filter dependencies: The date filter (d_month_seq 1221-1232) must be applied identically to both revenue computations; the revenue filter (<= 0.1 * ave) depends on the store-level average.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+date_filter -> fact_with_date -> store_item_revenue -> store_avg -> filtered_pairs -> join_store_item -> top_n
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1221 AND 1221+11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_with_date
+  fact_with_date:
+    FROM: store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_store_sk, ss_item_sk, ss_sales_price
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: store_item_revenue
+  store_item_revenue:
+    FROM: fact_with_date
+    GROUP BY: ss_store_sk, ss_item_sk
+    AGGREGATE: SUM(ss_sales_price) AS revenue
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: 2.7M
+    CONSUMERS: store_avg, filtered_pairs
+  store_avg:
+    FROM: store_item_revenue
+    GROUP BY: ss_store_sk
+    AGGREGATE: AVG(revenue) AS ave
+    OUTPUT: ss_store_sk, ave
+    EXPECTED_ROWS: 52
+    CONSUMERS: filtered_pairs
+  filtered_pairs:
+    FROM: store_item_revenue JOIN store_avg ON store_item_revenue.ss_store_sk = store_avg.ss_store_sk
+    WHERE: revenue <= 0.1 * ave
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: 243K
+    CONSUMERS: join_store_item
+  join_store_item:
+    FROM: filtered_pairs
+          JOIN store ON filtered_pairs.ss_store_sk = store.s_store_sk
+          JOIN item ON filtered_pairs.ss_item_sk = item.i_item_sk
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: 243K
+    CONSUMERS: top_n
+  top_n:
+    FROM: join_store_item
+    ORDER BY: s_store_name ASC, i_item_desc ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+
+NODE_CONTRACTS:
+date_filter:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1221 AND 1221+11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_with_date
+  fact_with_date:
+    FROM: store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_store_sk, ss_item_sk, ss_sales_price
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: store_item_revenue
+  store_item_revenue:
+    FROM: fact_with_date
+    GROUP BY: ss_store_sk, ss_item_sk
+    AGGREGATE: SUM(ss_sales_price) AS revenue
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: 2.7M
+    CONSUMERS: store_avg, filtered_pairs
+  store_avg:
+    FROM: store_item_revenue
+    GROUP BY: ss_store_sk
+    AGGREGATE: AVG(revenue) AS ave
+    OUTPUT: ss_store_sk, ave
+    EXPECTED_ROWS: 52
+    CONSUMERS: filtered_pairs
+  filtered_pairs:
+    FROM: store_item_revenue JOIN store_avg ON store_item_revenue.ss_store_sk = store_avg.ss_store_sk
+    WHERE: revenue <= 0.1 * ave
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: 243K
+    CONSUMERS: join_store_item
+  join_store_item:
+    FROM: filtered_pairs
+          JOIN store ON filtered_pairs.ss_store_sk = store.s_store_sk
+          JOIN item ON filtered_pairs.ss_item_sk = item.i_item_sk
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: 243K
+    CONSUMERS: top_n
+  top_n:
+    FROM: join_store_item
+    ORDER BY: s_store_name ASC, i_item_desc ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+
+## Hazard Flags (avoid these specific risks)
+
+- The date_filter CTE may be inlined by optimizer; still reduces date_dim scans from 2 to 1.
+
+## Regression Warnings (observed failures on similar queries)
+
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline runtime under 100ms, CTE materialization overhead dominated.
+   RULE: This query's baseline is 3281ms, so acceptable.
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Baseline under 50ms, CTE overhead dominated.
+   RULE: This query's baseline is 3281ms, acceptable.
+3. multi_dimension_prefetch (0.85x on Q67):
+   CAUSE: Unfiltered dimension CTEs added overhead.
+   RULE: Ensure every dimension CTE has a WHERE clause (date filter already selective).
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand in original order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced by downstream joins, filters, or output.
+- LITERAL_PRESERVATION: Must preserve literals 1221, 1221+11, 0.1 exactly.
+- SEMANTIC_EQUIVALENCE: Result set must be identical to original (100 rows ordered by s_store_name, i_item_desc).
+- REDUNDANT_SCAN_ELIMINATION: EXPLAIN shows two SEQ_SCAN on store_sales (259.0ms + 250.1ms) for identical date range.
+- CROSS_CTE_PREDICATE_BLINDNESS: Date filter repeated in two subqueries; could be shared.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+prefetch_fact_join: Apply the CTE chain: filter date_dim first, pre-join with store_sales, then aggregate. Ignore the multiple dimension pre-filtering (only date is filtered).
+  date_cte_isolate: Extract date filter into a CTE to share across both revenue computations. Ignore the multi-date-range aspect (only one range).
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. prefetch_fact_join (3.77x)
+
+**Principle:** Staged Join Pipeline: build a CTE chain that progressively reduces data — first CTE filters the dimension, second CTE pre-joins filtered dimension keys with the fact table, subsequent CTEs join remaining dimensions against the already-reduced fact set.
+
+**BEFORE (slow):**
+```sql
+select * 
+from (select i_manager_id
+             ,sum(ss_sales_price) sum_sales
+             ,avg(sum(ss_sales_price)) over (partition by i_manager_id) avg_monthly_sales
+      from item
+          ,store_sales
+          ,date_dim
+          ,store
+      where ss_item_sk = i_item_sk
+        and ss_sold_date_sk = d_date_sk
+        and ss_store_sk = s_store_sk
+        and d_month_seq in (1181,1181+1,1181+2,1181+3,1181+4,1181+5,1181+6,1181+7,1181+8,1181+9,1181+10,1181+11)
+        and ((    i_category in ('Books','Children','Electronics')
+              and i_class in ('personal','portable','reference','self-help')
+              and i_brand in ('scholaramalgamalg #14','scholaramalgamalg #7',
+		                  'exportiunivamalg #9','scholaramalgamalg #9'))
+           or(    i_category in ('Women','Music','Men')
+              and i_class in ('accessories','classical','fragrances','pants')
+              and i_brand in ('amalgimporto #1','edu packscholar #1','exportiimporto #1',
+		                 'importoamalg #1')))
+group by i_manager_id, d_moy) tmp1
+where case when avg_monthly_sales > 0 then abs (sum_sales - avg_monthly_sales) / avg_monthly_sales else null end > 0.1
+order by i_manager_id
+        ,avg_monthly_sales
+        ,sum_sales
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk, d_moy FROM date_dim WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)
+```
+[filtered_sales]:
+```sql
+SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_moy FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+```
+[main_query]:
+```sql
+SELECT * FROM (SELECT i_manager_id, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales FROM item JOIN filtered_sales ON ss_item_sk = i_item_sk JOIN store ON ss_store_sk = s_store_sk WHERE ((i_category IN ('Books', 'Children', 'Electronics') AND i_class IN ('personal', 'portable', 'reference', 'self-help') AND i_brand IN (...)) OR (i_category IN ('Women', 'Music', 'Men') AND i_class IN ('accessories', 'classical', 'fragrances', 'pants') AND i_brand IN (...))) GROUP BY i_manager_id, d_moy) AS tmp1 WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
+```
+
+### 2. date_cte_isolate (4.00x)
+
+**Principle:** Dimension Isolation: extract small dimension lookups into CTEs so they materialize once and subsequent joins probe a tiny hash table instead of rescanning.
+
+**BEFORE (slow):**
+```sql
+select a.ca_state state, count(*) cnt
+ from customer_address a
+     ,customer c
+     ,store_sales s
+     ,date_dim d
+     ,item i
+ where       a.ca_address_sk = c.c_current_addr_sk
+ 	and c.c_customer_sk = s.ss_customer_sk
+ 	and s.ss_sold_date_sk = d.d_date_sk
+ 	and s.ss_item_sk = i.i_item_sk
+ 	and d.d_month_seq = 
+ 	     (select distinct (d_month_seq)
+ 	      from date_dim
+               where d_year = 2002
+ 	        and d_moy = 3 )
+ 	and i.i_current_price > 1.2 * 
+             (select avg(j.i_current_price) 
+ 	     from item j 
+ 	     where j.i_category = i.i_category)
+ group by a.ca_state
+ having count(*) >= 10
+ order by cnt, a.ca_state
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[target_month]:
+```sql
+SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1
+```
+[category_avg_price]:
+```sql
+SELECT i_category, AVG(i_current_price) * 1.2 AS avg_threshold FROM item GROUP BY i_category
+```
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim JOIN target_month ON d_month_seq = target_month.d_month_seq
+```
+[filtered_sales]:
+```sql
+SELECT ss_customer_sk, ss_item_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+```
+[main_query]:
+```sql
+SELECT a.ca_state AS state, COUNT(*) AS cnt FROM customer_address a JOIN customer c ON a.ca_address_sk = c.c_current_addr_sk JOIN filtered_sales s ON c.c_customer_sk = s.ss_customer_sk JOIN item i ON s.ss_item_sk = i.i_item_sk JOIN category_avg_price cap ON i.i_category = cap.i_category WHERE i.i_current_price > cap.avg_threshold GROUP BY a.ca_state HAVING COUNT(*) >= 10 ORDER BY cnt, a.ca_state LIMIT 100
+```
+
+## Original SQL
+
+```sql
+-- start query 65 in stream 0 using template query65.tpl
+select
+	s_store_name,
+	i_item_desc,
+	sc.revenue,
+	i_current_price,
+	i_wholesale_cost,
+	i_brand
+ from store, item,
+     (select ss_store_sk, avg(revenue) as ave
+ 	from
+ 	    (select  ss_store_sk, ss_item_sk, 
+ 		     sum(ss_sales_price) as revenue
+ 		from store_sales, date_dim
+ 		where ss_sold_date_sk = d_date_sk and d_month_seq between 1221 and 1221+11
+ 		group by ss_store_sk, ss_item_sk) sa
+ 	group by ss_store_sk) sb,
+     (select  ss_store_sk, ss_item_sk, sum(ss_sales_price) as revenue
+ 	from store_sales, date_dim
+ 	where ss_sold_date_sk = d_date_sk and d_month_seq between 1221 and 1221+11
+ 	group by ss_store_sk, ss_item_sk) sc
+ where sb.ss_store_sk = sc.ss_store_sk and 
+       sc.revenue <= 0.1 * sb.ave and
+       s_store_sk = sc.ss_store_sk and
+       i_item_sk = sc.ss_item_sk
+ order by s_store_name, i_item_desc
+ LIMIT 100;
+
+-- end query 65 in stream 0 using template query65.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `s_store_name`
+  2. `i_item_desc`
+  3. `revenue`
+  4. `i_current_price`
+  5. `i_wholesale_cost`
+  6. `i_brand`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K  — Compute per-store average item revenue and per-store-item revenue over the same 12-month window, filter low-revenue pairs by the 10% threshold, and join store/item dimensions for output.
+    ├── SCAN (store, item (join), store_sales (join), date_dim (join))
+    ├── JOIN (sb.ss_store_sk = sc.ss_store_sk)
+    ├── JOIN (s_store_sk = sc.ss_store_sk)
+    ├── JOIN (+1 more)
+    ├── FILTER (sc.revenue <= 0.1 * sb.ave)
+    ├── AGG (GROUP BY)
+    ├── SORT (s_store_name ASC, i_item_desc ASC)
+    └── OUTPUT (s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

@@ -1,0 +1,94 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Aggregate store sales by manager and month under the category/class/brand filters, compute manager-level average monthly sales with a window function, and keep rows with >10% relative deviation.
+    ├── [CTE] filtered_date  [+]
+    │   └── SCAN (date_dim)
+    ├── [CTE] joined_fact_date  [+]
+    │   ├── SCAN (store_sales)
+    │   └── JOIN (INNER) filtered_date
+    ├── [CTE] join_item  [+]
+    │   ├── SCAN (joined_fact_date)
+    │   └── JOIN (INNER) item
+    ├── [CTE] join_store  [+]
+    │   ├── SCAN (join_item)
+    │   └── JOIN (INNER) store
+    ├── [CTE] aggregated_sales  [+]
+    │   └── AGG (GROUP BY)
+    ├── [CTE] windowed  [+]
+    │   └── WINDOW (AVG OVER PARTITION BY i_manager_id)
+    ├── FILTER (CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1)
+    ├── SORT (i_manager_id ASC, avg_monthly_sales ASC, sum_sales ASC)
+    └── OUTPUT (*)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Isolate date_dim filter into CTE to enable predicate pushdown", "applied_to": ["filtered_date"]},
+    {"id": "R2", "type": "cte_pipeline", "description": "Implement logical tree as CTE pipeline with exact column contracts", "applied_to": ["joined_fact_date", "join_item", "join_store", "aggregated_sales", "windowed"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_moy FROM date_dim WHERE d_month_seq IN (1181, 1182, 1183, 1184, 1185, 1186, 1187, 1188, 1189, 1190, 1191, 1192)",
+        "interfaces": {"outputs": ["d_date_sk", "d_moy"], "consumes": []}
+      },
+      "joined_fact_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_moy FROM store_sales INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ss_item_sk", "ss_store_sk", "ss_sales_price", "d_moy"], "consumes": ["filtered_date"]}
+      },
+      "join_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_manager_id, ss_store_sk, ss_sales_price, d_moy FROM joined_fact_date INNER JOIN item ON ss_item_sk = i_item_sk WHERE ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN ('scholaramalgamalg #14','scholaramalgamalg #7','exportiunivamalg #9','scholaramalgamalg #9')) OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN ('amalgimporto #1','edu packscholar #1','exportiimporto #1','importoamalg #1')))",
+        "interfaces": {"outputs": ["i_manager_id", "ss_store_sk", "ss_sales_price", "d_moy"], "consumes": ["joined_fact_date"]}
+      },
+      "join_store": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_manager_id, d_moy, ss_sales_price FROM join_item INNER JOIN store ON ss_store_sk = s_store_sk WHERE s_store_sk <= 100",
+        "interfaces": {"outputs": ["i_manager_id", "d_moy", "ss_sales_price"], "consumes": ["join_item"]}
+      },
+      "aggregated_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_manager_id, d_moy, SUM(ss_sales_price) AS sum_sales FROM join_store GROUP BY i_manager_id, d_moy",
+        "interfaces": {"outputs": ["i_manager_id", "d_moy", "sum_sales"], "consumes": ["join_store"]}
+      },
+      "windowed": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_manager_id, sum_sales, AVG(sum_sales) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales, d_moy FROM aggregated_sales",
+        "interfaces": {"outputs": ["i_manager_id", "sum_sales", "avg_monthly_sales", "d_moy"], "consumes": ["aggregated_sales"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_manager_id, sum_sales, avg_monthly_sales FROM windowed WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100",
+        "interfaces": {"outputs": ["i_manager_id", "sum_sales", "avg_monthly_sales"], "consumes": ["windowed"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "joined_fact_date", "join_item", "join_store", "aggregated_sales", "windowed", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), joined_fact_date AS ({joined_fact_date}), join_item AS ({join_item}), join_store AS ({join_store}), aggregated_sales AS ({aggregated_sales}), windowed AS ({windowed}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured original implicit joins into explicit CTE pipeline following target logical tree, isolating date filter first to enable predicate pushdown while preserving exact semantics and defensive division guard.
+
+**Expected speedup**: ~1.5-2x from reduced I/O via earlier filtering and columnar scan optimization.

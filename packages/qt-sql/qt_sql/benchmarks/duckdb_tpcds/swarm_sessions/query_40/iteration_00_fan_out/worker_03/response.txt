@@ -1,0 +1,94 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (multi-CTE structure)
+└── [MAIN] main_query  [!]  — CTE-based rewrite following Target Logical Tree
+    ├── [=] filtered_date  — CTE1: 61 date rows
+    │   ├── SCAN date_dim
+    │   └── FILTER (d_date BETWEEN (CAST('2001-04-02' AS DATE) - INTERVAL 30 DAY) AND (CAST('2001-04-02' AS DATE) + INTERVAL 30 DAY))
+    ├── [=] filtered_item  — CTE2: 6,464 item rows
+    │   ├── SCAN item
+    │   └── FILTER (i_current_price BETWEEN 0.99 AND 1.49)
+    ├── [+] aggregated_returns  — CTE3: pre-aggregated returns by order/item
+    │   ├── SCAN catalog_returns
+    │   ├── GROUP BY (cr_order_number, cr_item_sk)
+    │   └── AGG (SUM(cr_refunded_cash) AS cr_refunded_cash)
+    ├── [+] sales_with_dims_and_returns  — CTE4: join sales with dimensions and returns
+    │   ├── SCAN catalog_sales
+    │   ├── JOIN INNER filtered_date ON cs_sold_date_sk = d_date_sk
+    │   ├── JOIN INNER filtered_item ON cs_item_sk = i_item_sk
+    │   ├── JOIN LEFT aggregated_returns ON cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk
+    │   ├── JOIN INNER warehouse ON cs_warehouse_sk = w_warehouse_sk
+    │   └── PROJECT (w_state, i_item_id, d_date, cs_sales_price, COALESCE(cr_refunded_cash,0))
+    ├── [+] final_aggregation  — CTE5: group by state/item, compute before/after sums
+    │   ├── SCAN sales_with_dims_and_returns
+    │   ├── GROUP BY (w_state, i_item_id)
+    │   └── AGG (sales_before, sales_after via CASE expressions)
+    ├── [=] SORT (w_state, i_item_id)
+    └── [=] OUTPUT (w_state, i_item_id, sales_before, sales_after) with LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "cte_structure", "description": "Decomposed original query into explicit CTEs following target logical tree", "applied_to": ["filtered_date", "filtered_item", "aggregated_returns", "sales_with_dims_and_returns", "final_aggregation"]},
+    {"id": "R2", "type": "single_pass_aggregation", "description": "Pre-aggregated catalog_returns by (order, item) to reduce join cardinality", "applied_to": ["aggregated_returns"]},
+    {"id": "R3", "type": "early_filter", "description": "Filtered dimension tables (date_dim, item) before joining with fact table", "applied_to": ["filtered_date", "filtered_item"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN (CAST('2001-04-02' AS DATE) - INTERVAL 30 DAY) AND (CAST('2001-04-02' AS DATE) + INTERVAL 30 DAY)",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_current_price BETWEEN 0.99 AND 1.49",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "aggregated_returns": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cr_order_number, cr_item_sk, SUM(cr_refunded_cash) AS cr_refunded_cash FROM catalog_returns GROUP BY cr_order_number, cr_item_sk",
+        "interfaces": {"outputs": ["cr_order_number", "cr_item_sk", "cr_refunded_cash"], "consumes": []}
+      },
+      "sales_with_dims_and_returns": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT w.w_state, i.i_item_id, d.d_date, cs.cs_sales_price, COALESCE(ar.cr_refunded_cash, 0) AS cr_refunded_cash FROM catalog_sales cs INNER JOIN filtered_date d ON cs.cs_sold_date_sk = d.d_date_sk INNER JOIN filtered_item i ON cs.cs_item_sk = i.i_item_sk LEFT JOIN aggregated_returns ar ON cs.cs_order_number = ar.cr_order_number AND cs.cs_item_sk = ar.cr_item_sk INNER JOIN warehouse w ON cs.cs_warehouse_sk = w.w_warehouse_sk",
+        "interfaces": {"outputs": ["w_state", "i_item_id", "d_date", "cs_sales_price", "cr_refunded_cash"], "consumes": ["filtered_date", "filtered_item", "aggregated_returns"]}
+      },
+      "final_aggregation": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT w_state, i_item_id, SUM(CASE WHEN d_date < CAST('2001-04-02' AS DATE) THEN cs_sales_price - cr_refunded_cash ELSE 0 END) AS sales_before, SUM(CASE WHEN d_date >= CAST('2001-04-02' AS DATE) THEN cs_sales_price - cr_refunded_cash ELSE 0 END) AS sales_after FROM sales_with_dims_and_returns GROUP BY w_state, i_item_id",
+        "interfaces": {"outputs": ["w_state", "i_item_id", "sales_before", "sales_after"], "consumes": ["sales_with_dims_and_returns"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT w_state, i_item_id, sales_before, sales_after FROM final_aggregation ORDER BY w_state, i_item_id LIMIT 100",
+        "interfaces": {"outputs": ["w_state", "i_item_id", "sales_before", "sales_after"], "consumes": ["final_aggregation"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "aggregated_returns", "sales_with_dims_and_returns", "final_aggregation", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), aggregated_returns AS ({aggregated_returns}), sales_with_dims_and_returns AS ({sales_with_dims_and_returns}), final_aggregation AS ({final_aggregation}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured original query into explicit CTEs matching the Target Logical Tree - filtering dimensions first, pre-aggregating returns, then joining sequentially to catalog_sales. Preserved exact semantics (LEFT JOIN, COALESCE, CASE expressions).
+
+**Expected speedup:** ~2.5-3.5x due to reduced join cardinality (pre-aggregated returns), early dimension filtering, and explicit join ordering that avoids cross-joining dimensions.

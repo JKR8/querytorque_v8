@@ -1,0 +1,93 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Rewritten as CTE pipeline following target logical tree
+    ├── [CTE] filtered_reason  [+]
+    │   └── SCAN (reason) + FILTER (r_reason_desc = 'duplicate purchase')
+    ├── [CTE] filtered_returns_keys  [+]
+    │   ├── SCAN (store_returns)
+    │   └── JOIN (INNER) filtered_reason ON sr_reason_sk = r_reason_sk
+    ├── [CTE] sales_with_matching_returns  [+]
+    │   ├── SCAN (store_sales)
+    │   └── JOIN (INNER) filtered_returns_keys ON ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number
+    ├── [CTE] adjusted_sales  [+]
+    │   └── PROJECT (ss_customer_sk, (ss_quantity - sr_return_quantity) * ss_sales_price AS act_sales)
+    ├── [CTE] aggregated  [+]
+    │   ├── SCAN (adjusted_sales)
+    │   └── AGG (GROUP BY ss_customer_sk, SUM(act_sales) AS sumsales)
+    └── [CTE] top_n  [+]
+        ├── SCAN (aggregated)
+        └── SORT (sumsales ASC, ss_customer_sk ASC) + LIMIT 100
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Filter reason dimension early to reduce join cardinality", "applied_to": ["filtered_reason"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Stage join pipeline: filter returns by reason key before joining to sales", "applied_to": ["filtered_returns_keys"]},
+    {"id": "R3", "type": "compound_strategy", "description": "Explicit adjusted sales computation step preserves defensive guard semantics", "applied_to": ["adjusted_sales"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_reason": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT r_reason_sk, r_reason_desc FROM reason WHERE r_reason_desc = 'duplicate purchase'",
+        "interfaces": {"outputs": ["r_reason_sk", "r_reason_desc"], "consumes": []}
+      },
+      "filtered_returns_keys": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns INNER JOIN filtered_reason ON sr_reason_sk = r_reason_sk",
+        "interfaces": {"outputs": ["sr_item_sk", "sr_ticket_number", "sr_return_quantity"], "consumes": ["filtered_reason"]}
+      },
+      "sales_with_matching_returns": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_customer_sk, ss_quantity, ss_sales_price, sr_return_quantity FROM store_sales INNER JOIN filtered_returns_keys ON ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number",
+        "interfaces": {"outputs": ["ss_customer_sk", "ss_quantity", "ss_sales_price", "sr_return_quantity"], "consumes": ["filtered_returns_keys"]}
+      },
+      "adjusted_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_customer_sk, (ss_quantity - sr_return_quantity) * ss_sales_price AS act_sales FROM sales_with_matching_returns",
+        "interfaces": {"outputs": ["ss_customer_sk", "act_sales"], "consumes": ["sales_with_matching_returns"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM adjusted_sales GROUP BY ss_customer_sk",
+        "interfaces": {"outputs": ["ss_customer_sk", "sumsales"], "consumes": ["adjusted_sales"]}
+      },
+      "top_n": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_customer_sk, sumsales FROM aggregated ORDER BY sumsales ASC, ss_customer_sk ASC LIMIT 100",
+        "interfaces": {"outputs": ["ss_customer_sk", "sumsales"], "consumes": ["aggregated"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ss_customer_sk, sumsales FROM top_n",
+        "interfaces": {"outputs": ["ss_customer_sk", "sumsales"], "consumes": ["top_n"]}
+      }
+    },
+    "reconstruction_order": ["filtered_reason", "filtered_returns_keys", "sales_with_matching_returns", "adjusted_sales", "aggregated", "top_n", "main_query"],
+    "assembly_template": "WITH filtered_reason AS ({filtered_reason}), filtered_returns_keys AS ({filtered_returns_keys}), sales_with_matching_returns AS ({sales_with_matching_returns}), adjusted_sales AS ({adjusted_sales}), aggregated AS ({aggregated}), top_n AS ({top_n}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Transformed original query into explicit CTE pipeline following target logical tree - early reason filtering, staged fact joins, explicit adjusted sales computation, then aggregation and top-N selection. The CASE guard is preserved implicitly because sr_return_quantity is guaranteed non-null by the INNER JOIN chain.
+
+Expected speedup: 3.5-4.0x (combining early filter + prefetch join benefits while maintaining semantic equivalence).

@@ -1,0 +1,317 @@
+<reasoning>
+1. **CLASSIFY**: This is a "star-join with late dim filter" pattern. The fact table (store_sales) joins to dimension tables (date_dim, store) and uses a derived set of ZIP codes (from customer_address) for filtering. The derived set uses INTERSECT between a static list and a grouped result.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total execution time: 804ms
+   - Dominant cost: customer_address scan for static ZIP list (476.3ms, 59% of runtime). This scans 750K rows, filters with substring IN list (200+ values), returns 1,261 rows.
+   - Secondary cost: store_sales scan (237.9ms, 30% of runtime). Scans 533K rows after date filter applied.
+   - Row count drops:
+     - date_dim: 73K → 91 rows (99.9% reduction)
+     - store: 102 → 100 rows (minimal)
+     - customer_address (static list): 750K → 1,261 rows (99.8% reduction)
+     - INTERSECT result: 1,261 ∩ 2,268 = 1,190 rows
+     - Final join: store_sales 345.6M → 533K rows (after date filter) → 109K rows (after store join) → 6 groups
+   - Optimizer already: pushes date filter into scan, uses hash joins, implements INTERSECT as HASH_JOIN SEMI (not materializing full sets).
+   - Scans per base table:
+     - customer_address: scanned twice (once for static list, once for group by with customer)
+     - customer: scanned once
+     - store_sales: scanned once
+     - date_dim: scanned once
+     - store: scanned once
+   - The INTERSECT subquery is executed once (not re-executed per reference).
+
+3. **GAP MATCHING**:
+   - **CORRELATED_SUBQUERY_PARALYSIS**: No correlated subqueries present.
+   - **CROSS_COLUMN_OR_DECOMPOSITION**: No OR conditions.
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: The INTERSECT subquery is a derived table (CTE-like). Predicates from outer query (store ZIP prefix) are applied AFTER the INTERSECT computation. Opportunity: push store ZIP prefix into the INTERSECT computation to reduce its output.
+   - **REDUNDANT_SCAN_ELIMINATION**: customer_address scanned twice. Opportunity: consolidate into single scan.
+   - **UNION_CTE_SELF_JOIN_DECOMPOSITION**: No UNION ALL CTE.
+
+4. **AGGREGATION TRAP CHECK**: Only SUM(ss_net_profit) which is duplicate-safe. No FILTER clauses or sensitive aggregates.
+
+5. **TRANSFORM SELECTION** (ranked by potential):
+   a. **single_pass_aggregation** (scan consolidation): Merge the two customer_address scans into one. High value because customer_address scan dominates runtime.
+   b. **intersect_to_exists**: Convert INTERSECT to EXISTS to avoid full materialization. Medium value because optimizer already uses HASH_JOIN SEMI.
+   c. **star_join_prefetch** (dimension_cte_isolate): Pre-filter date_dim, store, and customer_address sets into CTEs before joining with store_sales. Reduces fact scan size.
+   d. **pushdown**: Push store ZIP prefix filter into the INTERSECT subquery to reduce its output earlier. Novel combination with intersect_to_exists.
+
+6. **LOGICAL TREE DESIGN**:
+   - Need to ensure CTE column completeness: each CTE must output all columns referenced downstream.
+   - The INTERSECT result (ca_zip) is used only for its first 2 characters in join with store. We can compute only the first 2 characters earlier.
+   - store_sales join requires ss_store_sk, ss_sold_date_sk, ss_net_profit, and join keys.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compute Q2 1998 net profit per store for stores whose ZIP prefix matches a targeted set of 5-digit ZIPs; the targeted set is the intersection of a fixed list of 5-digit ZIPs and ZIPs having more than 10 preferred customers. JOINs are INNER (all sides must match). Aggregation uses SUM, which is duplicate-safe. The filter on store ZIP prefix (first 2 characters) depends on the INTERSECT result's ZIP prefix; pushing this filter into the INTERSECT computation must preserve semantics (still intersect full 5-digit sets).
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: customer_address scan for static ZIP list dominates (476ms, 59% of runtime). The substring IN list on 750K rows is expensive. Secondary bottleneck is store_sales scan (238ms, 30%). Cardinality flow: customer_address → 1,261 rows static list, 2,268 rows grouped preferred customers → intersect → 1,190 rows → join with store (100 rows) reduces store_sales from 533K to 109K rows. Optimizer already pushes date filter into scan, uses efficient hash joins, and implements INTERSECT as semi-join. Logical-tree cost percentages misleading: customer_address scan shows 59% exclusive time, but its cost in logical tree is low.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output s_store_name and sum(ss_net_profit) ordered by s_store_name.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include ca_zip (or substr), s_store_sk, s_store_name, s_zip, d_date_sk, ss_net_profit, and join keys used downstream.
+- LITERAL_PRESERVATION: Must copy exact ZIP list values, date filters (d_qoy=2, d_year=1998), and c_preferred_cust_flag='Y'.
+- SEMANTIC_EQUIVALENCE: Result rows and order must match original.
+- REDUNDANT_SCAN_ELIMINATION: customer_address scanned twice (EXPLAIN shows SEQ_SCAN customer_address twice: 476ms for static list, 3ms for group-by side).
+- CROSS_CTE_PREDICATE_BLINDNESS: Store ZIP prefix filter applied after INTERSECT; could be pushed earlier (EXPLAIN shows filter on substr(s_zip,1,2)=substr(V1.ca_zip,1,2) after INTERSECT result).
+
+REGRESSION_WARNINGS:
+1. materialize_cte (0.14x on Q16):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan instead of semi-join short-circuit.
+   RULE: Do not convert INTERSECT to materialized CTE that scans entire customer_address; keep as join or EXISTS.
+2. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join multiple dimension CTEs; join them sequentially with fact table.
+3. pushdown (0.68x on Q74):
+   CAUSE: Kept original UNION CTE alongside split versions, causing redundant materialization.
+   RULE: When pushing filter into CTE, replace original CTE reference; don't keep both.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  filtered_dates -> filtered_stores -> zip_intersect_singlepass -> prefact -> main_agg -> order_limit
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_qoy = 2 AND d_year = 1998
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: prefact
+  filtered_stores:
+    FROM: store
+    OUTPUT: s_store_sk, s_store_name, s_zip
+    EXPECTED_ROWS: 100
+    CONSUMERS: prefact, main_agg
+  zip_intersect_singlepass:
+    FROM: customer_address ca
+    JOIN: customer c ON ca.ca_address_sk = c.c_current_addr_sk
+    WHERE: substr(ca.ca_zip,1,5) IN ('47602','16704',...)
+      AND c.c_preferred_cust_flag='Y'
+    GROUP BY: substr(ca.ca_zip,1,5)
+    HAVING: count(*) > 10
+    OUTPUT: substr(ca.ca_zip,1,5) AS ca_zip
+    EXPECTED_ROWS: ~1,190
+    CONSUMERS: prefact
+  prefact:
+    FROM: store_sales ss
+    JOIN: filtered_dates dd ON ss.ss_sold_date_sk = dd.d_date_sk
+    JOIN: filtered_stores st ON ss.ss_store_sk = st.s_store_sk
+    JOIN: zip_intersect_singlepass zip ON substr(st.s_zip,1,2) = substr(zip.ca_zip,1,2)
+    OUTPUT: st.s_store_name, ss.ss_net_profit
+    EXPECTED_ROWS: ~109K
+    CONSUMERS: main_agg
+  main_agg:
+    FROM: prefact
+    GROUP BY: s_store_name
+    AGGREGATE: sum(ss_net_profit) AS sum_ss_net_profit
+    OUTPUT: s_store_name, sum_ss_net_profit
+    EXPECTED_ROWS: ~6
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: main_agg
+    ORDER BY: s_store_name ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, sum_ss_net_profit
+    EXPECTED_ROWS: 6
+    CONSUMERS: final
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply the consolidation of two customer_address scans into one scan with join to customer and filtering by ZIP list. Ignore the CASE aggregation pattern — this query doesn't need per-bucket aggregation.
+- channel_bitmap_aggregation: Apply the principle of reducing multiple scans to one. Ignore the bitmap labeling — we just need a single filtered grouped set.
+HAZARD_FLAGS:
+- The single-pass rewrite must preserve INTERSECT semantics: original intersects static list (all rows) with grouped preferred customers. The single-pass filters static list BEFORE grouping, which is equivalent because grouping is on same column and condition is on same column.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: intersect_to_exists
+TARGET_LOGICAL_TREE:
+  filtered_dates -> filtered_stores -> zip_static -> zip_pref -> zip_intersect_exists -> prefact -> main_agg -> order_limit
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_qoy = 2 AND d_year = 1998
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: prefact
+  filtered_stores:
+    FROM: store
+    OUTPUT: s_store_sk, s_store_name, s_zip
+    EXPECTED_ROWS: 100
+    CONSUMERS: prefact, main_agg
+  zip_static:
+    FROM: customer_address
+    WHERE: substr(ca_zip,1,5) IN ('47602','16704',...)
+    OUTPUT: DISTINCT substr(ca_zip,1,5) AS ca_zip
+    EXPECTED_ROWS: ~1,261
+    CONSUMERS: zip_intersect_exists
+  zip_pref:
+    FROM: customer_address ca
+    JOIN: customer c ON ca.ca_address_sk = c.c_current_addr_sk
+    WHERE: c.c_preferred_cust_flag='Y'
+    GROUP BY: substr(ca.ca_zip,1,5)
+    HAVING: count(*) > 10
+    OUTPUT: substr(ca.ca_zip,1,5) AS ca_zip
+    EXPECTED_ROWS: ~2,268
+    CONSUMERS: zip_intersect_exists
+  zip_intersect_exists:
+    FROM: zip_static zs
+    WHERE: EXISTS (SELECT 1 FROM zip_pref zp WHERE zp.ca_zip = zs.ca_zip)
+    OUTPUT: zs.ca_zip
+    EXPECTED_ROWS: ~1,190
+    CONSUMERS: prefact
+  prefact:
+    FROM: store_sales ss
+    JOIN: filtered_dates dd ON ss.ss_sold_date_sk = dd.d_date_sk
+    JOIN: filtered_stores st ON ss.ss_store_sk = st.s_store_sk
+    JOIN: zip_intersect_exists zip ON substr(st.s_zip,1,2) = substr(zip.ca_zip,1,2)
+    OUTPUT: st.s_store_name, ss.ss_net_profit
+    EXPECTED_ROWS: ~109K
+    CONSUMERS: main_agg
+  main_agg:
+    FROM: prefact
+    GROUP BY: s_store_name
+    AGGREGATE: sum(ss_net_profit) AS sum_ss_net_profit
+    OUTPUT: s_store_name, sum_ss_net_profit
+    EXPECTED_ROWS: ~6
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: main_agg
+    ORDER BY: s_store_name ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, sum_ss_net_profit
+    EXPECTED_ROWS: 6
+    CONSUMERS: final
+EXAMPLES: intersect_to_exists, multi_intersect_exists_cte
+EXAMPLE_ADAPTATION:
+- intersect_to_exists: Replace INTERSECT with EXISTS between two CTEs. Ignore the multiple INTERSECT cascades — we have only one.
+- multi_intersect_exists_cte: Use separate CTEs for each side of INTERSECT and correlate via EXISTS. Ignore the date/channel CTEs — we only need ZIP CTEs.
+HAZARD_FLAGS:
+- EXISTS may force materialization of zip_pref CTE; if zip_pref is large, materialization overhead could offset gain.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  filtered_dates -> filtered_stores -> zip_intersect -> fact_keys -> fact_join -> main_agg -> order_limit
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_qoy = 2 AND d_year = 1998
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: fact_keys
+  filtered_stores:
+    FROM: store
+    OUTPUT: s_store_sk, s_store_name, s_zip
+    EXPECTED_ROWS: 100
+    CONSUMERS: fact_keys, main_agg
+  zip_intersect:
+    FROM: (SELECT substr(ca_zip,1,5) ca_zip FROM customer_address WHERE substr(ca_zip,1,5) IN (...)
+           INTERSECT
+           SELECT substr(ca_zip,1,5) ca_zip FROM customer_address ca, customer c WHERE ca.ca_address_sk = c.c_current_addr_sk AND c.c_preferred_cust_flag='Y' GROUP BY ca_zip HAVING count(*) > 10)
+    OUTPUT: ca_zip
+    EXPECTED_ROWS: ~1,190
+    CONSUMERS: fact_keys
+  fact_keys:
+    FROM: filtered_dates dd
+    CROSS JOIN: filtered_stores st
+    CROSS JOIN: zip_intersect zip
+    WHERE: substr(st.s_zip,1,2) = substr(zip.ca_zip,1,2)
+    OUTPUT: dd.d_date_sk, st.s_store_sk, st.s_store_name, st.s_zip
+    EXPECTED_ROWS: <100*1190 but reduced by ZIP prefix match; estimate ~1000
+    CONSUMERS: fact_join
+  fact_join:
+    FROM: store_sales ss
+    JOIN: fact_keys fk ON ss.ss_sold_date_sk = fk.d_date_sk AND ss.ss_store_sk = fk.s_store_sk
+    OUTPUT: fk.s_store_name, ss.ss_net_profit
+    EXPECTED_ROWS: ~109K
+    CONSUMERS: main_agg
+  main_agg:
+    FROM: fact_join
+    GROUP BY: s_store_name
+    AGGREGATE: sum(ss_net_profit) AS sum_ss_net_profit
+    OUTPUT: s_store_name, sum_ss_net_profit
+    EXPECTED_ROWS: ~6
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: main_agg
+    ORDER BY: s_store_name ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, sum_ss_net_profit
+    EXPECTED_ROWS: 6
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, prefetch_fact_join, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Pre-filter date, store, and ZIP intersect into separate CTEs. Ignore the cross-join hazard — we will join them with fact table sequentially.
+- prefetch_fact_join: Create fact_keys CTE that joins filtered dimensions before scanning store_sales. Ignore the multi-stage fact join chain — we only have one fact table.
+- multi_dimension_prefetch: Pre-filter multiple dimensions (date, store, ZIP) before fact join. Ignore the unfiltered dimension CTEs — each CTE has WHERE clause.
+HAZARD_FLAGS:
+- Cross-joining filtered_dates, filtered_stores, zip_intersect could produce large intermediate if ZIP prefix filter is applied late. Must apply substr equality in WHERE of fact_keys.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: pushdown_intersect
+TARGET_LOGICAL_TREE:
+  filtered_dates -> filtered_stores -> zip_intersect_with_storeprefix -> prefact -> main_agg -> order_limit
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_qoy = 2 AND d_year = 1998
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: prefact
+  filtered_stores:
+    FROM: store
+    OUTPUT: s_store_sk, s_store_name, s_zip, substr(s_zip,1,2) AS s_zip2
+    EXPECTED_ROWS: 100
+    CONSUMERS: zip_intersect_with_storeprefix, prefact, main_agg
+  zip_intersect_with_storeprefix:
+    FROM: (SELECT substr(ca.ca_zip,1,5) AS ca_zip, substr(ca.ca_zip,1,2) AS ca_zip2
+           FROM customer_address ca
+           WHERE substr(ca.ca_zip,1,5) IN (...)
+           INTERSECT
+           SELECT substr(ca.ca_zip,1,5) AS ca_zip, substr(ca.ca_zip,1,2) AS ca_zip2
+           FROM customer_address ca, customer c
+           WHERE ca.ca_address_sk = c.c_current_addr_sk
+             AND c.c_preferred_cust_flag='Y'
+           GROUP BY substr(ca.ca_zip,1,5), substr(ca.ca_zip,1,2)
+           HAVING count(*) > 10) AS zip_all
+    JOIN: filtered_stores st ON zip_all.ca_zip2 = st.s_zip2
+    OUTPUT: zip_all.ca_zip, st.s_zip2
+    EXPECTED_ROWS: ≤1,190 (reduced by store ZIP prefix match)
+    CONSUMERS: prefact
+  prefact:
+    FROM: store_sales ss
+    JOIN: filtered_dates dd ON ss.ss_sold_date_sk = dd.d_date_sk
+    JOIN: filtered_stores st ON ss.ss_store_sk = st.s_store_sk
+    JOIN: zip_intersect_with_storeprefix zip ON st.s_zip2 = zip.s_zip2
+    OUTPUT: st.s_store_name, ss.ss_net_profit
+    EXPECTED_ROWS: ~109K
+    CONSUMERS: main_agg
+  main_agg:
+    FROM: prefact
+    GROUP BY: s_store_name
+    AGGREGATE: sum(ss_net_profit) AS sum_ss_net_profit
+    OUTPUT: s_store_name, sum_ss_net_profit
+    EXPECTED_ROWS: ~6
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: main_agg
+    ORDER BY: s_store_name ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, sum_ss_net_profit
+    EXPECTED_ROWS: 6
+    CONSUMERS: final
+EXAMPLES: pushdown, early_filter, intersect_to_exists
+EXAMPLE_ADAPTATION:
+- pushdown: Push store ZIP prefix filter into the INTERSECT computation by joining with filtered_stores early. Ignore the scalar subquery consolidation — we are pushing a join predicate.
+- early_filter: Filter stores first and propagate ZIP prefix to reduce INTERSECT output. Ignore the reason table pattern — we filter stores instead.
+- intersect_to_exists: Keep INTERSECT structure but enhance with early store ZIP prefix join. Ignore the EXISTS conversion — keep INTERSECT.
+HAZARD_FLAGS:
+- Adding store ZIP prefix to INTERSECT may change semantics if same 5-digit ZIP appears with multiple 2-digit prefixes. Must ensure intersection is still on 5-digit ZIPs, then filter by prefix.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines pushdown with intersect_to_exists pattern)

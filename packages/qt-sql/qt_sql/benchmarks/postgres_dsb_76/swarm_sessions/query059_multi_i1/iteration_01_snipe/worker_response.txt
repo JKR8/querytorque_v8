@@ -1,0 +1,114 @@
+**<reasoning>**
+
+## 1. DIAGNOSE: Why 1.005x instead of 2.0x?
+
+The execution plan reveals the true bottleneck: **sequential scan on store_sales (2.3M rows)** dominates runtime (~2.8s). Previous attempts didn't address this core issue:
+
+1. **W1's "prefetch"**: Still scans entire store_sales in CTE before filtering by date. The CTE materialization fence prevents pushing `d_month_seq` filter down.
+2. **Comma-join weakness**: Original uses implicit joins (`FROM wss,store,date_dim d`), which PostgreSQL optimizes poorly compared to explicit JOINs.
+3. **Redundant scans**: The CTE `wss` aggregates *all* time (d_week_seq, ss_store_sk) but downstream only needs 2 specific 12-month periods (month_seq 1187-1210). That's 24 months out of ~60 months (5 years) - we're scanning 2.4x more data than needed.
+4. **Materialization overhead**: CTE `wss` is materialized (9,176 rows) but reused - good. However, the real win is reducing the initial fact scan, not optimizing the materialized CTE.
+
+Key insight from execution plan: The store_sales scan (2.3M rows) happens *before* CTE materialization. No previous attempt pushed date filters into that scan.
+
+## 2. IDENTIFY: Unexplored Optimization Angles
+
+Three high-potential angles remain untried:
+
+**A. Push date filter into fact scan** (Critical): The CTE should only aggregate weeks from months 1187-1210 (24 months), not all time. Create a filtered_date CTE with month_seq range, join to store_sales *before* aggregation.
+
+**B. Convert comma-joins to explicit JOINs**: PostgreSQL's cost model works better with explicit JOIN syntax, enabling better join reordering.
+
+**C. Single-pass period computation**: Instead of scanning wss twice (for y and x), compute both periods in one CTE using conditional aggregation on month_seq ranges, then self-join.
+
+**D. Strategic CTE design**: Use MATERIALIZED only where beneficial. Avoid fencing when single-use.
+
+**E. Parallelism tuning**: The fact scan could benefit from parallel workers.
+
+## 3. REWRITE Strategy
+
+Design a 3-CTE approach:
+1. `filtered_date`: dates in month_seq 1187-1210 (24 months)
+2. `filtered_store`: stores in the 8 states
+3. `wss_periods`: single-pass aggregation that tags each week with which period(s) it belongs to (year1: 1187-1198, year2: 1199-1210)
+4. Main query: self-join wss_periods on (store, week offset) with explicit JOINs
+
+This reduces store_sales scan by ~60% (24/60 months) upfront.
+
+</reasoning>
+
+**Modified Logic Tree:**
+```
+[+] filtered_date CTE (month_seq 1187-1210)
+[+] filtered_store CTE (8 states)
+[~] wss CTE → wss_periods CTE:
+    - Joins store_sales with filtered_date (reduces scan)
+    - Joins filtered_store (early filter)
+    - Adds period_flag via CASE on d_month_seq
+    - Aggregates by week, store, period_flag
+[~] Main query:
+    - Convert comma-joins to explicit JOINs
+    - Self-join wss_periods on store_id and week offset
+    - Pivot period_flag columns
+[-] Remove redundant store joins (already in wss_periods)
+```
+
+**Component Payload JSON:**
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pg_dimension_prefetch_star", "description": "Pre-filter date and store dimensions into CTEs for early reduction", "applied_to": ["filtered_date", "filtered_store"]},
+    {"id": "R2", "type": "comma_join_to_explicit", "description": "Convert implicit comma-joins to explicit JOIN syntax", "applied_to": ["wss_periods", "main_query"]},
+    {"id": "R3", "type": "single_pass_aggregation", "description": "Compute both year periods in single aggregation with conditional sums", "applied_to": ["wss_periods"]},
+    {"id": "R4", "type": "early_filter_decorrelate", "description": "Push date and store filters into fact scan before aggregation", "applied_to": ["wss_periods"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_week_seq, d_day_name, d_month_seq FROM date_dim WHERE d_month_seq BETWEEN 1187 AND 1187 + 23",
+        "interfaces": {"outputs": ["d_date_sk", "d_week_seq", "d_day_name", "d_month_seq"]}
+      },
+      "filtered_store": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_sk, s_store_id, s_store_name FROM store WHERE s_state IN ('AR','CO','IA','IL','NC','NY','PA','TX')",
+        "interfaces": {"outputs": ["s_store_sk", "s_store_id", "s_store_name"]}
+      },
+      "wss_periods": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT fd.d_week_seq, fs.s_store_id, fs.s_store_name, CASE WHEN fd.d_month_seq BETWEEN 1187 AND 1187 + 11 THEN 1 ELSE 2 END AS period, SUM(CASE WHEN fd.d_day_name = 'Sunday' THEN ss_sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN fd.d_day_name = 'Monday' THEN ss_sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN fd.d_day_name = 'Tuesday' THEN ss_sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN fd.d_day_name = 'Wednesday' THEN ss_sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN fd.d_day_name = 'Thursday' THEN ss_sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN fd.d_day_name = 'Friday' THEN ss_sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN fd.d_day_name = 'Saturday' THEN ss_sales_price ELSE NULL END) AS sat_sales FROM store_sales ss JOIN filtered_date fd ON fd.d_date_sk = ss.ss_sold_date_sk JOIN filtered_store fs ON fs.s_store_sk = ss.ss_store_sk WHERE ss.ss_sales_price / ss.ss_list_price BETWEEN 57 * 0.01 AND 77 * 0.01 GROUP BY fd.d_week_seq, fs.s_store_id, fs.s_store_name, CASE WHEN fd.d_month_seq BETWEEN 1187 AND 1187 + 11 THEN 1 ELSE 2 END",
+        "interfaces": {"outputs": ["d_week_seq", "s_store_id", "s_store_name", "period", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"], "consumes": ["filtered_date", "filtered_store"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT y.s_store_name AS s_store_name1, y.s_store_id AS s_store_id1, y.d_week_seq AS d_week_seq1, CASE WHEN y.sun_sales > 0 AND x.sun_sales > 0 THEN y.sun_sales / x.sun_sales END, CASE WHEN y.mon_sales > 0 AND x.mon_sales > 0 THEN y.mon_sales / x.mon_sales END, CASE WHEN y.tue_sales > 0 AND x.tue_sales > 0 THEN y.tue_sales / x.tue_sales END, CASE WHEN y.wed_sales > 0 AND x.wed_sales > 0 THEN y.wed_sales / x.wed_sales END, CASE WHEN y.thu_sales > 0 AND x.thu_sales > 0 THEN y.thu_sales / x.thu_sales END, CASE WHEN y.fri_sales > 0 AND x.fri_sales > 0 THEN y.fri_sales / x.fri_sales END, CASE WHEN y.sat_sales > 0 AND x.sat_sales > 0 THEN y.sat_sales / x.sat_sales END FROM wss_periods y JOIN wss_periods x ON y.s_store_id = x.s_store_id AND y.d_week_seq = x.d_week_seq - 52 WHERE y.period = 1 AND x.period = 2 ORDER BY y.s_store_name, y.s_store_id, y.d_week_seq LIMIT 100",
+        "interfaces": {"outputs": ["s_store_name1", "s_store_id1", "d_week_seq1", "sun_sales1/sun_sales2", "mon_sales1/mon_sales2", "tue_sales1/tue_sales2", "wed_sales1/wed_sales2", "thu_sales1/thu_sales2", "fri_sales1/fri_sales2", "sat_sales1/sat_sales2"], "consumes": ["wss_periods"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_store", "wss_periods", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_store AS ({filtered_store}), wss_periods AS ({wss_periods}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL work_mem = '512MB'",
+    "SET LOCAL max_parallel_workers_per_gather = 4",
+    "SET LOCAL parallel_tuple_cost = 0.001",
+    "SET LOCAL parallel_setup_cost = 100"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes:** Pushed date and store filters into early CTEs, converted to explicit JOINs, computed both periods in single aggregation, and added defensive division guards. Reduces fact table scan by ~60% and enables better join planning.
+
+**Expected speedup:** 2.5-3.0x (fact scan reduction + join optimization)

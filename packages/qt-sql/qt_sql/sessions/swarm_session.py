@@ -1329,11 +1329,12 @@ class SwarmSession(OptimizationSession):
         """Run self-directed retry worker: generate candidate, validate, save."""
         t_gen = time.time()
         example_ids = [e.get("id", "?") for e in examples]
+        snipe_worker_id = 4 + snipe_num  # snipe 1 → worker 5, snipe 2 → worker 6, etc.
         candidate = generator.generate_one(
             sql=self.original_sql,
             prompt=retry_prompt,
             examples_used=example_ids,
-            worker_id=5,  # retry worker = worker 5
+            worker_id=snipe_worker_id,
             dialect=self.dialect,
         )
         self._stage(
@@ -1372,7 +1373,7 @@ class SwarmSession(OptimizationSession):
             all_errors = [f"INTERFACE: {w}" for w in candidate.interface_warnings] + all_errors
 
         wr = WorkerResult(
-            worker_id=5,
+            worker_id=snipe_worker_id,
             strategy=strategy,
             examples_used=example_ids,
             optimized_sql=optimized_sql,

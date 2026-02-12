@@ -1,0 +1,276 @@
+<reasoning>
+1. **CLASSIFY**: This is a star-join aggregation query with complex OR conditions across two dimension groups (demographics and address). It's a single fact table (store_sales) joined to 5 dimension tables with conjunctive AND between date filter and two OR groups. No self-joins, no correlated subqueries, no UNION ALL branches, no window functions.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total runtime: 755.6ms
+   - Dominant nodes:
+     * Nested Loop Inner (rows=56K loops=3 time=443.9ms) - 58.7% of total runtime
+     * Hash Join Inner (rows=6,265 loops=3 time=452.2ms) - 59.8% (but overlaps with nested loop)
+   - Key observations:
+     * date_dim scan reduces to 122 rows (good)
+     * store_sales index scan yields 461 rows per date row, but filter removes 13K rows per loop - expensive filtering
+     * OR conditions are evaluated as Join Filters in Nested Loop (lines 13-33) and (lines 34-48)
+     * household_demographics seq scan filters 1440 of 7200 rows
+     * customer_address and customer_demographics use index scans but filter most rows (Rows Removed by Filter: 1)
+     * Fact table scanned once, dimensions each scanned once
+     * Optimizer already pushes date filter and uses index scans
+     * Main bottleneck: Evaluating complex OR conditions as join filters after joining
+
+3. **GAP MATCHING**:
+   - COMMA_JOIN_WEAKNESS: Yes - query uses comma-separated implicit joins
+   - CORRELATED_SUBQUERY_PARALYSIS: No - no correlated subqueries
+   - CROSS_CTE_PREDICATE_BLINDNESS: No - no repeated scans
+   - NON_EQUI_JOIN_INPUT_BLINDNESS: No - all equi-joins
+
+4. **AGGREGATION TRAP CHECK**: Query uses AVG and SUM. No STDDEV_SAMP or grouping-sensitive functions. OR conditions in WHERE clause affect which rows participate in aggregation. Any rewrite must preserve exact row set.
+
+5. **TRANSFORM SELECTION**:
+   a) **pg_dimension_prefetch_star** (3.32x): Pre-filter dimensions, explicit JOINs - attacks comma join weakness
+   b) **star_join_prefetch** + **single_pass_aggregation**: Pre-filter AND consolidate OR evaluation
+   c) **or_to_union** (28.6x avg): Convert OR to UNION ALL - but engine warns against for PostgreSQL
+   d) **scan_consolidation_pivot**: Consolidate OR branches into single scan with CASE
+
+6. **LOGICAL TREE DESIGN**:
+   Need 4 structurally diverse approaches:
+   1. Dimension prefetch with explicit JOINs
+   2. OR-to-UNION ALL (despite warning - but query has ≤3 branches per OR group)
+   3. Single scan with consolidated OR evaluation
+   4. Exploration: Materialized CTE with predicate push-through
+
+Node contracts must include all referenced columns: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost, ss_store_sk, ss_sold_date_sk, ss_hdemo_sk, ss_cdemo_sk, ss_sales_price, ss_addr_sk, ss_net_profit, plus dimension join keys and filter columns.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Compute average sales metrics for store sales in 2001 that match one of three demographic profiles AND one of three address profiles. All joins are INNER - rows must match all joined tables. Aggregates are AVG and SUM which are duplicate-sensitive if joins create duplicates. The OR conditions are independent between demographics and address groups but conjunctive overall - a row must satisfy one branch from each group.
+
+BOTTLENECK_DIAGNOSIS: Scan-bound with expensive OR filter evaluation. The nested loop join between date_dim and store_sales processes 56K rows (461 per date row) with complex OR filters removing 13K rows per loop. OR conditions are evaluated as join filters after dimension joins, preventing early reduction. Optimizer already handles date filtering well via index scan. Logical-tree cost misleading - actual bottleneck is store_sales filter evaluation (443.9ms).
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs 4 aggregate columns
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced in downstream WHERE/ON clauses and final SELECT
+- LITERAL_PRESERVATION: All string/numeric literals in OR conditions must be preserved exactly
+- SEMANTIC_EQUIVALENCE: Must preserve exact row set for AVG/SUM calculation
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated joins (FROM store_sales, store, ...)
+- OR_CONDITION_EVALUATION: OR conditions evaluated as late join filters in EXPLAIN
+
+REGRESSION_WARNINGS:
+1. Splitting OR to UNION ALL (observed 0.21x regression on Q085):
+   CAUSE: PostgreSQL's bitmap index scan handles OR efficiently; splitting loses this optimization
+   RULE: Avoid UNION ALL unless OR branches have mutually exclusive dimension key filters
+2. CTE blocking parallelism (observed 0.5x regression on Q069):
+   CAUSE: Materialized CTEs execute single-threaded, blocking parallel scan
+   RULE: Use non-materialized CTEs or inline subqueries when parallel scan benefits > materialization
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: dimension_prefetch_explicit_joins
+TARGET_LOGICAL_TREE:
+  date_filter -> store_filter -> hdemo_filter -> cdemo_filter -> addr_filter -> fact_join -> aggregation
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_year = 2001
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 122
+    CONSUMERS: fact_join
+  store_filter:
+    FROM: store
+    WHERE: (no filter)
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 102
+    CONSUMERS: fact_join
+  hdemo_filter:
+    FROM: household_demographics
+    WHERE: hd_dep_count IN (1, 3)
+    OUTPUT: hd_demo_sk, hd_dep_count
+    EXPECTED_ROWS: 1440
+    CONSUMERS: fact_join
+  cdemo_filter:
+    FROM: customer_demographics
+    WHERE: (cd_marital_status = 'M' AND cd_education_status = '2 yr Degree') OR (cd_marital_status = 'U' AND cd_education_status = 'College') OR (cd_marital_status = 'S' AND cd_education_status = 'Unknown')
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: unknown (filtered in original)
+    CONSUMERS: fact_join
+  addr_filter:
+    FROM: customer_address
+    WHERE: ca_country = 'United States' AND ca_state IN ('CO', 'NC', 'TX', 'AR', 'NY', 'IA', 'IL')
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: unknown (filtered in original)
+    CONSUMERS: fact_join
+  fact_join:
+    FROM: store_sales
+    JOIN: INNER JOIN date_filter ON ss_sold_date_sk = d_date_sk
+           INNER JOIN store_filter ON ss_store_sk = s_store_sk
+           INNER JOIN hdemo_filter ON ss_hdemo_sk = hd_demo_sk
+           INNER JOIN cdemo_filter ON ss_cdemo_sk = cd_demo_sk
+           INNER JOIN addr_filter ON ss_addr_sk = ca_address_sk
+    WHERE: ((cd_marital_status = 'M' AND cd_education_status = '2 yr Degree' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3) OR
+            (cd_marital_status = 'U' AND cd_education_status = 'College' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1) OR
+            (cd_marital_status = 'S' AND cd_education_status = 'Unknown' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1)) AND
+           ((ca_state IN ('CO', 'NC', 'TX') AND ss_net_profit BETWEEN 100 AND 200) OR
+            (ca_state IN ('AR', 'NY', 'TX') AND ss_net_profit BETWEEN 150 AND 300) OR
+            (ca_state IN ('IA', 'IL', 'NC') AND ss_net_profit BETWEEN 50 AND 250))
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~28 (per EXPLAIN)
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: fact_join
+    AGGREGATE: AVG(ss_quantity), AVG(ss_ext_sales_price), AVG(ss_ext_wholesale_cost), SUM(ss_ext_wholesale_cost)
+    OUTPUT: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering of all dimension tables into CTEs and explicit JOIN syntax; ignore promotion table references
+- pg_date_cte_explicit_join: Apply date CTE isolation and explicit JOIN conversion; ignore single-dimension focus (need all dimensions)
+- early_filter_decorrelate: Apply early filtering in CTE definitions; ignore decorrelation (no correlated subqueries)
+HAZARD_FLAGS:
+- CTE materialization may block parallel execution of store_sales scan
+- Dimension CTEs may be inlined, losing materialization benefit
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: or_consolidation_single_scan
+TARGET_LOGICAL_TREE:
+  filtered_fact -> aggregation
+NODE_CONTRACTS:
+  filtered_fact:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 2001
+           INNER JOIN store ON ss_store_sk = s_store_sk
+           INNER JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk
+           INNER JOIN customer_demographics ON ss_cdemo_sk = cd_demo_sk
+           INNER JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE: ( 
+            ((cd_marital_status = 'M' AND cd_education_status = '2 yr Degree' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3) OR
+             (cd_marital_status = 'U' AND cd_education_status = 'College' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1) OR
+             (cd_marital_status = 'S' AND cd_education_status = 'Unknown' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1))
+            AND
+            ((ca_country = 'United States' AND ca_state IN ('CO', 'NC', 'TX') AND ss_net_profit BETWEEN 100 AND 200) OR
+             (ca_country = 'United States' AND ca_state IN ('AR', 'NY', 'TX') AND ss_net_profit BETWEEN 150 AND 300) OR
+             (ca_country = 'United States' AND ca_state IN ('IA', 'IL', 'NC') AND ss_net_profit BETWEEN 50 AND 250))
+           )
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~28
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: filtered_fact
+    AGGREGATE: AVG(ss_quantity), AVG(ss_ext_sales_price), AVG(ss_ext_wholesale_cost), SUM(ss_ext_wholesale_cost)
+    OUTPUT: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply single scan with consolidated OR evaluation; ignore CASE-based aggregation (we're filtering, not conditional aggregates)
+- channel_bitmap_aggregation: Apply bitmap-friendly OR evaluation; ignore channel-specific partitioning
+HAZARD_FLAGS:
+- Complex WHERE clause may prevent predicate pushdown to dimension tables
+- PostgreSQL may not optimize the AND of two OR groups efficiently
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: or_to_union_structured
+TARGET_LOGICAL_TREE:
+  union_branches -> aggregation
+NODE_CONTRACTS:
+  branch1:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 2001
+           INNER JOIN store ON ss_store_sk = s_store_sk
+           INNER JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk AND hd_dep_count = 3
+           INNER JOIN customer_demographics ON ss_cdemo_sk = cd_demo_sk AND cd_marital_status = 'M' AND cd_education_status = '2 yr Degree'
+           INNER JOIN customer_address ON ss_addr_sk = ca_address_sk AND ca_country = 'United States' AND ca_state IN ('CO', 'NC', 'TX')
+    WHERE: ss_sales_price BETWEEN 100.00 AND 150.00 AND ss_net_profit BETWEEN 100 AND 200
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: unknown
+    CONSUMERS: union_all
+  branch2:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 2001
+           INNER JOIN store ON ss_store_sk = s_store_sk
+           INNER JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk AND hd_dep_count = 1
+           INNER JOIN customer_demographics ON ss_cdemo_sk = cd_demo_sk AND cd_marital_status = 'U' AND cd_education_status = 'College'
+           INNER JOIN customer_address ON ss_addr_sk = ca_address_sk AND ca_country = 'United States' AND ca_state IN ('AR', 'NY', 'TX')
+    WHERE: ss_sales_price BETWEEN 50.00 AND 100.00 AND ss_net_profit BETWEEN 150 AND 300
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: unknown
+    CONSUMERS: union_all
+  branch3:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 2001
+           INNER JOIN store ON ss_store_sk = s_store_sk
+           INNER JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk AND hd_dep_count = 1
+           INNER JOIN customer_demographics ON ss_cdemo_sk = cd_demo_sk AND cd_marital_status = 'S' AND cd_education_status = 'Unknown'
+           INNER JOIN customer_address ON ss_addr_sk = ca_address_sk AND ca_country = 'United States' AND ca_state IN ('IA', 'IL', 'NC')
+    WHERE: ss_sales_price BETWEEN 150.00 AND 200.00 AND ss_net_profit BETWEEN 50 AND 250
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: unknown
+    CONSUMERS: union_all
+  union_all:
+    FROM: branch1 UNION ALL branch2 UNION ALL branch3
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~28
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: union_all
+    AGGREGATE: AVG(ss_quantity), AVG(ss_ext_sales_price), AVG(ss_ext_wholesale_cost), SUM(ss_ext_wholesale_cost)
+    OUTPUT: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: or_to_union, union_cte_split
+EXAMPLE_ADAPTATION:
+- or_to_union: Apply OR-to-UNION ALL transformation; ignore branch count limit (we have exactly 3 OR branches that are conjunctive)
+- union_cte_split: Apply separate UNION branches; ignore self-join elimination aspect
+HAZARD_FLAGS:
+- PostgreSQL bitmap index scan may handle OR better than UNION ALL
+- 9 possible combos (3 demo × 3 addr) but only 3 are valid per original logic
+- Must ensure UNION ALL doesn't create duplicates where original OR would not
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: materialized_fact_predicate_pushthrough
+TARGET_LOGICAL_TREE:
+  fact_materialized -> dimension_joins -> aggregation
+NODE_CONTRACTS:
+  fact_materialized:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 2001
+    WHERE: (ss_sales_price BETWEEN 100.00 AND 150.00 OR ss_sales_price BETWEEN 50.00 AND 100.00 OR ss_sales_price BETWEEN 150.00 AND 200.00)
+           AND
+           (ss_net_profit BETWEEN 100 AND 200 OR ss_net_profit BETWEEN 150 AND 300 OR ss_net_profit BETWEEN 50 AND 250)
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost, ss_store_sk, ss_hdemo_sk, ss_cdemo_sk, ss_addr_sk, ss_sales_price, ss_net_profit
+    EXPECTED_ROWS: reduced from 56K (pushes fact filters early)
+    CONSUMERS: dimension_joins
+  dimension_joins:
+    FROM: fact_materialized
+    JOIN: INNER JOIN store ON ss_store_sk = s_store_sk
+           INNER JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk
+           INNER JOIN customer_demographics ON ss_cdemo_sk = cd_demo_sk
+           INNER JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE: ((cd_marital_status = 'M' AND cd_education_status = '2 yr Degree' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3) OR
+            (cd_marital_status = 'U' AND cd_education_status = 'College' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1) OR
+            (cd_marital_status = 'S' AND cd_education_status = 'Unknown' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1)) AND
+           ((ca_country = 'United States' AND ca_state IN ('CO', 'NC', 'TX') AND ss_net_profit BETWEEN 100 AND 200) OR
+            (ca_country = 'United States' AND ca_state IN ('AR', 'NY', 'TX') AND ss_net_profit BETWEEN 150 AND 300) OR
+            (ca_country = 'United States' AND ca_state IN ('IA', 'IL', 'NC') AND ss_net_profit BETWEEN 50 AND 250))
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~28
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: dimension_joins
+    AGGREGATE: AVG(ss_quantity), AVG(ss_ext_sales_price), AVG(ss_ext_wholesale_cost), SUM(ss_ext_wholesale_cost)
+    OUTPUT: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: pg_materialized_dimension_fact_prefilter, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED CTE for fact table with early filters; ignore non-equi joins (we have equi joins)
+- early_filter_decorrelate: Apply early fact filtering; ignore decorrelation (no correlated subqueries)
+HAZARD_FLAGS:
+- MATERIALIZED CTE blocks parallel execution
+- Early fact filters may be less selective without dimension predicates
+- PostgreSQL may inline non-materialized CTE
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines early fact filtering with materialization)

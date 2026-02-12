@@ -1,0 +1,106 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~660K
+    ├── WITH (CTEs)
+    │   ├── [+] consolidated_customer (CTE)
+    │   │   ├── SCAN (customer JOIN customer_demographics JOIN household_demographics JOIN customer_address)
+    │   │   └── FILTER (ca_state IN ('AZ','KS','OH','TX','WA'))
+    │   │
+    │   ├── [+] filtered_item (CTE)
+    │   │   ├── SCAN (item)
+    │   │   └── FILTER (i_category IN ('Children','Jewelry','Men') AND i_manager_id IN (21,22,38,39,46,47,66,67,74,93))
+    │   │
+    │   ├── [+] filtered_web_sales (CTE)
+    │   │   ├── SCAN (web_sales)
+    │   │   └── FILTER (ws_wholesale_cost BETWEEN 35 AND 55)
+    │   │
+    │   ├── [+] filtered_store_sales (CTE)
+    │   │   └── SCAN (store_sales)
+    │   │
+    │   └── [+] joined (CTE)
+    │       ├── JOIN (filtered_web_sales JOIN filtered_item JOIN consolidated_customer JOIN date_dim d1 JOIN date_dim d2 JOIN filtered_store_sales JOIN inventory JOIN warehouse JOIN store)
+    │       └── FILTER (d1.d_year = 2001 AND d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '30 DAY') AND inv_quantity_on_hand >= ss_quantity)
+    │
+    ├── [+] aggregation (CTE)
+    │   └── AGG (GROUP BY cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, COUNT(*) as cnt)
+    │
+    └── [+] sort (final SELECT)
+        └── SORT (cnt ASC)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql-16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pushdown", "description": "Push customer-related joins and filters into consolidated_customer CTE", "applied_to": ["consolidated_customer"]},
+    {"id": "R2", "type": "pushdown", "description": "Push item filters into filtered_item CTE", "applied_to": ["filtered_item"]},
+    {"id": "R3", "type": "pushdown", "description": "Push web_sales filter into filtered_web_sales CTE", "applied_to": ["filtered_web_sales"]},
+    {"id": "R4", "type": "early_filter_decorrelate", "description": "Extract store_sales scan into filtered_store_sales CTE without filtering to preserve join semantics", "applied_to": ["filtered_store_sales"]},
+    {"id": "R5", "type": "structured_joins", "description": "Convert comma joins to explicit JOINs in joined CTE", "applied_to": ["joined"]},
+    {"id": "R6", "type": "cte_materialization", "description": "Separate aggregation and sort into distinct CTE layers", "applied_to": ["aggregation", "sort"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "consolidated_customer": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_customer_sk, cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count FROM customer JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE ca_state IN ('AZ', 'KS', 'OH', 'TX', 'WA')",
+        "interfaces": {"outputs": ["c_customer_sk", "cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk FROM item WHERE i_category IN ('Children', 'Jewelry', 'Men') AND i_manager_id IN (21, 22, 38, 39, 46, 47, 66, 67, 74, 93)",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "filtered_web_sales": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk, ws_warehouse_sk FROM web_sales WHERE ws_wholesale_cost BETWEEN 35 AND 55",
+        "interfaces": {"outputs": ["ws_item_sk", "ws_bill_customer_sk", "ws_sold_date_sk", "ws_warehouse_sk"], "consumes": []}
+      },
+      "filtered_store_sales": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_item_sk, ss_customer_sk, ss_sold_date_sk, ss_quantity FROM store_sales",
+        "interfaces": {"outputs": ["ss_item_sk", "ss_customer_sk", "ss_sold_date_sk", "ss_quantity"], "consumes": []}
+      },
+      "joined": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count FROM filtered_web_sales ws JOIN filtered_item i ON ws.ws_item_sk = i.i_item_sk JOIN consolidated_customer cc ON ws.ws_bill_customer_sk = cc.c_customer_sk JOIN filtered_store_sales ss ON ss.ss_item_sk = ws.ws_item_sk AND ss.ss_customer_sk = cc.c_customer_sk JOIN date_dim d1 ON ss.ss_sold_date_sk = d1.d_date_sk JOIN date_dim d2 ON ws.ws_sold_date_sk = d2.d_date_sk JOIN inventory inv ON inv.inv_item_sk = ss.ss_item_sk AND inv.inv_date_sk = ss.ss_sold_date_sk AND inv.inv_warehouse_sk = ws.ws_warehouse_sk JOIN warehouse w ON ws.ws_warehouse_sk = w.w_warehouse_sk JOIN store s ON s.s_state = w.w_state WHERE d1.d_year = 2001 AND d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '30 DAY') AND inv.inv_quantity_on_hand >= ss.ss_quantity",
+        "interfaces": {"outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count"], "consumes": ["consolidated_customer", "filtered_item", "filtered_web_sales", "filtered_store_sales"]}
+      },
+      "aggregation": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, COUNT(*) AS cnt FROM joined GROUP BY cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count",
+        "interfaces": {"outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count", "cnt"], "consumes": ["joined"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, cnt FROM aggregation ORDER BY cnt",
+        "interfaces": {"outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count", "cnt"], "consumes": ["aggregation"]}
+      }
+    },
+    "reconstruction_order": ["consolidated_customer", "filtered_item", "filtered_web_sales", "filtered_store_sales", "joined", "aggregation", "main_query"],
+    "assembly_template": "WITH consolidated_customer AS ({{consolidated_customer}}), filtered_item AS ({{filtered_item}}), filtered_web_sales AS ({{filtered_web_sales}}), filtered_store_sales AS ({{filtered_store_sales}}), joined AS ({{joined}}), aggregation AS ({{aggregation}}) {{main_query}}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured the original comma-joined query into a CTE pipeline that matches the target logical tree. Each CTE performs early filtering on its respective dimension table, while preserving the join semantics and non-equi date correlation exactly as in the original. The store_sales CTE remains unfiltered to avoid premature reduction that could affect the date range join.
+
+**Expected speedup**: ~1.13x from early filtering of customer, item, and web_sales tables, plus better join estimation from explicit JOIN syntax, while maintaining semantic equivalence through proper CTE outputs and join condition preservation.

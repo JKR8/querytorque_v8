@@ -1,0 +1,253 @@
+<reasoning>
+1. **CLASSIFY**: This is a multi-channel UNION ALL query with star-joins (fact tables joined to dimensions) and aggregation. Both web_sales and catalog_sales are joined to the same set of dimension tables (warehouse, date_dim, time_dim, ship_mode) with identical filters. The union results are aggregated again in an outer query.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total execution time: 768ms.
+   - Biggest time consumers (exclusive ms):
+     - SEQ_SCAN web_sales: 259.7ms (34%), scanning 193K of 86.4M rows.
+     - SEQ_SCAN catalog_sales: 334.3ms (44%), scanning 384K of 172.8M rows.
+     - HASH_JOIN web_sales + date_dim: 26.5ms (3%).
+     - HASH_JOIN catalog_sales + date_dim: 6.3ms.
+   - Row count drops:
+     - date_dim: 365 rows from 73K after filter d_year=1998.
+     - time_dim: 29K rows from 86K after time range filter.
+     - ship_mode: 2 rows from 20 after carrier filter.
+     - Fact tables: web_sales 193K rows (0.22% of table), catalog_sales 384K rows (0.22%).
+   - The optimizer already pushes filters into dimension scans (INTRA_SCAN_PREDICATE_PUSHDOWN). It uses hash joins and does NOT split the UNION CTE.
+   - Each fact table is scanned once per channel (total 2 scans). The same dimension tables are scanned twice (once per UNION branch).
+   - The UNION CTE is referenced once, so it's likely inlined (CTE_INLINING). No materialization benefit.
+
+3. **GAP MATCHING**:
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: The same dimension filters (date_dim, time_dim, ship_mode) are applied independently in each UNION branch. The optimizer doesn't share these filtered dimension sets across branches → each branch re-scans the dimension tables. Opportunity: extract filtered dimensions into shared CTEs.
+   - **REDUNDANT_SCAN_ELIMINATION**: The fact tables are scanned only once each, but the dimension tables are scanned twice. Opportunity: reduce dimension scans from 2 to 1.
+   - **UNION_CTE_SELF_JOIN_DECOMPOSITION**: The UNION CTE is generic (same structure for both channels). Not scanned multiple times with different filters, so splitting not needed.
+   - Engine strengths already handle: predicate pushdown into scans, hash join selection, same-column OR (sm_carrier IN uses single scan). No correlated subqueries, no INTERSECT, no window functions.
+
+4. **AGGREGATION TRAP CHECK**: All aggregates are SUM with CASE expressions. The inner aggregates are at warehouse+year level, outer aggregates sum over UNION (same grouping). No STDDEV_SAMP/VARIANCE. No FILTER clauses. Restructuring that preserves the same rows per warehouse+year group is safe.
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   a. **Shared Dimension CTE** (shared_dimension_multi_channel): Extract filtered date_dim, time_dim, ship_mode into a single CTE, reuse in both UNION branches. Reduces dimension scans from 2→1.
+   b. **Prefetch Fact Join** (prefetch_fact_join): Build a CTE chain: filtered dimensions → join with fact table → then join warehouse. Reduces fact table probe size by pre-joining with filtered dimensions.
+   c. **Single Pass Aggregation** (single_pass_aggregation): Consolidate the two UNION branches into a single scan per fact table? Not applicable because web_sales and catalog_sales are separate tables. However, we can consolidate dimension scans.
+   d. **Dimension CTE Isolate** (dimension_cte_isolate): Pre-filter each dimension table into separate CTEs, then join with fact tables. Similar to (a) but more granular.
+   e. **Early Filter** (early_filter): Filter dimension tables first, then join to fact tables. The optimizer already does this, but we can enforce order via CTEs.
+
+6. **LOGICAL TREE DESIGN**:
+   - Need to ensure column completeness: each CTE must output all columns needed downstream (warehouse columns, fact aggregates, dimension keys).
+   - Shared CTEs should be referenced multiple times to justify materialization.
+
+Selected 4 strategies (structurally diverse):
+1. Worker 1: **Shared Dimension CTE** - extract filtered dimensions into a common CTE reused in both UNION branches.
+2. Worker 2: **Prefetch Fact Join** - staged CTE chain: filtered dimensions → fact join → warehouse join → aggregation.
+3. Worker 3: **Dimension CTE Isolate** - pre-filter each dimension table into separate CTEs, then join with fact and warehouse.
+4. Worker 4 (Exploration): **Compound Strategy: Shared Dimension + Prefetch + Late Attribute Binding** - combine shared dimensions, push aggregation below warehouse join (safe because warehouse is one-to-one), and defer non-filtering dimension columns (time_dim, ship_mode) until after aggregation.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Summarize 1998 warehouse monthly sales and net paid amounts (plus per-square-foot metrics) for shipments handled by carriers GREAT EASTERN or LATVIAN during a target time-of-day window, combining web and catalog channels. All joins are INNER (intersection), requiring matches in all dimension tables. Aggregation uses SUM with CASE expressions, which are duplicate-safe. Filters on date_dim (d_year=1998), time_dim (t_time range), and ship_mode (sm_carrier IN) must be preserved in each channel branch; missing any breaks equivalence.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: 78% of execution time (259.7ms+334.3ms) is spent on full sequential scans of web_sales and catalog_sales, reading 0.22% of rows each. Row counts drop sharply after dimension joins (193K/384K fact rows → 64K/128K after time join). The optimizer already pushes predicates into dimension scans and picks hash joins efficiently. Logical-tree cost percentages are misleading—EXPLAIN shows fact scans dominate, not joins.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output all 33 columns (w_warehouse_name through dec_net) in original order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (warehouse attributes, fact aggregates, dimension keys).
+- LITERAL_PRESERVATION: Must copy exact literals: d_year=1998, t_time between 48821 and 48821+28800, sm_carrier IN ('GREAT EASTERN','LATVIAN').
+- SEMANTIC_EQUIVALENCE: Must return same rows as original union-aggregate.
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows date_dim, time_dim, ship_mode scanned twice (once per UNION branch)—predicates not shared across branches.
+- REDUNDANT_SCAN_ELIMINATION: Dimension tables scanned twice; opportunity to reduce to one scan via shared CTE.
+
+REGRESSION_WARNINGS:
+1. materialize_cte (0.14x on Q16):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan instead of semi-join short-circuit.
+   RULE: Do not convert EXISTS/NOT EXISTS to CTEs; this query has none.
+2. or_to_union (0.59x on Q90):
+   CAUSE: Split same-column OR (time range) into UNION branches, duplicating fact scans.
+   RULE: Do not split t_time BETWEEN; it's a single-column range handled efficiently.
+3. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially with fact table.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: shared_dimension_multi_channel
+TARGET_LOGICAL_TREE:
+filtered_dims CTE -> web_branch CTE -> catalog_branch CTE -> union CTE -> main_agg
+NODE_CONTRACTS:
+  filtered_dims:
+    FROM: date_dim, time_dim, ship_mode
+    JOIN: none (cross join acceptable because filters independent)
+    WHERE: d_year=1998 AND t_time BETWEEN 48821 AND 48821+28800 AND sm_carrier IN ('GREAT EASTERN','LATVIAN')
+    OUTPUT: d_date_sk, d_year, t_time_sk, sm_ship_mode_sk
+    EXPECTED_ROWS: ~365 * 29K * 2 = ~21M combinations (but filtered by join with fact later)
+    CONSUMERS: web_branch, catalog_branch
+  web_branch:
+    FROM: web_sales, filtered_dims, warehouse
+    JOIN: ws_sold_date_sk = d_date_sk AND ws_sold_time_sk = t_time_sk AND ws_ship_mode_sk = sm_ship_mode_sk AND ws_warehouse_sk = w_warehouse_sk
+    WHERE: none (filters already in filtered_dims)
+    GROUP BY: w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country, d_year
+    AGGREGATE: SUM(CASE d_moy=1 THEN ws_ext_sales_price*ws_quantity ELSE 0 END) AS jan_sales, ... (all 24 aggregates)
+    OUTPUT: w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country, d_year, jan_sales, feb_sales, ..., dec_net
+    EXPECTED_ROWS: 10 (same as original group by)
+    CONSUMERS: union CTE
+  catalog_branch:
+    FROM: catalog_sales, filtered_dims, warehouse
+    JOIN: cs_sold_date_sk = d_date_sk AND cs_sold_time_sk = t_time_sk AND cs_ship_mode_sk = sm_ship_mode_sk AND cs_warehouse_sk = w_warehouse_sk
+    WHERE: none
+    GROUP BY: same as web_branch
+    AGGREGATE: SUM(CASE d_moy=1 THEN cs_ext_list_price*cs_quantity ELSE 0 END) AS jan_sales, ...
+    OUTPUT: same as web_branch plus d_year
+    EXPECTED_ROWS: 10
+    CONSUMERS: union CTE
+  union CTE:
+    FROM: web_branch UNION ALL catalog_branch
+    OUTPUT: all columns from web_branch
+    EXPECTED_ROWS: 20
+    CONSUMERS: main_agg
+EXAMPLES: shared_dimension_multi_channel, date_cte_isolate, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- shared_dimension_multi_channel: Apply the pattern of extracting shared date/time/ship_mode filters into a single CTE reused by both channel CTEs. Ignore the item/promotion filters—this query only has date/time/ship_mode.
+- date_cte_isolate: Apply isolating date_dim filter into a CTE, but combine with time and ship_mode.
+- dimension_cte_isolate: Apply pre-filtering each dimension, but combine them into one CTE to avoid cross-join.
+HAZARD_FLAGS:
+- filtered_dims CTE cross-joins three small tables—could produce large intermediate if not filtered by fact join.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+filtered_dims CTE -> web_fact CTE -> catalog_fact CTE -> web_agg CTE -> catalog_agg CTE -> union CTE -> main_agg
+NODE_CONTRACTS:
+  filtered_dims:
+    FROM: date_dim, time_dim, ship_mode
+    WHERE: d_year=1998 AND t_time BETWEEN 48821 AND 48821+28800 AND sm_carrier IN ('GREAT EASTERN','LATVIAN')
+    OUTPUT: d_date_sk, t_time_sk, sm_ship_mode_sk
+    EXPECTED_ROWS: ~21M combinations (filtered later)
+    CONSUMERS: web_fact, catalog_fact
+  web_fact:
+    FROM: web_sales JOIN filtered_dims ON ws_sold_date_sk = d_date_sk AND ws_sold_time_sk = t_time_sk AND ws_ship_mode_sk = sm_ship_mode_sk
+    OUTPUT: ws_warehouse_sk, ws_ext_sales_price, ws_quantity, ws_net_paid_inc_ship_tax, d_moy
+    EXPECTED_ROWS: 64K (from EXPLAIN)
+    CONSUMERS: web_agg
+  catalog_fact:
+    FROM: catalog_sales JOIN filtered_dims ON cs_sold_date_sk = d_date_sk AND cs_sold_time_sk = t_time_sk AND cs_ship_mode_sk = sm_ship_mode_sk
+    OUTPUT: cs_warehouse_sk, cs_ext_list_price, cs_quantity, cs_net_paid_inc_ship_tax, d_moy
+    EXPECTED_ROWS: 128K
+    CONSUMERS: catalog_agg
+  web_agg:
+    FROM: web_fact JOIN warehouse ON ws_warehouse_sk = w_warehouse_sk
+    GROUP BY: w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country
+    AGGREGATE: SUM(CASE d_moy=1 THEN ws_ext_sales_price*ws_quantity ELSE 0 END) AS jan_sales, ...
+    OUTPUT: w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country, jan_sales, ..., dec_net
+    EXPECTED_ROWS: 10
+    CONSUMERS: union CTE
+  catalog_agg:
+    FROM: catalog_fact JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk
+    GROUP BY: same as web_agg
+    AGGREGATE: SUM(CASE d_moy=1 THEN cs_ext_list_price*cs_quantity ELSE 0 END) AS jan_sales, ...
+    OUTPUT: same as web_agg
+    EXPECTED_ROWS: 10
+    CONSUMERS: union CTE
+EXAMPLES: prefetch_fact_join, multi_dimension_prefetch, early_filter
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply staged CTE chain: filter dimensions, pre-join with fact table, then join warehouse and aggregate. Ignore the multi-table join complexity—this query has only warehouse after fact.
+- multi_dimension_prefetch: Apply pre-filtering multiple dimensions (date, time, ship_mode) into a single CTE before fact join. Ignore store dimension—use warehouse.
+- early_filter: Apply filtering dimension tables first, then join to fact tables. Use CTEs to enforce order.
+HAZARD_FLAGS:
+- web_fact and catalog_fact CTEs lose d_year column; need to add d_year to output for outer grouping (or derive from filtered_dims).
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+date_cte, time_cte, ship_cte -> web_branch CTE -> catalog_branch CTE -> union CTE -> main_agg
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year=1998
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: 365
+    CONSUMERS: web_branch, catalog_branch
+  time_cte:
+    FROM: time_dim
+    WHERE: t_time BETWEEN 48821 AND 48821+28800
+    OUTPUT: t_time_sk
+    EXPECTED_ROWS: 29K
+    CONSUMERS: web_branch, catalog_branch
+  ship_cte:
+    FROM: ship_mode
+    WHERE: sm_carrier IN ('GREAT EASTERN','LATVIAN')
+    OUTPUT: sm_ship_mode_sk
+    EXPECTED_ROWS: 2
+    CONSUMERS: web_branch, catalog_branch
+  web_branch:
+    FROM: web_sales, warehouse, date_cte, time_cte, ship_cte
+    JOIN: ws_warehouse_sk = w_warehouse_sk AND ws_sold_date_sk = d_date_sk AND ws_sold_time_sk = t_time_sk AND ws_ship_mode_sk = sm_ship_mode_sk
+    GROUP BY: w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country, d_year
+    AGGREGATE: same as original web branch
+    OUTPUT: w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country, d_year, jan_sales, ..., dec_net
+    EXPECTED_ROWS: 10
+    CONSUMERS: union CTE
+  catalog_branch:
+    FROM: catalog_sales, warehouse, date_cte, time_cte, ship_cte
+    JOIN: cs_warehouse_sk = w_warehouse_sk AND cs_sold_date_sk = d_date_sk AND cs_sold_time_sk = t_time_sk AND cs_ship_mode_sk = sm_ship_mode_sk
+    GROUP BY: same as web_branch
+    AGGREGATE: same as original catalog branch
+    OUTPUT: same as web_branch
+    EXPECTED_ROWS: 10
+    CONSUMERS: union CTE
+EXAMPLES: dimension_cte_isolate, date_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering each dimension table into separate CTEs. Ignore cross-joining them; join them sequentially with fact table.
+- date_cte_isolate: Apply isolating date_dim filter, but also isolate time and ship_mode.
+- early_filter: Apply filter dimension tables first, using CTEs.
+HAZARD_FLAGS:
+- Joining three dimension CTEs directly with fact table may produce a large intermediate if not optimized (but each CTE is small).
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: compound_shared_prefetch_late_binding
+TARGET_LOGICAL_TREE:
+filtered_dims CTE -> web_fact_agg CTE -> catalog_fact_agg CTE -> web_final CTE -> catalog_final CTE -> union CTE -> main_agg
+NODE_CONTRACTS:
+  filtered_dims:
+    FROM: date_dim, time_dim, ship_mode
+    WHERE: d_year=1998 AND t_time BETWEEN 48821 AND 48821+28800 AND sm_carrier IN ('GREAT EASTERN','LATVIAN')
+    OUTPUT: d_date_sk, d_year, t_time_sk, sm_ship_mode_sk
+    EXPECTED_ROWS: ~21M combinations
+    CONSUMERS: web_fact_agg, catalog_fact_agg
+  web_fact_agg:
+    FROM: web_sales JOIN filtered_dims ON ws_sold_date_sk = d_date_sk AND ws_sold_time_sk = t_time_sk AND ws_ship_mode_sk = sm_ship_mode_sk
+    GROUP BY: ws_warehouse_sk, d_year
+    AGGREGATE: SUM(CASE d_moy=1 THEN ws_ext_sales_price*ws_quantity ELSE 0 END) AS jan_sales, ... (all 24 aggregates)
+    OUTPUT: ws_warehouse_sk, d_year, jan_sales, ..., dec_net
+    EXPECTED_ROWS: ~10 (group by warehouse_sk + year)
+    CONSUMERS: web_final
+  catalog_fact_agg:
+    FROM: catalog_sales JOIN filtered_dims ON cs_sold_date_sk = d_date_sk AND cs_sold_time_sk = t_time_sk AND cs_ship_mode_sk = sm_ship_mode_sk
+    GROUP BY: cs_warehouse_sk, d_year
+    AGGREGATE: SUM(CASE d_moy=1 THEN cs_ext_list_price*cs_quantity ELSE 0 END) AS jan_sales, ...
+    OUTPUT: cs_warehouse_sk, d_year, jan_sales, ..., dec_net
+    EXPECTED_ROWS: ~10
+    CONSUMERS: catalog_final
+  web_final:
+    FROM: web_fact_agg JOIN warehouse ON ws_warehouse_sk = w_warehouse_sk
+    OUTPUT: w_warehouse_name, w_warehouse_sq_ft, w_city, w_county, w_state, w_country, d_year, jan_sales, ..., dec_net
+    EXPECTED_ROWS: 10
+    CONSUMERS: union CTE
+  catalog_final:
+    FROM: catalog_fact_agg JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk
+    OUTPUT: same as web_final
+    EXPECTED_ROWS: 10
+    CONSUMERS: union CTE
+EXAMPLES: single_pass_aggregation, prefetch_fact_join, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply consolidating aggregates into a single pass per fact table, but keep separate for web and catalog. Ignore the CASE consolidation across channels.
+- prefetch_fact_join: Apply pre-joining filtered dimensions with fact table before aggregation. Ignore the warehouse join—defer it.
+- shared_dimension_multi_channel: Apply shared filtered dimensions CTE.
+HAZARD_FLAGS:
+- Aggregating by ws_warehouse_sk and d_year before joining warehouse assumes one-to-one mapping (true). Must include d_year in output for later grouping.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combining shared dimension CTE, prefetch fact join, and late attribute binding of warehouse).

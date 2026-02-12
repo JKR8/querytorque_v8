@@ -1,0 +1,116 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K
+    ├── WITH_CLAUSE  [+]  — Pre-filters date_dim into CTE, isolates dimension filter
+    │   ├── CTE filtered_dates  [+]  — Filters date_dim for Dec-1999
+    │   ├── CTE web_inner_join  [+]  — Joins web_sales → filtered_dates → web_returns with profit/amount filters
+    │   ├── CTE web_aggregate  [+]  — Groups by item_sk, sums quantities/amounts
+    │   ├── CTE web_ranked  [+]  — Computes ratios and ranks per channel
+    │   ├── CTE catalog_inner_join  [+]  — Catalog channel equivalent
+    │   ├── CTE catalog_aggregate  [+]  — Catalog aggregation
+    │   ├── CTE catalog_ranked  [+]  — Catalog ranking
+    │   ├── CTE store_inner_join  [+]  — Store channel equivalent
+    │   ├── CTE store_aggregate  [+]  — Store aggregation
+    │   └── CTE store_ranked  [+]  — Store ranking
+    ├── UNION_ALL  [~]  — Combines three channel results with channel literal
+    ├── FILTER  [~]  — Filters (return_rank≤10 OR currency_rank≤10) after union
+    ├── SORT  [=]  — ORDER BY 1,4,5,2
+    └── OUTPUT  [=]  — channel, item, return_ratio, return_rank, currency_rank
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Isolate date_dim filter into CTE to reduce fact table scans", "applied_to": ["filtered_dates"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Build CTE chain: filtered_dates → sales join → returns join for each channel", "applied_to": ["web_inner_join", "catalog_inner_join", "store_inner_join"]},
+    {"id": "R3", "type": "union_all_consolidation", "description": "Use UNION ALL instead of UNION (channels are disjoint) and apply filter after union", "applied_to": ["union_all", "filter_ranks"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy = 12",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "web_inner_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws.ws_item_sk, wr.wr_return_quantity, ws.ws_quantity, wr.wr_return_amt, ws.ws_net_paid FROM web_sales ws INNER JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk INNER JOIN web_returns wr ON ws.ws_order_number = wr.wr_order_number AND ws.ws_item_sk = wr.wr_item_sk WHERE ws.ws_net_profit > 1 AND ws.ws_net_paid > 0 AND ws.ws_quantity > 0 AND wr.wr_return_amt > 10000",
+        "interfaces": {"outputs": ["ws_item_sk", "wr_return_quantity", "ws_quantity", "wr_return_amt", "ws_net_paid"], "consumes": ["filtered_dates"]}
+      },
+      "web_aggregate": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_item_sk AS item_sk, SUM(wr_return_quantity) AS sum_return_qty, SUM(ws_quantity) AS sum_ws_qty, SUM(wr_return_amt) AS sum_return_amt, SUM(ws_net_paid) AS sum_net_paid FROM web_inner_join GROUP BY ws_item_sk",
+        "interfaces": {"outputs": ["item_sk", "sum_return_qty", "sum_ws_qty", "sum_return_amt", "sum_net_paid"], "consumes": ["web_inner_join"]}
+      },
+      "web_ranked": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT item_sk AS item, CAST(sum_return_qty AS DECIMAL(15,4)) / CAST(sum_ws_qty AS DECIMAL(15,4)) AS return_ratio, CAST(sum_return_amt AS DECIMAL(15,4)) / CAST(sum_net_paid AS DECIMAL(15,4)) AS currency_ratio, RANK() OVER (ORDER BY CAST(sum_return_qty AS DECIMAL(15,4)) / CAST(sum_ws_qty AS DECIMAL(15,4))) AS return_rank, RANK() OVER (ORDER BY CAST(sum_return_amt AS DECIMAL(15,4)) / CAST(sum_net_paid AS DECIMAL(15,4))) AS currency_rank FROM web_aggregate",
+        "interfaces": {"outputs": ["item", "return_ratio", "currency_ratio", "return_rank", "currency_rank"], "consumes": ["web_aggregate"]}
+      },
+      "catalog_inner_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cs.cs_item_sk, cr.cr_return_quantity, cs.cs_quantity, cr.cr_return_amount, cs.cs_net_paid FROM catalog_sales cs INNER JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk INNER JOIN catalog_returns cr ON cs.cs_order_number = cr.cr_order_number AND cs.cs_item_sk = cr.cr_item_sk WHERE cs.cs_net_profit > 1 AND cs.cs_net_paid > 0 AND cs.cs_quantity > 0 AND cr.cr_return_amount > 10000",
+        "interfaces": {"outputs": ["cs_item_sk", "cr_return_quantity", "cs_quantity", "cr_return_amount", "cs_net_paid"], "consumes": ["filtered_dates"]}
+      },
+      "catalog_aggregate": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cs_item_sk AS item_sk, SUM(cr_return_quantity) AS sum_return_qty, SUM(cs_quantity) AS sum_cs_qty, SUM(cr_return_amount) AS sum_return_amt, SUM(cs_net_paid) AS sum_net_paid FROM catalog_inner_join GROUP BY cs_item_sk",
+        "interfaces": {"outputs": ["item_sk", "sum_return_qty", "sum_cs_qty", "sum_return_amt", "sum_net_paid"], "consumes": ["catalog_inner_join"]}
+      },
+      "catalog_ranked": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT item_sk AS item, CAST(sum_return_qty AS DECIMAL(15,4)) / CAST(sum_cs_qty AS DECIMAL(15,4)) AS return_ratio, CAST(sum_return_amt AS DECIMAL(15,4)) / CAST(sum_net_paid AS DECIMAL(15,4)) AS currency_ratio, RANK() OVER (ORDER BY CAST(sum_return_qty AS DECIMAL(15,4)) / CAST(sum_cs_qty AS DECIMAL(15,4))) AS return_rank, RANK() OVER (ORDER BY CAST(sum_return_amt AS DECIMAL(15,4)) / CAST(sum_net_paid AS DECIMAL(15,4))) AS currency_rank FROM catalog_aggregate",
+        "interfaces": {"outputs": ["item", "return_ratio", "currency_ratio", "return_rank", "currency_rank"], "consumes": ["catalog_aggregate"]}
+      },
+      "store_inner_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT sts.ss_item_sk, sr.sr_return_quantity, sts.ss_quantity, sr.sr_return_amt, sts.ss_net_paid FROM store_sales sts INNER JOIN filtered_dates fd ON sts.ss_sold_date_sk = fd.d_date_sk INNER JOIN store_returns sr ON sts.ss_ticket_number = sr.sr_ticket_number AND sts.ss_item_sk = sr.sr_item_sk WHERE sts.ss_net_profit > 1 AND sts.ss_net_paid > 0 AND sts.ss_quantity > 0 AND sr.sr_return_amt > 10000",
+        "interfaces": {"outputs": ["ss_item_sk", "sr_return_quantity", "ss_quantity", "sr_return_amt", "ss_net_paid"], "consumes": ["filtered_dates"]}
+      },
+      "store_aggregate": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_item_sk AS item_sk, SUM(sr_return_quantity) AS sum_return_qty, SUM(ss_quantity) AS sum_ss_qty, SUM(sr_return_amt) AS sum_return_amt, SUM(ss_net_paid) AS sum_net_paid FROM store_inner_join GROUP BY ss_item_sk",
+        "interfaces": {"outputs": ["item_sk", "sum_return_qty", "sum_ss_qty", "sum_return_amt", "sum_net_paid"], "consumes": ["store_inner_join"]}
+      },
+      "store_ranked": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT item_sk AS item, CAST(sum_return_qty AS DECIMAL(15,4)) / CAST(sum_ss_qty AS DECIMAL(15,4)) AS return_ratio, CAST(sum_return_amt AS DECIMAL(15,4)) / CAST(sum_net_paid AS DECIMAL(15,4)) AS currency_ratio, RANK() OVER (ORDER BY CAST(sum_return_qty AS DECIMAL(15,4)) / CAST(sum_ss_qty AS DECIMAL(15,4))) AS return_rank, RANK() OVER (ORDER BY CAST(sum_return_amt AS DECIMAL(15,4)) / CAST(sum_net_paid AS DECIMAL(15,4))) AS currency_rank FROM store_aggregate",
+        "interfaces": {"outputs": ["item", "return_ratio", "currency_ratio", "return_rank", "currency_rank"], "consumes": ["store_aggregate"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT channel, item, return_ratio, return_rank, currency_rank FROM (SELECT 'web' AS channel, item, return_ratio, return_rank, currency_rank FROM web_ranked UNION ALL SELECT 'catalog' AS channel, item, return_ratio, return_rank, currency_rank FROM catalog_ranked UNION ALL SELECT 'store' AS channel, item, return_ratio, return_rank, currency_rank FROM store_ranked) AS union_all WHERE return_rank <= 10 OR currency_rank <= 10 ORDER BY 1, 4, 5, 2 LIMIT 100",
+        "interfaces": {"outputs": ["channel", "item", "return_ratio", "return_rank", "currency_rank"], "consumes": ["web_ranked", "catalog_ranked", "store_ranked"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "web_inner_join", "web_aggregate", "web_ranked", "catalog_inner_join", "catalog_aggregate", "catalog_ranked", "store_inner_join", "store_aggregate", "store_ranked", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), web_inner_join AS ({web_inner_join}), web_aggregate AS ({web_aggregate}), web_ranked AS ({web_ranked}), catalog_inner_join AS ({catalog_inner_join}), catalog_aggregate AS ({catalog_aggregate}), catalog_ranked AS ({catalog_ranked}), store_inner_join AS ({store_inner_join}), store_aggregate AS ({store_aggregate}), store_ranked AS ({store_ranked}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Isolated date_dim filter into a reusable CTE, built staged join pipelines for each channel (sales → filtered_dates → returns), and consolidated three UNION branches with post-union filtering. This reduces fact table scans by applying date filter early and avoids predicate pushdown blindness at UNION boundaries.
+
+**Expected speedup**: ~2.5-3x due to reduced fact table scanning (date filter applied before large joins) and more efficient per-channel aggregation pipelines.

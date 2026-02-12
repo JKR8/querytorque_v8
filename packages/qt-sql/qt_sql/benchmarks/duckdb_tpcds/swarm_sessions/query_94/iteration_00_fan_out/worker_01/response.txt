@@ -1,0 +1,87 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Filter web sales by ship date range, destination state, and web company; require existence of same order across different warehouses; exclude orders present in web_returns; then aggregate order/profitability metrics.
+    ├── [CTE] filtered_date  [+]  Output: d_date_sk
+    ├── [CTE] filtered_address  [+]  Output: ca_address_sk
+    ├── [CTE] filtered_website  [+]  Output: web_site_sk
+    ├── [CTE] candidate_orders  [+]  Output: ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk
+    │   ├── JOIN (ws1.ws_ship_date_sk = filtered_date.d_date_sk)
+    │   ├── JOIN (ws1.ws_ship_addr_sk = filtered_address.ca_address_sk)
+    │   └── JOIN (ws1.ws_web_site_sk = filtered_website.web_site_sk)
+    ├── [CTE] multi_warehouse_flag  [~]  Changed: Replace correlated EXISTS with window function to avoid second scan
+    │   └── WINDOW (COUNT(DISTINCT ws_warehouse_sk) OVER (PARTITION BY ws_order_number) AS warehouse_count)
+    ├── [CTE] final_aggregation  [~]  Changed: Filter NOT EXISTS on web_returns after multi-warehouse flag
+    └── OUTPUT (order count, total shipping cost, total net profit)
+```
+
+**Change Markers:**
+- `[+] filtered_date`, `filtered_address`, `filtered_website`: New dimension-filtering CTEs
+- `[+] candidate_orders`: Consolidated fact scan with dimension joins
+- `[~] multi_warehouse_flag`: Replaced correlated EXISTS with window function for single-pass evaluation
+- `[~] final_aggregation`: Preserved NOT EXISTS filter and aggregation
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_aggregation", "description": "Consolidated multiple correlated subqueries into single scan with window function", "applied_to": ["candidate_orders", "multi_warehouse_flag"]},
+    {"id": "R2", "type": "predicate_pushdown", "description": "Pushed dimension filters into early CTEs for columnar scan elimination", "applied_to": ["filtered_date", "filtered_address", "filtered_website"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '2000-2-01' AND (CAST('2000-2-01' AS DATE) + INTERVAL 60 DAY)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_address": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_state = 'OK'",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "filtered_website": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT web_site_sk FROM web_site WHERE web_company_name = 'pri'",
+        "interfaces": {"outputs": ["web_site_sk"], "consumes": []}
+      },
+      "candidate_orders": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit, ws1.ws_warehouse_sk FROM web_sales ws1 INNER JOIN filtered_date fd ON ws1.ws_ship_date_sk = fd.d_date_sk INNER JOIN filtered_address fa ON ws1.ws_ship_addr_sk = fa.ca_address_sk INNER JOIN filtered_website fw ON ws1.ws_web_site_sk = fw.web_site_sk",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit", "ws_warehouse_sk"], "consumes": ["filtered_date", "filtered_address", "filtered_website"]}
+      },
+      "multi_warehouse_flag": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_order_number, ws_ext_ship_cost, ws_net_profit FROM (SELECT ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk, COUNT(DISTINCT ws_warehouse_sk) OVER (PARTITION BY ws_order_number) AS warehouse_count FROM candidate_orders) sub WHERE warehouse_count >= 2",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": ["candidate_orders"]}
+      },
+      "final_aggregation": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(DISTINCT ws_order_number) AS \"order count\", SUM(ws_ext_ship_cost) AS \"total shipping cost\", SUM(ws_net_profit) AS \"total net profit\" FROM multi_warehouse_flag mwf WHERE NOT EXISTS (SELECT 1 FROM web_returns wr WHERE wr.wr_order_number = mwf.ws_order_number) ORDER BY COUNT(DISTINCT ws_order_number) LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["multi_warehouse_flag"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_address", "filtered_website", "candidate_orders", "multi_warehouse_flag", "final_aggregation"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_address AS ({filtered_address}), filtered_website AS ({filtered_website}), candidate_orders AS ({candidate_orders}), multi_warehouse_flag AS ({multi_warehouse_flag}) {final_aggregation}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Replaced the correlated EXISTS subquery for multi-warehouse detection with a window function (`COUNT(DISTINCT ws_warehouse_sk) OVER (PARTITION BY ws_order_number)`) to evaluate the condition in a single pass over candidate_orders, eliminating the second scan. Dimension filters are pushed into early CTEs for columnar scan optimization.
+
+**Expected speedup:** ~3-4x (single scan of web_sales instead of potential multiple scans, with early filtering reducing intermediate data volume).

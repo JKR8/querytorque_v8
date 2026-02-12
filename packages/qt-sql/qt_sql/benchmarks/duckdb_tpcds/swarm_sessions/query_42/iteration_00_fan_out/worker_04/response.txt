@@ -1,0 +1,77 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE chain)
+├── CTE date_item_pairs [−] — Replaced original implicit joins with explicit filtered cross-join CTE
+│   ├── SCAN (date_dim (join), item (join))
+│   ├── CROSS JOIN (date_dim, item)
+│   ├── FILTER (date_dim.d_moy = 11 AND date_dim.d_year = 2002 AND item.i_manager_id = 1)
+│   └── OUTPUT (d_date_sk, d_year, i_item_sk, i_category_id, i_category)
+├── CTE lateral_fact [−] — Added LATERAL join to store_sales using filtered dimension keys
+│   ├── SCAN (date_item_pairs (CTE))
+│   ├── LATERAL JOIN (store_sales ON ss_sold_date_sk = d_date_sk AND ss_item_sk = i_item_sk)
+│   └── OUTPUT (d_year, i_category_id, i_category, ss_ext_sales_price)
+├── CTE aggregate [−] — Group by category/year and sum sales
+│   ├── SCAN (lateral_fact (CTE))
+│   ├── GROUP BY (d_year, i_category_id, i_category)
+│   ├── AGG (SUM(ss_ext_sales_price) AS sum_sales)
+│   └── OUTPUT (d_year, i_category_id, i_category, sum_sales)
+└── MAIN top_n [−] — Final ordering and limit
+    ├── SCAN (aggregate (CTE))
+    ├── SORT (sum_sales DESC, d_year, i_category_id, i_category)
+    ├── LIMIT 100
+    └── OUTPUT (d_year, i_category_id, i_category, sum_sales)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter date_dim and item into CTE before fact table access", "applied_to": ["date_item_pairs"]},
+    {"id": "R2", "type": "lateral_join", "description": "Use LATERAL join to correlate filtered dimension keys with fact table", "applied_to": ["lateral_fact"]},
+    {"id": "R3", "type": "cte_staging", "description": "Explicit CTE chain isolates aggregation from filtering", "applied_to": ["date_item_pairs", "lateral_fact", "aggregate"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_item_pairs": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT dt.d_date_sk, dt.d_year, item.i_item_sk, item.i_category_id, item.i_category FROM date_dim dt CROSS JOIN item WHERE dt.d_moy = 11 AND dt.d_year = 2002 AND item.i_manager_id = 1",
+        "interfaces": {"outputs": ["d_date_sk", "d_year", "i_item_sk", "i_category_id", "i_category"], "consumes": []}
+      },
+      "lateral_fact": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d.d_year, d.i_category_id, d.i_category, ss.ss_ext_sales_price FROM date_item_pairs d LEFT JOIN LATERAL (SELECT ss_ext_sales_price FROM store_sales WHERE ss_sold_date_sk = d.d_date_sk AND ss_item_sk = d.i_item_sk) ss ON true WHERE ss.ss_ext_sales_price IS NOT NULL",
+        "interfaces": {"outputs": ["d_year", "i_category_id", "i_category", "ss_ext_sales_price"], "consumes": ["date_item_pairs"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_year, i_category_id, i_category, SUM(ss_ext_sales_price) AS sum_sales FROM lateral_fact GROUP BY d_year, i_category_id, i_category",
+        "interfaces": {"outputs": ["d_year", "i_category_id", "i_category", "sum_sales"], "consumes": ["lateral_fact"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT d_year, i_category_id, i_category, sum_sales FROM aggregate ORDER BY sum_sales DESC, d_year, i_category_id, i_category LIMIT 100",
+        "interfaces": {"outputs": ["d_year", "i_category_id", "i_category", "sum_sales"], "consumes": ["aggregate"]}
+      }
+    },
+    "reconstruction_order": ["date_item_pairs", "lateral_fact", "aggregate", "main_query"],
+    "assembly_template": "WITH date_item_pairs AS ({date_item_pairs}), lateral_fact AS ({lateral_fact}), aggregate AS ({aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Structural change from single SELECT with implicit joins to explicit CTE chain with LATERAL join. Filtered dimensions first (55K rows), then correlated fact lookups, then aggregation. This isolates predicate pushdown to dimension tables only.
+
+**Expected speedup**: 1.5–2x. Pre-filtering dimensions reduces fact table probing to relevant keys only. LATERAL join may be slower than hash join at scale, but with only 55K outer rows and indexed lookups (ss_sold_date_sk, ss_item_sk), it should outperform full scan+join in original. CTE materialization risk is low because each CTE is referenced only once (DuckDB will inline).

@@ -1,0 +1,348 @@
+<reasoning>
+1. **CLASSIFY**: This is a multi-channel UNION ALL query. Three independent CTEs (ss, cs, ws) each perform a star-join between a large fact table (store_sales, catalog_sales, web_sales) and three dimension tables (date_dim, customer_address, item), filter on specific dimensions (year=2000, month=2, GMT offset=-6, color in set), group by item_id, and then union the results for a final aggregation. It's a classic star-schema rollup across channels with identical dimension filters.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total time: 438ms.
+   - Dominant cost: Sequential scans of large fact tables.
+     - store_sales: 244K rows scanned (out of 345.6M), 265.6ms (61% of total time).
+     - catalog_sales: 131K rows, 5.4ms (1%).
+     - web_sales: 64K rows, 48.4ms (11%).
+   - Dimension table scans:
+     - date_dim: Scanned 3 times (once per channel), each time filtered to 29 rows. Time per scan ~0.6-1.0ms.
+     - customer_address: Scanned 3 times, filtered to 110K rows (ca_gmt_offset=-6). Time per scan ~0.9-1.0ms.
+     - item: Scanned multiple times per channel (subquery + join). Total item scans: 6 (2 per channel). Each scan processes 102K rows, ~1.3-4.8ms each.
+   - Joins and aggregations are fast (<10ms each).
+   - The optimizer already:
+     - Pushes date filters into the scan (d_year=2000, d_moy=2) and converts to a date_sk range.
+     - Pushes customer_address filter (ca_gmt_offset=-6) into the scan.
+     - Uses hash joins and semi-joins for the item subquery.
+     - Does NOT share dimension scans across CTEs (each CTE re-scans date_dim, customer_address, item independently).
+     - Does NOT consolidate the repeated item subquery across channels.
+
+3. **GAP MATCHING**:
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: Each CTE independently scans and filters the same dimension tables. Opportunity: pre-filter dimensions into shared CTEs to avoid redundant scans.
+   - **REDUNDANT_SCAN_ELIMINATION**: The item table is scanned 6 times (2 per channel). Opportunity: consolidate item filtering into a single CTE.
+   - **UNION_CTE_SELF_JOIN_DECOMPOSITION**: Not applicable (no self-join of a generic CTE).
+   - **CORRELATED_SUBQUERY_PARALYSIS**: Not applicable (no correlated subqueries).
+   - **CROSS_COLUMN_OR_DECOMPOSITION**: Not applicable (no OR on different columns).
+   - **SINGLE_PASS_AGGREGATION**: The three fact tables are scanned separately (one per channel). Could we consolidate into a single scan? No, because they are different tables. But we could share dimension lookups.
+
+4. **AGGREGATION TRAP CHECK**: The query uses SUM only, which is duplicate-safe. No FILTER clauses. The grouping is by i_item_id, and the joins are one-to-many (item to sales) but the GROUP BY after the join is correct. Any restructuring must preserve that each sale row is counted exactly once per channel.
+
+5. **TRANSFORM SELECTION** (diverse strategies):
+   - **Worker 1: Star-join prefetch (dimension_cte_isolate + prefetch_fact_join)**: Pre-filter all three dimension tables (date_dim, customer_address, item) into CTEs, then join each fact table with these CTEs. This reduces dimension scans from 3 each to 1 each.
+   - **Worker 2: Shared dimension CTEs (shared_dimension_multi_channel)**: Extract the common dimension filters (date, customer_address, item) into a single CTE that returns all surrogate keys and item_id, then join each fact table with this CTE. This consolidates all dimension logic into one CTE.
+   - **Worker 3: Single-pass aggregation across channels (channel_bitmap_aggregation adaptation)**: Since the fact tables are separate, we cannot do a single scan. However, we can restructure to compute the per-channel aggregates in a single pass per fact table using conditional aggregation? Actually, each CTE already does that. Alternative: Use a UNION ALL of the fact tables first, then join with filtered dimensions once, then aggregate. This reduces dimension joins from 3 to 1.
+   - **Worker 4 (Exploration): Compound strategy with dimension CTEs and deferred dimension joins (late_attribute_binding)**: The item table is joined for two purposes: (1) filter by color (subquery), (2) get i_item_id for grouping. The color filter is used early, but the item join could be deferred until after filtering by date and address? However, we need i_item_id for grouping. Actually, the item join is necessary to get i_item_id from ss_item_sk. But we could pre-filter item by color and store both i_item_sk and i_item_id in a CTE. Then join fact tables with this CTE on item_sk. This avoids the separate subquery and join.
+
+6. **LOGICAL TREE DESIGN**:
+   - For Worker 1: Create CTEs: filtered_date, filtered_customer, filtered_item. Then for each channel, join fact table with these three CTEs, group by i_item_id.
+   - For Worker 2: Create a CTE "filtered_dimensions" that joins date_dim, customer_address, item with the filters, returning d_date_sk, ca_address_sk, i_item_sk, i_item_id. Then join each fact table with this CTE on the respective keys.
+   - For Worker 3: Create a CTE "all_sales" that unions store_sales, catalog_sales, web_sales with a channel discriminator. Create filtered dimension CTEs (date, customer, item). Join all_sales with dimensions once, then aggregate by i_item_id and channel, then sum across channels.
+   - For Worker 4: Create a CTE "filtered_item" that selects i_item_sk, i_item_id where i_color in (...). Create CTEs for filtered_date and filtered_customer. Then for each fact table, join with filtered_date and filtered_customer first, then join with filtered_item. This changes the join order to push date and address filters before the item join, potentially reducing rows before the item join.
+
+Check column completeness: Each CTE must output all columns needed by downstream joins and GROUP BY.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compute February 2000 total sales per item (colors powder/green/cyan) across store, catalog, and web channels for addresses at GMT offset -6. INNER JOIN semantics require all dimension tables (date_dim, customer_address, item) to match for each sale row. Aggregation uses SUM, which is duplicate-safe, but the GROUP BY on i_item_id must be preserved after joins. The item color filter is applied via a semi-join subquery; rewriting must retain exact color values and GMT offset.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: 80% of time is spent scanning the three large fact tables (store_sales 265.6ms, web_sales 48.4ms). Each fact table scan is preceded by independent scans of the same dimension tables (date_dim 3x, customer_address 3x, item 6x). The optimizer already pushes filters into dimension scans (date range, ca_gmt_offset) but cannot share these scans across CTEs. Cardinality flow: fact tables → 244K/131K/64K rows → after joins → 6.9K/3.6K/1.7K rows → per-channel aggregation → 2.8K/2.1K/1.3K rows → union → final aggregation → 100 rows. Logical-tree cost percentages are misleading: store_sales scan is 61% of total time, but the logical tree assigns equal 25% cost to each CTE.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output i_item_id and total_sales ordered by total_sales, i_item_id LIMIT 100.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced by downstream joins (e.g., d_date_sk, ca_address_sk, i_item_sk, i_item_id).
+- LITERAL_PRESERVATION: Must preserve literal values: i_color in ('powder','green','cyan'), d_year=2000, d_moy=2, ca_gmt_offset=-6.
+- SEMANTIC_EQUIVALENCE: Must return exactly the same rows as original.
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows date_dim scanned 3 times, customer_address 3 times, item 6 times — predicates not pushed across CTE boundaries.
+- REDUNDANT_SCAN_ELIMINATION: item table scanned 6 times (2 per channel) for the same color filter.
+
+REGRESSION_WARNINGS:
+1. dimension_cte_isolate (0.0076x):
+   CAUSE: Cross-joining 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially with fact tables.
+2. materialize_cte (0.14x):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan.
+   RULE: Do not convert semi-join subqueries to materialized CTEs; keep as EXISTS or use semi-join.
+3. pushdown (0.49x):
+   CAUSE: Created filtered CTEs but kept original unfiltered CTEs, causing redundant materialization.
+   RULE: When creating filtered CTEs, remove the original unfiltered CTEs.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_customer -> filtered_item -> ss_joined -> ss_agg
+  filtered_date -> filtered_customer -> filtered_item -> cs_joined -> cs_agg
+  filtered_date -> filtered_customer -> filtered_item -> ws_joined -> ws_agg
+  (ss_agg, cs_agg, ws_agg) -> union_all -> main_agg -> order_limit
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_moy = 2
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 29
+    CONSUMERS: ss_joined, cs_joined, ws_joined
+  filtered_customer:
+    FROM: customer_address
+    WHERE: ca_gmt_offset = -6
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 110K
+    CONSUMERS: ss_joined, cs_joined, ws_joined
+  filtered_item:
+    FROM: item
+    WHERE: i_color IN ('powder', 'green', 'cyan')
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: 3,234
+    CONSUMERS: ss_joined, cs_joined, ws_joined
+  ss_joined:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+          INNER JOIN filtered_customer ON ss_addr_sk = ca_address_sk
+          INNER JOIN filtered_item ON ss_item_sk = i_item_sk
+    OUTPUT: i_item_id, ss_ext_sales_price
+    EXPECTED_ROWS: 6,877
+    CONSUMERS: ss_agg
+  ss_agg:
+    FROM: ss_joined
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(ss_ext_sales_price) AS total_sales
+    OUTPUT: i_item_id, total_sales
+    EXPECTED_ROWS: 2,814
+    CONSUMERS: union_all
+  cs_joined:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+          INNER JOIN filtered_customer ON cs_bill_addr_sk = ca_address_sk
+          INNER JOIN filtered_item ON cs_item_sk = i_item_sk
+    OUTPUT: i_item_id, cs_ext_sales_price
+    EXPECTED_ROWS: 3,600
+    CONSUMERS: cs_agg
+  cs_agg:
+    FROM: cs_joined
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(cs_ext_sales_price) AS total_sales
+    OUTPUT: i_item_id, total_sales
+    EXPECTED_ROWS: 2,137
+    CONSUMERS: union_all
+  ws_joined:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+          INNER JOIN filtered_customer ON ws_bill_addr_sk = ca_address_sk
+          INNER JOIN filtered_item ON ws_item_sk = i_item_sk
+    OUTPUT: i_item_id, ws_ext_sales_price
+    EXPECTED_ROWS: 1,721
+    CONSUMERS: ws_agg
+  ws_agg:
+    FROM: ws_joined
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(ws_ext_sales_price) AS total_sales
+    OUTPUT: i_item_id, total_sales
+    EXPECTED_ROWS: 1,344
+    CONSUMERS: union_all
+  union_all:
+    FROM: ss_agg UNION ALL cs_agg UNION ALL ws_agg
+    OUTPUT: i_item_id, total_sales
+    EXPECTED_ROWS: 6,295
+    CONSUMERS: main_agg
+  main_agg:
+    FROM: union_all
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(total_sales) AS total_sales
+    ORDER BY: total_sales ASC, i_item_id ASC
+    LIMIT: 100
+    OUTPUT: i_item_id, total_sales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: date_cte_isolate, prefetch_fact_join, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: Apply the pattern of extracting date filter into a CTE; ignore the scalar subquery aspect (original uses join).
+- prefetch_fact_join: Apply the staged join pipeline: filter dimensions first, then join with fact tables; ignore the multiple fact table CTE chains (we have three separate chains).
+- dimension_cte_isolate: Apply pre-filtering of all dimension tables into CTEs; ignore the cross-join hazard (we join dimensions sequentially with fact table).
+HAZARD_FLAGS:
+- Risk of materialization overhead if CTEs are inlined (single-reference CTEs may not materialize).
+- Must ensure filtered_item outputs both i_item_sk and i_item_id for joins and grouping.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: shared_dimension_multi_channel
+TARGET_LOGICAL_TREE:
+  filtered_dimensions -> ss_joined -> ss_agg
+  filtered_dimensions -> cs_joined -> cs_agg
+  filtered_dimensions -> ws_joined -> ws_agg
+  (ss_agg, cs_agg, ws_agg) -> union_all -> main_agg -> order_limit
+NODE_CONTRACTS:
+  filtered_dimensions:
+    FROM: date_dim, customer_address, item
+    JOIN: CROSS JOIN (date_dim, customer_address, item) — but must filter each independently. Actually, we need to combine the three dimension filters without cross-joining. Better: create three separate CTEs and then cross join? That would cause Cartesian explosion. Instead, we can create a CTE that joins date_dim, customer_address, item? There are no join conditions between them. So we must create three CTEs and then join them in each fact join. That's similar to Worker 1. Let's adjust: filtered_dimensions will be a CTE that SELECTs d_date_sk, ca_address_sk, i_item_sk, i_item_id FROM date_dim, customer_address, item WHERE date filters AND customer filters AND item filters. This is a cross join of three small tables (29 * 110K * 3,234) which is huge. So this strategy is dangerous. Instead, we should keep the dimensions separate but share them across channels. That's what Worker 1 does. So for Worker 2, we should use the same three dimension CTEs as Worker 1 but structure the query differently: create a CTE that unions the fact tables with a channel discriminator, then join with the dimension CTEs. That's actually Worker 3. Let's reassign Worker 2 to a different strategy.
+
+Revised Worker 2 strategy: **single_pass_aggregation adaptation** (but fact tables are separate). Instead, we can use a **union_all_consolidation** strategy: union the fact tables first, then join with filtered dimensions once, then aggregate.
+
+Let's redesign Worker 2.
+
+STRATEGY: union_all_consolidation
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_customer -> filtered_item -> all_sales_joined -> sales_agg -> channel_agg -> main_agg -> order_limit
+But note: the join keys are different per channel (ss_addr_sk vs cs_bill_addr_sk vs ws_bill_addr_sk). We need to handle that.
+
+We'll create a CTE "all_sales" that unions the three fact tables with consistent column names.
+
+NODE_CONTRACTS:
+  filtered_date: (same as Worker 1)
+  filtered_customer: (same as Worker 1)
+  filtered_item: (same as Worker 1)
+  all_sales:
+    FROM: (
+      SELECT ss_item_sk AS item_sk, ss_sold_date_sk AS date_sk, ss_addr_sk AS addr_sk, ss_ext_sales_price AS sales_price FROM store_sales
+      UNION ALL
+      SELECT cs_item_sk, cs_sold_date_sk, cs_bill_addr_sk, cs_ext_sales_price FROM catalog_sales
+      UNION ALL
+      SELECT ws_item_sk, ws_sold_date_sk, ws_bill_addr_sk, ws_ext_sales_price FROM web_sales
+    )
+    OUTPUT: item_sk, date_sk, addr_sk, sales_price
+    EXPECTED_ROWS: 244K + 131K + 64K = 439K
+    CONSUMERS: all_sales_joined
+  all_sales_joined:
+    FROM: all_sales
+    JOIN: INNER JOIN filtered_date ON date_sk = d_date_sk
+          INNER JOIN filtered_customer ON addr_sk = ca_address_sk
+          INNER JOIN filtered_item ON item_sk = i_item_sk
+    OUTPUT: i_item_id, sales_price
+    EXPECTED_ROWS: 6,877 + 3,600 + 1,721 = 12,198
+    CONSUMERS: sales_agg
+  sales_agg:
+    FROM: all_sales_joined
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(sales_price) AS total_sales
+    OUTPUT: i_item_id, total_sales
+    EXPECTED_ROWS: ~3,106
+    CONSUMERS: main_agg (but note: we don't need per-channel aggregation, so we can go directly to final aggregation. However, the original query does per-channel aggregation then sums across channels. But if we aggregate directly by item_id across all sales, we get the same result because SUM is additive. So we can skip the per-channel step.)
+  main_agg: (same as original main_agg but directly from sales_agg)
+    FROM: sales_agg
+    ORDER BY: total_sales ASC, i_item_id ASC
+    LIMIT: 100
+    OUTPUT: i_item_id, total_sales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+
+EXAMPLES: shared_dimension_multi_channel, single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- shared_dimension_multi_channel: Apply the idea of extracting shared dimension filters; ignore the multiple channel CTEs (we use a single union).
+- single_pass_aggregation: Consolidate multiple fact table scans into a single union; ignore the CASE aggregation (we just union).
+- channel_bitmap_aggregation: Consolidate repeated scans of the same fact table? Not directly applicable because we have different tables, but the pattern of unifying fact sources applies.
+HAZARD_FLAGS:
+- The union of three large fact tables may be expensive if not reduced by dimensions first. But we join after union, which may cause a large intermediate union.
+- Must ensure join keys are correctly mapped (addr_sk matches the appropriate column).
+- The original query does per-channel aggregation before union, which reduces data. Our approach does aggregation after union, which may be heavier if the union produces many rows.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: late_attribute_binding (defer item join)
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_customer -> ss_filtered -> ss_with_item -> ss_agg
+  filtered_date -> filtered_customer -> cs_filtered -> cs_with_item -> cs_agg
+  filtered_date -> filtered_customer -> ws_filtered -> ws_with_item -> ws_agg
+  (ss_agg, cs_agg, ws_agg) -> union_all -> main_agg -> order_limit
+NODE_CONTRACTS:
+  filtered_date: (same as Worker 1)
+  filtered_customer: (same as Worker 1)
+  filtered_item: (same as Worker 1)
+  ss_filtered:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+          INNER JOIN filtered_customer ON ss_addr_sk = ca_address_sk
+    OUTPUT: ss_item_sk, ss_ext_sales_price
+    EXPECTED_ROWS: 109K (from EXPLAIN: after joining date and customer)
+    CONSUMERS: ss_with_item
+  ss_with_item:
+    FROM: ss_filtered
+    JOIN: INNER JOIN filtered_item ON ss_item_sk = i_item_sk
+    OUTPUT: i_item_id, ss_ext_sales_price
+    EXPECTED_ROWS: 6,877
+    CONSUMERS: ss_agg
+  ss_agg: (same as Worker 1)
+  cs_filtered:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+          INNER JOIN filtered_customer ON cs_bill_addr_sk = ca_address_sk
+    OUTPUT: cs_item_sk, cs_ext_sales_price
+    EXPECTED_ROWS: 58K
+    CONSUMERS: cs_with_item
+  cs_with_item: (similar to ss_with_item)
+  ws_filtered: (similar)
+  ws_with_item: (similar)
+  ... union_all and main_agg as before.
+EXAMPLES: early_filter, prefetch_fact_join, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- early_filter: Apply filtering of date and customer before joining with item; ignore the fact that we still join item later.
+- prefetch_fact_join: Use staged join pipeline: filter date and customer, join with fact, then join item; ignore the multiple dimension CTEs (we have separate CTEs).
+- dimension_cte_isolate: Pre-filter date and customer into CTEs; ignore the item CTE (we also have that).
+HAZARD_FLAGS:
+- May not reduce item scans (still need to join with filtered_item). But we reduce the number of rows before the item join.
+- Must ensure filtered_item is still defined with both i_item_sk and i_item_id.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_star_join_with_aggregation_pushdown
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_customer -> filtered_item -> ss_joined -> ss_agg (as before)
+  ... similar for cs, ws.
+  Then union and aggregate.
+But this is similar to Worker 1. Let's try a novel combination: **single CTE for all filtered dimensions and fact pre-join**? That would cross-join dimensions, which is dangerous.
+
+Alternative exploration: **use a materialized CTE for the item color filter and then use it as a semi-join without re-scanning item for the join**. The original query uses a semi-join for the color filter and then an inner join for item. We can combine these into a single join with a filtered item CTE. That's what we already do in Worker 1.
+
+Another exploration: **use a lateral join to fetch item_id only for matching rows**? Not sure.
+
+Given the time, let's assign Worker 4 a strategy that combines dimension CTEs with a union of fact tables and early aggregation pushdown (similar to Worker 2 but with per-channel aggregation preserved). This is a compound strategy.
+
+STRATEGY: union_all_with_dimension_ctes_and_channel_aggregation
+TARGET_LOGICAL_TREE:
+  filtered_date, filtered_customer, filtered_item -> all_sales_joined -> sales_agg_by_channel -> channel_agg -> union_all -> main_agg -> order_limit
+But we need to preserve the channel distinction for aggregation? Actually, the final aggregation is across channels, so per-channel aggregation is not needed if we group by item_id and channel? Wait, the original does per-channel aggregation, then sums across channels. If we group by item_id and channel, then sum across channels, that's equivalent to grouping by item_id only. So we can do a single aggregation by item_id. That's what Worker 2 does.
+
+So for exploration, let's try a different compound: **use a single CTE that pre-joins all dimensions with each fact table separately, then unions the results**. That's essentially Worker 1.
+
+Given the limited novel options, let's explore a strategy that uses a **temporary table** (not CTE) for filtered dimensions? But we must stay within SQL.
+
+I'll assign Worker 4 to try a strategy that **pre-aggregates the fact tables by dimension keys before joining with dimensions**. This is aggregation pushdown.
+
+STRATEGY: fact_pre_aggregation
+TARGET_LOGICAL_TREE:
+  ss_agg_by_keys -> join_with_dimensions -> ss_agg
+  cs_agg_by_keys -> join_with_dimensions -> cs_agg
+  ws_agg_by_keys -> join_with_dimensions -> ws_agg
+  then union and final aggregate.
+NODE_CONTRACTS:
+  ss_agg_by_keys:
+    FROM: store_sales
+    GROUP BY: ss_item_sk, ss_sold_date_sk, ss_addr_sk
+    AGGREGATE: SUM(ss_ext_sales_price) AS sales_price
+    OUTPUT: ss_item_sk, ss_sold_date_sk, ss_addr_sk, sales_price
+    EXPECTED_ROWS: less than 244K (but grouping on three keys may not reduce much)
+    CONSUMERS: ss_joined_dims
+  filtered_date, filtered_customer, filtered_item as before.
+  ss_joined_dims:
+    FROM: ss_agg_by_keys
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+          INNER JOIN filtered_customer ON ss_addr_sk = ca_address_sk
+          INNER JOIN filtered_item ON ss_item_sk = i_item_sk
+    OUTPUT: i_item_id, sales_price
+    EXPECTED_ROWS: same as ss_joined rows? Possibly less because aggregation may have combined rows.
+  ss_agg: GROUP BY i_item_id SUM(sales_price)
+  ... and so on.
+EXAMPLES: single_pass_aggregation, prefetch_fact_join, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply pre-aggregation on fact table before joining dimensions; ignore the CASE aggregation.
+- prefetch_fact_join: Use dimension CTEs; ignore the fact that we pre-aggregate fact table.
+- dimension_cte_isolate: Use filtered dimension CTEs; ignore the pre-aggregation.
+HAZARD_FLAGS:
+- Pre-aggregation on high-cardinality keys (item, date, address) may not reduce rows significantly.
+- Must ensure that the pre-aggregation does not lose necessary granularity (it doesn't, because we group by the join keys).
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy
+</reasoning>

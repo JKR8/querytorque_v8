@@ -1,0 +1,119 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Cost: 100%  Rows: ~1K  — Join store sales to item and date, filter to the date window and target categories, aggregate revenue per item attributes, and compute class-level revenue share with a window partition on i_class.
+    ├── [~] CTE filtered_date
+    │   └── SCAN (date_dim) + FILTER (date range)
+    ├── [~] CTE filtered_item  
+    │   └── SCAN (item) + FILTER (categories)
+    ├── [~] CTE prefetched_sales
+    │   └── JOIN store_sales WITH filtered_date (ss_sold_date_sk=d_date_sk)
+    │       └── JOIN filtered_item (ss_item_sk=i_item_sk)
+    ├── [~] CTE main_aggregation
+    │   └── AGG (GROUP BY item attributes) on prefetched_sales
+    ├── [~] CTE window_computation
+    │   └── WINDOW (PARTITION BY i_class) on main_aggregation
+    └── [~] CTE order_by
+        └── SORT (i_category, i_class, i_item_id, i_item_desc, revenueratio)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "dimension_cte_isolate",
+      "description": "Extract date and item dimension filters into separate CTEs to create small hash tables for fact table probe",
+      "applied_to": ["filtered_date", "filtered_item", "prefetched_sales"]
+    },
+    {
+      "id": "R2",
+      "type": "prefetch_fact_join",
+      "description": "Staged join pipeline: first join filtered dimensions to fact table, then aggregate",
+      "applied_to": ["prefetched_sales", "main_aggregation"]
+    },
+    {
+      "id": "R3",
+      "type": "date_cte_isolate",
+      "description": "Isolate date filter into CTE to materialize once as tiny hash table",
+      "applied_to": ["filtered_date"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_date": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2002-05-20' AS DATE) AND (CAST('2002-05-20' AS DATE) + INTERVAL 30 DAY)",
+          "interfaces": {
+            "outputs": ["d_date_sk"],
+            "consumes": []
+          }
+        },
+        "filtered_item": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT i_item_sk, i_item_id, i_item_desc, i_category, i_class, i_current_price FROM item WHERE i_category IN ('Sports', 'Music', 'Shoes')",
+          "interfaces": {
+            "outputs": ["i_item_sk", "i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price"],
+            "consumes": []
+          }
+        },
+        "prefetched_sales": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT i.i_item_id, i.i_item_desc, i.i_category, i.i_class, i.i_current_price, ss.ss_ext_sales_price FROM store_sales ss INNER JOIN filtered_date fd ON ss.ss_sold_date_sk = fd.d_date_sk INNER JOIN filtered_item i ON ss.ss_item_sk = i.i_item_sk",
+          "interfaces": {
+            "outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "ss_ext_sales_price"],
+            "consumes": ["filtered_date", "filtered_item"]
+          }
+        },
+        "main_aggregation": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT i_item_id, i_item_desc, i_category, i_class, i_current_price, SUM(ss_ext_sales_price) AS itemrevenue FROM prefetched_sales GROUP BY i_item_id, i_item_desc, i_category, i_class, i_current_price",
+          "interfaces": {
+            "outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue"],
+            "consumes": ["prefetched_sales"]
+          }
+        },
+        "window_computation": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, itemrevenue * 100 / SUM(itemrevenue) OVER (PARTITION BY i_class) AS revenueratio FROM main_aggregation",
+          "interfaces": {
+            "outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue", "revenueratio"],
+            "consumes": ["main_aggregation"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, revenueratio FROM window_computation ORDER BY i_category, i_class, i_item_id, i_item_desc, revenueratio",
+          "interfaces": {
+            "outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue", "revenueratio"],
+            "consumes": ["window_computation"]
+          }
+        }
+      },
+      "reconstruction_order": ["filtered_date", "filtered_item", "prefetched_sales", "main_aggregation", "window_computation", "main_query"],
+      "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), prefetched_sales AS ({prefetched_sales}), main_aggregation AS ({main_aggregation}), window_computation AS ({window_computation}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured single join into a staged CTE pipeline with dimension isolation (filtered_date, filtered_item) → fact table join (prefetched_sales) → aggregation → window → ordering. This creates small hash tables from filtered dimensions before probing the large fact table.
+
+**Expected speedup**: 2-3x. The main mechanism is reducing the 345.6M row store_sales scan by early join elimination: filtered_date (31 rows) and filtered_item (31K rows) create tiny hash tables that allow DuckDB to push down predicates into the store_sales scan via hash join. Single-reference CTEs will be inlined, avoiding materialization overhead while preserving semantic equivalence.

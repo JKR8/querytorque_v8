@@ -1,0 +1,521 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+For store 146, pair items at matching rank positions from top-10 (ascending average profit) and bottom-10 (descending average profit) lists, where each item's average profit exceeds 90% of the store's baseline (transactions with null address). JOIN semantics: INNER joins require all sides to match (item must exist in item table, rank positions must exist in both lists). Aggregation trap: AVG(ss_net_profit) must be computed per item from the exact same rows as original (store=146 filter). Filter dependency: The store baseline subquery depends on ss_addr_sk IS NULL condition which must remain applied to the same store filter.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+consolidated_scan_cte -> filtered_items -> ranked_ctes -> final_join
+NODE_CONTRACTS:
+  consolidated_scan:
+    FROM: store_sales
+    WHERE: ss_store_sk = 146
+    GROUP BY: ss_item_sk
+    AGGREGATE: AVG(ss_net_profit) AS item_avg,
+              AVG(CASE WHEN ss_addr_sk IS NULL THEN ss_net_profit END) AS store_avg_nulls
+    OUTPUT: ss_item_sk AS item_sk, item_avg, store_avg_nulls
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: filtered_items
+  filtered_items:
+    FROM: consolidated_scan
+    WHERE: item_avg > 0.9 * (SELECT AVG(store_avg_nulls) FROM consolidated_scan WHERE store_avg_nulls IS NOT NULL)
+    OUTPUT: item_sk, item_avg
+    EXPECTED_ROWS: ~1K (filtered)
+    CONSUMERS: asc_ranks, desc_ranks
+  asc_ranks:
+    FROM: filtered_items
+    WINDOW: RANK() OVER (ORDER BY item_avg ASC) AS rnk
+    OUTPUT: item_sk, rnk
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: final_join
+  desc_ranks:
+    FROM: filtered_items  
+    WINDOW: RANK() OVER (ORDER BY item_avg DESC) AS rnk
+    OUTPUT: item_sk, rnk
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: final_join
+  final_join:
+    FROM: asc_ranks JOIN desc_ranks ON asc_ranks.rnk = desc_ranks.rnk
+         JOIN item i1 ON asc_ranks.item_sk = i1.i_item_sk
+         JOIN item i2 ON desc_ranks.item_sk = i2.i_item_sk
+    WHERE: asc_ranks.rnk < 11 AND desc_ranks.rnk < 11
+    ORDER BY: asc_ranks.rnk
+    OUTPUT: asc_ranks.rnk AS rnk, i1.i_product_name AS best_performing, i2.i_product_name AS worst_performing
+    EXPECTED_ROWS: ≤10
+    CONSUMERS: output
+
+NODE_CONTRACTS:
+consolidated_scan:
+    FROM: store_sales
+    WHERE: ss_store_sk = 146
+    GROUP BY: ss_item_sk
+    AGGREGATE: AVG(ss_net_profit) AS item_avg,
+              AVG(CASE WHEN ss_addr_sk IS NULL THEN ss_net_profit END) AS store_avg_nulls
+    OUTPUT: ss_item_sk AS item_sk, item_avg, store_avg_nulls
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: filtered_items
+  filtered_items:
+    FROM: consolidated_scan
+    WHERE: item_avg > 0.9 * (SELECT AVG(store_avg_nulls) FROM consolidated_scan WHERE store_avg_nulls IS NOT NULL)
+    OUTPUT: item_sk, item_avg
+    EXPECTED_ROWS: ~1K (filtered)
+    CONSUMERS: asc_ranks, desc_ranks
+  asc_ranks:
+    FROM: filtered_items
+    WINDOW: RANK() OVER (ORDER BY item_avg ASC) AS rnk
+    OUTPUT: item_sk, rnk
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: final_join
+  desc_ranks:
+    FROM: filtered_items  
+    WINDOW: RANK() OVER (ORDER BY item_avg DESC) AS rnk
+    OUTPUT: item_sk, rnk
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: final_join
+  final_join:
+    FROM: asc_ranks JOIN desc_ranks ON asc_ranks.rnk = desc_ranks.rnk
+         JOIN item i1 ON asc_ranks.item_sk = i1.i_item_sk
+         JOIN item i2 ON desc_ranks.item_sk = i2.i_item_sk
+    WHERE: asc_ranks.rnk < 11 AND desc_ranks.rnk < 11
+    ORDER BY: asc_ranks.rnk
+    OUTPUT: asc_ranks.rnk AS rnk, i1.i_product_name AS best_performing, i2.i_product_name AS worst_performing
+    EXPECTED_ROWS: ≤10
+    CONSUMERS: output
+
+## Hazard Flags (avoid these specific risks)
+
+- Conditional AVG with CASE may compute average differently if null rows are sparse
+- Store baseline computed from same scan as item aggregates (must ensure mathematical equivalence)
+
+## Regression Warnings (observed failures on similar queries)
+
+1. materialize_cte (0.14x on Q16):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan instead of semi-join short-circuit
+   RULE: Do not convert HAVING subquery to materialized CTE if it would force full evaluation per group
+2. date_cte_isolate (0.50x on Q25):
+   CAUSE: Materialized fact table join early, preventing optimizer from reordering multi-way joins
+   RULE: Avoid materializing intermediate fact table results if query has complex join reordering needs
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output rnk, best_performing, worst_performing exactly as aliased
+- CTE_COLUMN_COMPLETENESS: Any CTE must include item_sk, avg_profit, rank values needed by downstream
+- LITERAL_PRESERVATION: Must preserve ss_store_sk=146, 0.9 multiplier, ss_addr_sk IS NULL, rank < 11
+- SEMANTIC_EQUIVALENCE: Must produce identical rows with same ordering
+- CORRELATED_SUBQUERY_PARALYSIS: Scalar subquery in HAVING executes per group via nested loop (EXPLAIN shows NESTED_LOOP_JOIN)
+- REDUNDANT_SCAN_ELIMINATION: Store_sales scanned 4 times, item table 2 times (EXPLAIN shows duplicate SEQ_SCAN patterns)
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- channel_bitmap_aggregation: Consolidate multiple scans into one with conditional aggregation for null-addr average
+- single_pass_aggregation: Compute item averages and store baseline in single scan
+- pushdown: Push store filter into consolidated scan CTE
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. channel_bitmap_aggregation (6.24x)
+
+**BEFORE (slow):**
+```sql
+select * from
+ (select count(*) h8_30_to_9
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 8 and time_dim.t_minute >= 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s1,
+ (select count(*) h9_to_9_30
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 9 and time_dim.t_minute < 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s2,
+ (select count(*) h9_30_to_10
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 9 and time_dim.t_minute >= 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s3,
+ (select count(*) h10_to_10_30
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 10 and time_dim.t_minute < 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s4,
+ (select count(*) h10_30_to_11
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 10 and time_dim.t_minute >= 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s5,
+ (select count(*) h11_to_11_30
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 11 and time_dim.t_minute < 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s6,
+ (select count(*) h11_30_to_12
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 11 and time_dim.t_minute >= 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s7,
+ (select count(*) h12_to_12_30
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 12 and time_dim.t_minute < 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s8;
+```
+
+**AFTER (fast):**
+[filtered_store]:
+```sql
+SELECT s_store_sk FROM store WHERE s_store_name = 'ese'
+```
+[filtered_hd]:
+```sql
+SELECT hd_demo_sk FROM household_demographics WHERE (hd_dep_count = -1 AND hd_vehicle_count <= 1) OR (hd_dep_count = 4 AND hd_vehicle_count <= 6) OR (hd_dep_count = 3 AND hd_vehicle_count <= 5)
+```
+[time_ranges]:
+```sql
+SELECT t_time_sk, CASE WHEN t_hour = 8 AND t_minute >= 30 THEN 1 WHEN t_hour = 9 AND t_minute < 30 THEN 2 WHEN t_hour = 9 AND t_minute >= 30 THEN 3 WHEN t_hour = 10 AND t_minute < 30 THEN 4 WHEN t_hour = 10 AND t_minute >= 30 THEN 5 WHEN t_hour = 11 AND t_minute < 30 THEN 6 WHEN t_hour = 11 AND t_minute >= 30 THEN 7 WHEN t_hour = 12 AND t_minute < 30 THEN 8 END AS time_window FROM time_dim WHERE (t_hour BETWEEN 8 AND 12)
+```
+[sales_with_time]:
+```sql
+SELECT tr.time_window FROM store_sales ss JOIN filtered_store fs ON ss.ss_store_sk = fs.s_store_sk JOIN filtered_hd fhd ON ss.ss_hdemo_sk = fhd.hd_demo_sk JOIN time_ranges tr ON ss.ss_sold_time_sk = tr.t_time_sk
+```
+[main_query]:
+```sql
+SELECT COUNT(CASE WHEN time_window = 1 THEN 1 END) AS h8_30_to_9, COUNT(CASE WHEN time_window = 2 THEN 1 END) AS h9_to_9_30, COUNT(CASE WHEN time_window = 3 THEN 1 END) AS h9_30_to_10, COUNT(CASE WHEN time_window = 4 THEN 1 END) AS h10_to_10_30, COUNT(CASE WHEN time_window = 5 THEN 1 END) AS h10_30_to_11, COUNT(CASE WHEN time_window = 6 THEN 1 END) AS h11_to_11_30, COUNT(CASE WHEN time_window = 7 THEN 1 END) AS h11_30_to_12, COUNT(CASE WHEN time_window = 8 THEN 1 END) AS h12_to_12_30 FROM sales_with_time
+```
+
+### 2. single_pass_aggregation (4.47x)
+
+**Principle:** Single-Pass Aggregation: consolidate multiple scalar subqueries on the same table into one CTE using CASE expressions inside aggregate functions. Reduces N separate table scans to 1 pass.
+
+**BEFORE (slow):**
+```sql
+select case when (select count(*) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) > 2972190
+            then (select avg(ss_ext_sales_price) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 1 and 20) end bucket1 ,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 21 and 40) > 4505785
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 21 and 40) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 21 and 40) end bucket2,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 41 and 60) > 1575726
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 41 and 60)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 41 and 60) end bucket3,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 61 and 80) > 3188917
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 61 and 80)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 61 and 80) end bucket4,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 81 and 100) > 3525216
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 81 and 100)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 81 and 100) end bucket5
+from reason
+where r_reason_sk = 1;
+```
+
+**AFTER (fast):**
+[store_sales_aggregates]:
+```sql
+SELECT SUM(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 ELSE 0 END) AS cnt1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_ext_discount_amt END) AS avg_disc1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_net_paid END) AS avg_paid1, SUM(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN 1 ELSE 0 END) AS cnt2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_ext_discount_amt END) AS avg_disc2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_net_paid END) AS avg_paid2, SUM(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN 1 ELSE 0 END) AS cnt3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_ext_discount_amt END) AS avg_disc3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_net_paid END) AS avg_paid3, SUM(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN 1 ELSE 0 END) AS cnt4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_ext_discount_amt END) AS avg_disc4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_net_paid END) AS avg_paid4, SUM(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN 1 ELSE 0 END) AS cnt5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_ext_discount_amt END) AS avg_disc5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_net_paid END) AS avg_paid5 FROM store_sales
+```
+[main_query]:
+```sql
+SELECT CASE WHEN cnt1 > 74129 THEN avg_disc1 ELSE avg_paid1 END AS bucket1, CASE WHEN cnt2 > 122840 THEN avg_disc2 ELSE avg_paid2 END AS bucket2, CASE WHEN cnt3 > 56580 THEN avg_disc3 ELSE avg_paid3 END AS bucket3, CASE WHEN cnt4 > 10097 THEN avg_disc4 ELSE avg_paid4 END AS bucket4, CASE WHEN cnt5 > 165306 THEN avg_disc5 ELSE avg_paid5 END AS bucket5 FROM store_sales_aggregates
+```
+
+### 3. pushdown (2.11x)
+
+**Principle:** Scan Consolidation: when multiple subqueries scan the same table with similar patterns, consolidate them into CTEs that compute all needed aggregates in fewer passes. Reduces N scans to fewer scans.
+
+**BEFORE (slow):**
+```sql
+select case when (select count(*) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) > 2972190
+            then (select avg(ss_ext_sales_price) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 1 and 20) end bucket1 ,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 21 and 40) > 4505785
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 21 and 40) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 21 and 40) end bucket2,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 41 and 60) > 1575726
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 41 and 60)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 41 and 60) end bucket3,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 61 and 80) > 3188917
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 61 and 80)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 61 and 80) end bucket4,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 81 and 100) > 3525216
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 81 and 100)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 81 and 100) end bucket5
+from reason
+where r_reason_sk = 1;
+```
+
+**AFTER (fast):**
+[quantity_1_20_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20
+```
+[quantity_21_40_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40
+```
+[quantity_41_60_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 41 AND 60
+```
+[quantity_61_80_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 61 AND 80
+```
+[quantity_81_100_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 81 AND 100
+```
+[main_query]:
+```sql
+SELECT CASE WHEN q1.cnt > 2972190 THEN q1.avg_ext_price ELSE q1.avg_net_profit END AS bucket1, CASE WHEN q2.cnt > 4505785 THEN q2.avg_ext_price ELSE q2.avg_net_profit END AS bucket2, CASE WHEN q3.cnt > 1575726 THEN q3.avg_ext_price ELSE q3.avg_net_profit END AS bucket3, CASE WHEN q4.cnt > 3188917 THEN q4.avg_ext_price ELSE q4.avg_net_profit END AS bucket4, CASE WHEN q5.cnt > 3525216 THEN q5.avg_ext_price ELSE q5.avg_net_profit END AS bucket5 FROM reason CROSS JOIN quantity_1_20_stats AS q1 CROSS JOIN quantity_21_40_stats AS q2 CROSS JOIN quantity_41_60_stats AS q3 CROSS JOIN quantity_61_80_stats AS q4 CROSS JOIN quantity_81_100_stats AS q5 WHERE r_reason_sk = 1
+```
+
+## Original SQL
+
+```sql
+-- start query 44 in stream 0 using template query44.tpl
+select asceding.rnk, i1.i_product_name best_performing, i2.i_product_name worst_performing
+from(select *
+     from (select item_sk,rank() over (order by rank_col asc) rnk
+           from (select ss_item_sk item_sk,avg(ss_net_profit) rank_col 
+                 from store_sales ss1
+                 where ss_store_sk = 146
+                 group by ss_item_sk
+                 having avg(ss_net_profit) > 0.9*(select avg(ss_net_profit) rank_col
+                                                  from store_sales
+                                                  where ss_store_sk = 146
+                                                    and ss_addr_sk is null
+                                                  group by ss_store_sk))V1)V11
+     where rnk  < 11) asceding,
+    (select *
+     from (select item_sk,rank() over (order by rank_col desc) rnk
+           from (select ss_item_sk item_sk,avg(ss_net_profit) rank_col
+                 from store_sales ss1
+                 where ss_store_sk = 146
+                 group by ss_item_sk
+                 having avg(ss_net_profit) > 0.9*(select avg(ss_net_profit) rank_col
+                                                  from store_sales
+                                                  where ss_store_sk = 146
+                                                    and ss_addr_sk is null
+                                                  group by ss_store_sk))V2)V21
+     where rnk  < 11) descending,
+item i1,
+item i2
+where asceding.rnk = descending.rnk 
+  and i1.i_item_sk=asceding.item_sk
+  and i2.i_item_sk=descending.item_sk
+order by asceding.rnk
+ LIMIT 100;
+
+-- end query 44 in stream 0 using template query44.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `rnk`
+  2. `best_performing`
+  3. `worst_performing`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K  — Build ascending and descending item rankings from store-level average net profit, filter both to top 10 ranks, join on rank number, and map item keys to product names.
+    ├── SCAN (store_sales AS ss1 (join), store_sales, item AS i1 (join), item AS i2 (join))
+    ├── JOIN (asceding.rnk = descending.rnk)
+    ├── JOIN (i1.i_item_sk = asceding.item_sk)
+    ├── JOIN (+1 more)
+    ├── AGG (GROUP BY)
+    ├── SORT (asceding.rnk ASC)
+    └── OUTPUT (rnk, best_performing, worst_performing)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

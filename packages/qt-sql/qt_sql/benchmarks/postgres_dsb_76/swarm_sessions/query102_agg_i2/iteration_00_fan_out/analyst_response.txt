@@ -1,0 +1,322 @@
+<reasoning>
+1. **CLASSIFY**: This is a multi-channel comparison query with self-join characteristics between store_sales and web_sales for the same customer/item within a 30-day window, plus inventory validation. It's a star-join with late dimension filtering and repeated fact scans (store_sales and web_sales are both large fact tables). The query has a non-equi join condition (inv_quantity_on_hand >= ss_quantity) and a date range correlation.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - **Total runtime**: 837.3ms, dominated by hash joins and nested loops.
+   - **Major time consumers**:
+     1. Seq Scan on web_sales (381.8ms per worker × 3 workers = ~1145ms total scan time). Filter removes 1.9M of 2.4M rows (79% reduction).
+     2. Hash Join (web_sales ↔ customer): 528.3ms per worker × 3 = ~1585ms total. Large hash table from customer (22K rows).
+     3. Nested Loop (store_sales index scan): 0.2ms per loop × 4148 loops × 3 workers = ~2489ms total. This is the dominant cost - repeated index lookups.
+   - **Row count drops**: 
+     - web_sales: 2.4M → 482K after wholesale_cost filter.
+     - customer_address: 84K → 12K after state filter.
+     - item: 34K → 1,255 after category/manager filter.
+   - **Missed opportunities**: 
+     - store_sales is scanned repeatedly via nested loop (4148 × 3 workers). No pre-filtering of store_sales by date or item/customer constraints.
+     - The date range condition (d2 between d1 and d1+30) is applied late as a join filter after both date_dim tables are joined.
+     - inventory non-equi join is applied late after other joins.
+   - **Optimizer already does**: Hash joins for large tables, parallel execution, index scans on store_sales.
+   - **Scan counts**: web_sales scanned once, store_sales scanned 4148×3 times (12,444 times), inventory scanned once.
+
+3. **GAP MATCHING**:
+   - **COMMA_JOIN_WEAKNESS**: Query uses comma-separated implicit joins. ✓ Active gap.
+   - **NON_EQUI_JOIN_INPUT_BLINDNESS**: inv_quantity_on_hand >= ss_quantity applied late. ✓ Active gap.
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: store_sales and web_sales are both scanned and joined multiple ways (via customer, item, date). Could materialize once. ✓ Active gap.
+   - **CORRELATED_SUBQUERY_PARALYSIS**: No correlated subqueries. ✗ Not applicable.
+
+4. **AGGREGATION TRAP CHECK**: Simple COUNT(*) with GROUP BY. No sensitive aggregates. Safe to restructure.
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   1. **pg_materialized_dimension_fact_prefilter** (2.68x): Pre-filter both dimension and fact tables before non-equi join. Targets inventory bottleneck.
+   2. **pg_dimension_prefetch_star** (3.32x): Pre-filter all selective dimensions into CTEs + explicit JOINs. Targets comma-join weakness.
+   3. **pg_self_join_decomposition** (3.93x): Materialize shared fact scans once. Targets repeated store_sales scans.
+   4. **star_join_prefetch + scan_consolidation_pivot** (novel compound): Consolidate fact table accesses and pivot date correlation.
+
+6. **LOGICAL TREE DESIGN**:
+   For Worker 1: Dimension CTEs → fact CTEs → join with explicit syntax.
+   For Worker 2: Pre-filter dimensions → join with web_sales → join with store_sales.
+   For Worker 3: Materialize combined fact scan → derive both channel aggregates.
+   For Worker 4: Novel combination of prefetch and pivot.
+
+All CTEs must include columns referenced downstream. Check join columns, grouping columns, and filter columns.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Compare customer demographics for items sold through both store and web channels within 30 days, where inventory stock meets sales quantity. All joins are INNER (must match all sides). Aggregation is simple COUNT(*) with GROUP BY on 4 demographic columns - no sensitive aggregates. Filter dependencies: d2 date range depends on d1 date; inventory quantity check depends on store_sales quantity; state filter applies to customer_address.
+
+BOTTLENECK_DIAGNOSIS:
+Dominant cost is nested loop index scans on store_sales (2.5 seconds total) triggered by hash join output of 4,148 rows per worker. The query is join-bound with large intermediate hash tables (customer 22K rows). Cardinality flow: web_sales 2.4M → 482K after filter → hash join with customer 22K → 1,383 rows → nested loop probes store_sales 4,148 times → final aggregation to 0 rows. Optimizer already handles parallel hash joins well and uses indexes for store_sales lookups. Logical-tree costs misleading: 99% cost on main_query but actual time dominated by nested loop inside.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, cnt exactly.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (ss_item_sk, ss_customer_sk, ss_quantity, ws_item_sk, ws_bill_customer_sk, etc.).
+- LITERAL_PRESERVATION: Must preserve all filter values (1998, AR/CA/KS/NY/VA, 76-96, etc.).
+- SEMANTIC_EQUIVALENCE: Must return same rows and ordering.
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated implicit joins (EXPLAIN shows optimizer using hash/nested loops but may misestimate).
+- NON_EQUI_JOIN_INPUT_BLINDNESS: inv_quantity_on_hand >= ss_quantity applied late after joins (EXPLAIN shows Filter on inventory scan).
+- CROSS_CTE_PREDICATE_BLINDNESS: store_sales scanned repeatedly via nested loop (EXPLAIN shows 4,148 loops × 3 workers).
+
+REGRESSION_WARNINGS:
+1. CTE blocking parallelism (observed regression in heavy aggregation queries):
+   CAUSE: Materialized CTEs execute single-threaded, preventing parallel scans of large fact tables.
+   RULE: For web_sales/store_sales scans, avoid wrapping entire fact tables in CTEs if they benefit from parallel scans.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: pg_materialized_dimension_fact_prefilter
+TARGET_LOGICAL_TREE:
+  filtered_dims -> filtered_facts -> joined_facts -> final_aggregation
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: i_category IN ('Men', 'Shoes', 'Sports') AND i_manager_id IN (6, 11, 16, 17, 19, 28, 47, 82, 88, 98)
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: 1,255
+    CONSUMERS: filtered_web_sales, filtered_store_sales
+  filtered_customer:
+    FROM: customer JOIN customer_address ON c_current_addr_sk = ca_address_sk AND ca_state IN ('AR', 'CA', 'KS', 'NY', 'VA')
+                  JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk
+                  JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk
+    OUTPUT: c_customer_sk, cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count
+    EXPECTED_ROWS: 22K
+    CONSUMERS: filtered_web_sales, filtered_store_sales
+  filtered_dates:
+    FROM: date_dim d1
+    WHERE: d1.d_year = 1998
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 261
+    CONSUMERS: filtered_store_sales, date_range
+  filtered_web_sales:
+    FROM: web_sales JOIN filtered_item ON ws_item_sk = i_item_sk
+                    JOIN filtered_customer ON ws_bill_customer_sk = c_customer_sk
+                    JOIN date_dim d2 ON ws_sold_date_sk = d2.d_date_sk
+    WHERE: ws_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk, ws_warehouse_sk
+    EXPECTED_ROWS: ~43K
+    CONSUMERS: joined_facts
+  filtered_store_sales:
+    FROM: store_sales JOIN filtered_item ON ss_item_sk = i_item_sk
+                      JOIN filtered_customer ON ss_customer_sk = c_customer_sk
+                      JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_item_sk, ss_customer_sk, ss_quantity, ss_sold_date_sk
+    EXPECTED_ROWS: unknown (but reduced)
+    CONSUMERS: joined_facts
+  date_range:
+    FROM: filtered_dates d1, date_dim d2
+    WHERE: d2.d_date BETWEEN d1.d_date AND (d1.d_date + interval '30 day')
+    OUTPUT: d1.d_date_sk, d2.d_date_sk
+    EXPECTED_ROWS: small
+    CONSUMERS: joined_facts
+  joined_facts:
+    FROM: filtered_web_sales ws JOIN filtered_store_sales ss ON ws.ws_item_sk = ss.ss_item_sk AND ws.ws_bill_customer_sk = ss.ss_customer_sk
+                                JOIN date_range ON ss.ss_sold_date_sk = d1.d_date_sk AND ws.ws_sold_date_sk = d2.d_date_sk
+                                JOIN warehouse ON ws.ws_warehouse_sk = w_warehouse_sk
+                                JOIN store ON s_state = w_state
+                                JOIN inventory ON inv_warehouse_sk = ws.ws_warehouse_sk AND inv_item_sk = ss.ss_item_sk AND inv_date_sk = ss.ss_sold_date_sk
+    WHERE: inv_quantity_on_hand >= ss_quantity
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count
+    EXPECTED_ROWS: small
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: joined_facts
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count
+    AGGREGATE: COUNT(*) as cnt
+    ORDER BY: cnt
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, cnt
+    EXPECTED_ROWS: 0
+    CONSUMERS: output
+EXAMPLES: pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+Apply the staged reduction pattern: create CTEs for filtered dimensions (item, customer with demographics) and filtered facts (web_sales, store_sales) before the complex joins. Ignore that example Q072 had a different non-equi join structure - the principle of reducing both sides before inequality applies.
+HAZARD_FLAGS:
+- Creating CTEs for large fact tables may block parallel execution of web_sales scan.
+- Must ensure date_range CTE correctly correlates d1 and d2 dates.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: pg_dimension_prefetch_star
+TARGET_LOGICAL_TREE:
+  dim_ctes -> fact_joins -> final_aggregation
+NODE_CONTRACTS:
+  dim_item:
+    FROM: item
+    WHERE: i_category IN ('Men', 'Shoes', 'Sports') AND i_manager_id IN (6, 11, 16, 17, 19, 28, 47, 82, 88, 98)
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: 1,255
+    CONSUMERS: fact_joins
+  dim_customer:
+    FROM: customer 
+          JOIN customer_address ON c_current_addr_sk = ca_address_sk
+          JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk
+          JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk
+    WHERE: ca_state IN ('AR', 'CA', 'KS', 'NY', 'VA')
+    OUTPUT: c_customer_sk, cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count
+    EXPECTED_ROWS: 22K
+    CONSUMERS: fact_joins
+  dim_date_1998:
+    FROM: date_dim
+    WHERE: d_year = 1998
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 261
+    CONSUMERS: fact_joins
+  fact_joins:
+    FROM: web_sales 
+          JOIN store_sales ON ws_item_sk = ss_item_sk AND ws_bill_customer_sk = ss_customer_sk
+          JOIN dim_item ON ss_item_sk = i_item_sk
+          JOIN dim_customer ON ss_customer_sk = c_customer_sk
+          JOIN dim_date_1998 d1 ON ss_sold_date_sk = d1.d_date_sk
+          JOIN date_dim d2 ON ws_sold_date_sk = d2.d_date_sk
+          JOIN warehouse ON ws_warehouse_sk = w_warehouse_sk
+          JOIN store ON s_state = w_state
+          JOIN inventory ON inv_warehouse_sk = ws_warehouse_sk AND inv_item_sk = ss_item_sk AND inv_date_sk = ss_sold_date_sk
+    WHERE: d2.d_date BETWEEN d1.d_date AND (d1.d_date + interval '30 day')
+      AND inv_quantity_on_hand >= ss_quantity
+      AND ws_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count
+    EXPECTED_ROWS: small
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: fact_joins
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count
+    AGGREGATE: COUNT(*) as cnt
+    ORDER BY: cnt
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, cnt
+    EXPECTED_ROWS: 0
+    CONSUMERS: output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+Apply pre-filtering of selective dimensions (item, customer with address/demographics, date) into CTEs, then use explicit JOIN syntax instead of comma joins. From pg_date_cte_explicit_join, also isolate date filter but keep both date_dim references separate. Ignore that these examples didn't have the inventory non-equi join.
+HAZARD_FLAGS:
+- Explicit JOIN syntax may change join order; must preserve semantics with date range condition.
+- Need to include both date_dim tables (d1 filtered, d2 unfiltered) in explicit joins.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: pg_self_join_decomposition
+TARGET_LOGICAL_TREE:
+  base_sales -> web_sales_part -> store_sales_part -> joined -> final_aggregation
+NODE_CONTRACTS:
+  base_sales:
+    FROM: (SELECT ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk, ws_warehouse_sk, ws_wholesale_cost FROM web_sales WHERE ws_wholesale_cost BETWEEN 76 AND 96
+           UNION ALL
+           SELECT ss_item_sk, ss_customer_sk, ss_sold_date_sk, NULL, NULL FROM store_sales) sales
+          JOIN item ON sales.item_sk = i_item_sk AND i_category IN ('Men', 'Shoes', 'Sports') AND i_manager_id IN (6, 11, 16, 17, 19, 28, 47, 82, 88, 98)
+          JOIN customer ON sales.customer_sk = c_customer_sk
+          JOIN customer_address ON c_current_addr_sk = ca_address_sk AND ca_state IN ('AR', 'CA', 'KS', 'NY', 'VA')
+          JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk
+          JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk
+    OUTPUT: sales.item_sk, sales.customer_sk, sales.sold_date_sk, sales.warehouse_sk, sales.wholesale_cost, 
+            cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count,
+            CASE WHEN sales.wholesale_cost IS NOT NULL THEN 'web' ELSE 'store' END as channel
+    EXPECTED_ROWS: web_sales 43K + store_sales unknown
+    CONSUMERS: web_sales_part, store_sales_part
+  web_sales_part:
+    FROM: base_sales
+    WHERE: channel = 'web'
+    OUTPUT: item_sk, customer_sk, sold_date_sk, warehouse_sk, cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count
+    EXPECTED_ROWS: ~43K
+    CONSUMERS: joined
+  store_sales_part:
+    FROM: base_sales
+    WHERE: channel = 'store'
+    OUTPUT: item_sk, customer_sk, sold_date_sk, cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count
+    EXPECTED_ROWS: unknown
+    CONSUMERS: joined
+  joined:
+    FROM: web_sales_part ws JOIN store_sales_part ss ON ws.item_sk = ss.item_sk AND ws.customer_sk = ss.customer_sk
+                            JOIN date_dim d1 ON ss.sold_date_sk = d1.d_date_sk AND d1.d_year = 1998
+                            JOIN date_dim d2 ON ws.sold_date_sk = d2.d_date_sk
+                            JOIN warehouse ON ws.warehouse_sk = w_warehouse_sk
+                            JOIN store ON s_state = w_state
+                            JOIN inventory ON inv_warehouse_sk = ws.warehouse_sk AND inv_item_sk = ss.item_sk AND inv_date_sk = ss.sold_date_sk
+    WHERE: d2.d_date BETWEEN d1.d_date AND (d1.d_date + interval '30 day')
+      AND inv_quantity_on_hand >= (SELECT ss_quantity FROM store_sales WHERE ss_item_sk = ss.item_sk AND ss_customer_sk = ss.customer_sk AND ss_sold_date_sk = ss.sold_date_sk)
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count
+    EXPECTED_ROWS: small
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: joined
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count
+    AGGREGATE: COUNT(*) as cnt
+    ORDER BY: cnt
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, cnt
+    EXPECTED_ROWS: 0
+    CONSUMERS: output
+EXAMPLES: pg_self_join_decomposition
+EXAMPLE_ADAPTATION:
+Apply the shared materialization pattern: create a base CTE that scans both fact tables once with shared dimension joins, then split into web/store parts. Ignore that example Q65 aggregated differently - the principle of single fact+dimension scan applies.
+HAZARD_FLAGS:
+- UNION ALL in base_sales may duplicate rows if same sale appears in both channels (unlikely but possible).
+- Subquery for ss_quantity in joined may re-introduce nested loops; consider including ss_quantity in store_sales_part output.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: star_join_prefetch + scan_consolidation_pivot
+TARGET_LOGICAL_TREE:
+  dim_ctes -> consolidated_facts -> pivoted_joins -> final_aggregation
+NODE_CONTRACTS:
+  dim_item:
+    FROM: item
+    WHERE: i_category IN ('Men', 'Shoes', 'Sports') AND i_manager_id IN (6, 11, 16, 17, 19, 28, 47, 82, 88, 98)
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: 1,255
+    CONSUMERS: consolidated_facts
+  dim_customer:
+    FROM: customer 
+          JOIN customer_address ON c_current_addr_sk = ca_address_sk
+          JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk
+          JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk
+    WHERE: ca_state IN ('AR', 'CA', 'KS', 'NY', 'VA')
+    OUTPUT: c_customer_sk, cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count
+    EXPECTED_ROWS: 22K
+    CONSUMERS: consolidated_facts
+  dim_date_1998:
+    FROM: date_dim
+    WHERE: d_year = 1998
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 261
+    CONSUMERS: consolidated_facts
+  consolidated_facts:
+    FROM: (SELECT ss_item_sk, ss_customer_sk, ss_sold_date_sk, ss_quantity, 'store' as channel FROM store_sales
+           UNION ALL
+           SELECT ws_item_sk, ws_bill_customer_sk, ws_sold_date_sk, NULL, 'web' FROM web_sales WHERE ws_wholesale_cost BETWEEN 76 AND 96) sales
+          JOIN dim_item ON sales.item_sk = i_item_sk
+          JOIN dim_customer ON sales.customer_sk = c_customer_sk
+          LEFT JOIN dim_date_1998 d1 ON sales.channel = 'store' AND sales.sold_date_sk = d1.d_date_sk
+    WHERE: (channel = 'store') OR (channel = 'web')
+    OUTPUT: sales.item_sk, sales.customer_sk, sales.sold_date_sk, sales.quantity, sales.channel,
+            cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count,
+            d1.d_date as store_date
+    EXPECTED_ROWS: store_sales filtered + web_sales filtered
+    CONSUMERS: pivoted_joins
+  pivoted_joins:
+    FROM: consolidated_facts store 
+          JOIN consolidated_facts web ON store.item_sk = web.item_sk AND store.customer_sk = web.customer_sk AND web.channel = 'web'
+          JOIN date_dim d2 ON web.sold_date_sk = d2.d_date_sk
+          JOIN warehouse ON web.warehouse_sk = w_warehouse_sk
+          JOIN store ON s_state = w_state
+          JOIN inventory ON inv_warehouse_sk = web.warehouse_sk AND inv_item_sk = store.item_sk AND inv_date_sk = store.sold_date_sk
+    WHERE: store.channel = 'store'
+      AND d2.d_date BETWEEN store.store_date AND (store.store_date + interval '30 day')
+      AND inv_quantity_on_hand >= store.quantity
+    OUTPUT: store.cd_gender, store.cd_marital_status, store.cd_education_status, store.hd_vehicle_count
+    EXPECTED_ROWS: small
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: pivoted_joins
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count
+    AGGREGATE: COUNT(*) as cnt
+    ORDER BY: cnt
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, cnt
+    EXPECTED_ROWS: 0
+    CONSUMERS: output
+EXAMPLES: pg_dimension_prefetch_star, single_pass_aggregation
+EXAMPLE_ADAPTATION:
+From pg_dimension_prefetch_star, apply dimension CTEs. From single_pass_aggregation, apply consolidation of both fact scans into one UNION ALL with channel discriminator. Ignore that single_pass_aggregation used CASE aggregates - we're using UNION ALL then self-join.
+HAZARD_FLAGS:
+- Self-join on consolidated_facts may be large; ensure filters applied early.
+- Must handle NULL quantity for web sales in inventory check.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

@@ -1,0 +1,112 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [+] date_cte  [~]  Cost: 1%  Rows: 427  — Pre-filter date_dim for relevant months
+│   ├── SCAN (date_dim)
+│   ├── FILTER ((d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1)))
+│   └── OUTPUT (d_date_sk, d_year, d_moy)
+├── [+] call_center_cte  [~]  Cost: 0%  Rows: 24  — Unfiltered call_center keys
+│   ├── SCAN (call_center)
+│   └── OUTPUT (cc_call_center_sk, cc_name)
+├── [+] item_cte  [~]  Cost: 1%  Rows: 102K  — Unfiltered item keys
+│   ├── SCAN (item)
+│   └── OUTPUT (i_item_sk, i_category, i_brand)
+├── [+] filtered_fact  [~]  Cost: 95%  Rows: 3.5M  — Join catalog_sales with all filtered dimensions
+│   ├── SCAN (catalog_sales)
+│   ├── JOIN (cs_sold_date_sk = d_date_sk) [date_cte]
+│   ├── JOIN (cs_call_center_sk = cc_call_center_sk) [call_center_cte]
+│   ├── JOIN (cs_item_sk = i_item_sk) [item_cte]
+│   └── OUTPUT (i_category, i_brand, cc_name, d_year, d_moy, cs_sales_price)
+├── [CTE] v1  [~]  Cost: 2%  Rows: 148K  — Same aggregation/window, now on filtered_fact
+│   ├── SCAN (filtered_fact)
+│   ├── AGG (GROUP BY)
+│   ├── WINDOW
+│   ├── SORT (d_year ASC, d_moy ASC)
+│   └── OUTPUT (i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn)
+├── [CTE] v2  [=]  Cost: 1%  Rows: ~1K  — Unchanged self-join
+│   ├── SCAN (v1, v1 AS v1_lag, v1 AS v1_lead)
+│   ├── JOIN (v1.i_category = v1_lag.i_category)
+│   ├── JOIN (v1.i_category = v1_lead.i_category)
+│   ├── JOIN (+6 more)
+│   └── OUTPUT (i_brand, d_year, avg_monthly_sales, sum_sales, psum, nsum)
+└── [MAIN] main_query  [=]  Cost: 0%  Rows: ~1K  — Unchanged filter/order
+    ├── SCAN (v2)
+    ├── FILTER (d_year = 1999)
+    ├── FILTER (avg_monthly_sales > 0)
+    ├── FILTER (+1 more)
+    ├── SORT (sum_sales - avg_monthly_sales ASC, nsum ASC)
+    └── OUTPUT (*)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter date_dim into CTE with surrogate keys", "applied_to": ["date_cte"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Extract call_center keys into lightweight CTE", "applied_to": ["call_center_cte"]},
+    {"id": "R3", "type": "dimension_cte_isolate", "description": "Extract item keys into CTE (unfiltered but small)", "applied_to": ["item_cte"]},
+    {"id": "R4", "type": "prefetch_fact_join", "description": "Join all dimension CTEs with catalog_sales in single stage", "applied_to": ["filtered_fact"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_year, d_moy FROM date_dim WHERE (d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1))",
+        "interfaces": {"outputs": ["d_date_sk", "d_year", "d_moy"], "consumes": []}
+      },
+      "call_center_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cc_call_center_sk, cc_name FROM call_center",
+        "interfaces": {"outputs": ["cc_call_center_sk", "cc_name"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_category, i_brand FROM item",
+        "interfaces": {"outputs": ["i_item_sk", "i_category", "i_brand"], "consumes": []}
+      },
+      "filtered_fact": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i.i_category, i.i_brand, cc.cc_name, d.d_year, d.d_moy, cs.cs_sales_price FROM catalog_sales cs JOIN date_cte d ON cs.cs_sold_date_sk = d.d_date_sk JOIN call_center_cte cc ON cs.cs_call_center_sk = cc.cc_call_center_sk JOIN item_cte i ON cs.cs_item_sk = i.i_item_sk",
+        "interfaces": {"outputs": ["i_category", "i_brand", "cc_name", "d_year", "d_moy", "cs_sales_price"], "consumes": ["date_cte", "call_center_cte", "item_cte"]}
+      },
+      "v1": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_category, i_brand, cc_name, d_year, d_moy, sum(cs_sales_price) AS sum_sales, avg(sum(cs_sales_price)) OVER (PARTITION BY i_category, i_brand, cc_name, d_year) AS avg_monthly_sales, rank() OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy) AS rn FROM filtered_fact GROUP BY i_category, i_brand, cc_name, d_year, d_moy",
+        "interfaces": {"outputs": ["i_category", "i_brand", "cc_name", "d_year", "d_moy", "sum_sales", "avg_monthly_sales", "rn"], "consumes": ["filtered_fact"]}
+      },
+      "v2": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["i_brand", "d_year", "avg_monthly_sales", "sum_sales", "psum", "nsum"], "consumes": ["v1"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["*"], "consumes": ["v2"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "call_center_cte", "item_cte", "filtered_fact", "v1", "v2", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), call_center_cte AS ({call_center_cte}), item_cte AS ({item_cte}), filtered_fact AS ({filtered_fact}), v1 AS ({v1}), v2 AS ({v2}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Created three dimension CTEs (date, call_center, item) with surrogate keys, then joined them with the fact table in a single filtered_fact CTE before aggregation. This allows predicate pushdown and smaller hash tables during the fact table probe.
+
+**Expected speedup:** 1.5-2.0x (baseline 1467ms → ~800ms) due to early date filtering reducing fact table joins and columnar scan efficiency.

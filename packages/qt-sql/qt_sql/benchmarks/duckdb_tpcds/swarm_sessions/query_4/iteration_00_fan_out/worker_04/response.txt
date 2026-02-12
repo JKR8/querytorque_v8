@@ -1,0 +1,89 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_cte  [+]  Cost: <1%  Rows: ~730  — Filter date_dim to years 1999, 2000 only
+│   └── OUTPUT (d_date_sk, d_year)
+├── [CTE] sales_union_agg  [~]  Cost: 40%  Rows: ~958K  — Union store/catalog/web sales for both years with simplified projection (no aggregation yet)
+│   ├── SCAN (customer, store_sales, date_cte)
+│   ├── JOIN (c_customer_sk = ss_customer_sk)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── SCAN (customer, catalog_sales, date_cte)
+│   ├── JOIN (c_customer_sk = cs_bill_customer_sk)
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── SCAN (customer, web_sales, date_cte)
+│   ├── JOIN (c_customer_sk = ws_bill_customer_sk)
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── UNION ALL (3 branches)
+│   └── OUTPUT (c_customer_sk, c_customer_id, c_first_name, c_last_name, c_birth_country, amount, d_year, sale_type)
+├── [CTE] pivot_cte  [~]  Cost: 35%  Rows: ~650K  — Pivot year totals within each channel using conditional aggregation
+│   ├── SCAN (sales_union_agg)
+│   ├── AGG (GROUP BY c_customer_id, c_first_name, c_last_name, c_birth_country, sale_type)
+│   ├── AGG_EXPR (SUM(CASE WHEN d_year=1999 THEN amount END) as year_total_1999)
+│   ├── AGG_EXPR (SUM(CASE WHEN d_year=2000 THEN amount END) as year_total_2000)
+│   └── OUTPUT (c_customer_id, c_first_name, c_last_name, c_birth_country, sale_type, year_total_1999, year_total_2000)
+├── [-] year_total  — REMOVED: Original CTE eliminated entirely
+└── [MAIN] main_simple_join  [~]  Cost: 24%  Rows: ~619  — Triple self-join on customer_id with channel filters and growth ratio comparisons
+    ├── SCAN (pivot_cte AS s (join), pivot_cte AS c (join), pivot_cte AS w (join))
+    ├── JOIN (s.c_customer_id = c.c_customer_id AND s.c_customer_id = w.c_customer_id)
+    ├── FILTER (s.sale_type = 's' AND c.sale_type = 'c' AND w.sale_type = 'w')
+    ├── FILTER (s.year_total_1999 > 0 AND c.year_total_1999 > 0 AND w.year_total_1999 > 0)
+    ├── FILTER ((c.year_total_2000 / c.year_total_1999) > (s.year_total_2000 / s.year_total_1999))
+    ├── FILTER ((c.year_total_2000 / c.year_total_1999) > (w.year_total_2000 / w.year_total_1999))
+    ├── SORT (s.c_customer_id, s.c_first_name, s.c_last_name, s.c_birth_country)
+    └── OUTPUT (customer_id, customer_first_name, customer_last_name, customer_birth_country)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extract date filter into reusable CTE", "applied_to": ["date_cte"]},
+    {"id": "R2", "type": "union_consolidation", "description": "Consolidate three channel queries into single UNION ALL before aggregation", "applied_to": ["sales_union_agg"]},
+    {"id": "R3", "type": "single_pass_aggregation", "description": "Replace per-channel/year subqueries with conditional aggregation in pivot_cte", "applied_to": ["pivot_cte"]},
+    {"id": "R4", "type": "union_cte_split", "description": "Eliminate original year_total CTE entirely to avoid redundant materialization", "applied_to": ["year_total"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk, d_year FROM date_dim WHERE d_year IN (1999, 2000)",
+        "interfaces": {"outputs": ["d_date_sk", "d_year"], "consumes": []}
+      },
+      "sales_union_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c.c_customer_sk, c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country, ((ss_ext_list_price - ss_ext_wholesale_cost - ss_ext_discount_amt) + ss_ext_sales_price) / 2 AS amount, d.d_year, 's' AS sale_type FROM customer c, store_sales ss, date_cte d WHERE c.c_customer_sk = ss.ss_customer_sk AND ss.ss_sold_date_sk = d.d_date_sk UNION ALL SELECT c.c_customer_sk, c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country, ((cs_ext_list_price - cs_ext_wholesale_cost - cs_ext_discount_amt) + cs_ext_sales_price) / 2, d.d_year, 'c' FROM customer c, catalog_sales cs, date_cte d WHERE c.c_customer_sk = cs.cs_bill_customer_sk AND cs.cs_sold_date_sk = d.d_date_sk UNION ALL SELECT c.c_customer_sk, c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country, ((ws_ext_list_price - ws_ext_wholesale_cost - ws_ext_discount_amt) + ws_ext_sales_price) / 2, d.d_year, 'w' FROM customer c, web_sales ws, date_cte d WHERE c.c_customer_sk = ws.ws_bill_customer_sk AND ws.ws_sold_date_sk = d.d_date_sk",
+        "interfaces": {"outputs": ["c_customer_sk", "c_customer_id", "c_first_name", "c_last_name", "c_birth_country", "amount", "d_year", "sale_type"], "consumes": ["date_cte"]}
+      },
+      "pivot_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_id, c_first_name, c_last_name, c_birth_country, sale_type, SUM(CASE WHEN d_year = 1999 THEN amount END) AS year_total_1999, SUM(CASE WHEN d_year = 2000 THEN amount END) AS year_total_2000 FROM sales_union_agg GROUP BY c_customer_id, c_first_name, c_last_name, c_birth_country, sale_type",
+        "interfaces": {"outputs": ["c_customer_id", "c_first_name", "c_last_name", "c_birth_country", "sale_type", "year_total_1999", "year_total_2000"], "consumes": ["sales_union_agg"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s.c_customer_id AS customer_id, s.c_first_name AS customer_first_name, s.c_last_name AS customer_last_name, s.c_birth_country AS customer_birth_country FROM pivot_cte s, pivot_cte c, pivot_cte w WHERE s.c_customer_id = c.c_customer_id AND s.c_customer_id = w.c_customer_id AND s.sale_type = 's' AND c.sale_type = 'c' AND w.sale_type = 'w' AND s.year_total_1999 > 0 AND c.year_total_1999 > 0 AND w.year_total_1999 > 0 AND CASE WHEN c.year_total_1999 > 0 THEN c.year_total_2000 / c.year_total_1999 END > CASE WHEN s.year_total_1999 > 0 THEN s.year_total_2000 / s.year_total_1999 END AND CASE WHEN c.year_total_1999 > 0 THEN c.year_total_2000 / c.year_total_1999 END > CASE WHEN w.year_total_1999 > 0 THEN w.year_total_2000 / w.year_total_1999 END ORDER BY s.c_customer_id, s.c_first_name, s.c_last_name, s.c_birth_country LIMIT 100",
+        "interfaces": {"outputs": ["customer_id", "customer_first_name", "customer_last_name", "customer_birth_country"], "consumes": ["pivot_cte"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "sales_union_agg", "pivot_cte", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), sales_union_agg AS ({sales_union_agg}), pivot_cte AS ({pivot_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Consolidated six separate year/channel subqueries into a single UNION ALL followed by conditional aggregation, eliminating 5 redundant table scans. The date filter is isolated into a reusable CTE to avoid repeated dimension table scans.
+
+**Expected speedup**: 4-6x reduction in I/O and compute (from 6 fact table scans to 1 per channel, 6 date_dim scans to 1).

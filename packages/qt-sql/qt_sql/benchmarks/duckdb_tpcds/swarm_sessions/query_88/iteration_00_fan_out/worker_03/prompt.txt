@@ -1,0 +1,391 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Count store sales in eight consecutive half-hour windows from 8:30-12:30 at store "ese" for households matching three specific dependent/vehicle count combinations. Joins are INNER (all four tables must match). Aggregation is COUNT(*), which is duplicate-safe and grouping-insensitive. Time window filters depend on time_dim joins; store filter depends on store join; household filters depend on household_demographics join.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+time_filter_cte -> store_filter_cte -> household_filter_cte -> fact_join_cte -> windowed_aggregates
+NODE_CONTRACTS:
+  time_filter_cte:
+    FROM: time_dim
+    WHERE: (t_hour=8 AND t_minute>=30) OR ... [all 8 windows]
+    OUTPUT: t_time_sk, t_hour, t_minute
+    EXPECTED_ROWS: 14,400
+    CONSUMERS: fact_join_cte
+  store_filter_cte:
+    FROM: store
+    WHERE: s_store_name = 'ese'
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 14
+    CONSUMERS: fact_join_cte
+  household_filter_cte:
+    FROM: household_demographics
+    WHERE: ((hd_dep_count = -1 AND hd_vehicle_count<=1) OR (hd_dep_count = 4 AND hd_vehicle_count<=6) OR (hd_dep_count = 3 AND hd_vehicle_count<=5))
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1,440
+    CONSUMERS: fact_join_cte
+  fact_join_cte:
+    FROM: store_sales
+    JOIN time_filter_cte ON ss_sold_time_sk = t_time_sk
+    JOIN store_filter_cte ON ss_store_sk = s_store_sk
+    JOIN household_filter_cte ON ss_hdemo_sk = hd_demo_sk
+    OUTPUT: t_hour, t_minute
+    EXPECTED_ROWS: 15K-45K
+    CONSUMERS: windowed_aggregates
+  windowed_aggregates: (same as Worker 1)
+
+NODE_CONTRACTS:
+time_filter_cte:
+    FROM: time_dim
+    WHERE: (t_hour=8 AND t_minute>=30) OR ... [all 8 windows]
+    OUTPUT: t_time_sk, t_hour, t_minute
+    EXPECTED_ROWS: 14,400
+    CONSUMERS: fact_join_cte
+  store_filter_cte:
+    FROM: store
+    WHERE: s_store_name = 'ese'
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 14
+    CONSUMERS: fact_join_cte
+  household_filter_cte:
+    FROM: household_demographics
+    WHERE: ((hd_dep_count = -1 AND hd_vehicle_count<=1) OR (hd_dep_count = 4 AND hd_vehicle_count<=6) OR (hd_dep_count = 3 AND hd_vehicle_count<=5))
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1,440
+    CONSUMERS: fact_join_cte
+  fact_join_cte:
+    FROM: store_sales
+    JOIN time_filter_cte ON ss_sold_time_sk = t_time_sk
+    JOIN store_filter_cte ON ss_store_sk = s_store_sk
+    JOIN household_filter_cte ON ss_hdemo_sk = hd_demo_sk
+    OUTPUT: t_hour, t_minute
+    EXPECTED_ROWS: 15K-45K
+    CONSUMERS: windowed_aggregates
+  windowed_aggregates: (same as Worker 1)
+
+## Hazard Flags (avoid these specific risks)
+
+- Do not cross-join the three dimension CTEs (join them only through fact table).
+- Ensure each CTE includes surrogate keys for joining.
+
+## Regression Warnings (observed failures on similar queries)
+
+1. materialize_cte (observed regression 0.14x):
+   CAUSE: Converting EXISTS to materialized CTE forced full scan.
+   RULE: Do not convert EXISTS subqueries to materialized CTEs (query has no EXISTS).
+2. or_to_union (observed regression 0.59x):
+   CAUSE: Splitting same-column ORs into UNION ALL doubled fact scans.
+   RULE: Do not split household_demographics OR (optimizer already handles).
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Query must output 8 columns (h8_30_to_9 through h12_to_12_30).
+- CTE_COLUMN_COMPLETENESS: Any CTE must include ss_sold_time_sk, ss_hdemo_sk, ss_store_sk for downstream joins.
+- LITERAL_PRESERVATION: Preserve exact values: store name 'ese', hour=8/9/10/11/12, minute thresholds 30, household condition values (-1,4,3, +2).
+- SEMANTIC_EQUIVALENCE: Must produce identical 8 counts.
+- REDUNDANT_SCAN_ELIMINATION: EXPLAIN shows 8 store_sales scans at ~230ms each.
+- CROSS_CTE_PREDICATE_BLINDNESS: Time predicates (t_hour, t_minute) not pushed into store_sales scan.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+dimension_cte_isolate: Apply pre-filtering of all three dimension tables into separate CTEs, then join with fact. Ignore the promotion/date specifics (use time/store/household).
+  multi_dimension_prefetch: Apply pre-filtering of multiple dimensions in parallel. Ignore the unfiltered dimension CTE hazard (all CTEs have WHERE).
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. dimension_cte_isolate (1.93x)
+
+**Principle:** Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
+
+**BEFORE (slow):**
+```sql
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year = 2000
+```
+[filtered_customer_demographics]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'
+```
+[filtered_promotions]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+```
+[joined_facts]:
+```sql
+SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales AS cs JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk
+```
+[main_query]:
+```sql
+SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM joined_facts AS jf JOIN item AS i ON jf.cs_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
+```
+
+### 2. multi_dimension_prefetch (2.71x)
+
+**Principle:** Multi-Dimension Prefetch: when multiple dimension tables have selective filters, pre-filter ALL of them into CTEs before the fact table join. Combined selectivity compounds — each dimension CTE reduces the fact scan further.
+
+**BEFORE (slow):**
+```sql
+select s_store_name, s_store_id,
+        sum(case when (d_day_name='Sunday') then ss_sales_price else null end) sun_sales,
+        sum(case when (d_day_name='Monday') then ss_sales_price else null end) mon_sales,
+        sum(case when (d_day_name='Tuesday') then ss_sales_price else  null end) tue_sales,
+        sum(case when (d_day_name='Wednesday') then ss_sales_price else null end) wed_sales,
+        sum(case when (d_day_name='Thursday') then ss_sales_price else null end) thu_sales,
+        sum(case when (d_day_name='Friday') then ss_sales_price else null end) fri_sales,
+        sum(case when (d_day_name='Saturday') then ss_sales_price else null end) sat_sales
+ from date_dim, store_sales, store
+ where d_date_sk = ss_sold_date_sk and
+       s_store_sk = ss_store_sk and
+       s_gmt_offset = -5 and
+       d_year = 2000 
+ group by s_store_name, s_store_id
+ order by s_store_name, s_store_id,sun_sales,mon_sales,tue_sales,wed_sales,thu_sales,fri_sales,sat_sales
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk, d_day_name FROM date_dim WHERE d_year = 2000
+```
+[filtered_stores]:
+```sql
+SELECT s_store_sk, s_store_name, s_store_id FROM store WHERE s_gmt_offset = -5
+```
+[main_query]:
+```sql
+SELECT s_store_name, s_store_id, SUM(CASE WHEN (d_day_name = 'Sunday') THEN ss_sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN (d_day_name = 'Monday') THEN ss_sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN (d_day_name = 'Tuesday') THEN ss_sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN (d_day_name = 'Wednesday') THEN ss_sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN (d_day_name = 'Thursday') THEN ss_sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN (d_day_name = 'Friday') THEN ss_sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN (d_day_name = 'Saturday') THEN ss_sales_price ELSE NULL END) AS sat_sales FROM store_sales JOIN filtered_dates ON d_date_sk = ss_sold_date_sk JOIN filtered_stores ON s_store_sk = ss_store_sk GROUP BY s_store_name, s_store_id ORDER BY s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales LIMIT 100
+```
+
+## Original SQL
+
+```sql
+-- start query 88 in stream 0 using template query88.tpl
+select  *
+from
+ (select count(*) h8_30_to_9
+ from store_sales, household_demographics , time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk   
+     and ss_hdemo_sk = household_demographics.hd_demo_sk 
+     and ss_store_sk = s_store_sk
+     and time_dim.t_hour = 8
+     and time_dim.t_minute >= 30
+     and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+          (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+          (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2)) 
+     and store.s_store_name = 'ese') s1,
+ (select count(*) h9_to_9_30 
+ from store_sales, household_demographics , time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+     and ss_hdemo_sk = household_demographics.hd_demo_sk
+     and ss_store_sk = s_store_sk 
+     and time_dim.t_hour = 9 
+     and time_dim.t_minute < 30
+     and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+          (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+          (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+     and store.s_store_name = 'ese') s2,
+ (select count(*) h9_30_to_10 
+ from store_sales, household_demographics , time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+     and ss_hdemo_sk = household_demographics.hd_demo_sk
+     and ss_store_sk = s_store_sk
+     and time_dim.t_hour = 9
+     and time_dim.t_minute >= 30
+     and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+          (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+          (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+     and store.s_store_name = 'ese') s3,
+ (select count(*) h10_to_10_30
+ from store_sales, household_demographics , time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+     and ss_hdemo_sk = household_demographics.hd_demo_sk
+     and ss_store_sk = s_store_sk
+     and time_dim.t_hour = 10 
+     and time_dim.t_minute < 30
+     and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+          (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+          (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+     and store.s_store_name = 'ese') s4,
+ (select count(*) h10_30_to_11
+ from store_sales, household_demographics , time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+     and ss_hdemo_sk = household_demographics.hd_demo_sk
+     and ss_store_sk = s_store_sk
+     and time_dim.t_hour = 10 
+     and time_dim.t_minute >= 30
+     and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+          (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+          (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+     and store.s_store_name = 'ese') s5,
+ (select count(*) h11_to_11_30
+ from store_sales, household_demographics , time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+     and ss_hdemo_sk = household_demographics.hd_demo_sk
+     and ss_store_sk = s_store_sk 
+     and time_dim.t_hour = 11
+     and time_dim.t_minute < 30
+     and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+          (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+          (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+     and store.s_store_name = 'ese') s6,
+ (select count(*) h11_30_to_12
+ from store_sales, household_demographics , time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+     and ss_hdemo_sk = household_demographics.hd_demo_sk
+     and ss_store_sk = s_store_sk
+     and time_dim.t_hour = 11
+     and time_dim.t_minute >= 30
+     and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+          (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+          (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+     and store.s_store_name = 'ese') s7,
+ (select count(*) h12_to_12_30
+ from store_sales, household_demographics , time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+     and ss_hdemo_sk = household_demographics.hd_demo_sk
+     and ss_store_sk = s_store_sk
+     and time_dim.t_hour = 12
+     and time_dim.t_minute < 30
+     and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+          (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+          (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+     and store.s_store_name = 'ese') s8
+;
+
+-- end query 88 in stream 0 using template query88.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `*`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K  — Compute eight independent time-slice counts under identical household/store filters and return them in one cross-joined row for side-by-side comparison.
+    ├── SCAN (store_sales, household_demographics, time_dim, store)
+    ├── JOIN (ss_sold_time_sk = time_dim.t_time_sk)
+    ├── JOIN (ss_hdemo_sk = household_demographics.hd_demo_sk)
+    ├── JOIN (+1 more)
+    ├── FILTER (time_dim.t_hour = 8)
+    ├── FILTER (time_dim.t_minute >= 30)
+    ├── FILTER (+1 more)
+    └── OUTPUT (*)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

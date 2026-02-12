@@ -1,0 +1,144 @@
+## Modified Logic Tree
+
+QUERY:
+└── [MAIN] main_query  [~]  
+    ├── [CTE] exact_keys  [+]  — Filter customer, address, demographics, household, income band tables with city/income constraints
+    │   ├── JOIN (customer, customer_address, customer_demographics, household_demographics, income_band)
+    │   └── FILTER (ca_city='Oakwood', ib_lower_bound>=5806, ib_upper_bound<=5806+50000)
+    ├── [CTE] sr_filter  [+]  — Semi-join with store_returns using EXISTS
+    │   └── WHERE EXISTS (store_returns ON sr_cdemo_sk = cd_demo_sk)
+    ├── [CTE] enrich  [+]  — Format customer name
+    │   └── CONCAT (last_name, ', ', first_name) with COALESCE
+    └── [CTE] top_n  [+]  — Order and limit final results
+        ├── SORT (c_customer_id ASC)
+        └── LIMIT 100
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "dimension_cte_isolate",
+      "description": "Create exact_keys CTE to pre-filter dimension tables before joining to fact table, preventing Cartesian explosion.",
+      "applied_to": ["exact_keys"]
+    },
+    {
+      "id": "R2",
+      "type": "early_filter",
+      "description": "Apply city and income band filters early in dimension CTE to reduce fact table scan.",
+      "applied_to": ["exact_keys"]
+    },
+    {
+      "id": "R3",
+      "type": "intersect_to_exists",
+      "description": "Use EXISTS semi-join instead of full join with store_returns to short-circuit matching.",
+      "applied_to": ["sr_filter"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "exact_keys": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT c.c_customer_id, c.c_first_name, c.c_last_name, cd.cd_demo_sk FROM customer c INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk INNER JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk INNER JOIN income_band ib ON hd.hd_income_band_sk = ib.ib_income_band_sk WHERE ca.ca_city = 'Oakwood' AND ib.ib_lower_bound >= 5806 AND ib.ib_upper_bound <= 5806 + 50000",
+          "interfaces": {
+            "outputs": ["c_customer_id", "c_first_name", "c_last_name", "cd_demo_sk"],
+            "consumes": []
+          }
+        },
+        "sr_filter": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT c_customer_id, c_first_name, c_last_name FROM exact_keys ek WHERE EXISTS (SELECT 1 FROM store_returns sr WHERE sr.sr_cdemo_sk = ek.cd_demo_sk)",
+          "interfaces": {
+            "outputs": ["c_customer_id", "c_first_name", "c_last_name"],
+            "consumes": ["exact_keys"]
+          }
+        },
+        "enrich": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT c_customer_id, COALESCE(c_last_name,'') || ', ' || COALESCE(c_first_name,'') AS customername FROM sr_filter",
+          "interfaces": {
+            "outputs": ["c_customer_id", "customername"],
+            "consumes": ["sr_filter"]
+          }
+        },
+        "top_n": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT c_customer_id AS customer_id, customername FROM enrich ORDER BY c_customer_id ASC LIMIT 100",
+          "interfaces": {
+            "outputs": ["customer_id", "customername"],
+            "consumes": ["enrich"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT customer_id, customername FROM top_n",
+          "interfaces": {
+            "outputs": ["customer_id", "customername"],
+            "consumes": ["top_n"]
+          }
+        }
+      },
+      "reconstruction_order": ["exact_keys", "sr_filter", "enrich", "top_n", "main_query"],
+      "assembly_template": "WITH exact_keys AS ({exact_keys}), sr_filter AS ({sr_filter}), enrich AS ({enrich}), top_n AS ({top_n}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Final SQL
+
+```sql
+WITH exact_keys AS (
+  SELECT c.c_customer_id, c.c_first_name, c.c_last_name, cd.cd_demo_sk 
+  FROM customer c 
+  INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk 
+  INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk 
+  INNER JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk 
+  INNER JOIN income_band ib ON hd.hd_income_band_sk = ib.ib_income_band_sk 
+  WHERE ca.ca_city = 'Oakwood' 
+    AND ib.ib_lower_bound >= 5806 
+    AND ib.ib_upper_bound <= 5806 + 50000
+), 
+sr_filter AS (
+  SELECT c_customer_id, c_first_name, c_last_name 
+  FROM exact_keys ek 
+  WHERE EXISTS (
+    SELECT 1 
+    FROM store_returns sr 
+    WHERE sr.sr_cdemo_sk = ek.cd_demo_sk
+  )
+), 
+enrich AS (
+  SELECT c_customer_id, 
+         COALESCE(c_last_name,'') || ', ' || COALESCE(c_first_name,'') AS customername 
+  FROM sr_filter
+), 
+top_n AS (
+  SELECT c_customer_id AS customer_id, 
+         customername 
+  FROM enrich 
+  ORDER BY c_customer_id ASC 
+  LIMIT 100
+)
+SELECT customer_id, customername 
+FROM top_n;
+```
+
+**Changes:** Created four CTEs following the target logical tree: exact_keys isolates dimension filtering, sr_filter uses EXISTS semi-join with store_returns, enrich formats the customer name, and top_n applies ordering and limit. This restructures the original single join into a pipelined filter pattern.
+
+**Expected speedup:** ~2-3x from early dimension filtering and EXISTS short-circuiting, avoiding full Cartesian join of all six tables.

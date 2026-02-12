@@ -132,6 +132,10 @@ _SQL_KEYWORDS = {
 _WINDOW_KEYWORDS = {"window", "rank", "row_number", "dense_rank", "ntile", "lead", "lag"}
 
 
+# TPC-DS multi-channel fact tables
+_CHANNEL_FACT_TABLES = {"store_sales", "catalog_sales", "web_sales"}
+
+
 def extract_tags(sql: str, dialect: str = "duckdb") -> Set[str]:
     """Extract tags from SQL using AST analysis with regex fallback.
 
@@ -139,6 +143,13 @@ def extract_tags(sql: str, dialect: str = "duckdb") -> Set[str]:
     - Table names (lowercased)
     - SQL keywords present (intersect, union, rollup, etc.)
     - Structural patterns (self_join, repeated_scan, multi_cte, correlated_subquery)
+    - OR column analysis (or_same_col, or_cross_col, or_branch_count:N)
+    - Table repeat by name (repeat:table_name:N)
+    - Correlated vs independent subqueries (correlated_sub, independent_sub)
+    - Multi-channel pattern (multi_channel)
+    - CTE filter status (cte_filtered, cte_unfiltered)
+    - Star join pattern (star_join_pattern)
+    - LEFT JOIN with right-table WHERE filter (left_join_right_filter)
 
     Args:
         sql: SQL query text
@@ -199,11 +210,13 @@ def extract_tags(sql: str, dialect: str = "duckdb") -> Set[str]:
         if list(ast.find_all(exp.Order)):
             tags.add("order_by")
 
-        # Window function subtypes
-        if list(ast.find_all(exp.Rank)):
-            tags.add("rank")
-        if list(ast.find_all(exp.RowNumber)):
-            tags.add("row_number")
+        # Window function subtypes — guarded because some sqlglot versions
+        # lack exp.Rank / exp.RowNumber as standalone node types
+        for _attr, _tag in [("Rank", "rank"), ("RowNumber", "row_number"),
+                            ("DenseRank", "dense_rank")]:
+            cls = getattr(exp, _attr, None)
+            if cls and list(ast.find_all(cls)):
+                tags.add(_tag)
 
         # ROLLUP / CUBE / GROUPING — check via SQL text since sqlglot
         # represents these differently across versions
@@ -261,6 +274,38 @@ def extract_tags(sql: str, dialect: str = "duckdb") -> Set[str]:
             if "cross" in j_str:
                 tags.add("cross_join")
 
+        # ─── NEW FEATURE 1: OR Column Analysis ───
+        # Discriminates or_to_union (cross-col) vs engine-handles-it (same-col)
+        _extract_or_column_tags(ast, tags)
+
+        # ─── NEW FEATURE 2: Table Repeat By Name ───
+        # Emits repeat:table_name:N for tables appearing 2+ times
+        for name, count in name_counts.items():
+            if count >= 2:
+                tags.add(f"repeat:{name}:{count}")
+
+        # ─── NEW FEATURE 3: Correlated vs Independent Subqueries ───
+        # Finer-grained than the binary correlated_subquery tag above
+        _extract_subquery_correlation_tags(ast, tags)
+
+        # ─── NEW FEATURE 4: Multi-Channel Pattern ───
+        # Detects TPC-DS store/catalog/web sales co-occurrence
+        channel_tables = set(table_names) & _CHANNEL_FACT_TABLES
+        if len(channel_tables) >= 2:
+            tags.add("multi_channel")
+
+        # ─── NEW FEATURE 5: CTE Filter Status ───
+        # Detects filtered vs unfiltered CTEs (unfiltered = anti-pattern)
+        _extract_cte_filter_tags(ast, ctes, tags)
+
+        # ─── NEW FEATURE 7: Star Join Pattern ───
+        # Detects star-schema pattern: 1 fact table + 3+ dimension tables
+        _extract_star_join_tags(ast, table_names, tags)
+
+        # ─── NEW FEATURE 8: LEFT JOIN with right-table WHERE filter ───
+        # Detects inner_join_conversion opportunity pattern
+        _extract_left_join_filter_tags(ast, tags)
+
     except Exception as e:
         logger.debug(f"AST tag extraction failed, falling back to regex: {e}")
         # Regex fallback for fragments
@@ -270,6 +315,476 @@ def extract_tags(sql: str, dialect: str = "duckdb") -> Set[str]:
     _extract_tags_regex_keywords(sql, tags)
 
     return tags
+
+
+# =============================================================================
+# New Feature Helpers (Features 1-5)
+# =============================================================================
+
+def _extract_or_column_tags(ast, tags: Set[str]) -> None:
+    """Feature 1: OR Column Analysis.
+
+    Walks OR nodes and checks if branches reference the same column
+    or different columns. This discriminates:
+    - or_same_col: Engine handles efficiently in one scan (don't split)
+    - or_cross_col: Candidate for or_to_union transform
+    Also emits or_branch_count:N for the total OR branch count.
+    """
+    from sqlglot import exp
+
+    or_nodes = list(ast.find_all(exp.Or))
+    if not or_nodes:
+        return
+
+    # Count total OR branches (chain of ORs = N+1 branches for N OR nodes)
+    # Walk the OR tree to find root OR chains
+    branch_count = _count_or_branches(ast)
+    if branch_count >= 2:
+        tags.add(f"or_branch_count:{branch_count}")
+
+    # Analyze column references in OR branches
+    has_same_col = False
+    has_cross_col = False
+
+    for or_node in or_nodes:
+        left_cols = _get_comparison_columns(or_node.left)
+        right_cols = _get_comparison_columns(or_node.right)
+
+        if left_cols and right_cols:
+            # Compare column names (ignore table qualifiers for matching)
+            left_names = {c.split(".")[-1] for c in left_cols}
+            right_names = {c.split(".")[-1] for c in right_cols}
+            if left_names & right_names:
+                has_same_col = True
+            else:
+                has_cross_col = True
+
+    if has_same_col:
+        tags.add("or_same_col")
+    if has_cross_col:
+        tags.add("or_cross_col")
+
+
+def _count_or_branches(ast) -> int:
+    """Count the number of OR branches in the largest OR chain.
+
+    A chain like (A OR B OR C) is represented as OR(OR(A, B), C),
+    so we walk left-recursively to count leaf branches.
+    """
+    from sqlglot import exp
+
+    def _chain_size(node) -> int:
+        if not isinstance(node, exp.Or):
+            return 1
+        return _chain_size(node.left) + _chain_size(node.right)
+
+    max_branches = 0
+    for or_node in ast.find_all(exp.Or):
+        # Only count from root ORs (parent is not OR)
+        if not isinstance(or_node.parent, exp.Or):
+            size = _chain_size(or_node)
+            max_branches = max(max_branches, size)
+    return max_branches
+
+
+def _get_comparison_columns(node) -> Set[str]:
+    """Extract column names referenced in a comparison expression.
+
+    Returns fully qualified names (table.column) where available,
+    or just column name if unqualified.
+    """
+    from sqlglot import exp
+
+    cols = set()
+    # Direct comparison (e.g., col = 'value')
+    for col in node.find_all(exp.Column):
+        name = col.name.lower() if col.name else ""
+        if not name:
+            continue
+        tbl = col.table.lower() if col.table else ""
+        cols.add(f"{tbl}.{name}" if tbl else name)
+    return cols
+
+
+def _extract_subquery_correlation_tags(ast, tags: Set[str]) -> None:
+    """Feature 3: Correlated vs Independent Subquery analysis.
+
+    For each subquery, determines if it's correlated (references outer scope)
+    or independent (self-contained). Also tracks nesting depth.
+
+    Emits:
+    - correlated_sub: At least one correlated subquery found
+    - independent_sub: At least one independent subquery found
+    - sub_nesting_depth:N: Maximum subquery nesting depth
+    """
+    from sqlglot import exp
+
+    subqueries = list(ast.find_all(exp.Subquery))
+    if not subqueries:
+        return
+
+    correlated_count = 0
+    independent_count = 0
+    max_depth = 0
+
+    for sq in subqueries:
+        # Calculate nesting depth
+        depth = 0
+        parent = sq.parent
+        while parent:
+            if isinstance(parent, exp.Subquery):
+                depth += 1
+            parent = getattr(parent, "parent", None)
+
+        # Depth is relative to root (outermost subquery = depth 1)
+        actual_depth = depth + 1
+        max_depth = max(max_depth, actual_depth)
+
+        # Check correlation: does subquery reference columns from outer scope?
+        sq_tables = {t.name.lower() for t in sq.find_all(exp.Table) if t.name}
+        is_correlated = False
+        for col in sq.find_all(exp.Column):
+            tbl = col.table.lower() if col.table else ""
+            if tbl and tbl not in sq_tables:
+                is_correlated = True
+                break
+
+        if is_correlated:
+            correlated_count += 1
+        else:
+            independent_count += 1
+
+    if correlated_count > 0:
+        tags.add("correlated_sub")
+    if independent_count > 0:
+        tags.add("independent_sub")
+    if max_depth >= 1:
+        tags.add(f"sub_nesting_depth:{max_depth}")
+
+
+def _extract_cte_filter_tags(ast, ctes: list, tags: Set[str]) -> None:
+    """Feature 5: CTE Filter Status.
+
+    Checks each CTE body for WHERE clauses. Unfiltered CTEs are
+    anti-pattern targets (pure overhead, caused 0.85x regression on Q67).
+
+    Emits:
+    - cte_filtered: At least one CTE has a WHERE clause
+    - cte_unfiltered: At least one CTE lacks a WHERE clause
+    """
+    from sqlglot import exp
+
+    if not ctes:
+        return
+
+    has_filtered = False
+    has_unfiltered = False
+
+    for cte in ctes:
+        # CTE.this is the subquery body (Select node)
+        body = cte.this
+        if body is None:
+            has_unfiltered = True
+            continue
+
+        # Check if the CTE body contains a WHERE clause
+        where_nodes = list(body.find_all(exp.Where))
+        if where_nodes:
+            has_filtered = True
+        else:
+            has_unfiltered = True
+
+    if has_filtered:
+        tags.add("cte_filtered")
+    if has_unfiltered:
+        tags.add("cte_unfiltered")
+
+
+# =============================================================================
+# Features 7-8: Star Join + LEFT JOIN Right-Filter Detection
+# =============================================================================
+
+# TPC-DS fact and dimension tables for star join detection
+_FACT_TABLES = {
+    "store_sales", "catalog_sales", "web_sales", "inventory",
+    "store_returns", "catalog_returns", "web_returns",
+}
+_DIM_TABLES = {
+    "date_dim", "item", "store", "customer", "warehouse",
+    "customer_demographics", "customer_address", "promotion",
+    "household_demographics", "income_band", "reason",
+    "ship_mode", "time_dim", "web_site", "web_page",
+    "catalog_page", "call_center",
+}
+
+
+def _extract_star_join_tags(ast, table_names: list, tags: Set[str]) -> None:
+    """Feature 7: Star Join Pattern detection.
+
+    Emits star_join_pattern when query has 1+ fact table + 3+ dimension tables.
+    This identifies star-schema queries where prefetch_fact_join and
+    aggregate_pushdown transforms are most productive.
+    """
+    fact_count = sum(1 for t in table_names if t in _FACT_TABLES)
+    dim_count = len(set(t for t in table_names if t in _DIM_TABLES))
+    if fact_count >= 1 and dim_count >= 3:
+        tags.add("star_join_pattern")
+
+
+def _extract_left_join_filter_tags(ast, tags: Set[str]) -> None:
+    """Feature 8: Detect LEFT JOINs where WHERE clause filters on right-table column.
+
+    This is the inner_join_conversion opportunity pattern — when a WHERE
+    clause on the right table eliminates NULL rows, the LEFT JOIN behaves
+    as an INNER JOIN but the optimizer doesn't recognize this.
+
+    Handles both qualified (sr.sr_reason_sk) and unqualified (sr_reason_sk)
+    column references using TPC-DS naming conventions.
+
+    Emits: left_join_right_filter
+    """
+    from sqlglot import exp
+
+    # Find LEFT JOINs and collect right-side table names/aliases
+    left_join_tables = set()
+    for j in ast.find_all(exp.Join):
+        j_str = str(j).lower()
+        if "left" in j_str:
+            tbl = j.find(exp.Table)
+            if tbl and tbl.name:
+                left_join_tables.add(tbl.name.lower())
+                if tbl.alias:
+                    left_join_tables.add(tbl.alias.lower())
+
+    if not left_join_tables:
+        return
+
+    # Build column-prefix map for unqualified column detection
+    # TPC-DS convention: table "store_returns" → columns start with "sr_"
+    _PREFIX_MAP = {
+        "store_returns": "sr_", "store_sales": "ss_",
+        "catalog_returns": "cr_", "catalog_sales": "cs_",
+        "web_returns": "wr_", "web_sales": "ws_",
+        "inventory": "inv_",
+    }
+    left_join_prefixes = set()
+    for t in left_join_tables:
+        if t in _PREFIX_MAP:
+            left_join_prefixes.add(_PREFIX_MAP[t])
+
+    # Check WHERE for references to left-joined tables
+    for where in ast.find_all(exp.Where):
+        for col in where.find_all(exp.Column):
+            # Check qualified reference
+            tbl = col.table.lower() if col.table else ""
+            if tbl and tbl in left_join_tables:
+                tags.add("left_join_right_filter")
+                return
+            # Check unqualified reference by column prefix
+            col_name = col.name.lower() if col.name else ""
+            if not tbl and col_name:
+                for prefix in left_join_prefixes:
+                    if col_name.startswith(prefix):
+                        tags.add("left_join_right_filter")
+                        return
+
+
+# =============================================================================
+# Feature 6: EXPLAIN Plan Feature Extraction
+# =============================================================================
+
+def extract_explain_features(explain_text: str) -> Set[str]:
+    """Extract features from EXPLAIN ANALYZE output.
+
+    This is Feature 6: OPTIMIZER_PLAN_SCANS. Unlike features 1-5 which
+    operate on SQL AST, this requires actual EXPLAIN output from the engine.
+
+    Use this for collision disambiguation (e.g., pushdown vs single_pass_agg
+    on Q9 — both match AST features but differ in plan shape).
+
+    Supports both DuckDB and PostgreSQL EXPLAIN formats.
+
+    Emits:
+    - scan_count:N — number of table scan operators
+    - nested_loop_present — at least one nested loop join
+    - hash_join_present — at least one hash join
+    - merge_join_present — at least one merge/sort-merge join
+    - seq_scan_tables:table1,table2 — tables accessed via sequential scan
+
+    Args:
+        explain_text: Raw EXPLAIN ANALYZE output text
+
+    Returns:
+        Set of feature tag strings
+    """
+    if not explain_text:
+        return set()
+
+    tags: Set[str] = set()
+    text_upper = explain_text.upper()
+
+    # ── Scan counting ──
+    # DuckDB format:  SEQ_SCAN store_sales   or  SEQ_SCAN(store_sales)
+    # PG format:      Seq Scan on store_sales ss  (cost=...)
+    # Multiple scans can appear on a single line (DuckDB tree rendering)
+    scan_pattern = re.compile(
+        r'(?:SEQ[_\s]SCAN|TABLE[_\s]SCAN|INDEX[_\s]SCAN'
+        r'|INDEX[_\s]ONLY[_\s]SCAN|BITMAP[_\s]HEAP[_\s]SCAN)',
+        re.IGNORECASE,
+    )
+    # Table name extraction: match the scan operator followed by table name
+    # DuckDB: "SEQ_SCAN store_sales" or "SEQ_SCAN(store_sales)"
+    # PG:     "Seq Scan on store_sales ss" (skip "on", capture table)
+    table_pattern = re.compile(
+        r'(?:SEQ[_\s]SCAN|TABLE[_\s]SCAN)\s*'
+        r'(?:\(\s*([a-z_]\w*)|on\s+([a-z_]\w*)|([a-z_]\w*))',
+        re.IGNORECASE,
+    )
+    scan_count = 0
+    seq_scan_tables: list = []
+
+    for line in explain_text.split("\n"):
+        # Count all scan operators on this line (DuckDB packs multiple per line)
+        matches = scan_pattern.findall(line)
+        scan_count += len(matches)
+
+        # Extract table names from sequential/table scans on this line
+        for m in table_pattern.finditer(line):
+            tbl_name = (m.group(1) or m.group(2) or m.group(3) or "").lower()
+            if tbl_name and tbl_name not in ("on", "as", "the"):
+                seq_scan_tables.append(tbl_name)
+
+    if scan_count > 0:
+        tags.add(f"scan_count:{scan_count}")
+    if seq_scan_tables:
+        tags.add(f"seq_scan_tables:{','.join(sorted(set(seq_scan_tables)))}")
+
+    # ── Join type detection ──
+    # DuckDB uses underscores (HASH_JOIN, NESTED_LOOP_JOIN)
+    # PG uses spaces (Hash Join, Nested Loop, Merge Join)
+    if re.search(r'NESTED[_\s]*LOOP', text_upper):
+        tags.add("nested_loop_present")
+    if re.search(r'HASH[_\s]*JOIN', text_upper):
+        tags.add("hash_join_present")
+    if re.search(r'MERGE[_\s]*JOIN|SORT[_\s]*MERGE', text_upper):
+        tags.add("merge_join_present")
+
+    return tags
+
+
+# =============================================================================
+# Precondition Feature Extraction (for transform detection)
+# =============================================================================
+
+# Static mapping from extract_tags() output → transform precondition features
+_TAG_TO_FEATURE = {
+    "group_by": "GROUP_BY",
+    "having": "HAVING",
+    "case": "CASE_EXPR",
+    "date_dim": "DATE_DIM",
+    "left_join": "LEFT_JOIN",
+    "window": "WINDOW_FUNC",
+    "rollup": "ROLLUP",
+    "union": "UNION",
+    "intersect": "INTERSECT",
+    "exists": "EXISTS",
+    "cte": "CTE",
+    "correlated_sub": "CORRELATED_SUB",
+    "between": "BETWEEN",
+    "multi_channel": "MULTI_CHANNEL",
+    "star_join_pattern": "STAR_JOIN",
+    "left_join_right_filter": "LEFT_JOIN_RIGHT_FILTER",
+}
+
+
+def extract_precondition_features(sql: str, dialect: str = "duckdb") -> Set[str]:
+    """Extract precondition features for transform detection.
+
+    Maps the low-level tags from extract_tags() to the uppercase feature
+    vocabulary used by transforms.json precondition_features, plus derives
+    additional threshold-based features via AST analysis.
+
+    Features emitted:
+    - Direct mappings: GROUP_BY, HAVING, CASE_EXPR, DATE_DIM, LEFT_JOIN,
+      WINDOW_FUNC, ROLLUP, UNION, INTERSECT, EXISTS, CTE, CORRELATED_SUB,
+      BETWEEN, MULTI_CHANNEL, STAR_JOIN, LEFT_JOIN_RIGHT_FILTER
+    - Aggregate types: AGG_AVG, AGG_SUM, AGG_COUNT
+    - OR branches: OR_BRANCH (from or_branch_count:N tags)
+    - Subquery thresholds: SCALAR_SUB_2+, SCALAR_SUB_5+, SCALAR_SUB_8+
+    - Table thresholds: MULTI_TABLE_5+, TABLE_REPEAT_3+, TABLE_REPEAT_8+
+    - EXISTS thresholds: EXISTS_3+
+
+    Args:
+        sql: SQL query text
+        dialect: SQL dialect for parsing
+
+    Returns:
+        Set of uppercase feature strings
+    """
+    tags = extract_tags(sql, dialect=dialect)
+    features: Set[str] = set()
+
+    # 1. Direct tag → feature mapping
+    for tag, feature in _TAG_TO_FEATURE.items():
+        if tag in tags:
+            features.add(feature)
+
+    # 2. OR_BRANCH from or_branch_count:N tags
+    for tag in tags:
+        if tag.startswith("or_branch_count:"):
+            features.add("OR_BRANCH")
+            break
+
+    # 3. AST analysis for aggregate types, subquery counts, table counts
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        ast = sqlglot.parse_one(sql, dialect=dialect)
+
+        # Aggregate type detection
+        for agg_node in ast.find_all(exp.AggFunc):
+            if isinstance(agg_node, exp.Avg):
+                features.add("AGG_AVG")
+            elif isinstance(agg_node, exp.Sum):
+                features.add("AGG_SUM")
+            elif isinstance(agg_node, exp.Count):
+                features.add("AGG_COUNT")
+
+        # Subquery counting (exp.Subquery + exp.Exists)
+        subquery_count = len(list(ast.find_all(exp.Subquery)))
+        exists_count = len(list(ast.find_all(exp.Exists)))
+        total_sub = subquery_count + exists_count
+        if total_sub >= 2:
+            features.add("SCALAR_SUB_2+")
+        if total_sub >= 5:
+            features.add("SCALAR_SUB_5+")
+        if total_sub >= 8:
+            features.add("SCALAR_SUB_8+")
+
+        # EXISTS counting threshold
+        if exists_count >= 3:
+            features.add("EXISTS_3+")
+
+        # Table counting — distinct table names
+        table_names = [t.name.lower() for t in ast.find_all(exp.Table) if t.name]
+        distinct_tables = set(table_names)
+        if len(distinct_tables) >= 5:
+            features.add("MULTI_TABLE_5+")
+
+        # Table repeat thresholds — max repetition count
+        if table_names:
+            name_counts = Counter(table_names)
+            max_repeat = max(name_counts.values())
+            if max_repeat >= 3:
+                features.add("TABLE_REPEAT_3+")
+            if max_repeat >= 8:
+                features.add("TABLE_REPEAT_8+")
+
+    except Exception as e:
+        logger.debug(f"AST feature extraction failed: {e}")
+
+    return features
 
 
 def _extract_tags_regex(sql: str, tags: Set[str]) -> None:

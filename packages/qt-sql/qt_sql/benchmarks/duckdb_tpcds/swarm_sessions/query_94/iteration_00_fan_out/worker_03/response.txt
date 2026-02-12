@@ -1,0 +1,77 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement with CTEs)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: 1  — Aggregate filtered web sales.
+    ├── [~] CTE: multi_warehouse_orders  [~]  — Distinct multi-warehouse orders from full web_sales scan
+    │   └── SCAN (web_sales)
+    │   └── GROUP BY (ws_order_number)
+    │   └── FILTER (COUNT(DISTINCT ws_warehouse_sk) > 1)
+    ├── [~] CTE: returned_orders  [~]  — Distinct returned orders from full web_returns scan
+    │   └── SCAN (web_returns)
+    │   └── GROUP BY (wr_order_number)
+    ├── [~] CTE: filtered_fact  [~]  — Join web_sales with dimensions and CTEs, filter by date/state/company
+    │   ├── SCAN (web_sales AS ws1, date_dim, customer_address, web_site)
+    │   ├── JOIN (INNER) multi_warehouse_orders ON ws1.ws_order_number = mwo.ws_order_number
+    │   ├── JOIN (LEFT) returned_orders ON ws1.ws_order_number = ro.wr_order_number
+    │   ├── FILTER (ro.wr_order_number IS NULL)  // Anti‑join
+    │   ├── FILTER (d_date BETWEEN '2000‑2‑01' AND (CAST('2000‑2‑01' AS DATE) + INTERVAL 60 DAY))
+    │   ├── FILTER (ca_state = 'OK')
+    │   └── FILTER (web_company_name = 'pri')
+    └── [~] FINAL AGGREGATION  [~]  — Count distinct orders, sum shipping cost and net profit
+        ├── AGGREGATE (COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit))
+        └── SORT (COUNT(DISTINCT ws_order_number) ASC)  // Preserved from original ORDER BY
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "decorrelate", "description": "Convert correlated EXISTS (multi‑warehouse) to materialized CTE with GROUP BY/HAVING", "applied_to": ["multi_warehouse_orders"]},
+    {"id": "R2", "type": "decorrelate", "description": "Convert correlated NOT EXISTS (returns) to materialized CTE with GROUP BY, then anti‑join", "applied_to": ["returned_orders"]},
+    {"id": "R3", "type": "materialize_cte", "description": "Pre‑compute distinct multi‑warehouse and returned order sets to avoid repeated correlated execution", "applied_to": ["multi_warehouse_orders", "returned_orders"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "multi_warehouse_orders": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws_order_number FROM web_sales GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk) > 1",
+        "interfaces": {"outputs": ["ws_order_number"], "consumes": []}
+      },
+      "returned_orders": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT wr_order_number FROM web_returns GROUP BY wr_order_number",
+        "interfaces": {"outputs": ["wr_order_number"], "consumes": []}
+      },
+      "filtered_fact": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit FROM web_sales ws1 INNER JOIN date_dim ON ws1.ws_ship_date_sk = date_dim.d_date_sk INNER JOIN customer_address ON ws1.ws_ship_addr_sk = customer_address.ca_address_sk INNER JOIN web_site ON ws1.ws_web_site_sk = web_site.web_site_sk INNER JOIN multi_warehouse_orders mwo ON ws1.ws_order_number = mwo.ws_order_number LEFT JOIN returned_orders ro ON ws1.ws_order_number = ro.wr_order_number WHERE date_dim.d_date BETWEEN DATE '2000-02-01' AND (DATE '2000-02-01' + INTERVAL 60 DAY) AND customer_address.ca_state = 'OK' AND web_site.web_company_name = 'pri' AND ro.wr_order_number IS NULL",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": ["multi_warehouse_orders", "returned_orders"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(DISTINCT ws_order_number) AS \"order count\", SUM(ws_ext_ship_cost) AS \"total shipping cost\", SUM(ws_net_profit) AS \"total net profit\" FROM filtered_fact ORDER BY COUNT(DISTINCT ws_order_number) LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["filtered_fact"]}
+      }
+    },
+    "reconstruction_order": ["multi_warehouse_orders", "returned_orders", "filtered_fact", "main_query"],
+    "assembly_template": "WITH multi_warehouse_orders AS ({multi_warehouse_orders}), returned_orders AS ({returned_orders}), filtered_fact AS ({filtered_fact}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Decorrelated both EXISTS subqueries into materialized CTEs (`multi_warehouse_orders`, `returned_orders`), then joined them in a filtered fact CTE that applies dimension filters and performs the anti‑join, finally aggregating. This eliminates per‑row correlated execution.
+
+**Expected speedup:** ~2–3× due to single‑pass aggregation and elimination of correlated subquery overhead.

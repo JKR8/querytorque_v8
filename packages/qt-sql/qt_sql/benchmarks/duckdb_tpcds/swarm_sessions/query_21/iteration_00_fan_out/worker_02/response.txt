@@ -1,0 +1,126 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Cost: 100%  Rows: ~100  — Now uses CTE structure per target logical tree
+    ├── CTE date_cte  [+]  — Isolates date dimension with window filter
+    ├── CTE inventory_join_date  [+]  — Joins inventory with filtered dates
+    ├── CTE item_join  [+]  — Applies price filter via item join
+    ├── CTE warehouse_join  [+]  — Adds warehouse names
+    ├── CTE aggregate  [+]  — Groups and computes before/after sums
+    ├── CTE ratio_filter  [+]  — Applies ratio guard condition
+    ├── CTE order_limit  [+]  — Applies ordering and limit
+    └── OUTPUT (*)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "date_cte_isolate",
+      "description": "Extract small date dimension filter into CTE to reduce fact table scanning",
+      "applied_to": ["date_cte"]
+    },
+    {
+      "id": "R2", 
+      "type": "sequential_dimension_join",
+      "description": "Join dimensions sequentially with fact table to avoid cross-join explosion",
+      "applied_to": ["inventory_join_date", "item_join", "warehouse_join"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN DATE '2002-02-27' - INTERVAL 30 DAY AND DATE '2002-02-27' + INTERVAL 30 DAY",
+        "interfaces": {
+          "outputs": ["d_date_sk", "d_date"],
+          "consumes": []
+        }
+      },
+      "inventory_join_date": {
+        "type": "cte", 
+        "change": "added",
+        "sql": "SELECT inv_warehouse_sk, inv_item_sk, inv_quantity_on_hand, d_date FROM inventory JOIN date_cte ON inv_date_sk = d_date_sk",
+        "interfaces": {
+          "outputs": ["inv_warehouse_sk", "inv_item_sk", "inv_quantity_on_hand", "d_date"],
+          "consumes": ["date_cte"]
+        }
+      },
+      "item_join": {
+        "type": "cte",
+        "change": "added", 
+        "sql": "SELECT inv_warehouse_sk, i_item_id, inv_quantity_on_hand, d_date FROM inventory_join_date JOIN item ON inv_item_sk = i_item_sk AND i_current_price BETWEEN 0.99 AND 1.49",
+        "interfaces": {
+          "outputs": ["inv_warehouse_sk", "i_item_id", "inv_quantity_on_hand", "d_date"],
+          "consumes": ["inventory_join_date"]
+        }
+      },
+      "warehouse_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT w_warehouse_name, i_item_id, inv_quantity_on_hand, d_date FROM item_join JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk",
+        "interfaces": {
+          "outputs": ["w_warehouse_name", "i_item_id", "inv_quantity_on_hand", "d_date"],
+          "consumes": ["item_join"]
+        }
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT w_warehouse_name, i_item_id, SUM(CASE WHEN d_date < DATE '2002-02-27' THEN inv_quantity_on_hand ELSE 0 END) AS inv_before, SUM(CASE WHEN d_date >= DATE '2002-02-27' THEN inv_quantity_on_hand ELSE 0 END) AS inv_after FROM warehouse_join GROUP BY w_warehouse_name, i_item_id",
+        "interfaces": {
+          "outputs": ["w_warehouse_name", "i_item_id", "inv_before", "inv_after"],
+          "consumes": ["warehouse_join"]
+        }
+      },
+      "ratio_filter": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT w_warehouse_name, i_item_id, inv_before, inv_after FROM aggregate WHERE (CASE WHEN inv_before > 0 THEN inv_after / inv_before ELSE NULL END) BETWEEN (2.0/3.0) AND (3.0/2.0)",
+        "interfaces": {
+          "outputs": ["w_warehouse_name", "i_item_id", "inv_before", "inv_after"],
+          "consumes": ["aggregate"]
+        }
+      },
+      "order_limit": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT w_warehouse_name, i_item_id, inv_before, inv_after FROM ratio_filter ORDER BY w_warehouse_name ASC, i_item_id ASC LIMIT 100",
+        "interfaces": {
+          "outputs": ["w_warehouse_name", "i_item_id", "inv_before", "inv_after"],
+          "consumes": ["ratio_filter"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT * FROM order_limit",
+        "interfaces": {
+          "outputs": ["w_warehouse_name", "i_item_id", "inv_before", "inv_after"],
+          "consumes": ["order_limit"]
+        }
+      }
+    },
+    "reconstruction_order": ["date_cte", "inventory_join_date", "item_join", "warehouse_join", "aggregate", "ratio_filter", "order_limit", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), inventory_join_date AS ({inventory_join_date}), item_join AS ({item_join}), warehouse_join AS ({warehouse_join}), aggregate AS ({aggregate}), ratio_filter AS ({ratio_filter}), order_limit AS ({order_limit}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Changes and Mechanism
+
+**Changes:** Restructured the single-block query into a CTE pipeline following the target logical tree, isolating the date filter first to reduce the inventory scan, then joining dimensions sequentially to avoid Cartesian explosion while preserving all original semantics and defensive guards.
+
+**Expected speedup:** ~2-3x from reduced fact table scanning (only 61 dates vs full date_dim) and sequential hash join patterns that allow better predicate pushdown and intermediate result reduction.

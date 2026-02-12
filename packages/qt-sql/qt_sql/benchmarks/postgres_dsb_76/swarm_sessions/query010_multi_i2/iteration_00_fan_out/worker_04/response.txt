@@ -1,0 +1,106 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 99%  Rows: ~135K
+    ├── [~] CTE filtered_dates (new)
+    │   └── SCAN date_dim (filtered)
+    ├── [~] CTE filtered_items (new)
+    │   └── SCAN item (filtered)
+    ├── [~] CTE sales_bitmap (new)
+    │   ├── UNION ALL
+    │   │   ├── HASH AGGREGATE (store_sales + filtered_dates + filtered_items)
+    │   │   ├── HASH AGGREGATE (web_sales + filtered_dates + filtered_items)
+    │   │   └── HASH AGGREGATE (catalog_sales + filtered_dates + filtered_items)
+    │   └── HASH AGGREGATE (merge flags)
+    ├── [~] CTE customer_base (new)
+    │   ├── HASH JOIN (customer + customer_address)
+    │   ├── HASH JOIN (+ customer_demographics)
+    │   └── LEFT HASH JOIN (+ sales_bitmap)
+    ├── FILTER (original demographics + county + birth_month + channel flags)
+    ├── HASH AGGREGATE (GROUP BY 8 columns)
+    ├── SORT (8 columns ASC)
+    └── OUTPUT (14 columns)
+```
+
+**Change markers:**
+- `[~] CTE filtered_dates`: New CTE replacing date_dim subquery filters
+- `[~] CTE filtered_items`: New CTE replacing item subquery filters  
+- `[~] CTE sales_bitmap`: New CTE replacing three EXISTS subqueries with UNION ALL + GROUP BY channel
+- `[~] CTE customer_base`: New CTE combining customer, address, demographics, and channel flags
+- `[~] main_query`: Modified to use CTEs instead of comma joins and EXISTS subqueries
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "cte_materialization", "description": "Extract date_dim filter to CTE for reuse", "applied_to": ["filtered_dates"]},
+    {"id": "R2", "type": "cte_materialization", "description": "Extract item filter to CTE for reuse", "applied_to": ["filtered_items"]},
+    {"id": "R3", "type": "bitmap_channel_aggregation", "description": "Replace EXISTS with UNION ALL + BOOL_OR flags per channel", "applied_to": ["sales_bitmap"]},
+    {"id": "R4", "type": "cte_pipelining", "description": "Push customer-address-demographics join into CTE with channel flags", "applied_to": ["customer_base"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy BETWEEN 5 AND 8",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_items": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk FROM item WHERE i_category IN ('Children', 'Home', 'Women') AND i_manager_id BETWEEN 91 AND 100",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "sales_bitmap": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT customer_sk, MAX(has_store) AS has_store, MAX(has_web) AS has_web, MAX(has_catalog) AS has_catalog FROM (SELECT ss_customer_sk AS customer_sk, TRUE AS has_store, NULL::boolean AS has_web, NULL::boolean AS has_catalog FROM store_sales ss INNER JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk INNER JOIN filtered_items fi ON ss.ss_item_sk = fi.i_item_sk WHERE ss.ss_sales_price / ss.ss_list_price BETWEEN 0.65 AND 0.75 GROUP BY ss_customer_sk UNION ALL SELECT ws_bill_customer_sk AS customer_sk, NULL::boolean AS has_store, TRUE AS has_web, NULL::boolean AS has_catalog FROM web_sales ws INNER JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk INNER JOIN filtered_items fi ON ws.ws_item_sk = fi.i_item_sk WHERE ws.ws_sales_price / ws.ws_list_price BETWEEN 0.65 AND 0.75 GROUP BY ws_bill_customer_sk UNION ALL SELECT cs_ship_customer_sk AS customer_sk, NULL::boolean AS has_store, NULL::boolean AS has_web, TRUE AS has_catalog FROM catalog_sales cs INNER JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk INNER JOIN filtered_items fi ON cs.cs_item_sk = fi.i_item_sk WHERE cs.cs_sales_price / cs.cs_list_price BETWEEN 0.65 AND 0.75 GROUP BY cs_ship_customer_sk) channel_sales GROUP BY customer_sk",
+        "interfaces": {"outputs": ["customer_sk", "has_store", "has_web", "has_catalog"], "consumes": ["filtered_dates", "filtered_items"]}
+      },
+      "customer_base": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating, cd.cd_dep_count, cd.cd_dep_employed_count, cd.cd_dep_college_count FROM customer c INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk LEFT JOIN sales_bitmap sb ON c.c_customer_sk = sb.customer_sk WHERE ca.ca_county IN ('Alameda County','Lexington city','Pender County','Petroleum County','Walworth County') AND c.c_birth_month IN (4, 5) AND cd.cd_marital_status IN ('U', 'S', 'U') AND cd.cd_education_status IN ('College', 'Secondary', 'College') AND cd.cd_gender = 'M' AND (sb.has_store OR sb.has_web OR sb.has_catalog)",
+        "interfaces": {"outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "cd_purchase_estimate", "cd_credit_rating", "cd_dep_count", "cd_dep_employed_count", "cd_dep_college_count"], "consumes": ["sales_bitmap"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3, cd_dep_count, COUNT(*) AS cnt4, cd_dep_employed_count, COUNT(*) AS cnt5, cd_dep_college_count, COUNT(*) AS cnt6 FROM customer_base GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100",
+        "interfaces": {"outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "cnt1", "cd_purchase_estimate", "cnt2", "cd_credit_rating", "cnt3", "cd_dep_count", "cnt4", "cd_dep_employed_count", "cnt5", "cd_dep_college_count", "cnt6"], "consumes": ["customer_base"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_items", "sales_bitmap", "customer_base", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), filtered_items AS ({filtered_items}), sales_bitmap AS ({sales_bitmap}), customer_base AS ({customer_base}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL enable_hashjoin = on",
+    "SET LOCAL enable_mergejoin = off",
+    "SET LOCAL enable_nestloop = off",
+    "SET LOCAL work_mem = '512MB'",
+    "SET LOCAL max_parallel_workers_per_gather = 2",
+    "SET LOCAL parallel_setup_cost = 0",
+    "SET LOCAL parallel_tuple_cost = 0.001"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes:** Replaced comma joins and EXISTS subqueries with CTE pipeline using channel bitmap flags (BOOL_OR per channel aggregated with MAX). This reduces repeated filtering of date_dim and item tables while preserving exact semantic equivalence.
+
+**Expected speedup:** 2-3x by eliminating redundant date/item scans and enabling parallel hash aggregation on channel flags. The bitmap aggregation reduces the three EXISTS subqueries to single-pass scans per sales table with early filtering.
+
+**Runtime config rationale:**
+1. `enable_hashjoin = on, enable_mergejoin = off, enable_nestloop = off`: Force hash joins for large fact table joins; merge joins unnecessary for equality joins on integer keys; nested loops would be inefficient for large sales tables.
+2. `work_mem = '512MB'`: Supports hash aggregation for sales_bitmap (3 channel subqueries + outer aggregation) and hash joins in customer_base.
+3. `max_parallel_workers_per_gather = 2`: Allows parallel scans on sales tables within CTEs (non-materialized).
+4. `parallel_setup_cost = 0, parallel_tuple_cost = 0.001`: Encourage parallel execution for large fact table scans given HDD storage.

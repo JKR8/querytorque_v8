@@ -1,0 +1,110 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] store_sd  [+]  New CTE filtering store for SD (previously part of main query filter)
+│   └── OUTPUT: s_store_sk
+├── [CTE] date_2000  [+]  New CTE filtering date_dim for year 2000 (previously part of customer_total_return CTE)
+│   └── OUTPUT: d_date_sk
+├── [CTE] prefiltered_returns  [+]  New CTE joining store_returns with both dimension CTEs (replaces original store_returns/date_dim join)
+│   ├── JOIN (sr_returned_date_sk = date_2000.d_date_sk)
+│   ├── JOIN (sr_store_sk = store_sd.s_store_sk)
+│   └── OUTPUT: sr_customer_sk, sr_store_sk, sr_fee
+├── [CTE] customer_store_totals  [~]  Modified to source from prefiltered_returns instead of store_returns+date_dim join
+│   ├── SCAN (prefiltered_returns)
+│   ├── AGG (GROUP BY sr_customer_sk, sr_store_sk)
+│   └── OUTPUT: ctr_customer_sk, ctr_store_sk, ctr_total_return
+├── [CTE] store_averages  [+]  New CTE computing per-store averages (replaces correlated subquery)
+│   ├── SCAN (customer_store_totals)
+│   ├── AGG (GROUP BY ctr_store_sk)
+│   └── OUTPUT: ctr_store_sk, store_avg_return
+├── [CTE] filtered_totals  [+]  New CTE comparing customer totals to store averages
+│   ├── JOIN (customer_store_totals × store_averages)
+│   ├── FILTER (ctr_total_return > store_avg_return * 1.2)
+│   └── OUTPUT: ctr_customer_sk, ctr_store_sk
+├── [CTE] customer_join  [+]  New CTE joining filtered totals to customer
+│   ├── JOIN (filtered_totals × customer)
+│   └── OUTPUT: c_customer_id
+└── [MAIN] limit  [+]  Final ordering and limit (replaces original main query)
+    ├── SCAN (customer_join)
+    ├── SORT (c_customer_id ASC)
+    ├── LIMIT 100
+    └── OUTPUT: c_customer_id
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefetch", "description": "Extracted store and date dimension filters into separate CTEs before fact table join", "applied_to": ["store_sd", "date_2000", "prefiltered_returns"]},
+    {"id": "R2", "type": "decorrelation", "description": "Replaced correlated subquery with explicit store_averages CTE and filtered_totals join", "applied_to": ["store_averages", "filtered_totals"]},
+    {"id": "R3", "type": "progressive_reduction", "description": "Staged CTE chain reduces data volume at each step before final customer join", "applied_to": ["customer_store_totals", "filtered_totals", "customer_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "store_sd": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_sk FROM store WHERE s_state = 'SD'",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "date_2000": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "prefiltered_returns": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT sr_customer_sk, sr_store_sk, sr_fee FROM store_returns JOIN date_2000 ON sr_returned_date_sk = date_2000.d_date_sk JOIN store_sd ON sr_store_sk = store_sd.s_store_sk",
+        "interfaces": {"outputs": ["sr_customer_sk", "sr_store_sk", "sr_fee"], "consumes": ["date_2000", "store_sd"]}
+      },
+      "customer_store_totals": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(sr_fee) AS ctr_total_return FROM prefiltered_returns GROUP BY sr_customer_sk, sr_store_sk",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_total_return"], "consumes": ["prefiltered_returns"]}
+      },
+      "store_averages": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ctr_store_sk, AVG(ctr_total_return) AS store_avg_return FROM customer_store_totals GROUP BY ctr_store_sk",
+        "interfaces": {"outputs": ["ctr_store_sk", "store_avg_return"], "consumes": ["customer_store_totals"]}
+      },
+      "filtered_totals": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ctr_customer_sk, ctr_store_sk FROM customer_store_totals AS ctr1 JOIN store_averages ON ctr1.ctr_store_sk = store_averages.ctr_store_sk WHERE ctr1.ctr_total_return > store_averages.store_avg_return * 1.2",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_store_sk"], "consumes": ["customer_store_totals", "store_averages"]}
+      },
+      "customer_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_customer_id FROM filtered_totals JOIN customer ON ctr_customer_sk = c_customer_sk",
+        "interfaces": {"outputs": ["c_customer_id"], "consumes": ["filtered_totals"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id FROM customer_join ORDER BY c_customer_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["c_customer_id"], "consumes": ["customer_join"]}
+      }
+    },
+    "reconstruction_order": ["store_sd", "date_2000", "prefiltered_returns", "customer_store_totals", "store_averages", "filtered_totals", "customer_join", "main_query"],
+    "assembly_template": "WITH store_sd AS ({store_sd}), date_2000 AS ({date_2000}), prefiltered_returns AS ({prefiltered_returns}), customer_store_totals AS ({customer_store_totals}), store_averages AS ({store_averages}), filtered_totals AS ({filtered_totals}), customer_join AS ({customer_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Pre-filtered store and date dimensions into CTEs to reduce fact table scan, then built staged aggregation pipeline that computes per-customer totals, store averages, and the comparison filter before the final customer join. Expected speedup: 2-3x from reduced fact table I/O and decorrelated aggregation.
+
+Expected speedup: 2.5x (from ~0.113s to ~0.045s) due to early reduction of store_returns from 557K rows to ~19.5K rows via dimension prefetching, and elimination of correlated subquery overhead.

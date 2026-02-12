@@ -1,0 +1,73 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: ~25%  Rows: 1 — Compute eight time-slice counts via conditional aggregation on pre-joined fact data.
+    ├── [~] FROM: Instead of 8 independent scans, use CTE chain to scan store_sales once
+    │   ├── [+] time_filter_cte (new) — pre-filter time_dim for all 8 windows
+    │   ├── [+] fact_time_join_cte (new) — join filtered time slots with store_sales
+    │   └── [+] store_household_join_cte (new) — apply store and household filters
+    ├── [=] JOIN conditions preserved (time, store, household)
+    ├── [=] FILTER conditions preserved (time windows, store name, household combos)
+    └── [~] OUTPUT: Same 8 columns via conditional COUNT(*) instead of cross-join
+
+COMPONENTS:
+  time_filter_cte [new]: Filter time_dim for 8 half-hour windows, output t_time_sk + hour/minute
+  fact_time_join_cte [new]: Join store_sales with time_filter_cte, propagate ss_store_sk, ss_hdemo_sk
+  store_household_join_cte [new]: Join with store (s_store_name='ese') and household_demographics (OR conditions)
+  main_query [modified]: Single SELECT with 8 COUNT(*) FILTER (WHERE ...) aggregations
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "prefetch_fact_join", "description": "Staged join pipeline: filter time_dim first, pre-join with fact, then join remaining dims", "applied_to": ["time_filter_cte", "fact_time_join_cte", "store_household_join_cte"]},
+    {"id": "R2", "type": "aggregate_consolidation", "description": "Replace 8 independent subquery scans with single scan + conditional aggregation", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "time_filter_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT t_time_sk, t_hour, t_minute FROM time_dim WHERE (t_hour = 8 AND t_minute >= 30) OR (t_hour = 9 AND t_minute < 30) OR (t_hour = 9 AND t_minute >= 30) OR (t_hour = 10 AND t_minute < 30) OR (t_hour = 10 AND t_minute >= 30) OR (t_hour = 11 AND t_minute < 30) OR (t_hour = 11 AND t_minute >= 30) OR (t_hour = 12 AND t_minute < 30)",
+        "interfaces": {"outputs": ["t_time_sk", "t_hour", "t_minute"], "consumes": []}
+      },
+      "fact_time_join_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_sold_time_sk, ss_store_sk, ss_hdemo_sk, t_hour, t_minute FROM store_sales JOIN time_filter_cte ON ss_sold_time_sk = t_time_sk",
+        "interfaces": {"outputs": ["ss_sold_time_sk", "ss_store_sk", "ss_hdemo_sk", "t_hour", "t_minute"], "consumes": ["time_filter_cte"]}
+      },
+      "store_household_join_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT t_hour, t_minute FROM fact_time_join_cte JOIN store ON ss_store_sk = s_store_sk AND s_store_name = 'ese' JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk AND ((hd_dep_count = -1 AND hd_vehicle_count <= -1+2) OR (hd_dep_count = 4 AND hd_vehicle_count <= 4+2) OR (hd_dep_count = 3 AND hd_vehicle_count <= 3+2))",
+        "interfaces": {"outputs": ["t_hour", "t_minute"], "consumes": ["fact_time_join_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(*) FILTER (WHERE t_hour = 8 AND t_minute >= 30) AS h8_30_to_9, COUNT(*) FILTER (WHERE t_hour = 9 AND t_minute < 30) AS h9_to_9_30, COUNT(*) FILTER (WHERE t_hour = 9 AND t_minute >= 30) AS h9_30_to_10, COUNT(*) FILTER (WHERE t_hour = 10 AND t_minute < 30) AS h10_to_10_30, COUNT(*) FILTER (WHERE t_hour = 10 AND t_minute >= 30) AS h10_30_to_11, COUNT(*) FILTER (WHERE t_hour = 11 AND t_minute < 30) AS h11_to_11_30, COUNT(*) FILTER (WHERE t_hour = 11 AND t_minute >= 30) AS h11_30_to_12, COUNT(*) FILTER (WHERE t_hour = 12 AND t_minute < 30) AS h12_to_12_30 FROM store_household_join_cte",
+        "interfaces": {"outputs": ["h8_30_to_9", "h9_to_9_30", "h9_30_to_10", "h10_to_10_30", "h10_30_to_11", "h11_to_11_30", "h11_30_to_12", "h12_to_12_30"], "consumes": ["store_household_join_cte"]}
+      }
+    },
+    "reconstruction_order": ["time_filter_cte", "fact_time_join_cte", "store_household_join_cte", "main_query"],
+    "assembly_template": "WITH time_filter_cte AS ({time_filter_cte}), fact_time_join_cte AS ({fact_time_join_cte}), store_household_join_cte AS ({store_household_join_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Changes Explanation
+
+**Mechanism:** Replaced 8 independent store_sales scans (each ~230ms) with a single scan by: (1) filtering time_dim for all 8 windows into a CTE, (2) joining once with store_sales, (3) applying store and household filters, (4) using COUNT(*) FILTER for conditional aggregation per window.
+
+**Expected speedup:** ~4-8x (eliminates 7 redundant fact table scans while maintaining semantic equivalence).

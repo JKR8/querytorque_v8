@@ -1,0 +1,70 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] v1_lag_lead  [!]  Cost: 33%  Rows: ~148K  — Aggregate monthly catalog sales by category/brand/call-center for Dec-1998 through Jan-2000, compute yearly average monthly sales, and adjacent month sales via LAG/LEAD.
+│   ├── SCAN (item, catalog_sales (join), date_dim (join), call_center (join))
+│   ├── JOIN (cs_item_sk = i_item_sk)
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── JOIN (+1 more)
+│   ├── FILTER ((d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1)))
+│   ├── AGG (GROUP BY)
+│   ├── WINDOW (AVG, LAG, LEAD)
+│   ├── SORT (d_year ASC, d_moy ASC)  [implicit in window]
+│   └── OUTPUT (i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, prev_sum_sales, next_sum_sales)
+├── [CTE] v2_simple  [!]  Cost: 33%  Rows: ~148K  — Select subset of columns with renamed adjacent-month columns.
+│   ├── SCAN (v1_lag_lead)
+│   └── OUTPUT (i_brand, d_year, avg_monthly_sales, sum_sales, psum, nsum)
+└── [MAIN] main_query  [~]  Cost: 33%  Rows: ~1K  — Keep 1999 rows with nonzero average monthly sales and >10% relative deviation, then order by deviation and next-month sales.
+    ├── SCAN (v2_simple)
+    ├── FILTER (d_year = 1999)
+    ├── FILTER (avg_monthly_sales > 0)
+    ├── FILTER (+1 more)
+    ├── SORT (sum_sales - avg_monthly_sales ASC, nsum ASC)
+    └── OUTPUT (*)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "SELF_JOIN_TO_WINDOW", "description": "Replaced three-way self-join on rank adjacency with LAG/LEAD window functions in v1_lag_lead", "applied_to": ["v1_lag_lead", "v2_simple"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "v1_lag_lead": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_category, i_brand, cc_name, d_year, d_moy, SUM(cs_sales_price) AS sum_sales, AVG(SUM(cs_sales_price)) OVER (PARTITION BY i_category, i_brand, cc_name, d_year) AS avg_monthly_sales, LAG(SUM(cs_sales_price), 1) OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy) AS prev_sum_sales, LEAD(SUM(cs_sales_price), 1) OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy) AS next_sum_sales FROM item, catalog_sales, date_dim, call_center WHERE cs_item_sk = i_item_sk AND cs_sold_date_sk = d_date_sk AND cc_call_center_sk = cs_call_center_sk AND (d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1)) GROUP BY i_category, i_brand, cc_name, d_year, d_moy",
+        "interfaces": {"outputs": ["i_category", "i_brand", "cc_name", "d_year", "d_moy", "sum_sales", "avg_monthly_sales", "prev_sum_sales", "next_sum_sales"], "consumes": []}
+      },
+      "v2_simple": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_brand, d_year, avg_monthly_sales, sum_sales, prev_sum_sales AS psum, next_sum_sales AS nsum FROM v1_lag_lead",
+        "interfaces": {"outputs": ["i_brand", "d_year", "avg_monthly_sales", "sum_sales", "psum", "nsum"], "consumes": ["v1_lag_lead"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT * FROM v2_simple WHERE d_year = 1999 AND avg_monthly_sales > 0 AND CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE null END > 0.1 ORDER BY sum_sales - avg_monthly_sales ASC, nsum ASC LIMIT 100",
+        "interfaces": {"outputs": ["i_brand", "d_year", "avg_monthly_sales", "sum_sales", "psum", "nsum"], "consumes": ["v2_simple"]}
+      }
+    },
+    "reconstruction_order": ["v1_lag_lead", "v2_simple", "main_query"],
+    "assembly_template": "WITH v1_lag_lead AS ({v1_lag_lead}), v2_simple AS ({v2_simple}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Replaced the original v1 and v2 CTEs with v1_lag_lead and v2_simple as per the target logical tree, using LAG/LEAD window functions to compute adjacent-month sales directly, eliminating the three-way self‑join on rank adjacency.
+
+Expected speedup: 1.5–2x (removes expensive self‑join and reduces intermediate row count).

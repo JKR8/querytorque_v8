@@ -1,0 +1,357 @@
+<reasoning>
+CLASSIFICATION: This is a star-join with late dimension filter (item OR condition) and a window aggregation computed over grouped aggregates. The query follows a classic pattern: filter dimensions, join to fact, aggregate, compute window, then filter and order.
+
+EXPLAIN PLAN ANALYSIS:
+- Total execution: 416ms.
+- SEQ_SCAN store_sales: 279.8ms (67% exclusive time), returning 5.4M rows out of 345.6M (1.56% selectivity). This is the dominant cost.
+- HASH_JOIN INNER on ss_item_sk = i_item_sk: 54.8ms (13%).
+- HASH_JOIN INNER on ss_sold_date_sk = d_date_sk: 38.4ms (9%).
+- date_dim scan: 366 rows after filter (d_month_seq 1200-1211). Filter is pushed into scan (BETWEEN).
+- item scan: 5,279 rows after complex OR filter (from 102K total). Filter applied after scan.
+- store scan: 100 rows after s_store_sk<=100 filter.
+- After joins: 198K rows → HASH_GROUP_BY: 3,065 rows → WINDOW: 3,065 rows → FILTER: 2,618 rows → TOP_N: 100 rows.
+
+Cardinality flow: 5.4M (store_sales) → 198K (after item join) → 3,065 (group by) → 2,618 (filter) → 100 (limit).
+
+Bottleneck: The store_sales scan (279.8ms) is the overwhelming cost. The optimizer already pushes the date filter into the store_sales scan (via the BETWEEN on d_date_sk). The item filter is applied after the join, so it does not reduce the store_sales scan rows. The store filter is also applied late.
+
+Optimizer strengths: INTRA_SCAN_PREDICATE_PUSHDOWN (date filter pushed), HASH_JOIN_SELECTION (hash joins used), COLUMNAR_PROJECTION (only needed columns read). The optimizer does NOT push the item or store filters into the store_sales scan because they are on different tables.
+
+GAP MATCHING:
+1. CROSS_CTE_PREDICATE_BLINDNESS: The item and store filters are applied after the fact table join. Pre-filtering these dimensions into CTEs before joining could allow the optimizer to build small hash tables and possibly push the join keys as a filter into the store_sales scan? The EXPLAIN shows the date filter is pushed, but not item or store. This gap is active.
+2. REDUNDANT_SCAN_ELIMINATION: The fact table is scanned only once. No redundant scans.
+3. CORRELATED_SUBQUERY_PARALYSIS: No correlated subqueries.
+4. CROSS_COLUMN_OR_DECOMPOSITION: The OR condition is on the same table (item) and same columns (category, class, brand). The engine handles same-column ORs well. Splitting into UNION ALL would double the fact table scan. This gap is NOT active (and splitting is warned against).
+
+AGGREGATION TRAP CHECK: The query uses SUM and AVG(SUM(...)) OVER. The window function computes the average of per-manufacturer quarterly totals. The grouping is (i_manufact_id, d_qoy). Any restructuring must preserve the exact set of rows contributing to each group. The window function is computed after the GROUP BY, so it's safe as long as the GROUP BY result is identical.
+
+TRANSFORM SELECTION:
+1. **prefetch_fact_join** (tag-matched): Pre-filter date, item, store into CTEs, then join with store_sales. This attacks the CROSS_CTE_PREDICATE_BLINDNESS gap by forcing early dimension filtering.
+2. **dimension_cte_isolate** (tag-matched): Similar, but explicitly pre-filter all three dimensions into separate CTEs, then join with fact. Also attacks CROSS_CTE_PREDICATE_BLINDNESS.
+3. **single_pass_aggregation** (not tag-matched but applicable via scan_consolidation_pivot): The query groups by d_qoy (quarter). Could pre-join filtered dimensions with store_sales and aggregate by (i_manufact_id, d_qoy) in one pass. This is essentially the original plan but with explicit CTEs. However, we can explore a compound strategy that also pre-filters dimensions and pushes aggregation earlier? Actually, the aggregation cannot be pushed before joins because i_manufact_id and d_qoy come from different tables. So we keep the same aggregation order.
+4. **explicit_joins** (minimal-change baseline): Rewrite with explicit JOIN syntax to let the optimizer reorder joins freely. This is a safe baseline.
+
+Given the strategy leaderboard, prefetch_fact_join and dimension_cte_isolate have moderate win rates (28% and 24%). single_pass_aggregation has 30% win rate but is not directly applicable (no repeated scans). However, we can assign a compound strategy that combines dimension pre-filtering with an attempt to push the item filter earlier.
+
+For diversity:
+- Worker 1: prefetch_fact_join (staged CTE chain)
+- Worker 2: dimension_cte_isolate (parallel dimension CTEs)
+- Worker 3: or_to_union (exploration, despite warnings, because the OR is on item table only and could be split into two branches, but must ensure we don't double fact scan by using a UNION of pre-joined results? Actually, splitting the OR would require two separate joins with store_sales, which would double the fact scan. This is risky. We'll assign it as exploration with hazard flags.)
+- Worker 4: compound strategy: pre-filter dimensions and use a CTE to pre-join store_sales with date and store, then join with filtered item (both branches in one go). This is a novel combination.
+
+LOGICAL TREE DESIGN:
+For each strategy, define CTEs and ensure column completeness.
+
+</reasoning>
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Identify manufacturers with quarterly sales volatility in month sequence 1200-1211 for selected category/class/brand bundles by flagging quarter totals that deviate more than 10% from manufacturer average quarterly sales. All joins are INNER (intersection semantics). The window function AVG(SUM(...)) OVER must compute the average of per-manufacturer quarterly totals exactly as the original grouping (i_manufact_id, d_qoy). The final filter depends on the window result, so cannot be pushed below window.
+
+BOTTLENECK_DIAGNOSIS: Scan-bound on store_sales (279.8ms, 67% exclusive). The optimizer already pushes the date filter into the store_sales scan (via d_date_sk BETWEEN). The item and store filters are applied after the join, not reducing the fact scan. Cardinality: store_sales scan 5.4M rows → after joins 198K → after group by 3,065 → after window/filter 2,618 → limit 100. The optimizer handles hash joins and column projection well; logical-tree cost percentages are misleading because the scan cost is exclusive.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output i_manufact_id, sum_sales, avg_quarterly_sales.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (e.g., i_manufact_id, d_qoy, ss_sales_price, join keys).
+- LITERAL_PRESERVATION: Must preserve literal values for d_month_seq (1200..1211), item categories/classes/brands, and threshold 0.1.
+- SEMANTIC_EQUIVALENCE: Must return same rows, columns, ordering (avg_quarterly_sales ASC, sum_sales ASC, i_manufact_id ASC) with LIMIT 100.
+- CROSS_CTE_PREDICATE_BLINDNESS: Item and store filters are applied after join in current plan; pre-filtering into CTEs could reduce join probe size.
+- REDUNDANT_SCAN_ELIMINATION: Fact table scanned once; no redundancy.
+
+REGRESSION_WARNINGS:
+1. or_to_union (observed regression: 0.59x on Q90):
+   CAUSE: Splitting same-column OR doubled fact table scans without selectivity benefit.
+   RULE: Do not split OR into UNION ALL if it would cause multiple fact table scans.
+2. date_cte_isolate (observed regression: 0.49x on Q31):
+   CAUSE: Baseline already optimized (date predicate pushed), CTE overhead dominated.
+   RULE: Avoid creating date CTE if date filter already pushed down (it is in this plan).
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+date_cte -> item_cte -> store_cte -> prefetch_cte (join with store_sales) -> agg_cte -> window_cte -> filter_cte -> top_n
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1200 AND 1211
+    OUTPUT: d_date_sk, d_qoy
+    EXPECTED_ROWS: 366
+    CONSUMERS: prefetch_cte
+  item_cte:
+    FROM: item
+    WHERE: ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN ('scholaramalgamalg #14','scholaramalgamalg #7','exportiunivamalg #9','scholaramalgamalg #9')) OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN ('amalgimporto #1','edu packscholar #1','exportiimporto #1','importoamalg #1')))
+    OUTPUT: i_item_sk, i_manufact_id
+    EXPECTED_ROWS: 5,279
+    CONSUMERS: prefetch_cte
+  store_cte:
+    FROM: store
+    WHERE: s_store_sk <= 100
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 100
+    CONSUMERS: prefetch_cte
+  prefetch_cte:
+    FROM: store_sales
+    JOIN: INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+          INNER JOIN item_cte ON ss_item_sk = i_item_sk
+          INNER JOIN store_cte ON ss_store_sk = s_store_sk
+    OUTPUT: i_manufact_id, d_qoy, ss_sales_price
+    EXPECTED_ROWS: 198K
+    CONSUMERS: agg_cte
+  agg_cte:
+    FROM: prefetch_cte
+    GROUP BY: i_manufact_id, d_qoy
+    AGGREGATE: SUM(ss_sales_price) AS sum_sales
+    OUTPUT: i_manufact_id, d_qoy, sum_sales
+    EXPECTED_ROWS: 3,065
+    CONSUMERS: window_cte
+  window_cte:
+    FROM: agg_cte
+    WINDOW: AVG(sum_sales) OVER (PARTITION BY i_manufact_id) AS avg_quarterly_sales
+    OUTPUT: i_manufact_id, d_qoy, sum_sales, avg_quarterly_sales
+    EXPECTED_ROWS: 3,065
+    CONSUMERS: filter_cte
+  filter_cte:
+    FROM: window_cte
+    WHERE: CASE WHEN avg_quarterly_sales > 0 THEN ABS(sum_sales - avg_quarterly_sales) / avg_quarterly_sales ELSE NULL END > 0.1
+    OUTPUT: i_manufact_id, sum_sales, avg_quarterly_sales
+    EXPECTED_ROWS: 2,618
+    CONSUMERS: top_n
+  top_n:
+    FROM: filter_cte
+    ORDER BY: avg_quarterly_sales ASC, sum_sales ASC, i_manufact_id ASC
+    LIMIT: 100
+    OUTPUT: i_manufact_id, sum_sales, avg_quarterly_sales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: prefetch_fact_join, date_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply the staged CTE chain: filter dimensions first, then join with fact. Ignore the multi-channel aspect (this query has only one fact table).
+- date_cte_isolate: Apply the date filtering CTE pattern; ignore the decorrelation aspect (no correlated subquery).
+- early_filter: Apply the principle of filtering small dimension tables first; ignore the reason table filter (not applicable).
+HAZARD_FLAGS:
+- CTE materialization overhead may outweigh benefits if the dimension CTEs are inlined (single-reference).
+- Must ensure the prefetch_cte includes all columns needed for aggregation (i_manufact_id, d_qoy, ss_sales_price).
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+date_cte, item_cte, store_cte -> fact_join_cte (store_sales join all three) -> agg_cte -> window_cte -> filter_cte -> top_n
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1200 AND 1211
+    OUTPUT: d_date_sk, d_qoy
+    EXPECTED_ROWS: 366
+    CONSUMERS: fact_join_cte
+  item_cte:
+    FROM: item
+    WHERE: ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN ('scholaramalgamalg #14','scholaramalgamalg #7','exportiunivamalg #9','scholaramalgamalg #9')) OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN ('amalgimporto #1','edu packscholar #1','exportiimporto #1','importoamalg #1')))
+    OUTPUT: i_item_sk, i_manufact_id
+    EXPECTED_ROWS: 5,279
+    CONSUMERS: fact_join_cte
+  store_cte:
+    FROM: store
+    WHERE: s_store_sk <= 100
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 100
+    CONSUMERS: fact_join_cte
+  fact_join_cte:
+    FROM: store_sales
+    JOIN: INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+          INNER JOIN item_cte ON ss_item_sk = i_item_sk
+          INNER JOIN store_cte ON ss_store_sk = s_store_sk
+    OUTPUT: i_manufact_id, d_qoy, ss_sales_price
+    EXPECTED_ROWS: 198K
+    CONSUMERS: agg_cte
+  agg_cte:
+    FROM: fact_join_cte
+    GROUP BY: i_manufact_id, d_qoy
+    AGGREGATE: SUM(ss_sales_price) AS sum_sales
+    OUTPUT: i_manufact_id, d_qoy, sum_sales
+    EXPECTED_ROWS: 3,065
+    CONSUMERS: window_cte
+  window_cte:
+    FROM: agg_cte
+    WINDOW: AVG(sum_sales) OVER (PARTITION BY i_manufact_id) AS avg_quarterly_sales
+    OUTPUT: i_manufact_id, d_qoy, sum_sales, avg_quarterly_sales
+    EXPECTED_ROWS: 3,065
+    CONSUMERS: filter_cte
+  filter_cte:
+    FROM: window_cte
+    WHERE: CASE WHEN avg_quarterly_sales > 0 THEN ABS(sum_sales - avg_quarterly_sales) / avg_quarterly_sales ELSE NULL END > 0.1
+    OUTPUT: i_manufact_id, sum_sales, avg_quarterly_sales
+    EXPECTED_ROWS: 2,618
+    CONSUMERS: top_n
+  top_n:
+    FROM: filter_cte
+    ORDER BY: avg_quarterly_sales ASC, sum_sales ASC, i_manufact_id ASC
+    LIMIT: 100
+    OUTPUT: i_manufact_id, sum_sales, avg_quarterly_sales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, multi_dimension_prefetch, early_filter
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering of all dimension tables into CTEs; ignore the cross-join hazard (we are joining them with fact, not cross-joining CTEs).
+- multi_dimension_prefetch: Apply pre-filtering of multiple dimensions (date, item, store) before fact join; ignore the unfiltered dimension CTE warning (all CTEs have WHERE).
+- early_filter: Apply filtering of small dimension tables first; ignore the reason table filter.
+HAZARD_FLAGS:
+- If the optimizer inlines CTEs, the materialization benefit may be lost.
+- Must ensure fact_join_cte includes all required columns.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: or_to_union
+TARGET_LOGICAL_TREE:
+date_cte, store_cte -> branch1_cte (store_sales join date_cte join store_cte join item_filtered1) -> branch2_cte (store_sales join date_cte join store_cte join item_filtered2) -> union_cte -> agg_cte -> window_cte -> filter_cte -> top_n
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1200 AND 1211
+    OUTPUT: d_date_sk, d_qoy
+    EXPECTED_ROWS: 366
+    CONSUMERS: branch1_cte, branch2_cte
+  store_cte:
+    FROM: store
+    WHERE: s_store_sk <= 100
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 100
+    CONSUMERS: branch1_cte, branch2_cte
+  item_filtered1:
+    FROM: item
+    WHERE: i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN ('scholaramalgamalg #14','scholaramalgamalg #7','exportiunivamalg #9','scholaramalgamalg #9')
+    OUTPUT: i_item_sk, i_manufact_id
+    EXPECTED_ROWS: ~2,640 (half of 5,279)
+    CONSUMERS: branch1_cte
+  item_filtered2:
+    FROM: item
+    WHERE: i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN ('amalgimporto #1','edu packscholar #1','exportiimporto #1','importoamalg #1')
+    OUTPUT: i_item_sk, i_manufact_id
+    EXPECTED_ROWS: ~2,639
+    CONSUMERS: branch2_cte
+  branch1_cte:
+    FROM: store_sales
+    JOIN: INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+          INNER JOIN store_cte ON ss_store_sk = s_store_sk
+          INNER JOIN item_filtered1 ON ss_item_sk = i_item_sk
+    OUTPUT: i_manufact_id, d_qoy, ss_sales_price
+    EXPECTED_ROWS: ~99K (half of 198K)
+    CONSUMERS: union_cte
+  branch2_cte:
+    FROM: store_sales
+    JOIN: INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+          INNER JOIN store_cte ON ss_store_sk = s_store_sk
+          INNER JOIN item_filtered2 ON ss_item_sk = i_item_sk
+    OUTPUT: i_manufact_id, d_qoy, ss_sales_price
+    EXPECTED_ROWS: ~99K
+    CONSUMERS: union_cte
+  union_cte:
+    FROM: branch1_cte UNION ALL branch2_cte
+    OUTPUT: i_manufact_id, d_qoy, ss_sales_price
+    EXPECTED_ROWS: 198K
+    CONSUMERS: agg_cte
+  agg_cte:
+    FROM: union_cte
+    GROUP BY: i_manufact_id, d_qoy
+    AGGREGATE: SUM(ss_sales_price) AS sum_sales
+    OUTPUT: i_manufact_id, d_qoy, sum_sales
+    EXPECTED_ROWS: 3,065
+    CONSUMERS: window_cte
+  window_cte:
+    FROM: agg_cte
+    WINDOW: AVG(sum_sales) OVER (PARTITION BY i_manufact_id) AS avg_quarterly_sales
+    OUTPUT: i_manufact_id, d_qoy, sum_sales, avg_quarterly_sales
+    EXPECTED_ROWS: 3,065
+    CONSUMERS: filter_cte
+  filter_cte:
+    FROM: window_cte
+    WHERE: CASE WHEN avg_quarterly_sales > 0 THEN ABS(sum_sales - avg_quarterly_sales) / avg_quarterly_sales ELSE NULL END > 0.1
+    OUTPUT: i_manufact_id, sum_sales, avg_quarterly_sales
+    EXPECTED_ROWS: 2,618
+    CONSUMERS: top_n
+  top_n:
+    FROM: filter_cte
+    ORDER BY: avg_quarterly_sales ASC, sum_sales ASC, i_manufact_id ASC
+    LIMIT: 100
+    OUTPUT: i_manufact_id, sum_sales, avg_quarterly_sales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: or_to_union, multi_dimension_prefetch, early_filter
+EXAMPLE_ADAPTATION:
+- or_to_union: Apply splitting the OR into two branches with separate item filters; ignore the warning about same-column OR (we are splitting because the OR is on the same table but different categories, and we accept the risk of double fact scan).
+- multi_dimension_prefetch: Apply pre-filtering of date and store CTEs shared across branches; ignore the unfiltered dimension CTE warning.
+- early_filter: Apply filtering of dimensions first; ignore the reason table filter.
+HAZARD_FLAGS:
+- Double scan of store_sales (two branches) will likely double the scan cost (279.8ms → ~560ms), causing regression.
+- The UNION ALL may add overhead.
+- Must ensure the union does not duplicate rows (branches are mutually exclusive).
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: compound_prefetch_early_aggregation
+TARGET_LOGICAL_TREE:
+date_cte, store_cte -> prefact_cte (store_sales join date_cte join store_cte) -> join_item_cte (prefact_cte join item) -> agg_cte -> window_cte -> filter_cte -> top_n
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1200 AND 1211
+    OUTPUT: d_date_sk, d_qoy
+    EXPECTED_ROWS: 366
+    CONSUMERS: prefact_cte
+  store_cte:
+    FROM: store
+    WHERE: s_store_sk <= 100
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 100
+    CONSUMERS: prefact_cte
+  prefact_cte:
+    FROM: store_sales
+    JOIN: INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+          INNER JOIN store_cte ON ss_store_sk = s_store_sk
+    OUTPUT: ss_item_sk, ss_sales_price, d_qoy
+    EXPECTED_ROWS: ~5.4M (same as store_sales scan, but now filtered by date and store? Actually store filter may reduce rows. Expect similar to 5.4M)
+    CONSUMERS: join_item_cte
+  join_item_cte:
+    FROM: prefact_cte
+    JOIN: INNER JOIN item ON ss_item_sk = i_item_sk
+    WHERE: ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN ('scholaramalgamalg #14','scholaramalgamalg #7','exportiunivamalg #9','scholaramalgamalg #9')) OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN ('amalgimporto #1','edu packscholar #1','exportiimporto #1','importoamalg #1')))
+    OUTPUT: i_manufact_id, d_qoy, ss_sales_price
+    EXPECTED_ROWS: 198K
+    CONSUMERS: agg_cte
+  agg_cte:
+    FROM: join_item_cte
+    GROUP BY: i_manufact_id, d_qoy
+    AGGREGATE: SUM(ss_sales_price) AS sum_sales
+    OUTPUT: i_manufact_id, d_qoy, sum_sales
+    EXPECTED_ROWS: 3,065
+    CONSUMERS: window_cte
+  window_cte:
+    FROM: agg_cte
+    WINDOW: AVG(sum_sales) OVER (PARTITION BY i_manufact_id) AS avg_quarterly_sales
+    OUTPUT: i_manufact_id, d_qoy, sum_sales, avg_quarterly_sales
+    EXPECTED_ROWS: 3,065
+    CONSUMERS: filter_cte
+  filter_cte:
+    FROM: window_cte
+    WHERE: CASE WHEN avg_quarterly_sales > 0 THEN ABS(sum_sales - avg_quarterly_sales) / avg_quarterly_sales ELSE NULL END > 0.1
+    OUTPUT: i_manufact_id, sum_sales, avg_quarterly_sales
+    EXPECTED_ROWS: 2,618
+    CONSUMERS: top_n
+  top_n:
+    FROM: filter_cte
+    ORDER BY: avg_quarterly_sales ASC, sum_sales ASC, i_manufact_id ASC
+    LIMIT: 100
+    OUTPUT: i_manufact_id, sum_sales, avg_quarterly_sales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: prefetch_fact_join, early_filter, pushdown
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply the concept of pre-joining fact with some dimensions (date, store) before joining others (item); ignore the multi-channel aspect.
+- early_filter: Apply filtering of date and store early; ignore the reason table filter.
+- pushdown: Apply consolidating joins into a CTE chain; ignore the multiple subquery consolidation.
+HAZARD_FLAGS:
+- The prefact_cte may still scan 5.4M rows (store filter may not reduce scan if not pushed). The item filter is applied after the join, so no reduction in fact scan.
+- This strategy may not reduce the store_sales scan cost compared to original.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

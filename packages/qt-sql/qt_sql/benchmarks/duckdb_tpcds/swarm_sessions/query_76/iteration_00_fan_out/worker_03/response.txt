@@ -1,0 +1,83 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Now uses shared dimension CTEs
+    ├── [CTE] date_cte  [+]  — Filtered date dimension, 1,839 rows
+    │   ├── SCAN date_dim
+    │   └── FILTER d_date_sk BETWEEN 2450815 AND 2452653
+    ├── [CTE] item_cte  [+]  — Full item dimension, 102K rows  
+    │   └── SCAN item
+    ├── [CTE] union_all_prejoined  [~]  — Three channel subqueries join to dimension CTEs
+    │   ├── SUBQUERY store_channel
+    │   │   ├── SCAN store_sales
+    │   │   ├── FILTER ss_hdemo_sk IS NULL
+    │   │   ├── JOIN date_cte ON ss_sold_date_sk = d_date_sk
+    │   │   └── JOIN item_cte ON ss_item_sk = i_item_sk
+    │   ├── SUBQUERY web_channel
+    │   │   ├── SCAN web_sales
+    │   │   ├── FILTER ws_bill_addr_sk IS NULL
+    │   │   ├── JOIN date_cte ON ws_sold_date_sk = d_date_sk
+    │   │   └── JOIN item_cte ON ws_item_sk = i_item_sk
+    │   └── SUBQUERY catalog_channel
+    │       ├── SCAN catalog_sales
+    │       ├── FILTER cs_warehouse_sk IS NULL
+    │       ├── JOIN date_cte ON cs_sold_date_sk = d_date_sk
+    │       └── JOIN item_cte ON cs_item_sk = i_item_sk
+    └── [FINAL] final_aggregate  [=]  — Unchanged aggregation and ordering
+        ├── GROUP BY channel, col_name, d_year, d_qoy, i_category
+        ├── AGG COUNT(*), SUM(ext_sales_price)
+        ├── SORT channel, col_name, d_year, d_qoy, i_category
+        └── LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "shared_dimension_multi_channel", "description": "Extracted shared date and item filters into CTEs to avoid redundant dimension scans", "applied_to": ["date_cte", "item_cte", "union_all_prejoined"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_year, d_qoy FROM date_dim WHERE d_date_sk BETWEEN 2450815 AND 2452653",
+        "interfaces": {"outputs": ["d_date_sk", "d_year", "d_qoy"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_category FROM item",
+        "interfaces": {"outputs": ["i_item_sk", "i_category"], "consumes": []}
+      },
+      "union_all_prejoined": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT 'store' AS channel, 'ss_hdemo_sk' AS col_name, d_year, d_qoy, i_category, ss_ext_sales_price AS ext_sales_price FROM store_sales JOIN date_cte ON ss_sold_date_sk = date_cte.d_date_sk JOIN item_cte ON ss_item_sk = item_cte.i_item_sk WHERE ss_hdemo_sk IS NULL UNION ALL SELECT 'web', 'ws_bill_addr_sk', d_year, d_qoy, i_category, ws_ext_sales_price FROM web_sales JOIN date_cte ON ws_sold_date_sk = date_cte.d_date_sk JOIN item_cte ON ws_item_sk = item_cte.i_item_sk WHERE ws_bill_addr_sk IS NULL UNION ALL SELECT 'catalog', 'cs_warehouse_sk', d_year, d_qoy, i_category, cs_ext_sales_price FROM catalog_sales JOIN date_cte ON cs_sold_date_sk = date_cte.d_date_sk JOIN item_cte ON cs_item_sk = item_cte.i_item_sk WHERE cs_warehouse_sk IS NULL",
+        "interfaces": {"outputs": ["channel", "col_name", "d_year", "d_qoy", "i_category", "ext_sales_price"], "consumes": ["date_cte", "item_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT channel, col_name, d_year, d_qoy, i_category, COUNT(*) AS sales_cnt, SUM(ext_sales_price) AS sales_amt FROM union_all_prejoined GROUP BY channel, col_name, d_year, d_qoy, i_category ORDER BY channel, col_name, d_year, d_qoy, i_category LIMIT 100",
+        "interfaces": {"outputs": ["channel", "col_name", "d_year", "d_qoy", "i_category", "sales_cnt", "sales_amt"], "consumes": ["union_all_prejoined"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "item_cte", "union_all_prejoined", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), item_cte AS ({item_cte}), union_all_prejoined AS ({union_all_prejoined}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Extracted shared date and item dimension filters into CTEs, transforming the original implicit joins in UNION branches to explicit joins against the dimension CTEs. This eliminates 6 redundant dimension table scans (date_dim 3x, item 3x).
+
+**Expected speedup**: ~1.3x (pattern matches shared_dimension_multi_channel example). The date_cte filters ~1,839 rows vs full date_dim, and both CTEs materialize once for reuse across all three channel subqueries.

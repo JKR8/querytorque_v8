@@ -1,0 +1,98 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (multiple CTEs)
+└── [MAIN] main_query  [!]  — Split ROLLUP into explicit UNION ALL branches for optimizer transparency
+    ├── [~] filtered_dates  [=]  — Isolate date filter first
+    ├── [+] fact_with_dates  — Join date filter with web_sales
+    ├── [+] joined_all  — Add item dimension join
+    ├── [+] level2_agg  — Category+Class granular aggregation
+    ├── [+] level1_agg  — Category-only aggregation
+    ├── [+] level0_agg  — Grand total aggregation
+    ├── [+] union_all_levels  — Combine three grouping levels
+    ├── [+] final_window  — Compute hierarchy and ranking
+    └── [+] top_n  — Final ordering and limit
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "union_all_rollup", "description": "Replaced ROLLUP with explicit UNION ALL of three grouping levels", "applied_to": ["main_query"]},
+    {"id": "R2", "type": "predicate_early_filter", "description": "Isolated date filter before fact table join", "applied_to": ["filtered_dates"]},
+    {"id": "R3", "type": "cte_specialization", "description": "Each grouping level computed separately from base joined data", "applied_to": ["level2_agg", "level1_agg", "level0_agg"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1224 AND 1224 + 11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "fact_with_dates": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_item_sk, ws_net_paid FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ws_item_sk", "ws_net_paid"], "consumes": ["filtered_dates"]}
+      },
+      "joined_all": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_category, i_class, ws_net_paid FROM fact_with_dates JOIN item ON ws_item_sk = i_item_sk",
+        "interfaces": {"outputs": ["i_category", "i_class", "ws_net_paid"], "consumes": ["fact_with_dates"]}
+      },
+      "level2_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_category, i_class, SUM(ws_net_paid) AS total_sum, 0 AS grouping_category, 0 AS grouping_class FROM joined_all GROUP BY i_category, i_class",
+        "interfaces": {"outputs": ["i_category", "i_class", "total_sum", "grouping_category", "grouping_class"], "consumes": ["joined_all"]}
+      },
+      "level1_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_category, CAST(NULL AS TEXT) AS i_class, SUM(ws_net_paid) AS total_sum, 0 AS grouping_category, 1 AS grouping_class FROM joined_all GROUP BY i_category",
+        "interfaces": {"outputs": ["i_category", "i_class", "total_sum", "grouping_category", "grouping_class"], "consumes": ["joined_all"]}
+      },
+      "level0_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT CAST(NULL AS TEXT) AS i_category, CAST(NULL AS TEXT) AS i_class, SUM(ws_net_paid) AS total_sum, 1 AS grouping_category, 1 AS grouping_class FROM joined_all",
+        "interfaces": {"outputs": ["i_category", "i_class", "total_sum", "grouping_category", "grouping_class"], "consumes": ["joined_all"]}
+      },
+      "union_all_levels": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_category, i_class, total_sum, grouping_category, grouping_class FROM level2_agg UNION ALL SELECT i_category, i_class, total_sum, grouping_category, grouping_class FROM level1_agg UNION ALL SELECT i_category, i_class, total_sum, grouping_category, grouping_class FROM level0_agg",
+        "interfaces": {"outputs": ["i_category", "i_class", "total_sum", "grouping_category", "grouping_class"], "consumes": ["level2_agg", "level1_agg", "level0_agg"]}
+      },
+      "final_window": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT total_sum, i_category, i_class, grouping_category + grouping_class AS lochierarchy, RANK() OVER (PARTITION BY grouping_category + grouping_class, CASE WHEN grouping_class = 0 THEN i_category END ORDER BY total_sum DESC) AS rank_within_parent FROM union_all_levels",
+        "interfaces": {"outputs": ["total_sum", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["union_all_levels"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT total_sum, i_category, i_class, lochierarchy, rank_within_parent FROM final_window ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category END, rank_within_parent LIMIT 100",
+        "interfaces": {"outputs": ["total_sum", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["final_window"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "fact_with_dates", "joined_all", "level2_agg", "level1_agg", "level0_agg", "union_all_levels", "final_window", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), fact_with_dates AS ({fact_with_dates}), joined_all AS ({joined_all}), level2_agg AS ({level2_agg}), level1_agg AS ({level1_agg}), level0_agg AS ({level0_agg}), union_all_levels AS ({union_all_levels}), final_window AS ({final_window}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced ROLLUP with explicit UNION ALL of three grouping levels (category+class, category-only, grand total) to give optimizer transparent grouping sets. Isolated date filter first for predicate pushdown, then joined with fact and dimension tables.
+
+**Expected speedup**: ~2x from eliminating ROLLUP's hidden complexity and allowing per-level optimization.

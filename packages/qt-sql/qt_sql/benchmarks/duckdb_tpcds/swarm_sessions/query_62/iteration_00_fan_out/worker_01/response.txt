@@ -1,0 +1,100 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Converted to CTE structure with filtered date dimension first, then fact aggregation before dimension joins.
+    ├── CTE: date_filter_cte  [+]  — Isolate date filter for predicate pushdown
+    │   ├── SCAN (tpcds_sf10.main.date_dim)
+    │   └── FILTER (d_month_seq BETWEEN 1194 AND 1194 + 11)
+    ├── CTE: filtered_sales_cte  [+]  — Join fact table with filtered dates
+    │   ├── SCAN (tpcds_sf10.main.web_sales)
+    │   └── JOIN (INNER JOIN date_filter_cte ON ws_ship_date_sk = d_date_sk)
+    ├── CTE: aggregated_sales_cte  [+]  — Early aggregation by warehouse/ship_mode/web_site keys
+    │   ├── SCAN (filtered_sales_cte)
+    │   ├── AGG (GROUP BY ws_warehouse_sk, ws_ship_mode_sk, ws_web_site_sk)
+    │   └── COMPUTE (5 CASE sums for latency buckets)
+    ├── CTE: join_warehouse_cte  [+]  — Join aggregated results with warehouse dimension
+    │   ├── SCAN (aggregated_sales_cte)
+    │   └── JOIN (INNER JOIN tpcds_sf10.main.warehouse ON ws_warehouse_sk = w_warehouse_sk)
+    ├── CTE: join_ship_mode_cte  [+]  — Join ship_mode dimension
+    │   ├── SCAN (join_warehouse_cte)
+    │   └── JOIN (INNER JOIN tpcds_sf10.main.ship_mode ON ws_ship_mode_sk = sm_ship_mode_sk)
+    ├── CTE: join_web_site_cte  [+]  — Join web_site dimension
+    │   ├── SCAN (join_ship_mode_cte)
+    │   └── JOIN (INNER JOIN tpcds_sf10.main.web_site ON ws_web_site_sk = web_site_sk)
+    └── OUTPUT (SUBSTRING(w_warehouse_name, 1, 20), sm_type, web_name, 30 days, 31-60 days, 61-90 days, 91-120 days, >120 days) [=]
+        ├── SORT (SUBSTRING(w_warehouse_name, 1, 20) ASC, sm_type ASC, web_name ASC) [=]
+        └── LIMIT 100 [=]
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Isolate date filter into CTE for predicate pushdown to fact table", "applied_to": ["date_filter_cte"]},
+    {"id": "R2", "type": "single_pass_aggregation", "description": "Consolidate multiple CASE sum aggregations into single pass after filtering date", "applied_to": ["aggregated_sales_cte"]},
+    {"id": "R3", "type": "pushdown", "description": "Push aggregation below dimension joins using foreign keys", "applied_to": ["aggregated_sales_cte"]},
+    {"id": "R4", "type": "dimension_cte_isolate", "description": "Join dimensions sequentially after aggregation to avoid Cartesian explosion", "applied_to": ["join_warehouse_cte", "join_ship_mode_cte", "join_web_site_cte"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM tpcds_sf10.main.date_dim WHERE d_month_seq BETWEEN 1194 AND 1194 + 11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_sales_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws.ws_warehouse_sk, ws.ws_ship_mode_sk, ws.ws_web_site_sk, ws.ws_ship_date_sk, ws.ws_sold_date_sk FROM tpcds_sf10.main.web_sales ws INNER JOIN date_filter_cte df ON ws.ws_ship_date_sk = df.d_date_sk",
+        "interfaces": {"outputs": ["ws_warehouse_sk", "ws_ship_mode_sk", "ws_web_site_sk", "ws_ship_date_sk", "ws_sold_date_sk"], "consumes": ["date_filter_cte"]}
+      },
+      "aggregated_sales_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws_warehouse_sk, ws_ship_mode_sk, ws_web_site_sk, SUM(CASE WHEN (ws_ship_date_sk - ws_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS days_30, SUM(CASE WHEN (ws_ship_date_sk - ws_sold_date_sk > 30 AND ws_ship_date_sk - ws_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS days_31_60, SUM(CASE WHEN (ws_ship_date_sk - ws_sold_date_sk > 60 AND ws_ship_date_sk - ws_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS days_61_90, SUM(CASE WHEN (ws_ship_date_sk - ws_sold_date_sk > 90 AND ws_ship_date_sk - ws_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS days_91_120, SUM(CASE WHEN (ws_ship_date_sk - ws_sold_date_sk > 120) THEN 1 ELSE 0 END) AS days_over_120 FROM filtered_sales_cte GROUP BY ws_warehouse_sk, ws_ship_mode_sk, ws_web_site_sk",
+        "interfaces": {"outputs": ["ws_warehouse_sk", "ws_ship_mode_sk", "ws_web_site_sk", "days_30", "days_31_60", "days_61_90", "days_91_120", "days_over_120"], "consumes": ["filtered_sales_cte"]}
+      },
+      "join_warehouse_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ag.ws_ship_mode_sk, ag.ws_web_site_sk, ag.days_30, ag.days_31_60, ag.days_61_90, ag.days_91_120, ag.days_over_120, w.w_warehouse_name FROM aggregated_sales_cte ag INNER JOIN tpcds_sf10.main.warehouse w ON ag.ws_warehouse_sk = w.w_warehouse_sk",
+        "interfaces": {"outputs": ["ws_ship_mode_sk", "ws_web_site_sk", "days_30", "days_31_60", "days_61_90", "days_91_120", "days_over_120", "w_warehouse_name"], "consumes": ["aggregated_sales_cte"]}
+      },
+      "join_ship_mode_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT jw.ws_web_site_sk, jw.days_30, jw.days_31_60, jw.days_61_90, jw.days_91_120, jw.days_over_120, jw.w_warehouse_name, sm.sm_type FROM join_warehouse_cte jw INNER JOIN tpcds_sf10.main.ship_mode sm ON jw.ws_ship_mode_sk = sm.sm_ship_mode_sk",
+        "interfaces": {"outputs": ["ws_web_site_sk", "days_30", "days_31_60", "days_61_90", "days_91_120", "days_over_120", "w_warehouse_name", "sm_type"], "consumes": ["join_warehouse_cte"]}
+      },
+      "join_web_site_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT js.w_warehouse_name, js.sm_type, web.web_name, js.days_30, js.days_31_60, js.days_61_90, js.days_91_120, js.days_over_120 FROM join_ship_mode_cte js INNER JOIN tpcds_sf10.main.web_site web ON js.ws_web_site_sk = web.web_site_sk",
+        "interfaces": {"outputs": ["w_warehouse_name", "sm_type", "web_name", "days_30", "days_31_60", "days_61_90", "days_91_120", "days_over_120"], "consumes": ["join_ship_mode_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT SUBSTR(w_warehouse_name, 1, 20) AS w_warehouse_name_20, sm_type, web_name, days_30 AS \"30 days\", days_31_60 AS \"31-60 days\", days_61_90 AS \"61-90 days\", days_91_120 AS \"91-120 days\", days_over_120 AS \">120 days\" FROM join_web_site_cte ORDER BY SUBSTR(w_warehouse_name, 1, 20), sm_type, web_name LIMIT 100",
+        "interfaces": {"outputs": ["w_warehouse_name_20", "sm_type", "web_name", "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"], "consumes": ["join_web_site_cte"]}
+      }
+    },
+    "reconstruction_order": ["date_filter_cte", "filtered_sales_cte", "aggregated_sales_cte", "join_warehouse_cte", "join_ship_mode_cte", "join_web_site_cte", "main_query"],
+    "assembly_template": "WITH date_filter_cte AS ({date_filter_cte}), filtered_sales_cte AS ({filtered_sales_cte}), aggregated_sales_cte AS ({aggregated_sales_cte}), join_warehouse_cte AS ({join_warehouse_cte}), join_ship_mode_cte AS ({join_ship_mode_cte}), join_web_site_cte AS ({join_web_site_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured original single-block query into CTE pipeline that filters dates first, aggregates web_sales by foreign keys, then joins dimensions sequentially. This pushes aggregation below dimension joins and isolates date filter for predicate pushdown.
+
+**Expected speedup**: 2-4x due to reduced data movement (early aggregation on 1.4M rows vs. joining 1.4M × 3 dimension tables before aggregation). The CTE overhead is acceptable given baseline 381ms.

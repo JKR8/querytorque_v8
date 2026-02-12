@@ -1,0 +1,113 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_filter [+]  Cost: ~5%  Rows: 1,827 — Filter date_dim to 2000 quarters 1-3
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year=2000 AND d_qoy IN (1,2,3))
+│   └── OUTPUT (d_date_sk, d_qoy, d_year)
+├── [CTE] addr_all [+]  Cost: ~5%  Rows: 750K — All customer addresses (unfiltered)
+│   ├── SCAN (customer_address)
+│   └── OUTPUT (ca_address_sk, ca_county)
+├── [CTE] store_agg [~]  Cost: ~25%  Rows: 5,541 — Replace original ss CTE with filtered version using shared dimension CTEs
+│   ├── SCAN (store_sales)
+│   ├── JOIN (date_filter) ON ss_sold_date_sk = d_date_sk
+│   ├── JOIN (addr_all) ON ss_addr_sk = ca_address_sk
+│   ├── AGG (GROUP BY ca_county, d_qoy, d_year)
+│   └── OUTPUT (ca_county, d_qoy, d_year, store_sales)
+├── [CTE] web_agg [~]  Cost: ~25%  Rows: 5,535 — Replace original ws CTE with filtered version using shared dimension CTEs
+│   ├── SCAN (web_sales)
+│   ├── JOIN (date_filter) ON ws_sold_date_sk = d_date_sk
+│   ├── JOIN (addr_all) ON ws_bill_addr_sk = ca_address_sk
+│   ├── AGG (GROUP BY ca_county, d_qoy, d_year)
+│   └── OUTPUT (ca_county, d_qoy, d_year, web_sales)
+├── [MAIN] main_self_join [=]  Cost: ~40%  Rows: 307 — Self-join county aggregates, filter by quarter/growth, output ratios
+    ├── SCAN (store_agg AS ss1, store_agg AS ss2, store_agg AS ss3, web_agg AS ws1, web_agg AS ws2, web_agg AS ws3)
+    ├── JOIN (ss1.ca_county = ss2.ca_county = ss3.ca_county = ws1.ca_county = ws2.ca_county = ws3.ca_county)
+    ├── FILTER (quarter/year predicates and growth comparisons)
+    ├── SORT (web_q1_q2_increase ASC)
+    └── OUTPUT (ca_county, d_year, web_q1_q2_increase, store_q1_q2_increase, web_q2_q3_increase, store_q2_q3_increase)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "shared_dimension_extraction",
+      "description": "Extract date_dim filter (d_year=2000, d_qoy IN (1,2,3)) into reusable CTE to avoid redundant scans in store and web channel joins",
+      "applied_to": ["date_filter", "store_agg", "web_agg"]
+    },
+    {
+      "id": "R2", 
+      "type": "dimension_cte_isolate",
+      "description": "Pre-filter customer_address into CTE before joining with fact tables, reducing hash table build cost for both store and web sales",
+      "applied_to": ["addr_all", "store_agg", "web_agg"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_qoy, d_year FROM date_dim WHERE d_year = 2000 AND d_qoy IN (1, 2, 3)",
+        "interfaces": {
+          "outputs": ["d_date_sk", "d_qoy", "d_year"],
+          "consumes": []
+        }
+      },
+      "addr_all": {
+        "type": "cte", 
+        "change": "new",
+        "sql": "SELECT ca_address_sk, ca_county FROM customer_address",
+        "interfaces": {
+          "outputs": ["ca_address_sk", "ca_county"],
+          "consumes": []
+        }
+      },
+      "store_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT addr_all.ca_county, date_filter.d_qoy, date_filter.d_year, SUM(ss_ext_sales_price) AS store_sales FROM store_sales INNER JOIN date_filter ON store_sales.ss_sold_date_sk = date_filter.d_date_sk INNER JOIN addr_all ON store_sales.ss_addr_sk = addr_all.ca_address_sk GROUP BY addr_all.ca_county, date_filter.d_qoy, date_filter.d_year",
+        "interfaces": {
+          "outputs": ["ca_county", "d_qoy", "d_year", "store_sales"],
+          "consumes": ["date_filter", "addr_all"]
+        }
+      },
+      "web_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT addr_all.ca_county, date_filter.d_qoy, date_filter.d_year, SUM(ws_ext_sales_price) AS web_sales FROM web_sales INNER JOIN date_filter ON web_sales.ws_sold_date_sk = date_filter.d_date_sk INNER JOIN addr_all ON web_sales.ws_bill_addr_sk = addr_all.ca_address_sk GROUP BY addr_all.ca_county, date_filter.d_qoy, date_filter.d_year",
+        "interfaces": {
+          "outputs": ["ca_county", "d_qoy", "d_year", "web_sales"],
+          "consumes": ["date_filter", "addr_all"]
+        }
+      },
+      "main_self_join": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ss1.ca_county, ss1.d_year, ws2.web_sales / ws1.web_sales AS web_q1_q2_increase, ss2.store_sales / ss1.store_sales AS store_q1_q2_increase, ws3.web_sales / ws2.web_sales AS web_q2_q3_increase, ss3.store_sales / ss2.store_sales AS store_q2_q3_increase FROM store_agg ss1, store_agg ss2, store_agg ss3, web_agg ws1, web_agg ws2, web_agg ws3 WHERE ss1.ca_county = ss2.ca_county AND ss2.ca_county = ss3.ca_county AND ss1.ca_county = ws1.ca_county AND ws1.ca_county = ws2.ca_county AND ws1.ca_county = ws3.ca_county AND ss1.d_qoy = 1 AND ss1.d_year = 2000 AND ss2.d_qoy = 2 AND ss2.d_year = 2000 AND ss3.d_qoy = 3 AND ss3.d_year = 2000 AND ws1.d_qoy = 1 AND ws1.d_year = 2000 AND ws2.d_qoy = 2 AND ws2.d_year = 2000 AND ws3.d_qoy = 3 AND ws3.d_year = 2000 AND (ws2.web_sales / NULLIF(ws1.web_sales, 0)) > (ss2.store_sales / NULLIF(ss1.store_sales, 0)) AND (ws3.web_sales / NULLIF(ws2.web_sales, 0)) > (ss3.store_sales / NULLIF(ss2.store_sales, 0)) ORDER BY web_q1_q2_increase",
+        "interfaces": {
+          "outputs": ["ca_county", "d_year", "web_q1_q2_increase", "store_q1_q2_increase", "web_q2_q3_increase", "store_q2_q3_increase"],
+          "consumes": ["store_agg", "web_agg"]
+        }
+      }
+    },
+    "reconstruction_order": ["date_filter", "addr_all", "store_agg", "web_agg", "main_self_join"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), addr_all AS ({addr_all}), store_agg AS ({store_agg}), web_agg AS ({web_agg}) {main_self_join}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Extracted shared dimension filters (`date_dim` for year/quarter, `customer_address` for geography) into reusable CTEs before joining with fact tables, eliminating redundant dimension scans and reducing hash table build costs for both store and web sales channels.
+
+**Expected speedup:** 1.5-2.0x due to eliminating duplicate dimension table scans and enabling better predicate pushdown into filtered dimension CTEs.

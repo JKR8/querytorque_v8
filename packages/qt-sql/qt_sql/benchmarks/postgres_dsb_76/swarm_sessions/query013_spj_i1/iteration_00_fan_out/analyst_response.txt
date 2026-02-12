@@ -1,0 +1,291 @@
+<reasoning>
+1. **CLASSIFY**: This is a "star-join with late dim filter" archetype. A large fact table (store_sales) joins with multiple dimension tables (store, customer_demographics, household_demographics, customer_address, date_dim). The query has complex OR conditions across multiple dimension filters, creating a combinatorial filter space.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total runtime: 794.1ms. The Nested Loop Inner (rows=28 loops=3 time=522.4ms) consumes ~66% of runtime. This is the core join evaluating the OR conditions.
+   - store_sales is scanned once (Index Only Scan, rows=56K per worker, 461 rows after date filter). This is efficient.
+   - Dimension tables show problematic patterns:
+     - household_demographics: Seq Scan (rows=1,440) filters for hd_dep_count IN (1,3). Row reduction: 7,200 → 1,440 (80% filtered).
+     - customer_address: Index Scan (rows=0 per loop, 18,741 loops total). Each store_sales row probes customer_address, but most filters reject (Rows Removed by Filter: 1). This is 18,741 index lookups with minimal matches.
+     - customer_demographics: Index Scan (rows=0 per loop, 3,238 loops total). Similar pattern.
+   - Key bottleneck: The nested loop join with join filter forces per-row evaluation of complex OR conditions across multiple dimensions. Each store_sales row probes customer_demographics and customer_address via index scans, but most probes fail because the OR conditions require specific combinations of marital_status, education_status, state, etc.
+   - Row counts: store_sales → 56K (after date filter) → 1,079 after household_demographics join → 28 after customer_address/customer_demographics filters. Massive reduction (95%+) happens at the final join filter, not earlier.
+   - The optimizer already: splits work via parallel workers, uses index-only scans on selective date_dim, pushes d_year=2001 filter into date_dim scan.
+   - The optimizer does NOT: pre-filter dimension combinations to avoid unnecessary probes, restructure OR conditions for independent evaluation, or isolate the combinatorial nature of the filters.
+
+3. **GAP MATCHING**:
+   - COMMA_JOIN_WEAKNESS: Present. Query uses comma-separated joins (implicit joins). This confuses PostgreSQL's cardinality estimation.
+   - CORRELATED_SUBQUERY_PARALYSIS: Not present (no correlated subqueries).
+   - CROSS_CTE_PREDICATE_BLINDNESS: Not present (no repeated fact scans).
+   - NON_EQUI_JOIN_INPUT_BLINDNESS: Not present (all joins are equi-joins).
+   - OR condition evaluation is the primary gap. PostgreSQL evaluates OR via a single join filter that probes all dimension tables for each row, rather than partitioning the work.
+
+4. **AGGREGATION TRAP CHECK**: The query uses MIN() aggregations. MIN is duplicate-insensitive and grouping-insensitive. Splitting via UNION ALL preserves correctness as long as we UNION ALL identical row sets. The duplicate MIN(ss_ext_wholesale_cost) is fine.
+
+5. **TRANSFORM SELECTION**:
+   a) **Or To Union** (28.6x avg): Directly addresses the OR bottleneck by splitting into independent branches.
+   b) **star_join_prefetch** + explicit joins: Addresses comma-join weakness and pre-filters dimensions.
+   c) **single_pass_aggregation** with CASE: Consolidates OR branches into a single scan with conditional logic.
+   d) **exploration**: Compound strategy combining dimension prefetch with UNION ALL decomposition.
+
+6. **LOGICAL TREE DESIGN**:
+   - Need exhaustive column lists: store_sales columns (ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost, ss_store_sk, ss_sold_date_sk, ss_hdemo_sk, ss_cdemo_sk, ss_addr_sk, ss_sales_price, ss_net_profit).
+   - Dimension tables need their key columns (hd_demo_sk, cd_demo_sk, ca_address_sk, s_store_sk, d_date_sk) plus filter columns.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compute minimum sales metrics for store sales in 2001 that match specific demographic and geographic profiles. All joins are INNER (fact must match all dimensions). Aggregation uses MIN which is safe for duplication. Filter dependencies: each OR branch requires specific combinations of marital_status, education_status, sales_price range, dep_count, country, state, and net_profit range—these must remain logically ANDed within each branch.
+
+BOTTLENECK_DIAGNOSIS:
+Dominant cost is nested loop join evaluating complex OR conditions (522ms, 66% runtime). Scan-bound on store_sales is efficient (index-only). Join-bound: each store_sales row probes customer_demographics and customer_address via index scans, but 99% fail because OR conditions require specific dimension combinations. Cardinality flow: 56K store_sales rows → 1,079 after household_demographics → 28 after final filters. Optimizer already handles date filter pushdown and parallel aggregation well. Logical-tree costs misleading: Nested Loop shows 100% cost but actual bottleneck is per-row dimension probes due to OR evaluation.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs four MIN aggregates, including duplicate ss_ext_wholesale_cost.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all store_sales columns used in filters/joins/aggregates.
+- LITERAL_PRESERVATION: Many literal values in OR branches (e.g., 'M', '2 yr Degree', 'CO', 'NC', 'TX', 100.00, 150.00).
+- SEMANTIC_EQUIVALENCE: Must preserve exact row set for aggregation.
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated implicit joins (lines 5-10).
+- OR_TO_UNION_GAP: OR conditions evaluated via single join filter causing expensive per-row dimension probes.
+
+REGRESSION_WARNINGS:
+1. OR to UNION ALL over-splitting (observed regression 0.21x):
+   CAUSE: Splitting OR with >3 branches or overlapping conditions creates UNION ALL explosion.
+   RULE: For this query, split only the three demographic OR branches (lines 13-33), keep address OR as filter within each branch.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: Or To Union (demographic branch split)
+TARGET_LOGICAL_TREE:
+  date_dim_cte -> store_sales_base -> union_branch1 -> union_branch2 -> union_branch3 -> final_aggregate
+NODE_CONTRACTS:
+  date_dim_cte:
+    FROM: date_dim
+    WHERE: d_year = 2001
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 122
+    CONSUMERS: store_sales_base
+  store_sales_base:
+    FROM: store_sales JOIN date_dim_cte ON ss_sold_date_sk = d_date_sk
+    WHERE: (ss_sales_price BETWEEN 100.00 AND 150.00) OR (ss_sales_price BETWEEN 50.00 AND 100.00) OR (ss_sales_price BETWEEN 150.00 AND 200.00)
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost, ss_store_sk, ss_hdemo_sk, ss_cdemo_sk, ss_addr_sk, ss_sales_price, ss_net_profit
+    EXPECTED_ROWS: 56K
+    CONSUMERS: union_branch1, union_branch2, union_branch3
+  union_branch1:
+    FROM: store_sales_base
+         JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk AND hd_dep_count = 3
+         JOIN customer_demographics ON ss_cdemo_sk = cd_demo_sk AND cd_marital_status = 'M' AND cd_education_status = '2 yr Degree'
+         JOIN customer_address ON ss_addr_sk = ca_address_sk AND ca_country = 'United States' AND ca_state IN ('CO', 'NC', 'TX')
+         JOIN store ON ss_store_sk = s_store_sk
+    WHERE: ss_sales_price BETWEEN 100.00 AND 150.00 AND ss_net_profit BETWEEN 100 AND 200
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~9
+    CONSUMERS: final_aggregate
+  union_branch2:
+    FROM: store_sales_base
+         JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk AND hd_dep_count = 1
+         JOIN customer_demographics ON ss_cdemo_sk = cd_demo_sk AND cd_marital_status = 'U' AND cd_education_status = 'College'
+         JOIN customer_address ON ss_addr_sk = ca_address_sk AND ca_country = 'United States' AND ca_state IN ('AR', 'NY', 'TX')
+         JOIN store ON ss_store_sk = s_store_sk
+    WHERE: ss_sales_price BETWEEN 50.00 AND 100.00 AND ss_net_profit BETWEEN 150 AND 300
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~9
+    CONSUMERS: final_aggregate
+  union_branch3:
+    FROM: store_sales_base
+         JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk AND hd_dep_count = 1
+         JOIN customer_demographics ON ss_cdemo_sk = cd_demo_sk AND cd_marital_status = 'S' AND cd_education_status = 'Unknown'
+         JOIN customer_address ON ss_addr_sk = ca_address_sk AND ca_country = 'United States' AND ca_state IN ('IA', 'IL', 'NC')
+         JOIN store ON ss_store_sk = s_store_sk
+    WHERE: ss_sales_price BETWEEN 150.00 AND 200.00 AND ss_net_profit BETWEEN 50 AND 250
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~9
+    CONSUMERS: final_aggregate
+  final_aggregate:
+    FROM: union_branch1 UNION ALL union_branch2 UNION ALL union_branch3
+    AGGREGATE: MIN(ss_quantity), MIN(ss_ext_sales_price), MIN(ss_ext_wholesale_cost), MIN(ss_ext_wholesale_cost)
+    OUTPUT: min(ss_quantity), min(ss_ext_sales_price), min(ss_ext_wholesale_cost), min(ss_ext_wholesale_cost)
+    EXPECTED_ROWS: 1
+    CONSUMERS: none
+EXAMPLES: Or To Union
+EXAMPLE_ADAPTATION:
+  Apply: Split the three demographic OR branches (lines 13-33) into separate UNION ALL CTEs.
+  Ignore: Do not split the address OR branches (lines 34-48); keep them as AND conditions within each demographic branch.
+HAZARD_FLAGS:
+  - UNION ALL may prevent parallelism if CTEs are materialized.
+  - Must ensure store_sales_base includes all necessary columns for downstream joins.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: star_join_prefetch with explicit joins
+TARGET_LOGICAL_TREE:
+  prefetched_dates -> prefetched_household -> prefetched_customer_demo -> prefetched_customer_addr -> prefetched_store -> joined_fact -> final_aggregate
+NODE_CONTRACTS:
+  prefetched_dates:
+    FROM: date_dim
+    WHERE: d_year = 2001
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 122
+    CONSUMERS: joined_fact
+  prefetched_household:
+    FROM: household_demographics
+    WHERE: hd_dep_count IN (1, 3)
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1,440
+    CONSUMERS: joined_fact
+  prefetched_customer_demo:
+    FROM: customer_demographics
+    WHERE: (cd_marital_status = 'M' AND cd_education_status = '2 yr Degree') OR (cd_marital_status = 'U' AND cd_education_status = 'College') OR (cd_marital_status = 'S' AND cd_education_status = 'Unknown')
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~small
+    CONSUMERS: joined_fact
+  prefetched_customer_addr:
+    FROM: customer_address
+    WHERE: ca_country = 'United States' AND (ca_state IN ('CO', 'NC', 'TX') OR ca_state IN ('AR', 'NY', 'TX') OR ca_state IN ('IA', 'IL', 'NC'))
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: ~small
+    CONSUMERS: joined_fact
+  prefetched_store:
+    FROM: store
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 102
+    CONSUMERS: joined_fact
+  joined_fact:
+    FROM: store_sales
+         JOIN prefetched_dates ON ss_sold_date_sk = d_date_sk
+         JOIN prefetched_store ON ss_store_sk = s_store_sk
+         JOIN prefetched_household ON ss_hdemo_sk = hd_demo_sk
+         JOIN prefetched_customer_demo ON ss_cdemo_sk = cd_demo_sk
+         JOIN prefetched_customer_addr ON ss_addr_sk = ca_address_sk
+    WHERE: (
+        (cd_marital_status = 'M' AND cd_education_status = '2 yr Degree' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3 AND ca_state IN ('CO', 'NC', 'TX') AND ss_net_profit BETWEEN 100 AND 200)
+        OR (cd_marital_status = 'U' AND cd_education_status = 'College' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1 AND ca_state IN ('AR', 'NY', 'TX') AND ss_net_profit BETWEEN 150 AND 300)
+        OR (cd_marital_status = 'S' AND cd_education_status = 'Unknown' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1 AND ca_state IN ('IA', 'IL', 'NC') AND ss_net_profit BETWEEN 50 AND 250)
+    )
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: 28
+    CONSUMERS: final_aggregate
+  final_aggregate:
+    FROM: joined_fact
+    AGGREGATE: MIN(ss_quantity), MIN(ss_ext_sales_price), MIN(ss_ext_wholesale_cost), MIN(ss_ext_wholesale_cost)
+    OUTPUT: min(ss_quantity), min(ss_ext_sales_price), min(ss_ext_wholesale_cost), min(ss_ext_wholesale_cost)
+    EXPECTED_ROWS: 1
+    CONSUMERS: none
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+  pg_dimension_prefetch_star: Apply pre-filtering of all dimension tables into CTEs and explicit JOIN syntax.
+  pg_date_cte_explicit_join: Apply date_dim CTE isolation and explicit joins.
+  Ignore: The examples show UNION patterns; this strategy keeps OR in WHERE but with pre-filtered dimensions.
+HAZARD_FLAGS:
+  - Pre-filtered dimensions may be small, but OR condition still evaluated per row.
+  - Must preserve all original OR logic in WHERE clause.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: single_pass_aggregation with CASE
+TARGET_LOGICAL_TREE:
+  filtered_fact -> final_aggregate
+NODE_CONTRACTS:
+  filtered_fact:
+    FROM: store_sales
+         JOIN store ON ss_store_sk = s_store_sk
+         JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 2001
+         LEFT JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk
+         LEFT JOIN customer_demographics ON ss_cdemo_sk = cd_demo_sk
+         LEFT JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE: (
+        (hd_dep_count = 3 AND cd_marital_status = 'M' AND cd_education_status = '2 yr Degree' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND ca_country = 'United States' AND ca_state IN ('CO', 'NC', 'TX') AND ss_net_profit BETWEEN 100 AND 200)
+        OR (hd_dep_count = 1 AND cd_marital_status = 'U' AND cd_education_status = 'College' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND ca_country = 'United States' AND ca_state IN ('AR', 'NY', 'TX') AND ss_net_profit BETWEEN 150 AND 300)
+        OR (hd_dep_count = 1 AND cd_marital_status = 'S' AND cd_education_status = 'Unknown' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND ca_country = 'United States' AND ca_state IN ('IA', 'IL', 'NC') AND ss_net_profit BETWEEN 50 AND 250)
+    )
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: 28
+    CONSUMERS: final_aggregate
+  final_aggregate:
+    FROM: filtered_fact
+    AGGREGATE: MIN(ss_quantity), MIN(ss_ext_sales_price), MIN(ss_ext_wholesale_cost), MIN(ss_ext_wholesale_cost)
+    OUTPUT: min(ss_quantity), min(ss_ext_sales_price), min(ss_ext_wholesale_cost), min(ss_ext_wholesale_cost)
+    EXPECTED_ROWS: 1
+    CONSUMERS: none
+EXAMPLES: single_pass_aggregation
+EXAMPLE_ADAPTATION:
+  Apply: Keep single scan of store_sales with all dimension joins and OR conditions.
+  Ignore: Do not use CASE-based aggregation since we need full row filtering, not conditional aggregates.
+HAZARD_FLAGS:
+  - This is essentially the original structure with explicit JOIN syntax. Minimal change.
+  - May not improve performance significantly.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_dimension_prefetch_union
+TARGET_LOGICAL_TREE:
+  prefetched_dates -> prefetched_store -> prefetched_household -> prefetched_customer_demo -> prefetched_customer_addr -> fact_core -> union_branches -> final_aggregate
+NODE_CONTRACTS:
+  prefetched_dates:
+    FROM: date_dim
+    WHERE: d_year = 2001
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 122
+    CONSUMERS: fact_core
+  prefetched_store:
+    FROM: store
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 102
+    CONSUMERS: fact_core
+  prefetched_household:
+    FROM: household_demographics
+    WHERE: hd_dep_count IN (1, 3)
+    OUTPUT: hd_demo_sk, hd_dep_count
+    EXPECTED_ROWS: 1,440
+    CONSUMERS: fact_core
+  prefetched_customer_demo:
+    FROM: customer_demographics
+    WHERE: (cd_marital_status = 'M' AND cd_education_status = '2 yr Degree') OR (cd_marital_status = 'U' AND cd_education_status = 'College') OR (cd_marital_status = 'S' AND cd_education_status = 'Unknown')
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~small
+    CONSUMERS: fact_core
+  prefetched_customer_addr:
+    FROM: customer_address
+    WHERE: ca_country = 'United States'
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: ~small
+    CONSUMERS: fact_core
+  fact_core:
+    FROM: store_sales
+         JOIN prefetched_dates ON ss_sold_date_sk = d_date_sk
+         JOIN prefetched_store ON ss_store_sk = s_store_sk
+         JOIN prefetched_household ON ss_hdemo_sk = hd_demo_sk
+         JOIN prefetched_customer_demo ON ss_cdemo_sk = cd_demo_sk
+         JOIN prefetched_customer_addr ON ss_addr_sk = ca_address_sk
+    WHERE: (ss_sales_price BETWEEN 100.00 AND 150.00) OR (ss_sales_price BETWEEN 50.00 AND 100.00) OR (ss_sales_price BETWEEN 150.00 AND 200.00)
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost, ss_sales_price, ss_net_profit, hd_dep_count, cd_marital_status, cd_education_status, ca_state
+    EXPECTED_ROWS: ~1,079
+    CONSUMERS: union_branches
+  union_branches:
+    FROM: fact_core
+    WHERE: (
+        (hd_dep_count = 3 AND cd_marital_status = 'M' AND cd_education_status = '2 yr Degree' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND ca_state IN ('CO', 'NC', 'TX') AND ss_net_profit BETWEEN 100 AND 200)
+        OR (hd_dep_count = 1 AND cd_marital_status = 'U' AND cd_education_status = 'College' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND ca_state IN ('AR', 'NY', 'TX') AND ss_net_profit BETWEEN 150 AND 300)
+        OR (hd_dep_count = 1 AND cd_marital_status = 'S' AND cd_education_status = 'Unknown' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND ca_state IN ('IA', 'IL', 'NC') AND ss_net_profit BETWEEN 50 AND 250)
+    )
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: 28
+    CONSUMERS: final_aggregate
+  final_aggregate:
+    FROM: union_branches
+    AGGREGATE: MIN(ss_quantity), MIN(ss_ext_sales_price), MIN(ss_ext_wholesale_cost), MIN(ss_ext_wholesale_cost)
+    OUTPUT: min(ss_quantity), min(ss_ext_sales_price), min(ss_ext_wholesale_cost), min(ss_ext_wholesale_cost)
+    EXPECTED_ROWS: 1
+    CONSUMERS: none
+EXAMPLES: pg_dimension_prefetch_star, Or To Union
+EXAMPLE_ADAPTATION:
+  pg_dimension_prefetch_star: Apply pre-filtering all dimensions into CTEs before joining.
+  Or To Union: Apply UNION ALL concept but at the filter level after pre-joining (union_branches is a single SELECT with OR, not actual UNION).
+  Ignore: Do not create physical UNION ALL branches; keep as single WHERE with pre-joined dimensions.
+HAZARD_FLAGS:
+  - Complex CTE chain may materialize intermediate results, blocking parallelism.
+  - Must ensure all dimension columns needed for filters are in fact_core output.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

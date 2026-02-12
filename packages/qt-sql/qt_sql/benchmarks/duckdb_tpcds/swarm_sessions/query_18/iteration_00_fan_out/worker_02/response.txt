@@ -1,0 +1,139 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (WITH CTE chain)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K — CTE chain following target logical tree
+    ├── [+] filtered_date (CTE)
+    │   └── SCAN date_dim
+    ├── [+] filtered_customer_chain (CTE)
+    │   ├── SCAN customer
+    │   ├── JOIN customer_demographics cd2
+    │   ├── JOIN customer_address
+    │   └── FILTER (c_birth_month, ca_state)
+    ├── [+] early_fact (CTE)
+    │   ├── SCAN catalog_sales
+    │   ├── JOIN filtered_date
+    │   └── JOIN filtered_customer_chain
+    ├── [+] join_cd1 (CTE)
+    │   ├── FROM early_fact
+    │   └── JOIN customer_demographics cd1 (with filter)
+    ├── [+] join_item (CTE)
+    │   ├── FROM join_cd1
+    │   └── JOIN item
+    ├── [+] rollup_agg (CTE)
+    │   ├── FROM join_item
+    │   └── GROUP BY ROLLUP
+    └── [=] SORT/LIMIT (unchanged logic)
+```
+
+**Change markers:**
+- `[+]` Added 6 CTEs following the target logical tree structure
+- `[~]` Modified main query to use CTE chain instead of single flat join
+- `[=]` Final sort/limit unchanged
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "prefetch_fact_join",
+      "description": "Staged join pipeline: filter dimensions (date, customer chain) first, then join to fact table, then join remaining dimensions (cd1, item)",
+      "applied_to": ["filtered_date", "filtered_customer_chain", "early_fact", "join_cd1", "join_item"]
+    },
+    {
+      "id": "R2", 
+      "type": "early_filter",
+      "description": "Pre-filter small dimension tables (date_dim, customer+customer_address+customer_demographics cd2) into CTEs before joining to large fact table",
+      "applied_to": ["filtered_date", "filtered_customer_chain"]
+    },
+    {
+      "id": "R3",
+      "type": "dimension_cte_isolate",
+      "description": "Isolate filtered dimension scans into tiny CTEs that create small hash tables for faster fact table probe",
+      "applied_to": ["filtered_date", "filtered_customer_chain"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1998",
+        "interfaces": {
+          "outputs": ["d_date_sk"],
+          "consumes": []
+        }
+      },
+      "filtered_customer_chain": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT c_customer_sk, c_birth_year, ca_country, ca_state, ca_county FROM customer INNER JOIN customer_demographics cd2 ON c_current_cdemo_sk = cd2.cd_demo_sk INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE c_birth_month IN (10,7,8,4,1,2) AND ca_state IN ('WA','GA','NC','ME','WY','OK','IN')",
+        "interfaces": {
+          "outputs": ["c_customer_sk", "c_birth_year", "ca_country", "ca_state", "ca_county"],
+          "consumes": []
+        }
+      },
+      "early_fact": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_item_sk, cs_bill_cdemo_sk, c_birth_year, ca_country, ca_state, ca_county, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit FROM catalog_sales INNER JOIN filtered_date ON cs_sold_date_sk = d_date_sk INNER JOIN filtered_customer_chain ON cs_bill_customer_sk = c_customer_sk",
+        "interfaces": {
+          "outputs": ["cs_item_sk", "cs_bill_cdemo_sk", "c_birth_year", "ca_country", "ca_state", "ca_county", "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price", "cs_net_profit"],
+          "consumes": ["filtered_date", "filtered_customer_chain"]
+        }
+      },
+      "join_cd1": {
+        "type": "cte", 
+        "change": "added",
+        "sql": "SELECT cs_item_sk, c_birth_year, ca_country, ca_state, ca_county, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit, cd1.cd_dep_count FROM early_fact INNER JOIN customer_demographics cd1 ON cs_bill_cdemo_sk = cd1.cd_demo_sk WHERE cd1.cd_gender = 'F' AND cd1.cd_education_status = 'Advanced Degree'",
+        "interfaces": {
+          "outputs": ["cs_item_sk", "c_birth_year", "ca_country", "ca_state", "ca_county", "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price", "cs_net_profit", "cd_dep_count"],
+          "consumes": ["early_fact"]
+        }
+      },
+      "join_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_id, ca_country, ca_state, ca_county, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit, c_birth_year, cd_dep_count FROM join_cd1 INNER JOIN item ON cs_item_sk = i_item_sk",
+        "interfaces": {
+          "outputs": ["i_item_id", "ca_country", "ca_state", "ca_county", "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price", "cs_net_profit", "c_birth_year", "cd_dep_count"],
+          "consumes": ["join_cd1"]
+        }
+      },
+      "rollup_agg": {
+        "type": "cte",
+        "change": "added", 
+        "sql": "SELECT i_item_id, ca_country, ca_state, ca_county, AVG(CAST(cs_quantity AS DECIMAL(12,2))) AS agg1, AVG(CAST(cs_list_price AS DECIMAL(12,2))) AS agg2, AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))) AS agg3, AVG(CAST(cs_sales_price AS DECIMAL(12,2))) AS agg4, AVG(CAST(cs_net_profit AS DECIMAL(12,2))) AS agg5, AVG(CAST(c_birth_year AS DECIMAL(12,2))) AS agg6, AVG(CAST(cd_dep_count AS DECIMAL(12,2))) AS agg7 FROM join_item GROUP BY ROLLUP (i_item_id, ca_country, ca_state, ca_county)",
+        "interfaces": {
+          "outputs": ["i_item_id", "ca_country", "ca_state", "ca_county", "agg1", "agg2", "agg3", "agg4", "agg5", "agg6", "agg7"],
+          "consumes": ["join_item"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7 FROM rollup_agg ORDER BY ca_country, ca_state, ca_county, i_item_id LIMIT 100",
+        "interfaces": {
+          "outputs": ["i_item_id", "ca_country", "ca_state", "ca_county", "agg1", "agg2", "agg3", "agg4", "agg5", "agg6", "agg7"],
+          "consumes": ["rollup_agg"]
+        }
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_customer_chain", "early_fact", "join_cd1", "join_item", "rollup_agg", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_customer_chain AS ({filtered_customer_chain}), early_fact AS ({early_fact}), join_cd1 AS ({join_cd1}), join_item AS ({join_item}), rollup_agg AS ({rollup_agg}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Implemented staged join pipeline by pre-filtering dimensions (date, customer chain) into CTEs before joining to fact table, then joining remaining dimensions (cd1, item) sequentially. This enables early reduction of large fact table scan using small hash tables from filtered dimension CTEs.
+
+**Expected speedup:** 1.5-2x based on similar patterns, as baseline is 1521ms (above 100ms threshold where CTE materialization overhead is justified). The rewrite avoids scanning entire catalog_sales table and instead probes with pre-filtered dimension keys.

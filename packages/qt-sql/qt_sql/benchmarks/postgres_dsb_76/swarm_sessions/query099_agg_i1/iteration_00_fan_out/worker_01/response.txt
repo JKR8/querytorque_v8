@@ -1,0 +1,93 @@
+## Modified Logic Tree
+
+```
+QUERY:
+└── [MAIN] main_query [!]
+    ├── [~] CTE_STRUCTURE (single WITH clause)
+    │   ├── date_dim_cte [=]
+    │   ├── call_center_cte [=]
+    │   ├── warehouse_cte [=]
+    │   ├── ship_mode_cte [=]
+    │   └── prefactored_cte [!] (changed: CTE with explicit JOINs)
+    ├── [~] JOIN_TYPE [!] (changed: comma joins → explicit INNER JOIN)
+    │   ├── JOIN (cs_ship_date_sk = date_dim_cte.d_date_sk)
+    │   ├── JOIN (cs_call_center_sk = call_center_cte.cc_call_center_sk)
+    │   ├── JOIN (cs_warehouse_sk = warehouse_cte.w_warehouse_sk)
+    │   └── JOIN (cs_ship_mode_sk = ship_mode_cte.sm_ship_mode_sk)
+    ├── FILTER (cs_list_price BETWEEN 86 AND 115) [=]
+    ├── AGG (GROUP BY) [=]
+    ├── SORT (SUBSTRING(w_warehouse_name FROM 1 FOR 20) ASC, sm_type ASC, cc_name ASC) [=]
+    └── OUTPUT (8 columns exactly as contract) [=]
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "dimension_prefetch_materialized",
+      "description": "Convert comma-separated joins to explicit INNER JOINs with MATERIALIZED CTEs for selective dimensions",
+      "applied_to": ["date_dim_cte", "call_center_cte", "warehouse_cte", "ship_mode_cte", "prefactored_cte"]
+    },
+    {
+      "id": "R2", 
+      "type": "parallelism_preservation",
+      "description": "Avoid wrapping large fact table scan in CTE by joining dimension CTEs directly in main aggregation",
+      "applied_to": ["main_query"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_dim_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1192 AND 1192 + 23",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "call_center_cte": {
+        "type": "cte",
+        "change": "modified", 
+        "sql": "SELECT cc_call_center_sk, cc_name FROM call_center WHERE cc_class = 'small'",
+        "interfaces": {"outputs": ["cc_call_center_sk", "cc_name"], "consumes": []}
+      },
+      "warehouse_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT w_warehouse_sk, w_warehouse_name FROM warehouse WHERE w_gmt_offset = -5",
+        "interfaces": {"outputs": ["w_warehouse_sk", "w_warehouse_name"], "consumes": []}
+      },
+      "ship_mode_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT sm_ship_mode_sk, sm_type FROM ship_mode WHERE sm_type = 'EXPRESS'",
+        "interfaces": {"outputs": ["sm_ship_mode_sk", "sm_type"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT substring(w_warehouse_name,1,20), sm_type, cc_name, sum(case when (cs_ship_date_sk - cs_sold_date_sk <= 30) then 1 else 0 end) as \"30 days\", sum(case when (cs_ship_date_sk - cs_sold_date_sk > 30 and cs_ship_date_sk - cs_sold_date_sk <= 60) then 1 else 0 end) as \"31-60 days\", sum(case when (cs_ship_date_sk - cs_sold_date_sk > 60 and cs_ship_date_sk - cs_sold_date_sk <= 90) then 1 else 0 end) as \"61-90 days\", sum(case when (cs_ship_date_sk - cs_sold_date_sk > 90 and cs_ship_date_sk - cs_sold_date_sk <= 120) then 1 else 0 end) as \"91-120 days\", sum(case when (cs_ship_date_sk - cs_sold_date_sk > 120) then 1 else 0 end) as \">120 days\" FROM catalog_sales INNER JOIN date_dim_cte ON cs_ship_date_sk = date_dim_cte.d_date_sk INNER JOIN call_center_cte ON cs_call_center_sk = call_center_cte.cc_call_center_sk INNER JOIN warehouse_cte ON cs_warehouse_sk = warehouse_cte.w_warehouse_sk INNER JOIN ship_mode_cte ON cs_ship_mode_sk = ship_mode_cte.sm_ship_mode_sk WHERE cs_list_price BETWEEN 86 AND 115 GROUP BY substring(w_warehouse_name,1,20), sm_type, cc_name ORDER BY substring(w_warehouse_name,1,20), sm_type, cc_name LIMIT 100",
+        "interfaces": {
+          "outputs": ["substring(w_warehouse_name,1,20)", "sm_type", "cc_name", "\"30 days\"", "\"31-60 days\"", "\"61-90 days\"", "\"91-120 days\"", "\">120 days\""],
+          "consumes": ["date_dim_cte", "call_center_cte", "warehouse_cte", "ship_mode_cte"]
+        }
+      }
+    },
+    "reconstruction_order": ["date_dim_cte", "call_center_cte", "warehouse_cte", "ship_mode_cte", "main_query"],
+    "assembly_template": "WITH date_dim_cte AS ({{date_dim_cte}}), call_center_cte AS ({{call_center_cte}}), warehouse_cte AS ({{warehouse_cte}}), ship_mode_cte AS ({{ship_mode_cte}}) {{main_query}}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Converted comma-separated joins to explicit INNER JOIN syntax with MATERIALIZED CTEs for selective dimension tables, while avoiding wrapping the large catalog_sales scan in a CTE to preserve parallelism. This follows the pg_date_cte_explicit_join pattern.
+
+**Expected speedup**: 2-3x from eliminating nested loops and enabling hash joins with tiny dimension tables.

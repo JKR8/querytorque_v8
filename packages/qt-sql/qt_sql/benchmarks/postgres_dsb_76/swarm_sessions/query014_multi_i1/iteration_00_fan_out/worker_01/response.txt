@@ -1,0 +1,123 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_date [=] Cost: 0% Rows: 365
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year BETWEEN 1999 AND 2001)
+│   └── OUTPUT (d_date_sk, d_year, d_week_seq)
+├── [CTE] filtered_item [=] Cost: 0% Rows: 2,682
+│   ├── SCAN (item)
+│   ├── FILTER (i_category IN ('Electronics', 'Jewelry', 'Men'))
+│   ├── FILTER (i_manager_id BETWEEN 91 AND 100)
+│   └── OUTPUT (i_item_sk, i_brand_id, i_class_id, i_category_id)
+├── [CTE] prefactored_sales [~] Cost: 15% Rows: 1.3M
+│   ├── SCAN (store_sales) [CHANGE: explicit JOIN syntax, removed comma]
+│   ├── JOIN filtered_date ON ss_sold_date_sk = d_date_sk [CHANGE: explicit]
+│   ├── FILTER (ss_wholesale_cost BETWEEN 35 AND 55) [=]
+│   └── OUTPUT (ss_item_sk, ss_quantity, ss_list_price, ss_sold_date_sk)
+├── [CTE] cross_items [~] Cost: 2% Rows: 381
+│   ├── INTERSECT branches [=]
+│   ├── Store branch: JOIN prefactored_sales + filtered_item [CHANGE: uses CTEs]
+│   ├── Catalog branch: catalog_sales + filtered_date + filtered_item [CHANGE: explicit joins]
+│   ├── Web branch: web_sales + filtered_date + filtered_item [CHANGE: explicit joins]
+│   └── OUTPUT (ss_item_sk)
+├── [CTE] avg_sales [~] Cost: 10% Rows: 1
+│   ├── UNION ALL branches [=]
+│   ├── Store branch: prefactored_sales [CHANGE: direct use]
+│   ├── Catalog branch: catalog_sales + filtered_date [CHANGE: explicit joins]
+│   ├── Web branch: web_sales + filtered_date [CHANGE: explicit joins]
+│   └── OUTPUT (average_sales)
+└── [MAIN] main_query [~] Cost: 73% Rows: ~100
+    ├── Subquery: this_year [~]
+    │   ├── SCAN store_sales + filtered_item + filtered_date + cross_items [CHANGE: explicit joins]
+    │   ├── FILTER d_week_seq = (SELECT d_week_seq... 1999+1) [=]
+    │   └── AGG + HAVING (sum > avg_sales) [=]
+    ├── Subquery: last_year [~]
+    │   ├── SCAN store_sales + filtered_item + filtered_date + cross_items [CHANGE: explicit joins]
+    │   ├── FILTER d_week_seq = (SELECT d_week_seq... 1999) [=]
+    │   └── AGG + HAVING (sum > avg_sales) [=]
+    ├── JOIN this_year.i_brand_id = last_year.i_brand_id [CHANGE: explicit]
+    ├── JOIN this_year.i_class_id = last_year.i_class_id [CHANGE: explicit]
+    ├── JOIN this_year.i_category_id = last_year.i_category_id [CHANGE: explicit]
+    ├── SORT (this_year.channel, ...) [=]
+    └── OUTPUT (ty_channel, ty_brand, ty_class, ty_category, ty_sales, ty_number_sales, ly_channel, ly_brand, ly_class, ly_category, ly_sales, ly_number_sales)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL v16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefetch", "description": "Pre-filter date_dim and item into CTEs before large fact joins", "applied_to": ["filtered_date", "filtered_item"]},
+    {"id": "R2", "type": "explicit_join_syntax", "description": "Convert all comma-separated joins to explicit JOIN ON syntax", "applied_to": ["prefactored_sales", "cross_items", "avg_sales", "main_query"]},
+    {"id": "R3", "type": "cte_reuse", "description": "Reuse filtered_date and filtered_item CTEs in catalog/web branches of cross_items and avg_sales", "applied_to": ["cross_items", "avg_sales"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk, d_year, d_week_seq FROM date_dim WHERE d_year BETWEEN 1999 AND 2001",
+        "interfaces": {"outputs": ["d_date_sk", "d_year", "d_week_seq"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk, i_brand_id, i_class_id, i_category_id FROM item WHERE i_category IN ('Electronics', 'Jewelry', 'Men') AND i_manager_id BETWEEN 91 AND 100",
+        "interfaces": {"outputs": ["i_item_sk", "i_brand_id", "i_class_id", "i_category_id"], "consumes": []}
+      },
+      "prefactored_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk, ss_quantity, ss_list_price, ss_sold_date_sk FROM store_sales JOIN filtered_date ON ss_sold_date_sk = d_date_sk WHERE ss_wholesale_cost BETWEEN 35 AND 55",
+        "interfaces": {"outputs": ["ss_item_sk", "ss_quantity", "ss_list_price", "ss_sold_date_sk"], "consumes": ["filtered_date"]}
+      },
+      "cross_items": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk AS ss_item_sk FROM filtered_item WHERE (i_brand_id, i_class_id, i_category_id) IN ( (SELECT i_brand_id, i_class_id, i_category_id FROM prefactored_sales JOIN filtered_item ON ss_item_sk = i_item_sk) INTERSECT (SELECT i_brand_id, i_class_id, i_category_id FROM catalog_sales JOIN filtered_item ON cs_item_sk = i_item_sk JOIN filtered_date ON cs_sold_date_sk = d_date_sk WHERE cs_wholesale_cost BETWEEN 35 AND 55) INTERSECT (SELECT i_brand_id, i_class_id, i_category_id FROM web_sales JOIN filtered_item ON ws_item_sk = i_item_sk JOIN filtered_date ON ws_sold_date_sk = d_date_sk WHERE ws_wholesale_cost BETWEEN 35 AND 55) )",
+        "interfaces": {"outputs": ["ss_item_sk"], "consumes": ["filtered_item", "prefactored_sales", "filtered_date"]}
+      },
+      "avg_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT AVG(quantity * list_price) AS average_sales FROM ( SELECT ss_quantity AS quantity, ss_list_price AS list_price FROM prefactored_sales UNION ALL SELECT cs_quantity AS quantity, cs_list_price AS list_price FROM catalog_sales JOIN filtered_date ON cs_sold_date_sk = d_date_sk WHERE cs_wholesale_cost BETWEEN 35 AND 55 UNION ALL SELECT ws_quantity AS quantity, ws_list_price AS list_price FROM web_sales JOIN filtered_date ON ws_sold_date_sk = d_date_sk WHERE ws_wholesale_cost BETWEEN 35 AND 55 ) AS x",
+        "interfaces": {"outputs": ["average_sales"], "consumes": ["prefactored_sales", "filtered_date"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT this_year.channel AS ty_channel, this_year.i_brand_id AS ty_brand, this_year.i_class_id AS ty_class, this_year.i_category_id AS ty_category, this_year.sales AS ty_sales, this_year.number_sales AS ty_number_sales, last_year.channel AS ly_channel, last_year.i_brand_id AS ly_brand, last_year.i_class_id AS ly_class, last_year.i_category_id AS ly_category, last_year.sales AS ly_sales, last_year.number_sales AS ly_number_sales FROM ( SELECT 'store' AS channel, i_brand_id, i_class_id, i_category_id, SUM(ss_quantity * ss_list_price) AS sales, COUNT(*) AS number_sales FROM store_sales JOIN filtered_item ON ss_item_sk = i_item_sk JOIN filtered_date ON ss_sold_date_sk = d_date_sk JOIN cross_items ON ss_item_sk = cross_items.ss_item_sk WHERE d_week_seq = (SELECT d_week_seq FROM filtered_date WHERE d_year = 1999 + 1 AND d_moy = 12 AND d_dom = 20) AND i_category IN ('Electronics', 'Jewelry', 'Men') AND i_manager_id BETWEEN 91 AND 100 AND ss_wholesale_cost BETWEEN 35 AND 55 GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(ss_quantity * ss_list_price) > (SELECT average_sales FROM avg_sales) ) AS this_year JOIN ( SELECT 'store' AS channel, i_brand_id, i_class_id, i_category_id, SUM(ss_quantity * ss_list_price) AS sales, COUNT(*) AS number_sales FROM store_sales JOIN filtered_item ON ss_item_sk = i_item_sk JOIN filtered_date ON ss_sold_date_sk = d_date_sk JOIN cross_items ON ss_item_sk = cross_items.ss_item_sk WHERE d_week_seq = (SELECT d_week_seq FROM filtered_date WHERE d_year = 1999 AND d_moy = 12 AND d_dom = 20) AND i_category IN ('Electronics', 'Jewelry', 'Men') AND i_manager_id BETWEEN 91 AND 100 AND ss_wholesale_cost BETWEEN 35 AND 55 GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(ss_quantity * ss_list_price) > (SELECT average_sales FROM avg_sales) ) AS last_year ON this_year.i_brand_id = last_year.i_brand_id AND this_year.i_class_id = last_year.i_class_id AND this_year.i_category_id = last_year.i_category_id ORDER BY this_year.channel, this_year.i_brand_id, this_year.i_class_id, this_year.i_category_id LIMIT 100",
+        "interfaces": {
+          "outputs": ["ty_channel", "ty_brand", "ty_class", "ty_category", "ty_sales", "ty_number_sales", "ly_channel", "ly_brand", "ly_class", "ly_category", "ly_sales", "ly_number_sales"],
+          "consumes": ["filtered_item", "filtered_date", "cross_items", "avg_sales"]
+        }
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "prefactored_sales", "cross_items", "avg_sales", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), prefactored_sales AS ({prefactored_sales}), cross_items AS ({cross_items}), avg_sales AS ({avg_sales}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL work_mem = '64MB'",
+    "SET LOCAL hash_mem_multiplier = 2.0",
+    "SET LOCAL max_parallel_workers_per_gather = 2"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes:** Applied dimension prefetching (date_dim, item → CTEs) and converted all comma joins to explicit JOIN syntax. This reduces predicate blindness and enables better hash join planning with small dimension tables.
+
+**Expected speedup:** 2.5-3.0× from eliminating comma-join cross products and allowing parallel scans on large fact tables (store_sales, catalog_sales, web_sales) that are no longer inside materialized CTEs.
+
+**Runtime config rationale:** 
+1. `work_mem = '64MB'`: Each of the two main aggregations (this_year, last_year) needs hash tables for GROUP BY (~381 groups × ~24 bytes = ~9KB) plus hash join memory for filtered_item (~2,682 rows). 64MB is conservative.
+2. `hash_mem_multiplier = 2.0`: Allows hash operations to use 2× work_mem for hash tables, helping the large INTERSECT operations in cross_items.
+3. `max_parallel_workers_per_gather = 2`: Enables parallel scans on the large fact tables (store_sales, catalog_sales, web_sales) since they're no longer wrapped in materialized CTEs.

@@ -1,0 +1,99 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] store_distinct [~] (renamed from ssci, same logic)
+│   ├── SCAN (store_sales, date_dim (join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_month_seq BETWEEN 1214 AND 1214 + 11)
+│   ├── AGG (GROUP BY ss_customer_sk, ss_item_sk)
+│   └── OUTPUT (customer_sk, item_sk)
+├── [CTE] catalog_distinct [~] (renamed from csci, same logic)
+│   ├── SCAN (catalog_sales, date_dim (join))
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_month_seq BETWEEN 1214 AND 1214 + 11)
+│   ├── AGG (GROUP BY cs_bill_customer_sk, cs_item_sk)
+│   └── OUTPUT (customer_sk, item_sk)
+├── [CTE] store_only_count [+]
+│   ├── SCAN (store_distinct s)
+│   ├── FILTER (NOT EXISTS with catalog_distinct)
+│   ├── AGG (COUNT(*))
+│   └── OUTPUT (store_only)
+├── [CTE] catalog_only_count [+]
+│   ├── SCAN (catalog_distinct c)
+│   ├── FILTER (NOT EXISTS with store_distinct)
+│   ├── AGG (COUNT(*))
+│   └── OUTPUT (catalog_only)
+├── [CTE] overlap_count [+]
+│   ├── SCAN (store_distinct s)
+│   ├── FILTER (EXISTS with catalog_distinct)
+│   ├── AGG (COUNT(*))
+│   └── OUTPUT (store_and_catalog)
+└── [MAIN] combine_counts [~] (replaces full outer join with cross join of three scalar CTEs)
+    ├── SCAN (store_only_count, catalog_only_count, overlap_count (cross join))
+    └── OUTPUT (store_only, catalog_only, store_and_catalog)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "intersect_to_exists", "description": "Replaced full outer join with EXISTS/NOT EXISTS semi-joins to compute three buckets separately, avoiding full materialization of join.", "applied_to": ["store_only_count", "catalog_only_count", "overlap_count"]},
+    {"id": "R2", "type": "multi_intersect_exists_cte", "description": "Pre-materialize distinct store/catalog pairs in CTEs to allow multiple EXISTS checks without rescanning fact tables.", "applied_to": ["store_distinct", "catalog_distinct"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "store_distinct": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_customer_sk AS customer_sk, ss_item_sk AS item_sk FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk WHERE d_month_seq BETWEEN 1214 AND 1214 + 11 GROUP BY ss_customer_sk, ss_item_sk",
+        "interfaces": {"outputs": ["customer_sk", "item_sk"], "consumes": []}
+      },
+      "catalog_distinct": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk FROM catalog_sales JOIN date_dim ON cs_sold_date_sk = d_date_sk WHERE d_month_seq BETWEEN 1214 AND 1214 + 11 GROUP BY cs_bill_customer_sk, cs_item_sk",
+        "interfaces": {"outputs": ["customer_sk", "item_sk"], "consumes": []}
+      },
+      "store_only_count": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT COUNT(*) AS store_only FROM store_distinct s WHERE NOT EXISTS (SELECT 1 FROM catalog_distinct c WHERE c.customer_sk = s.customer_sk AND c.item_sk = s.item_sk)",
+        "interfaces": {"outputs": ["store_only"], "consumes": ["store_distinct", "catalog_distinct"]}
+      },
+      "catalog_only_count": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT COUNT(*) AS catalog_only FROM catalog_distinct c WHERE NOT EXISTS (SELECT 1 FROM store_distinct s WHERE s.customer_sk = c.customer_sk AND s.item_sk = c.item_sk)",
+        "interfaces": {"outputs": ["catalog_only"], "consumes": ["catalog_distinct", "store_distinct"]}
+      },
+      "overlap_count": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT COUNT(*) AS store_and_catalog FROM store_distinct s WHERE EXISTS (SELECT 1 FROM catalog_distinct c WHERE c.customer_sk = s.customer_sk AND c.item_sk = s.item_sk)",
+        "interfaces": {"outputs": ["store_and_catalog"], "consumes": ["store_distinct", "catalog_distinct"]}
+      },
+      "combine_counts": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT store_only, catalog_only, store_and_catalog FROM store_only_count, catalog_only_count, overlap_count LIMIT 100",
+        "interfaces": {"outputs": ["store_only", "catalog_only", "store_and_catalog"], "consumes": ["store_only_count", "catalog_only_count", "overlap_count"]}
+      }
+    },
+    "reconstruction_order": ["store_distinct", "catalog_distinct", "store_only_count", "catalog_only_count", "overlap_count", "combine_counts"],
+    "assembly_template": "WITH store_distinct AS ({store_distinct}), catalog_distinct AS ({catalog_distinct}), store_only_count AS ({store_only_count}), catalog_only_count AS ({catalog_only_count}), overlap_count AS ({overlap_count}) {combine_counts}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced the original full outer join with three separate scalar CTEs that compute each bucket via EXISTS/NOT EXISTS semi-joins, pre-materializing distinct pairs from each channel. This eliminates the need to materialize the full Cartesian join while preserving exact bucket semantics.
+
+**Expected speedup**: ~1.5-2x by avoiding full outer join materialization and enabling semi-join optimizations, while CTE overhead is acceptable given baseline runtime >2 seconds.

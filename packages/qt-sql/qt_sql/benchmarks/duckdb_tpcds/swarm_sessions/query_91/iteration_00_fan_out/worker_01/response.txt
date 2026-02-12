@@ -1,0 +1,92 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement with CTEs)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: 21 — Now uses two specialized customer_demographics CTEs, two branch chains, UNION ALL, aggregation, and sorting
+    ├── WITH cd_branch1 AS (SELECT ... WHERE cd_marital_status='M' AND cd_education_status='Unknown')  [+]
+    ├── WITH cd_branch2 AS (SELECT ... WHERE cd_marital_status='W' AND cd_education_status='Advanced Degree')  [+]
+    ├── WITH branch1_chain AS (JOIN cd_branch1 → customer → customer_address → household_demographics → catalog_returns → date_dim → call_center WITH filters)  [+]
+    ├── WITH branch2_chain AS (JOIN cd_branch2 → same chain WITH same filters)  [+]
+    ├── WITH union_all AS (branch1_chain UNION ALL branch2_chain)  [+]
+    ├── WITH aggregate AS (GROUP BY cc_call_center_id, cc_name, cc_manager, cd_marital_status, cd_education_status)  [+]
+    └── SELECT Call_Center, Call_Center_Name, Manager, Returns_Loss FROM aggregate ORDER BY Returns_Loss DESC  [~]
+```
+
+**Change markers:**
+- `[+]` **cd_branch1**: New CTE isolating male/unknown demographic rows
+- `[+]` **cd_branch2**: New CTE isolating female/advanced-degree demographic rows  
+- `[+]` **branch1_chain**: Join chain from cd_branch1 through all tables with GMT/buy-potential/date filters
+- `[+]` **branch2_chain**: Join chain from cd_branch2 through same tables with same filters
+- `[+]` **union_all**: UNION ALL of both branches
+- `[+]` **aggregate**: Group by call center + demographic columns, sum net loss
+- `[~]` **main_query**: Modified to select from aggregate CTE, order by Returns_Loss DESC
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "or_to_union", "description": "Split OR condition on customer_demographics (marital+education column pairs) into two separate CTE branches with focused predicates", "applied_to": ["cd_branch1", "cd_branch2", "branch1_chain", "branch2_chain", "union_all"]},
+    {"id": "R2", "type": "union_cte_split", "description": "Specialize generic customer_demographics scan into two CTEs embedding filter predicates, eliminating complex FILTER node and reducing scan size", "applied_to": ["cd_branch1", "cd_branch2"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "cd_branch1": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cd_demo_sk, cd_marital_status, cd_education_status FROM customer_demographics WHERE cd_marital_status = 'M' AND cd_education_status = 'Unknown'",
+        "interfaces": {"outputs": ["cd_demo_sk", "cd_marital_status", "cd_education_status"], "consumes": []}
+      },
+      "cd_branch2": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cd_demo_sk, cd_marital_status, cd_education_status FROM customer_demographics WHERE cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree'",
+        "interfaces": {"outputs": ["cd_demo_sk", "cd_marital_status", "cd_education_status"], "consumes": []}
+      },
+      "branch1_chain": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cc.cc_call_center_id, cc.cc_name, cc.cc_manager, cd1.cd_marital_status, cd1.cd_education_status, cr.cr_net_loss FROM cd_branch1 cd1 INNER JOIN customer c ON cd1.cd_demo_sk = c.c_current_cdemo_sk INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk INNER JOIN household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk INNER JOIN catalog_returns cr ON c.c_customer_sk = cr.cr_returning_customer_sk INNER JOIN date_dim d ON cr.cr_returned_date_sk = d.d_date_sk INNER JOIN call_center cc ON cr.cr_call_center_sk = cc.cc_call_center_sk WHERE ca.ca_gmt_offset = -6 AND hd.hd_buy_potential LIKE '1001-5000%' AND d.d_year = 2001 AND d.d_moy = 11",
+        "interfaces": {"outputs": ["cc_call_center_id", "cc_name", "cc_manager", "cd_marital_status", "cd_education_status", "cr_net_loss"], "consumes": ["cd_branch1"]}
+      },
+      "branch2_chain": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cc.cc_call_center_id, cc.cc_name, cc.cc_manager, cd2.cd_marital_status, cd2.cd_education_status, cr.cr_net_loss FROM cd_branch2 cd2 INNER JOIN customer c ON cd2.cd_demo_sk = c.c_current_cdemo_sk INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk INNER JOIN household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk INNER JOIN catalog_returns cr ON c.c_customer_sk = cr.cr_returning_customer_sk INNER JOIN date_dim d ON cr.cr_returned_date_sk = d.d_date_sk INNER JOIN call_center cc ON cr.cr_call_center_sk = cc.cc_call_center_sk WHERE ca.ca_gmt_offset = -6 AND hd.hd_buy_potential LIKE '1001-5000%' AND d.d_year = 2001 AND d.d_moy = 11",
+        "interfaces": {"outputs": ["cc_call_center_id", "cc_name", "cc_manager", "cd_marital_status", "cd_education_status", "cr_net_loss"], "consumes": ["cd_branch2"]}
+      },
+      "union_all": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT * FROM branch1_chain UNION ALL SELECT * FROM branch2_chain",
+        "interfaces": {"outputs": ["cc_call_center_id", "cc_name", "cc_manager", "cd_marital_status", "cd_education_status", "cr_net_loss"], "consumes": ["branch1_chain", "branch2_chain"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cc_call_center_id AS Call_Center, cc_name AS Call_Center_Name, cc_manager AS Manager, SUM(cr_net_loss) AS Returns_Loss, cd_marital_status, cd_education_status FROM union_all GROUP BY cc_call_center_id, cc_name, cc_manager, cd_marital_status, cd_education_status",
+        "interfaces": {"outputs": ["Call_Center", "Call_Center_Name", "Manager", "Returns_Loss", "cd_marital_status", "cd_education_status"], "consumes": ["union_all"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT Call_Center, Call_Center_Name, Manager, Returns_Loss FROM aggregate ORDER BY Returns_Loss DESC",
+        "interfaces": {"outputs": ["Call_Center", "Call_Center_Name", "Manager", "Returns_Loss"], "consumes": ["aggregate"]}
+      }
+    },
+    "reconstruction_order": ["cd_branch1", "cd_branch2", "branch1_chain", "branch2_chain", "union_all", "aggregate", "main_query"],
+    "assembly_template": "WITH cd_branch1 AS ({cd_branch1}), cd_branch2 AS ({cd_branch2}), branch1_chain AS ({branch1_chain}), branch2_chain AS ({branch2_chain}), union_all AS ({union_all}), aggregate AS ({aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: The rewrite splits the OR condition on customer_demographics into two separate CTEs with focused predicates (male/unknown and female/advanced-degree), each joined independently through the full table chain, then UNION ALL'd before aggregation. This eliminates the complex FILTER node and allows predicate pushdown into each branch.
+
+**Expected speedup**: ~1.5-3x due to reduced customer_demographics scan size (110K rows → ~55K per branch) and better join planning for each focused branch. The UNION ALL preserves exact multiplicity for correct aggregation.

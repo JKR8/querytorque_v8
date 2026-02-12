@@ -1,0 +1,161 @@
+## Modified Logic Tree
+
+```
+QUERY:
+└── [MAIN] main_query  [~]
+    ├── [~] CTE chain replacing single FROM clause
+    │   ├── [+] filtered_date  [=]  Cost: 0%  Rows: 365 — Filter date_dim to 12 months
+    │   ├── [+] filtered_store  [=]  Cost: 0%  Rows: 100 — Filter store to first 100
+    │   ├── [+] prefetched_sales  [=]  Cost: 100%  Rows: ~5.4M — Join fact with filtered dimensions early
+    │   ├── [+] join_item  [=]  Cost: 100%  Rows: 373K — Apply item attribute bundle filter
+    │   ├── [+] aggregated_sales  [=]  Cost: 100%  Rows: 1,200 — Group by manager and month
+    │   ├── [+] windowed  [=]  Cost: 100%  Rows: 1,200 — Compute manager-level average
+    │   ├── [+] filtered  [=]  Cost: 100%  Rows: ~1K — Filter for >10% deviation
+    │   ├── [+] ordered  [=]  Cost: 100%  Rows: ~1K — Apply ordering
+    │   └── [+] limited  [=]  Cost: 100%  Rows: 100 — Apply limit
+    ├── [=] FILTER (deviation > 10%)
+    ├── [=] AGG (GROUP BY)
+    ├── [=] SORT (i_manager_id, avg_monthly_sales, sum_sales)
+    └── [=] OUTPUT (*)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "multi_dimension_prefetch",
+      "description": "Pre-filter date_dim and store into CTEs, then join with store_sales before applying item filter to push predicates earlier",
+      "applied_to": ["filtered_date", "filtered_store", "prefetched_sales", "join_item"]
+    },
+    {
+      "id": "R2",
+      "type": "cte_pipeline",
+      "description": "Decompose original query into sequential CTEs matching logical tree: filtered_date → filtered_store → prefetched_sales → join_item → aggregated_sales → windowed → filtered → ordered → limited",
+      "applied_to": ["filtered_date", "filtered_store", "prefetched_sales", "join_item", "aggregated_sales", "windowed", "filtered", "ordered", "limited", "main_query"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_date": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT d_date_sk, d_moy FROM date_dim WHERE d_month_seq IN (1181,1182,1183,1184,1185,1186,1187,1188,1189,1190,1191,1192)",
+          "interfaces": {
+            "outputs": ["d_date_sk", "d_moy"],
+            "consumes": []
+          }
+        },
+        "filtered_store": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT s_store_sk FROM store WHERE s_store_sk <= 100",
+          "interfaces": {
+            "outputs": ["s_store_sk"],
+            "consumes": []
+          }
+        },
+        "prefetched_sales": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT ss_item_sk, ss_sales_price, d_moy FROM store_sales INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk INNER JOIN filtered_store ON ss_store_sk = s_store_sk",
+          "interfaces": {
+            "outputs": ["ss_item_sk", "ss_sales_price", "d_moy"],
+            "consumes": ["filtered_date", "filtered_store"]
+          }
+        },
+        "join_item": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT i_manager_id, d_moy, ss_sales_price FROM prefetched_sales INNER JOIN item ON ss_item_sk = i_item_sk WHERE ((i_category IN ('Books','Children','Electronics') AND i_class IN ('personal','portable','reference','self-help') AND i_brand IN ('scholaramalgamalg #14','scholaramalgamalg #7','exportiunivamalg #9','scholaramalgamalg #9')) OR (i_category IN ('Women','Music','Men') AND i_class IN ('accessories','classical','fragrances','pants') AND i_brand IN ('amalgimporto #1','edu packscholar #1','exportiimporto #1','importoamalg #1')))",
+          "interfaces": {
+            "outputs": ["i_manager_id", "d_moy", "ss_sales_price"],
+            "consumes": ["prefetched_sales"]
+          }
+        },
+        "aggregated_sales": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT i_manager_id, d_moy, SUM(ss_sales_price) AS sum_sales FROM join_item GROUP BY i_manager_id, d_moy",
+          "interfaces": {
+            "outputs": ["i_manager_id", "d_moy", "sum_sales"],
+            "consumes": ["join_item"]
+          }
+        },
+        "windowed": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT i_manager_id, sum_sales, d_moy, AVG(sum_sales) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales FROM aggregated_sales",
+          "interfaces": {
+            "outputs": ["i_manager_id", "sum_sales", "avg_monthly_sales", "d_moy"],
+            "consumes": ["aggregated_sales"]
+          }
+        },
+        "filtered": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT i_manager_id, sum_sales, avg_monthly_sales FROM windowed WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1",
+          "interfaces": {
+            "outputs": ["i_manager_id", "sum_sales", "avg_monthly_sales"],
+            "consumes": ["windowed"]
+          }
+        },
+        "ordered": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT i_manager_id, sum_sales, avg_monthly_sales FROM filtered ORDER BY i_manager_id ASC, avg_monthly_sales ASC, sum_sales ASC",
+          "interfaces": {
+            "outputs": ["i_manager_id", "sum_sales", "avg_monthly_sales"],
+            "consumes": ["filtered"]
+          }
+        },
+        "limited": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT i_manager_id, sum_sales, avg_monthly_sales FROM ordered LIMIT 100",
+          "interfaces": {
+            "outputs": ["i_manager_id", "sum_sales", "avg_monthly_sales"],
+            "consumes": ["ordered"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT * FROM limited",
+          "interfaces": {
+            "outputs": ["i_manager_id", "sum_sales", "avg_monthly_sales"],
+            "consumes": ["limited"]
+          }
+        }
+      },
+      "reconstruction_order": [
+        "filtered_date",
+        "filtered_store",
+        "prefetched_sales",
+        "join_item",
+        "aggregated_sales",
+        "windowed",
+        "filtered",
+        "ordered",
+        "limited",
+        "main_query"
+      ],
+      "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_store AS ({filtered_store}), prefetched_sales AS ({prefetched_sales}), join_item AS ({join_item}), aggregated_sales AS ({aggregated_sales}), windowed AS ({windowed}), filtered AS ({filtered}), ordered AS ({ordered}), limited AS ({limited}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Pre-filtered date_dim and store into CTEs, then joined with store_sales before applying item filter, decomposing original query into sequential CTEs matching logical tree.
+
+Expected speedup: 1.5-2x due to predicate pushdown to date_dim and store before fact table scan, while preserving exact semantics and defensive guards.

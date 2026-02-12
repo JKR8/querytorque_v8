@@ -1,0 +1,94 @@
+## Modified Logic Tree
+
+```
+QUERY: (structured CTE chain)
+└── [MAIN] main_query [!]
+    ├── [+] date_dim_cte
+    │   ├── SCAN (date_dim)
+    │   ├── FILTER (d_moy = 11 AND d_year = 2002)
+    │   └── OUTPUT (d_date_sk, d_year)
+    ├── [+] item_cte
+    │   ├── SCAN (item)
+    │   ├── FILTER (i_manager_id = 1)
+    │   └── OUTPUT (i_item_sk, i_category_id, i_category)
+    ├── [+] fact_prejoin
+    │   ├── SCAN (store_sales)
+    │   ├── JOIN (INNER JOIN date_dim_cte ON ss_sold_date_sk = d_date_sk)
+    │   ├── JOIN (INNER JOIN item_cte ON ss_item_sk = i_item_sk)
+    │   └── OUTPUT (d_year, i_category_id, i_category, ss_ext_sales_price)
+    ├── [+] aggregate
+    │   ├── FROM (fact_prejoin)
+    │   ├── AGG (GROUP BY d_year, i_category_id, i_category)
+    │   ├── AGG (SUM(ss_ext_sales_price) AS sum_sales)
+    │   └── OUTPUT (d_year, i_category_id, i_category, sum_sales)
+    └── [+] top_n
+        ├── FROM (aggregate)
+        ├── SORT (sum_sales DESC, d_year, i_category_id, i_category)
+        ├── LIMIT (100)
+        └── OUTPUT (d_year, i_category_id, i_category, sum_sales)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb_v1.4.3",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_isolation", "description": "Pre-filter date and item dimensions into separate CTEs to reduce fact table join size", "applied_to": ["date_dim_cte", "item_cte"]},
+    {"id": "R2", "type": "staged_join_pipeline", "description": "Join filtered dimensions sequentially with fact table in dedicated CTE", "applied_to": ["fact_prejoin"]},
+    {"id": "R3", "type": "aggregation_separation", "description": "Isolate aggregation logic from final ordering/limiting", "applied_to": ["aggregate", "top_n"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_dim_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_year FROM date_dim WHERE d_moy = 11 AND d_year = 2002",
+        "interfaces": {"outputs": ["d_date_sk", "d_year"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_category_id, i_category FROM item WHERE i_manager_id = 1",
+        "interfaces": {"outputs": ["i_item_sk", "i_category_id", "i_category"], "consumes": []}
+      },
+      "fact_prejoin": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d.d_year, i.i_category_id, i.i_category, ss.ss_ext_sales_price FROM store_sales ss INNER JOIN date_dim_cte d ON ss.ss_sold_date_sk = d.d_date_sk INNER JOIN item_cte i ON ss.ss_item_sk = i.i_item_sk",
+        "interfaces": {"outputs": ["d_year", "i_category_id", "i_category", "ss_ext_sales_price"], "consumes": ["date_dim_cte", "item_cte"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_year, i_category_id, i_category, SUM(ss_ext_sales_price) AS sum_sales FROM fact_prejoin GROUP BY d_year, i_category_id, i_category",
+        "interfaces": {"outputs": ["d_year", "i_category_id", "i_category", "sum_sales"], "consumes": ["fact_prejoin"]}
+      },
+      "top_n": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_year, i_category_id, i_category, sum_sales FROM aggregate ORDER BY sum_sales DESC, d_year, i_category_id, i_category LIMIT 100",
+        "interfaces": {"outputs": ["d_year", "i_category_id", "i_category", "sum_sales"], "consumes": ["aggregate"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT d_year, i_category_id, i_category, sum_sales FROM top_n",
+        "interfaces": {"outputs": ["d_year", "i_category_id", "i_category", "sum_sales"], "consumes": ["top_n"]}
+      }
+    },
+    "reconstruction_order": ["date_dim_cte", "item_cte", "fact_prejoin", "aggregate", "top_n", "main_query"],
+    "assembly_template": "WITH date_dim_cte AS ({date_dim_cte}), item_cte AS ({item_cte}), fact_prejoin AS ({fact_prejoin}), aggregate AS ({aggregate}), top_n AS ({top_n}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Restructured original flat query into a staged CTE pipeline that isolates dimension filtering (date_dim, item) before joining with the fact table, then aggregates and limits. This allows DuckDB to build small hash tables from selective dimension filters and probe the fact table efficiently.
+
+Expected speedup: 2-3x due to reduced fact table scan via early dimension filtering and materialized dimension lookups.

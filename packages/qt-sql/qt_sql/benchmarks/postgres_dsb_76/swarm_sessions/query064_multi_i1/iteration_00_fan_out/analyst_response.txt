@@ -1,0 +1,279 @@
+<reasoning>
+1. **CLASSIFY**: This is a **channel-comparison self-join / star-join with late dim filter** archetype. The query:
+   - Computes a filtered aggregate from catalog_sales/returns (cs_ui)
+   - Uses that in a massive star join with store_sales/returns and 17 dimension tables
+   - Self-joins the result to compare consecutive years (1998 vs 1999) for same item/store
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - **Total runtime**: 3317.8ms
+   - **Dominant cost**: cs_ui CTE computation (2160.2ms = 65% of total)
+     - Hash join of catalog_sales (814K rows) with catalog_returns (719K rows)
+     - External sort on disk (5224kB) for GROUP BY
+     - Aggregation with HAVING filter removes 9,466 groups
+   - **Secondary cost**: cross_sales CTE (3290.3ms scan time, overlaps with cs_ui)
+     - Nested loop structure with 17 joins
+     - Many index scans (low cost per scan but high cumulative overhead)
+   - **Cardinality flow**:
+     - cs_ui: 70K rows → filtered to ~60K rows
+     - Store_sales filtered by ss_wholesale_cost: very selective (rows=0 per index scan)
+     - Final cross_sales: 0 rows (expected ~42K per logical tree)
+   - **Optimizer already does**:
+     - Materializes cs_ui CTE (computed once)
+     - Uses hash join for catalog_sales/returns
+     - Uses index scans for dimension lookups
+   - **Missed opportunities**:
+     - cs_ui scans full catalog_sales (4M rows) despite cs_wholesale_cost filter
+     - Store_sales filtered late (after joining with cs_ui)
+     - Comma joins in cross_sales CTE (PostgreSQL weakness)
+     - Same store_sales table scanned multiple times? Actually appears once in plan
+
+3. **GAP MATCHING**:
+   - **COMMA_JOIN_WEAKNESS**: Yes - cross_sales CTE uses comma-separated implicit joins
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: Yes - cs_ui CTE computed once but could push store_sales filters earlier
+   - **NON_EQUI_JOIN_INPUT_BLINDNESS**: No expensive non-equi joins
+   - **CORRELATED_SUBQUERY_PARALYSIS**: No correlated subqueries
+
+4. **AGGREGATION TRAP CHECK**:
+   - Only SUM, COUNT aggregates - grouping-insensitive (safe for restructuring)
+   - HAVING clause in cs_ui uses SUM comparisons - must preserve equivalence
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   1. **pg_dimension_prefetch_star** (COMMA_JOIN_WEAKNESS): Pre-filter all selective dimensions into CTEs, convert comma joins to explicit JOINs
+   2. **pg_materialized_dimension_fact_prefilter** (CROSS_CTE_PREDICATE_BLINDNESS): Stage reduction - pre-filter both fact (store_sales) and dimensions before massive join
+   3. **pg_self_join_decomposition** (CROSS_CTE_PREDICATE_BLINDNESS): Eliminate duplicate fact scans by computing cross_sales once, then filtering years
+   4. **scan_consolidation_pivot** (novel exploration): Consolidate year comparison into single scan with CASE pivoting
+
+6. **LOGICAL TREE DESIGN**:
+   - Strategy 1: Dimension CTEs → Explicit JOIN star join
+   - Strategy 2: Fact CTE + Dimension CTEs → Staged reduction
+   - Strategy 3: Single materialized cross_sales → Year filtering in main query
+   - Strategy 4: Single scan with year discrimination in aggregates
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+This query compares year-over-year sales performance for items sold in stores, filtering for specific customer demographics and promotion channels. All joins are INNER (all dimension matches required). Aggregates are SUM and COUNT only, which are duplicate-insensitive. The HAVING clause in cs_ui compares sales to refunds with a 2:1 ratio - this filter must remain after aggregation.
+
+BOTTLENECK_DIAGNOSIS:
+The query is scan-bound on catalog_sales (65% of runtime) for the cs_ui CTE, scanning 4M rows to filter 814K by cs_wholesale_cost. Secondary cost is the 17-way nested loop join in cross_sales. Cardinality collapses sharply after cs_ui aggregation (4M → 60K), then again after store_sales joins (near zero). The optimizer already materializes cs_ui and uses efficient hash joins for catalog tables. Logical-tree costs mislead - cs_ui shows 43% but consumes 65% actual time.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs 22 columns from cross_sales self-join
+- CTE_COLUMN_COMPLETENESS: cs_ui outputs cs_item_sk used by cross_sales; cross_sales outputs all columns for main query self-join
+- LITERAL_PRESERVATION: Many literal filters (cs_wholesale_cost 35-55, i_current_price 26-36, states IA/IL/TX, marital status M/U, etc.)
+- SEMANTIC_EQUIVALENCE: Must return same rows comparing 1998 vs 1999 store/item performance
+- COMMA_JOIN_WEAKNESS: cross_sales CTE uses comma-separated implicit joins (FROM store_sales, store_returns, cs_ui, date_dim d1, ...)
+- CROSS_CTE_PREDICATE_BLINDNESS: store_sales filtered by ss_wholesale_cost after joining with cs_ui instead of before
+
+REGRESSION_WARNINGS:
+None applicable.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: pg_dimension_prefetch_star
+TARGET_LOGICAL_TREE:
+  filtered_dims (multiple CTEs) -> explicit_star_join -> cross_sales_cte -> main_query
+NODE_CONTRACTS:
+  filtered_date_d1:
+    FROM: date_dim d1
+    WHERE: d1.d_year = 1998 OR d1.d_year = 1999
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: ~730 (2 years of daily data)
+    CONSUMERS: explicit_star_join
+  filtered_date_d2:
+    FROM: date_dim d2
+    WHERE: EXISTS (SELECT 1 FROM customer WHERE c_first_sales_date_sk = d2.d_date_sk)
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: ~365 (matching customer dates)
+    CONSUMERS: explicit_star_join
+  filtered_date_d3:
+    FROM: date_dim d3
+    WHERE: EXISTS (SELECT 1 FROM customer WHERE c_first_shipto_date_sk = d3.d_date_sk)
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: ~365
+    CONSUMERS: explicit_star_join
+  filtered_customer_address_ad2:
+    FROM: customer_address ad2
+    WHERE: ad2.ca_state IN ('IA','IL','TX')
+    OUTPUT: ca_address_sk, ca_street_number, ca_street_name, ca_city, ca_zip
+    EXPECTED_ROWS: ~3% of addresses
+    CONSUMERS: explicit_star_join
+  filtered_promotion:
+    FROM: promotion
+    WHERE: p_channel_email = 'N' AND p_channel_tv = 'Y' AND p_channel_radio = 'N'
+    OUTPUT: p_promo_sk
+    EXPECTED_ROWS: ~1% of promotions
+    CONSUMERS: explicit_star_join
+  filtered_cd:
+    FROM: customer_demographics
+    WHERE: cd_marital_status IN ('M','U') AND cd_education_status IN ('Unknown','Advanced Degree','College')
+    OUTPUT: cd_demo_sk
+    EXPECTED_ROWS: ~30% of demographics
+    CONSUMERS: explicit_star_join (two instances: cd1, cd2)
+  explicit_star_join:
+    FROM: store_sales
+    JOIN: INNER JOIN store_returns ON ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number
+    JOIN: INNER JOIN cs_ui ON ss_item_sk = cs_ui.cs_item_sk
+    JOIN: INNER JOIN filtered_date_d1 d1 ON ss_sold_date_sk = d1.d_date_sk
+    JOIN: INNER JOIN store ON ss_store_sk = s_store_sk
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+    JOIN: INNER JOIN filtered_cd cd1 ON ss_cdemo_sk = cd1.cd_demo_sk
+    JOIN: INNER JOIN household_demographics hd1 ON ss_hdemo_sk = hd1.hd_demo_sk
+    JOIN: INNER JOIN income_band ib1 ON hd1.hd_income_band_sk = ib1.ib_income_band_sk
+    JOIN: INNER JOIN customer_address ad1 ON ss_addr_sk = ad1.ca_address_sk
+    JOIN: INNER JOIN filtered_cd cd2 ON c_current_cdemo_sk = cd2.cd_demo_sk
+    JOIN: INNER JOIN household_demographics hd2 ON c_current_hdemo_sk = hd2.hd_demo_sk
+    JOIN: INNER JOIN income_band ib2 ON hd2.hd_income_band_sk = ib2.ib_income_band_sk
+    JOIN: INNER JOIN filtered_customer_address_ad2 ad2 ON c_current_addr_sk = ad2.ca_address_sk
+    JOIN: INNER JOIN filtered_date_d2 d2 ON c_first_sales_date_sk = d2.d_date_sk
+    JOIN: INNER JOIN filtered_date_d3 d3 ON c_first_shipto_date_sk = d3.d_date_sk
+    JOIN: INNER JOIN filtered_promotion ON ss_promo_sk = p_promo_sk
+    JOIN: INNER JOIN item ON ss_item_sk = i_item_sk
+    WHERE: ss_wholesale_cost BETWEEN 35 AND 55 AND i_current_price BETWEEN 26 AND 36 AND cd1.cd_marital_status <> cd2.cd_marital_status
+    GROUP BY: i_product_name, i_item_sk, s_store_name, s_zip, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip, d1.d_year, d2.d_year, d3.d_year
+    AGGREGATE: COUNT(*) AS cnt, SUM(ss_wholesale_cost) AS s1, SUM(ss_list_price) AS s2, SUM(ss_coupon_amt) AS s3
+    OUTPUT: i_product_name, i_item_sk, s_store_name, s_zip, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip, d1.d_year AS syear, d2.d_year AS fsyear, d3.d_year AS s2year, cnt, s1, s2, s3
+    EXPECTED_ROWS: ~42K
+    CONSUMERS: cross_sales_cte
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering of ALL selective dimensions (date, promotion, customer_address, customer_demographics) into CTEs. Convert all comma joins to explicit INNER JOIN syntax. Ignore that example uses UNION - this query has no UNION.
+- pg_date_cte_explicit_join: Apply date dimension isolation into CTEs but also include other dimensions. The combination of CTEs + explicit joins is key.
+HAZARD_FLAGS:
+- Risk of over-materialization: 6+ CTEs may increase planning time
+- Must ensure cd1 and cd2 come from same filtered_cd CTE but with different aliases
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: pg_materialized_dimension_fact_prefilter
+TARGET_LOGICAL_TREE:
+  filtered_fact_cte -> filtered_dim_ctes -> staged_join -> cross_sales_cte -> main_query
+NODE_CONTRACTS:
+  filtered_store_sales:
+    FROM: store_sales
+    WHERE: ss_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: ss_sold_date_sk, ss_store_sk, ss_customer_sk, ss_cdemo_sk, ss_hdemo_sk, ss_addr_sk, ss_item_sk, ss_ticket_number, ss_promo_sk, ss_wholesale_cost, ss_list_price, ss_coupon_amt
+    EXPECTED_ROWS: ~20% of store_sales
+    CONSUMERS: staged_join
+  filtered_cs_ui:
+    FROM: catalog_sales, catalog_returns
+    WHERE: cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number AND cs_wholesale_cost BETWEEN 35 AND 55
+    GROUP BY: cs_item_sk
+    HAVING: SUM(cs_ext_list_price) > 2*SUM(cr_refunded_cash+cr_reversed_charge+cr_store_credit)
+    OUTPUT: cs_item_sk
+    EXPECTED_ROWS: ~60K
+    CONSUMERS: staged_join
+  filtered_dimensions: (multiple CTEs as in Worker 1)
+    OUTPUT: respective keys and columns
+    EXPECTED_ROWS: small
+    CONSUMERS: staged_join
+  staged_join:
+    FROM: filtered_store_sales ss
+    JOIN: INNER JOIN store_returns sr ON ss.ss_item_sk = sr.sr_item_sk AND ss.ss_ticket_number = sr.sr_ticket_number
+    JOIN: INNER JOIN filtered_cs_ui ON ss.ss_item_sk = filtered_cs_ui.cs_item_sk
+    JOIN: INNER JOIN date_dim d1 ON ss.ss_sold_date_sk = d1.d_date_sk
+    JOIN: INNER JOIN store ON ss.ss_store_sk = s_store_sk
+    JOIN: INNER JOIN customer ON ss.ss_customer_sk = c_customer_sk
+    JOIN: INNER JOIN customer_demographics cd1 ON ss.ss_cdemo_sk = cd1.cd_demo_sk
+    JOIN: INNER JOIN household_demographics hd1 ON ss.ss_hdemo_sk = hd1.hd_demo_sk
+    JOIN: INNER JOIN income_band ib1 ON hd1.hd_income_band_sk = ib1.ib_income_band_sk
+    JOIN: INNER JOIN customer_address ad1 ON ss.ss_addr_sk = ad1.ca_address_sk
+    JOIN: INNER JOIN customer_demographics cd2 ON c_current_cdemo_sk = cd2.cd_demo_sk
+    JOIN: INNER JOIN household_demographics hd2 ON c_current_hdemo_sk = hd2.hd_demo_sk
+    JOIN: INNER JOIN income_band ib2 ON hd2.hd_income_band_sk = ib2.ib_income_band_sk
+    JOIN: INNER JOIN customer_address ad2 ON c_current_addr_sk = ad2.ca_address_sk
+    JOIN: INNER JOIN date_dim d2 ON c_first_sales_date_sk = d2.d_date_sk
+    JOIN: INNER JOIN date_dim d3 ON c_first_shipto_date_sk = d3.d_date_sk
+    JOIN: INNER JOIN promotion ON ss.ss_promo_sk = p_promo_sk
+    JOIN: INNER JOIN item ON ss.ss_item_sk = i_item_sk
+    WHERE: i_current_price BETWEEN 26 AND 36 AND p_channel_email = 'N' AND p_channel_tv = 'Y' AND p_channel_radio = 'N' AND ad2.ca_state IN ('IA','IL','TX') AND cd1.cd_marital_status IN ('M','U') AND cd1.cd_education_status IN ('Unknown','Advanced Degree','College') AND cd2.cd_marital_status IN ('M','U') AND cd2.cd_education_status IN ('Unknown','Advanced Degree','College') AND cd1.cd_marital_status <> cd2.cd_marital_status
+    GROUP BY: i_product_name, i_item_sk, s_store_name, s_zip, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip, d1.d_year, d2.d_year, d3.d_year
+    AGGREGATE: COUNT(*) AS cnt, SUM(ss.ss_wholesale_cost) AS s1, SUM(ss.ss_list_price) AS s2, SUM(ss.ss_coupon_amt) AS s3
+    OUTPUT: i_product_name, i_item_sk, s_store_name, s_zip, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip, d1.d_year AS syear, d2.d_year AS fsyear, d3.d_year AS s2year, cnt, s1, s2, s3
+    EXPECTED_ROWS: ~42K
+    CONSUMERS: cross_sales_cte
+EXAMPLES: pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+- pg_materialized_dimension_fact_prefilter: Apply staged reduction: create MATERIALIZED CTE for filtered store_sales (fact table) AND filtered dimensions. Join only the pre-filtered sets. Ignore non-equi join aspect - this query has equality joins only.
+HAZARD_FLAGS:
+- MATERIALIZED keyword may force early computation but could block parallel execution
+- Must ensure all dimension filters are applied in staged_join WHERE clause
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: pg_self_join_decomposition
+TARGET_LOGICAL_TREE:
+  single_cross_sales_cte -> year_filtered_cs1 -> year_filtered_cs2 -> main_join
+NODE_CONTRACTS:
+  cross_sales_all_years:
+    FROM: store_sales, store_returns, cs_ui, date_dim d1, date_dim d2, date_dim d3, store, customer, customer_demographics cd1, customer_demographics cd2, promotion, household_demographics hd1, household_demographics hd2, customer_address ad1, customer_address ad2, income_band ib1, income_band ib2, item
+    WHERE: (all original join conditions and filters from cross_sales CTE)
+    GROUP BY: i_product_name, i_item_sk, s_store_name, s_zip, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip, d1.d_year, d2.d_year, d3.d_year
+    AGGREGATE: COUNT(*) AS cnt, SUM(ss_wholesale_cost) AS s1, SUM(ss_list_price) AS s2, SUM(ss_coupon_amt) AS s3
+    OUTPUT: i_product_name, i_item_sk, s_store_name, s_zip, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip, d1.d_year AS syear, d2.d_year AS fsyear, d3.d_year AS s2year, cnt, s1, s2, s3
+    EXPECTED_ROWS: ~84K (all years)
+    CONSUMERS: year_filtered_cs1, year_filtered_cs2
+  year_filtered_cs1:
+    FROM: cross_sales_all_years cs1
+    WHERE: cs1.syear = 1998
+    OUTPUT: all columns from cross_sales_all_years
+    EXPECTED_ROWS: ~42K
+    CONSUMERS: main_join
+  year_filtered_cs2:
+    FROM: cross_sales_all_years cs2
+    WHERE: cs2.syear = 1999
+    OUTPUT: all columns from cross_sales_all_years
+    EXPECTED_ROWS: ~42K
+    CONSUMERS: main_join
+  main_join:
+    FROM: year_filtered_cs1 cs1, year_filtered_cs2 cs2
+    WHERE: cs1.item_sk = cs2.item_sk AND cs2.cnt <= cs1.cnt AND cs1.store_name = cs2.store_name AND cs1.store_zip = cs2.store_zip
+    ORDER BY: cs1.product_name, cs1.store_name, cs2.cnt, cs1.s1, cs2.s1
+    OUTPUT: cs1.product_name, cs1.store_name, cs1.store_zip, cs1.b_street_number, cs1.b_street_name, cs1.b_city, cs1.b_zip, cs1.c_street_number, cs1.c_street_name, cs1.c_city, cs1.c_zip, cs1.syear, cs1.cnt, cs1.s1 AS s11, cs1.s2 AS s21, cs1.s3 AS s31, cs2.s1 AS s12, cs2.s2 AS s22, cs2.s3 AS s32, cs2.syear, cs2.cnt
+    EXPECTED_ROWS: 0 (as in original)
+    CONSUMERS: final output
+EXAMPLES: pg_self_join_decomposition
+EXAMPLE_ADAPTATION:
+- pg_self_join_decomposition: Compute the fact+dimension scan once in a CTE (cross_sales_all_years), then filter for each year in separate CTEs. This eliminates duplicate scanning of store_sales and dimension tables. Ignore that example computes aggregates per-item and per-store - here we need year partitioning.
+HAZARD_FLAGS:
+- cross_sales_all_years may be large (~84K rows) but materialized once
+- Must ensure d1.d_year filter moves to WHERE clause of cross_sales_all_years (original has no year filter there)
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: scan_consolidation_pivot
+TARGET_LOGICAL_TREE:
+  pivoted_cross_sales -> unpivot_filtered -> main_query_adapted
+NODE_CONTRACTS:
+  cross_sales_pivoted:
+    FROM: store_sales, store_returns, cs_ui, date_dim d1, date_dim d2, date_dim d3, store, customer, customer_demographics cd1, customer_demographics cd2, promotion, household_demographics hd1, household_demographics hd2, customer_address ad1, customer_address ad2, income_band ib1, income_band ib2, item
+    WHERE: (all original join conditions and filters from cross_sales CTE) AND d1.d_year IN (1998, 1999)
+    GROUP BY: i_product_name, i_item_sk, s_store_name, s_zip, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip, d1.d_year, d2.d_year, d3.d_year
+    AGGREGATE: COUNT(*) AS cnt, SUM(ss_wholesale_cost) AS s1, SUM(ss_list_price) AS s2, SUM(ss_coupon_amt) AS s3
+    OUTPUT: i_product_name, i_item_sk, s_store_name, s_zip, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip, d1.d_year AS syear, d2.d_year AS fsyear, d3.d_year AS s2year, cnt, s1, s2, s3
+    EXPECTED_ROWS: ~84K (both years combined)
+    CONSUMERS: unpivot_filtered
+  unpivot_filtered:
+    FROM: cross_sales_pivoted cs
+    WHERE: cs.syear IN (1998, 1999)
+    OUTPUT: all columns from cross_sales_pivoted
+    EXPECTED_ROWS: ~84K
+    CONSUMERS: main_query_adapted
+  main_query_adapted:
+    FROM: (SELECT * FROM unpivot_filtered WHERE syear = 1998) cs1
+    CROSS JOIN LATERAL (SELECT * FROM unpivot_filtered WHERE syear = 1999 AND item_sk = cs1.item_sk AND store_name = cs1.store_name AND store_zip = cs1.store_zip AND cnt <= cs1.cnt) cs2
+    ORDER BY: cs1.product_name, cs1.store_name, cs2.cnt, cs1.s1, cs2.s1
+    OUTPUT: cs1.product_name, cs1.store_name, cs1.store_zip, cs1.b_street_number, cs1.b_street_name, cs1.b_city, cs1.b_zip, cs1.c_street_number, cs1.c_street_name, cs1.c_city, cs1.c_zip, cs1.syear, cs1.cnt, cs1.s1 AS s11, cs1.s2 AS s21, cs1.s3 AS s31, cs2.s1 AS s12, cs2.s2 AS s22, cs2.s3 AS s32, cs2.syear, cs2.cnt
+    EXPECTED_ROWS: 0
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, pg_self_join_decomposition
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Compute both years in a single scan with d1.d_year IN (1998,1999), then separate rows for self-join. This avoids computing cross_sales twice. Ignore CASE pivoting - we keep rows separate.
+- pg_self_join_decomposition: Materialize once, but use LATERAL join for efficiency.
+HAZARD_FLAGS:
+- LATERAL join may not be more efficient than original self-join
+- Must ensure all original join conditions are preserved
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

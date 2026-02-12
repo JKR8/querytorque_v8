@@ -1,0 +1,135 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] frequent_ss_items  [=]  Cost: 25%  Rows: ~1K
+├── [CTE] max_store_sales  [=]  Cost: 25%  Rows: ~1K
+├── [CTE] max_store_sales_agg  [+]  — New node splitting max aggregation from correlated subquery
+│   ├── FROM: max_store_sales
+│   ├── AGG: MAX(csales) as tpcds_cmax
+│   └── OUTPUT: tpcds_cmax
+├── [CTE] best_ss_customer  [~]  Cost: 25%  Rows: ~1K  — Modified to reference max_store_sales_agg CTE instead of correlated subquery
+│   ├── SCAN (store_sales, customer)
+│   ├── JOIN (ss_customer_sk = c_customer_sk)
+│   ├── AGG (GROUP BY)
+│   ├── HAVING: references max_store_sales_agg.tpcds_cmax
+│   └── OUTPUT: c_customer_sk, ssales
+└── [MAIN] main_query  [=]  Cost: 25%  Rows: ~1K
+    ├── SCAN (catalog_sales, date_dim, web_sales)
+    ├── JOIN (cs_sold_date_sk = d_date_sk, ws_sold_date_sk = d_date_sk)
+    ├── FILTER (d_year = 2000, d_moy = 5)
+    ├── FILTER (cs_item_sk IN frequent_ss_items, ws_item_sk IN frequent_ss_items)
+    ├── FILTER (cs_bill_customer_sk IN best_ss_customer, ws_bill_customer_sk IN best_ss_customer)
+    ├── UNION ALL
+    └── OUTPUT: SUM(sales)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "materialize_cte", "description": "Split max_store_sales aggregation into separate CTE to enable reuse in best_ss_customer", "applied_to": ["max_store_sales_agg"]},
+    {"id": "R2", "type": "decorrelate", "description": "Convert correlated scalar subquery in best_ss_customer HAVING clause to reference materialized CTE", "applied_to": ["best_ss_customer"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "frequent_ss_items": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["itemdesc", "item_sk", "solddate", "cnt"], "consumes": []}
+      },
+      "max_store_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_sk, SUM(ss_quantity * ss_sales_price) AS csales FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk JOIN customer ON ss_customer_sk = c_customer_sk WHERE d_year IN (2000, 2000+1, 2000+2, 2000+3) GROUP BY c_customer_sk",
+        "interfaces": {"outputs": ["c_customer_sk", "csales"], "consumes": []}
+      },
+      "max_store_sales_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT MAX(csales) AS tpcds_cmax FROM max_store_sales",
+        "interfaces": {"outputs": ["tpcds_cmax"], "consumes": ["max_store_sales"]}
+      },
+      "best_ss_customer": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_sk, SUM(ss_quantity * ss_sales_price) AS ssales FROM store_sales JOIN customer ON ss_customer_sk = c_customer_sk GROUP BY c_customer_sk HAVING SUM(ss_quantity * ss_sales_price) > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales_agg)",
+        "interfaces": {"outputs": ["c_customer_sk", "ssales"], "consumes": ["max_store_sales_agg"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["sum(sales)"], "consumes": ["frequent_ss_items", "best_ss_customer"]}
+      }
+    },
+    "reconstruction_order": ["frequent_ss_items", "max_store_sales", "max_store_sales_agg", "best_ss_customer", "main_query"],
+    "assembly_template": "WITH frequent_ss_items AS ({frequent_ss_items}), max_store_sales AS ({max_store_sales}), max_store_sales_agg AS ({max_store_sales_agg}), best_ss_customer AS ({best_ss_customer}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Complete Assembly:**
+
+```sql
+WITH frequent_ss_items AS (
+  SELECT substr(i_item_desc,1,30) AS itemdesc, i_item_sk AS item_sk, d_date AS solddate, COUNT(*) AS cnt
+  FROM store_sales
+  JOIN date_dim ON ss_sold_date_sk = d_date_sk
+  JOIN item ON ss_item_sk = i_item_sk
+  WHERE d_year IN (2000, 2000+1, 2000+2, 2000+3)
+  GROUP BY substr(i_item_desc,1,30), i_item_sk, d_date
+  HAVING COUNT(*) > 4
+),
+max_store_sales AS (
+  SELECT c_customer_sk, SUM(ss_quantity * ss_sales_price) AS csales
+  FROM store_sales
+  JOIN date_dim ON ss_sold_date_sk = d_date_sk
+  JOIN customer ON ss_customer_sk = c_customer_sk
+  WHERE d_year IN (2000, 2000+1, 2000+2, 2000+3)
+  GROUP BY c_customer_sk
+),
+max_store_sales_agg AS (
+  SELECT MAX(csales) AS tpcds_cmax
+  FROM max_store_sales
+),
+best_ss_customer AS (
+  SELECT c_customer_sk, SUM(ss_quantity * ss_sales_price) AS ssales
+  FROM store_sales
+  JOIN customer ON ss_customer_sk = c_customer_sk
+  GROUP BY c_customer_sk
+  HAVING SUM(ss_quantity * ss_sales_price) > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales_agg)
+)
+SELECT SUM(sales)
+FROM (
+  SELECT cs_quantity * cs_list_price AS sales
+  FROM catalog_sales
+  JOIN date_dim ON cs_sold_date_sk = d_date_sk
+  WHERE d_year = 2000
+    AND d_moy = 5
+    AND cs_item_sk IN (SELECT item_sk FROM frequent_ss_items)
+    AND cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer)
+  UNION ALL
+  SELECT ws_quantity * ws_list_price AS sales
+  FROM web_sales
+  JOIN date_dim ON ws_sold_date_sk = d_date_sk
+  WHERE d_year = 2000
+    AND d_moy = 5
+    AND ws_item_sk IN (SELECT item_sk FROM frequent_ss_items)
+    AND ws_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer)
+)
+LIMIT 100;
+```
+
+**Changes:** Split the max aggregation into a separate CTE (max_store_sales_agg) and modified best_ss_customer to reference it instead of the original correlated scalar subquery. This ensures best_ss_customer is computed once and reused in both UNION branches.
+
+**Expected speedup:** 1.5-2x due to elimination of redundant max computation and better CTE materialization opportunities.

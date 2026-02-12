@@ -1,0 +1,90 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE chain)
+├── [+] date_cte [=]
+├── [+] store_cte [=]
+├── [+] customer_demographics_cte [=]
+├── [+] item_cte [=]
+├── [+] fact_filtered [~] — Created by joining store_sales with three filtered dimension CTEs
+├── [+] join_all [~] — Created by joining fact_filtered with item_cte
+├── [+] aggregate_rollup [=]
+└── [+] order_limit [=]
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "multi_dimension_prefetch", "description": "Pre-filter all selective dimension tables (date_dim, store, customer_demographics) into separate CTEs before fact table join to leverage combined selectivity", "applied_to": ["date_cte", "store_cte", "customer_demographics_cte"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Isolate unfiltered dimension (item) into separate CTE to create small hash table for efficient probing", "applied_to": ["item_cte"]},
+    {"id": "R3", "type": "staged_join_pipeline", "description": "Build fact_filtered CTE joining store_sales with three pre-filtered dimension CTEs, then join_all CTE to add remaining dimension", "applied_to": ["fact_filtered", "join_all"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "store_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_sk, s_state FROM store WHERE s_state IN ('MO','AL','MI','TN','LA','SC')",
+        "interfaces": {"outputs": ["s_store_sk", "s_state"], "consumes": []}
+      },
+      "customer_demographics_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'F' AND cd_marital_status = 'D' AND cd_education_status = 'Secondary'",
+        "interfaces": {"outputs": ["cd_demo_sk"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_item_id FROM item",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "fact_filtered": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss.ss_item_sk, ss.ss_quantity, ss.ss_list_price, ss.ss_coupon_amt, ss.ss_sales_price, st.s_state FROM store_sales ss INNER JOIN date_cte dt ON ss.ss_sold_date_sk = dt.d_date_sk INNER JOIN store_cte st ON ss.ss_store_sk = st.s_store_sk INNER JOIN customer_demographics_cte cd ON ss.ss_cdemo_sk = cd.cd_demo_sk",
+        "interfaces": {"outputs": ["ss_item_sk", "ss_quantity", "ss_list_price", "ss_coupon_amt", "ss_sales_price", "s_state"], "consumes": ["date_cte", "store_cte", "customer_demographics_cte"]}
+      },
+      "join_all": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT it.i_item_id, ff.s_state, ff.ss_quantity, ff.ss_list_price, ff.ss_coupon_amt, ff.ss_sales_price FROM fact_filtered ff INNER JOIN item_cte it ON ff.ss_item_sk = it.i_item_sk",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "ss_quantity", "ss_list_price", "ss_coupon_amt", "ss_sales_price"], "consumes": ["fact_filtered", "item_cte"]}
+      },
+      "aggregate_rollup": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_id, s_state, GROUPING(s_state) AS g_state, AVG(ss_quantity) AS agg1, AVG(ss_list_price) AS agg2, AVG(ss_coupon_amt) AS agg3, AVG(ss_sales_price) AS agg4 FROM join_all GROUP BY ROLLUP (i_item_id, s_state)",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"], "consumes": ["join_all"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_id, s_state, g_state, agg1, agg2, agg3, agg4 FROM aggregate_rollup ORDER BY i_item_id, s_state LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"], "consumes": ["aggregate_rollup"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "store_cte", "customer_demographics_cte", "item_cte", "fact_filtered", "join_all", "aggregate_rollup", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), store_cte AS ({store_cte}), customer_demographics_cte AS ({customer_demographics_cte}), item_cte AS ({item_cte}), fact_filtered AS ({fact_filtered}), join_all AS ({join_all}), aggregate_rollup AS ({aggregate_rollup}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Applied multi-dimension prefetch pattern by creating separate CTEs for all filtered dimensions (date_dim, store, customer_demographics) before joining with the fact table, then staged the remaining unfiltered dimension (item) in a separate CTE for clean join pipeline. This leverages combined selectivity of three independent dimension filters to reduce fact table scan early.
+
+**Expected speedup**: 2-3× (fact table scan reduced from ~5.5M rows to ~53K via early hash joins with small dimension CTEs)

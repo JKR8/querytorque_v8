@@ -1,0 +1,115 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] frequent_ss_items  [~]  Cost: 12%  Rows: 4,202  — Only output item_sk (removed itemdesc, solddate, cnt)
+│   ├── SCAN (store_sales, date_dim (join), item (join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── JOIN (ss_item_sk = i_item_sk)
+│   ├── FILTER (d_year IN (2000, 2001, 2002, 2003))
+│   ├── AGG (GROUP BY SUBSTR(i_item_desc,1,30), i_item_sk, d_date)
+│   └── OUTPUT (item_sk)
+├── [CTE] max_store_sales  [=]  Cost: 8%  Rows: 1  — Unchanged
+├── [CTE] best_ss_customer_keys  [~]  Cost: 35%  Rows: 171  — Output only c_customer_sk (removed ssales)
+│   ├── SCAN (store_sales, customer (join), max_store_sales (correlated subquery))
+│   ├── JOIN (ss_customer_sk = c_customer_sk)
+│   ├── AGG (GROUP BY c_customer_sk)
+│   └── OUTPUT (c_customer_sk)
+├── [CTE] catalog_sales_agg  [+]  Cost: 10%  Rows: ≤5  — New CTE aggregating catalog sales by customer
+│   ├── SCAN (catalog_sales, date_dim (join))
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_year = 2000 AND d_moy = 5)
+│   ├── SEMI JOIN (cs_item_sk IN frequent_ss_items)
+│   ├── SEMI JOIN (cs_bill_customer_sk IN best_ss_customer_keys)
+│   ├── AGG (GROUP BY cs_bill_customer_sk)
+│   └── OUTPUT (cs_bill_customer_sk, sales)
+├── [CTE] web_sales_agg  [+]  Cost: 5%  Rows: ≤2  — New CTE aggregating web sales by customer
+│   ├── SCAN (web_sales, date_dim (join))
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_year = 2000 AND d_moy = 5)
+│   ├── SEMI JOIN (ws_item_sk IN frequent_ss_items)
+│   ├── SEMI JOIN (ws_bill_customer_sk IN best_ss_customer_keys)
+│   ├── AGG (GROUP BY ws_bill_customer_sk)
+│   └── OUTPUT (ws_bill_customer_sk, sales)
+├── [CTE] combined_aggs  [+]  Cost: 15%  Rows: ≤7  — New CTE combining and summing channel sales
+│   ├── SCAN (catalog_sales_agg, web_sales_agg)
+│   ├── UNION ALL (customer_sk, sales)
+│   ├── AGG (GROUP BY customer_sk)
+│   └── OUTPUT (customer_sk, total_sales)
+└── [MAIN] final_customer_join  [~]  Cost: 15%  Rows: ≤100  — Final customer join with ordering/limit
+    ├── SCAN (combined_aggs, customer (join))
+    ├── JOIN (customer_sk = c_customer_sk)
+    ├── SORT (c_last_name ASC, c_first_name ASC, total_sales ASC)
+    └── OUTPUT (c_last_name, c_first_name, sales)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "shared_dimension_extraction", "description": "Extracted frequent_ss_items and best_ss_customer_keys as shared dimension filters for both catalog and web channels", "applied_to": ["frequent_ss_items", "best_ss_customer_keys"]},
+    {"id": "R2", "type": "deferred_aggregation", "description": "Delayed customer table join until after channel aggregation and combination", "applied_to": ["catalog_sales_agg", "web_sales_agg", "combined_aggs", "final_customer_join"]},
+    {"id": "R3", "type": "channel_aggregation_isolation", "description": "Separated catalog and web sales aggregation into dedicated CTEs before combining", "applied_to": ["catalog_sales_agg", "web_sales_agg"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "frequent_ss_items": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk AS item_sk FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk JOIN item ON ss_item_sk = i_item_sk WHERE d_year IN (2000, 2001, 2002, 2003) GROUP BY SUBSTR(i_item_desc,1,30), i_item_sk, d_date HAVING COUNT(*) > 4",
+        "interfaces": {"outputs": ["item_sk"], "consumes": []}
+      },
+      "max_store_sales": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["tpcds_cmax"], "consumes": []}
+      },
+      "best_ss_customer_keys": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_sk FROM store_sales JOIN customer ON ss_customer_sk = c_customer_sk GROUP BY c_customer_sk HAVING SUM(ss_quantity * ss_sales_price) > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales)",
+        "interfaces": {"outputs": ["c_customer_sk"], "consumes": ["max_store_sales"]}
+      },
+      "catalog_sales_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cs_bill_customer_sk, SUM(cs_quantity * cs_list_price) AS sales FROM catalog_sales JOIN date_dim ON cs_sold_date_sk = d_date_sk WHERE d_year = 2000 AND d_moy = 5 AND cs_item_sk IN (SELECT item_sk FROM frequent_ss_items) AND cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer_keys) GROUP BY cs_bill_customer_sk",
+        "interfaces": {"outputs": ["cs_bill_customer_sk", "sales"], "consumes": ["frequent_ss_items", "best_ss_customer_keys"]}
+      },
+      "web_sales_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_bill_customer_sk, SUM(ws_quantity * ws_list_price) AS sales FROM web_sales JOIN date_dim ON ws_sold_date_sk = d_date_sk WHERE d_year = 2000 AND d_moy = 5 AND ws_item_sk IN (SELECT item_sk FROM frequent_ss_items) AND ws_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer_keys) GROUP BY ws_bill_customer_sk",
+        "interfaces": {"outputs": ["ws_bill_customer_sk", "sales"], "consumes": ["frequent_ss_items", "best_ss_customer_keys"]}
+      },
+      "combined_aggs": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT customer_sk, SUM(sales) AS total_sales FROM (SELECT cs_bill_customer_sk AS customer_sk, sales FROM catalog_sales_agg UNION ALL SELECT ws_bill_customer_sk AS customer_sk, sales FROM web_sales_agg) t GROUP BY customer_sk",
+        "interfaces": {"outputs": ["customer_sk", "total_sales"], "consumes": ["catalog_sales_agg", "web_sales_agg"]}
+      },
+      "final_customer_join": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, total_sales AS sales FROM combined_aggs JOIN customer ON customer_sk = c_customer_sk ORDER BY c_last_name, c_first_name, total_sales LIMIT 100",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "sales"], "consumes": ["combined_aggs"]}
+      }
+    },
+    "reconstruction_order": ["frequent_ss_items", "max_store_sales", "best_ss_customer_keys", "catalog_sales_agg", "web_sales_agg", "combined_aggs", "final_customer_join"],
+    "assembly_template": "WITH frequent_ss_items AS ({frequent_ss_items}), max_store_sales AS ({max_store_sales}), best_ss_customer_keys AS ({best_ss_customer_keys}), catalog_sales_agg AS ({catalog_sales_agg}), web_sales_agg AS ({web_sales_agg}), combined_aggs AS ({combined_aggs}) {final_customer_join}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured into target logical tree: (1) extracted shared dimension filters (frequent_ss_items, best_ss_customer_keys) used by both catalog and web channels, (2) isolated channel aggregation into separate CTEs before combining, (3) deferred customer table join until after cross-channel aggregation. This eliminates redundant scans of store_sales and pushes filters earlier.
+
+**Expected speedup**: 1.8-2.2x due to reduced redundant store_sales scans, earlier filtering via dimension CTEs, and optimized join order (customer table joined last).

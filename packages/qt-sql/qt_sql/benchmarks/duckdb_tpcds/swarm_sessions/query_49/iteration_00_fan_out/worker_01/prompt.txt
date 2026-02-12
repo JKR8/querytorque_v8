@@ -1,0 +1,514 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Across web, catalog, and store channels for Dec-1999, rank items by return-quantity ratio and return-currency ratio, returning top-10 by either ranking per channel. LEFT JOIN with returns tables preserves items with no returns (COALESCE to 0), but wr_return_amt>10000 filter NULL-rejects returns rows, effectively making it an inner join for matching rows while keeping items without returns (which get 0 in aggregates). Aggregates use COALESCE to 0, making them duplicate-insensitive. Window rankings are computed per-channel after aggregation. The final filter (return_rank≤10 OR currency_rank≤10) must be applied per channel before UNION.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+filtered_dates -> web_channel -> catalog_channel -> store_channel -> union_all -> filter_ranks -> order_limit
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy = 12
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: web_channel, catalog_channel, store_channel
+  web_channel:
+    FROM: web_sales ws LEFT OUTER JOIN web_returns wr ON (ws.ws_order_number = wr.wr_order_number AND ws.ws_item_sk = wr.wr_item_sk), filtered_dates fd
+    JOIN: ws.ws_sold_date_sk = fd.d_date_sk
+    WHERE: wr.wr_return_amt > 10000 AND ws.ws_net_profit > 1 AND ws.ws_net_paid > 0 AND ws.ws_quantity > 0
+    GROUP BY: ws.ws_item_sk
+    AGGREGATE: SUM(COALESCE(wr.wr_return_quantity,0)) as sum_return_qty, SUM(COALESCE(ws.ws_quantity,0)) as sum_ws_qty, SUM(COALESCE(wr.wr_return_amt,0)) as sum_return_amt, SUM(COALESCE(ws.ws_net_paid,0)) as sum_net_paid
+    OUTPUT: ws.ws_item_sk as item, sum_return_qty, sum_ws_qty, sum_return_amt, sum_net_paid
+    EXPECTED_ROWS: 150
+    CONSUMERS: web_ranked
+  web_ranked:
+    FROM: web_channel
+    COMPUTE: cast(sum_return_qty as decimal(15,4))/cast(sum_ws_qty as decimal(15,4)) as return_ratio, cast(sum_return_amt as decimal(15,4))/cast(sum_net_paid as decimal(15,4)) as currency_ratio
+    WINDOW: RANK() OVER (ORDER BY return_ratio) as return_rank, RANK() OVER (ORDER BY currency_ratio) as currency_rank
+    OUTPUT: item, return_ratio, currency_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 150
+    CONSUMERS: union_all
+  catalog_channel: (similar to web with cs/cr tables)
+  store_channel: (similar to web with sts/sr tables)
+  union_all:
+    FROM: web_ranked UNION ALL catalog_ranked UNION ALL store_ranked with channel labels
+    OUTPUT: channel, item, return_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 41
+    CONSUMERS: filter_ranks
+  filter_ranks:
+    FROM: union_all
+    WHERE: return_rank <= 10 OR currency_rank <= 10
+    OUTPUT: channel, item, return_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 41
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: filter_ranks
+    ORDER BY: channel ASC, return_rank ASC, currency_rank ASC, item ASC
+    LIMIT: 100
+    OUTPUT: channel, item, return_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 41
+    CONSUMERS: final output
+
+NODE_CONTRACTS:
+filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy = 12
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: web_channel, catalog_channel, store_channel
+  web_channel:
+    FROM: web_sales ws LEFT OUTER JOIN web_returns wr ON (ws.ws_order_number = wr.wr_order_number AND ws.ws_item_sk = wr.wr_item_sk), filtered_dates fd
+    JOIN: ws.ws_sold_date_sk = fd.d_date_sk
+    WHERE: wr.wr_return_amt > 10000 AND ws.ws_net_profit > 1 AND ws.ws_net_paid > 0 AND ws.ws_quantity > 0
+    GROUP BY: ws.ws_item_sk
+    AGGREGATE: SUM(COALESCE(wr.wr_return_quantity,0)) as sum_return_qty, SUM(COALESCE(ws.ws_quantity,0)) as sum_ws_qty, SUM(COALESCE(wr.wr_return_amt,0)) as sum_return_amt, SUM(COALESCE(ws.ws_net_paid,0)) as sum_net_paid
+    OUTPUT: ws.ws_item_sk as item, sum_return_qty, sum_ws_qty, sum_return_amt, sum_net_paid
+    EXPECTED_ROWS: 150
+    CONSUMERS: web_ranked
+  web_ranked:
+    FROM: web_channel
+    COMPUTE: cast(sum_return_qty as decimal(15,4))/cast(sum_ws_qty as decimal(15,4)) as return_ratio, cast(sum_return_amt as decimal(15,4))/cast(sum_net_paid as decimal(15,4)) as currency_ratio
+    WINDOW: RANK() OVER (ORDER BY return_ratio) as return_rank, RANK() OVER (ORDER BY currency_ratio) as currency_rank
+    OUTPUT: item, return_ratio, currency_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 150
+    CONSUMERS: union_all
+  catalog_channel: (similar to web with cs/cr tables)
+  store_channel: (similar to web with sts/sr tables)
+  union_all:
+    FROM: web_ranked UNION ALL catalog_ranked UNION ALL store_ranked with channel labels
+    OUTPUT: channel, item, return_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 41
+    CONSUMERS: filter_ranks
+  filter_ranks:
+    FROM: union_all
+    WHERE: return_rank <= 10 OR currency_rank <= 10
+    OUTPUT: channel, item, return_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 41
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: filter_ranks
+    ORDER BY: channel ASC, return_rank ASC, currency_rank ASC, item ASC
+    LIMIT: 100
+    OUTPUT: channel, item, return_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 41
+    CONSUMERS: final output
+
+## Hazard Flags (avoid these specific risks)
+
+- Must ensure COALESCE handles NULLs correctly after converting LEFT JOIN to use filtered_dates CTE.
+- filtered_dates CTE output only d_date_sk; ensure no other date columns needed downstream.
+
+## Regression Warnings (observed failures on similar queries)
+
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline <100ms, CTE overhead dominated savings.
+   RULE: This query baseline is 2719ms >> 100ms, so CTE overhead acceptable.
+2. or_to_union (0.59x on Q90):
+   CAUSE: Split same-column OR into UNION branches, duplicating fact scans.
+   RULE: Do NOT split return_rank≤10 OR currency_rank≤10 into UNION - same derived columns.
+3. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join multiple dimension CTEs; join fact to each dimension independently.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output channel, item, return_ratio, return_rank, currency_rank in same order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (item_sk, date_sk, return columns, etc.).
+- LITERAL_PRESERVATION: Must preserve d_year=1999, d_moy=12, amount thresholds >10000, net_profit>1, net_paid>0, quantity>0.
+- SEMANTIC_EQUIVALENCE: Must return same rows and ordering (ORDER BY 1,4,5,2).
+- CROSS_CTE_PREDICATE_BLINDNESS: date_dim scanned 3 times independently (EXPLAIN shows 3 SEQ_SCAN date_dim nodes).
+- REDUNDANT_SCAN_ELIMINATION: date_dim scanned 3 times for same filter (d_year=1999, d_moy=12).
+- SHARED_DIMENSION_MULTI_CHANNEL: All 3 channel branches share identical date_dim filter.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- date_cte_isolate: Apply exact pattern - create filtered_dates CTE with d_date_sk only, join in each channel. Ignore the scalar subquery aspect (original doesn't have scalar subquery).
+- early_filter: Apply principle of filtering date_dim first, then join to fact tables. Ignore the multi-table join ordering (only date_dim here).
+- dimension_cte_isolate: Apply pattern of isolating dimension filter into CTE. Ignore the multiple dimension tables (only date_dim here).
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. date_cte_isolate (4.00x)
+
+**Principle:** Dimension Isolation: extract small dimension lookups into CTEs so they materialize once and subsequent joins probe a tiny hash table instead of rescanning.
+
+**BEFORE (slow):**
+```sql
+select a.ca_state state, count(*) cnt
+ from customer_address a
+     ,customer c
+     ,store_sales s
+     ,date_dim d
+     ,item i
+ where       a.ca_address_sk = c.c_current_addr_sk
+ 	and c.c_customer_sk = s.ss_customer_sk
+ 	and s.ss_sold_date_sk = d.d_date_sk
+ 	and s.ss_item_sk = i.i_item_sk
+ 	and d.d_month_seq = 
+ 	     (select distinct (d_month_seq)
+ 	      from date_dim
+               where d_year = 2002
+ 	        and d_moy = 3 )
+ 	and i.i_current_price > 1.2 * 
+             (select avg(j.i_current_price) 
+ 	     from item j 
+ 	     where j.i_category = i.i_category)
+ group by a.ca_state
+ having count(*) >= 10
+ order by cnt, a.ca_state
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[target_month]:
+```sql
+SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1
+```
+[category_avg_price]:
+```sql
+SELECT i_category, AVG(i_current_price) * 1.2 AS avg_threshold FROM item GROUP BY i_category
+```
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim JOIN target_month ON d_month_seq = target_month.d_month_seq
+```
+[filtered_sales]:
+```sql
+SELECT ss_customer_sk, ss_item_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+```
+[main_query]:
+```sql
+SELECT a.ca_state AS state, COUNT(*) AS cnt FROM customer_address a JOIN customer c ON a.ca_address_sk = c.c_current_addr_sk JOIN filtered_sales s ON c.c_customer_sk = s.ss_customer_sk JOIN item i ON s.ss_item_sk = i.i_item_sk JOIN category_avg_price cap ON i.i_category = cap.i_category WHERE i.i_current_price > cap.avg_threshold GROUP BY a.ca_state HAVING COUNT(*) >= 10 ORDER BY cnt, a.ca_state LIMIT 100
+```
+
+### 2. early_filter (4.00x)
+
+**Principle:** Early Selection: filter small dimension tables first, then join to large fact tables. This reduces the fact table scan to only rows matching the filter, rather than scanning all rows and filtering after the join.
+
+**BEFORE (slow):**
+```sql
+select ss_customer_sk
+            ,sum(act_sales) sumsales
+      from (select ss_item_sk
+                  ,ss_ticket_number
+                  ,ss_customer_sk
+                  ,case when sr_return_quantity is not null then (ss_quantity-sr_return_quantity)*ss_sales_price
+                                                            else (ss_quantity*ss_sales_price) end act_sales
+            from store_sales left outer join store_returns on (sr_item_sk = ss_item_sk
+                                                               and sr_ticket_number = ss_ticket_number)
+                ,reason
+            where sr_reason_sk = r_reason_sk
+              and r_reason_desc = 'duplicate purchase') t
+      group by ss_customer_sk
+      order by sumsales, ss_customer_sk
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_reason]:
+```sql
+SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'
+```
+[filtered_returns]:
+```sql
+SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+```
+[main_query]:
+```sql
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
+```
+
+### 3. dimension_cte_isolate (1.93x)
+
+**Principle:** Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
+
+**BEFORE (slow):**
+```sql
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year = 2000
+```
+[filtered_customer_demographics]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'
+```
+[filtered_promotions]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+```
+[joined_facts]:
+```sql
+SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales AS cs JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk
+```
+[main_query]:
+```sql
+SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM joined_facts AS jf JOIN item AS i ON jf.cs_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
+```
+
+## Original SQL
+
+```sql
+-- start query 49 in stream 0 using template query49.tpl
+select channel, item, return_ratio, return_rank, currency_rank from
+ (select
+ 'web' as channel
+ ,web.item
+ ,web.return_ratio
+ ,web.return_rank
+ ,web.currency_rank
+ from (
+ 	select 
+ 	 item
+ 	,return_ratio
+ 	,currency_ratio
+ 	,rank() over (order by return_ratio) as return_rank
+ 	,rank() over (order by currency_ratio) as currency_rank
+ 	from
+ 	(	select ws.ws_item_sk as item
+ 		,(cast(sum(coalesce(wr.wr_return_quantity,0)) as decimal(15,4))/
+ 		cast(sum(coalesce(ws.ws_quantity,0)) as decimal(15,4) )) as return_ratio
+ 		,(cast(sum(coalesce(wr.wr_return_amt,0)) as decimal(15,4))/
+ 		cast(sum(coalesce(ws.ws_net_paid,0)) as decimal(15,4) )) as currency_ratio
+ 		from 
+ 		 web_sales ws left outer join web_returns wr 
+ 			on (ws.ws_order_number = wr.wr_order_number and 
+ 			ws.ws_item_sk = wr.wr_item_sk)
+                 ,date_dim
+ 		where 
+ 			wr.wr_return_amt > 10000 
+ 			and ws.ws_net_profit > 1
+                         and ws.ws_net_paid > 0
+                         and ws.ws_quantity > 0
+                         and ws_sold_date_sk = d_date_sk
+                         and d_year = 1999
+                         and d_moy = 12
+ 		group by ws.ws_item_sk
+ 	) in_web
+ ) web
+ where 
+ (
+ web.return_rank <= 10
+ or
+ web.currency_rank <= 10
+ )
+ union
+ select 
+ 'catalog' as channel
+ ,catalog.item
+ ,catalog.return_ratio
+ ,catalog.return_rank
+ ,catalog.currency_rank
+ from (
+ 	select 
+ 	 item
+ 	,return_ratio
+ 	,currency_ratio
+ 	,rank() over (order by return_ratio) as return_rank
+ 	,rank() over (order by currency_ratio) as currency_rank
+ 	from
+ 	(	select 
+ 		cs.cs_item_sk as item
+ 		,(cast(sum(coalesce(cr.cr_return_quantity,0)) as decimal(15,4))/
+ 		cast(sum(coalesce(cs.cs_quantity,0)) as decimal(15,4) )) as return_ratio
+ 		,(cast(sum(coalesce(cr.cr_return_amount,0)) as decimal(15,4))/
+ 		cast(sum(coalesce(cs.cs_net_paid,0)) as decimal(15,4) )) as currency_ratio
+ 		from 
+ 		catalog_sales cs left outer join catalog_returns cr
+ 			on (cs.cs_order_number = cr.cr_order_number and 
+ 			cs.cs_item_sk = cr.cr_item_sk)
+                ,date_dim
+ 		where 
+ 			cr.cr_return_amount > 10000 
+ 			and cs.cs_net_profit > 1
+                         and cs.cs_net_paid > 0
+                         and cs.cs_quantity > 0
+                         and cs_sold_date_sk = d_date_sk
+                         and d_year = 1999
+                         and d_moy = 12
+                 group by cs.cs_item_sk
+ 	) in_cat
+ ) catalog
+ where 
+ (
+ catalog.return_rank <= 10
+ or
+ catalog.currency_rank <=10
+ )
+ union
+ select 
+ 'store' as channel
+ ,store.item
+ ,store.return_ratio
+ ,store.return_rank
+ ,store.currency_rank
+ from (
+ 	select 
+ 	 item
+ 	,return_ratio
+ 	,currency_ratio
+ 	,rank() over (order by return_ratio) as return_rank
+ 	,rank() over (order by currency_ratio) as currency_rank
+ 	from
+ 	(	select sts.ss_item_sk as item
+ 		,(cast(sum(coalesce(sr.sr_return_quantity,0)) as decimal(15,4))/cast(sum(coalesce(sts.ss_quantity,0)) as decimal(15,4) )) as return_ratio
+ 		,(cast(sum(coalesce(sr.sr_return_amt,0)) as decimal(15,4))/cast(sum(coalesce(sts.ss_net_paid,0)) as decimal(15,4) )) as currency_ratio
+ 		from 
+ 		store_sales sts left outer join store_returns sr
+ 			on (sts.ss_ticket_number = sr.sr_ticket_number and sts.ss_item_sk = sr.sr_item_sk)
+                ,date_dim
+ 		where 
+ 			sr.sr_return_amt > 10000 
+ 			and sts.ss_net_profit > 1
+                         and sts.ss_net_paid > 0 
+                         and sts.ss_quantity > 0
+                         and ss_sold_date_sk = d_date_sk
+                         and d_year = 1999
+                         and d_moy = 12
+ 		group by sts.ss_item_sk
+ 	) in_store
+ ) store
+ where  (
+ store.return_rank <= 10
+ or 
+ store.currency_rank <= 10
+ )
+ )
+ order by 1,4,5,2
+ LIMIT 100;
+
+-- end query 49 in stream 0 using template query49.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `channel`
+  2. `item`
+  3. `return_ratio`
+  4. `return_rank`
+  5. `currency_rank`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K  — For each channel, left-join sales to returns, compute item-level quantity and value return ratios under profitability/volume constraints, rank items by both ratios, keep top-10 by either metric, and union channel outputs.
+    ├── SCAN (store_sales AS sts (join), store_returns AS sr (join), date_dim, web_sales AS ws (join), web_returns AS wr (join), catalog_sales AS cs (join), catalog_returns AS cr (join))
+    ├── FILTER ((store.return_rank <= 10 OR store.currency_rank <= 10))
+    ├── AGG (GROUP BY)
+    ├── SORT (1 ASC, 4 ASC, 5 ASC, 2 ASC)
+    └── OUTPUT (channel, item, return_ratio, return_rank, currency_rank)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

@@ -1,0 +1,290 @@
+<reasoning>
+**CLASSIFY**: This is a star-join query with a disjunctive (OR) filter spanning dimension (customer_address) and fact (catalog_sales) tables, followed by aggregation and top-N. The OR condition prevents predicate pushdown, causing a full scan of catalog_sales (409K rows) before filtering.
+
+**EXPLAIN PLAN ANALYSIS**:
+- Total time: 99ms (borderline for CTE overhead risk).
+- Largest exclusive costs: 
+  - SEQ_SCAN catalog_sales (16.8ms, 17%) - scans 409K of 172.8M rows (0.23%).
+  - HASH_JOIN customer–customer_address (32.7ms, 33%) - full scans of both dimensions.
+  - FILTER on OR condition (7.4ms, 8%) applied after joins.
+- Row count drops sharply:
+  - date_dim: 73K → 91 rows (99.9% reduction).
+  - After date join: 409K → 33K rows (92% reduction).
+  - After OR filter: 33K → ? (final 520 groups).
+- The optimizer already pushes date filters into the scan (91 rows) but cannot push the OR condition because it spans tables.
+- Scans per base table: each table scanned once. However, the OR condition forces scanning entire customer_address (250K rows) and customer (500K rows) without pre-filtering.
+- No CTEs in original query.
+
+**GAP MATCHING**:
+1. **CROSS_COLUMN_OR_DECOMPOSITION**: Present. OR on ca_zip (customer_address), ca_state (customer_address), and cs_sales_price (catalog_sales). Matches "or_to_union" example (Q15, 3.17x).
+2. **CROSS_CTE_PREDICATE_BLINDNESS**: Present. The OR condition isn't pushed into dimension scans. "date_cte_isolate" already done by optimizer (date filter pushed). "dimension_cte_isolate" could pre-filter customer_address for zip/state conditions.
+3. **REDUNDANT_SCAN_ELIMINATION**: Not applicable (single fact scan).
+4. **CORRELATED_SUBQUERY_PARALYSIS**: Not present.
+
+**AGGREGATION TRAP CHECK**: Only SUM(cs_sales_price). No sensitive aggregates (STDDEV_SAMP, etc.). Duplicates from UNION must be handled to preserve OR semantics.
+
+**TRANSFORM SELECTION** (ranked by expected value):
+1. **or_to_union** (3.17x evidence) – Split OR into 3 branches (zip, state, price). High impact because each branch can push a focused predicate.
+2. **dimension_cte_isolate** (1.93x) – Pre-filter customer_address for zip/state, then join to fact. Reduces dimension scan from 250K to selective set.
+3. **prefetch_fact_join** (3.77x) – Chain: filtered date → filtered address → fact pre-join. Reduces fact probe size.
+4. **EXPLORATION: customer_key_bitmap** – Pre-compute distinct customer keys satisfying each OR branch via CTEs, then semi-join to fact. Novel combination.
+
+**LOGICAL TREE DESIGN**:
+- Worker 1: Three UNION branches, each with full joins but focused WHERE.
+- Worker 2: Two branches: (a) address pre-filtered, (b) sales_price condition; UNION.
+- Worker 3: CTE chain: filtered_date, filtered_address, prejoined_fact.
+- Worker 4: CTEs for address_customers and price_customers, then main join with IN (OR→IN rewrite).
+
+**COLUMN COMPLETENESS**: Must include cs_sales_price, ca_zip, and all join keys in CTEs.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Sum Q1 2001 catalog sales by billing ZIP for customers selected by either a target ZIP list, a target state list, or high transaction amount (>500). Joins are INNER (all sides must match). Aggregation uses SUM, which is duplicate-sensitive – if a sale satisfies multiple OR conditions, it must be counted once. The OR filter depends on columns from two tables (customer_address, catalog_sales), preventing independent predicate pushdown.
+
+BOTTLENECK_DIAGNOSIS: The query is join-bound and filter-bound. The largest costs are the HASH_JOIN between customer and customer_address (32.7ms, 33%) and the catalog_sales scan (16.8ms, 17%). The OR filter (7.4ms) is applied after joining 409K catalog_sales rows with 250K customer_address rows, forcing full dimension scans. Cardinality flow: date_dim (91 rows) reduces catalog_sales to 33K rows, but the OR filter must still process 33K joined rows. The optimizer already handles date predicate pushdown well (91-row scan). Logical-tree costs are misleading – the customer-address join is 33% exclusive time but likely blocks earlier filtering.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output ca_zip and sum(cs_sales_price) exactly.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include cs_sales_price, ca_zip, and join keys (cs_bill_customer_sk, c_current_addr_sk, etc.).
+- LITERAL_PRESERVATION: Must preserve all literal values: ZIP list, states ('CA','WA','GA'), sales_price > 500, d_qoy=1, d_year=2001.
+- SEMANTIC_EQUIVALENCE: Must return same rows, same ordering (ca_zip ASC), same limit 100.
+- CROSS_COLUMN_OR_DECOMPOSITION: OR spans ca_zip, ca_state, cs_sales_price – prevents optimal scan paths.
+- CROSS_CTE_PREDICATE_BLINDNESS: OR condition not pushed into dimension scans.
+
+REGRESSION_WARNINGS:
+1. Baseline <100ms (regression_q25_pushdown):
+   CAUSE: CTE materialization overhead dominates on fast queries.
+   RULE: Minimize CTE count and ensure each CTE has high selectivity.
+2. OR-to-UNION same-column split (regression_q90):
+   CAUSE: Splitting same-column OR (t_hour >=8 OR t_hour <=17) duplicated fact scans.
+   RULE: This query has OR on different columns (zip, state, price) – safe to split.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: or_to_union
+TARGET_LOGICAL_TREE:
+  union_branch_zip -> union_branch_state -> union_branch_price -> union_all -> aggregate -> top_n
+NODE_CONTRACTS:
+  union_branch_zip:
+    FROM: catalog_sales, customer, customer_address, date_dim
+    JOIN: cs_bill_customer_sk = c_customer_sk AND c_current_addr_sk = ca_address_sk AND cs_sold_date_sk = d_date_sk
+    WHERE: substr(ca_zip,1,5) IN ('85669','86197','88274','83405','86475','85392','85460','80348','81792') AND d_qoy = 1 AND d_year = 2001
+    OUTPUT: cs_sales_price, ca_zip
+    EXPECTED_ROWS: ~10K (estimate)
+    CONSUMERS: union_all
+  union_branch_state:
+    FROM: catalog_sales, customer, customer_address, date_dim
+    JOIN: cs_bill_customer_sk = c_customer_sk AND c_current_addr_sk = ca_address_sk AND cs_sold_date_sk = d_date_sk
+    WHERE: ca_state IN ('CA','WA','GA') AND d_qoy = 1 AND d_year = 2001
+    OUTPUT: cs_sales_price, ca_zip
+    EXPECTED_ROWS: ~15K (estimate)
+    CONSUMERS: union_all
+  union_branch_price:
+    FROM: catalog_sales, customer, customer_address, date_dim
+    JOIN: cs_bill_customer_sk = c_customer_sk AND c_current_addr_sk = ca_address_sk AND cs_sold_date_sk = d_date_sk
+    WHERE: cs_sales_price > 500 AND d_qoy = 1 AND d_year = 2001
+    OUTPUT: cs_sales_price, ca_zip
+    EXPECTED_ROWS: ~8K (estimate)
+    CONSUMERS: union_all
+  union_all:
+    FROM: union_branch_zip UNION union_branch_state UNION union_branch_price
+    OUTPUT: cs_sales_price, ca_zip
+    EXPECTED_ROWS: ~33K (sum minus duplicates)
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: union_all
+    GROUP BY: ca_zip
+    AGGREGATE: sum(cs_sales_price)
+    OUTPUT: ca_zip, sum_cs_sales_price
+    EXPECTED_ROWS: 520
+    CONSUMERS: top_n
+  top_n:
+    FROM: aggregate
+    ORDER BY: ca_zip ASC
+    LIMIT: 100
+    OUTPUT: ca_zip, sum_cs_sales_price
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: or_to_union
+EXAMPLE_ADAPTATION:
+  Apply the three-branch UNION ALL pattern from Q15; ignore that Q15 used UNION (not UNION ALL) – we must handle duplicates via UNION or explicit deduplication.
+HAZARD_FLAGS:
+  - UNION may remove duplicates but adds sorting cost. Consider UNION ALL if duplicates are negligible.
+  - Each branch rescans fact table – ensure selectivity is high enough to offset overhead.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+  filtered_address -> branch_address -> branch_price -> union_all -> aggregate -> top_n
+NODE_CONTRACTS:
+  filtered_address:
+    FROM: customer_address
+    WHERE: substr(ca_zip,1,5) IN ('85669','86197','88274','83405','86475','85392','85460','80348','81792') OR ca_state IN ('CA','WA','GA')
+    OUTPUT: ca_address_sk, ca_zip
+    EXPECTED_ROWS: ~? (selective set)
+    CONSUMERS: branch_address
+  branch_address:
+    FROM: catalog_sales, customer, filtered_address, date_dim
+    JOIN: cs_bill_customer_sk = c_customer_sk AND c_current_addr_sk = ca_address_sk AND cs_sold_date_sk = d_date_sk
+    WHERE: d_qoy = 1 AND d_year = 2001
+    OUTPUT: cs_sales_price, ca_zip
+    EXPECTED_ROWS: ~? (reduced by address filter)
+    CONSUMERS: union_all
+  branch_price:
+    FROM: catalog_sales, customer, customer_address, date_dim
+    JOIN: cs_bill_customer_sk = c_customer_sk AND c_current_addr_sk = ca_address_sk AND cs_sold_date_sk = d_date_sk
+    WHERE: cs_sales_price > 500 AND d_qoy = 1 AND d_year = 2001
+    OUTPUT: cs_sales_price, ca_zip
+    EXPECTED_ROWS: ~8K
+    CONSUMERS: union_all
+  union_all:
+    FROM: branch_address UNION branch_price
+    OUTPUT: cs_sales_price, ca_zip
+    EXPECTED_ROWS: ~33K (sum minus duplicates)
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: union_all
+    GROUP BY: ca_zip
+    AGGREGATE: sum(cs_sales_price)
+    OUTPUT: ca_zip, sum_cs_sales_price
+    EXPECTED_ROWS: 520
+    CONSUMERS: top_n
+  top_n:
+    FROM: aggregate
+    ORDER BY: ca_zip ASC
+    LIMIT: 100
+    OUTPUT: ca_zip, sum_cs_sales_price
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+  Apply pre-filtering of customer_address from dimension_cte_isolate; apply early dimension filtering from early_filter. Ignore the multi-dimension prefetch aspect – we only pre-filter address.
+HAZARD_FLAGS:
+  - Must ensure filtered_address includes ca_zip for output.
+  - Union must handle duplicates (address and price branches may overlap).
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_address -> prejoined_fact -> remaining_joins -> aggregate -> top_n
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_qoy = 1 AND d_year = 2001
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: prejoined_fact
+  filtered_address:
+    FROM: customer_address
+    WHERE: substr(ca_zip,1,5) IN ('85669','86197','88274','83405','86475','85392','85460','80348','81792') OR ca_state IN ('CA','WA','GA')
+    OUTPUT: ca_address_sk, ca_zip
+    EXPECTED_ROWS: ~? (selective)
+    CONSUMERS: prejoined_fact
+  prejoined_fact:
+    FROM: catalog_sales
+    JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    JOIN customer ON cs_bill_customer_sk = c_customer_sk
+    JOIN filtered_address ON c_current_addr_sk = ca_address_sk
+    WHERE: (no additional filter – address condition already in filtered_address)
+    OUTPUT: cs_sales_price, ca_zip
+    EXPECTED_ROWS: ~? (reduced by date and address)
+    CONSUMERS: union_all (with price branch)
+  branch_price:
+    FROM: catalog_sales, customer, customer_address, filtered_date
+    JOIN: cs_bill_customer_sk = c_customer_sk AND c_current_addr_sk = ca_address_sk AND cs_sold_date_sk = d_date_sk
+    WHERE: cs_sales_price > 500
+    OUTPUT: cs_sales_price, ca_zip
+    EXPECTED_ROWS: ~8K
+    CONSUMERS: union_all
+  union_all:
+    FROM: prejoined_fact UNION branch_price
+    OUTPUT: cs_sales_price, ca_zip
+    EXPECTED_ROWS: ~33K
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: union_all
+    GROUP BY: ca_zip
+    AGGREGATE: sum(cs_sales_price)
+    OUTPUT: ca_zip, sum_cs_sales_price
+    EXPECTED_ROWS: 520
+    CONSUMERS: top_n
+  top_n:
+    FROM: aggregate
+    ORDER BY: ca_zip ASC
+    LIMIT: 100
+    OUTPUT: ca_zip, sum_cs_sales_price
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: prefetch_fact_join, date_cte_isolate
+EXAMPLE_ADAPTATION:
+  Apply the CTE chain from prefetch_fact_join (filtered_date → pre-join with fact). Apply date_cte_isolate for the date filter. Ignore the multi-dimension prefetch – we only pre-filter address.
+HAZARD_FLAGS:
+  - filtered_address may still be large; ensure selectivity.
+  - Union duplicates must be handled.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: customer_key_bitmap
+TARGET_LOGICAL_TREE:
+  filtered_date -> address_customers -> price_customers -> eligible_customers -> main_join -> aggregate -> top_n
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_qoy = 1 AND d_year = 2001
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: price_customers, main_join
+  address_customers:
+    FROM: customer_address
+    JOIN customer ON ca_address_sk = c_current_addr_sk
+    WHERE: substr(ca_zip,1,5) IN ('85669','86197','88274','83405','86475','85392','85460','80348','81792') OR ca_state IN ('CA','WA','GA')
+    OUTPUT: c_customer_sk
+    EXPECTED_ROWS: ~? (distinct customers matching address)
+    CONSUMERS: eligible_customers
+  price_customers:
+    FROM: catalog_sales
+    JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    WHERE: cs_sales_price > 500
+    OUTPUT: cs_bill_customer_sk
+    EXPECTED_ROWS: ~? (distinct customers with high-price sales in Q1 2001)
+    CONSUMERS: eligible_customers
+  eligible_customers:
+    FROM: address_customers UNION price_customers
+    OUTPUT: customer_sk
+    EXPECTED_ROWS: ~? (union of distinct keys)
+    CONSUMERS: main_join
+  main_join:
+    FROM: catalog_sales
+    JOIN customer ON cs_bill_customer_sk = c_customer_sk
+    JOIN customer_address ON c_current_addr_sk = ca_address_sk
+    JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    WHERE: c_customer_sk IN (SELECT customer_sk FROM eligible_customers)
+    OUTPUT: cs_sales_price, ca_zip
+    EXPECTED_ROWS: ~33K
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: main_join
+    GROUP BY: ca_zip
+    AGGREGATE: sum(cs_sales_price)
+    OUTPUT: ca_zip, sum_cs_sales_price
+    EXPECTED_ROWS: 520
+    CONSUMERS: top_n
+  top_n:
+    FROM: aggregate
+    ORDER BY: ca_zip ASC
+    LIMIT: 100
+    OUTPUT: ca_zip, sum_cs_sales_price
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: composite_decorrelate_union, intersect_to_exists
+EXAMPLE_ADAPTATION:
+  Apply the DISTINCT customer key extraction from composite_decorrelate_union; apply the IN-subquery pattern from intersect_to_exists (converting OR to IN). Ignore the EXISTS correlation – this query has no EXISTS.
+HAZARD_FLAGS:
+  - IN-subquery may become a semi-join; ensure the subquery is efficient.
+  - Must preserve all original filters in main_join (date condition already in filtered_date).
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

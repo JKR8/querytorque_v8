@@ -1,0 +1,455 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Compare customer-item coverage between store and catalog channels over month sequence 1214-1225 by counting store-only, catalog-only, and overlapping customer-item pairs. The FULL OUTER JOIN preserves all rows from both sides, with NULLs indicating absence in one channel; the three conditional sums count membership in each bucket. Aggregation uses SUM of 0/1 flags (duplicate-safe). The date filter (d_month_seq between 1214 and 1214+11) must be applied identically to both store_sales and catalog_sales before grouping.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+date_filter -> store_sales_join -> store_group_by -> main_join
+                          \-> catalog_sales_join -> catalog_group_by ->/
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1214 AND 1214 + 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: store_sales_join, catalog_sales_join
+  store_sales_join:
+    FROM: store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk
+    WHERE: (none beyond join)
+    OUTPUT: ss_customer_sk AS customer_sk, ss_item_sk AS item_sk
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: store_group_by
+  store_group_by:
+    FROM: store_sales_join
+    GROUP BY: customer_sk, item_sk
+    OUTPUT: customer_sk, item_sk
+    EXPECTED_ROWS: 5.4M
+    CONSUMERS: main_join
+  catalog_sales_join:
+    FROM: catalog_sales JOIN date_filter ON cs_sold_date_sk = d_date_sk
+    WHERE: (none beyond join)
+    OUTPUT: cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk
+    EXPECTED_ROWS: 2.9M
+    CONSUMERS: catalog_group_by
+  catalog_group_by:
+    FROM: catalog_sales_join
+    GROUP BY: customer_sk, item_sk
+    OUTPUT: customer_sk, item_sk
+    EXPECTED_ROWS: 2.9M
+    CONSUMERS: main_join
+  main_join:
+    FROM: store_group_by FULL OUTER JOIN catalog_group_by ON (store_group_by.customer_sk = catalog_group_by.customer_sk AND store_group_by.item_sk = catalog_group_by.item_sk)
+    AGGREGATE: SUM(CASE WHEN store_group_by.customer_sk IS NOT NULL AND catalog_group_by.customer_sk IS NULL THEN 1 ELSE 0 END) AS store_only,
+               SUM(CASE WHEN store_group_by.customer_sk IS NULL AND catalog_group_by.customer_sk IS NOT NULL THEN 1 ELSE 0 END) AS catalog_only,
+               SUM(CASE WHEN store_group_by.customer_sk IS NOT NULL AND catalog_group_by.customer_sk IS NOT NULL THEN 1 ELSE 0 END) AS store_and_catalog
+    OUTPUT: store_only, catalog_only, store_and_catalog
+    EXPECTED_ROWS: 1 (after aggregation)
+    CONSUMERS: none
+
+NODE_CONTRACTS:
+date_filter:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1214 AND 1214 + 11
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: store_sales_join, catalog_sales_join
+  store_sales_join:
+    FROM: store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk
+    WHERE: (none beyond join)
+    OUTPUT: ss_customer_sk AS customer_sk, ss_item_sk AS item_sk
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: store_group_by
+  store_group_by:
+    FROM: store_sales_join
+    GROUP BY: customer_sk, item_sk
+    OUTPUT: customer_sk, item_sk
+    EXPECTED_ROWS: 5.4M
+    CONSUMERS: main_join
+  catalog_sales_join:
+    FROM: catalog_sales JOIN date_filter ON cs_sold_date_sk = d_date_sk
+    WHERE: (none beyond join)
+    OUTPUT: cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk
+    EXPECTED_ROWS: 2.9M
+    CONSUMERS: catalog_group_by
+  catalog_group_by:
+    FROM: catalog_sales_join
+    GROUP BY: customer_sk, item_sk
+    OUTPUT: customer_sk, item_sk
+    EXPECTED_ROWS: 2.9M
+    CONSUMERS: main_join
+  main_join:
+    FROM: store_group_by FULL OUTER JOIN catalog_group_by ON (store_group_by.customer_sk = catalog_group_by.customer_sk AND store_group_by.item_sk = catalog_group_by.item_sk)
+    AGGREGATE: SUM(CASE WHEN store_group_by.customer_sk IS NOT NULL AND catalog_group_by.customer_sk IS NULL THEN 1 ELSE 0 END) AS store_only,
+               SUM(CASE WHEN store_group_by.customer_sk IS NULL AND catalog_group_by.customer_sk IS NOT NULL THEN 1 ELSE 0 END) AS catalog_only,
+               SUM(CASE WHEN store_group_by.customer_sk IS NOT NULL AND catalog_group_by.customer_sk IS NOT NULL THEN 1 ELSE 0 END) AS store_and_catalog
+    OUTPUT: store_only, catalog_only, store_and_catalog
+    EXPECTED_ROWS: 1 (after aggregation)
+    CONSUMERS: none
+
+## Hazard Flags (avoid these specific risks)
+
+- CTE date_filter may be inlined (referenced twice) but DuckDB may materialize it; overhead minimal.
+
+## Regression Warnings (observed failures on similar queries)
+
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline runtime <100ms, CTE overhead exceeded savings.
+   RULE: This query baseline is 2311ms, so CTE overhead acceptable.
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Pre-filtered fact table before multi-way join, preventing optimizer reordering.
+   RULE: This query has only two independent fact tables joined via FULL OUTER JOIN, no multi-way fact joins, so safe.
+3. or_to_union (0.59x on Q90):
+   CAUSE: Split same-column OR into UNION ALL, duplicating fact scans.
+   RULE: Not applicable; no OR conditions.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output exactly three columns: store_only, catalog_only, store_and_catalog.
+- CTE_COLUMN_COMPLETENESS: Any CTE must output customer_sk and item_sk for downstream join/aggregation.
+- LITERAL_PRESERVATION: Must preserve d_month_seq values 1214 and 1214+11.
+- SEMANTIC_EQUIVALENCE: Result must match original row counts for each bucket.
+- CROSS_CTE_PREDICATE_BLINDNESS: date_dim scanned twice (once per CTE) with same filter; opportunity to share.
+- REDUNDANT_SCAN_ELIMINATION: Not active; each fact table scanned once.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: Not active.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- shared_dimension_multi_channel: Apply the pattern of extracting shared date filter into a CTE referenced by both channel joins. Ignore any promotion/item filters not present.
+- date_cte_isolate: Apply date filtering into a CTE. Ignore decomposition of existing CTEs; our CTEs are new.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. shared_dimension_multi_channel (1.30x)
+
+**Principle:** Shared Dimension Extraction: when multiple channel CTEs (store/catalog/web) apply identical dimension filters, extract those shared filters into one CTE and reference it from each channel. Avoids redundant dimension scans.
+
+**BEFORE (slow):**
+```sql
+with ssr as
+ (select  s_store_id as store_id,
+          sum(ss_ext_sales_price) as sales,
+          sum(coalesce(sr_return_amt, 0)) as "returns",
+          sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit
+  from store_sales left outer join store_returns on
+         (ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number),
+     date_dim,
+     store,
+     item,
+     promotion
+ where ss_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-28' as date) 
+                  and (cast('1998-08-28' as date) + INTERVAL 30 DAY)
+       and ss_store_sk = s_store_sk
+       and ss_item_sk = i_item_sk
+       and i_current_price > 50
+       and ss_promo_sk = p_promo_sk
+       and p_channel_tv = 'N'
+ group by s_store_id)
+ ,
+ csr as
+ (select  cp_catalog_page_id as catalog_page_id,
+          sum(cs_ext_sales_price) as sales,
+          sum(coalesce(cr_return_amount, 0)) as "returns",
+          sum(cs_net_profit - coalesce(cr_net_loss, 0)) as profit
+  from catalog_sales left outer join catalog_returns on
+         (cs_item_sk = cr_item_sk and cs_order_number = cr_order_number),
+     date_dim,
+     catalog_page,
+     item,
+     promotion
+ where cs_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-28' as date)
+                  and (cast('1998-08-28' as date) + INTERVAL 30 DAY)
+        and cs_catalog_page_sk = cp_catalog_page_sk
+       and cs_item_sk = i_item_sk
+       and i_current_price > 50
+       and cs_promo_sk = p_promo_sk
+       and p_channel_tv = 'N'
+group by cp_catalog_page_id)
+ ,
+ wsr as
+ (select  web_site_id,
+          sum(ws_ext_sales_price) as sales,
+          sum(coalesce(wr_return_amt, 0)) as "returns",
+          sum(ws_net_profit - coalesce(wr_net_loss, 0)) as profit
+  from web_sales left outer join web_returns on
+         (ws_item_sk = wr_item_sk and ws_order_number = wr_order_number),
+     date_dim,
+     web_site,
+     item,
+     promotion
+ where ws_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-28' as date)
+                  and (cast('1998-08-28' as date) + INTERVAL 30 DAY)
+        and ws_web_site_sk = web_site_sk
+       and ws_item_sk = i_item_sk
+       and i_current_price > 50
+       and ws_promo_sk = p_promo_sk
+       and p_channel_tv = 'N'
+group by web_site_id)
+  select channel
+        , id
+        , sum(sales) as sales
+        , sum("returns") as "returns"
+        , sum(profit) as profit
+ from 
+ (select 'store channel' as channel
+        , 'store' || store_id as id
+        , sales
+        , "returns"
+        , profit
+ from   ssr
+ union all
+ select 'catalog channel' as channel
+        , 'catalog_page' || catalog_page_id as id
+        , sales
+        , "returns"
+        , profit
+ from  csr
+ union all
+ select 'web channel' as channel
+        , 'web_site' || web_site_id as id
+        , sales
+        , "returns"
+        , profit
+ from   wsr
+ ) x
+ group by rollup (channel, id)
+ order by channel
+         ,id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL '30' DAY)
+```
+[filtered_items]:
+```sql
+SELECT i_item_sk FROM item WHERE i_current_price > 50
+```
+[filtered_promotions]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N'
+```
+[prefiltered_store_sales]:
+```sql
+SELECT ss_item_sk, ss_store_sk, ss_ticket_number, ss_ext_sales_price, ss_net_profit FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN filtered_items ON ss_item_sk = i_item_sk JOIN filtered_promotions ON ss_promo_sk = p_promo_sk
+```
+[prefiltered_web_sales]:
+```sql
+SELECT ws_item_sk, ws_web_site_sk, ws_order_number, ws_ext_sales_price, ws_net_profit FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk JOIN filtered_items ON ws_item_sk = i_item_sk JOIN filtered_promotions ON ws_promo_sk = p_promo_sk
+```
+[ssr]:
+```sql
+SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS returns, SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit FROM prefiltered_store_sales LEFT OUTER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) JOIN store ON ss_store_sk = s_store_sk GROUP BY s_store_id
+```
+[wsr]:
+```sql
+SELECT web_site_id, SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS returns, SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit FROM prefiltered_web_sales LEFT OUTER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number) JOIN web_site ON ws_web_site_sk = web_site_sk GROUP BY web_site_id
+```
+
+### 2. date_cte_isolate (4.00x)
+
+**Principle:** Dimension Isolation: extract small dimension lookups into CTEs so they materialize once and subsequent joins probe a tiny hash table instead of rescanning.
+
+**BEFORE (slow):**
+```sql
+select a.ca_state state, count(*) cnt
+ from customer_address a
+     ,customer c
+     ,store_sales s
+     ,date_dim d
+     ,item i
+ where       a.ca_address_sk = c.c_current_addr_sk
+ 	and c.c_customer_sk = s.ss_customer_sk
+ 	and s.ss_sold_date_sk = d.d_date_sk
+ 	and s.ss_item_sk = i.i_item_sk
+ 	and d.d_month_seq = 
+ 	     (select distinct (d_month_seq)
+ 	      from date_dim
+               where d_year = 2002
+ 	        and d_moy = 3 )
+ 	and i.i_current_price > 1.2 * 
+             (select avg(j.i_current_price) 
+ 	     from item j 
+ 	     where j.i_category = i.i_category)
+ group by a.ca_state
+ having count(*) >= 10
+ order by cnt, a.ca_state
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[target_month]:
+```sql
+SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1
+```
+[category_avg_price]:
+```sql
+SELECT i_category, AVG(i_current_price) * 1.2 AS avg_threshold FROM item GROUP BY i_category
+```
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim JOIN target_month ON d_month_seq = target_month.d_month_seq
+```
+[filtered_sales]:
+```sql
+SELECT ss_customer_sk, ss_item_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+```
+[main_query]:
+```sql
+SELECT a.ca_state AS state, COUNT(*) AS cnt FROM customer_address a JOIN customer c ON a.ca_address_sk = c.c_current_addr_sk JOIN filtered_sales s ON c.c_customer_sk = s.ss_customer_sk JOIN item i ON s.ss_item_sk = i.i_item_sk JOIN category_avg_price cap ON i.i_category = cap.i_category WHERE i.i_current_price > cap.avg_threshold GROUP BY a.ca_state HAVING COUNT(*) >= 10 ORDER BY cnt, a.ca_state LIMIT 100
+```
+
+## Original SQL
+
+```sql
+-- start query 97 in stream 0 using template query97.tpl
+with ssci as (
+select ss_customer_sk customer_sk
+      ,ss_item_sk item_sk
+from store_sales,date_dim
+where ss_sold_date_sk = d_date_sk
+  and d_month_seq between 1214 and 1214 + 11
+group by ss_customer_sk
+        ,ss_item_sk),
+csci as(
+ select cs_bill_customer_sk customer_sk
+      ,cs_item_sk item_sk
+from catalog_sales,date_dim
+where cs_sold_date_sk = d_date_sk
+  and d_month_seq between 1214 and 1214 + 11
+group by cs_bill_customer_sk
+        ,cs_item_sk)
+ select sum(case when ssci.customer_sk is not null and csci.customer_sk is null then 1 else 0 end) store_only
+      ,sum(case when ssci.customer_sk is null and csci.customer_sk is not null then 1 else 0 end) catalog_only
+      ,sum(case when ssci.customer_sk is not null and csci.customer_sk is not null then 1 else 0 end) store_and_catalog
+from ssci full outer join csci on (ssci.customer_sk=csci.customer_sk
+                               and ssci.item_sk = csci.item_sk)
+ LIMIT 100;
+
+-- end query 97 in stream 0 using template query97.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `store_only`
+  2. `catalog_only`
+  3. `store_and_catalog`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] csci  [=]  Cost: 33%  Rows: ~1K  — Build distinct customer-item pairs from catalog sales in the same window.
+│   ├── SCAN (catalog_sales, date_dim (join))
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_month_seq BETWEEN 1214 AND 1214 + 11)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (customer_sk, item_sk)
+├── [CTE] ssci  [=]  Cost: 33%  Rows: ~1K  — Build distinct customer-item pairs from store sales in the 12-month window.
+│   ├── SCAN (store_sales, date_dim (join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_month_seq BETWEEN 1214 AND 1214 + 11)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (customer_sk, item_sk)
+└── [MAIN] main_query  [=]  Cost: 33%  Rows: ~1K  — Full-outer-join store and catalog pair sets on customer-item and count membership in each exclusive/overlap bucket.
+    ├── SCAN (ssci, csci (join))
+    ├── AGG (GROUP BY)
+    └── OUTPUT (store_only, catalog_only, store_and_catalog)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

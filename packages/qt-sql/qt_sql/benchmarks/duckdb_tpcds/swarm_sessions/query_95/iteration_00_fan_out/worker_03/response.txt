@@ -1,0 +1,93 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] ws_wh_grouped  [+]  Replaces original ws_wh with GROUP BY HAVING MIN<>MAX
+│   ├── SCAN (web_sales)
+│   ├── GROUP BY (ws_order_number)
+│   ├── HAVING (MIN(ws_warehouse_sk) <> MAX(ws_warehouse_sk))
+│   └── OUTPUT (ws_order_number)
+├── [CTE] filtered_ws  [+]  Isolates dimension-joined fact rows with early filters
+│   ├── SCAN (web_sales AS ws1, date_dim, customer_address, web_site)
+│   ├── JOIN (ws1.ws_ship_date_sk = d_date_sk)
+│   ├── JOIN (ws1.ws_ship_addr_sk = ca_address_sk)
+│   ├── JOIN (ws1.ws_web_site_sk = web_site_sk)
+│   ├── FILTER (d_date BETWEEN '1999-2-01' AND (CAST('1999-2-01' AS DATE) + INTERVAL 60 DAY))
+│   ├── FILTER (ca_state = 'NC')
+│   ├── FILTER (web_company_name = 'pri')
+│   └── OUTPUT (ws_order_number, ws_ext_ship_cost, ws_net_profit)
+├── [CTE] semi_join1  [+]  First semi-join to multi-warehouse orders
+│   ├── SCAN (filtered_ws)
+│   ├── FILTER (ws_order_number IN (SELECT ws_order_number FROM ws_wh_grouped))
+│   └── OUTPUT (ws_order_number, ws_ext_ship_cost, ws_net_profit)
+├── [CTE] semi_join2  [+]  Second semi-join to returned multi-warehouse orders
+│   ├── SCAN (semi_join1)
+│   ├── FILTER (ws_order_number IN (SELECT wr_order_number FROM web_returns WHERE wr_order_number IN (SELECT ws_order_number FROM ws_wh_grouped)))
+│   └── OUTPUT (ws_order_number, ws_ext_ship_cost, ws_net_profit)
+└── [MAIN] aggregate  [+]  Final aggregation with distinct count and sums
+    ├── SCAN (semi_join2)
+    ├── AGGREGATE (COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit))
+    ├── ORDER BY (COUNT(DISTINCT ws_order_number))
+    ├── LIMIT (100)
+    └── OUTPUT (order count, total shipping cost, total net profit)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "SELF_JOIN_TO_WINDOW", "description": "Replace self-join on web_sales with GROUP BY HAVING MIN<>MAX to identify multi-warehouse orders", "applied_to": ["ws_wh_grouped"]},
+    {"id": "R2", "type": "materialize_cte", "description": "Materialize ws_wh_grouped CTE to share across two semi-joins", "applied_to": ["ws_wh_grouped"]},
+    {"id": "R3", "type": "dimension_cte_isolate", "description": "Isolate dimension-joined fact rows into filtered_ws CTE with early filters", "applied_to": ["filtered_ws"]},
+    {"id": "R4", "type": "semi_join_decomposition", "description": "Decompose two IN subqueries into sequential semi-join CTEs", "applied_to": ["semi_join1", "semi_join2"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "ws_wh_grouped": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_order_number FROM web_sales GROUP BY ws_order_number HAVING MIN(ws_warehouse_sk) <> MAX(ws_warehouse_sk)",
+        "interfaces": {"outputs": ["ws_order_number"], "consumes": []}
+      },
+      "filtered_ws": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit FROM web_sales ws1 JOIN date_dim ON ws1.ws_ship_date_sk = date_dim.d_date_sk JOIN customer_address ON ws1.ws_ship_addr_sk = customer_address.ca_address_sk JOIN web_site ON ws1.ws_web_site_sk = web_site.web_site_sk WHERE date_dim.d_date BETWEEN CAST('1999-2-01' AS DATE) AND (CAST('1999-2-01' AS DATE) + INTERVAL 60 DAY) AND customer_address.ca_state = 'NC' AND web_site.web_company_name = 'pri'",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": []}
+      },
+      "semi_join1": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT filtered_ws.ws_order_number, filtered_ws.ws_ext_ship_cost, filtered_ws.ws_net_profit FROM filtered_ws WHERE filtered_ws.ws_order_number IN (SELECT ws_order_number FROM ws_wh_grouped)",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": ["filtered_ws", "ws_wh_grouped"]}
+      },
+      "semi_join2": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT semi_join1.ws_order_number, semi_join1.ws_ext_ship_cost, semi_join1.ws_net_profit FROM semi_join1 WHERE semi_join1.ws_order_number IN (SELECT wr_order_number FROM web_returns WHERE wr_order_number IN (SELECT ws_order_number FROM ws_wh_grouped))",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": ["semi_join1", "ws_wh_grouped"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "new",
+        "sql": "SELECT COUNT(DISTINCT ws_order_number) AS \"order count\", SUM(ws_ext_ship_cost) AS \"total shipping cost\", SUM(ws_net_profit) AS \"total net profit\" FROM semi_join2 ORDER BY COUNT(DISTINCT ws_order_number) LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["semi_join2"]}
+      }
+    },
+    "reconstruction_order": ["ws_wh_grouped", "filtered_ws", "semi_join1", "semi_join2", "main_query"],
+    "assembly_template": "WITH ws_wh_grouped AS ({ws_wh_grouped}), filtered_ws AS ({filtered_ws}), semi_join1 AS ({semi_join1}), semi_join2 AS ({semi_join2}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced expensive self-join with GROUP BY HAVING MIN<>MAX to identify multi-warehouse orders, then restructured as sequential semi-joins using a shared materialized CTE. This avoids redundant computation of the multi-warehouse condition while maintaining correct semantics.
+
+**Expected speedup**: ~1.37x (similar to materialize_cte pattern) by eliminating self-join and reusing grouped CTE.

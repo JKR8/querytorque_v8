@@ -1,0 +1,125 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~100
+    ├── WITH store_cte AS (CTE)  [+]
+    │   └── SCAN store (filter: s_state IN)
+    ├── WITH item_cte AS (CTE)  [+]
+    │   └── SCAN item (filter: i_manager_id BETWEEN)
+    ├── WITH date_cte AS (CTE)  [+]
+    │   └── SCAN date_dim (filter: d_month_seq BETWEEN)
+    ├── WITH sales_agg AS (CTE)  [+]
+    │   ├── JOIN store_sales ↔ date_cte
+    │   ├── FILTER ss_sales_price/ss_list_price BETWEEN
+    │   └── AGG (GROUP BY ss_store_sk, ss_item_sk)
+    ├── WITH store_avg AS (CTE)  [+]
+    │   └── AGG (GROUP BY ss_store_sk) on sales_agg
+    ├── JOIN (sales_agg ↔ store_avg)  [~] (explicit INNER JOIN)
+    ├── JOIN (↔ store_cte)  [~] (explicit INNER JOIN)
+    ├── JOIN (↔ item_cte)  [~] (explicit INNER JOIN)
+    ├── FILTER (revenue <= 0.1 * ave)
+    ├── SORT (s_store_name ASC, i_item_desc ASC)
+    └── OUTPUT (s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "pg_self_join_decomposition",
+      "description": "Consolidate duplicate store_sales scans into single CTE with shared materialization",
+      "applied_to": ["sales_agg", "store_avg"]
+    },
+    {
+      "id": "R2",
+      "type": "pg_dimension_prefetch_star",
+      "description": "Pre-filter selective dimensions (store, item, date) into CTEs for tiny hash tables",
+      "applied_to": ["store_cte", "item_cte", "date_cte"]
+    },
+    {
+      "id": "R3",
+      "type": "pg_date_cte_explicit_join",
+      "description": "Replace comma-separated joins with explicit JOIN syntax and dimension CTEs",
+      "applied_to": ["sales_agg", "final_join"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "store_cte": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT s_store_sk, s_store_name FROM store WHERE s_state IN ('IA','IL','NC')",
+          "interfaces": {
+            "outputs": ["s_store_sk", "s_store_name"],
+            "consumes": []
+          }
+        },
+        "item_cte": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT i_item_sk, i_item_desc, i_current_price, i_wholesale_cost, i_brand FROM item WHERE i_manager_id BETWEEN 80 AND 84",
+          "interfaces": {
+            "outputs": ["i_item_sk", "i_item_desc", "i_current_price", "i_wholesale_cost", "i_brand"],
+            "consumes": []
+          }
+        },
+        "date_cte": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1195 AND 1195+11",
+          "interfaces": {
+            "outputs": ["d_date_sk"],
+            "consumes": []
+          }
+        },
+        "sales_agg": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM store_sales JOIN date_cte ON ss_sold_date_sk = d_date_sk WHERE ss_sales_price / ss_list_price BETWEEN 0.38 AND 0.48 GROUP BY ss_store_sk, ss_item_sk",
+          "interfaces": {
+            "outputs": ["ss_store_sk", "ss_item_sk", "revenue"],
+            "consumes": ["date_cte"]
+          }
+        },
+        "store_avg": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT ss_store_sk, AVG(revenue) AS ave FROM sales_agg GROUP BY ss_store_sk",
+          "interfaces": {
+            "outputs": ["ss_store_sk", "ave"],
+            "consumes": ["sales_agg"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT s.s_store_name, i.i_item_desc, g.revenue, i.i_current_price, i.i_wholesale_cost, i.i_brand FROM sales_agg g JOIN store_avg a ON g.ss_store_sk = a.ss_store_sk JOIN store_cte s ON s.s_store_sk = g.ss_store_sk JOIN item_cte i ON i.i_item_sk = g.ss_item_sk WHERE g.revenue <= 0.1 * a.ave ORDER BY s.s_store_name, i.i_item_desc LIMIT 100",
+          "interfaces": {
+            "outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"],
+            "consumes": ["sales_agg", "store_avg", "store_cte", "item_cte"]
+          }
+        }
+      },
+      "reconstruction_order": ["store_cte", "item_cte", "date_cte", "sales_agg", "store_avg", "main_query"],
+      "assembly_template": "WITH store_cte AS ({store_cte}), item_cte AS ({item_cte}), date_cte AS ({date_cte}), sales_agg AS ({sales_agg}), store_avg AS ({store_avg}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '32MB'", "SET LOCAL hash_mem_multiplier = 2.0"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced duplicate store_sales scans with single materialized CTE (`sales_agg`), pre-filtered all three dimension tables into separate CTEs, and converted comma-separated joins to explicit JOIN syntax. This consolidates work and provides clean hash join planning with tiny dimension CTEs.
+
+**Expected speedup**: 3.5-4× from eliminating redundant store_sales scan and enabling optimal hash join planning with pre-filtered dimension CTEs. The single `sales_agg` CTE (78K rows) is computed once and reused for both store average calculation and final joins.

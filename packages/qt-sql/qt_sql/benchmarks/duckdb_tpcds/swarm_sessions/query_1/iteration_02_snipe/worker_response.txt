@@ -1,0 +1,141 @@
+<reasoning>
+We need to achieve ≥2.0x speedup. The bottleneck is the TABLE_SCAN of store_returns (0.71s, 63% of total). The CTE aggregates 557K rows to 539K rows, then the store filter reduces to 158K rows (71% reduction) but applied AFTER materialization.
+
+Key insight: The store average must be computed over ALL stores (not just SD). But the main query only needs SD stores for the final result. The CTE currently aggregates ALL stores, wasting work.
+
+We can push the store filter (s_state='SD') into the CTE for the main query branch, while keeping a separate CTE for store averages (all stores). This reduces the aggregation workload for the main branch.
+
+However, previous attempts (W2, W4) tried this and got 1.0x. Why? They still scanned store_returns multiple times or didn't reduce early enough.
+
+New angle: Use a SINGLE scan of store_returns with conditional aggregation to compute BOTH the SD customer totals AND the all-stores store averages in one pass. We can compute:
+1. Customer totals for SD stores (by joining with store filter)
+2. Store totals and counts for all stores (for averages)
+
+But we need customer-level aggregates for SD stores and store-level aggregates for all stores. We can do this with two CTEs from the same base scan:
+
+- Base scan: store_returns JOIN date_dim (year=2000) LEFT JOIN store (for SD filter)
+- CTE1: Aggregate for SD stores (customer, store, sum(fee)) – only where s_state='SD'
+- CTE2: Aggregate for all stores (store, sum(fee), count(customer)) – for averages
+
+But wait: The store average is AVG(customer_total_return) per store, which requires customer-level totals first. So we still need customer-level aggregation for all stores.
+
+Alternative: Use window functions? Already tried (1.0x).
+
+Better: The optimizer already decorrelates the subquery (LEFT_DELIM_JOIN). The real issue is that the CTE materializes ALL customer-store pairs before filtering. We need to avoid materializing non-SD pairs.
+
+We can restructure: Compute customer totals ONLY for SD stores first (by joining store_returns with date_dim AND store filter). Then compute store averages from a SEPARATE scan of store_returns (all stores) but only aggregated to store level, not customer level? No, we need customer-level totals for averages.
+
+But note: Store averages are per store, across customers. We can compute store averages by grouping store_returns by store_sk, customer_sk first, then by store_sk. That's two aggregations.
+
+We need to minimize redundant work. Let's analyze data flow:
+- Original: Scan store_returns (557K rows) → aggregate to 539K rows → filter to 158K SD rows.
+- If we filter store_returns to SD stores early, we'd scan 557K rows, join with store (SD filter), get fewer rows, then aggregate. But we still need the all-stores aggregate for averages.
+
+We can try: One CTE that aggregates store_returns with date filter ONLY. Then:
+- Use that CTE for store averages (group by store_sk)
+- Filter that CTE by joining with store (SD) for main query
+
+But that's what W4 did (1.0x).
+
+We need a different physical plan: Push the store filter INTO the aggregation for the main query branch, while computing store averages separately. Use UNION ALL? Not appropriate.
+
+Wait: The store average is computed per store, and we only compare for SD stores. So we only need store averages for SD stores? No, the subquery computes average for each store in the CTE, but the main query only joins with SD stores. So we only need store averages for SD stores! Because we only compare ctr1.ctr_store_sk (which are SD stores) with store averages for those same stores.
+
+Look at the WHERE clause: `ctr1.ctr_store_sk = ctr2.ctr_store_sk` and `s_store_sk = ctr1.ctr_store_sk` and `s_state='SD'`. Therefore, ctr1.ctr_store_sk are SD stores. The subquery only needs averages for SD stores because other stores never join.
+
+Thus, we can restrict the store averages computation to SD stores only! This is a semantic breakthrough.
+
+Check semantics: "the correlated subquery computes per-store average across ALL stores in the CTE, not just SD stores." But the CTE includes all stores. However, the correlation is on ctr_store_sk, and ctr1 only has SD stores (due to join with store). So the subquery only executes for SD store keys. It still computes average over all customer returns for that store (which includes returns from all customers, not just SD customers). But the store itself is an SD store. So we need averages for SD stores only.
+
+Therefore, we can compute:
+1. Customer totals for SD stores (by joining store_returns with date_dim and store filter)
+2. Store averages for SD stores (from the same base data as step 1, but aggregated differently)
+
+But wait: The store averages must include returns from all customers for that SD store, not just SD customers (which is all customers anyway). So we can compute store averages from the same filtered set (SD stores) but aggregated by store_sk and customer_sk first.
+
+Thus, we only need to process SD stores from the beginning! This could cut ~71% of the aggregation work.
+
+Let's verify: The CTE customer_total_return includes all stores. But the main query joins it with store on s_store_sk and s_state='SD'. So only rows with SD stores survive. The subquery correlates on ctr_store_sk, which at that point are SD stores. So the subquery only runs for SD stores.
+
+Therefore, we can safely filter store_returns to SD stores early by joining with store table. This will reduce the scan/aggregation workload dramatically.
+
+But we must ensure that for each SD store, we include all customer returns (not just SD customers). That's fine because we're joining on store_sk, not customer_sk.
+
+So new plan:
+1. Pre-filter store to SD stores → small dimension.
+2. Join store_returns with date_dim (year=2000) and this filtered store list → reduces fact rows early.
+3. From this filtered set, compute:
+   - Customer totals per SD store (group by customer, store)
+   - Store averages per SD store (group by store, then average of customer totals)
+4. Join with customer.
+
+This should cut the fact table scan and aggregation by ~71% (matching the filter selectivity).
+
+We'll implement this with two CTEs from the same base filtered fact table.
+
+Edge case: Are there stores in store_returns that are not in store table? Probably not (foreign key). But use INNER JOIN to be safe.
+
+Now, we must preserve the division guard? No division in this query.
+
+We'll keep the original structure but push the store filter into the CTE.
+
+</reasoning>
+
+<logic_tree>
+[!] Structural change: Push store filter (s_state='SD') into the CTE definition for both customer totals and store averages, since subquery only needs SD stores.
+  [+] CTE filtered_returns: store_returns JOIN date_dim (d_year=2000) JOIN store (s_state='SD')
+  [+] CTE customer_total_return_sd: from filtered_returns, group by sr_customer_sk, sr_store_sk
+  [+] CTE store_avg_sd: from customer_total_return_sd, group by ctr_store_sk, compute AVG(ctr_total_return)*1.2
+  [~] main_query: join customer_total_return_sd with store_avg_sd and customer (no need to join store again, already filtered)
+</logic_tree>
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "cross_cte_predicate_pushdown", "description": "Push store filter into CTE to reduce fact rows early", "applied_to": ["filtered_returns"]},
+    {"id": "R2", "type": "decorrelate", "description": "Convert correlated subquery to explicit CTE for store averages", "applied_to": ["store_avg_sd"]},
+    {"id": "R3", "type": "dimension_isolation", "description": "Pre-filter store dimension to SD stores", "applied_to": ["filtered_returns"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_returns": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT sr_customer_sk, sr_store_sk, SR_FEE FROM store_returns JOIN date_dim ON sr_returned_date_sk = d_date_sk JOIN store ON sr_store_sk = s_store_sk WHERE d_year = 2000 AND s_state = 'SD'",
+        "interfaces": {"outputs": ["sr_customer_sk", "sr_store_sk", "SR_FEE"], "consumes": []}
+      },
+      "customer_total_return_sd": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM filtered_returns GROUP BY sr_customer_sk, sr_store_sk",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_total_return"], "consumes": ["filtered_returns"]}
+      },
+      "store_avg_sd": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS store_avg_threshold FROM customer_total_return_sd GROUP BY ctr_store_sk",
+        "interfaces": {"outputs": ["ctr_store_sk", "store_avg_threshold"], "consumes": ["customer_total_return_sd"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id FROM customer_total_return_sd ctr1 JOIN store_avg_sd sas ON ctr1.ctr_store_sk = sas.ctr_store_sk JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk WHERE ctr1.ctr_total_return > sas.store_avg_threshold ORDER BY c_customer_id LIMIT 100",
+        "interfaces": {"outputs": ["c_customer_id"], "consumes": ["customer_total_return_sd", "store_avg_sd"]}
+      }
+    },
+    "reconstruction_order": ["filtered_returns", "customer_total_return_sd", "store_avg_sd", "main_query"],
+    "assembly_template": "WITH filtered_returns AS ({filtered_returns}), customer_total_return_sd AS ({customer_total_return_sd}), store_avg_sd AS ({store_avg_sd}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Pushed store filter (s_state='SD') into the CTE definition, reducing fact rows early by ~71%. The store averages are now computed only for SD stores (semantically equivalent because only SD stores participate in the final join). This reduces aggregation workload and scan cost.
+
+**Expected speedup**: ~3x (since we eliminate 71% of aggregation and reduce fact scan proportionally).

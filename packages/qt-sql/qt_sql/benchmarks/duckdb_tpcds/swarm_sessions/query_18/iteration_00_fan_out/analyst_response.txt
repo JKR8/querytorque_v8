@@ -1,0 +1,295 @@
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Business intent: For 1998 catalog sales to female customers with advanced degrees and selected birth months in selected states, compute grouped averages of sales/customer metrics with rollups over item and geography. All joins are INNER, requiring matches across all tables. The aggregates are simple AVG over decimal-cast columns; duplication from joins would skew AVG, so row multiplicity must be preserved exactly as the original star join. The c_birth_month and ca_state IN-list filters are independent per table; moving them earlier cannot be lost.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: catalog_sales sequential scan (1067ms, 70% of total) dominates. Row flow: 172.8M rows → 2.9M after date join → 202K after cd1 join → 97K after customer join → 15K after cd2/address/item joins. The optimizer already pushes dimension filters into scans (date_dim to 365 rows, cd1 to 137K rows, customer to 500K rows, address to 250K rows) and uses efficient hash joins. Logical-tree cost percentages are misleading—the 70% cost on catalog_sales scan is exclusive time; the true bottleneck is the full fact table I/O.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output i_item_id, ca_country, ca_state, ca_county, and 7 AVG aggregates.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream: surrogate keys for joins, plus display/aggregation columns.
+- LITERAL_PRESERVATION: Must preserve literal filters: cd1.cd_gender='F', cd1.cd_education_status='Advanced Degree', c_birth_month IN (10,7,8,4,1,2), d_year=1998, ca_state IN ('WA','GA','NC','ME','WY','OK','IN').
+- SEMANTIC_EQUIVALENCE: Result set must match original row-for-row, including ROLLUP groups and ordering.
+- CROSS_CTE_PREDICATE_BLINDNESS: Filters are currently pushed into dimension scans but the fact table scan remains unfiltered; pre-filtering dimensions into CTEs could enable earlier reduction.
+- REDUNDANT_SCAN_ELIMINATION: catalog_sales scanned once; no redundant scans to eliminate.
+- CORRELATED_SUBQUERY_PARALYSIS: No correlated subqueries present.
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline <100ms; CTE materialization overhead exceeded savings.
+   RULE: Skip if baseline <100ms. Our baseline is 1521ms, so safe.
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Pre-joined fact table before multi-way fact joins, preventing optimizer reordering.
+   RULE: This query has only one fact table (catalog_sales), no multi-way fact joins, so safe.
+3. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join 3+ dimension CTEs; join dimensions sequentially via fact table.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_cd1 -> filtered_customer_chain -> prefact -> fact_join_item -> rollup_agg -> order_limit
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 1998
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: prefact
+  filtered_cd1:
+    FROM: customer_demographics
+    WHERE: cd_gender = 'F' AND cd_education_status = 'Advanced Degree'
+    OUTPUT: cd_demo_sk
+    EXPECTED_ROWS: 137K
+    CONSUMERS: prefact
+  filtered_customer_chain:
+    FROM: customer
+    JOIN: INNER JOIN customer_demographics cd2 ON c_current_cdemo_sk = cd2.cd_demo_sk
+    JOIN: INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk
+    WHERE: c_birth_month IN (10,7,8,4,1,2) AND ca_state IN ('WA','GA','NC','ME','WY','OK','IN')
+    OUTPUT: c_customer_sk, c_birth_year, ca_country, ca_state, ca_county
+    EXPECTED_ROWS: 15K
+    CONSUMERS: prefact
+  prefact:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN filtered_cd1 ON cs_bill_cdemo_sk = cd_demo_sk
+    JOIN: INNER JOIN filtered_customer_chain ON cs_bill_customer_sk = c_customer_sk
+    OUTPUT: cs_item_sk, c_birth_year, ca_country, ca_state, ca_county, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit, cd1.cd_dep_count
+    EXPECTED_ROWS: 15K
+    CONSUMERS: fact_join_item
+  fact_join_item:
+    FROM: prefact
+    JOIN: INNER JOIN item ON cs_item_sk = i_item_sk
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit, c_birth_year, cd_dep_count
+    EXPECTED_ROWS: 15K
+    CONSUMERS: rollup_agg
+  rollup_agg:
+    FROM: fact_join_item
+    GROUP BY: ROLLUP (i_item_id, ca_country, ca_state, ca_county)
+    AGGREGATE: AVG(CAST(cs_quantity AS DECIMAL(12,2))), AVG(CAST(cs_list_price AS DECIMAL(12,2))), AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))), AVG(CAST(cs_sales_price AS DECIMAL(12,2))), AVG(CAST(cs_net_profit AS DECIMAL(12,2))), AVG(CAST(c_birth_year AS DECIMAL(12,2))), AVG(CAST(cd_dep_count AS DECIMAL(12,2)))
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: 56K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: rollup_agg
+    ORDER BY: ca_country, ca_state, ca_county, i_item_id
+    LIMIT: 100
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, multi_dimension_prefetch, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering of all dimension tables into CTEs; ignore the cross-join hazard—we join dimensions sequentially via fact table.
+- multi_dimension_prefetch: Use separate CTEs for date, cd1, customer+cd2+address; ensure each has WHERE clause.
+- date_cte_isolate: Extract date filter into a CTE; ignore that date is already selective—still beneficial.
+HAZARD_FLAGS:
+- Must include cd_dep_count from cd1 in prefact output (currently missing in contract above—fix in SQL).
+- The filtered_customer_chain must output cd_dep_count from cd2? No, cd2 is not used in SELECT; only cd1.cd_dep_count is needed. Ensure cd1 is separate.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_customer_chain -> early_fact -> join_cd1 -> join_item -> rollup_agg -> order_limit
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 1998
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: early_fact
+  filtered_customer_chain:
+    FROM: customer
+    JOIN: INNER JOIN customer_demographics cd2 ON c_current_cdemo_sk = cd2.cd_demo_sk
+    JOIN: INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk
+    WHERE: c_birth_month IN (10,7,8,4,1,2) AND ca_state IN ('WA','GA','NC','ME','WY','OK','IN')
+    OUTPUT: c_customer_sk, c_birth_year, ca_country, ca_state, ca_county
+    EXPECTED_ROWS: 15K
+    CONSUMERS: early_fact
+  early_fact:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN filtered_customer_chain ON cs_bill_customer_sk = c_customer_sk
+    OUTPUT: cs_item_sk, cs_bill_cdemo_sk, c_birth_year, ca_country, ca_state, ca_county, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit
+    EXPECTED_ROWS: 15K
+    CONSUMERS: join_cd1
+  join_cd1:
+    FROM: early_fact
+    JOIN: INNER JOIN customer_demographics cd1 ON cs_bill_cdemo_sk = cd1.cd_demo_sk
+    WHERE: cd1.cd_gender = 'F' AND cd1.cd_education_status = 'Advanced Degree'
+    OUTPUT: i_item_id? Not yet. Wait, we need item join. Actually, we need item for i_item_id. So after join_cd1, we need item join.
+    EXPECTED_ROWS: 15K
+    CONSUMERS: join_item
+  join_item:
+    FROM: join_cd1
+    JOIN: INNER JOIN item ON cs_item_sk = i_item_sk
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit, c_birth_year, cd1.cd_dep_count
+    EXPECTED_ROWS: 15K
+    CONSUMERS: rollup_agg
+  rollup_agg:
+    FROM: join_item
+    GROUP BY: ROLLUP (i_item_id, ca_country, ca_state, ca_county)
+    AGGREGATE: AVG(CAST(cs_quantity AS DECIMAL(12,2))), AVG(CAST(cs_list_price AS DECIMAL(12,2))), AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))), AVG(CAST(cs_sales_price AS DECIMAL(12,2))), AVG(CAST(cs_net_profit AS DECIMAL(12,2))), AVG(CAST(c_birth_year AS DECIMAL(12,2))), AVG(CAST(cd_dep_count AS DECIMAL(12,2)))
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: 56K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: rollup_agg
+    ORDER BY: ca_country, ca_state, ca_county, i_item_id
+    LIMIT: 100
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: prefetch_fact_join, early_filter, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply staged CTE chain: filter dimensions, pre-join with fact table, then join remaining dimensions. Ignore that the original example had multiple fact tables—here only one.
+- early_filter: Filter customer chain early before joining with fact table.
+- dimension_cte_isolate: Pre-filter date and customer chain; ignore that cd1 is not pre-filtered separately—it's joined later with filter.
+HAZARD_FLAGS:
+- Must ensure cd1 filter (gender, education) is applied in join_cd1, not lost.
+- The early_fact CTE must output cs_bill_cdemo_sk for join_cd1.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: rollup_to_union_windowing
+TARGET_LOGICAL_TREE:
+  base_data -> level_agg_item_country_state_county -> level_agg_item_country_state -> level_agg_item_country -> level_agg_item -> level_agg_total -> union_all_levels -> order_limit
+NODE_CONTRACTS:
+  base_data:
+    FROM: catalog_sales
+    JOIN: INNER JOIN date_dim ON cs_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN customer_demographics cd1 ON cs_bill_cdemo_sk = cd1.cd_demo_sk
+    JOIN: INNER JOIN customer ON cs_bill_customer_sk = c_customer_sk
+    JOIN: INNER JOIN customer_demographics cd2 ON c_current_cdemo_sk = cd2.cd_demo_sk
+    JOIN: INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk
+    JOIN: INNER JOIN item ON cs_item_sk = i_item_sk
+    WHERE: cd1.cd_gender = 'F' AND cd1.cd_education_status = 'Advanced Degree' AND c_birth_month IN (10,7,8,4,1,2) AND d_year = 1998 AND ca_state IN ('WA','GA','NC','ME','WY','OK','IN')
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit, c_birth_year, cd1.cd_dep_count
+    EXPECTED_ROWS: 15K
+    CONSUMERS: level_agg_item_country_state_county, level_agg_item_country_state, level_agg_item_country, level_agg_item, level_agg_total
+  level_agg_item_country_state_county:
+    FROM: base_data
+    GROUP BY: i_item_id, ca_country, ca_state, ca_county
+    AGGREGATE: AVG(CAST(cs_quantity AS DECIMAL(12,2))), AVG(CAST(cs_list_price AS DECIMAL(12,2))), AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))), AVG(CAST(cs_sales_price AS DECIMAL(12,2))), AVG(CAST(cs_net_profit AS DECIMAL(12,2))), AVG(CAST(c_birth_year AS DECIMAL(12,2))), AVG(CAST(cd_dep_count AS DECIMAL(12,2)))
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: ~15K
+    CONSUMERS: union_all_levels
+  level_agg_item_country_state:
+    FROM: base_data
+    GROUP BY: i_item_id, ca_country, ca_state
+    AGGREGATE: AVG(CAST(cs_quantity AS DECIMAL(12,2))), AVG(CAST(cs_list_price AS DECIMAL(12,2))), AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))), AVG(CAST(cs_sales_price AS DECIMAL(12,2))), AVG(CAST(cs_net_profit AS DECIMAL(12,2))), AVG(CAST(c_birth_year AS DECIMAL(12,2))), AVG(CAST(cd_dep_count AS DECIMAL(12,2)))
+    OUTPUT: i_item_id, ca_country, ca_state, NULL AS ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: <15K
+    CONSUMERS: union_all_levels
+  level_agg_item_country:
+    FROM: base_data
+    GROUP BY: i_item_id, ca_country
+    AGGREGATE: AVG(CAST(cs_quantity AS DECIMAL(12,2))), AVG(CAST(cs_list_price AS DECIMAL(12,2))), AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))), AVG(CAST(cs_sales_price AS DECIMAL(12,2))), AVG(CAST(cs_net_profit AS DECIMAL(12,2))), AVG(CAST(c_birth_year AS DECIMAL(12,2))), AVG(CAST(cd_dep_count AS DECIMAL(12,2)))
+    OUTPUT: i_item_id, ca_country, NULL AS ca_state, NULL AS ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: <15K
+    CONSUMERS: union_all_levels
+  level_agg_item:
+    FROM: base_data
+    GROUP BY: i_item_id
+    AGGREGATE: AVG(CAST(cs_quantity AS DECIMAL(12,2))), AVG(CAST(cs_list_price AS DECIMAL(12,2))), AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))), AVG(CAST(cs_sales_price AS DECIMAL(12,2))), AVG(CAST(cs_net_profit AS DECIMAL(12,2))), AVG(CAST(c_birth_year AS DECIMAL(12,2))), AVG(CAST(cd_dep_count AS DECIMAL(12,2)))
+    OUTPUT: i_item_id, NULL AS ca_country, NULL AS ca_state, NULL AS ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: <15K
+    CONSUMERS: union_all_levels
+  level_agg_total:
+    FROM: base_data
+    GROUP BY: ( )
+    AGGREGATE: AVG(CAST(cs_quantity AS DECIMAL(12,2))), AVG(CAST(cs_list_price AS DECIMAL(12,2))), AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))), AVG(CAST(cs_sales_price AS DECIMAL(12,2))), AVG(CAST(cs_net_profit AS DECIMAL(12,2))), AVG(CAST(c_birth_year AS DECIMAL(12,2))), AVG(CAST(cd_dep_count AS DECIMAL(12,2)))
+    OUTPUT: NULL AS i_item_id, NULL AS ca_country, NULL AS ca_state, NULL AS ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: 1
+    CONSUMERS: union_all_levels
+  union_all_levels:
+    FROM: level_agg_item_country_state_county UNION ALL level_agg_item_country_state UNION ALL level_agg_item_country UNION ALL level_agg_item UNION ALL level_agg_total
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: 56K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: union_all_levels
+    ORDER BY: ca_country, ca_state, ca_county, i_item_id
+    LIMIT: 100
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: rollup_to_union_windowing, single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- rollup_to_union_windowing: Replace ROLLUP with explicit UNION ALL of each grouping level; ignore the windowing aspect—this query doesn't need window functions.
+- single_pass_aggregation: Compute all aggregates in a single pass per level; ignore the consolidation of multiple fact scans.
+- channel_bitmap_aggregation: Not applicable; ignore the CASE labeling.
+HAZARD_FLAGS:
+- Must ensure NULL placeholders for rolled-up columns match ROLLUP semantics (NULL for aggregated-out columns).
+- The base_data CTE must be referenced multiple times; ensure it's materialized to avoid repeated joins.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: late_attribute_binding_with_prefilter
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_cd1 -> filtered_customer_chain -> fact_agg -> join_item -> rollup_agg -> order_limit
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 1998
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_agg
+  filtered_cd1:
+    FROM: customer_demographics
+    WHERE: cd_gender = 'F' AND cd_education_status = 'Advanced Degree'
+    OUTPUT: cd_demo_sk, cd_dep_count
+    EXPECTED_ROWS: 137K
+    CONSUMERS: fact_agg
+  filtered_customer_chain:
+    FROM: customer
+    JOIN: INNER JOIN customer_demographics cd2 ON c_current_cdemo_sk = cd2.cd_demo_sk
+    JOIN: INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk
+    WHERE: c_birth_month IN (10,7,8,4,1,2) AND ca_state IN ('WA','GA','NC','ME','WY','OK','IN')
+    OUTPUT: c_customer_sk, c_birth_year, ca_country, ca_state, ca_county
+    EXPECTED_ROWS: 15K
+    CONSUMERS: fact_agg
+  fact_agg:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    JOIN: INNER JOIN filtered_cd1 ON cs_bill_cdemo_sk = cd_demo_sk
+    JOIN: INNER JOIN filtered_customer_chain ON cs_bill_customer_sk = c_customer_sk
+    GROUP BY: cs_item_sk, ca_country, ca_state, ca_county
+    AGGREGATE: AVG(CAST(cs_quantity AS DECIMAL(12,2))), AVG(CAST(cs_list_price AS DECIMAL(12,2))), AVG(CAST(cs_coupon_amt AS DECIMAL(12,2))), AVG(CAST(cs_sales_price AS DECIMAL(12,2))), AVG(CAST(cs_net_profit AS DECIMAL(12,2))), AVG(CAST(c_birth_year AS DECIMAL(12,2))), AVG(CAST(cd_dep_count AS DECIMAL(12,2)))
+    OUTPUT: cs_item_sk, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: <15K
+    CONSUMERS: join_item
+  join_item:
+    FROM: fact_agg
+    JOIN: INNER JOIN item ON cs_item_sk = i_item_sk
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: <15K
+    CONSUMERS: rollup_agg
+  rollup_agg:
+    FROM: join_item
+    GROUP BY: ROLLUP (i_item_id, ca_country, ca_state, ca_county)
+    AGGREGATE: agg1, agg2, agg3, agg4, agg5, agg6, agg7 (already aggregated, so use AVG of the group averages? Wait, that's wrong. Actually, we need to re-aggregate correctly. This is a hazard.)
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: 56K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: rollup_agg
+    ORDER BY: ca_country, ca_state, ca_county, i_item_id
+    LIMIT: 100
+    OUTPUT: i_item_id, ca_country, ca_state, ca_county, agg1, agg2, agg3, agg4, agg5, agg6, agg7
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: deferred_window_aggregation, dimension_cte_isolate, prefetch_fact_join
+EXAMPLE_ADAPTATION:
+- deferred_window_aggregation: Delay item join until after aggregation; ignore window functions.
+- dimension_cte_isolate: Pre-filter dimensions; ignore that aggregation is pushed before item join.
+- prefetch_fact_join: Use CTE chain; ignore that aggregation is pushed down.
+HAZARD_FLAGS:
+- Pushing aggregation before joining item changes group membership because item_sk may have multiple i_item_id? No, item_sk is unique to i_item_id, so grouping by cs_item_sk is equivalent to grouping by i_item_id. However, ROLLUP after joining item will produce additional groups? Actually, ROLLUP is over i_item_id, ca_country, ca_state, ca_county. If we aggregate by cs_item_sk (surrogate key) and then join item, we have i_item_id. The ROLLUP can be performed after the join without issue because the groups are the same.
+- But the aggregates are already computed per (cs_item_sk, ca_country, ca_state, ca_county). Rolling up further (e.g., to (i_item_id, ca_country, ca_state)) requires averaging the already-averaged values? That is incorrect. We must not pre-aggregate before the ROLLUP. This strategy is risky.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This strategy attempts to push aggregation before joining item, but ROLLUP requires aggregation at multiple levels. Pre-aggregating at the lowest level and then rolling up is mathematically correct only if the rollup is a further aggregation of the same base rows. However, if we pre-aggregate by (cs_item_sk, ca_country, ca_state, ca_county), then rolling up to (i_item_id, ca_country, ca_state) would require averaging the pre-aggregated averages weighted by count. This is complex and likely incorrect. Therefore, we must not pre-aggregate before the ROLLUP. Instead, we can defer the item join but keep all base rows. Let's adjust: fact_agg should not aggregate; it should output base rows. Then join item, then rollup. That's just the original star join with CTEs. So we revert to that.
+EXPLORATION_TYPE: compound_strategy

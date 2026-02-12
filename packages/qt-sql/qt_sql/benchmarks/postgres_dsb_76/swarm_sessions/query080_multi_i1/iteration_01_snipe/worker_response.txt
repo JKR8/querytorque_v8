@@ -1,0 +1,92 @@
+## Logic Tree
+
+[~] **root** (multi-channel sales rollup)
+  [~] **filtered_date** (CTE) – change to `NOT MATERIALIZED`
+  [~] **filtered_item** (CTE) – change to `NOT MATERIALIZED`
+  [~] **filtered_promotion** (CTE) – change to `NOT MATERIALIZED`
+  [~] **ssr** (CTE) – use explicit JOINs with NOT MATERIALIZED dimension CTEs
+  [~] **csr** (CTE) – use explicit JOINs with NOT MATERIALIZED dimension CTEs
+  [~] **wsr** (CTE) – use explicit JOINs with NOT MATERIALIZED dimension CTEs
+  [=] **main_query** (unchanged) – union all + rollup
+
+## Component Payload
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "explicit_join_conversion", "description": "Convert comma‑joins to explicit JOIN syntax for better cost estimation", "applied_to": ["ssr", "csr", "wsr"]},
+    {"id": "R2", "type": "dimension_prefetch_not_materialized", "description": "Pre‑filter selective dimensions with NOT MATERIALIZED CTEs to allow predicate push‑down and parallel plans", "applied_to": ["filtered_date", "filtered_item", "filtered_promotion"]},
+    {"id": "R3", "type": "parallelism_encouragement", "description": "Configure planner to favor parallel scans and hash joins", "applied_to": ["runtime_config"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-29' AS DATE) AND CAST('1998-08-29' AS DATE) + INTERVAL '30 DAY'",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk FROM item WHERE i_current_price > 50 AND i_category IN ('Children', 'Sports')",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "filtered_promotion": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' AND p_channel_tv = 'N' AND p_channel_radio = 'N' AND p_channel_press = 'N' AND p_channel_event = 'N'",
+        "interfaces": {"outputs": ["p_promo_sk"], "consumes": []}
+      },
+      "ssr": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS returns, SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit FROM store_sales LEFT OUTER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) INNER JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk INNER JOIN store ON ss_store_sk = s_store_sk INNER JOIN filtered_item ON ss_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ss_promo_sk = filtered_promotion.p_promo_sk WHERE ss_wholesale_cost BETWEEN 23 AND 38 GROUP BY s_store_id",
+        "interfaces": {"outputs": ["store_id", "sales", "returns", "profit"], "consumes": ["filtered_date", "filtered_item", "filtered_promotion"]}
+      },
+      "csr": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cp_catalog_page_id AS catalog_page_id, SUM(cs_ext_sales_price) AS sales, SUM(COALESCE(cr_return_amount, 0)) AS returns, SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit FROM catalog_sales LEFT OUTER JOIN catalog_returns ON (cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number) INNER JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk INNER JOIN catalog_page ON cs_catalog_page_sk = cp_catalog_page_sk INNER JOIN filtered_item ON cs_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON cs_promo_sk = filtered_promotion.p_promo_sk WHERE cs_wholesale_cost BETWEEN 23 AND 38 GROUP BY cp_catalog_page_id",
+        "interfaces": {"outputs": ["catalog_page_id", "sales", "returns", "profit"], "consumes": ["filtered_date", "filtered_item", "filtered_promotion"]}
+      },
+      "wsr": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT web_site_id, SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS returns, SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit FROM web_sales LEFT OUTER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number) INNER JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk INNER JOIN web_site ON ws_web_site_sk = web_site_sk INNER JOIN filtered_item ON ws_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ws_promo_sk = filtered_promotion.p_promo_sk WHERE ws_wholesale_cost BETWEEN 23 AND 38 GROUP BY web_site_id",
+        "interfaces": {"outputs": ["web_site_id", "sales", "returns", "profit"], "consumes": ["filtered_date", "filtered_item", "filtered_promotion"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "unchanged",
+        "sql": "SELECT channel, id, SUM(sales) AS sales, SUM(returns) AS returns, SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, returns, profit FROM ssr UNION ALL SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, returns, profit FROM csr UNION ALL SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, returns, profit FROM wsr) x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100",
+        "interfaces": {"outputs": ["channel", "id", "sales", "returns", "profit"], "consumes": ["ssr", "csr", "wsr"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "filtered_promotion", "ssr", "csr", "wsr", "main_query"],
+    "assembly_template": "WITH filtered_date AS (NOT MATERIALIZED {filtered_date}), filtered_item AS (NOT MATERIALIZED {filtered_item}), filtered_promotion AS (NOT MATERIALIZED {filtered_promotion}), ssr AS ({ssr}), csr AS ({csr}), wsr AS ({wsr}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL max_parallel_workers_per_gather = 4",
+    "SET LOCAL work_mem = '256MB'",
+    "SET LOCAL enable_nestloop = off",
+    "SET LOCAL enable_hashjoin = on",
+    "SET LOCAL enable_mergejoin = off",
+    "SET LOCAL parallel_tuple_cost = 0.001",
+    "SET LOCAL parallel_setup_cost = 1"
+  ],
+  "validation_checks": []
+}
+```
+
+## Changes and Expected Speedup
+
+**Changes**: Converted comma‑joins to explicit JOIN syntax and pre‑filtered selective dimensions using `NOT MATERIALIZED` CTEs, allowing the planner to push predicates and choose parallel hash joins. Configuration encourages parallel scans and larger hash tables.
+
+**Expected speedup**: ≥2.0x. The rewrite eliminates the comma‑join weakness, reduces nested‑loop pressure, and enables parallel fact‑table scans while keeping dimension filters lightweight. The NOT MATERIALIZED CTEs avoid the materialization fence, allowing the planner to reorder joins and use bitmap index scans on the fact tables.

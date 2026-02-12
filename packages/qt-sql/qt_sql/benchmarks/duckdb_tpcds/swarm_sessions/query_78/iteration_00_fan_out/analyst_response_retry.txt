@@ -1,0 +1,298 @@
+<reasoning>
+1. **CLASSIFY**: This is a multi-channel comparison query with three independent CTEs (store, web, catalog) that each aggregate non-returned sales by year-item-customer, followed by a main query that left-joins them on those dimensions. Structural archetype: channel-comparison self-join.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total execution: 8543ms
+   - Breakdown:
+     - store_sales CTE (ss): 2653ms (31% exclusive) - aggregates 5.5M rows → 4.9M rows (bottleneck)
+     - catalog_sales CTE (cs): 1175ms (14% exclusive) - aggregates 2.9M rows → 2.6M rows
+     - web_sales CTE (ws): 613ms (7% exclusive) - aggregates 1.4M rows → 1.3M rows
+     - Main query joins: ss+ws (499ms), ss+ws+cs (810ms), filter (113ms)
+   - Row count drops:
+     - date_dim: 73K → 366 rows (year=2000 filter pushed)
+     - store_sales: 345.6M → 5.5M rows (date filter effective)
+     - web_sales: 86.4M → 1.4M rows
+     - catalog_sales: 172.8M → 2.9M rows
+   - Each fact table scanned once per channel CTE (3 total scans of different tables)
+   - CTEs appear materialized once (each referenced once in main query)
+   - Optimizer already pushes year=2000 filter into date_dim joins (seen in FILTER nodes with d_date_sk range)
+
+3. **GAP MATCHING**:
+   - CROSS_CTE_PREDICATE_BLINDNESS: Yes. Each CTE independently joins with date_dim filtered to year=2000. Opportunity: share a single filtered date CTE.
+   - REDUNDANT_SCAN_ELIMINATION: No. Each fact table scanned only once (different tables). However, the same date_dim table is scanned 3 times.
+   - UNION_CTE_SELF_JOIN_DECOMPOSITION: No. No UNION or self-join of a generic CTE.
+   - CORRELATED_SUBQUERY_PARALYSIS: No correlated subqueries.
+   - CROSS_COLUMN_OR_DECOMPOSITION: No OR conditions on different columns.
+   - Engine strengths already handle: predicate pushdown (year=2000 pushed to date_dim scans), columnar projection, hash join selection.
+
+4. **AGGREGATION TRAP CHECK**: All aggregates are SUMs of numeric columns, grouping by year+item+customer. No duplicate-sensitive functions (STDDEV, AVG) or FILTER clauses. Changing group membership would break, but all transforms preserve the same grouping columns.
+
+5. **TRANSFORM SELECTION** (diverse strategies):
+   - Worker 1: **star_join_prefetch** - pre-filter date_dim into CTE, pre-join with each fact table in separate CTEs. Attacks redundant date_dim scans.
+   - Worker 2: **single_pass_aggregation** - consolidate the three channel CTEs into a single scan of all fact tables? Not possible - different tables. Instead: **scan_consolidation_pivot** - since main query filters to year=2000, push filter into CTEs and potentially pivot web/catalog aggregates into columns via CASE.
+   - Worker 3: **self_join_elimination** - split the generic CTEs (which group by all years) into specialized 2000-only CTEs. Eliminates grouping over unnecessary years.
+   - Worker 4 (exploration): **late_attribute_binding** - defer the customer dimension? Not used. Instead try **compound strategy**: combine date CTE isolation with early filter pushdown and restructure joins.
+
+6. **LOGICAL TREE DESIGN**:
+   - Verify column completeness: Each CTE must output year, item_sk, customer_sk, and the three aggregates (qty, wc, sp).
+   - Design shared CTEs where multiple consumers exist (date_2000 used by all three channel CTEs).
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Compare store channel quantity/value against combined web+catalog for same customer-item-year in 2000, excluding returned transactions. JOIN semantics: store CTE (ss) is driving left side; web/catalog CTEs left-joined on year-item-customer intersection. Aggregation trap: SUM aggregates are duplicate-insensitive but must preserve same group membership (year, item_sk, customer_sk). Filter dependencies: year=2000 filter applies to all channels; NULL check on return keys filters non-returned rows; main query's OR(ws_qty>0, cs_qty>0) must remain after joins.
+
+BOTTLENECK_DIAGNOSIS: Aggregation-bound on store_sales CTE (31% exclusive time, 2653ms) scanning 5.5M rows and grouping to 4.9M rows. Cardinality flow: date_dim filters to 366 rows early; store_sales reduces from 345.6M to 5.5M via date join; web/catalog similarly reduced. Optimizer already pushes year=2000 predicate into date_dim scans; logical-tree cost percentages misleading as store aggregation dominates but join costs also significant (combined ~15%).
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output ss_item_sk, ratio, store_qty, store_wholesale_cost, store_sales_price, other_chan_qty, other_chan_wholesale_cost, other_chan_sales_price in exact order.
+- CTE_COLUMN_COMPLETENESS: Each channel CTE must output sold_year, item_sk, customer_sk, qty, wc, sp for downstream joins.
+- LITERAL_PRESERVATION: Year value 2000 must remain exactly.
+- SEMANTIC_EQUIVALENCE: Same rows, ordering (8-column ORDER BY), and limit 100.
+- CROSS_CTE_PREDICATE_BLINDNESS: Each CTE independently scans date_dim filtered to year=2000 (3 scans of same 366 rows).
+- REDUNDANT_SCAN_ELIMINATION: date_dim scanned 3 times; opportunity to share.
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (regression_q31_pushdown):
+   CAUSE: Created filtered CTEs but kept original unfiltered versions, causing redundant materialization.
+   RULE: When creating date_2000 CTE, remove original date_dim joins from channel CTEs and join to date_2000 instead.
+2. pushdown (regression_q74_pushdown):
+   CAUSE: Split UNION CTE by year but kept original UNION CTE, causing redundant computation.
+   RULE: When splitting CTEs by year, eliminate the original generic CTE entirely.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_2000 -> ws_pre -> cs_pre -> ss_pre -> main_query
+NODE_CONTRACTS:
+  date_2000:
+    FROM: date_dim
+    WHERE: d_year = 2000
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: 366
+    CONSUMERS: ws_pre, cs_pre, ss_pre
+  ws_pre:
+    FROM: web_sales LEFT JOIN web_returns ON wr_order_number=ws_order_number AND ws_item_sk=wr_item_sk
+          JOIN date_2000 ON ws_sold_date_sk = d_date_sk
+    WHERE: wr_order_number IS NULL
+    GROUP BY: d_year, ws_item_sk, ws_bill_customer_sk
+    AGGREGATE: sum(ws_quantity) AS ws_qty, sum(ws_wholesale_cost) AS ws_wc, sum(ws_sales_price) AS ws_sp
+    OUTPUT: d_year AS ws_sold_year, ws_item_sk, ws_bill_customer_sk AS ws_customer_sk, ws_qty, ws_wc, ws_sp
+    EXPECTED_ROWS: 1.3M
+    CONSUMERS: main_query
+  cs_pre:
+    FROM: catalog_sales LEFT JOIN catalog_returns ON cr_order_number=cs_order_number AND cs_item_sk=cr_item_sk
+          JOIN date_2000 ON cs_sold_date_sk = d_date_sk
+    WHERE: cr_order_number IS NULL
+    GROUP BY: d_year, cs_item_sk, cs_bill_customer_sk
+    AGGREGATE: sum(cs_quantity) AS cs_qty, sum(cs_wholesale_cost) AS cs_wc, sum(cs_sales_price) AS cs_sp
+    OUTPUT: d_year AS cs_sold_year, cs_item_sk, cs_bill_customer_sk AS cs_customer_sk, cs_qty, cs_wc, cs_sp
+    EXPECTED_ROWS: 2.6M
+    CONSUMERS: main_query
+  ss_pre:
+    FROM: store_sales LEFT JOIN store_returns ON sr_ticket_number=ss_ticket_number AND ss_item_sk=sr_item_sk
+          JOIN date_2000 ON ss_sold_date_sk = d_date_sk
+    WHERE: sr_ticket_number IS NULL
+    GROUP BY: d_year, ss_item_sk, ss_customer_sk
+    AGGREGATE: sum(ss_quantity) AS ss_qty, sum(ss_wholesale_cost) AS ss_wc, sum(ss_sales_price) AS ss_sp
+    OUTPUT: d_year AS ss_sold_year, ss_item_sk, ss_customer_sk, ss_qty, ss_wc, ss_sp
+    EXPECTED_ROWS: 4.9M
+    CONSUMERS: main_query
+  main_query:
+    FROM: ss_pre LEFT JOIN ws_pre ON (ws_sold_year=ss_sold_year AND ws_item_sk=ss_item_sk AND ws_customer_sk=ss_customer_sk)
+          LEFT JOIN cs_pre ON (cs_sold_year=ss_sold_year AND cs_item_sk=ss_item_sk AND cs_customer_sk=ss_customer_sk)
+    WHERE: (COALESCE(ws_qty,0) > 0 OR COALESCE(cs_qty,0) > 0)
+    ORDER BY: ss_item_sk ASC, ss_qty DESC, ss_wc DESC, ss_sp DESC, (COALESCE(ws_qty,0)+COALESCE(cs_qty,0)) ASC, (COALESCE(ws_wc,0)+COALESCE(cs_wc,0)) ASC, (COALESCE(ws_sp,0)+COALESCE(cs_sp,0)) ASC, ROUND(ss_qty/(COALESCE(ws_qty,0)+COALESCE(cs_qty,0)),2) ASC
+    LIMIT: 100
+    OUTPUT: ss_item_sk, ROUND(ss_qty/(COALESCE(ws_qty,0)+COALESCE(cs_qty,0)),2) AS ratio, ss_qty AS store_qty, ss_wc AS store_wholesale_cost, ss_sp AS store_sales_price, COALESCE(ws_qty,0)+COALESCE(cs_qty,0) AS other_chan_qty, COALESCE(ws_wc,0)+COALESCE(cs_wc,0) AS other_chan_wholesale_cost, COALESCE(ws_sp,0)+COALESCE(cs_sp,0) AS other_chan_sales_price
+    EXPECTED_ROWS: 735 → 100
+    CONSUMERS: none
+
+EXAMPLES: date_cte_isolate, shared_dimension_multi_channel, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: apply the pattern of extracting date filter into CTE; ignore the scalar subquery aspect (not present).
+- shared_dimension_multi_channel: apply shared date filter across channels; ignore item/promotion filters (not present).
+- dimension_cte_isolate: apply pre-filtering dimension into CTE; ignore other dimensions (only date).
+HAZARD_FLAGS:
+- Must ensure date_2000 CTE includes both d_date_sk (for join) and d_year (for group by).
+- Removing original date_dim joins from channel CTEs is critical to avoid redundant scans.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: scan_consolidation_pivot
+TARGET_LOGICAL_TREE:
+  date_2000 -> sales_combined -> main_pivot
+NODE_CONTRACTS:
+  date_2000:
+    FROM: date_dim
+    WHERE: d_year = 2000
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: 366
+    CONSUMERS: sales_combined
+  sales_combined:
+    FROM: (
+        SELECT 'store' AS channel, d_year, ss_item_sk AS item_sk, ss_customer_sk AS customer_sk,
+               SUM(ss_quantity) AS qty, SUM(ss_wholesale_cost) AS wc, SUM(ss_sales_price) AS sp
+        FROM store_sales LEFT JOIN store_returns ON sr_ticket_number=ss_ticket_number AND ss_item_sk=sr_item_sk
+             JOIN date_2000 ON ss_sold_date_sk = d_date_sk
+        WHERE sr_ticket_number IS NULL
+        GROUP BY d_year, ss_item_sk, ss_customer_sk
+        UNION ALL
+        SELECT 'web' AS channel, d_year, ws_item_sk, ws_bill_customer_sk,
+               SUM(ws_quantity), SUM(ws_wholesale_cost), SUM(ws_sales_price)
+        FROM web_sales LEFT JOIN web_returns ON wr_order_number=ws_order_number AND ws_item_sk=wr_item_sk
+             JOIN date_2000 ON ws_sold_date_sk = d_date_sk
+        WHERE wr_order_number IS NULL
+        GROUP BY d_year, ws_item_sk, ws_bill_customer_sk
+        UNION ALL
+        SELECT 'catalog' AS channel, d_year, cs_item_sk, cs_bill_customer_sk,
+               SUM(cs_quantity), SUM(cs_wholesale_cost), SUM(cs_sales_price)
+        FROM catalog_sales LEFT JOIN catalog_returns ON cr_order_number=cs_order_number AND cs_item_sk=cr_item_sk
+             JOIN date_2000 ON cs_sold_date_sk = d_date_sk
+        WHERE cr_order_number IS NULL
+        GROUP BY d_year, cs_item_sk, cs_bill_customer_sk
+    )
+    OUTPUT: channel, d_year AS sold_year, item_sk, customer_sk, qty, wc, sp
+    EXPECTED_ROWS: 4.9M + 1.3M + 2.6M = ~8.8M
+    CONSUMERS: main_pivot
+  main_pivot:
+    FROM: (SELECT * FROM sales_combined WHERE channel='store') s
+          LEFT JOIN (SELECT * FROM sales_combined WHERE channel='web') w 
+            ON w.sold_year=s.sold_year AND w.item_sk=s.item_sk AND w.customer_sk=s.customer_sk
+          LEFT JOIN (SELECT * FROM sales_combined WHERE channel='catalog') c 
+            ON c.sold_year=s.sold_year AND c.item_sk=s.item_sk AND c.customer_sk=s.customer_sk
+    WHERE: (COALESCE(w.qty,0) > 0 OR COALESCE(c.qty,0) > 0)
+    ORDER BY: s.item_sk ASC, s.qty DESC, s.wc DESC, s.sp DESC, (COALESCE(w.qty,0)+COALESCE(c.qty,0)) ASC, (COALESCE(w.wc,0)+COALESCE(c.wc,0)) ASC, (COALESCE(w.sp,0)+COALESCE(c.sp,0)) ASC, ROUND(s.qty/(COALESCE(w.qty,0)+COALESCE(c.qty,0)),2) ASC
+    LIMIT: 100
+    OUTPUT: s.item_sk AS ss_item_sk, ROUND(s.qty/(COALESCE(w.qty,0)+COALESCE(c.qty,0)),2) AS ratio, s.qty AS store_qty, s.wc AS store_wholesale_cost, s.sp AS store_sales_price, COALESCE(w.qty,0)+COALESCE(c.qty,0) AS other_chan_qty, COALESCE(w.wc,0)+COALESCE(c.wc,0) AS other_chan_wholesale_cost, COALESCE(w.sp,0)+COALESCE(c.sp,0) AS other_chan_sales_price
+    EXPECTED_ROWS: 735 → 100
+    CONSUMERS: none
+
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: consolidate multiple fact scans into UNION ALL with same structure; ignore CASE pivoting (different tables).
+- channel_bitmap_aggregation: apply consolidation of repeated scans; ignore bitmap technique (not needed).
+HAZARD_FLAGS:
+- UNION ALL may increase intermediate rows (8.8M vs original 4.9M+1.3M+2.6M separately).
+- Must ensure each branch includes correct column aliases for consistent joins.
+- Pivoting via self-joins on sales_combined may be costly if not indexed.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: self_join_elimination
+TARGET_LOGICAL_TREE:
+  ws_2000 -> cs_2000 -> ss_2000 -> main_query
+NODE_CONTRACTS:
+  ws_2000:
+    FROM: web_sales LEFT JOIN web_returns ON wr_order_number=ws_order_number AND ws_item_sk=wr_item_sk
+          JOIN date_dim ON ws_sold_date_sk = d_date_sk
+    WHERE: wr_order_number IS NULL AND d_year = 2000
+    GROUP BY: d_year, ws_item_sk, ws_bill_customer_sk
+    AGGREGATE: sum(ws_quantity) AS ws_qty, sum(ws_wholesale_cost) AS ws_wc, sum(ws_sales_price) AS ws_sp
+    OUTPUT: d_year AS ws_sold_year, ws_item_sk, ws_bill_customer_sk AS ws_customer_sk, ws_qty, ws_wc, ws_sp
+    EXPECTED_ROWS: 1.3M
+    CONSUMERS: main_query
+  cs_2000:
+    FROM: catalog_sales LEFT JOIN catalog_returns ON cr_order_number=cs_order_number AND cs_item_sk=cr_item_sk
+          JOIN date_dim ON cs_sold_date_sk = d_date_sk
+    WHERE: cr_order_number IS NULL AND d_year = 2000
+    GROUP BY: d_year, cs_item_sk, cs_bill_customer_sk
+    AGGREGATE: sum(cs_quantity) AS cs_qty, sum(cs_wholesale_cost) AS cs_wc, sum(cs_sales_price) AS cs_sp
+    OUTPUT: d_year AS cs_sold_year, cs_item_sk, cs_bill_customer_sk AS cs_customer_sk, cs_qty, cs_wc, cs_sp
+    EXPECTED_ROWS: 2.6M
+    CONSUMERS: main_query
+  ss_2000:
+    FROM: store_sales LEFT JOIN store_returns ON sr_ticket_number=ss_ticket_number AND ss_item_sk=sr_item_sk
+          JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE: sr_ticket_number IS NULL AND d_year = 2000
+    GROUP BY: d_year, ss_item_sk, ss_customer_sk
+    AGGREGATE: sum(ss_quantity) AS ss_qty, sum(ss_wholesale_cost) AS ss_wc, sum(ss_sales_price) AS ss_sp
+    OUTPUT: d_year AS ss_sold_year, ss_item_sk, ss_customer_sk, ss_qty, ss_wc, ss_sp
+    EXPECTED_ROWS: 4.9M
+    CONSUMERS: main_query
+  main_query:
+    FROM: ss_2000 LEFT JOIN ws_2000 ON (ws_sold_year=ss_sold_year AND ws_item_sk=ss_item_sk AND ws_customer_sk=ss_customer_sk)
+          LEFT JOIN cs_2000 ON (cs_sold_year=ss_sold_year AND cs_item_sk=ss_item_sk AND cs_customer_sk=ss_customer_sk)
+    WHERE: (COALESCE(ws_qty,0) > 0 OR COALESCE(cs_qty,0) > 0)
+    ORDER BY: ss_item_sk ASC, ss_qty DESC, ss_wc DESC, ss_sp DESC, (COALESCE(ws_qty,0)+COALESCE(cs_qty,0)) ASC, (COALESCE(ws_wc,0)+COALESCE(cs_wc,0)) ASC, (COALESCE(ws_sp,0)+COALESCE(cs_sp,0)) ASC, ROUND(ss_qty/(COALESCE(ws_qty,0)+COALESCE(cs_qty,0)),2) ASC
+    LIMIT: 100
+    OUTPUT: ss_item_sk, ROUND(ss_qty/(COALESCE(ws_qty,0)+COALESCE(cs_qty,0)),2) AS ratio, ss_qty AS store_qty, ss_wc AS store_wholesale_cost, ss_sp AS store_sales_price, COALESCE(ws_qty,0)+COALESCE(cs_qty,0) AS other_chan_qty, COALESCE(ws_wc,0)+COALESCE(cs_wc,0) AS other_chan_wholesale_cost, COALESCE(ws_sp,0)+COALESCE(cs_sp,0) AS other_chan_sales_price
+    EXPECTED_ROWS: 735 → 100
+    CONSUMERS: none
+
+EXAMPLES: union_cte_split, early_filter, pushdown
+EXAMPLE_ADAPTATION:
+- union_cte_split: apply splitting generic CTE by year; ignore UNION structure (not present).
+- early_filter: push year filter into CTE definitions; ignore dimension pre-filtering (already done).
+- pushdown: push year filter from main query into CTEs; ignore consolidation aspect.
+HAZARD_FLAGS:
+- Must eliminate original generic CTEs (ws, cs, ss) that group by all years.
+- Year filter pushdown may already be optimized by engine; ensure not duplicating work.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_star_join_with_early_aggregate
+TARGET_LOGICAL_TREE:
+  date_2000 -> sales_prejoined -> channel_aggregates -> main_query
+NODE_CONTRACTS:
+  date_2000:
+    FROM: date_dim
+    WHERE: d_year = 2000
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: 366
+    CONSUMERS: sales_prejoined
+  sales_prejoined:
+    FROM: (
+        SELECT d_year, ss_item_sk AS item_sk, ss_customer_sk AS customer_sk,
+               ws_item_sk, ws_bill_customer_sk, cs_item_sk, cs_bill_customer_sk,
+               ss_quantity, ss_wholesale_cost, ss_sales_price,
+               ws_quantity, ws_wholesale_cost, ws_sales_price,
+               cs_quantity, cs_wholesale_cost, cs_sales_price,
+               sr_ticket_number, wr_order_number, cr_order_number
+        FROM store_sales
+        LEFT JOIN store_returns ON sr_ticket_number=ss_ticket_number AND ss_item_sk=sr_item_sk
+        LEFT JOIN web_sales ON ws_sold_date_sk = d_date_sk AND ws_item_sk = ss_item_sk AND ws_bill_customer_sk = ss_customer_sk
+        LEFT JOIN web_returns ON wr_order_number=ws_order_number AND ws_item_sk=wr_item_sk
+        LEFT JOIN catalog_sales ON cs_sold_date_sk = d_date_sk AND cs_item_sk = ss_item_sk AND cs_bill_customer_sk = ss_customer_sk
+        LEFT JOIN catalog_returns ON cr_order_number=cs_order_number AND cs_item_sk=cr_item_sk
+        JOIN date_2000 ON ss_sold_date_sk = d_date_sk
+    ) 
+    WHERE: sr_ticket_number IS NULL AND wr_order_number IS NULL AND cr_order_number IS NULL
+    OUTPUT: d_year, item_sk, customer_sk, 
+            ss_quantity, ss_wholesale_cost, ss_sales_price,
+            ws_quantity, ws_wholesale_cost, ws_sales_price,
+            cs_quantity, cs_wholesale_cost, cs_sales_price
+    EXPECTED_ROWS: <= 5.5M (store_sales rows)
+    CONSUMERS: channel_aggregates
+  channel_aggregates:
+    FROM: sales_prejoined
+    GROUP BY: d_year, item_sk, customer_sk
+    AGGREGATE: 
+        SUM(ss_quantity) AS ss_qty, SUM(ss_wholesale_cost) AS ss_wc, SUM(ss_sales_price) AS ss_sp,
+        SUM(ws_quantity) AS ws_qty, SUM(ws_wholesale_cost) AS ws_wc, SUM(ws_sales_price) AS ws_sp,
+        SUM(cs_quantity) AS cs_qty, SUM(cs_wholesale_cost) AS cs_wc, SUM(cs_sales_price) AS cs_sp
+    OUTPUT: d_year AS sold_year, item_sk, customer_sk, ss_qty, ss_wc, ss_sp, ws_qty, ws_wc, ws_sp, cs_qty, cs_wc, cs_sp
+    EXPECTED_ROWS: ~4.9M (same as ss CTE)
+    CONSUMERS: main_query
+  main_query:
+    FROM: channel_aggregates
+    WHERE: (COALESCE(ws_qty,0) > 0 OR COALESCE(cs_qty,0) > 0)
+    ORDER BY: item_sk ASC, ss_qty DESC, ss_wc DESC, ss_sp DESC, (COALESCE(ws_qty,0)+COALESCE(cs_qty,0)) ASC, (COALESCE(ws_wc,0)+COALESCE(cs_wc,0)) ASC, (COALESCE(ws_sp,0)+COALESCE(cs_sp,0)) ASC, ROUND(ss_qty/(COALESCE(ws_qty,0)+COALESCE(cs_qty,0)),2) ASC
+    LIMIT: 100
+    OUTPUT: item_sk AS ss_item_sk, ROUND(ss_qty/(COALESCE(ws_qty,0)+COALESCE(cs_qty,0)),2) AS ratio, ss_qty AS store_qty, ss_wc AS store_wholesale_cost, ss_sp AS store_sales_price, COALESCE(ws_qty,0)+COALESCE(cs_qty,0) AS other_chan_qty, COALESCE(ws_wc,0)+COALESCE(cs_wc,0) AS other_chan_wholesale_cost, COALESCE(ws_sp,0)+COALESCE(cs_sp,0) AS other_chan_sales_price
+    EXPECTED_ROWS: 735 → 100
+    CONSUMERS: none
+
+EXAMPLES: prefetch_fact_join, multi_dimension_prefetch, deferred_window_aggregation
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: apply staged join pipeline (date → fact → aggregates); ignore window functions.
+- multi_dimension_prefetch: pre-filter date into CTE; ignore other dimensions.
+- deferred_window_aggregation: delay aggregation until after joins? Actually aggregating after joins here; ignore window aspect.
+HAZARD_FLAGS:
+- Large fan-out possible: joining web_sales and catalog_sales to store_sales may explode rows if not 1:1.
+- NULL handling in WHERE clause may incorrectly filter rows (need to ensure LEFT JOIN semantics preserved).
+- Aggregation after multi-way join may compute incorrect sums if duplicates introduced.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This exploration attempts a novel join order that aggregates after joining all channels, which differs from regression patterns that involved UNION CTE duplication or early materialization overhead.
+EXPLORATION_TYPE: novel_combination

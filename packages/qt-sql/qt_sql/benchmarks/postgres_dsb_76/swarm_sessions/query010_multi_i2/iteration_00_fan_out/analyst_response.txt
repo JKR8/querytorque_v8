@@ -1,0 +1,340 @@
+<reasoning>
+1. **CLASSIFY**: This is a multi-channel customer analysis query with EXISTS semi-joins across three sales channels (store, web, catalog). Structural archetype: "multi-channel UNION ALL" disguised as OR-connected EXISTS subqueries. The query filters customers by demographics and geography, then checks if they have sales in any of three channels during a specific period with item/category filters. The main aggregation is on customer demographics columns.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total execution: 1513ms
+   - Major cost centers:
+     - Store_sales scan: 1115.5ms (Aggregate + Gather + Nested Loop) - 74% of total runtime
+     - Catalog_sales scan: 327ms (Gather + Nested Loop) - 22% of total runtime
+     - Web_sales scan: minimal (0.2ms in nested loop)
+   - Row flow:
+     - date_dim scans: 41 rows each (3 scans total)
+     - store_sales: 45K rows before filter → 1,101 after price ratio filter (96% filtered out)
+     - catalog_sales: 20K rows before filter → 485 after price ratio filter (98% filtered out)
+     - web_sales: minimal rows
+   - Existing selectivity: Price ratio filters remove 96-98% of fact rows. date_dim filters are very selective (41 rows).
+   - Missed opportunities: Same date_dim and item filters applied three times independently. Each channel re-scans the same dimension tables. No sharing of dimension table results.
+   - Scan counts: date_dim scanned 3 times, item table scanned 3 times (once per channel). store_sales and catalog_sales are large scans.
+
+3. **GAP MATCHING**:
+   - COMMA_JOIN_WEAKNESS: Present. Query uses comma-separated joins for customer, customer_address, customer_demographics. EXPLAIN shows nested loop joins with index scans.
+   - CROSS_CTE_PREDICATE_BLINDNESS: Present. Same dimension filters (date_dim, item) appear in three separate EXISTS subqueries, causing repeated scans.
+   - CORRELATED_SUBQUERY_PARALYSIS: Not present. EXISTS subqueries are already converted to semi-joins by optimizer (hashed SubPlan in EXPLAIN).
+   - NON_EQUI_JOIN_INPUT_BLINDNESS: Not applicable (no non-equi joins beyond price ratio filters).
+
+4. **AGGREGATION TRAP CHECK**: Query uses COUNT(*) only, which is duplicate-safe and grouping-insensitive. No FILTER clauses. Safe to restructure.
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   a) **star_join_prefetch** + **COMMA_JOIN_WEAKNESS fix**: Pre-filter date_dim and item into CTEs, convert to explicit JOINs. Expected high value due to eliminating 2 of 3 dimension scans.
+   b) **scan_consolidation_pivot**: Consolidate three channel checks into single scan with UNION ALL, then pivot. Reduces dimension scans from 3 to 1.
+   c) **single_pass_aggregation**: Merge channel existence checks into bitmap aggregation. More complex but could eliminate multiple fact scans.
+   d) **minimal-change baseline**: Just fix comma joins to explicit JOINs with join_collapse_limit=1.
+
+6. **LOGICAL TREE DESIGN**:
+   For each strategy, need CTEs that output all required columns:
+   - customer columns: c_customer_sk (join key), c_current_addr_sk, c_current_cdemo_sk, c_birth_month
+   - customer_address: ca_address_sk, ca_county
+   - customer_demographics: all columns in SELECT/GROUP BY plus cd_demo_sk
+   - date_dim: d_date_sk
+   - item: i_item_sk, i_category, i_manager_id
+   - sales tables: customer key, item key, date key, price columns
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: This query analyzes male customers with specific demographics who made purchases in Children/Home/Women categories at 65-75% discount during May-August 1999, grouped by 8 demographic attributes. JOIN semantics are INNER: all customer records must match address, demographics, and at least one sales channel. Aggregation uses only COUNT(*) which is duplicate-safe. Filter dependencies: price ratio filters must be applied per sales record before EXISTS evaluation; county, birth_month, and demographic filters apply to base customer.
+
+BOTTLENECK_DIAGNOSIS: The query is scan-bound with 74% runtime on store_sales scan and 22% on catalog_sales scan. Cardinality flow: date_dim → 41 rows, store_sales → 45K rows → 1,101 after price filter, catalog_sales → 20K rows → 485 after price filter. The optimizer already converts EXISTS to semi-joins and uses parallel execution. Logical-tree costs are misleading: store_sales scan dominates despite lower logical cost percentage.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs 14 columns (8 grouping + 6 counts)
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream
+- LITERAL_PRESERVATION: All literal values (county names, birth months, categories, etc.) must be preserved exactly
+- SEMANTIC_EQUIVALENCE: Must return same rows with same grouping
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated joins for customer, address, demographics tables
+- CROSS_CTE_PREDICATE_BLINDNESS: Same date_dim and item filters repeated in three EXISTS subqueries
+
+REGRESSION_WARNINGS:
+1. CTE blocking parallelism (observed regression in Q042):
+   CAUSE: Materialized CTEs prevent parallel table scans within the CTE
+   RULE: Avoid MATERIALIZED on large fact table CTEs; use WITH without MATERIALIZED
+2. EXISTS to IN conversion (observed 0.50x on Q069):
+   CAUSE: Converting EXISTS to IN materializes full subquery results
+   RULE: Preserve EXISTS semi-join structure; do not convert to IN
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch_with_explicit_joins
+TARGET_LOGICAL_TREE:
+  filtered_dates -> filtered_items -> customer_base -> sales_union -> final_aggregation
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy BETWEEN 5 AND 8
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 41
+    CONSUMERS: sales_union
+  filtered_items:
+    FROM: item
+    WHERE: i_category IN ('Children', 'Home', 'Women') AND i_manager_id BETWEEN 91 AND 100
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: ~1000 (estimate)
+    CONSUMERS: sales_union
+  customer_base:
+    FROM: customer c INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+          INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+    WHERE: ca.ca_county IN ('Alameda County','Lexington city','Pender County','Petroleum County','Walworth County')
+           AND c.c_birth_month IN (4, 5)
+           AND cd.cd_marital_status IN ('U', 'S', 'U')
+           AND cd.cd_education_status IN ('College', 'Secondary', 'College')
+           AND cd.cd_gender = 'M'
+    OUTPUT: c.c_customer_sk, cd.cd_gender, cd.cd_marital_status, cd.cd_education_status,
+            cd.cd_purchase_estimate, cd.cd_credit_rating, cd.cd_dep_count,
+            cd.cd_dep_employed_count, cd.cd_dep_college_count
+    EXPECTED_ROWS: ~4 (from EXPLAIN: rows=4 at Nested Loop Inner)
+    CONSUMERS: sales_union, final_aggregation
+  sales_union:
+    FROM: (SELECT ss_customer_sk AS customer_sk FROM store_sales ss 
+           JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk
+           JOIN filtered_items fi ON ss.ss_item_sk = fi.i_item_sk
+           WHERE ss.ss_sales_price / ss.ss_list_price BETWEEN 0.65 AND 0.75
+           UNION
+           SELECT ws_bill_customer_sk FROM web_sales ws
+           JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk
+           JOIN filtered_items fi ON ws.ws_item_sk = fi.i_item_sk
+           WHERE ws.ws_sales_price / ws.ws_list_price BETWEEN 0.65 AND 0.75
+           UNION
+           SELECT cs_ship_customer_sk FROM catalog_sales cs
+           JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk
+           JOIN filtered_items fi ON cs.cs_item_sk = fi.i_item_sk
+           WHERE cs.cs_sales_price / cs.cs_list_price BETWEEN 0.65 AND 0.75) sales
+    OUTPUT: customer_sk
+    EXPECTED_ROWS: ~2000 (distinct customers meeting criteria)
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: customer_base cb 
+    WHERE: EXISTS (SELECT 1 FROM sales_union su WHERE su.customer_sk = cb.c_customer_sk)
+    GROUP BY: cb.cd_gender, cb.cd_marital_status, cb.cd_education_status,
+              cb.cd_purchase_estimate, cb.cd_credit_rating, cb.cd_dep_count,
+              cb.cd_dep_employed_count, cb.cd_dep_college_count
+    AGGREGATE: COUNT(*) AS cnt1, COUNT(*) AS cnt2, COUNT(*) AS cnt3,
+               COUNT(*) AS cnt4, COUNT(*) AS cnt5, COUNT(*) AS cnt6
+    OUTPUT: All 14 columns as original
+    EXPECTED_ROWS: ≤100 (due to LIMIT)
+    CONSUMERS: output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering of date_dim and item into CTEs; convert comma joins to explicit JOIN syntax; ignore the promotion dimension as not present.
+- pg_date_cte_explicit_join: Use date_dim CTE pattern; combine with explicit JOINs for all tables; ignore the single-channel focus as we have three channels.
+HAZARD_FLAGS:
+- UNION instead of UNION ALL may deduplicate unnecessarily; use UNION ALL if customer can appear in multiple channels
+- Materializing filtered_items CTE may block index-only scans on item
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: scan_consolidation_pivot
+TARGET_LOGICAL_TREE:
+  filtered_dates -> filtered_items -> sales_consolidated -> customer_base -> final_aggregation
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy BETWEEN 5 AND 8
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 41
+    CONSUMERS: sales_consolidated
+  filtered_items:
+    FROM: item
+    WHERE: i_category IN ('Children', 'Home', 'Women') AND i_manager_id BETWEEN 91 AND 100
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: ~1000
+    CONSUMERS: sales_consolidated
+  sales_consolidated:
+    FROM: (SELECT 'store' AS channel, ss_customer_sk AS customer_sk 
+           FROM store_sales ss 
+           WHERE EXISTS (SELECT 1 FROM filtered_dates fd WHERE ss.ss_sold_date_sk = fd.d_date_sk)
+           AND EXISTS (SELECT 1 FROM filtered_items fi WHERE ss.ss_item_sk = fi.i_item_sk)
+           AND ss.ss_sales_price / ss.ss_list_price BETWEEN 0.65 AND 0.75
+           UNION ALL
+           SELECT 'web', ws_bill_customer_sk FROM web_sales ws
+           WHERE EXISTS (SELECT 1 FROM filtered_dates fd WHERE ws.ws_sold_date_sk = fd.d_date_sk)
+           AND EXISTS (SELECT 1 FROM filtered_items fi WHERE ws.ws_item_sk = fi.i_item_sk)
+           AND ws.ws_sales_price / ws.ws_list_price BETWEEN 0.65 AND 0.75
+           UNION ALL
+           SELECT 'catalog', cs_ship_customer_sk FROM catalog_sales cs
+           WHERE EXISTS (SELECT 1 FROM filtered_dates fd WHERE cs.cs_sold_date_sk = fd.d_date_sk)
+           AND EXISTS (SELECT 1 FROM filtered_items fi WHERE cs.cs_item_sk = fi.i_item_sk)
+           AND cs.cs_sales_price / cs.cs_list_price BETWEEN 0.65 AND 0.75) sales
+    OUTPUT: customer_sk
+    EXPECTED_ROWS: ~2500 (sum of three channels, with duplicates)
+    CONSUMERS: customer_base
+  customer_base:
+    FROM: customer c INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+          INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+          INNER JOIN sales_consolidated sc ON c.c_customer_sk = sc.customer_sk
+    WHERE: ca.ca_county IN ('Alameda County','Lexington city','Pender County','Petroleum County','Walworth County')
+           AND c.c_birth_month IN (4, 5)
+           AND cd.cd_marital_status IN ('U', 'S', 'U')
+           AND cd.cd_education_status IN ('College', 'Secondary', 'College')
+           AND cd.cd_gender = 'M'
+    OUTPUT: cd.cd_gender, cd.cd_marital_status, cd.cd_education_status,
+            cd.cd_purchase_estimate, cd.cd_credit_rating, cd.cd_dep_count,
+            cd.cd_dep_employed_count, cd.cd_dep_college_count
+    EXPECTED_ROWS: ~4
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: customer_base
+    GROUP BY: All 8 demographic columns
+    AGGREGATE: COUNT(*) AS cnt1, COUNT(*) AS cnt2, COUNT(*) AS cnt3,
+               COUNT(*) AS cnt4, COUNT(*) AS cnt5, COUNT(*) AS cnt6
+    OUTPUT: All 14 columns as original
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: output
+EXAMPLES: pg_self_join_decomposition, single_pass_aggregation
+EXAMPLE_ADAPTATION:
+- pg_self_join_decomposition: Apply materialization of dimension filters into CTEs; scan each sales table once and combine; ignore the self-join aspect as we have different tables.
+- single_pass_aggregation: Use UNION ALL to consolidate multiple fact table scans; ignore the CASE/FILTER aggregation as we only need existence check.
+HAZARD_FLAGS:
+- EXISTS in sales_consolidated CTE may cause nested loops; consider JOIN instead
+- UNION ALL may produce duplicate customer_sk values, but INNER JOIN will handle correctly
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: minimal_change_explicit_joins
+TARGET_LOGICAL_TREE:
+  customer_base -> store_exists -> web_exists -> catalog_exists -> final_aggregation
+NODE_CONTRACTS:
+  customer_base:
+    FROM: customer c INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+          INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+    WHERE: ca.ca_county IN ('Alameda County','Lexington city','Pender County','Petroleum County','Walworth County')
+           AND c.c_birth_month IN (4, 5)
+           AND cd.cd_marital_status IN ('U', 'S', 'U')
+           AND cd.cd_education_status IN ('College', 'Secondary', 'College')
+           AND cd.cd_gender = 'M'
+    OUTPUT: c.c_customer_sk, cd.cd_gender, cd.cd_marital_status, cd.cd_education_status,
+            cd.cd_purchase_estimate, cd.cd_credit_rating, cd.cd_dep_count,
+            cd.cd_dep_employed_count, cd.cd_dep_college_count
+    EXPECTED_ROWS: ~4
+    CONSUMERS: store_exists, web_exists, catalog_exists, final_aggregation
+  store_exists:
+    FROM: store_sales ss INNER JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk
+                         INNER JOIN item i ON ss.ss_item_sk = i.i_item_sk
+    WHERE: d.d_year = 1999 AND d.d_moy BETWEEN 5 AND 8
+           AND i.i_category IN ('Children', 'Home', 'Women') AND i.i_manager_id BETWEEN 91 AND 100
+           AND ss.ss_sales_price / ss.ss_list_price BETWEEN 0.65 AND 0.75
+           AND EXISTS (SELECT 1 FROM customer_base cb WHERE cb.c_customer_sk = ss.ss_customer_sk)
+    OUTPUT: ss.ss_customer_sk
+    EXPECTED_ROWS: ~1,101 (from EXPLAIN)
+    CONSUMERS: final_aggregation
+  web_exists:
+    FROM: web_sales ws INNER JOIN date_dim d ON ws.ws_sold_date_sk = d.d_date_sk
+                       INNER JOIN item i ON ws.ws_item_sk = i.i_item_sk
+    WHERE: d.d_year = 1999 AND d.d_moy BETWEEN 5 AND 8
+           AND i.i_category IN ('Children', 'Home', 'Women') AND i.i_manager_id BETWEEN 91 AND 100
+           AND ws.ws_sales_price / ws.ws_list_price BETWEEN 0.65 AND 0.75
+    OUTPUT: ws.ws_bill_customer_sk
+    EXPECTED_ROWS: minimal
+    CONSUMERS: final_aggregation
+  catalog_exists:
+    FROM: catalog_sales cs INNER JOIN date_dim d ON cs.cs_sold_date_sk = d.d_date_sk
+                           INNER JOIN item i ON cs.cs_item_sk = i.i_item_sk
+    WHERE: d.d_year = 1999 AND d.d_moy BETWEEN 5 AND 8
+           AND i.i_category IN ('Children', 'Home', 'Women') AND i.i_manager_id BETWEEN 91 AND 100
+           AND cs.cs_sales_price / cs.cs_list_price BETWEEN 0.65 AND 0.75
+    OUTPUT: cs.cs_ship_customer_sk
+    EXPECTED_ROWS: ~485
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: customer_base cb
+    WHERE: EXISTS (SELECT 1 FROM store_exists se WHERE se.ss_customer_sk = cb.c_customer_sk)
+           OR EXISTS (SELECT 1 FROM web_exists we WHERE we.ws_bill_customer_sk = cb.c_customer_sk)
+           OR EXISTS (SELECT 1 FROM catalog_exists ce WHERE ce.cs_ship_customer_sk = cb.c_customer_sk)
+    GROUP BY: All 8 demographic columns
+    AGGREGATE: COUNT(*) AS cnt1, COUNT(*) AS cnt2, COUNT(*) AS cnt3,
+               COUNT(*) AS cnt4, COUNT(*) AS cnt5, COUNT(*) AS cnt6
+    OUTPUT: All 14 columns as original
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: output
+EXAMPLES: pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- pg_date_cte_explicit_join: Convert all comma-separated joins to explicit INNER JOIN syntax; maintain original EXISTS structure; do not create dimension CTEs.
+HAZARD_FLAGS:
+- May not improve performance significantly as optimizer already does semi-joins
+- OR conditions between EXISTS may cause suboptimal plan
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: bitmap_aggregation_single_pass
+TARGET_LOGICAL_TREE:
+  filtered_dates -> filtered_items -> sales_bitmap -> customer_base -> final_aggregation
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy BETWEEN 5 AND 8
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 41
+    CONSUMERS: sales_bitmap
+  filtered_items:
+    FROM: item
+    WHERE: i_category IN ('Children', 'Home', 'Women') AND i_manager_id BETWEEN 91 AND 100
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: ~1000
+    CONSUMERS: sales_bitmap
+  sales_bitmap:
+    FROM: (SELECT ss_customer_sk AS customer_sk, 
+                  BOOL_OR(TRUE) AS has_store
+           FROM store_sales ss 
+           JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk
+           JOIN filtered_items fi ON ss.ss_item_sk = fi.i_item_sk
+           WHERE ss.ss_sales_price / ss.ss_list_price BETWEEN 0.65 AND 0.75
+           GROUP BY ss_customer_sk
+           UNION ALL
+           SELECT ws_bill_customer_sk, BOOL_OR(TRUE) AS has_web
+           FROM web_sales ws
+           JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk
+           JOIN filtered_items fi ON ws.ws_item_sk = fi.i_item_sk
+           WHERE ws.ws_sales_price / ws.ws_list_price BETWEEN 0.65 AND 0.75
+           GROUP BY ws_bill_customer_sk
+           UNION ALL
+           SELECT cs_ship_customer_sk, BOOL_OR(TRUE) AS has_catalog
+           FROM catalog_sales cs
+           JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk
+           JOIN filtered_items fi ON cs.cs_item_sk = fi.i_item_sk
+           WHERE cs.cs_sales_price / cs.cs_list_price BETWEEN 0.65 AND 0.75
+           GROUP BY cs_ship_customer_sk) sales
+    OUTPUT: customer_sk, has_store, has_web, has_catalog
+    EXPECTED_ROWS: ~2000 (distinct customers per channel, with overlaps)
+    CONSUMERS: customer_base
+  customer_base:
+    FROM: customer c INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+          INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+          LEFT JOIN sales_bitmap sb ON c.c_customer_sk = sb.customer_sk
+    WHERE: ca.ca_county IN ('Alameda County','Lexington city','Pender County','Petroleum County','Walworth County')
+           AND c.c_birth_month IN (4, 5)
+           AND cd.cd_marital_status IN ('U', 'S', 'U')
+           AND cd.cd_education_status IN ('College', 'Secondary', 'College')
+           AND cd.cd_gender = 'M'
+           AND (sb.has_store OR sb.has_web OR sb.has_catalog)
+    OUTPUT: cd.cd_gender, cd.cd_marital_status, cd.cd_education_status,
+            cd.cd_purchase_estimate, cd.cd_credit_rating, cd.cd_dep_count,
+            cd.cd_dep_employed_count, cd.cd_dep_college_count
+    EXPECTED_ROWS: ~4
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: customer_base
+    GROUP BY: All 8 demographic columns
+    AGGREGATE: COUNT(*) AS cnt1, COUNT(*) AS cnt2, COUNT(*) AS cnt3,
+               COUNT(*) AS cnt4, COUNT(*) AS cnt5, COUNT(*) AS cnt6
+    OUTPUT: All 14 columns as original
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: output
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Use GROUP BY per channel to reduce rows before joining; ignore the CASE/FILTER in SELECT as we only need existence.
+- channel_bitmap_aggregation: Create bitmap flags per channel; combine with OR in WHERE; novel aspect: using BOOL_OR for existence check.
+HAZARD_FLAGS:
+- BOOL_OR may not be optimized as well as EXISTS
+- LEFT JOIN + WHERE filter may be less efficient than semi-join
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

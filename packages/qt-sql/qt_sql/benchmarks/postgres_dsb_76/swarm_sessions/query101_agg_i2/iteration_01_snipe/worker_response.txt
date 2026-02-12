@@ -1,0 +1,72 @@
+## Logic Tree
+
+[=] Original query structure (comma joins, WHERE)
+[~] Converted comma joins to explicit JOIN syntax
+[+] filtered_d1: pre-filter date_dim for d_year=2000
+[+] filtered_item: pre-filter item for i_category IN ('Children','Home','Women')
+[+] filtered_ca: pre-filter customer_address for ca_state IN
+[+] filtered_hd: pre-filter household_demographics for hd_income_band_sk AND hd_buy_potential
+[~] Main query: rewritten with explicit JOINs using pre-filtered CTEs
+[=] Aggregation and ORDER BY preserved
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "comma_to_explicit_join", "description": "Convert comma-separated FROM to explicit JOIN...ON syntax", "applied_to": ["main_query"]},
+    {"id": "R2", "type": "dimension_prefetch", "description": "Pre-filter selective dimensions into CTEs before joining", "applied_to": ["filtered_d1", "filtered_item", "filtered_ca", "filtered_hd"]},
+    {"id": "R3", "type": "early_fact_filter", "description": "Push ss_sales_price/ss_list_price filter directly on store_sales scan", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_d1": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk FROM item WHERE i_category IN ('Children', 'Home', 'Women')",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "filtered_ca": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('AR', 'GA', 'IN', 'KY', 'VA')",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "filtered_hd": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT hd_demo_sk FROM household_demographics WHERE hd_income_band_sk BETWEEN 8 AND 14 AND hd_buy_potential = '501-1000'",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c.c_customer_sk, c.c_first_name, c.c_last_name, COUNT(*) AS cnt FROM store_sales ss JOIN store_returns sr ON ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_item_sk = sr.sr_item_sk JOIN web_sales ws ON sr.sr_item_sk = ws.ws_item_sk AND ss.ss_customer_sk = ws.ws_bill_customer_sk JOIN filtered_d1 d1 ON sr.sr_returned_date_sk = d1.d_date_sk JOIN date_dim d2 ON ws.ws_sold_date_sk = d2.d_date_sk JOIN filtered_item i ON ss.ss_item_sk = i.i_item_sk JOIN customer c ON ss.ss_customer_sk = c.c_customer_sk JOIN filtered_ca ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN filtered_hd hd ON c.c_current_hdemo_sk = hd.hd_demo_sk WHERE d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '90 day') AND ss.ss_sales_price / ss.ss_list_price BETWEEN 76 * 0.01 AND 96 * 0.01 GROUP BY c.c_customer_sk, c.c_first_name, c.c_last_name ORDER BY cnt",
+        "interfaces": {"outputs": ["c_customer_sk", "c_first_name", "c_last_name", "cnt"], "consumes": ["filtered_d1", "filtered_item", "filtered_ca", "filtered_hd"]}
+      }
+    },
+    "reconstruction_order": ["filtered_d1", "filtered_item", "filtered_ca", "filtered_hd", "main_query"],
+    "assembly_template": "WITH filtered_d1 AS ({filtered_d1}), filtered_item AS ({filtered_item}), filtered_ca AS ({filtered_ca}), filtered_hd AS ({filtered_hd}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '128MB'", "SET LOCAL enable_nestloop = off", "SET LOCAL enable_hashjoin = on", "SET LOCAL enable_mergejoin = off"],
+  "validation_checks": []
+}
+```
+
+## Explanation
+
+**Changes**: Converted comma joins to explicit JOIN syntax and pre‑filtered all selective dimensions into CTEs. This gives PostgreSQL better cardinality estimates and join ordering freedom, while the early price‑ratio filter on `store_sales` reduces the fact table input to the nested loop with `web_sales`.
+
+**Expected speedup**: ≥2.0x. The combination of explicit JOINs and dimension prefetch addresses PostgreSQL’s comma‑join weakness, and pushing the `ss_sales_price/ss_list_price` filter early cuts the most expensive nested‑loop input. The runtime configuration encourages hash joins (more efficient for the small dimension CTEs) and provides sufficient work_mem for the aggregation.

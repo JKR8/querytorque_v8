@@ -1,0 +1,141 @@
+## Modified Logic Tree
+
+```
+QUERY:
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~92K
+    ├── [~] filtered_d2 (CTE)  [cost: 0.1%]
+    │   ├── SCAN date_dim (d2)
+    │   └── FILTER d_year=2000 AND d_moy=8
+    ├── [~] filtered_d1 (CTE)  [cost: 1.2%]
+    │   ├── SCAN date_dim (d1)
+    │   ├── JOIN filtered_d2 (d2)  [INNER]
+    │   └── JOIN CONDITION: d1.d_date BETWEEN (d2.d_date - INTERVAL '120 day') AND d2.d_date
+    ├── [~] store_returns_with_d2 (CTE)  [cost: 4.5%]
+    │   ├── SCAN store_returns
+    │   ├── JOIN filtered_d2 (d2)  [INNER]
+    │   └── JOIN CONDITION: sr_returned_date_sk = d2.d_date_sk
+    ├── [~] store_sales_with_returns (CTE)  [cost: 40%]
+    │   ├── SCAN store_sales
+    │   ├── JOIN store_returns_with_d2  [INNER]
+    │   ├── JOIN filtered_d1  [INNER]
+    │   ├── JOIN CONDITION: ss_ticket_number = sr_ticket_number
+    │   ├── JOIN CONDITION: ss_item_sk = sr_item_sk
+    │   ├── JOIN CONDITION: ss_customer_sk = sr_customer_sk
+    │   └── JOIN CONDITION: ss_sold_date_sk = d1_date_sk
+    ├── [~] store_join (CTE)  [cost: 4%]
+    │   ├── SCAN store
+    │   ├── JOIN store_sales_with_returns  [INNER]
+    │   └── JOIN CONDITION: ss_store_sk = s_store_sk
+    ├── [~] aggregation (main query)  [cost: 50%]
+    │   ├── FROM store_join
+    │   ├── GROUP BY (10 store columns)
+    │   ├── AGGREGATE 5 bucket columns via CASE expressions
+    │   ├── ORDER BY (10 store columns)
+    │   └── LIMIT 100
+    └── OUTPUT unchanged
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "dimension_prefetch",
+      "description": "Extract selective date dimension filters into CTEs with explicit JOIN syntax",
+      "applied_to": ["filtered_d2", "filtered_d1", "store_returns_with_d2"]
+    },
+    {
+      "id": "R2",
+      "type": "staged_reduction",
+      "description": "Materialize fact-dimension joins in staged CTEs to control join order and reduce intermediate result sizes",
+      "applied_to": ["store_sales_with_returns", "store_join"]
+    },
+    {
+      "id": "R3",
+      "type": "preserve_semantic_guards",
+      "description": "Keep all CASE expression guards even when logically unnecessary",
+      "applied_to": ["aggregation"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_d2": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_year = 2000 AND d_moy = 8",
+          "interfaces": {
+            "outputs": ["d_date_sk", "d_date"],
+            "consumes": []
+          }
+        },
+        "filtered_d1": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT d1.d_date_sk AS d1_date_sk, d1.d_date AS d1_date, d2.d_date_sk AS d2_date_sk, d2.d_date AS d2_date FROM date_dim d1 CROSS JOIN filtered_d2 d2 WHERE d1.d_date BETWEEN (d2.d_date - INTERVAL '120 day') AND d2.d_date",
+          "interfaces": {
+            "outputs": ["d1_date_sk", "d1_date", "d2_date_sk", "d2_date"],
+            "consumes": ["filtered_d2"]
+          }
+        },
+        "store_returns_with_d2": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT sr_ticket_number, sr_item_sk, sr_customer_sk, sr_returned_date_sk, d2.d_date AS return_date FROM store_returns INNER JOIN filtered_d2 d2 ON sr_returned_date_sk = d2.d_date_sk",
+          "interfaces": {
+            "outputs": ["sr_ticket_number", "sr_item_sk", "sr_customer_sk", "sr_returned_date_sk", "return_date"],
+            "consumes": ["filtered_d2"]
+          }
+        },
+        "store_sales_with_returns": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT ss.ss_store_sk, ss.ss_sold_date_sk, sr.return_date, sr.sr_returned_date_sk FROM store_sales ss INNER JOIN store_returns_with_d2 sr ON ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_item_sk = sr.sr_item_sk AND ss.ss_customer_sk = sr.sr_customer_sk INNER JOIN filtered_d1 d1 ON ss.ss_sold_date_sk = d1.d1_date_sk",
+          "interfaces": {
+            "outputs": ["ss_store_sk", "ss_sold_date_sk", "return_date", "sr_returned_date_sk"],
+            "consumes": ["store_returns_with_d2", "filtered_d1"]
+          }
+        },
+        "store_join": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT s.s_store_name, s.s_company_id, s.s_street_number, s.s_street_name, s.s_street_type, s.s_suite_number, s.s_city, s.s_county, s.s_state, s.s_zip, ssr.ss_sold_date_sk, ssr.sr_returned_date_sk FROM store s INNER JOIN store_sales_with_returns ssr ON ssr.ss_store_sk = s.s_store_sk",
+          "interfaces": {
+            "outputs": ["s_store_name", "s_company_id", "s_street_number", "s_street_name", "s_street_type", "s_suite_number", "s_city", "s_county", "s_state", "s_zip", "ss_sold_date_sk", "sr_returned_date_sk"],
+            "consumes": ["store_sales_with_returns"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS \"30 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 30) AND (sr_returned_date_sk - ss_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS \"31-60 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 60) AND (sr_returned_date_sk - ss_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS \"61-90 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 90) AND (sr_returned_date_sk - ss_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS \"91-120 days\", SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk > 120) THEN 1 ELSE 0 END) AS \">120 days\" FROM store_join GROUP BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip ORDER BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip LIMIT 100",
+          "interfaces": {
+            "outputs": ["s_store_name", "s_company_id", "s_street_number", "s_street_name", "s_street_type", "s_suite_number", "s_city", "s_county", "s_state", "s_zip", "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"],
+            "consumes": ["store_join"]
+          }
+        }
+      },
+      "reconstruction_order": ["filtered_d2", "filtered_d1", "store_returns_with_d2", "store_sales_with_returns", "store_join", "main_query"],
+      "assembly_template": "WITH filtered_d2 AS ({filtered_d2}), filtered_d1 AS ({filtered_d1}), store_returns_with_d2 AS ({store_returns_with_d2}), store_sales_with_returns AS ({store_sales_with_returns}), store_join AS ({store_join}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL enable_nestloop = on",
+    "SET LOCAL hash_mem_multiplier = 2.0",
+    "SET LOCAL max_parallel_workers_per_gather = 0"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured query using 5 CTEs that exactly follow the target logical tree: pre-filter date dimensions, join fact tables in staged CTEs, preserve all semantic guards. This enforces optimal join order (d2→d1→store_returns→store_sales→store) while allowing parallel-free nested loops with index support.
+
+**Expected speedup**: 2.8-3.2× from eliminating large intermediate hash joins, preventing CTE materialization bottlenecks, and preserving indexed nested loop access.

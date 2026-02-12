@@ -1,0 +1,144 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [+] date_range
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_date BETWEEN CAST('1998-08-05' AS DATE) AND (CAST('1998-08-05' AS DATE) + INTERVAL 30 DAY))
+│   └── OUTPUT (d_date_sk, d_date)
+├── [~] store_combined (replaces ss+sr)
+│   ├── SCAN (store_sales, date_range)
+│   ├── FILTER (ss_sold_date_sk = d_date_sk)
+│   ├── PROJECT (store_sk, sales_amt, profit_amt, 0 as return_amt, 0 as loss_amt)
+│   ├── UNION ALL
+│   ├── SCAN (store_returns, date_range)
+│   ├── FILTER (sr_returned_date_sk = d_date_sk)
+│   ├── PROJECT (store_sk, 0 as sales_amt, 0 as profit_amt, return_amt, loss_amt)
+│   ├── JOIN (store) ON store_sk = s_store_sk
+│   ├── FILTER (s_store_sk <= 100)
+│   ├── AGG (GROUP BY s_store_sk)
+│   └── OUTPUT (s_store_sk, sales, returns, profit, profit_loss)
+├── [~] catalog_separate (unchanged but uses date_range)
+│   ├── [=] cs
+│   │   ├── SCAN (catalog_sales, date_range)
+│   │   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   │   ├── AGG (GROUP BY cs_call_center_sk)
+│   │   └── OUTPUT (cs_call_center_sk, sales, profit)
+│   └── [=] cr
+│       ├── SCAN (catalog_returns, date_range)
+│       ├── JOIN (cr_returned_date_sk = d_date_sk)
+│       ├── AGG (GROUP BY cr_call_center_sk)
+│       └── OUTPUT (cr_call_center_sk, returns, profit_loss)
+├── [~] web_combined (replaces ws+wr)
+│   ├── SCAN (web_sales, date_range)
+│   ├── FILTER (ws_sold_date_sk = d_date_sk)
+│   ├── PROJECT (page_sk, sales_amt, profit_amt, 0 as return_amt, 0 as loss_amt)
+│   ├── UNION ALL
+│   ├── SCAN (web_returns, date_range)
+│   ├── FILTER (wr_returned_date_sk = d_date_sk)
+│   ├── PROJECT (page_sk, 0 as sales_amt, 0 as profit_amt, return_amt, loss_amt)
+│   ├── JOIN (web_page) ON page_sk = wp_web_page_sk
+│   ├── AGG (GROUP BY wp_web_page_sk)
+│   └── OUTPUT (wp_web_page_sk, sales, returns, profit, profit_loss)
+└── [~] main_query
+    ├── SCAN (store_combined, cs, cr, web_combined)
+    ├── UNION ALL (three channel subqueries)
+    ├── AGG (GROUP BY ROLLUP (channel, id))
+    ├── SORT (channel, id)
+    └── OUTPUT (channel, id, sales, returns, profit)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "single_pass_aggregation",
+      "description": "Consolidate store sales/returns and web sales/returns into single-pass union+aggregation per channel, using shared date_range CTE",
+      "applied_to": ["store_combined", "web_combined", "date_range"]
+    },
+    {
+      "id": "R2",
+      "type": "cross_cte_predicate_blindness_fix",
+      "description": "Isolate date filter into a single CTE to eliminate 6 redundant date_dim scans",
+      "applied_to": ["date_range"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_range": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN CAST('1998-08-05' AS DATE) AND (CAST('1998-08-05' AS DATE) + INTERVAL 30 DAY)",
+        "interfaces": {
+          "outputs": ["d_date_sk", "d_date"],
+          "consumes": []
+        }
+      },
+      "store_combined": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT store.s_store_sk, SUM(t.sales_amt) AS sales, SUM(t.return_amt) AS \"returns\", SUM(t.profit_amt) AS profit, SUM(t.loss_amt) AS profit_loss FROM (SELECT ss_store_sk AS store_sk, ss_ext_sales_price AS sales_amt, ss_net_profit AS profit_amt, 0 AS return_amt, 0 AS loss_amt FROM store_sales, date_range WHERE ss_sold_date_sk = date_range.d_date_sk UNION ALL SELECT sr_store_sk AS store_sk, 0 AS sales_amt, 0 AS profit_amt, sr_return_amt AS return_amt, sr_net_loss AS loss_amt FROM store_returns, date_range WHERE sr_returned_date_sk = date_range.d_date_sk) t, store WHERE t.store_sk = store.s_store_sk AND store.s_store_sk <= 100 GROUP BY store.s_store_sk",
+        "interfaces": {
+          "outputs": ["s_store_sk", "sales", "returns", "profit", "profit_loss"],
+          "consumes": ["date_range"]
+        }
+      },
+      "cs": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cs_call_center_sk, SUM(cs_ext_sales_price) AS sales, SUM(cs_net_profit) AS profit FROM catalog_sales, date_range WHERE cs_sold_date_sk = date_range.d_date_sk GROUP BY cs_call_center_sk",
+        "interfaces": {
+          "outputs": ["cs_call_center_sk", "sales", "profit"],
+          "consumes": ["date_range"]
+        }
+      },
+      "cr": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cr_call_center_sk, SUM(cr_return_amount) AS \"returns\", SUM(cr_net_loss) AS profit_loss FROM catalog_returns, date_range WHERE cr_returned_date_sk = date_range.d_date_sk GROUP BY cr_call_center_sk",
+        "interfaces": {
+          "outputs": ["cr_call_center_sk", "returns", "profit_loss"],
+          "consumes": ["date_range"]
+        }
+      },
+      "web_combined": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT web_page.wp_web_page_sk, SUM(t.sales_amt) AS sales, SUM(t.return_amt) AS \"returns\", SUM(t.profit_amt) AS profit, SUM(t.loss_amt) AS profit_loss FROM (SELECT ws_web_page_sk AS page_sk, ws_ext_sales_price AS sales_amt, ws_net_profit AS profit_amt, 0 AS return_amt, 0 AS loss_amt FROM web_sales, date_range WHERE ws_sold_date_sk = date_range.d_date_sk UNION ALL SELECT wr_web_page_sk AS page_sk, 0 AS sales_amt, 0 AS profit_amt, wr_return_amt AS return_amt, wr_net_loss AS loss_amt FROM web_returns, date_range WHERE wr_returned_date_sk = date_range.d_date_sk) t, web_page WHERE t.page_sk = web_page.wp_web_page_sk GROUP BY web_page.wp_web_page_sk",
+        "interfaces": {
+          "outputs": ["wp_web_page_sk", "sales", "returns", "profit", "profit_loss"],
+          "consumes": ["date_range"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT channel, id, SUM(sales) AS sales, SUM(\"returns\") AS \"returns\", SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, s_store_sk AS id, sales, \"returns\", (profit - profit_loss) AS profit FROM store_combined UNION ALL SELECT 'catalog channel' AS channel, cs_call_center_sk AS id, sales, \"returns\", (profit - profit_loss) AS profit FROM cs, cr UNION ALL SELECT 'web channel' AS channel, wp_web_page_sk AS id, sales, \"returns\", (profit - profit_loss) AS profit FROM web_combined) x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100",
+        "interfaces": {
+          "outputs": ["channel", "id", "sales", "returns", "profit"],
+          "consumes": ["store_combined", "cs", "cr", "web_combined"]
+        }
+      }
+    },
+    "reconstruction_order": ["date_range", "store_combined", "cs", "cr", "web_combined", "main_query"],
+    "assembly_template": "WITH date_range AS ({date_range}), store_combined AS ({store_combined}), cs AS ({cs}), cr AS ({cr}), web_combined AS ({web_combined}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** 
+- Isolated date filter into single `date_range` CTE, eliminating 6 redundant scans of `date_dim`.
+- Consolidated store and web channel aggregations using UNION ALL of sales/returns followed by single-pass aggregation per entity, replacing separate CTEs and LEFT JOINs.
+- Preserved CROSS JOIN for catalog channel and all original guard semantics.
+
+**Expected speedup:** 2-3x from reduced date_dim scans and better aggregation patterns.

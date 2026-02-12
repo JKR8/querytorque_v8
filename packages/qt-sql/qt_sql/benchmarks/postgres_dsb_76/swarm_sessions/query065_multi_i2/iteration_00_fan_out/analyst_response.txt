@@ -1,0 +1,295 @@
+<reasoning>
+## 1. CLASSIFY
+This is a "repeated fact scan" archetype with a self-join pattern. The query scans `store_sales` twice (once for `sa/sb` to compute per-store averages, once for `sc` to compute per-store-item revenue) with identical filters (date range and price ratio). It then joins these two derived tables to filter items where revenue ≤ 10% of the store average. Additional dimension filters on `store` and `item` are applied late.
+
+## 2. EXPLAIN PLAN ANALYSIS
+- **Total time**: 2579.3 ms
+- **Dominant operations**: Two separate `store_sales` scans account for ~95% of runtime:
+  - First scan (for `sb`): 1584.4 ms (61% of total)
+  - Second scan (for `sc`): 994.3 ms (39% of total)
+- **Row flow**:
+  - `date_dim` scan: 122 rows → `store_sales` join: ~37K rows (per worker) → filtered by price ratio (13K rows removed) → aggregated to 6,666 rows (`sb`) and 22 rows (`sc` after aggregation).
+  - Sharp row drop after `store` filter (7 rows) and `item` filter (0 rows per loop).
+- **Optimizer behavior**:
+  - Already converts comma joins to explicit joins (Merge Join shown in plan).
+  - Already pushes `date_dim` filter (`d_month_seq`) into the scan.
+  - Already uses parallel execution for both `store_sales` scans.
+  - **Key missed opportunity**: The two `store_sales` scans are identical but executed separately. The optimizer does not consolidate them.
+  - CTEs (`sa`, `sb`, `sc`) are inlined, not materialized (no materialization shown).
+- **Scan count**: `store_sales` scanned 2× with same filters. Reducing to 1 scan could save ~50% of I/O on this largest table.
+
+## 3. GAP MATCHING
+- **CROSS_CTE_PREDICATE_BLINDNESS**: EXACT MATCH. Same fact+dimension scan appears twice. Example `pg_self_join_decomposition` (3.93x) directly addresses this.
+- **COMMA_JOIN_WEAKNESS**: PARTIAL MATCH. Original query uses comma joins, but EXPLAIN shows optimizer already converts to explicit joins. However, cardinality estimation may still suffer. Examples `pg_dimension_prefetch_star` and `pg_date_cte_explicit_join` combine pre-filtered CTEs with explicit joins.
+- **CORRELATED_SUBQUERY_PARALYSIS**: NOT APPLICABLE. No correlated subqueries.
+- **NON_EQUI_JOIN_INPUT_BLINDNESS**: NOT APPLICABLE. Only equality joins.
+
+## 4. AGGREGATION TRAP CHECK
+Aggregates: `SUM(ss_sales_price)` and `AVG(revenue)`. Both are duplicate-insensitive for this query because:
+- The join `store_sales` ↔ `date_dim` is one-to-many (one date to many sales). But grouping is on `ss_store_sk, ss_item_sk` (unique per sale) so no duplication within groups.
+- The self-join between `sb` and `sc` uses `ss_store_sk` equality, not introducing duplicates.
+Thus, restructuring that changes grouping must preserve group membership, but we can safely materialize the base aggregation once and derive both aggregates from it.
+
+## 5. TRANSFORM SELECTION
+Ranked by expected value:
+1. **Scan consolidation** (`pg_self_join_decomposition`): Eliminate duplicate `store_sales` scan. Expected 2x speedup (3.93x historically).
+2. **Explicit joins with pre-filtered dimensions** (`pg_dimension_prefetch_star`): Pre-filter `store` and `date_dim` into CTEs, use explicit joins. May improve cardinality estimation.
+3. **Late attribute binding**: Defer `item` join until after revenue filtering, since `i_manager_id` filter is selective (0 rows in plan). Could reduce `item` probe overhead.
+4. **Exploration: Single-pass aggregation with window function**: Compute per-store average via window function in same scan as per-store-item revenue, eliminating self-join entirely.
+
+## 6. LOGICAL TREE DESIGN
+For each strategy, define CTE structure ensuring column completeness.
+
+**Worker 1 (Scan consolidation)**:
+- CTE `store_sales_filtered`: `store_sales` + `date_dim` join with filters, group by `ss_store_sk, ss_item_sk` with `revenue`.
+- CTE `store_avg`: From CTE1, group by `ss_store_sk` to compute `ave`.
+- Final: Join CTE1, CTE2, `store`, `item` with filters.
+
+**Worker 2 (Explicit joins + pre-filter)**:
+- CTE `filtered_date`: `date_dim` with month filter.
+- CTE `filtered_store`: `store` with state filter.
+- CTE `store_item_revenue`: Join `store_sales` with `filtered_date`, group by `ss_store_sk, ss_item_sk`.
+- CTE `store_avg`: From CTE3, group by `ss_store_sk`.
+- Final: Explicit JOINs between CTEs and `item`.
+
+**Worker 3 (Late attribute binding)**:
+- CTE `store_sales_filtered` (as Worker 1).
+- CTE `store_avg` (as Worker 1).
+- CTE `low_revenue_items`: Join CTE1 and CTE2 with `revenue <= 0.1 * ave`, include `ss_store_sk, ss_item_sk, revenue`.
+- Final: Join CTE3 with `store` and `item` (deferred) for display columns.
+
+**Worker 4 (Exploration: Single-pass window)**:
+- CTE `store_sales_filtered`: `store_sales` + `date_dim` join with filters.
+- CTE `item_revenue_with_avg`: From CTE1, group by `ss_store_sk, ss_item_sk` to get `revenue`, and compute `AVG(revenue) OVER (PARTITION BY ss_store_sk)` as `store_avg`.
+- Final: Filter `revenue <= 0.1 * store_avg`, join `store`, `item`.
+
+Check column completeness: Each CTE must output all columns referenced downstream (`ss_store_sk`, `ss_item_sk`, `revenue`, `ave`/`store_avg`).
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Find stores in KS, OH, or SD selling items managed by managers 10–14 where the item's total revenue (over a year of sales with a 79–89% discount) is ≤10% of the store's average item revenue for that period. Report store name, item details, and pricing. All joins are INNER: a result row exists only when all joined tables match. Aggregates SUM and AVG are duplicate-insensitive given the grouping keys. The 0.1 multiplier filter depends on the per-store average computed from the same fact data; any rewrite must preserve exact group membership for both aggregations.
+
+BOTTLENECK_DIAGNOSIS:
+The query is scan-bound: two identical full scans of the large `store_sales` table (each ~1.5s) dominate 95% of runtime. Each scan joins with `date_dim` (122 rows) and filters by price ratio, producing ~37K rows per worker. Row counts drop sharply after `store` filter (7 rows) and `item` filter (0 rows), but these occur late. The optimizer already handles parallel execution, predicate pushdown to `date_dim`, and converts comma joins to explicit joins. Logical-tree cost percentages are misleading—the two `store_sales` scans appear as separate subtrees but are structurally identical.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand in original order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include ss_store_sk, ss_item_sk, revenue for downstream joins and filters.
+- LITERAL_PRESERVATION: Must preserve literal values: d_month_seq 1215–1226, price ratio 0.79–0.89, i_manager_id 10–14, s_state KS/OH/SD.
+- SEMANTIC_EQUIVALENCE: Must return same rows and ordering (by s_store_name, i_item_desc, limit 100).
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows two separate store_sales scans with identical filters (date_dim join + price ratio). Materializing once would eliminate duplicate work.
+- COMMA_JOIN_WEAKNESS: Original uses comma joins; EXPLAIN shows optimizer converts to explicit joins but cardinality estimation may still suffer from lack of pre-filtered dimension CTEs.
+
+REGRESSION_WARNINGS:
+1. CTE blocking parallelism (observed regression in SF-005):
+   CAUSE: Materializing CTEs can prevent parallel execution of inner scans.
+   RULE: Avoid MATERIALIZED unless necessary for decorrelation; prefer non-materialized CTEs or subqueries to preserve parallel plans.
+2. Over-aggressive predicate pushdown (observed regression in SF-009):
+   CAUSE: Pushing complex filters (price ratio) into CTEs can inhibit index-only scans.
+   RULE: Keep simple equality filters (date_dim) in CTEs, apply computed filters later if they block index usage.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: scan_consolidation_pivot
+TARGET_LOGICAL_TREE:
+store_sales_filtered -> store_avg -> low_revenue_items -> join_store_item -> sort_limit
+NODE_CONTRACTS:
+  filtered_sales:
+    FROM: store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE: d_month_seq BETWEEN 1215 AND 1226 AND ss_sales_price / ss_list_price BETWEEN 0.79 AND 0.89
+    GROUP BY: ss_store_sk, ss_item_sk
+    AGGREGATE: SUM(ss_sales_price) AS revenue
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: ~37K per worker (total ~110K)
+    CONSUMERS: store_avg, low_revenue_items
+  store_avg:
+    FROM: filtered_sales
+    GROUP BY: ss_store_sk
+    AGGREGATE: AVG(revenue) AS ave
+    OUTPUT: ss_store_sk, ave
+    EXPECTED_ROWS: ~6,666
+    CONSUMERS: low_revenue_items
+  low_revenue_items:
+    FROM: filtered_sales JOIN store_avg ON filtered_sales.ss_store_sk = store_avg.ss_store_sk
+    WHERE: revenue <= 0.1 * ave
+    OUTPUT: filtered_sales.ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: ~2 (from EXPLAIN)
+    CONSUMERS: join_store_item
+  join_store_item:
+    FROM: low_revenue_items JOIN store ON s_store_sk = ss_store_sk JOIN item ON i_item_sk = ss_item_sk
+    WHERE: i_manager_id BETWEEN 10 AND 14 AND s_state IN ('KS','OH','SD')
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: ~2
+    CONSUMERS: sort_limit
+  sort_limit:
+    FROM: join_store_item
+    ORDER BY: s_store_name, i_item_desc
+    LIMIT: 100
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final
+EXAMPLES: pg_self_join_decomposition
+EXAMPLE_ADAPTATION:
+Apply the single materialization of store_sales+date_dim scan with price filter, then derive both aggregates from it. Ignore any UNION ALL aspects—this query has no UNION.
+HAZARD_FLAGS:
+- CTE materialization may block parallel execution of the store_sales scan (observe EXPLAIN uses parallel workers). Consider using non-materialized CTE (WITHOUT MATERIALIZED) or subquery.
+- The price ratio filter (ss_sales_price / ss_list_price) may prevent index-only scan; ensure it's applied after date join to avoid early row expansion.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+filtered_date -> filtered_store -> store_sales_joined -> store_item_revenue -> store_avg -> final_join
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1215 AND 1226
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 122
+    CONSUMERS: store_sales_joined
+  filtered_store:
+    FROM: store
+    WHERE: s_state IN ('KS','OH','SD')
+    OUTPUT: s_store_sk, s_store_name
+    EXPECTED_ROWS: 7
+    CONSUMERS: final_join
+  store_sales_joined:
+    FROM: store_sales JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+    WHERE: ss_sales_price / ss_list_price BETWEEN 0.79 AND 0.89
+    OUTPUT: ss_store_sk, ss_item_sk, ss_sales_price
+    EXPECTED_ROWS: ~37K per worker
+    CONSUMERS: store_item_revenue
+  store_item_revenue:
+    FROM: store_sales_joined
+    GROUP BY: ss_store_sk, ss_item_sk
+    AGGREGATE: SUM(ss_sales_price) AS revenue
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: ~110K
+    CONSUMERS: store_avg, final_join
+  store_avg:
+    FROM: store_item_revenue
+    GROUP BY: ss_store_sk
+    AGGREGATE: AVG(revenue) AS ave
+    OUTPUT: ss_store_sk, ave
+    EXPECTED_ROWS: ~6,666
+    CONSUMERS: final_join
+  final_join:
+    FROM: store_item_revenue JOIN store_avg ON store_item_revenue.ss_store_sk = store_avg.ss_store_sk
+         JOIN filtered_store ON store_item_revenue.ss_store_sk = filtered_store.s_store_sk
+         JOIN item ON store_item_revenue.ss_item_sk = item.i_item_sk
+    WHERE: revenue <= 0.1 * ave AND i_manager_id BETWEEN 10 AND 14
+    ORDER BY: s_store_name, i_item_desc
+    LIMIT: 100
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+Apply pre-filtering of date_dim and store into separate CTEs, then explicit JOIN syntax throughout. Ignore any promotion table references—this query has only date and store dimensions.
+HAZARD_FLAGS:
+- Pre-filtering store may be redundant if store join happens late; ensure store CTE is joined at the right point to avoid cross-join.
+- Explicit JOINs may change join order; use JOIN_CROSS_LIMIT=1 or enforce order via CTE dependency.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+store_sales_filtered -> store_avg -> low_revenue_items -> join_store -> join_item -> sort_limit
+NODE_CONTRACTS:
+  store_sales_filtered:
+    FROM: store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE: d_month_seq BETWEEN 1215 AND 1226 AND ss_sales_price / ss_list_price BETWEEN 0.79 AND 0.89
+    GROUP BY: ss_store_sk, ss_item_sk
+    AGGREGATE: SUM(ss_sales_price) AS revenue
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: ~110K
+    CONSUMERS: store_avg, low_revenue_items
+  store_avg:
+    FROM: store_sales_filtered
+    GROUP BY: ss_store_sk
+    AGGREGATE: AVG(revenue) AS ave
+    OUTPUT: ss_store_sk, ave
+    EXPECTED_ROWS: ~6,666
+    CONSUMERS: low_revenue_items
+  low_revenue_items:
+    FROM: store_sales_filtered JOIN store_avg ON store_sales_filtered.ss_store_sk = store_avg.ss_store_sk
+    WHERE: revenue <= 0.1 * ave
+    OUTPUT: store_sales_filtered.ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: ~2
+    CONSUMERS: join_store
+  join_store:
+    FROM: low_revenue_items JOIN store ON s_store_sk = ss_store_sk
+    WHERE: s_state IN ('KS','OH','SD')
+    OUTPUT: ss_store_sk, ss_item_sk, revenue, s_store_name
+    EXPECTED_ROWS: ~2
+    CONSUMERS: join_item
+  join_item:
+    FROM: join_store JOIN item ON i_item_sk = ss_item_sk
+    WHERE: i_manager_id BETWEEN 10 AND 14
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: ~2
+    CONSUMERS: sort_limit
+  sort_limit:
+    FROM: join_item
+    ORDER BY: s_store_name, i_item_desc
+    LIMIT: 100
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final
+EXAMPLES: early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+Apply early filtering of date_dim and store, but defer item join until after revenue filtering. Ignore decorrelation aspects—no correlated subqueries here.
+HAZARD_FLAGS:
+- Deferring item join may cause missed index usage if item filter is highly selective (i_manager_id). Ensure item join uses index on i_item_sk and i_manager_id.
+- The store filter (s_state) is applied late; consider pushing into store_sales_filtered if possible via join.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: single_pass_window_aggregation
+TARGET_LOGICAL_TREE:
+store_sales_filtered -> item_revenue_with_avg -> filtered_items -> join_store_item -> sort_limit
+NODE_CONTRACTS:
+  store_sales_filtered:
+    FROM: store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE: d_month_seq BETWEEN 1215 AND 1226 AND ss_sales_price / ss_list_price BETWEEN 0.79 AND 0.89
+    GROUP BY: ss_store_sk, ss_item_sk
+    AGGREGATE: SUM(ss_sales_price) AS revenue
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: ~110K
+    CONSUMERS: item_revenue_with_avg
+  item_revenue_with_avg:
+    FROM: store_sales_filtered
+    WINDOW: AVG(revenue) OVER (PARTITION BY ss_store_sk) AS store_avg
+    OUTPUT: ss_store_sk, ss_item_sk, revenue, store_avg
+    EXPECTED_ROWS: ~110K
+    CONSUMERS: filtered_items
+  filtered_items:
+    FROM: item_revenue_with_avg
+    WHERE: revenue <= 0.1 * store_avg
+    OUTPUT: ss_store_sk, ss_item_sk, revenue
+    EXPECTED_ROWS: ~2
+    CONSUMERS: join_store_item
+  join_store_item:
+    FROM: filtered_items JOIN store ON s_store_sk = ss_store_sk JOIN item ON i_item_sk = ss_item_sk
+    WHERE: i_manager_id BETWEEN 10 AND 14 AND s_state IN ('KS','OH','SD')
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: ~2
+    CONSUMERS: sort_limit
+  sort_limit:
+    FROM: join_store_item
+    ORDER BY: s_store_name, i_item_desc
+    LIMIT: 100
+    OUTPUT: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand
+    EXPECTED_ROWS: ≤100
+    CONSUMERS: final
+EXAMPLES: None (novel combination)
+EXAMPLE_ADAPTATION:
+N/A (novel strategy)
+HAZARD_FLAGS:
+- Window function AVG over large partitions may spill to disk if work_mem insufficient; ensure adequate work_mem.
+- Window computation may be more expensive than separate aggregation if many groups; but here only ~6,666 store groups.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (combines scan consolidation with window aggregation to eliminate self-join)

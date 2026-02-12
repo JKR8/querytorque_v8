@@ -37,6 +37,7 @@ class ValidationResult:
     optimized_sql: str
     errors: list[str] = None  # All errors for learning
     error_category: Optional[str] = None  # syntax | semantic | timeout | execution | unknown
+    explain_plan: Optional[str] = None  # EXPLAIN ANALYZE plan text for candidate
 
     def __post_init__(self):
         if self.errors is None:
@@ -180,6 +181,7 @@ class WorkerResult:
     error_category: Optional[str] = None
     exploratory: bool = False  # True for Worker 4 (exploration budget)
     set_local_config: Optional[Dict[str, Any]] = None  # PG tuning: {"params": {...}, "reasoning": "..."}
+    explain_plan: Optional[str] = None  # EXPLAIN ANALYZE plan text for optimized query
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -199,6 +201,8 @@ class WorkerResult:
             d["exploratory"] = True
         if self.set_local_config:
             d["set_local_config"] = self.set_local_config
+        if self.explain_plan:
+            d["explain_plan"] = self.explain_plan
         return d
 
 

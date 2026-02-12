@@ -1,0 +1,455 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Detect 1999 monthly catalog-sales outliers by brand/category/call-center where monthly sales deviate >10% from that year's average monthly sales, using adjacent-month context. All joins are INNER (intersection), requiring matching rows in all four tables. The AVG window is partition-sensitive: it must compute the average monthly sales per (category, brand, call_center, year) exactly as the original, including only months present in the filtered set (Dec-1998, 1999, Jan-2000). The self-join depends on consecutive months within the same (category, brand, call_center) series; missing months break adjacency. The final filter depends on d_year=1999 and avg_monthly_sales>0; rewriting must preserve these dependencies.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+date_cte, call_center_cte, item_cte -> filtered_fact -> monthly_sales -> yearly_avg -> v1_lag_lead -> v2_simple -> main_query
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: (d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1))
+    OUTPUT: d_date_sk, d_year, d_moy
+    EXPECTED_ROWS: 427
+    CONSUMERS: filtered_fact
+  call_center_cte:
+    FROM: call_center
+    OUTPUT: cc_call_center_sk, cc_name
+    EXPECTED_ROWS: 24
+    CONSUMERS: filtered_fact
+  item_cte:
+    FROM: item
+    OUTPUT: i_item_sk, i_category, i_brand
+    EXPECTED_ROWS: 102K
+    CONSUMERS: filtered_fact
+  filtered_fact:
+    FROM: catalog_sales
+    JOIN: date_cte ON cs_sold_date_sk = d_date_sk
+    JOIN: call_center_cte ON cs_call_center_sk = cc_call_center_sk
+    JOIN: item_cte ON cs_item_sk = i_item_sk
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, cs_sales_price
+    EXPECTED_ROWS: 3.5M
+    CONSUMERS: monthly_sales
+  monthly_sales:
+    FROM: filtered_fact
+    GROUP BY: i_category, i_brand, cc_name, d_year, d_moy
+    AGGREGATE: sum(cs_sales_price) AS sum_sales
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, sum_sales
+    EXPECTED_ROWS: 148K
+    CONSUMERS: yearly_avg, v1_lag_lead
+  yearly_avg:
+    FROM: monthly_sales
+    GROUP BY: i_category, i_brand, cc_name, d_year
+    AGGREGATE: avg(sum_sales) AS avg_monthly_sales
+    OUTPUT: i_category, i_brand, cc_name, d_year, avg_monthly_sales
+    EXPECTED_ROWS: ~50K
+    CONSUMERS: v1_lag_lead
+  v1_lag_lead:
+    FROM: monthly_sales
+    JOIN: yearly_avg USING (i_category, i_brand, cc_name, d_year)
+    WINDOW: 
+        prev_sum_sales: LAG(sum_sales, 1) OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy)
+        next_sum_sales: LEAD(sum_sales, 1) OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy)
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, prev_sum_sales, next_sum_sales
+    EXPECTED_ROWS: 148K
+    CONSUMERS: v2_simple
+  v2_simple:
+    FROM: v1_lag_lead
+    OUTPUT: i_brand, d_year, avg_monthly_sales, sum_sales, prev_sum_sales AS psum, next_sum_sales AS nsum
+    EXPECTED_ROWS: 148K
+    CONSUMERS: main_query
+  main_query: same as Worker 1.
+
+NODE_CONTRACTS:
+date_cte:
+    FROM: date_dim
+    WHERE: (d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1))
+    OUTPUT: d_date_sk, d_year, d_moy
+    EXPECTED_ROWS: 427
+    CONSUMERS: filtered_fact
+  call_center_cte:
+    FROM: call_center
+    OUTPUT: cc_call_center_sk, cc_name
+    EXPECTED_ROWS: 24
+    CONSUMERS: filtered_fact
+  item_cte:
+    FROM: item
+    OUTPUT: i_item_sk, i_category, i_brand
+    EXPECTED_ROWS: 102K
+    CONSUMERS: filtered_fact
+  filtered_fact:
+    FROM: catalog_sales
+    JOIN: date_cte ON cs_sold_date_sk = d_date_sk
+    JOIN: call_center_cte ON cs_call_center_sk = cc_call_center_sk
+    JOIN: item_cte ON cs_item_sk = i_item_sk
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, cs_sales_price
+    EXPECTED_ROWS: 3.5M
+    CONSUMERS: monthly_sales
+  monthly_sales:
+    FROM: filtered_fact
+    GROUP BY: i_category, i_brand, cc_name, d_year, d_moy
+    AGGREGATE: sum(cs_sales_price) AS sum_sales
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, sum_sales
+    EXPECTED_ROWS: 148K
+    CONSUMERS: yearly_avg, v1_lag_lead
+  yearly_avg:
+    FROM: monthly_sales
+    GROUP BY: i_category, i_brand, cc_name, d_year
+    AGGREGATE: avg(sum_sales) AS avg_monthly_sales
+    OUTPUT: i_category, i_brand, cc_name, d_year, avg_monthly_sales
+    EXPECTED_ROWS: ~50K
+    CONSUMERS: v1_lag_lead
+  v1_lag_lead:
+    FROM: monthly_sales
+    JOIN: yearly_avg USING (i_category, i_brand, cc_name, d_year)
+    WINDOW: 
+        prev_sum_sales: LAG(sum_sales, 1) OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy)
+        next_sum_sales: LEAD(sum_sales, 1) OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy)
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, prev_sum_sales, next_sum_sales
+    EXPECTED_ROWS: 148K
+    CONSUMERS: v2_simple
+  v2_simple:
+    FROM: v1_lag_lead
+    OUTPUT: i_brand, d_year, avg_monthly_sales, sum_sales, prev_sum_sales AS psum, next_sum_sales AS nsum
+    EXPECTED_ROWS: 148K
+    CONSUMERS: main_query
+  main_query: same as Worker 1.
+
+## Hazard Flags (avoid these specific risks)
+
+- Complexity: This compound strategy introduces multiple CTEs, which may increase materialization overhead. However, each CTE reduces data progressively.
+- The LAG/LEAD window must be computed after the join with yearly_avg, which may increase window input size. Consider computing LAG/LEAD on monthly_sales before joining with yearly_avg? But then avg_monthly_sales would be missing. Must join first.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy
+
+## Regression Warnings (observed failures on similar queries)
+
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Created filtered CTEs when baseline was already optimized (<100ms) and the optimizer already pushed date predicates effectively.
+   RULE: For this query (baseline 1467ms), date_cte_isolate is safe, but ensure the date CTE has a WHERE clause that actually reduces rows (already true: 427 rows).
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Pre-filtered and materialized fact tables when the query has 3+ fact table joins, preventing optimizer reordering.
+   RULE: This query has only one fact table (catalog_sales), so prefetch_fact_join is safe.
+3. union_cte_split (0.49x on Q74):
+   CAUSE: Kept both original UNION and specialized CTEs, causing redundant materialization.
+   RULE: When splitting, eliminate the original generic CTE.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: The final SELECT * from v2 must output exactly i_brand, d_year, avg_monthly_sales, sum_sales, psum, nsum in that order.
+- CTE_COLUMN_COMPLETENESS: v1 must output i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn (and any additional columns needed for self-join or filtering).
+- LITERAL_PRESERVATION: All date literals (1999, 1998, 2000, 12, 1) must be copied exactly.
+- SEMANTIC_EQUIVALENCE: The result set must match exactly, including ordering and limit.
+- CROSS_CTE_PREDICATE_BLINDNESS: The predicate d_year=1999 is applied in main query, not pushed into v1. v1 includes unnecessary rows for 1998 and 2000 that are filtered out later.
+- SELF_JOIN_ELIMINATION: The v2 self-join on rank adjacency can be replaced with window functions (LAG/LEAD).
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+Combine patterns: pre-filter dimensions, compute yearly average via group-by (instead of window), and eliminate self-join with LAG/LEAD. Apply all three aspects; ignore any UNION or decorrelation patterns.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. dimension_cte_isolate (1.93x)
+
+**Principle:** Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
+
+**BEFORE (slow):**
+```sql
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year = 2000
+```
+[filtered_customer_demographics]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'
+```
+[filtered_promotions]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+```
+[joined_facts]:
+```sql
+SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales AS cs JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk
+```
+[main_query]:
+```sql
+SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM joined_facts AS jf JOIN item AS i ON jf.cs_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
+```
+
+### 2. deferred_window_aggregation (1.36x)
+
+**Principle:** Deferred Aggregation: delay expensive operations (window functions) until after joins reduce the dataset. Computing window functions inside individual CTEs then joining is more expensive than joining first and computing windows once on the combined result.
+
+**BEFORE (slow):**
+```sql
+WITH web_v1 as (
+select
+  ws_item_sk item_sk, d_date,
+  sum(sum(ws_sales_price))
+      over (partition by ws_item_sk order by d_date rows between unbounded preceding and current row) cume_sales
+from web_sales
+    ,date_dim
+where ws_sold_date_sk=d_date_sk
+  and d_month_seq between 1216 and 1216+11
+  and ws_item_sk is not NULL
+group by ws_item_sk, d_date),
+store_v1 as (
+select
+  ss_item_sk item_sk, d_date,
+  sum(sum(ss_sales_price))
+      over (partition by ss_item_sk order by d_date rows between unbounded preceding and current row) cume_sales
+from store_sales
+    ,date_dim
+where ss_sold_date_sk=d_date_sk
+  and d_month_seq between 1216 and 1216+11
+  and ss_item_sk is not NULL
+group by ss_item_sk, d_date)
+ select *
+from (select item_sk
+     ,d_date
+     ,web_sales
+     ,store_sales
+     ,max(web_sales)
+         over (partition by item_sk order by d_date rows between unbounded preceding and current row) web_cumulative
+     ,max(store_sales)
+         over (partition by item_sk order by d_date rows between unbounded preceding and current row) store_cumulative
+     from (select case when web.item_sk is not null then web.item_sk else store.item_sk end item_sk
+                 ,case when web.d_date is not null then web.d_date else store.d_date end d_date
+                 ,web.cume_sales web_sales
+                 ,store.cume_sales store_sales
+           from web_v1 web full outer join store_v1 store on (web.item_sk = store.item_sk
+                                                          and web.d_date = store.d_date)
+          )x )y
+where web_cumulative > store_cumulative
+order by item_sk
+        ,d_date
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[web_daily]:
+```sql
+SELECT ws_item_sk AS item_sk, d_date, SUM(ws_sales_price) AS daily_sales FROM web_sales, date_dim WHERE ws_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ws_item_sk IS NOT NULL GROUP BY ws_item_sk, d_date
+```
+[store_daily]:
+```sql
+SELECT ss_item_sk AS item_sk, d_date, SUM(ss_sales_price) AS daily_sales FROM store_sales, date_dim WHERE ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ss_item_sk IS NOT NULL GROUP BY ss_item_sk, d_date
+```
+[main_query]:
+```sql
+SELECT * FROM (SELECT COALESCE(web.item_sk, store.item_sk) AS item_sk, COALESCE(web.d_date, store.d_date) AS d_date, SUM(web.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS web_cumulative, SUM(store.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS store_cumulative FROM web_daily web FULL OUTER JOIN store_daily store ON web.item_sk = store.item_sk AND web.d_date = store.d_date) y WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100
+```
+
+### 3. SELF_JOIN_TO_WINDOW (unknown)
+
+**BEFORE (slow):**
+```sql
+SELECT a.*, b.max_salary
+      FROM employees a
+      JOIN (
+          SELECT department, MAX(salary) AS max_salary
+          FROM employees GROUP BY department
+      ) b ON a.department = b.department;
+```
+
+## Original SQL
+
+```sql
+-- start query 57 in stream 0 using template query57.tpl
+with v1 as(
+ select i_category, i_brand,
+        cc_name,
+        d_year, d_moy,
+        sum(cs_sales_price) sum_sales,
+        avg(sum(cs_sales_price)) over
+          (partition by i_category, i_brand,
+                     cc_name, d_year)
+          avg_monthly_sales,
+        rank() over
+          (partition by i_category, i_brand,
+                     cc_name
+           order by d_year, d_moy) rn
+ from item, catalog_sales, date_dim, call_center
+ where cs_item_sk = i_item_sk and
+       cs_sold_date_sk = d_date_sk and
+       cc_call_center_sk= cs_call_center_sk and
+       (
+         d_year = 1999 or
+         ( d_year = 1999-1 and d_moy =12) or
+         ( d_year = 1999+1 and d_moy =1)
+       )
+ group by i_category, i_brand,
+          cc_name , d_year, d_moy),
+ v2 as(
+ select v1.i_brand
+        ,v1.d_year
+        ,v1.avg_monthly_sales
+        ,v1.sum_sales, v1_lag.sum_sales psum, v1_lead.sum_sales nsum
+ from v1, v1 v1_lag, v1 v1_lead
+ where v1.i_category = v1_lag.i_category and
+       v1.i_category = v1_lead.i_category and
+       v1.i_brand = v1_lag.i_brand and
+       v1.i_brand = v1_lead.i_brand and
+       v1. cc_name = v1_lag. cc_name and
+       v1. cc_name = v1_lead. cc_name and
+       v1.rn = v1_lag.rn + 1 and
+       v1.rn = v1_lead.rn - 1)
+  select *
+ from v2
+ where  d_year = 1999 and
+        avg_monthly_sales > 0 and
+        case when avg_monthly_sales > 0 then abs(sum_sales - avg_monthly_sales) / avg_monthly_sales else null end > 0.1
+ order by sum_sales - avg_monthly_sales, nsum
+ LIMIT 100;
+
+-- end query 57 in stream 0 using template query57.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `*`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] v1  [=]  Cost: 33%  Rows: ~1K  — Aggregate monthly catalog sales by category/brand/call-center for Dec-1998 through Jan-2000, and compute yearly average monthly sales plus sequence rank.
+│   ├── SCAN (item, catalog_sales (join), date_dim (join), call_center (join))
+│   ├── JOIN (cs_item_sk = i_item_sk)
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── JOIN (+1 more)
+│   ├── FILTER ((d_year = 1999 OR (d_year = 1999 - 1 AND d_moy = 12) OR (d_year = 1999 + 1 AND d_moy = 1)))
+│   ├── AGG (GROUP BY)
+│   ├── WINDOW
+│   ├── SORT (d_year ASC, d_moy ASC)
+│   └── OUTPUT (i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn)
+├── [CTE] v2  [=]  Cost: 33%  Rows: ~1K  — Self-join monthly rows with prior and next month within the same category/brand/call-center series.
+│   ├── SCAN (v1, v1 AS v1_lag (join), v1 AS v1_lead (join))
+│   ├── JOIN (v1.i_category = v1_lag.i_category)
+│   ├── JOIN (v1.i_category = v1_lead.i_category)
+│   ├── JOIN (+6 more)
+│   └── OUTPUT (i_brand, d_year, avg_monthly_sales, sum_sales, psum, nsum)
+└── [MAIN] main_query  [=]  Cost: 33%  Rows: ~1K  — Keep 1999 rows with nonzero average monthly sales and >10% relative deviation, then order by deviation and next-month sales.
+    ├── SCAN (v2)
+    ├── FILTER (d_year = 1999)
+    ├── FILTER (avg_monthly_sales > 0)
+    ├── FILTER (+1 more)
+    ├── AGG (GROUP BY)
+    ├── SORT (sum_sales - avg_monthly_sales ASC, nsum ASC)
+    └── OUTPUT (*)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

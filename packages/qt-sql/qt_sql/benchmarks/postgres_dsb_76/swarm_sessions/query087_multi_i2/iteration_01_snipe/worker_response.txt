@@ -1,0 +1,103 @@
+<reasoning>
+We need to achieve ≥2.0x speedup. The original query takes ~1116ms. Previous attempts regressed because they didn't address the core bottleneck: repeated nested‑loop joins between each fact table and the dimension tables (date_dim, customer). The plan shows each branch does:
+
+1. Seq scan on date_dim (182 rows) → nested loop → index scan on fact table (store_sales, catalog_sales, web_sales) → nested loop → index scan on customer.
+
+The date_dim and customer filters are identical across all three branches, yet each branch re‑scans these tables. The fact‑table index scans are the dominant cost (~2ms each, 182 scans per fact table, 546 total scans).  
+
+**Unexplored angle**: Use a single pre‑filtered dimension CTE, but avoid materialization fences that prevent predicate pushdown. The previous CTE attempts (W1, W2) materialized the CTEs, causing repeated scans and blocking index‑based nested loops. Instead, we can use a **lateral join** that allows the planner to push the dimension filters into each fact‑table scan while still sharing the dimension subquery.
+
+**Key insight**: Use `LATERAL (SELECT ... FROM fact_table WHERE ...)` with the dimension CTEs referenced inside the lateral subquery. This preserves index usage and allows the dimension filters to be evaluated once, then reused in each lateral branch.
+
+**Mechanism**:
+- Create two non‑materialized CTEs (`filtered_date`, `filtered_customer`) that are referenced inside each lateral subquery.
+- For each channel, use `LATERAL (SELECT DISTINCT ... FROM fact_table WHERE fact_table.date_sk = filtered_date.d_date_sk AND fact_table.customer_sk = filtered_customer.c_customer_sk AND price filters)`.
+- The lateral subquery can use indexes on the fact tables because the join conditions are inside the lateral.
+- Then use `EXCEPT` (or `NOT EXISTS`) to compute the set difference.
+
+**Expected speedup**: ~2.5x. We eliminate repeated dimension scans, keep index‑based fact‑table access, and reduce total index scans from 546 to ~182 (because the dimension rows are now joined once per channel, not per date row).
+
+**Validation**: Must preserve all literals, defensive guards, and output exactly `count(*)`.
+</reasoning>
+
+## Modified Logic Tree
+
+```
+[=] main_query
+    [~] CTE filtered_date
+        change: pre‑filter date_dim once
+    [~] CTE filtered_customer
+        change: pre‑filter customer once
+    [+] CTE store_set
+        change: lateral join between filtered_date, filtered_customer, and store_sales
+    [+] CTE catalog_set
+        change: lateral join between filtered_date, filtered_customer, and catalog_sales
+    [+] CTE web_set
+        change: lateral join between filtered_date, filtered_customer, and web_sales
+    [~] main_query body
+        change: use EXCEPT on the three sets (same as original, but now sets come from CTEs)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefetch_lateral", "description": "Pre‑filter date_dim and customer into CTEs, then use LATERAL joins to fact tables to allow index usage and avoid repeated dimension scans.", "applied_to": ["filtered_date", "filtered_customer", "store_set", "catalog_set", "web_set"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1213 AND 1224",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "filtered_customer": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_sk, c_last_name, c_first_name FROM customer WHERE c_birth_year BETWEEN 1968 AND 1974",
+        "interfaces": {"outputs": ["c_customer_sk", "c_last_name", "c_first_name"], "consumes": []}
+      },
+      "store_set": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT DISTINCT fc.c_last_name, fc.c_first_name, fd.d_date FROM filtered_date fd, filtered_customer fc, LATERAL (SELECT 1 FROM store_sales ss WHERE ss.ss_sold_date_sk = fd.d_date_sk AND ss.ss_customer_sk = fc.c_customer_sk AND ss.ss_list_price BETWEEN 168 AND 197 AND ss.ss_wholesale_cost BETWEEN 76 AND 86) AS _",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date"], "consumes": ["filtered_date", "filtered_customer"]}
+      },
+      "catalog_set": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT DISTINCT fc.c_last_name, fc.c_first_name, fd.d_date FROM filtered_date fd, filtered_customer fc, LATERAL (SELECT 1 FROM catalog_sales cs WHERE cs.cs_sold_date_sk = fd.d_date_sk AND cs.cs_bill_customer_sk = fc.c_customer_sk AND cs.cs_list_price BETWEEN 168 AND 197 AND cs.cs_wholesale_cost BETWEEN 76 AND 86) AS _",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date"], "consumes": ["filtered_date", "filtered_customer"]}
+      },
+      "web_set": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT DISTINCT fc.c_last_name, fc.c_first_name, fd.d_date FROM filtered_date fd, filtered_customer fc, LATERAL (SELECT 1 FROM web_sales ws WHERE ws.ws_sold_date_sk = fd.d_date_sk AND ws.ws_bill_customer_sk = fc.c_customer_sk AND ws.ws_list_price BETWEEN 168 AND 197 AND ws.ws_wholesale_cost BETWEEN 76 AND 86) AS _",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date"], "consumes": ["filtered_date", "filtered_customer"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(*) FROM ((SELECT * FROM store_set) EXCEPT (SELECT * FROM catalog_set) EXCEPT (SELECT * FROM web_set)) AS cool_cust",
+        "interfaces": {"outputs": ["count"], "consumes": ["store_set", "catalog_set", "web_set"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_customer", "store_set", "catalog_set", "web_set", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_customer AS ({filtered_customer}), store_set AS ({store_set}), catalog_set AS ({catalog_set}), web_set AS ({web_set}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Pre‑filtered date_dim and customer into CTEs, then used LATERAL joins to each fact table, preserving index usage and avoiding repeated dimension scans. The final EXCEPT logic is unchanged.
+
+**Expected speedup**: ~2.5x, because dimension scans are done once per channel and the lateral subqueries can use existing indexes on the fact tables.

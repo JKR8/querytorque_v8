@@ -1,0 +1,129 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_filter  [+]  Cost: ~1%  Rows: ~30  — Filter date_dim for 30-day window starting 1998-08-28.
+├── [CTE] item_filter  [+]  Cost: ~1%  Rows: ~?  — Filter items with price > 50.
+├── [CTE] promo_filter  [+]  Cost: ~1%  Rows: ~?  — Filter promotions where channel ≠ TV.
+├── [CTE] ssr_sales_agg  [+]  Cost: ~8%  Rows: 51  — Aggregate store sales by store_id (sales, net_profit).
+├── [CTE] ssr_returns_agg  [+]  Cost: ~8%  Rows: ≤51  — Aggregate store returns by store_id (returns_amt, net_loss).
+├── [CTE] ssr_join  [+]  Cost: ~1%  Rows: 51  — Left join sales_agg with returns_agg, compute final store metrics.
+├── [CTE] csr_sales_agg  [+]  Cost: ~8%  Rows: ~1K  — Aggregate catalog sales by catalog_page_id.
+├── [CTE] csr_returns_agg  [+]  Cost: ~8%  Rows: ~1K  — Aggregate catalog returns by catalog_page_id.
+├── [CTE] csr_join  [+]  Cost: ~1%  Rows: ~1K  — Left join catalog aggregates.
+├── [CTE] wsr_sales_agg  [+]  Cost: ~8%  Rows: ~1K  — Aggregate web sales by web_site_id.
+├── [CTE] wsr_returns_agg  [+]  Cost: ~8%  Rows: ~1K  — Aggregate web returns by web_site_id.
+├── [CTE] wsr_join  [+]  Cost: ~1%  Rows: ~1K  — Left join web aggregates.
+└── [MAIN] main_query  [=]  Cost: 25%  Rows: ~1K  — Union all three channels, compute rollup totals.
+    ├── SCAN (ssr_join, csr_join, wsr_join)
+    ├── AGG (GROUP BY ROLLUP(channel, id))
+    ├── SORT (channel ASC, id ASC)
+    └── OUTPUT (channel, id, sales, returns, profit)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimensional_filter_decomposition", "description": "Extract date, item, promotion filters into separate CTEs for reuse across channels", "applied_to": ["date_filter", "item_filter", "promo_filter"]},
+    {"id": "R2", "type": "fact_aggregate_separation", "description": "Separate sales and returns aggregation for each channel, then join with LEFT JOIN", "applied_to": ["ssr_sales_agg", "ssr_returns_agg", "csr_sales_agg", "csr_returns_agg", "wsr_sales_agg", "wsr_returns_agg"]},
+    {"id": "R3", "type": "semantic_preservation", "description": "Maintain exact column names and calculations from original query, including COALESCE guards", "applied_to": ["ssr_join", "csr_join", "wsr_join", "main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "item_filter": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk FROM item WHERE i_current_price > 50",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "promo_filter": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N'",
+        "interfaces": {"outputs": ["p_promo_sk"], "consumes": []}
+      },
+      "ssr_sales_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(ss_net_profit) AS net_profit FROM store_sales INNER JOIN date_filter ON ss_sold_date_sk = d_date_sk INNER JOIN item_filter ON ss_item_sk = i_item_sk INNER JOIN promo_filter ON ss_promo_sk = p_promo_sk INNER JOIN store ON ss_store_sk = s_store_sk GROUP BY s_store_id",
+        "interfaces": {"outputs": ["store_id", "sales", "net_profit"], "consumes": ["date_filter", "item_filter", "promo_filter"]}
+      },
+      "ssr_returns_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_id AS store_id, SUM(sr_return_amt) AS returns_amt, SUM(sr_net_loss) AS net_loss FROM store_sales INNER JOIN date_filter ON ss_sold_date_sk = d_date_sk INNER JOIN item_filter ON ss_item_sk = i_item_sk INNER JOIN promo_filter ON ss_promo_sk = p_promo_sk INNER JOIN store ON ss_store_sk = s_store_sk INNER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) GROUP BY s_store_id",
+        "interfaces": {"outputs": ["store_id", "returns_amt", "net_loss"], "consumes": ["date_filter", "item_filter", "promo_filter"]}
+      },
+      "ssr_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT store_id, sales, COALESCE(returns_amt, 0) AS \"returns\", net_profit - COALESCE(net_loss, 0) AS profit FROM ssr_sales_agg LEFT JOIN ssr_returns_agg USING (store_id)",
+        "interfaces": {"outputs": ["store_id", "sales", "returns", "profit"], "consumes": ["ssr_sales_agg", "ssr_returns_agg"]}
+      },
+      "csr_sales_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cp_catalog_page_id AS catalog_page_id, SUM(cs_ext_sales_price) AS sales, SUM(cs_net_profit) AS net_profit FROM catalog_sales INNER JOIN date_filter ON cs_sold_date_sk = d_date_sk INNER JOIN item_filter ON cs_item_sk = i_item_sk INNER JOIN promo_filter ON cs_promo_sk = p_promo_sk INNER JOIN catalog_page ON cs_catalog_page_sk = cp_catalog_page_sk GROUP BY cp_catalog_page_id",
+        "interfaces": {"outputs": ["catalog_page_id", "sales", "net_profit"], "consumes": ["date_filter", "item_filter", "promo_filter"]}
+      },
+      "csr_returns_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cp_catalog_page_id AS catalog_page_id, SUM(cr_return_amount) AS returns_amt, SUM(cr_net_loss) AS net_loss FROM catalog_sales INNER JOIN date_filter ON cs_sold_date_sk = d_date_sk INNER JOIN item_filter ON cs_item_sk = i_item_sk INNER JOIN promo_filter ON cs_promo_sk = p_promo_sk INNER JOIN catalog_page ON cs_catalog_page_sk = cp_catalog_page_sk INNER JOIN catalog_returns ON (cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number) GROUP BY cp_catalog_page_id",
+        "interfaces": {"outputs": ["catalog_page_id", "returns_amt", "net_loss"], "consumes": ["date_filter", "item_filter", "promo_filter"]}
+      },
+      "csr_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT catalog_page_id, sales, COALESCE(returns_amt, 0) AS \"returns\", net_profit - COALESCE(net_loss, 0) AS profit FROM csr_sales_agg LEFT JOIN csr_returns_agg USING (catalog_page_id)",
+        "interfaces": {"outputs": ["catalog_page_id", "sales", "returns", "profit"], "consumes": ["csr_sales_agg", "csr_returns_agg"]}
+      },
+      "wsr_sales_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT web_site_id, SUM(ws_ext_sales_price) AS sales, SUM(ws_net_profit) AS net_profit FROM web_sales INNER JOIN date_filter ON ws_sold_date_sk = d_date_sk INNER JOIN item_filter ON ws_item_sk = i_item_sk INNER JOIN promo_filter ON ws_promo_sk = p_promo_sk INNER JOIN web_site ON ws_web_site_sk = web_site_sk GROUP BY web_site_id",
+        "interfaces": {"outputs": ["web_site_id", "sales", "net_profit"], "consumes": ["date_filter", "item_filter", "promo_filter"]}
+      },
+      "wsr_returns_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT web_site_id, SUM(wr_return_amt) AS returns_amt, SUM(wr_net_loss) AS net_loss FROM web_sales INNER JOIN date_filter ON ws_sold_date_sk = d_date_sk INNER JOIN item_filter ON ws_item_sk = i_item_sk INNER JOIN promo_filter ON ws_promo_sk = p_promo_sk INNER JOIN web_site ON ws_web_site_sk = web_site_sk INNER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number) GROUP BY web_site_id",
+        "interfaces": {"outputs": ["web_site_id", "returns_amt", "net_loss"], "consumes": ["date_filter", "item_filter", "promo_filter"]}
+      },
+      "wsr_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT web_site_id, sales, COALESCE(returns_amt, 0) AS \"returns\", net_profit - COALESCE(net_loss, 0) AS profit FROM wsr_sales_agg LEFT JOIN wsr_returns_agg USING (web_site_id)",
+        "interfaces": {"outputs": ["web_site_id", "sales", "returns", "profit"], "consumes": ["wsr_sales_agg", "wsr_returns_agg"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT channel, id, SUM(sales) AS sales, SUM(\"returns\") AS \"returns\", SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, \"returns\", profit FROM ssr_join UNION ALL SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, \"returns\", profit FROM csr_join UNION ALL SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, \"returns\", profit FROM wsr_join) x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100",
+        "interfaces": {"outputs": ["channel", "id", "sales", "returns", "profit"], "consumes": ["ssr_join", "csr_join", "wsr_join"]}
+      }
+    },
+    "reconstruction_order": ["date_filter", "item_filter", "promo_filter", "ssr_sales_agg", "ssr_returns_agg", "ssr_join", "csr_sales_agg", "csr_returns_agg", "csr_join", "wsr_sales_agg", "wsr_returns_agg", "wsr_join", "main_query"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), item_filter AS ({item_filter}), promo_filter AS ({promo_filter}), ssr_sales_agg AS ({ssr_sales_agg}), ssr_returns_agg AS ({ssr_returns_agg}), ssr_join AS ({ssr_join}), csr_sales_agg AS ({csr_sales_agg}), csr_returns_agg AS ({csr_returns_agg}), csr_join AS ({csr_join}), wsr_sales_agg AS ({wsr_sales_agg}), wsr_returns_agg AS ({wsr_returns_agg}), wsr_join AS ({wsr_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Decomposed the original monolithic channel CTEs into shared dimension filters and separate sales/returns aggregations that join before final union. This isolates dimension scans (preventing cross-joins) and allows predicate pushdown directly into each fact table scan.
+
+**Expected speedup**: 2-3x due to elimination of cross-joining dimension CTEs and enabling better join reordering within each channel's fact-dependency chain.

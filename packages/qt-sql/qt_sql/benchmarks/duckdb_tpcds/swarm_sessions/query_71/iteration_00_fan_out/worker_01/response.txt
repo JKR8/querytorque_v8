@@ -1,0 +1,103 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Union channel sales into a common stream with sold time keys, join item and time dimensions, filter to meal times breakfast/dinner, and aggregate ext_price by brand and minute-level time.
+    ├── [~] CTE filtered_date  [=]  Cost: 0%  Rows: 31  — Filter date_dim for Dec-1998
+    ├── [~] CTE web_sales_with_date  [=]  Cost: 0%  Rows: 244K  — Join web_sales with filtered_date
+    ├── [~] CTE catalog_sales_with_date  [=]  Cost: 0%  Rows: 485K  — Join catalog_sales with filtered_date
+    ├── [~] CTE store_sales_with_date  [=]  Cost: 0%  Rows: 931K  — Join store_sales with filtered_date
+    ├── [~] CTE union_all_channels  [=]  Cost: 0%  Rows: 1.66M  — Union all sales channels
+    ├── [~] CTE join_item  [=]  Cost: 0%  Rows: 31K  — Filter by i_manager_id=1
+    ├── [~] CTE join_time  [=]  Cost: 0%  Rows: 12K  — Filter by meal_time breakfast/dinner
+    ├── [~] CTE aggregate  [=]  Cost: 0%  Rows: 10K  — Group by brand and time
+    └── [~] CTE sort  [=]  Cost: 100%  Rows: 10K  — Order by revenue and brand
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extract date_dim filter into reusable CTE to prevent triple scanning", "applied_to": ["filtered_date"]},
+    {"id": "R2", "type": "staged_cte_pipeline", "description": "Follow target logical tree exactly with staged CTEs for predicate pushdown", "applied_to": ["web_sales_with_date", "catalog_sales_with_date", "store_sales_with_date", "union_all_channels", "join_item", "join_time", "aggregate", "sort"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_moy = 12 AND d_year = 1998",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "web_sales_with_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_ext_sales_price AS ext_price, ws_item_sk AS sold_item_sk, ws_sold_time_sk AS time_sk FROM web_sales JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk",
+        "interfaces": {"outputs": ["ext_price", "sold_item_sk", "time_sk"], "consumes": ["filtered_date"]}
+      },
+      "catalog_sales_with_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cs_ext_sales_price AS ext_price, cs_item_sk AS sold_item_sk, cs_sold_time_sk AS time_sk FROM catalog_sales JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk",
+        "interfaces": {"outputs": ["ext_price", "sold_item_sk", "time_sk"], "consumes": ["filtered_date"]}
+      },
+      "store_sales_with_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_ext_sales_price AS ext_price, ss_item_sk AS sold_item_sk, ss_sold_time_sk AS time_sk FROM store_sales JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk",
+        "interfaces": {"outputs": ["ext_price", "sold_item_sk", "time_sk"], "consumes": ["filtered_date"]}
+      },
+      "union_all_channels": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ext_price, sold_item_sk, time_sk FROM web_sales_with_date UNION ALL SELECT ext_price, sold_item_sk, time_sk FROM catalog_sales_with_date UNION ALL SELECT ext_price, sold_item_sk, time_sk FROM store_sales_with_date",
+        "interfaces": {"outputs": ["ext_price", "sold_item_sk", "time_sk"], "consumes": ["web_sales_with_date", "catalog_sales_with_date", "store_sales_with_date"]}
+      },
+      "join_item": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT union_all_channels.ext_price, item.i_brand_id, item.i_brand, union_all_channels.time_sk FROM union_all_channels JOIN item ON union_all_channels.sold_item_sk = item.i_item_sk WHERE item.i_manager_id = 1",
+        "interfaces": {"outputs": ["ext_price", "i_brand_id", "i_brand", "time_sk"], "consumes": ["union_all_channels"]}
+      },
+      "join_time": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT join_item.ext_price, join_item.i_brand_id, join_item.i_brand, time_dim.t_hour, time_dim.t_minute FROM join_item JOIN time_dim ON join_item.time_sk = time_dim.t_time_sk WHERE time_dim.t_meal_time = 'breakfast' OR time_dim.t_meal_time = 'dinner'",
+        "interfaces": {"outputs": ["ext_price", "i_brand_id", "i_brand", "t_hour", "t_minute"], "consumes": ["join_item"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_brand_id, i_brand, t_hour, t_minute, SUM(ext_price) AS ext_price FROM join_time GROUP BY i_brand_id, i_brand, t_hour, t_minute",
+        "interfaces": {"outputs": ["i_brand_id", "i_brand", "t_hour", "t_minute", "ext_price"], "consumes": ["join_time"]}
+      },
+      "sort": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_brand_id AS brand_id, i_brand AS brand, t_hour, t_minute, ext_price FROM aggregate ORDER BY ext_price DESC, i_brand_id",
+        "interfaces": {"outputs": ["brand_id", "brand", "t_hour", "t_minute", "ext_price"], "consumes": ["aggregate"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT brand_id, brand, t_hour, t_minute, ext_price FROM sort",
+        "interfaces": {"outputs": ["brand_id", "brand", "t_hour", "t_minute", "ext_price"], "consumes": ["sort"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "web_sales_with_date", "catalog_sales_with_date", "store_sales_with_date", "union_all_channels", "join_item", "join_time", "aggregate", "sort", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), web_sales_with_date AS ({web_sales_with_date}), catalog_sales_with_date AS ({catalog_sales_with_date}), store_sales_with_date AS ({store_sales_with_date}), union_all_channels AS ({union_all_channels}), join_item AS ({join_item}), join_time AS ({join_time}), aggregate AS ({aggregate}), sort AS ({sort}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Extracted date_dim filter into isolated CTE to prevent triple scanning, then followed staged CTE pipeline exactly as per target logical tree to enable predicate pushdown and maintain semantic equivalence.
+
+**Expected speedup**: ~2.5-3.0x (baseline 421ms → ~140-170ms) due to eliminating redundant date_dim scans and enabling better join ordering.

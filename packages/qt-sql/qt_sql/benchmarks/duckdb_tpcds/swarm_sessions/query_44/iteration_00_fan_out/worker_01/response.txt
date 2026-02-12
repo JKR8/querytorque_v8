@@ -1,0 +1,81 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE-based decomposition)
+├── [~] store_baseline_cte [=]
+│   └── SCAN store_sales (filter: ss_store_sk=146, ss_addr_sk IS NULL)
+├── [~] item_aggregates_cte [=]
+│   └── SCAN store_sales (filter: ss_store_sk=146)
+├── [+] ranked_items_cte
+│   ├── JOIN (CROSS) store_baseline_cte × item_aggregates_cte
+│   ├── FILTER (item_avg > 0.9 * store_avg)
+│   ├── WINDOW (RANK() ASC, RANK() DESC)
+│   └── PROJECT (item_sk, asc_rnk, desc_rnk)
+└── [+] final_join
+    ├── SELF-JOIN ranked_items_cte (asc.asc_rnk = desc.desc_rnk)
+    ├── JOIN item i1 (asc.item_sk = i1.i_item_sk)
+    ├── JOIN item i2 (desc.item_sk = i2.i_item_sk)
+    ├── FILTER (asc_rnk < 11 AND desc_rnk < 11)
+    ├── SORT (asc_rnk ASC)
+    └── OUTPUT (rnk, best_performing, worst_performing)
+```
+
+**Changes:**
+- `[~] store_baseline_cte`: Previously embedded scalar subquery, now explicit CTE
+- `[~] item_aggregates_cte`: Previously duplicated in both ranking subqueries, now single CTE
+- `[+] ranked_items_cte`: New CTE computing both rankings in single pass over filtered aggregates
+- `[+] final_join`: New main query joining ranked items and item tables
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "decorrelate", "description": "Extract scalar subquery for store baseline to standalone CTE", "applied_to": ["store_baseline_cte"]},
+    {"id": "R2", "type": "single_pass_aggregation", "description": "Compute item aggregates once instead of twice", "applied_to": ["item_aggregates_cte"]},
+    {"id": "R3", "type": "single_pass_window", "description": "Compute both rank windows in single pass over filtered items", "applied_to": ["ranked_items_cte"]},
+    {"id": "R4", "type": "early_filter", "description": "Push store filter early into both CTEs", "applied_to": ["store_baseline_cte", "item_aggregates_cte"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "store_baseline_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT AVG(ss_net_profit) AS store_avg FROM store_sales WHERE ss_store_sk = 146 AND ss_addr_sk IS NULL GROUP BY ss_store_sk",
+        "interfaces": {"outputs": ["store_avg"], "consumes": []}
+      },
+      "item_aggregates_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk AS item_sk, AVG(ss_net_profit) AS item_avg FROM store_sales WHERE ss_store_sk = 146 GROUP BY ss_item_sk",
+        "interfaces": {"outputs": ["item_sk", "item_avg"], "consumes": []}
+      },
+      "ranked_items_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT item_sk, RANK() OVER (ORDER BY item_avg ASC) AS asc_rnk, RANK() OVER (ORDER BY item_avg DESC) AS desc_rnk FROM item_aggregates_cte CROSS JOIN store_baseline_cte WHERE item_avg > 0.9 * store_avg",
+        "interfaces": {"outputs": ["item_sk", "asc_rnk", "desc_rnk"], "consumes": ["store_baseline_cte", "item_aggregates_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT asc.asc_rnk AS rnk, i1.i_product_name AS best_performing, i2.i_product_name AS worst_performing FROM ranked_items_cte asc JOIN ranked_items_cte desc ON asc.asc_rnk = desc.desc_rnk JOIN item i1 ON asc.item_sk = i1.i_item_sk JOIN item i2 ON desc.item_sk = i2.i_item_sk WHERE asc.asc_rnk < 11 AND desc.desc_rnk < 11 ORDER BY asc.asc_rnk LIMIT 100",
+        "interfaces": {"outputs": ["rnk", "best_performing", "worst_performing"], "consumes": ["ranked_items_cte"]}
+      }
+    },
+    "reconstruction_order": ["store_baseline_cte", "item_aggregates_cte", "ranked_items_cte", "main_query"],
+    "assembly_template": "WITH store_baseline_cte AS ({store_baseline_cte}), item_aggregates_cte AS ({item_aggregates_cte}), ranked_items_cte AS ({ranked_items_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Structural decomposition with CTEs to compute store baseline once, item aggregates once, both rankings in single pass. Original query had duplicate subqueries for store baseline and item aggregates in both ranking branches.
+
+**Expected speedup:** ~3-4x (eliminates duplicate store_sales scans and redundant window computations)

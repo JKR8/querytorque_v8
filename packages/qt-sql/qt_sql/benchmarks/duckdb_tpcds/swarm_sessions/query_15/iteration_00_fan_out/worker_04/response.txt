@@ -1,0 +1,83 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Follows TARGET_LOGICAL_TREE CTE structure
+    ├── [~] filtered_date  [CTE] — date dimension filter for Q1 2001
+    ├── [~] address_customers  [CTE] — customers matching ZIP or state
+    ├── [~] price_customers  [CTE] — customers with high-price sales in period
+    ├── [~] eligible_customers  [CTE] — UNION of distinct customer keys
+    ├── [~] main_join  [CTE] — join with IN-filter on eligible customers
+    ├── [~] aggregate  [CTE] — group by ZIP, sum sales
+    └── [~] top_n  [CTE] — order by ZIP ASC, limit 100
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "composite_decorrelate_union", "description": "Extract OR conditions into separate CTEs and UNION for distinct customer keys", "applied_to": ["filtered_date", "address_customers", "price_customers", "eligible_customers"]},
+    {"id": "R2", "type": "predicate_pushdown_boundary", "description": "Push date filter into filtered_date CTE reused across joins", "applied_to": ["filtered_date"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_qoy = 1 AND d_year = 2001",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "address_customers": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT DISTINCT c_customer_sk FROM customer_address JOIN customer ON ca_address_sk = c_current_addr_sk WHERE substr(ca_zip,1,5) IN ('85669','86197','88274','83405','86475','85392','85460','80348','81792') OR ca_state IN ('CA','WA','GA')",
+        "interfaces": {"outputs": ["c_customer_sk"], "consumes": []}
+      },
+      "price_customers": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT DISTINCT cs_bill_customer_sk FROM catalog_sales JOIN filtered_date ON cs_sold_date_sk = d_date_sk WHERE cs_sales_price > 500",
+        "interfaces": {"outputs": ["cs_bill_customer_sk"], "consumes": ["filtered_date"]}
+      },
+      "eligible_customers": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_sk AS customer_sk FROM address_customers UNION SELECT cs_bill_customer_sk AS customer_sk FROM price_customers",
+        "interfaces": {"outputs": ["customer_sk"], "consumes": ["address_customers", "price_customers"]}
+      },
+      "main_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk JOIN filtered_date ON cs_sold_date_sk = d_date_sk WHERE c_customer_sk IN (SELECT customer_sk FROM eligible_customers)",
+        "interfaces": {"outputs": ["cs_sales_price", "ca_zip"], "consumes": ["filtered_date", "eligible_customers"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ca_zip, SUM(cs_sales_price) AS sum_cs_sales_price FROM main_join GROUP BY ca_zip",
+        "interfaces": {"outputs": ["ca_zip", "sum_cs_sales_price"], "consumes": ["main_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ca_zip, sum_cs_sales_price FROM aggregate ORDER BY ca_zip ASC LIMIT 100",
+        "interfaces": {"outputs": ["ca_zip", "sum_cs_sales_price"], "consumes": ["aggregate"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "address_customers", "price_customers", "eligible_customers", "main_join", "aggregate", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), address_customers AS ({address_customers}), price_customers AS ({price_customers}), eligible_customers AS ({eligible_customers}), main_join AS ({main_join}), aggregate AS ({aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Rewrote single-query OR filter into CTE-based decorrelation with UNION of distinct customer keys from separate eligibility conditions, preserving semantic equivalence and ordering. The filtered_date CTE is reused for date-bound joins.
+
+**Expected speedup**: ~2.4x (similar to composite_decorrelate_union pattern) due to eliminating cross-table OR predicate pushdown barriers and enabling independent scans with distinct key extraction.

@@ -1,0 +1,298 @@
+<reasoning>
+1. CLASSIFY: This is a channel-comparison self-join query with independent CTEs for web and store channels, each computing cumulative sales via window functions. The CTEs are then full outer joined, followed by another window pass for cumulative maxima, and filtered.
+
+2. EXPLAIN PLAN ANALYSIS:
+   - Total execution: 10718ms
+   - Main bottleneck: WINDOW node in main query (5625.7ms, 52%) operating on 5.5M rows after the full outer join.
+   - Secondary bottlenecks: WINDOW nodes in CTEs (store_v1: 2260.2ms, web_v1: 687.0ms).
+   - Row count flow:
+     * store_sales scan: 5.5M rows → HASH_GROUP_BY reduces to 4.6M → WINDOW on 4.6M rows.
+     * web_sales scan: 1.4M rows → HASH_GROUP_BY reduces to 1.4M → WINDOW on 1.4M rows.
+     * FULL OUTER JOIN: 5.5M rows (sum of both sides, indicating little overlap).
+     * Main WINDOW: 5.5M rows → FILTER reduces to 179K rows → TOP_N to 100.
+   - The optimizer already splits CTEs (separate scans) and pushes date predicates into date_dim scans (365 rows each). It uses hash joins and hash group by.
+   - Each fact table is scanned once per channel CTE, but only once overall per channel. No redundant scans of the same fact table.
+   - CTEs are materialized once (each referenced once) but may be inlined; the EXPLAIN shows separate pipelines.
+
+3. GAP MATCHING:
+   - CROSS_CTE_PREDICATE_BLINDNESS: The date filter (d_month_seq) is applied in each CTE independently, causing two scans of date_dim (365 rows each). Could be shared.
+   - REDUNDANT_SCAN_ELIMINATION: No redundant fact table scans (each channel scans its own fact table once).
+   - UNION_CTE_SELF_JOIN_DECOMPOSITION: Not applicable; no UNION CTE.
+   - CORRELATED_SUBQUERY_PARALYSIS: Not applicable.
+   - CROSS_COLUMN_OR_DECOMPOSITION: Not applicable.
+   - Window functions are computed in CTEs and again in main query (deferred_window_aggregation opportunity).
+
+4. AGGREGATION TRAP CHECK:
+   - The query uses SUM(SUM(...)) OVER ... which is grouping-safe because the inner SUM is over ws_sales_price/ss_sales_price per item/date, and the outer SUM OVER is a running total. No FILTER clauses.
+   - The final window uses MAX(web_sales) OVER ... which carries forward the last non-null cumulative value. This is safe because cumulative sums are monotonic.
+
+5. TRANSFORM SELECTION (diverse):
+   a) deferred_window_aggregation: Delay window functions until after the full outer join, computing cumulative sums once on the combined result.
+   b) shared_dimension_multi_channel: Extract the common date filter into a shared CTE to avoid scanning date_dim twice.
+   c) star_join_prefetch (compound): Pre-filter date_dim into CTE, pre-join with both fact tables in separate CTEs, then compute daily aggregates before cumulative sums.
+   d) Exploration: Combine deferred window with shared dimension and attempt to eliminate the second window pass via COALESCE and single window.
+
+6. LOGICAL TREE DESIGN:
+   - For deferred_window_aggregation: daily aggregates → full outer join → single cumulative window.
+   - For shared_dimension_multi_channel: date_cte → join with web_sales/store_sales separately → compute cumulative sums in CTEs.
+   - For star_join_prefetch: date_cte → pre-join with web_sales and store_sales → daily aggregates → full outer join → cumulative window.
+   - Exploration: date_cte → daily aggregates for both channels in separate CTEs → full outer join → compute cumulative sums with LAST_VALUE IGNORE NULLS (if supported) or MAX.
+   Ensure column completeness: each CTE must output item_sk, d_date, and cumulative sales.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+(a) Business intent: Compare item-level cumulative daily sales between web and store channels over month sequence 1216-1227, returning dates where web cumulative sales exceed store cumulative sales.
+(b) JOIN semantics: FULL OUTER JOIN between web and store CTEs on item_sk and d_date preserves rows from both channels even when one channel has no sales on a given day; missing values become NULL.
+(c) Aggregation traps: The window function SUM(SUM(...)) OVER computes running totals; the outer SUM OVER is monotonic and grouping-safe. The final MAX OVER carries forward last non-null cumulative value.
+(d) Filter dependencies: The date filter d_month_seq BETWEEN 1216 AND 1216+11 must be applied before joining with fact tables; web/item_sk IS NOT NULL filters are redundant but safe.
+
+BOTTLENECK_DIAGNOSIS:
+Dominant cost is the WINDOW function in the main query (5625.7ms, 52%) operating on 5.5M rows after the full outer join. This is window-bound, not scan-bound. The optimizer already pushes date predicates into date_dim scans (365 rows each) and uses efficient hash joins. The logical-tree cost percentages are misleading—the main window is 52% of runtime, but logical tree splits cost equally. Cardinality flow: store_sales 5.5M → 4.6M after group by; web_sales 1.4M → 1.4M; full outer join 5.5M; main window 5.5M → filter 179K → limit 100.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Output must include item_sk, d_date, web_sales, store_sales, web_cumulative, store_cumulative.
+- CTE_COLUMN_COMPLETENESS: Each CTE must output item_sk, d_date, and cumulative sales columns referenced downstream.
+- LITERAL_PRESERVATION: Date filter values 1216 and 1216+11 must be preserved exactly.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows ordered by item_sk, d_date.
+- CROSS_CTE_PREDICATE_BLINDNESS: Date filter applied twice (once per channel CTE) causing two date_dim scans (365 rows each) in EXPLAIN.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: Not applicable; no UNION CTE.
+- REDUNDANT_SCAN_ELIMINATION: Not applicable; each fact table scanned once per channel.
+
+REGRESSION_WARNINGS:
+1. regression_q51_date_cte_isolate (0.87x):
+   CAUSE: Materializing cumulative window aggregates into CTEs before a join that filters on those aggregates. The optimizer can co-optimize window evaluation and join filtering.
+   RULE: Do not materialize running/cumulative window aggregates into CTEs before joins that filter based on those aggregates.
+2. regression_q31_pushdown (0.49x):
+   CAUSE: Keeping both filtered and original CTEs causes redundant materialization and cardinality misestimates.
+   RULE: When creating filtered CTEs, remove the original unfiltered CTEs.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: deferred_window_aggregation
+TARGET_LOGICAL_TREE:
+date_filtered -> web_daily -> store_daily -> combined_daily -> cumulative_single_pass -> final_filter
+NODE_CONTRACTS:
+  date_filtered:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1216 AND 1216+11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 365
+    CONSUMERS: web_daily, store_daily
+  web_daily:
+    FROM: web_sales INNER JOIN date_filtered ON ws_sold_date_sk = d_date_sk
+    WHERE: ws_item_sk IS NOT NULL
+    GROUP BY: ws_item_sk, d_date
+    AGGREGATE: daily_web_sales = SUM(ws_sales_price)
+    OUTPUT: ws_item_sk, d_date, daily_web_sales
+    EXPECTED_ROWS: 1.4M
+    CONSUMERS: combined_daily
+  store_daily:
+    FROM: store_sales INNER JOIN date_filtered ON ss_sold_date_sk = d_date_sk
+    WHERE: ss_item_sk IS NOT NULL
+    GROUP BY: ss_item_sk, d_date
+    AGGREGATE: daily_store_sales = SUM(ss_sales_price)
+    OUTPUT: ss_item_sk, d_date, daily_store_sales
+    EXPECTED_ROWS: 4.6M
+    CONSUMERS: combined_daily
+  combined_daily:
+    FROM: web_daily FULL OUTER JOIN store_daily ON web_daily.ws_item_sk = store_daily.ss_item_sk AND web_daily.d_date = store_daily.d_date
+    OUTPUT: COALESCE(web_daily.ws_item_sk, store_daily.ss_item_sk) AS item_sk, COALESCE(web_daily.d_date, store_daily.d_date) AS d_date, daily_web_sales, daily_store_sales
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: cumulative_single_pass
+  cumulative_single_pass:
+    FROM: combined_daily
+    WINDOW: PARTITION BY item_sk ORDER BY d_date
+    OUTPUT: item_sk, d_date, daily_web_sales, daily_store_sales, SUM(daily_web_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS web_cumulative, SUM(daily_store_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS store_cumulative
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: final_filter
+  final_filter:
+    FROM: cumulative_single_pass
+    WHERE: web_cumulative > store_cumulative
+    ORDER BY: item_sk, d_date
+    LIMIT: 100
+    OUTPUT: item_sk, d_date, daily_web_sales AS web_sales, daily_store_sales AS store_sales, web_cumulative, store_cumulative
+    EXPECTED_ROWS: 100
+EXAMPLES: deferred_window_aggregation
+EXAMPLE_ADAPTATION:
+Apply the deferred window pattern: compute daily aggregates in CTEs, then full outer join, then compute cumulative sums once. Ignore the fact that the example uses a different join type; we use FULL OUTER JOIN.
+HAZARD_FLAGS:
+- The window function SUM over daily_web_sales/daily_store_sales must handle NULLs (SUM ignores NULLs, which is correct).
+- The full outer join may produce rows where one channel's daily aggregate is NULL; the cumulative sum will treat NULL as 0.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: shared_dimension_multi_channel
+TARGET_LOGICAL_TREE:
+date_cte -> web_cumulative -> store_cumulative -> full_outer_join -> main_window -> final_filter
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1216 AND 1216+11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 365
+    CONSUMERS: web_cumulative, store_cumulative
+  web_cumulative:
+    FROM: web_sales INNER JOIN date_cte ON ws_sold_date_sk = d_date_sk
+    WHERE: ws_item_sk IS NOT NULL
+    GROUP BY: ws_item_sk, d_date
+    AGGREGATE: daily_web = SUM(ws_sales_price)
+    WINDOW: PARTITION BY ws_item_sk ORDER BY d_date
+    OUTPUT: ws_item_sk AS item_sk, d_date, SUM(daily_web) OVER (PARTITION BY ws_item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS cume_sales
+    EXPECTED_ROWS: 1.4M
+    CONSUMERS: full_outer_join
+  store_cumulative:
+    FROM: store_sales INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+    WHERE: ss_item_sk IS NOT NULL
+    GROUP BY: ss_item_sk, d_date
+    AGGREGATE: daily_store = SUM(ss_sales_price)
+    WINDOW: PARTITION BY ss_item_sk ORDER BY d_date
+    OUTPUT: ss_item_sk AS item_sk, d_date, SUM(daily_store) OVER (PARTITION BY ss_item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS cume_sales
+    EXPECTED_ROWS: 4.6M
+    CONSUMERS: full_outer_join
+  full_outer_join:
+    FROM: web_cumulative FULL OUTER JOIN store_cumulative ON web_cumulative.item_sk = store_cumulative.item_sk AND web_cumulative.d_date = store_cumulative.d_date
+    OUTPUT: COALESCE(web_cumulative.item_sk, store_cumulative.item_sk) AS item_sk, COALESCE(web_cumulative.d_date, store_cumulative.d_date) AS d_date, web_cumulative.cume_sales AS web_sales, store_cumulative.cume_sales AS store_sales
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: main_window
+  main_window:
+    FROM: full_outer_join
+    WINDOW: PARTITION BY item_sk ORDER BY d_date
+    OUTPUT: item_sk, d_date, web_sales, store_sales, MAX(web_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS web_cumulative, MAX(store_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS store_cumulative
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: final_filter
+  final_filter:
+    FROM: main_window
+    WHERE: web_cumulative > store_cumulative
+    ORDER BY: item_sk, d_date
+    LIMIT: 100
+    OUTPUT: item_sk, d_date, web_sales, store_sales, web_cumulative, store_cumulative
+    EXPECTED_ROWS: 100
+EXAMPLES: shared_dimension_multi_channel, date_cte_isolate
+EXAMPLE_ADAPTATION:
+Apply shared date dimension extraction from shared_dimension_multi_channel: create one date CTE referenced by both channel CTEs. Ignore the promotion/item filters from the example; we only have date filter.
+HAZARD_FLAGS:
+- The window functions in channel CTEs are still computed before the join, which may be redundant with the main window.
+- The date_cte may be inlined (single reference), but we reference it twice; ensure it's materialized.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+date_cte -> web_prejoin -> store_prejoin -> web_daily -> store_daily -> combined -> cumulative -> final_filter
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1216 AND 1216+11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 365
+    CONSUMERS: web_prejoin, store_prejoin
+  web_prejoin:
+    FROM: web_sales INNER JOIN date_cte ON ws_sold_date_sk = d_date_sk
+    WHERE: ws_item_sk IS NOT NULL
+    OUTPUT: ws_item_sk, d_date, ws_sales_price
+    EXPECTED_ROWS: 1.4M
+    CONSUMERS: web_daily
+  web_daily:
+    FROM: web_prejoin
+    GROUP BY: ws_item_sk, d_date
+    AGGREGATE: daily_web = SUM(ws_sales_price)
+    OUTPUT: ws_item_sk, d_date, daily_web
+    EXPECTED_ROWS: 1.4M
+    CONSUMERS: combined
+  store_prejoin:
+    FROM: store_sales INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+    WHERE: ss_item_sk IS NOT NULL
+    OUTPUT: ss_item_sk, d_date, ss_sales_price
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: store_daily
+  store_daily:
+    FROM: store_prejoin
+    GROUP BY: ss_item_sk, d_date
+    AGGREGATE: daily_store = SUM(ss_sales_price)
+    OUTPUT: ss_item_sk, d_date, daily_store
+    EXPECTED_ROWS: 4.6M
+    CONSUMERS: combined
+  combined:
+    FROM: web_daily FULL OUTER JOIN store_daily ON web_daily.ws_item_sk = store_daily.ss_item_sk AND web_daily.d_date = store_daily.d_date
+    OUTPUT: COALESCE(web_daily.ws_item_sk, store_daily.ss_item_sk) AS item_sk, COALESCE(web_daily.d_date, store_daily.d_date) AS d_date, daily_web, daily_store
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: cumulative
+  cumulative:
+    FROM: combined
+    WINDOW: PARTITION BY item_sk ORDER BY d_date
+    OUTPUT: item_sk, d_date, daily_web AS web_sales, daily_store AS store_sales, SUM(daily_web) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS web_cumulative, SUM(daily_store) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS store_cumulative
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: final_filter
+  final_filter:
+    FROM: cumulative
+    WHERE: web_cumulative > store_cumulative
+    ORDER BY: item_sk, d_date
+    LIMIT: 100
+    OUTPUT: item_sk, d_date, web_sales, store_sales, web_cumulative, store_cumulative
+    EXPECTED_ROWS: 100
+EXAMPLES: prefetch_fact_join, dimension_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+Apply prefetch_fact_join pattern: filter date dimension first, then pre-join with fact tables before aggregation. Ignore the multi-dimension aspect; we only have date dimension. Apply early_filter: filter date_dim first.
+HAZARD_FLAGS:
+- The prejoin CTEs may materialize large intermediate results (1.4M and 5.5M rows) before grouping.
+- The date_cte is referenced twice; ensure it's materialized to avoid repeated scans.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_deferred_shared
+TARGET_LOGICAL_TREE:
+date_cte -> web_daily -> store_daily -> combined -> single_window_carryforward -> final_filter
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1216 AND 1216+11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 365
+    CONSUMERS: web_daily, store_daily
+  web_daily:
+    FROM: web_sales INNER JOIN date_cte ON ws_sold_date_sk = d_date_sk
+    WHERE: ws_item_sk IS NOT NULL
+    GROUP BY: ws_item_sk, d_date
+    AGGREGATE: daily_web = SUM(ws_sales_price)
+    OUTPUT: ws_item_sk, d_date, daily_web
+    EXPECTED_ROWS: 1.4M
+    CONSUMERS: combined
+  store_daily:
+    FROM: store_sales INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+    WHERE: ss_item_sk IS NOT NULL
+    GROUP BY: ss_item_sk, d_date
+    AGGREGATE: daily_store = SUM(ss_sales_price)
+    OUTPUT: ss_item_sk, d_date, daily_store
+    EXPECTED_ROWS: 4.6M
+    CONSUMERS: combined
+  combined:
+    FROM: web_daily FULL OUTER JOIN store_daily ON web_daily.ws_item_sk = store_daily.ss_item_sk AND web_daily.d_date = store_daily.d_date
+    OUTPUT: COALESCE(web_daily.ws_item_sk, store_daily.ss_item_sk) AS item_sk, COALESCE(web_daily.d_date, store_daily.d_date) AS d_date, daily_web, daily_store
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: single_window_carryforward
+  single_window_carryforward:
+    FROM: combined
+    WINDOW: PARTITION BY item_sk ORDER BY d_date
+    OUTPUT: item_sk, d_date, daily_web AS web_sales, daily_store AS store_sales, 
+           COALESCE(daily_web, LAST_VALUE(daily_web IGNORE NULLS) OVER (PARTITION BY item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS web_cumulative,
+           COALESCE(daily_store, LAST_VALUE(daily_store IGNORE NULLS) OVER (PARTITION BY item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS store_cumulative
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: final_filter
+  final_filter:
+    FROM: single_window_carryforward
+    WHERE: web_cumulative > store_cumulative
+    ORDER BY: item_sk, d_date
+    LIMIT: 100
+    OUTPUT: item_sk, d_date, web_sales, store_sales, web_cumulative, store_cumulative
+    EXPECTED_ROWS: 100
+EXAMPLES: deferred_window_aggregation, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+Combine deferred window and shared dimension patterns. Use LAST_VALUE IGNORE NULLS to carry forward cumulative values in a single window pass, eliminating the need for separate MAX windows. If DuckDB doesn't support IGNORE NULLS, fall back to MAX.
+HAZARD_FLAGS:
+- DuckDB may not support IGNORE NULLS in window functions; need a fallback using MAX.
+- The cumulative values must be computed as running sums of daily aggregates, not carried forward directly.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

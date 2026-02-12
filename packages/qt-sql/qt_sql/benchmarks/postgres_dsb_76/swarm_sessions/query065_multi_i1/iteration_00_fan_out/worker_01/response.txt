@@ -1,0 +1,101 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~437K
+    ├── [~] CTE (filtered_sales) replaces direct store_sales+date_dim scan
+    │   ├── JOIN (store_sales ⟕ date_dim) ON ss_sold_date_sk = d_date_sk
+    │   ├── FILTER (d_month_seq BETWEEN 1195 AND 1206)
+    │   └── FILTER (ss_sales_price/ss_list_price BETWEEN 0.38 AND 0.48)
+    ├── [~] CTE (grouped_sales) replaces duplicate sa/sc subqueries
+    │   ├── FROM filtered_sales
+    │   └── AGG (GROUP BY ss_store_sk, ss_item_sk) SUM(ss_sales_price)→revenue
+    ├── [~] CTE (store_avg) replaces sb subquery
+    │   ├── FROM grouped_sales
+    │   └── AGG (GROUP BY ss_store_sk) AVG(revenue)→ave
+    ├── [~] JOIN (grouped_sales ⟕ store_avg ⟕ store ⟕ item) explicit joins
+    ├── [=] FILTER (g.revenue <= 0.1 * a.ave)
+    ├── [=] FILTER (store.s_state IN ('IA','IL','NC'))
+    ├── [=] FILTER (item.i_manager_id BETWEEN 80 AND 84)
+    ├── [=] SORT (s_store_name ASC, i_item_desc ASC)
+    └── [=] OUTPUT (s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "shared_materialization",
+      "description": "Materialize filtered store_sales once as CTE, deduplicate identical sa/sc subqueries",
+      "applied_to": ["filtered_sales", "grouped_sales", "store_avg"]
+    },
+    {
+      "id": "R2",
+      "type": "explicit_join_syntax",
+      "description": "Replace comma-separated implicit joins with explicit JOINs for clarity and planner hints",
+      "applied_to": ["final_join"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_store_sk, ss_item_sk, ss_sales_price FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk WHERE d_month_seq BETWEEN 1195 AND 1195 + 11 AND ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01",
+        "interfaces": {
+          "outputs": ["ss_store_sk", "ss_item_sk", "ss_sales_price"],
+          "consumes": []
+        }
+      },
+      "grouped_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM filtered_sales GROUP BY ss_store_sk, ss_item_sk",
+        "interfaces": {
+          "outputs": ["ss_store_sk", "ss_item_sk", "revenue"],
+          "consumes": ["filtered_sales"]
+        }
+      },
+      "store_avg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_store_sk, AVG(revenue) AS ave FROM grouped_sales GROUP BY ss_store_sk",
+        "interfaces": {
+          "outputs": ["ss_store_sk", "ave"],
+          "consumes": ["grouped_sales"]
+        }
+      },
+      "final_join": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s.s_store_name, i.i_item_desc, g.revenue, i.i_current_price, i.i_wholesale_cost, i.i_brand FROM grouped_sales g JOIN store_avg a ON g.ss_store_sk = a.ss_store_sk JOIN store s ON s.s_store_sk = g.ss_store_sk JOIN item i ON i.i_item_sk = g.ss_item_sk WHERE g.revenue <= 0.1 * a.ave AND s.s_state IN ('IA', 'IL', 'NC') AND i.i_manager_id BETWEEN 80 AND 84 ORDER BY s.s_store_name, i.i_item_desc LIMIT 100",
+        "interfaces": {
+          "outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"],
+          "consumes": ["grouped_sales", "store_avg"]
+        }
+      }
+    },
+    "reconstruction_order": ["filtered_sales", "grouped_sales", "store_avg", "final_join"],
+    "assembly_template": "WITH filtered_sales AS ({filtered_sales}), grouped_sales AS ({grouped_sales}), store_avg AS ({store_avg}) {final_join}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL work_mem = '16MB'",
+    "SET LOCAL hash_mem_multiplier = 2.0",
+    "SET LOCAL enable_nestloop = off"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes**: Materialized the filtered store_sales+date_dim scan once as a CTE (`filtered_sales`), derived the per-store-item aggregates (`grouped_sales`) and store averages (`store_avg`) from it, eliminating the duplicate scan present in the original query. Replaced comma-separated implicit joins with explicit JOINs.
+
+**Expected speedup**: ~3-4x reduction in I/O and CPU from eliminating duplicate fact table scan and leveraging CTE materialization.

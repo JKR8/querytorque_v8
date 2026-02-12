@@ -1,0 +1,109 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY:
+└── [MAIN] main_query  [~]  Now uses staged CTE pipeline with early dimension filtering
+    ├── CTE: date_cte  [+]  Early filter on date_dim (d_year=2001, d_moy=11)
+    ├── CTE: addr_cte  [+]  Early filter on customer_address (ca_gmt_offset=-6)
+    ├── CTE: hd_cte  [+]  Early filter on household_demographics (hd_buy_potential LIKE '1001-5000%')
+    ├── CTE: candidate_customers  [+]  Joins customer with addr_cte, hd_cte, customer_demographics, applies OR filter
+    ├── CTE: fact_join  [+]  Joins catalog_returns with date_cte and candidate_customers
+    ├── JOIN (fact_join + call_center)
+    ├── AGG (GROUP BY cc_call_center_id, cc_name, cc_manager, cd_marital_status, cd_education_status)
+    ├── SORT (SUM(cr_net_loss) DESC)
+    └── OUTPUT (Call_Center, Call_Center_Name, Manager, Returns_Loss)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "early_filter",
+      "description": "Extracted dimension filters into separate CTEs before joining to reduce fact table scan",
+      "applied_to": ["date_cte", "addr_cte", "hd_cte"]
+    },
+    {
+      "id": "R2", 
+      "type": "prefetch_fact_join",
+      "description": "Staged join pipeline: filtered dimensions → candidate customers → fact join → final aggregation",
+      "applied_to": ["candidate_customers", "fact_join", "final_agg"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "date_cte": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_moy = 11",
+          "interfaces": {
+            "outputs": ["d_date_sk"],
+            "consumes": []
+          }
+        },
+        "addr_cte": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_gmt_offset = -6",
+          "interfaces": {
+            "outputs": ["ca_address_sk"],
+            "consumes": []
+          }
+        },
+        "hd_cte": {
+          "type": "cte", 
+          "change": "added",
+          "sql": "SELECT hd_demo_sk FROM household_demographics WHERE hd_buy_potential LIKE '1001-5000%'",
+          "interfaces": {
+            "outputs": ["hd_demo_sk"],
+            "consumes": []
+          }
+        },
+        "candidate_customers": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT c.c_customer_sk, cd.cd_marital_status, cd.cd_education_status FROM customer c JOIN addr_cte a ON c.c_current_addr_sk = a.ca_address_sk JOIN hd_cte h ON c.c_current_hdemo_sk = h.hd_demo_sk JOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk WHERE (cd.cd_marital_status = 'M' AND cd.cd_education_status = 'Unknown') OR (cd.cd_marital_status = 'W' AND cd.cd_education_status = 'Advanced Degree')",
+          "interfaces": {
+            "outputs": ["c_customer_sk", "cd_marital_status", "cd_education_status"],
+            "consumes": ["addr_cte", "hd_cte"]
+          }
+        },
+        "fact_join": {
+          "type": "cte",
+          "change": "added", 
+          "sql": "SELECT cr.cr_call_center_sk, cr.cr_net_loss, cc.cd_marital_status, cc.cd_education_status FROM catalog_returns cr JOIN date_cte d ON cr.cr_returned_date_sk = d.d_date_sk JOIN candidate_customers cc ON cr.cr_returning_customer_sk = cc.c_customer_sk",
+          "interfaces": {
+            "outputs": ["cr_call_center_sk", "cr_net_loss", "cd_marital_status", "cd_education_status"],
+            "consumes": ["date_cte", "candidate_customers"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT cc.cc_call_center_id AS Call_Center, cc.cc_name AS Call_Center_Name, cc.cc_manager AS Manager, SUM(fj.cr_net_loss) AS Returns_Loss FROM fact_join fj JOIN call_center cc ON fj.cr_call_center_sk = cc.cc_call_center_sk GROUP BY cc.cc_call_center_id, cc.cc_name, cc.cc_manager, fj.cd_marital_status, fj.cd_education_status ORDER BY Returns_Loss DESC",
+          "interfaces": {
+            "outputs": ["Call_Center", "Call_Center_Name", "Manager", "Returns_Loss"],
+            "consumes": ["fact_join"]
+          }
+        }
+      },
+      "reconstruction_order": ["date_cte", "addr_cte", "hd_cte", "candidate_customers", "fact_join", "main_query"],
+      "assembly_template": "WITH date_cte AS ({date_cte}), addr_cte AS ({addr_cte}), hd_cte AS ({hd_cte}), candidate_customers AS ({candidate_customers}), fact_join AS ({fact_join}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured query into staged CTE pipeline: early filtering of small dimensions (date, address, household) reduces downstream join cardinality before hitting large fact tables. The OR filter on customer_demographics remains in the candidate_customers CTE, preserving semantic equivalence.
+
+**Expected speedup**: 2.5-4.0x due to reduced intermediate join sizes and predicate pushdown into dimension CTEs.

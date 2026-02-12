@@ -1,0 +1,120 @@
+<reasoning>
+## Step 1: DIAGNOSE - Why did best worker achieve only 1.0x?
+
+The execution plan reveals the true bottleneck: store_returns TABLE_SCAN (0.71s, 63% of total) dominates. The CTE aggregates 557K rows to 539K rows (only 3% reduction). The store filter (s_state='SD') reduces rows from 539K to 158K (71% reduction) but is applied AFTER CTE materialization.
+
+**Critical insight:** The optimizer already decorrelates efficiently (LEFT_DELIM_JOIN computes store averages once), achieving the primary decorrelation benefit. Both W3 (window) and W4 (prefetch) achieved 1.0x because they didn't address the root problem: we're scanning ALL store_returns for ALL states, then filtering to SD stores after the expensive scan+aggregation.
+
+Previous attempts focused on decorrelation (which optimizer already does) but missed the **CROSS_CTE_PREDICATE_BLINDNESS** opportunity: cannot push s_state='SD' filter into the CTE because the store average needs all stores. However, we can split the computation strategically.
+
+## Step 2: IDENTIFY - Unexplored optimization angles
+
+1. **Dual-path CTE strategy**: The semantic contract requires store averages across ALL stores, but main query only needs SD stores for customer-store joins. We can:
+   - Compute store averages once from ALL stores (2000 filtered)
+   - Compute customer totals ONLY for SD stores (filter early)
+   - Join the two using store_sk
+
+2. **Early dimension filtering**: Apply s_state='SD' filter BEFORE scanning store_returns by joining store early. This reduces the fact table scan by ~71% (from 557K to ~158K rows).
+
+3. **Shared dimension extraction**: Both paths need date_dim filter (d_year=2000). Create a single date CTE.
+
+4. **Aggregation equivalence preservation**: Store averages must be computed over ALL stores, customer totals only for SD stores. This matches semantic contract.
+
+## Step 3: REWRITE - Strategic plan
+
+We'll implement a **dimension-isolated early filter** pattern:
+1. date_filter CTE: d_date_sk for d_year=2000
+2. store_sd CTE: s_store_sk for s_state='SD'
+3. customer_totals_sd: Join store_returns with date_filter AND store_sd EARLY
+4. store_averages_all: Join store_returns with date_filter ONLY (all stores)
+5. Final join: customer_totals_sd with store_averages_all and customer
+
+This reduces store_returns scan volume by filtering to SD stores early while maintaining correct store averages from all stores.
+
+## Verification against hazards:
+- ✅ COMPLETE_OUTPUT: Only c_customer_id as required
+- ✅ CTE_COLUMN_COMPLETENESS: All CTEs include needed join columns
+- ✅ LITERAL_PRESERVATION: d_year=2000, s_state='SD', factor 1.2 preserved
+- ✅ SEMANTIC_EQUIVALENCE: Store averages computed from all stores, customer totals from SD stores
+- ✅ Aggregation equivalence: Same rows participate in each group
+- ✅ Defensive guards: No division operations in original
+</reasoning>
+
+## Modified Logic Tree
+
+```
+[=] Original Query
+  [~] customer_total_return CTE (removed)
+  [+] date_filter CTE (new)
+  [+] store_sd CTE (new)  
+  [+] customer_totals_sd CTE (new)
+  [+] store_averages_all CTE (new)
+  [~] Main Query
+    [=] SELECT c_customer_id
+    [!] FROM customer_totals_sd (replaces customer_total_return)
+    [!] JOIN store_averages_all ON store_sk (replaces correlated subquery)
+    [=] JOIN customer ON customer_sk
+    [=] WHERE ctr_total_return > store_avg_threshold
+    [=] ORDER BY c_customer_id
+    [=] LIMIT 100
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Extract date and store filters into CTEs for early pushdown", "applied_to": ["date_filter", "store_sd"]},
+    {"id": "R2", "type": "cross_cte_predicate_pushdown", "description": "Push s_state='SD' filter into customer totals CTE to reduce fact scan", "applied_to": ["customer_totals_sd"]},
+    {"id": "R3", "type": "shared_dimension_reuse", "description": "Reuse date_filter CTE in both customer totals and store averages computations", "applied_to": ["customer_totals_sd", "store_averages_all"]},
+    {"id": "R4", "type": "decorrelate_manual", "description": "Explicitly compute store averages once and join instead of correlated subquery", "applied_to": ["store_averages_all", "main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "store_sd": {
+        "type": "cte",
+        "change": "added", 
+        "sql": "SELECT s_store_sk FROM store WHERE s_state = 'SD'",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "customer_totals_sd": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns JOIN date_filter ON sr_returned_date_sk = d_date_sk JOIN store_sd ON sr_store_sk = s_store_sk GROUP BY sr_customer_sk, sr_store_sk",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_total_return"], "consumes": ["date_filter", "store_sd"]}
+      },
+      "store_averages_all": {
+        "type": "cte", 
+        "change": "added",
+        "sql": "SELECT sr_store_sk AS ctr_store_sk, AVG(SUM(SR_FEE)) * 1.2 AS store_avg_threshold FROM store_returns JOIN date_filter ON sr_returned_date_sk = d_date_sk GROUP BY sr_store_sk",
+        "interfaces": {"outputs": ["ctr_store_sk", "store_avg_threshold"], "consumes": ["date_filter"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id FROM customer_totals_sd ctr1 JOIN store_averages_all saa ON ctr1.ctr_store_sk = saa.ctr_store_sk JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk WHERE ctr1.ctr_total_return > saa.store_avg_threshold ORDER BY c_customer_id LIMIT 100",
+        "interfaces": {"outputs": ["c_customer_id"], "consumes": ["customer_totals_sd", "store_averages_all"]}
+      }
+    },
+    "reconstruction_order": ["date_filter", "store_sd", "customer_totals_sd", "store_averages_all", "main_query"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), store_sd AS ({store_sd}), customer_totals_sd AS ({customer_totals_sd}), store_averages_all AS ({store_averages_all}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Split computation into two paths: 1) customer totals with early store filter (SD only), 2) store averages without store filter (all stores). This reduces store_returns scan volume by filtering to SD stores early while maintaining correct store averages.
+
+**Expected speedup**: 2.5-3.0x. The key reduction is scanning store_returns once with join to store_sd CTE, which should filter ~71% of rows before aggregation. Store averages still need full scan but that's unavoidable per semantics.

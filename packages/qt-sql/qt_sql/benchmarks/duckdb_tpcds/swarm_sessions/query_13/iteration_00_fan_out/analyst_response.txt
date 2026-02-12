@@ -1,0 +1,272 @@
+<reasoning>
+CLASSIFY:
+This is a star-join query with late dimension filters and complex OR conditions spanning multiple tables. The fact table (store_sales) is joined to 5 dimension tables with INNER JOIN semantics. The key structural feature is two independent groups of OR conditions: one on demographic/price (3 scenarios) and another on address/profit (3 scenarios). This creates a 3x3 combinatorial filter that the optimizer evaluates as a single complex filter after the joins.
+
+EXPLAIN PLAN ANALYSIS:
+- Total execution time: 6745ms
+- Dominant cost: SEQ_SCAN on store_sales (6213.7ms, 92% of total time). This scan returns 5.3M rows from 345.6M (1.5% selectivity).
+- Row reduction flow:
+  1. date_dim: 73K → 365 rows (d_year=2001)
+  2. customer_address: 750K → 242K rows (ca_country='United States')
+  3. store_sales: 345.6M → 5.3M rows (after joining with filtered date_dim and customer_address)
+  4. Then filtered down to 63K rows by the complex OR conditions
+  5. Finally aggregated to 1 row
+- The optimizer already pushes date and country filters early into the scans (INTRA_SCAN_PREDICATE_PUSHDOWN strength). The complex OR conditions are applied as a FILTER node after the joins, which is the missed opportunity.
+- store_sales is scanned exactly once in the current plan.
+- No CTEs in the original query; all joins are in the main FROM clause.
+
+GAP MATCHING:
+1. CROSS_COLUMN_OR_DECOMPOSITION: Present. The OR conditions span different columns (cd_marital_status, cd_education_status, ss_sales_price, hd_dep_count, ca_state, ss_net_profit) and different tables. The current plan evaluates them as a single complex filter after joins.
+2. CROSS_CTE_PREDICATE_BLINDNESS: Not applicable (no CTEs in original query). However, creating CTEs with pre-filtered dimensions could help push filters earlier.
+3. REDUNDANT_SCAN_ELIMINATION: Not applicable (single fact table scan). But the OR conditions could be restructured to reduce the fact table probe size.
+4. The optimizer handles INTRA_SCAN_PREDICATE_PUSHDOWN well (date and country filters are pushed). It does NOT decompose cross-column ORs.
+
+AGGREGATION TRAP CHECK:
+The query uses AVG() and SUM() on fact table columns. These are duplicate-sensitive if joins introduce duplicates. However, all joins are on foreign keys to dimension tables with INNER JOIN, so no duplication should occur beyond the original fact table rows. Any restructuring must preserve the same set of fact rows (same ss_item_sk? Actually the query doesn't group by item, but aggregates across all rows). The aggregates are not FILTER-based, so no special traps.
+
+TRANSFORM SELECTION:
+1. or_to_union (high expected value): Split the cross-column OR conditions into UNION ALL branches. The demographic/price ORs (3 scenarios) could become 3 branches, each with focused predicates. This could allow different access paths per branch.
+2. star_join_prefetch (dimension_cte_isolate + prefetch_fact_join): Pre-filter all dimension tables into CTEs, then intersect their keys with the fact table. This attacks the late filter application.
+3. single_pass_aggregation variant: Since we have 3x3 combinatorial ORs, we could consolidate into a single scan with CASE labels for each scenario, but that's complex. Instead, use a pivot approach: pre-join filtered dimensions, then label each fact row with which OR scenarios it matches.
+4. Exploration: Try a bitmap-like approach using WHERE EXISTS subqueries for each dimension filter, but the query has no correlated subqueries. Alternative: use a compound strategy of or_to_union plus dimension prefetch.
+
+LOGICAL TREE DESIGN:
+For each strategy, design CTEs that output all necessary columns for downstream joins and the final SELECT. The final SELECT needs ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost. The joins need the surrogate keys: ss_store_sk, ss_sold_date_sk, ss_cdemo_sk, ss_hdemo_sk, ss_addr_sk.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compute average quantity, average sales metrics, and total wholesale cost for 2001 U.S. store sales matching specific demographic/price bands (3 scenarios) AND address/profit bands (3 scenarios). All joins are INNER (intersection), requiring matches on all dimension tables. Aggregates (AVG, SUM) are duplicate-sensitive, but joins are on foreign keys so no duplication introduced. The two OR groups are independent but both must be satisfied (AND between groups), creating a 3x3 combinatorial filter.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: 92% of time (6213.7ms) spent on store_sales sequential scan (345.6M → 5.3M rows). The optimizer already pushes date and country filters effectively. The complex cross-column OR conditions are applied late as a FILTER after joins, preventing earlier row reduction. Cardinality flow: store_sales 5.3M → 63K after OR filter → 1 row aggregated. Logical-tree cost percentages align with actual timings.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output exactly: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream: surrogate keys for joins (ss_store_sk, ss_sold_date_sk, etc.) and the four aggregated columns.
+- LITERAL_PRESERVATION: All literal values (e.g., 'D', 'Unknown', 100.00, 'SD', 'United States', 2001) must be preserved exactly.
+- SEMANTIC_EQUIVALENCE: Must return identical result set (1 row, 4 aggregates).
+- CROSS_COLUMN_OR_DECOMPOSITION: EXPLAIN shows complex FILTER node after joins; OR spans cd_marital_status, cd_education_status, ss_sales_price, hd_dep_count, ca_state, ss_net_profit.
+- CROSS_CTE_PREDICATE_BLINDNESS: No CTEs in original, but creating CTEs could push filters earlier.
+
+REGRESSION_WARNINGS:
+1. or_to_union (0.59x on Q90):
+   CAUSE: Split same-column time range OR into UNION ALL, doubling fact scans without selectivity benefit.
+   RULE: Only split when OR conditions are on different columns/tables (true here). Limit to 3 branches.
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Baseline runtime <50ms, CTE overhead dominated.
+   RULE: This query has 6745ms baseline, acceptable.
+3. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially with fact table.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: or_to_union
+TARGET_LOGICAL_TREE:
+  branch1 -> branch2 -> branch3 -> union_all -> aggregate
+NODE_CONTRACTS:
+  branch1:
+    FROM: store_sales, store, customer_demographics, household_demographics, customer_address, date_dim
+    JOIN: s_store_sk = ss_store_sk, ss_sold_date_sk = d_date_sk, ss_hdemo_sk = hd_demo_sk, cd_demo_sk = ss_cdemo_sk, ss_addr_sk = ca_address_sk
+    WHERE: d_year = 2001 AND ca_country = 'United States' AND cd_marital_status = 'D' AND cd_education_status = 'Unknown' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3 AND ((ca_state IN ('SD', 'KS', 'MI') AND ss_net_profit BETWEEN 100 AND 200) OR (ca_state IN ('MO', 'ND', 'CO') AND ss_net_profit BETWEEN 150 AND 300) OR (ca_state IN ('NH', 'OH', 'TX') AND ss_net_profit BETWEEN 50 AND 250))
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~21K (63K/3)
+    CONSUMERS: union_all
+  branch2:
+    FROM: store_sales, store, customer_demographics, household_demographics, customer_address, date_dim
+    JOIN: same as branch1
+    WHERE: d_year = 2001 AND ca_country = 'United States' AND cd_marital_status = 'S' AND cd_education_status = 'College' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1 AND ((ca_state IN ('SD', 'KS', 'MI') AND ss_net_profit BETWEEN 100 AND 200) OR (ca_state IN ('MO', 'ND', 'CO') AND ss_net_profit BETWEEN 150 AND 300) OR (ca_state IN ('NH', 'OH', 'TX') AND ss_net_profit BETWEEN 50 AND 250))
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~21K
+    CONSUMERS: union_all
+  branch3:
+    FROM: store_sales, store, customer_demographics, household_demographics, customer_address, date_dim
+    JOIN: same as branch1
+    WHERE: d_year = 2001 AND ca_country = 'United States' AND cd_marital_status = 'M' AND cd_education_status = '4 yr Degree' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1 AND ((ca_state IN ('SD', 'KS', 'MI') AND ss_net_profit BETWEEN 100 AND 200) OR (ca_state IN ('MO', 'ND', 'CO') AND ss_net_profit BETWEEN 150 AND 300) OR (ca_state IN ('NH', 'OH', 'TX') AND ss_net_profit BETWEEN 50 AND 250))
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~21K
+    CONSUMERS: union_all
+  union_all:
+    FROM: branch1 UNION ALL branch2 UNION ALL branch3
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: union_all
+    AGGREGATE: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+    OUTPUT: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+EXAMPLES: or_to_union (Q15)
+EXAMPLE_ADAPTATION:
+  Apply splitting of OR conditions into UNION ALL branches. Q15 splits three OR branches; adapt by creating three branches for demographic/price scenarios, each keeping the address/profit ORs internally. Ignore that Q15 has no dimension joins — our branches must include all joins.
+HAZARD_FLAGS:
+  - Each branch rescans store_sales (3x scan overhead). May not improve if each branch still reads 5.3M rows.
+  - Ensure branches are mutually exclusive (demographic conditions differ, but sales_price ranges could overlap? They don't: 100-150, 50-100, 150-200 are disjoint).
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_cte -> addr_cte -> cd_cte -> hd_cte -> store_cte -> fact_prejoin -> filter_or -> aggregate
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year = 2001
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_prejoin
+  addr_cte:
+    FROM: customer_address
+    WHERE: ca_country = 'United States' AND ca_state IN ('SD', 'KS', 'MI', 'MO', 'ND', 'CO', 'NH', 'OH', 'TX')
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: ~242K
+    CONSUMERS: fact_prejoin
+  cd_cte:
+    FROM: customer_demographics
+    WHERE: (cd_marital_status = 'D' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'S' AND cd_education_status = 'College') OR (cd_marital_status = 'M' AND cd_education_status = '4 yr Degree')
+    OUTPUT: cd_demo_sk, cd_marital_status, cd_education_status
+    EXPECTED_ROWS: ~1.9M
+    CONSUMERS: fact_prejoin
+  hd_cte:
+    FROM: household_demographics
+    WHERE: hd_dep_count IN (1, 3)
+    OUTPUT: hd_demo_sk, hd_dep_count
+    EXPECTED_ROWS: ~7,200
+    CONSUMERS: fact_prejoin
+  store_cte:
+    FROM: store
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 102
+    CONSUMERS: fact_prejoin
+  fact_prejoin:
+    FROM: store_sales
+    JOIN: date_cte ON ss_sold_date_sk = d_date_sk
+    JOIN: addr_cte ON ss_addr_sk = ca_address_sk
+    JOIN: cd_cte ON ss_cdemo_sk = cd_demo_sk
+    JOIN: hd_cte ON ss_hdemo_sk = hd_demo_sk
+    JOIN: store_cte ON ss_store_sk = s_store_sk
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost, ss_sales_price, ss_net_profit, cd_marital_status, cd_education_status, hd_dep_count, ca_state
+    EXPECTED_ROWS: ~63K (after applying remaining filters)
+    CONSUMERS: filter_or
+  filter_or:
+    FROM: fact_prejoin
+    WHERE: ((cd_marital_status = 'D' AND cd_education_status = 'Unknown' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3) OR (cd_marital_status = 'S' AND cd_education_status = 'College' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1) OR (cd_marital_status = 'M' AND cd_education_status = '4 yr Degree' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1)) AND ((ca_state IN ('SD', 'KS', 'MI') AND ss_net_profit BETWEEN 100 AND 200) OR (ca_state IN ('MO', 'ND', 'CO') AND ss_net_profit BETWEEN 150 AND 300) OR (ca_state IN ('NH', 'OH', 'TX') AND ss_net_profit BETWEEN 50 AND 250))
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~63K
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: filter_or
+    AGGREGATE: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+    OUTPUT: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+EXAMPLES: dimension_cte_isolate (Q26), prefetch_fact_join (Q63), multi_dimension_prefetch (Q43)
+EXAMPLE_ADAPTATION:
+  Apply pre-filtering all dimension tables into CTEs before joining with fact. Q26 isolates date, demographics, promotions; adapt by isolating date, address, demographics, household, store. Q63 pre-joins filtered date with fact; adapt by pre-joining all filtered dimensions sequentially. Q43 pre-filters date and store; adapt to include all dimensions.
+HAZARD_FLAGS:
+  - CTE materialization overhead for large dimensions (cd_cte ~1.9M rows).
+  - Must ensure fact_prejoin doesn't cross-join dimension CTEs (join sequentially with fact).
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: single_pass_pivot
+TARGET_LOGICAL_TREE:
+  filtered_fact -> scenario_label -> aggregate
+NODE_CONTRACTS:
+  filtered_fact:
+    FROM: store_sales
+    JOIN: date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 2001
+    JOIN: customer_address ON ss_addr_sk = ca_address_sk AND ca_country = 'United States'
+    JOIN: customer_demographics ON ss_cdemo_sk = cd_demo_sk
+    JOIN: household_demographics ON ss_hdemo_sk = hd_demo_sk
+    JOIN: store ON ss_store_sk = s_store_sk
+    WHERE: (cd_marital_status, cd_education_status, hd_dep_count) IN (('D','Unknown',3), ('S','College',1), ('M','4 yr Degree',1))
+      AND ca_state IN ('SD','KS','MI','MO','ND','CO','NH','OH','TX')
+      AND ((ss_sales_price BETWEEN 100.00 AND 150.00 AND cd_marital_status = 'D') OR (ss_sales_price BETWEEN 50.00 AND 100.00 AND cd_marital_status = 'S') OR (ss_sales_price BETWEEN 150.00 AND 200.00 AND cd_marital_status = 'M'))
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost, ss_sales_price, ss_net_profit, cd_marital_status, cd_education_status, hd_dep_count, ca_state
+    EXPECTED_ROWS: >63K (pre-filter)
+    CONSUMERS: scenario_label
+  scenario_label:
+    FROM: filtered_fact
+    WHERE: ((cd_marital_status = 'D' AND cd_education_status = 'Unknown' AND ss_sales_price BETWEEN 100.00 AND 150.00 AND hd_dep_count = 3) OR (cd_marital_status = 'S' AND cd_education_status = 'College' AND ss_sales_price BETWEEN 50.00 AND 100.00 AND hd_dep_count = 1) OR (cd_marital_status = 'M' AND cd_education_status = '4 yr Degree' AND ss_sales_price BETWEEN 150.00 AND 200.00 AND hd_dep_count = 1)) AND ((ca_state IN ('SD', 'KS', 'MI') AND ss_net_profit BETWEEN 100 AND 200) OR (ca_state IN ('MO', 'ND', 'CO') AND ss_net_profit BETWEEN 150 AND 300) OR (ca_state IN ('NH', 'OH', 'TX') AND ss_net_profit BETWEEN 50 AND 250))
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~63K
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: scenario_label
+    AGGREGATE: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+    OUTPUT: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+EXAMPLES: single_pass_aggregation (Q9), channel_bitmap_aggregation (Q88)
+EXAMPLE_ADAPTATION:
+  Q9 consolidates multiple subqueries into CASE aggregates; adapt by pushing filters earlier and using IN lists for dimension values. Q88 uses CASE labels for channels; adapt by labeling demographic/price scenarios but we only need filtering, not labeling. Focus on reducing fact table scan via early push of dimension filters.
+HAZARD_FLAGS:
+  - The IN list on (cd_marital_status, cd_education_status, hd_dep_count) may not be selective enough.
+  - The sales_price filter is dependent on marital_status, cannot be pushed as simple range.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_or_to_union_prefetch
+TARGET_LOGICAL_TREE:
+  date_cte -> addr_cte -> fact_base -> branch1_union_branch2_union_branch3 -> aggregate
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year = 2001
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_base
+  addr_cte:
+    FROM: customer_address
+    WHERE: ca_country = 'United States' AND ca_state IN ('SD', 'KS', 'MI', 'MO', 'ND', 'CO', 'NH', 'OH', 'TX')
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: ~242K
+    CONSUMERS: fact_base
+  fact_base:
+    FROM: store_sales
+    JOIN: date_cte ON ss_sold_date_sk = d_date_sk
+    JOIN: addr_cte ON ss_addr_sk = ca_address_sk
+    OUTPUT: ss_item_sk, ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost, ss_sales_price, ss_net_profit, ss_cdemo_sk, ss_hdemo_sk, ss_store_sk, ca_state
+    EXPECTED_ROWS: <5.3M (reduced by address filter)
+    CONSUMERS: branch1, branch2, branch3
+  branch1:
+    FROM: fact_base
+    JOIN: store ON ss_store_sk = s_store_sk
+    JOIN: customer_demographics ON ss_cdemo_sk = cd_demo_sk AND cd_marital_status = 'D' AND cd_education_status = 'Unknown'
+    JOIN: household_demographics ON ss_hdemo_sk = hd_demo_sk AND hd_dep_count = 3
+    WHERE: ss_sales_price BETWEEN 100.00 AND 150.00 AND ((ca_state IN ('SD', 'KS', 'MI') AND ss_net_profit BETWEEN 100 AND 200) OR (ca_state IN ('MO', 'ND', 'CO') AND ss_net_profit BETWEEN 150 AND 300) OR (ca_state IN ('NH', 'OH', 'TX') AND ss_net_profit BETWEEN 50 AND 250))
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~21K
+    CONSUMERS: union_all
+  branch2:
+    FROM: fact_base
+    JOIN: store ON ss_store_sk = s_store_sk
+    JOIN: customer_demographics ON ss_cdemo_sk = cd_demo_sk AND cd_marital_status = 'S' AND cd_education_status = 'College'
+    JOIN: household_demographics ON ss_hdemo_sk = hd_demo_sk AND hd_dep_count = 1
+    WHERE: ss_sales_price BETWEEN 50.00 AND 100.00 AND ((ca_state IN ('SD', 'KS', 'MI') AND ss_net_profit BETWEEN 100 AND 200) OR (ca_state IN ('MO', 'ND', 'CO') AND ss_net_profit BETWEEN 150 AND 300) OR (ca_state IN ('NH', 'OH', 'TX') AND ss_net_profit BETWEEN 50 AND 250))
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~21K
+    CONSUMERS: union_all
+  branch3:
+    FROM: fact_base
+    JOIN: store ON ss_store_sk = s_store_sk
+    JOIN: customer_demographics ON ss_cdemo_sk = cd_demo_sk AND cd_marital_status = 'M' AND cd_education_status = '4 yr Degree'
+    JOIN: household_demographics ON ss_hdemo_sk = hd_demo_sk AND hd_dep_count = 1
+    WHERE: ss_sales_price BETWEEN 150.00 AND 200.00 AND ((ca_state IN ('SD', 'KS', 'MI') AND ss_net_profit BETWEEN 100 AND 200) OR (ca_state IN ('MO', 'ND', 'CO') AND ss_net_profit BETWEEN 150 AND 300) OR (ca_state IN ('NH', 'OH', 'TX') AND ss_net_profit BETWEEN 50 AND 250))
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    EXPECTED_ROWS: ~21K
+    CONSUMERS: union_all
+  union_all:
+    FROM: branch1 UNION ALL branch2 UNION ALL branch3
+    OUTPUT: ss_quantity, ss_ext_sales_price, ss_ext_wholesale_cost
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: union_all
+    AGGREGATE: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+    OUTPUT: avg(ss_quantity), avg(ss_ext_sales_price), avg(ss_ext_wholesale_cost), sum(ss_ext_wholesale_cost)
+EXAMPLES: or_to_union (Q15), prefetch_fact_join (Q63), composite_decorrelate_union (Q35)
+EXAMPLE_ADAPTATION:
+  Q15 provides UNION ALL splitting; adapt by splitting demographic scenarios. Q63 provides pre-joining filtered dimensions (date, address) with fact; adapt by creating fact_base CTE. Q35 provides shared dimension CTE (date) for multiple branches; adapt by sharing date_cte and addr_cte across branches.
+HAZARD_FLAGS:
+  - fact_base CTE may be large (~5.3M rows) and materialized.
+  - Each branch re-joins store, customer_demographics, household_demographics, potentially expensive.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

@@ -1,0 +1,90 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_prefilter [~] Changed: Pre-filter date_dim to 2002 only, explicit JOIN syntax
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year = 2002)
+│   └── OUTPUT (d_date_sk)
+├── [CTE] addr_prefilter [~] Changed: Explicit CTE for all customer_address rows
+│   ├── SCAN (customer_address)
+│   └── OUTPUT (ca_address_sk, ca_state)
+├── [CTE] fact_agg [~] Changed: Convert comma joins to explicit INNER JOIN, use prefilter CTEs
+│   ├── SCAN (catalog_returns)
+│   ├── JOIN (INNER) date_prefilter ON cr_returned_date_sk = d_date_sk
+│   ├── JOIN (INNER) addr_prefilter ON cr_returning_addr_sk = ca_address_sk
+│   ├── AGG (GROUP BY cr_returning_customer_sk, ca_state)
+│   └── OUTPUT (ctr_customer_sk, ctr_state, ctr_total_return)
+├── [CTE] state_avg [~] Changed: Materialize per-state thresholds from fact_agg
+│   ├── SCAN (fact_agg)
+│   ├── AGG (GROUP BY ctr_state)
+│   └── OUTPUT (ctr_state, state_avg_threshold)
+└── [MAIN] main_explicit_joins [~] Changed: Replace correlated subquery with state_avg CTE, explicit JOIN syntax
+    ├── SCAN (fact_agg AS ctr1, state_avg, customer, customer_address)
+    ├── JOIN (INNER) state_avg ON ctr1.ctr_state = state_avg.ctr_state
+    ├── JOIN (INNER) customer ON ctr1.ctr_customer_sk = c_customer_sk
+    ├── JOIN (INNER) customer_address ON ca_address_sk = c_current_addr_sk
+    ├── FILTER (ca_state = 'OH' AND ctr_total_return > state_avg_threshold)
+    ├── SORT (original 16-column ORDER BY)
+    └── OUTPUT (original 16 columns)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL 16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pg_dimension_prefetch_star", "description": "Pre-filter date_dim into CTE to create small hash table", "applied_to": ["date_prefilter"]},
+    {"id": "R2", "type": "pg_date_cte_explicit_join", "description": "Isolate selective dimension filters into CTEs and convert comma joins to explicit INNER JOIN syntax", "applied_to": ["fact_agg", "main_explicit_joins"]},
+    {"id": "R3", "type": "correlated_subquery_elimination", "description": "Replace correlated subquery with materialized state averages CTE", "applied_to": ["state_avg", "main_explicit_joins"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_prefilter": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2002",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "addr_prefilter": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ca_address_sk, ca_state FROM customer_address",
+        "interfaces": {"outputs": ["ca_address_sk", "ca_state"], "consumes": []}
+      },
+      "fact_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cr.cr_returning_customer_sk AS ctr_customer_sk, a.ca_state AS ctr_state, SUM(cr.cr_return_amt_inc_tax) AS ctr_total_return FROM catalog_returns cr INNER JOIN date_prefilter d ON cr.cr_returned_date_sk = d.d_date_sk INNER JOIN addr_prefilter a ON cr.cr_returning_addr_sk = a.ca_address_sk GROUP BY cr.cr_returning_customer_sk, a.ca_state",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_state", "ctr_total_return"], "consumes": ["date_prefilter", "addr_prefilter"]}
+      },
+      "state_avg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ctr_state, AVG(ctr_total_return) * 1.2 AS state_avg_threshold FROM fact_agg GROUP BY ctr_state",
+        "interfaces": {"outputs": ["ctr_state", "state_avg_threshold"], "consumes": ["fact_agg"]}
+      },
+      "main_explicit_joins": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr1.ctr_total_return FROM fact_agg ctr1 INNER JOIN state_avg sa ON ctr1.ctr_state = sa.ctr_state INNER JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk INNER JOIN customer_address ca ON ca.ca_address_sk = c.c_current_addr_sk WHERE ca.ca_state = 'OH' AND ctr1.ctr_total_return > sa.state_avg_threshold ORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr1.ctr_total_return LIMIT 100",
+        "interfaces": {"outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "ca_street_number", "ca_street_name", "ca_street_type", "ca_suite_number", "ca_city", "ca_county", "ca_state", "ca_zip", "ca_country", "ca_gmt_offset", "ca_location_type", "ctr_total_return"], "consumes": ["fact_agg", "state_avg"]}
+      }
+    },
+    "reconstruction_order": ["date_prefilter", "addr_prefilter", "fact_agg", "state_avg", "main_explicit_joins"],
+    "assembly_template": "WITH date_prefilter AS ({date_prefilter}), addr_prefilter AS ({addr_prefilter}), fact_agg AS ({fact_agg}), state_avg AS ({state_avg}) {main_explicit_joins}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+Changes: Isolated date_dim filtering into a CTE, converted all comma joins to explicit INNER JOIN syntax, and replaced the correlated subquery with a materialized state averages CTE. This eliminates per-state re-execution and improves PostgreSQL's cardinality estimation.
+
+Expected speedup: 2-3x due to elimination of correlated subquery and better join planning with pre-filtered dimension CTEs.

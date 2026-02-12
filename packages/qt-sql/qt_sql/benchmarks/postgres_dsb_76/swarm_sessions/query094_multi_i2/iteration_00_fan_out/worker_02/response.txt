@@ -1,0 +1,87 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE-based)
+└── [MAIN] main_query [!]
+    ├── WITH [=]
+    │   ├── CTE_base_sales [+]
+    │   │   ├── SCAN (web_sales AS ws1, date_dim, customer_address, web_site)
+    │   │   ├── JOIN (ws1.ws_ship_date_sk = d_date_sk)
+    │   │   ├── JOIN (ws1.ws_ship_addr_sk = ca_address_sk)
+    │   │   ├── JOIN (ws1.ws_web_site_sk = web_site_sk)
+    │   │   ├── FILTER (d_date BETWEEN '1999-10-01' AND CAST('1999-10-01' AS DATE) + INTERVAL '60 DAY')
+    │   │   ├── FILTER (ca_state IN ('MO','MT','OK','SC','TX','WI'))
+    │   │   ├── FILTER (web_gmt_offset >= -5)
+    │   │   └── FILTER (ws1.ws_list_price BETWEEN 253 AND 282)
+    │   ├── CTE_warehouse_counts [+]
+    │   │   ├── FROM base_sales
+    │   │   └── AGGREGATE (GROUP BY ws_order_number, ws_ext_ship_cost, ws_net_profit; COUNT(DISTINCT ws_warehouse_sk))
+    │   └── CTE_multi_warehouse_orders [+]
+    │       ├── FROM warehouse_counts
+    │       └── FILTER (warehouse_count >= 2)
+    └── SELECT [!]
+        ├── FROM multi_warehouse_orders mwo
+        ├── WHERE NOT EXISTS (SELECT 1 FROM web_returns wr1 WHERE wr1.wr_order_number = mwo.ws_order_number AND wr1.wr_reason_sk IN (8,18,20,23,41))
+        └── AGGREGATE (COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit))
+```
+
+**Change markers:**
+- `[!]` main_query: Changed from single SELECT with comma joins to CTE structure
+- `[+]` CTE_base_sales: Added CTE with fact+dimension materialization
+- `[+]` CTE_warehouse_counts: Added CTE for warehouse count per order
+- `[+]` CTE_multi_warehouse_orders: Added CTE for multi-warehouse filter
+- `[=]` WITH: Structural container (unchanged role)
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL 16.11",
+  "rewrite_rules": [
+    {"id": "R1", "type": "self_join_decomposition", "description": "Replace correlated EXISTS for multi-warehouse with GROUP BY + COUNT DISTINCT", "applied_to": ["warehouse_counts"]},
+    {"id": "R2", "type": "shared_materialization", "description": "Materialize base fact+dimension scan once for both warehouse counting and anti-join", "applied_to": ["base_sales"]},
+    {"id": "R3", "type": "cte_parallelization_guard", "description": "Keep base_sales CTE non-materialized (no MATERIALIZED keyword) to allow parallel scan", "applied_to": ["base_sales"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "base_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit, ws1.ws_warehouse_sk FROM web_sales ws1 INNER JOIN date_dim ON ws1.ws_ship_date_sk = date_dim.d_date_sk INNER JOIN customer_address ON ws1.ws_ship_addr_sk = customer_address.ca_address_sk INNER JOIN web_site ON ws1.ws_web_site_sk = web_site.web_site_sk WHERE date_dim.d_date BETWEEN DATE '1999-10-01' AND DATE '1999-10-01' + INTERVAL '60 DAY' AND customer_address.ca_state IN ('MO','MT','OK','SC','TX','WI') AND web_site.web_gmt_offset >= -5 AND ws1.ws_list_price BETWEEN 253 AND 282",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit", "ws_warehouse_sk"], "consumes": []}
+      },
+      "warehouse_counts": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws_order_number, ws_ext_ship_cost, ws_net_profit, COUNT(DISTINCT ws_warehouse_sk) AS warehouse_count FROM base_sales GROUP BY ws_order_number, ws_ext_ship_cost, ws_net_profit",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit", "warehouse_count"], "consumes": ["base_sales"]}
+      },
+      "multi_warehouse_orders": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws_order_number, ws_ext_ship_cost, ws_net_profit FROM warehouse_counts WHERE warehouse_count >= 2",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": ["warehouse_counts"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(DISTINCT mwo.ws_order_number) AS \"order count\", SUM(mwo.ws_ext_ship_cost) AS \"total shipping cost\", SUM(mwo.ws_net_profit) AS \"total net profit\" FROM multi_warehouse_orders mwo WHERE NOT EXISTS (SELECT 1 FROM web_returns wr1 WHERE wr1.wr_order_number = mwo.ws_order_number AND wr1.wr_reason_sk IN (8,18,20,23,41))",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["multi_warehouse_orders"]}
+      }
+    },
+    "reconstruction_order": ["base_sales", "warehouse_counts", "multi_warehouse_orders", "main_query"],
+    "assembly_template": "WITH base_sales AS ({base_sales}), warehouse_counts AS ({warehouse_counts}), multi_warehouse_orders AS ({multi_warehouse_orders}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured to match target logical tree: materialize base fact+dimension scan once, compute warehouse counts via GROUP BY (replacing correlated EXISTS), filter for multi-warehouse orders, then apply anti-join and final aggregation. Preserves all original semantics and defensive guards.
+
+**Expected speedup:** ~2-4x due to elimination of correlated self-join and single materialization of fact+dimension scan.

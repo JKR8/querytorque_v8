@@ -1,0 +1,415 @@
+You are a SQL rewrite engine for PostgreSQL v16.11-0ubuntu0.24.04.1). Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+## Semantic Contract (MUST preserve)
+
+Find customers (by name) who made purchases in all three sales channels (store, catalog, web) within the same specific 12-month period and date, with similar price ranges, and count how many such distinct customer-date combinations exist. All joins are INNER (must match in all tables). The INTERSECT requires exact three-column matching across channels. No aggregation traps exist (only COUNT). Filter dependencies: date_dim and customer filters are identical across all three channels; fact table price filters are channel-specific but structurally similar.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+filtered_date -> filtered_customer -> fact_join_store -> fact_join_catalog -> fact_join_web -> intersect_materialized -> final_count
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_month_seq between 1207 and 1207 + 11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 182
+    CONSUMERS: fact_join_store, fact_join_catalog, fact_join_web
+  filtered_customer:
+    FROM: customer
+    WHERE: c_birth_month in (2, 3, 4, 10)
+    OUTPUT: c_customer_sk, c_last_name, c_first_name
+    EXPECTED_ROWS: ~25% of customer
+    CONSUMERS: fact_join_store, fact_join_catalog, fact_join_web
+  fact_join_store:
+    FROM: store_sales JOIN filtered_date ON ss_sold_date_sk = d_date_sk JOIN filtered_customer ON ss_customer_sk = c_customer_sk
+    WHERE: ss_list_price between 241 and 300 AND ss_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: 21K distinct
+    CONSUMERS: intersect_materialized
+  fact_join_catalog:
+    FROM: catalog_sales JOIN filtered_date ON cs_sold_date_sk = d_date_sk JOIN filtered_customer ON cs_bill_customer_sk = c_customer_sk  
+    WHERE: cs_list_price between 241 and 300 AND cs_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: 62K distinct
+    CONSUMERS: intersect_materialized
+  fact_join_web:
+    FROM: web_sales JOIN filtered_date ON ws_sold_date_sk = d_date_sk JOIN filtered_customer ON ws_bill_customer_sk = c_customer_sk
+    WHERE: ws_list_price between 241 and 300 AND ws_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: 22K distinct
+    CONSUMERS: intersect_materialized
+
+NODE_CONTRACTS:
+filtered_date:
+    FROM: date_dim
+    WHERE: d_month_seq between 1207 and 1207 + 11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 182
+    CONSUMERS: fact_join_store, fact_join_catalog, fact_join_web
+  filtered_customer:
+    FROM: customer
+    WHERE: c_birth_month in (2, 3, 4, 10)
+    OUTPUT: c_customer_sk, c_last_name, c_first_name
+    EXPECTED_ROWS: ~25% of customer
+    CONSUMERS: fact_join_store, fact_join_catalog, fact_join_web
+  fact_join_store:
+    FROM: store_sales JOIN filtered_date ON ss_sold_date_sk = d_date_sk JOIN filtered_customer ON ss_customer_sk = c_customer_sk
+    WHERE: ss_list_price between 241 and 300 AND ss_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: 21K distinct
+    CONSUMERS: intersect_materialized
+  fact_join_catalog:
+    FROM: catalog_sales JOIN filtered_date ON cs_sold_date_sk = d_date_sk JOIN filtered_customer ON cs_bill_customer_sk = c_customer_sk  
+    WHERE: cs_list_price between 241 and 300 AND cs_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: 62K distinct
+    CONSUMERS: intersect_materialized
+  fact_join_web:
+    FROM: web_sales JOIN filtered_date ON ws_sold_date_sk = d_date_sk JOIN filtered_customer ON ws_bill_customer_sk = c_customer_sk
+    WHERE: ws_list_price between 241 and 300 AND ws_wholesale_cost BETWEEN 76 AND 96
+    OUTPUT: c_last_name, c_first_name, d_date
+    EXPECTED_ROWS: 22K distinct
+    CONSUMERS: intersect_materialized
+
+## Hazard Flags (avoid these specific risks)
+
+- MATERIALIZED CTEs may block parallelism and predicate pushdown
+- May force single-threaded execution of dimension filtering
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy
+
+## Regression Warnings (observed failures on similar queries)
+
+None applicable.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output COUNT(*) as single column
+- CTE_COLUMN_COMPLETENESS: Any dimension CTE must output d_date_sk, d_date for joins; customer CTE must output c_customer_sk, c_last_name, c_first_name, c_birth_month
+- LITERAL_PRESERVATION: Must preserve exact literal values: d_month_seq 1207-1218, c_birth_month (2,3,4,10), price ranges 241-300, wholesale_cost 76-96
+- SEMANTIC_EQUIVALENCE: Must return same count of distinct customer-date tuples appearing in all three channels
+- COMMA_JOIN_WEAKNESS: All three subqueries use comma-separated joins (FROM store_sales, date_dim, customer)
+- CROSS_CTE_PREDICATE_BLINDNESS: Same date_dim and customer tables scanned 3x with identical filters
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED keyword to dimension CTEs to force early execution and prevent inlining. Use for both date and customer CTEs. Ignore the fact table prefiltering (we keep fact tables separate).
+- pg_self_join_decomposition: Materialize the dimension filtering once and reuse across channels, similar to materializing fact+dimension scan once. Apply the shared materialization concept to dimensions only. Ignore the aggregation derivation pattern.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. pg_materialized_dimension_fact_prefilter (2.68x)
+
+**Principle:** Staged Reduction for Non-Equi Joins: when queries have expensive non-equi joins, reduce BOTH dimension and fact table sizes via MATERIALIZED CTEs before the join. Combined selectivity dramatically cuts the search space for inequality predicates.
+
+**BEFORE (slow):**
+```sql
+select  i_item_desc
+      ,w_warehouse_name
+      ,d1.d_week_seq
+      ,sum(case when p_promo_sk is null then 1 else 0 end) no_promo
+      ,sum(case when p_promo_sk is not null then 1 else 0 end) promo
+      ,count(*) total_cnt
+from catalog_sales
+join inventory on (cs_item_sk = inv_item_sk)
+join warehouse on (w_warehouse_sk=inv_warehouse_sk)
+join item on (i_item_sk = cs_item_sk)
+join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk)
+join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk)
+join date_dim d1 on (cs_sold_date_sk = d1.d_date_sk)
+join date_dim d2 on (inv_date_sk = d2.d_date_sk)
+join date_dim d3 on (cs_ship_date_sk = d3.d_date_sk)
+left outer join promotion on (cs_promo_sk=p_promo_sk)
+left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number)
+where d1.d_week_seq = d2.d_week_seq
+  and inv_quantity_on_hand < cs_quantity
+  and d3.d_date > d1.d_date + interval '3 day'
+  and hd_buy_potential = '501-1000'
+  and d1.d_year = 1998
+  and cd_marital_status = 'M'
+  and cd_dep_count between 9 and 11
+  and i_category IN ('Home', 'Men', 'Music')
+  and cs_wholesale_cost BETWEEN 34 AND 54
+group by i_item_desc,w_warehouse_name,d1.d_week_seq
+order by total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq
+limit 100;
+```
+
+**AFTER (fast):**
+[filtered_date]:
+```sql
+SELECT d_date_sk, d_date, d_week_seq FROM date_dim WHERE d_year = 1998
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk, i_item_desc FROM item WHERE i_category IN ('Home', 'Men', 'Music')
+```
+[filtered_cd]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_marital_status = 'M' AND cd_dep_count BETWEEN 9 AND 11
+```
+[filtered_hd]:
+```sql
+SELECT hd_demo_sk FROM household_demographics WHERE hd_buy_potential = '501-1000'
+```
+[cs_filtered]:
+```sql
+SELECT cs_item_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk, cs_quantity, cs_wholesale_cost, cs_order_number FROM catalog_sales WHERE cs_wholesale_cost BETWEEN 34 AND 54
+```
+[main_query]:
+```sql
+SELECT i.i_item_desc, w.w_warehouse_name, d1.d_week_seq, SUM(CASE WHEN p.p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN p.p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt FROM cs_filtered cs JOIN inventory inv ON cs.cs_item_sk = inv.inv_item_sk JOIN warehouse w ON w.w_warehouse_sk = inv.inv_warehouse_sk JOIN filtered_item i ON i.i_item_sk = cs.cs_item_sk JOIN filtered_cd cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk JOIN filtered_hd hd ON cs.cs_bill_hdemo_sk = hd.hd_demo_sk JOIN filtered_date d1 ON cs.cs_sold_date_sk = d1.d_date_sk JOIN date_dim d2 ON inv.inv_date_sk = d2.d_date_sk JOIN date_dim d3 ON cs.cs_ship_date_sk = d3.d_date_sk LEFT OUTER JOIN promotion p ON cs.cs_promo_sk = p.p_promo_sk LEFT OUTER JOIN catalog_returns cr ON cr.cr_item_sk = cs.cs_item_sk AND cr.cr_order_number = cs.cs_order_number WHERE d1.d_week_seq = d2.d_week_seq AND inv.inv_quantity_on_hand < cs.cs_quantity AND d3.d_date > d1.d_date + INTERVAL '3 day' GROUP BY i.i_item_desc, w.w_warehouse_name, d1.d_week_seq ORDER BY total_cnt DESC, i.i_item_desc, w.w_warehouse_name, d1.d_week_seq LIMIT 100
+```
+
+### 2. pg_self_join_decomposition (3.93x)
+
+**Principle:** Shared Materialization (PG): when the same fact+dimension scan appears multiple times in self-join patterns, materialize it once as a CTE and derive all needed aggregates from the same result. PostgreSQL materializes CTEs by default, making this extremely effective.
+
+**BEFORE (slow):**
+```sql
+select 
+	s_store_name,
+	i_item_desc,
+	sc.revenue,
+	i_current_price,
+	i_wholesale_cost,
+	i_brand
+ from store, item,
+     (select ss_store_sk, avg(revenue) as ave
+	from
+	    (select  ss_store_sk, ss_item_sk,
+		     sum(ss_sales_price) as revenue
+		from store_sales, date_dim
+		where ss_sold_date_sk = d_date_sk and d_month_seq between 1213 and 1213+11
+   and ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+		group by ss_store_sk, ss_item_sk) sa
+	group by ss_store_sk) sb,
+     (select  ss_store_sk, ss_item_sk, sum(ss_sales_price) as revenue
+	from store_sales, date_dim
+	where ss_sold_date_sk = d_date_sk and d_month_seq between 1213 and 1213+11
+  and ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+	group by ss_store_sk, ss_item_sk) sc
+ where sb.ss_store_sk = sc.ss_store_sk and
+       sc.revenue <= 0.1 * sb.ave and
+       s_store_sk = sc.ss_store_sk and
+       i_item_sk = sc.ss_item_sk
+       and i_manager_id BETWEEN 32 and 36
+       and s_state in ('TN','TX','VA')
+ order by s_store_name, i_item_desc
+limit 100;
+```
+
+**AFTER (fast):**
+[date_filter]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1213 AND 1224
+```
+[store_sales_revenue]:
+```sql
+SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk WHERE ss_sales_price / ss_list_price BETWEEN 0.38 AND 0.48 GROUP BY ss_store_sk, ss_item_sk
+```
+[store_avg_revenue]:
+```sql
+SELECT ss_store_sk, AVG(revenue) AS ave FROM store_sales_revenue GROUP BY ss_store_sk
+```
+[filtered_store]:
+```sql
+SELECT s_store_sk, s_store_name FROM store WHERE s_state IN ('TN', 'TX', 'VA')
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk, i_item_desc, i_current_price, i_wholesale_cost, i_brand FROM item WHERE i_manager_id BETWEEN 32 AND 36
+```
+[main_query]:
+```sql
+SELECT s_store_name, i_item_desc, sc.revenue, i_current_price, i_wholesale_cost, i_brand FROM store_avg_revenue AS sb JOIN store_sales_revenue AS sc ON sb.ss_store_sk = sc.ss_store_sk JOIN filtered_store AS s ON sc.ss_store_sk = s.s_store_sk JOIN filtered_item AS i ON sc.ss_item_sk = i.i_item_sk WHERE sc.revenue <= 0.1 * sb.ave ORDER BY s_store_name, i_item_desc LIMIT 100
+```
+
+## Original SQL
+
+```sql
+select  count(*) from (
+    select distinct c_last_name, c_first_name, d_date
+    from store_sales, date_dim, customer
+          where store_sales.ss_sold_date_sk = date_dim.d_date_sk
+      and store_sales.ss_customer_sk = customer.c_customer_sk
+      and d_month_seq between 1207 and 1207 + 11
+      and c_birth_month in (2, 3, 4, 10)
+      and ss_list_price between 241 and 300
+      and ss_wholesale_cost BETWEEN 76 AND 96
+  intersect
+    select distinct c_last_name, c_first_name, d_date
+    from catalog_sales, date_dim, customer
+          where catalog_sales.cs_sold_date_sk = date_dim.d_date_sk
+      and catalog_sales.cs_bill_customer_sk = customer.c_customer_sk
+      and d_month_seq between 1207 and 1207 + 11
+      and c_birth_month in (2, 3, 4, 10)
+      and cs_list_price between 241 and 300
+      and cs_wholesale_cost BETWEEN 76 AND 96
+  intersect
+    select distinct c_last_name, c_first_name, d_date
+    from web_sales, date_dim, customer
+          where web_sales.ws_sold_date_sk = date_dim.d_date_sk
+      and web_sales.ws_bill_customer_sk = customer.c_customer_sk
+      and d_month_seq between 1207 and 1207 + 11
+      and c_birth_month in (2, 3, 4, 10)
+      and ws_list_price between 241 and 300
+      and ws_wholesale_cost BETWEEN 76 AND 96
+) hot_cust
+limit 100;
+```
+
+## Per-Rewrite Configuration (SET LOCAL)
+
+You have two optimization levers: SQL rewrite AND per-query configuration.
+After writing your rewrite, analyze its execution profile and emit SET LOCAL
+commands that fix planner-level bottlenecks specific to YOUR rewrite.
+
+Memory budget: shared_buffers=128MB, effective_cache_size=4GB
+Global work_mem: 4MB (per-operation)
+Active connections: ~1 (work_mem headroom: safe up to 16MB per-op)
+Storage: HDD (random_page_cost=4.0)
+Parallel capacity: max_parallel_workers=8, per_gather=2
+
+SET LOCAL permissions:
+  user-level (always available): effective_cache_size, enable_hashjoin, enable_mergejoin, enable_nestloop, enable_seqscan, from_collapse_limit, geqo_threshold, hash_mem_multiplier, jit, jit_above_cost, join_collapse_limit, max_parallel_workers_per_gather, parallel_setup_cost, parallel_tuple_cost, random_page_cost, work_mem
+
+### Tunable Parameters (whitelist — only these are allowed)
+
+- **effective_cache_size** (1024MB–65536MB): Advisory: how much OS cache to expect (MB). Safe to set aggressively.
+- **enable_hashjoin** (on | off): Enable hash join plan type.
+- **enable_mergejoin** (on | off): Enable merge join plan type.
+- **enable_nestloop** (on | off): Enable nested-loop join plan type.
+- **enable_seqscan** (on | off): Enable sequential scan plan type.
+- **from_collapse_limit** (1–20): Max FROM items before subqueries stop being flattened.
+- **geqo_threshold** (2–20): Number of FROM items that triggers genetic query optimizer.
+- **hash_mem_multiplier** (1.0–10.0): Multiplier applied to work_mem for hash-based operations.
+- **jit** (on | off): Enable JIT compilation.
+- **jit_above_cost** (0.0–1000000.0): Query cost above which JIT is activated.
+- **join_collapse_limit** (1–20): Max FROM items before planner stops trying all join orders.
+- **max_parallel_workers_per_gather** (0–8): Max parallel workers per Gather node.
+- **parallel_setup_cost** (0.0–10000.0): Planner estimate of cost to launch parallel workers.
+- **parallel_tuple_cost** (0.0–1.0): Planner estimate of cost to transfer a tuple to parallel worker.
+- **random_page_cost** (1.0–10.0): Planner estimate of cost of a random page fetch (1.0 = SSD, 4.0 = HDD).
+- **work_mem** (64MB–2048MB): Memory for sorts/hashes per operation (MB). Allocated PER-OPERATION, not per-query. Count hash/sort ops in EXPLAIN before sizing.
+
+### Rules
+- Every SET LOCAL MUST cite a specific EXPLAIN node your rewrite creates/changes
+- work_mem is PER-OPERATION: count hash/sort ops in your rewrite before sizing
+- random_page_cost: ONLY change if your rewrite creates index-favorable access patterns
+- Empty is valid: if your rewrite has no planner bottleneck, emit no SET LOCAL
+- Stay within the resource envelope bounds above
+
+### SET LOCAL Syntax
+Include SET LOCAL commands in the `runtime_config` array field of your JSON output.
+If no config changes help, omit the field or use an empty array.
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `COUNT(*)`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 98%  Rows: ~150K
+    ├── SCAN (web_sales, date_dim, customer, store_sales, catalog_sales)
+    ├── JOIN (web_sales.ws_sold_date_sk = date_dim.d_date_sk)
+    ├── JOIN (web_sales.ws_bill_customer_sk = customer.c_customer_sk)
+    ├── FILTER (d_month_seq BETWEEN 1207 AND 1207 + 11)
+    ├── FILTER (c_birth_month IN (2, 3, 4, 10))
+    ├── FILTER (+2 more)
+    └── OUTPUT (COUNT(*))
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit or use empty array if not needed
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

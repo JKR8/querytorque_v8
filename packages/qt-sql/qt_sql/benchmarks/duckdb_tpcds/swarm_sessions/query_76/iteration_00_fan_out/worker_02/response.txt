@@ -1,0 +1,86 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY:
+└── [MAIN] main_query  [~]  Changed from single UNION ALL to three CTEs (all_sales_cte → joined_sales → final_aggregate)
+    ├── [+} all_sales_cte (CTE)  — Single pass over three fact tables with NULL filters
+    │    ├── SCAN store_sales (filter: ss_hdemo_sk IS NULL)
+    │    ├── SCAN web_sales (filter: ws_bill_addr_sk IS NULL)
+    │    └── SCAN catalog_sales (filter: cs_warehouse_sk IS NULL)
+    ├── [+} joined_sales (CTE)  — Single join to date_dim and item
+    │    ├── JOIN date_dim ON sold_date_sk = d_date_sk
+    │    └── JOIN item ON item_sk = i_item_sk
+    └── [+} final_aggregate (main_query)  — Aggregation + ORDER BY + LIMIT
+         ├── AGG (GROUP BY channel, col_name, d_year, d_qoy, i_category)
+         ├── SORT (channel, col_name, d_year, d_qoy, i_category)
+         └── LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "channel_bitmap_aggregation",
+      "description": "Consolidated three UNION ALL fact table scans into single CTE with NULL filters, enabling single join passes to dimension tables",
+      "applied_to": ["all_sales_cte", "joined_sales"]
+    },
+    {
+      "id": "R2",
+      "type": "single_pass_aggregation",
+      "description": "Eliminated redundant dimension table scans (3x each) by joining once in joined_sales CTE",
+      "applied_to": ["joined_sales"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "all_sales_cte": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT 'store' AS channel, 'ss_hdemo_sk' AS col_name, ss_ext_sales_price AS ext_sales_price, ss_sold_date_sk AS sold_date_sk, ss_item_sk AS item_sk FROM store_sales WHERE ss_hdemo_sk IS NULL UNION ALL SELECT 'web' AS channel, 'ws_bill_addr_sk' AS col_name, ws_ext_sales_price AS ext_sales_price, ws_sold_date_sk AS sold_date_sk, ws_item_sk AS item_sk FROM web_sales WHERE ws_bill_addr_sk IS NULL UNION ALL SELECT 'catalog' AS channel, 'cs_warehouse_sk' AS col_name, cs_ext_sales_price AS ext_sales_price, cs_sold_date_sk AS sold_date_sk, cs_item_sk AS item_sk FROM catalog_sales WHERE cs_warehouse_sk IS NULL",
+          "interfaces": {
+            "outputs": ["channel", "col_name", "ext_sales_price", "sold_date_sk", "item_sk"],
+            "consumes": []
+          }
+        },
+        "joined_sales": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT a.channel, a.col_name, d.d_year, d.d_qoy, i.i_category, a.ext_sales_price FROM all_sales_cte a JOIN date_dim d ON a.sold_date_sk = d.d_date_sk JOIN item i ON a.item_sk = i.i_item_sk",
+          "interfaces": {
+            "outputs": ["channel", "col_name", "d_year", "d_qoy", "i_category", "ext_sales_price"],
+            "consumes": ["all_sales_cte"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT channel, col_name, d_year, d_qoy, i_category, COUNT(*) AS sales_cnt, SUM(ext_sales_price) AS sales_amt FROM joined_sales GROUP BY channel, col_name, d_year, d_qoy, i_category ORDER BY channel, col_name, d_year, d_qoy, i_category LIMIT 100",
+          "interfaces": {
+            "outputs": ["channel", "col_name", "d_year", "d_qoy", "i_category", "sales_cnt", "sales_amt"],
+            "consumes": ["joined_sales"]
+          }
+        }
+      },
+      "reconstruction_order": ["all_sales_cte", "joined_sales", "main_query"],
+      "assembly_template": "WITH all_sales_cte AS ({all_sales_cte}), joined_sales AS ({joined_sales}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Explanation
+
+**Changes**: Restructured the original UNION ALL of three joined subqueries into a two‑step CTE pipeline: `all_sales_cte` consolidates the fact‑table scans with their respective NULL filters; `joined_sales` performs a single join to `date_dim` and `item` for all channels. This eliminates 6 redundant dimension‑table scans (3× date_dim, 3× item) present in the original plan.
+
+**Expected speedup**: ~3×–4× due to removing redundant dimension table scans and enabling better predicate pushdown to fact tables. The consolidated `all_sales_cte` allows DuckDB to scan each fact table only once, while the single join in `joined_sales` avoids repeated dimension lookups.

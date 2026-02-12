@@ -1,0 +1,334 @@
+<reasoning>
+## 1. CLASSIFY
+This is a **channel-comparison self-join** archetype, specifically a week-over-week (year-over-year) comparison for the same store. The query computes aggregated daily sales for two consecutive 12-month periods, then joins them on store and week offset by 52 weeks to compute daily sales ratios.
+
+Key structural features:
+- Single CTE (`wss`) aggregates store_sales by week and store with conditional day-of-week sums.
+- Main query creates two derived tables (`y` and `x`) from the same CTE, each filtered by a different `d_month_seq` range (1196-1207 and 1208-1219), joined with store and date_dim.
+- Self-join between `y` and `x` on `s_store_id` and `d_week_seq` offset by 52.
+- No correlated subqueries, no UNION ALL, no window functions, no EXISTS/INTERSECT.
+
+## 2. EXPLAIN PLAN ANALYSIS
+
+**Wall-clock times (exclusive per node):**
+- CTE `wss`: 1096.9 ms (38%) - HASH_GROUP_BY on 27.5M rows after join.
+- store_sales scan: 277.1 ms (10%) - 27.5M rows (345.6M total).
+- date_dim scan in CTE: 0.1 ms - 1,827 rows filtered by `d_date_sk` range.
+- Main query HASH_JOINs: ~5.4ms + 2.3ms = 7.7 ms total.
+- TOP_N: 1.2 ms.
+
+**Total time: 2898 ms.**
+
+**Bottleneck:** The CTE `wss` aggregation (1096.9 ms) is the dominant cost. This aggregation processes 27.5M rows from the store_sales/date_dim join. The store_sales scan (277.1 ms) is also significant but less than the aggregation.
+
+**Cardinality flow:**
+- store_sales: 345.6M rows → filtered to 27.5M rows (by date_dim join? Actually the date_dim filter reduces to 1,827 rows, but the join produces 27.5M rows because each date matches many store_sales).
+- CTE output: 14K rows (after grouping by week/store).
+- Each year subquery: ~13K rows after joining CTE with store and date_dim (filtered by month_seq).
+- Final join: 129K rows? Wait, that's from EXPLAIN but seems high (19K x 19K cartesian?). Actually the plan shows HASH_JOIN producing 129K rows from two 19K inputs - this suggests the join condition `s_store_id1 = s_store_id2` and `d_week_seq1 = d_week_seq2-52` is producing multiple matches? This warrants investigation but final TOP_N limits to 100.
+
+**Optimizer already handles well:**
+- Predicate pushdown: `d_date_sk` range pushed into date_dim scan in CTE.
+- Hash joins and hash aggregation chosen appropriately.
+- CTE is materialized once and probed twice (good).
+- Columnar projection: only needed columns read.
+
+**Missed opportunities:**
+1. **Redundant filtering**: The CTE aggregates ALL weeks, but the main query only needs weeks from two specific 12-month periods (months 1196-1219). The CTE could be filtered by `d_month_seq` early.
+2. **Multiple date_dim scans**: The main query scans date_dim twice (366 and 365 rows) for the month filters. These could be pre-materialized.
+3. **Self-join could be eliminated**: The two period aggregations could be computed in a single pass with conditional aggregation.
+4. **Dimension pre-filtering**: store table is scanned twice (102 rows each). Could be pre-materialized.
+
+**Scan counts:**
+- store_sales: 1 scan (in CTE) - good.
+- date_dim: 3 scans (1 in CTE + 2 in main query) - opportunity to reduce.
+- store: 2 scans (in main query) - opportunity to reduce.
+
+## 3. GAP MATCHING
+
+**CROSS_CTE_PREDICATE_BLINDNESS**: The predicate `d_month_seq BETWEEN 1196 AND 1196+11` (and similar) is applied in the main query AFTER the CTE aggregation. This predicate could be pushed into the CTE if we split the CTE by period. The CTE currently aggregates all weeks regardless of month. This is a classic gap.
+
+**REDUNDANT_SCAN_ELIMINATION**: The date_dim is scanned 3 times. Could be reduced to 1 or 2 via pre-materialization.
+
+**SINGLE_PASS_AGGREGATION**: The two period aggregations are similar and could be consolidated into one pass over store_sales with CASE expressions.
+
+**UNION_CTE_SELF_JOIN_DECOMPOSITION**: The CTE is generic and scanned twice with different month filters. Could split into two specialized CTEs.
+
+**DIMENSION_CTE_ISOLATE**: The date_dim and store tables could be pre-filtered into CTEs.
+
+**Engine strengths already cover:**
+- INTRA_SCAN_PREDICATE_PUSHDOWN: Already pushing `d_date_sk` range.
+- HASH_JOIN_SELECTION: Already using hash joins.
+- CTE_INLINING: CTE is materialized (multi-reference).
+
+## 4. AGGREGATION TRAP CHECK
+
+The aggregates are simple SUMs with CASE expressions. These are duplicate-insensitive (SUM of a value). However, if we change the grouping (e.g., add `d_month_seq` to GROUP BY), we could get multiple rows per week (if week spans months). This would break the later self-join which expects one row per week per store per period. The original query avoids this by aggregating by week only, then joining with date_dim on week and filtering by month. This means a week that spans two months is included in the aggregation for the entire week, and then the month filter includes it if ANY day in that week falls in the month range. This is the correct semantics.
+
+If we push month filtering earlier, we must preserve this semantics: a week should be included if ANY of its days fall in the month range. This is tricky because the CTE groups by week, not by day. The current approach (join aggregated weekly data with date_dim on week and filter by month) correctly implements this because the date_dim row for that week may have a month_seq that doesn't represent all days in the week. However, the join condition is `d.d_week_seq = wss.d_week_seq`, and the date_dim table has one row per date, not per week. Wait, the join in the main query is `date_dim d` with `wss` on `d.d_week_seq = wss.d_week_seq`. This is a many-to-one join (multiple dates per week). Then filtering by `d_month_seq` selects only those weeks where at least one date in that week has month_seq in the range. This is correct.
+
+Thus, any rewrite must preserve: for each week, include it in a period if ∃ date in that week with month_seq in the period range.
+
+## 5. TRANSFORM SELECTION
+
+Ranked by expected value:
+
+1. **single_pass_aggregation** (high value): Consolidate the two period aggregations into one pass over store_sales with conditional aggregates. This could eliminate the self-join and reduce date_dim scans.
+
+2. **date_cte_isolate** (medium value): Pre-filter date_dim for the two month ranges into CTEs, then join with store_sales and aggregate. This could push month filtering earlier and reduce CTE aggregation size.
+
+3. **self_join_elimination** via pivot (medium value): Compute both periods in a single CTE with columns for each period, eliminating the self-join.
+
+4. **dimension_cte_isolate** (low value): Pre-filter store and date_dim into CTEs to reduce repeated scans.
+
+Given the need for diversity, I'll assign:
+- Worker 1: single_pass_aggregation (consolidate scans)
+- Worker 2: date_cte_isolate (push month filters early)
+- Worker 3: self_join_elimination via pivot (eliminate self-join)
+- Worker 4: exploration: compound strategy combining date_cte_isolate and single_pass_aggregation in a novel way (pre-filter date ranges, then single-pass aggregation with conditional pivoting).
+
+## 6. LOGICAL TREE DESIGN
+
+For each worker, design the CTE structure and node contracts with exhaustive column lists.
+
+Check column completeness: The final output needs:
+- s_store_name1, s_store_id1, d_week_seq1
+- sun_sales1, mon_sales1, ..., sat_sales1 (for period1)
+- sun_sales2, mon_sales2, ..., sat_sales2 (for period2)
+- Then compute ratios.
+
+Also need store.s_store_sk, store.s_store_id, store.s_store_name.
+date_dim.d_week_seq, date_dim.d_month_seq, date_dim.d_date_sk.
+store_sales.ss_store_sk, ss_sold_date_sk, ss_sales_price, d_day_name.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Compare day-of-week sales ratios for each store between two consecutive 12-month periods starting at month sequence 1196, aligning weeks exactly 52 apart. All joins are INNER (intersection), requiring matching rows from both periods. Aggregates are SUM with CASE, which are duplicate-insensitive but depend on week-month inclusion semantics: a week belongs to a period if ANY day in that week falls within the month range. Filter dependencies: month ranges (1196-1207 and 1208-1219) must be preserved exactly; week offset of 52 must be exact; store matching must be exact.
+
+BOTTLENECK_DIAGNOSIS:
+The dominant cost is the CTE aggregation (1096.9 ms, 38%) grouping 27.5M store_sales rows by week and store. This is aggregation-bound. The store_sales scan (277.1 ms) is secondary. Cardinality drops from 27.5M to 14K after aggregation, then to ~13K per period after month filtering. The optimizer already pushes date_sk filters and materializes the CTE, but misses pushing month filters into the CTE, causing aggregation of unnecessary weeks. Logical-tree cost percentages are misleading: the CTE shows 50% but actually takes 38% exclusive time.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output all 10 original columns in exact order: s_store_name1, s_store_id1, d_week_seq1, and 7 ratios.
+- CTE_COLUMN_COMPLETENESS: Any new CTE must include all columns referenced downstream: d_week_seq, ss_store_sk, sun_sales..sat_sales, s_store_sk, s_store_id, s_store_name, d_month_seq, d_date_sk.
+- LITERAL_PRESERVATION: Must preserve month range literals 1196, 1196+11, 1196+12, 1196+23 and week offset 52.
+- SEMANTIC_EQUIVALENCE: Must return identical rows, columns, and ordering as original.
+- CROSS_CTE_PREDICATE_BLINDNESS: Month predicates applied after CTE aggregation (EXPLAIN shows date_dim scans filtered by month_seq in main query, not in CTE).
+- REDUNDANT_SCAN_ELIMINATION: date_dim scanned 3 times (1 in CTE + 2 in main query); store scanned twice.
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline query already <100ms, CTE overhead dominated savings.
+   RULE: This query baseline is 2898ms >> 100ms, so CTE overhead acceptable.
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Baseline <50ms, CTE overhead dominated.
+   RULE: This query baseline is 2898ms, so acceptable.
+3. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joining 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join multiple dimension CTEs; keep dimension CTEs independent and join with fact sequentially.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  date_periods_cte -> sales_aggregates_cte -> period_pivot_cte -> final_select
+NODE_CONTRACTS:
+  date_periods_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1196 AND 1196 + 23
+    OUTPUT: d_date_sk, d_week_seq, d_month_seq, d_day_name, period = CASE WHEN d_month_seq BETWEEN 1196 AND 1196+11 THEN 1 ELSE 2 END
+    EXPECTED_ROWS: ~731 (366+365)
+    CONSUMERS: sales_aggregates_cte
+  sales_aggregates_cte:
+    FROM: store_sales JOIN date_periods_cte ON ss_sold_date_sk = d_date_sk
+    GROUP BY: d_week_seq, ss_store_sk, period
+    AGGREGATE: 
+      sun_sales = SUM(CASE WHEN d_day_name='Sunday' THEN ss_sales_price END),
+      mon_sales = SUM(CASE WHEN d_day_name='Monday' THEN ss_sales_price END),
+      tue_sales = SUM(CASE WHEN d_day_name='Tuesday' THEN ss_sales_price END),
+      wed_sales = SUM(CASE WHEN d_day_name='Wednesday' THEN ss_sales_price END),
+      thu_sales = SUM(CASE WHEN d_day_name='Thursday' THEN ss_sales_price END),
+      fri_sales = SUM(CASE WHEN d_day_name='Friday' THEN ss_sales_price END),
+      sat_sales = SUM(CASE WHEN d_day_name='Saturday' THEN ss_sales_price END)
+    OUTPUT: d_week_seq, ss_store_sk, period, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+    EXPECTED_ROWS: ~14K (similar to original CTE but with period split)
+    CONSUMERS: period_pivot_cte
+  period_pivot_cte:
+    FROM: sales_aggregates_cte period1 JOIN sales_aggregates_cte period2 
+          ON period1.ss_store_sk = period2.ss_store_sk 
+          AND period1.d_week_seq = period2.d_week_seq - 52 
+          AND period1.period = 1 AND period2.period = 2
+    JOIN store ON period1.ss_store_sk = s_store_sk
+    OUTPUT: 
+      s_store_name, s_store_id, 
+      period1.d_week_seq AS d_week_seq1,
+      period1.sun_sales AS sun_sales1, period1.mon_sales AS mon_sales1, ...,
+      period2.sun_sales AS sun_sales2, period2.mon_sales AS mon_sales2, ...
+    EXPECTED_ROWS: ~129K (same as original final join)
+    CONSUMERS: final_select
+  final_select:
+    FROM: period_pivot_cte
+    ORDER BY: s_store_name ASC, s_store_id ASC, d_week_seq1 ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, s_store_id, d_week_seq1, 
+            sun_sales1/NULLIF(sun_sales2,0), mon_sales1/NULLIF(mon_sales2,0), ...
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+  single_pass_aggregation: Apply the pattern of consolidating multiple period scans into one CTE with CASE-based period discrimination. Ignore the scalar subquery aspect — this query has no scalar subqueries.
+  channel_bitmap_aggregation: Apply the pattern of labeling rows with a period discriminator and conditional aggregation. Ignore the bitmap aspect — we don't need bitmaps.
+HAZARD_FLAGS:
+  - The period discriminator (1,2) must be based on month_seq range, not week. A week may have days in both periods? Actually periods are disjoint (12 months each, consecutive). A week cannot span both periods because periods are 12 months apart. But a week could have days in two different months within the same period? That's fine; we label by month_seq range at date level.
+  - Must adjust week offset in join: period1 week = period2 week - 52.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: date_cte_isolate
+TARGET_LOGICAL_TREE:
+  date_period1_cte -> date_period2_cte -> wss_period1_cte -> wss_period2_cte -> joined_periods -> final_select
+NODE_CONTRACTS:
+  date_period1_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1196 AND 1196 + 11
+    OUTPUT: d_date_sk, d_week_seq
+    EXPECTED_ROWS: ~366
+    CONSUMERS: wss_period1_cte
+  date_period2_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1196 + 12 AND 1196 + 23
+    OUTPUT: d_date_sk, d_week_seq
+    EXPECTED_ROWS: ~365
+    CONSUMERS: wss_period2_cte
+  wss_period1_cte:
+    FROM: store_sales JOIN date_period1_cte ON ss_sold_date_sk = d_date_sk
+    GROUP BY: d_week_seq, ss_store_sk
+    AGGREGATE: same day-of-week sums as original wss
+    OUTPUT: d_week_seq, ss_store_sk, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+    EXPECTED_ROWS: ~13K
+    CONSUMERS: joined_periods
+  wss_period2_cte:
+    FROM: store_sales JOIN date_period2_cte ON ss_sold_date_sk = d_date_sk
+    GROUP BY: d_week_seq, ss_store_sk
+    AGGREGATE: same day-of-week sums as original wss
+    OUTPUT: d_week_seq, ss_store_sk, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+    EXPECTED_ROWS: ~13K
+    CONSUMERS: joined_periods
+  joined_periods:
+    FROM: wss_period1_cte p1 
+          JOIN wss_period2_cte p2 ON p1.ss_store_sk = p2.ss_store_sk AND p1.d_week_seq = p2.d_week_seq - 52
+          JOIN store ON p1.ss_store_sk = s_store_sk
+    OUTPUT: s_store_name, s_store_id, p1.d_week_seq AS d_week_seq1,
+            p1.sun_sales AS sun_sales1, ..., p2.sun_sales AS sun_sales2, ...
+    EXPECTED_ROWS: ~129K
+    CONSUMERS: final_select
+  final_select:
+    FROM: joined_periods
+    ORDER BY: s_store_name ASC, s_store_id ASC, d_week_seq1 ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, s_store_id, d_week_seq1, ratios...
+EXAMPLES: date_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+  date_cte_isolate: Apply the pattern of extracting date filtering into separate CTEs for each period. Ignore the scalar subquery aspect — this query uses joins, not scalar subqueries.
+  early_filter: Apply the principle of filtering dimension tables first, then joining with fact. Here, filter date_dim by month_seq before joining with store_sales.
+HAZARD_FLAGS:
+  - Must ensure store_sales is joined with the correct date period CTE on d_date_sk, not d_week_seq.
+  - The CTEs wss_period1_cte and wss_period2_cte scan store_sales twice — still two scans. This is acceptable because we cannot consolidate due to different date filters.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: self_join_elimination
+TARGET_LOGICAL_TREE:
+  date_periods_cte -> sales_aggregates_cte -> period_pivot_cte -> final_select
+NODE_CONTRACTS:
+  date_periods_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1196 AND 1196 + 23
+    OUTPUT: d_date_sk, d_week_seq, d_month_seq, period = CASE WHEN d_month_seq BETWEEN 1196 AND 1196+11 THEN 1 ELSE 2 END
+    EXPECTED_ROWS: ~731
+    CONSUMERS: sales_aggregates_cte
+  sales_aggregates_cte:
+    FROM: store_sales JOIN date_periods_cte ON ss_sold_date_sk = d_date_sk
+    GROUP BY: d_week_seq, ss_store_sk, period
+    AGGREGATE: same day-of-week sums as original wss
+    OUTPUT: d_week_seq, ss_store_sk, period, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+    EXPECTED_ROWS: ~14K
+    CONSUMERS: period_pivot_cte
+  period_pivot_cte:
+    FROM: (SELECT ss_store_sk, d_week_seq, 
+                  MAX(CASE WHEN period=1 THEN sun_sales END) AS sun_sales1,
+                  MAX(CASE WHEN period=1 THEN mon_sales END) AS mon_sales1,
+                  ...,
+                  MAX(CASE WHEN period=2 THEN sun_sales END) AS sun_sales2,
+                  MAX(CASE WHEN period=2 THEN mon_sales END) AS mon_sales2,
+                  ...
+           FROM sales_aggregates_cte
+           GROUP BY ss_store_sk, d_week_seq) pivoted
+          JOIN store ON pivoted.ss_store_sk = s_store_sk
+    WHERE: sun_sales1 IS NOT NULL AND sun_sales2 IS NOT NULL  -- ensure both periods present
+    OUTPUT: s_store_name, s_store_id, d_week_seq, sun_sales1, ..., sun_sales2, ...
+    EXPECTED_ROWS: ~129K (but filtered to matching weeks)
+    CONSUMERS: final_select
+  final_select:
+    FROM: period_pivot_cte
+    ORDER BY: s_store_name ASC, s_store_id ASC, d_week_seq ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, s_store_id, d_week_seq, ratios...
+EXAMPLES: union_cte_split, rollup_to_union_windowing
+EXAMPLE_ADAPTATION:
+  union_cte_split: Apply the pattern of splitting a generic CTE into specialized ones (here by period). Ignore the UNION aspect — we use CASE pivoting instead of UNION.
+  rollup_to_union_windowing: Apply the pattern of replacing a self-join with explicit grouping and pivoting. Ignore the windowing aspect.
+HAZARD_FLAGS:
+  - The pivot uses MAX(CASE) because each (store, week, period) has at most one row due to GROUP BY. This is safe.
+  - Must adjust week offset: period2 weeks need to be aligned with period1 weeks by adding 52 before pivot? Actually we group by d_week_seq, but period2 weeks are 52 weeks later. We need to join on week offset. Solution: In sales_aggregates_cte, adjust d_week_seq for period2 by subtracting 52, so that weeks align. Then pivot on adjusted week.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_date_filter_single_pass
+TARGET_LOGICAL_TREE:
+  store_cte -> date_periods_cte -> sales_aggregates_cte -> period_alignment_cte -> final_select
+NODE_CONTRACTS:
+  store_cte:
+    FROM: store
+    OUTPUT: s_store_sk, s_store_id, s_store_name
+    EXPECTED_ROWS: 102
+    CONSUMERS: period_alignment_cte
+  date_periods_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1196 AND 1196 + 23
+    OUTPUT: d_date_sk, d_week_seq, d_month_seq, period = CASE WHEN d_month_seq BETWEEN 1196 AND 1196+11 THEN 1 ELSE 2 END
+    EXPECTED_ROWS: ~731
+    CONSUMERS: sales_aggregates_cte
+  sales_aggregates_cte:
+    FROM: store_sales 
+          JOIN date_periods_cte ON ss_sold_date_sk = d_date_sk
+    GROUP BY: ss_store_sk, d_week_seq, period
+    AGGREGATE: same day-of-week sums as original wss
+    OUTPUT: ss_store_sk, d_week_seq, period, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+    EXPECTED_ROWS: ~14K
+    CONSUMERS: period_alignment_cte
+  period_alignment_cte:
+    FROM: sales_aggregates_cte p1 
+          LEFT JOIN sales_aggregates_cte p2 ON p1.ss_store_sk = p2.ss_store_sk 
+              AND p1.d_week_seq = p2.d_week_seq - 52 
+              AND p1.period = 1 AND p2.period = 2
+          JOIN store_cte ON p1.ss_store_sk = store_cte.s_store_sk
+    WHERE: p2.ss_store_sk IS NOT NULL  -- inner join semantics
+    OUTPUT: store_cte.s_store_name, store_cte.s_store_id, p1.d_week_seq AS d_week_seq1,
+            p1.sun_sales AS sun_sales1, ..., p2.sun_sales AS sun_sales2, ...
+    EXPECTED_ROWS: ~129K
+    CONSUMERS: final_select
+  final_select:
+    FROM: period_alignment_cte
+    ORDER BY: s_store_name ASC, s_store_id ASC, d_week_seq1 ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, s_store_id, d_week_seq1, ratios...
+EXAMPLES: prefetch_fact_join, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+  prefetch_fact_join: Apply the pattern of pre-joining filtered dimension (date_periods_cte) with fact table before other joins. Ignore the cascading CTE chain — we only have one fact join.
+  multi_dimension_prefetch: Apply the pattern of pre-filtering multiple dimensions (store and date) into CTEs before the fact join. Here we pre-filter store and date.
+HAZARD_FLAGS:
+  - The store_cte is unfiltered but small (102 rows). This is acceptable overhead.
+  - The LEFT JOIN + NOT NULL filter ensures inner join semantics; must verify no duplicate rows.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This strategy pre-filters both store and date dimensions, but does not cross-join them. Each dimension CTE is independent and joined sequentially with the fact table, avoiding Cartesian explosion.
+EXPLORATION_TYPE: compound_strategy

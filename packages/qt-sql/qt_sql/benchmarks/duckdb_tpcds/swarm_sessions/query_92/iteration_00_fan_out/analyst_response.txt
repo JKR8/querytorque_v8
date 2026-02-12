@@ -1,0 +1,304 @@
+<reasoning>
+## 1. CLASSIFY
+This is a **correlated-aggregate filter** query with a **star-join** pattern (fact table `web_sales` joined to dimensions `item` and `date_dim`). The query filters by `i_manufact_id = 320` and a 90-day date window, then for each qualifying row, compares `ws_ext_discount_amt` to 1.3× the average discount for that same item within the same date window (correlated subquery). It then aggregates the qualifying excess amounts.
+
+## 2. EXPLAIN PLAN ANALYSIS
+**Wall-clock ms per major node (exclusive):**
+- `SEQ_SCAN web_sales` (outer): 40.0ms (34%)
+- `SEQ_SCAN web_sales` (subquery): 42.0ms (36%)
+- `HASH_JOIN INNER` (outer: web_sales ⋈ item): 17.8ms (15%)
+- `HASH_JOIN INNER` (subquery: web_sales ⋈ item): 7.7ms (7%)
+- `HASH_GROUP_BY` (subquery aggregation): 5.1ms (4%)
+- Other nodes (scans, filters, joins) <5ms each.
+
+**Summed costs:**
+- **Total web_sales scan time: 82ms (70% of runtime)** – two separate scans (7.1M rows for outer, 200K rows for subquery).
+- Join overhead: ~25.5ms (22%) for two hash joins between web_sales and item.
+- Aggregation overhead: 5.1ms (4%).
+
+**Row count flow:**
+- `item` scan filtered by `i_manufact_id = 320`: 168 rows → 102K rows (selective).
+- `date_dim` scan filtered by date range: 91 rows → 73K rows (selective).
+- Outer join: 168 items × 91 dates → ~15K possible combos, but web_sales join yields 12K rows (after date join reduces to 392 rows).
+- Subquery: scans 200K web_sales rows, joins with date_dim (91 rows) and item (via DELIM_SCAN, which is the outer item row?) – yields 392 rows, then aggregates to 98 groups (items).
+
+**Observations:**
+- The optimizer already decorrelates the subquery into a **RIGHT_DELIM_JOIN** (hash join) with a pre‑aggregated CTE (HASH_GROUP_BY). The subquery is executed **once**, not per row. This is good.
+- However, the subquery does **NOT** include the `i_manufact_id = 320` filter. It computes average discounts for **all items** sold in the date window, then joins to the outer filtered items. This wastes I/O and compute.
+- The same `date_dim` table is scanned twice (once in outer, once in subquery) with identical filters. This is redundant.
+- The same `item` table is scanned twice (once with filter, once without) – another redundancy.
+
+## 3. GAP MATCHING
+- **CORRELATED_SUBQUERY_PARALYSIS**: Already decorrelated by optimizer (RIGHT_DELIM_JOIN). However, the subquery misses the `i_manufact_id` filter – opportunity to push it.
+- **REDUNDANT_SCAN_ELIMINATION**: Two separate scans of `web_sales` (7.1M + 200K rows) and two scans of `date_dim` and `item`. This is the primary bottleneck (70% runtime). Opportunity: consolidate into one scan of web_sales with conditional aggregation or pre‑compute averages in a CTE that shares dimension filters.
+- **CROSS_CTE_PREDICATE_BLINDNESS**: The subquery does not inherit the outer `i_manufact_id` filter. This is a predicate‑pushdown opportunity across the correlated subquery boundary.
+- **Engine strengths already handle**: Intra‑scan predicate pushdown (filters pushed into SEQ_SCAN), hash join selection, CTE inlining. No need to restructure simple joins.
+
+## 4. AGGREGATION TRAP CHECK
+- Outer query uses `SUM(ws_ext_discount_amt)` – duplicate‑insensitive.
+- Subquery uses `AVG(ws_ext_discount_amt)` – duplicate‑sensitive, but the subquery joins `web_sales` with `date_dim` and `item` (via correlation). If we push the `i_manufact_id` filter into the subquery, we must ensure the join doesn’t introduce duplicates that change the average. The original correlation is on `i_item_sk`; adding an INNER JOIN to `item` with `i_manufact_id = 320` will not change row counts for a given `i_item_sk` because `item` is a dimension table with one row per `i_item_sk`. Safe.
+
+## 5. TRANSFORM SELECTION
+1. **decorrelate_with_pushdown**: Decorate the subquery with the missing `i_manufact_id` filter and pre‑compute averages only for manufacturer 320 items. This reduces the subquery’s web_sales scan from 200K rows to only rows for those items.
+2. **single_pass_aggregation**: Consolidate the two web_sales scans into one CTE that computes both the row‑level discounts and the per‑item average discount in a single pass, using a window function or self‑join.
+3. **star_join_prefetch**: Pre‑filter `date_dim` and `item` into CTEs, then join with `web_sales` once to compute both outer rows and averages, leveraging shared dimension filters.
+4. **exploration_compound**: Combine decorrelation, dimension pre‑filtering, and scan consolidation into a novel multi‑CTE pipeline that materializes the filtered fact rows once and reuses them for both outer and subquery logic.
+
+## 6. LOGICAL TREE DESIGN
+For each strategy, design CTEs that ensure column completeness (include all referenced columns: `ws_ext_discount_amt`, `ws_item_sk`, `ws_sold_date_sk`, `i_item_sk`, `i_manufact_id`, `d_date_sk`, `d_date`). Avoid cross‑joining dimension CTEs.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Sum web discount amounts for manufacturer 320 items sold in a 90-day window from 2002-02-26 where each row's discount exceeds 130% of that item's average discount in the same window. All joins are INNER (intersection), requiring matches in item, date, and web_sales. The AVG in the subquery is duplicate-sensitive; any rewrite must preserve the per-item grouping defined by the correlation on i_item_sk. The outer filter i_manufact_id = 320 must also apply to the subquery’s item average to maintain correctness.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: 70% of runtime (82ms) is spent scanning web_sales twice (7.1M + 200K rows). The optimizer already decorrelates the subquery into a single hash join (RIGHT_DELIM_JOIN) but fails to push the i_manufact_id filter into the subquery, causing a full scan of web_sales for all items. Cardinality flows: item filter reduces to 168 rows, date filter to 91 rows, outer join yields 12K rows, subquery aggregates 98 groups. The optimizer handles predicate pushdown into scans and hash join selection well; logical-tree costs are misleading (subquery scan is 36% exclusive time, not reflected in logical cost).
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output exactly "Excess Discount Amount" as sum(ws_ext_discount_amt).
+- CTE_COLUMN_COMPLETENESS: Any CTE must include ws_ext_discount_amt, ws_item_sk, ws_sold_date_sk, i_item_sk, i_manufact_id, d_date_sk, d_date as needed by downstream nodes.
+- LITERAL_PRESERVATION: Must preserve i_manufact_id=320, date range '2002-02-26' to +90 days, and multiplier 1.3.
+- SEMANTIC_EQUIVALENCE: Result rows and ordering must match original (ORDER BY sum(ws_ext_discount_amt) LIMIT 100).
+- CORRELATED_SUBQUERY_PARALYSIS: Subquery missing i_manufact_id filter, causing extra scan.
+- REDUNDANT_SCAN_ELIMINATION: web_sales scanned twice; date_dim and item scanned twice each.
+
+REGRESSION_WARNINGS:
+1. materialize_cte (0.14x on Q16):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan instead of semi-join short-circuit.
+   RULE: Do not convert correlated subquery to materialized CTE if it is used as a filter with early termination; ours is an aggregate join, safe.
+2. date_cte_isolate (0.50x on Q25):
+   CAUSE: Baseline <100ms, CTE overhead dominated savings.
+   RULE: Our baseline is 117ms, acceptable for CTE materialization.
+3. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join multiple dimension CTEs; keep joins sequential.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: decorrelate_with_pushdown
+TARGET_LOGICAL_TREE:
+  filtered_item -> filtered_date -> item_avg_discount -> main_join -> filter_agg -> top_n
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: i_manufact_id = 320
+    OUTPUT: i_item_sk, i_manufact_id
+    EXPECTED_ROWS: 168
+    CONSUMERS: item_avg_discount, main_join
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '2002-02-26' AND (CAST('2002-02-26' AS DATE) + INTERVAL 90 DAY)
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 91
+    CONSUMERS: item_avg_discount, main_join
+  item_avg_discount:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_date ON d_date_sk = ws_sold_date_sk
+    JOIN: INNER JOIN filtered_item ON i_item_sk = ws_item_sk
+    GROUP BY: i_item_sk
+    AGGREGATE: avg(ws_ext_discount_amt) AS avg_disc
+    OUTPUT: i_item_sk, avg_disc
+    EXPECTED_ROWS: 98
+    CONSUMERS: main_join
+  main_join:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_item ON i_item_sk = ws_item_sk
+    JOIN: INNER JOIN filtered_date ON d_date_sk = ws_sold_date_sk
+    JOIN: INNER JOIN item_avg_discount USING (i_item_sk)
+    WHERE: ws_ext_discount_amt > 1.3 * avg_disc
+    OUTPUT: ws_ext_discount_amt
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: filter_agg
+  filter_agg:
+    FROM: main_join
+    AGGREGATE: sum(ws_ext_discount_amt) AS "Excess Discount Amount"
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: top_n
+  top_n:
+    FROM: filter_agg
+    ORDER BY: "Excess Discount Amount" ASC
+    LIMIT: 100
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: decorrelate, pushdown, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- decorrelate: Apply the pattern of converting correlated subquery to CTE with GROUP BY; ignore the filter pushdown aspect (our subquery already grouped by item).
+- pushdown: Push the i_manufact_id filter into the subquery by joining with filtered_item CTE; ignore the consolidation of multiple subqueries (only one subquery).
+- date_cte_isolate: Isolate date filter into CTE and reuse in both outer and subquery; ignore the decomposition of existing CTEs.
+HAZARD_FLAGS:
+- Must ensure item_avg_discount includes only items from manufacturer 320, else semantic break.
+- Duplicate i_item_sk in filtered_item? No, item is dimension with unique i_item_sk.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  filtered_item -> filtered_date -> web_sales_enriched -> filtered_rows -> agg -> top_n
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: i_manufact_id = 320
+    OUTPUT: i_item_sk, i_manufact_id
+    EXPECTED_ROWS: 168
+    CONSUMERS: web_sales_enriched
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '2002-02-26' AND (CAST('2002-02-26' AS DATE) + INTERVAL 90 DAY)
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 91
+    CONSUMERS: web_sales_enriched
+  web_sales_enriched:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_date ON d_date_sk = ws_sold_date_sk
+    JOIN: INNER JOIN filtered_item ON i_item_sk = ws_item_sk
+    WINDOW: AVG(ws_ext_discount_amt) OVER (PARTITION BY ws_item_sk) AS avg_disc
+    OUTPUT: ws_ext_discount_amt, ws_item_sk, avg_disc
+    EXPECTED_ROWS: 12K
+    CONSUMERS: filtered_rows
+  filtered_rows:
+    FROM: web_sales_enriched
+    WHERE: ws_ext_discount_amt > 1.3 * avg_disc
+    OUTPUT: ws_ext_discount_amt
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: agg
+  agg:
+    FROM: filtered_rows
+    AGGREGATE: sum(ws_ext_discount_amt) AS "Excess Discount Amount"
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: top_n
+  top_n:
+    FROM: agg
+    ORDER BY: "Excess Discount Amount" ASC
+    LIMIT: 100
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Consolidate the two web_sales scans into one by computing the per-item average via window function; ignore the CASE aggregation (not needed).
+- channel_bitmap_aggregation: Use a single scan with added computation (window) to avoid separate subquery scan; ignore the labeling and conditional aggregation.
+HAZARD_FLAGS:
+- Window function AVG over partition by ws_item_sk must be computed over the same date range as outer; ensured by filtered_date join.
+- Window function may be computed over all rows in the partition, which matches the subquery’s logic (same date filter). Safe.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  filtered_item -> filtered_date -> web_sales_filtered -> item_avg_discount -> main_join -> filter_agg -> top_n
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: i_manufact_id = 320
+    OUTPUT: i_item_sk, i_manufact_id
+    EXPECTED_ROWS: 168
+    CONSUMERS: web_sales_filtered, item_avg_discount
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '2002-02-26' AND (CAST('2002-02-26' AS DATE) + INTERVAL 90 DAY)
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 91
+    CONSUMERS: web_sales_filtered, item_avg_discount
+  web_sales_filtered:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_date ON d_date_sk = ws_sold_date_sk
+    JOIN: INNER JOIN filtered_item ON i_item_sk = ws_item_sk
+    OUTPUT: ws_ext_discount_amt, ws_item_sk, ws_sold_date_sk
+    EXPECTED_ROWS: 12K
+    CONSUMERS: item_avg_discount, main_join
+  item_avg_discount:
+    FROM: web_sales_filtered
+    GROUP BY: ws_item_sk
+    AGGREGATE: avg(ws_ext_discount_amt) AS avg_disc
+    OUTPUT: ws_item_sk, avg_disc
+    EXPECTED_ROWS: 98
+    CONSUMERS: main_join
+  main_join:
+    FROM: web_sales_filtered
+    JOIN: INNER JOIN item_avg_discount ON web_sales_filtered.ws_item_sk = item_avg_discount.ws_item_sk
+    WHERE: ws_ext_discount_amt > 1.3 * avg_disc
+    OUTPUT: ws_ext_discount_amt
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: filter_agg
+  filter_agg:
+    FROM: main_join
+    AGGREGATE: sum(ws_ext_discount_amt) AS "Excess Discount Amount"
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: top_n
+  top_n:
+    FROM: filter_agg
+    ORDER BY: "Excess Discount Amount" ASC
+    LIMIT: 100
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: prefetch_fact_join, dimension_cte_isolate, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Pre-join filtered dimensions with fact table (web_sales_filtered) before aggregation; ignore the cascading fact-table chains (only one fact table).
+- dimension_cte_isolate: Pre-filter item and date into CTEs; ignore the cross-join of dimension CTEs (we join them sequentially with fact).
+- multi_dimension_prefetch: Pre-filter both dimensions before fact join; ignore the unfiltered dimension CTE risk (both have WHERE).
+HAZARD_FLAGS:
+- web_sales_filtered CTE is referenced twice (by item_avg_discount and main_join); ensure it is materialized to avoid rescanning.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_scan_consolidation
+TARGET_LOGICAL_TREE:
+  filtered_item -> filtered_date -> web_sales_filtered -> enriched -> agg -> top_n
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: i_manufact_id = 320
+    OUTPUT: i_item_sk, i_manufact_id
+    EXPECTED_ROWS: 168
+    CONSUMERS: web_sales_filtered
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '2002-02-26' AND (CAST('2002-02-26' AS DATE) + INTERVAL 90 DAY)
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 91
+    CONSUMERS: web_sales_filtered
+  web_sales_filtered:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_date ON d_date_sk = ws_sold_date_sk
+    JOIN: INNER JOIN filtered_item ON i_item_sk = ws_item_sk
+    OUTPUT: ws_ext_discount_amt, ws_item_sk
+    EXPECTED_ROWS: 12K
+    CONSUMERS: enriched
+  enriched:
+    FROM: web_sales_filtered
+    WINDOW: AVG(ws_ext_discount_amt) OVER (PARTITION BY ws_item_sk) AS avg_disc
+    OUTPUT: ws_ext_discount_amt, avg_disc
+    EXPECTED_ROWS: 12K
+    CONSUMERS: agg
+  agg:
+    FROM: enriched
+    WHERE: ws_ext_discount_amt > 1.3 * avg_disc
+    AGGREGATE: sum(ws_ext_discount_amt) AS "Excess Discount Amount"
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: top_n
+  top_n:
+    FROM: agg
+    ORDER BY: "Excess Discount Amount" ASC
+    LIMIT: 100
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, prefetch_fact_join, decorrelate
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Consolidate scans via window function; ignore the CASE aggregation.
+- prefetch_fact_join: Pre-join dimensions with fact table in web_sales_filtered; ignore the multi-fact chain.
+- decorrelate: Eliminate correlated subquery by computing average via window; ignore the separate CTE for averages.
+HAZARD_FLAGS:
+- Window function may be computed over the entire partition (all rows for the item in the date range) which matches subquery semantics; safe.
+- Must ensure the window function is computed after the dimension joins, not before.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

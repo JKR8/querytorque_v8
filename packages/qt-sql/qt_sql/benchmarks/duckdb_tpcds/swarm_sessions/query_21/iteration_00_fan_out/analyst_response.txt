@@ -1,0 +1,302 @@
+<reasoning>
+Let me analyze the query structure, EXPLAIN plan, and match against known optimization gaps.
+
+1. **CLASSIFICATION**: This is a star-join aggregation query with a single fact table (inventory) joined to three dimension tables (warehouse, item, date_dim). It has conditional aggregation (CASE inside SUM) and a post-aggregation filter on the ratio of two aggregates.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total execution: 419ms
+   - Main bottleneck: SEQ_SCAN inventory (298.5ms, 71% of total time) processes 4.6M rows out of 1.6B
+   - Secondary: HASH_GROUP_BY (79.4ms, 19%) processes 295K rows → 33K groups
+   - Row reduction flow: 
+     - date_dim: 73K → 61 rows (filter effective)
+     - item: 102K → 6,464 rows (filter effective)  
+     - warehouse: 10 rows (no filter)
+     - inventory: 1.6B → 4.6M rows (0.3% selectivity from date+item joins)
+   - The optimizer already pushes predicates into scans (date_dim filter in SEQ_SCAN, item filter in SEQ_SCAN)
+   - Single scan of each table, no repeated scans
+   - CTEs not present in original query
+
+3. **GAP MATCHING**:
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: Active. The query has no CTEs, so predicates can't be pushed across boundaries. Creating CTEs for dimension tables could help pre-filter and create small hash tables for faster fact table probing.
+   - **REDUNDANT_SCAN_ELIMINATION**: Not applicable. Single scan per table.
+   - **CORRELATED_SUBQUERY_PARALYSIS**: Not applicable. No correlated subqueries.
+   - **CROSS_COLUMN_OR_DECOMPOSITION**: Not applicable. No OR conditions.
+
+4. **AGGREGATION TRAP CHECK**: 
+   - Uses SUM with CASE expressions - duplicate-safe (joins don't change result if rows duplicated)
+   - Post-aggregation filter uses ratio of aggregates - safe to restructure as long as same rows aggregated
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   a) **star_join_prefetch** (prefetch_fact_join + dimension_cte_isolate): Pre-filter all dimensions into CTEs, then join with fact table. Expected high impact because inventory scan is bottleneck (71% cost). Historical: prefetch_fact_join 3.77x, dimension_cte_isolate 1.93x.
+   b) **date_cte_isolate**: Extract date filtering into CTE. Date_dim reduces to 61 rows (tiny). Historical: 4.00x.
+   c) **early_filter**: Filter small dimension tables first, then join to fact. Historical: 4.00x.
+   d) **single_pass_aggregation**: Not applicable (no repeated scans) but could be adapted as exploration: pivot the before/after aggregation using conditional aggregates without needing CASE expressions? Actually the query already uses CASE inside SUM - that's already single-pass.
+
+   For diversity:
+   1. Worker 1: star_join_prefetch (compound strategy)
+   2. Worker 2: date_cte_isolate (focused on date dimension)
+   3. Worker 3: early_filter (general dimension filtering)
+   4. Worker 4: Exploration - try pivot aggregation + late warehouse join (novel combination)
+
+6. **LOGICAL TREE DESIGN**:
+   - Need to ensure CTE_COLUMN_COMPLETENESS: Each CTE must output all columns needed downstream
+   - Key columns: w_warehouse_name, i_item_id, inv_quantity_on_hand, d_date, and surrogate keys for joins
+   - Warehouse table is tiny (10 rows) - can be joined last as "late_attribute_binding"
+
+   For Worker 4 exploration: The warehouse table is only used for w_warehouse_name in GROUP BY and final SELECT. It's not used in filters. We can defer the warehouse join until after aggregation (late attribute binding). This could reduce the hash join size during aggregation phase.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compare inventory levels in 30-day windows before/after 2002-02-27 for low-priced items (0.99-1.49) by warehouse and item, keeping groups where post-period inventory is roughly balanced (ratio 2/3 to 3/2). All joins are INNER (intersection), requiring matches in all four tables. The SUM(CASE) aggregation is duplicate-safe, but the ratio filter depends on inv_before > 0. The date filter (d_date ±30 days) must be preserved exactly, and the price filter (i_current_price 0.99-1.49) must remain before aggregation.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: inventory table scan dominates (298.5ms, 71% of total). 4.6M of 1.6B rows scanned after applying date and item filters via joins. Cardinality flow: date_dim (73K→61), item (102K→6,464), warehouse (10), inventory (1.6B→4.6M→295K→33K groups→19K after ratio filter→100 limit). The optimizer already pushes predicates into dimension scans (date_dim filter in SEQ_SCAN, item filter in SEQ_SCAN) and uses efficient hash joins. Logical-tree cost percentages are misleading - the 71% inventory scan cost is actual wall-clock time.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output w_warehouse_name, i_item_id, inv_before, inv_after in same order
+- CTE_COLUMN_COMPLETENESS: Any created CTE must include all columns referenced downstream
+- LITERAL_PRESERVATION: Must preserve '2002-02-27', 0.99, 1.49, 30 DAY intervals, 2.0/3.0, 3.0/2.0 exactly
+- SEMANTIC_EQUIVALENCE: Same rows, columns, ordering (w_warehouse_name, i_item_id ASC)
+- CROSS_CTE_PREDICATE_BLINDNESS: No existing CTEs; creating dimension CTEs can pre-filter before fact join
+- REDUNDANT_SCAN_ELIMINATION: Not active (single scan per table)
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (observed 0.5x on Q25):
+   CAUSE: Pre-filtered fact table before multi-way fact joins, preventing optimizer reordering
+   RULE: Do not pre-join inventory with date_dim before other dimension joins if it blocks join reordering
+2. dimension_cte_isolate (observed 0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion
+   RULE: Never cross-join dimension CTEs; join them sequentially with fact table
+3. prefetch_fact_join (observed 0.5x on Q25):
+   CAUSE: Baseline <50ms, CTE overhead dominated savings
+   RULE: Not applicable here (baseline 419ms > 100ms threshold)
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_cte -> item_cte -> warehouse_cte -> inventory_join_all -> aggregate -> ratio_filter -> order_limit
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_date BETWEEN DATE '2002-02-27' - INTERVAL 30 DAY AND DATE '2002-02-27' + INTERVAL 30 DAY
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 61
+    CONSUMERS: inventory_join_all
+  item_cte:
+    FROM: item
+    WHERE: i_current_price BETWEEN 0.99 AND 1.49
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: 6,464
+    CONSUMERS: inventory_join_all
+  warehouse_cte:
+    FROM: warehouse
+    WHERE: (no filter)
+    OUTPUT: w_warehouse_sk, w_warehouse_name
+    EXPECTED_ROWS: 10
+    CONSUMERS: inventory_join_all
+  inventory_join_all:
+    FROM: inventory
+    JOIN: date_cte ON inv_date_sk = d_date_sk
+    JOIN: item_cte ON inv_item_sk = i_item_sk
+    JOIN: warehouse_cte ON inv_warehouse_sk = w_warehouse_sk
+    OUTPUT: w_warehouse_name, i_item_id, inv_quantity_on_hand, d_date
+    EXPECTED_ROWS: 295K
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: inventory_join_all
+    GROUP BY: w_warehouse_name, i_item_id
+    AGGREGATE: SUM(CASE WHEN d_date < DATE '2002-02-27' THEN inv_quantity_on_hand ELSE 0 END) AS inv_before,
+              SUM(CASE WHEN d_date >= DATE '2002-02-27' THEN inv_quantity_on_hand ELSE 0 END) AS inv_after
+    OUTPUT: w_warehouse_name, i_item_id, inv_before, inv_after
+    EXPECTED_ROWS: 33K
+    CONSUMERS: ratio_filter
+  ratio_filter:
+    FROM: aggregate
+    WHERE: (CASE WHEN inv_before > 0 THEN inv_after / inv_before ELSE NULL END) BETWEEN (2.0/3.0) AND (3.0/2.0)
+    OUTPUT: w_warehouse_name, i_item_id, inv_before, inv_after
+    EXPECTED_ROWS: 19K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: ratio_filter
+    ORDER BY: w_warehouse_name ASC, i_item_id ASC
+    LIMIT: 100
+    OUTPUT: w_warehouse_name, i_item_id, inv_before, inv_after
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: prefetch_fact_join, dimension_cte_isolate, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply the staged CTE chain (filter dimensions first, then join with fact). Ignore that example uses multiple fact tables - we have only inventory.
+- dimension_cte_isolate: Apply pre-filtering of all dimension tables into CTEs. Ignore the regression warning about cross-joins - we will join dimensions sequentially with fact table.
+- multi_dimension_prefetch: Apply pre-filtering of multiple dimension tables (date + item + warehouse). Ignore that example uses store instead of warehouse.
+HAZARD_FLAGS:
+- Creating 3 separate dimension CTEs may add materialization overhead if they're not inlined
+- Must ensure all join columns (d_date_sk, i_item_sk, w_warehouse_sk) are in CTE outputs
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: date_cte_isolate
+TARGET_LOGICAL_TREE:
+  date_cte -> inventory_join_date -> item_join -> warehouse_join -> aggregate -> ratio_filter -> order_limit
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_date BETWEEN DATE '2002-02-27' - INTERVAL 30 DAY AND DATE '2002-02-27' + INTERVAL 30 DAY
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 61
+    CONSUMERS: inventory_join_date
+  inventory_join_date:
+    FROM: inventory
+    JOIN: date_cte ON inv_date_sk = d_date_sk
+    OUTPUT: inv_warehouse_sk, inv_item_sk, inv_quantity_on_hand, d_date
+    EXPECTED_ROWS: ~4.6M (date-filtered portion)
+    CONSUMERS: item_join
+  item_join:
+    FROM: inventory_join_date
+    JOIN: item ON inv_item_sk = i_item_sk AND i_current_price BETWEEN 0.99 AND 1.49
+    OUTPUT: inv_warehouse_sk, i_item_id, inv_quantity_on_hand, d_date
+    EXPECTED_ROWS: 295K
+    CONSUMERS: warehouse_join
+  warehouse_join:
+    FROM: item_join
+    JOIN: warehouse ON inv_warehouse_sk = w_warehouse_sk
+    OUTPUT: w_warehouse_name, i_item_id, inv_quantity_on_hand, d_date
+    EXPECTED_ROWS: 295K
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: warehouse_join
+    GROUP BY: w_warehouse_name, i_item_id
+    AGGREGATE: SUM(CASE WHEN d_date < DATE '2002-02-27' THEN inv_quantity_on_hand ELSE 0 END) AS inv_before,
+              SUM(CASE WHEN d_date >= DATE '2002-02-27' THEN inv_quantity_on_hand ELSE 0 END) AS inv_after
+    OUTPUT: w_warehouse_name, i_item_id, inv_before, inv_after
+    EXPECTED_ROWS: 33K
+    CONSUMERS: ratio_filter
+  ratio_filter:
+    FROM: aggregate
+    WHERE: (CASE WHEN inv_before > 0 THEN inv_after / inv_before ELSE NULL END) BETWEEN (2.0/3.0) AND (3.0/2.0)
+    OUTPUT: w_warehouse_name, i_item_id, inv_before, inv_after
+    EXPECTED_ROWS: 19K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: ratio_filter
+    ORDER BY: w_warehouse_name ASC, i_item_id ASC
+    LIMIT: 100
+    OUTPUT: w_warehouse_name, i_item_id, inv_before, inv_after
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: date_cte_isolate, early_filter, pushdown
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: Apply extracting date filter into CTE. Ignore that example uses multiple date aliases - we have only one.
+- early_filter: Apply filtering small dimension table (date_dim) first. Ignore that example filters reason table - same principle.
+- pushdown: Apply pushing date filter into CTE to reduce intermediate results. Ignore consolidation of multiple subqueries.
+HAZARD_FLAGS:
+- The item filter (price range) is applied AFTER date join, not in a separate CTE
+- Must ensure d_date column is preserved through joins for CASE expression
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: early_filter
+TARGET_LOGICAL_TREE:
+  filtered_dims -> inventory_join -> aggregate -> ratio_filter -> order_limit
+NODE_CONTRACTS:
+  filtered_dims:
+    FROM: date_dim, item, warehouse
+    WHERE: date_dim.d_date BETWEEN DATE '2002-02-27' - INTERVAL 30 DAY AND DATE '2002-02-27' + INTERVAL 30 DAY
+           AND item.i_current_price BETWEEN 0.99 AND 1.49
+           AND (no filter on warehouse)
+    JOIN: (cross join or no join - just list tables separately)
+    OUTPUT: date_dim.d_date_sk, date_dim.d_date, item.i_item_sk, item.i_item_id, warehouse.w_warehouse_sk, warehouse.w_warehouse_name
+    EXPECTED_ROWS: 61 * 6,464 * 10 ≈ 3.94M (but will be reduced by inventory join)
+    CONSUMERS: inventory_join
+  inventory_join:
+    FROM: inventory
+    JOIN: filtered_dims ON inv_date_sk = d_date_sk AND inv_item_sk = i_item_sk AND inv_warehouse_sk = w_warehouse_sk
+    OUTPUT: w_warehouse_name, i_item_id, inv_quantity_on_hand, d_date
+    EXPECTED_ROWS: 295K
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: inventory_join
+    GROUP BY: w_warehouse_name, i_item_id
+    AGGREGATE: SUM(CASE WHEN d_date < DATE '2002-02-27' THEN inv_quantity_on_hand ELSE 0 END) AS inv_before,
+              SUM(CASE WHEN d_date >= DATE '2002-02-27' THEN inv_quantity_on_hand ELSE 0 END) AS inv_after
+    OUTPUT: w_warehouse_name, i_item_id, inv_before, inv_after
+    EXPECTED_ROWS: 33K
+    CONSUMERS: ratio_filter
+  ratio_filter:
+    FROM: aggregate
+    WHERE: (CASE WHEN inv_before > 0 THEN inv_after / inv_before ELSE NULL END) BETWEEN (2.0/3.0) AND (3.0/2.0)
+    OUTPUT: w_warehouse_name, i_item_id, inv_before, inv_after
+    EXPECTED_ROWS: 19K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: ratio_filter
+    ORDER BY: w_warehouse_name ASC, i_item_id ASC
+    LIMIT: 100
+    OUTPUT: w_warehouse_name, i_item_id, inv_before, inv_after
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: early_filter, dimension_cte_isolate, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- early_filter: Apply filtering all dimension tables first. Ignore that example filters only reason table - we filter date_dim and item.
+- dimension_cte_isolate: Apply pre-filtering dimensions. Ignore the CTE structure - we use a single filtered_dims CTE.
+- multi_dimension_prefetch: Apply pre-filtering multiple dimensions. Ignore the separate CTEs - we combine in one CTE.
+HAZARD_FLAGS:
+- Creating a Cartesian product of filtered dimensions (61 × 6,464 × 10 = 3.94M rows) before inventory join could be expensive
+- Must ensure the CTE outputs all necessary join keys and columns for downstream use
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: late_attribute_binding_with_pivot
+TARGET_LOGICAL_TREE:
+  date_item_filtered -> inventory_agg -> warehouse_join -> ratio_filter -> order_limit
+NODE_CONTRACTS:
+  date_item_filtered:
+    FROM: date_dim
+    JOIN: item ON (no direct join, separate tables)
+    WHERE: date_dim.d_date BETWEEN DATE '2002-02-27' - INTERVAL 30 DAY AND DATE '2002-02-27' + INTERVAL 30 DAY
+           AND item.i_current_price BETWEEN 0.99 AND 1.49
+    OUTPUT: date_dim.d_date_sk, date_dim.d_date, item.i_item_sk, item.i_item_id
+    EXPECTED_ROWS: 61 (date_dim) and 6,464 (item) - kept separate or cross join? We'll keep as separate tables in CTE
+    CONSUMERS: inventory_agg
+  inventory_agg:
+    FROM: inventory
+    JOIN: date_item_filtered.date_dim ON inv_date_sk = d_date_sk
+    JOIN: date_item_filtered.item ON inv_item_sk = i_item_sk
+    GROUP BY: inv_warehouse_sk, i_item_id, (CASE WHEN d_date < DATE '2002-02-27' THEN 0 ELSE 1 END) as period_flag
+    AGGREGATE: SUM(inv_quantity_on_hand) as period_sum
+    OUTPUT: inv_warehouse_sk, i_item_id, period_flag, period_sum
+    EXPECTED_ROWS: 33K × 2 periods = 66K (before pivot)
+    CONSUMERS: warehouse_join
+  warehouse_join:
+    FROM: inventory_agg pivoted to have inv_before, inv_after columns
+    JOIN: warehouse ON inv_warehouse_sk = w_warehouse_sk
+    OUTPUT: w_warehouse_name, i_item_id, inv_before, inv_after
+    EXPECTED_ROWS: 33K
+    CONSUMERS: ratio_filter
+  ratio_filter:
+    FROM: warehouse_join
+    WHERE: (CASE WHEN inv_before > 0 THEN inv_after / inv_before ELSE NULL END) BETWEEN (2.0/3.0) AND (3.0/2.0)
+    OUTPUT: w_warehouse_name, i_item_id, inv_before, inv_after
+    EXPECTED_ROWS: 19K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: ratio_filter
+    ORDER BY: w_warehouse_name ASC, i_item_id ASC
+    LIMIT: 100
+    OUTPUT: w_warehouse_name, i_item_id, inv_before, inv_after
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, deferred_window_aggregation, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply consolidating before/after aggregation into one pass with period flag. Ignore that example has multiple scans - we have one scan.
+- deferred_window_aggregation: Apply deferring expensive operations (warehouse join) until after aggregation. Ignore window functions - we use aggregation.
+- dimension_cte_isolate: Apply pre-filtering date and item. Ignore keeping all dimensions together - we defer warehouse.
+HAZARD_FLAGS:
+- Pivoting period sums requires careful handling to ensure inv_before/inv_after calculated correctly
+- Grouping by period_flag then pivoting adds complexity
+- Must ensure all necessary columns for final output are preserved
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This strategy doesn't violate any correctness constraints; it restructures aggregation and defers warehouse join but preserves all semantics.
+EXPLORATION_TYPE: compound_strategy

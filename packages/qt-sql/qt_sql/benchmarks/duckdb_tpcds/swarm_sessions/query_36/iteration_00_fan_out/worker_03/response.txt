@@ -1,0 +1,85 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Modified: Added explicit CTE structure matching target logical tree
+    ├── [~] filtered_date  [=] (new CTE)
+    ├── [~] filtered_store  [=] (new CTE)
+    ├── [~] filtered_item  [=] (new CTE)
+    ├── [~] fact_join  [=] (new CTE)
+    ├── [~] rollup_agg  [=] (new CTE)
+    ├── [~] window_rank  [=] (new CTE)
+    ├── [=] SORT (lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category END ASC, rank_within_parent ASC)
+    └── [=] OUTPUT (gross_margin, i_category, i_class, lochierarchy, rank_within_parent)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter dimension tables into CTEs before fact table join", "applied_to": ["filtered_date", "filtered_store", "filtered_item"]},
+    {"id": "R2", "type": "multi_dimension_prefetch", "description": "Prefilter all three dimension tables into separate CTEs to enable early fact scan reduction", "applied_to": ["fact_join"]},
+    {"id": "R3", "type": "cte_pipeline", "description": "Structure query as linear pipeline of CTEs matching target logical tree", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2002",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_store": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_store_sk FROM store WHERE s_state IN ('SD','TN','GA','SC','MO','AL','MI','OH')",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_category, i_class FROM item",
+        "interfaces": {"outputs": ["i_item_sk", "i_category", "i_class"], "consumes": []}
+      },
+      "fact_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT fi.i_category, fi.i_class, ss.ss_net_profit, ss.ss_ext_sales_price FROM store_sales ss INNER JOIN filtered_date fd ON ss.ss_sold_date_sk = fd.d_date_sk INNER JOIN filtered_store fs ON ss.ss_store_sk = fs.s_store_sk INNER JOIN filtered_item fi ON ss.ss_item_sk = fi.i_item_sk",
+        "interfaces": {"outputs": ["i_category", "i_class", "ss_net_profit", "ss_ext_sales_price"], "consumes": ["filtered_date", "filtered_store", "filtered_item"]}
+      },
+      "rollup_agg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_category, i_class, GROUPING(i_category) AS g_cat, GROUPING(i_class) AS g_cls, SUM(ss_net_profit) AS sum_net_profit, SUM(ss_ext_sales_price) AS sum_sales_price FROM fact_join GROUP BY ROLLUP(i_category, i_class)",
+        "interfaces": {"outputs": ["i_category", "i_class", "g_cat", "g_cls", "sum_net_profit", "sum_sales_price"], "consumes": ["fact_join"]}
+      },
+      "window_rank": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT sum_net_profit / sum_sales_price AS gross_margin, i_category, i_class, (g_cat + g_cls) AS lochierarchy, RANK() OVER (PARTITION BY (g_cat + g_cls), CASE WHEN g_cls = 0 THEN i_category END ORDER BY sum_net_profit / sum_sales_price ASC) AS rank_within_parent FROM rollup_agg",
+        "interfaces": {"outputs": ["gross_margin", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["rollup_agg"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT gross_margin, i_category, i_class, lochierarchy, rank_within_parent FROM window_rank ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category END, rank_within_parent LIMIT 100",
+        "interfaces": {"outputs": ["gross_margin", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["window_rank"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_store", "filtered_item", "fact_join", "rollup_agg", "window_rank", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_store AS ({filtered_store}), filtered_item AS ({filtered_item}), fact_join AS ({fact_join}), rollup_agg AS ({rollup_agg}), window_rank AS ({window_rank}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Added explicit CTE pipeline that isolates dimension filtering before the fact join, enabling the optimizer to push filters into the fact table scan and create smaller hash tables for joins. The structure matches the target logical tree exactly while preserving all semantic invariants.
+
+Expected speedup: ~2-3x from early fact scan reduction via pre-filtered dimension hash tables and columnar projection pruning.

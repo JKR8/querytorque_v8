@@ -1,0 +1,77 @@
+## Part 1: Modified Logic Tree
+
+```
+[=] main_query
+    [~] sales_agg (modified): Single CTE computing both per-item revenue AND store average via window function
+        [+] filtered_dates: Pre-filtered date_dim CTE for date range
+        [+] filtered_fact: Store_sales filtered by date range and ratio
+    [-] store_avg: Removed separate CTE (now part of sales_agg)
+    [=] store_cte: Pre-filtered store dimension (unchanged)
+    [=] item_cte: Pre-filtered item dimension (unchanged)
+[!] Structural change: Collapsed two-pass aggregation into single-pass with window function
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "window_aggregation", "description": "Replace two-pass aggregation with single-pass using window function for store average", "applied_to": ["sales_agg"]},
+    {"id": "R2", "type": "explicit_join", "description": "Convert comma joins to explicit JOIN syntax", "applied_to": ["main_query", "sales_agg"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1195 AND 1195+11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_fact": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_store_sk, ss_item_sk, ss_sales_price FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk WHERE ss_sales_price / ss_list_price BETWEEN 0.38 AND 0.48",
+        "interfaces": {"outputs": ["ss_store_sk", "ss_item_sk", "ss_sales_price"], "consumes": ["filtered_dates"]}
+      },
+      "sales_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue, AVG(SUM(ss_sales_price)) OVER (PARTITION BY ss_store_sk) AS store_avg FROM filtered_fact GROUP BY ss_store_sk, ss_item_sk",
+        "interfaces": {"outputs": ["ss_store_sk", "ss_item_sk", "revenue", "store_avg"], "consumes": ["filtered_fact"]}
+      },
+      "store_cte": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["s_store_sk", "s_store_name"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_desc", "i_current_price", "i_wholesale_cost", "i_brand"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s.s_store_name, i.i_item_desc, sa.revenue, i.i_current_price, i.i_wholesale_cost, i.i_brand FROM sales_agg sa JOIN store s ON sa.ss_store_sk = s.s_store_sk JOIN item i ON sa.ss_item_sk = i.i_item_sk WHERE sa.revenue <= 0.1 * sa.store_avg AND s.s_state IN ('IA','IL','NC') AND i.i_manager_id BETWEEN 80 AND 84 ORDER BY s.s_store_name, i.i_item_desc LIMIT 100",
+        "interfaces": {"outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"], "consumes": ["sales_agg", "store_cte", "item_cte"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_fact", "sales_agg", "store_cte", "item_cte", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), filtered_fact AS ({filtered_fact}), sales_agg AS ({sales_agg}), store_cte AS (SELECT s_store_sk, s_store_name FROM store WHERE s_state IN ('IA','IL','NC')), item_cte AS (SELECT i_item_sk, i_item_desc, i_current_price, i_wholesale_cost, i_brand FROM item WHERE i_manager_id BETWEEN 80 AND 84) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'", "SET LOCAL enable_hashjoin = on", "SET LOCAL enable_mergejoin = off", "SET LOCAL enable_nestloop = off", "SET LOCAL max_parallel_workers_per_gather = 4", "SET LOCAL hash_mem_multiplier = 2.0"],
+  "validation_checks": []
+}
+```
+
+**Changes:** Replaced the two-pass aggregation (first compute per-item revenue, then compute store averages) with a single-pass aggregation using a window function. This eliminates the need for a separate CTE and join for store averages, reducing the number of passes over the aggregated data from two to one.
+
+**Expected speedup:** 2.1-2.3x. The primary bottleneck in previous attempts was computing store averages as a separate aggregation phase, requiring additional grouping and joining. By computing the store average via a window function in the same aggregation pass, we eliminate that entire phase while preserving the same semantics. The runtime configuration optimizes for hash joins and parallel execution while providing sufficient work_mem for the window function's sort operation.

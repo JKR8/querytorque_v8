@@ -1,0 +1,94 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [+] date_filtered  [~]  Cost: 0.01%  Rows: 365  — Filter date_dim to 12-month window
+│   ├── SCAN (date_dim)
+│   └── FILTER (d_month_seq BETWEEN 1188 AND 1188 + 11)
+├── [+] inventory_date  [~]  Cost: 30%  Rows: 26.5M  — Join inventory with filtered dates
+│   ├── SCAN (inventory)
+│   └── JOIN (HASH, inv_date_sk = d_date_sk)
+├── [+] inventory_agg  [~]  Cost: 40%  Rows: 102K  — Pre-aggregate by item before dimension join
+│   ├── AGG (GROUP BY inv_item_sk)
+│   └── AGGREGATE (SUM(inv_quantity_on_hand), COUNT(*))
+├── [+] join_item  [~]  Cost: 25%  Rows: 102K  — Join with item dimension
+│   ├── JOIN (HASH, inv_item_sk = i_item_sk)
+│   └── PROJECT (i_product_name, i_brand, i_class, i_category, sum_qty, cnt)
+├── [+] rollup_aggregate  [~]  Cost: 4.9%  Rows: 204K  — Hierarchical ROLLUP with correct average
+│   ├── AGG (GROUP BY ROLLUP)
+│   └── AGGREGATE (SUM(sum_qty)/SUM(cnt) AS qoh)
+└── [+] order_limit  [~]  Cost: 0.09%  Rows: 100  — Final ordering and limit
+    ├── SORT (qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC)
+    └── LIMIT (100)
+```
+
+**Changes:**
+- Broke single join into staged CTE pipeline (prefetch_fact_join)
+- Pushed aggregation below item join (aggregate_push_below_join)
+- Added explicit average calculation as SUM/SUM to avoid averaging averages
+- Preserved all original filters and output columns
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "prefetch_fact_join", "description": "Staged join pipeline: filter date first, join with fact table, then aggregate, then join dimensions", "applied_to": ["date_filtered", "inventory_date", "inventory_agg", "join_item"]},
+    {"id": "R2", "type": "aggregate_push_below_join", "description": "Push aggregation before dimension join where safe (one-to-one relationship)", "applied_to": ["inventory_agg"]},
+    {"id": "R3", "type": "rollup_correction", "description": "Replace AVG(sum_qty/cnt) with SUM(sum_qty)/SUM(cnt) for correct rollup average", "applied_to": ["rollup_aggregate"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filtered": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1188 AND 1188 + 11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "inventory_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT inv_item_sk, inv_quantity_on_hand FROM inventory JOIN date_filtered ON inv_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["inv_item_sk", "inv_quantity_on_hand"], "consumes": ["date_filtered"]}
+      },
+      "inventory_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT inv_item_sk, SUM(inv_quantity_on_hand) AS sum_qty, COUNT(inv_quantity_on_hand) AS cnt FROM inventory_date GROUP BY inv_item_sk",
+        "interfaces": {"outputs": ["inv_item_sk", "sum_qty", "cnt"], "consumes": ["inventory_date"]}
+      },
+      "join_item": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_product_name, i_brand, i_class, i_category, sum_qty, cnt FROM inventory_agg JOIN item ON inv_item_sk = i_item_sk",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "sum_qty", "cnt"], "consumes": ["inventory_agg"]}
+      },
+      "rollup_aggregate": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_product_name, i_brand, i_class, i_category, CASE WHEN SUM(cnt) > 0 THEN SUM(sum_qty) / SUM(cnt) END AS qoh FROM join_item GROUP BY ROLLUP(i_product_name, i_brand, i_class, i_category)",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "qoh"], "consumes": ["join_item"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_product_name, i_brand, i_class, i_category, qoh FROM rollup_aggregate ORDER BY qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC LIMIT 100",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "qoh"], "consumes": ["rollup_aggregate"]}
+      }
+    },
+    "reconstruction_order": ["date_filtered", "inventory_date", "inventory_agg", "join_item", "rollup_aggregate", "main_query"],
+    "assembly_template": "WITH date_filtered AS ({date_filtered}), inventory_date AS ({inventory_date}), inventory_agg AS ({inventory_agg}), join_item AS ({join_item}), rollup_aggregate AS ({rollup_aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Staged join pipeline reduces intermediate data size from 26.5M rows to 102K before dimension join. The aggregation pushdown exploits one-to-one relationship between inventory and item tables. The ROLLUP average correctly uses SUM/SUM with defensive division guard.
+
+**Expected speedup:** ~1.8-2.2x (primary gain from reducing 26.5M-row join to 102K-row join before dimension table, secondary gain from smaller hash tables in ROLLUP computation).

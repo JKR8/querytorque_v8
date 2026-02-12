@@ -1,0 +1,79 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: 67→100  — Structured as CTE chain per target logical tree
+    ├── [CTE] filtered_date  [+]  Cost: ~5%  Rows: 6,000  — Materialized date dimension filter
+    │   ├── SCAN date_dim
+    │   ├── FILTER (d_moy=11)
+    │   └── OUTPUT (d_date_sk, d_year)
+    ├── [CTE] filtered_item  [+]  Cost: ~1%  Rows: 25  — Materialized item dimension filter
+    │   ├── SCAN item
+    │   ├── FILTER (i_manufact_id=816)
+    │   └── OUTPUT (i_item_sk, i_brand_id, i_brand)
+    ├── [CTE] joined_sales  [+]  Cost: ~94%  Rows: 67  — Fact table join with aggregated revenue
+    │   ├── SCAN store_sales
+    │   ├── JOIN filtered_date (ss_sold_date_sk = d_date_sk)
+    │   ├── JOIN filtered_item (ss_item_sk = i_item_sk)
+    │   ├── AGG (GROUP BY d_year, i_brand, i_brand_id; SUM(ss_sales_price))
+    │   └── OUTPUT (d_year, i_brand, i_brand_id, sum_agg)
+    └── [MAIN] main_output  [~]  Cost: ~0%  Rows: 67→100
+        ├── SCAN joined_sales
+        ├── SORT (d_year ASC, sum_agg DESC, i_brand_id ASC)
+        ├── LIMIT 100
+        └── OUTPUT (d_year, brand_id, brand, sum_agg)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter date_dim into CTE with only November rows and needed columns", "applied_to": ["filtered_date"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Pre-filter item into CTE with only manufacturer 816 and needed columns", "applied_to": ["filtered_item"]},
+    {"id": "R3", "type": "prefetch_fact_join", "description": "Join fact table with pre-filtered dimension CTEs in staged pipeline", "applied_to": ["joined_sales"]},
+    {"id": "R4", "type": "logical_tree_follow", "description": "Structure CTE chain exactly as specified in target logical tree", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_year FROM date_dim WHERE d_moy = 11",
+        "interfaces": {"outputs": ["d_date_sk", "d_year"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_brand_id, i_brand FROM item WHERE i_manufact_id = 816",
+        "interfaces": {"outputs": ["i_item_sk", "i_brand_id", "i_brand"], "consumes": []}
+      },
+      "joined_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_year, i_brand, i_brand_id, SUM(ss_sales_price) AS sum_agg FROM store_sales INNER JOIN filtered_date ON store_sales.ss_sold_date_sk = filtered_date.d_date_sk INNER JOIN filtered_item ON store_sales.ss_item_sk = filtered_item.i_item_sk GROUP BY d_year, i_brand, i_brand_id",
+        "interfaces": {"outputs": ["d_year", "i_brand", "i_brand_id", "sum_agg"], "consumes": ["filtered_date", "filtered_item"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT d_year, i_brand_id AS brand_id, i_brand AS brand, sum_agg FROM joined_sales ORDER BY d_year ASC, sum_agg DESC, i_brand_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["d_year", "brand_id", "brand", "sum_agg"], "consumes": ["joined_sales"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "joined_sales", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), joined_sales AS ({joined_sales}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured the original join query into a CTE chain that isolates dimension filtering (date_dim with d_moy=11, item with i_manufact_id=816) before joining with the fact table store_sales, following the target logical tree. This creates small hash tables for dimension lookups and enables predicate pushdown.
+
+**Expected speedup:** 1.3-2x based on similar patterns in the reference examples (dimension_cte_isolate: 1.93x, prefetch_fact_join: 3.77x), though the baseline is relatively simple. Main benefit comes from materializing small dimension filters early.

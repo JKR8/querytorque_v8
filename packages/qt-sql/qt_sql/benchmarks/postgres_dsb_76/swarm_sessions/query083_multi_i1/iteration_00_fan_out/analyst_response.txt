@@ -1,0 +1,366 @@
+<reasoning>
+Let me analyze this query step by step.
+
+## 1. CLASSIFY
+This is a "multi-channel UNION ALL" pattern where the same aggregation logic is applied independently to three different fact tables (store_returns, catalog_returns, web_returns) with identical dimension filters (date, item). The CTEs are then INNER JOINED in the main query. This is structurally identical to repeated fact scans with shared dimension filters.
+
+## 2. EXPLAIN PLAN ANALYSIS
+Key observations from EXPLAIN ANALYZE (301.3ms total):
+- **sr_items**: 183.1ms (60% of runtime) - store_returns scan with nested loops
+- **cr_items**: 118.1ms (39% of runtime) - catalog_returns scan with hash join semi
+- **wr_items**: 0.0ms (negligible) - web_returns yields 0 rows
+- **Main query joins**: ~0.1ms
+
+**Row count flow**:
+- date_dim subquery: returns 4 rows (from d_date filter) → expands to 120 rows via d_month_seq join
+- store_returns: 120 loops with index scan → filters from ~2830 to 1 row per loop → 50 rows before item join → 2 rows after aggregation
+- catalog_returns: similar pattern but with 176 rows from seq scan → 1 row after aggregation
+- web_returns: 0 rows
+
+**Critical insight**: The optimizer ALREADY splits the CTEs (materializes them independently). Each CTE executes its own date_dim subquery (6 total index-only scans: 2+3+1). The date_dim subquery logic is repeated 3 times. The item table is scanned 3 times (once per CTE).
+
+**Opportunity**: The same date_dim subquery logic appears in all 3 CTEs. We can compute it once and reuse. Also, the same item filters appear in all 3 CTEs.
+
+**What optimizer does well**: Parallel execution on store_returns and catalog_returns, index usage on date_dim, early filtering on date values.
+
+## 3. GAP MATCHING
+**COMMA_JOIN_WEAKNESS**: ✅ The query uses comma-separated joins (`FROM store_returns, item, date_dim`) which can confuse cardinality estimation.
+
+**CROSS_CTE_PREDICATE_BLINDNESS**: ✅ Same date_dim subquery and item filters appear in all 3 CTEs. The optimizer computes them separately 3 times.
+
+**NON_EQUI_JOIN_INPUT_BLINDNESS**: ⚠️ Not directly applicable - the query has equality joins, not non-equi joins.
+
+**CORRELATED_SUBQUERY_PARALYSIS**: ⚠️ Not applicable - the subqueries are NOT correlated (they don't reference outer tables).
+
+## 4. AGGREGATION TRAP CHECK
+The query uses simple SUM() aggregates. No STDDEV_SAMP, VARIANCE, or other grouping-sensitive functions. The aggregates are computed independently per channel, then combined via division in the final SELECT. This is safe for restructuring.
+
+## 5. TRANSFORM SELECTION
+Based on gaps and structural diversity:
+
+1. **pg_dimension_prefetch_star** - Addresses COMMA_JOIN_WEAKNESS by converting to explicit JOINs with pre-filtered dimension CTEs.
+
+2. **pg_self_join_decomposition** - Addresses CROSS_CTE_PREDICATE_BLINDNESS by sharing the common date_dim subquery and item filter across CTEs.
+
+3. **single_pass_aggregation** - Novel approach: merge the three fact table scans into a UNION ALL with channel discriminator, compute aggregates once, then pivot.
+
+4. **exploration** - Combine dimension prefetch with late attribute binding for item table.
+
+## 6. LOGICAL TREE DESIGN
+For each strategy, I'll design logical trees with complete column contracts.
+
+Worker 1: pg_dimension_prefetch_star
+- CTE1: date_keys (d_date_sk, d_date)
+- CTE2: filtered_items (i_item_sk, i_item_id)  
+- Then 3 explicit-join CTEs for each fact table
+
+Worker 2: pg_self_join_decomposition  
+- CTE1: date_keys (as above)
+- CTE2: filtered_items (as above)
+- CTE3: all_returns UNION ALL of 3 fact tables with channel marker
+- CTE4: aggregated_returns grouped by item_id, channel
+- Main: pivot CTE4 results
+
+Worker 3: single_pass_aggregation
+- CTE1: date_keys
+- CTE2: filtered_items
+- CTE3: consolidated fact scan with CASE expressions in aggregates
+- Main: compute final metrics
+
+Worker 4: exploration with late attribute binding
+- CTE1: date_keys
+- CTE2: all_returns (fact data only, no item join)
+- CTE3: aggregated by item_sk (not item_id)
+- Main: join filtered_items once to resolve i_item_id
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+This query compares return quantities across store, catalog, and web channels for items in 'Home' and 'Men' categories managed by managers with IDs 8-17, on dates belonging to the same month sequences as four specific dates. All three CTEs must match on item_id (INNER JOIN semantics), requiring items to have returns in all three channels. Aggregates are simple SUMS with no grouping traps, but the division formulas in the final SELECT require handling NULLs when wr_items returns 0 rows. The date filter uses a self-join on date_dim that must preserve exact month-sequence logic.
+
+BOTTLENECK_DIAGNOSIS:
+The query is scan-bound on store_returns (183ms) and catalog_returns (118ms), with repeated execution of identical date_dim subqueries (6 index-only scans) and item filters (3 scans). The optimizer already handles parallel execution and predicate pushdown well, but misses sharing common subexpressions across CTEs. Logical-tree cost percentages are misleading: wr_items shows 6% cost but executes in 0ms due to zero rows, while cr_items at 49% cost actually consumes 39% of runtime.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs 8 columns (item_id, sr_item_qty, sr_dev, cr_item_qty, cr_dev, wr_item_qty, wr_dev, average) with specific formulas.
+- CTE_COLUMN_COMPLETENESS: All CTEs must output item_id for joining, plus aggregate columns for final computations.
+- LITERAL_PRESERVATION: Must preserve exact date values ('2002-02-26','2002-05-03','2002-08-19','2002-11-18'), categories ('Home','Men'), manager_id range (8-17), reason_sk values (6,7,25,45,51), and ratio bounds (237-266).
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows ordered by item_id, sr_item_qty.
+- COMMA_JOIN_WEAKNESS: All three CTEs use comma-separated joins (store_returns, item, date_dim).
+- CROSS_CTE_PREDICATE_BLINDNESS: Same date_dim subquery and item filters repeated in sr_items, cr_items, wr_items.
+
+REGRESSION_WARNINGS:
+1. CTE inlining (0.75x):
+   CAUSE: PostgreSQL may inline non-materialized CTEs, re-executing subqueries per reference.
+   RULE: Use MATERIALIZED keyword when creating shared dimension CTEs to guarantee single computation.
+2. OR to UNION ALL (0.21x):
+   CAUSE: Splitting OR conditions caused 5x slowdown on Q085 when optimizer could use bitmap index scan.
+   RULE: Do not split the sr_reason_sk IN (...), cr_reason_sk IN (...), wr_reason_sk IN (...) conditions.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: pg_dimension_prefetch_star
+TARGET_LOGICAL_TREE:
+  date_keys -> filtered_items -> sr_items_explicit -> cr_items_explicit -> wr_items_explicit -> main_query
+NODE_CONTRACTS:
+  date_keys:
+    FROM: date_dim d1
+    JOIN: INNER JOIN date_dim d2 ON d1.d_month_seq = d2.d_month_seq
+    WHERE: d2.d_date IN ('2002-02-26','2002-05-03','2002-08-19','2002-11-18')
+    OUTPUT: d1.d_date_sk, d1.d_date
+    EXPECTED_ROWS: 120
+    CONSUMERS: sr_items_explicit, cr_items_explicit, wr_items_explicit
+  filtered_items:
+    FROM: item
+    WHERE: i_category IN ('Home','Men') AND i_manager_id BETWEEN 8 AND 17
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: unknown but selective
+    CONSUMERS: sr_items_explicit, cr_items_explicit, wr_items_explicit
+  sr_items_explicit:
+    FROM: store_returns
+    JOIN: INNER JOIN date_keys ON sr_returned_date_sk = d_date_sk
+          INNER JOIN filtered_items ON sr_item_sk = i_item_sk
+    WHERE: sr_return_amt / sr_return_quantity BETWEEN 237 AND 266 
+           AND sr_reason_sk IN (6,7,25,45,51)
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(sr_return_quantity) AS sr_item_qty
+    OUTPUT: i_item_id AS item_id, sr_item_qty
+    EXPECTED_ROWS: 2
+    CONSUMERS: main_query
+  cr_items_explicit:
+    FROM: catalog_returns
+    JOIN: INNER JOIN date_keys ON cr_returned_date_sk = d_date_sk
+          INNER JOIN filtered_items ON cr_item_sk = i_item_sk
+    WHERE: cr_return_amount / cr_return_quantity BETWEEN 237 AND 266 
+           AND cr_reason_sk IN (6,7,25,45,51)
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(cr_return_quantity) AS cr_item_qty
+    OUTPUT: i_item_id AS item_id, cr_item_qty
+    EXPECTED_ROWS: 1
+    CONSUMERS: main_query
+  wr_items_explicit:
+    FROM: web_returns
+    JOIN: INNER JOIN date_keys ON wr_returned_date_sk = d_date_sk
+          INNER JOIN filtered_items ON wr_item_sk = i_item_sk
+    WHERE: wr_return_amt / wr_return_quantity BETWEEN 237 AND 266 
+           AND wr_reason_sk IN (6,7,25,45,51)
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(wr_return_quantity) AS wr_item_qty
+    OUTPUT: i_item_id AS item_id, wr_item_qty
+    EXPECTED_ROWS: 0
+    CONSUMERS: main_query
+  main_query:
+    FROM: sr_items_explicit 
+    JOIN: INNER JOIN cr_items_explicit USING (item_id)
+          INNER JOIN wr_items_explicit USING (item_id)
+    OUTPUT: item_id, sr_item_qty, sr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0*100 AS sr_dev, cr_item_qty, cr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0*100 AS cr_dev, wr_item_qty, wr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0*100 AS wr_dev, (sr_item_qty+cr_item_qty+wr_item_qty)/3.0 AS average
+    ORDER BY: item_id, sr_item_qty
+    LIMIT: 100
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+  pg_dimension_prefetch_star: Apply the pattern of pre-filtering date and item dimensions into CTEs and converting comma joins to explicit JOIN syntax. Ignore the promotion table aspect since this query doesn't have promotion.
+  pg_date_cte_explicit_join: Apply the date CTE isolation pattern exactly - create a CTE for the date_dim subquery logic and use explicit JOINs. Ignore that the example only handles date_dim; we extend to also pre-filter item.
+HAZARD_FLAGS:
+- Must preserve the exact date_dim self-join logic (d_date in dates → d_month_seq → all dates with same month_seq).
+- The MATERIALIZED keyword may be needed on date_keys and filtered_items to prevent inlining and re-execution.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: pg_self_join_decomposition
+TARGET_LOGICAL_TREE:
+  date_keys -> filtered_items -> all_returns -> aggregated_returns -> main_query_pivot
+NODE_CONTRACTS:
+  date_keys:
+    FROM: date_dim d1
+    JOIN: INNER JOIN date_dim d2 ON d1.d_month_seq = d2.d_month_seq
+    WHERE: d2.d_date IN ('2002-02-26','2002-05-03','2002-08-19','2002-11-18')
+    OUTPUT: d1.d_date_sk, d1.d_date
+    EXPECTED_ROWS: 120
+    CONSUMERS: all_returns
+  filtered_items:
+    FROM: item
+    WHERE: i_category IN ('Home','Men') AND i_manager_id BETWEEN 8 AND 17
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: unknown but selective
+    CONSUMERS: all_returns
+  all_returns:
+    FROM: (
+      SELECT 'store' AS channel, sr_item_sk AS item_sk, sr_returned_date_sk AS return_date_sk, sr_return_quantity AS return_qty, sr_return_amt AS return_amt, sr_reason_sk AS reason_sk
+      FROM store_returns
+      UNION ALL
+      SELECT 'catalog', cr_item_sk, cr_returned_date_sk, cr_return_quantity, cr_return_amount, cr_reason_sk
+      FROM catalog_returns
+      UNION ALL
+      SELECT 'web', wr_item_sk, wr_returned_date_sk, wr_return_quantity, wr_return_amt, wr_reason_sk
+      FROM web_returns
+    ) returns
+    JOIN: INNER JOIN date_keys ON returns.return_date_sk = date_keys.d_date_sk
+          INNER JOIN filtered_items ON returns.item_sk = filtered_items.i_item_sk
+    WHERE: (returns.channel = 'store' AND returns.return_amt / returns.return_qty BETWEEN 237 AND 266 AND returns.reason_sk IN (6,7,25,45,51))
+           OR (returns.channel = 'catalog' AND returns.return_amt / returns.return_qty BETWEEN 237 AND 266 AND returns.reason_sk IN (6,7,25,45,51))
+           OR (returns.channel = 'web' AND returns.return_amt / returns.return_qty BETWEEN 237 AND 266 AND returns.reason_sk IN (6,7,25,45,51))
+    OUTPUT: filtered_items.i_item_id AS item_id, returns.channel, returns.return_qty
+    EXPECTED_ROWS: ~3 (sum of rows from 3 channels)
+    CONSUMERS: aggregated_returns
+  aggregated_returns:
+    FROM: all_returns
+    GROUP BY: item_id, channel
+    AGGREGATE: SUM(return_qty) AS item_qty
+    OUTPUT: item_id, channel, item_qty
+    EXPECTED_ROWS: ~3
+    CONSUMERS: main_query_pivot
+  main_query_pivot:
+    FROM: aggregated_returns
+    OUTPUT: item_id,
+            MAX(CASE WHEN channel = 'store' THEN item_qty END) AS sr_item_qty,
+            MAX(CASE WHEN channel = 'catalog' THEN item_qty END) AS cr_item_qty,
+            MAX(CASE WHEN channel = 'web' THEN item_qty END) AS wr_item_qty,
+            -- Compute derived columns using the pivoted values
+            MAX(CASE WHEN channel = 'store' THEN item_qty END)/(MAX(CASE WHEN channel = 'store' THEN item_qty END)+MAX(CASE WHEN channel = 'catalog' THEN item_qty END)+MAX(CASE WHEN channel = 'web' THEN item_qty END))/3.0*100 AS sr_dev,
+            MAX(CASE WHEN channel = 'catalog' THEN item_qty END)/(MAX(CASE WHEN channel = 'store' THEN item_qty END)+MAX(CASE WHEN channel = 'catalog' THEN item_qty END)+MAX(CASE WHEN channel = 'web' THEN item_qty END))/3.0*100 AS cr_dev,
+            MAX(CASE WHEN channel = 'web' THEN item_qty END)/(MAX(CASE WHEN channel = 'store' THEN item_qty END)+MAX(CASE WHEN channel = 'catalog' THEN item_qty END)+MAX(CASE WHEN channel = 'web' THEN item_qty END))/3.0*100 AS wr_dev,
+            (MAX(CASE WHEN channel = 'store' THEN item_qty END)+MAX(CASE WHEN channel = 'catalog' THEN item_qty END)+MAX(CASE WHEN channel = 'web' THEN item_qty END))/3.0 AS average
+    GROUP BY: item_id
+    ORDER BY: item_id, MAX(CASE WHEN channel = 'store' THEN item_qty END)
+    LIMIT: 100
+EXAMPLES: pg_self_join_decomposition, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+  pg_self_join_decomposition: Apply the pattern of materializing the shared fact+dimension scan once (as all_returns UNION ALL) instead of three separate CTEs. Ignore that the example deals with self-joins on the same table; we adapt to UNION ALL of different tables.
+  shared_dimension_multi_channel: Apply the pattern of sharing dimension filters (date_keys, filtered_items) across multiple fact table scans via UNION ALL. Ignore any aspect about different dimension joins; our dimensions are identical.
+HAZARD_FLAGS:
+- The UNION ALL approach may lose parallelism benefits if PostgreSQL cannot parallelize UNION ALL CTEs.
+- Need COALESCE/NULL handling in pivot for channels with zero returns.
+- The OR conditions in WHERE clause must preserve exact per-channel filter semantics.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  date_keys -> filtered_items -> consolidated_aggregates -> main_query
+NODE_CONTRACTS:
+  date_keys:
+    FROM: date_dim d1
+    JOIN: INNER JOIN date_dim d2 ON d1.d_month_seq = d2.d_month_seq
+    WHERE: d2.d_date IN ('2002-02-26','2002-05-03','2002-08-19','2002-11-18')
+    OUTPUT: d1.d_date_sk, d1.d_date
+    EXPECTED_ROWS: 120
+    CONSUMERS: consolidated_aggregates
+  filtered_items:
+    FROM: item
+    WHERE: i_category IN ('Home','Men') AND i_manager_id BETWEEN 8 AND 17
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: unknown but selective
+    CONSUMERS: consolidated_aggregates
+  consolidated_aggregates:
+    FROM: (
+      SELECT i_item_sk, 
+             SUM(CASE WHEN sr_return_amt / sr_return_quantity BETWEEN 237 AND 266 AND sr_reason_sk IN (6,7,25,45,51) THEN sr_return_quantity ELSE 0 END) AS sr_qty,
+             SUM(CASE WHEN cr_return_amount / cr_return_quantity BETWEEN 237 AND 266 AND cr_reason_sk IN (6,7,25,45,51) THEN cr_return_quantity ELSE 0 END) AS cr_qty,
+             SUM(CASE WHEN wr_return_amt / wr_return_quantity BETWEEN 237 AND 266 AND wr_reason_sk IN (6,7,25,45,51) THEN wr_return_quantity ELSE 0 END) AS wr_qty
+      FROM (
+        SELECT i_item_sk, sr_return_quantity, sr_return_amt, sr_reason_sk, NULL::numeric AS cr_return_quantity, NULL::numeric AS cr_return_amount, NULL::integer AS cr_reason_sk, NULL::integer AS wr_return_quantity, NULL::numeric AS wr_return_amt, NULL::integer AS wr_reason_sk
+        FROM store_returns
+        INNER JOIN date_keys ON sr_returned_date_sk = d_date_sk
+        INNER JOIN filtered_items ON sr_item_sk = i_item_sk
+        UNION ALL
+        SELECT i_item_sk, NULL, NULL, NULL, cr_return_quantity, cr_return_amount, cr_reason_sk, NULL, NULL, NULL
+        FROM catalog_returns
+        INNER JOIN date_keys ON cr_returned_date_sk = d_date_sk
+        INNER JOIN filtered_items ON cr_item_sk = i_item_sk
+        UNION ALL
+        SELECT i_item_sk, NULL, NULL, NULL, NULL, NULL, NULL, wr_return_quantity, wr_return_amt, wr_reason_sk
+        FROM web_returns
+        INNER JOIN date_keys ON wr_returned_date_sk = d_date_sk
+        INNER JOIN filtered_items ON wr_item_sk = i_item_sk
+      ) combined
+      GROUP BY i_item_sk
+    ) agg
+    JOIN: INNER JOIN filtered_items ON agg.i_item_sk = filtered_items.i_item_sk
+    OUTPUT: filtered_items.i_item_id AS item_id, 
+            NULLIF(sr_qty, 0) AS sr_item_qty, 
+            NULLIF(cr_qty, 0) AS cr_item_qty, 
+            NULLIF(wr_qty, 0) AS wr_item_qty
+    EXPECTED_ROWS: ~2 (items with returns in any channel)
+    CONSUMERS: main_query
+  main_query:
+    FROM: consolidated_aggregates
+    WHERE: sr_item_qty IS NOT NULL AND cr_item_qty IS NOT NULL AND wr_item_qty IS NOT NULL
+    OUTPUT: item_id, sr_item_qty, sr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0*100 AS sr_dev, cr_item_qty, cr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0*100 AS cr_dev, wr_item_qty, wr_item_qty/(sr_item_qty+cr_item_qty+wr_item_qty)/3.0*100 AS wr_dev, (sr_item_qty+cr_item_qty+wr_item_qty)/3.0 AS average
+    ORDER BY: item_id, sr_item_qty
+    LIMIT: 100
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+  single_pass_aggregation: Apply the pattern of merging multiple fact table scans into a single aggregation with CASE expressions. Ignore any aspect about STDDEV_SAMP or other grouping-sensitive aggregates; we have only SUM.
+  channel_bitmap_aggregation: Adapt the idea of using CASE inside aggregates to compute per-channel sums in one pass. Ignore bitmap index specifics; we use UNION ALL with NULL padding.
+HAZARD_FLAGS:
+- The NULL padding in UNION ALL may increase memory usage.
+- Need to handle items that have returns in only 1-2 channels (filtered out by WHERE clause to match original INNER JOIN semantics).
+- Zero handling with NULLIF to match original behavior where missing channels show as NULL.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+  date_keys -> all_returns_sk -> aggregated_by_sk -> main_with_late_item_join
+NODE_CONTRACTS:
+  date_keys:
+    FROM: date_dim d1
+    JOIN: INNER JOIN date_dim d2 ON d1.d_month_seq = d2.d_month_seq
+    WHERE: d2.d_date IN ('2002-02-26','2002-05-03','2002-08-19','2002-11-18')
+    OUTPUT: d1.d_date_sk, d1.d_date
+    EXPECTED_ROWS: 120
+    CONSUMERS: all_returns_sk
+  all_returns_sk:
+    FROM: (
+      SELECT sr_item_sk AS item_sk, sr_returned_date_sk AS return_date_sk, sr_return_quantity AS return_qty, sr_return_amt AS return_amt, sr_reason_sk AS reason_sk, 'store' AS channel
+      FROM store_returns
+      UNION ALL
+      SELECT cr_item_sk, cr_returned_date_sk, cr_return_quantity, cr_return_amount, cr_reason_sk, 'catalog'
+      FROM catalog_returns
+      UNION ALL
+      SELECT wr_item_sk, wr_returned_date_sk, wr_return_quantity, wr_return_amt, wr_reason_sk, 'web'
+      FROM web_returns
+    ) returns
+    JOIN: INNER JOIN date_keys ON returns.return_date_sk = date_keys.d_date_sk
+    WHERE: (returns.channel = 'store' AND returns.return_amt / returns.return_qty BETWEEN 237 AND 266 AND returns.reason_sk IN (6,7,25,45,51))
+           OR (returns.channel = 'catalog' AND returns.return_amt / returns.return_qty BETWEEN 237 AND 266 AND returns.reason_sk IN (6,7,25,45,51))
+           OR (returns.channel = 'web' AND returns.return_amt / returns.return_qty BETWEEN 237 AND 266 AND returns.reason_sk IN (6,7,25,45,51))
+    OUTPUT: returns.item_sk, returns.channel, returns.return_qty
+    EXPECTED_ROWS: ~3
+    CONSUMERS: aggregated_by_sk
+  aggregated_by_sk:
+    FROM: all_returns_sk
+    GROUP BY: item_sk, channel
+    AGGREGATE: SUM(return_qty) AS item_qty
+    OUTPUT: item_sk, channel, item_qty
+    EXPECTED_ROWS: ~3
+    CONSUMERS: main_with_late_item_join
+  main_with_late_item_join:
+    FROM: aggregated_by_sk
+    JOIN: INNER JOIN item ON aggregated_by_sk.item_sk = item.i_item_sk
+    WHERE: item.i_category IN ('Home','Men') AND item.i_manager_id BETWEEN 8 AND 17
+    -- Pivot and compute final results
+    OUTPUT: item.i_item_id AS item_id,
+            MAX(CASE WHEN channel = 'store' THEN item_qty END) AS sr_item_qty,
+            MAX(CASE WHEN channel = 'catalog' THEN item_qty END) AS cr_item_qty,
+            MAX(CASE WHEN channel = 'web' THEN item_qty END) AS wr_item_qty,
+            MAX(CASE WHEN channel = 'store' THEN item_qty END)/(MAX(CASE WHEN channel = 'store' THEN item_qty END)+MAX(CASE WHEN channel = 'catalog' THEN item_qty END)+MAX(CASE WHEN channel = 'web' THEN item_qty END))/3.0*100 AS sr_dev,
+            MAX(CASE WHEN channel = 'catalog' THEN item_qty END)/(MAX(CASE WHEN channel = 'store' THEN item_qty END)+MAX(CASE WHEN channel = 'catalog' THEN item_qty END)+MAX(CASE WHEN channel = 'web' THEN item_qty END))/3.0*100 AS cr_dev,
+            MAX(CASE WHEN channel = 'web' THEN item_qty END)/(MAX(CASE WHEN channel = 'store' THEN item_qty END)+MAX(CASE WHEN channel = 'catalog' THEN item_qty END)+MAX(CASE WHEN channel = 'web' THEN item_qty END))/3.0*100 AS wr_dev,
+            (MAX(CASE WHEN channel = 'store' THEN item_qty END)+MAX(CASE WHEN channel = 'catalog' THEN item_qty END)+MAX(CASE WHEN channel = 'web' THEN item_qty END))/3.0 AS average
+    GROUP BY: item.i_item_id
+    HAVING: COUNT(DISTINCT channel) = 3  -- Ensure all 3 channels present
+    ORDER BY: item.i_item_id, MAX(CASE WHEN channel = 'store' THEN item_qty END)
+    LIMIT: 100
+EXAMPLES: pg_materialized_dimension_fact_prefilter, late_attribute_binding
+EXAMPLE_ADAPTATION:
+  pg_materialized_dimension_fact_prefilter: Apply staging reduction by filtering fact tables first (in all_returns_sk) before applying item filters. Ignore the non-equi join aspect; we have equality joins.
+  late_attribute_binding: Apply the pattern of deferring item table join until after aggregation, since item columns are only used for filtering (i_category, i_manager_id) and final display (i_item_id). This reduces item table scans from 3 to 1.
+HAZARD_FLAGS:
+- Deferring item filter may increase intermediate result size if many returns don't match item criteria.
+- The HAVING clause (COUNT(DISTINCT channel) = 3) must match original INNER JOIN semantics exactly.
+- Need to ensure NULL handling for missing channels in pivot.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This strategy doesn't violate any correctness constraints; it merely changes join order while preserving semantics.
+EXPLORATION_TYPE: novel_combination (combining late attribute binding with UNION ALL consolidation)

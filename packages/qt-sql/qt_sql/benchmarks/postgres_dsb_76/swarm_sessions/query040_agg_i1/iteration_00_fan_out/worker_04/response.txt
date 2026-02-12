@@ -1,0 +1,84 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: ~85%  Rows: ~100
+    ├── [!] CTE_SCAN (date_cte) -> INNER JOIN to catalog_sales
+    ├── [!] CTE_SCAN (item_cte) -> INNER JOIN to catalog_sales  
+    ├── [!] CTE_SCAN (returns_cte) -> LEFT JOIN to catalog_sales
+    ├── [!] AGG (GROUP BY cs_warehouse_sk, i_item_id with CASE aggregates) -> fact_pivot_agg
+    ├── [!] JOIN warehouse -> warehouse_join
+    ├── [=] SORT (w_state ASC, i_item_id ASC)
+    └── [=] OUTPUT (w_state, i_item_id, sales_before, sales_after)
+
+Changes:
+- [!] Structural change: Replaced implicit comma joins with explicit CTE-filtered joins
+- [~] Modified main query to follow TARGET_LOGICAL_TREE structure
+- [=] Preserved final sort and output unchanged
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "cte_decomposition", "description": "Split dimension filters into pre-filtered CTEs", "applied_to": ["date_cte", "item_cte", "returns_cte"]},
+    {"id": "R2", "type": "join_reordering", "description": "Convert comma joins to explicit JOINs with CTEs as first-class participants", "applied_to": ["main_query"]},
+    {"id": "R3", "type": "aggregation_preservation", "description": "Keep CASE guards and aggregation semantics identical", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN (CAST('2002-02-19' AS DATE) - INTERVAL '30 DAY') AND (CAST('2002-02-19' AS DATE) + INTERVAL '30 DAY')",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_category = 'Jewelry' AND i_manager_id BETWEEN 61 AND 100",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "returns_cte": {
+        "type": "cte", 
+        "change": "added",
+        "sql": "SELECT cr_order_number, cr_item_sk, cr_refunded_cash FROM catalog_returns WHERE cr_reason_sk = 33",
+        "interfaces": {"outputs": ["cr_order_number", "cr_item_sk", "cr_refunded_cash"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT w.w_state, f.i_item_id, f.sales_before, f.sales_after FROM (SELECT cs.cs_warehouse_sk, i.i_item_id, SUM(CASE WHEN d.d_date < CAST('2002-02-19' AS DATE) THEN cs.cs_sales_price - COALESCE(cr.cr_refunded_cash,0) ELSE 0 END) AS sales_before, SUM(CASE WHEN d.d_date >= CAST('2002-02-19' AS DATE) THEN cs.cs_sales_price - COALESCE(cr.cr_refunded_cash,0) ELSE 0 END) AS sales_after FROM catalog_sales cs INNER JOIN date_cte d ON cs.cs_sold_date_sk = d.d_date_sk INNER JOIN item_cte i ON cs.cs_item_sk = i.i_item_sk LEFT JOIN returns_cte cr ON cs.cs_order_number = cr.cr_order_number AND cs.cs_item_sk = cr.cr_item_sk WHERE cs.cs_wholesale_cost BETWEEN 42 AND 61 GROUP BY cs.cs_warehouse_sk, i.i_item_id) f INNER JOIN warehouse w ON f.cs_warehouse_sk = w.w_warehouse_sk ORDER BY w.w_state, f.i_item_id LIMIT 100",
+        "interfaces": {"outputs": ["w_state", "i_item_id", "sales_before", "sales_after"], "consumes": ["date_cte", "item_cte", "returns_cte"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "item_cte", "returns_cte", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), item_cte AS ({item_cte}), returns_cte AS ({returns_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL max_parallel_workers_per_gather = 2",
+    "SET LOCAL work_mem = '32MB'",
+    "SET LOCAL enable_hashjoin = on",
+    "SET LOCAL enable_mergejoin = off",
+    "SET LOCAL enable_nestloop = off"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes**: Converted implicit comma joins to explicit joins with pre-filtered CTEs for date, item, and returns dimensions. Preserved all original filters and CASE guard logic while restructuring to match the target logical tree.
+
+**Expected speedup**: 15-30% due to reduced join cardinality from pre-filtered CTEs, explicit join ordering, and parallel aggregation enabled by avoiding CTE materialization on the fact table.
+
+**Runtime config rationale**:
+1. `max_parallel_workers_per_gather = 2`: Allow parallel aggregation on the filtered fact table (up to 2 workers within 8-worker global limit)
+2. `work_mem = '32MB'`: Single hash aggregation in subquery requires ~20MB for grouping ~100 distinct (warehouse,item) pairs
+3. `enable_hashjoin = on`: Hash joins optimal for filtered dimension tables
+4. `enable_mergejoin = off, enable_nestloop = off`: Disable suboptimal join methods for this size

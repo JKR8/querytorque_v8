@@ -1,0 +1,93 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]
+    ├── [CTE] date_cte  [+]  Cost: 0%  Rows: 61  — Filter date_dim for April-June 2002 range.
+    │   └── SCAN date_dim
+    ├── [CTE] addr_cte  [+]  Cost: 0%  Rows: 4,298  — Filter customer_address for WV state.
+    │   └── SCAN customer_address
+    ├── [CTE] call_cte  [+]  Cost: 0%  Rows: 11  — Filter call_center for specified counties.
+    │   └── SCAN call_center
+    ├── [CTE] warehouse_bitmap_cte  [+]  Cost: 100%  Rows: unknown  — Pre-compute multi-warehouse orders via GROUP BY HAVING inequality.
+    │   └── SCAN catalog_sales
+    ├── [CTE] filtered_fact  [+]  Cost: 0%  Rows: ~1,942  — Join catalog_sales with all dimension CTEs and warehouse_bitmap CTE.
+    │   └── JOIN (cs1.cs_ship_date_sk = date_cte.d_date_sk)
+    ├── [CTE] no_returns_filter  [+]  Cost: 0%  Rows: ~1,575  — Anti-join filtered_fact against catalog_returns.
+    │   └── FILTER (NOT EXISTS)
+    └── [OUTPUT] final_agg  [~]  Cost: 0%  Rows: 1  — Aggregate with COUNT(DISTINCT) and SUMs, preserve ORDER BY and LIMIT.
+        ├── AGGREGATE
+        ├── SORT (COUNT(DISTINCT cs_order_number) ASC)
+        └── LIMIT 100
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "decorrelate", "description": "Convert multi-warehouse EXISTS into pre-computed bitmap CTE with GROUP BY HAVING", "applied_to": ["warehouse_bitmap_cte"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Isolate dimension filters into separate CTEs to prevent cross-join explosion", "applied_to": ["date_cte", "addr_cte", "call_cte"]},
+    {"id": "R3", "type": "semantic_preservation", "description": "Maintain exact JOIN semantics: INNER for dimensions, SEMI for multi-warehouse, ANTI for returns", "applied_to": ["filtered_fact", "no_returns_filter"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '2002-4-01' AND (CAST('2002-4-01' AS DATE) + INTERVAL 60 DAY)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "addr_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_state = 'WV'",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "call_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cc_call_center_sk FROM call_center WHERE cc_county IN ('Ziebach County', 'Luce County', 'Richland County', 'Daviess County', 'Barrow County')",
+        "interfaces": {"outputs": ["cc_call_center_sk"], "consumes": []}
+      },
+      "warehouse_bitmap_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_order_number FROM catalog_sales GROUP BY cs_order_number HAVING MIN(cs_warehouse_sk) <> MAX(cs_warehouse_sk)",
+        "interfaces": {"outputs": ["cs_order_number"], "consumes": []}
+      },
+      "filtered_fact": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs1.cs_order_number, cs1.cs_ext_ship_cost, cs1.cs_net_profit FROM catalog_sales cs1 INNER JOIN date_cte ON cs1.cs_ship_date_sk = date_cte.d_date_sk INNER JOIN addr_cte ON cs1.cs_ship_addr_sk = addr_cte.ca_address_sk INNER JOIN call_cte ON cs1.cs_call_center_sk = call_cte.cc_call_center_sk INNER JOIN warehouse_bitmap_cte w ON cs1.cs_order_number = w.cs_order_number",
+        "interfaces": {"outputs": ["cs_order_number", "cs_ext_ship_cost", "cs_net_profit"], "consumes": ["date_cte", "addr_cte", "call_cte", "warehouse_bitmap_cte"]}
+      },
+      "no_returns_filter": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_order_number, cs_ext_ship_cost, cs_net_profit FROM filtered_fact WHERE NOT EXISTS (SELECT 1 FROM catalog_returns cr1 WHERE filtered_fact.cs_order_number = cr1.cr_order_number)",
+        "interfaces": {"outputs": ["cs_order_number", "cs_ext_ship_cost", "cs_net_profit"], "consumes": ["filtered_fact"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(DISTINCT cs_order_number) AS \"order count\", SUM(cs_ext_ship_cost) AS \"total shipping cost\", SUM(cs_net_profit) AS \"total net profit\" FROM no_returns_filter ORDER BY COUNT(DISTINCT cs_order_number) LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["no_returns_filter"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "addr_cte", "call_cte", "warehouse_bitmap_cte", "filtered_fact", "no_returns_filter", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), addr_cte AS ({addr_cte}), call_cte AS ({call_cte}), warehouse_bitmap_cte AS ({warehouse_bitmap_cte}), filtered_fact AS ({filtered_fact}), no_returns_filter AS ({no_returns_filter}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: The original query's multi-warehouse EXISTS (correlated subquery) is converted to a standalone CTE (`warehouse_bitmap_cte`) that pre-computes qualifying order numbers via GROUP BY HAVING. Dimension filters are isolated into separate CTEs to prevent cross-join explosions, while preserving exact INNER/SEMI/ANTI join semantics. The final aggregation preserves ORDER BY and LIMIT for exact output equivalence.
+
+**Expected speedup**: Moderate (2-3x) due to decorrelation of EXISTS and anti-join, but limited by the full table scan in `warehouse_bitmap_cte`. The rewrite avoids re-executing the multi-warehouse check per row, but scans the entire catalog_sales table once upfront.

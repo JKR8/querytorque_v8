@@ -1,0 +1,107 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Cost: 100%  Rows: 1
+    ├── [~] CTE: filtered_ws1_cte
+    │   ├── SCAN web_sales AS ws1
+    │   ├── INNER JOIN date_dim ON ws1.ws_ship_date_sk = d_date_sk
+    │   ├── INNER JOIN customer_address ON ws1.ws_ship_addr_sk = ca_address_sk
+    │   ├── INNER JOIN web_site ON ws1.ws_web_site_sk = web_site_sk
+    │   └── FILTER (d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY')
+    │       AND (ca_state IN ('CA','MI','OH','SD','TX','VA'))
+    │       AND (web_gmt_offset >= -5)
+    │       AND (ws1.ws_list_price BETWEEN 237 AND 266)
+    ├── [~] CTE: filtered_wr_cte
+    │   ├── SCAN web_returns AS wr1
+    │   ├── INNER JOIN filtered_ws1_cte ON wr1.wr_order_number = ws_order_number
+    │   └── FILTER (wr1.wr_reason_sk IN (7,25,26,52,69))
+    ├── [~] CTE: anti_join
+    │   ├── SCAN filtered_ws1_cte
+    │   └── ANTI-JOIN (NOT EXISTS) filtered_wr_cte ON filtered_wr_cte.wr_order_number = ws_order_number
+    ├── [~] CTE: semi_join
+    │   ├── SCAN anti_join
+    │   └── SEMI-JOIN (EXISTS) web_sales ws2 ON (ws2.ws_order_number = ws_order_number AND ws2.ws_warehouse_sk <> ws_warehouse_sk)
+    └── [~] AGGREGATE
+        ├── SCAN semi_join
+        ├── AGGREGATE: COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit)
+        ├── SORT (COUNT(DISTINCT ws_order_number) ASC)
+        └── LIMIT 100
+```
+
+**Tree Changes:**
+- `[!]` Changed from single-block implicit joins with correlated subqueries to explicit CTE pipeline per target tree
+- `[~]` Restructured web_sales filtering into CTE `filtered_ws1_cte`
+- `[~]` Pulled web_returns anti-join into CTE `filtered_wr_cte` with dependency on `filtered_ws1_cte`
+- `[~]` Implemented anti-join as NOT EXISTS between CTEs
+- `[~]` Implemented semi-join as EXISTS with web_sales self-join in CTE `semi_join`
+- `[~]` Final aggregation moved to main query scanning `semi_join` CTE
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL v16.11",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "cte_pipeline",
+      "description": "Restructured implicit joins and correlated subqueries into explicit CTE pipeline per target logical tree",
+      "applied_to": ["filtered_ws1_cte", "filtered_wr_cte", "anti_join", "semi_join", "aggregate"]
+    },
+    {
+      "id": "R2", 
+      "type": "early_filter_decorrelate",
+      "description": "Pushed dimension filters into initial CTE to reduce hash table sizes and decorrelated anti-join via CTE dependency",
+      "applied_to": ["filtered_ws1_cte", "filtered_wr_cte", "anti_join"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_ws1_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit, ws1.ws_warehouse_sk FROM web_sales ws1 INNER JOIN date_dim ON ws1.ws_ship_date_sk = date_dim.d_date_sk INNER JOIN customer_address ON ws1.ws_ship_addr_sk = customer_address.ca_address_sk INNER JOIN web_site ON ws1.ws_web_site_sk = web_site.web_site_sk WHERE date_dim.d_date BETWEEN '2002-9-01' AND CAST('2002-9-01' AS DATE) + INTERVAL '60 DAY' AND customer_address.ca_state IN ('CA','MI','OH','SD','TX','VA') AND web_site.web_gmt_offset >= -5 AND ws1.ws_list_price BETWEEN 237 AND 266",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit", "ws_warehouse_sk"], "consumes": []}
+      },
+      "filtered_wr_cte": {
+        "type": "cte", 
+        "change": "new",
+        "sql": "SELECT wr1.wr_order_number FROM web_returns wr1 INNER JOIN filtered_ws1_cte ON wr1.wr_order_number = filtered_ws1_cte.ws_order_number WHERE wr1.wr_reason_sk IN (7,25,26,52,69)",
+        "interfaces": {"outputs": ["wr_order_number"], "consumes": ["filtered_ws1_cte"]}
+      },
+      "anti_join": {
+        "type": "cte",
+        "change": "new", 
+        "sql": "SELECT ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk FROM filtered_ws1_cte WHERE NOT EXISTS (SELECT 1 FROM filtered_wr_cte WHERE filtered_wr_cte.wr_order_number = filtered_ws1_cte.ws_order_number)",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit", "ws_warehouse_sk"], "consumes": ["filtered_ws1_cte", "filtered_wr_cte"]}
+      },
+      "semi_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_order_number, ws_ext_ship_cost, ws_net_profit FROM anti_join WHERE EXISTS (SELECT 1 FROM web_sales ws2 WHERE ws2.ws_order_number = anti_join.ws_order_number AND ws2.ws_warehouse_sk <> anti_join.ws_warehouse_sk)",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": ["anti_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(DISTINCT ws_order_number) AS \"order count\", SUM(ws_ext_ship_cost) AS \"total shipping cost\", SUM(ws_net_profit) AS \"total net profit\" FROM semi_join ORDER BY COUNT(DISTINCT ws_order_number) LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["semi_join"]}
+      }
+    },
+    "reconstruction_order": ["filtered_ws1_cte", "filtered_wr_cte", "anti_join", "semi_join", "main_query"],
+    "assembly_template": "WITH filtered_ws1_cte AS ({filtered_ws1_cte}), filtered_wr_cte AS ({filtered_wr_cte}), anti_join AS ({anti_join}), semi_join AS ({semi_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured the implicit-join query with correlated EXISTS subqueries into an explicit CTE pipeline that follows the target logical tree: filter web_sales early, pre-join returns, apply anti-join via NOT EXISTS, then semi-join via EXISTS, and finally aggregate.
+
+**Expected speedup:** 1.2-1.5x due to reduced hash table sizes from early filtering and decorrelated anti-join, though self-join correlation remains.

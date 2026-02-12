@@ -1,0 +1,133 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_date  [+]  Cost: ~0%  Rows: ~1095
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year = 1999 AND d_qoy IN (1,2,3))
+│   └── OUTPUT (d_date_sk, d_qoy, d_year)
+├── [CTE] filtered_item  [+]  Cost: ~0%  Rows: 272
+│   ├── SCAN (item)
+│   ├── FILTER (i_color IN ('dark', 'puff') AND i_manager_id BETWEEN 15 AND 34)
+│   └── OUTPUT (i_item_sk)
+├── [CTE] filtered_ca  [+]  Cost: ~0%  Rows: ~?
+│   ├── SCAN (customer_address)
+│   ├── FILTER (ca_state IN ('KS', 'OH'))
+│   └── OUTPUT (ca_address_sk, ca_county)
+├── [CTE] ss_fact_join  [+]  Cost: ~?  Rows: ~?
+│   ├── SCAN (store_sales)
+│   ├── JOIN filtered_date (ss_sold_date_sk = d_date_sk)
+│   ├── JOIN filtered_item (ss_item_sk = i_item_sk)
+│   ├── JOIN filtered_ca (ss_addr_sk = ca_address_sk)
+│   ├── FILTER (ss_list_price BETWEEN 244 AND 258)
+│   └── OUTPUT (ca_county, d_qoy, d_year, ss_ext_sales_price)
+├── [CTE] ss_agg  [+]  Cost: ~?  Rows: ~98
+│   ├── SCAN (ss_fact_join)
+│   ├── AGG (GROUP BY ca_county, d_qoy, d_year)
+│   ├── AGGREGATE (SUM(ss_ext_sales_price) AS store_sales)
+│   └── OUTPUT (ca_county, d_qoy, d_year, store_sales)
+├── [CTE] ws_fact_join  [+]  Cost: ~?  Rows: ~?
+│   ├── SCAN (web_sales)
+│   ├── JOIN filtered_date (ws_sold_date_sk = d_date_sk)
+│   ├── JOIN filtered_item (ws_item_sk = i_item_sk)
+│   ├── JOIN filtered_ca (ws_bill_addr_sk = ca_address_sk)
+│   ├── FILTER (ws_list_price BETWEEN 244 AND 258)
+│   └── OUTPUT (ca_county, d_qoy, d_year, ws_ext_sales_price)
+├── [CTE] ws_agg  [+]  Cost: ~?  Rows: ~?
+│   ├── SCAN (ws_fact_join)
+│   ├── AGG (GROUP BY ca_county, d_qoy, d_year)
+│   ├── AGGREGATE (SUM(ws_ext_sales_price) AS web_sales)
+│   └── OUTPUT (ca_county, d_qoy, d_year, web_sales)
+└── [MAIN] main_pivoted  [~]  Cost: ~?  Rows: same as original
+    ├── PIVOT (ss_agg -> ss_q1, ss_q2, ss_q3)
+    ├── PIVOT (ws_agg -> ws_q1, ws_q2, ws_q3)
+    ├── JOIN (ss_pivot.ca_county = ws_pivot.ca_county)
+    ├── FILTER (ws_q2/ws_q1 > ss_q2/ss_q1 AND ws_q3/ws_q2 > ss_q3/ss_q2) with NULL guards
+    ├── COMPUTE (ratios with CASE WHEN denominator > 0)
+    ├── SORT (d_year)
+    └── OUTPUT (ca_county, d_year, web_q1_q2_increase, store_q1_q2_increase, web_q2_q3_increase, store_q2_q3_increase)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefetch_star", "description": "Pre-filter all three dimensions (date, item, customer_address) into materialized CTEs before joining to facts", "applied_to": ["filtered_date", "filtered_item", "filtered_ca"]},
+    {"id": "R2", "type": "explicit_join_syntax", "description": "Convert comma-separated joins to explicit INNER JOIN syntax for better cardinality estimation", "applied_to": ["ss_fact_join", "ws_fact_join"]},
+    {"id": "R3", "type": "staged_reduction", "description": "Create separate fact CTEs for each channel (store_sales, web_sales) that join pre-filtered dimensions", "applied_to": ["ss_fact_join", "ss_agg", "ws_fact_join", "ws_agg"]},
+    {"id": "R4", "type": "pivot_self_join", "description": "Replace 6-way self-join with conditional aggregation (pivot) on quarter columns, then single join", "applied_to": ["main_pivoted"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_qoy, d_year FROM date_dim WHERE d_year = 1999 AND d_qoy IN (1, 2, 3)",
+        "interfaces": {"outputs": ["d_date_sk", "d_qoy", "d_year"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk FROM item WHERE i_color IN ('dark', 'puff') AND i_manager_id BETWEEN 15 AND 34",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "filtered_ca": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ca_address_sk, ca_county FROM customer_address WHERE ca_state IN ('KS', 'OH')",
+        "interfaces": {"outputs": ["ca_address_sk", "ca_county"], "consumes": []}
+      },
+      "ss_fact_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT filtered_ca.ca_county, filtered_date.d_qoy, filtered_date.d_year, ss_ext_sales_price FROM store_sales INNER JOIN filtered_date ON store_sales.ss_sold_date_sk = filtered_date.d_date_sk INNER JOIN filtered_item ON store_sales.ss_item_sk = filtered_item.i_item_sk INNER JOIN filtered_ca ON store_sales.ss_addr_sk = filtered_ca.ca_address_sk WHERE ss_list_price BETWEEN 244 AND 258",
+        "interfaces": {"outputs": ["ca_county", "d_qoy", "d_year", "ss_ext_sales_price"], "consumes": ["filtered_date", "filtered_item", "filtered_ca"]}
+      },
+      "ss_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ca_county, d_qoy, d_year, SUM(ss_ext_sales_price) AS store_sales FROM ss_fact_join GROUP BY ca_county, d_qoy, d_year",
+        "interfaces": {"outputs": ["ca_county", "d_qoy", "d_year", "store_sales"], "consumes": ["ss_fact_join"]}
+      },
+      "ws_fact_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT filtered_ca.ca_county, filtered_date.d_qoy, filtered_date.d_year, ws_ext_sales_price FROM web_sales INNER JOIN filtered_date ON web_sales.ws_sold_date_sk = filtered_date.d_date_sk INNER JOIN filtered_item ON web_sales.ws_item_sk = filtered_item.i_item_sk INNER JOIN filtered_ca ON web_sales.ws_bill_addr_sk = filtered_ca.ca_address_sk WHERE ws_list_price BETWEEN 244 AND 258",
+        "interfaces": {"outputs": ["ca_county", "d_qoy", "d_year", "ws_ext_sales_price"], "consumes": ["filtered_date", "filtered_item", "filtered_ca"]}
+      },
+      "ws_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ca_county, d_qoy, d_year, SUM(ws_ext_sales_price) AS web_sales FROM ws_fact_join GROUP BY ca_county, d_qoy, d_year",
+        "interfaces": {"outputs": ["ca_county", "d_qoy", "d_year", "web_sales"], "consumes": ["ws_fact_join"]}
+      },
+      "main_pivoted": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ss.ca_county, 1999 AS d_year, CASE WHEN ws_q1 > 0 THEN ws_q2 / ws_q1 ELSE NULL END AS web_q1_q2_increase, CASE WHEN ss_q1 > 0 THEN ss_q2 / ss_q1 ELSE NULL END AS store_q1_q2_increase, CASE WHEN ws_q2 > 0 THEN ws_q3 / ws_q2 ELSE NULL END AS web_q2_q3_increase, CASE WHEN ss_q2 > 0 THEN ss_q3 / ss_q2 ELSE NULL END AS store_q2_q3_increase FROM (SELECT ca_county, MAX(CASE WHEN d_qoy = 1 THEN store_sales END) AS ss_q1, MAX(CASE WHEN d_qoy = 2 THEN store_sales END) AS ss_q2, MAX(CASE WHEN d_qoy = 3 THEN store_sales END) AS ss_q3 FROM ss_agg GROUP BY ca_county) ss INNER JOIN (SELECT ca_county, MAX(CASE WHEN d_qoy = 1 THEN web_sales END) AS ws_q1, MAX(CASE WHEN d_qoy = 2 THEN web_sales END) AS ws_q2, MAX(CASE WHEN d_qoy = 3 THEN web_sales END) AS ws_q3 FROM ws_agg GROUP BY ca_county) ws ON ss.ca_county = ws.ca_county WHERE (CASE WHEN ws_q1 > 0 THEN ws_q2 / ws_q1 ELSE NULL END) > (CASE WHEN ss_q1 > 0 THEN ss_q2 / ss_q1 ELSE NULL END) AND (CASE WHEN ws_q2 > 0 THEN ws_q3 / ws_q2 ELSE NULL END) > (CASE WHEN ss_q2 > 0 THEN ss_q3 / ss_q2 ELSE NULL END) ORDER BY d_year",
+        "interfaces": {"outputs": ["ca_county", "d_year", "web_q1_q2_increase", "store_q1_q2_increase", "web_q2_q3_increase", "store_q2_q3_increase"], "consumes": ["ss_agg", "ws_agg"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "filtered_ca", "ss_fact_join", "ss_agg", "ws_fact_join", "ws_agg", "main_pivoted"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), filtered_ca AS ({filtered_ca}), ss_fact_join AS ({ss_fact_join}), ss_agg AS ({ss_agg}), ws_fact_join AS ({ws_fact_join}), ws_agg AS ({ws_agg}) {main_pivoted}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL work_mem = '32MB'",
+    "SET LOCAL hash_mem_multiplier = 2.0",
+    "SET LOCAL enable_seqscan = off",
+    "SET LOCAL enable_nestloop = off"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes:** Replaced comma-separated joins with explicit INNER JOINs and pre-filtered dimension CTEs (following pg_dimension_prefetch_star pattern). The main query pivots quarter data via conditional aggregation instead of 6-way self-join, reducing join complexity from O(n²) to O(n). All defensive division-by-zero guards preserved.
+
+**Expected speedup:** 3-4x due to better hash join planning with tiny dimension CTEs and elimination of expensive self-join cross-product.

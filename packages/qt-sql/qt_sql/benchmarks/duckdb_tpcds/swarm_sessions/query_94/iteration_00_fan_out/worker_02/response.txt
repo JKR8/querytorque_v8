@@ -1,0 +1,96 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]
+    ├── [CTE] filtered_date  [+]
+    ├── [CTE] filtered_address  [+]
+    ├── [CTE] filtered_website  [+]
+    ├── [CTE] fact_prejoin  [~] (now joins three dimension CTEs sequentially)
+    ├── [CTE] multi_warehouse_set  [+] (from entire web_sales, not filtered_fact)
+    ├── [CTE] no_returns_set  [+] (from entire web_returns)
+    └── [CTE] final_join_aggregation  [~] (uses CTE-based semi/anti-joins)
+        ├── SEMI-JOIN (multi_warehouse_set)
+        ├── ANTI-JOIN (no_returns_set)
+        ├── AGGREGATE
+        ├── SORT (order count ASC)
+        └── LIMIT 100
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Replace cross-joined dimension tables with three separate filtered CTEs to avoid Cartesian explosion", "applied_to": ["filtered_date", "filtered_address", "filtered_website"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Pre-join dimension keys with fact table early to reduce data before semi/anti-joins", "applied_to": ["fact_prejoin"]},
+    {"id": "R3", "type": "exists_to_materialized_set", "description": "Convert EXISTS/NOT EXISTS to materialized CTEs for multi-warehouse and no-returns sets, preserving original semantics (multi-warehouse from entire web_sales)", "applied_to": ["multi_warehouse_set", "no_returns_set"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '2000-2-01' AND (CAST('2000-2-01' AS DATE) + INTERVAL 60 DAY)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_address": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_state = 'OK'",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "filtered_website": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT web_site_sk FROM web_site WHERE web_company_name = 'pri'",
+        "interfaces": {"outputs": ["web_site_sk"], "consumes": []}
+      },
+      "fact_prejoin": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk FROM web_sales ws1 JOIN filtered_date ON ws1.ws_ship_date_sk = filtered_date.d_date_sk JOIN filtered_address ON ws1.ws_ship_addr_sk = filtered_address.ca_address_sk JOIN filtered_website ON ws1.ws_web_site_sk = filtered_website.web_site_sk",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit", "ws_warehouse_sk"], "consumes": ["filtered_date", "filtered_address", "filtered_website"]}
+      },
+      "multi_warehouse_set": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws_order_number FROM web_sales GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk) > 1",
+        "interfaces": {"outputs": ["ws_order_number"], "consumes": []}
+      },
+      "no_returns_set": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT wr_order_number FROM web_returns GROUP BY wr_order_number",
+        "interfaces": {"outputs": ["wr_order_number"], "consumes": []}
+      },
+      "final_join_aggregation": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT COUNT(DISTINCT fp.ws_order_number) AS \"order count\", SUM(fp.ws_ext_ship_cost) AS \"total shipping cost\", SUM(fp.ws_net_profit) AS \"total net profit\" FROM fact_prejoin fp JOIN multi_warehouse_set mws ON fp.ws_order_number = mws.ws_order_number LEFT JOIN no_returns_set nrs ON fp.ws_order_number = nrs.wr_order_number WHERE nrs.wr_order_number IS NULL GROUP BY ()",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["fact_prejoin", "multi_warehouse_set", "no_returns_set"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT \"order count\", \"total shipping cost\", \"total net profit\" FROM final_join_aggregation ORDER BY \"order count\" LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["final_join_aggregation"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_address", "filtered_website", "fact_prejoin", "multi_warehouse_set", "no_returns_set", "final_join_aggregation", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_address AS ({filtered_address}), filtered_website AS ({filtered_website}), fact_prejoin AS ({fact_prejoin}), multi_warehouse_set AS ({multi_warehouse_set}), no_returns_set AS ({no_returns_set}), final_join_aggregation AS ({final_join_aggregation}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Changes & Mechanism
+**Changes:** Replaced the original cross-join of dimension tables with three separate filtered CTEs, then pre-joined them with the fact table. Converted the EXISTS/NOT EXISTS conditions to materialized CTE sets (multi_warehouse_set from entire web_sales, no_returns_set from entire web_returns) for predictable semi/anti-join behavior.
+
+**Expected speedup:** ~2-3x from dimension pre-filtering and fact reduction before expensive semi/anti-joins, while avoiding Cartesian explosion and preserving exact semantics.

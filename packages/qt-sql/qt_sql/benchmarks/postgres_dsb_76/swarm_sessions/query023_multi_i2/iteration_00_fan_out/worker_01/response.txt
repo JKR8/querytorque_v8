@@ -1,0 +1,201 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] store_sales_enriched  [+]  Cost: 15%  Rows: ~300K
+│   ├── SCAN (store_sales, date_dim (join), item (join), customer (left join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk AND d_year = 1999)
+│   ├── JOIN (ss_item_sk = i_item_sk AND i_manager_id BETWEEN 44 AND 63 AND i_category IN ('Men', 'Music', 'Sports'))
+│   ├── JOIN (ss_customer_sk = c_customer_sk AND c_birth_year BETWEEN 1987 AND 1993) [LEFT]
+│   └── OUTPUT (ss_item_sk, ss_sold_date_sk, d_date, i_item_desc, ss_customer_sk, c_birth_year, ss_quantity, ss_sales_price, ss_wholesale_cost)
+├── [CTE] frequent_ss_items  [~]  Cost: 5%  Rows: ~2
+│   ├── SCAN (store_sales_enriched)
+│   ├── GROUP BY (SUBSTRING(i_item_desc FROM 1 FOR 30), ss_item_sk, d_date)
+│   ├── FILTER (HAVING COUNT(*) > 4)
+│   └── OUTPUT (itemdesc, item_sk, solddate, cnt)
+├── [CTE] max_store_sales  [~]  Cost: 10%  Rows: 1
+│   ├── SCAN (store_sales_enriched)
+│   ├── FILTER (ss_wholesale_cost BETWEEN 26 AND 36)
+│   ├── GROUP BY (ss_customer_sk)
+│   └── OUTPUT (tpcds_cmax)
+├── [CTE] best_ss_customer  [~]  Cost: 40%  Rows: ~5504
+│   ├── SCAN (store_sales_enriched)
+│   ├── FILTER (c_birth_year BETWEEN 1987 AND 1993)
+│   ├── GROUP BY (ss_customer_sk)
+│   ├── FILTER (HAVING ssales > 0.95 * scalar_subquery)
+│   └── OUTPUT (c_customer_sk, ssales)
+└── [MAIN] main_query  [=]  Cost: 30%  Rows: ~10K
+    ├── SCAN (catalog_sales, date_dim, web_sales, frequent_ss_items, best_ss_customer)
+    ├── FILTER (d_year = 1999 AND d_moy = 5)
+    ├── FILTER (cs_wholesale_cost/ws_wholesale_cost BETWEEN 26 AND 36)
+    └── OUTPUT (SUM(sales))
+```
+
+**Changes:**
+- Added `store_sales_enriched` CTE that materializes the base store_sales scan with dimension joins once
+- Modified `frequent_ss_items`, `max_store_sales`, and `best_ss_customer` to all consume from the shared CTE
+- Preserved exact filter semantics and column requirements for downstream consumers
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "shared_materialization",
+      "description": "Materialize store_sales scan once with dimension joins, then derive multiple aggregates from same result",
+      "applied_to": ["store_sales_enriched", "frequent_ss_items", "max_store_sales", "best_ss_customer"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "store_sales_enriched": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_item_sk, ss_sold_date_sk, d_date, i_item_desc, ss_customer_sk, c_birth_year, ss_quantity, ss_sales_price, ss_wholesale_cost FROM store_sales INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999 INNER JOIN item ON ss_item_sk = i_item_sk AND i_manager_id BETWEEN 44 AND 63 AND i_category IN ('Men', 'Music', 'Sports') LEFT JOIN customer ON ss_customer_sk = c_customer_sk AND c_birth_year BETWEEN 1987 AND 1993",
+        "interfaces": {
+          "outputs": ["ss_item_sk", "ss_sold_date_sk", "d_date", "i_item_desc", "ss_customer_sk", "c_birth_year", "ss_quantity", "ss_sales_price", "ss_wholesale_cost"],
+          "consumes": []
+        }
+      },
+      "frequent_ss_items": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT SUBSTRING(i_item_desc FROM 1 FOR 30) AS itemdesc, ss_item_sk AS item_sk, d_date AS solddate, COUNT(*) AS cnt FROM store_sales_enriched GROUP BY SUBSTRING(i_item_desc FROM 1 FOR 30), ss_item_sk, d_date HAVING COUNT(*) > 4",
+        "interfaces": {
+          "outputs": ["itemdesc", "item_sk", "solddate", "cnt"],
+          "consumes": ["store_sales_enriched"]
+        }
+      },
+      "max_store_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT MAX(csales) AS tpcds_cmax FROM (SELECT ss_customer_sk, SUM(ss_quantity * ss_sales_price) AS csales FROM store_sales_enriched WHERE ss_wholesale_cost BETWEEN 26 AND 36 GROUP BY ss_customer_sk) tmp1",
+        "interfaces": {
+          "outputs": ["tpcds_cmax"],
+          "consumes": ["store_sales_enriched"]
+        }
+      },
+      "best_ss_customer": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_customer_sk AS c_customer_sk, SUM(ss_quantity * ss_sales_price) AS ssales FROM store_sales_enriched WHERE c_birth_year BETWEEN 1987 AND 1993 GROUP BY ss_customer_sk HAVING SUM(ss_quantity * ss_sales_price) > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales)",
+        "interfaces": {
+          "outputs": ["c_customer_sk", "ssales"],
+          "consumes": ["store_sales_enriched", "max_store_sales"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {
+          "outputs": ["sum"],
+          "consumes": ["frequent_ss_items", "best_ss_customer"]
+        }
+      }
+    },
+    "reconstruction_order": ["store_sales_enriched", "frequent_ss_items", "max_store_sales", "best_ss_customer", "main_query"],
+    "assembly_template": "WITH store_sales_enriched AS ({store_sales_enriched}), frequent_ss_items AS ({frequent_ss_items}), max_store_sales AS ({max_store_sales}), best_ss_customer AS ({best_ss_customer}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL work_mem = '64MB'",
+    "SET LOCAL hash_mem_multiplier = 2.0",
+    "SET LOCAL max_parallel_workers_per_gather = 2",
+    "SET LOCAL parallel_tuple_cost = 0.001"
+  ],
+  "validation_checks": []
+}
+```
+
+## Final SQL
+
+```sql
+WITH store_sales_enriched AS (
+  SELECT 
+    ss_item_sk, 
+    ss_sold_date_sk, 
+    d_date, 
+    i_item_desc, 
+    ss_customer_sk, 
+    c_birth_year, 
+    ss_quantity, 
+    ss_sales_price, 
+    ss_wholesale_cost
+  FROM store_sales
+  INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk AND d_year = 1999
+  INNER JOIN item ON ss_item_sk = i_item_sk 
+    AND i_manager_id BETWEEN 44 AND 63 
+    AND i_category IN ('Men', 'Music', 'Sports')
+  LEFT JOIN customer ON ss_customer_sk = c_customer_sk 
+    AND c_birth_year BETWEEN 1987 AND 1993
+),
+frequent_ss_items AS (
+  SELECT 
+    SUBSTRING(i_item_desc FROM 1 FOR 30) AS itemdesc,
+    ss_item_sk AS item_sk,
+    d_date AS solddate,
+    COUNT(*) AS cnt
+  FROM store_sales_enriched
+  GROUP BY SUBSTRING(i_item_desc FROM 1 FOR 30), ss_item_sk, d_date
+  HAVING COUNT(*) > 4
+),
+max_store_sales AS (
+  SELECT MAX(csales) AS tpcds_cmax
+  FROM (
+    SELECT 
+      ss_customer_sk,
+      SUM(ss_quantity * ss_sales_price) AS csales
+    FROM store_sales_enriched
+    WHERE ss_wholesale_cost BETWEEN 26 AND 36
+    GROUP BY ss_customer_sk
+  ) tmp1
+),
+best_ss_customer AS (
+  SELECT 
+    ss_customer_sk AS c_customer_sk,
+    SUM(ss_quantity * ss_sales_price) AS ssales
+  FROM store_sales_enriched
+  WHERE c_birth_year BETWEEN 1987 AND 1993
+  GROUP BY ss_customer_sk
+  HAVING SUM(ss_quantity * ss_sales_price) > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales)
+)
+SELECT SUM(sales)
+FROM (
+  SELECT cs_quantity * cs_list_price AS sales
+  FROM catalog_sales
+  INNER JOIN date_dim ON cs_sold_date_sk = d_date_sk
+  WHERE d_year = 1999
+    AND d_moy = 5
+    AND cs_item_sk IN (SELECT item_sk FROM frequent_ss_items)
+    AND cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer)
+    AND cs_wholesale_cost BETWEEN 26 AND 36
+  UNION ALL
+  SELECT ws_quantity * ws_list_price AS sales
+  FROM web_sales
+  INNER JOIN date_dim ON ws_sold_date_sk = d_date_sk
+  WHERE d_year = 1999
+    AND d_moy = 5
+    AND ws_item_sk IN (SELECT item_sk FROM frequent_ss_items)
+    AND ws_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer)
+    AND ws_wholesale_cost BETWEEN 26 AND 36
+) tmp2
+LIMIT 100;
+```
+
+**Changes:** Materialized the store_sales scan once with all dimension joins, then derived three separate aggregates from that shared result. This eliminates three separate store_sales scans while preserving exact semantics.
+
+**Expected speedup:** 2-3x by reducing I/O and join overhead from repeated scans.
+
+**Runtime config rationale:**
+- `work_mem = '64MB'`: For hash aggregates on `store_sales_enriched` (~300K rows)
+- `hash_mem_multiplier = 2.0`: Amplify hash memory for the large fact table joins
+- `max_parallel_workers_per_gather = 2`: Maintain parallelism on fact table scans
+- `parallel_tuple_cost = 0.001`: Encourage parallel plans for the materialized CTE

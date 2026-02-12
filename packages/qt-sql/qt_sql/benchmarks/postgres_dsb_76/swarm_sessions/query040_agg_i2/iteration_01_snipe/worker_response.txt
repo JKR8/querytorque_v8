@@ -1,0 +1,80 @@
+## Part 1: Modified Logic Tree
+
+```
+[=] Original query structure
+[~] catalog_returns join semantics correction
+    |- Change: Convert implicit LEFT JOIN with WHERE filter to explicit INNER JOIN
+    |- Reason: cr_reason_sk=40 in WHERE converts LEFT JOIN to effective INNER JOIN
+[+] date_filter CTE (pre-filtered)
+    |- Selects: d_date_sk, d_date
+    |- Filter: d_date between (2002-02-20 - 30 days) and (2002-02-20 + 30 days)
+[+] item_filter CTE (pre-filtered)  
+    |- Selects: i_item_sk, i_item_id
+    |- Filter: i_category = 'Shoes' AND i_manager_id BETWEEN 42 AND 81
+[~] Main query restructured
+    |- FROM: catalog_sales INNER JOIN date_filter ON cs_sold_date_sk = d_date_sk
+    |- INNER JOIN item_filter ON cs_item_sk = i_item_sk  
+    |- INNER JOIN catalog_returns ON (cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk AND cr_reason_sk = 40)
+    |- INNER JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk
+    |- WHERE: cs_wholesale_cost BETWEEN 68 AND 87
+    |- Aggregation: Group by w_state, i_item_id with CASE expressions
+    |- Preserve: COALESCE(cr_refunded_cash,0) for safety
+    |- ORDER BY: w_state, i_item_id
+    |- LIMIT: 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pg_dimension_prefetch_star", "description": "Pre-filter selective dimensions into CTEs to reduce fact table probe size", "applied_to": ["date_filter", "item_filter"]},
+    {"id": "R2", "type": "join_semantics_correction", "description": "Convert implicit LEFT JOIN with WHERE filter to explicit INNER JOIN for catalog_returns (cr_reason_sk=40 forces match)", "applied_to": ["main_query"]},
+    {"id": "R3", "type": "explicit_join_syntax", "description": "Convert comma-joins to explicit JOIN...ON syntax for better PostgreSQL cost estimation", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN (CAST('2002-02-20' AS DATE) - INTERVAL '30 DAY') AND (CAST('2002-02-20' AS DATE) + INTERVAL '30 DAY')",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "item_filter": {
+        "type": "cte", 
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_category = 'Shoes' AND i_manager_id BETWEEN 42 AND 81",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT w.w_state, i.i_item_id, SUM(CASE WHEN (CAST(d.d_date AS DATE) < CAST('2002-02-20' AS DATE)) THEN cs.cs_sales_price - COALESCE(cr.cr_refunded_cash,0) ELSE 0 END) AS sales_before, SUM(CASE WHEN (CAST(d.d_date AS DATE) >= CAST('2002-02-20' AS DATE)) THEN cs.cs_sales_price - COALESCE(cr.cr_refunded_cash,0) ELSE 0 END) AS sales_after FROM catalog_sales cs INNER JOIN date_filter d ON cs.cs_sold_date_sk = d.d_date_sk INNER JOIN item_filter i ON cs.cs_item_sk = i.i_item_sk INNER JOIN catalog_returns cr ON (cs.cs_order_number = cr.cr_order_number AND cs.cs_item_sk = cr.cr_item_sk AND cr.cr_reason_sk = 40) INNER JOIN warehouse w ON cs.cs_warehouse_sk = w.w_warehouse_sk WHERE cs.cs_wholesale_cost BETWEEN 68 AND 87 GROUP BY w.w_state, i.i_item_id ORDER BY w.w_state, i.i_item_id LIMIT 100",
+        "interfaces": {"outputs": ["w_state", "i_item_id", "sales_before", "sales_after"], "consumes": ["date_filter", "item_filter"]}
+      }
+    },
+    "reconstruction_order": ["date_filter", "item_filter", "main_query"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), item_filter AS ({item_filter}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL enable_nestloop = off",
+    "SET LOCAL work_mem = '256MB'",
+    "SET LOCAL hash_mem_multiplier = 2.0",
+    "SET LOCAL max_parallel_workers_per_gather = 2"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes**: 
+1. Fixed join semantics: The original LEFT JOIN with `cr_reason_sk = 40` in WHERE effectively requires a match, making it an INNER JOIN. Converting to explicit INNER JOIN eliminates null-check overhead.
+2. Pre-filtered date_dim and item into CTEs before joining to catalog_sales, reducing the probe size from ~15K rows to near-zero early.
+3. Used explicit JOIN syntax instead of comma-joins for better PostgreSQL cost estimation and join reordering.
+
+**Expected speedup**: ~3-5x. The main bottleneck was scanning catalog_sales before applying item filters. By pre-filtering both dimensions and using correct join semantics, we reduce catalog_sales probes dramatically. Runtime config encourages hash joins and parallel execution.

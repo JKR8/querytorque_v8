@@ -1,0 +1,86 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query [~] Cost: 100% Rows: ~1K — Join store sales with household demographics, time, and store; apply hour/minute, dependent-count, and store-name filters; and return total qualifying row count.
+    ├── [~] SCAN (store_sales, household_demographics (join), time_dim (join), store (join))
+    │   ├── [+] WITH filtered_time AS (SELECT t_time_sk FROM time_dim WHERE t_hour = 8 AND t_minute >= 30)
+    │   ├── [~] JOIN store_sales INNER JOIN filtered_time ON ss_sold_time_sk = t_time_sk
+    │   ├── [~] JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk
+    │   └── [~] JOIN store ON ss_store_sk = s_store_sk
+    ├── [~] FILTER (household_demographics.hd_dep_count = 3)
+    ├── [~] FILTER (store.s_store_name = 'ese')
+    ├── [+] AGGREGATE (COUNT(*) as cnt)
+    ├── [+] ORDER BY (cnt ASC)
+    └── [+] OUTPUT (cnt as "count(*)")
+```
+
+**Changes:**
+- **[+]** Added filtered_time CTE isolating time_dim scan with t_hour=8, t_minute>=30
+- **[~]** Restructured joins: store_sales joins sequentially with filtered_time, then household_demographics, then store
+- **[~]** Moved household_demographics and store filters to WHERE clause in main join
+- **[+]** Added explicit aggregate step (COUNT(*) as cnt)
+- **[+]** Added ORDER BY cnt ASC and LIMIT 100
+- **[~]** Output column renamed to match original (cnt as "count(*)")
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Isolate time_dim filter into separate CTE to create small hash table for join", "applied_to": ["filtered_time"]},
+    {"id": "R2", "type": "sequential_fact_join", "description": "Join fact table sequentially with dimension CTEs instead of cross-joining dimensions", "applied_to": ["main_join"]},
+    {"id": "R3", "type": "early_filter", "description": "Apply dimension filters in CTE WHERE clauses before joining to fact table", "applied_to": ["main_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_time": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT t_time_sk FROM time_dim WHERE t_hour = 8 AND t_minute >= 30",
+        "interfaces": {"outputs": ["t_time_sk"], "consumes": []}
+      },
+      "main_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT 1 AS join_key FROM store_sales INNER JOIN filtered_time ON ss_sold_time_sk = t_time_sk INNER JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk INNER JOIN store ON ss_store_sk = s_store_sk WHERE household_demographics.hd_dep_count = 3 AND store.s_store_name = 'ese'",
+        "interfaces": {"outputs": ["join_key"], "consumes": ["filtered_time"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT COUNT(*) AS cnt FROM main_join",
+        "interfaces": {"outputs": ["cnt"], "consumes": ["main_join"]}
+      },
+      "limit": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cnt FROM aggregate ORDER BY cnt ASC LIMIT 100",
+        "interfaces": {"outputs": ["cnt"], "consumes": ["aggregate"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT cnt AS \"count(*)\" FROM limit",
+        "interfaces": {"outputs": ["count(*)"], "consumes": ["limit"]}
+      }
+    },
+    "reconstruction_order": ["filtered_time", "main_join", "aggregate", "limit", "main_query"],
+    "assembly_template": "WITH filtered_time AS ({filtered_time}), main_join AS ({main_join}), aggregate AS ({aggregate}), limit AS ({limit}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": [
+    {"check": "output_columns_match", "expected": ["count(*)"], "actual": ["count(*)"]},
+    {"check": "semantic_equivalence", "description": "Count must equal original: store sales at 8:30+ with household dependent count 3 in store 'ese'"}
+  ]
+}
+```
+
+**Changes:** Structural transformation from single-table join to CTE-based pipeline with dimension isolation. The mechanism creates small filtered dimension sets (time_dim: ~1,800 rows) before joining to the large fact table, reducing hash table build cost and enabling predicate pushdown. Sequential joins prevent Cartesian explosion risk.
+
+**Expected speedup:** ~2-3x based on similar patterns (date_cte_isolate showed 4x, but baseline 301ms suggests CTE overhead is acceptable). Key benefits: small hash tables for filtered_time, early reduction of fact scan via surrogate key joins.

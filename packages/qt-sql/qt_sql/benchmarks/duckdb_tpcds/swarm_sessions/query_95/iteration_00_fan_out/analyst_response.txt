@@ -1,0 +1,277 @@
+<reasoning>
+Step 1: CLASSIFY
+Archetype: Star-join with late dimension filters, plus two semi-join conditions that are both based on the same CTE (ws_wh). The CTE is a self-join to find orders spanning multiple warehouses. The main query filters web_sales by date range, state, and company, then requires orders to be in the multi-warehouse set AND in the set of returned orders that are also multi-warehouse. This is a star-join (web_sales with date_dim, customer_address, web_site) with two semi-joins referencing the same CTE.
+
+Step 2: EXPLAIN PLAN ANALYSIS
+Total time: 4776ms. Key bottlenecks:
+- Two HASH_JOIN INNER nodes computing ws_wh (self-join): each ~1.3s, 28-29% each. They scan web_sales twice (7.2M rows each) and produce 74.8M rows. The CTE is computed TWICE (once for each IN subquery), not materialized and reused.
+- HASH_JOIN RIGHT_SEMI for first IN subquery: 1244.8ms (26%) - joins the CTE with web_returns (74.8M rows) then semi-joins with web_sales (7.2M rows).
+- HASH_JOIN RIGHT_SEMI for second IN subquery: 280.2ms (6%) - joins the CTE with filtered web_sales (9,956 rows).
+- The dimension filters (date, customer_address, web_site) are applied late in the second branch, reducing web_sales to 9,956 rows.
+- Row counts: web_sales base scan 86.4M rows, filtered to 303K after date+customer+website? Actually, the plan shows SEQ_SCAN web_sales [303K of 86.4M rows] after joining with customer_address and date_dim. This is the filtered set for the second branch.
+- The optimizer already converts IN to RIGHT_SEMI joins and pushes filters into scans (e.g., customer_address filter pushed). But it does NOT share the CTE computation across the two IN subqueries.
+
+Step 3: GAP MATCHING
+- Gap: REDUNDANT_SCAN_ELIMINATION - The same CTE pattern (self-join on web_sales) is computed twice. Opportunity: consolidate into one materialized CTE.
+- Gap: CROSS_CTE_PREDICATE_BLINDNESS - The CTE ws_wh is computed on the entire web_sales, but the main query filters web_sales by date, state, company. Could we push those filters into the CTE? No, because the CTE is defined independently. However, we could pre-filter web_sales by those dimensions and then compute the CTE on the filtered set? That would change semantics because the CTE must consider ALL web_sales rows for multi-warehouse detection, not just those matching the filters. So this gap does NOT apply.
+- Gap: CORRELATED_SUBQUERY_PARALYSIS - The two IN subqueries are not correlated; they are already decorrelated by the optimizer into semi-joins. So this gap does NOT apply.
+- Gap: CROSS_COLUMN_OR_DECOMPOSITION - No OR conditions.
+
+Step 4: AGGREGATION TRAP CHECK
+Aggregates: count(distinct ws_order_number), sum(ws_ext_ship_cost), sum(ws_net_profit). No grouping-sensitive aggregates. The two IN subqueries act as filters; they do not affect aggregation except by filtering rows. Changing CTE materialization or restructuring filters must preserve the same set of rows for aggregation.
+
+Step 5: TRANSFORM SELECTION
+Ranked opportunities:
+1. Materialize the CTE ws_wh once and reuse for both IN subqueries (redundant scan elimination). Historical: materialize_cte (1.37x on Q95). This directly addresses the double computation.
+2. Pre-filter dimensions (date, customer_address, web_site) into CTEs and join with web_sales early (star_join_prefetch). This reduces the web_sales rows before the semi-joins. Historical: dimension_cte_isolate (1.93x), prefetch_fact_join (3.77x). The plan shows the second branch already does this partially, but we can restructure to apply these filters earlier and share across both branches.
+3. Rewrite the CTE using GROUP BY instead of self-join (self_join_elimination). The CTE currently uses a self-join to detect multiple warehouses. Could be replaced with GROUP BY ws_order_number HAVING MIN(ws_warehouse_sk) <> MAX(ws_warehouse_sk). This eliminates the Cartesian product.
+4. Combine the two IN conditions into one (semantic rewrite). Notice the second IN condition already implies the first: if an order is in web_returns and in ws_wh, then it must be in ws_wh. So the first IN condition is redundant. Removing it eliminates one semi-join. This is a semantic rewrite, not in the catalog but valid.
+
+Step 6: LOGICAL TREE DESIGN
+We'll design 4 strategies:
+Worker 1: Materialize CTE and reuse (materialize_cte).
+Worker 2: Pre-filter dimensions into CTEs, then join with web_sales, then apply semi-joins with materialized CTE (star_join_prefetch).
+Worker 3: Rewrite CTE with GROUP BY and materialize (self_join_elimination).
+Worker 4: (Exploration) Combine semantic rewrite (remove redundant IN) with materialized CTE and dimension pre-filtering (compound_strategy).
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: For NC shipments during 60 days from 1999-02-01 on 'pri' company sites, report order count, shipping cost, and net profit for orders that (a) involve multiple warehouses AND (b) have a return that also involves multiple warehouses. JOIN semantics: INNER joins require all dimension matches; two semi-joins (IN subqueries) require order to be in both sets. Aggregation traps: COUNT(DISTINCT ws_order_number) counts distinct orders after filtering; SUMs are duplicate-safe because joins are on ws_order_number which is unique per order? Actually, web_sales may have multiple line items per order, but we aggregate after joins, so duplicates could affect SUMs. Need to ensure no duplicate inflation. Filter dependencies: The date filter depends on d_date_sk join; state and company filters depend on ca_address_sk and web_site_sk joins; the two IN subqueries depend on the CTE ws_wh.
+
+BOTTLENECK_DIAGNOSIS: Dominant cost is computing the CTE ws_wh twice via self-join (two 1.3s HASH_JOIN INNER nodes, 58% total). Each self-join scans web_sales twice (7.2M rows each) and produces 74.8M rows. This is scan-bound and join-bound. Cardinality flow: web_sales 86.4M → filtered by date+state+company to 9,956 rows (second branch). The optimizer already pushes filters into scans and converts IN to semi-joins, but fails to share CTE computation across the two IN subqueries. Logical-tree cost percentages (50% each) are misleading; EXPLAIN shows CTE computation dominates.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output exactly three columns: "order count", "total shipping cost", "total net profit".
+- CTE_COLUMN_COMPLETENESS: Any CTE must include ws_order_number for semi-joins, plus ws_ext_ship_cost and ws_net_profit for aggregation.
+- LITERAL_PRESERVATION: Must preserve date '1999-2-01', interval 60, state 'NC', company 'pri'.
+- SEMANTIC_EQUIVALENCE: Must return same rows and aggregates.
+- ENGINE_GAP_REDUNDANT_SCAN_ELIMINATION: CTE ws_wh computed twice (two HASH_JOIN INNER nodes in EXPLAIN).
+- ENGINE_GAP_CROSS_CTE_PREDICATE_BLINDNESS: Dimension filters applied late; opportunity to pre-filter dimensions into CTEs.
+
+REGRESSION_WARNINGS:
+1. materialize_cte (0.54x on q95):
+   CAUSE: Decomposed tightly-correlated EXISTS/NOT EXISTS into independent CTEs, severing cardinality relationship.
+   RULE: Do not split the two IN conditions into independent CTEs; keep them as semi-joins on the same materialized CTE.
+2. dimension_cte_isolate (0.0076x on q26):
+   CAUSE: Cross-joined 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially with fact table.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: materialize_cte
+TARGET_LOGICAL_TREE:
+  ws_wh (materialized) -> filtered_ws (join dims) -> semi_join1 (IN) -> semi_join2 (IN) -> aggregate
+NODE_CONTRACTS:
+  ws_wh:
+    FROM: web_sales ws1, web_sales ws2
+    JOIN: ws1.ws_order_number = ws2.ws_order_number
+    WHERE: ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk
+    OUTPUT: ws_order_number
+    EXPECTED_ROWS: ~1K (from logical tree)
+    CONSUMERS: semi_join1, semi_join2
+  filtered_ws:
+    FROM: web_sales ws1, date_dim, customer_address, web_site
+    JOIN: ws1.ws_ship_date_sk = d_date_sk AND ws1.ws_ship_addr_sk = ca_address_sk AND ws1.ws_web_site_sk = web_site_sk
+    WHERE: d_date BETWEEN '1999-2-01' AND (CAST('1999-2-01' AS DATE) + INTERVAL 60 DAY) AND ca_state = 'NC' AND web_company_name = 'pri'
+    OUTPUT: ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit
+    EXPECTED_ROWS: 9,956 (from EXPLAIN)
+    CONSUMERS: semi_join1, semi_join2, aggregate
+  semi_join1:
+    FROM: filtered_ws
+    WHERE: ws_order_number IN (SELECT ws_order_number FROM ws_wh)
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: 7,217 (from EXPLAIN)
+    CONSUMERS: semi_join2
+  semi_join2:
+    FROM: semi_join1
+    WHERE: ws_order_number IN (SELECT wr_order_number FROM web_returns WHERE wr_order_number IN (SELECT ws_order_number FROM ws_wh))
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: ~1K (estimated)
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: semi_join2
+    AGGREGATE: COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit"
+    OUTPUT: "order count", "total shipping cost", "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final
+EXAMPLES: materialize_cte, prefetch_fact_join, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- materialize_cte: Apply CTE materialization of ws_wh; ignore the EXISTS conversion (this query uses IN).
+- prefetch_fact_join: Ignore the CTE chain; we are only materializing ws_wh.
+- dimension_cte_isolate: Ignore the dimension pre-filtering; we keep the original join order.
+HAZARD_FLAGS:
+- The CTE ws_wh may be large (74.8M rows in original self-join). Materializing it could spill to disk.
+- DuckDB may inline the CTE if referenced only once? We reference it twice, so it should materialize.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_filter -> ca_filter -> web_filter -> prefetch_ws (join filters with web_sales) -> ws_wh (materialized) -> semi_joins -> aggregate
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '1999-2-01' AND (CAST('1999-2-01' AS DATE) + INTERVAL 60 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 61 (from EXPLAIN)
+    CONSUMERS: prefetch_ws
+  ca_filter:
+    FROM: customer_address
+    WHERE: ca_state = 'NC'
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 7,827 (from EXPLAIN)
+    CONSUMERS: prefetch_ws
+  web_filter:
+    FROM: web_site
+    WHERE: web_company_name = 'pri'
+    OUTPUT: web_site_sk
+    EXPECTED_ROWS: 7 (from EXPLAIN)
+    CONSUMERS: prefetch_ws
+  prefetch_ws:
+    FROM: web_sales ws1, date_filter, ca_filter, web_filter
+    JOIN: ws1.ws_ship_date_sk = date_filter.d_date_sk AND ws1.ws_ship_addr_sk = ca_filter.ca_address_sk AND ws1.ws_web_site_sk = web_filter.web_site_sk
+    OUTPUT: ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit
+    EXPECTED_ROWS: 9,956 (from EXPLAIN)
+    CONSUMERS: semi_join1, semi_join2
+  ws_wh:
+    FROM: web_sales ws1, web_sales ws2
+    JOIN: ws1.ws_order_number = ws2.ws_order_number
+    WHERE: ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk
+    OUTPUT: ws_order_number
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: semi_join1, semi_join2
+  semi_join1:
+    FROM: prefetch_ws
+    WHERE: ws_order_number IN (SELECT ws_order_number FROM ws_wh)
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: 7,217
+    CONSUMERS: semi_join2
+  semi_join2:
+    FROM: semi_join1
+    WHERE: ws_order_number IN (SELECT wr_order_number FROM web_returns WHERE wr_order_number IN (SELECT ws_order_number FROM ws_wh))
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: semi_join2
+    AGGREGATE: COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit"
+    OUTPUT: "order count", "total shipping cost", "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final
+EXAMPLES: prefetch_fact_join, dimension_cte_isolate, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply the CTE chain: filter dimensions, pre-join with web_sales. Ignore the aggregation pushdown.
+- dimension_cte_isolate: Pre-filter all three dimensions into CTEs. Ignore the cross-join warning.
+- date_cte_isolate: Extract date filter into CTE; apply to this query.
+HAZARD_FLAGS:
+- Cross-joining three dimension CTEs with web_sales may cause the optimizer to choose a suboptimal join order.
+- The ws_wh CTE is still computed on the entire web_sales, not the filtered set.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: self_join_elimination
+TARGET_LOGICAL_TREE:
+  ws_wh_grouped (GROUP BY) -> filtered_ws (join dims) -> semi_joins -> aggregate
+NODE_CONTRACTS:
+  ws_wh_grouped:
+    FROM: web_sales
+    GROUP BY: ws_order_number
+    HAVING: MIN(ws_warehouse_sk) <> MAX(ws_warehouse_sk)
+    OUTPUT: ws_order_number
+    EXPECTED_ROWS: ~1K (same as original ws_wh)
+    CONSUMERS: semi_join1, semi_join2
+  filtered_ws:
+    FROM: web_sales ws1, date_dim, customer_address, web_site
+    JOIN: ws1.ws_ship_date_sk = d_date_sk AND ws1.ws_ship_addr_sk = ca_address_sk AND ws1.ws_web_site_sk = web_site_sk
+    WHERE: d_date BETWEEN '1999-2-01' AND (CAST('1999-2-01' AS DATE) + INTERVAL 60 DAY) AND ca_state = 'NC' AND web_company_name = 'pri'
+    OUTPUT: ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit
+    EXPECTED_ROWS: 9,956
+    CONSUMERS: semi_join1, semi_join2, aggregate
+  semi_join1:
+    FROM: filtered_ws
+    WHERE: ws_order_number IN (SELECT ws_order_number FROM ws_wh_grouped)
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: 7,217
+    CONSUMERS: semi_join2
+  semi_join2:
+    FROM: semi_join1
+    WHERE: ws_order_number IN (SELECT wr_order_number FROM web_returns WHERE wr_order_number IN (SELECT ws_order_number FROM ws_wh_grouped))
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: semi_join2
+    AGGREGATE: COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit"
+    OUTPUT: "order count", "total shipping cost", "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final
+EXAMPLES: SELF_JOIN_TO_WINDOW, materialize_cte, union_cte_split
+EXAMPLE_ADAPTATION:
+- SELF_JOIN_TO_WINDOW: Replace self-join with GROUP BY HAVING MIN <> MAX. Ignore window function aspect.
+- materialize_cte: Materialize the grouped CTE to share across semi-joins.
+- union_cte_split: Not applicable; ignore the split by discriminator.
+HAZARD_FLAGS:
+- GROUP BY on 86.4M row web_sales may be expensive, but should be cheaper than self-join producing 74.8M rows.
+- Need to ensure HAVING MIN <> MAX correctly identifies orders with at least two different warehouses (including NULL handling). ws_warehouse_sk is likely NOT NULL.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_semantic_prefetch
+TARGET_LOGICAL_TREE:
+  date_filter -> ca_filter -> web_filter -> prefetch_ws -> ws_wh_grouped -> single_semi_join (combined condition) -> aggregate
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '1999-2-01' AND (CAST('1999-2-01' AS DATE) + INTERVAL 60 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 61
+    CONSUMERS: prefetch_ws
+  ca_filter:
+    FROM: customer_address
+    WHERE: ca_state = 'NC'
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 7,827
+    CONSUMERS: prefetch_ws
+  web_filter:
+    FROM: web_site
+    WHERE: web_company_name = 'pri'
+    OUTPUT: web_site_sk
+    EXPECTED_ROWS: 7
+    CONSUMERS: prefetch_ws
+  prefetch_ws:
+    FROM: web_sales ws1, date_filter, ca_filter, web_filter
+    JOIN: ws1.ws_ship_date_sk = date_filter.d_date_sk AND ws1.ws_ship_addr_sk = ca_filter.ca_address_sk AND ws1.ws_web_site_sk = web_filter.web_site_sk
+    OUTPUT: ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit
+    EXPECTED_ROWS: 9,956
+    CONSUMERS: single_semi_join
+  ws_wh_grouped:
+    FROM: web_sales
+    GROUP BY: ws_order_number
+    HAVING: MIN(ws_warehouse_sk) <> MAX(ws_warehouse_sk)
+    OUTPUT: ws_order_number
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: single_semi_join
+  single_semi_join:
+    FROM: prefetch_ws
+    WHERE: ws_order_number IN (SELECT wr_order_number FROM web_returns WHERE wr_order_number IN (SELECT ws_order_number FROM ws_wh_grouped))
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: single_semi_join
+    AGGREGATE: COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit"
+    OUTPUT: "order count", "total shipping cost", "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final
+EXAMPLES: materialize_cte, prefetch_fact_join, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- materialize_cte: Materialize ws_wh_grouped.
+- prefetch_fact_join: Use CTE chain to pre-filter dimensions and join with web_sales.
+- dimension_cte_isolate: Pre-filter all three dimensions into CTEs.
+HAZARD_FLAGS:
+- Semantic rewrite: removing the first IN condition must be proven equivalent. The second IN condition already implies the first. Need to ensure no edge cases (e.g., NULLs in web_returns.wr_order_number).
+- Combining three transforms may introduce overhead if the optimizer cannot optimize the CTE chain.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

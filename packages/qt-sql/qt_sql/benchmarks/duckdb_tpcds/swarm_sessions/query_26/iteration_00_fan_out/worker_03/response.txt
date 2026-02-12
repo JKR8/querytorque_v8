@@ -1,0 +1,78 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Staged CTE pipeline: filter dimensions early, join sequentially to reduce fact table processing.
+    ├── [!] CTE date_cte  — Filters date_dim for d_year=2001 first
+    ├── [!] CTE fact_date_join  — Joins catalog_sales with filtered dates only
+    ├── [!] CTE customer_join  — Joins with filtered customer_demographics
+    ├── [!] CTE promotion_join  — Joins with filtered promotion
+    ├── [!] CTE item_join  — Final join with item
+    ├── [=] AGG (GROUP BY)
+    ├── [=] SORT (i_item_id ASC)
+    └── [=] OUTPUT (i_item_id, agg1, agg2, agg3, agg4)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "prefetch_fact_join", "description": "Staged CTE pipeline: filter small dimension tables first (date, customer_demographics, promotion), then join sequentially to fact table to reduce intermediate result sizes.", "applied_to": ["date_cte", "fact_date_join", "customer_join", "promotion_join", "item_join"]},
+    {"id": "R2", "type": "early_filter", "description": "Push dimension filters into dedicated CTEs before joining to fact table, enabling predicate pushdown and reduced fact table scans.", "applied_to": ["date_cte", "customer_join", "promotion_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "fact_date_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_item_sk, cs_bill_cdemo_sk, cs_promo_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales JOIN date_cte ON cs_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["cs_item_sk", "cs_bill_cdemo_sk", "cs_promo_sk", "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price"], "consumes": ["date_cte"]}
+      },
+      "customer_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT fact_date_join.cs_item_sk, fact_date_join.cs_promo_sk, fact_date_join.cs_quantity, fact_date_join.cs_list_price, fact_date_join.cs_coupon_amt, fact_date_join.cs_sales_price FROM fact_date_join JOIN customer_demographics ON fact_date_join.cs_bill_cdemo_sk = customer_demographics.cd_demo_sk WHERE customer_demographics.cd_gender = 'M' AND customer_demographics.cd_marital_status = 'S' AND customer_demographics.cd_education_status = 'Unknown'",
+        "interfaces": {"outputs": ["cs_item_sk", "cs_promo_sk", "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price"], "consumes": ["fact_date_join"]}
+      },
+      "promotion_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT customer_join.cs_item_sk, customer_join.cs_quantity, customer_join.cs_list_price, customer_join.cs_coupon_amt, customer_join.cs_sales_price FROM customer_join JOIN promotion ON customer_join.cs_promo_sk = promotion.p_promo_sk WHERE promotion.p_channel_email = 'N' OR promotion.p_channel_event = 'N'",
+        "interfaces": {"outputs": ["cs_item_sk", "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price"], "consumes": ["customer_join"]}
+      },
+      "item_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT item.i_item_id, promotion_join.cs_quantity, promotion_join.cs_list_price, promotion_join.cs_coupon_amt, promotion_join.cs_sales_price FROM promotion_join JOIN item ON promotion_join.cs_item_sk = item.i_item_sk",
+        "interfaces": {"outputs": ["i_item_id", "cs_quantity", "cs_list_price", "cs_coupon_amt", "cs_sales_price"], "consumes": ["promotion_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM item_join GROUP BY i_item_id ORDER BY i_item_id LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "agg1", "agg2", "agg3", "agg4"], "consumes": ["item_join"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "fact_date_join", "customer_join", "promotion_join", "item_join", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), fact_date_join AS ({fact_date_join}), customer_join AS ({customer_join}), promotion_join AS ({promotion_join}), item_join AS ({item_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured the single monolithic join into a staged CTE pipeline that filters dimension tables early (date_dim, customer_demographics, promotion) before joining to the large fact table (catalog_sales). This reduces the intermediate result sizes at each step, enabling better predicate pushdown and minimizing the data processed in later joins.
+
+**Expected speedup**: ~2-4x based on similar patterns in regression examples, due to reduced fact table scanning and early filtering of dimension tables. The baseline is 654ms, so CTE overhead is acceptable.

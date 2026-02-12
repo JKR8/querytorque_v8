@@ -1,0 +1,86 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Cost: 100%  Rows: ~366
+    ├── [~] CTE date_cte (MATERIALIZED) 
+    ├── [~] CTE store_cte (MATERIALIZED) 
+    ├── [~] CTE item_cte (MATERIALIZED) 
+    ├── [~] CTE cd_cte (MATERIALIZED) 
+    ├── [~] fact_join (explicit INNER JOINs with CTEs)
+    ├── [=] AGG (GROUP BY ROLLUP(i_item_id, s_state))
+    ├── [=] SORT (i_item_id, s_state)
+    └── [=] OUTPUT (i_item_id, s_state, g_state, agg1, agg2, agg3, agg4)
+```
+
+**Change markers explanation:**
+- `[!]` Structural change: Original comma‑separated joins replaced with explicit JOINs in a CTE‑based staged pipeline
+- `[~]` Components modified: Each dimension now a MATERIALIZED CTE with early filtering
+- `[~]` fact_join modified: Now explicit INNER JOINs between store_sales and pre‑filtered CTEs
+- `[=]` Unchanged: Aggregation, sorting, and final output remain identical
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL 16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefetch", "description": "Pre‑filter selective dimensions into MATERIALIZED CTEs before joining to fact table", "applied_to": ["date_cte", "store_cte", "item_cte", "cd_cte"]},
+    {"id": "R2", "type": "explicit_join", "description": "Replace comma‑separated joins with explicit INNER JOIN syntax for better cardinality estimation", "applied_to": ["fact_join"]},
+    {"id": "R3", "type": "cte_materialization", "description": "Force materialization of dimension CTEs to prevent inlining and create tiny hash‑join build sides", "applied_to": ["date_cte", "store_cte", "item_cte", "cd_cte"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "store_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s_store_sk, s_state FROM store WHERE s_state = 'OH'",
+        "interfaces": {"outputs": ["s_store_sk", "s_state"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_category = 'Music'",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "cd_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'W' AND cd_education_status = 'Secondary'",
+        "interfaces": {"outputs": ["cd_demo_sk"], "consumes": []}
+      },
+      "fact_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss.i_item_id, st.s_state, ss.ss_quantity, ss.ss_list_price, ss.ss_coupon_amt, ss.ss_sales_price FROM store_sales ss INNER JOIN date_cte dt ON ss.ss_sold_date_sk = dt.d_date_sk INNER JOIN store_cte st ON ss.ss_store_sk = st.s_store_sk INNER JOIN item_cte it ON ss.ss_item_sk = it.i_item_sk INNER JOIN cd_cte cd ON ss.ss_cdemo_sk = cd.cd_demo_sk",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "ss_quantity", "ss_list_price", "ss_coupon_amt", "ss_sales_price"], "consumes": ["date_cte", "store_cte", "item_cte", "cd_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_id, s_state, GROUPING(s_state) AS g_state, AVG(ss_quantity) AS agg1, AVG(ss_list_price) AS agg2, AVG(ss_coupon_amt) AS agg3, AVG(ss_sales_price) AS agg4 FROM fact_join GROUP BY ROLLUP (i_item_id, s_state) ORDER BY i_item_id, s_state LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "s_state", "g_state", "agg1", "agg2", "agg3", "agg4"], "consumes": ["fact_join"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "store_cte", "item_cte", "cd_cte", "fact_join", "main_query"],
+    "assembly_template": "WITH date_cte AS MATERIALIZED ({date_cte}), store_cte AS MATERIALIZED ({store_cte}), item_cte AS MATERIALIZED ({item_cte}), cd_cte AS MATERIALIZED ({cd_cte}), fact_join AS ({fact_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Transformed comma‑separated joins into a staged pipeline of MATERIALIZED CTEs for each dimension, then explicit INNER JOINs with the fact table. This creates tiny hash‑join build sides (date: ~122 rows, store: ~1 row, item/cd: small) before probing store_sales, drastically reducing the search space.
+
+**Expected speedup:** 2–4× (similar to pg_dimension_prefetch_star pattern). Materialized CTEs prevent inlining and force early reduction; explicit JOINs improve cardinality estimation. No nested‑loop regression risk because build sides are tiny, making hash joins efficient.

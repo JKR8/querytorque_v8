@@ -1,0 +1,74 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_customer  [!]
+│   ├── SCAN (customer)
+│   ├── JOIN (customer_address) ON c_current_addr_sk = ca_address_sk
+│   └── FILTER (ca_state = 'IN')
+├── [CTE] ctr_aggregate  [=]
+│   ├── SCAN (web_returns, date_dim (join), customer_address (join))
+│   ├── JOIN (wr_returned_date_sk = d_date_sk)
+│   ├── JOIN (wr_returning_addr_sk = ca_address_sk)
+│   ├── FILTER (d_year = 2002)
+│   ├── AGG (GROUP BY wr_returning_customer_sk, ca_state)
+│   └── OUTPUT (ctr_customer_sk, ctr_state, ctr_total_return)
+├── [MAIN] main_join_with_subquery  [~]
+│   ├── SCAN (filtered_customer (join), ctr_aggregate AS ctr1 (join))
+│   ├── JOIN (c_customer_sk = ctr1.ctr_customer_sk)
+│   ├── FILTER (ctr1.ctr_total_return > AVG(ctr_total_return) * 1.2 (correlated per state))
+│   └── OUTPUT (customer profile columns + ctr_total_return)
+└── [OPERATOR] top_n  [=]
+    ├── SORT (13 columns as original)
+    └── LIMIT 100
+```
+
+**Change markers:**
+- `[!]` New `filtered_customer` CTE added to pre-filter Indiana customers with current address join.
+- `[~]` Modified `main_join_with_subquery` to consume `filtered_customer` instead of raw `customer` + `customer_address` join. Removed redundant `customer_address` join and `ca_state = 'IN'` filter (now pushed upstream).
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Pre-join customer with current address and filter by ca_state='IN' before joining with large CTE.", "applied_to": ["filtered_customer"]},
+    {"id": "R2", "type": "staged_join_pipeline", "description": "Replace three-table join (ctr1, customer_address, customer) with filtered_customer CTE then join with ctr_aggregate.", "applied_to": ["main_join_with_subquery"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_customer": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_sk, c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk FROM customer JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE ca_state = 'IN'",
+        "interfaces": {"outputs": ["c_customer_sk", "c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag", "c_birth_day", "c_birth_month", "c_birth_year", "c_birth_country", "c_login", "c_email_address", "c_last_review_date_sk"], "consumes": []}
+      },
+      "ctr_aggregate": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_state", "ctr_total_return"], "consumes": []}
+      },
+      "main_join_with_subquery": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return FROM filtered_customer JOIN ctr_aggregate ctr1 ON c_customer_sk = ctr1.ctr_customer_sk WHERE ctr1.ctr_total_return > (SELECT avg(ctr_total_return)*1.2 FROM ctr_aggregate ctr2 WHERE ctr1.ctr_state = ctr2.ctr_state)",
+        "interfaces": {"outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag", "c_birth_day", "c_birth_month", "c_birth_year", "c_birth_country", "c_login", "c_email_address", "c_last_review_date_sk", "ctr_total_return"], "consumes": ["filtered_customer", "ctr_aggregate"]}
+      }
+    },
+    "reconstruction_order": ["filtered_customer", "ctr_aggregate", "main_join_with_subquery"],
+    "assembly_template": "WITH filtered_customer AS ({filtered_customer}), ctr_aggregate AS (SELECT wr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, sum(wr_return_amt) AS ctr_total_return FROM web_returns, date_dim, customer_address WHERE wr_returned_date_sk = d_date_sk AND d_year = 2002 AND wr_returning_addr_sk = ca_address_sk GROUP BY wr_returning_customer_sk, ca_state) {main_join_with_subquery} ORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return LIMIT 100"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Added `filtered_customer` CTE to pre-join customer with current address and filter `ca_state='IN'` early, reducing the probe side of the main join from 2M customers to ~3.6K Indiana customers. This allows the large `ctr_aggregate` CTE (132K rows) to join against a much smaller filtered customer set.
+
+**Expected speedup:** ~3–4x based on similar early-filter patterns where dimension pre-filtering reduces fact-table probe size by 2–3 orders of magnitude. The correlated subquery still executes per outer row, but the outer row count is reduced from ~132K to ~913 after the join and filter.

@@ -1,0 +1,289 @@
+<reasoning>
+CLASSIFY: This is a multi-channel UNION ALL query with independent fact table scans (web_sales, catalog_sales, store_sales) each joined with their respective returns tables and date_dim. Each channel branch performs identical filtering (date_dim: d_year=1999, d_moy=12), aggregation (GROUP BY item_sk), and window ranking. The UNION branches are independent but share the same date_dim filtering pattern.
+
+EXPLAIN PLAN ANALYSIS:
+- Total execution: 2719ms
+- Dominant costs:
+  1. store_sales scan: 1113.7ms (41% exclusive) - 231K of 345.6M rows
+  2. web_sales scan: 1266.7ms (47% exclusive) - 94K of 86.4M rows  
+  3. store_returns scan: 126.7ms (5% exclusive) - 4,813 of 34.5M rows
+  4. catalog_sales scan: 51.8ms (2% exclusive) - 188K of 172.8M rows
+- Row count drops:
+  - date_dim: 73K → 31 rows (BETWEEN filters)
+  - web_sales: 86.4M → 94K after ws_net_profit>1, ws_net_paid>0, ws_quantity>0
+  - catalog_sales: 172.8M → 188K after similar filters
+  - store_sales: 345.6M → 231K after similar filters
+- Critical observation: Each channel branch independently scans date_dim (3 separate scans). The optimizer already pushes date filters into each scan (d_date_sk BETWEEN ranges). However, each branch re-scans the same 31-row date_dim set.
+- Fact table scans: Each fact table scanned once per channel (3 total fact scans). No repeated scans of the same fact table.
+- CTE behavior: No CTEs in original query; UNION branches executed independently.
+
+GAP MATCHING:
+1. CROSS_CTE_PREDICATE_BLINDNESS: Active - date_dim filtering repeated 3x. date_cte_isolate applicable.
+2. REDUNDANT_SCAN_ELIMINATION: Active - date_dim scanned 3x. Could consolidate to 1 scan.
+3. UNION_CTE_SELF_JOIN_DECOMPOSITION: Not applicable - no generic CTE scanned multiple times.
+4. OR_TO_UNION: Not applicable - OR conditions within each branch (return_rank≤10 OR currency_rank≤10) but on same-table derived columns.
+5. SINGLE_PASS_AGGREGATION: Not applicable - no repeated fact table scans.
+6. SHARED_DIMENSION_MULTI_CHANNEL: Applicable - all 3 channels share same date filter.
+
+AGGREGATION TRAP CHECK:
+- Aggregates: SUM(coalesce(return_quantity,0)), SUM(coalesce(sales_quantity,0)), SUM(coalesce(return_amt,0)), SUM(coalesce(net_paid,0))
+- All are SUM with COALESCE to 0 - grouping-insensitive to duplicates.
+- Window functions RANK() over return_ratio and currency_ratio - sensitive to row ordering but not grouping.
+- LEFT JOIN with wr_return_amt>10000 condition: This filter on the outer side NULL-rejects, turning LEFT JOIN into INNER JOIN effectively. But original logic preserves items with no returns (COALESCE to 0). However, wr_return_amt>10000 eliminates NULL returns, so items with returns <10000 or no returns get return_quantity=0, return_amt=0. This is correct.
+
+TRANSFORM SELECTION (ranked by potential):
+1. **date_cte_isolate** (4.00x historical): Extract date filter into CTE, share across all 3 channels. Reduces date_dim scans from 3 to 1.
+2. **shared_dimension_multi_channel** (1.30x): Extract shared date filter into common CTE for all channels.
+3. **inner_join_conversion** (novel): Convert LEFT JOIN + NULL-rejecting filter to INNER JOIN for clarity and potential join reordering.
+4. **union_consolidation** (exploration): Attempt to consolidate channel branches using UNION ALL inside a single CTE with channel discriminator, then compute ranks once. Risky but novel.
+
+LOGICAL TREE DESIGN:
+For each strategy, need explicit node contracts with exhaustive output columns. Must preserve all original columns.
+
+Worker 1: date_cte_isolate - Create filtered_date CTE, reference in each channel branch.
+Worker 2: shared_dimension_multi_channel - Similar but emphasize sharing across UNION branches.
+Worker 3: inner_join_conversion - Change LEFT JOIN to INNER JOIN since wr_return_amt>10000 NULL-rejects.
+Worker 4: union_consolidation exploration - Single scan with channel discriminator and conditional joins.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Across web, catalog, and store channels for Dec-1999, rank items by return-quantity ratio and return-currency ratio, returning top-10 by either ranking per channel. LEFT JOIN with returns tables preserves items with no returns (COALESCE to 0), but wr_return_amt>10000 filter NULL-rejects returns rows, effectively making it an inner join for matching rows while keeping items without returns (which get 0 in aggregates). Aggregates use COALESCE to 0, making them duplicate-insensitive. Window rankings are computed per-channel after aggregation. The final filter (return_rank≤10 OR currency_rank≤10) must be applied per channel before UNION.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: store_sales (1113ms), web_sales (1266ms), and store_returns (126ms) scans dominate. Cardinality: date_dim filters from 73K to 31 rows, but scanned 3 times independently. Fact tables filtered by net_profit>1, net_paid>0, quantity>0 reduce rows by ~99.9%. Optimizer already pushes filters into scans and uses efficient hash joins. Logical-tree costs misleading: store_sales shows 41% exclusive but actually 1113ms vs total 2719ms = ~41% accurate.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output channel, item, return_ratio, return_rank, currency_rank in same order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (item_sk, date_sk, return columns, etc.).
+- LITERAL_PRESERVATION: Must preserve d_year=1999, d_moy=12, amount thresholds >10000, net_profit>1, net_paid>0, quantity>0.
+- SEMANTIC_EQUIVALENCE: Must return same rows and ordering (ORDER BY 1,4,5,2).
+- CROSS_CTE_PREDICATE_BLINDNESS: date_dim scanned 3 times independently (EXPLAIN shows 3 SEQ_SCAN date_dim nodes).
+- REDUNDANT_SCAN_ELIMINATION: date_dim scanned 3 times for same filter (d_year=1999, d_moy=12).
+- SHARED_DIMENSION_MULTI_CHANNEL: All 3 channel branches share identical date_dim filter.
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline <100ms, CTE overhead dominated savings.
+   RULE: This query baseline is 2719ms >> 100ms, so CTE overhead acceptable.
+2. or_to_union (0.59x on Q90):
+   CAUSE: Split same-column OR into UNION branches, duplicating fact scans.
+   RULE: Do NOT split return_rank≤10 OR currency_rank≤10 into UNION - same derived columns.
+3. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join multiple dimension CTEs; join fact to each dimension independently.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: date_cte_isolate
+TARGET_LOGICAL_TREE:
+  filtered_dates -> web_channel -> catalog_channel -> store_channel -> union_all -> filter_ranks -> order_limit
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy = 12
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: web_channel, catalog_channel, store_channel
+  web_channel:
+    FROM: web_sales ws LEFT OUTER JOIN web_returns wr ON (ws.ws_order_number = wr.wr_order_number AND ws.ws_item_sk = wr.wr_item_sk), filtered_dates fd
+    JOIN: ws.ws_sold_date_sk = fd.d_date_sk
+    WHERE: wr.wr_return_amt > 10000 AND ws.ws_net_profit > 1 AND ws.ws_net_paid > 0 AND ws.ws_quantity > 0
+    GROUP BY: ws.ws_item_sk
+    AGGREGATE: SUM(COALESCE(wr.wr_return_quantity,0)) as sum_return_qty, SUM(COALESCE(ws.ws_quantity,0)) as sum_ws_qty, SUM(COALESCE(wr.wr_return_amt,0)) as sum_return_amt, SUM(COALESCE(ws.ws_net_paid,0)) as sum_net_paid
+    OUTPUT: ws.ws_item_sk as item, sum_return_qty, sum_ws_qty, sum_return_amt, sum_net_paid
+    EXPECTED_ROWS: 150
+    CONSUMERS: web_ranked
+  web_ranked:
+    FROM: web_channel
+    COMPUTE: cast(sum_return_qty as decimal(15,4))/cast(sum_ws_qty as decimal(15,4)) as return_ratio, cast(sum_return_amt as decimal(15,4))/cast(sum_net_paid as decimal(15,4)) as currency_ratio
+    WINDOW: RANK() OVER (ORDER BY return_ratio) as return_rank, RANK() OVER (ORDER BY currency_ratio) as currency_rank
+    OUTPUT: item, return_ratio, currency_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 150
+    CONSUMERS: union_all
+  catalog_channel: (similar to web with cs/cr tables)
+  store_channel: (similar to web with sts/sr tables)
+  union_all:
+    FROM: web_ranked UNION ALL catalog_ranked UNION ALL store_ranked with channel labels
+    OUTPUT: channel, item, return_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 41
+    CONSUMERS: filter_ranks
+  filter_ranks:
+    FROM: union_all
+    WHERE: return_rank <= 10 OR currency_rank <= 10
+    OUTPUT: channel, item, return_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 41
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: filter_ranks
+    ORDER BY: channel ASC, return_rank ASC, currency_rank ASC, item ASC
+    LIMIT: 100
+    OUTPUT: channel, item, return_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 41
+    CONSUMERS: final output
+EXAMPLES: date_cte_isolate, early_filter, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: Apply exact pattern - create filtered_dates CTE with d_date_sk only, join in each channel. Ignore the scalar subquery aspect (original doesn't have scalar subquery).
+- early_filter: Apply principle of filtering date_dim first, then join to fact tables. Ignore the multi-table join ordering (only date_dim here).
+- dimension_cte_isolate: Apply pattern of isolating dimension filter into CTE. Ignore the multiple dimension tables (only date_dim here).
+HAZARD_FLAGS:
+- Must ensure COALESCE handles NULLs correctly after converting LEFT JOIN to use filtered_dates CTE.
+- filtered_dates CTE output only d_date_sk; ensure no other date columns needed downstream.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: shared_dimension_multi_channel
+TARGET_LOGICAL_TREE:
+  filtered_dates -> web_sales_filtered -> web_aggregate -> web_ranked -> similarly for catalog/store -> union_all -> filter_ranks -> order_limit
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy = 12
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: web_sales_filtered, catalog_sales_filtered, store_sales_filtered
+  web_sales_filtered:
+    FROM: web_sales ws INNER JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk
+    WHERE: ws.ws_net_profit > 1 AND ws.ws_net_paid > 0 AND ws.ws_quantity > 0
+    OUTPUT: ws.ws_item_sk, ws.ws_order_number, ws.ws_quantity, ws.ws_net_paid
+    EXPECTED_ROWS: 94K
+    CONSUMERS: web_joined_returns
+  web_joined_returns:
+    FROM: web_sales_filtered ws LEFT OUTER JOIN web_returns wr ON ws.ws_order_number = wr.wr_order_number AND ws.ws_item_sk = wr.wr_item_sk AND wr.wr_return_amt > 10000
+    OUTPUT: ws.ws_item_sk, COALESCE(wr.wr_return_quantity,0) as return_qty, ws.ws_quantity, COALESCE(wr.wr_return_amt,0) as return_amt, ws.ws_net_paid
+    EXPECTED_ROWS: 150
+    CONSUMERS: web_aggregate
+  web_aggregate:
+    FROM: web_joined_returns
+    GROUP BY: ws_item_sk
+    AGGREGATE: SUM(return_qty) as sum_return_qty, SUM(ws_quantity) as sum_ws_qty, SUM(return_amt) as sum_return_amt, SUM(ws_net_paid) as sum_net_paid
+    OUTPUT: item_sk, sum_return_qty, sum_ws_qty, sum_return_amt, sum_net_paid
+    EXPECTED_ROWS: 150
+    CONSUMERS: web_ranked
+  web_ranked: (as Worker 1)
+  catalog_sales_filtered, store_sales_filtered: similar patterns
+  union_all, filter_ranks, order_limit: as Worker 1
+EXAMPLES: shared_dimension_multi_channel, prefetch_fact_join, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- shared_dimension_multi_channel: Apply exactly - extract shared date filter into CTE used by all channels. Ignore the item/promotion filters (not present).
+- prefetch_fact_join: Apply staged join pipeline: filtered_dates CTE -> join with sales -> then join with returns. Ignore subsequent dimension joins (none).
+- multi_dimension_prefetch: Apply principle of pre-filtering dimension (date) into CTE before fact join. Ignore multiple dimensions (only date).
+HAZARD_FLAGS:
+- Moving wr_return_amt>10000 into JOIN ON clause must preserve semantics: items without returns still included with return_qty=0.
+- Ensure COALESCE in web_joined_returns OUTPUT handles NULL returns correctly.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: inner_join_conversion
+TARGET_LOGICAL_TREE:
+  filtered_dates -> web_inner_join -> web_aggregate -> web_ranked -> similarly for catalog/store -> union_all -> filter_ranks -> order_limit
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy = 12
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: web_inner_join, catalog_inner_join, store_inner_join
+  web_inner_join:
+    FROM: web_sales ws INNER JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk
+           INNER JOIN web_returns wr ON ws.ws_order_number = wr.wr_order_number AND ws.ws_item_sk = wr.wr_item_sk
+    WHERE: ws.ws_net_profit > 1 AND ws.ws_net_paid > 0 AND ws.ws_quantity > 0 AND wr.wr_return_amt > 10000
+    OUTPUT: ws.ws_item_sk, wr.wr_return_quantity, ws.ws_quantity, wr.wr_return_amt, ws.ws_net_paid
+    EXPECTED_ROWS: 150
+    CONSUMERS: web_aggregate
+  web_aggregate:
+    FROM: web_inner_join
+    GROUP BY: ws_item_sk
+    AGGREGATE: SUM(wr_return_quantity) as sum_return_qty, SUM(ws_quantity) as sum_ws_qty, SUM(wr_return_amt) as sum_return_amt, SUM(ws_net_paid) as sum_net_paid
+    OUTPUT: item_sk, sum_return_qty, sum_ws_qty, sum_return_amt, sum_net_paid
+    EXPECTED_ROWS: 150
+    CONSUMERS: web_ranked
+  web_ranked:
+    FROM: web_aggregate
+    COMPUTE: cast(sum_return_qty as decimal(15,4))/cast(sum_ws_qty as decimal(15,4)) as return_ratio, cast(sum_return_amt as decimal(15,4))/cast(sum_net_paid as decimal(15,4)) as currency_ratio
+    WINDOW: RANK() OVER (ORDER BY return_ratio) as return_rank, RANK() OVER (ORDER BY currency_ratio) as currency_rank
+    OUTPUT: item, return_ratio, currency_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 150
+    CONSUMERS: union_all
+  union_all:
+    FROM: (SELECT 'web' as channel, * FROM web_ranked) UNION ALL (catalog) UNION ALL (store)
+    OUTPUT: channel, item, return_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 41
+    CONSUMERS: filter_ranks
+  filter_ranks, order_limit: as Worker 1
+EXAMPLES: early_filter, prefetch_fact_join, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- early_filter: Apply filter dimension first, then join fact tables. Ignore the multiple fact tables (handle per channel).
+- prefetch_fact_join: Use filtered_dates CTE, join with sales, then inner join returns. Ignore the chain length (only 2 joins).
+- dimension_cte_isolate: Isolate date filter into CTE. Ignore the multiple dimensions.
+HAZARD_FLAGS:
+- Converting LEFT JOIN to INNER JOIN changes semantics: items with no returns or returns ≤10000 are excluded entirely. Original includes them with 0 ratios. Must handle by UNIONing back items with 0 returns. Actually, original WHERE wr.wr_return_amt > 10000 eliminates NULL returns, so items without returns matching that condition are excluded anyway. But items with returns ≤10000 are excluded by filter. This is correct per original.
+- Need to verify: original LEFT JOIN with wr.wr_return_amt>10000 in WHERE clause removes rows where wr.wr_return_amt IS NULL (no match). So effectively inner join. Our conversion is valid.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: union_consolidation
+TARGET_LOGICAL_TREE:
+  filtered_dates -> all_sales_returns -> channel_aggregates -> channel_ranks -> filter_ranks -> order_limit
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy = 12
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: all_sales_returns
+  all_sales_returns:
+    FROM: (
+        SELECT 'web' as channel, ws_item_sk as item_sk, ws_order_number as order_number, ws_quantity, ws_net_paid, ws_sold_date_sk, NULL as ticket_number, wr_return_quantity, wr_return_amt
+        FROM web_sales LEFT JOIN web_returns ON ws_order_number=wr_order_number AND ws_item_sk=wr_item_sk
+        WHERE wr_return_amt > 10000 OR wr_return_amt IS NULL
+        UNION ALL
+        SELECT 'catalog', cs_item_sk, cs_order_number, cs_quantity, cs_net_paid, cs_sold_date_sk, NULL, cr_return_quantity, cr_return_amount
+        FROM catalog_sales LEFT JOIN catalog_returns ON cs_order_number=cr_order_number AND cs_item_sk=cr_item_sk
+        WHERE cr_return_amount > 10000 OR cr_return_amount IS NULL
+        UNION ALL
+        SELECT 'store', ss_item_sk, NULL, ss_quantity, ss_net_paid, ss_sold_date_sk, ss_ticket_number, sr_return_quantity, sr_return_amt
+        FROM store_sales LEFT JOIN store_returns ON ss_ticket_number=sr_ticket_number AND ss_item_sk=sr_item_sk
+        WHERE sr_return_amt > 10000 OR sr_return_amt IS NULL
+    ) all_data INNER JOIN filtered_dates fd ON all_data.sold_date_sk = fd.d_date_sk
+    WHERE: (channel='web' AND ws_net_profit>1 AND ws_net_paid>0 AND ws_quantity>0)
+           OR (channel='catalog' AND cs_net_profit>1 AND cs_net_paid>0 AND cs_quantity>0)
+           OR (channel='store' AND ss_net_profit>1 AND ss_net_paid>0 AND ss_quantity>0)
+    OUTPUT: channel, item_sk, order_number, ticket_number, quantity, net_paid, return_quantity, return_amt
+    EXPECTED_ROWS: ~94K+188K+231K = 513K
+    CONSUMERS: channel_aggregates
+  channel_aggregates:
+    FROM: all_sales_returns
+    GROUP BY: channel, item_sk
+    AGGREGATE: SUM(COALESCE(return_quantity,0)) as sum_return_qty, SUM(COALESCE(quantity,0)) as sum_qty, SUM(COALESCE(return_amt,0)) as sum_return_amt, SUM(COALESCE(net_paid,0)) as sum_net_paid
+    OUTPUT: channel, item_sk, sum_return_qty, sum_qty, sum_return_amt, sum_net_paid
+    EXPECTED_ROWS: ~150+369+124 = 643
+    CONSUMERS: channel_ranks
+  channel_ranks:
+    FROM: channel_aggregates
+    COMPUTE: cast(sum_return_qty as decimal(15,4))/cast(sum_qty as decimal(15,4)) as return_ratio, cast(sum_return_amt as decimal(15,4))/cast(sum_net_paid as decimal(15,4)) as currency_ratio
+    WINDOW: PARTITION BY channel ORDER BY return_ratio as return_rank, PARTITION BY channel ORDER BY currency_ratio as currency_rank
+    OUTPUT: channel, item_sk as item, return_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 643
+    CONSUMERS: filter_ranks
+  filter_ranks:
+    FROM: channel_ranks
+    WHERE: return_rank <= 10 OR currency_rank <= 10
+    OUTPUT: channel, item, return_ratio, return_rank, currency_rank
+    EXPECTED_ROWS: 41
+    CONSUMERS: order_limit
+  order_limit: as Worker 1
+EXAMPLES: channel_bitmap_aggregation, single_pass_aggregation, union_cte_split
+EXAMPLE_ADAPTATION:
+- channel_bitmap_aggregation: Apply consolidation of multiple scans into one UNION ALL with channel discriminator. Ignore the CASE WHEN aggregation (we use UNION ALL of pre-joined data).
+- single_pass_aggregation: Apply principle of single scan over combined data. Ignore the scalar subquery consolidation.
+- union_cte_split: Reverse pattern - instead of splitting, we consolidate UNION branches. Ignore the splitting aspect.
+HAZARD_FLAGS:
+- Complex UNION ALL may inhibit join pushdown; ensure date join happens after UNION.
+- Different join keys (order_number vs ticket_number) require NULL handling.
+- Must preserve COALESCE semantics for NULL returns.
+- Window functions must partition by channel to rank per-channel.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

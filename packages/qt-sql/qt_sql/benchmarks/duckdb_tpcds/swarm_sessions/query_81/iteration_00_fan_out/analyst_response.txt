@@ -1,0 +1,246 @@
+<reasoning>
+Step 1: CLASSIFY
+This is a "correlated-aggregate filter" archetype: 
+- A CTE aggregates fact data (catalog_returns) grouped by customer and state.
+- The main query filters rows where the customer's aggregated value exceeds 1.2x the state average, computed via a correlated subquery on the same CTE.
+- Additional dimension joins (customer, customer_address for current address) apply selective filters (ca_state='CA').
+
+Step 2: EXPLAIN PLAN ANALYSIS
+Total execution: 240ms
+Key cost nodes:
+- CTE computation: 40.3ms (17%) for 276K rows.
+- catalog_returns scan: 51.7ms (22%) for 287K of 17.3M rows (already filtered by date).
+- customer_address scan (current): 27.8ms (12%) for 4,658 of 750K rows (CA filter).
+- Subquery average computation: 13.6ms (6%) for 51 rows.
+- Main query joins: ~35ms total (two hash joins).
+
+Row count flow:
+- catalog_returns: 17.3M → 287K (after date join)
+- CTE output: 276K rows (aggregated by customer+state)
+- customer_address (current): 750K → 4,658 (CA filter)
+- customer: 2.5M → 500K (scan, no filter) → 9,337 (after join with CA address)
+- After joining CTE with customer+address: 5,054 rows
+- After filter (ctr_total_return > 1.2*avg): 1,265 rows
+- After TOP_N: 100 rows
+
+Optimizer behavior:
+- CTE is materialized (CTE_SCAN appears twice).
+- Correlated subquery has been decorrelated: EXPLAIN shows HASH_JOIN LEFT on ctr_state, not a nested loop.
+- Predicate pushdown: d_year=2002 pushed into date_dim scan; ca_state='CA' pushed into customer_address scan.
+- No repeated fact table scans: catalog_returns scanned once in CTE.
+
+Step 3: GAP MATCHING
+- CORRELATED_SUBQUERY_PARALYSIS: Already decorrelated by optimizer (HASH_JOIN LEFT). No gap.
+- CROSS_COLUMN_OR_DECOMPOSITION: No OR conditions.
+- CROSS_CTE_PREDICATE_BLINDNESS: The filter ca_state='CA' applies to customer_address (current), not the CTE's customer_address (return address). Cannot be pushed into CTE without changing semantics. However, the CTE is scanned twice; we could split into specialized CTEs.
+- REDUNDANT_SCAN_ELIMINATION: CTE scanned twice (for ctr1 and ctr2). Opportunity to consolidate via window function or split.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: CTE is generic (all states) and scanned twice with different uses (row source vs. average). Could split into two CTEs: one with CA-customer filtered rows, another with state averages.
+
+Step 4: AGGREGATION TRAP CHECK
+- CTE uses SUM(cr_return_amt_inc_tax) - grouping-insensitive.
+- Subquery uses AVG(ctr_total_return) - grouping-insensitive.
+- No FILTER clauses or sensitive aggregates.
+
+Step 5: TRANSFORM SELECTION
+Ranked opportunities:
+1. **window_optimization**: Replace subquery with window function to compute state average in same CTE scan. Eliminates separate aggregation and self-join.
+2. **star_join_prefetch**: Pre-filter dimension tables (date_dim for 2002, customer_address for return address) into CTEs before joining with catalog_returns. May reduce CTE build cost.
+3. **scan_consolidation_pivot**: Since CTE is scanned twice, consolidate by computing both customer totals and state averages in one pass using window functions.
+4. **union_cte_split**: Split CTE into two: one for CA customers (with current address join), another for state averages (all customers). Reduces rows in main join.
+
+Structural diversity:
+- Worker 1: window_optimization (eliminate subquery)
+- Worker 2: star_join_prefetch (optimize CTE build)
+- Worker 3: union_cte_split (specialize CTEs)
+- Worker 4: exploration: combine window with early CA filter push via derived table.
+
+Step 6: LOGICAL TREE DESIGN
+For each strategy, ensure column completeness:
+- CTE must output: ctr_customer_sk, ctr_state, ctr_total_return.
+- If window function added: also state_avg.
+- CA-filtered CTE must also include customer_sk for join.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Find California customers whose 2002 catalog return amount (including tax) exceeds 120% of the average return amount for their return state. All joins are INNER (intersection) except the correlated subquery which compares per state. Aggregation uses SUM and AVG, which are duplicate-safe if join multiplicity unchanged. Filter dependencies: date filter (d_year=2002) applies to returns; ca_state='CA' applies to customer's current address, not return address.
+
+BOTTLENECK_DIAGNOSIS:
+CTE computation (40.3ms) and catalog_returns scan (51.7ms) dominate. Plan is scan-bound: filtering 17.3M catalog_returns rows to 287K via date join. The optimizer already decorrelates the subquery (hash join) and pushes date/state predicates into scans. Logical-tree cost percentages are misleading: CTE is 17% exclusive time but feeds entire query.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output all 15 customer/address columns plus ctr_total_return, ordered identically.
+- CTE_COLUMN_COMPLETENESS: CTEs must include all columns referenced downstream (ctr_customer_sk, ctr_state, ctr_total_return, possibly state_avg).
+- LITERAL_PRESERVATION: Must preserve d_year=2002, ca_state='CA', multiplier 1.2.
+- SEMANTIC_EQUIVALENCE: Result must match original rows exactly.
+- CROSS_CTE_PREDICATE_BLINDNESS: ca_state='CA' filter cannot be pushed into CTE without changing semantics (average must be over all customers).
+- REDUNDANT_SCAN_ELIMINATION: CTE scanned twice; opportunity to consolidate scans.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: Generic CTE used for both row source and average; can split.
+
+REGRESSION_WARNINGS:
+1. decorrelate (0.71x on Q1):
+   CAUSE: Pre-aggregating GROUP BY into CTEs loses incremental filter pushdown.
+   RULE: Do not materialize aggregates if the optimizer already decorrelates efficiently (hash join present).
+2. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline <100ms, CTE overhead dominates.
+   RULE: Avoid adding CTEs if baseline fast (240ms is borderline; focus on reducing scan cost).
+3. materialize_cte (0.14x on Q16):
+   CAUSE: Converting EXISTS to materialized CTE forces full scan.
+   RULE: Not applicable; no EXISTS here.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: window_optimization
+TARGET_LOGICAL_TREE:
+  ctr_with_avg (CTE with window) -> join_customer_address -> filter_CA -> order_limit
+NODE_CONTRACTS:
+  ctr_with_avg:
+    FROM: catalog_returns, date_dim, customer_address (return address)
+    JOIN: cr_returned_date_sk = d_date_sk AND cr_returning_addr_sk = ca_address_sk
+    WHERE: d_year = 2002
+    GROUP BY: cr_returning_customer_sk, ca_state
+    AGGREGATE: SUM(cr_return_amt_inc_tax) AS ctr_total_return
+    WINDOW: AVG(ctr_total_return) OVER (PARTITION BY ca_state) AS state_avg
+    OUTPUT: cr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, ctr_total_return, state_avg
+    EXPECTED_ROWS: 276K
+    CONSUMERS: main_query
+  main_query:
+    FROM: ctr_with_avg AS ctr1, customer, customer_address (current)
+    JOIN: ctr1.ctr_customer_sk = c_customer_sk AND ca_address_sk = c_current_addr_sk
+    WHERE: ca_state = 'CA' AND ctr_total_return > state_avg * 1.2
+    ORDER BY: c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return
+    LIMIT: 100
+    OUTPUT: c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: deferred_window_aggregation, CORRELATED_SUBQUERY_TO_WINDOW
+EXAMPLE_ADAPTATION:
+- deferred_window_aggregation: Apply the principle of computing window function (state average) in the same CTE as the aggregation to avoid separate scan; ignore the FULL OUTER JOIN and carry-forward aspects.
+- CORRELATED_SUBQUERY_TO_WINDOW: Replace correlated subquery with window function computing average per state; ignore top-N-per-group pattern.
+HAZARD_FLAGS:
+- Window function may require extra sort partition; verify performance against hash group+join.
+- Must ensure window AVG is computed over the same set as original subquery (all rows in CTE).
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_filter (CTE) -> return_addr_filter (CTE) -> ctr_prejoined (CTE) -> main_query (unchanged)
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_year = 2002
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: ctr_prejoined
+  return_addr_filter:
+    FROM: customer_address
+    WHERE: (no filter - all return addresses needed)
+    OUTPUT: ca_address_sk, ca_state
+    EXPECTED_ROWS: 750K
+    CONSUMERS: ctr_prejoined
+  ctr_prejoined:
+    FROM: catalog_returns, date_filter, return_addr_filter
+    JOIN: cr_returned_date_sk = date_filter.d_date_sk AND cr_returning_addr_sk = return_addr_filter.ca_address_sk
+    GROUP BY: cr_returning_customer_sk, return_addr_filter.ca_state
+    AGGREGATE: SUM(cr_return_amt_inc_tax) AS ctr_total_return
+    OUTPUT: cr_returning_customer_sk AS ctr_customer_sk, return_addr_filter.ca_state AS ctr_state, ctr_total_return
+    EXPECTED_ROWS: 276K
+    CONSUMERS: main_query (as customer_total_return CTE)
+  main_query: (identical to original main query, referencing ctr_prejoined as customer_total_return)
+EXAMPLES: prefetch_fact_join, dimension_cte_isolate, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Build CTE chain filtering dimensions before joining with fact; ignore multiple fact tables.
+- dimension_cte_isolate: Pre-filter date_dim into CTE; ignore other dimensions (customer_address return has no filter).
+- date_cte_isolate: Extract date filter into CTE; apply directly.
+HAZARD_FLAGS:
+- return_addr_filter CTE scans entire customer_address (750K) with no filter; may add overhead.
+- Ensure join columns are indexed/surrogate keys.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: union_cte_split
+TARGET_LOGICAL_TREE:
+  ctr_all (CTE for averages) -> ctr_ca (CTE for CA customers) -> join_averages -> order_limit
+NODE_CONTRACTS:
+  ctr_all:
+    FROM: catalog_returns, date_dim, customer_address (return address)
+    JOIN: cr_returned_date_sk = d_date_sk AND cr_returning_addr_sk = ca_address_sk
+    WHERE: d_year = 2002
+    GROUP BY: cr_returning_customer_sk, ca_state
+    AGGREGATE: SUM(cr_return_amt_inc_tax) AS ctr_total_return
+    OUTPUT: cr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, ctr_total_return
+    EXPECTED_ROWS: 276K
+    CONSUMERS: ctr_state_avg, ctr_ca (via join)
+  ctr_state_avg:
+    FROM: ctr_all
+    GROUP BY: ctr_state
+    AGGREGATE: AVG(ctr_total_return) AS state_avg
+    OUTPUT: ctr_state, state_avg
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  ctr_ca:
+    FROM: ctr_all, customer, customer_address (current)
+    JOIN: ctr_all.ctr_customer_sk = c_customer_sk AND c_current_addr_sk = ca_address_sk
+    WHERE: ca_state = 'CA'
+    OUTPUT: ctr_all.ctr_customer_sk, ctr_all.ctr_state, ctr_all.ctr_total_return, c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type
+    EXPECTED_ROWS: 5,054
+    CONSUMERS: main_query
+  main_query:
+    FROM: ctr_ca, ctr_state_avg
+    JOIN: ctr_ca.ctr_state = ctr_state_avg.ctr_state
+    WHERE: ctr_ca.ctr_total_return > ctr_state_avg.state_avg * 1.2
+    ORDER BY: c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return
+    LIMIT: 100
+    OUTPUT: (all columns from ctr_ca plus ctr_total_return)
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: union_cte_split, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+- union_cte_split: Split generic CTE into specialized CTEs (one for averages, one for CA-filtered rows); ignore year-based splitting.
+- shared_dimension_multi_channel: Extract shared dimension (date) into CTE; ignore multi-channel aspect.
+HAZARD_FLAGS:
+- ctr_all CTE still scanned twice (by ctr_state_avg and ctr_ca); may not reduce scans.
+- Must ensure ctr_ca includes all customer/address columns for output.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: early_ca_filter_derived
+TARGET_LOGICAL_TREE:
+  ca_customers (CTE) -> ctr_joined (CTE with window) -> filter_compare -> order_limit
+NODE_CONTRACTS:
+  ca_customers:
+    FROM: customer, customer_address
+    JOIN: c_current_addr_sk = ca_address_sk
+    WHERE: ca_state = 'CA'
+    OUTPUT: c_customer_sk, c_customer_id, c_salutation, c_first_name, c_last_name, ca_address_sk, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type
+    EXPECTED_ROWS: 9,337
+    CONSUMERS: ctr_joined
+  ctr_joined:
+    FROM: ca_customers, catalog_returns, date_dim, customer_address AS return_addr
+    JOIN: cr_returning_customer_sk = ca_customers.c_customer_sk AND cr_returned_date_sk = d_date_sk AND cr_returning_addr_sk = return_addr.ca_address_sk
+    WHERE: d_year = 2002
+    GROUP BY: ca_customers.c_customer_sk, ca_customers.c_customer_id, ca_customers.c_salutation, ca_customers.c_first_name, ca_customers.c_last_name, ca_customers.ca_street_number, ca_customers.ca_street_name, ca_customers.ca_street_type, ca_customers.ca_suite_number, ca_customers.ca_city, ca_customers.ca_county, ca_customers.ca_state, ca_customers.ca_zip, ca_customers.ca_country, ca_customers.ca_gmt_offset, ca_customers.ca_location_type, return_addr.ca_state
+    AGGREGATE: SUM(cr_return_amt_inc_tax) AS ctr_total_return, AVG(SUM(cr_return_amt_inc_tax)) OVER (PARTITION BY return_addr.ca_state) AS state_avg
+    OUTPUT: (all grouping columns), ctr_total_return, state_avg, return_addr.ca_state AS ctr_state
+    EXPECTED_ROWS: ≤5,054 (only CA customers with returns)
+    CONSUMERS: main_filter
+  main_filter:
+    FROM: ctr_joined
+    WHERE: ctr_total_return > state_avg * 1.2
+    ORDER BY: c_customer_id, c_salutation, c_first_name, c_last_name, ca_street_number, ca_street_name, ca_street_type, ca_suite_number, ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset, ca_location_type, ctr_total_return
+    LIMIT: 100
+    OUTPUT: (all customer/address columns from ctr_joined), ctr_total_return
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: early_filter, window_optimization, prefetch_fact_join
+EXAMPLE_ADAPTATION:
+- early_filter: Filter customer and customer_address for CA first, then join to returns; apply directly.
+- window_optimization: Compute state average via window function; apply.
+- prefetch_fact_join: Build chain: filtered customers → join with returns; ignore dimension CTEs.
+HAZARD_FLAGS:
+- Window AVG computed only over CA customers' returns, changing semantics (average should be over all customers). THIS IS A SEMANTIC BREAK.
+CONSTRAINT_OVERRIDE: None (strategy is exploratory but must maintain correctness).
+OVERRIDE_REASONING: The hazard flag indicates semantic break; worker must adjust to compute state average over all customers, perhaps via a separate aggregate joined before the window.
+EXPLORATION_TYPE: compound_strategy

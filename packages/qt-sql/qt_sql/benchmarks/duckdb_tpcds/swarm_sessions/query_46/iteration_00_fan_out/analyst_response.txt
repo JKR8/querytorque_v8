@@ -1,0 +1,331 @@
+<reasoning>
+CLASSIFY:
+This is a star-join with late dimension filter. The query joins a large fact table (store_sales) with multiple dimension tables (date_dim, store, household_demographics, customer_address), aggregates, then joins with customer and customer_address again for a city mismatch filter. It has no correlated subqueries, no UNION ALL, no INTERSECT, no window functions. The key structural features are:
+- Single fact table with 4 dimension joins before aggregation
+- OR condition on different columns (hd_dep_count = 6 OR hd_vehicle_count = 0)
+- Two separate uses of customer_address table (bought address vs current address)
+- LIMIT 100 with ORDER BY on customer columns
+
+EXPLAIN PLAN ANALYSIS:
+- Total execution time: 913ms
+- Dominant cost: store_sales SEQ_SCAN (576ms, 63% of total)
+- Second largest: hash join between store_sales and date_dim (86.5ms, 9%)
+- Row count flow:
+  - store_sales scan: 14.9M rows
+  - After date_dim join: 4.3M rows (71% reduction)
+  - After store join: 2.3M rows (47% reduction)
+  - After household_demographics join: 567K rows (75% reduction)
+  - After customer_address join: 564K rows (minimal reduction)
+  - After aggregation: 53K rows (91% reduction)
+  - After customer and current_addr joins: 48K rows
+- The optimizer is already pushing predicates into dimension scans (date_dim filtered to 1,096 rows, store to 102 rows, household_demographics to 7,200 rows).
+- The OR condition is on the same table (household_demographics) but different columns (hd_dep_count vs hd_vehicle_count).
+- The fact table is scanned only once.
+- No CTEs in original query, so no CTE materialization.
+
+GAP MATCHING:
+1. CROSS_COLUMN_OR_DECOMPOSITION: The OR condition spans two different columns in household_demographics. This matches the gap. Historical example: or_to_union (3.17x on Q15). However, the table is small (7,200 rows) and the engine already filters it to 1,800 rows (FILTER node). Splitting might add overhead vs benefit.
+2. STAR_JOIN_PREFETCH: Multiple dimension tables with selective filters that could be pre-filtered into CTEs before joining with fact table. Matches dimension_cte_isolate (1.93x), multi_dimension_prefetch (2.71x), prefetch_fact_join (3.77x). The optimizer already pushes filters into dimension scans, but creating explicit CTEs might help with join ordering.
+3. EARLY_FILTER: Dimension tables are filtered but joined in sequence. Could pre-filter all dimensions first. Matches early_filter (4.00x).
+4. SINGLE_PASS_AGGREGATION: Not applicable - only one aggregation pass.
+5. LATE_ATTRIBUTE_BINDING: The customer and current_addr joins are for display columns (names, cities) and a filter (city mismatch). Could be deferred until after aggregation and filtering. This matches the principle of late attribute binding.
+
+AGGREGATION TRAP CHECK:
+- Aggregates: SUM(ss_coupon_amt), SUM(ss_net_profit)
+- Both are duplicate-insensitive (SUM is additive, unaffected by row duplication as long as values aren't duplicated).
+- Group by includes ss_ticket_number, ss_customer_sk, ss_addr_sk, ca_city. The join with customer and current_addr is on customer key and address key, which are already in the group by (ss_customer_sk, ss_addr_sk). So joining after aggregation should not change aggregation results.
+
+TRANSFORM SELECTION (ranked by expected value):
+1. STAR_JOIN_PREFETCH + EARLY_FILTER (compound): Pre-filter all dimension tables into CTEs, then join with fact table. This attacks the dimension join ordering and could reduce the fact table probe size. Historical evidence: multi_dimension_prefetch (2.71x), early_filter (4.00x).
+2. OR_TO_UNION: Split the OR condition on household_demographics into UNION ALL branches. Despite the table being small, it's worth testing as a standalone transform. Historical: 3.17x on Q15.
+3. LATE_ATTRIBUTE_BINDING: Defer customer and current_addr joins until after all filtering and aggregation. This reduces the number of tables in the initial star join. Novel transform but follows the principle.
+4. EXPLORATION: Combine OR-to-UNION with star-join prefetch in a novel way.
+
+LOGICAL TREE DESIGN:
+For each strategy, need to define CTEs with exhaustive output columns. Must include all columns referenced downstream.
+</reasoning>
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Return weekend ticket-level coupon and profit totals for selected store cities during 1999-2001 where household has 6 dependents or 0 vehicles, then keep customers whose current city differs from purchase city. All joins are INNER (intersection semantics) requiring matches on all sides. Aggregates SUM(ss_coupon_amt) and SUM(ss_net_profit) are duplicate-insensitive but depend on correct group membership defined by (ss_ticket_number, ss_customer_sk, ss_addr_sk, ca_city). The city mismatch filter (current_addr.ca_city <> bought_city) depends on both customer_address aliases and must be preserved.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: store_sales SEQ_SCAN dominates at 576ms (63%). Cardinality flow: 14.9M → 4.3M after date join → 2.3M after store join → 567K after household join → 564K after address join → 53K after aggregation. The optimizer already pushes predicates into dimension scans (date_dim: 1,096 rows, store: 102 rows, household_demographics: 7,200 rows). Logical-tree cost percentages are misleading: HASH_GROUP_BY shows 4% but processes 564K rows; actual bottleneck is early fact table scan and subsequent hash joins.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, amt, profit in same order.
+- CTE_COLUMN_COMPLETENESS: Every CTE must include all columns referenced by downstream consumers.
+- LITERAL_PRESERVATION: Must preserve literal values: d_dow in (6,0), d_year in (1999,2000,2001), s_city list, hd_dep_count=6, hd_vehicle_count=0.
+- SEMANTIC_EQUIVALENCE: Must return exactly same 100 rows with same ordering.
+- CROSS_COLUMN_OR_DECOMPOSITION: OR condition on hd_dep_count and hd_vehicle_count prevents optimal scan path.
+- STAR_JOIN_PREFETCH: Multiple dimension tables with selective filters could be pre-filtered before fact join.
+- LATE_ATTRIBUTE_BINDING: customer and current_addr joins only provide display columns and one filter.
+
+REGRESSION_WARNINGS:
+1. or_to_union (0.59x on Q90):
+   CAUSE: Split same-column time range OR into UNION branches, doubling fact table scans.
+   RULE: Only split OR on DIFFERENT columns (hd_dep_count vs hd_vehicle_count), not same column.
+2. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially with fact table.
+3. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Baseline <50ms, CTE overhead dominated savings.
+   RULE: This query's baseline is 913ms, so CTE overhead acceptable.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch_early_filter
+TARGET_LOGICAL_TREE:
+  date_cte -> store_cte -> hd_cte -> addr_cte -> filtered_fact -> agg -> late_customer_join -> output
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_dow IN (6,0) AND d_year BETWEEN 1999 AND 2001
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 1,096
+    CONSUMERS: filtered_fact
+  store_cte:
+    FROM: store
+    WHERE: s_city IN ('Five Points','Centerville','Oak Grove','Fairview','Liberty')
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 102
+    CONSUMERS: filtered_fact
+  hd_cte:
+    FROM: household_demographics
+    WHERE: hd_dep_count = 6 OR hd_vehicle_count = 0
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 7,200
+    CONSUMERS: filtered_fact
+  addr_cte:
+    FROM: customer_address
+    OUTPUT: ca_address_sk, ca_city
+    EXPECTED_ROWS: 750K (unfiltered, but only needed for join key and city)
+    CONSUMERS: filtered_fact
+  filtered_fact:
+    FROM: store_sales
+    JOIN: INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+           INNER JOIN store_cte ON ss_store_sk = s_store_sk
+           INNER JOIN hd_cte ON ss_hdemo_sk = hd_demo_sk
+           INNER JOIN addr_cte ON ss_addr_sk = ca_address_sk
+    OUTPUT: ss_ticket_number, ss_customer_sk, ss_addr_sk, ca_city AS bought_city, ss_coupon_amt, ss_net_profit
+    EXPECTED_ROWS: 564K
+    CONSUMERS: agg
+  agg:
+    FROM: filtered_fact
+    GROUP BY: ss_ticket_number, ss_customer_sk, ss_addr_sk, bought_city
+    AGGREGATE: SUM(ss_coupon_amt) AS amt, SUM(ss_net_profit) AS profit
+    OUTPUT: ss_ticket_number, ss_customer_sk, ss_addr_sk, bought_city, amt, profit
+    EXPECTED_ROWS: 53K
+    CONSUMERS: late_customer_join
+  late_customer_join:
+    FROM: agg
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+           INNER JOIN customer_address current_addr ON customer.c_current_addr_sk = current_addr.ca_address_sk
+    WHERE: current_addr.ca_city <> bought_city
+    OUTPUT: c_last_name, c_first_name, current_addr.ca_city, bought_city, ss_ticket_number, amt, profit
+    EXPECTED_ROWS: 48K
+    CONSUMERS: output
+  output:
+    FROM: late_customer_join
+    ORDER BY: c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number
+    LIMIT: 100
+    OUTPUT: c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, amt, profit
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: multi_dimension_prefetch, early_filter, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- multi_dimension_prefetch (Q43): Apply pre-filtering of date_dim and store into CTEs before fact join; ignore that Q43 has multiple fact tables.
+- early_filter (Q11): Filter dimension tables first then join to fact; apply to all four dimensions.
+- dimension_cte_isolate (Q26): Pre-filter dimension tables into CTEs; ignore the cross-join hazard (we join sequentially).
+HAZARD_FLAGS:
+- addr_cte is unfiltered (750K rows) - large hash table for join.
+- Must ensure all CTE output columns match downstream references.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: or_to_union_decomposition
+TARGET_LOGICAL_TREE:
+  hd_branch1 -> hd_branch2 -> hd_union -> fact_join -> agg -> customer_join -> output
+NODE_CONTRACTS:
+  hd_branch1:
+    FROM: household_demographics
+    WHERE: hd_dep_count = 6
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: ~3,600 (half of 7,200)
+    CONSUMERS: hd_union
+  hd_branch2:
+    FROM: household_demographics
+    WHERE: hd_vehicle_count = 0
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: ~3,600
+    CONSUMERS: hd_union
+  hd_union:
+    FROM: (SELECT hd_demo_sk FROM hd_branch1 UNION ALL SELECT hd_demo_sk FROM hd_branch2)
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 7,200
+    CONSUMERS: fact_join
+  fact_join:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk
+           INNER JOIN store ON ss_store_sk = s_store_sk
+           INNER JOIN hd_union ON ss_hdemo_sk = hd_demo_sk
+           INNER JOIN customer_address ON ss_addr_sk = ca_address_sk
+    WHERE: d_dow IN (6,0) AND d_year BETWEEN 1999 AND 2001
+           AND s_city IN ('Five Points','Centerville','Oak Grove','Fairview','Liberty')
+    OUTPUT: ss_ticket_number, ss_customer_sk, ss_addr_sk, ca_city AS bought_city, ss_coupon_amt, ss_net_profit
+    EXPECTED_ROWS: 564K
+    CONSUMERS: agg
+  agg:
+    FROM: fact_join
+    GROUP BY: ss_ticket_number, ss_customer_sk, ss_addr_sk, bought_city
+    AGGREGATE: SUM(ss_coupon_amt) AS amt, SUM(ss_net_profit) AS profit
+    OUTPUT: ss_ticket_number, ss_customer_sk, ss_addr_sk, bought_city, amt, profit
+    EXPECTED_ROWS: 53K
+    CONSUMERS: customer_join
+  customer_join:
+    FROM: agg
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+           INNER JOIN customer_address current_addr ON customer.c_current_addr_sk = current_addr.ca_address_sk
+    WHERE: current_addr.ca_city <> bought_city
+    OUTPUT: c_last_name, c_first_name, current_addr.ca_city, bought_city, ss_ticket_number, amt, profit
+    EXPECTED_ROWS: 48K
+    CONSUMERS: output
+  output:
+    FROM: customer_join
+    ORDER BY: c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number
+    LIMIT: 100
+    OUTPUT: c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, amt, profit
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: or_to_union
+EXAMPLE_ADAPTATION:
+- or_to_union (Q15): Split OR conditions on different columns into UNION ALL branches; apply to household_demographics only; ignore that Q15 has three branches.
+HAZARD_FLAGS:
+- UNION ALL may produce duplicates if a row matches both conditions (hd_dep_count=6 AND hd_vehicle_count=0). Need DISTINCT or UNION to deduplicate? Check semantics: OR condition, a row matching both should be included once. Use UNION DISTINCT instead of UNION ALL.
+- Two scans of household_demographics instead of one.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+  core_agg -> customer_filter -> output
+NODE_CONTRACTS:
+  core_agg:
+    FROM: store_sales
+    JOIN: INNER JOIN date_dim ON ss_sold_date_sk = d_date_sk
+           INNER JOIN store ON ss_store_sk = s_store_sk
+           INNER JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk
+           INNER JOIN customer_address bought_addr ON ss_addr_sk = bought_addr.ca_address_sk
+    WHERE: (hd_dep_count = 6 OR hd_vehicle_count = 0)
+           AND d_dow IN (6,0) AND d_year BETWEEN 1999 AND 2001
+           AND s_city IN ('Five Points','Centerville','Oak Grove','Fairview','Liberty')
+    GROUP BY: ss_ticket_number, ss_customer_sk, ss_addr_sk, bought_addr.ca_city
+    AGGREGATE: SUM(ss_coupon_amt) AS amt, SUM(ss_net_profit) AS profit
+    OUTPUT: ss_ticket_number, ss_customer_sk, ss_addr_sk, bought_addr.ca_city AS bought_city, amt, profit
+    EXPECTED_ROWS: 53K
+    CONSUMERS: customer_filter
+  customer_filter:
+    FROM: core_agg
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+           INNER JOIN customer_address current_addr ON customer.c_current_addr_sk = current_addr.ca_address_sk
+    WHERE: current_addr.ca_city <> bought_city
+    OUTPUT: c_last_name, c_first_name, current_addr.ca_city, bought_city, ss_ticket_number, amt, profit
+    EXPECTED_ROWS: 48K
+    CONSUMERS: output
+  output:
+    FROM: customer_filter
+    ORDER BY: c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number
+    LIMIT: 100
+    OUTPUT: c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, amt, profit
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate (Q26): Isolate dimension filters early; but here we keep joins inline rather than CTEs.
+- early_filter (Q11): Filter dimensions first; apply by pushing all dimension WHERE clauses into the JOIN conditions.
+HAZARD_FLAGS:
+- Minimal change from original; may not provide significant speedup.
+- Must ensure join order doesn't change semantics.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_or_prefetch
+TARGET_LOGICAL_TREE:
+  date_cte -> store_cte -> hd_branch1 -> hd_branch2 -> hd_union -> addr_cte -> filtered_fact -> agg -> late_customer_join -> output
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_dow IN (6,0) AND d_year BETWEEN 1999 AND 2001
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 1,096
+    CONSUMERS: filtered_fact
+  store_cte:
+    FROM: store
+    WHERE: s_city IN ('Five Points','Centerville','Oak Grove','Fairview','Liberty')
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 102
+    CONSUMERS: filtered_fact
+  hd_branch1:
+    FROM: household_demographics
+    WHERE: hd_dep_count = 6
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: ~3,600
+    CONSUMERS: hd_union
+  hd_branch2:
+    FROM: household_demographics
+    WHERE: hd_vehicle_count = 0
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: ~3,600
+    CONSUMERS: hd_union
+  hd_union:
+    FROM: (SELECT hd_demo_sk FROM hd_branch1 UNION DISTINCT SELECT hd_demo_sk FROM hd_branch2)
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 7,200
+    CONSUMERS: filtered_fact
+  addr_cte:
+    FROM: customer_address
+    OUTPUT: ca_address_sk, ca_city
+    EXPECTED_ROWS: 750K
+    CONSUMERS: filtered_fact
+  filtered_fact:
+    FROM: store_sales
+    JOIN: INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+           INNER JOIN store_cte ON ss_store_sk = s_store_sk
+           INNER JOIN hd_union ON ss_hdemo_sk = hd_demo_sk
+           INNER JOIN addr_cte ON ss_addr_sk = ca_address_sk
+    OUTPUT: ss_ticket_number, ss_customer_sk, ss_addr_sk, ca_city AS bought_city, ss_coupon_amt, ss_net_profit
+    EXPECTED_ROWS: 564K
+    CONSUMERS: agg
+  agg:
+    FROM: filtered_fact
+    GROUP BY: ss_ticket_number, ss_customer_sk, ss_addr_sk, bought_city
+    AGGREGATE: SUM(ss_coupon_amt) AS amt, SUM(ss_net_profit) AS profit
+    OUTPUT: ss_ticket_number, ss_customer_sk, ss_addr_sk, bought_city, amt, profit
+    EXPECTED_ROWS: 53K
+    CONSUMERS: late_customer_join
+  late_customer_join:
+    FROM: agg
+    JOIN: INNER JOIN customer ON ss_customer_sk = c_customer_sk
+           INNER JOIN customer_address current_addr ON customer.c_current_addr_sk = current_addr.ca_address_sk
+    WHERE: current_addr.ca_city <> bought_city
+    OUTPUT: c_last_name, c_first_name, current_addr.ca_city, bought_city, ss_ticket_number, amt, profit
+    EXPECTED_ROWS: 48K
+    CONSUMERS: output
+  output:
+    FROM: late_customer_join
+    ORDER BY: c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number
+    LIMIT: 100
+    OUTPUT: c_last_name, c_first_name, ca_city, bought_city, ss_ticket_number, amt, profit
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: or_to_union, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- or_to_union (Q15): Split OR on household_demographics into UNION DISTINCT branches.
+- multi_dimension_prefetch (Q43): Pre-filter date and store into CTEs before fact join.
+- Combine both techniques: apply OR-to-UNION decomposition within a star-join prefetch structure.
+HAZARD_FLAGS:
+- UNION DISTINCT adds deduplication cost but ensures correct OR semantics.
+- Multiple CTEs may increase materialization overhead.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

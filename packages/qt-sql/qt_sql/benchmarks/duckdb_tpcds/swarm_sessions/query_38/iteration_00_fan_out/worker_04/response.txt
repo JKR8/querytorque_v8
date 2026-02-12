@@ -1,0 +1,90 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Consolidated three channel scans into UNION ALL with single-pass aggregation
+    ├── [!] filtered_dates  [NEW CTE] — Pre-filter date_dim once for all channels
+    ├── [!] store_scan  [NEW CTE] — Store sales with customer join
+    ├── [!] catalog_scan  [NEW CTE] — Catalog sales with customer join  
+    ├── [!] web_scan  [NEW CTE] — Web sales with customer join
+    ├── [!] all_sales_union  [NEW CTE] — UNION ALL of three channel CTEs
+    ├── [!] channel_aggregation  [NEW CTE] — GROUP BY with COUNT(DISTINCT channel)
+    └── [~] OUTPUT (COUNT(*)) — Final count of 3-channel combos
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_aggregation", "description": "Consolidated three channel INTERSECT operations into UNION ALL with COUNT(DISTINCT channel) aggregation", "applied_to": ["filtered_dates", "store_scan", "catalog_scan", "web_scan", "all_sales_union", "channel_aggregation"]},
+    {"id": "R2", "type": "channel_bitmap_aggregation", "description": "Replaced INTERSECT with channel counting using explicit channel literals", "applied_to": ["all_sales_union", "channel_aggregation"]},
+    {"id": "R3", "type": "date_cte_isolate", "description": "Extracted date filter to reusable CTE for all three channel scans", "applied_to": ["filtered_dates"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1183 AND 1183 + 11",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "store_scan": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT customer.c_last_name, customer.c_first_name, filtered_dates.d_date, 'store' as channel FROM store_sales INNER JOIN filtered_dates ON store_sales.ss_sold_date_sk = filtered_dates.d_date_sk INNER JOIN customer ON store_sales.ss_customer_sk = customer.c_customer_sk",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date", "channel"], "consumes": ["filtered_dates"]}
+      },
+      "catalog_scan": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT customer.c_last_name, customer.c_first_name, filtered_dates.d_date, 'catalog' as channel FROM catalog_sales INNER JOIN filtered_dates ON catalog_sales.cs_sold_date_sk = filtered_dates.d_date_sk INNER JOIN customer ON catalog_sales.cs_bill_customer_sk = customer.c_customer_sk",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date", "channel"], "consumes": ["filtered_dates"]}
+      },
+      "web_scan": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT customer.c_last_name, customer.c_first_name, filtered_dates.d_date, 'web' as channel FROM web_sales INNER JOIN filtered_dates ON web_sales.ws_sold_date_sk = filtered_dates.d_date_sk INNER JOIN customer ON web_sales.ws_bill_customer_sk = customer.c_customer_sk",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date", "channel"], "consumes": ["filtered_dates"]}
+      },
+      "all_sales_union": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT c_last_name, c_first_name, d_date, channel FROM store_scan UNION ALL SELECT c_last_name, c_first_name, d_date, channel FROM catalog_scan UNION ALL SELECT c_last_name, c_first_name, d_date, channel FROM web_scan",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date", "channel"], "consumes": ["store_scan", "catalog_scan", "web_scan"]}
+      },
+      "channel_aggregation": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT c_last_name, c_first_name, d_date, COUNT(DISTINCT channel) as channel_count FROM all_sales_union GROUP BY c_last_name, c_first_name, d_date",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date", "channel_count"], "consumes": ["all_sales_union"]}
+      },
+      "filter_all_channels": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT c_last_name, c_first_name, d_date FROM channel_aggregation WHERE channel_count = 3",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date"], "consumes": ["channel_aggregation"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(*) FROM filter_all_channels LIMIT 100",
+        "interfaces": {"outputs": ["count(*)"], "consumes": ["filter_all_channels"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "store_scan", "catalog_scan", "web_scan", "all_sales_union", "channel_aggregation", "filter_all_channels", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), store_scan AS ({store_scan}), catalog_scan AS ({catalog_scan}), web_scan AS ({web_scan}), all_sales_union AS ({all_sales_union}), channel_aggregation AS ({channel_aggregation}), filter_all_channels AS ({filter_all_channels}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced three separate INTERSECT operations with a single-pass aggregation approach that UNIONS ALL three channel scans, groups by customer/date, and counts distinct channels (must equal 3). Maintains same join semantics and date filtering via reusable date CTE.
+
+**Expected speedup**: 3-5x by eliminating duplicate date/customer scans and using single aggregation pass instead of three full distinct computations with INTERSECT.

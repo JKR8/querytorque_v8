@@ -1,0 +1,73 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] ctr_with_avg  [+]  Cost: 45%  Rows: 132K  — Aggregate 2002 web returns with state average via window function.
+│   ├── SCAN (web_returns, date_dim (join), customer_address (join) as return address)
+│   ├── JOIN (wr_returned_date_sk = d_date_sk)
+│   ├── JOIN (wr_returning_addr_sk = ca_address_sk)
+│   ├── FILTER (d_year = 2002)
+│   ├── AGG (GROUP BY wr_returning_customer_sk, ca_state)
+│   ├── WINDOW (AVG(ctr_total_return) PARTITION BY ca_state)
+│   └── OUTPUT (ctr_customer_sk, ctr_state, ctr_total_return, threshold=state_avg*1.2)
+├── [CTE] main_filter  [~]  Cost: 54%  Rows: 913  — Join CTE with customer/current address, filter IN customers above threshold.
+│   ├── SCAN (ctr_with_avg, customer, customer_address as current address)
+│   ├── JOIN (ctr_customer_sk = c_customer_sk)
+│   ├── JOIN (ca_address_sk = c_current_addr_sk)
+│   ├── FILTER (ca_state = 'IN' AND ctr_total_return > threshold)
+│   └── OUTPUT (13 customer columns + ctr_total_return)
+└── [CTE] top_n  [~]  Cost: 1%  Rows: 100  — Order and limit.
+    ├── SCAN (main_filter)
+    ├── SORT (13 columns)
+    └── OUTPUT (same 13 columns)
+```
+
+**Change markers explained:**
+- `[+]` ctr_with_avg: New CTE replaces original correlated subquery with window function to compute state average.
+- `[~]` main_filter: Changed FROM clause to use new CTE (ctr_with_avg) instead of original CTE (customer_total_return) and removed correlated subquery filter.
+- `[~]` top_n: Changed FROM clause to use main_filter CTE.
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "correlated_subquery_to_window", "description": "Replace state-level correlated subquery with window function AVG() OVER (PARTITION BY ca_state)", "applied_to": ["ctr_with_avg"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "ctr_with_avg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT wr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, SUM(wr_return_amt) AS ctr_total_return, AVG(SUM(wr_return_amt)) OVER (PARTITION BY ca_state) * 1.2 AS threshold FROM web_returns JOIN date_dim ON wr_returned_date_sk = d_date_sk JOIN customer_address ON wr_returning_addr_sk = ca_address_sk WHERE d_year = 2002 GROUP BY wr_returning_customer_sk, ca_state",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_state", "ctr_total_return", "threshold"], "consumes": []}
+      },
+      "main_filter": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return FROM ctr_with_avg JOIN customer ON ctr_customer_sk = c_customer_sk JOIN customer_address ON ca_address_sk = c_current_addr_sk WHERE ca_state = 'IN' AND ctr_total_return > threshold",
+        "interfaces": {"outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag", "c_birth_day", "c_birth_month", "c_birth_year", "c_birth_country", "c_login", "c_email_address", "c_last_review_date_sk", "ctr_total_return"], "consumes": ["ctr_with_avg"]}
+      },
+      "top_n": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return FROM main_filter ORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return LIMIT 100",
+        "interfaces": {"outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag", "c_birth_day", "c_birth_month", "c_birth_year", "c_birth_country", "c_login", "c_email_address", "c_last_review_date_sk", "ctr_total_return"], "consumes": ["main_filter"]}
+      }
+    },
+    "reconstruction_order": ["ctr_with_avg", "main_filter", "top_n"],
+    "assembly_template": "WITH ctr_with_avg AS ({ctr_with_avg}), main_filter AS ({main_filter}) {top_n}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Replaced the correlated subquery with a window function that computes the state average in a single pass over the grouped data, then multiplies by 1.2 to get the threshold. This eliminates N re-scans of the aggregated data per state.
+
+**Expected speedup:** 2-3× due to eliminating correlated subquery execution per outer row and enabling single-pass aggregation.

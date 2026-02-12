@@ -1,0 +1,282 @@
+<reasoning>
+1. **CLASSIFY**: This is a "channel-comparison self-join" archetype. The query computes per-customer yearly totals for store and web sales (2001 and 2002) via a UNION ALL CTE, then self-joins the CTE four times (store_2001, store_2002, web_2001, web_2002) to compare growth ratios.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total runtime: 9423ms
+   - Major bottlenecks:
+     - store_sales scan for 2001: 4000.1ms (42% of total)
+     - web_sales scan for 2001: 1065.7ms (11%)
+     - store_sales scan for 2002: 315.6ms (3%)
+     - web_sales scan for 2002: 46.3ms (<1%)
+   - Row count drops:
+     - date_dim scans: 73K → 365 rows (0.5% selectivity) - already optimized
+     - customer scans: 500K rows each (no reduction)
+     - store_sales joins: 5.5M → 5.4M rows (minimal reduction)
+     - web_sales joins: 1.4M rows (minimal reduction)
+   - The optimizer already:
+     - Pushes date filters (d_year) into date_dim scans
+     - Uses hash joins
+     - Materializes the CTE multiple times (store and web branches computed separately)
+   - Scan counts:
+     - store_sales: scanned twice (2001 and 2002)
+     - web_sales: scanned twice (2001 and 2002)
+     - customer: scanned 4 times (twice for store, twice for web)
+     - date_dim: scanned 4 times
+   - The CTE is NOT materialized once - each reference re-executes the UNION ALL with different year filters
+
+3. **GAP MATCHING**:
+   - **REDUNDANT_SCAN_ELIMINATION**: Present - store_sales and web_sales each scanned twice
+   - **UNION_CTE_SELF_JOIN_DECOMPOSITION**: Present - generic CTE scanned 4 times with different year/channel filters
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: Present - year and channel filters applied late in self-joins
+   - **CORRELATED_SUBQUERY_PARALYSIS**: NOT present - no correlated subqueries
+   - **CROSS_COLUMN_OR_DECOMPOSITION**: NOT present - no OR conditions
+
+4. **AGGREGATION TRAP CHECK**:
+   - Only SUM() aggregates, no STDDEV_SAMP/VARIANCE
+   - GROUP BY includes customer_id and d_year, so each customer/year combination is unique in the CTE
+   - Changing grouping would be unsafe, but consolidating scans with CASE WHEN and keeping the same GROUP BY is safe
+
+5. **TRANSFORM SELECTION** (diverse strategies):
+   - **Worker 1**: Single-pass aggregation - consolidate the two store_sales scans (2001, 2002) into one, and the two web_sales scans into one
+   - **Worker 2**: Union CTE split - split the generic CTE into 4 specialized CTEs (store_2001, store_2002, web_2001, web_2002)
+   - **Worker 3**: Prefetch fact join - pre-join filtered date_dim with fact tables before customer join
+   - **Worker 4**: Exploration - compound strategy combining single-pass aggregation with late attribute binding for customer columns
+
+6. **LOGICAL TREE DESIGN**:
+   - For each strategy, ensure all required columns flow through: customer_id, first_name, last_name, birth_country, plus dyear, year_total, sale_type for joins
+   - The main query needs 4 instances with specific filters - design CTEs accordingly
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Find customers whose web sales growth ratio (2002/2001) exceeds their store sales growth ratio (2002/2001), requiring positive 2001 totals in both channels. The query uses INNER JOIN semantics (all four year/channel combinations must match for a customer), with SUM aggregates that are duplicate-insensitive. Filter dependencies: year filters (2001, 2002) and channel filters ('s','w') must be preserved in the four-way self-join, and the growth ratio comparison depends on positive year_total values.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound bottleneck: 53% of runtime (5000+ ms) is spent scanning store_sales (5.5M rows) and web_sales (1.4M rows) twice each for 2001 and 2002. Row counts barely drop after joins (5.5M → 5.4M). The optimizer already pushes date filters effectively (73K → 365 rows) and uses hash joins efficiently. The logical-tree cost percentages (50%/50%) are misleading - the CTE dominates due to repeated fact table scans, not the self-join.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output t_s_secyear.customer_id, customer_first_name, customer_last_name, customer_birth_country in that order
+- CTE_COLUMN_COMPLETENESS: Any new CTEs must include customer_id, first_name, last_name, birth_country, dyear, year_total, sale_type for downstream joins
+- LITERAL_PRESERVATION: Must preserve literal values: dyear=2001 and 2002, sale_type='s'/'w'
+- SEMANTIC_EQUIVALENCE: Must return exactly same 100 rows ordered by customer_id, first_name, last_name, birth_country
+- REDUNDANT_SCAN_ELIMINATION: store_sales scanned twice (4000ms + 315ms), web_sales twice (1065ms + 46ms) - opportunity to consolidate
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: Generic year_total CTE scanned 4 times with different year/channel filters
+- CROSS_CTE_PREDICATE_BLINDNESS: Year/channel filters applied in main query self-joins, not pushed into CTE
+
+REGRESSION_WARNINGS:
+1. union_cte_split (0.49x on Q74):
+   CAUSE: Kept original UNION CTE alongside specialized CTEs, causing redundant materialization
+   RULE: When splitting CTE by year/channel, ELIMINATE the original generic CTE completely
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Baseline runtime <50ms, CTE materialization overhead dominated
+   RULE: Baseline here is 9400ms, so transform applicable, but keep CTE chain minimal
+3. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion
+   RULE: Never cross-join dimension CTEs; join them sequentially to fact tables
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  store_aggregates -> web_aggregates -> main_self_join
+NODE_CONTRACTS:
+  store_aggregates:
+    FROM: customer c, store_sales ss, date_dim d
+    JOIN: c.c_customer_sk = ss.ss_customer_sk AND ss.ss_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year IN (2001, 2002)
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country, d.d_year
+    AGGREGATE: SUM(ss.ss_ext_list_price - ss.ss_ext_discount_amt) AS year_total
+    OUTPUT: c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, d.d_year AS dyear, SUM(...) AS year_total, 's' AS sale_type
+    EXPECTED_ROWS: ~400K (200K per year)
+    CONSUMERS: main_self_join
+  web_aggregates:
+    FROM: customer c, web_sales ws, date_dim d
+    JOIN: c.c_customer_sk = ws.ws_bill_customer_sk AND ws.ws_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year IN (2001, 2002)
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country, d.d_year
+    AGGREGATE: SUM(ws.ws_ext_list_price - ws.ws_ext_discount_amt) AS year_total
+    OUTPUT: c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, d.d_year AS dyear, SUM(...) AS year_total, 'w' AS sale_type
+    EXPECTED_ROWS: ~200K (100K per year)
+    CONSUMERS: main_self_join
+  main_self_join:
+    FROM: store_aggregates s2001, store_aggregates s2002, web_aggregates w2001, web_aggregates w2002
+    JOIN: s2001.customer_id = s2002.customer_id = w2001.customer_id = w2002.customer_id
+    WHERE: s2001.dyear = 2001 AND s2002.dyear = 2002 AND w2001.dyear = 2001 AND w2002.dyear = 2002
+      AND s2001.year_total > 0 AND w2001.year_total > 0
+      AND (w2002.year_total / w2001.year_total) > (s2002.year_total / s2001.year_total)
+    OUTPUT: s2002.customer_id, s2002.customer_first_name, s2002.customer_last_name, s2002.customer_birth_country
+    EXPECTED_ROWS: ~100
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation, pushdown
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply CASE aggregation pattern but keep GROUP BY customer+year; ignore scalar subquery consolidation
+- channel_bitmap_aggregation: Consolidate two store scans into one with WHERE d_year IN (2001,2002); ignore bitmap technique
+- pushdown: Push d_year filter into CTE; ignore consolidation of multiple subqueries
+HAZARD_FLAGS:
+- Must ensure GROUP BY includes d_year to keep 2001/2002 rows separate
+- The pivot (selecting 2001 vs 2002) happens in main self-join, not in CTE
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: union_cte_split
+TARGET_LOGICAL_TREE:
+  store_2001 -> store_2002 -> web_2001 -> web_2002 -> main_self_join
+NODE_CONTRACTS:
+  store_2001:
+    FROM: customer c, store_sales ss, date_dim d
+    JOIN: c.c_customer_sk = ss.ss_customer_sk AND ss.ss_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year = 2001
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE: SUM(ss.ss_ext_list_price - ss.ss_ext_discount_amt) AS year_total
+    OUTPUT: c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, 2001 AS dyear, SUM(...) AS year_total, 's' AS sale_type
+    EXPECTED_ROWS: ~200K
+    CONSUMERS: main_self_join
+  store_2002:
+    FROM: customer c, store_sales ss, date_dim d
+    JOIN: c.c_customer_sk = ss.ss_customer_sk AND ss.ss_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year = 2002
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE: SUM(ss.ss_ext_list_price - ss.ss_ext_discount_amt) AS year_total
+    OUTPUT: c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, 2002 AS dyear, SUM(...) AS year_total, 's' AS sale_type
+    EXPECTED_ROWS: ~200K
+    CONSUMERS: main_self_join
+  web_2001:
+    FROM: customer c, web_sales ws, date_dim d
+    JOIN: c.c_customer_sk = ws.ws_bill_customer_sk AND ws.ws_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year = 2001
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE: SUM(ws.ws_ext_list_price - ws.ws_ext_discount_amt) AS year_total
+    OUTPUT: c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, 2001 AS dyear, SUM(...) AS year_total, 'w' AS sale_type
+    EXPECTED_ROWS: ~100K
+    CONSUMERS: main_self_join
+  web_2002:
+    FROM: customer c, web_sales ws, date_dim d
+    JOIN: c.c_customer_sk = ws.ws_bill_customer_sk AND ws.ws_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year = 2002
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE: SUM(ws.ws_ext_list_price - ws.ws_ext_discount_amt) AS year_total
+    OUTPUT: c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, 2002 AS dyear, SUM(...) AS year_total, 'w' AS sale_type
+    EXPECTED_ROWS: ~100K
+    CONSUMERS: main_self_join
+  main_self_join:
+    FROM: store_2001 s1, store_2002 s2, web_2001 w1, web_2002 w2
+    JOIN: s1.customer_id = s2.customer_id = w1.customer_id = w2.customer_id
+    WHERE: s1.year_total > 0 AND w1.year_total > 0
+      AND (w2.year_total / w1.year_total) > (s2.year_total / s1.year_total)
+    OUTPUT: s2.customer_id, s2.customer_first_name, s2.customer_last_name, s2.customer_birth_country
+    EXPECTED_ROWS: ~100
+    CONSUMERS: final output
+EXAMPLES: union_cte_split, shared_dimension_multi_channel, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- union_cte_split: Split by year AND channel into 4 CTEs; eliminate original UNION CTE completely
+- shared_dimension_multi_channel: Extract date_dim filter into CTE but here we embed in each CTE; ignore sharing across channels
+- date_cte_isolate: Push d_year filter into each CTE; ignore creating separate date CTE
+HAZARD_FLAGS:
+- Must eliminate original year_total CTE completely to avoid redundant computation
+- Each CTE still scans customer table separately (4 times) - opportunity for further optimization
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  filtered_dates -> store_sales_prejoin -> web_sales_prejoin -> store_aggregates -> web_aggregates -> main_self_join
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim d
+    WHERE: d.d_year IN (2001, 2002)
+    OUTPUT: d.d_date_sk, d.d_year
+    EXPECTED_ROWS: 730 (365 per year)
+    CONSUMERS: store_sales_prejoin, web_sales_prejoin
+  store_sales_prejoin:
+    FROM: store_sales ss INNER JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk
+    OUTPUT: ss.ss_customer_sk, fd.d_year, (ss.ss_ext_list_price - ss.ss_ext_discount_amt) AS amount
+    EXPECTED_ROWS: ~5.5M
+    CONSUMERS: store_aggregates
+  web_sales_prejoin:
+    FROM: web_sales ws INNER JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk
+    OUTPUT: ws.ws_bill_customer_sk, fd.d_year, (ws.ws_ext_list_price - ws.ws_ext_discount_amt) AS amount
+    EXPECTED_ROWS: ~1.4M
+    CONSUMERS: web_aggregates
+  store_aggregates:
+    FROM: customer c INNER JOIN store_sales_prejoin ssp ON c.c_customer_sk = ssp.ss_customer_sk
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country, ssp.d_year
+    AGGREGATE: SUM(ssp.amount) AS year_total
+    OUTPUT: c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, ssp.d_year AS dyear, SUM(ssp.amount) AS year_total, 's' AS sale_type
+    EXPECTED_ROWS: ~400K
+    CONSUMERS: main_self_join
+  web_aggregates:
+    FROM: customer c INNER JOIN web_sales_prejoin wsp ON c.c_customer_sk = wsp.ws_bill_customer_sk
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country, wsp.d_year
+    AGGREGATE: SUM(wsp.amount) AS year_total
+    OUTPUT: c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, wsp.d_year AS dyear, SUM(wsp.amount) AS year_total, 'w' AS sale_type
+    EXPECTED_ROWS: ~200K
+    CONSUMERS: main_self_join
+  main_self_join:
+    FROM: store_aggregates s2001, store_aggregates s2002, web_aggregates w2001, web_aggregates w2002
+    JOIN: s2001.customer_id = s2002.customer_id = w2001.customer_id = w2002.customer_id
+    WHERE: s2001.dyear = 2001 AND s2002.dyear = 2002 AND w2001.dyear = 2001 AND w2002.dyear = 2002
+      AND s2001.year_total > 0 AND w2001.year_total > 0
+      AND (w2002.year_total / w2001.year_total) > (s2002.year_total / s2001.year_total)
+    OUTPUT: s2002.customer_id, s2002.customer_first_name, s2002.customer_last_name, s2002.customer_birth_country
+    EXPECTED_ROWS: ~100
+    CONSUMERS: final output
+EXAMPLES: prefetch_fact_join, early_filter, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Filter date_dim first, pre-join with fact tables; ignore multiple dimension tables
+- early_filter: Push d_year filter to date_dim scan; ignore other dimension filters
+- multi_dimension_prefetch: Only prefetch date_dim (not other dimensions); ignore store/customer prefetch
+HAZARD_FLAGS:
+- Customer table still scanned twice (for store and web) - opportunity for further consolidation
+- Ensure all required customer columns flow through for final output
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: single_pass_with_late_customer
+TARGET_LOGICAL_TREE:
+  filtered_dates -> consolidated_sales -> customer_late_binding -> main_self_join
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim d
+    WHERE: d.d_year IN (2001, 2002)
+    OUTPUT: d.d_date_sk, d.d_year
+    EXPECTED_ROWS: 730
+    CONSUMERS: consolidated_sales
+  consolidated_sales:
+    FROM: (
+      SELECT ss_customer_sk AS customer_sk, d_year, (ss_ext_list_price - ss_ext_discount_amt) AS amount, 's' AS sale_type
+      FROM store_sales ss INNER JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk
+      UNION ALL
+      SELECT ws_bill_customer_sk AS customer_sk, d_year, (ws_ext_list_price - ws_ext_discount_amt) AS amount, 'w' AS sale_type
+      FROM web_sales ws INNER JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk
+    )
+    GROUP BY: customer_sk, d_year, sale_type
+    AGGREGATE: SUM(amount) AS year_total
+    OUTPUT: customer_sk, d_year, sale_type, SUM(amount) AS year_total
+    EXPECTED_ROWS: ~600K
+    CONSUMERS: customer_late_binding
+  customer_late_binding:
+    FROM: consolidated_sales cs INNER JOIN customer c ON cs.customer_sk = c.c_customer_sk
+    OUTPUT: c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, cs.d_year AS dyear, cs.year_total, cs.sale_type
+    EXPECTED_ROWS: ~600K
+    CONSUMERS: main_self_join
+  main_self_join:
+    FROM: customer_late_binding s2001, customer_late_binding s2002, customer_late_binding w2001, customer_late_binding w2002
+    JOIN: s2001.customer_id = s2002.customer_id = w2001.customer_id = w2002.customer_id
+    WHERE: s2001.dyear = 2001 AND s2002.dyear = 2002 AND s2001.sale_type = 's' AND s2002.sale_type = 's'
+      AND w2001.dyear = 2001 AND w2002.dyear = 2002 AND w2001.sale_type = 'w' AND w2002.sale_type = 'w'
+      AND s2001.year_total > 0 AND w2001.year_total > 0
+      AND (w2002.year_total / w2001.year_total) > (s2002.year_total / s2001.year_total)
+    OUTPUT: s2002.customer_id, s2002.customer_first_name, s2002.customer_last_name, s2002.customer_birth_country
+    EXPECTED_ROWS: ~100
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, deferred_window_aggregation, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Consolidate both store and web scans into one UNION; ignore CASE aggregation
+- deferred_window_aggregation: Delay customer join until after aggregation; ignore window functions
+- dimension_cte_isolate: Isolate date_dim filtering; ignore other dimension isolation
+HAZARD_FLAGS:
+- Must ensure customer join doesn't change aggregation results (one-to-many preserved)
+- The consolidated_sales CTE loses customer attributes needed for final output - must recover via late join
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

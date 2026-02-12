@@ -1,0 +1,98 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] ws_wh  [=]  Cost: 50%  Rows: ~1K  — Identify web order numbers that involve at least two different warehouses.
+│   ├── SCAN (web_sales AS ws1 (join), web_sales AS ws2 (join))
+│   ├── JOIN (ws1.ws_order_number = ws2.ws_order_number)
+│   ├── FILTER (ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)
+│   └── OUTPUT (ws_order_number)
+└── [MAIN] main_query  [~]  Cost: 50%  Rows: ~1K  — Restructured to follow target tree: filtered_ws → semi_join1 → semi_join2 → aggregate
+    ├── [CTE] filtered_ws  [+]
+    │   ├── SCAN (web_sales ws1, date_dim, customer_address, web_site)
+    │   ├── JOIN (ws1.ws_ship_date_sk = d_date_sk)
+    │   ├── JOIN (ws1.ws_ship_addr_sk = ca_address_sk)
+    │   ├── JOIN (ws1.ws_web_site_sk = web_site_sk)
+    │   ├── FILTER (d_date BETWEEN '1999-2-01' AND (CAST('1999-2-01' AS DATE) + INTERVAL 60 DAY))
+    │   ├── FILTER (ca_state = 'NC')
+    │   ├── FILTER (web_company_name = 'pri')
+    │   └── OUTPUT (ws_order_number, ws_ext_ship_cost, ws_net_profit)
+    ├── [CTE] semi_join1  [+]
+    │   ├── SCAN (filtered_ws)
+    │   ├── SEMI-JOIN (IN ws_wh)
+    │   └── OUTPUT (ws_order_number, ws_ext_ship_cost, ws_net_profit)
+    ├── [CTE] semi_join2  [+]
+    │   ├── SCAN (semi_join1)
+    │   ├── SEMI-JOIN (IN web_returns correlated with ws_wh)
+    │   └── OUTPUT (ws_order_number, ws_ext_ship_cost, ws_net_profit)
+    ├── [CTE] aggregate  [+]
+    │   ├── SCAN (semi_join2)
+    │   ├── AGGREGATE (COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit))
+    │   └── OUTPUT (order count, total shipping cost, total net profit)
+    ├── SORT (COUNT(DISTINCT ws_order_number) ASC)
+    └── OUTPUT (order count, total shipping cost, total net profit)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "materialize_cte", "description": "Extract multi-warehouse order detection into materialized CTE", "applied_to": ["ws_wh"]},
+    {"id": "R2", "type": "staged_join_pipeline", "description": "Restructure into CTE chain: filter facts → semi-join1 → semi-join2 → aggregate", "applied_to": ["filtered_ws", "semi_join1", "semi_join2", "aggregate"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "ws_wh": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT DISTINCT ws1.ws_order_number FROM web_sales ws1 INNER JOIN web_sales ws2 ON ws1.ws_order_number = ws2.ws_order_number WHERE ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk",
+        "interfaces": {"outputs": ["ws_order_number"], "consumes": []}
+      },
+      "filtered_ws": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit FROM web_sales ws1 INNER JOIN date_dim ON ws1.ws_ship_date_sk = date_dim.d_date_sk INNER JOIN customer_address ON ws1.ws_ship_addr_sk = customer_address.ca_address_sk INNER JOIN web_site ON ws1.ws_web_site_sk = web_site.web_site_sk WHERE date_dim.d_date BETWEEN '1999-2-01' AND (CAST('1999-2-01' AS DATE) + INTERVAL 60 DAY) AND customer_address.ca_state = 'NC' AND web_site.web_company_name = 'pri'",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": []}
+      },
+      "semi_join1": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT filtered_ws.ws_order_number, filtered_ws.ws_ext_ship_cost, filtered_ws.ws_net_profit FROM filtered_ws WHERE filtered_ws.ws_order_number IN (SELECT ws_wh.ws_order_number FROM ws_wh)",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": ["filtered_ws", "ws_wh"]}
+      },
+      "semi_join2": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT semi_join1.ws_order_number, semi_join1.ws_ext_ship_cost, semi_join1.ws_net_profit FROM semi_join1 WHERE semi_join1.ws_order_number IN (SELECT web_returns.wr_order_number FROM web_returns WHERE web_returns.wr_order_number IN (SELECT ws_wh.ws_order_number FROM ws_wh))",
+        "interfaces": {"outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"], "consumes": ["semi_join1", "ws_wh"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT COUNT(DISTINCT ws_order_number) AS \"order count\", SUM(ws_ext_ship_cost) AS \"total shipping cost\", SUM(ws_net_profit) AS \"total net profit\" FROM semi_join2",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["semi_join2"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT \"order count\", \"total shipping cost\", \"total net profit\" FROM aggregate ORDER BY \"order count\" LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["aggregate"]}
+      }
+    },
+    "reconstruction_order": ["ws_wh", "filtered_ws", "semi_join1", "semi_join2", "aggregate", "main_query"],
+    "assembly_template": "WITH ws_wh AS ({ws_wh}), filtered_ws AS ({filtered_ws}), semi_join1 AS ({semi_join1}), semi_join2 AS ({semi_join2}), aggregate AS ({aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Restructured query into explicit CTE chain per target logical tree, materializing the multi‑warehouse detection CTE (ws_wh) and staging joins to avoid recomputation. The mechanism preserves all original filters and semi‑join semantics while enabling DuckDB to push predicates within each CTE stage.
+
+Expected speedup: ~1.5‑2x from avoiding repeated self‑join computation and enabling staged predicate pushdown.

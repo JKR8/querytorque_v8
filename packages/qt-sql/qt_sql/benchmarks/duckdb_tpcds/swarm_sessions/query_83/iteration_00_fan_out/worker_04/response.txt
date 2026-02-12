@@ -1,0 +1,116 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_dates  [+]  Cost: 0.1%  Rows: 21  — Filter weeks containing the three reference dates
+│   ├── SCAN (date_dim)
+│   └── OUTPUT (d_date_sk)
+├── [CTE] sr_agg  [~]  Cost: 25%  Rows: ~1K  — Aggregate store returns by item_sk (no item join)
+│   ├── SCAN (store_returns)
+│   ├── JOIN (sr_returned_date_sk = filtered_dates.d_date_sk)
+│   ├── AGG (GROUP BY sr_item_sk)
+│   └── OUTPUT (item_sk, sr_qty)
+├── [CTE] cr_agg  [~]  Cost: 25%  Rows: ~1K  — Aggregate catalog returns by item_sk (no item join)
+│   ├── SCAN (catalog_returns)
+│   ├── JOIN (cr_returned_date_sk = filtered_dates.d_date_sk)
+│   ├── AGG (GROUP BY cr_item_sk)
+│   └── OUTPUT (item_sk, cr_qty)
+├── [CTE] wr_agg  [~]  Cost: 25%  Rows: ~1K  — Aggregate web returns by item_sk (no item join)
+│   ├── SCAN (web_returns)
+│   ├── JOIN (wr_returned_date_sk = filtered_dates.d_date_sk)
+│   ├── AGG (GROUP BY wr_item_sk)
+│   └── OUTPUT (item_sk, wr_qty)
+└── [MAIN] main_query  [~]  Cost: 24.9%  Rows: 100  — Join aggregated CTEs, add item attributes last
+    ├── SCAN (sr_agg, cr_agg, wr_agg)
+    ├── JOIN (sr_agg.item_sk = cr_agg.item_sk)
+    ├── JOIN (sr_agg.item_sk = wr_agg.item_sk)
+    ├── JOIN (sr_agg.item_sk = item.i_item_sk)
+    ├── SORT (i_item_id ASC, sr_qty ASC)
+    └── OUTPUT (item_id, sr_item_qty, sr_dev, cr_item_qty, cr_dev, wr_item_qty, wr_dev, average)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "dimension_cte_isolate",
+      "description": "Pre-filter date_dim once into a CTE containing only date keys for weeks containing the three reference dates",
+      "applied_to": ["filtered_dates"]
+    },
+    {
+      "id": "R2",
+      "type": "late_attribute_binding",
+      "description": "Aggregate return quantities by item surrogate key first, deferring item table join until final SELECT to reduce item table scans",
+      "applied_to": ["sr_agg", "cr_agg", "wr_agg", "main_query"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_dates": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT d_date_sk FROM date_dim WHERE d_week_seq IN (SELECT d_week_seq FROM date_dim WHERE d_date IN ('2001-06-06','2001-09-02','2001-11-11'))",
+          "interfaces": {
+            "outputs": ["d_date_sk"],
+            "consumes": []
+          }
+        },
+        "sr_agg": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT sr_item_sk AS item_sk, SUM(sr_return_quantity) AS sr_qty FROM store_returns JOIN filtered_dates ON sr_returned_date_sk = d_date_sk GROUP BY sr_item_sk",
+          "interfaces": {
+            "outputs": ["item_sk", "sr_qty"],
+            "consumes": ["filtered_dates"]
+          }
+        },
+        "cr_agg": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT cr_item_sk AS item_sk, SUM(cr_return_quantity) AS cr_qty FROM catalog_returns JOIN filtered_dates ON cr_returned_date_sk = d_date_sk GROUP BY cr_item_sk",
+          "interfaces": {
+            "outputs": ["item_sk", "cr_qty"],
+            "consumes": ["filtered_dates"]
+          }
+        },
+        "wr_agg": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT wr_item_sk AS item_sk, SUM(wr_return_quantity) AS wr_qty FROM web_returns JOIN filtered_dates ON wr_returned_date_sk = d_date_sk GROUP BY wr_item_sk",
+          "interfaces": {
+            "outputs": ["item_sk", "wr_qty"],
+            "consumes": ["filtered_dates"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT i.i_item_id AS item_id, sr_agg.sr_qty AS sr_item_qty, sr_agg.sr_qty/(sr_agg.sr_qty + cr_agg.cr_qty + wr_agg.wr_qty)/3.0 * 100 AS sr_dev, cr_agg.cr_qty AS cr_item_qty, cr_agg.cr_qty/(sr_agg.sr_qty + cr_agg.cr_qty + wr_agg.wr_qty)/3.0 * 100 AS cr_dev, wr_agg.wr_qty AS wr_item_qty, wr_agg.wr_qty/(sr_agg.sr_qty + cr_agg.cr_qty + wr_agg.wr_qty)/3.0 * 100 AS wr_dev, (sr_agg.sr_qty + cr_agg.cr_qty + wr_agg.wr_qty)/3.0 AS average FROM sr_agg JOIN cr_agg ON sr_agg.item_sk = cr_agg.item_sk JOIN wr_agg ON sr_agg.item_sk = wr_agg.item_sk JOIN item i ON sr_agg.item_sk = i.i_item_sk ORDER BY i.i_item_id, sr_agg.sr_qty LIMIT 100",
+          "interfaces": {
+            "outputs": ["item_id", "sr_item_qty", "sr_dev", "cr_item_qty", "cr_dev", "wr_item_qty", "wr_dev", "average"],
+            "consumes": ["sr_agg", "cr_agg", "wr_agg"]
+          }
+        }
+      },
+      "reconstruction_order": ["filtered_dates", "sr_agg", "cr_agg", "wr_agg", "main_query"],
+      "assembly_template": "WITH filtered_dates AS ({filtered_dates}), sr_agg AS ({sr_agg}), cr_agg AS ({cr_agg}), wr_agg AS ({wr_agg}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Changes
+We isolate the date dimension filter into a single CTE (`filtered_dates`) that is reused across all three channel aggregations, eliminating 6 redundant scans of `date_dim`. We also delay the join with the `item` table until after aggregation, reducing 3 item table scans to 1. This follows both the dimension_cte_isolate and late_attribute_binding patterns.
+
+**Expected speedup**: ~1.5-2.0x due to reduced dimension table scans (9→4 total) and early aggregation on smaller surrogate keys before attribute resolution.

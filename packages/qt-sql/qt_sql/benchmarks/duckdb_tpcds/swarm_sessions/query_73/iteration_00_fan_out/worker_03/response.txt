@@ -1,0 +1,94 @@
+### Part 1: Modified Logic Tree
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K
+    ├── [CTE] filtered_date  [+]  Output: d_date_sk
+    ├── [CTE] filtered_store [+]  Output: s_store_sk
+    ├── [CTE] filtered_hd    [+]  Output: hd_demo_sk
+    ├── [CTE] sales_with_keys[+]  Output: ss_ticket_number, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_hdemo_sk
+    ├── [CTE] early_aggregation[+] Output: ss_ticket_number, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_hdemo_sk, cnt
+    ├── [CTE] filtered_agg   [+]  Output: ss_ticket_number, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_hdemo_sk, cnt
+    ├── [CTE] dimension_join_check[+] Output: ss_ticket_number, ss_customer_sk, cnt
+    ├── SCAN (customer)
+    ├── JOIN (ss_customer_sk = c_customer_sk)
+    ├── FILTER (cnt BETWEEN 1 AND 5)  [~] moved upstream to filtered_agg CTE
+    ├── AGG (GROUP BY)  [~] moved upstream to early_aggregation CTE
+    ├── SORT (cnt DESC, c_last_name ASC)
+    └── OUTPUT (c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt)
+```
+
+### Part 2: Component Payload JSON
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Filter dimension tables first, then restrict fact table via IN clauses", "applied_to": ["filtered_date", "filtered_store", "filtered_hd", "sales_with_keys"]},
+    {"id": "R2", "type": "pushdown", "description": "Push dimension key filters into fact table scan using IN subqueries", "applied_to": ["sales_with_keys"]},
+    {"id": "R3", "type": "single_pass_aggregation", "description": "Perform aggregation early on filtered fact rows before final dimension verification", "applied_to": ["early_aggregation", "filtered_agg"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_dom BETWEEN 1 AND 2 AND d_year IN (2000, 2001, 2002)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_store": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_store_sk FROM store WHERE s_county IN ('Fairfield County','Walker County','Daviess County','Barrow County')",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "filtered_hd": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT hd_demo_sk FROM household_demographics WHERE (hd_buy_potential = '501-1000' OR hd_buy_potential = 'Unknown') AND hd_vehicle_count > 0 AND CASE WHEN hd_vehicle_count > 0 THEN hd_dep_count/hd_vehicle_count ELSE NULL END > 1",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": []}
+      },
+      "sales_with_keys": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_hdemo_sk FROM store_sales WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_date) AND ss_store_sk IN (SELECT s_store_sk FROM filtered_store) AND ss_hdemo_sk IN (SELECT hd_demo_sk FROM filtered_hd)",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "ss_sold_date_sk", "ss_store_sk", "ss_hdemo_sk"], "consumes": ["filtered_date", "filtered_store", "filtered_hd"]}
+      },
+      "early_aggregation": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_hdemo_sk, COUNT(*) AS cnt FROM sales_with_keys GROUP BY ss_ticket_number, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_hdemo_sk",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "ss_sold_date_sk", "ss_store_sk", "ss_hdemo_sk", "cnt"], "consumes": ["sales_with_keys"]}
+      },
+      "filtered_agg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, ss_sold_date_sk, ss_store_sk, ss_hdemo_sk, cnt FROM early_aggregation WHERE cnt BETWEEN 1 AND 5",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "ss_sold_date_sk", "ss_store_sk", "ss_hdemo_sk", "cnt"], "consumes": ["early_aggregation"]}
+      },
+      "dimension_join_check": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT fa.ss_ticket_number, fa.ss_customer_sk, fa.cnt FROM filtered_agg fa INNER JOIN filtered_date fd ON fa.ss_sold_date_sk = fd.d_date_sk INNER JOIN filtered_store fs ON fa.ss_store_sk = fs.s_store_sk INNER JOIN filtered_hd fh ON fa.ss_hdemo_sk = fh.hd_demo_sk",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "cnt"], "consumes": ["filtered_agg", "filtered_date", "filtered_store", "filtered_hd"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c.c_last_name, c.c_first_name, c.c_salutation, c.c_preferred_cust_flag, djc.ss_ticket_number, djc.cnt FROM dimension_join_check djc INNER JOIN customer c ON djc.ss_customer_sk = c.c_customer_sk ORDER BY djc.cnt DESC, c.c_last_name ASC",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "c_salutation", "c_preferred_cust_flag", "ss_ticket_number", "cnt"], "consumes": ["dimension_join_check"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_store", "filtered_hd", "sales_with_keys", "early_aggregation", "filtered_agg", "dimension_join_check", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_store AS ({filtered_store}), filtered_hd AS ({filtered_hd}), sales_with_keys AS ({sales_with_keys}), early_aggregation AS ({early_aggregation}), filtered_agg AS ({filtered_agg}), dimension_join_check AS ({dimension_join_check}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured to follow target logical tree: dimension filters isolated into CTEs, fact table filtered via IN clauses, early aggregation on fact keys, then final dimension verification joins and customer join. Preserves all original filters and defensive CASE expression.
+
+**Expected speedup:** ~4x via early filtering and reduced fact scan cardinality (52K rows vs full table scan).

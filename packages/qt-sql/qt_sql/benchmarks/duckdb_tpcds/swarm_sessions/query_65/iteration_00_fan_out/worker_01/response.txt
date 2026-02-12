@@ -1,0 +1,133 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Single-pass CTE structure with shared date filter
+    ├── CTE: date_filtered_sales  [+]  — Single scan of store_sales with date filter
+    │   ├── JOIN (store_sales ⋈ date_dim ON ss_sold_date_sk = d_date_sk)
+    │   └── FILTER (d_month_seq BETWEEN 1221 AND 1232)
+    │
+    ├── CTE: store_item_revenue  [+]  — Store-item revenue aggregates
+    │   ├── FROM: date_filtered_sales
+    │   └── AGG (GROUP BY ss_store_sk, ss_item_sk; SUM(ss_sales_price) AS revenue)
+    │
+    ├── CTE: store_avg  [+]  — Store-level averages
+    │   ├── FROM: store_item_revenue  
+    │   └── AGG (GROUP BY ss_store_sk; AVG(revenue) AS ave)
+    │
+    ├── CTE: filtered_pairs  [+]  — Filtered store-item pairs
+    │   ├── JOIN (store_item_revenue ⋈ store_avg ON ss_store_sk)
+    │   └── FILTER (revenue <= 0.1 * ave)
+    │
+    ├── CTE: join_store_item  [+]  — Enriched with dimension attributes
+    │   ├── JOIN (filtered_pairs ⋈ store ON ss_store_sk = s_store_sk)
+    │   ├── JOIN (filtered_pairs ⋈ item ON ss_item_sk = i_item_sk)
+    │   └── SELECT required output columns
+    │
+    └── SORT/LIMIT  [~]  — Final ordering and limit on enriched results
+        ├── ORDER BY (s_store_name ASC, i_item_desc ASC)
+        └── LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "single_pass_aggregation",
+      "description": "Consolidated two identical store_sales scans into single CTE with date filter, feeding both store-item revenue and store-average computations",
+      "applied_to": ["date_filtered_sales", "store_item_revenue", "store_avg"]
+    },
+    {
+      "id": "R2",
+      "type": "cte_pipeline",
+      "description": "Followed target logical tree structure with CTEs for each logical step, preserving exact semantic equivalence",
+      "applied_to": ["date_filtered_sales", "store_item_revenue", "store_avg", "filtered_pairs", "join_store_item", "top_n"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "date_filtered_sales": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ss_store_sk, ss_item_sk, ss_sales_price FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk WHERE d_month_seq BETWEEN 1221 AND 1221+11",
+          "interfaces": {
+            "outputs": ["ss_store_sk", "ss_item_sk", "ss_sales_price"],
+            "consumes": []
+          }
+        },
+        "store_item_revenue": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM date_filtered_sales GROUP BY ss_store_sk, ss_item_sk",
+          "interfaces": {
+            "outputs": ["ss_store_sk", "ss_item_sk", "revenue"],
+            "consumes": ["date_filtered_sales"]
+          }
+        },
+        "store_avg": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ss_store_sk, AVG(revenue) AS ave FROM store_item_revenue GROUP BY ss_store_sk",
+          "interfaces": {
+            "outputs": ["ss_store_sk", "ave"],
+            "consumes": ["store_item_revenue"]
+          }
+        },
+        "filtered_pairs": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT sir.ss_store_sk, sir.ss_item_sk, sir.revenue FROM store_item_revenue sir JOIN store_avg sa ON sir.ss_store_sk = sa.ss_store_sk WHERE sir.revenue <= 0.1 * sa.ave",
+          "interfaces": {
+            "outputs": ["ss_store_sk", "ss_item_sk", "revenue"],
+            "consumes": ["store_item_revenue", "store_avg"]
+          }
+        },
+        "join_store_item": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT s.s_store_name, i.i_item_desc, fp.revenue, i.i_current_price, i.i_wholesale_cost, i.i_brand FROM filtered_pairs fp JOIN store s ON fp.ss_store_sk = s.s_store_sk JOIN item i ON fp.ss_item_sk = i.i_item_sk",
+          "interfaces": {
+            "outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"],
+            "consumes": ["filtered_pairs"]
+          }
+        },
+        "top_n": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand FROM join_store_item ORDER BY s_store_name ASC, i_item_desc ASC LIMIT 100",
+          "interfaces": {
+            "outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"],
+            "consumes": ["join_store_item"]
+          }
+        }
+      },
+      "reconstruction_order": ["date_filtered_sales", "store_item_revenue", "store_avg", "filtered_pairs", "join_store_item", "top_n"],
+      "assembly_template": "WITH date_filtered_sales AS ({date_filtered_sales}), store_item_revenue AS ({store_item_revenue}), store_avg AS ({store_avg}), filtered_pairs AS ({filtered_pairs}), join_store_item AS ({join_store_item}) {top_n}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": [
+    {
+      "name": "output_schema",
+      "condition": "Column order matches: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand"
+    },
+    {
+      "name": "semantic_guard",
+      "condition": "Store_avg computed from store_item_revenue (per-item sums), not directly from fact table"
+    }
+  ]
+}
+```
+
+**Changes**: Replaced the original subqueries (which scanned store_sales twice) with a CTE pipeline that scans store_sales once, applies the date filter, then computes store-item revenue and store-level averages in sequence before filtering and joining with dimensions. This follows the single-pass aggregation pattern.
+
+**Expected speedup**: 1.5-2x reduction in query time by eliminating redundant fact table scan and enabling better predicate pushdown through the CTE chain.

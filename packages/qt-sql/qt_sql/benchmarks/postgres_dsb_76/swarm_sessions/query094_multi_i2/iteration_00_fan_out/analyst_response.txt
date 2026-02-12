@@ -1,0 +1,287 @@
+<reasoning>
+1. **CLASSIFY**: This is a star-join with EXISTS-set operations. The query joins web_sales with three dimension tables (date_dim, customer_address, web_site) and has two correlated subqueries: one EXISTS (self-join on web_sales for same order/different warehouse) and one NOT EXISTS (anti-join with web_returns with reason filter). This is a classic "star-join with late correlation traps" archetype.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total runtime: 550.6ms
+   - **Dominant nodes** (>10% runtime):
+     1. Hash Join Anti (396.3ms total across workers): Building hash table on 77K filtered web_returns rows
+     2. Nested Loop Inner (300.7ms total): Scanning web_sales via index (61 loops × 5,866 rows filtered to 182)
+     3. Seq Scan on web_returns (154ms total): Scanning 720K rows, filtering to 77K
+   - **Row count drops**:
+     - date_dim: 36K → 30 rows (highly selective)
+     - web_sales via index: 5,684 → 182 rows per loop (moderately selective)
+     - customer_address: removes 1 row per loop (highly selective)
+     - web_site: 42 → 22 rows (moderate)
+     - web_returns: 720K → 77K (moderate)
+   - **Missed opportunities**:
+     - web_returns scan processes ALL rows (720K) every time - no early filtering by date or order number
+     - EXISTS subquery executes 1,185 times (once per outer row) but uses index-only scan (fast)
+     - Dimension tables are scanned multiple times: web_sales scanned twice (ws1 and ws2), web_returns scanned once but builds large hash table
+   - **Optimizer already does**:
+     - Pushes date filter into date_dim scan
+     - Uses index on web_sales for ship_date_sk and order_number
+     - Converts NOT EXISTS to Hash Anti Join
+     - Parallel execution (2 workers)
+
+3. **GAP MATCHING**:
+   - **COMMA_JOIN_WEAKNESS**: Query uses comma-separated implicit joins (lines 6-9). ✓ Active gap.
+   - **CORRELATED_SUBQUERY_PARALYSIS**: EXISTS subquery is correlated (ws1.ws_order_number = ws2.ws_order_number). However, EXPLAIN shows it's already converted to Nested Loop Semi with Index Only Scan (fast). NOT a bottleneck.
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: Same fact table (web_sales) scanned twice (ws1 and ws2). ✓ Opportunity for shared materialization.
+   - **NON_EQUI_JOIN_INPUT_BLINDNESS**: Not applicable (no non-equi joins).
+
+4. **AGGREGATION TRAP CHECK**:
+   - Query uses COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit)
+   - COUNT(DISTINCT) is grouping-sensitive but safe if we preserve exact row set
+   - SUMs are duplicate-insensitive but must preserve exact values per order
+   - No FILTER clauses or window functions to worry about
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   1. **star_join_prefetch** + **COMMA_JOIN_WEAKNESS fix**: Pre-filter all dimension tables into CTEs, convert to explicit JOINs. Expected high value because dimensions are small and selective.
+   2. **self_join_elimination**: Materialize web_sales with dimensions once, derive EXISTS condition from same CTE. Expected medium value because eliminates second web_sales scan.
+   3. **decorrelation**: Pre-compute EXISTS condition (orders with multiple warehouses) and NOT EXISTS condition (orders with problematic returns) in separate CTEs. Expected medium value because replaces correlated subqueries with joins.
+   4. **EXPLORATION**: Combine all three above into compound strategy.
+
+6. **LOGICAL TREE DESIGN**:
+   - For Worker 1: CTE_date, CTE_ca, CTE_web → join with web_sales → apply EXISTS/NOT EXISTS
+   - For Worker 2: CTE_qualified_orders (web_sales + dimensions) → self-join elimination via grouping
+   - For Worker 3: CTE_multi_warehouse, CTE_bad_returns → join with filtered web_sales+dimensions
+   - For Worker 4: Compound: CTE_date, CTE_ca, CTE_web, CTE_base → CTE_multi_warehouse, CTE_bad_returns → final aggregation
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Find shipping metrics for web orders within a 60-day window where: (a) the order ships to one of six US states, (b) the website is in timezone GMT-5 or later, (c) list price is between $253-$282, (d) the order was fulfilled from at least two different warehouses, and (e) the order was not returned for any of five specific reasons. All joins are INNER (must match), and COUNT(DISTINCT) requires preserving exact order set. The NOT EXISTS with wr_reason_sk IN list must reject orders with ANY matching reason.
+
+BOTTLENECK_DIAGNOSIS:
+Hash Anti Join on web_returns dominates (396ms of 550ms). The anti-join builds a 77K-row hash table from a full sequential scan of web_returns (720K rows filtered by wr_reason_sk). The optimizer already handles date filtering (30 rows), index scans on web_sales, and converts EXISTS to efficient Nested Loop Semi. Logical-tree costs mislead: the 100% cost on main_query hides the real I/O bottleneck on web_returns sequential scan. The query is scan-bound on web_returns and join-bound on the large hash anti-join.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output exactly three columns: order count, total shipping cost, total net profit
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (ws_order_number, ws_ext_ship_cost, ws_net_profit, join keys)
+- LITERAL_PRESERVATION: Must preserve exact date '1999-10-01', interval '60 day', state list, price range 253-282, reason_sk values 8,18,20,23,41
+- SEMANTIC_EQUIVALENCE: Must return same rows and aggregation values
+- COMMA_JOIN_WEAKNESS: Query uses implicit comma joins (lines 6-9), causing poor cardinality estimation
+- CROSS_CTE_PREDICATE_BLINDNESS: web_sales scanned twice (ws1 for main, ws2 for EXISTS) - opportunity for shared materialization
+
+REGRESSION_WARNINGS:
+1. EXISTS to IN/NOT IN (observed 0.50x regression):
+   CAUSE: Converting EXISTS to IN with large result set forces materialization and loses semi-join early termination
+   RULE: Preserve EXISTS structure; if decorrelating, use JOIN with DISTINCT or GROUP BY instead of IN
+2. CTE blocking parallelism (observed 0.8x regression):
+   CAUSE: MATERIALIZED CTEs execute single-threaded, preventing parallel scan of large fact tables
+   RULE: Avoid wrapping large fact table scans in CTEs; keep them in main query for parallel execution
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch_explicit
+TARGET_LOGICAL_TREE:
+  CTE_date -> CTE_ca -> CTE_web -> JOIN with web_sales -> Filter EXISTS/NOT EXISTS -> Aggregate
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '1999-10-01' AND CAST('1999-10-01' AS DATE) + INTERVAL '60 DAY'
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 30
+    CONSUMERS: base_sales
+  filtered_ca:
+    FROM: customer_address
+    WHERE: ca_state IN ('MO','MT','OK','SC','TX','WI')
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: ~6% of table (small)
+    CONSUMERS: base_sales
+  filtered_web:
+    FROM: web_site
+    WHERE: web_gmt_offset >= -5
+    OUTPUT: web_site_sk
+    EXPECTED_ROWS: 22
+    CONSUMERS: base_sales
+  base_sales:
+    FROM: web_sales ws1
+    JOIN: INNER JOIN filtered_dates ON ws1.ws_ship_date_sk = filtered_dates.d_date_sk
+          INNER JOIN filtered_ca ON ws1.ws_ship_addr_sk = filtered_ca.ca_address_sk
+          INNER JOIN filtered_web ON ws1.ws_web_site_sk = filtered_web.web_site_sk
+    WHERE: ws1.ws_list_price BETWEEN 253 AND 282
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk
+    EXPECTED_ROWS: ~1,185
+    CONSUMERS: main_agg
+  main_agg:
+    FROM: base_sales
+    WHERE: EXISTS (SELECT 1 FROM web_sales ws2 WHERE ws2.ws_order_number = base_sales.ws_order_number AND ws2.ws_warehouse_sk <> base_sales.ws_warehouse_sk)
+           AND NOT EXISTS (SELECT 1 FROM web_returns wr1 WHERE wr1.wr_order_number = base_sales.ws_order_number AND wr1.wr_reason_sk IN (8,18,20,23,41))
+    AGGREGATE: COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit)
+    OUTPUT: order count, total shipping cost, total net profit
+    EXPECTED_ROWS: 1
+    CONSUMERS: final
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+  pg_dimension_prefetch_star: Apply pre-filtering of ALL three dimension tables into CTEs; convert comma joins to explicit INNER JOIN syntax; ignore the UNION ALL aspect (not needed).
+  pg_date_cte_explicit_join: Apply the date CTE pattern AND explicit JOIN conversion; ignore the single-dimension focus - we need all three dimensions.
+HAZARD_FLAGS:
+- CTEs may block parallel execution on web_sales scan (base_sales could lose parallelism)
+- Must ensure web_sales join order doesn't change predicate pushdown of ws_list_price
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: self_join_elimination_group
+TARGET_LOGICAL_TREE:
+  CTE_base_sales -> CTE_warehouse_counts -> Filter multi-warehouse -> Anti-join web_returns -> Aggregate
+NODE_CONTRACTS:
+  base_sales:
+    FROM: web_sales ws1, date_dim, customer_address, web_site
+    WHERE: d_date BETWEEN '1999-10-01' AND CAST('1999-10-01' AS DATE) + INTERVAL '60 DAY'
+           AND ws1.ws_ship_date_sk = d_date_sk
+           AND ws1.ws_ship_addr_sk = ca_address_sk
+           AND ca_state IN ('MO','MT','OK','SC','TX','WI')
+           AND ws1.ws_web_site_sk = web_site_sk
+           AND web_gmt_offset >= -5
+           AND ws1.ws_list_price BETWEEN 253 AND 282
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk
+    EXPECTED_ROWS: ~1,185
+    CONSUMERS: warehouse_counts
+  warehouse_counts:
+    FROM: base_sales
+    GROUP BY: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    AGGREGATE: COUNT(DISTINCT ws_warehouse_sk) as warehouse_count
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit, warehouse_count
+    EXPECTED_ROWS: ≤1,185 (one per order)
+    CONSUMERS: multi_warehouse_orders
+  multi_warehouse_orders:
+    FROM: warehouse_counts
+    WHERE: warehouse_count >= 2
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: same as final output (orders with multiple warehouses)
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: multi_warehouse_orders mwo
+    WHERE: NOT EXISTS (SELECT 1 FROM web_returns wr1 WHERE wr1.wr_order_number = mwo.ws_order_number AND wr1.wr_reason_sk IN (8,18,20,23,41))
+    AGGREGATE: COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit)
+    OUTPUT: order count, total shipping cost, total net profit
+    EXPECTED_ROWS: 1
+    CONSUMERS: final
+EXAMPLES: pg_self_join_decomposition
+EXAMPLE_ADAPTATION:
+  pg_self_join_decomposition: Apply the core idea - compute warehouse counts via GROUP BY instead of correlated EXISTS; materialize base_sales once; ignore the multi-channel aspect (we have single channel).
+HAZARD_FLAGS:
+- Changing EXISTS to COUNT(DISTINCT ws_warehouse_sk) >= 2 must be semantically equivalent
+- Must ensure web_returns anti-join preserves NOT EXISTS semantics exactly
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: decorrelation_cte_anti
+TARGET_LOGICAL_TREE:
+  CTE_multi_warehouse_orders -> CTE_bad_returns -> JOIN with filtered web_sales+dimensions -> Aggregate
+NODE_CONTRACTS:
+  multi_warehouse_orders:
+    FROM: web_sales
+    GROUP BY: ws_order_number
+    HAVING: COUNT(DISTINCT ws_warehouse_sk) >= 2
+    OUTPUT: ws_order_number
+    EXPECTED_ROWS: unknown but ≤ total orders
+    CONSUMERS: qualified_sales
+  bad_returns:
+    FROM: web_returns
+    WHERE: wr_reason_sk IN (8,18,20,23,41)
+    GROUP BY: wr_order_number
+    OUTPUT: wr_order_number
+    EXPECTED_ROWS: ≤77K (one per bad order)
+    CONSUMERS: qualified_sales
+  qualified_sales:
+    FROM: web_sales ws1, date_dim, customer_address, web_site, multi_warehouse_orders mwo
+    WHERE: d_date BETWEEN '1999-10-01' AND CAST('1999-10-01' AS DATE) + INTERVAL '60 DAY'
+           AND ws1.ws_ship_date_sk = d_date_sk
+           AND ws1.ws_ship_addr_sk = ca_address_sk
+           AND ca_state IN ('MO','MT','OK','SC','TX','WI')
+           AND ws1.ws_web_site_sk = web_site_sk
+           AND web_gmt_offset >= -5
+           AND ws1.ws_list_price BETWEEN 253 AND 282
+           AND ws1.ws_order_number = mwo.ws_order_number
+           AND NOT EXISTS (SELECT 1 FROM bad_returns br WHERE br.wr_order_number = ws1.ws_order_number)
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: same as final result set
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: qualified_sales
+    AGGREGATE: COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit)
+    OUTPUT: order count, total shipping cost, total net profit
+    EXPECTED_ROWS: 1
+    CONSUMERS: final
+EXAMPLES: inline_decorrelate_materialized, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+  inline_decorrelate_materialized: Apply decorrelation of EXISTS by pre-computing multi_warehouse_orders in a CTE; use MATERIALIZED to prevent re-inlining; ignore the 3-CTE structure (we only need 2 CTEs).
+  early_filter_decorrelate: Push dimension filters early; pre-compute bad_returns in separate CTE; ignore the threshold computation aspect.
+HAZARD_FLAGS:
+- bad_returns CTE may be large (77K rows) - could hurt performance if not selective
+- Must preserve NOT EXISTS semantics exactly (anti-join, not LEFT JOIN WHERE NULL)
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_star_prefetch_decorrelate
+TARGET_LOGICAL_TREE:
+  CTE_date + CTE_ca + CTE_web -> CTE_base_sales -> CTE_multi_warehouse -> CTE_bad_returns -> Final anti-join & aggregate
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '1999-10-01' AND CAST('1999-10-01' AS DATE) + INTERVAL '60 DAY'
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 30
+    CONSUMERS: base_sales
+  filtered_ca:
+    FROM: customer_address
+    WHERE: ca_state IN ('MO','MT','OK','SC','TX','WI')
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: small
+    CONSUMERS: base_sales
+  filtered_web:
+    FROM: web_site
+    WHERE: web_gmt_offset >= -5
+    OUTPUT: web_site_sk
+    EXPECTED_ROWS: 22
+    CONSUMERS: base_sales
+  base_sales:
+    FROM: web_sales ws1
+    JOIN: INNER JOIN filtered_dates ON ws1.ws_ship_date_sk = filtered_dates.d_date_sk
+          INNER JOIN filtered_ca ON ws1.ws_ship_addr_sk = filtered_ca.ca_address_sk
+          INNER JOIN filtered_web ON ws1.ws_web_site_sk = filtered_web.web_site_sk
+    WHERE: ws1.ws_list_price BETWEEN 253 AND 282
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit, ws_warehouse_sk
+    EXPECTED_ROWS: ~1,185
+    CONSUMERS: multi_warehouse, final_qualified
+  multi_warehouse:
+    FROM: base_sales
+    GROUP BY: ws_order_number
+    HAVING: COUNT(DISTINCT ws_warehouse_sk) >= 2
+    OUTPUT: ws_order_number
+    EXPECTED_ROWS: ≤1,185
+    CONSUMERS: final_qualified
+  bad_returns:
+    FROM: web_returns
+    WHERE: wr_reason_sk IN (8,18,20,23,41)
+    OUTPUT: wr_order_number
+    EXPECTED_ROWS: 77K
+    CONSUMERS: final_qualified
+  final_qualified:
+    FROM: base_sales bs
+    JOIN: INNER JOIN multi_warehouse mw ON bs.ws_order_number = mw.ws_order_number
+    WHERE: NOT EXISTS (SELECT 1 FROM bad_returns br WHERE br.wr_order_number = bs.ws_order_number)
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: final result set
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: final_qualified
+    AGGREGATE: COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit)
+    OUTPUT: order count, total shipping cost, total net profit
+    EXPECTED_ROWS: 1
+    CONSUMERS: final
+EXAMPLES: pg_dimension_prefetch_star, pg_self_join_decomposition, inline_decorrelate_materialized
+EXAMPLE_ADAPTATION:
+  pg_dimension_prefetch_star: Apply all three dimension CTEs and explicit JOIN syntax.
+  pg_self_join_decomposition: Replace EXISTS with GROUP BY on base_sales CTE.
+  inline_decorrelate_materialized: Pre-compute bad_returns in separate CTE with MATERIALIZED keyword.
+HAZARD_FLAGS:
+- Multiple CTEs may serialize execution and block parallelism
+- Complex CTE chain could confuse optimizer join ordering
+- bad_returns CTE still scans full web_returns table (720K rows)
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

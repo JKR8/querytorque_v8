@@ -1,0 +1,225 @@
+<reasoning>
+1. **CLASSIFY**: This is a star-join aggregation query with multiple dimension joins and non-equi join conditions. Key characteristics:
+   - 11 table joins (7 INNER, 2 LEFT OUTER)
+   - Non-equi join: inv_quantity_on_hand < cs_quantity
+   - Date correlation: d1.d_week_seq = d2.d_week_seq
+   - Temporal filter: d3.d_date > d1.d_date + interval '3 day'
+   - Multiple selective dimension filters (hd_buy_potential, cd_marital_status, i_category, etc.)
+   - GROUP BY with COUNT and conditional SUMs
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total time: 577.1ms
+   - Dominant nodes (>10% each):
+     1. Nested Loop Inner (catalog_sales + date_dim d1): ~395.9ms (68% of total)
+        - Index Scan on date_dim d1: 182 rows × 2 workers = 364 rows total
+        - Index Scan on catalog_sales: 895 rows per d1 row → ~163K rows
+     2. Hash Join Inner (catalog_sales + household_demographics): ~299.7ms
+     3. Nested Loop Left (entire join tree): ~570.9ms
+   - Sharp row reductions:
+     - date_dim d1: 36K rows → 182 rows (0.5% selectivity) via d_year=1998
+     - household_demographics: 7,200 rows → 1,200 rows (16.7%) via hd_buy_potential filter
+     - catalog_sales: ~5,278 rows per d1 row → 895 rows (17%) via cs_wholesale_cost filter
+   - Missed opportunities:
+     - The same date_dim base table is scanned 3 times (d1, d2, d3)
+     - Non-equi join (inv_quantity_on_hand < cs_quantity) applied late after multiple joins
+     - Optimizer uses nested loops for most joins despite large intermediate result (~163K rows)
+   - Scans per base table:
+     - date_dim: 3 scans (d1, d2, d3)
+     - catalog_sales: 1 scan
+     - inventory: 1 scan
+     - Other dimensions: 1 scan each
+   - No CTEs in original query → no materialization sharing
+
+3. **GAP MATCHING**:
+   - **NON_EQUI_JOIN_INPUT_BLINDNESS**: Present. Non-equi join applied late after multiple dimension joins. Tag-matched example "pg_materialized_dimension_fact_prefilter" (2.68x) directly applies.
+   - **COMMA_JOIN_WEAKNESS**: Not present (query uses explicit JOIN syntax)
+   - **CORRELATED_SUBQUERY_PARALYSIS**: Not present (no correlated subqueries)
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: Not present (no repeated fact scans)
+   - **JOIN_ORDER_TRAP**: Present. Plan shows 7 nested loops; optimizer struggles with 11-table join order.
+
+4. **AGGREGATION TRAP CHECK**:
+   - Aggregates: SUM(CASE...), COUNT(*)
+   - These are grouping-insensitive (modulo duplicates)
+   - No FILTER clauses or sensitive aggregates (STDDEV_SAMP, etc.)
+   - LEFT JOIN to promotion and catalog_returns must preserve null semantics
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   1. **star_join_prefetch** + **pg_materialized_dimension_fact_prefilter**: Pre-filter ALL dimensions and fact into CTEs before non-equi join. Targets NON_EQUI_JOIN_INPUT_BLINDNESS gap.
+   2. **late_attribute_binding**: Defer non-filtering dimension joins (item, warehouse) until after filtering and initial aggregation. Reduces dimension scan overhead.
+   3. **single_pass_aggregation** + **scan_consolidation_pivot**: Consolidate multiple date_dim scans into single CTE with pivot. Addresses repeated date_dim scans.
+   4. **EXPLORATION**: Combine star_join_prefetch with early non-equi join pushdown (novel compound).
+
+6. **LOGICAL TREE DESIGN**:
+   For each strategy, ensure CTE column completeness:
+   - Must include: cs_item_sk, cs_quantity, cs_wholesale_cost, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk, cs_order_number
+   - Plus all dimension key columns used in joins
+   - Plus all columns needed for GROUP BY and SELECT output
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Analyze weekly sales patterns comparing promotional vs non-promotional items, focusing on high-buy-potential households, unmarried customers with 9-11 dependents, and specific product categories. All dimension joins are INNER except promotion and catalog_returns are LEFT OUTER (must preserve nulls for promo counting). Aggregation uses COUNT(*) and conditional SUMs which are grouping-insensitive but depend on LEFT JOIN null preservation. Critical filter dependencies: d1.d_week_seq = d2.d_week_seq (date correlation), d3.d_date > d1.d_date + 3 days (temporal gap), and inv_quantity_on_hand < cs_quantity (non-equi join).
+
+BOTTLENECK_DIAGNOSIS:
+Query is join-bound with nested loop explosion: 182 date rows × 895 catalog_sales rows = ~163K intermediate rows processed through 7 nested loops. The initial date_dim d1 scan (0.5% selectivity) and catalog_sales cs_wholesale_cost filter (17% selectivity) create the largest intermediate result. Optimizer already uses efficient index scans on dimension tables but cannot reorder joins effectively due to non-equi conditions and date correlations. Logical-tree costs mislead: Nested Loop Left shows 0 rows but processes all 163K rows internally.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output i_item_desc, w_warehouse_name, d1.d_week_seq, no_promo, promo, total_cnt in exact order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream including cs_item_sk, cs_quantity, inv_quantity_on_hand, d1.d_date, d1.d_week_seq, d2.d_week_seq, d3.d_date, p_promo_sk, i_item_desc, w_warehouse_name.
+- LITERAL_PRESERVATION: Must preserve literal values: '>10000', 1998, 'U', 9, 11, 'Children', 'Jewelry', 'Men', 35, 55, interval '3 day'.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows with same ordering (total_cnt DESC, then i_item_desc, w_warehouse_name, d_week_seq ASC).
+- NON_EQUI_JOIN_INPUT_BLINDNESS: EXPLAIN shows inv_quantity_on_hand < cs_quantity filter applied late after multiple joins (Index Scan on inventory with Filter).
+- JOIN_ORDER_TRAP: EXPLAIN shows 7x Nested Loop joins with unstable order.
+
+REGRESSION_WARNINGS:
+1. CTE blocking parallelism (observed regression in SF-005):
+   CAUSE: MATERIALIZED CTEs execute single-threaded, preventing parallel scans of large fact tables.
+   RULE: For Worker 1's fact CTE, ensure catalog_sales scan remains in main query or use SET max_parallel_workers_per_gather.
+2. Nested loop disable risk (observed 184x regression in SF-002):
+   CAUSE: SET enable_nestloop = off forces hash/merge joins on selective indexed lookups.
+   RULE: Never disable nestloop globally; if needed, use force_hash/force_merge on specific joins only.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch_with_materialized_fact
+TARGET_LOGICAL_TREE:
+filtered_dims -> filtered_fact -> joined_with_inventory -> final_aggregation
+NODE_CONTRACTS:
+  filtered_dims:
+    FROM: date_dim d1, date_dim d2, date_dim d3, item, customer_demographics, household_demographics
+    JOIN: d1.d_week_seq = d2.d_week_seq
+    WHERE: d1.d_year = 1998 AND hd_buy_potential = '>10000' AND cd_marital_status = 'U' AND cd_dep_count BETWEEN 9 AND 11 AND i_category IN ('Children', 'Jewelry', 'Men')
+    OUTPUT: d1.d_date_sk, d1.d_date, d1.d_week_seq, d2.d_date_sk, d2.d_week_seq, d3.d_date_sk, d3.d_date, i_item_sk, i_item_desc, cd_demo_sk, hd_demo_sk
+    EXPECTED_ROWS: ~182 rows (d1) × 1 row per other dim = ~182 rows
+    CONSUMERS: filtered_fact
+  filtered_fact:
+    FROM: catalog_sales
+    JOIN: cs_sold_date_sk = filtered_dims.d1.d_date_sk AND cs_item_sk = filtered_dims.i_item_sk AND cs_bill_cdemo_sk = filtered_dims.cd_demo_sk AND cs_bill_hdemo_sk = filtered_dims.hd_demo_sk
+    WHERE: cs_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: cs_item_sk, cs_quantity, cs_wholesale_cost, cs_ship_date_sk, cs_promo_sk, cs_order_number, filtered_dims.d1.d_date, filtered_dims.d1.d_week_seq, filtered_dims.d2.d_date_sk, filtered_dims.d2.d_week_seq, filtered_dims.d3.d_date_sk, filtered_dims.d3.d_date, filtered_dims.i_item_desc
+    EXPECTED_ROWS: ~163K rows (from EXPLAIN)
+    CONSUMERS: joined_with_inventory
+  joined_with_inventory:
+    FROM: filtered_fact, inventory
+    JOIN: inv_item_sk = filtered_fact.cs_item_sk AND inv_date_sk = filtered_fact.d2.d_date_sk
+    WHERE: inv_quantity_on_hand < cs_quantity AND filtered_fact.d3.d_date > filtered_fact.d1.d_date + interval '3 day'
+    OUTPUT: filtered_fact.i_item_desc, filtered_fact.cs_item_sk, filtered_fact.cs_promo_sk, filtered_fact.cs_order_number, filtered_fact.d1.d_week_seq, w_warehouse_sk (from inventory join)
+    EXPECTED_ROWS: <163K rows (non-equi filter reduces)
+    CONSUMERS: final_aggregation
+EXAMPLES: pg_materialized_dimension_fact_prefilter, pg_dimension_prefetch_star, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_materialized_dimension_fact_prefilter: Apply staging - create CTEs for filtered dimensions AND filtered fact before non-equi join. Ignore the decorrelation aspect (no correlated subquery).
+- pg_dimension_prefetch_star: Apply pre-filtering all dimensions into a single CTE. Ignore comma-join conversion (query already has explicit JOINs).
+- early_filter_decorrelate: Apply early dimension filtering in CTEs. Ignore threshold pre-computation (no correlated subquery).
+HAZARD_FLAGS:
+- MATERIALIZED CTE on filtered_fact (~163K rows) may block parallelism. Consider SET max_parallel_workers_per_gather = 4.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: late_attribute_binding_deferred_dimensions
+TARGET_LOGICAL_TREE:
+core_filters -> initial_aggregation -> attach_descriptions
+NODE_CONTRACTS:
+  core_filters:
+    FROM: catalog_sales, date_dim d1, date_dim d2, date_dim d3, inventory, customer_demographics, household_demographics
+    JOIN: cs_sold_date_sk = d1.d_date_sk AND inv_item_sk = cs_item_sk AND inv_date_sk = d2.d_date_sk AND cs_bill_cdemo_sk = cd_demo_sk AND cs_bill_hdemo_sk = hd_demo_sk
+    WHERE: d1.d_year = 1998 AND d1.d_week_seq = d2.d_week_seq AND d3.d_date > d1.d_date + interval '3 day' AND inv_quantity_on_hand < cs_quantity AND hd_buy_potential = '>10000' AND cd_marital_status = 'U' AND cd_dep_count BETWEEN 9 AND 11 AND cs_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: cs_item_sk, cs_promo_sk, cs_order_number, d1.d_week_seq, inv_warehouse_sk
+    EXPECTED_ROWS: <163K rows (after all filters)
+    CONSUMERS: initial_aggregation
+  initial_aggregation:
+    FROM: core_filters
+    GROUP BY: cs_item_sk, inv_warehouse_sk, d1.d_week_seq
+    AGGREGATE: SUM(CASE WHEN cs_promo_sk IS NULL THEN 1 ELSE 0 END) as no_promo, SUM(CASE WHEN cs_promo_sk IS NOT NULL THEN 1 ELSE 0 END) as promo, COUNT(*) as total_cnt
+    OUTPUT: cs_item_sk, inv_warehouse_sk, d1.d_week_seq, no_promo, promo, total_cnt
+    EXPECTED_ROWS: <163K rows (grouped)
+    CONSUMERS: attach_descriptions
+  attach_descriptions:
+    FROM: initial_aggregation, item, warehouse, promotion p LEFT OUTER JOIN catalog_returns cr ON (cr_item_sk = cs_item_sk AND cr_order_number = cs_order_number)
+    JOIN: i_item_sk = initial_aggregation.cs_item_sk AND w_warehouse_sk = initial_aggregation.inv_warehouse_sk AND p.p_promo_sk = initial_aggregation.cs_promo_sk
+    WHERE: i_category IN ('Children', 'Jewelry', 'Men')
+    OUTPUT: i_item_desc, w_warehouse_name, d1.d_week_seq, no_promo, promo, total_cnt
+    EXPECTED_ROWS: ≤ initial_aggregation rows (item filter may reduce)
+    CONSUMERS: final_sort_limit
+EXAMPLES: dimension_cte_isolate, early_filter_decorrelate, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply deferring non-filtering dimensions (item, warehouse) to final step. Ignore the CTE isolation of date_dim (keep dates in core_filters).
+- early_filter_decorrelate: Apply pushing all selective filters into core_filters CTE. Ignore threshold pre-computation.
+- pg_date_cte_explicit_join: Apply explicit JOIN syntax (already present) and keep date filters together. Ignore comma-join conversion.
+HAZARD_FLAGS:
+- Must ensure catalog_returns LEFT JOIN semantics preserved after aggregation (joins on cs_item_sk, cs_order_number which are in GROUP BY).
+- Item category filter applied late may discard groups; verify i_category filter doesn't change grouping.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: single_pass_date_consolidation_pivot
+TARGET_LOGICAL_TREE:
+unified_dates -> filtered_sales -> complete_joins -> aggregation
+NODE_CONTRACTS:
+  unified_dates:
+    FROM: date_dim
+    WHERE: d_year = 1998
+    OUTPUT: d_date_sk, d_date, d_week_seq, CASE WHEN d_date_sk = d_date_sk THEN 'd1' END as role1, CASE WHEN d_date_sk = d_date_sk THEN 'd2' END as role2, CASE WHEN d_date_sk = d_date_sk THEN 'd3' END as role3
+    EXPECTED_ROWS: 182 rows
+    CONSUMERS: filtered_sales
+  filtered_sales:
+    FROM: catalog_sales, unified_dates d1, unified_dates d2, unified_dates d3, item, customer_demographics, household_demographics
+    JOIN: cs_sold_date_sk = d1.d_date_sk AND cs_item_sk = i_item_sk AND cs_bill_cdemo_sk = cd_demo_sk AND cs_bill_hdemo_sk = hd_demo_sk
+    WHERE: d1.d_week_seq = d2.d_week_seq AND d3.d_date > d1.d_date + interval '3 day' AND hd_buy_potential = '>10000' AND d1.d_year = 1998 AND cd_marital_status = 'U' AND cd_dep_count BETWEEN 9 AND 11 AND i_category IN ('Children', 'Jewelry', 'Men') AND cs_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: cs_item_sk, cs_quantity, cs_wholesale_cost, cs_ship_date_sk, cs_promo_sk, cs_order_number, d1.d_date, d1.d_week_seq, d2.d_date_sk, d3.d_date_sk
+    EXPECTED_ROWS: ~163K rows
+    CONSUMERS: complete_joins
+  complete_joins:
+    FROM: filtered_sales, inventory, warehouse, promotion p LEFT OUTER JOIN catalog_returns cr ON (cr_item_sk = cs_item_sk AND cr_order_number = cs_order_number)
+    JOIN: inv_item_sk = filtered_sales.cs_item_sk AND inv_date_sk = filtered_sales.d2.d_date_sk AND w_warehouse_sk = inv_warehouse_sk
+    WHERE: inv_quantity_on_hand < cs_quantity
+    OUTPUT: i_item_desc, w_warehouse_name, d1.d_week_seq, cs_promo_sk
+    EXPECTED_ROWS: <163K rows
+    CONSUMERS: aggregation
+EXAMPLES: pg_self_join_decomposition, single_pass_aggregation, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- pg_self_join_decomposition: Apply scanning date_dim once and reusing for d1,d2,d3 roles. Ignore the aggregation sharing aspect.
+- single_pass_aggregation: Apply consolidating multiple date roles into single scan. Ignore the CASE/FILTER aggregation pivot.
+- pg_date_cte_explicit_join: Apply isolating date filter into CTE. Ignore comma-join conversion.
+HAZARD_FLAGS:
+- Must ensure d1.d_week_seq = d2.d_week_seq correlation preserved when using same CTE for both roles.
+- Temporal filter d3.d_date > d1.d_date + 3 days requires comparing two rows from same CTE (self-join).
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: early_non_equi_join_pushdown
+TARGET_LOGICAL_TREE:
+prefiltered_dims -> sales_inventory_pair -> filtered_pair -> final_aggregation
+NODE_CONTRACTS:
+  prefiltered_dims:
+    FROM: date_dim d1, date_dim d2, date_dim d3, customer_demographics, household_demographics
+    WHERE: d1.d_year = 1998 AND d1.d_week_seq = d2.d_week_seq AND hd_buy_potential = '>10000' AND cd_marital_status = 'U' AND cd_dep_count BETWEEN 9 AND 11
+    OUTPUT: d1.d_date_sk, d1.d_date, d1.d_week_seq, d2.d_date_sk, d3.d_date_sk, d3.d_date, cd_demo_sk, hd_demo_sk
+    EXPECTED_ROWS: ~182 rows (d1) × selective dims
+    CONSUMERS: sales_inventory_pair
+  sales_inventory_pair:
+    FROM: catalog_sales, inventory, prefiltered_dims
+    JOIN: cs_sold_date_sk = prefiltered_dims.d1.d_date_sk AND cs_bill_cdemo_sk = prefiltered_dims.cd_demo_sk AND cs_bill_hdemo_sk = prefiltered_dims.hd_demo_sk AND inv_item_sk = cs_item_sk AND inv_date_sk = prefiltered_dims.d2.d_date_sk
+    WHERE: cs_wholesale_cost BETWEEN 35 AND 55 AND inv_quantity_on_hand < cs_quantity
+    OUTPUT: cs_item_sk, cs_quantity, cs_ship_date_sk, cs_promo_sk, cs_order_number, prefiltered_dims.d1.d_date, prefiltered_dims.d1.d_week_seq, prefiltered_dims.d3.d_date_sk, prefiltered_dims.d3.d_date, inv_warehouse_sk
+    EXPECTED_ROWS: <163K rows (non-equi applied early)
+    CONSUMERS: filtered_pair
+  filtered_pair:
+    FROM: sales_inventory_pair, item, warehouse, promotion p LEFT OUTER JOIN catalog_returns cr ON (cr_item_sk = cs_item_sk AND cr_order_number = cs_order_number)
+    JOIN: i_item_sk = sales_inventory_pair.cs_item_sk AND w_warehouse_sk = sales_inventory_pair.inv_warehouse_sk AND p.p_promo_sk = sales_inventory_pair.cs_promo_sk
+    WHERE: i_category IN ('Children', 'Jewelry', 'Men') AND sales_inventory_pair.d3.d_date > sales_inventory_pair.d1.d_date + interval '3 day'
+    OUTPUT: i_item_desc, w_warehouse_name, d1.d_week_seq, cs_promo_sk
+    EXPECTED_ROWS: ≤ sales_inventory_pair rows
+    CONSUMERS: final_aggregation
+EXAMPLES: pg_materialized_dimension_fact_prefilter, early_filter_decorrelate, pg_dimension_prefetch_star
+EXAMPLE_ADAPTATION:
+- pg_materialized_dimension_fact_prefilter: Apply early non-equi join in sales_inventory_pair CTE. Extend by pushing inv_quantity_on_hand < cs_condition immediately after catalog_sales join.
+- early_filter_decorrelate: Apply pre-filtering dimensions before joining with fact. Ignore threshold pre-computation.
+- pg_dimension_prefetch_star: Apply dimension pre-filtering but keep fact and inventory together. Ignore comma-join conversion.
+HAZARD_FLAGS:
+- Early non-equi join may increase intermediate rows if filter isn't selective enough.
+- Must ensure d3.d_date > d1.d_date + 3 days filter applied after d1.d_date available.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

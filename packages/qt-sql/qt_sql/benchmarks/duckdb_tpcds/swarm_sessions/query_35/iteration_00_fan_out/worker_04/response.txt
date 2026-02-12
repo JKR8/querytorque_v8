@@ -1,0 +1,88 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Replaced EXISTS semi-joins with CTE chain: date filter → store customers → customer base → web/catalog customers → final customers → aggregation.
+    ├── [~] WITH date_filter (CTE): filters date_dim for Q1-Q3 2001
+    ├── [~] WITH store_customers (CTE): DISTINCT store sales customers from filtered dates
+    ├── [~] WITH customer_base_store (CTE): joins customer, address, demographics with store customers
+    ├── [~] WITH web_or_catalog (CTE): UNION of web/catalog customers from filtered dates
+    ├── [~] WITH final_customers (CTE): INNER JOIN between customer_base_store and web_or_catalog
+    ├── [=] AGG (GROUP BY): same as original
+    ├── [=] SORT: same as original
+    └── [=] OUTPUT: same 19 columns as original
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "composite_decorrelate_union",
+      "description": "Extracted shared date filter into CTE, decorrelated EXISTS subqueries into pre-materialized customer key sets via UNION for OR condition.",
+      "applied_to": ["date_filter", "store_customers", "web_or_catalog", "final_customers"]
+    },
+    {
+      "id": "R2",
+      "type": "prefetch_fact_join",
+      "description": "Staged CTE pipeline: filter dates → find store customers → enrich with demographics → intersect with web/catalog customers.",
+      "applied_to": ["store_customers", "customer_base_store", "final_customers"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_qoy < 4",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "store_customers": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT DISTINCT ss_customer_sk AS customer_sk FROM store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["customer_sk"], "consumes": ["date_filter"]}
+      },
+      "customer_base_store": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c.c_customer_sk, ca.ca_state, cd.cd_gender, cd.cd_marital_status, cd.cd_dep_count, cd.cd_dep_employed_count, cd.cd_dep_college_count FROM customer c JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk JOIN store_customers sc ON c.c_customer_sk = sc.customer_sk",
+        "interfaces": {"outputs": ["c_customer_sk", "ca_state", "cd_gender", "cd_marital_status", "cd_dep_count", "cd_dep_employed_count", "cd_dep_college_count"], "consumes": ["store_customers"]}
+      },
+      "web_or_catalog": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT DISTINCT customer_sk FROM (SELECT ws_bill_customer_sk AS customer_sk FROM web_sales JOIN date_filter ON ws_sold_date_sk = d_date_sk UNION SELECT cs_ship_customer_sk AS customer_sk FROM catalog_sales JOIN date_filter ON cs_sold_date_sk = d_date_sk)",
+        "interfaces": {"outputs": ["customer_sk"], "consumes": ["date_filter"]}
+      },
+      "final_customers": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cbs.ca_state, cbs.cd_gender, cbs.cd_marital_status, cbs.cd_dep_count, cbs.cd_dep_employed_count, cbs.cd_dep_college_count FROM customer_base_store cbs JOIN web_or_catalog woc ON cbs.c_customer_sk = woc.customer_sk",
+        "interfaces": {"outputs": ["ca_state", "cd_gender", "cd_marital_status", "cd_dep_count", "cd_dep_employed_count", "cd_dep_college_count"], "consumes": ["customer_base_store", "web_or_catalog"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ca_state, cd_gender, cd_marital_status, cd_dep_count, COUNT(*) AS cnt1, MAX(cd_dep_count), SUM(cd_dep_count), MAX(cd_dep_count), cd_dep_employed_count, COUNT(*) AS cnt2, MAX(cd_dep_employed_count), SUM(cd_dep_employed_count), MAX(cd_dep_employed_count), cd_dep_college_count, COUNT(*) AS cnt3, MAX(cd_dep_college_count), SUM(cd_dep_college_count), MAX(cd_dep_college_count) FROM final_customers GROUP BY ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100",
+        "interfaces": {"outputs": ["ca_state", "cd_gender", "cd_marital_status", "cd_dep_count", "cnt1", "MAX(cd_dep_count)", "SUM(cd_dep_count)", "MAX(cd_dep_count)", "cd_dep_employed_count", "cnt2", "MAX(cd_dep_employed_count)", "SUM(cd_dep_employed_count)", "MAX(cd_dep_employed_count)", "cd_dep_college_count", "cnt3", "MAX(cd_dep_college_count)", "SUM(cd_dep_college_count)", "MAX(cd_dep_college_count)"], "consumes": ["final_customers"]}
+      }
+    },
+    "reconstruction_order": ["date_filter", "store_customers", "customer_base_store", "web_or_catalog", "final_customers", "main_query"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), store_customers AS ({store_customers}), customer_base_store AS ({customer_base_store}), web_or_catalog AS ({web_or_catalog}), final_customers AS ({final_customers}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Converted correlated EXISTS subqueries into a staged CTE pipeline with shared date filter, pre-materializing distinct customer keys for each sales channel and intersecting via INNER JOIN. Preserved all semantic constraints: customers must have store sales AND (web OR catalog sales) in 2001 Q1-Q3.
+
+Expected speedup: 2-4x from eliminating correlation overhead and sharing date dimension scans.

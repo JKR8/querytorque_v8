@@ -1,0 +1,81 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] ctr_aggregate  [+]  Cost: 50%  Rows: ~132K  — Aggregate 2002 web return amounts by returning customer and return-address state.
+│   ├── SCAN (web_returns, date_dim (join), customer_address (join))
+│   ├── JOIN (wr_returned_date_sk = d_date_sk)
+│   ├── JOIN (wr_returning_addr_sk = ca_address_sk)
+│   ├── FILTER (d_year = 2002)
+│   ├── AGG (GROUP BY wr_returning_customer_sk, ca_state)
+│   └── OUTPUT (ctr_customer_sk, ctr_state, ctr_total_return)
+├── [CTE] state_avg  [+]  Cost: 25%  Rows: 51  — Compute 120% of average return per state from ctr_aggregate.
+│   ├── SCAN (ctr_aggregate)
+│   ├── AGG (GROUP BY ctr_state)
+│   └── OUTPUT (ctr_state, avg_state_return)
+├── [MAIN] main_join  [+]  Cost: 24%  Rows: 913  — Join ctr_aggregate with state averages, customer, and current address (IN state).
+│   ├── SCAN (ctr_aggregate AS ctr1 (join), state_avg (join), customer (join), customer_address (join))
+│   ├── JOIN (ctr1.ctr_customer_sk = c_customer_sk)
+│   ├── JOIN (ca_address_sk = c_current_addr_sk)
+│   ├── JOIN (ctr1.ctr_state = state_avg.ctr_state)
+│   ├── FILTER (ca_state = 'IN')
+│   ├── FILTER (ctr1.ctr_total_return > state_avg.avg_state_return)
+│   └── OUTPUT (13 columns: customer profile + ctr_total_return)
+└── [MAIN] top_n  [+]  Cost: 1%  Rows: 100  — Apply ordering and limit.
+    ├── SCAN (main_join)
+    ├── SORT (13 columns in specified order)
+    └── OUTPUT (13 columns, same as main_join)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "decorrelate", "description": "Convert correlated state-average subquery to standalone CTE with GROUP BY", "applied_to": ["state_avg"]},
+    {"id": "R2", "type": "cte_pipeline", "description": "Restructure original single CTE into two-phase CTEs (aggregate then state-average) to enable efficient join", "applied_to": ["ctr_aggregate", "state_avg", "main_join"]},
+    {"id": "R3", "type": "explicit_join_ordering", "description": "Convert implicit cross-join to explicit INNER JOINs with clear join conditions", "applied_to": ["main_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "ctr_aggregate": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT wr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, SUM(wr_return_amt) AS ctr_total_return FROM web_returns, date_dim, customer_address WHERE wr_returned_date_sk = d_date_sk AND wr_returning_addr_sk = ca_address_sk AND d_year = 2002 GROUP BY wr_returning_customer_sk, ca_state",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_state", "ctr_total_return"], "consumes": []}
+      },
+      "state_avg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ctr_state, AVG(ctr_total_return) * 1.2 AS avg_state_return FROM ctr_aggregate GROUP BY ctr_state",
+        "interfaces": {"outputs": ["ctr_state", "avg_state_return"], "consumes": ["ctr_aggregate"]}
+      },
+      "main_join": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr1.ctr_total_return FROM ctr_aggregate ctr1 INNER JOIN state_avg ON ctr1.ctr_state = state_avg.ctr_state INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk WHERE ca_state = 'IN' AND ctr1.ctr_total_return > state_avg.avg_state_return",
+        "interfaces": {"outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag", "c_birth_day", "c_birth_month", "c_birth_year", "c_birth_country", "c_login", "c_email_address", "c_last_review_date_sk", "ctr_total_return"], "consumes": ["ctr_aggregate", "state_avg"]}
+      },
+      "top_n": {
+        "type": "main_query",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag", "c_birth_day", "c_birth_month", "c_birth_year", "c_birth_country", "c_login", "c_email_address", "c_last_review_date_sk", "ctr_total_return"], "consumes": ["main_join"]}
+      }
+    },
+    "reconstruction_order": ["ctr_aggregate", "state_avg", "main_join", "top_n"],
+    "assembly_template": "WITH ctr_aggregate AS ({ctr_aggregate}), state_avg AS ({state_avg}) {main_query} ORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return LIMIT 100"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured original correlated subquery into two CTEs (ctr_aggregate → state_avg) using decorrelation pattern, then joined in main query with explicit INNER JOINs. This eliminates per-state re-execution of the correlated subquery.
+
+**Expected speedup:** 2-4x due to single-pass computation of state averages instead of per-row subquery execution.

@@ -1,0 +1,100 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]
+    ├── CTE date_filter  [+]
+    │   └── SCAN date_dim (filtered by d_date range)
+    ├── CTE fact_agg_by_keys  [+]
+    │   ├── JOIN (catalog_sales INNER JOIN date_filter ON cs_sold_date_sk = d_date_sk)
+    │   ├── JOIN (LEFT OUTER JOIN catalog_returns ON (cs_order_number=cr_order_number AND cs_item_sk=cr_item_sk AND cr_reason_sk=40))
+    │   ├── FILTER (cs_wholesale_cost BETWEEN 68 AND 87)
+    │   └── AGG (GROUP BY cs_item_sk, cs_warehouse_sk, d_date; compute sales_before/after)
+    ├── CTE dimension_join  [+]
+    │   ├── JOIN (fact_agg_by_keys INNER JOIN item ON cs_item_sk = i_item_sk)
+    │   ├── JOIN (fact_agg_by_keys INNER JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk)
+    │   ├── FILTER (i_category='Shoes' AND i_manager_id BETWEEN 42 AND 81)
+    │   └── AGG (GROUP BY w_state, i_item_id; sum sales_before/after)
+    ├── SORT (w_state ASC, i_item_id ASC)
+    └── OUTPUT (w_state, i_item_id, sales_before, sales_after)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "cte_decomposition",
+      "description": "Replace mixed-comma joins with explicit CTE structure following Target Logical Tree",
+      "applied_to": ["main_query", "date_filter", "fact_agg_by_keys", "dimension_join"]
+    },
+    {
+      "id": "R2",
+      "type": "late_attribute_binding",
+      "description": "Aggregate first on surrogate keys (cs_item_sk, cs_warehouse_sk, d_date), then join to dimension tables for final grouping",
+      "applied_to": ["fact_agg_by_keys", "dimension_join"]
+    },
+    {
+      "id": "R3",
+      "type": "left_join_condition_fix",
+      "description": "Move cr_reason_sk=40 from WHERE clause to LEFT JOIN ON clause to preserve sales without returns",
+      "applied_to": ["fact_agg_by_keys"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN (CAST('2002-02-20' AS DATE) - INTERVAL '30 DAY') AND (CAST('2002-02-20' AS DATE) + INTERVAL '30 DAY')",
+        "interfaces": {
+          "outputs": ["d_date_sk", "d_date"],
+          "consumes": []
+        }
+      },
+      "fact_agg_by_keys": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cs_item_sk, cs_warehouse_sk, d_date, SUM(CASE WHEN (CAST(d_date AS DATE) < CAST('2002-02-20' AS DATE)) THEN cs_sales_price - COALESCE(cr_refunded_cash,0) ELSE 0 END) AS sales_before, SUM(CASE WHEN (CAST(d_date AS DATE) >= CAST('2002-02-20' AS DATE)) THEN cs_sales_price - COALESCE(cr_refunded_cash,0) ELSE 0 END) AS sales_after FROM catalog_sales INNER JOIN date_filter ON (cs_sold_date_sk = date_filter.d_date_sk) LEFT OUTER JOIN catalog_returns ON (cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk AND cr_reason_sk = 40) WHERE cs_wholesale_cost BETWEEN 68 AND 87 GROUP BY cs_item_sk, cs_warehouse_sk, d_date",
+        "interfaces": {
+          "outputs": ["cs_item_sk", "cs_warehouse_sk", "d_date", "sales_before", "sales_after"],
+          "consumes": ["date_filter"]
+        }
+      },
+      "dimension_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT w.w_state, i.i_item_id, SUM(f.sales_before) AS sales_before, SUM(f.sales_after) AS sales_after FROM fact_agg_by_keys f INNER JOIN item i ON (f.cs_item_sk = i.i_item_sk) INNER JOIN warehouse w ON (f.cs_warehouse_sk = w.w_warehouse_sk) WHERE i.i_category = 'Shoes' AND i.i_manager_id BETWEEN 42 AND 81 GROUP BY w.w_state, i.i_item_id",
+        "interfaces": {
+          "outputs": ["w_state", "i_item_id", "sales_before", "sales_after"],
+          "consumes": ["fact_agg_by_keys"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT w_state, i_item_id, sales_before, sales_after FROM dimension_join ORDER BY w_state, i_item_id LIMIT 100",
+        "interfaces": {
+          "outputs": ["w_state", "i_item_id", "sales_before", "sales_after"],
+          "consumes": ["dimension_join"]
+        }
+      }
+    },
+    "reconstruction_order": ["date_filter", "fact_agg_by_keys", "dimension_join", "main_query"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), fact_agg_by_keys AS ({fact_agg_by_keys}), dimension_join AS ({dimension_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL max_parallel_workers_per_gather = 2", "SET LOCAL work_mem = '32MB'"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured query into explicit CTEs following the target logical tree, moving dimension filters (item/warehouse) after the initial aggregation on surrogate keys, and fixing the LEFT JOIN condition to preserve sales without returns.  
+**Expected speedup**: 1.5-2x due to reduced intermediate rows via early filtering and enabling parallel scans on catalog_sales in the fact_agg_by_keys CTE (no CTE materialization fence). The runtime config enables parallelism for the large fact table scan and provides adequate work_mem for hash aggregation.

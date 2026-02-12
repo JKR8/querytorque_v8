@@ -1,0 +1,90 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] monthly_sales  [+]  New intermediate CTE for monthly aggregated sales
+│   ├── SCAN (item, catalog_sales (join), date_dim (join), call_center (join))
+│   ├── JOIN (cs_item_sk = i_item_sk)
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── JOIN (cc_call_center_sk = cs_call_center_sk)
+│   ├── FILTER ((d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1)))
+│   ├── AGG (GROUP BY i_category, i_brand, cc_name, d_year, d_moy)
+│   └── OUTPUT (i_category, i_brand, cc_name, d_year, d_moy, sum_sales)
+├── [CTE] yearly_avg  [+]  New CTE for yearly average monthly sales
+│   ├── SCAN (monthly_sales)
+│   ├── AGG (GROUP BY i_category, i_brand, cc_name, d_year)
+│   └── OUTPUT (i_category, i_brand, cc_name, d_year, avg_monthly_sales)
+├── [CTE] v1_combined  [~]  Modified: now joins monthly_sales and yearly_avg, window computes rank only
+│   ├── SCAN (monthly_sales)
+│   ├── JOIN (yearly_avg USING (i_category, i_brand, cc_name, d_year))
+│   ├── WINDOW (RANK() OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy))
+│   └── OUTPUT (i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn)
+├── [CTE] v2  [=]  Unchanged self-join on v1_combined
+│   ├── SCAN (v1_combined, v1_combined AS v1_lag, v1_combined AS v1_lead)
+│   ├── JOIN (7 equality conditions + rn adjacency)
+│   └── OUTPUT (i_brand, d_year, avg_monthly_sales, sum_sales, psum, nsum)
+└── [MAIN] main_query  [=]  Unchanged filtering and ordering
+    ├── SCAN (v2)
+    ├── FILTER (d_year = 1999 AND avg_monthly_sales > 0)
+    ├── FILTER (CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales END > 0.1)
+    ├── SORT (sum_sales - avg_monthly_sales ASC, nsum ASC)
+    └── OUTPUT (*)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "deferred_aggregation", "description": "Split AVG window into separate group-by and join, moving AVG computation from window to grouped CTE", "applied_to": ["v1_combined"]},
+    {"id": "R2", "type": "cte_materialization", "description": "Create intermediate CTEs monthly_sales and yearly_avg for better predicate pushdown and columnar scan", "applied_to": ["monthly_sales", "yearly_avg"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "monthly_sales": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_category, i_brand, cc_name, d_year, d_moy, SUM(cs_sales_price) AS sum_sales FROM item, catalog_sales, date_dim, call_center WHERE cs_item_sk = i_item_sk AND cs_sold_date_sk = d_date_sk AND cc_call_center_sk = cs_call_center_sk AND (d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1)) GROUP BY i_category, i_brand, cc_name, d_year, d_moy",
+        "interfaces": {"outputs": ["i_category", "i_brand", "cc_name", "d_year", "d_moy", "sum_sales"], "consumes": []}
+      },
+      "yearly_avg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_category, i_brand, cc_name, d_year, AVG(sum_sales) AS avg_monthly_sales FROM monthly_sales GROUP BY i_category, i_brand, cc_name, d_year",
+        "interfaces": {"outputs": ["i_category", "i_brand", "cc_name", "d_year", "avg_monthly_sales"], "consumes": ["monthly_sales"]}
+      },
+      "v1_combined": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ms.i_category, ms.i_brand, ms.cc_name, ms.d_year, ms.d_moy, ms.sum_sales, ya.avg_monthly_sales, RANK() OVER (PARTITION BY ms.i_category, ms.i_brand, ms.cc_name ORDER BY ms.d_year, ms.d_moy) AS rn FROM monthly_sales ms INNER JOIN yearly_avg ya ON ms.i_category = ya.i_category AND ms.i_brand = ya.i_brand AND ms.cc_name = ya.cc_name AND ms.d_year = ya.d_year",
+        "interfaces": {"outputs": ["i_category", "i_brand", "cc_name", "d_year", "d_moy", "sum_sales", "avg_monthly_sales", "rn"], "consumes": ["monthly_sales", "yearly_avg"]}
+      },
+      "v2": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": [], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": [], "consumes": []}
+      }
+    },
+    "reconstruction_order": ["monthly_sales", "yearly_avg", "v1_combined", "v2", "main_query"],
+    "assembly_template": "WITH monthly_sales AS ({monthly_sales}), yearly_avg AS ({yearly_avg}), v1_combined AS ({v1_combined}), v2 AS (SELECT v1.i_brand, v1.d_year, v1.avg_monthly_sales, v1.sum_sales, v1_lag.sum_sales AS psum, v1_lead.sum_sales AS nsum FROM v1_combined v1, v1_combined v1_lag, v1_combined v1_lead WHERE v1.i_category = v1_lag.i_category AND v1.i_category = v1_lead.i_category AND v1.i_brand = v1_lag.i_brand AND v1.i_brand = v1_lead.i_brand AND v1.cc_name = v1_lag.cc_name AND v1.cc_name = v1_lead.cc_name AND v1.rn = v1_lag.rn + 1 AND v1.rn = v1_lead.rn - 1) SELECT * FROM v2 WHERE d_year = 1999 AND avg_monthly_sales > 0 AND CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales END > 0.1 ORDER BY sum_sales - avg_monthly_sales, nsum LIMIT 100"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Split the original v1 CTE's AVG window function into a separate grouped aggregate (yearly_avg) and join, keeping only the RANK window in v1_combined. This reduces window computation cost by computing AVG over fewer groups.
+
+**Expected speedup:** 1.2-1.4x due to reduced window function overhead and better columnar scan of only needed columns in monthly_sales.

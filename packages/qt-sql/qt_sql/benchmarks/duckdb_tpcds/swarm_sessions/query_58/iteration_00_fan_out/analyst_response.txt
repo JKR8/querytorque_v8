@@ -1,0 +1,315 @@
+<reasoning>
+## 1. CLASSIFY
+This query is a **multi-channel comparison self-join** archetype. Three independent CTEs compute per-item revenue aggregates for store, catalog, and web channels for the same week, then joined together with pairwise ±10% filters. The structure exhibits:
+- Three parallel fact table scans (store_sales, catalog_sales, web_sales) with identical dimension joins (item, date_dim)
+- Each channel CTE uses the same date filter subquery (week of 2001-03-24)
+- Main query performs a 3-way inner join with complex revenue ratio filters
+- No window functions, no UNION, no INTERSECT, no correlated subqueries beyond the date lookup
+
+## 2. EXPLAIN PLAN ANALYSIS
+Wall-clock times (exclusive per operator):
+- store_sales scan: 152.1ms (57% of total) - largest bottleneck
+- web_sales scan: 31.7ms (12%)
+- catalog_sales scan: 0.6ms (negligible)
+- store_sales hash joins (item, date_dim): ~14.4ms total
+- web_sales hash joins: ~5.8ms total
+- catalog_sales hash joins: ~2.2ms total
+- Main query joins & filters: 7.7ms
+- Group by aggregations: ~37.8ms total (ss: 20.9ms, cs: 6.4ms, ws: 10.5ms)
+
+Row count flow:
+- store_sales: 345.6M → 60K after date filter → 60K after item join → 35K after group by
+- catalog_sales: 172.8M → 32K → 32K → 24K
+- web_sales: 86.4M → 17K → 17K → 14K
+- Main query: 35K × 24K × 14K (cartesian before filters) → 5 rows after all filters → TOP_N 100
+
+Optimizer behavior:
+- Already splits CTEs (each computed independently)
+- Already pushes date predicates into date_dim scans (d_date_sk ranges shown)
+- Already decorrelates the date subquery (converts to hash join semi)
+- CTEs are materialized once each (single reference)
+
+Scan counts:
+- store_sales: 1 scan
+- catalog_sales: 1 scan  
+- web_sales: 1 scan
+- item: 3 scans (once per channel CTE) - 102K rows each, ~1.3ms each
+- date_dim: 9 scans! (3× for week subquery, 3× for date filter, 3× for date join) but each is tiny (73K rows, 0.1ms each)
+
+## 3. GAP MATCHING
+Active gaps:
+- **CROSS_CTE_PREDICATE_BLINDNESS**: Each channel CTE independently computes the same date filter subquery. The optimizer doesn't share this computation across CTEs.
+- **REDUNDANT_SCAN_ELIMINATION**: item table scanned 3 times with identical unfiltered scans. Could be reduced to 1 scan.
+- **CROSS_COLUMN_OR_DECOMPOSITION**: Not applicable (no OR conditions).
+- **CORRELATED_SUBQUERY_PARALYSIS**: Already decorrelated by optimizer.
+- **UNION_CTE_SELF_JOIN_DECOMPOSITION**: Not applicable (no UNION).
+
+Engine strengths already handling:
+- INTRA_SCAN_PREDICATE_PUSHDOWN: Date predicates pushed into date_dim scans
+- HASH_JOIN_SELECTION: Efficient hash joins used
+- EXISTS_SEMI_JOIN: Date subquery converted to semi-join
+
+## 4. AGGREGATION TRAP CHECK
+Only SUM aggregates on revenue columns. No STDDEV, VARIANCE, PERCENTILE, or FILTER clauses. Aggregates are grouping-insensitive (modulo duplicates). The joins before aggregation are on foreign keys (item_sk, date_sk) which should preserve one-to-many relationships without duplication.
+
+## 5. TRANSFORM SELECTION
+Ranked opportunities:
+1. **Shared date filter CTE** (date_cte_isolate): Eliminate 6 redundant date_dim scans. Expected high value because date filter is complex (week lookup) and repeated 3×.
+2. **Single-pass multi-channel aggregation** (channel_bitmap_aggregation): Consolidate 3 separate item scans into 1, and possibly consolidate date joins. High value due to 3× item table scans.
+3. **Restructure main query filters** (simplify ratio checks): Replace 6 pairwise filters with min/max ratio check. Could reduce join complexity.
+4. **Prefetch dimension CTEs** (dimension_cte_isolate): Pre-filter item and date into CTEs before fact joins. Medium value.
+
+Structural diversity:
+- Worker 1: Shared date filter CTE (predicate movement)
+- Worker 2: Single-pass multi-channel aggregation (scan optimization)  
+- Worker 3: Simplified filter logic + late attribute binding (join restructuring)
+- Worker 4: Exploration - compound strategy combining all above
+
+## 6. LOGICAL TREE DESIGN
+For each strategy, ensure CTE column completeness:
+- Must include: item_id, ss_item_rev, cs_item_rev, ws_item_rev for main query
+- Must include join keys: item_sk, date_sk where needed
+- Must preserve exact literal values (2001-03-24)
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compare weekly item revenue consistency across store, catalog, and web channels for the week containing 2001-03-24, returning items whose channel revenues are all within +/-10% of each other. All three channel CTEs must match on item_id (INNER JOIN semantics). Only SUM aggregates are used, which are grouping-insensitive to duplicates. The date filter subquery is identical across all three CTEs; any rewrite must preserve that all three channels filter to the exact same week.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: store_sales scan dominates at 152ms (57% of total). Secondary: web_sales scan at 32ms. The optimizer already pushes date predicates and decorrelates subqueries efficiently. Cardinality drops sharply after date filters (345M→60K for store_sales). Logical-tree cost percentages mislead - store_sales scan is the true bottleneck, not the 25% per-CTE distribution. Three independent item table scans (102K rows each) and nine date_dim scans add overhead.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output all 8 columns (item_id, ss_item_rev, ss_dev, cs_item_rev, cs_dev, ws_item_rev, ws_dev, average) in original order.
+- CTE_COLUMN_COMPLETENESS: Any new CTE must include all columns referenced downstream, especially item_id and revenue aggregates.
+- LITERAL_PRESERVATION: Must preserve literal '2001-03-24' exactly.
+- SEMANTIC_EQUIVALENCE: Must return same rows and ordering (ORDER BY ss_items.item_id, ss_item_rev).
+- CROSS_CTE_PREDICATE_BLINDNESS: Each channel CTE independently computes same date filter (EXPLAIN shows 9 date_dim scans).
+- REDUNDANT_SCAN_ELIMINATION: item table scanned 3 times with identical unfiltered scans (EXPLAIN shows 3× SEQ_SCAN item).
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline <100ms, CTE overhead dominated savings
+   RULE: This query baseline is 266ms, so CTE overhead acceptable
+2. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion
+   RULE: Never cross-join 3+ dimension CTEs; ensure each has WHERE clause
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: shared_date_cte_isolate
+TARGET_LOGICAL_TREE:
+  date_week_cte -> store_agg_cte -> catalog_agg_cte -> web_agg_cte -> main_query
+NODE_CONTRACTS:
+  date_week_cte:
+    FROM: date_dim
+    WHERE: d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 7
+    CONSUMERS: store_agg_cte, catalog_agg_cte, web_agg_cte
+  store_agg_cte:
+    FROM: store_sales JOIN date_week_cte ON ss_sold_date_sk = d_date_sk JOIN item ON ss_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(ss_ext_sales_price) AS ss_item_rev
+    OUTPUT: i_item_id AS item_id, ss_item_rev
+    EXPECTED_ROWS: 35K
+    CONSUMERS: main_query
+  catalog_agg_cte:
+    FROM: catalog_sales JOIN date_week_cte ON cs_sold_date_sk = d_date_sk JOIN item ON cs_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(cs_ext_sales_price) AS cs_item_rev
+    OUTPUT: i_item_id AS item_id, cs_item_rev
+    EXPECTED_ROWS: 24K
+    CONSUMERS: main_query
+  web_agg_cte:
+    FROM: web_sales JOIN date_week_cte ON ws_sold_date_sk = d_date_sk JOIN item ON ws_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(ws_ext_sales_price) AS ws_item_rev
+    OUTPUT: i_item_id AS item_id, ws_item_rev
+    EXPECTED_ROWS: 14K
+    CONSUMERS: main_query
+  main_query:
+    FROM: store_agg_cte JOIN catalog_agg_cte ON item_id = item_id JOIN web_agg_cte ON item_id = item_id
+    WHERE: (All 6 pairwise ±10% filters preserved)
+    ORDER BY: store_agg_cte.item_id ASC, ss_item_rev ASC
+    OUTPUT: item_id, ss_item_rev, ss_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS ss_dev, cs_item_rev, cs_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS cs_dev, ws_item_rev, ws_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS ws_dev, (ss_item_rev+cs_item_rev+ws_item_rev)/3 AS average
+    EXPECTED_ROWS: 5
+    CONSUMERS: final output
+EXAMPLES: date_cte_isolate, early_filter, pushdown
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: Apply the pattern of extracting date filter into shared CTE; ignore that Q6/Q11 had multiple date ranges - here we have one week.
+- early_filter: Apply filtering small dimension (date_dim) first; ignore the reason table filter - we only have date.
+- pushdown: Apply consolidating repeated date subqueries; ignore the 15+ scalar subqueries - we have 3 channel CTEs.
+HAZARD_FLAGS:
+- Must ensure date_week_cte returns exact same dates as original subquery (all dates in the week).
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: single_pass_multi_channel_aggregation
+TARGET_LOGICAL_TREE:
+  date_week_cte -> all_sales_union_cte -> channel_pivot_cte -> main_query
+NODE_CONTRACTS:
+  date_week_cte:
+    FROM: date_dim
+    WHERE: d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 7
+    CONSUMERS: all_sales_union_cte
+  all_sales_union_cte:
+    FROM: (
+      SELECT ss_item_sk AS item_sk, ss_sold_date_sk AS date_sk, ss_ext_sales_price AS sales_price, 'store' AS channel FROM store_sales
+      UNION ALL
+      SELECT cs_item_sk, cs_sold_date_sk, cs_ext_sales_price, 'catalog' FROM catalog_sales
+      UNION ALL
+      SELECT ws_item_sk, ws_sold_date_sk, ws_ext_sales_price, 'web' FROM web_sales
+    ) sales JOIN date_week_cte ON sales.date_sk = d_date_sk JOIN item ON sales.item_sk = i_item_sk
+    OUTPUT: i_item_id, channel, sales_price
+    EXPECTED_ROWS: 60K+32K+17K = ~109K
+    CONSUMERS: channel_pivot_cte
+  channel_pivot_cte:
+    FROM: all_sales_union_cte
+    GROUP BY: i_item_id
+    AGGREGATE: 
+      SUM(CASE WHEN channel = 'store' THEN sales_price END) AS ss_item_rev,
+      SUM(CASE WHEN channel = 'catalog' THEN sales_price END) AS cs_item_rev,
+      SUM(CASE WHEN channel = 'web' THEN sales_price END) AS ws_item_rev
+    OUTPUT: i_item_id AS item_id, ss_item_rev, cs_item_rev, ws_item_rev
+    EXPECTED_ROWS: ~35K (max of individual channel groups)
+    CONSUMERS: main_query
+  main_query:
+    FROM: channel_pivot_cte
+    WHERE: (All 6 pairwise ±10% filters preserved)
+    ORDER BY: item_id ASC, ss_item_rev ASC
+    OUTPUT: item_id, ss_item_rev, ss_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS ss_dev, cs_item_rev, cs_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS cs_dev, ws_item_rev, ws_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS ws_dev, (ss_item_rev+cs_item_rev+ws_item_rev)/3 AS average
+    EXPECTED_ROWS: 5
+    CONSUMERS: final output
+EXAMPLES: channel_bitmap_aggregation, single_pass_aggregation, union_consolidation
+EXAMPLE_ADAPTATION:
+- channel_bitmap_aggregation: Apply consolidating multiple fact scans into single pass with CASE aggregation; ignore the >8 buckets warning - we have only 3 channels.
+- single_pass_aggregation: Apply using CASE inside aggregates for multiple channels; ignore the scalar subquery pattern - we use UNION ALL.
+- union_consolidation: Apply sharing dimension lookups across UNION branches; ignore that original had different dim joins - we have same dims.
+HAZARD_FLAGS:
+- UNION ALL may materialize large intermediate results; ensure date and item joins happen before union to reduce row count.
+- Must verify UNION ALL doesn't change semantics (should be equivalent to separate scans).
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: simplified_filters_late_attribute
+TARGET_LOGICAL_TREE:
+  date_week_cte -> item_prefetch_cte -> store_agg_cte -> catalog_agg_cte -> web_agg_cte -> filtered_join_cte -> main_query
+NODE_CONTRACTS:
+  date_week_cte:
+    FROM: date_dim
+    WHERE: d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 7
+    CONSUMERS: store_agg_cte, catalog_agg_cte, web_agg_cte
+  item_prefetch_cte:
+    FROM: item
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: 102K
+    CONSUMERS: store_agg_cte, catalog_agg_cte, web_agg_cte
+  store_agg_cte:
+    FROM: store_sales JOIN date_week_cte ON ss_sold_date_sk = d_date_sk JOIN item_prefetch_cte ON ss_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(ss_ext_sales_price) AS ss_item_rev
+    OUTPUT: i_item_id AS item_id, ss_item_rev
+    EXPECTED_ROWS: 35K
+    CONSUMERS: filtered_join_cte
+  catalog_agg_cte:
+    FROM: catalog_sales JOIN date_week_cte ON cs_sold_date_sk = d_date_sk JOIN item_prefetch_cte ON cs_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(cs_ext_sales_price) AS cs_item_rev
+    OUTPUT: i_item_id AS item_id, cs_item_rev
+    EXPECTED_ROWS: 24K
+    CONSUMERS: filtered_join_cte
+  web_agg_cte:
+    FROM: web_sales JOIN date_week_cte ON ws_sold_date_sk = d_date_sk JOIN item_prefetch_cte ON ws_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(ws_ext_sales_price) AS ws_item_rev
+    OUTPUT: i_item_id AS item_id, ws_item_rev
+    EXPECTED_ROWS: 14K
+    CONSUMERS: filtered_join_cte
+  filtered_join_cte:
+    FROM: store_agg_cte s JOIN catalog_agg_cte c ON s.item_id = c.item_id JOIN web_agg_cte w ON s.item_id = w.item_id
+    WHERE: GREATEST(s.ss_item_rev/c.cs_item_rev, c.cs_item_rev/s.ss_item_rev, s.ss_item_rev/w.ws_item_rev, w.ws_item_rev/s.ss_item_rev, c.cs_item_rev/w.ws_item_rev, w.ws_item_rev/c.cs_item_rev) <= 1.1
+    OUTPUT: s.item_id, ss_item_rev, cs_item_rev, ws_item_rev
+    EXPECTED_ROWS: 5
+    CONSUMERS: main_query
+  main_query:
+    FROM: filtered_join_cte
+    ORDER BY: item_id ASC, ss_item_rev ASC
+    OUTPUT: item_id, ss_item_rev, ss_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS ss_dev, cs_item_rev, cs_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS cs_dev, ws_item_rev, ws_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS ws_dev, (ss_item_rev+cs_item_rev+ws_item_rev)/3 AS average
+    EXPECTED_ROWS: 5
+    CONSUMERS: final output
+EXAMPLES: dimension_cte_isolate, late_attribute_binding, or_to_union
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering dimension (item) into CTE; ignore the cross-join warning - we join fact tables separately.
+- late_attribute_binding: Apply pre-joining item once and reusing; ignore that original had no display columns - we use item_sk for joins.
+- or_to_union: NOT APPLICABLE for filter simplification; use the min/max ratio logic instead.
+HAZARD_FLAGS:
+- Simplified filter (GREATEST of ratios <= 1.1) must be mathematically equivalent to 6 pairwise filters.
+- item_prefetch_cte has no WHERE clause, but necessary for completeness.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_star_join_prefetch_with_consolidation
+TARGET_LOGICAL_TREE:
+  date_week_cte -> item_prefetch_cte -> all_sales_single_pass -> channel_pivot_cte -> filtered_join_cte -> main_query
+NODE_CONTRACTS:
+  date_week_cte:
+    FROM: date_dim
+    WHERE: d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 7
+    CONSUMERS: all_sales_single_pass
+  item_prefetch_cte:
+    FROM: item
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: 102K
+    CONSUMERS: all_sales_single_pass
+  all_sales_single_pass:
+    FROM: (
+      SELECT ss_item_sk AS item_sk, ss_sold_date_sk AS date_sk, ss_ext_sales_price AS sales_price, 1 AS is_store, 0 AS is_catalog, 0 AS is_web FROM store_sales
+      UNION ALL
+      SELECT cs_item_sk, cs_sold_date_sk, cs_ext_sales_price, 0, 1, 0 FROM catalog_sales
+      UNION ALL
+      SELECT ws_item_sk, ws_sold_date_sk, ws_ext_sales_price, 0, 0, 1 FROM web_sales
+    ) sales JOIN date_week_cte ON sales.date_sk = d_date_sk JOIN item_prefetch_cte ON sales.item_sk = i_item_sk
+    OUTPUT: i_item_id, sales_price, is_store, is_catalog, is_web
+    EXPECTED_ROWS: ~109K
+    CONSUMERS: channel_pivot_cte
+  channel_pivot_cte:
+    FROM: all_sales_single_pass
+    GROUP BY: i_item_id
+    AGGREGATE: 
+      SUM(sales_price * is_store) AS ss_item_rev,
+      SUM(sales_price * is_catalog) AS cs_item_rev,
+      SUM(sales_price * is_web) AS ws_item_rev
+    OUTPUT: i_item_id AS item_id, ss_item_rev, cs_item_rev, ws_item_rev
+    EXPECTED_ROWS: ~35K
+    CONSUMERS: filtered_join_cte
+  filtered_join_cte:
+    FROM: channel_pivot_cte
+    WHERE: GREATEST(ss_item_rev/NULLIF(cs_item_rev,0), cs_item_rev/NULLIF(ss_item_rev,0), ss_item_rev/NULLIF(ws_item_rev,0), ws_item_rev/NULLIF(ss_item_rev,0), cs_item_rev/NULLIF(ws_item_rev,0), ws_item_rev/NULLIF(cs_item_rev,0)) <= 1.1
+    OUTPUT: item_id, ss_item_rev, cs_item_rev, ws_item_rev
+    EXPECTED_ROWS: 5
+    CONSUMERS: main_query
+  main_query:
+    FROM: filtered_join_cte
+    ORDER BY: item_id ASC, ss_item_rev ASC
+    OUTPUT: item_id, ss_item_rev, ss_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS ss_dev, cs_item_rev, cs_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS cs_dev, ws_item_rev, ws_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS ws_dev, (ss_item_rev+cs_item_rev+ws_item_rev)/3 AS average
+    EXPECTED_ROWS: 5
+    CONSUMERS: final output
+EXAMPLES: star_join_prefetch, scan_consolidation_pivot, single_pass_aggregation
+EXAMPLE_ADAPTATION:
+- star_join_prefetch: Apply pre-filtering all dimensions (date, item) before fact joins; ignore the multi-table join complexity - we use UNION.
+- scan_consolidation_pivot: Apply consolidating multiple channel scans into single pass with discriminator columns; ignore the pivot warning - we use multiplication not CASE.
+- single_pass_aggregation: Apply computing all channel aggregates in one GROUP BY; ignore the scalar subquery pattern.
+HAZARD_FLAGS:
+- Using multiplication (sales_price * is_store) may have precision issues vs CASE.
+- NULLIF in ratio checks to avoid division by zero (original filters would fail on zero revenue).
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

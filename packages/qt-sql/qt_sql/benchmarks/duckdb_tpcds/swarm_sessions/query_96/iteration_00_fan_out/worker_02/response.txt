@@ -1,0 +1,106 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Staged join pipeline via CTEs
+    ├── WITH
+    │   ├── filtered_time  [+]  — Isolate time filter
+    │   │   └── SCAN (time_dim) + FILTER (t_hour=8, t_minute>=30)
+    │   ├── fact_time  [+]  — First-stage fact join (time dimension)
+    │   │   ├── SCAN (store_sales)
+    │   │   └── JOIN filtered_time (ss_sold_time_sk = t_time_sk)
+    │   ├── filtered_hd  [+]  — Isolate household filter
+    │   │   └── SCAN (household_demographics) + FILTER (hd_dep_count=3)
+    │   ├── fact_hd  [+]  — Second-stage fact join (household dimension)
+    │   │   ├── FROM fact_time
+    │   │   └── JOIN filtered_hd (ss_hdemo_sk = hd_demo_sk)
+    │   ├── filtered_store  [+]  — Isolate store filter
+    │   │   └── SCAN (store) + FILTER (s_store_name='ese')
+    │   ├── final_join  [+]  — Final dimension join
+    │   │   ├── FROM fact_hd
+    │   │   └── JOIN filtered_store (ss_store_sk = s_store_sk)
+    │   ├── aggregate  [+]  — Count rows
+    │   │   └── AGGREGATE (COUNT(*) as cnt)
+    │   └── limit  [+]  — Order and limit
+    │       ├── FROM aggregate
+    │       ├── ORDER BY cnt ASC
+    │       └── LIMIT 100
+    └── OUTPUT (cnt)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extracted time filter into CTE", "applied_to": ["filtered_time"]},
+    {"id": "R2", "type": "early_filter", "description": "Pre-filter small dimension tables", "applied_to": ["filtered_hd", "filtered_store"]},
+    {"id": "R3", "type": "prefetch_fact_join", "description": "Staged fact joins to progressively reduce data", "applied_to": ["fact_time", "fact_hd", "final_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_time": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT t_time_sk FROM time_dim WHERE t_hour = 8 AND t_minute >= 30",
+        "interfaces": {"outputs": ["t_time_sk"], "consumes": []}
+      },
+      "fact_time": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_sold_time_sk, ss_hdemo_sk, ss_store_sk FROM store_sales INNER JOIN filtered_time ON ss_sold_time_sk = t_time_sk",
+        "interfaces": {"outputs": ["ss_sold_time_sk", "ss_hdemo_sk", "ss_store_sk"], "consumes": ["filtered_time"]}
+      },
+      "filtered_hd": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 3",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": []}
+      },
+      "fact_hd": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_sold_time_sk, ss_hdemo_sk, ss_store_sk FROM fact_time INNER JOIN filtered_hd ON ss_hdemo_sk = hd_demo_sk",
+        "interfaces": {"outputs": ["ss_sold_time_sk", "ss_hdemo_sk", "ss_store_sk"], "consumes": ["fact_time", "filtered_hd"]}
+      },
+      "filtered_store": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_sk FROM store WHERE s_store_name = 'ese'",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "final_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT 1 FROM fact_hd INNER JOIN filtered_store ON ss_store_sk = s_store_sk",
+        "interfaces": {"outputs": ["1"], "consumes": ["fact_hd", "filtered_store"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT COUNT(*) AS cnt FROM final_join",
+        "interfaces": {"outputs": ["cnt"], "consumes": ["final_join"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT cnt FROM aggregate ORDER BY cnt ASC LIMIT 100",
+        "interfaces": {"outputs": ["cnt"], "consumes": ["aggregate"]}
+      }
+    },
+    "reconstruction_order": ["filtered_time", "fact_time", "filtered_hd", "fact_hd", "filtered_store", "final_join", "aggregate", "main_query"],
+    "assembly_template": "WITH filtered_time AS ({filtered_time}), fact_time AS ({fact_time}), filtered_hd AS ({filtered_hd}), fact_hd AS ({fact_hd}), filtered_store AS ({filtered_store}), final_join AS ({final_join}), aggregate AS ({aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Converted the original 4-way join into a staged CTE pipeline that isolates dimension filters first, then joins them sequentially with the fact table to progressively reduce data. This follows the prefetch_fact_join pattern while respecting the exact logical tree structure.
+
+**Expected speedup**: 2-3x (baseline 301ms → ~100-150ms). The staged join reduces the fact table scan from 4M+ rows to ~411K rows after the first time filter, then to 48K after household filter, and finally to 7K after store filter before aggregation.

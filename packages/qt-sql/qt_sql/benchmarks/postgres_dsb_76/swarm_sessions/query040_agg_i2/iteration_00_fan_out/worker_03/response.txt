@@ -1,0 +1,126 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Structural change: CTE-based staged reduction
+    ├── [+] date_cte (CTE)
+    │   ├── SCAN date_dim
+    │   └── FILTER d_date BETWEEN (cast('2002-02-20' as date) - interval '30 day') AND (cast('2002-02-20' as date) + interval '30 day')
+    ├── [+] item_cte (CTE)
+    │   ├── SCAN item
+    │   └── FILTER i_category = 'Shoes' AND i_manager_id BETWEEN 42 AND 81
+    ├── [+] fact_cte (CTE)
+    │   ├── SCAN catalog_sales
+    │   ├── JOIN (INNER) date_cte ON cs_sold_date_sk = d_date_sk
+    │   ├── JOIN (INNER) item_cte ON cs_item_sk = i_item_sk
+    │   └── FILTER cs_wholesale_cost BETWEEN 68 AND 87
+    ├── [+] final_join (CTE)
+    │   ├── SCAN fact_cte
+    │   ├── JOIN (INNER) warehouse ON cs_warehouse_sk = w_warehouse_sk
+    │   └── JOIN (LEFT OUTER) catalog_returns ON cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk AND cr_reason_sk = 40
+    ├── [+] aggregation (CTE)
+    │   ├── SCAN final_join
+    │   ├── AGG (GROUP BY w_state, i_item_id)
+    │   └── AGGREGATE SUM(CASE ...) as sales_before, SUM(CASE ...) as sales_after
+    ├── SORT (w_state ASC, i_item_id ASC)  [=]
+    └── OUTPUT (w_state, i_item_id, sales_before, sales_after)  [=]
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "pg_materialized_dimension_fact_prefilter",
+      "description": "Materialize filtered dimension tables (date_dim, item) before joining with large fact table",
+      "applied_to": ["date_cte", "item_cte", "fact_cte"]
+    },
+    {
+      "id": "R2",
+      "type": "early_filter_decorrelate",
+      "description": "Push dimension filters into CTE definitions early to reduce rows before joins",
+      "applied_to": ["date_cte", "item_cte"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN (CAST('2002-02-20' AS DATE) - INTERVAL '30 DAY') AND (CAST('2002-02-20' AS DATE) + INTERVAL '30 DAY')",
+        "interfaces": {
+          "outputs": ["d_date_sk", "d_date"],
+          "consumes": []
+        }
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_category = 'Shoes' AND i_manager_id BETWEEN 42 AND 81",
+        "interfaces": {
+          "outputs": ["i_item_sk", "i_item_id"],
+          "consumes": []
+        }
+      },
+      "fact_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs.cs_item_sk, cs.cs_warehouse_sk, cs.cs_order_number, cs.cs_sales_price, dc.d_date, ic.i_item_id FROM catalog_sales cs INNER JOIN date_cte dc ON cs.cs_sold_date_sk = dc.d_date_sk INNER JOIN item_cte ic ON cs.cs_item_sk = ic.i_item_sk WHERE cs.cs_wholesale_cost BETWEEN 68 AND 87",
+        "interfaces": {
+          "outputs": ["cs_item_sk", "cs_warehouse_sk", "cs_order_number", "cs_sales_price", "d_date", "i_item_id"],
+          "consumes": ["date_cte", "item_cte"]
+        }
+      },
+      "final_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT w.w_state, fj.i_item_id, fj.d_date, fj.cs_sales_price, cr.cr_refunded_cash FROM fact_cte fj INNER JOIN warehouse w ON fj.cs_warehouse_sk = w.w_warehouse_sk LEFT OUTER JOIN catalog_returns cr ON fj.cs_order_number = cr.cr_order_number AND fj.cs_item_sk = cr.cr_item_sk AND cr.cr_reason_sk = 40",
+        "interfaces": {
+          "outputs": ["w_state", "i_item_id", "d_date", "cs_sales_price", "cr_refunded_cash"],
+          "consumes": ["fact_cte"]
+        }
+      },
+      "aggregation": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT w_state, i_item_id, SUM(CASE WHEN (CAST(d_date AS DATE) < CAST('2002-02-20' AS DATE)) THEN cs_sales_price - COALESCE(cr_refunded_cash, 0) ELSE 0 END) AS sales_before, SUM(CASE WHEN (CAST(d_date AS DATE) >= CAST('2002-02-20' AS DATE)) THEN cs_sales_price - COALESCE(cr_refunded_cash, 0) ELSE 0 END) AS sales_after FROM final_join GROUP BY w_state, i_item_id",
+        "interfaces": {
+          "outputs": ["w_state", "i_item_id", "sales_before", "sales_after"],
+          "consumes": ["final_join"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT w_state, i_item_id, sales_before, sales_after FROM aggregation ORDER BY w_state, i_item_id LIMIT 100",
+        "interfaces": {
+          "outputs": ["w_state", "i_item_id", "sales_before", "sales_after"],
+          "consumes": ["aggregation"]
+        }
+      }
+    },
+    "reconstruction_order": ["date_cte", "item_cte", "fact_cte", "final_join", "aggregation", "main_query"],
+    "assembly_template": "WITH date_cte AS MATERIALIZED ({date_cte}), item_cte AS MATERIALIZED ({item_cte}), fact_cte AS ({fact_cte}), final_join AS ({final_join}), aggregation AS ({aggregation}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL max_parallel_workers_per_gather = 2",
+    "SET LOCAL work_mem = '16MB'",
+    "SET LOCAL enable_nestloop = on",
+    "SET LOCAL enable_hashjoin = on",
+    "SET LOCAL effective_cache_size = '4GB'"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured original query into staged CTEs that filter dimension tables (date_dim, item) first, then join with catalog_sales using INNER JOINs. The catalog_returns remains a LEFT JOIN to preserve sales without returns. All original filters and defensive guards are preserved exactly.
+
+**Expected speedup**: ~1.5-2x from reduced fact table scan size (date filter + item filter applied before catalog_sales join) and maintained parallel scan capability on catalog_sales.

@@ -1,0 +1,73 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K — Now uses explicit CTE pipeline and UNION ALL rollup instead of GROUP BY ROLLUP.
+    ├── WITH date_filtered  [+]
+    │   └── SCAN date_dim, FILTER (d_month_seq BETWEEN 1188 AND 1188 + 11)
+    ├── WITH inventory_date_item  [+]
+    │   ├── SCAN inventory (inner join)
+    │   ├── JOIN date_filtered ON inv_date_sk = d_date_sk
+    │   └── JOIN item ON inv_item_sk = i_item_sk
+    ├── WITH union_levels  [+]
+    │   ├── AGG (GROUP BY i_product_name, i_brand, i_class, i_category) → Level 4
+    │   ├── AGG (GROUP BY i_product_name, i_brand, i_class) → Level 3
+    │   ├── AGG (GROUP BY i_product_name, i_brand) → Level 2
+    │   ├── AGG (GROUP BY i_product_name) → Level 1
+    │   ├── AGG (no GROUP BY) → Level 0
+    │   └── UNION ALL (all branches)
+    ├── SORT (qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC)
+    └── LIMIT 100
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "rollup_to_union_windowing", "description": "Replace ROLLUP with explicit UNION ALL branches for per-level aggregation", "applied_to": ["union_levels"]},
+    {"id": "R2", "type": "cte_materialization", "description": "Split into sequential CTEs for predicate pushdown and single materialization of 26.5M-row fact join", "applied_to": ["date_filtered", "inventory_date_item"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filtered": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1188 AND 1188 + 11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "inventory_date_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i.i_product_name, i.i_brand, i.i_class, i.i_category, inv.inv_quantity_on_hand FROM inventory inv JOIN date_filtered df ON inv.inv_date_sk = df.d_date_sk JOIN item i ON inv.inv_item_sk = i.i_item_sk",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "inv_quantity_on_hand"], "consumes": ["date_filtered"]}
+      },
+      "union_levels": {
+        "type": "cte",
+        "change": "added",
+        "sql": "(SELECT i_product_name, i_brand, i_class, i_category, AVG(inv_quantity_on_hand) AS qoh FROM inventory_date_item GROUP BY i_product_name, i_brand, i_class, i_category UNION ALL SELECT i_product_name, i_brand, i_class, NULL AS i_category, AVG(inv_quantity_on_hand) AS qoh FROM inventory_date_item GROUP BY i_product_name, i_brand, i_class UNION ALL SELECT i_product_name, i_brand, NULL, NULL, AVG(inv_quantity_on_hand) AS qoh FROM inventory_date_item GROUP BY i_product_name, i_brand UNION ALL SELECT i_product_name, NULL, NULL, NULL, AVG(inv_quantity_on_hand) AS qoh FROM inventory_date_item GROUP BY i_product_name UNION ALL SELECT NULL, NULL, NULL, NULL, AVG(inv_quantity_on_hand) AS qoh FROM inventory_date_item)",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "qoh"], "consumes": ["inventory_date_item"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_product_name, i_brand, i_class, i_category, qoh FROM union_levels ORDER BY qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC LIMIT 100",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "qoh"], "consumes": ["union_levels"]}
+      }
+    },
+    "reconstruction_order": ["date_filtered", "inventory_date_item", "union_levels", "main_query"],
+    "assembly_template": "WITH date_filtered AS ({date_filtered}), inventory_date_item AS ({inventory_date_item}), union_levels AS ({union_levels}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Replaced ROLLUP with explicit UNION ALL branches for hierarchical aggregation, and isolated date filtering into a separate CTE to push predicate before the 26.5M-row join. This ensures the inventory_date_item CTE is materialized once and reused across all five aggregation branches.
+
+**Expected speedup:** ~2-3x (similar to rollup_to_union_windowing pattern) due to per‑level aggregation efficiency and single scan of the filtered fact table.

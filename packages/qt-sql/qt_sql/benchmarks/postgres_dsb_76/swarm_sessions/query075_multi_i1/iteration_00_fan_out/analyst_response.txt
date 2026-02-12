@@ -1,0 +1,340 @@
+<reasoning>
+1. **CLASSIFY**: This is a multi-channel UNION ALL CTE with self-join comparison. The query:
+   - Scans three separate fact tables (store_sales, catalog_sales, web_sales) and their returns tables.
+   - Joins each with item and date_dim.
+   - Unions results, aggregates by product hierarchy + year.
+   - Self-joins the CTE to compare consecutive years (1999 vs 1998) with ratio filter.
+   Structural archetype: multi-channel UNION ALL with repeated dimension scans + self-join.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total runtime: 1587ms. CTE construction: ~1410ms (89% of total). Main query self-join: ~177ms.
+   - Bottlenecks: Sequential scans on returns tables (store_returns 605ms, catalog_returns 143ms, web_returns 203ms) filtering by reason_sk.
+   - Row count drops: Returns tables filter removes ~90% rows (2.2M→173K, 1.0M→79K, 1.3M→102K). Item filter removes 93K→8.6K rows (91% reduction).
+   - Missed opportunities: Item table scanned 3x (once per channel) despite same filter (i_category='Home'). Date_dim scanned 3x (once per channel). No sharing of dimension filtering across UNION branches.
+   - CTE materialization: The CTE is materialized once (CTE Scan shows 1 execution) and probed twice (curr_yr, prev_yr). Good.
+   - Optimizer already: Uses nested loop with index scans for sales table joins, pushes date_dim filter via index-only scan. Does NOT push item filter into returns table scan (scans returns first, then filters item).
+
+3. **GAP MATCHING**:
+   - COMMA_JOIN_WEAKNESS: Query uses explicit JOINs, not comma joins → NOT applicable.
+   - CORRELATED_SUBQUERY_PARALYSIS: No correlated subqueries → NOT applicable.
+   - CROSS_CTE_PREDICATE_BLINDNESS: Same dimension (item, date_dim) scanned 3x across UNION branches → APPLICABLE.
+   - NON_EQUI_JOIN_INPUT_BLINDNESS: No non-equi joins → NOT applicable.
+   Engine strengths: INNER_JOIN_REORDERING (optimizer reorders), INDEX_ONLY_SCAN (date_dim), PARALLEL_QUERY_EXECUTION (Gather with 2 workers). The optimizer already parallelizes the CTE construction.
+
+4. **AGGREGATION TRAP CHECK**:
+   - Aggregates: SUM(sales_cnt), SUM(sales_amt) in CTE; subtraction and division in main query.
+   - All aggregates are grouping-insensitive (SUM). No STDDEV_SAMP, VARIANCE, etc.
+   - The UNION branches are on separate tables → no duplication risk.
+   - Self-join uses same aggregation groups (brand, class, category, manufacturer) → safe.
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   1. **star_join_prefetch**: Pre-filter item and date_dim into CTEs, share across UNION branches. Target: eliminate 3x item scans, 3x date_dim scans. Historical: dimension_cte_isolate (2.5x avg). Highest impact because item scan repeated 3x (8.6K rows each) and date_dim scanned 3x.
+   2. **scan_consolidation_pivot**: Consolidate three UNION branches into single scans with CASE per channel? Not safe because tables are separate (store_sales vs catalog_sales). Instead: **single_pass_aggregation** not applicable. Alternative: **union_consolidation** – share dimension lookups across branches. Use CTEs for filtered item and date_dim, then each branch joins with them.
+   3. **self_join_elimination**: The CTE is self-joined once (curr_yr vs prev_yr). Could split into two CTEs (1999, 1998) early to avoid materializing full CTE then filtering. But CTE is small (~4K rows) after aggregation. Marginal gain.
+   4. **predicate movement**: Push item filter into returns table scan via join reordering? Optimizer already does this partially (item filter applied after returns). Could force with CTE.
+
+6. **LOGICAL TREE DESIGN**:
+   For star_join_prefetch: CTE filtered_item, CTE filtered_date, then three UNION branches joining returns+sales with these CTEs.
+   For union_consolidation: Similar but focus on sharing dimension CTEs.
+   For self_join_elimination: Create two CTEs: sales_1999, sales_1998 aggregated separately.
+   For exploration: Try bitmap OR on returns tables? Not in engine profile. Try converting UNION to UNION ALL with shared dimension CTEs and explicit JOINs (pg_dimension_prefetch_star example).
+
+Selected 4 strategies:
+1. Worker 1: star_join_prefetch (dimension isolation) – prefetch item and date_dim into CTEs.
+2. Worker 2: union_consolidation – share dimension CTEs across UNION branches, explicit JOINs.
+3. Worker 3: self_join_elimination – split CTE by year early to avoid filtering after materialization.
+4. Worker 4: exploration – combine dimension CTEs with early aggregation pushdown into returns tables (predicate movement + star_join_prefetch compound).
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Business intent: Compare year-over-year sales quantities and amounts for Home category items sold at 34-54% discount with specific return reasons, identifying products where current year sales dropped by more than 10% relative to prior year. JOIN semantics: All joins are INNER (item, date_dim) plus LEFT JOIN with returns tables (must preserve sales rows even without returns). Aggregation traps: None - only SUM and subtraction, no grouping-sensitive aggregates. Filter dependencies: The ratio filter (curr_yr.sales_cnt/prev_yr.sales_cnt < 0.9) depends on both years' aggregated values; rewriting must preserve exact decimal casting.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound on returns tables (store_returns 605ms, catalog_returns 143ms, web_returns 203ms) filtering by reason_sk, followed by repeated item table scans (3x, 8.6K rows each). Cardinality flow: Returns tables scan millions → filter to ~100K each → join with item (8.6K rows) → join with sales via index. The optimizer already parallelizes CTE construction (2 workers) and uses efficient index scans for sales and date_dim. Logical-tree cost percentages misleading: CTE shows 68% cost but consumes 89% of runtime.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output 10 columns with exact aliases: prev_year, year, i_brand_id, i_class_id, i_category_id, i_manufact_id, prev_yr_cnt, curr_yr_cnt, sales_cnt_diff, sales_amt_diff.
+- CTE_COLUMN_COMPLETENESS: Any new CTE must include d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt for downstream self-join.
+- LITERAL_PRESERVATION: Must preserve literal values: i_category='Home', discount range 0.34-0.54, reason_sk in (7,25,26,52,69), years 1999 and 1998.
+- SEMANTIC_EQUIVALENCE: Must return exact same 100 rows ordered by sales_cnt_diff, sales_amt_diff.
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows item table scanned 3x (once per UNION branch) with same filter i_category='Home'.
+- UNION_CONSOLIDATION: Three UNION branches share identical dimension joins (item, date_dim) but executed separately.
+
+REGRESSION_WARNINGS:
+1. CTE blocking parallelism (observed regression: 0.50x on Q069):
+   CAUSE: Materialized CTE prevents parallel execution of downstream operations.
+   RULE: Avoid wrapping entire UNION in a CTE that must be materialized before parallel processing; keep UNION inside parallelizable subtree.
+2. Splitting OR into UNION (observed regression: 0.21x on Q085):
+   CAUSE: PostgreSQL's BITMAP_OR_SCAN handles multi-branch ORs efficiently; splitting loses bitmap optimization.
+   RULE: Do NOT split the reason_sk IN list into separate UNION branches.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  filtered_item -> filtered_date -> returns_prejoin -> sales_joined -> union_aggregate -> main_selfjoin
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: i_category = 'Home'
+    OUTPUT: i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id
+    EXPECTED_ROWS: 8,638
+    CONSUMERS: store_branch, catalog_branch, web_branch
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year IN (1998, 1999)
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: ~730 (365 days * 2 years)
+    CONSUMERS: store_branch, catalog_branch, web_branch
+  store_branch:
+    FROM: store_returns sr LEFT JOIN filtered_item i ON sr.sr_item_sk = i.i_item_sk
+                         JOIN store_sales ss ON (sr.sr_ticket_number = ss.ss_ticket_number AND sr.sr_item_sk = ss.ss_item_sk)
+                         JOIN filtered_date d ON ss.ss_sold_date_sk = d.d_date_sk
+    WHERE: sr.sr_reason_sk IN (7, 25, 26, 52, 69)
+           AND (ss.ss_sales_price / ss.ss_list_price) BETWEEN 0.34 AND 0.54
+    OUTPUT: d.d_year, i.i_brand_id, i.i_class_id, i.i_category_id, i.i_manufact_id,
+            ss.ss_quantity - COALESCE(sr.sr_return_quantity,0) AS sales_cnt,
+            ss.ss_ext_sales_price - COALESCE(sr.sr_return_amt,0.0) AS sales_amt
+    EXPECTED_ROWS: ~1,856
+    CONSUMERS: union_aggregate
+  catalog_branch: (similar with cs/cr tables)
+  web_branch: (similar with ws/wr tables)
+  union_aggregate:
+    FROM: store_branch UNION ALL catalog_branch UNION ALL web_branch
+    GROUP BY: d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id
+    AGGREGATE: SUM(sales_cnt) AS sales_cnt, SUM(sales_amt) AS sales_amt
+    OUTPUT: d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt
+    EXPECTED_ROWS: ~4,598
+    CONSUMERS: main_selfjoin
+  main_selfjoin:
+    FROM: union_aggregate curr_yr, union_aggregate prev_yr
+    JOIN: curr_yr.i_brand_id = prev_yr.i_brand_id
+          AND curr_yr.i_class_id = prev_yr.i_class_id
+          AND curr_yr.i_category_id = prev_yr.i_category_id
+          AND curr_yr.i_manufact_id = prev_yr.i_manufact_id
+    WHERE: curr_yr.d_year = 1999
+           AND prev_yr.d_year = 1998
+           AND prev_yr.sales_cnt > 0
+           AND CAST(curr_yr.sales_cnt AS DECIMAL(17,2))/CAST(prev_yr.sales_cnt AS DECIMAL(17,2)) < 0.9
+    ORDER BY: curr_yr.sales_cnt - prev_yr.sales_cnt, curr_yr.sales_amt - prev_yr.sales_amt
+    LIMIT: 100
+    OUTPUT: prev_yr.d_year AS prev_year, curr_yr.d_year AS year, curr_yr.i_brand_id, curr_yr.i_class_id,
+            curr_yr.i_category_id, curr_yr.i_manufact_id, prev_yr.sales_cnt AS prev_yr_cnt,
+            curr_yr.sales_cnt AS curr_yr_cnt, curr_yr.sales_cnt - prev_yr.sales_cnt AS sales_cnt_diff,
+            curr_yr.sales_amt - prev_yr.sales_amt AS sales_amt_diff
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering item and date_dim into CTEs; convert implicit joins to explicit JOIN syntax (already explicit). Ignore promotion table not present.
+- pg_date_cte_explicit_join: Apply date_dim CTE with d_year filter; combine with explicit JOINs. Ignore comma join conversion (already explicit).
+- pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED to filtered_item and filtered_date CTEs to force early reduction. Ignore fact table prefiltering (returns tables are not fact tables here).
+HAZARD_FLAGS:
+- Adding MATERIALIZED may block parallel execution of UNION branches.
+- filtered_item CTE must include i_item_sk for joins, plus all hierarchy columns for output.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: union_consolidation
+TARGET_LOGICAL_TREE:
+  filtered_item -> filtered_date -> union_all_branches -> channel_aggregate -> main_selfjoin
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: i_category = 'Home'
+    OUTPUT: i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id
+    EXPECTED_ROWS: 8,638
+    CONSUMERS: union_all_branches
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year IN (1998, 1999)
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: ~730
+    CONSUMERS: union_all_branches
+  union_all_branches:
+    FROM: (
+      SELECT d.d_year, i.i_brand_id, i.i_class_id, i.i_category_id, i.i_manufact_id,
+             ss.ss_quantity - COALESCE(sr.sr_return_quantity,0) AS sales_cnt,
+             ss.ss_ext_sales_price - COALESCE(sr.sr_return_amt,0.0) AS sales_amt
+      FROM store_returns sr
+      LEFT JOIN filtered_item i ON sr.sr_item_sk = i.i_item_sk
+      JOIN store_sales ss ON sr.sr_ticket_number = ss.ss_ticket_number AND sr.sr_item_sk = ss.ss_item_sk
+      JOIN filtered_date d ON ss.ss_sold_date_sk = d.d_date_sk
+      WHERE sr.sr_reason_sk IN (7,25,26,52,69)
+        AND (ss.ss_sales_price / ss.ss_list_price) BETWEEN 0.34 AND 0.54
+      UNION ALL
+      SELECT d.d_year, i.i_brand_id, i.i_class_id, i.i_category_id, i.i_manufact_id,
+             cs.cs_quantity - COALESCE(cr.cr_return_quantity,0),
+             cs.cs_ext_sales_price - COALESCE(cr.cr_return_amount,0.0)
+      FROM catalog_returns cr
+      LEFT JOIN filtered_item i ON cr.cr_item_sk = i.i_item_sk
+      JOIN catalog_sales cs ON cr.cr_order_number = cs.cs_order_number AND cr.cr_item_sk = cs.cs_item_sk
+      JOIN filtered_date d ON cs.cs_sold_date_sk = d.d_date_sk
+      WHERE cr.cr_reason_sk IN (7,25,26,52,69)
+        AND (cs.cs_sales_price / cs.cs_list_price) BETWEEN 0.34 AND 0.54
+      UNION ALL
+      SELECT d.d_year, i.i_brand_id, i.i_class_id, i.i_category_id, i.i_manufact_id,
+             ws.ws_quantity - COALESCE(wr.wr_return_quantity,0),
+             ws.ws_ext_sales_price - COALESCE(wr.wr_return_amt,0.0)
+      FROM web_returns wr
+      LEFT JOIN filtered_item i ON wr.wr_item_sk = i.i_item_sk
+      JOIN web_sales ws ON wr.wr_order_number = ws.ws_order_number AND wr.wr_item_sk = ws.ws_item_sk
+      JOIN filtered_date d ON ws.ws_sold_date_sk = d.d_date_sk
+      WHERE wr.wr_reason_sk IN (7,25,26,52,69)
+        AND (ws.ws_sales_price / ws.ws_list_price) BETWEEN 0.34 AND 0.54
+    ) t
+    OUTPUT: d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt
+    EXPECTED_ROWS: ~9,571
+    CONSUMERS: channel_aggregate
+  channel_aggregate:
+    FROM: union_all_branches
+    GROUP BY: d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id
+    AGGREGATE: SUM(sales_cnt) AS sales_cnt, SUM(sales_amt) AS sales_amt
+    OUTPUT: d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt
+    EXPECTED_ROWS: ~4,598
+    CONSUMERS: main_selfjoin
+  main_selfjoin: (identical to Worker 1)
+EXAMPLES: pg_dimension_prefetch_star, early_filter_decorrelate, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtered dimension CTEs; use explicit JOIN syntax (already present). Ignore promotion table.
+- early_filter_decorrelate: Push dimension filters into CTE definitions; pre-filter item and date_dim early. Ignore decorrelation (no subqueries).
+- shared_dimension_multi_channel: Share filtered_item and filtered_date CTEs across all three UNION branches. Ignore any consolidation of fact tables.
+HAZARD_FLAGS:
+- UNION branches must remain UNION ALL, not merged into single query.
+- filtered_item must be LEFT JOINed to returns tables to preserve sales rows without returns.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: self_join_elimination
+TARGET_LOGICAL_TREE:
+  filtered_item -> filtered_date -> sales_1999_agg -> sales_1998_agg -> main_join
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: i_category = 'Home'
+    OUTPUT: i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id
+    EXPECTED_ROWS: 8,638
+    CONSUMERS: sales_1999_agg, sales_1998_agg
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year IN (1998, 1999)
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: ~730
+    CONSUMERS: sales_1999_agg, sales_1998_agg
+  sales_1999_agg:
+    FROM: (
+      -- store branch for 1999 only
+      SELECT i.i_brand_id, i.i_class_id, i.i_category_id, i.i_manufact_id,
+             SUM(ss.ss_quantity - COALESCE(sr.sr_return_quantity,0)) AS sales_cnt,
+             SUM(ss.ss_ext_sales_price - COALESCE(sr.sr_return_amt,0.0)) AS sales_amt
+      FROM store_returns sr
+      LEFT JOIN filtered_item i ON sr.sr_item_sk = i.i_item_sk
+      JOIN store_sales ss ON sr.sr_ticket_number = ss.ss_ticket_number AND sr.sr_item_sk = ss.ss_item_sk
+      JOIN filtered_date d ON ss.ss_sold_date_sk = d.d_date_sk
+      WHERE sr.sr_reason_sk IN (7,25,26,52,69)
+        AND (ss.ss_sales_price / ss.ss_list_price) BETWEEN 0.34 AND 0.54
+        AND d.d_year = 1999
+      GROUP BY i.i_brand_id, i.i_class_id, i.i_category_id, i.i_manufact_id
+      UNION ALL
+      -- catalog branch for 1999
+      ...
+      UNION ALL
+      -- web branch for 1999
+      ...
+    ) t
+    GROUP BY: i_brand_id, i_class_id, i_category_id, i_manufact_id
+    AGGREGATE: SUM(sales_cnt) AS sales_cnt, SUM(sales_amt) AS sales_amt
+    OUTPUT: i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt
+    EXPECTED_ROWS: ~731 (from EXPLAIN: CTE scan with d_year=1999 filter gives 731 rows)
+    CONSUMERS: main_join
+  sales_1998_agg:
+    FROM: (similar to sales_1999_agg but with d_year = 1998)
+    OUTPUT: i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt
+    EXPECTED_ROWS: ~690
+    CONSUMERS: main_join
+  main_join:
+    FROM: sales_1999_agg curr_yr, sales_1998_agg prev_yr
+    JOIN: curr_yr.i_brand_id = prev_yr.i_brand_id
+          AND curr_yr.i_class_id = prev_yr.i_class_id
+          AND curr_yr.i_category_id = prev_yr.i_category_id
+          AND curr_yr.i_manufact_id = prev_yr.i_manufact_id
+    WHERE: prev_yr.sales_cnt > 0
+           AND CAST(curr_yr.sales_cnt AS DECIMAL(17,2))/CAST(prev_yr.sales_cnt AS DECIMAL(17,2)) < 0.9
+    ORDER BY: curr_yr.sales_cnt - prev_yr.sales_cnt, curr_yr.sales_amt - prev_yr.sales_amt
+    LIMIT: 100
+    OUTPUT: 1998 AS prev_year, 1999 AS year, curr_yr.i_brand_id, curr_yr.i_class_id,
+            curr_yr.i_category_id, curr_yr.i_manufact_id, prev_yr.sales_cnt AS prev_yr_cnt,
+            curr_yr.sales_cnt AS curr_yr_cnt, curr_yr.sales_cnt - prev_yr.sales_cnt AS sales_cnt_diff,
+            curr_yr.sales_amt - prev_yr.sales_amt AS sales_amt_diff
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: pg_self_join_decomposition, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_self_join_decomposition: Materialize sales aggregates for each year separately to avoid scanning full CTE twice. Ignore the fact that original uses single CTE.
+- early_filter_decorrelate: Push year filter early into each UNION branch before aggregation. Ignore decorrelation.
+HAZARD_FLAGS:
+- Must ensure both year aggregates include same set of groups (brand, class, category, manufacturer) even if one year has zero sales; use COALESCE or ensure joins preserve.
+- Year literals (1999, 1998) must be preserved in output aliases.
+
+=== WORKER 4 BRIEFING (EXPLORATION WORKER)
+
+STRATEGY: predicate_movement_plus_star_prefetch
+TARGET_LOGICAL_TREE:
+  filtered_item -> filtered_date -> returns_prefiltered -> sales_joined -> union_aggregate -> main_selfjoin
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: i_category = 'Home'
+    OUTPUT: i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id
+    EXPECTED_ROWS: 8,638
+    CONSUMERS: returns_prefiltered
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year IN (1998, 1999)
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: ~730
+    CONSUMERS: sales_joined
+  returns_prefiltered:
+    FROM: (
+      SELECT sr_item_sk, sr_ticket_number, sr_return_quantity, sr_return_amt
+      FROM store_returns
+      WHERE sr_reason_sk IN (7,25,26,52,69)
+      UNION ALL
+      SELECT cr_item_sk, cr_order_number, cr_return_quantity, cr_return_amount
+      FROM catalog_returns
+      WHERE cr_reason_sk IN (7,25,26,52,69)
+      UNION ALL
+      SELECT wr_item_sk, wr_order_number, wr_return_quantity, wr_return_amt
+      FROM web_returns
+      WHERE wr_reason_sk IN (7,25,26,52,69)
+    ) returns_union
+    JOIN filtered_item i ON returns_union.sr_item_sk = i.i_item_sk
+    OUTPUT: returns_union.*, i.i_brand_id, i.i_class_id, i.i_category_id, i.i_manufact_id
+    EXPECTED_ROWS: ~354K (173K+79K+102K) but reduced by item join to ~? (item has 8.6K rows)
+    CONSUMERS: sales_joined
+  sales_joined:
+    FROM: returns_prefiltered r
+    JOIN store_sales ss ON r.sr_ticket_number = ss.ss_ticket_number AND r.sr_item_sk = ss.ss_item_sk
+    JOIN filtered_date d ON ss.ss_sold_date_sk = d.d_date_sk
+    WHERE (ss.ss_sales_price / ss.ss_list_price) BETWEEN 0.34 AND 0.54
+    -- similar for catalog_sales and web_sales via CASE/UNION?
+    -- Actually need separate joins per table type. This becomes complex.
+    -- Alternative: keep three branches but share returns_prefiltered CTE.
+    -- Let's simplify: returns_prefiltered CTE includes column 'channel' to distinguish.
+    OUTPUT: d.d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt
+    EXPECTED_ROWS: ~9,571
+    CONSUMERS: union_aggregate
+  union_aggregate: (identical to Worker 1)
+  main_selfjoin: (identical to Worker 1)
+EXAMPLES: pg_materialized_dimension_fact_prefilter, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED to filtered_item and returns_prefiltered CTEs to force early reduction of both dimensions and returns. Ignore fact table prefiltering.
+- early_filter_decorrelate: Push returns reason filter early into returns_prefiltered CTE; push item filter early. Ignore decorrelation.
+HAZARD_FLAGS:
+- Combining returns tables into single CTE may lose efficient index scans on sales tables (different join keys: ticket_number vs order_number).
+- Must preserve LEFT JOIN semantics: returns_prefiltered should include all returns rows, but item join is INNER (since item filter required). Actually original has LEFT JOIN item, but item filter i_category='Home' turns it into INNER implicitly.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (predicate movement + star_join_prefetch)

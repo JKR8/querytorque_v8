@@ -1,0 +1,100 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K — Restructured into CTE pipeline matching target logical tree: early date filtering → fact aggregation → two separate item joins (for detail vs class totals)
+    ├── CTE filtered_dates  [+]
+    │   ├── SCAN (date_dim)
+    │   └── FILTER (d_date BETWEEN CAST('2002-01-26' AS DATE) AND (CAST('2002-01-26' AS DATE) + INTERVAL 30 DAY))
+    ├── CTE filtered_catalog  [+]
+    │   ├── SCAN (catalog_sales)
+    │   ├── JOIN (INNER JOIN filtered_dates ON cs_sold_date_sk = d_date_sk)
+    │   └── PROJECT (cs_item_sk, cs_ext_sales_price)
+    ├── CTE item_agg  [+]
+    │   ├── SCAN (filtered_catalog)
+    │   ├── AGG (GROUP BY cs_item_sk, SUM(cs_ext_sales_price) AS itemrevenue)
+    │   └── PROJECT (cs_item_sk, itemrevenue)
+    ├── CTE joined_item  [+]
+    │   ├── SCAN (item_agg)
+    │   ├── JOIN (INNER JOIN item ON cs_item_sk = i_item_sk)
+    │   ├── FILTER (i_category IN ('Shoes', 'Books', 'Women'))
+    │   └── PROJECT (i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue)
+    ├── CTE class_agg  [+]
+    │   ├── SCAN (item_agg)
+    │   ├── JOIN (INNER JOIN item ON cs_item_sk = i_item_sk)
+    │   ├── FILTER (i_category IN ('Shoes', 'Books', 'Women'))
+    │   ├── AGG (GROUP BY i_class, SUM(itemrevenue) AS classrevenue)
+    │   └── PROJECT (i_class, classrevenue)
+    ├── CTE final_join  [+]
+    │   ├── SCAN (joined_item)
+    │   ├── JOIN (INNER JOIN class_agg ON joined_item.i_class = class_agg.i_class)
+    │   ├── PROJECT (i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, itemrevenue * 100 / classrevenue AS revenueratio)
+    │   ├── SORT (i_category, i_class, i_item_id, i_item_desc, revenueratio)
+    │   └── LIMIT 100
+    └── OUTPUT (i_item_id, i_item_desc, i_category, i_class, i_current_price, itemrevenue, revenueratio)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Push date filter into CTE before joining to catalog_sales", "applied_to": ["filtered_dates"]},
+    {"id": "R2", "type": "fact_pre_aggregation", "description": "Aggregate catalog sales by item before joining to dimension tables", "applied_to": ["item_agg"]},
+    {"id": "R3", "type": "split_join_paths", "description": "Separate item joins: one for detail columns, one for class-level aggregates", "applied_to": ["joined_item", "class_agg"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2002-01-26' AS DATE) AND (CAST('2002-01-26' AS DATE) + INTERVAL 30 DAY)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_catalog": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_item_sk, cs_ext_sales_price FROM catalog_sales INNER JOIN filtered_dates ON cs_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["cs_item_sk", "cs_ext_sales_price"], "consumes": ["filtered_dates"]}
+      },
+      "item_agg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_item_sk, SUM(cs_ext_sales_price) AS itemrevenue FROM filtered_catalog GROUP BY cs_item_sk",
+        "interfaces": {"outputs": ["cs_item_sk", "itemrevenue"], "consumes": ["filtered_catalog"]}
+      },
+      "joined_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i.i_item_id, i.i_item_desc, i.i_category, i.i_class, i.i_current_price, ia.itemrevenue FROM item_agg ia INNER JOIN item i ON ia.cs_item_sk = i.i_item_sk WHERE i.i_category IN ('Shoes', 'Books', 'Women')",
+        "interfaces": {"outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue"], "consumes": ["item_agg"]}
+      },
+      "class_agg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i.i_class, SUM(ia.itemrevenue) AS classrevenue FROM item_agg ia INNER JOIN item i ON ia.cs_item_sk = i.i_item_sk WHERE i.i_category IN ('Shoes', 'Books', 'Women') GROUP BY i.i_class",
+        "interfaces": {"outputs": ["i_class", "classrevenue"], "consumes": ["item_agg"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ji.i_item_id, ji.i_item_desc, ji.i_category, ji.i_class, ji.i_current_price, ji.itemrevenue, ji.itemrevenue * 100 / ca.classrevenue AS revenueratio FROM joined_item ji INNER JOIN class_agg ca ON ji.i_class = ca.i_class ORDER BY ji.i_category, ji.i_class, ji.i_item_id, ji.i_item_desc, revenueratio LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "i_item_desc", "i_category", "i_class", "i_current_price", "itemrevenue", "revenueratio"], "consumes": ["joined_item", "class_agg"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_catalog", "item_agg", "joined_item", "class_agg", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), filtered_catalog AS ({filtered_catalog}), item_agg AS ({item_agg}), joined_item AS ({joined_item}), class_agg AS ({class_agg}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured query into a CTE pipeline that isolates date filtering early, aggregates catalog sales by item before dimension joins, and separates item joins into two paths (detail vs class aggregates) to match the target logical tree exactly.
+
+**Expected speedup:** ~2-3x from reduced fact table scan (date filter pushdown) and pre-aggregation before dimension joins, plus elimination of window function overhead.

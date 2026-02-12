@@ -1,0 +1,103 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_dates  [+]  Cost: <1%  Rows: 365
+│   ├── SCAN (date_dim)
+│   └── FILTER (d_year = 1999)
+├── [CTE] filtered_items  [+]  Cost: <1%  Rows: ~10
+│   ├── SCAN (item)
+│   └── FILTER (i_manager_id BETWEEN 42 AND 51)
+├── [CTE] joined_fact_dims  [+]  Cost: 25%  Rows: ~6,084
+│   ├── SCAN (web_returns)
+│   ├── JOIN (INNER JOIN filtered_dates ON wr_returned_date_sk = d_date_sk)
+│   ├── JOIN (INNER JOIN customer_address ON wr_returning_addr_sk = ca_address_sk)
+│   ├── JOIN (INNER JOIN filtered_items ON wr_item_sk = i_item_sk)
+│   └── FILTER (wr_return_amt / wr_return_quantity BETWEEN 193 AND 222)
+├── [CTE] aggregated_cte  [~]  Cost: 35%  Rows: ~252
+│   ├── SCAN (joined_fact_dims)
+│   ├── AGG (GROUP BY wr_returning_customer_sk, ca_state, wr_reason_sk)
+│   └── OUTPUT (ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return)
+├── [CTE] state_avg_cte  [+]  Cost: 15%  Rows: ~15
+│   ├── SCAN (aggregated_cte)
+│   ├── AGG (GROUP BY ctr_state)
+│   └── OUTPUT (ctr_state, state_avg_threshold)
+└── [MAIN] main_join  [~]  Cost: 24%  Rows: 100
+    ├── SCAN (aggregated_cte AS ctr1 (join), customer (join), customer_address (join), state_avg_cte (join))
+    ├── JOIN (INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk)
+    ├── JOIN (INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk)
+    ├── JOIN (INNER JOIN state_avg_cte ON ctr1.ctr_state = state_avg_cte.ctr_state)
+    ├── FILTER (ctr1.ctr_reason_sk IN (22, 23))
+    ├── FILTER (ca_state IN ('CA', 'MI', 'SD', 'VA'))
+    ├── FILTER (c_birth_year BETWEEN 1945 AND 1951)
+    ├── FILTER (ctr1.ctr_total_return > state_avg_cte.state_avg_threshold)
+    ├── SORT (13 customer columns + ctr_total_return)
+    └── LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "decorrelate_scalar_subquery", "description": "Replace correlated subquery with separate state_avg_cte CTE", "applied_to": ["state_avg_cte", "main_join"]},
+    {"id": "R2", "type": "materialize_dimension_filters", "description": "Push date and item filters into separate CTEs for early filtering", "applied_to": ["filtered_dates", "filtered_items", "joined_fact_dims"]},
+    {"id": "R3", "type": "explicit_joins", "description": "Convert comma joins to explicit INNER JOIN syntax", "applied_to": ["joined_fact_dims", "main_join"]},
+    {"id": "R4", "type": "preserve_division_guard", "description": "Keep wr_return_amt / wr_return_quantity BETWEEN 193 AND 222 without CASE guard", "applied_to": ["joined_fact_dims"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1999",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_items": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk FROM item WHERE i_manager_id BETWEEN 42 AND 51",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "joined_fact_dims": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT wr_returning_customer_sk, ca_state, wr_reason_sk, wr_return_amt FROM web_returns INNER JOIN filtered_dates ON wr_returned_date_sk = d_date_sk INNER JOIN customer_address ON wr_returning_addr_sk = ca_address_sk INNER JOIN filtered_items ON wr_item_sk = i_item_sk WHERE wr_return_amt / wr_return_quantity BETWEEN 193 AND 222",
+        "interfaces": {"outputs": ["wr_returning_customer_sk", "ca_state", "wr_reason_sk", "wr_return_amt"], "consumes": ["filtered_dates", "filtered_items"]}
+      },
+      "aggregated_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT wr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, wr_reason_sk AS ctr_reason_sk, SUM(wr_return_amt) AS ctr_total_return FROM joined_fact_dims GROUP BY wr_returning_customer_sk, ca_state, wr_reason_sk",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_state", "ctr_reason_sk", "ctr_total_return"], "consumes": ["joined_fact_dims"]}
+      },
+      "state_avg_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ctr_state, AVG(ctr_total_return) * 1.2 AS state_avg_threshold FROM aggregated_cte GROUP BY ctr_state",
+        "interfaces": {"outputs": ["ctr_state", "state_avg_threshold"], "consumes": ["aggregated_cte"]}
+      },
+      "main_join": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return FROM aggregated_cte AS ctr1 INNER JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk INNER JOIN customer_address ON ca_address_sk = c_current_addr_sk INNER JOIN state_avg_cte ON ctr1.ctr_state = state_avg_cte.ctr_state WHERE ctr1.ctr_reason_sk IN (22, 23) AND ca_state IN ('CA', 'MI', 'SD', 'VA') AND c_birth_year BETWEEN 1945 AND 1951 AND ctr1.ctr_total_return > state_avg_cte.state_avg_threshold ORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr_total_return LIMIT 100",
+        "interfaces": {"outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag", "c_birth_day", "c_birth_month", "c_birth_year", "c_birth_country", "c_login", "c_email_address", "c_last_review_date_sk", "ctr_total_return"], "consumes": ["aggregated_cte", "state_avg_cte"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_items", "joined_fact_dims", "aggregated_cte", "state_avg_cte", "main_join"],
+    "assembly_template": "WITH filtered_dates AS MATERIALIZED ({filtered_dates}), filtered_items AS MATERIALIZED ({filtered_items}), joined_fact_dims AS MATERIALIZED ({joined_fact_dims}), aggregated_cte AS MATERIALIZED ({aggregated_cte}), state_avg_cte AS MATERIALIZED ({state_avg_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+Changes: Structural change replaces correlated subquery with materialized CTE for state averages, while preserving original join semantics and early dimension filtering. The state_avg_cte computes averages across all reason_sk values as required, eliminating per-row subquery execution.
+
+Expected speedup: 3-5x by eliminating correlated subquery (15 loops scanning 252 rows each) and enabling better join optimization through explicit CTE materialization.

@@ -1,0 +1,82 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Calculate qualifying web-sales counts for AM and PM windows via single consolidated scan with conditional aggregation
+    ├── CTE filtered_time  [+]  Scan time_dim with hour windows (10-11, 16-17)
+    │   └── OUTPUT (t_time_sk, t_hour)
+    ├── CTE filtered_hd  [+]  Scan household_demographics with hd_dep_count=2
+    │   └── OUTPUT (hd_demo_sk)
+    ├── CTE filtered_wp  [+]  Scan web_page with wp_char_count 5000-5200
+    │   └── OUTPUT (wp_web_page_sk)
+    ├── CTE consolidated_fact_scan  [+]  Single INNER JOIN of web_sales with all three filtered dimensions
+    │   └── OUTPUT (ws_sold_time_sk, ws_ship_hdemo_sk, ws_web_page_sk, t_hour)
+    ├── CTE conditional_aggregate  [+]  Aggregate counts with FILTER for AM/PM windows
+    │   └── OUTPUT (amc, pmc)
+    └── FINAL_SELECT  [~]  Compute ratio with CAST to DECIMAL(15,4)
+        ├── SORT (am_pm_ratio ASC)
+        └── OUTPUT (am_pm_ratio)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_aggregation", "description": "Replaced two separate web_sales scans (AM/PM) with single consolidated scan using conditional aggregation", "applied_to": ["consolidated_fact_scan", "conditional_aggregate"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_time": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT t_time_sk, t_hour FROM time_dim WHERE t_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17",
+        "interfaces": {"outputs": ["t_time_sk", "t_hour"], "consumes": []}
+      },
+      "filtered_hd": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 2",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": []}
+      },
+      "filtered_wp": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT wp_web_page_sk FROM web_page WHERE wp_char_count BETWEEN 5000 AND 5200",
+        "interfaces": {"outputs": ["wp_web_page_sk"], "consumes": []}
+      },
+      "consolidated_fact_scan": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws.ws_sold_time_sk, ws.ws_ship_hdemo_sk, ws.ws_web_page_sk, ft.t_hour FROM web_sales ws INNER JOIN filtered_time ft ON ws.ws_sold_time_sk = ft.t_time_sk INNER JOIN filtered_hd fhd ON ws.ws_ship_hdemo_sk = fhd.hd_demo_sk INNER JOIN filtered_wp fwp ON ws.ws_web_page_sk = fwp.wp_web_page_sk",
+        "interfaces": {"outputs": ["ws_sold_time_sk", "ws_ship_hdemo_sk", "ws_web_page_sk", "t_hour"], "consumes": ["filtered_time", "filtered_hd", "filtered_wp"]}
+      },
+      "conditional_aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT COUNT(*) FILTER (WHERE t_hour BETWEEN 10 AND 11) AS amc, COUNT(*) FILTER (WHERE t_hour BETWEEN 16 AND 17) AS pmc FROM consolidated_fact_scan",
+        "interfaces": {"outputs": ["amc", "pmc"], "consumes": ["consolidated_fact_scan"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT CAST(amc AS DECIMAL(15,4)) / CAST(pmc AS DECIMAL(15,4)) AS am_pm_ratio FROM conditional_aggregate ORDER BY am_pm_ratio LIMIT 100",
+        "interfaces": {"outputs": ["am_pm_ratio"], "consumes": ["conditional_aggregate"]}
+      }
+    },
+    "reconstruction_order": ["filtered_time", "filtered_hd", "filtered_wp", "consolidated_fact_scan", "conditional_aggregate", "main_query"],
+    "assembly_template": "WITH filtered_time AS ({filtered_time}), filtered_hd AS ({filtered_hd}), filtered_wp AS ({filtered_wp}), consolidated_fact_scan AS ({consolidated_fact_scan}), conditional_aggregate AS ({conditional_aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced two separate web_sales scans (for AM and PM time windows) with a single consolidated scan using conditional aggregation, eliminating redundant fact table access. The time window condition is preserved in the filtered_time CTE with an OR predicate to avoid splitting into UNION ALL.
+
+**Expected speedup**: 2.5x–4x (eliminates one full web_sales scan with joins to three dimension tables).

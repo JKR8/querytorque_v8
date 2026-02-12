@@ -1,0 +1,84 @@
+## Part 1: Modified Logic Tree
+
+```
+[=] Original query structure
+[!] Structural change: Convert implicit comma-joins to explicit JOIN syntax
+[+] New component: filtered_date - selective date_dim CTE
+[+] New component: filtered_cd - customer_demographics CTE with OR condition
+[+] New component: filtered_hd - household_demographics CTE with LIKE
+[+] New component: filtered_ca - customer_address CTE with gmt_offset
+[~] Modified component: main_query - reorganized as explicit JOINs with CTEs
+[=] Preserved grouping: cc_call_center_id, cc_name, cc_manager, cd_marital_status, cd_education_status
+[=] Preserved ordering: SUM(cr_net_loss) DESC
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "comma_to_explicit_join", "description": "Convert implicit comma-joins to explicit JOIN...ON syntax", "applied_to": ["main_query"]},
+    {"id": "R2", "type": "dimension_prefilter", "description": "Create selective CTEs for filtered dimensions", "applied_to": ["filtered_date", "filtered_cd", "filtered_hd", "filtered_ca"]},
+    {"id": "R3", "type": "join_reordering", "description": "Reorder joins to start with most selective dimensions first", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1998 AND d_moy = 2",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_cd": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cd_demo_sk, cd_marital_status, cd_education_status FROM customer_demographics WHERE ((cd_marital_status = 'M' AND cd_education_status = 'Unknown') OR (cd_marital_status = 'W' AND cd_education_status = 'Advanced Degree'))",
+        "interfaces": {"outputs": ["cd_demo_sk", "cd_marital_status", "cd_education_status"], "consumes": []}
+      },
+      "filtered_hd": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT hd_demo_sk FROM household_demographics WHERE hd_buy_potential LIKE '1001-5000%'",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": []}
+      },
+      "filtered_ca": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_gmt_offset = -7",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT cc.cc_call_center_id AS Call_Center, cc.cc_name AS Call_Center_Name, cc.cc_manager AS Manager, SUM(cr.cr_net_loss) AS Returns_Loss FROM filtered_date fd JOIN catalog_returns cr ON cr.cr_returned_date_sk = fd.d_date_sk JOIN call_center cc ON cr.cr_call_center_sk = cc.cc_call_center_sk JOIN customer c ON cr.cr_returning_customer_sk = c.c_customer_sk JOIN filtered_cd cd ON c.c_current_cdemo_sk = cd.cd_demo_sk JOIN filtered_hd hd ON c.c_current_hdemo_sk = hd.hd_demo_sk JOIN filtered_ca ca ON c.c_current_addr_sk = ca.ca_address_sk GROUP BY cc.cc_call_center_id, cc.cc_name, cc.cc_manager, cd.cd_marital_status, cd.cd_education_status ORDER BY SUM(cr.cr_net_loss) DESC",
+        "interfaces": {
+          "outputs": ["Call_Center", "Call_Center_Name", "Manager", "Returns_Loss"],
+          "consumes": ["filtered_date", "filtered_cd", "filtered_hd", "filtered_ca"]
+        }
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_cd", "filtered_hd", "filtered_ca", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_cd AS ({filtered_cd}), filtered_hd AS ({filtered_hd}), filtered_ca AS ({filtered_ca}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL join_collapse_limit = 1",
+    "SET LOCAL from_collapse_limit = 1",
+    "SET LOCAL enable_hashjoin = off",
+    "SET LOCAL enable_mergejoin = off",
+    "SET LOCAL enable_nestloop = on",
+    "SET LOCAL work_mem = '32MB'",
+    "SET LOCAL random_page_cost = 2.0"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes**: Converted implicit comma-joins to explicit JOIN syntax with selective dimension CTEs, forcing PostgreSQL to use a nested-loop join order starting with the highly selective date_dim CTE (28 rows) rather than scanning the entire catalog_returns table upfront.
+
+**Expected speedup**: 2.0x+ by eliminating the comma-join weakness and enabling better join ordering. The explicit JOIN syntax allows PostgreSQL to start with the tiny date_dim CTE (28 rows) and perform indexed nested-loop joins to catalog_returns using cr_returned_date_sk, dramatically reducing the fact table scan size. The runtime configuration prevents hash/merge joins and encourages the optimal nested-loop plan.

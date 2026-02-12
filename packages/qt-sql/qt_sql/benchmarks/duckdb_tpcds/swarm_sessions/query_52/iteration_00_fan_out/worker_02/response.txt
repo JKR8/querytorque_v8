@@ -1,0 +1,86 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (multiple CTEs leading to main query)
+├── [~] MAIN: main_query  [~]  Now selects from aggregated CTE instead of raw joins
+│   ├── CONSUME: aggregated
+│   ├── SORT (d_year ASC, ext_price DESC, brand_id ASC)
+│   └── OUTPUT (d_year, brand_id, brand, ext_price)
+├── [+] filtered_date: CTE that isolates date filtering
+│   ├── SCAN (date_dim AS dt)
+│   ├── FILTER (dt.d_moy=12 AND dt.d_year=2002)
+│   └── OUTPUT (d_date_sk)
+├── [+] date_filtered_sales: CTE that joins store_sales with filtered_date
+│   ├── SCAN (store_sales)
+│   ├── JOIN (INNER) with filtered_date on ss_sold_date_sk = d_date_sk
+│   └── OUTPUT (ss_item_sk, ss_ext_sales_price)
+├── [+] item_joined: CTE that joins date_filtered_sales with item and applies manager filter
+│   ├── CONSUME: date_filtered_sales
+│   ├── SCAN (item)
+│   ├── JOIN (INNER) on ss_item_sk = i_item_sk
+│   ├── FILTER (i_manager_id=1)
+│   └── OUTPUT (i_brand_id, i_brand, ss_ext_sales_price)
+└── [+] aggregated: CTE that groups by brand/brand_id and sums extended price
+    ├── CONSUME: item_joined
+    ├── AGG (GROUP BY i_brand, i_brand_id, SUM(ss_ext_sales_price) AS ext_price)
+    └── OUTPUT (2002 AS d_year, i_brand_id AS brand_id, i_brand AS brand, ext_price)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extract date filter into separate CTE to create small probe table", "applied_to": ["filtered_date"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Push item manager filter into separate CTE before joining to sales", "applied_to": ["item_joined"]},
+    {"id": "R3", "type": "logical_tree_follow", "description": "Follow exact node structure from target logical tree", "applied_to": ["filtered_date", "date_filtered_sales", "item_joined", "aggregated", "main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT dt.d_date_sk FROM date_dim dt WHERE dt.d_moy = 12 AND dt.d_year = 2002",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "date_filtered_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT store_sales.ss_item_sk, store_sales.ss_ext_sales_price FROM store_sales INNER JOIN filtered_date ON store_sales.ss_sold_date_sk = filtered_date.d_date_sk",
+        "interfaces": {"outputs": ["ss_item_sk", "ss_ext_sales_price"], "consumes": ["filtered_date"]}
+      },
+      "item_joined": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT item.i_brand_id, item.i_brand, date_filtered_sales.ss_ext_sales_price FROM date_filtered_sales INNER JOIN item ON date_filtered_sales.ss_item_sk = item.i_item_sk WHERE item.i_manager_id = 1",
+        "interfaces": {"outputs": ["i_brand_id", "i_brand", "ss_ext_sales_price"], "consumes": ["date_filtered_sales"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT 2002 AS d_year, i_brand_id AS brand_id, i_brand AS brand, SUM(ss_ext_sales_price) AS ext_price FROM item_joined GROUP BY i_brand, i_brand_id",
+        "interfaces": {"outputs": ["d_year", "brand_id", "brand", "ext_price"], "consumes": ["item_joined"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT d_year, brand_id, brand, ext_price FROM aggregated ORDER BY d_year ASC, ext_price DESC, brand_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["d_year", "brand_id", "brand", "ext_price"], "consumes": ["aggregated"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "date_filtered_sales", "item_joined", "aggregated", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), date_filtered_sales AS ({date_filtered_sales}), item_joined AS ({item_joined}), aggregated AS ({aggregated}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Restructured single join query into CTE pipeline isolating dimension filters first, creating small probe tables for date and item before joining to large fact table. This allows DuckDB to build hash tables from filtered dimension CTEs and probe store_sales efficiently.
+
+Expected speedup: 2-4x due to reduced fact table scanning and early dimension filtering.

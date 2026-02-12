@@ -1,0 +1,468 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Compare day-of-week sales ratios for each store between two consecutive 12-month periods starting at month sequence 1196, aligning weeks exactly 52 apart. All joins are INNER (intersection), requiring matching rows from both periods. Aggregates are SUM with CASE, which are duplicate-insensitive but depend on week-month inclusion semantics: a week belongs to a period if ANY day in that week falls within the month range. Filter dependencies: month ranges (1196-1207 and 1208-1219) must be preserved exactly; week offset of 52 must be exact; store matching must be exact.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+date_periods_cte -> sales_aggregates_cte -> period_pivot_cte -> final_select
+NODE_CONTRACTS:
+  date_periods_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1196 AND 1196 + 23
+    OUTPUT: d_date_sk, d_week_seq, d_month_seq, d_day_name, period = CASE WHEN d_month_seq BETWEEN 1196 AND 1196+11 THEN 1 ELSE 2 END
+    EXPECTED_ROWS: ~731 (366+365)
+    CONSUMERS: sales_aggregates_cte
+  sales_aggregates_cte:
+    FROM: store_sales JOIN date_periods_cte ON ss_sold_date_sk = d_date_sk
+    GROUP BY: d_week_seq, ss_store_sk, period
+    AGGREGATE: 
+      sun_sales = SUM(CASE WHEN d_day_name='Sunday' THEN ss_sales_price END),
+      mon_sales = SUM(CASE WHEN d_day_name='Monday' THEN ss_sales_price END),
+      tue_sales = SUM(CASE WHEN d_day_name='Tuesday' THEN ss_sales_price END),
+      wed_sales = SUM(CASE WHEN d_day_name='Wednesday' THEN ss_sales_price END),
+      thu_sales = SUM(CASE WHEN d_day_name='Thursday' THEN ss_sales_price END),
+      fri_sales = SUM(CASE WHEN d_day_name='Friday' THEN ss_sales_price END),
+      sat_sales = SUM(CASE WHEN d_day_name='Saturday' THEN ss_sales_price END)
+    OUTPUT: d_week_seq, ss_store_sk, period, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+    EXPECTED_ROWS: ~14K (similar to original CTE but with period split)
+    CONSUMERS: period_pivot_cte
+  period_pivot_cte:
+    FROM: sales_aggregates_cte period1 JOIN sales_aggregates_cte period2 
+          ON period1.ss_store_sk = period2.ss_store_sk 
+          AND period1.d_week_seq = period2.d_week_seq - 52 
+          AND period1.period = 1 AND period2.period = 2
+    JOIN store ON period1.ss_store_sk = s_store_sk
+    OUTPUT: 
+      s_store_name, s_store_id, 
+      period1.d_week_seq AS d_week_seq1,
+      period1.sun_sales AS sun_sales1, period1.mon_sales AS mon_sales1, ...,
+      period2.sun_sales AS sun_sales2, period2.mon_sales AS mon_sales2, ...
+    EXPECTED_ROWS: ~129K (same as original final join)
+    CONSUMERS: final_select
+  final_select:
+    FROM: period_pivot_cte
+    ORDER BY: s_store_name ASC, s_store_id ASC, d_week_seq1 ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, s_store_id, d_week_seq1, 
+            sun_sales1/NULLIF(sun_sales2,0), mon_sales1/NULLIF(mon_sales2,0), ...
+
+NODE_CONTRACTS:
+date_periods_cte:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1196 AND 1196 + 23
+    OUTPUT: d_date_sk, d_week_seq, d_month_seq, d_day_name, period = CASE WHEN d_month_seq BETWEEN 1196 AND 1196+11 THEN 1 ELSE 2 END
+    EXPECTED_ROWS: ~731 (366+365)
+    CONSUMERS: sales_aggregates_cte
+  sales_aggregates_cte:
+    FROM: store_sales JOIN date_periods_cte ON ss_sold_date_sk = d_date_sk
+    GROUP BY: d_week_seq, ss_store_sk, period
+    AGGREGATE: 
+      sun_sales = SUM(CASE WHEN d_day_name='Sunday' THEN ss_sales_price END),
+      mon_sales = SUM(CASE WHEN d_day_name='Monday' THEN ss_sales_price END),
+      tue_sales = SUM(CASE WHEN d_day_name='Tuesday' THEN ss_sales_price END),
+      wed_sales = SUM(CASE WHEN d_day_name='Wednesday' THEN ss_sales_price END),
+      thu_sales = SUM(CASE WHEN d_day_name='Thursday' THEN ss_sales_price END),
+      fri_sales = SUM(CASE WHEN d_day_name='Friday' THEN ss_sales_price END),
+      sat_sales = SUM(CASE WHEN d_day_name='Saturday' THEN ss_sales_price END)
+    OUTPUT: d_week_seq, ss_store_sk, period, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+    EXPECTED_ROWS: ~14K (similar to original CTE but with period split)
+    CONSUMERS: period_pivot_cte
+  period_pivot_cte:
+    FROM: sales_aggregates_cte period1 JOIN sales_aggregates_cte period2 
+          ON period1.ss_store_sk = period2.ss_store_sk 
+          AND period1.d_week_seq = period2.d_week_seq - 52 
+          AND period1.period = 1 AND period2.period = 2
+    JOIN store ON period1.ss_store_sk = s_store_sk
+    OUTPUT: 
+      s_store_name, s_store_id, 
+      period1.d_week_seq AS d_week_seq1,
+      period1.sun_sales AS sun_sales1, period1.mon_sales AS mon_sales1, ...,
+      period2.sun_sales AS sun_sales2, period2.mon_sales AS mon_sales2, ...
+    EXPECTED_ROWS: ~129K (same as original final join)
+    CONSUMERS: final_select
+  final_select:
+    FROM: period_pivot_cte
+    ORDER BY: s_store_name ASC, s_store_id ASC, d_week_seq1 ASC
+    LIMIT: 100
+    OUTPUT: s_store_name, s_store_id, d_week_seq1, 
+            sun_sales1/NULLIF(sun_sales2,0), mon_sales1/NULLIF(mon_sales2,0), ...
+
+## Hazard Flags (avoid these specific risks)
+
+- The period discriminator (1,2) must be based on month_seq range, not week. A week may have days in both periods? Actually periods are disjoint (12 months each, consecutive). A week cannot span both periods because periods are 12 months apart. But a week could have days in two different months within the same period? That's fine; we label by month_seq range at date level.
+  - Must adjust week offset in join: period1 week = period2 week - 52.
+
+## Regression Warnings (observed failures on similar queries)
+
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline query already <100ms, CTE overhead dominated savings.
+   RULE: This query baseline is 2898ms >> 100ms, so CTE overhead acceptable.
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Baseline <50ms, CTE overhead dominated.
+   RULE: This query baseline is 2898ms, so acceptable.
+3. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joining 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join multiple dimension CTEs; keep dimension CTEs independent and join with fact sequentially.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output all 10 original columns in exact order: s_store_name1, s_store_id1, d_week_seq1, and 7 ratios.
+- CTE_COLUMN_COMPLETENESS: Any new CTE must include all columns referenced downstream: d_week_seq, ss_store_sk, sun_sales..sat_sales, s_store_sk, s_store_id, s_store_name, d_month_seq, d_date_sk.
+- LITERAL_PRESERVATION: Must preserve month range literals 1196, 1196+11, 1196+12, 1196+23 and week offset 52.
+- SEMANTIC_EQUIVALENCE: Must return identical rows, columns, and ordering as original.
+- CROSS_CTE_PREDICATE_BLINDNESS: Month predicates applied after CTE aggregation (EXPLAIN shows date_dim scans filtered by month_seq in main query, not in CTE).
+- REDUNDANT_SCAN_ELIMINATION: date_dim scanned 3 times (1 in CTE + 2 in main query); store scanned twice.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+single_pass_aggregation: Apply the pattern of consolidating multiple period scans into one CTE with CASE-based period discrimination. Ignore the scalar subquery aspect — this query has no scalar subqueries.
+  channel_bitmap_aggregation: Apply the pattern of labeling rows with a period discriminator and conditional aggregation. Ignore the bitmap aspect — we don't need bitmaps.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. single_pass_aggregation (4.47x)
+
+**Principle:** Single-Pass Aggregation: consolidate multiple scalar subqueries on the same table into one CTE using CASE expressions inside aggregate functions. Reduces N separate table scans to 1 pass.
+
+**BEFORE (slow):**
+```sql
+select case when (select count(*) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) > 2972190
+            then (select avg(ss_ext_sales_price) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 1 and 20) end bucket1 ,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 21 and 40) > 4505785
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 21 and 40) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 21 and 40) end bucket2,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 41 and 60) > 1575726
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 41 and 60)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 41 and 60) end bucket3,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 61 and 80) > 3188917
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 61 and 80)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 61 and 80) end bucket4,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 81 and 100) > 3525216
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 81 and 100)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 81 and 100) end bucket5
+from reason
+where r_reason_sk = 1;
+```
+
+**AFTER (fast):**
+[store_sales_aggregates]:
+```sql
+SELECT SUM(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 ELSE 0 END) AS cnt1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_ext_discount_amt END) AS avg_disc1, AVG(CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN ss_net_paid END) AS avg_paid1, SUM(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN 1 ELSE 0 END) AS cnt2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_ext_discount_amt END) AS avg_disc2, AVG(CASE WHEN ss_quantity BETWEEN 21 AND 40 THEN ss_net_paid END) AS avg_paid2, SUM(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN 1 ELSE 0 END) AS cnt3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_ext_discount_amt END) AS avg_disc3, AVG(CASE WHEN ss_quantity BETWEEN 41 AND 60 THEN ss_net_paid END) AS avg_paid3, SUM(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN 1 ELSE 0 END) AS cnt4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_ext_discount_amt END) AS avg_disc4, AVG(CASE WHEN ss_quantity BETWEEN 61 AND 80 THEN ss_net_paid END) AS avg_paid4, SUM(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN 1 ELSE 0 END) AS cnt5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_ext_discount_amt END) AS avg_disc5, AVG(CASE WHEN ss_quantity BETWEEN 81 AND 100 THEN ss_net_paid END) AS avg_paid5 FROM store_sales
+```
+[main_query]:
+```sql
+SELECT CASE WHEN cnt1 > 74129 THEN avg_disc1 ELSE avg_paid1 END AS bucket1, CASE WHEN cnt2 > 122840 THEN avg_disc2 ELSE avg_paid2 END AS bucket2, CASE WHEN cnt3 > 56580 THEN avg_disc3 ELSE avg_paid3 END AS bucket3, CASE WHEN cnt4 > 10097 THEN avg_disc4 ELSE avg_paid4 END AS bucket4, CASE WHEN cnt5 > 165306 THEN avg_disc5 ELSE avg_paid5 END AS bucket5 FROM store_sales_aggregates
+```
+
+### 2. channel_bitmap_aggregation (6.24x)
+
+**BEFORE (slow):**
+```sql
+select * from
+ (select count(*) h8_30_to_9
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 8 and time_dim.t_minute >= 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s1,
+ (select count(*) h9_to_9_30
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 9 and time_dim.t_minute < 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s2,
+ (select count(*) h9_30_to_10
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 9 and time_dim.t_minute >= 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s3,
+ (select count(*) h10_to_10_30
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 10 and time_dim.t_minute < 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s4,
+ (select count(*) h10_30_to_11
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 10 and time_dim.t_minute >= 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s5,
+ (select count(*) h11_to_11_30
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 11 and time_dim.t_minute < 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s6,
+ (select count(*) h11_30_to_12
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 11 and time_dim.t_minute >= 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s7,
+ (select count(*) h12_to_12_30
+ from store_sales, household_demographics, time_dim, store
+ where ss_sold_time_sk = time_dim.t_time_sk
+   and ss_hdemo_sk = household_demographics.hd_demo_sk
+   and ss_store_sk = s_store_sk
+   and time_dim.t_hour = 12 and time_dim.t_minute < 30
+   and ((household_demographics.hd_dep_count = -1 and household_demographics.hd_vehicle_count<=-1+2) or
+        (household_demographics.hd_dep_count = 4 and household_demographics.hd_vehicle_count<=4+2) or
+        (household_demographics.hd_dep_count = 3 and household_demographics.hd_vehicle_count<=3+2))
+   and store.s_store_name = 'ese') s8;
+```
+
+**AFTER (fast):**
+[filtered_store]:
+```sql
+SELECT s_store_sk FROM store WHERE s_store_name = 'ese'
+```
+[filtered_hd]:
+```sql
+SELECT hd_demo_sk FROM household_demographics WHERE (hd_dep_count = -1 AND hd_vehicle_count <= 1) OR (hd_dep_count = 4 AND hd_vehicle_count <= 6) OR (hd_dep_count = 3 AND hd_vehicle_count <= 5)
+```
+[time_ranges]:
+```sql
+SELECT t_time_sk, CASE WHEN t_hour = 8 AND t_minute >= 30 THEN 1 WHEN t_hour = 9 AND t_minute < 30 THEN 2 WHEN t_hour = 9 AND t_minute >= 30 THEN 3 WHEN t_hour = 10 AND t_minute < 30 THEN 4 WHEN t_hour = 10 AND t_minute >= 30 THEN 5 WHEN t_hour = 11 AND t_minute < 30 THEN 6 WHEN t_hour = 11 AND t_minute >= 30 THEN 7 WHEN t_hour = 12 AND t_minute < 30 THEN 8 END AS time_window FROM time_dim WHERE (t_hour BETWEEN 8 AND 12)
+```
+[sales_with_time]:
+```sql
+SELECT tr.time_window FROM store_sales ss JOIN filtered_store fs ON ss.ss_store_sk = fs.s_store_sk JOIN filtered_hd fhd ON ss.ss_hdemo_sk = fhd.hd_demo_sk JOIN time_ranges tr ON ss.ss_sold_time_sk = tr.t_time_sk
+```
+[main_query]:
+```sql
+SELECT COUNT(CASE WHEN time_window = 1 THEN 1 END) AS h8_30_to_9, COUNT(CASE WHEN time_window = 2 THEN 1 END) AS h9_to_9_30, COUNT(CASE WHEN time_window = 3 THEN 1 END) AS h9_30_to_10, COUNT(CASE WHEN time_window = 4 THEN 1 END) AS h10_to_10_30, COUNT(CASE WHEN time_window = 5 THEN 1 END) AS h10_30_to_11, COUNT(CASE WHEN time_window = 6 THEN 1 END) AS h11_to_11_30, COUNT(CASE WHEN time_window = 7 THEN 1 END) AS h11_30_to_12, COUNT(CASE WHEN time_window = 8 THEN 1 END) AS h12_to_12_30 FROM sales_with_time
+```
+
+## Original SQL
+
+```sql
+-- start query 59 in stream 0 using template query59.tpl
+with wss as 
+ (select d_week_seq,
+        ss_store_sk,
+        sum(case when (d_day_name='Sunday') then ss_sales_price else null end) sun_sales,
+        sum(case when (d_day_name='Monday') then ss_sales_price else null end) mon_sales,
+        sum(case when (d_day_name='Tuesday') then ss_sales_price else  null end) tue_sales,
+        sum(case when (d_day_name='Wednesday') then ss_sales_price else null end) wed_sales,
+        sum(case when (d_day_name='Thursday') then ss_sales_price else null end) thu_sales,
+        sum(case when (d_day_name='Friday') then ss_sales_price else null end) fri_sales,
+        sum(case when (d_day_name='Saturday') then ss_sales_price else null end) sat_sales
+ from store_sales,date_dim
+ where d_date_sk = ss_sold_date_sk
+ group by d_week_seq,ss_store_sk
+ )
+  select s_store_name1,s_store_id1,d_week_seq1
+       ,sun_sales1/sun_sales2,mon_sales1/mon_sales2
+       ,tue_sales1/tue_sales2,wed_sales1/wed_sales2,thu_sales1/thu_sales2
+       ,fri_sales1/fri_sales2,sat_sales1/sat_sales2
+ from
+ (select s_store_name s_store_name1,wss.d_week_seq d_week_seq1
+        ,s_store_id s_store_id1,sun_sales sun_sales1
+        ,mon_sales mon_sales1,tue_sales tue_sales1
+        ,wed_sales wed_sales1,thu_sales thu_sales1
+        ,fri_sales fri_sales1,sat_sales sat_sales1
+  from wss,store,date_dim d
+  where d.d_week_seq = wss.d_week_seq and
+        ss_store_sk = s_store_sk and 
+        d_month_seq between 1196 and 1196 + 11) y,
+ (select s_store_name s_store_name2,wss.d_week_seq d_week_seq2
+        ,s_store_id s_store_id2,sun_sales sun_sales2
+        ,mon_sales mon_sales2,tue_sales tue_sales2
+        ,wed_sales wed_sales2,thu_sales thu_sales2
+        ,fri_sales fri_sales2,sat_sales sat_sales2
+  from wss,store,date_dim d
+  where d.d_week_seq = wss.d_week_seq and
+        ss_store_sk = s_store_sk and 
+        d_month_seq between 1196+ 12 and 1196 + 23) x
+ where s_store_id1=s_store_id2
+   and d_week_seq1=d_week_seq2-52
+ order by s_store_name1,s_store_id1,d_week_seq1
+ LIMIT 100;
+
+-- end query 59 in stream 0 using template query59.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `s_store_name1`
+  2. `s_store_id1`
+  3. `d_week_seq1`
+  4. `sun_sales1 / NULLIF(sun_sales2`
+  5. `mon_sales1 / NULLIF(mon_sales2`
+  6. `tue_sales1 / NULLIF(tue_sales2`
+  7. `wed_sales1 / NULLIF(wed_sales2`
+  8. `thu_sales1 / NULLIF(thu_sales2`
+  9. `fri_sales1 / NULLIF(fri_sales2`
+  10. `sat_sales1 / NULLIF(sat_sales2`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] wss  [=]  Cost: 50%  Rows: ~1K  — Aggregate store sales by week and store into Sunday-through-Saturday sales buckets.
+│   ├── SCAN (store_sales, date_dim (join))
+│   ├── JOIN (d_date_sk = ss_sold_date_sk)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (d_week_seq, ss_store_sk, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, ...)
+└── [MAIN] main_query  [=]  Cost: 50%  Rows: ~1K  — Build year1 and year2 weekly views from the bucketed data, match same store and week offset by 52, and compute day-level ratio comparisons.
+    ├── SCAN (wss, store, date_dim AS d (join))
+    ├── JOIN (s_store_id1 = s_store_id2)
+    ├── JOIN (d_week_seq1 = d_week_seq2 - 52)
+    ├── AGG (GROUP BY)
+    ├── SORT (s_store_name1 ASC, s_store_id1 ASC, d_week_seq1 ASC)
+    └── OUTPUT (s_store_name1, s_store_id1, d_week_seq1, sun_sales1 / NULLIF(sun_sales2, mon_sales1 / NULLIF(mon_sales2, tue_sales1 / NULLIF(tue_sales2, wed_sales1 / NULLIF(wed_sales2, thu_sales1 / NULLIF(thu_sales2, ...)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

@@ -1,0 +1,62 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] returns_all_reasons_cte  [+]  (materialized base aggregation)
+├── [CTE] store_avg_threshold_cte  [+]  (decorrelated store thresholds)
+├── [CTE] returns_filtered_reasons_cte  [+]  (early reason filtering)
+└── [MAIN] main_query  [~]  (explicit joins, no correlated subquery)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pg_materialized_dimension_fact_prefilter", "description": "Materialize base aggregation once for reuse", "applied_to": ["returns_all_reasons_cte"]},
+    {"id": "R2", "type": "early_filter_decorrelate", "description": "Push reason filter into separate CTE and decorrelate store average", "applied_to": ["returns_filtered_reasons_cte", "store_avg_threshold_cte"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "returns_all_reasons_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, sr_reason_sk AS ctr_reason_sk, SUM(SR_RETURN_AMT_INC_TAX) AS ctr_total_return FROM store_returns INNER JOIN date_dim ON sr_returned_date_sk = d_date_sk WHERE d_year = 2002 AND sr_return_amt / sr_return_quantity BETWEEN 108 AND 167 GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return"], "consumes": []}
+      },
+      "store_avg_threshold_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS store_avg_threshold FROM returns_all_reasons_cte GROUP BY ctr_store_sk",
+        "interfaces": {"outputs": ["ctr_store_sk", "store_avg_threshold"], "consumes": ["returns_all_reasons_cte"]}
+      },
+      "returns_filtered_reasons_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ctr_customer_sk, ctr_store_sk, ctr_reason_sk, ctr_total_return FROM returns_all_reasons_cte WHERE ctr_reason_sk BETWEEN 43 AND 46",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_reason_sk", "ctr_total_return"], "consumes": ["returns_all_reasons_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id FROM returns_filtered_reasons_cte ctr1 INNER JOIN store_avg_threshold_cte th ON ctr1.ctr_store_sk = th.ctr_store_sk INNER JOIN store ON s_store_sk = ctr1.ctr_store_sk INNER JOIN customer ON c_customer_sk = ctr1.ctr_customer_sk INNER JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk WHERE ctr1.ctr_total_return > th.store_avg_threshold AND s_state IN ('IL', 'KY', 'TX') AND cd_marital_status IN ('M', 'M') AND cd_education_status IN ('Advanced Degree', 'College') AND cd_gender = 'F' AND c_birth_month = 2 AND c_birth_year BETWEEN 1965 AND 1971 ORDER BY c_customer_id LIMIT 100",
+        "interfaces": {"outputs": ["c_customer_id"], "consumes": ["returns_filtered_reasons_cte", "store_avg_threshold_cte"]}
+      }
+    },
+    "reconstruction_order": ["returns_all_reasons_cte", "store_avg_threshold_cte", "returns_filtered_reasons_cte", "main_query"],
+    "assembly_template": "WITH returns_all_reasons_cte AS (MATERIALIZED {returns_all_reasons_cte}), store_avg_threshold_cte AS ({store_avg_threshold_cte}), returns_filtered_reasons_cte AS ({returns_filtered_reasons_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'", "SET LOCAL enable_nestloop = off"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Materialized base aggregation once, decorrelated store average via separate CTE, pushed reason filtering early. Eliminated correlated subquery execution (1,845 loops → 1 pass).
+
+**Expected speedup**: 2-3x from decorrelation and reduced join cardinality.

@@ -1,0 +1,125 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Follows TARGET_LOGICAL_TREE structure with CTEs.
+    ├── [=] filtered_item CTE
+    ├── [=] filtered_date CTE
+    ├── [!] web_sales_enriched CTE (replaces original join + subquery with window function)
+    ├── [=] filtered_rows CTE
+    ├── [=] agg CTE
+    └── [=] top_n CTE
+```
+
+**Change markers explanation:**
+- `[~]` - Main query modified to use CTE structure instead of original join + correlated subquery
+- `[!]` - Structural change: replaced correlated subquery with window function computation in single scan
+- `[=]` - All other nodes follow Target Logical Tree exactly
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "single_pass_aggregation",
+      "description": "Replaced correlated subquery with window function to compute per-item average in single scan",
+      "applied_to": ["web_sales_enriched"]
+    },
+    {
+      "id": "R2",
+      "type": "dimension_cte_isolate",
+      "description": "Isolate dimension table filters (item, date_dim) into separate CTEs for predicate pushdown",
+      "applied_to": ["filtered_item", "filtered_date"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_item": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_manufact_id FROM item WHERE i_manufact_id = 320",
+        "interfaces": {
+          "outputs": ["i_item_sk", "i_manufact_id"],
+          "consumes": []
+        }
+      },
+      "filtered_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN '2002-02-26' AND (CAST('2002-02-26' AS DATE) + INTERVAL 90 DAY)",
+        "interfaces": {
+          "outputs": ["d_date_sk", "d_date"],
+          "consumes": []
+        }
+      },
+      "web_sales_enriched": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws.ws_ext_discount_amt, ws.ws_item_sk, AVG(ws.ws_ext_discount_amt) OVER (PARTITION BY ws.ws_item_sk) AS avg_disc FROM web_sales ws INNER JOIN filtered_date fd ON fd.d_date_sk = ws.ws_sold_date_sk INNER JOIN filtered_item fi ON fi.i_item_sk = ws.ws_item_sk",
+        "interfaces": {
+          "outputs": ["ws_ext_discount_amt", "ws_item_sk", "avg_disc"],
+          "consumes": ["filtered_date", "filtered_item"]
+        }
+      },
+      "filtered_rows": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_ext_discount_amt FROM web_sales_enriched WHERE ws_ext_discount_amt > 1.3 * avg_disc",
+        "interfaces": {
+          "outputs": ["ws_ext_discount_amt"],
+          "consumes": ["web_sales_enriched"]
+        }
+      },
+      "agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT SUM(ws_ext_discount_amt) AS \"Excess Discount Amount\" FROM filtered_rows",
+        "interfaces": {
+          "outputs": ["Excess Discount Amount"],
+          "consumes": ["filtered_rows"]
+        }
+      },
+      "top_n": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT \"Excess Discount Amount\" FROM agg ORDER BY \"Excess Discount Amount\" ASC LIMIT 100",
+        "interfaces": {
+          "outputs": ["Excess Discount Amount"],
+          "consumes": ["agg"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT \"Excess Discount Amount\" FROM top_n",
+        "interfaces": {
+          "outputs": ["Excess Discount Amount"],
+          "consumes": ["top_n"]
+        }
+      }
+    },
+    "reconstruction_order": ["filtered_item", "filtered_date", "web_sales_enriched", "filtered_rows", "agg", "top_n", "main_query"],
+    "assembly_template": "WITH filtered_item AS ({filtered_item}), filtered_date AS ({filtered_date}), web_sales_enriched AS ({web_sales_enriched}), filtered_rows AS ({filtered_rows}), agg AS ({agg}), top_n AS ({top_n}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": [
+    "Output column 'Excess Discount Amount' matches original",
+    "Window function computes avg over same partition as correlated subquery",
+    "All joins remain INNER, preserving original intersection semantics",
+    "Date filter '2002-02-26' to +90 days preserved",
+    "Manufacturer filter i_manufact_id = 320 preserved",
+    "Threshold multiplier 1.3 preserved"
+  ]
+}
+```
+
+**Changes:** Replaced correlated subquery with window function to compute per-item average discount in a single scan, while maintaining the same filtering logic through separate dimension CTEs. This eliminates the redundant scan of web_sales, date_dim, and item tables.
+
+**Expected speedup:** ~3-5x due to elimination of redundant scans and correlated subquery execution overhead. The window function computes averages in a single pass over filtered data, avoiding the N+1 query pattern where N = number of items from manufacturer 320 (168 items).

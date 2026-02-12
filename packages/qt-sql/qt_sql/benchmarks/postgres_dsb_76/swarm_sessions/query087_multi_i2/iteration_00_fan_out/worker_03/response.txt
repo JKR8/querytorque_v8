@@ -1,0 +1,86 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  (Restructured as CTE pipeline)
+    ├── [~] filtered_dates
+    │   └── SCAN date_dim + FILTER (d_month_seq BETWEEN 1213 AND 1224)
+    ├── [~] filtered_customers  
+    │   └── SCAN customer + FILTER (c_birth_year BETWEEN 1968 AND 1974)
+    ├── [!] all_sales_joined
+    │   ├── LEFT JOIN filtered_dates → store_sales (with price/cost filters + customer IN subquery)
+    │   ├── LEFT JOIN filtered_dates → catalog_sales (with price/cost filters + customer IN subquery)  
+    │   ├── LEFT JOIN filtered_dates → web_sales (with price/cost filters + customer IN subquery)
+    │   └── SCALAR SUBQUERIES for each channel's customer names
+    ├── [~] distinct_combinations
+    │   └── FILTER (store_last_name IS NOT NULL) + presence flags
+    ├── [~] filter_by_presence
+    │   └── FILTER (in_catalog = 0 AND in_web = 0)
+    └── [=] OUTPUT (COUNT(*))
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL 16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "cte_pipeline", "description": "Replaced comma joins and EXCEPT with CTE pipeline tracking channel presence via LEFT JOIN + flags", "applied_to": ["all_sales_joined", "distinct_combinations", "filter_by_presence"]},
+    {"id": "R2", "type": "single_pass_aggregation", "description": "Single scan over date_dim with parallel LEFT JOINs to all three sales tables", "applied_to": ["all_sales_joined"]},
+    {"id": "R3", "type": "preserve_except_semantics", "description": "Maintains set difference semantics via channel presence flags (in_catalog, in_web) rather than NOT EXISTS", "applied_to": ["filter_by_presence"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1213 AND 1224",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "filtered_customers": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_sk, c_last_name, c_first_name FROM customer WHERE c_birth_year BETWEEN 1968 AND 1974",
+        "interfaces": {"outputs": ["c_customer_sk", "c_last_name", "c_first_name"], "consumes": []}
+      },
+      "all_sales_joined": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT fd.d_date,\n       (SELECT c_last_name FROM filtered_customers WHERE c_customer_sk = ss.ss_customer_sk) as store_last_name,\n       (SELECT c_first_name FROM filtered_customers WHERE c_customer_sk = ss.ss_customer_sk) as store_first_name,\n       (SELECT c_last_name FROM filtered_customers WHERE c_customer_sk = cs.cs_bill_customer_sk) as catalog_last_name,\n       (SELECT c_first_name FROM filtered_customers WHERE c_customer_sk = cs.cs_bill_customer_sk) as catalog_first_name,\n       (SELECT c_last_name FROM filtered_customers WHERE c_customer_sk = ws.ws_bill_customer_sk) as web_last_name,\n       (SELECT c_first_name FROM filtered_customers WHERE c_customer_sk = ws.ws_bill_customer_sk) as web_first_name\nFROM filtered_dates fd\nLEFT JOIN store_sales ss ON ss.ss_sold_date_sk = fd.d_date_sk \n  AND ss.ss_customer_sk IN (SELECT c_customer_sk FROM filtered_customers)\n  AND ss.ss_list_price BETWEEN 168 AND 197 \n  AND ss.ss_wholesale_cost BETWEEN 76 AND 86\nLEFT JOIN catalog_sales cs ON cs.cs_sold_date_sk = fd.d_date_sk \n  AND cs.cs_bill_customer_sk IN (SELECT c_customer_sk FROM filtered_customers)\n  AND cs.cs_list_price BETWEEN 168 AND 197 \n  AND cs.cs_wholesale_cost BETWEEN 76 AND 86\nLEFT JOIN web_sales ws ON ws.ws_sold_date_sk = fd.d_date_sk \n  AND ws.ws_bill_customer_sk IN (SELECT c_customer_sk FROM filtered_customers)\n  AND ws.ws_list_price BETWEEN 168 AND 197 \n  AND ws.ws_wholesale_cost BETWEEN 76 AND 86",
+        "interfaces": {"outputs": ["d_date", "store_last_name", "store_first_name", "catalog_last_name", "catalog_first_name", "web_last_name", "web_first_name"], "consumes": ["filtered_dates", "filtered_customers"]}
+      },
+      "distinct_combinations": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT DISTINCT\n       store_last_name as c_last_name,\n       store_first_name as c_first_name,\n       d_date,\n       CASE WHEN catalog_last_name IS NOT NULL THEN 1 ELSE 0 END as in_catalog,\n       CASE WHEN web_last_name IS NOT NULL THEN 1 ELSE 0 END as in_web\nFROM all_sales_joined\nWHERE store_last_name IS NOT NULL AND store_first_name IS NOT NULL",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date", "in_catalog", "in_web"], "consumes": ["all_sales_joined"]}
+      },
+      "filter_by_presence": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, d_date\nFROM distinct_combinations\nWHERE in_catalog = 0 AND in_web = 0",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date"], "consumes": ["distinct_combinations"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(*) FROM filter_by_presence",
+        "interfaces": {"outputs": ["count"], "consumes": ["filter_by_presence"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_customers", "all_sales_joined", "distinct_combinations", "filter_by_presence", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}),\n     filtered_customers AS ({filtered_customers}),\n     all_sales_joined AS ({all_sales_joined}),\n     distinct_combinations AS ({distinct_combinations}),\n     filter_by_presence AS ({filter_by_presence})\n{main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced comma-joins and EXCEPT operations with CTE pipeline that scans date_dim once, LEFT JOINs to all three sales channels in parallel, tracks presence via flags, and filters for store-only combinations.
+
+**Expected speedup**: Moderate (1.5-2x) due to single date_dim scan and parallelizable joins, avoiding EXCEPT's sequential execution and duplicate elimination overhead.

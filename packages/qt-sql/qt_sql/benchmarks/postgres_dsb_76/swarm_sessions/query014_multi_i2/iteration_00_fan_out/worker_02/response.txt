@@ -1,0 +1,100 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] cross_items [!] Structural change
+│   ├── [-] SCAN (item, web_sales (join), item AS iws (join), date_dim AS d3 (join), store_sales (join), item AS iss (join), date_dim AS d1 (join), catalog_sales (join), item AS ics (join), date_dim AS d2 (join))
+│   ├── [+] CTE with original INTERSECT structure
+│   └── OUTPUT (ss_item_sk)
+├── [CTE] avg_sales [!] Structural change
+│   ├── [-] SCAN (web_sales, date_dim, store_sales, catalog_sales)
+│   ├── [+] CTE with original UNION ALL structure
+│   └── OUTPUT (average_sales)
+├── [CTE] combined_years [~] Modified: Consolidates year scans, adds explicit date filters
+│   ├── SCAN (store_sales, item, date_dim, cross_items)
+│   ├── JOIN (ss_item_sk = i_item_sk)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── JOIN (ss_item_sk = cross_items.ss_item_sk)
+│   ├── FILTER (i_category IN ('Electronics', 'Shoes', 'Sports'))
+│   ├── FILTER (i_manager_id BETWEEN 42 AND 51)
+│   ├── FILTER (ss_wholesale_cost BETWEEN 76 AND 96)
+│   ├── FILTER (d_year IN (1999, 2000))
+│   ├── FILTER (d_moy = 12)
+│   └── FILTER (d_dom = 12)
+├── [CTE] pivot_aggregation [~] Modified: Uses GROUP BY with d_year, HAVING references avg_sales
+│   ├── SCAN (combined_years)
+│   ├── GROUP BY (i_brand_id, i_class_id, i_category_id, d_year)
+│   ├── FILTER HAVING (SUM(sales_amount) > avg_sales)
+│   └── OUTPUT (i_brand_id, i_class_id, i_category_id, d_year, sales, number_sales)
+└── [MAIN] final_join [~] Modified: Pivots via self-join on matching brand/class/category
+    ├── SCAN (pivot_aggregation filtered for 2000, pivot_aggregation filtered for 1999)
+    ├── JOIN (i_brand_id, i_class_id, i_category_id)
+    ├── SORT (ty_channel ASC, ty_brand ASC, ty_class ASC, ty_category ASC)
+    └── OUTPUT (ty_channel, ty_brand, ty_class, ty_category, ty_sales, ty_number_sales, ly_channel, ly_brand, ly_class, ly_category, ly_sales, ly_number_sales)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_aggregation", "description": "Consolidated year scans into single combined_years CTE with d_year IN (1999,2000) filter", "applied_to": ["combined_years"]},
+    {"id": "R2", "type": "scan_consolidation_pivot", "description": "Use GROUP BY with d_year then pivot via self-join on matching brand/class/category", "applied_to": ["pivot_aggregation", "final_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "cross_items": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["ss_item_sk"], "consumes": []}
+      },
+      "avg_sales": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["average_sales"], "consumes": []}
+      },
+      "combined_years": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i.i_brand_id, i.i_class_id, i.i_category_id, d.d_year, ss.ss_quantity * ss.ss_list_price AS sales_amount, ss.ss_quantity, ss.ss_list_price, d.d_week_seq FROM store_sales ss JOIN item i ON ss.ss_item_sk = i.i_item_sk JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk JOIN cross_items ci ON ss.ss_item_sk = ci.ss_item_sk WHERE i.i_category IN ('Electronics', 'Shoes', 'Sports') AND i.i_manager_id BETWEEN 42 AND 51 AND ss.ss_wholesale_cost BETWEEN 76 AND 96 AND d.d_year IN (1999, 2000) AND d.d_moy = 12 AND d.d_dom = 12",
+        "interfaces": {"outputs": ["i_brand_id", "i_class_id", "i_category_id", "d_year", "sales_amount", "ss_quantity", "ss_list_price", "d_week_seq"], "consumes": ["cross_items"]}
+      },
+      "pivot_aggregation": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_brand_id, i_class_id, i_category_id, d_year, SUM(sales_amount) AS sales, COUNT(*) AS number_sales FROM combined_years GROUP BY i_brand_id, i_class_id, i_category_id, d_year HAVING SUM(sales_amount) > (SELECT average_sales FROM avg_sales)",
+        "interfaces": {"outputs": ["i_brand_id", "i_class_id", "i_category_id", "d_year", "sales", "number_sales"], "consumes": ["combined_years", "avg_sales"]}
+      },
+      "final_join": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT 'store' AS ty_channel, ty.i_brand_id AS ty_brand, ty.i_class_id AS ty_class, ty.i_category_id AS ty_category, ty.sales AS ty_sales, ty.number_sales AS ty_number_sales, 'store' AS ly_channel, ly.i_brand_id AS ly_brand, ly.i_class_id AS ly_class, ly.i_category_id AS ly_category, ly.sales AS ly_sales, ly.number_sales AS ly_number_sales FROM (SELECT * FROM pivot_aggregation WHERE d_year = 2000) ty INNER JOIN (SELECT * FROM pivot_aggregation WHERE d_year = 1999) ly ON ty.i_brand_id = ly.i_brand_id AND ty.i_class_id = ly.i_class_id AND ty.i_category_id = ly.i_category_id ORDER BY ty_channel, ty_brand, ty_class, ty_category LIMIT 100",
+        "interfaces": {"outputs": ["ty_channel", "ty_brand", "ty_class", "ty_category", "ty_sales", "ty_number_sales", "ly_channel", "ly_brand", "ly_class", "ly_category", "ly_sales", "ly_number_sales"], "consumes": ["pivot_aggregation"]}
+      }
+    },
+    "reconstruction_order": ["cross_items", "avg_sales", "combined_years", "pivot_aggregation", "final_join"],
+    "assembly_template": "WITH cross_items AS (select i_item_sk ss_item_sk from item, (select iss.i_brand_id brand_id, iss.i_class_id class_id, iss.i_category_id category_id from store_sales, item iss, date_dim d1 where ss_item_sk = iss.i_item_sk and ss_sold_date_sk = d1.d_date_sk and d1.d_year between 1999 AND 1999 + 2 and i_category IN ('Electronics', 'Shoes', 'Sports') and i_manager_id BETWEEN 42 and 51 and ss_wholesale_cost BETWEEN 76 AND 96 intersect select ics.i_brand_id, ics.i_class_id, ics.i_category_id from catalog_sales, item ics, date_dim d2 where cs_item_sk = ics.i_item_sk and cs_sold_date_sk = d2.d_date_sk and d2.d_year between 1999 AND 1999 + 2 and i_category IN ('Electronics', 'Shoes', 'Sports') and i_manager_id BETWEEN 42 and 51 and cs_wholesale_cost BETWEEN 76 AND 96 intersect select iws.i_brand_id, iws.i_class_id, iws.i_category_id from web_sales, item iws, date_dim d3 where ws_item_sk = iws.i_item_sk and ws_sold_date_sk = d3.d_date_sk and ws_wholesale_cost BETWEEN 76 AND 96 and d3.d_year between 1999 AND 1999 + 2) x where i_brand_id = brand_id and i_class_id = class_id and i_category_id = category_id and i_category IN ('Electronics', 'Shoes', 'Sports') and i_manager_id BETWEEN 42 and 51), avg_sales AS (select avg(quantity*list_price) average_sales from (select ss_quantity quantity, ss_list_price list_price from store_sales, date_dim where ss_sold_date_sk = d_date_sk and d_year between 1999 and 1999 + 2 and ss_wholesale_cost BETWEEN 76 AND 96 union all select cs_quantity quantity, cs_list_price list_price from catalog_sales, date_dim where cs_sold_date_sk = d_date_sk and d_year between 1999 and 1999 + 2 and cs_wholesale_cost BETWEEN 76 AND 96 union all select ws_quantity quantity, ws_list_price list_price from web_sales, date_dim where ws_sold_date_sk = d_date_sk and ws_wholesale_cost BETWEEN 76 AND 96 and d_year between 1999 and 1999 + 2) x), combined_years AS ({combined_years}), pivot_aggregation AS ({pivot_aggregation}) {final_join}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL max_parallel_workers_per_gather = 2", "SET LOCAL work_mem = '32MB'", "SET LOCAL hash_mem_multiplier = 2.0"],
+  "validation_checks": []
+}
+```
+
+## Explanation
+
+**Changes**: Consolidated repetitive year scans into a single `combined_years` CTE that filters `d_year IN (1999,2000)` and uses `d_moy=12 AND d_dom=12` (equivalent to the original's week_seq correlation). Used GROUP BY with d_year in `pivot_aggregation`, then pivoted years via self-join in `final_join`.
+
+**Expected speedup**: 1.5-2x from eliminating duplicate fact table scans and enabling parallel execution of the consolidated store_sales scan. The single-pass aggregation reduces I/O and allows better join ordering.
+
+**Runtime config rationale**: 
+- `max_parallel_workers_per_gather = 2`: Enables parallelism for the consolidated store_sales scan in combined_years.
+- `work_mem = '32MB'`: Sufficient for hash joins on brand/class/category (small dimensions) and GROUP BY hash aggregation.
+- `hash_mem_multiplier = 2.0`: Gives more headroom for hash-based operations given the small per-operation work_mem budget.

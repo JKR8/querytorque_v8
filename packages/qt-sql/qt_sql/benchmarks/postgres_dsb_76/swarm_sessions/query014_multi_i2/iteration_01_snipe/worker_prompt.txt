@@ -1,0 +1,1275 @@
+You are a senior SQL optimization architect for PostgreSQL v16.11-0ubuntu0.24.04.1). You have FULL FREEDOM to design your own approach — you are NOT constrained to any specific logical tree topology or CTE structure. Your job: diagnose WHY previous workers failed to reach 2.0x, identify unexplored optimization angles, and produce an optimized SQL rewrite that reaches the target.
+
+Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — guards prevent silent breakage. Strip benchmark comments (-- start query, -- end query) from output.
+
+## Target: >=2.0x speedup
+
+Your target is >=2.0x speedup on this query. This is the bar. Anything below 2.0x is a miss.
+
+## Previous Optimization Attempts
+Target: **>=2.0x** | 4 workers tried | none reached target
+
+### Race Results (all ran in parallel, identical conditions)
+- **Original**: 11235ms
+- **W1**: DID_NOT_FINISH (slower than original)
+- **W2**: 6428ms (+74.8%)
+- **W3**: 10043ms (+11.9%)
+- **W4**: DID_NOT_FINISH (slower than original)
+
+### W3: self_join_elimination → 1.1186623193614078x ★ BEST [PASS, below target (1.1186623193614078x)]
+- **Examples**: pg_self_join_decomposition, shared_dimension_multi_channel
+- **Transforms**: decorrelate
+- **Approach**: - pg_self_join_decomposition: Materialize the base store_sales+item+date_dim sca
+- **Optimized SQL:**
+```sql
+WITH cross_items AS (SELECT i_item_sk ss_item_sk FROM item, (SELECT iss.i_brand_id brand_id, iss.i_class_id class_id, iss.i_category_id category_id FROM store_sales, item iss, date_dim d1 WHERE ss_item_sk = iss.i_item_sk AND ss_sold_date_sk = d1.d_date_sk AND d1.d_year BETWEEN 1999 AND 1999 + 2 AND i_category IN ('Electronics', 'Shoes', 'Sports') AND i_manager_id BETWEEN 42 AND 51 AND ss_wholesale_cost BETWEEN 76 AND 96 INTERSECT SELECT ics.i_brand_id, ics.i_class_id, ics.i_category_id FROM catalog_sales, item ics, date_dim d2 WHERE cs_item_sk = ics.i_item_sk AND cs_sold_date_sk = d2.d_date_sk AND d2.d_year BETWEEN 1999 AND 1999 + 2 AND i_category IN ('Electronics', 'Shoes', 'Sports') AND i_manager_id BETWEEN 42 AND 51 AND cs_wholesale_cost BETWEEN 76 AND 96 INTERSECT SELECT iws.i_brand_id, iws.i_class_id, iws.i_category_id FROM web_sales, item iws, date_dim d3 WHERE ws_item_sk = iws.i_item_sk AND ws_sold_date_sk = d3.d_date_sk AND ws_wholesale_cost BETWEEN 76 AND 96 AND d3.d_year BETWEEN 1999 AND 1999 + 2) x WHERE i_brand_id = brand_id AND i_class_id = class_id AND i_category_id = category_id AND i_category IN ('Electronics', 'Shoes', 'Sports') AND i_manager_id BETWEEN 42 AND 51), avg_sales AS (SELECT AVG(quantity*list_price) average_sales FROM (SELECT ss_quantity quantity, ss_list_price list_price FROM store_sales, date_dim WHERE ss_sold_date_sk = d_date_sk AND d_year BETWEEN 1999 AND 1999 + 2 AND ss_wholesale_cost BETWEEN 76 AND 96 UNION ALL SELECT cs_quantity quantity, cs_list_price list_price FROM catalog_sales, date_dim WHERE cs_sold_date_sk = d_date_sk AND d_year BETWEEN 1999 AND 1999 + 2 AND cs_wholesale_cost BETWEEN 76 AND 96 UNION ALL SELECT ws_quantity quantity, ws_list_price list_price FROM web_sales, date_dim WHERE ws_sold_date_sk = d_date_sk AND ws_wholesale_cost BETWEEN 76 AND 96 AND d_year BETWEEN 1999 AND 1999 + 2) x), base_aggregation AS (SELECT i.i_brand_id, i.i_class_id, i.i_category_id, d.d_year, d.d_week_seq, ss.ss_quantity * ss.ss_list_price AS sales_amount, ss.ss_quantity, ss.ss_list_price FROM store_sales ss JOIN item i ON ss.ss_item_sk = i.i_item_sk JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk JOIN cross_items ci ON ss.ss_item_sk = ci.ss_item_sk WHERE i.i_category IN ('Electronics', 'Shoes', 'Sports') AND i.i_manager_id BETWEEN 42 AND 51 AND ss.ss_wholesale_cost BETWEEN 76 AND 96 AND d.d_year IN (1999, 2000)), year_split AS (SELECT i_brand_id, i_class_id, i_category_id, d_year, d_week_seq, SUM(sales_amount) AS sales, COUNT(*) AS number_sales FROM base_aggregation GROUP BY i_brand_id, i_class_id, i_category_id, d_year, d_week_seq HAVING SUM(sales_amount) > (SELECT average_sales FROM avg_sales)) SELECT 'store' AS ty_channel, ty.i_brand_id AS ty_brand, ty.i_class_id AS ty_class, ty.i_category_id AS ty_category, ty.sales AS ty_sales, ty.number_sales AS ty_number_sales, 'store' AS ly_channel, ly.i_brand_id AS ly_brand, ly.i_class_id AS ly_class, ly.i_category_id AS ly_category, ly.sales AS ly_sales, ly.number_sales AS ly_number_sales FROM (SELECT * FROM year_split WHERE d_year = 2000 AND d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 12 AND d_dom = 12)) ty JOIN (SELECT * FROM year_split WHERE d_year = 1999 AND d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_year = 1999 AND d_moy = 12 AND d_dom = 12)) ly ON ty.i_brand_id = ly.i_brand_id AND ty.i_class_id = ly.i_class_id AND ty.i_category_id = ly.i_category_id ORDER BY ty_channel, ty_brand, ty_class, ty_category LIMIT 100
+```
+- **Execution Plan (EXPLAIN ANALYZE):**
+```
+Limit  (rows=55, time=6972.393)
+  Aggregate  (rows=11213, time=6905.025)
+    Aggregate  (rows=1, time=1823.123)
+      Gather  (rows=3, time=1823.109)
+        Aggregate  (rows=1, time=1617.553)
+          Append  (rows=1341178, time=1458.589)
+            Nested Loop  (rows=798538, time=762.285)
+              Index Only Scan on date_dim  (rows=365, time=0.687)
+              Index Only Scan on store_sales  (rows=2186, time=1.992)
+            Nested Loop  (rows=393816, time=580.954)
+              Index Only Scan on date_dim (date_dim_1)  (rows=548, time=0.697)
+              Index Scan on catalog_sales  (rows=719, time=1.022)
+            Nested Loop  (rows=840289, time=784.269)
+              Index Only Scan on date_dim (date_dim_2)  (rows=1096, time=1.436)
+              Index Scan on web_sales  (rows=767, time=0.676)
+    Incremental Sort  (rows=38801, time=5068.497)
+      Nested Loop  (rows=38801, time=5055.33)
+        Nested Loop  (rows=100842, time=4952.275)
+          Nested Loop  (rows=4735, time=3074.927)
+            Gather Merge  (rows=4750, time=16.882)
+              Sort  (rows=1583, time=10.753)
+                Nested Loop  (rows=1583, time=10.013)
+                  Seq Scan on item (i)  (rows=1583, time=6.759)
+                  Index Scan on item  (rows=1, time=0.002)
+            Materialize  (rows=207, time=0.637)
+              Subquery Scan (x_1)  (rows=435, time=3006.663)
+                SetOp  (rows=435, time=3006.641)
+                  Append  (rows=840725, time=2949.932)
+                    Result  (rows=436, time=2279.543)
+                      SetOp  (rows=436, time=2279.519)
+                        Append  (rows=116507, time=2261.292)
+                          Subquery Scan (*SELECT* 2)  (rows=59725, time=778.436)
+                            Gather  (rows=59725, time=774.388)
+                              Nested Loop  (rows=19908, time=653.053)
+                                Nested Loop  (rows=262544, time=402.374)
+                                  Index Only Scan on date_dim (d2)  (rows=365, time=0.684)
+                                  Index Scan on catalog_sales (catalog_sales_1)  (rows=719, time=1.064)
+                                Memoize  (rows=0, time=0.001)
+                                  Index Scan on item (ics)  (rows=0, time=0.003)
+                          Subquery Scan (*SELECT* 1)  (rows=56782, time=1477.411)
+                            Gather  (rows=56782, time=1473.442)
+                              Nested Loop  (rows=18927, time=1180.88)
+                                Nested Loop  (rows=798538, time=761.508)
+                                  Index Only Scan on date_dim (d1)  (rows=365, time=0.671)
+                                  Index Only Scan on store_sales (store_sales_1)  (rows=2186, time=1.994)
+                                Memoize  (rows=0, time=0.0)
+                                  Index Scan on item (iss)  (rows=0, time=0.003)
+                    Subquery Scan (*SELECT* 3)  (rows=840289, time=636.429)
+                      Gather  (rows=840289, time=590.336)
+                        Nested Loop  (rows=280096, time=547.957)
+                          Nested Loop  (rows=280096, time=280.785)
+                            Index Only Scan on date_dim (d3)  (rows=365, time=0.596)
+                            Index Scan on web_sales (web_sales_1)  (rows=767, time=0.731)
+                          Memoize  (rows=1, time=0.001)
+                            Index Scan on item (iws)  (rows=1, time=0.002)
+          Bitmap Heap Scan on store_sales (ss)  (rows=21, time=0.394)
+            Bitmap Index Scan  (rows=143, time=0.01)
+        Index Scan on date_dim (d)  (rows=0, time=0.001)
+  Index Scan on date_dim (date_dim_3)  (rows=1, time=0.024)
+  Index Scan on date_dim (date_dim_4)  (rows=1, time=0.01)
+  Sort  (rows=55, time=6972.189)
+    Nested Loop  (rows=55, time=6972.149)
+      CTE Scan (year_split)  (rows=194, time=4911.648)
+      CTE Scan (year_split_1)  (rows=91, time=10.618)
+```
+
+### W1: star_join_prefetch_explicit → 0.0x [ERROR]
+- **Examples**: pg_dimension_prefetch_star, pg_date_cte_explicit_join, early_filter_decorrelate
+- **Transforms**: decorrelate
+- **Approach**: - pg_dimension_prefetch_star: Apply pre-filtering of date_dim and item into CTEs
+- **Error**: DID_NOT_FINISH: slower than original
+- **Optimized SQL:**
+```sql
+WITH filtered_dates AS (SELECT d_date_sk, d_year, d_week_seq FROM date_dim WHERE d_year BETWEEN 1999 AND 2001), filtered_items AS (SELECT i_item_sk, i_brand_id, i_class_id, i_category_id FROM item WHERE i_category IN ('Electronics', 'Shoes', 'Sports') AND i_manager_id BETWEEN 42 AND 51), prefactored_sales AS (SELECT ss.ss_item_sk, ss.ss_quantity, ss.ss_list_price, ss.ss_sold_date_sk, fi.i_brand_id, fi.i_class_id, fi.i_category_id, fd.d_week_seq, fd.d_year FROM store_sales ss JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk JOIN filtered_items fi ON ss.ss_item_sk = fi.i_item_sk WHERE ss.ss_wholesale_cost BETWEEN 76 AND 96), cross_items AS (SELECT fi.i_item_sk AS ss_item_sk FROM (SELECT i_brand_id, i_class_id, i_category_id FROM prefactored_sales WHERE d_year BETWEEN 1999 AND 2001 INTERSECT SELECT i_brand_id, i_class_id, i_category_id FROM catalog_sales cs JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_items fi ON cs.cs_item_sk = fi.i_item_sk WHERE cs.cs_wholesale_cost BETWEEN 76 AND 96 INTERSECT SELECT i_brand_id, i_class_id, i_category_id FROM web_sales ws JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk JOIN filtered_items fi ON ws.ws_item_sk = fi.i_item_sk WHERE ws.ws_wholesale_cost BETWEEN 76 AND 96) AS x (brand_id, class_id, category_id) JOIN filtered_items fi ON fi.i_brand_id = x.brand_id AND fi.i_class_id = x.class_id AND fi.i_category_id = x.category_id), avg_sales AS (SELECT AVG(sales.quantity * sales.list_price) AS average_sales FROM (SELECT ss_quantity AS quantity, ss_list_price AS list_price FROM prefactored_sales UNION ALL SELECT cs_quantity AS quantity, cs_list_price AS list_price FROM catalog_sales cs JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk WHERE cs.cs_wholesale_cost BETWEEN 76 AND 96 UNION ALL SELECT ws_quantity AS quantity, ws_list_price AS list_price FROM web_sales ws JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk WHERE ws.ws_wholesale_cost BETWEEN 76 AND 96) AS sales) SELECT this_year.channel AS ty_channel, this_year.i_brand_id AS ty_brand, this_year.i_class_id AS ty_class, this_year.i_category_id AS ty_category, this_year.sales AS ty_sales, this_year.number_sales AS ty_number_sales, last_year.channel AS ly_channel, last_year.i_brand_id AS ly_brand, last_year.i_class_id AS ly_class, last_year.i_category_id AS ly_category, last_year.sales AS ly_sales, last_year.number_sales AS ly_number_sales FROM (SELECT 'store' AS channel, ps.i_brand_id, ps.i_class_id, ps.i_category_id, SUM(ps.ss_quantity * ps.ss_list_price) AS sales, COUNT(*) AS number_sales FROM prefactored_sales ps JOIN cross_items ci ON ps.ss_item_sk = ci.ss_item_sk WHERE ps.d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 12 AND d_dom = 12) GROUP BY ps.i_brand_id, ps.i_class_id, ps.i_category_id HAVING SUM(ps.ss_quantity * ps.ss_list_price) > (SELECT average_sales FROM avg_sales)) AS this_year INNER JOIN (SELECT 'store' AS channel, ps.i_brand_id, ps.i_class_id, ps.i_category_id, SUM(ps.ss_quantity * ps.ss_list_price) AS sales, COUNT(*) AS number_sales FROM prefactored_sales ps JOIN cross_items ci ON ps.ss_item_sk = ci.ss_item_sk WHERE ps.d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_year = 1999 AND d_moy = 12 AND d_dom = 12) GROUP BY ps.i_brand_id, ps.i_class_id, ps.i_category_id HAVING SUM(ps.ss_quantity * ps.ss_list_price) > (SELECT average_sales FROM avg_sales)) AS last_year ON this_year.i_brand_id = last_year.i_brand_id AND this_year.i_class_id = last_year.i_class_id AND this_year.i_category_id = last_year.i_category_id ORDER BY this_year.channel, this_year.i_brand_id, this_year.i_class_id, this_year.i_category_id LIMIT 100
+```
+- **Execution Plan (EXPLAIN ANALYZE):**
+```
+Limit  (rows=53, time=34970.852)
+  Bitmap Heap Scan on date_dim  (rows=1096, time=0.176)
+    Bitmap Index Scan  (rows=1096, time=0.032)
+  Seq Scan on item  (rows=4750, time=17.876)
+  Merge Join  (rows=56782, time=4100.345)
+    Sort  (rows=2395375, time=4025.528)
+      Hash Join  (rows=2395613, time=3487.097)
+        CTE Scan (fd)  (rows=1096, time=0.063)
+        Hash  (rows=4214895, time=3249.519)
+          Seq Scan on store_sales (ss)  (rows=4317056, time=2889.272)
+    Sort  (rows=57562, time=1.874)
+      CTE Scan (fi)  (rows=4750, time=0.183)
+  Hash Join  (rows=4735, time=7363.625)
+    Subquery Scan (x)  (rows=435, time=7339.685)
+      SetOp  (rows=435, time=7339.356)
+        Append  (rows=20505, time=7337.519)
+          Result  (rows=436, time=6176.749)
+            SetOp  (rows=436, time=6176.728)
+              Append  (rows=116507, time=6169.443)
+                Subquery Scan (*SELECT* 2)  (rows=59725, time=2049.368)
+                  Merge Join  (rows=59725, time=2047.056)
+                    Sort  (rows=787551, time=2020.978)
+                      Hash Join  (rows=787633, time=1893.217)
+                        CTE Scan (fd_1)  (rows=1096, time=0.296)
+                        Hash  (rows=1715464, time=1802.719)
+                          Seq Scan on catalog_sales (cs)  (rows=1719880, time=1660.695)
+                    Sort  (rows=60680, time=1.824)
+                      CTE Scan (fi_2)  (rows=4750, time=0.215)
+                Subquery Scan (*SELECT* 1)  (rows=56782, time=4116.248)
+                  CTE Scan (prefactored_sales)  (rows=56782, time=4113.784)
+          Subquery Scan (*SELECT* 3)  (rows=20069, time=1160.067)
+            Merge Join  (rows=20069, time=1159.185)
+              Sort  (rows=840197, time=1133.282)
+                Hash Join  (rows=840289, time=1006.576)
+                  CTE Scan (fd_2)  (rows=1096, time=0.05)
+                  Hash  (rows=1445967, time=936.246)
+                    Seq Scan on web_sales (ws)  (rows=1446129, time=819.104)
+              Sort  (rows=20958, time=1.012)
+                CTE Scan (fi_3)  (rows=4750, time=0.182)
+    Hash  (rows=4745, time=19.112)
+      CTE Scan (fi_1)  (rows=4750, time=18.616)
+  Aggregate  (rows=1, time=3043.783)
+    Append  (rows=1684704, time=2873.223)
+      CTE Scan (prefactored_sales_1)  (rows=56782, time=2.831)
+      Hash Join  (rows=787633, time=1838.207)
+        CTE Scan (fd_3)  (rows=1096, time=0.048)
+        Hash  (rows=1715464, time=1725.244)
+          Seq Scan on catalog_sales (cs_1)  (rows=1719880, time=1575.422)
+      Hash Join  (rows=840289, time=979.388)
+        CTE Scan (fd_4)  (rows=1096, time=0.052)
+        Hash  (rows=1445967, time=905.109)
+          Seq Scan on web_sales (ws_1)  (rows=1446129, time=787.873)
+  Sort  (rows=53, time=34970.819)
+    Merge Join  (rows=53, time=34970.784)
+      Aggregate  (rows=189, time=22813.719)
+        Index Scan on date_dim (date_dim_1)  (rows=1, time=0.036)
+        CTE Scan (avg_sales)  (rows=1, time=3043.781)
+        Sort  (rows=745, time=19769.753)
+          Nested Loop  (rows=751, time=19768.505)
+            CTE Scan (ci)  (rows=4735, time=7367.437)
+            CTE Scan (ps)  (rows=753, time=2.594)
+      Aggregate  (rows=86, time=12157.046)
+        Index Scan on date_dim (date_dim_2)  (rows=1, time=0.02)
+        CTE Scan (avg_sales_1)  (rows=1, time=0.001)
+        Sort  (rows=274, time=12156.95)
+          Nested Loop  (rows=274, time=12156.171)
+            CTE Scan (ci_1)  (rows=4735, time=1.8)
+            CTE Scan (ps_1)  (rows=275, time=2.556)
+```
+
+### W2: scan_consolidation_pivot → 0.0x [ERROR]
+- **Examples**: single_pass_aggregation, scan_consolidation_pivot
+- **Transforms**: single_pass_aggregation
+- **Approach**: - single_pass_aggregation: Combine both year scans into one with d_year filter, 
+- **Error**: Row count mismatch: original=55, optimized=9
+- **Optimized SQL:**
+```sql
+WITH cross_items AS (select i_item_sk ss_item_sk from item, (select iss.i_brand_id brand_id, iss.i_class_id class_id, iss.i_category_id category_id from store_sales, item iss, date_dim d1 where ss_item_sk = iss.i_item_sk and ss_sold_date_sk = d1.d_date_sk and d1.d_year between 1999 AND 1999 + 2 and i_category IN ('Electronics', 'Shoes', 'Sports') and i_manager_id BETWEEN 42 and 51 and ss_wholesale_cost BETWEEN 76 AND 96 intersect select ics.i_brand_id, ics.i_class_id, ics.i_category_id from catalog_sales, item ics, date_dim d2 where cs_item_sk = ics.i_item_sk and cs_sold_date_sk = d2.d_date_sk and d2.d_year between 1999 AND 1999 + 2 and i_category IN ('Electronics', 'Shoes', 'Sports') and i_manager_id BETWEEN 42 and 51 and cs_wholesale_cost BETWEEN 76 AND 96 intersect select iws.i_brand_id, iws.i_class_id, iws.i_category_id from web_sales, item iws, date_dim d3 where ws_item_sk = iws.i_item_sk and ws_sold_date_sk = d3.d_date_sk and ws_wholesale_cost BETWEEN 76 AND 96 and d3.d_year between 1999 AND 1999 + 2) x where i_brand_id = brand_id and i_class_id = class_id and i_category_id = category_id and i_category IN ('Electronics', 'Shoes', 'Sports') and i_manager_id BETWEEN 42 and 51), avg_sales AS (select avg(quantity*list_price) average_sales from (select ss_quantity quantity, ss_list_price list_price from store_sales, date_dim where ss_sold_date_sk = d_date_sk and d_year between 1999 and 1999 + 2 and ss_wholesale_cost BETWEEN 76 AND 96 union all select cs_quantity quantity, cs_list_price list_price from catalog_sales, date_dim where cs_sold_date_sk = d_date_sk and d_year between 1999 and 1999 + 2 and cs_wholesale_cost BETWEEN 76 AND 96 union all select ws_quantity quantity, ws_list_price list_price from web_sales, date_dim where ws_sold_date_sk = d_date_sk and ws_wholesale_cost BETWEEN 76 AND 96 and d_year between 1999 and 1999 + 2) x), combined_years AS (SELECT i.i_brand_id, i.i_class_id, i.i_category_id, d.d_year, ss.ss_quantity * ss.ss_list_price AS sales_amount, ss.ss_quantity, ss.ss_list_price, d.d_week_seq FROM store_sales ss JOIN item i ON ss.ss_item_sk = i.i_item_sk JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk JOIN cross_items ci ON ss.ss_item_sk = ci.ss_item_sk WHERE i.i_category IN ('Electronics', 'Shoes', 'Sports') AND i.i_manager_id BETWEEN 42 AND 51 AND ss.ss_wholesale_cost BETWEEN 76 AND 96 AND d.d_year IN (1999, 2000) AND d.d_moy = 12 AND d.d_dom = 12), pivot_aggregation AS (SELECT i_brand_id, i_class_id, i_category_id, d_year, SUM(sales_amount) AS sales, COUNT(*) AS number_sales FROM combined_years GROUP BY i_brand_id, i_class_id, i_category_id, d_year HAVING SUM(sales_amount) > (SELECT average_sales FROM avg_sales)) SELECT 'store' AS ty_channel, ty.i_brand_id AS ty_brand, ty.i_class_id AS ty_class, ty.i_category_id AS ty_category, ty.sales AS ty_sales, ty.number_sales AS ty_number_sales, 'store' AS ly_channel, ly.i_brand_id AS ly_brand, ly.i_class_id AS ly_class, ly.i_category_id AS ly_category, ly.sales AS ly_sales, ly.number_sales AS ly_number_sales FROM (SELECT * FROM pivot_aggregation WHERE d_year = 2000) ty INNER JOIN (SELECT * FROM pivot_aggregation WHERE d_year = 1999) ly ON ty.i_brand_id = ly.i_brand_id AND ty.i_class_id = ly.i_class_id AND ty.i_category_id = ly.i_category_id ORDER BY ty_channel, ty_brand, ty_class, ty_category LIMIT 100
+```
+- **Execution Plan (EXPLAIN estimate — query errored):**
+```
+[EXPLAIN estimate — query errored at execution]
+Limit  (cost=2400007.60..2400007.60 rows=1 width=168)
+  CTE pivot_aggregation
+    ->  GroupAggregate  (cost=1199515.46..2400007.52 rows=1 width=56)
+          Group Key: i.i_brand_id, i.i_class_id, i.i_category_id, d.d_year
+          Filter: (sum(((ss.ss_quantity)::numeric * ss.ss_list_price)) > $4)
+          InitPlan 1 (returns $4)
+            ->  Finalize Aggregate  (cost=1187418.09..1187418.10 rows=1 width=32)
+                  ->  Gather  (cost=1187417.86..1187418.07 rows=2 width=32)
+                        Workers Planned: 2
+                        ->  Partial Aggregate  (cost=1186417.86..1186417.87 rows=1 width=32)
+                              ->  Parallel Append  (cost=0.73..1185353.21 rows=141954 width=10)
+                                    ->  Nested Loop  (cost=0.85..514070.97 rows=33521 width=10)
+                                          ->  Parallel Index Only Scan using _dta_index_date_dim_6_661577395__k1_k7_k9 on date_dim  (cost=0.29..1864.70 rows=592 width=4)
+                                                Index Cond: ((d_year >= 1999) AND (d_year <= 2001))
+                                          ->  Index Only Scan using _dta_index_store_sales_6_1333579789__k1_k23_k14_k6_k8_k5_k7_3_4 on store_sales  (cost=0.56..845.10 rows=2011 width=14)
+                                                Index Cond: (ss_sold_date_sk = date_dim.d_date_sk)
+                                                Filter: ((ss_wholesale_cost >= '76'::numeric) AND (ss_wholesale_cost <= '96'::numeric))
+                                    ->  Nested Loop  (cost=0.73..437498.88 rows=14136 width=10)
+                                          ->  Parallel Index Only Scan using _dta_index_date_dim_6_661577395__k1_k7_k9 on date_dim date_dim_1  (cost=0.29..1864.70 rows=592 width=4)
+                                                Index Cond: ((d_year >= 1999) AND (d_year <= 2001))
+                                          ->  Index Scan using _dta_index_catalog_sales_6_1301579675__k1_4 on catalog_sales  (cost=0.43..727.67 rows=820 width=14)
+                                                Index Cond: (cs_sold_date_sk = date_dim_1.d_date_sk)
+                                                Filter: ((cs_wholesale_cost >= '76'::numeric) AND (cs_wholesale_cost <= '96'::numeric))
+                                    ->  Nested Loop  (cost=0.72..231654.04 rows=11490 width=10)
+                                          ->  Parallel Index Only Scan using _dta_index_date_dim_6_661577395__k1_k7_k9 on date_dim date_dim_2  (cost=0.29..1864.70 rows=592 width=4)
+                                                Index Cond: ((d_year >= 1999) AND (d_year <= 2001))
+                                          ->  Index Scan using _dta_index_web_sales_6_1269579561__k1_8_24 on web_sales  (cost=0.43..381.47 rows=669 width=14)
+                                                Index Cond: (ws_sold_date_sk = date_dim_2.d_date_sk)
+                                                Filter: ((ws_wholesale_cost >= '76'::numeric) AND (ws_wholesale_cost <= '96'::numeric))
+          ->  Nested Loop  (cost=12097.35..1212589.38 rows=1 width=26)
+                Join Filter: ((item.i_brand_id = x_1.brand_id) AND (item.i_class_id = x_1.class_id) AND (item.i_category_id = x_1.category_id))
+                ->  Nested Loop  (cost=11096.32..11098.44 rows=1 width=38)
+                      ->  Gather Merge  (cost=11096.03..11096.61 rows=5 width=34)
+                            Workers Planned: 2
+                            ->  Sort  (cost=10096.01..10096.01 rows=2 width=34)
+                                  Sort Key: i.i_brand_id, i.i_class_id, i.i_category_id, d.d_year
+                                  ->  Merge Join  (cost=10085.54..10096.00 rows=2 width=34)
+                                        Merge Cond: (i.i_item_sk = ss.ss_item_sk)
+                                        ->  Sort  (cost=7874.92..7879.86 rows=1974 width=16)
+                                              Sort Key: i.i_item_sk
+                                              ->  Parallel Seq Scan on item i  (cost=0.00..7766.88 rows=1974 width=16)
+                                                    Filter: ((i_manager_id >= 42) AND (i_manager_id <= 51) AND (i_category = ANY ('{Electronics,Shoes,Sports}'::bpchar[])))
+                                        ->  Sort  (cost=2210.62..2210.90 rows=113 width=18)
+                                              Sort Key: ss.ss_item_sk
+                                              ->  Nested Loop  (cost=0.85..2206.77 rows=113 width=18)
+                                                    ->  Index Scan using _dta_index_date_dim_6_661577395__k7_k9 on date_dim d  (cost=0.29..116.00 rows=2 width=8)
+                                                          Index Cond: ((d_year = ANY ('{1999,2000}'::integer[])) AND (d_moy = 12))
+                                                          Filter: (d_dom = 12)
+                                                    ->  Index Only Scan using _dta_index_store_sales_6_1333579789__k1_k23_k14_k6_k8_k5_k7_3_4 on store_sales ss  (cost=0.56..1025.27 rows=2011 width=18)
+                                                          Index Cond: (ss_sold_date_sk = d.d_date_sk)
+                                                          Filter: ((ss_wholesale_cost >= '76'::numeric) AND (ss_wholesale_cost <= '96'::numeric))
+                      ->  Index Scan using item_pkey on item  (cost=0.29..0.37 rows=1 width=16)
+                            Index Cond: (i_item_sk = ss.ss_item_sk)
+                            Filter: ((i_manager_id >= 42) AND (i_manager_id <= 51) AND (i_category = ANY ('{Electronics,Shoes,Sports}'::bpchar[])))
+                ->  Subquery Scan on x_1  (cost=1001.03..1201463.36 rows=1576 width=12)
+                      ->  HashSetOp Intersect  (cost=1001.03..1201447.60 rows=1576 width=16)
+                            ->  Append  (cost=1001.03..1201228.95 rows=29153 width=16)
+                                  ->  Result  (cost=1001.03..961902.26 rows=1576 width=16)
+                                        ->  HashSetOp Intersect  (cost=1001.03..961886.50 rows=1576 width=16)
+                                              ->  Append  (cost=1001.03..961846.66 rows=5312 width=16)
+                                                    ->  Subquery Scan on "*SELECT* 2"  (cost=1001.03..442324.42 rows=1576 width=16)
+                                                          ->  Gather  (cost=1001.03..442308.66 rows=1576 width=12)
+                                                                Workers Planned: 2
+                                                                ->  Nested Loop  (cost=1.03..441151.06 rows=657 width=12)
+                                                                      ->  Nested Loop  (cost=0.73..437498.88 rows=14136 width=4)
+                                                                            ->  Parallel Index Only Scan using _dta_index_date_dim_6_661577395__k1_k7_k9 on date_dim d2  (cost=0.29..1864.70 rows=592 width=4)
+                                                                                  Index Cond: ((d_year >= 1999) AND (d_year <= 2001))
+                                                                            ->  Index Scan using _dta_index_catalog_sales_6_1301579675__k1_4 on catalog_sales catalog_sales_1  (cost=0.43..727.67 rows=820 width=8)
+                                                                                  Index Cond: (cs_sold_date_sk = d2.d_date_sk)
+                                                                                  Filter: ((cs_wholesale_cost >= '76'::numeric) AND (cs_wholesale_cost <= '96'::numeric))
+                                                                      ->  Memoize  (cost=0.30..0.35 rows=1 width=16)
+                                                                            Cache Key: catalog_sales_1.cs_item_sk
+                                                                            Cache Mode: logical
+                                                                            ->  Index Scan using item_pkey on item ics  (cost=0.29..0.34 rows=1 width=16)
+                                                                                  Index Cond: (i_item_sk = catalog_sales_1.cs_item_sk)
+                                                                                  Filter: ((i_manager_id >= 42) AND (i_manager_id <= 51) AND (i_category = ANY ('{Electronics,Shoes,Sports}'::bpchar[])))
+                                                    ->  Subquery Scan on "*SELECT* 1"  (cost=1001.16..519495.68 rows=3736 width=16)
+                                                          ->  Gather  (cost=1001.16..519458.32 rows=3736 width=12)
+                                                                Workers Planned: 2
+... (36 more lines truncated)
+```
+
+### W4: intersect_to_exists_materialized → 0.0x [ERROR]
+- **Examples**: intersect_to_exists, pg_dimension_prefetch_star
+- **Transforms**: intersect_to_exists
+- **Approach**: - intersect_to_exists: Replace INTERSECT with EXISTS subqueries; ensure each bra
+- **Error**: DID_NOT_FINISH: slower than original
+- **Optimized SQL:**
+```sql
+WITH filtered_dates AS (SELECT d_date_sk FROM date_dim WHERE d_year BETWEEN 1999 AND 2001), filtered_items AS (SELECT i_item_sk, i_brand_id, i_class_id, i_category_id FROM item WHERE i_category IN ('Electronics', 'Shoes', 'Sports') AND i_manager_id BETWEEN 42 AND 51), store_branch AS (SELECT s.i_brand_id, s.i_class_id, s.i_category_id FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN filtered_items s ON ss_item_sk = s.i_item_sk WHERE ss_wholesale_cost BETWEEN 76 AND 96), catalog_branch AS (SELECT c.i_brand_id, c.i_class_id, c.i_category_id FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN filtered_items c ON cs_item_sk = c.i_item_sk WHERE cs_wholesale_cost BETWEEN 76 AND 96), web_branch AS (SELECT w.i_brand_id, w.i_class_id, w.i_category_id FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk JOIN filtered_items w ON ws_item_sk = w.i_item_sk WHERE ws_wholesale_cost BETWEEN 76 AND 96), cross_items_exists AS (SELECT i_item_sk AS ss_item_sk FROM filtered_items i WHERE EXISTS (SELECT 1 FROM store_branch s WHERE s.i_brand_id = i.i_brand_id AND s.i_class_id = i.i_class_id AND s.i_category_id = i.i_category_id) AND EXISTS (SELECT 1 FROM catalog_branch c WHERE c.i_brand_id = i.i_brand_id AND c.i_class_id = i.i_class_id AND c.i_category_id = i.i_category_id) AND EXISTS (SELECT 1 FROM web_branch w WHERE w.i_brand_id = i.i_brand_id AND w.i_class_id = i.i_class_id AND w.i_category_id = i.i_category_id)), avg_sales AS (SELECT AVG(quantity * list_price) AS average_sales FROM (SELECT ss_quantity AS quantity, ss_list_price AS list_price FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk WHERE ss_wholesale_cost BETWEEN 76 AND 96 UNION ALL SELECT cs_quantity AS quantity, cs_list_price AS list_price FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk WHERE cs_wholesale_cost BETWEEN 76 AND 96 UNION ALL SELECT ws_quantity AS quantity, ws_list_price AS list_price FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk WHERE ws_wholesale_cost BETWEEN 76 AND 96) x) SELECT this_year.channel AS ty_channel, this_year.i_brand_id AS ty_brand, this_year.i_class_id AS ty_class, this_year.i_category_id AS ty_category, this_year.sales AS ty_sales, this_year.number_sales AS ty_number_sales, last_year.channel AS ly_channel, last_year.i_brand_id AS ly_brand, last_year.i_class_id AS ly_class, last_year.i_category_id AS ly_category, last_year.sales AS ly_sales, last_year.number_sales AS ly_number_sales FROM (SELECT 'store' AS channel, i.i_brand_id, i.i_class_id, i.i_category_id, SUM(ss_quantity * ss_list_price) AS sales, COUNT(*) AS number_sales FROM store_sales JOIN filtered_items i ON ss_item_sk = i.i_item_sk JOIN date_dim ON ss_sold_date_sk = d_date_sk WHERE ss_item_sk IN (SELECT ss_item_sk FROM cross_items_exists) AND d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_year = 1999 + 1 AND d_moy = 12 AND d_dom = 12) AND ss_wholesale_cost BETWEEN 76 AND 96 GROUP BY i.i_brand_id, i.i_class_id, i.i_category_id HAVING SUM(ss_quantity * ss_list_price) > (SELECT average_sales FROM avg_sales)) this_year INNER JOIN (SELECT 'store' AS channel, i.i_brand_id, i.i_class_id, i.i_category_id, SUM(ss_quantity * ss_list_price) AS sales, COUNT(*) AS number_sales FROM store_sales JOIN filtered_items i ON ss_item_sk = i.i_item_sk JOIN date_dim ON ss_sold_date_sk = d_date_sk WHERE ss_item_sk IN (SELECT ss_item_sk FROM cross_items_exists) AND d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_year = 1999 AND d_moy = 12 AND d_dom = 12) AND ss_wholesale_cost BETWEEN 76 AND 96 GROUP BY i.i_brand_id, i.i_class_id, i.i_category_id HAVING SUM(ss_quantity * ss_list_price) > (SELECT average_sales FROM avg_sales)) last_year ON this_year.i_brand_id = last_year.i_brand_id AND this_year.i_class_id = last_year.i_class_id AND this_year.i_category_id = last_year.i_category_id ORDER BY this_year.channel, this_year.i_brand_id, this_year.i_class_id, this_year.i_category_id LIMIT 100
+```
+- **Execution Plan (EXPLAIN ANALYZE):**
+```
+Limit  (rows=55, time=13670.587)
+  Index Only Scan on date_dim (date_dim_2)  (rows=1096, time=0.184)
+  Seq Scan on item  (rows=4750, time=18.218)
+  Hash Join  (rows=4735, time=6949.607)
+    Merge Join  (rows=4736, time=5804.718)
+      Merge Join  (rows=4736, time=2002.906)
+        Sort  (rows=4747, time=0.838)
+          CTE Scan (i_2)  (rows=4750, time=0.134)
+        Sort  (rows=434, time=2001.441)
+          Aggregate  (rows=436, time=2001.363)
+            Merge Join  (rows=59725, time=1997.641)
+              Sort  (rows=787551, time=1971.389)
+                Hash Join  (rows=787633, time=1857.269)
+                  CTE Scan (filtered_dates_1)  (rows=1096, time=0.036)
+                  Hash  (rows=1715464, time=1782.193)
+                    Seq Scan on catalog_sales  (rows=1719880, time=1638.668)
+              Sort  (rows=60680, time=1.698)
+                CTE Scan (c)  (rows=4750, time=0.146)
+      Sort  (rows=435, time=3801.388)
+        Aggregate  (rows=437, time=3801.314)
+          Merge Join  (rows=56782, time=3797.128)
+            Sort  (rows=2395375, time=3727.507)
+              Hash Join  (rows=2395613, time=3311.746)
+                CTE Scan (filtered_dates)  (rows=1096, time=0.048)
+                Hash  (rows=4214895, time=3028.906)
+                  Seq Scan on store_sales (store_sales_2)  (rows=4317056, time=2713.061)
+            Sort  (rows=57562, time=1.637)
+              CTE Scan (s)  (rows=4750, time=0.14)
+    Hash  (rows=434, time=1144.287)
+      Aggregate  (rows=437, time=1144.258)
+        Merge Join  (rows=20069, time=1142.834)
+          Sort  (rows=840197, time=1099.615)
+            Hash Join  (rows=840289, time=972.3)
+              CTE Scan (filtered_dates_2)  (rows=1096, time=0.281)
+              Hash  (rows=1445967, time=899.331)
+                Seq Scan on web_sales  (rows=1446129, time=789.674)
+          Sort  (rows=20958, time=19.72)
+            CTE Scan (w)  (rows=4750, time=18.903)
+  Aggregate  (rows=1, time=6622.503)
+    Append  (rows=4023535, time=6222.4)
+      Hash Join  (rows=2395613, time=3275.369)
+        CTE Scan (filtered_dates_3)  (rows=1096, time=0.043)
+        Hash  (rows=4214895, time=3062.519)
+          Seq Scan on store_sales (store_sales_3)  (rows=4317056, time=2717.394)
+      Hash Join  (rows=787633, time=1839.138)
+        CTE Scan (filtered_dates_4)  (rows=1096, time=0.042)
+        Hash  (rows=1715464, time=1732.234)
+          Seq Scan on catalog_sales (catalog_sales_1)  (rows=1719880, time=1579.997)
+      Hash Join  (rows=840289, time=982.046)
+        CTE Scan (filtered_dates_5)  (rows=1096, time=0.038)
+        Hash  (rows=1445967, time=897.181)
+          Seq Scan on web_sales (web_sales_1)  (rows=1446129, time=781.63)
+  Sort  (rows=55, time=13670.551)
+    Nested Loop  (rows=55, time=13670.515)
+      Aggregate  (rows=194, time=13619.315)
+        Index Scan on date_dim (date_dim_3)  (rows=1, time=0.023)
+        CTE Scan (avg_sales)  (rows=1, time=6622.499)
+        Sort  (rows=751, time=6996.593)
+          Hash Join  (rows=751, time=6996.424)
+            CTE Scan (i)  (rows=4750, time=0.172)
+            Hash  (rows=751, time=6996.003)
+              Nested Loop  (rows=751, time=6995.886)
+                Seq Scan on date_dim  (rows=7, time=6.265)
+                Nested Loop  (rows=107, time=998.508)
+                  Aggregate  (rows=4735, time=993.253)
+                    CTE Scan (cross_items_exists)  (rows=4735, time=6950.021)
+                  Index Scan on store_sales  (rows=0, time=0.001)
+      Aggregate  (rows=78, time=0.262)
+        Index Scan on date_dim (date_dim_4)  (rows=1, time=0.034)
+        CTE Scan (avg_sales_1)  (rows=1, time=0.001)
+        Sort  (rows=244, time=0.198)
+          Hash Join  (rows=274, time=37.284)
+            CTE Scan (i_1)  (rows=4750, time=0.139)
+            Hash  (rows=274, time=36.96)
+              Nested Loop  (rows=274, time=36.897)
+                Seq Scan on date_dim (date_dim_1)  (rows=7, time=6.371)
+                Nested Loop  (rows=39, time=4.355)
+                  Aggregate  (rows=4735, time=0.372)
+                    CTE Scan (cross_items_exists_1)  (rows=4735, time=0.147)
+                  Index Scan on store_sales (store_sales_1)  (rows=0, time=0.001)
+```
+
+
+## Best Foundation SQL
+
+The best previous result. You may build on this or start fresh.
+
+```sql
+WITH cross_items AS (SELECT i_item_sk ss_item_sk FROM item, (SELECT iss.i_brand_id brand_id, iss.i_class_id class_id, iss.i_category_id category_id FROM store_sales, item iss, date_dim d1 WHERE ss_item_sk = iss.i_item_sk AND ss_sold_date_sk = d1.d_date_sk AND d1.d_year BETWEEN 1999 AND 1999 + 2 AND i_category IN ('Electronics', 'Shoes', 'Sports') AND i_manager_id BETWEEN 42 AND 51 AND ss_wholesale_cost BETWEEN 76 AND 96 INTERSECT SELECT ics.i_brand_id, ics.i_class_id, ics.i_category_id FROM catalog_sales, item ics, date_dim d2 WHERE cs_item_sk = ics.i_item_sk AND cs_sold_date_sk = d2.d_date_sk AND d2.d_year BETWEEN 1999 AND 1999 + 2 AND i_category IN ('Electronics', 'Shoes', 'Sports') AND i_manager_id BETWEEN 42 AND 51 AND cs_wholesale_cost BETWEEN 76 AND 96 INTERSECT SELECT iws.i_brand_id, iws.i_class_id, iws.i_category_id FROM web_sales, item iws, date_dim d3 WHERE ws_item_sk = iws.i_item_sk AND ws_sold_date_sk = d3.d_date_sk AND ws_wholesale_cost BETWEEN 76 AND 96 AND d3.d_year BETWEEN 1999 AND 1999 + 2) x WHERE i_brand_id = brand_id AND i_class_id = class_id AND i_category_id = category_id AND i_category IN ('Electronics', 'Shoes', 'Sports') AND i_manager_id BETWEEN 42 AND 51), avg_sales AS (SELECT AVG(quantity*list_price) average_sales FROM (SELECT ss_quantity quantity, ss_list_price list_price FROM store_sales, date_dim WHERE ss_sold_date_sk = d_date_sk AND d_year BETWEEN 1999 AND 1999 + 2 AND ss_wholesale_cost BETWEEN 76 AND 96 UNION ALL SELECT cs_quantity quantity, cs_list_price list_price FROM catalog_sales, date_dim WHERE cs_sold_date_sk = d_date_sk AND d_year BETWEEN 1999 AND 1999 + 2 AND cs_wholesale_cost BETWEEN 76 AND 96 UNION ALL SELECT ws_quantity quantity, ws_list_price list_price FROM web_sales, date_dim WHERE ws_sold_date_sk = d_date_sk AND ws_wholesale_cost BETWEEN 76 AND 96 AND d_year BETWEEN 1999 AND 1999 + 2) x), base_aggregation AS (SELECT i.i_brand_id, i.i_class_id, i.i_category_id, d.d_year, d.d_week_seq, ss.ss_quantity * ss.ss_list_price AS sales_amount, ss.ss_quantity, ss.ss_list_price FROM store_sales ss JOIN item i ON ss.ss_item_sk = i.i_item_sk JOIN date_dim d ON ss.ss_sold_date_sk = d.d_date_sk JOIN cross_items ci ON ss.ss_item_sk = ci.ss_item_sk WHERE i.i_category IN ('Electronics', 'Shoes', 'Sports') AND i.i_manager_id BETWEEN 42 AND 51 AND ss.ss_wholesale_cost BETWEEN 76 AND 96 AND d.d_year IN (1999, 2000)), year_split AS (SELECT i_brand_id, i_class_id, i_category_id, d_year, d_week_seq, SUM(sales_amount) AS sales, COUNT(*) AS number_sales FROM base_aggregation GROUP BY i_brand_id, i_class_id, i_category_id, d_year, d_week_seq HAVING SUM(sales_amount) > (SELECT average_sales FROM avg_sales)) SELECT 'store' AS ty_channel, ty.i_brand_id AS ty_brand, ty.i_class_id AS ty_class, ty.i_category_id AS ty_category, ty.sales AS ty_sales, ty.number_sales AS ty_number_sales, 'store' AS ly_channel, ly.i_brand_id AS ly_brand, ly.i_class_id AS ly_class, ly.i_category_id AS ly_category, ly.sales AS ly_sales, ly.number_sales AS ly_number_sales FROM (SELECT * FROM year_split WHERE d_year = 2000 AND d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 12 AND d_dom = 12)) ty JOIN (SELECT * FROM year_split WHERE d_year = 1999 AND d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_year = 1999 AND d_moy = 12 AND d_dom = 12)) ly ON ty.i_brand_id = ly.i_brand_id AND ty.i_class_id = ly.i_class_id AND ty.i_category_id = ly.i_category_id ORDER BY ty_channel, ty_brand, ty_class, ty_category LIMIT 100
+```
+
+## Original Execution Plan (EXPLAIN ANALYZE)
+
+Compare each candidate's plan (above) against this baseline.
+
+```
+Total execution time: 11483.1ms
+Planning time: 2.5ms
+
+-> Limit  (rows=55 loops=1 time=11483.1ms)
+  -> Hash Join Inner  (rows=4,735 loops=1 time=4785.2ms)
+     Hash Cond: ((item_2.i_brand_id = x.brand_id) AND (item_2.i_class_id = x.class_id) AND (item_2.i_category_id ...
+    -> Seq Scan on item item_2  (rows=4,750 loops=1 time=25.5ms)
+       Filter: ((i_manager_id >= 42) AND (i_manager_id <= 51) AND (i_category = ANY ('{Electronics,Shoes,Sports}...
+       Rows Removed by Filter: 97K
+    -> Hash  (rows=432 loops=1 time=4758.8ms)
+      -> Subquery Scan x  (rows=435 loops=1 time=4758.8ms)
+        -> SetOp  (rows=435 loops=1 time=4758.8ms)
+          -> Append  (rows=841K loops=1 time=4667.7ms)
+            -> Result  (rows=436 loops=1 time=3445.5ms)
+              -> SetOp  (rows=436 loops=1 time=3445.5ms)
+                -> Append  (rows=117K loops=1 time=3416.8ms)
+                  -> Subquery Scan *SELECT* 2  (rows=60K loops=1 time=1278.1ms)
+                    -> Gather  (rows=60K loops=1 time=1271.8ms)
+                       Workers: 2/2 launched
+                      -> Nested Loop Inner  (rows=20K loops=3 time=1063.0ms)
+                        -> Nested Loop Inner  (rows=263K loops=3 time=567.3ms)
+                          -> Index Only Scan on date_dim d2  (rows=365 loops=3 time=0.9ms)
+                             Index Cond: ((d_year >= 1999) AND (d_year <= 2001))
+                          -> Index Scan on catalog_sales  (rows=719 loops=1096 time=1.5ms)
+                             Filter: ((cs_wholesale_cost >= '76'::numeric) AND (cs_wholesale_cost <= '96'::numeric))
+                             Index Cond: (cs_sold_date_sk = d2.d_date_sk)
+                             Rows Removed by Filter: 5,291
+                        -> Index Scan on item ics  (rows=0 loops=787633 time=0.0ms)
+                           Filter: ((i_manager_id >= 42) AND (i_manager_id <= 51) AND (i_category = ANY ('{Electronics,Shoes,Sports}...
+                           Index Cond: (i_item_sk = catalog_sales.cs_item_sk)
+                           Rows Removed by Filter: 1
+                  -> Subquery Scan *SELECT* 1  (rows=57K loops=1 time=2131.6ms)
+                    -> Gather  (rows=57K loops=1 time=2126.0ms)
+                       Workers: 2/2 launched
+                      -> Nested Loop Inner  (rows=19K loops=3 time=1721.7ms)
+                        -> Nested Loop Inner  (rows=799K loops=3 time=1113.3ms)
+                          -> Index Only Scan on date_dim d1  (rows=365 loops=3 time=0.9ms)
+                             Index Cond: ((d_year >= 1999) AND (d_year <= 2001))
+                          -> Index Only Scan on store_sales store_sales_2  (rows=2,186 loops=1096 time=2.9ms)
+                             Filter: ((ss_wholesale_cost >= '76'::numeric) AND (ss_wholesale_cost <= '96'::numeric))
+                             Index Cond: (ss_sold_date_sk = d1.d_date_sk)
+                             Rows Removed by Filter: 12K
+                        -> Memoize  (rows=0 loops=2395613 time=0.0ms)
+                          -> Index Scan on item iss  (rows=0 loops=223326 time=0.0ms)
+                             Filter: ((i_manager_id >= 42) AND (i_manager_id <= 51) AND (i_category = ANY ('{Electronics,Shoes,Sports}...
+                             Index Cond: (i_item_sk = store_sales_2.ss_item_sk)
+                             Rows Removed by Filter: 1
+            -> Subquery Scan *SELECT* 3  (rows=840K loops=1 time=1176.5ms)
+              -> Gather  (rows=840K loops=1 time=1101.2ms)
+                 Workers: 2/2 launched
+                -> Nested Loop Inner  (rows=280K loops=3 time=943.4ms)
+                  -> Nested Loop Inner  (rows=280K loops=3 time=425.3ms)
+                    -> Index Only Scan on date_dim d3  (rows=365 loops=3 time=0.8ms)
+                       Index Cond: ((d_year >= 1999) AND (d_year <= 2001))
+                    -> Index Scan on web_sales  (rows=767 loops=1096 time=1.1ms)
+                       Filter: ((ws_wholesale_cost >= '76'::numeric) AND (ws_wholesale_cost <= '96'::numeric))
+                       Index Cond: (ws_sold_date_sk = d3.d_date_sk)
+                       Rows Removed by Filter: 3,045
+                  -> Index Scan on item iws  (rows=1 loops=840289 time=0.0ms)
+                     Index Cond: (i_item_sk = web_sales.ws_item_sk)
+  -> Aggregate  (rows=1 loops=1 time=2726.9ms)
+    -> Gather  (rows=3 loops=1 time=2726.9ms)
+       Workers: 2/2 launched
+      -> Aggregate  (rows=1 loops=3 time=2453.5ms)
+        -> Append  (rows=1.3M loops=3 time=2177.0ms)
+          -> Nested Loop Inner  (rows=799K loops=3 time=1150.3ms)
+            -> Index Only Scan on date_dim date_dim_2  (rows=365 loops=3 time=0.8ms)
+               Index Cond: ((d_year >= 1999) AND (d_year <= 2001))
+            -> Index Only Scan on store_sales store_sales_3  (rows=2,186 loops=1096 time=3.0ms)
+               Filter: ((ss_wholesale_cost >= '76'::numeric) AND (ss_wholesale_cost <= '96'::numeric))
+               Index Cond: (ss_sold_date_sk = date_dim_2.d_date_sk)
+               Rows Removed by Filter: 12K
+          -> Nested Loop Inner  (rows=394K loops=2 time=855.4ms)
+            -> Index Only Scan on date_dim date_dim_3  (rows=548 loops=2 time=1.1ms)
+               Index Cond: ((d_year >= 1999) AND (d_year <= 2001))
+            -> Index Scan on catalog_sales catalog_sales_1  (rows=719 loops=1096 time=1.5ms)
+               Filter: ((cs_wholesale_cost >= '76'::numeric) AND (cs_wholesale_cost <= '96'::numeric))
+               Index Cond: (cs_sold_date_sk = date_dim_3.d_date_sk)
+               Rows Removed by Filter: 5,291
+          -> Nested Loop Inner  (rows=840K loops=1 time=1156.5ms)
+... (62 more lines truncated)
+```
+
+## Semantic Contract (MUST preserve)
+
+This query compares store channel sales for items that sold across all three channels (store, catalog, web) in consecutive years (1999 vs 2000) for the same week (week 49-50). It filters to Electronics/Shoes/Sports categories, manager_id 42-51, and wholesale_cost 76-96. JOIN semantics are strict INNER intersections: items must appear in all three sales channels (INTERSECT), and year comparisons require matching brand/class/category. Aggregation uses SUM and COUNT which are duplicate-insensitive, but AVG in the threshold CTE must preserve exact row sets from the UNION ALL branches. Filter dependencies: date_dim filters for specific years and week_seq must remain correlated to their respective year subqueries.
+
+## Bottleneck Diagnosis
+
+The query is join-bound with excessive nested loops (16x) due to index-driven plans. The cross_items CTE (41% runtime) performs three large fact table scans with severe filtering (2,186 rows per date → 0-1 after item join). The main query's nested loop join between this_year and last_year executes the last_year subquery 194 times (2.1s). The optimizer already materializes CTEs effectively (cross_items scanned once, reused). Logical-tree costs are misleading: cross_items shows 0% cost but consumes 4.76s; main_query shows 71% cost but includes CTE execution time.
+
+## Engine Profile
+
+*This is field intelligence gathered from 53 DSB queries at SF5-SF10. PostgreSQL is a fundamentally different optimizer than DuckDB — it has bitmap index scans, JIT compilation, and aggressive CTE materialization. Techniques that work on DuckDB often regress here. Use this to guide your analysis but apply your own judgment — every query is different. Add to this knowledge if you observe something new.*
+
+### Optimizer Strengths (DO NOT fight these)
+- **BITMAP_OR_SCAN**: Multi-branch OR conditions on indexed columns are handled via BitmapOr — a single fact table scan with bitmap combination. Extremely efficient.
+- **SEMI_JOIN_EXISTS**: EXISTS/NOT EXISTS uses semi-join with early termination. Stops scanning after the first match per outer row.
+- **INNER_JOIN_REORDERING**: PostgreSQL freely reorders INNER JOINs based on estimated selectivity. The cost model works well for explicit JOIN...ON syntax.
+- **INDEX_ONLY_SCAN**: When an index covers all requested columns, PostgreSQL reads only the index without touching the heap.
+- **PARALLEL_QUERY_EXECUTION**: PostgreSQL parallelizes large scans and aggregations across worker processes with partial aggregation finalization.
+- **JIT_COMPILATION**: PostgreSQL JIT-compiles complex expressions and tuple deforming for long-running queries.
+
+### Optimizer Gaps (opportunities)
+- **COMMA_JOIN_WEAKNESS**: Implicit comma-separated FROM tables (FROM t1, t2, t3 WHERE t1.id = t2.id) are treated as cross products initially. The cost model is significantly weaker on comma-joins than on explicit JOIN...ON syntax.
+  Opportunity: Convert comma-joins to explicit JOIN...ON syntax. This alone can unlock 2-3x improvements. Best when combined with date_cte_isolate.
+    + Q080: 3.32x — comma-joins to explicit JOINs + date CTE on multi-channel UNION query
+    + Q099: 2.28x — same pattern on star schema
+    + Q054: 1.14x — JOIN conversion alone
+- **CORRELATED_SUBQUERY_PARALYSIS**: Cannot automatically decorrelate complex correlated subqueries. Correlated scalar subqueries with aggregates are executed as nested-loop with repeated evaluation.
+  Opportunity: Convert correlated WHERE to explicit CTE with GROUP BY + JOIN.
+    + Q092: 4428x — timeout recovery. Unbounded correlated subquery converted to explicit JOIN.
+    + Q032: 391x — same pattern, timeout to sub-second.
+- **NON_EQUI_JOIN_INPUT_BLINDNESS**: Cannot pre-filter fact tables before non-equi join operations (date arithmetic, range comparisons, quantity < quantity). Non-equi joins fall back to nested-loop, which is O(N*M).
+  Opportunity: Reduce fact table input size via filtered CTE before the non-equi join.
+    + Q072: 2.68x — pre-filtered catalog_sales by wholesale_cost range before non-equi quantity comparison with inventory. Reduced nested-loop input by ~70%.
+- **CTE_MATERIALIZATION_FENCE**: PostgreSQL materializes CTEs by default (multi-referenced) or by choice (AS MATERIALIZED). This creates a hard optimization fence — no predicate pushdown from outer query into CTE. This makes CTE-based strategies a double-edged sword on PG.
+  Opportunity: Use materialization STRATEGICALLY: materialize when the CTE is expensive and reused multiple times. Avoid CTEs that fence off predicate pushdown for single-use cases.
+    + Q065: 1.95x — strategic materialization prevented redundant fact table scan multiplication
+- **CROSS_CTE_PREDICATE_BLINDNESS**: Same gap as DuckDB but WORSE on PostgreSQL because CTE materialization fence makes it more impactful. Predicates in the outer WHERE cannot propagate into materialized CTEs.
+  Opportunity: Same as DuckDB: pre-filter into CTE definition. But be more cautious — only when the CTE is clearly suboptimal.
+    + Q080: 3.32x — date filter + comma-join conversion (the combo is key)
+    + Q099: 2.28x — date CTE with explicit JOIN
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. pg_dimension_prefetch_star (3.32x)
+
+**Principle:** Multi-Dimension Prefetch (PG): pre-filter all selective dimensions into CTEs to create tiny hash tables, combined with explicit JOIN syntax. PostgreSQL's optimizer gets better cardinality estimates from pre-materialized small dimension results.
+
+**BEFORE (slow):**
+```sql
+with ssr as
+ (select  s_store_id as store_id,
+          sum(ss_ext_sales_price) as sales,
+          sum(coalesce(sr_return_amt, 0)) as returns,
+          sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit
+  from store_sales left outer join store_returns on
+         (ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number),
+     date_dim,
+     store,
+     item,
+     promotion
+ where ss_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+       and ss_store_sk = s_store_sk
+       and ss_item_sk = i_item_sk
+       and i_current_price > 50
+       and ss_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and ss_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+ group by s_store_id)
+ ,
+ csr as
+ (select  cp_catalog_page_id as catalog_page_id,
+          sum(cs_ext_sales_price) as sales,
+          sum(coalesce(cr_return_amount, 0)) as returns,
+          sum(cs_net_profit - coalesce(cr_net_loss, 0)) as profit
+  from catalog_sales left outer join catalog_returns on
+         (cs_item_sk = cr_item_sk and cs_order_number = cr_order_number),
+     date_dim,
+     catalog_page,
+     item,
+     promotion
+ where cs_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+        and cs_catalog_page_sk = cp_catalog_page_sk
+       and cs_item_sk = i_item_sk
+       and i_current_price > 50
+       and cs_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and cs_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+group by cp_catalog_page_id)
+ ,
+ wsr as
+ (select  web_site_id,
+          sum(ws_ext_sales_price) as sales,
+          sum(coalesce(wr_return_amt, 0)) as returns,
+          sum(ws_net_profit - coalesce(wr_net_loss, 0)) as profit
+  from web_sales left outer join web_returns on
+         (ws_item_sk = wr_item_sk and ws_order_number = wr_order_number),
+     date_dim,
+     web_site,
+     item,
+     promotion
+ where ws_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-23' as date)
+                  and cast('1998-08-23' as date) + interval '30 day'
+        and ws_web_site_sk = web_site_sk
+       and ws_item_sk = i_item_sk
+       and i_current_price > 50
+       and ws_promo_sk = p_promo_sk
+       and p_channel_email = 'Y'
+       and p_channel_tv = 'Y'
+       and p_channel_radio = 'N'
+       and p_channel_press = 'N'
+       and p_channel_event = 'Y'
+       and ws_wholesale_cost BETWEEN 63 AND 78
+       and i_category IN ('Jewelry', 'Music')
+group by web_site_id)
+  select  channel
+        , id
+        , sum(sales) as sales
+        , sum(returns) as returns
+        , sum(profit) as profit
+ from
+ (select 'store channel' as channel
+        , 'store' || store_id as id
+        , sales
+        , returns
+        , profit
+ from   ssr
+ union all
+ select 'catalog channel' as channel
+        , 'catalog_page' || catalog_page_id as id
+        , sales
+        , returns
+        , profit
+ from  csr
+ union all
+ select 'web channel' as channel
+        , 'web_site' || web_site_id as id
+        , sales
+        , returns
+        , profit
+ from   wsr
+ ) x
+ group by rollup (channel, id)
+ order by channel
+         ,id
+ limit 100;
+```
+
+**AFTER (fast):**
+[filtered_date]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-23' AS DATE) AND CAST('1998-08-23' AS DATE) + INTERVAL '30 DAY'
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk FROM item WHERE i_current_price > 50 AND i_category IN ('Jewelry', 'Music')
+```
+[filtered_promotion]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'Y' AND p_channel_tv = 'Y' AND p_channel_radio = 'N' AND p_channel_press = 'N' AND p_channel_event = 'Y'
+```
+[ssr]:
+```sql
+SELECT s_store_id AS store_id, SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS returns, SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit FROM store_sales LEFT OUTER JOIN store_returns ON (ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number) INNER JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk INNER JOIN store ON ss_store_sk = s_store_sk INNER JOIN filtered_item ON ss_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ss_promo_sk = filtered_promotion.p_promo_sk WHERE ss_wholesale_cost BETWEEN 63 AND 78 GROUP BY s_store_id
+```
+[csr]:
+```sql
+SELECT cp_catalog_page_id AS catalog_page_id, SUM(cs_ext_sales_price) AS sales, SUM(COALESCE(cr_return_amount, 0)) AS returns, SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit FROM catalog_sales LEFT OUTER JOIN catalog_returns ON (cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number) INNER JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk INNER JOIN catalog_page ON cs_catalog_page_sk = cp_catalog_page_sk INNER JOIN filtered_item ON cs_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON cs_promo_sk = filtered_promotion.p_promo_sk WHERE cs_wholesale_cost BETWEEN 63 AND 78 GROUP BY cp_catalog_page_id
+```
+[wsr]:
+```sql
+SELECT web_site_id, SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS returns, SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit FROM web_sales LEFT OUTER JOIN web_returns ON (ws_item_sk = wr_item_sk AND ws_order_number = wr_order_number) INNER JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk INNER JOIN web_site ON ws_web_site_sk = web_site_sk INNER JOIN filtered_item ON ws_item_sk = filtered_item.i_item_sk INNER JOIN filtered_promotion ON ws_promo_sk = filtered_promotion.p_promo_sk WHERE ws_wholesale_cost BETWEEN 63 AND 78 GROUP BY web_site_id
+```
+[main_query]:
+```sql
+SELECT channel, id, SUM(sales) AS sales, SUM(returns) AS returns, SUM(profit) AS profit FROM (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, returns, profit FROM ssr UNION ALL SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, returns, profit FROM csr UNION ALL SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, returns, profit FROM wsr) AS x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100
+```
+
+### 2. early_filter_decorrelate (1.13x)
+
+**Principle:** Early Selection + Decorrelation: push dimension filters into CTE definitions before materialization, and decorrelate correlated subqueries by pre-computing thresholds in separate CTEs. Filters reduce rows early; decorrelation replaces per-row subquery execution with a single pre-computed JOIN.
+
+**BEFORE (slow):**
+```sql
+WITH customer_total_return AS (
+  SELECT sr_customer_sk AS ctr_customer_sk,
+         sr_store_sk AS ctr_store_sk,
+         sr_reason_sk AS ctr_reason_sk,
+         SUM(SR_REFUNDED_CASH) AS ctr_total_return
+  FROM store_returns, date_dim
+  WHERE sr_returned_date_sk = d_date_sk
+    AND d_year = 2001
+    AND sr_return_amt / sr_return_quantity BETWEEN 236 AND 295
+  GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk
+)
+SELECT c_customer_id
+FROM customer_total_return ctr1, store, customer, customer_demographics
+WHERE ctr1.ctr_total_return > (
+    SELECT AVG(ctr_total_return) * 1.2
+    FROM customer_total_return ctr2
+    WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk
+  )
+  AND ctr1.ctr_reason_sk BETWEEN 28 AND 31
+  AND s_store_sk = ctr1.ctr_store_sk
+  AND s_state IN ('MI', 'NC', 'WI')
+  AND ctr1.ctr_customer_sk = c_customer_sk
+  AND c_current_cdemo_sk = cd_demo_sk
+  AND cd_marital_status IN ('W', 'W')
+  AND cd_education_status IN ('4 yr Degree', 'College')
+  AND cd_gender = 'M'
+  AND c_birth_month = 5
+  AND c_birth_year BETWEEN 1950 AND 1956
+ORDER BY c_customer_id
+LIMIT 100
+```
+
+**AFTER (fast):**
+```sql
+WITH customer_total_return AS (
+    SELECT sr_customer_sk AS ctr_customer_sk,
+           sr_store_sk AS ctr_store_sk,
+           sr_reason_sk AS ctr_reason_sk,
+           SUM(SR_REFUNDED_CASH) AS ctr_total_return
+    FROM store_returns
+    JOIN date_dim ON sr_returned_date_sk = d_date_sk
+    JOIN store ON sr_store_sk = s_store_sk
+    WHERE d_year = 2001
+      AND s_state IN ('MI', 'NC', 'WI')
+      AND sr_return_amt / sr_return_quantity BETWEEN 236 AND 295
+    GROUP BY sr_customer_sk, sr_store_sk, sr_reason_sk
+),
+store_thresholds AS (
+    SELECT ctr_store_sk,
+           AVG(ctr_total_return) * 1.2 AS avg_limit
+    FROM customer_total_return
+    GROUP BY ctr_store_sk
+)
+SELECT c_customer_id
+FROM customer_total_return ctr1
+JOIN store_thresholds st ON ctr1.ctr_store_sk = st.ctr_store_sk
+JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk
+JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk
+JOIN store s ON ctr1.ctr_store_sk = s.s_store_sk
+WHERE ctr1.ctr_total_return > st.avg_limit
+  AND ctr1.ctr_reason_sk BETWEEN 28 AND 31
+  AND s.s_state IN ('MI', 'NC', 'WI')
+  AND cd_marital_status = 'W'
+  AND cd_education_status IN ('4 yr Degree', 'College')
+  AND cd_gender = 'M'
+  AND c_birth_month = 5
+  AND c_birth_year BETWEEN 1950 AND 1956
+ORDER BY c_customer_id
+LIMIT 100
+```
+
+### 3. pg_materialized_dimension_fact_prefilter (2.68x)
+
+**Principle:** Staged Reduction for Non-Equi Joins: when queries have expensive non-equi joins, reduce BOTH dimension and fact table sizes via MATERIALIZED CTEs before the join. Combined selectivity dramatically cuts the search space for inequality predicates.
+
+**BEFORE (slow):**
+```sql
+select  i_item_desc
+      ,w_warehouse_name
+      ,d1.d_week_seq
+      ,sum(case when p_promo_sk is null then 1 else 0 end) no_promo
+      ,sum(case when p_promo_sk is not null then 1 else 0 end) promo
+      ,count(*) total_cnt
+from catalog_sales
+join inventory on (cs_item_sk = inv_item_sk)
+join warehouse on (w_warehouse_sk=inv_warehouse_sk)
+join item on (i_item_sk = cs_item_sk)
+join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk)
+join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk)
+join date_dim d1 on (cs_sold_date_sk = d1.d_date_sk)
+join date_dim d2 on (inv_date_sk = d2.d_date_sk)
+join date_dim d3 on (cs_ship_date_sk = d3.d_date_sk)
+left outer join promotion on (cs_promo_sk=p_promo_sk)
+left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number)
+where d1.d_week_seq = d2.d_week_seq
+  and inv_quantity_on_hand < cs_quantity
+  and d3.d_date > d1.d_date + interval '3 day'
+  and hd_buy_potential = '501-1000'
+  and d1.d_year = 1998
+  and cd_marital_status = 'M'
+  and cd_dep_count between 9 and 11
+  and i_category IN ('Home', 'Men', 'Music')
+  and cs_wholesale_cost BETWEEN 34 AND 54
+group by i_item_desc,w_warehouse_name,d1.d_week_seq
+order by total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq
+limit 100;
+```
+
+**AFTER (fast):**
+[filtered_date]:
+```sql
+SELECT d_date_sk, d_date, d_week_seq FROM date_dim WHERE d_year = 1998
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk, i_item_desc FROM item WHERE i_category IN ('Home', 'Men', 'Music')
+```
+[filtered_cd]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_marital_status = 'M' AND cd_dep_count BETWEEN 9 AND 11
+```
+[filtered_hd]:
+```sql
+SELECT hd_demo_sk FROM household_demographics WHERE hd_buy_potential = '501-1000'
+```
+[cs_filtered]:
+```sql
+SELECT cs_item_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk, cs_quantity, cs_wholesale_cost, cs_order_number FROM catalog_sales WHERE cs_wholesale_cost BETWEEN 34 AND 54
+```
+[main_query]:
+```sql
+SELECT i.i_item_desc, w.w_warehouse_name, d1.d_week_seq, SUM(CASE WHEN p.p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN p.p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt FROM cs_filtered cs JOIN inventory inv ON cs.cs_item_sk = inv.inv_item_sk JOIN warehouse w ON w.w_warehouse_sk = inv.inv_warehouse_sk JOIN filtered_item i ON i.i_item_sk = cs.cs_item_sk JOIN filtered_cd cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk JOIN filtered_hd hd ON cs.cs_bill_hdemo_sk = hd.hd_demo_sk JOIN filtered_date d1 ON cs.cs_sold_date_sk = d1.d_date_sk JOIN date_dim d2 ON inv.inv_date_sk = d2.d_date_sk JOIN date_dim d3 ON cs.cs_ship_date_sk = d3.d_date_sk LEFT OUTER JOIN promotion p ON cs.cs_promo_sk = p.p_promo_sk LEFT OUTER JOIN catalog_returns cr ON cr.cr_item_sk = cs.cs_item_sk AND cr.cr_order_number = cs.cs_order_number WHERE d1.d_week_seq = d2.d_week_seq AND inv.inv_quantity_on_hand < cs.cs_quantity AND d3.d_date > d1.d_date + INTERVAL '3 day' GROUP BY i.i_item_desc, w.w_warehouse_name, d1.d_week_seq ORDER BY total_cnt DESC, i.i_item_desc, w.w_warehouse_name, d1.d_week_seq LIMIT 100
+```
+
+### 4. pg_self_join_decomposition (3.93x)
+
+**Principle:** Shared Materialization (PG): when the same fact+dimension scan appears multiple times in self-join patterns, materialize it once as a CTE and derive all needed aggregates from the same result. PostgreSQL materializes CTEs by default, making this extremely effective.
+
+**BEFORE (slow):**
+```sql
+select 
+	s_store_name,
+	i_item_desc,
+	sc.revenue,
+	i_current_price,
+	i_wholesale_cost,
+	i_brand
+ from store, item,
+     (select ss_store_sk, avg(revenue) as ave
+	from
+	    (select  ss_store_sk, ss_item_sk,
+		     sum(ss_sales_price) as revenue
+		from store_sales, date_dim
+		where ss_sold_date_sk = d_date_sk and d_month_seq between 1213 and 1213+11
+   and ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+		group by ss_store_sk, ss_item_sk) sa
+	group by ss_store_sk) sb,
+     (select  ss_store_sk, ss_item_sk, sum(ss_sales_price) as revenue
+	from store_sales, date_dim
+	where ss_sold_date_sk = d_date_sk and d_month_seq between 1213 and 1213+11
+  and ss_sales_price / ss_list_price BETWEEN 38 * 0.01 AND 48 * 0.01
+	group by ss_store_sk, ss_item_sk) sc
+ where sb.ss_store_sk = sc.ss_store_sk and
+       sc.revenue <= 0.1 * sb.ave and
+       s_store_sk = sc.ss_store_sk and
+       i_item_sk = sc.ss_item_sk
+       and i_manager_id BETWEEN 32 and 36
+       and s_state in ('TN','TX','VA')
+ order by s_store_name, i_item_desc
+limit 100;
+```
+
+**AFTER (fast):**
+[date_filter]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1213 AND 1224
+```
+[store_sales_revenue]:
+```sql
+SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk WHERE ss_sales_price / ss_list_price BETWEEN 0.38 AND 0.48 GROUP BY ss_store_sk, ss_item_sk
+```
+[store_avg_revenue]:
+```sql
+SELECT ss_store_sk, AVG(revenue) AS ave FROM store_sales_revenue GROUP BY ss_store_sk
+```
+[filtered_store]:
+```sql
+SELECT s_store_sk, s_store_name FROM store WHERE s_state IN ('TN', 'TX', 'VA')
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk, i_item_desc, i_current_price, i_wholesale_cost, i_brand FROM item WHERE i_manager_id BETWEEN 32 AND 36
+```
+[main_query]:
+```sql
+SELECT s_store_name, i_item_desc, sc.revenue, i_current_price, i_wholesale_cost, i_brand FROM store_avg_revenue AS sb JOIN store_sales_revenue AS sc ON sb.ss_store_sk = sc.ss_store_sk JOIN filtered_store AS s ON sc.ss_store_sk = s.s_store_sk JOIN filtered_item AS i ON sc.ss_item_sk = i.i_item_sk WHERE sc.revenue <= 0.1 * sb.ave ORDER BY s_store_name, i_item_desc LIMIT 100
+```
+
+### 5. inline_decorrelate_materialized (timeout_rescue)
+
+**Principle:** Inline Decorrelation with MATERIALIZED CTEs: When a WHERE clause contains a correlated scalar subquery (e.g., col > (SELECT 1.3 * avg(col) FROM ... WHERE correlated_key = outer.key)), PostgreSQL re-executes the subquery per outer row. Fix: decompose into 3 MATERIALIZED CTEs — (1) pre-filter dimension table, (2) pre-filter fact table by date range, (3) compute per-key aggregate threshold from filtered data — then JOIN the threshold CTE in the final query. MATERIALIZED keyword prevents PG from inlining the CTEs back into correlated form.
+
+**BEFORE (slow):**
+```sql
+select  sum(cs_ext_discount_amt)  as "excess discount amount"
+from
+   catalog_sales
+   ,item
+   ,date_dim
+where
+(i_manufact_id in (1, 78, 97, 516, 521)
+or i_manager_id BETWEEN 25 and 54)
+and i_item_sk = cs_item_sk
+and d_date between '1999-03-07' and
+        cast('1999-03-07' as date) + interval '90 day'
+and d_date_sk = cs_sold_date_sk
+and cs_ext_discount_amt
+     > (
+         select
+            1.3 * avg(cs_ext_discount_amt)
+         from
+            catalog_sales
+           ,date_dim
+         where
+              cs_item_sk = i_item_sk
+          and d_date between '1999-03-07' and
+                             cast('1999-03-07' as date) + interval '90 day'
+          and d_date_sk = cs_sold_date_sk
+          and cs_list_price between 16 and 45
+          and cs_sales_price / cs_list_price BETWEEN 63 * 0.01 AND 83 * 0.01
+      )
+order by sum(cs_ext_discount_amt)
+limit 100;
+```
+
+**AFTER (fast):**
+```sql
+WITH filtered_items AS MATERIALIZED (
+    SELECT i_item_sk
+    FROM item
+    WHERE i_manufact_id IN (1, 78, 97, 516, 521)
+       OR i_manager_id BETWEEN 25 AND 54
+),
+date_filtered_sales AS MATERIALIZED (
+    SELECT cs.cs_item_sk, cs.cs_ext_discount_amt,
+           cs.cs_list_price, cs.cs_sales_price
+    FROM catalog_sales cs
+    JOIN date_dim d ON d.d_date_sk = cs.cs_sold_date_sk
+    WHERE d.d_date BETWEEN '1999-03-07' AND cast('1999-03-07' as date) + interval '90 day'
+),
+item_avg_discount AS MATERIALIZED (
+    SELECT dfs.cs_item_sk,
+           1.3 * avg(dfs.cs_ext_discount_amt) AS threshold
+    FROM date_filtered_sales dfs
+    JOIN filtered_items fi ON fi.i_item_sk = dfs.cs_item_sk
+    WHERE dfs.cs_list_price BETWEEN 16 AND 45
+      AND dfs.cs_sales_price / dfs.cs_list_price BETWEEN 63 * 0.01 AND 83 * 0.01
+    GROUP BY dfs.cs_item_sk
+)
+SELECT sum(dfs.cs_ext_discount_amt) AS "excess discount amount"
+FROM date_filtered_sales dfs
+JOIN item_avg_discount iad ON iad.cs_item_sk = dfs.cs_item_sk
+WHERE dfs.cs_ext_discount_amt > iad.threshold
+ORDER BY 1
+LIMIT 100;
+```
+
+### 6. pg_date_cte_explicit_join (2.28x)
+
+**Principle:** Dimension Isolation + Explicit Joins: materialize selective dimension filters into CTEs to create tiny hash tables, AND convert comma-separated joins to explicit JOIN syntax. On PostgreSQL, the combination enables better hash join planning with a tiny probe table.
+
+**BEFORE (slow):**
+```sql
+select 
+   substring(w_warehouse_name,1,20)
+  ,sm_type
+  ,cc_name
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk <= 30 ) then 1 else 0 end)  as "30 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 30) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 60) then 1 else 0 end )  as "31-60 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 60) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 90) then 1 else 0 end)  as "61-90 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk > 90) and
+                 (cs_ship_date_sk - cs_sold_date_sk <= 120) then 1 else 0 end)  as "91-120 days"
+  ,sum(case when (cs_ship_date_sk - cs_sold_date_sk  > 120) then 1 else 0 end)  as ">120 days"
+from
+   catalog_sales
+  ,warehouse
+  ,ship_mode
+  ,call_center
+  ,date_dim
+where
+d_month_seq between 1193 and 1193 + 23
+and cs_ship_date_sk   = d_date_sk
+and cs_warehouse_sk   = w_warehouse_sk
+and cs_ship_mode_sk   = sm_ship_mode_sk
+and cs_call_center_sk = cc_call_center_sk
+and cs_list_price between 271 and 300
+and sm_type = 'REGULAR'
+and cc_class = 'small'
+and w_gmt_offset = -5
+group by
+   substring(w_warehouse_name,1,20)
+  ,sm_type
+  ,cc_name
+order by substring(w_warehouse_name,1,20)
+        ,sm_type
+        ,cc_name
+limit 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1193 AND 1216
+```
+[main_query]:
+```sql
+SELECT SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name, SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS "30 days", ... FROM catalog_sales JOIN filtered_dates ON cs_ship_date_sk = d_date_sk JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk JOIN ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk JOIN call_center ON cs_call_center_sk = cc_call_center_sk WHERE cs_list_price BETWEEN 271 AND 300 AND sm_type = 'REGULAR' AND cc_class = 'small' AND w_gmt_offset = -5 GROUP BY SUBSTRING(w_warehouse_name FROM 1 FOR 20), sm_type, cc_name ORDER BY 1, 2, 3 LIMIT 100
+```
+
+## Correctness Invariants (HARD STOPS — non-negotiable)
+
+These 4 constraints are absolute. Even with full creative freedom, you may NEVER violate these:
+
+- **COMPLETE_OUTPUT**: The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original.
+- **CTE_COLUMN_COMPLETENESS**: CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+- **LITERAL_PRESERVATION**: CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+- **SEMANTIC_EQUIVALENCE**: The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set — even by one row, one column, or a different sort order — is WRONG and will be REJECTED.
+
+## Aggregation Semantics Check (HARD STOP)
+
+- STDDEV_SAMP/VARIANCE are grouping-sensitive — changing group membership changes the result.
+- AVG and STDDEV are NOT duplicate-safe.
+- FILTER over a combined group != separate per-group computation.
+- Verify aggregation equivalence for ANY proposed restructuring.
+
+## Original SQL
+
+```sql
+with  cross_items as
+ (select i_item_sk ss_item_sk
+ from item,
+ (select iss.i_brand_id brand_id
+     ,iss.i_class_id class_id
+     ,iss.i_category_id category_id
+ from store_sales
+     ,item iss
+     ,date_dim d1
+ where ss_item_sk = iss.i_item_sk
+   and ss_sold_date_sk = d1.d_date_sk
+   and d1.d_year between 1999 AND 1999 + 2
+   and i_category IN ('Electronics', 'Shoes', 'Sports')
+   and i_manager_id BETWEEN 42 and 51
+   and ss_wholesale_cost BETWEEN 76 AND 96
+intersect
+ select ics.i_brand_id
+     ,ics.i_class_id
+     ,ics.i_category_id
+ from catalog_sales
+     ,item ics
+     ,date_dim d2
+ where cs_item_sk = ics.i_item_sk
+   and cs_sold_date_sk = d2.d_date_sk
+   and d2.d_year between 1999 AND 1999 + 2
+   and i_category IN ('Electronics', 'Shoes', 'Sports')
+   and i_manager_id BETWEEN 42 and 51
+   and cs_wholesale_cost BETWEEN 76 AND 96
+intersect
+ select iws.i_brand_id
+     ,iws.i_class_id
+     ,iws.i_category_id
+ from web_sales
+     ,item iws
+     ,date_dim d3
+ where ws_item_sk = iws.i_item_sk
+   and ws_sold_date_sk = d3.d_date_sk
+   and ws_wholesale_cost BETWEEN 76 AND 96
+   and d3.d_year between 1999 AND 1999 + 2) x
+ where i_brand_id = brand_id
+      and i_class_id = class_id
+      and i_category_id = category_id
+      and i_category IN ('Electronics', 'Shoes', 'Sports')
+      and i_manager_id BETWEEN 42 and 51
+),
+ avg_sales as
+(select avg(quantity*list_price) average_sales
+  from (select ss_quantity quantity
+             ,ss_list_price list_price
+       from store_sales
+           ,date_dim
+       where ss_sold_date_sk = d_date_sk
+         and d_year between 1999 and 1999 + 2
+         and ss_wholesale_cost BETWEEN 76 AND 96
+       union all
+       select cs_quantity quantity
+             ,cs_list_price list_price
+       from catalog_sales
+           ,date_dim
+       where cs_sold_date_sk = d_date_sk
+         and d_year between 1999 and 1999 + 2
+         and cs_wholesale_cost BETWEEN 76 AND 96
+       union all
+       select ws_quantity quantity
+             ,ws_list_price list_price
+       from web_sales
+           ,date_dim
+       where ws_sold_date_sk = d_date_sk
+        and ws_wholesale_cost BETWEEN 76 AND 96
+         and d_year between 1999 and 1999 + 2) x)
+  select  this_year.channel ty_channel
+                           ,this_year.i_brand_id ty_brand
+                           ,this_year.i_class_id ty_class
+                           ,this_year.i_category_id ty_category
+                           ,this_year.sales ty_sales
+                           ,this_year.number_sales ty_number_sales
+                           ,last_year.channel ly_channel
+                           ,last_year.i_brand_id ly_brand
+                           ,last_year.i_class_id ly_class
+                           ,last_year.i_category_id ly_category
+                           ,last_year.sales ly_sales
+                           ,last_year.number_sales ly_number_sales
+ from
+ (select 'store' channel, i_brand_id,i_class_id,i_category_id
+        ,sum(ss_quantity*ss_list_price) sales, count(*) number_sales
+ from store_sales
+     ,item
+     ,date_dim
+ where ss_item_sk in (select ss_item_sk from cross_items)
+   and ss_item_sk = i_item_sk
+   and ss_sold_date_sk = d_date_sk
+   and d_week_seq = (select d_week_seq
+                     from date_dim
+                     where d_year = 1999 + 1
+                       and d_moy = 12
+                       and d_dom = 12)
+   and i_category IN ('Electronics', 'Shoes', 'Sports')
+   and i_manager_id BETWEEN 42 and 51
+   and ss_wholesale_cost BETWEEN 76 AND 96
+ group by i_brand_id,i_class_id,i_category_id
+ having sum(ss_quantity*ss_list_price) > (select average_sales from avg_sales)) this_year,
+ (select 'store' channel, i_brand_id,i_class_id
+        ,i_category_id, sum(ss_quantity*ss_list_price) sales, count(*) number_sales
+ from store_sales
+     ,item
+     ,date_dim
+ where ss_item_sk in (select ss_item_sk from cross_items)
+   and ss_item_sk = i_item_sk
+   and ss_sold_date_sk = d_date_sk
+   and d_week_seq = (select d_week_seq
+                     from date_dim
+                     where d_year = 1999
+                       and d_moy = 12
+                       and d_dom = 12)
+   and i_category IN ('Electronics', 'Shoes', 'Sports')
+   and ss_wholesale_cost BETWEEN 76 AND 96
+   and i_manager_id BETWEEN 42 and 51
+group by i_brand_id,i_class_id,i_category_id
+ having sum(ss_quantity*ss_list_price) > (select average_sales from avg_sales)) last_year
+ where this_year.i_brand_id= last_year.i_brand_id
+   and this_year.i_class_id = last_year.i_class_id
+   and this_year.i_category_id = last_year.i_category_id
+ order by this_year.channel, this_year.i_brand_id, this_year.i_class_id, this_year.i_category_id
+ limit 100;
+```
+
+## Per-Rewrite Configuration (SET LOCAL)
+
+You have two optimization levers: SQL rewrite AND per-query configuration.
+After writing your rewrite, analyze its execution profile and emit SET LOCAL
+commands that fix planner-level bottlenecks specific to YOUR rewrite.
+
+Memory budget: shared_buffers=128MB, effective_cache_size=4GB
+Global work_mem: 4MB (per-operation)
+Active connections: ~1 (work_mem headroom: safe up to 16MB per-op)
+Storage: HDD (random_page_cost=4.0)
+Parallel capacity: max_parallel_workers=8, per_gather=2
+
+SET LOCAL permissions:
+  user-level (always available): effective_cache_size, enable_hashjoin, enable_mergejoin, enable_nestloop, enable_seqscan, from_collapse_limit, geqo_threshold, hash_mem_multiplier, jit, jit_above_cost, join_collapse_limit, max_parallel_workers_per_gather, parallel_setup_cost, parallel_tuple_cost, random_page_cost, work_mem
+
+### Tunable Parameters (whitelist — only these are allowed)
+
+- **effective_cache_size** (1024MB–65536MB): Advisory: how much OS cache to expect (MB). Safe to set aggressively.
+- **enable_hashjoin** (on | off): Enable hash join plan type.
+- **enable_mergejoin** (on | off): Enable merge join plan type.
+- **enable_nestloop** (on | off): Enable nested-loop join plan type.
+- **enable_seqscan** (on | off): Enable sequential scan plan type.
+- **from_collapse_limit** (1–20): Max FROM items before subqueries stop being flattened.
+- **geqo_threshold** (2–20): Number of FROM items that triggers genetic query optimizer.
+- **hash_mem_multiplier** (1.0–10.0): Multiplier applied to work_mem for hash-based operations.
+- **jit** (on | off): Enable JIT compilation.
+- **jit_above_cost** (0.0–1000000.0): Query cost above which JIT is activated.
+- **join_collapse_limit** (1–20): Max FROM items before planner stops trying all join orders.
+- **max_parallel_workers_per_gather** (0–8): Max parallel workers per Gather node.
+- **parallel_setup_cost** (0.0–10000.0): Planner estimate of cost to launch parallel workers.
+- **parallel_tuple_cost** (0.0–1.0): Planner estimate of cost to transfer a tuple to parallel worker.
+- **random_page_cost** (1.0–10.0): Planner estimate of cost of a random page fetch (1.0 = SSD, 4.0 = HDD).
+- **work_mem** (64MB–2048MB): Memory for sorts/hashes per operation (MB). Allocated PER-OPERATION, not per-query. Count hash/sort ops in EXPLAIN before sizing.
+
+### Rules
+- Every SET LOCAL MUST cite a specific EXPLAIN node your rewrite creates/changes
+- work_mem is PER-OPERATION: count hash/sort ops in your rewrite before sizing
+- random_page_cost: ONLY change if your rewrite creates index-favorable access patterns
+- Empty is valid: if your rewrite has no planner bottleneck, emit no SET LOCAL
+- Stay within the resource envelope bounds above
+
+### SET LOCAL Syntax
+Include SET LOCAL commands in the `runtime_config` array field of your JSON output.
+If no config changes help, omit the field or use an empty array.
+
+## Your Task — Self-Directed Retry
+
+Work through these 3 steps in a `<reasoning>` block, then output your optimized SQL:
+
+1. **DIAGNOSE**: Why did the best worker achieve 1.1186623193614078x instead of the 2.0x target? What do the EXPLAIN plans reveal about the actual execution bottleneck?
+2. **IDENTIFY**: What optimization angles are still unexplored? What did the empirical results reveal that couldn't have been known before seeing the execution plans?
+3. **REWRITE**: Produce optimized SQL that exploits the angles you identified. You may build on the best foundation or start fresh.
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Verify output schema matches the Column Completeness Contract (same columns, same names, same order).
+- Keep all semantic invariants from `Correctness Invariants` (including join/null behavior).
+- Verify aggregation equivalence: same rows participate in each group, same aggregate semantics.
+- Preserve all literals exactly (numbers, strings, date values).
+- Apply `Hazard Flags` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `ty_channel`
+  2. `ty_brand`
+  3. `ty_class`
+  4. `ty_category`
+  5. `ty_sales`
+  6. `ty_number_sales`
+  7. `ly_channel`
+  8. `ly_brand`
+  9. `ly_class`
+  10. `ly_category`
+  11. `ly_sales`
+  12. `ly_number_sales`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit or use empty array if not needed
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

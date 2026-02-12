@@ -1,0 +1,84 @@
+**Part 1: Modified Logic Tree**
+
+```
+QUERY: (multi-CTE structure)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: 100  — CTE-based rewrite with early fact filtering
+    ├── [+] CTE date_keys  — Pre-filter date_dim for November, output d_date_sk
+    │   ├── SCAN (date_dim)
+    │   └── FILTER (d_moy=11)
+    ├── [+] CTE item_keys  — Pre-filter item for manufacturer 816, output i_item_sk
+    │   ├── SCAN (item)
+    │   └── FILTER (i_manufact_id=816)
+    ├── [+] CTE filtered_sales  — Filter store_sales using IN-subqueries
+    │   ├── SCAN (store_sales)
+    │   ├── FILTER (ss_sold_date_sk IN (SELECT d_date_sk FROM date_keys))
+    │   └── FILTER (ss_item_sk IN (SELECT i_item_sk FROM item_keys))
+    ├── [+] CTE joined  — Join with dimension tables, apply redundant filters, aggregate
+    │   ├── JOIN (filtered_sales ➔ date_dim ON ss_sold_date_sk = d_date_sk)
+    │   ├── JOIN (filtered_sales ➔ item ON ss_item_sk = i_item_sk)
+    │   ├── FILTER (date_dim.d_moy=11)
+    │   ├── FILTER (item.i_manufact_id=816)
+    │   └── AGG (GROUP BY d_year, i_brand, i_brand_id; SUM(ss_sales_price))
+    └── [+] CTE main_output  — Final ordering and limit
+        ├── SORT (d_year ASC, sum_agg DESC, i_brand_id ASC)
+        └── LIMIT 100
+```
+
+**Part 2: Component Payload JSON**
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb_v1.4.3",
+  "rewrite_rules": [
+    {"id": "R1", "type": "cte_decomposition", "description": "Decompose original join into CTEs for early filtering", "applied_to": ["date_keys", "item_keys", "filtered_sales"]},
+    {"id": "R2", "type": "predicate_pushdown", "description": "Push d_moy=11 and i_manufact_id=816 into initial CTE scans", "applied_to": ["date_keys", "item_keys"]},
+    {"id": "R3", "type": "fact_filtering", "description": "Filter fact table using IN-subqueries with dimension keys", "applied_to": ["filtered_sales"]},
+    {"id": "R4", "type": "redundant_filter_preservation", "description": "Keep redundant filters in joined CTE as defensive guards", "applied_to": ["joined"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_keys": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_moy = 11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "item_keys": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk FROM item WHERE i_manufact_id = 816",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "filtered_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_item_sk, ss_sold_date_sk, ss_sales_price FROM store_sales WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM date_keys) AND ss_item_sk IN (SELECT i_item_sk FROM item_keys)",
+        "interfaces": {"outputs": ["ss_item_sk", "ss_sold_date_sk", "ss_sales_price"], "consumes": ["date_keys", "item_keys"]}
+      },
+      "joined": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT date_dim.d_year, item.i_brand_id, item.i_brand, SUM(filtered_sales.ss_sales_price) AS sum_agg FROM filtered_sales INNER JOIN date_dim ON filtered_sales.ss_sold_date_sk = date_dim.d_date_sk INNER JOIN item ON filtered_sales.ss_item_sk = item.i_item_sk WHERE date_dim.d_moy = 11 AND item.i_manufact_id = 816 GROUP BY date_dim.d_year, item.i_brand, item.i_brand_id",
+        "interfaces": {"outputs": ["d_year", "i_brand_id", "i_brand", "sum_agg"], "consumes": ["filtered_sales"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT d_year, i_brand_id AS brand_id, i_brand AS brand, sum_agg FROM joined ORDER BY d_year ASC, sum_agg DESC, i_brand_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["d_year", "brand_id", "brand", "sum_agg"], "consumes": ["joined"]}
+      }
+    },
+    "reconstruction_order": ["date_keys", "item_keys", "filtered_sales", "joined", "main_query"],
+    "assembly_template": "WITH date_keys AS ({date_keys}), item_keys AS ({item_keys}), filtered_sales AS ({filtered_sales}), joined AS ({joined}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Structural decomposition into CTEs with early filtering on dimensions, then fact-table filtering via IN-subqueries, preserving redundant filters in the final join for safety.  
+**Expected speedup:** ~1.5-2x via predicate pushdown and reduced fact-table scans (326ms baseline → ~160-220ms). CTE overhead is acceptable given baseline >100ms.

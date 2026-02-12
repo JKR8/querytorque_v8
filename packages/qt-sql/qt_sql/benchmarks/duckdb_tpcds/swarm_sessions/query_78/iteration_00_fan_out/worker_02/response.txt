@@ -1,0 +1,82 @@
+### Part 1: Modified Logic Tree
+```
+QUERY: (single statement)
+├── [CTE] date_2000  [+]  Cost: <1%  Rows: 366  — Filter date_dim to year 2000.
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year = 2000)
+│   └── OUTPUT (d_date_sk, d_year)
+├── [CTE] sales_combined  [+]  Cost: ~98%  Rows: 8.8M  — Union of store, web, catalog sales for 2000, non-returned, aggregated by year-item-customer.
+│   ├── UNION ALL
+│   │   ├── Branch 1 (store):
+│   │   │   ├── SCAN (store_sales, store_returns (left join), date_2000 (join))
+│   │   │   ├── FILTER (sr_ticket_number IS NULL)
+│   │   │   ├── AGG (GROUP BY d_year, ss_item_sk, ss_customer_sk)
+│   │   │   └── OUTPUT (channel, sold_year, item_sk, customer_sk, qty, wc, sp)
+│   │   ├── Branch 2 (web):
+│   │   │   ├── SCAN (web_sales, web_returns (left join), date_2000 (join))
+│   │   │   ├── FILTER (wr_order_number IS NULL)
+│   │   │   ├── AGG (GROUP BY d_year, ws_item_sk, ws_bill_customer_sk)
+│   │   │   └── OUTPUT (channel, sold_year, item_sk, customer_sk, qty, wc, sp)
+│   │   └── Branch 3 (catalog):
+│   │       ├── SCAN (catalog_sales, catalog_returns (left join), date_2000 (join))
+│   │       ├── FILTER (cr_order_number IS NULL)
+│   │       ├── AGG (GROUP BY d_year, cs_item_sk, cs_bill_customer_sk)
+│   │       └── OUTPUT (channel, sold_year, item_sk, customer_sk, qty, wc, sp)
+│   └── OUTPUT (channel, sold_year, item_sk, customer_sk, qty, wc, sp)
+├── [- CTE] ws  — Removed; consolidated into sales_combined.
+├── [- CTE] cs  — Removed; consolidated into sales_combined.
+├── [- CTE] ss  — Removed; consolidated into sales_combined.
+└── [MAIN] main_pivot  [+]  Cost: ~2%  Rows: 100  — Left join store channel to web/catalog channels from sales_combined, filter for other-channel activity, compute ratio, order, limit.
+    ├── SCAN (sales_combined as s, sales_combined as w (left join), sales_combined as c (left join))
+    ├── FILTER (s.channel='store', w.channel='web', c.channel='catalog')
+    ├── JOIN (ON s.sold_year=w.sold_year AND s.item_sk=w.item_sk AND s.customer_sk=w.customer_sk)
+    ├── JOIN (ON s.sold_year=c.sold_year AND s.item_sk=c.item_sk AND s.customer_sk=c.customer_sk)
+    ├── FILTER (COALESCE(w.qty,0)>0 OR COALESCE(c.qty,0)>0)
+    ├── SORT (s.item_sk ASC, s.qty DESC, s.wc DESC, s.sp DESC, (COALESCE(w.qty,0)+COALESCE(c.qty,0)) ASC, (COALESCE(w.wc,0)+COALESCE(c.wc,0)) ASC, (COALESCE(w.sp,0)+COALESCE(c.sp,0)) ASC, ROUND(s.qty/(COALESCE(w.qty,0)+COALESCE(c.qty,0)),2) ASC)
+    └── OUTPUT (ss_item_sk, ratio, store_qty, store_wholesale_cost, store_sales_price, other_chan_qty, other_chan_wholesale_cost, other_chan_sales_price)
+```
+
+### Part 2: Component Payload JSON
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb_v1.4.3",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extract year=2000 filter into a shared CTE to eliminate redundant date_dim scans in each channel.", "applied_to": ["date_2000", "sales_combined"]},
+    {"id": "R2", "type": "union_all_consolidation", "description": "Consolidate three separate channel CTEs (ss, ws, cs) into a single UNION ALL CTE (sales_combined) with uniform structure, enabling predicate pushdown to date_2000 and reducing repeated aggregation scaffolding.", "applied_to": ["sales_combined", "main_pivot"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_2000": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_year FROM date_dim WHERE d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk", "d_year"], "consumes": []}
+      },
+      "sales_combined": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT 'store' AS channel, d_year AS sold_year, ss_item_sk AS item_sk, ss_customer_sk AS customer_sk, SUM(ss_quantity) AS qty, SUM(ss_wholesale_cost) AS wc, SUM(ss_sales_price) AS sp FROM store_sales LEFT JOIN store_returns ON sr_ticket_number = ss_ticket_number AND ss_item_sk = sr_item_sk JOIN date_2000 ON ss_sold_date_sk = d_date_sk WHERE sr_ticket_number IS NULL GROUP BY d_year, ss_item_sk, ss_customer_sk UNION ALL SELECT 'web' AS channel, d_year AS sold_year, ws_item_sk AS item_sk, ws_bill_customer_sk AS customer_sk, SUM(ws_quantity) AS qty, SUM(ws_wholesale_cost) AS wc, SUM(ws_sales_price) AS sp FROM web_sales LEFT JOIN web_returns ON wr_order_number = ws_order_number AND ws_item_sk = wr_item_sk JOIN date_2000 ON ws_sold_date_sk = d_date_sk WHERE wr_order_number IS NULL GROUP BY d_year, ws_item_sk, ws_bill_customer_sk UNION ALL SELECT 'catalog' AS channel, d_year AS sold_year, cs_item_sk AS item_sk, cs_bill_customer_sk AS customer_sk, SUM(cs_quantity) AS qty, SUM(cs_wholesale_cost) AS wc, SUM(cs_sales_price) AS sp FROM catalog_sales LEFT JOIN catalog_returns ON cr_order_number = cs_order_number AND cs_item_sk = cr_item_sk JOIN date_2000 ON cs_sold_date_sk = d_date_sk WHERE cr_order_number IS NULL GROUP BY d_year, cs_item_sk, cs_bill_customer_sk",
+        "interfaces": {"outputs": ["channel", "sold_year", "item_sk", "customer_sk", "qty", "wc", "sp"], "consumes": ["date_2000"]}
+      },
+      "main_pivot": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s.item_sk AS ss_item_sk, ROUND(s.qty / (COALESCE(w.qty, 0) + COALESCE(c.qty, 0)), 2) AS ratio, s.qty AS store_qty, s.wc AS store_wholesale_cost, s.sp AS store_sales_price, COALESCE(w.qty, 0) + COALESCE(c.qty, 0) AS other_chan_qty, COALESCE(w.wc, 0) + COALESCE(c.wc, 0) AS other_chan_wholesale_cost, COALESCE(w.sp, 0) + COALESCE(c.sp, 0) AS other_chan_sales_price FROM (SELECT * FROM sales_combined WHERE channel = 'store') s LEFT JOIN (SELECT * FROM sales_combined WHERE channel = 'web') w ON w.sold_year = s.sold_year AND w.item_sk = s.item_sk AND w.customer_sk = s.customer_sk LEFT JOIN (SELECT * FROM sales_combined WHERE channel = 'catalog') c ON c.sold_year = s.sold_year AND c.item_sk = s.item_sk AND c.customer_sk = s.customer_sk WHERE (COALESCE(w.qty, 0) > 0 OR COALESCE(c.qty, 0) > 0) ORDER BY s.item_sk ASC, s.qty DESC, s.wc DESC, s.sp DESC, (COALESCE(w.qty, 0) + COALESCE(c.qty, 0)) ASC, (COALESCE(w.wc, 0) + COALESCE(c.wc, 0)) ASC, (COALESCE(w.sp, 0) + COALESCE(c.sp, 0)) ASC, ROUND(s.qty / (COALESCE(w.qty, 0) + COALESCE(c.qty, 0)), 2) ASC LIMIT 100",
+        "interfaces": {"outputs": ["ss_item_sk", "ratio", "store_qty", "store_wholesale_cost", "store_sales_price", "other_chan_qty", "other_chan_wholesale_cost", "other_chan_sales_price"], "consumes": ["sales_combined"]}
+      }
+    },
+    "reconstruction_order": ["date_2000", "sales_combined", "main_pivot"],
+    "assembly_template": "WITH date_2000 AS ({date_2000}), sales_combined AS ({sales_combined}) {main_pivot}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Consolidated three separate channel CTEs (ss, ws, cs) into a single UNION ALL CTE (sales_combined) and extracted the year=2000 filter into a shared date_2000 CTE. This eliminates three independent date_dim scans and unifies the aggregation structure, allowing DuckDB to push the year filter once per channel branch and materialize the UNION ALL only once.
+
+**Expected speedup**: 2–4x due to elimination of redundant date_dim scans (3→1) and reduction of repeated aggregation scaffolding, though UNION ALL may increase intermediate rows (8.8M vs original separate CTEs). Materialization of sales_combined may be optimized by columnar projection and predicate pushdown.

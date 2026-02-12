@@ -1,0 +1,61 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Replaced 15 correlated scalar subqueries with single-pass aggregation + pivot
+    ├── [CTE] filtered_sales_cte  [+]  — Single scan with bucket labeling
+    │   └── SCAN store_sales
+    │       └── FILTER (ss_quantity BETWEEN 1 AND 100)
+    ├── [CTE] bucket_aggregates_cte  [+]  — Group by bucket to compute aggregates
+    │   └── AGGREGATE (GROUP BY bucket_id) on filtered_sales_cte
+    └── MAIN SELECT
+        ├── SCAN reason
+        ├── CROSS JOIN (pivot subquery)
+        │   └── SCAN bucket_aggregates_cte
+        └── FILTER (r_reason_sk = 1)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_aggregation", "description": "Consolidated 15 separate store_sales scans into one scan with bucket labeling, then GROUP BY + pivot", "applied_to": ["filtered_sales_cte", "bucket_aggregates_cte", "main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_sales_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_quantity, ss_ext_sales_price, ss_net_profit, CASE WHEN ss_quantity BETWEEN 1 AND 20 THEN 1 WHEN ss_quantity BETWEEN 21 AND 40 THEN 2 WHEN ss_quantity BETWEEN 41 AND 60 THEN 3 WHEN ss_quantity BETWEEN 61 AND 80 THEN 4 WHEN ss_quantity BETWEEN 81 AND 100 THEN 5 END AS bucket_id FROM store_sales WHERE ss_quantity BETWEEN 1 AND 100",
+        "interfaces": {"outputs": ["ss_quantity", "ss_ext_sales_price", "ss_net_profit", "bucket_id"], "consumes": []}
+      },
+      "bucket_aggregates_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT bucket_id, COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext, AVG(ss_net_profit) AS avg_net FROM filtered_sales_cte GROUP BY bucket_id",
+        "interfaces": {"outputs": ["bucket_id", "cnt", "avg_ext", "avg_net"], "consumes": ["filtered_sales_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT bucket1, bucket2, bucket3, bucket4, bucket5 FROM reason CROSS JOIN (SELECT MAX(CASE WHEN bucket_id = 1 AND cnt > 2972190 THEN avg_ext WHEN bucket_id = 1 THEN avg_net END) AS bucket1, MAX(CASE WHEN bucket_id = 2 AND cnt > 4505785 THEN avg_ext WHEN bucket_id = 2 THEN avg_net END) AS bucket2, MAX(CASE WHEN bucket_id = 3 AND cnt > 1575726 THEN avg_ext WHEN bucket_id = 3 THEN avg_net END) AS bucket3, MAX(CASE WHEN bucket_id = 4 AND cnt > 3188917 THEN avg_ext WHEN bucket_id = 4 THEN avg_net END) AS bucket4, MAX(CASE WHEN bucket_id = 5 AND cnt > 3525216 THEN avg_ext WHEN bucket_id = 5 THEN avg_net END) AS bucket5 FROM bucket_aggregates_cte) AS buckets WHERE r_reason_sk = 1",
+        "interfaces": {"outputs": ["bucket1", "bucket2", "bucket3", "bucket4", "bucket5"], "consumes": ["bucket_aggregates_cte"]}
+      }
+    },
+    "reconstruction_order": ["filtered_sales_cte", "bucket_aggregates_cte", "main_query"],
+    "assembly_template": "WITH filtered_sales_cte AS ({filtered_sales_cte}), bucket_aggregates_cte AS ({bucket_aggregates_cte}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Replaced 15 independent scalar subqueries with a single store_sales scan that labels rows by quantity bucket, aggregates by bucket, then pivots to the required single-row format using MAX(CASE WHEN...). The cross-join with reason preserves the original semantics where r_reason_sk=1 guarantees exactly one output row.
+
+**Expected speedup:** 4-5x based on benchmark examples (single_pass_aggregation showed 4.47x, channel_bitmap_aggregation 6.24x) due to eliminating 14 redundant table scans.

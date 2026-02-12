@@ -1,0 +1,274 @@
+<reasoning>
+1. **CLASSIFY**: This is a star-join with late dim filter pattern. The query joins a fact table (store_sales) with its returns (store_returns) and dimension tables (store, date_dim d1, date_dim d2). Key characteristic: The date_dim d2 filter (year=1999, month=7) is selective and applied early, but the date_dim d1 join has a correlated range condition (d1.d_date between d2.d_date - 120 days and d2.d_date) that depends on d2. This creates a correlated join pattern.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total execution: 1239.5ms
+   - Dominant nodes:
+     * Gather Merge + Sort: 1157.3ms (93% of total) - This is the aggregation sorting phase.
+     * Nested Loop Inner (d2 + store_returns + store_sales + store): 872.9ms per worker (70% of total when aggregated) - This is the fact table joining phase.
+   - Row count drops:
+     * date_dim d2: 37K rows → 16 rows (filter on d_year=1999, d_moy=7) - Excellent selectivity.
+     * store_returns after join with d2: 56K rows (3,632 rows per d2 row) - Moderate expansion.
+     * store_sales join: 42K rows (1 row per store_returns) - Good reduction.
+     * store join: 42K rows (1 row per store_sales) - No reduction.
+     * d1 join with range filter: 39K rows (slight reduction).
+   - Scans per base table:
+     * date_dim d2: 1 scan (seq scan with filter)
+     * store_returns: 1 scan (index only scan)
+     * store_sales: 1 scan (index only scan)
+     * store: 1 scan (index scan)
+     * date_dim d1: 1 scan (index scan) but performed 81,513 times (once per row from previous join)
+   - The optimizer has NOT split CTEs or pushed the d1 range condition early. The nested loop with d1 is executed 81,513 times with an index scan each time (0.0ms per loop but high overhead).
+   - The comma join syntax is used, which may limit join reordering.
+
+3. **GAP MATCHING**:
+   - **COMMA_JOIN_WEAKNESS**: Present - Query uses comma-separated implicit joins.
+   - **CORRELATED_SUBQUERY_PARALYSIS**: Present - The d1.d_date BETWEEN condition correlates d1 with d2.d_date.
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: Not present - No repeated fact table scans.
+   - **NON_EQUI_JOIN_INPUT_BLINDNESS**: Present - The d1 range join is a non-equi join.
+   - The optimizer already handles INNER_JOIN_REORDERING well, but comma joins may hinder this.
+
+4. **AGGREGATION TRAP CHECK**: The aggregates are conditional sums of 1/0 values using CASE expressions. These are grouping-insensitive (SUM of 0/1). No FILTER clauses. No STDDEV_SAMP/VARIANCE. Safe to restructure.
+
+5. **TRANSFORM SELECTION** (ranked by expected impact):
+   a) **star_join_prefetch** + **decorrelation**: Pre-filter d2 and store, pre-join d1 with d2 on the range condition to decorrelate, then join with fact tables. High impact due to eliminating per-row d1 index scans.
+   b) **transitive_predicate_propagation**: Push d2 filter through to d1 via equivalence chain. Combine with explicit JOIN syntax.
+   c) **late_attribute_binding**: Defer store join until after aggregation (store columns only needed for GROUP BY and output, not for filters).
+   d) **compound_strategy**: Combine explicit JOINs with pre-filtered CTEs and optimizer hinting.
+
+6. **LOGICAL TREE DESIGN**:
+   For each strategy, design CTEs that:
+   - Materialize filtered d2 (16 rows)
+   - Materialize d1-d2 range pairs (decorrelated)
+   - Join fact tables with these CTEs
+   - Ensure all required columns are present in each CTE output
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+This query computes for each store in July 1999 the distribution of return delays (in days) for items sold and returned within 120 days. All joins are INNER joins requiring matches across store_sales, store_returns, store, and two date_dim instances. Aggregation uses conditional sums of 1/0 values (grouping-insensitive). The d1.d_date filter depends on d2.d_date (correlated range: d1.d_date between d2.d_date - 120 days and d2.d_date) - any rewrite must preserve this temporal relationship.
+
+BOTTLENECK_DIAGNOSIS:
+The dominant cost is the nested loop join with date_dim d1 (81,513 index scans @ 0.0ms each, cumulative overhead) and the parallel sort for aggregation (1157.3ms, 93% of runtime). The query is join-bound due to the correlated range condition between d1 and d2, causing per-row index probes. Cardinality flows: d2 (16 rows) → store_returns (56K) → store_sales (42K) → store (42K) → d1 (39K). The optimizer already handles the d2 filter and fact table joins efficiently with index scans. Logical-tree costs are misleading as the nested loop with d1 shows 0.0ms per loop but high cumulative overhead.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs 10 store columns and 5 aggregated bucket counts.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include ss_sold_date_sk, sr_returned_date_sk, and all store columns used in GROUP BY.
+- LITERAL_PRESERVATION: Literal values 1999, 7, 30, 60, 90, 120 must be preserved exactly.
+- SEMANTIC_EQUIVALENCE: Must return same rows and ordering (store attributes).
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated implicit joins (lines 21-25).
+- CORRELATED_SUBQUERY_PARALYSIS: d1.d_date BETWEEN condition correlates with d2.d_date (lines 35-36).
+
+REGRESSION_WARNINGS:
+1. Never set enable_nestloop=off (observed 184x regression):
+   CAUSE: Disabling nested loops forces hash/merge joins that spill to disk for large tables.
+   RULE: Avoid SET enable_nestloop=off; nested loops are efficient for indexed lookups on d1.
+2. CTEs blocking parallelism (observed 0.50x on Q069):
+   CAUSE: Materialized CTEs execute single-threaded, preventing parallel table scans.
+   RULE: Use non-materialized CTEs (WITHOUT MATERIALIZED) or inline subqueries for large fact joins.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch with decorrelation
+TARGET_LOGICAL_TREE:
+d2_filtered -> d1_d2_range -> store_returns_filtered -> sales_returns_joined -> store_joined -> aggregated -> sorted -> limited
+NODE_CONTRACTS:
+  d2_filtered:
+    FROM: date_dim d2
+    WHERE: d_year = 1999 AND d_moy = 7
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 16
+    CONSUMERS: d1_d2_range, store_returns_filtered
+  d1_d2_range:
+    FROM: date_dim d1, d2_filtered
+    WHERE: d1.d_date BETWEEN (d2_filtered.d_date - INTERVAL '120 DAY') AND d2_filtered.d_date
+    OUTPUT: d1.d_date_sk, d2_filtered.d_date_sk, d2_filtered.d_date
+    EXPECTED_ROWS: ~1,920 (16 * 120 days)
+    CONSUMERS: sales_returns_joined
+  store_returns_filtered:
+    FROM: store_returns, d2_filtered
+    JOIN: sr_returned_date_sk = d2_filtered.d_date_sk
+    OUTPUT: sr_item_sk, sr_ticket_number, sr_customer_sk, sr_returned_date_sk
+    EXPECTED_ROWS: 56K
+    CONSUMERS: sales_returns_joined
+  sales_returns_joined:
+    FROM: store_sales, store_returns_filtered, d1_d2_range
+    JOIN: ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number AND ss_customer_sk = sr_customer_sk AND ss_sold_date_sk = d1_d2_range.d_date_sk
+    OUTPUT: ss_store_sk, sr_returned_date_sk, ss_sold_date_sk
+    EXPECTED_ROWS: 39K
+    CONSUMERS: store_joined
+  store_joined:
+    FROM: sales_returns_joined, store
+    JOIN: ss_store_sk = s_store_sk
+    OUTPUT: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, sr_returned_date_sk, ss_sold_date_sk
+    EXPECTED_ROWS: 39K
+    CONSUMERS: aggregated
+  aggregated:
+    FROM: store_joined
+    GROUP BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    AGGREGATE: SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) as "30 days", [repeat for other buckets]
+    OUTPUT: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"
+    EXPECTED_ROWS: ~30
+    CONSUMERS: sorted
+  sorted:
+    FROM: aggregated
+    ORDER BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    OUTPUT: same as aggregated
+    EXPECTED_ROWS: 30
+    CONSUMERS: limited
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+  pg_dimension_prefetch_star: Apply pre-filtering of d2 into CTE and convert comma joins to explicit JOIN syntax. Ignore multi-dimension prefetch (only d2 is highly selective).
+  pg_date_cte_explicit_join: Apply date_dim CTE isolation for d2 and explicit JOINs. Ignore the fact that d1 also needs filtering via correlation.
+  early_filter_decorrelate: Apply decorrelation of d1-d2 range condition by pre-joining in CTE. Ignore subquery decorrelation (no subqueries present).
+HAZARD_FLAGS:
+  - d1_d2_range CTE may expand to ~1,920 rows (16 * 120) which could be larger than original d1 index scan count.
+  - Explicit JOIN syntax may prevent some optimizer reordering.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: transitive_predicate_propagation with explicit joins
+TARGET_LOGICAL_TREE:
+d2_filtered -> store_returns_filtered -> sales_returns_store_joined -> d1_joined -> aggregated -> sorted -> limited
+NODE_CONTRACTS:
+  d2_filtered:
+    FROM: date_dim d2
+    WHERE: d_year = 1999 AND d_moy = 7
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 16
+    CONSUMERS: store_returns_filtered, d1_joined
+  store_returns_filtered:
+    FROM: store_returns, d2_filtered
+    JOIN: sr_returned_date_sk = d2_filtered.d_date_sk
+    OUTPUT: sr_item_sk, sr_ticket_number, sr_customer_sk, sr_returned_date_sk, d2_filtered.d_date
+    EXPECTED_ROWS: 56K
+    CONSUMERS: sales_returns_store_joined
+  sales_returns_store_joined:
+    FROM: store_sales, store_returns_filtered, store
+    JOIN: ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number AND ss_customer_sk = sr_customer_sk AND ss_store_sk = s_store_sk
+    OUTPUT: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, ss_sold_date_sk, sr_returned_date_sk, d2_filtered.d_date
+    EXPECTED_ROWS: 39K
+    CONSUMERS: d1_joined
+  d1_joined:
+    FROM: sales_returns_store_joined, date_dim d1
+    JOIN: ss_sold_date_sk = d1.d_date_sk
+    WHERE: d1.d_date BETWEEN (d2_filtered.d_date - INTERVAL '120 DAY') AND d2_filtered.d_date
+    OUTPUT: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, ss_sold_date_sk, sr_returned_date_sk
+    EXPECTED_ROWS: 39K
+    CONSUMERS: aggregated
+  aggregated:
+    FROM: d1_joined
+    GROUP BY: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip
+    AGGREGATE: same conditional sums
+    OUTPUT: store columns + 5 bucket aggregates
+    EXPECTED_ROWS: ~30
+    CONSUMERS: sorted
+EXAMPLES: pg_date_cte_explicit_join, pushdown
+EXAMPLE_ADAPTATION:
+  pg_date_cte_explicit_join: Apply isolation of d2 filter into CTE and convert all comma joins to explicit JOIN syntax. Ignore the need for d1 CTE.
+  pushdown: Push d2.d_date predicate into the d1 join condition via transitive propagation (d1.d_date between (d2_filtered.d_date - 120 days) and d2_filtered.d_date). Ignore other predicate pushdowns.
+HAZARD_FLAGS:
+  - The d1 join still has correlated range condition, may still cause nested loops.
+  - Explicit JOIN order may differ from original comma join order.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: late_attribute_binding with aggregation pushdown
+TARGET_LOGICAL_TREE:
+d2_filtered -> store_returns_filtered -> sales_returns_joined -> d1_joined -> pre_aggregated -> store_joined -> sorted -> limited
+NODE_CONTRACTS:
+  d2_filtered:
+    FROM: date_dim d2
+    WHERE: d_year = 1999 AND d_moy = 7
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 16
+    CONSUMERS: store_returns_filtered, d1_joined
+  store_returns_filtered:
+    FROM: store_returns, d2_filtered
+    JOIN: sr_returned_date_sk = d2_filtered.d_date_sk
+    OUTPUT: sr_item_sk, sr_ticket_number, sr_customer_sk, sr_returned_date_sk, d2_filtered.d_date
+    EXPECTED_ROWS: 56K
+    CONSUMERS: sales_returns_joined
+  sales_returns_joined:
+    FROM: store_sales, store_returns_filtered
+    JOIN: ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number AND ss_customer_sk = sr_customer_sk
+    OUTPUT: ss_store_sk, ss_sold_date_sk, sr_returned_date_sk, d2_filtered.d_date
+    EXPECTED_ROWS: 42K
+    CONSUMERS: d1_joined
+  d1_joined:
+    FROM: sales_returns_joined, date_dim d1
+    JOIN: ss_sold_date_sk = d1.d_date_sk
+    WHERE: d1.d_date BETWEEN (d2_filtered.d_date - INTERVAL '120 DAY') AND d2_filtered.d_date
+    OUTPUT: ss_store_sk, sr_returned_date_sk, ss_sold_date_sk
+    EXPECTED_ROWS: 39K
+    CONSUMERS: pre_aggregated
+  pre_aggregated:
+    FROM: d1_joined
+    GROUP BY: ss_store_sk
+    AGGREGATE: SUM(CASE WHEN (sr_returned_date_sk - ss_sold_date_sk <= 30) THEN 1 ELSE 0 END) as "30 days", [other buckets], COUNT(*) as cnt
+    OUTPUT: ss_store_sk, "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"
+    EXPECTED_ROWS: ~number of stores
+    CONSUMERS: store_joined
+  store_joined:
+    FROM: pre_aggregated, store
+    JOIN: ss_store_sk = s_store_sk
+    OUTPUT: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"
+    EXPECTED_ROWS: ~30
+    CONSUMERS: sorted
+EXAMPLES: pg_self_join_decomposition, late_attribute_binding
+EXAMPLE_ADAPTATION:
+  pg_self_join_decomposition: Apply materialization of fact joins before aggregation, but ignore self-join aspect (no repeated scans).
+  late_attribute_binding: Defer store join until after aggregation (store columns not used in filters or aggregates). Ignore the need to preserve all grouping columns in pre_aggregated.
+HAZARD_FLAGS:
+  - Aggregation pushdown changes group membership (grouping by ss_store_sk only vs 10 store columns). Must ensure store join is one-to-one (ss_store_sk → store columns) to preserve semantics.
+  - Pre-aggregation loses store columns needed for final ORDER BY.
+
+=== WORKER 4 BRIEFING (EXPLORATION WORKER) ===
+
+STRATEGY: compound_strategy: explicit joins with optimizer hinting
+TARGET_LOGICAL_TREE:
+d2_filtered -> store_returns_filtered -> sales_returns_store_joined -> d1_joined -> aggregated -> sorted -> limited
+NODE_CONTRACTS:
+  d2_filtered:
+    FROM: date_dim d2
+    WHERE: d_year = 1999 AND d_moy = 7
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 16
+    CONSUMERS: store_returns_filtered, d1_joined
+  store_returns_filtered:
+    FROM: store_returns, d2_filtered
+    JOIN: sr_returned_date_sk = d2_filtered.d_date_sk
+    OUTPUT: sr_item_sk, sr_ticket_number, sr_customer_sk, sr_returned_date_sk, d2_filtered.d_date
+    EXPECTED_ROWS: 56K
+    CONSUMERS: sales_returns_store_joined
+  sales_returns_store_joined:
+    FROM: store_sales, store_returns_filtered, store
+    JOIN: ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number AND ss_customer_sk = sr_customer_sk AND ss_store_sk = s_store_sk
+    OUTPUT: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, ss_sold_date_sk, sr_returned_date_sk, d2_filtered.d_date
+    EXPECTED_ROWS: 39K
+    CONSUMERS: d1_joined
+  d1_joined:
+    FROM: sales_returns_store_joined, date_dim d1
+    JOIN: ss_sold_date_sk = d1.d_date_sk
+    WHERE: d1.d_date BETWEEN (d2_filtered.d_date - INTERVAL '120 DAY') AND d2_filtered.d_date
+    OUTPUT: store columns + ss_sold_date_sk, sr_returned_date_sk
+    EXPECTED_ROWS: 39K
+    CONSUMERS: aggregated
+  aggregated:
+    FROM: d1_joined
+    GROUP BY: store columns
+    AGGREGATE: conditional sums
+    OUTPUT: store columns + 5 bucket aggregates
+    EXPECTED_ROWS: ~30
+    CONSUMERS: sorted
+EXAMPLES: pg_date_cte_explicit_join, pg_dimension_prefetch_star
+EXAMPLE_ADAPTATION:
+  pg_date_cte_explicit_join: Apply CTE isolation for d2 and explicit JOIN syntax. Combine with optimizer hints.
+  pg_dimension_prefetch_star: Apply multi-dimension prefetch concept, but only d2 is selective. Combine with SET LOCAL optimizations.
+HAZARD_FLAGS:
+  - Optimizer hints may cause regressions on different data distributions.
+  - Compound strategy may interact poorly with parallel execution.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This strategy does not violate any correctness constraints; it combines proven patterns with cautious optimizer hinting.
+EXPLORATION_TYPE: compound_strategy

@@ -1,0 +1,108 @@
+### Part 1: Modified Logic Tree
+
+```
+MODIFIED LOGIC TREE:
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  (decorrelated with materialized CTEs)
+    ├── [CTE] filtered_items  [+]
+    │   ├── SCAN item
+    │   └── FILTER (i_manufact_id IN (47,226,612,676,818) OR i_manager_id BETWEEN 71 AND 100)
+    ├── [CTE] filtered_dates  [+]
+    │   ├── SCAN date_dim
+    │   └── FILTER (d_date BETWEEN '1998-01-06' AND '1998-01-06'::date + interval '90 day')
+    ├── [CTE] item_avg_threshold  [+]
+    │   ├── SCAN catalog_sales
+    │   ├── JOIN filtered_dates (d_date_sk = cs_sold_date_sk)
+    │   ├── FILTER (cs_list_price BETWEEN 108 AND 137 AND cs_sales_price/cs_list_price BETWEEN 0.23 AND 0.43)
+    │   └── AGGREGATE (GROUP BY cs_item_sk, 1.3*AVG(cs_ext_discount_amt))
+    ├── [CTE] main_join  [+]
+    │   ├── SCAN catalog_sales
+    │   ├── JOIN filtered_items (i_item_sk = cs_item_sk)
+    │   ├── JOIN filtered_dates (d_date_sk = cs_sold_date_sk)
+    │   ├── JOIN item_avg_threshold (cs_item_sk)
+    │   └── FILTER (cs_ext_discount_amt > threshold)
+    └── [MAIN] final_aggregate  [~]
+        ├── AGGREGATE (SUM(cs_ext_discount_amt))
+        ├── SORT (SUM(cs_ext_discount_amt) ASC)
+        └── LIMIT 100
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "decorrelate_subquery",
+      "description": "Convert correlated subquery to materialized CTEs: pre-filter dimension tables, compute per-item thresholds, then join",
+      "applied_to": ["main_query"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_items": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT i_item_sk, i_manufact_id, i_manager_id FROM item WHERE (i_manufact_id IN (47, 226, 612, 676, 818) OR i_manager_id BETWEEN 71 AND 100)",
+          "interfaces": {
+            "outputs": ["i_item_sk", "i_manufact_id", "i_manager_id"],
+            "consumes": []
+          }
+        },
+        "filtered_dates": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN '1998-01-06' AND CAST('1998-01-06' AS DATE) + INTERVAL '90 DAY'",
+          "interfaces": {
+            "outputs": ["d_date_sk", "d_date"],
+            "consumes": []
+          }
+        },
+        "item_avg_threshold": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT cs.cs_item_sk, 1.3 * AVG(cs.cs_ext_discount_amt) AS threshold FROM catalog_sales cs JOIN filtered_dates fd ON fd.d_date_sk = cs.cs_sold_date_sk WHERE cs.cs_list_price BETWEEN 108 AND 137 AND cs.cs_sales_price / cs.cs_list_price BETWEEN 23 * 0.01 AND 43 * 0.01 GROUP BY cs.cs_item_sk",
+          "interfaces": {
+            "outputs": ["cs_item_sk", "threshold"],
+            "consumes": ["filtered_dates"]
+          }
+        },
+        "main_join": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT cs.cs_ext_discount_amt FROM catalog_sales cs JOIN filtered_items fi ON fi.i_item_sk = cs.cs_item_sk JOIN filtered_dates fd ON fd.d_date_sk = cs.cs_sold_date_sk JOIN item_avg_threshold iat ON iat.cs_item_sk = cs.cs_item_sk WHERE cs.cs_ext_discount_amt > iat.threshold",
+          "interfaces": {
+            "outputs": ["cs_ext_discount_amt"],
+            "consumes": ["filtered_items", "filtered_dates", "item_avg_threshold"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT SUM(cs_ext_discount_amt) AS \"excess discount amount\" FROM main_join ORDER BY 1 LIMIT 100",
+          "interfaces": {
+            "outputs": ["excess discount amount"],
+            "consumes": ["main_join"]
+          }
+        }
+      },
+      "reconstruction_order": ["filtered_items", "filtered_dates", "item_avg_threshold", "main_join", "main_query"],
+      "assembly_template": "WITH filtered_items AS MATERIALIZED ({filtered_items}), filtered_dates AS MATERIALIZED ({filtered_dates}), item_avg_threshold AS MATERIALIZED ({item_avg_threshold}), main_join AS MATERIALIZED ({main_join}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
+  "validation_checks": []
+}
+```
+
+**Changes:** Eliminated the correlated subquery by precomputing per-item discount thresholds in a materialized CTE, then joining it with the filtered fact and dimension tables. This replaces N repeated subquery executions with a single grouped aggregation plus a hash join.
+
+**Expected speedup:** 10-100x depending on data distribution, by removing the correlated execution penalty and enabling parallel scan optimizations on the fact CTEs.

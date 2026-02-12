@@ -1,0 +1,83 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [MAIN] main_query  [=]  Cost: 100%  Rows: ~100
+├── [CTE] date_filter  [+]  Cost: 0%  Rows: 365  — Filter date_dim to 12-month window
+├── [CTE] fact_with_date  [+]  Cost: 17%  Rows: 5.5M  — Join store_sales with filtered dates
+├── [CTE] store_item_revenue_window  [+]  Cost: 49%  Rows: 2.7M  — Compute per-store-item revenue and store average via window function
+├── [CTE] filtered_pairs  [+]  Cost: 32%  Rows: 243K  — Apply 10% revenue threshold
+├── [CTE] join_store_item  [+]  Cost: 2%  Rows: 243K  — Join with store and item dimension tables
+└── [~] top_n  [~]  Cost: 0%  Rows: 100  — Order and limit (formerly embedded in main)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extract date filter to reusable CTE eliminating duplicate scans", "applied_to": ["date_filter"]},
+    {"id": "R2", "type": "single_pass_aggregation", "description": "Replace separate store average aggregation with window function over same grouping", "applied_to": ["store_item_revenue_window"]},
+    {"id": "R3", "type": "cte_pipeline", "description": "Structure as linear CTE pipeline matching target logical tree", "applied_to": ["fact_with_date", "store_item_revenue_window", "filtered_pairs", "join_store_item", "top_n"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1221 AND 1221+11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "fact_with_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_store_sk, ss_item_sk, ss_sales_price FROM store_sales INNER JOIN date_filter ON store_sales.ss_sold_date_sk = date_filter.d_date_sk",
+        "interfaces": {"outputs": ["ss_store_sk", "ss_item_sk", "ss_sales_price"], "consumes": ["date_filter"]}
+      },
+      "store_item_revenue_window": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue, AVG(SUM(ss_sales_price)) OVER (PARTITION BY ss_store_sk) AS ave FROM fact_with_date GROUP BY ss_store_sk, ss_item_sk",
+        "interfaces": {"outputs": ["ss_store_sk", "ss_item_sk", "revenue", "ave"], "consumes": ["fact_with_date"]}
+      },
+      "filtered_pairs": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_store_sk, ss_item_sk, revenue FROM store_item_revenue_window WHERE revenue <= 0.1 * ave",
+        "interfaces": {"outputs": ["ss_store_sk", "ss_item_sk", "revenue"], "consumes": ["store_item_revenue_window"]}
+      },
+      "join_store_item": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT store.s_store_name, item.i_item_desc, filtered_pairs.revenue, item.i_current_price, item.i_wholesale_cost, item.i_brand FROM filtered_pairs INNER JOIN store ON filtered_pairs.ss_store_sk = store.s_store_sk INNER JOIN item ON filtered_pairs.ss_item_sk = item.i_item_sk",
+        "interfaces": {"outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"], "consumes": ["filtered_pairs"]}
+      },
+      "top_n": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand FROM join_store_item ORDER BY s_store_name ASC, i_item_desc ASC LIMIT 100",
+        "interfaces": {"outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"], "consumes": ["join_store_item"]}
+      }
+    },
+    "reconstruction_order": ["date_filter", "fact_with_date", "store_item_revenue_window", "filtered_pairs", "join_store_item", "top_n"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), fact_with_date AS ({fact_with_date}), store_item_revenue_window AS ({store_item_revenue_window}), filtered_pairs AS ({filtered_pairs}), join_store_item AS ({join_store_item}) {top_n}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": [
+    "Output columns match original: s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand",
+    "Date range preserved: 1221 to 1221+11",
+    "Threshold preserved: revenue <= 0.1 * ave",
+    "Ordering preserved: s_store_name ASC, i_item_desc ASC",
+    "LIMIT 100 preserved"
+  ]
+}
+```
+
+**Changes**: Restructured original query into explicit CTE pipeline matching target logical tree. The key optimization computes store average via window function `AVG(SUM(...)) OVER (PARTITION BY ss_store_sk)` in the same pass as per-store-item revenue aggregation, eliminating a separate group-by and self-join.
+
+**Expected speedup**: ~1.2-1.5x due to reduced duplicate date-dimension filtering and single-pass aggregation. The window function overhead is acceptable given the 2.7M rows and ~52 store partitions.

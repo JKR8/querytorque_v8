@@ -1,0 +1,78 @@
+**Part 1: Modified Logic Tree**
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Structural change: Uses CTEs and explicit joins
+    ├── [+] date_cte (new CTE) 
+    │   └── SCAN date_dim (filtered: 61-day window)
+    ├── [+] item_cte (new CTE)
+    │   └── SCAN item (filtered: Shoes category, manager_id 42-81)
+    ├── [~] fact_hash_join (replaces original FROM clause)
+    │   ├── SCAN catalog_sales
+    │   ├── HASH JOIN date_cte (cs_sold_date_sk = d_date_sk)
+    │   ├── HASH JOIN item_cte (cs_item_sk = i_item_sk)
+    │   ├── HASH JOIN warehouse (cs_warehouse_sk = w_warehouse_sk)
+    │   ├── LEFT HASH JOIN catalog_returns (cs_order_number = cr_order_number, cs_item_sk = cr_item_sk, cr_reason_sk = 40)
+    │   └── FILTER cs_wholesale_cost BETWEEN 68 AND 87
+    ├── [~] aggregation (unchanged logic, now operates on fact_hash_join)
+    │   ├── GROUP BY w_state, i_item_id
+    │   ├── AGGREGATE sales_before (sum with date guard)
+    │   └── AGGREGATE sales_after (sum with date guard)
+    ├── [=] SORT (w_state ASC, i_item_id ASC)
+    └── [=] OUTPUT (w_state, i_item_id, sales_before, sales_after)
+```
+
+**Part 2: Component Payload JSON**
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefetch", "description": "Isolate selective dimension filters into CTEs before joining to fact table", "applied_to": ["date_cte", "item_cte"]},
+    {"id": "R2", "type": "explicit_joins", "description": "Replace comma-separated joins with explicit INNER/LEFT JOIN syntax", "applied_to": ["fact_hash_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN (CAST('2002-02-20' AS DATE) - INTERVAL '30 DAY') AND (CAST('2002-02-20' AS DATE) + INTERVAL '30 DAY')",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_category = 'Shoes' AND i_manager_id BETWEEN 42 AND 81",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "fact_hash_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT w.w_state, i.i_item_id, d.d_date, cs.cs_sales_price, cr.cr_refunded_cash FROM catalog_sales cs INNER JOIN date_cte d ON (cs.cs_sold_date_sk = d.d_date_sk) INNER JOIN item_cte i ON (cs.cs_item_sk = i.i_item_sk) INNER JOIN warehouse w ON (cs.cs_warehouse_sk = w.w_warehouse_sk) LEFT OUTER JOIN catalog_returns cr ON (cs.cs_order_number = cr.cr_order_number AND cs.cs_item_sk = cr.cr_item_sk AND cr.cr_reason_sk = 40) WHERE cs.cs_wholesale_cost BETWEEN 68 AND 87",
+        "interfaces": {"outputs": ["w_state", "i_item_id", "d_date", "cs_sales_price", "cr_refunded_cash"], "consumes": ["date_cte", "item_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT w_state, i_item_id, SUM(CASE WHEN (CAST(d_date AS DATE) < CAST('2002-02-20' AS DATE)) THEN cs_sales_price - COALESCE(cr_refunded_cash, 0) ELSE 0 END) AS sales_before, SUM(CASE WHEN (CAST(d_date AS DATE) >= CAST('2002-02-20' AS DATE)) THEN cs_sales_price - COALESCE(cr_refunded_cash, 0) ELSE 0 END) AS sales_after FROM fact_hash_join GROUP BY w_state, i_item_id ORDER BY w_state, i_item_id LIMIT 100",
+        "interfaces": {"outputs": ["w_state", "i_item_id", "sales_before", "sales_after"], "consumes": ["fact_hash_join"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "item_cte", "fact_hash_join", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), item_cte AS ({item_cte}), fact_hash_join AS ({fact_hash_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL enable_nestloop = off", "SET LOCAL enable_hashjoin = on", "SET LOCAL work_mem = '32MB'"],
+  "validation_checks": []
+}
+```
+
+**Mechanism Explanation**
+
+Changes: Pre-filtered date_dim and item into tiny CTEs, then used explicit hash joins with the fact table. This forces the optimizer to build hash tables from the small dimension sets and probe against catalog_sales, avoiding nested loops that might perform poorly when dimension tables are large.
+
+Expected speedup: 2–3× from better join planning and reduced intermediate cardinality. The SET LOCAL commands force hash joins (optimal for this pattern) and allocate sufficient work_mem for the hash tables.

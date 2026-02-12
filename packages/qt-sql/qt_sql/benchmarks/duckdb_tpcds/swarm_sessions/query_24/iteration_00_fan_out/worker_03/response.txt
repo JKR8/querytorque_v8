@@ -1,0 +1,184 @@
+## Modified Logic Tree
+
+```
+QUERY: (two independent statements with shared CTE structure)
+├── [CTE] filtered_store  [+]  — New CTE: pre-filtered store dimension with market=8
+│   ├── SCAN store
+│   ├── FILTER s_market_id = 8
+│   └── OUTPUT s_store_sk, s_store_name, s_state, s_zip
+├── [CTE] filtered_customer_addr  [+]  — New CTE: joined customer+address with birth country mismatch
+│   ├── SCAN customer
+│   ├── JOIN customer_address ON c_current_addr_sk = ca_address_sk
+│   ├── FILTER c_birth_country <> UPPER(ca_country)
+│   └── OUTPUT c_customer_sk, c_last_name, c_first_name, ca_zip
+├── [CTE] fact_join  [+]  — New CTE: core fact joins with dimension pre-filters
+│   ├── SCAN store_sales
+│   ├── JOIN store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+│   ├── JOIN filtered_store ON ss_store_sk = s_store_sk
+│   ├── JOIN filtered_customer_addr ON ss_customer_sk = c_customer_sk AND s_zip = ca_zip
+│   ├── JOIN item ON ss_item_sk = i_item_sk
+│   └── OUTPUT ss_net_profit, c_last_name, c_first_name, s_store_name, i_color, i_current_price, i_manager_id, i_units, i_size, ca_state, s_state
+├── [CTE] agg_all  [+]  — New CTE: aggregated net profit by all dimensions
+│   ├── SCAN fact_join
+│   ├── AGG GROUP BY c_last_name, c_first_name, s_store_name, ca_state, s_state, i_color, i_current_price, i_manager_id, i_units, i_size
+│   └── OUTPUT c_last_name, c_first_name, s_store_name, ca_state, s_state, i_color, i_current_price, i_manager_id, i_units, i_size, netpaid
+├── [CTE] threshold_cte  [+]  — New CTE: compute 5% threshold from all aggregated data
+│   ├── SCAN agg_all
+│   ├── AGG 0.05 * AVG(netpaid) AS threshold
+│   └── OUTPUT threshold
+├── [CTE] color_split  [+]  — New CTE: filter to relevant colors after aggregation
+│   ├── SCAN agg_all
+│   ├── FILTER i_color IN ('beige', 'blue')
+│   └── OUTPUT c_last_name, c_first_name, s_store_name, i_color, netpaid
+└── [STATEMENT 1] final_beige  [+]  — Final query for beige items
+    ├── SCAN color_split CROSS JOIN threshold_cte
+    ├── FILTER i_color = 'beige'
+    ├── AGG GROUP BY c_last_name, c_first_name, s_store_name, threshold
+    ├── HAVING SUM(netpaid) > threshold
+    └── OUTPUT c_last_name, c_first_name, s_store_name, paid
+
+QUERY: (second independent statement)
+├── [CTE] filtered_store  [=]  — Same as first statement
+├── [CTE] filtered_customer_addr  [=]  — Same as first statement
+├── [CTE] fact_join  [=]  — Same as first statement
+├── [CTE] agg_all  [=]  — Same as first statement
+├── [CTE] threshold_cte  [=]  — Same as first statement
+├── [CTE] color_split  [=]  — Same as first statement
+└── [STATEMENT 2] final_blue  [+]  — Final query for blue items
+    ├── SCAN color_split CROSS JOIN threshold_cte
+    ├── FILTER i_color = 'blue'
+    ├── AGG GROUP BY c_last_name, c_first_name, s_store_name, threshold
+    ├── HAVING SUM(netpaid) > threshold
+    └── OUTPUT c_last_name, c_first_name, s_store_name, paid
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter store dimension to market=8", "applied_to": ["filtered_store"]},
+    {"id": "R2", "type": "multi_dimension_prefetch", "description": "Pre-join customer+address with birth country mismatch", "applied_to": ["filtered_customer_addr"]},
+    {"id": "R3", "type": "prefetch_fact_join", "description": "Stage join pipeline: join facts with pre-filtered dimensions", "applied_to": ["fact_join"]},
+    {"id": "R4", "type": "aggregation_split", "description": "Separate full aggregation from color filtering", "applied_to": ["agg_all", "color_split"]},
+    {"id": "R5", "type": "threshold_materialization", "description": "Compute threshold once from full aggregated data", "applied_to": ["threshold_cte"]},
+    {"id": "R6", "type": "final_split", "description": "Separate final queries per color with shared CTEs", "applied_to": ["final_beige", "final_blue"]}
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_store": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT s_store_sk, s_store_name, s_state, s_zip FROM store WHERE s_market_id = 8",
+          "interfaces": {"outputs": ["s_store_sk", "s_store_name", "s_state", "s_zip"], "consumes": []}
+        },
+        "filtered_customer_addr": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT c_customer_sk, c_last_name, c_first_name, ca_zip FROM customer JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE c_birth_country <> UPPER(ca_country)",
+          "interfaces": {"outputs": ["c_customer_sk", "c_last_name", "c_first_name", "ca_zip"], "consumes": []}
+        },
+        "fact_join": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ss.ss_net_profit, fca.c_last_name, fca.c_first_name, fs.s_store_name, i.i_color, i.i_current_price, i.i_manager_id, i.i_units, i.i_size, fca.ca_zip, fs.s_state FROM store_sales ss JOIN store_returns sr ON ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_item_sk = sr.sr_item_sk JOIN filtered_store fs ON ss.ss_store_sk = fs.s_store_sk JOIN filtered_customer_addr fca ON ss.ss_customer_sk = fca.c_customer_sk AND fs.s_zip = fca.ca_zip JOIN item i ON ss.ss_item_sk = i.i_item_sk",
+          "interfaces": {"outputs": ["ss_net_profit", "c_last_name", "c_first_name", "s_store_name", "i_color", "i_current_price", "i_manager_id", "i_units", "i_size", "ca_state", "s_state"], "consumes": ["filtered_store", "filtered_customer_addr"]}
+        },
+        "agg_all": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT c_last_name, c_first_name, s_store_name, ca_state, s_state, i_color, i_current_price, i_manager_id, i_units, i_size, SUM(ss_net_profit) AS netpaid FROM fact_join GROUP BY c_last_name, c_first_name, s_store_name, ca_state, s_state, i_color, i_current_price, i_manager_id, i_units, i_size",
+          "interfaces": {"outputs": ["c_last_name", "c_first_name", "s_store_name", "ca_state", "s_state", "i_color", "i_current_price", "i_manager_id", "i_units", "i_size", "netpaid"], "consumes": ["fact_join"]}
+        },
+        "threshold_cte": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT 0.05 * AVG(netpaid) AS threshold FROM agg_all",
+          "interfaces": {"outputs": ["threshold"], "consumes": ["agg_all"]}
+        },
+        "color_split": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT c_last_name, c_first_name, s_store_name, i_color, netpaid FROM agg_all WHERE i_color IN ('beige', 'blue')",
+          "interfaces": {"outputs": ["c_last_name", "c_first_name", "s_store_name", "i_color", "netpaid"], "consumes": ["agg_all"]}
+        },
+        "final_beige": {
+          "type": "main_query",
+          "change": "new",
+          "sql": "SELECT c_last_name, c_first_name, s_store_name, SUM(netpaid) AS paid FROM color_split CROSS JOIN threshold_cte WHERE i_color = 'beige' GROUP BY c_last_name, c_first_name, s_store_name, threshold HAVING SUM(netpaid) > threshold ORDER BY c_last_name, c_first_name, s_store_name",
+          "interfaces": {"outputs": ["c_last_name", "c_first_name", "s_store_name", "paid"], "consumes": ["color_split", "threshold_cte"]}
+        }
+      },
+      "reconstruction_order": ["filtered_store", "filtered_customer_addr", "fact_join", "agg_all", "threshold_cte", "color_split", "final_beige"],
+      "assembly_template": "WITH filtered_store AS ({filtered_store}), filtered_customer_addr AS ({filtered_customer_addr}), fact_join AS ({fact_join}), agg_all AS ({agg_all}), threshold_cte AS ({threshold_cte}), color_split AS ({color_split}) {final_beige}"
+    },
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_store": {
+          "type": "cte",
+          "change": "unchanged",
+          "sql": "",
+          "interfaces": {"outputs": ["s_store_sk", "s_store_name", "s_state", "s_zip"], "consumes": []}
+        },
+        "filtered_customer_addr": {
+          "type": "cte",
+          "change": "unchanged",
+          "sql": "",
+          "interfaces": {"outputs": ["c_customer_sk", "c_last_name", "c_first_name", "ca_zip"], "consumes": []}
+        },
+        "fact_join": {
+          "type": "cte",
+          "change": "unchanged",
+          "sql": "",
+          "interfaces": {"outputs": ["ss_net_profit", "c_last_name", "c_first_name", "s_store_name", "i_color", "i_current_price", "i_manager_id", "i_units", "i_size", "ca_state", "s_state"], "consumes": ["filtered_store", "filtered_customer_addr"]}
+        },
+        "agg_all": {
+          "type": "cte",
+          "change": "unchanged",
+          "sql": "",
+          "interfaces": {"outputs": ["c_last_name", "c_first_name", "s_store_name", "ca_state", "s_state", "i_color", "i_current_price", "i_manager_id", "i_units", "i_size", "netpaid"], "consumes": ["fact_join"]}
+        },
+        "threshold_cte": {
+          "type": "cte",
+          "change": "unchanged",
+          "sql": "",
+          "interfaces": {"outputs": ["threshold"], "consumes": ["agg_all"]}
+        },
+        "color_split": {
+          "type": "cte",
+          "change": "unchanged",
+          "sql": "",
+          "interfaces": {"outputs": ["c_last_name", "c_first_name", "s_store_name", "i_color", "netpaid"], "consumes": ["agg_all"]}
+        },
+        "final_blue": {
+          "type": "main_query",
+          "change": "new",
+          "sql": "SELECT c_last_name, c_first_name, s_store_name, SUM(netpaid) AS paid FROM color_split CROSS JOIN threshold_cte WHERE i_color = 'blue' GROUP BY c_last_name, c_first_name, s_store_name, threshold HAVING SUM(netpaid) > threshold ORDER BY c_last_name, c_first_name, s_store_name",
+          "interfaces": {"outputs": ["c_last_name", "c_first_name", "s_store_name", "paid"], "consumes": ["color_split", "threshold_cte"]}
+        }
+      },
+      "reconstruction_order": ["filtered_store", "filtered_customer_addr", "fact_join", "agg_all", "threshold_cte", "color_split", "final_blue"],
+      "assembly_template": "WITH filtered_store AS ({filtered_store}), filtered_customer_addr AS ({filtered_customer_addr}), fact_join AS ({fact_join}), agg_all AS ({agg_all}), threshold_cte AS ({threshold_cte}), color_split AS ({color_split}) {final_blue}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": [
+    "All CTEs produce exact output columns as specified in node contracts",
+    "Threshold computed from full agg_all (not filtered by color)",
+    "s_zip = ca_zip join preserved between filtered_store and filtered_customer_addr",
+    "Final outputs match required schema: c_last_name, c_first_name, s_store_name, paid"
+  ]
+}
+```
+
+**Changes**: Restructured into staged CTE pipeline: pre-filter dimensions (store, customer+address), join with facts, aggregate fully, then filter colors and compute threshold once. Each final query uses shared CTEs but separate main queries.
+
+**Expected speedup**: ~2.5-3x through dimension pre-filtering (reducing fact table joins) and threshold computation materialization (avoiding correlated subquery).

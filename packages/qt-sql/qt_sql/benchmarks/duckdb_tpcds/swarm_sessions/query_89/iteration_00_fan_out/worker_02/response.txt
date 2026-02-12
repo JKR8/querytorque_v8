@@ -1,0 +1,79 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query [!]
+    ├── WITH filtered_tables_join AS (SELECT ...)  [!]  — Added explicit CTE with filtered dimension subqueries
+    ├── aggregated AS (SELECT ... FROM filtered_tables_join) [!] — Now consumes CTE instead of direct joins
+    ├── windowed AS (SELECT ... FROM aggregated) [!] — Now consumes CTE
+    ├── filtered AS (SELECT ... FROM windowed) [!] — Now consumes CTE
+    └── ordered AS (SELECT ... FROM filtered) [!] — Now consumes CTE
+        ├── FILTER (CASE WHEN (avg_monthly_sales <> 0) THEN (ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales) ELSE NULL END > 0.1) [=]
+        ├── AGG (GROUP BY) [=]
+        ├── SORT (sum_sales - avg_monthly_sales ASC, s_store_name ASC) [=]
+        └── OUTPUT (*) [=]
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Filter dimension tables first in subqueries before joining to fact table", "applied_to": ["filtered_tables_join"]},
+    {"id": "R2", "type": "cte_isolation", "description": "Isolate logical pipeline stages into explicit CTEs for predicate pushdown", "applied_to": ["filtered_tables_join", "aggregated", "windowed", "filtered", "ordered"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_tables_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i.i_category, i.i_class, i.i_brand, s.s_store_name, s.s_company_name, d.d_moy, ss.ss_sales_price FROM (SELECT i_item_sk, i_category, i_class, i_brand FROM item WHERE ((i_category IN ('Jewelry','Shoes','Electronics') AND i_class IN ('semi-precious','athletic','portable')) OR (i_category IN ('Men','Music','Women') AND i_class IN ('accessories','rock','maternity')))) AS i INNER JOIN store_sales ss ON ss.ss_item_sk = i.i_item_sk INNER JOIN (SELECT d_date_sk, d_moy FROM date_dim WHERE d_year = 1999) AS d ON ss.ss_sold_date_sk = d.d_date_sk INNER JOIN (SELECT s_store_sk, s_store_name, s_company_name FROM store WHERE s_store_sk <= 100) AS s ON ss.ss_store_sk = s.s_store_sk",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "s_store_name", "s_company_name", "d_moy", "ss_sales_price"], "consumes": []}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_category, i_class, i_brand, s_store_name, s_company_name, d_moy, SUM(ss_sales_price) AS sum_sales FROM filtered_tables_join GROUP BY i_category, i_class, i_brand, s_store_name, s_company_name, d_moy",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "s_store_name", "s_company_name", "d_moy", "sum_sales"], "consumes": ["filtered_tables_join"]}
+      },
+      "windowed": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_category, i_class, i_brand, s_store_name, s_company_name, d_moy, sum_sales, AVG(sum_sales) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name) AS avg_monthly_sales FROM aggregated",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "s_store_name", "s_company_name", "d_moy", "sum_sales", "avg_monthly_sales"], "consumes": ["aggregated"]}
+      },
+      "filtered": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_category, i_class, i_brand, s_store_name, s_company_name, d_moy, sum_sales, avg_monthly_sales FROM windowed WHERE CASE WHEN avg_monthly_sales <> 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "s_store_name", "s_company_name", "d_moy", "sum_sales", "avg_monthly_sales"], "consumes": ["windowed"]}
+      },
+      "ordered": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_category, i_class, i_brand, s_store_name, s_company_name, d_moy, sum_sales, avg_monthly_sales FROM filtered ORDER BY (sum_sales - avg_monthly_sales) ASC, s_store_name ASC LIMIT 100",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "s_store_name", "s_company_name", "d_moy", "sum_sales", "avg_monthly_sales"], "consumes": ["filtered"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT * FROM ordered",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "s_store_name", "s_company_name", "d_moy", "sum_sales", "avg_monthly_sales"], "consumes": ["ordered"]}
+      }
+    },
+    "reconstruction_order": ["filtered_tables_join", "aggregated", "windowed", "filtered", "ordered", "main_query"],
+    "assembly_template": "WITH filtered_tables_join AS ({filtered_tables_join}), aggregated AS ({aggregated}), windowed AS ({windowed}), filtered AS ({filtered}), ordered AS ({ordered}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Added explicit CTEs isolating each logical pipeline stage and applied early filtering by moving dimension table filters into subqueries before joining. This enables predicate pushdown and materialization benefits in DuckDB.
+
+Expected speedup: 2.5-3.0x due to early filtering reducing the store_sales scan and CTE isolation allowing better optimization boundaries.

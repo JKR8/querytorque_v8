@@ -1,0 +1,80 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [+]  Cost: 100%  — CTE pipeline: filter dimensions, join with fact, aggregate, sort
+    ├── [~] WITH filtered_date AS (...)  [NEW CTE]
+    ├── [~] WITH filtered_item AS (...)  [NEW CTE]
+    ├── [~] WITH prefetched_sales AS (...)  [NEW CTE]
+    ├── [~] WITH aggregated AS (...)  [NEW CTE]
+    ├── [~] WITH sorted_limited AS (...)  [NEW CTE]
+    ├── [=] OUTPUT (d_year, brand_id, brand, ext_price)
+    └── [=] ORDER BY + LIMIT
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Filter date_dim and item into separate CTEs before joining with fact table", "applied_to": ["filtered_date", "filtered_item"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Staged join pipeline: join filtered dimensions with fact table in dedicated CTE", "applied_to": ["prefetched_sales"]},
+    {"id": "R3", "type": "multi_dimension_prefetch", "description": "Apply selective filters to both dimension tables before fact table join", "applied_to": ["filtered_date", "filtered_item"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT dt.d_date_sk, dt.d_year FROM date_dim dt WHERE dt.d_moy = 12 AND dt.d_year = 2002",
+        "interfaces": {"outputs": ["d_date_sk", "d_year"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_brand_id, i_brand FROM item WHERE i_manager_id = 1",
+        "interfaces": {"outputs": ["i_item_sk", "i_brand_id", "i_brand"], "consumes": []}
+      },
+      "prefetched_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT fd.d_year, fi.i_brand_id, fi.i_brand, ss.ss_ext_sales_price FROM store_sales ss INNER JOIN filtered_date fd ON ss.ss_sold_date_sk = fd.d_date_sk INNER JOIN filtered_item fi ON ss.ss_item_sk = fi.i_item_sk",
+        "interfaces": {"outputs": ["d_year", "i_brand_id", "i_brand", "ss_ext_sales_price"], "consumes": ["filtered_date", "filtered_item"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_year, i_brand_id AS brand_id, i_brand AS brand, SUM(ss_ext_sales_price) AS ext_price FROM prefetched_sales GROUP BY d_year, i_brand, i_brand_id",
+        "interfaces": {"outputs": ["d_year", "brand_id", "brand", "ext_price"], "consumes": ["prefetched_sales"]}
+      },
+      "sorted_limited": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_year, brand_id, brand, ext_price FROM aggregated ORDER BY d_year ASC, ext_price DESC, brand_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["d_year", "brand_id", "brand", "ext_price"], "consumes": ["aggregated"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT d_year, brand_id, brand, ext_price FROM sorted_limited",
+        "interfaces": {"outputs": ["d_year", "brand_id", "brand", "ext_price"], "consumes": ["sorted_limited"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "prefetched_sales", "aggregated", "sorted_limited", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), prefetched_sales AS ({prefetched_sales}), aggregated AS ({aggregated}), sorted_limited AS ({sorted_limited}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Mechanism
+
+Changes: Restructured the query into a CTE pipeline that pre-filters both dimension tables (date_dim and item) into small hash tables, then joins them with the fact table (store_sales) in a dedicated CTE before aggregation and sorting. This creates staged reduction that prevents predicate pushdown blindness across CTE boundaries.
+
+Expected speedup: 1.8-2.5x based on similar patterns where dimension tables have high selectivity filters.

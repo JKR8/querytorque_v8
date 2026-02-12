@@ -1,0 +1,123 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (structured as CTEs)
+├── [MAIN] main_query [~] — Final aggregation with sort and limit
+│   └── CONSUMES: aggregate
+│
+├── [!] aggregate [~] — Group by ZIP and city, sum sales price
+│   └── CONSUMES: dedup_fact_keys
+│
+├── [!] dedup_fact_keys [~] — Remove duplicate fact rows across OR branches
+│   └── CONSUMES: union_all
+│
+├── [!] union_all [~] — Combine ZIP-branch and item-branch results
+│   ├── CONSUMES: zip_branch
+│   └── CONSUMES: item_branch
+│
+├── [!] item_branch [~] — Sales for key items (joins date, item, customer, address)
+│   ├── CONSUMES: date_filtered
+│   └── CONSUMES: item_filtered
+│
+├── [!] zip_branch [~] — Sales for target ZIP prefixes (joins date, customer, address)
+│   ├── CONSUMES: date_filtered
+│   └── CONSUMES: zip_customers
+│
+├── [+] item_filtered [~] — Filter for key item SKs
+│
+├── [+] zip_customers [~] — Filter for target ZIP prefixes
+│
+└── [+] date_filtered [~] — Filter for Q2 2000 dates
+```
+
+**Changes from original:**
+- `[!]` Structural change: Converted single-block query into OR-to-UNION decomposition with CTEs
+- `[+]` Added three dimension-filtering CTEs (`date_filtered`, `zip_customers`, `item_filtered`)
+- `[!]` Created two separate fact-scan branches (`zip_branch`, `item_branch`) that apply selective predicates early
+- `[!]` Added `union_all` to combine branches with UNION ALL
+- `[!]` Added `dedup_fact_keys` to remove duplicate fact rows that satisfy both OR conditions
+- `[~]` Modified `aggregate` and `main_query` to use CTE-based flow
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "or_to_union", "description": "Split OR on customer_address.ca_zip vs item.i_item_id into UNION ALL branches", "applied_to": ["zip_branch", "item_branch", "union_all"]},
+    {"id": "R2", "type": "early_filter", "description": "Filter small dimension tables (date_dim, customer_address, item) into CTEs before joining to large fact table", "applied_to": ["date_filtered", "zip_customers", "item_filtered"]},
+    {"id": "R3", "type": "dimension_cte_isolate", "description": "Isolate dimension filters into CTEs for hash-join probing efficiency", "applied_to": ["date_filtered", "zip_customers", "item_filtered"]},
+    {"id": "R4", "type": "deduplicate_union", "description": "Add dedup_fact_keys to remove duplicate fact rows that satisfy both OR conditions", "applied_to": ["dedup_fact_keys"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filtered": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_qoy = 2 AND d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "zip_customers": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ca_address_sk, ca_zip, ca_city FROM customer_address WHERE substr(ca_zip, 1, 5) IN ('85669', '86197','88274','83405','86475', '85392', '85460', '80348', '81792')",
+        "interfaces": {"outputs": ["ca_address_sk", "ca_zip", "ca_city"], "consumes": []}
+      },
+      "zip_branch": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws.ws_sold_date_sk, ws.ws_item_sk, ws.ws_sales_price, zc.ca_zip, zc.ca_city, ws.ws_bill_customer_sk FROM web_sales ws INNER JOIN date_filtered df ON ws.ws_sold_date_sk = df.d_date_sk INNER JOIN customer c ON ws.ws_bill_customer_sk = c.c_customer_sk INNER JOIN zip_customers zc ON c.c_current_addr_sk = zc.ca_address_sk",
+        "interfaces": {"outputs": ["ws_sold_date_sk", "ws_item_sk", "ws_sales_price", "ca_zip", "ca_city", "ws_bill_customer_sk"], "consumes": ["date_filtered", "zip_customers"]}
+      },
+      "item_filtered": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_item_sk IN (2, 3, 5, 7, 11, 13, 17, 19, 23, 29)",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "item_branch": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws.ws_sold_date_sk, ws.ws_item_sk, ws.ws_sales_price, ca.ca_zip, ca.ca_city, ws.ws_bill_customer_sk FROM web_sales ws INNER JOIN date_filtered df ON ws.ws_sold_date_sk = df.d_date_sk INNER JOIN item_filtered it ON ws.ws_item_sk = it.i_item_sk INNER JOIN customer c ON ws.ws_bill_customer_sk = c.c_customer_sk INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk",
+        "interfaces": {"outputs": ["ws_sold_date_sk", "ws_item_sk", "ws_sales_price", "ca_zip", "ca_city", "ws_bill_customer_sk"], "consumes": ["date_filtered", "item_filtered"]}
+      },
+      "union_all": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_sold_date_sk, ws_item_sk, ws_sales_price, ca_zip, ca_city, ws_bill_customer_sk FROM zip_branch UNION ALL SELECT ws_sold_date_sk, ws_item_sk, ws_sales_price, ca_zip, ca_city, ws_bill_customer_sk FROM item_branch",
+        "interfaces": {"outputs": ["ws_sold_date_sk", "ws_item_sk", "ws_sales_price", "ca_zip", "ca_city", "ws_bill_customer_sk"], "consumes": ["zip_branch", "item_branch"]}
+      },
+      "dedup_fact_keys": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_sales_price, ca_zip, ca_city FROM union_all GROUP BY ws_sold_date_sk, ws_bill_customer_sk, ws_item_sk, ws_sales_price, ca_zip, ca_city",
+        "interfaces": {"outputs": ["ws_sales_price", "ca_zip", "ca_city"], "consumes": ["union_all"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ca_zip, ca_city, SUM(ws_sales_price) AS sum_sales FROM dedup_fact_keys GROUP BY ca_zip, ca_city",
+        "interfaces": {"outputs": ["ca_zip", "ca_city", "sum_sales"], "consumes": ["dedup_fact_keys"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ca_zip, ca_city, sum_sales FROM aggregate ORDER BY ca_zip, ca_city LIMIT 100",
+        "interfaces": {"outputs": ["ca_zip", "ca_city", "sum_sales"], "consumes": ["aggregate"]}
+      }
+    },
+    "reconstruction_order": ["date_filtered", "zip_customers", "item_filtered", "zip_branch", "item_branch", "union_all", "dedup_fact_keys", "aggregate", "main_query"],
+    "assembly_template": "WITH date_filtered AS ({date_filtered}), zip_customers AS ({zip_customers}), item_filtered AS ({item_filtered}), zip_branch AS ({zip_branch}), item_branch AS ({item_branch}), union_all AS ({union_all}), dedup_fact_keys AS ({dedup_fact_keys}), aggregate AS ({aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** OR-to-UNION decomposition with early dimension filtering. The original OR condition (customer ZIP prefix OR key item) is split into separate branches. Each branch filters small dimension tables first (date_dim, customer_address with ZIP filter, item with SK filter) before joining to the large web_sales fact table. A deduplication step removes duplicate fact rows that satisfy both conditions. The final aggregation groups by ZIP and city.
+
+**Expected speedup:** ~3-4x. The rewrite allows different access paths for each OR branch (ZIP filter can use customer_address index, item filter can use item index), avoids scanning the entire fact table with complex OR logic, and reduces join cardinality through early filtering.

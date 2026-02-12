@@ -1,0 +1,441 @@
+<reasoning>
+## 1. CLASSIFY
+This is a **multi-channel comparison query with anti-joins**. It finds customers who made store purchases in a specific period but made NO web or catalog purchases in the same period, then groups by demographics. It features:
+- **Correlated subqueries**: EXISTS/NOT EXISTS that reference outer customer key
+- **Multiple fact table scans**: store_sales, web_sales, catalog_sales each scanned independently
+- **Star-join pattern**: customer joined with address and demographics dimensions
+- **Anti-join semantics**: NOT EXISTS acts as anti-join (customers absent from web/catalog)
+
+## 2. EXPLAIN PLAN ANALYSIS
+**Total runtime: 22.5s**. Breakdown:
+
+### Dominant Bottleneck: Repeated Anti-Join Materialization
+- **Nested Loop Anti (catalog_sales)**: 22.5s total, but actual time is outer loop (986 loops) × inner materialize (207K rows) = ~8.3s materialization + join filter overhead
+- **Nested Loop Anti (web_sales)**: 7.2s total, 1011 loops × 90K rows = ~3.7s materialization
+- **Store_sales EXISTS (Semi-join)**: Only 0.3s - efficient parallel hash semi-join
+
+**Row Count Flow**:
+1. customer_address scan: 74K → 9K rows (state filter: GA/KY/SD)
+2. customer join: 167K → 18K rows (after address join)
+3. store_sales EXISTS: 18K → 337 rows (selective!)
+4. web_sales NOT EXISTS: 337 → 986 rows (wait, this INCREASES? Actually plan shows 986 rows after web anti-join - this is suspicious)
+5. catalog_sales NOT EXISTS: 986 → 914 rows
+
+**Scan Counts**:
+- date_dim: scanned 3 times independently (store, web, catalog branches)
+- store_sales: 1 scan (165K rows)
+- web_sales: 1 scan (90K rows) but materialized and probed 1011 times
+- catalog_sales: 1 scan (207K rows) but materialized and probed 986 times
+
+**Optimizer Already Handles**:
+- Store_sales EXISTS efficiently via hash semi-join with parallel workers
+- Date_dim index-only scans for all 3 branches
+- Predicate pushdown to base tables
+
+**Missed Opportunities**:
+1. **Same date filter applied 3 times independently** - could compute once
+2. **Anti-joins use nested loops with large materialized inner tables** - could use hash anti-join if restructured
+3. **Comma-separated joins** may confuse cardinality estimation
+
+## 3. GAP MATCHING
+
+### COMMA_JOIN_WEAKNESS ✓
+Query uses comma-separated joins: `customer c, customer_address ca, customer_demographics`. Matches pg_dimension_prefetch_star example.
+
+### CORRELATED_SUBQUERY_PARALYSIS ✓
+EXISTS/NOT EXISTS are correlated subqueries. However, optimizer already converts them to semi/anti-joins. The problem is the ANTI-join execution plan (nested loop with materialization). Could decorrelate by pre-computing customer sets.
+
+### CROSS_CTE_PREDICATE_BLINDNESS ✗
+Not applicable - no repeated identical fact+dimension scan pattern.
+
+### NON_EQUI_JOIN_INPUT_BLINDNESS ✗
+No non-equi joins.
+
+### SINGLE_PASS_AGGREGATION Opportunity ✓
+Three separate fact table scans could potentially be consolidated into fewer scans.
+
+## 4. AGGREGATION TRAP CHECK
+Query uses `COUNT(*)` only - no STDDEV_SAMP, VARIANCE, or FILTER clauses. COUNT(*) is grouping-insensitive (modulo duplicates). Safe to restructure as long as row membership per group is preserved.
+
+## 5. TRANSFORM SELECTION (Ranked by Expected Value)
+
+1. **star_join_prefetch** (dimension_cte_isolate): Pre-filter selective dimensions (address state, demographics) into CTEs + explicit JOINs. Addresses comma-join weakness. Historical: 2.5-3.32x.
+
+2. **decorrelation** + **scan_consolidation**: Pre-compute customer sets for each channel in CTEs, then join once. Eliminates nested loop anti-joins with materialization. Addresses correlated subquery paralysis. Novel combination but grounded in decorrelate + single_pass_aggregation principles.
+
+3. **exists_restructuring**: Convert complex NOT EXISTS pattern to LEFT JOIN + NULL check. May enable hash anti-joins. Addresses anti-join inefficiency.
+
+4. **exploration**: Try **aggregate_pushdown** - push GROUP BY below the anti-joins? Risky but novel exploration of whether grouping first reduces anti-join cost.
+
+## 6. LOGICAL TREE DESIGN
+
+**Worker 1**: star_join_prefetch
+- CTEs: filtered_address, filtered_demo, filtered_date
+- Explicit JOIN syntax
+- Preserve EXISTS/NOT EXISTS structure but with CTE-probed fact tables
+
+**Worker 2**: decorrelation + scan_consolidation
+- CTEs: store_customers, web_customers, catalog_customers (pre-computed for date/price filter)
+- Main query: JOIN filtered dimensions, then check membership in CTEs via JOINs
+- Eliminates correlated subqueries entirely
+
+**Worker 3**: exists_restructuring
+- Convert EXISTS to INNER JOIN, NOT EXISTS to LEFT JOIN + NULL
+- Use explicit JOINs with pre-filtered dimensions
+- May enable hash anti-joins
+
+**Worker 4**: aggregate_pushdown exploration
+- Push GROUP BY to before anti-joins? Actually can't - anti-joins filter rows before aggregation.
+- Alternative: pivot approach - compute all channel flags per customer in single scan, then filter and group
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+This query identifies customers in specific states with certain demographics who purchased via stores in Q2 1999 but did NOT purchase via web or catalog in the same period, then counts them by demographic attributes. JOIN semantics are INNER between customer, address, demographics; EXISTS requires at least one matching store_sales row; NOT EXISTS requires NO matching web_sales or catalog_sales rows (anti-join). Aggregation uses COUNT(*) which is duplicate-sensitive but grouping-insensitive. Filter dependencies: address state, demographic statuses, date range (1999, months 3-5), price ranges (52-141) must all be preserved exactly.
+
+BOTTLENECK_DIAGNOSIS:
+The query is join-bound with dominant cost in nested loop anti-joins for web_sales (7.2s) and catalog_sales (22.5s total), each materializing large inner tables (90K/207K rows) and probing them hundreds of times. Row flow: 18K customers after address/demo filters → 337 after store_sales EXISTS → 986 after web_sales NOT EXISTS → 914 after catalog_sales NOT EXISTS. The optimizer already handles store_sales EXISTS efficiently via parallel hash semi-join and uses index-only scans for date_dim. Logical-tree costs misleading: anti-joins dominate but appear as small percentage.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output all 8 columns exactly as in original SELECT lines 2-9.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include c_customer_sk for joins, plus all demographic columns for GROUP BY and SELECT.
+- LITERAL_PRESERVATION: All filter values (states: 'GA','KY','SD'; marital: 'D','W','U'; education: 'Primary','College'; year: 1999; months: 3-5; prices: 52-141) must be preserved exactly.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows with same grouping counts.
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated joins `customer c, customer_address ca, customer_demographics` - evidence from EXPLAIN shows sequential scan planning.
+- CORRELATED_SUBQUERY_PARALYSIS: EXISTS/NOT EXISTS are correlated subqueries - evidence from EXPLAIN shows nested loop anti-joins with materialized inner scans.
+
+REGRESSION_WARNINGS:
+1. Converting EXISTS to IN/NOT IN (observed regression 0.50x on Q069):
+   CAUSE: NOT IN with NULLs blocks hash anti-joins and changes NULL semantics.
+   RULE: Do not convert EXISTS/NOT EXISTS to IN/NOT IN; keep as EXISTS or convert to explicit ANTI JOIN.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  filtered_address -> filtered_demo -> filtered_date -> customer_base -> store_exists -> web_not_exists -> catalog_not_exists -> group_by
+NODE_CONTRACTS:
+  filtered_address:
+    FROM: customer_address
+    WHERE: ca_state IN ('GA','KY','SD')
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 9,018
+    CONSUMERS: customer_base
+  filtered_demo:
+    FROM: customer_demographics
+    WHERE: cd_marital_status IN ('D','W','U') AND cd_education_status IN ('Primary','College')
+    OUTPUT: cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    EXPECTED_ROWS: selective (exact unknown)
+    CONSUMERS: customer_base
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy BETWEEN 3 AND 5
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: store_sales_filtered, web_sales_filtered, catalog_sales_filtered
+  customer_base:
+    FROM: customer c
+    JOIN: INNER JOIN filtered_address ON c.c_current_addr_sk = filtered_address.ca_address_sk
+          INNER JOIN filtered_demo ON c.c_current_cdemo_sk = filtered_demo.cd_demo_sk
+    OUTPUT: c.c_customer_sk, filtered_demo.cd_gender, filtered_demo.cd_marital_status, filtered_demo.cd_education_status, filtered_demo.cd_purchase_estimate, filtered_demo.cd_credit_rating
+    EXPECTED_ROWS: 18,000
+    CONSUMERS: store_exists, web_not_exists, catalog_not_exists
+  store_sales_filtered:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk
+    WHERE: ss_list_price BETWEEN 52 AND 141
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: 165,000
+    CONSUMERS: store_exists
+  store_exists:
+    FROM: customer_base
+    WHERE: EXISTS (SELECT 1 FROM store_sales_filtered WHERE store_sales_filtered.ss_customer_sk = customer_base.c_customer_sk)
+    OUTPUT: same as customer_base
+    EXPECTED_ROWS: 337
+    CONSUMERS: web_not_exists
+  web_sales_filtered:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk
+    WHERE: ws_list_price BETWEEN 52 AND 141
+    OUTPUT: ws_bill_customer_sk
+    EXPECTED_ROWS: 90,000
+    CONSUMERS: web_not_exists
+  web_not_exists:
+    FROM: store_exists
+    WHERE: NOT EXISTS (SELECT 1 FROM web_sales_filtered WHERE web_sales_filtered.ws_bill_customer_sk = store_exists.c_customer_sk)
+    OUTPUT: same as store_exists
+    EXPECTED_ROWS: 986
+    CONSUMERS: catalog_not_exists
+  catalog_sales_filtered:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk
+    WHERE: cs_list_price BETWEEN 52 AND 141
+    OUTPUT: cs_ship_customer_sk
+    EXPECTED_ROWS: 207,000
+    CONSUMERS: catalog_not_exists
+  catalog_not_exists:
+    FROM: web_not_exists
+    WHERE: NOT EXISTS (SELECT 1 FROM catalog_sales_filtered WHERE catalog_sales_filtered.cs_ship_customer_sk = web_not_exists.c_customer_sk)
+    OUTPUT: same as web_not_exists
+    EXPECTED_ROWS: 914
+    CONSUMERS: group_by
+  group_by:
+    FROM: catalog_not_exists
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    AGGREGATE: COUNT(*) as cnt1, COUNT(*) as cnt2, COUNT(*) as cnt3
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3
+    EXPECTED_ROWS: 80
+    CONSUMERS: final output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, early_filter_decorrelate
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering of address and demographics into CTEs and convert comma joins to explicit JOIN syntax. Ignore the multi-dimension aspect beyond address/demo.
+- pg_date_cte_explicit_join: Use filtered_date CTE for date predicate, but keep it referenced by all three fact CTEs. Ignore that example uses only one date CTE reference.
+- early_filter_decorrelate: Push address and demo filters early into CTEs. Ignore decorrelation aspect - keep EXISTS/NOT EXISTS structure.
+HAZARD_FLAGS:
+- Materializing filtered fact CTEs (store_sales_filtered etc.) could consume memory but avoids repeated scans.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: decorrelation_consolidation
+TARGET_LOGICAL_TREE:
+  filtered_date -> store_customers, web_customers, catalog_customers -> filtered_address -> filtered_demo -> customer_base -> channel_joins -> filter -> group_by
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy BETWEEN 3 AND 5
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: store_customers, web_customers, catalog_customers
+  store_customers:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk
+    WHERE: ss_list_price BETWEEN 52 AND 141
+    OUTPUT: DISTINCT ss_customer_sk
+    EXPECTED_ROWS: much less than 165K (distinct customers)
+    CONSUMERS: channel_joins
+  web_customers:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk
+    WHERE: ws_list_price BETWEEN 52 AND 141
+    OUTPUT: DISTINCT ws_bill_customer_sk
+    EXPECTED_ROWS: distinct web customers
+    CONSUMERS: channel_joins
+  catalog_customers:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk
+    WHERE: cs_list_price BETWEEN 52 AND 141
+    OUTPUT: DISTINCT cs_ship_customer_sk
+    EXPECTED_ROWS: distinct catalog customers
+    CONSUMERS: channel_joins
+  filtered_address:
+    FROM: customer_address
+    WHERE: ca_state IN ('GA','KY','SD')
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 9,018
+    CONSUMERS: customer_base
+  filtered_demo:
+    FROM: customer_demographics
+    WHERE: cd_marital_status IN ('D','W','U') AND cd_education_status IN ('Primary','College')
+    OUTPUT: cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    EXPECTED_ROWS: selective
+    CONSUMERS: customer_base
+  customer_base:
+    FROM: customer c
+    JOIN: INNER JOIN filtered_address ON c.c_current_addr_sk = filtered_address.ca_address_sk
+          INNER JOIN filtered_demo ON c.c_current_cdemo_sk = filtered_demo.cd_demo_sk
+    OUTPUT: c.c_customer_sk, filtered_demo.cd_gender, filtered_demo.cd_marital_status, filtered_demo.cd_education_status, filtered_demo.cd_purchase_estimate, filtered_demo.cd_credit_rating
+    EXPECTED_ROWS: 18,000
+    CONSUMERS: channel_joins
+  channel_joins:
+    FROM: customer_base
+    LEFT JOIN: store_customers ON customer_base.c_customer_sk = store_customers.ss_customer_sk
+    LEFT JOIN: web_customers ON customer_base.c_customer_sk = web_customers.ws_bill_customer_sk
+    LEFT JOIN: catalog_customers ON customer_base.c_customer_sk = catalog_customers.cs_ship_customer_sk
+    OUTPUT: customer_base.*, store_customers.ss_customer_sk as has_store, web_customers.ws_bill_customer_sk as has_web, catalog_customers.cs_ship_customer_sk as has_catalog
+    EXPECTED_ROWS: 18,000
+    CONSUMERS: filter
+  filter:
+    FROM: channel_joins
+    WHERE: has_store IS NOT NULL AND has_web IS NULL AND has_catalog IS NULL
+    OUTPUT: same as customer_base
+    EXPECTED_ROWS: 914
+    CONSUMERS: group_by
+  group_by:
+    FROM: filter
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    AGGREGATE: COUNT(*) as cnt1, COUNT(*) as cnt2, COUNT(*) as cnt3
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3
+    EXPECTED_ROWS: 80
+    CONSUMERS: final output
+EXAMPLES: decorrelate, single_pass_aggregation, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+- decorrelate: Decouple correlated subqueries by pre-computing customer sets per channel. Apply DISTINCT to get unique customers per channel.
+- single_pass_aggregation: Consolidate three fact scans into independent CTEs that compute once. Ignore CASE aggregation aspect.
+- pg_materialized_dimension_fact_prefilter: Use MATERIALIZED CTEs for fact table pre-filtering. Apply to store_customers, web_customers, catalog_customers CTEs.
+HAZARD_FLAGS:
+- DISTINCT in fact CTEs adds overhead but reduces anti-join probe size.
+- LEFT JOIN + NULL check may not use hash anti-join efficiently.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: explicit_anti_join
+TARGET_LOGICAL_TREE:
+  filtered_address -> filtered_demo -> filtered_date -> customer_base -> store_join -> web_anti_join -> catalog_anti_join -> group_by
+NODE_CONTRACTS:
+  filtered_address:
+    FROM: customer_address
+    WHERE: ca_state IN ('GA','KY','SD')
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 9,018
+    CONSUMERS: customer_base
+  filtered_demo:
+    FROM: customer_demographics
+    WHERE: cd_marital_status IN ('D','W','U') AND cd_education_status IN ('Primary','College')
+    OUTPUT: cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    EXPECTED_ROWS: selective
+    CONSUMERS: customer_base
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy BETWEEN 3 AND 5
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: store_sales_filtered, web_sales_filtered, catalog_sales_filtered
+  customer_base:
+    FROM: customer c
+    JOIN: INNER JOIN filtered_address ON c.c_current_addr_sk = filtered_address.ca_address_sk
+          INNER JOIN filtered_demo ON c.c_current_cdemo_sk = filtered_demo.cd_demo_sk
+    OUTPUT: c.c_customer_sk, filtered_demo.cd_gender, filtered_demo.cd_marital_status, filtered_demo.cd_education_status, filtered_demo.cd_purchase_estimate, filtered_demo.cd_credit_rating
+    EXPECTED_ROWS: 18,000
+    CONSUMERS: store_join
+  store_sales_filtered:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk
+    WHERE: ss_list_price BETWEEN 52 AND 141
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: 165,000
+    CONSUMERS: store_join
+  store_join:
+    FROM: customer_base
+    JOIN: INNER JOIN store_sales_filtered ON customer_base.c_customer_sk = store_sales_filtered.ss_customer_sk
+    OUTPUT: same as customer_base
+    EXPECTED_ROWS: 337
+    CONSUMERS: web_anti_join
+  web_sales_filtered:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk
+    WHERE: ws_list_price BETWEEN 52 AND 141
+    OUTPUT: ws_bill_customer_sk
+    EXPECTED_ROWS: 90,000
+    CONSUMERS: web_anti_join
+  web_anti_join:
+    FROM: store_join
+    LEFT JOIN: web_sales_filtered ON store_join.c_customer_sk = web_sales_filtered.ws_bill_customer_sk
+    WHERE: web_sales_filtered.ws_bill_customer_sk IS NULL
+    OUTPUT: same as store_join
+    EXPECTED_ROWS: 986
+    CONSUMERS: catalog_anti_join
+  catalog_sales_filtered:
+    FROM: catalog_sales
+    JOIN: INNER JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk
+    WHERE: cs_list_price BETWEEN 52 AND 141
+    OUTPUT: cs_ship_customer_sk
+    EXPECTED_ROWS: 207,000
+    CONSUMERS: catalog_anti_join
+  catalog_anti_join:
+    FROM: web_anti_join
+    LEFT JOIN: catalog_sales_filtered ON web_anti_join.c_customer_sk = catalog_sales_filtered.cs_ship_customer_sk
+    WHERE: catalog_sales_filtered.cs_ship_customer_sk IS NULL
+    OUTPUT: same as web_anti_join
+    EXPECTED_ROWS: 914
+    CONSUMERS: group_by
+  group_by:
+    FROM: catalog_anti_join
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    AGGREGATE: COUNT(*) as cnt1, COUNT(*) as cnt2, COUNT(*) as cnt3
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3
+    EXPECTED_ROWS: 80
+    CONSUMERS: final output
+EXAMPLES: exists_restructuring, intersect_to_exists, pg_self_join_decomposition
+EXAMPLE_ADAPTATION:
+- exists_restructuring: Convert EXISTS to INNER JOIN, NOT EXISTS to LEFT JOIN + NULL. Apply exactly as target tree shows.
+- intersect_to_exists: Not using INTERSECT, but apply similar explicit join transformation. Ignore INTERSECT syntax.
+- pg_self_join_decomposition: Not self-join, but apply materialization of fact filters into CTEs to avoid repeated scans. Ignore self-join aspect.
+HAZARD_FLAGS:
+- LEFT JOIN + NULL may not use hash anti-join if optimizer chooses nested loop.
+- Multiple joins may produce duplicates if not careful (but fact CTEs already filtered to price/date).
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: pivot_consolidation
+TARGET_LOGICAL_TREE:
+  filtered_date -> all_sales_unified -> filtered_address -> filtered_demo -> customer_base -> pivot_join -> filter -> group_by
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_moy BETWEEN 3 AND 5
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 31
+    CONSUMERS: all_sales_unified
+  all_sales_unified:
+    FROM: (
+      SELECT ss_customer_sk as customer_sk, 'store' as channel FROM store_sales JOIN filtered_date ON ss_sold_date_sk = filtered_date.d_date_sk WHERE ss_list_price BETWEEN 52 AND 141
+      UNION ALL
+      SELECT ws_bill_customer_sk as customer_sk, 'web' as channel FROM web_sales JOIN filtered_date ON ws_sold_date_sk = filtered_date.d_date_sk WHERE ws_list_price BETWEEN 52 AND 141
+      UNION ALL
+      SELECT cs_ship_customer_sk as customer_sk, 'catalog' as channel FROM catalog_sales JOIN filtered_date ON cs_sold_date_sk = filtered_date.d_date_sk WHERE cs_list_price BETWEEN 52 AND 141
+    )
+    OUTPUT: customer_sk, channel
+    EXPECTED_ROWS: 165K + 90K + 207K = ~462K
+    CONSUMERS: pivot_join
+  filtered_address:
+    FROM: customer_address
+    WHERE: ca_state IN ('GA','KY','SD')
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 9,018
+    CONSUMERS: customer_base
+  filtered_demo:
+    FROM: customer_demographics
+    WHERE: cd_marital_status IN ('D','W','U') AND cd_education_status IN ('Primary','College')
+    OUTPUT: cd_demo_sk, cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    EXPECTED_ROWS: selective
+    CONSUMERS: customer_base
+  customer_base:
+    FROM: customer c
+    JOIN: INNER JOIN filtered_address ON c.c_current_addr_sk = filtered_address.ca_address_sk
+          INNER JOIN filtered_demo ON c.c_current_cdemo_sk = filtered_demo.cd_demo_sk
+    OUTPUT: c.c_customer_sk, filtered_demo.cd_gender, filtered_demo.cd_marital_status, filtered_demo.cd_education_status, filtered_demo.cd_purchase_estimate, filtered_demo.cd_credit_rating
+    EXPECTED_ROWS: 18,000
+    CONSUMERS: pivot_join
+  pivot_join:
+    FROM: customer_base
+    LEFT JOIN: all_sales_unified store ON customer_base.c_customer_sk = store.customer_sk AND store.channel = 'store'
+    LEFT JOIN: all_sales_unified web ON customer_base.c_customer_sk = web.customer_sk AND web.channel = 'web'
+    LEFT JOIN: all_sales_unified catalog ON customer_base.c_customer_sk = catalog.customer_sk AND catalog.channel = 'catalog'
+    OUTPUT: customer_base.*, store.customer_sk as has_store, web.customer_sk as has_web, catalog.customer_sk as has_catalog
+    EXPECTED_ROWS: 18,000
+    CONSUMERS: filter
+  filter:
+    FROM: pivot_join
+    WHERE: has_store IS NOT NULL AND has_web IS NULL AND has_catalog IS NULL
+    OUTPUT: same as customer_base
+    EXPECTED_ROWS: 914
+    CONSUMERS: group_by
+  group_by:
+    FROM: filter
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    AGGREGATE: COUNT(*) as cnt1, COUNT(*) as cnt2, COUNT(*) as cnt3
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3
+    EXPECTED_ROWS: 80
+    CONSUMERS: final output
+EXAMPLES: scan_consolidation_pivot, union_consolidation, single_pass_aggregation
+EXAMPLE_ADAPTATION:
+- scan_consolidation_pivot: Consolidate three fact scans into one UNION ALL with channel discriminator. Apply exactly.
+- union_consolidation: Share date_dim filter across UNION branches via CTE. Apply filtered_date CTE.
+- single_pass_aggregation: Single scan of each fact table via UNION ALL. Ignore CASE aggregation.
+HAZARD_FLAGS:
+- UNION ALL of large fact tables creates huge intermediate result (~462K rows).
+- Multiple LEFT JOINs to same CTE with different filters may be inefficient.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines scan_consolidation with pivot join pattern)

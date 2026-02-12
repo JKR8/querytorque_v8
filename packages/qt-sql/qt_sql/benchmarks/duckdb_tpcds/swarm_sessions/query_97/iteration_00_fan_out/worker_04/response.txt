@@ -1,0 +1,96 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] store_distinct  [~]  Cost: 33%  Rows: 5.4M  — Build distinct customer-item pairs from store sales in 12-month window.
+│   ├── SCAN (store_sales, date_dim (join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_month_seq BETWEEN 1214 AND 1214 + 11)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (customer_sk, item_sk)
+├── [CTE] catalog_distinct [~]  Cost: 33%  Rows: 2.9M  — Build distinct customer-item pairs from catalog sales in same window.
+│   ├── SCAN (catalog_sales, date_dim (join))
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_month_seq BETWEEN 1214 AND 1214 + 11)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (customer_sk, item_sk)
+├── [CTE] intersect_count  [+]  Cost: 11%  Rows: 1  — Count intersection of store_distinct and catalog_distinct.
+│   ├── SETOP (INTERSECT store_distinct, catalog_distinct)
+│   ├── AGG (COUNT)
+│   └── OUTPUT (store_and_catalog)
+├── [CTE] except_store     [+]  Cost: 11%  Rows: 1  — Count store_distinct minus catalog_distinct.
+│   ├── SETOP (EXCEPT store_distinct, catalog_distinct)
+│   ├── AGG (COUNT)
+│   └── OUTPUT (store_only)
+├── [CTE] except_catalog   [+]  Cost: 11%  Rows: 1  — Count catalog_distinct minus store_distinct.
+│   ├── SETOP (EXCEPT catalog_distinct, store_distinct)
+│   ├── AGG (COUNT)
+│   └── OUTPUT (catalog_only)
+└── [MAIN] combine         [~]  Cost: 1%  Rows: 1  — Combine three counts into single row.
+    ├── SCAN (intersect_count, except_store, except_catalog)
+    └── OUTPUT (store_only, catalog_only, store_and_catalog)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb_v1.4.3",
+  "rewrite_rules": [
+    {"id": "R1", "type": "intersect_to_exists", "description": "Replace FULL OUTER JOIN with INTERSECT/EXCEPT set operations to compute counts directly", "applied_to": ["main_query"]},
+    {"id": "R2", "type": "multi_intersect_exists_cte", "description": "Decompose original join into three separate set-operation counts computed from same base CTEs", "applied_to": ["intersect_count", "except_store", "except_catalog", "combine"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "store_distinct": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["customer_sk", "item_sk"], "consumes": []}
+      },
+      "catalog_distinct": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["customer_sk", "item_sk"], "consumes": []}
+      },
+      "intersect_count": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT COUNT(*) AS store_and_catalog FROM (SELECT customer_sk, item_sk FROM store_distinct INTERSECT SELECT customer_sk, item_sk FROM catalog_distinct)",
+        "interfaces": {"outputs": ["store_and_catalog"], "consumes": ["store_distinct", "catalog_distinct"]}
+      },
+      "except_store": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT COUNT(*) AS store_only FROM (SELECT customer_sk, item_sk FROM store_distinct EXCEPT SELECT customer_sk, item_sk FROM catalog_distinct)",
+        "interfaces": {"outputs": ["store_only"], "consumes": ["store_distinct", "catalog_distinct"]}
+      },
+      "except_catalog": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT COUNT(*) AS catalog_only FROM (SELECT customer_sk, item_sk FROM catalog_distinct EXCEPT SELECT customer_sk, item_sk FROM store_distinct)",
+        "interfaces": {"outputs": ["catalog_only"], "consumes": ["catalog_distinct", "store_distinct"]}
+      },
+      "combine": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT store_only, catalog_only, store_and_catalog FROM except_store, except_catalog, intersect_count LIMIT 100",
+        "interfaces": {"outputs": ["store_only", "catalog_only", "store_and_catalog"], "consumes": ["intersect_count", "except_store", "except_catalog"]}
+      }
+    },
+    "reconstruction_order": ["store_distinct", "catalog_distinct", "intersect_count", "except_store", "except_catalog", "combine"],
+    "assembly_template": "WITH store_distinct AS (SELECT ss_customer_sk AS customer_sk, ss_item_sk AS item_sk FROM store_sales, date_dim WHERE ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1214 AND 1214 + 11 GROUP BY ss_customer_sk, ss_item_sk), catalog_distinct AS (SELECT cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk FROM catalog_sales, date_dim WHERE cs_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1214 AND 1214 + 11 GROUP BY cs_bill_customer_sk, cs_item_sk), intersect_count AS ({intersect_count}), except_store AS ({except_store}), except_catalog AS ({except_catalog}) {combine}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Changes: Replace FULL OUTER JOIN with INTERSECT/EXCEPT set operations to compute three counts directly from base distinct pair CTEs. Expected mechanism: DuckDB can optimize set operations with hashing to avoid materializing the full join result while maintaining semantic equivalence (since columns are NOT NULL). The three independent counts can be computed in parallel from the same base CTEs.
+
+Expected speedup: 1.5-2x (set operations avoid full outer join materialization and eliminate CASE-WHEN expression evaluation per row).

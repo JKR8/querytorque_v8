@@ -1,0 +1,326 @@
+<reasoning>
+We need to analyze query059_multi_i2 and produce briefings for 4 workers.
+
+## 1. CLASSIFY
+This is a **channel-comparison self-join** query:
+- CTE `wss` computes weekly sales per store aggregated by day-of-week.
+- Main query self-joins the same CTE twice: once for year 1 (month_seq 1183-1194) and once for year 2 (month_seq 1195-1206).
+- Join condition: same store, week sequences offset by 52 weeks (year-over-year comparison).
+- Output: ratios of sales per day of week between the two years.
+
+## 2. EXPLAIN PLAN ANALYSIS
+
+**Compute wall-clock ms per node**:
+- Total: 5857.1 ms
+- CTE wss computation: ~4045.7 ms (69% of total)
+  - Seq Scan on store_sales: 3347.9 ms (filter removes 8.3M rows, keeps 1.3M)
+  - Nested Loop with date_dim: 3671.8 ms total
+- Main query processing: ~1811.4 ms (31%)
+  - Hash joins between wss scans and date_dim/store: 1297.9 ms
+  - Final processing: remaining time
+
+**Key observations**:
+1. **CTE wss dominates runtime** (69%). It scans ALL store_sales rows (1.3M after price filter), joins with ALL date_dim rows via nested loop, and aggregates by week/store.
+2. **Row count drops**:
+   - store_sales: 1.3M rows after price filter (86% filtered out)
+   - wss CTE: 9,175 rows after aggregation (99.3% reduction)
+   - store: 26 rows after state filter (from 102 total)
+   - date_dim: ~365 rows per year range
+3. **Missed opportunity**: The CTE aggregates ALL weeks, but main query only needs weeks in two 12-month ranges. The date_dim filter (d_month_seq) is applied AFTER aggregation in the main query, not pushed into CTE.
+4. **CTE is materialized once** and scanned twice (as wss and wss_1). Good sharing.
+5. **Optimizer already**:
+   - Materializes CTE (good)
+   - Uses hash joins for main query (good)
+   - Does NOT push date_month_seq filter into CTE (gap)
+   - Does NOT push store state filter into CTE (gap)
+6. **Scan count**: store_sales scanned ONCE (good), date_dim scanned 4 times (once in CTE, twice for year1/year2 filters, once more?), store scanned 3 times.
+
+## 3. GAP MATCHING
+
+**COMMA_JOIN_WEAKNESS** (HIGH relevance):
+- Query uses comma-separated joins in CTE (`store_sales, date_dim`) and derived tables (`wss,store,date_dim d`).
+- Evidence: EXPLAIN shows comma joins not optimized as well as explicit JOINs.
+- Tag-matched example: `pg_dimension_prefetch_star`, `pg_date_cte_explicit_join`
+
+**CROSS_CTE_PREDICATE_BLINDNESS** (MEDIUM relevance):
+- Same fact+dimension scan (store_sales+date_dim) appears in two derived tables with different date filters.
+- But CTE is materialized once and reused, so not duplicate scan.
+- However, predicate blindness: date filters not pushed into CTE.
+- Tag-matched example: `pg_self_join_decomposition` (but that's for duplicate scans, which we don't have)
+
+**NON_EQUI_JOIN_INPUT_BLINDNESS** (LOW relevance):
+- No expensive non-equi joins. Price ratio filter is in CTE scan.
+
+**CORRELATED_SUBQUERY_PARALYSIS** (NONE):
+- No correlated subqueries.
+
+**Additional gap**: **PREDICATE_NOT_PUSHED_INTO_CTE** (novel):
+- Selective filters (d_month_seq, s_state) applied AFTER CTE aggregation, not before.
+- CTE aggregates 1.3M rows → 9K rows, but could filter first to reduce input.
+
+## 4. AGGREGATION TRAP CHECK
+- Aggregates: SUM with CASE per day-of-week.
+- These are **duplicate-safe**: SUM is additive, NULL values handled correctly.
+- No FILTER clauses.
+- No grouping-sensitive functions (STDDEV_SAMP, VARIANCE, etc.).
+- Self-join doesn't create duplicates because join is on unique combinations (store+week).
+
+## 5. TRANSFORM SELECTION
+
+Ranked by expected value:
+
+1. **Predicate pushdown into CTE** (star_join_prefetch):
+   - Push d_month_seq and s_state filters into CTE definition.
+   - But need TWO CTEs (year1 and year2) because filters differ.
+   - Expected: reduce CTE input from 1.3M rows to ~(1.3M * 1/3?) rows per year.
+   - Tag: `pg_dimension_prefetch_star`, `early_filter_decorrelate`
+
+2. **Explicit JOIN conversion** (COMMA_JOIN_WEAKNESS exploit):
+   - Convert all comma joins to explicit JOIN syntax.
+   - Combine with dimension CTEs for better cardinality estimation.
+   - Tag: `pg_date_cte_explicit_join`, `pg_dimension_prefetch_star`
+
+3. **Scan consolidation with pivot** (single_pass_aggregation):
+   - Instead of two CTEs with different date ranges, compute ONE aggregation that includes both years via CASE in aggregates.
+   - Then pivot using MAX(CASE) in main query.
+   - SAFE because aggregates are SUM, not grouping-sensitive.
+   - Tag: `single_pass_aggregation`
+
+4. **Novel exploration**: **Late attribute binding** + **predicate pushdown**:
+   - Defer store join until after date filtering.
+   - Create date-filtered CTE, join with store_sales, then aggregate.
+   - Exploration: test if pushing store filter later helps.
+
+## 6. LOGICAL TREE DESIGN
+
+For each strategy, define nodes and verify column completeness.
+
+**Strategy 1 (Predicate pushdown)**:
+- CTE wss_year1: store_sales JOIN date_dim JOIN store, filtered for year1 range and states
+- CTE wss_year2: same for year2
+- Main: join wss_year1 and wss_year2 on store+week offset
+
+**Strategy 2 (Explicit JOINs)**:
+- CTE filtered_dates1: date_dim with month_seq 1183-1194
+- CTE filtered_dates2: date_dim with month_seq 1195-1206  
+- CTE filtered_stores: store with state filter
+- CTE wss: explicit JOIN of store_sales, filtered_dates1/2, filtered_stores
+- Main: explicit JOINs throughout
+
+**Strategy 3 (Single-pass aggregation)**:
+- CTE wss_both_years: single aggregation with CASE for year1/year2 sales
+- Main: pivot year1 and year2 columns, compute ratios
+
+**Strategy 4 (Exploration: Late store binding)**:
+- CTE filtered_dates1, filtered_dates2
+- CTE sales_year1: store_sales JOIN filtered_dates1, aggregate
+- CTE sales_year2: store_sales JOIN filtered_dates2, aggregate  
+- CTE stores: store with state filter
+- Main: join sales_year1, sales_year2 with stores on store_sk
+
+Check column completeness: each CTE must output d_week_seq, ss_store_sk, and the 7 sales columns, plus s_store_id, s_store_name if joining store.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: This query compares year-over-year sales ratios per day of week for stores in 8 states, comparing weeks 52 weeks apart. JOIN semantics: INNER joins throughout - all sides must match. Aggregation trap: None - uses SUM with CASE which is duplicate-safe. Filter dependencies: The date range filters (d_month_seq 1183-1194 vs 1195-1206) must remain separate per year; state filter applies to both years.
+
+BOTTLENECK_DIAGNOSIS: Scan-bound on store_sales: 69% of time (4045.7 ms) spent scanning and filtering 1.3M store_sales rows, joining with date_dim via nested loop, then aggregating to 9,175 rows. Cardinality flow: 1.3M store_sales → 9,175 aggregated rows → filtered to ~2,928 per year. The optimizer already materializes CTE once (good) and uses hash joins in main query (good), but fails to push selective date and store filters into CTE - these filters are applied AFTER aggregation, wasting work.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output s_store_name1, s_store_id1, d_week_seq1, and 7 ratio columns exactly as original.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include d_week_seq, ss_store_sk, all 7 sales columns, plus s_store_id and s_store_name if store is joined.
+- LITERAL_PRESERVATION: Must preserve exact values: 1183, 1183+11, 1183+12, 1183+23, and state list ('AR','GA','IN','KS','KY','OH','SD','VA').
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows ordered by s_store_name1, s_store_id1, d_week_seq1.
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated joins in CTE (line 11) and derived tables (lines 26, 38), confusing PostgreSQL's cardinality estimation.
+- CROSS_CTE_PREDICATE_BLINDNESS: Selective date filters (d_month_seq ranges) not pushed into CTE definition, applied after aggregation.
+
+REGRESSION_WARNINGS:
+1. No regression warnings applicable.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: predicate_pushdown_split_ctes
+TARGET_LOGICAL_TREE:
+  wss_year1 -> wss_year2 -> main_join
+NODE_CONTRACTS:
+  wss_year1:
+    FROM: store_sales JOIN date_dim ON d_date_sk = ss_sold_date_sk JOIN store ON ss_store_sk = s_store_sk
+    JOIN: INNER JOIN date_dim ON d_date_sk = ss_sold_date_sk, INNER JOIN store ON ss_store_sk = s_store_sk
+    WHERE: ss_sales_price / ss_list_price BETWEEN 0.65 AND 0.85 AND d_month_seq BETWEEN 1183 AND 1194 AND s_state IN ('AR','GA','IN','KS','KY','OH','SD','VA')
+    GROUP BY: d_week_seq, ss_store_sk, s_store_id, s_store_name
+    AGGREGATE: SUM(CASE WHEN d_day_name='Sunday' THEN ss_sales_price END) AS sun_sales, SUM(CASE WHEN d_day_name='Monday' THEN ss_sales_price END) AS mon_sales, SUM(CASE WHEN d_day_name='Tuesday' THEN ss_sales_price END) AS tue_sales, SUM(CASE WHEN d_day_name='Wednesday' THEN ss_sales_price END) AS wed_sales, SUM(CASE WHEN d_day_name='Thursday' THEN ss_sales_price END) AS thu_sales, SUM(CASE WHEN d_day_name='Friday' THEN ss_sales_price END) AS fri_sales, SUM(CASE WHEN d_day_name='Saturday' THEN ss_sales_price END) AS sat_sales
+    OUTPUT: d_week_seq, ss_store_sk, s_store_id, s_store_name, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+    EXPECTED_ROWS: ~2,928 (from EXPLAIN: Hash Join Inner rows=2,928)
+    CONSUMERS: main_join
+  wss_year2:
+    FROM: store_sales JOIN date_dim ON d_date_sk = ss_sold_date_sk JOIN store ON ss_store_sk = s_store_sk
+    JOIN: INNER JOIN date_dim ON d_date_sk = ss_sold_date_sk, INNER JOIN store ON ss_store_sk = s_store_sk
+    WHERE: ss_sales_price / ss_list_price BETWEEN 0.65 AND 0.85 AND d_month_seq BETWEEN 1195 AND 1206 AND s_state IN ('AR','GA','IN','KS','KY','OH','SD','VA')
+    GROUP BY: d_week_seq, ss_store_sk, s_store_id, s_store_name
+    AGGREGATE: Same 7 aggregates as wss_year1
+    OUTPUT: d_week_seq, ss_store_sk, s_store_id, s_store_name, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+    EXPECTED_ROWS: ~2,928
+    CONSUMERS: main_join
+  main_join:
+    FROM: wss_year1 y JOIN wss_year2 x ON y.s_store_id = x.s_store_id AND y.d_week_seq = x.d_week_seq - 52
+    JOIN: INNER JOIN wss_year2 x ON y.s_store_id = x.s_store_id AND y.d_week_seq = x.d_week_seq - 52
+    WHERE: (none - all in JOIN)
+    OUTPUT: y.s_store_name AS s_store_name1, y.s_store_id AS s_store_id1, y.d_week_seq AS d_week_seq1, y.sun_sales / x.sun_sales, y.mon_sales / x.mon_sales, y.tue_sales / x.tue_sales, y.wed_sales / x.wed_sales, y.thu_sales / x.thu_sales, y.fri_sales / x.fri_sales, y.sat_sales / x.sat_sales
+    EXPECTED_ROWS: ~100 (after LIMIT)
+    CONSUMERS: final output
+EXAMPLES: early_filter_decorrelate, pg_dimension_prefetch_star
+EXAMPLE_ADAPTATION:
+- early_filter_decorrelate: Apply early filtering of date_dim and store into CTE before joining with fact table. IGNORE the decorrelation aspect - this query has no correlated subqueries.
+- pg_dimension_prefetch_star: Apply pre-filtering of dimension tables (date_dim, store) before joining with fact table. IGNORE the multi-channel aspect - this query has two years but not multiple fact tables.
+HAZARD_FLAGS:
+- Store join may increase CTE row count if one store_sk maps to multiple stores (unlikely but verify).
+- Must ensure GROUP BY includes s_store_id and s_store_name for downstream join.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: explicit_joins_dimension_ctes
+TARGET_LOGICAL_TREE:
+  filtered_dates1 -> filtered_dates2 -> filtered_stores -> wss_explicit -> main_explicit
+NODE_CONTRACTS:
+  filtered_dates1:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1183 AND 1194
+    OUTPUT: d_date_sk, d_week_seq
+    EXPECTED_ROWS: ~365 (from EXPLAIN: Index Scan rows=365)
+    CONSUMERS: wss_explicit
+  filtered_dates2:
+    FROM: date_dim  
+    WHERE: d_month_seq BETWEEN 1195 AND 1206
+    OUTPUT: d_date_sk, d_week_seq
+    EXPECTED_ROWS: ~366
+    CONSUMERS: wss_explicit
+  filtered_stores:
+    FROM: store
+    WHERE: s_state IN ('AR','GA','IN','KS','KY','OH','SD','VA')
+    OUTPUT: s_store_sk, s_store_id, s_store_name
+    EXPECTED_ROWS: 26 (from EXPLAIN: Seq Scan rows=26)
+    CONSUMERS: wss_explicit
+  wss_explicit:
+    FROM: store_sales 
+      JOIN filtered_dates1 d1 ON ss_sold_date_sk = d1.d_date_sk
+      JOIN filtered_stores s ON ss_store_sk = s.s_store_sk
+    WHERE: ss_sales_price / ss_list_price BETWEEN 0.65 AND 0.85
+    GROUP BY: d1.d_week_seq, s.s_store_sk, s.s_store_id, s.s_store_name
+    AGGREGATE: Same 7 day-of-week SUM(CASE) aggregates
+    OUTPUT: d_week_seq, s_store_sk, s_store_id, s_store_name, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+    EXPECTED_ROWS: ~9,175 (same as original CTE but filtered early)
+    CONSUMERS: main_explicit
+  main_explicit:
+    FROM: (SELECT * FROM wss_explicit JOIN filtered_dates1 ON d_week_seq = filtered_dates1.d_week_seq) y
+      JOIN (SELECT * FROM wss_explicit JOIN filtered_dates2 ON d_week_seq = filtered_dates2.d_week_seq) x
+      ON y.s_store_id = x.s_store_id AND y.d_week_seq = x.d_week_seq - 52
+    OUTPUT: Same 10 columns as original
+    EXPECTED_ROWS: ~100
+    CONSUMERS: final output
+EXAMPLES: pg_date_cte_explicit_join, pg_dimension_prefetch_star
+EXAMPLE_ADAPTATION:
+- pg_date_cte_explicit_join: Apply date_dim filtering into CTE and convert comma joins to explicit JOIN syntax. IGNORE the single-date-CTE aspect - we need two date CTEs for two year ranges.
+- pg_dimension_prefetch_star: Pre-filter all dimension tables (date_dim, store) into CTEs before joining with fact table. IGNORE the promotion/item dimensions - this query only has date and store dimensions.
+HAZARD_FLAGS:
+- Need to ensure wss_explicit CTE doesn't get inlined (use MATERIALIZED if necessary).
+- Must join wss_explicit with filtered_dates1/filtered_dates2 in main query to get correct year separation.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: single_pass_aggregation_pivot
+TARGET_LOGICAL_TREE:
+  wss_both_years -> main_pivot
+NODE_CONTRACTS:
+  wss_both_years:
+    FROM: store_sales JOIN date_dim ON d_date_sk = ss_sold_date_sk JOIN store ON ss_store_sk = s_store_sk
+    WHERE: ss_sales_price / ss_list_price BETWEEN 0.65 AND 0.85 AND d_month_seq BETWEEN 1183 AND 1206 AND s_state IN ('AR','GA','IN','KS','KY','OH','SD','VA')
+    GROUP BY: d_week_seq, ss_store_sk, s_store_id, s_store_name
+    AGGREGATE: 
+      SUM(CASE WHEN d_month_seq BETWEEN 1183 AND 1194 AND d_day_name='Sunday' THEN ss_sales_price END) AS sun_sales_y1,
+      SUM(CASE WHEN d_month_seq BETWEEN 1183 AND 1194 AND d_day_name='Monday' THEN ss_sales_price END) AS mon_sales_y1,
+      SUM(CASE WHEN d_month_seq BETWEEN 1183 AND 1194 AND d_day_name='Tuesday' THEN ss_sales_price END) AS tue_sales_y1,
+      SUM(CASE WHEN d_month_seq BETWEEN 1183 AND 1194 AND d_day_name='Wednesday' THEN ss_sales_price END) AS wed_sales_y1,
+      SUM(CASE WHEN d_month_seq BETWEEN 1183 AND 1194 AND d_day_name='Thursday' THEN ss_sales_price END) AS thu_sales_y1,
+      SUM(CASE WHEN d_month_seq BETWEEN 1183 AND 1194 AND d_day_name='Friday' THEN ss_sales_price END) AS fri_sales_y1,
+      SUM(CASE WHEN d_month_seq BETWEEN 1183 AND 1194 AND d_day_name='Saturday' THEN ss_sales_price END) AS sat_sales_y1,
+      SUM(CASE WHEN d_month_seq BETWEEN 1195 AND 1206 AND d_day_name='Sunday' THEN ss_sales_price END) AS sun_sales_y2,
+      SUM(CASE WHEN d_month_seq BETWEEN 1195 AND 1206 AND d_day_name='Monday' THEN ss_sales_price END) AS mon_sales_y2,
+      SUM(CASE WHEN d_month_seq BETWEEN 1195 AND 1206 AND d_day_name='Tuesday' THEN ss_sales_price END) AS tue_sales_y2,
+      SUM(CASE WHEN d_month_seq BETWEEN 1195 AND 1206 AND d_day_name='Wednesday' THEN ss_sales_price END) AS wed_sales_y2,
+      SUM(CASE WHEN d_month_seq BETWEEN 1195 AND 1206 AND d_day_name='Thursday' THEN ss_sales_price END) AS thu_sales_y2,
+      SUM(CASE WHEN d_month_seq BETWEEN 1195 AND 1206 AND d_day_name='Friday' THEN ss_sales_price END) AS fri_sales_y2,
+      SUM(CASE WHEN d_month_seq BETWEEN 1195 AND 1206 AND d_day_name='Saturday' THEN ss_sales_price END) AS sat_sales_y2
+    OUTPUT: d_week_seq, ss_store_sk, s_store_id, s_store_name, sun_sales_y1, mon_sales_y1, tue_sales_y1, wed_sales_y1, thu_sales_y1, fri_sales_y1, sat_sales_y1, sun_sales_y2, mon_sales_y2, tue_sales_y2, wed_sales_y2, thu_sales_y2, fri_sales_y2, sat_sales_y2
+    EXPECTED_ROWS: ~9,175 (similar to original CTE)
+    CONSUMERS: main_pivot
+  main_pivot:
+    FROM: wss_both_years y JOIN wss_both_years x ON y.s_store_id = x.s_store_id AND y.d_week_seq = x.d_week_seq - 52
+    OUTPUT: y.s_store_name AS s_store_name1, y.s_store_id AS s_store_id1, y.d_week_seq AS d_week_seq1, y.sun_sales_y1 / x.sun_sales_y2, y.mon_sales_y1 / x.mon_sales_y2, y.tue_sales_y1 / x.tue_sales_y2, y.wed_sales_y1 / x.wed_sales_y2, y.thu_sales_y1 / x.thu_sales_y2, y.fri_sales_y1 / x.fri_sales_y2, y.sat_sales_y1 / x.sat_sales_y2
+    EXPECTED_ROWS: ~100
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply single scan of fact table with conditional aggregation for both years. IGNORE the bitmap aspect - this query doesn't use bitmaps.
+- channel_bitmap_aggregation: Apply conditional aggregation to compute multiple metrics in one pass. IGNORE the bitmap index usage.
+HAZARD_FLAGS:
+- Must ensure year1 and year2 aggregates are computed correctly (different d_month_seq ranges).
+- The self-join still needed because week sequences differ by 52 weeks.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: late_store_binding_deferred_join
+TARGET_LOGICAL_TREE:
+  filtered_dates1 -> filtered_dates2 -> sales_year1 -> sales_year2 -> stores_filtered -> main_deferred
+NODE_CONTRACTS:
+  filtered_dates1:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1183 AND 1194
+    OUTPUT: d_date_sk, d_week_seq
+    EXPECTED_ROWS: ~365
+    CONSUMERS: sales_year1
+  filtered_dates2:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1195 AND 1206
+    OUTPUT: d_date_sk, d_week_seq
+    EXPECTED_ROWS: ~366
+    CONSUMERS: sales_year2
+  sales_year1:
+    FROM: store_sales JOIN filtered_dates1 ON ss_sold_date_sk = d_date_sk
+    WHERE: ss_sales_price / ss_list_price BETWEEN 0.65 AND 0.85
+    GROUP BY: d_week_seq, ss_store_sk
+    AGGREGATE: Same 7 day-of-week SUM(CASE) aggregates
+    OUTPUT: d_week_seq, ss_store_sk, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+    EXPECTED_ROWS: ~2,928
+    CONSUMERS: main_deferred
+  sales_year2:
+    FROM: store_sales JOIN filtered_dates2 ON ss_sold_date_sk = d_date_sk
+    WHERE: ss_sales_price / ss_list_price BETWEEN 0.65 AND 0.85
+    GROUP BY: d_week_seq, ss_store_sk
+    AGGREGATE: Same 7 aggregates
+    OUTPUT: d_week_seq, ss_store_sk, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales
+    EXPECTED_ROWS: ~2,928
+    CONSUMERS: main_deferred
+  stores_filtered:
+    FROM: store
+    WHERE: s_state IN ('AR','GA','IN','KS','KY','OH','SD','VA')
+    OUTPUT: s_store_sk, s_store_id, s_store_name
+    EXPECTED_ROWS: 26
+    CONSUMERS: main_deferred
+  main_deferred:
+    FROM: (sales_year1 JOIN stores_filtered ON ss_store_sk = s_store_sk) y
+      JOIN (sales_year2 JOIN stores_filtered ON ss_store_sk = s_store_sk) x
+      ON y.s_store_id = x.s_store_id AND y.d_week_seq = x.d_week_seq - 52
+    OUTPUT: Same 10 columns as original
+    EXPECTED_ROWS: ~100
+    CONSUMERS: final output
+EXAMPLES: dimension_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply date dimension filtering into separate CTEs before joining with fact table. IGNORE the full dimension prefetch - we're isolating dates but deferring store join.
+- early_filter: Apply early filtering of date_dim into CTEs before fact table join. IGNORE the decorrelation aspect.
+HAZARD_FLAGS:
+- Store filter applied late may miss optimization opportunities for pushing into fact scan.
+- Need to join stores_filtered twice (for y and x) - ensure no cartesian product.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (combines date_cte_isolate with late attribute binding for store dimension)

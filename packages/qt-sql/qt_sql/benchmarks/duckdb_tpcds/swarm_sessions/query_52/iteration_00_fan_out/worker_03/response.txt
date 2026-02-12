@@ -1,0 +1,87 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~100
+    ├── [CTE] filtered_date  [+]  — Isolate date dimension filtering
+    │   ├── SCAN (date_dim AS dt)
+    │   ├── FILTER (dt.d_moy=12 AND dt.d_year=2002)
+    │   └── OUTPUT (d_date_sk, d_year)
+    ├── [CTE] date_joined  [+]  — Join store_sales with filtered_date
+    │   ├── SCAN (store_sales)
+    │   ├── JOIN (INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk)
+    │   └── OUTPUT (d_year, ss_item_sk, ss_ext_sales_price)
+    ├── [CTE] item_filtered  [+]  — Join with item and filter
+    │   ├── SCAN (date_joined)
+    │   ├── JOIN (INNER JOIN item ON ss_item_sk = i_item_sk)
+    │   ├── FILTER (item.i_manager_id=1)
+    │   └── OUTPUT (d_year, i_brand_id, i_brand, ss_ext_sales_price)
+    ├── [CTE] aggregated  [+]  — Group and aggregate
+    │   ├── SCAN (item_filtered)
+    │   ├── AGG (GROUP BY d_year, i_brand, i_brand_id)
+    │   ├── AGG (SUM(ss_ext_sales_price) AS ext_price)
+    │   └── OUTPUT (d_year, brand_id, brand, ext_price)
+    └── [SORT+FETCH] sorted_limited  [+]  — Order and limit
+        ├── SCAN (aggregated)
+        ├── SORT (d_year ASC, ext_price DESC, brand_id ASC)
+        ├── LIMIT (100)
+        └── OUTPUT (d_year, brand_id, brand, ext_price)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_isolation", "description": "Extracted date dimension filtering into separate CTE to materialize small lookup table", "applied_to": ["filtered_date"]},
+    {"id": "R2", "type": "cte_sequence", "description": "Restructured into linear CTE chain following target logical tree: filtered_date → date_joined → item_filtered → aggregated → sorted_limited", "applied_to": ["date_joined", "item_filtered", "aggregated", "sorted_limited"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT dt.d_date_sk, dt.d_year FROM date_dim dt WHERE dt.d_moy = 12 AND dt.d_year = 2002",
+        "interfaces": {"outputs": ["d_date_sk", "d_year"], "consumes": []}
+      },
+      "date_joined": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT filtered_date.d_year, store_sales.ss_item_sk, store_sales.ss_ext_sales_price FROM store_sales INNER JOIN filtered_date ON store_sales.ss_sold_date_sk = filtered_date.d_date_sk",
+        "interfaces": {"outputs": ["d_year", "ss_item_sk", "ss_ext_sales_price"], "consumes": ["filtered_date"]}
+      },
+      "item_filtered": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT date_joined.d_year, item.i_brand_id, item.i_brand, date_joined.ss_ext_sales_price FROM date_joined INNER JOIN item ON date_joined.ss_item_sk = item.i_item_sk WHERE item.i_manager_id = 1",
+        "interfaces": {"outputs": ["d_year", "i_brand_id", "i_brand", "ss_ext_sales_price"], "consumes": ["date_joined"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_year, i_brand_id AS brand_id, i_brand AS brand, SUM(ss_ext_sales_price) AS ext_price FROM item_filtered GROUP BY d_year, i_brand, i_brand_id",
+        "interfaces": {"outputs": ["d_year", "brand_id", "brand", "ext_price"], "consumes": ["item_filtered"]}
+      },
+      "sorted_limited": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT d_year, brand_id, brand, ext_price FROM aggregated ORDER BY d_year ASC, ext_price DESC, brand_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["d_year", "brand_id", "brand", "ext_price"], "consumes": ["aggregated"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "date_joined", "item_filtered", "aggregated", "sorted_limited"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), date_joined AS ({date_joined}), item_filtered AS ({item_filtered}), aggregated AS ({aggregated}) {sorted_limited}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Isolated date dimension filtering into a materialized CTE (`filtered_date`) to create a small hash table for efficient probing, then built linear CTE chain that maintains correct join multiplicities while enabling predicate pushdown.
+
+**Expected speedup**: ~2.5-4.0x due to reduced fact table scanning (date filter applied before join) and dimension isolation benefits.

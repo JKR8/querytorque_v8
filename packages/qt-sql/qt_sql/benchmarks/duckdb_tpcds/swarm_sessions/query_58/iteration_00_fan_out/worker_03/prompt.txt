@@ -1,0 +1,427 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Compare weekly item revenue consistency across store, catalog, and web channels for the week containing 2001-03-24, returning items whose channel revenues are all within +/-10% of each other. All three channel CTEs must match on item_id (INNER JOIN semantics). Only SUM aggregates are used, which are grouping-insensitive to duplicates. The date filter subquery is identical across all three CTEs; any rewrite must preserve that all three channels filter to the exact same week.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+date_week_cte -> item_prefetch_cte -> store_agg_cte -> catalog_agg_cte -> web_agg_cte -> filtered_join_cte -> main_query
+NODE_CONTRACTS:
+  date_week_cte:
+    FROM: date_dim
+    WHERE: d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 7
+    CONSUMERS: store_agg_cte, catalog_agg_cte, web_agg_cte
+  item_prefetch_cte:
+    FROM: item
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: 102K
+    CONSUMERS: store_agg_cte, catalog_agg_cte, web_agg_cte
+  store_agg_cte:
+    FROM: store_sales JOIN date_week_cte ON ss_sold_date_sk = d_date_sk JOIN item_prefetch_cte ON ss_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(ss_ext_sales_price) AS ss_item_rev
+    OUTPUT: i_item_id AS item_id, ss_item_rev
+    EXPECTED_ROWS: 35K
+    CONSUMERS: filtered_join_cte
+  catalog_agg_cte:
+    FROM: catalog_sales JOIN date_week_cte ON cs_sold_date_sk = d_date_sk JOIN item_prefetch_cte ON cs_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(cs_ext_sales_price) AS cs_item_rev
+    OUTPUT: i_item_id AS item_id, cs_item_rev
+    EXPECTED_ROWS: 24K
+    CONSUMERS: filtered_join_cte
+  web_agg_cte:
+    FROM: web_sales JOIN date_week_cte ON ws_sold_date_sk = d_date_sk JOIN item_prefetch_cte ON ws_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(ws_ext_sales_price) AS ws_item_rev
+    OUTPUT: i_item_id AS item_id, ws_item_rev
+    EXPECTED_ROWS: 14K
+    CONSUMERS: filtered_join_cte
+  filtered_join_cte:
+    FROM: store_agg_cte s JOIN catalog_agg_cte c ON s.item_id = c.item_id JOIN web_agg_cte w ON s.item_id = w.item_id
+    WHERE: GREATEST(s.ss_item_rev/c.cs_item_rev, c.cs_item_rev/s.ss_item_rev, s.ss_item_rev/w.ws_item_rev, w.ws_item_rev/s.ss_item_rev, c.cs_item_rev/w.ws_item_rev, w.ws_item_rev/c.cs_item_rev) <= 1.1
+    OUTPUT: s.item_id, ss_item_rev, cs_item_rev, ws_item_rev
+    EXPECTED_ROWS: 5
+    CONSUMERS: main_query
+  main_query:
+    FROM: filtered_join_cte
+    ORDER BY: item_id ASC, ss_item_rev ASC
+    OUTPUT: item_id, ss_item_rev, ss_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS ss_dev, cs_item_rev, cs_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS cs_dev, ws_item_rev, ws_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS ws_dev, (ss_item_rev+cs_item_rev+ws_item_rev)/3 AS average
+    EXPECTED_ROWS: 5
+    CONSUMERS: final output
+
+NODE_CONTRACTS:
+date_week_cte:
+    FROM: date_dim
+    WHERE: d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_date = '2001-03-24')
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 7
+    CONSUMERS: store_agg_cte, catalog_agg_cte, web_agg_cte
+  item_prefetch_cte:
+    FROM: item
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: 102K
+    CONSUMERS: store_agg_cte, catalog_agg_cte, web_agg_cte
+  store_agg_cte:
+    FROM: store_sales JOIN date_week_cte ON ss_sold_date_sk = d_date_sk JOIN item_prefetch_cte ON ss_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(ss_ext_sales_price) AS ss_item_rev
+    OUTPUT: i_item_id AS item_id, ss_item_rev
+    EXPECTED_ROWS: 35K
+    CONSUMERS: filtered_join_cte
+  catalog_agg_cte:
+    FROM: catalog_sales JOIN date_week_cte ON cs_sold_date_sk = d_date_sk JOIN item_prefetch_cte ON cs_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(cs_ext_sales_price) AS cs_item_rev
+    OUTPUT: i_item_id AS item_id, cs_item_rev
+    EXPECTED_ROWS: 24K
+    CONSUMERS: filtered_join_cte
+  web_agg_cte:
+    FROM: web_sales JOIN date_week_cte ON ws_sold_date_sk = d_date_sk JOIN item_prefetch_cte ON ws_item_sk = i_item_sk
+    GROUP BY: i_item_id
+    AGGREGATE: SUM(ws_ext_sales_price) AS ws_item_rev
+    OUTPUT: i_item_id AS item_id, ws_item_rev
+    EXPECTED_ROWS: 14K
+    CONSUMERS: filtered_join_cte
+  filtered_join_cte:
+    FROM: store_agg_cte s JOIN catalog_agg_cte c ON s.item_id = c.item_id JOIN web_agg_cte w ON s.item_id = w.item_id
+    WHERE: GREATEST(s.ss_item_rev/c.cs_item_rev, c.cs_item_rev/s.ss_item_rev, s.ss_item_rev/w.ws_item_rev, w.ws_item_rev/s.ss_item_rev, c.cs_item_rev/w.ws_item_rev, w.ws_item_rev/c.cs_item_rev) <= 1.1
+    OUTPUT: s.item_id, ss_item_rev, cs_item_rev, ws_item_rev
+    EXPECTED_ROWS: 5
+    CONSUMERS: main_query
+  main_query:
+    FROM: filtered_join_cte
+    ORDER BY: item_id ASC, ss_item_rev ASC
+    OUTPUT: item_id, ss_item_rev, ss_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS ss_dev, cs_item_rev, cs_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS cs_dev, ws_item_rev, ws_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3)*100 AS ws_dev, (ss_item_rev+cs_item_rev+ws_item_rev)/3 AS average
+    EXPECTED_ROWS: 5
+    CONSUMERS: final output
+
+## Hazard Flags (avoid these specific risks)
+
+- Simplified filter (GREATEST of ratios <= 1.1) must be mathematically equivalent to 6 pairwise filters.
+- item_prefetch_cte has no WHERE clause, but necessary for completeness.
+
+## Regression Warnings (observed failures on similar queries)
+
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline <100ms, CTE overhead dominated savings
+   RULE: This query baseline is 266ms, so CTE overhead acceptable
+2. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion
+   RULE: Never cross-join 3+ dimension CTEs; ensure each has WHERE clause
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output all 8 columns (item_id, ss_item_rev, ss_dev, cs_item_rev, cs_dev, ws_item_rev, ws_dev, average) in original order.
+- CTE_COLUMN_COMPLETENESS: Any new CTE must include all columns referenced downstream, especially item_id and revenue aggregates.
+- LITERAL_PRESERVATION: Must preserve literal '2001-03-24' exactly.
+- SEMANTIC_EQUIVALENCE: Must return same rows and ordering (ORDER BY ss_items.item_id, ss_item_rev).
+- CROSS_CTE_PREDICATE_BLINDNESS: Each channel CTE independently computes same date filter (EXPLAIN shows 9 date_dim scans).
+- REDUNDANT_SCAN_ELIMINATION: item table scanned 3 times with identical unfiltered scans (EXPLAIN shows 3× SEQ_SCAN item).
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- dimension_cte_isolate: Apply pre-filtering dimension (item) into CTE; ignore the cross-join warning - we join fact tables separately.
+- late_attribute_binding: Apply pre-joining item once and reusing; ignore that original had no display columns - we use item_sk for joins.
+- or_to_union: NOT APPLICABLE for filter simplification; use the min/max ratio logic instead.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. dimension_cte_isolate (1.93x)
+
+**Principle:** Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
+
+**BEFORE (slow):**
+```sql
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year = 2000
+```
+[filtered_customer_demographics]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'
+```
+[filtered_promotions]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+```
+[joined_facts]:
+```sql
+SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales AS cs JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk
+```
+[main_query]:
+```sql
+SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM joined_facts AS jf JOIN item AS i ON jf.cs_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
+```
+
+### 2. or_to_union (3.17x)
+
+**Principle:** OR-to-UNION Decomposition: split OR conditions on different columns into separate UNION ALL branches, each with a focused predicate. The optimizer can use different access paths per branch instead of a single scan with a complex filter.
+
+**BEFORE (slow):**
+```sql
+select ca_zip
+       ,sum(cs_sales_price)
+ from catalog_sales
+     ,customer
+     ,customer_address
+     ,date_dim
+ where cs_bill_customer_sk = c_customer_sk
+ 	and c_current_addr_sk = ca_address_sk 
+ 	and ( substr(ca_zip,1,5) in ('85669', '86197','88274','83405','86475',
+                                   '85392', '85460', '80348', '81792')
+ 	      or ca_state in ('CA','WA','GA')
+ 	      or cs_sales_price > 500)
+ 	and cs_sold_date_sk = d_date_sk
+ 	and d_qoy = 1 and d_year = 2001
+ group by ca_zip
+ order by ca_zip
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_qoy = 1 AND d_year = 2001
+```
+[filtered_sales]:
+```sql
+SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE substr(ca_zip,1,5) IN ('85669', '86197', '88274', '83405', '86475', '85392', '85460', '80348', '81792') UNION ALL SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE ca_state IN ('CA','WA','GA') UNION ALL SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk WHERE cs_sales_price > 500
+```
+[main_query]:
+```sql
+SELECT ca_zip, SUM(cs_sales_price) FROM filtered_sales GROUP BY ca_zip ORDER BY ca_zip LIMIT 100
+```
+
+## Original SQL
+
+```sql
+-- start query 58 in stream 0 using template query58.tpl
+with ss_items as
+ (select i_item_id item_id
+        ,sum(ss_ext_sales_price) ss_item_rev 
+ from store_sales
+     ,item
+     ,date_dim
+ where ss_item_sk = i_item_sk
+   and d_date in (select d_date
+                  from date_dim
+                  where d_week_seq = (select d_week_seq 
+                                      from date_dim
+                                      where d_date = '2001-03-24'))
+   and ss_sold_date_sk   = d_date_sk
+ group by i_item_id),
+ cs_items as
+ (select i_item_id item_id
+        ,sum(cs_ext_sales_price) cs_item_rev
+  from catalog_sales
+      ,item
+      ,date_dim
+ where cs_item_sk = i_item_sk
+  and  d_date in (select d_date
+                  from date_dim
+                  where d_week_seq = (select d_week_seq 
+                                      from date_dim
+                                      where d_date = '2001-03-24'))
+  and  cs_sold_date_sk = d_date_sk
+ group by i_item_id),
+ ws_items as
+ (select i_item_id item_id
+        ,sum(ws_ext_sales_price) ws_item_rev
+  from web_sales
+      ,item
+      ,date_dim
+ where ws_item_sk = i_item_sk
+  and  d_date in (select d_date
+                  from date_dim
+                  where d_week_seq =(select d_week_seq 
+                                     from date_dim
+                                     where d_date = '2001-03-24'))
+  and ws_sold_date_sk   = d_date_sk
+ group by i_item_id)
+  select ss_items.item_id
+       ,ss_item_rev
+       ,ss_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 ss_dev
+       ,cs_item_rev
+       ,cs_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 cs_dev
+       ,ws_item_rev
+       ,ws_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 ws_dev
+       ,(ss_item_rev+cs_item_rev+ws_item_rev)/3 average
+ from ss_items,cs_items,ws_items
+ where ss_items.item_id=cs_items.item_id
+   and ss_items.item_id=ws_items.item_id 
+   and ss_item_rev between 0.9 * cs_item_rev and 1.1 * cs_item_rev
+   and ss_item_rev between 0.9 * ws_item_rev and 1.1 * ws_item_rev
+   and cs_item_rev between 0.9 * ss_item_rev and 1.1 * ss_item_rev
+   and cs_item_rev between 0.9 * ws_item_rev and 1.1 * ws_item_rev
+   and ws_item_rev between 0.9 * ss_item_rev and 1.1 * ss_item_rev
+   and ws_item_rev between 0.9 * cs_item_rev and 1.1 * cs_item_rev
+ order by ss_items.item_id
+         ,ss_item_rev
+ LIMIT 100;
+
+-- end query 58 in stream 0 using template query58.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `item_id`
+  2. `ss_item_rev`
+  3. `ss_dev`
+  4. `cs_item_rev`
+  5. `cs_dev`
+  6. `ws_item_rev`
+  7. `ws_dev`
+  8. `average`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] cs_items  [=]  Cost: 25%  Rows: ~1K  — Aggregate catalog revenue per item for the target week.
+│   ├── SCAN (catalog_sales, item (join), date_dim (join))
+│   ├── JOIN (cs_item_sk = i_item_sk)
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── FILTER (? op d_date (per d_week_seq))
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (item_id, cs_item_rev)
+├── [CTE] ss_items  [=]  Cost: 25%  Rows: ~1K  — Aggregate store revenue per item for the target week.
+│   ├── SCAN (store_sales, item (join), date_dim (join))
+│   ├── JOIN (ss_item_sk = i_item_sk)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (? op d_date (per d_week_seq))
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (item_id, ss_item_rev)
+├── [CTE] ws_items  [=]  Cost: 25%  Rows: ~1K  — Aggregate web revenue per item for the target week.
+│   ├── SCAN (web_sales, item (join), date_dim (join))
+│   ├── JOIN (ws_item_sk = i_item_sk)
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── FILTER (? op d_date (per d_week_seq))
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (item_id, ws_item_rev)
+└── [MAIN] main_query  [=]  Cost: 25%  Rows: ~1K  — Join per-channel item revenues, enforce pairwise +/-10% consistency across all channels, and report each item with channel deviations from the cross-channel average.
+    ├── SCAN (ss_items, cs_items (join), ws_items (join))
+    ├── JOIN (ss_items.item_id = cs_items.item_id)
+    ├── JOIN (ss_items.item_id = ws_items.item_id)
+    ├── FILTER (ss_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev)
+    ├── FILTER (ss_item_rev BETWEEN 0.9 * ws_item_rev AND 1.1 * ws_item_rev)
+    ├── FILTER (+4 more)
+    ├── AGG (GROUP BY)
+    ├── SORT (ss_items.item_id ASC, ss_item_rev ASC)
+    └── OUTPUT (item_id, ss_item_rev, ss_dev, cs_item_rev, cs_dev, ws_item_rev, ws_dev, average)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

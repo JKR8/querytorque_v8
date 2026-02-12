@@ -1,0 +1,129 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_jan1998  [+]  Cost: 0%  Rows: ~10
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year = 1998 AND d_moy = 1)
+│   └── OUTPUT (d_date_sk, d_month_seq)
+├── [CTE] date_range_values  [+]  Cost: 0%  Rows: ~1
+│   ├── SCAN (date_jan1998)
+│   ├── AGG (MIN(d_month_seq+1), MAX(d_month_seq+3))
+│   └── OUTPUT (month_start, month_end)
+├── [CTE] my_customers_explicit  [~]  Cost: 84%  Rows: ~69
+│   ├── SCAN (catalog_sales, web_sales)
+│   ├── FILTER (cs_wholesale_cost BETWEEN 35 AND 65)
+│   ├── FILTER (ws_wholesale_cost BETWEEN 35 AND 65)
+│   ├── UNION ALL
+│   ├── JOIN (date_jan1998)
+│   ├── JOIN (item)
+│   ├── JOIN (customer)
+│   ├── FILTER (i_category = 'Electronics')
+│   ├── FILTER (i_class = 'personal')
+│   ├── FILTER (c_birth_year BETWEEN 1928 AND 1941)
+│   ├── DISTINCT (c_customer_sk, c_current_addr_sk)
+│   └── OUTPUT (c_customer_sk, c_current_addr_sk)
+├── [CTE] my_revenue_explicit  [~]  Cost: 9%  Rows: ~69
+│   ├── SCAN (my_customers_explicit)
+│   ├── JOIN (customer_address)
+│   ├── JOIN (store)
+│   ├── JOIN (store_sales)
+│   ├── JOIN (date_dim)
+│   ├── FILTER (ss_wholesale_cost BETWEEN 35 AND 65)
+│   ├── FILTER (s_state IN ('AR','CO','IA','IL','KY','NC','NM','NY','PA','TX'))
+│   ├── FILTER (d_month_seq BETWEEN month_start AND month_end)
+│   ├── AGG (GROUP BY c_customer_sk)
+│   └── OUTPUT (c_customer_sk, revenue)
+├── [CTE] segments  [=]  Cost: 0%  Rows: ~1K
+│   ├── SCAN (my_revenue_explicit)
+│   └── OUTPUT (segment)
+└── [MAIN] main_query  [=]  Cost: 6%
+    ├── SCAN (segments)
+    ├── AGG (GROUP BY)
+    ├── SORT (segment ASC, num_customers ASC)
+    └── OUTPUT (segment, num_customers, segment_base)
+```
+
+Changes:
+- `[+]` Added `date_jan1998` CTE isolating the date_dim scan for January 1998
+- `[+]` Added `date_range_values` CTE pre-computing the month_seq range once
+- `[~]` Modified `my_customers` to `my_customers_explicit` with explicit JOIN syntax and using `date_jan1998` CTE
+- `[~]` Modified `my_revenue` to `my_revenue_explicit` with explicit JOIN syntax and using scalar CTE values from `date_range_values`
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_isolation", "description": "Extract January 1998 dates into a separate CTE to create a tiny hash table", "applied_to": ["date_jan1998"]},
+    {"id": "R2", "type": "scalar_decorrelation", "description": "Pre-compute date_range_values once instead of per-row scalar subqueries", "applied_to": ["date_range_values"]},
+    {"id": "R3", "type": "explicit_join_syntax", "description": "Convert comma-separated joins to explicit JOIN syntax for better join ordering", "applied_to": ["my_customers_explicit", "my_revenue_explicit"]},
+    {"id": "R4", "type": "cte_prefiltering", "description": "Use CTE-filtered date_dim in both my_customers_explicit and date_range_values", "applied_to": ["my_customers_explicit", "date_range_values"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_jan1998": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_month_seq FROM date_dim WHERE d_year = 1998 AND d_moy = 1",
+        "interfaces": {"outputs": ["d_date_sk", "d_month_seq"], "consumes": []}
+      },
+      "date_range_values": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT MIN(d_month_seq+1) AS month_start, MAX(d_month_seq+3) AS month_end FROM date_jan1998",
+        "interfaces": {"outputs": ["month_start", "month_end"], "consumes": ["date_jan1998"]}
+      },
+      "my_customers_explicit": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT DISTINCT c_customer_sk, c_current_addr_sk FROM (SELECT cs_sold_date_sk AS sold_date_sk, cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk FROM catalog_sales WHERE cs_wholesale_cost BETWEEN 35 AND 65 UNION ALL SELECT ws_sold_date_sk AS sold_date_sk, ws_bill_customer_sk AS customer_sk, ws_item_sk AS item_sk FROM web_sales WHERE ws_wholesale_cost BETWEEN 35 AND 65) sales INNER JOIN date_jan1998 ON sales.sold_date_sk = date_jan1998.d_date_sk INNER JOIN item ON sales.item_sk = item.i_item_sk AND item.i_category = 'Electronics' AND item.i_class = 'personal' INNER JOIN customer ON sales.customer_sk = customer.c_customer_sk AND customer.c_birth_year BETWEEN 1928 AND 1941",
+        "interfaces": {"outputs": ["c_customer_sk", "c_current_addr_sk"], "consumes": ["date_jan1998"]}
+      },
+      "my_revenue_explicit": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT my_customers_explicit.c_customer_sk, SUM(ss_ext_sales_price) AS revenue FROM my_customers_explicit INNER JOIN customer_address ON my_customers_explicit.c_current_addr_sk = customer_address.ca_address_sk INNER JOIN store ON customer_address.ca_state = store.s_state AND customer_address.ca_county = store.s_county AND store.s_state IN ('AR','CO','IA','IL','KY','NC','NM','NY','PA','TX') INNER JOIN store_sales ON my_customers_explicit.c_customer_sk = store_sales.ss_customer_sk AND store_sales.ss_wholesale_cost BETWEEN 35 AND 65 INNER JOIN date_dim ON store_sales.ss_sold_date_sk = date_dim.d_date_sk WHERE date_dim.d_month_seq BETWEEN (SELECT month_start FROM date_range_values) AND (SELECT month_end FROM date_range_values) GROUP BY my_customers_explicit.c_customer_sk",
+        "interfaces": {"outputs": ["c_customer_sk", "revenue"], "consumes": ["my_customers_explicit", "date_range_values"]}
+      },
+      "segments": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["segment"], "consumes": ["my_revenue_explicit"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["segment", "num_customers", "segment_base"], "consumes": ["segments"]}
+      }
+    },
+    "reconstruction_order": ["date_jan1998", "date_range_values", "my_customers_explicit", "my_revenue_explicit", "segments", "main_query"],
+    "assembly_template": "WITH date_jan1998 AS ({date_jan1998}), date_range_values AS ({date_range_values}), my_customers_explicit AS ({my_customers_explicit}), my_revenue_explicit AS ({my_revenue_explicit}), segments AS ({segments}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL enable_nestloop = off",
+    "SET LOCAL work_mem = '64MB'",
+    "SET LOCAL hash_mem_multiplier = 2.0",
+    "SET LOCAL join_collapse_limit = 8"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes**: Isolated the January 1998 date_dim scan into a tiny CTE (10 rows) to serve as a hash table for two downstream consumers, pre-computed the d_month_seq range once instead of per-row scalar subqueries, and converted comma-separated joins to explicit JOIN syntax for better PostgreSQL join ordering.
+
+**Expected speedup**: 1.5-2.5x due to: (1) eliminating 3 separate date_dim scans (now 1 CTE + 1 join), (2) better hash join planning with tiny date_jan1998 CTE, (3) decorrelation of scalar subqueries. The SET LOCAL settings disable nestloop (not needed with hash tables), allocate sufficient work_mem for hash operations, and allow PostgreSQL to explore more join orders.
+
+**Runtime_config rationale**:
+1. `enable_nestloop = off`: With tiny CTEs, hash joins are more efficient
+2. `work_mem = '64MB'`: Sufficient for hash tables from date_jan1998 (10 rows) and my_customers_explicit (~69 rows)
+3. `hash_mem_multiplier = 2.0`: Gives hash operations more memory headroom
+4. `join_collapse_limit = 8`: Allows PostgreSQL to reorder the 4-5 table joins in my_revenue_explicit optimally

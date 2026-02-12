@@ -1,0 +1,369 @@
+You are a SQL rewrite engine for PostgreSQL v16.11-0ubuntu0.24.04.1). Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+## Semantic Contract (MUST preserve)
+
+This query compares per-item revenue across three sales channels (store, catalog, web) for customers born 1985-1991, focusing on items with list price 168-197 and manager_id 42-71 during the same month as 2001-06-06. It returns items where all three channel revenues are within 10% of each other. JOIN semantics are INNER: all three CTEs must match on (item_id, birth_year). Aggregates are SUMs, safe for restructuring. The date subquery depends on outer date_dim; breaking this correlation must preserve the set of dates for that month_seq.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+dim_cte -> ss_items -> cs_items -> ws_items -> main_query
+NODE_CONTRACTS:
+  dim_cte:
+    FROM: item
+    JOIN: CROSS JOIN customer
+          CROSS JOIN (SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq = (SELECT d_month_seq FROM date_dim WHERE d_date = '2001-06-06')) AS date_filter
+    WHERE: i_manager_id BETWEEN 42 AND 71
+      AND c_birth_year BETWEEN 1985 AND 1991
+    OUTPUT: i_item_sk, i_item_id, c_customer_sk, c_birth_year, d_date_sk, d_date
+    EXPECTED_ROWS: (item rows × customer rows × 30 dates) filtered by manager_id and birth_year
+    CONSUMERS: ss_items, cs_items, ws_items
+  ss_items:
+    FROM: store_sales
+    JOIN: INNER JOIN dim_cte ON ss_item_sk = dim_cte.i_item_sk
+           AND ss_sold_date_sk = dim_cte.d_date_sk
+           AND ss_customer_sk = dim_cte.c_customer_sk
+    WHERE: ss_list_price BETWEEN 168 AND 197
+    GROUP BY: dim_cte.i_item_id, dim_cte.c_birth_year
+    AGGREGATE: SUM(ss_ext_sales_price) AS ss_item_rev
+    OUTPUT: dim_cte.i_item_id AS item_id, dim_cte.c_birth_year AS birth_year, ss_item_rev
+    EXPECTED_ROWS: ~54K
+    CONSUMERS: main_query
+  cs_items, ws_items: similar with respective fact tables and customer key.
+
+NODE_CONTRACTS:
+dim_cte:
+    FROM: item
+    JOIN: CROSS JOIN customer
+          CROSS JOIN (SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq = (SELECT d_month_seq FROM date_dim WHERE d_date = '2001-06-06')) AS date_filter
+    WHERE: i_manager_id BETWEEN 42 AND 71
+      AND c_birth_year BETWEEN 1985 AND 1991
+    OUTPUT: i_item_sk, i_item_id, c_customer_sk, c_birth_year, d_date_sk, d_date
+    EXPECTED_ROWS: (item rows × customer rows × 30 dates) filtered by manager_id and birth_year
+    CONSUMERS: ss_items, cs_items, ws_items
+  ss_items:
+    FROM: store_sales
+    JOIN: INNER JOIN dim_cte ON ss_item_sk = dim_cte.i_item_sk
+           AND ss_sold_date_sk = dim_cte.d_date_sk
+           AND ss_customer_sk = dim_cte.c_customer_sk
+    WHERE: ss_list_price BETWEEN 168 AND 197
+    GROUP BY: dim_cte.i_item_id, dim_cte.c_birth_year
+    AGGREGATE: SUM(ss_ext_sales_price) AS ss_item_rev
+    OUTPUT: dim_cte.i_item_id AS item_id, dim_cte.c_birth_year AS birth_year, ss_item_rev
+    EXPECTED_ROWS: ~54K
+    CONSUMERS: main_query
+  cs_items, ws_items: similar with respective fact tables and customer key.
+
+## Hazard Flags (avoid these specific risks)
+
+- Cross-join in dim_cte could explode if filters are not selective (but they are). Must ensure WHERE clauses are applied before cross-join.
+- Output columns must include all dimension keys for fact joins.
+
+## Regression Warnings (observed failures on similar queries)
+
+1. OR to UNION ALL (observed 0.21x regression):
+   CAUSE: Splitting OR conditions into UNION ALL branches prevented bitmap index combination.
+   RULE: Do NOT split OR conditions in this query—there are no OR conditions.
+2. EXISTS to IN (observed 0.50x regression):
+   CAUSE: Converting EXISTS to IN changed join type and blocked hash anti-join.
+   RULE: Do NOT convert EXISTS—this query has no EXISTS.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output all 9 columns (item_id, birth_year, ss_item_rev, ss_dev, cs_item_rev, cs_dev, ws_item_rev, ws_dev, average) in same order.
+- CTE_COLUMN_COMPLETENESS: Dimension CTEs must output i_item_sk, i_item_id, c_customer_sk, c_birth_year, d_date_sk, d_date for downstream fact joins.
+- LITERAL_PRESERVATION: Must keep all literal values: '2001-06-06', 168, 197, 42, 71, 1985, 1991, 0.9, 1.1.
+- SEMANTIC_EQUIVALENCE: Result rows must be identical to original.
+- COMMA_JOIN_WEAKNESS: CTEs use comma-separated joins, causing poor cardinality estimation (EXPLAIN shows sequential scans on date_dim).
+- CORRELATED_SUBQUERY_PARALYSIS: Date subquery is correlated; EXPLAIN shows hash semi-join but still scans date_dim twice per CTE.
+- CROSS_CTE_PREDICATE_BLINDNESS: Same dimension filters repeated across three CTEs (EXPLAIN shows 3× scans of item and customer).
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+shared_dimension_multi_channel: Apply shared dimension CTE across multiple fact tables; ignore the UNION ALL branch splitting.
+  pg_materialized_dimension_fact_prefilter: Apply MATERIALIZED to dim_cte to pre-filter dimensions; ignore the fact table pre-filtering (we keep fact filters in separate CTEs).
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. pg_materialized_dimension_fact_prefilter (2.68x)
+
+**Principle:** Staged Reduction for Non-Equi Joins: when queries have expensive non-equi joins, reduce BOTH dimension and fact table sizes via MATERIALIZED CTEs before the join. Combined selectivity dramatically cuts the search space for inequality predicates.
+
+**BEFORE (slow):**
+```sql
+select  i_item_desc
+      ,w_warehouse_name
+      ,d1.d_week_seq
+      ,sum(case when p_promo_sk is null then 1 else 0 end) no_promo
+      ,sum(case when p_promo_sk is not null then 1 else 0 end) promo
+      ,count(*) total_cnt
+from catalog_sales
+join inventory on (cs_item_sk = inv_item_sk)
+join warehouse on (w_warehouse_sk=inv_warehouse_sk)
+join item on (i_item_sk = cs_item_sk)
+join customer_demographics on (cs_bill_cdemo_sk = cd_demo_sk)
+join household_demographics on (cs_bill_hdemo_sk = hd_demo_sk)
+join date_dim d1 on (cs_sold_date_sk = d1.d_date_sk)
+join date_dim d2 on (inv_date_sk = d2.d_date_sk)
+join date_dim d3 on (cs_ship_date_sk = d3.d_date_sk)
+left outer join promotion on (cs_promo_sk=p_promo_sk)
+left outer join catalog_returns on (cr_item_sk = cs_item_sk and cr_order_number = cs_order_number)
+where d1.d_week_seq = d2.d_week_seq
+  and inv_quantity_on_hand < cs_quantity
+  and d3.d_date > d1.d_date + interval '3 day'
+  and hd_buy_potential = '501-1000'
+  and d1.d_year = 1998
+  and cd_marital_status = 'M'
+  and cd_dep_count between 9 and 11
+  and i_category IN ('Home', 'Men', 'Music')
+  and cs_wholesale_cost BETWEEN 34 AND 54
+group by i_item_desc,w_warehouse_name,d1.d_week_seq
+order by total_cnt desc, i_item_desc, w_warehouse_name, d_week_seq
+limit 100;
+```
+
+**AFTER (fast):**
+[filtered_date]:
+```sql
+SELECT d_date_sk, d_date, d_week_seq FROM date_dim WHERE d_year = 1998
+```
+[filtered_item]:
+```sql
+SELECT i_item_sk, i_item_desc FROM item WHERE i_category IN ('Home', 'Men', 'Music')
+```
+[filtered_cd]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_marital_status = 'M' AND cd_dep_count BETWEEN 9 AND 11
+```
+[filtered_hd]:
+```sql
+SELECT hd_demo_sk FROM household_demographics WHERE hd_buy_potential = '501-1000'
+```
+[cs_filtered]:
+```sql
+SELECT cs_item_sk, cs_bill_cdemo_sk, cs_bill_hdemo_sk, cs_sold_date_sk, cs_ship_date_sk, cs_promo_sk, cs_quantity, cs_wholesale_cost, cs_order_number FROM catalog_sales WHERE cs_wholesale_cost BETWEEN 34 AND 54
+```
+[main_query]:
+```sql
+SELECT i.i_item_desc, w.w_warehouse_name, d1.d_week_seq, SUM(CASE WHEN p.p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN p.p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt FROM cs_filtered cs JOIN inventory inv ON cs.cs_item_sk = inv.inv_item_sk JOIN warehouse w ON w.w_warehouse_sk = inv.inv_warehouse_sk JOIN filtered_item i ON i.i_item_sk = cs.cs_item_sk JOIN filtered_cd cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk JOIN filtered_hd hd ON cs.cs_bill_hdemo_sk = hd.hd_demo_sk JOIN filtered_date d1 ON cs.cs_sold_date_sk = d1.d_date_sk JOIN date_dim d2 ON inv.inv_date_sk = d2.d_date_sk JOIN date_dim d3 ON cs.cs_ship_date_sk = d3.d_date_sk LEFT OUTER JOIN promotion p ON cs.cs_promo_sk = p.p_promo_sk LEFT OUTER JOIN catalog_returns cr ON cr.cr_item_sk = cs.cs_item_sk AND cr.cr_order_number = cs.cs_order_number WHERE d1.d_week_seq = d2.d_week_seq AND inv.inv_quantity_on_hand < cs.cs_quantity AND d3.d_date > d1.d_date + INTERVAL '3 day' GROUP BY i.i_item_desc, w.w_warehouse_name, d1.d_week_seq ORDER BY total_cnt DESC, i.i_item_desc, w.w_warehouse_name, d1.d_week_seq LIMIT 100
+```
+
+## Original SQL
+
+```sql
+with ss_items as
+ (select i_item_id item_id
+       ,c_birth_year birth_year
+        ,sum(ss_ext_sales_price) ss_item_rev
+ from store_sales
+     ,item
+     ,date_dim
+     ,customer
+ where ss_item_sk = i_item_sk
+   and d_date in (select d_date
+                  from date_dim
+                  where d_month_seq = (select d_month_seq
+                                      from date_dim
+                                      where d_date = '2001-06-06'))
+   and ss_sold_date_sk   = d_date_sk
+   and ss_list_price between 168 and 197
+   and i_manager_id BETWEEN 42 and 71
+   and ss_customer_sk = c_customer_sk
+   and c_birth_year BETWEEN 1985 AND 1991
+group by i_item_id, c_birth_year),
+ cs_items as
+ (select i_item_id item_id
+        ,c_birth_year birth_year
+        ,sum(cs_ext_sales_price) cs_item_rev
+  from catalog_sales
+      ,item
+      ,date_dim
+      ,customer
+ where cs_item_sk = i_item_sk
+  and  d_date in (select d_date
+                  from date_dim
+                  where d_month_seq = (select d_month_seq
+                                      from date_dim
+                                      where d_date = '2001-06-06'))
+  and  cs_sold_date_sk = d_date_sk
+  and  cs_list_price between 168 and 197
+  and i_manager_id BETWEEN 42 and 71
+  and cs_bill_customer_sk = c_customer_sk
+  and c_birth_year BETWEEN 1985 AND 1991
+group by i_item_id, c_birth_year),
+ ws_items as
+ (select i_item_id item_id
+      ,c_birth_year birth_year
+        ,sum(ws_ext_sales_price) ws_item_rev
+  from web_sales
+      ,item
+      ,date_dim
+      ,customer
+ where ws_item_sk = i_item_sk
+  and  d_date in (select d_date
+                  from date_dim
+                  where d_month_seq = (select d_month_seq
+                                     from date_dim
+                                     where d_date = '2001-06-06'))
+  and ws_sold_date_sk   = d_date_sk
+  and ws_list_price between 168 and 197
+  and i_manager_id BETWEEN 42 and 71
+  and ws_bill_customer_sk = c_customer_sk
+  and c_birth_year BETWEEN 1985 AND 1991
+group by i_item_id, c_birth_year)
+  select  ss_items.item_id, ss_items.birth_year
+       ,ss_item_rev
+       ,ss_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 ss_dev
+       ,cs_item_rev
+       ,cs_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 cs_dev
+       ,ws_item_rev
+       ,ws_item_rev/((ss_item_rev+cs_item_rev+ws_item_rev)/3) * 100 ws_dev
+       ,(ss_item_rev+cs_item_rev+ws_item_rev)/3 average
+ from ss_items,cs_items,ws_items
+ where ss_items.item_id=cs_items.item_id
+   and ss_items.item_id=ws_items.item_id
+   and ss_items.birth_year = cs_items.birth_year
+   and ss_items.birth_year = ws_items.birth_year
+   and ss_item_rev between 0.9 * cs_item_rev and 1.1 * cs_item_rev
+   and ss_item_rev between 0.9 * ws_item_rev and 1.1 * ws_item_rev
+   and cs_item_rev between 0.9 * ss_item_rev and 1.1 * ss_item_rev
+   and cs_item_rev between 0.9 * ws_item_rev and 1.1 * ws_item_rev
+   and ws_item_rev between 0.9 * ss_item_rev and 1.1 * ss_item_rev
+   and ws_item_rev between 0.9 * cs_item_rev and 1.1 * cs_item_rev
+ order by item_id, birth_year
+         ,ss_item_rev
+ limit 100;
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] cs_items  [=]  Cost: 4%  Rows: ~6K
+│   ├── SCAN (catalog_sales, item (join), date_dim (join), customer (join))
+│   ├── JOIN (cs_item_sk = i_item_sk)
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── JOIN (+1 more)
+│   ├── FILTER (? op d_date (per d_month_seq))
+│   ├── FILTER (cs_list_price BETWEEN 168 AND 197)
+│   ├── FILTER (+2 more)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (item_id, birth_year, cs_item_rev)
+├── [CTE] ss_items  [=]  Cost: 37%  Rows: ~54K
+│   ├── SCAN (store_sales, item (join), date_dim (join), customer (join))
+│   ├── JOIN (ss_item_sk = i_item_sk)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── JOIN (+1 more)
+│   ├── FILTER (? op d_date (per d_month_seq))
+│   ├── FILTER (ss_list_price BETWEEN 168 AND 197)
+│   ├── FILTER (+2 more)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (item_id, birth_year, ss_item_rev)
+├── [CTE] ws_items  [=]  Cost: 52%  Rows: ~73K
+│   ├── SCAN (web_sales, item (join), date_dim (join), customer (join))
+│   ├── JOIN (ws_item_sk = i_item_sk)
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── JOIN (+1 more)
+│   ├── FILTER (? op d_date (per d_month_seq))
+│   ├── FILTER (ws_list_price BETWEEN 168 AND 197)
+│   ├── FILTER (+2 more)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (item_id, birth_year, ws_item_rev)
+└── [MAIN] main_query  [=]  Cost: 1%  Rows: ~1K
+    ├── SCAN (ss_items, cs_items (join), ws_items (join))
+    ├── JOIN (ss_items.item_id = cs_items.item_id)
+    ├── JOIN (ss_items.item_id = ws_items.item_id)
+    ├── JOIN (+2 more)
+    ├── FILTER (ss_item_rev BETWEEN 0.9 * cs_item_rev AND 1.1 * cs_item_rev)
+    ├── FILTER (ss_item_rev BETWEEN 0.9 * ws_item_rev AND 1.1 * ws_item_rev)
+    ├── FILTER (+4 more)
+    ├── AGG (GROUP BY)
+    ├── SORT (item_id ASC, birth_year ASC, ss_item_rev ASC)
+    └── OUTPUT (item_id, birth_year, ss_item_rev, ss_dev, cs_item_rev, cs_dev, ws_item_rev, ws_dev, ...)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'"],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit or use empty array if not needed
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

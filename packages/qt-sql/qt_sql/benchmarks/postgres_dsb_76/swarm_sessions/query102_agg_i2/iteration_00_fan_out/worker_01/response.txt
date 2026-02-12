@@ -1,0 +1,104 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 99%  Rows: ~1.4M
+    ├── [=] CTE filtered_item
+    ├── [=] CTE filtered_customer  
+    ├── [=] CTE filtered_dates
+    ├── [!] CTE filtered_web_sales (added date_dim d2 join with wholesale_cost filter)
+    ├── [!] CTE filtered_store_sales (uses filtered_dates instead of date_dim d1)
+    ├── [!] CTE date_range (explicit CROSS JOIN + date range condition)
+    ├── [!] CTE joined_facts (structured joins with inventory inequality last)
+    └── [!] CTE final_aggregation (COUNT(*) with GROUP BY/ORDER BY)
+```
+
+**Changes:**
+- `[!]` Restructured from monolithic implicit joins to explicit CTE sequence per Target Logical Tree
+- `[~]` Preserved all original filters and join conditions but reorganized execution order
+- `[=]` Dimension filters (item, customer, dates) isolated in early CTEs for reduction
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "staged_reduction", "description": "Create CTEs for filtered dimensions before fact joins to reduce search space", "applied_to": ["filtered_item", "filtered_customer", "filtered_dates"]},
+    {"id": "R2", "type": "fact_prefilter", "description": "Filter web_sales/store_sales with dimension CTEs before complex joins", "applied_to": ["filtered_web_sales", "filtered_store_sales"]},
+    {"id": "R3", "type": "date_range_explicit", "description": "Extract date range pairs before main join to avoid repeated computation", "applied_to": ["date_range"]},
+    {"id": "R4", "type": "inequality_late_apply", "description": "Apply inv_quantity_on_hand >= ss_quantity filter after all joins established", "applied_to": ["joined_facts"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_item": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk FROM item WHERE i_category IN ('Men', 'Shoes', 'Sports') AND i_manager_id IN (6, 11, 16, 17, 19, 28, 47, 82, 88, 98)",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "filtered_customer": {
+        "type": "cte", 
+        "change": "new",
+        "sql": "SELECT c.c_customer_sk, cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, hd.hd_vehicle_count FROM customer c INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk AND ca.ca_state IN ('AR', 'CA', 'KS', 'NY', 'VA') INNER JOIN household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk INNER JOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk",
+        "interfaces": {"outputs": ["c_customer_sk", "cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count"], "consumes": []}
+      },
+      "filtered_dates": {
+        "type": "cte",
+        "change": "new", 
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_year = 1998",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "filtered_web_sales": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws.ws_item_sk, ws.ws_bill_customer_sk, ws.ws_sold_date_sk, ws.ws_warehouse_sk FROM web_sales ws INNER JOIN filtered_item i ON ws.ws_item_sk = i.i_item_sk INNER JOIN filtered_customer c ON ws.ws_bill_customer_sk = c.c_customer_sk INNER JOIN date_dim d2 ON ws.ws_sold_date_sk = d2.d_date_sk WHERE ws.ws_wholesale_cost BETWEEN 76 AND 96",
+        "interfaces": {"outputs": ["ws_item_sk", "ws_bill_customer_sk", "ws_sold_date_sk", "ws_warehouse_sk"], "consumes": ["filtered_item", "filtered_customer"]}
+      },
+      "filtered_store_sales": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss.ss_item_sk, ss.ss_customer_sk, ss.ss_quantity, ss.ss_sold_date_sk FROM store_sales ss INNER JOIN filtered_item i ON ss.ss_item_sk = i.i_item_sk INNER JOIN filtered_customer c ON ss.ss_customer_sk = c.c_customer_sk INNER JOIN filtered_dates d1 ON ss.ss_sold_date_sk = d1.d_date_sk",
+        "interfaces": {"outputs": ["ss_item_sk", "ss_customer_sk", "ss_quantity", "ss_sold_date_sk"], "consumes": ["filtered_item", "filtered_customer", "filtered_dates"]}
+      },
+      "date_range": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d1.d_date_sk AS d1_date_sk, d2.d_date_sk AS d2_date_sk FROM filtered_dates d1 CROSS JOIN date_dim d2 WHERE d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '30 day')",
+        "interfaces": {"outputs": ["d1_date_sk", "d2_date_sk"], "consumes": ["filtered_dates"]}
+      },
+      "joined_facts": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c.cd_gender, c.cd_marital_status, c.cd_education_status, c.hd_vehicle_count FROM filtered_web_sales ws INNER JOIN filtered_store_sales ss ON ws.ws_item_sk = ss.ss_item_sk AND ws.ws_bill_customer_sk = ss.ss_customer_sk INNER JOIN date_range dr ON ss.ss_sold_date_sk = dr.d1_date_sk AND ws.ws_sold_date_sk = dr.d2_date_sk INNER JOIN warehouse w ON ws.ws_warehouse_sk = w.w_warehouse_sk INNER JOIN store s ON s.s_state = w.w_state INNER JOIN inventory inv ON inv.inv_warehouse_sk = ws.ws_warehouse_sk AND inv.inv_item_sk = ss.ss_item_sk AND inv.inv_date_sk = ss.ss_sold_date_sk INNER JOIN filtered_customer c ON c.c_customer_sk = ss.ss_customer_sk WHERE inv.inv_quantity_on_hand >= ss.ss_quantity",
+        "interfaces": {"outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count"], "consumes": ["filtered_web_sales", "filtered_store_sales", "date_range", "filtered_customer"]}
+      },
+      "final_aggregation": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, COUNT(*) AS cnt FROM joined_facts GROUP BY cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count ORDER BY cnt",
+        "interfaces": {"outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count", "cnt"], "consumes": ["joined_facts"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT cd_gender, cd_marital_status, cd_education_status, hd_vehicle_count, cnt FROM final_aggregation",
+        "interfaces": {"outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "hd_vehicle_count", "cnt"], "consumes": ["final_aggregation"]}
+      }
+    },
+    "reconstruction_order": ["filtered_item", "filtered_customer", "filtered_dates", "filtered_web_sales", "filtered_store_sales", "date_range", "joined_facts", "final_aggregation", "main_query"],
+    "assembly_template": "WITH filtered_item AS ({filtered_item}), filtered_customer AS ({filtered_customer}), filtered_dates AS ({filtered_dates}), filtered_web_sales AS ({filtered_web_sales}), filtered_store_sales AS ({filtered_store_sales}), date_range AS ({date_range}), joined_facts AS ({joined_facts}), final_aggregation AS ({final_aggregation}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured from monolithic implicit joins to staged CTE sequence that reduces dimension tables first, then filters fact tables, before performing the complex joins with inventory inequality. This follows the staged reduction pattern while preserving all original filters, join conditions, and defensive guards.
+
+**Expected speedup:** 2-3x due to reduced intermediate result sets from early dimension filtering and controlled join order that applies inventory inequality late.

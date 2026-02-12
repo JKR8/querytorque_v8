@@ -1,0 +1,341 @@
+<reasoning>
+## 1. CLASSIFY
+This is a **star-join with correlated EXISTS/NOT EXISTS filters** archetype. Key characteristics:
+- Single fact table (catalog_sales) joined to 3 dimension tables (date_dim, customer_address, call_center)
+- Two correlated subqueries: EXISTS (self-join for multi-warehouse orders) and NOT EXISTS (anti-join with catalog_returns)
+- Aggregation with COUNT(DISTINCT) and SUMs at outermost level
+- ORDER BY + LIMIT on aggregated result
+
+## 2. EXPLAIN PLAN ANALYSIS
+
+**Wall-clock ms per major node (exclusive times):**
+- SEQ_SCAN catalog_sales (main): 115.4ms (85%) - **DOMINANT BOTTLENECK**
+- Other scans: customer_address (3.1ms), call_center (1.2ms), date_dim (1.0ms), catalog_sales (EXISTS subquery: 1.4ms), catalog_returns (1.2ms)
+- Joins: all < 4ms each
+- Aggregations: < 3ms total
+
+**Row count flow:**
+1. catalog_sales main scan: 172.8M → 182K rows (0.1% selectivity) - **massive reduction but still expensive scan**
+2. customer_address filter: 750K → 4,298 rows (ca_state='WV')
+3. call_center filter: 24 → 11 rows (IN list)
+4. date_dim filter: 73K → 61 rows (date range)
+5. After dimension joins: 1,944 rows
+6. EXISTS filter (multi-warehouse): 1,944 → 1,942 rows (minimal reduction)
+7. NOT EXISTS filter (no returns): 1,942 → 1,575 rows
+8. Final aggregation: 1 row
+
+**Key observations:**
+- catalog_sales is scanned **twice**: once for main query (115.4ms), once for EXISTS subquery (1.4ms)
+- Dimension filters are selective but applied AFTER the fact table scan
+- EXISTS and NOT EXISTS are already decorrelated by optimizer (RIGHT_SEMI/RIGHT_ANTI joins)
+- The optimizer already pushes filters into dimension scans (ca_state, cc_county, d_date)
+- CTE_INLINING strength: single-reference CTEs will be inlined, not materialized
+
+**Missed opportunity:** The fact table scan (115.4ms) reads 182K rows AFTER filtering through dimensions. If we could push dimension filters INTO the fact scan via pre-joined CTEs, we might reduce the 172.8M scan to ~1K rows directly.
+
+## 3. GAP MATCHING
+
+**Gap: CROSS_CTE_PREDICATE_BLINDNESS** ✅
+- Dimension filters aren't pushed into fact table scan
+- Opportunity: pre-filter dimensions into CTEs, then join with fact
+- Not disqualified: baseline > 100ms (135ms), dimension CTEs have WHERE clauses
+
+**Gap: REDUNDANT_SCAN_ELIMINATION** ✅
+- catalog_sales scanned twice (main + EXISTS)
+- Opportunity: consolidate into single scan with conditional logic
+- Not disqualified: 2 scans < 8 bucket limit
+
+**Gap: CORRELATED_SUBQUERY_PARALYSIS** ❌
+- EXISTS/NOT EXISTS already decorrelated by optimizer (RIGHT_SEMI/RIGHT_ANTI in EXPLAIN)
+- Transform would add overhead without benefit
+
+**Gap: CROSS_COLUMN_OR_DECOMPOSITION** ❌
+- No OR conditions on different columns
+- Only IN list (single column)
+
+## 4. AGGREGATION TRAP CHECK
+- COUNT(DISTINCT cs_order_number): grouping-insensitive to duplicates
+- SUM(cs_ext_ship_cost): grouping-insensitive  
+- SUM(cs_net_profit): grouping-insensitive
+- No FILTER clauses, no STDDEV_SAMP/VARIANCE
+- Safe to restructure joins/CTEs as long as row membership preserved
+
+## 5. TRANSFORM SELECTION
+
+Ranked by expected value:
+1. **star_join_prefetch** (pre-filter all dimensions, then probe fact) - attacks main bottleneck (115.4ms scan)
+2. **single_pass_aggregation** (consolidate main + EXISTS scans) - attacks redundant scan (1.4ms + 115.4ms)
+3. **decorrelation** (restructure NOT EXISTS as CTE + ANTI JOIN) - already done by optimizer, but we can pre-aggregate returns
+4. **exploration** (novel: combine prefetch with bitmap for multi-warehouse detection)
+
+## 6. LOGICAL TREE DESIGN
+
+For each strategy, ensure CTE columns include all downstream references:
+- Main query needs: cs_order_number, cs_ext_ship_cost, cs_net_profit, cs_warehouse_sk (for EXISTS), plus join keys
+- Dimension CTEs need: surrogate keys (d_date_sk, ca_address_sk, cc_call_center_sk)
+
+Check CTE references: In star_join_prefetch, dimension CTEs referenced once → will be inlined (no materialization benefit). But we can chain them to force early reduction.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Measure distinct order count, shipping cost, and net profit for WV shipments (April-June 2002) from specific call-center counties, limited to orders shipped from multiple warehouses with no returns. JOIN semantics: INNER joins require matching rows in all 4 tables; EXISTS is a semi-join (stop at first match); NOT EXISTS is anti-join (exclude if any match). Aggregation traps: COUNT(DISTINCT) and SUMs are grouping-insensitive to duplicates. Filter dependencies: date range filter on d_date must join via d_date_sk; state filter on ca_address_sk join; county filter on cc_call_center_sk join; multi-warehouse check depends on cs_warehouse_sk inequality; no-returns check depends on cr_order_number.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: catalog_sales main scan (115.4ms, 85% of runtime) reads 172.8M rows → 182K rows after dimension joins, but dimension filters aren't pushed into the scan. Cardinality flow: 172.8M → 182K (0.1%) → 1,944 → 1,942 → 1,575 → 1 row. Optimizer already handles: EXISTS/NOT EXISTS decorrelation (RIGHT_SEMI/RIGHT_ANTI), intra-scan predicate pushdown for dimension tables, hash join selection. Logical-tree cost percentages misleading: 85% cost on catalog_sales scan suggests opportunity to push dimension filters earlier.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output exactly 3 columns: count(distinct cs_order_number), sum(cs_ext_ship_cost), sum(cs_net_profit)
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (cs_order_number, cs_ext_ship_cost, cs_net_profit, cs_warehouse_sk, plus join keys)
+- LITERAL_PRESERVATION: Must preserve date '2002-4-01', interval 60 DAY, state 'WV', county list exactly
+- SEMANTIC_EQUIVALENCE: Must return same 1-row result with same ordering (ORDER BY count(distinct cs_order_number) ASC)
+- CROSS_CTE_PREDICATE_BLINDNESS: Dimension filters not pushed into fact scan (EXPLAIN shows SEQ_SCAN catalog_sales without dimension filters)
+- REDUNDANT_SCAN_ELIMINATION: catalog_sales scanned twice (main:115.4ms, EXISTS:1.4ms) in EXPLAIN
+
+REGRESSION_WARNINGS:
+1. materialize_cte (0.14x):
+   CAUSE: EXISTS subquery materialized into full CTE scan, destroying semi-join short-circuit
+   RULE: Never convert EXISTS/NOT EXISTS used as filter into materialized CTE
+2. regression_q25_date_cte_isolate (0.5x):
+   CAUSE: Pre-filtered fact table before multi-way join, preventing optimizer reordering
+   RULE: Avoid pre-joining fact with date CTE when query has complex multi-table joins
+3. dimension_cte_isolate (0.0076x):
+   CAUSE: Cross-joined 3+ dimension CTEs caused Cartesian explosion
+   RULE: Never cross-join 3+ dimension CTEs; each CTE must have WHERE clause
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_cte -> addr_cte -> call_cte -> prefetch_cte -> multi_warehouse_filter -> no_returns_filter -> final_agg
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '2002-4-01' AND (CAST('2002-4-01' AS DATE) + INTERVAL 60 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 61
+    CONSUMERS: prefetch_cte
+  addr_cte:
+    FROM: customer_address
+    WHERE: ca_state = 'WV'
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 4,298
+    CONSUMERS: prefetch_cte
+  call_cte:
+    FROM: call_center
+    WHERE: cc_county IN ('Ziebach County','Luce County','Richland County','Daviess County','Barrow County')
+    OUTPUT: cc_call_center_sk
+    EXPECTED_ROWS: 11
+    CONSUMERS: prefetch_cte
+  prefetch_cte:
+    FROM: catalog_sales cs1
+    JOIN: INNER JOIN date_cte ON cs1.cs_ship_date_sk = date_cte.d_date_sk
+    JOIN: INNER JOIN addr_cte ON cs1.cs_ship_addr_sk = addr_cte.ca_address_sk
+    JOIN: INNER JOIN call_cte ON cs1.cs_call_center_sk = call_cte.cc_call_center_sk
+    OUTPUT: cs_order_number, cs_ext_ship_cost, cs_net_profit, cs_warehouse_sk
+    EXPECTED_ROWS: ~1,944
+    CONSUMERS: multi_warehouse_filter
+  multi_warehouse_filter:
+    FROM: prefetch_cte cs1
+    WHERE: EXISTS (SELECT 1 FROM catalog_sales cs2 WHERE cs1.cs_order_number = cs2.cs_order_number AND cs1.cs_warehouse_sk <> cs2.cs_warehouse_sk)
+    OUTPUT: cs_order_number, cs_ext_ship_cost, cs_net_profit
+    EXPECTED_ROWS: ~1,942
+    CONSUMERS: no_returns_filter
+  no_returns_filter:
+    FROM: multi_warehouse_filter cs1
+    WHERE: NOT EXISTS (SELECT 1 FROM catalog_returns cr1 WHERE cs1.cs_order_number = cr1.cr_order_number)
+    OUTPUT: cs_order_number, cs_ext_ship_cost, cs_net_profit
+    EXPECTED_ROWS: ~1,575
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: no_returns_filter
+    AGGREGATE: COUNT(DISTINCT cs_order_number), SUM(cs_ext_ship_cost), SUM(cs_net_profit)
+    OUTPUT: count(distinct cs_order_number) as "order count", sum(cs_ext_ship_cost) as "total shipping cost", sum(cs_net_profit) as "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: OUTPUT
+EXAMPLES: date_cte_isolate, prefetch_fact_join, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: Apply date filtering into separate CTE; ignore that Q31 regression (our baseline >100ms)
+- prefetch_fact_join: Apply CTE chain: filter dimensions first, then join with fact; ignore the Q25 regression (we have simple star-join, not multi-fact join)
+- multi_dimension_prefetch: Apply pre-filtering of all 3 dimensions; ensure each CTE has WHERE clause
+HAZARD_FLAGS:
+- EXISTS subquery still scans catalog_sales again (redundant scan not eliminated)
+- Multiple CTEs may be inlined (single reference), losing materialization benefit
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  date_cte -> addr_cte -> call_cte -> combined_scan -> no_returns_filter -> final_agg
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '2002-4-01' AND (CAST('2002-4-01' AS DATE) + INTERVAL 60 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 61
+    CONSUMERS: combined_scan
+  addr_cte:
+    FROM: customer_address
+    WHERE: ca_state = 'WV'
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 4,298
+    CONSUMERS: combined_scan
+  call_cte:
+    FROM: call_center
+    WHERE: cc_county IN ('Ziebach County','Luce County','Richland County','Daviess County','Barrow County')
+    OUTPUT: cc_call_center_sk
+    EXPECTED_ROWS: 11
+    CONSUMERS: combined_scan
+  combined_scan:
+    FROM: catalog_sales cs1
+    JOIN: INNER JOIN date_cte ON cs1.cs_ship_date_sk = date_cte.d_date_sk
+    JOIN: INNER JOIN addr_cte ON cs1.cs_ship_addr_sk = addr_cte.ca_address_sk
+    JOIN: INNER JOIN call_cte ON cs1.cs_call_center_sk = call_cte.cc_call_center_sk
+    WHERE: EXISTS (SELECT 1 FROM catalog_sales cs2 WHERE cs1.cs_order_number = cs2.cs_order_number AND cs1.cs_warehouse_sk <> cs2.cs_warehouse_sk)
+    OUTPUT: cs_order_number, cs_ext_ship_cost, cs_net_profit
+    EXPECTED_ROWS: ~1,942
+    CONSUMERS: no_returns_filter
+  no_returns_filter:
+    FROM: combined_scan cs1
+    WHERE: NOT EXISTS (SELECT 1 FROM catalog_returns cr1 WHERE cs1.cs_order_number = cr1.cr_order_number)
+    OUTPUT: cs_order_number, cs_ext_ship_cost, cs_net_profit
+    EXPECTED_ROWS: ~1,575
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: no_returns_filter
+    AGGREGATE: COUNT(DISTINCT cs_order_number), SUM(cs_ext_ship_cost), SUM(cs_net_profit)
+    OUTPUT: count(distinct cs_order_number) as "order count", sum(cs_ext_ship_cost) as "total shipping cost", sum(cs_net_profit) as "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: OUTPUT
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation, pushdown
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply consolidation of main and EXISTS scans by pushing EXISTS into WHERE clause of main scan; ignore that our consolidation uses same table scan with correlated subquery (still single pass)
+- channel_bitmap_aggregation: Apply single scan with condition (EXISTS) evaluated per row; ignore the bucket count limit (we have only 1 condition)
+- pushdown: Push EXISTS filter into main scan WHERE; ignore that we're not consolidating multiple subqueries
+HAZARD_FLAGS:
+- EXISTS subquery may still cause correlated execution per row (but optimizer may decorrelate)
+- Loses benefit of semi-join short-circuit (but scan already filtered by dimensions)
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: decorrelation_with_preaggregation
+TARGET_LOGICAL_TREE:
+  date_cte -> addr_cte -> call_cte -> multi_warehouse_cte -> returns_cte -> joined_filter -> final_agg
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '2002-4-01' AND (CAST('2002-4-01' AS DATE) + INTERVAL 60 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 61
+    CONSUMERS: multi_warehouse_cte
+  addr_cte:
+    FROM: customer_address
+    WHERE: ca_state = 'WV'
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 4,298
+    CONSUMERS: multi_warehouse_cte
+  call_cte:
+    FROM: call_center
+    WHERE: cc_county IN ('Ziebach County','Luce County','Richland County','Daviess County','Barrow County')
+    OUTPUT: cc_call_center_sk
+    EXPECTED_ROWS: 11
+    CONSUMERS: multi_warehouse_cte
+  multi_warehouse_cte:
+    FROM: catalog_sales cs1
+    JOIN: INNER JOIN date_cte ON cs1.cs_ship_date_sk = date_cte.d_date_sk
+    JOIN: INNER JOIN addr_cte ON cs1.cs_ship_addr_sk = addr_cte.ca_address_sk
+    JOIN: INNER JOIN call_cte ON cs1.cs_call_center_sk = call_cte.cc_call_center_sk
+    OUTPUT: cs_order_number, cs_ext_ship_cost, cs_net_profit, cs_warehouse_sk
+    EXPECTED_ROWS: ~1,944
+    CONSUMERS: joined_filter
+  returns_cte:
+    FROM: catalog_returns
+    GROUP BY: cr_order_number
+    OUTPUT: cr_order_number
+    EXPECTED_ROWS: ~429 (from EXPLAIN hash join)
+    CONSUMERS: joined_filter
+  joined_filter:
+    FROM: multi_warehouse_cte cs1
+    WHERE: EXISTS (SELECT 1 FROM catalog_sales cs2 WHERE cs1.cs_order_number = cs2.cs_order_number AND cs1.cs_warehouse_sk <> cs2.cs_warehouse_sk)
+    ANTI JOIN: LEFT JOIN returns_cte r ON cs1.cs_order_number = r.cr_order_number WHERE r.cr_order_number IS NULL
+    OUTPUT: cs_order_number, cs_ext_ship_cost, cs_net_profit
+    EXPECTED_ROWS: ~1,575
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: joined_filter
+    AGGREGATE: COUNT(DISTINCT cs_order_number), SUM(cs_ext_ship_cost), SUM(cs_net_profit)
+    OUTPUT: count(distinct cs_order_number) as "order count", sum(cs_ext_ship_cost) as "total shipping cost", sum(cs_net_profit) as "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: OUTPUT
+EXAMPLES: decorrelate, composite_decorrelate_union, multi_intersect_exists_cte
+EXAMPLE_ADAPTATION:
+- decorrelate: Apply pre-aggregation of catalog_returns into CTE for anti-join; ignore that EXISTS is already decorrelated
+- composite_decorrelate_union: Apply shared dimension CTEs for date/addr/call; ignore the UNION aspect (we have single EXISTS)
+- multi_intersect_exists_cte: Apply pre-materialized dimension CTEs; ignore INTERSECT conversion
+HAZARD_FLAGS:
+- Pre-aggregating returns may scan full table (66K rows) vs. anti-join with early termination
+- Still has correlated EXISTS for multi-warehouse
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: bitmap_multi_warehouse_prefetch
+TARGET_LOGICAL_TREE:
+  date_cte -> addr_cte -> call_cte -> warehouse_bitmap_cte -> filtered_fact -> no_returns_filter -> final_agg
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '2002-4-01' AND (CAST('2002-4-01' AS DATE) + INTERVAL 60 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 61
+    CONSUMERS: warehouse_bitmap_cte
+  addr_cte:
+    FROM: customer_address
+    WHERE: ca_state = 'WV'
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 4,298
+    CONSUMERS: warehouse_bitmap_cte
+  call_cte:
+    FROM: call_center
+    WHERE: cc_county IN ('Ziebach County','Luce County','Richland County','Daviess County','Barrow County')
+    OUTPUT: cc_call_center_sk
+    EXPECTED_ROWS: 11
+    CONSUMERS: warehouse_bitmap_cte
+  warehouse_bitmap_cte:
+    FROM: catalog_sales
+    GROUP BY: cs_order_number
+    HAVING: MIN(cs_warehouse_sk) <> MAX(cs_warehouse_sk)  -- multi-warehouse detection
+    OUTPUT: cs_order_number
+    EXPECTED_ROWS: unknown (distinct multi-warehouse orders)
+    CONSUMERS: filtered_fact
+  filtered_fact:
+    FROM: catalog_sales cs1
+    JOIN: INNER JOIN date_cte ON cs1.cs_ship_date_sk = date_cte.d_date_sk
+    JOIN: INNER JOIN addr_cte ON cs1.cs_ship_addr_sk = addr_cte.ca_address_sk
+    JOIN: INNER JOIN call_cte ON cs1.cs_call_center_sk = call_cte.cc_call_center_sk
+    SEMI JOIN: INNER JOIN warehouse_bitmap_cte w ON cs1.cs_order_number = w.cs_order_number
+    OUTPUT: cs_order_number, cs_ext_ship_cost, cs_net_profit
+    EXPECTED_ROWS: ~1,942
+    CONSUMERS: no_returns_filter
+  no_returns_filter:
+    FROM: filtered_fact cs1
+    WHERE: NOT EXISTS (SELECT 1 FROM catalog_returns cr1 WHERE cs1.cs_order_number = cr1.cr_order_number)
+    OUTPUT: cs_order_number, cs_ext_ship_cost, cs_net_profit
+    EXPECTED_ROWS: ~1,575
+    CONSUMERS: final_agg
+  final_agg:
+    FROM: no_returns_filter
+    AGGREGATE: COUNT(DISTINCT cs_order_number), SUM(cs_ext_ship_cost), SUM(cs_net_profit)
+    OUTPUT: count(distinct cs_order_number) as "order count", sum(cs_ext_ship_cost) as "total shipping cost", sum(cs_net_profit) as "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: OUTPUT
+EXAMPLES: channel_bitmap_aggregation, single_pass_aggregation, decorrelate
+EXAMPLE_ADAPTATION:
+- channel_bitmap_aggregation: Apply GROUP BY with HAVING for multi-warehouse detection (bitmap); ignore CASE WHEN labeling (we have single condition)
+- single_pass_aggregation: Apply consolidation of warehouse check into pre-aggregation; ignore that we're scanning catalog_sales twice (once for bitmap, once for main)
+- decorrelate: Apply pre-computed CTE for multi-warehouse orders; ignore that this materializes full unfiltered catalog_sales
+HAZARD_FLAGS:
+- warehouse_bitmap_cte scans ENTIRE catalog_sales (172.8M rows) unfiltered - may be catastrophic
+- GROUP BY on cs_order_number across whole table expensive
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: This strategy attempts novel combination: pre-computing multi-warehouse orders via GROUP BY HAVING before dimension filters. Risk is high due to full table scan, but if dimension filters are very selective, the bitmap CTE might be small and join efficiently.
+EXPLORATION_TYPE: novel_combination

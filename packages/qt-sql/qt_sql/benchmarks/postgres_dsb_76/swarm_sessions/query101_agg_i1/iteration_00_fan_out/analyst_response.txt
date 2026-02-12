@@ -1,0 +1,368 @@
+<reasoning>
+1. **CLASSIFY**: This is a multi-channel star-join with non-equi date correlation. The query joins three fact tables (store_sales, store_returns, web_sales) with multiple dimension tables, and includes a temporal correlation condition (d2.d_date between d1.d_date + 90 days). It's a classic "channel comparison" pattern with a date window constraint.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total runtime: 2213.5ms
+   - Dominant operations (wall-clock):
+     1. Hash Join Inner (store_returns + item): 52.9ms × 3 workers = ~159ms total
+     2. Nested Loop Inner (store_sales lookup): 0.0ms per loop but 352,461 loops → significant total time (hidden in aggregate)
+     3. Gather Merge + Sort: 2181.1ms total (including parallel work)
+     4. Nested Loop for web_sales: 231 loops × 0.1ms = ~23ms
+   - Row count drops:
+     - date_dim d1: 24K rows → 122 rows after filter (d_year=1998)
+     - store_returns: 2,439 rows per d1 row → ~297K total after join
+     - item: 12K rows after category filter
+     - store_sales: 0 rows per loop (filter ss_sales_price/ss_list_price ratio eliminates almost all rows)
+     - The query returns 0 rows total, indicating extreme selectivity
+   - Optimizer already handles:
+     - Pushes date_dim filter (d_year=1998) into index scan
+     - Uses index-only scans on selective dimensions (item, store_returns)
+     - Parallel execution with 2 workers
+   - Scan counts:
+     - store_sales: scanned once via index (per store_returns row)
+     - store_returns: scanned once via index (per date_dim row)
+     - web_sales: scanned once via bitmap index (per store_returns row)
+     - Each dimension table scanned once
+   - The plan shows PostgreSQL is already doing aggressive predicate pushdown and using indexes effectively.
+
+3. **GAP MATCHING**:
+   - COMMA_JOIN_WEAKNESS: Present. Query uses implicit comma joins. Convert to explicit JOINs.
+   - CORRELATED_SUBQUERY_PARALYSIS: Not present (no correlated subqueries).
+   - CROSS_CTE_PREDICATE_BLINDNESS: Not present (no repeated CTE scans).
+   - NON_EQUI_JOIN_INPUT_BLINDNESS: Present. The date window condition (d2.d_date between d1.d_date AND d1.d_date + 90 days) is a non-equi join filter applied late (as Join Filter in Nested Loop). Could benefit from pre-filtering both date dimensions.
+
+4. **AGGREGATION TRAP CHECK**: Query uses COUNT(*), which is grouping-insensitive (safe against duplicates). No FILTER clauses or sensitive aggregates.
+
+5. **TRANSFORM SELECTION** (4 diverse strategies):
+   a) **Star-join prefetch + explicit joins**: Addresses comma-join weakness and pre-filters selective dimensions.
+   b) **Non-equi join optimization**: Addresses date window blindness by pre-filtering date ranges.
+   c) **Late attribute binding**: Defer non-filtering dimension joins (customer, address, household) until after fact aggregation.
+   d) **Exploration**: Combine explicit JOINs with MATERIALIZED CTEs for all dimensions (compound strategy).
+
+6. **LOGICAL TREE DESIGN**:
+   For each strategy, design CTEs that include all columns referenced downstream (customer keys, date keys, item keys, etc.).
+   Verify column completeness for each node contract.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+This query identifies customers who made purchases across store and web channels within 90 days, with specific product categories and demographic filters. All joins are INNER (all sides must match). Aggregation uses COUNT(*) which is safe to restructuring. The date window filter (d2 between d1 and d1+90) creates a temporal dependency between the store return date and web sale date.
+
+BOTTLENECK_DIAGNOSIS:
+The query is join-bound with extreme selectivity, returning 0 rows despite scanning millions. Dominant cost is the parallel gather-merge-sort (2181ms) operating on near-empty results. The optimizer already handles predicate pushdown well (filters on date_dim, item, household_demographics pushed to index scans). Logical-tree cost percentages are misleading—the 100% cost node shows ~890K rows but actual execution yields 0 rows due to ratio filter (ss_sales_price/ss_list_price BETWEEN 0.35 AND 0.55) eliminating all matches.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs c_customer_sk, c_first_name, c_last_name, cnt
+- CTE_COLUMN_COMPLETENESS: All CTEs must include customer keys, date keys, item keys, and any columns used in downstream joins/filters
+- LITERAL_PRESERVATION: Must preserve all literal values: i_category IN ('Children', 'Electronics', 'Music'), ca_state IN ('AR', 'CO', 'NC', 'NY', 'TX'), d1.d_year=1998, hd_income_band_sk BETWEEN 7 AND 13, hd_buy_potential='0-500', ss_sales_price/ss_list_price BETWEEN 35*0.01 AND 55*0.01
+- SEMANTIC_EQUIVALENCE: Must return same 0 rows with same grouping and ordering
+- COMMA_JOIN_WEAKNESS: Query uses implicit comma joins (FROM store_sales, store_returns, web_sales...)
+- NON_EQUI_JOIN_INPUT_BLINDNESS: Date window condition applied as late Join Filter in Nested Loop
+
+REGRESSION_WARNINGS:
+1. CTE blocking parallelism (observed regression 0.50x on Q045):
+   CAUSE: Materialized CTEs executed single-threaded, preventing parallel scan of large fact tables
+   RULE: For fact table scans (store_sales, store_returns, web_sales), avoid wrapping in MATERIALIZED CTEs if they would benefit from parallel scans
+2. Nestloop disable on selective lookups (observed regression 0.21x on Q085):
+   CAUSE: SET enable_nestloop=off forced hash joins for small selective lookups, increasing overhead
+   RULE: Preserve optimizer's choice of nested loops for indexed lookups on highly selective filters
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch_explicit
+TARGET_LOGICAL_TREE:
+  filtered_dates -> filtered_item -> filtered_customer_dims -> fact_joins -> aggregation -> sort
+NODE_CONTRACTS:
+  filtered_dates_d1:
+    FROM: date_dim d1
+    WHERE: d1.d_year = 1998
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 122
+    CONSUMERS: filtered_store_returns, date_window_cte
+  filtered_dates_d2:
+    FROM: date_dim d2
+    WHERE: EXISTS (SELECT 1 FROM filtered_dates_d1 WHERE d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '90 DAY'))
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: ~365 (90 days × 4 years)
+    CONSUMERS: filtered_web_sales
+  filtered_item:
+    FROM: item
+    WHERE: i_category IN ('Children', 'Electronics', 'Music')
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: 12K
+    CONSUMERS: filtered_store_returns, filtered_store_sales
+  filtered_customer_dims:
+    FROM: customer
+         INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk
+         INNER JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk
+    WHERE: ca_state IN ('AR', 'CO', 'NC', 'NY', 'TX')
+           AND hd_income_band_sk BETWEEN 7 AND 13
+           AND hd_buy_potential = '0-500'
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, c_current_addr_sk, c_current_hdemo_sk
+    EXPECTED_ROWS: unknown (selective)
+    CONSUMERS: filtered_store_sales
+  filtered_store_returns:
+    FROM: store_returns
+         INNER JOIN filtered_dates_d1 ON sr_returned_date_sk = d1.d_date_sk
+         INNER JOIN filtered_item ON sr_item_sk = i_item_sk
+    OUTPUT: sr_ticket_number, sr_item_sk, sr_returned_date_sk
+    EXPECTED_ROWS: ~2,439 per date × 122 dates = ~297K
+    CONSUMERS: filtered_store_sales, filtered_web_sales
+  filtered_store_sales:
+    FROM: store_sales
+         INNER JOIN filtered_store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+         INNER JOIN filtered_item ON ss_item_sk = i_item_sk
+         INNER JOIN filtered_customer_dims ON ss_customer_sk = c_customer_sk
+    WHERE: ss_sales_price / ss_list_price BETWEEN 35 * 0.01 AND 55 * 0.01
+    OUTPUT: ss_customer_sk, ss_item_sk, ss_ticket_number
+    EXPECTED_ROWS: 0 (extremely selective)
+    CONSUMERS: main_join
+  filtered_web_sales:
+    FROM: web_sales
+         INNER JOIN filtered_store_returns ON ws_item_sk = sr_item_sk
+         INNER JOIN filtered_dates_d2 ON ws_sold_date_sk = d2.d_date_sk
+    OUTPUT: ws_bill_customer_sk, ws_item_sk
+    EXPECTED_ROWS: 38 per store_return × 297K = ~11M (but filtered by date window)
+    CONSUMERS: main_join
+  main_join:
+    FROM: filtered_store_sales
+         INNER JOIN filtered_web_sales ON ss_customer_sk = ws_bill_customer_sk AND ss_item_sk = ws_item_sk
+    GROUP BY: c_customer_sk, c_first_name, c_last_name
+    AGGREGATE: COUNT(*) as cnt
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, cnt
+    EXPECTED_ROWS: 0
+    CONSUMERS: final_sort
+  final_sort:
+    FROM: main_join
+    ORDER BY: cnt
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, cnt
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, star_join_prefetch
+EXAMPLE_ADAPTATION:
+  pg_dimension_prefetch_star: Apply pre-filtering of all selective dimensions (date, item, customer dimensions) into CTEs; convert comma joins to explicit JOIN syntax; ignore the UNION ALL pattern as this query has no UNION.
+  pg_date_cte_explicit_join: Isolate date_dim filters into separate CTEs for d1 and d2; use explicit JOINs throughout; ignore the single-date-dimension aspect (this query uses two date_dim instances).
+  star_join_prefetch: Pre-filter dimension tables before joining with fact tables; create a star-like structure with fact tables at the center; ignore any aggregation pushdown as aggregation happens after all joins.
+HAZARD_FLAGS:
+- Risk of materializing large intermediate results (filtered_store_returns at ~297K rows) in CTEs
+- Date window condition between d1 and d2 may be expensive to compute in filtered_dates_d2 CTE
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: non_equi_date_prefilter
+TARGET_LOGICAL_TREE:
+  date_pairs -> filtered_item -> fact_joins -> dim_joins -> aggregation -> sort
+NODE_CONTRACTS:
+  date_pairs:
+    FROM: date_dim d1
+         INNER JOIN date_dim d2 ON d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '90 DAY')
+    WHERE: d1.d_year = 1998
+    OUTPUT: d1.d_date_sk as d1_date_sk, d1.d_date as d1_date, d2.d_date_sk as d2_date_sk
+    EXPECTED_ROWS: 122 × ~90 = ~11K (but limited by calendar)
+    CONSUMERS: store_returns_with_date, web_sales_with_date
+  filtered_item:
+    FROM: item
+    WHERE: i_category IN ('Children', 'Electronics', 'Music')
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: 12K
+    CONSUMERS: store_returns_with_item, store_sales_with_item
+  store_returns_with_date:
+    FROM: store_returns
+         INNER JOIN date_pairs ON sr_returned_date_sk = d1_date_sk
+    OUTPUT: sr_ticket_number, sr_item_sk, d2_date_sk
+    EXPECTED_ROWS: ~2,439 per d1 date × 122 = ~297K
+    CONSUMERS: store_sales_joined, web_sales_joined
+  store_returns_with_item:
+    FROM: store_returns_with_date
+         INNER JOIN filtered_item ON sr_item_sk = i_item_sk
+    OUTPUT: sr_ticket_number, sr_item_sk, d2_date_sk
+    EXPECTED_ROWS: ~297K (all store returns match item category)
+    CONSUMERS: store_sales_joined
+  store_sales_with_item:
+    FROM: store_sales
+         INNER JOIN filtered_item ON ss_item_sk = i_item_sk
+    WHERE: ss_sales_price / ss_list_price BETWEEN 35 * 0.01 AND 55 * 0.01
+    OUTPUT: ss_ticket_number, ss_item_sk, ss_customer_sk
+    EXPECTED_ROWS: very low (highly selective ratio)
+    CONSUMERS: store_sales_joined
+  store_sales_joined:
+    FROM: store_sales_with_item
+         INNER JOIN store_returns_with_item ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+    OUTPUT: ss_customer_sk, ss_item_sk, d2_date_sk
+    EXPECTED_ROWS: 0
+    CONSUMERS: web_sales_joined
+  web_sales_joined:
+    FROM: web_sales
+         INNER JOIN store_returns_with_date ON ws_item_sk = sr_item_sk
+         INNER JOIN date_pairs ON ws_sold_date_sk = d2_date_sk AND store_returns_with_date.d2_date_sk = date_pairs.d2_date_sk
+    OUTPUT: ws_bill_customer_sk, ws_item_sk
+    EXPECTED_ROWS: unknown
+    CONSUMERS: final_join
+  final_join:
+    FROM: store_sales_joined
+         INNER JOIN web_sales_joined ON ss_customer_sk = ws_bill_customer_sk AND ss_item_sk = ws_item_sk
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: 0
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: final_join
+         INNER JOIN customer ON ss_customer_sk = c_customer_sk
+         INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk
+         INNER JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk
+    WHERE: ca_state IN ('AR', 'CO', 'NC', 'NY', 'TX')
+           AND hd_income_band_sk BETWEEN 7 AND 13
+           AND hd_buy_potential = '0-500'
+    GROUP BY: c_customer_sk, c_first_name, c_last_name
+    AGGREGATE: COUNT(*) as cnt
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, cnt
+    EXPECTED_ROWS: 0
+    CONSUMERS: final_sort
+  final_sort:
+    FROM: aggregation
+    ORDER BY: cnt
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, cnt
+EXAMPLES: pg_materialized_dimension_fact_prefilter, non_equi_join_input_blindness
+EXAMPLE_ADAPTATION:
+  pg_materialized_dimension_fact_prefilter: Apply staged reduction by pre-joining date dimensions with the non-equi condition before joining with fact tables; use MATERIALIZED CTEs for the date_pairs to prevent re-execution; ignore the fact table prefiltering aspect (store_sales and web_sales remain large).
+  non_equi_join_input_blindness: Address the date window blindness by materializing the valid date pairs first; then use those pre-computed pairs to filter fact table joins; ignore any decorrelation patterns (no correlated subqueries).
+HAZARD_FLAGS:
+- Date_pairs CTE may produce Cartesian product (122 × ~90 = ~11K rows) which could be large
+- Risk of double-joining date_pairs (once for store_returns, once for web_sales) causing confusion
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+  fact_core -> aggregation -> late_dim_join -> sort
+NODE_CONTRACTS:
+  fact_core:
+    FROM: store_sales
+         INNER JOIN store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+         INNER JOIN web_sales ON ss_customer_sk = ws_bill_customer_sk AND ss_item_sk = ws_item_sk
+         INNER JOIN date_dim d1 ON sr_returned_date_sk = d1.d_date_sk
+         INNER JOIN date_dim d2 ON ws_sold_date_sk = d2.d_date_sk
+         INNER JOIN item ON i_item_sk = ss_item_sk
+    WHERE: i_category IN ('Children', 'Electronics', 'Music')
+           AND d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '90 DAY')
+           AND d1.d_year = 1998
+           AND ss_sales_price / ss_list_price BETWEEN 35 * 0.01 AND 55 * 0.01
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: 0
+    CONSUMERS: aggregation_core
+  aggregation_core:
+    FROM: fact_core
+    GROUP BY: ss_customer_sk
+    AGGREGATE: COUNT(*) as cnt
+    OUTPUT: ss_customer_sk, cnt
+    EXPECTED_ROWS: 0
+    CONSUMERS: late_dim_join
+  late_dim_join:
+    FROM: aggregation_core
+         INNER JOIN customer ON ss_customer_sk = c_customer_sk
+         INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk
+         INNER JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk
+    WHERE: ca_state IN ('AR', 'CO', 'NC', 'NY', 'TX')
+           AND hd_income_band_sk BETWEEN 7 AND 13
+           AND hd_buy_potential = '0-500'
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, cnt
+    EXPECTED_ROWS: 0
+    CONSUMERS: final_sort
+  final_sort:
+    FROM: late_dim_join
+    ORDER BY: cnt
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, cnt
+EXAMPLES: late_attribute_binding, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+  late_attribute_binding: Defer customer, customer_address, and household_demographics joins until after aggregation, since they are only used for filtering/display and not in join conditions with other fact tables; keep all fact table joins and filters in the core CTE; ignore any CTE materialization directives (let optimizer decide).
+  dimension_cte_isolate: Isolate dimension filters but apply them late; in this case, we isolate the customer dimension filters but apply them after aggregation; ignore the pre-filtering of dimensions into early CTEs.
+HAZARD_FLAGS:
+- May miss optimization opportunities from pushing customer filters earlier (though they're selective)
+- Aggregation on ss_customer_sk alone may produce more rows than final result (if customers filtered out by state/income later)
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: explicit_joins_materialized_dims
+TARGET_LOGICAL_TREE:
+  materialized_dims -> fact_joins_explicit -> aggregation -> sort
+NODE_CONTRACTS:
+  dim_date1:
+    FROM: date_dim d1
+    WHERE: d_year = 1998
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 122
+    CONSUMERS: fact_store_returns
+  dim_date2:
+    FROM: date_dim d2
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: ~73K (full table)
+    CONSUMERS: fact_web_sales, date_window_filter
+  dim_item:
+    FROM: item
+    WHERE: i_category IN ('Children', 'Electronics', 'Music')
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: 12K
+    CONSUMERS: fact_store_returns, fact_store_sales, fact_web_sales
+  dim_customer:
+    FROM: customer
+         INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk
+         INNER JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk
+    WHERE: ca_state IN ('AR', 'CO', 'NC', 'NY', 'TX')
+           AND hd_income_band_sk BETWEEN 7 AND 13
+           AND hd_buy_potential = '0-500'
+    OUTPUT: c_customer_sk, c_first_name, c_last_name
+    EXPECTED_ROWS: unknown (selective)
+    CONSUMERS: fact_store_sales
+  fact_store_returns:
+    FROM: store_returns
+         INNER JOIN dim_date1 ON sr_returned_date_sk = d_date_sk
+         INNER JOIN dim_item ON sr_item_sk = i_item_sk
+    OUTPUT: sr_ticket_number, sr_item_sk, sr_returned_date_sk
+    EXPECTED_ROWS: ~297K
+    CONSUMERS: fact_store_sales, fact_web_sales
+  fact_store_sales:
+    FROM: store_sales
+         INNER JOIN fact_store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk
+         INNER JOIN dim_item ON ss_item_sk = i_item_sk
+         INNER JOIN dim_customer ON ss_customer_sk = c_customer_sk
+    WHERE: ss_sales_price / ss_list_price BETWEEN 35 * 0.01 AND 55 * 0.01
+    OUTPUT: ss_customer_sk, ss_item_sk, ss_ticket_number
+    EXPECTED_ROWS: 0
+    CONSUMERS: fact_web_sales_join
+  fact_web_sales:
+    FROM: web_sales
+         INNER JOIN fact_store_returns ON ws_item_sk = sr_item_sk
+         INNER JOIN dim_item ON ws_item_sk = i_item_sk
+         INNER JOIN dim_date2 ON ws_sold_date_sk = d2.d_date_sk
+    OUTPUT: ws_bill_customer_sk, ws_item_sk, ws_sold_date_sk
+    EXPECTED_ROWS: unknown
+    CONSUMERS: fact_web_sales_join
+  fact_web_sales_join:
+    FROM: fact_store_sales
+         INNER JOIN fact_web_sales ON ss_customer_sk = ws_bill_customer_sk AND ss_item_sk = ws_item_sk
+    OUTPUT: ss_customer_sk, c_first_name, c_last_name
+    EXPECTED_ROWS: 0
+    CONSUMERS: date_window_filter
+  date_window_filter:
+    FROM: fact_web_sales_join
+         INNER JOIN dim_date1 ON fact_store_returns.sr_returned_date_sk = dim_date1.d_date_sk
+         INNER JOIN dim_date2 ON fact_web_sales.ws_sold_date_sk = dim_date2.d_date_sk
+    WHERE: dim_date2.d_date BETWEEN dim_date1.d_date AND (dim_date1.d_date + INTERVAL '90 DAY')
+    GROUP BY: ss_customer_sk, c_first_name, c_last_name
+    AGGREGATE: COUNT(*) as cnt
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, cnt
+    EXPECTED_ROWS: 0
+    CONSUMERS: final_sort
+  final_sort:
+    FROM: date_window_filter
+    ORDER BY: cnt
+    OUTPUT: c_customer_sk, c_first_name, c_last_name, cnt
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+  pg_dimension_prefetch_star: Apply pre-filtering of all dimensions into MATERIALIZED CTEs; use explicit JOIN syntax throughout; ignore the UNION ALL pattern.
+  pg_date_cte_explicit_join: Materialize both date dimensions separately; apply date window filter late as in original but with explicit joins; ignore the single-date-dimension optimization.
+  pg_materialized_dimension_fact_prefilter: Use MATERIALIZED CTEs for all dimension tables to force early execution and create tiny hash tables; keep fact tables outside CTEs to allow parallel scans; ignore the fact table prefiltering aspect.
+HAZARD_FLAGS:
+- MATERIALIZED CTEs may block parallel execution of dimension scans (though they're small)
+- Date window filter applied very late may still be expensive
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines explicit JOINs, MATERIALIZED dimension CTEs, and late date window filter)

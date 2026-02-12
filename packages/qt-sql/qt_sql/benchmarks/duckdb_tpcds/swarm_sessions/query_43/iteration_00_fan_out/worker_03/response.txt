@@ -1,0 +1,99 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Cost: 100%  Rows: ~1K  — Restructured to follow target logical tree with early dimension filtering and CTEs
+    ├── [~] filtered_date  [=]  Cost: 0%  Rows: 366  — CTE filtering date_dim to d_year=2000
+    │   ├── SCAN (date_dim)
+    │   └── FILTER (d_year = 2000)
+    ├── [~] filtered_store  [=]  Cost: 0%  Rows: 31  — CTE filtering store to s_gmt_offset=-5
+    │   ├── SCAN (store)
+    │   └── FILTER (s_gmt_offset = -5)
+    ├── [~] semijoin_filtered_sales  [!]  Cost: 80%  Rows: 1.9M  — Fact table filtered via IN subqueries to dimension CTEs
+    │   ├── SCAN (store_sales)
+    │   ├── FILTER (ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_date))
+    │   └── FILTER (ss_store_sk IN (SELECT s_store_sk FROM filtered_store))
+    ├── [~] joined_with_dims  [!]  Cost: 15%  Rows: 1.9M  — Inner joins with redundant defensive filters
+    │   ├── SCAN (semijoin_filtered_sales)
+    │   ├── JOIN (ss_sold_date_sk = d_date_sk)
+    │   ├── JOIN (ss_store_sk = s_store_sk)
+    │   ├── FILTER (d_year = 2000)  # redundant defensive
+    │   └── FILTER (s_gmt_offset = -5)  # redundant defensive
+    ├── [~] main_aggregation  [!]  Cost: 5%  Rows: 18  — Group by store with CASE aggregates
+    │   ├── AGG (GROUP BY s_store_name, s_store_id)
+    │   ├── AGG (SUM(CASE WHEN d_day_name='Sunday' THEN ss_sales_price END))
+    │   ├── ... (6 more day aggregates)
+    │   ├── SORT (s_store_name ASC, s_store_id ASC, sun_sales ASC, mon_sales ASC, tue_sales ASC, wed_sales ASC, thu_sales ASC, fri_sales ASC, sat_sales ASC)
+    │   └── OUTPUT (s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales)
+    └── LIMIT 100
+```
+
+**Change markers:**
+- `[!]` for structural changes: Original query restructured into 5 CTEs per target logical tree
+- `[~]` for modified components: Each CTE implements specific filtering/join contracts
+- `[=]` for unchanged logical operations: Filters and joins preserve original semantics
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Filter dimension tables first, then use IN subqueries to restrict fact table scan", "applied_to": ["filtered_date", "filtered_store", "semijoin_filtered_sales"]},
+    {"id": "R2", "type": "cte_isolation", "description": "Isolate dimension filters in separate CTEs to prevent Cartesian explosion", "applied_to": ["filtered_date", "filtered_store"]},
+    {"id": "R3", "type": "defensive_filters", "description": "Preserve redundant dimension filters in join node as defensive guards", "applied_to": ["joined_with_dims"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_store": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_sk FROM store WHERE s_gmt_offset = -5",
+        "interfaces": {"outputs": ["s_store_sk"], "consumes": []}
+      },
+      "semijoin_filtered_sales": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_sold_date_sk, ss_store_sk, ss_sales_price FROM store_sales WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_date) AND ss_store_sk IN (SELECT s_store_sk FROM filtered_store)",
+        "interfaces": {"outputs": ["ss_sold_date_sk", "ss_store_sk", "ss_sales_price"], "consumes": ["filtered_date", "filtered_store"]}
+      },
+      "joined_with_dims": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s.s_store_name, s.s_store_id, d.d_day_name, fss.ss_sales_price FROM semijoin_filtered_sales fss INNER JOIN date_dim d ON fss.ss_sold_date_sk = d.d_date_sk INNER JOIN store s ON fss.ss_store_sk = s.s_store_sk WHERE d.d_year = 2000 AND s.s_gmt_offset = -5",
+        "interfaces": {"outputs": ["s_store_name", "s_store_id", "d_day_name", "ss_sales_price"], "consumes": ["semijoin_filtered_sales"]}
+      },
+      "main_aggregation": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_name, s_store_id, SUM(CASE WHEN d_day_name = 'Sunday' THEN ss_sales_price END) AS sun_sales, SUM(CASE WHEN d_day_name = 'Monday' THEN ss_sales_price END) AS mon_sales, SUM(CASE WHEN d_day_name = 'Tuesday' THEN ss_sales_price END) AS tue_sales, SUM(CASE WHEN d_day_name = 'Wednesday' THEN ss_sales_price END) AS wed_sales, SUM(CASE WHEN d_day_name = 'Thursday' THEN ss_sales_price END) AS thu_sales, SUM(CASE WHEN d_day_name = 'Friday' THEN ss_sales_price END) AS fri_sales, SUM(CASE WHEN d_day_name = 'Saturday' THEN ss_sales_price END) AS sat_sales FROM joined_with_dims GROUP BY s_store_name, s_store_id",
+        "interfaces": {"outputs": ["s_store_name", "s_store_id", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"], "consumes": ["joined_with_dims"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales FROM main_aggregation ORDER BY s_store_name, s_store_id, sun_sales, mon_sales, tue_sales, wed_sales, thu_sales, fri_sales, sat_sales LIMIT 100",
+        "interfaces": {"outputs": ["s_store_name", "s_store_id", "sun_sales", "mon_sales", "tue_sales", "wed_sales", "thu_sales", "fri_sales", "sat_sales"], "consumes": ["main_aggregation"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_store", "semijoin_filtered_sales", "joined_with_dims", "main_aggregation", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_store AS ({filtered_store}), semijoin_filtered_sales AS ({semijoin_filtered_sales}), joined_with_dims AS ({joined_with_dims}), main_aggregation AS ({main_aggregation}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured original single-query join into CTE pipeline that filters dimensions early, then restricts fact table via IN subqueries, preserving all original filters and defensive redundant checks. This enables predicate pushdown to dimension tables while maintaining semantic equivalence.
+
+**Expected speedup:** 2-4x due to reduced fact table scanning (from 2.8M rows to ~1.9M) and better use of columnar filtering. The CTE overhead is acceptable given the baseline of 653ms.

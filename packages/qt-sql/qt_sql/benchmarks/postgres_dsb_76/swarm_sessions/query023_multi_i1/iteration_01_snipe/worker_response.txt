@@ -1,0 +1,104 @@
+## Modified Logic Tree
+
+[=] Original query structure
+[+] filtered_date: CTE for date_dim with d_year=1998
+[+] filtered_item: CTE for item with i_manager_id 81-100 and i_category IN
+[+] filtered_customer: CTE for customer with c_birth_year 1934-1940
+[~] frequent_ss_items: Modified to use filtered_date and filtered_item via explicit JOINs
+[+] store_sales_enriched: CTE joining store_sales with filtered_date and filtered_customer (LEFT JOIN)
+[+] customer_aggregates: CTE computing conditional aggregates for csales and ssales from store_sales_enriched
+[~] max_store_sales: Modified to use customer_aggregates
+[~] best_ss_customer: Modified to use customer_aggregates and max_store_sales
+[=] main_query: Unchanged UNION ALL structure, but now references the new CTEs
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pg_dimension_prefetch_star", "description": "Pre-filter selective dimensions into CTEs to create small hash tables", "applied_to": ["filtered_date", "filtered_item", "filtered_customer"]},
+    {"id": "R2", "type": "pg_self_join_decomposition", "description": "Materialize store_sales enriched with filtered dimensions once, then compute both customer aggregates in a single pass", "applied_to": ["store_sales_enriched", "customer_aggregates"]},
+    {"id": "R3", "type": "explicit_join_conversion", "description": "Convert comma joins to explicit JOIN syntax for better planner estimates", "applied_to": ["frequent_ss_items", "store_sales_enriched", "main_query"]},
+    {"id": "R4", "type": "conditional_aggregation", "description": "Compute csales and ssales via CASE expressions in a single aggregation over store_sales_enriched", "applied_to": ["customer_aggregates"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1998",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_item_desc FROM item WHERE i_manager_id BETWEEN 81 AND 100 AND i_category IN ('Children', 'Men', 'Sports')",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_desc"], "consumes": []}
+      },
+      "filtered_customer": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_customer_sk FROM customer WHERE c_birth_year BETWEEN 1934 AND 1940",
+        "interfaces": {"outputs": ["c_customer_sk"], "consumes": []}
+      },
+      "frequent_ss_items": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT substring(i_item_desc,1,30) AS itemdesc, i_item_sk AS item_sk, d_date AS solddate, count(*) AS cnt FROM store_sales INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk INNER JOIN filtered_item ON ss_item_sk = i_item_sk GROUP BY substring(i_item_desc,1,30), i_item_sk, d_date HAVING count(*) > 4",
+        "interfaces": {"outputs": ["itemdesc", "item_sk", "solddate", "cnt"], "consumes": ["filtered_date", "filtered_item"]}
+      },
+      "store_sales_enriched": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_customer_sk, ss_quantity, ss_sales_price, ss_wholesale_cost, d_date_sk, c_customer_sk FROM store_sales LEFT JOIN filtered_date ON ss_sold_date_sk = d_date_sk LEFT JOIN filtered_customer ON ss_customer_sk = c_customer_sk",
+        "interfaces": {"outputs": ["ss_customer_sk", "ss_quantity", "ss_sales_price", "ss_wholesale_cost", "d_date_sk", "c_customer_sk"], "consumes": ["filtered_date", "filtered_customer"]}
+      },
+      "customer_aggregates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_customer_sk, SUM(CASE WHEN d_date_sk IS NOT NULL AND ss_wholesale_cost BETWEEN 11 AND 21 THEN ss_quantity * ss_sales_price END) AS csales, SUM(CASE WHEN c_customer_sk IS NOT NULL THEN ss_quantity * ss_sales_price END) AS ssales FROM store_sales_enriched GROUP BY ss_customer_sk",
+        "interfaces": {"outputs": ["ss_customer_sk", "csales", "ssales"], "consumes": ["store_sales_enriched"]}
+      },
+      "max_store_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT max(csales) AS tpcds_cmax FROM customer_aggregates WHERE csales IS NOT NULL",
+        "interfaces": {"outputs": ["tpcds_cmax"], "consumes": ["customer_aggregates"]}
+      },
+      "best_ss_customer": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_customer_sk AS c_customer_sk, ssales FROM customer_aggregates WHERE ssales IS NOT NULL AND ssales > (95/100.0) * (SELECT tpcds_cmax FROM max_store_sales)",
+        "interfaces": {"outputs": ["c_customer_sk", "ssales"], "consumes": ["customer_aggregates", "max_store_sales"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT sum(sales) FROM (SELECT cs_quantity * cs_list_price AS sales FROM catalog_sales INNER JOIN filtered_date ON cs_sold_date_sk = d_date_sk AND d_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_moy = 10) WHERE cs_item_sk IN (SELECT item_sk FROM frequent_ss_items) AND cs_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer) AND cs_wholesale_cost BETWEEN 11 AND 21 UNION ALL SELECT ws_quantity * ws_list_price AS sales FROM web_sales INNER JOIN filtered_date ON ws_sold_date_sk = d_date_sk AND d_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_moy = 10) WHERE ws_item_sk IN (SELECT item_sk FROM frequent_ss_items) AND ws_bill_customer_sk IN (SELECT c_customer_sk FROM best_ss_customer) AND ws_wholesale_cost BETWEEN 11 AND 21) tmp2 LIMIT 100",
+        "interfaces": {"outputs": ["sum"], "consumes": ["filtered_date", "frequent_ss_items", "best_ss_customer"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "filtered_customer", "frequent_ss_items", "store_sales_enriched", "customer_aggregates", "max_store_sales", "best_ss_customer", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), filtered_customer AS ({filtered_customer}), frequent_ss_items AS ({frequent_ss_items}), store_sales_enriched AS ({store_sales_enriched}), customer_aggregates AS ({customer_aggregates}), max_store_sales AS ({max_store_sales}), best_ss_customer AS ({best_ss_customer}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'", "SET LOCAL hash_mem_multiplier = 2.0", "SET LOCAL enable_nestloop = off", "SET LOCAL enable_hashjoin = on", "SET LOCAL enable_mergejoin = off", "SET LOCAL jit = off"],
+  "validation_checks": []
+}
+```
+
+## Explanation
+
+**Changes**: 
+1. Pre‑filtered dimensions (`filtered_date`, `filtered_item`, `filtered_customer`) are isolated as tiny CTEs, enabling hash‑join planning with small probe tables.
+2. `store_sales_enriched` materializes a single scan of `store_sales` left‑joined with the filtered dimensions, eliminating the duplicate scans in the original.
+3. `customer_aggregates` computes both `csales` (for threshold) and `ssales` (for candidate customers) via conditional aggregation in one pass over the enriched sales data.
+4. All comma joins are converted to explicit `INNER JOIN` syntax, giving the planner better cardinality estimates.
+5. Runtime settings increase `work_mem` for the large hash aggregation and discourage nested‑loop joins.
+
+**Expected speedup**: 2.0×–2.5×. The main gain comes from replacing two full `store_sales` scans (for `max_store_sales` and `best_ss_customer`) with a single scan that computes both aggregates simultaneously. The pre‑filtered dimension CTEs further reduce join costs. The configuration settings ensure hash‑join plans and adequate memory for the aggregation.

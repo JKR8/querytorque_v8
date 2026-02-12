@@ -1,0 +1,85 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] shared_dims  [+]
+│   ├── SCAN (date_dim, item, promotion)
+│   ├── FILTER (d_date BETWEEN CAST('1999-10-21' AS DATE) AND CAST('1999-10-21' AS DATE) + INTERVAL '30 DAY')
+│   ├── FILTER (i_current_price > 50)
+│   ├── FILTER (i_category IN ('Men', 'Music'))
+│   ├── FILTER (p_channel_email = 'Y' AND p_channel_tv = 'N' AND p_channel_radio = 'N' AND p_channel_press = 'N' AND p_channel_event = 'N')
+│   └── OUTPUT (d_date_sk, i_item_sk, p_promo_sk)
+├── [CTE] channel_union  [+]
+│   ├── SCAN (store_sales, catalog_sales, web_sales as sales_union subquery)
+│   ├── SCAN (store_returns, catalog_returns, web_returns as returns_union subquery)
+│   ├── JOIN (LEFT OUTER JOIN returns ON complex key matching)
+│   ├── JOIN (INNER JOIN shared_dims ON item_sk)
+│   ├── JOIN (LEFT JOIN store/catalog_page/web_site for location_id)
+│   ├── FILTER (wholesale_cost BETWEEN 21 AND 36)
+│   └── OUTPUT (channel, location_id, ext_sales_price, return_amt, net_profit, net_loss)
+├── [CTE] aggregated  [+]
+│   ├── SCAN (channel_union)
+│   ├── AGG (GROUP BY channel, location_id)
+│   └── OUTPUT (channel, location_id, sales, returns, profit)
+├── [MAIN] main_query  [~]
+│   ├── SCAN (aggregated)
+│   ├── TRANSFORM (format channel names and location_id prefixes)
+│   ├── AGG (GROUP BY ROLLUP (channel, id))
+│   ├── SORT (channel ASC, id ASC)
+│   └── OUTPUT (channel, id, sales, returns, profit)
+└── [REMOVED] ssr, csr, wsr  [-]
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL 16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_consolidation", "description": "Extract shared dimension filters into single CTE to avoid redundant filtering", "applied_to": ["shared_dims"]},
+    {"id": "R2", "type": "fact_table_union", "description": "Unify three sales channels into single UNION ALL structure with consistent returns join", "applied_to": ["channel_union"]},
+    {"id": "R3", "type": "cte_to_subquery", "description": "Move large fact table scans out of CTEs to preserve parallelism", "applied_to": ["channel_union"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "shared_dims": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, i_item_sk, p_promo_sk FROM date_dim, item, promotion WHERE d_date BETWEEN CAST('1999-10-21' AS DATE) AND CAST('1999-10-21' AS DATE) + INTERVAL '30 DAY' AND i_current_price > 50 AND i_category IN ('Men', 'Music') AND p_channel_email = 'Y' AND p_channel_tv = 'N' AND p_channel_radio = 'N' AND p_channel_press = 'N' AND p_channel_event = 'N'",
+        "interfaces": {"outputs": ["d_date_sk", "i_item_sk", "p_promo_sk"], "consumes": []}
+      },
+      "channel_union": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s.channel, CASE s.channel WHEN 'store' THEN s.store_sk WHEN 'catalog' THEN s.page_sk WHEN 'web' THEN s.site_sk END AS location_id, s.ext_sales_price, COALESCE(r.return_amt, 0) AS return_amt, s.net_profit, COALESCE(r.net_loss, 0) AS net_loss FROM (SELECT 'store' AS channel, ss_item_sk AS item_sk, ss_ticket_number AS ticket_number, ss_store_sk AS store_sk, NULL AS order_number, NULL AS page_sk, NULL AS site_sk, ss_ext_sales_price AS ext_sales_price, ss_net_profit AS net_profit, ss_wholesale_cost AS wholesale_cost, ss_sold_date_sk AS date_sk, ss_promo_sk AS promo_sk FROM store_sales UNION ALL SELECT 'catalog' AS channel, cs_item_sk, NULL, NULL, cs_order_number, cs_catalog_page_sk, NULL, cs_ext_sales_price, cs_net_profit, cs_wholesale_cost, cs_sold_date_sk, cs_promo_sk FROM catalog_sales UNION ALL SELECT 'web' AS channel, ws_item_sk, NULL, NULL, ws_order_number, NULL, ws_web_site_sk, ws_ext_sales_price, ws_net_profit, ws_wholesale_cost, ws_sold_date_sk, ws_promo_sk FROM web_sales) s LEFT JOIN (SELECT 'store' AS channel, sr_item_sk AS item_sk, sr_ticket_number AS ticket_number, NULL AS cr_order_number, NULL AS wr_order_number, sr_return_amt AS return_amt, sr_net_loss AS net_loss FROM store_returns UNION ALL SELECT 'catalog' AS channel, cr_item_sk, NULL, cr_order_number, NULL, cr_return_amount, cr_net_loss FROM catalog_returns UNION ALL SELECT 'web' AS channel, wr_item_sk, NULL, NULL, wr_order_number, wr_return_amt, wr_net_loss FROM web_returns) r ON s.channel = r.channel AND s.item_sk = r.item_sk AND (s.ticket_number = r.ticket_number OR s.order_number = r.cr_order_number OR s.order_number = r.wr_order_number) INNER JOIN shared_dims sd ON s.item_sk = sd.i_item_sk AND s.date_sk = sd.d_date_sk AND s.promo_sk = sd.p_promo_sk WHERE s.wholesale_cost BETWEEN 21 AND 36",
+        "interfaces": {"outputs": ["channel", "location_id", "ext_sales_price", "return_amt", "net_profit", "net_loss"], "consumes": ["shared_dims"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT channel, location_id, SUM(ext_sales_price) AS sales, SUM(return_amt) AS returns, SUM(net_profit - net_loss) AS profit FROM channel_union GROUP BY channel, location_id",
+        "interfaces": {"outputs": ["channel", "location_id", "sales", "returns", "profit"], "consumes": ["channel_union"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT channel, id, SUM(sales) AS sales, SUM(returns) AS returns, SUM(profit) AS profit FROM (SELECT CASE channel WHEN 'store' THEN 'store channel' WHEN 'catalog' THEN 'catalog channel' WHEN 'web' THEN 'web channel' END AS channel, CASE channel WHEN 'store' THEN 'store' || location_id WHEN 'catalog' THEN 'catalog_page' || location_id WHEN 'web' THEN 'web_site' || location_id END AS id, sales, returns, profit FROM aggregated) x GROUP BY ROLLUP (channel, id) ORDER BY channel, id LIMIT 100",
+        "interfaces": {"outputs": ["channel", "id", "sales", "returns", "profit"], "consumes": ["aggregated"]}
+      }
+    },
+    "reconstruction_order": ["shared_dims", "channel_union", "aggregated", "main_query"],
+    "assembly_template": "WITH shared_dims AS ({shared_dims}), channel_union AS ({channel_union}), aggregated AS ({aggregated}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced three independent channel CTEs with single shared dimension CTE and unified fact table union. This consolidates dimension filtering (avoiding triple evaluation) while keeping fact tables as UNION ALL subqueries (preserving parallel execution).
+
+**Expected speedup**: 10-20% from eliminating redundant dimension scans and allowing better join optimization across channels.

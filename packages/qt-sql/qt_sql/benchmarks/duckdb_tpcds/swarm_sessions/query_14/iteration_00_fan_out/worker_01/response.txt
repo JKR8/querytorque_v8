@@ -1,0 +1,98 @@
+## Modified Logic Tree
+
+QUERY: (single statement)
+```
+├── [CTE] filtered_dates  [+]  Cost: ~2%  Rows: ~1095  — Date dimension filtered to 2000-2002
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year BETWEEN 2000 AND 2002)
+│   └── OUTPUT (d_date_sk, d_year)
+├── [CTE] channel_sales_keys  [+]  Cost: ~15%  Rows: ~?  — Store sales (single channel) brand/class/category combos
+│   ├── SCAN (store_sales, item AS iss, filtered_dates)
+│   ├── JOIN (ss_item_sk = iss.i_item_sk)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   └── OUTPUT (i_brand_id, i_class_id, i_category_id)
+├── [CTE] cross_items  [~]  Cost: ~18%  Rows: ~1K  — Items sold across all three channels via EXISTS (no INTERSECT)
+│   ├── SCAN (item)
+│   ├── FILTER (EXISTS channel_sales_keys)
+│   ├── FILTER (EXISTS catalog_sales via filtered_dates)
+│   ├── FILTER (EXISTS web_sales via filtered_dates)
+│   └── OUTPUT (ss_item_sk)
+├── [CTE] avg_sales  [~]  Cost: ~15%  Rows: 1  — Cross-channel average sales using filtered_dates CTE
+│   ├── SCAN (store_sales, filtered_dates)
+│   ├── UNION ALL (catalog_sales, filtered_dates)
+│   ├── UNION ALL (web_sales, filtered_dates)
+│   ├── AGG (AVG(quantity * list_price))
+│   └── OUTPUT (average_sales)
+└── [MAIN] main_query  [~]  Cost: ~50%  Rows: 100  — November 2002 per‑channel aggregates with HAVING > avg_sales
+    ├── SCAN (store_sales, item, date_dim, cross_items, avg_sales)
+    ├── JOIN (ss_item_sk = i_item_sk)
+    ├── JOIN (ss_sold_date_sk = d_date_sk)
+    ├── FILTER (d_year = 2002 AND d_moy = 11)
+    ├── FILTER (ss_item_sk IN cross_items)
+    ├── AGG (GROUP BY i_brand_id, i_class_id, i_category_id)
+    ├── HAVING (sum(sales) > avg_sales.average_sales)
+    ├── UNION ALL (catalog branch)
+    ├── UNION ALL (web branch)
+    ├── AGG (ROLLUP (channel, i_brand_id, i_class_id, i_category_id))
+    ├── SORT (channel, i_brand_id, i_class_id, i_category_id)
+    └── OUTPUT (channel, i_brand_id, i_class_id, i_category_id, sum(sales), sum(number_sales))
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "intersect_to_exists", "description": "Replace INTERSECT with three EXISTS subqueries on brand/class/category combos", "applied_to": ["cross_items"]},
+    {"id": "R2", "type": "multi_intersect_exists_cte", "description": "Introduce filtered_dates CTE shared across all channel existence checks", "applied_to": ["filtered_dates", "channel_sales_keys", "cross_items", "avg_sales"]},
+    {"id": "R3", "type": "union_cte_split", "description": "Replace original UNION in avg_sales with three separate scans using filtered_dates CTE", "applied_to": ["avg_sales"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_year FROM date_dim WHERE d_year BETWEEN 2000 AND 2002",
+        "interfaces": {"outputs": ["d_date_sk", "d_year"], "consumes": []}
+      },
+      "channel_sales_keys": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT DISTINCT iss.i_brand_id, iss.i_class_id, iss.i_category_id FROM store_sales JOIN item iss ON ss_item_sk = iss.i_item_sk JOIN filtered_dates d1 ON ss_sold_date_sk = d1.d_date_sk",
+        "interfaces": {"outputs": ["i_brand_id", "i_class_id", "i_category_id"], "consumes": ["filtered_dates"]}
+      },
+      "cross_items": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk AS ss_item_sk FROM item WHERE EXISTS (SELECT 1 FROM channel_sales_keys s WHERE s.i_brand_id = item.i_brand_id AND s.i_class_id = item.i_class_id AND s.i_category_id = item.i_category_id) AND EXISTS (SELECT 1 FROM catalog_sales JOIN item ics ON cs_item_sk = ics.i_item_sk JOIN filtered_dates d2 ON cs_sold_date_sk = d2.d_date_sk WHERE ics.i_brand_id = item.i_brand_id AND ics.i_class_id = item.i_class_id AND ics.i_category_id = item.i_category_id) AND EXISTS (SELECT 1 FROM web_sales JOIN item iws ON ws_item_sk = iws.i_item_sk JOIN filtered_dates d3 ON ws_sold_date_sk = d3.d_date_sk WHERE iws.i_brand_id = item.i_brand_id AND iws.i_class_id = item.i_class_id AND iws.i_category_id = item.i_category_id)",
+        "interfaces": {"outputs": ["ss_item_sk"], "consumes": ["channel_sales_keys", "filtered_dates"]}
+      },
+      "avg_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT AVG(quantity * list_price) AS average_sales FROM (SELECT ss_quantity AS quantity, ss_list_price AS list_price FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk UNION ALL SELECT cs_quantity, cs_list_price FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk UNION ALL SELECT ws_quantity, ws_list_price FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk) x",
+        "interfaces": {"outputs": ["average_sales"], "consumes": ["filtered_dates"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT channel, i_brand_id, i_class_id, i_category_id, SUM(sales) AS sum_sales, SUM(number_sales) AS sum_number_sales FROM (SELECT 'store' AS channel, i_brand_id, i_class_id, i_category_id, SUM(ss_quantity * ss_list_price) AS sales, COUNT(*) AS number_sales FROM store_sales JOIN item ON ss_item_sk = i_item_sk JOIN date_dim ON ss_sold_date_sk = d_date_sk WHERE d_year = 2002 AND d_moy = 11 AND ss_item_sk IN (SELECT ss_item_sk FROM cross_items) GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(ss_quantity * ss_list_price) > (SELECT average_sales FROM avg_sales) UNION ALL SELECT 'catalog' AS channel, i_brand_id, i_class_id, i_category_id, SUM(cs_quantity * cs_list_price) AS sales, COUNT(*) AS number_sales FROM catalog_sales JOIN item ON cs_item_sk = i_item_sk JOIN date_dim ON cs_sold_date_sk = d_date_sk WHERE d_year = 2002 AND d_moy = 11 AND cs_item_sk IN (SELECT ss_item_sk FROM cross_items) GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(cs_quantity * cs_list_price) > (SELECT average_sales FROM avg_sales) UNION ALL SELECT 'web' AS channel, i_brand_id, i_class_id, i_category_id, SUM(ws_quantity * ws_list_price) AS sales, COUNT(*) AS number_sales FROM web_sales JOIN item ON ws_item_sk = i_item_sk JOIN date_dim ON ws_sold_date_sk = d_date_sk WHERE d_year = 2002 AND d_moy = 11 AND ws_item_sk IN (SELECT ss_item_sk FROM cross_items) GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(ws_quantity * ws_list_price) > (SELECT average_sales FROM avg_sales)) y GROUP BY ROLLUP (channel, i_brand_id, i_class_id, i_category_id) ORDER BY channel, i_brand_id, i_class_id, i_category_id LIMIT 100",
+        "interfaces": {"outputs": ["channel", "i_brand_id", "i_class_id", "i_category_id", "sum_sales", "sum_number_sales"], "consumes": ["cross_items", "avg_sales"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "channel_sales_keys", "cross_items", "avg_sales", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), channel_sales_keys AS ({channel_sales_keys}), cross_items AS ({cross_items}), avg_sales AS ({avg_sales}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced INTERSECT with EXISTS subqueries using brand/class/category combos (semi‑join short‑circuit) and introduced shared `filtered_dates` CTE to eliminate redundant date‑dimension scans. The `channel_sales_keys` CTE materializes store‑channel combos once, reused in the first EXISTS.
+
+**Expected speedup**: ~2.0‑2.5× due to elimination of INTERSECT materialization/sorting and reuse of filtered date dimension across all channel scans.

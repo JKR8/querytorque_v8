@@ -1,0 +1,160 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_filter  [+]  Cost: <1%  Rows: 365  — Pre-filter 2002 dates
+│   └── OUTPUT: d_date_sk
+├── [CTE] return_addr_filter  [+]  Cost: 5%  Rows: 750K  — All return addresses (no filter)
+│   └── OUTPUT: ca_address_sk, ca_state
+├── [CTE] customer_total_return  [~]  Cost: 45%  Rows: 276K  — Now joins via filtered CTEs instead of base tables
+│   ├── SCAN (catalog_returns)
+│   ├── JOIN (date_filter)
+│   ├── JOIN (return_addr_filter)
+│   └── OUTPUT: ctr_customer_sk, ctr_state, ctr_total_return
+└── [MAIN] main_query  [=]  Cost: 50%  Rows: ~1K  — Identical to original (uses CTE as before)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "dimension_cte_isolate",
+      "description": "Extract date filter into separate CTE for hash join efficiency",
+      "applied_to": ["date_filter"]
+    },
+    {
+      "id": "R2",
+      "type": "prefetch_fact_join",
+      "description": "Stage return address scan to isolate dimension scan from fact join",
+      "applied_to": ["return_addr_filter"]
+    },
+    {
+      "id": "R3",
+      "type": "staged_join_pipeline",
+      "description": "Build customer_total_return CTE from pre-filtered dimension CTEs",
+      "applied_to": ["customer_total_return"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "date_filter": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2002",
+          "interfaces": {
+            "outputs": ["d_date_sk"],
+            "consumes": []
+          }
+        },
+        "return_addr_filter": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT ca_address_sk, ca_state FROM customer_address",
+          "interfaces": {
+            "outputs": ["ca_address_sk", "ca_state"],
+            "consumes": []
+          }
+        },
+        "customer_total_return": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT cr_returning_customer_sk AS ctr_customer_sk, return_addr_filter.ca_state AS ctr_state, SUM(cr_return_amt_inc_tax) AS ctr_total_return FROM catalog_returns INNER JOIN date_filter ON cr_returned_date_sk = date_filter.d_date_sk INNER JOIN return_addr_filter ON cr_returning_addr_sk = return_addr_filter.ca_address_sk GROUP BY cr_returning_customer_sk, return_addr_filter.ca_state",
+          "interfaces": {
+            "outputs": ["ctr_customer_sk", "ctr_state", "ctr_total_return"],
+            "consumes": ["date_filter", "return_addr_filter"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "unchanged",
+          "sql": "",
+          "interfaces": {
+            "outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "ca_street_number", "ca_street_name", "ca_street_type", "ca_suite_number", "ca_city", "ca_county", "ca_state", "ca_zip", "ca_country", "ca_gmt_offset", "ca_location_type", "ctr_total_return"],
+            "consumes": ["customer_total_return"]
+          }
+        }
+      },
+      "reconstruction_order": ["date_filter", "return_addr_filter", "customer_total_return", "main_query"],
+      "assembly_template": "WITH date_filter AS ({date_filter}), return_addr_filter AS ({return_addr_filter}), customer_total_return AS ({customer_total_return}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Final SQL
+
+```sql
+WITH date_filter AS (
+  SELECT d_date_sk
+  FROM date_dim
+  WHERE d_year = 2002
+), return_addr_filter AS (
+  SELECT ca_address_sk, ca_state
+  FROM customer_address
+), customer_total_return AS (
+  SELECT cr_returning_customer_sk AS ctr_customer_sk,
+         return_addr_filter.ca_state AS ctr_state,
+         SUM(cr_return_amt_inc_tax) AS ctr_total_return
+  FROM catalog_returns
+  INNER JOIN date_filter ON cr_returned_date_sk = date_filter.d_date_sk
+  INNER JOIN return_addr_filter ON cr_returning_addr_sk = return_addr_filter.ca_address_sk
+  GROUP BY cr_returning_customer_sk, return_addr_filter.ca_state
+)
+SELECT c_customer_id,
+       c_salutation,
+       c_first_name,
+       c_last_name,
+       ca_street_number,
+       ca_street_name,
+       ca_street_type,
+       ca_suite_number,
+       ca_city,
+       ca_county,
+       ca_state,
+       ca_zip,
+       ca_country,
+       ca_gmt_offset,
+       ca_location_type,
+       ctr_total_return
+FROM customer_total_return ctr1,
+     customer_address,
+     customer
+WHERE ctr1.ctr_total_return > (SELECT AVG(ctr_total_return) * 1.2
+                                FROM customer_total_return ctr2
+                                WHERE ctr1.ctr_state = ctr2.ctr_state)
+  AND ca_address_sk = c_current_addr_sk
+  AND ca_state = 'CA'
+  AND ctr1.ctr_customer_sk = c_customer_sk
+ORDER BY c_customer_id,
+         c_salutation,
+         c_first_name,
+         c_last_name,
+         ca_street_number,
+         ca_street_name,
+         ca_street_type,
+         ca_suite_number,
+         ca_city,
+         ca_county,
+         ca_state,
+         ca_zip,
+         ca_country,
+         ca_gmt_offset,
+         ca_location_type,
+         ctr_total_return
+LIMIT 100;
+```
+
+**Changes**: Isolated date and address dimension scans into separate CTEs, then built the main aggregate CTE using these pre-filtered dimension tables. This creates smaller hash tables for the fact table probe and enables better predicate pushdown.
+
+**Expected speedup**: 1.5–2.0× due to reduced dimension scan overhead and better join pipeline isolation.

@@ -1,0 +1,339 @@
+<reasoning>
+## 1. CLASSIFY
+This is a **correlated-aggregate filter** archetype:
+- Star-join pattern (web_sales fact with item/date_dim dimensions)
+- WHERE clause contains correlated scalar subquery: `ws_ext_discount_amt > 1.3 * avg(ws_ext_discount_amt)` per item
+- Subquery re-executes for each outer row (correlated via `i_item_sk`)
+- Multiple selective dimension filters (date range, item category/manufacturer, wholesale cost)
+
+## 2. EXPLAIN PLAN ANALYSIS
+No EXPLAIN ANALYZE output provided, but logical tree shows:
+
+**Key structural issues:**
+1. **Correlated subquery execution**: Subquery runs once per outer row (correlation via `i_item_sk`)
+2. **Comma joins**: Implicit joins prevent optimal join ordering
+3. **Repeated fact table scan**: Same `web_sales` table scanned twice (outer query + subquery) with similar filters
+4. **Multiple selective dimension filters**: Date_dim (90-day range), item (OR condition), wholesale_cost range
+
+**Cardinality flow (estimated):**
+- `date_dim`: ~365 rows (90 days out of ~2,500 total)
+- `item`: ~30% of rows (OR condition on manufacturer + 3 categories)
+- `web_sales`: large fact table, filtered by date (via join) and wholesale_cost
+- Subquery: runs per item-date combination in outer result
+
+**Bottleneck**: The correlated subquery executing per outer row will dominate runtime.
+
+## 3. GAP MATCHING
+
+**COMMA_JOIN_WEAKNESS** ✓ APPLIES
+- Query uses comma-separated joins (lines 4-6: `web_sales, item, date_dim`)
+- PostgreSQL's cardinality estimation suffers with implicit joins
+- **Opportunity**: Convert to explicit JOINs with pre-filtered CTEs
+
+**CORRELATED_SUBQUERY_PARALYSIS** ✓ APPLIES  
+- Scalar subquery in WHERE clause correlated via `i_item_sk` (line 23: `ws_item_sk = i_item_sk`)
+- Subquery re-executes per outer row with same date/wholesale_cost filters
+- **Opportunity**: Decorate via MATERIALIZED CTEs with pre-computed per-item thresholds
+
+**CROSS_CTE_PREDICATE_BLINDNESS** ✓ APPLIES
+- Same `web_sales` + `date_dim` scan appears twice (outer + subquery)
+- Same date filter (`d_date between...`) and wholesale_cost filter applied twice
+- **Opportunity**: Materialize common scan once, reuse for outer query and threshold computation
+
+**Optimizer already handles**: 
+- INNER_JOIN_REORDERING: Optimizer can reorder inner joins, but comma syntax weakens this
+- BITMAP_OR_SCAN: OR condition on item could use bitmap index scan if indexes exist
+
+## 4. AGGREGATION TRAP CHECK
+Only aggregate is `AVG(ws_ext_discount_amt)` in subquery. No FILTER clauses. Decorrelating by pre-computing per-item averages preserves equivalence because:
+1. Subquery groups implicitly by correlation key (`i_item_sk` + date via join)
+2. Outer query compares each row's `ws_ext_discount_amt` to the average for that exact item
+3. No row duplication from joins affects AVG in subquery (it's computed on web_sales filtered by date/wholesale_cost)
+4. Safe to compute per-item average once in CTE, then JOIN
+
+## 5. TRANSFORM SELECTION
+Ranked by expected impact:
+
+1. **Decorrelate with MATERIALIZED CTEs** (HIGH impact: eliminates per-row subquery execution)
+   - Use `inline_decorrelate_materialized` pattern
+   - Create CTEs: filtered_date, filtered_item, fact_prefilter, per_item_threshold
+
+2. **Explicit JOINs + dimension CTEs** (MEDIUM impact: improves join planning)
+   - Use `pg_dimension_prefetch_star` pattern  
+   - Pre-filter date_dim and item into CTEs, convert to explicit JOINs
+
+3. **Shared scan consolidation** (HIGH impact: eliminates duplicate fact table scan)
+   - Use `pg_self_join_decomposition` pattern
+   - Materialize common web_sales+date_dim scan once, derive outer rows and thresholds from same CTE
+
+4. **Compound exploration** (NOVEL combination)
+   - Combine dimension prefetch + decorrelation + scan consolidation
+   - Test interaction of multiple optimizations
+
+## 6. LOGICAL TREE DESIGN
+
+**Worker 1 (Decorrelate):**
+```
+filtered_date -> filtered_item -> fact_prefilter -> per_item_threshold -> main_join -> aggregate
+```
+
+**Worker 2 (Explicit JOINs + CTEs):**
+```
+date_cte -> item_cte -> fact_with_dates -> final_join -> aggregate
+```
+
+**Worker 3 (Shared scan):**
+```
+common_scan -> threshold_computation -> outer_rows -> join -> aggregate
+```
+
+**Worker 4 (Compound):**
+```
+filtered_date -> filtered_item -> common_fact -> thresholds + outer_data -> join -> aggregate
+```
+
+All CTEs must include all columns referenced downstream (JOIN keys, filtered columns, aggregates).
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compute total excess discount amount where web sales discount exceeds 1.3x the average discount for that same item during the same 90-day period, for items meeting manufacturer or category criteria. INNER JOIN semantics require all three tables to match. The AVG in the correlated subquery groups implicitly by item and date (via join correlation). Filter dependencies: the subquery's additional ws_sales_price/ws_list_price ratio filter (76-91%) does NOT apply to the outer query rows, only to the average calculation.
+
+BOTTLENECK_DIAGNOSIS:
+Correlated subquery execution dominates cost - the subquery runs once per outer row (item-date combination) with similar date/wholesale_cost filters, causing repeated full fact table scans. Scan-bound on web_sales table (scanned twice). Cardinality: date_dim filters to ~365 rows, item filters to ~30% via OR condition, web_sales filtered by date join and wholesale_cost. Optimizer already handles INNER_JOIN_REORDERING but comma-join syntax weakens cardinality estimation.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs single column "Excess Discount Amount" as SUM(ws_ext_discount_amt)
+- CTE_COLUMN_COMPLETENESS: Any CTE must include ws_item_sk, ws_sold_date_sk, ws_ext_discount_amt, ws_wholesale_cost, plus item/dim join keys
+- LITERAL_PRESERVATION: All date literals ('1999-01-29'), intervals ('90 day'), numeric ranges (797-996, 35-55, 1.3, 76*0.01, 91*0.01), categories ('Men','Shoes','Sports') must be preserved
+- SEMANTIC_EQUIVALENCE: Must return same sum of ws_ext_discount_amt for rows where discount exceeds 1.3x per-item average
+- COMMA_JOIN_WEAKNESS: Query uses comma-separated joins (web_sales, item, date_dim) which confuses PostgreSQL cardinality estimation
+- CORRELATED_SUBQUERY_PARALYSIS: Scalar subquery correlated via i_item_sk re-executes per outer row
+- CROSS_CTE_PREDICATE_BLINDNESS: Same web_sales+date_dim scan appears in outer query and subquery with same date/wholesale_cost filters
+
+REGRESSION_WARNINGS:
+None applicable.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: decorrelation_materialized_cte
+TARGET_LOGICAL_TREE:
+filtered_date -> filtered_item -> fact_prefilter -> per_item_threshold -> main_join -> final_aggregate
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '1999-01-29' AND CAST('1999-01-29' AS DATE) + INTERVAL '90 DAY'
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: ~365
+    CONSUMERS: fact_prefilter, per_item_threshold
+  filtered_item:
+    FROM: item
+    WHERE: (i_manufact_id BETWEEN 797 AND 996 OR i_category IN ('Men', 'Shoes', 'Sports'))
+    OUTPUT: i_item_sk, i_manufact_id, i_category
+    EXPECTED_ROWS: ~30% of item table
+    CONSUMERS: main_join
+  fact_prefilter:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_date ON d_date_sk = ws_sold_date_sk
+    WHERE: ws_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: ws_item_sk, ws_sold_date_sk, ws_ext_discount_amt, ws_wholesale_cost, ws_sales_price, ws_list_price
+    EXPECTED_ROWS: web_sales rows within date range and wholesale_cost range
+    CONSUMERS: per_item_threshold
+  per_item_threshold:
+    FROM: fact_prefilter
+    WHERE: ws_sales_price / ws_list_price BETWEEN 76 * 0.01 AND 91 * 0.01
+    GROUP BY: ws_item_sk
+    AGGREGATE: 1.3 * AVG(ws_ext_discount_amt) AS threshold
+    OUTPUT: ws_item_sk, threshold
+    EXPECTED_ROWS: distinct ws_item_sk values meeting ratio filter
+    CONSUMERS: main_join
+  main_join:
+    FROM: filtered_item
+    JOIN: INNER JOIN fact_prefilter ON i_item_sk = ws_item_sk
+    JOIN: INNER JOIN per_item_threshold ON fact_prefilter.ws_item_sk = per_item_threshold.ws_item_sk
+    WHERE: ws_ext_discount_amt > threshold
+    OUTPUT: ws_ext_discount_amt
+    EXPECTED_ROWS: web_sales rows where discount exceeds per-item threshold
+    CONSUMERS: final_aggregate
+  final_aggregate:
+    FROM: main_join
+    AGGREGATE: SUM(ws_ext_discount_amt) AS "Excess Discount Amount"
+    ORDER BY: SUM(ws_ext_discount_amt) ASC
+    LIMIT: 100
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: output
+EXAMPLES: inline_decorrelate_materialized
+EXAMPLE_ADAPTATION:
+Apply the 3-CTE decomposition pattern: (1) filtered_date CTE, (2) fact_prefilter CTE with date join, (3) per_item_threshold CTE with ratio filter and AVG. Use AS MATERIALIZED on CTEs to prevent inlining. Ignore any UNION ALL aspects not present in this query.
+HAZARD_FLAGS:
+- Must ensure per_item_threshold CTE groups only by ws_item_sk (not ws_sold_date_sk) since original correlation is only by item
+- The ratio filter (ws_sales_price/ws_list_price) applies ONLY to threshold calculation, not outer query
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: explicit_join_dimension_prefetch
+TARGET_LOGICAL_TREE:
+date_cte -> item_cte -> fact_with_dates -> final_explicit_join -> aggregate
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '1999-01-29' AND CAST('1999-01-29' AS DATE) + INTERVAL '90 DAY'
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: ~365
+    CONSUMERS: fact_with_dates
+  item_cte:
+    FROM: item
+    WHERE: (i_manufact_id BETWEEN 797 AND 996 OR i_category IN ('Men', 'Shoes', 'Sports'))
+    OUTPUT: i_item_sk, i_manufact_id, i_category
+    EXPECTED_ROWS: ~30% of item table
+    CONSUMERS: final_explicit_join
+  fact_with_dates:
+    FROM: web_sales
+    JOIN: INNER JOIN date_cte ON d_date_sk = ws_sold_date_sk
+    WHERE: ws_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: ws_item_sk, ws_sold_date_sk, ws_ext_discount_amt, ws_wholesale_cost, ws_sales_price, ws_list_price
+    EXPECTED_ROWS: web_sales rows within date range and wholesale_cost range
+    CONSUMERS: final_explicit_join, subquery_inline
+  final_explicit_join:
+    FROM: item_cte
+    JOIN: INNER JOIN fact_with_dates ON i_item_sk = ws_item_sk
+    WHERE: ws_ext_discount_amt > (
+      SELECT 1.3 * AVG(ws_ext_discount_amt)
+      FROM fact_with_dates AS sub
+      WHERE sub.ws_item_sk = item_cte.i_item_sk
+        AND sub.ws_sales_price / sub.ws_list_price BETWEEN 76 * 0.01 AND 91 * 0.01
+    )
+    OUTPUT: ws_ext_discount_amt
+    EXPECTED_ROWS: web_sales rows where discount exceeds per-item threshold
+    CONSUMERS: final_aggregate
+  final_aggregate:
+    FROM: final_explicit_join
+    AGGREGATE: SUM(ws_ext_discount_amt) AS "Excess Discount Amount"
+    ORDER BY: SUM(ws_ext_discount_amt) ASC
+    LIMIT: 100
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+Apply pre-filtering of date_dim and item into CTEs, then convert comma joins to explicit JOIN syntax (INNER JOIN ... ON). Use the pg_date_cte_explicit_join pattern of CTE + explicit joins. Ignore the decorrelation aspect - keep correlated subquery but with fact_with_dates CTE as base.
+HAZARD_FLAGS:
+- Correlated subquery remains but now scans smaller fact_with_dates CTE instead of full web_sales
+- Must ensure fact_with_dates CTE includes all columns needed by subquery (ws_sales_price, ws_list_price)
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: shared_scan_decomposition
+TARGET_LOGICAL_TREE:
+common_scan -> threshold_computation -> outer_rows -> join_filter -> aggregate
+NODE_CONTRACTS:
+  common_scan:
+    FROM: web_sales
+    JOIN: INNER JOIN date_dim ON d_date_sk = ws_sold_date_sk
+    WHERE: d_date BETWEEN '1999-01-29' AND CAST('1999-01-29' AS DATE) + INTERVAL '90 DAY'
+      AND ws_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: ws_item_sk, ws_sold_date_sk, ws_ext_discount_amt, ws_wholesale_cost, ws_sales_price, ws_list_price, d_date_sk
+    EXPECTED_ROWS: web_sales rows within date range and wholesale_cost range
+    CONSUMERS: threshold_computation, outer_rows
+  threshold_computation:
+    FROM: common_scan
+    WHERE: ws_sales_price / ws_list_price BETWEEN 76 * 0.01 AND 91 * 0.01
+    GROUP BY: ws_item_sk
+    AGGREGATE: 1.3 * AVG(ws_ext_discount_amt) AS threshold
+    OUTPUT: ws_item_sk, threshold
+    EXPECTED_ROWS: distinct ws_item_sk values meeting ratio filter
+    CONSUMERS: join_filter
+  outer_rows:
+    FROM: common_scan
+    JOIN: INNER JOIN item ON i_item_sk = ws_item_sk
+    WHERE: (i_manufact_id BETWEEN 797 AND 996 OR i_category IN ('Men', 'Shoes', 'Sports'))
+    OUTPUT: ws_item_sk, ws_ext_discount_amt
+    EXPECTED_ROWS: common_scan rows meeting item criteria
+    CONSUMERS: join_filter
+  join_filter:
+    FROM: outer_rows
+    JOIN: INNER JOIN threshold_computation ON outer_rows.ws_item_sk = threshold_computation.ws_item_sk
+    WHERE: outer_rows.ws_ext_discount_amt > threshold_computation.threshold
+    OUTPUT: ws_ext_discount_amt
+    EXPECTED_ROWS: outer_rows where discount exceeds threshold
+    CONSUMERS: final_aggregate
+  final_aggregate:
+    FROM: join_filter
+    AGGREGATE: SUM(ws_ext_discount_amt) AS "Excess Discount Amount"
+    ORDER BY: SUM(ws_ext_discount_amt) ASC
+    LIMIT: 100
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: output
+EXAMPLES: pg_self_join_decomposition
+EXAMPLE_ADAPTATION:
+Apply the shared materialization pattern: common_scan CTE contains the expensive web_sales+date_dim join with date/wholesale_cost filters, reused for both threshold computation and outer rows. This eliminates duplicate fact table scan. Ignore any store_sales vs web_sales differences - pattern applies to any fact table.
+HAZARD_FLAGS:
+- Common_scan must include all columns needed by both branches (ws_sales_price, ws_list_price for threshold, ws_ext_discount_amt for both)
+- Threshold computation groups only by ws_item_sk (not ws_sold_date_sk) since original correlation is by item only
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: compound_prefetch_decorrelate
+TARGET_LOGICAL_TREE:
+filtered_date -> filtered_item -> common_fact -> thresholds -> outer_data -> join -> aggregate
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '1999-01-29' AND CAST('1999-01-29' AS DATE) + INTERVAL '90 DAY'
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: ~365
+    CONSUMERS: common_fact
+  filtered_item:
+    FROM: item
+    WHERE: (i_manufact_id BETWEEN 797 AND 996 OR i_category IN ('Men', 'Shoes', 'Sports'))
+    OUTPUT: i_item_sk, i_manufact_id, i_category
+    EXPECTED_ROWS: ~30% of item table
+    CONSUMERS: outer_data
+  common_fact:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_date ON d_date_sk = ws_sold_date_sk
+    WHERE: ws_wholesale_cost BETWEEN 35 AND 55
+    OUTPUT: ws_item_sk, ws_sold_date_sk, ws_ext_discount_amt, ws_wholesale_cost, ws_sales_price, ws_list_price
+    EXPECTED_ROWS: web_sales rows within date range and wholesale_cost range
+    CONSUMERS: thresholds, outer_data
+  thresholds:
+    FROM: common_fact
+    WHERE: ws_sales_price / ws_list_price BETWEEN 76 * 0.01 AND 91 * 0.01
+    GROUP BY: ws_item_sk
+    AGGREGATE: 1.3 * AVG(ws_ext_discount_amt) AS threshold
+    OUTPUT: ws_item_sk, threshold
+    EXPECTED_ROWS: distinct ws_item_sk values meeting ratio filter
+    CONSUMERS: join
+  outer_data:
+    FROM: filtered_item
+    JOIN: INNER JOIN common_fact ON i_item_sk = ws_item_sk
+    OUTPUT: ws_item_sk, ws_ext_discount_amt
+    EXPECTED_ROWS: common_fact rows meeting item criteria
+    CONSUMERS: join
+  join:
+    FROM: outer_data
+    JOIN: INNER JOIN thresholds ON outer_data.ws_item_sk = thresholds.ws_item_sk
+    WHERE: outer_data.ws_ext_discount_amt > thresholds.threshold
+    OUTPUT: ws_ext_discount_amt
+    EXPECTED_ROWS: outer_data rows where discount exceeds threshold
+    CONSUMERS: final_aggregate
+  final_aggregate:
+    FROM: join
+    AGGREGATE: SUM(ws_ext_discount_amt) AS "Excess Discount Amount"
+    ORDER BY: SUM(ws_ext_discount_amt) ASC
+    LIMIT: 100
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: output
+EXAMPLES: pg_dimension_prefetch_star, inline_decorrelate_materialized, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+Combine dimension prefetch (date+item CTEs), fact prefilter (common_fact CTE), and decorrelation (thresholds CTE). Apply pg_materialized_dimension_fact_prefilter pattern of staging reduction. Use AS MATERIALIZED on all CTEs. Ignore any non-equi join aspects - this query has equality joins.
+HAZARD_FLAGS:
+- Multiple CTEs may increase planning time
+- Must ensure all CTEs are MATERIALIZED to prevent inlining and enable true decorrelation
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

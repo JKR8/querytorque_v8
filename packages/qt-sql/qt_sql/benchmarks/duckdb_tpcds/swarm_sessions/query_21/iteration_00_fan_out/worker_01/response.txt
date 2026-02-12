@@ -1,0 +1,90 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Aggregate on-hand inventory in two 30-day windows around 2002-02-27 using CASE splits, then filter warehouse-item groups by the before/after ratio band and return ordered identifiers.
+    ├── [~] date_cte  [~]  — Pre-filter date dimension to the 61-day window
+    │   └── SCAN (date_dim)
+    ├── [~] item_cte  [~]  — Pre-filter low-priced items (0.99-1.49)
+    │   └── SCAN (item)
+    ├── [~] warehouse_cte  [~]  — Full warehouse table (small dimension)
+    │   └── SCAN (warehouse)
+    ├── [~] inventory_join_all  [~]  — Join fact table sequentially with pre-filtered dimension CTEs
+    │   └── SCAN (inventory)
+    ├── [~] aggregate  [=]  — Group by warehouse/item, compute before/after sums
+    ├── [~] ratio_filter  [=]  — Apply ratio guard with CASE protection
+    ├── [~] order_limit  [=]  — Order and limit final results
+    └── OUTPUT (*)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter date_dim to ±30 days around 2002-02-27", "applied_to": ["date_cte"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Pre-filter item to price range 0.99-1.49", "applied_to": ["item_cte"]},
+    {"id": "R3", "type": "dimension_cte_isolate", "description": "Select warehouse columns needed downstream", "applied_to": ["warehouse_cte"]},
+    {"id": "R4", "type": "multi_dimension_prefetch", "description": "Join inventory sequentially with pre-filtered dimension CTEs (date→item→warehouse)", "applied_to": ["inventory_join_all"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN DATE '2002-02-27' - INTERVAL 30 DAY AND DATE '2002-02-27' + INTERVAL 30 DAY",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_current_price BETWEEN 0.99 AND 1.49",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "warehouse_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT w_warehouse_sk, w_warehouse_name FROM warehouse",
+        "interfaces": {"outputs": ["w_warehouse_sk", "w_warehouse_name"], "consumes": []}
+      },
+      "inventory_join_all": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT w.w_warehouse_name, i.i_item_id, inv.inv_quantity_on_hand, d.d_date FROM inventory inv JOIN date_cte d ON inv.inv_date_sk = d.d_date_sk JOIN item_cte i ON inv.inv_item_sk = i.i_item_sk JOIN warehouse_cte w ON inv.inv_warehouse_sk = w.w_warehouse_sk",
+        "interfaces": {"outputs": ["w_warehouse_name", "i_item_id", "inv_quantity_on_hand", "d_date"], "consumes": ["date_cte", "item_cte", "warehouse_cte"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT w_warehouse_name, i_item_id, SUM(CASE WHEN d_date < DATE '2002-02-27' THEN inv_quantity_on_hand ELSE 0 END) AS inv_before, SUM(CASE WHEN d_date >= DATE '2002-02-27' THEN inv_quantity_on_hand ELSE 0 END) AS inv_after FROM inventory_join_all GROUP BY w_warehouse_name, i_item_id",
+        "interfaces": {"outputs": ["w_warehouse_name", "i_item_id", "inv_before", "inv_after"], "consumes": ["inventory_join_all"]}
+      },
+      "ratio_filter": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT w_warehouse_name, i_item_id, inv_before, inv_after FROM aggregate WHERE (CASE WHEN inv_before > 0 THEN inv_after / inv_before ELSE NULL END) BETWEEN (2.0/3.0) AND (3.0/2.0)",
+        "interfaces": {"outputs": ["w_warehouse_name", "i_item_id", "inv_before", "inv_after"], "consumes": ["aggregate"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT * FROM ratio_filter ORDER BY w_warehouse_name ASC, i_item_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["w_warehouse_name", "i_item_id", "inv_before", "inv_after"], "consumes": ["ratio_filter"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "item_cte", "warehouse_cte", "inventory_join_all", "aggregate", "ratio_filter", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), item_cte AS ({item_cte}), warehouse_cte AS ({warehouse_cte}), inventory_join_all AS ({inventory_join_all}), aggregate AS ({aggregate}), ratio_filter AS ({ratio_filter}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Restructured the query using a CTE pipeline that pre-filters all dimension tables (date_dim, item, warehouse) before joining with the large fact table (inventory). This allows DuckDB to build small hash tables from filtered dimensions and probe them efficiently against the fact table.
+
+Expected speedup: 2-3x due to reduced fact table scanning through early dimension filtering and optimal join order.

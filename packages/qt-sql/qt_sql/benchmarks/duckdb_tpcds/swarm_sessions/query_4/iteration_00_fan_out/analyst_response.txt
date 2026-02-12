@@ -1,0 +1,338 @@
+<reasoning>
+Query Classification:
+This is a "multi-channel UNION ALL with self-join decomposition" archetype. The query has a CTE that UNIONs three sales channels (store, catalog, web), groups by customer attributes and year, then the main query self-joins this CTE 6 times (each channel × two years) to compare year-over-year growth ratios.
+
+EXPLAIN Plan Analysis:
+- Total runtime: 8156ms.
+- Store sales scans: 2 (1999, 2000) @ ~5.5M rows each = ~11M rows scanned, ~755ms each join = ~1510ms total.
+- Catalog sales scans: 2 (1999, 2000) @ ~2.9M rows each = ~5.8M rows scanned, ~350ms each join = ~700ms total.
+- Web sales scans: 2 (1999, 2000) @ ~1.4M rows each = ~2.8M rows scanned, ~185ms each join = ~370ms total.
+- Customer table scanned 6 times (once per channel/year) = ~500K rows each, ~300ms total.
+- Date_dim scanned 6 times (once per channel/year) = ~365 rows each, negligible.
+
+Bottleneck: Repeated fact table scans dominate. Each fact table is scanned twice (once per year). The optimizer does NOT consolidate these scans—each year is processed separately. The CTE is inlined and expanded per reference, so no materialization sharing.
+
+Aggregation Trap Check:
+The aggregates are SUMs of a deterministic expression. No STDDEV_SAMP, VARIANCE, etc. The grouping is by (customer_id, year, sale_type). If we consolidate scans, we must ensure each (customer, year, channel) group remains distinct. Conditional aggregation with CASE WHEN year=1999 and year=2000 is safe because the GROUP BY still includes year? Actually, we can remove year from GROUP BY and pivot using CASE aggregates, but that would combine 1999 and 2000 rows into one group per customer per channel. The original computes SUM per year separately. Using SUM(CASE WHEN year=1999 THEN expr END) and SUM(CASE WHEN year=2000 THEN expr END) with GROUP BY customer, channel (excluding year) is equivalent because each original row belongs to exactly one year. No aggregation trap.
+
+Gap Matching:
+- REDUNDANT_SCAN_ELIMINATION: Present. Each fact table scanned twice (once per year). Historical transform: single_pass_aggregation (4.47x), channel_bitmap_aggregation (6.24x).
+- CROSS_CTE_PREDICATE_BLINDNESS: Present. The date filter (d_year IN (1999,2000)) is pushed into each scan, but date_dim is still scanned 6 times. Could isolate into a CTE and reuse.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: Present. The generic CTE is self-joined 6 times with different (sale_type, year) filters. Historical transform: union_cte_split (1.36x) but must eliminate original union.
+
+Transform Selection:
+1. **single_pass_aggregation** (Worker 1): Consolidate each channel's two year-scans into one scan with conditional aggregates for 1999 and 2000. Reduces fact scans from 6 to 3.
+2. **date_cte_isolate** (Worker 2): Extract date_dim filter into a CTE to be reused across all channel scans. Reduces date_dim scans from 6 to 1.
+3. **union_cte_split** (Worker 3): Split the generic CTE into 6 specialized CTEs (each channel × year). Eliminates the discriminator filters and allows direct joins without self-join on year/sale_type.
+4. **Exploration: channel_bitmap_aggregation** (Worker 4): Consolidate all three channels into a single scan? Not directly possible because different fact tables. Instead, try a compound strategy: date_cte_isolate + single_pass_aggregation + pivot the years into columns to avoid self-joins entirely (novel combination).
+
+Logical Tree Design:
+For Worker 1: Create a CTE per channel that computes both year totals in one pass, then join them on customer_id.
+For Worker 2: Create a date_cte with d_date_sk for years 1999,2000; then join once per channel.
+For Worker 3: Create 6 CTEs: store_1999, store_2000, catalog_1999, etc. Then join directly.
+For Worker 4: Create a date_cte, then a sales_aggregate CTE that unions all channels with conditional aggregates for both years, then pivot into columns for main query.
+
+Constraints:
+- CTE_COLUMN_COMPLETENESS: Must include all columns referenced downstream: customer_id, first_name, last_name, birth_country, year_total (or year_total_1999, year_total_2000), sale_type, d_year (if needed).
+- LITERAL_PRESERVATION: Must keep d_year=1999 and 2000 exactly.
+- COMPLETE_OUTPUT: Output columns: customer_id, customer_first_name, customer_last_name, customer_birth_country.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows ordered by same columns.
+
+Regression Warnings:
+- union_cte_split on q74 (0.49x): CAUSE: kept original UNION CTE alongside specialized CTEs. RULE: When splitting, eliminate the original union CTE entirely.
+- date_cte_isolate on q31 (0.49x): CAUSE: baseline <100ms, CTE overhead dominated. RULE: Our baseline is 8s, so safe.
+- prefetch_fact_join on q25 (0.50x): CAUSE: baseline <50ms. Not applicable.
+</reasoning>
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Find customers whose catalog sales growth ratio (2000/1999) exceeds both store and web growth ratios, requiring positive 1999 baselines in all three channels. JOIN semantics: all 6 self-joins are INNER on customer_id (intersection) and filter by specific (sale_type, year) pairs. Aggregation trap: SUMs are duplicate-sensitive, but each (customer, year, channel) group is distinct; conditional aggregation with CASE WHEN year=X is safe because each original row belongs to exactly one year. Filter dependencies: year_total>0 filters must be applied after aggregation, and growth ratio comparisons must use the same channel's 1999 and 2000 totals.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: 6 fact table scans (store_sales 2×, catalog_sales 2×, web_sales 2×) consume ~2580ms (32% of total). Each scan joins with customer and date_dim. Row counts: fact tables scanned at 5.5M, 2.9M, 1.4M rows per year. Cardinality drops sharply after date filter (to ~365 rows) and after join with customer (to ~5.5M/2.9M/1.4M). The optimizer already pushes date filters into scans but does not consolidate multiple year scans into one. Logical-tree cost percentages (50% CTE, 50% main) are misleading; actual time is dominated by fact scans and joins, not the final self-join.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output exactly columns customer_id, customer_first_name, customer_last_name, customer_birth_country in same order.
+- CTE_COLUMN_COMPLETENESS: Downstream joins need customer_id, sale_type, year totals; output needs customer attributes.
+- LITERAL_PRESERVATION: Must preserve d_year=1999 and d_year=2000 exactly.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows with same ordering.
+- REDUNDANT_SCAN_ELIMINATION: EXPLAIN shows each fact table scanned twice (once per year); total 6 scans.
+- CROSS_CTE_PREDICATE_BLINDNESS: date_dim scanned 6 times; filter not shared across CTE references.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: Generic CTE year_total is self-joined 6 times with different (sale_type, year) filters.
+
+REGRESSION_WARNINGS:
+1. union_cte_split (0.49x on Q74):
+   CAUSE: Kept original UNION CTE alongside specialized CTEs, causing redundant materialization.
+   RULE: When splitting the CTE into year/channel-specific CTEs, ELIMINATE the original year_total CTE entirely.
+2. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline runtime <100ms, CTE materialization overhead exceeded savings.
+   RULE: Our baseline is 8156ms, so safe to apply.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  date_filter_cte -> store_agg_cte -> catalog_agg_cte -> web_agg_cte -> main_join
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_year IN (1999, 2000)
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: ~730
+    CONSUMERS: store_agg, catalog_agg, web_agg
+  store_agg:
+    FROM: customer c, store_sales ss, date_filter d
+    JOIN: c.c_customer_sk = ss.ss_customer_sk AND ss.ss_sold_date_sk = d.d_date_sk
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE: 
+      SUM(CASE WHEN d.d_year=1999 THEN ((ss_ext_list_price-ss_ext_wholesale_cost-ss_ext_discount_amt)+ss_ext_sales_price)/2 END) as year_total_1999,
+      SUM(CASE WHEN d.d_year=2000 THEN ((ss_ext_list_price-ss_ext_wholesale_cost-ss_ext_discount_amt)+ss_ext_sales_price)/2 END) as year_total_2000
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_birth_country, year_total_1999, year_total_2000, 's' as sale_type
+    EXPECTED_ROWS: ~308K (combined across years)
+    CONSUMERS: main_join
+  catalog_agg:
+    FROM: customer c, catalog_sales cs, date_filter d
+    JOIN: c.c_customer_sk = cs.cs_bill_customer_sk AND cs.cs_sold_date_sk = d.d_date_sk
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE:
+      SUM(CASE WHEN d.d_year=1999 THEN ((cs_ext_list_price-cs_ext_wholesale_cost-cs_ext_discount_amt)+cs_ext_sales_price)/2 END) as year_total_1999,
+      SUM(CASE WHEN d.d_year=2000 THEN ((cs_ext_list_price-cs_ext_wholesale_cost-cs_ext_discount_amt)+cs_ext_sales_price)/2 END) as year_total_2000
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_birth_country, year_total_1999, year_total_2000, 'c' as sale_type
+    EXPECTED_ROWS: ~235K
+    CONSUMERS: main_join
+  web_agg:
+    FROM: customer c, web_sales ws, date_filter d
+    JOIN: c.c_customer_sk = ws.ws_bill_customer_sk AND ws.ws_sold_date_sk = d.d_date_sk
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE:
+      SUM(CASE WHEN d.d_year=1999 THEN ((ws_ext_list_price-ws_ext_wholesale_cost-ws_ext_discount_amt)+ws_ext_sales_price)/2 END) as year_total_1999,
+      SUM(CASE WHEN d.d_year=2000 THEN ((ws_ext_list_price-ws_ext_wholesale_cost-ws_ext_discount_amt)+ws_ext_sales_price)/2 END) as year_total_2000
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_birth_country, year_total_1999, year_total_2000, 'w' as sale_type
+    EXPECTED_ROWS: ~107K
+    CONSUMERS: main_join
+  main_join:
+    FROM: store_agg s, catalog_agg c, web_agg w
+    JOIN: s.c_customer_id = c.c_customer_id AND s.c_customer_id = w.c_customer_id
+    WHERE: 
+      s.year_total_1999 > 0 AND c.year_total_1999 > 0 AND w.year_total_1999 > 0
+      AND (c.year_total_2000 / c.year_total_1999) > (s.year_total_2000 / s.year_total_1999)
+      AND (c.year_total_2000 / c.year_total_1999) > (w.year_total_2000 / w.year_total_1999)
+    ORDER BY: s.c_customer_id, s.c_first_name, s.c_last_name, s.c_birth_country
+    OUTPUT: s.c_customer_id, s.c_first_name, s.c_last_name, s.c_birth_country
+    EXPECTED_ROWS: ~619
+    CONSUMERS: final LIMIT 100
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation, pushdown
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation (Q9): Apply conditional aggregation within each channel to compute 1999 and 2000 totals in one pass. Ignore that Q9 uses scalar subqueries; we adapt the CASE aggregation pattern.
+- channel_bitmap_aggregation (Q88): Apply the idea of labeling rows with CASE and aggregating conditionally, but we keep separate CTEs per channel (different fact tables). Ignore the bitmap aspect.
+- pushdown (Q9): Push the date filter into the CTE; we already do that via date_filter CTE.
+HAZARD_FLAGS:
+- Must ensure year_total_1999 and year_total_2000 are NULL for customers missing sales in that year; growth ratio comparisons handle NULL via CASE in original, but we simplified to division. Original uses CASE WHEN year_total>0 THEN division ELSE NULL. Our WHERE already filters year_total_1999>0, so division safe.
+- The original main query uses 6 self-joins; we use 3 CTEs. Ensure join semantics identical: all customers must have sales in all three channels in both years (due to INNER joins and year_total_1999>0 filters). Our join on customer_id across three CTEs preserves that.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: date_cte_isolate
+TARGET_LOGICAL_TREE:
+  date_cte -> year_total_cte (union all per channel) -> main_self_join
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year IN (1999, 2000)
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: ~730
+    CONSUMERS: store_sales_cte, catalog_sales_cte, web_sales_cte
+  store_sales_cte:
+    FROM: customer c, store_sales ss, date_cte d
+    JOIN: c.c_customer_sk = ss.ss_customer_sk AND ss.ss_sold_date_sk = d.d_date_sk
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_preferred_cust_flag, c.c_birth_country, c.c_login, c.c_email_address, d.d_year
+    AGGREGATE: SUM(((ss_ext_list_price-ss_ext_wholesale_cost-ss_ext_discount_amt)+ss_ext_sales_price)/2) as year_total
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year, year_total, 's' as sale_type
+    EXPECTED_ROWS: ~308K (per year, so ~616K total)
+    CONSUMERS: year_total_cte
+  catalog_sales_cte:
+    FROM: customer c, catalog_sales cs, date_cte d
+    JOIN: c.c_customer_sk = cs.cs_bill_customer_sk AND cs.cs_sold_date_sk = d.d_date_sk
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_preferred_cust_flag, c.c_birth_country, c.c_login, c.c_email_address, d.d_year
+    AGGREGATE: SUM(((cs_ext_list_price-cs_ext_wholesale_cost-cs_ext_discount_amt)+cs_ext_sales_price)/2) as year_total
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year, year_total, 'c' as sale_type
+    EXPECTED_ROWS: ~235K
+    CONSUMERS: year_total_cte
+  web_sales_cte:
+    FROM: customer c, web_sales ws, date_cte d
+    JOIN: c.c_customer_sk = ws.ws_bill_customer_sk AND ws.ws_sold_date_sk = d.d_date_sk
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_preferred_cust_flag, c.c_birth_country, c.c_login, c.c_email_address, d.d_year
+    AGGREGATE: SUM(((ws_ext_list_price-ws_ext_wholesale_cost-ws_ext_discount_amt)+ws_ext_sales_price)/2) as year_total
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address, d_year, year_total, 'w' as sale_type
+    EXPECTED_ROWS: ~107K
+    CONSUMERS: year_total_cte
+  year_total_cte:
+    FROM: store_sales_cte UNION ALL catalog_sales_cte UNION ALL web_sales_cte
+    OUTPUT: customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear, year_total, sale_type
+    EXPECTED_ROWS: sum of above (~958K)
+    CONSUMERS: t_s_firstyear, t_s_secyear, t_c_firstyear, t_c_secyear, t_w_firstyear, t_w_secyear
+  main_self_join:
+    (same as original main query, referencing year_total_cte 6 times with aliases and filters)
+    FROM: year_total_cte t_s_firstyear, year_total_cte t_s_secyear, year_total_cte t_c_firstyear, year_total_cte t_c_secyear, year_total_cte t_w_firstyear, year_total_cte t_w_secyear
+    JOIN: t_s_secyear.customer_id = t_s_firstyear.customer_id AND t_s_firstyear.customer_id = t_c_secyear.customer_id AND t_s_firstyear.customer_id = t_c_firstyear.customer_id AND t_s_firstyear.customer_id = t_w_firstyear.customer_id AND t_s_firstyear.customer_id = t_w_secyear.customer_id
+    WHERE: (all original filters on sale_type, dyear, year_total>0, growth ratios)
+    ORDER BY: t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name, t_s_secyear.customer_birth_country
+    OUTPUT: t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name, t_s_secyear.customer_birth_country
+    EXPECTED_ROWS: ~619
+    CONSUMERS: final LIMIT 100
+EXAMPLES: date_cte_isolate, early_filter, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- date_cte_isolate (Q6/Q11): Extract date filter into a CTE and reuse across all channel joins. Ignore that Q6/Q11 are single-channel; we apply to multi-channel.
+- early_filter (Q11/Q93): Filter date_dim first, then join. Apply to all three channels.
+- multi_dimension_prefetch (Q43): Pre-filter date_dim into CTE before joining with fact tables. Ignore that Q43 also pre-filters store dimension; we only have date.
+HAZARD_FLAGS:
+- The year_total_cte is still a UNION of three CTEs; each channel CTE will be materialized separately. This may not reduce fact scans (still 3 scans per channel, but date_dim scanned only once per channel). The main query still self-joins 6 times on the union.
+- Ensure date_cte is referenced in each channel CTE, not joined multiple times in the union.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: union_cte_split
+TARGET_LOGICAL_TREE:
+  store_1999_cte, store_2000_cte, catalog_1999_cte, catalog_2000_cte, web_1999_cte, web_2000_cte -> main_direct_join
+NODE_CONTRACTS:
+  store_1999:
+    FROM: customer c, store_sales ss, date_dim d
+    JOIN: c.c_customer_sk = ss.ss_customer_sk AND ss.ss_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year = 1999
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE: SUM(((ss_ext_list_price-ss_ext_wholesale_cost-ss_ext_discount_amt)+ss_ext_sales_price)/2) as year_total
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_birth_country, year_total
+    EXPECTED_ROWS: ~308K
+    CONSUMERS: main_direct_join
+  store_2000:
+    FROM: customer c, store_sales ss, date_dim d
+    JOIN: c.c_customer_sk = ss.ss_customer_sk AND ss.ss_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year = 2000
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE: SUM(((ss_ext_list_price-ss_ext_wholesale_cost-ss_ext_discount_amt)+ss_ext_sales_price)/2) as year_total
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_birth_country, year_total
+    EXPECTED_ROWS: ~309K
+    CONSUMERS: main_direct_join
+  catalog_1999:
+    FROM: customer c, catalog_sales cs, date_dim d
+    JOIN: c.c_customer_sk = cs.cs_bill_customer_sk AND cs.cs_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year = 1999
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE: SUM(((cs_ext_list_price-cs_ext_wholesale_cost-cs_ext_discount_amt)+cs_ext_sales_price)/2) as year_total
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_birth_country, year_total
+    EXPECTED_ROWS: ~235K
+    CONSUMERS: main_direct_join
+  catalog_2000:
+    FROM: customer c, catalog_sales cs, date_dim d
+    JOIN: c.c_customer_sk = cs.cs_bill_customer_sk AND cs.cs_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year = 2000
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE: SUM(((cs_ext_list_price-cs_ext_wholesale_cost-cs_ext_discount_amt)+cs_ext_sales_price)/2) as year_total
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_birth_country, year_total
+    EXPECTED_ROWS: ~237K
+    CONSUMERS: main_direct_join
+  web_1999:
+    FROM: customer c, web_sales ws, date_dim d
+    JOIN: c.c_customer_sk = ws.ws_bill_customer_sk AND ws.ws_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year = 1999
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE: SUM(((ws_ext_list_price-ws_ext_wholesale_cost-ws_ext_discount_amt)+ws_ext_sales_price)/2) as year_total
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_birth_country, year_total
+    EXPECTED_ROWS: ~107K
+    CONSUMERS: main_direct_join
+  web_2000:
+    FROM: customer c, web_sales ws, date_dim d
+    JOIN: c.c_customer_sk = ws.ws_bill_customer_sk AND ws.ws_sold_date_sk = d.d_date_sk
+    WHERE: d.d_year = 2000
+    GROUP BY: c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country
+    AGGREGATE: SUM(((ws_ext_list_price-ws_ext_wholesale_cost-ws_ext_discount_amt)+ws_ext_sales_price)/2) as year_total
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_birth_country, year_total
+    EXPECTED_ROWS: ~108K
+    CONSUMERS: main_direct_join
+  main_direct_join:
+    FROM: store_1999 s1, store_2000 s2, catalog_1999 c1, catalog_2000 c2, web_1999 w1, web_2000 w2
+    JOIN: s1.c_customer_id = s2.c_customer_id AND s1.c_customer_id = c1.c_customer_id AND s1.c_customer_id = c2.c_customer_id AND s1.c_customer_id = w1.c_customer_id AND s1.c_customer_id = w2.c_customer_id
+    WHERE: 
+      s1.year_total > 0 AND c1.year_total > 0 AND w1.year_total > 0
+      AND (c2.year_total / c1.year_total) > (s2.year_total / s1.year_total)
+      AND (c2.year_total / c1.year_total) > (w2.year_total / w1.year_total)
+    ORDER BY: s1.c_customer_id, s1.c_first_name, s1.c_last_name, s1.c_birth_country
+    OUTPUT: s1.c_customer_id, s1.c_first_name, s1.c_last_name, s1.c_birth_country
+    EXPECTED_ROWS: ~619
+    CONSUMERS: final LIMIT 100
+EXAMPLES: union_cte_split, rollup_to_union_windowing, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+- union_cte_split (Q74): Split the generic CTE into year/channel-specific CTEs. IMPORTANT: Eliminate the original year_total CTE entirely.
+- rollup_to_union_windowing (Q36): Replace generic grouping with explicit per-level CTEs; we adapt by creating explicit per-year CTEs.
+- shared_dimension_multi_channel (Q80): Extract shared date filter? Not needed; each CTE has its own date filter. Ignore the shared dimension extraction.
+HAZARD_FLAGS:
+- Must ensure each CTE includes only the required year; do not accidentally include both years.
+- The main query now joins 6 CTEs directly; ensure join conditions are correct (all on customer_id).
+- Dropping sale_type column from CTEs because each CTE is specific to a channel/year; but we need to know which is which in joins. We'll rely on CTE naming; sale_type not needed in output.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: compound_single_pass_date_isolate_pivot
+TARGET_LOGICAL_TREE:
+  date_cte -> sales_union_agg -> pivot_cte -> main_simple_join
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year IN (1999, 2000)
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: ~730
+    CONSUMERS: sales_union_agg
+  sales_union_agg:
+    FROM: 
+      (SELECT c.c_customer_sk, c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country, 
+              ((ss_ext_list_price-ss_ext_wholesale_cost-ss_ext_discount_amt)+ss_ext_sales_price)/2 as amount, 
+              d.d_year, 's' as sale_type
+       FROM customer c, store_sales ss, date_cte d
+       WHERE c.c_customer_sk = ss.ss_customer_sk AND ss.ss_sold_date_sk = d.d_date_sk)
+      UNION ALL
+      (SELECT c.c_customer_sk, c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country,
+              ((cs_ext_list_price-cs_ext_wholesale_cost-cs_ext_discount_amt)+cs_ext_sales_price)/2,
+              d.d_year, 'c'
+       FROM customer c, catalog_sales cs, date_cte d
+       WHERE c.c_customer_sk = cs.cs_bill_customer_sk AND cs.cs_sold_date_sk = d.d_date_sk)
+      UNION ALL
+      (SELECT c.c_customer_sk, c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country,
+              ((ws_ext_list_price-ws_ext_wholesale_cost-ws_ext_discount_amt)+ws_ext_sales_price)/2,
+              d.d_year, 'w'
+       FROM customer c, web_sales ws, date_cte d
+       WHERE c.c_customer_sk = ws.ws_bill_customer_sk AND ws.ws_sold_date_sk = d.d_date_sk)
+    OUTPUT: c_customer_sk, c_customer_id, c_first_name, c_last_name, c_birth_country, amount, d_year, sale_type
+    EXPECTED_ROWS: sum of rows from three channels for two years (~958K)
+    CONSUMERS: pivot_cte
+  pivot_cte:
+    FROM: sales_union_agg
+    GROUP BY: c_customer_id, c_first_name, c_last_name, c_birth_country, sale_type
+    AGGREGATE:
+      SUM(CASE WHEN d_year=1999 THEN amount END) as year_total_1999,
+      SUM(CASE WHEN d_year=2000 THEN amount END) as year_total_2000
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_birth_country, sale_type, year_total_1999, year_total_2000
+    EXPECTED_ROWS: ~650K (customers per channel)
+    CONSUMERS: main_simple_join
+  main_simple_join:
+    FROM: pivot_cte s, pivot_cte c, pivot_cte w
+    JOIN: s.c_customer_id = c.c_customer_id AND s.c_customer_id = w.c_customer_id
+    WHERE: s.sale_type = 's' AND c.sale_type = 'c' AND w.sale_type = 'w'
+      AND s.year_total_1999 > 0 AND c.year_total_1999 > 0 AND w.year_total_1999 > 0
+      AND (c.year_total_2000 / c.year_total_1999) > (s.year_total_2000 / s.year_total_1999)
+      AND (c.year_total_2000 / c.year_total_1999) > (w.year_total_2000 / w.year_total_1999)
+    ORDER BY: s.c_customer_id, s.c_first_name, s.c_last_name, s.c_birth_country
+    OUTPUT: s.c_customer_id, s.c_first_name, s.c_last_name, s.c_birth_country
+    EXPECTED_ROWS: ~619
+    CONSUMERS: final LIMIT 100
+EXAMPLES: single_pass_aggregation, date_cte_isolate, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation (Q9): Use conditional aggregation across years within each channel, but we do it after unioning all channels.
+- date_cte_isolate (Q6): Isolate date filter into CTE reused across all channel subqueries.
+- channel_bitmap_aggregation (Q88): Label rows with sale_type and year, then aggregate; we adapt by unioning all channels first.
+HAZARD_FLAGS:
+- The sales_union_agg CTE may be large (union of 3 fact tables). However, it reduces customer and date joins to one per channel.
+- Must ensure grouping by sale_type is preserved; otherwise pivot would mix channels.
+- The pivot_cte must output sale_type to allow main join filter.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines date_cte_isolate, single_pass_aggregation, and union consolidation into a novel pipeline)

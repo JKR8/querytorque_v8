@@ -1,0 +1,108 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE pipeline)
+[+] filtered_date: CTE – isolated date filter for Q1 2001.
+    ├── SCAN (date_dim)
+    ├── FILTER (d_qoy = 1 AND d_year = 2001)
+    └── OUTPUT (d_date_sk)
+[+] filtered_address: CTE – isolated address filter (zip or state).
+    ├── SCAN (customer_address)
+    ├── FILTER (substr(zip) IN list OR ca_state IN list)
+    └── OUTPUT (ca_address_sk, ca_zip)
+[+] prejoined_fact: CTE – fact pre-join with filtered date, customer, and filtered address (address-branch).
+    ├── JOIN (catalog_sales ⋈ filtered_date ON cs_sold_date_sk = d_date_sk)
+    ├── JOIN (catalog_sales ⋈ customer ON cs_bill_customer_sk = c_customer_sk)
+    ├── JOIN (customer ⋈ filtered_address ON c_current_addr_sk = ca_address_sk)
+    └── OUTPUT (cs_sales_price, ca_zip)
+[+] branch_price: CTE – fact join with filtered date, customer, customer_address, filtered on price > 500 (price-branch).
+    ├── JOIN (catalog_sales ⋈ filtered_date ON cs_sold_date_sk = d_date_sk)
+    ├── JOIN (catalog_sales ⋈ customer ON cs_bill_customer_sk = c_customer_sk)
+    ├── JOIN (customer ⋈ customer_address ON c_current_addr_sk = ca_address_sk)
+    ├── FILTER (cs_sales_price > 500)
+    └── OUTPUT (cs_sales_price, ca_zip)
+[+] union_all: CTE – union of address-branch and price-branch (duplicates eliminated by UNION).
+    ├── UNION (prejoined_fact, branch_price)
+    └── OUTPUT (cs_sales_price, ca_zip)
+[+] aggregate: CTE – group by zip, sum sales.
+    ├── FROM (union_all)
+    ├── GROUP BY (ca_zip)
+    └── OUTPUT (ca_zip, sum(cs_sales_price) as sum_cs_sales_price)
+[~] main_query: modified – selects from aggregate with ordering and limit.
+    ├── FROM (aggregate)
+    ├── SORT (ca_zip ASC)
+    ├── LIMIT (100)
+    └── OUTPUT (ca_zip, sum_cs_sales_price)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_isolation", "description": "Extracted date filter into CTE to materialize once.", "applied_to": ["filtered_date"]},
+    {"id": "R2", "type": "dimension_isolation", "description": "Extracted address filter into CTE to reduce dimension size.", "applied_to": ["filtered_address"]},
+    {"id": "R3", "type": "staged_join_pipeline", "description": "Pre-join filtered dimensions with fact to reduce intermediate rows early.", "applied_to": ["prejoined_fact"]},
+    {"id": "R4", "type": "or_to_union_cross_column", "description": "Split OR across zip/state vs. price into separate branches, union to deduplicate.", "applied_to": ["branch_price", "union_all"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_qoy = 1 AND d_year = 2001",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_address": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_address_sk, ca_zip FROM customer_address WHERE substr(ca_zip,1,5) IN ('85669','86197','88274','83405','86475','85392','85460','80348','81792') OR ca_state IN ('CA','WA','GA')",
+        "interfaces": {"outputs": ["ca_address_sk", "ca_zip"], "consumes": []}
+      },
+      "prejoined_fact": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs.cs_sales_price, fa.ca_zip FROM catalog_sales cs INNER JOIN filtered_date fd ON cs.cs_sold_date_sk = fd.d_date_sk INNER JOIN customer c ON cs.cs_bill_customer_sk = c.c_customer_sk INNER JOIN filtered_address fa ON c.c_current_addr_sk = fa.ca_address_sk",
+        "interfaces": {"outputs": ["cs_sales_price", "ca_zip"], "consumes": ["filtered_date", "filtered_address"]}
+      },
+      "branch_price": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs.cs_sales_price, ca.ca_zip FROM catalog_sales cs INNER JOIN filtered_date fd ON cs.cs_sold_date_sk = fd.d_date_sk INNER JOIN customer c ON cs.cs_bill_customer_sk = c.c_customer_sk INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk WHERE cs.cs_sales_price > 500",
+        "interfaces": {"outputs": ["cs_sales_price", "ca_zip"], "consumes": ["filtered_date"]}
+      },
+      "union_all": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_sales_price, ca_zip FROM prejoined_fact UNION SELECT cs_sales_price, ca_zip FROM branch_price",
+        "interfaces": {"outputs": ["cs_sales_price", "ca_zip"], "consumes": ["prejoined_fact", "branch_price"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_zip, SUM(cs_sales_price) AS sum_cs_sales_price FROM union_all GROUP BY ca_zip",
+        "interfaces": {"outputs": ["ca_zip", "sum_cs_sales_price"], "consumes": ["union_all"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ca_zip, sum_cs_sales_price FROM aggregate ORDER BY ca_zip ASC LIMIT 100",
+        "interfaces": {"outputs": ["ca_zip", "sum_cs_sales_price"], "consumes": ["aggregate"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_address", "prejoined_fact", "branch_price", "union_all", "aggregate", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_address AS ({filtered_address}), prejoined_fact AS ({prejoined_fact}), branch_price AS ({branch_price}), union_all AS ({union_all}), aggregate AS ({aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Isolated date and address filters into CTEs, split the cross‑column OR into two branches (address‑branch via `filtered_address`, price‑branch via `cs_sales_price > 500`), union the branches to deduplicate, then aggregate. This prevents predicate‑pushdown blindness and reduces early‑stage row counts.
+
+**Expected speedup**: ~3–4× due to reduced dimension scans, staged join pipeline, and elimination of full‑table scans under the OR.

@@ -1,0 +1,124 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query [~]
+    ├── WITH
+    │   ├── [CTE] filtered_cs [+]
+    │   │   ├── SCAN (catalog_sales, date_dim d1, date_dim d3, customer_demographics, household_demographics)
+    │   │   ├── JOIN (cs_sold_date_sk = d1.d_date_sk)
+    │   │   ├── JOIN (cs_ship_date_sk = d3.d_date_sk)
+    │   │   ├── JOIN (cs_bill_cdemo_sk = cd_demo_sk)
+    │   │   ├── JOIN (cs_bill_hdemo_sk = hd_demo_sk)
+    │   │   ├── FILTER (d1.d_year = 2002, d3.d_date > d1.d_date + 5, cd_marital_status = 'W', hd_buy_potential = '501-1000')
+    │   │   └── OUTPUT (cs_item_sk, cs_order_number, cs_quantity, cs_promo_sk, cs_sold_date_sk, d_week_seq, d_date)
+    │   ├── [CTE] filtered_inv [+]
+    │   │   ├── SCAN (inventory)
+    │   │   ├── FILTER (inv_quantity_on_hand <= 100)
+    │   │   └── OUTPUT (inv_item_sk, inv_warehouse_sk, inv_date_sk, inv_quantity_on_hand)
+    │   ├── [CTE] cs_inventory_join [+]
+    │   │   ├── JOIN filtered_cs AS cs, filtered_inv AS inv ON cs.cs_item_sk = inv.inv_item_sk AND inv.inv_quantity_on_hand < cs.cs_quantity
+    │   │   ├── JOIN date_dim d2 ON inv.inv_date_sk = d2.d_date_sk AND cs.d_week_seq = d2.d_week_seq
+    │   │   └── OUTPUT (cs_item_sk, cs_order_number, cs_promo_sk, inv_warehouse_sk, d_week_seq)
+    │   └── [CTE] dim_joins [+]
+    │       ├── JOIN item ON i_item_sk = cs_item_sk
+    │       ├── JOIN warehouse ON w_warehouse_sk = inv_warehouse_sk
+    │       ├── LEFT JOIN promotion ON p_promo_sk = cs_promo_sk
+    │       ├── LEFT JOIN catalog_returns ON cr_item_sk = cs_item_sk AND cr_order_number = cs_order_number
+    │       ├── GROUP BY (i_item_desc, w_warehouse_name, d_week_seq)
+    │       ├── AGGREGATE (SUM(CASE WHEN p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt)
+    │       └── OUTPUT (i_item_desc, w_warehouse_name, d_week_seq, no_promo, promo, total_cnt)
+    ├── SORT (total_cnt DESC, i_item_desc ASC, w_warehouse_name ASC, d_week_seq ASC)
+    └── OUTPUT (i_item_desc, w_warehouse_name, d_week_seq, no_promo, promo, total_cnt) LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "prefetch_fact_join",
+      "description": "Stage join pipeline: first CTE filters catalog_sales with dimensions, second CTE pre-filters inventory, third joins them with date alignment, fourth adds remaining dimensions and aggregates.",
+      "applied_to": ["filtered_cs", "filtered_inv", "cs_inventory_join", "dim_joins"]
+    },
+    {
+      "id": "R2",
+      "type": "early_filter",
+      "description": "Push down dimension filters (date, demographics) into initial catalog_sales scan; push inventory quantity filter into its own CTE.",
+      "applied_to": ["filtered_cs", "filtered_inv"]
+    },
+    {
+      "id": "R3",
+      "type": "pushdown",
+      "description": "Consolidate multiple date_dim joins into filtered_cs CTE; isolate inventory date join in cs_inventory_join.",
+      "applied_to": ["filtered_cs", "cs_inventory_join"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_cs": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT cs.cs_item_sk, cs.cs_order_number, cs.cs_quantity, cs.cs_promo_sk, cs.cs_sold_date_sk, d1.d_week_seq, d1.d_date FROM catalog_sales cs JOIN date_dim d1 ON cs.cs_sold_date_sk = d1.d_date_sk JOIN date_dim d3 ON cs.cs_ship_date_sk = d3.d_date_sk JOIN customer_demographics ON cs.cs_bill_cdemo_sk = cd_demo_sk JOIN household_demographics ON cs.cs_bill_hdemo_sk = hd_demo_sk WHERE d1.d_year = 2002 AND d3.d_date > d1.d_date + 5 AND cd_marital_status = 'W' AND hd_buy_potential = '501-1000'",
+          "interfaces": {
+            "outputs": ["cs_item_sk", "cs_order_number", "cs_quantity", "cs_promo_sk", "cs_sold_date_sk", "d_week_seq", "d_date"],
+            "consumes": []
+          }
+        },
+        "filtered_inv": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT inv_item_sk, inv_warehouse_sk, inv_date_sk, inv_quantity_on_hand FROM inventory WHERE inv_quantity_on_hand <= 100",
+          "interfaces": {
+            "outputs": ["inv_item_sk", "inv_warehouse_sk", "inv_date_sk", "inv_quantity_on_hand"],
+            "consumes": []
+          }
+        },
+        "cs_inventory_join": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT cs.cs_item_sk, cs.cs_order_number, cs.cs_promo_sk, inv.inv_warehouse_sk, cs.d_week_seq FROM filtered_cs cs JOIN filtered_inv inv ON cs.cs_item_sk = inv.inv_item_sk AND inv.inv_quantity_on_hand < cs.cs_quantity JOIN date_dim d2 ON inv.inv_date_sk = d2.d_date_sk AND cs.d_week_seq = d2.d_week_seq",
+          "interfaces": {
+            "outputs": ["cs_item_sk", "cs_order_number", "cs_promo_sk", "inv_warehouse_sk", "d_week_seq"],
+            "consumes": ["filtered_cs", "filtered_inv"]
+          }
+        },
+        "dim_joins": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT i.i_item_desc, w.w_warehouse_name, j.d_week_seq, SUM(CASE WHEN p.p_promo_sk IS NULL THEN 1 ELSE 0 END) AS no_promo, SUM(CASE WHEN p.p_promo_sk IS NOT NULL THEN 1 ELSE 0 END) AS promo, COUNT(*) AS total_cnt FROM cs_inventory_join j JOIN item i ON i.i_item_sk = j.cs_item_sk JOIN warehouse w ON w.w_warehouse_sk = j.inv_warehouse_sk LEFT JOIN promotion p ON p.p_promo_sk = j.cs_promo_sk LEFT JOIN catalog_returns cr ON cr.cr_item_sk = j.cs_item_sk AND cr.cr_order_number = j.cs_order_number GROUP BY i.i_item_desc, w.w_warehouse_name, j.d_week_seq",
+          "interfaces": {
+            "outputs": ["i_item_desc", "w_warehouse_name", "d_week_seq", "no_promo", "promo", "total_cnt"],
+            "consumes": ["cs_inventory_join"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT i_item_desc, w_warehouse_name, d_week_seq, no_promo, promo, total_cnt FROM dim_joins ORDER BY total_cnt DESC, i_item_desc, w_warehouse_name, d_week_seq LIMIT 100",
+          "interfaces": {
+            "outputs": ["i_item_desc", "w_warehouse_name", "d_week_seq", "no_promo", "promo", "total_cnt"],
+            "consumes": ["dim_joins"]
+          }
+        }
+      },
+      "reconstruction_order": ["filtered_cs", "filtered_inv", "cs_inventory_join", "dim_joins", "main_query"],
+      "assembly_template": "WITH filtered_cs AS ({filtered_cs}), filtered_inv AS ({filtered_inv}), cs_inventory_join AS ({cs_inventory_join}), dim_joins AS ({dim_joins}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured into staged CTE pipeline: first filter catalog_sales with all dimension filters, then filter inventory, then join them with date alignment, then join remaining dimensions and aggregate. This matches the target logical tree exactly while preserving all original semantics and defensive guards.
+
+**Expected speedup:** 2-3x from reduced fact-table scan size and better join ordering.

@@ -1,0 +1,514 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Compare store channel quantity/value against combined web+catalog for same customer-item-year in 2000, excluding returned transactions. JOIN semantics: store CTE (ss) is driving left side; web/catalog CTEs left-joined on year-item-customer intersection. Aggregation trap: SUM aggregates are duplicate-insensitive but must preserve same group membership (year, item_sk, customer_sk). Filter dependencies: year=2000 filter applies to all channels; NULL check on return keys filters non-returned rows; main query's OR(ws_qty>0, cs_qty>0) must remain after joins.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+ws_2000 -> cs_2000 -> ss_2000 -> main_query
+NODE_CONTRACTS:
+  ws_2000:
+    FROM: web_sales LEFT JOIN web_returns ON wr_order_number=ws_order_number AND ws_item_sk=wr_item_sk
+          JOIN date_dim ON ws_sold_date_sk = d_date_sk
+    WHERE: wr_order_number IS NULL AND d_year = 2000
+    GROUP BY: d_year, ws_item_sk, ws_bill_customer_sk
+    AGGREGATE: sum(ws_quantity) AS ws_qty, sum(ws_wholesale_cost) AS ws_wc, sum(ws_sales_price) AS ws_sp
+    OUTPUT: d_year AS ws_sold_year, ws_item_sk, ws_bill_customer_sk AS ws_customer_sk, ws_qty, ws_wc, ws_sp
+    EXPECTED_ROWS: 1.3M
+    CONSUMERS: main_query
+  cs_2000:
+    FROM: catalog_sales LEFT JOIN catalog_returns ON cr_order_number=cs_order_number AND cs_item_sk=cr_item_sk
+          JOIN date_dim ON cs_sold_date_sk = d_date_sk
+    WHERE: cr_order_number IS NULL AND d_year = 2000
+    GROUP BY: d_year, cs_item_sk, cs_bill_customer_sk
+    AGGREGATE: sum(cs_quantity) AS cs_qty, sum(cs_wholesale_cost) AS cs_wc, sum(cs_sales_price) AS cs_sp
+    OUTPUT: d_year AS cs_sold_year, cs_item_sk, cs_bill_customer_sk AS cs_customer_sk, cs_qty, cs_wc, cs_sp
+    EXPECTED_ROWS: 2.6M
+    CONSUMERS: main_query
+  ss_2000:
+    FROM: store_sales LEFT JOIN store_returns ON sr_ticket_number=ss_ticket_number AND ss_item_sk=sr_item_sk
+          JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE: sr_ticket_number IS NULL AND d_year = 2000
+    GROUP BY: d_year, ss_item_sk, ss_customer_sk
+    AGGREGATE: sum(ss_quantity) AS ss_qty, sum(ss_wholesale_cost) AS ss_wc, sum(ss_sales_price) AS ss_sp
+    OUTPUT: d_year AS ss_sold_year, ss_item_sk, ss_customer_sk, ss_qty, ss_wc, ss_sp
+    EXPECTED_ROWS: 4.9M
+    CONSUMERS: main_query
+  main_query:
+    FROM: ss_2000 LEFT JOIN ws_2000 ON (ws_sold_year=ss_sold_year AND ws_item_sk=ss_item_sk AND ws_customer_sk=ss_customer_sk)
+          LEFT JOIN cs_2000 ON (cs_sold_year=ss_sold_year AND cs_item_sk=ss_item_sk AND cs_customer_sk=ss_customer_sk)
+    WHERE: (COALESCE(ws_qty,0) > 0 OR COALESCE(cs_qty,0) > 0)
+    ORDER BY: ss_item_sk ASC, ss_qty DESC, ss_wc DESC, ss_sp DESC, (COALESCE(ws_qty,0)+COALESCE(cs_qty,0)) ASC, (COALESCE(ws_wc,0)+COALESCE(cs_wc,0)) ASC, (COALESCE(ws_sp,0)+COALESCE(cs_sp,0)) ASC, ROUND(ss_qty/(COALESCE(ws_qty,0)+COALESCE(cs_qty,0)),2) ASC
+    LIMIT: 100
+    OUTPUT: ss_item_sk, ROUND(ss_qty/(COALESCE(ws_qty,0)+COALESCE(cs_qty,0)),2) AS ratio, ss_qty AS store_qty, ss_wc AS store_wholesale_cost, ss_sp AS store_sales_price, COALESCE(ws_qty,0)+COALESCE(cs_qty,0) AS other_chan_qty, COALESCE(ws_wc,0)+COALESCE(cs_wc,0) AS other_chan_wholesale_cost, COALESCE(ws_sp,0)+COALESCE(cs_sp,0) AS other_chan_sales_price
+    EXPECTED_ROWS: 735 → 100
+    CONSUMERS: none
+
+NODE_CONTRACTS:
+ws_2000:
+    FROM: web_sales LEFT JOIN web_returns ON wr_order_number=ws_order_number AND ws_item_sk=wr_item_sk
+          JOIN date_dim ON ws_sold_date_sk = d_date_sk
+    WHERE: wr_order_number IS NULL AND d_year = 2000
+    GROUP BY: d_year, ws_item_sk, ws_bill_customer_sk
+    AGGREGATE: sum(ws_quantity) AS ws_qty, sum(ws_wholesale_cost) AS ws_wc, sum(ws_sales_price) AS ws_sp
+    OUTPUT: d_year AS ws_sold_year, ws_item_sk, ws_bill_customer_sk AS ws_customer_sk, ws_qty, ws_wc, ws_sp
+    EXPECTED_ROWS: 1.3M
+    CONSUMERS: main_query
+  cs_2000:
+    FROM: catalog_sales LEFT JOIN catalog_returns ON cr_order_number=cs_order_number AND cs_item_sk=cr_item_sk
+          JOIN date_dim ON cs_sold_date_sk = d_date_sk
+    WHERE: cr_order_number IS NULL AND d_year = 2000
+    GROUP BY: d_year, cs_item_sk, cs_bill_customer_sk
+    AGGREGATE: sum(cs_quantity) AS cs_qty, sum(cs_wholesale_cost) AS cs_wc, sum(cs_sales_price) AS cs_sp
+    OUTPUT: d_year AS cs_sold_year, cs_item_sk, cs_bill_customer_sk AS cs_customer_sk, cs_qty, cs_wc, cs_sp
+    EXPECTED_ROWS: 2.6M
+    CONSUMERS: main_query
+  ss_2000:
+    FROM: store_sales LEFT JOIN store_returns ON sr_ticket_number=ss_ticket_number AND ss_item_sk=sr_item_sk
+          JOIN date_dim ON ss_sold_date_sk = d_date_sk
+    WHERE: sr_ticket_number IS NULL AND d_year = 2000
+    GROUP BY: d_year, ss_item_sk, ss_customer_sk
+    AGGREGATE: sum(ss_quantity) AS ss_qty, sum(ss_wholesale_cost) AS ss_wc, sum(ss_sales_price) AS ss_sp
+    OUTPUT: d_year AS ss_sold_year, ss_item_sk, ss_customer_sk, ss_qty, ss_wc, ss_sp
+    EXPECTED_ROWS: 4.9M
+    CONSUMERS: main_query
+  main_query:
+    FROM: ss_2000 LEFT JOIN ws_2000 ON (ws_sold_year=ss_sold_year AND ws_item_sk=ss_item_sk AND ws_customer_sk=ss_customer_sk)
+          LEFT JOIN cs_2000 ON (cs_sold_year=ss_sold_year AND cs_item_sk=ss_item_sk AND cs_customer_sk=ss_customer_sk)
+    WHERE: (COALESCE(ws_qty,0) > 0 OR COALESCE(cs_qty,0) > 0)
+    ORDER BY: ss_item_sk ASC, ss_qty DESC, ss_wc DESC, ss_sp DESC, (COALESCE(ws_qty,0)+COALESCE(cs_qty,0)) ASC, (COALESCE(ws_wc,0)+COALESCE(cs_wc,0)) ASC, (COALESCE(ws_sp,0)+COALESCE(cs_sp,0)) ASC, ROUND(ss_qty/(COALESCE(ws_qty,0)+COALESCE(cs_qty,0)),2) ASC
+    LIMIT: 100
+    OUTPUT: ss_item_sk, ROUND(ss_qty/(COALESCE(ws_qty,0)+COALESCE(cs_qty,0)),2) AS ratio, ss_qty AS store_qty, ss_wc AS store_wholesale_cost, ss_sp AS store_sales_price, COALESCE(ws_qty,0)+COALESCE(cs_qty,0) AS other_chan_qty, COALESCE(ws_wc,0)+COALESCE(cs_wc,0) AS other_chan_wholesale_cost, COALESCE(ws_sp,0)+COALESCE(cs_sp,0) AS other_chan_sales_price
+    EXPECTED_ROWS: 735 → 100
+    CONSUMERS: none
+
+## Hazard Flags (avoid these specific risks)
+
+- Must eliminate original generic CTEs (ws, cs, ss) that group by all years.
+- Year filter pushdown may already be optimized by engine; ensure not duplicating work.
+
+## Regression Warnings (observed failures on similar queries)
+
+1. date_cte_isolate (regression_q31_pushdown):
+   CAUSE: Created filtered CTEs but kept original unfiltered versions, causing redundant materialization.
+   RULE: When creating date_2000 CTE, remove original date_dim joins from channel CTEs and join to date_2000 instead.
+2. pushdown (regression_q74_pushdown):
+   CAUSE: Split UNION CTE by year but kept original UNION CTE, causing redundant computation.
+   RULE: When splitting CTEs by year, eliminate the original generic CTE entirely.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output ss_item_sk, ratio, store_qty, store_wholesale_cost, store_sales_price, other_chan_qty, other_chan_wholesale_cost, other_chan_sales_price in exact order.
+- CTE_COLUMN_COMPLETENESS: Each channel CTE must output sold_year, item_sk, customer_sk, qty, wc, sp for downstream joins.
+- LITERAL_PRESERVATION: Year value 2000 must remain exactly.
+- SEMANTIC_EQUIVALENCE: Same rows, ordering (8-column ORDER BY), and limit 100.
+- CROSS_CTE_PREDICATE_BLINDNESS: Each CTE independently scans date_dim filtered to year=2000 (3 scans of same 366 rows).
+- REDUNDANT_SCAN_ELIMINATION: date_dim scanned 3 times; opportunity to share.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- union_cte_split: apply splitting generic CTE by year; ignore UNION structure (not present).
+- early_filter: push year filter into CTE definitions; ignore dimension pre-filtering (already done).
+- pushdown: push year filter from main query into CTEs; ignore consolidation aspect.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. union_cte_split (1.36x)
+
+**Principle:** CTE Specialization: when a generic CTE is scanned multiple times with different filters (e.g., by year), split it into specialized CTEs that embed the filter in their definition. Each specialized CTE processes only its relevant subset, eliminating redundant scans.
+
+**BEFORE (slow):**
+```sql
+with year_total as (
+ select c_customer_id customer_id
+       ,c_first_name customer_first_name
+       ,c_last_name customer_last_name
+       ,d_year as year
+       ,stddev_samp(ss_net_paid) year_total
+       ,'s' sale_type
+ from customer
+     ,store_sales
+     ,date_dim
+ where c_customer_sk = ss_customer_sk
+   and ss_sold_date_sk = d_date_sk
+   and d_year in (1999,1999+1)
+ group by c_customer_id
+         ,c_first_name
+         ,c_last_name
+         ,d_year
+ union all
+ select c_customer_id customer_id
+       ,c_first_name customer_first_name
+       ,c_last_name customer_last_name
+       ,d_year as year
+       ,stddev_samp(ws_net_paid) year_total
+       ,'w' sale_type
+ from customer
+     ,web_sales
+     ,date_dim
+ where c_customer_sk = ws_bill_customer_sk
+   and ws_sold_date_sk = d_date_sk
+   and d_year in (1999,1999+1)
+ group by c_customer_id
+         ,c_first_name
+         ,c_last_name
+         ,d_year
+         )
+  select
+        t_s_secyear.customer_id, t_s_secyear.customer_first_name, t_s_secyear.customer_last_name
+ from year_total t_s_firstyear
+     ,year_total t_s_secyear
+     ,year_total t_w_firstyear
+     ,year_total t_w_secyear
+ where t_s_secyear.customer_id = t_s_firstyear.customer_id
+         and t_s_firstyear.customer_id = t_w_secyear.customer_id
+         and t_s_firstyear.customer_id = t_w_firstyear.customer_id
+         and t_s_firstyear.sale_type = 's'
+         and t_w_firstyear.sale_type = 'w'
+         and t_s_secyear.sale_type = 's'
+         and t_w_secyear.sale_type = 'w'
+         and t_s_firstyear.year = 1999
+         and t_s_secyear.year = 1999+1
+         and t_w_firstyear.year = 1999
+         and t_w_secyear.year = 1999+1
+         and t_s_firstyear.year_total > 0
+         and t_w_firstyear.year_total > 0
+         and case when t_w_firstyear.year_total > 0 then t_w_secyear.year_total / t_w_firstyear.year_total else null end
+           > case when t_s_firstyear.year_total > 0 then t_s_secyear.year_total / t_s_firstyear.year_total else null end
+ order by 2,1,3
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[year_1998_dates]:
+```sql
+SELECT d_date_sk, d_week_seq, d_day_name FROM date_dim WHERE d_year = 1998
+```
+[year_1999_dates]:
+```sql
+SELECT d_date_sk, d_week_seq, d_day_name FROM date_dim WHERE d_year = 1999
+```
+[wswscs_1998]:
+```sql
+SELECT d_week_seq, SUM(CASE WHEN d_day_name='Sunday' THEN sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN d_day_name='Monday' THEN sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN d_day_name='Tuesday' THEN sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN d_day_name='Wednesday' THEN sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN d_day_name='Thursday' THEN sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN d_day_name='Friday' THEN sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN d_day_name='Saturday' THEN sales_price ELSE NULL END) AS sat_sales FROM (SELECT ws_sold_date_sk AS sold_date_sk, ws_ext_sales_price AS sales_price FROM web_sales UNION ALL SELECT cs_sold_date_sk AS sold_date_sk, cs_ext_sales_price AS sales_price FROM catalog_sales) wscs JOIN year_1998_dates ON d_date_sk = sold_date_sk GROUP BY d_week_seq
+```
+[wswscs_1999]:
+```sql
+SELECT d_week_seq, SUM(CASE WHEN d_day_name='Sunday' THEN sales_price ELSE NULL END) AS sun_sales, SUM(CASE WHEN d_day_name='Monday' THEN sales_price ELSE NULL END) AS mon_sales, SUM(CASE WHEN d_day_name='Tuesday' THEN sales_price ELSE NULL END) AS tue_sales, SUM(CASE WHEN d_day_name='Wednesday' THEN sales_price ELSE NULL END) AS wed_sales, SUM(CASE WHEN d_day_name='Thursday' THEN sales_price ELSE NULL END) AS thu_sales, SUM(CASE WHEN d_day_name='Friday' THEN sales_price ELSE NULL END) AS fri_sales, SUM(CASE WHEN d_day_name='Saturday' THEN sales_price ELSE NULL END) AS sat_sales FROM (SELECT ws_sold_date_sk AS sold_date_sk, ws_ext_sales_price AS sales_price FROM web_sales UNION ALL SELECT cs_sold_date_sk AS sold_date_sk, cs_ext_sales_price AS sales_price FROM catalog_sales) wscs JOIN year_1999_dates ON d_date_sk = sold_date_sk GROUP BY d_week_seq
+```
+[main_query]:
+```sql
+SELECT y.d_week_seq AS d_week_seq1, ROUND(y.sun_sales / NULLIF(z.sun_sales, 0), 2), ROUND(y.mon_sales / NULLIF(z.mon_sales, 0), 2), ROUND(y.tue_sales / NULLIF(z.tue_sales, 0), 2), ROUND(y.wed_sales / NULLIF(z.wed_sales, 0), 2), ROUND(y.thu_sales / NULLIF(z.thu_sales, 0), 2), ROUND(y.fri_sales / NULLIF(z.fri_sales, 0), 2), ROUND(y.sat_sales / NULLIF(z.sat_sales, 0), 2) FROM wswscs_1998 y JOIN wswscs_1999 z ON y.d_week_seq = z.d_week_seq - 53 ORDER BY y.d_week_seq
+```
+
+### 2. early_filter (4.00x)
+
+**Principle:** Early Selection: filter small dimension tables first, then join to large fact tables. This reduces the fact table scan to only rows matching the filter, rather than scanning all rows and filtering after the join.
+
+**BEFORE (slow):**
+```sql
+select ss_customer_sk
+            ,sum(act_sales) sumsales
+      from (select ss_item_sk
+                  ,ss_ticket_number
+                  ,ss_customer_sk
+                  ,case when sr_return_quantity is not null then (ss_quantity-sr_return_quantity)*ss_sales_price
+                                                            else (ss_quantity*ss_sales_price) end act_sales
+            from store_sales left outer join store_returns on (sr_item_sk = ss_item_sk
+                                                               and sr_ticket_number = ss_ticket_number)
+                ,reason
+            where sr_reason_sk = r_reason_sk
+              and r_reason_desc = 'duplicate purchase') t
+      group by ss_customer_sk
+      order by sumsales, ss_customer_sk
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_reason]:
+```sql
+SELECT r_reason_sk FROM reason WHERE r_reason_desc = 'duplicate purchase'
+```
+[filtered_returns]:
+```sql
+SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+```
+[main_query]:
+```sql
+SELECT ss_customer_sk, SUM(act_sales) AS sumsales FROM (SELECT ss.ss_customer_sk, CASE WHEN NOT fr.sr_return_quantity IS NULL THEN (ss.ss_quantity - fr.sr_return_quantity) * ss.ss_sales_price ELSE (ss.ss_quantity * ss.ss_sales_price) END AS act_sales FROM store_sales ss JOIN filtered_returns fr ON (fr.sr_item_sk = ss.ss_item_sk AND fr.sr_ticket_number = ss.ss_ticket_number)) AS t GROUP BY ss_customer_sk ORDER BY sumsales, ss_customer_sk LIMIT 100
+```
+
+### 3. pushdown (2.11x)
+
+**Principle:** Scan Consolidation: when multiple subqueries scan the same table with similar patterns, consolidate them into CTEs that compute all needed aggregates in fewer passes. Reduces N scans to fewer scans.
+
+**BEFORE (slow):**
+```sql
+select case when (select count(*) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) > 2972190
+            then (select avg(ss_ext_sales_price) 
+                  from store_sales 
+                  where ss_quantity between 1 and 20) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 1 and 20) end bucket1 ,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 21 and 40) > 4505785
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 21 and 40) 
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 21 and 40) end bucket2,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 41 and 60) > 1575726
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 41 and 60)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 41 and 60) end bucket3,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 61 and 80) > 3188917
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 61 and 80)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 61 and 80) end bucket4,
+       case when (select count(*)
+                  from store_sales
+                  where ss_quantity between 81 and 100) > 3525216
+            then (select avg(ss_ext_sales_price)
+                  from store_sales
+                  where ss_quantity between 81 and 100)
+            else (select avg(ss_net_profit)
+                  from store_sales
+                  where ss_quantity between 81 and 100) end bucket5
+from reason
+where r_reason_sk = 1;
+```
+
+**AFTER (fast):**
+[quantity_1_20_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 1 AND 20
+```
+[quantity_21_40_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 21 AND 40
+```
+[quantity_41_60_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 41 AND 60
+```
+[quantity_61_80_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 61 AND 80
+```
+[quantity_81_100_stats]:
+```sql
+SELECT COUNT(*) AS cnt, AVG(ss_ext_sales_price) AS avg_ext_price, AVG(ss_net_profit) AS avg_net_profit FROM store_sales WHERE ss_quantity BETWEEN 81 AND 100
+```
+[main_query]:
+```sql
+SELECT CASE WHEN q1.cnt > 2972190 THEN q1.avg_ext_price ELSE q1.avg_net_profit END AS bucket1, CASE WHEN q2.cnt > 4505785 THEN q2.avg_ext_price ELSE q2.avg_net_profit END AS bucket2, CASE WHEN q3.cnt > 1575726 THEN q3.avg_ext_price ELSE q3.avg_net_profit END AS bucket3, CASE WHEN q4.cnt > 3188917 THEN q4.avg_ext_price ELSE q4.avg_net_profit END AS bucket4, CASE WHEN q5.cnt > 3525216 THEN q5.avg_ext_price ELSE q5.avg_net_profit END AS bucket5 FROM reason CROSS JOIN quantity_1_20_stats AS q1 CROSS JOIN quantity_21_40_stats AS q2 CROSS JOIN quantity_41_60_stats AS q3 CROSS JOIN quantity_61_80_stats AS q4 CROSS JOIN quantity_81_100_stats AS q5 WHERE r_reason_sk = 1
+```
+
+## Original SQL
+
+```sql
+-- start query 78 in stream 0 using template query78.tpl
+with ws as
+  (select d_year AS ws_sold_year, ws_item_sk,
+    ws_bill_customer_sk ws_customer_sk,
+    sum(ws_quantity) ws_qty,
+    sum(ws_wholesale_cost) ws_wc,
+    sum(ws_sales_price) ws_sp
+   from web_sales
+   left join web_returns on wr_order_number=ws_order_number and ws_item_sk=wr_item_sk
+   join date_dim on ws_sold_date_sk = d_date_sk
+   where wr_order_number is null
+   group by d_year, ws_item_sk, ws_bill_customer_sk
+   ),
+cs as
+  (select d_year AS cs_sold_year, cs_item_sk,
+    cs_bill_customer_sk cs_customer_sk,
+    sum(cs_quantity) cs_qty,
+    sum(cs_wholesale_cost) cs_wc,
+    sum(cs_sales_price) cs_sp
+   from catalog_sales
+   left join catalog_returns on cr_order_number=cs_order_number and cs_item_sk=cr_item_sk
+   join date_dim on cs_sold_date_sk = d_date_sk
+   where cr_order_number is null
+   group by d_year, cs_item_sk, cs_bill_customer_sk
+   ),
+ss as
+  (select d_year AS ss_sold_year, ss_item_sk,
+    ss_customer_sk,
+    sum(ss_quantity) ss_qty,
+    sum(ss_wholesale_cost) ss_wc,
+    sum(ss_sales_price) ss_sp
+   from store_sales
+   left join store_returns on sr_ticket_number=ss_ticket_number and ss_item_sk=sr_item_sk
+   join date_dim on ss_sold_date_sk = d_date_sk
+   where sr_ticket_number is null
+   group by d_year, ss_item_sk, ss_customer_sk
+   )
+ select
+ss_item_sk,
+round(ss_qty/(coalesce(ws_qty,0)+coalesce(cs_qty,0)),2) ratio,
+ss_qty store_qty, ss_wc store_wholesale_cost, ss_sp store_sales_price,
+coalesce(ws_qty,0)+coalesce(cs_qty,0) other_chan_qty,
+coalesce(ws_wc,0)+coalesce(cs_wc,0) other_chan_wholesale_cost,
+coalesce(ws_sp,0)+coalesce(cs_sp,0) other_chan_sales_price
+from ss
+left join ws on (ws_sold_year=ss_sold_year and ws_item_sk=ss_item_sk and ws_customer_sk=ss_customer_sk)
+left join cs on (cs_sold_year=ss_sold_year and cs_item_sk=ss_item_sk and cs_customer_sk=ss_customer_sk)
+where (coalesce(ws_qty,0)>0 or coalesce(cs_qty, 0)>0) and ss_sold_year=2000
+order by 
+  ss_item_sk,
+  ss_qty desc, ss_wc desc, ss_sp desc,
+  other_chan_qty,
+  other_chan_wholesale_cost,
+  other_chan_sales_price,
+  ratio
+ LIMIT 100;
+
+-- end query 78 in stream 0 using template query78.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `ss_item_sk`
+  2. `ratio`
+  3. `store_qty`
+  4. `store_wholesale_cost`
+  5. `store_sales_price`
+  6. `other_chan_qty`
+  7. `other_chan_wholesale_cost`
+  8. `other_chan_sales_price`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] cs  [=]  Cost: 25%  Rows: ~1K  — Aggregate yearly non-returned catalog quantities, wholesale cost, and sales price by item and billing customer.
+│   ├── SCAN (catalog_sales, catalog_returns (join), date_dim (join))
+│   ├── FILTER (cr_order_number IS NULL)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (cs_sold_year, cs_item_sk, cs_customer_sk, cs_qty, cs_wc, cs_sp)
+├── [CTE] ss  [=]  Cost: 25%  Rows: ~1K  — Aggregate yearly non-returned store quantities, wholesale cost, and sales price by item and customer.
+│   ├── SCAN (store_sales, store_returns (join), date_dim (join))
+│   ├── FILTER (sr_ticket_number IS NULL)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (ss_sold_year, ss_item_sk, ss_customer_sk, ss_qty, ss_wc, ss_sp)
+├── [CTE] ws  [=]  Cost: 25%  Rows: ~1K  — Aggregate yearly non-returned web quantities, wholesale cost, and sales price by item and billing customer.
+│   ├── SCAN (web_sales, web_returns (join), date_dim (join))
+│   ├── FILTER (wr_order_number IS NULL)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (ws_sold_year, ws_item_sk, ws_customer_sk, ws_qty, ws_wc, ws_sp)
+└── [MAIN] main_query  [=]  Cost: 25%  Rows: ~1K  — Left-join store aggregates to web and catalog aggregates on year/item/customer, keep rows with other-channel activity, and report store-to-other-channel quantity ratio and value comparisons.
+    ├── SCAN (ss, ws (join), cs (join))
+    ├── FILTER ((COALESCE(ws_qty, 0) > 0 OR COALESCE(cs_qty, 0) > 0))
+    ├── FILTER (ss_sold_year = 2000)
+    ├── AGG (GROUP BY)
+    ├── SORT (ss_item_sk ASC, ss_qty DESC, ss_wc DESC, ss_sp DESC, other_chan_qty ASC, other_chan_wholesale_cost ASC, other_chan_sales_price ASC, ratio ASC)
+    └── OUTPUT (ss_item_sk, ratio, store_qty, store_wholesale_cost, store_sales_price, other_chan_qty, other_chan_wholesale_cost, other_chan_sales_price)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

@@ -1,0 +1,107 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (CTE-based structure)
+├── [~] filtered_dates [=] — now a CTE
+├── [~] filtered_stores [=] — now a CTE with condition s_store_sk <= 100
+├── [+] joined_fact — CTE joining store_sales with filtered_dates and filtered_stores
+├── [+] county_base — CTE aggregating to (state, county) level
+├── [+] state_derived — CTE aggregating to state level
+├── [+] top_states — CTE ranking states and filtering top 5
+├── [+] filtered_county — CTE joining county_base with top_states
+├── [+] rollup_from_county — CTE with ROLLUP aggregation
+├── [+] windowed — CTE computing final window rank
+└── [~] main_query — now a simple SELECT from windowed with ordering
+    ├── SCAN (windowed)
+    ├── SORT (lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN s_state END ASC, rank_within_parent ASC)
+    └── OUTPUT (total_sum, s_state, s_county, lochierarchy, rank_within_parent)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "decorrelate", "description": "Convert correlated state subquery to pre-computed CTE with ranking", "applied_to": ["top_states", "filtered_county"]},
+    {"id": "R2", "type": "single_pass_aggregation", "description": "Scan store_sales once for both county and state aggregation", "applied_to": ["joined_fact", "county_base", "state_derived"]},
+    {"id": "R3", "type": "cte_materialization", "description": "Structure as explicit CTEs matching target logical tree", "applied_to": ["filtered_dates", "filtered_stores", "joined_fact", "county_base", "state_derived", "top_states", "filtered_county", "rollup_from_county", "windowed"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1213 AND 1224",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_stores": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s_store_sk, s_state, s_county FROM store WHERE s_store_sk <= 100",
+        "interfaces": {"outputs": ["s_store_sk", "s_state", "s_county"], "consumes": []}
+      },
+      "joined_fact": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_net_profit, s_state, s_county FROM store_sales INNER JOIN filtered_dates ON ss_sold_date_sk = d_date_sk INNER JOIN filtered_stores ON ss_store_sk = s_store_sk",
+        "interfaces": {"outputs": ["ss_net_profit", "s_state", "s_county"], "consumes": ["filtered_dates", "filtered_stores"]}
+      },
+      "county_base": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s_state, s_county, SUM(ss_net_profit) AS county_sum FROM joined_fact GROUP BY s_state, s_county",
+        "interfaces": {"outputs": ["s_state", "s_county", "county_sum"], "consumes": ["joined_fact"]}
+      },
+      "state_derived": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s_state, SUM(county_sum) AS state_sum FROM county_base GROUP BY s_state",
+        "interfaces": {"outputs": ["s_state", "state_sum"], "consumes": ["county_base"]}
+      },
+      "top_states": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s_state, state_sum, RANK() OVER (ORDER BY state_sum DESC) AS ranking FROM state_derived",
+        "interfaces": {"outputs": ["s_state", "state_sum", "ranking"], "consumes": ["state_derived"]}
+      },
+      "filtered_county": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT county_base.s_state, s_county, county_sum FROM county_base INNER JOIN top_states ON county_base.s_state = top_states.s_state WHERE top_states.ranking <= 5",
+        "interfaces": {"outputs": ["s_state", "s_county", "county_sum"], "consumes": ["county_base", "top_states"]}
+      },
+      "rollup_from_county": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT SUM(county_sum) AS total_sum, s_state, s_county, GROUPING(s_state) + GROUPING(s_county) AS lochierarchy FROM filtered_county GROUP BY ROLLUP(s_state, s_county)",
+        "interfaces": {"outputs": ["total_sum", "s_state", "s_county", "lochierarchy"], "consumes": ["filtered_county"]}
+      },
+      "windowed": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT total_sum, s_state, s_county, lochierarchy, RANK() OVER (PARTITION BY lochierarchy, CASE WHEN GROUPING(s_county) = 0 THEN s_state END ORDER BY total_sum DESC) AS rank_within_parent FROM rollup_from_county",
+        "interfaces": {"outputs": ["total_sum", "s_state", "s_county", "lochierarchy", "rank_within_parent"], "consumes": ["rollup_from_county"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT total_sum, s_state, s_county, lochierarchy, rank_within_parent FROM windowed ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN s_state END, rank_within_parent LIMIT 100",
+        "interfaces": {"outputs": ["total_sum", "s_state", "s_county", "lochierarchy", "rank_within_parent"], "consumes": ["windowed"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_stores", "joined_fact", "county_base", "state_derived", "top_states", "filtered_county", "rollup_from_county", "windowed", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), filtered_stores AS ({filtered_stores}), joined_fact AS ({joined_fact}), county_base AS ({county_base}), state_derived AS ({state_derived}), top_states AS ({top_states}), filtered_county AS ({filtered_county}), rollup_from_county AS ({rollup_from_county}), windowed AS ({windowed}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Decorrelated the state ranking subquery into a CTE chain that computes top states once, then filters counties. The query scans store_sales once (in joined_fact) and reuses aggregates through CTEs, avoiding duplicate scans.
+
+**Expected speedup:** ~3-4x from eliminating duplicate fact table scans and enabling predicate pushdown through CTEs.

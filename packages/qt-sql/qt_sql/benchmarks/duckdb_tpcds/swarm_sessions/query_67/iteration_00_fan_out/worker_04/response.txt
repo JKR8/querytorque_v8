@@ -1,0 +1,89 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K — Same final output, restructured CTE pipeline
+    ├── [~] date_cte  [NEW] — Filter date_dim for 12-month period
+    ├── [~] store_cte  [NEW] — Filter first 100 stores
+    ├── [~] item_cte  [NEW] — All items (no filter)
+    ├── [~] base_agg  [NEW] — Join fact with dimension CTEs, group by full granularity
+    ├── [~] rollup_grouping_sets  [NEW] — Compute ROLLUP via GROUPING SETS over base_agg
+    ├── [~] window_rank  [NEW] — Rank by sumsales within each category
+    ├── [~] filter_rank  [NEW] — Filter to top 100 per category
+    └── [~] order_limit  [NEW] — Apply final ordering and LIMIT
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "prefetch_fact_join", "description": "Replace single ROLLUP with staged CTE pipeline: dimension filters → base aggregation → GROUPING SETS rollup", "applied_to": ["date_cte", "store_cte", "item_cte", "base_agg", "rollup_grouping_sets"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_year, d_qoy, d_moy FROM date_dim WHERE d_month_seq BETWEEN 1206 AND 1206+11",
+        "interfaces": {"outputs": ["d_date_sk", "d_year", "d_qoy", "d_moy"], "consumes": []}
+      },
+      "store_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_sk, s_store_id FROM store WHERE s_store_sk <= 100",
+        "interfaces": {"outputs": ["s_store_sk", "s_store_id"], "consumes": []}
+      },
+      "item_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_category, i_class, i_brand, i_product_name FROM item",
+        "interfaces": {"outputs": ["i_item_sk", "i_category", "i_class", "i_brand", "i_product_name"], "consumes": []}
+      },
+      "base_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, SUM(COALESCE(ss_sales_price * ss_quantity, 0)) AS sumsales FROM store_sales JOIN date_cte ON ss_sold_date_sk = d_date_sk JOIN store_cte ON ss_store_sk = s_store_sk JOIN item_cte ON ss_item_sk = i_item_sk GROUP BY i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "i_product_name", "d_year", "d_qoy", "d_moy", "s_store_id", "sumsales"], "consumes": ["date_cte", "store_cte", "item_cte"]}
+      },
+      "rollup_grouping_sets": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, SUM(sumsales) AS sumsales FROM base_agg GROUP BY GROUPING SETS ((i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id), (i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy), (i_category, i_class, i_brand, i_product_name, d_year, d_qoy), (i_category, i_class, i_brand, i_product_name, d_year), (i_category, i_class, i_brand, i_product_name), (i_category, i_class, i_brand), (i_category, i_class), (i_category), ())",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "i_product_name", "d_year", "d_qoy", "d_moy", "s_store_id", "sumsales"], "consumes": ["base_agg"]}
+      },
+      "window_rank": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, sumsales, RANK() OVER (PARTITION BY i_category ORDER BY sumsales DESC) AS rk FROM rollup_grouping_sets",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "i_product_name", "d_year", "d_qoy", "d_moy", "s_store_id", "sumsales", "rk"], "consumes": ["rollup_grouping_sets"]}
+      },
+      "filter_rank": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT * FROM window_rank WHERE rk <= 100",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "i_product_name", "d_year", "d_qoy", "d_moy", "s_store_id", "sumsales", "rk"], "consumes": ["window_rank"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT * FROM filter_rank ORDER BY i_category, i_class, i_brand, i_product_name, d_year, d_qoy, d_moy, s_store_id, sumsales, rk LIMIT 100",
+        "interfaces": {"outputs": ["i_category", "i_class", "i_brand", "i_product_name", "d_year", "d_qoy", "d_moy", "s_store_id", "sumsales", "rk"], "consumes": ["filter_rank"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "store_cte", "item_cte", "base_agg", "rollup_grouping_sets", "window_rank", "filter_rank", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), store_cte AS ({store_cte}), item_cte AS ({item_cte}), base_agg AS ({base_agg}), rollup_grouping_sets AS ({rollup_grouping_sets}), window_rank AS ({window_rank}), filter_rank AS ({filter_rank}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Split the original single ROLLUP into staged CTE pipeline: first filter dimensions, then compute base aggregation at finest granularity, then compute ROLLUP via GROUPING SETS over the aggregated data, then rank and filter. This preserves exact semantic equivalence while separating the expensive ROLLUP computation from the joins.
+
+**Expected speedup**: Neutral to moderate (0.85x–1.2x). The rewrite avoids the regression warning by computing ROLLUP after the base aggregation, which may allow DuckDB to optimize the base aggregation pushdown separately. However, materializing dimension CTEs might still block some optimizations—this is a trade-off for following the target structure.

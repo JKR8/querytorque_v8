@@ -1,0 +1,330 @@
+<reasoning>
+1. **CLASSIFY**: This is a "multi-channel existence check with OR" query. Customers must have a store sale in Jan-Apr 2001 AND (web sale OR catalog sale in same period). The query profiles demographics by counting customers meeting these criteria. Structural archetype: EXISTS-set operations with correlated subqueries across multiple fact tables sharing a common date filter.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total time: 2899ms
+   - Dominant costs:
+     - store_sales SEQ_SCAN: 2093.8ms (72%) scanning 1.0M of 345.6M rows
+     - web_sales SEQ_SCAN: 567.4ms (20%) scanning 273K of 86.4M rows  
+     - catalog_sales SEQ_SCAN: 25.8ms scanning 535K of 172.8M rows
+   - Row count flow:
+     - customer_address filtered to 1,487 rows (county filter works)
+     - customer join → 2,897 rows
+     - customer_demographics join → 2,795 rows
+     - store_sales EXISTS reduces to 460 rows (semi-join effective)
+     - web/catalog EXISTS OR reduces to 460 rows (mark join effective)
+     - Final grouping: 75 rows
+   - Missed opportunities:
+     - date_dim scanned 3 times (store, web, catalog) with same filter (120 rows each)
+     - Each fact table scanned separately despite similar date join pattern
+   - Optimizer already does: semi-joins for EXISTS, mark joins for OR, predicate pushdown to scans
+   - CTEs: No CTEs in original; optimizer doesn't create any
+
+3. **GAP MATCHING**:
+   - CROSS_CTE_PREDICATE_BLINDNESS: Yes - date filter not shared across subqueries
+   - REDUNDANT_SCAN_ELIMINATION: Yes - 3 separate fact table scans with same date pattern
+   - CORRELATED_SUBQUERY_PARALYSIS: Yes - EXISTS subqueries are correlated
+   - CROSS_COLUMN_OR_DECOMPOSITION: No - OR is between different tables (web vs catalog), not same column
+
+4. **AGGREGATION TRAP CHECK**: Only COUNT(*) aggregates. No FILTER clauses. COUNT is duplicate-sensitive but joins are 1:1 (customer to demographics). Must preserve no duplicates.
+
+5. **TRANSFORM SELECTION** (ranked by impact):
+   a. **channel_bitmap_aggregation** (6.24x historical) - consolidate 3 fact scans into 1 scan per table with CASE aggregation
+   b. **composite_decorrelate_union** (2.42x) - decorrelate EXISTS and handle OR with UNION
+   c. **date_cte_isolate** (4.00x) - share date filter across subqueries  
+   d. **prefetch_fact_join** (3.77x) - filter dates first, pre-join with facts
+
+6. **LOGICAL TREE DESIGN**: Each strategy needs distinct approach:
+   - Worker 1: Single-pass aggregation with CASE (channel_bitmap_aggregation)
+   - Worker 2: Decorrelation with UNION (composite_decorrelate_union)
+   - Worker 3: Date CTE isolation (date_cte_isolate)
+   - Worker 4: Exploration - combine decorrelation with single-pass (novel compound)
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+(a) Profile customer demographics for selected counties by counting customers who bought in stores during Jan-Apr 2001 and also bought through either web or catalog in the same period.
+(b) INNER JOIN semantics: all customer-address-demographics must match; EXISTS requires store sale AND (web OR catalog sale) - intersection plus union.
+(c) COUNT(*) is duplicate-sensitive but joins are 1:1 from customer to demographics; any rewrite must not introduce duplicate customer rows.
+(d) The date filter (d_year=2001, d_moy 1-4) must apply identically to all three channel subqueries; county filter must remain with customer_address join.
+
+BOTTLENECK_DIAGNOSIS:
+The query is scan-bound on three large fact tables: store_sales (2093.8ms, 72%), web_sales (567.4ms, 20%), catalog_sales (25.8ms). Cardinality flows from 1,487 filtered addresses → 2,897 customers → 2,795 with demographics → 460 after store EXISTS → 460 after web/catalog OR. The optimizer already handles EXISTS as efficient semi-joins and OR as mark joins, but misses sharing the date filter (scanned 3×) and consolidating fact scans.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output all 8 demographic columns and 6 COUNT(*) values exactly as named.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include c_customer_sk for joins and demographic columns for GROUP BY.
+- LITERAL_PRESERVATION: County names, year=2001, month range 1-4 must be preserved exactly.
+- SEMANTIC_EQUIVALENCE: Same customers must be counted in same demographic groups.
+- CROSS_CTE_PREDICATE_BLINDNESS: Date filter repeated 3× in separate subqueries (EXPLAIN shows 3 separate date_dim scans).
+- REDUNDANT_SCAN_ELIMINATION: Three separate fact table scans with identical date join patterns (EXPLAIN shows store_sales, web_sales, catalog_sales each scanned separately).
+
+REGRESSION_WARNINGS:
+1. materialize_cte (regression_q16_semantic_rewrite: 0.14x):
+   CAUSE: Converting EXISTS to materialized CTE forced full fact table scan instead of semi-join short-circuit.
+   RULE: Do not convert EXISTS subqueries into materialized CTEs that scan entire fact tables.
+2. or_to_union (regression_q90: 0.59x):
+   CAUSE: Splitting same-column OR into UNION branches duplicated fact scans.
+   RULE: This query's OR is between different tables (web vs catalog), which may be safe, but limit to ≤3 UNION branches.
+3. prefetch_fact_join (regression_q25_date_cte_isolate: 0.5x):
+   CAUSE: Pre-joining filtered fact tables before multi-way joins prevented optimizer reordering.
+   RULE: This query has only one fact table per subquery, so prefetch may work, but verify final join order remains flexible.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: Single-pass channel aggregation
+TARGET_LOGICAL_TREE:
+date_cte → multi_channel_cte → filtered_customers → group_by → order_limit
+
+NODE_CONTRACTS:
+date_cte:
+FROM: date_dim
+WHERE: d_year = 2001 AND d_moy BETWEEN 1 AND 4
+OUTPUT: d_date_sk
+EXPECTED_ROWS: 120
+CONSUMERS: multi_channel_cte
+
+multi_channel_cte:
+FROM: (
+    SELECT ss_customer_sk AS customer_sk, 'store' AS channel, d_date_sk
+    FROM store_sales JOIN date_cte ON ss_sold_date_sk = d_date_sk
+    UNION ALL
+    SELECT ws_bill_customer_sk, 'web', d_date_sk
+    FROM web_sales JOIN date_cte ON ws_sold_date_sk = d_date_sk  
+    UNION ALL
+    SELECT cs_ship_customer_sk, 'catalog', d_date_sk
+    FROM catalog_sales JOIN date_cte ON cs_sold_date_sk = d_date_sk
+) all_sales
+GROUP BY: customer_sk
+AGGREGATE: 
+    MAX(CASE WHEN channel = 'store' THEN 1 ELSE 0 END) AS has_store,
+    MAX(CASE WHEN channel = 'web' THEN 1 ELSE 0 END) AS has_web,
+    MAX(CASE WHEN channel = 'catalog' THEN 1 ELSE 0 END) AS has_catalog
+HAVING: has_store = 1 AND (has_web = 1 OR has_catalog = 1)
+OUTPUT: customer_sk
+EXPECTED_ROWS: 460
+CONSUMERS: filtered_customers
+
+filtered_customers:
+FROM: customer c
+JOIN: customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+JOIN: customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+JOIN: multi_channel_cte m ON c.c_customer_sk = m.customer_sk
+WHERE: ca.ca_county IN ('Storey County','Marquette County','Warren County','Cochran County','Kandiyohi County')
+OUTPUT: cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating, cd.cd_dep_count, cd.cd_dep_employed_count, cd.cd_dep_college_count, c.c_customer_sk
+EXPECTED_ROWS: 2,795
+CONSUMERS: group_by
+
+group_by:
+FROM: filtered_customers
+GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count
+AGGREGATE: COUNT(*) AS cnt1, COUNT(*) AS cnt2, COUNT(*) AS cnt3, COUNT(*) AS cnt4, COUNT(*) AS cnt5, COUNT(*) AS cnt6
+OUTPUT: cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3, cd_dep_count, cnt4, cd_dep_employed_count, cnt5, cd_dep_college_count, cnt6
+EXPECTED_ROWS: 75
+CONSUMERS: order_limit
+
+order_limit:
+FROM: group_by
+ORDER BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating, cd_dep_count, cd_dep_employed_count, cd_dep_college_count
+LIMIT: 100
+OUTPUT: Same as group_by
+EXPECTED_ROWS: 75
+CONSUMERS: final output
+
+EXAMPLES: channel_bitmap_aggregation, single_pass_aggregation
+EXAMPLE_ADAPTATION:
+- channel_bitmap_aggregation: Apply the CASE WHEN labeling per channel and single GROUP BY. Ignore that example uses same fact table with different filters - we have different tables.
+- single_pass_aggregation: Apply consolidation of multiple subqueries into UNION ALL with conditional aggregation. Ignore that original uses scalar subqueries - we have EXISTS subqueries.
+
+HAZARD_FLAGS:
+- UNION ALL of three large fact tables may create huge intermediate result before GROUP BY.
+- MAX(CASE) aggregation must correctly detect existence (1 vs 0).
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: Decorrelate with UNION
+TARGET_LOGICAL_TREE:
+date_cte → store_customers → web_customers → catalog_customers → eligible_customers → filtered_customers → group_by → order_limit
+
+NODE_CONTRACTS:
+date_cte:
+FROM: date_dim
+WHERE: d_year = 2001 AND d_moy BETWEEN 1 AND 4
+OUTPUT: d_date_sk
+EXPECTED_ROWS: 120
+CONSUMERS: store_customers, web_customers, catalog_customers
+
+store_customers:
+FROM: store_sales
+JOIN: date_cte ON ss_sold_date_sk = d_date_sk
+GROUP BY: ss_customer_sk
+OUTPUT: ss_customer_sk
+EXPECTED_ROWS: 460
+CONSUMERS: eligible_customers
+
+web_customers:
+FROM: web_sales  
+JOIN: date_cte ON ws_sold_date_sk = d_date_sk
+GROUP BY: ws_bill_customer_sk
+OUTPUT: ws_bill_customer_sk
+EXPECTED_ROWS: 460
+CONSUMERS: eligible_customers
+
+catalog_customers:
+FROM: catalog_sales
+JOIN: date_cte ON cs_sold_date_sk = d_date_sk
+GROUP BY: cs_ship_customer_sk
+OUTPUT: cs_ship_customer_sk
+EXPECTED_ROWS: 460
+CONSUMERS: eligible_customers
+
+eligible_customers:
+FROM: store_customers s
+WHERE: EXISTS (SELECT 1 FROM web_customers w WHERE w.ws_bill_customer_sk = s.ss_customer_sk)
+   OR EXISTS (SELECT 1 FROM catalog_customers c WHERE c.cs_ship_customer_sk = s.ss_customer_sk)
+OUTPUT: ss_customer_sk AS customer_sk
+EXPECTED_ROWS: 460
+CONSUMERS: filtered_customers
+
+filtered_customers:
+FROM: customer c
+JOIN: customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+JOIN: customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+JOIN: eligible_customers e ON c.c_customer_sk = e.customer_sk
+WHERE: ca.ca_county IN ('Storey County','Marquette County','Warren County','Cochran County','Kandiyohi County')
+OUTPUT: cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating, cd.cd_dep_count, cd.cd_dep_employed_count, cd.cd_dep_college_count, c.c_customer_sk
+EXPECTED_ROWS: 2,795
+CONSUMERS: group_by
+
+group_by: (same as Worker 1)
+order_limit: (same as Worker 1)
+
+EXAMPLES: composite_decorrelate_union, decorrelate
+EXAMPLE_ADAPTATION:
+- composite_decorrelate_union: Apply shared date CTE and decorrelate each EXISTS into DISTINCT CTE. Keep the OR between web and catalog as EXISTS on the CTEs.
+- decorrelate: Convert correlated subqueries to standalone CTEs. Ignore that original uses scalar aggregates - we use existence checks.
+
+HAZARD_FLAGS:
+- eligible_customers uses EXISTS on CTEs which may force materialization.
+- Must ensure county filter remains with customer_address join, not pushed into channel CTEs.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: Date CTE isolation with prefetch
+TARGET_LOGICAL_TREE:
+date_cte → store_sales_pre → web_sales_pre → catalog_sales_pre → filtered_customers → group_by → order_limit
+
+NODE_CONTRACTS:
+date_cte:
+FROM: date_dim
+WHERE: d_year = 2001 AND d_moy BETWEEN 1 AND 4
+OUTPUT: d_date_sk
+EXPECTED_ROWS: 120
+CONSUMERS: store_sales_pre, web_sales_pre, catalog_sales_pre
+
+store_sales_pre:
+FROM: store_sales
+JOIN: date_cte ON ss_sold_date_sk = d_date_sk
+GROUP BY: ss_customer_sk
+OUTPUT: ss_customer_sk
+EXPECTED_ROWS: 460
+CONSUMERS: filtered_customers
+
+web_sales_pre:
+FROM: web_sales
+JOIN: date_cte ON ws_sold_date_sk = d_date_sk
+GROUP BY: ws_bill_customer_sk
+OUTPUT: ws_bill_customer_sk
+EXPECTED_ROWS: 460
+CONSUMERS: filtered_customers
+
+catalog_sales_pre:
+FROM: catalog_sales
+JOIN: date_cte ON cs_sold_date_sk = d_date_sk
+GROUP BY: cs_ship_customer_sk
+OUTPUT: cs_ship_customer_sk
+EXPECTED_ROWS: 460
+CONSUMERS: filtered_customers
+
+filtered_customers:
+FROM: customer c
+JOIN: customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+JOIN: customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+JOIN: store_sales_pre ss ON c.c_customer_sk = ss.ss_customer_sk
+LEFT JOIN: web_sales_pre ws ON c.c_customer_sk = ws.ws_bill_customer_sk
+LEFT JOIN: catalog_sales_pre cs ON c.c_customer_sk = cs.cs_ship_customer_sk
+WHERE: ca.ca_county IN ('Storey County','Marquette County','Warren County','Cochran County','Kandiyohi County')
+  AND (ws.ws_bill_customer_sk IS NOT NULL OR cs.cs_ship_customer_sk IS NOT NULL)
+OUTPUT: cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating, cd.cd_dep_count, cd.cd_dep_employed_count, cd.cd_dep_college_count, c.c_customer_sk
+EXPECTED_ROWS: 2,795
+CONSUMERS: group_by
+
+group_by: (same as Worker 1)
+order_limit: (same as Worker 1)
+
+EXAMPLES: date_cte_isolate, prefetch_fact_join
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: Extract date filter into shared CTE. Apply exactly - date filter used by all three channel pre-joins.
+- prefetch_fact_join: Pre-join filtered dates with each fact table before main customer join. Ignore that example chains multiple dimension filters - we only have date.
+
+HAZARD_FLAGS:
+- Three separate fact table GROUP BYs may materialize unnecessarily.
+- LEFT JOIN + OR condition may be less efficient than mark join in original.
+
+=== WORKER 4 BRIEFING (EXPLORATION WORKER) ===
+
+STRATEGY: Hybrid decorrelation with bitmap
+TARGET_LOGICAL_TREE:
+date_cte → channel_bitmap → filtered_customers → group_by → order_limit
+
+NODE_CONTRACTS:
+date_cte:
+FROM: date_dim
+WHERE: d_year = 2001 AND d_moy BETWEEN 1 AND 4
+OUTPUT: d_date_sk
+EXPECTED_ROWS: 120
+CONSUMERS: channel_bitmap
+
+channel_bitmap:
+FROM: (
+    SELECT 
+        COALESCE(ss.ss_customer_sk, ws.ws_bill_customer_sk, cs.cs_ship_customer_sk) AS customer_sk,
+        MAX(CASE WHEN ss.ss_customer_sk IS NOT NULL THEN 1 ELSE 0 END) AS has_store,
+        MAX(CASE WHEN ws.ws_bill_customer_sk IS NOT NULL THEN 1 ELSE 0 END) AS has_web,
+        MAX(CASE WHEN cs.cs_ship_customer_sk IS NOT NULL THEN 1 ELSE 0 END) AS has_catalog
+    FROM date_cte d
+    LEFT JOIN store_sales ss ON ss.ss_sold_date_sk = d.d_date_sk
+    LEFT JOIN web_sales ws ON ws.ws_sold_date_sk = d.d_date_sk  
+    LEFT JOIN catalog_sales cs ON cs.cs_sold_date_sk = d.d_date_sk
+    GROUP BY customer_sk
+    HAVING has_store = 1 AND (has_web = 1 OR has_catalog = 1)
+) 
+OUTPUT: customer_sk
+EXPECTED_ROWS: 460
+CONSUMERS: filtered_customers
+
+filtered_customers:
+FROM: customer c
+JOIN: customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+JOIN: customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
+JOIN: channel_bitmap b ON c.c_customer_sk = b.customer_sk
+WHERE: ca.ca_county IN ('Storey County','Marquette County','Warren County','Cochran County','Kandiyohi County')
+OUTPUT: cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating, cd.cd_dep_count, cd.cd_dep_employed_count, cd.cd_dep_college_count, c.c_customer_sk
+EXPECTED_ROWS: 2,795
+CONSUMERS: group_by
+
+group_by: (same as Worker 1)
+order_limit: (same as Worker 1)
+
+EXAMPLES: channel_bitmap_aggregation, composite_decorrelate_union
+EXAMPLE_ADAPTATION:
+- channel_bitmap_aggregation: Apply single-pass bitmap idea but with LEFT JOINs instead of UNION ALL.
+- composite_decorrelate_union: Apply shared date CTE and existence checking via bitmap rather than separate CTEs.
+HAZARD_FLAGS:
+- Three-way LEFT JOIN of large fact tables may create Cartesian explosion if date keys match many rows.
+- COALESCE to get customer_sk may incorrectly combine rows from different customers.
+
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

@@ -1,0 +1,116 @@
+## Step 1: DIAGNOSE Why 1.103x Failed to Reach 2.0x
+
+The best attempt (W2) achieved only 1.103x because it still suffers from the **NESTED LOOP with d1 INDEX SCAN per outer row**. Looking at the execution plan:
+
+- **Nested Loop (rows=81,513, time=269.422)**: Each row from the store_sales/store_returns/store join probes date_dim d1 via index scan
+- **Index Scan on date_dim (d1) (rows=1, time=0.0)**: Shows 0.0ms per loop but cumulative overhead is massive
+- **Parallel Sort (rows=39,154, time=362.629)**: High sorting cost due to materializing all joined rows before aggregation
+
+**Root cause**: The correlated range condition `d1.d_date BETWEEN (d2.d_date - INTERVAL '120 DAY') AND d2.d_date` forces PostgreSQL into nested-loop execution. Even with explicit joins and CTE materialization, the planner can't decorrelate this non-equi join.
+
+## Step 2: IDENTIFY Unexplored Optimization Angles
+
+1. **Date Dimension Pre-computation**: The 120-day window for each d2.d_date in July 1999 creates a fixed overall d1 date range. We can pre-compute ALL valid (d1.d_date_sk, d2.d_date_sk) pairs that satisfy the condition into a small hash table.
+
+2. **Aggregation Push-Before-Join**: The aggregation uses only `sr_returned_date_sk - ss_sold_date_sk` differences. We can compute these differences early and filter/store them before the store join.
+
+3. **Parallel Aggregation Optimization**: The final GROUP BY on 10 store columns creates a high-cardinality aggregation (39K rows). PostgreSQL's sort-based GroupAggregate is inefficient here.
+
+4. **CTE Materialization Fence Benefit**: While CTEs create optimization fences, they can **prevent** predicate pushdown BUT also **enable** hash join planning with tiny pre-materialized dimension tables.
+
+## Step 3: REWRITE Strategy
+
+**Core innovation**: Pre-compute ALL valid (d1, d2) date pairs for July 1999 ±120 days into a tiny CTE (max: 31 d2 days × 120 d1 days = 3,720 rows). Then:
+1. Join store_returns to d2_filtered
+2. Join store_sales to the result AND to date_pairs CTE
+3. Compute return delays early
+4. Join to store for aggregation
+
+This replaces the nested-loop with a **hash join** on pre-computed date pairs.
+
+# Modified Logic Tree
+
+```
+[+] date_pairs: CTE with all (d1_date_sk, d2_date_sk, d2_date) satisfying d1.d_date between d2.d_date - 120 days and d2.d_date
+[~] store_returns_filtered: Join store_returns with date_pairs (not just d2_filtered)
+[~] sales_returns_joined: Join store_sales with store_returns_filtered AND date_pairs for date validation
+[+] early_computation: Compute return_delay = sr_returned_date_sk - ss_sold_date_sk before store join
+[~] store_joined: Join with store and pre-computed return_delay
+[~] aggregated: Simplified CASE expressions using pre-computed return_delay
+[=] main_query: Unchanged output structure
+```
+
+# Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "date_pair_precomputation",
+      "description": "Pre-compute all valid (d1,d2) date pairs for July 1999 with 120-day window into small hash table",
+      "applied_to": ["date_pairs"]
+    },
+    {
+      "id": "R2", 
+      "type": "early_delay_computation",
+      "description": "Compute return delay before store join to simplify CASE expressions",
+      "applied_to": ["sales_returns_joined"]
+    },
+    {
+      "id": "R3",
+      "type": "hash_join_optimization",
+      "description": "Force hash joins by materializing small dimension CTEs",
+      "applied_to": ["store_returns_filtered", "sales_returns_joined", "store_joined"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_pairs": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d1.d_date_sk AS d1_date_sk, d2.d_date_sk AS d2_date_sk, d2.d_date AS d2_date FROM date_dim d1 CROSS JOIN date_dim d2 WHERE d2.d_year = 1999 AND d2.d_moy = 7 AND d1.d_date BETWEEN (d2.d_date - INTERVAL '120 DAY') AND d2.d_date",
+        "interfaces": {"outputs": ["d1_date_sk", "d2_date_sk", "d2_date"], "consumes": []}
+      },
+      "store_returns_filtered": {
+        "type": "cte", 
+        "change": "modified",
+        "sql": "SELECT sr.sr_item_sk, sr.sr_ticket_number, sr.sr_customer_sk, sr.sr_returned_date_sk, dp.d1_date_sk, dp.d2_date FROM store_returns sr JOIN date_pairs dp ON sr.sr_returned_date_sk = dp.d2_date_sk",
+        "interfaces": {"outputs": ["sr_item_sk", "sr_ticket_number", "sr_customer_sk", "sr_returned_date_sk", "d1_date_sk", "d2_date"], "consumes": ["date_pairs"]}
+      },
+      "sales_returns_joined": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss.ss_store_sk, ss.ss_sold_date_sk, srf.sr_returned_date_sk, (srf.sr_returned_date_sk - ss.ss_sold_date_sk) AS return_delay FROM store_sales ss JOIN store_returns_filtered srf ON ss.ss_item_sk = srf.sr_item_sk AND ss.ss_ticket_number = srf.sr_ticket_number AND ss.ss_customer_sk = srf.sr_customer_sk AND ss.ss_sold_date_sk = srf.d1_date_sk",
+        "interfaces": {"outputs": ["ss_store_sk", "ss_sold_date_sk", "sr_returned_date_sk", "return_delay"], "consumes": ["store_returns_filtered"]}
+      },
+      "store_joined": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT s.s_store_name, s.s_company_id, s.s_street_number, s.s_street_name, s.s_street_type, s.s_suite_number, s.s_city, s.s_county, s.s_state, s.s_zip, srj.return_delay FROM sales_returns_joined srj JOIN store s ON srj.ss_store_sk = s.s_store_sk",
+        "interfaces": {"outputs": ["s_store_name", "s_company_id", "s_street_number", "s_street_name", "s_street_type", "s_suite_number", "s_city", "s_county", "s_state", "s_zip", "return_delay"], "consumes": ["sales_returns_joined"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, SUM(CASE WHEN return_delay <= 30 THEN 1 ELSE 0 END) AS \"30 days\", SUM(CASE WHEN return_delay > 30 AND return_delay <= 60 THEN 1 ELSE 0 END) AS \"31-60 days\", SUM(CASE WHEN return_delay > 60 AND return_delay <= 90 THEN 1 ELSE 0 END) AS \"61-90 days\", SUM(CASE WHEN return_delay > 90 AND return_delay <= 120 THEN 1 ELSE 0 END) AS \"91-120 days\", SUM(CASE WHEN return_delay > 120 THEN 1 ELSE 0 END) AS \">120 days\" FROM store_joined GROUP BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip ORDER BY s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip LIMIT 100",
+        "interfaces": {"outputs": ["s_store_name", "s_company_id", "s_street_number", "s_street_name", "s_street_type", "s_suite_number", "s_city", "s_county", "s_state", "s_zip", "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"], "consumes": ["store_joined"]}
+      }
+    },
+    "reconstruction_order": ["date_pairs", "store_returns_filtered", "sales_returns_joined", "store_joined", "main_query"],
+    "assembly_template": "WITH date_pairs AS ({date_pairs}), store_returns_filtered AS ({store_returns_filtered}), sales_returns_joined AS ({sales_returns_joined}), store_joined AS ({store_joined}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL enable_nestloop = off", "SET LOCAL enable_hashjoin = on", "SET LOCAL work_mem = '256MB'", "SET LOCAL hash_mem_multiplier = 2.0"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Pre-computed all valid (d1,d2) date pairs into a tiny CTE (max 3,720 rows), enabling hash joins instead of nested loops. Computed return delay early to simplify aggregation expressions.
+
+**Expected speedup**: 2.5-3.0x by eliminating per-row index scans on date_dim d1 and enabling parallel hash joins with small dimension tables. The date_pairs CTE creates a complete mapping that replaces the correlated range condition with a simple equi-join.

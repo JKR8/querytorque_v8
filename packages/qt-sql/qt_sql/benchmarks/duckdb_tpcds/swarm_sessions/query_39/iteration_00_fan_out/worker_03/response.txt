@@ -1,0 +1,96 @@
+### Part 1: Modified Logic Tree
+```
+QUERY:
+├── [CTE] filtered_dates  [+]  Cost: low  Rows: ~60  — Isolate date filtering to create small hash table for join
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year = 1998 AND d_moy IN (1,2))
+│   └── OUTPUT (d_date_sk, d_moy)
+├── [CTE] inv_cte  [~]  Cost: high  Rows: ~warehouses×items×2 with cov>1  — Join with filtered_dates instead of full date_dim scan
+│   ├── SCAN (inventory)
+│   ├── JOIN (INNER) filtered_dates ON inv_date_sk = d_date_sk
+│   ├── JOIN (INNER) item ON inv_item_sk = i_item_sk
+│   ├── JOIN (INNER) warehouse ON inv_warehouse_sk = w_warehouse_sk
+│   ├── AGG (GROUP BY w_warehouse_sk, i_item_sk, d_moy)
+│   ├── FILTER (CASE WHEN mean = 0 THEN 0 ELSE stdev/mean END > 1)
+│   └── OUTPUT (w_warehouse_sk, i_item_sk, d_moy, stdev, mean, cov)
+└── [MAIN] main_query  [=]  Cost: medium  Rows: same as original  — Unchanged self-join structure
+    ├── SCAN (inv_cte as inv1, inv_cte as inv2)
+    ├── JOIN (inv1.i_item_sk = inv2.i_item_sk AND inv1.w_warehouse_sk = inv2.w_warehouse_sk)
+    ├── FILTER (inv1.d_moy = 1 AND inv2.d_moy = 2)
+    ├── FILTER (inv1.cov > 1.5)  [for second query only]
+    ├── SORT (same as original)
+    └── OUTPUT (same 10 columns)
+```
+
+### Part 2: Component Payload JSON
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extract date dimension filtering into separate CTE to avoid full-year scan", "applied_to": ["filtered_dates"]},
+    {"id": "R2", "type": "early_filter", "description": "Filter date_dim first, then join to inventory to push predicates earlier", "applied_to": ["inv_cte"]}
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_dates": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT d_date_sk, d_moy FROM date_dim WHERE d_year = 1998 AND d_moy IN (1, 2)",
+          "interfaces": {"outputs": ["d_date_sk", "d_moy"], "consumes": []}
+        },
+        "inv_cte": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT w_warehouse_sk, i_item_sk, d_moy, stddev_samp(inv_quantity_on_hand) AS stdev, avg(inv_quantity_on_hand) AS mean, CASE WHEN avg(inv_quantity_on_hand) = 0 THEN NULL ELSE stddev_samp(inv_quantity_on_hand) / avg(inv_quantity_on_hand) END AS cov FROM inventory INNER JOIN filtered_dates ON inv_date_sk = d_date_sk INNER JOIN item ON inv_item_sk = i_item_sk INNER JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk GROUP BY w_warehouse_sk, i_item_sk, d_moy HAVING CASE WHEN avg(inv_quantity_on_hand) = 0 THEN 0 ELSE stddev_samp(inv_quantity_on_hand) / avg(inv_quantity_on_hand) END > 1",
+          "interfaces": {"outputs": ["w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean", "cov"], "consumes": ["filtered_dates"]}
+        },
+        "main_query_1": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov FROM inv_cte inv1, inv_cte inv2 WHERE inv1.i_item_sk = inv2.i_item_sk AND inv1.w_warehouse_sk = inv2.w_warehouse_sk AND inv1.d_moy = 1 AND inv2.d_moy = 2 ORDER BY inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, inv2.d_moy, inv2.mean, inv2.cov",
+          "interfaces": {"outputs": ["w_warehouse_sk", "i_item_sk", "d_moy", "mean", "cov", "w_warehouse_sk", "i_item_sk", "d_moy", "mean", "cov"], "consumes": ["inv_cte"]}
+        }
+      },
+      "reconstruction_order": ["filtered_dates", "inv_cte", "main_query_1"],
+      "assembly_template": "WITH filtered_dates AS ({filtered_dates}), inv_cte AS ({inv_cte}) {main_query_1}"
+    },
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_dates": {
+          "type": "cte",
+          "change": "unchanged",
+          "sql": "",
+          "interfaces": {"outputs": ["d_date_sk", "d_moy"], "consumes": []}
+        },
+        "inv_cte": {
+          "type": "cte",
+          "change": "unchanged",
+          "sql": "",
+          "interfaces": {"outputs": ["w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean", "cov"], "consumes": ["filtered_dates"]}
+        },
+        "main_query_2": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov FROM inv_cte inv1, inv_cte inv2 WHERE inv1.i_item_sk = inv2.i_item_sk AND inv1.w_warehouse_sk = inv2.w_warehouse_sk AND inv1.d_moy = 1 AND inv2.d_moy = 2 AND inv1.cov > 1.5 ORDER BY inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov, inv2.d_moy, inv2.mean, inv2.cov",
+          "interfaces": {"outputs": ["w_warehouse_sk", "i_item_sk", "d_moy", "mean", "cov", "w_warehouse_sk", "i_item_sk", "d_moy", "mean", "cov"], "consumes": ["inv_cte"]}
+        }
+      },
+      "reconstruction_order": ["filtered_dates", "inv_cte", "main_query_2"],
+      "assembly_template": "WITH filtered_dates AS ({filtered_dates}), inv_cte AS ({inv_cte}) {main_query_2}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Isolated date filtering into a separate CTE (`filtered_dates`) that selects only months 1-2 of 1998, then joined this small result to inventory. This prevents a full-year scan of date_dim and reduces the inventory join to only those months.
+
+**Expected speedup**: 2-4x due to eliminating the full-year date_dim scan and reducing the inventory join cardinality by ~6x (12 months → 2 months).

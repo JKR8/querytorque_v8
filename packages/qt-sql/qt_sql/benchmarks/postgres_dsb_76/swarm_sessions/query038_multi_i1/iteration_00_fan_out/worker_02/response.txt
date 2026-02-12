@@ -1,0 +1,70 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  (CTE-based rewrite with UNION ALL + aggregation)
+    ├── [CTE] all_sales  [+]  (UNION ALL of three channels with price filters)
+    ├── [CTE] joined_sales  [+]  (INNER JOIN with date_dim + customer)
+    ├── [CTE] grouped_sales  [+]  (GROUP BY triple with COUNT(DISTINCT channel))
+    └── [OUTPUT] COUNT(*)  [=]
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "union_cte_split", "description": "Consolidate three separate fact table scans into single UNION ALL with channel discriminator", "applied_to": ["all_sales"]},
+    {"id": "R2", "type": "single_pass_aggregation", "description": "Replace INTERSECT with COUNT(DISTINCT channel) aggregation for set intersection semantics", "applied_to": ["grouped_sales"]},
+    {"id": "R3", "type": "cross_cte_predicate_blindness", "description": "Apply date_dim and customer filters once after UNION ALL instead of three separate times", "applied_to": ["joined_sales"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "all_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT 'store' AS channel, ss_sold_date_sk AS sold_date_sk, ss_customer_sk AS customer_sk, ss_list_price AS list_price, ss_wholesale_cost AS wholesale_cost FROM store_sales WHERE ss_list_price BETWEEN 193 AND 252 AND ss_wholesale_cost BETWEEN 35 AND 55 UNION ALL SELECT 'catalog' AS channel, cs_sold_date_sk AS sold_date_sk, cs_bill_customer_sk AS customer_sk, cs_list_price AS list_price, cs_wholesale_cost AS wholesale_cost FROM catalog_sales WHERE cs_list_price BETWEEN 193 AND 252 AND cs_wholesale_cost BETWEEN 35 AND 55 UNION ALL SELECT 'web' AS channel, ws_sold_date_sk AS sold_date_sk, ws_bill_customer_sk AS customer_sk, ws_list_price AS list_price, ws_wholesale_cost AS wholesale_cost FROM web_sales WHERE ws_list_price BETWEEN 193 AND 252 AND ws_wholesale_cost BETWEEN 35 AND 55",
+        "interfaces": {"outputs": ["channel", "sold_date_sk", "customer_sk", "list_price", "wholesale_cost"], "consumes": []}
+      },
+      "joined_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c.c_last_name, c.c_first_name, d.d_date, s.channel FROM all_sales s INNER JOIN date_dim d ON s.sold_date_sk = d.d_date_sk INNER JOIN customer c ON s.customer_sk = c.c_customer_sk WHERE d.d_month_seq BETWEEN 1200 AND 1200 + 11 AND c.c_birth_month IN (1, 2, 5, 12)",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date", "channel"], "consumes": ["all_sales"]}
+      },
+      "grouped_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, d_date, COUNT(DISTINCT channel) AS channel_count FROM joined_sales GROUP BY c_last_name, c_first_name, d_date",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date", "channel_count"], "consumes": ["joined_sales"]}
+      },
+      "filter_count_3": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, d_date FROM grouped_sales WHERE channel_count = 3",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date"], "consumes": ["grouped_sales"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(*) FROM filter_count_3",
+        "interfaces": {"outputs": ["COUNT(*)"], "consumes": ["filter_count_3"]}
+      }
+    },
+    "reconstruction_order": ["all_sales", "joined_sales", "grouped_sales", "filter_count_3", "main_query"],
+    "assembly_template": "WITH all_sales AS ({all_sales}), joined_sales AS ({joined_sales}), grouped_sales AS ({grouped_sales}), filter_count_3 AS ({filter_count_3}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '128MB'", "SET LOCAL max_parallel_workers_per_gather = 2", "SET LOCAL enable_mergejoin = off", "SET LOCAL enable_nestloop = off"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced three-way INTERSECT with single-pass UNION ALL + COUNT(DISTINCT channel) aggregation. This consolidates three separate fact table scans into one logical scan, reduces redundant joins, and uses aggregation for set intersection semantics.
+
+**Expected speedup**: ~2-3x due to eliminating redundant work (single date_dim/customer join instead of three) and more efficient use of work_mem for one large hash aggregation instead of multiple hash-based INTERSECT operations.

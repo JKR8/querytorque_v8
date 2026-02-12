@@ -1,0 +1,145 @@
+## Logic Tree Changes
+
+```
+[~] Original CTE "inv" restructured:
+    [+] CTE "filtered_date": pre‑filter date_dim to d_year=2002 AND d_moy IN (2,3)
+    [+] CTE "filtered_item": pre‑filter item to i_category IN ('Jewelry','Men') AND i_manager_id BETWEEN 81 AND 100
+    [+] CTE "filtered_warehouse": select w_warehouse_sk, w_warehouse_name (unchanged)
+    [+] CTE "base_agg": explicit JOINs of inventory with filtered dimensions, GROUP BY w_warehouse_sk, w_warehouse_name, i_item_sk, d_moy
+    [~] CTE "inv": compute cov from base_agg and filter on coefficient of variation >1 (unchanged logic, now based on base_agg)
+[=] Main query: unchanged self‑join and ordering (now references the new CTE structure)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pg_dimension_prefetch_star", "description": "Pre‑filter selective dimensions into CTEs to create tiny hash tables, combined with explicit JOIN syntax", "applied_to": ["filtered_date", "filtered_item", "filtered_warehouse", "base_agg"]},
+    {"id": "R2", "type": "early_filter_decorrelate", "description": "Push month filter (2,3) into the base aggregation CTE to reduce materialized rows by ~83%", "applied_to": ["filtered_date", "base_agg"]},
+    {"id": "R3", "type": "comma_join_conversion", "description": "Convert implicit comma‑joins to explicit INNER JOIN ... ON syntax for better cardinality estimation", "applied_to": ["base_agg"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_moy FROM date_dim WHERE d_year = 2002 AND d_moy IN (2, 3)",
+        "interfaces": {"outputs": ["d_date_sk", "d_moy"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk FROM item WHERE i_category IN ('Jewelry', 'Men') AND i_manager_id BETWEEN 81 AND 100",
+        "interfaces": {"outputs": ["i_item_sk"], "consumes": []}
+      },
+      "filtered_warehouse": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT w_warehouse_sk, w_warehouse_name FROM warehouse",
+        "interfaces": {"outputs": ["w_warehouse_sk", "w_warehouse_name"], "consumes": []}
+      },
+      "base_agg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT w.w_warehouse_sk, w.w_warehouse_name, i.i_item_sk, d.d_moy, STDDEV_SAMP(inv.inv_quantity_on_hand) AS stdev, AVG(inv.inv_quantity_on_hand) AS mean FROM inventory inv INNER JOIN filtered_date d ON inv.inv_date_sk = d.d_date_sk INNER JOIN filtered_item i ON inv.inv_item_sk = i.i_item_sk INNER JOIN filtered_warehouse w ON inv.inv_warehouse_sk = w.w_warehouse_sk WHERE inv.inv_quantity_on_hand BETWEEN 0 AND 200 GROUP BY w.w_warehouse_sk, w.w_warehouse_name, i.i_item_sk, d.d_moy",
+        "interfaces": {"outputs": ["w_warehouse_sk", "w_warehouse_name", "i_item_sk", "d_moy", "stdev", "mean"], "consumes": ["filtered_date", "filtered_item", "filtered_warehouse"]}
+      },
+      "inv": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END AS cov FROM base_agg WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1",
+        "interfaces": {"outputs": ["w_warehouse_name", "w_warehouse_sk", "i_item_sk", "d_moy", "stdev", "mean", "cov"], "consumes": ["base_agg"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["w_warehouse_sk", "i_item_sk", "d_moy", "mean", "cov", "w_warehouse_sk", "i_item_sk", "d_moy", "mean", "cov"], "consumes": ["inv"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "filtered_warehouse", "base_agg", "inv", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), filtered_warehouse AS ({filtered_warehouse}), base_agg AS ({base_agg}), inv AS ({inv}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'", "SET LOCAL max_parallel_workers_per_gather = 8", "SET LOCAL enable_nestloop = off", "SET LOCAL enable_mergejoin = off", "SET LOCAL effective_cache_size = '4GB'"],
+  "validation_checks": []
+}
+```
+
+## Final Optimized SQL
+
+```sql
+WITH filtered_date AS (
+  SELECT d_date_sk, d_moy
+  FROM date_dim
+  WHERE d_year = 2002 AND d_moy IN (2, 3)
+),
+filtered_item AS (
+  SELECT i_item_sk
+  FROM item
+  WHERE i_category IN ('Jewelry', 'Men')
+    AND i_manager_id BETWEEN 81 AND 100
+),
+filtered_warehouse AS (
+  SELECT w_warehouse_sk, w_warehouse_name
+  FROM warehouse
+),
+base_agg AS (
+  SELECT w.w_warehouse_sk,
+         w.w_warehouse_name,
+         i.i_item_sk,
+         d.d_moy,
+         STDDEV_SAMP(inv.inv_quantity_on_hand) AS stdev,
+         AVG(inv.inv_quantity_on_hand) AS mean
+  FROM inventory inv
+    INNER JOIN filtered_date d ON inv.inv_date_sk = d.d_date_sk
+    INNER JOIN filtered_item i ON inv.inv_item_sk = i.i_item_sk
+    INNER JOIN filtered_warehouse w ON inv.inv_warehouse_sk = w.w_warehouse_sk
+  WHERE inv.inv_quantity_on_hand BETWEEN 0 AND 200
+  GROUP BY w.w_warehouse_sk, w.w_warehouse_name, i.i_item_sk, d.d_moy
+),
+inv AS (
+  SELECT w_warehouse_name,
+         w_warehouse_sk,
+         i_item_sk,
+         d_moy,
+         stdev,
+         mean,
+         CASE mean WHEN 0 THEN NULL ELSE stdev / mean END AS cov
+  FROM base_agg
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1
+)
+SELECT inv1.w_warehouse_sk,
+       inv1.i_item_sk,
+       inv1.d_moy,
+       inv1.mean,
+       inv1.cov,
+       inv2.w_warehouse_sk,
+       inv2.i_item_sk,
+       inv2.d_moy,
+       inv2.mean,
+       inv2.cov
+FROM inv inv1, inv inv2
+WHERE inv1.i_item_sk = inv2.i_item_sk
+  AND inv1.w_warehouse_sk = inv2.w_warehouse_sk
+  AND inv1.d_moy = 2
+  AND inv2.d_moy = 2 + 1
+ORDER BY inv1.w_warehouse_sk,
+         inv1.i_item_sk,
+         inv1.d_moy,
+         inv1.mean,
+         inv1.cov,
+         inv2.d_moy,
+         inv2.mean,
+         inv2.cov;
+```
+
+**Changes**: Restructured the query using dimension‑prefetch CTEs with explicit JOINs, pushing the month filter (2,3) into the base aggregation to drastically reduce the materialized row count, while preserving all original semantics and defensive guards.
+
+**Expected speedup**: ≥3.0x (primary gains from reducing the inventory‑dimension join to only months 2 and 3, plus better join planning from explicit JOIN syntax).

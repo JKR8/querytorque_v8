@@ -1,0 +1,314 @@
+<reasoning>
+## Step 1: CLASSIFY
+This is a **star-join with late dim filter and multi-bucket time-window aggregation**. It joins two large fact tables (store_sales, store_returns) with two date dimensions and a store dimension. The primary filter is on the returned date (d2). A secondary filter is a 120-day window between sold date (d1) and returned date (d2). Aggregation computes counts of returns in different time buckets based on the difference between two date surrogate keys.
+
+## Step 2: EXPLAIN PLAN ANALYSIS
+**Total time: 3096.5 ms**
+
+Key nodes:
+1. **Nested Loop Inner** (rows=52K, 3081.2 ms) - Dominates runtime (99.5%). This is the top-level join joining the result of the Gather Merge with `date_dim d1`.
+2. **Gather Merge** (rows=67K, 3026.3 ms) - Parallel sort operation that spills to disk (external merge, 6760kB). This is the main bottleneck.
+3. **Sort** (rows=33K per worker, 1975.2 ms per worker) - The spill to disk indicates insufficient `work_mem`.
+4. **Nested Loop Inner** (rows=33K per worker, 1910.5 ms per worker) - Joins store_returns → store_sales → store.
+
+**Cardinality flow**:
+- `date_dim d2` filter: 31 rows (16 per worker) from 37K → high selectivity.
+- `store_returns` index scan: ~2,974 rows per d2 row → ~92K rows total.
+- `store_sales` index scan: 1 row per store_returns row (exact match on composite key).
+- `store` index scan: 1 row per store_sales row.
+- **Row count drops sharply** after d2 filter, but the nested loops explode to 92K rows.
+- The final aggregation reduces 92K rows to ~30 groups (LIMIT 100 shows 30 rows in output).
+
+**What optimizer already handles well**:
+- Uses index-only scans on store_returns and index scans on store_sales/store.
+- Parallel execution (2 workers) for the main join path.
+- Pushes `d_year=2000 AND d_moy=8` into d2 seq scan.
+- Already splits the query into a parallel gather merge section.
+
+**Missed opportunities**:
+1. **Comma-join weakness**: Query uses implicit comma joins. The optimizer may not get optimal join ordering.
+2. **Late dimension filter**: The `d1` filter `d1.d_date BETWEEN (d2.d_date - 120 days) AND d2.d_date` is applied as a JOIN FILTER in the final nested loop, not pushed down early.
+3. **Multiple fact table scans**: The plan scans store_returns once and store_sales once via nested loop index scans. This is reasonable given the join conditions, but the nested loop may be inefficient.
+
+**Scan counts**:
+- `date_dim d2`: 1 scan (seq scan with filter)
+- `store_returns`: 1 scan (index only)
+- `store_sales`: 1 scan per store_returns row (nested loop index scan) → 92K index lookups
+- `store`: 1 scan per store_sales row → 92K index lookups
+- `date_dim d1`: 1 scan per store_sales row → 92K index lookups
+
+The heavy nested loop with 92K index scans on d1 is expensive.
+
+## Step 3: GAP MATCHING
+1. **COMMA_JOIN_WEAKNESS** ✓: Query uses comma-separated implicit joins. Opportunity for explicit JOINs with pre-filtered CTEs.
+2. **CORRELATED_SUBQUERY_PARALYSIS** ✗: No correlated subqueries.
+3. **CROSS_CTE_PREDICATE_BLINDNESS** ✓: The same date_dim d1 is scanned 92K times via nested loop. Could be prefetched.
+4. **NON_EQUI_JOIN_INPUT_BLINDNESS** ✗: The date window is a range condition but not extremely expensive.
+5. **JOIN_ORDER_TRAP** ✓: Plan shows unstable table order (Nested Loop with d2 first, then store_returns, then store_sales, then store, then d1). The implicit join order may be suboptimal.
+
+## Step 4: AGGREGATION TRAP CHECK
+Aggregates are `SUM(CASE WHEN ... THEN 1 ELSE 0 END)`. These are duplicate-safe (1/0 per row). No STDDEV, VARIANCE, or FILTER clauses. The join between store_sales and store_returns is on composite key (ticket_number, item_sk, customer_sk), which should be unique per return item, so no duplication introduced. Restructuring that changes row multiplicity could affect counts.
+
+## Step 5: TRANSFORM SELECTION
+Ranked by expected value:
+
+1. **star_join_prefetch** (dimension_cte_isolate + explicit JOINs): Pre-filter all dimensions into CTEs, convert to explicit JOINs. Addresses COMMA_JOIN_WEAKNESS and reduces nested loop scans. Historical speedup: 3.32x (pg_dimension_prefetch_star).
+2. **late_attribute_binding**: Defer the store join until after aggregation (since store columns are only used in GROUP BY and SELECT, not in filters/joins). Could reduce store index scans from 92K to ~30. Novel transform but low-risk.
+3. **global_predicate_pushdown**: Push the d1 date window filter earlier into the join with d2. Currently applied as late join filter. Could reduce the nested loop fanout.
+4. **single_pass_aggregation**: Already a single aggregation pass. Not applicable.
+
+**Selected 4 diverse strategies**:
+1. **Worker 1**: star_join_prefetch + explicit JOINs (addresses comma-join weakness)
+2. **Worker 2**: late_attribute_binding (defer store join to post-aggregation)
+3. **Worker 3**: global_predicate_pushdown + date_cte_isolate (push d1 window filter early)
+4. **Worker 4** (Exploration): compound strategy: pre-filter d2 and d1 into CTEs with window constraint baked in, then join fact tables.
+
+## Step 6: LOGICAL TREE DESIGN
+For each strategy, define CTE structure and node contracts.
+
+**Critical columns to preserve**:
+- All store columns (s_store_name ... s_zip) for GROUP BY and SELECT.
+- ss_sold_date_sk, sr_returned_date_sk for bucket calculations.
+- Join keys: ss_ticket_number, sr_ticket_number, ss_item_sk, sr_item_sk, ss_customer_sk, sr_customer_sk, ss_store_sk, s_store_sk, ss_sold_date_sk, d1.d_date_sk, sr_returned_date_sk, d2.d_date_sk.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Analyze return timeliness for stores in August 2000, counting returns within 30, 31-60, 61-90, 91-120, and >120 days of sale. All joins are INNER: every store_sales row must have matching store_returns, store, and both date rows. Aggregation uses simple SUM of 1/0 flags, which is duplicate-safe. The date window filter (d1.d_date BETWEEN d2.d_date - 120 days AND d2.d_date) depends on the d2 date, creating a correlation that restricts which d1 rows join.
+
+BOTTLENECK_DIAGNOSIS:
+The query is join-bound with a costly nested loop joining d1 (92K index scans). The Gather Merge sort spills to disk (work_mem too low). Cardinality: d2 (31 rows) → store_returns (92K) → store_sales (92K) → store (92K) → d1 (92K) → aggregate (30 groups). The optimizer already parallelizes well and uses index scans. Logical-tree costs are misleading: the nested loop join filter on d1 date window is 99.5% of runtime, not the sort.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query outputs 10 store columns plus 5 bucket counts.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all store columns, date keys, and join keys used downstream.
+- LITERAL_PRESERVATION: Must preserve d_year=2000, d_moy=8, interval '120 day'.
+- SEMANTIC_EQUIVALENCE: Must return same 30 rows ordered by store attributes.
+- COMMA_JOIN_WEAKNESS: Query uses implicit comma joins; EXPLAIN shows nested loop with d1 joined last.
+- CROSS_CTE_PREDICATE_BLINDNESS: d1 scanned 92K times via nested loop; could be prefetched.
+- JOIN_ORDER_TRAP: Plan shows unstable join order (d2 → store_returns → store_sales → store → d1).
+
+REGRESSION_WARNINGS:
+1. No_nestloop (0.21x regression):
+   CAUSE: Disabling nestloop forced hash joins that spilled to disk on large intermediate results.
+   RULE: Do not SET enable_nestloop=off; the nested loop here uses index scans.
+2. CTE blocks parallelism (0.50x regression):
+   CAUSE: Materialized CTE executed serially, preventing parallel table scans.
+   RULE: Avoid wrapping entire join tree in a single CTE; use CTEs only for small dimension pre-filtering.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch_explicit
+TARGET_LOGICAL_TREE:
+  filtered_d2 -> filtered_d1 -> store_returns_with_d2 -> store_sales_with_returns -> store_join -> aggregation
+NODE_CONTRACTS:
+  filtered_d2:
+    FROM: date_dim d2
+    WHERE: d_year = 2000 AND d_moy = 8
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 31
+    CONSUMERS: filtered_d1, store_returns_with_d2
+  filtered_d1:
+    FROM: date_dim d1, filtered_d2
+    JOIN: d1.d_date BETWEEN (filtered_d2.d_date - INTERVAL '120 day') AND filtered_d2.d_date
+    OUTPUT: d1.d_date_sk, d1.d_date, filtered_d2.d_date_sk as d2_date_sk, filtered_d2.d_date as d2_date
+    EXPECTED_ROWS: ~? (each d2 row matches ~120 d1 rows)
+    CONSUMERS: store_sales_with_returns
+  store_returns_with_d2:
+    FROM: store_returns, filtered_d2
+    JOIN: sr_returned_date_sk = filtered_d2.d_date_sk
+    OUTPUT: sr_ticket_number, sr_item_sk, sr_customer_sk, sr_returned_date_sk, filtered_d2.d_date as return_date
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: store_sales_with_returns
+  store_sales_with_returns:
+    FROM: store_sales, store_returns_with_d2, filtered_d1
+    JOIN: ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk AND ss_sold_date_sk = filtered_d1.d_date_sk
+    OUTPUT: ss_store_sk, ss_sold_date_sk, store_returns_with_d2.return_date, store_returns_with_d2.sr_returned_date_sk
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: store_join
+  store_join:
+    FROM: store_sales_with_returns, store
+    JOIN: ss_store_sk = s_store_sk
+    OUTPUT: s_store_name, s_company_id, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, ss_sold_date_sk, sr_returned_date_sk
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: store_join
+    GROUP BY: all 10 store columns
+    AGGREGATE: SUM(CASE WHEN sr_returned_date_sk - ss_sold_date_sk <= 30 THEN 1 ELSE 0 END) as "30 days", etc.
+    OUTPUT: all 10 store columns plus 5 bucket columns
+    EXPECTED_ROWS: ~30
+    CONSUMERS: final
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: apply pre-filtering of date_dim d2 and d1 into CTEs; convert comma joins to explicit JOINs; ignore the promotion/item dimensions as not present.
+- pg_date_cte_explicit_join: apply date_dim d2 CTE with explicit JOIN syntax; ignore the single-date pattern (we have two dates).
+- pg_materialized_dimension_fact_prefilter: apply MATERIALIZED to filtered_d1 CTE to force early reduction; ignore fact prefiltering (store_sales remains large).
+HAZARD_FLAGS:
+- filtered_d1 CTE may become large if not selective; consider LATERAL join.
+- Explicit JOIN order must respect dependency: filtered_d2 → filtered_d1.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+  filtered_d2 -> store_returns_with_d2 -> store_sales_with_returns -> filtered_d1 -> pre_aggregation -> store_deferred_join -> final_aggregation
+NODE_CONTRACTS:
+  filtered_d2:
+    FROM: date_dim d2
+    WHERE: d_year = 2000 AND d_moy = 8
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 31
+    CONSUMERS: store_returns_with_d2, filtered_d1
+  store_returns_with_d2:
+    FROM: store_returns, filtered_d2
+    JOIN: sr_returned_date_sk = filtered_d2.d_date_sk
+    OUTPUT: sr_ticket_number, sr_item_sk, sr_customer_sk, sr_returned_date_sk, filtered_d2.d_date as return_date
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: store_sales_with_returns
+  store_sales_with_returns:
+    FROM: store_sales, store_returns_with_d2
+    JOIN: ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk
+    OUTPUT: ss_store_sk, ss_sold_date_sk, sr_returned_date_sk
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: filtered_d1
+  filtered_d1:
+    FROM: store_sales_with_returns, date_dim d1, filtered_d2
+    JOIN: ss_sold_date_sk = d1.d_date_sk AND d1.d_date BETWEEN (filtered_d2.d_date - INTERVAL '120 day') AND filtered_d2.d_date
+    OUTPUT: ss_store_sk, ss_sold_date_sk, sr_returned_date_sk
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: pre_aggregation
+  pre_aggregation:
+    FROM: filtered_d1
+    GROUP BY: ss_store_sk
+    AGGREGATE: ss_sold_date_sk, sr_returned_date_sk (arrays or structs? cannot aggregate) - Actually we need to keep the raw rows for bucket calculation. So this node cannot aggregate yet. Instead, we keep all rows but defer store join.
+    OUTPUT: ss_store_sk, ss_sold_date_sk, sr_returned_date_sk
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: store_deferred_join
+  store_deferred_join:
+    FROM: pre_aggregation, store
+    JOIN: ss_store_sk = s_store_sk
+    OUTPUT: all store columns, ss_sold_date_sk, sr_returned_date_sk
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: final_aggregation
+  final_aggregation:
+    FROM: store_deferred_join
+    GROUP BY: all 10 store columns
+    AGGREGATE: bucket sums
+    OUTPUT: all 10 store columns plus 5 bucket columns
+    EXPECTED_ROWS: ~30
+    CONSUMERS: final
+EXAMPLES: early_filter_decorrelate, pg_self_join_decomposition
+EXAMPLE_ADAPTATION:
+- early_filter_decorrelate: push d2 filter early into CTE; ignore decorrelation (no subquery).
+- pg_self_join_decomposition: defer store join to reduce dimension scans; ignore the self-join pattern.
+HAZARD_FLAGS:
+- Deferring store join until after the d1 window filter may not reduce store scans if store join is still on 92K rows.
+- Must ensure all store columns are available for GROUP BY after the deferred join.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: predicate_pushdown_date_window
+TARGET_LOGICAL_TREE:
+  filtered_d2 -> d1_candidate_window -> store_returns_with_d2 -> store_sales_with_dates -> store_join -> aggregation
+NODE_CONTRACTS:
+  filtered_d2:
+    FROM: date_dim d2
+    WHERE: d_year = 2000 AND d_moy = 8
+    OUTPUT: d_date_sk, d_date, (d_date - INTERVAL '120 day') as window_start
+    EXPECTED_ROWS: 31
+    CONSUMERS: d1_candidate_window, store_returns_with_d2
+  d1_candidate_window:
+    FROM: date_dim d1, filtered_d2
+    JOIN: d1.d_date BETWEEN filtered_d2.window_start AND filtered_d2.d_date
+    OUTPUT: d1.d_date_sk, d1.d_date, filtered_d2.d_date_sk as d2_date_sk
+    EXPECTED_ROWS: ~? (each d2 row matches ~120 d1 rows)
+    CONSUMERS: store_sales_with_dates
+  store_returns_with_d2:
+    FROM: store_returns, filtered_d2
+    JOIN: sr_returned_date_sk = filtered_d2.d_date_sk
+    OUTPUT: sr_ticket_number, sr_item_sk, sr_customer_sk, filtered_d2.d_date_sk as return_date_sk
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: store_sales_with_dates
+  store_sales_with_dates:
+    FROM: store_sales, store_returns_with_d2, d1_candidate_window
+    JOIN: ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk AND ss_sold_date_sk = d1_candidate_window.d_date_sk
+    OUTPUT: ss_store_sk, ss_sold_date_sk, return_date_sk
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: store_join
+  store_join:
+    FROM: store_sales_with_dates, store
+    JOIN: ss_store_sk = s_store_sk
+    OUTPUT: all store columns, ss_sold_date_sk, return_date_sk
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: store_join
+    GROUP BY: all store columns
+    AGGREGATE: bucket sums
+    OUTPUT: all store columns plus 5 bucket columns
+    EXPECTED_ROWS: ~30
+    CONSUMERS: final
+EXAMPLES: pg_date_cte_explicit_join, early_filter_decorrelate, pushdown
+EXAMPLE_ADAPTATION:
+- pg_date_cte_explicit_join: isolate d2 filter into CTE and compute window_start; apply explicit JOINs; ignore single-date pattern.
+- early_filter_decorrelate: push d2 filter early and pre-compute window_start; ignore decorrelation.
+- pushdown: push the date window predicate into the d1 CTE definition; ignore other predicates.
+HAZARD_FLAGS:
+- d1_candidate_window may still be large (~120 rows per d2 row = ~3720 rows).
+- Must ensure join between store_returns_with_d2 and d1_candidate_window uses d2_date_sk matching.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: composite_prefilter_parallel_hash
+TARGET_LOGICAL_TREE:
+  filtered_d2 -> d1_window_lateral -> store_returns_filtered -> store_sales_hash_join -> store_hash_join -> aggregation
+NODE_CONTRACTS:
+  filtered_d2:
+    FROM: date_dim d2
+    WHERE: d_year = 2000 AND d_moy = 8
+    OUTPUT: d_date_sk, d_date, (d_date - INTERVAL '120 day') as window_start
+    EXPECTED_ROWS: 31
+    CONSUMERS: d1_window_lateral, store_returns_filtered
+  d1_window_lateral:
+    FROM: filtered_d2, LATERAL (SELECT d_date_sk, d_date FROM date_dim d1 WHERE d1.d_date BETWEEN filtered_d2.window_start AND filtered_d2.d_date) d1
+    OUTPUT: filtered_d2.d_date_sk as d2_date_sk, d1.d_date_sk as d1_date_sk
+    EXPECTED_ROWS: ~? (each d2 row matches ~120 d1 rows)
+    CONSUMERS: store_sales_hash_join
+  store_returns_filtered:
+    FROM: store_returns, filtered_d2
+    JOIN: sr_returned_date_sk = filtered_d2.d_date_sk
+    OUTPUT: sr_ticket_number, sr_item_sk, sr_customer_sk, filtered_d2.d_date_sk as return_date_sk
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: store_sales_hash_join
+  store_sales_hash_join:
+    FROM: store_sales, store_returns_filtered, d1_window_lateral
+    JOIN: ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk AND ss_customer_sk = sr_customer_sk AND ss_sold_date_sk = d1_window_lateral.d1_date_sk
+    OUTPUT: ss_store_sk, ss_sold_date_sk, return_date_sk
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: store_hash_join
+  store_hash_join:
+    FROM: store_sales_hash_join, store
+    JOIN: ss_store_sk = s_store_sk
+    OUTPUT: all store columns, ss_sold_date_sk, return_date_sk
+    EXPECTED_ROWS: ~92K
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: store_hash_join
+    GROUP BY: all store columns
+    AGGREGATE: bucket sums
+    OUTPUT: all store columns plus 5 bucket columns
+    EXPECTED_ROWS: ~30
+    CONSUMERS: final
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, inline_decorrelate_materialized
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: pre-filter d2 and compute window_start; apply explicit JOINs; ignore multi-dimension prefetch.
+- pg_date_cte_explicit_join: use LATERAL to compute d1 window per d2 row; ignore single CTE pattern.
+- inline_decorrelate_materialized: use LATERAL to decorrelate the date window; ignore subquery decorrelation.
+HAZARD_FLAGS:
+- LATERAL may force nested loop execution; but with only 31 d2 rows, it may be efficient.
+- Hash joins may spill due to large row counts; need sufficient work_mem.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines LATERAL for window, explicit JOINs, and hash join hints)

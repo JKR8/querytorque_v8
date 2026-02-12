@@ -1,0 +1,78 @@
+### Part 1: Modified Logic Tree
+```
+QUERY: (single statement)
+└── [MAIN] main_query [!]
+    ├── [~] filtered_sales (CTE)
+    │   ├── SCAN store_sales (single scan)
+    │   ├── JOIN date_dim (filtered: d_year 1998-1999)
+    │   ├── JOIN item (filtered: category OR manager condition)
+    │   ├── JOIN customer
+    │   └── JOIN customer_demographics (filtered: marital/education)
+    ├── [+] ranked_items (CTE)
+    │   └── WINDOW (ROW_NUMBER over tickets by ss_item_sk)
+    ├── [+] pair_generation (CTE)
+    │   └── SELF-JOIN ranked_items (r1.rn < r2.rn with item-specific filters)
+    ├── [+] final_aggregate (CTE)
+    │   ├── JOIN customer_address
+    │   └── AGGREGATE (GROUP BY item1_sk, item2_sk, COUNT)
+    └── [=] SORT (cnt ASC)
+```
+
+### Part 2: Component Payload JSON
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql-16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "shared_materialization", "description": "Replace duplicate store_sales scans with single filtered CTE", "applied_to": ["filtered_sales"]},
+    {"id": "R2", "type": "pair_generation_via_window", "description": "Generate distinct item pairs within transactions using row_number instead of self-join on inequality", "applied_to": ["ranked_items", "pair_generation"]},
+    {"id": "R3", "type": "cte_structure", "description": "Follow exact TARGET_LOGICAL_TREE node structure with specified outputs", "applied_to": ["filtered_sales", "ranked_items", "pair_generation", "final_aggregate"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_ticket_number, ss_item_sk, i_category, i_manager_id, c_current_addr_sk FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk JOIN item ON ss_item_sk = i_item_sk JOIN customer ON ss_customer_sk = c_customer_sk JOIN customer_demographics ON c_current_cdemo_sk = cd_demo_sk WHERE d_year BETWEEN 1998 AND 1999 AND ss_list_price BETWEEN 108 AND 122 AND (i_category IN ('Electronics', 'Jewelry') OR i_manager_id BETWEEN 81 AND 100) AND cd_marital_status = 'S' AND cd_education_status = 'College'",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_item_sk", "i_category", "i_manager_id", "c_current_addr_sk"], "consumes": []}
+      },
+      "ranked_items": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_ticket_number, ss_item_sk, i_category, i_manager_id, c_current_addr_sk, ROW_NUMBER() OVER (PARTITION BY ss_ticket_number ORDER BY ss_item_sk) AS rn FROM filtered_sales",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_item_sk", "i_category", "i_manager_id", "c_current_addr_sk", "rn"], "consumes": ["filtered_sales"]}
+      },
+      "pair_generation": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT r1.ss_item_sk AS item1_sk, r2.ss_item_sk AS item2_sk, r1.c_current_addr_sk FROM ranked_items r1 JOIN ranked_items r2 ON r1.ss_ticket_number = r2.ss_ticket_number WHERE r1.rn < r2.rn AND r1.i_category IN ('Electronics', 'Jewelry') AND r2.i_manager_id BETWEEN 81 AND 100",
+        "interfaces": {"outputs": ["item1_sk", "item2_sk", "c_current_addr_sk"], "consumes": ["ranked_items"]}
+      },
+      "final_aggregate": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT item1_sk, item2_sk, COUNT(*) AS cnt FROM pair_generation JOIN customer_address ON ca_address_sk = c_current_addr_sk GROUP BY item1_sk, item2_sk",
+        "interfaces": {"outputs": ["item1_sk", "item2_sk", "cnt"], "consumes": ["pair_generation"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT item1_sk, item2_sk, cnt FROM final_aggregate ORDER BY cnt",
+        "interfaces": {"outputs": ["item1_sk", "item2_sk", "cnt"], "consumes": ["final_aggregate"]}
+      }
+    },
+    "reconstruction_order": ["filtered_sales", "ranked_items", "pair_generation", "final_aggregate", "main_query"],
+    "assembly_template": "WITH filtered_sales AS ({filtered_sales}), ranked_items AS ({ranked_items}), pair_generation AS ({pair_generation}), final_aggregate AS ({final_aggregate}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Replaced two duplicate store_sales scans with a single CTE filtered by combined conditions, then uses window function within transactions to generate ordered item pairs, applying item-specific filters during the self-join. This eliminates the large cross-join between two item tables and two sales tables.
+
+**Expected speedup:** 2-4x (avoids scanning store_sales twice and eliminates large non-equijoin between item tables)

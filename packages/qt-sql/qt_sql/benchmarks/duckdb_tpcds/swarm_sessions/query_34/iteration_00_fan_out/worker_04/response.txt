@@ -1,0 +1,94 @@
+### Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~4.5K
+    ├── [~] CTE hh_filtered  — isolate household_demographics filter
+    │   └── SCAN (household_demographics)
+    ├── [~] CTE date_filtered  — isolate date_dim filter
+    │   └── SCAN (date_dim)
+    ├── [~] CTE store_filtered  — isolate store filter
+    │   └── SCAN (store)
+    ├── [~] CTE fact_join  — join fact table with dimension CTEs
+    │   └── JOIN (store_sales → hh_filtered, date_filtered, store_filtered)
+    ├── [~] CTE aggregation  — group by ticket+customer
+    │   └── AGG (GROUP BY)
+    ├── [~] CTE customer_join  — join aggregation with customer, filter count range
+    │   └── JOIN (aggregation → customer)
+    └── SORT (c_last_name, c_first_name, c_salutation, c_preferred_cust_flag desc, ss_ticket_number)
+```
+
+**Changes:**
+- Added three dimension CTEs (`hh_filtered`, `date_filtered`, `store_filtered`) to isolate predicate evaluation and guarantee early filtering.
+- Restructured the fact join and aggregation as separate CTEs to mirror the target logical tree.
+- Preserved the original join order (fact table first) to maintain DuckDB's join reordering flexibility.
+
+### Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb_v1.4.3",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter dimension tables into CTEs to guarantee early predicate evaluation before fact join.", "applied_to": ["hh_filtered", "date_filtered", "store_filtered"]},
+    {"id": "R2", "type": "materialize_cte", "description": "Use CTE structure to separate dimension filtering, fact join, aggregation, and customer join for clarity and predicate pushdown control.", "applied_to": ["fact_join", "aggregation", "customer_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "hh_filtered": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT hd_demo_sk, hd_buy_potential, hd_vehicle_count, hd_dep_count FROM household_demographics WHERE (hd_buy_potential = '1001-5000' OR hd_buy_potential = '0-500') AND hd_vehicle_count > 0 AND (CASE WHEN hd_vehicle_count > 0 THEN hd_dep_count / hd_vehicle_count ELSE NULL END) > 1.2",
+        "interfaces": {"outputs": ["hd_demo_sk", "hd_buy_potential", "hd_vehicle_count", "hd_dep_count"], "consumes": []}
+      },
+      "date_filtered": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_dom, d_year FROM date_dim WHERE (d_dom BETWEEN 1 AND 3 OR d_dom BETWEEN 25 AND 28) AND d_year IN (1998, 1999, 2000)",
+        "interfaces": {"outputs": ["d_date_sk", "d_dom", "d_year"], "consumes": []}
+      },
+      "store_filtered": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_store_sk, s_county FROM store WHERE s_county IN ('Ziebach County', 'Daviess County', 'Walker County', 'Richland County', 'Barrow County', 'Franklin Parish', 'Williamson County', 'Luce County')",
+        "interfaces": {"outputs": ["s_store_sk", "s_county"], "consumes": []}
+      },
+      "fact_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk FROM store_sales INNER JOIN hh_filtered ON store_sales.ss_hdemo_sk = hh_filtered.hd_demo_sk INNER JOIN date_filtered ON store_sales.ss_sold_date_sk = date_filtered.d_date_sk INNER JOIN store_filtered ON store_sales.ss_store_sk = store_filtered.s_store_sk",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk"], "consumes": ["hh_filtered", "date_filtered", "store_filtered"]}
+      },
+      "aggregation": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, COUNT(*) AS cnt FROM fact_join GROUP BY ss_ticket_number, ss_customer_sk",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "cnt"], "consumes": ["fact_join"]}
+      },
+      "customer_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, aggregation.ss_ticket_number, aggregation.cnt FROM aggregation INNER JOIN customer ON aggregation.ss_customer_sk = customer.c_customer_sk WHERE aggregation.cnt BETWEEN 15 AND 20",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "c_salutation", "c_preferred_cust_flag", "ss_ticket_number", "cnt"], "consumes": ["aggregation"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt FROM customer_join ORDER BY c_last_name, c_first_name, c_salutation, c_preferred_cust_flag DESC, ss_ticket_number",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "c_salutation", "c_preferred_cust_flag", "ss_ticket_number", "cnt"], "consumes": ["customer_join"]}
+      }
+    },
+    "reconstruction_order": ["hh_filtered", "date_filtered", "store_filtered", "fact_join", "aggregation", "customer_join", "main_query"],
+    "assembly_template": "WITH hh_filtered AS ({hh_filtered}), date_filtered AS ({date_filtered}), store_filtered AS ({store_filtered}), fact_join AS ({fact_join}), aggregation AS ({aggregation}), customer_join AS ({customer_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Isolated dimension filtering into CTEs to guarantee early predicate evaluation, then joined through the fact table. This avoids cross-joining dimensions and preserves predicate pushdown control.
+
+**Expected speedup:** Moderate (1.2–1.5×) due to early reduction of dimension rows before the large fact join, with minimal CTE overhead.

@@ -1,0 +1,114 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] consolidated_store_sales  [+]  Cost: 15%  Rows: ~?  — Single-pass consolidation of store_sales for years 2000-2003, grouping by customer/item/date
+│   ├── SCAN (store_sales, date_dim, customer, item)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── JOIN (ss_customer_sk = c_customer_sk)
+│   ├── JOIN (ss_item_sk = i_item_sk)
+│   ├── FILTER (d_year IN (2000, 2001, 2002, 2003))
+│   ├── AGG (GROUP BY c_customer_sk, i_item_sk, d_date, SUBSTR(i_item_desc,1,30))
+│   └── OUTPUT (c_customer_sk, i_item_sk, d_date, itemdesc, cust_sales, transaction_count)
+├── [CTE] frequent_items_cte  [+]  Cost: 5%  Rows: ~1K  — Items sold more than 4 times per day
+│   ├── SCAN (consolidated_store_sales)
+│   ├── AGG (GROUP BY itemdesc, i_item_sk, d_date)
+│   ├── FILTER (transaction_count > 4)
+│   └── OUTPUT (item_sk, itemdesc, solddate, cnt)
+├── [CTE] top_customers_cte  [+]  Cost: 5%  Rows: ~1K  — Top 5% customers by store sales
+│   ├── SCAN (consolidated_store_sales)
+│   ├── AGG (GROUP BY c_customer_sk)
+│   ├── FILTER (cust_sales > (95/100.0) * (SELECT MAX(cust_sales) FROM consolidated_store_sales))
+│   └── OUTPUT (c_customer_sk, ssales)
+├── [CTE] main_union  [+]  Cost: 35%  Rows: ~?  — Union of May 2000 catalog and web sales for frequent items and top customers
+│   ├── SCAN (catalog_sales, date_dim, frequent_items_cte, top_customers_cte, customer)
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── JOIN (cs_item_sk = item_sk)
+│   ├── JOIN (cs_bill_customer_sk = top_customers_cte.c_customer_sk)
+│   ├── JOIN (cs_bill_customer_sk = customer.c_customer_sk)
+│   ├── FILTER (d_year = 2000)
+│   ├── FILTER (d_moy = 5)
+│   ├── UNION ALL
+│   ├── SCAN (web_sales, date_dim, frequent_items_cte, top_customers_cte, customer)
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── JOIN (ws_item_sk = item_sk)
+│   ├── JOIN (ws_bill_customer_sk = top_customers_cte.c_customer_sk)
+│   ├── JOIN (ws_bill_customer_sk = customer.c_customer_sk)
+│   ├── FILTER (d_year = 2000)
+│   ├── FILTER (d_moy = 5)
+│   └── OUTPUT (c_last_name, c_first_name, sales)
+├── [CTE] group_by  [+]  Cost: 10%  Rows: ~?  — Aggregate sales by customer name
+│   ├── SCAN (main_union)
+│   ├── AGG (GROUP BY c_last_name, c_first_name)
+│   └── OUTPUT (c_last_name, c_first_name, sales)
+└── [MAIN] main_query  [~]  Cost: 30%  Rows: 100  — Final ordering and limit
+    ├── SCAN (group_by)
+    ├── ORDER BY (c_last_name, c_first_name, sales)
+    └── OUTPUT (c_last_name, c_first_name, sales)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_aggregation", "description": "Consolidate three store_sales scans (frequent_ss_items, max_store_sales, best_ss_customer) into one CTE that outputs customer sales and item transaction counts", "applied_to": ["consolidated_store_sales"]},
+    {"id": "R2", "type": "hazard_fix", "description": "Fixed circular reference in top_customers_cte HAVING clause by computing max in separate scalar subquery", "applied_to": ["top_customers_cte"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "consolidated_store_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss.c_customer_sk, ss.i_item_sk, d_date, SUBSTR(i_item_desc,1,30) AS itemdesc, SUM(ss_quantity * ss_sales_price) AS cust_sales, COUNT(*) AS transaction_count FROM store_sales, date_dim, customer, item WHERE ss_sold_date_sk = d_date_sk AND ss_customer_sk = c_customer_sk AND ss_item_sk = i_item_sk AND d_year IN (2000, 2001, 2002, 2003) GROUP BY ss.c_customer_sk, ss.i_item_sk, d_date, SUBSTR(i_item_desc,1,30)",
+        "interfaces": {"outputs": ["c_customer_sk", "i_item_sk", "d_date", "itemdesc", "cust_sales", "transaction_count"], "consumes": []}
+      },
+      "frequent_items_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk AS item_sk, itemdesc, d_date AS solddate, transaction_count AS cnt FROM consolidated_store_sales GROUP BY itemdesc, i_item_sk, d_date HAVING transaction_count > 4",
+        "interfaces": {"outputs": ["item_sk", "itemdesc", "solddate", "cnt"], "consumes": ["consolidated_store_sales"]}
+      },
+      "top_customers_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_sk, cust_sales AS ssales FROM consolidated_store_sales GROUP BY c_customer_sk HAVING cust_sales > (95/100.0) * (SELECT MAX(cust_sales) FROM consolidated_store_sales)",
+        "interfaces": {"outputs": ["c_customer_sk", "ssales"], "consumes": ["consolidated_store_sales"]}
+      },
+      "main_union": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, cs_quantity * cs_list_price AS sales FROM catalog_sales, date_dim, frequent_items_cte, top_customers_cte, customer WHERE d_year = 2000 AND d_moy = 5 AND cs_sold_date_sk = d_date_sk AND cs_item_sk = item_sk AND cs_bill_customer_sk = top_customers_cte.c_customer_sk AND cs_bill_customer_sk = customer.c_customer_sk UNION ALL SELECT c_last_name, c_first_name, ws_quantity * ws_list_price AS sales FROM web_sales, date_dim, frequent_items_cte, top_customers_cte, customer WHERE d_year = 2000 AND d_moy = 5 AND ws_sold_date_sk = d_date_sk AND ws_item_sk = item_sk AND ws_bill_customer_sk = top_customers_cte.c_customer_sk AND ws_bill_customer_sk = customer.c_customer_sk",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "sales"], "consumes": ["frequent_items_cte", "top_customers_cte"]}
+      },
+      "group_by": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, SUM(sales) AS sales FROM main_union GROUP BY c_last_name, c_first_name",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "sales"], "consumes": ["main_union"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, sales FROM group_by ORDER BY c_last_name, c_first_name, sales LIMIT 100",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "sales"], "consumes": ["group_by"]}
+      }
+    },
+    "reconstruction_order": ["consolidated_store_sales", "frequent_items_cte", "top_customers_cte", "main_union", "group_by", "main_query"],
+    "assembly_template": "WITH consolidated_store_sales AS ({consolidated_store_sales}), frequent_items_cte AS ({frequent_items_cte}), top_customers_cte AS ({top_customers_cte}), main_union AS ({main_union}), group_by AS ({group_by}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Changes
+
+**Structural change:** Consolidated three separate store_sales scans (frequent_ss_items, max_store_sales calculation, best_ss_customer base data) into a single CTE that outputs both customer sales aggregates and item transaction counts in one pass. Fixed circular reference in top_customers_cte by computing max(cust_sales) in a scalar subquery rather than referencing the same CTE in the HAVING clause.
+
+**Expected speedup:** ~4.5x (single_pass_aggregation pattern) by eliminating redundant store_sales scans with identical date filters (2000-2003).

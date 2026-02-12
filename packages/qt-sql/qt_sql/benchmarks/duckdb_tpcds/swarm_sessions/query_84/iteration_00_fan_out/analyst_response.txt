@@ -1,0 +1,290 @@
+<reasoning>
+CLASSIFY: This is a star-join with late dim filter. The query joins a central fact table (store_returns) with multiple dimension tables (customer, customer_address, customer_demographics, household_demographics, income_band). Filters exist on dimension tables (city, income band bounds). The fact table is scanned once, but with a derived range filter from the join.
+
+EXPLAIN PLAN ANALYSIS:
+- Total execution time: 174ms
+- Dominant cost: SEQ_SCAN on store_returns (125.3ms, 72% of total time)
+- Second highest: SEQ_SCAN on customer (14.5ms, 8%)
+- Hash joins: 17.4ms + 8.4ms + others <5ms each
+- Row reduction:
+  - customer_address: 750K → 2,046 rows (city filter)
+  - income_band: 20 → 4 rows (bounds filter)
+  - household_demographics: 7,200 → 1,440 rows (no filter shown, but join reduces)
+  - customer: 2.5M → 499K rows (no direct filter, only join)
+  - customer_demographics: 23.0M → 1.9M rows (range filter derived)
+  - store_returns: 34.5M → 2.8M rows (range filter derived)
+- Sharpest row drop: customer_address and income_band have high selectivity.
+- Missed opportunity: The store_returns scan filters by a wide range (sr_cdemo_sk>=4 AND sr_cdemo_sk<=1920791) instead of using the actual filtered cd_demo_sk values from the dimension joins. The optimizer pushes the range but cannot push the exact list of keys because it's computed after the join.
+- Scans per table: Each table scanned once (no repeated scans).
+- CTE materialization: No CTEs in original query.
+
+GAP MATCHING:
+1. CROSS_CTE_PREDICATE_BLINDNESS: The dimension filters (city, income bounds) are applied early, but the store_returns scan uses a derived range rather than the exact key set. Creating CTEs that pre-filter dimensions and compute the exact cd_demo_sk set could allow a more selective join with store_returns.
+2. REDUNDANT_SCAN_ELIMINATION: Not applicable - no repeated scans.
+3. CORRELATED_SUBQUERY_PARALYSIS: Not applicable - no correlated subqueries.
+4. CROSS_COLUMN_OR_DECOMPOSITION: Not applicable - no OR conditions.
+
+Engine already handles: INTRA_SCAN_PREDICATE_PUSHDOWN (filters pushed into scans), HASH_JOIN_SELECTION (good join choice).
+
+AGGREGATION TRAP CHECK: No aggregates in query.
+
+TRANSFORM SELECTION:
+1. star_join_prefetch (dimension_cte_isolate + prefetch_fact_join): Pre-filter all dimension tables into CTEs, compute exact cd_demo_sk set, then join with store_returns. Attacks CROSS_CTE_PREDICATE_BLINDNESS.
+2. early_filter: Focus on filtering small dimensions first (customer_address, income_band) before joining with larger tables. Attacks same gap but different emphasis.
+3. single_pass_aggregation: Not applicable but can adapt to consolidate dimension filtering into a single CTE that computes the exact key set.
+4. Exploration: Try a compound strategy that creates a CTE with the exact cd_demo_sk list from filtered dimensions, then uses it in a semi-join with store_returns (potentially using EXISTS instead of range filter).
+
+LOGICAL TREE DESIGN:
+For star_join_prefetch: Create CTEs for filtered dimensions, join them to get cd_demo_sk list, then join with store_returns.
+For early_filter: Similar but emphasize early filtering of customer_address and income_band.
+For dimension_cte_isolate: Create separate CTEs for each dimension table.
+For exploration: Create a CTE with exact cd_demo_sk values and use EXISTS or IN list.
+
+All strategies must output same columns: customer_id, customername, ordered by c_customer_id, limit 100.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+List customers residing in Oakwood whose household income band falls within 5806-55806 and have matching customer demographics in store returns. All joins are INNER (intersection) requiring matches in all six tables. No aggregation functions exist, so no aggregation traps. Filter dependencies: city filter applies to customer_address, income bounds to income_band, and both propagate via join keys (ca_address_sk, hd_income_band_sk) to customer and household_demographics respectively.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound on store_returns (125.3ms, 72% of total). The optimizer pushes a range filter (sr_cdemo_sk>=4 AND sr_cdemo_sk<=1920791) derived from join equivalences, but this range is wide (covers 2.8M of 34.5M rows). Cardinality flow: dimension filters reduce customer_address to 2,046 rows and income_band to 4 rows, but the store_returns scan remains large due to imprecise range propagation. The optimizer already handles predicate pushdown into scans and hash join selection well.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output customer_id and customername exactly as original.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (join keys, customer attributes).
+- LITERAL_PRESERVATION: Must preserve 'Oakwood', 5806, 50000 exactly.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows in same order.
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows store_returns scan uses derived range instead of exact cd_demo_sk list from filtered dimensions.
+
+REGRESSION_WARNINGS:
+1. dimension_cte_isolate (0.0076x regression):
+   CAUSE: Cross-joining 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join 3+ dimension CTEs in this query; ensure each CTE joins directly via foreign keys.
+2. prefetch_fact_join (0.50x regression):
+   CAUSE: Baseline runtime <100ms, CTE overhead dominated savings.
+   RULE: This query's baseline is 174ms, so CTE overhead may still be acceptable but must be minimized.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  filtered_ca -> filtered_ib -> filtered_hd -> filtered_c -> filtered_cd -> sr_join -> top_n
+NODE_CONTRACTS:
+  filtered_ca:
+    FROM: customer_address
+    WHERE: ca_city = 'Oakwood'
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 2,046
+    CONSUMERS: filtered_c
+  filtered_ib:
+    FROM: income_band
+    WHERE: ib_lower_bound >= 5806 AND ib_upper_bound <= 55806
+    OUTPUT: ib_income_band_sk
+    EXPECTED_ROWS: 4
+    CONSUMERS: filtered_hd
+  filtered_hd:
+    FROM: household_demographics
+    JOIN: hd_income_band_sk = filtered_ib.ib_income_band_sk
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: ~1,440
+    CONSUMERS: filtered_c
+  filtered_c:
+    FROM: customer
+    JOIN: c_current_addr_sk = filtered_ca.ca_address_sk
+    JOIN: c_current_hdemo_sk = filtered_hd.hd_demo_sk
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_current_cdemo_sk
+    EXPECTED_ROWS: ~795
+    CONSUMERS: filtered_cd
+  filtered_cd:
+    FROM: customer_demographics
+    JOIN: cd_demo_sk = filtered_c.c_current_cdemo_sk
+    OUTPUT: cd_demo_sk, filtered_c.c_customer_id, filtered_c.c_first_name, filtered_c.c_last_name
+    EXPECTED_ROWS: ~783
+    CONSUMERS: sr_join
+  sr_join:
+    FROM: filtered_cd
+    JOIN: store_returns ON sr_cdemo_sk = filtered_cd.cd_demo_sk
+    OUTPUT: c_customer_id, COALESCE(c_last_name,'') || ', ' || COALESCE(c_first_name,'') AS customername
+    EXPECTED_ROWS: 1,158
+    CONSUMERS: top_n
+  top_n:
+    FROM: sr_join
+    ORDER BY: c_customer_id ASC
+    LIMIT: 100
+    OUTPUT: customer_id, customername
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, prefetch_fact_join, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply pre-filtering of each dimension table into separate CTEs; ignore cross-joining them - join sequentially via keys.
+- prefetch_fact_join: Apply the CTE chain that progressively reduces data; ignore the multi-fact aspect (only one fact table).
+- multi_dimension_prefetch: Apply pre-filtering of multiple dimensions (customer_address, income_band) before joining; ignore store pre-filtering (not in query).
+HAZARD_FLAGS:
+- Risk of CTE materialization overhead on small intermediate results (~795 rows).
+- Must preserve all original join conditions exactly.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: early_filter
+TARGET_LOGICAL_TREE:
+  ca_ib_filtered -> hd_join -> c_join -> cd_join -> sr_join -> top_n
+NODE_CONTRACTS:
+  ca_ib_filtered:
+    FROM: customer_address, income_band
+    WHERE: ca_city = 'Oakwood' AND ib_lower_bound >= 5806 AND ib_upper_bound <= 55806
+    OUTPUT: ca_address_sk, ib_income_band_sk
+    EXPECTED_ROWS: 2,046 * 4 = 8,184 (Cartesian product, but will be reduced by joins)
+    CONSUMERS: hd_join, c_join
+  hd_join:
+    FROM: household_demographics
+    JOIN: hd_income_band_sk = ca_ib_filtered.ib_income_band_sk
+    OUTPUT: hd_demo_sk, ca_address_sk
+    EXPECTED_ROWS: ~1,440
+    CONSUMERS: c_join
+  c_join:
+    FROM: customer
+    JOIN: c_current_addr_sk = ca_ib_filtered.ca_address_sk
+    JOIN: c_current_hdemo_sk = hd_join.hd_demo_sk
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_current_cdemo_sk
+    EXPECTED_ROWS: ~795
+    CONSUMERS: cd_join
+  cd_join:
+    FROM: customer_demographics
+    JOIN: cd_demo_sk = c_join.c_current_cdemo_sk
+    OUTPUT: cd_demo_sk, c_customer_id, c_first_name, c_last_name
+    EXPECTED_ROWS: ~783
+    CONSUMERS: sr_join
+  sr_join:
+    FROM: cd_join
+    JOIN: store_returns ON sr_cdemo_sk = cd_demo_sk
+    OUTPUT: c_customer_id, COALESCE(c_last_name,'') || ', ' || COALESCE(c_first_name,'') AS customername
+    EXPECTED_ROWS: 1,158
+    CONSUMERS: top_n
+  top_n:
+    FROM: sr_join
+    ORDER BY: c_customer_id ASC
+    LIMIT: 100
+    OUTPUT: customer_id, customername
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: early_filter, pushdown, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- early_filter: Apply filtering of small dimension tables (customer_address, income_band) first; ignore the fact that date_dim is not present.
+- pushdown: Consolidate filters into the earliest possible scans; ignore the scalar subquery consolidation aspect.
+- date_cte_isolate: Apply the principle of isolating selective dimension filters into separate CTEs; ignore date-specific patterns.
+HAZARD_FLAGS:
+- Cartesian product between customer_address and income_band in ca_ib_filtered (8,184 rows) may be inefficient if not quickly reduced by joins.
+- Must ensure join order reduces rows quickly.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+  ca_cte -> ib_cte -> hd_cte -> c_cte -> cd_cte -> combined -> sr_join -> top_n
+NODE_CONTRACTS:
+  ca_cte:
+    FROM: customer_address
+    WHERE: ca_city = 'Oakwood'
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 2,046
+    CONSUMERS: combined
+  ib_cte:
+    FROM: income_band
+    WHERE: ib_lower_bound >= 5806 AND ib_upper_bound <= 55806
+    OUTPUT: ib_income_band_sk
+    EXPECTED_ROWS: 4
+    CONSUMERS: combined
+  hd_cte:
+    FROM: household_demographics
+    OUTPUT: hd_demo_sk, hd_income_band_sk
+    EXPECTED_ROWS: 7,200
+    CONSUMERS: combined
+  c_cte:
+    FROM: customer
+    OUTPUT: c_customer_id, c_first_name, c_last_name, c_current_addr_sk, c_current_hdemo_sk, c_current_cdemo_sk
+    EXPECTED_ROWS: 2.5M
+    CONSUMERS: combined
+  cd_cte:
+    FROM: customer_demographics
+    OUTPUT: cd_demo_sk
+    EXPECTED_ROWS: 23.0M
+    CONSUMERS: combined
+  combined:
+    FROM: ca_cte, ib_cte, hd_cte, c_cte, cd_cte
+    JOIN: c_cte.c_current_addr_sk = ca_cte.ca_address_sk
+    JOIN: hd_cte.hd_income_band_sk = ib_cte.ib_income_band_sk
+    JOIN: c_cte.c_current_hdemo_sk = hd_cte.hd_demo_sk
+    JOIN: cd_cte.cd_demo_sk = c_cte.c_current_cdemo_sk
+    OUTPUT: c_customer_id, c_first_name, c_last_name, cd_demo_sk
+    EXPECTED_ROWS: ~783
+    CONSUMERS: sr_join
+  sr_join:
+    FROM: combined
+    JOIN: store_returns ON sr_cdemo_sk = combined.cd_demo_sk
+    OUTPUT: c_customer_id, COALESCE(c_last_name,'') || ', ' || COALESCE(c_first_name,'') AS customername
+    EXPECTED_ROWS: 1,158
+    CONSUMERS: top_n
+  top_n:
+    FROM: sr_join
+    ORDER BY: c_customer_id ASC
+    LIMIT: 100
+    OUTPUT: customer_id, customername
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: dimension_cte_isolate, multi_dimension_prefetch, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply creating separate CTEs for each dimension table; ignore the cross-join hazard by joining sequentially via keys.
+- multi_dimension_prefetch: Apply pre-filtering multiple dimensions before joining; ignore the fact that some CTEs (hd_cte, c_cte, cd_cte) are unfiltered.
+- date_cte_isolate: Apply the pattern of isolating dimension filters; ignore date-specific aspects.
+HAZARD_FLAGS:
+- Unfiltered CTEs (hd_cte, c_cte, cd_cte) may materialize large tables (7.2M, 2.5M, 23.0M rows) causing high overhead.
+- Must ensure join conditions are correctly specified to avoid Cartesian explosion.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: exact_key_semi_join
+TARGET_LOGICAL_TREE:
+  exact_keys -> sr_filter -> enrich -> top_n
+NODE_CONTRACTS:
+  exact_keys:
+    FROM: customer, customer_address, household_demographics, income_band, customer_demographics
+    JOIN: c_current_addr_sk = ca_address_sk
+    JOIN: hd_income_band_sk = ib_income_band_sk
+    JOIN: c_current_hdemo_sk = hd_demo_sk
+    JOIN: cd_demo_sk = c_current_cdemo_sk
+    WHERE: ca_city = 'Oakwood' AND ib_lower_bound >= 5806 AND ib_upper_bound <= 55806
+    OUTPUT: c_customer_id, c_first_name, c_last_name, cd_demo_sk
+    EXPECTED_ROWS: ~783
+    CONSUMERS: sr_filter
+  sr_filter:
+    FROM: exact_keys
+    WHERE: EXISTS (SELECT 1 FROM store_returns WHERE sr_cdemo_sk = exact_keys.cd_demo_sk)
+    OUTPUT: c_customer_id, c_first_name, c_last_name
+    EXPECTED_ROWS: ~783 (but actual matching ~1,158? Need distinct)
+    CONSUMERS: enrich
+  enrich:
+    FROM: sr_filter
+    OUTPUT: c_customer_id, COALESCE(c_last_name,'') || ', ' || COALESCE(c_first_name,'') AS customername
+    EXPECTED_ROWS: same as sr_filter
+    CONSUMERS: top_n
+  top_n:
+    FROM: enrich
+    ORDER BY: c_customer_id ASC
+    LIMIT: 100
+    OUTPUT: customer_id, customername
+    EXPECTED_ROWS: 100
+    CONSUMERS: final
+EXAMPLES: intersect_to_exists, decorrelate, early_filter
+EXAMPLE_ADAPTATION:
+- intersect_to_exists: Apply converting a join pattern to EXISTS for short-circuiting; ignore INTERSECT-specific aspects.
+- decorrelate: This is the inverse - we're introducing a correlated EXISTS, but the pattern of pre-computing keys applies.
+- early_filter: Apply filtering dimensions early in exact_keys CTE; ignore the join structure.
+HAZARD_FLAGS:
+- EXISTS may force nested loop join instead of hash join, potentially slower.
+- Need to ensure output matches original exactly (same 100 rows, same order).
+- DISTINCT may be needed if customer has multiple store returns.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

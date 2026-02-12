@@ -1,0 +1,96 @@
+## Modified Logic Tree
+
+```diff
+QUERY: (single statement)
+└── [~] main_query
+    ├── [+] filtered_dates CTE
+    │   └── [~] SCAN date_dim → d_date_sk, d_date
+    │       └── [=] FILTER d_month_seq BETWEEN 1200 AND 1211
+    ├── [+] filtered_customers CTE
+    │   └── [~] SCAN customer → c_customer_sk, c_last_name, c_first_name
+    │       └── [=] FILTER c_birth_month IN (1, 2, 5, 12)
+    ├── [+] store_sales_join CTE
+    │   ├── [~] JOIN store_sales ↔ filtered_dates ↔ filtered_customers
+    │   └── [~] OUTPUT c_last_name, c_first_name, d_date
+    ├── [+] catalog_sales_join CTE
+    │   ├── [~] JOIN catalog_sales ↔ filtered_dates ↔ filtered_customers
+    │   └── [~] OUTPUT c_last_name, c_first_name, d_date
+    ├── [+] web_sales_join CTE
+    │   ├── [~] JOIN web_sales ↔ filtered_dates ↔ filtered_customers
+    │   └── [~] OUTPUT c_last_name, c_first_name, d_date
+    ├── [=] INTERSECT (3 inputs)
+    └── [=] COUNT(*) → LIMIT 100
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL 16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefetch", "description": "Pre-filter date_dim and customer into CTEs to create small hash tables", "applied_to": ["filtered_dates", "filtered_customers"]},
+    {"id": "R2", "type": "explicit_join_syntax", "description": "Convert comma-separated joins to explicit INNER JOINs", "applied_to": ["store_sales_join", "catalog_sales_join", "web_sales_join"]},
+    {"id": "R3", "type": "shared_dimension_ctes", "description": "Reuse dimension CTEs across all three channel subqueries", "applied_to": ["store_sales_join", "catalog_sales_join", "web_sales_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1200 AND 1200 + 11",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "filtered_customers": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_customer_sk, c_last_name, c_first_name FROM customer WHERE c_birth_month IN (1, 2, 5, 12)",
+        "interfaces": {"outputs": ["c_customer_sk", "c_last_name", "c_first_name"], "consumes": []}
+      },
+      "store_sales_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_last_name, c_first_name, d_date FROM store_sales INNER JOIN filtered_dates ON store_sales.ss_sold_date_sk = filtered_dates.d_date_sk INNER JOIN filtered_customers ON store_sales.ss_customer_sk = filtered_customers.c_customer_sk WHERE ss_list_price BETWEEN 193 AND 252 AND ss_wholesale_cost BETWEEN 35 AND 55",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date"], "consumes": ["filtered_dates", "filtered_customers"]}
+      },
+      "catalog_sales_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_last_name, c_first_name, d_date FROM catalog_sales INNER JOIN filtered_dates ON catalog_sales.cs_sold_date_sk = filtered_dates.d_date_sk INNER JOIN filtered_customers ON catalog_sales.cs_bill_customer_sk = filtered_customers.c_customer_sk WHERE cs_list_price BETWEEN 193 AND 252 AND cs_wholesale_cost BETWEEN 35 AND 55",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date"], "consumes": ["filtered_dates", "filtered_customers"]}
+      },
+      "web_sales_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c_last_name, c_first_name, d_date FROM web_sales INNER JOIN filtered_dates ON web_sales.ws_sold_date_sk = filtered_dates.d_date_sk INNER JOIN filtered_customers ON web_sales.ws_bill_customer_sk = filtered_customers.c_customer_sk WHERE ws_list_price BETWEEN 193 AND 252 AND ws_wholesale_cost BETWEEN 35 AND 55",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date"], "consumes": ["filtered_dates", "filtered_customers"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(*) FROM (SELECT c_last_name, c_first_name, d_date FROM store_sales_join INTERSECT SELECT c_last_name, c_first_name, d_date FROM catalog_sales_join INTERSECT SELECT c_last_name, c_first_name, d_date FROM web_sales_join) hot_cust LIMIT 100",
+        "interfaces": {"outputs": ["count"], "consumes": ["store_sales_join", "catalog_sales_join", "web_sales_join"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_customers", "store_sales_join", "catalog_sales_join", "web_sales_join", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), filtered_customers AS ({filtered_customers}), store_sales_join AS ({store_sales_join}), catalog_sales_join AS ({catalog_sales_join}), web_sales_join AS ({web_sales_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL work_mem = '32MB'",
+    "SET LOCAL enable_nestloop = off",
+    "SET LOCAL enable_hashjoin = on",
+    "SET LOCAL enable_mergejoin = off",
+    "SET LOCAL from_collapse_limit = 1",
+    "SET LOCAL join_collapse_limit = 1"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes:** Isolated selective dimension filters (date_dim, customer) into separate CTEs and converted all comma joins to explicit INNER JOINs, preserving exact intersection semantics. The CTEs create small hash tables that PostgreSQL can efficiently probe during the three large sales table joins.
+
+**Expected speedup:** 2.5–3.5× from reduced random I/O and better join planning with pre‑materialized dimension hash tables. The SET LOCAL configuration prevents nested‑loop fallbacks and preserves the planned join order while providing ample memory for hash operations.

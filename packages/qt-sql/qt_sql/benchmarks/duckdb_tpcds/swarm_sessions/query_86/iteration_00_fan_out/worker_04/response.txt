@@ -1,0 +1,76 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: 100 — Rewritten to use explicit CTE chain matching target logical tree
+    ├── CTE filtered_dates [=]
+    ├── CTE fact_with_dates [=]
+    ├── CTE leaf_agg [=]
+    ├── CTE rollup_from_leaves [=]
+    ├── CTE final_window [=]
+    └── SELECT from final_window with ORDER BY/LIMIT [=]
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "cte_decomposition", "description": "Decomposed original join-aggregation into explicit CTE chain following target logical tree", "applied_to": ["filtered_dates", "fact_with_dates", "leaf_agg", "rollup_from_leaves", "final_window", "main_query"]},
+    {"id": "R2", "type": "single_pass_aggregation", "description": "Pre-aggregate at leaf (category, class) level before rollup to reduce input size to grouping", "applied_to": ["leaf_agg"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1224 AND 1224 + 11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "fact_with_dates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_item_sk, ws_net_paid FROM web_sales INNER JOIN filtered_dates ON ws_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ws_item_sk", "ws_net_paid"], "consumes": ["filtered_dates"]}
+      },
+      "leaf_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i.i_category, i.i_class, SUM(fwd.ws_net_paid) AS leaf_total FROM fact_with_dates fwd INNER JOIN item i ON fwd.ws_item_sk = i.i_item_sk GROUP BY i.i_category, i.i_class",
+        "interfaces": {"outputs": ["i_category", "i_class", "leaf_total"], "consumes": ["fact_with_dates"]}
+      },
+      "rollup_from_leaves": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_category, i_class, SUM(leaf_total) AS total_sum, GROUPING(i_category) AS gcat, GROUPING(i_class) AS gcls FROM leaf_agg GROUP BY ROLLUP(i_category, i_class)",
+        "interfaces": {"outputs": ["i_category", "i_class", "total_sum", "gcat", "gcls"], "consumes": ["leaf_agg"]}
+      },
+      "final_window": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT total_sum, i_category, i_class, (gcat + gcls) AS lochierarchy, RANK() OVER (PARTITION BY (gcat + gcls), CASE WHEN gcls = 0 THEN i_category END ORDER BY total_sum DESC) AS rank_within_parent FROM rollup_from_leaves",
+        "interfaces": {"outputs": ["total_sum", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["rollup_from_leaves"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT total_sum, i_category, i_class, lochierarchy, rank_within_parent FROM final_window ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category END, rank_within_parent LIMIT 100",
+        "interfaces": {"outputs": ["total_sum", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["final_window"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "fact_with_dates", "leaf_agg", "rollup_from_leaves", "final_window", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), fact_with_dates AS ({fact_with_dates}), leaf_agg AS ({leaf_agg}), rollup_from_leaves AS ({rollup_from_leaves}), final_window AS ({final_window}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Decomposed the original single query into a chain of CTEs matching the target logical tree. Key transformation is pre-aggregating at leaf (category, class) level before computing the ROLLUP, reducing the 1.4M input rows to ~160 before grouping.
+
+**Expected speedup:** 2-3x due to reduced data movement into ROLLUP aggregation and maintained predicate pushdown through CTE boundaries.

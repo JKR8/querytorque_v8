@@ -1,0 +1,81 @@
+## Logic Tree Changes
+
+```diff
+[~] root
+├─[+] base_returns (new CTE)
+│   ├─[=] web_returns
+│   ├─[=] date_dim (filtered: d_year=1999)
+│   ├─[=] customer_address (filtered: ca_state IN ('CA','MI','SD','VA'))
+│   └─[=] item (filtered: i_manager_id 42-51)
+├─[+] state_customer_reason_returns (new CTE)
+│   └─[+] aggregates base_returns by (state, customer, reason)
+├─[+] state_thresholds (modified)
+│   └─[~] computes AVG from state_customer_reason_returns (not from separate scan)
+├─[+] filtered_returns (new CTE)
+│   └─[~] filters state_customer_reason_returns for reasons 22,23
+└─[~] main_query
+    ├─[=] customer
+    ├─[=] customer_address
+    ├─[~] joins filtered_returns instead of original CTE
+    └─[=] state_thresholds
+```
+
+## Component Payload
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_shared_aggregation", "description": "Compute base aggregation once, derive both filtered returns and state thresholds from it", "applied_to": ["base_returns", "state_customer_reason_returns"]},
+    {"id": "R2", "type": "predicate_pushdown_early", "description": "Push ca_state filter into base CTE to reduce fact table join size", "applied_to": ["base_returns"]},
+    {"id": "R3", "type": "explicit_join_syntax", "description": "Convert comma joins to explicit JOIN syntax for better PG optimization", "applied_to": ["base_returns", "main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "base_returns": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT wr_returning_customer_sk, ca_state, wr_reason_sk, wr_return_amt FROM web_returns JOIN date_dim ON wr_returned_date_sk = d_date_sk JOIN customer_address ON wr_returning_addr_sk = ca_address_sk JOIN item ON wr_item_sk = i_item_sk WHERE d_year = 1999 AND i_manager_id BETWEEN 42 AND 51 AND wr_return_amt / wr_return_quantity BETWEEN 193 AND 222 AND ca_state IN ('CA', 'MI', 'SD', 'VA')",
+        "interfaces": {"outputs": ["wr_returning_customer_sk", "ca_state", "wr_reason_sk", "wr_return_amt"]}
+      },
+      "state_customer_reason_returns": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_state AS ctr_state, wr_returning_customer_sk AS ctr_customer_sk, wr_reason_sk AS ctr_reason_sk, SUM(wr_return_amt) AS ctr_total_return FROM base_returns GROUP BY ca_state, wr_returning_customer_sk, wr_reason_sk",
+        "interfaces": {"outputs": ["ctr_state", "ctr_customer_sk", "ctr_reason_sk", "ctr_total_return"], "consumes": ["base_returns"]}
+      },
+      "state_thresholds": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ctr_state, AVG(ctr_total_return) * 1.2 AS avg_threshold FROM state_customer_reason_returns GROUP BY ctr_state",
+        "interfaces": {"outputs": ["ctr_state", "avg_threshold"], "consumes": ["state_customer_reason_returns"]}
+      },
+      "filtered_returns": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ctr_customer_sk, ctr_state, ctr_reason_sk, ctr_total_return FROM state_customer_reason_returns WHERE ctr_reason_sk IN (22, 23)",
+        "interfaces": {"outputs": ["ctr_customer_sk", "ctr_state", "ctr_reason_sk", "ctr_total_return"], "consumes": ["state_customer_reason_returns"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr1.ctr_total_return FROM filtered_returns ctr1 JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk JOIN customer_address ON ca_address_sk = c_current_addr_sk JOIN state_thresholds st ON ctr1.ctr_state = st.ctr_state WHERE c_birth_year BETWEEN 1945 AND 1951 AND ca_state IN ('CA', 'MI', 'SD', 'VA') AND ctr1.ctr_total_return > st.avg_threshold ORDER BY c_customer_id, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_day, c_birth_month, c_birth_year, c_birth_country, c_login, c_email_address, c_last_review_date_sk, ctr1.ctr_total_return LIMIT 100",
+        "interfaces": {"outputs": ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag", "c_birth_day", "c_birth_month", "c_birth_year", "c_birth_country", "c_login", "c_email_address", "c_last_review_date_sk", "ctr_total_return"], "consumes": ["filtered_returns", "state_thresholds"]}
+      }
+    },
+    "reconstruction_order": ["base_returns", "state_customer_reason_returns", "state_thresholds", "filtered_returns", "main_query"],
+    "assembly_template": "WITH base_returns AS ({base_returns}), state_customer_reason_returns AS ({state_customer_reason_returns}), state_thresholds AS ({state_thresholds}), filtered_returns AS ({filtered_returns}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '512MB'", "SET LOCAL max_parallel_workers_per_gather = 0", "SET LOCAL jit = off"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Single-pass aggregation strategy with explicit JOIN syntax and early state filtering. The base CTE scans web_returns once with all dimension filters, including ca_state. Then we compute aggregates once (by state, customer, reason) and derive both the filtered results (reasons 22,23) and state thresholds from that single aggregation. This eliminates the dual CTE scans from W3.
+
+**Expected speedup**: 2.2-2.5x. The main gain comes from scanning the 6M-row web_returns table only once instead of twice (or more). Early state filtering reduces join fanout. Disabling parallel workers and JIT reduces overhead for this moderate-sized query.

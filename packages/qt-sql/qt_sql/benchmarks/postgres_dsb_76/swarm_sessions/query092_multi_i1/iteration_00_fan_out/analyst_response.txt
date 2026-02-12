@@ -1,0 +1,329 @@
+<reasoning>
+## Step 1: CLASSIFY
+This query is a **correlated-aggregate filter** pattern with a **star-join** structure. Key characteristics:
+- Main query joins web_sales (fact) with item and date_dim (dimensions)
+- WHERE clause contains a correlated scalar subquery: `ws_ext_discount_amt > 1.3 * AVG(ws_ext_discount_amt)`
+- Subquery re-executes for each outer row (correlated via `ws_item_sk = i_item_sk`)
+- No UNION ALL, no window functions, no INTERSECT/EXCEPT
+- Has OR condition on item table (manufacturer OR category)
+
+## Step 2: EXPLAIN PLAN ANALYSIS
+No EXPLAIN ANALYZE output provided, but logical tree shows:
+- web_sales scanned twice (once in main query, once in subquery)
+- Subquery is correlated → re-executed per outer row
+- Comma joins (implicit joins) present
+- Item table has OR filter that may be evaluated late
+- No CTEs in original → optimizer must handle correlation
+
+From plan-space scanner: 23 distinct plans, joins unstable, scan methods fragile → indicates optimizer struggles with this pattern.
+
+## Step 3: GAP MATCHING
+1. **CORRELATED_SUBQUERY_PARALYSIS** (ACTIVE): Query has correlated scalar subquery in WHERE clause. Matches `inline_decorrelate_materialized` example.
+2. **COMMA_JOIN_WEAKNESS** (ACTIVE): Uses implicit comma joins. Matches `pg_dimension_prefetch_star` and `pg_date_cte_explicit_join` examples.
+3. **CROSS_CTE_PREDICATE_BLINDNESS** (ACTIVE): Same fact table (web_sales) scanned twice with same date/wholesale_cost filters. Matches `pg_self_join_decomposition` example.
+4. **BITMAP_OR_SCAN** (ENGINE STRENGTH): PostgreSQL handles OR via bitmap scans. Do NOT split OR to UNION ALL (regression warning).
+
+## Step 4: AGGREGATION TRAP CHECK
+- Main aggregate: `SUM(ws_ext_discount_amt)` - duplicate-insensitive (safe)
+- Subquery aggregate: `AVG(ws_ext_discount_amt)` - duplicate-sensitive
+- Critical: The subquery computes average PER ITEM (correlated on i_item_sk). Any decorrelation must preserve per-item grouping.
+- No STDDEV_SAMP, VARIANCE, or FILTER clauses → no grouping traps.
+
+## Step 5: TRANSFORM SELECTION
+Ranked by expected impact:
+1. **Decorrelate via MATERIALIZED CTEs** (high impact: eliminates N re-executions)
+2. **Star-join prefetch with explicit joins** (medium: better cardinality estimates)
+3. **Self-join decomposition** (medium: eliminates duplicate fact scan)
+4. **Exploration: LATERAL join decorrelation** (novel: tests PostgreSQL's lateral optimization)
+
+## Step 6: LOGICAL TREE DESIGNS
+
+### Worker 1: Decorrelate via MATERIALIZED CTEs
+Target: Pre-compute per-item averages in a CTE, join once.
+Tree: filtered_item → filtered_dates → fact_prefilter → item_avg → final_join → aggregation
+
+### Worker 2: Star-join prefetch with explicit joins  
+Target: Pre-filter all dimensions into CTEs, convert to explicit JOINs.
+Tree: item_cte → date_cte → ws_cte → avg_cte → explicit_joins → aggregation
+
+### Worker 3: Self-join decomposition
+Target: Materialize fact+dimension scan once, derive both main and subquery data.
+Tree: base_scan → split to main_data and subquery_data → compute_avg → join → aggregation
+
+### Worker 4: Exploration - LATERAL decorrelation
+Target: Use LATERAL join to compute per-item average inline.
+Tree: filtered_item → filtered_dates → ws_data → LATERAL avg → filter → aggregation
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Business intent: find excess discount amounts where the discount exceeds 130% of the average discount for that item during a 90-day period, for items meeting manufacturer or category criteria, with wholesale cost constraints. JOIN semantics: INNER joins between web_sales, item, and date_dim (all sides must match). Aggregation trap: Subquery computes AVG per item (correlated on i_item_sk); decorrelation must preserve per-item grouping without introducing duplicates. Filter dependencies: The date filter ('2002-03-06' to +90 days) and wholesale_cost filter (16-36) apply to BOTH main query and subquery; the price ratio filter (ws_sales_price/ws_list_price BETWEEN 35*0.01 AND 50*0.01) applies ONLY to subquery.
+
+BOTTLENECK_DIAGNOSIS: Dominant cost is correlated subquery re-execution per outer row (correlated-aggregate filter). Join-bound due to correlation overhead. Cardinality flow: web_sales (large) → filtered by date/wholesale_cost → correlated subquery per item → final aggregation. Optimizer already handles OR via bitmap scans (strength). Logical-tree costs misleading because they don't capture correlation multiplier effect.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output exactly one column "Excess Discount Amount" as SUM.
+- CTE_COLUMN_COMPLETENESS: CTEs must include i_item_sk, ws_item_sk, d_date_sk, ws_ext_discount_amt for downstream joins.
+- LITERAL_PRESERVATION: Must preserve date '2002-03-06', interval '90 day', category values, numeric bounds exactly.
+- SEMANTIC_EQUIVALENCE: Must return same sum of ws_ext_discount_amt over same filtered rows.
+- CORRELATED_SUBQUERY_PARALYSIS: Subquery correlated on i_item_sk re-executes per outer row.
+- COMMA_JOIN_WEAKNESS: Implicit comma joins in both main query and subquery.
+- CROSS_CTE_PREDICATE_BLINDNESS: Same web_sales+date_dim scan appears in main and subquery.
+
+REGRESSION_WARNINGS:
+1. OR to UNION ALL (0.21x regression):
+   CAUSE: Splitting OR condition into UNION ALL branches bypassed PostgreSQL's BITMAP_OR_SCAN optimization.
+   RULE: Do NOT split the item OR condition (i_manufact_id BETWEEN 566 AND 765 OR i_category IN (...)) into UNION ALL.
+2. EXISTS to IN materialization (0.50x regression):
+   CAUSE: Converting EXISTS to IN with materialized CTE blocked hash anti-joins.
+   RULE: Not applicable - query has no EXISTS.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: decorrelate_materialized_ctes
+TARGET_LOGICAL_TREE:
+  filtered_item -> filtered_dates -> fact_prefilter -> item_avg -> final_join -> aggregation
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: (i_manufact_id BETWEEN 566 AND 765 OR i_category IN ('Children', 'Jewelry', 'Men'))
+    OUTPUT: i_item_sk, i_manufact_id, i_category
+    EXPECTED_ROWS: ~10K (selective OR)
+    CONSUMERS: final_join
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '2002-03-06' AND CAST('2002-03-06' AS DATE) + INTERVAL '90 day'
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: ~90 (90 days)
+    CONSUMERS: fact_prefilter, subquery_fact
+  fact_prefilter:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_dates ON d_date_sk = ws_sold_date_sk
+    WHERE: ws_wholesale_cost BETWEEN 16 AND 36
+    OUTPUT: ws_item_sk, ws_sold_date_sk, ws_ext_discount_amt, ws_wholesale_cost, ws_sales_price, ws_list_price
+    EXPECTED_ROWS: ~1M (filtered by date + cost)
+    CONSUMERS: item_avg, final_join
+  item_avg:
+    FROM: fact_prefilter
+    WHERE: ws_sales_price / ws_list_price BETWEEN 35 * 0.01 AND 50 * 0.01
+    GROUP BY: ws_item_sk
+    AGGREGATE: 1.3 * AVG(ws_ext_discount_amt) AS threshold
+    OUTPUT: ws_item_sk, threshold
+    EXPECTED_ROWS: ~50K (per item with price ratio filter)
+    CONSUMERS: final_join
+  final_join:
+    FROM: filtered_item
+    JOIN: INNER JOIN fact_prefilter ON i_item_sk = ws_item_sk
+    JOIN: INNER JOIN item_avg ON fact_prefilter.ws_item_sk = item_avg.ws_item_sk
+    WHERE: ws_ext_discount_amt > item_avg.threshold
+    OUTPUT: ws_ext_discount_amt
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: final_join
+    GROUP BY: () [implicit]
+    AGGREGATE: SUM(ws_ext_discount_amt) AS "Excess Discount Amount"
+    ORDER BY: SUM(ws_ext_discount_amt) ASC
+    LIMIT: 100
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: output
+EXAMPLES: inline_decorrelate_materialized, early_filter_decorrelate, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- inline_decorrelate_materialized: Apply 3-CTE decomposition (dimension filter, fact filter, per-key aggregate). Ignore timeout context - we have no timeout.
+- early_filter_decorrelate: Apply early dimension filtering into CTEs. Ignore limited benefit warning - correlation overhead is primary bottleneck.
+- pg_date_cte_explicit_join: Apply date CTE isolation AND convert to explicit JOINs. Ignore that example doesn't have correlation.
+HAZARD_FLAGS:
+- Must ensure item_avg CTE computes average PER ITEM (GROUP BY ws_item_sk) to match correlation.
+- price ratio filter (ws_sales_price/ws_list_price) applies ONLY to subquery, not main fact_prefilter.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: star_join_prefetch_explicit
+TARGET_LOGICAL_TREE:
+  item_cte -> date_cte -> ws_cte -> avg_cte -> explicit_joins -> aggregation
+NODE_CONTRACTS:
+  item_cte:
+    FROM: item
+    WHERE: (i_manufact_id BETWEEN 566 AND 765 OR i_category IN ('Children', 'Jewelry', 'Men'))
+    OUTPUT: i_item_sk, i_manufact_id, i_category
+    EXPECTED_ROWS: ~10K
+    CONSUMERS: explicit_joins
+  date_cte:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '2002-03-06' AND CAST('2002-03-06' AS DATE) + INTERVAL '90 day'
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: ~90
+    CONSUMERS: ws_cte, subq_fact_cte
+  ws_cte:
+    FROM: web_sales
+    JOIN: INNER JOIN date_cte ON d_date_sk = ws_sold_date_sk
+    WHERE: ws_wholesale_cost BETWEEN 16 AND 36
+    OUTPUT: ws_item_sk, ws_sold_date_sk, ws_ext_discount_amt, ws_wholesale_cost, ws_sales_price, ws_list_price
+    EXPECTED_ROWS: ~1M
+    CONSUMERS: explicit_joins, subq_fact_cte
+  subq_fact_cte:
+    FROM: ws_cte
+    WHERE: ws_sales_price / ws_list_price BETWEEN 35 * 0.01 AND 50 * 0.01
+    OUTPUT: ws_item_sk, ws_ext_discount_amt
+    EXPECTED_ROWS: ~500K (with price ratio filter)
+    CONSUMERS: avg_cte
+  avg_cte:
+    FROM: subq_fact_cte
+    GROUP BY: ws_item_sk
+    AGGREGATE: 1.3 * AVG(ws_ext_discount_amt) AS threshold
+    OUTPUT: ws_item_sk, threshold
+    EXPECTED_ROWS: ~50K
+    CONSUMERS: explicit_joins
+  explicit_joins:
+    FROM: item_cte
+    JOIN: INNER JOIN ws_cte ON i_item_sk = ws_item_sk
+    JOIN: INNER JOIN avg_cte ON ws_cte.ws_item_sk = avg_cte.ws_item_sk
+    WHERE: ws_ext_discount_amt > avg_cte.threshold
+    OUTPUT: ws_ext_discount_amt
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: explicit_joins
+    GROUP BY: () [implicit]
+    AGGREGATE: SUM(ws_ext_discount_amt) AS "Excess Discount Amount"
+    ORDER BY: SUM(ws_ext_discount_amt) ASC
+    LIMIT: 100
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering of ALL dimensions (item, date) into CTEs AND convert comma joins to explicit JOIN syntax. Ignore multi-channel UNION aspect.
+- pg_date_cte_explicit_join: Apply date CTE isolation combined with explicit JOIN syntax. Ignore that example has no item table.
+- pg_materialized_dimension_fact_prefilter: Apply staged reduction: shrink both dimension AND fact tables via MATERIALIZED CTEs before final join. Ignore non-equi join context.
+HAZARD_FLAGS:
+- Must use AS MATERIALIZED on CTEs to prevent inlining and ensure decorrelation.
+- ws_cte must NOT include price ratio filter (that's only for subquery).
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: self_join_decomposition
+TARGET_LOGICAL_TREE:
+  base_scan -> main_data + subquery_data -> compute_avg -> join -> aggregation
+NODE_CONTRACTS:
+  base_scan:
+    FROM: web_sales
+    JOIN: INNER JOIN date_dim ON d_date_sk = ws_sold_date_sk
+    JOIN: INNER JOIN item ON i_item_sk = ws_item_sk
+    WHERE: d_date BETWEEN '2002-03-06' AND CAST('2002-03-06' AS DATE) + INTERVAL '90 day'
+      AND (i_manufact_id BETWEEN 566 AND 765 OR i_category IN ('Children', 'Jewelry', 'Men'))
+      AND ws_wholesale_cost BETWEEN 16 AND 36
+    OUTPUT: ws_item_sk, ws_ext_discount_amt, ws_sales_price, ws_list_price, i_item_sk
+    EXPECTED_ROWS: ~1M (filtered by all three tables)
+    CONSUMERS: main_data, subquery_data
+  main_data:
+    FROM: base_scan
+    OUTPUT: ws_item_sk, ws_ext_discount_amt
+    EXPECTED_ROWS: ~1M
+    CONSUMERS: final_join
+  subquery_data:
+    FROM: base_scan
+    WHERE: ws_sales_price / ws_list_price BETWEEN 35 * 0.01 AND 50 * 0.01
+    OUTPUT: ws_item_sk, ws_ext_discount_amt
+    EXPECTED_ROWS: ~500K
+    CONSUMERS: compute_avg
+  compute_avg:
+    FROM: subquery_data
+    GROUP BY: ws_item_sk
+    AGGREGATE: 1.3 * AVG(ws_ext_discount_amt) AS threshold
+    OUTPUT: ws_item_sk, threshold
+    EXPECTED_ROWS: ~50K
+    CONSUMERS: final_join
+  final_join:
+    FROM: main_data
+    JOIN: INNER JOIN compute_avg ON main_data.ws_item_sk = compute_avg.ws_item_sk
+    WHERE: main_data.ws_ext_discount_amt > compute_avg.threshold
+    OUTPUT: ws_ext_discount_amt
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: final_join
+    GROUP BY: () [implicit]
+    AGGREGATE: SUM(ws_ext_discount_amt) AS "Excess Discount Amount"
+    ORDER BY: SUM(ws_ext_discount_amt) ASC
+    LIMIT: 100
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: output
+EXAMPLES: pg_self_join_decomposition, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+- pg_self_join_decomposition: Apply single materialization of fact+dimension scan (base_scan), then derive both main and subquery data from it. Ignore store vs item context.
+- pg_materialized_dimension_fact_prefilter: Apply concept of reducing BOTH dimension and fact tables in one CTE before further processing. Ignore non-equi join aspect.
+HAZARD_FLAGS:
+- base_scan must include ALL filters from both main and subquery EXCEPT price ratio (which separates main vs subquery data).
+- Must verify join between item and web_sales doesn't change row counts for subquery average (one-to-many is OK for AVG if per-item grouping preserved).
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: lateral_decorrelation_exploration
+TARGET_LOGICAL_TREE:
+  filtered_item -> filtered_dates -> ws_data -> lateral_avg -> filter -> aggregation
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: (i_manufact_id BETWEEN 566 AND 765 OR i_category IN ('Children', 'Jewelry', 'Men'))
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: ~10K
+    CONSUMERS: ws_data
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '2002-03-06' AND CAST('2002-03-06' AS DATE) + INTERVAL '90 day'
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: ~90
+    CONSUMERS: ws_data, lateral_subquery
+  ws_data:
+    FROM: filtered_item
+    JOIN: INNER JOIN web_sales ON i_item_sk = ws_item_sk
+    JOIN: INNER JOIN filtered_dates ON d_date_sk = ws_sold_date_sk
+    WHERE: ws_wholesale_cost BETWEEN 16 AND 36
+    OUTPUT: i_item_sk, ws_item_sk, ws_ext_discount_amt
+    EXPECTED_ROWS: ~1M
+    CONSUMERS: lateral_avg
+  lateral_subquery:
+    FROM: web_sales
+    JOIN: INNER JOIN filtered_dates ON d_date_sk = ws_sold_date_sk
+    WHERE: ws_wholesale_cost BETWEEN 16 AND 36
+      AND ws_sales_price / ws_list_price BETWEEN 35 * 0.01 AND 50 * 0.01
+    OUTPUT: ws_item_sk, ws_ext_discount_amt
+    EXPECTED_ROWS: ~500K
+    CONSUMERS: lateral_avg (implicit via LATERAL)
+  lateral_avg:
+    FROM: ws_data
+    LATERAL: (
+      SELECT 1.3 * AVG(ws_ext_discount_amt) AS threshold
+      FROM lateral_subquery
+      WHERE lateral_subquery.ws_item_sk = ws_data.i_item_sk
+    )
+    OUTPUT: ws_ext_discount_amt, threshold
+    EXPECTED_ROWS: ~1M (same as ws_data)
+    CONSUMERS: filter
+  filter:
+    FROM: lateral_avg
+    WHERE: ws_ext_discount_amt > threshold
+    OUTPUT: ws_ext_discount_amt
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: aggregation
+  aggregation:
+    FROM: filter
+    GROUP BY: () [implicit]
+    AGGREGATE: SUM(ws_ext_discount_amt) AS "Excess Discount Amount"
+    ORDER BY: SUM(ws_ext_discount_amt) ASC
+    LIMIT: 100
+    OUTPUT: "Excess Discount Amount"
+    EXPECTED_ROWS: 1
+    CONSUMERS: output
+EXAMPLES: None directly matching (exploration)
+EXAMPLE_ADAPTATION:
+- No direct examples; this is novel exploration of PostgreSQL's LATERAL optimization for correlated aggregates.
+HAZARD_FLAGS:
+- LATERAL may still execute subquery per outer row (not decorrelated) if optimizer doesn't transform.
+- Must ensure LATERAL subquery groups by ws_item_sk implicitly via correlation.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (testing PostgreSQL's LATERAL join optimization for correlated scalar aggregates)

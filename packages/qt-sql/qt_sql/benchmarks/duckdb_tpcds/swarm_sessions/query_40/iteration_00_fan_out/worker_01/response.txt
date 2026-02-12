@@ -1,0 +1,82 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Structured as 5 CTEs following target logical tree
+    ├── [CTE] filtered_date  [+]  Cost: 0%  Rows: 61  — Date filter isolated
+    │   └── SCAN date_dim with filter d_date BETWEEN (CAST('2001-04-02' AS DATE) - 30 DAYS) AND (CAST('2001-04-02' AS DATE) + 30 DAYS)
+    ├── [CTE] filtered_item  [+]  Cost: 0%  Rows: 6,464  — Item price filter isolated
+    │   └── SCAN item with filter i_current_price BETWEEN 0.99 AND 1.49
+    ├── [CTE] sales_with_dims  [+]  Cost: 0%  Rows: 18K  — Catalog sales joined with filtered dimensions
+    │   ├── SCAN catalog_sales
+    │   ├── JOIN filtered_date ON cs_sold_date_sk = d_date_sk
+    │   └── JOIN filtered_item ON cs_item_sk = i_item_sk
+    ├── [CTE] sales_with_returns  [+]  Cost: 0%  Rows: 18K  — Left join with catalog_returns
+    │   ├── SCAN sales_with_dims
+    │   └── LEFT JOIN catalog_returns ON cs_order_number = cr_order_number AND cs_item_sk = cr_item_sk
+    └── [=] final_aggregation  (now main_query body)
+        ├── SCAN sales_with_returns
+        ├── JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk
+        ├── AGG GROUP BY w_state, i_item_id
+        ├── SORT w_state, i_item_id
+        └── OUTPUT w_state, i_item_id, sales_before, sales_after
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "date_cte_isolate", "description": "Extract date filter into separate CTE", "applied_to": ["filtered_date"]},
+    {"id": "R2", "type": "early_filter", "description": "Extract item price filter into separate CTE", "applied_to": ["filtered_item"]},
+    {"id": "R3", "type": "prefetch_fact_join", "description": "Join catalog_sales with filtered dimensions before optional returns", "applied_to": ["sales_with_dims", "sales_with_returns"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN (CAST('2001-04-02' AS DATE) - INTERVAL 30 DAY) AND (CAST('2001-04-02' AS DATE) + INTERVAL 30 DAY)",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_current_price BETWEEN 0.99 AND 1.49",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "sales_with_dims": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cs.cs_order_number, cs.cs_item_sk, cs.cs_warehouse_sk, cs.cs_sales_price, fd.d_date, fi.i_item_id FROM catalog_sales cs INNER JOIN filtered_date fd ON cs.cs_sold_date_sk = fd.d_date_sk INNER JOIN filtered_item fi ON cs.cs_item_sk = fi.i_item_sk",
+        "interfaces": {"outputs": ["cs_order_number", "cs_item_sk", "cs_warehouse_sk", "cs_sales_price", "d_date", "i_item_id"], "consumes": ["filtered_date", "filtered_item"]}
+      },
+      "sales_with_returns": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT swd.cs_warehouse_sk, swd.i_item_id, swd.d_date, swd.cs_sales_price, COALESCE(cr.cr_refunded_cash, 0) AS cr_refunded_cash FROM sales_with_dims swd LEFT JOIN catalog_returns cr ON swd.cs_order_number = cr.cr_order_number AND swd.cs_item_sk = cr.cr_item_sk",
+        "interfaces": {"outputs": ["cs_warehouse_sk", "i_item_id", "d_date", "cs_sales_price", "cr_refunded_cash"], "consumes": ["sales_with_dims"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT w.w_state, swr.i_item_id, SUM(CASE WHEN swr.d_date < CAST('2001-04-02' AS DATE) THEN swr.cs_sales_price - swr.cr_refunded_cash ELSE 0 END) AS sales_before, SUM(CASE WHEN swr.d_date >= CAST('2001-04-02' AS DATE) THEN swr.cs_sales_price - swr.cr_refunded_cash ELSE 0 END) AS sales_after FROM sales_with_returns swr INNER JOIN warehouse w ON swr.cs_warehouse_sk = w.w_warehouse_sk GROUP BY w.w_state, swr.i_item_id ORDER BY w.w_state, swr.i_item_id LIMIT 100",
+        "interfaces": {"outputs": ["w_state", "i_item_id", "sales_before", "sales_after"], "consumes": ["sales_with_returns"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "sales_with_dims", "sales_with_returns", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), sales_with_dims AS ({sales_with_dims}), sales_with_returns AS ({sales_with_returns}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Restructured query into a 5-CTE pipeline that isolates dimension filtering (date/item), joins them with catalog_sales, then left-joins returns, maintaining exact original semantics and output ordering.
+
+Expected speedup: 2-4x from dimension isolation and staged join pipeline reducing intermediate data volume.

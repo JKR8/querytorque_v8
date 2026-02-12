@@ -1,0 +1,357 @@
+<reasoning>
+1. **CLASSIFY**: This is a channel-comparison self-join query with repeated fact scans. Two CTEs (store_sales and web_sales) perform similar star-joins with dimension filters, then the main query self-joins each CTE three times (quarters 1,2,3 of 1999) and compares quarter-over-quarter growth ratios between channels. Structural archetype: "repeated fact scan with dimension filtering" and "self-join pattern".
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total runtime: 1351.3ms. Dominant node: store_sales CTE scan and aggregation (1351.2ms, 99.99% of runtime). web_sales CTE is negligible (0.0ms).
+   - store_sales sequential scan: 138K rows after filter (removes 9.5M rows). This is the bottleneck - scan-bound.
+   - Row count drops: store_sales → item join reduces to 272 rows (bitmap index scan on i_color, then filter on i_manager_id). customer_address index scan reduces further (0 rows per loop). date_dim index scan is trivial.
+   - The optimizer already splits CTEs (ss and ws are materialized once each). The main query uses nested loops to join CTE instances.
+   - Fact table scans: store_sales scanned 1 time, web_sales scanned 1 time. CTEs are materialized once, then probed multiple times (3x each).
+   - The web_sales CTE shows 0 rows in EXPLAIN (no matching data in sample). This is important: the main query's growth comparisons will filter out all rows if web_sales are zero. But we must optimize for general case.
+
+3. **GAP MATCHING**:
+   - COMMA_JOIN_WEAKNESS: Yes. CTEs use comma-separated implicit joins (FROM store_sales, date_dim, customer_address, item). Opportunity: convert to explicit JOINs with pre-filtered dimension CTEs.
+   - CROSS_CTE_PREDICATE_BLINDNESS: Partial. Same dimension tables (date_dim, item, customer_address) are scanned twice (once per channel CTE). Opportunity: share dimension pre-filtering across channels.
+   - NON_EQUI_JOIN_INPUT_BLINDNESS: No. No non-equi joins.
+   - CORRELATED_SUBQUERY_PARALYSIS: No.
+   - Self-join pattern: The main query self-joins the same CTE (ss) three times with different quarter filters. This is a candidate for scan consolidation via pivoting.
+
+4. **AGGREGATION TRAP CHECK**: Only SUM aggregates. No STDDEV_SAMP, VARIANCE, etc. Safe to restructure as long as join cardinality doesn't create duplicates.
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   a) **star_join_prefetch** + **COMMA_JOIN_WEAKNESS**: Pre-filter all dimension tables into CTEs, convert to explicit JOINs. Reduces repeated dimension scans and improves cardinality estimation.
+   b) **self_join_elimination** via **scan_consolidation_pivot**: Consolidate three quarter instances into one CTE that aggregates by quarter, then pivot. Eliminates self-joins and repeated filtering.
+   c) **single_pass_aggregation**: Merge store and web CTEs into one UNION ALL scan with channel discriminator, then separate. Shares dimension joins.
+   d) **predicate_pushdown**: Push quarter/year filters into CTEs (currently filtered in main query). Reduces aggregation workload.
+
+6. **LOGICAL TREE DESIGN**:
+   - Worker 1: Star join prefetch with explicit JOINs (pg_dimension_prefetch_star pattern)
+   - Worker 2: Self-join elimination via quarter pivoting (scan_consolidation_pivot)
+   - Worker 3: Single-pass aggregation with UNION ALL (single_pass_aggregation)
+   - Worker 4 (Exploration): Compound strategy combining prefetch + pivoting + predicate pushdown
+
+Check column completeness:
+- ss CTE outputs: ca_county, d_qoy, d_year, store_sales
+- ws CTE outputs: ca_county, d_qoy, d_year, web_sales
+- Main query needs all these columns plus derived growth ratios.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Business intent: Compare quarter-over-quarter sales growth (Q1→Q2, Q2→Q3) between web and store channels for counties in KS and OH in 1999, filtering to items with specific colors/manager IDs/price ranges, and requiring web growth to exceed store growth both quarters. JOIN semantics: All joins are INNER - all dimension tables must match, and all CTE instances must have rows for the same county across quarters. Aggregation traps: Only SUM aggregates, safe to restructure. Filter dependencies: The main query's CASE statements protect against division by zero; must preserve NULL semantics when sales = 0.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound on store_sales sequential scan (1351.2ms, 99.9% runtime). Filter on ss_list_price reduces 9.5M rows to 138K. Dimension joins (item, customer_address, date_dim) are efficient with index scans. The optimizer already materializes CTEs (computed once) and uses nested loops for main query self-joins. Logical-tree cost percentages are misleading: ss CTE shows 73% cost but consumes >99% of actual runtime; ws CTE shows 1% cost but runs in 0ms (no matching data). Cardinality flow: store_sales 138K → item join 272 → customer_address 0 per loop → aggregate to 98 rows.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output exactly 6 columns: ca_county, d_year, web_q1_q2_increase, store_q1_q2_increase, web_q2_q3_increase, store_q2_q3_increase.
+- CTE_COLUMN_COMPLETENESS: Any new CTEs must include ca_county, d_qoy, d_year, and sales aggregates that downstream consumers reference.
+- LITERAL_PRESERVATION: All filter values ('dark','puff', 15,34, 244,258, 'KS','OH', 1999, 1,2,3) must be copied exactly.
+- SEMANTIC_EQUIVALENCE: Must return same rows with same growth ratio comparisons.
+- COMMA_JOIN_WEAKNESS: CTEs use comma-separated joins (FROM store_sales, date_dim, customer_address, item). EXPLAIN shows this may confuse cardinality estimation.
+- CROSS_CTE_PREDICATE_BLINDNESS: Same dimension tables scanned twice (once per channel CTE). Opportunity to share pre-filtered dimensions.
+
+REGRESSION_WARNINGS:
+1. Splitting OR conditions into UNION ALL (observed regression 0.21x on Q085):
+   CAUSE: This query uses IN clauses (i_color IN, ca_state IN) which are OR equivalents; splitting could disable bitmap index scans.
+   RULE: Do not split IN conditions into UNION ALL branches.
+2. Converting EXISTS to IN (observed regression 0.50x on Q069):
+   CAUSE: This query has no EXISTS subqueries.
+   RULE: Not applicable.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch_explicit_joins
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_item -> filtered_ca -> ss_fact_join -> ss_agg -> main_pivoted
+  filtered_date -> filtered_item -> filtered_ca -> ws_fact_join -> ws_agg -> main_pivoted
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_qoy IN (1,2,3)
+    OUTPUT: d_date_sk, d_qoy, d_year
+    EXPECTED_ROWS: ~1095 (365 days * 3 quarters)
+    CONSUMERS: ss_fact_join, ws_fact_join
+  filtered_item:
+    FROM: item
+    WHERE: i_color IN ('dark', 'puff') AND i_manager_id BETWEEN 15 AND 34
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: 272
+    CONSUMERS: ss_fact_join, ws_fact_join
+  filtered_ca:
+    FROM: customer_address
+    WHERE: ca_state IN ('KS', 'OH')
+    OUTPUT: ca_address_sk, ca_county
+    EXPECTED_ROWS: ~? (not in EXPLAIN)
+    CONSUMERS: ss_fact_join, ws_fact_join
+  ss_fact_join:
+    FROM: store_sales
+    JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+    JOIN filtered_item ON ss_item_sk = i_item_sk
+    JOIN filtered_ca ON ss_addr_sk = ca_address_sk
+    WHERE: ss_list_price BETWEEN 244 AND 258
+    OUTPUT: ca_county, d_qoy, d_year, ss_ext_sales_price
+    EXPECTED_ROWS: ~? (less than original 138K due to date filter)
+    CONSUMERS: ss_agg
+  ss_agg:
+    FROM: ss_fact_join
+    GROUP BY: ca_county, d_qoy, d_year
+    AGGREGATE: SUM(ss_ext_sales_price) AS store_sales
+    OUTPUT: ca_county, d_qoy, d_year, store_sales
+    EXPECTED_ROWS: ~98
+    CONSUMERS: main_pivoted
+  ws_fact_join:
+    FROM: web_sales
+    JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+    JOIN filtered_item ON ws_item_sk = i_item_sk
+    JOIN filtered_ca ON ws_bill_addr_sk = ca_address_sk
+    WHERE: ws_list_price BETWEEN 244 AND 258
+    OUTPUT: ca_county, d_qoy, d_year, ws_ext_sales_price
+    EXPECTED_ROWS: ~? (small)
+    CONSUMERS: ws_agg
+  ws_agg:
+    FROM: ws_fact_join
+    GROUP BY: ca_county, d_qoy, d_year
+    AGGREGATE: SUM(ws_ext_sales_price) AS web_sales
+    OUTPUT: ca_county, d_qoy, d_year, web_sales
+    EXPECTED_ROWS: ~? (small)
+    CONSUMERS: main_pivoted
+  main_pivoted:
+    FROM: (pivot ss_agg quarters) ss_pivot, (pivot ws_agg quarters) ws_pivot
+    JOIN ON ss_pivot.ca_county = ws_pivot.ca_county
+    WHERE: ws_q2/ws_q1 > ss_q2/ss_q1 AND ws_q3/ws_q2 > ss_q3/ss_q2 (with NULL guards)
+    OUTPUT: ca_county, 1999 AS d_year, ws_q2/ws_q1, ss_q2/ss_q1, ws_q3/ws_q2, ss_q3/ss_q2
+    ORDER BY: d_year
+    EXPECTED_ROWS: same as original
+    CONSUMERS: final output
+EXAMPLES: pg_dimension_prefetch_star, pg_date_cte_explicit_join, pg_materialized_dimension_fact_prefilter
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering of date, item, customer_address into CTEs and explicit JOIN syntax; ignore the UNION ALL aspect.
+- pg_date_cte_explicit_join: Apply date filter isolation and explicit joins; ignore the single-dimension focus (we pre-filter all three dimensions).
+- pg_materialized_dimension_fact_prefilter: Apply staged reduction via MATERIALIZED CTEs for dimensions; ignore the non-equi join aspect.
+HAZARD_FLAGS:
+- Over-materialization: Creating 3 dimension CTEs plus 2 fact CTEs may add overhead if dimensions are tiny.
+- Parallelism blocking: CTE materialization may inhibit parallel scan of store_sales.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: self_join_elimination_pivot
+TARGET_LOGICAL_TREE:
+  ss_all_quarters -> ss_pivot -> main_with_pivot
+  ws_all_quarters -> ws_pivot -> main_with_pivot
+NODE_CONTRACTS:
+  ss_all_quarters:
+    FROM: store_sales, date_dim, customer_address, item
+    WHERE: ss_sold_date_sk = d_date_sk AND ss_addr_sk = ca_address_sk AND ss_item_sk = i_item_sk
+      AND i_color IN ('dark', 'puff') AND i_manager_id BETWEEN 15 AND 34
+      AND ss_list_price BETWEEN 244 AND 258 AND ca_state IN ('KS', 'OH')
+      AND d_year = 1999 AND d_qoy IN (1,2,3)
+    GROUP BY: ca_county, d_qoy, d_year
+    AGGREGATE: SUM(ss_ext_sales_price) AS store_sales
+    OUTPUT: ca_county, d_qoy, d_year, store_sales
+    EXPECTED_ROWS: ~98 (but only quarters 1,2,3)
+    CONSUMERS: ss_pivot
+  ss_pivot:
+    FROM: ss_all_quarters
+    GROUP BY: ca_county, d_year
+    AGGREGATE: 
+      MAX(CASE WHEN d_qoy = 1 THEN store_sales END) AS store_sales_q1,
+      MAX(CASE WHEN d_qoy = 2 THEN store_sales END) AS store_sales_q2,
+      MAX(CASE WHEN d_qoy = 3 THEN store_sales END) AS store_sales_q3
+    OUTPUT: ca_county, d_year, store_sales_q1, store_sales_q2, store_sales_q3
+    EXPECTED_ROWS: ~33 (one per county)
+    CONSUMERS: main_with_pivot
+  ws_all_quarters:
+    FROM: web_sales, date_dim, customer_address, item
+    WHERE: ws_sold_date_sk = d_date_sk AND ws_bill_addr_sk = ca_address_sk AND ws_item_sk = i_item_sk
+      AND i_color IN ('dark', 'puff') AND i_manager_id BETWEEN 15 AND 34
+      AND ws_list_price BETWEEN 244 AND 258 AND ca_state IN ('KS', 'OH')
+      AND d_year = 1999 AND d_qoy IN (1,2,3)
+    GROUP BY: ca_county, d_qoy, d_year
+    AGGREGATE: SUM(ws_ext_sales_price) AS web_sales
+    OUTPUT: ca_county, d_qoy, d_year, web_sales
+    EXPECTED_ROWS: ~? (small)
+    CONSUMERS: ws_pivot
+  ws_pivot:
+    FROM: ws_all_quarters
+    GROUP BY: ca_county, d_year
+    AGGREGATE:
+      MAX(CASE WHEN d_qoy = 1 THEN web_sales END) AS web_sales_q1,
+      MAX(CASE WHEN d_qoy = 2 THEN web_sales END) AS web_sales_q2,
+      MAX(CASE WHEN d_qoy = 3 THEN web_sales END) AS web_sales_q3
+    OUTPUT: ca_county, d_year, web_sales_q1, web_sales_q2, web_sales_q3
+    EXPECTED_ROWS: ~? (same as ws_all_quarters count per county)
+    CONSUMERS: main_with_pivot
+  main_with_pivot:
+    FROM: ss_pivot, ws_pivot
+    WHERE: ss_pivot.ca_county = ws_pivot.ca_county
+      AND CASE WHEN web_sales_q1 > 0 THEN web_sales_q2/web_sales_q1 ELSE NULL END
+          > CASE WHEN store_sales_q1 > 0 THEN store_sales_q2/store_sales_q1 ELSE NULL END
+      AND CASE WHEN web_sales_q2 > 0 THEN web_sales_q3/web_sales_q2 ELSE NULL END
+          > CASE WHEN store_sales_q2 > 0 THEN store_sales_q3/store_sales_q2 ELSE NULL END
+    OUTPUT: ca_county, d_year, 
+        web_sales_q2/web_sales_q1 AS web_q1_q2_increase,
+        store_sales_q2/store_sales_q1 AS store_q1_q2_increase,
+        web_sales_q3/web_sales_q2 AS web_q2_q3_increase,
+        store_sales_q3/store_sales_q2 AS store_q2_q3_increase
+    ORDER BY: d_year
+    EXPECTED_ROWS: same as original
+    CONSUMERS: final output
+EXAMPLES: pg_self_join_decomposition, single_pass_aggregation
+EXAMPLE_ADAPTATION:
+- pg_self_join_decomposition: Apply materializing the fact+dimension scan once and deriving multiple quarter aggregates from it; ignore the per-item vs per-store aspect (we do per-quarter).
+- single_pass_aggregation: Apply consolidating multiple quarter scans into one GROUP BY with CASE pivoting; ignore the channel merging (we keep store and web separate).
+HAZARD_FLAGS:
+- Pivot correctness: MAX(CASE) works because GROUP BY (ca_county, d_qoy, d_year) guarantees one row per quarter; but must ensure no duplicate quarters per county.
+- Division by zero: Must preserve NULL semantics when sales_q1=0 etc.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: single_pass_aggregation_union
+TARGET_LOGICAL_TREE:
+  filtered_dims -> combined_sales -> channel_quarter_agg -> main_split
+NODE_CONTRACTS:
+  filtered_dims:
+    FROM: date_dim, item, customer_address
+    WHERE: date_dim.d_year = 1999 AND date_dim.d_qoy IN (1,2,3)
+      AND item.i_color IN ('dark', 'puff') AND item.i_manager_id BETWEEN 15 AND 34
+      AND customer_address.ca_state IN ('KS', 'OH')
+    OUTPUT: date_dim.d_date_sk, date_dim.d_qoy, date_dim.d_year,
+            item.i_item_sk,
+            customer_address.ca_address_sk, customer_address.ca_county
+    EXPECTED_ROWS: cross product of filtered rows (date ~1095, item 272, ca unknown)
+    CONSUMERS: combined_sales
+  combined_sales:
+    FROM: (
+      SELECT 'store' AS channel, ss_ext_sales_price AS sales, ss_sold_date_sk, ss_item_sk, ss_addr_sk, ss_list_price
+      FROM store_sales
+      WHERE ss_list_price BETWEEN 244 AND 258
+      UNION ALL
+      SELECT 'web' AS channel, ws_ext_sales_price AS sales, ws_sold_date_sk, ws_item_sk, ws_bill_addr_sk, ws_list_price
+      FROM web_sales
+      WHERE ws_list_price BETWEEN 244 AND 258
+    ) sales
+    JOIN filtered_dims date ON sales.sold_date_sk = date.d_date_sk
+    JOIN filtered_dims item ON sales.item_sk = item.i_item_sk
+    JOIN filtered_dims addr ON 
+      (sales.channel = 'store' AND sales.addr_sk = addr.ca_address_sk) OR
+      (sales.channel = 'web' AND sales.bill_addr_sk = addr.ca_address_sk)
+    OUTPUT: channel, ca_county, d_qoy, d_year, sales
+    EXPECTED_ROWS: sum of store_sales and web_sales filtered rows
+    CONSUMERS: channel_quarter_agg
+  channel_quarter_agg:
+    FROM: combined_sales
+    GROUP BY: channel, ca_county, d_qoy, d_year
+    AGGREGATE: SUM(sales) AS total_sales
+    OUTPUT: channel, ca_county, d_qoy, d_year, total_sales
+    EXPECTED_ROWS: ~98 (store) + ? (web)
+    CONSUMERS: main_split
+  main_split:
+    FROM: 
+      (SELECT * FROM channel_quarter_agg WHERE channel = 'store') store_agg,
+      (SELECT * FROM channel_quarter_agg WHERE channel = 'web') web_agg
+    -- Then self-join each for quarters 1,2,3 as in original, or pivot
+    -- (Worker will implement either self-join or pivot from here)
+    OUTPUT: ca_county, d_year, web_q1_q2_increase, store_q1_q2_increase, web_q2_q3_increase, store_q2_q3_increase
+    ORDER BY: d_year
+    EXPECTED_ROWS: same as original
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply merging store and web scans via UNION ALL with channel discriminator; ignore the FILTER inside aggregates (we use separate grouping).
+- shared_dimension_multi_channel: Apply sharing dimension lookups across channels via filtered_dims CTE; ignore the UNION ALL of dimensions (we join once).
+HAZARD_FLAGS:
+- Complex join condition: The addr join must handle different address keys per channel.
+- UNION ALL may prevent index usage on fact tables.
+- Dimension CTE cross product could be large if not selective.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_prefetch_pivot_pushdown
+TARGET_LOGICAL_TREE:
+  filtered_date -> filtered_item -> filtered_ca -> ss_fact_join -> ss_pivot -> main
+  filtered_date -> filtered_item -> filtered_ca -> ws_fact_join -> ws_pivot -> main
+NODE_CONTRACTS:
+  filtered_date:
+    FROM: date_dim
+    WHERE: d_year = 1999 AND d_qoy IN (1,2,3)
+    OUTPUT: d_date_sk, d_qoy, d_year
+    EXPECTED_ROWS: ~1095
+    CONSUMERS: ss_fact_join, ws_fact_join
+  filtered_item:
+    FROM: item
+    WHERE: i_color IN ('dark', 'puff') AND i_manager_id BETWEEN 15 AND 34
+    OUTPUT: i_item_sk
+    EXPECTED_ROWS: 272
+    CONSUMERS: ss_fact_join, ws_fact_join
+  filtered_ca:
+    FROM: customer_address
+    WHERE: ca_state IN ('KS', 'OH')
+    OUTPUT: ca_address_sk, ca_county
+    EXPECTED_ROWS: unknown
+    CONSUMERS: ss_fact_join, ws_fact_join
+  ss_fact_join:
+    FROM: store_sales
+    JOIN filtered_date ON ss_sold_date_sk = d_date_sk
+    JOIN filtered_item ON ss_item_sk = i_item_sk
+    JOIN filtered_ca ON ss_addr_sk = ca_address_sk
+    WHERE: ss_list_price BETWEEN 244 AND 258
+    OUTPUT: ca_county, d_qoy, d_year, ss_ext_sales_price
+    EXPECTED_ROWS: reduced
+    CONSUMERS: ss_pivot
+  ss_pivot:
+    FROM: ss_fact_join
+    GROUP BY: ca_county, d_year
+    AGGREGATE:
+      SUM(CASE WHEN d_qoy = 1 THEN ss_ext_sales_price END) AS store_sales_q1,
+      SUM(CASE WHEN d_qoy = 2 THEN ss_ext_sales_price END) AS store_sales_q2,
+      SUM(CASE WHEN d_qoy = 3 THEN ss_ext_sales_price END) AS store_sales_q3
+    OUTPUT: ca_county, d_year, store_sales_q1, store_sales_q2, store_sales_q3
+    EXPECTED_ROWS: ~33
+    CONSUMERS: main
+  ws_fact_join:
+    FROM: web_sales
+    JOIN filtered_date ON ws_sold_date_sk = d_date_sk
+    JOIN filtered_item ON ws_item_sk = i_item_sk
+    JOIN filtered_ca ON ws_bill_addr_sk = ca_address_sk
+    WHERE: ws_list_price BETWEEN 244 AND 258
+    OUTPUT: ca_county, d_qoy, d_year, ws_ext_sales_price
+    EXPECTED_ROWS: small
+    CONSUMERS: ws_pivot
+  ws_pivot:
+    FROM: ws_fact_join
+    GROUP BY: ca_county, d_year
+    AGGREGATE:
+      SUM(CASE WHEN d_qoy = 1 THEN ws_ext_sales_price END) AS web_sales_q1,
+      SUM(CASE WHEN d_qoy = 2 THEN ws_ext_sales_price END) AS web_sales_q2,
+      SUM(CASE WHEN d_qoy = 3 THEN ws_ext_sales_price END) AS web_sales_q3
+    OUTPUT: ca_county, d_year, web_sales_q1, web_sales_q2, web_sales_q3
+    EXPECTED_ROWS: small
+    CONSUMERS: main
+  main:
+    FROM: ss_pivot, ws_pivot
+    WHERE: ss_pivot.ca_county = ws_pivot.ca_county
+      AND CASE WHEN web_sales_q1 > 0 THEN web_sales_q2/web_sales_q1 ELSE NULL END
+          > CASE WHEN store_sales_q1 > 0 THEN store_sales_q2/store_sales_q1 ELSE NULL END
+      AND CASE WHEN web_sales_q2 > 0 THEN web_sales_q3/web_sales_q2 ELSE NULL END
+          > CASE WHEN store_sales_q2 > 0 THEN store_sales_q3/store_sales_q2 ELSE NULL END
+    OUTPUT: ca_county, d_year,
+        web_sales_q2/web_sales_q1 AS web_q1_q2_increase,
+        store_sales_q2/store_sales_q1 AS store_q1_q2_increase,
+        web_sales_q3/web_sales_q2 AS web_q2_q3_increase,
+        store_sales_q3/store_sales_q2 AS store_q2_q3_increase
+    ORDER BY: d_year
+    EXPECTED_ROWS: same as original
+    CONSUMERS: final output
+EXAMPLES: pg_dimension_prefetch_star, pg_self_join_decomposition, pg_date_cte_explicit_join
+EXAMPLE_ADAPTATION:
+- pg_dimension_prefetch_star: Apply pre-filtering all three dimensions into CTEs and explicit JOINs.
+- pg_self_join_decomposition: Apply pivot aggregation to eliminate self-joins.
+- pg_date_cte_explicit_join: Apply date filter pushdown into CTE.
+HAZARD_FLAGS:
+- Aggregation before pivot: SUM(CASE) within single pass may be less efficient than separate aggregations if many rows have NULL for other quarters.
+- Overhead of multiple CTEs may outweigh benefits.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

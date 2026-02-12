@@ -1,0 +1,85 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Uses staged CTE pipeline to pre-filter dimensions
+    ├── CTE filtered_date  [+]  Cost: 0%  Rows: 31  — Pre-filtered date dimension
+    │   ├── SCAN (date_dim)
+    │   ├── FILTER (d_moy = 12 AND d_year = 2000)
+    │   └── OUTPUT (d_date_sk)
+    ├── CTE filtered_item  [+]  Cost: 0%  Rows: 317  — Pre-filtered item dimension
+    │   ├── SCAN (item)
+    │   ├── FILTER (i_manager_id = 100)
+    │   └── OUTPUT (i_item_sk, i_brand_id, i_brand)
+    ├── CTE joined_sales  [+]  Cost: 50%  Rows: 2,698  — Fact table join with pre-filtered dimensions
+    │   ├── SCAN (store_sales)
+    │   ├── JOIN (INNER) filtered_date ON ss_sold_date_sk = d_date_sk
+    │   ├── JOIN (INNER) filtered_item ON ss_item_sk = i_item_sk
+    │   └── OUTPUT (i_brand_id, i_brand, ss_ext_sales_price)
+    ├── CTE aggregated  [+]  Cost: 30%  Rows: 112  — Aggregation after join reduction
+    │   ├── SCAN (joined_sales)
+    │   ├── AGG (GROUP BY i_brand_id, i_brand)
+    │   └── OUTPUT (i_brand_id, i_brand, ext_price)
+    └── OUTPUT (brand_id, brand, ext_price)
+        ├── SORT (ext_price DESC, i_brand_id ASC)
+        └── LIMIT (100)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter date_dim into CTE before join", "applied_to": ["filtered_date"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Pre-filter item into CTE before join", "applied_to": ["filtered_item"]},
+    {"id": "R3", "type": "prefetch_fact_join", "description": "Join fact table with pre-filtered dimension CTEs in separate step", "applied_to": ["joined_sales"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_moy = 12 AND d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_brand_id, i_brand FROM item WHERE i_manager_id = 100",
+        "interfaces": {"outputs": ["i_item_sk", "i_brand_id", "i_brand"], "consumes": []}
+      },
+      "joined_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT filtered_item.i_brand_id, filtered_item.i_brand, store_sales.ss_ext_sales_price FROM store_sales INNER JOIN filtered_date ON store_sales.ss_sold_date_sk = filtered_date.d_date_sk INNER JOIN filtered_item ON store_sales.ss_item_sk = filtered_item.i_item_sk",
+        "interfaces": {"outputs": ["i_brand_id", "i_brand", "ss_ext_sales_price"], "consumes": ["filtered_date", "filtered_item"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_brand_id, i_brand, SUM(ss_ext_sales_price) AS ext_price FROM joined_sales GROUP BY i_brand_id, i_brand",
+        "interfaces": {"outputs": ["i_brand_id", "i_brand", "ext_price"], "consumes": ["joined_sales"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_brand_id AS brand_id, i_brand AS brand, ext_price FROM aggregated ORDER BY ext_price DESC, i_brand_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["brand_id", "brand", "ext_price"], "consumes": ["aggregated"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "joined_sales", "aggregated", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), joined_sales AS ({joined_sales}), aggregated AS ({aggregated}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Structural change from a single flat join to a staged CTE pipeline that isolates dimension filtering. The mechanism builds small hash tables from pre-filtered dimensions before joining with the large fact table, reducing probe cost and enabling early row elimination.
+
+Expected speedup: 1.5-2x (dimension tables are small filters; main benefit is building smaller hash tables for the join)

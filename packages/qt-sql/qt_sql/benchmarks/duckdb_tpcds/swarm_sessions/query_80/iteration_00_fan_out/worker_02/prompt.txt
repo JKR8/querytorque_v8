@@ -1,0 +1,483 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+For a 30-day window from 1998-08-28 with non-TV promotions and items priced above 50, summarize sales, returns, and profit by store, catalog page, and web site with rollup totals. All joins are INNER except the left outer join between sales and returns (preserve all sales even without returns). Aggregates are SUM and COALESCE to handle NULL returns; profit is computed as ss_net_profit - COALESCE(sr_net_loss,0). Filters on date, item price, and promotion channel must be applied to sales before matching returns; returns are indirectly filtered via the sales they correspond to.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+(ssr_prefiltered, csr_prefiltered, wsr_prefiltered) -> main_query
+NODE_CONTRACTS:
+  ssr_prefiltered:
+    FROM: (SELECT ss_item_sk, ss_ticket_number, ss_store_sk, ss_ext_sales_price, ss_net_profit
+           FROM store_sales
+           WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY))
+             AND ss_item_sk IN (SELECT i_item_sk FROM item WHERE i_current_price > 50)
+             AND ss_promo_sk IN (SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N')) ss
+         LEFT JOIN store_returns sr ON (ss.ss_item_sk = sr.sr_item_sk AND ss.ss_ticket_number = sr.sr_ticket_number)
+         INNER JOIN store ON ss.ss_store_sk = s_store_sk
+    GROUP BY: s_store_id
+    AGGREGATE: SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS "returns", SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit
+    OUTPUT: store_id (s_store_id), sales, "returns", profit
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  csr_prefiltered:
+    FROM: (SELECT cs_item_sk, cs_order_number, cs_catalog_page_sk, cs_ext_sales_price, cs_net_profit
+           FROM catalog_sales
+           WHERE cs_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY))
+             AND cs_item_sk IN (SELECT i_item_sk FROM item WHERE i_current_price > 50)
+             AND cs_promo_sk IN (SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N')) cs
+         LEFT JOIN catalog_returns cr ON (cs.cs_item_sk = cr.cr_item_sk AND cs.cs_order_number = cr.cr_order_number)
+         INNER JOIN catalog_page ON cs.cs_catalog_page_sk = cp_catalog_page_sk
+    GROUP BY: cp_catalog_page_id
+    AGGREGATE: SUM(cs_ext_sales_price) AS sales, SUM(COALESCE(cr_return_amount, 0)) AS "returns", SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit
+    OUTPUT: catalog_page_id (cp_catalog_page_id), sales, "returns", profit
+    EXPECTED_ROWS: 444
+    CONSUMERS: main_query
+  wsr_prefiltered:
+    FROM: (SELECT ws_item_sk, ws_order_number, ws_web_site_sk, ws_ext_sales_price, ws_net_profit
+           FROM web_sales
+           WHERE ws_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY))
+             AND ws_item_sk IN (SELECT i_item_sk FROM item WHERE i_current_price > 50)
+             AND ws_promo_sk IN (SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N')) ws
+         LEFT JOIN web_returns wr ON (ws.ws_item_sk = wr.wr_item_sk AND ws.ws_order_number = wr.wr_order_number)
+         INNER JOIN web_site ON ws.ws_web_site_sk = web_site_sk
+    GROUP BY: web_site_id
+    AGGREGATE: SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS "returns", SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit
+    OUTPUT: web_site_id, sales, "returns", profit
+    EXPECTED_ROWS: 21
+    CONSUMERS: main_query
+  main_query:
+    FROM: (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, "returns", profit FROM ssr_prefiltered
+           UNION ALL
+           SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, "returns", profit FROM csr_prefiltered
+           UNION ALL
+           SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, "returns", profit FROM wsr_prefiltered) x
+    GROUP BY: ROLLUP(channel, id)
+    OUTPUT: channel, id, SUM(sales) AS sales, SUM("returns") AS "returns", SUM(profit) AS profit
+    ORDER BY: channel, id
+    LIMIT: 100
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+
+NODE_CONTRACTS:
+ssr_prefiltered:
+    FROM: (SELECT ss_item_sk, ss_ticket_number, ss_store_sk, ss_ext_sales_price, ss_net_profit
+           FROM store_sales
+           WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY))
+             AND ss_item_sk IN (SELECT i_item_sk FROM item WHERE i_current_price > 50)
+             AND ss_promo_sk IN (SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N')) ss
+         LEFT JOIN store_returns sr ON (ss.ss_item_sk = sr.sr_item_sk AND ss.ss_ticket_number = sr.sr_ticket_number)
+         INNER JOIN store ON ss.ss_store_sk = s_store_sk
+    GROUP BY: s_store_id
+    AGGREGATE: SUM(ss_ext_sales_price) AS sales, SUM(COALESCE(sr_return_amt, 0)) AS "returns", SUM(ss_net_profit - COALESCE(sr_net_loss, 0)) AS profit
+    OUTPUT: store_id (s_store_id), sales, "returns", profit
+    EXPECTED_ROWS: 51
+    CONSUMERS: main_query
+  csr_prefiltered:
+    FROM: (SELECT cs_item_sk, cs_order_number, cs_catalog_page_sk, cs_ext_sales_price, cs_net_profit
+           FROM catalog_sales
+           WHERE cs_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY))
+             AND cs_item_sk IN (SELECT i_item_sk FROM item WHERE i_current_price > 50)
+             AND cs_promo_sk IN (SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N')) cs
+         LEFT JOIN catalog_returns cr ON (cs.cs_item_sk = cr.cr_item_sk AND cs.cs_order_number = cr.cr_order_number)
+         INNER JOIN catalog_page ON cs.cs_catalog_page_sk = cp_catalog_page_sk
+    GROUP BY: cp_catalog_page_id
+    AGGREGATE: SUM(cs_ext_sales_price) AS sales, SUM(COALESCE(cr_return_amount, 0)) AS "returns", SUM(cs_net_profit - COALESCE(cr_net_loss, 0)) AS profit
+    OUTPUT: catalog_page_id (cp_catalog_page_id), sales, "returns", profit
+    EXPECTED_ROWS: 444
+    CONSUMERS: main_query
+  wsr_prefiltered:
+    FROM: (SELECT ws_item_sk, ws_order_number, ws_web_site_sk, ws_ext_sales_price, ws_net_profit
+           FROM web_sales
+           WHERE ws_sold_date_sk IN (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL 30 DAY))
+             AND ws_item_sk IN (SELECT i_item_sk FROM item WHERE i_current_price > 50)
+             AND ws_promo_sk IN (SELECT p_promo_sk FROM promotion WHERE p_channel_tv = 'N')) ws
+         LEFT JOIN web_returns wr ON (ws.ws_item_sk = wr.wr_item_sk AND ws.ws_order_number = wr.wr_order_number)
+         INNER JOIN web_site ON ws.ws_web_site_sk = web_site_sk
+    GROUP BY: web_site_id
+    AGGREGATE: SUM(ws_ext_sales_price) AS sales, SUM(COALESCE(wr_return_amt, 0)) AS "returns", SUM(ws_net_profit - COALESCE(wr_net_loss, 0)) AS profit
+    OUTPUT: web_site_id, sales, "returns", profit
+    EXPECTED_ROWS: 21
+    CONSUMERS: main_query
+  main_query:
+    FROM: (SELECT 'store channel' AS channel, 'store' || store_id AS id, sales, "returns", profit FROM ssr_prefiltered
+           UNION ALL
+           SELECT 'catalog channel' AS channel, 'catalog_page' || catalog_page_id AS id, sales, "returns", profit FROM csr_prefiltered
+           UNION ALL
+           SELECT 'web channel' AS channel, 'web_site' || web_site_id AS id, sales, "returns", profit FROM wsr_prefiltered) x
+    GROUP BY: ROLLUP(channel, id)
+    OUTPUT: channel, id, SUM(sales) AS sales, SUM("returns") AS "returns", SUM(profit) AS profit
+    ORDER BY: channel, id
+    LIMIT: 100
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+
+## Hazard Flags (avoid these specific risks)
+
+- Subqueries in WHERE clause (IN) may be less efficient than joins; ensure they are selective.
+- Must preserve left join semantics: all filtered sales rows must be kept.
+
+## Regression Warnings (observed failures on similar queries)
+
+1. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Pre-filtered and joined store_sales to date CTE before 3-way fact table join, preventing optimizer reordering.
+   RULE: Do not pre-join fact tables with dimensions when multiple fact tables are joined together; this query has no fact-to-fact joins.
+2. dimension_cte_isolate (0.0076x on Q26):
+   CAUSE: Cross-joined 3+ dimension CTEs causing Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially with fact table.
+3. materialize_cte (0.14x on Q16):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan.
+   RULE: This query has no EXISTS; safe to materialize dimension CTEs.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output channel, id, sales, returns, profit in same order and with same aliases.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced by downstream joins, aggregates, and output.
+- LITERAL_PRESERVATION: Must preserve date '1998-08-28', interval 30 DAY, price > 50, p_channel_tv = 'N'.
+- SEMANTIC_EQUIVALENCE: Result set must match exactly.
+- CROSS_CTE_PREDICATE_BLINDNESS: Each channel CTE repeats identical dimension scans (date_dim, item, promotion) with same filters, not shared.
+- REDUNDANT_SCAN_ELIMINATION: date_dim, item, promotion scanned three times each; fact tables scanned once per channel but left join is oversized.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+Apply the dimension pre-filtering via subqueries in the fact table scan to reduce rows before the left join. Ignore the CTE materialization aspect — use subqueries instead of CTEs for dimensions. This is a prefetch pattern without explicit CTEs.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. dimension_cte_isolate (1.93x)
+
+**Principle:** Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
+
+**BEFORE (slow):**
+```sql
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year = 2000
+```
+[filtered_customer_demographics]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'
+```
+[filtered_promotions]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+```
+[joined_facts]:
+```sql
+SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales AS cs JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk
+```
+[main_query]:
+```sql
+SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM joined_facts AS jf JOIN item AS i ON jf.cs_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
+```
+
+### 2. prefetch_fact_join (3.77x)
+
+**Principle:** Staged Join Pipeline: build a CTE chain that progressively reduces data — first CTE filters the dimension, second CTE pre-joins filtered dimension keys with the fact table, subsequent CTEs join remaining dimensions against the already-reduced fact set.
+
+**BEFORE (slow):**
+```sql
+select * 
+from (select i_manager_id
+             ,sum(ss_sales_price) sum_sales
+             ,avg(sum(ss_sales_price)) over (partition by i_manager_id) avg_monthly_sales
+      from item
+          ,store_sales
+          ,date_dim
+          ,store
+      where ss_item_sk = i_item_sk
+        and ss_sold_date_sk = d_date_sk
+        and ss_store_sk = s_store_sk
+        and d_month_seq in (1181,1181+1,1181+2,1181+3,1181+4,1181+5,1181+6,1181+7,1181+8,1181+9,1181+10,1181+11)
+        and ((    i_category in ('Books','Children','Electronics')
+              and i_class in ('personal','portable','reference','self-help')
+              and i_brand in ('scholaramalgamalg #14','scholaramalgamalg #7',
+		                  'exportiunivamalg #9','scholaramalgamalg #9'))
+           or(    i_category in ('Women','Music','Men')
+              and i_class in ('accessories','classical','fragrances','pants')
+              and i_brand in ('amalgimporto #1','edu packscholar #1','exportiimporto #1',
+		                 'importoamalg #1')))
+group by i_manager_id, d_moy) tmp1
+where case when avg_monthly_sales > 0 then abs (sum_sales - avg_monthly_sales) / avg_monthly_sales else null end > 0.1
+order by i_manager_id
+        ,avg_monthly_sales
+        ,sum_sales
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk, d_moy FROM date_dim WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)
+```
+[filtered_sales]:
+```sql
+SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_moy FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+```
+[main_query]:
+```sql
+SELECT * FROM (SELECT i_manager_id, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales FROM item JOIN filtered_sales ON ss_item_sk = i_item_sk JOIN store ON ss_store_sk = s_store_sk WHERE ((i_category IN ('Books', 'Children', 'Electronics') AND i_class IN ('personal', 'portable', 'reference', 'self-help') AND i_brand IN (...)) OR (i_category IN ('Women', 'Music', 'Men') AND i_class IN ('accessories', 'classical', 'fragrances', 'pants') AND i_brand IN (...))) GROUP BY i_manager_id, d_moy) AS tmp1 WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
+```
+
+## Original SQL
+
+```sql
+-- start query 80 in stream 0 using template query80.tpl
+with ssr as
+ (select  s_store_id as store_id,
+          sum(ss_ext_sales_price) as sales,
+          sum(coalesce(sr_return_amt, 0)) as "returns",
+          sum(ss_net_profit - coalesce(sr_net_loss, 0)) as profit
+  from store_sales left outer join store_returns on
+         (ss_item_sk = sr_item_sk and ss_ticket_number = sr_ticket_number),
+     date_dim,
+     store,
+     item,
+     promotion
+ where ss_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-28' as date) 
+                  and (cast('1998-08-28' as date) + INTERVAL 30 DAY)
+       and ss_store_sk = s_store_sk
+       and ss_item_sk = i_item_sk
+       and i_current_price > 50
+       and ss_promo_sk = p_promo_sk
+       and p_channel_tv = 'N'
+ group by s_store_id)
+ ,
+ csr as
+ (select  cp_catalog_page_id as catalog_page_id,
+          sum(cs_ext_sales_price) as sales,
+          sum(coalesce(cr_return_amount, 0)) as "returns",
+          sum(cs_net_profit - coalesce(cr_net_loss, 0)) as profit
+  from catalog_sales left outer join catalog_returns on
+         (cs_item_sk = cr_item_sk and cs_order_number = cr_order_number),
+     date_dim,
+     catalog_page,
+     item,
+     promotion
+ where cs_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-28' as date)
+                  and (cast('1998-08-28' as date) + INTERVAL 30 DAY)
+        and cs_catalog_page_sk = cp_catalog_page_sk
+       and cs_item_sk = i_item_sk
+       and i_current_price > 50
+       and cs_promo_sk = p_promo_sk
+       and p_channel_tv = 'N'
+group by cp_catalog_page_id)
+ ,
+ wsr as
+ (select  web_site_id,
+          sum(ws_ext_sales_price) as sales,
+          sum(coalesce(wr_return_amt, 0)) as "returns",
+          sum(ws_net_profit - coalesce(wr_net_loss, 0)) as profit
+  from web_sales left outer join web_returns on
+         (ws_item_sk = wr_item_sk and ws_order_number = wr_order_number),
+     date_dim,
+     web_site,
+     item,
+     promotion
+ where ws_sold_date_sk = d_date_sk
+       and d_date between cast('1998-08-28' as date)
+                  and (cast('1998-08-28' as date) + INTERVAL 30 DAY)
+        and ws_web_site_sk = web_site_sk
+       and ws_item_sk = i_item_sk
+       and i_current_price > 50
+       and ws_promo_sk = p_promo_sk
+       and p_channel_tv = 'N'
+group by web_site_id)
+  select channel
+        , id
+        , sum(sales) as sales
+        , sum("returns") as "returns"
+        , sum(profit) as profit
+ from 
+ (select 'store channel' as channel
+        , 'store' || store_id as id
+        , sales
+        , "returns"
+        , profit
+ from   ssr
+ union all
+ select 'catalog channel' as channel
+        , 'catalog_page' || catalog_page_id as id
+        , sales
+        , "returns"
+        , profit
+ from  csr
+ union all
+ select 'web channel' as channel
+        , 'web_site' || web_site_id as id
+        , sales
+        , "returns"
+        , profit
+ from   wsr
+ ) x
+ group by rollup (channel, id)
+ order by channel
+         ,id
+ LIMIT 100;
+
+-- end query 80 in stream 0 using template query80.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `channel`
+  2. `id`
+  3. `sales`
+  4. `returns`
+  5. `profit`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] csr  [=]  Cost: 25%  Rows: ~1K  — Aggregate catalog-channel sales/returns/profit by catalog page id from catalog sales left-joined to catalog returns under the same filters.
+│   ├── SCAN (catalog_sales, catalog_returns (join), date_dim (join), catalog_page (join), item (join), promotion (join))
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   ├── JOIN (cs_catalog_page_sk = cp_catalog_page_sk)
+│   ├── JOIN (+2 more)
+│   ├── FILTER (d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL '30' DAY))
+│   ├── FILTER (i_current_price > 50)
+│   ├── FILTER (+1 more)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (catalog_page_id, sales, returns, profit)
+├── [CTE] ssr  [=]  Cost: 25%  Rows: ~1K  — Aggregate store-channel sales/returns/profit by store id from store sales left-joined to store returns under the date, item-price, and promotion filters.
+│   ├── SCAN (store_sales, store_returns (join), date_dim (join), store (join), item (join), promotion (join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── JOIN (ss_store_sk = s_store_sk)
+│   ├── JOIN (+2 more)
+│   ├── FILTER (d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL '30' DAY))
+│   ├── FILTER (i_current_price > 50)
+│   ├── FILTER (+1 more)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (store_id, sales, returns, profit)
+├── [CTE] wsr  [=]  Cost: 25%  Rows: ~1K  — Aggregate web-channel sales/returns/profit by web site id from web sales left-joined to web returns under the same filters.
+│   ├── SCAN (web_sales, web_returns (join), date_dim (join), web_site (join), item (join), promotion (join))
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── JOIN (ws_web_site_sk = web_site_sk)
+│   ├── JOIN (+2 more)
+│   ├── FILTER (d_date BETWEEN CAST('1998-08-28' AS DATE) AND (CAST('1998-08-28' AS DATE) + INTERVAL '30' DAY))
+│   ├── FILTER (i_current_price > 50)
+│   ├── FILTER (+1 more)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (web_site_id, sales, returns, profit)
+└── [MAIN] main_query  [=]  Cost: 25%  Rows: ~1K  — Union channel aggregates, label channel/entity ids, and produce rollup totals of sales, returns, and profit by channel and id.
+    ├── SCAN (wsr, ssr, csr)
+    ├── AGG (GROUP BY)
+    ├── SORT (channel ASC, id ASC)
+    └── OUTPUT (channel, id, sales, returns, profit)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

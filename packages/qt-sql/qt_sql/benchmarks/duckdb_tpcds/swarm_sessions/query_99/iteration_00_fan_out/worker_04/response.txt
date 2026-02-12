@@ -1,0 +1,75 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~100 — Reorganized into CTE structure per target logical tree
+    ├── [~] CTE filtered_date: pre-filter date_dim to d_month_seq range
+    │   └── SCAN (date_dim)
+    │       └── FILTER (d_month_seq BETWEEN 1224 AND 1224 + 11)
+    ├── [~] CTE fact_agg_with_keys: early aggregation on surrogate keys with single-pass CASE sums
+    │   ├── JOIN (catalog_sales INNER JOIN filtered_date ON cs_ship_date_sk = d_date_sk)
+    │   └── AGG (GROUP BY cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk)
+    ├── [~] CTE join_dimensions: join aggregated facts with three dimension tables
+    │   ├── JOIN (fact_agg_with_keys INNER JOIN warehouse ON cs_warehouse_sk = w_warehouse_sk)
+    │   ├── JOIN (+ ship_mode ON cs_ship_mode_sk = sm_ship_mode_sk)
+    │   └── JOIN (+ call_center ON cs_call_center_sk = cc_call_center_sk)
+    └── [~] top_n: final projection, ordering, and limit
+        ├── PROJECT (substr(w_warehouse_name,1,20), sm_type, cc_name, five sum columns)
+        ├── SORT (substr(w_warehouse_name,1,20) ASC, sm_type ASC, cc_name ASC)
+        └── LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_aggregation", "description": "Consolidate five bucket aggregates into single GROUP BY on surrogate keys before dimension joins", "applied_to": ["fact_agg_with_keys"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Isolate date filter into separate CTE; join dimensions sequentially after aggregation", "applied_to": ["filtered_date", "join_dimensions"]},
+    {"id": "R3", "type": "logical_tree_follow", "description": "Structure query exactly as target logical tree: filtered_date → fact_agg_with_keys → join_dimensions → top_n", "applied_to": ["main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1224 AND 1224 + 11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "fact_agg_with_keys": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk, SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk <= 30) THEN 1 ELSE 0 END) AS \"30 days\", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 30) AND (cs_ship_date_sk - cs_sold_date_sk <= 60) THEN 1 ELSE 0 END) AS \"31-60 days\", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 60) AND (cs_ship_date_sk - cs_sold_date_sk <= 90) THEN 1 ELSE 0 END) AS \"61-90 days\", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 90) AND (cs_ship_date_sk - cs_sold_date_sk <= 120) THEN 1 ELSE 0 END) AS \"91-120 days\", SUM(CASE WHEN (cs_ship_date_sk - cs_sold_date_sk > 120) THEN 1 ELSE 0 END) AS \">120 days\" FROM catalog_sales JOIN filtered_date ON cs_ship_date_sk = d_date_sk GROUP BY cs_warehouse_sk, cs_ship_mode_sk, cs_call_center_sk",
+        "interfaces": {"outputs": ["cs_warehouse_sk", "cs_ship_mode_sk", "cs_call_center_sk", "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"], "consumes": ["filtered_date"]}
+      },
+      "join_dimensions": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT SUBSTR(w_warehouse_name, 1, 20), sm_type, cc_name, f.\"30 days\", f.\"31-60 days\", f.\"61-90 days\", f.\"91-120 days\", f.\">120 days\" FROM fact_agg_with_keys f JOIN warehouse ON f.cs_warehouse_sk = warehouse.w_warehouse_sk JOIN ship_mode ON f.cs_ship_mode_sk = ship_mode.sm_ship_mode_sk JOIN call_center ON f.cs_call_center_sk = call_center.cc_call_center_sk",
+        "interfaces": {"outputs": ["SUBSTR(w_warehouse_name, 1, 20)", "sm_type", "cc_name", "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"], "consumes": ["fact_agg_with_keys"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT * FROM join_dimensions ORDER BY SUBSTR(w_warehouse_name, 1, 20), sm_type, cc_name LIMIT 100",
+        "interfaces": {"outputs": ["SUBSTR(w_warehouse_name, 1, 20)", "sm_type", "cc_name", "30 days", "31-60 days", "61-90 days", "91-120 days", ">120 days"], "consumes": ["join_dimensions"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "fact_agg_with_keys", "join_dimensions", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), fact_agg_with_keys AS ({fact_agg_with_keys}), join_dimensions AS ({join_dimensions}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Explanation
+
+**Changes:** Restructured the original flat join-and-aggregate query into the exact target logical tree: date filter CTE → early aggregation on surrogate keys → dimension joins → final projection/ordering. This applies single-pass aggregation (combining five bucket sums into one GROUP BY) and dimension CTE isolation (pre-filtering date_dim).
+
+**Expected speedup:** ~1.5-2x due to reduced fact table scan size (via early date filter) and cheaper aggregation on integer keys before dimension string processing. The biggest win comes from computing all five bucket aggregates in a single pass over filtered catalog_sales rows.

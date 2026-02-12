@@ -1,0 +1,179 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Cost: 100%  Rows: ~0
+    ├── CTE_WITH (filtered_dates_d1, filtered_dates_d2, filtered_item, filtered_customer_dims, filtered_store_returns, filtered_store_sales, filtered_web_sales)  [+]
+    │   ├── filtered_dates_d1  [!]
+    │   │   └── SCAN (date_dim d1)  [=]
+    │   │       └── FILTER (d_year = 1998)  [=]
+    │   │
+    │   ├── filtered_dates_d2  [!]
+    │   │   └── SCAN (date_dim d2)  [=]
+    │   │       └── FILTER (EXISTS (SELECT 1 FROM filtered_dates_d1 WHERE d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '90 DAY')))  [~] (from implicit join to explicit subquery)
+    │   │
+    │   ├── filtered_item  [!]
+    │   │   └── SCAN (item)  [=]
+    │   │       └── FILTER (i_category IN ('Children', 'Electronics', 'Music'))  [=]
+    │   │
+    │   ├── filtered_customer_dims  [!]
+    │   │   ├── SCAN (customer)  [=]
+    │   │   ├── JOIN (customer_address ON c_current_addr_sk = ca_address_sk)  [~] (comma → explicit)
+    │   │   ├── JOIN (household_demographics ON c_current_hdemo_sk = hd_demo_sk)  [~] (comma → explicit)
+    │   │   └── FILTER (ca_state IN ('AR', 'CO', 'NC', 'NY', 'TX'), hd_income_band_sk BETWEEN 7 AND 13, hd_buy_potential = '0-500')  [=]
+    │   │
+    │   ├── filtered_store_returns  [!]
+    │   │   ├── SCAN (store_returns)  [=]
+    │   │   ├── JOIN (filtered_dates_d1 ON sr_returned_date_sk = d_date_sk)  [~] (comma → explicit)
+    │   │   └── JOIN (filtered_item ON sr_item_sk = i_item_sk)  [~] (comma → explicit)
+    │   │
+    │   ├── filtered_store_sales  [!]
+    │   │   ├── SCAN (store_sales)  [=]
+    │   │   ├── JOIN (filtered_store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk)  [~] (comma → explicit)
+    │   │   ├── JOIN (filtered_item ON ss_item_sk = i_item_sk)  [~] (comma → explicit)
+    │   │   ├── JOIN (filtered_customer_dims ON ss_customer_sk = c_customer_sk)  [~] (comma → explicit)
+    │   │   └── FILTER (ss_sales_price / ss_list_price BETWEEN 35 * 0.01 AND 55 * 0.01)  [=]
+    │   │
+    │   └── filtered_web_sales  [!]
+    │       ├── SCAN (web_sales)  [=]
+    │       ├── JOIN (filtered_store_returns ON ws_item_sk = sr_item_sk)  [~] (comma → explicit)
+    │       └── JOIN (filtered_dates_d2 ON ws_sold_date_sk = d_date_sk)  [~] (comma → explicit)
+    │
+    ├── main_join  [!]
+    │   ├── FROM (filtered_store_sales)  [~] (CTE reference)
+    │   ├── JOIN (filtered_web_sales ON ss_customer_sk = ws_bill_customer_sk AND ss_item_sk = ws_item_sk)  [~] (comma → explicit)
+    │   ├── GROUP BY (c_customer_sk, c_first_name, c_last_name)  [=]
+    │   └── AGG (COUNT(*) AS cnt)  [=]
+    │
+    └── final_sort  [!]
+        ├── FROM (main_join)  [~] (CTE reference)
+        └── ORDER BY (cnt)  [=]
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "dimension_prefetch_star",
+      "description": "Isolate selective dimension filters into separate CTEs (date, item, customer) to create tiny hash tables for fact table joins",
+      "applied_to": ["filtered_dates_d1", "filtered_dates_d2", "filtered_item", "filtered_customer_dims"]
+    },
+    {
+      "id": "R2",
+      "type": "explicit_join_conversion",
+      "description": "Convert all comma-separated joins to explicit JOIN syntax for better cardinality estimation and join order control",
+      "applied_to": ["filtered_customer_dims", "filtered_store_returns", "filtered_store_sales", "filtered_web_sales", "main_join"]
+    },
+    {
+      "id": "R3",
+      "type": "cte_fact_pushdown",
+      "description": "Push filtered fact tables (store_returns, store_sales, web_sales) through dimension CTEs to reduce intermediate result sizes",
+      "applied_to": ["filtered_store_returns", "filtered_store_sales", "filtered_web_sales"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_dates_d1": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT d_date_sk, d_date FROM date_dim d1 WHERE d1.d_year = 1998",
+          "interfaces": {
+            "outputs": ["d_date_sk", "d_date"],
+            "consumes": []
+          }
+        },
+        "filtered_dates_d2": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT d2.d_date_sk, d2.d_date FROM date_dim d2 WHERE EXISTS (SELECT 1 FROM filtered_dates_d1 d1 WHERE d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '90 DAY'))",
+          "interfaces": {
+            "outputs": ["d_date_sk", "d_date"],
+            "consumes": ["filtered_dates_d1"]
+          }
+        },
+        "filtered_item": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT i_item_sk FROM item WHERE i_category IN ('Children', 'Electronics', 'Music')",
+          "interfaces": {
+            "outputs": ["i_item_sk"],
+            "consumes": []
+          }
+        },
+        "filtered_customer_dims": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT c.c_customer_sk, c.c_first_name, c.c_last_name, c.c_current_addr_sk, c.c_current_hdemo_sk FROM customer c INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk INNER JOIN household_demographics hd ON c.c_current_hdemo_sk = hd.hd_demo_sk WHERE ca.ca_state IN ('AR', 'CO', 'NC', 'NY', 'TX') AND hd.hd_income_band_sk BETWEEN 7 AND 13 AND hd.hd_buy_potential = '0-500'",
+          "interfaces": {
+            "outputs": ["c_customer_sk", "c_first_name", "c_last_name", "c_current_addr_sk", "c_current_hdemo_sk"],
+            "consumes": []
+          }
+        },
+        "filtered_store_returns": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT sr.sr_ticket_number, sr.sr_item_sk, sr.sr_returned_date_sk FROM store_returns sr INNER JOIN filtered_dates_d1 d1 ON sr.sr_returned_date_sk = d1.d_date_sk INNER JOIN filtered_item i ON sr.sr_item_sk = i.i_item_sk",
+          "interfaces": {
+            "outputs": ["sr_ticket_number", "sr_item_sk", "sr_returned_date_sk"],
+            "consumes": ["filtered_dates_d1", "filtered_item"]
+          }
+        },
+        "filtered_store_sales": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT ss.ss_customer_sk, ss.ss_item_sk, ss.ss_ticket_number FROM store_sales ss INNER JOIN filtered_store_returns sr ON ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_item_sk = sr.sr_item_sk INNER JOIN filtered_item i ON ss.ss_item_sk = i.i_item_sk INNER JOIN filtered_customer_dims c ON ss.ss_customer_sk = c.c_customer_sk WHERE ss.ss_sales_price / ss.ss_list_price BETWEEN 35 * 0.01 AND 55 * 0.01",
+          "interfaces": {
+            "outputs": ["ss_customer_sk", "ss_item_sk", "ss_ticket_number"],
+            "consumes": ["filtered_store_returns", "filtered_item", "filtered_customer_dims"]
+          }
+        },
+        "filtered_web_sales": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT ws.ws_bill_customer_sk, ws.ws_item_sk FROM web_sales ws INNER JOIN filtered_store_returns sr ON ws.ws_item_sk = sr.sr_item_sk INNER JOIN filtered_dates_d2 d2 ON ws.ws_sold_date_sk = d2.d_date_sk",
+          "interfaces": {
+            "outputs": ["ws_bill_customer_sk", "ws_item_sk"],
+            "consumes": ["filtered_store_returns", "filtered_dates_d2"]
+          }
+        },
+        "main_join": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT fs.ss_customer_sk AS c_customer_sk, c.c_first_name, c.c_last_name, COUNT(*) AS cnt FROM filtered_store_sales fs INNER JOIN filtered_web_sales ws ON fs.ss_customer_sk = ws.ws_bill_customer_sk AND fs.ss_item_sk = ws.ws_item_sk INNER JOIN filtered_customer_dims c ON fs.ss_customer_sk = c.c_customer_sk GROUP BY fs.ss_customer_sk, c.c_first_name, c.c_last_name",
+          "interfaces": {
+            "outputs": ["c_customer_sk", "c_first_name", "c_last_name", "cnt"],
+            "consumes": ["filtered_store_sales", "filtered_web_sales", "filtered_customer_dims"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT c_customer_sk, c_first_name, c_last_name, cnt FROM main_join ORDER BY cnt",
+          "interfaces": {
+            "outputs": ["c_customer_sk", "c_first_name", "c_last_name", "cnt"],
+            "consumes": ["main_join"]
+          }
+        }
+      },
+      "reconstruction_order": ["filtered_dates_d1", "filtered_dates_d2", "filtered_item", "filtered_customer_dims", "filtered_store_returns", "filtered_store_sales", "filtered_web_sales", "main_join", "main_query"],
+      "assembly_template": "WITH filtered_dates_d1 AS ({filtered_dates_d1}), filtered_dates_d2 AS ({filtered_dates_d2}), filtered_item AS ({filtered_item}), filtered_customer_dims AS ({filtered_customer_dims}), filtered_store_returns AS ({filtered_store_returns}), filtered_store_sales AS ({filtered_store_sales}), filtered_web_sales AS ({filtered_web_sales}), main_join AS ({main_join}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Converted from single-statement comma joins to explicit CTE-based star join with dimension prefetching. Each selective dimension (date, item, customer) is pre-filtered into separate CTEs, then fact tables are joined through these filtered dimensions. All joins are explicit INNER JOINs matching the original semantics.
+
+**Expected speedup**: ~3x (dimension prefetch creates tiny hash tables for fact joins; explicit joins give optimizer better cardinality estimates; CTE structure avoids large intermediate Cartesian products from comma joins)

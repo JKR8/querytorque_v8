@@ -1,0 +1,93 @@
+### Part 1: Modified Logic Tree
+```
+QUERY: (single statement)
+├── [CTE] date_filter  [+]  — Filter date_dim once for shared month sequence range.
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_month_seq BETWEEN 1214 AND 1214 + 11)
+│   └── OUTPUT (d_date_sk)
+├── [CTE] store_sales_join  [+]  — Join store_sales with filtered dates.
+│   ├── SCAN (store_sales)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   └── OUTPUT (ss_customer_sk AS customer_sk, ss_item_sk AS item_sk)
+├── [CTE] store_group_by  [+]  — Distinct customer‑item pairs from store channel.
+│   ├── SCAN (store_sales_join)
+│   ├── AGG (GROUP BY customer_sk, item_sk)
+│   └── OUTPUT (customer_sk, item_sk)
+├── [CTE] catalog_sales_join  [+]  — Join catalog_sales with filtered dates.
+│   ├── SCAN (catalog_sales)
+│   ├── JOIN (cs_sold_date_sk = d_date_sk)
+│   └── OUTPUT (cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk)
+├── [CTE] catalog_group_by  [+]  — Distinct customer‑item pairs from catalog channel.
+│   ├── SCAN (catalog_sales_join)
+│   ├── AGG (GROUP BY customer_sk, item_sk)
+│   └── OUTPUT (customer_sk, item_sk)
+└── [MAIN] main_join  [~]  — Full outer join of grouped pairs, compute three‑way bucket counts.
+    ├── SCAN (store_group_by, catalog_group_by (full outer join))
+    ├── AGG (no GROUP BY, SUM of conditional flags)
+    └── OUTPUT (store_only, catalog_only, store_and_catalog)
+```
+
+### Part 2: Component Payload JSON
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "shared_dimension_multi_channel", "description": "Extracted shared date filter into a reusable CTE to avoid redundant date_dim scans.", "applied_to": ["date_filter"]},
+    {"id": "R2", "type": "date_cte_isolate", "description": "Isolated date filter into a separate CTE, enabling hash‑join with small dimension table.", "applied_to": ["store_sales_join", "catalog_sales_join"]},
+    {"id": "R3", "type": "structural_decomposition", "description": "Split original CTEs (ssci, csci) into separate join‑then‑group steps per Target Logical Tree.", "applied_to": ["store_sales_join", "store_group_by", "catalog_sales_join", "catalog_group_by"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filter": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1214 AND 1214 + 11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "store_sales_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_customer_sk AS customer_sk, ss_item_sk AS item_sk FROM store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["customer_sk", "item_sk"], "consumes": ["date_filter"]}
+      },
+      "store_group_by": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT customer_sk, item_sk FROM store_sales_join GROUP BY customer_sk, item_sk",
+        "interfaces": {"outputs": ["customer_sk", "item_sk"], "consumes": ["store_sales_join"]}
+      },
+      "catalog_sales_join": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk FROM catalog_sales JOIN date_filter ON cs_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["customer_sk", "item_sk"], "consumes": ["date_filter"]}
+      },
+      "catalog_group_by": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT customer_sk, item_sk FROM catalog_sales_join GROUP BY customer_sk, item_sk",
+        "interfaces": {"outputs": ["customer_sk", "item_sk"], "consumes": ["catalog_sales_join"]}
+      },
+      "main_join": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT SUM(CASE WHEN store_group_by.customer_sk IS NOT NULL AND catalog_group_by.customer_sk IS NULL THEN 1 ELSE 0 END) AS store_only, SUM(CASE WHEN store_group_by.customer_sk IS NULL AND catalog_group_by.customer_sk IS NOT NULL THEN 1 ELSE 0 END) AS catalog_only, SUM(CASE WHEN store_group_by.customer_sk IS NOT NULL AND catalog_group_by.customer_sk IS NOT NULL THEN 1 ELSE 0 END) AS store_and_catalog FROM store_group_by FULL OUTER JOIN catalog_group_by ON (store_group_by.customer_sk = catalog_group_by.customer_sk AND store_group_by.item_sk = catalog_group_by.item_sk) LIMIT 100",
+        "interfaces": {"outputs": ["store_only", "catalog_only", "store_and_catalog"], "consumes": ["store_group_by", "catalog_group_by"]}
+      }
+    },
+    "reconstruction_order": ["date_filter", "store_sales_join", "store_group_by", "catalog_sales_join", "catalog_group_by", "main_join"],
+    "assembly_template": "WITH date_filter AS ({date_filter}), store_sales_join AS ({store_sales_join}), store_group_by AS ({store_group_by}), catalog_sales_join AS ({catalog_sales_join}), catalog_group_by AS ({catalog_group_by}) {main_join}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Explanation of Changes
+**Changes:** Extracted the shared date filter into a reusable CTE (`date_filter`), then split the original two CTEs (`ssci`, `csci`) into separate join‑then‑group steps per the Target Logical Tree, preserving the exact full‑outer‑join logic and conditional aggregation.
+
+**Expected speedup:** ~1.3‑1.5× from avoiding redundant date_dim scans and enabling hash‑joins with a small, materialized date set. The overhead of additional CTEs is minimal because each is referenced only once and DuckDB can inline them. The query baseline (~2311 ms) is large enough to absorb CTE materialization costs.

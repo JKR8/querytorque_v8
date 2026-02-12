@@ -1,0 +1,364 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+(a) Business intent: Compare item-level cumulative daily sales between web and store channels over month sequence 1216-1227, returning dates where web cumulative sales exceed store cumulative sales.
+(b) JOIN semantics: FULL OUTER JOIN between web and store CTEs on item_sk and d_date preserves rows from both channels even when one channel has no sales on a given day; missing values become NULL.
+(c) Aggregation traps: The window function SUM(SUM(...)) OVER computes running totals; the outer SUM OVER is monotonic and grouping-safe. The final MAX OVER carries forward last non-null cumulative value.
+(d) Filter dependencies: The date filter d_month_seq BETWEEN 1216 AND 1216+11 must be applied before joining with fact tables; web/item_sk IS NOT NULL filters are redundant but safe.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+date_filtered -> web_daily -> store_daily -> combined_daily -> cumulative_single_pass -> final_filter
+NODE_CONTRACTS:
+  date_filtered:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1216 AND 1216+11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 365
+    CONSUMERS: web_daily, store_daily
+  web_daily:
+    FROM: web_sales INNER JOIN date_filtered ON ws_sold_date_sk = d_date_sk
+    WHERE: ws_item_sk IS NOT NULL
+    GROUP BY: ws_item_sk, d_date
+    AGGREGATE: daily_web_sales = SUM(ws_sales_price)
+    OUTPUT: ws_item_sk, d_date, daily_web_sales
+    EXPECTED_ROWS: 1.4M
+    CONSUMERS: combined_daily
+  store_daily:
+    FROM: store_sales INNER JOIN date_filtered ON ss_sold_date_sk = d_date_sk
+    WHERE: ss_item_sk IS NOT NULL
+    GROUP BY: ss_item_sk, d_date
+    AGGREGATE: daily_store_sales = SUM(ss_sales_price)
+    OUTPUT: ss_item_sk, d_date, daily_store_sales
+    EXPECTED_ROWS: 4.6M
+    CONSUMERS: combined_daily
+  combined_daily:
+    FROM: web_daily FULL OUTER JOIN store_daily ON web_daily.ws_item_sk = store_daily.ss_item_sk AND web_daily.d_date = store_daily.d_date
+    OUTPUT: COALESCE(web_daily.ws_item_sk, store_daily.ss_item_sk) AS item_sk, COALESCE(web_daily.d_date, store_daily.d_date) AS d_date, daily_web_sales, daily_store_sales
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: cumulative_single_pass
+  cumulative_single_pass:
+    FROM: combined_daily
+    WINDOW: PARTITION BY item_sk ORDER BY d_date
+    OUTPUT: item_sk, d_date, daily_web_sales, daily_store_sales, SUM(daily_web_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS web_cumulative, SUM(daily_store_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS store_cumulative
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: final_filter
+  final_filter:
+    FROM: cumulative_single_pass
+    WHERE: web_cumulative > store_cumulative
+    ORDER BY: item_sk, d_date
+    LIMIT: 100
+    OUTPUT: item_sk, d_date, daily_web_sales AS web_sales, daily_store_sales AS store_sales, web_cumulative, store_cumulative
+    EXPECTED_ROWS: 100
+
+NODE_CONTRACTS:
+date_filtered:
+    FROM: date_dim
+    WHERE: d_month_seq BETWEEN 1216 AND 1216+11
+    OUTPUT: d_date_sk, d_date
+    EXPECTED_ROWS: 365
+    CONSUMERS: web_daily, store_daily
+  web_daily:
+    FROM: web_sales INNER JOIN date_filtered ON ws_sold_date_sk = d_date_sk
+    WHERE: ws_item_sk IS NOT NULL
+    GROUP BY: ws_item_sk, d_date
+    AGGREGATE: daily_web_sales = SUM(ws_sales_price)
+    OUTPUT: ws_item_sk, d_date, daily_web_sales
+    EXPECTED_ROWS: 1.4M
+    CONSUMERS: combined_daily
+  store_daily:
+    FROM: store_sales INNER JOIN date_filtered ON ss_sold_date_sk = d_date_sk
+    WHERE: ss_item_sk IS NOT NULL
+    GROUP BY: ss_item_sk, d_date
+    AGGREGATE: daily_store_sales = SUM(ss_sales_price)
+    OUTPUT: ss_item_sk, d_date, daily_store_sales
+    EXPECTED_ROWS: 4.6M
+    CONSUMERS: combined_daily
+  combined_daily:
+    FROM: web_daily FULL OUTER JOIN store_daily ON web_daily.ws_item_sk = store_daily.ss_item_sk AND web_daily.d_date = store_daily.d_date
+    OUTPUT: COALESCE(web_daily.ws_item_sk, store_daily.ss_item_sk) AS item_sk, COALESCE(web_daily.d_date, store_daily.d_date) AS d_date, daily_web_sales, daily_store_sales
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: cumulative_single_pass
+  cumulative_single_pass:
+    FROM: combined_daily
+    WINDOW: PARTITION BY item_sk ORDER BY d_date
+    OUTPUT: item_sk, d_date, daily_web_sales, daily_store_sales, SUM(daily_web_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS web_cumulative, SUM(daily_store_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS UNBOUNDED PRECEDING) AS store_cumulative
+    EXPECTED_ROWS: 5.5M
+    CONSUMERS: final_filter
+  final_filter:
+    FROM: cumulative_single_pass
+    WHERE: web_cumulative > store_cumulative
+    ORDER BY: item_sk, d_date
+    LIMIT: 100
+    OUTPUT: item_sk, d_date, daily_web_sales AS web_sales, daily_store_sales AS store_sales, web_cumulative, store_cumulative
+    EXPECTED_ROWS: 100
+
+## Hazard Flags (avoid these specific risks)
+
+- The window function SUM over daily_web_sales/daily_store_sales must handle NULLs (SUM ignores NULLs, which is correct).
+- The full outer join may produce rows where one channel's daily aggregate is NULL; the cumulative sum will treat NULL as 0.
+
+## Regression Warnings (observed failures on similar queries)
+
+1. regression_q51_date_cte_isolate (0.87x):
+   CAUSE: Materializing cumulative window aggregates into CTEs before a join that filters on those aggregates. The optimizer can co-optimize window evaluation and join filtering.
+   RULE: Do not materialize running/cumulative window aggregates into CTEs before joins that filter based on those aggregates.
+2. regression_q31_pushdown (0.49x):
+   CAUSE: Keeping both filtered and original CTEs causes redundant materialization and cardinality misestimates.
+   RULE: When creating filtered CTEs, remove the original unfiltered CTEs.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Output must include item_sk, d_date, web_sales, store_sales, web_cumulative, store_cumulative.
+- CTE_COLUMN_COMPLETENESS: Each CTE must output item_sk, d_date, and cumulative sales columns referenced downstream.
+- LITERAL_PRESERVATION: Date filter values 1216 and 1216+11 must be preserved exactly.
+- SEMANTIC_EQUIVALENCE: Must return same 100 rows ordered by item_sk, d_date.
+- CROSS_CTE_PREDICATE_BLINDNESS: Date filter applied twice (once per channel CTE) causing two date_dim scans (365 rows each) in EXPLAIN.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: Not applicable; no UNION CTE.
+- REDUNDANT_SCAN_ELIMINATION: Not applicable; each fact table scanned once per channel.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+Apply the deferred window pattern: compute daily aggregates in CTEs, then full outer join, then compute cumulative sums once. Ignore the fact that the example uses a different join type; we use FULL OUTER JOIN.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. deferred_window_aggregation (1.36x)
+
+**Principle:** Deferred Aggregation: delay expensive operations (window functions) until after joins reduce the dataset. Computing window functions inside individual CTEs then joining is more expensive than joining first and computing windows once on the combined result.
+
+**BEFORE (slow):**
+```sql
+WITH web_v1 as (
+select
+  ws_item_sk item_sk, d_date,
+  sum(sum(ws_sales_price))
+      over (partition by ws_item_sk order by d_date rows between unbounded preceding and current row) cume_sales
+from web_sales
+    ,date_dim
+where ws_sold_date_sk=d_date_sk
+  and d_month_seq between 1216 and 1216+11
+  and ws_item_sk is not NULL
+group by ws_item_sk, d_date),
+store_v1 as (
+select
+  ss_item_sk item_sk, d_date,
+  sum(sum(ss_sales_price))
+      over (partition by ss_item_sk order by d_date rows between unbounded preceding and current row) cume_sales
+from store_sales
+    ,date_dim
+where ss_sold_date_sk=d_date_sk
+  and d_month_seq between 1216 and 1216+11
+  and ss_item_sk is not NULL
+group by ss_item_sk, d_date)
+ select *
+from (select item_sk
+     ,d_date
+     ,web_sales
+     ,store_sales
+     ,max(web_sales)
+         over (partition by item_sk order by d_date rows between unbounded preceding and current row) web_cumulative
+     ,max(store_sales)
+         over (partition by item_sk order by d_date rows between unbounded preceding and current row) store_cumulative
+     from (select case when web.item_sk is not null then web.item_sk else store.item_sk end item_sk
+                 ,case when web.d_date is not null then web.d_date else store.d_date end d_date
+                 ,web.cume_sales web_sales
+                 ,store.cume_sales store_sales
+           from web_v1 web full outer join store_v1 store on (web.item_sk = store.item_sk
+                                                          and web.d_date = store.d_date)
+          )x )y
+where web_cumulative > store_cumulative
+order by item_sk
+        ,d_date
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[web_daily]:
+```sql
+SELECT ws_item_sk AS item_sk, d_date, SUM(ws_sales_price) AS daily_sales FROM web_sales, date_dim WHERE ws_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ws_item_sk IS NOT NULL GROUP BY ws_item_sk, d_date
+```
+[store_daily]:
+```sql
+SELECT ss_item_sk AS item_sk, d_date, SUM(ss_sales_price) AS daily_sales FROM store_sales, date_dim WHERE ss_sold_date_sk = d_date_sk AND d_month_seq BETWEEN 1216 AND 1216 + 11 AND ss_item_sk IS NOT NULL GROUP BY ss_item_sk, d_date
+```
+[main_query]:
+```sql
+SELECT * FROM (SELECT COALESCE(web.item_sk, store.item_sk) AS item_sk, COALESCE(web.d_date, store.d_date) AS d_date, SUM(web.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS web_cumulative, SUM(store.daily_sales) OVER (PARTITION BY COALESCE(web.item_sk, store.item_sk) ORDER BY COALESCE(web.d_date, store.d_date) ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS store_cumulative FROM web_daily web FULL OUTER JOIN store_daily store ON web.item_sk = store.item_sk AND web.d_date = store.d_date) y WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100
+```
+
+## Original SQL
+
+```sql
+-- start query 51 in stream 0 using template query51.tpl
+WITH web_v1 as (
+select
+  ws_item_sk item_sk, d_date,
+  sum(sum(ws_sales_price))
+      over (partition by ws_item_sk order by d_date rows between unbounded preceding and current row) cume_sales
+from web_sales
+    ,date_dim
+where ws_sold_date_sk=d_date_sk
+  and d_month_seq between 1216 and 1216+11
+  and ws_item_sk is not NULL
+group by ws_item_sk, d_date),
+store_v1 as (
+select
+  ss_item_sk item_sk, d_date,
+  sum(sum(ss_sales_price))
+      over (partition by ss_item_sk order by d_date rows between unbounded preceding and current row) cume_sales
+from store_sales
+    ,date_dim
+where ss_sold_date_sk=d_date_sk
+  and d_month_seq between 1216 and 1216+11
+  and ss_item_sk is not NULL
+group by ss_item_sk, d_date)
+ select *
+from (select item_sk
+     ,d_date
+     ,web_sales
+     ,store_sales
+     ,max(web_sales)
+         over (partition by item_sk order by d_date rows between unbounded preceding and current row) web_cumulative
+     ,max(store_sales)
+         over (partition by item_sk order by d_date rows between unbounded preceding and current row) store_cumulative
+     from (select case when web.item_sk is not null then web.item_sk else store.item_sk end item_sk
+                 ,case when web.d_date is not null then web.d_date else store.d_date end d_date
+                 ,web.cume_sales web_sales
+                 ,store.cume_sales store_sales
+           from web_v1 web full outer join store_v1 store on (web.item_sk = store.item_sk
+                                                          and web.d_date = store.d_date)
+          )x )y
+where web_cumulative > store_cumulative
+order by item_sk
+        ,d_date
+ LIMIT 100;
+
+-- end query 51 in stream 0 using template query51.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `*`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] store_v1  [=]  Cost: 33%  Rows: ~1K  — Compute cumulative store sales per item by date within the same sequence using windowed running sums.
+│   ├── SCAN (store_sales, date_dim (join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_month_seq BETWEEN 1216 AND 1216 + 11)
+│   ├── FILTER (NOT ss_item_sk IS NULL)
+│   ├── AGG (GROUP BY)
+│   ├── WINDOW
+│   ├── SORT (d_date ASC)
+│   └── OUTPUT (item_sk, d_date, cume_sales)
+├── [CTE] web_v1  [=]  Cost: 33%  Rows: ~1K  — Compute cumulative web sales per item by date within the 12-month sequence using windowed running sums.
+│   ├── SCAN (web_sales, date_dim (join))
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_month_seq BETWEEN 1216 AND 1216 + 11)
+│   ├── FILTER (NOT ws_item_sk IS NULL)
+│   ├── AGG (GROUP BY)
+│   ├── WINDOW
+│   ├── SORT (d_date ASC)
+│   └── OUTPUT (item_sk, d_date, cume_sales)
+└── [MAIN] main_query  [=]  Cost: 33%  Rows: ~1K  — Full-outer-join web and store daily cumulative series by item/date, carry forward cumulative maxima, and keep rows where web cumulative exceeds store cumulative.
+    ├── SCAN (web_v1 AS web (join), store_v1 AS store (join))
+    ├── FILTER (web_cumulative > store_cumulative)
+    ├── AGG (GROUP BY)
+    ├── SORT (item_sk ASC, d_date ASC)
+    └── OUTPUT (*)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

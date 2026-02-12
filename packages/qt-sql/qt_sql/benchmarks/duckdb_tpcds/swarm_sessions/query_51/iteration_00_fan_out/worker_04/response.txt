@@ -1,0 +1,103 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_cte  [+]  Cost: 1%  Rows: 365  — Extract filtered date dimension for month sequence 1216-1227
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_month_seq BETWEEN 1216 AND 1216+11)
+│   └── OUTPUT (d_date_sk, d_date)
+├── [CTE] web_daily  [+]  Cost: 33%  Rows: 1.4M  — Daily web sales aggregates per item/date
+│   ├── SCAN (web_sales)
+│   ├── JOIN (date_cte ON ws_sold_date_sk = d_date_sk)
+│   ├── FILTER (ws_item_sk IS NOT NULL)
+│   ├── AGG (GROUP BY ws_item_sk, d_date)
+│   ├── AGGREGATE (SUM(ws_sales_price) AS daily_web)
+│   └── OUTPUT (ws_item_sk, d_date, daily_web)
+├── [CTE] store_daily  [+]  Cost: 33%  Rows: 4.6M  — Daily store sales aggregates per item/date
+│   ├── SCAN (store_sales)
+│   ├── JOIN (date_cte ON ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (ss_item_sk IS NOT NULL)
+│   ├── AGG (GROUP BY ss_item_sk, d_date)
+│   ├── AGGREGATE (SUM(ss_sales_price) AS daily_store)
+│   └── OUTPUT (ss_item_sk, d_date, daily_store)
+├── [CTE] combined  [+]  Cost: 20%  Rows: 5.5M  — Full outer join of web and store daily aggregates
+│   ├── SCAN (web_daily, store_daily)
+│   ├── JOIN (FULL OUTER ON ws_item_sk = ss_item_sk AND web_daily.d_date = store_daily.d_date)
+│   └── OUTPUT (item_sk, d_date, daily_web, daily_store)
+├── [CTE] single_window_carryforward  [+]  Cost: 10%  Rows: 5.5M  — Compute running totals with carry-forward
+│   ├── SCAN (combined)
+│   ├── WINDOW (PARTITION BY item_sk ORDER BY d_date)
+│   ├── COMPUTE (web_cumulative, store_cumulative)
+│   └── OUTPUT (item_sk, d_date, web_sales, store_sales, web_cumulative, store_cumulative)
+└── [MAIN] main_query  [~]  Cost: 3%  Rows: 100  — Filter for web > store cumulative, order, limit
+    ├── SCAN (single_window_carryforward)
+    ├── FILTER (web_cumulative > store_cumulative)
+    ├── SORT (item_sk ASC, d_date ASC)
+    ├── LIMIT (100)
+    └── OUTPUT (*)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "deferred_window_aggregation", "description": "Move cumulative window computation after full join to avoid materializing expensive windows before join", "applied_to": ["single_window_carryforward"]},
+    {"id": "R2", "type": "shared_dimension_multi_channel", "description": "Extract shared date filter into reusable CTE to avoid redundant date_dim scans", "applied_to": ["date_cte"]},
+    {"id": "R3", "type": "cte_structure_preservation", "description": "Maintain exact node contract outputs and semantic equivalence while removing original window-from-CTE pattern", "applied_to": ["web_daily", "store_daily", "combined", "single_window_carryforward"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1216 AND 1216+11",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "web_daily": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_item_sk, d_date, SUM(ws_sales_price) AS daily_web FROM web_sales INNER JOIN date_cte ON ws_sold_date_sk = d_date_sk WHERE ws_item_sk IS NOT NULL GROUP BY ws_item_sk, d_date",
+        "interfaces": {"outputs": ["ws_item_sk", "d_date", "daily_web"], "consumes": ["date_cte"]}
+      },
+      "store_daily": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_item_sk, d_date, SUM(ss_sales_price) AS daily_store FROM store_sales INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk WHERE ss_item_sk IS NOT NULL GROUP BY ss_item_sk, d_date",
+        "interfaces": {"outputs": ["ss_item_sk", "d_date", "daily_store"], "consumes": ["date_cte"]}
+      },
+      "combined": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT COALESCE(web_daily.ws_item_sk, store_daily.ss_item_sk) AS item_sk, COALESCE(web_daily.d_date, store_daily.d_date) AS d_date, daily_web, daily_store FROM web_daily FULL OUTER JOIN store_daily ON web_daily.ws_item_sk = store_daily.ss_item_sk AND web_daily.d_date = store_daily.d_date",
+        "interfaces": {"outputs": ["item_sk", "d_date", "daily_web", "daily_store"], "consumes": ["web_daily", "store_daily"]}
+      },
+      "single_window_carryforward": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT item_sk, d_date, daily_web AS web_sales, daily_store AS store_sales, COALESCE(daily_web, LAST_VALUE(daily_web IGNORE NULLS) OVER (PARTITION BY item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS web_cumulative, COALESCE(daily_store, LAST_VALUE(daily_store IGNORE NULLS) OVER (PARTITION BY item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS store_cumulative FROM combined",
+        "interfaces": {"outputs": ["item_sk", "d_date", "web_sales", "store_sales", "web_cumulative", "store_cumulative"], "consumes": ["combined"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT * FROM single_window_carryforward WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100",
+        "interfaces": {"outputs": ["item_sk", "d_date", "web_sales", "store_sales", "web_cumulative", "store_cumulative"], "consumes": ["single_window_carryforward"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "web_daily", "store_daily", "combined", "single_window_carryforward", "main_query"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), web_daily AS ({web_daily}), store_daily AS ({store_daily}), combined AS ({combined}), single_window_carryforward AS ({single_window_carryforward}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured query into sequential CTEs following target logical tree: shared date filter CTE → daily aggregates per channel → full outer join → single-pass cumulative window with carry-forward → final filter. This defers expensive window computation until after join, eliminating duplicate window materialization and redundant date dimension scans.
+
+**Expected speedup:** 1.3-1.4x (combining benefits of deferred window aggregation and shared dimension extraction)

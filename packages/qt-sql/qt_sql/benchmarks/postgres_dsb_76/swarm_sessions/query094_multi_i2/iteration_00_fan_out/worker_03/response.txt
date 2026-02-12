@@ -1,0 +1,103 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query [~]  Cost: 100%  Rows: ~154K
+    ├── [CTE] multi_warehouse_orders [+]
+    │   └── SCAN web_sales (ws2) → GROUP BY ws_order_number
+    │       └── HAVING COUNT(DISTINCT ws_warehouse_sk) ≥ 2
+    ├── [CTE] bad_returns [+]
+    │   └── SCAN web_returns → FILTER wr_reason_sk IN (8,18,20,23,41)
+    │       └── GROUP BY wr_order_number
+    ├── [CTE] qualified_sales [+]
+    │   └── SCAN web_sales ws1, date_dim, customer_address, web_site, multi_warehouse_orders mwo
+    │       ├── JOIN (ws1.ws_ship_date_sk = d_date_sk)
+    │       ├── JOIN (ws1.ws_ship_addr_sk = ca_address_sk)
+    │       ├── JOIN (ws1.ws_web_site_sk = web_site_sk)
+    │       ├── JOIN (ws1.ws_order_number = mwo.ws_order_number)
+    │       ├── FILTER (d_date BETWEEN '1999-10-01' AND '1999-10-01' + INTERVAL '60 DAY')
+    │       ├── FILTER (ca_state IN ('MO','MT','OK','SC','TX','WI'))
+    │       ├── FILTER (web_gmt_offset >= -5)
+    │       ├── FILTER (ws_list_price BETWEEN 253 AND 282)
+    │       └── FILTER (NOT EXISTS (SELECT 1 FROM bad_returns br WHERE br.wr_order_number = ws1.ws_order_number))
+    └── AGGREGATE (COUNT(DISTINCT ws_order_number), SUM(ws_ext_ship_cost), SUM(ws_net_profit))
+        └── ORDER BY COUNT(DISTINCT ws_order_number) ASC
+            └── LIMIT 100
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL v16.11-0ubuntu0.24.04.1",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "inline_decorrelate_materialized",
+      "description": "Replace EXISTS for multi-warehouse with precomputed CTE, precompute bad returns in separate CTE, preserve NOT EXISTS anti-join semantics",
+      "applied_to": ["multi_warehouse_orders", "bad_returns", "qualified_sales"]
+    },
+    {
+      "id": "R2",
+      "type": "early_filter_decorrelate",
+      "description": "Push dimension filters (date, state, GMT offset, price) into main join, pre-aggregate multi-warehouse and bad returns before joining",
+      "applied_to": ["qualified_sales"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "multi_warehouse_orders": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ws_order_number FROM web_sales GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk) >= 2",
+          "interfaces": {
+            "outputs": ["ws_order_number"],
+            "consumes": []
+          }
+        },
+        "bad_returns": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT wr_order_number FROM web_returns WHERE wr_reason_sk IN (8, 18, 20, 23, 41) GROUP BY wr_order_number",
+          "interfaces": {
+            "outputs": ["wr_order_number"],
+            "consumes": []
+          }
+        },
+        "qualified_sales": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit FROM web_sales ws1 INNER JOIN date_dim ON ws1.ws_ship_date_sk = date_dim.d_date_sk INNER JOIN customer_address ON ws1.ws_ship_addr_sk = customer_address.ca_address_sk INNER JOIN web_site ON ws1.ws_web_site_sk = web_site.web_site_sk INNER JOIN multi_warehouse_orders mwo ON ws1.ws_order_number = mwo.ws_order_number WHERE date_dim.d_date BETWEEN '1999-10-01' AND CAST('1999-10-01' AS DATE) + INTERVAL '60 DAY' AND customer_address.ca_state IN ('MO', 'MT', 'OK', 'SC', 'TX', 'WI') AND web_site.web_gmt_offset >= -5 AND ws1.ws_list_price BETWEEN 253 AND 282 AND NOT EXISTS (SELECT 1 FROM bad_returns br WHERE br.wr_order_number = ws1.ws_order_number)",
+          "interfaces": {
+            "outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"],
+            "consumes": ["multi_warehouse_orders", "bad_returns"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT COUNT(DISTINCT ws_order_number) AS \"order count\", SUM(ws_ext_ship_cost) AS \"total shipping cost\", SUM(ws_net_profit) AS \"total net profit\" FROM qualified_sales ORDER BY COUNT(DISTINCT ws_order_number) LIMIT 100",
+          "interfaces": {
+            "outputs": ["order count", "total shipping cost", "total net profit"],
+            "consumes": ["qualified_sales"]
+          }
+        }
+      },
+      "reconstruction_order": ["multi_warehouse_orders", "bad_returns", "qualified_sales", "main_query"],
+      "assembly_template": "WITH multi_warehouse_orders AS ({multi_warehouse_orders}), bad_returns AS ({bad_returns}), qualified_sales AS ({qualified_sales}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured the original query into three CTEs: (1) `multi_warehouse_orders` to find orders fulfilled from ≥2 warehouses, (2) `bad_returns` to precompute orders with prohibited return reasons, (3) `qualified_sales` to join dimension tables and apply all filters with an anti‑join against the bad returns CTE. This preserves the original NOT EXISTS semantics while enabling early filtering and decorrelation.
+
+**Expected speedup**: Moderate (1.2‑1.5×) due to pre‑aggregation of multi‑warehouse and bad‑returns sets, and explicit joins that allow better cardinality estimation. Anti‑join preserved to avoid IN‑list materialization penalty.

@@ -1,0 +1,129 @@
+**Part 1: Modified Logic Tree**
+
+```
+QUERY: (single statement)
+├── [CTE] ss_all_quarters  [~]  Cost: 73% → ~50% (materialized once)
+│   ├── SCAN (store_sales, date_dim (join), customer_address (join), item (join))  [=]
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)  [=]
+│   ├── JOIN (ss_addr_sk = ca_address_sk)  [=]
+│   ├── JOIN (+1 more)  [=]
+│   ├── FILTER (i_color IN ('dark', 'puff'))  [=]
+│   ├── FILTER (i_manager_id BETWEEN 15 AND 34)  [=]
+│   ├── FILTER (+2 more)  [=]
+│   ├── AGG (GROUP BY ca_county, d_qoy, d_year)  [=]
+│   └── OUTPUT (ca_county, d_qoy, d_year, store_sales)  [=]
+├── [CTE] ss_pivot  [+]  New pivot via CASE aggregation
+│   ├── SCAN (ss_all_quarters)  [=]
+│   ├── AGG (GROUP BY ca_county, d_year)  [=]
+│   ├── PIVOT (MAX(CASE WHEN d_qoy=1 THEN store_sales END) AS store_sales_q1, ...)  [+]
+│   └── OUTPUT (ca_county, d_year, store_sales_q1, store_sales_q2, store_sales_q3)  [+]
+├── [CTE] ws_all_quarters  [~]  Cost: 1% → ~25% (materialized once)
+│   ├── SCAN (web_sales, date_dim (join), customer_address (join), item (join))  [=]
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)  [=]
+│   ├── JOIN (ws_bill_addr_sk = ca_address_sk)  [=]
+│   ├── JOIN (+1 more)  [=]
+│   ├── FILTER (i_color IN ('dark', 'puff'))  [=]
+│   ├── FILTER (i_manager_id BETWEEN 15 AND 34)  [=]
+│   ├── FILTER (+2 more)  [=]
+│   ├── AGG (GROUP BY ca_county, d_qoy, d_year)  [=]
+│   └── OUTPUT (ca_county, d_qoy, d_year, web_sales)  [=]
+├── [CTE] ws_pivot  [+]  New pivot via CASE aggregation
+│   ├── SCAN (ws_all_quarters)  [=]
+│   ├── AGG (GROUP BY ca_county, d_year)  [=]
+│   ├── PIVOT (MAX(CASE WHEN d_qoy=1 THEN web_sales END) AS web_sales_q1, ...)  [+]
+│   └── OUTPUT (ca_county, d_year, web_sales_q1, web_sales_q2, web_sales_q3)  [+]
+└── [MAIN] main_with_pivot  [!]  Structural change: single join + direct ratio comparisons
+    ├── SCAN (ss_pivot (join), ws_pivot (join))  [!]
+    ├── JOIN (ss_pivot.ca_county = ws_pivot.ca_county)  [!]
+    ├── FILTER (case when web_sales_q1>0 then web_sales_q2/web_sales_q1 else null end > ...)  [!]
+    ├── FILTER (case when web_sales_q2>0 then web_sales_q3/web_sales_q2 else null end > ...)  [!]
+    ├── COMPUTE (web_q1_q2_increase, store_q1_q2_increase, web_q2_q3_increase, store_q2_q3_increase)  [!]
+    ├── SORT (d_year ASC)  [=]
+    └── OUTPUT (ca_county, d_year, web_q1_q2_increase, store_q1_q2_increase, web_q2_q3_increase, store_q2_q3_increase)  [!]
+```
+
+**Part 2: Component Payload JSON**
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "single_pass_aggregation",
+      "description": "Replaced six self-joins of quarterly CTEs with two pivot CTEs that aggregate quarters into columns via MAX(CASE WHEN d_qoy=...).",
+      "applied_to": ["ss_pivot", "ws_pivot", "main_with_pivot"]
+    },
+    {
+      "id": "R2",
+      "type": "shared_materialization",
+      "description": "Kept separate materialized CTEs for store and web channels (ss_all_quarters, ws_all_quarters) to preserve inner join semantics and allow independent filtering.",
+      "applied_to": ["ss_all_quarters", "ws_all_quarters"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "ss_all_quarters": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT ca_county, d_qoy, d_year, SUM(ss_ext_sales_price) AS store_sales FROM store_sales, date_dim, customer_address, item WHERE ss_sold_date_sk = d_date_sk AND ss_addr_sk = ca_address_sk AND ss_item_sk = i_item_sk AND i_color IN ('dark', 'puff') AND i_manager_id BETWEEN 15 AND 34 AND ss_list_price BETWEEN 244 AND 258 AND ca_state IN ('KS', 'OH') AND d_year = 1999 AND d_qoy IN (1, 2, 3) GROUP BY ca_county, d_qoy, d_year",
+          "interfaces": {
+            "outputs": ["ca_county", "d_qoy", "d_year", "store_sales"],
+            "consumes": []
+          }
+        },
+        "ss_pivot": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ca_county, d_year, MAX(CASE WHEN d_qoy = 1 THEN store_sales END) AS store_sales_q1, MAX(CASE WHEN d_qoy = 2 THEN store_sales END) AS store_sales_q2, MAX(CASE WHEN d_qoy = 3 THEN store_sales END) AS store_sales_q3 FROM ss_all_quarters GROUP BY ca_county, d_year",
+          "interfaces": {
+            "outputs": ["ca_county", "d_year", "store_sales_q1", "store_sales_q2", "store_sales_q3"],
+            "consumes": ["ss_all_quarters"]
+          }
+        },
+        "ws_all_quarters": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT ca_county, d_qoy, d_year, SUM(ws_ext_sales_price) AS web_sales FROM web_sales, date_dim, customer_address, item WHERE ws_sold_date_sk = d_date_sk AND ws_bill_addr_sk = ca_address_sk AND ws_item_sk = i_item_sk AND i_color IN ('dark', 'puff') AND i_manager_id BETWEEN 15 AND 34 AND ws_list_price BETWEEN 244 AND 258 AND ca_state IN ('KS', 'OH') AND d_year = 1999 AND d_qoy IN (1, 2, 3) GROUP BY ca_county, d_qoy, d_year",
+          "interfaces": {
+            "outputs": ["ca_county", "d_qoy", "d_year", "web_sales"],
+            "consumes": []
+          }
+        },
+        "ws_pivot": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ca_county, d_year, MAX(CASE WHEN d_qoy = 1 THEN web_sales END) AS web_sales_q1, MAX(CASE WHEN d_qoy = 2 THEN web_sales END) AS web_sales_q2, MAX(CASE WHEN d_qoy = 3 THEN web_sales END) AS web_sales_q3 FROM ws_all_quarters GROUP BY ca_county, d_year",
+          "interfaces": {
+            "outputs": ["ca_county", "d_year", "web_sales_q1", "web_sales_q2", "web_sales_q3"],
+            "consumes": ["ws_all_quarters"]
+          }
+        },
+        "main_with_pivot": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT ss_pivot.ca_county, ss_pivot.d_year, CASE WHEN web_sales_q1 > 0 THEN web_sales_q2 / web_sales_q1 ELSE NULL END AS web_q1_q2_increase, CASE WHEN store_sales_q1 > 0 THEN store_sales_q2 / store_sales_q1 ELSE NULL END AS store_q1_q2_increase, CASE WHEN web_sales_q2 > 0 THEN web_sales_q3 / web_sales_q2 ELSE NULL END AS web_q2_q3_increase, CASE WHEN store_sales_q2 > 0 THEN store_sales_q3 / store_sales_q2 ELSE NULL END AS store_q2_q3_increase FROM ss_pivot JOIN ws_pivot ON ss_pivot.ca_county = ws_pivot.ca_county WHERE CASE WHEN web_sales_q1 > 0 THEN web_sales_q2 / web_sales_q1 ELSE NULL END > CASE WHEN store_sales_q1 > 0 THEN store_sales_q2 / store_sales_q1 ELSE NULL END AND CASE WHEN web_sales_q2 > 0 THEN web_sales_q3 / web_sales_q2 ELSE NULL END > CASE WHEN store_sales_q2 > 0 THEN store_sales_q3 / store_sales_q2 ELSE NULL END ORDER BY ss_pivot.d_year",
+          "interfaces": {
+            "outputs": ["ca_county", "d_year", "web_q1_q2_increase", "store_q1_q2_increase", "web_q2_q3_increase", "store_q2_q3_increase"],
+            "consumes": ["ss_pivot", "ws_pivot"]
+          }
+        }
+      },
+      "reconstruction_order": ["ss_all_quarters", "ss_pivot", "ws_all_quarters", "ws_pivot", "main_with_pivot"],
+      "assembly_template": "WITH ss_all_quarters AS ({ss_all_quarters}), ss_pivot AS ({ss_pivot}), ws_all_quarters AS ({ws_all_quarters}), ws_pivot AS ({ws_pivot}) {main_with_pivot}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL work_mem = '64MB'", "SET LOCAL enable_hashjoin = on", "SET LOCAL enable_mergejoin = off", "SET LOCAL enable_nestloop = off", "SET LOCAL hash_mem_multiplier = 2.0"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Replaced six self-joins of quarterly CTEs with two pivot CTEs that aggregate quarters into columns via `MAX(CASE WHEN d_qoy=...)`. This reduces the join complexity from O(n²) to O(n) and eliminates redundant scans. The materialized CTEs preserve inner-join semantics.
+
+**Expected speedup**: 3-4× due to elimination of self-join explosion (6-way to 2-way join) and reduced intermediate row count.

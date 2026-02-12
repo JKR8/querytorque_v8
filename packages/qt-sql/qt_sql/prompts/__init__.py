@@ -2,8 +2,9 @@
 
 from .swarm_fan_out import build_fan_out_prompt
 from .swarm_snipe import (
-    build_snipe_analyst_prompt,
-    build_sniper_prompt,
+    build_retry_worker_prompt,
+    build_snipe_analyst_prompt,   # DEPRECATED — kept for reference
+    build_sniper_prompt,          # DEPRECATED — kept for reference
 )
 from .swarm_common import build_worker_strategy_header
 from .swarm_parsers import (
@@ -51,9 +52,10 @@ __all__ = [
     "build_oneshot_section_checklist",
     "build_worker_rewrite_checklist",
     "validate_parsed_briefing",
-    # Snipe
-    "build_snipe_analyst_prompt",
-    "build_sniper_prompt",
+    # Snipe / Retry
+    "build_retry_worker_prompt",
+    "build_snipe_analyst_prompt",   # DEPRECATED
+    "build_sniper_prompt",          # DEPRECATED
     "SnipeAnalysis",
     "parse_snipe_response",
 ]

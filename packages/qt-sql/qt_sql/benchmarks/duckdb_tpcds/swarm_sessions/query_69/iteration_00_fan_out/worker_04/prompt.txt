@@ -1,0 +1,453 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+Profile customers in TX/VA/MI who made store purchases Jan-Mar 2000 but had no web or catalog purchases in same period. INNER JOIN semantics require all three base tables (customer, address, demographics) to match. EXISTS/NOT EXISTS are semi/anti joins with early termination—do NOT materialize full result sets. Aggregation uses COUNT(*) only, duplicate-safe. Filter dependencies: date filter (d_year=2000, d_moy 1-3) must apply identically to all three channel subqueries; state filter applies before EXISTS checks.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+date_range -> store_customers -> web_customers -> catalog_customers -> customer_set -> customer_join -> group_by
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_moy BETWEEN 1 AND 3
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: store_customers, web_customers, catalog_customers
+  store_customers:
+    FROM: store_sales JOIN date_range ON ss_sold_date_sk = d_date_sk
+    OUTPUT: DISTINCT ss_customer_sk
+    EXPECTED_ROWS: ~116K (distinct customers from store_sales in period)
+    CONSUMERS: customer_set
+  web_customers:
+    FROM: web_sales JOIN date_range ON ws_sold_date_sk = d_date_sk
+    OUTPUT: DISTINCT ws_bill_customer_sk
+    EXPECTED_ROWS: ~3,753 (distinct customers from web_sales in period)
+    CONSUMERS: customer_set
+  catalog_customers:
+    FROM: catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk
+    OUTPUT: DISTINCT cs_ship_customer_sk
+    EXPECTED_ROWS: ~7,620 (distinct customers from catalog_sales in period)
+    CONSUMERS: customer_set
+  customer_set:
+    FROM: store_customers sc
+    WHERE: sc.ss_customer_sk NOT IN (SELECT ws_bill_customer_sk FROM web_customers)
+      AND sc.ss_customer_sk NOT IN (SELECT cs_ship_customer_sk FROM catalog_customers)
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: ~4,337
+    CONSUMERS: customer_join
+  customer_join:
+    FROM: customer_set cs
+      JOIN customer c ON cs.ss_customer_sk = c.c_customer_sk
+      JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+      JOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk
+    WHERE: ca.ca_state IN ('TX', 'VA', 'MI')
+    OUTPUT: cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating
+    EXPECTED_ROWS: 4,337
+    CONSUMERS: group_by
+  group_by:
+    FROM: customer_join
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    AGGREGATE: COUNT(*) AS cnt1, COUNT(*) AS cnt2, COUNT(*) AS cnt3
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3
+    EXPECTED_ROWS: 4,337
+    CONSUMERS: final_sort
+
+NODE_CONTRACTS:
+date_range:
+    FROM: date_dim
+    WHERE: d_year = 2000 AND d_moy BETWEEN 1 AND 3
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 91
+    CONSUMERS: store_customers, web_customers, catalog_customers
+  store_customers:
+    FROM: store_sales JOIN date_range ON ss_sold_date_sk = d_date_sk
+    OUTPUT: DISTINCT ss_customer_sk
+    EXPECTED_ROWS: ~116K (distinct customers from store_sales in period)
+    CONSUMERS: customer_set
+  web_customers:
+    FROM: web_sales JOIN date_range ON ws_sold_date_sk = d_date_sk
+    OUTPUT: DISTINCT ws_bill_customer_sk
+    EXPECTED_ROWS: ~3,753 (distinct customers from web_sales in period)
+    CONSUMERS: customer_set
+  catalog_customers:
+    FROM: catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk
+    OUTPUT: DISTINCT cs_ship_customer_sk
+    EXPECTED_ROWS: ~7,620 (distinct customers from catalog_sales in period)
+    CONSUMERS: customer_set
+  customer_set:
+    FROM: store_customers sc
+    WHERE: sc.ss_customer_sk NOT IN (SELECT ws_bill_customer_sk FROM web_customers)
+      AND sc.ss_customer_sk NOT IN (SELECT cs_ship_customer_sk FROM catalog_customers)
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: ~4,337
+    CONSUMERS: customer_join
+  customer_join:
+    FROM: customer_set cs
+      JOIN customer c ON cs.ss_customer_sk = c.c_customer_sk
+      JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
+      JOIN customer_demographics cd ON c.c_current_cdemo_sk = cd.cd_demo_sk
+    WHERE: ca.ca_state IN ('TX', 'VA', 'MI')
+    OUTPUT: cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating
+    EXPECTED_ROWS: 4,337
+    CONSUMERS: group_by
+  group_by:
+    FROM: customer_join
+    GROUP BY: cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating
+    AGGREGATE: COUNT(*) AS cnt1, COUNT(*) AS cnt2, COUNT(*) AS cnt3
+    OUTPUT: cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3
+    EXPECTED_ROWS: 4,337
+    CONSUMERS: final_sort
+
+## Hazard Flags (avoid these specific risks)
+
+- NOT IN may have NULL handling issues; ensure customer keys are non-NULL.
+- Materializing distinct customer keys per channel may be larger than semi/anti join intermediate results.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (combines date_cte_isolate with distinct key materialization and set operations)
+
+## Regression Warnings (observed failures on similar queries)
+
+1. date_cte_isolate (regression_q25_date_cte_isolate: 0.5x):
+   CAUSE: Pre-filtered and materialized fact table before 3-way fact join, preventing optimizer reordering.
+   RULE: Do NOT pre-join fact tables with date CTE if it forces join order; keep date CTE as dimension-only.
+2. materialize_cte (regression_q16_semantic_rewrite: 0.14x):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan instead of semi-join short-circuit.
+   RULE: Preserve EXISTS/NOT EXISTS as semi/anti joins; do NOT materialize channel existence checks.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3 in original order.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (customer keys, demographic columns, date keys).
+- LITERAL_PRESERVATION: Must preserve d_year=2000, d_moy between 1 and 3, ca_state IN ('TX','VA','MI').
+- SEMANTIC_EQUIVALENCE: Must return exactly same rows as original query.
+- CROSS_CTE_PREDICATE_BLINDNESS: date_dim scanned 3 times with same filter (EXPLAIN shows 3 separate FILTER nodes on date_dim).
+- REDUNDANT_SCAN_ELIMINATION: date_dim scanned 3 times (opportunity to consolidate to 1 scan).
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+composite_decorrelate_union: Extract shared date filter, create distinct customer key CTEs per channel, combine with set operations (NOT IN). Ignore the UNION aspect — Q35 used UNION for EXISTS with OR.
+  multi_intersect_exists_cte: Use NOT IN instead of INTERSECT for anti-join. Ignore the cascading INTERSECT — Q14 had INTERSECT.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. composite_decorrelate_union (2.42x)
+
+**Principle:** Composite Decorrelation: when multiple correlated EXISTS share common filters, extract shared dimensions into a single CTE and decorrelate the EXISTS checks into pre-materialized key sets joined via UNION.
+
+**BEFORE (slow):**
+```sql
+select  
+  ca_state,
+  cd_gender,
+  cd_marital_status,
+  cd_dep_count,
+  count(*) cnt1,
+  max(cd_dep_count),
+  sum(cd_dep_count),
+  max(cd_dep_count),
+  cd_dep_employed_count,
+  count(*) cnt2,
+  max(cd_dep_employed_count),
+  sum(cd_dep_employed_count),
+  max(cd_dep_employed_count),
+  cd_dep_college_count,
+  count(*) cnt3,
+  max(cd_dep_college_count),
+  sum(cd_dep_college_count),
+  max(cd_dep_college_count)
+ from
+  customer c,customer_address ca,customer_demographics
+ where
+  c.c_current_addr_sk = ca.ca_address_sk and
+  cd_demo_sk = c.c_current_cdemo_sk and 
+  exists (select *
+          from store_sales,date_dim
+          where c.c_customer_sk = ss_customer_sk and
+                ss_sold_date_sk = d_date_sk and
+                d_year = 2001 and
+                d_qoy < 4) and
+   (exists (select *
+            from web_sales,date_dim
+            where c.c_customer_sk = ws_bill_customer_sk and
+                  ws_sold_date_sk = d_date_sk and
+                  d_year = 2001 and
+                  d_qoy < 4) or 
+    exists (select * 
+            from catalog_sales,date_dim
+            where c.c_customer_sk = cs_ship_customer_sk and
+                  cs_sold_date_sk = d_date_sk and
+                  d_year = 2001 and
+                  d_qoy < 4))
+ group by ca_state,
+          cd_gender,
+          cd_marital_status,
+          cd_dep_count,
+          cd_dep_employed_count,
+          cd_dep_college_count
+ order by ca_state,
+          cd_gender,
+          cd_marital_status,
+          cd_dep_count,
+          cd_dep_employed_count,
+          cd_dep_college_count
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_qoy < 4
+```
+[store_customers]:
+```sql
+SELECT DISTINCT ss_customer_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+```
+[web_customers]:
+```sql
+SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk
+```
+[catalog_customers]:
+```sql
+SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk
+```
+[web_or_catalog_customers]:
+```sql
+SELECT ws_bill_customer_sk AS customer_sk FROM web_customers UNION SELECT cs_ship_customer_sk AS customer_sk FROM catalog_customers
+```
+[main_query]:
+```sql
+SELECT ca_state, cd_gender, cd_marital_status, cd_dep_count, COUNT(*) AS cnt1, MAX(cd_dep_count), SUM(cd_dep_count), MAX(cd_dep_count), cd_dep_employed_count, COUNT(*) AS cnt2, MAX(cd_dep_employed_count), SUM(cd_dep_employed_count), MAX(cd_dep_employed_count), cd_dep_college_count, COUNT(*) AS cnt3, MAX(cd_dep_college_count), SUM(cd_dep_college_count), MAX(cd_dep_college_count) FROM customer AS c JOIN customer_address AS ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics ON cd_demo_sk = c.c_current_cdemo_sk JOIN store_customers AS sc ON c.c_customer_sk = sc.ss_customer_sk JOIN web_or_catalog_customers AS wcc ON c.c_customer_sk = wcc.customer_sk GROUP BY ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100
+```
+
+### 2. multi_intersect_exists_cte (2.39x)
+
+**BEFORE (slow):**
+```sql
+with cross_items as
+ (select i_item_sk ss_item_sk
+ from item,
+ (select iss.i_brand_id brand_id, iss.i_class_id class_id, iss.i_category_id category_id
+ from store_sales, item iss, date_dim d1
+ where ss_item_sk = iss.i_item_sk and ss_sold_date_sk = d1.d_date_sk
+   and d1.d_year between 2000 AND 2000 + 2
+ intersect
+ select ics.i_brand_id, ics.i_class_id, ics.i_category_id
+ from catalog_sales, item ics, date_dim d2
+ where cs_item_sk = ics.i_item_sk and cs_sold_date_sk = d2.d_date_sk
+   and d2.d_year between 2000 AND 2000 + 2
+ intersect
+ select iws.i_brand_id, iws.i_class_id, iws.i_category_id
+ from web_sales, item iws, date_dim d3
+ where ws_item_sk = iws.i_item_sk and ws_sold_date_sk = d3.d_date_sk
+   and d3.d_year between 2000 AND 2000 + 2)
+ where i_brand_id = brand_id and i_class_id = class_id and i_category_id = category_id),
+ avg_sales as
+ (select avg(quantity*list_price) average_sales
+  from (select ss_quantity quantity, ss_list_price list_price from store_sales, date_dim where ss_sold_date_sk = d_date_sk and d_year between 2000 and 2000 + 2
+   union all select cs_quantity, cs_list_price from catalog_sales, date_dim where cs_sold_date_sk = d_date_sk and d_year between 2000 and 2000 + 2
+   union all select ws_quantity, ws_list_price from web_sales, date_dim where ws_sold_date_sk = d_date_sk and d_year between 2000 and 2000 + 2) x)
+ select channel, i_brand_id, i_class_id, i_category_id, sum(sales), sum(number_sales)
+ from (
+  select 'store' channel, i_brand_id, i_class_id, i_category_id, sum(ss_quantity*ss_list_price) sales, count(*) number_sales
+  from store_sales, item, date_dim
+  where ss_item_sk in (select ss_item_sk from cross_items) and ss_item_sk = i_item_sk and ss_sold_date_sk = d_date_sk and d_year = 2000+2 and d_moy = 11
+  group by i_brand_id, i_class_id, i_category_id
+  having sum(ss_quantity*ss_list_price) > (select average_sales from avg_sales)
+  union all
+  select 'catalog' channel, i_brand_id, i_class_id, i_category_id, sum(cs_quantity*cs_list_price) sales, count(*) number_sales
+  from catalog_sales, item, date_dim
+  where cs_item_sk in (select ss_item_sk from cross_items) and cs_item_sk = i_item_sk and cs_sold_date_sk = d_date_sk and d_year = 2000+2 and d_moy = 11
+  group by i_brand_id, i_class_id, i_category_id
+  having sum(cs_quantity*cs_list_price) > (select average_sales from avg_sales)
+  union all
+  select 'web' channel, i_brand_id, i_class_id, i_category_id, sum(ws_quantity*ws_list_price) sales, count(*) number_sales
+  from web_sales, item, date_dim
+  where ws_item_sk in (select ss_item_sk from cross_items) and ws_item_sk = i_item_sk and ws_sold_date_sk = d_date_sk and d_year = 2000+2 and d_moy = 11
+  group by i_brand_id, i_class_id, i_category_id
+  having sum(ws_quantity*ws_list_price) > (select average_sales from avg_sales)
+ ) y
+ group by rollup (channel, i_brand_id, i_class_id, i_category_id)
+ order by channel, i_brand_id, i_class_id, i_category_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year BETWEEN 2000 AND 2002
+```
+[cross_items]:
+```sql
+SELECT i_item_sk AS ss_item_sk, i_brand_id, i_class_id, i_category_id FROM item WHERE EXISTS (SELECT 1 FROM store_sales JOIN item iss ON ss_item_sk = iss.i_item_sk JOIN filtered_dates d1 ON ss_sold_date_sk = d1.d_date_sk WHERE iss.i_brand_id = item.i_brand_id AND iss.i_class_id = item.i_class_id AND iss.i_category_id = item.i_category_id) AND EXISTS (SELECT 1 FROM catalog_sales JOIN item ics ON cs_item_sk = ics.i_item_sk JOIN filtered_dates d2 ON cs_sold_date_sk = d2.d_date_sk WHERE ics.i_brand_id = item.i_brand_id AND ics.i_class_id = item.i_class_id AND ics.i_category_id = item.i_category_id) AND EXISTS (SELECT 1 FROM web_sales JOIN item iws ON ws_item_sk = iws.i_item_sk JOIN filtered_dates d3 ON ws_sold_date_sk = d3.d_date_sk WHERE iws.i_brand_id = item.i_brand_id AND iws.i_class_id = item.i_class_id AND iws.i_category_id = item.i_category_id)
+```
+
+## Original SQL
+
+```sql
+-- start query 69 in stream 0 using template query69.tpl
+select 
+  cd_gender,
+  cd_marital_status,
+  cd_education_status,
+  count(*) cnt1,
+  cd_purchase_estimate,
+  count(*) cnt2,
+  cd_credit_rating,
+  count(*) cnt3
+ from
+  customer c,customer_address ca,customer_demographics
+ where
+  c.c_current_addr_sk = ca.ca_address_sk and
+  ca_state in ('TX','VA','MI') and
+  cd_demo_sk = c.c_current_cdemo_sk and 
+  exists (select *
+          from store_sales,date_dim
+          where c.c_customer_sk = ss_customer_sk and
+                ss_sold_date_sk = d_date_sk and
+                d_year = 2000 and
+                d_moy between 1 and 1+2) and
+   (not exists (select *
+            from web_sales,date_dim
+            where c.c_customer_sk = ws_bill_customer_sk and
+                  ws_sold_date_sk = d_date_sk and
+                  d_year = 2000 and
+                  d_moy between 1 and 1+2) and
+    not exists (select * 
+            from catalog_sales,date_dim
+            where c.c_customer_sk = cs_ship_customer_sk and
+                  cs_sold_date_sk = d_date_sk and
+                  d_year = 2000 and
+                  d_moy between 1 and 1+2))
+ group by cd_gender,
+          cd_marital_status,
+          cd_education_status,
+          cd_purchase_estimate,
+          cd_credit_rating
+ order by cd_gender,
+          cd_marital_status,
+          cd_education_status,
+          cd_purchase_estimate,
+          cd_credit_rating
+ LIMIT 100;
+
+-- end query 69 in stream 0 using template query69.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `cd_gender`
+  2. `cd_marital_status`
+  3. `cd_education_status`
+  4. `cnt1`
+  5. `cd_purchase_estimate`
+  6. `cnt2`
+  7. `cd_credit_rating`
+  8. `cnt3`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K  — Join customer/address/demographics, enforce store-sales EXISTS and web/catalog NOT EXISTS constraints over the Jan-Mar 2000 window, then group and count by demographic dimensions.
+    ├── SCAN (customer AS c (join), customer_address AS ca (join), customer_demographics (join), date_dim (join))
+    ├── JOIN (c.c_current_addr_sk = ca.ca_address_sk)
+    ├── JOIN (cd_demo_sk = c.c_current_cdemo_sk)
+    ├── FILTER (ca_state IN ('TX', 'VA', 'MI'))
+    ├── FILTER (EXISTS(SELECT * FROM store_sales, date_dim WHERE c.c_customer_sk = ss_customer_sk AND ss_sold_date_sk = d_date_sk AND d_year = 2000 AND d_moy BETWEEN 1 AND 1 + 2))
+    ├── AGG (GROUP BY)
+    ├── SORT (cd_gender ASC, cd_marital_status ASC, cd_education_status ASC, cd_purchase_estimate ASC, cd_credit_rating ASC)
+    └── OUTPUT (cd_gender, cd_marital_status, cd_education_status, cnt1, cd_purchase_estimate, cnt2, cd_credit_rating, cnt3)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

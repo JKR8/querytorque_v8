@@ -1,0 +1,86 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K — Calculate AM/PM ratio via unified single fact scan with prefetched dimensions.
+    ├── [~] COMPONENT dim_time (CTE)  [=]  Cost: 0%  Rows: ~14.4K — Prefiltered time dimension for both AM and PM windows.
+    ├── [~] COMPONENT dim_hd (CTE)  [=]  Cost: 0%  Rows: ~720 — Prefiltered household dimension for dependents=2.
+    ├── [~] COMPONENT dim_wp (CTE)  [=]  Cost: 0%  Rows: ~3 — Prefiltered web page dimension for medium character count.
+    ├── [~] COMPONENT single_fact_join (CTE)  [=]  Cost: 99%  Rows: ~2.5K — Single fact table scan joined with all prefetched dimensions.
+    ├── [~] COMPONENT post_join_aggregate (CTE)  [=]  Cost: 0%  Rows: ~1 — Conditional counts for AM and PM in one aggregation.
+    └── [~] COMPONENT final_ratio  [=]  Cost: 1%  Rows: ~1 — Compute ratio with decimal division, ordered and limited.
+        ├── INPUT (from post_join_aggregate)
+        ├── PROJECT (CAST(amc AS DECIMAL(15,4)) / CAST(pmc AS DECIMAL(15,4)) AS am_pm_ratio)
+        ├── SORT (am_pm_ratio ASC)
+        └── OUTPUT (am_pm_ratio)
+```
+
+**Change markers explained:**
+- `[~]` main_query: Structural change from two correlated subqueries to a unified CTE chain with prefetched dimensions.
+- `[~]` Components: All CTEs are new implementations replacing the original correlated subqueries.
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Prefilter dimension tables into separate CTEs before fact join", "applied_to": ["dim_time", "dim_hd", "dim_wp"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Single fact table scan joined with all prefiltered dimensions in one CTE", "applied_to": ["single_fact_join"]},
+    {"id": "R3", "type": "conditional_aggregation", "description": "Consolidate two count subqueries into one conditional aggregation", "applied_to": ["post_join_aggregate"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "dim_time": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT t_time_sk, t_hour FROM time_dim WHERE t_hour BETWEEN 10 AND 11 OR t_hour BETWEEN 16 AND 17",
+        "interfaces": {"outputs": ["t_time_sk", "t_hour"], "consumes": []}
+      },
+      "dim_hd": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT hd_demo_sk FROM household_demographics WHERE hd_dep_count = 2",
+        "interfaces": {"outputs": ["hd_demo_sk"], "consumes": []}
+      },
+      "dim_wp": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT wp_web_page_sk FROM web_page WHERE wp_char_count BETWEEN 5000 AND 5200",
+        "interfaces": {"outputs": ["wp_web_page_sk"], "consumes": []}
+      },
+      "single_fact_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws_sold_time_sk, ws_ship_hdemo_sk, ws_web_page_sk, t_hour FROM web_sales INNER JOIN dim_time ON ws_sold_time_sk = t_time_sk INNER JOIN dim_hd ON ws_ship_hdemo_sk = hd_demo_sk INNER JOIN dim_wp ON ws_web_page_sk = wp_web_page_sk",
+        "interfaces": {"outputs": ["ws_sold_time_sk", "ws_ship_hdemo_sk", "ws_web_page_sk", "t_hour"], "consumes": ["dim_time", "dim_hd", "dim_wp"]}
+      },
+      "post_join_aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT SUM(CASE WHEN t_hour BETWEEN 10 AND 11 THEN 1 ELSE 0 END) AS amc, SUM(CASE WHEN t_hour BETWEEN 16 AND 17 THEN 1 ELSE 0 END) AS pmc FROM single_fact_join",
+        "interfaces": {"outputs": ["amc", "pmc"], "consumes": ["single_fact_join"]}
+      },
+      "final_ratio": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT CAST(amc AS DECIMAL(15,4)) / CAST(pmc AS DECIMAL(15,4)) AS am_pm_ratio FROM post_join_aggregate ORDER BY am_pm_ratio LIMIT 100",
+        "interfaces": {"outputs": ["am_pm_ratio"], "consumes": ["post_join_aggregate"]}
+      }
+    },
+    "reconstruction_order": ["dim_time", "dim_hd", "dim_wp", "single_fact_join", "post_join_aggregate", "final_ratio"],
+    "assembly_template": "WITH dim_time AS ({dim_time}), dim_hd AS ({dim_hd}), dim_wp AS ({dim_wp}), single_fact_join AS ({single_fact_join}), post_join_aggregate AS ({post_join_aggregate}) {final_ratio}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Changes Explanation
+**Structural change:** Replaced the two correlated subqueries (each scanning `web_sales` separately with AM/PM filters) with a unified CTE pipeline that prefilters all dimension tables first, then performs a single fact table scan joined with all dimensions, followed by conditional aggregation to compute both counts. This eliminates the redundant fact table scan.
+
+**Expected speedup:** ~2.2x (single fact scan instead of two, plus dimension prefiltering reduces join probe cost).

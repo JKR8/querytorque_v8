@@ -1,0 +1,293 @@
+<reasoning>
+1. **CLASSIFY**: This is a "channel-comparison self-join" archetype (specifically month-to-month comparison). The query:
+   - Filters inventory data for 1998
+   - Groups by warehouse, item, and month
+   - Computes statistics (mean, stdev, coefficient of variation)
+   - Filters groups with high variability (cov > 1)
+   - Self-joins the result to compare month 1 vs month 2 for same warehouse-item pairs
+   - Two variants: one without extra filter, one with inv1.cov > 1.5
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   The EXPLAIN plan shows operator-exclusive wall-clock times (in microseconds). I need to interpret these:
+   - The numbers appear to be a sequence of execution times per operator
+   - Since there are 52 numbers and the logical tree has ~8-10 nodes, each physical operator likely has multiple timing measurements
+   - Without explicit operator labels, I can infer bottlenecks from logical structure:
+     * The CTE `inv` scans 4 tables (inventory, item, warehouse, date_dim) with joins
+     * Inventory is the largest fact table (billions of rows)
+     * The grouping is by 4 columns (warehouse, item, month) - potentially many groups
+     * The main query self-joins the CTE twice
+   - Key bottleneck: Computing stddev_samp and avg over the entire 1998 inventory dataset
+   - Row count flow: inventory (huge) → grouped by warehouse/item/month (smaller) → filtered by cov>1 (even smaller) → self-join on month 1 & 2 (tiny)
+   - The optimizer likely already pushes d_year=1998 into the scan
+   - The CTE is referenced twice (inv1, inv2), so it may be materialized once
+
+3. **GAP MATCHING**:
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: The CTE computes stats for ALL months in 1998, but main query only needs months 1 and 2. Predicate `d_moy IN (1,2)` is NOT pushed into CTE.
+   - **REDUNDANT_SCAN_ELIMINATION**: The CTE scans inventory once, but could we compute stats for both months 1 and 2 in a single pass? Currently groups by d_moy, producing separate rows.
+   - **UNION_CTE_SELF_JOIN_DECOMPOSITION**: The CTE is generic (all months) and self-joined with month filters. Could split into specialized month CTEs.
+   - **SELF_JOIN_TO_WINDOW**: Could replace self-join with window functions to get month 1 and 2 stats side-by-side.
+
+4. **AGGREGATION TRAP CHECK**:
+   - `STDDEV_SAMP(inv_quantity_on_hand)` and `AVG(inv_quantity_on_hand)` are grouping-sensitive
+   - Current grouping: `(w_warehouse_sk, i_item_sk, d_moy)`
+   - If we change grouping to `(w_warehouse_sk, i_item_sk)` and use conditional aggregation with `CASE WHEN d_moy=1 THEN inv_quantity_on_hand END`, the stddev/avg would be computed over ONLY rows where d_moy=1, which is CORRECT because we're partitioning by month.
+   - The coefficient of variation calculation `stdev/mean` is safe.
+
+5. **TRANSFORM SELECTION** (ranked by potential):
+   a. **single_pass_aggregation** (scan consolidation): Compute stats for months 1 and 2 in one scan with CASE aggregation
+   b. **union_cte_split**: Split CTE into month1 and month2 specialized CTEs
+   c. **date_cte_isolate**: Pre-filter date_dim for months 1,2 of 1998
+   d. **self_join_to_window**: Replace self-join with LAG/LEAD window functions
+   
+   The optimizer already handles intra-scan predicate pushdown, so simple filter pushing won't help. The big opportunity is reducing the inventory scan size by pushing month filter earlier.
+
+6. **LOGICAL TREE DESIGN**:
+   For each strategy, define CTE structure ensuring all needed columns are included.
+   Check CTE_COLUMN_COMPLETENESS: The main query needs w_warehouse_sk, i_item_sk, d_moy, mean, cov for both months.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Compare January and February 1998 inventory statistics (mean, coefficient of variation) for warehouse-item combinations with high monthly variability (cov > 1). JOIN semantics: INNER self-join requires both months to exist for same warehouse-item pair. Aggregation trap: STDDEV_SAMP requires ≥2 non-NULL values per group; changing group partitioning changes results. Filter dependency: cov>1 filter in CTE must apply BEFORE month filtering to preserve semantics.
+
+BOTTLENECK_DIAGNOSIS:
+Scan-bound: Computing stddev_samp and avg over entire 1998 inventory dataset dominates cost. Cardinality flow: billions of inventory rows → grouped by (warehouse, item, month) → filtered by cov>1 → self-join for months 1&2. Optimizer already pushes d_year=1998 filter but NOT d_moy IN (1,2), causing full-year scan for only 2 months. Logical-tree cost percentages misleading: CTE shows 50% but actual scan cost higher.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must preserve all 10 output columns in exact order
+- CTE_COLUMN_COMPLETENESS: CTEs must include w_warehouse_sk, i_item_sk, d_moy, mean, cov for downstream self-join
+- LITERAL_PRESERVATION: Must keep d_year=1998, d_moy=1, d_moy=2, cov>1, cov>1.5 exactly
+- SEMANTIC_EQUIVALENCE: Must return identical rows as original
+- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows full-year scan despite only needing months 1&2
+- REDUNDANT_SCAN_ELIMINATION: Single inventory scan could compute both month stats
+
+REGRESSION_WARNINGS:
+1. pushdown (0.49x on Q31):
+   CAUSE: Created filtered versions of CTEs but kept original unfiltered CTEs, causing redundant materialization
+   RULE: When creating month-specialized CTEs, ELIMINATE the original all-months CTE
+2. date_cte_isolate (0.71x on Q1):
+   CAUSE: Decomposed well-structured CTE into slower pieces when optimizer already pushed predicates
+   RULE: Verify EXPLAIN doesn't already push d_moy filter before applying date isolation
+3. or_to_union (0.59x on Q90):
+   CAUSE: Split same-column time range into UNION branches, duplicating fact scans
+   RULE: Don't split d_moy IN (1,2) into UNION - engine handles single-column IN natively
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  filtered_dates -> inventory_join -> monthly_stats -> main_output
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 1998 AND d_moy IN (1, 2)
+    OUTPUT: d_date_sk, d_moy
+    EXPECTED_ROWS: ~60 (2 months × ~30 days)
+    CONSUMERS: inventory_join
+  inventory_join:
+    FROM: inventory
+    JOIN: INNER JOIN filtered_dates ON inv_date_sk = d_date_sk
+    JOIN: INNER JOIN item ON inv_item_sk = i_item_sk
+    JOIN: INNER JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk
+    WHERE: (none additional)
+    OUTPUT: w_warehouse_sk, i_item_sk, d_moy, inv_quantity_on_hand
+    EXPECTED_ROWS: ~1/6 of inventory (2/12 months)
+    CONSUMERS: monthly_stats
+  monthly_stats:
+    FROM: inventory_join
+    GROUP BY: w_warehouse_sk, i_item_sk
+    AGGREGATE: 
+      stddev_samp(CASE WHEN d_moy = 1 THEN inv_quantity_on_hand END) as stdev1,
+      avg(CASE WHEN d_moy = 1 THEN inv_quantity_on_hand END) as mean1,
+      stddev_samp(CASE WHEN d_moy = 2 THEN inv_quantity_on_hand END) as stdev2,
+      avg(CASE WHEN d_moy = 2 THEN inv_quantity_on_hand END) as mean2
+    OUTPUT: w_warehouse_sk, i_item_sk, stdev1, mean1, stdev2, mean2
+    EXPECTED_ROWS: ~warehouses×items with data in Jan/Feb
+    CONSUMERS: main_output
+  main_output:
+    FROM: monthly_stats
+    WHERE: 
+      CASE WHEN mean1 = 0 THEN 0 ELSE stdev1/mean1 END > 1
+      AND CASE WHEN mean2 = 0 THEN 0 ELSE stdev2/mean2 END > 1
+      [AND CASE WHEN mean1 = 0 THEN 0 ELSE stdev1/mean1 END > 1.5 for second query]
+    OUTPUT: 
+      w_warehouse_sk, i_item_sk, 
+      1 as d_moy1, mean1, CASE WHEN mean1 = 0 THEN NULL ELSE stdev1/mean1 END as cov1,
+      w_warehouse_sk, i_item_sk, 
+      2 as d_moy2, mean2, CASE WHEN mean2 = 0 THEN NULL ELSE stdev2/mean2 END as cov2
+    ORDER BY: w_warehouse_sk, i_item_sk, 1, mean1, cov1, 2, mean2, cov2
+    EXPECTED_ROWS: same as original
+    CONSUMERS: final
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply CASE WHEN conditional aggregation for months 1&2 in single GROUP BY; ignore the scalar subquery consolidation aspect
+- channel_bitmap_aggregation: Apply single scan with CASE labels; ignore the multi-channel aspect (we have months not channels)
+HAZARD_FLAGS:
+- STDDEV_SAMP over CASE returns NULL if <2 non-NULL values - preserves original semantics
+- Must compute cov filter PER MONTH before main query
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: union_cte_split
+TARGET_LOGICAL_TREE:
+  month1_stats -> month2_stats -> joined_months -> main_output
+NODE_CONTRACTS:
+  month1_stats:
+    FROM: inventory, item, warehouse, date_dim
+    WHERE: 
+      inv_item_sk = i_item_sk
+      AND inv_warehouse_sk = w_warehouse_sk
+      AND inv_date_sk = d_date_sk
+      AND d_year = 1998
+      AND d_moy = 1
+    GROUP BY: w_warehouse_sk, i_item_sk
+    AGGREGATE: 
+      stddev_samp(inv_quantity_on_hand) as stdev,
+      avg(inv_quantity_on_hand) as mean
+    HAVING: CASE WHEN avg(inv_quantity_on_hand) = 0 THEN 0 ELSE stddev_samp(inv_quantity_on_hand)/avg(inv_quantity_on_hand) END > 1
+    OUTPUT: w_warehouse_sk, i_item_sk, 1 as d_moy, stdev, mean, 
+            CASE WHEN mean = 0 THEN NULL ELSE stdev/mean END as cov
+    EXPECTED_ROWS: ~1/2 of final result
+    CONSUMERS: joined_months
+  month2_stats:
+    FROM: inventory, item, warehouse, date_dim
+    WHERE: 
+      inv_item_sk = i_item_sk
+      AND inv_warehouse_sk = w_warehouse_sk
+      AND inv_date_sk = d_date_sk
+      AND d_year = 1998
+      AND d_moy = 2
+    GROUP BY: w_warehouse_sk, i_item_sk
+    AGGREGATE: 
+      stddev_samp(inv_quantity_on_hand) as stdev,
+      avg(inv_quantity_on_hand) as mean
+    HAVING: CASE WHEN avg(inv_quantity_on_hand) = 0 THEN 0 ELSE stddev_samp(inv_quantity_on_hand)/avg(inv_quantity_on_hand) END > 1
+    OUTPUT: w_warehouse_sk, i_item_sk, 2 as d_moy, stdev, mean, 
+            CASE WHEN mean = 0 THEN NULL ELSE stdev/mean END as cov
+    EXPECTED_ROWS: ~1/2 of final result
+    CONSUMERS: joined_months
+  joined_months:
+    FROM: month1_stats JOIN month2_stats ON 
+      month1_stats.w_warehouse_sk = month2_stats.w_warehouse_sk
+      AND month1_stats.i_item_sk = month2_stats.i_item_sk
+    WHERE: [month1_stats.cov > 1.5 for second query]
+    OUTPUT: 
+      month1_stats.w_warehouse_sk, month1_stats.i_item_sk,
+      month1_stats.d_moy, month1_stats.mean, month1_stats.cov,
+      month2_stats.w_warehouse_sk, month2_stats.i_item_sk,
+      month2_stats.d_moy, month2_stats.mean, month2_stats.cov
+    ORDER BY: month1_stats.w_warehouse_sk, month1_stats.i_item_sk, 
+              month1_stats.d_moy, month1_stats.mean, month1_stats.cov,
+              month2_stats.d_moy, month2_stats.mean, month2_stats.cov
+    EXPECTED_ROWS: same as original
+    CONSUMERS: final
+EXAMPLES: union_cte_split, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+- union_cte_split: Split generic CTE into month-specialized CTEs; ignore the year-splitting aspect
+- shared_dimension_multi_channel: Apply dimension pre-filtering; ignore the multi-channel UNION ALL
+HAZARD_FLAGS:
+- Must ELIMINATE original all-months CTE to avoid redundant scan
+- Each month CTE scans inventory separately (2 scans vs original 1)
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: date_cte_isolate
+TARGET_LOGICAL_TREE:
+  filtered_dates -> inv_cte -> main_join -> main_output
+NODE_CONTRACTS:
+  filtered_dates:
+    FROM: date_dim
+    WHERE: d_year = 1998 AND d_moy IN (1, 2)
+    OUTPUT: d_date_sk, d_moy
+    EXPECTED_ROWS: ~60
+    CONSUMERS: inv_cte
+  inv_cte:
+    FROM: inventory
+    JOIN: INNER JOIN filtered_dates ON inv_date_sk = d_date_sk
+    JOIN: INNER JOIN item ON inv_item_sk = i_item_sk
+    JOIN: INNER JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk
+    GROUP BY: w_warehouse_sk, i_item_sk, d_moy
+    AGGREGATE: 
+      stddev_samp(inv_quantity_on_hand) as stdev,
+      avg(inv_quantity_on_hand) as mean
+    OUTPUT: w_warehouse_sk, i_item_sk, d_moy, stdev, mean,
+            CASE WHEN mean = 0 THEN NULL ELSE stdev/mean END as cov
+    HAVING: CASE WHEN mean = 0 THEN 0 ELSE stdev/mean END > 1
+    EXPECTED_ROWS: ~warehouses×items×2 with cov>1
+    CONSUMERS: main_join (twice as inv1 and inv2)
+  main_join:
+    FROM: inv_cte as inv1, inv_cte as inv2
+    WHERE: 
+      inv1.i_item_sk = inv2.i_item_sk
+      AND inv1.w_warehouse_sk = inv2.w_warehouse_sk
+      AND inv1.d_moy = 1
+      AND inv2.d_moy = 2
+      [AND inv1.cov > 1.5 for second query]
+    OUTPUT: 
+      inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,
+      inv2.w_warehouse_sk, inv2.i_item_sk, inv2.d_moy, inv2.mean, inv2.cov
+    ORDER BY: inv1.w_warehouse_sk, inv1.i_item_sk, inv1.d_moy, inv1.mean, inv1.cov,
+              inv2.d_moy, inv2.mean, inv2.cov
+    EXPECTED_ROWS: same as original
+    CONSUMERS: final
+EXAMPLES: date_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+- date_cte_isolate: Extract date filtering into separate CTE; apply to months 1&2 only
+- early_filter: Filter date dimension first; ignore other dimension filters (item, warehouse already selective)
+HAZARD_FLAGS:
+- Check EXPLAIN doesn't already push d_moy filter
+- CTE inv_cte still groups by d_moy (needed for self-join)
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: self_join_to_window
+TARGET_LOGICAL_TREE:
+  all_monthly_stats -> pivoted_stats -> main_output
+NODE_CONTRACTS:
+  all_monthly_stats:
+    FROM: inventory, item, warehouse, date_dim
+    WHERE: 
+      inv_item_sk = i_item_sk
+      AND inv_warehouse_sk = w_warehouse_sk
+      AND inv_date_sk = d_date_sk
+      AND d_year = 1998
+      AND d_moy IN (1, 2)
+    GROUP BY: w_warehouse_sk, i_item_sk, d_moy
+    AGGREGATE: 
+      stddev_samp(inv_quantity_on_hand) as stdev,
+      avg(inv_quantity_on_hand) as mean
+    OUTPUT: w_warehouse_sk, i_item_sk, d_moy, stdev, mean,
+            CASE WHEN mean = 0 THEN NULL ELSE stdev/mean END as cov
+    EXPECTED_ROWS: ~warehouses×items×2
+    CONSUMERS: pivoted_stats
+  pivoted_stats:
+    FROM: all_monthly_stats
+    WINDOW: 
+      LAG(mean) OVER (PARTITION BY w_warehouse_sk, i_item_sk ORDER BY d_moy) as prev_mean,
+      LAG(cov) OVER (PARTITION BY w_warehouse_sk, i_item_sk ORDER BY d_moy) as prev_cov,
+      LAG(d_moy) OVER (PARTITION BY w_warehouse_sk, i_item_sk ORDER BY d_moy) as prev_d_moy
+    WHERE: d_moy = 2 AND prev_d_moy = 1  -- consecutive months Jan->Feb
+      AND cov > 1 AND prev_cov > 1
+      [AND prev_cov > 1.5 for second query]
+    OUTPUT: 
+      w_warehouse_sk, i_item_sk,
+      prev_d_moy as d_moy1, prev_mean as mean1, prev_cov as cov1,
+      d_moy as d_moy2, mean as mean2, cov as cov2
+    EXPECTED_ROWS: same as original
+    CONSUMERS: main_output
+  main_output:
+    FROM: pivoted_stats
+    ORDER BY: w_warehouse_sk, i_item_sk, d_moy1, mean1, cov1, d_moy2, mean2, cov2
+    OUTPUT: w_warehouse_sk, i_item_sk, d_moy1, mean1, cov1, w_warehouse_sk, i_item_sk, d_moy2, mean2, cov2
+    EXPECTED_ROWS: same as original
+    CONSUMERS: final
+EXAMPLES: SELF_JOIN_TO_WINDOW, deferred_window_aggregation
+EXAMPLE_ADAPTATION:
+- SELF_JOIN_TO_WINDOW: Replace self-join with LAG window function; ensure partition ordering matches month sequence
+- deferred_window_aggregation: Compute window after filtering; ignore the cumulative sum aspect
+HAZARD_FLAGS:
+- Window functions compute over ALL rows in partition; must filter cov>1 AFTER window or use QUALIFY
+- Must handle missing months (if Jan exists but Feb doesn't, row excluded - correct per INNER JOIN semantics)
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (combines window-based self-join elimination with early month filtering)

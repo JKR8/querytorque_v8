@@ -1,0 +1,76 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] grouped_item  [+]  Cost: low  Rows: 3,533  — Filter and deduplicate item table first
+│   ├── SCAN item
+│   ├── FILTER (i_current_price BETWEEN 17 AND 47 AND i_manufact_id IN (639,169,138,339))
+│   └── GROUP BY (i_item_sk, i_item_id, i_item_desc, i_current_price)
+├── [CTE] filtered_inventory_date  [+]  Cost: medium  Rows: unknown  — Filter inventory with date range and quantity
+│   ├── JOIN inventory ⋈ date_dim (inv_date_sk = d_date_sk)
+│   ├── FILTER (d_date BETWEEN '1999-07-09' AND '1999-07-09' + 60 days)
+│   ├── FILTER (inv_quantity_on_hand BETWEEN 100 AND 500)
+│   └── GROUP BY inv_item_sk
+├── [CTE] filtered_store_sales  [+]  Cost: high  Rows: many  — Distinct items with store sales
+│   ├── SCAN store_sales
+│   └── GROUP BY ss_item_sk
+├── [MAIN] main_query  [~]  Cost: low  Rows: ≤100  — Join three pre-filtered CTEs and apply final limit
+│   ├── JOIN grouped_item ⋈ filtered_inventory_date (i_item_sk = inv_item_sk)
+│   ├── JOIN ⋈ filtered_store_sales (i_item_sk = ss_item_sk)
+│   ├── SORT i_item_id ASC
+│   └── LIMIT 100
+└── OUTPUT (i_item_id, i_item_desc, i_current_price)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Filter small dimension table (item) first before joining to large fact tables", "applied_to": ["grouped_item"]},
+    {"id": "R2", "type": "decorrelate", "description": "Convert EXISTS-like store_sales join to pre-aggregated CTE with GROUP BY", "applied_to": ["filtered_store_sales"]},
+    {"id": "R3", "type": "aggregate_pushdown", "description": "Push grouping down to fact tables before multi-way joins", "applied_to": ["filtered_inventory_date", "filtered_store_sales"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "grouped_item": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_item_id, i_item_desc, i_current_price FROM item WHERE i_current_price BETWEEN 17 AND 47 AND i_manufact_id IN (639, 169, 138, 339) GROUP BY i_item_sk, i_item_id, i_item_desc, i_current_price",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id", "i_item_desc", "i_current_price"], "consumes": []}
+      },
+      "filtered_inventory_date": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT inv_item_sk FROM inventory JOIN date_dim ON inv_date_sk = d_date_sk WHERE d_date BETWEEN CAST('1999-07-09' AS DATE) AND (CAST('1999-07-09' AS DATE) + INTERVAL 60 DAY) AND inv_quantity_on_hand BETWEEN 100 AND 500 GROUP BY inv_item_sk",
+        "interfaces": {"outputs": ["inv_item_sk"], "consumes": []}
+      },
+      "filtered_store_sales": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_item_sk FROM store_sales GROUP BY ss_item_sk",
+        "interfaces": {"outputs": ["ss_item_sk"], "consumes": []}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT gi.i_item_id, gi.i_item_desc, gi.i_current_price FROM grouped_item gi JOIN filtered_inventory_date fid ON gi.i_item_sk = fid.inv_item_sk JOIN filtered_store_sales fss ON gi.i_item_sk = fss.ss_item_sk ORDER BY gi.i_item_id LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "i_item_desc", "i_current_price"], "consumes": ["grouped_item", "filtered_inventory_date", "filtered_store_sales"]}
+      }
+    },
+    "reconstruction_order": ["grouped_item", "filtered_inventory_date", "filtered_store_sales", "main_query"],
+    "assembly_template": "WITH grouped_item AS ({grouped_item}), filtered_inventory_date AS ({filtered_inventory_date}), filtered_store_sales AS ({filtered_store_sales}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured into three pre-filtered CTEs followed by a final join. The dimension table (item) is filtered first, reducing early join cardinality. The inventory-date join is isolated to prevent predicate pushdown blockage. Store sales is pre-grouped to convert the many-to-many join into a distinct existence check.
+
+**Expected speedup**: ~3-4x due to early reduction of fact table scans and conversion of many-to-many join to semi-join via grouping.

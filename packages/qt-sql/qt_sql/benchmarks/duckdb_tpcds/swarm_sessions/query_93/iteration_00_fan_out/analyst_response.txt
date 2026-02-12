@@ -1,0 +1,246 @@
+<reasoning>
+CLASSIFY:
+This query is a star-join with a late dimension filter on the reason table. It joins two large fact tables (store_sales left join store_returns) and then inner joins with a small dimension (reason) filtered by description.
+
+EXPLAIN PLAN ANALYSIS:
+- Total execution time: 2191ms.
+- HASH_JOIN LEFT between store_sales (28.8M rows) and store_returns (2.9M rows): 1779.8ms, 81% of total time. This is the dominant bottleneck.
+- HASH_JOIN INNER with reason: 145.4ms, 7% of total time.
+- SEQ_SCAN store_sales: 229.6ms (10%).
+- SEQ_SCAN store_returns: 13.3ms.
+- SEQ_SCAN reason: negligible.
+- Row count flow: store_sales 28.8M → left join with store_returns → 28.8M rows → inner join with reason → 62K rows → aggregation → 55K rows → top-N 100 rows.
+- The optimizer already pushes the reason filter into the scan (SEQ_SCAN reason [1 of 45 rows]). However, the reason filter is applied AFTER the expensive left join. This is a missed opportunity: we could filter store_returns by reason before the left join.
+- The query scans store_sales once, store_returns once, reason once. No repeated scans.
+- The left join is performed on the full store_sales and store_returns tables before applying the reason filter. The reason filter is selective (1 row) and would greatly reduce store_returns if applied earlier.
+
+GAP MATCHING:
+- Gap: CROSS_CTE_PREDICATE_BLINDNESS. The predicate `r_reason_desc = 'duplicate purchase'` is not pushed across the LEFT JOIN boundary. The optimizer cannot push it because the left join may produce NULLs for sr_reason_sk. However, we know that rows without a matching store_returns row will be filtered out by the INNER JOIN with reason (since sr_reason_sk must match r_reason_sk). This effectively turns the left join into an inner join for matching rows. We can exploit this by pre-filtering store_returns with reason and then inner joining with store_sales.
+- Transform `early_filter` matches: filter small dimension table first, then join to fact tables. Here, filter reason, then join with store_returns, then join with store_sales.
+- Transform `prefetch_fact_join` matches: pre-filter dimension (reason), pre-join with fact table (store_returns), then join with other fact table (store_sales).
+- Transform `dimension_cte_isolate` matches: pre-filter dimension table into CTE.
+- The optimizer does NOT convert the left join to an inner join automatically (EXPLAIN shows LEFT). This is a potential optimization: since the WHERE condition `sr_reason_sk = r_reason_sk` rejects NULLs, the left join is semantically an inner join. We can explicitly rewrite as inner joins.
+- No other gaps (correlated subqueries, OR conditions, repeated scans, etc.) are present.
+
+AGGREGATION TRAP CHECK:
+- The aggregate is SUM(act_sales). act_sales is computed per row via a CASE expression that depends on sr_return_quantity. Since the query effectively only returns rows where sr_return_quantity is NOT NULL (due to the reason join), the CASE always uses the first branch. However, we must preserve the exact semantics: if a store_sales row has a matching store_returns row with the specific reason, we adjust; otherwise, the row is not included. No aggregation traps.
+
+TRANSFORM SELECTION:
+1. early_filter (proven 4.00x on Q93): Filter reason first, then join with store_returns, then join with store_sales. This directly attacks the bottleneck by reducing the store_returns rows before the large left join.
+2. prefetch_fact_join (3.77x avg): Chain CTEs: filter reason, pre-join with store_returns, then join with store_sales. Similar to early_filter but with explicit CTE staging.
+3. inner_join_conversion (novel, but implied by semantic equivalence): Convert the left join to inner join because the WHERE condition rejects non-matching rows. This may allow the optimizer to reorder joins more freely.
+4. exploration: compound strategy of early_filter + aggregate_pushdown? Not applicable because aggregation cannot be pushed before the join. Instead, explore a semi-join transformation: pre-filter store_returns by reason, then use a semi-join to filter store_sales, then compute adjusted sales. This is a novel combination.
+
+LOGICAL TREE DESIGN:
+We'll design four distinct logical trees, each with explicit node contracts and column completeness.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Compute total effective sales per customer for store sales where a return was made due to 'duplicate purchase', adjusting sales amount by subtracting returned quantity. JOIN semantics: store_sales left join store_returns ensures all sales rows are considered, but the subsequent inner join with reason on sr_reason_sk = r_reason_sk filters out rows without a matching return reason, effectively making the left join an inner join for qualifying rows. Aggregation trap: SUM over act_sales is safe; the CASE expression's ELSE branch is never used due to the reason filter. Filter dependency: The reason filter must be applied before or during the join with store_returns to reduce intermediate rows.
+
+BOTTLENECK_DIAGNOSIS:
+The query is join-bound, specifically the left hash join between store_sales (28.8M rows) and store_returns (2.9M rows) consuming 81% of runtime (1779.8ms). Cardinality flow: store_sales scan (28.8M) left join store_returns (2.9M) → 28.8M rows, then inner join with reason (1 row) → 62K rows, then aggregation → 55K rows. The optimizer already pushes the reason filter into the reason scan but cannot push it across the left join boundary, causing a large intermediate result. The logical-tree cost percentages are misleading: the left join cost (81%) is exclusive of its children, making it the clear bottleneck.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output ss_customer_sk and sumsales, ordered by sumsales ASC, ss_customer_sk ASC, LIMIT 100.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream: ss_item_sk, ss_ticket_number, ss_customer_sk, ss_quantity, ss_sales_price, sr_return_quantity, sr_reason_sk, r_reason_sk, r_reason_desc.
+- LITERAL_PRESERVATION: Must preserve literal 'duplicate purchase' exactly.
+- SEMANTIC_EQUIVALENCE: Must return exactly the same rows as original.
+- CROSS_CTE_PREDICATE_BLINDNESS: Reason filter applied after left join, missing opportunity to reduce store_returns early.
+- NULL_REJECTING_JOIN_SIMPLIFICATION: WHERE condition sr_reason_sk = r_reason_sk rejects NULLs from left join, allowing conversion to INNER.
+
+REGRESSION_WARNINGS:
+1. regression_q93_decorrelate (0.34x):
+   CAUSE: Materialized correlated LEFT JOIN into CTEs, forcing redundant scans of store_returns.
+   RULE: Do not materialize the store_returns join into separate CTEs; keep the join structure.
+2. regression_q1_decorrelate (0.71x):
+   CAUSE: Pre-aggregated GROUP BY into CTEs, losing incremental computation.
+   RULE: Avoid pre-aggregating before joins unless aggregation reduces rows significantly.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: early_filter
+TARGET_LOGICAL_TREE:
+  filtered_reason -> filtered_returns -> joined_sales -> aggregated -> top_n
+NODE_CONTRACTS:
+  filtered_reason:
+    FROM: reason
+    WHERE: r_reason_desc = 'duplicate purchase'
+    OUTPUT: r_reason_sk, r_reason_desc
+    EXPECTED_ROWS: 1
+    CONSUMERS: filtered_returns
+  filtered_returns:
+    FROM: store_returns
+    JOIN: INNER JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+    OUTPUT: sr_item_sk, sr_ticket_number, sr_return_quantity
+    EXPECTED_ROWS: less than 2.9M (exact unknown, but reduced by reason filter)
+    CONSUMERS: joined_sales
+  joined_sales:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_returns ON ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number
+    OUTPUT: ss_customer_sk, ss_quantity, ss_sales_price, sr_return_quantity
+    EXPECTED_ROWS: 62K (matching original after reason join)
+    CONSUMERS: aggregated
+  aggregated:
+    FROM: joined_sales
+    GROUP BY: ss_customer_sk
+    AGGREGATE: SUM((ss_quantity - sr_return_quantity) * ss_sales_price) AS sumsales
+    OUTPUT: ss_customer_sk, sumsales
+    EXPECTED_ROWS: 55K
+    CONSUMERS: top_n
+  top_n:
+    FROM: aggregated
+    ORDER BY: sumsales ASC, ss_customer_sk ASC
+    LIMIT: 100
+    OUTPUT: ss_customer_sk, sumsales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: early_filter, date_cte_isolate, pushdown
+EXAMPLE_ADAPTATION:
+- early_filter: Apply the pattern of filtering the small dimension (reason) first, then joining with the fact table (store_returns). Ignore that the example may use date_dim; the principle is the same.
+- date_cte_isolate: Use the technique of isolating a dimension filter into a CTE. Ignore the date-specific aspects.
+- pushdown: Push the reason filter down into the store_returns join. Ignore the consolidation of multiple subqueries.
+HAZARD_FLAGS:
+- Must ensure that the inner join between store_sales and filtered_returns does not lose rows that would have been filtered out by the original reason join (it does not, because we already filtered store_returns by reason).
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: inner_join_conversion
+TARGET_LOGICAL_TREE:
+  filtered_reason -> joined_returns_sales -> aggregated -> top_n
+NODE_CONTRACTS:
+  filtered_reason:
+    FROM: reason
+    WHERE: r_reason_desc = 'duplicate purchase'
+    OUTPUT: r_reason_sk, r_reason_desc
+    EXPECTED_ROWS: 1
+    CONSUMERS: joined_returns_sales
+  joined_returns_sales:
+    FROM: store_sales
+    JOIN: INNER JOIN store_returns ON ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number
+    JOIN: INNER JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+    OUTPUT: ss_customer_sk, ss_quantity, ss_sales_price, sr_return_quantity
+    EXPECTED_ROWS: 62K
+    CONSUMERS: aggregated
+  aggregated:
+    FROM: joined_returns_sales
+    GROUP BY: ss_customer_sk
+    AGGREGATE: SUM((ss_quantity - sr_return_quantity) * ss_sales_price) AS sumsales
+    OUTPUT: ss_customer_sk, sumsales
+    EXPECTED_ROWS: 55K
+    CONSUMERS: top_n
+  top_n:
+    FROM: aggregated
+    ORDER BY: sumsales ASC, ss_customer_sk ASC
+    LIMIT: 100
+    OUTPUT: ss_customer_sk, sumsales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: early_filter, pushdown
+EXAMPLE_ADAPTATION:
+- early_filter: Use the filtered reason CTE, but keep the join order as store_sales inner join store_returns inner join reason. Ignore the pre-joining of reason with store_returns before store_sales.
+- pushdown: The reason filter is pushed down via the inner join. Ignore the consolidation of multiple subqueries.
+HAZARD_FLAGS:
+- Must verify that the inner join conversion is semantically equivalent: the original left join with subsequent reason inner join yields the same rows as inner join on all three tables. This holds because the reason join rejects NULLs from the left join.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  filtered_reason -> prefetched_returns -> joined_sales -> aggregated -> top_n
+NODE_CONTRACTS:
+  filtered_reason:
+    FROM: reason
+    WHERE: r_reason_desc = 'duplicate purchase'
+    OUTPUT: r_reason_sk, r_reason_desc
+    EXPECTED_ROWS: 1
+    CONSUMERS: prefetched_returns
+  prefetched_returns:
+    FROM: store_returns
+    JOIN: INNER JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+    OUTPUT: sr_item_sk, sr_ticket_number, sr_return_quantity
+    EXPECTED_ROWS: reduced
+    CONSUMERS: joined_sales
+  joined_sales:
+    FROM: store_sales
+    JOIN: INNER JOIN prefetched_returns ON ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number
+    OUTPUT: ss_customer_sk, ss_quantity, ss_sales_price, sr_return_quantity
+    EXPECTED_ROWS: 62K
+    CONSUMERS: aggregated
+  aggregated:
+    FROM: joined_sales
+    GROUP BY: ss_customer_sk
+    AGGREGATE: SUM((ss_quantity - sr_return_quantity) * ss_sales_price) AS sumsales
+    OUTPUT: ss_customer_sk, sumsales
+    EXPECTED_ROWS: 55K
+    CONSUMERS: top_n
+  top_n:
+    FROM: aggregated
+    ORDER BY: sumsales ASC, ss_customer_sk ASC
+    LIMIT: 100
+    OUTPUT: ss_customer_sk, sumsales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: prefetch_fact_join, dimension_cte_isolate, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply the CTE chain: filter dimension, pre-join with one fact table, then join with other fact table. Ignore the presence of multiple dimensions; we only have reason.
+- dimension_cte_isolate: Isolate the reason filter into a CTE. Ignore the pre-filtering of other dimensions.
+- multi_dimension_prefetch: Not applicable; we only have one dimension. Ignore this example's multi-dimension aspect.
+HAZARD_FLAGS:
+- Similar to early_filter: ensure inner join equivalence.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: semi_join_prefilter
+TARGET_LOGICAL_TREE:
+  filtered_reason -> filtered_returns_keys -> sales_with_matching_returns -> adjusted_sales -> aggregated -> top_n
+NODE_CONTRACTS:
+  filtered_reason:
+    FROM: reason
+    WHERE: r_reason_desc = 'duplicate purchase'
+    OUTPUT: r_reason_sk, r_reason_desc
+    EXPECTED_ROWS: 1
+    CONSUMERS: filtered_returns_keys
+  filtered_returns_keys:
+    FROM: store_returns
+    JOIN: INNER JOIN filtered_reason ON sr_reason_sk = r_reason_sk
+    OUTPUT: sr_item_sk, sr_ticket_number, sr_return_quantity
+    EXPECTED_ROWS: reduced
+    CONSUMERS: sales_with_matching_returns
+  sales_with_matching_returns:
+    FROM: store_sales
+    JOIN: INNER JOIN filtered_returns_keys ON ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number
+    OUTPUT: ss_customer_sk, ss_quantity, ss_sales_price, sr_return_quantity
+    EXPECTED_ROWS: 62K
+    CONSUMERS: adjusted_sales
+  adjusted_sales:
+    FROM: sales_with_matching_returns
+    OUTPUT: ss_customer_sk, (ss_quantity - sr_return_quantity) * ss_sales_price AS act_sales
+    EXPECTED_ROWS: 62K
+    CONSUMERS: aggregated
+  aggregated:
+    FROM: adjusted_sales
+    GROUP BY: ss_customer_sk
+    AGGREGATE: SUM(act_sales) AS sumsales
+    OUTPUT: ss_customer_sk, sumsales
+    EXPECTED_ROWS: 55K
+    CONSUMERS: top_n
+  top_n:
+    FROM: aggregated
+    ORDER BY: sumsales ASC, ss_customer_sk ASC
+    LIMIT: 100
+    OUTPUT: ss_customer_sk, sumsales
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: early_filter, prefetch_fact_join, single_pass_aggregation
+EXAMPLE_ADAPTATION:
+- early_filter: Use the filtered reason CTE. Ignore the join order.
+- prefetch_fact_join: Use the CTE chain. Ignore the fact that we are not pre-joining with another fact table.
+- single_pass_aggregation: Not applicable; we are not consolidating multiple aggregates. Ignore this example's aggregation consolidation.
+HAZARD_FLAGS:
+- This strategy is essentially the same as early_filter and prefetch_fact_join but with an explicit adjusted_sales node. Risk of unnecessary complexity.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines early_filter with explicit adjusted sales computation step)

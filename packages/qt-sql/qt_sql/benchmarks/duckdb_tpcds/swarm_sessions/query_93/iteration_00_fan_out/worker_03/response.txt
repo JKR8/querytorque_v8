@@ -1,0 +1,121 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Rewritten as CTE chain per target logical tree
+    ├── WITH
+    │   ├── filtered_reason  [+]  — Early dimension filter
+    │   │   └── SCAN reason
+    │   │       └── FILTER r_reason_desc = 'duplicate purchase'
+    │   ├── prefetched_returns  [+]  — Reduced returns via early reason join
+    │   │   ├── SCAN store_returns
+    │   │   └── JOIN filtered_reason (INNER)
+    │   ├── joined_sales  [+]  — Join filtered returns to sales
+    │   │   ├── SCAN store_sales
+    │   │   └── JOIN prefetched_returns (INNER) on item_sk + ticket_number
+    │   ├── aggregated  [+]  — Group by customer, compute adjusted sum
+    │   │   ├── SCAN joined_sales
+    │   │   └── AGG (GROUP BY ss_customer_sk)
+    │   └── top_n  [+]  — Final ordering and limit
+    │       ├── SCAN aggregated
+    │       └── SORT sumsales ASC, ss_customer_sk ASC + LIMIT 100
+    └── OUTPUT (ss_customer_sk, sumsales)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "dimension_cte_isolate",
+      "description": "Isolate reason filter into a separate CTE for early reduction.",
+      "applied_to": ["filtered_reason"]
+    },
+    {
+      "id": "R2",
+      "type": "prefetch_fact_join",
+      "description": "Prefetch store_returns by joining with filtered reason before joining to store_sales.",
+      "applied_to": ["prefetched_returns"]
+    },
+    {
+      "id": "R3",
+      "type": "staged_join_pipeline",
+      "description": "Build a CTE chain that progressively reduces data: reason → returns → sales → aggregation.",
+      "applied_to": ["joined_sales", "aggregated", "top_n"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_reason": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT r_reason_sk, r_reason_desc FROM reason WHERE r_reason_desc = 'duplicate purchase'",
+        "interfaces": {
+          "outputs": ["r_reason_sk", "r_reason_desc"],
+          "consumes": []
+        }
+      },
+      "prefetched_returns": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns INNER JOIN filtered_reason ON sr_reason_sk = r_reason_sk",
+        "interfaces": {
+          "outputs": ["sr_item_sk", "sr_ticket_number", "sr_return_quantity"],
+          "consumes": ["filtered_reason"]
+        }
+      },
+      "joined_sales": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_customer_sk, ss_quantity, ss_sales_price, sr_return_quantity FROM store_sales INNER JOIN prefetched_returns ON ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number",
+        "interfaces": {
+          "outputs": ["ss_customer_sk", "ss_quantity", "ss_sales_price", "sr_return_quantity"],
+          "consumes": ["prefetched_returns"]
+        }
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_customer_sk, SUM((ss_quantity - sr_return_quantity) * ss_sales_price) AS sumsales FROM joined_sales GROUP BY ss_customer_sk",
+        "interfaces": {
+          "outputs": ["ss_customer_sk", "sumsales"],
+          "consumes": ["joined_sales"]
+        }
+      },
+      "top_n": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss_customer_sk, sumsales FROM aggregated ORDER BY sumsales ASC, ss_customer_sk ASC LIMIT 100",
+        "interfaces": {
+          "outputs": ["ss_customer_sk", "sumsales"],
+          "consumes": ["aggregated"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ss_customer_sk, sumsales FROM top_n",
+        "interfaces": {
+          "outputs": ["ss_customer_sk", "sumsales"],
+          "consumes": ["top_n"]
+        }
+      }
+    },
+    "reconstruction_order": ["filtered_reason", "prefetched_returns", "joined_sales", "aggregated", "top_n", "main_query"],
+    "assembly_template": "WITH filtered_reason AS ({filtered_reason}), prefetched_returns AS ({prefetched_returns}), joined_sales AS ({joined_sales}), aggregated AS ({aggregated}), top_n AS ({top_n}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured the original query into a staged CTE pipeline that first filters the reason dimension, then joins it early with store_returns to reduce the fact table before joining to store_sales, finally aggregating and limiting. This follows the target logical tree exactly.
+
+**Expected speedup:** ~2–3x from early reduction of store_returns via the filtered reason, plus better predicate pushdown and hash‑join efficiency in the staged pipeline.

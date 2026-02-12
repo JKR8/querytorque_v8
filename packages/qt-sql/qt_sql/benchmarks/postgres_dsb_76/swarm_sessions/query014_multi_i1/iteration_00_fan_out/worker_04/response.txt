@@ -1,0 +1,85 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] consolidated_sales  [+]  Cost: 17%  Rows: ~1.8M
+│   ├── SCAN (store_sales, item, date_dim) with channel='store'
+│   ├── JOIN (ss_item_sk = i_item_sk)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (d_year 1999-2001, i_category IN, i_manager_id 91-100, ss_wholesale_cost 35-55)
+│   ├── UNION ALL with catalog_sales (cs_wholesale_cost 35-55)
+│   ├── UNION ALL with web_sales (ws_wholesale_cost 35-55)
+│   └── OUTPUT (channel, item_sk, i_brand_id, i_class_id, i_category_id, quantity, list_price, d_date_sk, d_week_seq)
+├── [CTE] cross_items  [~]  Cost: 0%  Rows: ~381
+│   ├── SCAN (consolidated_sales) for each channel with INTERSECT
+│   ├── JOIN (item) on brand/class/category
+│   ├── FILTER (i_category IN, i_manager_id BETWEEN)
+│   └── OUTPUT (ss_item_sk)
+├── [CTE] avg_sales  [~]  Cost: 0%  Rows: 1
+│   ├── SCAN (consolidated_sales)
+│   └── OUTPUT (average_sales)
+└── [MAIN] main_query  [~]  Cost: 75%  Rows: ~47
+    ├── SCAN (consolidated_sales) with channel='store'
+    ├── FILTER (d_week_seq = subquery, item_sk IN cross_items)
+    ├── AGG (GROUP BY brand/class/category) for this_year
+    ├── HAVING (sum > avg_sales)
+    ├── AGG (GROUP BY brand/class/category) for last_year
+    ├── HAVING (sum > avg_sales)
+    ├── JOIN (brand/class/category) between years
+    ├── SORT (channel, brand, class, category)
+    └── OUTPUT (12 columns)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "single_pass_aggregation", "description": "Consolidate three channel fact table scans into one UNION ALL CTE with channel discriminator", "applied_to": ["consolidated_sales"]},
+    {"id": "R2", "type": "union_cte_split", "description": "Share same dimension joins (item, date_dim) across UNION ALL branches", "applied_to": ["consolidated_sales"]},
+    {"id": "R3", "type": "shared_dimension_multi_channel", "description": "Use single consolidated CTE for cross_items, avg_sales, and main_query instead of separate scans", "applied_to": ["cross_items", "avg_sales", "main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "consolidated_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT 'store' AS channel, ss_item_sk AS item_sk, i_brand_id, i_class_id, i_category_id, ss_quantity AS quantity, ss_list_price AS list_price, d_date_sk, d_week_seq FROM store_sales JOIN item ON ss_item_sk = i_item_sk JOIN date_dim ON ss_sold_date_sk = d_date_sk WHERE d_year BETWEEN 1999 AND 2001 AND i_category IN ('Electronics', 'Jewelry', 'Men') AND i_manager_id BETWEEN 91 AND 100 AND ss_wholesale_cost BETWEEN 35 AND 55 UNION ALL SELECT 'catalog' AS channel, cs_item_sk AS item_sk, i_brand_id, i_class_id, i_category_id, cs_quantity AS quantity, cs_list_price AS list_price, d_date_sk, d_week_seq FROM catalog_sales JOIN item ON cs_item_sk = i_item_sk JOIN date_dim ON cs_sold_date_sk = d_date_sk WHERE d_year BETWEEN 1999 AND 2001 AND i_category IN ('Electronics', 'Jewelry', 'Men') AND i_manager_id BETWEEN 91 AND 100 AND cs_wholesale_cost BETWEEN 35 AND 55 UNION ALL SELECT 'web' AS channel, ws_item_sk AS item_sk, i_brand_id, i_class_id, i_category_id, ws_quantity AS quantity, ws_list_price AS list_price, d_date_sk, d_week_seq FROM web_sales JOIN item ON ws_item_sk = i_item_sk JOIN date_dim ON ws_sold_date_sk = d_date_sk WHERE d_year BETWEEN 1999 AND 2001 AND i_category IN ('Electronics', 'Jewelry', 'Men') AND i_manager_id BETWEEN 91 AND 100 AND ws_wholesale_cost BETWEEN 35 AND 55",
+        "interfaces": {"outputs": ["channel", "item_sk", "i_brand_id", "i_class_id", "i_category_id", "quantity", "list_price", "d_date_sk", "d_week_seq"], "consumes": []}
+      },
+      "cross_items": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk AS ss_item_sk FROM item WHERE i_category IN ('Electronics', 'Jewelry', 'Men') AND i_manager_id BETWEEN 91 AND 100 AND (i_brand_id, i_class_id, i_category_id) IN (SELECT i_brand_id, i_class_id, i_category_id FROM consolidated_sales WHERE channel = 'store' INTERSECT SELECT i_brand_id, i_class_id, i_category_id FROM consolidated_sales WHERE channel = 'catalog' INTERSECT SELECT i_brand_id, i_class_id, i_category_id FROM consolidated_sales WHERE channel = 'web')",
+        "interfaces": {"outputs": ["ss_item_sk"], "consumes": ["consolidated_sales"]}
+      },
+      "avg_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT AVG(quantity * list_price) AS average_sales FROM consolidated_sales",
+        "interfaces": {"outputs": ["average_sales"], "consumes": ["consolidated_sales"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT this_year.channel AS ty_channel, this_year.i_brand_id AS ty_brand, this_year.i_class_id AS ty_class, this_year.i_category_id AS ty_category, this_year.sales AS ty_sales, this_year.number_sales AS ty_number_sales, last_year.channel AS ly_channel, last_year.i_brand_id AS ly_brand, last_year.i_class_id AS ly_class, last_year.i_category_id AS ly_category, last_year.sales AS ly_sales, last_year.number_sales AS ly_number_sales FROM (SELECT 'store' AS channel, i_brand_id, i_class_id, i_category_id, SUM(quantity * list_price) AS sales, COUNT(*) AS number_sales FROM consolidated_sales WHERE channel = 'store' AND d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_year = 1999 + 1 AND d_moy = 12 AND d_dom = 20) AND item_sk IN (SELECT ss_item_sk FROM cross_items) GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(quantity * list_price) > (SELECT average_sales FROM avg_sales)) this_year, (SELECT 'store' AS channel, i_brand_id, i_class_id, i_category_id, SUM(quantity * list_price) AS sales, COUNT(*) AS number_sales FROM consolidated_sales WHERE channel = 'store' AND d_week_seq = (SELECT d_week_seq FROM date_dim WHERE d_year = 1999 AND d_moy = 12 AND d_dom = 20) AND item_sk IN (SELECT ss_item_sk FROM cross_items) GROUP BY i_brand_id, i_class_id, i_category_id HAVING SUM(quantity * list_price) > (SELECT average_sales FROM avg_sales)) last_year WHERE this_year.i_brand_id = last_year.i_brand_id AND this_year.i_class_id = last_year.i_class_id AND this_year.i_category_id = last_year.i_category_id ORDER BY this_year.channel, this_year.i_brand_id, this_year.i_class_id, this_year.i_category_id LIMIT 100",
+        "interfaces": {"outputs": ["ty_channel", "ty_brand", "ty_class", "ty_category", "ty_sales", "ty_number_sales", "ly_channel", "ly_brand", "ly_class", "ly_category", "ly_sales", "ly_number_sales"], "consumes": ["consolidated_sales", "cross_items", "avg_sales"]}
+      }
+    },
+    "reconstruction_order": ["consolidated_sales", "cross_items", "avg_sales", "main_query"],
+    "assembly_template": "WITH consolidated_sales AS ({consolidated_sales}), cross_items AS ({cross_items}), avg_sales AS ({avg_sales}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": ["SET LOCAL max_parallel_workers_per_gather = 0", "SET LOCAL from_collapse_limit = 1", "SET LOCAL join_collapse_limit = 1"],
+  "validation_checks": []
+}
+```
+
+**Changes**: Consolidated three separate channel scans into a single UNION ALL CTE that serves all downstream consumers (cross_items, avg_sales, main_query). This eliminates redundant dimension joins and fact table scans while preserving the exact INTERSECT and average calculation semantics.
+
+**Expected speedup**: ~2-3x from eliminating 4 separate store_sales scans and parallelizing the consolidated scan. The SET LOCAL commands prevent the planner from flattening the CTE (which would lose parallelism benefits) and keep the UNION ALL structure intact for optimal index usage.

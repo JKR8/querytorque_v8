@@ -1,0 +1,434 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced once are typically inlined; CTEs referenced multiple times may be materialized. FILTER clause is native (`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at UNION ALL boundaries and multi-level CTE references.
+
+## Semantic Contract (MUST preserve)
+
+For NC shipments during 60 days from 1999-02-01 on 'pri' company sites, report order count, shipping cost, and net profit for orders that (a) involve multiple warehouses AND (b) have a return that also involves multiple warehouses. JOIN semantics: INNER joins require all dimension matches; two semi-joins (IN subqueries) require order to be in both sets. Aggregation traps: COUNT(DISTINCT ws_order_number) counts distinct orders after filtering; SUMs are duplicate-safe because joins are on ws_order_number which is unique per order? Actually, web_sales may have multiple line items per order, but we aggregate after joins, so duplicates could affect SUMs. Need to ensure no duplicate inflation. Filter dependencies: The date filter depends on d_date_sk join; state and company filters depend on ca_address_sk and web_site_sk joins; the two IN subqueries depend on the CTE ws_wh.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+date_filter -> ca_filter -> web_filter -> prefetch_ws -> ws_wh_grouped -> single_semi_join (combined condition) -> aggregate
+NODE_CONTRACTS:
+  date_filter:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '1999-2-01' AND (CAST('1999-2-01' AS DATE) + INTERVAL 60 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 61
+    CONSUMERS: prefetch_ws
+  ca_filter:
+    FROM: customer_address
+    WHERE: ca_state = 'NC'
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 7,827
+    CONSUMERS: prefetch_ws
+  web_filter:
+    FROM: web_site
+    WHERE: web_company_name = 'pri'
+    OUTPUT: web_site_sk
+    EXPECTED_ROWS: 7
+    CONSUMERS: prefetch_ws
+  prefetch_ws:
+    FROM: web_sales ws1, date_filter, ca_filter, web_filter
+    JOIN: ws1.ws_ship_date_sk = date_filter.d_date_sk AND ws1.ws_ship_addr_sk = ca_filter.ca_address_sk AND ws1.ws_web_site_sk = web_filter.web_site_sk
+    OUTPUT: ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit
+    EXPECTED_ROWS: 9,956
+    CONSUMERS: single_semi_join
+  ws_wh_grouped:
+    FROM: web_sales
+    GROUP BY: ws_order_number
+    HAVING: MIN(ws_warehouse_sk) <> MAX(ws_warehouse_sk)
+    OUTPUT: ws_order_number
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: single_semi_join
+  single_semi_join:
+    FROM: prefetch_ws
+    WHERE: ws_order_number IN (SELECT wr_order_number FROM web_returns WHERE wr_order_number IN (SELECT ws_order_number FROM ws_wh_grouped))
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: single_semi_join
+    AGGREGATE: COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit"
+    OUTPUT: "order count", "total shipping cost", "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final
+
+NODE_CONTRACTS:
+date_filter:
+    FROM: date_dim
+    WHERE: d_date BETWEEN '1999-2-01' AND (CAST('1999-2-01' AS DATE) + INTERVAL 60 DAY)
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 61
+    CONSUMERS: prefetch_ws
+  ca_filter:
+    FROM: customer_address
+    WHERE: ca_state = 'NC'
+    OUTPUT: ca_address_sk
+    EXPECTED_ROWS: 7,827
+    CONSUMERS: prefetch_ws
+  web_filter:
+    FROM: web_site
+    WHERE: web_company_name = 'pri'
+    OUTPUT: web_site_sk
+    EXPECTED_ROWS: 7
+    CONSUMERS: prefetch_ws
+  prefetch_ws:
+    FROM: web_sales ws1, date_filter, ca_filter, web_filter
+    JOIN: ws1.ws_ship_date_sk = date_filter.d_date_sk AND ws1.ws_ship_addr_sk = ca_filter.ca_address_sk AND ws1.ws_web_site_sk = web_filter.web_site_sk
+    OUTPUT: ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit
+    EXPECTED_ROWS: 9,956
+    CONSUMERS: single_semi_join
+  ws_wh_grouped:
+    FROM: web_sales
+    GROUP BY: ws_order_number
+    HAVING: MIN(ws_warehouse_sk) <> MAX(ws_warehouse_sk)
+    OUTPUT: ws_order_number
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: single_semi_join
+  single_semi_join:
+    FROM: prefetch_ws
+    WHERE: ws_order_number IN (SELECT wr_order_number FROM web_returns WHERE wr_order_number IN (SELECT ws_order_number FROM ws_wh_grouped))
+    OUTPUT: ws_order_number, ws_ext_ship_cost, ws_net_profit
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: aggregate
+  aggregate:
+    FROM: single_semi_join
+    AGGREGATE: COUNT(DISTINCT ws_order_number) AS "order count", SUM(ws_ext_ship_cost) AS "total shipping cost", SUM(ws_net_profit) AS "total net profit"
+    OUTPUT: "order count", "total shipping cost", "total net profit"
+    EXPECTED_ROWS: 1
+    CONSUMERS: final
+
+## Hazard Flags (avoid these specific risks)
+
+- Semantic rewrite: removing the first IN condition must be proven equivalent. The second IN condition already implies the first. Need to ensure no edge cases (e.g., NULLs in web_returns.wr_order_number).
+- Combining three transforms may introduce overhead if the optimizer cannot optimize the CTE chain.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy
+
+## Regression Warnings (observed failures on similar queries)
+
+1. materialize_cte (0.54x on q95):
+   CAUSE: Decomposed tightly-correlated EXISTS/NOT EXISTS into independent CTEs, severing cardinality relationship.
+   RULE: Do not split the two IN conditions into independent CTEs; keep them as semi-joins on the same materialized CTE.
+2. dimension_cte_isolate (0.0076x on q26):
+   CAUSE: Cross-joined 3+ dimension CTEs caused Cartesian explosion.
+   RULE: Never cross-join dimension CTEs; join them sequentially with fact table.
+
+## Constraints (analyst-filtered for this query)
+
+- COMPLETE_OUTPUT: Must output exactly three columns: "order count", "total shipping cost", "total net profit".
+- CTE_COLUMN_COMPLETENESS: Any CTE must include ws_order_number for semi-joins, plus ws_ext_ship_cost and ws_net_profit for aggregation.
+- LITERAL_PRESERVATION: Must preserve date '1999-2-01', interval 60, state 'NC', company 'pri'.
+- SEMANTIC_EQUIVALENCE: Must return same rows and aggregates.
+- ENGINE_GAP_REDUNDANT_SCAN_ELIMINATION: CTE ws_wh computed twice (two HASH_JOIN INNER nodes in EXPLAIN).
+- ENGINE_GAP_CROSS_CTE_PREDICATE_BLINDNESS: Dimension filters applied late; opportunity to pre-filter dimensions into CTEs.
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+- materialize_cte: Materialize ws_wh_grouped.
+- prefetch_fact_join: Use CTE chain to pre-filter dimensions and join with web_sales.
+- dimension_cte_isolate: Pre-filter all three dimensions into CTEs.
+
+## Reference Examples
+
+Pattern reference only — do not copy table/column names or literals.
+
+### 1. materialize_cte (1.37x)
+
+**Principle:** Shared Materialization: extract repeated subquery patterns into CTEs to avoid recomputation. When the same logical check appears multiple times, compute it once and reference the result.
+
+**BEFORE (slow):**
+```sql
+with ws_wh as
+(select ws1.ws_order_number,ws1.ws_warehouse_sk wh1,ws2.ws_warehouse_sk wh2
+ from web_sales ws1,web_sales ws2
+ where ws1.ws_order_number = ws2.ws_order_number
+   and ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)
+ select 
+   count(distinct ws_order_number) as "order count"
+  ,sum(ws_ext_ship_cost) as "total shipping cost"
+  ,sum(ws_net_profit) as "total net profit"
+from
+   web_sales ws1
+  ,date_dim
+  ,customer_address
+  ,web_site
+where
+    d_date between '1999-2-01' and 
+           (cast('1999-2-01' as date) + INTERVAL 60 DAY)
+and ws1.ws_ship_date_sk = d_date_sk
+and ws1.ws_ship_addr_sk = ca_address_sk
+and ca_state = 'NC'
+and ws1.ws_web_site_sk = web_site_sk
+and web_company_name = 'pri'
+and ws1.ws_order_number in (select ws_order_number
+                            from ws_wh)
+and ws1.ws_order_number in (select wr_order_number
+                            from web_returns,ws_wh
+                            where wr_order_number = ws_wh.ws_order_number)
+order by count(distinct ws_order_number)
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[multi_warehouse_orders]:
+```sql
+SELECT DISTINCT ws_order_number FROM web_sales ws1 WHERE EXISTS (SELECT 1 FROM web_sales ws2 WHERE ws1.ws_order_number = ws2.ws_order_number AND ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)
+```
+[returned_orders]:
+```sql
+SELECT DISTINCT wr_order_number FROM web_returns
+```
+[main_query]:
+```sql
+SELECT COUNT(DISTINCT ws_order_number) AS order_count, SUM(ws_ext_ship_cost) AS total_shipping FROM web_sales ws1 JOIN date_dim ON ws1.ws_ship_date_sk = d_date_sk JOIN customer_address ON ws1.ws_ship_addr_sk = ca_address_sk JOIN web_site ON ws1.ws_web_site_sk = web_site_sk JOIN multi_warehouse_orders mwo ON ws1.ws_order_number = mwo.ws_order_number LEFT JOIN returned_orders ro ON ws1.ws_order_number = ro.wr_order_number WHERE d_date BETWEEN '2000-03-01' AND '2000-05-01' AND ca_state = 'IL' AND web_company_name = 'pri' AND ro.wr_order_number IS NULL
+```
+
+### 2. prefetch_fact_join (3.77x)
+
+**Principle:** Staged Join Pipeline: build a CTE chain that progressively reduces data — first CTE filters the dimension, second CTE pre-joins filtered dimension keys with the fact table, subsequent CTEs join remaining dimensions against the already-reduced fact set.
+
+**BEFORE (slow):**
+```sql
+select * 
+from (select i_manager_id
+             ,sum(ss_sales_price) sum_sales
+             ,avg(sum(ss_sales_price)) over (partition by i_manager_id) avg_monthly_sales
+      from item
+          ,store_sales
+          ,date_dim
+          ,store
+      where ss_item_sk = i_item_sk
+        and ss_sold_date_sk = d_date_sk
+        and ss_store_sk = s_store_sk
+        and d_month_seq in (1181,1181+1,1181+2,1181+3,1181+4,1181+5,1181+6,1181+7,1181+8,1181+9,1181+10,1181+11)
+        and ((    i_category in ('Books','Children','Electronics')
+              and i_class in ('personal','portable','reference','self-help')
+              and i_brand in ('scholaramalgamalg #14','scholaramalgamalg #7',
+		                  'exportiunivamalg #9','scholaramalgamalg #9'))
+           or(    i_category in ('Women','Music','Men')
+              and i_class in ('accessories','classical','fragrances','pants')
+              and i_brand in ('amalgimporto #1','edu packscholar #1','exportiimporto #1',
+		                 'importoamalg #1')))
+group by i_manager_id, d_moy) tmp1
+where case when avg_monthly_sales > 0 then abs (sum_sales - avg_monthly_sales) / avg_monthly_sales else null end > 0.1
+order by i_manager_id
+        ,avg_monthly_sales
+        ,sum_sales
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk, d_moy FROM date_dim WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)
+```
+[filtered_sales]:
+```sql
+SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_moy FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+```
+[main_query]:
+```sql
+SELECT * FROM (SELECT i_manager_id, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales FROM item JOIN filtered_sales ON ss_item_sk = i_item_sk JOIN store ON ss_store_sk = s_store_sk WHERE ((i_category IN ('Books', 'Children', 'Electronics') AND i_class IN ('personal', 'portable', 'reference', 'self-help') AND i_brand IN (...)) OR (i_category IN ('Women', 'Music', 'Men') AND i_class IN ('accessories', 'classical', 'fragrances', 'pants') AND i_brand IN (...))) GROUP BY i_manager_id, d_moy) AS tmp1 WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
+```
+
+### 3. dimension_cte_isolate (1.93x)
+
+**Principle:** Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
+
+**BEFORE (slow):**
+```sql
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
+ LIMIT 100;
+```
+
+**AFTER (fast):**
+[filtered_dates]:
+```sql
+SELECT d_date_sk FROM date_dim WHERE d_year = 2000
+```
+[filtered_customer_demographics]:
+```sql
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'
+```
+[filtered_promotions]:
+```sql
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+```
+[joined_facts]:
+```sql
+SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales AS cs JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk
+```
+[main_query]:
+```sql
+SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM joined_facts AS jf JOIN item AS i ON jf.cs_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
+```
+
+## Original SQL
+
+```sql
+-- start query 95 in stream 0 using template query95.tpl
+with ws_wh as
+(select ws1.ws_order_number,ws1.ws_warehouse_sk wh1,ws2.ws_warehouse_sk wh2
+ from web_sales ws1,web_sales ws2
+ where ws1.ws_order_number = ws2.ws_order_number
+   and ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)
+ select 
+   count(distinct ws_order_number) as "order count"
+  ,sum(ws_ext_ship_cost) as "total shipping cost"
+  ,sum(ws_net_profit) as "total net profit"
+from
+   web_sales ws1
+  ,date_dim
+  ,customer_address
+  ,web_site
+where
+    d_date between '1999-2-01' and 
+           (cast('1999-2-01' as date) + INTERVAL 60 DAY)
+and ws1.ws_ship_date_sk = d_date_sk
+and ws1.ws_ship_addr_sk = ca_address_sk
+and ca_state = 'NC'
+and ws1.ws_web_site_sk = web_site_sk
+and web_company_name = 'pri'
+and ws1.ws_order_number in (select ws_order_number
+                            from ws_wh)
+and ws1.ws_order_number in (select wr_order_number
+                            from web_returns,ws_wh
+                            where wr_order_number = ws_wh.ws_order_number)
+order by count(distinct ws_order_number)
+ LIMIT 100;
+
+-- end query 95 in stream 0 using template query95.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `order count`
+  2. `total shipping cost`
+  3. `total net profit`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] ws_wh  [=]  Cost: 50%  Rows: ~1K  — Identify web order numbers that involve at least two different warehouses.
+│   ├── SCAN (web_sales AS ws1 (join), web_sales AS ws2 (join))
+│   ├── JOIN (ws1.ws_order_number = ws2.ws_order_number)
+│   ├── FILTER (ws1.ws_warehouse_sk <> ws2.ws_warehouse_sk)
+│   └── OUTPUT (ws_order_number, wh1, wh2)
+└── [MAIN] main_query  [=]  Cost: 50%  Rows: ~1K  — Filter web sales by ship date range, state, and company; keep orders in the multi-warehouse set and in returned-order set; then aggregate distinct order count, shipping cost, and net profit.
+    ├── SCAN (web_sales AS ws1 (join), date_dim (join), customer_address (join), web_site (join), ws_wh (join), web_returns (correlated subquery))
+    ├── JOIN (ws1.ws_ship_date_sk = d_date_sk)
+    ├── JOIN (ws1.ws_ship_addr_sk = ca_address_sk)
+    ├── JOIN (+1 more)
+    ├── FILTER (d_date BETWEEN '1999-2-01' AND (CAST('1999-2-01' AS DATE) + INTERVAL '60' DAY))
+    ├── FILTER (ca_state = 'NC')
+    ├── FILTER (+3 more)
+    ├── SORT (COUNT(DISTINCT ws_order_number) ASC)
+    └── OUTPUT (order count, total shipping cost, total net profit)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

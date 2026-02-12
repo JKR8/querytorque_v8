@@ -1,0 +1,815 @@
+{
+  "$schema": "QT-ATTACK/1.0",
+  "$comment": "MITRE ATT&CK-style taxonomy for SQL query optimization. Plan signatures serve as detection telemetry.",
+
+  "tactics": [
+    {
+      "id": "TA001",
+      "name": "Redundant Scan Elimination",
+      "description": "Optimizer fails to share scans when the same table appears in multiple subqueries with identical or overlapping filters.",
+      "detection_class": "structural",
+      "telemetry": "EXPLAIN node counts — N×TABLE_SCAN on same table with CROSS_PRODUCT or repeated HASH_JOIN build sides",
+      "techniques": ["T001", "T002", "T007"]
+    },
+    {
+      "id": "TA002",
+      "name": "Predicate Blindness",
+      "description": "Optimizer cannot push selective filters across CTE/subquery boundaries, causing full scans where filtered scans would suffice.",
+      "detection_class": "data_flow",
+      "telemetry": "EXPLAIN ANALYZE row counts — large actual rows at scan nodes that could be pre-filtered by dimension predicates",
+      "techniques": ["T003", "T004", "T005", "T006"]
+    },
+    {
+      "id": "TA003",
+      "name": "Correlation Penalty",
+      "description": "Optimizer re-executes correlated subqueries per outer row instead of materializing once.",
+      "detection_class": "data_flow",
+      "telemetry": "EXPLAIN ANALYZE loops count — Nested Loop with loops >> 1 on subquery that could be pre-computed",
+      "techniques": ["T008", "T009"]
+    },
+    {
+      "id": "TA004",
+      "name": "Join Order Rigidity",
+      "description": "Optimizer picks suboptimal join order, joining large tables before applying selective filters.",
+      "detection_class": "data_flow",
+      "telemetry": "EXPLAIN ANALYZE row counts — intermediate join produces M rows where post-filter reduces to K << M",
+      "techniques": ["T010", "T011"]
+    },
+    {
+      "id": "TA005",
+      "name": "Materialization Waste",
+      "description": "Optimizer materializes too much (full CTE) or too little (repeated computation) due to CTE materialization boundaries.",
+      "detection_class": "buffer_access",
+      "telemetry": "PG: Buffer hit+read counts. DuckDB: repeated TABLE_SCAN of same table in different CTE consumers.",
+      "techniques": ["T012", "T013", "T014"]
+    }
+  ],
+
+  "techniques": {
+    "T001": {
+      "id": "T001",
+      "name": "Single-Pass Aggregation",
+      "tactic": "TA001",
+      "description": "Consolidate N subqueries scanning the same table into 1 CTE with CASE expressions inside aggregate functions. Reduces N scans to 1.",
+      "applicability": ["duckdb", "postgresql"],
+
+      "detection": {
+        "class": "structural",
+        "data_sources": ["explain_node_counts"],
+        "signatures": [
+          {
+            "id": "D001.1",
+            "name": "Repeated fact scan with cross products",
+            "description": "N≥3 TABLE_SCAN nodes on same fact table, connected by CROSS_PRODUCT joins. Each subquery computes a scalar aggregate independently.",
+            "engine": "duckdb",
+            "plan_indicators": {
+              "TABLE_SCAN_same_table_min": 3,
+              "CROSS_PRODUCT_min": 2,
+              "pattern": "N scalar subqueries → CROSS_PRODUCT chain"
+            },
+            "sql_indicators": [
+              "Multiple (SELECT agg(...) FROM same_table WHERE ...) in SELECT list",
+              "CASE WHEN (SELECT count...) > threshold THEN (SELECT avg...)"
+            ]
+          },
+          {
+            "id": "D001.2",
+            "name": "Repeated fact scan with identical joins",
+            "description": "N≥3 TABLE_SCAN nodes on same fact table, each joined to identical dimension tables. Common in time-bucketed queries.",
+            "engine": "duckdb",
+            "plan_indicators": {
+              "TABLE_SCAN_same_table_min": 3,
+              "HASH_JOIN_repeated_build": true,
+              "pattern": "N subqueries with same fact+dim joins differing only in filter"
+            },
+            "sql_indicators": [
+              "Multiple FROM same_table, dim1, dim2 WHERE ... subqueries",
+              "Each subquery differs only in one filter predicate (time range, bucket)"
+            ]
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P001.1",
+          "query": "Q9",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 4.47,
+          "gold_example": "single_pass_aggregation",
+          "plan_before_summary": "16 TABLE_SCAN store_sales, 15 CROSS_PRODUCT. Each bucket scans full fact table independently.",
+          "plan_after_summary": "2 TABLE_SCAN store_sales, 1 CROSS_PRODUCT. Single CTE with CASE WHEN routing to 5 conditional aggregates.",
+          "plan_evidence": {
+            "original_nodes": 88,
+            "optimized_nodes": 10,
+            "scan_change": "16→2 TABLE_SCAN",
+            "cross_product_change": "15→0",
+            "smoking_gun": "88→10 plan nodes, 16→2 scans. Original builds 5 scalar subqueries each scanning store_sales independently, cross-producted together. Optimized: single CTE scans once with CASE WHEN routing rows to conditional aggregates."
+          }
+        },
+        {
+          "id": "P001.2",
+          "query": "Q88",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 6.24,
+          "gold_example": "channel_bitmap_aggregation",
+          "plan_before_summary": "16 TABLE_SCAN (8×store_sales + 8×dim tables), 7 CROSS_PRODUCT. Each time bucket rescans fact+dims.",
+          "plan_after_summary": "4 TABLE_SCAN (1×store_sales + 3 dim CTEs), 0 CROSS_PRODUCT. Single scan with time_window CASE labels.",
+          "plan_evidence": {
+            "original_nodes": 64,
+            "optimized_nodes": 16,
+            "scan_change": "16→4 TABLE_SCAN",
+            "cross_product_change": "7→0",
+            "smoking_gun": "64→16 plan nodes, 16→4 scans. Original: 8 time buckets each re-scan store_sales + time_dim + household_demographics + store, cross-producted. Optimized: 3 dimension CTEs + 1 fact scan with CASE WHEN time_window labels."
+          }
+        }
+      ],
+
+      "mitigations": [
+        {
+          "id": "M001.1",
+          "severity": "MEDIUM",
+          "instruction": "Limit to ≤8 CASE branches. Beyond 8, CASE evaluation overhead offsets scan reduction."
+        },
+        {
+          "id": "M001.2",
+          "severity": "HIGH",
+          "instruction": "Only apply when subqueries share the SAME table and SAME join structure. If subqueries hit different tables, this technique does not apply."
+        }
+      ]
+    },
+
+    "T003": {
+      "id": "T003",
+      "name": "Date CTE Isolation",
+      "tactic": "TA002",
+      "description": "Extract selective date_dim filter into a CTE, creating a tiny hash table that the fact table probes. Reduces rows entering downstream joins.",
+      "applicability": ["duckdb", "postgresql"],
+
+      "detection": {
+        "class": "data_flow",
+        "data_sources": ["explain_analyze_row_counts"],
+        "signatures": [
+          {
+            "id": "D003.1",
+            "name": "Full date_dim scan in star join",
+            "description": "date_dim scanned with 73K rows but only 365-730 match the year/month filter. The selective filter is applied AFTER joining with the fact table, not before.",
+            "engine": "duckdb",
+            "plan_indicators": {
+              "hot_node": "TABLE_SCAN date_dim → HASH_JOIN with fact table",
+              "actual_rows_in": "73K (full table)",
+              "actual_rows_out": "365-730 (after filter)",
+              "selectivity": "< 1%"
+            },
+            "sql_indicators": [
+              "date_dim in FROM clause with d_year = YYYY or d_month_seq BETWEEN",
+              "Star schema: fact table comma-joined with date_dim + other dims"
+            ]
+          },
+          {
+            "id": "D003.2",
+            "name": "PG nested loop on date_dim with high buffer access",
+            "description": "On PostgreSQL, date_dim filter applied inside nested loop causing repeated index lookups. CTE materialization + explicit JOIN switches to hash join with tiny probe table.",
+            "engine": "postgresql",
+            "plan_indicators": {
+              "nested_loop_on": "date_dim",
+              "loops_gt": 100,
+              "buffer_access_high": true
+            },
+            "sql_indicators": [
+              "Comma-separated joins including date_dim",
+              "Must NOT contain EXISTS/NOT EXISTS or INTERSECT (harmed by CTE on PG)"
+            ]
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P003.1",
+          "query": "Q6",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 1.86,
+          "gold_example": "date_cte_isolate",
+          "plan_before_summary": "7 scans, 7 HASH_JOIN. Same plan structure as optimized — DuckDB handles scan sharing. Win comes from smaller hash table probe sizes.",
+          "plan_after_summary": "7 scans, 6 HASH_JOIN. One fewer join. Rows flowing through main pipeline reduced."
+        },
+        {
+          "id": "P003.2",
+          "query": "Q099_agg",
+          "engine": "postgresql",
+          "benchmark": "DSB SF10",
+          "speedup": 2.28,
+          "gold_example": "pg_date_cte_explicit_join",
+          "plan_before_summary": "Nested Loop chain with 731 loops on date_dim. 74K buffer accesses (shared hit=74084).",
+          "plan_after_summary": "Same Nested Loop structure — PG inlined the CTE. 74K buffers unchanged. Speedup from explicit JOIN syntax enabling better join order.",
+          "plan_evidence": {
+            "original_buffers": 74084,
+            "optimized_buffers": 74084,
+            "original_exec_ms": 48.0,
+            "optimized_exec_ms": 21.0,
+            "smoking_gun": "Same buffer count but 2.3x faster — join order change, not scan reduction. Explicit JOIN syntax enabled PG planner to reorder."
+          }
+        }
+      ],
+
+      "mitigations": [
+        {
+          "id": "M003.1",
+          "severity": "HIGH",
+          "instruction": "On PostgreSQL, MUST pair with explicit JOIN syntax. CTE alone can hurt — the combination enables hash join planning."
+        },
+        {
+          "id": "M003.2",
+          "severity": "CRITICAL",
+          "instruction": "Do NOT apply when query contains EXISTS/NOT EXISTS or INTERSECT/EXCEPT. These patterns are harmed by CTE isolation on PostgreSQL."
+        },
+        {
+          "id": "M003.3",
+          "severity": "MEDIUM",
+          "instruction": "Do NOT decompose an already-efficient existing CTE into sub-CTEs. Caused 0.49x regression on Q31 (DuckDB already optimized the date pushdown)."
+        }
+      ]
+    },
+
+    "T004": {
+      "id": "T004",
+      "name": "Dimension CTE Isolation",
+      "tactic": "TA002",
+      "description": "Pre-filter ALL selective dimension tables into CTEs returning only surrogate keys before joining with fact table. Each CTE creates a tiny hash table.",
+      "applicability": ["duckdb", "postgresql"],
+
+      "detection": {
+        "class": "data_flow",
+        "data_sources": ["explain_analyze_row_counts"],
+        "signatures": [
+          {
+            "id": "D004.1",
+            "name": "Multiple dimension scans with selective filters",
+            "description": "Star schema query with 3+ dimension tables, each having selective WHERE filters. Dimensions scanned fully then filtered after join.",
+            "plan_indicators": {
+              "dimension_tables_with_filters_min": 2,
+              "fact_table_scan_rows_high": true,
+              "pattern": "fact → dim1(filtered) → dim2(filtered) → dim3(filtered)"
+            },
+            "sql_indicators": [
+              "Star schema: fact_table, dim1, dim2, dim3 with WHERE filters on each dim",
+              "Selective predicates on 2+ dimensions (e.g., d_year=2000, cd_gender='M', p_channel='N')"
+            ]
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P004.1",
+          "query": "Q26",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 1.93,
+          "gold_example": "dimension_cte_isolate"
+        },
+        {
+          "id": "P004.2",
+          "query": "Q080",
+          "engine": "postgresql",
+          "benchmark": "DSB SF10",
+          "speedup": 4.69,
+          "gold_example": "pg_materialized_dimension_fact_prefilter",
+          "plan_before_summary": "7 Nested Loops, 181K buffer accesses. Deep join chain probing unfiltered dimensions.",
+          "plan_after_summary": "2 Nested Loops, 30K buffers, +5 CTE Scans, +4 Hash Joins. 6x buffer reduction.",
+          "plan_evidence": {
+            "original_buffers": 181582,
+            "optimized_buffers": 30266,
+            "buffer_reduction": 6.0,
+            "original_exec_ms": 360.6,
+            "optimized_exec_ms": 76.8,
+            "smoking_gun": "181K→30K buffers (6x reduction). Dimension CTEs (item filter→17K rows, date filter→365 rows, cd filter→0 rows) materialized once then probed via Hash Join. Original deep Nested Loop chain accessed 77K read buffers; optimized uses 30K read via CTE scans."
+          }
+        }
+      ],
+
+      "mitigations": [
+        {
+          "id": "M004.1",
+          "severity": "CRITICAL",
+          "instruction": "NEVER create dimension CTEs without a WHERE clause. Unfiltered dimension CTEs add pure overhead."
+        },
+        {
+          "id": "M004.2",
+          "severity": "CRITICAL",
+          "instruction": "NEVER CROSS JOIN 3+ pre-filtered dimension CTEs. This creates a cartesian product. Evidence: Q80 0.0076x (132x slower)."
+        }
+      ]
+    },
+
+    "T005": {
+      "id": "T005",
+      "name": "Multi-Date Range CTE",
+      "tactic": "TA002",
+      "description": "When query joins date_dim multiple times with different filters (d1, d2, d3), create separate CTEs for each range and pre-join with fact tables.",
+      "applicability": ["duckdb"],
+
+      "detection": {
+        "class": "data_flow",
+        "data_sources": ["explain_analyze_row_counts"],
+        "signatures": [
+          {
+            "id": "D005.1",
+            "name": "Multiple date_dim aliases with different filters",
+            "sql_indicators": [
+              "date_dim d1, date_dim d2, date_dim d3 pattern",
+              "Each alias has different WHERE (d1.d_year=X, d2.d_moy BETWEEN, d3.d_year IN (...))"
+            ]
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P005.1",
+          "query": "Q29",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 2.35,
+          "gold_example": "multi_date_range_cte"
+        }
+      ]
+    },
+
+    "T006": {
+      "id": "T006",
+      "name": "Shared Dimension Multi-Channel",
+      "tactic": "TA002",
+      "description": "When multiple channel CTEs (store/catalog/web) apply identical dimension filters, extract shared filters into common CTEs referenced by all channels.",
+      "applicability": ["duckdb"],
+
+      "detection": {
+        "class": "structural",
+        "data_sources": ["explain_node_counts", "sql_pattern"],
+        "signatures": [
+          {
+            "id": "D006.1",
+            "name": "Repeated dimension joins across UNION ALL branches",
+            "sql_indicators": [
+              "3 parallel subqueries (store_sales, catalog_sales, web_sales) each with identical date_dim/item/promotion joins",
+              "UNION ALL combining channel results"
+            ]
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P006.1",
+          "query": "Q80",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 1.4,
+          "gold_example": "shared_dimension_multi_channel"
+        }
+      ]
+    },
+
+    "T007": {
+      "id": "T007",
+      "name": "CTE Specialization (Union Split)",
+      "tactic": "TA001",
+      "description": "Split a generic CTE that is scanned multiple times with different filters into specialized CTEs embedding each filter. Eliminates redundant post-hoc filtering.",
+      "applicability": ["duckdb"],
+
+      "detection": {
+        "class": "structural",
+        "data_sources": ["explain_node_counts"],
+        "signatures": [
+          {
+            "id": "D007.1",
+            "name": "Same CTE scanned N times with year/type filter",
+            "plan_indicators": {
+              "TABLE_SCAN_reduction": "12→6 or similar",
+              "pattern": "CTE with UNION ALL scanned 2-4x, each consumer filters by year or sale_type"
+            },
+            "sql_indicators": [
+              "CTE referenced multiple times in FROM with different WHERE year= or type= filters",
+              "year_total CTE pattern: scanned as t_s_firstyear, t_s_secyear, t_w_firstyear, t_w_secyear"
+            ]
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P007.1",
+          "query": "Q74",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 1.57,
+          "gold_example": "union_cte_split"
+        }
+      ],
+
+      "mitigations": [
+        {
+          "id": "M007.1",
+          "severity": "HIGH",
+          "instruction": "The specialized CTEs must COMPLETELY REPLACE the generic CTE. Leaving the old CTE referenced alongside specialized ones doubles the work."
+        }
+      ]
+    },
+
+    "T008": {
+      "id": "T008",
+      "name": "Decorrelation",
+      "tactic": "TA003",
+      "description": "Convert correlated subqueries to standalone CTEs with GROUP BY, then JOIN. Replaces per-row re-execution with single materialization.",
+      "applicability": ["duckdb", "postgresql"],
+
+      "detection": {
+        "class": "data_flow",
+        "data_sources": ["explain_analyze_row_counts", "explain_node_types"],
+        "signatures": [
+          {
+            "id": "D008.1",
+            "name": "DELIM_JOIN or Nested Loop SubPlan with high loops",
+            "description": "DuckDB: DELIM_JOIN node indicates correlated subquery. PG: SubPlan with loops >> 1.",
+            "plan_indicators": {
+              "duckdb": "DELIM_JOIN present",
+              "postgresql": "SubPlan with loops > 100"
+            },
+            "sql_indicators": [
+              "WHERE col > (SELECT agg() FROM ... WHERE outer.key = inner.key)",
+              "Correlated scalar subquery in WHERE or SELECT"
+            ]
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P008.1",
+          "query": "Q1",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 1.87,
+          "gold_example": "decorrelate",
+          "plan_before_summary": "DELIM_JOIN present. 4 scans, 5 HASH_JOIN.",
+          "plan_after_summary": "No DELIM_JOIN. 4 scans, 4 HASH_JOIN. Correlated subquery replaced by GROUP BY CTE + JOIN.",
+          "plan_evidence": {
+            "original_nodes": 30,
+            "optimized_nodes": 25,
+            "key_change": "DELIM_JOIN eliminated",
+            "smoking_gun": "30→25 plan nodes. DELIM_JOIN (DuckDB's correlated subquery marker) eliminated. Correlated scalar subquery WHERE sr_return_amt > AVG() replaced by standalone GROUP BY CTE joined via HASH_JOIN."
+          }
+        },
+        {
+          "id": "P008.2",
+          "query": "Q092",
+          "engine": "postgresql",
+          "benchmark": "DSB SF10",
+          "speedup": 4428,
+          "gold_example": "inline_decorrelate_materialized",
+          "plan_before_summary": "TIMEOUT >120s. Correlated scalar subquery in WHERE cs_ext_discount_amt > 1.3×AVG(...) re-executes per-row against unfiltered catalog_sales. PG cannot decorrelate the AVG subquery and rescans the full fact table per outer row.",
+          "plan_after_summary": "244ms. Three staged CTEs: filtered_items (31K→17K), date_filtered_sales (506K rows, pre-joined fact×date), item_avg_discount (GROUP BY with threshold). Final Hash Join between date_filtered_sales and item_avg_discount eliminates correlation entirely.",
+          "plan_evidence": {
+            "original_buffers": "TIMEOUT (>120s, plan not obtainable)",
+            "optimized_buffers": 23277,
+            "optimized_exec_ms": 244.0,
+            "smoking_gun": "Timeout→244ms. Original's correlated subquery forced PG to re-execute AVG() per outer row against full catalog_sales. Optimized pre-computes item_avg_discount CTE with GROUP BY cs_item_sk, then Hash Joins — single pass over fact table instead of N×full-scan."
+          }
+        }
+      ],
+
+      "mitigations": [
+        {
+          "id": "M008.1",
+          "severity": "HIGH",
+          "instruction": "Must push selective filters into the decorrelated CTE. Decorrelating without pre-filtering can create a CTE larger than needed."
+        }
+      ]
+    },
+
+    "T009": {
+      "id": "T009",
+      "name": "Composite Decorrelation",
+      "tactic": "TA003",
+      "description": "When multiple correlated EXISTS share common filters, extract shared dimensions once, decorrelate each EXISTS into DISTINCT CTE, replace OR(EXISTS) with UNION of key sets.",
+      "applicability": ["duckdb"],
+
+      "detection": {
+        "class": "data_flow",
+        "data_sources": ["explain_analyze_row_counts"],
+        "signatures": [
+          {
+            "id": "D009.1",
+            "name": "Multiple EXISTS subqueries with shared date filter",
+            "sql_indicators": [
+              "EXISTS (... date_dim WHERE d_year=X) AND (EXISTS (... date_dim WHERE d_year=X) OR EXISTS (...))",
+              "Multiple correlated EXISTS on different fact tables sharing the same dimension filter"
+            ]
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P009.1",
+          "query": "Q35",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 2.01,
+          "gold_example": "composite_decorrelate_union"
+        }
+      ]
+    },
+
+    "T010": {
+      "id": "T010",
+      "name": "Early Filter (Staged Pipeline)",
+      "tactic": "TA004",
+      "description": "Filter small dimension tables FIRST into CTEs, then join to fact tables. Builds a staged CTE pipeline that progressively reduces data.",
+      "applicability": ["duckdb", "postgresql"],
+
+      "detection": {
+        "class": "data_flow",
+        "data_sources": ["explain_analyze_row_counts"],
+        "signatures": [
+          {
+            "id": "D010.1",
+            "name": "Fact table joined before selective dimension filter applied",
+            "description": "Fact table scan produces millions of rows that flow into a join, but a highly selective dimension filter (e.g., reason_desc='X' → 1 row) is applied AFTER the expensive join.",
+            "plan_indicators": {
+              "fact_scan_rows": "> 1M",
+              "dimension_filter_selectivity": "< 0.1%",
+              "filter_applied": "after join (late)"
+            },
+            "sql_indicators": [
+              "Small dimension table (reason, store) with equality filter listed AFTER fact table in FROM",
+              "Fact table LEFT/INNER JOIN with filter on small dimension in WHERE"
+            ]
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P010.1",
+          "query": "Q93",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 2.97,
+          "gold_example": "early_filter",
+          "plan_before_summary": "3 scans. Same structure as optimized. But 28M store_sales rows flow through join before reason filter (65 rows) is applied.",
+          "plan_after_summary": "3 scans. reason filtered first → store_returns pre-filtered → store_sales probed against tiny result.",
+          "plan_evidence": {
+            "original_nodes": 9,
+            "optimized_nodes": 11,
+            "key_change": "Data flow reordered — selective filter applied first",
+            "smoking_gun": "Same 3 table scans but different join order. Original: store_sales (28M rows) → store_returns → reason (65 rows). Optimized: reason (65 rows) → store_returns (pre-filtered) → store_sales (probed against tiny set). More plan nodes (9→11) but far less data flowing through pipeline."
+          }
+        }
+      ]
+    },
+
+    "T011": {
+      "id": "T011",
+      "name": "OR-to-UNION Decomposition",
+      "tactic": "TA004",
+      "description": "Split OR conditions on different columns into UNION ALL branches with focused predicates. Enables different access paths per branch.",
+      "applicability": ["duckdb"],
+
+      "detection": {
+        "class": "data_flow",
+        "data_sources": ["explain_analyze_row_counts", "sql_pattern"],
+        "signatures": [
+          {
+            "id": "D011.1",
+            "name": "OR on different column families in single scan",
+            "sql_indicators": [
+              "WHERE (col_a IN (...) OR col_b IN (...) OR col_c > threshold)",
+              "OR conditions span different tables or fundamentally different column families"
+            ],
+            "anti_pattern": "Do NOT apply when all OR branches filter the SAME column on the same table"
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P011.1",
+          "query": "Q15",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 1.52,
+          "gold_example": "or_to_union"
+        }
+      ],
+
+      "mitigations": [
+        {
+          "id": "M011.1",
+          "severity": "CRITICAL",
+          "instruction": "NEVER split into more than 3 UNION ALL branches. Each branch rescans the fact table. 9 branches = 9x scans = disaster. Evidence: Q13, Q48 → 0.23x-0.41x."
+        },
+        {
+          "id": "M011.2",
+          "severity": "HIGH",
+          "instruction": "Do NOT split OR when all branches filter the SAME column (e.g., t_hour >= 8 OR t_hour <= 17). This duplicates scans with no selectivity benefit. Evidence: Q90 → 0.59x."
+        }
+      ]
+    },
+
+    "T012": {
+      "id": "T012",
+      "name": "INTERSECT to EXISTS",
+      "tactic": "TA005",
+      "description": "Replace INTERSECT with EXISTS to avoid full materialization and sorting. EXISTS short-circuits at first match, enabling semi-join optimization.",
+      "applicability": ["duckdb"],
+
+      "detection": {
+        "class": "structural",
+        "data_sources": ["explain_node_counts", "sql_pattern"],
+        "signatures": [
+          {
+            "id": "D012.1",
+            "name": "INTERSECT between large result sets",
+            "sql_indicators": [
+              "SELECT ... FROM channel_1 INTERSECT SELECT ... FROM channel_2 INTERSECT SELECT ... FROM channel_3",
+              "INTERSECT operands each scan large fact tables"
+            ]
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P012.1",
+          "query": "Q14",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 2.72,
+          "gold_example": "intersect_to_exists"
+        }
+      ]
+    },
+
+    "T013": {
+      "id": "T013",
+      "name": "Self-Join Decomposition (Shared Materialization)",
+      "tactic": "TA005",
+      "description": "When same fact+dimension scan appears in self-join pattern, materialize once as CTE and derive both aggregates from same result.",
+      "applicability": ["postgresql"],
+
+      "detection": {
+        "class": "buffer_access",
+        "data_sources": ["explain_buffer_counts"],
+        "signatures": [
+          {
+            "id": "D013.1",
+            "name": "Duplicate fact scan in self-join",
+            "description": "Same fact+dimension join appears twice — once for per-item aggregate, once for per-store average. PG scans the fact table twice.",
+            "plan_indicators": {
+              "buffer_reduction_potential": "> 1.5x",
+              "duplicate_scan_pattern": "same table scanned with identical join predicates at two plan positions"
+            },
+            "sql_indicators": [
+              "Subquery sa and subquery sc both scan store_sales+date_dim with identical WHERE",
+              "Self-join: sb.store_sk = sc.store_sk with sb computing AVG of sc's result"
+            ]
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P013.1",
+          "query": "Q065_multi",
+          "engine": "postgresql",
+          "benchmark": "DSB SF10",
+          "speedup": 3.93,
+          "gold_example": "pg_self_join_decomposition",
+          "plan_before_summary": "88K buffer accesses. Merge Join between two independently computed GroupAggregates — both scan store_sales×date_dim identically (Nested Loop, 365 loops each). Duplicate work: same fact+dim scan appears at two plan positions.",
+          "plan_after_summary": "48K buffers. CTE store_sales_revenue computed once (Gather Merge + Partial GroupAggregate), then scanned twice as CTE Scan — one for per-item revenue, one for per-store average. Hash Join replaces Merge Join for the comparison.",
+          "plan_evidence": {
+            "original_buffers": 88093,
+            "optimized_buffers": 48120,
+            "buffer_reduction": 1.83,
+            "original_exec_ms": 1922.6,
+            "optimized_exec_ms": 1121.1,
+            "original_temp_rw": "read=2360 written=3300",
+            "optimized_temp_rw": "read=2223 written=2232",
+            "smoking_gun": "88K→48K buffers (1.83x). Original runs two identical GroupAggregate pipelines (each: Nested Loop date_dim×store_sales, 365 loops, ~37K read buffers). Optimized CTE materializes once, two CTE Scans reuse result. Temp I/O also reduced."
+          }
+        }
+      ]
+    },
+
+    "T014": {
+      "id": "T014",
+      "name": "Deferred Window Aggregation",
+      "tactic": "TA005",
+      "description": "Delay window functions until after joins reduce the dataset. Compute GROUP BY in CTEs, join results, then apply WINDOW once.",
+      "applicability": ["duckdb"],
+
+      "detection": {
+        "class": "data_flow",
+        "data_sources": ["explain_analyze_row_counts"],
+        "signatures": [
+          {
+            "id": "D014.1",
+            "name": "Window functions computed before FULL OUTER JOIN",
+            "sql_indicators": [
+              "CTE_a: SUM() OVER(PARTITION BY...) before join",
+              "CTE_b: SUM() OVER(PARTITION BY...) before join",
+              "Main: CTE_a FULL OUTER JOIN CTE_b → MAX() OVER() for carry-forward"
+            ]
+          }
+        ]
+      },
+
+      "procedures": [
+        {
+          "id": "P014.1",
+          "query": "Q51",
+          "engine": "duckdb",
+          "benchmark": "TPC-DS SF10",
+          "speedup": 1.36,
+          "gold_example": "deferred_window_aggregation"
+        }
+      ],
+
+      "mitigations": [
+        {
+          "id": "M014.1",
+          "severity": "MEDIUM",
+          "instruction": "Only applies when window is monotonically accumulating SUM. AVG, COUNT, or non-monotonic windows require separate computation."
+        }
+      ]
+    }
+  },
+
+  "detection_data_sources": {
+    "explain_node_counts": {
+      "description": "Count of plan node types from EXPLAIN (no ANALYZE needed). Cheapest telemetry.",
+      "detects": "Class 1 — Structural Redundancy (scan reduction, cross product elimination)",
+      "collection": "EXPLAIN without ANALYZE, parse node type counts",
+      "cost": "zero extra execution"
+    },
+    "explain_analyze_row_counts": {
+      "description": "Per-node actual row counts from EXPLAIN ANALYZE. Requires query execution.",
+      "detects": "Class 2 — Data Flow problems (rows flowing through wrong paths)",
+      "collection": "EXPLAIN ANALYZE, extract actual rows per node",
+      "cost": "one extra execution (after timing runs complete)"
+    },
+    "explain_buffer_counts": {
+      "description": "Buffer hit/read counts from EXPLAIN (ANALYZE, BUFFERS). PostgreSQL only.",
+      "detects": "Class 3 — Buffer access waste from materialization decisions",
+      "collection": "EXPLAIN (ANALYZE, BUFFERS), extract top-level shared hit + read",
+      "cost": "one extra execution (PG only)"
+    }
+  },
+
+  "hot_node_extraction_rules": {
+    "$comment": "Rules for extracting 'smoking gun' metrics from EXPLAIN ANALYZE to show workers",
+    "rules": [
+      {
+        "id": "HN001",
+        "name": "High-row scan node",
+        "condition": "TABLE_SCAN or Seq Scan with actual_rows > 1M",
+        "output": "→ {table}: {actual_rows} rows scanned ({time_pct}% of total)"
+      },
+      {
+        "id": "HN002",
+        "name": "High-loop nested operation",
+        "condition": "Nested Loop or SubPlan with loops > 100",
+        "output": "→ Nested Loop on {table}: {loops} iterations × {rows_per_loop} rows = {total_work}"
+      },
+      {
+        "id": "HN003",
+        "name": "Filter selectivity waste",
+        "condition": "Rows Removed by Filter > 10× actual rows",
+        "output": "→ {table} filter: {rows_removed} removed / {actual_rows} kept ({selectivity}% waste)"
+      },
+      {
+        "id": "HN004",
+        "name": "Cross product in plan",
+        "condition": "CROSS_PRODUCT node exists",
+        "output": "→ CROSS PRODUCT: {left_rows} × {right_rows} = {total} (avoidable?)"
+      },
+      {
+        "id": "HN005",
+        "name": "Duplicate table scan",
+        "condition": "Same table appears in 2+ TABLE_SCAN nodes",
+        "output": "→ {table} scanned {N}× ({total_rows_across_scans} rows total)"
+      },
+      {
+        "id": "HN006",
+        "name": "Buffer-heavy node (PG)",
+        "condition": "shared hit + read > 50K at any node",
+        "output": "→ {node_type} on {table}: {buffers} buffer accesses ({pct}% of total)"
+      }
+    ]
+  }
+}

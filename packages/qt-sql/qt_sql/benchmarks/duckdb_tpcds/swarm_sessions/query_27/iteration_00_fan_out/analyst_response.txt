@@ -1,0 +1,321 @@
+<reasoning>
+**1. CLASSIFY**
+This is a classic star-join with late dim filter? Actually, it's a star-join (store_sales fact with dimensions) with filters on multiple dimensions (customer_demographics, date_dim, store). The aggregation is a ROLLUP on two dimensions (item_id, state). No correlated subqueries, no INTERSECT, no UNION ALL, no window functions, no OR conditions. Archetype: star-join with group-by rollup.
+
+**2. EXPLAIN PLAN ANALYSIS**
+- Total time: 1816ms.
+- Biggest cost: SEQ_SCAN store_sales (1031.4ms, 57% of total). This is the fact table scan.
+- Second: HASH_JOIN customer_demographics (627.4ms, 35%). This join is expensive because customer_demographics filter yields 27K rows (selective) but join with 5.5M rows from store_sales is heavy.
+- Other joins are cheap (<80ms each).
+- Row flow: store_sales 345.6M → after date join 5.5M → after customer_demographics join 79K → after store join 53K → after item join 53K → aggregation 74K rows → top-N 100.
+- The optimizer already pushes predicates into scans (date_dim, customer_demographics, store). It uses hash joins, and the join order is: store_sales → date_dim → customer_demographics → store → item.
+- The fact table is scanned ONCE. No repeated scans.
+- The customer_demographics join is performed AFTER the date join, which already reduced store_sales to 5.5M rows. Could we pre-filter customer_demographics and join earlier? The optimizer already chose this order.
+- The ROLLUP aggregation is cheap (40.4ms). The bottleneck is clearly the store_sales scan and the customer_demographics join.
+
+**3. GAP MATCHING**
+- CROSS_COLUMN_OR_DECOMPOSITION: No OR conditions. Not applicable.
+- CORRELATED_SUBQUERY_PARALYSIS: No correlated subqueries.
+- CROSS_CTE_PREDICATE_BLINDNESS: The query has no CTEs. The optimizer pushes predicates into scans. However, creating CTEs for dimension filters could allow early reduction before the fact join? The engine strength INTRA_SCAN_PREDICATE_PUSHDOWN already pushes filters into scans. But the dimension tables are small; pre-filtering them into CTEs might not reduce scan time (they are already fast). The real bottleneck is the store_sales scan.
+- REDUNDANT_SCAN_ELIMINATION: Only one fact scan. No repeated scans.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: No UNION CTE.
+
+However, there is an opportunity: the customer_demographics join is expensive because it's joining 27K rows with 5.5M rows. Could we reduce the 5.5M rows earlier by pre-filtering store_sales with all dimension keys? That's the star_join_prefetch transform. Pre-filter all dimension tables into CTEs, then probe store_sales with the intersection of foreign keys. This could reduce the store_sales scan to only rows matching all dimensions, rather than scanning 5.5M rows and then filtering.
+
+Check engine gaps: "CROSS_CTE_PREDICATE_BLINDNESS" — the optimizer may not push multiple dimension filters into the fact scan simultaneously. The EXPLAIN shows store_sales scan has no filter (it's a full seq scan). The date filter is applied via a join after the scan. So the fact table is scanned entirely for the date range (5.5M rows). If we could push all dimension key filters into the fact scan (via a composite key lookup), we might scan fewer rows. But DuckDB doesn't have index-based lookup. However, we could precompute the set of valid foreign keys from each dimension, then use a semi-join or join with store_sales on the composite key? That's essentially the star_join_prefetch.
+
+**4. AGGREGATION TRAP CHECK**
+Aggregates are AVG. AVG is not duplicate-safe, but the joins are all inner joins on foreign keys, so no duplication introduced. ROLLUP produces multiple grouping levels. Any rewrite must preserve the exact grouping sets.
+
+**5. TRANSFORM SELECTION**
+We need 4 diverse strategies.
+
+1. **star_join_prefetch** (multi_dimension_prefetch): Pre-filter all dimensions into CTEs, then join with fact table using the intersection of foreign keys. This attacks the bottleneck by reducing fact scan rows.
+2. **rollup_to_union_windowing**: Replace ROLLUP with explicit UNION ALL of pre-aggregated CTEs per level. This might allow per-level optimization (e.g., for the grand total, we could aggregate without joining to item? No, item join still needed for filter? Actually, item join is for i_item_id, which is in GROUP BY. For the grand total level, i_item_id is NULL, but we still need to filter rows? The item join is needed for the foreign key constraint but not for grouping. Could we avoid joining item for the grand total? Possibly. This is an exploration.
+3. **prefetch_fact_join**: Staged join pipeline: filter date_dim first, pre-join with store_sales, then join other dimensions. This is similar to what the optimizer already does, but we can enforce order via CTEs.
+4. **exploration: aggregate_pushdown**: Push aggregation below the item join? The item join is on ss_item_sk = i_item_sk. The GROUP BY includes i_item_id. We could aggregate on ss_item_sk first (with other keys), then join with item to get i_item_id. This reduces the rows joined with item (102K rows). However, AVG must be computed on the original rows. We can group by ss_item_sk, s_store_sk, ss_cdemo_sk, d_date_sk? That's too many keys. Instead, we could join filtered dimensions first, then aggregate. Wait, that's the original plan.
+
+Given the bottleneck is the store_sales scan and customer_demographics join, strategies that reduce fact scan rows are most promising.
+
+**6. LOGICAL TREE DESIGN**
+For each strategy, design CTEs with exhaustive output columns.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Business intent: Compute average sales metrics for 1999 store sales to female, divorced, secondary-educated customers in six states, with rollup subtotals by item and state. JOIN semantics are INNER joins on surrogate keys, requiring matches in all five tables. Aggregation uses AVG, which is sensitive to row duplication from joins; ensure joins do not multiply rows. Filters on customer_demographics, date_dim, and store are independent; missing any filter changes the result set.
+
+BOTTLENECK_DIAGNOSIS:
+The query is scan-bound: the store_sales sequential scan (1031ms, 57%) dominates. The customer_demographics hash join (627ms, 35%) is also expensive because it joins 27K filtered demographic rows with 5.5M date-filtered sales rows. Cardinality flow: store_sales 345.6M → 5.5M after date join → 79K after customer_demographics join → 53K after store join → 53K after item join → 74K groups after ROLLUP → top 100. The optimizer already pushes dimension filters into their scans (date_dim, customer_demographics, store) and chooses a reasonable join order. The logical-tree cost percentages are misleading; the EXPLAIN timings are ground truth.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output i_item_id, s_state, grouping(s_state) g_state, avg(ss_quantity) agg1, avg(ss_list_price) agg2, avg(ss_coupon_amt) agg3, avg(ss_sales_price) agg4.
+- CTE_COLUMN_COMPLETENESS: Any CTE must include all columns referenced downstream (e.g., surrogate keys for joins, grouping columns, aggregates).
+- LITERAL_PRESERVATION: Must preserve literal values: cd_gender='F', cd_marital_status='D', cd_education_status='Secondary', d_year=1999, s_state IN ('MO','AL','MI','TN','LA','SC').
+- SEMANTIC_EQUIVALENCE: Must return same rows, order, and grouping as original ROLLUP with ORDER BY i_item_id, s_state.
+- CROSS_CTE_PREDICATE_BLINDNESS: The optimizer pushes filters into scans but may not push multiple dimension filters into the fact scan simultaneously. The fact table scan currently reads 5.5M rows; pre-filtering dimensions could reduce this via early semi-joins.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: The ROLLUP generates three grouping levels; splitting into explicit UNION ALL could allow per-level optimization.
+
+REGRESSION_WARNINGS:
+1. Prefetch_fact_join (observed regression 0.50x on Q25):
+   CAUSE: Pre-filtering and materializing fact tables before 3+ fact table joins prevents optimizer join reordering.
+   RULE: Avoid materializing fact table CTEs when the query has multiple fact table joins (this query has only one fact table).
+2. Dimension_cte_isolate (observed regression 0.85x on Q67):
+   CAUSE: Unfiltered dimension CTEs added overhead without selectivity benefit.
+   RULE: Ensure every dimension CTE has a WHERE clause that reduces rows (all dimensions here have filters).
+3. Rollup_to_union_windowing (no regression observed but caution):
+   CAUSE: Replacing efficient ROLLUP with UNION ALL may increase complexity if ROLLUP is already optimal.
+   RULE: Only apply if ROLLUP is inefficient (few groups? 74K groups here, but aggregation is cheap 40ms).
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_cte -> store_cte -> customer_demographics_cte -> item_cte -> fact_filtered -> join_all -> aggregate_rollup -> order_limit
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year = 1999
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_filtered
+  store_cte:
+    FROM: store
+    WHERE: s_state IN ('MO','AL','MI','TN','LA','SC')
+    OUTPUT: s_store_sk, s_state
+    EXPECTED_ROWS: 66
+    CONSUMERS: fact_filtered, join_all
+  customer_demographics_cte:
+    FROM: customer_demographics
+    WHERE: cd_gender = 'F' AND cd_marital_status = 'D' AND cd_education_status = 'Secondary'
+    OUTPUT: cd_demo_sk
+    EXPECTED_ROWS: 27K
+    CONSUMERS: fact_filtered
+  item_cte:
+    FROM: item
+    OUTPUT: i_item_sk, i_item_id
+    EXPECTED_ROWS: 102K
+    CONSUMERS: join_all
+  fact_filtered:
+    FROM: store_sales
+    JOIN: INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+          INNER JOIN store_cte ON ss_store_sk = s_store_sk
+          INNER JOIN customer_demographics_cte ON ss_cdemo_sk = cd_demo_sk
+    OUTPUT: ss_item_sk, ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price, s_state
+    EXPECTED_ROWS: ~53K (after all dimension filters)
+    CONSUMERS: join_all
+  join_all:
+    FROM: fact_filtered
+    JOIN: INNER JOIN item_cte ON ss_item_sk = i_item_sk
+    OUTPUT: i_item_id, s_state, ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price
+    EXPECTED_ROWS: 53K
+    CONSUMERS: aggregate_rollup
+  aggregate_rollup:
+    FROM: join_all
+    GROUP BY: ROLLUP (i_item_id, s_state)
+    AGGREGATE: AVG(ss_quantity) agg1, AVG(ss_list_price) agg2, AVG(ss_coupon_amt) agg3, AVG(ss_sales_price) agg4
+    OUTPUT: i_item_id, s_state, GROUPING(s_state) g_state, agg1, agg2, agg3, agg4
+    EXPECTED_ROWS: 74K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: aggregate_rollup
+    ORDER BY: i_item_id, s_state
+    LIMIT: 100
+    OUTPUT: i_item_id, s_state, g_state, agg1, agg2, agg3, agg4
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: multi_dimension_prefetch, prefetch_fact_join, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+- multi_dimension_prefetch (Q43): Apply the pattern of pre-filtering multiple dimensions (date, store, customer_demographics) into separate CTEs before joining with fact table. Ignore the specific filters (different tables).
+- prefetch_fact_join (Q63): Use the staged CTE chain: filter dimensions, then join with fact table. Ignore the subsequent joins with other fact tables (only one fact table here).
+- dimension_cte_isolate (Q26): Pre-filter each dimension table into a CTE returning surrogate keys and needed columns. Ignore the cross-join warning (we will join via fact table, not cross-join CTEs).
+HAZARD_FLAGS:
+- The fact_filtered CTE may become large (53K rows) and materialized, adding overhead if inlined.
+- Ensure all dimension CTEs include surrogate keys for joins; missing s_state in store_cte would break grouping.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: rollup_to_union_windowing
+TARGET_LOGICAL_TREE:
+  base_joined -> level2_agg -> level1_agg -> level0_agg -> union_all -> order_limit
+NODE_CONTRACTS:
+  base_joined:
+    FROM: store_sales, customer_demographics, date_dim, store, item
+    JOIN: ss_sold_date_sk = d_date_sk AND ss_item_sk = i_item_sk AND ss_store_sk = s_store_sk AND ss_cdemo_sk = cd_demo_sk
+    WHERE: cd_gender = 'F' AND cd_marital_status = 'D' AND cd_education_status = 'Secondary' AND d_year = 1999 AND s_state IN ('MO','AL','MI','TN','LA','SC')
+    OUTPUT: i_item_id, s_state, ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price
+    EXPECTED_ROWS: 53K
+    CONSUMERS: level2_agg, level1_agg, level0_agg
+  level2_agg:
+    FROM: base_joined
+    GROUP BY: i_item_id, s_state
+    AGGREGATE: AVG(ss_quantity) agg1, AVG(ss_list_price) agg2, AVG(ss_coupon_amt) agg3, AVG(ss_sales_price) agg4
+    OUTPUT: i_item_id, s_state, 0 AS grouping_level, agg1, agg2, agg3, agg4
+    EXPECTED_ROWS: ~53K? (less than 53K, many groups)
+    CONSUMERS: union_all
+  level1_agg:
+    FROM: base_joined
+    GROUP BY: i_item_id
+    AGGREGATE: AVG(ss_quantity) agg1, AVG(ss_list_price) agg2, AVG(ss_coupon_amt) agg3, AVG(ss_sales_price) agg4
+    OUTPUT: i_item_id, NULL AS s_state, 1 AS grouping_level, agg1, agg2, agg3, agg4
+    EXPECTED_ROWS: number of distinct i_item_id in filtered set
+    CONSUMERS: union_all
+  level0_agg:
+    FROM: base_joined
+    GROUP BY: ( )
+    AGGREGATE: AVG(ss_quantity) agg1, AVG(ss_list_price) agg2, AVG(ss_coupon_amt) agg3, AVG(ss_sales_price) agg4
+    OUTPUT: NULL AS i_item_id, NULL AS s_state, 2 AS grouping_level, agg1, agg2, agg3, agg4
+    EXPECTED_ROWS: 1
+    CONSUMERS: union_all
+  union_all:
+    FROM: level2_agg UNION ALL level1_agg UNION ALL level0_agg
+    OUTPUT: i_item_id, s_state, grouping_level, agg1, agg2, agg3, agg4
+    EXPECTED_ROWS: 74K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: union_all
+    ORDER BY: i_item_id, s_state
+    LIMIT: 100
+    OUTPUT: i_item_id, s_state, GROUPING(s_state) as g_state (derived from grouping_level), agg1, agg2, agg3, agg4
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: rollup_to_union_windowing, union_cte_split
+EXAMPLE_ADAPTATION:
+- rollup_to_union_windowing (Q36): Replace GROUP BY ROLLUP with explicit UNION ALL of three aggregation levels. Ignore the windowing/ranking aspect (this query has no window functions).
+- union_cte_split (Q74): Split a generic CTE into specialized ones; here we split aggregation levels. Ignore the year-splitting aspect.
+HAZARD_FLAGS:
+- Must compute GROUPING(s_state) correctly: when s_state is NULL and grouping_level=1 or 2, g_state should be 1? Actually GROUPING(s_state) returns 1 when s_state is aggregated (i.e., level1 and level0). We can derive from grouping_level.
+- The base_joined CTE is scanned three times (once per level). If not materialized, may be re-executed thrice, increasing store_sales scan cost. Consider materializing base_joined if referenced multiple times.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  date_cte -> customer_demographics_cte -> store_cte -> fact_prejoined -> item_join -> aggregate_rollup -> order_limit
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year = 1999
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_prejoined
+  customer_demographics_cte:
+    FROM: customer_demographics
+    WHERE: cd_gender = 'F' AND cd_marital_status = 'D' AND cd_education_status = 'Secondary'
+    OUTPUT: cd_demo_sk
+    EXPECTED_ROWS: 27K
+    CONSUMERS: fact_prejoined
+  store_cte:
+    FROM: store
+    WHERE: s_state IN ('MO','AL','MI','TN','LA','SC')
+    OUTPUT: s_store_sk, s_state
+    EXPECTED_ROWS: 66
+    CONSUMERS: fact_prejoined
+  fact_prejoined:
+    FROM: store_sales
+    JOIN: INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+          INNER JOIN customer_demographics_cte ON ss_cdemo_sk = cd_demo_sk
+          INNER JOIN store_cte ON ss_store_sk = s_store_sk
+    OUTPUT: ss_item_sk, ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price, s_state
+    EXPECTED_ROWS: ~53K
+    CONSUMERS: item_join
+  item_join:
+    FROM: fact_prejoined
+    JOIN: INNER JOIN item ON ss_item_sk = i_item_sk
+    OUTPUT: i_item_id, s_state, ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price
+    EXPECTED_ROWS: 53K
+    CONSUMERS: aggregate_rollup
+  aggregate_rollup:
+    FROM: item_join
+    GROUP BY: ROLLUP (i_item_id, s_state)
+    AGGREGATE: AVG(ss_quantity) agg1, AVG(ss_list_price) agg2, AVG(ss_coupon_amt) agg3, AVG(ss_sales_price) agg4
+    OUTPUT: i_item_id, s_state, GROUPING(s_state) g_state, agg1, agg2, agg3, agg4
+    EXPECTED_ROWS: 74K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: aggregate_rollup
+    ORDER BY: i_item_id, s_state
+    LIMIT: 100
+    OUTPUT: i_item_id, s_state, g_state, agg1, agg2, agg3, agg4
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: prefetch_fact_join, date_cte_isolate, early_filter
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join (Q63): Use the CTE chain: filter date_dim first, pre-join with store_sales, then join other dimensions. Ignore the subsequent fact table joins.
+- date_cte_isolate (Q6/Q11): Extract date filter into a CTE to reduce hash probe size. Apply similarly to customer_demographics and store.
+- early_filter (Q11/Q93): Filter small dimension tables first, then join to fact table. Apply to all three filtered dimensions.
+HAZARD_FLAGS:
+- This strategy is similar to Worker 1 but with a different CTE ordering (date and customer_demographics before store). The optimizer may already choose this order; materializing CTEs may not improve performance.
+- Ensure fact_prejoined includes s_state from store_cte for grouping.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: aggregate_pushdown_below_item
+TARGET_LOGICAL_TREE:
+  date_cte -> store_cte -> customer_demographics_cte -> fact_filtered -> pre_aggregate -> item_join -> final_aggregate_rollup -> order_limit
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: d_year = 1999
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 365
+    CONSUMERS: fact_filtered
+  store_cte:
+    FROM: store
+    WHERE: s_state IN ('MO','AL','MI','TN','LA','SC')
+    OUTPUT: s_store_sk, s_state
+    EXPECTED_ROWS: 66
+    CONSUMERS: fact_filtered
+  customer_demographics_cte:
+    FROM: customer_demographics
+    WHERE: cd_gender = 'F' AND cd_marital_status = 'D' AND cd_education_status = 'Secondary'
+    OUTPUT: cd_demo_sk
+    EXPECTED_ROWS: 27K
+    CONSUMERS: fact_filtered
+  fact_filtered:
+    FROM: store_sales
+    JOIN: INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk
+          INNER JOIN store_cte ON ss_store_sk = s_store_sk
+          INNER JOIN customer_demographics_cte ON ss_cdemo_sk = cd_demo_sk
+    OUTPUT: ss_item_sk, s_state, ss_quantity, ss_list_price, ss_coupon_amt, ss_sales_price
+    EXPECTED_ROWS: ~53K
+    CONSUMERS: pre_aggregate
+  pre_aggregate:
+    FROM: fact_filtered
+    GROUP BY: ss_item_sk, s_state
+    AGGREGATE: SUM(ss_quantity) sum_qty, COUNT(ss_quantity) cnt_qty, SUM(ss_list_price) sum_price, COUNT(ss_list_price) cnt_price, SUM(ss_coupon_amt) sum_coupon, COUNT(ss_coupon_amt) cnt_coupon, SUM(ss_sales_price) sum_sales, COUNT(ss_sales_price) cnt_sales
+    OUTPUT: ss_item_sk, s_state, sum_qty, cnt_qty, sum_price, cnt_price, sum_coupon, cnt_coupon, sum_sales, cnt_sales
+    EXPECTED_ROWS: less than 53K (grouped by ss_item_sk, s_state)
+    CONSUMERS: item_join
+  item_join:
+    FROM: pre_aggregate
+    JOIN: INNER JOIN item ON ss_item_sk = i_item_sk
+    OUTPUT: i_item_id, s_state, sum_qty, cnt_qty, sum_price, cnt_price, sum_coupon, cnt_coupon, sum_sales, cnt_sales
+    EXPECTED_ROWS: same as pre_aggregate
+    CONSUMERS: final_aggregate_rollup
+  final_aggregate_rollup:
+    FROM: item_join
+    GROUP BY: ROLLUP (i_item_id, s_state)
+    AGGREGATE: AVG(ss_quantity) agg1 as sum_qty/cnt_qty, similarly for others
+    OUTPUT: i_item_id, s_state, GROUPING(s_state) g_state, agg1, agg2, agg3, agg4
+    EXPECTED_ROWS: 74K
+    CONSUMERS: order_limit
+  order_limit:
+    FROM: final_aggregate_rollup
+    ORDER BY: i_item_id, s_state
+    LIMIT: 100
+    OUTPUT: i_item_id, s_state, g_state, agg1, agg2, agg3, agg4
+    EXPECTED_ROWS: 100
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation (Q9): Use partial aggregation (SUM/COUNT) before joining with a dimension, then compute final AVG. Ignore the multiple subquery consolidation.
+- channel_bitmap_aggregation (Q88): Consolidate multiple scans into one; here we aggregate before a dimension join to reduce rows. Ignore the CASE WHEN labeling.
+HAZARD_FLAGS:
+- Pre-aggregation must preserve all rows needed for final ROLLUP. Grouping by ss_item_sk, s_state is correct because i_item_id is determined by ss_item_sk (functional dependency). However, ROLLUP also includes subtotals where s_state is NULL; pre-aggregation at (ss_item_sk, s_state) level still allows rolling up to (i_item_id) and overall.
+- AVG must be computed as SUM/COUNT; ensure COUNT counts non-null values? AVG ignores NULLs; if ss_quantity can be NULL, need COUNT(ss_quantity) not COUNT(*). Use COUNT(column) as above.
+- The pre_aggregate CTE may not reduce rows significantly if each (ss_item_sk, s_state) combination is unique.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy (combines star_join_prefetch with aggregate_pushdown)

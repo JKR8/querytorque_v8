@@ -1,0 +1,71 @@
+**Part 1: Modified Logic Tree**
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~100 — Break monolithic join into staged CTEs for predicate pushdown
+    ├── WITH clause  [+]
+    │   ├── filtered_date  [+] — Scan date_dim with d_moy=12, d_year=2000
+    │   ├── filtered_item  [+] — Scan item with i_manager_id=100
+    │   ├── semi_joined_sales  [+] — Filter store_sales via IN subqueries to date/item
+    │   └── aggregated  [+] — Join semi_joined_sales with filtered_item and aggregate
+    └── final_top_n  [+] — ORDER BY ext_price DESC, i_brand_id ASC LIMIT 100
+```
+
+**Part 2: Component Payload JSON**
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Separate dimension table scans into CTEs to push filters before fact table access", "applied_to": ["filtered_date", "filtered_item"]},
+    {"id": "R2", "type": "semi_join_via_in", "description": "Convert monolithic JOIN to fact table filtered by IN subqueries against filtered dimensions", "applied_to": ["semi_joined_sales"]},
+    {"id": "R3", "type": "staged_aggregation", "description": "Push aggregation into CTE after fact-table filtering but before final ordering", "applied_to": ["aggregated"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_moy = 12 AND d_year = 2000",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_brand_id, i_brand FROM item WHERE i_manager_id = 100",
+        "interfaces": {"outputs": ["i_item_sk", "i_brand_id", "i_brand"], "consumes": []}
+      },
+      "semi_joined_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_item_sk, ss_sold_date_sk, ss_ext_sales_price FROM store_sales WHERE ss_sold_date_sk IN (SELECT d_date_sk FROM filtered_date) AND ss_item_sk IN (SELECT i_item_sk FROM filtered_item)",
+        "interfaces": {"outputs": ["ss_item_sk", "ss_sold_date_sk", "ss_ext_sales_price"], "consumes": ["filtered_date", "filtered_item"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT filtered_item.i_brand_id, filtered_item.i_brand, SUM(semi_joined_sales.ss_ext_sales_price) AS ext_price FROM semi_joined_sales INNER JOIN filtered_item ON semi_joined_sales.ss_item_sk = filtered_item.i_item_sk GROUP BY filtered_item.i_brand_id, filtered_item.i_brand",
+        "interfaces": {"outputs": ["i_brand_id", "i_brand", "ext_price"], "consumes": ["semi_joined_sales", "filtered_item"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_brand_id AS brand_id, i_brand AS brand, ext_price FROM aggregated ORDER BY ext_price DESC, i_brand_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["brand_id", "brand", "ext_price"], "consumes": ["aggregated"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "filtered_item", "semi_joined_sales", "aggregated", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), filtered_item AS ({filtered_item}), semi_joined_sales AS ({semi_joined_sales}), aggregated AS ({aggregated}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured original monolithic join into staged CTEs: first filter dimension tables (`date_dim` and `item`) independently, then filter the fact table (`store_sales`) using IN subqueries against those filtered dimensions, then join and aggregate in a separate CTE, finally order and limit. This ensures dimension filters are applied before any fact table access, reducing the fact table scan from full table to only rows matching both dimension predicates.
+
+**Expected speedup:** 3-5x due to early reduction of fact table rows via semi-joins, avoiding full table scan followed by late filtering after Cartesian expansion.

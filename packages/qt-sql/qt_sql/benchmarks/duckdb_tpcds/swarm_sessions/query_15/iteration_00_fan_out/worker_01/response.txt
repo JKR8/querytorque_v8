@@ -1,0 +1,109 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K — CTE-based OR-to-UNION decomposition.
+    ├── [CTE] union_branch_zip  [+]  — Branch 1: ZIP filter
+    │   ├── SCAN (catalog_sales, customer, customer_address, date_dim)
+    │   ├── JOIN (cs_bill_customer_sk = c_customer_sk)
+    │   ├── JOIN (c_current_addr_sk = ca_address_sk)
+    │   ├── JOIN (cs_sold_date_sk = d_date_sk)
+    │   ├── FILTER (substr(ca_zip,1,5) IN zip_list)
+    │   └── FILTER (d_qoy=1 AND d_year=2001)
+    ├── [CTE] union_branch_state  [+]  — Branch 2: state filter
+    │   ├── SCAN (catalog_sales, customer, customer_address, date_dim)
+    │   ├── JOIN (cs_bill_customer_sk = c_customer_sk)
+    │   ├── JOIN (c_current_addr_sk = ca_address_sk)
+    │   ├── JOIN (cs_sold_date_sk = d_date_sk)
+    │   ├── FILTER (ca_state IN state_list)
+    │   └── FILTER (d_qoy=1 AND d_year=2001)
+    ├── [CTE] union_branch_price  [+]  — Branch 3: price filter
+    │   ├── SCAN (catalog_sales, customer, customer_address, date_dim)
+    │   ├── JOIN (cs_bill_customer_sk = c_customer_sk)
+    │   ├── JOIN (c_current_addr_sk = ca_address_sk)
+    │   ├── JOIN (cs_sold_date_sk = d_date_sk)
+    │   ├── FILTER (cs_sales_price > 500)
+    │   └── FILTER (d_qoy=1 AND d_year=2001)
+    ├── [CTE] union_all  [+]  — UNION (duplicate removal)
+    │   ├── INPUT (union_branch_zip)
+    │   ├── INPUT (union_branch_state)
+    │   └── INPUT (union_branch_price)
+    ├── [CTE] aggregate  [+]  — Group by ZIP and sum
+    │   ├── INPUT (union_all)
+    │   └── AGG (GROUP BY ca_zip, SUM(cs_sales_price))
+    ├── [CTE] top_n  [+]  — Final ordering and limit
+    │   ├── INPUT (aggregate)
+    │   ├── SORT (ca_zip ASC)
+    │   └── LIMIT 100
+    └── OUTPUT (ca_zip, sum_cs_sales_price)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "or_to_union", "description": "Split cross‑column OR into three independent branches, each with focused predicate", "applied_to": ["union_branch_zip", "union_branch_state", "union_branch_price"]},
+    {"id": "R2", "type": "union_deduplicate", "description": "Use UNION (not UNION ALL) to remove duplicate rows across branches, preserving original OR semantics", "applied_to": ["union_all"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "union_branch_zip": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk JOIN date_dim ON cs_sold_date_sk = d_date_sk WHERE substr(ca_zip,1,5) IN ('85669','86197','88274','83405','86475','85392','85460','80348','81792') AND d_qoy = 1 AND d_year = 2001",
+        "interfaces": {"outputs": ["cs_sales_price", "ca_zip"], "consumes": []}
+      },
+      "union_branch_state": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk JOIN date_dim ON cs_sold_date_sk = d_date_sk WHERE ca_state IN ('CA','WA','GA') AND d_qoy = 1 AND d_year = 2001",
+        "interfaces": {"outputs": ["cs_sales_price", "ca_zip"], "consumes": []}
+      },
+      "union_branch_price": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_sales_price, ca_zip FROM catalog_sales JOIN customer ON cs_bill_customer_sk = c_customer_sk JOIN customer_address ON c_current_addr_sk = ca_address_sk JOIN date_dim ON cs_sold_date_sk = d_date_sk WHERE cs_sales_price > 500 AND d_qoy = 1 AND d_year = 2001",
+        "interfaces": {"outputs": ["cs_sales_price", "ca_zip"], "consumes": []}
+      },
+      "union_all": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT cs_sales_price, ca_zip FROM union_branch_zip UNION SELECT cs_sales_price, ca_zip FROM union_branch_state UNION SELECT cs_sales_price, ca_zip FROM union_branch_price",
+        "interfaces": {"outputs": ["cs_sales_price", "ca_zip"], "consumes": ["union_branch_zip", "union_branch_state", "union_branch_price"]}
+      },
+      "aggregate": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_zip, SUM(cs_sales_price) AS sum_cs_sales_price FROM union_all GROUP BY ca_zip",
+        "interfaces": {"outputs": ["ca_zip", "sum_cs_sales_price"], "consumes": ["union_all"]}
+      },
+      "top_n": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ca_zip, sum_cs_sales_price FROM aggregate ORDER BY ca_zip ASC LIMIT 100",
+        "interfaces": {"outputs": ["ca_zip", "sum_cs_sales_price"], "consumes": ["aggregate"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ca_zip, sum_cs_sales_price FROM top_n",
+        "interfaces": {"outputs": ["ca_zip", "sum_cs_sales_price"], "consumes": ["top_n"]}
+      }
+    },
+    "reconstruction_order": ["union_branch_zip", "union_branch_state", "union_branch_price", "union_all", "aggregate", "top_n", "main_query"],
+    "assembly_template": "WITH union_branch_zip AS ({union_branch_zip}), union_branch_state AS ({union_branch_state}), union_branch_price AS ({union_branch_price}), union_all AS ({union_all}), aggregate AS ({aggregate}), top_n AS ({top_n}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: The original single‑scan OR filter is decomposed into three independent branches (zip, state, price) joined via UNION to remove duplicates, then aggregated and limited. This allows each branch to push its own predicate into the join.
+
+Expected speedup: ~2‑3× due to per‑branch predicate pushdown and elimination of the cross‑column OR barrier.

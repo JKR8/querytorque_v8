@@ -1,0 +1,72 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~2.2M
+    ├── CTE filtered_dates  [+]  (outputs: d_date_sk)
+    ├── CTE fact_with_key_joins  [+]  (outputs: cr_net_loss, cc_call_center_id, cc_name, cc_manager, c_current_cdemo_sk)
+    ├── CTE aggregated_result  [+]  (outputs: cc_call_center_id, cc_name, cc_manager, c_current_cdemo_sk, Returns_Loss)
+    └── final_dimension_lookup  [~]
+        ├── FROM aggregated_result
+        ├── JOIN customer_demographics ON cd_demo_sk = c_current_cdemo_sk
+        ├── ORDER BY Returns_Loss DESC
+        └── OUTPUT (Call_Center, Call_Center_Name, Manager, Returns_Loss, cd_marital_status, cd_education_status)
+```
+
+**Change markers:**
+- `[+]` Added three CTEs: filtered_dates, fact_with_key_joins, aggregated_result
+- `[~]` Modified main_query structure to use CTEs instead of single-table joins
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefetch", "description": "Pre-filter date_dim into CTE to create tiny hash table", "applied_to": ["filtered_dates"]},
+    {"id": "R2", "type": "structured_cte_flow", "description": "Split single monolithic join into logical CTE sequence following target tree", "applied_to": ["fact_with_key_joins", "aggregated_result", "final_dimension_lookup"]},
+    {"id": "R3", "type": "late_dimension_binding", "description": "Defer customer_demographics attribute lookup until after aggregation to reduce join fanout", "applied_to": ["final_dimension_lookup"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1998 AND d_moy = 2",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "fact_with_key_joins": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cr.cr_net_loss, cc.cc_call_center_id, cc.cc_name, cc.cc_manager, c.c_current_cdemo_sk FROM catalog_returns cr INNER JOIN filtered_dates fd ON cr.cr_returned_date_sk = fd.d_date_sk INNER JOIN call_center cc ON cr.cr_call_center_sk = cc.cc_call_center_sk INNER JOIN customer c ON cr.cr_returning_customer_sk = c.c_customer_sk INNER JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk AND ((cd.cd_marital_status = 'M' AND cd.cd_education_status = 'Unknown') OR (cd.cd_marital_status = 'W' AND cd.cd_education_status = 'Advanced Degree')) INNER JOIN household_demographics hd ON hd.hd_demo_sk = c.c_current_hdemo_sk AND hd.hd_buy_potential LIKE '1001-5000%' INNER JOIN customer_address ca ON ca.ca_address_sk = c.c_current_addr_sk AND ca.ca_gmt_offset = -7",
+        "interfaces": {"outputs": ["cr_net_loss", "cc_call_center_id", "cc_name", "cc_manager", "c_current_cdemo_sk"], "consumes": ["filtered_dates"]}
+      },
+      "aggregated_result": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cc_call_center_id, cc_name, cc_manager, c_current_cdemo_sk, SUM(cr_net_loss) AS Returns_Loss FROM fact_with_key_joins GROUP BY cc_call_center_id, cc_name, cc_manager, c_current_cdemo_sk",
+        "interfaces": {"outputs": ["cc_call_center_id", "cc_name", "cc_manager", "c_current_cdemo_sk", "Returns_Loss"], "consumes": ["fact_with_key_joins"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT agg.cc_call_center_id AS Call_Center, agg.cc_name AS Call_Center_Name, agg.cc_manager AS Manager, agg.Returns_Loss, cd.cd_marital_status, cd.cd_education_status FROM aggregated_result agg INNER JOIN customer_demographics cd ON cd.cd_demo_sk = agg.c_current_cdemo_sk ORDER BY agg.Returns_Loss DESC",
+        "interfaces": {"outputs": ["Call_Center", "Call_Center_Name", "Manager", "Returns_Loss", "cd_marital_status", "cd_education_status"], "consumes": ["aggregated_result"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "fact_with_key_joins", "aggregated_result", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), fact_with_key_joins AS ({fact_with_key_joins}), aggregated_result AS ({aggregated_result}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured the single monolithic join into a CTE sequence following the target logical tree, with pre-filtered dates and late binding of customer_demographics attributes. This reduces join fanout during aggregation by grouping on the surrogate key first, then joining for attributes.
+
+**Expected speedup:** 1.8-2.5x (reduced join cardinality before aggregation, better hash join planning with small dimension CTEs)

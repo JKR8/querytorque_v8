@@ -1,0 +1,75 @@
+### Part 1: Modified Logic Tree
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K  — Restructured into CTE pipeline per target logical tree.
+    ├── [CTE] filtered_reason  [+]  — Early filter on reason dimension.
+    ├── [CTE] filtered_returns  [+]  — Join returns with filtered reason to reduce intermediate rows.
+    ├── [CTE] joined_sales  [+]  — Inner join sales with filtered returns (original left join semantics preserved).
+    ├── [CTE] aggregated  [+]  — Group by customer with direct sales calculation.
+    ├── [CTE] top_n  [+]  — Apply ordering and limit.
+    └── OUTPUT (ss_customer_sk, sumsales)
+```
+
+### Part 2: Component Payload JSON
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter", "description": "Filter reason table first to reduce fact table join size.", "applied_to": ["filtered_reason"]},
+    {"id": "R2", "type": "pushdown", "description": "Push reason filter into store_returns join, consolidating scans.", "applied_to": ["filtered_returns"]},
+    {"id": "R3", "type": "cte_isolate", "description": "Isolate each logical step into explicit CTE for predictable materialization.", "applied_to": ["filtered_reason", "filtered_returns", "joined_sales", "aggregated", "top_n"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_reason": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT r_reason_sk, r_reason_desc FROM reason WHERE r_reason_desc = 'duplicate purchase'",
+        "interfaces": {"outputs": ["r_reason_sk", "r_reason_desc"], "consumes": []}
+      },
+      "filtered_returns": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT sr_item_sk, sr_ticket_number, sr_return_quantity FROM store_returns INNER JOIN filtered_reason ON sr_reason_sk = r_reason_sk",
+        "interfaces": {"outputs": ["sr_item_sk", "sr_ticket_number", "sr_return_quantity"], "consumes": ["filtered_reason"]}
+      },
+      "joined_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_customer_sk, ss_quantity, ss_sales_price, sr_return_quantity FROM store_sales INNER JOIN filtered_returns ON ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number",
+        "interfaces": {"outputs": ["ss_customer_sk", "ss_quantity", "ss_sales_price", "sr_return_quantity"], "consumes": ["filtered_returns"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_customer_sk, SUM((ss_quantity - sr_return_quantity) * ss_sales_price) AS sumsales FROM joined_sales GROUP BY ss_customer_sk",
+        "interfaces": {"outputs": ["ss_customer_sk", "sumsales"], "consumes": ["joined_sales"]}
+      },
+      "top_n": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_customer_sk, sumsales FROM aggregated ORDER BY sumsales ASC, ss_customer_sk ASC LIMIT 100",
+        "interfaces": {"outputs": ["ss_customer_sk", "sumsales"], "consumes": ["aggregated"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT ss_customer_sk, sumsales FROM top_n",
+        "interfaces": {"outputs": ["ss_customer_sk", "sumsales"], "consumes": ["top_n"]}
+      }
+    },
+    "reconstruction_order": ["filtered_reason", "filtered_returns", "joined_sales", "aggregated", "top_n", "main_query"],
+    "assembly_template": "WITH filtered_reason AS ({filtered_reason}), filtered_returns AS ({filtered_returns}), joined_sales AS ({joined_sales}), aggregated AS ({aggregated}), top_n AS ({top_n}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Restructured the original flat query into a CTE pipeline that filters the reason dimension first, then joins with returns, then with sales, aggregates, and finally limits. This follows the target logical tree exactly, applying early filtering to reduce intermediate rows.
+
+**Expected speedup:** 2-4x due to early reduction of fact table rows via dimension filter pushdown and elimination of redundant scans.

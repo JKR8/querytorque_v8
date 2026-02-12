@@ -1,0 +1,97 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Cost: 100%  Rows: ~1K
+    ├── item_cte  [+]  (MATERIALIZED CTE: filtered items)
+    │   └── SCAN (item) WITH FILTER ((i_manufact_id BETWEEN 566 AND 765 OR i_category IN ('Children', 'Jewelry', 'Men')))
+    ├── date_cte  [+]  (MATERIALIZED CTE: filtered dates)
+    │   └── SCAN (date_dim) WITH FILTER (d_date BETWEEN '2002-03-06' AND CAST('2002-03-06' AS DATE) + INTERVAL '90 day')
+    ├── ws_cte  [+]  (MATERIALIZED CTE: web_sales filtered by date and wholesale_cost)
+    │   └── JOIN (web_sales INNER JOIN date_cte ON d_date_sk = ws_sold_date_sk) WITH FILTER (ws_wholesale_cost BETWEEN 16 AND 36)
+    ├── subq_fact_cte  [+]  (MATERIALIZED CTE: ws_cte rows with price ratio filter)
+    │   └── FILTER (ws_sales_price/ws_list_price BETWEEN 35*0.01 AND 50*0.01) ON ws_cte
+    ├── avg_cte  [+]  (MATERIALIZED CTE: average threshold per item)
+    │   └── AGGREGATE (GROUP BY ws_item_sk) WITH 1.3 * AVG(ws_ext_discount_amt)
+    ├── explicit_joins  [+]  (final join of item_cte, ws_cte, avg_cte)
+    │   ├── JOIN (item_cte INNER JOIN ws_cte ON i_item_sk = ws_item_sk)
+    │   ├── JOIN (INNER JOIN avg_cte ON ws_cte.ws_item_sk = avg_cte.ws_item_sk)
+    │   └── FILTER (ws_ext_discount_amt > threshold)
+    └── aggregation  [~]  (SUM and ORDER BY)
+        ├── AGGREGATE (SUM(ws_ext_discount_amt))
+        ├── SORT (SUM(ws_ext_discount_amt) ASC)
+        └── LIMIT 100
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL 16",
+  "rewrite_rules": [
+    {"id": "R1", "type": "multi_dimension_prefetch", "description": "Materialize filtered dimension tables (item, date_dim) and fact table (web_sales) into separate CTEs before final join.", "applied_to": ["item_cte", "date_cte", "ws_cte"]},
+    {"id": "R2", "type": "explicit_join_syntax", "description": "Replace comma joins with explicit INNER JOIN syntax.", "applied_to": ["ws_cte", "explicit_joins"]},
+    {"id": "R3", "type": "subquery_decorrelation", "description": "Convert correlated subquery to CTE (avg_cte) with per-item grouping, then join.", "applied_to": ["subq_fact_cte", "avg_cte"]},
+    {"id": "R4", "type": "materialized_ctes", "description": "Add MATERIALIZED to prevent CTE inlining and ensure decorrelation.", "applied_to": ["item_cte", "date_cte", "ws_cte", "subq_fact_cte", "avg_cte"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "item_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT i_item_sk, i_manufact_id, i_category FROM item WHERE (i_manufact_id BETWEEN 566 AND 765 OR i_category IN ('Children', 'Jewelry', 'Men'))",
+        "interfaces": {"outputs": ["i_item_sk", "i_manufact_id", "i_category"], "consumes": []}
+      },
+      "date_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN '2002-03-06' AND CAST('2002-03-06' AS DATE) + INTERVAL '90 day'",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "ws_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_item_sk, ws_sold_date_sk, ws_ext_discount_amt, ws_wholesale_cost, ws_sales_price, ws_list_price FROM web_sales INNER JOIN date_cte ON date_cte.d_date_sk = web_sales.ws_sold_date_sk WHERE web_sales.ws_wholesale_cost BETWEEN 16 AND 36",
+        "interfaces": {"outputs": ["ws_item_sk", "ws_sold_date_sk", "ws_ext_discount_amt", "ws_wholesale_cost", "ws_sales_price", "ws_list_price"], "consumes": ["date_cte"]}
+      },
+      "subq_fact_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_item_sk, ws_ext_discount_amt FROM ws_cte WHERE ws_sales_price / ws_list_price BETWEEN 35 * 0.01 AND 50 * 0.01",
+        "interfaces": {"outputs": ["ws_item_sk", "ws_ext_discount_amt"], "consumes": ["ws_cte"]}
+      },
+      "avg_cte": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_item_sk, 1.3 * AVG(ws_ext_discount_amt) AS threshold FROM subq_fact_cte GROUP BY ws_item_sk",
+        "interfaces": {"outputs": ["ws_item_sk", "threshold"], "consumes": ["subq_fact_cte"]}
+      },
+      "explicit_joins": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_cte.ws_ext_discount_amt FROM item_cte INNER JOIN ws_cte ON item_cte.i_item_sk = ws_cte.ws_item_sk INNER JOIN avg_cte ON ws_cte.ws_item_sk = avg_cte.ws_item_sk WHERE ws_cte.ws_ext_discount_amt > avg_cte.threshold",
+        "interfaces": {"outputs": ["ws_ext_discount_amt"], "consumes": ["item_cte", "ws_cte", "avg_cte"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT SUM(ws_ext_discount_amt) AS \"Excess Discount Amount\" FROM explicit_joins GROUP BY () ORDER BY SUM(ws_ext_discount_amt) ASC LIMIT 100",
+        "interfaces": {"outputs": ["Excess Discount Amount"], "consumes": ["explicit_joins"]}
+      }
+    },
+    "reconstruction_order": ["item_cte", "date_cte", "ws_cte", "subq_fact_cte", "avg_cte", "explicit_joins", "main_query"],
+    "assembly_template": "WITH item_cte AS MATERIALIZED ({item_cte}), date_cte AS MATERIALIZED ({date_cte}), ws_cte AS MATERIALIZED ({ws_cte}), subq_fact_cte AS MATERIALIZED ({subq_fact_cte}), avg_cte AS MATERIALIZED ({avg_cte}), explicit_joins AS MATERIALIZED ({explicit_joins}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+### Changes: Converted implicit comma joins and correlated subquery to explicit MATERIALIZED CTEs with staged reduction (dimension prefetch), decorrelating the subquery by computing per-item thresholds in a separate CTE, then joining. This eliminates correlated execution and allows better hash join planning with small filtered dimension tables.
+
+Expected speedup: 2-3x (based on reference examples with similar transformations).

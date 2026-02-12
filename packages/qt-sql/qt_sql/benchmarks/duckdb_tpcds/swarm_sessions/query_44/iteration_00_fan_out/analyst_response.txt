@@ -1,0 +1,282 @@
+<reasoning>
+1. CLASSIFY:
+This is a "correlated-aggregate filter" archetype with a self-comparison pattern. The query:
+- Filters store_sales by store_sk=146
+- Groups by item_sk and computes average net profit per item
+- Compares each item's average to 0.9 * a store-level baseline (computed from same store with ss_addr_sk is null)
+- Ranks items by average profit in ascending order (best performing) and descending order (worst performing)
+- Takes top 10 from each ranking
+- Pairs them by rank position and joins with item table for names
+
+2. EXPLAIN PLAN ANALYSIS:
+The EXPLAIN shows 0ms execution time, which suggests either:
+a) The data is empty or filtered to zero rows
+b) DuckDB optimized everything away (unlikely for complex query)
+c) The EXPLAIN is from a metadata-only execution
+
+From the structure:
+- Two symmetric branches (ascending and descending) each with identical subplans
+- Each branch scans store_sales twice: once for item averages, once for scalar subquery baseline
+- HASH_GROUP_BY operations show aggregation happening
+- NESTED_LOOP_JOIN for the HAVING condition indicates correlated execution of scalar subquery per group
+- SEQ_SCAN on item table twice (once per branch)
+
+Row counts: All show 0 rows, but logical-tree says ~1K rows. This suggests the EXPLAIN may be from an empty dataset.
+
+Key observations:
+- Store_sales is scanned 4 times total: 2x per branch (item aggregation + scalar subquery)
+- The scalar subquery (store baseline) is computed twice (once per branch) and likely re-executed per group via nested loop
+- Item table scanned twice (could be reduced to once)
+- No CTE materialization visible - optimizer likely inlined everything
+
+3. GAP MATCHING:
+- CORRELATED_SUBQUERY_PARALYSIS: YES. The HAVING clause has a correlated scalar subquery (0.9*subquery) that executes per group.
+- REDUNDANT_SCAN_ELIMINATION: YES. Store_sales scanned 4 times, item table 2 times.
+- CROSS_CTE_PREDICATE_BLINDNESS: PARTIAL. The store filter (ss_store_sk=146) appears in multiple places but could be centralized.
+- Engine already does INTRA_SCAN_PREDICATE_PUSHDOWN (store filter pushed into scans).
+
+4. AGGREGATION TRAP CHECK:
+- Only AVG() used, which is grouping-sensitive to duplicates but not to FILTER semantics
+- HAVING clause uses same aggregate computation as SELECT, no FILTER clauses
+- If we consolidate scans, we must ensure each item's average is computed from same rows
+
+5. TRANSFORM SELECTION (ranked by potential):
+1. decorrelate + single_pass_aggregation: Precompute store baseline once, compute item averages once, derive both rankings from single result set.
+2. channel_bitmap_aggregation style: Consolidate the 4 store_sales scans into 1 scan that computes both item averages and store baseline.
+3. dimension_cte_isolate: Pre-filter item table into CTE, join once with aggregated results.
+4. Exploration: Combine decorrelation with window optimization to compute both rankings in single pass.
+
+6. LOGICAL TREE DESIGN:
+Need to ensure column completeness:
+- Store baseline: scalar value
+- Item aggregates: item_sk, avg_profit
+- Rankings: item_sk, asc_rnk, desc_rnk
+- Final: rnk, best_item_sk, worst_item_sk, i1.i_product_name, i2.i_product_name
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+For store 146, pair items at matching rank positions from top-10 (ascending average profit) and bottom-10 (descending average profit) lists, where each item's average profit exceeds 90% of the store's baseline (transactions with null address). JOIN semantics: INNER joins require all sides to match (item must exist in item table, rank positions must exist in both lists). Aggregation trap: AVG(ss_net_profit) must be computed per item from the exact same rows as original (store=146 filter). Filter dependency: The store baseline subquery depends on ss_addr_sk IS NULL condition which must remain applied to the same store filter.
+
+BOTTLENECK_DIAGNOSIS:
+The query is aggregation-bound with correlated subquery overhead. Store_sales is scanned 4 times total (2 per ranking branch), each with the same store filter. The scalar subquery computing store baseline (avg profit where ss_addr_sk is null) executes per item group via nested loop join in HAVING clause. Item table scanned twice unnecessarily. The optimizer already pushes the store filter into scans but cannot eliminate redundant scans or decorrelate the scalar subquery. Cardinality flow: store_sales filtered by store → grouped by item (~1K groups) → filtered by HAVING → ranked → top 10 → joined with item.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output rnk, best_performing, worst_performing exactly as aliased
+- CTE_COLUMN_COMPLETENESS: Any CTE must include item_sk, avg_profit, rank values needed by downstream
+- LITERAL_PRESERVATION: Must preserve ss_store_sk=146, 0.9 multiplier, ss_addr_sk IS NULL, rank < 11
+- SEMANTIC_EQUIVALENCE: Must produce identical rows with same ordering
+- CORRELATED_SUBQUERY_PARALYSIS: Scalar subquery in HAVING executes per group via nested loop (EXPLAIN shows NESTED_LOOP_JOIN)
+- REDUNDANT_SCAN_ELIMINATION: Store_sales scanned 4 times, item table 2 times (EXPLAIN shows duplicate SEQ_SCAN patterns)
+
+REGRESSION_WARNINGS:
+1. materialize_cte (0.14x on Q16):
+   CAUSE: Converted EXISTS to materialized CTE, forcing full scan instead of semi-join short-circuit
+   RULE: Do not convert HAVING subquery to materialized CTE if it would force full evaluation per group
+2. date_cte_isolate (0.50x on Q25):
+   CAUSE: Materialized fact table join early, preventing optimizer from reordering multi-way joins
+   RULE: Avoid materializing intermediate fact table results if query has complex join reordering needs
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: decorrelate_single_pass
+TARGET_LOGICAL_TREE:
+  store_baseline_cte -> item_aggregates_cte -> ranked_items_cte -> final_join
+NODE_CONTRACTS:
+  store_baseline:
+    FROM: store_sales
+    WHERE: ss_store_sk = 146 AND ss_addr_sk IS NULL
+    GROUP BY: ss_store_sk
+    AGGREGATE: AVG(ss_net_profit) AS store_avg
+    OUTPUT: store_avg
+    EXPECTED_ROWS: 1
+    CONSUMERS: item_aggregates_cte
+  item_aggregates:
+    FROM: store_sales
+    WHERE: ss_store_sk = 146
+    GROUP BY: ss_item_sk
+    AGGREGATE: AVG(ss_net_profit) AS item_avg
+    OUTPUT: ss_item_sk AS item_sk, item_avg
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: ranked_items_cte
+  ranked_items:
+    FROM: item_aggregates CROSS JOIN store_baseline
+    WHERE: item_avg > 0.9 * store_avg
+    WINDOW: RANK() OVER (ORDER BY item_avg ASC) AS asc_rnk,
+            RANK() OVER (ORDER BY item_avg DESC) AS desc_rnk
+    OUTPUT: item_sk, asc_rnk, desc_rnk
+    EXPECTED_ROWS: ~1K (filtered)
+    CONSUMERS: final_join
+  final_join:
+    FROM: ranked_items AS asc JOIN ranked_items AS desc ON asc.asc_rnk = desc.desc_rnk
+         JOIN item i1 ON asc.item_sk = i1.i_item_sk
+         JOIN item i2 ON desc.item_sk = i2.i_item_sk
+    WHERE: asc.asc_rnk < 11 AND desc.desc_rnk < 11
+    ORDER BY: asc.asc_rnk
+    OUTPUT: asc.asc_rnk AS rnk, i1.i_product_name AS best_performing, i2.i_product_name AS worst_performing
+    EXPECTED_ROWS: ≤10
+    CONSUMERS: output
+EXAMPLES: decorrelate, single_pass_aggregation, early_filter
+EXAMPLE_ADAPTATION:
+- decorrelate: Apply decorrelation of scalar subquery to CTE + CROSS JOIN
+- single_pass_aggregation: Compute item aggregates once, reuse for both rankings
+- early_filter: Push store filter early into both CTEs
+HAZARD_FLAGS:
+- Self-join on ranked_items may duplicate computation if optimizer doesn't recognize symmetry
+- Must ensure rank filtering (<11) applied after window computation
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: consolidated_scan_pivot
+TARGET_LOGICAL_TREE:
+  consolidated_scan_cte -> filtered_items -> ranked_ctes -> final_join
+NODE_CONTRACTS:
+  consolidated_scan:
+    FROM: store_sales
+    WHERE: ss_store_sk = 146
+    GROUP BY: ss_item_sk
+    AGGREGATE: AVG(ss_net_profit) AS item_avg,
+              AVG(CASE WHEN ss_addr_sk IS NULL THEN ss_net_profit END) AS store_avg_nulls
+    OUTPUT: ss_item_sk AS item_sk, item_avg, store_avg_nulls
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: filtered_items
+  filtered_items:
+    FROM: consolidated_scan
+    WHERE: item_avg > 0.9 * (SELECT AVG(store_avg_nulls) FROM consolidated_scan WHERE store_avg_nulls IS NOT NULL)
+    OUTPUT: item_sk, item_avg
+    EXPECTED_ROWS: ~1K (filtered)
+    CONSUMERS: asc_ranks, desc_ranks
+  asc_ranks:
+    FROM: filtered_items
+    WINDOW: RANK() OVER (ORDER BY item_avg ASC) AS rnk
+    OUTPUT: item_sk, rnk
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: final_join
+  desc_ranks:
+    FROM: filtered_items  
+    WINDOW: RANK() OVER (ORDER BY item_avg DESC) AS rnk
+    OUTPUT: item_sk, rnk
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: final_join
+  final_join:
+    FROM: asc_ranks JOIN desc_ranks ON asc_ranks.rnk = desc_ranks.rnk
+         JOIN item i1 ON asc_ranks.item_sk = i1.i_item_sk
+         JOIN item i2 ON desc_ranks.item_sk = i2.i_item_sk
+    WHERE: asc_ranks.rnk < 11 AND desc_ranks.rnk < 11
+    ORDER BY: asc_ranks.rnk
+    OUTPUT: asc_ranks.rnk AS rnk, i1.i_product_name AS best_performing, i2.i_product_name AS worst_performing
+    EXPECTED_ROWS: ≤10
+    CONSUMERS: output
+EXAMPLES: channel_bitmap_aggregation, single_pass_aggregation, pushdown
+EXAMPLE_ADAPTATION:
+- channel_bitmap_aggregation: Consolidate multiple scans into one with conditional aggregation for null-addr average
+- single_pass_aggregation: Compute item averages and store baseline in single scan
+- pushdown: Push store filter into consolidated scan CTE
+HAZARD_FLAGS:
+- Conditional AVG with CASE may compute average differently if null rows are sparse
+- Store baseline computed from same scan as item aggregates (must ensure mathematical equivalence)
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: dimension_prefetch_shared
+TARGET_LOGICAL_TREE:
+  store_baseline_cte -> item_aggregates_cte -> item_cte -> asc_ranked -> desc_ranked -> final_join
+NODE_CONTRACTS:
+  store_baseline:
+    FROM: store_sales
+    WHERE: ss_store_sk = 146 AND ss_addr_sk IS NULL
+    GROUP BY: ss_store_sk
+    AGGREGATE: AVG(ss_net_profit) AS store_avg
+    OUTPUT: store_avg
+    EXPECTED_ROWS: 1
+    CONSUMERS: item_aggregates_cte
+  item_aggregates:
+    FROM: store_sales
+    WHERE: ss_store_sk = 146
+    GROUP BY: ss_item_sk
+    AGGREGATE: AVG(ss_net_profit) AS item_avg
+    OUTPUT: ss_item_sk AS item_sk, item_avg
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: asc_ranked, desc_ranked
+  item_cte:
+    FROM: item
+    WHERE: i_item_sk IN (SELECT item_sk FROM item_aggregates)
+    OUTPUT: i_item_sk, i_product_name
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: final_join
+  asc_ranked:
+    FROM: item_aggregates CROSS JOIN store_baseline
+    WHERE: item_avg > 0.9 * store_avg
+    WINDOW: RANK() OVER (ORDER BY item_avg ASC) AS rnk
+    OUTPUT: item_sk, rnk
+    EXPECTED_ROWS: ~1K (filtered)
+    CONSUMERS: final_join
+  desc_ranked:
+    FROM: item_aggregates CROSS JOIN store_baseline
+    WHERE: item_avg > 0.9 * store_avg
+    WINDOW: RANK() OVER (ORDER BY item_avg DESC) AS rnk
+    OUTPUT: item_sk, rnk
+    EXPECTED_ROWS: ~1K (filtered)
+    CONSUMERS: final_join
+  final_join:
+    FROM: asc_ranked JOIN desc_ranked ON asc_ranked.rnk = desc_ranked.rnk
+         JOIN item_cte i1 ON asc_ranked.item_sk = i1.i_item_sk
+         JOIN item_cte i2 ON desc_ranked.item_sk = i2.i_item_sk
+    WHERE: asc_ranked.rnk < 11 AND desc_ranked.rnk < 11
+    ORDER BY: asc_ranked.rnk
+    OUTPUT: asc_ranked.rnk AS rnk, i1.i_product_name AS best_performing, i2.i_product_name AS worst_performing
+    EXPECTED_ROWS: ≤10
+    CONSUMERS: output
+EXAMPLES: dimension_cte_isolate, prefetch_fact_join, early_filter
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Pre-filter item table into CTE to avoid double scan
+- prefetch_fact_join: Chain CTEs to progressively reduce data (store baseline → item aggregates → item lookup)
+- early_filter: Apply store filter early in fact table CTEs
+HAZARD_FLAGS:
+- IN subquery in item_cte may be inefficient if not optimized to semi-join
+- Cross join with store_baseline in both ranking CTEs duplicates the scalar value
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: window_consolidation_self_join_elimination
+TARGET_LOGICAL_TREE:
+  combined_cte -> ranked_pairs -> final_join
+NODE_CONTRACTS:
+  combined_cte:
+    FROM: store_sales
+    WHERE: ss_store_sk = 146
+    GROUP BY: ss_item_sk
+    AGGREGATE: AVG(ss_net_profit) AS item_avg,
+              (SELECT AVG(ss_net_profit) FROM store_sales WHERE ss_store_sk = 146 AND ss_addr_sk IS NULL GROUP BY ss_store_sk) AS store_avg
+    OUTPUT: ss_item_sk AS item_sk, item_avg, store_avg
+    EXPECTED_ROWS: ~1K
+    CONSUMERS: ranked_pairs
+  ranked_pairs:
+    FROM: combined_cte
+    WHERE: item_avg > 0.9 * store_avg
+    WINDOW: RANK() OVER (ORDER BY item_avg ASC) AS asc_rnk,
+            RANK() OVER (ORDER BY item_avg DESC) AS desc_rnk
+    OUTPUT: item_sk, asc_rnk, desc_rnk
+    EXPECTED_ROWS: ~1K (filtered)
+    CONSUMERS: final_join
+  final_join:
+    FROM: (SELECT item_sk, asc_rnk AS rnk FROM ranked_pairs WHERE asc_rnk < 11) AS asc
+          JOIN (SELECT item_sk, desc_rnk AS rnk FROM ranked_pairs WHERE desc_rnk < 11) AS desc ON asc.rnk = desc.rnk
+          JOIN item i1 ON asc.item_sk = i1.i_item_sk
+          JOIN item i2 ON desc.item_sk = i2.i_item_sk
+    ORDER BY: asc.rnk
+    OUTPUT: asc.rnk AS rnk, i1.i_product_name AS best_performing, i2.i_product_name AS worst_performing
+    EXPECTED_ROWS: ≤10
+    CONSUMERS: output
+EXAMPLES: deferred_window_aggregation, self_join_to_window, union_cte_split
+EXAMPLE_ADAPTATION:
+- deferred_window_aggregation: Compute both rankings in single window pass, filter after
+- self_join_to_window: Replace self-join of two ranking CTEs with single CTE containing both ranks
+- union_cte_split: NOT APPLICABLE - ignore the split aspect, focus on single source for both rankings
+HAZARD_FLAGS:
+- Scalar subquery inside aggregate may still execute per group if not optimized
+- Filtering (rnk < 11) must be applied after window computation
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination

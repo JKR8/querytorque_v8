@@ -1,0 +1,157 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [!] filtered_date
+│   └── SCAN (date_dim) [=] + FILTER (d_year=2002, d_moy 10-12)
+├── [!] store_sales_filtered
+│   └── JOIN (store_sales ⋈ filtered_date) + FILTER (ss_list_price 80-169)
+├── [!] web_sales_filtered
+│   └── JOIN (web_sales ⋈ filtered_date) + FILTER (ws_list_price 80-169)
+├── [!] catalog_sales_filtered
+│   └── JOIN (catalog_sales ⋈ filtered_date) + FILTER (cs_list_price 80-169)
+├── [!] all_sales_union
+│   └── UNION ALL (store_sales_filtered, web_sales_filtered, catalog_sales_filtered)
+├── [!] customer_channel_flags
+│   └── AGG (GROUP BY customer_sk) + FLAG_LOGIC (MAX(CASE channel...))
+├── [!] customer_base
+│   └── JOIN (customer ⋈ customer_address ⋈ customer_demographics) [=] + FILTERS (state, marital, education) [=]
+├── [!] filter_flags
+│   └── JOIN (customer_base ⋈ customer_channel_flags) + FILTER (has_store=1, has_web=0, has_catalog=0)
+├── [=] group_by
+│   └── AGG (GROUP BY demo columns) + COUNT(*) [=]
+├── [=] sort
+│   └── ORDER BY (5 columns) [=]
+└── [=] limit
+    └── LIMIT 100 [=]
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "shared_materialization",
+      "description": "Materialize date filter once and reuse across all three channel scans",
+      "applied_to": ["filtered_date", "store_sales_filtered", "web_sales_filtered", "catalog_sales_filtered"]
+    },
+    {
+      "id": "R2",
+      "type": "union_consolidation",
+      "description": "Consolidate three channel scans via UNION ALL, then aggregate per customer to compute channel flags",
+      "applied_to": ["all_sales_union", "customer_channel_flags"]
+    },
+    {
+      "id": "R3",
+      "type": "decorrelation",
+      "description": "Replace EXISTS/NOT EXISTS with explicit flag-based filtering via precomputed channel flags",
+      "applied_to": ["filter_flags"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "filtered_date": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2002 AND d_moy BETWEEN 10 AND 12",
+          "interfaces": {
+            "outputs": ["d_date_sk"],
+            "consumes": []
+          }
+        },
+        "store_sales_filtered": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ss_customer_sk AS customer_sk, 'store' AS channel FROM store_sales JOIN filtered_date ON ss_sold_date_sk = d_date_sk WHERE ss_list_price BETWEEN 80 AND 169",
+          "interfaces": {
+            "outputs": ["customer_sk", "channel"],
+            "consumes": ["filtered_date"]
+          }
+        },
+        "web_sales_filtered": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT ws_bill_customer_sk AS customer_sk, 'web' AS channel FROM web_sales JOIN filtered_date ON ws_sold_date_sk = d_date_sk WHERE ws_list_price BETWEEN 80 AND 169",
+          "interfaces": {
+            "outputs": ["customer_sk", "channel"],
+            "consumes": ["filtered_date"]
+          }
+        },
+        "catalog_sales_filtered": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT cs_ship_customer_sk AS customer_sk, 'catalog' AS channel FROM catalog_sales JOIN filtered_date ON cs_sold_date_sk = d_date_sk WHERE cs_list_price BETWEEN 80 AND 169",
+          "interfaces": {
+            "outputs": ["customer_sk", "channel"],
+            "consumes": ["filtered_date"]
+          }
+        },
+        "all_sales_union": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT customer_sk, channel FROM store_sales_filtered UNION ALL SELECT customer_sk, channel FROM web_sales_filtered UNION ALL SELECT customer_sk, channel FROM catalog_sales_filtered",
+          "interfaces": {
+            "outputs": ["customer_sk", "channel"],
+            "consumes": ["store_sales_filtered", "web_sales_filtered", "catalog_sales_filtered"]
+          }
+        },
+        "customer_channel_flags": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT customer_sk, MAX(CASE WHEN channel = 'store' THEN 1 ELSE 0 END) AS has_store, MAX(CASE WHEN channel = 'web' THEN 1 ELSE 0 END) AS has_web, MAX(CASE WHEN channel = 'catalog' THEN 1 ELSE 0 END) AS has_catalog FROM all_sales_union GROUP BY customer_sk",
+          "interfaces": {
+            "outputs": ["customer_sk", "has_store", "has_web", "has_catalog"],
+            "consumes": ["all_sales_union"]
+          }
+        },
+        "customer_base": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT c.c_customer_sk, cd.cd_gender, cd.cd_marital_status, cd.cd_education_status, cd.cd_purchase_estimate, cd.cd_credit_rating FROM customer c JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk WHERE ca.ca_state IN ('CO','NC','TX') AND cd.cd_marital_status IN ('S','M','U') AND cd.cd_education_status IN ('Primary','College')",
+          "interfaces": {
+            "outputs": ["c_customer_sk", "cd_gender", "cd_marital_status", "cd_education_status", "cd_purchase_estimate", "cd_credit_rating"],
+            "consumes": []
+          }
+        },
+        "filter_flags": {
+          "type": "cte",
+          "change": "new",
+          "sql": "SELECT cb.cd_gender, cb.cd_marital_status, cb.cd_education_status, cb.cd_purchase_estimate, cb.cd_credit_rating FROM customer_base cb JOIN customer_channel_flags ccf ON cb.c_customer_sk = ccf.customer_sk WHERE ccf.has_store = 1 AND ccf.has_web = 0 AND ccf.has_catalog = 0",
+          "interfaces": {
+            "outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "cd_purchase_estimate", "cd_credit_rating"],
+            "consumes": ["customer_base", "customer_channel_flags"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT cd_gender, cd_marital_status, cd_education_status, COUNT(*) AS cnt1, cd_purchase_estimate, COUNT(*) AS cnt2, cd_credit_rating, COUNT(*) AS cnt3 FROM filter_flags GROUP BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating ORDER BY cd_gender, cd_marital_status, cd_education_status, cd_purchase_estimate, cd_credit_rating LIMIT 100",
+          "interfaces": {
+            "outputs": ["cd_gender", "cd_marital_status", "cd_education_status", "cnt1", "cd_purchase_estimate", "cnt2", "cd_credit_rating", "cnt3"],
+            "consumes": ["filter_flags"]
+          }
+        }
+      },
+      "reconstruction_order": ["filtered_date", "store_sales_filtered", "web_sales_filtered", "catalog_sales_filtered", "all_sales_union", "customer_channel_flags", "customer_base", "filter_flags", "main_query"],
+      "assembly_template": "WITH filtered_date AS ({filtered_date}), store_sales_filtered AS ({store_sales_filtered}), web_sales_filtered AS ({web_sales_filtered}), catalog_sales_filtered AS ({catalog_sales_filtered}), all_sales_union AS ({all_sales_union}), customer_channel_flags AS ({customer_channel_flags}), customer_base AS ({customer_base}), filter_flags AS ({filter_flags}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+## Mechanism
+
+**Changes:** Materialized the shared date filter into a CTE (`filtered_date`) and reused it across three channel scans, then consolidated channel scans via UNION ALL and aggregated per customer to compute channel presence flags, replacing EXISTS/NOT EXISTS with explicit flag-based filtering. This eliminates three separate date_dim scans and decorrelates the subqueries.
+
+**Expected speedup:** 2-3x from eliminating repeated date_dim scans and enabling hash aggregation on channel flags, while avoiding the nested-loop anti-joins of the original correlated subqueries.

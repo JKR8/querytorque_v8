@@ -1,0 +1,103 @@
+**<reasoning>**
+
+**1. DIAGNOSE - Why 1.02x only?**
+The best previous attempt (W1) failed to reach 2.0x because it only partially addressed PostgreSQL's weaknesses. Key issues:
+- **Comma-join weakness persists**: The original uses `FROM store_returns, item, date_dim WHERE ...` - PostgreSQL's cost model is weak on comma-joins. W1 converted to explicit JOINs in CTEs but kept the same structure.
+- **CTE materialization fence hurts**: Materializing `date_keys` and `filtered_items` creates optimization fences preventing predicate pushdown into fact tables. The filters on return amount/quantity ratio and reason_sk can't be evaluated until after the join.
+- **Non-equi join input blindness**: The `sr_return_amt / sr_return_quantity BETWEEN 237 AND 266` condition forces nested-loop evaluation after the join, scanning the entire filtered fact table.
+- **Redundant work**: Each channel CTE repeats the same date_dim self-join subquery three times (once per channel). W1 materialized it once but still executes it separately for each channel.
+
+**2. IDENTIFY - Unexplored angles**
+From the empirical results and PostgreSQL profile:
+- **Combine pg_dimension_prefetch_star with pg_date_cte_explicit_join**: The reference examples show 3.32x speedup when combining dimension prefetch with explicit JOIN syntax conversion.
+- **Strategic CTE materialization**: Materialize ONLY the expensive date_dim self-join (executed once), but don't materialize the item filter - let it be inlined into each channel CTE.
+- **Early fact table reduction**: Push date and item filters directly into each channel's FROM clause BEFORE applying the non-equi conditions.
+- **BitMapOr for OR conditions**: The `sr_reason_sk in (6,7,25,45,51)` is perfect for PostgreSQL's BitmapOr index scan - ensure it's used.
+- **Avoid CTE for filtered_items**: Let PostgreSQL inline the item filter into each channel query for better predicate pushdown.
+
+**3. REWRITE - New approach**
+I'll combine the most effective patterns:
+1. **date_keys CTE MATERIALIZED**: Compute the complex date_dim self-join once.
+2. **Explicit JOIN syntax**: Convert all comma-joins to explicit INNER JOIN.
+3. **Early fact reduction**: Join fact tables with date_keys first, then with item, applying filters at each stage.
+4. **Preserve division guards**: Keep CASE WHEN x > 0 THEN y/x END.
+5. **Strategic materialization**: Only materialize date_keys (expensive self-join), let item filter be inlined.
+
+**Key insight**: The original executes the date_dim self-join 3x (once per channel). Materializing it once gives immediate 3x reduction on that subquery. Combined with explicit JOIN syntax conversion, this should unlock PostgreSQL's better hash join planning with tiny dimension tables.
+
+</reasoning>
+
+### Part 1: Modified Logic Tree
+
+```
+[~] date_keys: Modified - MATERIALIZED CTE computing d_date_sk for target month sequences
+[+] store_returns_agg: New - Explicit JOIN with date_keys and item filter, early reduction
+[+] catalog_returns_agg: New - Explicit JOIN with date_keys and item filter, early reduction  
+[+] web_returns_agg: New - Explicit JOIN with date_keys and item filter, early reduction
+[=] main_query: Unchanged semantics, now consumes the three agg CTEs
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "pg_dimension_prefetch_star", "description": "Materialize complex date_dim self-join once", "applied_to": ["date_keys"]},
+    {"id": "R2", "type": "pg_date_cte_explicit_join", "description": "Convert comma-joins to explicit JOIN syntax with early fact reduction", "applied_to": ["store_returns_agg", "catalog_returns_agg", "web_returns_agg"]},
+    {"id": "R3", "type": "strategic_materialization", "description": "Materialize only date_keys, inline item filter for predicate pushdown", "applied_to": ["date_keys"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_keys": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT d1.d_date_sk, d1.d_date FROM date_dim d1 INNER JOIN date_dim d2 ON d1.d_month_seq = d2.d_month_seq WHERE d2.d_date IN ('2002-02-26','2002-05-03','2002-08-19','2002-11-18')",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "store_returns_agg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i.i_item_id AS item_id, SUM(sr.sr_return_quantity) AS sr_item_qty FROM store_returns sr INNER JOIN date_keys dk ON sr.sr_returned_date_sk = dk.d_date_sk INNER JOIN item i ON sr.sr_item_sk = i.i_item_sk WHERE i.i_category IN ('Home', 'Men') AND i.i_manager_id BETWEEN 8 AND 17 AND sr.sr_reason_sk IN (6, 7, 25, 45, 51) AND sr.sr_return_amt / NULLIF(sr.sr_return_quantity, 0) BETWEEN 237 AND 266 GROUP BY i.i_item_id",
+        "interfaces": {"outputs": ["item_id", "sr_item_qty"], "consumes": ["date_keys"]}
+      },
+      "catalog_returns_agg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i.i_item_id AS item_id, SUM(cr.cr_return_quantity) AS cr_item_qty FROM catalog_returns cr INNER JOIN date_keys dk ON cr.cr_returned_date_sk = dk.d_date_sk INNER JOIN item i ON cr.cr_item_sk = i.i_item_sk WHERE i.i_category IN ('Home', 'Men') AND i.i_manager_id BETWEEN 8 AND 17 AND cr.cr_reason_sk IN (6, 7, 25, 45, 51) AND cr.cr_return_amount / NULLIF(cr.cr_return_quantity, 0) BETWEEN 237 AND 266 GROUP BY i.i_item_id",
+        "interfaces": {"outputs": ["item_id", "cr_item_qty"], "consumes": ["date_keys"]}
+      },
+      "web_returns_agg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i.i_item_id AS item_id, SUM(wr.wr_return_quantity) AS wr_item_qty FROM web_returns wr INNER JOIN date_keys dk ON wr.wr_returned_date_sk = dk.d_date_sk INNER JOIN item i ON wr.wr_item_sk = i.i_item_sk WHERE i.i_category IN ('Home', 'Men') AND i.i_manager_id BETWEEN 8 AND 17 AND wr.wr_reason_sk IN (6, 7, 25, 45, 51) AND wr.wr_return_amt / NULLIF(wr.wr_return_quantity, 0) BETWEEN 237 AND 266 GROUP BY i.i_item_id",
+        "interfaces": {"outputs": ["item_id", "wr_item_qty"], "consumes": ["date_keys"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT sra.item_id, sra.sr_item_qty, sra.sr_item_qty/(sra.sr_item_qty+cra.cr_item_qty+wra.wr_item_qty)/3.0 * 100 AS sr_dev, cra.cr_item_qty, cra.cr_item_qty/(sra.sr_item_qty+cra.cr_item_qty+wra.wr_item_qty)/3.0 * 100 AS cr_dev, wra.wr_item_qty, wra.wr_item_qty/(sra.sr_item_qty+cra.cr_item_qty+wra.wr_item_qty)/3.0 * 100 AS wr_dev, (sra.sr_item_qty+cra.cr_item_qty+wra.wr_item_qty)/3.0 AS average FROM store_returns_agg sra INNER JOIN catalog_returns_agg cra ON sra.item_id = cra.item_id INNER JOIN web_returns_agg wra ON sra.item_id = wra.item_id ORDER BY sra.item_id, sra.sr_item_qty LIMIT 100",
+        "interfaces": {"outputs": ["item_id", "sr_item_qty", "sr_dev", "cr_item_qty", "cr_dev", "wr_item_qty", "wr_dev", "average"], "consumes": ["store_returns_agg", "catalog_returns_agg", "web_returns_agg"]}
+      }
+    },
+    "reconstruction_order": ["date_keys", "store_returns_agg", "catalog_returns_agg", "web_returns_agg", "main_query"],
+    "assembly_template": "WITH date_keys AS MATERIALIZED ({date_keys}), store_returns_agg AS ({store_returns_agg}), catalog_returns_agg AS ({catalog_returns_agg}), web_returns_agg AS ({web_returns_agg}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [
+    "SET LOCAL work_mem = '32MB'",
+    "SET LOCAL hash_mem_multiplier = 2.0",
+    "SET LOCAL max_parallel_workers_per_gather = 4",
+    "SET LOCAL random_page_cost = 1.0"
+  ],
+  "validation_checks": []
+}
+```
+
+**Changes**: Materialized the expensive date_dim self-join once, converted all comma-joins to explicit INNER JOIN syntax with early fact table reduction, and added NULLIF guards for division operations. The runtime config increases work_mem for hash joins, encourages parallelism, and sets random_page_cost=1.0 to favor index scans (SSD-like).
+
+**Expected speedup**: 2.2-2.5x - The combination of eliminating 3x date_dim self-joins, explicit JOIN syntax, and early fact reduction should significantly reduce nested-loop overhead and enable better hash join planning.

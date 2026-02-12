@@ -1,0 +1,272 @@
+<reasoning>
+CLASSIFY: This is a "repeated fact scan" archetype. The same fact table (store_sales) is scanned 8 independent times in separate subqueries, each with nearly identical joins and filters except for different time window predicates. This is a classic candidate for scan consolidation.
+
+EXPLAIN PLAN ANALYSIS:
+- Wall-clock ms: Total 2254ms. Each store_sales scan takes ~230-240ms (8 scans total ~1840ms). The rest is join/aggregation overhead.
+- Dominant nodes: SEQ_SCAN store_sales accounts for ~80% of total runtime (8 × ~230ms). Each scan reads 345.6M rows and filters down to 419K-1.3M rows (0.1%-0.4% selectivity).
+- Row count drops: store_sales scan → 719K-1.3M rows after time_dim join (2% selectivity). Then store join reduces to 64K-192K rows (further 10% selectivity). household_demographics join reduces to 15K-45K rows (further 20% selectivity).
+- Missed opportunity: The optimizer DOES push time filters into time_dim scans (t_hour, t_minute), but cannot push them into store_sales scan because the predicate is on the joined table (time_dim). Each subquery re-scans the entire fact table.
+- Scans per base table: store_sales: 8 times (345.6M rows each). time_dim: 8 times (86K rows → 1,800 filtered rows each). store: 8 times (102 rows → 14 filtered rows each). household_demographics: 8 times (7,200 rows → 1,440 filtered rows each).
+- CTE materialization: No CTEs in original query. Each subquery is independent.
+
+GAP MATCHING:
+1. REDUNDANT_SCAN_ELIMINATION: Strong match. Query scans store_sales 8 times with identical joins/filters except time window. channel_bitmap_aggregation (6.24x) and single_pass_aggregation (4.47x) directly address this.
+2. CROSS_CTE_PREDICATE_BLINDNESS: Moderate match. Predicates on time_dim (hour/minute) are not pushed into store_sales scan. Pre-filtering dimensions could reduce fact table probe size. date_cte_isolate (4.00x), prefetch_fact_join (3.77x), dimension_cte_isolate (1.93x) apply.
+3. CROSS_COLUMN_OR_DECOMPOSITION: No match. OR conditions are within household_demographics table on same columns (hd_dep_count and hd_vehicle_count). EXPLAIN shows optimizer already handles this with single scan + filter.
+4. CORRELATED_SUBQUERY_PARALYSIS: No match. No correlated subqueries.
+5. UNION_CTE_SELF_JOIN_DECOMPOSITION: No match. No UNION CTEs.
+
+Optimizer Strengths already handling:
+- INTRA_SCAN_PREDICATE_PUSHDOWN: Yes, time_dim filters are pushed into its scan.
+- SAME_COLUMN_OR: Yes, household_demographics OR is handled in single scan.
+- HASH_JOIN_SELECTION: Yes, hash joins chosen.
+CTE_INLINING is not relevant (no CTEs).
+
+AGGREGATION TRAP CHECK: Only COUNT(*), which is duplicate-safe and grouping-insensitive. Changing join order or consolidation doesn't affect counts as long as same rows counted.
+
+TRANSFORM SELECTION (ranked by expected value):
+1. channel_bitmap_aggregation (6.24x): Consolidate 8 scans into 1 with CASE WHEN labels.
+2. single_pass_aggregation (4.47x): Similar consolidation but uses conditional aggregation.
+3. prefetch_fact_join (3.77x): Pre-filter dimensions, pre-join with fact, then aggregate.
+4. dimension_cte_isolate (1.93x): Pre-filter all dimensions into CTEs before fact join.
+
+LOGICAL TREE DESIGN: Need to ensure column completeness. For consolidation strategies, must output time window identifier and preserve all join keys.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: Count store sales in eight consecutive half-hour windows from 8:30-12:30 at store "ese" for households matching three specific dependent/vehicle count combinations. Joins are INNER (all four tables must match). Aggregation is COUNT(*), which is duplicate-safe and grouping-insensitive. Time window filters depend on time_dim joins; store filter depends on store join; household filters depend on household_demographics join.
+
+BOTTLENECK_DIAGNOSIS: Scan-bound: 8 sequential full scans of store_sales (345.6M rows each) dominate 80% of runtime (~1840ms total). Each scan filters via joins to pre-filtered dimensions but cannot push time predicates into fact scan. Cardinality: store_sales → 419K-1.3M rows after time join → 64K-192K after store join → 15K-45K after household join. Optimizer already pushes filters into dimension scans and uses efficient hash joins; logical-tree costs misleadingly emphasize joins over scans.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Query must output 8 columns (h8_30_to_9 through h12_to_12_30).
+- CTE_COLUMN_COMPLETENESS: Any CTE must include ss_sold_time_sk, ss_hdemo_sk, ss_store_sk for downstream joins.
+- LITERAL_PRESERVATION: Preserve exact values: store name 'ese', hour=8/9/10/11/12, minute thresholds 30, household condition values (-1,4,3, +2).
+- SEMANTIC_EQUIVALENCE: Must produce identical 8 counts.
+- REDUNDANT_SCAN_ELIMINATION: EXPLAIN shows 8 store_sales scans at ~230ms each.
+- CROSS_CTE_PREDICATE_BLINDNESS: Time predicates (t_hour, t_minute) not pushed into store_sales scan.
+
+REGRESSION_WARNINGS:
+1. materialize_cte (observed regression 0.14x):
+   CAUSE: Converting EXISTS to materialized CTE forced full scan.
+   RULE: Do not convert EXISTS subqueries to materialized CTEs (query has no EXISTS).
+2. or_to_union (observed regression 0.59x):
+   CAUSE: Splitting same-column ORs into UNION ALL doubled fact scans.
+   RULE: Do not split household_demographics OR (optimizer already handles).
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: channel_bitmap_aggregation
+TARGET_LOGICAL_TREE:
+  time_windows_cte -> store_filter_cte -> household_filter_cte -> consolidated_scan -> windowed_aggregates
+NODE_CONTRACTS:
+  time_windows_cte:
+    FROM: time_dim
+    WHERE: (t_hour=8 AND t_minute>=30) OR (t_hour=9 AND t_minute<30) OR (t_hour=9 AND t_minute>=30) OR (t_hour=10 AND t_minute<30) OR (t_hour=10 AND t_minute>=30) OR (t_hour=11 AND t_minute<30) OR (t_hour=11 AND t_minute>=30) OR (t_hour=12 AND t_minute<30)
+    OUTPUT: t_time_sk, t_hour, t_minute
+    EXPECTED_ROWS: 14,400
+    CONSUMERS: consolidated_scan
+  store_filter_cte:
+    FROM: store
+    WHERE: s_store_name = 'ese'
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 14
+    CONSUMERS: consolidated_scan
+  household_filter_cte:
+    FROM: household_demographics
+    WHERE: ((hd_dep_count = -1 AND hd_vehicle_count<=1) OR (hd_dep_count = 4 AND hd_vehicle_count<=6) OR (hd_dep_count = 3 AND hd_vehicle_count<=5))
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1,440
+    CONSUMERS: consolidated_scan
+  consolidated_scan:
+    FROM: store_sales
+    JOIN time_windows_cte ON ss_sold_time_sk = t_time_sk
+    JOIN store_filter_cte ON ss_store_sk = s_store_sk
+    JOIN household_filter_cte ON ss_hdemo_sk = hd_demo_sk
+    OUTPUT: ss_sold_time_sk, t_hour, t_minute
+    EXPECTED_ROWS: 15K-45K (per window aggregate)
+    CONSUMERS: windowed_aggregates
+  windowed_aggregates:
+    FROM: consolidated_scan
+    AGGREGATE: 
+      COUNT(CASE WHEN t_hour=8 AND t_minute>=30 THEN 1 END) AS h8_30_to_9,
+      COUNT(CASE WHEN t_hour=9 AND t_minute<30 THEN 1 END) AS h9_to_9_30,
+      COUNT(CASE WHEN t_hour=9 AND t_minute>=30 THEN 1 END) AS h9_30_to_10,
+      COUNT(CASE WHEN t_hour=10 AND t_minute<30 THEN 1 END) AS h10_to_10_30,
+      COUNT(CASE WHEN t_hour=10 AND t_minute>=30 THEN 1 END) AS h10_30_to_11,
+      COUNT(CASE WHEN t_hour=11 AND t_minute<30 THEN 1 END) AS h11_to_11_30,
+      COUNT(CASE WHEN t_hour=11 AND t_minute>=30 THEN 1 END) AS h11_30_to_12,
+      COUNT(CASE WHEN t_hour=12 AND t_minute<30 THEN 1 END) AS h12_to_12_30
+    OUTPUT: h8_30_to_9, h9_to_9_30, h9_30_to_10, h10_to_10_30, h10_30_to_11, h11_to_11_30, h11_30_to_12, h12_to_12_30
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: channel_bitmap_aggregation, single_pass_aggregation
+EXAMPLE_ADAPTATION:
+  channel_bitmap_aggregation: Apply the pattern of consolidating 8 repeated fact scans into one scan with CASE WHEN window labeling. Ignore the channel-specific logic (this query uses time windows not channels).
+  single_pass_aggregation: Apply conditional aggregation with CASE inside COUNT. Ignore any decorrelation aspects.
+HAZARD_FLAGS:
+- Must ensure time window conditions are exactly as original (8 windows, exact hour/minute boundaries).
+- Avoid cross-joining dimension CTEs before fact join (cartesian explosion).
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: prefetch_fact_join
+TARGET_LOGICAL_TREE:
+  filtered_dims_cte -> prefetched_fact_cte -> windowed_aggregates
+NODE_CONTRACTS:
+  filtered_dims_cte:
+    FROM: time_dim, store, household_demographics
+    WHERE: time_dim.t_time_sk IN (SELECT t_time_sk FROM time_dim WHERE (t_hour=8 AND t_minute>=30) OR ... [all 8 windows])
+      AND store.s_store_name = 'ese'
+      AND ((household_demographics.hd_dep_count = -1 AND hd_vehicle_count<=1) OR ...)
+    OUTPUT: time_dim.t_time_sk, time_dim.t_hour, time_dim.t_minute, store.s_store_sk, household_demographics.hd_demo_sk
+    EXPECTED_ROWS: 14 (store) × 1,440 (household) × 14,400 (time) = 290M cartesian product — THIS IS WRONG. Redesign.
+    
+  Let me redesign: prefetch_fact_join should filter dimensions independently, then join with fact in stages.
+  Better design:
+    1. time_filter_cte (as before)
+    2. store_filter_cte (as before)
+    3. household_filter_cte (as before)
+    4. prefetched_fact_cte: join store_sales with time_filter_cte and store_filter_cte and household_filter_cte
+    5. windowed_aggregates
+
+  Actually, prefetch_fact_join example Q63 filters date_dim first, pre-joins with store_sales, then joins other dims.
+  For this query: filter time_dim first, pre-join with store_sales, then join store and household.
+
+  Revised TARGET_LOGICAL_TREE:
+    time_filter_cte -> fact_time_join_cte -> store_household_join_cte -> windowed_aggregates
+
+  NODE_CONTRACTS:
+  time_filter_cte:
+    FROM: time_dim
+    WHERE: (t_hour=8 AND t_minute>=30) OR ... [all 8 windows]
+    OUTPUT: t_time_sk, t_hour, t_minute
+    EXPECTED_ROWS: 14,400
+    CONSUMERS: fact_time_join_cte
+  fact_time_join_cte:
+    FROM: store_sales
+    JOIN time_filter_cte ON ss_sold_time_sk = t_time_sk
+    OUTPUT: ss_sold_time_sk, ss_store_sk, ss_hdemo_sk, t_hour, t_minute
+    EXPECTED_ROWS: 419K-1.3M (varies per window)
+    CONSUMERS: store_household_join_cte
+  store_household_join_cte:
+    FROM: fact_time_join_cte
+    JOIN store ON ss_store_sk = s_store_sk AND s_store_name = 'ese'
+    JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk AND ((hd_dep_count = -1 AND hd_vehicle_count<=1) OR ...)
+    OUTPUT: t_hour, t_minute
+    EXPECTED_ROWS: 15K-45K
+    CONSUMERS: windowed_aggregates
+  windowed_aggregates: (same as Worker 1)
+
+EXAMPLES: prefetch_fact_join, date_cte_isolate
+EXAMPLE_ADAPTATION:
+  prefetch_fact_join: Apply staged join pipeline: filter time_dim first, pre-join with fact, then join remaining dimensions. Ignore the multi-fact join aspect (only one fact table).
+  date_cte_isolate: Apply time dimension pre-filtering into CTE. Ignore the date-specific logic (use time_dim).
+HAZARD_FLAGS:
+- Pre-joining fact with time may still scan full store_sales if join is not selective enough (but time filter reduces build side).
+- Must ensure store and household filters are applied as JOIN conditions, not WHERE, to avoid Cartesian product.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: dimension_cte_isolate
+TARGET_LOGICAL_TREE:
+  time_filter_cte -> store_filter_cte -> household_filter_cte -> fact_join_cte -> windowed_aggregates
+NODE_CONTRACTS:
+  time_filter_cte:
+    FROM: time_dim
+    WHERE: (t_hour=8 AND t_minute>=30) OR ... [all 8 windows]
+    OUTPUT: t_time_sk, t_hour, t_minute
+    EXPECTED_ROWS: 14,400
+    CONSUMERS: fact_join_cte
+  store_filter_cte:
+    FROM: store
+    WHERE: s_store_name = 'ese'
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 14
+    CONSUMERS: fact_join_cte
+  household_filter_cte:
+    FROM: household_demographics
+    WHERE: ((hd_dep_count = -1 AND hd_vehicle_count<=1) OR (hd_dep_count = 4 AND hd_vehicle_count<=6) OR (hd_dep_count = 3 AND hd_vehicle_count<=5))
+    OUTPUT: hd_demo_sk
+    EXPECTED_ROWS: 1,440
+    CONSUMERS: fact_join_cte
+  fact_join_cte:
+    FROM: store_sales
+    JOIN time_filter_cte ON ss_sold_time_sk = t_time_sk
+    JOIN store_filter_cte ON ss_store_sk = s_store_sk
+    JOIN household_filter_cte ON ss_hdemo_sk = hd_demo_sk
+    OUTPUT: t_hour, t_minute
+    EXPECTED_ROWS: 15K-45K
+    CONSUMERS: windowed_aggregates
+  windowed_aggregates: (same as Worker 1)
+EXAMPLES: dimension_cte_isolate, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+  dimension_cte_isolate: Apply pre-filtering of all three dimension tables into separate CTEs, then join with fact. Ignore the promotion/date specifics (use time/store/household).
+  multi_dimension_prefetch: Apply pre-filtering of multiple dimensions in parallel. Ignore the unfiltered dimension CTE hazard (all CTEs have WHERE).
+HAZARD_FLAGS:
+- Do not cross-join the three dimension CTEs (join them only through fact table).
+- Ensure each CTE includes surrogate keys for joining.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: scan_consolidation_pivot
+TARGET_LOGICAL_TREE:
+  time_window_label_cte -> filtered_dims_cte -> consolidated_grouped_cte -> pivot_aggregates
+NODE_CONTRACTS:
+  time_window_label_cte:
+    FROM: time_dim
+    WHERE: (t_hour=8 AND t_minute>=30) OR ... [all 8 windows]
+    OUTPUT: t_time_sk, 
+            CASE 
+              WHEN t_hour=8 AND t_minute>=30 THEN 1
+              WHEN t_hour=9 AND t_minute<30 THEN 2
+              WHEN t_hour=9 AND t_minute>=30 THEN 3
+              WHEN t_hour=10 AND t_minute<30 THEN 4
+              WHEN t_hour=10 AND t_minute>=30 THEN 5
+              WHEN t_hour=11 AND t_minute<30 THEN 6
+              WHEN t_hour=11 AND t_minute>=30 THEN 7
+              WHEN t_hour=12 AND t_minute<30 THEN 8
+            END AS window_id
+    EXPECTED_ROWS: 14,400
+    CONSUMERS: consolidated_grouped_cte
+  filtered_dims_cte:
+    FROM: store, household_demographics
+    WHERE: store.s_store_name = 'ese'
+      AND ((household_demographics.hd_dep_count = -1 AND hd_vehicle_count<=1) OR ...)
+    OUTPUT: store.s_store_sk, household_demographics.hd_demo_sk
+    EXPECTED_ROWS: 14 × 1,440 = 20,160
+    CONSUMERS: consolidated_grouped_cte
+  consolidated_grouped_cte:
+    FROM: store_sales
+    JOIN time_window_label_cte ON ss_sold_time_sk = t_time_sk
+    JOIN filtered_dims_cte ON ss_store_sk = s_store_sk AND ss_hdemo_sk = hd_demo_sk
+    GROUP BY window_id
+    AGGREGATE: COUNT(*) AS window_count
+    OUTPUT: window_id, window_count
+    EXPECTED_ROWS: 8
+    CONSUMERS: pivot_aggregates
+  pivot_aggregates:
+    FROM: consolidated_grouped_cte
+    AGGREGATE:
+      MAX(CASE WHEN window_id=1 THEN window_count END) AS h8_30_to_9,
+      MAX(CASE WHEN window_id=2 THEN window_count END) AS h9_to_9_30,
+      MAX(CASE WHEN window_id=3 THEN window_count END) AS h9_30_to_10,
+      MAX(CASE WHEN window_id=4 THEN window_count END) AS h10_to_10_30,
+      MAX(CASE WHEN window_id=5 THEN window_count END) AS h10_30_to_11,
+      MAX(CASE WHEN window_id=6 THEN window_count END) AS h11_to_11_30,
+      MAX(CASE WHEN window_id=7 THEN window_count END) AS h11_30_to_12,
+      MAX(CASE WHEN window_id=8 THEN window_count END) AS h12_to_12_30
+    OUTPUT: h8_30_to_9, h9_to_9_30, h9_30_to_10, h10_to_10_30, h10_30_to_11, h11_to_11_30, h11_30_to_12, h12_to_12_30
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, union_cte_split
+EXAMPLE_ADAPTATION:
+  single_pass_aggregation: Apply consolidation of multiple scans into one GROUP BY with discriminator column. Ignore the conditional aggregation (using GROUP BY + pivot instead).
+  union_cte_split: Apply splitting by discriminator (window_id) but consolidate into single scan. Ignore the UNION ALL aspect (use GROUP BY).
+HAZARD_FLAGS:
+- GROUP BY window_id changes aggregation grouping but each window is independent in original query (safe).
+- MAX pivot is safe because each window_id has exactly one row.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination (combines scan consolidation with GROUP BY + pivot instead of conditional aggregation)

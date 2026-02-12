@@ -1,0 +1,90 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] v1_extended  [~]  Cost: 33%  Rows: ~105K — Aggregate monthly store sales by category/brand/store/company for Dec-2000 through Jan-2002, and compute yearly average monthly sales, rank, and adjacent-month sales via LAG/LEAD.
+│   ├── SCAN (item, store_sales (join), date_dim (join), store (join))
+│   ├── JOIN (ss_item_sk = i_item_sk)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── JOIN (ss_store_sk = s_store_sk)
+│   ├── FILTER ((d_year = 2001) OR (d_year = 2000 AND d_moy = 12) OR (d_year = 2002 AND d_moy = 1))
+│   ├── AGG (GROUP BY i_category, i_brand, s_store_name, s_company_name, d_year, d_moy)
+│   ├── WINDOW (AVG(sum_sales) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name, d_year))
+│   ├── WINDOW (RANK() OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy))
+│   ├── WINDOW (LAG(sum_sales) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy))
+│   ├── WINDOW (LEAD(sum_sales) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy))
+│   └── OUTPUT (i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn, psum, nsum)
+├── [MAIN] main_query  [~]  Cost: 67%  Rows: ~100 — Keep 2001 rows with nonzero average monthly sales and >10% relative deviation from that average, then order by deviation and next-month sales.
+    ├── SCAN (v1_extended)
+    ├── FILTER (d_year = 2001)
+    ├── FILTER (avg_monthly_sales > 0)
+    ├── FILTER (CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1)
+    ├── SORT (sum_sales - avg_monthly_sales ASC, nsum ASC)
+    ├── LIMIT (100)
+    └── OUTPUT (s_store_name, d_year, avg_monthly_sales, sum_sales, psum, nsum)
+```
+
+Changes:
+- `[~] v1_extended`: Replaced original v1 with enhanced version that includes LAG/LEAD windows for psum/nsum, eliminating the need for v2 self-join
+- `[-] v2`: Removed entirely (self-join CTE)
+- `[~] main_query`: Now queries v1_extended directly instead of v2, but maintains same filters/ordering
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "deferred_window_aggregation",
+      "description": "Replaced self-join for adjacent month sales with LAG/LEAD window functions in the same CTE as other windows",
+      "applied_to": ["v1_extended"]
+    },
+    {
+      "id": "R2",
+      "type": "cte_inlining",
+      "description": "Eliminated v2 self-join CTE by computing adjacent month values directly in v1_extended",
+      "applied_to": ["v1_extended", "main_query"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "v1_extended": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name, d_year) AS avg_monthly_sales, RANK() OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS rn, LAG(SUM(ss_sales_price)) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS psum, LEAD(SUM(ss_sales_price)) OVER (PARTITION BY i_category, i_brand, s_store_name, s_company_name ORDER BY d_year, d_moy) AS nsum FROM item, store_sales, date_dim, store WHERE ss_item_sk = i_item_sk AND ss_sold_date_sk = d_date_sk AND ss_store_sk = s_store_sk AND (d_year = 2001 OR (d_year = 2000 AND d_moy = 12) OR (d_year = 2002 AND d_moy = 1)) GROUP BY i_category, i_brand, s_store_name, s_company_name, d_year, d_moy",
+          "interfaces": {
+            "outputs": ["i_category", "i_brand", "s_store_name", "s_company_name", "d_year", "d_moy", "sum_sales", "avg_monthly_sales", "rn", "psum", "nsum"],
+            "consumes": []
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT s_store_name, d_year, avg_monthly_sales, sum_sales, psum, nsum FROM v1_extended WHERE d_year = 2001 AND avg_monthly_sales > 0 AND CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY sum_sales - avg_monthly_sales, nsum LIMIT 100",
+          "interfaces": {
+            "outputs": ["s_store_name", "d_year", "avg_monthly_sales", "sum_sales", "psum", "nsum"],
+            "consumes": ["v1_extended"]
+          }
+        }
+      },
+      "reconstruction_order": ["v1_extended", "main_query"],
+      "assembly_template": "WITH v1_extended AS ({v1_extended}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+## Mechanism
+
+**Changes:** Eliminated the expensive 3-way self-join (v2) by computing adjacent month sales via LAG/LEAD window functions directly in v1_extended. This reduces the query from two CTEs to one while preserving exact semantics—the window functions use the same partition/ordering as the original self-join conditions.
+
+**Expected speedup:** ~2-3x reduction in runtime due to eliminating the Cartesian explosion risk of the self-join and reducing the data processed by window functions (original v1 had to be materialized and joined twice).

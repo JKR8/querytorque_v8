@@ -1,0 +1,95 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 99%  Rows: ~55K
+    ├── [=] SCAN (store_sales, catalog_sales, web_sales, date_dim, customer)
+    ├── [~] JOIN (explicit INNER JOIN syntax replacing comma joins)
+    ├── [~] FILTER (date_dim filters isolated in CTE)
+    ├── [~] FILTER (customer filters isolated in CTE)
+    ├── [~] FILTER (price/wholesale filters remain in per-branch WHERE)
+    ├── [+] CTE filtered_dates
+    │   └── SCAN (date_dim) WHERE d_month_seq BETWEEN 1213 AND 1224
+    ├── [+] CTE filtered_customers  
+    │   └── SCAN (customer) WHERE c_birth_year BETWEEN 1968 AND 1974
+    ├── [+] CTE store_results
+    │   ├── JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+    │   ├── JOIN filtered_customers ON ss_customer_sk = c_customer_sk
+    │   └── WHERE ss_list_price BETWEEN 168 AND 197 AND ss_wholesale_cost BETWEEN 76 AND 86
+    ├── [+] CTE catalog_results
+    │   ├── JOIN filtered_dates ON cs_sold_date_sk = d_date_sk
+    │   ├── JOIN filtered_customers ON cs_bill_customer_sk = c_customer_sk
+    │   └── WHERE cs_list_price BETWEEN 168 AND 197 AND cs_wholesale_cost BETWEEN 76 AND 86
+    ├── [+] CTE web_results
+    │   ├── JOIN filtered_dates ON ws_sold_date_sk = d_date_sk
+    │   ├── JOIN filtered_customers ON ws_bill_customer_sk = c_customer_sk
+    │   └── WHERE ws_list_price BETWEEN 168 AND 197 AND ws_wholesale_cost BETWEEN 76 AND 86
+    ├── [=] EXCEPT chain (store_results EXCEPT catalog_results EXCEPT web_results)
+    └── [=] OUTPUT (COUNT(*))
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_prefiltering", "description": "Isolated date_dim and customer filters into CTEs before fact table joins", "applied_to": ["filtered_dates", "filtered_customers"]},
+    {"id": "R2", "type": "explicit_join_conversion", "description": "Converted comma-separated implicit joins to explicit INNER JOIN syntax", "applied_to": ["store_results", "catalog_results", "web_results"]},
+    {"id": "R3", "type": "cte_non_materialized", "description": "Used non-materialized CTEs to avoid blocking parallel execution of fact table scans", "applied_to": ["filtered_dates", "filtered_customers", "store_results", "catalog_results", "web_results"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1213 AND 1224",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "filtered_customers": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT c_customer_sk, c_last_name, c_first_name FROM customer WHERE c_birth_year BETWEEN 1968 AND 1974",
+        "interfaces": {"outputs": ["c_customer_sk", "c_last_name", "c_first_name"], "consumes": []}
+      },
+      "store_results": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT DISTINCT fc.c_last_name, fc.c_first_name, fd.d_date FROM store_sales ss INNER JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk INNER JOIN filtered_customers fc ON ss.ss_customer_sk = fc.c_customer_sk WHERE ss.ss_list_price BETWEEN 168 AND 197 AND ss.ss_wholesale_cost BETWEEN 76 AND 86",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date"], "consumes": ["filtered_dates", "filtered_customers"]}
+      },
+      "catalog_results": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT DISTINCT fc.c_last_name, fc.c_first_name, fd.d_date FROM catalog_sales cs INNER JOIN filtered_dates fd ON cs.cs_sold_date_sk = fd.d_date_sk INNER JOIN filtered_customers fc ON cs.cs_bill_customer_sk = fc.c_customer_sk WHERE cs.cs_list_price BETWEEN 168 AND 197 AND cs.cs_wholesale_cost BETWEEN 76 AND 86",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date"], "consumes": ["filtered_dates", "filtered_customers"]}
+      },
+      "web_results": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT DISTINCT fc.c_last_name, fc.c_first_name, fd.d_date FROM web_sales ws INNER JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk INNER JOIN filtered_customers fc ON ws.ws_bill_customer_sk = fc.c_customer_sk WHERE ws.ws_list_price BETWEEN 168 AND 197 AND ws.ws_wholesale_cost BETWEEN 76 AND 86",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "d_date"], "consumes": ["filtered_dates", "filtered_customers"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(*) FROM ((SELECT * FROM store_results) EXCEPT (SELECT * FROM catalog_results) EXCEPT (SELECT * FROM web_results)) AS cool_cust",
+        "interfaces": {"outputs": ["count"], "consumes": ["store_results", "catalog_results", "web_results"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_customers", "store_results", "catalog_results", "web_results", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), filtered_customers AS ({filtered_customers}), store_results AS ({store_results}), catalog_results AS ({catalog_results}), web_results AS ({web_results}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Isolated selective dimension filters (date_dim and customer) into CTEs before joining with large fact tables, and converted comma-separated implicit joins to explicit INNER JOIN syntax while preserving the original EXCEPT structure.
+
+**Expected speedup:** 2.5-3.5x based on similar patterns in reference examples (pg_dimension_prefetch_star: 3.32x, pg_date_cte_explicit_join: 2.28x). The combined approach should enable better cardinality estimates and parallel execution of fact table scans.

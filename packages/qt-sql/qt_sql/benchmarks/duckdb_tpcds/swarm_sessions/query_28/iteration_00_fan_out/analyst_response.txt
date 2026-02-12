@@ -1,0 +1,229 @@
+<reasoning>
+1. **CLASSIFY**: This query is a "repeated fact scan" archetype. Six independent subqueries scan the same fact table (store_sales) with different filters on ss_quantity and compound OR conditions on three other columns. Each subquery returns a single aggregated row, and they are cross-joined to produce one row of six bucket profiles.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total execution time: 3734ms.
+   - Each of the six subqueries performs a SEQ_SCAN on store_sales, reading ~1.4M rows (out of 345.6M) per scan, for a total of ~8.4M rows scanned across all six scans. The scans are disjoint because ss_quantity ranges are non-overlapping.
+   - Each scan's filter reduces from ~1.4M rows to ~300-350K rows (filter selectivity ~25%).
+   - The most expensive scan is the first (B1) at 1154.4ms (31% of total time), but each scan takes 300-1150ms. The aggregated cost of six scans dominates.
+   - The optimizer pushes the ss_quantity filter and the OR condition into each scan (INTRA_SCAN_PREDICATE_PUSHDOWN works). It does not consolidate the six scans into one.
+   - The cross-joins and aggregations are trivial cost (< 2% each).
+   - No CTEs are present; each subquery is executed independently.
+
+3. **GAP MATCHING**:
+   - **REDUNDANT_SCAN_ELIMINATION**: The same fact table is scanned six times. This is a prime opportunity for channel_bitmap_aggregation or single_pass_aggregation.
+   - **CROSS_COLUMN_OR_DECOMPOSITION**: Each subquery has OR conditions on three different columns (ss_list_price, ss_coupon_amt, ss_wholesale_cost). However, splitting OR into UNION ALL per column is not beneficial here because the OR is within each bucket and we already have disjoint ss_quantity ranges. Also, same-column OR is not present, so or_to_union is not applicable.
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: No CTEs exist, so this gap is not active.
+   - **CORRELATED_SUBQUERY_PARALYSIS**: No correlated subqueries.
+   - **UNION_CTE_SELF_JOIN_DECOMPOSITION**: No UNION CTE.
+
+4. **AGGREGATION TRAP CHECK**:
+   - Aggregates are AVG, COUNT, COUNT(DISTINCT) on ss_list_price.
+   - Each bucket's aggregation is independent (rows are partitioned by ss_quantity range and bucket-specific OR condition).
+   - Consolidating scans via CASE WHEN inside aggregates preserves grouping because each row belongs to exactly one bucket (disjoint ss_quantity ranges) and the CASE includes the bucket-specific OR condition. COUNT(DISTINCT) with CASE is safe because it counts distinct values per bucket condition.
+   - No FILTER clauses, STDDEV, or variance.
+
+5. **TRANSFORM SELECTION** (ranked by expected value):
+   a. **single_pass_aggregation** (expected high win): Consolidate six scans into one with conditional aggregation.
+   b. **channel_bitmap_aggregation** (similar, but with labeling): Also consolidates scans, but uses a bucket label column. Slightly different logical tree.
+   c. **or_to_union** (riskier, but explore decomposition of OR within each bucket): Split each bucket's OR into three UNION ALL branches (one per column), then aggregate per bucket. This could allow the optimizer to use different scan paths per column? But DuckDB is columnar and the OR is already evaluated in a single scan. This is exploration.
+   d. **materialize_cte** (low win): Materialize the filtered store_sales (ss_quantity 0-30) into a CTE, then compute each bucket's aggregates by scanning the CTE six times. This might reduce base table scans to one, but increases total rows scanned (CTE scan six times). However, if the CTE is materialized and small, it could be faster. This is exploration.
+
+6. **LOGICAL TREE DESIGN**:
+   - For single_pass_aggregation: One CTE that scans store_sales once, computes six sets of conditional aggregates.
+   - For channel_bitmap_aggregation: One CTE that assigns a bucket label to each row, then groups by bucket and aggregates, then pivots.
+   - For or_to_union: For each bucket, create a UNION ALL of three subqueries (each with a single column filter), then aggregate per bucket with deduplication (because a row could appear in multiple branches). Then combine buckets.
+   - For materialize_cte: One CTE with filtered rows (ss_quantity 0-30), then six subqueries referencing that CTE.
+
+   Column completeness: Each CTE must output all columns needed for downstream aggregates: ss_list_price, and the columns used in OR conditions (ss_coupon_amt, ss_wholesale_cost) for filtering.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Return six side-by-side quantity-bucket profiles of store sales, each with average list price, row count, and distinct list-price count under bucket-specific price/coupon/wholesale filters. The six subqueries are independent (no joins between them) and their results are cross-joined (Cartesian product) to produce one row. Aggregation uses AVG, COUNT, and COUNT(DISTINCT) on ss_list_price; COUNT only includes non-null values. Each row belongs to exactly one bucket due to disjoint ss_quantity ranges, and must also satisfy the bucket's OR condition on three columns. Any rewrite must preserve the exact bucket definitions and literal constants.
+
+BOTTLENECK_DIAGNOSIS:
+The query is scan-bound: six sequential scans of store_sales consume ~90% of runtime (each scan reads ~1.4M rows, total ~8.4M rows). Each scan applies two filters: a selective range on ss_quantity (reduces to ~1.4M from 345.6M) and a compound OR filter (further reduces to ~300-350K). The optimizer already pushes filters into each scan (INTRA_SCAN_PREDICATE_PUSHDOWN) but does not consolidate the six scans into one. Aggregation and cross-joins are negligible (<2% each). Logical-tree cost percentages are misleading; the EXPLAIN timings show the real bottleneck.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must output exactly six columns per bucket (B1_LP, B1_CNT, B1_CNTD, ..., B6_LP, B6_CNT, B6_CNTD).
+- CTE_COLUMN_COMPLETENESS: Any CTE must include ss_list_price, ss_coupon_amt, ss_wholesale_cost, and ss_quantity for downstream filtering and aggregation.
+- LITERAL_PRESERVATION: All numeric constants in filters (e.g., 131, 16798, 25) must be copied exactly.
+- SEMANTIC_EQUIVALENCE: The single output row must match the original exactly.
+- REDUNDANT_SCAN_ELIMINATION: Six scans of store_sales present a clear opportunity for consolidation (evidence: each scan takes 300-1150ms, total 3734ms).
+
+REGRESSION_WARNINGS:
+1. Or-to-Union on same-column OR (observed regression 0.59x on Q90):
+   CAUSE: Splitting same-column OR into UNION ALL duplicated fact scans without selectivity benefit.
+   RULE: Do not split OR conditions on the same column; here OR is on different columns, but each bucket's OR is three different columns. Splitting per column could still duplicate rows (a row may satisfy multiple conditions) requiring deduplication.
+2. Materialize CTE for EXISTS (observed regression 0.14x on Q16):
+   CAUSE: Converting EXISTS to materialized CTE forced full scan instead of semi-join short-circuit.
+   RULE: Not applicable; this query has no EXISTS subqueries.
+3. Unfiltered dimension CTE (observed regression 0.85x on Q67):
+   CAUSE: CTE without WHERE clause added overhead.
+   RULE: Any CTE must have a WHERE clause (e.g., ss_quantity BETWEEN 0 AND 30) to reduce rows.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  store_sales_scan -> conditional_aggregation -> cross_join_output
+NODE_CONTRACTS:
+  store_sales_scan:
+    FROM: store_sales
+    WHERE: ss_quantity BETWEEN 0 AND 30
+    OUTPUT: ss_quantity, ss_list_price, ss_coupon_amt, ss_wholesale_cost
+    EXPECTED_ROWS: ~8.4M (all rows in quantity ranges 0-30)
+    CONSUMERS: conditional_aggregation
+  conditional_aggregation:
+    FROM: store_sales_scan
+    AGGREGATE: 
+      B1_LP = AVG(CASE WHEN ss_quantity BETWEEN 0 AND 5 AND (ss_list_price BETWEEN 131 AND 141 OR ss_coupon_amt BETWEEN 16798 AND 17798 OR ss_wholesale_cost BETWEEN 25 AND 45) THEN ss_list_price END),
+      B1_CNT = COUNT(CASE WHEN ss_quantity BETWEEN 0 AND 5 AND (ss_list_price BETWEEN 131 AND 141 OR ss_coupon_amt BETWEEN 16798 AND 17798 OR ss_wholesale_cost BETWEEN 25 AND 45) THEN ss_list_price END),
+      B1_CNTD = COUNT(DISTINCT CASE WHEN ss_quantity BETWEEN 0 AND 5 AND (ss_list_price BETWEEN 131 AND 141 OR ss_coupon_amt BETWEEN 16798 AND 17798 OR ss_wholesale_cost BETWEEN 25 AND 45) THEN ss_list_price END),
+      ... repeat for B2 to B6 with their respective filters (see original query for constants).
+    OUTPUT: B1_LP, B1_CNT, B1_CNTD, B2_LP, B2_CNT, B2_CNTD, B3_LP, B3_CNT, B3_CNTD, B4_LP, B4_CNT, B4_CNTD, B5_LP, B5_CNT, B5_CNTD, B6_LP, B6_CNT, B6_CNTD
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation (Q9): Apply the pattern of merging multiple scalar subqueries into one CTE with CASE inside aggregates. Ignore the dimension joins — this query has no joins.
+- channel_bitmap_aggregation (Q88): Apply the consolidation of repeated fact scans into a single scan with conditional aggregation. Ignore the bitmap labeling — we use CASE directly.
+HAZARD_FLAGS:
+- Complex CASE expressions may increase CPU overhead per row, but I/O reduction should dominate.
+- COUNT(DISTINCT) with CASE may be more expensive than separate scans, but still one pass.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: channel_bitmap_aggregation_with_pivot
+TARGET_LOGICAL_TREE:
+  store_sales_scan -> bucket_assignment -> bucket_aggregation -> pivot
+NODE_CONTRACTS:
+  store_sales_scan:
+    FROM: store_sales
+    WHERE: ss_quantity BETWEEN 0 AND 30
+    OUTPUT: ss_quantity, ss_list_price, ss_coupon_amt, ss_wholesale_cost
+    EXPECTED_ROWS: ~8.4M
+    CONSUMERS: bucket_assignment
+  bucket_assignment:
+    FROM: store_sales_scan
+    WHERE: (ss_quantity BETWEEN 0 AND 5 AND (ss_list_price BETWEEN 131 AND 141 OR ss_coupon_amt BETWEEN 16798 AND 17798 OR ss_wholesale_cost BETWEEN 25 AND 45))
+           OR (ss_quantity BETWEEN 6 AND 10 AND (ss_list_price BETWEEN 145 AND 155 OR ss_coupon_amt BETWEEN 14792 AND 15792 OR ss_wholesale_cost BETWEEN 46 AND 66))
+           OR ... (all six bucket conditions combined with OR)
+    OUTPUT: 
+      bucket_id = CASE 
+        WHEN ss_quantity BETWEEN 0 AND 5 THEN 1
+        WHEN ss_quantity BETWEEN 6 AND 10 THEN 2
+        WHEN ss_quantity BETWEEN 11 AND 15 THEN 3
+        WHEN ss_quantity BETWEEN 16 AND 20 THEN 4
+        WHEN ss_quantity BETWEEN 21 AND 25 THEN 5
+        WHEN ss_quantity BETWEEN 26 AND 30 THEN 6
+      END,
+      ss_list_price
+    EXPECTED_ROWS: ~2.0M (sum of filtered rows across buckets)
+    CONSUMERS: bucket_aggregation
+  bucket_aggregation:
+    FROM: bucket_assignment
+    GROUP BY: bucket_id
+    AGGREGATE: 
+      avg_price = AVG(ss_list_price),
+      cnt = COUNT(ss_list_price),
+      cntd = COUNT(DISTINCT ss_list_price)
+    OUTPUT: bucket_id, avg_price, cnt, cntd
+    EXPECTED_ROWS: 6 (one per bucket)
+    CONSUMERS: pivot
+  pivot:
+    FROM: bucket_aggregation
+    AGGREGATE: 
+      B1_LP = MAX(CASE WHEN bucket_id=1 THEN avg_price END),
+      B1_CNT = MAX(CASE WHEN bucket_id=1 THEN cnt END),
+      B1_CNTD = MAX(CASE WHEN bucket_id=1 THEN cntd END),
+      ... similarly for buckets 2-6
+    OUTPUT: B1_LP, B1_CNT, B1_CNTD, ..., B6_LP, B6_CNT, B6_CNTD
+    EXPECTED_ROWS: 1
+    CONSUMERS: final output
+EXAMPLES: channel_bitmap_aggregation, single_pass_aggregation
+EXAMPLE_ADAPTATION:
+- channel_bitmap_aggregation (Q88): Apply the labeling of rows into buckets and grouping by bucket. Ignore the bitmap index usage — we use a simple CASE.
+- single_pass_aggregation (Q9): The pivot step is similar to using MAX(CASE) to convert rows to columns. Ignore the single-pass aggregation without grouping — we group first.
+HAZARD_FLAGS:
+- The combined WHERE clause in bucket_assignment is large and may be less efficient than per-bucket filtering in the scan.
+- Grouping by bucket_id may add overhead but reduces rows before pivot.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: or_to_union_per_bucket
+TARGET_LOGICAL_TREE:
+  For each bucket: union three column-specific scans -> deduplicate per bucket -> aggregate per bucket -> combine buckets
+NODE_CONTRACTS:
+  We'll design for one bucket (B1) as template; repeat for six buckets and cross-join.
+  B1_union:
+    FROM: (
+      SELECT ss_list_price FROM store_sales WHERE ss_quantity BETWEEN 0 AND 5 AND ss_list_price BETWEEN 131 AND 141
+      UNION ALL
+      SELECT ss_list_price FROM store_sales WHERE ss_quantity BETWEEN 0 AND 5 AND ss_coupon_amt BETWEEN 16798 AND 17798
+      UNION ALL
+      SELECT ss_list_price FROM store_sales WHERE ss_quantity BETWEEN 0 AND 5 AND ss_wholesale_cost BETWEEN 25 AND 45
+    )
+    OUTPUT: ss_list_price
+    EXPECTED_ROWS: ~3x original filtered rows (but duplicates possible)
+    CONSUMERS: B1_dedup
+  B1_dedup:
+    FROM: B1_union
+    GROUP BY: ss_list_price   -- deduplicate because a row may satisfy multiple conditions
+    OUTPUT: ss_list_price
+    EXPECTED_ROWS: <= original filtered rows (~323K)
+    CONSUMERS: B1_aggregate
+  B1_aggregate:
+    FROM: B1_dedup
+    AGGREGATE: 
+      B1_LP = AVG(ss_list_price),
+      B1_CNT = COUNT(ss_list_price),
+      B1_CNTD = COUNT(DISTINCT ss_list_price)  -- same as COUNT because already distinct
+    OUTPUT: B1_LP, B1_CNT, B1_CNTD
+    EXPECTED_ROWS: 1
+    CONSUMERS: final cross-join
+  Similarly define B2_union, B2_dedup, B2_aggregate ... B6_union, B6_dedup, B6_aggregate.
+  final cross-join: Cross-join the six aggregate results.
+EXAMPLES: or_to_union
+EXAMPLE_ADAPTATION:
+- or_to_union (Q15): Apply splitting OR on different columns into UNION ALL branches. Ignore the fact that Q15 had no deduplication requirement — here we must deduplicate because a row could appear in multiple branches.
+HAZARD_FLAGS:
+- This approach triples the number of scans per bucket (18 scans total) and may be slower than original.
+- Deduplication via GROUP BY adds overhead.
+- May violate the "max 3 UNION branches" guard because we have 3 branches per bucket, 18 total across buckets.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: materialize_filtered_cte
+TARGET_LOGICAL_TREE:
+  filtered_sales CTE -> six subqueries scanning CTE -> cross-join
+NODE_CONTRACTS:
+  filtered_sales:
+    FROM: store_sales
+    WHERE: ss_quantity BETWEEN 0 AND 30
+    OUTPUT: ss_quantity, ss_list_price, ss_coupon_amt, ss_wholesale_cost
+    EXPECTED_ROWS: ~8.4M
+    CONSUMERS: B1_subquery, B2_subquery, ..., B6_subquery
+  B1_subquery:
+    FROM: filtered_sales
+    WHERE: ss_quantity BETWEEN 0 AND 5 AND (ss_list_price BETWEEN 131 AND 141 OR ss_coupon_amt BETWEEN 16798 AND 17798 OR ss_wholesale_cost BETWEEN 25 AND 45)
+    AGGREGATE: 
+      B1_LP = AVG(ss_list_price),
+      B1_CNT = COUNT(ss_list_price),
+      B1_CNTD = COUNT(DISTINCT ss_list_price)
+    OUTPUT: B1_LP, B1_CNT, B1_CNTD
+    EXPECTED_ROWS: 1
+    CONSUMERS: final cross-join
+  ... similarly for B2 to B6 with their respective filters.
+  final cross-join: Cross-join B1_subquery, B2_subquery, ..., B6_subquery.
+EXAMPLES: materialize_cte
+EXAMPLE_ADAPTATION:
+- materialize_cte (Q95): Apply the pattern of extracting a repeated subquery pattern into a CTE. Ignore the EXISTS logic — here we have simple scans.
+HAZARD_FLAGS:
+- The CTE may be scanned six times, reading ~8.4M rows each time, total ~50.4M rows, which could be slower than original.
+- DuckDB may inline the CTE (single reference) but here it's referenced six times, so it might materialize. Materialization could help if the CTE is much smaller than base table, but here it's the same as the union of original scans.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: constraint_relaxation (testing if materializing a filtered CTE referenced multiple times can be beneficial despite the regression warning about unfiltered CTEs; here the CTE has a WHERE clause).

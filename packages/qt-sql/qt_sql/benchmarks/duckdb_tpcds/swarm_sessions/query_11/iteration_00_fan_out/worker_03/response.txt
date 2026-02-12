@@ -1,0 +1,101 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] filtered_dates  [+]
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year IN (2001, 2002))
+│   └── OUTPUT (d_date_sk, d_year)
+├── [CTE] store_sales_prejoin  [+]
+│   ├── SCAN (store_sales)
+│   ├── JOIN (filtered_dates ON ss_sold_date_sk = d_date_sk)
+│   └── OUTPUT (ss_customer_sk, d_year, amount)
+├── [CTE] web_sales_prejoin  [+]
+│   ├── SCAN (web_sales)
+│   ├── JOIN (filtered_dates ON ws_sold_date_sk = d_date_sk)
+│   └── OUTPUT (ws_bill_customer_sk, d_year, amount)
+├── [CTE] store_aggregates  [+]
+│   ├── SCAN (customer)
+│   ├── JOIN (store_sales_prejoin ON c_customer_sk = ss_customer_sk)
+│   ├── AGG (GROUP BY c_customer_id, c_first_name, c_last_name, c_birth_country, d_year)
+│   └── OUTPUT (customer_id, customer_first_name, customer_last_name, customer_birth_country, dyear, year_total, sale_type)
+├── [CTE] web_aggregates  [+]
+│   ├── SCAN (customer)
+│   ├── JOIN (web_sales_prejoin ON c_customer_sk = ws_bill_customer_sk)
+│   ├── AGG (GROUP BY c_customer_id, c_first_name, c_last_name, c_birth_country, d_year)
+│   └── OUTPUT (customer_id, customer_first_name, customer_last_name, customer_birth_country, dyear, year_total, sale_type)
+├── [- CTE] year_total  [-]  -- Removed completely
+└── [~ MAIN] main_query  [~]
+    ├── SCAN (store_aggregates AS s2001, store_aggregates AS s2002, web_aggregates AS w2001, web_aggregates AS w2002)
+    ├── JOIN (s2001.customer_id = s2002.customer_id AND s2001.customer_id = w2001.customer_id AND s2001.customer_id = w2002.customer_id)
+    ├── FILTER (s2001.dyear = 2001 AND s2002.dyear = 2002 AND w2001.dyear = 2001 AND w2002.dyear = 2002)
+    ├── FILTER (s2001.year_total > 0 AND w2001.year_total > 0)
+    ├── FILTER (CASE WHEN w2001.year_total > 0 THEN w2002.year_total / w2001.year_total ELSE 0.0 END > CASE WHEN s2001.year_total > 0 THEN s2002.year_total / s2001.year_total ELSE 0.0 END)
+    ├── SORT (s2002.customer_id, s2002.customer_first_name, s2002.customer_last_name, s2002.customer_birth_country)
+    └── OUTPUT (customer_id, customer_first_name, customer_last_name, customer_birth_country)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "union_cte_split", "description": "Replace monolithic UNION CTE with specialized per-channel CTEs", "applied_to": ["year_total"]},
+    {"id": "R2", "type": "prefetch_fact_join", "description": "Filter date_dim first, then pre-join with fact tables", "applied_to": ["filtered_dates", "store_sales_prejoin", "web_sales_prejoin"]},
+    {"id": "R3", "type": "early_filter", "description": "Push d_year filter to earliest possible scan", "applied_to": ["filtered_dates"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_year FROM date_dim WHERE d_year IN (2001, 2002)",
+        "interfaces": {"outputs": ["d_date_sk", "d_year"], "consumes": []}
+      },
+      "store_sales_prejoin": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ss.ss_customer_sk, fd.d_year, (ss.ss_ext_list_price - ss.ss_ext_discount_amt) AS amount FROM store_sales ss INNER JOIN filtered_dates fd ON ss.ss_sold_date_sk = fd.d_date_sk",
+        "interfaces": {"outputs": ["ss_customer_sk", "d_year", "amount"], "consumes": ["filtered_dates"]}
+      },
+      "web_sales_prejoin": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws.ws_bill_customer_sk, fd.d_year, (ws.ws_ext_list_price - ws.ws_ext_discount_amt) AS amount FROM web_sales ws INNER JOIN filtered_dates fd ON ws.ws_sold_date_sk = fd.d_date_sk",
+        "interfaces": {"outputs": ["ws_bill_customer_sk", "d_year", "amount"], "consumes": ["filtered_dates"]}
+      },
+      "store_aggregates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, ssp.d_year AS dyear, SUM(ssp.amount) AS year_total, 's' AS sale_type FROM customer c INNER JOIN store_sales_prejoin ssp ON c.c_customer_sk = ssp.ss_customer_sk GROUP BY c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country, ssp.d_year",
+        "interfaces": {"outputs": ["customer_id", "customer_first_name", "customer_last_name", "customer_birth_country", "dyear", "year_total", "sale_type"], "consumes": ["store_sales_prejoin"]}
+      },
+      "web_aggregates": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT c.c_customer_id AS customer_id, c.c_first_name AS customer_first_name, c.c_last_name AS customer_last_name, c.c_birth_country AS customer_birth_country, wsp.d_year AS dyear, SUM(wsp.amount) AS year_total, 'w' AS sale_type FROM customer c INNER JOIN web_sales_prejoin wsp ON c.c_customer_sk = wsp.ws_bill_customer_sk GROUP BY c.c_customer_id, c.c_first_name, c.c_last_name, c.c_birth_country, wsp.d_year",
+        "interfaces": {"outputs": ["customer_id", "customer_first_name", "customer_last_name", "customer_birth_country", "dyear", "year_total", "sale_type"], "consumes": ["web_sales_prejoin"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s2002.customer_id, s2002.customer_first_name, s2002.customer_last_name, s2002.customer_birth_country FROM store_aggregates s2001, store_aggregates s2002, web_aggregates w2001, web_aggregates w2002 WHERE s2001.customer_id = s2002.customer_id AND s2001.customer_id = w2001.customer_id AND s2001.customer_id = w2002.customer_id AND s2001.dyear = 2001 AND s2002.dyear = 2002 AND w2001.dyear = 2001 AND w2002.dyear = 2002 AND s2001.year_total > 0 AND w2001.year_total > 0 AND (CASE WHEN w2001.year_total > 0 THEN w2002.year_total / w2001.year_total ELSE 0.0 END) > (CASE WHEN s2001.year_total > 0 THEN s2002.year_total / s2001.year_total ELSE 0.0 END) ORDER BY s2002.customer_id, s2002.customer_first_name, s2002.customer_last_name, s2002.customer_birth_country LIMIT 100",
+        "interfaces": {"outputs": ["customer_id", "customer_first_name", "customer_last_name", "customer_birth_country"], "consumes": ["store_aggregates", "web_aggregates"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "store_sales_prejoin", "web_sales_prejoin", "store_aggregates", "web_aggregates", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), store_sales_prejoin AS ({store_sales_prejoin}), web_sales_prejoin AS ({web_sales_prejoin}), store_aggregates AS ({store_aggregates}), web_aggregates AS ({web_aggregates}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Replaced monolithic UNION CTE with staged join pipeline - filter dates first, pre-join to fact tables separately, then aggregate by channel. This enables predicate pushdown to date_dim scan and eliminates redundant fact table scans.
+
+Expected speedup: 2.5-3.5x (eliminates 4 full scans of UNION CTE, enables early filtering)

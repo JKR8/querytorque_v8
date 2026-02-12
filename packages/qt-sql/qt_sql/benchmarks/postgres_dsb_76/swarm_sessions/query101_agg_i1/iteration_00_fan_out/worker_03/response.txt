@@ -1,0 +1,80 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query [!] Cost: 100% Rows: ~0
+    ├── [~] WITH CTEs: fact_core, aggregation_core, late_dim_join
+    │   ├── [!] fact_core: SCAN store_sales, store_returns, web_sales, date_dim d1, date_dim d2, item
+    │   │   ├── JOIN (ss_ticket_number = sr_ticket_number)
+    │   │   ├── JOIN (ss_item_sk = sr_item_sk)
+    │   │   ├── JOIN (ss_customer_sk = ws_bill_customer_sk)
+    │   │   ├── JOIN (ss_item_sk = ws_item_sk)
+    │   │   ├── JOIN (sr_returned_date_sk = d1.d_date_sk)
+    │   │   ├── JOIN (ws_sold_date_sk = d2.d_date_sk)
+    │   │   ├── JOIN (i_item_sk = ss_item_sk)
+    │   │   ├── FILTER (i_category IN ('Children','Electronics','Music'))
+    │   │   ├── FILTER (d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '90 DAY'))
+    │   │   ├── FILTER (d1.d_year = 1998)
+    │   │   └── FILTER (ss_sales_price/ss_list_price BETWEEN 35*0.01 AND 55*0.01)
+    │   ├── [!] aggregation_core: FROM fact_core GROUP BY ss_customer_sk COUNT(*) as cnt
+    │   └── [!] late_dim_join: JOIN aggregation_core→customer→customer_address→household_demographics
+    │       ├── FILTER (ca_state IN ('AR','CO','NC','NY','TX'))
+    │       ├── FILTER (hd_income_band_sk BETWEEN 7 AND 13)
+    │       └── FILTER (hd_buy_potential = '0-500')
+    └── [!] final_sort: ORDER BY cnt
+        └── OUTPUT (c_customer_sk, c_first_name, c_last_name, cnt)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "cte_decomposition", "description": "Decompose original flat query into CTEs matching target logical tree", "applied_to": ["fact_core", "aggregation_core", "late_dim_join"]},
+    {"id": "R2", "type": "late_dimension_binding", "description": "Move customer, customer_address, household_demographics joins after aggregation", "applied_to": ["late_dim_join"]},
+    {"id": "R3", "type": "group_by_simplification", "description": "Change GROUP BY c_customer_sk,c_first_name,c_last_name to GROUP BY ss_customer_sk with late join for names", "applied_to": ["aggregation_core"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "fact_core": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_customer_sk FROM store_sales INNER JOIN store_returns ON ss_ticket_number = sr_ticket_number AND ss_item_sk = sr_item_sk INNER JOIN web_sales ON ss_customer_sk = ws_bill_customer_sk AND ss_item_sk = ws_item_sk INNER JOIN date_dim d1 ON sr_returned_date_sk = d1.d_date_sk INNER JOIN date_dim d2 ON ws_sold_date_sk = d2.d_date_sk INNER JOIN item ON i_item_sk = ss_item_sk WHERE i_category IN ('Children', 'Electronics', 'Music') AND d2.d_date BETWEEN d1.d_date AND (d1.d_date + INTERVAL '90 DAY') AND d1.d_year = 1998 AND ss_sales_price / ss_list_price BETWEEN 35 * 0.01 AND 55 * 0.01",
+        "interfaces": {"outputs": ["ss_customer_sk"], "consumes": []}
+      },
+      "aggregation_core": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_customer_sk, COUNT(*) AS cnt FROM fact_core GROUP BY ss_customer_sk",
+        "interfaces": {"outputs": ["ss_customer_sk", "cnt"], "consumes": ["fact_core"]}
+      },
+      "late_dim_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT c_customer_sk, c_first_name, c_last_name, cnt FROM aggregation_core INNER JOIN customer ON ss_customer_sk = c_customer_sk INNER JOIN customer_address ON c_current_addr_sk = ca_address_sk INNER JOIN household_demographics ON c_current_hdemo_sk = hd_demo_sk WHERE ca_state IN ('AR', 'CO', 'NC', 'NY', 'TX') AND hd_income_band_sk BETWEEN 7 AND 13 AND hd_buy_potential = '0-500'",
+        "interfaces": {"outputs": ["c_customer_sk", "c_first_name", "c_last_name", "cnt"], "consumes": ["aggregation_core"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_sk, c_first_name, c_last_name, cnt FROM late_dim_join ORDER BY cnt",
+        "interfaces": {"outputs": ["c_customer_sk", "c_first_name", "c_last_name", "cnt"], "consumes": ["late_dim_join"]}
+      }
+    },
+    "reconstruction_order": ["fact_core", "aggregation_core", "late_dim_join", "main_query"],
+    "assembly_template": "WITH fact_core AS ( {fact_core} ), aggregation_core AS ( {aggregation_core} ), late_dim_join AS ( {late_dim_join} ) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Decomposed original query into 3 CTEs following target logical tree, moving customer dimension joins after aggregation while preserving all semantic filters and division guards.
+
+**Expected speedup**: Neutral to slight improvement due to reduced aggregation size before selective dimension filters (customer state/income) and preserved parallel scan opportunities on fact tables.

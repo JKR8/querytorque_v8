@@ -1,0 +1,80 @@
+### Part 1: Modified Logic Tree
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~3  — Restructured into explicit CTE chain matching TARGET_LOGICAL_TREE.
+    ├── CTE filtered_item  [+]
+    │   ├── SCAN item
+    │   └── FILTER (i_current_price BETWEEN 45 AND 75 AND i_manufact_id IN (856,707,1000,747))
+    ├── CTE filtered_inventory_date  [+]
+    │   ├── SCAN inventory
+    │   ├── JOIN (INNER JOIN filtered_item ON inv_item_sk = i_item_sk)
+    │   ├── JOIN (INNER JOIN date_dim ON inv_date_sk = d_date_sk)
+    │   └── FILTER (inv_quantity_on_hand BETWEEN 100 AND 500 AND d_date BETWEEN CAST('1999-02-21' AS DATE) AND (CAST('1999-02-21' AS DATE) + INTERVAL 60 DAY))
+    ├── CTE grouped_items  [+]
+    │   ├── SCAN filtered_inventory_date
+    │   └── AGG (GROUP BY i_item_sk, i_item_id, i_item_desc, i_current_price)
+    ├── CTE final_catalog_join  [+]
+    │   ├── SCAN grouped_items
+    │   ├── JOIN (INNER JOIN catalog_sales ON cs_item_sk = i_item_sk)
+    │   └── AGG (GROUP BY i_item_id, i_item_desc, i_current_price)
+    ├── SORT (i_item_id ASC)
+    └── OUTPUT (i_item_id, i_item_desc, i_current_price)
+```
+
+### Part 2: Component Payload JSON
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "deferred_join", "description": "Delay catalog_sales join until after filtering and grouping to reduce rows", "applied_to": ["grouped_items", "final_catalog_join"]},
+    {"id": "R2", "type": "predicate_pushdown", "description": "Push price/manufacturer filter into filtered_item CTE, push inventory/date filter into filtered_inventory_date CTE", "applied_to": ["filtered_item", "filtered_inventory_date"]},
+    {"id": "R3", "type": "deduplicate_early", "description": "Group by item_sk after inventory join to deduplicate multiple inventory dates before catalog_sales join", "applied_to": ["grouped_items"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_item_id, i_item_desc, i_current_price FROM item WHERE i_current_price BETWEEN 45 AND 75 AND i_manufact_id IN (856,707,1000,747)",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id", "i_item_desc", "i_current_price"], "consumes": []}
+      },
+      "filtered_inventory_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT f.i_item_sk, f.i_item_id, f.i_item_desc, f.i_current_price FROM inventory AS inv INNER JOIN filtered_item AS f ON inv.inv_item_sk = f.i_item_sk INNER JOIN date_dim AS d ON inv.inv_date_sk = d.d_date_sk WHERE inv.inv_quantity_on_hand BETWEEN 100 AND 500 AND d.d_date BETWEEN CAST('1999-02-21' AS DATE) AND (CAST('1999-02-21' AS DATE) + INTERVAL 60 DAY)",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id", "i_item_desc", "i_current_price"], "consumes": ["filtered_item"]}
+      },
+      "grouped_items": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_item_id, i_item_desc, i_current_price FROM filtered_inventory_date GROUP BY i_item_sk, i_item_id, i_item_desc, i_current_price",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id", "i_item_desc", "i_current_price"], "consumes": ["filtered_inventory_date"]}
+      },
+      "final_catalog_join": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT g.i_item_id, g.i_item_desc, g.i_current_price FROM grouped_items AS g INNER JOIN catalog_sales AS cs ON cs.cs_item_sk = g.i_item_sk GROUP BY g.i_item_id, g.i_item_desc, g.i_current_price ORDER BY g.i_item_id LIMIT 100",
+        "interfaces": {"outputs": ["i_item_id", "i_item_desc", "i_current_price"], "consumes": ["grouped_items"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_id, i_item_desc, i_current_price FROM final_catalog_join",
+        "interfaces": {"outputs": ["i_item_id", "i_item_desc", "i_current_price"], "consumes": ["final_catalog_join"]}
+      }
+    },
+    "reconstruction_order": ["filtered_item", "filtered_inventory_date", "grouped_items", "final_catalog_join", "main_query"],
+    "assembly_template": "WITH filtered_item AS ({filtered_item}), filtered_inventory_date AS ({filtered_inventory_date}), grouped_items AS ({grouped_items}), final_catalog_join AS ({final_catalog_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Restructured original flat join into a CTE pipeline that filters items first, joins inventory/date with filters, deduplicates inventory rows, then finally joins catalog_sales. This follows the late_attribute_binding principle—delaying the large catalog_sales join until the dataset is reduced.
+
+Expected speedup: ~1.3-1.5x due to reduced rows before catalog_sales join and predicate pushdown into early scans.

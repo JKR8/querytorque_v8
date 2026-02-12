@@ -1,0 +1,109 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] date_cte  [+]  Cost: 0%  Rows: 365  — Extract date dimension keys for the 12-month sequence.
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_month_seq BETWEEN 1216 AND 1216+11)
+│   └── OUTPUT (d_date_sk, d_date)
+├── [CTE] web_cumulative  [~]  Cost: 33%  Rows: 1.4M  — Changed: Join with date_cte instead of date_dim directly. Keep window function.
+│   ├── SCAN (web_sales, date_cte (join))
+│   ├── JOIN (ws_sold_date_sk = d_date_sk)
+│   ├── FILTER (NOT ws_item_sk IS NULL)
+│   ├── AGG (GROUP BY ws_item_sk, d_date)
+│   ├── WINDOW (SUM(SUM(ws_sales_price)) OVER...)
+│   └── OUTPUT (item_sk, d_date, cume_sales)
+├── [CTE] store_cumulative  [~]  Cost: 33%  Rows: 4.6M  — Changed: Join with date_cte instead of date_dim directly. Keep window function.
+│   ├── SCAN (store_sales, date_cte (join))
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── FILTER (NOT ss_item_sk IS NULL)
+│   ├── AGG (GROUP BY ss_item_sk, d_date)
+│   ├── WINDOW (SUM(SUM(ss_sales_price)) OVER...)
+│   └── OUTPUT (item_sk, d_date, cume_sales)
+├── [CTE] full_outer_join  [=]  Cost: 11%  Rows: 5.5M  — FULL OUTER JOIN of web_cumulative and store_cumulative.
+│   ├── SCAN (web_cumulative, store_cumulative (join))
+│   ├── JOIN (FULL OUTER JOIN on item_sk AND d_date)
+│   └── OUTPUT (item_sk, d_date, web_sales, store_sales)
+├── [CTE] main_window  [=]  Cost: 11%  Rows: 5.5M  — Carry-forward cumulative maxima via MAX OVER.
+│   ├── SCAN (full_outer_join)
+│   ├── WINDOW (MAX(web_sales) OVER..., MAX(store_sales) OVER...)
+│   └── OUTPUT (item_sk, d_date, web_sales, store_sales, web_cumulative, store_cumulative)
+└── [MAIN] final_filter  [=]  Cost: 12%  Rows: 100  — Filter where web_cumulative > store_cumulative, order and limit.
+    ├── SCAN (main_window)
+    ├── FILTER (web_cumulative > store_cumulative)
+    ├── SORT (item_sk ASC, d_date ASC)
+    ├── LIMIT (100)
+    └── OUTPUT (*)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb_v1.4.3",
+  "rewrite_rules": [
+    {"id": "R1", "type": "shared_dimension_extraction", "description": "Extract date_dim filter into reusable date_cte to avoid redundant scans", "applied_to": ["date_cte"]},
+    {"id": "R2", "type": "cte_materialization", "description": "Maintain web_cumulative and store_cumulative CTEs with window functions as in original", "applied_to": ["web_cumulative", "store_cumulative"]},
+    {"id": "R3", "type": "semantic_preservation", "description": "Preserve FULL OUTER JOIN and carry-forward window logic exactly", "applied_to": ["full_outer_join", "main_window"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1216 AND 1216+11",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "web_cumulative": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws_item_sk AS item_sk, d_date, SUM(SUM(ws_sales_price)) OVER (PARTITION BY ws_item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cume_sales FROM web_sales INNER JOIN date_cte ON ws_sold_date_sk = d_date_sk WHERE ws_item_sk IS NOT NULL GROUP BY ws_item_sk, d_date",
+        "interfaces": {"outputs": ["item_sk", "d_date", "cume_sales"], "consumes": ["date_cte"]}
+      },
+      "store_cumulative": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ss_item_sk AS item_sk, d_date, SUM(SUM(ss_sales_price)) OVER (PARTITION BY ss_item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cume_sales FROM store_sales INNER JOIN date_cte ON ss_sold_date_sk = d_date_sk WHERE ss_item_sk IS NOT NULL GROUP BY ss_item_sk, d_date",
+        "interfaces": {"outputs": ["item_sk", "d_date", "cume_sales"], "consumes": ["date_cte"]}
+      },
+      "full_outer_join": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["item_sk", "d_date", "web_sales", "store_sales"], "consumes": ["web_cumulative", "store_cumulative"]}
+      },
+      "main_window": {
+        "type": "cte",
+        "change": "unchanged",
+        "sql": "",
+        "interfaces": {"outputs": ["item_sk", "d_date", "web_sales", "store_sales", "web_cumulative", "store_cumulative"], "consumes": ["full_outer_join"]}
+      },
+      "final_filter": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT item_sk, d_date, web_sales, store_sales, web_cumulative, store_cumulative FROM main_window WHERE web_cumulative > store_cumulative ORDER BY item_sk, d_date LIMIT 100",
+        "interfaces": {"outputs": ["item_sk", "d_date", "web_sales", "store_sales", "web_cumulative", "store_cumulative"], "consumes": ["main_window"]}
+      }
+    },
+    "reconstruction_order": ["date_cte", "web_cumulative", "store_cumulative", "full_outer_join", "main_window", "final_filter"],
+    "assembly_template": "WITH date_cte AS ({date_cte}), web_cumulative AS ({web_cumulative}), store_cumulative AS ({store_cumulative}), full_outer_join AS (SELECT COALESCE(web_cumulative.item_sk, store_cumulative.item_sk) AS item_sk, COALESCE(web_cumulative.d_date, store_cumulative.d_date) AS d_date, web_cumulative.cume_sales AS web_sales, store_cumulative.cume_sales AS store_sales FROM web_cumulative FULL OUTER JOIN store_cumulative ON web_cumulative.item_sk = store_cumulative.item_sk AND web_cumulative.d_date = store_cumulative.d_date), main_window AS (SELECT item_sk, d_date, web_sales, store_sales, MAX(web_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS web_cumulative, MAX(store_sales) OVER (PARTITION BY item_sk ORDER BY d_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS store_cumulative FROM full_outer_join) {final_filter}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": [
+    "date_cte outputs d_date_sk and d_date",
+    "web_cumulative outputs item_sk, d_date, cume_sales",
+    "store_cumulative outputs item_sk, d_date, cume_sales",
+    "full_outer_join outputs item_sk, d_date, web_sales, store_sales",
+    "main_window outputs item_sk, d_date, web_sales, store_sales, web_cumulative, store_cumulative",
+    "final_filter outputs exactly item_sk, d_date, web_sales, store_sales, web_cumulative, store_cumulative"
+  ]
+}
+```
+
+**Changes:** Extracted shared date filter into a reusable `date_cte` (single scan) while preserving all original window logic and join semantics. Maintained defensive `ws_item_sk IS NOT NULL`/`ss_item_sk IS NOT NULL` filters.
+
+**Expected speedup:** ~1.3x from eliminating redundant date_dim scans while keeping window computation before join (as required by contract).

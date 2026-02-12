@@ -1,0 +1,263 @@
+<reasoning>
+1. **CLASSIFY**: This is a "self-join with window aggregation" archetype. The query computes monthly aggregates, then self-joins to get adjacent months, and finally filters for outliers. Key structural features:
+   - Single fact table (catalog_sales) joined to 3 dimension tables (item, date_dim, call_center).
+   - Window functions (AVG over partition, RANK) computed on aggregated data.
+   - CTE v1 is referenced 3 times (v1, v1_lag, v1_lead) in a self-join pattern.
+   - Final filter on d_year=1999 and deviation threshold.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Total time: 1467ms.
+   - Most expensive node: HASH_GROUP_BY (650.4ms, 44% exclusive). This is the aggregation in v1 that processes 3.5M rows from catalog_sales and reduces to 148K rows.
+   - Second expensive: Two WINDOW nodes (130.7ms + 147.2ms = 277.9ms, ~19%) for AVG and RANK.
+   - Third: Self-join HASH_JOINs in v2 (64.3ms + 50.6ms = 114.9ms, ~8%).
+   - Row count flow: 
+     - catalog_sales scan: 3.5M rows (2% of table)
+     - After date_dim filter: 3.5M rows (date filter applied via join, not scan)
+     - After group by: 148K rows
+     - v2 self-join: 122K rows → filtered to 112K → top 100.
+   - The optimizer already pushes date filter into date_dim scan (range on d_date_sk). It also materializes v1 CTE (referenced 3 times) and probes it multiple times.
+   - Scans per base table: Each base table scanned once. catalog_sales scanned once (in v1). No repeated fact scans.
+   - CTE materialization: v1 is materialized (CTE_SCAN nodes) and referenced 3 times in v2.
+
+3. **GAP MATCHING**:
+   - **CROSS_CTE_PREDICATE_BLINDNESS**: The predicate `d_year = 1999` is applied in the main query AFTER v2 is computed. It's not pushed into v1. v1 includes data for 1998-12, 1999, 2000-01, but the main query only needs 1999. This is a classic predicate-not-pushed-into-CTE gap.
+   - **REDUNDANT_SCAN_ELIMINATION**: No repeated fact scans, but v1 is materialized and then self-joined 3 ways. The self-join could be eliminated by using LAG/LEAD window functions (SELF_JOIN_TO_WINDOW pattern).
+   - **WINDOW OPTIMIZATION**: Two separate window computations (AVG and RANK) with different partitions. Could they be combined or deferred? The RANK is used only for self-join adjacency; could be replaced with LAG/LEAD.
+   - **SELF_JOIN_ELIMINATION**: The v2 self-join on rank adjacency is a prime candidate for LAG/LEAD.
+   - **CORRELATED_SUBQUERY_PARALYSIS**: Not present.
+   - **CROSS_COLUMN_OR_DECOMPOSITION**: The date filter OR spans same table (date_dim) but different columns (d_year and d_moy). However, the optimizer already pushes it as a single scan with a complex filter. Not a candidate for OR-to-UNION.
+
+4. **AGGREGATION TRAP CHECK**:
+   - The query uses `AVG(SUM(cs_sales_price)) OVER (PARTITION BY ...)`. The inner SUM is over the monthly grouping, the outer AVG is over months within a year. This is grouping-sensitive: changing which months participate in the average changes the result. However, if we pre-filter to only 1999 data, the average would be computed only over 1999 months (12 months) instead of potentially 3 months (Dec-1998, 1999, Jan-2000). But the business intent is to detect deviations within 1999, using the 1999 average. The original query computes the average over the same year partition, but includes Dec-1998 and Jan-2000 data in the partition? No: the partition includes d_year, so Dec-1998 is in partition with d_year=1998, Jan-2000 in partition with d_year=2000. So pre-filtering to 1999 would not change the average for 1999 rows, but would remove the 1998 and 2000 rows from v1 entirely, which is safe because the main query only uses 1999 rows. However, the self-join needs adjacent months (Dec-1998 and Jan-2000) for 1999 rows? Yes, to compute psum and nsum for 1999 months, we need the adjacent months. So we must keep Dec-1998 and Jan-2000 in v1 for the self-join, but we can filter v1 to only those three months (as the original does). That's already done.
+
+5. **TRANSFORM SELECTION** (ranked by potential):
+   a. **SELF_JOIN_ELIMINATION**: Replace v2 self-join with LAG/LEAD in v1. Eliminates two hash joins (114.9ms). High impact, low risk.
+   b. **PREDICATE_PUSHDOWN**: Push `d_year = 1999` into v1 definition? But v1 needs adjacent months for self-join. However, we can create a specialized v1 for 1999 only and compute psum/nsum via LAG/LEAD that cross year boundaries? Actually, LAG/LEAD with partition by category/brand/cc_name and order by d_year,d_moy will work across years. So we can filter v1 to only 1999 data, and still get Dec-1998 as LAG? No, because Dec-1998 won't be in the partition. So we must keep the three months. But we can create a v1 that is filtered to the three months (as original), then push the `d_year=1999` filter into the main query? It's already there. Alternative: create a v1 that computes everything, then a filtered version for 1999? This is similar to union_cte_split: v1 generic, then filter later. But we can split v1 into two CTEs: one for 1999, one for adjacent months? Complex.
+   c. **STAR_JOIN_PREFETCH**: Pre-filter dimension tables (date_dim, item, call_center) into CTEs before joining with catalog_sales. This could reduce the hash join probe sizes. The date_dim CTE would be tiny (427 rows). item and call_center are small (102K and 24 rows). Could speed up the initial join.
+   d. **WINDOW_OPTIMIZATION**: Combine AVG and RANK windows? Not possible due to different partitions. But we could compute the yearly average via a separate group-by and join, eliminating the AVG window. The RANK window could be replaced by LAG/LEAD ordering.
+   e. **SINGLE_PASS_AGGREGATION**: Not applicable (no repeated scans).
+
+6. **LOGICAL TREE DESIGN**:
+   - Worker 1: Self-join elimination via LAG/LEAD.
+   - Worker 2: Star-join prefetch: pre-filter dimensions into CTEs, then join with fact.
+   - Worker 3: Yearly average via group-by (separate from monthly aggregation) + self-join elimination.
+   - Worker 4 (Exploration): Combine dimension pre-filtering, yearly average via group-by, and self-join elimination (compound strategy).
+
+Check column completeness: v1 outputs [i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn]. v2 uses all except i_category, cc_name? Actually v2 selects i_brand, d_year, avg_monthly_sales, sum_sales, psum, nsum. But the join conditions use i_category, i_brand, cc_name. So v1 must output i_category and cc_name for the self-join, even if v2 doesn't select them. Similarly, v2 outputs i_brand, d_year, avg_monthly_sales, sum_sales, psum, nsum. The main query uses all these columns.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Detect 1999 monthly catalog-sales outliers by brand/category/call-center where monthly sales deviate >10% from that year's average monthly sales, using adjacent-month context. All joins are INNER (intersection), requiring matching rows in all four tables. The AVG window is partition-sensitive: it must compute the average monthly sales per (category, brand, call_center, year) exactly as the original, including only months present in the filtered set (Dec-1998, 1999, Jan-2000). The self-join depends on consecutive months within the same (category, brand, call_center) series; missing months break adjacency. The final filter depends on d_year=1999 and avg_monthly_sales>0; rewriting must preserve these dependencies.
+
+BOTTLENECK_DIAGNOSIS:
+Aggregation-bound: HASH_GROUP_BY in v1 consumes 44% (650ms) of runtime, processing 3.5M fact rows to produce 148K monthly aggregates. Window computations (AVG and RANK) add 19% (278ms). Self-joins in v2 add 8% (115ms). The optimizer already pushes date filters into the date_dim scan and materializes the v1 CTE (since it's referenced 3 times). Logical-tree cost percentages are misleading: the group-by dominates, not the joins. Cardinality flow: 3.5M → 148K → 122K → 112K → 100 rows.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: The final SELECT * from v2 must output exactly i_brand, d_year, avg_monthly_sales, sum_sales, psum, nsum in that order.
+- CTE_COLUMN_COMPLETENESS: v1 must output i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn (and any additional columns needed for self-join or filtering).
+- LITERAL_PRESERVATION: All date literals (1999, 1998, 2000, 12, 1) must be copied exactly.
+- SEMANTIC_EQUIVALENCE: The result set must match exactly, including ordering and limit.
+- CROSS_CTE_PREDICATE_BLINDNESS: The predicate d_year=1999 is applied in main query, not pushed into v1. v1 includes unnecessary rows for 1998 and 2000 that are filtered out later.
+- SELF_JOIN_ELIMINATION: The v2 self-join on rank adjacency can be replaced with window functions (LAG/LEAD).
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Created filtered CTEs when baseline was already optimized (<100ms) and the optimizer already pushed date predicates effectively.
+   RULE: For this query (baseline 1467ms), date_cte_isolate is safe, but ensure the date CTE has a WHERE clause that actually reduces rows (already true: 427 rows).
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Pre-filtered and materialized fact tables when the query has 3+ fact table joins, preventing optimizer reordering.
+   RULE: This query has only one fact table (catalog_sales), so prefetch_fact_join is safe.
+3. union_cte_split (0.49x on Q74):
+   CAUSE: Kept both original UNION and specialized CTEs, causing redundant materialization.
+   RULE: When splitting, eliminate the original generic CTE.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: self_join_elimination
+TARGET_LOGICAL_TREE:
+  v1_lag_lead -> v2_simple -> main_query
+NODE_CONTRACTS:
+  v1_lag_lead:
+    FROM: item, catalog_sales, date_dim, call_center
+    JOIN: cs_item_sk = i_item_sk, cs_sold_date_sk = d_date_sk, cc_call_center_sk = cs_call_center_sk
+    WHERE: (d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1))
+    GROUP BY: i_category, i_brand, cc_name, d_year, d_moy
+    AGGREGATE: sum(cs_sales_price) AS sum_sales
+    WINDOW: 
+        avg_monthly_sales: AVG(sum(cs_sales_price)) OVER (PARTITION BY i_category, i_brand, cc_name, d_year)
+        prev_sum_sales: LAG(sum(cs_sales_price), 1) OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy)
+        next_sum_sales: LEAD(sum(cs_sales_price), 1) OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy)
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, prev_sum_sales, next_sum_sales
+    EXPECTED_ROWS: 148K
+    CONSUMERS: v2_simple
+  v2_simple:
+    FROM: v1_lag_lead
+    OUTPUT: i_brand, d_year, avg_monthly_sales, sum_sales, prev_sum_sales AS psum, next_sum_sales AS nsum
+    EXPECTED_ROWS: 148K
+    CONSUMERS: main_query
+  main_query:
+    FROM: v2_simple
+    WHERE: d_year = 1999 AND avg_monthly_sales > 0 AND CASE WHEN avg_monthly_sales > 0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE null END > 0.1
+    ORDER BY: sum_sales - avg_monthly_sales ASC, nsum ASC
+    LIMIT: 100
+EXAMPLES: SELF_JOIN_TO_WINDOW
+EXAMPLE_ADAPTATION:
+  Apply the self-join elimination pattern: replace the three-way self-join with LAG/LEAD window functions in v1. Ignore any decorrelation or UNION aspects — this query has no correlated subqueries.
+HAZARD_FLAGS:
+- If there are gaps in the month sequence for a (category, brand, cc_name) group, LAG/LEAD may not match the original rank-based adjacency. However, the date filter ensures at most three months (Dec-1998, 1999, Jan-2000) per group, so no gaps.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_cte, call_center_cte, item_cte -> filtered_fact -> v1 -> v2 -> main_query
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: (d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1))
+    OUTPUT: d_date_sk, d_year, d_moy
+    EXPECTED_ROWS: 427
+    CONSUMERS: filtered_fact
+  call_center_cte:
+    FROM: call_center
+    OUTPUT: cc_call_center_sk, cc_name
+    EXPECTED_ROWS: 24
+    CONSUMERS: filtered_fact
+  item_cte:
+    FROM: item
+    OUTPUT: i_item_sk, i_category, i_brand
+    EXPECTED_ROWS: 102K
+    CONSUMERS: filtered_fact
+  filtered_fact:
+    FROM: catalog_sales
+    JOIN: date_cte ON cs_sold_date_sk = d_date_sk
+    JOIN: call_center_cte ON cs_call_center_sk = cc_call_center_sk
+    JOIN: item_cte ON cs_item_sk = i_item_sk
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, cs_sales_price
+    EXPECTED_ROWS: 3.5M
+    CONSUMERS: v1
+  v1:
+    FROM: filtered_fact
+    GROUP BY: i_category, i_brand, cc_name, d_year, d_moy
+    AGGREGATE: sum(cs_sales_price) AS sum_sales
+    WINDOW: 
+        avg_monthly_sales: AVG(sum(cs_sales_price)) OVER (PARTITION BY i_category, i_brand, cc_name, d_year)
+        rn: RANK() OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy)
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn
+    EXPECTED_ROWS: 148K
+    CONSUMERS: v2
+  v2 and main_query: same as original.
+EXAMPLES: dimension_cte_isolate, prefetch_fact_join, multi_dimension_prefetch
+EXAMPLE_ADAPTATION:
+  Apply the dimension pre-filtering pattern: create CTEs for each dimension with their filters, then join with the fact table. Ignore the self-join elimination — keep the original v2 self-join. Ensure each dimension CTE has a WHERE clause (date_cte already does, call_center_cte and item_cte have no filters but are small; keep them unfiltered).
+HAZARD_FLAGS:
+- The item_cte is large (102K rows) and unfiltered; materializing it may add overhead. However, it's still smaller than the fact table.
+- The optimizer might already push these filters; the benefit may be marginal.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: yearly_avg_group_by
+TARGET_LOGICAL_TREE:
+  monthly_sales -> yearly_avg -> v1_combined -> v2 -> main_query
+NODE_CONTRACTS:
+  monthly_sales:
+    FROM: item, catalog_sales, date_dim, call_center
+    JOIN: cs_item_sk = i_item_sk, cs_sold_date_sk = d_date_sk, cc_call_center_sk = cs_call_center_sk
+    WHERE: (d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1))
+    GROUP BY: i_category, i_brand, cc_name, d_year, d_moy
+    AGGREGATE: sum(cs_sales_price) AS sum_sales
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, sum_sales
+    EXPECTED_ROWS: 148K
+    CONSUMERS: yearly_avg, v1_combined
+  yearly_avg:
+    FROM: monthly_sales
+    GROUP BY: i_category, i_brand, cc_name, d_year
+    AGGREGATE: avg(sum_sales) AS avg_monthly_sales
+    OUTPUT: i_category, i_brand, cc_name, d_year, avg_monthly_sales
+    EXPECTED_ROWS: ~50K (estimate)
+    CONSUMERS: v1_combined
+  v1_combined:
+    FROM: monthly_sales
+    JOIN: yearly_avg USING (i_category, i_brand, cc_name, d_year)
+    WINDOW: rn: RANK() OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy)
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, rn
+    EXPECTED_ROWS: 148K
+    CONSUMERS: v2
+  v2 and main_query: same as original.
+EXAMPLES: deferred_window_aggregation
+EXAMPLE_ADAPTATION:
+  Apply the deferred aggregation pattern: split the AVG window into a separate group-by and join. Ignore the self-join elimination — keep the original v2 self-join. Note that the window for AVG is replaced by a group-by and join, which may reduce window computation cost.
+HAZARD_FLAGS:
+- The join between monthly_sales and yearly_avg may increase intermediate data size (148K join 50K). However, the original window also processes all rows.
+- The RANK window remains; could be combined with LAG/LEAD for further optimization, but that's out of scope for this strategy.
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: compound_prefilter_avg_groupby_selfjoin_elim
+TARGET_LOGICAL_TREE:
+  date_cte, call_center_cte, item_cte -> filtered_fact -> monthly_sales -> yearly_avg -> v1_lag_lead -> v2_simple -> main_query
+NODE_CONTRACTS:
+  date_cte:
+    FROM: date_dim
+    WHERE: (d_year = 1999 OR (d_year = 1998 AND d_moy = 12) OR (d_year = 2000 AND d_moy = 1))
+    OUTPUT: d_date_sk, d_year, d_moy
+    EXPECTED_ROWS: 427
+    CONSUMERS: filtered_fact
+  call_center_cte:
+    FROM: call_center
+    OUTPUT: cc_call_center_sk, cc_name
+    EXPECTED_ROWS: 24
+    CONSUMERS: filtered_fact
+  item_cte:
+    FROM: item
+    OUTPUT: i_item_sk, i_category, i_brand
+    EXPECTED_ROWS: 102K
+    CONSUMERS: filtered_fact
+  filtered_fact:
+    FROM: catalog_sales
+    JOIN: date_cte ON cs_sold_date_sk = d_date_sk
+    JOIN: call_center_cte ON cs_call_center_sk = cc_call_center_sk
+    JOIN: item_cte ON cs_item_sk = i_item_sk
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, cs_sales_price
+    EXPECTED_ROWS: 3.5M
+    CONSUMERS: monthly_sales
+  monthly_sales:
+    FROM: filtered_fact
+    GROUP BY: i_category, i_brand, cc_name, d_year, d_moy
+    AGGREGATE: sum(cs_sales_price) AS sum_sales
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, sum_sales
+    EXPECTED_ROWS: 148K
+    CONSUMERS: yearly_avg, v1_lag_lead
+  yearly_avg:
+    FROM: monthly_sales
+    GROUP BY: i_category, i_brand, cc_name, d_year
+    AGGREGATE: avg(sum_sales) AS avg_monthly_sales
+    OUTPUT: i_category, i_brand, cc_name, d_year, avg_monthly_sales
+    EXPECTED_ROWS: ~50K
+    CONSUMERS: v1_lag_lead
+  v1_lag_lead:
+    FROM: monthly_sales
+    JOIN: yearly_avg USING (i_category, i_brand, cc_name, d_year)
+    WINDOW: 
+        prev_sum_sales: LAG(sum_sales, 1) OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy)
+        next_sum_sales: LEAD(sum_sales, 1) OVER (PARTITION BY i_category, i_brand, cc_name ORDER BY d_year, d_moy)
+    OUTPUT: i_category, i_brand, cc_name, d_year, d_moy, sum_sales, avg_monthly_sales, prev_sum_sales, next_sum_sales
+    EXPECTED_ROWS: 148K
+    CONSUMERS: v2_simple
+  v2_simple:
+    FROM: v1_lag_lead
+    OUTPUT: i_brand, d_year, avg_monthly_sales, sum_sales, prev_sum_sales AS psum, next_sum_sales AS nsum
+    EXPECTED_ROWS: 148K
+    CONSUMERS: main_query
+  main_query: same as Worker 1.
+EXAMPLES: dimension_cte_isolate, deferred_window_aggregation, self_join_to_window
+EXAMPLE_ADAPTATION:
+  Combine patterns: pre-filter dimensions, compute yearly average via group-by (instead of window), and eliminate self-join with LAG/LEAD. Apply all three aspects; ignore any UNION or decorrelation patterns.
+HAZARD_FLAGS:
+- Complexity: This compound strategy introduces multiple CTEs, which may increase materialization overhead. However, each CTE reduces data progressively.
+- The LAG/LEAD window must be computed after the join with yearly_avg, which may increase window input size. Consider computing LAG/LEAD on monthly_sales before joining with yearly_avg? But then avg_monthly_sales would be missing. Must join first.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy

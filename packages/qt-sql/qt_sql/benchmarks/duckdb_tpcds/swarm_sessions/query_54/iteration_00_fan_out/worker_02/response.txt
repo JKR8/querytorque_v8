@@ -1,0 +1,130 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] may1998_dates  [+]  Cost: 5%  Rows: 31  — Filter date_dim once for May 1998, output date keys and month_seq.
+│   ├── SCAN (date_dim)
+│   ├── FILTER (d_year=1998, d_moy=5)
+│   └── OUTPUT (d_date_sk, d_month_seq)
+├── [CTE] my_customers  [~]  Cost: 25%  Rows: 5,270  — Join catalog/web sales to filtered dates CTE instead of raw date_dim.
+│   ├── SCAN (catalog_sales, web_sales UNION ALL, item, may1998_dates, customer)
+│   ├── JOIN (sold_date_sk = d_date_sk) → may1998_dates
+│   ├── JOIN (item_sk = i_item_sk)
+│   ├── JOIN (c_customer_sk = customer_sk)
+│   ├── FILTER (i_category='Women', i_class='maternity')
+│   └── OUTPUT (c_customer_sk, c_current_addr_sk)
+├── [CTE] month_range  [+]  Cost: 1%  Rows: 1  — Compute month_seq range from filtered dates CTE.
+│   ├── SCAN (may1998_dates)
+│   └── OUTPUT (month_start, month_end)
+├── [CTE] my_revenue  [~]  Cost: 25%  Rows: 4,605  — Join store_sales to date_dim filtered by month_range CTE.
+│   ├── SCAN (my_customers, store_sales, customer_address, store, date_dim, month_range)
+│   ├── JOIN (c_current_addr_sk = ca_address_sk)
+│   ├── JOIN (ca_county = s_county, ca_state = s_state)
+│   ├── JOIN (ss_sold_date_sk = d_date_sk)
+│   ├── JOIN (c_customer_sk = ss_customer_sk)
+│   ├── FILTER (d_month_seq BETWEEN month_start AND month_end)
+│   ├── AGG (GROUP BY c_customer_sk)
+│   └── OUTPUT (c_customer_sk, revenue)
+├── [CTE] segments  [=]  Cost: 25%  Rows: 4,605  — Unchanged.
+│   ├── SCAN (my_revenue)
+│   └── OUTPUT (segment)
+└── [MAIN] main_query  [=]  Cost: 25%  Rows: ≤100  — Unchanged.
+    ├── SCAN (segments)
+    ├── AGG (GROUP BY segment)
+    ├── SORT (segment, num_customers)
+    └── OUTPUT (segment, num_customers, segment_base)
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "date_cte_isolate",
+      "description": "Extracted May 1998 date filter into reusable CTE to avoid redundant scans.",
+      "applied_to": ["may1998_dates", "my_customers", "month_range", "my_revenue"]
+    },
+    {
+      "id": "R2",
+      "type": "early_filter",
+      "description": "Filter date_dim first in may1998_dates CTE, then probe small hash table in downstream joins.",
+      "applied_to": ["may1998_dates"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "may1998_dates": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT d_date_sk, d_month_seq FROM date_dim WHERE d_year = 1998 AND d_moy = 5",
+          "interfaces": {
+            "outputs": ["d_date_sk", "d_month_seq"],
+            "consumes": []
+          }
+        },
+        "my_customers": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT DISTINCT c_customer_sk, c_current_addr_sk FROM (SELECT cs_sold_date_sk AS sold_date_sk, cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk FROM catalog_sales UNION ALL SELECT ws_sold_date_sk AS sold_date_sk, ws_bill_customer_sk AS customer_sk, ws_item_sk AS item_sk FROM web_sales) cs_or_ws_sales, item, may1998_dates, customer WHERE sold_date_sk = d_date_sk AND item_sk = i_item_sk AND i_category = 'Women' AND i_class = 'maternity' AND c_customer_sk = cs_or_ws_sales.customer_sk",
+          "interfaces": {
+            "outputs": ["c_customer_sk", "c_current_addr_sk"],
+            "consumes": ["may1998_dates"]
+          }
+        },
+        "month_range": {
+          "type": "cte",
+          "change": "added",
+          "sql": "SELECT (SELECT DISTINCT d_month_seq + 1 FROM may1998_dates) AS month_start, (SELECT DISTINCT d_month_seq + 3 FROM may1998_dates) AS month_end",
+          "interfaces": {
+            "outputs": ["month_start", "month_end"],
+            "consumes": ["may1998_dates"]
+          }
+        },
+        "my_revenue": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT c_customer_sk, SUM(ss_ext_sales_price) AS revenue FROM my_customers, store_sales, customer_address, store, date_dim, month_range WHERE c_current_addr_sk = ca_address_sk AND ca_county = s_county AND ca_state = s_state AND ss_sold_date_sk = d_date_sk AND c_customer_sk = ss_customer_sk AND d_month_seq BETWEEN month_start AND month_end GROUP BY c_customer_sk",
+          "interfaces": {
+            "outputs": ["c_customer_sk", "revenue"],
+            "consumes": ["my_customers", "month_range"]
+          }
+        },
+        "segments": {
+          "type": "cte",
+          "change": "unchanged",
+          "sql": "",
+          "interfaces": {
+            "outputs": ["segment"],
+            "consumes": ["my_revenue"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "unchanged",
+          "sql": "",
+          "interfaces": {
+            "outputs": ["segment", "num_customers", "segment_base"],
+            "consumes": ["segments"]
+          }
+        }
+      },
+      "reconstruction_order": ["may1998_dates", "my_customers", "month_range", "my_revenue", "segments", "main_query"],
+      "assembly_template": "WITH may1998_dates AS ({may1998_dates}), my_customers AS ({my_customers}), month_range AS ({month_range}), my_revenue AS ({my_revenue}), segments AS ({segments}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Isolated May 1998 date filter into `may1998_dates` CTE, reused for catalog/web sales join and month range derivation, eliminating 3 redundant scans of date_dim.
+
+**Expected speedup**: 1.5–2× reduction in date_dim I/O; more efficient hash joins with pre‑filtered dimension CTEs.

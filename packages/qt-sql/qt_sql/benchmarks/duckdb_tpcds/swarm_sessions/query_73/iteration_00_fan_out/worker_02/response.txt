@@ -1,0 +1,87 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (structured as CTE pipeline)
+└── [MAIN] main_query  [~]  Rewritten as CTE pipeline with staged dimension filtering
+    ├── WITH filtered_date  [+]  Cost: 0%  Rows: 72  — Filter date_dim for d_dom 1-2 and years 2000-2002
+    ├── WITH date_sales  [+]  Cost: 0%  Rows: 135K  — Join filtered_date with store_sales
+    ├── WITH date_sales_store  [+]  Cost: 0%  Rows: 52K  — Join date_sales with store for county filter
+    ├── WITH date_sales_store_hd  [+]  Cost: 0%  Rows: 52K  — Join date_sales_store with household_demographics for demo filters
+    ├── WITH aggregated  [+]  Cost: 0%  Rows: 5,044  — Group by ticket and customer to count line items
+    ├── WITH filtered  [+]  Cost: 0%  Rows: 308  — Filter counts between 1 and 5
+    ├── FINAL SELECT  [~]  — Join filtered with customer and apply final ordering
+    │   ├── JOIN (filtered.ss_customer_sk = customer.c_customer_sk)
+    │   ├── SORT (cnt DESC, c_last_name ASC)
+    │   └── OUTPUT (c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "prefetch_fact_join", "description": "Staged join pipeline: filter dimensions early, progressively reduce fact rows", "applied_to": ["filtered_date", "date_sales", "date_sales_store", "date_sales_store_hd"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Isolate each dimension filter in separate CTEs, join sequentially to fact table", "applied_to": ["filtered_date", "date_sales_store", "date_sales_store_hd"]},
+    {"id": "R3", "type": "early_filter", "description": "Apply small dimension table filters before joining to large fact table", "applied_to": ["filtered_date", "date_sales_store", "date_sales_store_hd"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_date": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_dom BETWEEN 1 AND 2 AND d_year IN (2000, 2001, 2002)",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "date_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, ss_store_sk, ss_hdemo_sk FROM store_sales INNER JOIN filtered_date ON ss_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "ss_store_sk", "ss_hdemo_sk"], "consumes": ["filtered_date"]}
+      },
+      "date_sales_store": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, ss_hdemo_sk FROM date_sales INNER JOIN store ON ss_store_sk = s_store_sk WHERE s_county IN ('Fairfield County','Walker County','Daviess County','Barrow County')",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "ss_hdemo_sk"], "consumes": ["date_sales"]}
+      },
+      "date_sales_store_hd": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk FROM date_sales_store INNER JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk WHERE (hd_buy_potential = '501-1000' OR hd_buy_potential = 'Unknown') AND hd_vehicle_count > 0 AND CASE WHEN hd_vehicle_count > 0 THEN hd_dep_count/hd_vehicle_count ELSE NULL END > 1",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk"], "consumes": ["date_sales_store"]}
+      },
+      "aggregated": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, COUNT(*) AS cnt FROM date_sales_store_hd GROUP BY ss_ticket_number, ss_customer_sk",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "cnt"], "consumes": ["date_sales_store_hd"]}
+      },
+      "filtered": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_ticket_number, ss_customer_sk, cnt FROM aggregated WHERE cnt BETWEEN 1 AND 5",
+        "interfaces": {"outputs": ["ss_ticket_number", "ss_customer_sk", "cnt"], "consumes": ["aggregated"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt FROM filtered INNER JOIN customer ON ss_customer_sk = c_customer_sk ORDER BY cnt DESC, c_last_name ASC",
+        "interfaces": {"outputs": ["c_last_name", "c_first_name", "c_salutation", "c_preferred_cust_flag", "ss_ticket_number", "cnt"], "consumes": ["filtered"]}
+      }
+    },
+    "reconstruction_order": ["filtered_date", "date_sales", "date_sales_store", "date_sales_store_hd", "aggregated", "filtered", "main_query"],
+    "assembly_template": "WITH filtered_date AS ({filtered_date}), date_sales AS ({date_sales}), date_sales_store AS ({date_sales_store}), date_sales_store_hd AS ({date_sales_store_hd}), aggregated AS ({aggregated}), filtered AS ({filtered}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured the original flat join into a staged CTE pipeline that filters dimensions (date, store, household_demographics) early and progressively reduces the fact table rows before aggregation. This isolates dimension filters, prevents cross-joining dimensions, and allows predicate pushdown through the CTE chain.
+
+**Expected speedup**: 2-4x (based on similar patterns where staged dimension filtering with CTEs outperforms flat joins by reducing intermediate result sizes early).

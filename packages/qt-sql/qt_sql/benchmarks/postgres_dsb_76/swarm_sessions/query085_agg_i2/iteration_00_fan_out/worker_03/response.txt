@@ -1,0 +1,164 @@
+## Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_aggregation  [~]  Cost: 100%  Rows: ≤100
+    ├── [CTE] date_cte  [+]  MATERIALIZED CTE
+    │   └── SCAN date_dim (d_date_sk), FILTER d_year=2002
+    ├── [CTE] cd1_cte  [+]  MATERIALIZED CTE  
+    │   └── SCAN customer_demographics (cd_demo_sk, marital_status, education_status), FILTER OR conditions
+    ├── [CTE] cd2_cte  [+]  MATERIALIZED CTE
+    │   └── SCAN customer_demographics (cd_demo_sk, marital_status, education_status), FILTER OR conditions  
+    ├── [CTE] address_cte  [+]  MATERIALIZED CTE
+    │   └── SCAN customer_address (ca_address_sk, ca_state), FILTER ca_country='United States' AND ca_state IN (...)
+    ├── [CTE] reason_cte  [+]  MATERIALIZED CTE
+    │   └── SCAN reason (r_reason_sk, r_reason_desc)
+    ├── [CTE] web_sales_filtered  [+]  MATERIALIZED CTE
+    │   ├── JOIN web_sales × date_cte ON ws_sold_date_sk = d_date_sk
+    │   └── FILTER (sales_price OR ranges) AND (net_profit OR ranges)
+    ├── [CTE] web_returns_filtered  [+]  MATERIALIZED CTE
+    │   ├── JOIN web_returns × web_sales_filtered ON (ws_item_sk=wr_item_sk AND ws_order_number=wr_order_number)
+    │   ├── JOIN cd1_cte ON cd_demo_sk=wr_refunded_cdemo_sk
+    │   ├── JOIN cd2_cte ON cd_demo_sk=wr_returning_cdemo_sk AND marital_status=marital_status AND education_status=education_status
+    │   ├── JOIN address_cte ON ca_address_sk=wr_refunded_addr_sk
+    │   ├── JOIN reason_cte ON r_reason_sk=wr_reason_sk
+    │   ├── JOIN web_page ON wp_web_page_sk=ws_web_page_sk
+    │   └── FILTER state+net_profit OR conditions
+    ├── [CTE] joined_cte  [+]  MATERIALIZED CTE
+    │   └── SELECT FROM web_returns_filtered (passthrough)
+    ├── AGG (GROUP BY r_reason_desc)
+    ├── SORT (SUBSTRING(r_reason_desc FROM 1 FOR 20) ASC, AVG(ws_quantity) ASC, AVG(wr_refunded_cash) ASC, AVG(wr_fee) ASC)
+    └── OUTPUT (SUBSTRING(r_reason_desc,1,20), AVG(ws_quantity), AVG(wr_refunded_cash), AVG(wr_fee))
+```
+
+**Changes:**
+- `[+]` Added 9 MATERIALIZED CTEs following target logical tree structure
+- `[~]` Modified main query to use CTEs instead of comma joins
+- Preserved all original filters, literals, and defensive semantics
+- Added MATERIALIZED keywords to prevent inlining and force staged reduction
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "staged_materialization",
+      "description": "Convert comma joins to explicit CTEs with MATERIALIZED keyword for staged reduction",
+      "applied_to": ["date_cte", "cd1_cte", "cd2_cte", "address_cte", "reason_cte", "web_sales_filtered", "web_returns_filtered", "joined_cte"]
+    },
+    {
+      "id": "R2", 
+      "type": "dimension_prefetch",
+      "description": "Pre-filter selective dimension tables into small hash tables before fact table joins",
+      "applied_to": ["date_cte", "cd1_cte", "cd2_cte", "address_cte", "reason_cte"]
+    },
+    {
+      "id": "R3",
+      "type": "fact_prefilter",
+      "description": "Filter fact table (web_sales) early using selective date range before expensive multi-table join",
+      "applied_to": ["web_sales_filtered"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2002",
+        "interfaces": {
+          "outputs": ["d_date_sk"],
+          "consumes": []
+        }
+      },
+      "cd1_cte": {
+        "type": "cte", 
+        "change": "new",
+        "sql": "SELECT cd_demo_sk, cd_marital_status, cd_education_status FROM customer_demographics WHERE (cd_marital_status = 'S' AND cd_education_status = 'Primary') OR (cd_marital_status = 'M' AND cd_education_status = 'Secondary') OR (cd_marital_status = 'U' AND cd_education_status = '2 yr Degree')",
+        "interfaces": {
+          "outputs": ["cd_demo_sk", "cd_marital_status", "cd_education_status"],
+          "consumes": []
+        }
+      },
+      "cd2_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT cd_demo_sk, cd_marital_status, cd_education_status FROM customer_demographics WHERE (cd_marital_status = 'S' AND cd_education_status = 'Primary') OR (cd_marital_status = 'M' AND cd_education_status = 'Secondary') OR (cd_marital_status = 'U' AND cd_education_status = '2 yr Degree')",
+        "interfaces": {
+          "outputs": ["cd_demo_sk", "cd_marital_status", "cd_education_status"],
+          "consumes": []
+        }
+      },
+      "address_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ca_address_sk, ca_state FROM customer_address WHERE ca_country = 'United States' AND ca_state IN ('KY','NC','SD','AR','GA','IN','KS','OH','VA')",
+        "interfaces": {
+          "outputs": ["ca_address_sk", "ca_state"],
+          "consumes": []
+        }
+      },
+      "reason_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT r_reason_sk, r_reason_desc FROM reason",
+        "interfaces": {
+          "outputs": ["r_reason_sk", "r_reason_desc"],
+          "consumes": []
+        }
+      },
+      "web_sales_filtered": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT ws_item_sk, ws_order_number, ws_web_page_sk, ws_quantity, ws_sales_price, ws_net_profit FROM web_sales INNER JOIN date_cte ON ws_sold_date_sk = date_cte.d_date_sk WHERE ((ws_sales_price BETWEEN 100.00 AND 150.00) OR (ws_sales_price BETWEEN 50.00 AND 100.00) OR (ws_sales_price BETWEEN 150.00 AND 200.00)) AND ((ws_net_profit BETWEEN 100 AND 200) OR (ws_net_profit BETWEEN 150 AND 300) OR (ws_net_profit BETWEEN 50 AND 250))",
+        "interfaces": {
+          "outputs": ["ws_item_sk", "ws_order_number", "ws_web_page_sk", "ws_quantity", "ws_sales_price", "ws_net_profit"],
+          "consumes": ["date_cte"]
+        }
+      },
+      "web_returns_filtered": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT reason_cte.r_reason_desc, web_sales_filtered.ws_quantity, wr_refunded_cash, wr_fee FROM web_returns INNER JOIN web_sales_filtered ON web_sales_filtered.ws_item_sk = web_returns.wr_item_sk AND web_sales_filtered.ws_order_number = web_returns.wr_order_number INNER JOIN cd1_cte ON cd1_cte.cd_demo_sk = web_returns.wr_refunded_cdemo_sk INNER JOIN cd2_cte ON cd2_cte.cd_demo_sk = web_returns.wr_returning_cdemo_sk AND cd1_cte.cd_marital_status = cd2_cte.cd_marital_status AND cd1_cte.cd_education_status = cd2_cte.cd_education_status INNER JOIN address_cte ON address_cte.ca_address_sk = web_returns.wr_refunded_addr_sk INNER JOIN reason_cte ON reason_cte.r_reason_sk = web_returns.wr_reason_sk INNER JOIN web_page ON web_page.wp_web_page_sk = web_sales_filtered.ws_web_page_sk WHERE ((address_cte.ca_state IN ('KY','NC','SD') AND web_sales_filtered.ws_net_profit BETWEEN 100 AND 200) OR (address_cte.ca_state IN ('AR','GA','IN') AND web_sales_filtered.ws_net_profit BETWEEN 150 AND 300) OR (address_cte.ca_state IN ('KS','OH','VA') AND web_sales_filtered.ws_net_profit BETWEEN 50 AND 250))",
+        "interfaces": {
+          "outputs": ["r_reason_desc", "ws_quantity", "wr_refunded_cash", "wr_fee"],
+          "consumes": ["web_sales_filtered", "cd1_cte", "cd2_cte", "address_cte", "reason_cte"]
+        }
+      },
+      "joined_cte": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT r_reason_desc, ws_quantity, wr_refunded_cash, wr_fee FROM web_returns_filtered",
+        "interfaces": {
+          "outputs": ["r_reason_desc", "ws_quantity", "wr_refunded_cash", "wr_fee"],
+          "consumes": ["web_returns_filtered"]
+        }
+      },
+      "main_aggregation": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT SUBSTRING(r_reason_desc FROM 1 FOR 20), AVG(ws_quantity), AVG(wr_refunded_cash), AVG(wr_fee) FROM joined_cte GROUP BY r_reason_desc ORDER BY SUBSTRING(r_reason_desc FROM 1 FOR 20), AVG(ws_quantity), AVG(wr_refunded_cash), AVG(wr_fee) LIMIT 100",
+        "interfaces": {
+          "outputs": ["substring", "avg", "avg", "avg"],
+          "consumes": ["joined_cte"]
+        }
+      }
+    },
+    "reconstruction_order": ["date_cte", "cd1_cte", "cd2_cte", "address_cte", "reason_cte", "web_sales_filtered", "web_returns_filtered", "joined_cte", "main_aggregation"],
+    "assembly_template": "WITH date_cte AS MATERIALIZED ({date_cte}), cd1_cte AS MATERIALIZED ({cd1_cte}), cd2_cte AS MATERIALIZED ({cd2_cte}), address_cte AS MATERIALIZED ({address_cte}), reason_cte AS MATERIALIZED ({reason_cte}), web_sales_filtered AS MATERIALIZED ({web_sales_filtered}), web_returns_filtered AS MATERIALIZED ({web_returns_filtered}), joined_cte AS MATERIALIZED ({joined_cte}) {main_aggregation}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Converted original comma-style joins with complex OR conditions into a staged CTE approach with MATERIALIZED hints. Each CTE pre-filters dimension tables (customer_demographics x2, customer_address, reason, date_dim) and the main fact table (web_sales) before the final multi-table join. This reduces the search space for the optimizer and breaks the 7 nested loops into hash-joinable stages.
+
+**Expected speedup:** 2-3x from eliminating nested loop ambiguity and enabling hash joins on pre-materialized small dimension tables.

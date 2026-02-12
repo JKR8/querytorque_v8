@@ -1,0 +1,99 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  Cost: 100%  Rows: ~1K — Restructured into CTEs following target tree
+    ├── WITH filtered_dates  [+]
+    │   └── SCAN date_dim, FILTER (d_month_seq BETWEEN 1224 AND 1224+11)
+    ├── WITH filtered_items  [+]
+    │   └── SCAN item (no filter)
+    ├── WITH fact_with_dates  [+]
+    │   └── JOIN web_sales ⟕ filtered_dates (ws_sold_date_sk = d_date_sk)
+    ├── WITH joined_all  [+]
+    │   └── JOIN fact_with_dates ⟕ filtered_items (ws_item_sk = i_item_sk)
+    ├── WITH rollup_agg  [+]
+    │   └── AGG (GROUP BY ROLLUP(i_category, i_class))
+    ├── WITH final_window  [+]
+    │   └── WINDOW (lochierarchy = gcat+gcls, rank_within_parent = RANK() OVER ...)
+    ├── WITH top_n  [+]
+    │   └── SORT (lochierarchy DESC, CASE ..., rank_within_parent), LIMIT 100
+    └── OUTPUT (total_sum, i_category, i_class, lochierarchy, rank_within_parent)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter date_dim into CTE before joining with fact table", "applied_to": ["filtered_dates"]},
+    {"id": "R2", "type": "multi_dimension_prefetch", "description": "Isolate item dimension in CTE to create small hash table", "applied_to": ["filtered_items"]},
+    {"id": "R3", "type": "early_filter", "description": "Join fact table with pre-filtered dimension CTEs sequentially", "applied_to": ["fact_with_dates", "joined_all"]},
+    {"id": "R4", "type": "cte_materialization_avoidance", "description": "Keep CTEs flat without nested materialization between rollup and window", "applied_to": ["rollup_agg", "final_window", "top_n"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1224 AND 1224 + 11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_items": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_item_sk, i_category, i_class FROM item WHERE 1=1",
+        "interfaces": {"outputs": ["i_item_sk", "i_category", "i_class"], "consumes": []}
+      },
+      "fact_with_dates": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ws_item_sk, ws_net_paid FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk",
+        "interfaces": {"outputs": ["ws_item_sk", "ws_net_paid"], "consumes": ["filtered_dates"]}
+      },
+      "joined_all": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_category, i_class, ws_net_paid FROM fact_with_dates JOIN filtered_items ON ws_item_sk = i_item_sk",
+        "interfaces": {"outputs": ["i_category", "i_class", "ws_net_paid"], "consumes": ["fact_with_dates", "filtered_items"]}
+      },
+      "rollup_agg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_category, i_class, SUM(ws_net_paid) AS total_sum, GROUPING(i_category) AS gcat, GROUPING(i_class) AS gcls FROM joined_all GROUP BY ROLLUP(i_category, i_class)",
+        "interfaces": {"outputs": ["i_category", "i_class", "total_sum", "gcat", "gcls"], "consumes": ["joined_all"]}
+      },
+      "final_window": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT total_sum, i_category, i_class, (gcat + gcls) AS lochierarchy, RANK() OVER (PARTITION BY (gcat + gcls), CASE WHEN gcls = 0 THEN i_category END ORDER BY total_sum DESC) AS rank_within_parent FROM rollup_agg",
+        "interfaces": {"outputs": ["total_sum", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["rollup_agg"]}
+      },
+      "top_n": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT total_sum, i_category, i_class, lochierarchy, rank_within_parent FROM final_window ORDER BY lochierarchy DESC, CASE WHEN lochierarchy = 0 THEN i_category END, rank_within_parent LIMIT 100",
+        "interfaces": {"outputs": ["total_sum", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["final_window"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT total_sum, i_category, i_class, lochierarchy, rank_within_parent FROM top_n",
+        "interfaces": {"outputs": ["total_sum", "i_category", "i_class", "lochierarchy", "rank_within_parent"], "consumes": ["top_n"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_items", "fact_with_dates", "joined_all", "rollup_agg", "final_window", "top_n", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), filtered_items AS ({filtered_items}), fact_with_dates AS ({fact_with_dates}), joined_all AS ({joined_all}), rollup_agg AS ({rollup_agg}), final_window AS ({final_window}), top_n AS ({top_n}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured the original single-block query into a CTE sequence following the target logical tree, isolating dimension filters into separate CTEs (date_dim and item) before joining with the fact table. This creates small hash tables for dimension lookups and allows predicate pushdown while avoiding materialization barriers between the rollup aggregation and window computation.
+
+**Expected speedup**: 1.5-2x due to better join ordering and reduced fact table scan size via early dimension filtering, while avoiding the materialization regression observed in similar patterns.

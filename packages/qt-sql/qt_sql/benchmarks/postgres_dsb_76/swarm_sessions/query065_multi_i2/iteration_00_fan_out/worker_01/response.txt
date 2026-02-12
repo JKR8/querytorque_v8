@@ -1,0 +1,90 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Structural change: Original subqueries replaced by CTE pipeline
+    ├── [CTE] filtered_sales  [+]  Single materialized scan of store_sales+date_dim with price ratio filter
+    ├── [CTE] store_avg  [+]  Derived from filtered_sales
+    ├── [CTE] low_revenue_items  [+]  Join filtered_sales to store_avg with 0.1*ave filter
+    ├── [CTE] join_store_item  [+]  Join to store and item with dimension filters
+    ├── SORT (s_store_name ASC, i_item_desc ASC)  [=]
+    └── OUTPUT (s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand)  [=]
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "PostgreSQL 16.11",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "shared_materialization",
+      "description": "Replace duplicate store_sales+date_dim scans with single materialized CTE",
+      "applied_to": ["filtered_sales", "store_avg", "low_revenue_items"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_sales": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_store_sk, ss_item_sk, SUM(ss_sales_price) AS revenue FROM store_sales JOIN date_dim ON ss_sold_date_sk = d_date_sk WHERE d_month_seq BETWEEN 1215 AND 1226 AND ss_sales_price / ss_list_price BETWEEN 0.79 AND 0.89 GROUP BY ss_store_sk, ss_item_sk",
+        "interfaces": {
+          "outputs": ["ss_store_sk", "ss_item_sk", "revenue"],
+          "consumes": []
+        }
+      },
+      "store_avg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ss_store_sk, AVG(revenue) AS ave FROM filtered_sales GROUP BY ss_store_sk",
+        "interfaces": {
+          "outputs": ["ss_store_sk", "ave"],
+          "consumes": ["filtered_sales"]
+        }
+      },
+      "low_revenue_items": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT f.ss_store_sk, f.ss_item_sk, f.revenue FROM filtered_sales f JOIN store_avg a ON f.ss_store_sk = a.ss_store_sk WHERE f.revenue <= 0.1 * a.ave",
+        "interfaces": {
+          "outputs": ["ss_store_sk", "ss_item_sk", "revenue"],
+          "consumes": ["filtered_sales", "store_avg"]
+        }
+      },
+      "join_store_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s.s_store_name, i.i_item_desc, l.revenue, i.i_current_price, i.i_wholesale_cost, i.i_brand FROM low_revenue_items l JOIN store s ON l.ss_store_sk = s.s_store_sk JOIN item i ON l.ss_item_sk = i.i_item_sk WHERE i.i_manager_id BETWEEN 10 AND 14 AND s.s_state IN ('KS','OH','SD')",
+        "interfaces": {
+          "outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"],
+          "consumes": ["low_revenue_items"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT s_store_name, i_item_desc, revenue, i_current_price, i_wholesale_cost, i_brand FROM join_store_item ORDER BY s_store_name, i_item_desc LIMIT 100",
+        "interfaces": {
+          "outputs": ["s_store_name", "i_item_desc", "revenue", "i_current_price", "i_wholesale_cost", "i_brand"],
+          "consumes": ["join_store_item"]
+        }
+      }
+    },
+    "reconstruction_order": ["filtered_sales", "store_avg", "low_revenue_items", "join_store_item", "main_query"],
+    "assembly_template": "WITH filtered_sales AS MATERIALIZED ({filtered_sales}), store_avg AS NOT MATERIALIZED ({store_avg}), low_revenue_items AS NOT MATERIALIZED ({low_revenue_items}), join_store_item AS NOT MATERIALIZED ({join_store_item}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes:** Structural rewrite using CTEs: `filtered_sales` materializes the single fact+dimension scan with price ratio filter; `store_avg` and `low_revenue_items` compute aggregates and filtering from that single source; `join_store_item` applies dimension filters. The `WITHOUT MATERIALIZED` hints on downstream CTEs preserve parallel plan flexibility while the materialized root CTE prevents duplicate work.
+
+**Expected speedup:** ~3–4× reduction in I/O (single scan instead of two) plus potential parallelism gains from non-materialized CTEs.

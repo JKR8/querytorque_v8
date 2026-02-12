@@ -1,0 +1,129 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]
+    ├── [~] CTE filtered_dates
+    │   └── SCAN (date_dim)
+    ├── [~] CTE filtered_ca
+    │   └── SCAN (customer_address)
+    ├── [~] CTE filtered_web
+    │   └── SCAN (web_site)
+    ├── [~] CTE base_sales
+    │   ├── JOIN (ws1 ↔ filtered_dates)
+    │   ├── JOIN (ws1 ↔ filtered_ca)
+    │   └── JOIN (ws1 ↔ filtered_web)
+    ├── [~] CTE multi_warehouse
+    │   └── GROUP BY (ws_order_number)
+    ├── [~] CTE bad_returns
+    │   └── SCAN (web_returns)
+    ├── [~] CTE final_qualified
+    │   ├── JOIN (base_sales ↔ multi_warehouse)
+    │   └── ANTI-JOIN (NOT EXISTS bad_returns)
+    └── [~] AGGREGATE final_agg
+        └── OUTPUT (order count, total shipping cost, total net profit)
+```
+
+Change markers:
+- `[!]` — Structural change from original implicit joins to explicit CTE chain
+- `[~]` — All components modified to follow target logical tree structure
+- `[=]` — No unchanged components (all are now CTEs)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "pg_dimension_prefetch_star",
+      "description": "Pre-filter selective dimensions into CTEs to create tiny hash tables with explicit JOIN syntax",
+      "applied_to": ["filtered_dates", "filtered_ca", "filtered_web", "base_sales"]
+    },
+    {
+      "id": "R2", 
+      "type": "pg_self_join_decomposition",
+      "description": "Replace EXISTS for multi-warehouse with GROUP BY in separate CTE, enabling shared materialization of base_sales",
+      "applied_to": ["multi_warehouse", "base_sales"]
+    },
+    {
+      "id": "R3",
+      "type": "inline_decorrelate_materialized", 
+      "description": "Materialize bad_returns separately to avoid re-executing correlated subquery for each order",
+      "applied_to": ["bad_returns", "final_qualified"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "filtered_dates": {
+        "type": "cte",
+        "change": "modified", 
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '1999-10-01' AND CAST('1999-10-01' AS DATE) + INTERVAL '60 DAY'",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "filtered_ca": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ca_address_sk FROM customer_address WHERE ca_state IN ('MO','MT','OK','SC','TX','WI')",
+        "interfaces": {"outputs": ["ca_address_sk"], "consumes": []}
+      },
+      "filtered_web": {
+        "type": "cte", 
+        "change": "modified",
+        "sql": "SELECT web_site_sk FROM web_site WHERE web_gmt_offset >= -5",
+        "interfaces": {"outputs": ["web_site_sk"], "consumes": []}
+      },
+      "base_sales": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT ws1.ws_order_number, ws1.ws_ext_ship_cost, ws1.ws_net_profit, ws1.ws_warehouse_sk FROM web_sales ws1 INNER JOIN filtered_dates ON ws1.ws_ship_date_sk = filtered_dates.d_date_sk INNER JOIN filtered_ca ON ws1.ws_ship_addr_sk = filtered_ca.ca_address_sk INNER JOIN filtered_web ON ws1.ws_web_site_sk = filtered_web.web_site_sk WHERE ws1.ws_list_price BETWEEN 253 AND 282",
+        "interfaces": {
+          "outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit", "ws_warehouse_sk"],
+          "consumes": ["filtered_dates", "filtered_ca", "filtered_web"]
+        }
+      },
+      "multi_warehouse": {
+        "type": "cte",
+        "change": "modified", 
+        "sql": "SELECT ws_order_number FROM base_sales GROUP BY ws_order_number HAVING COUNT(DISTINCT ws_warehouse_sk) >= 2",
+        "interfaces": {"outputs": ["ws_order_number"], "consumes": ["base_sales"]}
+      },
+      "bad_returns": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT wr_order_number FROM web_returns WHERE wr_reason_sk IN (8,18,20,23,41)",
+        "interfaces": {"outputs": ["wr_order_number"], "consumes": []}
+      },
+      "final_qualified": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT bs.ws_order_number, bs.ws_ext_ship_cost, bs.ws_net_profit FROM base_sales bs INNER JOIN multi_warehouse mw ON bs.ws_order_number = mw.ws_order_number WHERE NOT EXISTS (SELECT 1 FROM bad_returns br WHERE br.wr_order_number = bs.ws_order_number)",
+        "interfaces": {
+          "outputs": ["ws_order_number", "ws_ext_ship_cost", "ws_net_profit"],
+          "consumes": ["base_sales", "multi_warehouse", "bad_returns"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT COUNT(DISTINCT ws_order_number) AS \"order count\", SUM(ws_ext_ship_cost) AS \"total shipping cost\", SUM(ws_net_profit) AS \"total net profit\" FROM final_qualified ORDER BY COUNT(DISTINCT ws_order_number) LIMIT 100",
+        "interfaces": {"outputs": ["order count", "total shipping cost", "total net profit"], "consumes": ["final_qualified"]}
+      }
+    },
+    "reconstruction_order": ["filtered_dates", "filtered_ca", "filtered_web", "base_sales", "multi_warehouse", "bad_returns", "final_qualified", "main_query"],
+    "assembly_template": "WITH filtered_dates AS ({filtered_dates}), filtered_ca AS ({filtered_ca}), filtered_web AS ({filtered_web}), base_sales AS ({base_sales}), multi_warehouse AS ({multi_warehouse}), bad_returns AS ({bad_returns}), final_qualified AS ({final_qualified}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured from original implicit joins to explicit CTE chain following target logical tree. Applied multi-dimension prefetch (3 selective dimension CTEs), shared materialization of base_sales for multi-warehouse detection, and separate materialization of bad_returns to avoid correlated subquery re-execution.
+
+**Expected speedup**: 2.5-3.5x due to better join cardinality estimation, elimination of self-join on web_sales, and prevention of EXISTS re-evaluation per row.

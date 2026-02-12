@@ -1,0 +1,88 @@
+## Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [!]  Cost: 100%  Rows: ~1K  — Aggregate on-hand inventory in two 30-day windows around 2002-02-27 using CASE splits, then filter warehouse-item groups by the before/after ratio band and return ordered identifiers.
+    ├── [~] CTE date_filtered (new)
+    │   └── SCAN date_dim with date filter
+    ├── [~] CTE item_filtered (new)  
+    │   └── SCAN item with price filter
+    ├── [~] CTE inventory_agg (modified)
+    │   ├── SCAN inventory
+    │   ├── JOIN date_filtered ON inv_date_sk = d_date_sk
+    │   ├── JOIN item_filtered ON inv_item_sk = i_item_sk
+    │   └── AGG GROUP BY (inv_warehouse_sk, i_item_id, period_flag) with SUM
+    ├── [~] CTE pivoted (new)
+    │   └── PIVOT inventory_agg (period_flag → inv_before, inv_after)
+    ├── [~] CTE warehouse_join (modified)
+    │   ├── FROM pivoted
+    │   └── JOIN warehouse ON inv_warehouse_sk = w_warehouse_sk
+    ├── [=] FILTER ((CASE WHEN inv_before > 0 THEN inv_after / inv_before ELSE NULL END) BETWEEN 2.0/3.0 AND 3.0/2.0)
+    ├── [=] SORT (w_warehouse_name ASC, i_item_id ASC)
+    └── [=] OUTPUT (*)
+```
+
+## Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter date_dim and item into separate CTEs before joining with inventory", "applied_to": ["date_filtered", "item_filtered"]},
+    {"id": "R2", "type": "single_pass_aggregation", "description": "Consolidate before/after aggregation into one pass using period_flag CASE expression", "applied_to": ["inventory_agg"]},
+    {"id": "R3", "type": "deferred_join", "description": "Defer warehouse join until after aggregation and pivoting", "applied_to": ["warehouse_join"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filtered": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT d_date_sk, d_date FROM date_dim WHERE d_date BETWEEN DATE '2002-02-27' - INTERVAL 30 DAY AND DATE '2002-02-27' + INTERVAL 30 DAY",
+        "interfaces": {"outputs": ["d_date_sk", "d_date"], "consumes": []}
+      },
+      "item_filtered": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT i_item_sk, i_item_id FROM item WHERE i_current_price BETWEEN 0.99 AND 1.49",
+        "interfaces": {"outputs": ["i_item_sk", "i_item_id"], "consumes": []}
+      },
+      "inventory_agg": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT inv.inv_warehouse_sk, item.i_item_id, CASE WHEN date.d_date < DATE '2002-02-27' THEN 0 ELSE 1 END AS period_flag, SUM(inv.inv_quantity_on_hand) AS period_sum FROM inventory inv JOIN date_filtered date ON inv.inv_date_sk = date.d_date_sk JOIN item_filtered item ON inv.inv_item_sk = item.i_item_sk GROUP BY inv.inv_warehouse_sk, item.i_item_id, period_flag",
+        "interfaces": {"outputs": ["inv_warehouse_sk", "i_item_id", "period_flag", "period_sum"], "consumes": ["date_filtered", "item_filtered"]}
+      },
+      "pivoted": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT inv_warehouse_sk, i_item_id, SUM(CASE WHEN period_flag = 0 THEN period_sum ELSE 0 END) AS inv_before, SUM(CASE WHEN period_flag = 1 THEN period_sum ELSE 0 END) AS inv_after FROM inventory_agg GROUP BY inv_warehouse_sk, i_item_id",
+        "interfaces": {"outputs": ["inv_warehouse_sk", "i_item_id", "inv_before", "inv_after"], "consumes": ["inventory_agg"]}
+      },
+      "warehouse_join": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT w.w_warehouse_name, piv.i_item_id, piv.inv_before, piv.inv_after FROM pivoted piv JOIN warehouse w ON piv.inv_warehouse_sk = w.w_warehouse_sk",
+        "interfaces": {"outputs": ["w_warehouse_name", "i_item_id", "inv_before", "inv_after"], "consumes": ["pivoted"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT w_warehouse_name, i_item_id, inv_before, inv_after FROM warehouse_join WHERE (CASE WHEN inv_before > 0 THEN inv_after / inv_before ELSE NULL END) BETWEEN (2.0/3.0) AND (3.0/2.0) ORDER BY w_warehouse_name ASC, i_item_id ASC LIMIT 100",
+        "interfaces": {"outputs": ["w_warehouse_name", "i_item_id", "inv_before", "inv_after"], "consumes": ["warehouse_join"]}
+      }
+    },
+    "reconstruction_order": ["date_filtered", "item_filtered", "inventory_agg", "pivoted", "warehouse_join", "main_query"],
+    "assembly_template": "WITH date_filtered AS ({date_filtered}), item_filtered AS ({item_filtered}), inventory_agg AS ({inventory_agg}), pivoted AS ({pivoted}), warehouse_join AS ({warehouse_join}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured into 5 CTEs: (1) pre-filter date_dim by 30-day window, (2) pre-filter item by price range, (3) single-pass aggregation with period_flag, (4) pivot to before/after columns, (5) join warehouse and apply ratio filter. This isolates dimension filtering early while maintaining single fact table scan.
+
+**Expected speedup**: 1.5–2.0x (dimension isolation reduces hash table sizes; single-pass aggregation eliminates repeated scans; deferred join reduces intermediate row counts).

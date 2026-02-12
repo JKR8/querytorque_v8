@@ -1,0 +1,70 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (rewritten with CTEs)
+├── [~] CORE_FILTERS (CTE)
+│   ├── SCAN (catalog_sales, inventory, date_dim d1, date_dim d2, date_dim d3, customer_demographics, household_demographics)
+│   ├── JOIN (explicit INNER JOINs for all except promotion and catalog_returns moved later)
+│   ├── FILTER (d1.d_year = 1998 AND d1.d_week_seq = d2.d_week_seq AND inv_quantity_on_hand < cs_quantity)
+│   ├── FILTER (hd_buy_potential = '>10000' AND cd_marital_status = 'U' AND cd_dep_count BETWEEN 9 AND 11)
+│   └── FILTER (cs_wholesale_cost BETWEEN 35 AND 55 AND d3.d_date > d1.d_date + interval '3 day')
+├── [~] INITIAL_AGGREGATION (CTE)
+│   ├── FROM: core_filters
+│   ├── GROUP BY: cs_item_sk, inv_warehouse_sk, d_week_seq
+│   └── AGGREGATE: SUM(CASE WHEN cs_promo_sk IS NULL THEN 1 ELSE 0 END) as no_promo, SUM(CASE WHEN cs_promo_sk IS NOT NULL THEN 1 ELSE 0 END) as promo, COUNT(*) as total_cnt
+├── [~] ATTACH_DESCRIPTIONS (main query)
+│   ├── FROM: initial_aggregation
+│   ├── JOIN: item (INNER), warehouse (INNER), promotion (LEFT OUTER), catalog_returns (LEFT OUTER)
+│   ├── FILTER: i_category IN ('Children', 'Jewelry', 'Men')
+│   ├── SORT: total_cnt DESC, i_item_desc ASC, w_warehouse_name ASC, d_week_seq ASC
+│   └── LIMIT: 100
+└── OUTPUT (i_item_desc, w_warehouse_name, d_week_seq, no_promo, promo, total_cnt)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "postgresql",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter_decorrelate", "description": "Push all selective filters into core_filters CTE, including date correlation and non-equi join.", "applied_to": ["core_filters"]},
+    {"id": "R2", "type": "dimension_cte_isolate", "description": "Defer non-filtering dimensions (item, warehouse, promotion, catalog_returns) to final step after aggregation.", "applied_to": ["attach_descriptions"]},
+    {"id": "R3", "type": "pg_date_cte_explicit_join", "description": "Use explicit JOIN syntax and keep date filters together in core_filters.", "applied_to": ["core_filters"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "core_filters": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cs_item_sk, cs_promo_sk, cs_order_number, d1.d_week_seq, inv_warehouse_sk FROM catalog_sales JOIN date_dim d1 ON cs_sold_date_sk = d1.d_date_sk JOIN inventory ON inv_item_sk = cs_item_sk JOIN date_dim d2 ON inv_date_sk = d2.d_date_sk JOIN date_dim d3 ON cs_ship_date_sk = d3.d_date_sk JOIN customer_demographics ON cs_bill_cdemo_sk = cd_demo_sk JOIN household_demographics ON cs_bill_hdemo_sk = hd_demo_sk WHERE d1.d_year = 1998 AND d1.d_week_seq = d2.d_week_seq AND d3.d_date > d1.d_date + interval '3 day' AND inv_quantity_on_hand < cs_quantity AND hd_buy_potential = '>10000' AND cd_marital_status = 'U' AND cd_dep_count BETWEEN 9 AND 11 AND cs_wholesale_cost BETWEEN 35 AND 55",
+        "interfaces": {"outputs": ["cs_item_sk", "cs_promo_sk", "cs_order_number", "d_week_seq", "inv_warehouse_sk"], "consumes": []}
+      },
+      "initial_aggregation": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT cs_item_sk, inv_warehouse_sk, d_week_seq, SUM(CASE WHEN cs_promo_sk IS NULL THEN 1 ELSE 0 END) as no_promo, SUM(CASE WHEN cs_promo_sk IS NOT NULL THEN 1 ELSE 0 END) as promo, COUNT(*) as total_cnt FROM core_filters GROUP BY cs_item_sk, inv_warehouse_sk, d_week_seq",
+        "interfaces": {"outputs": ["cs_item_sk", "inv_warehouse_sk", "d_week_seq", "no_promo", "promo", "total_cnt"], "consumes": ["core_filters"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_item_desc, w_warehouse_name, agg.d_week_seq, agg.no_promo, agg.promo, agg.total_cnt FROM initial_aggregation agg JOIN item ON i_item_sk = agg.cs_item_sk JOIN warehouse ON w_warehouse_sk = agg.inv_warehouse_sk LEFT OUTER JOIN promotion p ON p.p_promo_sk = agg.cs_promo_sk LEFT OUTER JOIN catalog_returns cr ON cr.cr_item_sk = agg.cs_item_sk AND cr.cr_order_number = agg.cs_order_number WHERE i_category IN ('Children', 'Jewelry', 'Men') ORDER BY agg.total_cnt DESC, i_item_desc, w_warehouse_name, agg.d_week_seq LIMIT 100",
+        "interfaces": {"outputs": ["i_item_desc", "w_warehouse_name", "d_week_seq", "no_promo", "promo", "total_cnt"], "consumes": ["initial_aggregation"]}
+      }
+    },
+    "reconstruction_order": ["core_filters", "initial_aggregation", "main_query"],
+    "assembly_template": "WITH core_filters AS ({core_filters}), initial_aggregation AS ({initial_aggregation}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "runtime_config": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured query into three CTEs matching the target logical tree: core_filters applies all selective filters early, initial_aggregation groups at warehouse-item-week granularity, and attach_descriptions adds dimension descriptions and late filters. This isolates heavy filtering from dimension expansion.
+
+**Expected speedup**: 1.8-2.5x from reduced join cardinality before aggregation and parallel-friendly CTEs.

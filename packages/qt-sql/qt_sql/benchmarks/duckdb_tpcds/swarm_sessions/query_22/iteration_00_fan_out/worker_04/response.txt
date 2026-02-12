@@ -1,0 +1,78 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [~]  — Wrap CTE chain with final SELECT that matches original output columns exactly.
+    ├── [CTE] date_filtered  [+]  — Pre-filter date_dim for 12-month window.
+    ├── [CTE] inventory_agg  [+]  — Aggregate inventory quantities by item before joining to item.
+    ├── [CTE] join_item  [+]  — Join aggregated inventory with item to get product attributes.
+    ├── [CTE] union_levels_with_sums  [+]  — Explicit UNION ALL of 5 grouping levels (product, brand, class, category, total).
+    ├── [CTE] final_avg  [+]  — Compute average (total_sum/total_cnt) for each row.
+    ├── SORT (qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC)
+    └── OUTPUT (i_product_name, i_brand, i_class, i_category, qoh)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "duckdb",
+  "rewrite_rules": [
+    {"id": "R1", "type": "dimension_cte_isolate", "description": "Pre-filter date_dim into CTE to reduce hash table size for inventory join.", "applied_to": ["date_filtered"]},
+    {"id": "R2", "type": "aggregate_push_below_join", "description": "Aggregate inventory by item before joining to item (safe because inv_item_sk → i_item_sk is one-to-one).", "applied_to": ["inventory_agg"]},
+    {"id": "R3", "type": "rollup_to_union_windowing", "description": "Replace ROLLUP with explicit UNION ALL of grouping levels to control grouping sets.", "applied_to": ["union_levels_with_sums"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "date_filtered": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1188 AND 1188 + 11",
+        "interfaces": {"outputs": ["d_date_sk"], "consumes": []}
+      },
+      "inventory_agg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT inv_item_sk, SUM(inv_quantity_on_hand) AS sum_qty, COUNT(inv_quantity_on_hand) AS cnt FROM inventory JOIN date_filtered ON inv_date_sk = d_date_sk GROUP BY inv_item_sk",
+        "interfaces": {"outputs": ["inv_item_sk", "sum_qty", "cnt"], "consumes": ["date_filtered"]}
+      },
+      "join_item": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_product_name, i_brand, i_class, i_category, sum_qty, cnt FROM inventory_agg JOIN item ON inv_item_sk = i_item_sk",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "sum_qty", "cnt"], "consumes": ["inventory_agg"]}
+      },
+      "union_levels_with_sums": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_product_name, i_brand, i_class, i_category, SUM(sum_qty) AS total_sum, SUM(cnt) AS total_cnt FROM join_item GROUP BY i_product_name, i_brand, i_class, i_category UNION ALL SELECT i_product_name, i_brand, i_class, NULL, SUM(sum_qty) AS total_sum, SUM(cnt) AS total_cnt FROM join_item GROUP BY i_product_name, i_brand, i_class UNION ALL SELECT i_product_name, i_brand, NULL, NULL, SUM(sum_qty) AS total_sum, SUM(cnt) AS total_cnt FROM join_item GROUP BY i_product_name, i_brand UNION ALL SELECT i_product_name, NULL, NULL, NULL, SUM(sum_qty) AS total_sum, SUM(cnt) AS total_cnt FROM join_item GROUP BY i_product_name UNION ALL SELECT NULL, NULL, NULL, NULL, SUM(sum_qty) AS total_sum, SUM(cnt) AS total_cnt FROM join_item",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "total_sum", "total_cnt"], "consumes": ["join_item"]}
+      },
+      "final_avg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT i_product_name, i_brand, i_class, i_category, total_sum / total_cnt AS qoh FROM union_levels_with_sums WHERE total_cnt > 0",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "qoh"], "consumes": ["union_levels_with_sums"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT i_product_name, i_brand, i_class, i_category, qoh FROM final_avg ORDER BY qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC LIMIT 100",
+        "interfaces": {"outputs": ["i_product_name", "i_brand", "i_class", "i_category", "qoh"], "consumes": ["final_avg"]}
+      }
+    },
+    "reconstruction_order": ["date_filtered", "inventory_agg", "join_item", "union_levels_with_sums", "final_avg", "main_query"],
+    "assembly_template": "WITH date_filtered AS ({date_filtered}), inventory_agg AS ({inventory_agg}), join_item AS ({join_item}), union_levels_with_sums AS ({union_levels_with_sums}), final_avg AS ({final_avg}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+**Changes**: Restructured original single-block query into a CTE pipeline that (1) pre‑filters dates, (2) aggregates inventory before joining to item (safe 1:1), (3) expands ROLLUP into explicit UNION ALL grouping levels, and (4) computes the average once per level. This isolates dimension filtering, pushes aggregation below the join, and gives the optimizer explicit control over each grouping set.
+
+**Expected speedup**: ~2.5–3x due to reduced hash‑join size (aggregation pushdown) and elimination of ROLLUP overhead.

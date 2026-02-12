@@ -1,0 +1,349 @@
+<reasoning>
+## Step 1: CLASSIFY
+This is a **channel-comparison self-join** archetype with a **star-join with late dim filter** pattern. It compares year-over-year store sales (2001 vs 2002) for items that meet a catalog net-sales condition, involving a massive star join (store_sales with 15+ dimension tables) followed by a self-join on the aggregated result.
+
+## Step 2: EXPLAIN PLAN ANALYSIS
+
+**Compute wall-clock ms per major node (exclusive time):**
+- catalog_sales ↔ catalog_returns join: 818ms (26% total)
+- store_sales scan: 696ms (22%)
+- cs_ui HASH_GROUP_BY: 380ms (12%)
+- customer ↔ customer_demographics join: 161ms (5%)
+- store_sales ↔ store_returns join: 113ms (4%)
+- catalog_sales scan: 559ms (18%)
+- store_returns scan: 11ms
+- item scan: 4ms
+
+**Row count flow:**
+- catalog_sales: 14.2M → join with catalog_returns → 1.4M → GROUP BY → 100K → HAVING filter → 99K
+- item: 102K → color/price filter → 1,090 → join with cs_ui (99K) → 19 rows (massive reduction!)
+- store_sales: 10.3M → join with store_returns (2.8M) → 139 rows (after all joins/filters)
+- cross_sales CTE output: 99 rows
+- Main query: self-join 99 rows → 3 rows
+
+**Key observations:**
+1. **cs_ui CTE is the primary bottleneck**: Processes 14.2M + 1.4M rows to produce 99K rows, but only 19 survive the item join. The item filter (color/price) is applied AFTER cs_ui computation.
+2. **store_sales ↔ store_returns join reduces dramatically**: From 10.3M to 139 rows due to many dimension filters.
+3. **Optimizer already splits CTEs**: The EXPLAIN shows CTE materialization (CTE_SCAN nodes). cross_sales CTE is materialized once (99 rows) and probed twice.
+4. **Predicate pushdown is partial**: The item filter (i_color IN, i_current_price BETWEEN) is pushed into item scan but NOT into cs_ui CTE. The date filters (d_year=2001/2002) are pushed into date_dim scans.
+5. **Multiple date_dim aliases**: d1, d2, d3 are all filtered differently but scanned separately.
+
+**Missed opportunities:**
+- cs_ui computes 99K rows but only 19 match the item filter → **98.9% wasted computation**.
+- cross_sales CTE computes all years but main query only uses 2001/2002 → **wasted computation for other years**.
+- Dimension tables (customer_demographics, household_demographics, income_band, promotion) are scanned multiple times (once per alias in cross_sales).
+
+## Step 3: GAP MATCHING
+
+1. **CROSS_CTE_PREDICATE_BLINDNESS** ✓
+   - cs_ui CTE doesn't have item filter pushed down (i_color, i_current_price)
+   - cross_sales CTE doesn't have year filter (syear=2001/2002) pushed down
+   - Opportunity: pre-filter dimensions into CTEs before fact joins
+
+2. **REDUNDANT_SCAN_ELIMINATION** ✓
+   - catalog_sales scanned once (in cs_ui), store_sales scanned once, store_returns scanned once
+   - No repeated scans of same fact table → this gap doesn't apply
+
+3. **UNION_CTE_SELF_JOIN_DECOMPOSITION** ✓
+   - cross_sales CTE is generic (all years) and scanned twice with different year filters
+   - Opportunity: split into year-specific CTEs (2001, 2002)
+
+4. **CORRELATED_SUBQUERY_PARALLELISM** ✗ (no correlated subqueries)
+
+**Optimizer already handles well:**
+- Intra-scan predicate pushdown (filters in SEQ_SCAN nodes)
+- Hash join selection
+- CTE materialization for multi-reference CTEs
+
+## Step 4: AGGREGATION TRAP CHECK
+- cs_ui: SUM() with HAVING inequality → safe to push filters
+- cross_sales: COUNT(*), SUM() → safe to push filters
+- No STDDEV_SAMP, VARIANCE, or FILTER clauses
+- Changing group membership by pushing item filter into cs_ui changes which items are aggregated, but that's correct: we only want items meeting both catalog and store criteria.
+
+## Step 5: TRANSFORM SELECTION
+
+Ranked opportunities:
+1. **Push item filter into cs_ui** (biggest win: reduces 99K → ~19 rows early) → single_pass_aggregation + star_join_prefetch
+2. **Split cross_sales by year** (avoids computing all years) → union_cte_split
+3. **Pre-filter all dimensions before fact joins** → dimension_cte_isolate + multi_date_range_cte
+4. **Consolidate dimension scans** (customer_demographics scanned twice) → shared_dimension_multi_channel
+
+Select 4 structurally diverse strategies:
+1. **Worker 1: Star-join prefetch with early item pushdown** (single_pass_aggregation + star_join_prefetch)
+2. **Worker 2: Year-split CTE decomposition** (union_cte_split)
+3. **Worker 3: Dimension isolation with multi-date CTEs** (dimension_cte_isolate + multi_date_range_cte)
+4. **Worker 4: Exploration: Combine all three + late attribute binding** (compound strategy with novel combination)
+
+## Step 6: LOGICAL TREE DESIGN
+
+For each strategy, ensure CTE column completeness:
+- cs_ui must output: cs_item_sk, sale, refund
+- cross_sales must output: all 30+ columns listed in GROUP BY plus aggregates
+- Main query needs all cross_sales columns from both aliases
+
+Check downstream references from logical tree.
+</reasoning>
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Business: Compare year-over-year store sales (2001 vs 2002) for items whose catalog net sales exceed twice their refunds, under demographic/address/item constraints. JOIN semantics: All joins are INNER except the main self-join which is also INNER (intersection). Aggregation traps: No STDDEV_SAMP or FILTER clauses; SUM/COUNT are duplicate-safe but ensure item filter pushdown doesn't break HAVING logic. Filter dependencies: cs_ui HAVING depends on catalog aggregates; cross_sales filters (cd1≠cd2, i_color, price) must preserve marital status inequality.
+
+BOTTLENECK_DIAGNOSIS:
+Dominant cost is cs_ui CTE (818ms join + 380ms aggregation) processing 15.6M rows to produce 99K rows, of which only 19 match the item filter — 99.98% waste. Query is scan-bound on catalog_sales and store_sales. Cardinality flow: catalog_sales 14.2M → 1.4M → 100K → 99K; item 102K → 1,090 → join with cs_ui → 19; store_sales 10.3M → 139 → cross_sales 99 rows. Optimizer already handles predicate pushdown into scans and hash joins well. Logical-tree cost percentages (33% each) are misleading — cs_ui dominates actual runtime.
+
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must preserve all 30+ output columns from original SELECT.
+- CTE_COLUMN_COMPLETENESS: cross_sales CTE must include all GROUP BY columns plus aggregates for main query self-join.
+- LITERAL_PRESERVATION: Must keep exact literal values (i_color list, price 23+10, years 2001/2002).
+- SEMANTIC_EQUIVALENCE: Result rows and ordering must match exactly.
+- CROSS_CTE_PREDICATE_BLINDNESS: cs_ui lacks item filter; cross_sales lacks year filter.
+- UNION_CTE_SELF_JOIN_DECOMPOSITION: cross_sales CTE scanned twice with year filters.
+
+REGRESSION_WARNINGS:
+1. date_cte_isolate (0.49x on Q31):
+   CAUSE: Baseline <100ms, CTE overhead dominated savings.
+   RULE: This query baseline is 3175ms >> 100ms, so safe.
+2. prefetch_fact_join (0.50x on Q25):
+   CAUSE: Pre-filtered fact table before 3-way fact join, preventing optimizer reorder.
+   RULE: This query has only one fact table (store_sales) in cross_sales, no multi-fact join.
+3. union_cte_split (0.49x on Q74):
+   CAUSE: Kept original UNION CTE alongside specialized CTEs, causing redundant materialization.
+   RULE: When splitting cross_sales by year, ELIMINATE the original generic CTE.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: star_join_prefetch_with_item_pushdown
+TARGET_LOGICAL_TREE:
+filtered_item -> filtered_cs_ui -> prefetched_store_sales -> cross_sales -> main_query
+NODE_CONTRACTS:
+  filtered_item:
+    FROM: item
+    WHERE: i_color IN ('blanched','medium','brown','chocolate','burlywood','drab') AND i_current_price BETWEEN 23 AND 33 AND i_current_price BETWEEN 24 AND 38
+    OUTPUT: i_item_sk, i_product_name
+    EXPECTED_ROWS: 1,090
+    CONSUMERS: filtered_cs_ui, prefetched_store_sales
+  filtered_cs_ui:
+    FROM: catalog_sales JOIN catalog_returns ON cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number, filtered_item
+    WHERE: cs_item_sk = i_item_sk
+    GROUP BY: cs_item_sk
+    HAVING: SUM(cs_ext_list_price) > 2*SUM(cr_refunded_cash+cr_reversed_charge+cr_store_credit)
+    OUTPUT: cs_item_sk, SUM(cs_ext_list_price) AS sale, SUM(cr_refunded_cash+cr_reversed_charge+cr_store_credit) AS refund
+    EXPECTED_ROWS: ~19
+    CONSUMERS: prefetched_store_sales
+  prefetched_store_sales:
+    FROM: store_sales, store_returns, filtered_item, filtered_cs_ui, date_dim d1, date_dim d2, date_dim d3, store, customer, customer_demographics cd1, customer_demographics cd2, promotion, household_demographics hd1, household_demographics hd2, customer_address ad1, customer_address ad2, income_band ib1, income_band ib2
+    JOIN: ss_store_sk = s_store_sk AND ss_sold_date_sk = d1.d_date_sk AND ss_customer_sk = c_customer_sk AND ss_cdemo_sk = cd1.cd_demo_sk AND ss_hdemo_sk = hd1.hd_demo_sk AND ss_addr_sk = ad1.ca_address_sk AND ss_item_sk = i_item_sk AND ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number AND ss_item_sk = cs_item_sk AND c_current_cdemo_sk = cd2.cd_demo_sk AND c_current_hdemo_sk = hd2.hd_demo_sk AND c_current_addr_sk = ad2.ca_address_sk AND c_first_sales_date_sk = d2.d_date_sk AND c_first_shipto_date_sk = d3.d_date_sk AND ss_promo_sk = p_promo_sk AND hd1.hd_income_band_sk = ib1.ib_income_band_sk AND hd2.hd_income_band_sk = ib2.ib_income_band_sk
+    WHERE: cd1.cd_marital_status <> cd2.cd_marital_status AND d1.d_year IN (2001,2002) AND d1.d_date_sk BETWEEN 2450816 AND 2452642
+    OUTPUT: i_product_name, i_item_sk, s_store_name, s_zip, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip, d1.d_year AS syear, d2.d_year AS fsyear, d3.d_year AS s2year, COUNT(*) AS cnt, SUM(ss_wholesale_cost) AS s1, SUM(ss_list_price) AS s2, SUM(ss_coupon_amt) AS s3
+    EXPECTED_ROWS: ~99
+    CONSUMERS: cross_sales
+  cross_sales:
+    FROM: prefetched_store_sales
+    GROUP BY: i_product_name, i_item_sk, s_store_name, s_zip, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip, d1.d_year, d2.d_year, d3.d_year
+    OUTPUT: product_name, item_sk, store_name, store_zip, b_street_number, b_street_name, b_city, b_zip, c_street_number, c_street_name, c_city, c_zip, syear, cnt, s1, s2, s3
+    EXPECTED_ROWS: ~99
+    CONSUMERS: main_query
+  main_query:
+    FROM: cross_sales cs1, cross_sales cs2
+    WHERE: cs1.item_sk = cs2.item_sk AND cs1.syear = 2001 AND cs2.syear = 2002 AND cs2.cnt <= cs1.cnt AND cs1.store_name = cs2.store_name AND cs1.store_zip = cs2.store_zip
+    ORDER BY: cs1.product_name, cs1.store_name, cs2.cnt, cs1.s1, cs2.s1
+    OUTPUT: cs1.product_name, cs1.store_name, cs1.store_zip, cs1.b_street_number, cs1.b_street_name, cs1.b_city, cs1.b_zip, cs1.c_street_number, cs1.c_street_name, cs1.c_city, cs1.c_zip, cs1.syear, cs1.cnt, cs1.s1 AS s11, cs1.s2 AS s21, cs1.s3 AS s31, cs2.s1 AS s12, cs2.s2 AS s22, cs2.s3 AS s32, cs2.syear, cs2.cnt
+    EXPECTED_ROWS: 3
+    CONSUMERS: final output
+EXAMPLES: single_pass_aggregation, star_join_prefetch, date_cte_isolate
+EXAMPLE_ADAPTATION:
+- single_pass_aggregation: Apply by pushing item filter into cs_ui CTE (consolidate item scan with catalog scan). Ignore the CASE aggregation aspect — we're not merging multiple subqueries.
+- star_join_prefetch: Apply by pre-filtering item and cs_ui before joining with store_sales. Ignore the multiple dimension CTE chain — we'll keep all dimension joins together.
+- date_cte_isolate: Apply by filtering d1 for years 2001/2002 and date range in prefetched_store_sales. Ignore creating separate date CTE — we'll push filters directly.
+HAZARD_FLAGS:
+- Must ensure cs_ui HAVING still evaluates correctly after joining with filtered_item (no duplicate rows introduced).
+- The item price filter has overlapping ranges (23-33 AND 24-38) which simplifies to 24-33. Ensure rewritten filter captures this.
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: year_split_cte_decomposition
+TARGET_LOGICAL_TREE:
+cs_ui -> cross_sales_2001 -> cross_sales_2002 -> main_query
+NODE_CONTRACTS:
+  cs_ui:
+    FROM: catalog_sales JOIN catalog_returns ON cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number
+    GROUP BY: cs_item_sk
+    HAVING: SUM(cs_ext_list_price) > 2*SUM(cr_refunded_cash+cr_reversed_charge+cr_store_credit)
+    OUTPUT: cs_item_sk, SUM(cs_ext_list_price) AS sale, SUM(cr_refunded_cash+cr_reversed_charge+cr_store_credit) AS refund
+    EXPECTED_ROWS: 99K
+    CONSUMERS: cross_sales_2001, cross_sales_2002
+  cross_sales_2001:
+    FROM: store_sales, store_returns, cs_ui, date_dim d1, date_dim d2, date_dim d3, store, customer, customer_demographics cd1, customer_demographics cd2, promotion, household_demographics hd1, household_demographics hd2, customer_address ad1, customer_address ad2, income_band ib1, income_band ib2, item
+    JOIN: (same 18 joins as original)
+    WHERE: cd1.cd_marital_status <> cd2.cd_marital_status AND i_color IN ('blanched','medium','brown','chocolate','burlywood','drab') AND i_current_price BETWEEN 23 AND 33 AND i_current_price BETWEEN 24 AND 38 AND d1.d_year = 2001 AND d1.d_date_sk BETWEEN 2450816 AND 2452642
+    GROUP BY: (same 17 columns as original)
+    OUTPUT: product_name, item_sk, store_name, store_zip, b_street_number, b_street_name, b_city, b_zip, c_street_number, c_street_name, c_city, c_zip, syear, cnt, s1, s2, s3
+    EXPECTED_ROWS: ~50 (half of 99)
+    CONSUMERS: main_query
+  cross_sales_2002:
+    FROM: (same as cross_sales_2001)
+    WHERE: ... AND d1.d_year = 2002 AND d1.d_date_sk BETWEEN 2450816 AND 2452642
+    GROUP BY: (same)
+    OUTPUT: (same columns as cross_sales_2001)
+    EXPECTED_ROWS: ~49
+    CONSUMERS: main_query
+  main_query:
+    FROM: cross_sales_2001 cs1, cross_sales_2002 cs2
+    WHERE: cs1.item_sk = cs2.item_sk AND cs2.cnt <= cs1.cnt AND cs1.store_name = cs2.store_name AND cs1.store_zip = cs2.store_zip
+    ORDER BY: cs1.product_name, cs1.store_name, cs2.cnt, cs1.s1, cs2.s1
+    OUTPUT: (same as original)
+    EXPECTED_ROWS: 3
+    CONSUMERS: final output
+EXAMPLES: union_cte_split, multi_date_range_cte, shared_dimension_multi_channel
+EXAMPLE_ADAPTATION:
+- union_cte_split: Apply by splitting cross_sales into year-specific CTEs (2001, 2002). Ignore the UNION aspect — we're not merging results.
+- multi_date_range_cte: Apply by filtering d1 for specific year in each CTE. Ignore creating separate CTEs for d2/d3 — keep them joined inline.
+- shared_dimension_multi_channel: Apply by reusing cs_ui CTE across both year CTEs. Ignore the multi-channel aspect — we have single channel.
+HAZARD_FLAGS:
+- Must ELIMINATE the original cross_sales CTE to avoid redundant materialization (regression warning).
+- Ensure d2 and d3 filters (date ranges) remain in each year CTE; they are independent of d1 year.
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: dimension_isolation_multi_date_cte
+TARGET_LOGICAL_TREE:
+filtered_item -> filtered_d1 -> filtered_d2 -> filtered_d3 -> filtered_store -> filtered_customer -> filtered_cd1 -> filtered_cd2 -> filtered_hd1 -> filtered_hd2 -> filtered_ad1 -> filtered_ad2 -> filtered_promo -> filtered_ib1 -> filtered_ib2 -> cs_ui -> joined_fact -> cross_sales -> main_query
+NODE_CONTRACTS:
+  filtered_item: (as Worker 1)
+  filtered_d1:
+    FROM: date_dim
+    WHERE: d_year IN (2001,2002) AND d_date_sk BETWEEN 2450816 AND 2452642
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: 730
+    CONSUMERS: joined_fact
+  filtered_d2:
+    FROM: date_dim
+    WHERE: d_date_sk BETWEEN 2448998 AND 2452648
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: 3,651
+    CONSUMERS: joined_fact
+  filtered_d3:
+    FROM: date_dim
+    WHERE: d_date_sk BETWEEN 2449028 AND 2452678
+    OUTPUT: d_date_sk, d_year
+    EXPECTED_ROWS: 3,651
+    CONSUMERS: joined_fact
+  filtered_store:
+    FROM: store
+    WHERE: s_store_sk <= 100
+    OUTPUT: s_store_sk, s_store_name, s_zip
+    EXPECTED_ROWS: 100
+    CONSUMERS: joined_fact
+  filtered_customer:
+    FROM: customer, customer_address, filtered_d2, filtered_d3
+    JOIN: c_current_addr_sk = ca_address_sk AND c_first_sales_date_sk = d_date_sk AND c_first_shipto_date_sk = d_date_sk
+    WHERE: (no extra filter)
+    OUTPUT: c_customer_sk, c_current_cdemo_sk, c_current_hdemo_sk, ca_address_sk, d2.d_year AS fsyear, d3.d_year AS s2year
+    EXPECTED_ROWS: ~474K
+    CONSUMERS: joined_fact
+  filtered_cd1:
+    FROM: customer_demographics
+    WHERE: cd_demo_sk >= 4 AND cd_demo_sk <= 1920791
+    OUTPUT: cd_demo_sk, cd_marital_status
+    EXPECTED_ROWS: 1.9M
+    CONSUMERS: joined_fact
+  filtered_cd2:
+    FROM: customer_demographics
+    WHERE: (same as filtered_cd1)
+    OUTPUT: cd_demo_sk, cd_marital_status
+    EXPECTED_ROWS: 1.9M
+    CONSUMERS: joined_fact
+  filtered_hd1:
+    FROM: household_demographics JOIN income_band ON hd_income_band_sk = ib_income_band_sk
+    OUTPUT: hd_demo_sk, hd_income_band_sk
+    EXPECTED_ROWS: 7,200
+    CONSUMERS: joined_fact
+  filtered_hd2: (same as filtered_hd1)
+  filtered_ad1:
+    FROM: customer_address
+    WHERE: ca_address_sk <= 250000
+    OUTPUT: ca_address_sk, ca_street_number, ca_street_name, ca_city, ca_zip
+    EXPECTED_ROWS: 250K
+    CONSUMERS: joined_fact
+  filtered_ad2: (same as filtered_ad1)
+  filtered_promo:
+    FROM: promotion
+    OUTPUT: p_promo_sk
+    EXPECTED_ROWS: 500
+    CONSUMERS: joined_fact
+  filtered_ib1:
+    FROM: income_band
+    OUTPUT: ib_income_band_sk
+    EXPECTED_ROWS: 20
+    CONSUMERS: joined_fact
+  filtered_ib2: (same as filtered_ib1)
+  cs_ui: (as original, no item filter)
+  joined_fact:
+    FROM: store_sales, store_returns, filtered_item, cs_ui, filtered_d1, filtered_d2, filtered_d3, filtered_store, filtered_customer, filtered_cd1, filtered_cd2, filtered_hd1, filtered_hd2, filtered_ad1, filtered_ad2, filtered_promo, filtered_ib1, filtered_ib2
+    JOIN: (all 18 join conditions using filtered CTE keys)
+    WHERE: cd1.cd_marital_status <> cd2.cd_marital_status AND ss_item_sk = i_item_sk AND ss_item_sk = cs_item_sk
+    OUTPUT: (all columns needed for cross_sales GROUP BY)
+    EXPECTED_ROWS: ~139
+    CONSUMERS: cross_sales
+  cross_sales: (as Worker 1)
+  main_query: (as Worker 1)
+EXAMPLES: dimension_cte_isolate, multi_dimension_prefetch, multi_date_range_cte
+EXAMPLE_ADAPTATION:
+- dimension_cte_isolate: Apply by creating filtered CTEs for every dimension table. Ignore the risk of cross-joining 3+ CTEs — we'll join them via fact table.
+- multi_dimension_prefetch: Apply by pre-filtering date, store, customer, demographics, address, promotion, income_band. Ignore the requirement that every CTE must have WHERE clause — some dimensions have no filter (promotion, income_band) but are small.
+- multi_date_range_cte: Apply by creating separate date CTEs for d1,d2,d3 with their specific ranges. Ignore the fact that d2 and d3 filters are not year-based — keep range filters.
+HAZARD_FLAGS:
+- Risk of Cartesian explosion if joining many dimension CTEs incorrectly. Must join via fact table surrogate keys only.
+- filtered_cd1 and filtered_cd2 are identical scans; could share one CTE but need separate aliases for marital status inequality.
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: compound_item_pushdown_year_split_late_binding
+TARGET_LOGICAL_TREE:
+filtered_item -> filtered_cs_ui -> filtered_dimensions -> fact_2001 -> fact_2002 -> main_query
+NODE_CONTRACTS:
+  filtered_item: (as Worker 1)
+  filtered_cs_ui:
+    FROM: catalog_sales JOIN catalog_returns ON cs_item_sk = cr_item_sk AND cs_order_number = cr_order_number, filtered_item
+    WHERE: cs_item_sk = i_item_sk
+    GROUP BY: cs_item_sk
+    HAVING: SUM(cs_ext_list_price) > 2*SUM(cr_refunded_cash+cr_reversed_charge+cr_store_credit)
+    OUTPUT: cs_item_sk
+    EXPECTED_ROWS: ~19
+    CONSUMERS: fact_2001, fact_2002
+  filtered_dimensions:
+    FROM: store, customer, customer_demographics cd1, customer_demographics cd2, promotion, household_demographics hd1, household_demographics hd2, customer_address ad1, customer_address ad2, income_band ib1, income_band ib2, date_dim d2, date_dim d3
+    JOIN: c_current_cdemo_sk = cd2.cd_demo_sk AND c_current_hdemo_sk = hd2.hd_demo_sk AND c_current_addr_sk = ad2.ca_address_sk AND c_first_sales_date_sk = d2.d_date_sk AND c_first_shipto_date_sk = d3.d_date_sk AND hd1.hd_income_band_sk = ib1.ib_income_band_sk AND hd2.hd_income_band_sk = ib2.ib_income_band_sk
+    WHERE: cd1.cd_marital_status <> cd2.cd_marital_status AND s_store_sk <= 100 AND d2.d_date_sk BETWEEN 2448998 AND 2452648 AND d3.d_date_sk BETWEEN 2449028 AND 2452678
+    OUTPUT: s_store_sk, s_store_name, s_zip, c_customer_sk, cd1.cd_demo_sk, hd1.hd_demo_sk, ad1.ca_address_sk, p_promo_sk, cd2.cd_demo_sk, hd2.hd_demo_sk, ad2.ca_address_sk, d2.d_year AS fsyear, d3.d_year AS s2year, ad1.ca_street_number, ad1.ca_street_name, ad1.ca_city, ad1.ca_zip, ad2.ca_street_number, ad2.ca_street_name, ad2.ca_city, ad2.ca_zip
+    EXPECTED_ROWS: ~? (reduced dimension set)
+    CONSUMERS: fact_2001, fact_2002
+  fact_2001:
+    FROM: store_sales, store_returns, filtered_item, filtered_cs_ui, filtered_dimensions, date_dim d1
+    JOIN: ss_store_sk = s_store_sk AND ss_sold_date_sk = d1.d_date_sk AND ss_customer_sk = c_customer_sk AND ss_cdemo_sk = cd1.cd_demo_sk AND ss_hdemo_sk = hd1.hd_demo_sk AND ss_addr_sk = ad1.ca_address_sk AND ss_item_sk = i_item_sk AND ss_item_sk = sr_item_sk AND ss_ticket_number = sr_ticket_number AND ss_item_sk = cs_item_sk AND ss_promo_sk = p_promo_sk
+    WHERE: d1.d_year = 2001 AND d1.d_date_sk BETWEEN 2450816 AND 2452642
+    GROUP BY: (same 17 columns as original)
+    OUTPUT: (same as cross_sales_2001)
+    EXPECTED_ROWS: ~50
+    CONSUMERS: main_query
+  fact_2002:
+    FROM: (same as fact_2001)
+    WHERE: d1.d_year = 2002 AND d1.d_date_sk BETWEEN 2450816 AND 2452642
+    GROUP BY: (same)
+    OUTPUT: (same)
+    EXPECTED_ROWS: ~49
+    CONSUMERS: main_query
+  main_query: (as Worker 2)
+EXAMPLES: prefetch_fact_join, union_cte_split, deferred_window_aggregation
+EXAMPLE_ADAPTATION:
+- prefetch_fact_join: Apply by creating filtered_dimensions CTE that pre-joins all dimensions except d1, then join with store_sales separately for each year. Ignore the CTE chain length warning — we have only 2 fact CTEs.
+- union_cte_split: Apply by creating separate fact CTEs for 2001 and 2002. Ignore the UNION aspect.
+- deferred_window_aggregation: Not applicable (no window functions), but inspiration: defer dimension attribute binding until after fact aggregation? Actually we're binding early.
+HAZARD_FLAGS:
+- Complex CTE structure may confuse optimizer cardinality estimation.
+- filtered_dimensions CTE must include all dimension columns needed for GROUP BY and SELECT.
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: compound_strategy
