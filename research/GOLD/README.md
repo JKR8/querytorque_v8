@@ -12,10 +12,9 @@
 - Sources: Kimi K2.5, V2 Evolutionary, 3-Worker Retry, 4-Worker Retry, DSR1
 
 ### PostgreSQL DSB (SF10)
-- **50 queries** total
-- **46 paired** (original + optimized)
-- Status: {'wins': 24, 'improved': 6, 'neutral': 13, 'regression': 7}
-- Sources: V2 Swarm (6 workers), Config Tuning, pg_hint_plan, Regression Retry
+- **52 queries** total (combined: SQL rewrites + config tuning)
+- Status: {'WIN': 29, 'IMPROVED': 11, 'NEUTRAL': 12}
+- Sources: V2 Swarm (76 sessions), Config Tuning (52 queries, 3-race validated), pg_hint_plan
 
 ## Directory Structure
 
@@ -144,64 +143,58 @@ GOLD/
 
 ## PostgreSQL DSB Full Leaderboard
 
-| # | Query | Speedup | Status | Transform | Source | Orig (ms) | Opt (ms) |
-|---|-------|---------|--------|-----------|--------|-----------|----------|
-| 1 | query092_multi | 4428.32x | WIN | decorrelate, date_cte_isolate, dimension_cte_isolate | swarm_w4_q092 | 300000 | 68 |
-| 2 | query081_multi | 676.00x | WIN | rewrite+config | config_tuning | 300000 | 444 |
-| 3 | query032_multi | 391.71x | WIN | decorrelate, date_cte_isolate, dimension_cte_isolate | swarm_w2_q032 | 300000 | 766 |
-| 4 | query013_agg | 60.69x | WIN |  | swarm_w4 | 5106 | 84 |
-| 5 | query014_multi | 30.37x | WIN | rewrite+config | config_tuning | 300000 | 9878 |
-| 6 | query010_multi | 30.18x | WIN |  | revalidation | 1562 | 52 |
-| 7 | query039_multi | 29.48x | WIN |  | revalidation | 6656 | 226 |
-| 8 | query101_agg | 13.97x | WIN |  | swarm_w5 | 118464 | 8482 |
-| 9 | query100_agg | 6.91x | WIN | config_only | config_tuning | 1407 | 204 |
-| 10 | query059_multi | 4.12x | WIN |  | swarm_w1 | 27244 | 6616 |
-| 11 | query072_spj_spj | 3.64x | WIN |  | swarm_w2 | 4732 | 1301 |
-| 12 | query101_spj_spj | 2.91x | WIN |  | swarm_w3 | 117591 | 40442 |
-| 13 | query102_agg | 2.22x | WIN | hint+config | hint_poc | 14312 | 6447 |
-| 14 | query065_multi | 1.93x | WIN |  | swarm_w6 | 6284 | 3251 |
-| 15 | query099_agg | 1.90x | WIN |  | swarm_w3 | 96 | 51 |
-| 16 | query054_multi | 1.68x | WIN |  | swarm_w2 | 35 | 21 |
-| 17 | query050_agg | 1.55x | WIN |  | swarm_w4 | 11981 | 7738 |
-| 18 | query080_multi | 1.47x | WIN |  | swarm_w3 | 88 | 60 |
-| 19 | query087_multi | 1.44x | WIN |  | swarm_w6 | 8826 | 6124 |
-| 20 | query102_spj_spj | 1.36x | WIN |  | swarm_w5 | 15300 | 11290 |
-| 21 | query069_multi | 1.33x | WIN |  | swarm_w5 | 2084 | 1564 |
-| 22 | query038_multi | 1.15x | WIN |  | regression_retry | 18998 | 16520 |
-| 23 | query084_agg | 1.14x | WIN |  | swarm_w3 | 832 | 729 |
-| 24 | query084_spj_spj | 1.10x | WIN |  | swarm_w4 | 743 | 676 |
-| 25 | query027_spj_spj | 1.08x | IMPROVED |  | swarm_w6 | 6294 | 5854 |
-| 26 | query050_spj_spj | 1.08x | IMPROVED |  | swarm_w5 | 8528 | 7928 |
-| 27 | query023_multi | 1.07x | IMPROVED |  | swarm_w4 | 9844 | 9230 |
-| 28 | query064_multi | 1.06x | IMPROVED |  | swarm_w6 | 30318 | 28672 |
-| 29 | query085_agg | 1.06x | IMPROVED |  | regression_retry | 3910 | 3688 |
-| 30 | query085_spj_spj | 1.05x | IMPROVED |  | regression_retry | 3150 | 3000 |
-| 31 | query099_spj_spj | 1.04x | NEUTRAL |  | swarm_w6 | 57 | 54 |
-| 32 | query018_spj_spj | 1.04x | NEUTRAL |  | swarm_w6 | 4727 | 4559 |
-| 33 | query091_spj_spj | 1.02x | NEUTRAL |  | swarm_w5 | 1765 | 1730 |
-| 34 | query030_multi | 1.02x | NEUTRAL |  | swarm_w5 | 1202 | 1174 |
-| 35 | query091_agg | 1.01x | NEUTRAL |  | swarm_w3 | 1808 | 1782 |
-| 36 | query018_agg | 1.01x | NEUTRAL |  | swarm_w4 | 4300 | 4237 |
-| 37 | query072_agg | 1.00x | NEUTRAL |  | swarm_w2 | 4823 | 4803 |
-| 38 | query019_spj_spj | 1.00x | NEUTRAL |  | swarm_w6 | 915 | 913 |
-| 39 | query094_multi | 1.00x | NEUTRAL |  | swarm_w2 | 1648 | 1651 |
-| 40 | query031_multi | 1.00x | REGRESSION |  | swarm_w5 | 4479 | 5372 |
-| 41 | query040_spj_spj | 0.99x | NEUTRAL |  | swarm_w1 | 1174 | 1188 |
-| 42 | query040_agg | 0.98x | NEUTRAL |  | swarm_w6 | 1254 | 1281 |
-| 43 | query027_agg | 0.97x | NEUTRAL |  | swarm_w3 | 3553 | 3650 |
-| 44 | query058_multi | 0.95x | NEUTRAL |  | swarm_w2 | 1538 | 1617 |
-| 45 | query019_agg | 0.93x | REGRESSION |  | swarm_w1 | 920 | 991 |
-| 46 | query025_agg | 0.91x | REGRESSION |  | swarm_w1 | 3781 | 4166 |
-| 47 | query013_spj_spj | 0.90x | REGRESSION |  | swarm_w3 | 4903 | 5450 |
-| 48 | query025_spj_spj | 0.76x | REGRESSION |  | swarm_w3 | 2255 | 2959 |
-| 49 | query100_spj_spj | 0.51x | REGRESSION |  | swarm_w4 | 18486 | 36504 |
-| 50 | query083_multi | 0.49x | REGRESSION |  | swarm_w2 | 2148 | 4356 |
+| # | Query | Speedup | Status | Best Source | Config Type | Notes |
+|---|-------|---------|--------|-------------|-------------|-------|
+| 1 | query092_multi | 8043.91x | WIN | rewrite |  |  |
+| 2 | query032_multi | 1465.16x | WIN | rewrite |  |  |
+| 3 | query081_multi | 438.93x | WIN | rewrite | hint+config | both help |
+| 4 | query010_multi | 30.18x | WIN | rewrite | config | both help |
+| 5 | query039_multi | 29.48x | WIN | rewrite |  |  |
+| 6 | query001_multi | 27.80x | WIN | rewrite |  |  |
+| 7 | query101_spj_spj | 11.47x | WIN | rewrite |  |  |
+| 8 | query101_agg | 10.92x | WIN | rewrite |  |  |
+| 9 | query100_spj_spj | 9.09x | WIN | config | config | recovered from 0.61x |
+| 10 | query083_multi | 8.56x | WIN | rewrite | hint+config | both help |
+| 11 | query072_spj_spj | 7.18x | WIN | rewrite | hint+config | both help |
+| 12 | query013_agg | 7.02x | WIN | rewrite |  |  |
+| 13 | query102_spj_spj | 5.95x | WIN | config | config | recovered from 0.51x |
+| 14 | query100_agg | 5.71x | WIN | config | hint+config | both help |
+| 15 | query072_agg | 5.35x | WIN | config | hint |  |
+| 16 | query064_multi | 3.81x | WIN | rewrite | hint | both help |
+| 17 | query027_agg | 3.76x | WIN | config | config | recovered from 0.46x |
+| 18 | query025_agg | 3.10x | WIN | rewrite |  |  |
+| 19 | query014_multi | 3.02x | WIN | config | hint+config | both help |
+| 20 | query058_multi | 2.51x | WIN | config | hint |  |
+| 21 | query027_spj_spj | 2.35x | WIN | config | hint+config | recovered from 0.43x |
+| 22 | query102_agg | 2.11x | WIN | config | config | both help |
+| 23 | query059_multi | 2.07x | WIN | rewrite | config | both help |
+| 24 | query069_multi | 1.98x | WIN | rewrite | config | both help |
+| 25 | query030_multi | 1.86x | WIN | rewrite | config | both help |
+| 26 | query075_multi | 1.85x | WIN | config | config | recovered from 0.30x |
+| 27 | query031_multi | 1.79x | WIN | rewrite |  |  |
+| 28 | query038_multi | 1.78x | WIN | rewrite |  |  |
+| 29 | query065_multi | 1.75x | WIN | rewrite | hint+config | both help |
+| 30 | query050_spj_spj | 1.39x | IMPROVED | config | config |  |
+| 31 | query080_multi | 1.39x | IMPROVED | rewrite |  |  |
+| 32 | query091_spj_spj | 1.21x | IMPROVED | config | config |  |
+| 33 | query091_agg | 1.19x | IMPROVED | config | config | both help |
+| 34 | query099_agg | 1.18x | IMPROVED | rewrite |  |  |
+| 35 | query087_multi | 1.15x | IMPROVED | rewrite | config | both help |
+| 36 | query050_agg | 1.09x | IMPROVED | rewrite |  |  |
+| 37 | query084_spj_spj | 1.08x | IMPROVED | config | config | both help |
+| 38 | query018_agg | 1.07x | IMPROVED | rewrite |  |  |
+| 39 | query023_multi | 1.07x | IMPROVED | config | config | both help |
+| 40 | query025_spj_spj | 1.06x | IMPROVED | rewrite |  |  |
+| 41 | query018_spj_spj | 1.04x | NEUTRAL | rewrite |  |  |
+| 42 | query085_agg | 1.04x | NEUTRAL | rewrite |  |  |
+| 43 | query013_spj_spj | 1.03x | NEUTRAL | rewrite |  |  |
+| 44 | query019_agg | 1.02x | NEUTRAL | rewrite |  |  |
+| 45 | query019_spj_spj | 1.02x | NEUTRAL | rewrite |  |  |
+| 46 | query094_multi | 1.02x | NEUTRAL | rewrite |  |  |
+| 47 | query040_spj_spj | 1.01x | NEUTRAL | rewrite |  |  |
+| 48 | query054_multi | 1.01x | NEUTRAL | rewrite |  |  |
+| 49 | query040_agg | 1.00x | NEUTRAL | none |  |  |
+| 50 | query084_agg | 1.00x | NEUTRAL | none |  |  |
+| 51 | query085_spj_spj | 1.00x | NEUTRAL | none |  |  |
+| 52 | query099_spj_spj | 1.00x | NEUTRAL | none |  |  |
 
-## Validation Rules
-
-All speedups validated using one of:
-1. **3x runs**: Run 3 times, discard 1st (warmup), average last 2
-2. **5x trimmed mean**: Run 5 times, remove min/max, average remaining 3
-3. **4x triage (1-2-1-2)**: Interleaved warmup+measure for drift control
-
-**Single-run timing comparisons are never used.**

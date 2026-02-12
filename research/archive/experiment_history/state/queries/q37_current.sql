@@ -1,6 +1,0 @@
--- Q37 current state: optimized (retry3w_2, 1.30x)
--- Source: /mnt/c/Users/jakc9/Documents/QueryTorque_V8/retry_collect/q37/w3_optimized.sql
--- Best speedup: 1.30x
-
-WITH filtered_dates AS (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN CAST('2000-02-01' AS DATE) AND CAST('2000-04-01' AS DATE)), filtered_inventory AS (SELECT inv_item_sk FROM inventory JOIN filtered_dates ON d_date_sk = inv_date_sk WHERE inv_quantity_on_hand BETWEEN 100 AND 500), filtered_items AS (SELECT i_item_sk, i_item_id, i_item_desc, i_current_price FROM item WHERE i_current_price BETWEEN 68 AND 68 + 30 AND i_manufact_id IN (677, 940, 694, 808))
-SELECT i_item_id, i_item_desc, i_current_price FROM filtered_items JOIN filtered_inventory ON inv_item_sk = i_item_sk WHERE EXISTS(SELECT 1 FROM catalog_sales WHERE cs_item_sk = i_item_sk) GROUP BY i_item_id, i_item_desc, i_current_price ORDER BY i_item_id LIMIT 100

@@ -1,2 +1,0 @@
-WITH filtered_dates AS (SELECT d_date_sk FROM date_dim WHERE d_date BETWEEN '2000-01-27' AND CAST('2000-04-26' AS DATE))
-SELECT SUM(cs_ext_discount_amt) AS "excess discount amount" FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk JOIN item ON i_item_sk = cs_item_sk WHERE i_manufact_id = 977 AND cs_ext_discount_amt > (SELECT 1.3 * AVG(cs_ext_discount_amt) FROM catalog_sales AS cs2 JOIN filtered_dates AS fd2 ON cs2.cs_sold_date_sk = fd2.d_date_sk WHERE cs2.cs_item_sk = i_item_sk) LIMIT 100

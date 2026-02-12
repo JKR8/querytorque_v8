@@ -1,0 +1,34 @@
+{
+  "id": "pg_state_avg_decorrelate",
+  "name": "State-Average Decorrelation (PostgreSQL)",
+  "description": "Decorrelate a correlated subquery that computes per-state averages by extracting the state aggregation into a separate CTE, then JOINing back on the state key. Converts per-row subquery re-execution into a single GROUP BY + hash join.",
+  "engine": "postgresql",
+  "benchmark": "DSB SF10",
+  "benchmark_queries": ["DSB Q081_multi"],
+  "verified_speedup": "438.93x (timeout rescue)",
+  "principle": "State-Average Decorrelation: when a CTE self-references with a correlated AVG (e.g., ctr1.state = ctr2.state), extract the per-state average into a separate CTE with GROUP BY state, then JOIN. Converts O(states × rows_per_state) to O(total_rows).",
+  "transforms": ["decorrelate"],
+  "original_sql": "with customer_total_return as\n (select cr_returning_customer_sk as ctr_customer_sk\n        ,ca_state as ctr_state, \n \tsum(cr_return_amt_inc_tax) as ctr_total_return\n from catalog_returns\n     ,date_dim\n     ,customer_address\n where cr_returned_date_sk = d_date_sk \n   and d_year =1998\n   and cr_returning_addr_sk = ca_address_sk \n group by cr_returning_customer_sk\n         ,ca_state )\n  select  c_customer_id,c_salutation,c_first_name,c_last_name,ca_street_number,ca_street_name\n                   ,ca_street_type,ca_suite_number,ca_city,ca_county,ca_state,ca_zip,ca_country,ca_gmt_offset\n                  ,ca_location_type,ctr_total_return\n from customer_total_return ctr1\n     ,customer_address\n     ,customer\n where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2\n \t\t\t  from customer_total_return ctr2 \n                  \t  where ctr1.ctr_state = ctr2.ctr_state)\n       and ca_address_sk = c_current_addr_sk\n       and ca_state = 'VA'\n       and ctr1.ctr_customer_sk = c_customer_sk\n order by c_customer_id,c_salutation,c_first_name,c_last_name,ca_street_number,ca_street_name\n                   ,ca_street_type,ca_suite_number,ca_city,ca_county,ca_state,ca_zip,ca_country,ca_gmt_offset\n                  ,ca_location_type,ctr_total_return\n limit 100;",
+  "optimized_sql": "WITH filtered_date AS (\n  SELECT d_date_sk FROM date_dim WHERE d_year = 1998\n),\nreturns_cte AS (\n  SELECT cr_returning_customer_sk AS ctr_customer_sk,\n         ca_state AS ctr_state,\n         SUM(cr_return_amt_inc_tax) AS ctr_total_return\n  FROM catalog_returns\n  JOIN filtered_date ON cr_returned_date_sk = d_date_sk\n  JOIN customer_address ON cr_returning_addr_sk = ca_address_sk\n  GROUP BY cr_returning_customer_sk, ca_state\n),\nstate_avg_cte AS (\n  SELECT ctr_state, AVG(ctr_total_return) AS state_avg\n  FROM returns_cte\n  GROUP BY ctr_state\n)\nSELECT c_customer_id, c_salutation, c_first_name, c_last_name,\n       ca_street_number, ca_street_name, ca_street_type, ca_suite_number,\n       ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset,\n       ca_location_type, ctr1.ctr_total_return\nFROM returns_cte ctr1\nJOIN state_avg_cte ON ctr1.ctr_state = state_avg_cte.ctr_state\nJOIN customer ON ctr1.ctr_customer_sk = c_customer_sk\nJOIN customer_address ON ca_address_sk = c_current_addr_sk\nWHERE ctr1.ctr_total_return > state_avg_cte.state_avg * 1.2\n  AND ca_state = 'VA'\nORDER BY c_customer_id, c_salutation, c_first_name, c_last_name,\n         ca_street_number, ca_street_name, ca_street_type, ca_suite_number,\n         ca_city, ca_county, ca_state, ca_zip, ca_country, ca_gmt_offset,\n         ca_location_type, ctr_total_return\nLIMIT 100",
+  "example": {
+    "opportunity": "STATE_AVG_DECORRELATE",
+    "input_slice": "with customer_total_return as (...)\nselect c_customer_id, ...\nfrom customer_total_return ctr1, customer_address, customer\nwhere ctr1.ctr_total_return > (\n    select avg(ctr_total_return)*1.2\n    from customer_total_return ctr2\n    where ctr1.ctr_state = ctr2.ctr_state)  -- correlated on state\n  and ca_state = 'VA'\n  and ctr1.ctr_customer_sk = c_customer_sk",
+    "output": {
+      "rewrite_sets": [{
+        "id": "rs_01",
+        "transform": "decorrelate",
+        "nodes": {
+          "filtered_date": "SELECT d_date_sk FROM date_dim WHERE d_year = 1998",
+          "returns_cte": "SELECT cr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, SUM(cr_return_amt_inc_tax) AS ctr_total_return FROM catalog_returns JOIN filtered_date ON ... JOIN customer_address ON ... GROUP BY ...",
+          "state_avg_cte": "SELECT ctr_state, AVG(ctr_total_return) AS state_avg FROM returns_cte GROUP BY ctr_state",
+          "main_query": "SELECT ... FROM returns_cte ctr1 JOIN state_avg_cte ON ctr1.ctr_state = state_avg_cte.ctr_state JOIN customer ON ... WHERE ctr1.ctr_total_return > state_avg_cte.state_avg * 1.2 AND ca_state = 'VA'"
+        },
+        "invariants_kept": ["same result rows", "same aggregation", "same ordering"],
+        "expected_speedup": "400x+ (timeout rescue)",
+        "risk": "low"
+      }]
+    },
+    "key_insight": "Principle: State-Average Decorrelation — the correlated subquery computes AVG per state for every outer row. By extracting this into a state_avg_cte with GROUP BY ctr_state (only ~50 states), the O(N * rows_per_state) nested loop becomes a tiny hash join on ~50 rows. Also converts comma joins to explicit JOINs and isolates date filter into CTE.",
+    "pattern_detection": "Look for: CTE that self-references with a correlated AVG where the correlation key is a low-cardinality dimension (state, category, year). The AVG can be pre-computed once with GROUP BY and JOINed back."
+  }
+}

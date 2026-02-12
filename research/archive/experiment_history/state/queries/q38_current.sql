@@ -1,6 +1,0 @@
--- Q38 current state: optimized (retry3w_2, 1.44x)
--- Source: /mnt/c/Users/jakc9/Documents/QueryTorque_V8/retry_collect/q38/w3_optimized.sql
--- Best speedup: 1.44x
-
-WITH date_filter AS (SELECT d_date_sk, d_date FROM date_dim WHERE d_month_seq BETWEEN 1200 AND 1200 + 11)
-SELECT COUNT(*) FROM (SELECT DISTINCT c_last_name, c_first_name, d_date FROM web_sales, date_filter, customer WHERE web_sales.ws_sold_date_sk = date_filter.d_date_sk AND web_sales.ws_bill_customer_sk = customer.c_customer_sk AND EXISTS(SELECT 1 FROM store_sales, date_filter AS sf, customer AS sc WHERE store_sales.ss_sold_date_sk = sf.d_date_sk AND store_sales.ss_customer_sk = sc.c_customer_sk AND sc.c_last_name = customer.c_last_name AND sc.c_first_name = customer.c_first_name AND sf.d_date = date_filter.d_date) AND EXISTS(SELECT 1 FROM catalog_sales, date_filter AS cf, customer AS cc WHERE catalog_sales.cs_sold_date_sk = cf.d_date_sk AND catalog_sales.cs_bill_customer_sk = cc.c_customer_sk AND cc.c_last_name = customer.c_last_name AND cc.c_first_name = customer.c_first_name AND cf.d_date = date_filter.d_date)) AS hot_cust LIMIT 100

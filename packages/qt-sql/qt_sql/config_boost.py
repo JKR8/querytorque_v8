@@ -4,16 +4,23 @@ After the swarm fan-out picks a winning rewrite, this module proposes
 SET LOCAL config changes based on the winner's EXPLAIN ANALYZE plan.
 Rules are derived from V1 manual tuning evidence + PG internals.
 
-No LLM calls — pure rule-based EXPLAIN parsing.
+Two modes:
+  1. Rule-based (default): Pure regex EXPLAIN parsing, no LLM calls.
+  2. LLM-driven (--use-llm): Uses pg_tuner prompt, falls back to rules.
+
+Two input paths:
+  1. boost_session() / boost_benchmark(): Reads from swarm_sessions/
+  2. boost_from_leaderboard(): Reads from leaderboard.json (preferred)
 
 Usage:
+    from qt_sql.config_boost import boost_from_leaderboard
+
+    # From leaderboard (preferred)
+    results = boost_from_leaderboard(benchmark_dir, dsn)
+
+    # Legacy: from swarm_sessions
     from qt_sql.config_boost import boost_session, boost_benchmark
-
-    # Single session
     result = boost_session(session_dir, dsn)
-
-    # Full benchmark
-    results = boost_benchmark(benchmark_dir, dsn)
 """
 
 from __future__ import annotations
@@ -572,3 +579,292 @@ def _write_config_boost_json(session_dir: Path, result: Dict[str, Any]) -> None:
     out_path = session_dir / "config_boost.json"
     out_path.write_text(json.dumps(result, indent=2, default=str))
     logger.info(f"Wrote {out_path}")
+
+
+# =========================================================================
+# LLM-Driven Config Proposal
+# =========================================================================
+
+def propose_config_from_llm(
+    query_sql: str,
+    explain_text: str,
+    dsn: str,
+    current_work_mem_mb: int = 4,
+) -> Dict[str, Dict[str, Any]]:
+    """LLM-driven config proposal using pg_tuner prompt.
+
+    Falls back to rule-based if LLM unavailable or returns empty config.
+
+    Args:
+        query_sql: The SQL query being optimized
+        explain_text: EXPLAIN ANALYZE output text
+        dsn: PostgreSQL connection DSN (for system profile)
+        current_work_mem_mb: Current work_mem in MB
+
+    Returns:
+        Dict of param_name -> {"value": str, "rule": str, "reason": str}
+    """
+    try:
+        from qt_shared.llm import create_llm_client
+        from .prompts.pg_tuner import build_pg_tuner_prompt
+        from .pg_tuning import load_or_collect_profile, PG_TUNABLE_PARAMS
+
+        # Load system profile
+        cache_dir = Path.cwd() / ".cache"
+        profile = load_or_collect_profile(dsn, cache_dir=cache_dir)
+        settings = {s["name"]: s["setting"] for s in profile.settings}
+
+        # Load engine profile if available
+        engine_profile_path = (
+            Path(__file__).parent / "constraints" / "engine_profile_postgresql.json"
+        )
+        engine_profile = None
+        if engine_profile_path.exists():
+            engine_profile = json.loads(engine_profile_path.read_text())
+
+        # Build prompt
+        prompt = build_pg_tuner_prompt(
+            query_sql=query_sql,
+            explain_plan=explain_text,
+            current_settings=settings,
+            engine_profile=engine_profile,
+            baseline_ms=None,
+        )
+
+        # Call LLM
+        llm = create_llm_client()
+        if llm is None:
+            logger.warning("No LLM client configured, falling back to rules")
+            return propose_config_from_explain(explain_text, current_work_mem_mb)
+
+        response = llm.analyze(prompt)
+
+        # Parse response (expects JSON {"params": {...}, "reasoning": "..."})
+        json_match = re.search(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
+        if not json_match:
+            json_match = re.search(r'(\{[^{}]*"params"[^{}]*\{[^}]*\}[^}]*\})', response, re.DOTALL)
+
+        if json_match:
+            config_data = json.loads(json_match.group(1))
+            raw_params = config_data.get("params", {})
+            reasoning = config_data.get("reasoning", "")
+
+            # Convert to proposals format, validate against whitelist
+            proposals: Dict[str, Dict[str, Any]] = {}
+            for param, value in raw_params.items():
+                if param in PG_TUNABLE_PARAMS:
+                    proposals[param] = {
+                        "value": str(value),
+                        "rule": "llm_analysis",
+                        "reason": reasoning[:200],
+                    }
+
+            if proposals:
+                return proposals
+
+        logger.info("LLM returned no usable config, falling back to rules")
+
+    except Exception as e:
+        logger.warning(f"LLM config proposal failed: {e}, falling back to rules")
+
+    # Fallback to rule-based
+    return propose_config_from_explain(explain_text, current_work_mem_mb)
+
+
+# =========================================================================
+# Leaderboard-Based Boost
+# =========================================================================
+
+def boost_from_leaderboard(
+    benchmark_dir: Path,
+    dsn: str,
+    min_speedup: float = 1.05,
+    dry_run: bool = False,
+    use_llm: bool = False,
+    query_ids: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Run config boost on queries from leaderboard.json.
+
+    Reads optimized SQL + EXPLAIN from leaderboard, proposes SET LOCAL
+    configs, and benchmarks the 3-variant comparison.
+
+    Args:
+        benchmark_dir: Path to the benchmark directory
+        dsn: PostgreSQL connection DSN
+        min_speedup: Minimum rewrite speedup to attempt boost
+        dry_run: If True, propose configs without benchmarking
+        use_llm: If True, use LLM for config analysis instead of rules
+        query_ids: If provided, only boost these query IDs
+
+    Returns:
+        List of result dicts, one per query attempted
+    """
+    from .pg_tuning import validate_tuning_config, build_set_local_sql
+
+    benchmark_dir = Path(benchmark_dir)
+    lb_path = benchmark_dir / "leaderboard.json"
+    if not lb_path.exists():
+        logger.error(f"No leaderboard.json in {benchmark_dir}")
+        return []
+
+    data = json.loads(lb_path.read_text())
+    queries = data.get("queries", [])
+
+    # Filter to requested query IDs
+    if query_ids:
+        query_id_set = set(query_ids)
+        queries = [q for q in queries if q.get("query_id") in query_id_set]
+
+    # Filter by speedup threshold
+    queries = [q for q in queries if q.get("speedup", 0) >= min_speedup]
+
+    results: List[Dict[str, Any]] = []
+    for q in queries:
+        query_id = q["query_id"]
+
+        try:
+            result = _boost_leaderboard_entry(
+                q, benchmark_dir, dsn, min_speedup, dry_run, use_llm,
+            )
+            results.append(result)
+        except Exception as e:
+            logger.error(f"Config boost failed for {query_id}: {e}")
+            results.append({
+                "query_id": query_id,
+                "status": "ERROR",
+                "error": str(e),
+            })
+
+    return results
+
+
+def _boost_leaderboard_entry(
+    entry: Dict[str, Any],
+    benchmark_dir: Path,
+    dsn: str,
+    min_speedup: float,
+    dry_run: bool,
+    use_llm: bool,
+) -> Dict[str, Any]:
+    """Process a single leaderboard entry for config boost."""
+    from .pg_tuning import validate_tuning_config, build_set_local_sql
+
+    query_id = entry["query_id"]
+
+    # Load optimized SQL from leaderboard
+    optimized_sql = entry.get("optimized_sql")
+    if not optimized_sql:
+        # Fallback: read from swarm_sessions
+        sessions_dir = benchmark_dir / "swarm_sessions" / query_id
+        worker_id = entry.get("best_worker_id")
+        optimized_sql = _load_best_worker_sql(sessions_dir, worker_id) if sessions_dir.exists() else None
+
+    if not optimized_sql:
+        return {
+            "query_id": query_id,
+            "status": "SKIPPED",
+            "reason": "No optimized SQL in leaderboard",
+        }
+
+    # Load original SQL
+    original_sql = entry.get("original_sql")
+    if not original_sql:
+        sql_path = benchmark_dir / "queries" / f"{query_id}.sql"
+        if sql_path.exists():
+            original_sql = sql_path.read_text(errors="replace").strip()
+
+    if not original_sql:
+        return {
+            "query_id": query_id,
+            "status": "SKIPPED",
+            "reason": "Could not find original SQL",
+        }
+
+    # Get EXPLAIN text: from leaderboard entry, session files, or run fresh
+    explain_text = entry.get("explain_text") or entry.get("explain")
+    if not explain_text:
+        session_dir = benchmark_dir / "swarm_sessions" / query_id
+        worker_id = entry.get("best_worker_id")
+        if session_dir.exists():
+            explain_text = _get_or_run_explain(session_dir, dsn, optimized_sql, worker_id)
+        else:
+            # Run fresh EXPLAIN
+            try:
+                from .execution.database_utils import run_explain_analyze
+                from .prompts.analyst_briefing import format_pg_explain_tree
+                result = run_explain_analyze(dsn, optimized_sql)
+                if result:
+                    explain_text = result.get("plan_text")
+                    if not explain_text:
+                        plan_json = result.get("plan_json")
+                        if plan_json:
+                            explain_text = format_pg_explain_tree(plan_json)
+            except Exception as e:
+                logger.warning(f"EXPLAIN failed for {query_id}: {e}")
+
+    # Propose config
+    if use_llm and explain_text:
+        proposals = propose_config_from_llm(optimized_sql, explain_text, dsn)
+    elif explain_text:
+        proposals = propose_config_from_explain(explain_text)
+    else:
+        proposals = {}
+
+    if not proposals:
+        return {
+            "query_id": query_id,
+            "rewrite_speedup": entry.get("speedup"),
+            "config_proposed": {},
+            "status": "NO_RULES",
+        }
+
+    # Validate and build SET LOCAL commands
+    raw_config = {k: v["value"] for k, v in proposals.items()}
+    validated_config = validate_tuning_config(raw_config)
+    config_commands = build_set_local_sql(validated_config)
+    rules_fired = [v["rule"] for v in proposals.values()]
+    reasons = {k: v["reason"] for k, v in proposals.items()}
+
+    if dry_run:
+        return {
+            "query_id": query_id,
+            "rewrite_speedup": entry.get("speedup"),
+            "config_proposed": validated_config,
+            "config_commands": config_commands,
+            "rules_fired": rules_fired,
+            "reasons": reasons,
+            "status": "DRY_RUN",
+        }
+
+    # Benchmark 3 variants
+    benchmark_result = _run_benchmark(dsn, original_sql, optimized_sql, config_commands)
+
+    if "error" in benchmark_result:
+        return {
+            "query_id": query_id,
+            "rewrite_speedup": entry.get("speedup"),
+            "config_proposed": validated_config,
+            "config_commands": config_commands,
+            "rules_fired": rules_fired,
+            "reasons": reasons,
+            "benchmark_error": benchmark_result["error"],
+            "status": "BENCHMARK_ERROR",
+        }
+
+    # Determine status
+    config_additive = benchmark_result.get("config_additive", 1.0)
+    if benchmark_result.get("best_variant") == "rewrite+config" and config_additive > 1.02:
+        status = "BOOSTED"
+    else:
+        status = "NO_GAIN"
+
+    return {
+        "query_id": query_id,
+        "rewrite_speedup": entry.get("speedup"),
+        "config_proposed": validated_config,
+        "config_commands": config_commands,
+        "benchmark": benchmark_result,
+        "rules_fired": rules_fired,
+        "reasons": reasons,
+        "status": status,
+    }

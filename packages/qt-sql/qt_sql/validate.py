@@ -940,8 +940,8 @@ class Validator:
     ) -> dict:
         """Interleaved 3-variant benchmark: original, rewrite, rewrite+config.
 
-        Uses 1-2-3-1-2-3 pattern: first round warmup, second round measure.
-        All variants share the same cache/thermal state via interleaving.
+        Uses 1-2-3-1-2-3-1-2-3 pattern: warmup, measure1, measure2.
+        Two measurement rounds averaged for reliability.
 
         Only works for PostgreSQL.
 
@@ -1191,9 +1191,10 @@ class PostgresValidatorWrapper:
         rewrite_sql: str,
         config_commands: list[str],
     ) -> dict:
-        """Interleaved 3-variant benchmark: original, rewrite, rewrite+config.
+        """Interleaved 3-variant benchmark with proper validation.
 
-        Pattern: 1-2-3-1-2-3 (round 1 = warmup, round 2 = measure).
+        Pattern: 1-2-3-1-2-3-1-2-3 (3 rounds: warmup, measure1, measure2).
+        Each variant measured twice, results averaged.
         Interleaving controls for cache warming and system drift.
 
         Returns dict with timing, speedups, and best variant.
@@ -1204,28 +1205,48 @@ class PostgresValidatorWrapper:
         try:
             # Round 1: warmup (all three variants)
             executor.execute(original_sql, timeout_ms=timeout_ms)
-            rows_rw = executor.execute(rewrite_sql, timeout_ms=timeout_ms)
-            rows_cfg = executor.execute_with_config(
+            executor.execute(rewrite_sql, timeout_ms=timeout_ms)
+            executor.execute_with_config(
                 rewrite_sql, config_commands, timeout_ms=timeout_ms
             )
 
-            # Round 2: measure (all three variants, same order)
+            # Round 2: measure 1
             t0 = time.perf_counter()
             executor.execute(original_sql, timeout_ms=timeout_ms)
-            t_orig = (time.perf_counter() - t0) * 1000
+            t_orig_1 = (time.perf_counter() - t0) * 1000
 
             t0 = time.perf_counter()
             rows_rw = executor.execute(rewrite_sql, timeout_ms=timeout_ms)
-            t_rewrite = (time.perf_counter() - t0) * 1000
+            t_rewrite_1 = (time.perf_counter() - t0) * 1000
 
             t0 = time.perf_counter()
             rows_cfg = executor.execute_with_config(
                 rewrite_sql, config_commands, timeout_ms=timeout_ms
             )
-            t_config = (time.perf_counter() - t0) * 1000
+            t_config_1 = (time.perf_counter() - t0) * 1000
+
+            # Round 3: measure 2
+            t0 = time.perf_counter()
+            executor.execute(original_sql, timeout_ms=timeout_ms)
+            t_orig_2 = (time.perf_counter() - t0) * 1000
+
+            t0 = time.perf_counter()
+            executor.execute(rewrite_sql, timeout_ms=timeout_ms)
+            t_rewrite_2 = (time.perf_counter() - t0) * 1000
+
+            t0 = time.perf_counter()
+            executor.execute_with_config(
+                rewrite_sql, config_commands, timeout_ms=timeout_ms
+            )
+            t_config_2 = (time.perf_counter() - t0) * 1000
 
         except Exception as e:
             return {"error": str(e)}
+
+        # Average two measurement rounds
+        t_orig = (t_orig_1 + t_orig_2) / 2
+        t_rewrite = (t_rewrite_1 + t_rewrite_2) / 2
+        t_config = (t_config_1 + t_config_2) / 2
 
         rewrite_speedup = t_orig / t_rewrite if t_rewrite > 0 else 1.0
         config_speedup = t_orig / t_config if t_config > 0 else 1.0

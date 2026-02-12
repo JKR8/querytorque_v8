@@ -1,2 +1,0 @@
-WITH filtered_dates AS (SELECT d_date_sk FROM date_dim WHERE d_year = 1999 AND d_moy = 11)
-SELECT i_brand_id AS brand_id, i_brand AS brand, SUM(ss_ext_sales_price) AS ext_price FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk JOIN item ON ss_item_sk = i_item_sk WHERE i_manager_id = 28 GROUP BY i_brand, i_brand_id ORDER BY ext_price DESC, i_brand_id LIMIT 100

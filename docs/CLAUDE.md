@@ -13,6 +13,7 @@
 | **SQL Product** | `packages/qt-sql/` |
 | **DAX Product** | `packages/qt-dax/` |
 | **Shared UI Components** | `packages/qt-ui-shared/` |
+| **Leaderboards** | `research/leaderboards/` |
 | **Research/Experiments** | `research/` |
 
 ---
@@ -176,6 +177,18 @@ cd packages/qt-sql && pytest tests/ -v
 # qt-dax tests
 cd packages/qt-dax && pytest tests/ -v
 ```
+
+---
+
+## Leaderboards
+
+**All leaderboard data lives in `research/leaderboards/`.** Never create leaderboard data outside this directory.
+
+- `*.html` at root — self-contained viewable leaderboards (double-click to open)
+- `data/` — JSON + CSV machine-readable data
+- `prompts/` — prompt chain snapshots keyed by run name
+- `scripts/` — build and snapshot scripts
+- Naming convention: `YYYYMMDD_{benchmark}_{label}.html`
 
 ---
 
