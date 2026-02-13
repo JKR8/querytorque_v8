@@ -232,116 +232,50 @@ def _section_output_format(
     """
     lines = []
 
-    # ── Column Completeness Contract (always first) ──
+    # ── Column Completeness Contract ──
     if output_columns:
-        lines.append("### Column Completeness Contract")
-        lines.append("")
+        cols_str = ", ".join(f"`{c}`" for c in output_columns)
         lines.append(
-            "Your `main_query` component MUST produce **exactly** these output columns "
-            "(same names, same order):"
+            f"### Column Completeness Contract\n\n"
+            f"`main_query` MUST produce exactly these columns (same names, same order): "
+            f"{cols_str}\n"
         )
-        lines.append("")
-        for i, col in enumerate(output_columns, 1):
-            lines.append(f"  {i}. `{col}`")
-        lines.append("")
-        lines.append(
-            "Do NOT add, remove, or rename any output columns. "
-            "The result set schema must be identical to the original query."
-        )
-        lines.append("")
 
     # ── Original Query Structure (Logic Tree context) ──
     if original_logic_tree:
-        lines.append("## Original Query Structure")
-        lines.append("")
         lines.append(
-            "This is the current query structure. All nodes are `[=]` (unchanged). "
-            "Your modified Logic Tree below should show which nodes you changed."
+            "## Original Query Structure\n\n"
+            "Current structure (all `[=]` unchanged). Your modified tree shows what you changed.\n\n"
+            "```\n" + original_logic_tree + "\n```\n"
         )
-        lines.append("")
-        lines.append("```")
-        lines.append(original_logic_tree)
-        lines.append("```")
-        lines.append("")
 
     # ── Output Format ──
-    lines.append("## Output Format")
-    lines.append("")
     lines.append(
-        "Your response has **two parts** in order:"
+        "## Output Format\n\n"
+        "Two parts in order:\n\n"
+        "### Part 1: Modified Logic Tree\n\n"
+        "Generate BEFORE writing SQL. Markers: `[+]` new, `[-]` removed, `[~]` modified, `[=]` unchanged, `[!]` structural change.\n\n"
+        "### Part 2: Component Payload JSON\n\n"
+        "```json\n"
+        '{"spec_version": "1.0", "dialect": "<dialect>",\n'
+        ' "rewrite_rules": [{"id": "R1", "type": "<transform>", "description": "<what>", "applied_to": ["<id>"]}],\n'
+        ' "statements": [{"target_table": null, "change": "modified",\n'
+        '   "components": {\n'
+        '     "<cte>": {"type": "cte", "change": "modified", "sql": "<full SQL>",\n'
+        '       "interfaces": {"outputs": ["col1"], "consumes": ["<upstream>"]}},\n'
+        '     "main_query": {"type": "main_query", "change": "modified", "sql": "<SELECT>",\n'
+        '       "interfaces": {"outputs": ["col1"], "consumes": ["<cte>"]}}},\n'
+        '   "reconstruction_order": ["<cte>", "main_query"],\n'
+        '   "assembly_template": "WITH <cte> AS ({<cte>}) {main_query}"}],\n'
+        ' "macros": {}, "frozen_blocks": [], "validation_checks": []}\n'
+        "```\n\n"
+        "### Rules\n"
+        "- Tree first, then SQL. Every `sql` must be complete (no ellipsis). Frozen blocks verbatim.\n"
+        "- Only include changed/added components. Unchanged → `\"change\": \"unchanged\", \"sql\": \"\"`.\n"
+        "- `main_query` columns must match Column Completeness Contract. `reconstruction_order` in dependency order.\n\n"
+        "After JSON:\n"
+        "```\nChanges: <1-2 sentences>\nExpected speedup: <estimate>\n```\n\n"
+        "Now output your Logic Tree and Component Payload JSON:"
     )
-    lines.append("")
-
-    # Part 1: Modified Logic Tree
-    lines.append("### Part 1: Modified Logic Tree")
-    lines.append("")
-    lines.append(
-        "Show what changed using change markers. Generate the tree BEFORE writing SQL."
-    )
-    lines.append("")
-    lines.append("Change markers:")
-    lines.append("- `[+]` — New component added")
-    lines.append("- `[-]` — Component removed")
-    lines.append("- `[~]` — Component modified (describe what changed)")
-    lines.append("- `[=]` — Unchanged (no children needed)")
-    lines.append("- `[!]` — Structural change (e.g. CTE → subquery)")
-    lines.append("")
-
-    # Part 2: Component Payload JSON
-    lines.append("### Part 2: Component Payload JSON")
-    lines.append("")
-    lines.append("```json")
-    lines.append("{")
-    lines.append('  "spec_version": "1.0",')
-    lines.append(f'  "dialect": "<dialect>",')
-    lines.append('  "rewrite_rules": [')
-    lines.append('    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}')
-    lines.append("  ],")
-    lines.append('  "statements": [{')
-    lines.append('    "target_table": null,')
-    lines.append('    "change": "modified",')
-    lines.append('    "components": {')
-    lines.append('      "<cte_name>": {')
-    lines.append('        "type": "cte",')
-    lines.append('        "change": "modified",')
-    lines.append('        "sql": "<complete SQL for this CTE body>",')
-    lines.append('        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}')
-    lines.append("      },")
-    lines.append('      "main_query": {')
-    lines.append('        "type": "main_query",')
-    lines.append('        "change": "modified",')
-    lines.append('        "sql": "<final SELECT>",')
-    lines.append('        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}')
-    lines.append("      }")
-    lines.append("    },")
-    lines.append('    "reconstruction_order": ["<cte_name>", "main_query"],')
-    lines.append('    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"')
-    lines.append("  }],")
-    lines.append('  "macros": {},')
-    lines.append('  "frozen_blocks": [],')
-    lines.append('  "validation_checks": []')
-    lines.append("}")
-    lines.append("```")
-    lines.append("")
-
-    # Rules
-    lines.append("### Rules")
-    lines.append("- **Tree first, always.** Generate the Logic Tree before writing any SQL")
-    lines.append("- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces")
-    lines.append("- **No ellipsis.** Every `sql` value must be complete, executable SQL")
-    lines.append("- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim")
-    lines.append("- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`")
-    lines.append("- Only include components you **changed or added** — set unchanged components to `\"change\": \"unchanged\"` with `\"sql\": \"\"`")
-    lines.append("- `main_query` output columns must match the Column Completeness Contract above")
-    lines.append("- `reconstruction_order`: topological order of components for assembly")
-    lines.append("")
-    lines.append("After the JSON, explain the mechanism:")
-    lines.append("")
-    lines.append("```")
-    lines.append("Changes: <1-2 sentences: what structural change + the expected mechanism>")
-    lines.append("Expected speedup: <estimate>")
-    lines.append("```")
-    lines.append("")
-    lines.append("Now output your Logic Tree and Component Payload JSON:")
 
     return "\n".join(lines)

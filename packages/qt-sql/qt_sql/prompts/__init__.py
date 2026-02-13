@@ -24,6 +24,8 @@ from .swarm_parsers import (
 )
 from .analyst_briefing import build_analyst_briefing_prompt
 from .worker import build_worker_prompt
+from .worker_shared_prefix import build_shared_worker_prefix, build_worker_assignment
+from .coach import build_coach_prompt, build_coach_refinement_prefix
 from .briefing_checks import (
     build_analyst_section_checklist,
     build_expert_section_checklist,
@@ -58,4 +60,9 @@ __all__ = [
     "build_sniper_prompt",          # DEPRECATED
     "SnipeAnalysis",
     "parse_snipe_response",
+    # Shared-prefix + Coach
+    "build_shared_worker_prefix",
+    "build_worker_assignment",
+    "build_coach_prompt",
+    "build_coach_refinement_prefix",
 ]

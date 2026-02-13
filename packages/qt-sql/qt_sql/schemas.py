@@ -185,6 +185,7 @@ class WorkerResult:
     error_category: Optional[str] = None
     exploratory: bool = False  # True for Worker 4 (exploration budget)
     set_local_config: Optional[Dict[str, Any]] = None  # PG tuning: {"params": {...}, "reasoning": "..."}
+    set_local_commands: List[str] = field(default_factory=list)  # ["SET LOCAL work_mem = '256MB'", ...]
     explain_plan: Optional[str] = None  # EXPLAIN ANALYZE plan text for optimized query
 
     def to_dict(self) -> Dict[str, Any]:
@@ -205,6 +206,8 @@ class WorkerResult:
             d["exploratory"] = True
         if self.set_local_config:
             d["set_local_config"] = self.set_local_config
+        if self.set_local_commands:
+            d["set_local_commands"] = self.set_local_commands
         if self.explain_plan:
             d["explain_plan"] = self.explain_plan
         return d

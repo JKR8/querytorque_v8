@@ -1,14 +1,16 @@
-"""Swarm optimization session — multi-worker fan-out with self-directed retry.
+"""Swarm optimization session — multi-worker fan-out with coach refinement.
 
-Workflow:
+Workflow (shared-prefix coach architecture):
 1. Fan-out: Analyst distributes top 20 matched examples across 4 workers
-   (3 each, no duplicates). Each worker gets a different strategy.
-2. Validate all 4 candidates. If any >= target_speedup, done.
-3. Retry: Self-directed worker gets ALL raw evidence (previous results,
-   EXPLAIN plans, race timings) and diagnoses + rewrites in one LLM call.
-4. Iterate retry (not fan-out) up to max_iterations.
+   (3 each, no duplicates). All 4 share an identical prefix (for prompt caching),
+   diverging only at the assignment line.
+2. Race-validate all 4 candidates. If any >= target_speedup, done.
+3. Coach round: Coach LLM reviews race results + vital signs (condensed EXPLAIN),
+   produces per-worker refinement directives. 4 refined workers run in parallel
+   with shared prefix extended by coach output.
+4. Iterate coach rounds up to max_iterations.
 
-Fan-out only happens ONCE (iteration 1). Subsequent iterations are retries.
+Falls back to single-worker retry if shared prefix is unavailable (e.g., resumed session).
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ def _fmt_elapsed(seconds: float) -> str:
 
 
 class SwarmSession(OptimizationSession):
-    """Multi-worker fan-out with snipe refinement."""
+    """Multi-worker fan-out with coach refinement."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -49,7 +51,7 @@ class SwarmSession(OptimizationSession):
         self._run_log_path: Optional[Path] = None
         self._run_log_handler: Optional[logging.Handler] = None
         self._cached_baseline: Optional[Any] = None  # OriginalBaseline from first validation
-        # Snipe state — persisted from fan-out for snipe reuse
+        # Coach state — persisted from fan-out for reuse
         self._explain_plan_text: Optional[str] = None
         self._engine_profile: Optional[Dict] = None
         self._constraints: List[Dict] = []
@@ -57,8 +59,9 @@ class SwarmSession(OptimizationSession):
         self._output_columns: List[str] = []
         self._matched_examples: List[Dict] = []
         self._regression_warnings: Optional[List[Dict]] = None
-        self._sniper_result: Optional[WorkerResult] = None  # for retry
+        self._sniper_result: Optional[WorkerResult] = None  # for retry fallback
         self._candidate_explains: Dict[int, str] = {}  # worker_id → explain_text
+        self._candidate_plan_jsons: Dict[int, Any] = {}  # worker_id → plan_json (DuckDB)
         self._race_result: Optional[Any] = None  # RaceResult from fan-out race
         self._db_reachable: Optional[bool] = None  # DB connectivity (set once, reused)
         # Two-phase state (set by prepare_candidates, consumed by validate_and_finish)
@@ -67,6 +70,11 @@ class SwarmSession(OptimizationSession):
         self._costs: Optional[Dict[str, Any]] = None
         self._prepare_t_session: float = 0.0
         self._generation_done: bool = False
+        # Coach architecture state — shared prefix cached for prompt caching
+        self._shared_prefix: Optional[str] = None  # Shared across all 4 workers
+        self._coach_prefix: Optional[str] = None  # Grows across coach rounds
+        self._all_worker_briefings: List[Any] = []  # BriefingWorker list from fan-out
+        self._all_examples: Dict[int, List[Dict]] = {}  # worker_id → loaded examples
 
     @staticmethod
     def _stage(query_id: str, msg: str):
@@ -101,7 +109,7 @@ class SwarmSession(OptimizationSession):
         self._run_log_handler = None
 
     def run(self) -> SessionResult:
-        """Execute swarm optimization: fan-out then snipe."""
+        """Execute swarm optimization: fan-out then coach rounds."""
         t_session = time.time()
         session_dir = (
             self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id
@@ -111,7 +119,7 @@ class SwarmSession(OptimizationSession):
         try:
             print(f"\n{'='*60}", flush=True)
             print(f"  SWARM SESSION: {self.query_id}", flush=True)
-            print(f"  fan-out=4 workers  snipe=max {self.max_iterations - 1}  target={self.target_speedup:.1f}x", flush=True)
+            print(f"  fan-out=4 workers  coach=max {self.max_iterations - 1}  target={self.target_speedup:.1f}x", flush=True)
             print(f"{'='*60}", flush=True)
 
             # Phase 1: Parse logical tree once (shared across all iterations)
@@ -138,7 +146,7 @@ class SwarmSession(OptimizationSession):
                 self.save_session()
                 return self._build_result()
 
-            # Cache baseline for snipe iterations (avoids re-timing original)
+            # Cache baseline for coach iterations (avoids re-timing original)
             if self._cached_baseline is None and self.max_iterations > 1 and self._db_reachable is not False:
                 try:
                     self._cached_baseline = self.pipeline._benchmark_baseline(self.original_sql)
@@ -157,26 +165,26 @@ class SwarmSession(OptimizationSession):
                 self._explain_plan_text = self._cached_baseline.explain_text
                 self._stage(self.query_id, "EXPLAIN: using baseline EXPLAIN (no cached file)")
 
-            # Iterations 2-N: Snipe phase (wrapped so API failures don't lose fan-out results)
+            # Iterations 2-N: Coach rounds (wrapped so API failures don't lose fan-out results)
             try:
-                for snipe_num in range(1, self.max_iterations):
-                    print(f"\n--- Snipe {snipe_num}/{self.max_iterations - 1} ---", flush=True)
-                    t_snipe = time.time()
-                    snipe_result = self._snipe_iteration(dag, costs, snipe_num, t_session)
-                    self.iterations_data.append(snipe_result)
-                    self._stage(self.query_id, f"SNIPE {snipe_num}: complete ({_fmt_elapsed(time.time() - t_snipe)}) | total {_fmt_elapsed(time.time() - t_session)}")
+                for coach_num in range(1, self.max_iterations):
+                    print(f"\n--- Coach Round {coach_num}/{self.max_iterations - 1} ---", flush=True)
+                    t_coach = time.time()
+                    coach_result = self._coach_iteration(dag, costs, coach_num, t_session)
+                    self.iterations_data.append(coach_result)
+                    self._stage(self.query_id, f"COACH {coach_num}: complete ({_fmt_elapsed(time.time() - t_coach)}) | total {_fmt_elapsed(time.time() - t_session)}")
 
                     best_wr = self._best_worker()
                     if best_wr and best_wr.speedup >= self.target_speedup:
                         print(f"\n{'='*60}", flush=True)
                         print(f"  DONE: {self.query_id} — {best_wr.status} {best_wr.speedup:.2f}x "
-                              f"(snipe {snipe_num}) | {_fmt_elapsed(time.time() - t_session)}", flush=True)
+                              f"(coach {coach_num}) | {_fmt_elapsed(time.time() - t_session)}", flush=True)
                         print(f"{'='*60}\n", flush=True)
                         self.save_session()
                         return self._build_result()
             except Exception as e:
-                logger.error(f"[{self.query_id}] Snipe failed (saving fan-out results): {e}")
-                self._stage(self.query_id, f"SNIPE FAILED: {e} — saving fan-out results")
+                logger.error(f"[{self.query_id}] Coach failed (saving fan-out results): {e}")
+                self._stage(self.query_id, f"COACH FAILED: {e} — saving fan-out results")
 
             # Final summary
             best_wr = self._best_worker()
@@ -291,7 +299,7 @@ class SwarmSession(OptimizationSession):
             raw=analyst_response,
         )
 
-        # Parse logical tree (needed for snipe)
+        # Parse logical tree (needed for coach rounds)
         self._prepare_t_session = time.time()
         self._dag, self._costs, _explain = self.pipeline._parse_logical_tree(
             self.original_sql, dialect=self.dialect, query_id=self.query_id
@@ -319,6 +327,7 @@ class SwarmSession(OptimizationSession):
         Returns True if analyst was recovered and workers generated.
         """
         from ..prompts.swarm_parsers import parse_briefing_response
+        from ..prompts import validate_parsed_briefing
 
         session_dir = self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id
         iter_dir = session_dir / "iteration_00_fan_out"
@@ -342,9 +351,47 @@ class SwarmSession(OptimizationSession):
             logger.warning(f"[{self.query_id}] Failed to parse saved analyst response: {e}")
             return False
 
+        # Validate briefing quality — reject if critical issues found
+        briefing_issues = validate_parsed_briefing(briefing)
+        if briefing_issues:
+            for issue in briefing_issues[:4]:
+                logger.warning(f"[{self.query_id}] Resume briefing issue: {issue}")
+            # Only reject if no workers have meaningful strategies
+            # (swarm_parsers falls back to "strategy_N" placeholders for unparsed workers)
+            import re as _re_resume
+            has_strategy = any(
+                w.strategy and not _re_resume.match(r'^strategy_\d+$', w.strategy)
+                for w in briefing.workers
+            )
+            if not has_strategy:
+                logger.warning(f"[{self.query_id}] Resumed briefing has no meaningful worker strategies — skipping")
+                return False
+
         if not briefing.workers or len(briefing.workers) < 2:
             logger.warning(f"[{self.query_id}] Saved analyst response has {len(briefing.workers)} workers, skipping")
             return False
+
+        # Validate briefing integrity — deduplicate worker IDs and ensure 4 unique
+        seen_ids = set()
+        deduped = []
+        for w in briefing.workers:
+            if w.worker_id not in seen_ids:
+                seen_ids.add(w.worker_id)
+                deduped.append(w)
+        if len(deduped) < len(briefing.workers):
+            logger.warning(
+                f"[{self.query_id}] Resumed briefing had duplicate worker IDs — "
+                f"deduped {len(briefing.workers)} → {len(deduped)}"
+            )
+            briefing.workers = deduped
+        # Pad missing worker IDs up to 4
+        from ..prompts.swarm_parsers import BriefingWorker
+        for wid in range(1, 5):
+            if wid not in seen_ids:
+                briefing.workers.append(BriefingWorker(worker_id=wid))
+                logger.warning(f"[{self.query_id}] Padded missing Worker {wid} in resumed briefing")
+        briefing.workers.sort(key=lambda w: w.worker_id)
+        briefing.workers = briefing.workers[:4]
 
         self._stage(self.query_id, f"RESUME: Re-parsed analyst from disk ({len(briefing.workers)} workers)")
 
@@ -377,15 +424,15 @@ class SwarmSession(OptimizationSession):
 
         t_gen = time.time()
 
-        # Build output columns
-        output_columns = ""
+        # Build output columns (must be List[str] — build_worker_prompt iterates it)
+        output_columns: List[str] = []
         if self._dag:
             try:
                 final_node = [n for n in self._dag.nodes() if self._dag.out_degree(n) == 0]
                 if final_node:
                     cols = self._dag.nodes[final_node[0]].get("columns", [])
                     if cols:
-                        output_columns = ", ".join(cols)
+                        output_columns = list(cols)
             except Exception:
                 pass
 
@@ -400,7 +447,11 @@ class SwarmSession(OptimizationSession):
             logger.warning(f"[{self.query_id}] Logic tree build failed: {e}")
 
         candidates_by_worker = {}
-        generator = CandidateGenerator()
+        generator = CandidateGenerator(
+            provider=self.pipeline.provider,
+            model=self.pipeline.model,
+            analyze_fn=self.pipeline.analyze_fn,
+        )
 
         def generate_worker(worker_briefing):
             examples = self.pipeline._load_examples_by_id(
@@ -504,10 +555,10 @@ class SwarmSession(OptimizationSession):
             cbw[wid] = (wb, sql, transforms, "", "", set_local, iface)
 
     def validate_and_finish(self) -> SessionResult:
-        """Phase 2: Validate candidates and run snipe iterations.
+        """Phase 2: Validate candidates and run coach iterations.
 
         Must be called after prepare_candidates(). Runs DB validation
-        (race or sequential), then snipe iterations if needed.
+        (race or sequential), then coach iterations if needed.
 
         Returns SessionResult.
         """
@@ -541,7 +592,7 @@ class SwarmSession(OptimizationSession):
                 self.save_session()
                 return self._build_result()
 
-            # Cache baseline for snipe iterations
+            # Cache baseline for coach iterations
             if self._cached_baseline is None and self.max_iterations > 1 and self._db_reachable is not False:
                 try:
                     self._cached_baseline = self.pipeline._benchmark_baseline(
@@ -560,15 +611,15 @@ class SwarmSession(OptimizationSession):
                     and self._cached_baseline.explain_text):
                 self._explain_plan_text = self._cached_baseline.explain_text
 
-            # Snipe iterations
-            for snipe_num in range(1, self.max_iterations):
-                print(f"\n  --- Snipe {snipe_num}/{self.max_iterations - 1} [{self.query_id}] ---", flush=True)
-                t_snipe = time.time()
-                snipe_result = self._snipe_iteration(dag, costs, snipe_num, t_session)
-                self.iterations_data.append(snipe_result)
+            # Coach iterations
+            for coach_num in range(1, self.max_iterations):
+                print(f"\n  --- Coach Round {coach_num}/{self.max_iterations - 1} [{self.query_id}] ---", flush=True)
+                t_coach = time.time()
+                coach_result = self._coach_iteration(dag, costs, coach_num, t_session)
+                self.iterations_data.append(coach_result)
                 self._stage(
                     self.query_id,
-                    f"SNIPE {snipe_num}: complete ({_fmt_elapsed(time.time() - t_snipe)}) | "
+                    f"COACH {coach_num}: complete ({_fmt_elapsed(time.time() - t_coach)}) | "
                     f"total {_fmt_elapsed(time.time() - t_session)}"
                 )
 
@@ -576,7 +627,7 @@ class SwarmSession(OptimizationSession):
                 if best_wr and best_wr.speedup >= self.target_speedup:
                     print(
                         f"  DONE: {self.query_id} — {best_wr.status} {best_wr.speedup:.2f}x "
-                        f"(snipe {snipe_num}) | {_fmt_elapsed(time.time() - t_session)}",
+                        f"(coach {coach_num}) | {_fmt_elapsed(time.time() - t_session)}",
                         flush=True,
                     )
                     self.save_session()
@@ -621,7 +672,6 @@ class SwarmSession(OptimizationSession):
         """
         from ..prompts import (
             build_analyst_briefing_prompt,
-            build_worker_prompt,
             parse_briefing_response,
             validate_parsed_briefing,
         )
@@ -636,7 +686,7 @@ class SwarmSession(OptimizationSession):
             engine=self.engine,
         )
 
-        # Unpack for local use + snipe reuse
+        # Unpack for local use + coach reuse
         explain_plan_text = ctx["explain_plan_text"]
         plan_scanner_text = ctx["plan_scanner_text"]
         global_knowledge = ctx["global_knowledge"]
@@ -662,7 +712,7 @@ class SwarmSession(OptimizationSession):
             f"({_fmt_elapsed(time.time() - t0)})"
         )
 
-        # Persist data for snipe reuse
+        # Persist data for coach reuse
         self._explain_plan_text = explain_plan_text
         self._engine_profile = engine_profile
         self._constraints = constraints
@@ -702,6 +752,11 @@ class SwarmSession(OptimizationSession):
             analyze_fn=self.pipeline.analyze_fn,
         )
 
+        # Save analyst prompt BEFORE the LLM call (crash safety — never lose the prompt)
+        iter_dir = self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id / "iteration_00_fan_out"
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        (iter_dir / "analyst_prompt.txt").write_text(analyst_prompt, encoding="utf-8")
+
         try:
             analyst_response = generator._analyze_with_max_tokens(
                 analyst_prompt, max_tokens=4096
@@ -716,10 +771,7 @@ class SwarmSession(OptimizationSession):
             f"{_fmt_elapsed(time.time() - t0)})"
         )
 
-        # Persist analyst prompt + response before validation (so failures are debuggable)
-        iter_dir = self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id / "iteration_00_fan_out"
-        iter_dir.mkdir(parents=True, exist_ok=True)
-        (iter_dir / "analyst_prompt.txt").write_text(analyst_prompt, encoding="utf-8")
+        # Save analyst response immediately after receiving it
         (iter_dir / "analyst_response.txt").write_text(analyst_response, encoding="utf-8")
 
         # ── Step 4: Parse briefing (with retry on format errors) ────────
@@ -770,6 +822,10 @@ class SwarmSession(OptimizationSession):
                     "Analyst briefing failed validation (after retry): "
                     + "; ".join(briefing_issues[:4])
                 )
+            # Update canonical analyst_response.txt so resume paths get the good version
+            (iter_dir / "analyst_response.txt").write_text(
+                analyst_response, encoding="utf-8"
+            )
             self._stage(self.query_id, "ANALYST: retry succeeded")
 
         # Log parsed briefing
@@ -808,25 +864,45 @@ class SwarmSession(OptimizationSession):
             logger.warning(f"[{self.query_id}] Logic tree build failed: {e}")
 
         candidates_by_worker = {}
+        all_worker_examples: Dict[int, List[Dict]] = {}
+
+        # ── Build shared prefix for prompt caching (coach architecture) ───
+        from ..prompts.worker_shared_prefix import build_shared_worker_prefix, build_worker_assignment
+        # Pre-load examples for all workers (needed for shared prefix)
+        for wb in briefing.workers:
+            loaded = self.pipeline._load_examples_by_id(wb.examples, self.engine)
+            all_worker_examples[wb.worker_id] = loaded
+
+        shared_prefix = build_shared_worker_prefix(
+            analyst_response=analyst_response,
+            shared_briefing=briefing.shared,
+            all_worker_briefings=briefing.workers,
+            all_examples=all_worker_examples,
+            original_sql=self.original_sql,
+            output_columns=output_columns,
+            dialect=self.dialect,
+            engine_version=self.pipeline._engine_version,
+            original_logic_tree=original_logic_tree,
+        )
+        # Cache for coach rounds
+        self._shared_prefix = shared_prefix
+        self._all_worker_briefings = list(briefing.workers)
+        self._all_examples = all_worker_examples
+
+        # Save shared prefix to disk (the bulk of what workers see)
+        (iter_dir / "shared_prefix.txt").write_text(shared_prefix, encoding="utf-8")
+
+        self._stage(
+            self.query_id,
+            f"SHARED PREFIX: {len(shared_prefix)} chars built for prompt caching"
+        )
 
         def generate_worker(worker_briefing):
-            """Generate a single worker's candidate."""
-            # Load examples by ID
-            examples = self.pipeline._load_examples_by_id(
-                worker_briefing.examples, self.engine
-            )
+            """Generate a single worker's candidate using shared prefix."""
+            examples = all_worker_examples.get(worker_briefing.worker_id, [])
 
-            # Build worker prompt
-            prompt = build_worker_prompt(
-                worker_briefing=worker_briefing,
-                shared_briefing=briefing.shared,
-                examples=examples,
-                original_sql=self.original_sql,
-                output_columns=output_columns,
-                dialect=self.dialect,
-                engine_version=self.pipeline._engine_version,
-                original_logic_tree=original_logic_tree,
-            )
+            # Build worker prompt = shared prefix + assignment suffix
+            prompt = shared_prefix + "\n\n" + build_worker_assignment(worker_briefing.worker_id)
 
             example_ids = [e.get("id", "?") for e in examples]
             candidate = generator.generate_one(
@@ -970,7 +1046,7 @@ class SwarmSession(OptimizationSession):
                 )
                 if race_result is not None:
                     batch_results = race_result.verdicts
-                    # Cache baseline and race result for snipe reuse
+                    # Cache baseline and race result for coach reuse
                     self._cached_baseline = race_result.baseline
                     self._race_result = race_result
 
@@ -1077,6 +1153,7 @@ class SwarmSession(OptimizationSession):
                 error_messages=all_errors,
                 error_category=error_cat,
                 exploratory=is_exploratory,
+                set_local_commands=set_local_cmds or [],
             )
             worker_results.append(wr)
             self.all_worker_results.append(wr)
@@ -1092,7 +1169,38 @@ class SwarmSession(OptimizationSession):
                 f" {marker} W{wr.worker_id} ({wr.strategy}){explore_tag}: {wr.status} {wr.speedup:.2f}x{err}"
             )
 
-        # ── Step 6.6: Collect candidate EXPLAIN plans for snipe ──────────
+        # Update per-worker result.json with validation results (overwrites pre-validation PENDING)
+        iter_dir = self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id / "iteration_00_fan_out"
+        for wr in worker_results:
+            w_dir = iter_dir / f"worker_{wr.worker_id:02d}"
+            if w_dir.exists():
+                result_data = {
+                    "worker_id": wr.worker_id,
+                    "strategy": wr.strategy,
+                    "examples_used": wr.examples_used,
+                    "optimized_sql": wr.optimized_sql,
+                    "speedup": wr.speedup,
+                    "status": wr.status,
+                    "transforms": wr.transforms,
+                    "hint": wr.hint,
+                    "set_local_commands": wr.set_local_commands,
+                    "error_message": wr.error_message,
+                    "error_category": wr.error_category,
+                    "exploratory": wr.exploratory,
+                }
+                (w_dir / "result.json").write_text(
+                    json.dumps(result_data, indent=2, default=str), encoding="utf-8"
+                )
+
+        # Save race timings if available (for audit)
+        if self._race_result is not None:
+            race_timings_data = self._build_race_timings()
+            if race_timings_data:
+                (iter_dir / "race_timings.json").write_text(
+                    json.dumps(race_timings_data, indent=2, default=str), encoding="utf-8"
+                )
+
+        # ── Step 6.6: Collect candidate EXPLAIN plans for coach ───────────
         if self.max_iterations > 1:
             self._candidate_explains = self._collect_candidate_explains(worker_results)
 
@@ -1216,10 +1324,14 @@ class SwarmSession(OptimizationSession):
                 if not result:
                     continue
 
+                # Store JSON plan for vital signs extraction (DuckDB)
+                plan_json = result.get("plan_json")
+                if plan_json:
+                    self._candidate_plan_jsons[wr.worker_id] = plan_json
+
                 # Format to text
                 plan_text = result.get("plan_text")
                 if not plan_text:
-                    plan_json = result.get("plan_json")
                     if plan_json:
                         plan_text = format_pg_explain_tree(plan_json)
 
@@ -1239,10 +1351,609 @@ class SwarmSession(OptimizationSession):
             )
         return explains
 
+    def _coach_iteration(
+        self, dag: Any, costs: Dict[str, Any], coach_num: int, t_session: float,
+    ) -> Dict[str, Any]:
+        """Coach-guided refinement round — 1 coach call + 4 parallel worker calls.
+
+        Flow:
+        1. Collect vital signs from all candidates from previous round
+        2. Build coach prompt (single call — post-mortem analysis)
+        3. Build refinement prefix (extends round 1 shared prefix)
+        4. Generate 4 workers in parallel (cache-hit on prefix)
+        5. Race validate all 4
+        6. Collect EXPLAIN plans for next round
+
+        Falls back to retry if shared prefix is not available.
+        """
+        from ..prompts.coach import build_coach_prompt, build_coach_refinement_prefix
+        from ..prompts.worker_shared_prefix import build_coach_worker_assignment
+        from ..explain_signals import extract_vital_signs
+        from ..generate import CandidateGenerator
+
+        # Architecturally correct fallback: without a shared prefix (e.g., resumed
+        # session where fan-out didn't run), we cannot build coach refinement prompts
+        # or run 4 parallel workers. Single-worker retry is the only valid path.
+        if not self._shared_prefix:
+            self._stage(self.query_id, "COACH: No shared prefix — falling back to retry")
+            return self._snipe_iteration(dag, costs, coach_num, t_session)
+
+        generator = CandidateGenerator(
+            provider=self.pipeline.provider,
+            model=self.pipeline.model,
+            analyze_fn=self.pipeline.analyze_fn,
+        )
+
+        # ── Step 1: Collect vital signs from previous round ───────────────
+        vital_signs: Dict[int, str] = {}
+        last_round_results = self.all_worker_results[-4:]  # Last 4 workers
+        for wr in last_round_results:
+            explain_text = self._candidate_explains.get(wr.worker_id, "")
+            plan_json = self._candidate_plan_jsons.get(wr.worker_id)
+            if explain_text or plan_json:
+                vital_signs[wr.worker_id] = extract_vital_signs(
+                    explain_text or "", plan_json, self.dialect
+                )
+
+        # ── Step 1b: Compute original query vital signs ──────────────────
+        original_vs = None
+        if self._explain_plan_text:
+            original_vs = extract_vital_signs(
+                self._explain_plan_text, None, self.dialect
+            )
+
+        # ── Step 2: Build coach prompt ────────────────────────────────────
+        self._stage(
+            self.query_id,
+            f"COACH: Analyzing {len(last_round_results)} workers, "
+            f"{len(vital_signs)} vital signs | total {_fmt_elapsed(time.time() - t_session)}"
+        )
+        t_coach = time.time()
+
+        coach_prompt = build_coach_prompt(
+            original_sql=self.original_sql,
+            worker_results=last_round_results,
+            vital_signs=vital_signs,
+            race_timings=self._build_race_timings(),
+            engine_profile=self._engine_profile,
+            dialect=self.dialect,
+            target_speedup=self.target_speedup,
+            original_vital_signs=original_vs,
+            round_num=coach_num,
+        )
+
+        # Save coach prompt BEFORE the LLM call (crash safety)
+        iter_dir = (
+            self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id
+            / f"iteration_{coach_num:02d}_coach"
+        )
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        (iter_dir / "coach_prompt.txt").write_text(coach_prompt, encoding="utf-8")
+
+        # Save vital signs and race timings that fed the coach prompt
+        if vital_signs:
+            (iter_dir / "vital_signs.json").write_text(
+                json.dumps(vital_signs, indent=2, default=str), encoding="utf-8"
+            )
+        if original_vs:
+            (iter_dir / "original_vital_signs.txt").write_text(original_vs, encoding="utf-8")
+        race_timings_data = self._build_race_timings()
+        if race_timings_data:
+            (iter_dir / "race_timings.json").write_text(
+                json.dumps(race_timings_data, indent=2, default=str), encoding="utf-8"
+            )
+
+        try:
+            coach_response = generator._analyze_with_max_tokens(
+                coach_prompt, max_tokens=4096
+            )
+        except Exception as e:
+            self._stage(self.query_id, f"COACH: LLM call failed ({e}) — replaying 4 workers with existing prefix")
+            return self._replay_workers_with_prefix(generator, dag, costs, coach_num, t_session, iter_dir)
+
+        self._stage(
+            self.query_id,
+            f"COACH: analysis done ({len(coach_response)} chars, "
+            f"{_fmt_elapsed(time.time() - t_coach)})"
+        )
+
+        # Save coach response immediately after receiving it
+        (iter_dir / "coach_response.txt").write_text(coach_response, encoding="utf-8")
+
+        # Validate coach directives — check all 4 workers have directives
+        import re as _re
+        found_directives = set(
+            int(m) for m in _re.findall(
+                r'REFINEMENT DIRECTIVE FOR WORKER\s+(\d+)', coach_response
+            )
+        )
+        missing_directives = {1, 2, 3, 4} - found_directives
+        if missing_directives:
+            missing_str = ", ".join(f"W{w}" for w in sorted(missing_directives))
+            self._stage(
+                self.query_id,
+                f"COACH WARNING: Missing refinement directives for {missing_str} "
+                f"(found: {sorted(found_directives)})"
+            )
+            if len(found_directives) < 3:
+                self._stage(
+                    self.query_id,
+                    f"COACH: Only {len(found_directives)} directives found — "
+                    f"replaying 4 workers with existing prefix"
+                )
+                return self._replay_workers_with_prefix(generator, dag, costs, coach_num, t_session, iter_dir)
+
+        # ── Step 3: Build refinement prefix ───────────────────────────────
+        # Compact race results summary for the prefix
+        race_summary_lines = []
+        for wr in sorted(last_round_results, key=lambda w: w.speedup, reverse=True):
+            vs = vital_signs.get(wr.worker_id, "")
+            vs_first_line = vs.split("\n")[0] if vs else ""
+            race_summary_lines.append(
+                f"W{wr.worker_id} ({wr.strategy}): {wr.speedup:.2f}x {wr.status}"
+                + (f" — {vs_first_line}" if vs_first_line else "")
+            )
+        race_summary = "\n".join(race_summary_lines)
+
+        # Use the accumulated coach prefix (grows each round) or the original
+        # shared prefix for the first coach round.
+        current_base = self._coach_prefix or self._shared_prefix
+
+        refinement_prefix = build_coach_refinement_prefix(
+            base_prefix=current_base,
+            coach_directives=coach_response,
+            round_results_summary=race_summary,
+            round_num=coach_num,
+        )
+
+        # Persist so the NEXT coach round builds on THIS round's context
+        self._coach_prefix = refinement_prefix
+
+        # Save refinement prefix to disk (the complete prompt workers see in this round)
+        (iter_dir / "refinement_prefix.txt").write_text(refinement_prefix, encoding="utf-8")
+
+        # ── Step 4: Generate 4 refined workers in parallel ────────────────
+        self._stage(
+            self.query_id,
+            f"GENERATE: 4 refined workers in parallel... | total {_fmt_elapsed(time.time() - t_session)}"
+        )
+        t_gen = time.time()
+        candidates_by_worker: Dict[int, tuple] = {}
+
+        def generate_refined_worker(worker_id: int):
+            # Workers WITH a directive get coach assignment; workers WITHOUT
+            # get fan-out assignment (avoids "directive is PRIMARY" when none exists)
+            from ..prompts.worker_shared_prefix import build_worker_assignment
+            if worker_id in found_directives:
+                suffix = build_coach_worker_assignment(worker_id)
+            else:
+                suffix = build_worker_assignment(worker_id)
+            prompt = refinement_prefix + "\n\n" + suffix
+            candidate = generator.generate_one(
+                sql=self.original_sql,
+                prompt=prompt,
+                examples_used=[],
+                worker_id=worker_id,
+                dialect=self.dialect,
+            )
+            optimized_sql = candidate.optimized_sql
+            try:
+                import sqlglot
+                sqlglot.parse_one(optimized_sql, dialect=self.dialect)
+            except Exception:
+                optimized_sql = self.original_sql
+            return (worker_id, optimized_sql, candidate.transforms,
+                    candidate.prompt, candidate.response,
+                    candidate.set_local_commands, candidate.interface_warnings)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(generate_refined_worker, wid): wid
+                for wid in [1, 2, 3, 4]
+            }
+            for future in as_completed(futures):
+                try:
+                    wid, sql, transforms, w_prompt, w_response, slc, iw = future.result()
+                    candidates_by_worker[wid] = (sql, transforms, w_prompt, w_response, slc, iw)
+                    self._stage(
+                        self.query_id,
+                        f"GENERATE: W{wid} refined ready ({_fmt_elapsed(time.time() - t_gen)})"
+                    )
+                except Exception as e:
+                    wid = futures[future]
+                    logger.error(f"[{self.query_id}] W{wid} refined generation failed: {e}")
+                    candidates_by_worker[wid] = (self.original_sql, [], "", str(e), [], [])
+
+        self._stage(
+            self.query_id,
+            f"GENERATE: all 4 refined workers complete ({_fmt_elapsed(time.time() - t_gen)})"
+        )
+
+        # Save worker outputs to disk
+        for wid in sorted(candidates_by_worker.keys()):
+            sql, transforms, w_prompt, w_response, slc, iw = candidates_by_worker[wid]
+            w_dir = iter_dir / f"worker_{wid:02d}"
+            w_dir.mkdir(parents=True, exist_ok=True)
+            if w_prompt:
+                (w_dir / "prompt.txt").write_text(w_prompt, encoding="utf-8")
+            if w_response:
+                (w_dir / "response.txt").write_text(w_response, encoding="utf-8")
+            (w_dir / "optimized.sql").write_text(sql, encoding="utf-8")
+
+        # ── Step 5: Validate (race or sequential) ─────────────────────────
+        sorted_wids = sorted(candidates_by_worker.keys())
+        optimized_sqls = [candidates_by_worker[wid][0] for wid in sorted_wids]
+
+        self._stage(
+            self.query_id,
+            f"VALIDATE: Racing coach round {coach_num} candidates... | total {_fmt_elapsed(time.time() - t_session)}"
+        )
+        t_val = time.time()
+
+        batch_results = None
+        if self._db_reachable is False:
+            batch_results = [("NEUTRAL", 1.00, ["DB unreachable"], None)] * len(optimized_sqls)
+        else:
+            # Try race first
+            from ..validate import race_candidates
+            cfg = self.pipeline.config
+            try:
+                race_result = race_candidates(
+                    db_path=cfg.db_path_or_dsn,
+                    original_sql=self.original_sql,
+                    candidate_sqls=optimized_sqls,
+                    worker_ids=sorted_wids,
+                    min_runtime_ms=cfg.race_min_runtime_ms,
+                    min_margin=cfg.race_min_margin,
+                    timeout_ms=cfg.timeout_seconds * 1000,
+                )
+                if race_result is not None:
+                    batch_results = race_result.verdicts
+                    self._cached_baseline = race_result.baseline
+                    self._race_result = race_result
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] Coach race failed, falling back: {e}")
+
+            # Sequential fallback
+            if batch_results is None:
+                if self._cached_baseline is not None:
+                    batch_results = []
+                    for sql in optimized_sqls:
+                        status, spd, errs, ecat = self.pipeline._validate_against_baseline(
+                            self._cached_baseline, sql
+                        )
+                        batch_results.append((status, spd, errs, ecat))
+                else:
+                    batch_results, seq_baseline = self.pipeline._validate_batch(
+                        self.original_sql, optimized_sqls, return_baseline=True
+                    )
+                    if seq_baseline is not None and self._cached_baseline is None:
+                        self._cached_baseline = seq_baseline
+
+        # Build WorkerResult objects
+        worker_results = []
+        worker_prompts = {}
+        for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
+            sql, transforms, w_prompt, w_response, slc, iw = candidates_by_worker[wid]
+            worker_prompts[wid] = (w_prompt, w_response)
+
+            all_errors = list(error_msgs or [])
+            if iw:
+                all_errors = [f"INTERFACE: {w}" for w in iw] + all_errors
+
+            # Find original strategy from briefing
+            strategy = f"coach_{coach_num}_w{wid}"
+            for wb in self._all_worker_briefings:
+                if wb.worker_id == wid:
+                    strategy = f"coach_{coach_num}_{wb.strategy}"
+                    break
+
+            wr = WorkerResult(
+                worker_id=wid,
+                strategy=strategy,
+                examples_used=[],
+                optimized_sql=sql,
+                speedup=speedup,
+                status=status,
+                transforms=transforms,
+                hint="",
+                error_message=" | ".join(all_errors) if all_errors else None,
+                error_messages=all_errors,
+                error_category=error_cat,
+                set_local_commands=slc or [],
+            )
+            worker_results.append(wr)
+            self.all_worker_results.append(wr)
+
+        # Print results
+        self._stage(self.query_id, f"VALIDATE: complete ({_fmt_elapsed(time.time() - t_val)})")
+        for wr in sorted(worker_results, key=lambda w: w.worker_id):
+            marker = "*" if wr.speedup >= 1.10 else " "
+            err = f" — {wr.error_message[:60]}" if wr.error_message else ""
+            self._stage(
+                self.query_id,
+                f" {marker} W{wr.worker_id} ({wr.strategy}): {wr.status} {wr.speedup:.2f}x{err}"
+            )
+
+        # Save per-worker validation results inline (crash safety — don't wait for save_session)
+        for wr in worker_results:
+            w_dir = iter_dir / f"worker_{wr.worker_id:02d}"
+            w_dir.mkdir(parents=True, exist_ok=True)
+            result_data = {
+                "worker_id": wr.worker_id,
+                "strategy": wr.strategy,
+                "optimized_sql": wr.optimized_sql,
+                "speedup": wr.speedup,
+                "status": wr.status,
+                "transforms": wr.transforms,
+                "set_local_commands": wr.set_local_commands,
+                "error_message": wr.error_message,
+                "error_category": wr.error_category,
+            }
+            (w_dir / "result.json").write_text(
+                json.dumps(result_data, indent=2, default=str), encoding="utf-8"
+            )
+
+        # ── Step 6: Collect EXPLAINs for next round ──────────────────────
+        # Clear BOTH maps before collection — _collect_candidate_explains writes
+        # to self._candidate_plan_jsons during collection (line 1309). Without
+        # clearing first, error candidates keep stale plan_json from prior rounds.
+        self._candidate_explains = {}
+        self._candidate_plan_jsons = {}
+        self._candidate_explains = self._collect_candidate_explains(worker_results)
+
+        # Learning records
+        for wr in worker_results:
+            try:
+                lr = self.pipeline.learner.create_learning_record(
+                    query_id=self.query_id,
+                    examples_recommended=[],
+                    transforms_recommended=[],
+                    status="pass" if wr.status in ("WIN", "IMPROVED", "NEUTRAL") else "error",
+                    speedup=wr.speedup,
+                    transforms_used=wr.transforms,
+                    error_category=wr.error_category,
+                    error_messages=wr.error_messages,
+                )
+                self.pipeline.learner.save_learning_record(lr)
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] Learning record failed: {e}")
+
+        return {
+            "iteration": coach_num,
+            "phase": "coach",
+            "coach_prompt": coach_prompt,
+            "coach_response": coach_response,
+            "worker_prompts": worker_prompts,
+            "worker_results": [wr.to_dict() for wr in worker_results],
+            "best_speedup": max((wr.speedup for wr in worker_results), default=0.0),
+        }
+
+    def _replay_workers_with_prefix(
+        self,
+        generator: Any,
+        dag: Any,
+        costs: Dict[str, Any],
+        coach_num: int,
+        t_session: float,
+        iter_dir: Path,
+    ) -> Dict[str, Any]:
+        """Fallback: re-run 4 parallel workers with existing shared prefix.
+
+        Used when the coach LLM fails or returns insufficient directives.
+        Preserves 4-worker parallelism instead of collapsing to single retry.
+        Workers use the original fan-out assignment (not coach directives).
+        """
+        from ..prompts.worker_shared_prefix import build_worker_assignment
+
+        current_prefix = self._coach_prefix or self._shared_prefix
+        if not current_prefix:
+            # Architecturally correct: without a prefix we cannot run 4 parallel
+            # workers (they need shared context). Single-worker retry is the only path.
+            self._stage(self.query_id, "REPLAY: No prefix available — single-worker retry")
+            return self._snipe_iteration(dag, costs, coach_num, t_session)
+
+        self._stage(
+            self.query_id,
+            f"REPLAY: 4 workers in parallel (using existing prefix)... | "
+            f"total {_fmt_elapsed(time.time() - t_session)}"
+        )
+        t_gen = time.time()
+        candidates_by_worker: Dict[int, tuple] = {}
+
+        def generate_replay_worker(worker_id: int):
+            prompt = current_prefix + "\n\n" + build_worker_assignment(worker_id)
+            candidate = generator.generate_one(
+                sql=self.original_sql,
+                prompt=prompt,
+                examples_used=[],
+                worker_id=worker_id,
+                dialect=self.dialect,
+            )
+            optimized_sql = candidate.optimized_sql
+            try:
+                import sqlglot
+                sqlglot.parse_one(optimized_sql, dialect=self.dialect)
+            except Exception:
+                optimized_sql = self.original_sql
+            return (worker_id, optimized_sql, candidate.transforms,
+                    candidate.prompt, candidate.response,
+                    candidate.set_local_commands, candidate.interface_warnings)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(generate_replay_worker, wid): wid
+                for wid in [1, 2, 3, 4]
+            }
+            for future in as_completed(futures):
+                try:
+                    wid, sql, transforms, w_prompt, w_response, slc, iw = future.result()
+                    candidates_by_worker[wid] = (sql, transforms, w_prompt, w_response, slc, iw)
+                    self._stage(
+                        self.query_id,
+                        f"REPLAY: W{wid} ready ({_fmt_elapsed(time.time() - t_gen)})"
+                    )
+                except Exception as e:
+                    wid = futures[future]
+                    logger.error(f"[{self.query_id}] W{wid} replay generation failed: {e}")
+                    candidates_by_worker[wid] = (self.original_sql, [], "", str(e), [], [])
+
+        self._stage(
+            self.query_id,
+            f"REPLAY: all 4 workers complete ({_fmt_elapsed(time.time() - t_gen)})"
+        )
+
+        # Save worker outputs
+        for wid in sorted(candidates_by_worker.keys()):
+            sql, transforms, w_prompt, w_response, slc, iw = candidates_by_worker[wid]
+            w_dir = iter_dir / f"worker_{wid:02d}"
+            w_dir.mkdir(parents=True, exist_ok=True)
+            if w_prompt:
+                (w_dir / "prompt.txt").write_text(w_prompt, encoding="utf-8")
+            if w_response:
+                (w_dir / "response.txt").write_text(w_response, encoding="utf-8")
+            (w_dir / "optimized.sql").write_text(sql, encoding="utf-8")
+
+        # Validate (same logic as coach iteration step 5)
+        sorted_wids = sorted(candidates_by_worker.keys())
+        optimized_sqls = [candidates_by_worker[wid][0] for wid in sorted_wids]
+
+        self._stage(
+            self.query_id,
+            f"VALIDATE: Racing replay candidates... | total {_fmt_elapsed(time.time() - t_session)}"
+        )
+        t_val = time.time()
+
+        batch_results = None
+        if self._db_reachable is False:
+            batch_results = [("NEUTRAL", 1.00, ["DB unreachable"], None)] * len(optimized_sqls)
+        else:
+            from ..validate import race_candidates
+            cfg = self.pipeline.config
+            try:
+                race_result = race_candidates(
+                    db_path=cfg.db_path_or_dsn,
+                    original_sql=self.original_sql,
+                    candidate_sqls=optimized_sqls,
+                    worker_ids=sorted_wids,
+                    min_runtime_ms=cfg.race_min_runtime_ms,
+                    min_margin=cfg.race_min_margin,
+                    timeout_ms=cfg.timeout_seconds * 1000,
+                )
+                if race_result is not None:
+                    batch_results = race_result.verdicts
+                    self._cached_baseline = race_result.baseline
+                    self._race_result = race_result
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] Replay race failed, falling back: {e}")
+
+            if batch_results is None:
+                if self._cached_baseline is not None:
+                    batch_results = []
+                    for sql in optimized_sqls:
+                        status, spd, errs, ecat = self.pipeline._validate_against_baseline(
+                            self._cached_baseline, sql
+                        )
+                        batch_results.append((status, spd, errs, ecat))
+                else:
+                    batch_results, seq_baseline = self.pipeline._validate_batch(
+                        self.original_sql, optimized_sqls, return_baseline=True
+                    )
+                    if seq_baseline is not None and self._cached_baseline is None:
+                        self._cached_baseline = seq_baseline
+
+        # Build WorkerResult objects
+        worker_results = []
+        worker_prompts = {}
+        for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
+            sql, transforms, w_prompt, w_response, slc, iw = candidates_by_worker[wid]
+            worker_prompts[wid] = (w_prompt, w_response)
+            all_errors = list(error_msgs or [])
+            if iw:
+                all_errors = [f"INTERFACE: {w}" for w in iw] + all_errors
+
+            strategy = f"replay_{coach_num}_w{wid}"
+            for wb in self._all_worker_briefings:
+                if wb.worker_id == wid:
+                    strategy = f"replay_{coach_num}_{wb.strategy}"
+                    break
+
+            wr = WorkerResult(
+                worker_id=wid,
+                strategy=strategy,
+                examples_used=[],
+                optimized_sql=sql,
+                speedup=speedup,
+                status=status,
+                transforms=transforms,
+                hint="",
+                error_message=" | ".join(all_errors) if all_errors else None,
+                error_messages=all_errors,
+                error_category=error_cat,
+                set_local_commands=slc or [],
+            )
+            worker_results.append(wr)
+            self.all_worker_results.append(wr)
+
+        self._stage(self.query_id, f"VALIDATE: complete ({_fmt_elapsed(time.time() - t_val)})")
+        for wr in sorted(worker_results, key=lambda w: w.worker_id):
+            marker = "*" if wr.speedup >= 1.10 else " "
+            err = f" — {wr.error_message[:60]}" if wr.error_message else ""
+            self._stage(
+                self.query_id,
+                f" {marker} W{wr.worker_id} ({wr.strategy}): {wr.status} {wr.speedup:.2f}x{err}"
+            )
+
+        # Save per-worker validation results
+        for wr in worker_results:
+            w_dir = iter_dir / f"worker_{wr.worker_id:02d}"
+            w_dir.mkdir(parents=True, exist_ok=True)
+            result_data = {
+                "worker_id": wr.worker_id,
+                "strategy": wr.strategy,
+                "optimized_sql": wr.optimized_sql,
+                "speedup": wr.speedup,
+                "status": wr.status,
+                "transforms": wr.transforms,
+                "set_local_commands": wr.set_local_commands,
+                "error_message": wr.error_message,
+                "error_category": wr.error_category,
+            }
+            (w_dir / "result.json").write_text(
+                json.dumps(result_data, indent=2, default=str), encoding="utf-8"
+            )
+
+        # Collect EXPLAINs for next round
+        self._candidate_explains = {}
+        self._candidate_plan_jsons = {}
+        self._candidate_explains = self._collect_candidate_explains(worker_results)
+
+        # Read coach prompt/response from disk if they were saved before replay
+        # (coach prompt is always saved pre-LLM; response is saved if LLM succeeded
+        # but directives were insufficient)
+        saved_coach_prompt = ""
+        saved_coach_response = ""
+        coach_prompt_file = iter_dir / "coach_prompt.txt"
+        coach_response_file = iter_dir / "coach_response.txt"
+        if coach_prompt_file.exists():
+            saved_coach_prompt = coach_prompt_file.read_text(encoding="utf-8")
+        if coach_response_file.exists():
+            saved_coach_response = coach_response_file.read_text(encoding="utf-8")
+
+        return {
+            "iteration": coach_num,
+            "phase": "replay",
+            "coach_prompt": saved_coach_prompt,
+            "coach_response": saved_coach_response,
+            "worker_prompts": worker_prompts,
+            "worker_results": [wr.to_dict() for wr in worker_results],
+            "best_speedup": max((wr.speedup for wr in worker_results), default=0.0),
+        }
+
     def _snipe_iteration(
         self, dag: Any, costs: Dict[str, Any], snipe_num: int, t_session: float,
     ) -> Dict[str, Any]:
-        """Self-directed retry iteration — single LLM call.
+        """Self-directed retry iteration — single LLM call (fallback when coach unavailable).
 
         The retry worker gets all raw evidence (previous results, EXPLAIN plans,
         race timings) plus standard worker context and self-directs through
@@ -1440,7 +2151,7 @@ class SwarmSession(OptimizationSession):
 
         return {
             "iteration": snipe_num,
-            "phase": "snipe",
+            "phase": "retry",
             "worker_prompt": candidate.prompt,
             "worker_response": candidate.response,
             "worker_results": [wr.to_dict()],
@@ -1510,7 +2221,7 @@ class SwarmSession(OptimizationSession):
             return verdicts
 
     def _build_race_timings(self) -> Optional[Dict[str, Any]]:
-        """Build race timings dict for snipe analyst prompt.
+        """Build race timings dict for coach prompt.
 
         Returns None if no race was run (fast queries used sequential validation).
         """
@@ -1609,7 +2320,9 @@ class SwarmSession(OptimizationSession):
 
         Counts only LLM calls:
         - Fan-out iteration: 1 analyst + N worker generations
-        - Snipe (retry): 1 self-directed worker per iteration
+        - Coach round: 1 coach + 4 worker refinements
+        - Replay round: 1 coach attempt (may have failed) + N replay workers
+        - Retry fallback: 1 self-directed worker per iteration
         """
         total = 0
         for it_data in self.iterations_data:
@@ -1617,7 +2330,15 @@ class SwarmSession(OptimizationSession):
             if phase == "fan_out":
                 total += 1  # analyst
                 total += len(it_data.get("worker_results", []))  # workers
-            elif phase == "snipe":
+            elif phase == "coach":
+                total += 1  # coach analysis
+                total += len(it_data.get("worker_results", []))  # refined workers
+            elif phase == "replay":
+                # Coach was attempted (1 API call, even if it failed or was insufficient)
+                if it_data.get("coach_prompt"):
+                    total += 1
+                total += len(it_data.get("worker_results", []))  # replay workers
+            elif phase in ("snipe", "retry"):
                 total += 1  # self-directed retry worker
         return total
 
@@ -1667,10 +2388,16 @@ class SwarmSession(OptimizationSession):
             if it_data.get("analyst_response"):
                 (it_dir / "analyst_response.txt").write_text(it_data["analyst_response"])
 
-            # Fan-out worker prompts (dict of wid -> (prompt, response))
+            # Fan-out / coach worker prompts (dict of wid -> (prompt, response))
             worker_prompts = it_data.get("worker_prompts", {})
 
-            # Snipe worker prompt/response (single worker)
+            # Coach prompt/response
+            if it_data.get("coach_prompt"):
+                (it_dir / "coach_prompt.txt").write_text(it_data["coach_prompt"])
+            if it_data.get("coach_response"):
+                (it_dir / "coach_response.txt").write_text(it_data["coach_response"])
+
+            # Retry worker prompt/response (single worker — fallback)
             if it_data.get("worker_prompt"):
                 (it_dir / "worker_prompt.txt").write_text(it_data["worker_prompt"])
             if it_data.get("worker_response"):
@@ -1694,10 +2421,117 @@ class SwarmSession(OptimizationSession):
                     if w_response:
                         (w_dir / "response.txt").write_text(w_response)
 
+        # ── Manifest: sequential list of every prompt/response in execution order ──
+        manifest = []
+        for it_data in self.iterations_data:
+            it_num = it_data.get("iteration", 0)
+            phase = it_data.get("phase", "unknown")
+            it_dir_name = f"iteration_{it_num:02d}_{phase}"
+
+            if phase == "fan_out":
+                manifest.append({
+                    "step": len(manifest) + 1,
+                    "type": "analyst_prompt",
+                    "file": f"{it_dir_name}/analyst_prompt.txt",
+                    "description": "Analyst briefing prompt (generates 4 worker strategies)",
+                })
+                manifest.append({
+                    "step": len(manifest) + 1,
+                    "type": "analyst_response",
+                    "file": f"{it_dir_name}/analyst_response.txt",
+                    "description": "Analyst LLM response (shared analysis + 4 worker briefings)",
+                })
+                if (output_dir / it_dir_name / "shared_prefix.txt").exists():
+                    manifest.append({
+                        "step": len(manifest) + 1,
+                        "type": "shared_prefix",
+                        "file": f"{it_dir_name}/shared_prefix.txt",
+                        "description": "Shared prefix sent to all 4 workers (identical — enables prompt caching)",
+                    })
+                for wid in [1, 2, 3, 4]:
+                    w_dir = f"{it_dir_name}/worker_{wid:02d}"
+                    if (output_dir / w_dir / "prompt.txt").exists():
+                        manifest.append({
+                            "step": len(manifest) + 1,
+                            "type": f"worker_{wid}_prompt",
+                            "file": f"{w_dir}/prompt.txt",
+                            "description": f"Worker {wid} full prompt (shared prefix + assignment suffix) — ran in PARALLEL",
+                        })
+                    if (output_dir / w_dir / "response.txt").exists():
+                        manifest.append({
+                            "step": len(manifest) + 1,
+                            "type": f"worker_{wid}_response",
+                            "file": f"{w_dir}/response.txt",
+                            "description": f"Worker {wid} LLM response (optimized SQL)",
+                        })
+
+            elif phase in ("coach", "replay"):
+                # Coach prompt/response — existence-checked because replay rounds
+                # may have coach prompt (saved pre-LLM) but no response (LLM failed)
+                if (output_dir / it_dir_name / "coach_prompt.txt").exists():
+                    manifest.append({
+                        "step": len(manifest) + 1,
+                        "type": "coach_prompt",
+                        "file": f"{it_dir_name}/coach_prompt.txt",
+                        "description": f"Coach round {it_num} prompt (post-mortem of previous round)",
+                    })
+                if (output_dir / it_dir_name / "coach_response.txt").exists():
+                    manifest.append({
+                        "step": len(manifest) + 1,
+                        "type": "coach_response",
+                        "file": f"{it_dir_name}/coach_response.txt",
+                        "description": f"Coach round {it_num} LLM response (refinement directives)",
+                    })
+                if (output_dir / it_dir_name / "refinement_prefix.txt").exists():
+                    manifest.append({
+                        "step": len(manifest) + 1,
+                        "type": "refinement_prefix",
+                        "file": f"{it_dir_name}/refinement_prefix.txt",
+                        "description": f"Refinement prefix for round {it_num} workers (base prefix + coach directives)",
+                    })
+                phase_label = "Coach" if phase == "coach" else "Replay"
+                for wid in [1, 2, 3, 4]:
+                    w_dir = f"{it_dir_name}/worker_{wid:02d}"
+                    if (output_dir / w_dir / "prompt.txt").exists():
+                        manifest.append({
+                            "step": len(manifest) + 1,
+                            "type": f"coach_{it_num}_worker_{wid}_prompt",
+                            "file": f"{w_dir}/prompt.txt",
+                            "description": f"{phase_label} round {it_num} Worker {wid} full prompt — ran in PARALLEL",
+                        })
+                    if (output_dir / w_dir / "response.txt").exists():
+                        manifest.append({
+                            "step": len(manifest) + 1,
+                            "type": f"coach_{it_num}_worker_{wid}_response",
+                            "file": f"{w_dir}/response.txt",
+                            "description": f"{phase_label} round {it_num} Worker {wid} LLM response",
+                        })
+
+            elif phase in ("retry", "snipe"):
+                if it_data.get("worker_prompt"):
+                    manifest.append({
+                        "step": len(manifest) + 1,
+                        "type": "retry_worker_prompt",
+                        "file": f"{it_dir_name}/worker_prompt.txt",
+                        "description": f"Retry worker prompt (single self-directed worker)",
+                    })
+                if it_data.get("worker_response"):
+                    manifest.append({
+                        "step": len(manifest) + 1,
+                        "type": "retry_worker_response",
+                        "file": f"{it_dir_name}/worker_response.txt",
+                        "description": f"Retry worker LLM response",
+                    })
+
+        (output_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+
         logger.info(
             f"Saved swarm session: {output_dir} "
             f"({len(self.iterations_data)} iterations, "
-            f"{len(self.all_worker_results)} total workers)"
+            f"{len(self.all_worker_results)} total workers, "
+            f"{len(manifest)} prompt artifacts in manifest)"
         )
         return output_dir
 
@@ -1710,9 +2544,9 @@ class SwarmSession(OptimizationSession):
             ├── worker_{N}_prompt.txt
             ├── worker_{N}_response.txt
             ├── worker_{N}_sql.sql
-            ├── snipe_{N}_prompt.txt   (if snipe iterations)
-            ├── snipe_{N}_response.txt
-            ├── snipe_{N}_sql.sql
+            ├── coach_{N}_prompt.txt    (if coach iterations)
+            ├── coach_{N}_response.txt
+            ├── coach_{N}_worker_{W}_sql.sql
             └── validation.json
         """
         query_dir = Path(run_dir) / self.query_id
@@ -1753,15 +2587,33 @@ class SwarmSession(OptimizationSession):
                     if wr_data.get("optimized_sql"):
                         (query_dir / f"worker_{wid}_sql.sql").write_text(wr_data["optimized_sql"])
 
-            elif phase in ("snipe", "snipe_retry"):
-                # Snipe prompt/response/SQL
+            elif phase in ("coach", "replay"):
+                # Coach prompt/response (replay may have partial — prompt only if LLM failed)
+                if it_data.get("coach_prompt"):
+                    (query_dir / f"coach_{it_num}_prompt.txt").write_text(it_data["coach_prompt"])
+                if it_data.get("coach_response"):
+                    (query_dir / f"coach_{it_num}_response.txt").write_text(it_data["coach_response"])
+                # Coach/replay worker prompts/responses/SQL
+                for wr_data in it_data.get("worker_results", []):
+                    wid = wr_data.get("worker_id", 0)
+                    if wid in worker_prompts:
+                        w_prompt, w_response = worker_prompts[wid]
+                        if w_prompt:
+                            (query_dir / f"coach_{it_num}_worker_{wid}_prompt.txt").write_text(w_prompt)
+                        if w_response:
+                            (query_dir / f"coach_{it_num}_worker_{wid}_response.txt").write_text(w_response)
+                    if wr_data.get("optimized_sql"):
+                        (query_dir / f"coach_{it_num}_worker_{wid}_sql.sql").write_text(wr_data["optimized_sql"])
+
+            elif phase in ("snipe", "snipe_retry", "retry"):
+                # Retry prompt/response/SQL (fallback)
                 if it_data.get("worker_prompt"):
-                    (query_dir / f"snipe_{it_num}_prompt.txt").write_text(it_data["worker_prompt"])
+                    (query_dir / f"retry_{it_num}_prompt.txt").write_text(it_data["worker_prompt"])
                 if it_data.get("worker_response"):
-                    (query_dir / f"snipe_{it_num}_response.txt").write_text(it_data["worker_response"])
+                    (query_dir / f"retry_{it_num}_response.txt").write_text(it_data["worker_response"])
                 for wr_data in it_data.get("worker_results", []):
                     if wr_data.get("optimized_sql"):
-                        (query_dir / f"snipe_{it_num}_sql.sql").write_text(wr_data["optimized_sql"])
+                        (query_dir / f"retry_{it_num}_sql.sql").write_text(wr_data["optimized_sql"])
 
         # Validation summary
         best = self._best_worker()
