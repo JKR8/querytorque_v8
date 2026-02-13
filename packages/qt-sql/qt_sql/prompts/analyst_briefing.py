@@ -482,19 +482,17 @@ def _format_constraint_for_analyst(c: Dict[str, Any]) -> str:
     parts = [f"**[{severity}] {tag}{cid}**: {instruction}"]
     if failures:
         for f in failures[:2]:
-            qid = f.get("query", f.get("query_id", "?"))
             reg = f.get("regression", f.get("speedup"))
             err = f.get("error", "")
             if reg:
-                parts.append(f"  - Failure: {qid} regressed to {reg}")
+                parts.append(f"  - Failure: regressed to {reg}")
             elif err:
-                parts.append(f"  - Failure: {qid} — {err}")
+                parts.append(f"  - Failure: {err}")
     if successes:
         for s in successes[:2]:
-            qid = s.get("query", "?")
             spd = str(s.get("speedup", "?")).rstrip("x")
             ctx = s.get("context", "")
-            parts.append(f"  - Success: {qid} achieved {spd}x — {ctx}")
+            parts.append(f"  - Success: {spd}x — {ctx}")
     if overridable and override_conditions:
         parts.append("  - Override conditions (Worker 4 exploration):")
         for oc in override_conditions:
