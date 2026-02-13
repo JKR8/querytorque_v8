@@ -52,7 +52,8 @@ qt-dax audit model.SemanticModel -v
 
 ```bash
 qt-dax optimize model.vpax --provider deepseek
-qt-dax optimize model.vpax --dspy --port <pbi_port>
+qt-dax optimize model.vpax --dry-run -m "Total Sales"
+qt-dax optimize model.vpax --provider openrouter --attempts 2
 ```
 
 ### Validate Two DAX Files

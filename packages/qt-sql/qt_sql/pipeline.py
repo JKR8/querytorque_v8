@@ -1799,14 +1799,21 @@ class Pipeline:
     def get_explain_plan_text(
         self, query_id: str, dialect: str = "duckdb",
     ) -> Optional[str]:
-        """Load EXPLAIN ANALYZE plan text from cached explains.
+        """Load EXPLAIN plan and return pre-rendered compact text.
 
         Searches: explains/ (flat) -> explains/sf10/ -> explains/sf5/.
-        For DuckDB: uses plan_text field (JSON string -> rendered tree).
-        For PG: renders plan_json to ASCII tree via format_pg_explain_tree().
-        Returns the ASCII text plan or None.
+        For DuckDB: prefers plan_json (structured) and renders via
+        format_duckdb_explain_tree() into a compact indented tree
+        (~40 lines vs ~230 lines of box-drawing ASCII).
+        For PG: renders plan_json via format_pg_explain_tree().
+        Returns pre-rendered text ready for prompt embedding.
         """
-        from .prompts.analyst_briefing import format_pg_explain_tree
+        from .prompts.analyst_briefing import (
+            format_duckdb_explain_tree,
+            format_pg_explain_tree,
+        )
+
+        is_duckdb = dialect.lower() in ("duckdb",)
 
         search_paths = [
             self.benchmark_dir / "explains" / f"{query_id}.json",
@@ -1818,14 +1825,27 @@ class Pipeline:
             if cache_path.exists():
                 try:
                     data = json.loads(cache_path.read_text())
-                    plan_text = data.get("plan_text")
-                    if plan_text:
-                        return plan_text
                     plan_json = data.get("plan_json")
-                    if plan_json:
-                        rendered = format_pg_explain_tree(plan_json)
-                        if rendered:
-                            return rendered
+                    plan_text = data.get("plan_text")
+
+                    if is_duckdb:
+                        # Prefer plan_json — structured tree rendered as
+                        # compact indented text (vs box-drawing ASCII)
+                        if plan_json and isinstance(plan_json, dict) and plan_json.get("children"):
+                            rendered = format_duckdb_explain_tree(json.dumps(plan_json))
+                            if rendered:
+                                return rendered
+                        # Fallback: plan_text may be JSON string or box-drawing
+                        if plan_text:
+                            return format_duckdb_explain_tree(plan_text)
+                    else:
+                        # PG/Snowflake: render plan_json via PG formatter
+                        if plan_json:
+                            rendered = format_pg_explain_tree(plan_json)
+                            if rendered:
+                                return rendered
+                        if plan_text:
+                            return plan_text
                 except Exception:
                     pass
 

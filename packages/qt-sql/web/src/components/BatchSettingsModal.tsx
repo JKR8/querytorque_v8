@@ -39,65 +39,25 @@ export default function BatchSettingsModal({
         </div>
 
         <div className="bs-content">
-          {/* Auto-fix Threshold */}
-          <div className="bs-field">
-            <label>Auto-Fix Threshold</label>
-            <p className="bs-hint">
-              Queries with Torque Score below this value will be optimized
-            </p>
-            <div className="bs-slider-container">
-              <input
-                type="range"
-                min="0"
-                max="100"
-                value={localSettings.autoFixThreshold}
-                onChange={e =>
-                  setLocalSettings(s => ({
-                    ...s,
-                    autoFixThreshold: Number(e.target.value),
-                  }))
-                }
-              />
-              <div className="bs-slider-labels">
-                <span>0</span>
-                <span className="bs-slider-value">{localSettings.autoFixThreshold}</span>
-                <span>100</span>
-              </div>
-            </div>
-            <div className="bs-threshold-preview">
-              {localSettings.autoFixThreshold === 0 && (
-                <span className="bs-preview-hint">All queries will be skipped</span>
-              )}
-              {localSettings.autoFixThreshold === 100 && (
-                <span className="bs-preview-hint">All queries will be optimized</span>
-              )}
-              {localSettings.autoFixThreshold > 0 && localSettings.autoFixThreshold < 100 && (
-                <span className="bs-preview-hint">
-                  Optimize queries scoring below {localSettings.autoFixThreshold}
-                </span>
-              )}
-            </div>
-          </div>
-
-          {/* Mode Selection */}
+          {/* Optimization Mode */}
           <div className="bs-field">
             <label>Optimization Mode</label>
             <div className="bs-mode-options">
               <button
-                className={`bs-mode-btn ${localSettings.mode === 'auto' ? 'active' : ''}`}
-                onClick={() => setLocalSettings(s => ({ ...s, mode: 'auto' }))}
+                className={`bs-mode-btn ${localSettings.mode === 'swarm' ? 'active' : ''}`}
+                onClick={() => setLocalSettings(s => ({ ...s, mode: 'swarm' }))}
               >
                 <span className="bs-mode-icon">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
                   </svg>
                 </span>
-                <span className="bs-mode-label">Auto</span>
-                <span className="bs-mode-desc">Use configured LLM</span>
+                <span className="bs-mode-label">Swarm</span>
+                <span className="bs-mode-desc">4 workers + snipe (best quality)</span>
               </button>
               <button
-                className={`bs-mode-btn ${localSettings.mode === 'manual' ? 'active' : ''}`}
-                onClick={() => setLocalSettings(s => ({ ...s, mode: 'manual' }))}
+                className={`bs-mode-btn ${localSettings.mode === 'expert' ? 'active' : ''}`}
+                onClick={() => setLocalSettings(s => ({ ...s, mode: 'expert' }))}
               >
                 <span className="bs-mode-icon">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -105,8 +65,20 @@ export default function BatchSettingsModal({
                     <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
                   </svg>
                 </span>
-                <span className="bs-mode-label">Manual</span>
-                <span className="bs-mode-desc">Analyze only</span>
+                <span className="bs-mode-label">Expert</span>
+                <span className="bs-mode-desc">Single expert rewrite</span>
+              </button>
+              <button
+                className={`bs-mode-btn ${localSettings.mode === 'oneshot' ? 'active' : ''}`}
+                onClick={() => setLocalSettings(s => ({ ...s, mode: 'oneshot' }))}
+              >
+                <span className="bs-mode-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <polygon points="13,2 3,14 12,14 11,22 21,10 12,10" />
+                  </svg>
+                </span>
+                <span className="bs-mode-label">Oneshot</span>
+                <span className="bs-mode-desc">Fast single pass</span>
               </button>
             </div>
           </div>

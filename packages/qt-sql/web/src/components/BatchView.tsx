@@ -1,12 +1,11 @@
 /**
  * BatchView Component
- * Displays batch processing progress and file list
+ * Displays batch processing progress with speedup column
  */
 
 import { useState } from 'react'
 import type { BatchFile, BatchSettings } from '@/hooks/useBatchProcessor'
 import { exportBatchResults } from '@/utils/zipExport'
-import BatchSettingsModal from './BatchSettingsModal'
 import './BatchView.css'
 
 interface BatchViewProps {
@@ -15,8 +14,9 @@ interface BatchViewProps {
   progress: {
     total: number
     completed: number
-    fixed: number
-    skipped: number
+    optimized: number
+    neutral: number
+    regression: number
     failed: number
     percent: number
   }
@@ -26,7 +26,7 @@ interface BatchViewProps {
   onReset: () => void
   onRetry: (id: string) => void
   onRemoveFile: (id: string) => void
-  onUpdateSettings: (settings: BatchSettings) => void
+  onUpdateSettings: (settings: Partial<BatchSettings>) => void
 }
 
 function getStatusIcon(status: string) {
@@ -37,26 +37,32 @@ function getStatusIcon(status: string) {
           <circle cx="12" cy="12" r="10" />
         </svg>
       )
-    case 'analyzing':
-    case 'optimizing':
+    case 'running':
       return (
         <svg className="bv-spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
           <circle cx="12" cy="12" r="10" />
           <path d="M12 6v6l4 2" />
         </svg>
       )
-    case 'fixed':
+    case 'optimized':
       return (
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
           <circle cx="12" cy="12" r="10" />
           <polyline points="9,12 11,14 15,10" />
         </svg>
       )
-    case 'skipped':
+    case 'neutral':
       return (
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
           <circle cx="12" cy="12" r="10" />
           <line x1="8" y1="12" x2="16" y2="12" />
+        </svg>
+      )
+    case 'regression':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <circle cx="12" cy="12" r="10" />
+          <polyline points="8,10 12,14 16,10" />
         </svg>
       )
     case 'failed':
@@ -72,6 +78,12 @@ function getStatusIcon(status: string) {
   }
 }
 
+function formatSpeedup(speedup?: number): string {
+  if (speedup == null) return '--'
+  if (speedup >= 10) return speedup.toFixed(0) + 'x'
+  return speedup.toFixed(2) + 'x'
+}
+
 export default function BatchView({
   files,
   isProcessing,
@@ -84,7 +96,6 @@ export default function BatchView({
   onRemoveFile,
   onUpdateSettings,
 }: BatchViewProps) {
-  const [showSettings, setShowSettings] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
 
   const handleExport = async () => {
@@ -98,8 +109,8 @@ export default function BatchView({
     }
   }
 
-  const canStart = files.length > 0 && !isProcessing && files.some(f => f.status === 'pending')
-  const canExport = files.some(f => f.status === 'fixed')
+  const canStart = files.length > 0 && !isProcessing && files.some(f => f.status === 'pending') && settings.dsn
+  const canExport = files.some(f => f.status === 'optimized')
 
   return (
     <div className="bv-container">
@@ -110,17 +121,15 @@ export default function BatchView({
           <span className="bv-file-count">{files.length} files</span>
         </div>
         <div className="bv-header-actions">
-          <button
-            className="action-btn"
-            onClick={() => setShowSettings(true)}
+          {/* DSN input */}
+          <input
+            type="text"
+            className="bv-dsn-input"
+            placeholder="Database DSN (postgres://...)"
+            value={settings.dsn}
+            onChange={(e) => onUpdateSettings({ dsn: e.target.value })}
             disabled={isProcessing}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="3" />
-              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
-            </svg>
-            Settings
-          </button>
+          />
           {isProcessing ? (
             <button className="action-btn" onClick={onAbort}>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -133,11 +142,12 @@ export default function BatchView({
               className="action-btn primary"
               onClick={onStart}
               disabled={!canStart}
+              title={!settings.dsn ? 'Enter a database DSN first' : ''}
             >
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <polygon points="5,3 19,12 5,21 5,3" />
               </svg>
-              Start
+              Run All
             </button>
           )}
         </div>
@@ -153,14 +163,25 @@ export default function BatchView({
         </div>
         <div className="bv-progress-stats">
           <span>{progress.completed}/{progress.total} completed</span>
-          <span className="bv-stat fixed">{progress.fixed} fixed</span>
-          <span className="bv-stat skipped">{progress.skipped} skipped</span>
+          <span className="bv-stat optimized">{progress.optimized} optimized</span>
+          <span className="bv-stat neutral">{progress.neutral} neutral</span>
+          <span className="bv-stat regression">{progress.regression} regression</span>
           <span className="bv-stat failed">{progress.failed} failed</span>
         </div>
       </div>
 
-      {/* File List */}
+      {/* File Table */}
       <div className="bv-file-list">
+        {/* Table header */}
+        <div className="bv-file-item bv-file-header">
+          <div className="bv-file-icon" />
+          <div className="bv-file-info"><span className="bv-file-name">Filename</span></div>
+          <div className="bv-file-speedup">Speedup</div>
+          <div className="bv-file-transforms">Transforms</div>
+          <div className="bv-file-status"><span>Status</span></div>
+          <div className="bv-file-actions" />
+        </div>
+
         {files.map(file => (
           <div key={file.id} className={`bv-file-item ${file.status}`}>
             <div className="bv-file-icon">
@@ -168,11 +189,27 @@ export default function BatchView({
             </div>
             <div className="bv-file-info">
               <span className="bv-file-name">{file.name}</span>
-              {file.score != null && (
-                <span className="bv-file-score">Score: {file.score}</span>
-              )}
               {file.error && (
                 <span className="bv-file-error">{file.error}</span>
+              )}
+            </div>
+            <div className="bv-file-speedup">
+              {file.speedup != null && (
+                <span className={`bv-speedup-value ${file.status}`}>
+                  {formatSpeedup(file.speedup)}
+                </span>
+              )}
+            </div>
+            <div className="bv-file-transforms">
+              {file.transforms && file.transforms.length > 0 && (
+                <div className="bv-transform-tags">
+                  {file.transforms.slice(0, 3).map((t, i) => (
+                    <span key={i} className="bv-transform-tag">{t}</span>
+                  ))}
+                  {file.transforms.length > 3 && (
+                    <span className="bv-transform-tag">+{file.transforms.length - 3}</span>
+                  )}
+                </div>
               )}
             </div>
             <div className="bv-file-status">
@@ -223,7 +260,7 @@ export default function BatchView({
           onClick={onReset}
           disabled={isProcessing}
         >
-          Clear All
+          Clear
         </button>
         <button
           className="action-btn primary"
@@ -247,15 +284,6 @@ export default function BatchView({
           )}
         </button>
       </div>
-
-      {/* Settings Modal */}
-      {showSettings && (
-        <BatchSettingsModal
-          settings={settings}
-          onSave={onUpdateSettings}
-          onClose={() => setShowSettings(false)}
-        />
-      )}
     </div>
   )
 }

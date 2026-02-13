@@ -71,6 +71,7 @@ class OptimizeRequest(BaseModel):
         description="Optimization mode: swarm (4-worker fan-out), expert (iterative), oneshot (single call)"
     )
     query_id: Optional[str] = Field(default=None, description="Query identifier for traceability")
+    session_id: Optional[str] = Field(default=None, description="Database session ID — required for DuckDB uploaded fixtures")
     max_iterations: int = Field(default=3, ge=1, le=10, description="Max optimization iterations")
     target_speedup: float = Field(default=1.10, ge=1.0, description="Target speedup ratio to achieve")
 
@@ -120,6 +121,7 @@ class HealthResponse(BaseModel):
 # ============================================
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
+@app.get("/api/health", response_model=HealthResponse, tags=["Health"], include_in_schema=False)
 async def health_check():
     """Health check endpoint."""
     settings = get_settings()
@@ -170,8 +172,28 @@ async def optimize_sql(request: OptimizeRequest):
         }
     )
 
+    # For DuckDB uploaded fixtures, export session data to a temp .duckdb file
+    # so the pipeline can access the actual tables (not an empty :memory: DB)
+    dsn = request.dsn
+    tmp_duckdb_path = None
+    if request.session_id and request.session_id in db_sessions:
+        executor = db_sessions[request.session_id]
+        if type(executor).__name__ == "DuckDBExecutor":
+            try:
+                import duckdb
+                conn = executor._ensure_connected()
+                tmp_duckdb = tempfile.NamedTemporaryFile(suffix='.duckdb', delete=False)
+                tmp_duckdb_path = tmp_duckdb.name
+                tmp_duckdb.close()
+                conn.execute(f"ATTACH '{tmp_duckdb_path}' AS export_db")
+                conn.execute("COPY FROM DATABASE memory TO export_db")
+                conn.execute("DETACH export_db")
+                dsn = tmp_duckdb_path  # Pipeline uses file path for DuckDB
+            except Exception as e:
+                logger.warning(f"Failed to export DuckDB session, using DSN as-is: {e}")
+
     try:
-        pipeline = Pipeline(dsn=request.dsn)
+        pipeline = Pipeline(dsn=dsn)
         result = pipeline.run_optimization_session(
             query_id=query_id,
             sql=request.sql,
@@ -217,13 +239,21 @@ async def optimize_sql(request: OptimizeRequest):
             query_id=query_id,
             error=str(e),
         )
+    finally:
+        # Clean up temp DuckDB export file
+        if tmp_duckdb_path:
+            try:
+                os.unlink(tmp_duckdb_path)
+            except Exception:
+                pass
 
 
 # ============================================
 # Database Connection Endpoints
 # ============================================
 
-db_sessions: dict[str, "DuckDBExecutor"] = {}  # type: ignore[name-defined]
+db_sessions: dict[str, object] = {}  # DuckDBExecutor or PostgresExecutor
+db_fixture_paths: dict[str, str] = {}  # session_id -> temp fixture file path (DuckDB only)
 
 
 class DatabaseConnectResponse(BaseModel):
@@ -298,38 +328,75 @@ async def connect_duckdb(fixture_file: UploadFile = File(...)):
             tmp.write(content)
             tmp_path = tmp.name
 
-        try:
-            executor = DuckDBExecutor(":memory:")
-            executor.connect()
+        executor = DuckDBExecutor(":memory:")
+        executor.connect()
 
-            if suffix.lower() == ".sql":
-                executor.execute_script(content.decode('utf-8'))
-            elif suffix.lower() == ".csv":
-                executor._ensure_connected().execute(
-                    f"CREATE TABLE data AS SELECT * FROM read_csv_auto('{tmp_path}')"
-                )
-            elif suffix.lower() in (".parquet", ".pq"):
-                executor._ensure_connected().execute(
-                    f"CREATE TABLE data AS SELECT * FROM read_parquet('{tmp_path}')"
-                )
-            else:
-                executor.execute_script(content.decode('utf-8'))
-
-            db_sessions[session_id] = executor
-            schema = executor.get_schema_info(include_row_counts=False)
-            table_count = len(schema.get("tables", []))
-
-            return DatabaseConnectResponse(
-                session_id=session_id, connected=True, type="duckdb",
-                details=f"Loaded {table_count} table(s) from {fixture_file.filename}",
+        if suffix.lower() == ".sql":
+            executor.execute_script(content.decode('utf-8'))
+        elif suffix.lower() == ".csv":
+            executor._ensure_connected().execute(
+                f"CREATE TABLE data AS SELECT * FROM read_csv_auto('{tmp_path}')"
             )
-        finally:
-            os.unlink(tmp_path)
+        elif suffix.lower() in (".parquet", ".pq"):
+            executor._ensure_connected().execute(
+                f"CREATE TABLE data AS SELECT * FROM read_parquet('{tmp_path}')"
+            )
+        else:
+            executor.execute_script(content.decode('utf-8'))
+
+        db_sessions[session_id] = executor
+        db_fixture_paths[session_id] = tmp_path  # Keep file for pipeline reuse
+        schema = executor.get_schema_info(include_row_counts=False)
+        table_count = len(schema.get("tables", []))
+
+        return DatabaseConnectResponse(
+            session_id=session_id, connected=True, type="duckdb",
+            details=f"Loaded {table_count} table(s) from {fixture_file.filename}",
+        )
 
     except Exception as e:
         logger.exception("DuckDB connection failed")
         return DatabaseConnectResponse(
             session_id=session_id, connected=False, type="duckdb", error=str(e),
+        )
+
+
+class PostgresConnectRequest(BaseModel):
+    connection_string: str = Field(..., description="PostgreSQL connection string (postgres://user:pass@host:port/db)")
+
+
+@app.post("/api/database/connect/postgres", response_model=DatabaseConnectResponse, tags=["Database"])
+async def connect_postgres(request: PostgresConnectRequest):
+    """Connect to PostgreSQL with a connection string."""
+    from qt_sql.execution import PostgresExecutor
+    from urllib.parse import urlparse
+
+    session_id = str(uuid.uuid4())[:12]
+
+    try:
+        parsed = urlparse(request.connection_string)
+        executor = PostgresExecutor(
+            host=parsed.hostname or "localhost",
+            port=parsed.port or 5432,
+            database=parsed.path.lstrip("/") or "postgres",
+            user=parsed.username or "postgres",
+            password=parsed.password or "",
+        )
+        executor.connect()
+
+        db_sessions[session_id] = executor
+        schema = executor.get_schema_info(include_row_counts=False)
+        table_count = len(schema.get("tables", []))
+
+        return DatabaseConnectResponse(
+            session_id=session_id, connected=True, type="postgres",
+            details=f"Connected to {parsed.hostname}:{parsed.port}/{parsed.path.lstrip('/')} ({table_count} tables)",
+        )
+
+    except Exception as e:
+        logger.exception("PostgreSQL connection failed")
+        return DatabaseConnectResponse(
+            session_id=session_id, connected=False, type="postgres", error=str(e),
         )
 
 
@@ -387,7 +454,8 @@ async def get_database_status(session_id: str):
     executor = db_sessions.get(session_id)
     if not executor:
         return DatabaseStatusResponse(connected=False)
-    return DatabaseStatusResponse(connected=True, type="duckdb", details="Connected")
+    db_type = "postgres" if type(executor).__name__ == "PostgresExecutor" else "duckdb"
+    return DatabaseStatusResponse(connected=True, type=db_type, details="Connected")
 
 
 @app.delete("/api/database/disconnect/{session_id}", tags=["Database"])
@@ -397,6 +465,13 @@ async def disconnect_database(session_id: str):
     if executor:
         try:
             executor.close()
+        except Exception:
+            pass
+    # Clean up DuckDB fixture file
+    fixture_path = db_fixture_paths.pop(session_id, None)
+    if fixture_path:
+        try:
+            os.unlink(fixture_path)
         except Exception:
             pass
     return {"success": True}
@@ -417,11 +492,41 @@ async def execute_query(session_id: str, request: ExecuteRequest):
         if not has_limit and request.limit:
             sql = f"SELECT * FROM ({sql}) AS _subq LIMIT {request.limit}"
 
-        conn = executor._ensure_connected()
-        result = conn.execute(sql)
-        columns = [desc[0] for desc in result.description] if result.description else []
-        column_types = [desc[1] for desc in result.description] if result.description else []
-        rows = result.fetchall()
+        is_postgres = type(executor).__name__ == "PostgresExecutor"
+
+        if is_postgres:
+            # PostgresExecutor returns list[dict]
+            raw_rows = executor.execute(sql)
+            if raw_rows:
+                columns = list(raw_rows[0].keys())
+                column_types = [type(v).__name__ for v in raw_rows[0].values()]
+                rows = [list(r.values()) for r in raw_rows]
+            else:
+                # Empty result — still fetch column metadata via LIMIT 0
+                try:
+                    meta_rows = executor.execute(f"SELECT * FROM ({request.sql.strip().rstrip(';')}) AS _meta LIMIT 0")
+                    # meta_rows will be empty but we need column names from the executor's cursor
+                    # Fall back to running with cursor directly
+                    conn = executor._ensure_connected()
+                    with conn.cursor() as cur:
+                        cur.execute(f"SELECT * FROM ({request.sql.strip().rstrip(';')}) AS _meta LIMIT 0")
+                        if cur.description:
+                            columns = [desc[0] for desc in cur.description]
+                            column_types = [str(desc[1]) for desc in cur.description]
+                        else:
+                            columns, column_types = [], []
+                    conn.rollback()  # Don't leave transaction open
+                except Exception:
+                    columns, column_types = [], []
+                rows = []
+        else:
+            # DuckDB path
+            conn = executor._ensure_connected()
+            result = conn.execute(sql)
+            columns = [desc[0] for desc in result.description] if result.description else []
+            column_types = [desc[1] for desc in result.description] if result.description else []
+            rows = result.fetchall()
+
         execution_time = (time.time() - start) * 1000
 
         def convert_value(v):
@@ -452,6 +557,7 @@ async def execute_query(session_id: str, request: ExecuteRequest):
 async def explain_query(session_id: str, request: ExplainRequest):
     """Get execution plan for a SQL query."""
     from qt_sql.execution import DuckDBPlanParser
+    from qt_sql.execution.postgres_plan_parser import PostgresPlanParser
 
     executor = db_sessions.get(session_id)
     if not executor:
@@ -459,7 +565,10 @@ async def explain_query(session_id: str, request: ExplainRequest):
 
     try:
         plan_json = executor.explain(request.sql, analyze=request.analyze)
-        parser = DuckDBPlanParser()
+        if type(executor).__name__ == "PostgresExecutor":
+            parser = PostgresPlanParser()
+        else:
+            parser = DuckDBPlanParser()
         analysis = parser.parse(plan_json)
 
         return ExecutionPlanResponse(
@@ -471,6 +580,69 @@ async def explain_query(session_id: str, request: ExplainRequest):
     except Exception as e:
         logger.exception("Explain failed")
         return ExecutionPlanResponse(success=False, error=str(e))
+
+
+class AuditResponse(BaseModel):
+    success: bool
+    plan_tree: Optional[list] = None
+    bottleneck: Optional[dict] = None
+    pathology_name: Optional[str] = None
+    execution_time_ms: Optional[float] = None
+    total_cost: Optional[float] = None
+    warnings: list[str] = []
+    error: Optional[str] = None
+
+
+@app.post("/api/database/audit/{session_id}", response_model=AuditResponse, tags=["Database"])
+async def audit_query(session_id: str, request: ExplainRequest):
+    """Audit a SQL query — runs EXPLAIN ANALYZE, identifies bottleneck and pathology.
+
+    This is the free tier: no LLM calls, just plan analysis.
+    """
+    from qt_sql.execution import DuckDBPlanParser
+    from qt_sql.execution.postgres_plan_parser import PostgresPlanParser
+
+    executor = db_sessions.get(session_id)
+    if not executor:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Database session not found")
+
+    try:
+        plan_json = executor.explain(request.sql, analyze=request.analyze)
+        if type(executor).__name__ == "PostgresExecutor":
+            parser = PostgresPlanParser()
+        else:
+            parser = DuckDBPlanParser()
+        analysis = parser.parse(plan_json)
+
+        # Build human-readable pathology name from bottleneck
+        pathology_name = None
+        if analysis.bottleneck:
+            op = analysis.bottleneck.get("operator", "Unknown")
+            cost = analysis.bottleneck.get("cost_pct", 0)
+            detail = analysis.bottleneck.get("details", "")
+            suggestion = analysis.bottleneck.get("suggestion", "")
+
+            if detail:
+                pathology_name = f"{op} on {detail} — {cost:.0f}% of query cost"
+            else:
+                pathology_name = f"{op} — {cost:.0f}% of query cost"
+
+            if suggestion:
+                pathology_name += f". {suggestion}"
+
+        return AuditResponse(
+            success=True,
+            plan_tree=analysis.plan_tree,
+            bottleneck=analysis.bottleneck,
+            pathology_name=pathology_name,
+            execution_time_ms=analysis.execution_time_ms,
+            total_cost=analysis.total_cost,
+            warnings=analysis.warnings or [],
+        )
+
+    except Exception as e:
+        logger.exception("Audit failed")
+        return AuditResponse(success=False, error=str(e))
 
 
 @app.get("/api/database/schema/{session_id}", response_model=SchemaResponse, tags=["Database"])

@@ -1,0 +1,346 @@
+==========================================================================================
+DEEP Q-ERROR ANALYSIS
+==========================================================================================
+
+Data loaded: 98 Q-Error, 99 leaderboard, 21 gold
+Merged: 98 queries with both Q-Error and leaderboard data
+
+==========================================================================================
+§1  EXPLAIN-ONLY vs EXPLAIN ANALYZE — What's Free?
+==========================================================================================
+
+EXPLAIN (no execution):
+  ✅ Estimated Cardinality per node      ✅ Plan tree structure
+  ✅ Node types (JOIN, SCAN, etc.)       ✅ Join conditions & filters
+  ✅ CTE boundaries                      ✅ DELIM_SCAN markers
+  ❌ Actual row counts                   ❌ Execution timing
+  ❌ Q-Error (needs actuals)             ❌ Memory/spill stats
+
+EXPLAIN ANALYZE (full query execution):
+  ✅ Everything above PLUS:
+  ✅ operator_cardinality (actual rows)   ✅ operator_timing per node
+  ✅ Q-Error computable                   ✅ Memory usage
+
+CRITICAL INSIGHT: Q-Error itself requires EXPLAIN ANALYZE (i.e. running the
+query). But STRUCTURAL SIGNALS from EXPLAIN-only are strong proxies:
+
+  Sentinel signals in 100 TPC-DS queries:
+    Estimated = 0 (planner gave up):  9 queries
+    Estimated = 1 (planner guessing):  2 queries
+    DELIM_SCAN (decorrelation marker): 7 queries
+
+  Predictive power of Est=0 or Act=0 (visible from EXPLAIN when Est=0):
+    Median Q-Error (sentinel zero):  11,356
+    Median Q-Error (non-sentinel):   239
+    → Est=0 in EXPLAIN is 47x stronger signal
+
+  EXPLAIN-ONLY PROXY FEATURES (no execution needed):
+
+  | Signal                     | What it tells you              | Detectable? |
+  |----------------------------|--------------------------------|-------------|
+  | Est=0 on any node          | Planner has ZERO information   | ✅ FREE     |
+  | Est=1 on non-leaf node     | Planner is guessing minimum    | ✅ FREE     |
+  | DELIM_SCAN/DELIM_JOIN      | Decorrelated subquery present  | ✅ FREE     |
+  | Same table scanned N times | Repeated scan consolidation    | ✅ FREE     |
+  | LEFT JOIN present          | Inner join conversion cand.    | ✅ FREE     |
+  | INTERSECT/EXCEPT present   | EXISTS rewrite candidate       | ✅ FREE     |
+  | CTE count ≥ 2              | Predicate pushback candidate   | ✅ FREE     |
+  | Row est increase thru join | Join fanout misprediction      | ✅ FREE     |
+  |                            |                                |             |
+  | Actual row count           | Ground truth for Q-Error       | ❌ COSTLY   |
+  | operator_timing            | Where time is actually spent   | ❌ COSTLY   |
+  | Q-Error number             | Exact wrongness magnitude      | ❌ COSTLY   |
+
+  VERDICT: For pre-screening, EXPLAIN-only gives ~80% of the signal.
+  EXPLAIN ANALYZE is needed to QUANTIFY the wrongness and to compute the
+  mismatch DIRECTION (under vs over-estimate), which routes to transforms.
+
+==========================================================================================
+§2  CATEGORICAL VARIABLES — Derived from Q-Error
+==========================================================================================
+
+  Three categorical variables derivable from Q-Error analysis:
+
+  MISMATCH_DIRECTION — which way is the optimizer wrong?
+  ----------------------------------------------------------------------
+    OVER_EST     :  60/98 (  61%)  avg_speedup=1.33x  wins=12
+    UNDER_EST    :  14/98 (  14%)  avg_speedup=1.66x  wins=5
+    ZERO_EST     :  20/98 (  20%)  avg_speedup=1.21x  wins=4
+    ACCURATE     :   4/98 (   4%)  avg_speedup=2.00x  wins=1
+
+  MISMATCH_LOCUS — where in the plan is the optimizer wrong?
+  ----------------------------------------------------------------------
+    PROJECTION   :  35/98 (  36%)  avg_speedup=1.45x  wins=6
+    JOIN         :  14/98 (  14%)  avg_speedup=1.50x  wins=6
+    AGGREGATE    :   6/98 (   6%)  avg_speedup=1.35x  wins=1
+    CTE          :   4/98 (   4%)  avg_speedup=1.50x  wins=2
+    FILTER       :  19/98 (  19%)  avg_speedup=1.33x  wins=4
+    SCAN         :  20/98 (  20%)  avg_speedup=1.21x  wins=3
+
+  MISMATCH_MAGNITUDE — how wrong is the optimizer?
+  ----------------------------------------------------------------------
+    EXTREME      :  29/98 (  30%)  avg_speedup=1.43x  wins=5
+    3_ORDER      :  13/98 (  13%)  avg_speedup=1.04x  wins=1
+    2_ORDER      :  24/98 (  24%)  avg_speedup=1.33x  wins=6
+    1_ORDER      :  26/98 (  27%)  avg_speedup=1.46x  wins=9
+    MINOR        :   6/98 (   6%)  avg_speedup=1.76x  wins=1
+
+==========================================================================================
+§3  Q-ERROR NODE TYPE → PATHOLOGY MAPPING
+==========================================================================================
+
+  Does the Q-Error node type tell us WHICH pathology to target?
+  Cross-referencing gold examples where we know the winning transform:
+
+  Example                      Q-Err Node     Direction    Pathology Transform                    Speedup 
+  ------------------------------------------------------------------------------------------------
+  aggregate_pushdown           AGGREGATE      OVER_EST     P3     aggregate_pushdown            42.90x
+  channel_bitmap_aggregation   SCAN           OVER_EST     P1     channel_bitmap_aggregation     6.24x
+  self_join_decomposition      CTE            ZERO_EST     P7     self_join_decomposition        4.76x
+  inner_join_conversion        PROJECTION     UNDER_EST    P5     inner_join_conversion          3.44x
+  early_filter                 PROJECTION     UNDER_EST    P0     early_filter                   2.97x
+  intersect_to_exists          PROJECTION     UNDER_EST    P6     intersect_to_exists            2.72x
+  rollup_to_union_windowing    PROJECTION     OVER_EST     P7     rollup_to_union_windowing      2.47x
+  multi_intersect_exists_cte   PROJECTION     UNDER_EST    P6     multi_intersect_exists_cte     2.39x
+  composite_decorrelate_union  SCAN           ZERO_EST     P2     composite_decorrelate_union    2.01x
+  decorrelate                  JOIN           UNDER_EST    P2     decorrelate                    1.87x
+  date_cte_isolate             JOIN           ZERO_EST     P0     date_cte_isolate               1.86x
+  union_cte_split              PROJECTION     OVER_EST     P7     union_cte_split                1.57x
+  or_to_union                  PROJECTION     OVER_EST     P4     or_to_union                    1.52x
+  materialize_cte              FILTER         OVER_EST     P9     materialize_cte                1.43x
+  shared_dimension_multi_channel PROJECTION     OVER_EST     P0     shared_dimension_multi_channel   1.40x
+  multi_dimension_prefetch     PROJECTION     OVER_EST     P0     multi_dimension_prefetch       1.07x
+
+  NODE/DIRECTION → PATHOLOGY ROUTING TABLE:
+  ----------------------------------------------------------------------
+    AGGREGATE/OVER_EST       → P3(1)
+    CTE/ZERO_EST             → P7(1)
+    FILTER/OVER_EST          → P9(1)
+    JOIN/UNDER_EST           → P2(1)
+    JOIN/ZERO_EST            → P0(1)
+    PROJECTION/OVER_EST      → P7(2), P0(2), P4(1)
+    PROJECTION/UNDER_EST     → P6(2), P5(1), P0(1)
+    SCAN/OVER_EST            → P1(1)
+    SCAN/ZERO_EST            → P2(1)
+
+==========================================================================================
+§4  PINPOINT vs FLAG — How Specific Is the Signal?
+==========================================================================================
+
+  QUESTION: Does Q-Error tell us WHICH optimization to apply,
+            or just that optimization is worthwhile?
+
+  ANSWER: It's a LAYERED signal with increasing specificity:
+
+  Layer 1 — MAGNITUDE (from EXPLAIN ANALYZE):
+    "There IS an opportunity here."
+    Q-Error > 100 → green light for optimization.
+    Predictive power: 69% overlap with actual wins (gold examples).
+    Limitation: Needs full query execution.
+
+  Layer 2 — STRUCTURAL SIGNALS (from EXPLAIN-only, FREE):
+    "Here's the TYPE of opportunity."
+    DELIM_SCAN present → decorrelation candidate (P2)
+    Same table N scans → consolidation candidate (P1)
+    LEFT JOIN present → inner conversion candidate (P5)
+    INTERSECT present → EXISTS rewrite candidate (P6)
+    CTE count ≥ 2 → predicate pushback candidate (P0)
+    Predictive power: narrows from 10 pathologies to 2-3.
+
+  Layer 3 — DIRECTION (from EXPLAIN ANALYZE):
+    "Here's the SPECIFIC weakness."
+    UNDER_EST on JOIN → decorrelate, materialize CTE (planner chose wrong join)
+    OVER_EST on AGGREGATE → push agg below join (planner overestimated fan-out)
+    ZERO_EST on CTE → self-join decomposition (planner has no CTE statistics)
+    Predictive power: narrows to 1-2 transforms.
+
+  Layer 4 — LOCUS + DIRECTION (from EXPLAIN ANALYZE):
+    "Here's the EXACT operator to fix."
+    AGGREGATE/OVER_EST → P3 (aggregate pushdown)
+    CTE/ZERO_EST → P7 (self-join decomposition)
+    JOIN/UNDER_EST → P2 (decorrelation) or P0 (predicate pushback)
+    SCAN/OVER_EST → P4 (cross-column OR) or P1 (repeated scans)
+
+==========================================================================================
+§5  WIN RATE BY Q-ERROR CATEGORY
+==========================================================================================
+
+  Category                     Total   WIN   IMP   NEU   REG   Win%  Avg Spd
+  ----------------------------------------------------------------------------------
+  CATASTROPHIC (>10K)             29     5    15     9     0    17%    1.43x
+  MAJOR (100-10K)                 36     6     9    21     0    17%    1.21x
+  MODERATE (10-100)               27    10     5    12     0    37%    1.48x
+  MINOR/ACCURATE (<10)             6     1     3     2     0    17%    1.76x
+
+  Direction: OVER_EST             60    12    23    25     0    20%    1.33x
+  Direction: UNDER_EST            14     5     3     6     0    36%    1.66x
+  Direction: ZERO_EST             20     4     5    11     0    20%    1.21x
+
+  Locus: JOIN                     14     6     3     5     0    43%    1.50x
+  Locus: AGGREGATE                 6     1     5     0     0    17%    1.35x
+  Locus: CTE                       4     2     0     2     0    50%    1.50x
+  Locus: FILTER                   19     4     6     9     0    21%    1.33x
+  Locus: SCAN                     20     3     4    13     0    15%    1.21x
+  Locus: PROJECTION               35     6    14    15     0    17%    1.45x
+
+==========================================================================================
+§6  INTEGRATION WITH THE ANALYST REASONING CHAIN
+==========================================================================================
+
+  Current chain (from duckdb.md EXPLAIN ANALYSIS PROCEDURE):
+    Step 1: IDENTIFY COST SPINE
+    Step 2: CLASSIFY EACH SPINE NODE
+    Step 3: TRACE DATA FLOW (row counts should decrease)
+    Step 4: CHECK SYMPTOM ROUTING TABLE
+    Step 5: FORM BOTTLENECK HYPOTHESIS
+
+  Enhanced chain with Q-Error:
+    Step 1: IDENTIFY COST SPINE                               ← same
+    Step 2: CLASSIFY EACH SPINE NODE                          ← same
+    Step 2b: FLAG ESTIMATION ANOMALIES [NEW — EXPLAIN-only]
+             • Est=0 on any spine node → BLIND_ESTIMATION
+             • Est=1 on join/aggregate → SENTINEL_GUESS
+             • DELIM_SCAN on spine → DECORRELATION_NEEDED
+             • Same table appears 2+ times → REPEATED_SCAN
+    Step 3: TRACE DATA FLOW                                   ← same
+    Step 3b: COMPUTE Q-ERROR [NEW — needs EXPLAIN ANALYZE]
+             If available: compute max(est/act, act/est) per spine node
+             Classify: direction (OVER/UNDER/ZERO), locus, magnitude
+    Step 4: CHECK SYMPTOM ROUTING TABLE                       ← enhanced
+             Add Q-Error columns to routing table:
+             | Symptom | + Q-Error Locus | + Direction | → Pathology |
+    Step 5: FORM BOTTLENECK HYPOTHESIS                        ← enhanced
+             Include Q-Error evidence: "The optimizer estimates X rows
+             but actually processes Y rows (Q-Error = Z), suggesting
+             [pathology] because [reasoning]."
+
+  KEY: Step 2b is FREE (EXPLAIN-only). It narrows the pathology search
+  from 10 candidates to 2-3 before the analyst even looks at Q-Error.
+  Step 3b requires EXPLAIN ANALYZE but provides the quantitative signal
+  that determines WHICH transform within that pathology to apply.
+
+==========================================================================================
+§7  ENHANCED SYMPTOM ROUTING TABLE
+==========================================================================================
+
+  | EXPLAIN Symptom               | Q-Error Locus | Direction  | Pathology | Action                        |
+  |-------------------------------|---------------|------------|-----------|-------------------------------|
+  | Row counts flat thru CTEs     | any           | any        | P0        | Push most selective predicate |
+  | Same table scanned N times    | SCAN          | OVER_EST   | P1        | Single-pass CASE WHEN         |
+  | Nested loop + inner aggregate | CTE/JOIN      | UNDER_EST  | P2        | Decorrelate to CTE+JOIN       |
+  | Aggregate input >> output     | AGGREGATE     | OVER_EST   | P3        | Push GROUP BY below join      |
+  | OR across DIFFERENT columns   | SCAN          | OVER_EST   | P4        | Split to UNION ALL (max 3)    |
+  | LEFT JOIN + WHERE on right    | JOIN          | UNDER_EST  | P5        | Convert to INNER JOIN         |
+  | INTERSECT, large inputs       | PROJECTION    | UNDER_EST  | P6        | Replace with EXISTS           |
+  | CTE self-join, discriminators | CTE           | ZERO_EST   | P7        | Split per-partition CTEs      |
+  | Window in CTE before join     | PROJECTION    | OVER_EST   | P8        | Defer window past join        |
+  | Identical subtrees            | any           | OVER_EST   | P9        | Extract shared CTE            |
+  |                               |               |            |           |                               |
+  | Est=0 on CTE node             | CTE           | ZERO_EST   | P0/P7     | Planner blind to CTE stats    |
+  | Est=1 on JOIN node            | JOIN          | UNDER_EST  | P2/P0     | Planner has no join estimate  |
+  | DELIM_SCAN present            | CTE           | ZERO_EST   | P2        | Decorrelation needed          |
+  | Est >> Act on GROUP BY        | AGGREGATE     | OVER_EST   | P3        | Agg below join opportunity    |
+
+==========================================================================================
+§8  VALIDATION: ROUTING ACCURACY (Feb 13, 2026)
+==========================================================================================
+
+  Retrospective validation on 41 DuckDB TPC-DS queries with known winning
+  transforms (WIN + IMPROVED with labeled transforms):
+
+  QUESTION: Does Q-Error Locus+Direction correctly predict WHERE the
+            winning transform operates?
+
+  METHODOLOGY:
+  - For each query with a winning transform, compare:
+    (a) Q-Error locus (the operator type with worst mismatch)
+    (b) The area the winning transform targets (JOIN, FILTER, CTE, etc.)
+  - "Direct hit" = locus exactly matches transform target
+  - "Routing hit" = locus→routing expansion (P0-P9) includes the correct area
+
+  RESULTS:
+    Direct locus hit:   3/41 ( 7%)  ← worst mismatch node ≠ fix location
+    Routing hit:       32/41 (78%)  ← routing table reaches correct area
+    Combined:          35/41 (85%)  ← Q-Error routing is 85% accurate
+    Miss:               6/41 (14%)  ← mostly unlabeled transforms
+
+  KEY INSIGHT: The raw locus (worst Q-Error node) is only 7% predictive.
+  The ROUTING TABLE expansion (locus+direction → pathology candidates →
+  transform areas) reaches 85%. The routing is the signal, not the locus alone.
+
+  MISSES: 6 queries — 3 had unlabeled transforms (semantic_rewrite, reorder_join),
+  2 had CTE isolation fixes downstream of the scan/aggregate mismatch,
+  1 had a novel transform not in the routing table.
+
+==========================================================================================
+§9  VALIDATION: MAGNITUDE IS NOT PREDICTIVE (Feb 13, 2026)
+==========================================================================================
+
+  QUESTION: Does Q-Error magnitude/severity predict optimization opportunity?
+
+  RESULTS (DuckDB TPC-DS, 101 queries):
+
+    Magnitude       Q-Error Range    Queries    Wins    Win%   Avg Speedup (wins)
+    EXTREME         >1000               44       12      27%        1.71x
+    3_ORDER         100-1000            23        8      34%        1.80x
+    2_ORDER         10-100              27        7      25%        2.06x
+    1_ORDER         2-10                 2        2     100%        1.27x
+    MINOR           <2                   1        1     100%        4.47x
+
+  CONCLUSION: Win rate is FLAT across all magnitudes (25-34%).
+  The biggest win (Q9, 4.47x) had MINOR Q-Error. The highest Q-Error
+  queries (Q31: 1.8×10¹⁹) only achieved IMPROVED (1.04x).
+
+  Magnitude tells you the planner is wrong, but not whether a rewrite can
+  exploit that wrongness. A 10x mismatch on a decorrelatable subquery is
+  more valuable than a 10⁶x mismatch on a projection node.
+
+  IMPLICATION: Do NOT prioritize queries by Q-Error magnitude.
+  Do NOT use severity as a confidence signal.
+  Use ONLY locus+direction→routing for pathology selection.
+
+==========================================================================================
+§10  POSTGRESQL SUPPORT (Feb 13, 2026)
+==========================================================================================
+
+  Q-Error analysis extended to PostgreSQL EXPLAIN (ANALYZE, FORMAT JSON).
+
+  PG plan format differences:
+    - "Plan Rows" (estimated) vs DuckDB "Estimated Cardinality"
+    - "Actual Rows" (actual per loop) vs DuckDB "operator_cardinality"
+    - "Plans" (children) vs DuckDB "children"
+    - "Node Type" (string) vs DuckDB "operator_name"
+    - "Parent Relationship" = "SubPlan" → correlated subquery (PG equiv of DELIM_SCAN)
+
+  PG DSB-76 coverage: 67/76 queries have Q-Error signals (9 empty plan_json).
+
+  Spot checks on known PG winners:
+    Q001 (27.80x early_filter_decorrelate): CTE/UNDER_EST → P2 ← HIT
+    Q069 (17.48x set_operation_materialization): JOIN/UNDER_EST → P2,P6 ← HIT
+
+  Same routing table used for both engines. PG-specific structural flag:
+  CORRELATED_SUBPLAN (SubPlan parent relationship) = PG equivalent of DuckDB DELIM_SCAN.
+
+==========================================================================================
+§11  VERDICT (UPDATED Feb 13, 2026)
+==========================================================================================
+
+  Q-Error is a ROUTING signal, not a severity indicator:
+
+  1. USEFUL: Locus + Direction → Pathology routing (85% accuracy, validated
+     on 41 DuckDB wins). This is the primary signal fed to the analyst.
+
+  2. USEFUL: Structural flags (DELIM_SCAN, EST_ZERO, CORRELATED_SUBPLAN,
+     REPEATED_TABLE, LEFT_JOIN, INTERSECT_EXCEPT) — free EXPLAIN-only
+     signals that directly trigger specific transforms.
+
+  3. NOT USEFUL: Magnitude/severity — win rate is flat across all levels.
+     Excluded from analyst prompt to avoid false confidence signals.
+
+  4. IMPLEMENTATION: Locus+Direction routing and structural flags are
+     rendered in §2b-i of the analyst briefing. Severity/magnitude are
+     computed but NOT shown in the prompt (only used for analytics).
+
+  5. COVERAGE: DuckDB 96/101 queries, PostgreSQL 67/76 queries.
+     Same routing table, same pathology candidates for both engines.
+

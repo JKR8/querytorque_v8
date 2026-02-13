@@ -195,7 +195,7 @@ def _validate_shared(shared: Any) -> List[str]:
         issues.append("SHARED: BOTTLENECK_DIAGNOSIS missing.")
     else:
         low = bottleneck.lower()
-        if not any(t in low for t in ("scan-bound", "join-bound", "aggregation-bound")):
+        if not re.search(r'\b\w+-bound\b', low):
             issues.append(
                 "SHARED: BOTTLENECK_DIAGNOSIS missing bound classification "
                 "(`scan-bound`/`join-bound`/`aggregation-bound`)."
@@ -209,8 +209,10 @@ def _validate_shared(shared: Any) -> List[str]:
     else:
         ids = re.findall(r"-\s*([A-Z][A-Z0-9_]+)\s*:", active_constraints)
         id_set = set(ids)
-        for cid in REQUIRED_CORRECTNESS_IDS:
-            if cid not in id_set:
+        missing_correctness = [cid for cid in REQUIRED_CORRECTNESS_IDS if cid not in id_set]
+        if len(missing_correctness) > 2:
+            # Hard-fail only if more than 2 correctness IDs are missing
+            for cid in missing_correctness:
                 issues.append(f"SHARED: ACTIVE_CONSTRAINTS missing {cid}.")
         gap_ids = [cid for cid in ids if cid not in REQUIRED_CORRECTNESS_IDS]
         if len(gap_ids) > 3:

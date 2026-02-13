@@ -4,11 +4,19 @@
  */
 
 import PlanViewer from './PlanViewer'
-import type { PlanTreeNode, ExecutionPlanComparison } from '@/api/client'
+import type { PlanTreeNode } from '@/api/client'
 import './PlanComparison.css'
 
 interface PlanComparisonProps {
-  comparison: ExecutionPlanComparison
+  originalPlanTree?: PlanTreeNode[]
+  optimizedPlanTree?: PlanTreeNode[]
+  originalTimeMs?: number
+  optimizedTimeMs?: number
+  originalCost?: number
+  optimizedCost?: number
+  originalWarnings?: string[]
+  optimizedWarnings?: string[]
+  speedup?: number
 }
 
 function formatImprovement(pct: number | undefined): string {
@@ -24,64 +32,75 @@ function formatTime(ms: number | undefined): string {
   return ms.toFixed(2) + 'ms'
 }
 
-export default function PlanComparison({ comparison }: PlanComparisonProps) {
-  const {
-    original_execution_time_ms,
-    optimized_execution_time_ms,
-    time_improvement_pct,
-    cost_improvement_pct,
-    original_bottleneck,
-    optimized_bottleneck,
-    original_plan_summary,
-    optimized_plan_summary,
-    original_total_cost,
-    optimized_total_cost,
-  } = comparison
+export default function PlanComparison({
+  originalPlanTree,
+  optimizedPlanTree,
+  originalTimeMs,
+  optimizedTimeMs,
+  originalCost,
+  optimizedCost,
+  originalWarnings,
+  optimizedWarnings,
+  speedup,
+}: PlanComparisonProps) {
+  const timeImprovementPct = (originalTimeMs && optimizedTimeMs)
+    ? ((originalTimeMs - optimizedTimeMs) / originalTimeMs) * 100
+    : undefined
 
-  const originalPlanTree = (original_plan_summary?.plan_tree || []) as PlanTreeNode[]
-  const optimizedPlanTree = (optimized_plan_summary?.plan_tree || []) as PlanTreeNode[]
-  const originalWarnings = original_plan_summary?.warnings as string[] | undefined
-  const optimizedWarnings = optimized_plan_summary?.warnings as string[] | undefined
+  const costImprovementPct = (originalCost && optimizedCost)
+    ? ((originalCost - optimizedCost) / originalCost) * 100
+    : undefined
 
-  const hasImprovement = (time_improvement_pct ?? 0) > 0 || (cost_improvement_pct ?? 0) > 0
+  const hasImprovement = (timeImprovementPct ?? 0) > 0 || (costImprovementPct ?? 0) > 0
 
   return (
     <div className="pc-container">
       {/* Summary Metrics */}
       <div className="pc-metrics">
         <div className="pc-metric-group">
-          <div className="pc-metric">
-            <span className="pc-metric-label">Execution Time</span>
-            <div className="pc-metric-comparison">
-              <span className="pc-metric-before">{formatTime(original_execution_time_ms)}</span>
-              <span className="pc-metric-arrow">→</span>
-              <span className={`pc-metric-after ${(time_improvement_pct ?? 0) > 0 ? 'improved' : ''}`}>
-                {formatTime(optimized_execution_time_ms)}
-              </span>
+          {(originalTimeMs != null || optimizedTimeMs != null) && (
+            <div className="pc-metric">
+              <span className="pc-metric-label">Execution Time</span>
+              <div className="pc-metric-comparison">
+                <span className="pc-metric-before">{formatTime(originalTimeMs)}</span>
+                <span className="pc-metric-arrow">&rarr;</span>
+                <span className={`pc-metric-after ${(timeImprovementPct ?? 0) > 0 ? 'improved' : ''}`}>
+                  {formatTime(optimizedTimeMs)}
+                </span>
+              </div>
+              {timeImprovementPct != null && (
+                <span className={`pc-metric-change ${timeImprovementPct > 0 ? 'improved' : 'regressed'}`}>
+                  {formatImprovement(timeImprovementPct)}
+                </span>
+              )}
             </div>
-            {time_improvement_pct != null && (
-              <span className={`pc-metric-change ${time_improvement_pct > 0 ? 'improved' : 'regressed'}`}>
-                {formatImprovement(time_improvement_pct)}
-              </span>
-            )}
-          </div>
+          )}
 
-          <div className="pc-metric">
-            <span className="pc-metric-label">Query Cost</span>
-            <div className="pc-metric-comparison">
-              <span className="pc-metric-before">{original_total_cost?.toFixed(0) ?? '--'}</span>
-              <span className="pc-metric-arrow">→</span>
-              <span className={`pc-metric-after ${(cost_improvement_pct ?? 0) > 0 ? 'improved' : ''}`}>
-                {optimized_total_cost?.toFixed(0) ?? '--'}
-              </span>
+          {(originalCost != null || optimizedCost != null) && (
+            <div className="pc-metric">
+              <span className="pc-metric-label">Query Cost</span>
+              <div className="pc-metric-comparison">
+                <span className="pc-metric-before">{originalCost?.toFixed(0) ?? '--'}</span>
+                <span className="pc-metric-arrow">&rarr;</span>
+                <span className={`pc-metric-after ${(costImprovementPct ?? 0) > 0 ? 'improved' : ''}`}>
+                  {optimizedCost?.toFixed(0) ?? '--'}
+                </span>
+              </div>
+              {costImprovementPct != null && (
+                <span className={`pc-metric-change ${costImprovementPct > 0 ? 'improved' : 'regressed'}`}>
+                  {formatImprovement(costImprovementPct)}
+                </span>
+              )}
             </div>
-            {cost_improvement_pct != null && (
-              <span className={`pc-metric-change ${cost_improvement_pct > 0 ? 'improved' : 'regressed'}`}>
-                {formatImprovement(cost_improvement_pct)}
-              </span>
-            )}
-          </div>
+          )}
         </div>
+
+        {/* Speedup display */}
+        {speedup != null && speedup > 0 && (
+          <div className={`pc-speedup ${speedup >= 1.05 ? 'improved' : speedup < 0.95 ? 'regressed' : ''}`}>
+            <span className="pc-speedup-number">{speedup.toFixed(1)}x</span>
+          </div>
+        )}
 
         {hasImprovement && (
           <div className="pc-verdict improved">
@@ -93,27 +112,13 @@ export default function PlanComparison({ comparison }: PlanComparisonProps) {
         )}
       </div>
 
-      {/* Bottleneck Changes */}
-      {(original_bottleneck || optimized_bottleneck) && (
-        <div className="pc-bottleneck-summary">
-          <div className="pc-bottleneck-item">
-            <span className="pc-bottleneck-label">Original Bottleneck:</span>
-            <span className="pc-bottleneck-value">{original_bottleneck || 'None'}</span>
-          </div>
-          <div className="pc-bottleneck-item">
-            <span className="pc-bottleneck-label">Optimized Bottleneck:</span>
-            <span className="pc-bottleneck-value">{optimized_bottleneck || 'None'}</span>
-          </div>
-        </div>
-      )}
-
       {/* Side-by-side Plans */}
       <div className="pc-plans">
         <div className="pc-plan-column">
           <PlanViewer
-            planTree={originalPlanTree}
-            totalCost={original_total_cost}
-            executionTimeMs={original_execution_time_ms}
+            planTree={originalPlanTree || []}
+            totalCost={originalCost}
+            executionTimeMs={originalTimeMs}
             warnings={originalWarnings}
             title="Original Plan"
           />
@@ -121,9 +126,9 @@ export default function PlanComparison({ comparison }: PlanComparisonProps) {
 
         <div className="pc-plan-column">
           <PlanViewer
-            planTree={optimizedPlanTree}
-            totalCost={optimized_total_cost}
-            executionTimeMs={optimized_execution_time_ms}
+            planTree={optimizedPlanTree || []}
+            totalCost={optimizedCost}
+            executionTimeMs={optimizedTimeMs}
             warnings={optimizedWarnings}
             title="Optimized Plan"
           />

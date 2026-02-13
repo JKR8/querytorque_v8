@@ -10,8 +10,9 @@ import type { BatchFile } from '@/hooks/useBatchProcessor'
  * Generate HTML summary report for batch results
  */
 function generateBatchSummary(files: BatchFile[]): string {
-  const fixed = files.filter(f => f.status === 'fixed')
-  const skipped = files.filter(f => f.status === 'skipped')
+  const optimized = files.filter(f => f.status === 'optimized')
+  const neutral = files.filter(f => f.status === 'neutral')
+  const regression = files.filter(f => f.status === 'regression')
   const failed = files.filter(f => f.status === 'failed')
 
   const timestamp = new Date().toISOString()
@@ -30,6 +31,8 @@ function generateBatchSummary(files: BatchFile[]): string {
       --fg-muted: #71717a;
       --border: #27272a;
       --low: #22c55e;
+      --medium: #eab308;
+      --high: #f97316;
       --critical: #ef4444;
       --info: #3b82f6;
     }
@@ -52,7 +55,7 @@ function generateBatchSummary(files: BatchFile[]): string {
     .header .brand { color: var(--info); }
     .summary {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(5, 1fr);
       gap: 1rem;
       margin-bottom: 2rem;
     }
@@ -71,7 +74,9 @@ function generateBatchSummary(files: BatchFile[]): string {
       font-size: 0.875rem;
       color: var(--fg-muted);
     }
-    .summary-card.fixed .value { color: var(--low); }
+    .summary-card.optimized .value { color: var(--low); }
+    .summary-card.neutral .value { color: var(--medium); }
+    .summary-card.regression .value { color: var(--high); }
     .summary-card.failed .value { color: var(--critical); }
     .section {
       background: var(--bg-card);
@@ -96,7 +101,7 @@ function generateBatchSummary(files: BatchFile[]): string {
     }
     .file-item:hover { background: rgba(255,255,255,0.02); }
     .file-name { flex: 1; font-family: monospace; }
-    .file-score { color: var(--fg-muted); }
+    .file-speedup { color: var(--fg-muted); font-family: monospace; }
     .badge {
       padding: 0.125rem 0.5rem;
       border-radius: 4px;
@@ -104,8 +109,9 @@ function generateBatchSummary(files: BatchFile[]): string {
       font-weight: 500;
       text-transform: uppercase;
     }
-    .badge.fixed { background: rgba(34,197,94,0.1); color: var(--low); }
-    .badge.skipped { background: rgba(113,113,122,0.1); color: var(--fg-muted); }
+    .badge.optimized { background: rgba(34,197,94,0.1); color: var(--low); }
+    .badge.neutral { background: rgba(234,179,8,0.1); color: var(--medium); }
+    .badge.regression { background: rgba(249,115,22,0.1); color: var(--high); }
     .badge.failed { background: rgba(239,68,68,0.1); color: var(--critical); }
     .footer {
       text-align: center;
@@ -127,13 +133,17 @@ function generateBatchSummary(files: BatchFile[]): string {
         <div class="value">${files.length}</div>
         <div class="label">Total Files</div>
       </div>
-      <div class="summary-card fixed">
-        <div class="value">${fixed.length}</div>
+      <div class="summary-card optimized">
+        <div class="value">${optimized.length}</div>
         <div class="label">Optimized</div>
       </div>
-      <div class="summary-card">
-        <div class="value">${skipped.length}</div>
-        <div class="label">Skipped</div>
+      <div class="summary-card neutral">
+        <div class="value">${neutral.length}</div>
+        <div class="label">Neutral</div>
+      </div>
+      <div class="summary-card regression">
+        <div class="value">${regression.length}</div>
+        <div class="label">Regression</div>
       </div>
       <div class="summary-card failed">
         <div class="value">${failed.length}</div>
@@ -141,30 +151,45 @@ function generateBatchSummary(files: BatchFile[]): string {
       </div>
     </div>
 
-    ${fixed.length > 0 ? `
+    ${optimized.length > 0 ? `
     <div class="section">
-      <div class="section-header">Optimized Files (${fixed.length})</div>
+      <div class="section-header">Optimized Files (${optimized.length})</div>
       <div class="file-list">
-        ${fixed.map(f => `
+        ${optimized.map(f => `
         <div class="file-item">
           <span class="file-name">${f.name}</span>
-          <span class="file-score">Score: ${f.score || '--'}</span>
-          <span class="badge fixed">fixed</span>
+          <span class="file-speedup">${f.speedup != null ? f.speedup.toFixed(2) + 'x' : '--'}</span>
+          <span class="badge optimized">optimized</span>
         </div>
         `).join('')}
       </div>
     </div>
     ` : ''}
 
-    ${skipped.length > 0 ? `
+    ${neutral.length > 0 ? `
     <div class="section">
-      <div class="section-header">Skipped Files (${skipped.length})</div>
+      <div class="section-header">Neutral Files (${neutral.length})</div>
       <div class="file-list">
-        ${skipped.map(f => `
+        ${neutral.map(f => `
         <div class="file-item">
           <span class="file-name">${f.name}</span>
-          <span class="file-score">Score: ${f.score || '--'}</span>
-          <span class="badge skipped">skipped</span>
+          <span class="file-speedup">${f.speedup != null ? f.speedup.toFixed(2) + 'x' : '--'}</span>
+          <span class="badge neutral">neutral</span>
+        </div>
+        `).join('')}
+      </div>
+    </div>
+    ` : ''}
+
+    ${regression.length > 0 ? `
+    <div class="section">
+      <div class="section-header">Regression Files (${regression.length})</div>
+      <div class="file-list">
+        ${regression.map(f => `
+        <div class="file-item">
+          <span class="file-name">${f.name}</span>
+          <span class="file-speedup">${f.speedup != null ? f.speedup.toFixed(2) + 'x' : '--'}</span>
+          <span class="badge regression">regression</span>
         </div>
         `).join('')}
       </div>
@@ -178,7 +203,7 @@ function generateBatchSummary(files: BatchFile[]): string {
         ${failed.map(f => `
         <div class="file-item">
           <span class="file-name">${f.name}</span>
-          <span class="file-score">${f.error || 'Unknown error'}</span>
+          <span class="file-speedup">${f.error || 'Unknown error'}</span>
           <span class="badge failed">failed</span>
         </div>
         `).join('')}
@@ -198,7 +223,7 @@ function generateBatchSummary(files: BatchFile[]): string {
  * Export batch results as ZIP file
  *
  * Structure:
- * - /optimized/   - Fixed queries with optimized SQL
+ * - /optimized/   - Optimized queries with rewritten SQL
  * - /original/    - Original queries
  * - /reports/batch_summary.html - Summary report
  */
@@ -220,9 +245,8 @@ export async function exportBatchResults(files: BatchFile[]): Promise<void> {
     originalFolder.file(file.name, file.content)
 
     // Add optimized version if available
-    if (file.status === 'fixed' && file.optimizedContent) {
-      // Add marker comment
-      const markedContent = `-- qt:optimized\n-- Original file: ${file.name}\n-- Score: ${file.score || 'N/A'}\n\n${file.optimizedContent}`
+    if (file.status === 'optimized' && file.optimizedContent) {
+      const markedContent = `-- qt:optimized\n-- Original file: ${file.name}\n-- Speedup: ${file.speedup != null ? file.speedup.toFixed(2) + 'x' : 'N/A'}\n\n${file.optimizedContent}`
       optimizedFolder.file(file.name, markedContent)
     }
   }

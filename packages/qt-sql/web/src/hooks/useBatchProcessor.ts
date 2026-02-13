@@ -1,16 +1,16 @@
 /**
- * Batch processor hook - manages batch SQL optimization
+ * Batch processor hook — manages batch SQL optimization via real pipeline API
  */
 
 import { useReducer, useCallback, useRef } from 'react'
-import { analyzeSql, startOptimization, AnalysisResult, OptimizationSession } from '@/api/client'
+import { optimizeQuery, OptimizeResponse } from '@/api/client'
 
 export type BatchFileStatus =
   | 'pending'
-  | 'analyzing'
-  | 'optimizing'
-  | 'fixed'
-  | 'skipped'
+  | 'running'
+  | 'optimized'
+  | 'neutral'
+  | 'regression'
   | 'failed'
 
 export interface BatchFile {
@@ -18,18 +18,19 @@ export interface BatchFile {
   name: string
   content: string
   status: BatchFileStatus
-  score?: number
-  analysis?: AnalysisResult
-  optimization?: OptimizationSession
+  speedup?: number
+  transforms?: string[]
   optimizedContent?: string
+  optimizeResult?: OptimizeResponse
   error?: string
   retryCount: number
 }
 
 export interface BatchSettings {
-  autoFixThreshold: number // Score below this will be optimized (0-100)
   maxRetries: number
-  mode: 'auto' | 'manual'
+  dsn: string
+  mode: 'swarm' | 'expert' | 'oneshot'
+  sessionId?: string
 }
 
 interface BatchState {
@@ -51,9 +52,9 @@ type BatchAction =
   | { type: 'REMOVE_FILE'; id: string }
 
 const DEFAULT_SETTINGS: BatchSettings = {
-  autoFixThreshold: 80, // Optimize if score < 80
-  maxRetries: 3,
-  mode: 'auto',
+  maxRetries: 2,
+  dsn: '',
+  mode: 'swarm',
 }
 
 function generateId(): string {
@@ -102,7 +103,7 @@ function batchReducer(state: BatchState, action: BatchAction): BatchState {
         files: [],
         isProcessing: false,
         currentIndex: 0,
-        settings: DEFAULT_SETTINGS,
+        settings: state.settings, // preserve DSN
         aborted: false,
       }
 
@@ -125,8 +126,9 @@ export interface UseBatchProcessorReturn {
   progress: {
     total: number
     completed: number
-    fixed: number
-    skipped: number
+    optimized: number
+    neutral: number
+    regression: number
     failed: number
     percent: number
   }
@@ -150,19 +152,19 @@ export function useBatchProcessor(): UseBatchProcessorReturn {
 
   const abortRef = useRef(false)
 
-  // Calculate progress
   const progress = {
     total: state.files.length,
     completed: state.files.filter(f =>
-      ['fixed', 'skipped', 'failed'].includes(f.status)
+      ['optimized', 'neutral', 'regression', 'failed'].includes(f.status)
     ).length,
-    fixed: state.files.filter(f => f.status === 'fixed').length,
-    skipped: state.files.filter(f => f.status === 'skipped').length,
+    optimized: state.files.filter(f => f.status === 'optimized').length,
+    neutral: state.files.filter(f => f.status === 'neutral').length,
+    regression: state.files.filter(f => f.status === 'regression').length,
     failed: state.files.filter(f => f.status === 'failed').length,
     percent: state.files.length > 0
       ? Math.round(
           (state.files.filter(f =>
-            ['fixed', 'skipped', 'failed'].includes(f.status)
+            ['optimized', 'neutral', 'regression', 'failed'].includes(f.status)
           ).length /
             state.files.length) *
             100
@@ -170,7 +172,6 @@ export function useBatchProcessor(): UseBatchProcessorReturn {
       : 0,
   }
 
-  // Add files from file input
   const addFiles = useCallback(async (files: File[]) => {
     const fileData = await Promise.all(
       files.map(async file => ({
@@ -181,71 +182,53 @@ export function useBatchProcessor(): UseBatchProcessorReturn {
     dispatch({ type: 'ADD_FILES', files: fileData })
   }, [])
 
-  // Remove a file
   const removeFile = useCallback((id: string) => {
     dispatch({ type: 'REMOVE_FILE', id })
   }, [])
 
-  // Process a single file
   const processFile = useCallback(
     async (file: BatchFile): Promise<Partial<BatchFile>> => {
-      // Step 1: Analyze
-      dispatch({ type: 'UPDATE_FILE', id: file.id, updates: { status: 'analyzing' } })
+      if (!state.settings.dsn) {
+        return { status: 'failed', error: 'No database DSN configured' }
+      }
+
+      dispatch({ type: 'UPDATE_FILE', id: file.id, updates: { status: 'running' } })
 
       try {
-        const analysis = await analyzeSql(file.content, file.name)
+        const result = await optimizeQuery({
+          sql: file.content,
+          dsn: state.settings.dsn,
+          mode: state.settings.mode,
+          query_id: file.name.replace('.sql', ''),
+          session_id: state.settings.sessionId,
+        })
 
-        // Check if optimization needed
-        if (analysis.score >= state.settings.autoFixThreshold) {
-          return {
-            status: 'skipped',
-            score: analysis.score,
-            analysis,
-          }
+        const statusMap: Record<string, BatchFileStatus> = {
+          'WIN': 'optimized',
+          'IMPROVED': 'optimized',
+          'NEUTRAL': 'neutral',
+          'REGRESSION': 'regression',
+          'ERROR': 'failed',
         }
 
-        // Step 2: Optimize (if in auto mode)
-        if (state.settings.mode === 'manual') {
-          return {
-            status: 'skipped',
-            score: analysis.score,
-            analysis,
-            error: 'Manual mode - optimization skipped',
-          }
-        }
-
-        dispatch({ type: 'UPDATE_FILE', id: file.id, updates: { status: 'optimizing' } })
-
-        const session = await startOptimization(file.content, 'auto', file.name)
-
-        if (session.optimized_code) {
-          return {
-            status: 'fixed',
-            score: analysis.score,
-            analysis,
-            optimization: session,
-            optimizedContent: session.optimized_code,
-          }
-        } else {
-          return {
-            status: 'failed',
-            score: analysis.score,
-            analysis,
-            optimization: session,
-            error: session.errors?.[0] || 'Optimization returned no result',
-          }
+        return {
+          status: statusMap[result.status] || 'failed',
+          speedup: result.speedup,
+          transforms: result.transforms,
+          optimizedContent: result.optimized_sql || undefined,
+          optimizeResult: result,
+          error: result.error || undefined,
         }
       } catch (err) {
         return {
           status: 'failed',
-          error: err instanceof Error ? err.message : 'Processing failed',
+          error: err instanceof Error ? err.message : 'Optimization failed',
         }
       }
     },
     [state.settings]
   )
 
-  // Start batch processing
   const start = useCallback(async () => {
     dispatch({ type: 'SET_PROCESSING', isProcessing: true })
     abortRef.current = false
@@ -265,24 +248,20 @@ export function useBatchProcessor(): UseBatchProcessorReturn {
     dispatch({ type: 'SET_PROCESSING', isProcessing: false })
   }, [state.files, processFile])
 
-  // Abort processing
   const abort = useCallback(() => {
     abortRef.current = true
     dispatch({ type: 'ABORT' })
   }, [])
 
-  // Reset everything
   const reset = useCallback(() => {
     abortRef.current = false
     dispatch({ type: 'RESET' })
   }, [])
 
-  // Update settings
   const updateSettings = useCallback((settings: Partial<BatchSettings>) => {
     dispatch({ type: 'SET_SETTINGS', settings })
   }, [])
 
-  // Retry a failed file
   const retryFile = useCallback(
     async (id: string) => {
       const file = state.files.find(f => f.id === id)

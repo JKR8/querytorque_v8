@@ -1,0 +1,79 @@
+## Modified Logic Tree
+
+```
+[+] sd_stores: Prefilter stores to SD state
+[~] customer_total_return: Join with sd_stores to filter store_returns early
+[+] store_avg: Precomputed store averages with 1.2 multiplier
+[~] main_query: Replace correlated subquery with store_avg CTE
+```
+
+## Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "snowflake",
+  "rewrite_rules": [
+    {"id": "R1", "type": "early_filter_pushdown", "description": "Push store state filter into customer_total_return CTE via precomputed SD store keys", "applied_to": ["sd_stores", "customer_total_return"]},
+    {"id": "R2", "type": "decorrelate_aggregate", "description": "Replace correlated subquery with precomputed store average CTE", "applied_to": ["store_avg", "main_query"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "sd_stores": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT s_store_sk FROM store WHERE s_state = 'SD'",
+        "interfaces": {
+          "outputs": ["s_store_sk"],
+          "consumes": []
+        }
+      },
+      "customer_total_return": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns, date_dim, sd_stores WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000 AND sr_store_sk = sd_stores.s_store_sk GROUP BY sr_customer_sk, sr_store_sk",
+        "interfaces": {
+          "outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_total_return"],
+          "consumes": ["sd_stores"]
+        }
+      },
+      "store_avg": {
+        "type": "cte",
+        "change": "added",
+        "sql": "SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_threshold FROM customer_total_return GROUP BY ctr_store_sk",
+        "interfaces": {
+          "outputs": ["ctr_store_sk", "avg_threshold"],
+          "consumes": ["customer_total_return"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id FROM customer_total_return ctr1, customer, store_avg WHERE ctr1.ctr_store_sk = store_avg.ctr_store_sk AND ctr1.ctr_total_return > store_avg.avg_threshold AND ctr1.ctr_customer_sk = c_customer_sk ORDER BY c_customer_id LIMIT 100",
+        "interfaces": {
+          "outputs": ["c_customer_id"],
+          "consumes": ["customer_total_return", "store_avg"]
+        }
+      }
+    },
+    "reconstruction_order": ["sd_stores", "customer_total_return", "store_avg", "main_query"],
+    "assembly_template": "WITH sd_stores AS ({sd_stores}), customer_total_return AS ({customer_total_return}), store_avg AS ({store_avg}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": [
+    {"name": "output_schema", "assertion": "output_columns = ['c_customer_id']"},
+    {"name": "literal_preservation", "assertion": "d_year=2000 AND s_state='SD' AND multiplier=1.2"}
+  ]
+}
+```
+
+Changes: 
+1. Added `sd_stores` CTE to prefilter SD stores
+2. Modified `customer_total_return` to join with `sd_stores` for early filtering
+3. Added `store_avg` CTE to precompute store averages
+4. Replaced correlated subquery with direct join to `store_avg`
+
+Expected speedup: 2.5-3.0x by eliminating correlated subquery rescans and reducing CTE cardinality through early filtering. The rewrite converts O(n²) subquery pattern to O(1) join with precomputed aggregates.

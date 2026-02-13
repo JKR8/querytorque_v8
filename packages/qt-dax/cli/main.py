@@ -9,7 +9,7 @@ Commands:
     qt-dax validate <orig.dax> <opt.dax> Validate equivalence + performance
 """
 
-import asyncio
+import json
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -364,18 +364,12 @@ def audit(
 
 @cli.command()
 @click.argument("file", type=click.Path(exists=True))
-@click.option("--provider", default=None, help="LLM provider (deepseek, openrouter)")
+@click.option("--provider", default=None, help="LLM provider (deepseek, openrouter, anthropic, ...)")
 @click.option("--model", default=None, help="LLM model name")
 @click.option("--output", "-o", type=click.Path(), help="Output file for optimized measures")
-@click.option("--dry-run", is_flag=True, help="Show what would be optimized without calling LLM")
+@click.option("--dry-run", is_flag=True, help="Build prompt only, do not call LLM")
 @click.option("--measure", "-m", multiple=True, help="Specific measure(s) to optimize")
-@click.option("--dspy", is_flag=True, help="Use DSPy optimizer with validation")
-@click.option("--port", "-p", type=int, default=None, help="Power BI Desktop port for validation")
-@click.option("--max-retries", default=2, show_default=True, help="Max DSPy retries on validation failure")
-@click.option("--warmup-runs", default=2, show_default=True, help="Runs per query (min time used)")
-@click.option("--max-rows", default=10000, show_default=True, help="Max rows to compare")
-@click.option("--sample-limit", default=5, show_default=True, help="Max mismatches to show")
-@click.option("--tolerance", default=1e-9, show_default=True, help="Float comparison tolerance")
+@click.option("--attempts", default=3, show_default=True, help="Max LLM attempts (including retries)")
 def optimize(
     file: str,
     provider: Optional[str],
@@ -383,25 +377,24 @@ def optimize(
     output: Optional[str],
     dry_run: bool,
     measure: tuple,
-    dspy: bool,
-    port: Optional[int],
-    max_retries: int,
-    warmup_runs: int,
-    max_rows: int,
-    sample_limit: int,
-    tolerance: float,
+    attempts: int,
 ):
     """Optimize DAX measures using LLM-powered analysis.
 
-    Analyzes the VPAX file and uses an LLM to suggest DAX optimizations
-    based on detected anti-patterns and best practices.
+    Analyzes the model for anti-patterns, builds a structured prompt with
+    dependency closure + playbook intelligence, and calls the LLM to produce
+    an optimised DAX expression.
 
     Examples:
         qt-dax optimize model.vpax
-        qt-dax optimize model.vpax --provider openrouter
-        qt-dax optimize model.vpax -m "Total Sales" -m "Profit %"
-        qt-dax optimize model.vpax --dspy --port 54000
+        qt-dax optimize model.vpax --dry-run -m "Total Sales"
+        qt-dax optimize model.vpax --provider openrouter --attempts 2
     """
+    from qt_dax.analyzers.vpax_analyzer import DAXAnalyzer
+    from qt_dax.analyzers.measure_dependencies import MeasureDependencyAnalyzer
+    from qt_dax.prompts.optimizer import DAXOptimizer
+    from qt_dax.prompts.prompter import PromptInputs
+
     def issue_field(issue, field, default=None):
         if isinstance(issue, dict):
             if field == "name":
@@ -422,278 +415,166 @@ def optimize(
     console.print(f"\n[bold]Analyzing:[/bold] {file}\n")
 
     try:
-        # Run analysis
+        # 1. Run static analysis
         if model_kind == "vpax":
             generator = ReportGenerator(str(model_path))
         else:
             generator = PBIPReportGenerator(str(model_path))
-        result = generator.generate()
+        report = generator.generate()
 
-        display_analysis_result(result, verbose=False)
+        display_analysis_result(report, verbose=False)
 
-        if not result.all_issues:
+        if not report.all_issues:
             console.print("\n[green]No issues found - model already looks optimal.[/green]")
             return
 
-        # Filter measures if specified
+        # 2. Build measure definitions + dependency graph
+        measures_data = report.measures if hasattr(report, "measures") else []
+        measure_list = [
+            {"name": m.get("name", ""), "table": m.get("table", ""), "expression": m.get("expression", "")}
+            for m in measures_data
+        ]
+        measure_defs = {m["name"]: m for m in measure_list}
+
+        dep_analyzer = MeasureDependencyAnalyzer()
+        dep_result = dep_analyzer.analyze(measure_list)
+
+        # 3. Build per-measure DAXAnalyzer
+        dax_analyzer = DAXAnalyzer(dependency_result=dep_result)
+
+        # 4. Gather model schema (tables, columns, relationships)
+        model_schema = None
+        if model_kind == "pbip":
+            try:
+                from qt_dax.parsers.tmdl_parser import TMDLParser
+                parsed = TMDLParser(model_path).parse()
+                model_schema = parsed
+            except Exception:
+                pass  # schema is optional context
+
+        # Filter measures to optimize
         measures_to_optimize = list(measure) if measure else None
 
-        if dry_run:
-            console.print("\n[yellow]Dry run mode - LLM optimization skipped.[/yellow]")
-            console.print("Issues that would be addressed:")
-            for issue in result.all_issues:
-                affected = issue_field(issue, "affected_object")
-                if measures_to_optimize and affected not in measures_to_optimize:
-                    continue
-                name = issue_field(issue, "name", "")
-                suggestion = issue_field(issue, "suggestion")
-                description = issue_field(issue, "description", "")
-                label = affected or name or "<unknown>"
-                if affected and name:
-                    label = f"{affected} ({name})"
-                console.print(f"  - {label}: {suggestion or description}")
-            return
-
-        # Get measures with issues
-        measure_issues = {}
-        for issue in result.all_issues:
+        # Identify measures with DAX anti-pattern issues
+        measure_issues: dict[str, list] = {}
+        for issue in report.all_issues:
             if issue_field(issue, "category") == "dax_anti_pattern":
                 affected = issue_field(issue, "affected_object")
                 if not affected:
                     continue
                 if measures_to_optimize and affected not in measures_to_optimize:
                     continue
-                if affected not in measure_issues:
-                    measure_issues[affected] = []
-                measure_issues[affected].append(issue)
-
-        if dspy:
-            try:
-                import dspy  # noqa: F401
-                from qt_dax.connections import PBIDesktopConnection, find_pbi_instances
-                from qt_dax.validation import DAXEquivalenceValidator
-                from qt_dax.optimization import optimize_measure_with_validation
-            except ImportError as e:
-                console.print(f"[red]DSPy optimization not available: {e}[/red]")
-                console.print("[dim]Install with: pip install dspy-ai[/dim]")
-                sys.exit(1)
-
-            try:
-                instances = find_pbi_instances()
-            except OSError as e:
-                console.print(f"[red]{e}[/red]")
-                sys.exit(1)
-
-            if not instances:
-                console.print("[red]No Power BI Desktop instances found.[/red]")
-                console.print("[dim]Open Power BI Desktop with a model loaded and retry.[/dim]")
-                sys.exit(1)
-
-            target_port = port or instances[0].port
-            console.print(f"[dim]Using Power BI Desktop port: {target_port}[/dim]")
-
-            if not measure_issues:
-                console.print("\n[yellow]No DAX measure issues to optimize.[/yellow]")
-                return
-
-            console.print(f"\n[bold]Optimizing {len(measure_issues)} measure(s) with DSPy...[/bold]")
-
-            measures_data = result.measures if hasattr(result, "measures") else []
-            measure_defs = {m.get("name"): m.get("expression", "") for m in measures_data}
-
-            optimizations = []
-
-            with PBIDesktopConnection(target_port) as conn:
-                validator = DAXEquivalenceValidator(
-                    connection=conn,
-                    tolerance=tolerance,
-                    max_rows_to_compare=max_rows,
-                    sample_mismatch_limit=sample_limit,
-                    warmup_runs=warmup_runs,
-                )
-
-                for measure_name, issues in measure_issues.items():
-                    console.print(f"\n[bold]Optimizing: {measure_name}[/bold]")
-
-                    original_dax = measure_defs.get(measure_name, "")
-                    if not original_dax:
-                        console.print("  [yellow]Could not find definition, skipping.[/yellow]")
-                        continue
-
-                    issues_text = "\n".join(
-                        f"- {issue_field(issue, 'name')} ({issue_field(issue, 'severity')}): "
-                        f"{issue_field(issue, 'description')}"
-                        for issue in issues
-                    )
-
-                    result_opt = optimize_measure_with_validation(
-                        measure_name=measure_name,
-                        original_dax=original_dax,
-                        issues_text=issues_text,
-                        validator=validator,
-                        provider=provider or "deepseek",
-                        model=model,
-                        max_retries=max_retries,
-                    )
-
-                    if result_opt.correct:
-                        console.print(
-                            f"  [green]Validated[/green] "
-                            f"({result_opt.speedup_ratio:.2f}x, attempts={result_opt.attempts})"
-                        )
-                        console.print(Syntax(result_opt.optimized_dax, "sql", theme="monokai"))
-                        optimizations.append({
-                            "measure": measure_name,
-                            "original": original_dax,
-                            "optimized": result_opt.optimized_dax,
-                        })
-                    else:
-                        console.print(
-                            f"  [red]Validation failed[/red] "
-                            f"(attempts={result_opt.attempts})"
-                        )
-                        if result_opt.error:
-                            console.print(f"  [dim]{result_opt.error}[/dim]")
-
-            if output and optimizations:
-                output_path = Path(output)
-                if output_path.suffix == ".json":
-                    import json
-                    output_path.write_text(json.dumps(optimizations, indent=2), encoding="utf-8")
-                else:
-                    content = []
-                    for opt in optimizations:
-                        content.append(f"-- Measure: {opt['measure']}")
-                        content.append("-- Original:")
-                        content.append(f"-- {opt['original'].replace(chr(10), chr(10) + '-- ')}")
-                        content.append("")
-                        content.append(f"{opt['measure']} =")
-                        content.append(opt["optimized"])
-                        content.append("")
-                        content.append("")
-
-                    output_path.write_text("\n".join(content), encoding="utf-8")
-
-                console.print(f"\n[green]Optimizations saved to: {output}[/green]")
-
-            return
-
-        # Create LLM client
-        try:
-            from qt_shared.llm import create_llm_client
-            from qt_shared.config import get_settings
-
-            settings = get_settings()
-            llm_client = create_llm_client(provider=provider, model=model)
-
-            if llm_client is None:
-                console.print(
-                    "[red]No LLM provider configured. "
-                    "Set QT_LLM_PROVIDER and API key environment variables.[/red]"
-                )
-                sys.exit(1)
-
-        except ImportError:
-            console.print("[red]qt_shared package not installed. Cannot use LLM optimization.[/red]")
-            sys.exit(1)
+                measure_issues.setdefault(affected, []).append(issue)
 
         if not measure_issues:
             console.print("\n[yellow]No DAX measure issues to optimize.[/yellow]")
             return
 
-        console.print(f"\n[bold]Optimizing {len(measure_issues)} measure(s)...[/bold]")
+        # 5. Create LLM client (skip for dry-run)
+        llm_client = None
+        if not dry_run:
+            try:
+                from qt_shared.llm import create_llm_client
+                llm_client = create_llm_client(provider=provider, model=model)
+                if llm_client is None:
+                    console.print(
+                        "[red]No LLM provider configured. "
+                        "Set QT_LLM_PROVIDER and API key in .env[/red]"
+                    )
+                    sys.exit(1)
+            except ImportError:
+                console.print("[red]qt_shared package not installed.[/red]")
+                sys.exit(1)
 
-        # Get measure definitions from analysis
-        measures_data = result.measures if hasattr(result, "measures") else []
-        measure_defs = {m.get("name"): m.get("expression", "") for m in measures_data}
+        optimizer = DAXOptimizer(llm_client=llm_client)
+
+        console.print(f"\n[bold]Optimizing {len(measure_issues)} measure(s)...[/bold]")
 
         optimizations = []
 
         for measure_name, issues in measure_issues.items():
-            console.print(f"\n[bold]Optimizing: {measure_name}[/bold]")
+            console.print(f"\n[bold]{'[dry-run] ' if dry_run else ''}Optimizing: {measure_name}[/bold]")
 
-            original_dax = measure_defs.get(measure_name, "")
-            if not original_dax:
-                console.print(f"  [yellow]Could not find definition, skipping.[/yellow]")
+            mdef = measure_defs.get(measure_name)
+            if not mdef or not mdef.get("expression"):
+                console.print("  [yellow]Could not find definition, skipping.[/yellow]")
                 continue
 
-            issues_text = "\n".join(
-                f"- {issue_field(issue, 'name')} ({issue_field(issue, 'severity')}): "
-                f"{issue_field(issue, 'description')}"
-                for issue in issues
+            # Build dependency chain
+            chain = dep_analyzer.get_dependency_chain(dep_result, measure_name)
+            dep_chain = []
+            for dep_name in chain:
+                dep_def = measure_defs.get(dep_name)
+                if dep_def and dep_name != measure_name:
+                    dep_chain.append(dep_def)
+
+            # Run per-measure analysis for detected issues
+            analysis = dax_analyzer.analyze_measure(
+                mdef["name"], mdef["table"], mdef["expression"]
             )
 
-            prompt = f"""You are a DAX optimization expert. Optimize the following DAX measure.
+            inputs = PromptInputs(
+                measure_name=measure_name,
+                measure_table=mdef.get("table", ""),
+                measure_dax=mdef["expression"],
+                dependency_chain=dep_chain,
+                model_schema=model_schema,
+                detected_issues=analysis.issues,
+            )
 
-Measure: {measure_name}
+            result_opt = optimizer.optimize_measure(
+                inputs, max_attempts=attempts, dry_run=dry_run,
+            )
 
-Original DAX:
-```dax
-{original_dax}
-```
+            if dry_run:
+                console.print(f"  [dim]Prompt length: {len(result_opt.prompt):,} chars[/dim]")
+                console.print(Syntax(result_opt.prompt[:3000], "markdown", theme="monokai"))
+                if len(result_opt.prompt) > 3000:
+                    console.print(f"  [dim]... truncated ({len(result_opt.prompt):,} total chars)[/dim]")
+                continue
 
-Detected issues:
-{issues_text}
+            if result_opt.status == "pass":
+                console.print(
+                    f"  [green]Optimized[/green] (attempts={result_opt.attempts})"
+                )
+                if result_opt.transforms_applied:
+                    console.print(f"  [dim]Transforms: {', '.join(result_opt.transforms_applied)}[/dim]")
+                if result_opt.rationale:
+                    console.print(f"  [dim]{result_opt.rationale}[/dim]")
+                console.print(Syntax(result_opt.optimized_dax, "sql", theme="monokai"))
+                optimizations.append({
+                    "measure": measure_name,
+                    "original": mdef["expression"],
+                    "optimized": result_opt.optimized_dax,
+                    "transforms": result_opt.transforms_applied,
+                    "rationale": result_opt.rationale,
+                })
+            elif result_opt.status == "no_improvement":
+                console.print(f"  [yellow]No improvement possible[/yellow]")
+                if result_opt.rationale:
+                    console.print(f"  [dim]{result_opt.rationale}[/dim]")
+            else:
+                console.print(f"  [red]Failed[/red] (attempts={result_opt.attempts})")
+                if result_opt.error:
+                    console.print(f"  [dim]{result_opt.error}[/dim]")
 
-Please provide:
-1. An optimized version of the DAX measure
-2. Brief explanation of changes
-3. Expected performance improvement
-
-Format your response as:
-## Optimized DAX
-```dax
-<optimized measure>
-```
-
-## Changes Made
-<brief list>
-
-## Expected Improvement
-<description>
-"""
-
-            try:
-                response = llm_client.analyze(prompt)
-
-                console.print(Markdown(response))
-
-                # Extract optimized DAX
-                import re
-                dax_match = re.search(r"```dax\s*(.*?)\s*```", response, re.DOTALL)
-                if dax_match:
-                    optimized_dax = dax_match.group(1).strip()
-                    optimizations.append({
-                        "measure": measure_name,
-                        "original": original_dax,
-                        "optimized": optimized_dax,
-                    })
-
-            except Exception as e:
-                console.print(f"  [red]Optimization failed: {e}[/red]")
-
-        # Save optimizations if output specified
+        # Save optimizations
         if output and optimizations:
             output_path = Path(output)
-
             if output_path.suffix == ".json":
-                import json
                 output_path.write_text(json.dumps(optimizations, indent=2), encoding="utf-8")
             else:
-                # Write as DAX text file
                 content = []
                 for opt in optimizations:
                     content.append(f"-- Measure: {opt['measure']}")
-                    content.append(f"-- Original:")
+                    content.append("-- Original:")
                     content.append(f"-- {opt['original'].replace(chr(10), chr(10) + '-- ')}")
-                    content.append(f"")
+                    content.append("")
                     content.append(f"{opt['measure']} =")
-                    content.append(opt['optimized'])
+                    content.append(opt["optimized"])
                     content.append("")
                     content.append("")
-
                 output_path.write_text("\n".join(content), encoding="utf-8")
-
             console.print(f"\n[green]Optimizations saved to: {output}[/green]")
 
     except Exception as e:
@@ -1017,23 +898,22 @@ def menu():
             "[bold]QT DAX Menu[/bold]\n"
             "1) Analyze model (VPAX/PBIP)\n"
             "2) Optimize measures (LLM)\n"
-            "3) Optimize measures (DSPy + validation)\n"
-            "4) Validate optimized DAX\n"
-            "5) List Power BI Desktop instances\n"
-            "6) Exit",
+            "3) Validate optimized DAX\n"
+            "4) List Power BI Desktop instances\n"
+            "5) Exit",
             border_style="blue"
         ))
 
-        choice = IntPrompt.ask("Select", choices=["1", "2", "3", "4", "5", "6"])
+        choice = IntPrompt.ask("Select", choices=["1", "2", "3", "4", "5"])
 
         if choice == 1:
             file_path = _prompt_path("Model path (.vpax/.pbip/.SemanticModel)")
             verbose = Confirm.ask("Show detailed issues?", default=False)
-            _safe_call(audit, file_path, verbose, False, None)
+            _safe_call(audit, file_path, verbose, False, None, False)
         elif choice == 2:
             file_path = _prompt_path("Model path (.vpax/.pbip/.SemanticModel)")
             provider = Prompt.ask("Provider (blank=auto)", default="").strip() or None
-            model = Prompt.ask("Model (blank=default)", default="").strip() or None
+            model_name = Prompt.ask("Model (blank=default)", default="").strip() or None
             output = Prompt.ask("Output file (optional)", default="").strip() or None
             dry_run = Confirm.ask("Dry run only?", default=False)
             measures = _prompt_measures()
@@ -1041,46 +921,13 @@ def menu():
                 optimize,
                 file_path,
                 provider,
-                model,
+                model_name,
                 output,
                 dry_run,
                 measures,
-                False,
-                None,
-                2,
-                2,
-                10000,
-                5,
-                1e-9,
+                3,
             )
         elif choice == 3:
-            file_path = _prompt_path("Model path (.vpax/.pbip/.SemanticModel)")
-            provider = Prompt.ask("Provider", default="deepseek").strip() or "deepseek"
-            model = Prompt.ask("Model (blank=default)", default="").strip() or None
-            port = _prompt_int("Power BI Desktop port (blank=auto)", default=None)
-            output = Prompt.ask("Output file (optional)", default="").strip() or None
-            max_retries = _prompt_int("Max retries", default=2) or 2
-            warmup_runs = _prompt_int("Warmup runs", default=2) or 2
-            max_rows = _prompt_int("Max rows to compare", default=10000) or 10000
-            sample_limit = _prompt_int("Sample mismatch limit", default=5) or 5
-            measures = _prompt_measures()
-            _safe_call(
-                optimize,
-                file_path,
-                provider,
-                model,
-                output,
-                False,
-                measures,
-                True,
-                port,
-                max_retries,
-                warmup_runs,
-                max_rows,
-                sample_limit,
-                1e-9,
-            )
-        elif choice == 4:
             original = _prompt_path("Original DAX file (.dax/.txt)")
             optimized = _prompt_path("Optimized DAX file (.dax/.txt)")
             port = _prompt_int("Power BI Desktop port (blank=auto)", default=None)
@@ -1099,7 +946,7 @@ def menu():
                 False,
                 False,
             )
-        elif choice == 5:
+        elif choice == 4:
             _safe_call(connect, None, True, None, None)
         else:
             return

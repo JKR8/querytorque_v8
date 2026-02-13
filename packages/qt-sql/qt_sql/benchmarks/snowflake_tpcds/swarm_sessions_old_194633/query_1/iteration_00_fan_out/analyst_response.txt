@@ -1,0 +1,188 @@
+### SHARED BRIEFING
+
+SEMANTIC_CONTRACT: Identify customers in South Dakota (SD) stores whose total return fees in 2000 exceeded 120% of their store's average. Output customer IDs ordered by ID. Joins are INNER: all tables must match. Aggregations use SUM and AVG - verify AVG reconstruction from SUM/COUNT if pre-aggregating. The state filter ('SD') depends on store table, not present in initial CTE.
+
+BOTTLENECK_DIAGNOSIS: The query is scan-bound (store_returns + date_dim scan dominates 50% cost) and join-bound (correlated subquery forces repeated CTE scans). Cardinality: store_returns (large) → CTE (~1K rows) → main query filters to SD stores → correlated subquery rescans CTE per store. Optimizer handles column pruning automatically but misses predicate pushdown into multi-ref CTE and decorrelation opportunity.
+
+ACTIVE_CONSTRAINTS:
+- CTE_COLUMN_COMPLETENESS: CTE must output ctr_customer_sk, ctr_store_sk, ctr_total_return
+- LITERAL_PRESERVATION: Preserve 'SD', 2000, 1.2 exactly
+- SEMANTIC_EQUIVALENCE: Maintain identical output rows/order
+- COMPLETE_OUTPUT: Output only c_customer_id ordered ASC
+- H1_CTE_PREDICATE_FENCE: Outer filter s_state='SD' not pushed into CTE
+- H4_AGGREGATE_BELOW_JOIN: Correlated subquery aggregates after join
+
+REGRESSION_WARNINGS:
+1. Window function spill (Q22 regression):
+   CAUSE: Adding window functions to large partitions caused remote spills
+   RULE: For Worker 3, verify store partition size < 1M rows
+2. LEFT→INNER mis-conversion (Q19 regression):
+   CAUSE: Converted LEFT JOIN where right-side NULLs were needed
+   RULE: No LEFT JOINs here - safe to ignore
+3. Correlated subquery decorrelation (Q76 regression):
+   CAUSE: Decorrelated subquery changed NULL handling
+   RULE: Use NOT EXISTS instead of NOT IN if nullable columns
+
+### WORKER 1 BRIEFING (Predicate Pushdown)
+
+STRATEGY: global_predicate_pushdown  
+TARGET_LOGICAL_TREE:  
+```mermaid
+CTE: filtered_store → CTE: customer_total_return → MAIN
+```  
+NODE_CONTRACTS:  
+  filtered_store:  
+    FROM: store  
+    WHERE: s_state = 'SD'  
+    OUTPUT: s_store_sk  
+    EXPECTED_ROWS: ~10 (selective)  
+    CONSUMERS: customer_total_return  
+  customer_total_return:  
+    FROM: store_returns, date_dim, filtered_store  
+    JOIN: sr_store_sk = s_store_sk AND sr_returned_date_sk = d_date_sk  
+    WHERE: d_year = 2000  
+    GROUP BY: sr_customer_sk, sr_store_sk  
+    OUTPUT: ctr_customer_sk, ctr_store_sk, ctr_total_return  
+    EXPECTED_ROWS: ~500 (reduced by store filter)  
+    CONSUMERS: MAIN  
+  MAIN:  
+    FROM: customer_total_return ctr1, customer  
+    JOIN: ctr1.ctr_customer_sk = c_customer_sk  
+    WHERE: ctr_total_return > (SELECT AVG(ctr2.ctr_total_return)*1.2 ...)  
+    ORDER BY: c_customer_id  
+    OUTPUT: c_customer_id  
+    EXPECTED_ROWS: ~100  
+
+EXAMPLES: early_filter, date_cte_isolate  
+EXAMPLE_ADAPTATION: Apply early_filter's predicate pushdown but ignore date isolation. Use date_cte_isolate's CTE structure.  
+HAZARD_FLAGS: Risk of over-filtering if store-returns exist without matching stores  
+CONSTRAINT_OVERRIDE: None  
+OVERRIDE_REASONING: CTE outputs all required columns for consumers  
+EXPLORATION_TYPE: constraint_relaxation  
+HYPOTHESIS_TAG: H1_CTE_PREDICATE_FENCE  
+HYPOTHESIS: Pushing store filter into CTE reduces scan rows  
+EVIDENCE: Store filter (s_state='SD') applied AFTER CTE materialization  
+EXPECTED_MECHANISM: Filtering store_returns early via store join reduces input to aggregation  
+CONTROL_SIGNAL: If runtime increases, scan pruning failed or filter wasn't selective  
+
+### WORKER 2 BRIEFING (Decorrelate Subquery)
+
+STRATEGY: aggregate_pushdown  
+TARGET_LOGICAL_TREE:  
+```mermaid
+CTE: store_returns_agg → CTE: store_avg → MAIN
+```  
+NODE_CONTRACTS:  
+  store_returns_agg:  
+    FROM: store_returns, date_dim  
+    JOIN: sr_returned_date_sk = d_date_sk  
+    WHERE: d_year = 2000  
+    GROUP BY: sr_customer_sk, sr_store_sk  
+    OUTPUT: sr_customer_sk, sr_store_sk, SUM(SR_FEE) AS ctr_total_return  
+    EXPECTED_ROWS: ~1K  
+    CONSUMERS: store_avg, MAIN  
+  store_avg:  
+    FROM: store_returns_agg  
+    GROUP BY: sr_store_sk  
+    OUTPUT: sr_store_sk, AVG(ctr_total_return)*1.2 AS store_avg  
+    EXPECTED_ROWS: ~5 (stores in SD)  
+    CONSUMERS: MAIN  
+  MAIN:  
+    FROM: store_returns_agg ctr1, store, store_avg, customer  
+    JOIN: ctr1.sr_store_sk = s_store_sk AND ctr1.sr_store_sk = store_avg.sr_store_sk AND ctr1.sr_customer_sk = c_customer_sk  
+    WHERE: s_state = 'SD' AND ctr1.ctr_total_return > store_avg.store_avg  
+    ORDER BY: c_customer_id  
+    OUTPUT: c_customer_id  
+    EXPECTED_ROWS: ~100  
+
+EXAMPLES: decorrelate, composite_decorrelate_union  
+EXAMPLE_ADAPTATION: Use decorrelate's subquery-to-join pattern. Ignore UNION aspects from composite example.  
+HAZARD_FLAGS: AVG must be reconstructed exactly (SUM/COUNT)  
+CONSTRAINT_OVERRIDE: None  
+OVERRIDE_REASONING: Aggregation groups preserved (store_sk)  
+EXPLORATION_TYPE: compound_strategy  
+HYPOTHESIS_TAG: H4_AGGREGATE_BELOW_JOIN  
+HYPOTHESIS: Precomputing store averages eliminates correlated execution  
+EVIDENCE: Correlated subquery rescans CTE per store  
+EXPECTED_MECHANISM: Store-level aggregation before join reduces per-row computations  
+CONTROL_SIGNAL: If row count differs, aggregation group integrity broken  
+
+### WORKER 3 BRIEFING (Window Consolidation)
+
+STRATEGY: single_pass_aggregation  
+TARGET_LOGICAL_TREE:  
+```mermaid
+CTE: enhanced_ctr → MAIN
+```  
+NODE_CONTRACTS:  
+  enhanced_ctr:  
+    FROM: store_returns, date_dim  
+    JOIN: sr_returned_date_sk = d_date_sk  
+    WHERE: d_year = 2000  
+    GROUP BY: sr_customer_sk, sr_store_sk  
+    WINDOW: AVG(SUM(SR_FEE)) OVER (PARTITION BY sr_store_sk) AS store_avg  
+    OUTPUT: sr_customer_sk, sr_store_sk, SUM(SR_FEE) AS ctr_total_return, store_avg  
+    EXPECTED_ROWS: ~1K  
+    CONSUMERS: MAIN  
+  MAIN:  
+    FROM: enhanced_ctr ctr1, store, customer  
+    JOIN: ctr1.sr_store_sk = s_store_sk AND ctr1.sr_customer_sk = c_customer_sk  
+    WHERE: s_state = 'SD' AND ctr_total_return > store_avg*1.2  
+    ORDER BY: c_customer_id  
+    OUTPUT: c_customer_id  
+    EXPECTED_ROWS: ~100  
+
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation  
+EXAMPLE_ADAPTATION: Apply single_pass_aggregation's window technique. Ignore bitmap aspects.  
+HAZARD_FLAGS: Window computation memory pressure  
+CONSTRAINT_OVERRIDE: None  
+OVERRIDE_REASONING: Window computes AVG per store group - equivalent to original  
+EXPLORATION_TYPE: novel_combination  
+HYPOTHESIS_TAG: NOVEL_WINDOW_AGG  
+HYPOTHESIS: Computing store average in-window avoids CTE rescan  
+EVIDENCE: Correlated subquery forces repeated CTE access  
+EXPECTED_MECHANISM: Single aggregation+window pass replaces subquery executions  
+CONTROL_SIGNAL: If spills occur, window partition too large  
+
+### WORKER 4 BRIEFING (Star-Join Prefetch)
+
+STRATEGY: star_join_prefetch  
+TARGET_LOGICAL_TREE:  
+```mermaid
+CTE: sd_stores → CTE: store_returns_filtered → MAIN
+```  
+NODE_CONTRACTS:  
+  sd_stores:  
+    FROM: store  
+    WHERE: s_state = 'SD'  
+    OUTPUT: s_store_sk  
+    EXPECTED_ROWS: ~10  
+    CONSUMERS: store_returns_filtered  
+  store_returns_filtered:  
+    FROM: store_returns, date_dim, sd_stores  
+    JOIN: sr_store_sk = s_store_sk AND sr_returned_date_sk = d_date_sk  
+    WHERE: d_year = 2000  
+    GROUP BY: sr_customer_sk, sr_store_sk  
+    OUTPUT: sr_customer_sk, sr_store_sk, SUM(SR_FEE) AS ctr_total_return  
+    EXPECTED_ROWS: ~500  
+    CONSUMERS: MAIN  
+  MAIN:  
+    FROM: store_returns_filtered ctr1, customer,  
+          LATERAL (SELECT AVG(ctr_total_return)*1.2 FROM store_returns_filtered ctr2 WHERE ctr1.sr_store_sk = ctr2.sr_store_sk)  
+    JOIN: ctr1.sr_customer_sk = c_customer_sk  
+    WHERE: ctr_total_return > avg  
+    ORDER BY: c_customer_id  
+    OUTPUT: c_customer_id  
+    EXPECTED_ROWS: ~100  
+
+EXAMPLES: dimension_cte_isolate, prefetch_fact_join  
+EXAMPLE_ADAPTATION: Use dimension_cte_isolate's early dim filtering. Keep LATERAL for subquery equivalence.  
+HAZARD_FLAGS: LATERAL may force nested loop  
+CONSTRAINT_OVERRIDE: None  
+OVERRIDE_REASONING: All columns preserved through CTEs  
+EXPLORATION_TYPE: compound_strategy  
+HYPOTHESIS_TAG: H1_CTE_PREDICATE_FENCE + H4_AGGREGATE_BELOW_JOIN  
+HYPOTHESIS: Prefiltering stores reduces CTE rows before aggregation  
+EVIDENCE: State filter applied late; subquery rescans full CTE  
+EXPECTED_MECHANISM: Early store filtering shrinks aggregation input  
+CONTROL_SIGNAL: If LATERAL causes slowdown, decorrelation was ineffective

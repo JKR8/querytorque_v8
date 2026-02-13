@@ -195,8 +195,39 @@ def run_explain_analyze(
 
     if db_type == "postgres":
         return _run_explain_analyze_postgres(database_path, sql)
+    elif db_type == "snowflake":
+        return _run_explain_analyze_snowflake(database_path, sql)
     else:
         return _run_explain_analyze_duckdb(database_path, sql)
+
+
+def _run_explain_analyze_snowflake(dsn: str, sql: str) -> Optional[dict]:
+    """Run EXPLAIN on Snowflake (no ANALYZE available)."""
+    try:
+        from .factory import SnowflakeConfig
+
+        config = SnowflakeConfig.from_dsn(dsn)
+        executor = config.get_executor()
+
+        with executor:
+            result = {
+                "execution_time_ms": None,
+                "plan_text": None,
+                "plan_json": None,
+                "actual_rows": None,
+            }
+
+            try:
+                plan_data = executor.explain(sql, analyze=False)
+                result["plan_text"] = plan_data.get("plan", "")
+            except Exception as e:
+                logger.warning(f"Snowflake EXPLAIN failed: {e}")
+
+            return result
+
+    except Exception as e:
+        logger.warning(f"Failed to run Snowflake EXPLAIN: {e}")
+        return None
 
 
 def _run_explain_analyze_duckdb(database_path: str, sql: str) -> Optional[dict]:

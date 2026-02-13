@@ -50,50 +50,6 @@ class PlanIssue:
             "details": self.details,
         }
 
-    def to_issue(self) -> "Issue":
-        """Convert PlanIssue to the unified Issue model with source=plan.
-
-        This bridges plan-detected performance issues into the main audit
-        pipeline so they appear alongside AST-detected issues in reports,
-        scoring, and LLM payloads.
-        """
-        from query_torque.models.audit_result import (
-            Issue, Severity, Confidence, IssueSource,
-        )
-
-        severity_map = {
-            "critical": Severity.CRITICAL,
-            "high": Severity.HIGH,
-            "medium": Severity.MEDIUM,
-            "low": Severity.LOW,
-            "info": Severity.INFO,
-        }
-
-        # Build evidence from details dict
-        evidence = []
-        if self.details:
-            for key, value in self.details.items():
-                evidence.append(f"{key}: {value}")
-
-        # Generate instance ID from rule_id + location
-        import hashlib
-        hash_suffix = hashlib.md5(
-            f"{self.rule_id}:{self.location}".encode()
-        ).hexdigest()[:4]
-        instance_id = f"{self.rule_id}-{hash_suffix}"
-
-        return Issue(
-            id=instance_id,
-            rule=self.rule_id,
-            severity=severity_map.get(self.severity.lower(), Severity.MEDIUM),
-            title=self.name[:100],
-            penalty=self.penalty,
-            problem=self.description,
-            remediation=self.suggestion,
-            evidence=evidence,
-            confidence=Confidence.HIGH,
-            source=IssueSource.PLAN,
-        )
 
 
 # Operator types that indicate potential performance issues

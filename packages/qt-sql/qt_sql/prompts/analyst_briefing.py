@@ -781,7 +781,8 @@ def build_analyst_briefing_prompt(
     # ── §2b. EXPLAIN Plan ────────────────────────────────────────────────
     is_estimate_plan = False  # hoisted for use in reasoning step 2
     if explain_plan_text:
-        formatted_plan = format_duckdb_explain_tree(explain_plan_text)
+        # explain_plan_text is pre-rendered by pipeline.get_explain_plan_text()
+        formatted_plan = explain_plan_text
         # Detect estimate-only plans (no actual timing data)
         is_estimate_plan = "est_rows=" in formatted_plan or "EXPLAIN only" in formatted_plan
         if is_estimate_plan:

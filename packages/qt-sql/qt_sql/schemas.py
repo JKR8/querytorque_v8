@@ -58,11 +58,13 @@ class BenchmarkConfig:
     benchmark_dsn: str    # DSN/path used for benchmarking (may differ from EXPLAIN DSN)
     scale_factor: int
     timeout_seconds: int
-    validation_method: str  # "3-run" | "5-run"
+    validation_method: str  # "race" | "3-run" | "5-run"
     n_queries: int
     workers_state_0: int
     workers_state_n: int
     promote_threshold: float
+    race_min_runtime_ms: float = 2000.0   # Race only triggers if original >= this
+    race_min_margin: float = 0.05         # Candidate must beat original by this fraction
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> BenchmarkConfig:
@@ -77,11 +79,13 @@ class BenchmarkConfig:
             benchmark_dsn=data.get("benchmark_dsn") or db_path_or_dsn,
             scale_factor=data.get("scale_factor", 10),
             timeout_seconds=data.get("timeout_seconds", 300),
-            validation_method=data.get("validation_method", "3-run"),
+            validation_method=data.get("validation_method", "race"),
             n_queries=data.get("n_queries", 99),
             workers_state_0=data.get("workers_state_0", 5),
             workers_state_n=data.get("workers_state_n", 1),
             promote_threshold=data.get("promote_threshold", 1.05),
+            race_min_runtime_ms=data.get("race_min_runtime_ms", 2000.0),
+            race_min_margin=data.get("race_min_margin", 0.05),
         )
 
 

@@ -1,0 +1,983 @@
+## §1. ROLE & MISSION
+
+You are a senior query optimization architect. Your job is to deeply analyze a SQL query and produce a structured briefing for 4 specialist workers who will each write a different optimized version.
+
+You are the ONLY call that sees all the data: EXPLAIN plans, logical-tree costs, full constraint list, global knowledge, and the complete example catalog. The workers will only see what YOU put in their briefings. Your output quality directly determines their success.
+
+## §2a. Original Query: query084_agg_i1 (postgres)
+
+```sql
+ 1 | select  c_customer_id as customer_id
+ 2 |        , coalesce(c_last_name,'') || ', ' || coalesce(c_first_name,'') as customername
+ 3 |  from customer
+ 4 |      ,customer_address
+ 5 |      ,customer_demographics
+ 6 |      ,household_demographics
+ 7 |      ,income_band
+ 8 |      ,store_returns
+ 9 |  where ca_city	        =  'Jackson'
+10 |    and c_current_addr_sk = ca_address_sk
+11 |    and ib_lower_bound   >=  23567
+12 |    and ib_upper_bound   <=  23567 + 50000
+13 |    and ib_income_band_sk = hd_income_band_sk
+14 |    and cd_demo_sk = c_current_cdemo_sk
+15 |    and hd_demo_sk = c_current_hdemo_sk
+16 |    and sr_cdemo_sk = cd_demo_sk
+17 |  order by c_customer_id
+18 |  limit 100;
+```
+
+## §2b. EXPLAIN ANALYZE Plan
+
+```
+Total execution time: 43.9ms
+Planning time: 1.5ms
+
+-> Limit  (rows=100 loops=1 time=43.9ms)
+  -> Gather Merge  (rows=100 loops=1 time=43.9ms)
+     Workers: 2/2 launched
+    -> Sort  (rows=43 loops=3 time=40.0ms)
+       Sort Method: quicksort  Space: 28kB (Memory)
+      -> Nested Loop Inner  (rows=44 loops=3 time=39.9ms)
+        -> Nested Loop Inner  (rows=12 loops=3 time=34.5ms)
+          -> Hash Join Inner  (rows=12 loops=3 time=34.4ms)
+             Hash Cond: (household_demographics.hd_income_band_sk = income_band.ib_income_band_sk)
+            -> Nested Loop Inner  (rows=63 loops=3 time=34.3ms)
+              -> Hash Join Inner  (rows=64 loops=3 time=33.9ms)
+                 Hash Cond: (customer.c_current_addr_sk = customer_address.ca_address_sk)
+                -> Seq Scan on customer  (rows=167K loops=3 time=15.3ms)
+                -> Hash  (rows=33 loops=3 time=8.9ms)
+                  -> Seq Scan on customer_address  (rows=33 loops=3 time=8.8ms)
+                     Filter: ((ca_city)::text = 'Jackson'::text)
+                     Rows Removed by Filter: 83K
+              -> Index Scan on household_demographics  (rows=1 loops=193 time=0.0ms)
+                 Index Cond: (hd_demo_sk = customer.c_current_hdemo_sk)
+            -> Hash  (rows=4 loops=3 time=0.0ms)
+              -> Seq Scan on income_band  (rows=4 loops=3 time=0.0ms)
+                 Filter: ((ib_lower_bound >= 23567) AND (ib_upper_bound <= 73567))
+                 Rows Removed by Filter: 16
+          -> Index Only Scan on customer_demographics  (rows=1 loops=37 time=0.0ms)
+             Index Cond: (cd_demo_sk = customer.c_current_cdemo_sk)
+        -> Index Only Scan on store_returns  (rows=4 loops=35 time=0.5ms)
+           Index Cond: (sr_cdemo_sk = customer_demographics.cd_demo_sk)
+```
+
+**NOTE:** EXPLAIN shows PHYSICAL execution — ground truth when it disagrees with the logical tree (optimizer may already split CTEs, push predicates, reorder joins).
+Use EXPLAIN ANALYZE timings as ground truth, not logical-tree %.
+
+### Plan-Space Scanner Intelligence
+
+Plan diversity: 20 distinct plans, 7 plan changers | HIGH
+Baseline joins: 3x Nested Loop, 2x Hash Join
+  JOIN_TYPE_TRAP (27 combos): no_nestloop: ['Nested Loop(Inner)'] → []
+  JOIN_ORDER_TRAP (26 combos): table order unstable
+  SCAN_TYPE_TRAP (26 combos): scan methods fragile
+Plan changers: no_nestloop, no_hashjoin, no_seqscan, force_merge, force_nestloop, no_parallel, max_parallel
+
+postgres_optimizer_workflow:
+  description: "Step-by-step logic for an LLM to apply PostgreSQL tuning flags based on DSB benchmark findings."
+
+  step_1_apply_baseline_globals:
+    description: "Apply to ALL queries. Based on Findings SF-001 (Cost Model) and SF-007 (Memory)."
+    rationale: "Default random_page_cost is too high for SSDs; work_mem defaults are too low for star-schemas."
+    commands:
+      - "SET random_page_cost = 1.1;"
+      - "SET work_mem = '256MB';"
+      - "SET effective_cache_size = '4GB';"
+
+  step_2_analyze_and_apply_conditionals:
+    logic: "Check query structure and intent to apply specific overrides."
+    branches:
+      - case: "Low Latency / Point Lookup"
+        condition: "Query filters on PKs or highly selective indexes; expected runtime < 100ms."
+        finding_ref: "SF-006 (JIT overhead)"
+        action: "Prepend: SET jit = off;"
+
+      - case: "Heavy Aggregation / Star Scan"
+        condition: "Query involves large fact table scans and GROUP BY."
+        finding_ref: "SF-005, SF-010 (Conservative Parallelism)"
+        action: "Force parallelism. Prepend: SET max_parallel_workers_per_gather = 4; SET min_parallel_table_scan_size = '8kB';"
+
+      - case: "Complex Multi-Join"
+        condition: "Query contains > 5 joins where the textual order implies a specific logical flow."
+        finding_ref: "SF-004 (Join Order Trap)"
+        action: "Respect author order. Prepend: SET join_collapse_limit = 1;"
+
+  step_3_safety_constraints:
+    description: "Critical anti-patterns to avoid. Based on Findings SF-002 and SF-009."
+    rules:
+      - "NEVER generate 'SET enable_nestloop = off;' (Risks 184x regression on lookups)."
+      - "NEVER generate 'SET enable_hashjoin = off;' for large analytic queries (Structural bottleneck)."
+
+  step_4_fallback_strategy:
+    description: "If the query remains slow (1-10s range) despite baseline."
+    finding_ref: "SF-003, SF-008"
+    action: "Suggest trying: SET enable_mergejoin = off; (can force efficient hash/nested loops in rare 'trap' scenarios)."
+
+
+### §2b-i. Cardinality Estimation Routing (Q-Error)
+
+Direction: OVER_EST (estimated >> actual — planner over-provisions, redundant work likely)
+Locus: SCAN — worst mismatch at Index Only Scan (est=24, act=4)
+
+Pathology routing: P1, P4, P5, P0, P7
+(Locus+Direction routing is 85% accurate at predicting where the winning transform operates)
+
+## §2c. Query Structure (Logic Tree)
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~500K
+    ├── SCAN (customer, customer_address (join), customer_demographics (join), household_demographics (join), income_band (join), store_returns (join))
+    ├── JOIN (c_current_addr_sk = ca_address_sk)
+    ├── JOIN (ib_income_band_sk = hd_income_band_sk)
+    ├── JOIN (+3 more)
+    ├── FILTER (ca_city = 'Jackson')
+    ├── FILTER (ib_lower_bound >= 23567)
+    ├── FILTER (+1 more)
+    ├── SORT (c_customer_id ASC)
+    └── OUTPUT (customer_id, customername)
+```
+
+### Node Details
+
+### 1. main_query
+**Role**: Root / Output (Definition Order: 0)
+**Stats**: 100% Cost | ~500k rows processed → 100 rows output
+**Flags**: ORDER_BY, LIMIT(100)
+**Outputs**: [customer_id, customername] — ordered by c_customer_id ASC
+**Dependencies**: customer, customer_address (join), customer_demographics (join), household_demographics (join), income_band (join), store_returns (join)
+**Joins**: c_current_addr_sk = ca_address_sk | ib_income_band_sk = hd_income_band_sk | cd_demo_sk = c_current_cdemo_sk | hd_demo_sk = c_current_hdemo_sk | sr_cdemo_sk = cd_demo_sk
+**Filters**: ca_city = 'Jackson' | ib_lower_bound >= 23567 | ib_upper_bound <= 23567 + 50000
+**Operators**: SEQ_SCAN[customer], SEQ_SCAN[customer_address], SEQ_SCAN[household_demographics], SEQ_SCAN[income_band], SEQ_SCAN[customer_demographics]
+**Key Logic (SQL)**:
+```sql
+SELECT
+  c_customer_id AS customer_id,
+  COALESCE(c_last_name, '') || ', ' || COALESCE(c_first_name, '') AS customername
+FROM customer, customer_address, customer_demographics, household_demographics, income_band, store_returns
+WHERE
+  ca_city = 'Jackson'
+  AND c_current_addr_sk = ca_address_sk
+  AND ib_lower_bound >= 23567
+  AND ib_upper_bound <= 23567 + 50000
+  AND ib_income_band_sk = hd_income_band_sk
+  AND cd_demo_sk = c_current_cdemo_sk
+  AND hd_demo_sk = c_current_hdemo_sk
+  AND sr_cdemo_sk = cd_demo_sk
+ORDER BY
+  c_customer_id
+LIMIT 100
+```
+
+
+## §3a. Correctness Constraints (4 — NEVER violate)
+
+**[CRITICAL] COMPLETE_OUTPUT**: The rewritten query must output ALL columns from the original SELECT. Never drop, rename, or reorder output columns. Every column alias must be preserved exactly as in the original.
+
+**[CRITICAL] CTE_COLUMN_COMPLETENESS**: CRITICAL: When creating or modifying a CTE, its SELECT list MUST include ALL columns referenced by downstream queries. Check the Node Contracts section: every column in downstream_refs MUST appear in the CTE output. Also ensure: (1) JOIN columns used by consumers are included in SELECT, (2) every table referenced in WHERE is present in FROM/JOIN, (3) no ambiguous column names between the CTE and re-joined tables. Dropping a column that a downstream node needs will cause an execution error.
+  - Failure: Q21 — prefetched_inventory CTE omits i_item_id but main query references it in SELECT and GROUP BY
+  - Failure: Q76 — filtered_store_dates CTE omits d_year and d_qoy but aggregation CTE uses them in GROUP BY
+
+**[CRITICAL] LITERAL_PRESERVATION**: CRITICAL: When rewriting SQL, you MUST copy ALL literal values (strings, numbers, dates) EXACTLY from the original query. Do NOT invent, substitute, or 'improve' any filter values. If the original says d_year = 2000, your rewrite MUST say d_year = 2000. If the original says ca_state = 'GA', your rewrite MUST say ca_state = 'GA'. Changing these values will produce WRONG RESULTS and the rewrite will be REJECTED.
+
+**[CRITICAL] SEMANTIC_EQUIVALENCE**: The rewritten query MUST return exactly the same rows, columns, and ordering as the original. This is the prime directive. Any rewrite that changes the result set — even by one row, one column, or a different sort order — is WRONG and will be REJECTED.
+
+## §3b. Aggregation Equivalence Rules
+
+You MUST verify aggregation equivalence for any proposed restructuring:
+
+- **STDDEV_SAMP(x)** requires >=2 non-NULL values per group. Returns NULL for 0-1 values. Changing group membership changes the result.
+- `STDDEV_SAMP(x) FILTER (WHERE year=1999)` over a combined (1999,2000) group is NOT equivalent to `STDDEV_SAMP(x)` over only 1999 rows — FILTER still uses the combined group's membership for the stddev denominator.
+- **AVG and STDDEV are NOT duplicate-safe**: if a join introduces row duplication, the aggregate result changes.
+- When splitting a UNION ALL CTE with GROUP BY + aggregate, each split branch must preserve the exact GROUP BY columns and filter to the exact same row set as the original.
+- **SAFE ALTERNATIVE**: If GROUP BY includes the discriminator column (e.g., d_year), each group is already partitioned. STDDEV_SAMP computed per-group is correct. You can then pivot using `MAX(CASE WHEN year = 1999 THEN year_total END) AS year_total_1999` because the GROUP BY guarantees exactly one row per (customer, year) — the MAX is just a row selector, not a real aggregation.
+
+## §4. Exploit Algorithm: Evidence-Based Gap Intelligence
+
+The following describes known optimizer gaps with detection rules, procedural exploit steps, and evidence. Use DETECT rules to match structural features of the query, then follow EXPLOIT_STEPS.
+
+# PostgreSQL Rewrite Playbook
+# DSB SF10 field intelligence
+
+## HOW TO USE THIS DOCUMENT
+
+Work in phase order. Each phase changes the plan shape — re-evaluate later phases after each.
+
+  Phase 1: Reduce scan volume (P1, P6, P7) — always first. Every optimization benefits from smaller input.
+  Phase 2: Eliminate redundant work (P2, P3)
+  Phase 3: Fix structural inefficiencies (P4, P5)
+
+Before choosing any strategy, scan the explain plan for:
+- Row count profile: monotonically decreasing = healthy. Flat then sharp drop = pushback opportunity.
+- Join types: hash join = good. Nested loop on large table = decorrelation candidate.
+- Repeated tables: same table N times = consolidation (P3).
+- CTE materialization: large CTE + small post-filter = pushback. Use AS MATERIALIZED when needed.
+- Bitmap OR scan: indexed OR already optimized — do NOT split to UNION.
+- Parallel workers: active parallelism — avoid CTE fence that blocks parallel execution.
+- Index-only scan on dimension: small dimension already efficient — CTE wrapper may hurt.
+- EXISTS/NOT EXISTS: uses semi-join early termination — NEVER materialize.
+
+## ENGINE STRENGTHS — do NOT rewrite these patterns
+
+1. **BITMAP_OR_SCAN**: Multi-branch ORs on indexed columns handled via bitmap combination in one scan. Splitting ORs to UNION ALL is lethal (0.21x observed).
+2. **EXISTS semi-join**: Uses early termination. Converting to materializing CTEs caused 0.50x, 0.75x — semi-join destroyed. **Never materialize EXISTS.**
+3. **INNER JOIN reordering**: Freely reorders INNER JOINs by selectivity estimates. Do NOT manually restructure INNER JOIN order.
+4. **Index-only scan**: Reads only index when covering all requested columns. Small dimension lookups may not need CTEs.
+5. **Parallel query execution**: Large scans and aggregations parallelized across workers. CTEs block parallelism (materialization is single-threaded).
+6. **JIT compilation**: JIT-compiles complex expressions for long-running queries (>100ms).
+
+## CORRECTNESS RULES
+
+- Preserve exact row count — no filtering or duplication.
+- Maintain NULL semantics in WHERE/ON conditions.
+- Do not add/remove ORDER BY unless proven safe.
+- Preserve LIMIT semantics — no result set expansion.
+- NOT IN with NULLs blocks hash anti-joins — preserve EXISTS form.
+
+## GLOBAL GUARDS (check always, before any rewrite)
+
+1. OR conditions on indexed columns → never split to UNION ALL (0.21x observed)
+2. EXISTS/NOT EXISTS → never materialize into CTEs (0.50x, 0.75x — semi-join destroyed)
+3. INNER JOIN order → never restructure (optimizer handles reordering)
+4. Small dimensions (< 10K rows) → index-only scan may be faster than CTE
+5. Baseline < 100ms → skip CTE-based rewrites (overhead exceeds savings)
+6. CTEs block parallel execution — only use when benefit outweighs parallelism loss
+7. Use AS MATERIALIZED when CTE must not be inlined (decorrelation, shared scans)
+8. Preserve efficient existing CTEs — don't decompose working patterns
+9. Verify NULL semantics in NOT IN conversions
+10. ROLLUP/window in same query → CTE may prevent pushdown optimizations
+11. Never inline a large UNION CTE — re-execution multiplied per reference (0.16x — 6 fact scans re-executed)
+12. Max 2 cascading fact-table CTE chains — deeper chains block parallelism
+13. EXPLAIN cost gaps ≠ runtime gains for config tuning — 6 false positives caught (up to 84% EXPLAIN gap → 0% runtime). Always 3-race validate config changes.
+
+---
+
+## PATHOLOGIES
+
+### P1: Comma join confusing cardinality estimation [Phase 1 — LOW RISK]
+
+  Gap: COMMA_JOIN_WEAKNESS — PostgreSQL's planner uses cross-product estimation
+  for comma-separated joins in the FROM clause. Without explicit JOIN syntax, the
+  planner lacks the join-key hint that enables hash-join probing with filtered
+  dimension tables. This manifests as poor row estimates on intermediate joins,
+  leading to nested-loop plans on large fact tables.
+
+  The fix has two parts: (1) convert comma joins to explicit INNER JOIN syntax,
+  and (2) pre-filter selective dimensions into MATERIALIZED CTEs to create tiny
+  hash probe tables. Both are required — the CTE alone can hurt, but CTE +
+  explicit JOINs together enable optimal hash join planning.
+
+  Signal: hash/nested-loop join with poor row estimates in EXPLAIN, large
+  intermediate results. SQL shows FROM t1, t2, t3 WHERE t1.key = t2.key
+  AND ... (comma joins, no explicit JOIN).
+
+  Decision gates:
+  - Structural: multiple tables in comma-separated FROM with equi-join predicates
+  - Selectivity: dimension filters available (date range, state, category)
+  - Fact table: 1-2 fact tables only (3+ → join order lock)
+  - CTE count: max 3-4 dimension CTEs (avoid over-materialization)
+  - Stop: if all JOINs already explicit → skip to P6/P7
+
+  Transform selection (lightest sufficient):
+  - Date filter + star schema → pg_date_cte_explicit_join (4 wins, 2.1x avg)
+  - Multiple dimension filters → pg_dimension_prefetch_star (3 wins, 2.8x avg)
+  - Complex multi-join → explicit_join_materialized (2 wins, 5.9x avg)
+
+  Ordering: apply first — reduces fact table scan before other optimizations.
+  Composition: combines well with P2 (decorrelation) and P6 (date consolidation).
+  After applying: re-evaluate P4 (non-equi inputs now smaller).
+
+  Wins: 4 validated (1.8x–8.6x, avg 4.0x)
+  Improved: 1 (1.4x)
+  Regressions: 0.88x (explicit join overhead on simple query)
+
+### P2: Correlated subquery executing per outer row [Phase 2 — HIGHEST IMPACT]
+
+  Gap: CORRELATED_SUBQUERY_PARALYSIS — PostgreSQL cannot decorrelate correlated
+  aggregate subqueries into GROUP BY + hash join. It falls back to nested-loop
+  re-execution, scanning the inner relation once per outer row. For N outer rows
+  and M inner rows, cost is O(N × M) instead of O(N + M).
+
+  This is the single most impactful pathology on PostgreSQL. It accounts for 9
+  of 31 wins including the three largest speedups (8044x, 1465x, 439x). The
+  extreme wins occur when the correlated subquery causes a timeout — the original
+  query never finishes, but the decorrelated version completes in milliseconds.
+
+  The fix: extract the correlated aggregate into a MATERIALIZED CTE with GROUP BY
+  on the correlation key, then JOIN back. Use AS MATERIALIZED to prevent the
+  optimizer from inlining the CTE back into a correlated form.
+
+  Signal: nested loop in EXPLAIN, inner side re-executes aggregate per outer row.
+  If EXPLAIN shows hash join on correlation key → already decorrelated → STOP.
+  SQL signal: WHERE col > (SELECT AGG(...) FROM ... WHERE outer.key = inner.key)
+
+  Decision gates:
+  - Structural: correlated scalar subquery with aggregate (AVG, SUM, COUNT)
+  - EXPLAIN: nested loop with inner re-execution (NOT hash join)
+  - NOT EXISTS: NEVER decorrelate EXISTS/NOT EXISTS (destroys semi-join, 0.50x observed)
+  - Shared scan: if inner and outer scan same table → extract common scan to shared CTE
+  - CTE keyword: ALWAYS use AS MATERIALIZED (prevents optimizer re-correlating)
+  - Multi-fact: 1-2 fact tables safe, 3+ → STOP (0.51x on multi-fact query)
+
+  Transform selection (lightest sufficient):
+  - Simple avg comparison → inline_decorrelate_materialized (3 wins, avg 500x)
+  - Multiple correlation keys → decorrelate (8 wins, avg 3.2x)
+  - Inner = outer table → shared scan + decorrelate (2 wins, avg 7000x)
+
+  Ordering: apply after P1 (smaller inputs make decorrelation cheaper).
+  Composition: almost always combined with P1 (comma join conversion).
+  After applying: re-evaluate P3 (decorrelated CTEs may now be reusable).
+
+  Wins: 9 validated (1.9x–8044x, avg 1100x), 3 timeout recoveries (439x–8044x)
+  Improved: 2 (1.1x–1.5x)
+  Regressions: 0.51x (multi-fact join lock), 0.75x (EXISTS materialized)
+
+### P3: Same fact+dimension scan repeated across subquery boundaries [Phase 2 — ZERO REGRESSIONS]
+
+  Gap: CROSS_CTE_PREDICATE_BLINDNESS — PostgreSQL cannot detect that N subqueries
+  all scan the same fact table with identical joins and filters. Each subquery is
+  an independent plan unit with no Common Subexpression Elimination across query
+  boundaries. This includes self-join patterns where the same aggregation is
+  computed at different granularities.
+
+  Two fix strategies: (1) Materialize identical scan once as CTE, derive
+  aggregates from single result. (2) Consolidate multiple channel scans
+  (store/catalog/web) into single UNION ALL scan with CASE-based pivoting.
+
+  Signal: identical scan subtrees appearing 2+ times in EXPLAIN with similar
+  costs. SQL signal: same fact table joined to same dimensions in multiple
+  subqueries, or self-join with different GROUP BY granularity.
+
+  Decision gates:
+  - Structural: 2+ subqueries scanning same fact table with identical filters
+  - Aggregation: COUNT/SUM/AVG/MIN/MAX only (not STDDEV/PERCENTILE)
+  - Self-join: if query joins CTE to itself → consolidate into single CTE
+  - Channel pattern: 3 channel scans (store/catalog/web) → single_pass_aggregation
+
+  Transform selection:
+  - Multi-channel INTERSECT-like → single_pass_aggregation (1 win, 1.98x)
+  - Year-over-year self-join → self_join_pivot (1 win, 1.79x)
+
+  Ordering: apply after P1/P2 — reduced inputs make consolidation cheaper.
+  After applying: P4 benefits from smaller materialized inputs.
+
+  Wins: 2 validated (1.8x–2.0x, avg 1.9x)
+  Regressions: none observed
+
+### P4: Non-equi join without prefiltering [Phase 3 — ZERO REGRESSIONS]
+
+  Gap: NON_EQUI_JOIN_INPUT_BLINDNESS — PostgreSQL handles non-equi joins
+  (BETWEEN, <, >) via nested-loop or hash join with recheck, but cannot push
+  dimension filters past the non-equi join boundary. Both sides of the non-equi
+  join receive full unfiltered input, making the join O(N × M) on large tables.
+
+  Fix: shrink BOTH sides via MATERIALIZED CTEs before the non-equi join.
+  Pre-filter dimensions (date, demographics, household) into small CTEs, then
+  join fact table with pre-filtered dimensions to reduce cardinality before the
+  non-equi join.
+
+  Signal: expensive non-equi join (BETWEEN, <, >) in EXPLAIN with large inputs.
+  SQL signal: JOIN ... ON a.col BETWEEN b.low AND b.high, neither side filtered.
+
+  Decision gates:
+  - Structural: non-equi join predicate (BETWEEN, range comparison)
+  - Cardinality: both join inputs > 10K rows
+  - Dimension filters: at least one side has selective dimension filter available
+  - Fact side: reducible by pre-joining with filtered dimensions
+
+  Transform selection:
+  - Multiple dimension filters → pg_materialized_dimension_fact_prefilter (1 win, 12.07x)
+
+  Ordering: apply after P1 (explicit join syntax) and P6 (date CTE).
+  After applying: non-equi join now operates on pre-filtered inputs.
+
+  Wins: 1 validated (12.1x)
+  Regressions: none observed
+
+### P5: Set operation materializing full result sets [Phase 3 — CAUTION]
+
+  Gap: SET_OPERATION_MATERIALIZATION — INTERSECT and EXCEPT are implemented via
+  full materialization + sort/hash comparison. For EXISTS (positive set test)
+  this destroys semi-join early termination. For NOT EXISTS (negative set test)
+  the planner uses hash-anti-join which is efficient, but correlated set
+  operations re-execute per outer row.
+
+  Two opposite fixes depending on direction:
+  (a) INTERSECT → EXISTS: replace set materialization with semi-join early
+      termination. PostgreSQL's EXISTS uses index + early termination.
+  (b) Correlated EXISTS/NOT EXISTS on large sets → MATERIALIZED CTE + LEFT JOIN
+      + IS NULL: pre-compute distinct customer sets once, then hash join for
+      set difference. Only when 3+ channel checks (store, web, catalog).
+
+  Signal: INTERSECT/EXCEPT between large result sets in EXPLAIN.
+  SQL signal: EXISTS subquery correlated to outer with fact+date scan inside.
+
+  Decision gates:
+  - INTERSECT with 10K+ rows → convert to EXISTS (P5a)
+  - Correlated NOT EXISTS on 3+ channels → materialize channel sets (P5b)
+  - Simple EXISTS (single channel) → KEEP EXISTS (semi-join is optimal)
+  - NOT EXISTS already using hash anti-join in EXPLAIN → STOP
+  - CAUTION: materializing simple EXISTS destroys semi-join (0.75x observed)
+
+  Transform selection:
+  - INTERSECT → intersect_to_exists (1 win, 1.78x)
+  - Multi-channel EXISTS/NOT EXISTS → set_operation_materialization (1 win, 17.48x)
+
+  Ordering: apply after P1 (explicit joins for channel CTEs).
+  Composition: P5a (INTERSECT→EXISTS) is standalone; P5b combines with P1/P6.
+  After applying: check P3 if set operations were the only repeated-scan source.
+
+  Wins: 2 validated (1.8x–17.5x, avg 9.6x)
+  Regressions: 0.75x (over-materialized date CTE in EXISTS path)
+
+### P6: Multiple date_dim aliases with overlapping filters [Phase 1 — HIGHEST RELIABILITY]
+
+  Gap: DATE_DIM_REDUNDANCY — PostgreSQL cannot detect that N references to
+  date_dim with overlapping year/month filters select the same rows. Each alias
+  is an independent scan. On star schemas with 3 date_dim instances (sold,
+  returned, shipped), the optimizer scans date_dim 3 times with similar predicates.
+
+  Fix: consolidate overlapping date filters into a single CTE (all_dates) that
+  selects the union of needed date_sk values, then join each fact table reference
+  to the shared CTE with specific MOY conditions.
+
+  Signal: 2+ date_dim aliases in FROM with similar year/month_seq/moy predicates.
+  SQL signal: d1.d_year = 1999 AND d2.d_year = 1999 AND d3.d_year = 1999.
+
+  Decision gates:
+  - Structural: 2+ date_dim instances with overlapping date predicates
+  - Selectivity: date filter selects < 1% of date_dim (always true for year+month)
+  - Combine with: explicit JOIN conversion when comma joins present
+
+  Transform selection:
+  - 2-3 date aliases, same year → date_consolidation (1 win, 3.10x)
+  - Single date filter, star schema → date_cte_isolate (3 wins + 7 improved)
+
+  Ordering: apply first (Phase 1) — date CTE is the smallest, most reliable transform.
+  Composition: always combine with P1 (explicit join syntax).
+  After applying: fact table scans reduced, all downstream pathologies benefit.
+
+  Wins: 3 validated (2.0x–3.1x, avg 2.4x)
+  Improved: 7 (1.07x–1.26x)
+  Regressions: none observed
+
+### P7: Multi-dimension prefetch for star-schema aggregation [Phase 1 — CAUTION]
+
+  Gap: DIMENSION_FILTER_PUSHDOWN_FAILURE — when multiple selective dimension
+  filters exist (item category, store state, customer demographics), the planner
+  may not apply them early enough. Pre-filtering dimensions into small CTEs and
+  joining them to the fact table reduces cardinality before expensive aggregation.
+
+  Fix: create MATERIALIZED CTEs for each selective dimension, then join fact table
+  to all filtered dimensions using explicit INNER JOIN syntax.
+
+  Signal: large fact table scan followed by late dimension filter in EXPLAIN.
+  SQL signal: star schema with 3+ dimension filters in WHERE clause.
+
+  Decision gates:
+  - Structural: star schema with 3+ selective dimension filters
+  - Dimension selectivity: each dimension filter selects < 10% of dimension table
+  - Fact table: single fact table, NOT self-join or multi-fact
+  - Stop: if query has self-join pattern → use P3 instead (0.25x observed)
+  - Stop: if query has multi-fact join → dimension prefetch locks join order (0.51x observed)
+
+  Transform selection:
+  - 2-3 dimensions → pg_dimension_prefetch_star (2 wins, 2.5x avg)
+  - Mixed dimensions + date → multi_dimension_prefetch (1 win, 2.50x)
+  - Fact + date + non-equi → combine with P4 (pg_materialized_dimension_fact_prefilter)
+
+  Ordering: apply with P1/P6 (all Phase 1 optimizations together).
+  CAUTION: do NOT apply to self-join or multi-fact queries.
+
+  Wins: 3 validated (1.8x–2.5x, avg 2.2x)
+  Improved: 3 (1.09x–1.25x)
+  Regressions: 0.25x (self-join), 0.51x (multi-fact)
+
+### NO MATCH — First-Principles Reasoning
+
+  If no pathology matches, do NOT stop.
+
+  1. **Check §2b-i Q-Error routing first.** Direction+locus still points to
+     where the planner is wrong — use as starting hypothesis.
+  2. Identify the largest cost node. What dominates? Can it be restructured?
+  3. Count scans per base table. Repeated scans → consolidation opportunity.
+  4. Trace row counts. Where do they stay flat or increase?
+  5. Check transform catalog (§5a) as a menu.
+
+  Record: which pathologies checked, which gates failed, nearest miss,
+  structural features present.
+
+---
+
+## CONFIG TUNING PATTERNS
+
+Config tuning is ADDITIVE to SQL rewrite — not a substitute. Apply after SQL rewrite.
+Evidence: 52 queries benchmarked, 25 config wins, 3-race validated (PG 14.3, SF10).
+CRITICAL: EXPLAIN ANALYZE cost gaps do NOT predict runtime gains. 6 false positives
+caught where EXPLAIN showed 38-84% improvement but runtime showed 0% or regression.
+Always 3-race validate config changes.
+
+### C1: Merge join forcing suboptimal plan [HIGHEST IMPACT hint]
+
+  Mechanism: /*+ Set(enable_mergejoin off) */
+  Signal: EXPLAIN shows Merge Join with Sort node below it on large unsorted inputs.
+  The optimizer chooses merge join for cost model reasons but the sort overhead
+  exceeds hash join's hash-build cost.
+
+  Decision gates:
+  - Merge Join present in EXPLAIN with Sort node below it
+  - Both inputs > 10K rows (small merge joins are fine)
+  - Alternative: Hash Join would work (equi-join condition exists)
+  - DANGER: Do NOT disable on queries already using merge join efficiently on pre-sorted data
+
+  Wins: 6 validated (+8.6%–+82.5%, avg +50.6%)
+
+### C2: Cost model undervaluing index scans on SSD [HIGHEST RECOVERY]
+
+  Mechanism: SET LOCAL random_page_cost = '1.1'; SET LOCAL effective_cache_size = '48GB'
+  Signal: Seq Scan on fact tables in EXPLAIN when btree indexes exist on join/filter
+  columns. The default random_page_cost=4.0 assumes spinning disk — on SSD the actual
+  cost ratio is ~1.1. Combined with effective_cache_size, the optimizer tips to index scans.
+  These two parameters have a nonlinear interaction — neither alone is sufficient.
+
+  Decision gates:
+  - Storage is SSD (not spinning disk)
+  - Seq Scan on fact table in EXPLAIN despite btree index on join/filter columns
+  - Buffer cache warm (shared_buffers + OS cache covers working set)
+
+  Wins: 6 validated (+46.0%–+89.0%, avg +71.1%). Rescued 3 rewrite regressions
+  (0.61x→9.09x, 0.51x→5.95x, 0.30x→1.85x).
+
+### C3: Parallelism underutilized on large scans [MOST VERSATILE]
+
+  Mechanism: SET LOCAL max_parallel_workers_per_gather = '4';
+             SET LOCAL parallel_setup_cost = '100';
+             SET LOCAL parallel_tuple_cost = '0.001'
+  Signal: Large Seq Scan (>100K rows) without Gather/Parallel node above in EXPLAIN.
+  Prefer cost reduction (setup=100, tuple=0.001) over max_workers forcing alone.
+
+  Decision gates:
+  - Seq Scan > 100K rows without parallel workers
+  - Query execution > 500ms (CRITICAL: never on fast queries)
+  - DANGER: 7.34x REGRESSION observed when forced on 244ms query
+  - DANGER: par4-alone caused -15.3% — must include work_mem=512MB
+  - par4 alone insufficient for hash-heavy queries — combine with work_mem (C4)
+
+  Wins (standalone): 5 validated (+6.2%–+28.2%, avg +14.3%). Also in 10+ combo wins.
+
+### C4: Hash/sort spilling to disk [TARGETED]
+
+  Mechanism: SET LOCAL work_mem = '256MB' or '512MB'
+  Signal: Hash Batches > 1 or Sort Space Type = 'Disk' in EXPLAIN ANALYZE.
+  Size by op count: ≤2 ops → 512MB, 3-5 → 256MB, 6+ → 128MB.
+  work_mem is per-operation — count sort+hash nodes before sizing.
+
+  Decision gates:
+  - Hash Batches > 1 OR Sort Space = 'Disk' in EXPLAIN
+  - Count sort+hash ops in EXPLAIN to size appropriately
+  - Often needs par4 (C3) to realize full benefit
+
+  Wins: 4 validated (+11.4%–+41.5%, avg +21.7%)
+
+### C5: Nested loop on large join inputs [HIGH IMPACT hint]
+
+  Mechanism: /*+ Set(enable_nestloop off) */
+  Signal: Nested Loop in EXPLAIN with >10K rows on both sides. NL is O(N×M)
+  when both inputs are large — hash join is O(N+M) with equi-join condition.
+
+  Decision gates:
+  - Nested Loop in EXPLAIN with both inputs > 10K rows
+  - Equi-join condition exists (hash join is viable alternative)
+  - NOT correlated subquery (NL is correct there — use P2 decorrelation instead)
+  - DANGER: NL_off caused -1454% regression — never on queries where NL is correct
+
+  Wins: 3 validated (+42.5%–+81.3%, avg +60.4%)
+
+### C6: Sort overhead on pre-ordered data [RARE]
+
+  Mechanism: SET LOCAL enable_sort = 'off'
+  Signal: Sort node in EXPLAIN on data that is already index-ordered or where
+  hash-based aggregation would be cheaper. Forces hash-based execution paths.
+
+  Decision gates:
+  - Sort node in EXPLAIN with input from index scan (already ordered)
+  - Or Sort node where hash aggregation is viable alternative
+  - High variance observed (3.2-7.7%) — validate carefully
+
+  Wins: 2 validated (+4.7%–+68.2%, avg +36.5%)
+
+---
+
+## SAFETY RANKING
+
+| Rank | Pattern | Regr. | Worst | Action |
+|------|---------|-------|-------|--------|
+| 1 | P6: Date CTE isolation | 0 | — | Always fix (zero regressions) |
+| 2 | P3: Repeated scans | 0 | — | Always fix (verify agg type) |
+| 3 | P4: Non-equi prefilter | 0 | — | Always fix |
+| 4 | C2: SSD cost model (rpc+cache) | 0 | — | Always apply on SSD (zero regressions) |
+| 5 | C4: work_mem for spills | 0 | — | Size by op count (zero regressions) |
+| 6 | C6: Sort disable | 0 | — | Rare, validate carefully |
+| 7 | P1: Comma join + CTE | 1 | 0.88x | Fix when comma joins present |
+| 8 | C1: Merge join disable | 0 | — | Only when Sort+MJ visible in EXPLAIN |
+| 9 | P5: Set operation | 1 | 0.75x | Check direction (INTERSECT vs EXISTS) |
+| 10 | C5: Nested loop disable | 1 | -1454% | ONLY when NL on large inputs, never on correlated |
+| 11 | P2: Correlated subquery | 2 | 0.51x | Check EXPLAIN, never on EXISTS |
+| 12 | C3: Forced parallelism | 1 | 7.34x regr | NEVER on queries < 500ms |
+| 13 | P7: Multi-dim prefetch | 2 | 0.25x | Star schema only, not self-join |
+
+## VERIFICATION CHECKLIST
+
+Before finalizing any rewrite:
+- [ ] AS MATERIALIZED used on all decorrelation CTEs (prevents re-correlation)
+- [ ] EXISTS/NOT EXISTS still uses EXISTS (not materialized into CTE)
+- [ ] OR conditions on indexed columns still intact (not split to UNION)
+- [ ] Comma joins converted to explicit INNER JOIN
+- [ ] Parallel execution not blocked by unnecessary CTE materialization
+- [ ] No orphaned CTEs (every CTE referenced downstream)
+- [ ] NULL semantics preserved in NOT IN conversions
+- [ ] Row counts decrease monotonically through CTE chain
+- [ ] Max 2 cascading fact-table CTE chains
+- [ ] Rewrite doesn't match any REGRESSION REGISTRY pattern
+- [ ] Config: query execution > 500ms before applying parallelism (C3)
+- [ ] Config: EXPLAIN gap validated by 3-race (EXPLAIN ≠ runtime — 6 false positives caught)
+- [ ] Config: work_mem sized by sort+hash op count, not query complexity
+- [ ] Config: hint disable (MJ/NL/sort off) only when EXPLAIN shows the problematic operator
+
+## PRUNING GUIDE
+
+Skip pathologies the plan rules out:
+
+| Plan shows | Skip |
+|---|---|
+| No comma joins (all explicit JOINs) | P1 (comma join fix) |
+| No nested loops on large tables | P2 (decorrelation) |
+| Each table appears once | P3 (repeated scans) |
+| No non-equi joins (BETWEEN, <, >) | P4 (non-equi prefilter) |
+| No INTERSECT/EXCEPT and no correlated multi-channel EXISTS | P5 (set operation) |
+| Single date_dim reference | P6 (date consolidation) |
+| No GROUP BY or only 1 dimension filter | P7 (multi-dim prefetch) |
+| Baseline < 100ms | ALL CTE-based transforms |
+| Bitmap OR scan present | OR→UNION rewrites |
+| Parallel workers active + query fast | CTE-heavy transforms |
+
+## REGRESSION REGISTRY
+
+| Severity | Transform | Result | Root cause |
+|----------|-----------|--------|------------|
+| CATASTROPHIC | cte_inlining | 0.16x | Inlined large UNION CTE → 6 fact scans re-executed 2x each |
+| SEVERE | multi_dim_prefetch | 0.15x | CTEs blocked date-predicate pushdown on 90-day interval join |
+| SEVERE | dimension_prefetch | 0.25x | Applied star-schema pattern to 6-way self-join → parallelism destroyed |
+| MAJOR | cte_materialization | 0.30x | Multi-scan CTE overhead similar to above cte_inlining pattern |
+| MAJOR | early_fact_filtering | 0.51x | Disabled nestloop too aggressively + DISTINCT forced hash spill |
+| MAJOR | date_cte_prefetch | 0.75x | Over-materialized date CTE in EXISTS path → destroyed semi-join |
+| MODERATE | explicit_join | 0.88x | Explicit join conversion overhead exceeded benefit on simple query |
+| CATASTROPHIC | forced_parallelism (C3) | 7.34x regr | Worker startup + coordination overhead on 244ms query. NEVER force par on < 500ms |
+| CATASTROPHIC | enable_nestloop_off (C5) | -1454% | NL was correct plan. Disabling forced catastrophic merge/hash on unsuitable query |
+| MAJOR | geqo_off | -254% | Exhaustive planner found "better" cost plan on 19 joins but cardinality errors made it catastrophic |
+| MAJOR | par4_without_wm | -15.3% | Parallelism without sufficient work_mem causes hash spill under parallel execution |
+
+
+### System Resource Envelope (PostgreSQL)
+
+Workers will use this to size SET LOCAL parameters for their rewrites. Included here for your awareness — you do NOT output config. Each worker decides its own per-rewrite config.
+
+Memory budget: shared_buffers=128MB, effective_cache_size=4GB
+Global work_mem: 4MB (per-operation)
+Active connections: ~1 (work_mem headroom: safe up to 16MB per-op)
+Storage: HDD (random_page_cost=4.0)
+Parallel capacity: max_parallel_workers=8, per_gather=2
+
+SET LOCAL permissions:
+  user-level (always available): effective_cache_size, enable_hashjoin, enable_mergejoin, enable_nestloop, enable_seqscan, from_collapse_limit, geqo_threshold, hash_mem_multiplier, jit, jit_above_cost, join_collapse_limit, max_parallel_workers_per_gather, parallel_setup_cost, parallel_tuple_cost, random_page_cost, work_mem
+
+## §5a. Transform Catalog
+
+Select 4 transforms that are applicable to THIS query, maximizing structural diversity (each must attack a different part of the execution plan).
+
+### Predicate Movement
+- **global_predicate_pushdown**: Trace selective predicates from late in the CTE chain back to the earliest scan via join equivalences. Biggest win when a dimension filter is applied after a large intermediate materialization.
+  Maps to examples: pushdown, early_filter, date_cte_isolate
+- **transitive_predicate_propagation**: Infer predicates through join equivalence chains (A.key = B.key AND B.key = 5 -> A.key = 5). Especially across CTE boundaries where optimizers stop propagating.
+  Maps to examples: early_filter, dimension_cte_isolate
+- **null_rejecting_join_simplification**: When downstream WHERE rejects NULLs from the outer side of a LEFT JOIN, convert to INNER. Enables reordering and predicate pushdown. CHECK: does the query actually have LEFT/OUTER joins before assigning this.
+  Maps to examples: (no direct gold example — novel transform)
+
+### Join Restructuring
+- **self_join_elimination**: When a UNION ALL CTE is self-joined N times with each join filtering to a different discriminator, split into N pre-partitioned CTEs. Eliminates discriminator filtering and repeated hash probes on rows that don't match.
+  Maps to examples: union_cte_split, shared_dimension_multi_channel
+- **decorrelation**: Convert correlated EXISTS/IN/scalar subqueries to CTE + JOIN. CHECK: does the query actually have correlated subqueries before assigning this.
+  Maps to examples: decorrelate, composite_decorrelate_union
+- **aggregate_pushdown**: When GROUP BY follows a multi-table join but aggregation only uses columns from one side, push the GROUP BY below the join. CHECK: verify the join doesn't change row multiplicity for the aggregate (one-to-many breaks AVG/STDDEV).
+  Maps to examples: (no direct gold example — novel transform)
+- **late_attribute_binding**: When a dimension table is joined only to resolve display columns (names, descriptions) that aren't used in filters, aggregations, or join conditions, defer that join until after all filtering and aggregation is complete. Join on the surrogate key once against the final reduced result set. This eliminates N-1 dimension scans when the CTE references the dimension N times. CHECK: verify the deferred columns aren't used in WHERE, GROUP BY, or JOIN ON — only in the final SELECT.
+  Maps to examples: dimension_cte_isolate (partial pattern), early_filter
+
+### Scan Optimization
+- **star_join_prefetch**: Pre-filter ALL dimension tables into CTEs, then probe fact table with the combined key intersection.
+  Maps to examples: dimension_cte_isolate, multi_dimension_prefetch, prefetch_fact_join, date_cte_isolate
+- **single_pass_aggregation**: Merge N subqueries on the same fact table into 1 scan with CASE/FILTER inside aggregates. CHECK: STDDEV_SAMP/VARIANCE are grouping-sensitive — FILTER over a combined group != separate per-group computation.
+  Maps to examples: single_pass_aggregation, channel_bitmap_aggregation
+- **scan_consolidation_pivot**: When a CTE is self-joined N times with each reference filtering to a different discriminator (e.g., year, channel), consolidate into fewer scans that GROUP BY the discriminator, then pivot rows to columns using MAX(CASE WHEN discriminator = X THEN agg_value END). This halves the fact scans and dimension joins. SAFE when GROUP BY includes the discriminator — each group is naturally partitioned, so aggregates like STDDEV_SAMP are computed correctly per-partition. The pivot MAX is just a row selector (one row per group), not a real aggregation.
+  Maps to examples: single_pass_aggregation, union_cte_split
+
+### Structural Transforms
+- **union_consolidation**: Share dimension lookups across UNION ALL branches that scan different fact tables with the same dim joins.
+  Maps to examples: shared_dimension_multi_channel
+- **window_optimization**: Push filters before window functions when they don't affect the frame. Convert ROW_NUMBER + filter to LATERAL + LIMIT. Merge same-PARTITION windows into one sort pass.
+  Maps to examples: deferred_window_aggregation
+- **exists_restructuring**: Convert INTERSECT to EXISTS for semi-join short-circuit, or restructure complex EXISTS with shared CTEs. CHECK: does the query actually have INTERSECT or complex EXISTS.
+  Maps to examples: intersect_to_exists, multi_intersect_exists_cte
+
+## §6. REASONING PROCESS
+
+First, use a `<reasoning>` block for your internal analysis. This will be stripped before parsing. Work through these steps IN ORDER:
+
+1. **CLASSIFY**: What structural archetype is this query?
+   (channel-comparison self-join / correlated-aggregate filter / star-join with late dim filter / repeated fact scan / multi-channel UNION ALL / EXISTS-set operations / other)
+
+2. **EXPLAIN PLAN ANALYSIS**: From the EXPLAIN ANALYZE output, identify:
+   - Compute wall-clock ms per EXPLAIN node. Sum repeated operations (e.g., 2x store_sales joins = total cost). The EXPLAIN is ground truth, not the logical-tree cost percentages.
+   - Which nodes consume >10% of runtime and WHY
+   - Where row counts drop sharply (existing selectivity)
+   - Where row counts DON'T drop (missed optimization opportunity)
+   - Whether the optimizer already splits CTEs, pushes predicates, or performs transforms you might otherwise assign
+   - Count scans per base table. If a fact table is scanned N times, a restructuring that reduces it to 1 scan saves (N-1)/N of that table's I/O cost. Prioritize transforms that reduce scan count on the largest tables.
+   - Whether the CTE is materialized once and probed multiple times, or re-executed per reference
+
+   **Q-ERROR ROUTING** (§2b-i): The cardinality estimation routing above identifies WHERE the planner is wrong (locus) and HOW (direction). This routing is 85% accurate at predicting where the winning transform operates.
+   - **Direction + Locus → Pathology routing**: This is the primary signal. Start your hypothesis from the routed pathologies.
+   - **Structural flags** (DELIM_SCAN, EST_ZERO, etc.) are direct transform triggers. DELIM_SCAN = correlated subquery → P2. EST_ZERO = CTE stats blind → P0/P7.
+   - **Ignore magnitude/severity** — Q-Error size does NOT predict optimization opportunity (win rate is flat across all severity levels).
+
+3. **BOTTLENECK HYPOTHESIS**: From your EXPLAIN observations in Step 2, reason
+   about WHY each bottleneck exists and what intervention could fix it.
+
+   **Start from Q-Error routing.** The §2b-i routing identified the planner's
+   worst mismatch direction+locus and mapped it to candidate pathologies.
+   Use this as your primary hypothesis anchor, then verify against the plan structure:
+
+   For the top 2-3 cost centers identified on the cost spine:
+
+   a) DIAGNOSE: What optimizer behavior causes this cost?
+      - What operation dominates? (scan, join, sort, aggregate, window)
+      - Is the input to this node larger than it needs to be? Why?
+      - Is the optimizer executing operations in a suboptimal order?
+      - Is work being repeated that could be done once?
+
+   b) HYPOTHESIZE: What SQL restructuring would change the physical plan?
+      - Scan dominates + low pruning ratio → predicate not reaching scan layer
+      - Same table scanned N times → consolidate into single scan + conditional agg
+      - Large intermediate + selective late filter → push predicate earlier in chain
+      - Nested loop on large table → decorrelate to CTE + hash join
+      - Aggregate input >> output after join → pre-aggregate before join
+      - CTE materialized but referenced once → inline as subquery
+      - Window computed in CTE before join → defer window to post-join
+      - OR across different columns + full scan → decompose into UNION ALL branches
+
+   c) CALIBRATE against engine knowledge (§4):
+      - If a documented gap matches your diagnosis: USE its evidence
+        (what_worked, what_didnt_work, field_notes, decision gates)
+        to sharpen your intervention. Follow its gates — they encode failures.
+      - If a strength matches what you'd rewrite: STOP — the optimizer already
+        handles it. Your rewrite adds overhead or destroys an optimization.
+      - If no gap matches: your hypothesis is novel — tag as UNVERIFIED_HYPOTHESIS
+        and proceed with structural reasoning only. Design a control variant
+        that tests the opposite assumption.
+
+4. **AGGREGATION TRAP CHECK**: For every aggregate function in the query, verify: does my proposed restructuring change which rows participate in each group? STDDEV_SAMP, VARIANCE, PERCENTILE_CONT, CORR are grouping-sensitive. SUM, COUNT, MIN, MAX are grouping-insensitive (modulo duplicates). If the query uses FILTER clauses or conditional aggregation, verify equivalence explicitly.
+
+5. **INTERVENTION DESIGN**: For each hypothesized bottleneck from Step 3,
+   design a transform:
+
+   a) Match the diagnosed optimizer behavior to a transform category in §5a
+      (missed pushdown → Predicate Movement, redundant scans → Scan Consolidation, etc.)
+   b) If engine evidence exists for the matched transform:
+      - Prefer the proven approach and follow documented gates
+      - Apply the transform's structural preconditions as hard constraints
+      - Use documented regressions as REJECTION criteria
+   c) If no evidence exists (UNVERIFIED_HYPOTHESIS):
+      - Design the intervention from the transform description + structural preconditions
+      - RANK by estimated impact: (scan reduction × table size) > (join reordering)
+        > (aggregation restructuring) > (window deferral)
+      - Include a rollback path — explain what makes this rewrite reversible
+   d) Assign 4 structurally diverse interventions. Each worker attacks a DIFFERENT
+      bottleneck or a different approach to the same bottleneck.
+      No two workers should apply the same transform to the same query region.
+
+6. **LOGICAL TREE DESIGN**: For each worker's strategy, define the target logical tree topology. Verify that every node contract has exhaustive output columns by checking downstream references.
+   CTE materialization matters for your design: a CTE referenced by 2+ consumers will likely be materialized (good — computed once, probed many). A CTE referenced once may be inlined (no materialization benefit from 'sharing'). Design shared CTEs only when multiple downstream nodes consume them. See CTE_INLINING in Engine Profile strengths.
+
+### Strategy Selection Rules
+
+1. **CHECK APPLICABILITY**: Each transform has a structural prerequisite (correlated subquery, UNION ALL CTE, LEFT JOIN, etc.). Verify the query actually has the prerequisite before assigning a transform. DO NOT assign decorrelation if there are no correlated subqueries.
+2. **CHECK OPTIMIZER OVERLAP**: Read the EXPLAIN plan. If the optimizer already performs a transform (e.g., already splits a UNION CTE, already pushes a predicate), that transform will have marginal benefit. Note this in your reasoning and prefer transforms the optimizer is NOT already doing.
+3. **MAXIMIZE DIVERSITY**: Each worker must attack a different part of the execution plan. Do not assign 'pushdown variant A' and 'pushdown variant B'. Assign transforms from different categories above.
+4. **ASSESS RISK PER-QUERY**: Risk is a function of (transform x query complexity), not an inherent property of the transform. Decorrelation is low-risk on a simple EXISTS and high-risk on nested correlation inside a CTE. Assess per-assignment.
+5. **COMPOSITION IS ALLOWED AND ENCOURAGED**: A strategy can combine 2-3 transforms from different categories (e.g., star_join_prefetch + scan_consolidation_pivot, or date_cte_isolate + early_filter + decorrelate). The TARGET_LOGICAL_TREE should reflect the combined structure. Compound strategies are often the source of the biggest wins.
+6. **MINIMAL-CHANGE BASELINE**: If the EXPLAIN shows the optimizer already handles the primary bottleneck (e.g., already splits CTEs, already pushes predicates), consider assigning one worker as a minimal-change baseline: explicit JOINs only, no structural changes. This provides a regression-safe fallback.
+
+Each worker gets 1-3 examples from the 'Maps to examples' notes in the Transform Catalog. The system auto-loads full before/after SQL for each assigned example. Do NOT pad with irrelevant examples — an irrelevant example is worse than no example.
+
+For TARGET_LOGICAL_TREE: Define the CTE structure you want produced. For NODE_CONTRACTS: Be exhaustive with OUTPUT columns — missing columns cause semantic breaks.
+
+## §7a. Output Format
+
+Then produce the structured briefing in EXACTLY this format:
+
+```
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT: (80-150 tokens, cover ONLY:)
+(a) One sentence of business intent (start from pre-computed intent if available).
+(b) JOIN type semantics that constrain rewrites (INNER = intersection = all sides must match).
+(c) Any aggregation function traps specific to THIS query.
+(d) Any filter dependencies that a rewrite could break.
+Do NOT repeat information already in ACTIVE_CONSTRAINTS or REGRESSION_WARNINGS.
+
+BOTTLENECK_DIAGNOSIS:
+[Which operation dominates cost and WHY (not just '50% cost').
+Scan-bound vs join-bound vs aggregation-bound.
+Cardinality flow (how many rows at each stage).
+What the optimizer already handles well (don't re-optimize).
+Whether logical-tree cost percentages are misleading.]
+
+ACTIVE_CONSTRAINTS:
+- [CORRECTNESS_CONSTRAINT_ID]: [Why it applies to this query, 1 line]
+- [ENGINE_GAP_ID]: [Evidence from EXPLAIN that this gap is active]
+(List all 4 correctness constraints + the 1-3 engine gaps that
+are active for THIS query based on your EXPLAIN analysis.)
+
+REGRESSION_WARNINGS:
+1. [Pattern name] ([observed regression]):
+   CAUSE: [What happened mechanistically]
+   RULE: [Actionable avoidance rule for THIS query]
+(If no regression warnings are relevant, write 'None applicable.')
+
+NODE_CONTRACTS: Write all fields as SQL fragments, not natural language. Example: `WHERE: d_year IN (1999, 2000)` not `WHERE: filter to target years`. Workers use these as specifications to code against.
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: [strategy_name]
+TARGET_LOGICAL_TREE:
+  [node] -> [node] -> [node]
+NODE_CONTRACTS:
+  [node_name]:
+    FROM: [tables/CTEs]
+    JOIN: [join conditions]
+    WHERE: [filters]
+    GROUP BY: [columns] (if applicable)
+    AGGREGATE: [functions] (if applicable)
+    OUTPUT: [exhaustive column list]
+    EXPECTED_ROWS: [approximate row count from EXPLAIN analysis]
+    CONSUMERS: [downstream nodes]
+EXAMPLES: [ex1], [ex2], [ex3]
+EXAMPLE_ADAPTATION:
+  [For each: what to apply, what to IGNORE for this strategy.]
+HAZARD_FLAGS:
+- [Specific risk for this approach on this query]
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: [strategy_name]
+TARGET_LOGICAL_TREE:
+  [node] -> [node] -> [node]
+NODE_CONTRACTS:
+  [node_name]:
+    FROM: [tables/CTEs]
+    JOIN: [join conditions]
+    WHERE: [filters]
+    GROUP BY: [columns] (if applicable)
+    AGGREGATE: [functions] (if applicable)
+    OUTPUT: [exhaustive column list]
+    EXPECTED_ROWS: [approximate row count from EXPLAIN analysis]
+    CONSUMERS: [downstream nodes]
+EXAMPLES: [ex1], [ex2], [ex3]
+EXAMPLE_ADAPTATION:
+  [For each: what to apply, what to IGNORE for this strategy.]
+HAZARD_FLAGS:
+- [Specific risk for this approach on this query]
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: [strategy_name]
+TARGET_LOGICAL_TREE:
+  [node] -> [node] -> [node]
+NODE_CONTRACTS:
+  [node_name]:
+    FROM: [tables/CTEs]
+    JOIN: [join conditions]
+    WHERE: [filters]
+    GROUP BY: [columns] (if applicable)
+    AGGREGATE: [functions] (if applicable)
+    OUTPUT: [exhaustive column list]
+    EXPECTED_ROWS: [approximate row count from EXPLAIN analysis]
+    CONSUMERS: [downstream nodes]
+EXAMPLES: [ex1], [ex2], [ex3]
+EXAMPLE_ADAPTATION:
+  [For each: what to apply, what to IGNORE for this strategy.]
+HAZARD_FLAGS:
+- [Specific risk for this approach on this query]
+
+=== WORKER 4 BRIEFING === (EXPLORATION WORKER)
+
+STRATEGY: [strategy_name]
+TARGET_LOGICAL_TREE:
+  [node] -> [node] -> [node]
+NODE_CONTRACTS:
+  [node_name]:
+    FROM: [tables/CTEs]
+    JOIN: [join conditions]
+    WHERE: [filters]
+    GROUP BY: [columns] (if applicable)
+    AGGREGATE: [functions] (if applicable)
+    OUTPUT: [exhaustive column list]
+    EXPECTED_ROWS: [approximate row count from EXPLAIN analysis]
+    CONSUMERS: [downstream nodes]
+EXAMPLES: [ex1], [ex2], [ex3]
+EXAMPLE_ADAPTATION:
+  [For each: what to apply, what to IGNORE for this strategy.]
+HAZARD_FLAGS:
+- [Specific risk for this approach on this query]
+CONSTRAINT_OVERRIDE: [CONSTRAINT_ID or 'None']
+OVERRIDE_REASONING: [Why this query's structure differs from the observed failure, or 'N/A']
+EXPLORATION_TYPE: [constraint_relaxation | compound_strategy | novel_combination]
+HYPOTHESIS_TAG: [H1_CTE_PREDICATE_FENCE | H2_JOIN_ORDER | ... | NOVEL_<description>]
+
+```
+
+## Section Validation Checklist (MUST pass before final output)
+
+### SHARED BRIEFING
+- `SEMANTIC_CONTRACT`: 30-250 tokens covering business intent, JOIN semantics, aggregation trap, filter dependency.
+- `BOTTLENECK_DIAGNOSIS`: dominant mechanism, bound type (`scan-bound`/`join-bound`/`aggregation-bound`), what optimizer already handles.
+- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs + 0-3 engine gap or hypothesis IDs with EXPLAIN evidence.
+- `REGRESSION_WARNINGS`: `None applicable.` or entries with `CAUSE:` and `RULE:`.
+
+### WORKER N BRIEFING (N=1..4)
+- `STRATEGY`: non-empty, unique across workers.
+- `TARGET_LOGICAL_TREE`: explicit node chain. `NODE_CONTRACTS`: every logical tree node has a contract with FROM, OUTPUT, CONSUMERS.
+- `EXAMPLES`: 1-3 IDs. `EXAMPLE_ADAPTATION`: what to adapt/ignore per example.
+- `HAZARD_FLAGS`: query-specific risks, not generic cautions.
+
+### WORKER 4 EXPLORATION FIELDS
+- Includes `CONSTRAINT_OVERRIDE`, `OVERRIDE_REASONING`, `EXPLORATION_TYPE`, and `HYPOTHESIS_TAG`.
+
+## §7c. Worker 4 Exploration Rules
+
+Workers 1-3 follow the engine profile's proven patterns. **Worker 4 is the EXPLORATION worker** with a different mandate:
+
+Worker 4 MAY (in priority order — prefer higher-value exploration):
+  (c) **PREFERRED**: Attempt a novel technique not listed in the engine profile, if the EXPLAIN plan reveals an optimizer blind spot not yet documented. This is the highest-value exploration — new discoveries expand the engine profile for all future queries.
+  (b) Combine 2-3 transforms from different engine gaps into a compound strategy that hasn't been tested before. Medium value — tests interaction effects between known patterns.
+  (a) Retry a technique from 'what_didnt_work', IF the structural context of THIS query differs materially from the observed failure — explain the structural difference in HAZARD_FLAGS. Lowest priority — only when the query structure clearly diverges from the failed case.
+
+Worker 4 may NEVER violate correctness constraints (LITERAL_PRESERVATION, SEMANTIC_EQUIVALENCE, COMPLETE_OUTPUT, CTE_COLUMN_COMPLETENESS).
+
+The exploration worker's output is tagged EXPLORATORY and tracked separately. Past failures documented in the engine profile are context-specific — they happened on specific queries with specific structures. Worker 4's job is to test whether those failures generalize or not. If Worker 4 discovers a new win, it becomes field intelligence for the engine profile.
+
+## §7d. Output Consumption Spec
+
+Each worker receives: SHARED BRIEFING + their WORKER N BRIEFING + full before/after SQL for assigned examples + original SQL + output format.
+Workers do NOT see other workers' briefings.

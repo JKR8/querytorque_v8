@@ -66,6 +66,14 @@ class Settings(BaseSettings):
     pattern_selector_model: str = "qwen2.5-coder:14b-instruct-q4_K_M"
     pattern_selector_api_key: str = ""
 
+    # Snowflake connection
+    snowflake_account: str = ""
+    snowflake_user: str = ""
+    snowflake_password: str = ""
+    snowflake_warehouse: str = ""
+    snowflake_database: str = ""
+    snowflake_schema: str = ""
+
     class Config:
         env_prefix = "QT_"
         env_file = ".env"

@@ -1,23 +1,7 @@
 import { useNavigate } from 'react-router-dom'
-import { useAuth0 } from '@auth0/auth0-react'
-import { isAuthConfigured } from '@/config'
 
 export default function HomePage() {
   const navigate = useNavigate()
-  const authEnabled = isAuthConfigured()
-  const auth0 = authEnabled ? useAuth0() : null
-  const { isAuthenticated, loginWithRedirect } = auth0 || {
-    isAuthenticated: false,
-    loginWithRedirect: () => {},
-  }
-
-  const handleGetStarted = () => {
-    if (authEnabled && !isAuthenticated) {
-      loginWithRedirect()
-    } else {
-      navigate('/editor')
-    }
-  }
 
   return (
     <div className="home-page">
@@ -29,31 +13,31 @@ export default function HomePage() {
           <span>Query Torque SQL</span>
         </div>
 
-        {authEnabled && !isAuthenticated ? (
-          <button className="btn btn-primary" onClick={() => loginWithRedirect()}>
-            Sign In
+        <div className="home-nav">
+          <button className="btn btn-secondary" onClick={() => navigate('/editor')}>
+            Editor
           </button>
-        ) : authEnabled ? (
-          <button className="btn btn-primary" onClick={() => navigate('/editor')}>
-            Open Editor
+          <button className="btn btn-primary" onClick={() => navigate('/batch')}>
+            Batch
           </button>
-        ) : (
-          <button className="btn btn-primary" onClick={() => navigate('/editor')}>
-            Open Editor
-          </button>
-        )}
+        </div>
       </header>
 
       <main className="home-main">
         <section className="hero">
-          <h1>SQL Performance Analysis</h1>
+          <h1>SQL Performance Optimization</h1>
           <p className="hero-subtitle">
-            Detect anti-patterns, optimize queries, and ship faster SQL.
-            Powered by 119+ detection rules and AI-assisted optimization.
+            Audit query plans, optimize with AI-powered rewriting, and validate results.
+            Powered by engine-specific pathology detection and a 4-worker swarm.
           </p>
-          <button className="btn btn-primary btn-lg" onClick={handleGetStarted}>
-            Get Started
-          </button>
+          <div className="hero-actions">
+            <button className="btn btn-primary btn-lg" onClick={() => navigate('/editor')}>
+              Open Editor
+            </button>
+            <button className="btn btn-secondary btn-lg" onClick={() => navigate('/batch')}>
+              Batch Process
+            </button>
+          </div>
         </section>
 
         <section className="features">
@@ -64,19 +48,18 @@ export default function HomePage() {
                 <path d="M21 21l-4.35-4.35" />
               </svg>
             </div>
-            <h3>Analyze</h3>
-            <p>Detect 119+ SQL anti-patterns including performance killers, security issues, and maintainability problems.</p>
+            <h3>Audit</h3>
+            <p>Run EXPLAIN ANALYZE, identify bottleneck operators, and name the pathology — free, no LLM needed.</p>
           </div>
 
           <div className="feature-card">
             <div className="feature-icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M12 20h9" />
-                <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
               </svg>
             </div>
             <h3>Optimize</h3>
-            <p>Get AI-powered optimization suggestions with validated fixes. No regressions, guaranteed equivalence.</p>
+            <p>4-worker swarm generates candidates, validates correctness via row-count + checksum, and races for speed.</p>
           </div>
 
           <div className="feature-card">
@@ -87,21 +70,21 @@ export default function HomePage() {
               </svg>
             </div>
             <h3>Validate</h3>
-            <p>Every optimization is validated for syntax, schema compliance, and semantic equivalence before acceptance.</p>
+            <p>Every optimization is benchmarked with 3-run averages or parallel races. No regressions shipped.</p>
           </div>
         </section>
 
         <section className="cta">
           <h2>Ready to optimize your SQL?</h2>
-          <p>Start analyzing your queries in seconds. No credit card required.</p>
-          <button className="btn btn-primary btn-lg" onClick={handleGetStarted}>
-            Try It Now
+          <p>Connect your database and start analyzing queries in seconds.</p>
+          <button className="btn btn-primary btn-lg" onClick={() => navigate('/editor')}>
+            Get Started
           </button>
         </section>
       </main>
 
       <footer className="home-footer">
-        <p>Query Torque SQL - Part of the QueryTorque Platform</p>
+        <p>QueryTorque SQL</p>
       </footer>
 
       <style>{`
@@ -135,6 +118,11 @@ export default function HomePage() {
           color: var(--qt-info);
         }
 
+        .home-nav {
+          display: flex;
+          gap: 0.5rem;
+        }
+
         .home-main {
           flex: 1;
           max-width: 1200px;
@@ -160,6 +148,12 @@ export default function HomePage() {
           max-width: 600px;
           margin: 0 auto 2rem;
           line-height: 1.6;
+        }
+
+        .hero-actions {
+          display: flex;
+          gap: 1rem;
+          justify-content: center;
         }
 
         .features {

@@ -1,0 +1,202 @@
+### SHARED BRIEFING
+
+**SEMANTIC_CONTRACT**: This query counts store sales transactions within specific 30-minute intervals for store 'ese' that meet household demographic conditions (dep_count = -1, 3, or 4 with corresponding vehicle_count thresholds). All joins are INNER = transactions must match all dimension tables. Output preserves 8 distinct count columns with original names/literals. Aggregation uses simple COUNTs (safe for restructuring).
+
+**BOTTLENECK_DIAGNOSIS**: Scan-bound on store_sales (1.25TB scanned) dominates cost. Optimizer merged 8 subqueries into 1 scan with conditional aggregation (good), but:  
+1) Household_demographics filters applied AFTER store_sales scan/aggregation  
+2) Time_dim filters use disjunctive ORs (8 intervals)  
+3) Store filter applied late  
+Row flow: 125B rows → 72K rows after bloom filter → 72K rows after aggregation → 1 row. Optimizer handles bloom filtering and conditional aggregation well.
+
+**ACTIVE_CONSTRAINTS**:  
+- COMPLETE_OUTPUT: Must preserve 8 count columns with original names  
+- CTE_COLUMN_COMPLETENESS: CTEs must output all join keys + filter columns  
+- LITERAL_PRESERVATION: Exact store name 'ese' and numeric filters (-1,2,3,4)  
+- SEMANTIC_EQUIVALENCE: Maintain INNER join semantics  
+- H4_AGGREGATE_BELOW_JOIN: Aggregation keys ⊇ join keys (ss_store_sk, ss_hdemo_sk)  
+- H1_CTE_PREDICATE_FENCE: Selective filters (store, household) not pushed into CTE  
+- H5_COLUMN_PRUNING_FAILURE: store_sales scan reads 3 columns (optimized)
+
+**REGRESSION_WARNINGS**:  
+1. Single-pass aggregation with FILTER (Q22 regression):  
+   CAUSE: FILTER changes STDDEV_SAMP denominator vs separate groups  
+   RULE: Use CASE inside COUNT, not FILTER, since groups are disjoint  
+2. Late dimension join (Q67 regression):  
+   CAUSE: Deferring household_demographics join broke AVG reconstruction  
+   RULE: Join dimensions BEFORE aggregation if using AVG/STDDEV  
+
+### WORKER 1 BRIEFING
+
+**STRATEGY**: star_join_prefetch  
+**TARGET_LOGICAL_TREE**:  
+```
+filtered_store → filtered_household → prefetched_keys → sales_time_agg → final_pivot
+```  
+**NODE_CONTRACTS**:  
+- filtered_store:  
+  FROM: store  
+  WHERE: s_store_name = 'ese'  
+  OUTPUT: s_store_sk  
+  EXPECTED_ROWS: 1 (store)  
+  CONSUMERS: prefetched_keys  
+- filtered_household:  
+  FROM: household_demographics  
+  WHERE: (hd_dep_count = -1 AND hd_vehicle_count <= 1) OR (hd_dep_count = 3 AND hd_vehicle_count <= 5) OR (hd_dep_count = 4 AND hd_vehicle_count <= 6)  
+  OUTPUT: hd_demo_sk  
+  EXPECTED_ROWS: ~10K (33% of 30K)  
+  CONSUMERS: prefetched_keys  
+- prefetched_keys:  
+  FROM: store_sales  
+  JOIN: ss_store_sk = filtered_store.s_store_sk, ss_hdemo_sk = filtered_household.hd_demo_sk  
+  OUTPUT: ss_sold_time_sk  
+  EXPECTED_ROWS: ~24K (33% of 72K)  
+  CONSUMERS: sales_time_agg  
+- sales_time_agg:  
+  FROM: prefetched_keys JOIN time_dim ON ss_sold_time_sk = t_time_sk  
+  AGGREGATE: COUNT(CASE WHEN (t_hour=8 AND t_minute>=30) THEN 1 END) AS h8_30_to_9, ... (7 more)  
+  OUTPUT: h8_30_to_9, h9_to_9_30, ..., h12_to_12_30  
+  EXPECTED_ROWS: 1  
+  CONSUMERS: final_pivot  
+**EXAMPLES**: dimension_cte_isolate, multi_dimension_prefetch  
+**EXAMPLE_ADAPTATION**: Use dimension_cte_isolate for store/household prefetch. Ignore date handling from examples.  
+**HAZARD_FLAGS**:  
+- Household condition uses ORs – verify all 3 cases preserved  
+- Time conditions must remain disjoint to prevent double-counting  
+**CONSTRAINT_OVERRIDE**: None  
+**EXPLORATION_TYPE**: compound_strategy  
+**HYPOTHESIS_TAG**: H1_CTE_PREDICATE_FENCE + H4_AGGREGATE_BELOW_JOIN  
+**HYPOTHESIS**: Pushing store/household filters into CTEs enables early fact table reduction.  
+**EVIDENCE**: EXPLAIN shows household filter applied AFTER store_sales scan (node 8).  
+**EXPECTED_MECHANISM**: Pre-filtered dimension CTEs → smaller hash tables → earlier store_sales row elimination via join.  
+**CONTROL_SIGNAL**: If filtered_household row count > 15K or prefetched_keys rows > 50K, hypothesis fails.  
+
+### WORKER 2 BRIEFING
+
+**STRATEGY**: single_pass_aggregation  
+**TARGET_LOGICAL_TREE**:  
+```
+time_buckets → sales_agg → final
+```  
+**NODE_CONTRACTS**:  
+- time_buckets:  
+  FROM: time_dim  
+  WHERE: (t_hour=8 AND t_minute>=30) OR (t_hour=9 AND t_minute<30) OR ... (all 8 conditions)  
+  OUTPUT: t_time_sk, 
+    CASE WHEN (t_hour=8 AND t_minute>=30) THEN 1
+         WHEN (t_hour=9 AND t_minute<30) THEN 2 
+         ... END AS interval_id  
+  EXPECTED_ROWS: ~187K (1/6 of 1.1M)  
+  CONSUMERS: sales_agg  
+- sales_agg:  
+  FROM: store_sales  
+  JOIN: time_buckets ON ss_sold_time_sk = t_time_sk  
+  JOIN: store ON ss_store_sk = s_store_sk  
+  JOIN: household_demographics ON ss_hdemo_sk = hd_demo_sk  
+  WHERE: store.s_store_name = 'ese' 
+    AND (household filters)  
+  GROUP BY: interval_id  
+  AGGREGATE: COUNT(*) AS cnt  
+  OUTPUT: interval_id, cnt  
+  EXPECTED_ROWS: 8  
+  CONSUMERS: final  
+- final:  
+  FROM: sales_agg  
+  OUTPUT: MAX(CASE interval_id WHEN 1 THEN cnt END) AS h8_30_to_9, ...  
+  EXPECTED_ROWS: 1  
+**EXAMPLES**: single_pass_aggregation, channel_bitmap_aggregation  
+**EXAMPLE_ADAPTATION**: Use single_pass_aggregation's CASE grouping. Ignore bitmap techniques.  
+**HAZARD_FLAGS**:  
+- Verify interval_id covers all 8 cases exclusively  
+- Household OR conditions must not be simplified  
+**CONSTRAINT_OVERRIDE**: None  
+**EXPLORATION_TYPE**: constraint_relaxation  
+**HYPOTHESIS_TAG**: H4_AGGREGATE_BELOW_JOIN  
+**HYPOTHESIS**: Grouping by time interval ID enables single aggregation pass.  
+**EVIDENCE**: EXPLAIN already does conditional aggregation but with post-join household filters.  
+**EXPECTED_MECHANISM**: Early time categorization + dimension join before aggregation reduces intermediate rows.  
+**CONTROL_SIGNAL**: If sales_agg outputs ≠ 8 rows, time bucketing failed.  
+
+### WORKER 3 BRIEFING
+
+**STRATEGY**: predicate_propagation  
+**TARGET_LOGICAL_TREE**:  
+```
+filtered_sales → time_join → interval_agg → final
+```  
+**NODE_CONTRACTS**:  
+- filtered_sales:  
+  FROM: store_sales  
+  JOIN: store ON ss_store_sk = s_store_sk  
+  JOIN: household_demographics ON ss_hdemo_sk = hd_demo_sk  
+  WHERE: store.s_store_name = 'ese'  
+    AND (hd_dep_count = -1 AND hd_vehicle_count <= 1)  
+    OR (hd_dep_count = 3 AND hd_vehicle_count <= 5)  
+    OR (hd_dep_count = 4 AND hd_vehicle_count <= 6)  
+  OUTPUT: ss_sold_time_sk  
+  EXPECTED_ROWS: ~24K  
+  CONSUMERS: time_join  
+- time_join:  
+  FROM: filtered_sales JOIN time_dim ON ss_sold_time_sk = t_time_sk  
+  OUTPUT: ss_sold_time_sk, t_hour, t_minute  
+  EXPECTED_ROWS: ~24K  
+  CONSUMERS: interval_agg  
+- interval_agg:  
+  FROM: time_join  
+  AGGREGATE: COUNT_IF(t_hour=8 AND t_minute>=30) AS h8_30_to_9, ...  
+  OUTPUT: h8_30_to_9, h9_to_9_30, ..., h12_to_12_30  
+  EXPECTED_ROWS: 1  
+**EXAMPLES**: early_filter, transitive_predicate  
+**EXAMPLE_ADAPTATION**: Use early_filter's dimension join pushdown. Ignore date-specific logic.  
+**HAZARD_FLAGS**:  
+- Combined household OR condition must retain parentheses  
+- Do not push time filters into filtered_sales (breaks bloom filter)  
+**CONSTRAINT_OVERRIDE**: None  
+**EXPLORATION_TYPE**: novel_combination  
+**HYPOTHESIS_TAG**: NOVEL_PREDICATE_MIRRORING  
+**HYPOTHESIS**: Pushing store/household filters directly into fact table join reduces rows before time processing.  
+**EVIDENCE**: EXPLAIN applies household filter AFTER initial aggregation (node 8).  
+**EXPECTED_MECHANISM**: Early dimension join → smaller fact row set → cheaper time joins.  
+**CONTROL_SIGNAL**: If filtered_sales row count > 50K, predicate pushdown failed.  
+
+### WORKER 4 BRIEFING
+
+**STRATEGY**: late_household_binding  
+**TARGET_LOGICAL_TREE**:  
+```
+filtered_store → sales_time_agg → household_join → final
+```  
+**NODE_CONTRACTS**:  
+- filtered_store:  
+  FROM: store  
+  WHERE: s_store_name = 'ese'  
+  OUTPUT: s_store_sk  
+  EXPECTED_ROWS: 1  
+  CONSUMERS: sales_time_agg  
+- sales_time_agg:  
+  FROM: store_sales  
+  JOIN: filtered_store ON ss_store_sk = s_store_sk  
+  JOIN: time_dim ON ss_sold_time_sk = t_time_sk  
+  WHERE: (t_hour=8 AND t_minute>=30) OR ... (all 8)  
+  AGGREGATE: COUNT_IF(t_hour=8 AND t_minute>=30) AS h8_30_to_9, ...  
+  GROUP BY: ss_hdemo_sk  
+  OUTPUT: ss_hdemo_sk, h8_30_to_9, ...  
+  EXPECTED_ROWS: ~500 (distinct households)  
+  CONSUMERS: household_join  
+- household_join:  
+  FROM: sales_time_agg JOIN household_demographics ON ss_hdemo_sk = hd_demo_sk  
+  WHERE: (hd_dep_count = -1 AND hd_vehicle_count <=1) OR ...  
+  AGGREGATE: SUM(h8_30_to_9) AS h8_30_to_9, ...  
+  OUTPUT: h8_30_to_9, h9_to_9_30, ..., h12_to_12_30  
+  EXPECTED_ROWS: 1  
+**EXAMPLES**: deferred_window_aggregation, late_attribute_binding  
+**EXAMPLE_ADAPTATION**: Use late_attribute_binding's deferred dimension join.  
+**HAZARD_FLAGS**:  
+- SUM(COUNT) must equal original COUNT  
+- Verify household filter not applied before aggregation  
+**CONSTRAINT_OVERRIDE**: None  
+**EXPLORATION_TYPE**: compound_strategy  
+**HYPOTHESIS_TAG**: H4_AGGREGATE_BELOW_JOIN + H1_CTE_PREDICATE_FENCE  
+**HYPOTHESIS**: Deferring household join allows store/time filtering before aggregation.  
+**EVIDENCE**: EXPLAIN shows household filter prevents predicate pushdown.  
+**EXPECTED_MECHANISM**: Partial aggregation before household join → smaller working set.  
+**CONTROL_SIGNAL**: If sales_time_agg row count > 1K, aggregation pushdown failed.

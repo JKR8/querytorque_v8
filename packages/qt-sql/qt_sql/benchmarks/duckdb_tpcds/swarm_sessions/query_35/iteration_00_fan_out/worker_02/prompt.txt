@@ -4,313 +4,214 @@ DuckDB specifics: columnar storage (SELECT only needed columns). CTEs referenced
 
 ## Semantic Contract (MUST preserve)
 
-Profile household dependent metrics by state and demographics for customers who made store purchases in 2001 Q1-Q3 AND also purchased via web OR catalog in same period. JOIN semantics: INNER joins between customer/address/demographics require all three matches; EXISTS conditions act as semi-joins (customer must have at least one matching sale). Aggregation traps: COUNT(*), MAX, SUM on demographic counts are duplicate-safe (row multiplication from joins doesn't change results). Filter dependencies: d_year=2001 AND d_qoy<4 must apply to ALL three sales channels; customer must satisfy store_sales EXISTS AND (web_sales EXISTS OR catalog_sales EXISTS).
+Profile household dependent metrics by state and customer demographics for customers who purchased in-store during 2001 Q1-Q3 AND also purchased via web OR catalog in the same period. JOINs are INNER (all must match) with EXISTS semi-joins. Aggregation traps: MAX(cd_dep_count) appears twice (lines 7,9) - must preserve duplicate outputs. Filter dependencies: date_dim filters (d_year=2001, d_qoy<4) must apply identically across all sales channels.
 
 ## Target Logical Tree + Node Contracts
 
 Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
 
 TARGET_LOGICAL_TREE:
-date_filter -> store_customers -> web_customers -> catalog_customers -> or_customers -> customer_base -> aggregation -> top_n
-NODE_CONTRACTS:
-  date_filter:
-    FROM: date_dim
-    WHERE: d_year = 2001 AND d_qoy < 4
-    OUTPUT: d_date_sk
-    EXPECTED_ROWS: 274
-    CONSUMERS: store_customers, web_customers, catalog_customers
-  store_customers:
-    FROM: store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk
-    OUTPUT: DISTINCT ss_customer_sk as customer_sk
-    EXPECTED_ROWS: 200K
-    CONSUMERS: customer_base
-  web_customers:
-    FROM: web_sales JOIN date_filter ON ws_sold_date_sk = d_date_sk
-    OUTPUT: DISTINCT ws_bill_customer_sk as customer_sk
-    EXPECTED_ROWS: 324K
-    CONSUMERS: or_customers
-  catalog_customers:
-    FROM: catalog_sales JOIN date_filter ON cs_sold_date_sk = d_date_sk
-    OUTPUT: DISTINCT cs_ship_customer_sk as customer_sk
-    EXPECTED_ROWS: 635K
-    CONSUMERS: or_customers
-  or_customers:
-    FROM: (SELECT customer_sk FROM web_customers UNION SELECT customer_sk FROM catalog_customers)
-    OUTPUT: customer_sk
-    EXPECTED_ROWS: ~959K (union distinct)
-    CONSUMERS: customer_base
-  customer_base:
-    FROM: customer c
-          JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
-          JOIN customer_demographics cd ON cd_demo_sk = c.c_current_cdemo_sk
-          JOIN store_customers sc ON c.c_customer_sk = sc.customer_sk
-          JOIN or_customers oc ON c.c_customer_sk = oc.customer_sk
-    OUTPUT: ca.ca_state, cd.cd_gender, cd.cd_marital_status, cd.cd_dep_count, cd.cd_dep_employed_count, cd.cd_dep_college_count
-    EXPECTED_ROWS: ~200K
-    CONSUMERS: aggregation
-  aggregation: (same as Worker 1)
+date_range → customer_base → store_filtered → web_or_catalog_filtered → group_by  
+NODE_CONTRACTS:  
+date_range: (same as Worker 1)  
+
+customer_base:  
+  FROM: customer c  
+    JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk  
+    JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk  
+  OUTPUT: c_customer_sk, ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count  
+  EXPECTED_ROWS: 2M (SF10 customer)  
+  CONSUMERS: store_filtered  
+
+store_filtered:  
+  FROM: customer_base cb  
+  WHERE EXISTS (  
+    SELECT 1 FROM store_sales ss JOIN date_range dr ON ss_sold_date_sk = dr.d_date_sk  
+    WHERE ss.ss_customer_sk = cb.c_customer_sk  
+  )  
+  OUTPUT: All customer_base columns  
+  EXPECTED_ROWS: ~1.2M  
+  CONSUMERS: web_or_catalog_filtered  
+
+web_or_catalog_filtered:  
+  FROM: store_filtered sf  
+  WHERE EXISTS (  
+    SELECT 1 FROM web_sales ws JOIN date_range dr ON ws.ws_sold_date_sk = dr.d_date_sk  
+    WHERE ws.ws_bill_customer_sk = sf.c_customer_sk  
+  ) OR EXISTS (  
+    SELECT 1 FROM catalog_sales cs JOIN date_range dr ON cs.cs_sold_date_sk = dr.d_date_sk  
+    WHERE cs.cs_ship_customer_sk = sf.c_customer_sk  
+  )  
+  OUTPUT: All customer_base columns  
+  EXPECTED_ROWS: ~120K  
+  CONSUMERS: group_by  
+
+group_by: (same as Worker 1)
 
 NODE_CONTRACTS:
-date_filter:
-    FROM: date_dim
-    WHERE: d_year = 2001 AND d_qoy < 4
-    OUTPUT: d_date_sk
-    EXPECTED_ROWS: 274
-    CONSUMERS: store_customers, web_customers, catalog_customers
-  store_customers:
-    FROM: store_sales JOIN date_filter ON ss_sold_date_sk = d_date_sk
-    OUTPUT: DISTINCT ss_customer_sk as customer_sk
-    EXPECTED_ROWS: 200K
-    CONSUMERS: customer_base
-  web_customers:
-    FROM: web_sales JOIN date_filter ON ws_sold_date_sk = d_date_sk
-    OUTPUT: DISTINCT ws_bill_customer_sk as customer_sk
-    EXPECTED_ROWS: 324K
-    CONSUMERS: or_customers
-  catalog_customers:
-    FROM: catalog_sales JOIN date_filter ON cs_sold_date_sk = d_date_sk
-    OUTPUT: DISTINCT cs_ship_customer_sk as customer_sk
-    EXPECTED_ROWS: 635K
-    CONSUMERS: or_customers
-  or_customers:
-    FROM: (SELECT customer_sk FROM web_customers UNION SELECT customer_sk FROM catalog_customers)
-    OUTPUT: customer_sk
-    EXPECTED_ROWS: ~959K (union distinct)
-    CONSUMERS: customer_base
-  customer_base:
-    FROM: customer c
-          JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk
-          JOIN customer_demographics cd ON cd_demo_sk = c.c_current_cdemo_sk
-          JOIN store_customers sc ON c.c_customer_sk = sc.customer_sk
-          JOIN or_customers oc ON c.c_customer_sk = oc.customer_sk
-    OUTPUT: ca.ca_state, cd.cd_gender, cd.cd_marital_status, cd.cd_dep_count, cd.cd_dep_employed_count, cd.cd_dep_college_count
-    EXPECTED_ROWS: ~200K
-    CONSUMERS: aggregation
-  aggregation: (same as Worker 1)
+date_range: (same as Worker 1)  
+
+customer_base:  
+  FROM: customer c  
+    JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk  
+    JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk  
+  OUTPUT: c_customer_sk, ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count  
+  EXPECTED_ROWS: 2M (SF10 customer)  
+  CONSUMERS: store_filtered  
+
+store_filtered:  
+  FROM: customer_base cb  
+  WHERE EXISTS (  
+    SELECT 1 FROM store_sales ss JOIN date_range dr ON ss_sold_date_sk = dr.d_date_sk  
+    WHERE ss.ss_customer_sk = cb.c_customer_sk  
+  )  
+  OUTPUT: All customer_base columns  
+  EXPECTED_ROWS: ~1.2M  
+  CONSUMERS: web_or_catalog_filtered  
+
+web_or_catalog_filtered:  
+  FROM: store_filtered sf  
+  WHERE EXISTS (  
+    SELECT 1 FROM web_sales ws JOIN date_range dr ON ws.ws_sold_date_sk = dr.d_date_sk  
+    WHERE ws.ws_bill_customer_sk = sf.c_customer_sk  
+  ) OR EXISTS (  
+    SELECT 1 FROM catalog_sales cs JOIN date_range dr ON cs.cs_sold_date_sk = dr.d_date_sk  
+    WHERE cs.cs_ship_customer_sk = sf.c_customer_sk  
+  )  
+  OUTPUT: All customer_base columns  
+  EXPECTED_ROWS: ~120K  
+  CONSUMERS: group_by  
+
+group_by: (same as Worker 1)
 
 ## Hazard Flags (avoid these specific risks)
 
-- UNION with DISTINCT on web+catalog customers (959K rows) may be expensive
-- Must ensure JOIN order: store_customers (mandatory) INNER JOIN, then or_customers INNER JOIN
+- OR condition prevents channel consolidation  
+- EXISTS preserved to maintain semi-join semantics
 
 ## Regression Warnings (observed failures on similar queries)
 
-1. materialize_cte (observed regression 0.14x):
-   CAUSE: Converting EXISTS to materialized CTE forced full scan, destroying semi-join short-circuit
-   RULE: Never convert EXISTS used as filter into materialized CTE; preserve as semi-join
-2. or_to_union (observed regression 0.59x):
-   CAUSE: Splitting same-column OR conditions duplicated fact scans without selectivity benefit
-   RULE: Only split OR spanning different tables (web vs catalog); never split same-table OR
+1. Materialized EXISTS (0.14x):  
+   CAUSE: Converting EXISTS to materialized CTE destroys semi-join short-circuit  
+   RULE: Preserve EXISTS as semi-joins; use WHERE c.c_customer_sk IN (precomputed_keys)  
+2. Orphaned CTE (0.49x):  
+   CAUSE: Keeping original subquery alongside new CTE causes double materialization  
+   RULE: Remove original EXISTS after CTE replacement
 
 ## Constraints (analyst-filtered for this query)
 
-- COMPLETE_OUTPUT: Must output exactly 19 columns as in original SELECT lines 2-19.
-- CTE_COLUMN_COMPLETENESS: Any CTE must include customer_sk for joins and demographic columns for final GROUP BY.
-- LITERAL_PRESERVATION: d_year=2001 and d_qoy<4 must be preserved exactly.
-- SEMANTIC_EQUIVALENCE: Result set must match original's 100 rows with same ordering.
-- CROSS_CTE_PREDICATE_BLINDNESS: EXPLAIN shows date_dim scanned 3x (274 rows each) with same filter - predicate not shared.
-- CROSS_COLUMN_OR_DECOMPOSITION: OR condition spans web_sales and catalog_sales EXISTS on different tables.
+- COMPLETE_OUTPUT: Must preserve all 19 output columns including duplicate MAX()  
+- CTE_COLUMN_COMPLETENESS: Downstream GROUP BY references cd_dep_count, cd_dep_employed_count, cd_dep_college_count  
+- LITERAL_PRESERVATION: d_year=2001 and d_qoy<4 must remain unchanged  
+- SEMANTIC_EQUIVALENCE: EXISTS semi-join semantics critical for customer filtering  
+- CORRELATED_SUBQUERY_PARALYSIS (P2): EXPLAIN shows DELIM_SCAN for sales subqueries  
+- CROSS_CTE_PREDICATE_BLINDNESS (P0): Q-Error=ZERO_EST at CTE boundary
 
 ## Example Adaptation Notes
 
 For each example: what to apply to your rewrite, and what to ignore.
 
-composite_decorrelate_union: Apply the shared date filter CTE and separate customer key CTEs for each channel. Ignore the EXISTS decorrelation — optimizer already does semi-joins, but we're materializing distinct keys.
-  date_cte_isolate: Apply the date filter CTE pattern to share across channels.
-  decorrelate: Apply the decorrelation pattern by converting EXISTS to pre-materialized DISTINCT customer CTEs. Ignore the GROUP BY aspect — we use DISTINCT instead.
+- prefetch_fact_join: Push date_range to all subqueries but keep EXISTS  
+- dimension_cte_isolate: Pre-join customer/address/demographics
 
 ## Reference Examples
 
 Pattern reference only — do not copy table/column names or literals.
 
-### 1. composite_decorrelate_union (2.42x)
+### 1. prefetch_fact_join (3.77x)
 
-**Principle:** Composite Decorrelation: when multiple correlated EXISTS share common filters, extract shared dimensions into a single CTE and decorrelate the EXISTS checks into pre-materialized key sets joined via UNION.
+**Principle:** Staged Join Pipeline: build a CTE chain that progressively reduces data — first CTE filters the dimension, second CTE pre-joins filtered dimension keys with the fact table, subsequent CTEs join remaining dimensions against the already-reduced fact set.
 
 **BEFORE (slow):**
 ```sql
-select  
-  ca_state,
-  cd_gender,
-  cd_marital_status,
-  cd_dep_count,
-  count(*) cnt1,
-  max(cd_dep_count),
-  sum(cd_dep_count),
-  max(cd_dep_count),
-  cd_dep_employed_count,
-  count(*) cnt2,
-  max(cd_dep_employed_count),
-  sum(cd_dep_employed_count),
-  max(cd_dep_employed_count),
-  cd_dep_college_count,
-  count(*) cnt3,
-  max(cd_dep_college_count),
-  sum(cd_dep_college_count),
-  max(cd_dep_college_count)
- from
-  customer c,customer_address ca,customer_demographics
- where
-  c.c_current_addr_sk = ca.ca_address_sk and
-  cd_demo_sk = c.c_current_cdemo_sk and 
-  exists (select *
-          from store_sales,date_dim
-          where c.c_customer_sk = ss_customer_sk and
-                ss_sold_date_sk = d_date_sk and
-                d_year = 2001 and
-                d_qoy < 4) and
-   (exists (select *
-            from web_sales,date_dim
-            where c.c_customer_sk = ws_bill_customer_sk and
-                  ws_sold_date_sk = d_date_sk and
-                  d_year = 2001 and
-                  d_qoy < 4) or 
-    exists (select * 
-            from catalog_sales,date_dim
-            where c.c_customer_sk = cs_ship_customer_sk and
-                  cs_sold_date_sk = d_date_sk and
-                  d_year = 2001 and
-                  d_qoy < 4))
- group by ca_state,
-          cd_gender,
-          cd_marital_status,
-          cd_dep_count,
-          cd_dep_employed_count,
-          cd_dep_college_count
- order by ca_state,
-          cd_gender,
-          cd_marital_status,
-          cd_dep_count,
-          cd_dep_employed_count,
-          cd_dep_college_count
+select * 
+from (select i_manager_id
+             ,sum(ss_sales_price) sum_sales
+             ,avg(sum(ss_sales_price)) over (partition by i_manager_id) avg_monthly_sales
+      from item
+          ,store_sales
+          ,date_dim
+          ,store
+      where ss_item_sk = i_item_sk
+        and ss_sold_date_sk = d_date_sk
+        and ss_store_sk = s_store_sk
+        and d_month_seq in (1181,1181+1,1181+2,1181+3,1181+4,1181+5,1181+6,1181+7,1181+8,1181+9,1181+10,1181+11)
+        and ((    i_category in ('Books','Children','Electronics')
+              and i_class in ('personal','portable','reference','self-help')
+              and i_brand in ('scholaramalgamalg #14','scholaramalgamalg #7',
+		                  'exportiunivamalg #9','scholaramalgamalg #9'))
+           or(    i_category in ('Women','Music','Men')
+              and i_class in ('accessories','classical','fragrances','pants')
+              and i_brand in ('amalgimporto #1','edu packscholar #1','exportiimporto #1',
+		                 'importoamalg #1')))
+group by i_manager_id, d_moy) tmp1
+where case when avg_monthly_sales > 0 then abs (sum_sales - avg_monthly_sales) / avg_monthly_sales else null end > 0.1
+order by i_manager_id
+        ,avg_monthly_sales
+        ,sum_sales
  LIMIT 100;
 ```
 
 **AFTER (fast):**
 [filtered_dates]:
 ```sql
-SELECT d_date_sk FROM date_dim WHERE d_year = 2001 AND d_qoy < 4
-```
-[store_customers]:
-```sql
-SELECT DISTINCT ss_customer_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
-```
-[web_customers]:
-```sql
-SELECT DISTINCT ws_bill_customer_sk FROM web_sales JOIN filtered_dates ON ws_sold_date_sk = d_date_sk
-```
-[catalog_customers]:
-```sql
-SELECT DISTINCT cs_ship_customer_sk FROM catalog_sales JOIN filtered_dates ON cs_sold_date_sk = d_date_sk
-```
-[web_or_catalog_customers]:
-```sql
-SELECT ws_bill_customer_sk AS customer_sk FROM web_customers UNION SELECT cs_ship_customer_sk AS customer_sk FROM catalog_customers
-```
-[main_query]:
-```sql
-SELECT ca_state, cd_gender, cd_marital_status, cd_dep_count, COUNT(*) AS cnt1, MAX(cd_dep_count), SUM(cd_dep_count), MAX(cd_dep_count), cd_dep_employed_count, COUNT(*) AS cnt2, MAX(cd_dep_employed_count), SUM(cd_dep_employed_count), MAX(cd_dep_employed_count), cd_dep_college_count, COUNT(*) AS cnt3, MAX(cd_dep_college_count), SUM(cd_dep_college_count), MAX(cd_dep_college_count) FROM customer AS c JOIN customer_address AS ca ON c.c_current_addr_sk = ca.ca_address_sk JOIN customer_demographics ON cd_demo_sk = c.c_current_cdemo_sk JOIN store_customers AS sc ON c.c_customer_sk = sc.ss_customer_sk JOIN web_or_catalog_customers AS wcc ON c.c_customer_sk = wcc.customer_sk GROUP BY ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count ORDER BY ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count LIMIT 100
-```
-
-### 2. date_cte_isolate (4.00x)
-
-**Principle:** Dimension Isolation: extract small dimension lookups into CTEs so they materialize once and subsequent joins probe a tiny hash table instead of rescanning.
-
-**BEFORE (slow):**
-```sql
-select a.ca_state state, count(*) cnt
- from customer_address a
-     ,customer c
-     ,store_sales s
-     ,date_dim d
-     ,item i
- where       a.ca_address_sk = c.c_current_addr_sk
- 	and c.c_customer_sk = s.ss_customer_sk
- 	and s.ss_sold_date_sk = d.d_date_sk
- 	and s.ss_item_sk = i.i_item_sk
- 	and d.d_month_seq = 
- 	     (select distinct (d_month_seq)
- 	      from date_dim
-               where d_year = 2002
- 	        and d_moy = 3 )
- 	and i.i_current_price > 1.2 * 
-             (select avg(j.i_current_price) 
- 	     from item j 
- 	     where j.i_category = i.i_category)
- group by a.ca_state
- having count(*) >= 10
- order by cnt, a.ca_state
- LIMIT 100;
-```
-
-**AFTER (fast):**
-[target_month]:
-```sql
-SELECT DISTINCT d_month_seq FROM date_dim WHERE d_year = 2000 AND d_moy = 1
-```
-[category_avg_price]:
-```sql
-SELECT i_category, AVG(i_current_price) * 1.2 AS avg_threshold FROM item GROUP BY i_category
-```
-[filtered_dates]:
-```sql
-SELECT d_date_sk FROM date_dim JOIN target_month ON d_month_seq = target_month.d_month_seq
+SELECT d_date_sk, d_moy FROM date_dim WHERE d_month_seq IN (1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211)
 ```
 [filtered_sales]:
 ```sql
-SELECT ss_customer_sk, ss_item_sk FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
+SELECT ss_item_sk, ss_store_sk, ss_sales_price, d_moy FROM store_sales JOIN filtered_dates ON ss_sold_date_sk = d_date_sk
 ```
 [main_query]:
 ```sql
-SELECT a.ca_state AS state, COUNT(*) AS cnt FROM customer_address a JOIN customer c ON a.ca_address_sk = c.c_current_addr_sk JOIN filtered_sales s ON c.c_customer_sk = s.ss_customer_sk JOIN item i ON s.ss_item_sk = i.i_item_sk JOIN category_avg_price cap ON i.i_category = cap.i_category WHERE i.i_current_price > cap.avg_threshold GROUP BY a.ca_state HAVING COUNT(*) >= 10 ORDER BY cnt, a.ca_state LIMIT 100
+SELECT * FROM (SELECT i_manager_id, SUM(ss_sales_price) AS sum_sales, AVG(SUM(ss_sales_price)) OVER (PARTITION BY i_manager_id) AS avg_monthly_sales FROM item JOIN filtered_sales ON ss_item_sk = i_item_sk JOIN store ON ss_store_sk = s_store_sk WHERE ((i_category IN ('Books', 'Children', 'Electronics') AND i_class IN ('personal', 'portable', 'reference', 'self-help') AND i_brand IN (...)) OR (i_category IN ('Women', 'Music', 'Men') AND i_class IN ('accessories', 'classical', 'fragrances', 'pants') AND i_brand IN (...))) GROUP BY i_manager_id, d_moy) AS tmp1 WHERE CASE WHEN avg_monthly_sales > 0 THEN ABS(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1 ORDER BY i_manager_id, avg_monthly_sales, sum_sales LIMIT 100
 ```
 
-### 3. decorrelate (2.92x)
+### 2. dimension_cte_isolate (1.93x)
 
-**Principle:** Decorrelation: convert correlated subqueries to standalone CTEs with GROUP BY, then JOIN. Correlated subqueries re-execute per outer row; a pre-computed CTE executes once.
+**Principle:** Early Selection: pre-filter dimension tables into CTEs returning only surrogate keys before joining with fact tables. Each dimension CTE is tiny, creating small hash tables that speed up the fact table probe.
 
 **BEFORE (slow):**
 ```sql
-with customer_total_return as
-(select sr_customer_sk as ctr_customer_sk
-,sr_store_sk as ctr_store_sk
-,sum(SR_FEE) as ctr_total_return
-from store_returns
-,date_dim
-where sr_returned_date_sk = d_date_sk
-and d_year =2000
-group by sr_customer_sk
-,sr_store_sk)
- select c_customer_id
-from customer_total_return ctr1
-,store
-,customer
-where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2
-from customer_total_return ctr2
-where ctr1.ctr_store_sk = ctr2.ctr_store_sk)
-and s_store_sk = ctr1.ctr_store_sk
-and s_state = 'SD'
-and ctr1.ctr_customer_sk = c_customer_sk
-order by c_customer_id
+select i_item_id, 
+        avg(cs_quantity) agg1,
+        avg(cs_list_price) agg2,
+        avg(cs_coupon_amt) agg3,
+        avg(cs_sales_price) agg4 
+ from catalog_sales, customer_demographics, date_dim, item, promotion
+ where cs_sold_date_sk = d_date_sk and
+       cs_item_sk = i_item_sk and
+       cs_bill_cdemo_sk = cd_demo_sk and
+       cs_promo_sk = p_promo_sk and
+       cd_gender = 'M' and 
+       cd_marital_status = 'S' and
+       cd_education_status = 'Unknown' and
+       (p_channel_email = 'N' or p_channel_event = 'N') and
+       d_year = 2001 
+ group by i_item_id
+ order by i_item_id
  LIMIT 100;
 ```
 
 **AFTER (fast):**
-[filtered_returns]:
+[filtered_dates]:
 ```sql
-SELECT sr.sr_customer_sk, sr.sr_store_sk, sr.sr_fee FROM store_returns sr JOIN date_dim d ON sr.sr_returned_date_sk = d.d_date_sk JOIN store s ON sr.sr_store_sk = s.s_store_sk WHERE d.d_year = 2000 AND s.s_state = 'SD'
+SELECT d_date_sk FROM date_dim WHERE d_year = 2000
 ```
-[customer_total_return]:
+[filtered_customer_demographics]:
 ```sql
-SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(sr_fee) AS ctr_total_return FROM filtered_returns GROUP BY sr_customer_sk, sr_store_sk
+SELECT cd_demo_sk FROM customer_demographics WHERE cd_gender = 'M' AND cd_marital_status = 'S' AND cd_education_status = 'College'
 ```
-[store_avg_return]:
+[filtered_promotions]:
 ```sql
-SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS avg_return_threshold FROM customer_total_return GROUP BY ctr_store_sk
+SELECT p_promo_sk FROM promotion WHERE p_channel_email = 'N' OR p_channel_event = 'N'
+```
+[joined_facts]:
+```sql
+SELECT cs_item_sk, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price FROM catalog_sales AS cs JOIN filtered_dates AS fd ON cs.cs_sold_date_sk = fd.d_date_sk JOIN filtered_customer_demographics AS fcd ON cs.cs_bill_cdemo_sk = fcd.cd_demo_sk JOIN filtered_promotions AS fp ON cs.cs_promo_sk = fp.p_promo_sk
 ```
 [main_query]:
 ```sql
-SELECT c.c_customer_id FROM customer_total_return ctr1 JOIN store_avg_return sar ON ctr1.ctr_store_sk = sar.ctr_store_sk JOIN customer c ON ctr1.ctr_customer_sk = c.c_customer_sk WHERE ctr1.ctr_total_return > sar.avg_return_threshold ORDER BY c.c_customer_id LIMIT 100
+SELECT i_item_id, AVG(cs_quantity) AS agg1, AVG(cs_list_price) AS agg2, AVG(cs_coupon_amt) AS agg3, AVG(cs_sales_price) AS agg4 FROM joined_facts AS jf JOIN item AS i ON jf.cs_item_sk = i.i_item_sk GROUP BY i_item_id ORDER BY i_item_id LIMIT 100
 ```
 
 ## Original SQL
@@ -414,7 +315,7 @@ This is the current query structure. All nodes are `[=]` (unchanged). Your modif
 
 ```
 QUERY: (single statement)
-└── [MAIN] main_query  [=]  Cost: 100%  Rows: ~1K  — Join customer/address/demographics, enforce multi-channel purchase existence constraints for 2001 quarters 1-3, then group by geography and demographic dependent-count attributes to compute counts/sums/max statistics.
+└── [MAIN] main_query  [=]  Cost: 95%  Rows: ~3.1M  — Join customer/address/demographics, enforce multi-channel purchase existence constraints for 2001 quarters 1-3, then group by geography and demographic dependent-count attributes to compute counts/sums/max statistics.
     ├── SCAN (customer AS c (join), customer_address AS ca (join), customer_demographics (join), date_dim (join))
     ├── JOIN (c.c_current_addr_sk = ca.ca_address_sk)
     ├── JOIN (cd_demo_sk = c.c_current_cdemo_sk)

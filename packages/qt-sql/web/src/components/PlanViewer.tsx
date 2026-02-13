@@ -1,6 +1,6 @@
 /**
  * PlanViewer Component
- * Displays execution plan as a visual tree with cost bars
+ * Displays execution plan as a visual tree with cost bars and operator colors
  */
 
 import type { PlanTreeNode } from '@/api/client'
@@ -26,20 +26,24 @@ function getCostColor(costPct: number): string {
   return 'low'
 }
 
+function getOperatorCategory(operator: string): string {
+  const op = operator.toLowerCase()
+  if (op.includes('scan') || op.includes('read') || op.includes('fetch')) return 'scan'
+  if (op.includes('join') || op.includes('merge') || op.includes('nested loop') || op.includes('hash match')) return 'join'
+  if (op.includes('aggregate') || op.includes('group') || op.includes('sum') || op.includes('count') || op.includes('window')) return 'aggregate'
+  if (op.includes('sort') || op.includes('order') || op.includes('top-n')) return 'sort'
+  if (op.includes('filter') || op.includes('where')) return 'filter'
+  return 'other'
+}
+
 function formatRows(rows: number): string {
-  if (rows >= 1_000_000) {
-    return (rows / 1_000_000).toFixed(1) + 'M'
-  }
-  if (rows >= 1_000) {
-    return (rows / 1_000).toFixed(1) + 'K'
-  }
+  if (rows >= 1_000_000) return (rows / 1_000_000).toFixed(1) + 'M'
+  if (rows >= 1_000) return (rows / 1_000).toFixed(1) + 'K'
   return rows.toLocaleString()
 }
 
 function formatTime(ms: number): string {
-  if (ms >= 1000) {
-    return (ms / 1000).toFixed(2) + 's'
-  }
+  if (ms >= 1000) return (ms / 1000).toFixed(2) + 's'
   return ms.toFixed(2) + 'ms'
 }
 
@@ -110,67 +114,75 @@ export default function PlanViewer({
 
       {/* Plan Tree */}
       <div className="pv-tree">
-        {planTree.map((node, i) => (
-          <div
-            key={i}
-            className={`pv-node ${node.is_bottleneck ? 'bottleneck' : ''}`}
-            style={{ paddingLeft: `${node.indent * 1.5}rem` }}
-          >
-            {/* Connector lines */}
-            {node.indent > 0 && (
-              <span className="pv-connector">
-                {i === planTree.length - 1 || planTree[i + 1]?.indent <= node.indent
-                  ? '└─'
-                  : '├─'}
-              </span>
-            )}
-
-            {/* Operator */}
-            <span className={`pv-operator ${node.is_bottleneck ? 'bottleneck' : ''}`}>
-              {node.operator}
-            </span>
-
-            {/* Cost Bar */}
-            {node.cost_pct > 0 && (
-              <div className="pv-cost-bar-container">
-                <div
-                  className={`pv-cost-bar ${getCostColor(node.cost_pct)}`}
-                  style={{ width: `${Math.min(node.cost_pct, 100)}%` }}
-                />
-                <span className="pv-cost-label">{node.cost_pct.toFixed(1)}%</span>
-              </div>
-            )}
-
-            {/* Row Count */}
-            {node.rows != null && node.rows > 0 && (
-              <span className="pv-rows">
-                {formatRows(node.rows)} rows
-                {node.estimated_rows != null && node.estimated_rows !== node.rows && (
-                  <span className="pv-estimated">
-                    (est. {formatRows(node.estimated_rows)})
-                  </span>
-                )}
-              </span>
-            )}
-
-            {/* Timing */}
-            {node.timing_ms != null && node.timing_ms > 0 && (
-              <span className="pv-timing">{formatTime(node.timing_ms)}</span>
-            )}
-
-            {/* Badges */}
-            <div className="pv-badges">
-              {node.spill && (
-                <span className="pv-badge spill">SPILL</span>
-              )}
-              {node.pruning_ratio != null && node.pruning_ratio > 0 && (
-                <span className="pv-badge prune">
-                  {node.pruning_ratio}% pruned
+        {planTree.map((node, i) => {
+          const category = getOperatorCategory(node.operator)
+          return (
+            <div
+              key={i}
+              className={`pv-node ${node.is_bottleneck ? 'bottleneck' : ''}`}
+              style={{ paddingLeft: `${node.indent * 1.5}rem` }}
+            >
+              {/* Connector lines */}
+              {node.indent > 0 && (
+                <span className="pv-connector">
+                  {i === planTree.length - 1 || planTree[i + 1]?.indent <= node.indent
+                    ? '\u2514\u2500'
+                    : '\u251C\u2500'}
                 </span>
               )}
+
+              {/* Operator with category color */}
+              <span className={`pv-operator ${node.is_bottleneck ? 'bottleneck' : ''} pv-op-${category}`}>
+                {node.operator}
+              </span>
+
+              {/* Details text */}
+              {node.details && (
+                <span className="pv-details">{node.details}</span>
+              )}
+
+              {/* Cost Bar */}
+              {node.cost_pct > 0 && (
+                <div className="pv-cost-bar-container">
+                  <div
+                    className={`pv-cost-bar ${getCostColor(node.cost_pct)}`}
+                    style={{ width: `${Math.min(node.cost_pct, 100)}%` }}
+                  />
+                  <span className="pv-cost-label">{node.cost_pct.toFixed(1)}%</span>
+                </div>
+              )}
+
+              {/* Row Count */}
+              {node.rows != null && node.rows > 0 && (
+                <span className="pv-rows">
+                  {formatRows(node.rows)} rows
+                  {node.estimated_rows != null && node.estimated_rows !== node.rows && (
+                    <span className="pv-estimated">
+                      (est. {formatRows(node.estimated_rows)})
+                    </span>
+                  )}
+                </span>
+              )}
+
+              {/* Timing */}
+              {node.timing_ms != null && node.timing_ms > 0 && (
+                <span className="pv-timing">{formatTime(node.timing_ms)}</span>
+              )}
+
+              {/* Badges */}
+              <div className="pv-badges">
+                {node.spill && (
+                  <span className="pv-badge spill">SPILL</span>
+                )}
+                {node.pruning_ratio != null && node.pruning_ratio > 0 && (
+                  <span className="pv-badge prune">
+                    {node.pruning_ratio}% pruned
+                  </span>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          )
+        })}
       </div>
     </div>
   )

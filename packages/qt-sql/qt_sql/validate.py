@@ -112,7 +112,12 @@ def race_candidates(
     from concurrent.futures import wait as futures_wait, FIRST_COMPLETED
     from .execution.factory import create_executor_from_dsn
 
-    is_pg = db_path.lower().startswith("postgres://") or db_path.lower().startswith("postgresql://")
+    _lower = db_path.lower()
+    is_server_db = (
+        _lower.startswith("postgres://")
+        or _lower.startswith("postgresql://")
+        or _lower.startswith("snowflake://")
+    )
 
     # ── Warmup: run original once to prime caches ──────────────────────
     logger.info("Race: warmup run (original)")
@@ -120,7 +125,7 @@ def race_candidates(
         with create_executor_from_dsn(db_path) as warmup_exec:
             warmup_exec.connect()
             t0 = time.perf_counter()
-            if is_pg:
+            if is_server_db:
                 warmup_exec.execute(original_sql, timeout_ms=timeout_ms)
             else:
                 warmup_exec.execute(original_sql)
@@ -159,7 +164,7 @@ def race_candidates(
             start_barrier.wait(timeout=30)
 
             t0 = time.perf_counter()
-            if is_pg:
+            if is_server_db:
                 rows = executor.execute(sql, timeout_ms=timeout_ms)
             else:
                 rows = executor.execute(sql)
@@ -435,9 +440,11 @@ class Validator:
         if self._validator is None:
             try:
                 # Detect database type from connection string
-                if self.sample_db.startswith("postgres://") or self.sample_db.startswith("postgresql://"):
-                    # PostgreSQL - use executor-based validation
-                    self._validator = self._create_pg_validator()
+                db_lower = self.sample_db.lower()
+                if db_lower.startswith("postgres://") or db_lower.startswith("postgresql://"):
+                    self._validator = PostgresValidatorWrapper(self.sample_db)
+                elif db_lower.startswith("snowflake://"):
+                    self._validator = PostgresValidatorWrapper(self.sample_db)
                 else:
                     # DuckDB - use SQLValidator directly
                     from .validation.sql_validator import SQLValidator
@@ -448,11 +455,6 @@ class Validator:
                 self._validator = None
 
         return self._validator
-
-    def _create_pg_validator(self):
-        """Create a PostgreSQL-compatible validator wrapper."""
-        # For PostgreSQL, we create a simple wrapper that uses the executor
-        return PostgresValidatorWrapper(self.sample_db)
 
     def validate(
         self,
@@ -573,7 +575,14 @@ class Validator:
                 t2 = (time.perf_counter() - start) * 1000
 
                 avg_ms = (t1 + t2) / 2
-                logger.info(f"Baseline (PG): {avg_ms:.1f}ms ({len(rows)} rows)")
+
+                # Compute checksum for correctness verification
+                checksum = None
+                if rows:
+                    from .validation.equivalence_checker import EquivalenceChecker
+                    checksum = EquivalenceChecker().compute_checksum(rows)
+
+                logger.info(f"Baseline: {avg_ms:.1f}ms ({len(rows)} rows, checksum={checksum})")
 
                 # Collect EXPLAIN ANALYZE (non-blocking, after timing)
                 explain_text = _collect_explain_text(self.sample_db, original_sql)
@@ -582,6 +591,7 @@ class Validator:
                     measured_time_ms=avg_ms,
                     row_count=len(rows),
                     rows=rows,
+                    checksum=checksum,
                     explain_text=explain_text,
                 )
             except Exception as e:
@@ -835,7 +845,7 @@ class Validator:
                 error_category=categorize_error(error_msg),
             )
 
-        # Compare row counts
+        # Compare row counts + checksums
         cand_count = len(cand_rows)
 
         if is_timeout_baseline:
@@ -851,7 +861,20 @@ class Validator:
                 f"optimized={cand_count}"
             )
             ado_status = ValidationStatus.FAIL
+        elif baseline.checksum and cand_rows:
+            # Checksum comparison (MD5 of normalized, sorted rows)
+            from .validation.equivalence_checker import EquivalenceChecker
+            cand_checksum = EquivalenceChecker().compute_checksum(cand_rows)
+            if cand_checksum != baseline.checksum:
+                errors.append(
+                    f"Checksum mismatch: original={baseline.checksum}, "
+                    f"optimized={cand_checksum}"
+                )
+                ado_status = ValidationStatus.FAIL
+            else:
+                ado_status = ValidationStatus.PASS
         elif baseline.rows and cand_rows != baseline.rows:
+            # Fallback: direct list comparison (if no checksum on baseline)
             errors.append("Value mismatch: rows differ between original and optimized")
             ado_status = ValidationStatus.FAIL
         else:

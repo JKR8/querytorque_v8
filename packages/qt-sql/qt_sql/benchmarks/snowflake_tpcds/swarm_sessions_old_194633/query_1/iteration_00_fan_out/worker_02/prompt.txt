@@ -1,0 +1,228 @@
+You are a SQL rewrite engine for Snowflake. Follow the Target Logical Tree structure below. Your job is to write correct, executable SQL for each node — not to decide whether to restructure. Preserve exact semantic equivalence (same rows, same columns, same ordering). Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END around a division, keep it — even when a WHERE clause makes the zero case unreachable. Guards prevent silent breakage if filters change upstream. Strip benchmark comments (-- start query, -- end query) from your output.
+
+## Semantic Contract (MUST preserve)
+
+Identify customers in South Dakota (SD) stores whose total return fees in 2000 exceeded 120% of their store's average. Output customer IDs ordered by ID. Joins are INNER: all tables must match. Aggregations use SUM and AVG - verify AVG reconstruction from SUM/COUNT if pre-aggregating. The state filter ('SD') depends on store table, not present in initial CTE.
+
+## Target Logical Tree + Node Contracts
+
+Build your rewrite following this CTE structure. Each node's OUTPUT list is exhaustive — your SQL must produce exactly those columns.
+
+TARGET_LOGICAL_TREE:
+CTE: store_returns_agg → CTE: store_avg → MAIN
+
+NODE_CONTRACTS:  
+  store_returns_agg:  
+    FROM: store_returns, date_dim  
+    JOIN: sr_returned_date_sk = d_date_sk  
+    WHERE: d_year = 2000  
+    GROUP BY: sr_customer_sk, sr_store_sk  
+    OUTPUT: sr_customer_sk, sr_store_sk, SUM(SR_FEE) AS ctr_total_return  
+    EXPECTED_ROWS: ~1K  
+    CONSUMERS: store_avg, MAIN  
+  store_avg:  
+    FROM: store_returns_agg  
+    GROUP BY: sr_store_sk  
+    OUTPUT: sr_store_sk, AVG(ctr_total_return)*1.2 AS store_avg  
+    EXPECTED_ROWS: ~5 (stores in SD)  
+    CONSUMERS: MAIN  
+  MAIN:  
+    FROM: store_returns_agg ctr1, store, store_avg, customer  
+    JOIN: ctr1.sr_store_sk = s_store_sk AND ctr1.sr_store_sk = store_avg.sr_store_sk AND ctr1.sr_customer_sk = c_customer_sk  
+    WHERE: s_state = 'SD' AND ctr1.ctr_total_return > store_avg.store_avg  
+    ORDER BY: c_customer_id  
+    OUTPUT: c_customer_id  
+    EXPECTED_ROWS: ~100
+
+NODE_CONTRACTS:
+store_returns_agg:  
+    FROM: store_returns, date_dim  
+    JOIN: sr_returned_date_sk = d_date_sk  
+    WHERE: d_year = 2000  
+    GROUP BY: sr_customer_sk, sr_store_sk  
+    OUTPUT: sr_customer_sk, sr_store_sk, SUM(SR_FEE) AS ctr_total_return  
+    EXPECTED_ROWS: ~1K  
+    CONSUMERS: store_avg, MAIN  
+  store_avg:  
+    FROM: store_returns_agg  
+    GROUP BY: sr_store_sk  
+    OUTPUT: sr_store_sk, AVG(ctr_total_return)*1.2 AS store_avg  
+    EXPECTED_ROWS: ~5 (stores in SD)  
+    CONSUMERS: MAIN  
+  MAIN:  
+    FROM: store_returns_agg ctr1, store, store_avg, customer  
+    JOIN: ctr1.sr_store_sk = s_store_sk AND ctr1.sr_store_sk = store_avg.sr_store_sk AND ctr1.sr_customer_sk = c_customer_sk  
+    WHERE: s_state = 'SD' AND ctr1.ctr_total_return > store_avg.store_avg  
+    ORDER BY: c_customer_id  
+    OUTPUT: c_customer_id  
+    EXPECTED_ROWS: ~100
+
+## Hazard Flags (avoid these specific risks)
+
+AVG must be reconstructed exactly (SUM/COUNT)  
+CONSTRAINT_OVERRIDE: None  
+OVERRIDE_REASONING: Aggregation groups preserved (store_sk)  
+EXPLORATION_TYPE: compound_strategy  
+HYPOTHESIS_TAG: H4_AGGREGATE_BELOW_JOIN  
+HYPOTHESIS: Precomputing store averages eliminates correlated execution  
+EVIDENCE: Correlated subquery rescans CTE per store  
+EXPECTED_MECHANISM: Store-level aggregation before join reduces per-row computations  
+CONTROL_SIGNAL: If row count differs, aggregation group integrity broken
+
+## Regression Warnings (observed failures on similar queries)
+
+1. Window function spill (Q22 regression):
+   CAUSE: Adding window functions to large partitions caused remote spills
+   RULE: For
+
+## Constraints (analyst-filtered for this query)
+
+- CTE_COLUMN_COMPLETENESS: CTE must output ctr_customer_sk, ctr_store_sk, ctr_total_return
+- LITERAL_PRESERVATION: Preserve 'SD', 2000, 1.2 exactly
+- SEMANTIC_EQUIVALENCE: Maintain identical output rows/order
+- COMPLETE_OUTPUT: Output only c_customer_id ordered ASC
+- H1_CTE_PREDICATE_FENCE: Outer filter s_state='SD' not pushed into CTE
+- H4_AGGREGATE_BELOW_JOIN: Correlated subquery aggregates after join
+
+## Example Adaptation Notes
+
+For each example: what to apply to your rewrite, and what to ignore.
+
+Use decorrelate's subquery-to-join pattern. Ignore UNION aspects from composite example.
+
+## Original SQL
+
+```sql
+-- start query 1 in stream 0 using template query1.tpl
+with customer_total_return as
+(select sr_customer_sk as ctr_customer_sk
+,sr_store_sk as ctr_store_sk
+,sum(SR_FEE) as ctr_total_return
+from store_returns
+,date_dim
+where sr_returned_date_sk = d_date_sk
+and d_year =2000
+group by sr_customer_sk
+,sr_store_sk)
+ select c_customer_id
+from customer_total_return ctr1
+,store
+,customer
+where ctr1.ctr_total_return > (select avg(ctr_total_return)*1.2
+from customer_total_return ctr2
+where ctr1.ctr_store_sk = ctr2.ctr_store_sk)
+and s_store_sk = ctr1.ctr_store_sk
+and s_state = 'SD'
+and ctr1.ctr_customer_sk = c_customer_sk
+order by c_customer_id
+ LIMIT 100;
+
+-- end query 1 in stream 0 using template query1.tpl
+```
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.
+
+### Column Completeness Contract
+
+Your `main_query` component MUST produce **exactly** these output columns (same names, same order):
+
+  1. `c_customer_id`
+
+Do NOT add, remove, or rename any output columns. The result set schema must be identical to the original query.
+
+## Original Query Structure
+
+This is the current query structure. All nodes are `[=]` (unchanged). Your modified Logic Tree below should show which nodes you changed.
+
+```
+QUERY: (single statement)
+├── [CTE] customer_total_return  [=]  Cost: 50%  Rows: ~1K
+│   ├── SCAN (store_returns, date_dim (join))
+│   ├── JOIN (sr_returned_date_sk = d_date_sk)
+│   ├── FILTER (d_year = 2000)
+│   ├── AGG (GROUP BY)
+│   └── OUTPUT (ctr_customer_sk, ctr_store_sk, ctr_total_return)
+└── [MAIN] main_query  [=]  Cost: 50%  Rows: ~1K
+    ├── SCAN (customer_total_return AS ctr1 (join), store (join), customer (join), customer_total_return AS ctr2 (correlated subquery))
+    ├── JOIN (s_store_sk = ctr1.ctr_store_sk)
+    ├── JOIN (ctr1.ctr_customer_sk = c_customer_sk)
+    ├── FILTER (ctr1.ctr_total_return > AVG(ctr_total_return) * 1.2 (per store_sk))
+    ├── FILTER (s_state = 'SD')
+    ├── AGG (GROUP BY)
+    ├── SORT (c_customer_id ASC)
+    └── OUTPUT (c_customer_id)
+```
+
+## Output Format
+
+Your response has **two parts** in order:
+
+### Part 1: Modified Logic Tree
+
+Show what changed using change markers. Generate the tree BEFORE writing SQL.
+
+Change markers:
+- `[+]` — New component added
+- `[-]` — Component removed
+- `[~]` — Component modified (describe what changed)
+- `[=]` — Unchanged (no children needed)
+- `[!]` — Structural change (e.g. CTE → subquery)
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "<dialect>",
+  "rewrite_rules": [
+    {"id": "R1", "type": "<transform_name>", "description": "<what changed>", "applied_to": ["<component_id>"]}
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "<cte_name>": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "<complete SQL for this CTE body>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<upstream_id>"]}
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "<final SELECT>",
+        "interfaces": {"outputs": ["col1", "col2"], "consumes": ["<cte_name>"]}
+      }
+    },
+    "reconstruction_order": ["<cte_name>", "main_query"],
+    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+### Rules
+- **Tree first, always.** Generate the Logic Tree before writing any SQL
+- **One component at a time.** When writing SQL for component X, treat others as opaque interfaces
+- **No ellipsis.** Every `sql` value must be complete, executable SQL
+- **Frozen blocks are copy-paste.** Large CASE-WHEN lookups must be verbatim
+- **Validate interfaces.** Verify every `consumes` reference exists in upstream `outputs`
+- Only include components you **changed or added** — set unchanged components to `"change": "unchanged"` with `"sql": ""`
+- `main_query` output columns must match the Column Completeness Contract above
+- `reconstruction_order`: topological order of components for assembly
+
+After the JSON, explain the mechanism:
+
+```
+Changes: <1-2 sentences: what structural change + the expected mechanism>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:

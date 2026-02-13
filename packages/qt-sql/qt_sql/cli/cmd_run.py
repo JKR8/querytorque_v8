@@ -35,6 +35,8 @@ import click
               help="Parallel LLM generation concurrency (0=serial, N=two-phase with N threads).")
 @click.option("--config-boost", "config_boost", is_flag=True,
               help="Run config boost (SET LOCAL tuning) on winners after validation.")
+@click.option("--bootstrap", is_flag=True,
+              help="Allow first-run mode: skip intelligence gates (no gold examples/global knowledge required).")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -48,6 +50,7 @@ def run(
     output_dir: str | None,
     concurrency: int,
     config_boost: bool,
+    bootstrap: bool,
 ) -> None:
     """Run the full optimization pipeline (requires LLM API key).
 
@@ -94,6 +97,10 @@ def run(
 
     from ..pipeline import Pipeline
     from ..schemas import OptimizationMode
+
+    if bootstrap:
+        import os
+        os.environ["QT_ALLOW_INTELLIGENCE_BOOTSTRAP"] = "1"
 
     mode_map = {
         "swarm": OptimizationMode.SWARM,

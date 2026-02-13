@@ -956,15 +956,17 @@ class SwarmSession(OptimizationSession):
 
         # Try parallel race first (all 5 queries run simultaneously)
         from ..validate import race_candidates
+        cfg = self.pipeline.config
         if batch_results is None:
             try:
                 race_result = race_candidates(
-                    db_path=self.pipeline.config.db_path_or_dsn,
+                    db_path=cfg.db_path_or_dsn,
                     original_sql=self.original_sql,
                     candidate_sqls=optimized_sqls,
                     worker_ids=sorted_wids,
-                    min_runtime_ms=2000.0,
-                    min_margin=0.05,
+                    min_runtime_ms=cfg.race_min_runtime_ms,
+                    min_margin=cfg.race_min_margin,
+                    timeout_ms=cfg.timeout_seconds * 1000,
                 )
                 if race_result is not None:
                     batch_results = race_result.verdicts
@@ -993,6 +995,11 @@ class SwarmSession(OptimizationSession):
                             and race_result.baseline.explain_text):
                         self._explain_plan_text = race_result.baseline.explain_text
                         self._stage(self.query_id, "EXPLAIN: captured from race baseline")
+
+                    # Post-race checksum: verify passing candidates match original
+                    batch_results = self._checksum_race_verdicts(
+                        batch_results, optimized_sqls, sorted_wids,
+                    )
             except Exception as e:
                 logger.warning(f"[{self.query_id}] Race failed, falling back: {e}")
 
@@ -1048,7 +1055,7 @@ class SwarmSession(OptimizationSession):
         for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
             wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds, iface_warns = candidates_by_worker[wid]
             worker_prompts[wid] = (w_prompt, w_response)
-            result_sql = self.original_sql if self._db_reachable is False else optimized_sql
+            result_sql = optimized_sql
 
             # Prepend interface warnings to error messages so retry worker sees them
             all_errors = list(error_msgs or [])
@@ -1397,9 +1404,7 @@ class SwarmSession(OptimizationSession):
             worker_id=snipe_worker_id,
             strategy=strategy,
             examples_used=example_ids,
-            optimized_sql=(
-                self.original_sql if self._db_reachable is False else optimized_sql
-            ),
+            optimized_sql=optimized_sql,
             speedup=speedup,
             status=status,
             transforms=candidate.transforms,
@@ -1449,6 +1454,60 @@ class SwarmSession(OptimizationSession):
             return None
         best = max(passing, key=lambda w: w.speedup)
         return best.optimized_sql
+
+    def _checksum_race_verdicts(
+        self,
+        verdicts: List[tuple],
+        optimized_sqls: List[str],
+        worker_ids: List[int],
+    ) -> List[tuple]:
+        """Post-race checksum verification for passing candidates.
+
+        Race mode only checks row counts for speed. This runs a single
+        execution of the original + each passing candidate, computes MD5
+        checksums, and downgrades mismatches to FAIL.
+        """
+        # Find indices of passing candidates (WIN, IMPROVED, NEUTRAL)
+        passing = [
+            i for i, (status, *_) in enumerate(verdicts)
+            if status in ("WIN", "IMPROVED", "NEUTRAL")
+        ]
+        if not passing:
+            return verdicts
+
+        try:
+            from ..execution.factory import create_executor_from_dsn
+            from ..validation.equivalence_checker import EquivalenceChecker
+
+            executor = create_executor_from_dsn(self.pipeline.config.db_path_or_dsn)
+            executor.connect()
+            checker = EquivalenceChecker()
+
+            # Get original checksum
+            orig_rows = executor.execute(self.original_sql)
+            orig_checksum = checker.compute_checksum(orig_rows)
+
+            updated = list(verdicts)
+            for i in passing:
+                cand_rows = executor.execute(optimized_sqls[i])
+                cand_checksum = checker.compute_checksum(cand_rows)
+                if cand_checksum != orig_checksum:
+                    wid = worker_ids[i]
+                    self._stage(
+                        self.query_id,
+                        f"CHECKSUM FAIL: W{wid} checksum {cand_checksum} != {orig_checksum}"
+                    )
+                    updated[i] = (
+                        "FAIL", 0.0,
+                        [f"Checksum mismatch: original={orig_checksum}, optimized={cand_checksum}"],
+                        "semantic",
+                    )
+
+            executor.close()
+            return updated
+        except Exception as e:
+            logger.warning(f"[{self.query_id}] Post-race checksum failed: {e}")
+            return verdicts
 
     def _build_race_timings(self) -> Optional[Dict[str, Any]]:
         """Build race timings dict for snipe analyst prompt.

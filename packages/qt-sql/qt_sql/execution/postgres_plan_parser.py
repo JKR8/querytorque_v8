@@ -9,8 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Optional
 
-from query_torque.execution.base import ExecutionPlanAnalysis, PlanNode
-from query_torque.execution.plan_parser import PlanIssue
+from .base import ExecutionPlanAnalysis, PlanNode
+from .plan_parser import PlanIssue
 
 
 # PostgreSQL node types that indicate potential performance issues
@@ -277,10 +277,14 @@ class PostgresPlanParser:
 
         return result
 
-    def _identify_bottleneck(self, plan_tree: list[dict[str, Any]]) -> str:
-        """Identify the most expensive operator in the plan."""
+    def _identify_bottleneck(self, plan_tree: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        """Identify the most expensive operator in the plan.
+
+        Returns a dict matching ExecutionPlanAnalysis.bottleneck shape:
+        {operator, cost_pct, rows, details, suggestion}
+        """
         if not plan_tree:
-            return "Unknown"
+            return None
 
         # Find highest cost percentage
         max_cost = 0
@@ -294,10 +298,34 @@ class PostgresPlanParser:
                 bottleneck_idx = i
 
         if plan_tree:
-            plan_tree[bottleneck_idx]["is_bottleneck"] = True
-            return plan_tree[bottleneck_idx]["operator"]
+            node = plan_tree[bottleneck_idx]
+            node["is_bottleneck"] = True
 
-        return "Unknown"
+            operator = node.get("operator", "Unknown")
+            details = node.get("details", "")
+            cost_pct = node.get("cost_pct", 0)
+            rows = node.get("rows", 0)
+
+            # Generate suggestion based on operator type
+            suggestion = ""
+            if operator == "Seq Scan":
+                suggestion = "Consider adding an index on filter/join columns"
+            elif operator in ("Sort", "IncrementalSort"):
+                suggestion = "Consider adding an index for presorted data or increasing work_mem"
+            elif operator == "Hash Join":
+                suggestion = "Check join selectivity and consider index-based join"
+            elif operator in ("Materialize", "CTE Scan"):
+                suggestion = "Consider inlining the CTE or reducing materialization"
+
+            return {
+                "operator": operator,
+                "cost_pct": cost_pct,
+                "rows": rows,
+                "details": details,
+                "suggestion": suggestion,
+            }
+
+        return None
 
     def _extract_warnings(self, node: PostgresPlanNode) -> list[str]:
         """Extract performance warnings from plan."""

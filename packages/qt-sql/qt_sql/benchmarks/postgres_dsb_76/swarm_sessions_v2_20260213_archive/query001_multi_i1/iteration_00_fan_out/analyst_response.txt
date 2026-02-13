@@ -1,0 +1,236 @@
+### Reasoning Process
+
+1. **CLASSIFY**: This is a "correlated-aggregate filter" archetype. The query uses a CTE to pre-aggregate store returns, then filters customers based on their total return exceeding 1.2x the store average via a correlated subquery. Additional dimension filters (store state, customer demographics) are applied late.
+
+2. **EXPLAIN PLAN ANALYSIS**:
+   - Dominant bottleneck: Correlated subquery executes 1845 times (95K rows scanned each time) consuming 10461ms (99.8% of runtime)
+   - CTE materialization (95K rows) is expensive but secondary
+   - Row counts: 95K rows from CTE → 582 rows after reason_sk filter → 30 rows after customer/demo filters
+   - Optimizer strengths: Handles date_dim scan efficiently (index scan) but fails to decorrelate subquery
+   - Critical gap: Nested loop re-executes aggregate per row (O(N*M))
+
+3. **GAP MATCHING**:
+   - CORRELATED_SUBQUERY_PARALYSIS (P2): Active (nested loop in EXPLAIN, scalar aggregate subquery)
+   - COMMA_JOIN_WEAKNESS (P1): Active (comma joins in CTE and main query)
+   - DIMENSION_FILTER_PUSHDOWN_FAILURE (P7): Active (store/customer filters applied after CTE materialization)
+   - Engine strengths: Bitmap scans not present, EXISTS not used, parallelism active but blocked by CTE
+
+4. **AGGREGATION TRAP CHECK**: Only SUM/AVG used - safe for decorrelation. No FILTER clauses or sensitive aggregates.
+
+5. **TRANSFORM SELECTION**:
+   - Worker 1: Decorrelate subquery (P2 - highest impact)
+   - Worker 2: Dimension prefetch + explicit joins (P7+P1)
+   - Worker 3: Repeated scan elimination (P3 - shares CTE scan)
+   - Worker 4: Novel late-attribute binding + predicate pushdown
+
+---
+
+### Structured Briefing
+
+=== SHARED BRIEFING ===
+
+SEMANTIC_CONTRACT:
+Identify customers (born Feb 1965-1971, female, college-educated, married) in TX/KY/IL stores whose 2002 return amount per item (108-167) exceeds 1.2x their store's average. Output customer IDs. All joins are inner joins requiring matches. AVG must compute per-store aggregates. The sr_return_amt/sr_return_quantity ratio filter must preserve exact decimal semantics.
+
+BOTTLENECK_DIAGNOSIS:
+Correlated subquery execution dominates runtime (1845 iterations, 95K rows scanned each). Query is join-bound due to nested loop re-execution. Optimizer handles date filtering efficiently but fails to decorrelate. Logical tree costs mislead - 88% main query cost manifests as subquery re-execution.
+
+ACTIVE_CONSTRAINTS:
+- CORRELATED_SUBQUERY_PARALYSIS: EXPLAIN shows nested loop with 1845 SubPlan executions
+- COMMA_JOIN_WEAKNESS: FROM clauses use comma joins (lines 6-7, 14-17)
+- CTE_COLUMN_COMPLETENESS: Downstream requires ctr_store_sk, ctr_total_return
+- LITERAL_PRESERVATION: 21 literals must be preserved exactly
+- DIMENSION_FILTER_PUSHDOWN_FAILURE: Store/customer filters applied after CTE materialization
+
+REGRESSION_WARNINGS:
+1. Correlated subquery decorrelation (Q054_i1 0.51x):
+   CAUSE: Multi-fact join lock when decorrelating complex queries
+   RULE: Use only with single fact table (store_returns)
+2. Dimension prefetch (Q031_i1 0.25x):
+   CAUSE: Applied to self-join pattern destroying parallelism
+   RULE: Verify no self-joins before prefetch
+
+NODE_CONTRACTS: Defined per worker
+
+=== WORKER 1 BRIEFING ===
+
+STRATEGY: decorrelate_subquery
+TARGET_LOGICAL_TREE:
+  store_avg_return (CTE) → filtered_ctr (CTE) → main_join
+NODE_CONTRACTS:
+  store_avg_return:
+    FROM: customer_total_return
+    GROUP BY: ctr_store_sk
+    AGGREGATE: AVG(ctr_total_return) AS avg_return
+    OUTPUT: ctr_store_sk, avg_return
+    EXPECTED_ROWS: ~100 (distinct stores)
+    CONSUMERS: filtered_ctr
+  filtered_ctr:
+    FROM: customer_total_return
+    WHERE: ctr_reason_sk BETWEEN 43 AND 46
+    OUTPUT: ctr_customer_sk, ctr_store_sk, ctr_total_return
+    EXPECTED_ROWS: 582
+    CONSUMERS: main_join
+  main_join:
+    FROM: filtered_ctr, store_avg_return, store, customer, customer_demographics
+    JOIN: filtered_ctr.ctr_store_sk = store_avg_return.ctr_store_sk
+          AND filtered_ctr.ctr_store_sk = s_store_sk
+          AND filtered_ctr.ctr_customer_sk = c_customer_sk
+          AND c_current_cdemo_sk = cd_demo_sk
+    WHERE: filtered_ctr.ctr_total_return > 1.2 * store_avg_return.avg_return
+          AND s_state IN ('IL','KY','TX')
+          AND cd_marital_status IN ('M')
+          AND cd_education_status IN ('Advanced Degree','College')
+          AND cd_gender = 'F'
+          AND c_birth_month = 2
+          AND c_birth_year BETWEEN 1965 AND 1971
+    OUTPUT: c_customer_id
+    EXPECTED_ROWS: 30
+    CONSUMERS: none
+EXAMPLES: decorrelate, inline_decorrelate_materialized
+EXAMPLE_ADAPTATION:
+  Use decorrelate's CTE structure but preserve original ratio filter
+  Ignore inline_decorrelate_materialized's EXISTS conversion
+HAZARD_FLAGS:
+- Must materialize store_avg_return to prevent re-correlation
+- Verify AVG null handling matches original
+
+=== WORKER 2 BRIEFING ===
+
+STRATEGY: star_prefetch_explicit_joins
+TARGET_LOGICAL_TREE:
+  prefetch_store → prefetch_customer → prefetch_demo → ctr_base (CTE) → main_query
+NODE_CONTRACTS:
+  prefetch_store:
+    FROM: store
+    WHERE: s_state IN ('IL','KY','TX')
+    OUTPUT: s_store_sk
+    EXPECTED_ROWS: 9
+    CONSUMERS: ctr_base
+  prefetch_customer:
+    FROM: customer
+    WHERE: c_birth_month = 2 AND c_birth_year BETWEEN 1965 AND 1971
+    OUTPUT: c_customer_sk, c_current_cdemo_sk
+    EXPECTED_ROWS: ~5,000
+    CONSUMERS: ctr_base
+  prefetch_demo:
+    FROM: customer_demographics
+    WHERE: cd_marital_status IN ('M') 
+           AND cd_education_status IN ('Advanced Degree','College')
+           AND cd_gender = 'F'
+    OUTPUT: cd_demo_sk
+    EXPECTED_ROWS: ~100
+    CONSUMERS: ctr_base
+  ctr_base:
+    FROM: store_returns
+    JOIN: sr_store_sk = prefetch_store.s_store_sk
+          sr_customer_sk = prefetch_customer.c_customer_sk
+          prefetch_customer.c_current_cdemo_sk = prefetch_demo.cd_demo_sk
+    WHERE: sr_return_amt / sr_return_quantity BETWEEN 108 AND 167
+    GROUP BY: sr_customer_sk, sr_store_sk, sr_reason_sk
+    AGGREGATE: SUM(SR_RETURN_AMT_INC_TAX) AS ctr_total_return
+    OUTPUT: sr_customer_sk AS ctr_customer_sk, 
+            sr_store_sk AS ctr_store_sk, 
+            sr_reason_sk AS ctr_reason_sk, 
+            ctr_total_return
+    EXPECTED_ROWS: ~1,000
+    CONSUMERS: main_query
+  main_query: (subquery remains but on reduced CTE)
+EXAMPLES: pg_dimension_prefetch_star, explicit_join_materialized
+EXAMPLE_ADAPTATION:
+  Apply pg_dimension_prefetch_star's CTE structure
+  Use explicit_join_materialized's INNER JOIN syntax
+  Ignore examples' unrelated fact tables
+HAZARD_FLAGS:
+- Correlated subquery still present but on smaller CTE
+- JOIN order must match dimension prefetch sequence
+
+=== WORKER 3 BRIEFING ===
+
+STRATEGY: shared_scan_consolidation
+TARGET_LOGICAL_TREE:
+  base_returns (CTE) → ctr1 (CTE) → store_avg (CTE) → main_join
+NODE_CONTRACTS:
+  base_returns:
+    FROM: store_returns, date_dim
+    JOIN: sr_returned_date_sk = d_date_sk
+    WHERE: d_year = 2002 
+           AND sr_return_amt / sr_return_quantity BETWEEN 108 AND 167
+    OUTPUT: sr_customer_sk, sr_store_sk, sr_reason_sk, SR_RETURN_AMT_INC_TAX
+    EXPECTED_ROWS: ~95K
+    CONSUMERS: ctr1, store_avg
+  ctr1:
+    FROM: base_returns
+    GROUP BY: sr_customer_sk, sr_store_sk, sr_reason_sk
+    AGGREGATE: SUM(SR_RETURN_AMT_INC_TAX) AS ctr_total_return
+    OUTPUT: sr_customer_sk AS ctr_customer_sk, 
+            sr_store_sk AS ctr_store_sk, 
+            sr_reason_sk AS ctr_reason_sk, 
+            ctr_total_return
+    EXPECTED_ROWS: ~95K
+    CONSUMERS: main_join
+  store_avg:
+    FROM: base_returns
+    GROUP BY: sr_store_sk
+    AGGREGATE: SUM(SR_RETURN_AMT_INC_TAX) AS total_return, 
+               COUNT(*) AS return_count
+    OUTPUT: sr_store_sk, 
+            total_return / return_count AS avg_return
+    EXPECTED_ROWS: ~100
+    CONSUMERS: main_join
+  main_join: (same as Worker 1)
+EXAMPLES: shared_scan, self_join_pivot
+EXAMPLE_ADAPTATION:
+  Use shared_scan's base CTE structure
+  Adapt self_join_pivot's AVG computation method
+  Ignore pivot aspects of examples
+HAZARD_FLAGS:
+- AVG must be computed as SUM/COUNT to match division semantics
+- CTE may block parallelism if too large
+
+=== WORKER 4 BRIEFING ===
+
+STRATEGY: late_attribute_binding
+TARGET_LOGICAL_TREE:
+  core_filter (CTE) → store_avg (CTE) → main_projection
+NODE_CONTRACTS:
+  core_filter:
+    FROM: store_returns, date_dim
+    JOIN: sr_returned_date_sk = d_date_sk
+    WHERE: d_year = 2002 
+           AND sr_return_amt / sr_return_quantity BETWEEN 108 AND 167
+           AND sr_reason_sk BETWEEN 43 AND 46
+    GROUP BY: sr_customer_sk, sr_store_sk
+    AGGREGATE: SUM(SR_RETURN_AMT_INC_TAX) AS ctr_total_return
+    OUTPUT: sr_customer_sk, sr_store_sk, ctr_total_return
+    EXPECTED_ROWS: ~500
+    CONSUMERS: store_avg, main_projection
+  store_avg:
+    FROM: core_filter
+    GROUP BY: sr_store_sk
+    AGGREGATE: AVG(ctr_total_return) AS avg_return
+    OUTPUT: sr_store_sk, avg_return
+    EXPECTED_ROWS: ~10
+    CONSUMERS: main_projection
+  main_projection:
+    FROM: core_filter, store_avg, customer
+    JOIN: core_filter.sr_customer_sk = c_customer_sk
+          core_filter.sr_store_sk = store_avg.sr_store_sk
+    WHERE: core_filter.ctr_total_return > 1.2 * store_avg.avg_return
+          AND c_birth_month = 2
+          AND c_birth_year BETWEEN 1965 AND 1971
+    OUTPUT: c_customer_id
+    EXPECTED_ROWS: 30
+    CONSUMERS: none
+EXAMPLES: late_attribute_binding, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+  Apply late_attribute_binding's deferred dimension join
+  Use dimension_cte_isolate's customer filtering
+  Ignore examples' unrelated tables
+HAZARD_FLAGS:
+- Demographic filters deferred to customer table
+- Must verify c_current_cdemo_sk consistency
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: N/A
+EXPLORATION_TYPE: novel_combination
+EXPLORATION_RATIONALE: Combines deferred dimension joining with predicate pushdown into CTE, avoiding early materialization of unused attributes. Structural difference from failures: no self-join, single fact table.

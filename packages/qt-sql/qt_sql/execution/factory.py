@@ -23,7 +23,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Protocol, Type
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 
 # =============================================================================
@@ -191,8 +191,8 @@ class PostgresConfig(DatabaseConfig):
                 host=parsed.hostname or "localhost",
                 port=parsed.port or 5432,
                 database=parsed.path.lstrip("/") if parsed.path else "postgres",
-                user=parsed.username or "postgres",
-                password=parsed.password or "",
+                user=unquote(parsed.username or "postgres"),
+                password=unquote(parsed.password or ""),
             )
         elif "=" in dsn:
             # libpq key=value format
@@ -280,8 +280,8 @@ class SnowflakeConfig(DatabaseConfig):
             path_parts = parsed.path.lstrip("/").split("/")
             return cls(
                 account=parsed.hostname or "",
-                user=parsed.username or "",
-                password=parsed.password or "",
+                user=unquote(parsed.username or ""),
+                password=unquote(parsed.password or ""),
                 database=path_parts[0] if len(path_parts) > 0 else "",
                 schema=path_parts[1] if len(path_parts) > 1 else "public",
                 warehouse=params.get("warehouse", ""),
@@ -290,9 +290,15 @@ class SnowflakeConfig(DatabaseConfig):
         raise ValueError(f"Invalid Snowflake DSN: {dsn}")
 
     def get_executor(self) -> DatabaseExecutor:
-        raise NotImplementedError(
-            "Snowflake executor not yet implemented. "
-            "To add support, create SnowflakeExecutor in snowflake_executor.py"
+        from .snowflake_executor import SnowflakeExecutor
+        return SnowflakeExecutor(
+            account=self.account,
+            user=self.user,
+            password=self.password,
+            warehouse=self.warehouse,
+            database=self.database,
+            schema=self.schema,
+            role=self.role,
         )
 
 
@@ -423,11 +429,15 @@ def create_executor_from_dsn(dsn: str) -> DatabaseExecutor:
     elif dsn_lower.startswith("duckdb://"):
         return DuckDBConfig.from_dsn(dsn).get_executor()
     elif dsn_lower == ":memory:" or dsn_lower.endswith(".duckdb") or dsn_lower.endswith(".db"):
-        # Assume DuckDB for file paths
+        # Assume DuckDB for file paths with explicit DuckDB extensions
         return DuckDBConfig(database=dsn).get_executor()
     else:
-        # Default to DuckDB
-        return DuckDBConfig(database=dsn).get_executor()
+        raise ValueError(
+            f"Unrecognized database DSN scheme: {dsn!r}. "
+            f"Supported prefixes: postgres://, postgresql://, snowflake://, duckdb://, "
+            f":memory:, *.duckdb, *.db. "
+            f"Will NOT silently fall back to another engine."
+        )
 
 
 def create_executor_from_cli_args(
