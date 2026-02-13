@@ -792,13 +792,12 @@ class Prompter:
 
         for i, reg in enumerate(regressions):
             speedup = str(reg.get("verified_speedup", "?")).rstrip("x")
-            query_id = reg.get("query_id", "?")
             transform = reg.get("transform_attempted", "unknown")
             mechanism = reg.get("regression_mechanism", "")
             description = reg.get("description", "")
 
             lines.append(
-                f"### Warning {i + 1}: {transform} on {query_id} ({speedup}x)"
+                f"### Warning {i + 1}: {transform} ({speedup}x)"
             )
 
             if description:

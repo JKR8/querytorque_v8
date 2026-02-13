@@ -246,10 +246,7 @@ class AnalystSession:
             costs=costs,
             semantic_intents=ctx["semantic_intents"],
             global_knowledge=ctx["global_knowledge"],
-            matched_examples=ctx["matched_examples"],
-            all_available_examples=ctx["all_available_examples"],
             constraints=ctx["constraints"],
-            regression_warnings=ctx["regression_warnings"],
             dialect=dialect,
             strategy_leaderboard=ctx["strategy_leaderboard"],
             query_archetype=ctx["query_archetype"],
@@ -259,6 +256,7 @@ class AnalystSession:
             plan_scanner_text=ctx["plan_scanner_text"],
             iteration_history=self._build_iteration_history(),
             mode="expert",
+            qerror_analysis=ctx.get("qerror_analysis"),
         )
 
         from .generate import CandidateGenerator
@@ -280,7 +278,7 @@ class AnalystSession:
 
         # Phase 4: Parse briefing and build worker prompt
         briefing = parse_briefing_response(analyst_response)
-        briefing_issues = validate_parsed_briefing(briefing)
+        briefing_issues = validate_parsed_briefing(briefing, expected_workers=1)
         if briefing_issues:
             for issue in briefing_issues[:8]:
                 self._stage(self.query_id, f"  Analyst briefing error: {issue}")

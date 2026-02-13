@@ -535,13 +535,12 @@ def _format_example_full(ex: Dict[str, Any]) -> str:
 def _format_regression_for_analyst(reg: Dict[str, Any]) -> str:
     """Format a regression example for the analyst's full view."""
     eid = reg.get("id", "?")
-    query_id = reg.get("query_id", "?")
     speedup = str(reg.get("verified_speedup", "?")).rstrip("x")
     transform = reg.get("transform_attempted", "unknown")
     mechanism = reg.get("regression_mechanism", "")
     desc = reg.get("description", "")
 
-    parts = [f"### {eid}: {transform} on {query_id} ({speedup}x)"]
+    parts = [f"### {eid}: {transform} ({speedup}x)"]
     if desc:
         parts.append(f"**Anti-pattern:** {desc}")
     if mechanism:
@@ -658,10 +657,7 @@ def build_analyst_briefing_prompt(
     costs: Dict[str, Any],
     semantic_intents: Optional[Dict[str, Any]],
     global_knowledge: Optional[Dict[str, Any]],
-    matched_examples: List[Dict[str, Any]],
-    all_available_examples: List[Dict[str, str]],
-    constraints: List[Dict[str, Any]],
-    regression_warnings: Optional[List[Dict[str, Any]]],
+    constraints: Optional[List[Dict[str, Any]]] = None,
     dialect: str = "duckdb",
     dialect_version: Optional[str] = None,
     strategy_leaderboard: Optional[Dict[str, Any]] = None,
@@ -673,6 +669,7 @@ def build_analyst_briefing_prompt(
     iteration_history: Optional[Dict[str, Any]] = None,
     mode: str = "swarm",
     detected_transforms: Optional[List] = None,
+    qerror_analysis: Optional[Any] = None,
 ) -> str:
     """Build the analyst briefing prompt for swarm, expert, or oneshot mode.
 
@@ -697,10 +694,7 @@ def build_analyst_briefing_prompt(
         costs: Per-node cost analysis
         semantic_intents: Pre-computed per-query + per-node intents (may be None)
         global_knowledge: GlobalKnowledge dict with principles + anti_patterns
-        matched_examples: Top tag-matched examples (full metadata, typically 16)
-        all_available_examples: Full catalog (id + speedup + description)
         constraints: All engine-filtered constraints (full JSON)
-        regression_warnings: Tag-matched regression examples (may be None)
         dialect: SQL dialect
         dialect_version: Engine version string (e.g., '1.4.3')
         strategy_leaderboard: Pre-built leaderboard JSON (from build_strategy_leaderboard.py)
@@ -847,6 +841,13 @@ def build_analyst_briefing_prompt(
             lines.append(algo_text)
             lines.append("")
 
+    # ── §2b-i. Q-Error Cardinality Analysis (appended to §2b) ──────────
+    if qerror_analysis is not None:
+        from ..qerror import format_qerror_for_prompt
+        qerror_text = format_qerror_for_prompt(qerror_analysis)
+        if qerror_text:
+            lines.append(qerror_text)
+
     # ── §2c. Query Structure (Logic Tree + condensed node details) ───────
     from ..logic_tree import build_logic_tree
     from ..analyst import _append_dag_analysis
@@ -927,7 +928,7 @@ def build_analyst_briefing_prompt(
 
     # ── §3a. Correctness Constraints (non-negotiable validation gates) ───
     correctness_constraints = [
-        c for c in constraints
+        c for c in (constraints or [])
         if c.get("id") in (
             "LITERAL_PRESERVATION", "SEMANTIC_EQUIVALENCE",
             "COMPLETE_OUTPUT", "CTE_COLUMN_COMPLETENESS",
@@ -1096,6 +1097,12 @@ def build_analyst_briefing_prompt(
                     lines.append(f"  ⚠ {ci['id']}: {ci['instruction']}")
             lines.append("")
 
+    # ── Discovery mode detection ────────────────────────────────────────
+    # Discovery mode: no empirical gaps for this engine.
+    # When true, all 4 workers explore (no proven patterns to follow).
+    has_empirical_gaps = bool(engine_profile and engine_profile.get("gaps"))
+    is_discovery_mode = not has_empirical_gaps
+
     # ═══════════════════════════════════════════════════════════════════════
     # §5. TRANSFORM CATALOG (action vocabulary)
     # ═══════════════════════════════════════════════════════════════════════
@@ -1251,6 +1258,7 @@ def build_analyst_briefing_prompt(
         "multi-channel UNION ALL / EXISTS-set operations / other)"
     )
     lines.append("")
+    has_qerror = qerror_analysis is not None and hasattr(qerror_analysis, 'signals') and qerror_analysis.signals
     if is_estimate_plan:
         lines.append(
             "2. **EXPLAIN PLAN ANALYSIS**: From the EXPLAIN plan (planner estimates), identify:\n"
@@ -1269,7 +1277,7 @@ def build_analyst_briefing_prompt(
             "or re-executed per reference"
         )
     else:
-        lines.append(
+        step2_parts = [
             "2. **EXPLAIN PLAN ANALYSIS**: From the EXPLAIN ANALYZE output, identify:\n"
             "   - Compute wall-clock ms per EXPLAIN node. Sum repeated operations "
             "(e.g., 2x store_sales joins = total cost). The EXPLAIN is ground truth, "
@@ -1283,20 +1291,60 @@ def build_analyst_briefing_prompt(
             "a restructuring that reduces it to 1 scan saves (N-1)/N of that table's "
             "I/O cost. Prioritize transforms that reduce scan count on the largest tables.\n"
             "   - Whether the CTE is materialized once and probed multiple times, "
-            "or re-executed per reference"
-        )
+            "or re-executed per reference",
+        ]
+        if has_qerror:
+            step2_parts.append(
+                "\n\n"
+                "   **Q-ERROR ROUTING** (§2b-i): The cardinality estimation routing above "
+                "identifies WHERE the planner is wrong (locus) and HOW (direction). "
+                "This routing is 85% accurate at predicting where the winning transform operates.\n"
+                "   - **Direction + Locus → Pathology routing**: This is the primary signal. "
+                "Start your hypothesis from the routed pathologies.\n"
+                "   - **Structural flags** (DELIM_SCAN, EST_ZERO, etc.) are direct transform "
+                "triggers. DELIM_SCAN = correlated subquery → P2. EST_ZERO = CTE stats blind → P0/P7.\n"
+                "   - **Ignore magnitude/severity** — Q-Error size does NOT predict optimization "
+                "opportunity (win rate is flat across all severity levels)."
+            )
+        lines.append("".join(step2_parts))
     lines.append("")
-    lines.append(
-        "3. **GAP MATCHING**: Compare the EXPLAIN analysis to the Engine Profile "
-        "gaps above. For each gap:\n"
-        "   - Does this query exhibit the gap? (e.g., is a predicate NOT pushed "
-        "into a CTE? Is the same fact table scanned multiple times?)\n"
-        "   - Check the 'opportunity' — does this query's structure match?\n"
-        "   - Check 'what_didnt_work' and 'field_notes' — any disqualifiers for this query?\n"
-        "   - Also verify: is the optimizer ALREADY handling this well? "
-        "(Check the Optimizer Strengths above — if the engine already does it, "
-        "your transform adds overhead, not value.)"
+    step3_parts = [
+        "3. **BOTTLENECK HYPOTHESIS**: From your EXPLAIN observations in Step 2, reason\n"
+        "   about WHY each bottleneck exists and what intervention could fix it.\n\n",
+    ]
+    if has_qerror:
+        step3_parts.append(
+            "   **Start from Q-Error routing.** The §2b-i routing identified the planner's\n"
+            "   worst mismatch direction+locus and mapped it to candidate pathologies.\n"
+            "   Use this as your primary hypothesis anchor, then verify against the plan structure:\n\n"
+        )
+    step3_parts.append(
+        "   For the top 2-3 cost centers identified on the cost spine:\n\n"
+        "   a) DIAGNOSE: What optimizer behavior causes this cost?\n"
+        "      - What operation dominates? (scan, join, sort, aggregate, window)\n"
+        "      - Is the input to this node larger than it needs to be? Why?\n"
+        "      - Is the optimizer executing operations in a suboptimal order?\n"
+        "      - Is work being repeated that could be done once?\n\n"
+        "   b) HYPOTHESIZE: What SQL restructuring would change the physical plan?\n"
+        "      - Scan dominates + low pruning ratio → predicate not reaching scan layer\n"
+        "      - Same table scanned N times → consolidate into single scan + conditional agg\n"
+        "      - Large intermediate + selective late filter → push predicate earlier in chain\n"
+        "      - Nested loop on large table → decorrelate to CTE + hash join\n"
+        "      - Aggregate input >> output after join → pre-aggregate before join\n"
+        "      - CTE materialized but referenced once → inline as subquery\n"
+        "      - Window computed in CTE before join → defer window to post-join\n"
+        "      - OR across different columns + full scan → decompose into UNION ALL branches\n\n"
+        "   c) CALIBRATE against engine knowledge (§4):\n"
+        "      - If a documented gap matches your diagnosis: USE its evidence\n"
+        "        (what_worked, what_didnt_work, field_notes, decision gates)\n"
+        "        to sharpen your intervention. Follow its gates — they encode failures.\n"
+        "      - If a strength matches what you'd rewrite: STOP — the optimizer already\n"
+        "        handles it. Your rewrite adds overhead or destroys an optimization.\n"
+        "      - If no gap matches: your hypothesis is novel — tag as UNVERIFIED_HYPOTHESIS\n"
+        "        and proceed with structural reasoning only. Design a control variant\n"
+        "        that tests the opposite assumption."
     )
+    lines.append("".join(step3_parts))
     lines.append("")
     lines.append(
         "4. **AGGREGATION TRAP CHECK**: For every aggregate function in the query, "
@@ -1309,23 +1357,35 @@ def build_analyst_briefing_prompt(
     lines.append("")
     if mode == "swarm":
         lines.append(
-            "5. **TRANSFORM SELECTION**: From the matched engine gaps, select transforms "
-            "that exploit the specific gaps present in THIS query. Rank by expected value "
-            "(rows affected × historical speedup from evidence). Select 4 that are "
-            "structurally diverse — each attacking a different gap or bottleneck.\n"
-            "   REJECT tag-matched examples whose primary technique requires a structural "
-            "feature this query lacks (e.g., reject intersect_to_exists if query has no "
-            "INTERSECT; reject decorrelate if query has no correlated subquery). Tag "
-            "matching is approximate — always verify structural applicability."
+            "5. **INTERVENTION DESIGN**: For each hypothesized bottleneck from Step 3,\n"
+            "   design a transform:\n\n"
+            "   a) Match the diagnosed optimizer behavior to a transform category in §5a\n"
+            "      (missed pushdown → Predicate Movement, redundant scans → Scan Consolidation, etc.)\n"
+            "   b) If engine evidence exists for the matched transform:\n"
+            "      - Prefer the proven approach and follow documented gates\n"
+            "      - Apply the transform's structural preconditions as hard constraints\n"
+            "      - Use documented regressions as REJECTION criteria\n"
+            "   c) If no evidence exists (UNVERIFIED_HYPOTHESIS):\n"
+            "      - Design the intervention from the transform description + structural preconditions\n"
+            "      - RANK by estimated impact: (scan reduction × table size) > (join reordering)\n"
+            "        > (aggregation restructuring) > (window deferral)\n"
+            "      - Include a rollback path — explain what makes this rewrite reversible\n"
+            "   d) Assign 4 structurally diverse interventions. Each worker attacks a DIFFERENT\n"
+            "      bottleneck or a different approach to the same bottleneck.\n"
+            "      No two workers should apply the same transform to the same query region."
         )
     else:
         lines.append(
-            "5. **TRANSFORM SELECTION**: From the matched engine gaps, select the single "
-            "best transform (or compound strategy) that maximizes expected value "
-            "(rows affected × historical speedup from evidence) for THIS query.\n"
-            "   REJECT tag-matched examples whose primary technique requires a structural "
-            "feature this query lacks. Tag matching is approximate — always verify "
-            "structural applicability."
+            "5. **INTERVENTION DESIGN**: For each hypothesized bottleneck from Step 3,\n"
+            "   design a transform:\n\n"
+            "   a) Match the diagnosed optimizer behavior to a transform category in §5a\n"
+            "   b) If engine evidence exists: prefer the proven approach and follow gates\n"
+            "   c) If no evidence exists (UNVERIFIED_HYPOTHESIS):\n"
+            "      - RANK by estimated impact: (scan reduction × table size) > (join reordering)\n"
+            "        > (aggregation restructuring) > (window deferral)\n"
+            "      - Include a rollback path — explain what makes this rewrite reversible\n"
+            "   Select the single best transform (or compound strategy of 2-3 transforms)\n"
+            "   that maximizes expected speedup for THIS query."
         )
     lines.append("")
     if mode == "swarm":
@@ -1459,9 +1519,14 @@ def build_analyst_briefing_prompt(
     lines.append("")
     lines.append("ACTIVE_CONSTRAINTS:")
     lines.append("- [CORRECTNESS_CONSTRAINT_ID]: [Why it applies to this query, 1 line]")
-    lines.append("- [ENGINE_GAP_ID]: [Evidence from EXPLAIN that this gap is active]")
-    lines.append("(List all 4 correctness constraints + the 1-3 engine gaps that")
-    lines.append("are active for THIS query based on your EXPLAIN analysis.)")
+    if is_discovery_mode:
+        lines.append("- [HYPOTHESIS_ID]: [Evidence from EXPLAIN that this hypothesis applies] (optional — 0-3)")
+        lines.append("(List all 4 correctness constraints. If any hypothesized gaps from §4")
+        lines.append("apply to this query, list 1-3 with EXPLAIN evidence. OK to list 0 if none match.)")
+    else:
+        lines.append("- [ENGINE_GAP_ID]: [Evidence from EXPLAIN that this gap is active]")
+        lines.append("(List all 4 correctness constraints + the 1-3 engine gaps that")
+        lines.append("are active for THIS query based on your EXPLAIN analysis.)")
     lines.append("")
     lines.append("REGRESSION_WARNINGS:")
     lines.append("1. [Pattern name] ([observed regression]):")
@@ -1503,17 +1568,26 @@ def build_analyst_briefing_prompt(
 
     if mode == "swarm":
         for wid in range(1, 5):
-            if wid == 4:
+            if is_discovery_mode:
+                # Discovery mode: all workers are exploration workers
+                lines.append(f"=== WORKER {wid} BRIEFING === (EXPLORATION WORKER)")
+            elif wid == 4:
                 lines.append(f"=== WORKER {wid} BRIEFING === (EXPLORATION WORKER)")
             else:
                 lines.append(f"=== WORKER {wid} BRIEFING ===")
             lines.append("")
             for tl in _WORKER_BRIEFING_TEMPLATE:
                 lines.append(tl)
-            if wid == 4:
+            if is_discovery_mode or wid == 4:
                 lines.append("CONSTRAINT_OVERRIDE: [CONSTRAINT_ID or 'None']")
                 lines.append("OVERRIDE_REASONING: [Why this query's structure differs from the observed failure, or 'N/A']")
                 lines.append("EXPLORATION_TYPE: [constraint_relaxation | compound_strategy | novel_combination]")
+                lines.append("HYPOTHESIS_TAG: [H1_CTE_PREDICATE_FENCE | H2_JOIN_ORDER | ... | NOVEL_<description>]")
+            if is_discovery_mode:
+                lines.append("HYPOTHESIS: [What optimizer blind spot this worker tests]")
+                lines.append("EVIDENCE: [Specific EXPLAIN plan features that suggest this gap]")
+                lines.append("EXPECTED_MECHANISM: [Why this transform should change the physical plan]")
+                lines.append("CONTROL_SIGNAL: [How to tell if the hypothesis was wrong — what regression looks like]")
             lines.append("")
     elif mode == "expert":
         lines.append("=== WORKER 1 BRIEFING ===")
@@ -1572,52 +1646,86 @@ def build_analyst_briefing_prompt(
 
     # ── §7b. Validation Checklist ────────────────────────────────────────
     if mode == "swarm":
-        lines.append(build_analyst_section_checklist())
+        lines.append(build_analyst_section_checklist(is_discovery_mode=is_discovery_mode))
     elif mode == "expert":
         lines.append(build_expert_section_checklist())
     elif mode == "oneshot":
         lines.append(build_oneshot_section_checklist())
     lines.append("")
 
-    # ── §7c. Worker 4 Exploration Rules (swarm only) ─────────────────────
+    # ── §7c. Worker Exploration Rules (swarm only) ──────────────────────
     if mode == "swarm":
-        lines.append("## §7c. Worker 4 Exploration Rules")
-        lines.append("")
-        lines.append(
-            "Workers 1-3 follow the engine profile's proven patterns. "
-            "**Worker 4 is the EXPLORATION worker** with a different mandate:"
-        )
-        lines.append("")
-        lines.append(
-            "Worker 4 MAY (in priority order — prefer higher-value exploration):\n"
-            "  (c) **PREFERRED**: Attempt a novel technique not listed in the engine "
-            "profile, if the EXPLAIN plan reveals an optimizer blind spot not yet "
-            "documented. This is the highest-value exploration — new discoveries "
-            "expand the engine profile for all future queries.\n"
-            "  (b) Combine 2-3 transforms from different engine gaps into a compound "
-            "strategy that hasn't been tested before. Medium value — tests "
-            "interaction effects between known patterns.\n"
-            "  (a) Retry a technique from 'what_didnt_work', IF the structural "
-            "context of THIS query differs materially from the observed failure — "
-            "explain the structural difference in HAZARD_FLAGS. Lowest priority — "
-            "only when the query structure clearly diverges from the failed case."
-        )
-        lines.append("")
-        lines.append(
-            "Worker 4 may NEVER violate correctness constraints "
-            "(LITERAL_PRESERVATION, SEMANTIC_EQUIVALENCE, COMPLETE_OUTPUT, "
-            "CTE_COLUMN_COMPLETENESS)."
-        )
-        lines.append("")
-        lines.append(
-            "The exploration worker's output is tagged EXPLORATORY and tracked "
-            "separately. Past failures documented in the engine profile are "
-            "context-specific — they happened on specific queries with specific "
-            "structures. Worker 4's job is to test whether those failures "
-            "generalize or not. If Worker 4 discovers a new win, it becomes "
-            "field intelligence for the engine profile."
-        )
-        lines.append("")
+        if is_discovery_mode:
+            lines.append("## §7c. Discovery Mode — All Workers Explore")
+            lines.append("")
+            lines.append(
+                "DISCOVERY MODE: No empirical engine profile exists. All 4 workers are exploration "
+                "workers. Each tests a DIFFERENT hypothesis from your EXPLAIN analysis."
+            )
+            lines.append("")
+            lines.append(
+                "  Worker 1: Highest-confidence hypothesis — most obvious bottleneck with clearest\n"
+                "            intervention path. This is the 'most likely to work' bet.\n"
+                "  Worker 2: Second-highest impact — may target a different bottleneck entirely or\n"
+                "            a more aggressive version of Worker 1's approach.\n"
+                "  Worker 3: Structural inefficiency — redundant scans, missed decorrelation,\n"
+                "            unnecessary materialization. Targets plan shape, not filter placement.\n"
+                "  Worker 4: Compound / speculative — combines 2 transforms, or tests a hypothesis\n"
+                "            with lower confidence. This is the 'high risk / high reward' worker."
+            )
+            lines.append("")
+            lines.append(
+                "Each worker MUST specify in their briefing:\n"
+                "  HYPOTHESIS: What optimizer blind spot this worker tests\n"
+                "  EVIDENCE: Specific EXPLAIN plan features that suggest this gap\n"
+                "  EXPECTED_MECHANISM: Why this transform should change the physical plan\n"
+                "  CONTROL_SIGNAL: How to tell if the hypothesis was wrong (what would regression look like)"
+            )
+            lines.append("")
+            lines.append(
+                "No worker may violate correctness constraints "
+                "(LITERAL_PRESERVATION, SEMANTIC_EQUIVALENCE, COMPLETE_OUTPUT, "
+                "CTE_COLUMN_COMPLETENESS)."
+            )
+            lines.append("")
+        else:
+            lines.append("## §7c. Worker 4 Exploration Rules")
+            lines.append("")
+            lines.append(
+                "Workers 1-3 follow the engine profile's proven patterns. "
+                "**Worker 4 is the EXPLORATION worker** with a different mandate:"
+            )
+            lines.append("")
+            lines.append(
+                "Worker 4 MAY (in priority order — prefer higher-value exploration):\n"
+                "  (c) **PREFERRED**: Attempt a novel technique not listed in the engine "
+                "profile, if the EXPLAIN plan reveals an optimizer blind spot not yet "
+                "documented. This is the highest-value exploration — new discoveries "
+                "expand the engine profile for all future queries.\n"
+                "  (b) Combine 2-3 transforms from different engine gaps into a compound "
+                "strategy that hasn't been tested before. Medium value — tests "
+                "interaction effects between known patterns.\n"
+                "  (a) Retry a technique from 'what_didnt_work', IF the structural "
+                "context of THIS query differs materially from the observed failure — "
+                "explain the structural difference in HAZARD_FLAGS. Lowest priority — "
+                "only when the query structure clearly diverges from the failed case."
+            )
+            lines.append("")
+            lines.append(
+                "Worker 4 may NEVER violate correctness constraints "
+                "(LITERAL_PRESERVATION, SEMANTIC_EQUIVALENCE, COMPLETE_OUTPUT, "
+                "CTE_COLUMN_COMPLETENESS)."
+            )
+            lines.append("")
+            lines.append(
+                "The exploration worker's output is tagged EXPLORATORY and tracked "
+                "separately. Past failures documented in the engine profile are "
+                "context-specific — they happened on specific queries with specific "
+                "structures. Worker 4's job is to test whether those failures "
+                "generalize or not. If Worker 4 discovers a new win, it becomes "
+                "field intelligence for the engine profile."
+            )
+            lines.append("")
 
     # ── §7d. Output Consumption Spec (swarm only) ────────────────────────
     if mode == "swarm":
@@ -1645,7 +1753,6 @@ def build_script_oneshot_prompt(
     engine_profile: Optional[Dict[str, Any]] = None,
     matched_examples: Optional[List[Dict[str, Any]]] = None,
     constraints: Optional[List[Dict[str, Any]]] = None,
-    regression_warnings: Optional[List[Dict[str, Any]]] = None,
     resource_envelope: Optional[str] = None,
 ) -> str:
     """Build a oneshot prompt for an entire multi-statement SQL pipeline.
@@ -1668,7 +1775,6 @@ def build_script_oneshot_prompt(
         engine_profile: Engine optimizer strengths/gaps (optional)
         matched_examples: Gold examples for pattern matching (optional)
         constraints: Correctness constraints (optional)
-        regression_warnings: Known regression patterns (optional)
 
     Returns:
         Complete prompt text for a single LLM call

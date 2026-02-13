@@ -1,5 +1,5 @@
 # PostgreSQL Rewrite Playbook
-# 31 gold wins + 21 improved + 7 regressions | DSB SF10
+# DSB SF10 field intelligence
 
 ## HOW TO USE THIS DOCUMENT
 
@@ -21,8 +21,8 @@ Before choosing any strategy, scan the explain plan for:
 
 ## ENGINE STRENGTHS — do NOT rewrite these patterns
 
-1. **BITMAP_OR_SCAN**: Multi-branch ORs on indexed columns handled via bitmap combination in one scan. Splitting ORs to UNION ALL is lethal (0.21x Q085 V1).
-2. **EXISTS semi-join**: Uses early termination. Converting to materializing CTEs caused 0.50x Q069 V1, 0.75x Q069_i2. **Never materialize EXISTS.**
+1. **BITMAP_OR_SCAN**: Multi-branch ORs on indexed columns handled via bitmap combination in one scan. Splitting ORs to UNION ALL is lethal (0.21x observed).
+2. **EXISTS semi-join**: Uses early termination. Converting to materializing CTEs caused 0.50x, 0.75x — semi-join destroyed. **Never materialize EXISTS.**
 3. **INNER JOIN reordering**: Freely reorders INNER JOINs by selectivity estimates. Do NOT manually restructure INNER JOIN order.
 4. **Index-only scan**: Reads only index when covering all requested columns. Small dimension lookups may not need CTEs.
 5. **Parallel query execution**: Large scans and aggregations parallelized across workers. CTEs block parallelism (materialization is single-threaded).
@@ -38,8 +38,8 @@ Before choosing any strategy, scan the explain plan for:
 
 ## GLOBAL GUARDS (check always, before any rewrite)
 
-1. OR conditions on indexed columns → never split to UNION ALL (0.21x Q085)
-2. EXISTS/NOT EXISTS → never materialize into CTEs (0.50x Q069, 0.75x Q069_i2)
+1. OR conditions on indexed columns → never split to UNION ALL (0.21x observed)
+2. EXISTS/NOT EXISTS → never materialize into CTEs (0.50x, 0.75x — semi-join destroyed)
 3. INNER JOIN order → never restructure (optimizer handles reordering)
 4. Small dimensions (< 10K rows) → index-only scan may be faster than CTE
 5. Baseline < 100ms → skip CTE-based rewrites (overhead exceeds savings)
@@ -48,7 +48,7 @@ Before choosing any strategy, scan the explain plan for:
 8. Preserve efficient existing CTEs — don't decompose working patterns
 9. Verify NULL semantics in NOT IN conversions
 10. ROLLUP/window in same query → CTE may prevent pushdown optimizations
-11. Never inline a large UNION CTE — re-execution multiplied per reference (0.16x Q075)
+11. Never inline a large UNION CTE — re-execution multiplied per reference (0.16x — 6 fact scans re-executed)
 12. Max 2 cascading fact-table CTE chains — deeper chains block parallelism
 13. EXPLAIN cost gaps ≠ runtime gains for config tuning — 6 false positives caught (up to 84% EXPLAIN gap → 0% runtime). Always 3-race validate config changes.
 
@@ -89,9 +89,9 @@ Before choosing any strategy, scan the explain plan for:
   Composition: combines well with P2 (decorrelation) and P6 (date consolidation).
   After applying: re-evaluate P4 (non-equi inputs now smaller).
 
-  Wins: Q083 8.56x, Q025 3.10x, Q099 2.50x, Q023 1.83x
-  Improved: Q080 1.42x
-  Regressions: Q058_i1 0.88x (explicit join overhead on simple query)
+  Wins: 4 validated (1.8x–8.6x, avg 4.0x)
+  Improved: 1 (1.4x)
+  Regressions: 0.88x (explicit join overhead on simple query)
 
 ### P2: Correlated subquery executing per outer row [Phase 2 — HIGHEST IMPACT]
 
@@ -116,10 +116,10 @@ Before choosing any strategy, scan the explain plan for:
   Decision gates:
   - Structural: correlated scalar subquery with aggregate (AVG, SUM, COUNT)
   - EXPLAIN: nested loop with inner re-execution (NOT hash join)
-  - NOT EXISTS: NEVER decorrelate EXISTS/NOT EXISTS (destroys semi-join, 0.50x Q069)
+  - NOT EXISTS: NEVER decorrelate EXISTS/NOT EXISTS (destroys semi-join, 0.50x observed)
   - Shared scan: if inner and outer scan same table → extract common scan to shared CTE
   - CTE keyword: ALWAYS use AS MATERIALIZED (prevents optimizer re-correlating)
-  - Multi-fact: 1-2 fact tables safe, 3+ → STOP (0.51x Q054)
+  - Multi-fact: 1-2 fact tables safe, 3+ → STOP (0.51x on multi-fact query)
 
   Transform selection (lightest sufficient):
   - Simple avg comparison → inline_decorrelate_materialized (3 wins, avg 500x)
@@ -130,10 +130,9 @@ Before choosing any strategy, scan the explain plan for:
   Composition: almost always combined with P1 (comma join conversion).
   After applying: re-evaluate P3 (decorrelated CTEs may now be reusable).
 
-  Wins: Q092 8044x, Q032 1465x, Q081 439x, Q001 27.80x, Q083 8.56x,
-        Q001_i1 7.99x, Q065 2.05x, Q065_i1 1.90x, Q030 1.86x
-  Improved: Q058 1.49x, Q014_i2 1.12x
-  Regressions: Q054 0.51x (multi-fact join lock), Q069_i2 0.75x (EXISTS materialized)
+  Wins: 9 validated (1.9x–8044x, avg 1100x), 3 timeout recoveries (439x–8044x)
+  Improved: 2 (1.1x–1.5x)
+  Regressions: 0.51x (multi-fact join lock), 0.75x (EXISTS materialized)
 
 ### P3: Same fact+dimension scan repeated across subquery boundaries [Phase 2 — ZERO REGRESSIONS]
 
@@ -164,7 +163,7 @@ Before choosing any strategy, scan the explain plan for:
   Ordering: apply after P1/P2 — reduced inputs make consolidation cheaper.
   After applying: P4 benefits from smaller materialized inputs.
 
-  Wins: Q014 1.98x, Q031 1.79x
+  Wins: 2 validated (1.8x–2.0x, avg 1.9x)
   Regressions: none observed
 
 ### P4: Non-equi join without prefiltering [Phase 3 — ZERO REGRESSIONS]
@@ -194,7 +193,7 @@ Before choosing any strategy, scan the explain plan for:
   Ordering: apply after P1 (explicit join syntax) and P6 (date CTE).
   After applying: non-equi join now operates on pre-filtered inputs.
 
-  Wins: Q072 12.07x
+  Wins: 1 validated (12.1x)
   Regressions: none observed
 
 ### P5: Set operation materializing full result sets [Phase 3 — CAUTION]
@@ -220,7 +219,7 @@ Before choosing any strategy, scan the explain plan for:
   - Correlated NOT EXISTS on 3+ channels → materialize channel sets (P5b)
   - Simple EXISTS (single channel) → KEEP EXISTS (semi-join is optimal)
   - NOT EXISTS already using hash anti-join in EXPLAIN → STOP
-  - CAUTION: materializing simple EXISTS destroys semi-join (0.75x Q069_i2)
+  - CAUTION: materializing simple EXISTS destroys semi-join (0.75x observed)
 
   Transform selection:
   - INTERSECT → intersect_to_exists (1 win, 1.78x)
@@ -230,8 +229,8 @@ Before choosing any strategy, scan the explain plan for:
   Composition: P5a (INTERSECT→EXISTS) is standalone; P5b combines with P1/P6.
   After applying: check P3 if set operations were the only repeated-scan source.
 
-  Wins: Q069 17.48x, Q038 1.78x
-  Regressions: Q069_i2 0.75x (over-materialized date CTE in EXISTS path)
+  Wins: 2 validated (1.8x–17.5x, avg 9.6x)
+  Regressions: 0.75x (over-materialized date CTE in EXISTS path)
 
 ### P6: Multiple date_dim aliases with overlapping filters [Phase 1 — HIGHEST RELIABILITY]
 
@@ -260,9 +259,8 @@ Before choosing any strategy, scan the explain plan for:
   Composition: always combine with P1 (explicit join syntax).
   After applying: fact table scans reduced, all downstream pathologies benefit.
 
-  Wins: Q025 3.10x, Q025_i1 2.23x, Q010 2.00x
-  Improved: Q102 1.26x, Q080_i2 1.22x, Q091 1.18x, Q050_i2 1.10x,
-            Q018 1.07x, Q072_i1 1.07x, Q094_i2 1.07x
+  Wins: 3 validated (2.0x–3.1x, avg 2.4x)
+  Improved: 7 (1.07x–1.26x)
   Regressions: none observed
 
 ### P7: Multi-dimension prefetch for star-schema aggregation [Phase 1 — CAUTION]
@@ -282,8 +280,8 @@ Before choosing any strategy, scan the explain plan for:
   - Structural: star schema with 3+ selective dimension filters
   - Dimension selectivity: each dimension filter selects < 10% of dimension table
   - Fact table: single fact table, NOT self-join or multi-fact
-  - Stop: if query has self-join pattern → use P3 instead (0.25x Q031_i1)
-  - Stop: if query has multi-fact join → dimension prefetch locks join order (0.51x Q054)
+  - Stop: if query has self-join pattern → use P3 instead (0.25x observed)
+  - Stop: if query has multi-fact join → dimension prefetch locks join order (0.51x observed)
 
   Transform selection:
   - 2-3 dimensions → pg_dimension_prefetch_star (2 wins, 2.5x avg)
@@ -293,16 +291,23 @@ Before choosing any strategy, scan the explain plan for:
   Ordering: apply with P1/P6 (all Phase 1 optimizations together).
   CAUTION: do NOT apply to self-join or multi-fact queries.
 
-  Wins: Q099 2.50x, Q064 2.12x, Q023 1.83x
-  Improved: Q094 1.25x, Q084 1.10x, Q040 1.09x
-  Regressions: Q031_i1 0.25x (self-join), Q054 0.51x (multi-fact)
+  Wins: 3 validated (1.8x–2.5x, avg 2.2x)
+  Improved: 3 (1.09x–1.25x)
+  Regressions: 0.25x (self-join), 0.51x (multi-fact)
 
-### NO MATCH
+### NO MATCH — First-Principles Reasoning
 
-  Record: which pathologies checked, which gates failed.
-  Nearest miss: closest pathology + why it didn't qualify.
-  Features present: structural features for future pattern discovery.
-  → Workers get: broad gold example set, analyst's manual reasoning.
+  If no pathology matches, do NOT stop.
+
+  1. **Check §2b-i Q-Error routing first.** Direction+locus still points to
+     where the planner is wrong — use as starting hypothesis.
+  2. Identify the largest cost node. What dominates? Can it be restructured?
+  3. Count scans per base table. Repeated scans → consolidation opportunity.
+  4. Trace row counts. Where do they stay flat or increase?
+  5. Check transform catalog (§5a) as a menu.
+
+  Record: which pathologies checked, which gates failed, nearest miss,
+  structural features present.
 
 ---
 
@@ -327,9 +332,7 @@ Always 3-race validate config changes.
   - Alternative: Hash Join would work (equi-join condition exists)
   - DANGER: Do NOT disable on queries already using merge join efficiently on pre-sorted data
 
-  Wins: Q100_agg +82.5%, Q083 +68.2%, Q014 +66.9%, Q058 +60.2%,
-        Q064 +17.1%, Q065 +8.6%
-  6 wins, avg +50.6%
+  Wins: 6 validated (+8.6%–+82.5%, avg +50.6%)
 
 ### C2: Cost model undervaluing index scans on SSD [HIGHEST RECOVERY]
 
@@ -344,10 +347,8 @@ Always 3-race validate config changes.
   - Seq Scan on fact table in EXPLAIN despite btree index on join/filter columns
   - Buffer cache warm (shared_buffers + OS cache covers working set)
 
-  Wins: Q100_spj +89.0%, Q102_spj +83.2%, Q027_agg +73.4% (with par4),
-        Q075 +46.0%, Q100_agg +82.5% (with MJ_off), Q102_agg +52.5% (with par4)
-  6 wins, avg +71.1%. Rescued 3 rewrite regressions (Q100_spj 0.61x→9.09x,
-  Q102_spj 0.51x→5.95x, Q075 0.30x→1.85x).
+  Wins: 6 validated (+46.0%–+89.0%, avg +71.1%). Rescued 3 rewrite regressions
+  (0.61x→9.09x, 0.51x→5.95x, 0.30x→1.85x).
 
 ### C3: Parallelism underutilized on large scans [MOST VERSATILE]
 
@@ -360,13 +361,11 @@ Always 3-race validate config changes.
   Decision gates:
   - Seq Scan > 100K rows without parallel workers
   - Query execution > 500ms (CRITICAL: never on fast queries)
-  - DANGER: Q039 got 7.34x REGRESSION when forced on 244ms query
-  - DANGER: Q023 par4-alone caused -15.3% — must include work_mem=512MB
+  - DANGER: 7.34x REGRESSION observed when forced on 244ms query
+  - DANGER: par4-alone caused -15.3% — must include work_mem=512MB
   - par4 alone insufficient for hash-heavy queries — combine with work_mem (C4)
 
-  Wins (standalone): Q050_spj +28.2%, Q091_spj +17.4%, Q030 +12.5%,
-                     Q084_spj +7.0%, Q023 +6.2% (with wm512)
-  5 standalone wins, avg +14.3%. Also in 10+ combo wins.
+  Wins (standalone): 5 validated (+6.2%–+28.2%, avg +14.3%). Also in 10+ combo wins.
 
 ### C4: Hash/sort spilling to disk [TARGETED]
 
@@ -380,9 +379,7 @@ Always 3-race validate config changes.
   - Count sort+hash ops in EXPLAIN to size appropriately
   - Often needs par4 (C3) to realize full benefit
 
-  Wins: Q010 +41.5% (wm512+par), Q069 +17.9% (wm256+par),
-        Q091_agg +16.0% (wm256+par), Q087 +11.4% (wm256 alone)
-  4 wins, avg +21.7%
+  Wins: 4 validated (+11.4%–+41.5%, avg +21.7%)
 
 ### C5: Nested loop on large join inputs [HIGH IMPACT hint]
 
@@ -394,11 +391,9 @@ Always 3-race validate config changes.
   - Nested Loop in EXPLAIN with both inputs > 10K rows
   - Equi-join condition exists (hash join is viable alternative)
   - NOT correlated subquery (NL is correct there — use P2 decorrelation instead)
-  - DANGER: Q075 NL_off caused -1454% regression — never on queries where NL is correct
+  - DANGER: NL_off caused -1454% regression — never on queries where NL is correct
 
-  Wins: Q072_agg +81.3%, Q027_spj +57.5% (with par4),
-        Q081 +42.5% (with par4)
-  3 wins, avg +60.4%
+  Wins: 3 validated (+42.5%–+81.3%, avg +60.4%)
 
 ### C6: Sort overhead on pre-ordered data [RARE]
 
@@ -409,10 +404,9 @@ Always 3-race validate config changes.
   Decision gates:
   - Sort node in EXPLAIN with input from index scan (already ordered)
   - Or Sort node where hash aggregation is viable alternative
-  - High variance observed (3.2-7.7% on Q059) — validate carefully
+  - High variance observed (3.2-7.7%) — validate carefully
 
-  Wins: Q083 +68.2% (with MJ_off), Q059 +4.7%
-  2 wins, avg +36.5%
+  Wins: 2 validated (+4.7%–+68.2%, avg +36.5%)
 
 ---
 
@@ -471,16 +465,16 @@ Skip pathologies the plan rules out:
 
 ## REGRESSION REGISTRY
 
-| Severity | Query | Transform | Result | Root cause |
-|----------|-------|-----------|--------|------------|
-| CATASTROPHIC | Q075_i1 | cte_inlining | 0.16x | Inlined large UNION CTE → 6 fact scans re-executed 2x each |
-| SEVERE | Q101_i1 | multi_dim_prefetch | 0.15x | CTEs blocked date-predicate pushdown on 90-day interval join |
-| SEVERE | Q031_i1 | dimension_prefetch | 0.25x | Applied star-schema pattern to 6-way self-join → parallelism destroyed |
-| MAJOR | Q075_i2 | cte_materialization | 0.30x | Multi-scan CTE overhead similar to Q075_i1 |
-| MAJOR | Q054_i1 | early_fact_filtering | 0.51x | Disabled nestloop too aggressively + DISTINCT forced hash spill |
-| MAJOR | Q069_i2 | date_cte_prefetch | 0.75x | Over-materialized date CTE in EXISTS path → destroyed semi-join |
-| MODERATE | Q058_i1 | explicit_join | 0.88x | Explicit join conversion overhead exceeded benefit on simple query |
-| CATASTROPHIC | Q039 | forced_parallelism (C3) | 7.34x regr | Worker startup + coordination overhead on 244ms query. NEVER force par on < 500ms |
-| CATASTROPHIC | Q075 | enable_nestloop_off (C5) | -1454% | NL was correct plan. Disabling forced catastrophic merge/hash on unsuitable query |
-| MAJOR | Q064 | geqo_off | -254% | Exhaustive planner found "better" cost plan on 19 joins but cardinality errors made it catastrophic |
-| MAJOR | Q023 | par4_without_wm | -15.3% | Parallelism without sufficient work_mem causes hash spill under parallel execution |
+| Severity | Transform | Result | Root cause |
+|----------|-----------|--------|------------|
+| CATASTROPHIC | cte_inlining | 0.16x | Inlined large UNION CTE → 6 fact scans re-executed 2x each |
+| SEVERE | multi_dim_prefetch | 0.15x | CTEs blocked date-predicate pushdown on 90-day interval join |
+| SEVERE | dimension_prefetch | 0.25x | Applied star-schema pattern to 6-way self-join → parallelism destroyed |
+| MAJOR | cte_materialization | 0.30x | Multi-scan CTE overhead similar to above cte_inlining pattern |
+| MAJOR | early_fact_filtering | 0.51x | Disabled nestloop too aggressively + DISTINCT forced hash spill |
+| MAJOR | date_cte_prefetch | 0.75x | Over-materialized date CTE in EXISTS path → destroyed semi-join |
+| MODERATE | explicit_join | 0.88x | Explicit join conversion overhead exceeded benefit on simple query |
+| CATASTROPHIC | forced_parallelism (C3) | 7.34x regr | Worker startup + coordination overhead on 244ms query. NEVER force par on < 500ms |
+| CATASTROPHIC | enable_nestloop_off (C5) | -1454% | NL was correct plan. Disabling forced catastrophic merge/hash on unsuitable query |
+| MAJOR | geqo_off | -254% | Exhaustive planner found "better" cost plan on 19 joins but cardinality errors made it catastrophic |
+| MAJOR | par4_without_wm | -15.3% | Parallelism without sufficient work_mem causes hash spill under parallel execution |

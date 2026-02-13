@@ -1,5 +1,5 @@
 # DuckDB Rewrite Playbook
-# 22 gold wins + 10 regressions | TPC-DS SF1–SF10
+# TPC-DS SF1–SF10 field intelligence
 
 ## HOW TO USE THIS DOCUMENT
 
@@ -9,24 +9,78 @@ Work in phase order. Each phase changes the plan shape — re-evaluate later pha
   Phase 2: Eliminate redundant work (P1, P3)
   Phase 3: Fix structural inefficiencies (P2, P4–P9)
 
-Before choosing any strategy, scan the explain plan for:
-- Row count profile: monotonically decreasing = healthy. Flat then sharp drop = pushback opportunity.
-- Join types: hash join = good. Nested loop = decorrelation candidate.
-- Repeated tables: same table N times = consolidation.
-- CTE sizes: large materialization + small post-filter = pushback.
-- Aggregation inputs: GROUP BY over millions with thousands of distinct keys = pushdown.
-- LEFT JOIN + WHERE on right table = INNER conversion.
-- INTERSECT/EXCEPT = EXISTS conversion.
+## EXPLAIN ANALYSIS PROCEDURE
+
+Before choosing any strategy, execute this procedure on the EXPLAIN plan:
+
+1. IDENTIFY THE COST SPINE — which sequence of nodes accounts for >70% of total cost?
+   The spine is your optimization target. Everything else is noise.
+2. CLASSIFY EACH SPINE NODE:
+   - SEQ_SCAN: how many rows? Is there a filter? Is the filter selective (>5:1)?
+   - HASH_JOIN: what's the build side cardinality? Is it the smaller table?
+   - AGGREGATE: input rows vs output rows ratio? >10:1 = pushdown candidate.
+   - NESTED_LOOP: ALWAYS suspicious — check if decorrelation is possible.
+   - WINDOW: is it computed before or after a join? Could it be deferred?
+3. TRACE DATA FLOW: row counts should decrease monotonically through the plan.
+   Where do they stay flat or increase? That transition point is the bottleneck.
+4. CHECK THE SYMPTOM ROUTING TABLE: match your observations to primary hypotheses.
+5. FORM BOTTLENECK HYPOTHESIS: "The optimizer is doing X, but Y would be better
+   because Z." This hypothesis drives both pathology matching AND novel reasoning.
+
+## SYMPTOM ROUTING — from EXPLAIN to hypothesis
+
+Two routing paths exist and should agree. If they disagree, trust Q-Error (quantitative).
+
+### Path A: Q-Error routing (quantitative — from §2b-i when available)
+
+Q-Error = max(estimated/actual, actual/estimated) per operator.
+The operator with the highest Q-Error is where the planner's worst decision lives.
+
+| Q-Error Locus | Direction  | Primary hypothesis     | Why                                      |
+|---------------|------------|------------------------|------------------------------------------|
+| JOIN          | UNDER_EST  | P2 (decorrelate)       | Planner thinks join is cheap, it's not    |
+| JOIN          | ZERO_EST   | P0, P2                 | Planner has no join estimate at all       |
+| JOIN          | OVER_EST   | P5 (LEFT→INNER)        | Planner over-provisions for NULLs         |
+| SCAN          | OVER_EST   | P1, P4                 | Redundant scans or missed pruning         |
+| SCAN          | ZERO_EST   | P2                     | DELIM_SCAN = correlated subquery          |
+| AGGREGATE     | OVER_EST   | P3 (agg below join)    | Fan-out before GROUP BY                   |
+| CTE           | ZERO_EST   | P0, P7                 | Planner blind to CTE statistics           |
+| CTE           | UNDER_EST  | P2, P0                 | CTE output larger than expected           |
+| PROJECTION    | OVER_EST   | P7, P0, P4             | Redundant computation                     |
+| PROJECTION    | UNDER_EST  | P6, P5, P0             | Set operation or join underestimate       |
+| FILTER        | OVER_EST   | P9, P0                 | Shared expression or missed pushdown      |
+
+Structural flags (free, no execution needed):
+- DELIM_SCAN → P2 (correlated subquery the optimizer couldn't decorrelate)
+- EST_ZERO → P0/P7 (planner gave up — CTE boundary blocks stats)
+- EST_ONE_NONLEAF → P2/P0 (planner guessing on non-leaf node)
+- REPEATED_TABLE → P1 (single-pass consolidation opportunity)
+
+### Path B: Structural routing (qualitative — from EXPLAIN tree inspection)
+
+| EXPLAIN symptom                          | Primary hypothesis   | Verify           |
+|------------------------------------------|---------------------|------------------|
+| Row counts flat through CTEs, late drop  | P0 (predicate push) | Filter ratio, chain depth |
+| Same table scanned N times               | P1 (repeated scans) | Join structure identical? |
+| Nested loop with inner aggregate         | P2 (correlated sub)  | Already hash join? |
+| Aggregate input >> output after join     | P3 (agg below join)  | Key alignment    |
+| Full scan, OR across DIFFERENT columns   | P4 (cross-col OR)    | Same column? → STOP |
+| LEFT JOIN + WHERE on right column        | P5 (LEFT→INNER)      | COALESCE check   |
+| INTERSECT node, large inputs             | P6 (INTERSECT)       | Row count >1K?   |
+| CTE self-joined with discriminators      | P7 (self-join CTE)   | 2-4 values?      |
+| Window in CTE before join                | P8 (deferred window) | LAG/LEAD check   |
+| Identical subtrees in different branches | P9 (shared expr)     | EXISTS check     |
+| None of the above                        | FIRST-PRINCIPLES     | See NO MATCH     |
 
 ## ENGINE STRENGTHS — do NOT rewrite
 
 1. **Predicate pushdown**: filter inside scan node → leave it.
-2. **Same-column OR**: handled natively in one scan. Splitting = lethal (0.23x Q13).
+2. **Same-column OR**: handled natively in one scan. Splitting = lethal (0.23x observed).
 3. **Hash join selection**: sound for 2–4 tables. Reduce inputs, not order.
 4. **CTE inlining**: single-ref CTEs inlined automatically (zero overhead).
 5. **Columnar projection**: only referenced columns read.
 6. **Parallel aggregation**: scans and aggregations parallelized across threads.
-7. **EXISTS semi-join**: early termination. **Never materialize** (0.14x Q16).
+7. **EXISTS semi-join**: early termination. **Never materialize** (0.14x observed).
 
 ## CORRECTNESS RULES
 
@@ -37,14 +91,14 @@ Before choosing any strategy, scan the explain plan for:
 
 ## GLOBAL GUARDS
 
-1. EXISTS/NOT EXISTS → never materialize (0.14x Q16, 0.54x Q95)
-2. Same-column OR → never split to UNION (0.23x Q13, 0.59x Q90)
+1. EXISTS/NOT EXISTS → never materialize (0.14x, 0.54x — semi-join destroyed)
+2. Same-column OR → never split to UNION (0.23x, 0.59x — native OR handling)
 3. Baseline < 100ms → skip CTE-based rewrites (overhead exceeds savings)
 4. 3+ fact table joins → do not pre-materialize facts (locks join order)
-5. Every CTE MUST have a WHERE clause (0.85x Q67)
-6. No orphaned CTEs — remove original after splitting (0.49x Q31, 0.68x Q74)
-7. No cross-joining 3+ dimension CTEs (0.0076x Q80 — Cartesian product)
-8. Max 2 cascading fact-table CTE chains (0.78x Q4)
+5. Every CTE MUST have a WHERE clause (0.85x observed)
+6. No orphaned CTEs — remove original after splitting (0.49x, 0.68x — double materialization)
+7. No cross-joining 3+ dimension CTEs (0.0076x — Cartesian product)
+8. Max 2 cascading fact-table CTE chains (0.78x observed)
 9. Convert comma joins to explicit JOIN...ON
 10. NOT EXISTS → NOT IN breaks with NULLs — preserve EXISTS form
 
@@ -72,9 +126,9 @@ Before choosing any strategy, scan the explain plan for:
   Decision gates:
   - Structural: 2+ stage CTE chain + late predicate with columns available earlier
   - Cardinality: filter ratio >5:1 strong, 2:1–5:1 moderate if baseline >200ms, <2:1 skip
-  - Multi-fact: 1 fact = safe, 2 = careful, 3+ = STOP (0.50x Q25)
-  - ROLLUP/WINDOW downstream: CAUTION (0.85x Q67)
-  - CTE already filtered on this predicate: skip (0.71x Q1)
+  - Multi-fact: 1 fact = safe, 2 = careful, 3+ = STOP (0.50x on 3-fact query)
+  - ROLLUP/WINDOW downstream: CAUTION (0.85x observed)
+  - CTE already filtered on this predicate: skip (0.71x observed)
 
   Transform selection (lightest sufficient):
   - Single dim, ≤2 stages → date_cte_isolate (12 wins, 1.34x avg)
@@ -91,8 +145,8 @@ Before choosing any strategy, scan the explain plan for:
   P2 (outer set may be small enough that nested loop is fine),
   P3 (pre-agg on smaller set may now be more valuable).
 
-  Wins: Q6 4.00x, Q11 4.00x, Q39 4.76x, Q63 3.77x, Q93 2.97x, Q43 2.71x, Q29 2.35x, Q26 1.93x
-  Regressions: Q80 0.0076x (dim cross-join), Q25 0.50x (3-fact), Q67 0.85x (ROLLUP), Q1 0.71x (over-decomposed)
+  Wins: 8 validated (1.9x–4.8x, avg 3.3x)
+  Regressions: 0.0076x (dim cross-join), 0.50x (3-fact join lock), 0.85x (ROLLUP blocked), 0.71x (over-decomposed)
 
 ### P1: Repeated scans of same table [Phase 2 — ZERO REGRESSIONS]
 
@@ -106,7 +160,7 @@ Before choosing any strategy, scan the explain plan for:
   COUNT/SUM/AVG/MIN/MAX only (not STDDEV/VARIANCE/PERCENTILE).
 
   Transforms: single_pass_aggregation (8 wins, 1.88x avg), channel_bitmap_aggregation (1 win, 6.24x)
-  Wins: Q88 6.24x, Q9 4.47x, Q61 2.27x, Q32 1.61x, Q4 1.53x, Q90 1.47x
+  Wins: 6 validated (1.5x–6.2x, avg 2.9x)
 
 ### P2: Correlated subquery nested loop [Phase 3]
 
@@ -117,12 +171,12 @@ Before choosing any strategy, scan the explain plan for:
   Signal: nested loop, inner re-executes aggregate per outer row.
   If EXPLAIN shows hash join on correlation key → already decorrelated → STOP.
   Decision: extract correlated aggregate into CTE with GROUP BY on correlation key, JOIN back.
-  Gates: NEVER decorrelate EXISTS (0.34x Q93, 0.14x Q16), preserve ALL WHERE filters,
+  Gates: NEVER decorrelate EXISTS (0.34x, 0.14x — semi-join destroyed), preserve ALL WHERE filters,
   check if Phase 1 reduced outer to <1000 rows (nested loop may be fast enough).
 
   Transforms: decorrelate (3 wins, 2.45x avg), composite_decorrelate_union (1 win, 2.42x)
-  Wins: Q1 2.92x, Q35 2.42x
-  Regressions: Q93 0.34x (semi-join destroyed), Q1 variant 0.71x (already decorrelated)
+  Wins: 2 validated (2.4x–2.9x, avg 2.7x)
+  Regressions: 0.34x (semi-join destroyed), 0.71x (already decorrelated)
 
 ### P3: Aggregation after join — fan-out before GROUP BY [Phase 2 — ZERO REGRESSIONS]
 
@@ -136,7 +190,7 @@ Before choosing any strategy, scan the explain plan for:
   reconstruct AVG from SUM/COUNT when pre-aggregating for ROLLUP.
 
   Transforms: aggregate_pushdown, star_join_prefetch
-  Wins: Q22 42.90x (biggest win), Q65 1.80x, Q72 1.27x
+  Wins: 3 validated (1.3x–42.9x, avg 15.3x)
 
 ### P4: Cross-column OR forcing full scan [Phase 3 — HIGHEST VARIANCE]
 
@@ -150,8 +204,8 @@ Before choosing any strategy, scan the explain plan for:
   Gates: max 3 branches, cross-column only, no self-join, no nested OR (multiplicative expansion).
 
   Transforms: or_to_union
-  Wins: Q15 3.17x, Q88 6.28x, Q10 1.49x, Q45 1.35x
-  Regressions: Q13 0.23x (9 branches), Q48 0.41x (nested OR), Q90 0.59x (same-col), Q23 0.51x (self-join)
+  Wins: 4 validated (1.4x–6.3x, avg 3.1x)
+  Regressions: 0.23x (9 branches from nested OR), 0.41x (nested OR expansion), 0.59x (same-col split), 0.51x (self-join re-executed per branch)
 
 ### P5: LEFT JOIN + NULL-eliminating WHERE [Phase 3 — ZERO REGRESSIONS]
 
@@ -164,7 +218,7 @@ Before choosing any strategy, scan the explain plan for:
   Gate: no CASE WHEN IS NULL / COALESCE on right-table column.
 
   Transforms: inner_join_conversion
-  Wins: Q93 3.44x, Q80 1.89x
+  Wins: 2 validated (1.9x–3.4x, avg 2.7x)
 
 ### P6: INTERSECT materializing both sides [Phase 3 — ZERO REGRESSIONS]
 
@@ -178,7 +232,7 @@ Before choosing any strategy, scan the explain plan for:
   Related: semi_join_exists — replace full JOIN with EXISTS when joined columns not in output (1.67x).
 
   Transforms: intersect_to_exists, multi_intersect_exists_cte
-  Wins: Q14 2.72x
+  Wins: 1 validated (2.7x)
 
 ### P7: Self-joined CTE materialized for all values [Phase 3]
 
@@ -193,8 +247,8 @@ Before choosing any strategy, scan the explain plan for:
 
   Transforms: self_join_decomposition (1 win, 4.76x), union_cte_split (2 wins, 1.72x avg),
   rollup_to_union_windowing (1 win, 2.47x)
-  Wins: Q39 4.76x, Q36 2.47x, Q74 1.57x
-  Regressions: Q31 0.49x (orphaned CTE), Q74 0.68x (orphaned variant)
+  Wins: 3 validated (1.6x–4.8x, avg 2.9x)
+  Regressions: 0.49x (orphaned CTE — double materialization), 0.68x (orphaned variant)
 
 ### P8: Window functions in CTEs before join [Phase 3 — ZERO REGRESSIONS]
 
@@ -208,13 +262,13 @@ Before choosing any strategy, scan the explain plan for:
   Note: SUM() OVER() naturally skips NULLs — handles FULL OUTER JOIN gaps.
 
   Transforms: deferred_window_aggregation
-  Wins: Q51 1.36x
+  Wins: 1 validated (1.4x)
 
 ### P9: Shared subexpression executed multiple times [Phase 3]
 
   Gap: the optimizer may not CSE identical subqueries across different query branches.
   When it doesn't, cost is N× what single execution would be.
-  HARD STOP: EXISTS/NOT EXISTS → NEVER materialize (0.14x Q16). Semi-join
+  HARD STOP: EXISTS/NOT EXISTS → NEVER materialize (0.14x observed). Semi-join
   short-circuit is destroyed by CTE materialization.
 
   Signal: identical subtrees with identical costs scanning same tables.
@@ -222,14 +276,28 @@ Before choosing any strategy, scan the explain plan for:
   Gates: NOT EXISTS, subquery is expensive (joins/aggregates), CTE must have WHERE.
 
   Transforms: materialize_cte
-  Wins: Q95 1.43x
-  Regressions: Q16 0.14x (EXISTS materialized), Q95 0.54x (cardinality severed)
+  Wins: 1 validated (1.4x)
+  Regressions: 0.14x (EXISTS materialized — semi-join destroyed), 0.54x (correlated EXISTS pairs broken)
 
-### NO MATCH
+### NO MATCH — First-Principles Reasoning
 
-  Record: which pathologies checked, which gates failed.
-  Nearest miss: closest pathology + why it didn't qualify.
-  Features present: structural features for future pattern discovery.
+If no pathology matches this query, do NOT stop.
+
+1. **Check §2b-i Q-Error routing first.** Even when no pathology gate passes,
+   the Q-Error direction+locus still points to where the planner is wrong.
+   Use it as a starting hypothesis for novel intervention design.
+2. Identify the single largest cost node. What operation dominates? Can it be restructured?
+3. Count scans per base table. Repeated scans are always a consolidation opportunity.
+4. Trace row counts through the plan. Where do they stay flat or increase?
+5. Look for operations the optimizer DIDN'T optimize that it could have:
+   - Subqueries not flattened
+   - Predicates not pushed through CTE boundaries
+   - CTEs re-executed instead of materialized
+6. Use the transform catalog (§5a) as a menu. For each transform, check: does the
+   EXPLAIN show the optimizer already handles this? If not → candidate.
+
+Record: which pathologies checked, which gates failed, nearest miss, structural
+features present. This data seeds pathology discovery for future updates.
 
 ---
 
@@ -280,19 +348,19 @@ Skip pathologies the plan rules out:
 
 ## REGRESSION REGISTRY
 
-| Severity | Query | Transform | Result | Root cause |
-|----------|-------|-----------|--------|------------|
-| CATASTROPHIC | Q80 | dimension_cte_isolate | 0.0076x | Cross-joined 3 dim CTEs: Cartesian product |
-| CATASTROPHIC | Q16 | materialize_cte | 0.14x | Materialized EXISTS → semi-join destroyed |
-| SEVERE | Q13 | or_to_union | 0.23x | 9 UNION branches from nested OR |
-| SEVERE | Q93 | decorrelate | 0.34x | LEFT JOIN was already semi-join |
-| MAJOR | Q31 | union_cte_split | 0.49x | Original CTE kept → double materialization |
-| MAJOR | Q25 | date_cte_isolate | 0.50x | 3-way fact join locked optimizer order |
-| MAJOR | Q23 | or_to_union | 0.51x | Self-join re-executed per branch |
-| MAJOR | Q95 | semantic_rewrite | 0.54x | Correlated EXISTS pairs broken |
-| MODERATE | Q90 | or_to_union | 0.59x | Split same-column OR |
-| MODERATE | Q74 | union_cte_split | 0.68x | Original CTE kept alongside split |
-| MODERATE | Q1 | decorrelate | 0.71x | Pre-aggregated ALL stores when only SD needed |
-| MODERATE | Q4 | prefetch_fact_join | 0.78x | 3rd cascading CTE chain |
-| MINOR | Q72 | multi_dimension_prefetch | 0.77x | Forced suboptimal join order |
-| MINOR | Q67 | date_cte_isolate | 0.85x | CTE blocked ROLLUP pushdown |
+| Severity | Transform | Result | Root cause |
+|----------|-----------|--------|------------|
+| CATASTROPHIC | dimension_cte_isolate | 0.0076x | Cross-joined 3 dim CTEs: Cartesian product |
+| CATASTROPHIC | materialize_cte | 0.14x | Materialized EXISTS → semi-join destroyed |
+| SEVERE | or_to_union | 0.23x | 9 UNION branches from nested OR |
+| SEVERE | decorrelate | 0.34x | LEFT JOIN was already semi-join |
+| MAJOR | union_cte_split | 0.49x | Original CTE kept → double materialization |
+| MAJOR | date_cte_isolate | 0.50x | 3-way fact join locked optimizer order |
+| MAJOR | or_to_union | 0.51x | Self-join re-executed per branch |
+| MAJOR | semantic_rewrite | 0.54x | Correlated EXISTS pairs broken |
+| MODERATE | or_to_union | 0.59x | Split same-column OR |
+| MODERATE | union_cte_split | 0.68x | Original CTE kept alongside split |
+| MODERATE | decorrelate | 0.71x | Pre-aggregated ALL stores when only subset needed |
+| MODERATE | prefetch_fact_join | 0.78x | 3rd cascading CTE chain |
+| MINOR | multi_dimension_prefetch | 0.77x | Forced suboptimal join order |
+| MINOR | date_cte_isolate | 0.85x | CTE blocked ROLLUP pushdown |

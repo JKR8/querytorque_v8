@@ -160,6 +160,36 @@ class ParsedBriefing:
     raw: str = ""                # full response for audit
 
 
+def _strip_markdown_formatting(text: str) -> str:
+    """Strip markdown bold markers and heading prefixes from field names.
+
+    LLMs (especially DeepSeek R1) sometimes wrap field names in **bold**,
+    use ### headings instead of === delimiters, or wrap content in code fences.
+    Normalize for parsing.
+    """
+    # **FIELD_NAME**: → FIELD_NAME:  (strip bold markers around field names)
+    text = re.sub(r'\*\*([A-Z_]+)\*\*', r'\1', text)
+    # `FIELD_NAME`: → FIELD_NAME:  (strip inline code backticks around identifiers)
+    text = re.sub(r'`([A-Z][A-Z0-9_]+)`', r'\1', text)
+    # ### SHARED BRIEFING → === SHARED BRIEFING ===
+    text = re.sub(
+        r'^#{1,4}\s+(SHARED\s+BRIEFING)\s*(?:\(.*?\))?\s*$',
+        r'=== \1 ===',
+        text, flags=re.MULTILINE | re.IGNORECASE,
+    )
+    # ### WORKER N BRIEFING (anything) → === WORKER N BRIEFING ===
+    text = re.sub(
+        r'^#{1,4}\s+(WORKER\s+\d+\s+BRIEFING)\s*(?:\(.*?\))?\s*$',
+        r'=== \1 ===',
+        text, flags=re.MULTILINE | re.IGNORECASE,
+    )
+    # --- (horizontal rule) separators — remove
+    text = re.sub(r'^---+\s*$', '', text, flags=re.MULTILINE)
+    # Strip backtick code fences (``` or ```text) — keep content
+    text = re.sub(r'^```\w*\s*$', '', text, flags=re.MULTILINE)
+    return text
+
+
 def parse_briefing_response(response: str) -> ParsedBriefing:
     """Parse analyst briefing response into structured sections.
 
@@ -193,6 +223,9 @@ def parse_briefing_response(response: str) -> ParsedBriefing:
         r'<reasoning>.*?</reasoning>',
         '', response, flags=re.DOTALL,
     ).strip()
+
+    # Normalize markdown formatting (bold fields, heading delimiters)
+    stripped = _strip_markdown_formatting(stripped)
 
     # Parse shared briefing
     result.shared = _parse_shared_briefing(stripped)
@@ -319,7 +352,18 @@ def _parse_single_worker(block: str, worker_id: int) -> BriefingWorker:
     # HAZARD_FLAGS (multi-line)
     w.hazard_flags = _extract_briefing_section(
         block, "HAZARD_FLAGS",
-        ["===", "WORKER"],
+        [
+            "CONSTRAINT_OVERRIDE",
+            "OVERRIDE_REASONING",
+            "EXPLORATION_TYPE",
+            "HYPOTHESIS_TAG",
+            "HYPOTHESIS",
+            "EVIDENCE",
+            "EXPECTED_MECHANISM",
+            "CONTROL_SIGNAL",
+            "===",
+            "WORKER",
+        ],
     )
 
     return w

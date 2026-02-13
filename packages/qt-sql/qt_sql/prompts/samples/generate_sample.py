@@ -226,6 +226,42 @@ def get_dialect_version() -> Optional[str]:
         return None
 
 
+def load_exploit_algorithm(dialect: str = "duckdb") -> Optional[str]:
+    """Load the distilled knowledge playbook from knowledge/{dialect}.md."""
+    try:
+        from qt_sql.prompter import load_exploit_algorithm as _load
+        text = _load(dialect)
+        if text:
+            print(f"Exploit algorithm: {len(text)} chars from knowledge/{dialect}.md")
+        return text
+    except Exception as e:
+        print(f"Failed to load exploit algorithm: {e}")
+        return None
+
+
+def load_qerror_analysis(query_id: str):
+    """Load plan_json from explain cache and compute Q-Error analysis."""
+    for subdir in ["", "sf10", "sf5"]:
+        d = BENCHMARK_DIR / "explains" / subdir if subdir else BENCHMARK_DIR / "explains"
+        p = d / f"{query_id}.json"
+        if p.exists():
+            try:
+                data = json.loads(p.read_text())
+                plan_json = data.get("plan_json")
+                if plan_json and plan_json != {} and plan_json != []:
+                    from qt_sql.qerror import analyze_plan_qerror
+                    analysis = analyze_plan_qerror(plan_json)
+                    if analysis.signals or analysis.structural_flags:
+                        print(f"Q-Error: {analysis.severity} max_q={analysis.max_q_error:.0f} "
+                              f"dir={analysis.direction} locus={analysis.locus} "
+                              f"routing={analysis.pathology_candidates}")
+                    return analysis
+            except Exception as e:
+                print(f"Q-Error analysis failed: {e}")
+    print("No Q-Error data (plan_json empty or missing)")
+    return None
+
+
 def load_examples_by_ids(
     example_ids: List[str],
     matched_examples: List[Dict],
@@ -304,6 +340,8 @@ class PromptContext:
         self.strategy_leaderboard, self.query_archetype = load_strategy_leaderboard(self.original_sql)
         self.engine_profile = load_engine_profile("duckdb")
         self.dialect_version = get_dialect_version()
+        self.exploit_algorithm_text = load_exploit_algorithm("duckdb")
+        self.qerror_analysis = load_qerror_analysis(query_id)
 
         # Q88-specific output columns
         self.output_columns = extract_output_columns(self.dag)
@@ -636,15 +674,14 @@ def generate_oneshot_query(ctx: PromptContext, out_dir: Path) -> None:
         costs=ctx.costs,
         semantic_intents=ctx.semantic_intents,
         global_knowledge=ctx.global_knowledge,
-        matched_examples=ctx.matched_examples,
-        all_available_examples=ctx.all_available,
         constraints=ctx.constraints,
-        regression_warnings=ctx.regression_warnings,
         dialect="duckdb",
         dialect_version=ctx.dialect_version,
         strategy_leaderboard=ctx.strategy_leaderboard,
         query_archetype=ctx.query_archetype,
         engine_profile=ctx.engine_profile,
+        exploit_algorithm_text=ctx.exploit_algorithm_text,
+        qerror_analysis=ctx.qerror_analysis,
         mode="oneshot",
     )
 
@@ -668,15 +705,14 @@ def generate_expert(ctx: PromptContext, out_dir: Path) -> None:
         costs=ctx.costs,
         semantic_intents=ctx.semantic_intents,
         global_knowledge=ctx.global_knowledge,
-        matched_examples=ctx.matched_examples,
-        all_available_examples=ctx.all_available,
         constraints=ctx.constraints,
-        regression_warnings=ctx.regression_warnings,
         dialect="duckdb",
         dialect_version=ctx.dialect_version,
         strategy_leaderboard=ctx.strategy_leaderboard,
         query_archetype=ctx.query_archetype,
         engine_profile=ctx.engine_profile,
+        exploit_algorithm_text=ctx.exploit_algorithm_text,
+        qerror_analysis=ctx.qerror_analysis,
         mode="expert",
     )
 
@@ -717,15 +753,14 @@ def generate_swarm_analyst(ctx: PromptContext, out_dir: Path) -> None:
         costs=ctx.costs,
         semantic_intents=ctx.semantic_intents,
         global_knowledge=ctx.global_knowledge,
-        matched_examples=ctx.matched_examples,
-        all_available_examples=ctx.all_available,
         constraints=ctx.constraints,
-        regression_warnings=ctx.regression_warnings,
         dialect="duckdb",
         dialect_version=ctx.dialect_version,
         strategy_leaderboard=ctx.strategy_leaderboard,
         query_archetype=ctx.query_archetype,
         engine_profile=ctx.engine_profile,
+        exploit_algorithm_text=ctx.exploit_algorithm_text,
+        qerror_analysis=ctx.qerror_analysis,
         mode="swarm",
     )
 

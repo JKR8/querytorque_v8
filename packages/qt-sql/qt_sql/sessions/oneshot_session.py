@@ -72,10 +72,7 @@ class OneshotSession(OptimizationSession):
                 costs=costs,
                 semantic_intents=ctx["semantic_intents"],
                 global_knowledge=ctx["global_knowledge"],
-                matched_examples=ctx["matched_examples"],
-                all_available_examples=ctx["all_available_examples"],
                 constraints=ctx["constraints"],
-                regression_warnings=ctx["regression_warnings"],
                 dialect=self.dialect,
                 strategy_leaderboard=ctx["strategy_leaderboard"],
                 query_archetype=ctx["query_archetype"],
@@ -85,6 +82,7 @@ class OneshotSession(OptimizationSession):
                 plan_scanner_text=ctx["plan_scanner_text"],
                 iteration_history={"attempts": iteration_history} if iteration_history else None,
                 mode="oneshot",
+                qerror_analysis=ctx.get("qerror_analysis"),
             )
 
             # Phase 4: LLM call + JSON rewrite parsing via generate_one()

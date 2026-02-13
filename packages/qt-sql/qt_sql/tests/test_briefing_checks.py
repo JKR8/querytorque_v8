@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from qt_sql.prompts.analyst_briefing import build_analyst_briefing_prompt
 from qt_sql.prompts.briefing_checks import validate_parsed_briefing
-from qt_sql.prompts.swarm_parsers import BriefingShared, BriefingWorker, ParsedBriefing
+from qt_sql.prompts.swarm_parsers import (
+    BriefingShared,
+    BriefingWorker,
+    ParsedBriefing,
+    parse_briefing_response,
+)
 from qt_sql.prompts.worker import build_worker_prompt
 from qt_sql.dag import LogicalTreeNode, QueryLogicalTree
 
@@ -87,15 +92,12 @@ def test_analyst_prompt_includes_section_validation_checklist() -> None:
         costs={},
         semantic_intents=None,
         global_knowledge=None,
-        matched_examples=[],
-        all_available_examples=[],
         constraints=[
             {"id": "LITERAL_PRESERVATION", "severity": "CRITICAL", "prompt_instruction": "a"},
             {"id": "SEMANTIC_EQUIVALENCE", "severity": "CRITICAL", "prompt_instruction": "b"},
             {"id": "COMPLETE_OUTPUT", "severity": "CRITICAL", "prompt_instruction": "c"},
             {"id": "CTE_COLUMN_COMPLETENESS", "severity": "CRITICAL", "prompt_instruction": "d"},
         ],
-        regression_warnings=None,
         dialect="postgresql",
         dialect_version="14.3",
         strategy_leaderboard=None,
@@ -105,9 +107,9 @@ def test_analyst_prompt_includes_section_validation_checklist() -> None:
     )
 
     assert "## Section Validation Checklist (MUST pass before final output)" in prompt
-    assert "`SEMANTIC_CONTRACT`: 40-200 tokens" in prompt
+    assert "`SEMANTIC_CONTRACT`: 30-250 tokens" in prompt
     assert "`NODE_CONTRACTS`: every logical tree node has a contract" in prompt
-    assert "WORKER 4 EXPLORATION FIELDS" in prompt
+    assert "EXPLORATION FIELDS" in prompt
 
 
 def test_analyst_prompt_exploit_algorithm_branch() -> None:
@@ -136,10 +138,7 @@ def test_analyst_prompt_exploit_algorithm_branch() -> None:
         costs={},
         semantic_intents=None,
         global_knowledge=None,
-        matched_examples=[],
-        all_available_examples=[],
         constraints=[],
-        regression_warnings=None,
         dialect="postgresql",
         exploit_algorithm_text=fake_algo,
         engine_profile={"briefing_note": "should not appear"},
@@ -202,3 +201,79 @@ def test_validate_parsed_briefing_accepts_well_populated_briefing() -> None:
     issues = validate_parsed_briefing(parsed)
 
     assert issues == []
+
+
+def test_validate_parsed_briefing_expert_mode_accepts_single_worker() -> None:
+    parsed = ParsedBriefing(
+        shared=_shared_valid(),
+        workers=[
+            _worker(1),
+            BriefingWorker(worker_id=2),
+            BriefingWorker(worker_id=3),
+            BriefingWorker(worker_id=4),
+        ],
+        raw="",
+    )
+
+    issues = validate_parsed_briefing(parsed, expected_workers=1)
+
+    assert issues == []
+
+
+def test_validate_parsed_briefing_rejects_too_many_gap_ids() -> None:
+    shared = _shared_valid()
+    shared.active_constraints = (
+        "- LITERAL_PRESERVATION: preserve all constants exactly.\n"
+        "- SEMANTIC_EQUIVALENCE: preserve join and filter semantics.\n"
+        "- COMPLETE_OUTPUT: preserve projected columns and order.\n"
+        "- CTE_COLUMN_COMPLETENESS: keep downstream-required columns.\n"
+        "- GAP_A: signal A.\n"
+        "- GAP_B: signal B.\n"
+        "- GAP_C: signal C.\n"
+        "- GAP_D: signal D."
+    )
+    parsed = ParsedBriefing(
+        shared=shared,
+        workers=[_worker(1), _worker(2), _worker(3), _worker(4)],
+        raw="",
+    )
+
+    issues = validate_parsed_briefing(parsed)
+
+    assert any("too many gap/hypothesis IDs" in i for i in issues)
+
+
+def test_parse_worker_hazard_flags_stop_before_exploration_fields() -> None:
+    response = (
+        "=== SHARED BRIEFING ===\n"
+        "SEMANTIC_CONTRACT: " + "word " * 40 + "\n"
+        "BOTTLENECK_DIAGNOSIS: join-bound with optimizer overlap\n"
+        "ACTIVE_CONSTRAINTS:\n"
+        "- LITERAL_PRESERVATION: a\n"
+        "- SEMANTIC_EQUIVALENCE: b\n"
+        "- COMPLETE_OUTPUT: c\n"
+        "- CTE_COLUMN_COMPLETENESS: d\n"
+        "REGRESSION_WARNINGS:\n"
+        "None applicable.\n\n"
+        "=== WORKER 1 BRIEFING ===\n"
+        "STRATEGY: strategy_1_custom\n"
+        "TARGET_LOGICAL_TREE:\n"
+        "  a -> b\n"
+        "NODE_CONTRACTS:\n"
+        "  a:\n"
+        "    FROM: t\n"
+        "    OUTPUT: c\n"
+        "    CONSUMERS: b\n"
+        "EXAMPLES: ex_1\n"
+        "EXAMPLE_ADAPTATION:\n"
+        "  Apply core shape only.\n"
+        "HAZARD_FLAGS:\n"
+        "- Preserve output schema\n"
+        "CONSTRAINT_OVERRIDE: None\n"
+        "EXPLORATION_TYPE: novel_combination\n"
+        "HYPOTHESIS_TAG: H1_TEST\n"
+    )
+
+    parsed = parse_briefing_response(response)
+
+    assert parsed.workers[0].hazard_flags == "- Preserve output schema"

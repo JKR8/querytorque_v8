@@ -14,15 +14,15 @@ REQUIRED_CORRECTNESS_IDS = (
 )
 
 
-def build_analyst_section_checklist() -> str:
+def build_analyst_section_checklist(is_discovery_mode: bool = False) -> str:
     """Checklist the analyst must satisfy for each output section."""
-    return "\n".join([
+    lines = [
         "## Section Validation Checklist (MUST pass before final output)",
         "",
         "### SHARED BRIEFING",
-        "- `SEMANTIC_CONTRACT`: 40-200 tokens covering business intent, JOIN semantics, aggregation trap, filter dependency.",
+        "- `SEMANTIC_CONTRACT`: 30-250 tokens covering business intent, JOIN semantics, aggregation trap, filter dependency.",
         "- `BOTTLENECK_DIAGNOSIS`: dominant mechanism, bound type (`scan-bound`/`join-bound`/`aggregation-bound`), what optimizer already handles.",
-        "- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs + 1-3 engine gaps with EXPLAIN evidence.",
+        "- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs + 0-3 engine gap or hypothesis IDs with EXPLAIN evidence.",
         "- `REGRESSION_WARNINGS`: `None applicable.` or entries with `CAUSE:` and `RULE:`.",
         "",
         "### WORKER N BRIEFING (N=1..4)",
@@ -31,9 +31,19 @@ def build_analyst_section_checklist() -> str:
         "- `EXAMPLES`: 1-3 IDs. `EXAMPLE_ADAPTATION`: what to adapt/ignore per example.",
         "- `HAZARD_FLAGS`: query-specific risks, not generic cautions.",
         "",
-        "### WORKER 4 EXPLORATION FIELDS",
-        "- Includes `CONSTRAINT_OVERRIDE`, `OVERRIDE_REASONING`, and `EXPLORATION_TYPE`.",
-    ])
+    ]
+    if is_discovery_mode:
+        lines.extend([
+            "### EXPLORATION FIELDS (all workers in discovery mode)",
+            "- All workers include `CONSTRAINT_OVERRIDE`, `EXPLORATION_TYPE`, `HYPOTHESIS_TAG`.",
+            "- All workers include `HYPOTHESIS`, `EVIDENCE`, `EXPECTED_MECHANISM`, `CONTROL_SIGNAL`.",
+        ])
+    else:
+        lines.extend([
+            "### WORKER 4 EXPLORATION FIELDS",
+            "- Includes `CONSTRAINT_OVERRIDE`, `OVERRIDE_REASONING`, `EXPLORATION_TYPE`, and `HYPOTHESIS_TAG`.",
+        ])
+    return "\n".join(lines)
 
 
 def build_expert_section_checklist() -> str:
@@ -42,9 +52,9 @@ def build_expert_section_checklist() -> str:
         "## Section Validation Checklist (MUST pass before final output)",
         "",
         "### SHARED BRIEFING",
-        "- `SEMANTIC_CONTRACT`: 40-200 tokens covering business intent, JOIN semantics, aggregation trap, filter dependency.",
+        "- `SEMANTIC_CONTRACT`: 30-250 tokens covering business intent, JOIN semantics, aggregation trap, filter dependency.",
         "- `BOTTLENECK_DIAGNOSIS`: dominant mechanism, bound type (`scan-bound`/`join-bound`/`aggregation-bound`), what optimizer already handles.",
-        "- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs + 1-3 engine gaps with EXPLAIN evidence.",
+        "- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs + 0-3 engine gap or hypothesis IDs with EXPLAIN evidence.",
         "- `REGRESSION_WARNINGS`: `None applicable.` or entries with `CAUSE:` and `RULE:`.",
         "",
         "### WORKER 1 BRIEFING",
@@ -61,9 +71,9 @@ def build_oneshot_section_checklist() -> str:
         "## Section Validation Checklist (MUST pass before final output)",
         "",
         "### SHARED BRIEFING",
-        "- `SEMANTIC_CONTRACT`: 40-200 tokens covering business intent, JOIN semantics, aggregation trap, filter dependency.",
+        "- `SEMANTIC_CONTRACT`: 30-250 tokens covering business intent, JOIN semantics, aggregation trap, filter dependency.",
         "- `BOTTLENECK_DIAGNOSIS`: dominant mechanism, bound type (`scan-bound`/`join-bound`/`aggregation-bound`), what optimizer already handles.",
-        "- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs + 1-3 engine gaps with EXPLAIN evidence.",
+        "- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs + 0-3 engine gap or hypothesis IDs with EXPLAIN evidence.",
         "- `REGRESSION_WARNINGS`: `None applicable.` or entries with `CAUSE:` and `RULE:`.",
         "",
         "### REWRITE",
@@ -101,11 +111,17 @@ def build_sniper_rewrite_checklist() -> str:
     ])
 
 
-def validate_parsed_briefing(briefing: Any) -> List[str]:
+def validate_parsed_briefing(
+    briefing: Any,
+    expected_workers: int = 4,
+) -> List[str]:
     """Validate that a parsed analyst briefing is correctly populated.
 
     Returns a list of human-readable issues. Empty list means it passed checks.
     """
+    if expected_workers < 1:
+        raise ValueError("expected_workers must be >= 1")
+
     issues: List[str] = []
     shared = getattr(briefing, "shared", None)
     workers = list(getattr(briefing, "workers", []) or [])
@@ -115,14 +131,21 @@ def validate_parsed_briefing(briefing: Any) -> List[str]:
 
     issues.extend(_validate_shared(shared))
 
+    # Mode-aware worker filtering: expert mode expects 1 worker, swarm expects 4.
+    relevant_workers = []
+    for w in workers:
+        wid = int(getattr(w, "worker_id", 0) or 0)
+        if 1 <= wid <= expected_workers:
+            relevant_workers.append(w)
+
     seen_strategies: Dict[str, int] = {}
     seen_examples: Dict[str, int] = {}
-    worker_ids = {int(getattr(w, "worker_id", 0) or 0) for w in workers}
-    for wid in range(1, 5):
+    worker_ids = {int(getattr(w, "worker_id", 0) or 0) for w in relevant_workers}
+    for wid in range(1, expected_workers + 1):
         if wid not in worker_ids:
             issues.append(f"WORKER_{wid}: missing worker briefing block.")
 
-    for worker in workers:
+    for worker in relevant_workers:
         wid = int(getattr(worker, "worker_id", 0) or 0)
         strategy = (getattr(worker, "strategy", "") or "").strip()
         if not strategy or strategy == f"strategy_{wid}":
@@ -162,9 +185,9 @@ def _validate_shared(shared: Any) -> List[str]:
         issues.append("SHARED: SEMANTIC_CONTRACT missing.")
     else:
         token_count = len(semantic_contract.split())
-        if token_count < 40 or token_count > 200:
+        if token_count < 30 or token_count > 250:
             issues.append(
-                f"SHARED: SEMANTIC_CONTRACT token count {token_count} (expected 40-200)."
+                f"SHARED: SEMANTIC_CONTRACT token count {token_count} (expected 30-250)."
             )
 
     bottleneck = (getattr(shared, "bottleneck_diagnosis", "") or "").strip()
@@ -190,10 +213,10 @@ def _validate_shared(shared: Any) -> List[str]:
             if cid not in id_set:
                 issues.append(f"SHARED: ACTIVE_CONSTRAINTS missing {cid}.")
         gap_ids = [cid for cid in ids if cid not in REQUIRED_CORRECTNESS_IDS]
-        if not (1 <= len(gap_ids) <= 3):
+        if len(gap_ids) > 3:
             issues.append(
-                "SHARED: ACTIVE_CONSTRAINTS should include 1-3 engine gap IDs in addition "
-                "to the 4 correctness constraints."
+                "SHARED: ACTIVE_CONSTRAINTS has too many gap/hypothesis IDs "
+                f"({len(gap_ids)}). Expected 0-3 engine gaps or hypothesis IDs."
             )
 
     regression = (getattr(shared, "regression_warnings", "") or "").strip()
@@ -207,5 +230,3 @@ def _validate_shared(shared: Any) -> List[str]:
                 )
 
     return issues
-
-

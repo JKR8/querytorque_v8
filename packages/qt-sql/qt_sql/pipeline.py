@@ -1178,7 +1178,8 @@ class Pipeline:
             costs=costs,
             dialect=dialect,
             dialect_version=self._engine_version,
-            **{k: v for k, v in ctx.items()},
+            **{k: v for k, v in ctx.items()
+               if k not in ("matched_examples", "all_available_examples", "regression_warnings")},
         )
 
         # Send to LLM
@@ -1199,7 +1200,7 @@ class Pipeline:
         # so we parse with parse_briefing_response and convert the shared
         # sections into the flat text format that Prompter.build_prompt() expects.
         briefing = parse_briefing_response(raw_response)
-        briefing_issues = validate_parsed_briefing(briefing)
+        briefing_issues = validate_parsed_briefing(briefing, expected_workers=1)
         if briefing_issues:
             logger.error(
                 "[%s] Analyst briefing invalid: %s",
@@ -1571,6 +1572,10 @@ class Pipeline:
             load_exploit_algorithm,
         )
 
+        # Normalize dialect aliases early so all downstream branches are consistent
+        if dialect.lower() in ("pg",):
+            dialect = "postgres"
+
         # Exploit algorithm (replaces engine profile when available)
         exploit_algorithm_text = load_exploit_algorithm(dialect)
 
@@ -1659,11 +1664,15 @@ class Pipeline:
         try:
             from .detection import detect_transforms, load_transforms
             all_transforms = load_transforms()
-            engine_name = "duckdb" if dialect in ("duckdb",) else "postgresql"
+            engine_name = {"duckdb": "duckdb", "snowflake": "snowflake"}.get(dialect, "postgresql")
             detected = detect_transforms(sql, all_transforms, engine=engine_name, dialect=dialect)
             detected_transforms = detected[:5]
         except Exception as e:
             logger.warning(f"[{query_id}] Failed to detect transforms: {e}")
+
+        # Q-Error analysis (all engines — requires plan_json from EXPLAIN ANALYZE)
+        # Snowflake: plan_json typically null (no ANALYZE), gracefully returns None
+        qerror_analysis = self._get_qerror_analysis(query_id)
 
         ctx = {
             "explain_plan_text": explain_plan_text,
@@ -1680,6 +1689,7 @@ class Pipeline:
             "resource_envelope": resource_envelope,
             "exploit_algorithm_text": exploit_algorithm_text,
             "detected_transforms": detected_transforms,
+            "qerror_analysis": qerror_analysis,
         }
         self._enforce_intelligence_gates(query_id=query_id, dialect=dialect, ctx=ctx)
         return ctx
@@ -1691,6 +1701,10 @@ class Pipeline:
         ctx: Dict[str, Any],
     ) -> None:
         """Hard gate for required intelligence inputs before analyst prompting."""
+        # Normalize dialect aliases so gate checks are consistent
+        if dialect.lower() in ("pg",):
+            dialect = "postgres"
+
         missing: list[str] = []
 
         if not ctx.get("matched_examples"):
@@ -1743,6 +1757,44 @@ class Pipeline:
             logger.warning("%s (bootstrap override enabled)", message)
             return
         raise RuntimeError(message)
+
+    def _get_qerror_analysis(self, query_id: str) -> Optional[Any]:
+        """Load plan_json from explain cache and run Q-Error analysis.
+
+        Returns QErrorAnalysis if plan_json is available, None otherwise.
+        """
+        search_paths = [
+            self.benchmark_dir / "explains" / f"{query_id}.json",
+            self.benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
+            self.benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
+        ]
+
+        for cache_path in search_paths:
+            if cache_path.exists():
+                try:
+                    data = json.loads(cache_path.read_text())
+                    plan_json = data.get("plan_json")
+                    # plan_json can be dict (DuckDB) or list (PostgreSQL)
+                    if plan_json and plan_json != {} and plan_json != []:
+                        from .qerror import analyze_plan_qerror
+                        analysis = analyze_plan_qerror(plan_json)
+                        if analysis.signals or analysis.structural_flags:
+                            logger.info(
+                                f"[{query_id}] Q-Error: {analysis.severity} "
+                                f"max_q={analysis.max_q_error:.0f} "
+                                f"dir={analysis.direction} locus={analysis.locus} "
+                                f"routing={analysis.pathology_candidates}"
+                            )
+                        return analysis
+                    elif plan_json == {} or plan_json is None:
+                        # plan_json empty — try structural flags from plan_text
+                        from .qerror import extract_structural_flags, QErrorAnalysis
+                        # Can't extract structural flags from ASCII text
+                        return None
+                except Exception as e:
+                    logger.warning(f"[{query_id}] Q-Error analysis failed: {e}")
+
+        return None
 
     def get_explain_plan_text(
         self, query_id: str, dialect: str = "duckdb",

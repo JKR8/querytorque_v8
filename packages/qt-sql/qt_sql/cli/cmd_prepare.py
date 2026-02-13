@@ -21,6 +21,8 @@ import click
     help="Prompt mode.",
 )
 @click.option("--force", is_flag=True, help="Regenerate even if prompts exist.")
+@click.option("--bootstrap", is_flag=True,
+              help="Allow first-run mode: skip intelligence gates (no gold examples/global knowledge required).")
 @click.option("-o", "--output-dir", type=click.Path(), default=None,
               help="Custom output directory (default: benchmark/prepared/<timestamp>).")
 @click.pass_context
@@ -30,6 +32,7 @@ def prepare(
     query: tuple,
     mode: str,
     force: bool,
+    bootstrap: bool,
     output_dir: str | None,
 ) -> None:
     """Generate analyst briefing prompts deterministically (no LLM calls).
@@ -76,6 +79,10 @@ def prepare(
     from ..pipeline import Pipeline
     from ..prompts.analyst_briefing import build_analyst_briefing_prompt
 
+    if bootstrap:
+        import os
+        os.environ["QT_ALLOW_INTELLIGENCE_BOOTSTRAP"] = "1"
+
     pipeline = Pipeline(bench_dir)
 
     results = []
@@ -110,10 +117,7 @@ def prepare(
                 costs=costs,
                 semantic_intents=ctx_data.get("semantic_intents"),
                 global_knowledge=ctx_data.get("global_knowledge"),
-                matched_examples=ctx_data.get("matched_examples", []),
-                all_available_examples=ctx_data.get("all_available_examples", []),
                 constraints=ctx_data.get("constraints", []),
-                regression_warnings=ctx_data.get("regression_warnings"),
                 dialect=dialect,
                 strategy_leaderboard=ctx_data.get("strategy_leaderboard"),
                 query_archetype=ctx_data.get("query_archetype"),
@@ -122,6 +126,7 @@ def prepare(
                 exploit_algorithm_text=ctx_data.get("exploit_algorithm_text"),
                 plan_scanner_text=ctx_data.get("plan_scanner_text"),
                 mode=mode,
+                qerror_analysis=ctx_data.get("qerror_analysis"),
             )
 
             # Save outputs

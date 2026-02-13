@@ -60,6 +60,7 @@ class SwarmSession(OptimizationSession):
         self._sniper_result: Optional[WorkerResult] = None  # for retry
         self._candidate_explains: Dict[int, str] = {}  # worker_id → explain_text
         self._race_result: Optional[Any] = None  # RaceResult from fan-out race
+        self._db_reachable: Optional[bool] = None  # DB connectivity (set once, reused)
         # Two-phase state (set by prepare_candidates, consumed by validate_and_finish)
         self._gen_result: Optional[Dict[str, Any]] = None
         self._dag: Optional[Any] = None
@@ -138,7 +139,7 @@ class SwarmSession(OptimizationSession):
                 return self._build_result()
 
             # Cache baseline for snipe iterations (avoids re-timing original)
-            if self._cached_baseline is None and self.max_iterations > 1:
+            if self._cached_baseline is None and self.max_iterations > 1 and self._db_reachable is not False:
                 try:
                     self._cached_baseline = self.pipeline._benchmark_baseline(self.original_sql)
                     self._stage(
@@ -541,7 +542,7 @@ class SwarmSession(OptimizationSession):
                 return self._build_result()
 
             # Cache baseline for snipe iterations
-            if self._cached_baseline is None and self.max_iterations > 1:
+            if self._cached_baseline is None and self.max_iterations > 1 and self._db_reachable is not False:
                 try:
                     self._cached_baseline = self.pipeline._benchmark_baseline(
                         self.original_sql
@@ -641,7 +642,6 @@ class SwarmSession(OptimizationSession):
         global_knowledge = ctx["global_knowledge"]
         semantic_intents = ctx["semantic_intents"]
         matched_examples = ctx["matched_examples"]
-        all_available = ctx["all_available_examples"]
         engine_profile = ctx["engine_profile"]
         constraints = ctx["constraints"]
         regression_warnings = ctx["regression_warnings"]
@@ -650,6 +650,7 @@ class SwarmSession(OptimizationSession):
         resource_envelope = ctx["resource_envelope"]
         exploit_algorithm_text = ctx["exploit_algorithm_text"]
         detected_transforms = ctx.get("detected_transforms", [])
+        qerror_analysis = ctx.get("qerror_analysis")
 
         self._stage(
             self.query_id,
@@ -678,10 +679,7 @@ class SwarmSession(OptimizationSession):
             costs=costs,
             semantic_intents=semantic_intents,
             global_knowledge=global_knowledge,
-            matched_examples=matched_examples,
-            all_available_examples=all_available,
             constraints=constraints,
-            regression_warnings=regression_warnings,
             dialect=self.dialect,
             strategy_leaderboard=strategy_leaderboard,
             query_archetype=query_archetype,
@@ -690,6 +688,7 @@ class SwarmSession(OptimizationSession):
             exploit_algorithm_text=exploit_algorithm_text,
             plan_scanner_text=plan_scanner_text,
             detected_transforms=detected_transforms,
+            qerror_analysis=qerror_analysis,
         )
 
         # ── Step 3: Call analyst LLM ─────────────────────────────────────
@@ -938,47 +937,64 @@ class SwarmSession(OptimizationSession):
         self._stage(self.query_id, f"VALIDATE: Racing original + 4 candidates... | total {_fmt_elapsed(time.time() - t_session)}")
         t_val = time.time()
 
-        # Try parallel race first (all 5 queries run simultaneously)
+        # ── Pre-flight: verify DB connectivity ────────────────────────────
+        # Skip validation entirely if DB is unreachable (e.g. Snowflake auth pending)
         batch_results = None
+        if self._db_reachable is None:
+            try:
+                from ..execution.factory import create_executor_from_dsn
+                test_exec = create_executor_from_dsn(self.pipeline.config.db_path_or_dsn)
+                test_exec.execute("SELECT 1")
+                test_exec.close()
+                self._db_reachable = True
+            except Exception as e:
+                self._db_reachable = False
+                self._stage(self.query_id, f"VALIDATE: DB unreachable ({type(e).__name__}: {str(e)[:80]})")
+        if not self._db_reachable:
+            self._stage(self.query_id, "VALIDATE: Skipping — returning NEUTRAL for all candidates (generation-only mode)")
+            batch_results = [("NEUTRAL", 1.00, ["DB unreachable — validation skipped"], None)] * len(optimized_sqls)
+
+        # Try parallel race first (all 5 queries run simultaneously)
         from ..validate import race_candidates
-        try:
-            race_result = race_candidates(
-                db_path=self.pipeline.config.db_path_or_dsn,
-                original_sql=self.original_sql,
-                candidate_sqls=optimized_sqls,
-                worker_ids=sorted_wids,
-                min_runtime_ms=2000.0,
-                min_margin=0.05,
-            )
-            if race_result is not None:
-                batch_results = race_result.verdicts
-                # Cache baseline and race result for snipe reuse
-                self._cached_baseline = race_result.baseline
-                self._race_result = race_result
-
-                # Log race results
-                lane_tags = []
-                for cl in race_result.candidates:
-                    if not cl.finished:
-                        lane_tags.append(f"W{cl.lane_id}=DNF")
-                    elif cl.error:
-                        lane_tags.append(f"W{cl.lane_id}=ERR")
-                    else:
-                        lane_tags.append(f"W{cl.lane_id}={cl.elapsed_ms:.0f}ms")
-                winner_tag = "WINNER" if race_result.has_clear_winner else "NO WINNER"
-                self._stage(
-                    self.query_id,
-                    f"RACE [{winner_tag}]: original={race_result.original.elapsed_ms:.0f}ms | "
-                    + " | ".join(lane_tags)
+        if batch_results is None:
+            try:
+                race_result = race_candidates(
+                    db_path=self.pipeline.config.db_path_or_dsn,
+                    original_sql=self.original_sql,
+                    candidate_sqls=optimized_sqls,
+                    worker_ids=sorted_wids,
+                    min_runtime_ms=2000.0,
+                    min_margin=0.05,
                 )
+                if race_result is not None:
+                    batch_results = race_result.verdicts
+                    # Cache baseline and race result for snipe reuse
+                    self._cached_baseline = race_result.baseline
+                    self._race_result = race_result
 
-                # Use race baseline EXPLAIN as fallback
-                if (not self._explain_plan_text
-                        and race_result.baseline.explain_text):
-                    self._explain_plan_text = race_result.baseline.explain_text
-                    self._stage(self.query_id, "EXPLAIN: captured from race baseline")
-        except Exception as e:
-            logger.warning(f"[{self.query_id}] Race failed, falling back: {e}")
+                    # Log race results
+                    lane_tags = []
+                    for cl in race_result.candidates:
+                        if not cl.finished:
+                            lane_tags.append(f"W{cl.lane_id}=DNF")
+                        elif cl.error:
+                            lane_tags.append(f"W{cl.lane_id}=ERR")
+                        else:
+                            lane_tags.append(f"W{cl.lane_id}={cl.elapsed_ms:.0f}ms")
+                    winner_tag = "WINNER" if race_result.has_clear_winner else "NO WINNER"
+                    self._stage(
+                        self.query_id,
+                        f"RACE [{winner_tag}]: original={race_result.original.elapsed_ms:.0f}ms | "
+                        + " | ".join(lane_tags)
+                    )
+
+                    # Use race baseline EXPLAIN as fallback
+                    if (not self._explain_plan_text
+                            and race_result.baseline.explain_text):
+                        self._explain_plan_text = race_result.baseline.explain_text
+                        self._stage(self.query_id, "EXPLAIN: captured from race baseline")
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] Race failed, falling back: {e}")
 
         # Fallback: sequential validation (for fast queries < 2s)
         if batch_results is None:
@@ -1032,6 +1048,7 @@ class SwarmSession(OptimizationSession):
         for wid, (status, speedup, error_msgs, error_cat) in zip(sorted_wids, batch_results):
             wb, optimized_sql, transforms, w_prompt, w_response, set_local_cmds, iface_warns = candidates_by_worker[wid]
             worker_prompts[wid] = (w_prompt, w_response)
+            result_sql = self.original_sql if self._db_reachable is False else optimized_sql
 
             # Prepend interface warnings to error messages so retry worker sees them
             all_errors = list(error_msgs or [])
@@ -1044,7 +1061,7 @@ class SwarmSession(OptimizationSession):
                 worker_id=wb.worker_id,
                 strategy=wb.strategy,
                 examples_used=wb.examples,
-                optimized_sql=optimized_sql,
+                optimized_sql=result_sql,
                 speedup=speedup,
                 status=status,
                 transforms=transforms,
@@ -1356,7 +1373,11 @@ class SwarmSession(OptimizationSession):
             f"VALIDATE: Timing... | total {_fmt_elapsed(time.time() - t_session)}"
         )
         t_val = time.time()
-        if self._cached_baseline is not None:
+        if self._db_reachable is False:
+            status, speedup = "NEUTRAL", 1.00
+            val_errors, val_error_cat = ["DB unreachable — validation skipped"], None
+            self._stage(self.query_id, "VALIDATE: Skipping (DB unreachable)")
+        elif self._cached_baseline is not None:
             status, speedup, val_errors, val_error_cat = self.pipeline._validate_against_baseline(
                 self._cached_baseline, optimized_sql
             )
@@ -1376,7 +1397,9 @@ class SwarmSession(OptimizationSession):
             worker_id=snipe_worker_id,
             strategy=strategy,
             examples_used=example_ids,
-            optimized_sql=optimized_sql,
+            optimized_sql=(
+                self.original_sql if self._db_reachable is False else optimized_sql
+            ),
             speedup=speedup,
             status=status,
             transforms=candidate.transforms,
