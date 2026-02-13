@@ -2,38 +2,38 @@
   "engine": "postgresql",
   "version_tested": "14.3+",
   "profile_type": "engine_profile",
-  "briefing_note": "This is field intelligence gathered from 53 DSB queries at SF5-SF10. PostgreSQL is a fundamentally different optimizer than DuckDB — it has bitmap index scans, JIT compilation, and aggressive CTE materialization. Techniques that work on DuckDB often regress here. Use this to guide your analysis but apply your own judgment — every query is different. Add to this knowledge if you observe something new.",
+  "briefing_note": "Field intelligence from 53 DSB queries at SF5-SF10. PostgreSQL has bitmap index scans, JIT compilation, and aggressive CTE materialization. Techniques that work on DuckDB often regress here.",
 
   "strengths": [
     {
       "id": "BITMAP_OR_SCAN",
-      "summary": "Multi-branch OR conditions on indexed columns are handled via BitmapOr — a single fact table scan with bitmap combination. Extremely efficient.",
-      "field_note": "NEVER split OR conditions into UNION ALL branches on PostgreSQL. BitmapOr is categorically faster. We saw 0.21x and 0.26x observed — each UNION branch forced a full 7-table join + fact scan that BitmapOr avoids. The only conceivable case for OR-to-UNION on PG is when branches reference completely different tables, and even then it's risky."
+      "summary": "Multi-branch OR conditions on indexed columns handled via BitmapOr — single scan with bitmap combination.",
+      "implication": "NEVER split OR conditions into UNION ALL. 0.21x and 0.26x observed."
     },
     {
       "id": "SEMI_JOIN_EXISTS",
-      "summary": "EXISTS/NOT EXISTS uses semi-join with early termination. Stops scanning after the first match per outer row.",
-      "field_note": "NEVER convert EXISTS to IN/NOT IN or to materialized CTEs with SELECT DISTINCT. The semi-join stops after first match — materializing forces a full DISTINCT scan of million-row fact tables. We saw 0.50x (3 DISTINCT CTEs vs 3 semi-joins) and 0.86x (UNION ALL CTE without dedup vs OR'd EXISTS short-circuits) observed. Also: NOT IN has NULL-handling semantics that can block hash anti-join optimization."
+      "summary": "EXISTS/NOT EXISTS uses semi-join with early termination.",
+      "implication": "NEVER convert EXISTS to IN/NOT IN or materialized CTEs. 0.50x, 0.75x observed."
     },
     {
       "id": "INNER_JOIN_REORDERING",
-      "summary": "PostgreSQL freely reorders INNER JOINs based on estimated selectivity. The cost model works well for explicit JOIN...ON syntax.",
-      "field_note": "Don't restructure INNER JOIN orders — the optimizer handles this well. Focus on queries where JOIN type (LEFT) prevents reordering, or where comma-joins confuse the cost model (see COMMA_JOIN_WEAKNESS gap)."
+      "summary": "Freely reorders INNER JOINs based on estimated selectivity.",
+      "implication": "Don't restructure INNER JOIN orders. Focus on LEFT JOIN blocking or comma-join confusion."
     },
     {
       "id": "INDEX_ONLY_SCAN",
-      "summary": "When an index covers all requested columns, PostgreSQL reads only the index without touching the heap.",
-      "field_note": "Dimension table lookups are already fast via index-only scans. Pre-filtering small dimensions (<10K rows) into CTEs adds materialization overhead with minimal benefit."
+      "summary": "Reads only index when covering all requested columns.",
+      "implication": "Small dimension lookups (<10K rows) may not need CTEs."
     },
     {
       "id": "PARALLEL_QUERY_EXECUTION",
-      "summary": "PostgreSQL parallelizes large scans and aggregations across worker processes with partial aggregation finalization.",
-      "field_note": "Large fact table scans are already parallelized. Restructuring into CTEs may reduce parallelism opportunities because CTE materialization is single-threaded."
+      "summary": "Parallelizes large scans and aggregations across worker processes.",
+      "implication": "CTEs may reduce parallelism — CTE materialization is single-threaded."
     },
     {
       "id": "JIT_COMPILATION",
-      "summary": "PostgreSQL JIT-compiles complex expressions and tuple deforming for long-running queries.",
-      "field_note": "Complex WHERE expressions have low per-row overhead due to JIT. Simplifying expressions for performance is usually unnecessary."
+      "summary": "JIT-compiles complex expressions for long-running queries (>100ms).",
+      "implication": "Complex WHERE expressions have low per-row overhead due to JIT."
     }
   ],
 
@@ -41,184 +41,175 @@
     {
       "id": "COMMA_JOIN_WEAKNESS",
       "priority": "HIGH",
-      "what": "Implicit comma-separated FROM tables (FROM t1, t2, t3 WHERE t1.id = t2.id) are treated as cross products initially. The cost model is significantly weaker on comma-joins than on explicit JOIN...ON syntax.",
-      "why": "The planner's join search space is less constrained with comma-joins. Explicit JOINs provide structural hints that help the optimizer find better plans faster, especially for 5+ table joins.",
-      "opportunity": "Convert comma-joins to explicit JOIN...ON syntax. This alone can unlock 2-3x improvements. Best when combined with date_cte_isolate.",
+      "goal": "ARM_THE_OPTIMIZER",
+      "detect": "FROM t1, t2, t3 WHERE t1.key = t2.key (comma joins, no explicit JOIN). Poor row estimates in EXPLAIN.",
+      "gates": "Multiple tables in comma-separated FROM with equi-join predicates. Dimension filters available. 1-2 fact tables only. Max 3-4 dimension CTEs. Stop if all JOINs already explicit.",
+      "what": "Implicit comma-separated FROM tables treated as cross products initially. Cost model significantly weaker on comma-joins.",
+      "why": "Planner's join search space less constrained with comma-joins. Explicit JOINs provide structural hints.",
+      "opportunity": "Convert comma-joins to explicit JOIN...ON syntax. Best when combined with date_cte_isolate.",
       "what_worked": [
-        "3.32x — comma-joins to explicit JOINs + date CTE on multi-channel UNION query",
+        "3.32x — comma-joins to explicit JOINs + date CTE",
         "2.28x — same pattern on star schema",
         "1.14x — JOIN conversion alone"
       ],
       "what_didnt_work": [],
       "field_notes": [
-        "Look for FROM t1, t2, t3 WHERE ... syntax. 5+ comma-separated tables is the sweet spot.",
-        "EXPLAIN will show unexpected join orders or high-cost nested loops when comma-joins confuse the cost model.",
-        "The win usually comes from explicit JOINs + CTE together, not CTE alone. date_cte_isolate without JOIN conversion is often neutral or harmful.",
-        "This is our most reliable PG optimization — convert the implicit syntax and the optimizer rewards you.",
-        "Validate at target scale — SF5 wins don't predict SF10 on PG (one query went from 9.62x to 0.97x)."
+        "Most reliable PG optimization. 5+ comma-separated tables is the sweet spot.",
+        "Win usually comes from explicit JOINs + CTE together, not CTE alone."
       ]
     },
     {
       "id": "CORRELATED_SUBQUERY_PARALYSIS",
       "priority": "HIGH",
-      "what": "Cannot automatically decorrelate complex correlated subqueries. Correlated scalar subqueries with aggregates are executed as nested-loop with repeated evaluation.",
-      "why": "Same limitation as DuckDB — correlation requires recognizing GROUP BY + JOIN equivalence. PostgreSQL does basic decorrelation for simple IN/EXISTS but fails on complex aggregate correlations.",
+      "goal": "SETS_OVER_LOOPS",
+      "detect": "Nested loop in EXPLAIN, inner re-executes aggregate per outer row. SQL: WHERE col > (SELECT AGG FROM ... WHERE outer.key = inner.key). Hash join on correlation key → already decorrelated → STOP.",
+      "gates": "Correlated scalar subquery with aggregate. NOT EXISTS: NEVER decorrelate (0.50x). Inner = outer table → shared CTE. ALWAYS use AS MATERIALIZED. 1-2 fact tables safe, 3+ → STOP.",
+      "what": "Cannot decorrelate complex correlated subqueries. Nested-loop with repeated evaluation.",
+      "why": "Same limitation as DuckDB — PG does basic decorrelation for IN/EXISTS but fails on complex aggregate correlations.",
       "opportunity": "Convert correlated WHERE to explicit CTE with GROUP BY + JOIN.",
       "what_worked": [
-        "4428x — timeout recovery. Unbounded correlated subquery converted to explicit JOIN.",
-        "391x — same pattern, timeout to sub-second."
+        "4428x — timeout recovery, unbounded correlated → explicit JOIN",
+        "391x — same pattern, timeout to sub-second"
       ],
-      "what_didnt_work": [],
+      "what_didnt_work": [
+        "0.51x — multi-fact join lock",
+        "0.75x — EXISTS materialized"
+      ],
       "field_notes": [
-        "Look for WHERE col > (SELECT AGG FROM ... WHERE outer.key = inner.key) patterns.",
-        "EXPLAIN will show SubPlan or nested-loop with repeated subquery execution if the optimizer failed to decorrelate.",
-        "These are often the queries that time out — if a DSB query runs >10s, check for correlated scalar subqueries first.",
-        "Simple IN/EXISTS correlation is already handled by PG's semi-join optimization — only complex aggregate correlations need manual decorrelation.",
-        "CRITICAL: when decorrelating, preserve ALL filters from the original subquery in the new CTE.",
-        "Validate at target scale — decorrelation wins are usually robust across scales, but verify on SF10."
+        "HIGHEST IMPACT pathology. 9 of 31 wins including 8044x, 1465x, 439x.",
+        "Queries that time out (>10s) — check for correlated scalar subqueries first.",
+        "MUST preserve all WHERE filters. ALWAYS use AS MATERIALIZED."
       ]
     },
     {
       "id": "NON_EQUI_JOIN_INPUT_BLINDNESS",
       "priority": "HIGH",
-      "what": "Cannot pre-filter fact tables before non-equi join operations (date arithmetic, range comparisons, quantity < quantity). Non-equi joins fall back to nested-loop, which is O(N*M).",
-      "why": "Hash joins require equi-conditions. Non-equi joins fall back to nested-loop, which processes all input rows. The optimizer cannot recognize that reducing N or M via pre-filtering would dramatically reduce cost.",
+      "goal": "MINIMIZE_ROWS_TOUCHED",
+      "detect": "Expensive non-equi join (BETWEEN, <, >) with large inputs on both sides. Neither side filtered.",
+      "gates": "Non-equi join predicate exists. Both inputs > 10K rows. At least one side has selective dimension filter.",
+      "what": "Cannot pre-filter fact tables before non-equi join operations. Non-equi joins fall back to nested-loop O(N*M).",
+      "why": "Hash joins require equi-conditions. Optimizer cannot recognize that reducing N or M via pre-filtering would reduce cost.",
       "opportunity": "Reduce fact table input size via filtered CTE before the non-equi join.",
       "what_worked": [
-        "2.68x — pre-filtered catalog_sales by wholesale_cost range before non-equi quantity comparison with inventory. Reduced nested-loop input by ~70%."
+        "2.68x — pre-filtered catalog_sales by wholesale_cost range before non-equi join"
       ],
       "what_didnt_work": [
-        "0.79x — pre-filtered with UNION/OR superset (loose filter). CTE fence blocked dimension predicate pushdown."
+        "0.79x — loose UNION/OR superset filter, CTE fence blocked pushdown"
       ],
       "field_notes": [
-        "Look for non-equi join conditions: >, <, BETWEEN, date arithmetic, quantity comparisons.",
-        "EXPLAIN will show nested-loop join with high row estimates on both sides.",
-        "A simple range filter on the fact table (e.g., wholesale_cost BETWEEN 34 AND 54) works well. A union/OR superset filter does NOT — it materializes too many rows.",
-        "Only pre-filter when one side of the non-equi join is a large fact table. Small dimension tables (<10K rows) don't benefit.",
-        "The CTE fence cost is negligible vs the non-equi join savings when the filter is tight.",
-        "Validate at target scale — non-equi join cost grows super-linearly, so wins tend to hold or improve at larger scales."
+        "ZERO REGRESSIONS with tight filters. Loose superset filters harmful.",
+        "Only pre-filter when one side is large fact table. Small dimensions (<10K) don't benefit."
       ]
     },
     {
       "id": "CTE_MATERIALIZATION_FENCE",
       "priority": "MEDIUM",
-      "what": "PostgreSQL materializes CTEs by default (multi-referenced) or by choice (AS MATERIALIZED). This creates a hard optimization fence — no predicate pushdown from outer query into CTE. This makes CTE-based strategies a double-edged sword on PG.",
-      "why": "CTE is computed and stored in memory/temp before the outer query executes. Any WHERE clause filters in the outer query cannot be pushed back into the CTE definition. Single-reference CTEs may be inlined in PG 12+, but multi-referenced CTEs are always materialized.",
-      "opportunity": "Use materialization STRATEGICALLY: materialize when the CTE is expensive and reused multiple times. Avoid CTEs that fence off predicate pushdown for single-use cases.",
+      "goal": "ARM_THE_OPTIMIZER",
+      "detect": "Large CTE + small post-filter. Multi-referenced CTE that blocks predicate pushdown.",
+      "gates": "NEVER duplicate CTE body with 5+ table joins. Do NOT force AS MATERIALIZED on small dims. CTE + EXISTS = disaster. CTE + INTERSECT/EXCEPT = harmful.",
+      "what": "CTE materialization creates hard optimization fence — no predicate pushdown from outer query into CTE.",
+      "why": "CTE computed and stored before outer query executes. Outer WHERE cannot reach into CTE.",
+      "opportunity": "Materialize STRATEGICALLY: only when CTE is expensive and reused. Avoid fencing single-use cases.",
       "what_worked": [
-        "1.95x — strategic materialization prevented redundant fact table scan multiplication"
+        "1.95x — strategic materialization prevented redundant fact scan multiplication"
       ],
       "what_didnt_work": [
-        "0.74x — CTE fence blocked predicate pushdown that worked in original",
-        "0.77x — date_cte_isolate added fence that blocked INTERSECT optimization",
-        "0.65x — duplicated 18-table CTE body to push filters inside. NEVER do this — computing an 18-table join twice is always worse than computing once and filtering."
+        "0.74x — CTE fence blocked predicate pushdown",
+        "0.77x — date_cte_isolate fence blocked INTERSECT optimization",
+        "0.65x — duplicated 18-table CTE body to push filters inside"
       ],
       "field_notes": [
-        "NEVER duplicate a CTE body to push a filter inside when the CTE contains 5+ table joins. Filter the materialized result with WHERE, don't recompute.",
-        "Do NOT use the AS MATERIALIZED keyword on CTEs. Write plain CTEs: 'name AS (SELECT ...)'. PG auto-materializes when beneficial. Forcing materialization on small dimension CTEs (<1000 rows) adds temp-table I/O overhead (0.69x observed).",
-        "CTE fence + EXISTS = disaster. If the query uses EXISTS/NOT EXISTS, a CTE that fences off the semi-join optimization is actively harmful.",
-        "CTE fence + INTERSECT/EXCEPT = harmful. Set operations handle their inputs efficiently inline. A CTE fence per branch adds overhead.",
-        "A CTE result referenced 2+ times is materialized once, probed many — this IS the valid use case for CTEs on PG.",
-        "When a date_cte_isolate CTE is applied to UNION ALL branches, apply to ALL branches or NONE. Partial application creates asymmetric plans."
+        "NEVER duplicate a CTE body to push a filter inside. Filter the materialized result with WHERE.",
+        "Write plain CTEs: 'name AS (SELECT ...)'. PG auto-materializes when beneficial."
       ]
     },
     {
       "id": "CROSS_CTE_PREDICATE_BLINDNESS",
       "priority": "MEDIUM",
-      "what": "Same gap as DuckDB but WORSE on PostgreSQL because CTE materialization fence makes it more impactful. Predicates in the outer WHERE cannot propagate into materialized CTEs.",
-      "why": "Even single-reference CTEs may be materialized (version-dependent). The optimizer does not trace data lineage through CTE boundaries.",
-      "opportunity": "Same as DuckDB: pre-filter into CTE definition. But be more cautious — only when the CTE is clearly suboptimal.",
+      "goal": "SMALLEST_SET_FIRST",
+      "detect": "Sequential scan on dimension table without index condition. Late filter after large scan/join.",
+      "gates": "Convert comma-joins simultaneously — CTE alone often insufficient. No INTERSECT/EXCEPT queries. Baseline > 100ms.",
+      "what": "Same gap as DuckDB but WORSE due to CTE materialization fence.",
+      "why": "Even single-reference CTEs may be materialized. No data lineage tracing through CTE boundaries.",
+      "opportunity": "Pre-filter into CTE definition. But be more cautious than on DuckDB.",
       "what_worked": [
-        "3.32x — date filter + comma-join conversion (the combo is key)",
+        "3.32x — date filter + comma-join conversion (combo is key)",
         "2.28x — date CTE with explicit JOIN"
       ],
       "what_didnt_work": [
-        "0.97x — won at SF5 (9.62x) but neutral at SF10. Cost model unreliability across scale.",
-        "0.55x — over-decomposed an already-efficient query"
+        "0.97x — won at SF5 (9.62x) but neutral at SF10",
+        "0.55x — over-decomposed already-efficient query"
       ],
       "field_notes": [
-        "Convert comma-joins to explicit JOINs simultaneously — the CTE alone often isn't enough on PG.",
-        "EXPLAIN will show sequential scan on dimension table without index condition — that's the signal.",
-        "Don't use this on queries with INTERSECT, EXCEPT, or set operations — the CTE fence blocks set operation optimization.",
-        "If the query already returns quickly (<100ms), the CTE materialization overhead can negate any savings.",
-        "Validate at target scale — SF5 wins don't reliably predict SF10 on PostgreSQL."
+        "Always convert comma-joins to explicit JOINs simultaneously.",
+        "Validate at target scale — SF5 wins don't reliably predict SF10."
       ]
     }
   ],
 
   "set_local_config_intel": {
-    "briefing_note": "Field intelligence from 52 DSB queries at SF10 (PG 14.3). 25 config wins, 3-race validated. Config tuning is ADDITIVE to SQL rewrite — not a substitute. 6 strategy categories: enable_mergejoin_off (6 wins, avg +50.6%), random_page_cost+cache (6 wins, avg +71.1%), par4 (5 wins, avg +14.3%), enable_nestloop_off (3 wins, avg +60.4%), work_mem+par4 (3 wins, avg +25.1%), enable_sort_off (2 wins, avg +36.5%). CRITICAL WARNING: EXPLAIN ANALYZE cost gaps do NOT predict runtime gains — 6 false positives caught where EXPLAIN showed 38-84% improvement but 3-race showed 0% or regression.",
+    "briefing_note": "Field intelligence from 52 DSB queries at SF10 (PG 14.3). 25 config wins, 3-race validated. Config tuning is ADDITIVE to SQL rewrite. CRITICAL: EXPLAIN cost gaps do NOT predict runtime gains — 6 false positives caught.",
 
     "rules": [
       {
         "id": "MERGE_JOIN_DISABLE",
         "trigger": "EXPLAIN shows Merge Join with Sort node below it on inputs > 10K rows",
         "config": "/*+ Set(enable_mergejoin off) */ or SET LOCAL enable_mergejoin = 'off'",
-        "evidence": "6 wins: +82.5%, +68.2%, +66.9%, +60.2%, +17.1%, +8.6%. Highest impact single hint. Tight race variance (e.g., 68.1-68.4%).",
-        "risk": "LOW when Sort+MJ visible in EXPLAIN. Do NOT disable on pre-sorted data or index-ordered inputs."
+        "evidence": "6 wins: +82.5%, +68.2%, +66.9%, +60.2%, +17.1%, +8.6%. Highest impact single hint.",
+        "risk": "LOW when Sort+MJ visible. Do NOT disable on pre-sorted data."
       },
       {
         "id": "SSD_COST_MODEL_FIX",
         "trigger": "Seq Scan on fact table despite btree index on join/filter columns",
         "config": "SET LOCAL random_page_cost = '1.1'; SET LOCAL effective_cache_size = '48GB'",
-        "evidence": "6 wins: +89.0%, +83.2%, +73.4%, +82.5%, +52.5%, +46.0%. Rescued 3 rewrite regressions. CRITICAL: nonlinear interaction — neither param alone sufficient.",
-        "risk": "LOW on SSD storage. Zero regressions observed across 52 queries."
+        "evidence": "6 wins: +89.0%, +83.2%, +73.4%, +82.5%, +52.5%, +46.0%. Rescued 3 rewrite regressions. Nonlinear interaction.",
+        "risk": "LOW on SSD. Zero regressions."
       },
       {
         "id": "PARALLEL_COST_REDUCTION",
         "trigger": "Large Seq Scan (>100K rows) without Gather/Parallel node, query > 500ms",
         "config": "SET LOCAL max_parallel_workers_per_gather = '4'; SET LOCAL parallel_setup_cost = '100'; SET LOCAL parallel_tuple_cost = '0.001'",
-        "evidence": "5 standalone wins: +28.2%, +17.4%, +12.5%, +7.0%, +6.2%. Also in 10+ combo wins. Prefer cost reduction over max_workers forcing alone.",
-        "risk": "MEDIUM. CRITICAL: 7.34x REGRESSION observed on 244ms query. NEVER on queries < 500ms. par4-alone caused -15.3% on one query — must include work_mem."
+        "evidence": "5 standalone wins: +28.2%, +17.4%, +12.5%, +7.0%, +6.2%. Also in 10+ combo wins.",
+        "risk": "MEDIUM. 7.34x REGRESSION on 244ms query. NEVER < 500ms. par4-alone -15.3% — must include work_mem."
       },
       {
         "id": "SORT_SPILL_WORK_MEM",
-        "trigger": "EXPLAIN shows Hash Batches > 1 or Sort Space Type = 'Disk'",
-        "config": "work_mem sized by sort/hash op count: ≤2 ops → 512MB, 3-5 → 256MB, 6+ → 128MB",
-        "evidence": "4 wins: +41.5% (wm512+par), +17.9% (wm256+par), +16.0% (wm256+par), +11.4% (wm256 alone). Often needs par4 to realize full benefit.",
-        "risk": "LOW. work_mem is per-operation — count sort+hash ops before sizing."
+        "trigger": "Hash Batches > 1 or Sort Space Type = 'Disk'",
+        "config": "work_mem sized by op count: ≤2 ops → 512MB, 3-5 → 256MB, 6+ → 128MB",
+        "evidence": "4 wins: +41.5%, +17.9%, +16.0%, +11.4%. Often needs par4.",
+        "risk": "LOW. Per-operation — count sort+hash ops."
       },
       {
         "id": "NESTED_LOOP_DISABLE",
-        "trigger": "Nested Loop in EXPLAIN with both inputs > 10K rows and equi-join condition exists",
+        "trigger": "Nested Loop with both inputs > 10K rows and equi-join condition exists",
         "config": "/*+ Set(enable_nestloop off) */ or SET LOCAL enable_nestloop = 'off'",
-        "evidence": "3 wins: +81.3%, +57.5% (with par4), +42.5% (with par4). One query was completely config-resistant before this hint.",
-        "risk": "HIGH. NL_off caused -1454% regression on one query. NEVER on correlated subqueries (NL is correct there — use SQL decorrelation P2 instead). NEVER when NL is the correct plan shape."
+        "evidence": "3 wins: +81.3%, +57.5%, +42.5%.",
+        "risk": "HIGH. -1454% regression. NEVER on correlated subqueries."
       },
       {
         "id": "SORT_DISABLE",
         "trigger": "Sort node on index-ordered data or where hash aggregation is viable",
         "config": "SET LOCAL enable_sort = 'off'",
-        "evidence": "2 wins: +68.2% (with MJ_off), +4.7%. One had high variance (3.2-7.7%).",
-        "risk": "MEDIUM. Forces hash-based execution. Validate carefully — high variance observed."
+        "evidence": "2 wins: +68.2%, +4.7%. High variance (3.2-7.7%).",
+        "risk": "MEDIUM. Forces hash-based execution."
       },
       {
         "id": "EXPLAIN_FALSE_POSITIVE_WARNING",
         "trigger": "ALWAYS — applies to all config tuning decisions",
         "config": "3-race validate ALL config changes",
-        "evidence": "6 false positives caught: geqo_off (EXPLAIN +38% → runtime -254%), ALL 12 configs (EXPLAIN +84% → runtime 0%), one query (EXPLAIN +81% → runtime -1.3%), one query (EXPLAIN +74% → runtime -2.4%), 10 hints (EXPLAIN +15% → runtime 0%), par4 (EXPLAIN +25% → race -15.3%).",
-        "risk": "CRITICAL. EXPLAIN ANALYZE cost gaps measure plan cost, not runtime. Buffer cache, I/O patterns, and parallelism effects are invisible to EXPLAIN."
+        "evidence": "6 false positives: geqo_off (+38% EXPLAIN → -254% runtime), 12 configs (+84% → 0%), 10 hints (+15% → 0%), par4 (+25% → -15.3%).",
+        "risk": "CRITICAL. EXPLAIN cost gaps measure plan cost, not runtime."
       }
     ],
 
     "combo_patterns": [
-      "rpc+cache (C2) + MJ_off (C1): +82.5% — index scan tips + sort elimination",
-      "NL_off (C5) + par4 (C3): +57.5%, +42.5% — hint alone insufficient, parallelism adds 12-35%",
-      "wm512 (C4) + par4 (C3): +41.5%, +6.2% — CRITICAL: par4 alone regresses without work_mem",
-      "sort_off (C6) + MJ_off (C1): +68.2% — eliminates both sort and merge overhead",
-      "rpc+cache (C2) + par4 (C3): +73.4%, +52.5% — tips to index + parallelizes remaining scans"
-    ],
-
-    "key_findings": [
-      "Config tuning is ADDITIVE to SQL rewrite — not a substitute. Best results combine good rewrite + targeted config.",
-      "EXPLAIN ANALYZE cost gaps do NOT predict runtime gains. 6 false positives caught (38-84% EXPLAIN gap → 0% or regression). Always 3-race validate.",
-      "enable_mergejoin_off is the single highest-impact hint (6 wins, avg +50.6%). Look for Sort+Merge Join in EXPLAIN.",
-      "random_page_cost=1.1 + effective_cache_size=48GB have a nonlinear interaction — neither alone sufficient. Together: 6 wins, avg +71.1%.",
-      "Forced parallelism (max_parallel_workers_per_gather=4) is DANGEROUS on fast queries (<500ms). 7.34x REGRESSION observed.",
-      "work_mem + parallelism must be applied together — par4 alone on hash-heavy queries causes spill regression (-15.3% observed).",
-      "Combo patterns (hint + config) beat either alone. Example: hint alone +23%, hint+par4 +57.5%."
+      "rpc+cache (C2) + MJ_off (C1): +82.5%",
+      "NL_off (C5) + par4 (C3): +57.5%, +42.5%",
+      "wm512 (C4) + par4 (C3): +41.5%, +6.2%",
+      "sort_off (C6) + MJ_off (C1): +68.2%",
+      "rpc+cache (C2) + par4 (C3): +73.4%, +52.5%"
     ]
   },
 
-  "scale_sensitivity_warning": "PostgreSQL optimizations validated at SF5 do NOT reliably predict SF10 behavior. 7 queries that won at SF5 regressed at SF10 (one went from 9.62x to 0.97x). Always validate at target scale. Cost estimates are overconfident on sample data."
+  "scale_sensitivity_warning": "PostgreSQL optimizations at SF5 do NOT reliably predict SF10. 7 queries won at SF5, regressed at SF10 (one 9.62x → 0.97x). Always validate at target scale."
 }

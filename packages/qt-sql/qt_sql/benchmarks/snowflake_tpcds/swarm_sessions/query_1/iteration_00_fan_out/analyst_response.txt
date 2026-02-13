@@ -1,0 +1,162 @@
+### SHARED BRIEFING
+
+SEMANTIC_CONTRACT:  
+Identify customers in South Dakota (SD) stores who had 2000 returns exceeding 1.2× their store's average return. Preserve INNER JOIN semantics (all tables must match) and correlated subquery logic. Critical aggregation trap: AVG(ctr_total_return) must be computed per store_sk without state filtering to maintain correctness. Filter dependencies: s_state='SD' cannot be pushed into CTE without breaking subquery semantics.
+
+BOTTLENECK_DIAGNOSIS:  
+Scan-bound (50% cost on store_returns scan) due to unpruned year filter. Join-bound (self-join of CTE) with correlated subquery executing per store_sk. Cardinality flow: 1K rows from CTE → 1K rows after subquery → <100 after state filter. Optimizer handles column pruning well. Logical-tree costs mislead - subquery cost hidden in main_query node.
+
+ACTIVE_CONSTRAINTS:  
+- CTE_COLUMN_COMPLETENESS: Downstream requires ctr_customer_sk/ctr_store_sk/ctr_total_return  
+- LITERAL_PRESERVATION: Must preserve d_year=2000, s_state='SD', multiplier=1.2  
+- H1_CTE_PREDICATE_FENCE: CTE referenced 2x (ctr1/ctr2) with selective s_state='SD' filter applied late  
+- H4_AGGREGATE_BELOW_JOIN: Aggregation after join despite keys ⊆ join keys  
+
+REGRESSION_WARNINGS:  
+1. AVG Reconstruction Failure (observed regression):  
+   CAUSE: Replaced AVG(x) with SUM(x)/COUNT(x) without handling COUNT(x)=0 → division by NULL.  
+   RULE: Use AVG() directly or wrap COUNT in NULLIF(COUNT(x),0)  
+
+### WORKER 1 BRIEFING (Predicate Fence Exploit)
+
+STRATEGY: cte_predicate_split  
+TARGET_LOGICAL_TREE:  
+  ctr_base → ctr_sd (filtered) → main_query  
+  ctr_base → ctr_avg (subquery)  
+NODE_CONTRACTS:  
+  ctr_base:  
+    FROM: store_returns, date_dim  
+    JOIN: sr_returned_date_sk = d_date_sk  
+    WHERE: d_year=2000  
+    GROUP BY: sr_customer_sk, sr_store_sk  
+    AGGREGATE: SUM(SR_FEE) AS ctr_total_return  
+    OUTPUT: sr_customer_sk, sr_store_sk, ctr_total_return  
+    EXPECTED_ROWS: 1K  
+    CONSUMERS: ctr_sd, ctr_avg  
+  ctr_sd:  
+    FROM: ctr_base, store  
+    JOIN: sr_store_sk = s_store_sk  
+    WHERE: s_state='SD'  
+    OUTPUT: ctr_customer_sk, ctr_store_sk, ctr_total_return  
+    EXPECTED_ROWS: 50 (5% filter)  
+    CONSUMERS: main_query  
+  ctr_avg:  
+    FROM: ctr_base  
+    GROUP BY: ctr_store_sk  
+    AGGREGATE: AVG(ctr_total_return)*1.2 AS avg_return  
+    OUTPUT: ctr_store_sk, avg_return  
+    EXPECTED_ROWS: 10 (stores)  
+    CONSUMERS: main_query  
+EXAMPLES: dimension_cte_isolate, early_filter  
+EXAMPLE_ADAPTATION: Apply dimension_cte_isolate pattern to store table. Ignore date filtering from examples.  
+HAZARD_FLAGS:  
+- Incorrect avg_return if ctr_sd leaks into ctr_avg  
+CONSTRAINT_OVERRIDE: None  
+OVERRIDE_REASONING: N/A  
+EXPLORATION_TYPE: compound_strategy  
+HYPOTHESIS_TAG: H1_CTE_PREDICATE_FENCE  
+HYPOTHESIS: Snowflake doesn't push state filter into multi-ref CTE  
+EVIDENCE: s_state='SD' applied after CTE in logical tree  
+EXPECTED_MECHANISM: ctr_sd reduces CTE rows 20x before main join  
+CONTROL_SIGNAL: Row count mismatch if state filter changes group keys  
+
+### WORKER 2 BRIEFING (Aggregate Pushdown)
+
+STRATEGY: aggregate_below_join  
+TARGET_LOGICAL_TREE:  
+  store_pre → ctr_agg → main_query  
+  date_dim (inline)  
+NODE_CONTRACTS:  
+  store_pre:  
+    FROM: store  
+    WHERE: s_state='SD'  
+    OUTPUT: s_store_sk  
+    EXPECTED_ROWS: 50  
+    CONSUMERS: ctr_agg  
+  ctr_agg:  
+    FROM: store_returns, date_dim, store_pre  
+    JOIN: sr_store_sk = s_store_sk AND sr_returned_date_sk = d_date_sk  
+    WHERE: d_year=2000  
+    GROUP BY: sr_customer_sk, sr_store_sk  
+    AGGREGATE: SUM(SR_FEE) AS ctr_total_return,  
+               AVG(SUM(SR_FEE)) OVER(PARTITION BY sr_store_sk)*1.2 AS avg_store  
+    OUTPUT: sr_customer_sk, sr_store_sk, ctr_total_return, avg_store  
+    EXPECTED_ROWS: 50  
+    CONSUMERS: main_query  
+EXAMPLES: single_pass_aggregation  
+EXAMPLE_ADAPTATION: Use window function for per-store avg. Ignore bitmap aggregation from example.  
+HAZARD_FLAGS:  
+- Window function computes avg over pre-state-filtered rows  
+CONSTRAINT_OVERRIDE: None  
+OVERRIDE_REASONING: N/A  
+EXPLORATION_TYPE: constraint_relaxation  
+HYPOTHESIS_TAG: H4_AGGREGATE_BELOW_JOIN  
+HYPOTHESIS: Late aggregation forces full fact scan before state filter  
+EVIDENCE: 50% cost on CTE scan despite 95% store reduction potential  
+EXPECTED_MECHANISM: Join store_pre first enables partition pruning  
+CONTROL_SIGNAL: avg_store differs if state filter changes group membership  
+
+### WORKER 3 BRIEFING (Subquery-to-Join)
+
+STRATEGY: decorrelation  
+TARGET_LOGICAL_TREE:  
+  ctr_all → store_avg → main_query  
+NODE_CONTRACTS:  
+  ctr_all:  
+    FROM: store_returns, date_dim  
+    JOIN: sr_returned_date_sk = d_date_sk  
+    WHERE: d_year=2000  
+    GROUP BY: sr_customer_sk, sr_store_sk  
+    AGGREGATE: SUM(SR_FEE) AS ctr_total_return  
+    OUTPUT: sr_customer_sk, sr_store_sk, ctr_total_return  
+    EXPECTED_ROWS: 1K  
+    CONSUMERS: store_avg, main_query  
+  store_avg:  
+    FROM: ctr_all  
+    GROUP BY: ctr_store_sk  
+    AGGREGATE: AVG(ctr_total_return)*1.2 AS avg_return  
+    OUTPUT: ctr_store_sk, avg_return  
+    EXPECTED_ROWS: 10  
+    CONSUMERS: main_query  
+EXAMPLES: decorrelate  
+EXAMPLE_ADAPTATION: Apply scalar subquery-to-join. Ignore EXISTS conversion.  
+HAZARD_FLAGS:  
+- Cartesian product if join condition omitted  
+CONSTRAINT_OVERRIDE: None  
+OVERRIDE_REASONING: N/A  
+EXPLORATION_TYPE: novel_combination  
+HYPOTHESIS_TAG: NOVEL_DECORRELATION_SAFETY  
+HYPOTHESIS: Manual decorrelation beats Snowflake's optimizer  
+EVIDENCE: Correlated subquery in logical tree  
+EXPECTED_MECHANISM: Store avg computed once vs per-row  
+CONTROL_SIGNAL: Performance regression if Snowflake already decorrelates  
+
+### WORKER 4 BRIEFING (Window Elimination)
+
+STRATEGY: qualify_filter  
+TARGET_LOGICAL_TREE:  
+  ctr_qualified → main_query  
+NODE_CONTRACTS:  
+  ctr_qualified:  
+    FROM: store_returns, date_dim, store  
+    JOIN: sr_returned_date_sk = d_date_sk AND sr_store_sk = s_store_sk  
+    WHERE: d_year=2000 AND s_state='SD'  
+    GROUP BY: sr_customer_sk, sr_store_sk  
+    AGGREGATE: SUM(SR_FEE) AS ctr_total_return,  
+               AVG(SUM(SR_FEE)) OVER(PARTITION BY sr_store_sk) AS store_avg  
+    QUALIFY: ctr_total_return > store_avg*1.2  
+    OUTPUT: sr_customer_sk  
+    EXPECTED_ROWS: <100  
+    CONSUMERS: main_query  
+EXAMPLES: deferred_window_aggregation  
+EXAMPLE_ADAPTATION: Move filter to QUALIFY. Ignore window merging from example.  
+HAZARD_FLAGS:  
+- QUALIFY executes after aggregation, may alter group semantics  
+CONSTRAINT_OVERRIDE: None  
+OVERRIDE_REASONING: N/A  
+EXPLORATION_TYPE: novel_combination  
+HYPOTHESIS_TAG: NOVEL_QUALIFY_AGGREGATE  
+HYPOTHESIS: QUALIFY avoids materializing intermediate aggregates  
+EVIDENCE: Logical tree shows separate aggregation and filter steps  
+EXPECTED_MECHANISM: Combined aggregation+filter in single operation  
+CONTROL_SIGNAL: Row count mismatch if QUALIFY alters group membership

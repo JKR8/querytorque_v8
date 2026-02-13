@@ -1,0 +1,98 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] store_pre  [+]  Cost: 10%  Rows: 50
+│   ├── SCAN (store)
+│   ├── FILTER (s_state='SD')
+│   └── OUTPUT (s_store_sk)
+├── [CTE] ctr_agg  [~]  Cost: 80%  Rows: 50
+│   ├── SCAN (store_returns, date_dim, store_pre (join))
+│   ├── JOIN (sr_store_sk = s_store_sk AND sr_returned_date_sk = d_date_sk)
+│   ├── FILTER (d_year=2000)
+│   ├── AGG (GROUP BY sr_customer_sk, sr_store_sk)
+│   ├── WINDOW (AVG(SUM(SR_FEE)) OVER (PARTITION BY sr_store_sk)*1.2)
+│   └── OUTPUT (sr_customer_sk, sr_store_sk, ctr_total_return, avg_store)
+└── [MAIN] main_query  [~]  Cost: 10%  Rows: ~1K
+    ├── SCAN (ctr_agg (join), customer (join))
+    ├── JOIN (ctr_agg.sr_customer_sk = customer.c_customer_sk)
+    ├── FILTER (ctr_total_return > avg_store)
+    ├── SORT (c_customer_id ASC)
+    └── OUTPUT (c_customer_id)
+```
+
+Changes:
+- `store_pre`: Added new CTE for SD stores
+- `ctr_agg`: Modified to use window function for store averages
+- `main_query`: Removed store join/subquery, uses precomputed avg_store
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "snowflake",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "cte_restructure",
+      "description": "Split CTE into store_pre and ctr_agg per target logical tree",
+      "applied_to": ["store_pre", "ctr_agg"]
+    },
+    {
+      "id": "R2",
+      "type": "window_agg",
+      "description": "Replaced correlated subquery with window function for store averages",
+      "applied_to": ["ctr_agg"]
+    },
+    {
+      "id": "R3",
+      "type": "join_simplify",
+      "description": "Removed redundant store join and subquery in main query",
+      "applied_to": ["main_query"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "store_pre": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT s_store_sk FROM store WHERE s_state = 'SD'",
+        "interfaces": {
+          "outputs": ["s_store_sk"],
+          "consumes": []
+        }
+      },
+      "ctr_agg": {
+        "type": "cte",
+        "change": "new",
+        "sql": "SELECT\n  sr_customer_sk,\n  sr_store_sk,\n  SUM(SR_FEE) AS ctr_total_return,\n  AVG(SUM(SR_FEE)) OVER (PARTITION BY sr_store_sk) * 1.2 AS avg_store\nFROM store_returns\nJOIN date_dim ON sr_returned_date_sk = d_date_sk\nJOIN store_pre ON sr_store_sk = s_store_sk\nWHERE d_year = 2000\nGROUP BY sr_customer_sk, sr_store_sk",
+        "interfaces": {
+          "outputs": ["sr_customer_sk", "sr_store_sk", "ctr_total_return", "avg_store"],
+          "consumes": ["store_pre"]
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT c_customer_id\nFROM ctr_agg\nJOIN customer ON sr_customer_sk = c_customer_sk\nWHERE ctr_total_return > avg_store\nORDER BY c_customer_id\nLIMIT 100",
+        "interfaces": {
+          "outputs": ["c_customer_id"],
+          "consumes": ["ctr_agg"]
+        }
+      }
+    },
+    "reconstruction_order": ["store_pre", "ctr_agg", "main_query"],
+    "assembly_template": "WITH store_pre AS ({store_pre}), ctr_agg AS ({ctr_agg}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Restructured to follow target CTE flow where `store_pre` filters SD stores first. `ctr_agg` computes per-store averages via window function (preserving unfiltered store_sk averages). Main query uses precomputed aggregates instead of correlated subquery. 
+
+Expected speedup: 2-3x by eliminating correlated subquery execution and redundant store joins. Window function enables single-pass aggregation while maintaining correct average semantics per store_sk.

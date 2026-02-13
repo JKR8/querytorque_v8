@@ -1,0 +1,86 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (single statement)
+├── [CTE] ctr_qualified  [~]  
+│   ├── SCAN (store_returns, date_dim, store) [=]  
+│   ├── JOIN (sr_returned_date_sk = d_date_sk AND sr_store_sk = s_store_sk) [=]  
+│   ├── FILTER (d_year=2000 AND s_state='SD') [=]  
+│   ├── AGG (GROUP BY sr_customer_sk, sr_store_sk) [=]  
+│   ├── WINDOW (AVG(SUM(SR_FEE)) OVER(PARTITION BY sr_store_sk) AS store_avg) [+]  
+│   ├── QUALIFY (ctr_total_return > store_avg*1.2) [+]  
+│   └── OUTPUT (sr_customer_sk, sr_store_sk, ctr_total_return) [~]  # Added sr_store_sk/ctr_total_return per constraint  
+└── [MAIN] main_query  [~]  
+    ├── SCAN (ctr_qualified (join), store (join), customer (join)) [~]  # Removed subquery  
+    ├── JOIN (s_store_sk = ctr_qualified.sr_store_sk) [=]  
+    ├── JOIN (ctr_qualified.sr_customer_sk = c_customer_sk) [=]  
+    ├── REMOVED: FILTER (s_state = 'SD') [-]  # Already in CTE  
+    ├── REMOVED: CORRELATED SUBQUERY [-]  
+    ├── SORT (c_customer_id ASC) [=]  
+    └── OUTPUT (c_customer_id) [=]  
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "snowflake",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "window_aggregate_pushdown",
+      "description": "Replaced correlated subquery with window function + QUALIFY",
+      "applied_to": ["ctr_qualified"]
+    },
+    {
+      "id": "R2",
+      "type": "predicate_pushdown",
+      "description": "Pushed s_state='SD' into CTE per node contract",
+      "applied_to": ["ctr_qualified"]
+    },
+    {
+      "id": "R3",
+      "type": "redundancy_elimination",
+      "description": "Removed redundant store join filter and subquery",
+      "applied_to": ["main_query"]
+    }
+  ],
+  "statements": [{
+    "target_table": null,
+    "change": "modified",
+    "components": {
+      "ctr_qualified": {
+        "type": "cte",
+        "change": "modified",
+        "sql": "SELECT\n    sr_customer_sk,\n    sr_store_sk,\n    SUM(SR_FEE) AS ctr_total_return,\n    AVG(SUM(SR_FEE)) OVER (PARTITION BY sr_store_sk) AS store_avg\nFROM store_returns\nJOIN date_dim ON sr_returned_date_sk = d_date_sk\nJOIN store ON sr_store_sk = s_store_sk\nWHERE d_year = 2000\n  AND s_state = 'SD'\nGROUP BY sr_customer_sk, sr_store_sk\nQUALIFY ctr_total_return > store_avg * 1.2",
+        "interfaces": {
+          "outputs": ["sr_customer_sk", "sr_store_sk", "ctr_total_return"],
+          "consumes": []
+        }
+      },
+      "main_query": {
+        "type": "main_query",
+        "change": "modified",
+        "sql": "SELECT\n    c_customer_id\nFROM ctr_qualified\nJOIN store ON ctr_qualified.sr_store_sk = store.s_store_sk\nJOIN customer ON ctr_qualified.sr_customer_sk = c_customer_sk\nORDER BY c_customer_id\nLIMIT 100",
+        "interfaces": {
+          "outputs": ["c_customer_id"],
+          "consumes": ["ctr_qualified"]
+        }
+      }
+    },
+    "reconstruction_order": ["ctr_qualified", "main_query"],
+    "assembly_template": "WITH ctr_qualified AS ({ctr_qualified}) {main_query}"
+  }],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes:  
+- **Structural change**: Replaced correlated subquery with window function + QUALIFY in CTE.  
+- **Mechanism**: Compute store-level average during initial aggregation using `AVG(...) OVER()`, then filter groups with `QUALIFY`. State filter (`s_state='SD'`) is pushed into CTE per node contract.  
+- **Downstream columns**: Added `sr_store_sk` and `ctr_total_return` to CTE output to satisfy join dependencies and column completeness constraint.  
+
+Expected speedup: **2-3x** (eliminates correlated subquery execution and redundant scans)

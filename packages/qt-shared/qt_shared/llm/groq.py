@@ -43,6 +43,7 @@ class GroqClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
+        self.last_usage: dict = {}
         logger.info(
             "Initialized GroqClient: model=%s, temp=%.1f, max_tokens=%d",
             model, temperature, max_tokens

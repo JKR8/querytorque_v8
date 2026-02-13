@@ -1,0 +1,95 @@
+### Part 1: Modified Logic Tree
+
+```
+QUERY: (WITH blocks)
+├── [CTE] ctr_base [=]
+│   ├── SCAN (store_returns, date_dim (join))
+│   ├── JOIN (sr_returned_date_sk = d_date_sk)
+│   ├── FILTER (d_year=2000)
+│   ├── AGG (GROUP BY sr_customer_sk, sr_store_sk)
+│   └── OUTPUT (ctr_customer_sk, ctr_store_sk, ctr_total_return)
+├── [CTE] ctr_sd [=]
+│   ├── SCAN (ctr_base (join), store (join))
+│   ├── JOIN (ctr_store_sk = s_store_sk)
+│   ├── FILTER (s_state='SD')
+│   └── OUTPUT (ctr_customer_sk, ctr_store_sk, ctr_total_return)
+├── [CTE] ctr_avg [=]
+│   ├── SCAN (ctr_base)
+│   ├── AGG (GROUP BY ctr_store_sk)
+│   └── OUTPUT (ctr_store_sk, avg_return)
+└── [MAIN] main_query [~]
+    ├── SCAN (ctr_sd (join), customer (join), ctr_avg (join))
+    ├── JOIN (ctr_store_sk = ctr_avg.ctr_store_sk)
+    ├── JOIN (ctr_customer_sk = c_customer_sk)
+    ├── FILTER (ctr_total_return > avg_return)
+    └── SORT (c_customer_id ASC)
+```
+
+### Part 2: Component Payload JSON
+
+```json
+{
+  "spec_version": "1.0",
+  "dialect": "snowflake",
+  "rewrite_rules": [
+    {
+      "id": "R1",
+      "type": "cte_isolate_avg",
+      "description": "Split single CTE into ctr_base/ctr_sd/ctr_avg to avoid filter leakage",
+      "applied_to": ["ctr_base", "ctr_sd", "ctr_avg"]
+    }
+  ],
+  "statements": [
+    {
+      "target_table": null,
+      "change": "modified",
+      "components": {
+        "ctr_base": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT\n    sr_customer_sk AS ctr_customer_sk,\n    sr_store_sk AS ctr_store_sk,\n    SUM(SR_FEE) AS ctr_total_return\nFROM store_returns\nJOIN date_dim ON store_returns.sr_returned_date_sk = date_dim.d_date_sk\nWHERE date_dim.d_year = 2000\nGROUP BY sr_customer_sk, sr_store_sk",
+          "interfaces": {
+            "outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_total_return"],
+            "consumes": []
+          }
+        },
+        "ctr_sd": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT\n    ctr_base.ctr_customer_sk,\n    ctr_base.ctr_store_sk,\n    ctr_total_return\nFROM ctr_base\nJOIN store ON ctr_base.ctr_store_sk = store.s_store_sk\nWHERE store.s_state = 'SD'",
+          "interfaces": {
+            "outputs": ["ctr_customer_sk", "ctr_store_sk", "ctr_total_return"],
+            "consumes": ["ctr_base"]
+          }
+        },
+        "ctr_avg": {
+          "type": "cte",
+          "change": "modified",
+          "sql": "SELECT\n    ctr_store_sk,\n    AVG(ctr_total_return) * 1.2 AS avg_return\nFROM ctr_base\nGROUP BY ctr_store_sk",
+          "interfaces": {
+            "outputs": ["ctr_store_sk", "avg_return"],
+            "consumes": ["ctr_base"]
+          }
+        },
+        "main_query": {
+          "type": "main_query",
+          "change": "modified",
+          "sql": "SELECT\n    customer.c_customer_id\nFROM ctr_sd\nJOIN customer ON ctr_sd.ctr_customer_sk = customer.c_customer_sk\nJOIN ctr_avg ON ctr_sd.ctr_store_sk = ctr_avg.ctr_store_sk\nWHERE ctr_sd.ctr_total_return > ctr_avg.avg_return\nORDER BY customer.c_customer_id\nLIMIT 100",
+          "interfaces": {
+            "outputs": ["c_customer_id"],
+            "consumes": ["ctr_sd", "ctr_avg"]
+          }
+        }
+      },
+      "reconstruction_order": ["ctr_base", "ctr_sd", "ctr_avg", "main_query"],
+      "assembly_template": "WITH ctr_base AS ({ctr_base}), ctr_sd AS ({ctr_sd}), ctr_avg AS ({ctr_avg}) {main_query}"
+    }
+  ],
+  "macros": {},
+  "frozen_blocks": [],
+  "validation_checks": []
+}
+```
+
+Changes: Split original CTE into 3 components (base/SD filter/avg) to isolate state filtering from aggregate computation. Main query uses explicit JOINs instead of correlated subquery.
+Expected speedup: 2-3x by precomputing aggregates and avoiding per-row subqueries.

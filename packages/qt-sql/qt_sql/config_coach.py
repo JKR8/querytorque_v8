@@ -38,6 +38,7 @@ class CoachConfig:
     benchmark_timeout_ms: int = 300_000
     collect_explain_top_n: int = 3    # Collect EXPLAIN for top N candidates
     dry_run: bool = False             # Skip benchmarks, just parse LLM output
+    model: Optional[str] = None       # LLM model override
 
 
 @dataclass
@@ -137,7 +138,7 @@ def coach_query(
 
         # ── Create LLM client ───────────────────────────────────────
         from qt_shared.llm import create_llm_client
-        llm = create_llm_client()
+        llm = create_llm_client(model=config.model)
         if llm is None:
             result.status = "ERROR"
             logger.error("Failed to create LLM client")

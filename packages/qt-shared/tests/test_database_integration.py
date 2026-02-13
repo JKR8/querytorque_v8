@@ -245,19 +245,6 @@ class TestLLMIntegration:
             # May return None or raise
             assert client is None or client is not None
 
-    def test_create_llm_client_anthropic(self):
-        """Test creating Anthropic LLM client."""
-        from qt_shared.llm import create_llm_client
-        from qt_shared.llm.anthropic import AnthropicClient
-
-        # Pass api_key directly to avoid needing environment variables
-        client = create_llm_client(
-            provider="anthropic",
-            api_key="test-api-key-for-testing"
-        )
-        # Should create an AnthropicClient instance
-        assert isinstance(client, AnthropicClient)
-
     def test_llm_protocol_has_analyze(self):
         """Test LLMClient protocol has analyze method."""
         from qt_shared.llm.protocol import LLMClient

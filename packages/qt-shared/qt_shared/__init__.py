@@ -4,7 +4,7 @@ This package provides shared components for QueryTorque products:
 - auth: Auth0 middleware and UserContext
 - billing: Stripe integration and tier features
 - database: SQLAlchemy models and connection management
-- llm: LLM client implementations (Anthropic, Groq, DeepSeek, etc.)
+- llm: LLM client implementations (DeepSeek, Groq, Gemini, OpenAI, etc.)
 - config: Shared settings management
 """
 

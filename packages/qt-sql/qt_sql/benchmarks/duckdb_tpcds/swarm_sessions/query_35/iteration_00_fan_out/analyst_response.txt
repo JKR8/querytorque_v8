@@ -1,223 +1,185 @@
 ### SHARED BRIEFING
 
-**SEMANTIC_CONTRACT**: Profile household dependent metrics by state and customer demographics for customers who purchased in-store during 2001 Q1-Q3 AND also purchased via web OR catalog in the same period. JOINs are INNER (all must match) with EXISTS semi-joins. Aggregation traps: MAX(cd_dep_count) appears twice (lines 7,9) - must preserve duplicate outputs. Filter dependencies: date_dim filters (d_year=2001, d_qoy<4) must apply identically across all sales channels.
+SEMANTIC_CONTRACT: Profile household dependent metrics by state/demographics for customers who made store purchases in 2001 Q1-Q3 AND (web OR catalog) purchases in same period. INNER JOINs require all customer/address/demographic matches. EXISTS semi-joins require at least one matching sale per channel. Aggregation uses COUNT/MAX/SUM which are duplicate-insensitive. The d_year=2001 and d_qoy<4 filters must propagate identically to all three date_dim references.
 
-**BOTTLENECK_DIAGNOSIS**: Join-bound due to correlated subquery nested loops (DELIM_SCAN) forcing repeated full scans of large fact tables. Row counts: customer (2M) → join fanout → 82K groups. Optimizer handles same-table OR efficiently but cannot decorrelate EXISTS subqueries or push date filters across CTE boundaries. Logical-tree costs mislead - physical plan shows 70% cost in nested loop re-execution.
+BOTTLENECK_DIAGNOSIS: Scan-bound (store_sales: 4406ms, 62% total). Row flow: 806M store_sales → 3.1M filtered → 200K after semi-join. Optimizer handles semi-joins well but repeats identical date_dim scan three times (3x274 rows) and scans three fact tables separately despite identical date filters. Cardinality mismatch at DELIM_SCAN (est=280K, act=0) indicates CTE stats blindness.
 
-**ACTIVE_CONSTRAINTS**:  
-- COMPLETE_OUTPUT: Must preserve all 19 output columns including duplicate MAX()  
-- CTE_COLUMN_COMPLETENESS: Downstream GROUP BY references cd_dep_count, cd_dep_employed_count, cd_dep_college_count  
-- LITERAL_PRESERVATION: d_year=2001 and d_qoy<4 must remain unchanged  
-- SEMANTIC_EQUIVALENCE: EXISTS semi-join semantics critical for customer filtering  
-- CORRELATED_SUBQUERY_PARALYSIS (P2): EXPLAIN shows DELIM_SCAN for sales subqueries  
-- CROSS_CTE_PREDICATE_BLINDNESS (P0): Q-Error=ZERO_EST at CTE boundary  
+ACTIVE_CONSTRAINTS:
+- COMPLETE_OUTPUT: Must preserve all 19 output columns including counts and aggregates
+- CTE_COLUMN_COMPLETENESS: CTEs must include customer_sk for joins and date_sk for filtering
+- LITERAL_PRESERVATION: d_year=2001 and d_qoy<4 must remain exact
+- SEMANTIC_EQUIVALENCE: EXISTS conditions require semi-join semantics
+- P0: Predicate chain pushback - date filters applied late in subqueries
+- P1: Repeated scans - date_dim scanned 3x, fact tables scanned separately
+- P3: Aggregation after join - group by occurs after large dimension joins
 
-**REGRESSION_WARNINGS**:  
-1. Materialized EXISTS (0.14x):  
-   CAUSE: Converting EXISTS to materialized CTE destroys semi-join short-circuit  
-   RULE: Preserve EXISTS as semi-joins; use WHERE c.c_customer_sk IN (precomputed_keys)  
-2. Orphaned CTE (0.49x):  
-   CAUSE: Keeping original subquery alongside new CTE causes double materialization  
-   RULE: Remove original EXISTS after CTE replacement  
+REGRESSION_WARNINGS:
+1. Materialize CTE for EXISTS (0.14x regression):
+   CAUSE: Materializing EXISTS destroys semi-join short-circuit
+   RULE: Preserve EXISTS structure, precompute only keys
+2. Split same-column OR (0.23x regression):
+   CAUSE: Splitting same-channel OR to UNION forces redundant scans
+   RULE: Keep web/catalog OR intact
+3. Cross-join 3 dim CTEs (0.0076x regression):
+   CAUSE: Cartesian product from isolated dimension CTEs
+   RULE: Join dimensions to facts, not to each other
 
----
+=== WORKER 1 BRIEFING ===
 
-### WORKER 1 BRIEFING  
+STRATEGY: date_cte_isolate
+TARGET_LOGICAL_TREE:
+  date_range → store_sales_cte → web_sales_cte → catalog_sales_cte → main_join
+NODE_CONTRACTS:
+  date_range:
+    FROM: date_dim
+    WHERE: d_year=2001 AND d_qoy<4
+    OUTPUT: d_date_sk
+    EXPECTED_ROWS: 274
+    CONSUMERS: store_sales_cte, web_sales_cte, catalog_sales_cte
 
-**STRATEGY**: composite_decorrelate_union  
-**TARGET_LOGICAL_TREE**:  
-date_range → store_customers → web_or_catalog_customers → base_tables_join → filtered_customers → group_by  
-**NODE_CONTRACTS**:  
-date_range:  
-  FROM: date_dim  
-  WHERE: d_year = 2001 AND d_qoy < 4  
-  OUTPUT: d_date_sk  
-  EXPECTED_ROWS: 273 (91 days/quarter * 3 quarters)  
-  CONSUMERS: store_customers, web_or_catalog_customers  
+  store_sales_cte:
+    FROM: store_sales, date_range
+    JOIN: ss_sold_date_sk = d_date_sk
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: 200K
+    CONSUMERS: main_join
 
-store_customers:  
-  FROM: store_sales JOIN date_range ON ss_sold_date_sk = d_date_sk  
-  OUTPUT: ss_customer_sk  
-  EXPECTED_ROWS: 2.8M (SF10 store_sales) → 1.2M distinct  
-  CONSUMERS: filtered_customers  
+  web_sales_cte:
+    FROM: web_sales, date_range
+    JOIN: ws_sold_date_sk = d_date_sk
+    OUTPUT: ws_bill_customer_sk
+    EXPECTED_ROWS: 200K
+    CONSUMERS: main_join
 
-web_or_catalog_customers:  
-  FROM: (  
-    SELECT ws_bill_customer_sk FROM web_sales JOIN date_range ON ws_sold_date_sk = d_date_sk  
-    UNION ALL  
-    SELECT cs_ship_customer_sk FROM catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk  
-  )  
-  OUTPUT: customer_sk  
-  EXPECTED_ROWS: 1.5M distinct  
-  CONSUMERS: filtered_customers  
+  catalog_sales_cte:
+    FROM: catalog_sales, date_range
+    JOIN: cs_sold_date_sk = d_date_sk
+    OUTPUT: cs_ship_customer_sk
+    EXPECTED_ROWS: 200K
+    CONSUMERS: main_join
 
-filtered_customers:  
-  FROM: customer c  
-    JOIN store_customers sc ON c.c_customer_sk = sc.ss_customer_sk  
-    JOIN web_or_catalog_customers wc ON c.c_customer_sk = wc.customer_sk  
-    JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk  
-    JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk  
-  OUTPUT: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count  
-  EXPECTED_ROWS: ~120K  
-  CONSUMERS: group_by  
+  main_join:
+    FROM: customer c, customer_address ca, customer_demographics, store_sales_cte st, web_sales_cte ws, catalog_sales_cte cs
+    JOIN: c.c_current_addr_sk=ca.ca_address_sk 
+      AND cd_demo_sk=c.c_current_cdemo_sk
+      AND c.c_customer_sk=st.ss_customer_sk
+      AND (c.c_customer_sk=ws.ws_bill_customer_sk OR c.c_customer_sk=cs.cs_ship_customer_sk)
+    GROUP BY: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count
+    OUTPUT: All original SELECT columns
+    EXPECTED_ROWS: 58K
+    CONSUMERS: ORDER/LIMIT
+EXAMPLES: date_cte_isolate, prefetch_fact_join
+EXAMPLE_ADAPTATION: 
+  - date_cte_isolate: Replicate date_range CTE
+  - prefetch_fact_join: Prefilter facts but keep OR condition
+HAZARD_FLAGS:
+- OR condition may force full scan of web/catalog CTEs
 
-group_by:  
-  GROUP BY: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count  
-  AGGREGATE: count(*) cnt1, max(cd_dep_count), sum(cd_dep_count), ... [all original aggregates]  
-  OUTPUT: All 19 original columns  
-  EXPECTED_ROWS: ~82K  
-  CONSUMERS: order_by  
+=== WORKER 2 BRIEFING ===
 
-order_by:  
-  ORDER BY: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count  
-  LIMIT: 100  
+STRATEGY: single_pass_aggregation
+TARGET_LOGICAL_TREE:
+  date_range → multi_channel_cte → main_join
+NODE_CONTRACTS:
+  date_range: (same as Worker 1)
+  multi_channel_cte:
+    FROM: 
+      (SELECT ss_customer_sk AS cust_sk, 'store' AS channel FROM store_sales, date_range WHERE ss_sold_date_sk=d_date_sk)
+      UNION ALL
+      (SELECT ws_bill_customer_sk, 'web' FROM web_sales, date_range WHERE ws_sold_date_sk=d_date_sk)
+      UNION ALL
+      (SELECT cs_ship_customer_sk, 'catalog' FROM catalog_sales, date_range WHERE cs_sold_date_sk=d_date_sk)
+    OUTPUT: cust_sk, channel
+    EXPECTED_ROWS: 600K
+    CONSUMERS: main_join
+  main_join:
+    FROM: customer c, customer_address ca, customer_demographics
+    JOIN: c.c_current_addr_sk=ca.ca_address_sk 
+      AND cd_demo_sk=c.c_current_cdemo_sk
+    WHERE: EXISTS (SELECT 1 FROM multi_channel_cte m 
+                  WHERE m.cust_sk=c.c_customer_sk AND m.channel='store')
+      AND EXISTS (SELECT 1 FROM multi_channel_cte m 
+                  WHERE m.cust_sk=c.c_customer_sk AND (m.channel='web' OR m.channel='catalog'))
+    GROUP BY: (same as original)
+    OUTPUT: (same as original)
+    EXPECTED_ROWS: 58K
+    CONSUMERS: ORDER/LIMIT
+EXAMPLES: single_pass_aggregation, channel_bitmap_aggregation
+EXAMPLE_ADAPTATION:
+  - single_pass_aggregation: Consolidate scans but preserve EXISTS
+  - channel_bitmap_aggregation: Use channel tags instead of bitmaps
+HAZARD_FLAGS:
+- UNION ALL may materialize duplicate customer-channel pairs
 
-**EXAMPLES**: decorrelate, composite_decorrelate_union  
-**EXAMPLE_ADAPTATION**:  
-- decorrelate: Use CTE for store_customers but preserve UNION for web/catalog OR  
-- composite_decorrelate_union: Apply date_range CTE to all channels  
-**HAZARD_FLAGS**:  
-- UNION ALL may produce duplicates if customer bought via both web+catalog → use UNION DISTINCT?  
-- EXISTS semantics require DISTINCT customer keys in CTEs  
+=== WORKER 3 BRIEFING ===
 
----
+STRATEGY: star_join_prefetch
+TARGET_LOGICAL_TREE:
+  date_range → filtered_customers → main_agg
+NODE_CONTRACTS:
+  date_range: (same as Worker 1)
+  filtered_customers:
+    FROM: customer c
+    WHERE: EXISTS (store_sales subquery) 
+      AND (EXISTS (web_sales subquery) OR EXISTS (catalog_sales subquery))
+    OUTPUT: c.*
+    EXPECTED_ROWS: 50K
+    CONSUMERS: main_agg
+  main_agg:
+    FROM: filtered_customers c, customer_address ca, customer_demographics
+    JOIN: c.c_current_addr_sk=ca.ca_address_sk 
+      AND cd_demo_sk=c.c_current_cdemo_sk
+    GROUP BY: (same as original)
+    OUTPUT: (same as original)
+    EXPECTED_ROWS: 58K
+    CONSUMERS: ORDER/LIMIT
+EXAMPLES: star_join_prefetch, dimension_cte_isolate
+EXAMPLE_ADAPTATION:
+  - star_join_prefetch: Push customer filtering before dimensions
+  - dimension_cte_isolate: Join dimensions after customer filtering
+HAZARD_FLAGS:
+- EXISTS subqueries may re-scan facts without date_range benefit
 
-### WORKER 2 BRIEFING  
+=== WORKER 4 BRIEFING ===
 
-**STRATEGY**: star_join_prefetch  
-**TARGET_LOGICAL_TREE**:  
-date_range → customer_base → store_filtered → web_or_catalog_filtered → group_by  
-**NODE_CONTRACTS**:  
-date_range: (same as Worker 1)  
-
-customer_base:  
-  FROM: customer c  
-    JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk  
-    JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk  
-  OUTPUT: c_customer_sk, ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count  
-  EXPECTED_ROWS: 2M (SF10 customer)  
-  CONSUMERS: store_filtered  
-
-store_filtered:  
-  FROM: customer_base cb  
-  WHERE EXISTS (  
-    SELECT 1 FROM store_sales ss JOIN date_range dr ON ss_sold_date_sk = dr.d_date_sk  
-    WHERE ss.ss_customer_sk = cb.c_customer_sk  
-  )  
-  OUTPUT: All customer_base columns  
-  EXPECTED_ROWS: ~1.2M  
-  CONSUMERS: web_or_catalog_filtered  
-
-web_or_catalog_filtered:  
-  FROM: store_filtered sf  
-  WHERE EXISTS (  
-    SELECT 1 FROM web_sales ws JOIN date_range dr ON ws.ws_sold_date_sk = dr.d_date_sk  
-    WHERE ws.ws_bill_customer_sk = sf.c_customer_sk  
-  ) OR EXISTS (  
-    SELECT 1 FROM catalog_sales cs JOIN date_range dr ON cs.cs_sold_date_sk = dr.d_date_sk  
-    WHERE cs.cs_ship_customer_sk = sf.c_customer_sk  
-  )  
-  OUTPUT: All customer_base columns  
-  EXPECTED_ROWS: ~120K  
-  CONSUMERS: group_by  
-
-group_by: (same as Worker 1)  
-
-**EXAMPLES**: prefetch_fact_join, dimension_cte_isolate  
-**EXAMPLE_ADAPTATION**:  
-- prefetch_fact_join: Push date_range to all subqueries but keep EXISTS  
-- dimension_cte_isolate: Pre-join customer/address/demographics  
-**HAZARD_FLAGS**:  
-- OR condition prevents channel consolidation  
-- EXISTS preserved to maintain semi-join semantics  
-
----
-
-### WORKER 3 BRIEFING  
-
-**STRATEGY**: single_pass_aggregation  
-**TARGET_LOGICAL_TREE**:  
-date_range → multi_channel_agg → base_tables_join → group_by  
-**NODE_CONTRACTS**:  
-date_range: (same as Worker 1)  
-
-multi_channel_agg:  
-  FROM: (  
-    SELECT ss_customer_sk AS customer_sk, 1 AS store_flag, 0 AS web_flag, 0 AS catalog_flag  
-    FROM store_sales JOIN date_range ON ss_sold_date_sk = d_date_sk  
-    UNION ALL  
-    SELECT ws_bill_customer_sk, 0, 1, 0 FROM web_sales JOIN date_range ON ws_sold_date_sk = d_date_sk  
-    UNION ALL  
-    SELECT cs_ship_customer_sk, 0, 0, 1 FROM catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk  
-  )  
-  GROUP BY: customer_sk  
-  AGGREGATE: MAX(store_flag) AS bought_store, MAX(web_flag) AS bought_web, MAX(catalog_flag) AS bought_catalog  
-  OUTPUT: customer_sk, bought_store, bought_web, bought_catalog  
-  EXPECTED_ROWS: ~2.5M distinct  
-  CONSUMERS: base_tables_join  
-
-base_tables_join:  
-  FROM: multi_channel_agg mca  
-    JOIN customer c ON mca.customer_sk = c.c_customer_sk  
-    JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk  
-    JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk  
-  WHERE: bought_store = 1 AND (bought_web = 1 OR bought_catalog = 1)  
-  OUTPUT: ca_state, cd_gender, ... [all grouping columns]  
-  EXPECTED_ROWS: ~120K  
-  CONSUMERS: group_by  
-
-group_by: (same as Worker 1)  
-
-**EXAMPLES**: single_pass_aggregation, channel_bitmap_aggregation  
-**EXAMPLE_ADAPTATION**:  
-- single_pass_aggregation: Use UNION ALL + MAX flags instead of bitmap  
-- channel_bitmap_aggregation: Adapt to MAX() since DuckDB lacks bitmaps  
-**HAZARD_FLAGS**:  
-- UNION ALL across 3 large fact tables → ensure date_range reduces scans  
-- MAX() flags safe for semi-join emulation  
-
----
-
-### WORKER 4 BRIEFING (EXPLORATION)  
-
-**STRATEGY**: exists_restructuring  
-**TARGET_LOGICAL_TREE**:  
-date_range → store_customers → web_catalog_intersect → base_tables_join → group_by  
-**NODE_CONTRACTS**:  
-date_range: (same as Worker 1)  
-
-store_customers: (same as Worker 1)  
-
-web_catalog_intersect:  
-  FROM: (  
-    SELECT ws_bill_customer_sk AS customer_sk FROM web_sales JOIN date_range ON ws_sold_date_sk = d_date_sk  
-    UNION  
-    SELECT cs_ship_customer_sk FROM catalog_sales JOIN date_range ON cs_sold_date_sk = d_date_sk  
-  )  
-  OUTPUT: customer_sk  
-  EXPECTED_ROWS: ~1.5M distinct  
-  CONSUMERS: base_tables_join  
-
-base_tables_join:  
-  FROM: store_customers sc  
-    JOIN web_catalog_intersect wci ON sc.ss_customer_sk = wci.customer_sk  
-    JOIN customer c ON c.c_customer_sk = sc.ss_customer_sk  
-    JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk  
-    JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk  
-  OUTPUT: All grouping columns  
-  EXPECTED_ROWS: ~120K  
-  CONSUMERS: group_by  
-
-group_by: (same as Worker 1)  
-
-**EXAMPLES**: intersect_to_exists, multi_intersect_exists_cte  
-**EXAMPLE_ADAPTATION**:  
-- intersect_to_exists: Replace OR with UNION (set operation)  
-- multi_intersect_exists_cte: Use date_range in all CTEs  
-**HAZARD_FLAGS**:  
-- UNION may change NULL handling vs OR-EXISTS  
-- Requires testing edge cases with NULL customer keys  
-**CONSTRAINT_OVERRIDE**: None  
-**OVERRIDE_REASONING**: N/A - preserves EXISTS via set operations  
-**EXPLORATION_TYPE**: novel_combination  
-**HYPOTHESIS_TAG**: H2_JOIN_ORDER (replaces correlated loops with set operations)
+STRATEGY: composite_decorrelate_union
+TARGET_LOGICAL_TREE:
+  date_range → store_customers → web_customers → catalog_customers → combined_customers → main_agg
+NODE_CONTRACTS:
+  date_range: (same as Worker 1)
+  store_customers:
+    FROM: store_sales, date_range
+    JOIN: ss_sold_date_sk=d_date_sk
+    GROUP BY: ss_customer_sk
+    OUTPUT: ss_customer_sk
+    EXPECTED_ROWS: 180K
+    CONSUMERS: combined_customers
+  web_customers: (similar for web_sales)
+  catalog_customers: (similar for catalog_sales)
+  combined_customers:
+    FROM: store_customers st
+      LEFT JOIN web_customers ws ON st.ss_customer_sk=ws.ws_bill_customer_sk
+      LEFT JOIN catalog_customers cs ON st.ss_customer_sk=cs.cs_ship_customer_sk
+    WHERE: ws.ws_bill_customer_sk IS NOT NULL OR cs.cs_ship_customer_sk IS NOT NULL
+    OUTPUT: st.ss_customer_sk
+    EXPECTED_ROWS: 50K
+    CONSUMERS: main_agg
+  main_agg:
+    FROM: combined_customers cc, customer c, customer_address ca, customer_demographics
+    JOIN: cc.ss_customer_sk=c.c_customer_sk
+      AND c.c_current_addr_sk=ca.ca_address_sk
+      AND cd_demo_sk=c.c_current_cdemo_sk
+    GROUP BY: (same as original)
+    OUTPUT: (same as original)
+    EXPECTED_ROWS: 58K
+    CONSUMERS: ORDER/LIMIT
+EXAMPLES: composite_decorrelate_union, prefetch_fact_join
+EXAMPLE_ADAPTATION: 
+  - composite_decorrelate_union: Pre-aggregate customers per channel
+  - prefetch_fact_join: Use date_range in all fact CTEs
+HAZARD_FLAGS:
+- LEFT JOIN + OR condition may force full outer scan
+CONSTRAINT_OVERRIDE: None
+OVERRIDE_REASONING: Maintains EXISTS via LEFT JOIN/IS NOT NULL semantics
+EXPLORATION_TYPE: compound_strategy
+HYPOTHESIS_TAG: H1_CTE_PREDICATE_FENCE + H2_JOIN_ORDER

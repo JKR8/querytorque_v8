@@ -1,4 +1,5 @@
-with frequent_ss_items as 
+-- start query 23a in stream 0 using template query23.tpl
+with frequent_ss_items as
  (select substr(i_item_desc,1,30) itemdesc,i_item_sk item_sk,d_date solddate,count(*) cnt
   from store_sales
       ,date_dim 
@@ -47,3 +48,5 @@ from
          and ws_item_sk in (select item_sk from frequent_ss_items)
          and ws_bill_customer_sk in (select c_customer_sk from best_ss_customer))
  LIMIT 100;
+
+-- end query 23a in stream 0 using template query23.tpl

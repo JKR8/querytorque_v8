@@ -21,6 +21,10 @@ import click
               help="Call LLM and parse, but skip benchmarking.")
 @click.option("-q", "--query", multiple=True,
               help="Query filter (repeatable, prefix match).")
+@click.option("--model", default=None,
+              help="LLM model override. Value depends on provider in .env: "
+                   "openrouter: deepseek/deepseek-chat, deepseek/deepseek-r1; "
+                   "deepseek: deepseek-chat, deepseek-reasoner.")
 @click.pass_context
 def config_coach(
     ctx: click.Context,
@@ -30,6 +34,7 @@ def config_coach(
     min_speedup: float,
     dry_run: bool,
     query: tuple,
+    model: str,
 ) -> None:
     """Iterative config + hint tuning via LLM reflection loop.
 
@@ -61,10 +66,11 @@ def config_coach(
         raise SystemExit(1)
 
     tag = " [DRY RUN]" if dry_run else ""
+    model_tag = f", model={model}" if model else ""
     print_header(
         f"Config Coach{tag}: {bench_dir.name} "
         f"(iters={max_iterations}, candidates={max_candidates}, "
-        f"target={min_speedup}x)"
+        f"target={min_speedup}x{model_tag})"
     )
 
     # Resolve query filter
@@ -81,6 +87,7 @@ def config_coach(
         max_candidates=max_candidates,
         min_speedup=min_speedup,
         dry_run=dry_run,
+        model=model,
     )
 
     # Run coaching

@@ -4,7 +4,6 @@ from typing import Optional
 
 from ..config import get_settings
 from .protocol import LLMClient
-from .anthropic import AnthropicClient
 from .deepseek import DeepSeekClient
 from .gemini import GeminiAPIClient, GeminiCLIClient
 from .groq import GroqClient
@@ -21,7 +20,7 @@ def create_llm_client(
     If no arguments are provided, uses settings from environment.
 
     Args:
-        provider: LLM provider name (anthropic, deepseek, gemini-api, gemini-cli, groq, openai)
+        provider: LLM provider name (deepseek, gemini-api, gemini-cli, groq, openai, openrouter)
         model: Model name (optional, uses provider default if not specified)
         api_key: API key (optional, uses environment if not specified)
 
@@ -41,9 +40,7 @@ def create_llm_client(
 
     # Get API key from settings if not provided
     if api_key is None:
-        if provider == "anthropic":
-            api_key = settings.anthropic_api_key
-        elif provider == "deepseek":
+        if provider == "deepseek":
             api_key = settings.deepseek_api_key
         elif provider in ("gemini-api", "gemini"):
             api_key = settings.gemini_api_key
@@ -55,14 +52,7 @@ def create_llm_client(
             api_key = settings.openrouter_api_key
 
     # Create client based on provider
-    if provider == "anthropic":
-        if not api_key:
-            raise ValueError("Anthropic API key required")
-        return AnthropicClient(
-            api_key=api_key,
-            model=model or "claude-sonnet-4-20250514",
-        )
-    elif provider == "deepseek":
+    if provider == "deepseek":
         if not api_key:
             raise ValueError("DeepSeek API key required")
         return DeepSeekClient(

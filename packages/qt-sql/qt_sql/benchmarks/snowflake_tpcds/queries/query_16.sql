@@ -10,7 +10,7 @@ from
   ,call_center
 where
     d_date between '2002-4-01' and 
-           (cast('2002-4-01' as date) + INTERVAL 60 DAY)
+           (cast('2002-4-01' as date) + INTERVAL '60 DAY')
 and cs1.cs_ship_date_sk = d_date_sk
 and cs1.cs_ship_addr_sk = ca_address_sk
 and ca_state = 'WV'

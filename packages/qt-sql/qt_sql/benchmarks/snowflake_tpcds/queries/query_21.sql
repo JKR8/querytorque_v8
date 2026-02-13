@@ -16,8 +16,8 @@ select *
      and i_item_sk          = inv_item_sk
      and inv_warehouse_sk   = w_warehouse_sk
      and inv_date_sk    = d_date_sk
-     and d_date between (cast ('2002-02-27' as date) - INTERVAL 30 DAY)
-                    and (cast ('2002-02-27' as date) + INTERVAL 30 DAY)
+     and d_date between (cast ('2002-02-27' as date) - INTERVAL '30 DAY')
+                    and (cast ('2002-02-27' as date) + INTERVAL '30 DAY')
    group by w_warehouse_name, i_item_id) x
  where (case when inv_before > 0 
              then inv_after / inv_before 

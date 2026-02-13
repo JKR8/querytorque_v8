@@ -1,7 +1,6 @@
 """LLM client implementations for QueryTorque.
 
 Provides a unified interface for multiple LLM providers:
-- Anthropic (Claude)
 - DeepSeek
 - Gemini (API and CLI)
 - Groq
@@ -9,7 +8,6 @@ Provides a unified interface for multiple LLM providers:
 """
 
 from .protocol import LLMClient
-from .anthropic import AnthropicClient
 from .deepseek import DeepSeekClient
 from .gemini import GeminiAPIClient, GeminiCLIClient
 from .groq import GroqClient
@@ -23,7 +21,6 @@ __all__ = [
     # Protocol
     "LLMClient",
     # Clients
-    "AnthropicClient",
     "DeepSeekClient",
     "GeminiAPIClient",
     "GeminiCLIClient",

@@ -31,6 +31,7 @@ class GeminiAPIClient:
         """
         self.api_key = api_key
         self.model = model
+        self.last_usage: dict = {}
         logger.info("Initialized GeminiAPIClient with model=%s", model)
 
     def analyze(self, prompt: str) -> str:
@@ -88,6 +89,7 @@ class GeminiCLIClient:
         """
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.last_usage: dict = {}
         logger.info("Initialized GeminiCLIClient with model=%s", model or "default")
 
     def analyze(self, prompt: str) -> str:

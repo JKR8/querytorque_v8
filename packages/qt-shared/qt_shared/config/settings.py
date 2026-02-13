@@ -51,7 +51,6 @@ class Settings(BaseSettings):
     max_batch_files: int = 20
 
     # LLM Configuration (shared across products)
-    anthropic_api_key: str = ""
     deepseek_api_key: str = ""
     gemini_api_key: str = ""
     groq_api_key: str = ""
@@ -114,9 +113,7 @@ class Settings(BaseSettings):
         provider = self.llm_provider
         model = self.llm_model
 
-        if provider == "anthropic":
-            return provider, model or "claude-sonnet-4-20250514", self.anthropic_api_key
-        elif provider == "deepseek":
+        if provider == "deepseek":
             return provider, model or "deepseek-reasoner", self.deepseek_api_key
         elif provider == "gemini-api":
             return provider, model or "gemini-3-flash-preview", self.gemini_api_key

@@ -13,6 +13,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..hint_plan import (
@@ -256,21 +257,36 @@ def _section_explain(explain_plan: str) -> str:
     )
 
 
+def _load_config_playbook() -> Optional[str]:
+    """Load the config tuning playbook from knowledge/postgres_config.md."""
+    playbook_path = (
+        Path(__file__).resolve().parent.parent / "knowledge" / "postgres_config.md"
+    )
+    if playbook_path.exists():
+        text = playbook_path.read_text(errors="replace").strip()
+        if text:
+            return text
+    return None
+
+
 def _section_engine_profile(profile: Dict[str, Any]) -> str:
-    # Extract SET LOCAL intel from engine profile
+    # Prefer the structured markdown playbook over flat JSON
+    playbook = _load_config_playbook()
+    if playbook:
+        return f"## [4] CONFIG TUNING PLAYBOOK\n\n{playbook}"
+
+    # Fallback to flat JSON rendering from engine profile
     intel = profile.get("set_local_config_intel", {})
     if not intel:
         return "## [4] ENGINE PROFILE\n\nNo SET LOCAL intel available."
 
     lines = ["## [4] ENGINE PROFILE — SET LOCAL Intel\n"]
 
-    # Briefing note
     note = intel.get("briefing_note", "")
     if note:
         lines.append(note)
         lines.append("")
 
-    # Rules
     rules = intel.get("rules", [])
     for rule in rules:
         rid = rule.get("id", "?")
@@ -285,7 +301,6 @@ def _section_engine_profile(profile: Dict[str, Any]) -> str:
         lines.append(f"- Risk: {risk}")
         lines.append("")
 
-    # Combo patterns
     combos = intel.get("combo_patterns", [])
     if combos:
         lines.append("### Proven Combo Patterns")
@@ -293,7 +308,6 @@ def _section_engine_profile(profile: Dict[str, Any]) -> str:
             lines.append(f"- {c}")
         lines.append("")
 
-    # Key findings
     findings = intel.get("key_findings", [])
     if findings:
         lines.append("### Key Findings")

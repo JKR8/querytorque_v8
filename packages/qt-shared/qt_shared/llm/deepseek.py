@@ -30,6 +30,7 @@ class DeepSeekClient:
     # Store last reasoning for callers that want to inspect/save it
     last_reasoning: str = ""
     last_duration: float = 0.0
+    last_usage: dict = {}
 
     def analyze(self, prompt: str) -> str:
         """Send prompt to DeepSeek and return response."""
@@ -60,6 +61,20 @@ class DeepSeekClient:
         DeepSeekClient.last_duration = duration
         response_text = response.choices[0].message.content or ""
 
+        # Capture token usage and cache metrics
+        self.last_usage = {}
+        DeepSeekClient.last_usage = {}
+        if hasattr(response, 'usage') and response.usage:
+            u = response.usage
+            self.last_usage = {
+                "prompt_tokens": getattr(u, 'prompt_tokens', 0),
+                "completion_tokens": getattr(u, 'completion_tokens', 0),
+                "total_tokens": getattr(u, 'total_tokens', 0),
+                "prompt_cache_hit_tokens": getattr(u, 'prompt_cache_hit_tokens', 0),
+                "prompt_cache_miss_tokens": getattr(u, 'prompt_cache_miss_tokens', 0),
+            }
+            DeepSeekClient.last_usage = self.last_usage
+
         # R1 reasoner: final answer should be in content, reasoning chain in reasoning_content.
         # Known issue: sometimes content is empty and the JSON answer is in reasoning_content.
         reasoning = getattr(response.choices[0].message, 'reasoning_content', None)
@@ -76,8 +91,11 @@ class DeepSeekClient:
             response_text = self._extract_from_reasoning(reasoning)
 
         logger.info(
-            "DeepSeek API response: model=%s, duration=%.2fs, response=%d chars",
-            self.model, duration, len(response_text)
+            "DeepSeek API response: model=%s, duration=%.2fs, response=%d chars, "
+            "cache_hit=%d, cache_miss=%d",
+            self.model, duration, len(response_text),
+            self.last_usage.get("prompt_cache_hit_tokens", 0),
+            self.last_usage.get("prompt_cache_miss_tokens", 0),
         )
 
         return response_text

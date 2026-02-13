@@ -99,12 +99,6 @@ class TestQtSharedImports:
         from qt_shared.llm.factory import create_llm_client
         assert callable(create_llm_client)
 
-    def test_import_llm_anthropic(self):
-        """Test Anthropic LLM client import."""
-        from qt_shared.llm import anthropic
-        from qt_shared.llm.anthropic import AnthropicClient
-        assert AnthropicClient is not None
-
     def test_import_llm_openai(self):
         """Test OpenAI LLM client import."""
         from qt_shared.llm import openai

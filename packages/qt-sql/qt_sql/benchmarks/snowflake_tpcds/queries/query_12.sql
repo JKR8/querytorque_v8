@@ -16,7 +16,7 @@ where
   	and i_category in ('Books', 'Sports', 'Men')
   	and ws_sold_date_sk = d_date_sk
 	and d_date between cast('1998-04-06' as date) 
-				and (cast('1998-04-06' as date) + INTERVAL 30 DAY)
+				and (cast('1998-04-06' as date) + INTERVAL '30 DAY')
 group by 
 	i_item_id
         ,i_item_desc 

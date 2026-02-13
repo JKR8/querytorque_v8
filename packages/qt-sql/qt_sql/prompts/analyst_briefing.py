@@ -1005,10 +1005,10 @@ def build_analyst_briefing_prompt(
             for s in strengths:
                 sid = s.get("id", "")
                 summary = s.get("summary", "")
-                field_note = s.get("field_note", "")
+                field_note = s.get("implication", s.get("field_note", ""))
                 lines.append(f"- **{sid}**: {summary}")
                 if field_note:
-                    lines.append(f"  *Field note:* {field_note}")
+                    lines.append(f"  *Implication:* {field_note}")
             lines.append("")
 
         # Gaps (opportunities — the hunting guide)

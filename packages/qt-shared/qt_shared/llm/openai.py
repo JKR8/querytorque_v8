@@ -27,6 +27,7 @@ class OpenAIClient:
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
+        self.last_usage: dict = {}
         logger.info("Initialized OpenAIClient with model=%s, base_url=%s", model, base_url)
 
     def analyze(self, prompt: str) -> str:
@@ -57,9 +58,30 @@ class OpenAIClient:
 
         duration = time.time() - start_time
         response_text = response.choices[0].message.content
+
+        # Capture token usage and cache metrics
+        self.last_usage = {}
+        if hasattr(response, 'usage') and response.usage:
+            u = response.usage
+            self.last_usage = {
+                "prompt_tokens": getattr(u, 'prompt_tokens', 0),
+                "completion_tokens": getattr(u, 'completion_tokens', 0),
+                "total_tokens": getattr(u, 'total_tokens', 0),
+                # DeepSeek via OpenRouter
+                "prompt_cache_hit_tokens": getattr(u, 'prompt_cache_hit_tokens', 0),
+                "prompt_cache_miss_tokens": getattr(u, 'prompt_cache_miss_tokens', 0),
+                # OpenAI native
+                "cached_tokens": getattr(
+                    getattr(u, 'prompt_tokens_details', None), 'cached_tokens', 0
+                ),
+            }
+
         logger.info(
-            "OpenAI API response: model=%s, duration=%.2fs, response=%d chars",
-            self.model, duration, len(response_text)
+            "OpenAI API response: model=%s, duration=%.2fs, response=%d chars, "
+            "cache_hit=%d, cache_miss=%d",
+            self.model, duration, len(response_text),
+            self.last_usage.get("prompt_cache_hit_tokens", 0),
+            self.last_usage.get("prompt_cache_miss_tokens", 0),
         )
 
         return response_text
