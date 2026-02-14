@@ -135,7 +135,7 @@ def _render_query_summary(query: QueryIR, lines: list[str], indent: int = 4) -> 
         where_hash = canonical_hash(query.where.sql_text)
         if len(where_text) > 100:
             where_text = where_text[:97] + "..."
-        lines.append(f"{pad}WHERE [{where_hash[:12]}]: {where_text}")
+        lines.append(f"{pad}WHERE [{where_hash}]: {where_text}")
 
     # GROUP BY
     if query.group_by:
