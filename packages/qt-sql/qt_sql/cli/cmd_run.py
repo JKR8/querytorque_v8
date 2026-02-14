@@ -157,6 +157,7 @@ def run(
             errors=errors,
             console=console,
             orchestrator=orchestrator,
+            patch_mode=patch_mode,
         )
     else:
         _run_serial(
@@ -174,6 +175,7 @@ def run(
             errors=errors,
             console=console,
             orchestrator=orchestrator,
+            patch_mode=patch_mode,
         )
 
     elapsed = time.time() - t0
@@ -258,6 +260,7 @@ def _run_serial(
     errors,
     console,
     orchestrator=None,
+    patch_mode=False,
 ) -> None:
     """Original serial execution: each query end-to-end."""
     for i, qid in enumerate(query_ids, 1):
@@ -310,6 +313,7 @@ def _run_two_phase(
     errors,
     console,
     orchestrator=None,
+    patch_mode=False,
 ) -> None:
     """Two-phase execution: generate all candidates in parallel, then validate serially."""
     from ..sessions.swarm_session import SwarmSession

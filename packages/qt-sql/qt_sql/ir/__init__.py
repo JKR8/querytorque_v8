@@ -106,13 +106,13 @@ def render_ir_node_map(script_ir: ScriptIR) -> str:
         lines.append(f"  MAIN QUERY (via {query.id})")
         _render_query_summary(query, lines, indent=4)
 
-    # Footer: available patch operations + targeting
+    # Footer
     lines.append("")
     lines.append(
         "Patch operations: insert_cte, replace_expr_subtree, "
         "replace_where_predicate, delete_expr_subtree"
     )
-    lines.append('Target nodes by: by_node_id (e.g. "{}")'.format(
+    lines.append('Target: by_node_id (statement, e.g. "{}") + by_anchor_hash (expression)'.format(
         script_ir.statements[0].id if script_ir.statements else "S0"
     ))
 
@@ -128,12 +128,14 @@ def _render_query_summary(query: QueryIR, lines: list[str], indent: int = 4) -> 
     if from_parts:
         lines.append(f"{pad}FROM: {', '.join(from_parts)}")
 
-    # WHERE clause (truncated)
+    # WHERE clause (truncated) with anchor hash for targeting
     if query.where:
         where_text = query.where.sql_text
-        if len(where_text) > 120:
-            where_text = where_text[:117] + "..."
-        lines.append(f"{pad}WHERE: {where_text}")
+        from .schema import canonical_hash
+        where_hash = canonical_hash(query.where.sql_text)
+        if len(where_text) > 100:
+            where_text = where_text[:97] + "..."
+        lines.append(f"{pad}WHERE [{where_hash[:12]}]: {where_text}")
 
     # GROUP BY
     if query.group_by:
@@ -173,10 +175,19 @@ def _dict_to_plan(data: dict) -> PatchPlan:
         payload_d = s.get("payload", {}) or {}
         gates_d = s.get("gates", [])
 
+        # Normalize: if worker sends sql_fragment for an expr op, treat as expr_sql
+        op_val = s["op"]
+        raw_expr_sql = payload_d.get("expr_sql")
+        raw_sql_frag = payload_d.get("sql_fragment")
+        if not raw_expr_sql and raw_sql_frag and op_val in (
+            "replace_expr_subtree", "replace_where_predicate", "replace_join_condition",
+        ):
+            raw_expr_sql = raw_sql_frag
+
         steps.append(
             PatchStep(
                 step_id=s["step_id"],
-                op=PatchOp(s["op"]),
+                op=PatchOp(op_val),
                 target=PatchTarget(
                     by_node_id=target_d.get("by_node_id"),
                     by_label=target_d.get("by_label"),
@@ -184,8 +195,8 @@ def _dict_to_plan(data: dict) -> PatchPlan:
                     by_path=target_d.get("by_path"),
                 ),
                 payload=PatchPayload(
-                    sql_fragment=payload_d.get("sql_fragment"),
-                    expr_sql=payload_d.get("expr_sql"),
+                    sql_fragment=raw_sql_frag,
+                    expr_sql=raw_expr_sql,
                     cte_name=payload_d.get("cte_name"),
                     cte_query_sql=payload_d.get("cte_query_sql"),
                 ),

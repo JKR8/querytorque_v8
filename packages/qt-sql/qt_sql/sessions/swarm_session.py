@@ -449,6 +449,17 @@ class SwarmSession(OptimizationSession):
         except Exception as e:
             logger.warning(f"[{self.query_id}] Logic tree build failed: {e}")
 
+        # Build IR for patch mode (same as _generate_fan_out)
+        if self.patch and self._script_ir is None:
+            try:
+                from ..ir import build_script_ir, render_ir_node_map, Dialect
+                ir_dialect = Dialect.POSTGRES if self.engine == "postgres" else Dialect(self.dialect)
+                self._script_ir = build_script_ir(self.original_sql, ir_dialect)
+                self._ir_node_map = render_ir_node_map(self._script_ir)
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] IR build failed in resume, disabling patch: {e}")
+                self.patch = False
+
         candidates_by_worker = {}
         generator = CandidateGenerator(
             provider=self.pipeline.provider,
@@ -469,6 +480,8 @@ class SwarmSession(OptimizationSession):
                 dialect=self.dialect,
                 engine_version=self.pipeline._engine_version,
                 original_logic_tree=original_logic_tree,
+                patch=self.patch,
+                ir_node_map=self._ir_node_map,
             )
             example_ids = [e.get("id", "?") for e in examples]
             candidate = generator.generate_one(
@@ -477,6 +490,7 @@ class SwarmSession(OptimizationSession):
                 examples_used=example_ids,
                 worker_id=worker_briefing.worker_id,
                 dialect=self.dialect,
+                script_ir=self._script_ir if self.patch else None,
             )
             optimized_sql = candidate.optimized_sql
             try:
