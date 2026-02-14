@@ -690,6 +690,18 @@ class SwarmSession(OptimizationSession):
         if self.orchestrator is not None:
             system_ctx = self.orchestrator.compose_system_context()
             ctx["orchestrator_context"] = system_ctx
+            # Inject orchestrator-rendered text into prompt-visible fields
+            # so build_analyst_briefing_prompt() sees them without signature changes
+            extra_sections = []
+            if system_ctx.get("scenario_text"):
+                extra_sections.append(system_ctx["scenario_text"])
+            if system_ctx.get("capabilities_text"):
+                extra_sections.append(system_ctx["capabilities_text"])
+            if extra_sections:
+                existing = ctx.get("resource_envelope") or ""
+                ctx["resource_envelope"] = (
+                    existing + "\n\n" + "\n\n".join(extra_sections)
+                ).strip()
 
         # Unpack for local use + coach reuse
         explain_plan_text = ctx["explain_plan_text"]

@@ -60,7 +60,9 @@ class Orchestrator:
     def engine_pack(self) -> Optional[Dict[str, Any]]:
         if self._engine_pack is None:
             from .engine_packs import load_engine_pack
-            self._engine_pack = load_engine_pack(self.engine)
+            self._engine_pack = load_engine_pack(
+                self.engine, version=self.engine_version,
+            )
         return self._engine_pack
 
     @property

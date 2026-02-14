@@ -28,6 +28,30 @@ from .scorecard import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_threshold(threshold: str) -> Optional[float]:
+    """Parse threshold string like '>300s', '>0', '>500MB' into numeric value.
+
+    Returns seconds for time units, bytes for data units, raw number otherwise.
+    Returns None if unparseable.
+    """
+    s = threshold.strip().lstrip("><=")
+    if not s:
+        return None
+    # "any" means threshold is 0 (any amount triggers)
+    if s.lower() == "any":
+        return 0.0
+    try:
+        if s.endswith("s"):
+            return float(s[:-1])
+        if s.endswith("GB"):
+            return float(s[:-2]) * 1e9
+        if s.endswith("MB"):
+            return float(s[:-2]) * 1e6
+        return float(s)
+    except (ValueError, IndexError):
+        return None
+
+
 @dataclass
 class WorkloadConfig:
     """Configuration for workload optimization."""
@@ -64,6 +88,12 @@ class WorkloadSession:
         self._triage: Optional[WorkloadTriage] = None
         self._fleet: Optional[FleetAnalysis] = None
         self._results: List[Dict[str, Any]] = []
+        self._scenario_card: Optional[Dict[str, Any]] = None
+
+        # Load scenario card if configured
+        if self.config.scenario:
+            from ..scenario_cards import load_scenario_card
+            self._scenario_card = load_scenario_card(self.config.scenario)
 
     def run(self) -> WorkloadScorecard:
         """Execute full workload optimization pipeline.
@@ -111,7 +141,7 @@ class WorkloadSession:
                 "tier": "SKIP",
                 "status": "SKIP",
                 "speedup": 1.0,
-                "fits_scenario": True,
+                "fits_scenario": self._evaluate_scenario_fit(qid, 1.0),
             })
 
         # Step 7: Compile scorecard
@@ -181,7 +211,7 @@ class WorkloadSession:
                 "tier": "TIER_2",
                 "status": "NEUTRAL",
                 "speedup": 1.0,
-                "fits_scenario": True,
+                "fits_scenario": self._evaluate_scenario_fit(qid, 1.0),
             })
 
     def _run_tier3(self, query_ids: List[str]) -> None:
@@ -208,7 +238,7 @@ class WorkloadSession:
                 "tier": "TIER_3",
                 "status": "NEUTRAL",
                 "speedup": 1.0,
-                "fits_scenario": True,
+                "fits_scenario": self._evaluate_scenario_fit(qid, 1.0),
             })
 
     def _run_single_query(
@@ -263,13 +293,14 @@ class WorkloadSession:
                 )
 
             result = session.run()
+            fits = self._evaluate_scenario_fit(query_id, result.best_speedup)
             return {
                 "query_id": query_id,
                 "tier": tier,
                 "status": result.status,
                 "speedup": result.best_speedup,
                 "technique": ", ".join(result.best_transforms) if result.best_transforms else "",
-                "fits_scenario": True,
+                "fits_scenario": fits,
             }
         except Exception as e:
             return {
@@ -279,6 +310,56 @@ class WorkloadSession:
                 "speedup": 1.0,
                 "failure_reason": str(e),
             }
+
+    def _evaluate_scenario_fit(
+        self, query_id: str, speedup: float,
+    ) -> bool:
+        """Evaluate whether post-optimization metrics fit scenario constraints.
+
+        Checks the scenario card's failure_definitions against estimated
+        post-optimization values. Currently evaluates:
+        - query_duration: original_ms / speedup vs threshold
+
+        Returns True (fits) when no scenario card is loaded.
+        """
+        if not self._scenario_card:
+            return True
+
+        # Find original query data
+        original = None
+        for q in self.queries:
+            if q["query_id"] == query_id:
+                original = q
+                break
+        if not original:
+            return True
+
+        failures = self._scenario_card.get("failure_definitions", [])
+        for fdef in failures:
+            if fdef.get("severity") != "fatal":
+                continue
+
+            metric = fdef.get("metric", "")
+            threshold = _parse_threshold(fdef.get("threshold", ""))
+            if threshold is None:
+                continue
+
+            if metric == "query_duration":
+                orig_ms = original.get("duration_ms")
+                if orig_ms and speedup > 0:
+                    estimated_ms = orig_ms / speedup
+                    # threshold is in seconds
+                    if estimated_ms > threshold * 1000:
+                        return False
+
+            elif metric in ("bytes_spilled_remote", "bytes_spilled_local"):
+                # If original had spill and optimization didn't help much,
+                # conservatively mark as not fitting
+                if original.get("spill_detected") and speedup < 2.0:
+                    if threshold == 0:  # ">0" means any spill is fatal
+                        return False
+
+        return True
 
     def _handle_tier3_failure(
         self, query_id: str, result: Dict[str, Any]

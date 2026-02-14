@@ -49,7 +49,7 @@ class WorkloadTriage:
 def score_pain(
     query_duration_ms: Optional[float] = None,
     timed_out: bool = False,
-    spills_remote: bool = False,
+    spill_detected: bool = False,
     exceeds_memory: bool = False,
     meets_sla: bool = False,
 ) -> int:
@@ -63,7 +63,7 @@ def score_pain(
     """
     if timed_out or (query_duration_ms and query_duration_ms > 300_000):
         return 10
-    if spills_remote:
+    if spill_detected:
         return 7
     if exceeds_memory:
         return 5
@@ -147,7 +147,7 @@ def triage_workload(
             - query_id: str
             - duration_ms: float (optional)
             - timed_out: bool (optional)
-            - spills_remote: bool (optional)
+            - spill_detected: bool (optional, also accepts spills_remote)
             - exceeds_memory: bool (optional)
             - meets_sla: bool (optional)
             - frequency_per_day: int (optional)
@@ -163,7 +163,7 @@ def triage_workload(
         pain = score_pain(
             query_duration_ms=q.get("duration_ms"),
             timed_out=q.get("timed_out", False),
-            spills_remote=q.get("spills_remote", False),
+            spill_detected=q.get("spill_detected", False) or q.get("spills_remote", False),
             exceeds_memory=q.get("exceeds_memory", False),
             meets_sla=q.get("meets_sla", False),
         )

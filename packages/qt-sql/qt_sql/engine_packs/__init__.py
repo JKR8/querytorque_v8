@@ -27,28 +27,45 @@ _PACK_FILES = {
 }
 
 
-def load_engine_pack(engine: str) -> Optional[Dict[str, Any]]:
+def load_engine_pack(
+    engine: str, version: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Load engine pack YAML for the given engine.
+
+    When *version* is provided (e.g., ``"17"`` for PG), tries
+    ``{engine}_{version}.yaml`` first, falling back to the default
+    pack file for the engine.
 
     Returns None if no pack exists for the engine.
     Cached after first load.
     """
     engine_key = engine.lower()
-    if engine_key in _pack_cache:
-        return _pack_cache[engine_key]
+    cache_key = f"{engine_key}_{version}" if version else engine_key
+    if cache_key in _pack_cache:
+        return _pack_cache[cache_key]
 
-    filename = _PACK_FILES.get(engine_key)
-    if not filename:
-        logger.warning(f"No engine pack for engine: {engine}")
-        return None
+    # Try version-specific file first
+    pack_path = None
+    if version:
+        versioned = f"{engine_key}_{version.replace('.', '_')}.yaml"
+        candidate = _PACKS_DIR / versioned
+        if candidate.exists():
+            pack_path = candidate
 
-    pack_path = _PACKS_DIR / filename
+    # Fall back to default alias
+    if pack_path is None:
+        filename = _PACK_FILES.get(engine_key)
+        if not filename:
+            logger.warning(f"No engine pack for engine: {engine}")
+            return None
+        pack_path = _PACKS_DIR / filename
+
     if not pack_path.exists():
         logger.warning(f"Engine pack file not found: {pack_path}")
         return None
 
     pack = yaml.safe_load(pack_path.read_text())
-    _pack_cache[engine_key] = pack
+    _pack_cache[cache_key] = pack
     return pack
 
 

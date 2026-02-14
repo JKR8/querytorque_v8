@@ -151,12 +151,15 @@ def prepare(
             # Evidence bundle (optional)
             if evidence:
                 from ..evidence import extract_evidence_bundle, render_evidence_for_prompt
+                # explain_result is the raw plan JSON from _parse_logical_tree
+                plan_json = explain_result
                 bundle = extract_evidence_bundle(
                     query_id=qid,
                     query_sql=sql,
-                    explain_result=explain_result,
-                    dag=dag,
-                    costs=costs,
+                    explain_text=ctx_data.get("explain_plan_text"),
+                    plan_json=plan_json,
+                    qerror_analysis=ctx_data.get("qerror_analysis"),
+                    resource_envelope=ctx_data.get("resource_envelope"),
                     dialect=dialect,
                 )
                 evidence_text = render_evidence_for_prompt(bundle)
