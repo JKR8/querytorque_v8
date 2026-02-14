@@ -715,3 +715,126 @@ class TestBugRegressions:
         result = apply_patch_plan(ir, plan)
         assert not result.success
         assert any("unsupported" in e.lower() for e in result.errors)
+
+    # Bug 7: rollback must preserve reads/writes/query metadata
+    def test_rollback_preserves_statement_metadata(self):
+        """After rollback, reads/writes/query fields must be intact."""
+        sql = textwrap.dedent("""\
+            CREATE VIEW v AS SELECT * FROM t;
+        """)
+        ir = build_script_ir(sql, Dialect.DUCKDB)
+
+        # Verify metadata is present before patch
+        stmt = ir.statements[0]
+        assert len(stmt.reads) > 0
+        assert len(stmt.writes) > 0
+        assert stmt.query is not None
+        original_reads = {r.name for r in stmt.reads}
+        original_writes = {w.name for w in stmt.writes}
+
+        plan = PatchPlan(
+            plan_id="meta_rollback",
+            dialect=Dialect.DUCKDB,
+            steps=[
+                PatchStep(
+                    step_id="S1",
+                    op=PatchOp.INSERT_VIEW_STATEMENT,
+                    target=PatchTarget(by_node_id="S0"),
+                    payload=PatchPayload(
+                        sql_fragment="CREATE VIEW v2 AS SELECT 1;"
+                    ),
+                    gates=[Gate(kind=GateKind.PARSE_OK)],
+                ),
+            ],
+            # Postcondition that will fail → triggers rollback
+            postconditions=[
+                Gate(
+                    kind=GateKind.PLAN_SHAPE,
+                    args={"expectation": "no_scalar_subquery_max_calendar_date_remaining"},
+                ),
+                Gate(kind=GateKind.BIND_OK),  # forces failure
+            ],
+        )
+
+        result = apply_patch_plan(ir, plan)
+        assert not result.success
+
+        # After rollback, metadata must be fully restored
+        stmt = ir.statements[0]
+        assert {r.name for r in stmt.reads} == original_reads
+        assert {w.name for w in stmt.writes} == original_writes
+        assert stmt.query is not None
+
+    # Bug 8: delete_expr_subtree must work inside CTE bodies
+    def test_delete_predicate_inside_cte_body(self):
+        """delete_expr_subtree should find and remove predicates in CTE WHERE."""
+        sql = textwrap.dedent("""\
+            WITH cte AS (
+                SELECT * FROM location_record a
+                JOIN tbl_address_portfolio_v1 b ON 1 = 1
+                WHERE ROUND(6371 * 2 * ASIN(SQRT(1)), 2) <= 80
+            )
+            SELECT * FROM cte;
+        """)
+        ir = build_script_ir(sql, Dialect.DUCKDB)
+        ir.statements[0].labels.append("geo.distance_filter")
+
+        plan = PatchPlan(
+            plan_id="delete_cte_pred",
+            dialect=Dialect.DUCKDB,
+            steps=[
+                PatchStep(
+                    step_id="D1",
+                    op=PatchOp.DELETE_EXPR_SUBTREE,
+                    target=PatchTarget(by_label="geo.distance_filter"),
+                    payload=PatchPayload(),
+                    gates=[Gate(kind=GateKind.PARSE_OK)],
+                ),
+            ],
+        )
+
+        result = apply_patch_plan(ir, plan)
+        assert result.success, f"Delete in CTE failed: {result.errors}"
+        rendered = result.output_sql.lower()
+        assert "asin" not in rendered
+        assert "<= 80" not in rendered
+        # CTE structure should still be intact
+        assert "with" in rendered
+        assert "cte" in rendered
+
+    # Bug 9: successful patch must rebuild script-level indexes
+    def test_success_rebuilds_indexes(self):
+        """After a successful patch, symbols/references/fingerprints must reflect new state."""
+        sql = "SELECT * FROM t;"
+        ir = build_script_ir(sql, Dialect.DUCKDB)
+
+        original_fp = dict(ir.fingerprints.hashes)
+        assert "v_new" not in {e.name for e in ir.symbols.entries}
+
+        plan = PatchPlan(
+            plan_id="index_rebuild",
+            dialect=Dialect.DUCKDB,
+            steps=[
+                PatchStep(
+                    step_id="S1",
+                    op=PatchOp.INSERT_VIEW_STATEMENT,
+                    target=PatchTarget(by_node_id="S0"),
+                    payload=PatchPayload(
+                        sql_fragment="CREATE VIEW v_new AS SELECT 1 AS col;"
+                    ),
+                    gates=[Gate(kind=GateKind.PARSE_OK)],
+                ),
+            ],
+        )
+
+        result = apply_patch_plan(ir, plan)
+        assert result.success, f"Patch failed: {result.errors}"
+
+        # Symbols must include the new view
+        v_entry = ir.symbols.lookup("v_new")
+        assert v_entry is not None, "v_new not in symbols after successful patch"
+        assert v_entry.kind == "view"
+
+        # Fingerprints must cover all statements (2 now)
+        assert len(ir.fingerprints.hashes) == 2
+        assert ir.fingerprints.hashes != original_fp

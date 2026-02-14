@@ -52,19 +52,36 @@ def _rollback_statements(
     snapshot: List[Tuple[str, str, StatementKind, list]],
     dialect: str,
 ):
-    """Restore ScriptIR.statements from a snapshot, re-parsing each AST."""
+    """Restore ScriptIR.statements from a snapshot, rebuilding full metadata."""
+    from .builder import _build_statement
+
     new_stmts: List[StatementIR] = []
+    counter = [0]
     for sid, sql_text, kind, labels in snapshot:
         try:
             ast = sqlglot.parse_one(sql_text, dialect=dialect)
+            stmt = _build_statement(ast, sid, dialect, counter)
+            stmt.labels = labels
         except Exception:
-            ast = None
-        new_stmts.append(
-            StatementIR(
-                id=sid, kind=kind, sql_text=sql_text, ast=ast, labels=labels
+            stmt = StatementIR(
+                id=sid, kind=kind, sql_text=sql_text, ast=None, labels=labels
             )
-        )
+        new_stmts.append(stmt)
     script_ir.statements = new_stmts
+    _rebuild_script_indexes(script_ir)
+
+
+def _rebuild_script_indexes(script_ir: ScriptIR):
+    """Recompute symbols, references, and fingerprints from current statements."""
+    from .builder import _update_symbols, _build_fingerprints
+    from .reference_index import build_reference_index
+    from .schema import SymbolTable
+
+    script_ir.symbols = SymbolTable()
+    for stmt in script_ir.statements:
+        _update_symbols(script_ir.symbols, stmt)
+    script_ir.references = build_reference_index(script_ir)
+    script_ir.fingerprints = _build_fingerprints(script_ir)
 
 
 # ── Public API ─────────────────────────────────────────────────────────
@@ -131,6 +148,7 @@ def apply_patch_plan(script_ir: ScriptIR, plan: PatchPlan) -> PatchResult:
 
     result.success = True
     result.output_sql = current_sql
+    _rebuild_script_indexes(script_ir)
     return result
 
 
@@ -175,14 +193,9 @@ def _op_insert_view_statement(
     insert_idx = _find_target_stmt_index(script_ir, step.target)
     new_id = f"S_patch_{len(script_ir.statements) + 100}"
 
-    from .builder import _classify_statement
+    from .builder import _build_statement
 
-    new_stmt = StatementIR(
-        id=new_id,
-        kind=_classify_statement(ast),
-        sql_text=ast.sql(dialect=dialect),
-        ast=ast,
-    )
+    new_stmt = _build_statement(ast, new_id, dialect, [0])
     script_ir.statements.insert(insert_idx, new_stmt)
 
 
@@ -395,6 +408,9 @@ def _find_target_stmts(
                     results.append(stmt)
                     continue
                 if pattern_type == "latest_date_filter":
+                    # Skip views — they are the parameterisation, not the target
+                    if stmt.kind == StatementKind.CREATE_VIEW:
+                        continue
                     if any(r.name.lower() == table_name for r in stmt.reads):
                         results.append(stmt)
                 elif pattern_type == "geo":
@@ -564,6 +580,8 @@ def _replace_by_hash_walk(
 def _delete_by_label(stmt: StatementIR, label: str, dialect: str) -> bool:
     """Remove an expression matching *label* from the statement's WHERE.
 
+    Searches both the main query and all CTE bodies.
+
     Handles:
     - Single-predicate WHERE → removes entire WHERE clause.
     - AND-conjunction → removes the matching conjunct, keeps the rest.
@@ -576,35 +594,55 @@ def _delete_by_label(stmt: StatementIR, label: str, dialect: str) -> bool:
     label_parts = label.split(".")
     pattern_type = label_parts[0] if label_parts else ""
 
-    # Find the SELECT (possibly inside CREATE)
-    select_node = stmt.ast
-    if isinstance(select_node, exp.Create):
-        select_node = select_node.args.get("expression")
-    # Unwrap With
-    if isinstance(select_node, exp.With):
-        select_node = select_node.this
-    # Walk into CTEs as well
-    if isinstance(select_node, exp.Select) and select_node.args.get("with"):
-        # Also check CTE bodies
-        pass
+    # Find the query root (possibly inside CREATE)
+    root = stmt.ast
+    if isinstance(root, exp.Create):
+        root = root.args.get("expression")
 
-    if not isinstance(select_node, exp.Select):
-        return False
+    # Collect all SELECT nodes to check (CTE bodies + main query)
+    selects: List[exp.Select] = []
 
+    if isinstance(root, exp.With):
+        for cte_node in root.expressions:
+            body = cte_node.this
+            if isinstance(body, exp.Select):
+                selects.append(body)
+        if isinstance(root.this, exp.Select):
+            selects.append(root.this)
+    elif isinstance(root, exp.Select):
+        with_clause = root.args.get("with")
+        if with_clause:
+            for cte_node in with_clause.expressions:
+                body = cte_node.this
+                if isinstance(body, exp.Select):
+                    selects.append(body)
+        selects.append(root)
+
+    # Try deleting from each SELECT's WHERE
+    for select_node in selects:
+        if _try_delete_from_where(select_node, pattern_type, label_parts, dialect):
+            stmt.sql_text = stmt.ast.sql(dialect=dialect)
+            return True
+
+    return False
+
+
+def _try_delete_from_where(
+    select_node: exp.Select,
+    pattern_type: str,
+    label_parts: list,
+    dialect: str,
+) -> bool:
+    """Try to remove a matching predicate from *select_node*'s WHERE clause."""
     where_clause = select_node.args.get("where")
     if not where_clause:
         return False
 
     predicate = where_clause.this
-    matched = _predicate_matches_label(predicate, pattern_type, label_parts, dialect)
-
-    if matched:
-        # Entire WHERE matches → remove it
+    if _predicate_matches_label(predicate, pattern_type, label_parts, dialect):
         select_node.set("where", None)
-        stmt.sql_text = stmt.ast.sql(dialect=dialect)
         return True
 
-    # Check if WHERE is an AND conjunction — try removing one conjunct
     if isinstance(predicate, exp.And):
         conjuncts = _flatten_and(predicate)
         remaining = [
@@ -619,7 +657,6 @@ def _delete_by_label(stmt: StatementIR, label: str, dialect: str) -> bool:
                 for r in remaining[1:]:
                     new_pred = exp.And(this=new_pred, expression=r)
                 where_clause.set("this", new_pred)
-            stmt.sql_text = stmt.ast.sql(dialect=dialect)
             return True
 
     return False
