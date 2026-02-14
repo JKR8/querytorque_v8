@@ -538,7 +538,7 @@ def _get_or_run_explain(
     # Run fresh EXPLAIN ANALYZE
     try:
         from .execution.database_utils import run_explain_analyze
-        from .prompts.analyst_briefing import format_pg_explain_tree
+        from .prompts.v2_analyst_briefing import format_pg_explain_tree
 
         result = run_explain_analyze(dsn, optimized_sql)
         if not result:
@@ -791,7 +791,7 @@ def _boost_leaderboard_entry(
             # Run fresh EXPLAIN
             try:
                 from .execution.database_utils import run_explain_analyze
-                from .prompts.analyst_briefing import format_pg_explain_tree
+                from .prompts.v2_analyst_briefing import format_pg_explain_tree
                 result = run_explain_analyze(dsn, optimized_sql)
                 if result:
                     explain_text = result.get("plan_text")

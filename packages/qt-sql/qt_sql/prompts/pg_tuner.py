@@ -95,7 +95,7 @@ def build_pg_tuner_prompt(
     """
     # Render plan_json to text if no text plan provided
     if not explain_plan and plan_json:
-        from .analyst_briefing import format_pg_explain_tree
+        from .v2_analyst_briefing import format_pg_explain_tree
         explain_plan = format_pg_explain_tree(plan_json)
 
     if current_settings is None:

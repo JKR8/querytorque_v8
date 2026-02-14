@@ -1160,17 +1160,17 @@ class Pipeline:
             recommended swaps. Returns (None, None, None, []) on failure.
         """
         from .analyst import parse_example_overrides
-        from .prompts.analyst_briefing import build_analyst_briefing_prompt
-        from .prompts.swarm_parsers import parse_briefing_response
-        from .prompts.briefing_checks import validate_parsed_briefing
+        from .prompts.v2_analyst_briefing import build_v2_analyst_briefing_prompt
+        from .prompts.v2_swarm_parsers import parse_v2_briefing_response
+        from .prompts.v2_briefing_checks import validate_v2_parsed_briefing
 
         logger.info(f"[{query_id}] Running LLM analyst (stubborn query mode)")
 
         # Gather context via the shared method
         ctx = self.gather_analyst_context(query_id, sql, dialect, engine)
 
-        # Build the analysis prompt using expert mode template
-        analysis_prompt = build_analyst_briefing_prompt(
+        # Build the analysis prompt using expert mode template (V2 §I-§VIII)
+        analysis_prompt = build_v2_analyst_briefing_prompt(
             mode="expert",
             query_id=query_id,
             sql=sql,
@@ -1178,8 +1178,16 @@ class Pipeline:
             costs=costs,
             dialect=dialect,
             dialect_version=self._engine_version,
-            **{k: v for k, v in ctx.items()
-               if k not in ("matched_examples", "all_available_examples", "regression_warnings")},
+            explain_plan_text=ctx.get("explain_plan_text"),
+            semantic_intents=ctx.get("semantic_intents"),
+            constraints=ctx.get("constraints"),
+            engine_profile=ctx.get("engine_profile"),
+            resource_envelope=ctx.get("resource_envelope"),
+            exploit_algorithm_text=ctx.get("exploit_algorithm_text"),
+            plan_scanner_text=ctx.get("plan_scanner_text"),
+            detected_transforms=ctx.get("detected_transforms"),
+            qerror_analysis=ctx.get("qerror_analysis"),
+            matched_examples=ctx.get("matched_examples"),
         )
 
         # Send to LLM
@@ -1199,8 +1207,8 @@ class Pipeline:
         # The LLM responds in briefing format (=== SHARED BRIEFING === etc.),
         # so we parse with parse_briefing_response and convert the shared
         # sections into the flat text format that Prompter.build_prompt() expects.
-        briefing = parse_briefing_response(raw_response)
-        briefing_issues = validate_parsed_briefing(briefing, expected_workers=1)
+        briefing = parse_v2_briefing_response(raw_response)
+        briefing_issues = validate_v2_parsed_briefing(briefing, expected_workers=1)
         if briefing_issues:
             logger.error(
                 "[%s] Analyst briefing invalid: %s",
@@ -1419,6 +1427,7 @@ class Pipeline:
                     ex_id, engine=engine, seed_dirs=self._seed_dirs,
                 )
                 if ex_data:
+                    ex_data["_match_score"] = round(score, 3)
                     examples.append(ex_data)
 
         if not examples:
@@ -1808,7 +1817,7 @@ class Pipeline:
         For PG: renders plan_json via format_pg_explain_tree().
         Returns pre-rendered text ready for prompt embedding.
         """
-        from .prompts.analyst_briefing import (
+        from .prompts.v2_analyst_briefing import (
             format_duckdb_explain_tree,
             format_pg_explain_tree,
         )

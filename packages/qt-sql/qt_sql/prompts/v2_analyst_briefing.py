@@ -107,6 +107,403 @@ def _detect_query_features(dag: Any) -> Dict[str, bool]:
     return features
 
 
+# ──────────────────────────────────────────────────────────────────────
+# PostgreSQL EXPLAIN formatting (imported from V1, needed by swarm_snipe)
+# ──────────────────────────────────────────────────────────────────────
+
+def _render_pg_node(
+    node: Dict[str, Any],
+    depth: int,
+    lines: list[str],
+    max_depth: int = 30,
+    is_estimate: bool = False,
+) -> None:
+    """Recursively render a PG EXPLAIN JSON node as indented text."""
+    if depth > max_depth:
+        return
+
+    ntype = node.get("Node Type", "???")
+
+    # Prefer ANALYZE actuals; fall back to planner estimates
+    if "Actual Rows" in node:
+        rows = node.get("Actual Rows", 0) or 0
+        loops = node.get("Actual Loops", 1) or 1
+        time_ms = node.get("Actual Total Time", 0) or 0
+        is_estimate = False
+    else:
+        rows = node.get("Plan Rows", 0) or 0
+        loops = 1
+        time_ms = node.get("Total Cost", 0) or 0  # cost units, not ms
+        is_estimate = True
+
+    indent = "  " * depth
+
+    # Build the main line
+    parts = [f"{indent}-> {ntype}"]
+
+    # Relation/index name
+    rel = node.get("Relation Name") or node.get("Index Name")
+    if rel:
+        parts.append(f"on {rel}")
+    alias = node.get("Alias")
+    if alias and alias != rel:
+        parts.append(f"{alias}")
+
+    # Join type
+    jtype = node.get("Join Type")
+    if jtype:
+        parts[0] = f"{indent}-> {ntype} {jtype}"
+
+    # CTE name
+    cte = node.get("CTE Name")
+    if cte:
+        parts.append(f"(CTE: {cte})")
+
+    line = " ".join(parts)
+
+    # Stats — label clearly when using planner estimates vs actual measurements
+    if is_estimate:
+        stats = f"(est_rows={_fmt_count(rows)} cost={time_ms:.0f})"
+    else:
+        stats = f"(rows={_fmt_count(rows)} loops={loops} time={time_ms:.1f}ms)"
+    lines.append(f"{line}  {stats}")
+
+    # Important detail lines
+    # Sort info
+    sort_method = node.get("Sort Method")
+    if sort_method:
+        space = node.get("Sort Space Used", 0)
+        stype = node.get("Sort Space Type", "")
+        lines.append(f"{indent}   Sort Method: {sort_method}  Space: {space}kB ({stype})")
+
+    # Hash info
+    batches = node.get("Hash Batches")
+    if batches and batches > 1:
+        mem = node.get("Peak Memory Usage", 0)
+        lines.append(f"{indent}   Batches: {batches}  Memory: {mem}kB")
+
+    # Workers
+    w_planned = node.get("Workers Planned")
+    w_launched = node.get("Workers Launched")
+    if w_planned is not None:
+        lines.append(f"{indent}   Workers: {w_launched}/{w_planned} launched")
+
+    # Filter/conditions
+    for key in ("Filter", "Index Cond", "Hash Cond", "Merge Cond", "Join Filter",
+                "Recheck Cond", "One-Time Filter"):
+        val = node.get(key)
+        if val:
+            vstr = str(val)
+            if len(vstr) > 100:
+                vstr = vstr[:97] + "..."
+            lines.append(f"{indent}   {key}: {vstr}")
+
+    # Rows removed by filter
+    removed = node.get("Rows Removed by Filter")
+    if removed and removed > 0:
+        lines.append(f"{indent}   Rows Removed by Filter: {_fmt_count(removed)}")
+
+    # I/O stats (compact)
+    shared_read = node.get("Shared Read Blocks", 0)
+    shared_hit = node.get("Shared Hit Blocks", 0)
+    temp_read = node.get("Temp Read Blocks", 0)
+    temp_write = node.get("Temp Written Blocks", 0)
+    if shared_read > 1000 or temp_read > 0:
+        io_parts = []
+        if shared_hit:
+            io_parts.append(f"hit={_fmt_count(shared_hit)}")
+        if shared_read:
+            io_parts.append(f"read={_fmt_count(shared_read)}")
+        if temp_read:
+            io_parts.append(f"temp_r={_fmt_count(temp_read)}")
+        if temp_write:
+            io_parts.append(f"temp_w={_fmt_count(temp_write)}")
+        lines.append(f"{indent}   Buffers: {' '.join(io_parts)}")
+
+    # Subplan name (for CTEs)
+    subplan = node.get("Subplan Name")
+    if subplan:
+        lines[len(lines) - len(lines)] = lines[len(lines) - len(lines)]  # no-op
+        # Already shown via CTE name above
+
+    # Recurse into children
+    for child in node.get("Plans", []):
+        _render_pg_node(child, depth + 1, lines, max_depth, is_estimate)
+
+
+def format_pg_explain_tree(plan_json: Any) -> str:
+    """Convert PG EXPLAIN (FORMAT JSON) plan to a readable ASCII tree.
+
+    Args:
+        plan_json: The plan_json field from cached explains (list or dict).
+            Standard PG JSON format: [{"Plan": {...}, "Planning Time": ..., ...}]
+
+    Returns:
+        Readable ASCII tree string showing operators, timing, and key details.
+    """
+    if not plan_json:
+        return ""
+
+    # Handle both list wrapper and bare dict
+    if isinstance(plan_json, list):
+        if not plan_json:
+            return ""
+        top = plan_json[0]
+    elif isinstance(plan_json, dict):
+        top = plan_json
+    else:
+        return str(plan_json)
+
+    root = top.get("Plan")
+    if not root:
+        return str(plan_json)
+
+    planning_ms = top.get("Planning Time", 0)
+    exec_ms = top.get("Execution Time", 0)
+
+    lines: list[str] = []
+
+    # Detect whether this is EXPLAIN ANALYZE (has actuals) or plain EXPLAIN (estimates only)
+    has_actuals = "Actual Rows" in root
+    is_estimate = not has_actuals
+
+    # Header with total times
+    if has_actuals:
+        total_ms = root.get("Actual Total Time", 0)
+        if total_ms:
+            lines.append(f"Total execution time: {total_ms:.1f}ms")
+    else:
+        total_cost = root.get("Total Cost", 0)
+        lines.append(f"NOTE: EXPLAIN only (no ANALYZE) — rows and costs are planner ESTIMATES, not measurements.")
+        lines.append(f"Total estimated cost: {total_cost:.0f}")
+    if planning_ms:
+        lines.append(f"Planning time: {planning_ms:.1f}ms")
+    if lines:
+        lines.append("")
+
+    # Render the tree
+    _render_pg_node(root, depth=0, lines=lines, is_estimate=is_estimate)
+
+    # JIT info
+    jit = top.get("JIT") or root.get("JIT")
+    if jit:
+        lines.append("")
+        funcs = jit.get("Functions", 0)
+        gen_ms = jit.get("Generation", {}).get("Timing", 0)
+        opt_ms = jit.get("Optimization", {}).get("Timing", 0)
+        emit_ms = jit.get("Emission", {}).get("Timing", 0)
+        total_jit = gen_ms + opt_ms + emit_ms
+        lines.append(f"JIT: {funcs} functions, total={total_jit:.1f}ms "
+                     f"(gen={gen_ms:.1f} opt={opt_ms:.1f} emit={emit_ms:.1f})")
+
+    # Triggers
+    triggers = top.get("Triggers", [])
+    if triggers:
+        lines.append("")
+        for t in triggers:
+            lines.append(f"Trigger: {t.get('Trigger Name', '?')} "
+                         f"calls={t.get('Calls', 0)} time={t.get('Time', 0):.1f}ms")
+
+    return "\n".join(lines)
+
+
+def _format_regression_for_analyst(reg: Dict[str, Any]) -> str:
+    """Format a regression example for the analyst's full view."""
+    eid = reg.get("id", "?")
+    speedup = str(reg.get("verified_speedup", "?")).rstrip("x")
+    transform = reg.get("transform_attempted", "unknown")
+    mechanism = reg.get("regression_mechanism", "")
+    desc = reg.get("description", "")
+
+    parts = [f"### {eid}: {transform} ({speedup}x)"]
+    if desc:
+        parts.append(f"**Anti-pattern:** {desc}")
+    if mechanism:
+        parts.append(f"**Mechanism:** {mechanism}")
+    return "\n".join(parts)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# DuckDB EXPLAIN formatting
+# ──────────────────────────────────────────────────────────────────────
+
+# Operators that are just internal plumbing — collapse/skip them
+_SKIP_OPERATORS = {"PROJECTION", "RESULT_COLLECTOR", "COLUMN_DATA_SCAN"}
+
+_EXTRA_INFO_KEYS = {
+    "HASH_AGGREGATE": ["Distinct Aggregates"],
+    "SIMPLE_AGGREGATE": ["Distinct Aggregates"],
+    "WINDOW": ["Function", "Order By"],
+    "HASH_JOIN": ["Hash Condition"],
+    "NESTED_LOOP_JOIN": ["Join Condition"],
+    "MERGE_JOIN": ["Merge Condition"],
+}
+
+
+def _fmt_extra_value(key: str, val: Any) -> str:
+    """Format an extra_info value for readability."""
+    if isinstance(val, list):
+        if not val:
+            return ""
+        return ", ".join(str(v) for v in val)
+    return str(val)
+
+
+def _collect_total_timing(node: Dict[str, Any]) -> float:
+    """Sum all operator_timing values in the tree (exclusive/self-time)."""
+    total = node.get("operator_timing", 0) or 0
+    for child in node.get("children", []):
+        total += _collect_total_timing(child)
+    return total
+
+
+def _render_node(
+    node: Dict[str, Any],
+    depth: int,
+    total_time: float,
+    lines: list[str],
+    max_depth: int = 30,
+) -> None:
+    """Recursively render a plan node as an indented ASCII line."""
+    if depth > max_depth:
+        return
+
+    name = node.get("operator_name", "")
+    timing = node.get("operator_timing", 0) or 0
+    card = node.get("operator_cardinality", 0) or 0
+    scanned = node.get("operator_rows_scanned", 0) or 0
+    extra = node.get("extra_info", {}) or {}
+    children = node.get("children", [])
+
+    # Skip noise operators — just recurse into their children
+    if name in _SKIP_OPERATORS or not name:
+        for child in children:
+            _render_node(child, depth, total_time, lines, max_depth)
+        return
+
+    # Build the line
+    indent = "  " * depth
+    timing_ms = timing * 1000
+    pct = (timing / total_time * 100) if total_time > 0 else 0
+
+    # Cardinality + timing
+    if timing_ms >= 0.1:
+        if pct >= 1.0:
+            stats = f"[{_fmt_count(card)} rows, {timing_ms:.1f}ms, {pct:.0f}%]"
+        else:
+            stats = f"[{_fmt_count(card)} rows, {timing_ms:.1f}ms]"
+    else:
+        stats = f"[{_fmt_count(card)} rows]"
+
+    # Special handling for SEQ_SCAN: show table name and scan ratio
+    if "SCAN" in name and extra.get("Table"):
+        table = extra["Table"]
+        if scanned > 0 and scanned != card:
+            stats = f"{table} [{_fmt_count(card)} of {_fmt_count(scanned)} rows"
+        else:
+            stats = f"{table} [{_fmt_count(card)} rows"
+        if timing_ms >= 0.1:
+            if pct >= 1.0:
+                stats += f", {timing_ms:.1f}ms, {pct:.0f}%]"
+            else:
+                stats += f", {timing_ms:.1f}ms]"
+        else:
+            stats += "]"
+        # Show filters inline for scans
+        filters = extra.get("Filters")
+        if filters:
+            fstr = _fmt_extra_value("Filters", filters)
+            if len(fstr) > 80:
+                fstr = fstr[:77] + "..."
+            stats += f"  Filters: {fstr}"
+        lines.append(f"{indent}{name} {stats}")
+    else:
+        # Join info inline
+        suffix = ""
+        if "JOIN" in name:
+            jtype = extra.get("Join Type", "")
+            conds = extra.get("Conditions", "")
+            if jtype:
+                suffix += f" {jtype}"
+            if conds:
+                cstr = _fmt_extra_value("Conditions", conds)
+                if len(cstr) > 60:
+                    cstr = cstr[:57] + "..."
+                suffix += f" on {cstr}"
+        lines.append(f"{indent}{name}{suffix} {stats}")
+
+        # Show key extra_info on next line(s) for non-join/non-scan
+        show_keys = _EXTRA_INFO_KEYS.get(name, [])
+        for key in show_keys:
+            if key in ("Join Type", "Conditions", "Table", "Filters"):
+                continue  # Already shown inline
+            val = extra.get(key)
+            if val:
+                vstr = _fmt_extra_value(key, val)
+                if len(vstr) > 100:
+                    vstr = vstr[:97] + "..."
+                lines.append(f"{indent}  {key}: {vstr}")
+
+    # Recurse
+    for child in children:
+        _render_node(child, depth + 1, total_time, lines, max_depth)
+
+
+def format_duckdb_explain_tree(plan_text: str) -> str:
+    """Convert DuckDB JSON EXPLAIN plan to a readable ASCII operator tree.
+
+    The plan_text field in cached explain files contains a JSON string
+    (not ASCII text). This function parses it and renders a compact tree
+    showing operator name, cardinality, timing, cost%, and key metadata.
+
+    Noise operators (PROJECTION, RESULT_COLLECTOR) are collapsed.
+    Timing is shown as ms with % of total for bottleneck identification.
+
+    Args:
+        plan_text: JSON string from explains/*.json field "plan_text"
+
+    Returns:
+        Readable ASCII tree string, or the original text if not JSON.
+    """
+    import json
+
+    # If it's not JSON, return as-is (might be pre-formatted text)
+    stripped = plan_text.strip()
+    if not stripped.startswith("{"):
+        return plan_text
+
+    try:
+        plan = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return plan_text
+
+    # Find the real root — skip wrapper and EXPLAIN_ANALYZE
+    root_nodes = []
+    for child in plan.get("children", []):
+        if child.get("operator_name") == "EXPLAIN_ANALYZE":
+            root_nodes.extend(child.get("children", []))
+        else:
+            root_nodes.append(child)
+
+    if not root_nodes:
+        root_nodes = plan.get("children", [])
+    if not root_nodes:
+        return plan_text
+
+    # Compute total timing for % calculation
+    total_time = sum(_collect_total_timing(n) for n in root_nodes)
+
+    lines: list[str] = []
+    if total_time > 0:
+        lines.append(f"Total execution time: {total_time * 1000:.0f}ms")
+        lines.append("")
+
+    for node in root_nodes:
+        _render_node(node, depth=0, total_time=total_time, lines=lines)
+
+    return "\n".join(lines)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Section Builders — each returns a string for its section
 # ═══════════════════════════════════════════════════════════════════════
