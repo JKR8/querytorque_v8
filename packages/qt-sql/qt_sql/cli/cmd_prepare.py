@@ -151,8 +151,8 @@ def prepare(
             # Evidence bundle (optional)
             if evidence:
                 from ..evidence import extract_evidence_bundle, render_evidence_for_prompt
-                # explain_result is the raw plan JSON from _parse_logical_tree
-                plan_json = explain_result
+                # explain_result is the wrapper dict; extract nested plan_json
+                plan_json = explain_result.get("plan_json") if explain_result else None
                 bundle = extract_evidence_bundle(
                     query_id=qid,
                     query_sql=sql,

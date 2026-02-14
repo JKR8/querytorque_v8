@@ -723,8 +723,9 @@ def section_this_engine(
             lines.append("")
             lines.append(plan_scanner_text)
             lines.append("")
-        # Resource Envelope (PG only)
-        if dialect in ("postgresql", "postgres") and resource_envelope:
+        # Resource Envelope — rendered for all engines when present
+        # (PG: pg_tuning resource envelope; all engines: orchestrator scenario/capabilities)
+        if resource_envelope:
             lines.append("### System Resource Envelope")
             lines.append("")
             lines.append(resource_envelope)

@@ -136,14 +136,22 @@ class OneshotSession(OptimizationSession):
                 logger.warning(f"[{self.query_id}] Syntax error: {e}")
                 optimized_sql = self.original_sql
 
-            # Phase 6: Validate
-            status, speedup, val_errors, val_error_cat = self.pipeline._validate(
-                self.original_sql, optimized_sql,
-            )
-            logger.info(
-                f"[{self.query_id}] Oneshot iter {i + 1}: "
-                f"{status} ({speedup:.2f}x)"
-            )
+            # Phase 6: Validate — skip if SQL unchanged (no point timing noise)
+            if optimized_sql.strip() == self.original_sql.strip():
+                logger.info(
+                    f"[{self.query_id}] Oneshot iter {i + 1}: "
+                    f"SQL unchanged after rewrite failure, skipping validation"
+                )
+                status, speedup = "NEUTRAL", 1.0
+                val_errors, val_error_cat = ["Rewrite produced unchanged SQL"], "rewrite_failure"
+            else:
+                status, speedup, val_errors, val_error_cat = self.pipeline._validate(
+                    self.original_sql, optimized_sql,
+                )
+                logger.info(
+                    f"[{self.query_id}] Oneshot iter {i + 1}: "
+                    f"{status} ({speedup:.2f}x)"
+                )
 
             # Track iteration
             iter_record = {

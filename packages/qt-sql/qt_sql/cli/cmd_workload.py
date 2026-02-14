@@ -68,17 +68,40 @@ def workload(
     # Load queries from benchmark
     config = json.loads(config_path.read_text())
     queries_dir = bench_dir / "queries"
+    explains_dir = bench_dir / "explains"
     queries = []
 
     if queries_dir.exists():
         for qf in sorted(queries_dir.glob("*.sql")):
             qid = qf.stem
+            duration_ms = None
+            timed_out = False
+            spill_detected = False
+
+            # Try to read baseline metrics from cached EXPLAIN results
+            explain_path = explains_dir / f"{qid}.json"
+            if explain_path.exists():
+                try:
+                    explain_data = json.loads(explain_path.read_text())
+                    exec_ms = explain_data.get("execution_time_ms")
+                    if exec_ms is not None:
+                        duration_ms = float(exec_ms)
+                        timed_out = duration_ms > 300_000
+                    # Check for spill indicators in plan text
+                    plan_text = explain_data.get("plan_text") or ""
+                    if any(kw in plan_text.lower() for kw in
+                           ("spill", "external merge", "temp written",
+                            "bytes_spilled")):
+                        spill_detected = True
+                except Exception:
+                    pass
+
             queries.append({
                 "query_id": qid,
                 "sql": qf.read_text(),
-                "duration_ms": None,
-                "timed_out": False,
-                "spill_detected": False,
+                "duration_ms": duration_ms,
+                "timed_out": timed_out,
+                "spill_detected": spill_detected,
                 "meets_sla": False,
             })
     else:

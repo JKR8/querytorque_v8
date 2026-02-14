@@ -182,14 +182,14 @@ class Orchestrator:
         if not self.engine_pack:
             return ""
         from .engine_packs import render_capabilities_for_prompt
-        return render_capabilities_for_prompt(self.engine)
+        return render_capabilities_for_prompt(self.engine, pack=self.engine_pack)
 
     def _render_optimizer_profile(self) -> str:
         """Render optimizer profile for prompt injection."""
         if not self.engine_pack:
             return ""
         from .engine_packs import render_optimizer_profile_for_prompt
-        return render_optimizer_profile_for_prompt(self.engine)
+        return render_optimizer_profile_for_prompt(self.engine, pack=self.engine_pack)
 
     def _render_scenario(self) -> str:
         """Render scenario card for prompt injection."""

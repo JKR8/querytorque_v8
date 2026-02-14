@@ -105,9 +105,20 @@ def get_validation_probes(engine: str) -> List[str]:
     return pack.get("validation", []) if pack else []
 
 
-def render_capabilities_for_prompt(engine: str) -> str:
-    """Render engine capabilities as text for prompt injection."""
-    caps = get_capabilities(engine)
+def render_capabilities_for_prompt(
+    engine: str, *, pack: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Render engine capabilities as text for prompt injection.
+
+    Args:
+        engine: Engine name (used to load pack if *pack* is None).
+        pack: Pre-loaded engine pack dict.  When provided, avoids
+              re-loading (and potentially losing version specificity).
+    """
+    if pack is not None:
+        caps = pack.get("capabilities", {})
+    else:
+        caps = get_capabilities(engine)
     if not caps:
         return ""
 
@@ -135,9 +146,19 @@ def render_capabilities_for_prompt(engine: str) -> str:
     return "\n".join(lines)
 
 
-def render_optimizer_profile_for_prompt(engine: str) -> str:
-    """Render optimizer profile as text for prompt injection."""
-    profile = get_optimizer_profile(engine)
+def render_optimizer_profile_for_prompt(
+    engine: str, *, pack: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Render optimizer profile as text for prompt injection.
+
+    Args:
+        engine: Engine name (used to load pack if *pack* is None).
+        pack: Pre-loaded engine pack dict.
+    """
+    if pack is not None:
+        profile = pack.get("optimizer_profile", {})
+    else:
+        profile = get_optimizer_profile(engine)
     if not profile:
         return ""
 
