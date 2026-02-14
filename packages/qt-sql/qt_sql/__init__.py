@@ -9,8 +9,7 @@ Pipeline:
 
 Optimization Modes:
 - ONESHOT: 1 LLM call per iteration, analyst produces SQL directly
-- EXPERT:  Iterative with analyst failure analysis (default)
-- SWARM:   Multi-worker fan-out with snipe refinement
+- SWARM:   Multi-worker fan-out with snipe refinement (default)
 
 Usage:
     from qt_sql.pipeline import Pipeline
@@ -20,10 +19,7 @@ Usage:
     # Oneshot mode (cheapest, 1 API call per iteration):
     result = p.run_optimization_session("query_1", sql, mode=OptimizationMode.ONESHOT)
 
-    # Expert mode (default, iterative with failure analysis):
-    result = p.run_optimization_session("query_1", sql, mode=OptimizationMode.EXPERT)
-
-    # Swarm mode (4-worker fan-out + snipe):
+    # Swarm mode (default, 4-worker fan-out + snipe):
     result = p.run_optimization_session("query_88", sql, mode=OptimizationMode.SWARM)
 """
 
@@ -42,7 +38,6 @@ from .schemas import (
 from .sessions import (
     OptimizationSession,
     OneshotSession,
-    ExpertSession,
     SwarmSession,
 )
 
@@ -54,7 +49,6 @@ __all__ = [
     "OptimizationMode",
     "OptimizationSession",
     "OneshotSession",
-    "ExpertSession",
     "SwarmSession",
     "PipelineResult",
     "PromotionAnalysis",
