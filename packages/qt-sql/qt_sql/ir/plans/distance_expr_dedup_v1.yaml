@@ -1,0 +1,79 @@
+# Plan B — Distance expression deduplication (H2)
+#
+# Splits the haversine computation (computed twice: once in SELECT, once in
+# WHERE) into a candidates CTE that computes it once, then filters.
+
+plan_id: distance_expr_dedup_v1
+dialect: duckdb
+description: >
+  Extract haversine distance into a locations_candidates CTE so the expensive
+  expression is evaluated once.  The downstream locations_within_range CTE
+  filters on the pre-computed distance_km column.
+
+preconditions:
+  - kind: parse_ok
+
+steps:
+  - step_id: B1_extract_distance_into_candidates_cte
+    op: replace_block_with_cte_pair
+    description: >
+      Replace the monolithic locations_within_range CTE with a two-CTE chain:
+      locations_candidates (computes distance_km) then locations_within_range
+      (filters on distance_km <= 80).
+    target:
+      by_label: "geo.distance_haversine"
+    payload:
+      sql_fragment: |
+        locations_candidates AS (
+          SELECT
+            acc.address_id,
+            acc.city,
+            acc.state,
+            acc.postal_code,
+            acc.longitude,
+            acc.latitude,
+            s.store_name,
+            s.dealer_code,
+            s.store_longitude,
+            s.store_latitude,
+            ROUND(
+              6371 * 2 * ASIN(
+                SQRT(
+                  POW(SIN(RADIANS((CAST(s.store_latitude AS DOUBLE) - CAST(acc.latitude AS DOUBLE)) / 2)), 2)
+                  + COS(RADIANS(CAST(acc.latitude AS DOUBLE))) * COS(RADIANS(CAST(s.store_latitude AS DOUBLE)))
+                  * POW(SIN(RADIANS((CAST(s.store_longitude AS DOUBLE) - CAST(acc.longitude AS DOUBLE)) / 2)), 2)
+                )
+              ),
+              2
+            ) AS distance_km
+          FROM tbl_address_portfolio_v1 acc
+          JOIN location_record s ON 1 = 1
+          WHERE acc.longitude BETWEEN s.longitude_offset_min AND s.longitude_offset_max
+            AND acc.latitude  BETWEEN s.latitude_offset_min  AND s.latitude_offset_max
+        )
+        , locations_within_range AS (
+          SELECT *
+          FROM locations_candidates
+          WHERE distance_km <= 80
+        )
+    gates:
+      - kind: parse_ok
+
+  - step_id: B2_remove_duplicate_distance_where_expr
+    op: delete_expr_subtree
+    description: >
+      Remove the old inline ROUND(...) <= 80 predicate that duplicated the
+      haversine computation (now handled by locations_within_range filter).
+    target:
+      by_label: "geo.distance_filter"
+    payload: {}
+    gates:
+      - kind: parse_ok
+
+postconditions:
+  - kind: plan_shape
+    args:
+      expectation: "haversine_expr_occurs_once"
+  - kind: plan_shape
+    args:
+      expectation: "distance_filter_uses_distance_km_column"
