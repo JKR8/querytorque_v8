@@ -245,12 +245,13 @@ class WorkloadSession:
         # Run through pipeline
         try:
             if tier == "TIER_2":
-                # Oneshot mode for Tier 2
+                # Oneshot mode for Tier 2 — single pass (no iteration)
                 from ..sessions.oneshot_session import OneshotSession
                 session = OneshotSession(
                     pipeline=self.pipeline,
                     query_id=query_id,
                     original_sql=query_sql,
+                    max_iterations=1,
                 )
             else:
                 # Swarm mode for Tier 3

@@ -206,25 +206,24 @@ def _walk_pg_plan(node: Dict, entries: List[CostSpineEntry], depth: int = 0) -> 
     node_type = node.get("Node Type", "Unknown")
 
     if total_cost > 0:
-        entries.append(CostSpineEntry(
+        entry = CostSpineEntry(
             node_id=f"d{depth}",
             operator=node_type,
-            cost_pct=0,  # Will be normalized later
+            cost_pct=0,  # Will be normalized using Total Cost
             estimated_rows=plan_rows,
             actual_rows=actual_rows,
-        ))
+        )
+        entry._raw_cost = total_cost  # type: ignore[attr-defined]
+        entries.append(entry)
 
     for child in node.get("Plans", []):
         _walk_pg_plan(child, entries, depth + 1)
 
-    # Normalize cost_pct after full walk
+    # Normalize cost_pct after full walk using Total Cost, not row counts
     if depth == 0 and entries:
-        max_cost = max(e.estimated_rows for e in entries) if entries else 1
-        # For PG, use total_cost as proxy
-        root_cost = node.get("Total Cost", 1) or 1
+        root_cost = node.get("Total Cost", 0) or 1
         for e in entries:
-            # Approximate cost contribution
-            e.cost_pct = round(e.estimated_rows / max(root_cost, 1) * 100, 1)
+            e.cost_pct = round(e._raw_cost / max(root_cost, 1) * 100, 1)
 
 
 def _walk_duckdb_plan(node: Dict, entries: List[CostSpineEntry], depth: int = 0) -> None:
@@ -238,24 +237,25 @@ def _walk_duckdb_plan(node: Dict, entries: List[CostSpineEntry], depth: int = 0)
     extra_info = node.get("extra_info", "")
 
     if timing > 0 or cardinality > 0:
-        entries.append(CostSpineEntry(
+        entry = CostSpineEntry(
             node_id=f"d{depth}",
             operator=name,
-            cost_pct=0,  # Will be normalized
+            cost_pct=0,  # Will be normalized using timing
             estimated_rows=0,
             actual_rows=cardinality,
             notes=extra_info[:100] if extra_info else "",
-        ))
+        )
+        entry._raw_cost = timing  # type: ignore[attr-defined]
+        entries.append(entry)
 
     for child in node.get("children", []):
         _walk_duckdb_plan(child, entries, depth + 1)
 
-    # Normalize by timing
+    # Normalize by timing (not row counts)
     if depth == 0 and entries:
-        total_timing = sum(e.actual_rows for e in entries) or 1
-        # DuckDB plans have timing — use it for cost_pct
+        total_timing = sum(e._raw_cost for e in entries) or 1  # type: ignore[attr-defined]
         for e in entries:
-            e.cost_pct = round(e.actual_rows / total_timing * 100, 1)
+            e.cost_pct = round(e._raw_cost / total_timing * 100, 1)  # type: ignore[attr-defined]
 
 
 def render_evidence_for_prompt(bundle: EvidenceBundle) -> str:

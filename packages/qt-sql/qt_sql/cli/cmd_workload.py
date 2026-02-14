@@ -78,7 +78,7 @@ def workload(
                 "sql": qf.read_text(),
                 "duration_ms": None,
                 "timed_out": False,
-                "spills_remote": False,
+                "spill_detected": False,
                 "meets_sla": False,
             })
     else:

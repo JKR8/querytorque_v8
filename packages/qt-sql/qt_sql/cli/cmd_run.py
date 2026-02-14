@@ -120,6 +120,20 @@ def run(
     iters = 1 if fan_out_only else max_iterations
     n_workers = cfg.get("workers_state_0", 4)
 
+    # Create orchestrator when scenario or engine-version is provided
+    orchestrator = None
+    if scenario or engine_version:
+        from ..orchestrator import Orchestrator
+        engine = cfg.get("engine", "duckdb")
+        orchestrator = Orchestrator(
+            engine=engine,
+            scenario=scenario or None,
+            engine_version=engine_version or None,
+        )
+        console.print(f"  Orchestrator: engine={engine}"
+                      f"{f', scenario={scenario}' if scenario else ''}"
+                      f"{f', version={engine_version}' if engine_version else ''}")
+
     results = []
     errors = []
     t0 = time.time()
@@ -139,6 +153,7 @@ def run(
             results=results,
             errors=errors,
             console=console,
+            orchestrator=orchestrator,
         )
     else:
         _run_serial(
@@ -155,6 +170,7 @@ def run(
             results=results,
             errors=errors,
             console=console,
+            orchestrator=orchestrator,
         )
 
     elapsed = time.time() - t0
@@ -192,6 +208,30 @@ def run(
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
 
+    # Emit output contracts if requested
+    if output_contract:
+        from ..contracts import QueryOutputContract
+        contracts_dir = out / "contracts"
+        contracts_dir.mkdir(exist_ok=True)
+        n_contracts = 0
+        for r in results:
+            qid = r.get("query_id", "unknown")
+            result_path = out / qid / "result.json"
+            if result_path.exists():
+                try:
+                    result_data = json.loads(result_path.read_text())
+                    from ..schemas import SessionResult
+                    sr = SessionResult(**{
+                        k: result_data[k] for k in SessionResult.__dataclass_fields__
+                        if k in result_data
+                    })
+                    contract = QueryOutputContract.from_session_result(sr)
+                    (contracts_dir / f"{qid}.json").write_text(contract.to_json())
+                    n_contracts += 1
+                except Exception as e:
+                    console.print(f"  contract {qid}: [dim]skipped ({e})[/dim]")
+        console.print(f"  Output contracts: {n_contracts} written → {contracts_dir}")
+
     console.print()
     print_success(f"Completed {len(results)}/{len(query_ids)} in {elapsed:.1f}s → {out}")
     if errors:
@@ -214,6 +254,7 @@ def _run_serial(
     results,
     errors,
     console,
+    orchestrator=None,
 ) -> None:
     """Original serial execution: each query end-to-end."""
     for i, qid in enumerate(query_ids, 1):
@@ -237,6 +278,7 @@ def _run_serial(
                 target_speedup=target_speedup,
                 n_workers=n_workers,
                 mode=mode_enum,
+                orchestrator=orchestrator,
             )
 
             _save_query_result(result, qid, out, checkpoint_path, completed_ids, results)
@@ -263,6 +305,7 @@ def _run_two_phase(
     results,
     errors,
     console,
+    orchestrator=None,
 ) -> None:
     """Two-phase execution: generate all candidates in parallel, then validate serially."""
     from ..sessions.swarm_session import SwarmSession
@@ -294,6 +337,7 @@ def _run_two_phase(
             max_iterations=max_iterations,
             target_speedup=target_speedup,
             n_workers=4,
+            orchestrator=orchestrator,
         )
         sessions.append((qid, session))
 

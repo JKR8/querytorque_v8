@@ -196,12 +196,12 @@ def triage_workload(
         cumulative = 0
         for r in results[:3]:
             cumulative += r.pain_score * r.frequency_score
-            if cumulative / triage.total_pain >= 0.8:
-                break
             r.quick_win = True
             r.tier = Tier.TIER_3
             r.reason = "quick-win: top pain contributor"
             triage.quick_wins.append(r.query_id)
+            if cumulative / triage.total_pain >= 0.8:
+                break
 
     # Classify into lists
     for r in results:

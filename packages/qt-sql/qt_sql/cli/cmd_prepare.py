@@ -91,6 +91,16 @@ def prepare(
 
     pipeline = Pipeline(bench_dir)
 
+    # Load scenario card if specified
+    scenario_card = None
+    if scenario:
+        from ..scenario_cards import load_scenario_card
+        scenario_card = load_scenario_card(scenario)
+        if scenario_card:
+            console.print(f"  Scenario card: {scenario}")
+        else:
+            console.print(f"  [yellow]Warning: scenario '{scenario}' not found[/yellow]")
+
     results = []
     errors = []
     t0 = time.time()
@@ -138,6 +148,26 @@ def prepare(
             (out / "prompts" / f"{qid}.txt").write_text(prompt)
             (out / "original" / f"{qid}.sql").write_text(sql)
 
+            # Evidence bundle (optional)
+            if evidence:
+                from ..evidence import extract_evidence_bundle, render_evidence_for_prompt
+                bundle = extract_evidence_bundle(
+                    query_id=qid,
+                    query_sql=sql,
+                    explain_result=explain_result,
+                    dag=dag,
+                    costs=costs,
+                    dialect=dialect,
+                )
+                evidence_text = render_evidence_for_prompt(bundle)
+                (out / "context" / f"{qid}_evidence.txt").write_text(evidence_text)
+
+            # Scenario card (optional)
+            if scenario_card:
+                from ..scenario_cards import render_scenario_for_prompt
+                scenario_text = render_scenario_for_prompt(scenario_card)
+                (out / "context" / f"{qid}_scenario.txt").write_text(scenario_text)
+
             # Context JSON (non-serializable items removed)
             ctx_serializable = {}
             for k, v in ctx_data.items():
@@ -162,6 +192,8 @@ def prepare(
                 "n_matched_examples": len(ctx_data.get("matched_examples", [])),
                 "n_constraints": len(ctx_data.get("constraints", [])),
                 "query_archetype": ctx_data.get("query_archetype"),
+                "scenario": scenario or None,
+                "has_evidence": evidence,
             }
             (out / "metadata" / f"{qid}.json").write_text(
                 json.dumps(meta, indent=2)

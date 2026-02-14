@@ -757,6 +757,7 @@ class Pipeline:
         target_speedup: float = 2.0,
         n_workers: int = 3,
         mode: OptimizationMode = OptimizationMode.SWARM,
+        orchestrator=None,
     ) -> SessionResult:
         """Run optimization session in specified mode.
 
@@ -767,6 +768,7 @@ class Pipeline:
             target_speedup: Stop early when this speedup is reached
             n_workers: Parallel workers per iteration
             mode: Optimization mode (oneshot, swarm)
+            orchestrator: Optional Orchestrator for declarative composition
 
         Returns:
             SessionResult with the best result across all iterations
@@ -780,6 +782,7 @@ class Pipeline:
                 target_speedup=target_speedup,
                 max_iterations=max_iterations,
                 n_workers=1,
+                orchestrator=orchestrator,
             )
         elif mode == OptimizationMode.SWARM:
             from .sessions.swarm_session import SwarmSession
@@ -790,6 +793,7 @@ class Pipeline:
                 max_iterations=max_iterations,
                 target_speedup=target_speedup,
                 n_workers=4,  # Always 4 in swarm mode
+                orchestrator=orchestrator,
             )
         else:
             raise ValueError(f"Unknown optimization mode: {mode}")
