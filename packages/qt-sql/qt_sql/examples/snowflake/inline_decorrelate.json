@@ -1,0 +1,51 @@
+{
+  "id": "sf_inline_decorrelate",
+  "name": "Inline Correlated Subquery Decorrelation (Snowflake)",
+  "description": "When a WHERE clause contains a correlated scalar subquery (e.g., col > (SELECT 1.3 * avg(col) FROM ... WHERE key = outer.key)), Snowflake re-executes the subquery per outer row. Fix: decompose into CTEs — (1) pre-filter dimension table, (2) pre-filter fact table by date range, (3) compute per-key aggregate threshold — then JOIN the threshold CTE in the final query.",
+  "verified_speedup": "23.17x",
+  "principle": "Inline Decorrelation: when WHERE has a correlated scalar subquery that re-scans the fact table per outer row, decompose into 3 CTEs: (1) dimension filter, (2) date-filtered fact rows, (3) per-key aggregate threshold via GROUP BY. The final query JOINs the threshold CTE, replacing O(N*M) correlated scans with a single hash join.",
+  "benchmark": {
+    "dataset": "tpcds_sf10tcl",
+    "warehouse": "MEDIUM",
+    "orig_ms": 69414.7,
+    "opt_ms": 2995.5,
+    "speedup": 23.17,
+    "validation": "3x3 (discard warmup, average last 2)",
+    "row_match": true
+  },
+  "example": {
+    "opportunity": "SF_INLINE_DECORRELATE",
+    "input_slice": "select sum(cs_ext_discount_amt) as \"excess discount amount\"\nfrom catalog_sales, item, date_dim\nwhere ... and i_item_sk = cs_item_sk\n  and d_date between '...' and '...' + interval '90 day'\n  and d_date_sk = cs_sold_date_sk\n  and cs_ext_discount_amt > (\n    SELECT 1.3 * avg(cs_ext_discount_amt)\n    FROM catalog_sales, date_dim\n    WHERE cs_item_sk = i_item_sk  -- correlated!\n      and d_date between ... and d_date_sk = cs_sold_date_sk\n      and cs_list_price between 16 and 45\n      and cs_sales_price / cs_list_price BETWEEN ...)",
+    "output": {
+      "rewrite_sets": [
+        {
+          "id": "rs_01",
+          "transform": "decorrelate",
+          "nodes": {
+            "filtered_items": "SELECT i_item_sk FROM item WHERE i_manufact_id IN (...) OR i_manager_id BETWEEN ...",
+            "date_filtered_sales": "SELECT cs.cs_item_sk, cs.cs_ext_discount_amt, ... FROM catalog_sales cs JOIN date_dim d ON d.d_date_sk = cs.cs_sold_date_sk WHERE d.d_date BETWEEN ...",
+            "item_avg_discount": "SELECT dfs.cs_item_sk, 1.3 * avg(dfs.cs_ext_discount_amt) AS threshold FROM date_filtered_sales dfs JOIN filtered_items fi ON fi.i_item_sk = dfs.cs_item_sk WHERE ... GROUP BY dfs.cs_item_sk",
+            "main_query": "SELECT sum(dfs.cs_ext_discount_amt) FROM date_filtered_sales dfs JOIN item_avg_discount iad ON iad.cs_item_sk = dfs.cs_item_sk WHERE dfs.cs_ext_discount_amt > iad.threshold"
+          },
+          "invariants_kept": [
+            "same result rows",
+            "same aggregation"
+          ],
+          "expected_speedup": "23x",
+          "risk": "low"
+        }
+      ]
+    },
+    "transforms": [
+      "decorrelate",
+      "early_filter",
+      "date_cte_isolate"
+    ],
+    "key_insight": "Snowflake P2 pathology: correlated scalar subqueries in WHERE re-execute the inner query per outer row. The optimizer cannot flatten when the inner query aggregates over a correlated key. Fix: decompose into 3 CTEs — dimension filter, date-filtered fact, per-key threshold — then JOIN. The correlated O(N*M) execution becomes a single hash join. Also converts comma joins to explicit JOINs (P1 synergy)."
+  },
+  "original_sql": "select  sum(cs_ext_discount_amt)  as \"excess discount amount\"\nfrom\n   catalog_sales\n   ,item\n   ,date_dim\nwhere\n(i_manufact_id in (1, 78, 97, 516, 521)\nor i_manager_id BETWEEN 25 and 54)\nand i_item_sk = cs_item_sk\nand d_date between '1999-03-07' and\n        cast('1999-03-07' as date) + interval '90 day'\nand d_date_sk = cs_sold_date_sk\nand cs_ext_discount_amt\n     > (\n         select\n            1.3 * avg(cs_ext_discount_amt)\n         from\n            catalog_sales\n           ,date_dim\n         where\n              cs_item_sk = i_item_sk\n          and d_date between '1999-03-07' and\n                             cast('1999-03-07' as date) + interval '90 day'\n          and d_date_sk = cs_sold_date_sk\n          and cs_list_price between 16 and 45\n          and cs_sales_price / cs_list_price BETWEEN 63 * 0.01 AND 83 * 0.01\n      )\norder by sum(cs_ext_discount_amt)\nlimit 100;",
+  "optimized_sql": "WITH filtered_items AS (\n    SELECT i_item_sk\n    FROM item\n    WHERE i_manufact_id IN (1, 78, 97, 516, 521)\n       OR i_manager_id BETWEEN 25 AND 54\n),\ndate_filtered_sales AS (\n    SELECT cs.cs_item_sk, cs.cs_ext_discount_amt,\n           cs.cs_list_price, cs.cs_sales_price\n    FROM catalog_sales cs\n    JOIN date_dim d ON d.d_date_sk = cs.cs_sold_date_sk\n    WHERE d.d_date BETWEEN '1999-03-07' AND cast('1999-03-07' as date) + interval '90 day'\n),\nitem_avg_discount AS (\n    SELECT dfs.cs_item_sk,\n           1.3 * avg(dfs.cs_ext_discount_amt) AS threshold\n    FROM date_filtered_sales dfs\n    JOIN filtered_items fi ON fi.i_item_sk = dfs.cs_item_sk\n    WHERE dfs.cs_list_price BETWEEN 16 AND 45\n      AND dfs.cs_sales_price / dfs.cs_list_price BETWEEN 63 * 0.01 AND 83 * 0.01\n    GROUP BY dfs.cs_item_sk\n)\nSELECT sum(dfs.cs_ext_discount_amt) AS \"excess discount amount\"\nFROM date_filtered_sales dfs\nJOIN item_avg_discount iad ON iad.cs_item_sk = dfs.cs_item_sk\nWHERE dfs.cs_ext_discount_amt > iad.threshold\nORDER BY 1\nLIMIT 100;",
+  "optimized_source": "adapted_from_pg",
+  "type": "gold",
+  "family": "B"
+}

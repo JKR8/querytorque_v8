@@ -6,7 +6,7 @@
 1. **Micro-partition pruning**: Filters on clustered columns skip micro-partitions. DO NOT wrap filter columns in functions (kills pruning).
 2. **Column pruning through CTEs**: Reads only columns referenced by final query. Automatic.
 3. **Predicate pushdown**: Filters pushed to storage layer, including through single-ref CTEs. Also does predicate MIRRORING across join sides. DO NOT manually duplicate filters.
-4. **Correlated subquery decorrelation**: Transforms correlated subqueries into hash joins. DO NOT decorrelate unless EXPLAIN shows a nested loop.
+4. **Correlated subquery decorrelation (simple)**: Transforms simple correlated subqueries into hash joins. DOES NOT handle correlated scalar subqueries with aggregation (see P3). Check EXPLAIN for nested loop before manual decorrelation of simple EXISTS/IN patterns.
 5. **EXISTS/NOT EXISTS semi-join**: Early termination. SemiJoin node in plan. NEVER materialize EXISTS into CTEs.
 6. **Join filtering (bloom filters)**: JoinFilter nodes push bloom filters from build side to probe-side TableScan. 77/99 TPC-DS queries show JoinFilter. DO NOT restructure joins that already have JoinFilter.
 7. **Cost-based join ordering**: Usually correct. DO NOT force join order unless evidence of a flipped join.
@@ -71,6 +71,22 @@ Evidence table — wins (all were TIMEOUT >300s):
 | Treatments | Consolidate into single scan with conditional aggregation (CASE WHEN). |
 | Failures | Q9 TIMEOUT — 73K parts unavoidable without date filter. |
 
+**P3: Correlated Scalar Subquery with Aggregation** (DECORRELATE) — 100% success (2/2)
+
+| Aspect | Detail |
+|---|---|
+| Detect | WHERE col > (SELECT agg(col) FROM fact WHERE key = outer.key). Correlated scalar subquery with AVG/SUM/COUNT that re-scans the same or different fact table per outer row. |
+| Gates | REQUIRED: correlated scalar subquery with aggregate function. REQUIRED: inner query joins fact table. Works on any fact table (catalog_sales, web_sales, store_sales). |
+| Treatments | Decompose into CTEs: (1) dimension filter, (2) date-filtered fact rows, (3) per-key aggregate threshold via GROUP BY. Final query JOINs threshold CTE. If inner and outer scan the SAME fact table with SAME filters, use shared-scan variant (single CTE for both). Also convert comma joins to explicit JOINs (P1 synergy). |
+| Failures | None observed. |
+
+Evidence table — wins (MEDIUM warehouse, 3x3 validation):
+
+| Example | Orig_ms | Opt_ms | Speedup | Pattern |
+|---------|---------|--------|---------|---------|
+| inline_decorrelate | 69,415 | 2,996 | 23.17x | 3 CTEs: dim filter + date-filtered fact + per-key threshold |
+| shared_scan_decorrelate | 8,025 | 1,026 | 7.82x | Shared-scan variant: common fact CTE reused for threshold + outer rows |
+
 ---
 
 ## PRUNING GUIDE
@@ -80,6 +96,8 @@ Evidence table — wins (all were TIMEOUT >300s):
 | No date_dim comma join | P1 (date CTE pruning) |
 | Date filter already in fact scan | P1 (already pruning) |
 | Each table appears once | P2 (scan consolidation) |
+| No correlated scalar subquery with aggregate | P3 (decorrelation) |
+| Simple EXISTS/IN correlation (no aggregate) | P3 (Snowflake handles these natively) |
 | Baseline < 100ms | ALL structural rewrites |
 
 ## REGRESSION REGISTRY

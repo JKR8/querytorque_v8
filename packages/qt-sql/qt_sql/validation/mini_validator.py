@@ -107,7 +107,15 @@ class MiniValidator:
             )
 
     def _tier1_structural(self, original_sql: str, rewrite_sql: str) -> Dict[str, Any]:
-        """Tier 1: structural checks via AST."""
+        """Tier 1: structural checks via AST.
+
+        Checks:
+        1. Both queries parse without error
+        2. Literal preservation: every string/numeric literal in the original
+           must appear somewhere in the rewrite (catches LLM hallucinating
+           different filter values)
+        3. Column shape: output columns must match
+        """
         try:
             if not sqlglot:
                 return {"passed": True}
@@ -120,6 +128,13 @@ class MiniValidator:
                 "errors": [f"SQL parse error: {str(e)[:80]}"],
                 "syntax_error": str(e)[:200],
             }
+
+        # ── Literal preservation check ─────────────────────────────────
+        # Every string/numeric literal in the original must appear in the
+        # rewrite. Position can change (pushdown is fine), but values can't.
+        literal_result = self._check_literal_preservation(orig_ast, rewrite_ast)
+        if not literal_result["passed"]:
+            return literal_result
 
         try:
             orig_cols = self._extract_select_columns(orig_ast)
@@ -145,6 +160,109 @@ class MiniValidator:
                     f"Column mismatch: {len(mismatch.missing)} missing, {len(mismatch.extra)} extra"
                 ],
                 "column_mismatch": mismatch,
+            }
+
+        return {"passed": True}
+
+    @staticmethod
+    def _extract_literals(ast: Any) -> Tuple[Set[str], Set[str]]:
+        """Extract string and numeric literals from a parsed AST.
+
+        Returns (string_literals, numeric_literals) as sets of normalized values.
+        Skips trivially short strings (single char) and common constants (0, 1).
+        """
+        strings: Set[str] = set()
+        numbers: Set[str] = set()
+
+        for node in ast.walk():
+            if isinstance(node, exp.Literal):
+                val = node.this
+                if node.is_string:
+                    if len(val) > 1:  # skip single-char literals
+                        strings.add(val)
+                elif node.is_number:
+                    # Normalize: strip leading zeros, trailing .0
+                    try:
+                        n = float(val)
+                        if n not in (0, 1, -1):  # skip trivial constants
+                            numbers.add(str(n))
+                    except (ValueError, TypeError):
+                        numbers.add(val)
+
+        return strings, numbers
+
+    @staticmethod
+    def _extract_column_refs(ast: Any) -> Set[str]:
+        """Extract base column names referenced in a query.
+
+        Returns a set of lowercase column names (e.g. {'ss_sold_date_sk',
+        'ss_ext_sales_price'}). Skips aliases and CTE names — only captures
+        actual table column references.
+
+        A valid rewrite may introduce NEW column refs (e.g. intermediate
+        calculations) but must not DROP original ones — that means the
+        rewrite is reading different data.
+        """
+        cols: Set[str] = set()
+        for node in ast.walk():
+            if isinstance(node, exp.Column):
+                col_name = node.name
+                if col_name:
+                    cols.add(col_name.lower())
+        return cols
+
+    def _check_literal_preservation(
+        self, orig_ast: Any, rewrite_ast: Any
+    ) -> Dict[str, Any]:
+        """Verify all original literals and column references appear in the rewrite.
+
+        Three checks:
+        1. String literals (cities, dates, state codes, etc.)
+        2. Numeric literals (thresholds, year values, etc.)
+        3. Column references (table columns the query reads)
+
+        Rewrites may ADD new literals/columns but must not DROP or CHANGE
+        original ones. This catches LLM hallucination of different filter
+        values and column name substitutions.
+        """
+        # ── Check literals ──────────────────────────────────────────
+        orig_strings, orig_numbers = self._extract_literals(orig_ast)
+        rewrite_strings, rewrite_numbers = self._extract_literals(rewrite_ast)
+
+        missing_strings = orig_strings - rewrite_strings
+        missing_numbers = orig_numbers - rewrite_numbers
+
+        if missing_strings or missing_numbers:
+            missing_parts = []
+            if missing_strings:
+                examples = sorted(missing_strings)[:5]
+                missing_parts.append(f"strings: {examples}")
+            if missing_numbers:
+                examples = sorted(missing_numbers)[:5]
+                missing_parts.append(f"numbers: {examples}")
+            return {
+                "passed": False,
+                "errors": [
+                    f"LITERAL MISMATCH: Original literals missing from rewrite — "
+                    f"{', '.join(missing_parts)}. "
+                    f"The rewrite changed filter values instead of preserving them."
+                ],
+            }
+
+        # ── Check column references ─────────────────────────────────
+        orig_cols = self._extract_column_refs(orig_ast)
+        rewrite_cols = self._extract_column_refs(rewrite_ast)
+
+        missing_cols = orig_cols - rewrite_cols
+        if missing_cols:
+            examples = sorted(missing_cols)[:5]
+            return {
+                "passed": False,
+                "errors": [
+                    f"COLUMN REF MISMATCH: Original columns missing from rewrite — "
+                    f"{examples}. "
+                    f"The rewrite references different table columns."
+                ],
             }
 
         return {"passed": True}
