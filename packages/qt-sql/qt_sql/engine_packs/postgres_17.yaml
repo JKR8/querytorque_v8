@@ -1,0 +1,272 @@
+# Engine Pack: PostgreSQL 17
+# Declarative knowledge base for the Query Swarm optimizer.
+# Complements engine_profile_postgresql.json (detailed evidence)
+# and knowledge/postgresql.md (LLM playbook).
+
+engine: postgres
+version: "17"
+label: "PostgreSQL 17"
+
+capabilities:
+  services: {}                    # Postgres has no QAS/SOS equivalents
+
+  hints:
+    join_order:
+      - "SET join_collapse_limit = 1"
+      - "SET from_collapse_limit = 1"
+    scan_method:
+      - "SET enable_seqscan = off"
+      - "SET enable_indexscan = off"
+      - "SET enable_hashjoin = off"
+      - "SET enable_mergejoin = off"
+      - "SET enable_nestloop = off"
+    resource_tuning:
+      - "SET work_mem = '{N}MB'"
+      - "SET max_parallel_workers_per_gather = {N}"
+      - "SET parallel_tuple_cost = {N}"
+      - "SET parallel_setup_cost = {N}"
+      - "SET random_page_cost = {N}"
+      - "SET effective_cache_size = '{N}MB'"
+      - "SET join_collapse_limit = {N}"
+      - "SET from_collapse_limit = {N}"
+      - "SET geqo_threshold = {N}"
+      - "SET enable_hashjoin = {on|off}"
+      - "SET enable_mergejoin = {on|off}"
+      - "SET enable_nestloop = {on|off}"
+      - "SET enable_seqscan = {on|off}"
+      - "SET jit = {on|off}"
+      - "SET jit_above_cost = {N}"
+      - "SET hash_mem_multiplier = {N}"
+
+  stats_operations:
+    - "ANALYZE <table>"
+    - "CREATE STATISTICS <name> (dependencies) ON <cols> FROM <table>"
+
+  materialization_controls:
+    cte_materialization:
+      behavior: |
+        PG12+: optimizer chooses. Single-reference CTEs are typically
+        inlined. Multi-reference CTEs may be materialized.
+      hints:
+        - "AS MATERIALIZED"
+        - "AS NOT MATERIALIZED"
+
+  parallel_execution:
+    controls:
+      - "SET max_parallel_workers_per_gather"
+      - "SET parallel_tuple_cost"
+      - "SET parallel_setup_cost"
+      - "SET min_parallel_table_scan_size"
+
+  partitioning:
+    type: "declarative (range, list, hash)"
+    clustering: "N/A (no auto clustering; CLUSTER command for one-time sort)"
+    auto_maintenance: false
+
+optimizer_profile:
+  handles_well:
+    - pattern: "BITMAP_OR_SCAN"
+      mechanism: "Multi-branch OR conditions on indexed columns handled via BitmapOr -- single scan with bitmap combination."
+      implication: "NEVER split OR conditions into UNION ALL. 0.21x and 0.26x observed."
+    - pattern: "SEMI_JOIN_EXISTS"
+      mechanism: "EXISTS/NOT EXISTS uses semi-join with early termination."
+      implication: "NEVER convert EXISTS to IN/NOT IN or materialized CTEs. 0.50x, 0.75x observed."
+    - pattern: "INNER_JOIN_REORDERING"
+      mechanism: "Freely reorders INNER JOINs based on estimated selectivity."
+      implication: "Don't restructure INNER JOIN orders. Focus on LEFT JOIN blocking or comma-join confusion."
+    - pattern: "INDEX_ONLY_SCAN"
+      mechanism: "Reads only index when covering all requested columns."
+      implication: "Small dimension lookups (<10K rows) may not need CTEs."
+    - pattern: "PARALLEL_QUERY_EXECUTION"
+      mechanism: "Parallelizes large scans and aggregations across worker processes."
+      implication: "CTEs may reduce parallelism -- CTE materialization is single-threaded."
+    - pattern: "JIT_COMPILATION"
+      mechanism: "JIT-compiles complex expressions for long-running queries (>100ms)."
+      implication: "Complex WHERE expressions have low per-row overhead due to JIT."
+
+  blind_spots:
+    - pattern: "COMMA_JOIN_WEAKNESS"
+      mechanism: "Implicit comma-separated FROM tables treated as cross products initially. Cost model significantly weaker on comma-joins."
+      opportunity: "Convert comma-joins to explicit JOIN...ON syntax. Best when combined with date_cte_isolate."
+      what_worked:
+        - "3.32x -- comma-joins to explicit JOINs + date CTE"
+        - "2.28x -- same pattern on star schema"
+        - "1.14x -- JOIN conversion alone"
+      what_didnt_work: []
+      field_notes:
+        - "Most reliable PG optimization. 5+ comma-separated tables is the sweet spot."
+        - "Win usually comes from explicit JOINs + CTE together, not CTE alone."
+    - pattern: "CORRELATED_SUBQUERY_PARALYSIS"
+      mechanism: "Cannot decorrelate complex correlated subqueries. Nested-loop with repeated evaluation."
+      opportunity: "Convert correlated WHERE to explicit CTE with GROUP BY + JOIN."
+      what_worked:
+        - "4428x -- timeout recovery, unbounded correlated to explicit JOIN"
+        - "391x -- same pattern, timeout to sub-second"
+      what_didnt_work:
+        - "0.51x -- multi-fact join lock"
+        - "0.75x -- EXISTS materialized"
+      field_notes:
+        - "HIGHEST IMPACT pathology. 9 of 31 wins including 8044x, 1465x, 439x."
+        - "Queries that time out (>10s) -- check for correlated scalar subqueries first."
+        - "MUST preserve all WHERE filters. ALWAYS use AS MATERIALIZED."
+    - pattern: "NON_EQUI_JOIN_INPUT_BLINDNESS"
+      mechanism: "Cannot pre-filter fact tables before non-equi join operations. Non-equi joins fall back to nested-loop O(N*M)."
+      opportunity: "Reduce fact table input size via filtered CTE before the non-equi join."
+      what_worked:
+        - "2.68x -- pre-filtered catalog_sales by wholesale_cost range before non-equi join"
+      what_didnt_work:
+        - "0.79x -- loose UNION/OR superset filter, CTE fence blocked pushdown"
+      field_notes:
+        - "ZERO REGRESSIONS with tight filters. Loose superset filters harmful."
+        - "Only pre-filter when one side is large fact table. Small dimensions (<10K) don't benefit."
+    - pattern: "CTE_MATERIALIZATION_FENCE"
+      mechanism: "CTE materialization creates hard optimization fence -- no predicate pushdown from outer query into CTE."
+      opportunity: "Materialize STRATEGICALLY: only when CTE is expensive and reused. Avoid fencing single-use cases."
+      what_worked:
+        - "1.95x -- strategic materialization prevented redundant fact scan multiplication"
+      what_didnt_work:
+        - "0.74x -- CTE fence blocked predicate pushdown"
+        - "0.77x -- date_cte_isolate fence blocked INTERSECT optimization"
+        - "0.65x -- duplicated 18-table CTE body to push filters inside"
+      field_notes:
+        - "NEVER duplicate a CTE body to push a filter inside. Filter the materialized result with WHERE."
+        - "Write plain CTEs: 'name AS (SELECT ...)'. PG auto-materializes when beneficial."
+    - pattern: "CROSS_CTE_PREDICATE_BLINDNESS"
+      mechanism: "Same gap as DuckDB but WORSE due to CTE materialization fence. No data lineage tracing through CTE boundaries."
+      opportunity: "Pre-filter into CTE definition. But be more cautious than on DuckDB."
+      what_worked:
+        - "3.32x -- date filter + comma-join conversion (combo is key)"
+        - "2.28x -- date CTE with explicit JOIN"
+      what_didnt_work:
+        - "0.97x -- won at SF5 (9.62x) but neutral at SF10"
+        - "0.55x -- over-decomposed already-efficient query"
+      field_notes:
+        - "Always convert comma-joins to explicit JOINs simultaneously."
+        - "Validate at target scale -- SF5 wins don't reliably predict SF10."
+
+profile_signals:
+  spill:
+    counters:
+      - "Sort Method: external merge"
+      - "Batches: N (originally 1)"
+      - "temp_blks_read / temp_blks_written"
+    likely_causes:
+      - "work_mem too small for sort"
+      - "hash join build side exceeds work_mem"
+      - "hash_mem_multiplier insufficient"
+
+  pruning:
+    metrics:
+      - "Rows Removed by Filter (high = bad pruning or missing index)"
+      - "partitions scanned vs total partitions (declarative partitioning)"
+    good_threshold: "Rows Removed by Filter should be <10x rows returned"
+
+  memory:
+    counters:
+      - "Peak Memory Usage (per-node, EXPLAIN ANALYZE BUFFERS)"
+      - "shared_blks_hit + shared_blks_read (buffer usage)"
+      - "temp_blks_written (spill indicator)"
+
+  estimates:
+    accuracy_signals:
+      - "Rows (estimated) vs Rows (actual) per plan node"
+      - "ratio > 10x indicates bad statistics or correlation"
+
+  plan_nodes:
+    cte_materialized: ["CTE Scan"]
+    hash_join: ["Hash Join"]
+    sort: ["Sort", "Incremental Sort"]
+    scan: ["Seq Scan", "Index Scan", "Index Only Scan", "Bitmap Heap Scan"]
+
+rewrite_playbook:
+  - name: or_to_union_all
+    detect: "OR predicates across different indexed columns"
+    action: "Split into UNION ALL branches, each using its own index"
+    why: "Postgres cannot use multiple indexes efficiently through OR; BitmapOr is often slower than separate index scans"
+    guard: "Skip if both columns are in a composite index"
+
+  - name: cte_inline_for_pushdown
+    detect: "CTE with filter applied outside; optimizer not pushing filter in"
+    action: "Use AS NOT MATERIALIZED or rewrite as subquery"
+    why: "Materialized CTEs are optimization fences in older PG; even in 17, multi-ref CTEs may fence"
+
+  - name: decorrelate_subquery
+    detect: "Correlated subquery in SELECT or WHERE with high outer row count"
+    action: "Rewrite as JOIN with pre-aggregation"
+    why: "Nested loop over correlated subquery executes inner query once per outer row"
+
+  - name: predicate_pullup
+    detect: "Filter applied late in plan (after join) that could filter earlier"
+    action: "Move restrictive predicate into subquery or CTE to reduce join input"
+    why: "Reduces intermediate row count, less memory/spill pressure"
+
+  - name: partial_aggregation
+    detect: "GROUP BY on large join result; aggregation is the bottleneck"
+    action: "Pre-aggregate one side before joining"
+    why: "Reduces join input cardinality; hash join build side fits in work_mem"
+
+physical_design:
+  indexing:
+    types: ["btree", "hash", "gin", "gist", "brin"]
+    auto_managed: false
+    recommendations_format: "CREATE INDEX [CONCURRENTLY] idx_name ON table (columns) [WHERE ...]"
+
+  clustering:
+    command: "CLUSTER table USING index_name"
+    economics: "Only useful for range scans on the clustered column. Does not auto-maintain. BRIN indexes are the low-cost alternative for append-only tables."
+
+  materialized_views:
+    supported: true
+    incremental: false
+    limitations:
+      - "REFRESH MATERIALIZED VIEW is full recomputation"
+      - "CONCURRENTLY option requires unique index"
+
+config_boost_rules:
+  - condition: "Hash join spill detected (Batches > 1)"
+    action: "SET work_mem = '{calculated}MB'"
+    rationale: "Eliminates hash join spill, keeps processing in memory"
+    scope: "session"
+
+  - condition: "Sort spill detected (external merge)"
+    action: "SET work_mem = '{calculated}MB'"
+    rationale: "In-memory quicksort is orders of magnitude faster than external merge"
+    scope: "session"
+
+  - condition: "Parallel workers not utilized on large sequential scan"
+    action: "SET max_parallel_workers_per_gather = {calculated}"
+    rationale: "Distributes scan across cores; reduces wall-clock time"
+    scope: "session"
+
+  - condition: "Cardinality estimates off by >10x on multi-column predicate"
+    action: "CREATE STATISTICS (dependencies) ON col1, col2 FROM table"
+    rationale: "Extended statistics capture column correlations the optimizer misses"
+    scope: "session"
+
+  - condition: "Join collapse limit preventing optimal join order"
+    action: "SET join_collapse_limit = {calculated}"
+    rationale: "Default limit of 8 may prevent optimizer from finding optimal order for complex joins"
+    scope: "session"
+
+physical_design_recommendations:
+  - condition: "Sequential scan on fact table despite btree index on join/filter columns"
+    action: "SET LOCAL random_page_cost = '1.1'; SET LOCAL effective_cache_size = '48GB'"
+    rationale: "SSD cost model fix -- random I/O nearly as cheap as sequential on SSD"
+    scope: "fleet"
+
+  - condition: "Merge Join with Sort node below it on inputs > 10K rows"
+    action: "SET LOCAL enable_mergejoin = 'off'"
+    rationale: "Hash join is almost always faster than sort + merge on large inputs (6 wins: +82.5%, +68.2%, +66.9%)"
+    scope: "fleet"
+
+  - condition: "Large Seq Scan (>100K rows) without Gather/Parallel node, query > 500ms"
+    action: "SET LOCAL max_parallel_workers_per_gather = '4'; SET LOCAL parallel_setup_cost = '100'; SET LOCAL parallel_tuple_cost = '0.001'"
+    rationale: "Distributes scan across cores. NEVER on queries < 500ms (7.34x regression observed)"
+    scope: "fleet"
+
+validation:
+  - "Compare EXPLAIN ANALYZE before/after: check actual rows at each node"
+  - "Check for new spill (Sort Method, Hash Batches) after rewrite"
+  - "Verify temp_blks_written reduced (pg_stat_statements)"
+  - "Confirm no regression in total Buffers (shared + temp)"
+  - "Run on target instance size, not development instance"

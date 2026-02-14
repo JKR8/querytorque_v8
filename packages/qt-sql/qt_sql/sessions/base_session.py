@@ -10,6 +10,7 @@ from ..schemas import SessionResult
 
 if TYPE_CHECKING:
     from ..pipeline import Pipeline
+    from ..orchestrator import Orchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class OptimizationSession:
         target_speedup: float = 2.0,
         max_iterations: int = 3,
         n_workers: int = 3,
+        orchestrator: Optional["Orchestrator"] = None,
     ):
         self.pipeline = pipeline
         self.query_id = query_id
@@ -37,6 +39,7 @@ class OptimizationSession:
         self.target_speedup = target_speedup
         self.max_iterations = max_iterations
         self.n_workers = n_workers
+        self.orchestrator = orchestrator
 
         # Derived config
         self.dialect = (

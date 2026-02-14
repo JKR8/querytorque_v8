@@ -25,6 +25,10 @@ import click
               help="Allow first-run mode: skip intelligence gates (no gold examples/global knowledge required).")
 @click.option("-o", "--output-dir", type=click.Path(), default=None,
               help="Custom output directory (default: benchmark/prepared/<timestamp>).")
+@click.option("--scenario", default="",
+              help="Scenario card name (e.g., 'postgres_small_instance').")
+@click.option("--evidence", is_flag=True,
+              help="Include evidence bundle in prepared output.")
 @click.pass_context
 def prepare(
     ctx: click.Context,
@@ -34,6 +38,8 @@ def prepare(
     force: bool,
     bootstrap: bool,
     output_dir: str | None,
+    scenario: str,
+    evidence: bool,
 ) -> None:
     """Generate analyst briefing prompts deterministically (no LLM calls).
 

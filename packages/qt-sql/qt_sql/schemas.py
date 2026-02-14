@@ -399,3 +399,4 @@ class SessionResult:
     iterations: List[Any] = field(default_factory=list)
     n_iterations: int = 0
     n_api_calls: int = 0
+    config_changes: List[str] = field(default_factory=list)

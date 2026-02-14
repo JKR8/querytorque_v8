@@ -1,0 +1,300 @@
+# Engine Pack: DuckDB 1.2
+# Declarative knowledge base for the Query Swarm optimizer.
+# Complements engine_profile_duckdb.json (detailed evidence)
+# and knowledge/duckdb.md (LLM playbook).
+
+engine: duckdb
+version: "1.2"
+label: "DuckDB 1.2"
+
+capabilities:
+  services: {}                    # DuckDB is embedded, no external services
+
+  hints: {}                       # DuckDB has no optimizer hints
+
+  stats_operations:
+    - "auto"                      # Statistics collected automatically on first query
+
+  materialization_controls:
+    cte_materialization:
+      behavior: |
+        Single-reference CTEs inlined automatically. Multi-referenced
+        CTEs may be materialized. Optimizer chooses based on cost.
+      hints: []                   # No explicit materialization hints
+
+  parallel_execution:
+    controls: []                  # Automatic parallelism, thread count = CPU cores
+
+  partitioning:
+    type: "hive-style partitioning (external files)"
+    clustering: "N/A (in-memory columnar, no clustering command)"
+    auto_maintenance: false
+
+optimizer_profile:
+  handles_well:
+    - pattern: "INTRA_SCAN_PREDICATE_PUSHDOWN"
+      mechanism: "Pushes WHERE filters directly into SEQ_SCAN. Single-table predicates applied at scan time, zero overhead."
+      implication: "If EXPLAIN shows the filter inside the scan node, do not create a CTE to push it."
+    - pattern: "SAME_COLUMN_OR"
+      mechanism: "OR on the SAME column handled in a single scan with range checks."
+      implication: "Never split same-column ORs into UNION ALL. 0.59x and 0.23x observed."
+    - pattern: "HASH_JOIN_SELECTION"
+      mechanism: "Selects hash joins automatically. Join ordering sound for 2-4 tables."
+      implication: "Focus on reducing join inputs, not reordering joins."
+    - pattern: "CTE_INLINING"
+      mechanism: "Single-reference CTEs inlined automatically. Multi-referenced CTEs may be materialized."
+      implication: "Single-ref CTEs are free -- use for clarity. CTE-based strategies are low-cost on DuckDB."
+    - pattern: "COLUMNAR_PROJECTION"
+      mechanism: "Only referenced columns read. Unused columns have zero I/O cost."
+      implication: "When creating pre-filter CTEs, only SELECT columns downstream needs."
+    - pattern: "PARALLEL_AGGREGATION"
+      mechanism: "Scans and aggregations parallelized across threads. PERFECT_HASH_GROUP_BY efficient."
+      implication: "Restructuring simple aggregation queries rarely helps unless reducing input rows."
+    - pattern: "EXISTS_SEMI_JOIN"
+      mechanism: "EXISTS/NOT EXISTS uses semi-join with early termination."
+      implication: "NEVER materialize EXISTS into CTEs. 0.14x and 0.54x from this mistake."
+
+  blind_spots:
+    - pattern: "CROSS_CTE_PREDICATE_BLINDNESS"
+      mechanism: "Cannot push predicates from the outer query backward into CTE definitions. CTEs are planned as independent subplans."
+      opportunity: "Move selective predicates INTO the CTE definition. Pre-filter dimensions/facts before materialization."
+      what_worked:
+        - "4.76x -- self-joined CTE split into per-month CTEs"
+        - "4.00x -- date filter moved into CTE"
+        - "3.77x -- pre-joined filtered dates with fact table"
+        - "2.97x -- dimension filter applied before LEFT JOIN chain"
+        - "1.93x -- all dimensions pre-filtered into separate CTEs"
+        - "1.80x -- prefetch_fact_join on store_sales with date pre-filter"
+      what_didnt_work:
+        - "0.0076x -- cross-joined 3 dim CTEs: Cartesian product"
+        - "0.50x -- 3-way fact join locked optimizer order"
+        - "0.85x -- CTE blocked ROLLUP pushdown"
+        - "0.71x -- over-decomposed already-efficient query"
+      field_notes:
+        - "~35% of all wins exploit this gap. Most productive on star-join queries with late dim filters."
+        - "NEVER cross-join 3+ dim CTEs -- join each filtered dimension directly to fact table."
+        - "Max 2 cascading fact-table CTE chains. Every CTE MUST have a WHERE clause."
+        - "Remove dead CTEs when restructuring -- orphaned CTEs still get materialized."
+    - pattern: "REDUNDANT_SCAN_ELIMINATION"
+      mechanism: "Cannot detect when the same fact table is scanned N times with similar filters across subquery boundaries. CSE doesn't cross scalar subquery boundaries."
+      opportunity: "Consolidate N subqueries into 1 scan with CASE WHEN / FILTER() inside aggregates."
+      what_worked:
+        - "6.28x -- 8 time-bucket subqueries consolidated into 1 scan"
+        - "4.47x -- 15 separate scans consolidated into 1 with 5 CASE buckets"
+        - "2.27x -- single_pass_aggregation consolidated channel subqueries"
+      what_didnt_work: []
+      field_notes:
+        - "ZERO REGRESSIONS. DuckDB supports native FILTER clause: COUNT(*) FILTER (WHERE cond)."
+        - "~37% of benchmark wins exploit this gap (tied with CROSS_CTE_PREDICATE_BLINDNESS)."
+    - pattern: "CORRELATED_SUBQUERY_PARALYSIS"
+      mechanism: "Cannot decorrelate correlated aggregate subqueries into GROUP BY + JOIN."
+      opportunity: "Convert correlated WHERE to CTE with GROUP BY on the correlation column, then JOIN back."
+      what_worked:
+        - "2.92x -- correlated AVG converted to GROUP BY + JOIN"
+      what_didnt_work:
+        - "0.34x -- LEFT JOIN was already semi-join"
+        - "0.71x -- already decorrelated"
+      field_notes:
+        - "Only applies to correlated scalar subqueries with aggregates. EXISTS correlation handled by semi-join."
+        - "When decorrelating, MUST preserve all WHERE filters from original subquery."
+    - pattern: "CROSS_COLUMN_OR_DECOMPOSITION"
+      mechanism: "Cannot decompose OR conditions spanning different columns into independent targeted scans. Evaluates OR as a single filter."
+      opportunity: "Split cross-column ORs into UNION ALL branches with targeted single-column filters."
+      what_worked:
+        - "6.28x -- 8 time-bucket subqueries with distinct hour ranges"
+        - "3.17x -- (zip OR state OR price) split to 3 targeted branches"
+      what_didnt_work:
+        - "0.23x -- nested OR expansion (3x3=9 branches = 9 fact scans)"
+        - "0.59x -- same-column OR (engine handles natively)"
+        - "0.51x -- self-join re-executed per UNION branch"
+      field_notes:
+        - "HIGHEST VARIANCE: biggest win (6.28x) and worst regressions (0.23x) both from or_to_union."
+        - "Count resulting branches before committing. 6+ branches almost certainly harmful."
+    - pattern: "LEFT_JOIN_FILTER_ORDER_RIGIDITY"
+      mechanism: "Cannot infer LEFT JOIN to INNER when WHERE eliminates NULLs, and cannot reorder LEFT JOINs."
+      opportunity: "Convert LEFT to INNER when WHERE proves right non-null, or pre-filter dimension into CTE."
+      what_worked:
+        - "3.44x -- LEFT to INNER + early filter CTE"
+        - "2.97x -- filtered dimension FIRST, then LEFT JOIN"
+        - "1.89x -- dimension isolation before fact join"
+      what_didnt_work: []
+      field_notes:
+        - "ZERO REGRESSIONS. Only applies to LEFT JOINs -- INNER JOINs freely reordered."
+    - pattern: "UNION_CTE_SELF_JOIN_DECOMPOSITION"
+      mechanism: "UNION ALL CTE self-joined N times -- optimizer materializes full UNION once, probes N times discarding most rows."
+      opportunity: "Split into N separate CTEs (one per discriminator value)."
+      what_worked:
+        - "4.76x -- self_join_decomposition"
+        - "2.47x -- rollup_to_union_windowing"
+        - "1.72x avg -- union_cte_split"
+      what_didnt_work:
+        - "0.49x -- orphaned CTE (double materialization)"
+        - "0.68x -- original CTE kept alongside split"
+      field_notes:
+        - "MUST remove original UNION CTE and redirect all references to split CTEs."
+    - pattern: "AGGREGATE_BELOW_JOIN_BLINDNESS"
+      mechanism: "Cannot push GROUP BY below joins when aggregation keys align with join keys. Joins first then aggregates."
+      opportunity: "Pre-aggregate fact table by join key BEFORE dimension join."
+      what_worked:
+        - "42.90x -- pre-aggregated inventory by item_sk before item dimension join + ROLLUP"
+      what_didnt_work: []
+      field_notes:
+        - "ZERO REGRESSIONS. Produced single biggest individual win (42.90x). Check for join to GROUP BY in every star-schema query."
+    - pattern: "INTERSECT_MATERIALIZATION"
+      mechanism: "INTERSECT is implemented as set materialization + comparison, not as semi-join."
+      opportunity: "Replace INTERSECT with EXISTS semi-join."
+      what_worked:
+        - "2.7x -- intersect_to_exists"
+      what_didnt_work: []
+      field_notes:
+        - "ZERO REGRESSIONS. Related: semi_join_exists (1.67x) for full JOIN where joined columns not in output."
+    - pattern: "WINDOW_BEFORE_JOIN"
+      mechanism: "Cannot defer window computation past a join when partition/ordering is preserved."
+      opportunity: "Remove windows from CTEs, compute once on joined result."
+      what_worked:
+        - "1.4x -- deferred_window_aggregation"
+      what_didnt_work: []
+      field_notes:
+        - "ZERO REGRESSIONS. SUM() OVER() naturally skips NULLs -- handles FULL OUTER JOIN gaps."
+    - pattern: "SHARED_SUBEXPRESSION"
+      mechanism: "May not CSE identical subqueries across different query branches."
+      opportunity: "Extract shared subexpression into CTE."
+      what_worked:
+        - "1.4x -- materialize_cte"
+      what_didnt_work:
+        - "0.14x -- EXISTS materialized, semi-join destroyed"
+        - "0.54x -- correlated EXISTS pairs broken"
+      field_notes:
+        - "Semi-join short-circuit destroyed by CTE materialization. NEVER on EXISTS."
+
+profile_signals:
+  spill:
+    counters:
+      - "N/A (DuckDB is in-memory; no spill counters in EXPLAIN output)"
+    likely_causes:
+      - "memory_limit exceeded for large hash joins or sorts"
+      - "Intermediate results exceed available memory"
+
+  pruning:
+    metrics:
+      - "Filter percentage in SEQ_SCAN node (rows filtered vs rows scanned)"
+    good_threshold: "Filter should remove >90% of rows if predicate is selective"
+
+  memory:
+    counters:
+      - "No explicit memory counters in EXPLAIN ANALYZE"
+      - "Monitor via PRAGMA memory_limit and .memory command"
+
+  estimates:
+    accuracy_signals:
+      - "Estimated cardinality vs actual rows per plan node"
+      - "Large discrepancies on multi-column filters or skewed data"
+
+  plan_nodes:
+    cte_materialized: ["CTE_SCAN"]
+    hash_join: ["HASH_JOIN"]
+    sort: ["ORDER_BY", "TOP_N"]
+    scan: ["SEQ_SCAN", "INDEX_SCAN", "FILTER"]
+
+rewrite_playbook:
+  - name: date_cte_isolate
+    detect: "Date dimension filter applied late; fact table scanned before date predicate reduces rows"
+    action: "Isolate date filter into CTE, join to fact table early"
+    why: "DuckDB cannot push date predicates backward through CTE boundaries"
+    guard: "Skip if EXPLAIN already shows date filter inside scan node"
+
+  - name: single_pass_aggregation
+    detect: "N separate SEQ_SCAN nodes on same fact table with different bucket filters"
+    action: "Consolidate into single scan with CASE WHEN / FILTER() inside aggregates"
+    why: "Eliminates N-1 redundant full table scans. ZERO REGRESSIONS observed."
+    guard: "Only COUNT/SUM/AVG/MIN/MAX aggregates (not STDDEV/VARIANCE/PERCENTILE)"
+
+  - name: decorrelate_subquery
+    detect: "Correlated subquery with aggregate in WHERE; nested loop in EXPLAIN"
+    action: "Convert to CTE with GROUP BY on correlation column, then JOIN back"
+    why: "DuckDB cannot decorrelate complex aggregate correlations"
+    guard: "NEVER decorrelate EXISTS (0.34x, 0.14x -- semi-join destroyed). Check if hash join on correlation key means already decorrelated."
+
+  - name: or_to_union_all
+    detect: "OR across DIFFERENT columns, single scan, 70%+ rows discarded"
+    action: "Split cross-column ORs into UNION ALL with targeted filters per branch"
+    why: "DuckDB evaluates cross-column OR as single filter; separate scans can target each column"
+    guard: "Max 3 branches. Same-column OR = STOP. No self-join. No nested OR."
+
+  - name: left_join_to_inner
+    detect: "LEFT JOIN + WHERE on right-table column proves right non-null"
+    action: "Convert LEFT to INNER JOIN; pre-filter dimension into CTE if selective"
+    why: "LEFT JOIN prevents join reordering and early filtering"
+    guard: "No CASE WHEN IS NULL / COALESCE on right-table column"
+
+  - name: union_cte_split
+    detect: "UNION ALL CTE self-joined N times with different WHERE per arm"
+    action: "Split into N separate CTEs (one per discriminator value)"
+    why: "Optimizer materializes full UNION once, probes N times discarding most rows"
+    guard: "2-4 discriminator values. MUST remove original combined CTE after splitting."
+
+  - name: pre_aggregate_before_join
+    detect: "GROUP BY input rows >> distinct keys; aggregate sits after join"
+    action: "Pre-aggregate fact table by join key BEFORE dimension join"
+    why: "Reduces join input dramatically; biggest individual win 42.90x"
+    guard: "GROUP BY keys must be superset of join keys (CORRECTNESS). Reconstruct AVG from SUM/COUNT for ROLLUP."
+
+  - name: intersect_to_exists
+    detect: "INTERSECT between 10K+ row result sets"
+    action: "Replace INTERSECT with EXISTS semi-join"
+    why: "INTERSECT is set materialization + comparison; EXISTS uses semi-join with short-circuit"
+    guard: "Both sides >1K rows"
+
+  - name: deferred_window
+    detect: "N WINDOW nodes inside CTEs, same ORDER BY key, CTEs then joined"
+    action: "Remove windows from CTEs, compute once on joined result"
+    why: "Avoids computing windows on rows that will be filtered by subsequent join"
+    guard: "Not LAG/LEAD (depends on pre-join row order). Not ROWS BETWEEN with specific frame."
+
+  - name: shared_subexpression_cte
+    detect: "Identical subtrees with identical costs scanning same tables"
+    action: "Extract shared subexpression into CTE"
+    why: "Eliminates duplicate computation when CSE fails across subquery boundaries"
+    guard: "HARD STOP: EXISTS/NOT EXISTS -- NEVER materialize (0.14x). Subquery must be expensive."
+
+physical_design:
+  indexing:
+    types: ["ART (adaptive radix tree, auto-created on primary key)"]
+    auto_managed: true
+    recommendations_format: "N/A (DuckDB auto-manages indexes)"
+
+  clustering:
+    command: "N/A"
+    economics: "In-memory columnar engine. No clustering command. Data order depends on ingestion."
+
+  materialized_views:
+    supported: false
+    incremental: false
+    limitations:
+      - "No materialized view support"
+      - "Use CTEs or temporary tables for materialization"
+
+config_boost_rules:
+  - condition: "Large hash join or sort exceeds default memory"
+    action: "SET memory_limit = '{calculated}GB'"
+    rationale: "Increases available memory for in-memory operations"
+    scope: "session"
+
+  - condition: "Query not utilizing all CPU cores"
+    action: "SET threads = {calculated}"
+    rationale: "DuckDB auto-detects cores but can be overridden for specific workloads"
+    scope: "session"
+
+  - condition: "Query processing very large dataset on disk-backed database"
+    action: "SET temp_directory = '/fast/ssd/path'"
+    rationale: "Ensures spill-to-disk uses fastest available storage"
+    scope: "session"
+
+physical_design_recommendations: []
+
+validation:
+  - "Compare EXPLAIN ANALYZE before/after: check estimated vs actual cardinalities"
+  - "Verify no redundant SEQ_SCAN nodes after consolidation rewrites"
+  - "Check that FILTER() aggregation produces identical row counts to original"
+  - "Confirm CTE inlining occurs for single-reference CTEs (no CTE_SCAN node)"
+  - "Test at target scale factor -- SF1 wins correlate r=0.77 with SF10"

@@ -30,9 +30,12 @@ qt prepare postgres_dsb_76 -q query001_multi_i1   # single query
 qt prepare postgres_dsb_76 --mode oneshot          # oneshot mode prompt
 qt prepare duckdb_tpcds -q query088               # prefix match (all Q88 variants)
 qt prepare postgres_dsb_76 -o /tmp/prompts        # custom output dir
+qt prepare duckdb_tpcds --scenario duckdb_embedded # with scenario card
+qt prepare duckdb_tpcds --bootstrap               # first-run mode (no gold examples needed)
+qt prepare duckdb_tpcds --evidence                # include evidence bundle
 ```
 
-Options: `--query/-q` (repeatable), `--mode` (swarm/oneshot), `--force`, `--output-dir/-o`
+Options: `--query/-q` (repeatable), `--mode` (swarm/oneshot), `--force`, `--output-dir/-o`, `--bootstrap`, `--scenario`, `--evidence`
 
 Output: `benchmark/prepared/<timestamp>/` with `prompts/`, `context/`, `metadata/`, `original/`, `summary.json`
 
@@ -49,9 +52,14 @@ qt run <benchmark>                                  # all queries
 qt run postgres_dsb_76 -q query001 --mode oneshot   # single query, oneshot mode
 qt run duckdb_tpcds --fan-out-only                  # state 0 only
 qt run postgres_dsb_76 --resume                     # resume from checkpoint
+qt run duckdb_tpcds --scenario duckdb_embedded      # with scenario card
+qt run postgres_dsb_76 --engine-version 17          # explicit engine version
+qt run duckdb_tpcds --output-contract               # emit QueryOutputContract JSON
+qt run duckdb_tpcds --concurrency 4                 # parallel generation (4 threads)
+qt run postgres_dsb_76 --config-boost               # SET LOCAL tuning on winners
 ```
 
-Options: `--query/-q`, `--mode`, `--max-iterations`, `--target-speedup`, `--fan-out-only`, `--resume`, `--output-dir/-o`
+Options: `--query/-q`, `--mode`, `--max-iterations`, `--target-speedup`, `--fan-out-only`, `--resume`, `--output-dir/-o`, `--concurrency`, `--config-boost`, `--bootstrap`, `--scenario`, `--engine-version`, `--output-contract`
 
 Output: `benchmark/runs/run_<timestamp>/` with per-query results + `summary.json` + `checkpoint.json`
 
@@ -161,3 +169,93 @@ qt leaderboard duckdb_tpcds --build-strategy       # build strategy leaderboard
 Options: `--format` (table/json/csv), `--top N`, `--build-strategy`
 
 Wraps: `leaderboard.json` reading, `build_strategy_leaderboard.py`
+
+---
+
+## qt config-boost
+
+**SET LOCAL tuning on validated winners** (no LLM, PostgreSQL only)
+
+```
+qt config-boost <benchmark>                        # boost all winners
+qt config-boost postgres_dsb_76 --min-speedup 1.1  # custom threshold
+```
+
+Options: `--min-speedup`
+
+Wraps: `config_boost.boost_benchmark()`
+
+---
+
+## qt refresh-explains
+
+**Re-collect EXPLAIN ANALYZE plans** (no LLM)
+
+```
+qt refresh-explains <benchmark>                    # refresh all
+qt refresh-explains postgres_dsb_76 -q query001    # single query
+```
+
+Options: `--query/-q`
+
+---
+
+## qt collect-explains
+
+**Collect EXPLAIN plans for benchmark queries** (no LLM)
+
+```
+qt collect-explains <benchmark>
+```
+
+---
+
+## qt config-coach
+
+**Interactive config tuning advisor** (LLM required, PostgreSQL only)
+
+```
+qt config-coach <benchmark>
+```
+
+---
+
+## qt workload
+
+**Fleet-level workload optimization** (LLM required for full run)
+
+```
+qt workload <benchmark>                                        # full workload optimization
+qt workload duckdb_tpcds --dry-run                             # triage + fleet detection only
+qt workload duckdb_tpcds --target-size Small                   # target warehouse size
+qt workload duckdb_tpcds --scenario duckdb_embedded            # with scenario card
+qt workload postgres_dsb_76 --max-tier3 10                     # limit deep optimization
+qt workload duckdb_tpcds -o scorecard.md                       # save scorecard to file
+```
+
+Options: `--target-size/-t`, `--scenario/-s`, `--max-tier3/-m` (default 20), `--output/-o`, `--dry-run`
+
+Stages:
+1. **Triage**: Score all queries by pain x frequency x tractability → classify SKIP/TIER_2/TIER_3
+2. **Fleet Detection**: Shared scans → index recommendations, config opportunities, statistics staleness
+3. **Quick-Win Fast Path**: Top 3 queries with >80% total pain → direct to Tier 3
+4. **Tier 2 (Light)**: Single-pass oneshot optimization (~5K tokens)
+5. **Tier 3 (Deep)**: Full swarm pipeline (~40-50K tokens)
+6. **Scorecard**: Business case with estimated savings, residuals, recommendations
+
+Output: Markdown scorecard (stdout or file)
+
+Wraps: `WorkloadSession.run()` → `triage_workload()` → `detect_fleet_patterns()` → `compile_scorecard()`
+
+---
+
+## qt dashboard
+
+**Web dashboard for swarm sessions** (no LLM)
+
+```
+qt dashboard <benchmark>                           # open on port 8765
+qt dashboard duckdb_tpcds --port 9000              # custom port
+```
+
+Options: `--port` (default 8765)

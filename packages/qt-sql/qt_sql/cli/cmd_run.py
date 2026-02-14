@@ -37,6 +37,12 @@ import click
               help="Run config boost (SET LOCAL tuning) on winners after validation.")
 @click.option("--bootstrap", is_flag=True,
               help="Allow first-run mode: skip intelligence gates (no gold examples/global knowledge required).")
+@click.option("--scenario", default="",
+              help="Scenario card name (e.g., 'postgres_small_instance', 'xsmall_survival').")
+@click.option("--engine-version", default="",
+              help="Engine version override (e.g., '17' for PG, '1.2' for DuckDB).")
+@click.option("--output-contract", is_flag=True,
+              help="Emit structured QueryOutputContract JSON alongside results.")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -51,6 +57,9 @@ def run(
     concurrency: int,
     config_boost: bool,
     bootstrap: bool,
+    scenario: str,
+    engine_version: str,
+    output_contract: bool,
 ) -> None:
     """Run the full optimization pipeline (requires LLM API key).
 

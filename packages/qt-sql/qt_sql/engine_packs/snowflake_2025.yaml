@@ -1,0 +1,294 @@
+# Engine Pack: Snowflake 2025 (Gen2 / Optima Architecture)
+# Declarative knowledge base for the Query Swarm optimizer.
+# Complements engine_profile_snowflake.json (detailed evidence)
+# and knowledge/snowflake.md (LLM playbook).
+
+engine: snowflake
+version: "2025-gen2-optima"
+label: "Snowflake 2025 (Gen2 / Optima Architecture)"
+
+capabilities:
+  services:
+    query_acceleration_service:
+      exists: true
+      description: "Offloads scan-heavy portions to elastic compute pool"
+      triggers:
+        - "Large TableScan nodes with high percentage of total time"
+        - "Queries with LIMIT clause (even without ORDER BY)"
+        - "Filter-heavy scans on large tables"
+      knobs:
+        - "ALTER WAREHOUSE SET ENABLE_QUERY_ACCELERATION = TRUE"
+        - "ALTER WAREHOUSE SET QUERY_ACCELERATION_MAX_SCALE_FACTOR = N"
+      limitations:
+        - "Not supported on Hybrid Tables"
+        - "Most effective with selective predicates"
+
+    search_optimization_service:
+      exists: true
+      description: "Persistent search structures for point-lookup and search patterns"
+      triggers:
+        - "High-cardinality equality lookups (point queries)"
+        - "LIKE / ILIKE / substring predicates"
+        - "Geo-spatial predicates"
+        - "Scalar functions in predicates"
+        - "Queries joining massive table to small subset"
+      knobs:
+        - "ALTER TABLE ADD SEARCH OPTIMIZATION ON EQUALITY(...)"
+        - "ALTER TABLE ADD SEARCH OPTIMIZATION ON SUBSTRING(...)"
+        - "ALTER TABLE ADD SEARCH OPTIMIZATION ON GEO(...)"
+      limitations:
+        - "Not supported on Hybrid Tables"
+        - "Ongoing storage cost"
+
+    dynamic_tables:
+      exists: true
+      description: "Declarative incremental materialization"
+      triggers:
+        - "Complex transformation pipelines (multiple CTEs, joins)"
+        - "Deduplication patterns (QUALIFY RANK()=1)"
+        - "ETL replacing INSERT OVERWRITE statements"
+      knobs:
+        - "CREATE DYNAMIC TABLE ... TARGET_LAG = '...' AS SELECT ..."
+      limitations:
+        - "2025: supports Left Outer Join, incremental Rank"
+        - "Verify specific join/window patterns are supported"
+
+    hybrid_tables:
+      exists: true
+      description: "Row-oriented storage for transactional workloads (Unistore)"
+      triggers:
+        - "Single-row INSERT/UPDATE patterns"
+        - "Strict constraint enforcement needs"
+      knobs:
+        - "CREATE HYBRID TABLE ..."
+      limitations:
+        - "No QAS support"
+        - "No SOS support"
+        - "Different performance model from columnar"
+
+    optima_indexing:
+      exists: true
+      description: "Automatic background index creation for recurring lookup patterns"
+      triggers:
+        - "Recurring point-lookup queries on non-clustered columns"
+      knobs: []
+      limitations:
+        - "Background process; not immediate"
+        - "Only recommend manual intervention if SLA < 200ms"
+
+  hints:
+    join_order:
+      - "/*+ FORCE_JOIN_ORDER */"
+    cte_materialization:
+      - "AS MATERIALIZED"
+      - "-- remove AS MATERIALIZED to force inline"
+
+  stats_operations:
+    - "ANALYZE TABLE <table>"
+
+  materialization_controls:
+    cte_materialization:
+      behavior: "Physical materialization (WithClauseResult node in plan). Stores full result before downstream consumption."
+      hints:
+        - "AS MATERIALIZED"
+        - "Remove to allow optimizer inlining"
+
+  parallel_execution:
+    controls: []                  # Managed by warehouse size, not configurable per-query
+
+  partitioning:
+    type: "micro-partitions (automatic, columnar)"
+    clustering: "ALTER TABLE ... CLUSTER BY (...)"
+    auto_maintenance: true
+
+optimizer_profile:
+  handles_well:
+    - pattern: "MICRO_PARTITION_PRUNING"
+      mechanism: "Filters on clustered columns skip micro-partitions at scan level."
+      implication: "Snowflake's #1 optimization. Functions on filter columns kill pruning. Runtime pruning from CTE values invisible in static EXPLAIN."
+    - pattern: "COLUMN_PRUNING"
+      mechanism: "Reads only columns referenced by final query, even through CTEs."
+      implication: "Automatic unless final SELECT is *."
+    - pattern: "PREDICATE_PUSHDOWN"
+      mechanism: "Filters pushed to storage layer including through single-ref CTEs."
+      implication: "Also does predicate mirroring across join sides. Does NOT push through comma joins for partition pruning."
+    - pattern: "CORRELATED_DECORRELATION"
+      mechanism: "Correlated subqueries automatically decorrelated to hash joins."
+      implication: "Do NOT decorrelate unless EXPLAIN shows nested loop."
+    - pattern: "SEMI_JOIN"
+      mechanism: "EXISTS to SemiJoin with early termination."
+      implication: "Never materialize EXISTS patterns."
+    - pattern: "JOIN_FILTER"
+      mechanism: "Bloom filter pushdown from build side to probe-side TableScan."
+      implication: "77/99 TPC-DS queries. Date CTE does NOT interfere with JoinFilter."
+    - pattern: "COST_BASED_JOIN_ORDER"
+      mechanism: "Evaluates multiple join orders, selects lowest cost."
+      implication: "Usually correct. Do NOT force join order."
+    - pattern: "QUALIFY_OPTIMIZATION"
+      mechanism: "Native window-function filtering, more efficient than nested subquery."
+      implication: "Gives optimizer full visibility into filter intent."
+
+  blind_spots:
+    - pattern: "COMMA_JOIN_DATE_PRUNING_FAILURE"
+      mechanism: "Comma joins between fact tables and date_dim prevent runtime partition pruning. Optimizer assigns all micro-partitions before resolving date filter through comma join."
+      opportunity: "Isolate date_dim filter into CTE, JOIN to fact table. Enables runtime pruning invisible in EXPLAIN."
+      what_worked:
+        - "22 wins -- Date CTE + explicit JOINs"
+        - "All from TIMEOUT (300s+) to completes (0.7s-55s)"
+        - "Works for single-date, multi-date (d1/d2/d3), EXISTS subqueries, UNION branches"
+      what_didnt_work:
+        - "No date filter (Q9/Q88/Q93)"
+        - "CTE self-join (Q47/Q57)"
+        - "FULL OUTER JOIN (Q51/Q97)"
+        - "3-way fact + wide date (Q17/Q29)"
+        - "Too heavy for X-Small (Q35/Q67/Q72/Q85/Q89)"
+        - "EXCEPT (Q87)"
+      field_notes:
+        - "63% success rate (22/35 tested). Dominant pathology."
+        - "Static EXPLAIN still shows all partitions -- pruning is runtime only."
+        - "SF10 partitions: store_sales 73K (1.2TB), catalog_sales 55K (861GB), web_sales 28K (461GB)."
+        - "Narrower date ranges prune more: 30d -> 1s, 1yr -> 55-250s."
+    - pattern: "REPEATED_SUBQUERY_FULL_SCAN"
+      mechanism: "Multiple identical subqueries on same fact table trigger independent full scans. No CSE across subquery boundaries."
+      opportunity: "Consolidate into single scan with conditional aggregation (CASE WHEN)."
+      what_worked:
+        - "Untested with date pruning"
+      what_didnt_work:
+        - "Q9 TIMEOUT -- 73K partitions unavoidable without date filter"
+      field_notes:
+        - "Needs more evidence. Only attempt after P1 (date pruning) is applied."
+        - "Without date pruning: insufficient on huge tables."
+
+profile_signals:
+  spill:
+    counters:
+      - "Bytes Spilled to Local Storage"
+      - "Bytes Spilled to Remote Storage"
+    likely_causes:
+      - "Hash join build side exceeds warehouse memory"
+      - "Large sort exceeds warehouse memory"
+      - "CTE materialization of large intermediate"
+
+  pruning:
+    metrics:
+      - "Partitions Scanned vs Partitions Total (per TableScan node)"
+    good_threshold: "<5% of total partitions scanned for filtered queries"
+
+  memory:
+    counters:
+      - "Bytes Spilled to Remote Storage"
+      - "Peak Memory Usage (if shown in profile)"
+
+  estimates:
+    accuracy_signals:
+      - "Q-Error on join keys (ratio of estimated to actual NDV)"
+      - "Estimated vs actual row counts per operator (if available)"
+
+  plan_nodes:
+    cte_materialized: ["WithClauseResult"]
+    hash_join: ["HashJoin"]
+    sort: ["Sort", "SortWithLimit"]
+    scan: ["TableScan", "ExternalScan"]
+
+rewrite_playbook:
+  - name: date_cte_isolate_for_pruning
+    detect: "Fact table shows all partitions assigned in EXPLAIN; date filter on date_dim; comma join between fact and date_dim"
+    action: "Isolate date_dim filter into CTE with explicit JOIN to fact table"
+    why: "Comma joins prevent runtime partition pruning. Date CTE + explicit JOIN enables pruning invisible in static EXPLAIN."
+    guard: "Skip if no date filter on date_dim. Skip if fact table < 1000 partitions."
+
+  - name: or_to_union_all_for_pruning
+    detect: "OR predicates across different columns in WHERE clause"
+    action: "Rewrite as UNION ALL with one predicate per branch"
+    why: "Snowflake cannot prune micro-partitions through OR across columns. UNION ALL allows independent pruning per branch."
+    guard: "Skip if both predicates are on the clustering key"
+
+  - name: cte_inline_for_memory
+    detect: "Large CTE materialized (WithClauseResult) on small warehouse"
+    action: "Remove AS MATERIALIZED; allow optimizer to inline and stream"
+    why: "Physical materialization of large intermediate is fatal on memory-constrained warehouses."
+    guard: "Only if CTE is referenced once. Multi-reference CTEs may benefit from materialization if result is small."
+
+  - name: pre_aggregate_for_spill
+    detect: "Hash join spills to remote; one input is aggregatable before join"
+    action: "Pre-aggregate the large input before joining"
+    why: "Reduces hash join build side below warehouse memory. Eliminates remote spill."
+
+  - name: force_join_order_for_build_side
+    detect: "Q-Error shows wrong join order; large table on build side"
+    action: "Reorder joins and apply FORCE_JOIN_ORDER hint, or ANALYZE TABLE"
+    why: "Stale or incorrect NDV estimates cause optimizer to pick wrong build/probe assignment"
+
+physical_design:
+  indexing:
+    types: ["automatic (Optima)", "SOS"]
+    auto_managed: true
+    recommendations_format: "ALTER TABLE ... ADD SEARCH OPTIMIZATION ON ..."
+
+  clustering:
+    command: "ALTER TABLE ... CLUSTER BY (...)"
+    economics: |
+      High-churn tables (frequent UPDATE/DELETE): STOP automatic clustering.
+      Use natural ingestion sort or SOS for point lookups.
+      Low-churn or append-only: automatic clustering is cost-effective.
+
+  materialized_views:
+    supported: true
+    incremental: true
+    limitations:
+      - "Limited transformation support"
+      - "Consider Dynamic Tables for complex transforms"
+
+config_boost_rules:
+  - condition: "QAS eligible (large scan + selective filter or LIMIT)"
+    action: "ALTER WAREHOUSE SET ENABLE_QUERY_ACCELERATION = TRUE"
+    rationale: "Offloads scan to elastic compute; warehouse only processes filtered result"
+    scope: "fleet"
+
+  - condition: "Spill to remote detected + stale statistics (Q-Error > 5x)"
+    action: "ANALYZE TABLE on tables with bad estimates"
+    rationale: "Better statistics -> correct join order -> smaller build side -> no spill"
+    scope: "fleet"
+
+  - condition: "Poor pruning (>5% partitions scanned) on date-filtered query"
+    action: "ALTER TABLE ... CLUSTER BY (date_column)"
+    rationale: "Aligns micro-partition boundaries with common filter predicates"
+    scope: "fleet"
+
+  - condition: "High-churn table with expensive automatic clustering"
+    action: "ALTER TABLE ... SUSPEND RECLUSTER; use natural ingestion sort"
+    rationale: "Automatic clustering on high-churn tables has poor cost/benefit"
+    scope: "fleet"
+
+  - condition: "Recurring point-lookup, SLA > 200ms"
+    action: "No action (Optima will auto-index in background)"
+    rationale: "Manual intervention unnecessary"
+    scope: "fleet"
+
+  - condition: "Recurring point-lookup, SLA < 200ms"
+    action: "ALTER TABLE ... ADD SEARCH OPTIMIZATION ON EQUALITY(lookup_column)"
+    rationale: "SOS provides immediate search structure; Optima too slow for tight SLA"
+    scope: "fleet"
+
+physical_design_recommendations:
+  - condition: "Date-filtered queries scanning >50% of fact table partitions"
+    action: "ALTER TABLE fact_table CLUSTER BY (date_sk)"
+    rationale: "Aligns micro-partition boundaries with most common filter predicates"
+    scope: "fleet"
+
+  - condition: "Recurring equality lookups on high-cardinality non-clustered column"
+    action: "ALTER TABLE ... ADD SEARCH OPTIMIZATION ON EQUALITY(column)"
+    rationale: "SOS provides sub-second lookup without clustering by that column"
+    scope: "fleet"
+
+  - condition: "Complex ETL pipeline with multiple CTEs and dedup patterns"
+    action: "CREATE DYNAMIC TABLE ... TARGET_LAG = '...' AS SELECT ..."
+    rationale: "Declarative incremental materialization; auto-refreshes on upstream changes"
+    scope: "fleet"
+
+validation:
+  - "Re-check Bytes Spilled to Remote Storage (must be 0 on target warehouse)"
+  - "Check Partitions Scanned ratio (must be <5% for filtered queries)"
+  - "Verify join order in profile matches intended order"
+  - "Check QAS usage in profile (Bytes accelerated)"
+  - "Run on target warehouse size, not larger"

@@ -686,6 +686,11 @@ class SwarmSession(OptimizationSession):
             engine=self.engine,
         )
 
+        # Enrich context via orchestrator if available
+        if self.orchestrator is not None:
+            system_ctx = self.orchestrator.compose_system_context()
+            ctx["orchestrator_context"] = system_ctx
+
         # Unpack for local use + coach reuse
         explain_plan_text = ctx["explain_plan_text"]
         plan_scanner_text = ctx["plan_scanner_text"]

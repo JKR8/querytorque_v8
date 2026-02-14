@@ -57,6 +57,7 @@ def _register_commands() -> None:
     from .cmd_refresh_explains import refresh_explains
     from .cmd_collect_explains import cmd_collect_explains
     from .cmd_config_coach import config_coach
+    from .cmd_workload import workload
 
     main.add_command(status)
     main.add_command(prepare)
@@ -72,6 +73,7 @@ def _register_commands() -> None:
     main.add_command(refresh_explains)
     main.add_command(cmd_collect_explains)
     main.add_command(config_coach)
+    main.add_command(workload)
 
 
 _register_commands()

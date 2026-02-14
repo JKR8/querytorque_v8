@@ -133,3 +133,69 @@ The HYPOTHESIS_TAG field flows through: worker briefing → worker output → ex
 | §6 Reasoning Process | 400-500 tokens |
 | §7 Output Spec | 300-500 tokens |
 | **Total** | **2500-4700 tokens** |
+
+## Declarative Composition Model
+
+The system supports an optional declarative composition layer via the `Orchestrator` class.
+When an `Orchestrator` is provided (e.g., via `--scenario` or `--engine-version` CLI flags),
+it assembles context from four declarative sources:
+
+### Components
+
+| Component | File Pattern | Purpose |
+|-----------|-------------|---------|
+| **Universal Doctrine** | `doctrine/universal_doctrine.yaml` | Engine-agnostic optimization philosophy, bottleneck taxonomy (9 labels), hallucination rules, correctness constraints, worker diversity (families A-F) |
+| **Engine Pack** | `engine_packs/{engine}_{version}.yaml` | Per-engine capabilities, optimizer profile (handles_well + blind_spots), rewrite playbook, config boost rules, validation probes |
+| **Scenario Card** | `scenario_cards/{name}.yaml` | Resource envelope + failure definitions + strategy priorities (e.g., `xsmall_survival`, `postgres_small_instance`) |
+| **Pattern Library** | `patterns/library.yaml` | Cross-engine index of anti-patterns with scoring rubric: bottleneck +3, signal +2, scenario +1 |
+
+### Composition Flow
+
+```
+Orchestrator.compose_system_context()
+    ├── load_doctrine()           → universal rules, bottleneck taxonomy
+    ├── load_engine_pack(engine)  → capabilities, blind spots, playbook
+    ├── load_scenario_card(name)  → resource constraints, failure modes
+    └── load_pattern_library()    → scored example selection
+```
+
+The composed context is added to `gather_analyst_context()` output as `orchestrator_context`.
+It enriches the existing prompt assembly — it does NOT replace the battle-tested prompt builders.
+
+### Backward Compatibility
+
+When no orchestrator is provided (the default), the system uses the existing code path:
+- `engine_profile_{dialect}.json` for gap/strength data
+- `knowledge/{dialect}.md` for the exploit algorithm (tip of the spear)
+- `pg_tuning.py` for resource envelope
+- `tag_index.py` for example matching
+
+Both paths produce working prompts. The orchestrator path adds structured metadata
+from YAML sources alongside the existing JSON/markdown knowledge.
+
+### Evidence Bundle
+
+The `EvidenceBundle` unifies existing extractors into a single structure:
+
+| Field | Source | Existing Extractor |
+|-------|--------|--------------------|
+| `cost_spine` | DAG per-node costs | `pipeline._parse_logical_tree()` |
+| `runtime_profile.estimates` | Q-Error analysis | `qerror.py` (85% accurate) |
+| `runtime_profile.spill` | Vital signs | `explain_signals.extract_vital_signs()` |
+| `runtime_profile.pruning` | Vital signs | `explain_signals.extract_vital_signs()` |
+| `runtime_profile.memory` | Resource envelope | `pg_tuning.build_resource_envelope()` |
+
+### Output Contract
+
+`QueryOutputContract` wraps `SessionResult` with structured diagnostics:
+- `Diagnosis`: bottleneck label, evidence, engine feature
+- `ExpectedImpact`: metric, before/after, confidence
+- `ValidationSummary`: equivalence, regression check, benchmark result, scenario fit
+
+### Compress Stage
+
+Post-validation candidate ranking via `compress.py`:
+- **Dedup**: AST-normalize via sqlglot, deduplicate identical rewrites
+- **Score**: Impact (1-5) x Confidence (1-5) x Invasiveness (1-5), range 1-125
+- Confidence from validation tier: race-validated=5, sequential 3-run=4, estimate-only=2
+- Invasiveness: query-only=5 (best), with config=4, with stats=3, with index=2, with schema=1

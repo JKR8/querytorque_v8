@@ -1,0 +1,581 @@
+# QueryTorque V8 Pattern Library
+# Cross-engine index of anti-patterns and canonical rewrites.
+# Each pattern references gold examples by file path (SQL is NOT duplicated here).
+#
+# Family codes: A=Early Filtering, B=Decorrelation, C=Aggregation,
+#               D=Set Ops, E=Materialization, F=Join Transform
+#
+# Engine tags: "all" means every supported engine; otherwise list specific engines.
+# Scenario tags: structural features that amplify the pattern's impact.
+
+patterns:
+  # ---------------------------------------------------------------------------
+  # B-family: Decorrelation
+  # ---------------------------------------------------------------------------
+  - name: decorrelate_subquery
+    family: B
+    anti_pattern: >
+      Correlated scalar subquery in WHERE or HAVING re-executes the inner query
+      once per outer row, causing O(N*M) nested-loop evaluation even when the
+      inner result could be pre-computed.
+    canonical_rewrite: >
+      Extract the correlated subquery into a standalone CTE with GROUP BY on the
+      correlation key, computing the aggregate (AVG, SUM, COUNT) once. Replace
+      the original subquery with a JOIN to the pre-computed CTE.
+    engine_tags: [all]
+    scenario_tags: [CORRELATED_SUB, AGG_AVG, AGG_SUM, SCALAR_SUB_2+]
+    contraindications:
+      - id: MISSING_FILTER
+        severity: CRITICAL
+        note: "Preserve ALL WHERE filters from original subquery -- missing filter = cross-product (0.34x observed)"
+      - id: ALREADY_DECORRELATED
+        severity: MEDIUM
+        note: "Check EXPLAIN -- if hash join (not nested loop), optimizer already decorrelated"
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          DuckDB cannot always auto-decorrelate correlated subqueries with complex
+          predicates, falling back to nested-loop execution. Pre-computing the
+          aggregate in a CTE enables parallel hash join.
+        detection: "EXPLAIN shows NESTED_LOOP_JOIN with correlated subquery; AGG inside WHERE/HAVING"
+      - engine: postgresql
+        motivation: >
+          PostgreSQL materializes CTEs by default (pre-12 always, 12+ with MATERIALIZED keyword),
+          making decorrelation into MATERIALIZED CTEs extremely effective. The CTE
+          executes once and the hash join replaces row-by-row re-execution.
+        detection: "EXPLAIN ANALYZE shows SubPlan with Loops > 1000; correlated col = outer.col pattern"
+      - engine: snowflake
+        motivation: >
+          Snowflake may not decorrelate complex correlated predicates automatically,
+          causing full table rescans per micro-partition batch.
+        detection: "Query profile shows FLAT_SCAN on inner relation with high repetition count"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/decorrelate.json
+        improvement: "2.92x"
+      - engine: postgresql
+        file: examples/postgres/shared_scan_decorrelate.json
+        improvement: "8044x (timeout rescue)"
+      - engine: postgresql
+        file: examples/postgres/early_filter_decorrelate.json
+        improvement: "27.80x"
+      - engine: postgresql
+        file: examples/postgres/state_avg_decorrelate.json
+        improvement: "439x"
+      - engine: postgresql
+        file: examples/postgres/inline_decorrelate_materialized.json
+        improvement: "1465x"
+
+  # ---------------------------------------------------------------------------
+  # A-family: Early Filtering
+  # ---------------------------------------------------------------------------
+  - name: date_cte_isolate
+    family: A
+    anti_pattern: >
+      Date dimension joined inline with fact table via comma-join or late WHERE
+      clause. The optimizer cannot push the date filter before the fact scan,
+      causing a full scan of the fact table before filtering by date.
+    canonical_rewrite: >
+      Extract the date_dim filter into a CTE that returns only matching
+      d_date_sk values. JOIN the fact table to this tiny CTE so the hash probe
+      eliminates non-matching fact rows immediately.
+    engine_tags: [all]
+    scenario_tags: [DATE_DIM, GROUP_BY, MULTI_TABLE_5+, SCALAR_SUB_2+]
+    contraindications:
+      - id: LOW_BASELINE
+        severity: MEDIUM
+        note: "Skip if baseline <100ms -- CTE overhead exceeds filter savings (0.50x observed)"
+      - id: ROLLUP_PRESENT
+        severity: LOW
+        note: "CTE may prevent optimizer from pushing ROLLUP/window down through join tree (0.85x observed)"
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          DuckDB cannot push predicates across CTE boundaries (CROSS_CTE_PREDICATE_BLINDNESS).
+          Isolating the date filter into a CTE creates a tiny hash table that the
+          fact scan probes, reducing I/O by the date selectivity ratio.
+        detection: "date_dim in FROM with d_year/d_moy/d_qoy filter; EXPLAIN shows full SEQ_SCAN on fact table"
+      - engine: postgresql
+        motivation: >
+          PostgreSQL comma joins produce poor cardinality estimates on multi-table
+          queries. A date CTE with explicit JOIN gives the planner accurate row
+          counts and enables hash join with a tiny probe table.
+        detection: "Comma join between fact table and date_dim; EXPLAIN shows Nested Loop or bad row estimate"
+      - engine: snowflake
+        motivation: >
+          Snowflake comma joins prevent runtime micro-partition pruning on the fact
+          table. A date CTE + explicit JOIN enables runtime pruning (invisible in
+          static EXPLAIN), reducing scanned micro-partitions from 73K to hundreds.
+        detection: "Comma join fact+date_dim; query timeout or >60s; EXPLAIN shows TableScan with all partitions"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/date_cte_isolate.json
+        improvement: "4.00x"
+      - engine: duckdb
+        file: examples/duckdb/multi_date_range_cte.json
+        improvement: "2.14x"
+      - engine: postgresql
+        file: examples/postgres/date_cte_explicit_join.json
+        improvement: "3.10x"
+
+  - name: early_filter
+    family: A
+    anti_pattern: >
+      Small dimension table with a highly selective filter is joined to a large
+      fact table, but the filter is applied AFTER the join. The fact table is
+      fully scanned before the dimension filter eliminates most rows.
+    canonical_rewrite: >
+      Filter the dimension table first (in a CTE or subquery), then JOIN the
+      filtered result to the fact table. The tiny filtered dimension creates a
+      small hash table that the fact scan probes.
+    engine_tags: [all]
+    scenario_tags: [LEFT_JOIN, AGG_SUM, GROUP_BY, CASE_EXPR]
+    contraindications: []
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          DuckDB does not always reorder joins to filter small dimensions first
+          when the filter is in the WHERE clause rather than the JOIN ON clause.
+          Explicit early filtering via CTE forces the correct join order.
+        detection: "Dimension filter in WHERE (not ON); EXPLAIN shows fact scan before dimension filter"
+      - engine: postgresql
+        motivation: >
+          PostgreSQL with comma joins cannot always infer optimal join order.
+          Pre-filtering the dimension table and using explicit JOIN syntax gives
+          the planner a clear cardinality signal.
+        detection: "Dimension filter applied late; EXPLAIN shows large Rows estimate at fact join step"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/early_filter.json
+        improvement: "3.44x"
+      - engine: postgresql
+        file: examples/postgres/early_filter_decorrelate.json
+        improvement: "27.80x"
+
+  - name: dimension_cte_isolate
+    family: A
+    anti_pattern: >
+      Multiple dimension tables with selective filters are joined to the fact
+      table in a flat star-join. The optimizer cannot determine the combined
+      selectivity and scans the fact table fully.
+    canonical_rewrite: >
+      Pre-filter ALL selective dimension tables into separate CTEs returning only
+      surrogate keys. JOIN the fact table to these tiny CTEs. Combined selectivity
+      compounds -- each CTE reduces the fact scan further.
+    engine_tags: [all]
+    scenario_tags: [DATE_DIM, GROUP_BY, MULTI_TABLE_5+, STAR_JOIN]
+    contraindications:
+      - id: CROSS_JOIN_3_DIMS
+        severity: CRITICAL
+        note: "NEVER cross-join 3+ dimension CTEs -- Cartesian explosion (0.0076x observed)"
+      - id: UNFILTERED_CTE
+        severity: HIGH
+        note: "Every CTE must have a WHERE clause -- unfiltered CTE = pure overhead"
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          CROSS_CTE_PREDICATE_BLINDNESS: DuckDB does not push predicates from
+          the main query into CTEs, so each CTE must embed its own filter.
+          Multiple tiny hash tables compound the selectivity benefit.
+        detection: "3+ dimension tables with WHERE filters; EXPLAIN shows full SEQ_SCAN on fact"
+      - engine: postgresql
+        motivation: >
+          PostgreSQL benefits from materialized dimension CTEs because the planner
+          gets exact row counts from the CTE result, improving join ordering.
+        detection: "Star-schema query with 3+ dimensions; EXPLAIN shows poor cardinality estimates"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/dimension_cte_isolate.json
+        improvement: "3.23x"
+      - engine: duckdb
+        file: examples/duckdb/multi_dimension_prefetch.json
+        improvement: "1.85x"
+      - engine: postgresql
+        file: examples/postgres/dimension_prefetch_star.json
+        improvement: "12.07x"
+
+  # ---------------------------------------------------------------------------
+  # D-family: Set Operations
+  # ---------------------------------------------------------------------------
+  - name: or_to_union_all
+    family: D
+    anti_pattern: >
+      WHERE clause contains OR conditions on DIFFERENT columns/tables. The
+      optimizer must use a single scan with a complex filter that cannot leverage
+      column-specific access paths (indexes, partition pruning).
+    canonical_rewrite: >
+      Split each OR branch into a separate SELECT with a focused predicate,
+      combine with UNION ALL. Extract shared filters (e.g., date range) into a
+      common CTE. Each branch gets its own optimized access path.
+    engine_tags: [all]
+    scenario_tags: [OR_BRANCH, AGG_SUM, DATE_DIM, GROUP_BY]
+    contraindications:
+      - id: MAX_3_BRANCHES
+        severity: CRITICAL
+        note: "Max 3 UNION branches -- 6+ is lethal (9 branches = 9x fact scans, 0.23x observed)"
+      - id: SAME_COL_OR
+        severity: HIGH
+        note: "NEVER split same-column ORs -- engine handles natively (0.59x observed)"
+      - id: SELF_JOIN_PRESENT
+        severity: HIGH
+        note: "NEVER if self-join present -- each branch re-does the self-join (0.51x observed)"
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          DuckDB cannot decompose cross-column OR predicates into separate scan
+          paths (CROSS_COLUMN_OR_DECOMPOSITION gap). UNION ALL branches enable
+          parallel execution of focused predicates.
+        detection: "OR in WHERE spanning different columns/tables; EXPLAIN shows single FILTER with complex OR"
+      - engine: postgresql
+        motivation: >
+          PostgreSQL can sometimes use BitmapOr for same-table ORs, but cross-table
+          ORs force sequential scan. UNION ALL enables per-branch index usage.
+        detection: "Cross-table OR; EXPLAIN shows Seq Scan with Filter (not BitmapOr)"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/or_to_union.json
+        improvement: "3.17x"
+
+  - name: intersect_to_exists
+    family: D
+    anti_pattern: >
+      INTERSECT set operations between large subqueries. INTERSECT materializes
+      both complete result sets, sorts them, and compares row by row. Expensive
+      for large intermediate results.
+    canonical_rewrite: >
+      Replace INTERSECT with EXISTS semi-joins. The first query becomes the
+      driving table; subsequent queries become EXISTS subqueries correlated on
+      the INTERSECT columns. EXISTS uses semi-join with early termination.
+    engine_tags: [all]
+    scenario_tags: [INTERSECT, AGG_COUNT, CTE, DATE_DIM, UNION]
+    contraindications: []
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          DuckDB INTERSECT materializes full results before comparison. EXISTS
+          enables hash semi-join with early termination per probe row.
+        detection: "INTERSECT between 2+ subqueries; EXPLAIN shows HASH_INTERSECT with large build side"
+      - engine: postgresql
+        motivation: >
+          PostgreSQL INTERSECT uses Sort + SetOp which requires full materialization.
+          EXISTS uses semi-join (Hash Semi Join or Nested Loop Semi Join) with
+          early termination.
+        detection: "INTERSECT; EXPLAIN shows SetOp Intersect with Sort; subquery rows >10K"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/intersect_to_exists.json
+        improvement: "1.78x"
+      - engine: duckdb
+        file: examples/duckdb/multi_intersect_exists_cte.json
+        improvement: "2.15x"
+      - engine: postgresql
+        file: examples/postgres/intersect_to_exists.json
+        improvement: "1.78x"
+
+  # ---------------------------------------------------------------------------
+  # C-family: Aggregation
+  # ---------------------------------------------------------------------------
+  - name: single_pass_aggregation
+    family: C
+    anti_pattern: >
+      Multiple scalar subqueries on the SAME fact table with different filter
+      ranges (e.g., ss_quantity BETWEEN 1 AND 20, BETWEEN 21 AND 40). Each
+      subquery performs a full table scan, resulting in N scans for N buckets.
+    canonical_rewrite: >
+      Consolidate all subqueries into a single CTE that uses CASE expressions
+      inside aggregate functions. Each CASE routes rows to the appropriate
+      bucket in a single pass, reducing N scans to 1.
+    engine_tags: [all]
+    scenario_tags: [AGG_AVG, AGG_COUNT, SCALAR_SUB_2+, SCALAR_SUB_5+, TABLE_REPEAT_3+, TABLE_REPEAT_8+]
+    contraindications: []
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          DuckDB cannot eliminate redundant scans across scalar subqueries
+          (REDUNDANT_SCAN_ELIMINATION gap). A single-pass CTE with conditional
+          aggregates avoids re-reading the columnar data N times.
+        detection: "5+ scalar subqueries on same table; EXPLAIN shows multiple SEQ_SCANs on same relation"
+      - engine: postgresql
+        motivation: >
+          PostgreSQL executes each scalar subquery independently. Consolidating
+          into a single scan with CASE aggregates dramatically reduces I/O on
+          large fact tables.
+        detection: "Multiple SubPlan nodes scanning same table; Seq Scan repeated in EXPLAIN"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/single_pass_aggregation.json
+        improvement: "4.47x"
+      - engine: duckdb
+        file: examples/duckdb/channel_bitmap_aggregation.json
+        improvement: "6.24x"
+      - engine: postgresql
+        file: examples/postgres/single_pass_aggregation.json
+        improvement: "1.98x"
+
+  - name: aggregate_pushdown
+    family: C
+    anti_pattern: >
+      GROUP BY + aggregate operates on a fact table joined with multiple
+      dimensions. The join expands intermediate rows before aggregation,
+      processing millions of rows through the GROUP BY.
+    canonical_rewrite: >
+      Pre-aggregate the fact table on the join key FIRST (in a CTE), then join
+      the small aggregated result with dimension tables. Reduces rows entering
+      the join from millions to thousands.
+    engine_tags: [duckdb]
+    scenario_tags: [AGG_AVG, GROUP_BY, ROLLUP, MULTI_TABLE_5+]
+    contraindications:
+      - id: NO_GROUP_KEY_MATCH
+        severity: CRITICAL
+        note: "Only works when GROUP BY keys align with join keys -- misaligned keys produce wrong results"
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          DuckDB does not push aggregation below joins (AGGREGATE_BELOW_JOIN_BLINDNESS).
+          Pre-aggregating the fact table before dimension joins reduces rows from
+          millions to thousands, making ROLLUP and complex aggregation tractable.
+        detection: "EXPLAIN shows large intermediate after fact-dim join before GROUP BY; ROLLUP present"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/aggregate_pushdown.json
+        improvement: "42.90x"
+
+  # ---------------------------------------------------------------------------
+  # A-family: Predicate Pushdown / Staged Pipeline
+  # ---------------------------------------------------------------------------
+  - name: predicate_pushdown
+    family: A
+    anti_pattern: >
+      Multiple subqueries scan the same fact table with similar filter patterns
+      but different ranges. The optimizer treats each as independent, resulting
+      in redundant I/O.
+    canonical_rewrite: >
+      Consolidate related subqueries into CTEs that compute all needed aggregates
+      in fewer passes. Build a staged CTE pipeline where each stage reduces
+      cardinality before the next join.
+    engine_tags: [all]
+    scenario_tags: [AGG_AVG, AGG_COUNT, BETWEEN, CASE_EXPR, SCALAR_SUB_5+, TABLE_REPEAT_8+]
+    contraindications: []
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          CROSS_CTE_PREDICATE_BLINDNESS: DuckDB cannot push predicates into CTEs
+          or across CTE boundaries. Explicit staged CTEs with embedded filters
+          force the correct execution order.
+        detection: "Same table appears 3+ times in EXPLAIN; subqueries with overlapping filter patterns"
+      - engine: postgresql
+        motivation: >
+          PostgreSQL re-executes each subquery independently. CTEs with embedded
+          filters reduce redundant scans and give the planner accurate
+          cardinality at each stage.
+        detection: "Same table appears in multiple SubPlan nodes; overlapping WHERE predicates"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/pushdown.json
+        improvement: "2.50x"
+      - engine: duckdb
+        file: examples/duckdb/prefetch_fact_join.json
+        improvement: "3.77x"
+
+  # ---------------------------------------------------------------------------
+  # E-family: Materialization
+  # ---------------------------------------------------------------------------
+  - name: cte_inline_or_materialize
+    family: E
+    anti_pattern: >
+      A CTE is referenced multiple times but the optimizer either (a) inlines it
+      causing redundant computation, or (b) materializes it when inlining would
+      be cheaper. Subquery patterns are repeated without shared computation.
+    canonical_rewrite: >
+      Extract repeated subquery patterns into a shared CTE. On PostgreSQL, use
+      AS MATERIALIZED to prevent re-inlining. On DuckDB, CTEs auto-materialize
+      when referenced multiple times.
+    engine_tags: [all]
+    scenario_tags: [CTE, AGG_COUNT, AGG_SUM, BETWEEN, DATE_DIM]
+    contraindications:
+      - id: EXISTS_MATERIALIZATION
+        severity: HIGH
+        note: "NEVER materialize EXISTS filters into CTEs -- destroys semi-join short-circuit (0.14x observed)"
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          DuckDB materializes CTEs when referenced multiple times but cannot push
+          outer predicates into them. Each CTE must embed its own filters.
+        detection: "Same logical subquery appears 2+ times; EXPLAIN shows duplicate scans"
+      - engine: postgresql
+        motivation: >
+          PostgreSQL 12+ inlines CTEs by default unless AS MATERIALIZED is specified.
+          For shared computation, MATERIALIZED prevents redundant re-execution.
+          For single-use CTEs, allow inlining for predicate pushdown.
+        detection: "CTE referenced 2+ times; EXPLAIN shows CTE Scan with identical plans"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/materialize_cte.json
+        improvement: "1.67x"
+      - engine: postgresql
+        file: examples/postgres/inline_decorrelate_materialized.json
+        improvement: "1465x"
+
+  # ---------------------------------------------------------------------------
+  # F-family: Join Transform
+  # ---------------------------------------------------------------------------
+  - name: explicit_join_conversion
+    family: F
+    anti_pattern: >
+      Comma-separated join syntax (FROM a, b, c WHERE a.x = b.x AND ...) with
+      5+ tables. The optimizer has limited ability to infer join order and
+      produces poor cardinality estimates compared to explicit JOIN ON syntax.
+    canonical_rewrite: >
+      Convert comma joins to explicit INNER JOIN ... ON syntax. Combine with
+      dimension CTE pre-filtering for maximum benefit. The explicit join graph
+      gives the optimizer freedom to choose optimal join order.
+    engine_tags: [postgresql, snowflake]
+    scenario_tags: [AGG_SUM, BETWEEN, DATE_DIM, GROUP_BY, MULTI_TABLE_5+]
+    contraindications: []
+    motivation_variants:
+      - engine: postgresql
+        motivation: >
+          PostgreSQL comma joins with 5+ tables often produce suboptimal plans
+          (COMMA_JOIN_WEAKNESS). Explicit JOIN + dimension CTEs give the planner
+          accurate row counts at each join step.
+        detection: "FROM clause with 4+ comma-separated tables; EXPLAIN shows Nested Loop where Hash Join expected"
+      - engine: snowflake
+        motivation: >
+          Snowflake comma joins between fact and date_dim prevent runtime
+          micro-partition pruning (COMMA_JOIN_DATE_PRUNING_FAILURE). Explicit JOIN
+          enables runtime pruning that is invisible in static EXPLAIN.
+        detection: "Comma join fact+date_dim; query timeout; 73K+ micro-partitions scanned"
+    gold_examples:
+      - engine: postgresql
+        file: examples/postgres/explicit_join_materialized.json
+        improvement: "8.56x"
+      - engine: postgresql
+        file: examples/postgres/date_cte_explicit_join.json
+        improvement: "3.10x"
+
+  - name: inner_join_conversion
+    family: F
+    anti_pattern: >
+      LEFT JOIN immediately followed by a WHERE filter on the right table that
+      eliminates NULL rows. The LEFT JOIN preserves all left rows, but the WHERE
+      discards them, wasting work on rows that are filtered out.
+    canonical_rewrite: >
+      Convert LEFT JOIN to INNER JOIN when the WHERE clause filters on a
+      non-nullable column of the right table. Optionally pre-filter the right
+      table into a CTE for additional early-filtering benefit.
+    engine_tags: [duckdb]
+    scenario_tags: [LEFT_JOIN, LEFT_JOIN_RIGHT_FILTER, AGG_SUM, GROUP_BY]
+    contraindications:
+      - id: NULL_DEPENDENT_LOGIC
+        severity: CRITICAL
+        note: "Do NOT convert if CASE WHEN checks for IS NULL on right table -- the NULL branch is semantically meaningful"
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          DuckDB cannot infer that a WHERE on the right-table column makes LEFT
+          JOIN equivalent to INNER JOIN (LEFT_JOIN_FILTER_ORDER_RIGIDITY). Manual
+          conversion + early filter CTE gives 3.44x.
+        detection: "LEFT JOIN + WHERE on right table column; EXPLAIN shows LEFT_OUTER_JOIN with post-filter"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/inner_join_conversion.json
+        improvement: "3.44x"
+
+  - name: self_join_decomposition
+    family: F
+    anti_pattern: >
+      A CTE is self-joined with different discriminator predicates (e.g.,
+      inv1.d_moy=1 AND inv2.d_moy=2). The CTE materializes ALL rows for ALL
+      discriminator values, then post-filters after the self-join.
+    canonical_rewrite: >
+      Split the generic CTE into separate specialized CTEs, each embedding its
+      discriminator predicate. Each CTE aggregates only its relevant subset,
+      avoiding full materialization and post-filtering.
+    engine_tags: [all]
+    scenario_tags: [CTE, GROUP_BY, AGG_AVG]
+    contraindications: []
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          CROSS_CTE_PREDICATE_BLINDNESS: DuckDB cannot push the outer WHERE
+          (d_moy=1) into the CTE definition. Splitting into per-month CTEs
+          embeds the filter at the source.
+        detection: "CTE aliased 2+ times with different WHERE filters; EXPLAIN shows full CTE materialization"
+      - engine: postgresql
+        motivation: >
+          PostgreSQL materializes CTEs, so a self-join on a fully materialized CTE
+          processes ALL rows. Separate CTEs each process only their subset.
+        detection: "CTE Scan appears twice in EXPLAIN with different Filter conditions"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/self_join_decomposition.json
+        improvement: "4.76x"
+      - engine: postgresql
+        file: examples/postgres/self_join_decomposition.json
+        improvement: "2.10x"
+
+  # ---------------------------------------------------------------------------
+  # D-family: Set Operations (additional)
+  # ---------------------------------------------------------------------------
+  - name: redundant_scan_consolidation
+    family: C
+    anti_pattern: >
+      Multiple CTEs or subqueries scan the same fact table with identical
+      dimension joins but different channel/bucket discriminators. Each channel
+      (store/catalog/web) independently rescans fact + dimension tables.
+    canonical_rewrite: >
+      Consolidate all channel scans into a single UNION ALL CTE with a channel
+      discriminator column. Shared dimension filters are applied once. Downstream
+      queries filter by channel tag instead of re-scanning.
+    engine_tags: [all]
+    scenario_tags: [MULTI_CHANNEL, TABLE_REPEAT_3+, CTE, UNION, AGG_SUM]
+    contraindications: []
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          DuckDB treats each CTE as an independent scan. Consolidating channels
+          into a single pass eliminates redundant dimension joins and fact scans.
+        detection: "3 CTEs with identical dimension joins but different fact tables (store/catalog/web)"
+      - engine: postgresql
+        motivation: >
+          PostgreSQL materializes each CTE independently. A consolidated UNION ALL
+          CTE with shared dimension filters reduces total I/O.
+        detection: "Repeated date_dim/item joins across CTEs; same WHERE predicates"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/shared_dimension_multi_channel.json
+        improvement: "2.30x"
+      - engine: postgresql
+        file: examples/postgres/single_pass_aggregation.json
+        improvement: "1.98x"
+
+  - name: union_cte_split
+    family: D
+    anti_pattern: >
+      A generic CTE is scanned multiple times with different post-hoc filters
+      (e.g., WHERE year = 1998 from one consumer, WHERE year = 1999 from
+      another). The CTE materializes ALL years, then each consumer post-filters.
+    canonical_rewrite: >
+      Split the generic CTE into specialized CTEs, each embedding its filter
+      in the definition. Each specialized CTE processes only its relevant subset.
+      CRITICAL: eliminate the original generic CTE to avoid double materialization.
+    engine_tags: [duckdb]
+    scenario_tags: [CTE, DATE_DIM, GROUP_BY, UNION, CASE_EXPR]
+    contraindications:
+      - id: ORPHANED_UNION
+        severity: HIGH
+        note: "Original UNION must be eliminated -- keeping both = double materialization (0.49x observed)"
+    motivation_variants:
+      - engine: duckdb
+        motivation: >
+          UNION_CTE_SELF_JOIN_DECOMPOSITION: DuckDB cannot push consumer-side
+          filters into a shared CTE. Splitting into per-year CTEs embeds the
+          filter at the source, halving the data each CTE processes.
+        detection: "CTE referenced 2+ times with different WHERE filters on same column"
+    gold_examples:
+      - engine: duckdb
+        file: examples/duckdb/union_cte_split.json
+        improvement: "2.50x"
+      - engine: duckdb
+        file: examples/duckdb/rollup_to_union_windowing.json
+        improvement: "1.89x"
