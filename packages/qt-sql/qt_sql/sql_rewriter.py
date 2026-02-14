@@ -555,8 +555,9 @@ class ResponseParser:
 
     @staticmethod
     def detect_format(json_str: str) -> str:
-        """Detect JSON format: 'dap' | 'rewrite_sets' | 'unknown'.
+        """Detect JSON format: 'patch' | 'dap' | 'rewrite_sets' | 'unknown'.
 
+        Patch: has plan_id + steps array (IR patch plan)
         DAP: has spec_version + statements array
         Legacy: has rewrite_sets array
         """
@@ -566,6 +567,8 @@ class ResponseParser:
             return "unknown"
 
         if isinstance(data, dict):
+            if "plan_id" in data and "steps" in data:
+                return "patch"
             if "spec_version" in data and "statements" in data:
                 return "dap"
             if "rewrite_sets" in data:
@@ -1022,15 +1025,17 @@ class DAPAssembler:
 class SQLRewriter:
     """Apply LLM-generated rewrites to SQL."""
 
-    def __init__(self, sql: str, dialect: str = "duckdb"):
+    def __init__(self, sql: str, dialect: str = "duckdb", script_ir=None):
         """Initialize with original SQL.
 
         Args:
             sql: The original SQL query to rewrite
             dialect: SQL dialect (duckdb, postgres, etc.)
+            script_ir: Optional ScriptIR for patch-mode application
         """
         self.original_sql = sql
         self.dialect = dialect
+        self._script_ir = script_ir
         self.parser = ResponseParser()
         self.assembler = SQLAssembler(dialect=dialect)
         self.dap_assembler = DAPAssembler(dialect=dialect)
@@ -1125,6 +1130,18 @@ class SQLRewriter:
 
         if json_str:
             fmt = self.parser.detect_format(json_str)
+
+            # ── Priority 0: IR Patch Plan ──
+            if fmt == "patch" and self._script_ir is not None:
+                try:
+                    patch_data = json.loads(json_str)
+                    result = self._apply_patch(patch_data)
+                    if result.success:
+                        return result
+                    # Patch failed — fall through to DAP/legacy paths
+                    dap_warnings = result.warnings
+                except Exception as e:
+                    logger.warning(f"Patch application failed: {e}")
 
             # ── Priority 1: DAP Component Payload ──
             if fmt == "dap":
@@ -1349,6 +1366,83 @@ class SQLRewriter:
             transform=transform_name,
             set_local_commands=set_local_cmds,
             warnings=interface_warnings,
+        )
+
+    def _apply_patch(self, patch_data: dict) -> RewriteResult:
+        """Apply an IR patch plan to produce a RewriteResult.
+
+        Steps:
+        1. Deepcopy IR (apply mutates in place)
+        2. Deserialise dict → PatchPlan via dict_to_plan()
+        3. Apply patch plan → PatchResult
+        4. AST validation on output SQL
+        5. Infer transforms from SQL diff
+        """
+        import copy
+        from .ir import dict_to_plan, apply_patch_plan, render_script
+
+        # Deepcopy so we don't mutate the shared IR
+        ir_copy = copy.deepcopy(self._script_ir)
+
+        try:
+            plan = dict_to_plan(patch_data)
+        except Exception as e:
+            return RewriteResult(
+                success=False,
+                optimized_sql=self.original_sql,
+                error=f"Patch plan parse failed: {e}",
+            )
+
+        try:
+            patch_result = apply_patch_plan(ir_copy, plan)
+        except Exception as e:
+            return RewriteResult(
+                success=False,
+                optimized_sql=self.original_sql,
+                error=f"Patch apply failed: {e}",
+            )
+
+        if not patch_result.success or not patch_result.output_sql:
+            errors_str = "; ".join(patch_result.errors[:3]) if patch_result.errors else "unknown"
+            return RewriteResult(
+                success=False,
+                optimized_sql=self.original_sql,
+                error=f"Patch plan failed ({patch_result.steps_applied}/{patch_result.steps_total} steps): {errors_str}",
+            )
+
+        output_sql = patch_result.output_sql
+
+        # Validate SQL parses
+        if not self._validate_sql(output_sql):
+            return RewriteResult(
+                success=False,
+                optimized_sql=self.original_sql,
+                error="Patched SQL does not parse",
+            )
+
+        # AST equivalence check
+        ast_check = validate_ast_equivalence(
+            self.original_sql, output_sql, self.dialect
+        )
+        if not ast_check.valid:
+            return RewriteResult(
+                success=False,
+                optimized_sql=self.original_sql,
+                error=f"Patch AST validation failed: {ast_check.errors[0]}",
+            )
+
+        # Infer transforms from SQL diff
+        transforms = infer_transforms_from_sql_diff(
+            self.original_sql, output_sql, self.dialect
+        )
+        transform_name = transforms[0] if transforms else "semantic_rewrite"
+        if transform_name not in ALLOWED_TRANSFORMS:
+            transform_name = "semantic_rewrite"
+
+        return RewriteResult(
+            success=True,
+            optimized_sql=output_sql,
+            transform=transform_name,
         )
 
     def _validate_sql(self, sql: str) -> bool:

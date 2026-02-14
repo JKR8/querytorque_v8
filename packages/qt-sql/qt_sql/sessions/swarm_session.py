@@ -75,6 +75,9 @@ class SwarmSession(OptimizationSession):
         self._coach_prefix: Optional[str] = None  # Grows across coach rounds
         self._all_worker_briefings: List[Any] = []  # BriefingWorker list from fan-out
         self._all_examples: Dict[int, List[Dict]] = {}  # worker_id → loaded examples
+        # IR patch mode state
+        self._script_ir: Optional[Any] = None  # ScriptIR built once per query
+        self._ir_node_map: Optional[str] = None  # Rendered node map text for prompts
 
     @staticmethod
     def _stage(query_id: str, msg: str):
@@ -880,6 +883,20 @@ class SwarmSession(OptimizationSession):
         except Exception as e:
             logger.warning(f"[{self.query_id}] Logic tree build failed: {e}")
 
+        # Build IR node map for patch mode (once per query)
+        if self.patch:
+            try:
+                from ..ir import build_script_ir, render_ir_node_map, Dialect
+                dialect_map = {"duckdb": Dialect.DUCKDB, "postgres": Dialect.POSTGRES,
+                               "snowflake": Dialect.SNOWFLAKE}
+                ir_dialect = dialect_map.get(self.dialect, Dialect.DUCKDB)
+                self._script_ir = build_script_ir(self.original_sql, ir_dialect)
+                self._ir_node_map = render_ir_node_map(self._script_ir)
+                self._stage(self.query_id, f"IR: built ({len(self._script_ir.statements)} statements, patch mode)")
+            except Exception as e:
+                logger.warning(f"[{self.query_id}] IR build failed, disabling patch mode: {e}")
+                self.patch = False
+
         candidates_by_worker = {}
         all_worker_examples: Dict[int, List[Dict]] = {}
 
@@ -900,6 +917,8 @@ class SwarmSession(OptimizationSession):
             dialect=self.dialect,
             engine_version=self.pipeline._engine_version,
             original_logic_tree=original_logic_tree,
+            patch=self.patch,
+            ir_node_map=self._ir_node_map,
         )
         # Cache for coach rounds
         self._shared_prefix = shared_prefix
@@ -928,6 +947,7 @@ class SwarmSession(OptimizationSession):
                 examples_used=example_ids,
                 worker_id=worker_briefing.worker_id,
                 dialect=self.dialect,
+                script_ir=self._script_ir if self.patch else None,
             )
 
             # Syntax check

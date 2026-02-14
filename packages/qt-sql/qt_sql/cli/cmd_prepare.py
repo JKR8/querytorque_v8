@@ -29,6 +29,8 @@ import click
               help="Scenario card name (e.g., 'postgres_small_instance').")
 @click.option("--evidence", is_flag=True,
               help="Include evidence bundle in prepared output.")
+@click.option("--patch", "patch_mode", is_flag=True,
+              help="Include IR node map in prepared output for patch-mode workers.")
 @click.pass_context
 def prepare(
     ctx: click.Context,
@@ -40,6 +42,7 @@ def prepare(
     output_dir: str | None,
     scenario: str,
     evidence: bool,
+    patch_mode: bool,
 ) -> None:
     """Generate analyst briefing prompts deterministically (no LLM calls).
 
@@ -144,9 +147,24 @@ def prepare(
                 matched_examples=ctx_data.get("matched_examples"),
             )
 
+            # IR node map for patch mode (optional)
+            ir_node_map_text = None
+            if patch_mode:
+                try:
+                    from ..ir import build_script_ir, render_ir_node_map, Dialect
+                    dialect_map = {"duckdb": Dialect.DUCKDB, "postgres": Dialect.POSTGRES,
+                                   "snowflake": Dialect.SNOWFLAKE}
+                    ir_dialect = dialect_map.get(dialect, Dialect.DUCKDB)
+                    script_ir = build_script_ir(sql, ir_dialect)
+                    ir_node_map_text = render_ir_node_map(script_ir)
+                except Exception as e:
+                    console.print(f"  {status_prefix} [yellow]IR build failed: {e}[/yellow]")
+
             # Save outputs
             (out / "prompts" / f"{qid}.txt").write_text(prompt)
             (out / "original" / f"{qid}.sql").write_text(sql)
+            if ir_node_map_text:
+                (out / "context" / f"{qid}_ir_node_map.txt").write_text(ir_node_map_text)
 
             # Evidence bundle (optional)
             if evidence:
@@ -197,6 +215,8 @@ def prepare(
                 "query_archetype": ctx_data.get("query_archetype"),
                 "scenario": scenario or None,
                 "has_evidence": evidence,
+                "patch_mode": patch_mode,
+                "has_ir_node_map": ir_node_map_text is not None,
             }
             (out / "metadata" / f"{qid}.json").write_text(
                 json.dumps(meta, indent=2)

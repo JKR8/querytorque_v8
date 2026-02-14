@@ -31,6 +31,8 @@ def build_worker_prompt(
     dialect: str = "duckdb",
     engine_version: Optional[str] = None,
     original_logic_tree: Optional[str] = None,
+    patch: bool = False,
+    ir_node_map: Optional[str] = None,
 ) -> str:
     """Build a worker prompt from analyst briefing sections.
 
@@ -179,7 +181,14 @@ def build_worker_prompt(
     sections.append(build_worker_rewrite_checklist())
 
     # ── [9] COLUMN COMPLETENESS CONTRACT + OUTPUT FORMAT ─────────────
-    sections.append(_section_output_format(output_columns, original_logic_tree, dialect))
+    if patch and ir_node_map:
+        sections.append(
+            _section_output_format_patch(output_columns, ir_node_map, dialect)
+        )
+    else:
+        sections.append(
+            _section_output_format(output_columns, original_logic_tree, dialect)
+        )
 
     return "\n\n".join(sections)
 
@@ -292,6 +301,64 @@ def _section_output_format(
         "After JSON:\n"
         "```\nChanges: <1-2 sentences>\nExpected speedup: <estimate>\n```\n\n"
         "Now output your Logic Tree and Component Payload JSON:"
+    )
+
+    return "\n".join(lines)
+
+
+def _section_output_format_patch(
+    output_columns: Optional[List[str]],
+    ir_node_map: str,
+    dialect: str,
+) -> str:
+    """Output format section for IR patch mode.
+
+    Instructs the worker to emit a PatchPlan JSON instead of full SQL.
+    """
+    lines = []
+
+    if output_columns:
+        cols_str = ", ".join(f"`{c}`" for c in output_columns)
+        lines.append(
+            f"### Column Completeness Contract\n\n"
+            f"The final query MUST produce exactly these columns (same names, same order): "
+            f"{cols_str}\n"
+        )
+
+    lines.append(
+        "## IR Node Map\n\n"
+        "The original query has been parsed into a stable IR with the following structure:\n\n"
+        "```\n" + ir_node_map + "\n```\n"
+    )
+
+    lines.append(
+        "## Output Format — Patch Plan\n\n"
+        "Emit a single JSON object describing ONLY the changes (not the full SQL).\n"
+        "The patch engine will apply your steps atomically to the IR above.\n\n"
+        "```json\n"
+        '{"plan_id": "W<N>_<query_id>", "dialect": "<dialect>",\n'
+        ' "steps": [\n'
+        '   {"step_id": "s1", "op": "<operation>",\n'
+        '    "target": {"by_node_id": "<statement_id>"},\n'
+        '    "payload": { ... },\n'
+        '    "description": "<what this step does>"}\n'
+        ' ]}\n'
+        "```\n\n"
+        "### Available Operations\n\n"
+        "| op | payload fields | description |\n"
+        "|---|---|---|\n"
+        "| `insert_cte` | `cte_name`, `cte_query_sql` | Add a new CTE to a statement |\n"
+        "| `replace_expr_subtree` | `expr_sql` | Replace an expression (e.g. a SELECT column) |\n"
+        "| `replace_where_predicate` | `sql_fragment` | Replace the WHERE clause |\n"
+        "| `delete_expr_subtree` | _(none)_ | Remove an expression node |\n\n"
+        "### Rules\n"
+        "- Target nodes using `by_node_id` from the IR Node Map above.\n"
+        "- Every `cte_query_sql` and `sql_fragment` must be complete, executable SQL (no ellipsis).\n"
+        "- Steps are applied in order. Later steps see the IR state after earlier steps.\n"
+        "- The final query columns must match the Column Completeness Contract.\n\n"
+        "After JSON:\n"
+        "```\nChanges: <1-2 sentences>\nExpected speedup: <estimate>\n```\n\n"
+        "Now output your Patch Plan JSON:"
     )
 
     return "\n".join(lines)

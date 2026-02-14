@@ -32,6 +32,7 @@ class OptimizationSession:
         max_iterations: int = 3,
         n_workers: int = 3,
         orchestrator: Optional["Orchestrator"] = None,
+        patch: bool = False,
     ):
         self.pipeline = pipeline
         self.query_id = query_id
@@ -40,6 +41,7 @@ class OptimizationSession:
         self.max_iterations = max_iterations
         self.n_workers = n_workers
         self.orchestrator = orchestrator
+        self.patch = patch
 
         # Derived config
         self.dialect = (

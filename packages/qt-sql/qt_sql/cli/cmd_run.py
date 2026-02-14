@@ -43,6 +43,8 @@ import click
               help="Engine version override (e.g., '17' for PG, '1.2' for DuckDB).")
 @click.option("--output-contract", is_flag=True,
               help="Emit structured QueryOutputContract JSON alongside results.")
+@click.option("--patch", "patch_mode", is_flag=True,
+              help="Use IR patch plans instead of full SQL rewrites.")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -60,6 +62,7 @@ def run(
     scenario: str,
     engine_version: str,
     output_contract: bool,
+    patch_mode: bool,
 ) -> None:
     """Run the full optimization pipeline (requires LLM API key).
 
@@ -279,6 +282,7 @@ def _run_serial(
                 n_workers=n_workers,
                 mode=mode_enum,
                 orchestrator=orchestrator,
+                patch=patch_mode,
             )
 
             _save_query_result(result, qid, out, checkpoint_path, completed_ids, results)
@@ -338,6 +342,7 @@ def _run_two_phase(
             target_speedup=target_speedup,
             n_workers=4,
             orchestrator=orchestrator,
+            patch=patch_mode,
         )
         sessions.append((qid, session))
 

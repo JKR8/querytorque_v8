@@ -147,6 +147,7 @@ class CandidateGenerator:
         examples_used: list[str],
         worker_id: int,
         dialect: str = "duckdb",
+        script_ir=None,
     ) -> Candidate:
         """Generate a single optimization candidate.
 
@@ -156,6 +157,7 @@ class CandidateGenerator:
             examples_used: List of example IDs used in prompt
             worker_id: Worker identifier
             dialect: SQL dialect
+            script_ir: Optional ScriptIR for patch-mode application
 
         Returns:
             Candidate with optimized SQL or error
@@ -165,7 +167,7 @@ class CandidateGenerator:
             response = self._analyze(prompt)
 
             # Apply rewrite
-            rewriter = SQLRewriter(sql, dialect=dialect)
+            rewriter = SQLRewriter(sql, dialect=dialect, script_ir=script_ir)
             result = rewriter.apply_response(response)
 
             # Use explicit transform from JSON rewrite_set when available,

@@ -29,6 +29,8 @@ def build_shared_worker_prefix(
     dialect: str = "duckdb",
     engine_version: Optional[str] = None,
     original_logic_tree: Optional[str] = None,
+    patch: bool = False,
+    ir_node_map: Optional[str] = None,
 ) -> str:
     """Build the shared prefix that all 4 workers receive identically.
 
@@ -58,7 +60,7 @@ def build_shared_worker_prefix(
     Returns:
         Shared prefix string (identical for all 4 workers)
     """
-    from .worker import _section_examples, _section_output_format
+    from .worker import _section_examples, _section_output_format, _section_output_format_patch
     from .briefing_checks import build_worker_rewrite_checklist
 
     sections: list[str] = []
@@ -138,7 +140,10 @@ def build_shared_worker_prefix(
     sections.append(build_worker_rewrite_checklist())
 
     # ── [9] Output format + column completeness + query structure ───────
-    sections.append(_section_output_format(output_columns, original_logic_tree, dialect=dialect))
+    if patch and ir_node_map:
+        sections.append(_section_output_format_patch(output_columns, ir_node_map, dialect=dialect))
+    else:
+        sections.append(_section_output_format(output_columns, original_logic_tree, dialect=dialect))
 
     # ── [10] Worker task summaries (compact index) ──────────────────────
     task_lines = ["## Worker Task Assignments", ""]

@@ -74,6 +74,97 @@ def detect_all(script_ir: ScriptIR) -> dict:
     }
 
 
+def dict_to_plan(data: dict) -> PatchPlan:
+    """Public entry: deserialise a dict (from JSON/YAML) into a PatchPlan."""
+    return _dict_to_plan(data)
+
+
+def render_ir_node_map(script_ir: ScriptIR) -> str:
+    """Render a concise node map of the IR for worker prompts.
+
+    Returns a human-readable tree showing statement IDs, CTE names,
+    FROM tables, WHERE predicates, and GROUP BY clauses — enough
+    context for a worker to target patch operations by node ID.
+    """
+    lines: list[str] = []
+
+    for stmt in script_ir.statements:
+        kind_label = stmt.kind.value.upper()
+        lines.append(f"{stmt.id} [{kind_label}]")
+
+        query = stmt.query
+        if query is None:
+            continue
+
+        # Render CTEs
+        for cte in query.with_ctes:
+            cq = cte.query
+            lines.append(f"  CTE: {cte.name}  (via {cq.id})")
+            _render_query_summary(cq, lines, indent=4)
+
+        # Render main query body
+        lines.append(f"  MAIN QUERY (via {query.id})")
+        _render_query_summary(query, lines, indent=4)
+
+    # Footer: available patch operations + targeting
+    lines.append("")
+    lines.append(
+        "Patch operations: insert_cte, replace_expr_subtree, "
+        "replace_where_predicate, delete_expr_subtree"
+    )
+    lines.append('Target nodes by: by_node_id (e.g. "{}")'.format(
+        script_ir.statements[0].id if script_ir.statements else "S0"
+    ))
+
+    return "\n".join(lines)
+
+
+def _render_query_summary(query: QueryIR, lines: list[str], indent: int = 4) -> None:
+    """Render FROM, WHERE, GROUP BY summary for a QueryIR node."""
+    pad = " " * indent
+
+    # FROM clause
+    from_parts = _collect_from_tables(query.from_clause)
+    if from_parts:
+        lines.append(f"{pad}FROM: {', '.join(from_parts)}")
+
+    # WHERE clause (truncated)
+    if query.where:
+        where_text = query.where.sql_text
+        if len(where_text) > 120:
+            where_text = where_text[:117] + "..."
+        lines.append(f"{pad}WHERE: {where_text}")
+
+    # GROUP BY
+    if query.group_by:
+        gb_cols = [e.sql_text for e in query.group_by]
+        lines.append(f"{pad}GROUP BY: {', '.join(gb_cols)}")
+
+    # ORDER BY
+    if query.order_by:
+        ob_cols = [e.expr.sql_text for e in query.order_by]
+        lines.append(f"{pad}ORDER BY: {', '.join(ob_cols)}")
+
+
+def _collect_from_tables(from_ir) -> list[str]:
+    """Recursively collect table names from a FromIR node."""
+    if from_ir is None:
+        return []
+
+    if from_ir.kind == FromKind.TABLE and from_ir.table:
+        alias = f" {from_ir.table.alias}" if from_ir.table.alias else ""
+        return [f"{from_ir.table.name}{alias}"]
+    elif from_ir.kind == FromKind.SUBQUERY and from_ir.subquery:
+        alias = f" {from_ir.subquery.alias}" if from_ir.subquery else ""
+        return [f"(subquery){alias}"]
+    elif from_ir.kind == FromKind.JOIN and from_ir.join:
+        left = _collect_from_tables(from_ir.join.left)
+        right = _collect_from_tables(from_ir.join.right)
+        return left + right
+
+    return []
+
+
 def _dict_to_plan(data: dict) -> PatchPlan:
     """Deserialise a dict (from YAML) into a PatchPlan."""
     steps = []
