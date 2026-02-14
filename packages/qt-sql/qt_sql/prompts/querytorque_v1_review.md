@@ -16,7 +16,7 @@ The system works. The data shows it:
 - No single worker dominates — every slot contributes, validating the 4-worker architecture
 - W4 exploration produces the highest ceilings (5.25x DuckDB, 4428x PG)
 - Sniper adds 13% overall but 38% on PG, earning its cost on harder queries
-- DSR1 (single-worker expert mode) produces 27% of all DuckDB wins — more than any individual swarm worker
+- DSR1 (single-worker single-worker mode) produces 27% of all DuckDB wins — more than any individual swarm worker
 
 The prompt architecture is the competitive advantage. This review identifies incremental improvements that protect and extend what's working, not structural changes that risk breaking it.
 
@@ -187,17 +187,17 @@ This is a prompt-generation-time optimization, not a prompt-content change.
 
 ### 3.1 The Problem
 
-The expert analyst prompt inherits the full swarm infrastructure:
+The single-worker analyst prompt inherits the full swarm infrastructure:
 - Transform catalog with diversity guidelines designed for 4 workers
 - Strategy selection rules including "MAXIMIZE DIVERSITY" (changed to "MAXIMIZE EXPECTED VALUE" but everything else stays)
 - Worker 4 exploration rules (irrelevant — there's no Worker 4)
 - All 14 matched examples (the analyst must pick 1–3, but sees 14)
 
-The expert analyst doesn't need to reason about diversity, exploration, or worker role differentiation. It needs to reason about depth: which single compound strategy has the highest expected value?
+The single-worker analyst doesn't need to reason about diversity, exploration, or worker role differentiation. It needs to reason about depth: which single compound strategy has the highest expected value?
 
 ### 3.2 Proposed Expert-Specific Additions
 
-Add to §6 reasoning process (expert mode only):
+Add to §6 reasoning process (single-worker mode only):
 
 ```
 EXPERT MODE: You are assigning a single worker. Your reasoning budget should
@@ -216,14 +216,14 @@ Do NOT enumerate alternative strategies. Select the single best approach and
 invest your full reasoning depth in specifying it precisely.
 ```
 
-Add to §5a (expert mode only):
+Add to §5a (single-worker mode only):
 
 ```
 Select the 3 most applicable examples. Relevance over coverage — 3 closely
 matched examples are better than 3 diverse but loosely matched ones.
 ```
 
-**Effort: LOW.** These are conditional paragraphs gated on `mode="expert"`.
+**Effort: LOW.** These are conditional paragraphs gated on `mode="oneshot"`.
 
 ---
 
@@ -404,7 +404,7 @@ Items are ordered by (impact × confidence / effort). All are additive — none 
 | 1 | Q-Error graceful degradation | §6 Step 2 | None | 3 lines | Prevents silent reasoning failure when §2b-i is absent |
 | 2 | Literal arithmetic standardization | §3a | None | 2 lines | Eliminates inconsistency between constraint and NODE_CONTRACTS |
 | 3 | PG tuner no-EXPLAIN fallback | PG tuner | None | 15 lines | Enables config recommendations when EXPLAIN unavailable |
-| 4 | Expert mode depth-over-breadth guidance | §6 expert | None | 8 lines | May improve DSR1's already-leading 27% win rate |
+| 4 | single-worker mode depth-over-breadth guidance | §6 single-worker | None | 8 lines | May improve DSR1's already-leading 27% win rate |
 | 5 | EXPLAIN tree compression for repeated subtrees | §2b formatter | Low | Code change | Gives LLM parseable structure instead of truncated ASCII |
 | 6 | Snipe analyst all-pass handling | Snipe §3 | None | 6 lines | Better diagnostic framing when all workers succeed |
 | 7 | Composition patterns table | §4 | None | Table addition | Documents tested transform combinations |

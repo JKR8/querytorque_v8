@@ -1,4 +1,4 @@
-"""Comprehensive tests for V2 analyst briefing prompt template.
+"""Comprehensive tests for canonical analyst briefing prompt template.
 
 Covers:
   - §I ROLE: senior investigator framing + 6 principles + self-sufficiency
@@ -8,9 +8,9 @@ Covers:
   - §V INVESTIGATE: 6-step reasoning (including Match Gold Examples) + worker diversity
   - §VI OUTPUT FORMAT: shared briefing + worker briefings
   - §VII REFERENCE APPENDIX: documented cases by blind spot, transform mapping, regression registry, structural matches, verification
-  - V2 Parser: OPTIMAL_PATH, CURRENT_PLAN_GAP, APPROACH, TARGET_QUERY_MAP, NODE_CONTRACTS
-  - V2 Validator: all new fields validated
-  - V2 Worker: new fields wired into worker prompt
+  - Parser: OPTIMAL_PATH, CURRENT_PLAN_GAP, APPROACH, TARGET_QUERY_MAP, NODE_CONTRACTS
+  - Validator: all new fields validated
+  - Worker: new fields wired into worker prompt
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ from __future__ import annotations
 import pytest
 
 from qt_sql.dag import LogicalTreeNode, QueryLogicalTree
-from qt_sql.prompts.v2_analyst_briefing import (
-    build_v2_analyst_briefing_prompt,
+from qt_sql.prompts.analyst_briefing import (
+    build_analyst_briefing_prompt,
     section_role,
     section_the_case,
     section_this_engine,
@@ -31,21 +31,20 @@ from qt_sql.prompts.v2_analyst_briefing import (
     _detect_query_features,
     _format_blind_spot_id,
 )
-from qt_sql.prompts.v2_swarm_parsers import (
-    V2BriefingShared,
-    V2BriefingWorker,
-    V2ParsedBriefing,
-    parse_v2_briefing_response,
+from qt_sql.prompts.swarm_parsers import (
+    BriefingShared,
+    BriefingWorker,
+    ParsedBriefing,
+    parse_briefing_response,
 )
-from qt_sql.prompts.v2_briefing_checks import (
-    build_v2_analyst_checklist,
-    build_v2_expert_checklist,
-    build_v2_oneshot_checklist,
-    build_v2_worker_rewrite_checklist,
-    validate_v2_parsed_briefing,
+from qt_sql.prompts.briefing_checks import (
+    build_analyst_checklist,
+    build_oneshot_checklist,
+    build_worker_rewrite_checklist,
+    validate_parsed_briefing,
     VALID_GOALS,
 )
-from qt_sql.prompts.v2_worker import build_v2_worker_prompt
+from qt_sql.prompts.worker import build_worker_prompt
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -176,7 +175,7 @@ def _semantic_contract_text():
 
 
 def _shared_valid():
-    return V2BriefingShared(
+    return BriefingShared(
         semantic_contract=_semantic_contract_text(),
         optimal_path=(
             "date_dim(d_year=2001 AND d_qoy<4) -> ~274 rows -> "
@@ -222,7 +221,7 @@ def _worker_valid(worker_id: int = 1):
         4: "D",  # Set operations
     }
 
-    return V2BriefingWorker(
+    return BriefingWorker(
         worker_id=worker_id,
         strategy=f"strategy_{worker_id}_custom",
         role=role_map.get(worker_id, "proven_compound"),
@@ -259,11 +258,6 @@ class TestSectionRole:
         assert "senior query optimization architect" in result
         assert "4 specialist workers" in result
         assert "ONLY what you provide" in result
-
-    def test_expert_mode(self):
-        result = section_role("expert")
-        assert "§I. ROLE" in result
-        assert "single specialist worker" in result
 
     def test_oneshot_mode(self):
         result = section_role("oneshot")
@@ -304,11 +298,6 @@ class TestSectionRole:
     def test_swarm_mentions_query_map(self):
         result = section_role("swarm")
         assert "query map" in result
-
-    def test_expert_mentions_query_map(self):
-        result = section_role("expert")
-        assert "query map" in result
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # §II. THE CASE Tests
@@ -619,21 +608,15 @@ class TestSectionInvestigate:
         result = section_investigate("swarm", _minimal_dag(), None, None)
         diversity_start = result.index("Worker Diversity")
         diversity_section = result[diversity_start:]
-        assert "SCAN REDUCTION" in diversity_section
-        assert "JOIN RESTRUCTURING" in diversity_section
-        assert "AGGREGATION REWRITE" in diversity_section
-        assert "SCAN CONSOLIDATION" in diversity_section
-        assert "SUBQUERY ELIMINATION" in diversity_section
-        assert "PREDICATE RESTRUCTURE" in diversity_section
+        assert "EARLY FILTERING" in diversity_section
+        assert "DECORRELATION" in diversity_section
+        assert "AGGREGATION" in diversity_section
+        assert "SET OPERATIONS" in diversity_section
+        assert "MATERIALIZATION" in diversity_section
+        assert "JOIN TRANSFORMATION" in diversity_section
         # Worker diversity should NOT reference specific table/column names
         assert "web_sales" not in diversity_section
         assert "customer_sk" not in diversity_section
-
-    def test_expert_mode_best_strategy(self):
-        result = section_investigate("expert", _minimal_dag(), None, None)
-        assert "Best Strategy" in result
-        assert "Four Strategies" not in result
-        assert "Worker Diversity" not in result
 
     def test_oneshot_mode_implement(self):
         result = section_investigate("oneshot", _minimal_dag(), None, None)
@@ -642,13 +625,13 @@ class TestSectionInvestigate:
 
     def test_step5_appears_in_all_modes(self):
         """Step 5 (Match Gold Examples) appears in all modes."""
-        for mode in ("swarm", "expert", "oneshot"):
+        for mode in ("swarm", "oneshot"):
             result = section_investigate(mode, _minimal_dag(), None, None)
             assert "Match Gold Examples" in result, f"Missing Step 5 in {mode} mode"
 
     def test_step6_appears_in_all_modes(self):
         """Step 6 (Select Examples) appears in all modes."""
-        for mode in ("swarm", "expert", "oneshot"):
+        for mode in ("swarm", "oneshot"):
             result = section_investigate(mode, _minimal_dag(), None, None)
             assert "Select Examples" in result, f"Missing Step 6 in {mode} mode"
 
@@ -679,8 +662,8 @@ class TestSectionOutputFormat:
         assert "Primary Family" in result
         assert "Key Structural Idea |" in result
 
-    def test_no_diversity_map_in_expert(self):
-        result = section_output_format("expert", False, "duckdb")
+    def test_no_diversity_map_in_oneshot(self):
+        result = section_output_format("oneshot", False, "duckdb")
         assert "DIVERSITY_MAP:" not in result
 
     def test_worker_briefing_new_fields(self):
@@ -708,10 +691,6 @@ class TestSectionOutputFormat:
         assert "=== OPTIMIZED SQL ===" in result
         assert "STRATEGY:" in result
         assert "WORKER 1 BRIEFING" not in result
-
-    def test_expert_single_worker(self):
-        result = section_output_format("expert", False, "duckdb")
-        assert "=== WORKER 1 BRIEFING ===" in result
 
     def test_swarm_worker_n_template(self):
         """Swarm generates explicit WORKER 1..4 briefing blocks (not generic N template)."""
@@ -843,7 +822,7 @@ class TestSectionReferenceAppendix:
 
 class TestFullPromptBuild:
     def test_swarm_has_all_seven_sections(self):
-        prompt = build_v2_analyst_briefing_prompt(
+        prompt = build_analyst_briefing_prompt(
             query_id="q1", sql="SELECT 1",
             explain_plan_text=None, dag=_minimal_dag(), costs={},
             semantic_intents=None, constraints=_constraints(),
@@ -858,18 +837,8 @@ class TestFullPromptBuild:
         assert "§VI. OUTPUT FORMAT" in prompt
         assert "§VII. REFERENCE APPENDIX" in prompt
 
-    def test_expert_has_all_sections(self):
-        prompt = build_v2_analyst_briefing_prompt(
-            query_id="q1", sql="SELECT 1",
-            explain_plan_text=None, dag=_minimal_dag(), costs={},
-            semantic_intents=None, constraints=_constraints(),
-            dialect="postgresql", mode="expert",
-        )
-        assert "§I. ROLE" in prompt
-        assert "§VI. OUTPUT FORMAT" in prompt
-
     def test_oneshot_has_all_sections(self):
-        prompt = build_v2_analyst_briefing_prompt(
+        prompt = build_analyst_briefing_prompt(
             query_id="q1", sql="SELECT 1",
             explain_plan_text=None, dag=_minimal_dag(), costs={},
             semantic_intents=None, constraints=_constraints(),
@@ -880,14 +849,14 @@ class TestFullPromptBuild:
 
     def test_invalid_mode_raises(self):
         with pytest.raises(ValueError, match="Invalid mode"):
-            build_v2_analyst_briefing_prompt(
+            build_analyst_briefing_prompt(
                 query_id="q1", sql="SELECT 1",
                 explain_plan_text=None, dag=_minimal_dag(), costs={},
                 semantic_intents=None, mode="invalid",
             )
 
     def test_exploit_algorithm_replaces_engine_profile(self):
-        prompt = build_v2_analyst_briefing_prompt(
+        prompt = build_analyst_briefing_prompt(
             query_id="q1", sql="SELECT 1",
             explain_plan_text=None, dag=_minimal_dag(), costs={},
             semantic_intents=None, dialect="duckdb",
@@ -898,7 +867,7 @@ class TestFullPromptBuild:
         assert "| Capability | Implication |" not in prompt
 
     def test_section_order_is_correct(self):
-        prompt = build_v2_analyst_briefing_prompt(
+        prompt = build_analyst_briefing_prompt(
             query_id="q1", sql="SELECT 1",
             explain_plan_text=None, dag=_minimal_dag(), costs={},
             semantic_intents=None, constraints=_constraints(),
@@ -917,10 +886,10 @@ class TestFullPromptBuild:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# V2 Parser Tests
+# Parser Tests
 # ═══════════════════════════════════════════════════════════════════════
 
-class TestV2Parser:
+class TestParser:
     def _full_response(self) -> str:
         """Response in the NEW §VI output format with OPTIMAL_PATH, CURRENT_PLAN_GAP, APPROACH, TARGET_QUERY_MAP."""
         return (
@@ -1016,100 +985,100 @@ class TestV2Parser:
         )
 
     def test_parses_shared_semantic_contract(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert len(parsed.shared.semantic_contract.split()) >= 30
 
     def test_parses_optimal_path(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert "date_dim" in parsed.shared.optimal_path
         assert "274 rows" in parsed.shared.optimal_path
 
     def test_parses_current_plan_gap(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert "MINIMIZE ROWS TOUCHED" in parsed.shared.current_plan_gap
         assert "store_sales" in parsed.shared.current_plan_gap
 
     def test_backwards_compat_bottleneck_diagnosis(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         # bottleneck_diagnosis should be populated from optimal_path
         assert parsed.shared.bottleneck_diagnosis != ""
 
     def test_backwards_compat_goal_violations(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         # goal_violations should be populated from current_plan_gap
         assert parsed.shared.goal_violations != ""
 
     def test_parses_active_constraints(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert "LITERAL_PRESERVATION" in parsed.shared.active_constraints
 
     def test_parses_regression_warnings(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert "None applicable" in parsed.shared.regression_warnings
 
     def test_parses_diversity_map(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert "Worker" in parsed.shared.diversity_map
 
     def test_parses_four_workers(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert len(parsed.workers) == 4
 
     def test_worker_strategy(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert parsed.workers[0].strategy == "explicit_joins"
 
     def test_worker_approach(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert "explicit JOINs" in parsed.workers[0].approach
         assert "predicate blindness" in parsed.workers[0].approach
 
     def test_worker_target_query_map(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert "filtered_dates" in parsed.workers[0].target_query_map
 
     def test_worker_node_contracts(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert "d_date_sk" in parsed.workers[0].node_contracts
 
     def test_worker_backwards_compat_target_logical_tree(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         # target_logical_tree should be composed from target_query_map + node_contracts
         tlt = parsed.workers[0].target_logical_tree
         assert "TARGET_QUERY_MAP" in tlt
         assert "NODE_CONTRACTS" in tlt
 
     def test_worker_examples(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert "date_cte_isolate" in parsed.workers[0].examples
         assert "prefetch_fact_join" in parsed.workers[0].examples
 
     def test_worker_example_adaptation(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert "date isolation" in parsed.workers[0].example_adaptation
 
     def test_worker_hazard_flags(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert "semi-join" in parsed.workers[0].hazard_flags
 
     def test_worker4_exploration_fields(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         w4 = parsed.workers[3]
         assert w4.exploration_type == "novel_technique"
         assert w4.hypothesis_tag == "NOVEL_MULTI_CHANNEL_SCAN"
 
     def test_strips_reasoning_block(self):
-        parsed = parse_v2_briefing_response(self._full_response())
+        parsed = parse_briefing_response(self._full_response())
         assert "internal analysis" not in parsed.shared.semantic_contract
 
     def test_fault_tolerant_empty_response(self):
-        parsed = parse_v2_briefing_response("")
+        parsed = parse_briefing_response("")
         assert parsed.shared.semantic_contract == ""
         assert len(parsed.workers) == 4
 
     def test_preserves_raw(self):
         resp = self._full_response()
-        parsed = parse_v2_briefing_response(resp)
+        parsed = parse_briefing_response(resp)
         assert parsed.raw == resp
 
     def test_backwards_compat_old_format_still_parses(self):
@@ -1142,7 +1111,7 @@ class TestV2Parser:
             "EXAMPLE_ADAPTATION: adapt.\n"
             "HAZARD_FLAGS: risk.\n"
         )
-        parsed = parse_v2_briefing_response(old_response)
+        parsed = parse_briefing_response(old_response)
         # Should populate via backwards-compat aliases
         assert parsed.shared.bottleneck_diagnosis != ""
         assert parsed.shared.goal_violations != ""
@@ -1219,7 +1188,7 @@ class TestV2Parser:
             "**EXPLORATION_TYPE**: novel_technique\n"
             "**HYPOTHESIS_TAG**: MULTI_CHANNEL_SCAN\n"
         )
-        parsed = parse_v2_briefing_response(md_response)
+        parsed = parse_briefing_response(md_response)
         # Shared fields must parse even without colons
         assert len(parsed.shared.semantic_contract.split()) >= 30, (
             f"SEMANTIC_CONTRACT not parsed: '{parsed.shared.semantic_contract[:60]}'"
@@ -1238,121 +1207,121 @@ class TestV2Parser:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# V2 Validator Tests
+# Validator Tests
 # ═══════════════════════════════════════════════════════════════════════
 
-class TestV2Validator:
+class TestValidator:
     def test_valid_briefing_passes(self):
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=_shared_valid(),
             workers=[_worker_valid(i) for i in range(1, 5)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert issues == [], f"Unexpected issues: {issues}"
 
     def test_missing_semantic_contract(self):
         shared = _shared_valid()
         shared.semantic_contract = ""
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=shared,
             workers=[_worker_valid(i) for i in range(1, 5)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert any("SEMANTIC_CONTRACT missing" in i for i in issues)
 
     def test_semantic_contract_too_short(self):
         shared = _shared_valid()
         shared.semantic_contract = "too short"
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=shared,
             workers=[_worker_valid(i) for i in range(1, 5)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert any("token count" in i for i in issues)
 
     def test_missing_optimal_path(self):
         shared = _shared_valid()
         shared.optimal_path = ""
         shared.bottleneck_diagnosis = ""  # Also clear alias
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=shared,
             workers=[_worker_valid(i) for i in range(1, 5)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert any("OPTIMAL_PATH missing" in i for i in issues)
 
     def test_missing_current_plan_gap(self):
         shared = _shared_valid()
         shared.current_plan_gap = ""
         shared.goal_violations = ""  # Also clear alias
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=shared,
             workers=[_worker_valid(i) for i in range(1, 5)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert any("CURRENT_PLAN_GAP missing" in i for i in issues)
 
     def test_missing_diversity_map(self):
         shared = _shared_valid()
         shared.diversity_map = ""
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=shared,
             workers=[_worker_valid(i) for i in range(1, 5)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert any("DIVERSITY_MAP missing" in i for i in issues)
 
-    def test_diversity_map_not_required_for_expert(self):
+    def test_diversity_map_not_required_for_single_worker(self):
         shared = _shared_valid()
         shared.diversity_map = ""
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=shared,
             workers=[_worker_valid(1)],
         )
-        issues = validate_v2_parsed_briefing(parsed, expected_workers=1)
+        issues = validate_parsed_briefing(parsed, expected_workers=1)
         assert not any("DIVERSITY_MAP" in i for i in issues)
 
     def test_missing_approach(self):
         w = _worker_valid(1)
         w.approach = ""
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=_shared_valid(),
             workers=[w, _worker_valid(2), _worker_valid(3), _worker_valid(4)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert any("APPROACH missing" in i for i in issues)
 
     def test_missing_target_query_map(self):
         w = _worker_valid(1)
         w.target_query_map = ""
         w.target_logical_tree = ""  # Also clear alias
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=_shared_valid(),
             workers=[w, _worker_valid(2), _worker_valid(3), _worker_valid(4)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert any("TARGET_QUERY_MAP missing" in i for i in issues)
 
     def test_missing_node_contracts(self):
         w = _worker_valid(1)
         w.node_contracts = ""
         w.target_logical_tree = ""  # Also clear alias
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=_shared_valid(),
             workers=[w, _worker_valid(2), _worker_valid(3), _worker_valid(4)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert any("NODE_CONTRACTS missing" in i for i in issues)
 
     def test_duplicate_strategy_flagged(self):
         w1 = _worker_valid(1)
         w2 = _worker_valid(2)
         w2.strategy = w1.strategy
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=_shared_valid(),
             workers=[w1, w2, _worker_valid(3), _worker_valid(4)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert any("duplicates" in i for i in issues)
 
     def test_missing_one_correctness_id_flagged(self):
@@ -1364,11 +1333,11 @@ class TestV2Validator:
             "- COMPLETE_OUTPUT: c\n"
             # Missing CTE_COLUMN_COMPLETENESS
         )
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=shared,
             workers=[_worker_valid(i) for i in range(1, 5)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert any("CTE_COLUMN_COMPLETENESS" in i for i in issues)
 
     def test_missing_one_correctness_id_lenient_passes(self):
@@ -1380,11 +1349,11 @@ class TestV2Validator:
             "- CTE_COLUMN_COMPLETENESS: d\n"
             # Missing SEMANTIC_EQUIVALENCE — tolerated in lenient mode
         )
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=shared,
             workers=[_worker_valid(i) for i in range(1, 5)],
         )
-        issues = validate_v2_parsed_briefing(parsed, lenient=True)
+        issues = validate_parsed_briefing(parsed, lenient=True)
         assert not any("SEMANTIC_EQUIVALENCE" in i for i in issues), (
             f"Lenient mode should tolerate 1 missing ID, got: {issues}"
         )
@@ -1397,11 +1366,11 @@ class TestV2Validator:
             "- COMPLETE_OUTPUT: c\n"
             # Missing SEMANTIC_EQUIVALENCE and CTE_COLUMN_COMPLETENESS
         )
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=shared,
             workers=[_worker_valid(i) for i in range(1, 5)],
         )
-        issues = validate_v2_parsed_briefing(parsed, lenient=True)
+        issues = validate_parsed_briefing(parsed, lenient=True)
         assert any("SEMANTIC_EQUIVALENCE" in i for i in issues)
         assert any("CTE_COLUMN_COMPLETENESS" in i for i in issues)
 
@@ -1414,33 +1383,33 @@ class TestV2Validator:
             "- CTE_COLUMN_COMPLETENESS: d\n"
             "- GAP_A: e\n- GAP_B: f\n- GAP_C: g\n- GAP_D: h\n"
         )
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=shared,
             workers=[_worker_valid(i) for i in range(1, 5)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert any("too many gap IDs" in i for i in issues)
 
-    def test_expert_mode_single_worker(self):
-        parsed = V2ParsedBriefing(
+    def test_single_worker_validation(self):
+        parsed = ParsedBriefing(
             shared=_shared_valid(),
             workers=[_worker_valid(1)],
         )
-        issues = validate_v2_parsed_briefing(parsed, expected_workers=1)
+        issues = validate_parsed_briefing(parsed, expected_workers=1)
         assert issues == [], f"Unexpected issues: {issues}"
 
     def test_missing_worker_flagged(self):
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=_shared_valid(),
             workers=[_worker_valid(1), _worker_valid(2)],  # missing 3, 4
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         assert any("WORKER_3: missing" in i for i in issues)
         assert any("WORKER_4: missing" in i for i in issues)
 
     def test_backwards_compat_target_logical_tree_still_validates(self):
         """Worker with only target_logical_tree (no target_query_map) should still pass."""
-        w = V2BriefingWorker(
+        w = BriefingWorker(
             worker_id=1,
             strategy="old_style",
             approach="Some approach text.",
@@ -1449,73 +1418,67 @@ class TestV2Validator:
             example_adaptation="Adapt.",
             hazard_flags="Risk.",
         )
-        parsed = V2ParsedBriefing(
+        parsed = ParsedBriefing(
             shared=_shared_valid(),
             workers=[w, _worker_valid(2), _worker_valid(3), _worker_valid(4)],
         )
-        issues = validate_v2_parsed_briefing(parsed)
+        issues = validate_parsed_briefing(parsed)
         # Should NOT flag TARGET_QUERY_MAP or NODE_CONTRACTS missing when target_logical_tree is set
         assert not any("TARGET_QUERY_MAP missing" in i for i in issues)
         assert not any("NODE_CONTRACTS missing" in i for i in issues)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# V2 Checklist Tests
+# Checklist Tests
 # ═══════════════════════════════════════════════════════════════════════
 
-class TestV2Checklists:
+class TestChecklists:
     def test_analyst_checklist_has_optimal_path(self):
-        result = build_v2_analyst_checklist()
+        result = build_analyst_checklist()
         assert "OPTIMAL_PATH" in result
 
     def test_analyst_checklist_has_current_plan_gap(self):
-        result = build_v2_analyst_checklist()
+        result = build_analyst_checklist()
         assert "CURRENT_PLAN_GAP" in result
 
     def test_analyst_checklist_has_diversity_map(self):
-        result = build_v2_analyst_checklist()
+        result = build_analyst_checklist()
         assert "DIVERSITY_MAP" in result
 
     def test_analyst_checklist_has_approach(self):
-        result = build_v2_analyst_checklist()
+        result = build_analyst_checklist()
         assert "APPROACH" in result
 
     def test_analyst_checklist_has_target_query_map(self):
-        result = build_v2_analyst_checklist()
+        result = build_analyst_checklist()
         assert "TARGET_QUERY_MAP" in result
 
     def test_analyst_checklist_has_node_contracts(self):
-        result = build_v2_analyst_checklist()
+        result = build_analyst_checklist()
         assert "NODE_CONTRACTS" in result
 
-    def test_expert_checklist(self):
-        result = build_v2_expert_checklist()
-        assert "OPTIMAL_PATH" in result
-        assert "CURRENT_PLAN_GAP" in result
-        assert "TARGET_QUERY_MAP" in result
-
     def test_oneshot_checklist(self):
-        result = build_v2_oneshot_checklist()
+        result = build_oneshot_checklist()
         assert "OPTIMAL_PATH" in result
         assert "CURRENT_PLAN_GAP" in result
 
     def test_worker_rewrite_checklist(self):
-        result = build_v2_worker_rewrite_checklist()
+        result = build_worker_rewrite_checklist()
         assert "TARGET_QUERY_MAP" in result
         assert "CURRENT_PLAN_GAP" in result
 
     def test_discovery_mode_checklist(self):
-        result = build_v2_analyst_checklist(is_discovery_mode=True)
+        result = build_analyst_checklist(is_discovery_mode=True)
         assert "all" in result.lower()
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# V2 Worker Prompt Tests
+# Worker Prompt Tests
 # ═══════════════════════════════════════════════════════════════════════
 
-class TestV2WorkerPrompt:
+class TestWorkerPrompt:
     def test_basic_worker_prompt(self):
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=_worker_valid(1),
             shared_briefing=_shared_valid(),
             examples=[],
@@ -1529,7 +1492,7 @@ class TestV2WorkerPrompt:
         assert "SELECT 1" in prompt
 
     def test_includes_current_plan_gap(self):
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=_worker_valid(1),
             shared_briefing=_shared_valid(),
             examples=[],
@@ -1540,7 +1503,7 @@ class TestV2WorkerPrompt:
         assert "MINIMIZE ROWS TOUCHED" in prompt
 
     def test_includes_approach(self):
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=_worker_valid(1),
             shared_briefing=_shared_valid(),
             examples=[],
@@ -1551,7 +1514,7 @@ class TestV2WorkerPrompt:
         assert "restructure the date filtering" in prompt
 
     def test_includes_strategy_in_assignment(self):
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=_worker_valid(1),
             shared_briefing=_shared_valid(),
             examples=[],
@@ -1561,7 +1524,7 @@ class TestV2WorkerPrompt:
         assert "Strategy: strategy_1_custom" in prompt
 
     def test_includes_target_query_map(self):
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=_worker_valid(1),
             shared_briefing=_shared_valid(),
             examples=[],
@@ -1572,7 +1535,7 @@ class TestV2WorkerPrompt:
         assert "filtered_dates" in prompt
 
     def test_includes_node_contracts(self):
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=_worker_valid(1),
             shared_briefing=_shared_valid(),
             examples=[],
@@ -1583,7 +1546,7 @@ class TestV2WorkerPrompt:
         assert "d_date_sk" in prompt
 
     def test_includes_hazard_flags(self):
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=_worker_valid(1),
             shared_briefing=_shared_valid(),
             examples=[],
@@ -1593,7 +1556,7 @@ class TestV2WorkerPrompt:
         assert "Hazard Flags" in prompt
 
     def test_includes_rewrite_checklist(self):
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=_worker_valid(1),
             shared_briefing=_shared_valid(),
             examples=[],
@@ -1603,7 +1566,7 @@ class TestV2WorkerPrompt:
         assert "Rewrite Checklist" in prompt
 
     def test_includes_column_completeness(self):
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=_worker_valid(1),
             shared_briefing=_shared_valid(),
             examples=[],
@@ -1614,7 +1577,7 @@ class TestV2WorkerPrompt:
         assert "`col_b`" in prompt
 
     def test_includes_output_format(self):
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=_worker_valid(1),
             shared_briefing=_shared_valid(),
             examples=[],
@@ -1624,7 +1587,7 @@ class TestV2WorkerPrompt:
         assert "Component Payload JSON" in prompt
 
     def test_postgresql_dialect(self):
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=_worker_valid(1),
             shared_briefing=_shared_valid(),
             examples=[],
@@ -1645,7 +1608,7 @@ class TestV2WorkerPrompt:
                 "output": {"sql": "SELECT * FROM t1 WHERE id > 0"},
             },
         }]
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=_worker_valid(1),
             shared_briefing=_shared_valid(),
             examples=examples,
@@ -1657,7 +1620,7 @@ class TestV2WorkerPrompt:
 
     def test_backwards_compat_old_worker_briefing(self):
         """Worker prompt works with old-style briefing (target_logical_tree instead of target_query_map)."""
-        old_worker = V2BriefingWorker(
+        old_worker = BriefingWorker(
             worker_id=1,
             strategy="old_strategy",
             target_logical_tree=(
@@ -1672,13 +1635,13 @@ class TestV2WorkerPrompt:
             example_adaptation="Adapt.",
             hazard_flags="Risk.",
         )
-        old_shared = V2BriefingShared(
+        old_shared = BriefingShared(
             semantic_contract="Business intent.",
             goal_violations="- MINIMIZE ROWS TOUCHED: too many rows.",
             regression_warnings="None applicable.",
             active_constraints="- LITERAL_PRESERVATION: keep.",
         )
-        prompt = build_v2_worker_prompt(
+        prompt = build_worker_prompt(
             worker_briefing=old_worker,
             shared_briefing=old_shared,
             examples=[],

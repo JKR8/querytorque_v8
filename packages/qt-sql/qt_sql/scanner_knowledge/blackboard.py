@@ -319,7 +319,7 @@ def _process_stacking_data(
 
         # Extract the four key variants
         orig_ms = variants[0].get("avg_ms", 0)  # V1: Original SQL
-        config_ms = variants[1].get("avg_ms", 0)  # V2: Original + config
+        config_ms = variants[1].get("avg_ms", 0)  # Variant 2: Original + config
         rewrite_ms = variants[2].get("avg_ms", 0)  # V3: Rewrite only
         combined_ms = variants[3].get("avg_ms", 0)  # V4: Rewrite + config
 
@@ -338,10 +338,10 @@ def _process_stacking_data(
         else:
             interaction = "REDUNDANT"
 
-        # Extract config flags from V2 variant name
-        v2_name = variants[1].get("name", "")
-        # Parse "V2: Original + no_hashjoin+max_parallel" → combo names
-        config_part = v2_name.split(" + ", 1)[-1] if " + " in v2_name else ""
+        # Extract config flags from variant name
+        variant_name = variants[1].get("name", "")
+        # Parse "Variant 2: Original + no_hashjoin+max_parallel" → combo names
+        config_part = variant_name.split(" + ", 1)[-1] if " + " in variant_name else ""
         combo_names = [c.strip() for c in config_part.split("+") if c.strip()]
 
         flags: Dict[str, str] = {}

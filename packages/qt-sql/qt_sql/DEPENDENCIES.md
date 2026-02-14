@@ -46,7 +46,6 @@ CLI (qt_sql.cli)
         +-- store.py (Store)
         +-- learn.py (Learner)
         +-- generate.py (CandidateGenerator)
-        +-- analyst_session.py (V1 session)
         +-- dag.py (logical tree)
         +-- prompter.py
         |     +-- loads: knowledge/{dialect}.md
@@ -63,38 +62,30 @@ CLI (qt_sql.cli)
         +-- sessions/
               +-- base_session.py (abstract base)
               +-- swarm_session.py (DEFAULT)
-              |     +-- prompts/v2_analyst_briefing.py (Sections I-VII)
-              |     +-- prompts/v2_worker.py
-              |     +-- prompts/v2_swarm_parsers.py
-              |     +-- prompts/v2_briefing_checks.py
+              |     +-- prompts/analyst_briefing.py (Sections I-VII)
+              |     +-- prompts/worker.py
+              |     +-- prompts/swarm_parsers.py
+              |     +-- prompts/briefing_checks.py
               |     +-- prompts/swarm_fan_out.py
               |     +-- prompts/swarm_snipe.py
-              |     |     +-- prompts/analyst_briefing.py (V1 utilities)
-              |     |     +-- prompts/worker.py (V1 utilities)
-              |     |     +-- prompts/briefing_checks.py (V1 utilities)
+              |     |     +-- prompts/analyst_briefing.py
+              |     |     +-- prompts/worker.py
+              |     |     +-- prompts/briefing_checks.py
               |     +-- generate.py (CandidateGenerator)
-              +-- expert_session.py
-              |     +-- analyst_session.py
               +-- oneshot_session.py
 ```
 
-## V1 vs V2 Prompt Modules
+## Prompt Modules
 
-The codebase maintains two prompt generations:
+Canonical prompt modules:
 
 | Module | Version | Used By |
 |--------|---------|---------|
-| `prompts/analyst_briefing.py` | V1 | `config_boost.py`, `swarm_snipe.py`, `pipeline.py` |
-| `prompts/worker.py` | V1 | `swarm_snipe.py` |
-| `prompts/briefing_checks.py` | V1 | `swarm_snipe.py`, `analyst_briefing.py` |
-| `prompts/swarm_common.py` | V1 | `prompts/__init__.py` |
-| `prompts/swarm_parsers.py` | V1 | `prompts/__init__.py` |
-| `prompts/v2_analyst_briefing.py` | V2 | `swarm_session.py` |
-| `prompts/v2_worker.py` | V2 | `swarm_session.py` |
-| `prompts/v2_swarm_parsers.py` | V2 | `swarm_session.py` |
-| `prompts/v2_briefing_checks.py` | V2 | `swarm_session.py` |
-
-V1 modules are still actively used by the snipe pipeline (`swarm_snipe.py`).
+| `prompts/analyst_briefing.py` | canonical | `swarm_session.py`, `cmd_prepare.py`, `pipeline.py` |
+| `prompts/worker.py` | canonical | `swarm_session.py`, `oneshot_session.py`, `swarm_snipe.py` |
+| `prompts/swarm_parsers.py` | canonical | `swarm_session.py`, `prompts/__init__.py` |
+| `prompts/briefing_checks.py` | canonical | `swarm_session.py`, `prompts/__init__.py` |
+| `prompts/swarm_common.py` | canonical | `prompts/__init__.py` |
 
 ## Archived Files
 

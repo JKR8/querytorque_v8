@@ -1,20 +1,19 @@
-"""3-tier semantic validation using TABLESAMPLE mini dataset.
+"""3-tier semantic validation using a deterministic mini dataset.
 
 This module validates optimized SQL candidates against the original query
-before expensive benchmarking. Uses TABLESAMPLE to create a "mini oracle"
-that runs in milliseconds but catches semantic errors.
+before expensive benchmarking.
 
 Validation tiers:
-1. Structural: AST checks (columns, ORDER BY, LIMIT)
-2. Logic: Execute on TABLESAMPLE, compare results
-3. Dialect: Optional syntax checks for cross-dialect
+1. Structural: AST checks (column-shape compatibility)
+2. Logic: Execute both queries against the same sampled base tables
+3. Dialect: Placeholder for future cross-dialect checks
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     import sqlglot
@@ -37,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 class MiniValidator:
-    """3-tier semantic validation using TABLESAMPLE."""
+    """3-tier semantic validation on a deterministic sampled slice."""
 
     def __init__(
         self,
@@ -46,20 +45,11 @@ class MiniValidator:
         timeout_ms: int = 30_000,
         dialect: str = "duckdb",
     ):
-        """Initialize MiniValidator.
-
-        Args:
-            db_path: Database path or DSN
-            sample_pct: TABLESAMPLE percentage (default 2%)
-            timeout_ms: Max execution time per mini query
-            dialect: SQL dialect ("duckdb", "postgresql", "snowflake")
-        """
         self.db_path = db_path
         self.sample_pct = sample_pct
         self.timeout_ms = timeout_ms
         self.dialect = dialect
         self._executor: Optional[Any] = None
-        self._checker = EquivalenceChecker()
 
     def validate_rewrite(
         self,
@@ -67,21 +57,10 @@ class MiniValidator:
         rewrite_sql: str,
         worker_id: int,
     ) -> SemanticValidationResult:
-        """Run 3-tier validation and return rich diagnostics.
-
-        Args:
-            original_sql: Original query
-            rewrite_sql: Rewritten query
-            worker_id: Worker ID for logging
-
-        Returns:
-            SemanticValidationResult with tier passed and error details
-        """
+        """Run 3-tier validation and return diagnostics."""
         t_start = time.time()
-        errors: List[str] = []
 
         try:
-            # ── Tier 1: Structural checks (instant) ───────────────────
             tier1_result = self._tier1_structural(original_sql, rewrite_sql)
             if not tier1_result["passed"]:
                 elapsed = (time.time() - t_start) * 1000
@@ -94,7 +73,6 @@ class MiniValidator:
                     validation_time_ms=elapsed,
                 )
 
-            # ── Tier 2: Logic check on TABLESAMPLE (milliseconds) ──────
             tier2_result = self._tier2_logic(original_sql, rewrite_sql)
             if not tier2_result["passed"]:
                 elapsed = (time.time() - t_start) * 1000
@@ -108,8 +86,7 @@ class MiniValidator:
                     validation_time_ms=elapsed,
                 )
 
-            # ── Tier 3: Dialect warnings (optional) ────────────────────
-            tier3_result = self._tier3_dialect(original_sql, rewrite_sql)
+            _tier3_result = self._tier3_dialect(original_sql, rewrite_sql)
 
             elapsed = (time.time() - t_start) * 1000
             return SemanticValidationResult(
@@ -121,48 +98,29 @@ class MiniValidator:
 
         except Exception as e:
             elapsed = (time.time() - t_start) * 1000
-            logger.warning(
-                f"[W{worker_id}] Validation exception (tier unknown): {e}"
-            )
+            logger.warning("[W%s] Validation exception: %s", worker_id, e)
             return SemanticValidationResult(
                 tier_passed=0,
                 passed=False,
-                errors=[f"Validation exception: {str(e)[:100]}"],
+                errors=[f"Validation exception: {str(e)[:120]}"],
                 validation_time_ms=elapsed,
             )
 
-    def _tier1_structural(
-        self, original_sql: str, rewrite_sql: str
-    ) -> Dict[str, Any]:
-        """Tier 1: Structural checks via AST.
-
-        Checks:
-        - Both queries parse without errors
-        - Output columns match (count and names)
-        - ORDER BY/LIMIT preservation
-
-        Returns:
-            Dict with "passed" bool and optional error details
-        """
-        errors: List[str] = []
-
-        # Parse both SQLs
+    def _tier1_structural(self, original_sql: str, rewrite_sql: str) -> Dict[str, Any]:
+        """Tier 1: structural checks via AST."""
         try:
             if not sqlglot:
-                # If sqlglot not available, skip Tier 1
                 return {"passed": True}
 
             orig_ast = sqlglot.parse_one(original_sql, dialect=self.dialect)
             rewrite_ast = sqlglot.parse_one(rewrite_sql, dialect=self.dialect)
         except Exception as e:
-            # Parse error is a syntax problem
             return {
                 "passed": False,
                 "errors": [f"SQL parse error: {str(e)[:80]}"],
                 "syntax_error": str(e)[:200],
             }
 
-        # Extract output columns from both
         try:
             orig_cols = self._extract_select_columns(orig_ast)
             rewrite_cols = self._extract_select_columns(rewrite_ast)
@@ -172,108 +130,96 @@ class MiniValidator:
                 "errors": [f"Failed to extract columns: {str(e)[:80]}"],
             }
 
-        # Check column mismatch
         if orig_cols != rewrite_cols:
             orig_set = set(orig_cols)
             rewrite_set = set(rewrite_cols)
-            missing = list(orig_set - rewrite_set)
-            extra = list(rewrite_set - orig_set)
             mismatch = ColumnMismatch(
                 original_columns=orig_cols,
                 rewrite_columns=rewrite_cols,
-                missing=missing,
-                extra=extra,
-            )
-            errors.append(
-                f"Column mismatch: {len(missing)} missing, {len(extra)} extra"
+                missing=sorted(orig_set - rewrite_set),
+                extra=sorted(rewrite_set - orig_set),
             )
             return {
                 "passed": False,
-                "errors": errors,
+                "errors": [
+                    f"Column mismatch: {len(mismatch.missing)} missing, {len(mismatch.extra)} extra"
+                ],
                 "column_mismatch": mismatch,
             }
 
         return {"passed": True}
 
     def _extract_select_columns(self, ast: Any) -> List[str]:
-        """Extract SELECT column names from AST.
-
-        Args:
-            ast: sqlglot AST node
-
-        Returns:
-            List of column names in order
-        """
+        """Extract top-level output columns in order."""
         if not ast:
             return []
 
-        columns = []
-        # Find the SELECT statement
-        select_node = None
-        if isinstance(ast, exp.Select):
-            select_node = ast
+        select_exprs = []
+
+        # Prefer top-level output expressions when available.
+        if hasattr(ast, "selects") and ast.selects:
+            select_exprs = list(ast.selects)
+        elif isinstance(ast, exp.Select):
+            select_exprs = list(ast.expressions)
         else:
-            # Traverse to find SELECT
+            select_node = None
             for node in ast.walk():
                 if isinstance(node, exp.Select):
                     select_node = node
                     break
+            if select_node is not None:
+                select_exprs = list(select_node.expressions)
 
-        if not select_node:
-            return []
+        cols: List[str] = []
+        for expression in select_exprs:
+            if isinstance(expression, exp.Alias):
+                cols.append(expression.alias_or_name)
+                continue
+            if isinstance(expression, exp.Column):
+                cols.append(expression.name)
+                continue
+            if isinstance(expression, exp.Star):
+                cols.append("*")
+                continue
 
-        # Extract columns from SELECT clause
-        for expr in select_node.expressions:
-            if isinstance(expr, exp.Alias):
-                columns.append(expr.alias)
-            elif isinstance(expr, exp.Column):
-                columns.append(expr.name)
-            elif isinstance(expr, exp.Star):
-                columns.append("*")
+            output_name = getattr(expression, "output_name", None)
+            if output_name:
+                cols.append(output_name)
             else:
-                # Use string representation as fallback
-                columns.append(str(expr)[:50])
+                cols.append(expression.sql(dialect=self.dialect)[:80])
 
-        return columns
+        return cols
 
     def _tier2_logic(self, original_sql: str, rewrite_sql: str) -> Dict[str, Any]:
-        """Tier 2: Execute on TABLESAMPLE and compare results.
+        """Tier 2: execute both queries over the same sampled base tables."""
+        executor = self._get_executor()
+        cleanup_tables: List[str] = []
 
-        Args:
-            original_sql: Original query
-            rewrite_sql: Rewritten query
-
-        Returns:
-            Dict with "passed" bool and optional diff details
-        """
-        errors: List[str] = []
-
-        # Wrap both queries with TABLESAMPLE
         try:
-            orig_sample_sql = self._wrap_tablesample(original_sql)
-            rewrite_sample_sql = self._wrap_tablesample(rewrite_sql)
+            sampled_original, sampled_rewrite, cleanup_tables = self._prepare_sampled_queries(
+                executor,
+                original_sql,
+                rewrite_sql,
+            )
+
+            orig_rows = self._execute_sql(executor, sampled_original, with_timeout=True)
+            rewrite_rows = self._execute_sql(executor, sampled_rewrite, with_timeout=True)
         except Exception as e:
             return {
                 "passed": False,
-                "errors": [f"Failed to wrap TABLESAMPLE: {str(e)[:80]}"],
+                "errors": [f"Execution failed: {str(e)[:120]}"],
             }
+        finally:
+            for table_name in cleanup_tables:
+                try:
+                    self._execute_sql(
+                        executor,
+                        f"DROP TABLE IF EXISTS {table_name}",
+                        with_timeout=False,
+                    )
+                except Exception:
+                    pass
 
-        # Execute both queries
-        try:
-            executor = self._get_executor()
-            orig_rows = executor.execute(
-                orig_sample_sql, timeout_ms=self.timeout_ms
-            )
-            rewrite_rows = executor.execute(
-                rewrite_sample_sql, timeout_ms=self.timeout_ms
-            )
-        except Exception as e:
-            return {
-                "passed": False,
-                "errors": [f"Execution failed: {str(e)[:80]}"],
-            }
-
-        # Compare row counts
         if len(orig_rows) != len(rewrite_rows):
             diff = RowCountDiff(
                 original_count=len(orig_rows),
@@ -281,22 +227,17 @@ class MiniValidator:
                 diff=len(rewrite_rows) - len(orig_rows),
                 sample_pct=self.sample_pct,
             )
-            errors.append(
-                f"Row count mismatch on {self.sample_pct}% sample: "
-                f"{len(orig_rows)} vs {len(rewrite_rows)}"
-            )
             return {
                 "passed": False,
-                "errors": errors,
+                "errors": [
+                    f"Row count mismatch on {self.sample_pct}% sample: "
+                    f"{len(orig_rows)} vs {len(rewrite_rows)}"
+                ],
                 "row_count_diff": diff,
             }
 
-        # Compare values
         checker = EquivalenceChecker()
-        value_result = checker.compare_values(
-            orig_rows, rewrite_rows, max_differences=10
-        )
-
+        value_result = checker.compare_values(orig_rows, rewrite_rows, max_differences=10)
         if not value_result.match:
             value_diffs = [
                 ValueDiff(
@@ -307,86 +248,136 @@ class MiniValidator:
                 )
                 for vd in value_result.differences
             ]
-            errors.append(
-                f"Value mismatch on {self.sample_pct}% sample: "
-                f"{len(value_result.differences)} differences"
-            )
-
-            # Generate SQL diff
-            sql_diff = SQLDiffer.unified_diff(original_sql, rewrite_sql)
-
             return {
                 "passed": False,
-                "errors": errors,
+                "errors": [
+                    f"Value mismatch on {self.sample_pct}% sample: "
+                    f"{len(value_result.differences)} differences"
+                ],
                 "value_diffs": value_diffs,
-                "sql_diff": sql_diff,
+                "sql_diff": SQLDiffer.unified_diff(original_sql, rewrite_sql),
             }
 
         return {"passed": True}
 
-    def _wrap_tablesample(self, sql: str) -> str:
-        """Wrap SQL with TABLESAMPLE on real tables.
+    def _prepare_sampled_queries(
+        self,
+        executor: Any,
+        original_sql: str,
+        rewrite_sql: str,
+    ) -> Tuple[str, str, List[str]]:
+        """Build deterministic sampled-table rewrites for both queries.
 
-        Injects TABLESAMPLE BERNOULLI (sample_pct) into all table references,
-        skipping CTEs and subqueries.
-
-        Args:
-            sql: Original SQL
-
-        Returns:
-            Modified SQL with TABLESAMPLE injected
+        Creates one sampled temp table per base table and rewrites both queries to
+        reference those exact temp tables so both sides run on identical data.
         """
         if not sqlglot:
-            # If sqlglot not available, return original
-            return sql
+            return original_sql, rewrite_sql, []
 
-        try:
-            ast = sqlglot.parse_one(sql, dialect=self.dialect)
+        orig_ast = sqlglot.parse_one(original_sql, dialect=self.dialect)
+        rewrite_ast = sqlglot.parse_one(rewrite_sql, dialect=self.dialect)
 
-            # Find all Table nodes and add TABLESAMPLE
+        table_map: Dict[str, str] = {}
+        cleanup_tables: List[str] = []
+        run_token = int(time.time() * 1000) % 100_000_000
+
+        for ast in (orig_ast, rewrite_ast):
+            cte_names = self._collect_cte_names(ast)
             for table in ast.find_all(exp.Table):
-                # Only add TABLESAMPLE to real tables, not CTEs
-                # (CTEs are handled separately in the query structure)
-                # Add SAMPLE clause
-                sample_pct_val = sqlglot.exp.Literal.number(self.sample_pct)
-                table.set(
-                    "sample",
-                    exp.TableSample(
-                        method=exp.Identifier(this="BERNOULLI"),
-                        expression=sample_pct_val,
-                    ),
-                )
+                if self._is_cte_reference(table, cte_names):
+                    continue
+                key = self._table_key(table)
+                if key in table_map:
+                    continue
 
-            return ast.sql(dialect=self.dialect)
-        except Exception as e:
-            logger.warning(f"Failed to wrap TABLESAMPLE: {e}")
-            # Fall back to original SQL
-            return sql
+                sampled_name = f"__qt_sem_{run_token}_{len(table_map) + 1}"
+                create_sql = self._sample_create_sql(sampled_name, key)
+                self._execute_sql(executor, create_sql, with_timeout=False)
+                table_map[key] = sampled_name
+                cleanup_tables.append(sampled_name)
+
+        sampled_original = self._rewrite_with_sample_tables(orig_ast, table_map)
+        sampled_rewrite = self._rewrite_with_sample_tables(rewrite_ast, table_map)
+
+        return sampled_original, sampled_rewrite, cleanup_tables
+
+    def _collect_cte_names(self, ast: Any) -> Set[str]:
+        names: Set[str] = set()
+        for cte in ast.find_all(exp.CTE):
+            alias = cte.alias_or_name
+            if alias:
+                names.add(alias.lower())
+        return names
+
+    def _is_cte_reference(self, table: Any, cte_names: Set[str]) -> bool:
+        name = getattr(table, "name", "")
+        return bool(name and name.lower() in cte_names)
+
+    def _table_key(self, table: Any) -> str:
+        table_copy = table.copy()
+        table_copy.set("alias", None)
+        table_copy.set("sample", None)
+        return table_copy.sql(dialect=self.dialect)
+
+    def _rewrite_with_sample_tables(self, ast: Any, table_map: Dict[str, str]) -> str:
+        cte_names = self._collect_cte_names(ast)
+        for table in ast.find_all(exp.Table):
+            if self._is_cte_reference(table, cte_names):
+                continue
+            key = self._table_key(table)
+            sampled_name = table_map.get(key)
+            if not sampled_name:
+                continue
+            table.set("this", exp.to_identifier(sampled_name))
+            table.set("db", None)
+            table.set("catalog", None)
+            table.set("sample", None)
+        return ast.sql(dialect=self.dialect)
+
+    def _sample_create_sql(self, sampled_name: str, source_sql: str) -> str:
+        norm = self.dialect.lower()
+        if norm in ("postgres", "postgresql"):
+            return (
+                f"CREATE TEMP TABLE {sampled_name} AS "
+                f"SELECT * FROM {source_sql} "
+                f"TABLESAMPLE BERNOULLI ({self.sample_pct}) REPEATABLE (42)"
+            )
+        if norm == "duckdb":
+            return (
+                f"CREATE TEMP TABLE {sampled_name} AS "
+                f"SELECT * FROM {source_sql} "
+                f"USING SAMPLE BERNOULLI ({self.sample_pct} PERCENT) REPEATABLE (42)"
+            )
+        if norm == "snowflake":
+            return (
+                f"CREATE TEMP TABLE {sampled_name} AS "
+                f"SELECT * FROM {source_sql} "
+                f"SAMPLE BERNOULLI ({self.sample_pct}) SEED (42)"
+            )
+        # Fallback for unknown dialects.
+        return (
+            f"CREATE TEMP TABLE {sampled_name} AS "
+            f"SELECT * FROM {source_sql}"
+        )
+
+    def _execute_sql(self, executor: Any, sql: str, *, with_timeout: bool) -> List[Dict[str, Any]]:
+        if with_timeout:
+            try:
+                return executor.execute(sql, timeout_ms=self.timeout_ms)
+            except TypeError:
+                return executor.execute(sql)
+        return executor.execute(sql)
 
     def _tier3_dialect(self, original_sql: str, rewrite_sql: str) -> Dict[str, Any]:
-        """Tier 3: Dialect-specific syntax checks (optional).
-
-        For DuckDB→DuckDB: no-op.
-        For cross-dialect: could check for unsupported functions, keywords.
-
-        Args:
-            original_sql: Original query
-            rewrite_sql: Rewritten query
-
-        Returns:
-            Dict with warnings (always returns passed=True)
-        """
-        # Placeholder for future cross-dialect validation
+        """Tier 3 placeholder for future dialect-specific checks."""
         return {"passed": True}
 
     def _get_executor(self) -> Any:
-        """Get or create database executor."""
         if self._executor is None:
             self._executor = create_executor_from_dsn(self.db_path)
         return self._executor
 
     def close(self) -> None:
-        """Close executor connection."""
         if self._executor:
             try:
                 self._executor.close()

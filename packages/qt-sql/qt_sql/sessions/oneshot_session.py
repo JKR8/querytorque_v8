@@ -5,7 +5,7 @@ shot (no separate worker step). Output uses the same JSON rewrite_sets
 format as worker prompts — parsed by SQLRewriter.apply_response().
 
 Flow per iteration:
-1. Parse logical tree + gather context (same as expert/swarm)
+1. Parse logical tree + gather context (same as swarm)
 2. build_analyst_briefing_prompt(mode="oneshot") → LLM call
 3. SQLRewriter.apply_response() → extract per-node SQL + transforms
 4. Syntax check → validate → failure analysis if needed → iterate

@@ -639,7 +639,7 @@ def build_failure_analysis_prompt(
 
     # Context
     lines.append(
-        "You are a database performance expert analyzing a failed optimization attempt."
+        "You are a database performance specialist analyzing a failed optimization attempt."
     )
     lines.append(f"**Target**: {target_speedup:.1f}x speedup")
     lines.append(f"**Achieved**: {actual_speedup:.2f}x ({status})")

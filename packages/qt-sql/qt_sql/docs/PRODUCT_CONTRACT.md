@@ -90,7 +90,6 @@ Contract:
 
 **Orchestrators** (choose one):
 - `SwarmSession` — 4-worker fan-out + snipe refinement
-- `ExpertSession` — iterative analyst + worker with failure analysis (default)
 - `OneshotSession` — single LLM call, no iteration
 
 ---
@@ -511,7 +510,7 @@ Run the full optimization pipeline on a query.
 {
   "sql": "SELECT ... (required)",
   "dsn": "duckdb:///path.db | postgres://user:pass@host:port/db (required)",
-  "mode": "swarm | expert | oneshot (optional, default: expert)",
+  "mode": "swarm | oneshot (optional, default: swarm)",
   "query_id": "string (optional, auto-generated if omitted)",
   "max_iterations": 3,
   "target_speedup": 1.10

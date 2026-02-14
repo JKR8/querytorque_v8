@@ -27,12 +27,12 @@ Shows: config.json, queries count, explains coverage, knowledge, plan_scanner (P
 ```
 qt prepare <benchmark>                            # all queries, swarm mode
 qt prepare postgres_dsb_76 -q query001_multi_i1   # single query
-qt prepare postgres_dsb_76 --mode expert           # expert mode prompt
+qt prepare postgres_dsb_76 --mode oneshot          # oneshot mode prompt
 qt prepare duckdb_tpcds -q query088               # prefix match (all Q88 variants)
 qt prepare postgres_dsb_76 -o /tmp/prompts        # custom output dir
 ```
 
-Options: `--query/-q` (repeatable), `--mode` (swarm/expert/oneshot), `--force`, `--output-dir/-o`
+Options: `--query/-q` (repeatable), `--mode` (swarm/oneshot), `--force`, `--output-dir/-o`
 
 Output: `benchmark/prepared/<timestamp>/` with `prompts/`, `context/`, `metadata/`, `original/`, `summary.json`
 
@@ -46,7 +46,7 @@ Wraps: `Pipeline._parse_logical_tree()` → `Pipeline.gather_analyst_context()` 
 
 ```
 qt run <benchmark>                                  # all queries
-qt run postgres_dsb_76 -q query001 --mode expert    # single query, expert mode
+qt run postgres_dsb_76 -q query001 --mode oneshot   # single query, oneshot mode
 qt run duckdb_tpcds --fan-out-only                  # state 0 only
 qt run postgres_dsb_76 --resume                     # resume from checkpoint
 ```

@@ -1,4 +1,4 @@
-"""API endpoint tests for qt_sql V2 API.
+"""API endpoint tests for qt_sql API.
 
 Tests for the FastAPI routes defined in api/main.py:
     POST /api/sql/optimize  - Pipeline-backed optimization
@@ -9,6 +9,15 @@ Tests for the FastAPI routes defined in api/main.py:
 
 import pytest
 from unittest.mock import MagicMock, patch
+from pathlib import Path
+import sys
+
+# Ensure sibling package imports work when tests run from packages/qt-sql.
+QT_SQL_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = QT_SQL_ROOT.parents[1]
+QT_SHARED_PATH = REPO_ROOT / "packages" / "qt-shared"
+if QT_SHARED_PATH.exists():
+    sys.path.insert(0, str(QT_SHARED_PATH))
 
 
 class TestHealthEndpoint:
@@ -119,8 +128,8 @@ class TestOptimizeEndpoint:
         assert "n_api_calls" in data
 
     def test_optimize_accepts_mode_parameter(self, client):
-        """Should accept all three optimization modes."""
-        for mode in ["swarm", "expert", "oneshot"]:
+        """Should accept all canonical optimization modes."""
+        for mode in ["swarm", "oneshot"]:
             response = client.post(
                 "/api/sql/optimize",
                 json={

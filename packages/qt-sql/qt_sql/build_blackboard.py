@@ -1206,7 +1206,7 @@ _DEFAULT_KIMI_DIRS = [
     _CONSOLIDATED / "kimi_q1-q30_optimization",
     _CONSOLIDATED / "kimi_q31-q99_optimization",
 ]
-_DEFAULT_V2_DIR = _CONSOLIDATED / "benchmark_output_v2"
+_DEFAULT_STANDARD_DIR = _CONSOLIDATED / "benchmark_output_v2"
 _DEFAULT_MASTER_CSV = _CONSOLIDATED / "DuckDB_TPC-DS_Master_v3_20260206.csv"
 _DEFAULT_SQL_CSV = _CONSOLIDATED / "DuckDB_TPC-DS_SQL_v1_20260205.csv"
 _DEFAULT_LEADERBOARD = _ADO_BENCHMARKS / "leaderboard.json"
@@ -1631,15 +1631,15 @@ def read_kimi_source(kimi_dirs: List[Path]) -> Dict[str, List[SourceAttempt]]:
     return dict(result)
 
 
-def read_v2_source(v2_dir: Path) -> Dict[str, List[SourceAttempt]]:
-    """Read V2 Standard benchmark output."""
+def read_standard_source(standard_dir: Path) -> Dict[str, List[SourceAttempt]]:
+    """Read Standard benchmark output."""
     result: Dict[str, List[SourceAttempt]] = defaultdict(list)
 
-    if not v2_dir.is_dir():
-        logger.warning(f"  V2: directory not found: {v2_dir}")
+    if not standard_dir.is_dir():
+        logger.warning(f"  Standard source directory not found: {standard_dir}")
         return dict(result)
 
-    for qdir in sorted(v2_dir.iterdir()):
+    for qdir in sorted(standard_dir.iterdir()):
         if not qdir.is_dir() or not qdir.name.startswith("q"):
             continue
 
@@ -1811,12 +1811,12 @@ def build_global_blackboard() -> Path:
         logger.warning("  Kimi dirs not found")
 
     # Source 5: V2
-    if _DEFAULT_V2_DIR.is_dir():
-        v2 = read_v2_source(_DEFAULT_V2_DIR)
-        for qid, attempts in v2.items():
+    if _DEFAULT_STANDARD_DIR.is_dir():
+        standard_attempts = read_standard_source(_DEFAULT_STANDARD_DIR)
+        for qid, attempts in standard_attempts.items():
             all_attempts[qid].extend(attempts)
     else:
-        logger.warning(f"  V2 not found: {_DEFAULT_V2_DIR}")
+        logger.warning(f"  Standard source not found: {_DEFAULT_STANDARD_DIR}")
 
     # Source 6: Master CSV (for Evo + timing enrichment)
     master_csv = read_master_csv_source(_DEFAULT_MASTER_CSV)

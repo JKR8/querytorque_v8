@@ -29,7 +29,7 @@ export interface BatchFile {
 export interface BatchSettings {
   maxRetries: number
   dsn: string
-  mode: 'swarm' | 'expert' | 'oneshot'
+  mode: 'swarm' | 'oneshot'
   sessionId?: string
 }
 

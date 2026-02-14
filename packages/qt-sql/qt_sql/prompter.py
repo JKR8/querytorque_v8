@@ -209,7 +209,7 @@ class Prompter:
         costs: Dict[str, Any],
         history: Optional[Dict[str, Any]] = None,
         examples: Optional[List[Dict[str, Any]]] = None,
-        expert_analysis: Optional[str] = None,
+        analyst_analysis: Optional[str] = None,
         global_learnings: Optional[Dict[str, Any]] = None,
         regression_warnings: Optional[List[Dict[str, Any]]] = None,
         dialect: str = "duckdb",
@@ -226,9 +226,9 @@ class Prompter:
             history: Previous attempts and promotion context for this query.
                      Dict with 'attempts' (list) and 'promotion' (PromotionAnalysis).
             examples: List of gold examples (tag-matched, up to 3)
-            expert_analysis: Pre-computed LLM analyst output (analyst mode only).
-                             When present, replaces examples with concrete
-                             structural guidance.
+            analyst_analysis: Pre-computed LLM analyst output.
+                              When present, prepends concrete structural
+                              guidance before examples.
             global_learnings: Aggregate learnings from benchmark runs (from
                               Learner.build_learning_summary()). Shows transform
                               effectiveness, known anti-patterns, example success rates.
@@ -268,10 +268,10 @@ class Prompter:
             if gl_section:
                 sections.append(gl_section)
 
-        if expert_analysis:
+        if analyst_analysis:
             # Analyst mode: inject analysis AND examples
             # Analysis tells the rewriter WHAT to do, examples show HOW
-            sections.append(expert_analysis)
+            sections.append(analyst_analysis)
         # Gold examples (tag-matched or analyst-overridden)
         if examples:
             sections.append(self._section_examples(examples))

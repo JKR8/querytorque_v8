@@ -498,11 +498,11 @@ class Pipeline:
 
         # Optional: LLM analyst (stubborn query mode)
         # Analyst sees tag-matched picks and can swap them for better ones
-        expert_analysis = None
+        analyst_analysis = None
         analysis_raw = None
         analysis_prompt_text = None
         if analyst_enabled:
-            expert_analysis, analysis_raw, analysis_prompt_text, examples = self._run_analyst(
+            analyst_analysis, analysis_raw, analysis_prompt_text, examples = self._run_analyst(
                 query_id=query_id,
                 sql=sql,
                 dag=logical_tree,
@@ -534,7 +534,7 @@ class Pipeline:
             costs=costs,
             history=history,
             examples=examples,
-            expert_analysis=expert_analysis,
+            analyst_analysis=analyst_analysis,
             global_learnings=global_learnings,
             regression_warnings=regression_warnings,
             dialect=dialect,
@@ -601,7 +601,7 @@ class Pipeline:
             response=best_response,
             analysis=analysis_raw,
             analysis_prompt=analysis_prompt_text,
-            analysis_formatted=expert_analysis,
+            analysis_formatted=analyst_analysis,
         )
 
         # Create learning record
@@ -766,7 +766,7 @@ class Pipeline:
             max_iterations: Max optimization rounds
             target_speedup: Stop early when this speedup is reached
             n_workers: Parallel workers per iteration
-            mode: Optimization mode (oneshot, expert, swarm)
+            mode: Optimization mode (oneshot, swarm)
 
         Returns:
             SessionResult with the best result across all iterations
@@ -1047,14 +1047,14 @@ class Pipeline:
     # =========================================================================
 
     @staticmethod
-    def _format_briefing_as_expert_analysis(briefing) -> str:
-        """Convert a parsed briefing into flat expert_analysis text.
+    def _format_briefing_as_analysis(briefing) -> str:
+        """Convert a parsed briefing into flat analysis text.
 
         Translates briefing shared sections (semantic_contract, bottleneck_diagnosis,
         etc.) and worker strategy into the format Prompter.build_prompt() expects
         for the batch pipeline (run_query) path.
         """
-        lines = ["## Expert Analysis", ""]
+        lines = ["## Analysis", ""]
         shared = briefing.shared
         if shared.bottleneck_diagnosis:
             lines.append("### Performance Bottleneck")
@@ -1080,8 +1080,8 @@ class Pipeline:
                 lines.append(w.hazard_flags)
                 lines.append("")
         if len(lines) <= 2:
-            logger.error("Expert analysis formatting produced no structured sections.")
-            return "## Expert Analysis\n\n[ERROR] Missing required structured briefing sections."
+            logger.error("Analysis formatting produced no structured sections.")
+            return "## Analysis\n\n[ERROR] Missing required structured briefing sections."
         lines.append(
             "Apply the recommended strategy above. Focus on implementing it "
             "correctly while preserving semantic equivalence."
@@ -1102,7 +1102,7 @@ class Pipeline:
         """Run LLM analyst to generate deep structural analysis.
 
         Used by the run_query() path for single-pass optimization. Session
-        modes (oneshot/expert/swarm) use gather_analyst_context() +
+        modes (oneshot/swarm) use gather_analyst_context() +
         build_analyst_briefing_prompt() directly instead.
 
         Returns:
@@ -1111,18 +1111,20 @@ class Pipeline:
             recommended swaps. Returns (None, None, None, []) on failure.
         """
         from .analyst import parse_example_overrides
-        from .prompts.v2_analyst_briefing import build_v2_analyst_briefing_prompt
-        from .prompts.v2_swarm_parsers import parse_v2_briefing_response
-        from .prompts.v2_briefing_checks import validate_v2_parsed_briefing
+        from .prompts import (
+            build_analyst_briefing_prompt,
+            parse_briefing_response,
+            validate_parsed_briefing,
+        )
 
         logger.info(f"[{query_id}] Running LLM analyst (stubborn query mode)")
 
         # Gather context via the shared method
         ctx = self.gather_analyst_context(query_id, sql, dialect, engine)
 
-        # Build the analysis prompt using expert mode template (V2 §I-§VIII)
-        analysis_prompt = build_v2_analyst_briefing_prompt(
-            mode="expert",
+        # Build the analysis prompt using swarm mode template (canonical §I-§VIII)
+        analysis_prompt = build_analyst_briefing_prompt(
+            mode="swarm",
             query_id=query_id,
             sql=sql,
             dag=dag,
@@ -1158,8 +1160,8 @@ class Pipeline:
         # The LLM responds in briefing format (=== SHARED BRIEFING === etc.),
         # so we parse with parse_briefing_response and convert the shared
         # sections into the flat text format that Prompter.build_prompt() expects.
-        briefing = parse_v2_briefing_response(raw_response)
-        briefing_issues = validate_v2_parsed_briefing(briefing, expected_workers=1)
+        briefing = parse_briefing_response(raw_response)
+        briefing_issues = validate_parsed_briefing(briefing)
         if briefing_issues:
             logger.error(
                 "[%s] Analyst briefing invalid: %s",
@@ -1167,7 +1169,7 @@ class Pipeline:
                 "; ".join(briefing_issues[:6]),
             )
             return None, raw_response, analysis_prompt, []
-        formatted = self._format_briefing_as_expert_analysis(briefing)
+        formatted = self._format_briefing_as_analysis(briefing)
 
         # Check if analyst wants different examples (from WORKER 1's EXAMPLES field)
         overrides = parse_example_overrides(raw_response)
@@ -1508,7 +1510,7 @@ class Pipeline:
         return None
 
     # =========================================================================
-    # Shared analyst context gathering (used by swarm, expert, oneshot)
+    # Shared analyst context gathering (used by swarm and oneshot)
     # =========================================================================
 
     def gather_analyst_context(
@@ -1768,7 +1770,7 @@ class Pipeline:
         For PG: renders plan_json via format_pg_explain_tree().
         Returns pre-rendered text ready for prompt embedding.
         """
-        from .prompts.v2_analyst_briefing import (
+        from .prompts.analyst_briefing import (
             format_duckdb_explain_tree,
             format_pg_explain_tree,
         )

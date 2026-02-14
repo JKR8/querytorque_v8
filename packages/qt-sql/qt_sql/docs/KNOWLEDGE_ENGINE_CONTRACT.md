@@ -223,7 +223,7 @@ One JSONL entry per optimization attempt. The raw learning record from every pip
 |----------------|-----------------|---------|
 | `4w_worker` | 1-4 | Standard 4-worker swarm pipeline |
 | `plan_scanner` | null | PostgreSQL plan-space scanner |
-| `expert_session` | null | Iterative expert session |
+| `oneshot` | null | Single-call oneshot optimization run |
 
 ### Validation Rules
 

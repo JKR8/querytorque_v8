@@ -113,7 +113,7 @@ class BenchmarkConfig:
     race_min_margin: float = 0.05         # Candidate must beat original by this fraction
 
     # Semantic validation options
-    semantic_validation_enabled: bool = True
+    semantic_validation_enabled: bool = False
     semantic_sample_pct: float = 2.0  # TABLESAMPLE percentage
     semantic_timeout_ms: int = 30_000  # 30s max per mini query
 
@@ -137,7 +137,7 @@ class BenchmarkConfig:
             promote_threshold=data.get("promote_threshold", 1.05),
             race_min_runtime_ms=data.get("race_min_runtime_ms", 2000.0),
             race_min_margin=data.get("race_min_margin", 0.05),
-            semantic_validation_enabled=data.get("semantic_validation_enabled", True),
+            semantic_validation_enabled=data.get("semantic_validation_enabled", False),
             semantic_sample_pct=data.get("semantic_sample_pct", 2.0),
             semantic_timeout_ms=data.get("semantic_timeout_ms", 30_000),
         )

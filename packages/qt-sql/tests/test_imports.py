@@ -107,11 +107,11 @@ class TestQtSqlPromptImports:
         from qt_sql.prompts import (
             build_snipe_analyst_prompt,
             build_sniper_prompt,
-            SnipeAnalysis,
-            parse_snipe_response,
+            build_retry_worker_prompt,
         )
         assert callable(build_snipe_analyst_prompt)
         assert callable(build_sniper_prompt)
+        assert callable(build_retry_worker_prompt)
 
     def test_import_worker_prompt(self):
         """Test worker prompt import."""
@@ -143,11 +143,9 @@ class TestQtSqlSessionImports:
         from qt_sql.sessions import (
             SwarmSession,
             OneshotSession,
-            ExpertSession,
         )
         assert SwarmSession is not None
         assert OneshotSession is not None
-        assert ExpertSession is not None
 
 
 class TestQtSqlValidationImports:

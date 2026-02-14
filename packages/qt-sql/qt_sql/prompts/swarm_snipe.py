@@ -1,6 +1,6 @@
 """Snipe prompts for swarm mode.
 
-Current flow (V2): Self-directed retry worker — single LLM call per retry
+Current flow (canonical): Self-directed retry worker — single LLM call per retry
 iteration. The worker diagnoses failures, identifies unexplored angles, and
 produces optimized SQL in one pass.
 

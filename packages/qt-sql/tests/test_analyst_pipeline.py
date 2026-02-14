@@ -38,6 +38,10 @@ ANALYST_PROMPT_SCRIPT = (
 )
 
 
+def _load_analyst_session():
+    return pytest.importorskip("qt_sql.analyst_session")
+
+
 def _extract_load_query_history_fn(benchmark_dir: Path):
     """Load the real load_query_history() function body from the script.
 
@@ -269,9 +273,9 @@ class TestStep4FormattedAnalysis:
     def test_formatted_exists(self, artifacts):
         assert artifacts["04_analysis_formatted.txt"] is not None
 
-    def test_formatted_has_expert_header(self, artifacts):
+    def test_formatted_has_analysis_header(self, artifacts):
         formatted = artifacts["04_analysis_formatted.txt"]
-        assert "## Expert Analysis" in formatted
+        assert "## Analysis" in formatted
 
     def test_formatted_has_structure(self, artifacts):
         formatted = artifacts["04_analysis_formatted.txt"]
@@ -316,11 +320,11 @@ class TestStep5RewritePrompt:
         assert "date_cte_isolate" in prompt
         assert "REGRESSION" in prompt or "0.87" in prompt
 
-    def test_has_expert_analysis(self, artifacts):
+    def test_has_analysis_section(self, artifacts):
         """Rewrite prompt should embed the analyst's structural guidance."""
         prompt = artifacts["05_rewrite_prompt.txt"]
-        assert "## Expert Analysis" in prompt or "Expert Analysis" in prompt, (
-            "CRITICAL: Rewrite prompt missing Expert Analysis section"
+        assert "## Analysis" in prompt or "Analysis" in prompt, (
+            "CRITICAL: Rewrite prompt missing Analysis section"
         )
 
     def test_has_reference_examples(self, artifacts):
@@ -401,7 +405,7 @@ class TestHistoryLoading:
 
     def test_analyst_session_loads_batch_history(self):
         """Verify AnalystSession._build_iteration_history() loads state_N results."""
-        from qt_sql.analyst_session import AnalystSession
+        AnalystSession = _load_analyst_session().AnalystSession
 
         benchmark_dir = QT_SQL / "qt_sql" / "benchmarks" / "duckdb_tpcds"
         state_0_val = benchmark_dir / "state_0" / "validation"
@@ -438,7 +442,7 @@ class TestHistoryLoading:
 
     def test_analyst_session_no_history_returns_none(self):
         """When no batch results and no iterations, should return None."""
-        from qt_sql.analyst_session import AnalystSession
+        AnalystSession = _load_analyst_session().AnalystSession
 
         with tempfile.TemporaryDirectory() as tmpdir:
             mock_pipeline = MagicMock()
@@ -457,7 +461,9 @@ class TestHistoryLoading:
 
     def test_analyst_session_combines_batch_and_session_history(self):
         """When both batch results and session iterations exist, both should appear."""
-        from qt_sql.analyst_session import AnalystSession, AnalystIteration
+        analyst_session = _load_analyst_session()
+        AnalystSession = analyst_session.AnalystSession
+        AnalystIteration = analyst_session.AnalystIteration
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = Path(tmpdir)
@@ -610,7 +616,7 @@ class TestPipelineHistoryWiring:
         pipeline._find_regression_warnings = MagicMock(return_value=[])
         pipeline._run_analyst = MagicMock(
             return_value=(
-                "## Expert Analysis\n...",
+                "## Analysis\n...",
                 "raw analyst response",
                 "analyst prompt text",
                 [{"id": "deferred_window_aggregation"}],
@@ -632,7 +638,7 @@ class TestPipelineHistoryWiring:
         assert pipeline._run_analyst.call_args.kwargs["history"] is history
         assert pipeline.prompter.build_prompt.call_args.kwargs["history"] is history
         assert result.analysis_prompt == "analyst prompt text"
-        assert result.analysis_formatted == "## Expert Analysis\n..."
+        assert result.analysis_formatted == "## Analysis\n..."
 
     def test_run_query_passes_history_without_analyst(self):
         from qt_sql.pipeline import Pipeline
@@ -723,7 +729,7 @@ class TestPipelineHistoryWiring:
 
     def test_analyst_iteration_stores_error_messages(self):
         """Verify AnalystIteration dataclass stores error fields correctly."""
-        from qt_sql.analyst_session import AnalystIteration
+        AnalystIteration = _load_analyst_session().AnalystIteration
 
         it = AnalystIteration(
             iteration=0,
@@ -741,7 +747,9 @@ class TestPipelineHistoryWiring:
 
     def test_iteration_history_includes_error_messages(self):
         """Verify iterations with errors produce correct history dicts."""
-        from qt_sql.analyst_session import AnalystSession, AnalystIteration
+        analyst_session = _load_analyst_session()
+        AnalystSession = analyst_session.AnalystSession
+        AnalystIteration = analyst_session.AnalystIteration
 
         # Build a session with pre-populated iterations (no mocks needed)
         pipeline = self._make_pipeline(use_analyst=True)

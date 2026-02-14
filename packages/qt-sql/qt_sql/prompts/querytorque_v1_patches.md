@@ -85,7 +85,7 @@ reasoning and flag lower confidence.
 
 ## Patch 4: Expert Mode Depth Guidance
 
-**File:** `analyst_briefing.py` — §6, conditional on `mode="expert"`  
+**File:** `analyst_briefing.py` — §6, conditional on `mode="oneshot"`  
 **Insert:** Before strategy selection rules
 
 ```markdown

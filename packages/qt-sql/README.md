@@ -19,7 +19,7 @@ Detailed engineering contract: `qt_sql/docs/PRODUCT_CONTRACT.md`
 │  6. Validate:   Equivalence check + 3-run/5-run timing          │
 │  7. Learn:      Artifacts + leaderboard + learning records      │
 │                                                                 │
-│  Sessions: OneshotSession | ExpertSession | SwarmSession        │
+│  Sessions: OneshotSession | SwarmSession                        │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 
@@ -69,13 +69,6 @@ Detailed engineering contract: `qt_sql/docs/PRODUCT_CONTRACT.md`
 result = p.run_optimization_session("query_1", sql, mode=OptimizationMode.ONESHOT)
 ```
 
-### Expert (default)
-Iterative with failure analysis. Each iteration: analyst briefing → 1 worker rewrite → validate → failure analysis if below target. History accumulates so the LLM learns from prior failures.
-
-```python
-result = p.run_optimization_session("query_1", sql, mode=OptimizationMode.EXPERT)
-```
-
 ### Swarm
 4-worker fan-out: analyst distributes diverse strategies across 4 workers. If none hit target, a snipe round synthesizes failures into a refined attempt.
 
@@ -104,14 +97,13 @@ result = p.run_optimization_session("query_88", sql, mode=OptimizationMode.SWARM
 |--------|------|
 | `sessions/base_session.py` | Abstract base with shared iteration logic |
 | `sessions/oneshot_session.py` | Single-call analyst-as-worker mode |
-| `sessions/expert_session.py` | Iterative analyst → worker with failure history |
 | `sessions/swarm_session.py` | 4-worker fan-out + sniper synthesis |
 
 ### Prompts
 
 | Module | Role |
 |--------|------|
-| `prompts/analyst_briefing.py` | Analyst prompt builder (swarm/expert/oneshot modes) |
+| `prompts/analyst_briefing.py` | Analyst prompt builder (swarm/oneshot modes) |
 | `prompts/worker.py` | Worker prompt builder from analyst briefing sections |
 | `prompts/swarm_fan_out.py` | Fan-out prompt — analyst distributes strategies to 4 workers |
 | `prompts/swarm_snipe.py` | Sniper prompt — synthesizes worker failures into refined attempt |
@@ -188,7 +180,6 @@ See [`scanner_knowledge/README.md`](qt_sql/scanner_knowledge/README.md) for full
 | `pg_tuning.py` | PG system introspection — `PGSystemProfile`, resource envelope, `PG_TUNABLE_PARAMS` whitelist |
 | `learn.py` | Learning record system — captures speedup, transforms, errors per optimization attempt |
 | `analyst.py` | Analyst utilities |
-| `analyst_session.py` | Analyst session management |
 | `store.py` | Result storage |
 | `session_logging.py` | Session-level logging |
 | `script_parser.py` | ScriptParser — enterprise SQL multi-statement parsing |

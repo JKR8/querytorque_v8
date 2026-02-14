@@ -1,9 +1,19 @@
-"""Checklist and validation helpers for V2 analyst briefings."""
+"""Briefing validation — checklist and structural validation for §VI output.
+
+Validates:
+  - SHARED: semantic_contract, optimal_path, current_plan_gap,
+    active_constraints, regression_warnings, diversity_map
+  - WORKER: strategy, approach, target_query_map, node_contracts,
+    examples, example_adaptation, hazard_flags
+"""
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
 
 
 REQUIRED_CORRECTNESS_IDS = (
@@ -13,76 +23,91 @@ REQUIRED_CORRECTNESS_IDS = (
     "CTE_COLUMN_COMPLETENESS",
 )
 
+VALID_GOALS = (
+    "MINIMIZE ROWS TOUCHED",
+    "SMALLEST SET FIRST",
+    "DON'T REPEAT WORK",
+    "SETS OVER LOOPS",
+    "ARM THE OPTIMIZER",
+    "MINIMIZE DATA MOVEMENT",
+)
 
-def build_analyst_section_checklist(is_discovery_mode: bool = False) -> str:
-    """Checklist the analyst must satisfy for each output section."""
+VALID_ROLES = (
+    "proven_compound",
+    "structural_alt",
+    "aggressive_compound",
+    "novel_orthogonal",
+)
+
+VALID_FAMILIES = ("A", "B", "C", "D", "E", "F")
+
+
+def build_analyst_checklist(is_discovery_mode: bool = False) -> str:
+    """Checklist the analyst must satisfy for swarm output."""
     lines = [
         "## Section Validation Checklist (MUST pass before final output)",
         "",
         "### SHARED BRIEFING",
-        "- `SEMANTIC_CONTRACT`: 30-250 tokens covering business intent, JOIN semantics, aggregation trap, filter dependency.",
-        "- `BOTTLENECK_DIAGNOSIS`: dominant mechanism, bound type (`scan-bound`/`join-bound`/`aggregation-bound`), what optimizer already handles.",
-        "- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs + 0-3 engine gap or hypothesis IDs with EXPLAIN evidence.",
+        "- `SEMANTIC_CONTRACT`: 80-150 tokens covering business intent, JOIN semantics, aggregation traps, filter dependencies.",
+        "- `OPTIMAL_PATH`: deduced ideal join order from Step 3 with running rowcount at each step.",
+        "- `CURRENT_PLAN_GAP`: per divergence: which goal violated, which blind spot causes it, how many excess rows.",
+        "- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs + 0-3 engine gap IDs with EXPLAIN evidence.",
         "- `REGRESSION_WARNINGS`: `None applicable.` or entries with `CAUSE:` and `RULE:`.",
-        "",
-        "### WORKER N BRIEFING (N=1..4)",
-        "- `STRATEGY`: non-empty, unique across workers.",
-        "- `TARGET_LOGICAL_TREE`: explicit node chain. `NODE_CONTRACTS`: every logical tree node has a contract with FROM, OUTPUT, CONSUMERS.",
-        "- `EXAMPLES`: 1-3 IDs. `EXAMPLE_ADAPTATION`: what to adapt/ignore per example.",
-        "- `HAZARD_FLAGS`: query-specific risks, not generic cautions.",
-        "",
     ]
     if is_discovery_mode:
         lines.extend([
+            "- `DIVERSITY_MAP`: table with 4 rows, columns: Worker, Role, Primary Family, Secondary, Key Structural Idea.",
+            "- `FAMILY_COVERAGE`: lists which worker covers each family A-F.",
+            "",
+            "### WORKER N BRIEFING (N=1..4) — all exploration workers",
+        ])
+    else:
+        lines.extend([
+            "- `DIVERSITY_MAP`: table with 4 rows, columns: Worker, Role, Primary Family, Secondary, Key Structural Idea.",
+            "- `FAMILY_COVERAGE`: lists which worker covers each family A-F.",
+            "",
+            "### WORKER N BRIEFING (N=1..4)",
+        ])
+    lines.extend([
+        "- `STRATEGY`: non-empty, unique across workers.",
+        "- `ROLE`: proven_compound | structural_alt | aggressive_compound | novel_orthogonal.",
+        "- `PRIMARY_FAMILY`: A-F — which transform family this worker leads with.",
+        "- `APPROACH`: 2-3 sentences: structural idea, which gap it closes, which goal it serves.",
+        "- `TARGET_QUERY_MAP`: new query map showing restructured data flow with monotonically decreasing rowcounts.",
+        "- `NODE_CONTRACTS`: every node has FROM, OUTPUT, CONSUMERS.",
+        "- `EXAMPLES`: 1-3 IDs from §VII.B. `EXAMPLE_ADAPTATION`: what to adapt/ignore per example.",
+        "- `HAZARD_FLAGS`: query-specific risks, not generic cautions.",
+        "",
+    ])
+    if is_discovery_mode:
+        lines.extend([
             "### EXPLORATION FIELDS (all workers in discovery mode)",
-            "- All workers include `CONSTRAINT_OVERRIDE`, `EXPLORATION_TYPE`, `HYPOTHESIS_TAG`.",
-            "- All workers include `HYPOTHESIS`, `EVIDENCE`, `EXPECTED_MECHANISM`, `CONTROL_SIGNAL`.",
+            "- All workers include `EXPLORATION_TYPE`, `HYPOTHESIS_TAG`.",
         ])
     else:
         lines.extend([
             "### WORKER 4 EXPLORATION FIELDS",
-            "- Includes `CONSTRAINT_OVERRIDE`, `OVERRIDE_REASONING`, `EXPLORATION_TYPE`, and `HYPOTHESIS_TAG`.",
+            "- Includes `EXPLORATION_TYPE`, `HYPOTHESIS_TAG`, `UNCOVERED_FAMILY`.",
         ])
     return "\n".join(lines)
 
 
-def build_expert_section_checklist() -> str:
-    """Checklist for single-worker expert mode."""
+def build_oneshot_checklist() -> str:
+    """Checklist for oneshot mode."""
     return "\n".join([
         "## Section Validation Checklist (MUST pass before final output)",
         "",
         "### SHARED BRIEFING",
-        "- `SEMANTIC_CONTRACT`: 30-250 tokens covering business intent, JOIN semantics, aggregation trap, filter dependency.",
-        "- `BOTTLENECK_DIAGNOSIS`: dominant mechanism, bound type (`scan-bound`/`join-bound`/`aggregation-bound`), what optimizer already handles.",
-        "- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs + 0-3 engine gap or hypothesis IDs with EXPLAIN evidence.",
-        "- `REGRESSION_WARNINGS`: `None applicable.` or entries with `CAUSE:` and `RULE:`.",
+        "- `SEMANTIC_CONTRACT`: 80-150 tokens.",
+        "- `OPTIMAL_PATH`: deduced ideal join order.",
+        "- `CURRENT_PLAN_GAP`: at least one divergence.",
+        "- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs.",
+        "- `REGRESSION_WARNINGS`: `None applicable.` or entries with CAUSE/RULE.",
         "",
-        "### WORKER 1 BRIEFING",
-        "- `STRATEGY`: non-empty, describes the best single strategy.",
-        "- `TARGET_LOGICAL_TREE`: explicit node chain. `NODE_CONTRACTS`: every node has FROM, OUTPUT, CONSUMERS.",
-        "- `EXAMPLES`: 1-3 IDs. `EXAMPLE_ADAPTATION`: what to adapt/ignore per example.",
-        "- `HAZARD_FLAGS`: query-specific risks, not generic cautions.",
-    ])
-
-
-def build_oneshot_section_checklist() -> str:
-    """Checklist for one-shot mode (analysis + SQL output)."""
-    return "\n".join([
-        "## Section Validation Checklist (MUST pass before final output)",
-        "",
-        "### SHARED BRIEFING",
-        "- `SEMANTIC_CONTRACT`: 30-250 tokens covering business intent, JOIN semantics, aggregation trap, filter dependency.",
-        "- `BOTTLENECK_DIAGNOSIS`: dominant mechanism, bound type (`scan-bound`/`join-bound`/`aggregation-bound`), what optimizer already handles.",
-        "- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs + 0-3 engine gap or hypothesis IDs with EXPLAIN evidence.",
-        "- `REGRESSION_WARNINGS`: `None applicable.` or entries with `CAUSE:` and `RULE:`.",
-        "",
-        "### REWRITE",
-        "- Modified Logic Tree with change markers ([+]/[-]/[~]/[=]).",
-        "- Component Payload JSON: `spec_version`, `statements`, `rewrite_rules`.",
-        "- Each component has complete, executable `sql` (no ellipsis).",
-        "- `reconstruction_order` in dependency order. `interfaces.outputs` matches SELECT columns.",
-        "- `main_query` output columns match original exactly (names + order). All literals preserved.",
-        "- Semantically equivalent to the original query.",
+        "### OPTIMIZED SQL",
+        "- `STRATEGY` and `TRANSFORM` specified.",
+        "- SQL enclosed in ```sql code block.",
+        "- Semantically equivalent to original.",
     ])
 
 
@@ -91,33 +116,31 @@ def build_worker_rewrite_checklist() -> str:
     return "\n".join([
         "## Rewrite Checklist (must pass before final SQL)",
         "",
-        "- Follow every node in `TARGET_LOGICAL_TREE` and produce each `NODE_CONTRACT` output column exactly.",
-        "- Keep all semantic invariants from `Semantic Contract` and `Constraints` (including join/null behavior).",
+        "- Follow every node in `TARGET_QUERY_MAP` and produce each `NODE_CONTRACT` output column exactly.",
+        "- Keep all semantic invariants from `Semantic Contract` and `Constraints`.",
         "- Preserve all literals and the exact final output schema/order.",
-        "- Apply `Hazard Flags` and `Regression Warnings` as hard guards against known failure modes.",
-    ])
-
-
-def build_sniper_rewrite_checklist() -> str:
-    """Checklist the sniper uses before returning SQL (no TARGET_LOGICAL_TREE reference)."""
-    return "\n".join([
-        "## Rewrite Checklist (must pass before final SQL)",
-        "",
-        "- Verify output schema matches the Column Completeness Contract (same columns, same names, same order).",
-        "- Keep all semantic invariants from `Correctness Invariants` (including join/null behavior).",
-        "- Verify aggregation equivalence: same rows participate in each group, same aggregate semantics.",
-        "- Preserve all literals exactly (numbers, strings, date values).",
-        "- Apply `Hazard Flags` as hard guards against known failure modes.",
+        "- Apply `Hazard Flags` and `Regression Warnings` as hard guards.",
+        "- Verify your rewrite addresses the CURRENT_PLAN_GAP divergences.",
     ])
 
 
 def validate_parsed_briefing(
     briefing: Any,
     expected_workers: int = 4,
+    lenient: bool = False,
 ) -> List[str]:
-    """Validate that a parsed analyst briefing is correctly populated.
+    """Validate a parsed analyst briefing.
 
-    Returns a list of human-readable issues. Empty list means it passed checks.
+    Returns list of issues. Empty = passed.
+
+    Args:
+        lenient: If True (used after retry), tolerate 1 missing correctness ID
+            in the ACTIVE_CONSTRAINTS briefing reminder section. Workers still
+            receive the actual correctness gates from the shared prefix's
+            CORRECTNESS GATES section (§V), which includes all required gates
+            regardless of what's in the briefing reminder. One missing ID from
+            the briefing reminder is non-fatal because the gates are still
+            enforced at execution time.
     """
     if expected_workers < 1:
         raise ValueError("expected_workers must be >= 1")
@@ -129,9 +152,9 @@ def validate_parsed_briefing(
     if shared is None:
         return ["Missing shared briefing section."]
 
-    issues.extend(_validate_shared(shared))
+    issues.extend(_validate_shared(shared, expected_workers, lenient=lenient))
 
-    # Mode-aware worker filtering: expert mode expects 1 worker, swarm expects 4.
+    # Worker validation
     relevant_workers = []
     for w in workers:
         wid = int(getattr(w, "worker_id", 0) or 0)
@@ -139,7 +162,6 @@ def validate_parsed_briefing(
             relevant_workers.append(w)
 
     seen_strategies: Dict[str, int] = {}
-    seen_examples: Dict[str, int] = {}
     worker_ids = {int(getattr(w, "worker_id", 0) or 0) for w in relevant_workers}
     for wid in range(1, expected_workers + 1):
         if wid not in worker_ids:
@@ -147,88 +169,149 @@ def validate_parsed_briefing(
 
     for worker in relevant_workers:
         wid = int(getattr(worker, "worker_id", 0) or 0)
-        strategy = (getattr(worker, "strategy", "") or "").strip()
-        if not strategy or strategy == f"strategy_{wid}":
-            issues.append(f"WORKER_{wid}: STRATEGY missing or placeholder.")
-        elif strategy in seen_strategies:
-            issues.append(
-                f"WORKER_{wid}: STRATEGY duplicates WORKER_{seen_strategies[strategy]}."
-            )
-        else:
-            seen_strategies[strategy] = wid
-
-        examples = [e.strip() for e in (getattr(worker, "examples", []) or []) if e and e.strip()]
-        if not examples:
-            issues.append(f"WORKER_{wid}: EXAMPLES missing.")
-        if len(examples) > 3:
-            issues.append(f"WORKER_{wid}: EXAMPLES has more than 3 IDs.")
-        for ex in examples:
-            seen_examples.setdefault(ex, wid)
-
-        if not (getattr(worker, "example_adaptation", "") or "").strip():
-            issues.append(f"WORKER_{wid}: EXAMPLE_ADAPTATION missing.")
-        if not (getattr(worker, "hazard_flags", "") or "").strip():
-            issues.append(f"WORKER_{wid}: HAZARD_FLAGS missing.")
-
-        target_logical_tree = (getattr(worker, "target_logical_tree", "") or "").strip()
-        if not target_logical_tree:
-            issues.append(f"WORKER_{wid}: TARGET_LOGICAL_TREE/NODE_CONTRACTS missing.")
+        issues.extend(_validate_worker(worker, wid, seen_strategies))
 
     return issues
 
 
-def _validate_shared(shared: Any) -> List[str]:
+def _validate_shared(shared: Any, expected_workers: int, *, lenient: bool = False) -> List[str]:
+    """Validate shared briefing fields."""
     issues: List[str] = []
 
-    semantic_contract = (getattr(shared, "semantic_contract", "") or "").strip()
-    if not semantic_contract:
+    # SEMANTIC_CONTRACT
+    sc = (getattr(shared, "semantic_contract", "") or "").strip()
+    if not sc:
         issues.append("SHARED: SEMANTIC_CONTRACT missing.")
     else:
-        token_count = len(semantic_contract.split())
+        token_count = len(sc.split())
         if token_count < 30 or token_count > 250:
             issues.append(
                 f"SHARED: SEMANTIC_CONTRACT token count {token_count} (expected 30-250)."
             )
 
-    bottleneck = (getattr(shared, "bottleneck_diagnosis", "") or "").strip()
-    if not bottleneck:
-        issues.append("SHARED: BOTTLENECK_DIAGNOSIS missing.")
-    else:
-        low = bottleneck.lower()
-        if not re.search(r'\b\w+-bound\b', low):
-            issues.append(
-                "SHARED: BOTTLENECK_DIAGNOSIS missing bound classification "
-                "(`scan-bound`/`join-bound`/`aggregation-bound`)."
-            )
-        if "optimizer" not in low:
-            issues.append("SHARED: BOTTLENECK_DIAGNOSIS should mention optimizer overlap.")
+    # OPTIMAL_PATH (was BOTTLENECK_DIAGNOSIS)
+    op = (getattr(shared, "optimal_path", "") or "").strip()
+    # Backwards-compat: also check old alias
+    if not op:
+        op = (getattr(shared, "bottleneck_diagnosis", "") or "").strip()
+    if not op:
+        issues.append("SHARED: OPTIMAL_PATH missing.")
 
-    active_constraints = (getattr(shared, "active_constraints", "") or "").strip()
-    if not active_constraints:
+    # CURRENT_PLAN_GAP (was GOAL_VIOLATIONS)
+    cpg = (getattr(shared, "current_plan_gap", "") or "").strip()
+    # Backwards-compat: also check old alias
+    if not cpg:
+        cpg = (getattr(shared, "goal_violations", "") or "").strip()
+    if not cpg:
+        issues.append("SHARED: CURRENT_PLAN_GAP missing.")
+
+    # ACTIVE_CONSTRAINTS
+    ac = (getattr(shared, "active_constraints", "") or "").strip()
+    if not ac:
         issues.append("SHARED: ACTIVE_CONSTRAINTS missing.")
     else:
-        ids = re.findall(r"-\s*([A-Z][A-Z0-9_]+)\s*:", active_constraints)
+        ids = re.findall(r"-\s*([A-Z][A-Z0-9_]+)\s*:", ac)
         id_set = set(ids)
-        missing_correctness = [cid for cid in REQUIRED_CORRECTNESS_IDS if cid not in id_set]
-        if len(missing_correctness) > 2:
-            # Hard-fail only if more than 2 correctness IDs are missing
-            for cid in missing_correctness:
-                issues.append(f"SHARED: ACTIVE_CONSTRAINTS missing {cid}.")
+        missing = [cid for cid in REQUIRED_CORRECTNESS_IDS if cid not in id_set]
+        if missing:
+            if lenient and len(missing) <= 1:
+                # Post-retry leniency: 1 missing correctness ID is a warning,
+                # not a hard error. Workers still receive all constraints from
+                # §V CORRECTNESS GATES in the shared worker prefix.
+                logger.warning(
+                    "ACTIVE_CONSTRAINTS missing %s (lenient: continuing)",
+                    ", ".join(missing),
+                )
+            else:
+                for cid in missing:
+                    issues.append(f"SHARED: ACTIVE_CONSTRAINTS missing {cid}.")
         gap_ids = [cid for cid in ids if cid not in REQUIRED_CORRECTNESS_IDS]
         if len(gap_ids) > 3:
             issues.append(
-                "SHARED: ACTIVE_CONSTRAINTS has too many gap/hypothesis IDs "
-                f"({len(gap_ids)}). Expected 0-3 engine gaps or hypothesis IDs."
+                f"SHARED: ACTIVE_CONSTRAINTS has too many gap IDs ({len(gap_ids)})."
             )
 
-    regression = (getattr(shared, "regression_warnings", "") or "").strip()
-    if not regression:
+    # REGRESSION_WARNINGS
+    rw = (getattr(shared, "regression_warnings", "") or "").strip()
+    if not rw:
         issues.append("SHARED: REGRESSION_WARNINGS missing.")
     else:
-        if regression.lower() != "none applicable.":
-            if "CAUSE:" not in regression or "RULE:" not in regression:
+        if rw.lower() != "none applicable.":
+            if "CAUSE:" not in rw or "RULE:" not in rw:
                 issues.append(
-                    "SHARED: REGRESSION_WARNINGS entries must include both CAUSE and RULE."
+                    "SHARED: REGRESSION_WARNINGS entries must include CAUSE and RULE."
                 )
+
+    # DIVERSITY_MAP (swarm only)
+    if expected_workers > 1:
+        dm = (getattr(shared, "diversity_map", "") or "").strip()
+        if not dm:
+            issues.append("SHARED: DIVERSITY_MAP missing.")
+
+    return issues
+
+
+def _validate_worker(worker: Any, wid: int, seen_strategies: Dict[str, int]) -> List[str]:
+    """Validate a single worker's briefing fields."""
+    issues: List[str] = []
+
+    # STRATEGY
+    strategy = (getattr(worker, "strategy", "") or "").strip()
+    if not strategy or strategy == f"strategy_{wid}":
+        issues.append(f"WORKER_{wid}: STRATEGY missing or placeholder.")
+    elif strategy in seen_strategies:
+        issues.append(
+            f"WORKER_{wid}: STRATEGY duplicates WORKER_{seen_strategies[strategy]}."
+        )
+    else:
+        seen_strategies[strategy] = wid
+
+    # ROLE (machine-readable family assignment)
+    role = (getattr(worker, "role", "") or "").strip().lower()
+    if not role:
+        issues.append(f"WORKER_{wid}: ROLE missing.")
+    elif role not in VALID_ROLES:
+        issues.append(
+            f"WORKER_{wid}: ROLE '{role}' must be one of: {', '.join(VALID_ROLES)}."
+        )
+
+    # PRIMARY_FAMILY (machine-readable optimization family A-F)
+    primary_family = (getattr(worker, "primary_family", "") or "").strip().upper()
+    if not primary_family:
+        issues.append(f"WORKER_{wid}: PRIMARY_FAMILY missing.")
+    elif primary_family not in VALID_FAMILIES:
+        issues.append(
+            f"WORKER_{wid}: PRIMARY_FAMILY '{primary_family}' must be one of: {', '.join(VALID_FAMILIES)}."
+        )
+
+    # APPROACH (new — structural idea, gap, goal)
+    approach = (getattr(worker, "approach", "") or "").strip()
+    if not approach:
+        issues.append(f"WORKER_{wid}: APPROACH missing.")
+
+    # TARGET_QUERY_MAP + NODE_CONTRACTS (replaces TARGET_LOGICAL_TREE)
+    tqm = (getattr(worker, "target_query_map", "") or "").strip()
+    nc = (getattr(worker, "node_contracts", "") or "").strip()
+    # Also check backwards-compat alias
+    tlt = (getattr(worker, "target_logical_tree", "") or "").strip()
+    if not tqm and not tlt:
+        issues.append(f"WORKER_{wid}: TARGET_QUERY_MAP missing.")
+    if not nc and not tlt:
+        issues.append(f"WORKER_{wid}: NODE_CONTRACTS missing.")
+
+    # EXAMPLES
+    examples = [e.strip() for e in (getattr(worker, "examples", []) or []) if e and e.strip()]
+    if not examples:
+        issues.append(f"WORKER_{wid}: EXAMPLES missing.")
+    if len(examples) > 3:
+        issues.append(f"WORKER_{wid}: EXAMPLES has more than 3 IDs.")
+
+    # EXAMPLE_ADAPTATION
+    if not (getattr(worker, "example_adaptation", "") or "").strip():
+        issues.append(f"WORKER_{wid}: EXAMPLE_ADAPTATION missing.")
+
+    # HAZARD_FLAGS
+    if not (getattr(worker, "hazard_flags", "") or "").strip():
+        issues.append(f"WORKER_{wid}: HAZARD_FLAGS missing.")
 
     return issues

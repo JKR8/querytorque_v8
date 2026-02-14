@@ -1,15 +1,15 @@
-"""Worker prompt builder — focused SQL generator from analyst briefing.
+"""Worker prompt builder — SQL generator from analyst briefing.
 
-Workers receive a precise specification from the analyst briefing:
-  [1] Role + dialect (short, mechanical — worker follows the logical tree)
-  [2] SEMANTIC CONTRACT (primacy — frames what MUST be preserved)
-  [3] TARGET LOGICAL TREE + NODE CONTRACTS (what to produce — the blueprint)
-  [4] HAZARD FLAGS (what to avoid — before they start writing)
-  [4b] REGRESSION WARNINGS (observed failures on similar queries)
-  [5] ACTIVE CONSTRAINTS (rules that apply — analyst-filtered 3-6)
-  [6] REASONED EXAMPLES + before/after SQL (pattern material)
-  [7] ORIGINAL SQL (source reference)
-  [8] COLUMN COMPLETENESS CONTRACT (recency — final check)
+Workers receive a precise specification:
+  [1] Role + dialect + assignment metadata
+  [2] SEMANTIC CONTRACT (primacy — what MUST be preserved)
+  [3] CURRENT PLAN GAP (what divergences to fix)
+  [4] APPROACH + TARGET QUERY MAP + NODE CONTRACTS (blueprint)
+  [5] HAZARD FLAGS + REGRESSION WARNINGS (what to avoid)
+  [6] ACTIVE CONSTRAINTS (analyst-filtered rules)
+  [7] EXAMPLE ADAPTATION + before/after SQL
+  [8] ORIGINAL SQL
+  [9] COLUMN COMPLETENESS CONTRACT + OUTPUT FORMAT (recency)
 """
 
 from __future__ import annotations
@@ -23,38 +23,33 @@ logger = logging.getLogger(__name__)
 
 
 def build_worker_prompt(
-    worker_briefing: Any,  # BriefingWorker dataclass
-    shared_briefing: Any,  # BriefingShared dataclass
+    worker_briefing: Any,  # BriefingWorker
+    shared_briefing: Any,  # BriefingShared
     examples: List[Dict[str, Any]],
     original_sql: str,
     output_columns: List[str],
     dialect: str = "duckdb",
     engine_version: Optional[str] = None,
     original_logic_tree: Optional[str] = None,
-    resource_envelope: Optional[str] = None,  # deprecated, ignored
 ) -> str:
     """Build a worker prompt from analyst briefing sections.
 
-    This prompt is attention-optimized: understanding before material,
-    constraints before freedom.
-
     Args:
-        worker_briefing: This worker's assignment from ParsedBriefing
-        shared_briefing: Shared analysis from ParsedBriefing
+        worker_briefing: This worker's BriefingWorker assignment
+        shared_briefing: Shared briefing sections
         examples: Loaded gold examples (full before/after SQL)
         original_sql: The original SQL query
         output_columns: Expected output columns for completeness contract
         dialect: SQL dialect
-        engine_version: Engine version string (e.g., '1.4.3')
-        original_logic_tree: Pre-built Logic Tree text (DAP format, all [=] markers)
-        resource_envelope: Deprecated, ignored. Config tuning moved to config_boost phase.
+        engine_version: Engine version string
+        original_logic_tree: Pre-built Logic Tree text
 
     Returns:
         Complete worker prompt string
     """
     sections: list[str] = []
 
-    # ── [1] Role + dialect + output format ───────────────────────────────
+    # ── [1] Role + dialect ──────────────────────────────────────────
     engine_names = {
         "duckdb": "DuckDB",
         "postgres": "PostgreSQL",
@@ -64,77 +59,115 @@ def build_worker_prompt(
     engine = engine_names.get(dialect, dialect)
     ver = f" v{engine_version}" if engine_version else ""
 
-    sections.append(
-        f"You are a SQL rewrite engine for {engine}{ver}. "
-        f"Follow the Target Logical Tree structure below. Your job is to write correct, "
-        f"executable SQL for each node — not to decide whether to restructure. "
-        f"Preserve exact semantic equivalence (same rows, same columns, same ordering). "
-        f"Preserve defensive guards: if the original uses CASE WHEN x > 0 THEN y/x END "
-        f"around a division, keep it — even when a WHERE clause makes the zero case "
-        f"unreachable. Guards prevent silent breakage if filters change upstream. "
-        f"Strip benchmark comments (-- start query, -- end query) from your output."
-    )
+    role_parts = [
+        f"You are a SQL rewrite engine for {engine}{ver}.",
+        "Follow the Target Query Map structure below.",
+        "Write correct, executable SQL for each node.",
+        "Preserve exact semantic equivalence (same rows, same columns, same ordering).",
+    ]
 
-    # Engine-specific compact hints
-    if dialect == "duckdb":
-        sections.append(
-            "DuckDB specifics: columnar storage (SELECT only needed columns). "
-            "CTEs referenced once are typically inlined; CTEs referenced multiple "
-            "times may be materialized. FILTER clause is native "
-            "(`COUNT(*) FILTER (WHERE cond)`). Predicate pushdown stops at "
-            "UNION ALL boundaries and multi-level CTE references."
-        )
+    # Worker metadata header
+    approach = getattr(worker_briefing, "approach", "")
+    strategy = getattr(worker_briefing, "strategy", "")
 
-    # ── [2] SEMANTIC CONTRACT ────────────────────────────────────────────
+    meta_parts = []
+    if strategy:
+        meta_parts.append(f"Strategy: {strategy}")
+    if approach:
+        meta_parts.append(f"Approach: {approach}")
+
+    if meta_parts:
+        role_parts.append(f"\n**Assignment:** {' | '.join(meta_parts)}")
+
+    sections.append(" ".join(role_parts[:4]) + ("\n" + role_parts[4] if len(role_parts) > 4 else ""))
+
+    # ── [2] SEMANTIC CONTRACT ────────────────────────────────────────
     if shared_briefing.semantic_contract:
         sections.append(
             "## Semantic Contract (MUST preserve)\n\n"
             + shared_briefing.semantic_contract
         )
 
-    # ── [3] TARGET LOGICAL TREE + NODE CONTRACTS ─────────────────────────
-    if worker_briefing.target_logical_tree:
+    # ── [3] CURRENT PLAN GAP ────────────────────────────────────────
+    # Use new field first, fall back to backwards-compat alias
+    plan_gap = getattr(shared_briefing, "current_plan_gap", "") or ""
+    if not plan_gap:
+        plan_gap = getattr(shared_briefing, "goal_violations", "") or ""
+    if plan_gap:
         sections.append(
-            "## Target Logical Tree + Node Contracts\n\n"
+            "## Current Plan Gap (what to fix)\n\n"
+            + plan_gap
+        )
+
+    # ── [4] APPROACH + TARGET QUERY MAP + NODE CONTRACTS ───────────
+    # Approach: the structural idea
+    if approach:
+        sections.append(
+            "## Approach\n\n"
+            + approach
+        )
+
+    # Target Query Map: the new restructured data flow
+    target_map = getattr(worker_briefing, "target_query_map", "") or ""
+    node_contracts = getattr(worker_briefing, "node_contracts", "") or ""
+    # Fall back to backwards-compat target_logical_tree
+    target_tree = getattr(worker_briefing, "target_logical_tree", "") or ""
+
+    if target_map or node_contracts:
+        tree_text = ""
+        if target_map:
+            tree_text += f"TARGET_QUERY_MAP:\n{target_map}"
+        if node_contracts:
+            if tree_text:
+                tree_text += "\n\n"
+            tree_text += f"NODE_CONTRACTS:\n{node_contracts}"
+        sections.append(
+            "## Target Query Map + Node Contracts\n\n"
             "Build your rewrite following this CTE structure. Each node's "
             "OUTPUT list is exhaustive — your SQL must produce exactly those "
             "columns.\n\n"
-            + worker_briefing.target_logical_tree
+            + tree_text
+        )
+    elif target_tree:
+        sections.append(
+            "## Target Query Map + Node Contracts\n\n"
+            "Build your rewrite following this CTE structure. Each node's "
+            "OUTPUT list is exhaustive — your SQL must produce exactly those "
+            "columns.\n\n"
+            + target_tree
         )
 
-    # ── [4] HAZARD FLAGS ─────────────────────────────────────────────────
+    # ── [5] HAZARD FLAGS + REGRESSION WARNINGS ──────────────────────
     if worker_briefing.hazard_flags:
         sections.append(
             "## Hazard Flags (avoid these specific risks)\n\n"
             + worker_briefing.hazard_flags
         )
 
-    # ── [4b] REGRESSION WARNINGS ──────────────────────────────────────────
     if shared_briefing.regression_warnings:
         sections.append(
             "## Regression Warnings (observed failures on similar queries)\n\n"
             + shared_briefing.regression_warnings
         )
 
-    # ── [5] ACTIVE CONSTRAINTS ───────────────────────────────────────────
+    # ── [6] ACTIVE CONSTRAINTS ───────────────────────────────────────
     if shared_briefing.active_constraints:
         sections.append(
             "## Constraints (analyst-filtered for this query)\n\n"
             + shared_briefing.active_constraints
         )
 
-    # ── [6] EXAMPLE ADAPTATION ─────────────────────────────────────────
+    # ── [7] EXAMPLE ADAPTATION + EXAMPLES ─────────────────────────
     if worker_briefing.example_adaptation:
         sections.append(
             "## Example Adaptation Notes\n\n"
-            "For each example: what to apply to your rewrite, and what to ignore.\n\n"
             + worker_briefing.example_adaptation
         )
 
     if examples:
         sections.append(_section_examples(examples))
 
-    # ── [7] ORIGINAL SQL ─────────────────────────────────────────────────
+    # ── [8] ORIGINAL SQL ─────────────────────────────────────────────
     sections.append(
         "## Original SQL\n\n"
         "```sql\n"
@@ -142,20 +175,17 @@ def build_worker_prompt(
         "```"
     )
 
+    # Rewrite checklist
     sections.append(build_worker_rewrite_checklist())
 
-    # ── [8] COLUMN COMPLETENESS CONTRACT + OUTPUT FORMAT ─────────────────
-    sections.append(_section_output_format(output_columns, original_logic_tree, dialect=dialect))
+    # ── [9] COLUMN COMPLETENESS CONTRACT + OUTPUT FORMAT ─────────────
+    sections.append(_section_output_format(output_columns, original_logic_tree, dialect))
 
     return "\n\n".join(sections)
 
 
 def _section_examples(examples: List[Dict[str, Any]]) -> str:
-    """Format reference examples with before/after SQL pairs.
-
-    Reuses the same format as prompter._section_examples() for
-    consistency, but without the generic preamble.
-    """
+    """Format reference examples with before/after SQL pairs."""
     lines = [
         "## Reference Examples",
         "",
@@ -176,12 +206,10 @@ def _section_examples(examples: List[Dict[str, Any]]) -> str:
 
         ex = example.get("example", example)
 
-        # Principle
         principle = example.get("principle", "")
         if principle:
             lines.append(f"\n**Principle:** {principle}")
 
-        # BEFORE (slow)
         before_sql = (
             example.get("original_sql")
             or ex.get("before_sql")
@@ -196,7 +224,6 @@ def _section_examples(examples: List[Dict[str, Any]]) -> str:
             lines.append("**BEFORE (slow):**")
             lines.append(f"```sql\n{before_sql}\n```")
 
-        # AFTER (fast)
         output = ex.get("output", example.get("output", {}))
         rewrite_sets = output.get("rewrite_sets", [])
         if rewrite_sets and rewrite_sets[0].get("nodes"):
@@ -217,22 +244,13 @@ def _section_examples(examples: List[Dict[str, Any]]) -> str:
 
 
 def _section_output_format(
-    output_columns: Optional[List[str]] = None,
-    original_logic_tree: Optional[str] = None,
-    dialect: str = "duckdb",
+    output_columns: Optional[List[str]],
+    original_logic_tree: Optional[str],
+    dialect: str,
 ) -> str:
-    """Output format section — DAP (Decomposed Attention Protocol).
-
-    Two-part output:
-    1. Modified Logic Tree (change markers: [+]/[-]/[~]/[=]/[!])
-    2. Component Payload JSON (per DAP spec)
-
-    When original_logic_tree is provided, it's shown as context so the LLM
-    sees the current structure in exactly the format it should output.
-    """
+    """Output format section — DAP (Decomposed Attention Protocol)."""
     lines = []
 
-    # ── Column Completeness Contract ──
     if output_columns:
         cols_str = ", ".join(f"`{c}`" for c in output_columns)
         lines.append(
@@ -241,20 +259,18 @@ def _section_output_format(
             f"{cols_str}\n"
         )
 
-    # ── Original Query Structure (Logic Tree context) ──
     if original_logic_tree:
         lines.append(
             "## Original Query Structure\n\n"
-            "Current structure (all `[=]` unchanged). Your modified tree shows what you changed.\n\n"
+            "Current structure (all `[=]` unchanged).\n\n"
             "```\n" + original_logic_tree + "\n```\n"
         )
 
-    # ── Output Format ──
     lines.append(
         "## Output Format\n\n"
         "Two parts in order:\n\n"
         "### Part 1: Modified Logic Tree\n\n"
-        "Generate BEFORE writing SQL. Markers: `[+]` new, `[-]` removed, `[~]` modified, `[=]` unchanged, `[!]` structural change.\n\n"
+        "Markers: `[+]` new, `[-]` removed, `[~]` modified, `[=]` unchanged, `[!]` structural.\n\n"
         "### Part 2: Component Payload JSON\n\n"
         "```json\n"
         '{"spec_version": "1.0", "dialect": "<dialect>",\n'
@@ -270,9 +286,9 @@ def _section_output_format(
         ' "macros": {}, "frozen_blocks": [], "validation_checks": []}\n'
         "```\n\n"
         "### Rules\n"
-        "- Tree first, then SQL. Every `sql` must be complete (no ellipsis). Frozen blocks verbatim.\n"
-        "- Only include changed/added components. Unchanged → `\"change\": \"unchanged\", \"sql\": \"\"`.\n"
-        "- `main_query` columns must match Column Completeness Contract. `reconstruction_order` in dependency order.\n\n"
+        "- Tree first, then SQL. Every `sql` must be complete (no ellipsis).\n"
+        "- Only changed/added components. Unchanged -> `\"change\": \"unchanged\", \"sql\": \"\"`.\n"
+        "- `main_query` columns must match Column Completeness Contract.\n\n"
         "After JSON:\n"
         "```\nChanges: <1-2 sentences>\nExpected speedup: <estimate>\n```\n\n"
         "Now output your Logic Tree and Component Payload JSON:"

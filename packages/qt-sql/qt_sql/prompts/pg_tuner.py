@@ -95,7 +95,7 @@ def build_pg_tuner_prompt(
     """
     # Render plan_json to text if no text plan provided
     if not explain_plan and plan_json:
-        from .v2_analyst_briefing import format_pg_explain_tree
+        from .analyst_briefing import format_pg_explain_tree
         explain_plan = format_pg_explain_tree(plan_json)
 
     if current_settings is None:
@@ -104,7 +104,7 @@ def build_pg_tuner_prompt(
 
     # ── Role ──
     lines.append(
-        "You are a PostgreSQL performance tuning expert. Your job is to "
+        "You are a PostgreSQL performance tuning specialist. Your job is to "
         "recommend SET LOCAL configuration parameters that will improve "
         "the performance of a specific SQL query."
     )

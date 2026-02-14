@@ -66,9 +66,9 @@ class OptimizeRequest(BaseModel):
     """Request body for pipeline-backed SQL optimization."""
     sql: str = Field(..., description="SQL query to optimize", min_length=1)
     dsn: str = Field(..., description="Database DSN (duckdb:///path.db or postgres://user:pass@host:port/db)")
-    mode: Literal["swarm", "expert", "oneshot"] = Field(
-        default="expert",
-        description="Optimization mode: swarm (4-worker fan-out), expert (iterative), oneshot (single call)"
+    mode: Literal["swarm", "oneshot"] = Field(
+        default="swarm",
+        description="Optimization mode: swarm (4-worker fan-out), oneshot (single call)"
     )
     query_id: Optional[str] = Field(default=None, description="Query identifier for traceability")
     session_id: Optional[str] = Field(default=None, description="Database session ID — required for DuckDB uploaded fixtures")
@@ -142,7 +142,7 @@ async def optimize_sql(request: OptimizeRequest):
 
     - **sql**: The SQL query to optimize
     - **dsn**: Database connection string (DuckDB or PostgreSQL)
-    - **mode**: swarm (4 workers), expert (iterative), or oneshot (single call)
+    - **mode**: swarm (4 workers) or oneshot (single call)
     - **query_id**: Optional identifier for traceability
     """
     try:
@@ -156,7 +156,6 @@ async def optimize_sql(request: OptimizeRequest):
 
     mode_map = {
         "swarm": OptimizationMode.SWARM,
-        "expert": OptimizationMode.EXPERT,
         "oneshot": OptimizationMode.ONESHOT,
     }
     mode = mode_map[request.mode]

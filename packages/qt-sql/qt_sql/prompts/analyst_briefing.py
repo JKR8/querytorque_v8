@@ -1,72 +1,23 @@
-"""V2 analyst prompt builder — analyst as interpreter, not router.
+"""Analyst prompt builder — §I–§VII investigation-method template.
 
-Two-layer architecture:
-  Layer 1: Engine gap profiles (offensive hunting guide — what optimizer gaps to exploit)
-  Layer 2: Correctness constraints (defensive validation gates — 4 non-negotiable rules)
+Clean rewrite: investigation-method framing with 6 goals embedded in mission,
+engine-specific profiles, 5-step investigation + worker diversity, reference
+appendix with documented cases and regression registry.
 
-The V2 analyst produces a structured briefing:
-  Shared (all workers):
-    1. SEMANTIC_CONTRACT — business intent, invariants, aggregation traps
-    2. BOTTLENECK_DIAGNOSIS — dominant cost + mechanism + cardinality flow
-    3. ACTIVE_CONSTRAINTS — correctness gates + matched engine gaps
-    4. REGRESSION_WARNINGS — causal rules, not just "this happened"
-  Per-worker:
-    5. TARGET_LOGICAL_TREE + NODE_CONTRACTS — CTE blueprint + column contracts
-    6. EXAMPLES + EXAMPLE_ADAPTATION — what to apply/ignore per example
-    7. HAZARD_FLAGS — strategy-specific risks for this query
+Supports two modes:
+  - swarm: 4 workers, diversity map, full investigation method
+  - oneshot: analyse + produce SQL directly
 """
 
 from __future__ import annotations
 
-import json
 import logging
-from functools import lru_cache
-from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-from .briefing_checks import (
-    build_analyst_section_checklist,
-    build_expert_section_checklist,
-    build_oneshot_section_checklist,
-)
 
 logger = logging.getLogger(__name__)
 
-ALGO_DIR = Path(__file__).resolve().parent.parent / "algorithms"
 
-
-@lru_cache(maxsize=16)
-def _load_algorithm(name: str) -> Optional[str]:
-    """Load a prompt-level algorithm YAML and inject into prompt as-is."""
-    path = ALGO_DIR / f"{name}.yaml"
-    if not path.exists():
-        return None
-    return path.read_text()
-
-
-# ── EXPLAIN plan formatter ──────────────────────────────────────────────
-
-# Operators that are just internal plumbing — collapse/skip them
-_SKIP_OPERATORS = {"PROJECTION", "RESULT_COLLECTOR", "COLUMN_DATA_SCAN"}
-
-# Extra-info keys worth showing per operator type
-_EXTRA_INFO_KEYS = {
-    "SEQ_SCAN": ["Table", "Filters"],
-    "INDEX_SCAN": ["Table", "Index", "Filters"],
-    "HASH_JOIN": ["Join Type", "Conditions"],
-    "CROSS_PRODUCT": [],
-    "PIECEWISE_MERGE_JOIN": ["Join Type", "Conditions"],
-    "NESTED_LOOP_JOIN": ["Join Type", "Conditions"],
-    "HASH_GROUP_BY": ["Aggregates"],
-    "PERFECT_HASH_GROUP_BY": ["Aggregates"],
-    "UNGROUPED_AGGREGATE": ["Aggregates"],
-    "STREAMING_WINDOW": ["Partitions", "Orders"],
-    "FILTER": ["Expression"],
-    "TOP_N": ["Top", "Order By"],
-    "ORDER_BY": ["Orders"],
-    "LIMIT": ["Value"],
-}
-
+# ── Helpers ─────────────────────────────────────────────────────────────
 
 def _fmt_count(n: int) -> str:
     """Format a number compactly: 1234 -> 1,234; 2500000 -> 2.5M."""
@@ -81,172 +32,86 @@ def _fmt_count(n: int) -> str:
     return str(n)
 
 
-def _fmt_extra_value(key: str, val: Any) -> str:
-    """Format an extra_info value to a compact string."""
-    if isinstance(val, list):
-        items = [str(v) for v in val[:4]]
-        s = ", ".join(items)
-        if len(val) > 4:
-            s += f" (+{len(val) - 4} more)"
-        return s
-    return str(val)
+def _strip_template_comments(sql: str) -> str:
+    """Strip TPC-DS/DSB template comments from SQL."""
+    import re
+    lines = sql.split("\n")
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^--\s*(start|end)\s+query\s+\d+", stripped, re.IGNORECASE):
+            continue
+        if not cleaned and stripped == "--":
+            continue
+        cleaned.append(line)
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    return "\n".join(cleaned)
 
 
-def _collect_total_timing(node: dict) -> float:
-    """Sum all operator_timing values in the tree (exclusive/self-time)."""
-    total = node.get("operator_timing", 0) or 0
-    for child in node.get("children", []):
-        total += _collect_total_timing(child)
-    return total
+def _add_line_numbers(sql: str) -> str:
+    """Add line numbers to SQL for analyst reference."""
+    lines = sql.split("\n")
+    width = len(str(len(lines)))
+    return "\n".join(f"{i+1:>{width}} | {line}" for i, line in enumerate(lines))
 
 
-def _render_node(
-    node: dict,
-    depth: int,
-    total_time: float,
-    lines: list[str],
-    max_depth: int = 30,
-) -> None:
-    """Recursively render a plan node as an indented ASCII line."""
-    if depth > max_depth:
-        return
-
-    name = node.get("operator_name", "")
-    timing = node.get("operator_timing", 0) or 0
-    card = node.get("operator_cardinality", 0) or 0
-    scanned = node.get("operator_rows_scanned", 0) or 0
-    extra = node.get("extra_info", {}) or {}
-    children = node.get("children", [])
-
-    # Skip noise operators — just recurse into their children
-    if name in _SKIP_OPERATORS or not name:
-        for child in children:
-            _render_node(child, depth, total_time, lines, max_depth)
-        return
-
-    # Build the line
-    indent = "  " * depth
-    timing_ms = timing * 1000
-    pct = (timing / total_time * 100) if total_time > 0 else 0
-
-    # Cardinality + timing
-    if timing_ms >= 0.1:
-        if pct >= 1.0:
-            stats = f"[{_fmt_count(card)} rows, {timing_ms:.1f}ms, {pct:.0f}%]"
-        else:
-            stats = f"[{_fmt_count(card)} rows, {timing_ms:.1f}ms]"
-    else:
-        stats = f"[{_fmt_count(card)} rows]"
-
-    # Special handling for SEQ_SCAN: show table name and scan ratio
-    if "SCAN" in name and extra.get("Table"):
-        table = extra["Table"]
-        if scanned > 0 and scanned != card:
-            stats = f"{table} [{_fmt_count(card)} of {_fmt_count(scanned)} rows"
-        else:
-            stats = f"{table} [{_fmt_count(card)} rows"
-        if timing_ms >= 0.1:
-            if pct >= 1.0:
-                stats += f", {timing_ms:.1f}ms, {pct:.0f}%]"
-            else:
-                stats += f", {timing_ms:.1f}ms]"
-        else:
-            stats += "]"
-        # Show filters inline for scans
-        filters = extra.get("Filters")
-        if filters:
-            fstr = _fmt_extra_value("Filters", filters)
-            if len(fstr) > 80:
-                fstr = fstr[:77] + "..."
-            stats += f"  Filters: {fstr}"
-        lines.append(f"{indent}{name} {stats}")
-    else:
-        # Join info inline
-        suffix = ""
-        if "JOIN" in name:
-            jtype = extra.get("Join Type", "")
-            conds = extra.get("Conditions", "")
-            if jtype:
-                suffix += f" {jtype}"
-            if conds:
-                cstr = _fmt_extra_value("Conditions", conds)
-                if len(cstr) > 60:
-                    cstr = cstr[:57] + "..."
-                suffix += f" on {cstr}"
-        lines.append(f"{indent}{name}{suffix} {stats}")
-
-        # Show key extra_info on next line(s) for non-join/non-scan
-        show_keys = _EXTRA_INFO_KEYS.get(name, [])
-        for key in show_keys:
-            if key in ("Join Type", "Conditions", "Table", "Filters"):
-                continue  # Already shown inline
-            val = extra.get(key)
-            if val:
-                vstr = _fmt_extra_value(key, val)
-                if len(vstr) > 100:
-                    vstr = vstr[:97] + "..."
-                lines.append(f"{indent}  {key}: {vstr}")
-
-    # Recurse
-    for child in children:
-        _render_node(child, depth + 1, total_time, lines, max_depth)
+def _detect_aggregate_functions(dag: Any, costs: Dict[str, Any]) -> List[str]:
+    """Detect aggregate functions used in the query from DAG/costs."""
+    aggs = set()
+    nodes = getattr(dag, "nodes", {}) or {}
+    for nid, node in nodes.items():
+        sql_text = getattr(node, "sql", "") or ""
+        sql_upper = sql_text.upper()
+        for fn in ("COUNT", "SUM", "MAX", "MIN", "AVG",
+                    "STDDEV_SAMP", "STDDEV", "VARIANCE", "VAR_SAMP",
+                    "PERCENTILE_CONT", "CORR", "COVAR_SAMP"):
+            if fn + "(" in sql_upper or fn + " (" in sql_upper:
+                aggs.add(fn)
+    return sorted(aggs)
 
 
-def format_duckdb_explain_tree(plan_text: str) -> str:
-    """Convert DuckDB JSON EXPLAIN plan to a readable ASCII operator tree.
+def _detect_query_features(dag: Any) -> Dict[str, bool]:
+    """Detect structural features from DAG for pruning guide."""
+    features = {
+        "has_left_join": False,
+        "has_or_predicate": False,
+        "has_group_by": False,
+        "has_window": False,
+        "has_intersect": False,
+        "has_exists": False,
+        "has_cte": False,
+        "has_correlated_subquery": False,
+    }
+    nodes = getattr(dag, "nodes", {}) or {}
+    for nid, node in nodes.items():
+        sql_text = (getattr(node, "sql", "") or "").upper()
+        flags = getattr(node, "flags", []) or []
+        if "LEFT JOIN" in sql_text or "LEFT OUTER JOIN" in sql_text:
+            features["has_left_join"] = True
+        if " OR " in sql_text:
+            features["has_or_predicate"] = True
+        if "GROUP BY" in sql_text:
+            features["has_group_by"] = True
+        if "OVER(" in sql_text or "OVER (" in sql_text:
+            features["has_window"] = True
+        if "INTERSECT" in sql_text:
+            features["has_intersect"] = True
+        if "EXISTS" in sql_text:
+            features["has_exists"] = True
+        if nid != "main_query" and getattr(node, "node_type", "") == "cte":
+            features["has_cte"] = True
+        if "CORRELATED" in " ".join(str(f) for f in flags).upper():
+            features["has_correlated_subquery"] = True
+    return features
 
-    The plan_text field in cached explain files contains a JSON string
-    (not ASCII text). This function parses it and renders a compact tree
-    showing operator name, cardinality, timing, cost%, and key metadata.
 
-    Noise operators (PROJECTION, RESULT_COLLECTOR) are collapsed.
-    Timing is shown as ms with % of total for bottleneck identification.
-
-    Args:
-        plan_text: JSON string from explains/*.json field "plan_text"
-
-    Returns:
-        Readable ASCII tree string, or the original text if not JSON.
-    """
-    # If it's not JSON, return as-is (might be pre-formatted text)
-    stripped = plan_text.strip()
-    if not stripped.startswith("{"):
-        return plan_text
-
-    try:
-        plan = json.loads(stripped)
-    except (json.JSONDecodeError, ValueError):
-        return plan_text
-
-    # Find the real root — skip wrapper and EXPLAIN_ANALYZE
-    root_nodes = []
-    for child in plan.get("children", []):
-        if child.get("operator_name") == "EXPLAIN_ANALYZE":
-            root_nodes.extend(child.get("children", []))
-        else:
-            root_nodes.append(child)
-
-    if not root_nodes:
-        root_nodes = plan.get("children", [])
-    if not root_nodes:
-        return plan_text
-
-    # Compute total timing for % calculation
-    total_time = sum(_collect_total_timing(n) for n in root_nodes)
-
-    lines: list[str] = []
-    if total_time > 0:
-        lines.append(f"Total execution time: {total_time * 1000:.0f}ms")
-        lines.append("")
-
-    for node in root_nodes:
-        _render_node(node, depth=0, total_time=total_time, lines=lines)
-
-    return "\n".join(lines)
-
+# ──────────────────────────────────────────────────────────────────────
+# PostgreSQL EXPLAIN formatting helpers (shared with swarm_snipe)
+# ──────────────────────────────────────────────────────────────────────
 
 def _render_pg_node(
-    node: dict,
+    node: Dict[str, Any],
     depth: int,
     lines: list[str],
     max_depth: int = 30,
@@ -441,95 +306,6 @@ def format_pg_explain_tree(plan_json: Any) -> str:
     return "\n".join(lines)
 
 
-def _strip_template_comments(sql: str) -> str:
-    """Strip TPC-DS/DSB template comments from SQL."""
-    import re
-    lines = sql.split("\n")
-    cleaned = []
-    for line in lines:
-        stripped = line.strip()
-        # Skip TPC-DS template markers
-        if re.match(r"^--\s*(start|end)\s+query\s+\d+", stripped, re.IGNORECASE):
-            continue
-        # Skip empty comment-only lines at start/end
-        if not cleaned and stripped == "--":
-            continue
-        cleaned.append(line)
-    # Strip trailing blank lines
-    while cleaned and not cleaned[-1].strip():
-        cleaned.pop()
-    return "\n".join(cleaned)
-
-
-def _add_line_numbers(sql: str) -> str:
-    """Add line numbers to SQL for analyst reference."""
-    lines = sql.split("\n")
-    width = len(str(len(lines)))
-    return "\n".join(f"{i+1:>{width}} | {line}" for i, line in enumerate(lines))
-
-
-def _format_constraint_for_analyst(c: Dict[str, Any]) -> str:
-    """Format a single constraint for the analyst's full view."""
-    cid = c.get("id", "?")
-    severity = c.get("severity", "MEDIUM")
-    overridable = c.get("overridable", False)
-    instruction = c.get("prompt_instruction", c.get("description", ""))
-    failures = c.get("observed_failures", [])
-    successes = c.get("observed_successes", [])
-    override_conditions = c.get("override_conditions", [])
-
-    tag = "[overridable] " if overridable else ""
-    parts = [f"**[{severity}] {tag}{cid}**: {instruction}"]
-    if failures:
-        for f in failures[:2]:
-            reg = f.get("regression", f.get("speedup"))
-            err = f.get("error", "")
-            if reg:
-                parts.append(f"  - Failure: regressed to {reg}")
-            elif err:
-                parts.append(f"  - Failure: {err}")
-    if successes:
-        for s in successes[:2]:
-            spd = str(s.get("speedup", "?")).rstrip("x")
-            ctx = s.get("context", "")
-            parts.append(f"  - Success: {spd}x — {ctx}")
-    if overridable and override_conditions:
-        parts.append("  - Override conditions (Worker 4 exploration):")
-        for oc in override_conditions:
-            parts.append(f"    * {oc}")
-    return "\n".join(parts)
-
-
-def _format_example_compact(ex: Dict[str, str]) -> str:
-    """Format a gold example compactly: id (speedup) — description."""
-    eid = ex.get("id", "?")
-    speedup = str(ex.get("speedup", "?")).rstrip("x")
-    desc = ex.get("description", "")[:80]
-    return f"- **{eid}** ({speedup}x) — {desc}"
-
-
-def _format_example_full(ex: Dict[str, Any]) -> str:
-    """Format a tag-matched example with full metadata."""
-    eid = ex.get("id", "?")
-    speedup = str(ex.get("verified_speedup", ex.get("speedup", "?"))).rstrip("x")
-    desc = ex.get("description", "")
-    principle = ex.get("principle", "")
-
-    # when_not_to_use lives inside the example sub-dict
-    example_data = ex.get("example", {})
-    when_not = example_data.get("when_not_to_use", "")
-
-    parts = [f"### {eid} ({speedup}x)"]
-    if desc:
-        parts.append(f"**Description:** {desc}")
-    if principle:
-        parts.append(f"**Principle:** {principle}")
-    if when_not:
-        parts.append(f"**When NOT to apply:** {when_not}")
-
-    return "\n".join(parts)
-
-
 def _format_regression_for_analyst(reg: Dict[str, Any]) -> str:
     """Format a regression example for the analyst's full view."""
     eid = reg.get("id", "?")
@@ -546,310 +322,302 @@ def _format_regression_for_analyst(reg: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _format_global_knowledge(gk: Dict[str, Any]) -> str:
-    """Format GlobalKnowledge principles for analyst (no anti-patterns — those
-    are covered by the Regression Examples section with real mechanisms)."""
-    lines = []
+# ──────────────────────────────────────────────────────────────────────
+# DuckDB EXPLAIN formatting
+# ──────────────────────────────────────────────────────────────────────
 
-    principles = gk.get("principles", [])
-    if principles:
-        ranked = sorted(principles, key=lambda p: p.get("avg_speedup", 0), reverse=True)
-        for p in ranked[:5]:
-            name = p.get("name", p.get("id", "?"))
-            why = p.get("why", "")
-            when = p.get("when", "")
-            avg = p.get("avg_speedup", 0)
-            win_count = len(p.get("queries", []))
-            regression_count = len(p.get("regression_queries", []))
+# Operators that are just internal plumbing — collapse/skip them
+_SKIP_OPERATORS = {"PROJECTION", "RESULT_COLLECTOR", "COLUMN_DATA_SCAN"}
 
-            header = f"**{name}** ({avg:.1f}x avg"
-            if win_count:
-                header += f", {win_count} wins"
-            if regression_count:
-                header += f", {regression_count} regressions"
-            header += ")"
-            parts = [header]
-            if why:
-                parts.append(f"  Why: {why}")
-            if when:
-                parts.append(f"  When: {when}")
-            lines.append("\n".join(parts))
+_EXTRA_INFO_KEYS = {
+    "HASH_AGGREGATE": ["Distinct Aggregates"],
+    "SIMPLE_AGGREGATE": ["Distinct Aggregates"],
+    "WINDOW": ["Function", "Order By"],
+    "HASH_JOIN": ["Hash Condition"],
+    "NESTED_LOOP_JOIN": ["Join Condition"],
+    "MERGE_JOIN": ["Merge Condition"],
+}
+
+
+def _fmt_extra_value(key: str, val: Any) -> str:
+    """Format an extra_info value for readability."""
+    if isinstance(val, list):
+        if not val:
+            return ""
+        return ", ".join(str(v) for v in val)
+    return str(val)
+
+
+def _collect_total_timing(node: Dict[str, Any]) -> float:
+    """Sum all operator_timing values in the tree (exclusive/self-time)."""
+    total = node.get("operator_timing", 0) or 0
+    for child in node.get("children", []):
+        total += _collect_total_timing(child)
+    return total
+
+
+def _render_node(
+    node: Dict[str, Any],
+    depth: int,
+    total_time: float,
+    lines: list[str],
+    max_depth: int = 30,
+) -> None:
+    """Recursively render a plan node as an indented ASCII line."""
+    if depth > max_depth:
+        return
+
+    name = node.get("operator_name", "")
+    timing = node.get("operator_timing", 0) or 0
+    card = node.get("operator_cardinality", 0) or 0
+    scanned = node.get("operator_rows_scanned", 0) or 0
+    extra = node.get("extra_info", {}) or {}
+    children = node.get("children", [])
+
+    # Skip noise operators — just recurse into their children
+    if name in _SKIP_OPERATORS or not name:
+        for child in children:
+            _render_node(child, depth, total_time, lines, max_depth)
+        return
+
+    # Build the line
+    indent = "  " * depth
+    timing_ms = timing * 1000
+    pct = (timing / total_time * 100) if total_time > 0 else 0
+
+    # Cardinality + timing
+    if timing_ms >= 0.1:
+        if pct >= 1.0:
+            stats = f"[{_fmt_count(card)} rows, {timing_ms:.1f}ms, {pct:.0f}%]"
+        else:
+            stats = f"[{_fmt_count(card)} rows, {timing_ms:.1f}ms]"
+    else:
+        stats = f"[{_fmt_count(card)} rows]"
+
+    # Special handling for SEQ_SCAN: show table name and scan ratio
+    if "SCAN" in name and extra.get("Table"):
+        table = extra["Table"]
+        if scanned > 0 and scanned != card:
+            stats = f"{table} [{_fmt_count(card)} of {_fmt_count(scanned)} rows"
+        else:
+            stats = f"{table} [{_fmt_count(card)} rows"
+        if timing_ms >= 0.1:
+            if pct >= 1.0:
+                stats += f", {timing_ms:.1f}ms, {pct:.0f}%]"
+            else:
+                stats += f", {timing_ms:.1f}ms]"
+        else:
+            stats += "]"
+        # Show filters inline for scans
+        filters = extra.get("Filters")
+        if filters:
+            fstr = _fmt_extra_value("Filters", filters)
+            if len(fstr) > 80:
+                fstr = fstr[:77] + "..."
+            stats += f"  Filters: {fstr}"
+        lines.append(f"{indent}{name} {stats}")
+    else:
+        # Join info inline
+        suffix = ""
+        if "JOIN" in name:
+            jtype = extra.get("Join Type", "")
+            conds = extra.get("Conditions", "")
+            if jtype:
+                suffix += f" {jtype}"
+            if conds:
+                cstr = _fmt_extra_value("Conditions", conds)
+                if len(cstr) > 60:
+                    cstr = cstr[:57] + "..."
+                suffix += f" on {cstr}"
+        lines.append(f"{indent}{name}{suffix} {stats}")
+
+        # Show key extra_info on next line(s) for non-join/non-scan
+        show_keys = _EXTRA_INFO_KEYS.get(name, [])
+        for key in show_keys:
+            if key in ("Join Type", "Conditions", "Table", "Filters"):
+                continue  # Already shown inline
+            val = extra.get(key)
+            if val:
+                vstr = _fmt_extra_value(key, val)
+                if len(vstr) > 100:
+                    vstr = vstr[:97] + "..."
+                lines.append(f"{indent}  {key}: {vstr}")
+
+    # Recurse
+    for child in children:
+        _render_node(child, depth + 1, total_time, lines, max_depth)
+
+
+def format_duckdb_explain_tree(plan_text: str) -> str:
+    """Convert DuckDB JSON EXPLAIN plan to a readable ASCII operator tree.
+
+    The plan_text field in cached explain files contains a JSON string
+    (not ASCII text). This function parses it and renders a compact tree
+    showing operator name, cardinality, timing, cost%, and key metadata.
+
+    Noise operators (PROJECTION, RESULT_COLLECTOR) are collapsed.
+    Timing is shown as ms with % of total for bottleneck identification.
+
+    Args:
+        plan_text: JSON string from explains/*.json field "plan_text"
+
+    Returns:
+        Readable ASCII tree string, or the original text if not JSON.
+    """
+    import json
+
+    # If it's not JSON, return as-is (might be pre-formatted text)
+    stripped = plan_text.strip()
+    if not stripped.startswith("{"):
+        return plan_text
+
+    try:
+        plan = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        return plan_text
+
+    # Find the real root — skip wrapper and EXPLAIN_ANALYZE
+    root_nodes = []
+    for child in plan.get("children", []):
+        if child.get("operator_name") == "EXPLAIN_ANALYZE":
+            root_nodes.extend(child.get("children", []))
+        else:
+            root_nodes.append(child)
+
+    if not root_nodes:
+        root_nodes = plan.get("children", [])
+    if not root_nodes:
+        return plan_text
+
+    # Compute total timing for % calculation
+    total_time = sum(_collect_total_timing(n) for n in root_nodes)
+
+    lines: list[str] = []
+    if total_time > 0:
+        lines.append(f"Total execution time: {total_time * 1000:.0f}ms")
+        lines.append("")
+
+    for node in root_nodes:
+        _render_node(node, depth=0, total_time=total_time, lines=lines)
 
     return "\n".join(lines)
 
 
-def _section_strategy_leaderboard(
-    leaderboard: Dict[str, Any],
-    archetype: str,
-) -> str:
-    """Format strategy leaderboard section for a specific archetype.
+# ═══════════════════════════════════════════════════════════════════════
+# Section Builders — each returns a string for its section
+# ═══════════════════════════════════════════════════════════════════════
 
-    Shows observed success rates per transform so the analyst can make
-    data-driven strategy selections instead of guessing.
-    """
-    lines: list[str] = []
-
-    arch_summary = leaderboard.get("archetype_summary", {}).get(archetype)
-    if not arch_summary:
-        return ""
-
-    lines.append(f"### Strategy Leaderboard (observed success rates)")
+def section_role(mode: str) -> str:
+    """§I. ROLE — senior query optimization architect + 6 principles."""
+    lines = ["## §I. ROLE", ""]
+    lines.append(
+        "You are a senior query optimization architect. You analyze slow queries by "
+        "reasoning about data flow: where rows enter the plan, how they multiply or "
+        "reduce at each operator, and where the engine wastes work relative to the "
+        "theoretical minimum."
+    )
+    lines.append("")
+    lines.append("Your diagnostic lens is six principles. Every slow query violates at least one:")
+    lines.append("")
+    lines.append("1. **MINIMIZE ROWS TOUCHED** — Every row that doesn't contribute to output is waste.")
+    lines.append("2. **SMALLEST SET FIRST** — Most selective filter applied earliest. Selectivity compounds.")
+    lines.append("3. **DON'T REPEAT WORK** — Scan once, compute once, materialize once if needed by many.")
+    lines.append("4. **SETS OVER LOOPS** — Set operations parallelize. Row-by-row re-execution doesn't.")
+    lines.append("5. **ARM THE OPTIMIZER** — Restructure so it has full intelligence. Don't force plans.")
+    lines.append("6. **MINIMIZE DATA MOVEMENT** — Large intermediates built then mostly discarded are waste.")
     lines.append("")
     lines.append(
-        f"Archetype: **{archetype}** ({arch_summary['query_count']} queries in pool, "
-        f"{arch_summary['total_attempts']} total attempts)"
-    )
-    lines.append("")
-
-    # Get transforms for this archetype
-    transforms = leaderboard.get("transform_by_archetype", {}).get(archetype, {})
-    if not transforms:
-        lines.append("*No transform data available for this archetype.*")
-        return "\n".join(lines)
-
-    # Get elimination list
-    elim = leaderboard.get("elimination_table", {}).get(archetype, {})
-    avoid_set = set(elim.get("avoid", []))
-    elim_reasons = elim.get("reason", {})
-
-    # Sort by success_rate descending, then avg_speedup
-    ranked = sorted(
-        transforms.items(),
-        key=lambda x: (-x[1]["success_rate"], -x[1]["avg_speedup_all"]),
+        "Your primary asset is a library of **gold examples** — proven before/after SQL "
+        "rewrites with measured speedups gathered from hundreds of benchmark runs. "
+        "Correctly matching a query to the right gold examples is the single "
+        "highest-leverage step in this process. Workers receive the full before/after "
+        "SQL for the examples you assign and use them as structural templates. The "
+        "diagnosis tells you what's wrong; the examples are the edge — they tell the "
+        "workers exactly how to fix it."
     )
 
-    # Filter to transforms with at least 3 attempts (enough signal)
-    ranked = [(t, d) for t, d in ranked if d["attempts"] >= 3]
-
-    if not ranked:
-        lines.append("*Insufficient data (< 3 attempts per transform).*")
-        return "\n".join(lines)
-
-    lines.append("| Transform | Attempts | Win Rate | Avg Speedup | Avoid? |")
-    lines.append("|-----------|----------|----------|-------------|--------|")
-
-    for transform, data in ranked:
-        avoid_flag = "AVOID" if transform in avoid_set else ""
-        win_pct = f"{data['success_rate']:.0%}"
-        avg_sp = f"{data['avg_speedup_all']:.2f}x"
-        lines.append(
-            f"| {transform} | {data['attempts']} | {win_pct} | {avg_sp} | {avoid_flag} |"
-        )
-
-    # Show elimination reasons if any
-    if avoid_set:
+    if mode == "swarm":
         lines.append("")
-        lines.append("**Elimination reasons:**")
-        for t in sorted(avoid_set):
-            reason = elim_reasons.get(t, "low success rate")
-            lines.append(f"- **{t}**: {reason}")
-
+        lines.append(
+            "You produce structured briefings for 4 specialist workers. Each worker "
+            "designs a new query map showing how their restructuring fixes the "
+            "identified problems, THEN writes the SQL to implement that map. They see "
+            "ONLY what you provide."
+        )
+    elif mode == "oneshot":
+        lines.append("")
+        lines.append(
+            "You analyze the query, determine the single best optimization "
+            "strategy, and produce the optimized SQL directly."
+        )
     return "\n".join(lines)
 
 
-def build_analyst_briefing_prompt(
+def section_the_case(
     query_id: str,
     sql: str,
     explain_plan_text: Optional[str],
     dag: Any,
     costs: Dict[str, Any],
     semantic_intents: Optional[Dict[str, Any]],
-    global_knowledge: Optional[Dict[str, Any]],
-    constraints: Optional[List[Dict[str, Any]]] = None,
-    dialect: str = "duckdb",
-    dialect_version: Optional[str] = None,
-    strategy_leaderboard: Optional[Dict[str, Any]] = None,
-    query_archetype: Optional[str] = None,
-    engine_profile: Optional[Dict[str, Any]] = None,
-    resource_envelope: Optional[str] = None,
-    exploit_algorithm_text: Optional[str] = None,
-    plan_scanner_text: Optional[str] = None,
-    iteration_history: Optional[Dict[str, Any]] = None,
-    mode: str = "swarm",
-    detected_transforms: Optional[List] = None,
-    qerror_analysis: Optional[Any] = None,
+    dialect: str,
+    dialect_version: Optional[str],
+    qerror_analysis: Optional[Any],
+    iteration_history: Optional[Dict[str, Any]],
 ) -> str:
-    """Build the analyst briefing prompt for swarm, expert, or oneshot mode.
+    """§II. THE CASE — Original SQL, Current Execution Plan, Query Map, Estimation Errors."""
+    lines = ["## §II. THE CASE", ""]
 
-    All modes share the same data sections (EXPLAIN, logical tree, examples, constraints,
-    etc.). What varies: role framing, output format, strategy rules, and
-    exploration budget.
-
-    Prompt structure (7 sections):
-      §1. ROLE & MISSION — framing + information asymmetry
-      §2. INPUT PACKAGE — SQL, EXPLAIN, logic tree, semantic intent, iteration history
-      §3. CONSTRAINTS — correctness gates + aggregation rules
-      §4. ENGINE PROFILE — exploit algorithm / gap profiles, regressions, resources
-      §5. TRANSFORM CATALOG — transforms, example library, optimization principles
-      §6. REASONING PROCESS — reasoning steps + strategy selection rules
-      §7. OUTPUT SPECIFICATION — format, checklist, exploration rules, consumption spec
-
-    Args:
-        query_id: Query identifier (e.g., 'query_74')
-        sql: Original SQL query
-        explain_plan_text: ASCII EXPLAIN ANALYZE tree (may be None for ~4 queries)
-        dag: Parsed logical tree from Phase 1
-        costs: Per-node cost analysis
-        semantic_intents: Pre-computed per-query + per-node intents (may be None)
-        global_knowledge: GlobalKnowledge dict with principles + anti_patterns
-        constraints: All engine-filtered constraints (full JSON)
-        dialect: SQL dialect
-        dialect_version: Engine version string (e.g., '1.4.3')
-        strategy_leaderboard: Pre-built leaderboard JSON (from build_strategy_leaderboard.py)
-        query_archetype: Archetype classification for this query (e.g., 'scan_consolidation')
-        engine_profile: Engine profile JSON with optimizer strengths/gaps (may be None)
-        resource_envelope: System resource envelope text for PG workers (may be None)
-        exploit_algorithm_text: Evidence-based exploit algorithm YAML from frontier
-            probing (may be None). When present, replaces engine profile section.
-        plan_scanner_text: Pre-computed plan-space scanner results for PG (may be None).
-            Shows what happens when planner flags are toggled via SET LOCAL.
-        iteration_history: Prior optimization attempts for this query (expert/oneshot
-            iterative mode). Dict with 'attempts' list. None for first iteration or swarm.
-        mode: Prompt mode — "swarm" (4 workers), "expert" (1 worker), or "oneshot"
-            (analyze + produce SQL directly). Default "swarm".
-        detected_transforms: Top-N transforms ranked by precondition feature overlap
-            with this query (may be None). Each is a TransformMatch dataclass.
-
-    Returns:
-        Complete analyst prompt string (~3000-5000 tokens input)
-    """
-    if mode not in ("swarm", "expert", "oneshot"):
-        raise ValueError(f"Invalid mode: {mode!r}. Must be 'swarm', 'expert', or 'oneshot'.")
-    lines: list[str] = []
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # §1. ROLE & MISSION
-    # ═══════════════════════════════════════════════════════════════════════
-    lines.append("## §1. ROLE & MISSION")
-    lines.append("")
-    if mode == "swarm":
-        lines.append(
-            "You are a senior query optimization architect. Your job is to deeply "
-            "analyze a SQL query and produce a structured briefing for 4 specialist "
-            "workers who will each write a different optimized version."
-        )
-        lines.append("")
-        lines.append(
-            "You are the ONLY call that sees all the data: EXPLAIN plans, logical-tree costs, "
-            "full constraint list, global knowledge, and the complete example catalog. "
-            "The workers will only see what YOU put in their briefings. "
-            "Your output quality directly determines their success."
-        )
-    elif mode == "expert":
-        lines.append(
-            "You are a senior query optimization architect. Your job is to deeply "
-            "analyze a SQL query and produce a structured briefing for a single "
-            "specialist worker who will write the best possible optimized version."
-        )
-        lines.append("")
-        lines.append(
-            "You are the ONLY call that sees all the data: EXPLAIN plans, logical-tree costs, "
-            "full constraint list, global knowledge, and the complete example catalog. "
-            "The worker will only see what YOU put in the briefing. "
-            "Your output quality directly determines success."
-        )
-    elif mode == "oneshot":
-        lines.append(
-            "You are a senior query optimization architect. Your job is to deeply "
-            "analyze a SQL query, determine the single best optimization strategy, "
-            "and then produce the optimized SQL directly."
-        )
-        lines.append("")
-        lines.append(
-            "You have all the data: EXPLAIN plans, logical-tree costs, full constraint list, "
-            "global knowledge, and the complete example catalog. Analyze thoroughly, "
-            "then implement the best strategy as working SQL."
-        )
-    lines.append("")
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # §2. INPUT PACKAGE
-    # ═══════════════════════════════════════════════════════════════════════
-
-    # ── §2a. Original Query ──────────────────────────────────────────────
+    # A. Original SQL
     dialect_str = dialect
     if dialect_version:
         dialect_str += f" v{dialect_version}"
-    lines.append(f"## §2a. Original Query: {query_id} ({dialect_str})")
+    lines.append(f"### A. Original SQL: {query_id} ({dialect_str})")
     lines.append("")
     clean_sql = _strip_template_comments(sql)
     lines.append("```sql")
-    lines.append(_add_line_numbers(clean_sql))
+    lines.append(clean_sql)
     lines.append("```")
     lines.append("")
 
-    # ── §2b. EXPLAIN Plan ────────────────────────────────────────────────
-    is_estimate_plan = False  # hoisted for use in reasoning step 2
+    # B. Current Execution Plan (EXPLAIN ANALYZE)
     if explain_plan_text:
-        # explain_plan_text is pre-rendered by pipeline.get_explain_plan_text()
-        formatted_plan = explain_plan_text
-        # Detect estimate-only plans (no actual timing data)
-        is_estimate_plan = "est_rows=" in formatted_plan or "EXPLAIN only" in formatted_plan
-        if is_estimate_plan:
-            lines.append("## §2b. EXPLAIN Plan (planner estimates)")
+        is_estimate = "est_rows=" in explain_plan_text or "EXPLAIN only" in explain_plan_text
+        if is_estimate:
+            lines.append("### B. Current Execution Plan (EXPLAIN — planner estimates)")
         else:
-            lines.append("## §2b. EXPLAIN ANALYZE Plan")
+            lines.append("### B. Current Execution Plan (EXPLAIN ANALYZE)")
         lines.append("")
         lines.append("```")
-        # Truncate very long plans to ~150 lines
-        plan_lines = formatted_plan.split("\n")
+        plan_lines = explain_plan_text.split("\n")
         if len(plan_lines) > 150:
             lines.extend(plan_lines[:150])
             lines.append(f"... ({len(plan_lines) - 150} more lines truncated)")
         else:
-            lines.append(formatted_plan)
+            lines.append(explain_plan_text)
         lines.append("```")
         lines.append("")
-        lines.append(
-            "**NOTE:** EXPLAIN shows PHYSICAL execution — ground truth when it "
-            "disagrees with the logical tree (optimizer may already split CTEs, "
-            "push predicates, reorder joins)."
-        )
         if dialect == "duckdb":
             lines.append(
-                "DuckDB times are **operator-exclusive** (children excluded). "
-                "Sum siblings for pipeline cost. Use EXPLAIN timings, not logical-tree %."
+                "DuckDB times are operator-exclusive (children excluded). "
+                "EXPLAIN is ground truth."
             )
-        elif is_estimate_plan:
+        elif is_estimate:
             lines.append(
                 "Estimate-only plan — use directionally, cross-check against "
-                "schema knowledge (table sizes, index selectivity)."
+                "schema knowledge."
             )
         else:
-            lines.append(
-                "Use EXPLAIN ANALYZE timings as ground truth, not logical-tree %."
-            )
+            lines.append("EXPLAIN ANALYZE timings are ground truth.")
         lines.append("")
     else:
-        lines.append("## §2b. EXPLAIN Plan")
+        lines.append("### B. Current Execution Plan")
         lines.append("")
-        lines.append(
-            "*EXPLAIN plan not available for this query. "
-            "Use logical-tree cost percentages as proxy for bottleneck identification.*"
-        )
+        lines.append("*EXPLAIN plan not available. Use logical-tree cost % as proxy.*")
         lines.append("")
 
-    # Plan-Space Scanner Intelligence (appended to §2b)
-    if plan_scanner_text:
-        lines.append("### Plan-Space Scanner Intelligence")
-        lines.append("")
-        lines.append(plan_scanner_text)
-        lines.append("")
-        algo_text = _load_algorithm("postgres_dsb_sf10_scanner")
-        if algo_text:
-            lines.append(algo_text)
-            lines.append("")
-
-    # ── §2b-i. Q-Error Cardinality Analysis (appended to §2b) ──────────
-    if qerror_analysis is not None:
-        from ..qerror import format_qerror_for_prompt
-        qerror_text = format_qerror_for_prompt(qerror_analysis)
-        if qerror_text:
-            lines.append(qerror_text)
-
-    # ── §2c. Query Structure (Logic Tree + condensed node details) ───────
+    # C. Query Map (Semantic Structure with filter/join ratios)
     from ..logic_tree import build_logic_tree
-    from ..analyst import _append_dag_analysis
     from ..prompter import _build_node_intent_map
 
     node_intents = _build_node_intent_map(semantic_intents)
@@ -858,7 +626,10 @@ def build_analyst_briefing_prompt(
         if query_intent and "main_query" not in node_intents:
             node_intents["main_query"] = query_intent
 
-    lines.append("## §2c. Query Structure (Logic Tree)")
+    lines.append("### C. Query Map")
+    lines.append("")
+    lines.append("The semantic structure with filter ratios, join ratios, and join directions. "
+                 "Use this to deduce the optimal path.")
     lines.append("")
     tree = build_logic_tree(sql, dag, costs, dialect, node_intents)
     lines.append("```")
@@ -866,36 +637,35 @@ def build_analyst_briefing_prompt(
     lines.append("```")
     lines.append("")
 
-    # Condensed per-node detail cards (analyst needs join/filter details)
+    # Intent line
+    if semantic_intents:
+        query_intent = semantic_intents.get("query_intent", "")
+        if query_intent:
+            lines.append(f"**Intent:** {query_intent}")
+            lines.append("")
+
+    # D. Estimation Errors (Q-Error routing)
+    if qerror_analysis is not None:
+        from ..qerror import format_qerror_for_prompt
+        qerror_text = format_qerror_for_prompt(qerror_analysis)
+        if qerror_text:
+            lines.append("### D. Estimation Errors")
+            lines.append("")
+            lines.append(qerror_text)
+            lines.append("")
+
+    # Condensed per-node detail cards
+    from ..analyst import _append_dag_analysis
     lines.append("### Node Details")
     lines.append("")
     _append_dag_analysis(lines, dag, costs, dialect=dialect, node_intents=node_intents)
     lines.append("")
 
-    # ── §2d. Semantic Intent (if available) ──────────────────────────────
-    if semantic_intents:
-        query_intent = semantic_intents.get("query_intent", "")
-        if query_intent:
-            lines.append("## §2d. Pre-Computed Semantic Intent")
-            lines.append("")
-            lines.append(f"**Query intent:** {query_intent}")
-            lines.append("")
-            lines.append(
-                "START from this pre-computed intent. In your SEMANTIC_CONTRACT output, "
-                "ENRICH it with: intersection/union semantics from JOIN types, "
-                "aggregation function traps, NULL propagation paths, and filter "
-                "dependencies. Do NOT re-derive what is already stated above."
-            )
-            lines.append("")
-    # When no pre-computed intents exist, omit this section entirely.
-    # The analyst's task already requires producing SEMANTIC_CONTRACT output.
-
-    # ── §2e. Iteration History (expert/oneshot iterative mode) ───────────
+    # Iteration History
     if iteration_history and iteration_history.get("attempts"):
-        lines.append("## §2e. Previous Optimization Attempts")
+        lines.append("### E. Previous Optimization Attempts")
         lines.append("")
         lines.append(
-            "The following attempts have already been tried. "
             "Do NOT repeat strategies that regressed or failed. "
             "Build on what worked; avoid what didn't."
         )
@@ -907,1139 +677,946 @@ def build_analyst_briefing_prompt(
             t_str = ", ".join(transforms) if transforms else "unknown"
             if status in ("error", "ERROR"):
                 error = attempt.get("error", "")
-                lines.append(f"- Attempt {i+1}: **{t_str}** → ERROR: {error}")
+                lines.append(f"- Attempt {i+1}: **{t_str}** -> ERROR: {error}")
             elif speedup < 0.95:
-                lines.append(f"- Attempt {i+1}: **{t_str}** → REGRESSION ({speedup:.2f}x)")
+                lines.append(f"- Attempt {i+1}: **{t_str}** -> REGRESSION ({speedup:.2f}x)")
             elif speedup >= 1.10:
-                lines.append(f"- Attempt {i+1}: **{t_str}** → WIN ({speedup:.2f}x)")
+                lines.append(f"- Attempt {i+1}: **{t_str}** -> WIN ({speedup:.2f}x)")
             else:
-                lines.append(f"- Attempt {i+1}: **{t_str}** → NEUTRAL ({speedup:.2f}x)")
-            # Include failure analysis if present
+                lines.append(f"- Attempt {i+1}: **{t_str}** -> NEUTRAL ({speedup:.2f}x)")
             failure_analysis = attempt.get("failure_analysis", "")
             if failure_analysis and status not in ("WIN", "IMPROVED"):
                 preview = failure_analysis[:200] + "..." if len(failure_analysis) > 200 else failure_analysis
                 lines.append(f"  Analysis: {preview}")
         lines.append("")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # §3. CONSTRAINTS (hard rules — check always)
-    # ═══════════════════════════════════════════════════════════════════════
+    return "\n".join(lines)
 
-    # ── §3a. Correctness Constraints (non-negotiable validation gates) ───
-    correctness_constraints = [
-        c for c in (constraints or [])
-        if c.get("id") in (
-            "LITERAL_PRESERVATION", "SEMANTIC_EQUIVALENCE",
-            "COMPLETE_OUTPUT", "CTE_COLUMN_COMPLETENESS",
-        )
-    ]
-    if correctness_constraints:
-        lines.append(f"## §3a. Correctness Constraints ({len(correctness_constraints)} — NEVER violate)")
-        lines.append("")
-        for c in correctness_constraints:
-            lines.append(_format_constraint_for_analyst(c))
-            lines.append("")
 
-    # ── §3b. Aggregation Equivalence Rules ───────────────────────────────
-    lines.append("## §3b. Aggregation Equivalence Rules")
-    lines.append("")
-    lines.append(
-        "You MUST verify aggregation equivalence for any proposed restructuring:"
-    )
-    lines.append("")
-    lines.append(
-        "- **STDDEV_SAMP(x)** requires >=2 non-NULL values per group. Returns NULL "
-        "for 0-1 values. Changing group membership changes the result."
-    )
-    lines.append(
-        "- `STDDEV_SAMP(x) FILTER (WHERE year=1999)` over a combined (1999,2000) "
-        "group is NOT equivalent to `STDDEV_SAMP(x)` over only 1999 rows — "
-        "FILTER still uses the combined group's membership for the stddev denominator."
-    )
-    lines.append(
-        "- **AVG and STDDEV are NOT duplicate-safe**: if a join introduces row "
-        "duplication, the aggregate result changes."
-    )
-    lines.append(
-        "- When splitting a UNION ALL CTE with GROUP BY + aggregate, each split "
-        "branch must preserve the exact GROUP BY columns and filter to the exact "
-        "same row set as the original."
-    )
-    lines.append(
-        "- **SAFE ALTERNATIVE**: If GROUP BY includes the discriminator column "
-        "(e.g., d_year), each group is already partitioned. STDDEV_SAMP computed "
-        "per-group is correct. You can then pivot using "
-        "`MAX(CASE WHEN year = 1999 THEN year_total END) AS year_total_1999` "
-        "because the GROUP BY guarantees exactly one row per (customer, year) — "
-        "the MAX is just a row selector, not a real aggregation."
-    )
-    lines.append("")
+def section_this_engine(
+    engine_profile: Optional[Dict[str, Any]],
+    exploit_algorithm_text: Optional[str],
+    dialect: str,
+    resource_envelope: Optional[str],
+    plan_scanner_text: Optional[str] = None,
+) -> str:
+    """§III. THIS ENGINE — tabular strengths + blind spots."""
+    lines = ["## §III. THIS ENGINE", ""]
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # §4. ENGINE PROFILE (reference knowledge)
-    # ═══════════════════════════════════════════════════════════════════════
+    engine_names = {"duckdb": "DuckDB", "postgres": "PostgreSQL",
+                    "postgresql": "PostgreSQL", "snowflake": "Snowflake"}
+    engine_name = engine_names.get(dialect, dialect)
+
     if exploit_algorithm_text:
-        lines.append("## §4. Exploit Algorithm: Evidence-Based Gap Intelligence")
+        lines.append(f"### {engine_name}")
         lines.append("")
         lines.append(
-            "The following describes known optimizer gaps with detection rules, "
-            "procedural exploit steps, and evidence. Use DETECT rules to match "
-            "structural features of the query, then follow EXPLOIT_STEPS."
+            "Evidence-based exploit algorithm. Use DETECT rules to match "
+            "structural features, then follow EXPLOIT_STEPS."
         )
         lines.append("")
         lines.append(exploit_algorithm_text)
         lines.append("")
-    elif engine_profile:
-        briefing_note = engine_profile.get("briefing_note", "")
-        lines.append("## §4. Engine Profile: Field Intelligence Briefing")
+        # Plan-Space Scanner (PG only) — append even with exploit algorithm
+        if plan_scanner_text:
+            lines.append("### Plan-Space Scanner Intelligence")
+            lines.append("")
+            lines.append(plan_scanner_text)
+            lines.append("")
+        # Resource Envelope (PG only)
+        if dialect in ("postgresql", "postgres") and resource_envelope:
+            lines.append("### System Resource Envelope")
+            lines.append("")
+            lines.append(resource_envelope)
+            lines.append("")
+        return "\n".join(lines)
+
+    if not engine_profile:
+        lines.append(f"### {engine_name}")
         lines.append("")
-        if briefing_note:
-            lines.append(f"*{briefing_note}*")
-            lines.append("")
+        lines.append("*No engine profile available.*")
+        return "\n".join(lines)
 
-        # Strengths (things the optimizer already does — don't fight these)
-        strengths = engine_profile.get("strengths", [])
-        if strengths:
-            lines.append("### Optimizer Strengths (DO NOT fight these)")
-            lines.append("")
-            for s in strengths:
-                sid = s.get("id", "")
-                summary = s.get("summary", "")
-                field_note = s.get("implication", s.get("field_note", ""))
-                lines.append(f"- **{sid}**: {summary}")
-                if field_note:
-                    lines.append(f"  *Implication:* {field_note}")
-            lines.append("")
+    briefing_note = engine_profile.get("briefing_note", "")
 
-        # Gaps (opportunities — the hunting guide)
-        gaps = engine_profile.get("gaps", [])
-        if gaps:
-            lines.append("### Optimizer Gaps (hunt for these)")
-            lines.append("")
-            for g in gaps:
-                gid = g.get("id", "")
-                priority = g.get("priority", "")
-                what = g.get("what", "")
-                why = g.get("why", "")
-                opportunity = g.get("opportunity", "")
+    lines.append(f"### {engine_name}")
+    lines.append("")
+    if briefing_note:
+        lines.append(f"*{briefing_note}*")
+        lines.append("")
 
-                lines.append(f"**{gid}** [{priority}]")
-                lines.append(f"  What: {what}")
-                if why:
-                    lines.append(f"  Why: {why}")
-                if opportunity:
-                    lines.append(f"  Opportunity: {opportunity}")
+    # Strengths table: "Handles Well (don't rewrite)"
+    strengths = engine_profile.get("strengths", [])
+    if strengths:
+        lines.append("**Handles Well (don't rewrite)**")
+        lines.append("")
+        lines.append("| Capability | Implication |")
+        lines.append("|---|---|")
+        for s in strengths:
+            cap = s.get("summary", s.get("id", ""))
+            imp = s.get("implication", s.get("field_note", ""))
+            lines.append(f"| {cap} | {imp} |")
+        lines.append("")
 
-                # What worked (compact)
-                what_worked = g.get("what_worked", [])
-                if what_worked:
-                    lines.append("  What worked:")
-                    for w in what_worked[:4]:
-                        lines.append(f"    + {w}")
+    # Blind spots table: "Blind Spots (your opportunity)"
+    gaps = engine_profile.get("gaps", [])
+    if gaps:
+        lines.append("**Blind Spots (your opportunity)**")
+        lines.append("")
+        lines.append("| Blind Spot | Consequence |")
+        lines.append("|---|---|")
+        for g in gaps:
+            blind_spot = g.get("id", "")
+            consequence = g.get("why", g.get("opportunity", g.get("what", "")))
+            lines.append(f"| {blind_spot} | {consequence} |")
+        lines.append("")
 
-                # What didn't work (compact)
-                what_didnt = g.get("what_didnt_work", [])
-                if what_didnt:
-                    lines.append("  What didn't work:")
-                    for w in what_didnt[:3]:
-                        lines.append(f"    - {w}")
+    # Plan-Space Scanner (PG only)
+    if plan_scanner_text:
+        lines.append("### Plan-Space Scanner Intelligence")
+        lines.append("")
+        lines.append(plan_scanner_text)
+        lines.append("")
 
-                # Field notes (the real intel)
-                field_notes = g.get("field_notes", [])
-                if field_notes:
-                    lines.append("  Field notes:")
-                    for fn in field_notes:
-                        lines.append(f"    * {fn}")
-                lines.append("")
-
-        # Scale sensitivity warning
-        scale_warn = engine_profile.get("scale_sensitivity_warning")
-        if scale_warn:
-            lines.append(f"**SCALE WARNING**: {scale_warn}")
-            lines.append("")
-
-    # Regression examples: covered by REGRESSION REGISTRY table in the
-    # knowledge/{dialect}.md blob above. No separate narrative section needed.
-
-    # Resource Envelope (PostgreSQL only — passed through to workers)
+    # Resource Envelope (PG only)
     if dialect in ("postgresql", "postgres") and resource_envelope:
-        lines.append("### System Resource Envelope (PostgreSQL)")
-        lines.append("")
-        lines.append(
-            "Workers will use this to size SET LOCAL parameters for their rewrites. "
-            "Included here for your awareness — you do NOT output config. "
-            "Each worker decides its own per-rewrite config."
-        )
+        lines.append("### System Resource Envelope")
         lines.append("")
         lines.append(resource_envelope)
         lines.append("")
 
-    # Detected Transforms (structural feature match, under §4)
-    if detected_transforms:
-        lines.append("### Detected Transforms: Structural Feature Match")
+    return "\n".join(lines)
+
+
+def section_constraints(
+    constraints: Optional[List[Dict[str, Any]]],
+    dag: Any,
+    costs: Dict[str, Any],
+) -> str:
+    """§IV. CONSTRAINTS — 4 non-negotiable rules + aggregation note."""
+    lines = ["## §IV. CONSTRAINTS", ""]
+
+    # 4 core constraints
+    correctness_ids = (
+        "LITERAL_PRESERVATION", "SEMANTIC_EQUIVALENCE",
+        "COMPLETE_OUTPUT", "CTE_COLUMN_COMPLETENESS",
+    )
+    correctness_constraints = [
+        c for c in (constraints or [])
+        if c.get("id") in correctness_ids
+    ]
+    if correctness_constraints:
+        for c in correctness_constraints:
+            cid = c.get("id", "?")
+            instruction = c.get("prompt_instruction", c.get("description", ""))
+            lines.append(f"- **{cid}**: {instruction}")
+        lines.append("")
+    else:
+        # Fallback: always list the 4 constraints
+        lines.append("- **COMPLETE_OUTPUT**: All original SELECT columns, aliases, and order preserved exactly.")
+        lines.append("- **LITERAL_PRESERVATION**: All literals copied exactly. `d_year = 2001` stays `2001`.")
+        lines.append("- **SEMANTIC_EQUIVALENCE**: Same rows, columns, ordering. Prime directive.")
+        lines.append("- **CTE_COLUMN_COMPLETENESS**: Every CTE SELECTs all columns its consumers reference.")
+        lines.append("")
+
+    # Aggregation note — detect aggregate functions and classify safety
+    aggs = _detect_aggregate_functions(dag, costs)
+    safe_aggs = {"COUNT", "SUM", "MAX", "MIN"}
+    unsafe_aggs = {"STDDEV_SAMP", "STDDEV", "VARIANCE", "VAR_SAMP",
+                   "PERCENTILE_CONT", "CORR", "COVAR_SAMP", "AVG"}
+    found_safe = [a for a in aggs if a in safe_aggs]
+    found_unsafe = [a for a in aggs if a in unsafe_aggs]
+
+    if aggs:
+        safe_str = ", ".join(found_safe) if found_safe else "none"
+        if found_unsafe:
+            unsafe_str = ", ".join(found_unsafe)
+            lines.append(
+                f"**Aggregation:** This query uses {safe_str} (safe) and "
+                f"{unsafe_str} (grouping-sensitive). Verify aggregation equivalence "
+                f"for any restructuring."
+            )
+        else:
+            lines.append(
+                f"**Aggregation:** This query uses {safe_str} — all safe. "
+                f"No STDDEV/VARIANCE traps."
+            )
+    else:
+        lines.append("**Aggregation:** No aggregate functions detected.")
+
+    return "\n".join(lines)
+
+
+def section_investigate(
+    mode: str,
+    dag: Any,
+    qerror_analysis: Optional[Any],
+    explain_plan_text: Optional[str],
+) -> str:
+    """§V. INVESTIGATE — 7-step reasoning + Worker Diversity."""
+    lines = ["## §V. INVESTIGATE", ""]
+    lines.append("Work in `<reasoning>`. Follow this investigation process:")
+    lines.append("")
+
+    # Step 1: Analyze the Current Plan
+    lines.append(
+        "**Step 1: Analyze the Current Plan.** Read the cost spine and EXPLAIN in §II.B. "
+        "Identify the red flags: where is time going? What's the running rowcount at each "
+        "stage? Where does it fail to decrease?"
+    )
+    lines.append("")
+
+    # Step 2: Read the Map
+    lines.append(
+        "**Step 2: Read the Map.** Use the query map (§II.C) to understand the data shape. "
+        "Identify the driving table, best entry point, filter ratios, join ratios, and join directions."
+    )
+    lines.append("")
+
+    # Step 3: Deduce the Optimal Path
+    lines.append(
+        "**Step 3: Deduce the Optimal Path.** From the map, work out the ideal join order:"
+    )
+    lines.append("")
+    lines.append("- Start from the best entry point (most selective filter)")
+    lines.append("- Follow reducing joins first (downward/semi)")
+    lines.append("- Pick up filters early to shrink the running rowcount at every step")
+    lines.append("- Defer expanding joins and pure attribute lookups until last")
+    lines.append("- Compute the running rowcount at each step of your optimal path")
+    lines.append("")
+
+    # Step 4: Diagnose the Gap
+    lines.append(
+        "**Step 4: Diagnose the Gap.** Compare your optimal path (Step 3) to the actual "
+        "plan (Step 1). For each divergence:"
+    )
+    lines.append("")
+    lines.append("- Name the violated goal (§I)")
+    lines.append(
+        "- Check if an engine blind spot from §III explains it. If yes, name it. "
+        "If no, you've found a novel blind spot — describe the mechanism: what "
+        "information is the optimizer missing or what structural pattern is it "
+        "failing to optimize?"
+    )
+    lines.append("- Quantify: how many excess rows flow because of this divergence?")
+    lines.append("")
+    lines.append(
+        "This diagnosis is complete and actionable on its own. Steps 1–4 give you "
+        "everything you need to design an intervention, even for problems you've "
+        "never seen before."
+    )
+    lines.append("")
+
+    # Step 5: Match Gold Examples
+    lines.append(
+        "**Step 5: Match Gold Examples.** This is the highest-leverage step. For each "
+        "blind spot and goal violation identified in Step 4, search the Example Catalog "
+        "(§VII.B) for gold examples with matching query structure."
+    )
+    lines.append("")
+    lines.append(
+        "- **Match found**: The matching examples become the primary basis for worker "
+        "strategies. Assign them to workers with APPLY/IGNORE/ADAPT guidance. The gold "
+        "example's before/after SQL is a structural template — the worker adapts it, "
+        "not invents from scratch."
+    )
+    lines.append(
+        "- **No match**: Design the intervention from your diagnosis. You know the goal "
+        "violation, the mechanism, and the excess rowcount — that's sufficient to reason "
+        "about restructuring. Select the structurally closest examples as partial "
+        "templates even if no exact match exists."
+    )
+    lines.append("")
+
+    # Step 6: Select Examples Per Worker (NEW)
+    if mode == "swarm":
+        lines.append(
+            "**Step 6: Select Examples Per Worker.** For each of the 4 strategies, "
+            "select 1–3 examples from the catalog:"
+        )
+    else:
+        lines.append(
+            "**Step 6: Select Examples.** For your strategy, "
+            "select 1–3 examples from the catalog:"
+        )
+    lines.append("")
+    lines.append("*Matching criteria* (in priority order):")
+    lines.append(
+        "1. **Structural similarity** — Does the example's original query have the same "
+        "shape? (same join pattern, same subquery type, same fact/dim relationship). "
+        "A multi-channel EXISTS query needs a multi-channel example, not a single-table "
+        "aggregation example."
+    )
+    lines.append(
+        "2. **Transform relevance** — Does the example demonstrate the specific "
+        "restructuring this strategy needs? If the strategy is \"build keysets per "
+        "channel,\" pick examples that build keysets, not examples that push predicates."
+    )
+    lines.append(
+        "3. **Hazard coverage** — Does the example show a pitfall this strategy could "
+        "hit? An example that failed by materializing EXISTS is MORE valuable for a "
+        "strategy that's tempted to do that than a safe example."
+    )
+    lines.append("")
+    lines.append(
+        "*Adaptation guidance* — For each assigned example, you MUST specify:"
+    )
+    lines.append(
+        "- **APPLY**: Which structural pattern from the example maps to this query "
+        "(e.g., \"the date_dim CTE pattern — isolate qualifying dates first, then join "
+        "to fact\")"
+    )
+    lines.append(
+        "- **IGNORE**: Which parts of the example don't apply and WHY (e.g., \"ignore "
+        "the ROLLUP handling — this query has no ROLLUP\"). Without this, workers copy "
+        "irrelevant complexity."
+    )
+    lines.append(
+        "- **ADAPT**: What's different between the example's query and this query that "
+        "requires modification (e.g., \"example has 2 channels, this query has 3 — "
+        "extend the pattern but don't exceed 2 CTE chains\")"
+    )
+    lines.append("")
+    lines.append("*Anti-patterns*:")
+    lines.append(
+        "- Don't assign an example just because it matches the same blind spot if the "
+        "query structure is fundamentally different"
+    )
+    lines.append(
+        "- Don't pad with 3 examples when 1 is a strong match — irrelevant examples "
+        "dilute attention"
+    )
+    lines.append(
+        "- Don't assign examples that demonstrate transforms the strategy ISN'T using"
+    )
+    lines.append("")
+
+    # Step 7: Design Strategies
+    if mode == "swarm":
+        lines.append(
+            "**Step 7: Design Four Strategies.** Each strategy must include a NEW QUERY MAP "
+            "showing the restructured data flow before specifying any SQL. The map is the "
+            "design document — it proves the restructuring produces monotonically decreasing "
+            "rowcounts and addresses the diagnosed goal violations."
+        )
+        lines.append("")
+        lines.append("Selection rules:")
+        lines.append(
+            "- If the EXPLAIN shows the optimizer already handles something "
+            "(e.g., EXISTS → semi-join), don't re-do it"
+        )
+        lines.append(
+            "- Verify structural prerequisites before assigning transforms "
+            "(no decorrelation if there's no correlated subquery)"
+        )
+        lines.append(
+            "- Strategies may compose 2–3 transforms — compound strategies produce "
+            "the biggest wins and biggest regressions"
+        )
+        lines.append("")
+
+        # Worker Diversity
+        lines.append("### Worker Diversity")
+        lines.append("")
+        lines.append("### Transform Families")
         lines.append("")
         lines.append(
-            "Transforms ranked by precondition feature overlap with THIS query. "
-            "Higher overlap = more structurally applicable."
+            "Six families of structural transformation, classified by the optimizer blind "
+            "spot they exploit (not by syntactic change). Each family has a measured "
+            "win:regression ratio from empirical benchmarks:"
         )
+        lines.append("")
+        lines.append(
+            "**Family A — EARLY FILTERING** (filter early, scan less)"
+        )
+        lines.append(
+            "Transforms: date_cte_isolate, dimension_cte_isolate, early_filter, "
+            "pushdown, multi_date_range_cte, prefetch_fact_join"
+        )
+        lines.append(
+            "Mechanism: Pre-filter dimension tables into CTEs so fact table joins probe "
+            "tiny hash tables. Move predicates earlier in the plan."
+        )
+        lines.append(
+            "Blind spot: CROSS_CTE_PREDICATE_BLINDNESS — optimizer cannot push predicates "
+            "backward from outer query into CTE definitions."
+        )
+        lines.append("Win ratio: 1:1 (high volume, medium risk). ~35% of all DuckDB wins.")
+        lines.append("")
+        lines.append(
+            "**Family B — DECORRELATION** (sets over loops)"
+        )
+        lines.append(
+            "Transforms: decorrelate, inline_decorrelate_materialized, "
+            "composite_decorrelate_union, early_filter_decorrelate"
+        )
+        lines.append(
+            "Mechanism: Convert correlated subqueries into precomputed key/aggregate sets "
+            "that are joined once, instead of per-row re-execution."
+        )
+        lines.append(
+            "Blind spot: CORRELATED_SUBQUERY_PARALYSIS — optimizer fails to decorrelate "
+            "complex aggregate correlations reliably."
+        )
+        lines.append("Win ratio: 1.7:1 (medium-safe, high upside on hard queries).")
+        lines.append("")
+        lines.append(
+            "**Family C — AGGREGATION REWRITE** (minimize rows touched)"
+        )
+        lines.append(
+            "Transforms: aggregate_pushdown, deferred_window_aggregation"
+        )
+        lines.append(
+            "Mechanism: Push GROUP BY below joins when aggregation keys align with join "
+            "keys. Defer window functions to after filtering joins."
+        )
+        lines.append(
+            "Blind spot: AGGREGATE_BELOW_JOIN_BLINDNESS — optimizer cannot push GROUP BY "
+            "below joins."
+        )
+        lines.append(
+            "Win ratio: INFINITY (ZERO regressions). aggregate_pushdown produced 42.90x "
+            "(largest single win). Always safe."
+        )
+        lines.append("")
+        lines.append("**Family D — SET OPERATIONS** (set-level rewrites)")
+        lines.append(
+            "Transforms: or_to_union (limit to 3 branches), intersect_to_exists, "
+            "union_cte_split, rollup_to_union_windowing"
+        )
+        lines.append(
+            "Mechanism: Rewrite INTERSECT/OR/set-shaped logic into branch-local or "
+            "semi-join forms that short-circuit and avoid unnecessary materialization."
+        )
+        lines.append(
+            "Blind spot: INTERSECT_MATERIALIZATION and CROSS_COLUMN_OR_DECOMPOSITION."
+        )
+        lines.append(
+            "Win ratio: mixed. Strong upside when predicates are structurally separable; "
+            "apply strict safeguards for OR→UNION."
+        )
+        lines.append("")
+        lines.append(
+            "**Family E — MATERIALIZATION** (don't repeat work)"
+        )
+        lines.append(
+            "Transforms: materialize_cte, pg_self_join_decomposition"
+        )
+        lines.append(
+            "Mechanism: Materialize expensive shared intermediates once when multiple "
+            "consumers would otherwise repeat the same work."
+        )
+        lines.append(
+            "Blind spot: repeated rescans of identical subplans across consumer branches."
+        )
+        lines.append(
+            "Win ratio: situational. Use when reuse is clear and the baseline is heavy "
+            "enough to amortize materialization overhead."
+        )
+        lines.append("")
+        lines.append(
+            "**Family F — JOIN TRANSFORMATION** (arm the optimizer — join structure)"
+        )
+        lines.append(
+            "Transforms: inner_join_conversion, self_join_decomposition, "
+            "date_cte_explicit_join, dimension_prefetch_star, "
+            "materialized_dimension_fact_prefilter, sf_date_cte_explicit_join"
+        )
+        lines.append(
+            "Mechanism: Make join intent explicit (join type/order/filter placement) so "
+            "the optimizer can choose better join strategies and cardinality paths."
+        )
+        lines.append(
+            "Blind spot: join-order rigidity and ambiguous join semantics in complex plans."
+        )
+        lines.append(
+            "Win ratio: generally favorable when semantics are preserved and NULL behavior "
+            "is validated."
+        )
+        lines.append("Guardrails: verify NULL-preserving behavior before LEFT→INNER conversion.")
+        lines.append("")
+        lines.append("### Worker Roles")
+        lines.append("")
+        lines.append(
+            "Workers are differentiated by WHICH families they attack, not by how "
+            "aggressively they attack them."
+        )
+        lines.append("")
+        lines.append("**W1 — Proven compound** (highest expected win rate)")
+        lines.append(
+            "Apply the best 2 transforms from different families, chosen from gold examples "
+            "with strong measured speedups. This is NOT a conservative worker — it's the "
+            "highest-expectation play. Prefer families C/D (zero regressions) as primary "
+            "when the query structure supports them."
+        )
+        lines.append("")
+        lines.append("**W2 — Structural alternative** (different angle of attack)")
+        lines.append(
+            "Primary family MUST differ from W1's primary family. If W1 leads with Scan "
+            "Reduction (A), W2 leads with Decorrelation (B) or Materialization "
+            "(E). Guarantees the system explores a genuinely different structural approach."
+        )
+        lines.append("")
+        lines.append("**W3 — Aggressive compound** (highest ceiling, highest variance)")
+        lines.append(
+            "Compose 3+ transforms across multiple families. This is where the extreme "
+            "outliers live (8044x, 359x on PG). Higher risk of regression, but captures wins "
+            "that simpler strategies can't reach. Must include at least one family not in "
+            "W1's primary."
+        )
+        lines.append("")
+        lines.append("**W4 — Novel / orthogonal** (exploration mandate)")
+        lines.append(
+            "MUST use a family not covered by W1–W3, OR attempt a novel technique not in "
+            "the gold library. W4 priority:"
+        )
+        lines.append(
+            "  1. PREFERRED: Attempt a novel technique — new discoveries expand the library"
+        )
+        lines.append(
+            "  2. MEDIUM: Target uncovered family (if C or D uncovered, they have HIGHER "
+            "priority — zero regressions)"
+        )
+        lines.append(
+            "  3. LOWEST: If F (Join Transformation) is uncovered, W4 targets it with "
+            "semantics-first safeguards."
+        )
+        lines.append("")
+        lines.append("### Family Coverage Rule")
+        lines.append("")
+        lines.append(
+            "**Across W1–W4, at least 3 of the 6 transform families must be represented as "
+            "a primary or secondary family.** No two workers may share the same primary "
+            "family unless the query structure only supports 2 applicable families (rare — "
+            "document why in DIVERSITY_MAP)."
+        )
+        lines.append("")
+        lines.append("Verify coverage before finalizing:")
+        lines.append("```")
+        lines.append("Family A (Early Filtering):        covered by W_?")
+        lines.append("Family B (Decorrelation):          covered by W_?")
+        lines.append("Family C (Aggregation):            covered by W_?")
+        lines.append("Family D (Set Operations):         covered by W_?")
+        lines.append("Family E (Materialization):        covered by W_?")
+        lines.append("Family F (Join Transformation):    covered by W_?")
+        lines.append("Uncovered families:                [list → W4 should target these]")
+        lines.append("```")
+    elif mode == "oneshot":
+        lines.append(
+            "**Step 7: Implement.** Design and implement the single best strategy "
+            "as working SQL."
+        )
+        lines.append("")
+        lines.append("Selection rules:")
+        lines.append(
+            "- If the EXPLAIN shows the optimizer already handles something, don't re-do it"
+        )
+        lines.append(
+            "- Verify structural prerequisites before assigning transforms"
+        )
+
+    return "\n".join(lines)
+
+
+def section_output_format(
+    mode: str,
+    is_discovery_mode: bool,
+    dialect: str,
+) -> str:
+    """§VI. OUTPUT FORMAT — shared briefing + per-worker briefings."""
+    lines = ["## §VI. OUTPUT FORMAT", ""]
+
+    # Shared briefing
+    lines.append("```")
+    lines.append("=== SHARED BRIEFING ===")
+    lines.append("")
+    lines.append("SEMANTIC_CONTRACT: (80-150 tokens)")
+    lines.append("(a) Business intent.")
+    lines.append("(b) JOIN semantics.")
+    lines.append("(c) Aggregation traps.")
+    lines.append("(d) Filter dependencies.")
+    lines.append("")
+    lines.append("OPTIMAL_PATH:")
+    lines.append("[Your deduced ideal join order from Step 3, with running rowcount at each step.")
+    lines.append("This is the destination — what every worker is trying to get the optimizer to execute.]")
+    lines.append("")
+    lines.append("CURRENT_PLAN_GAP:")
+    lines.append("[Where the actual plan diverges from optimal. Per divergence: which goal violated,")
+    lines.append("which blind spot causes it, how many excess rows result.]")
+    lines.append("")
+    lines.append("ACTIVE_CONSTRAINTS:")
+    lines.append("- [ID]: [1-line relevance]")
+    lines.append("")
+    lines.append("REGRESSION_WARNINGS:")
+    lines.append("- [Pattern] ([result]):")
+    lines.append("  CAUSE: [...]")
+    lines.append("  RULE: [...]")
+    lines.append("")
+
+    if mode == "swarm":
+        lines.append("DIVERSITY_MAP:")
+        lines.append("| Worker | Role              | Primary Family | Secondary | Key Structural Idea |")
+        lines.append("|--------|-------------------|----------------|-----------|---------------------|")
+        lines.append("| W1     | Proven compound   | [A-F]          | [A-F]     | [1-line]            |")
+        lines.append("| W2     | Structural alt    | [≠ W1 primary]  | [opt.]    | [1-line]            |")
+        lines.append("| W3     | Aggressive cmpd   | [multi]         | [multi]   | [1-line]            |")
+        lines.append("| W4     | Novel/orthogonal  | [uncovered]     | -         | [1-line]            |")
+        lines.append("")
+        lines.append("FAMILY_COVERAGE: A [W_] B [W_] C [W_] D [W_] E [W_] F [W_] | Uncovered: [list → W4 targets]")
+        lines.append("")
+
+    # Worker briefing template
+    _WORKER_TEMPLATE = [
+        "STRATEGY: [name — matches diversity map]",
+        "ROLE: [proven_compound | structural_alt | aggressive_compound | novel_orthogonal]",
+        "PRIMARY_FAMILY: [A-F] — [family name]",
+        "APPROACH: [2-3 sentences: structural idea, which gap it closes, which goal it serves]",
+        "",
+        "TARGET_QUERY_MAP:",
+        "[The NEW query map for this strategy — same tree format as §II.C but showing the",
+        "restructured data flow. Must show running rowcount at each node decreasing",
+        "monotonically. This is the worker's design document — they write SQL to implement",
+        "THIS map.]",
+        "",
+        "NODE_CONTRACTS:",
+        "  [node_name]:",
+        "    FROM/JOIN/WHERE/GROUP BY/AGGREGATE/OUTPUT/EXPECTED_ROWS/CONSUMERS",
+        "    (all as SQL fragments)",
+        "",
+        "EXAMPLES: [1-3 IDs from §VII.B — selected for structural similarity to THIS strategy]",
+        "EXAMPLE_ADAPTATION:",
+        "  [example_id]:",
+        "    APPLY: [which structural pattern from this example maps to this query]",
+        "    IGNORE: [which parts don't apply and why]",
+        "    ADAPT: [what differs between example and this query]",
+        "HAZARD_FLAGS: [query-specific risks for THIS approach]",
+    ]
+
+    _WORKER4_EXTRA = [
+        "EXPLORATION_TYPE: [novel_technique | compound_from_uncovered | retry_different_structure]",
+        "HYPOTHESIS_TAG: [descriptive]",
+        "UNCOVERED_FAMILY: [which family W1-W3 missed that W4 targets]",
+    ]
+
+    if mode == "swarm":
+        # Generate explicit WORKER 1, 2, 3, 4 briefing templates
+        # (Parser requires numeric headers, not template placeholder "N")
+        for worker_num in range(1, 5):
+            lines.append("")
+            lines.append(f"=== WORKER {worker_num} BRIEFING ===")
+            lines.append("")
+            for tl in _WORKER_TEMPLATE:
+                lines.append(tl)
+            lines.append("")
+            if worker_num == 4:
+                lines.append("Worker 4 adds:")
+                for extra in _WORKER4_EXTRA:
+                    lines.append(f"  {extra}")
+            if is_discovery_mode:
+                lines.append("")
+                lines.append(
+                    "(Discovery mode: ALL workers include EXPLORATION_TYPE and HYPOTHESIS_TAG.)"
+                )
+            lines.append("")
+    elif mode == "oneshot":
+        lines.append("")
+        lines.append("=== OPTIMIZED SQL ===")
+        lines.append("")
+        lines.append("STRATEGY: strategy_name")
+        lines.append("TRANSFORM: transform_names")
+        lines.append("")
+        lines.append("```sql")
+        lines.append("SELECT ...")
+        lines.append("```")
+        lines.append("")
+
+    lines.append("```")
+
+    return "\n".join(lines)
+
+
+def section_reference_appendix(
+    engine_profile: Optional[Dict[str, Any]],
+    exploit_algorithm_text: Optional[str],
+    dag: Any,
+    detected_transforms: Optional[List] = None,
+    matched_examples: Optional[List[Dict[str, Any]]] = None,
+    dialect: str = "duckdb",
+) -> str:
+    """§VII. REFERENCE APPENDIX — case files by blind spot, gold example catalog, regression registry, structural matches, verification."""
+    engine_names = {
+        "duckdb": "DuckDB",
+        "postgres": "PostgreSQL",
+        "postgresql": "PostgreSQL",
+        "snowflake": "Snowflake",
+    }
+    engine_display = engine_names.get(dialect, dialect)
+    lines = [f"## §VII. REFERENCE APPENDIX ({engine_display})", ""]
+    lines.append(
+        "Case files and gold examples from past investigations, organized by engine "
+        "blind spot (matching §III). Consult during Step 5 when your diagnosis identifies "
+        "a matching blind spot."
+    )
+    lines.append("")
+
+    # A. Documented Cases by Blind Spot
+    if exploit_algorithm_text:
+        # Exploit algorithm already has documented cases — skip detailed gap rendering
+        pass
+    elif engine_profile:
+        gaps = engine_profile.get("gaps", [])
+        if gaps:
+            lines.append("### A. Documented Cases by Blind Spot")
+            lines.append("")
+            for g in gaps:
+                gid = g.get("id", "")
+                goal = g.get("goal", "")
+                detect = g.get("detect", "")
+                gates = g.get("gates", "")
+                what_worked = g.get("what_worked", [])
+                what_didnt = g.get("what_didnt_work", [])
+                field_notes = g.get("field_notes", [])
+                also_manifests = g.get("also_manifests_as", [])
+
+                goal_str = f" → {goal}" if goal else ""
+                pct_str = ""
+                for note in field_notes:
+                    if "%" in note:
+                        pct_str = f" ({note})"
+                        break
+                lines.append(f"**Blind spot: {_format_blind_spot_id(gid)}**{goal_str}{pct_str}")
+                if detect:
+                    lines.append(f"Detect: {detect}")
+                if gates:
+                    lines.append(f"Gates: {gates}")
+                if what_worked:
+                    treatments_str = ", ".join(what_worked[:4])
+                    lines.append(f"Treatments: {treatments_str}.")
+                if what_didnt:
+                    failures_str = ", ".join(what_didnt[:3])
+                    lines.append(f"Failures: {failures_str}.")
+                for am in also_manifests:
+                    name = am.get("name", "")
+                    desc = am.get("description", "")
+                    treatment = am.get("treatment", "")
+                    lines.append(f"Also manifests as **{name}** — {desc}")
+                    if treatment:
+                        lines.append(f"Treatment: {treatment}")
+                remaining_notes = [n for n in field_notes if "%" not in n]
+                if remaining_notes:
+                    notes_str = " ".join(remaining_notes[:3])
+                    lines.append(f"Notes: {notes_str}")
+                lines.append("")
+
+    # B. Gold Example Catalog
+    lines.append(f"### B. Gold Example Catalog ({engine_display})")
+    lines.append("")
+    lines.append(
+        "Each example is a proven before/after SQL pair with measured speedups. "
+        "Workers receive the full SQL for assigned examples. You select based on "
+        "structural similarity to this query."
+    )
+    lines.append("")
+    if matched_examples:
+        lines.append("| Example ID | Family | Match | Query Shape | Result | Key Feature |")
+        lines.append("|---|---|---|---|---|---|")
+        for ex in matched_examples:
+            ex_id = ex.get("id", "?")
+            family = ex.get("family", "?")
+            desc = ex.get("description", "")
+            speedup = ex.get("verified_speedup", "")
+            principle = ex.get("principle", "")
+            match_score = ex.get("_match_score", 0)
+            match_pct = f"{match_score:.0%}" if match_score else "—"
+            # Extract a short "query shape" from description or principle
+            raw_shape = desc if desc else (principle if principle else "")
+            shape = (raw_shape[:57] + "...") if len(raw_shape) > 60 else raw_shape
+            # Key feature: use key_insight if available, else principle
+            raw_insight = (ex.get("example", {}).get("key_insight", "") or "")
+            if not raw_insight:
+                raw_insight = principle if principle else ""
+            key_insight = (raw_insight[:77] + "...") if len(raw_insight) > 80 else raw_insight
+            lines.append(f"| {ex_id} | {family} | {match_pct} | {shape} | {speedup} | {key_insight} |")
+        lines.append("")
+    else:
+        lines.append("*No gold examples available for this engine.*")
+        lines.append("")
+
+    # C. Regression Registry — engine-specific known failures
+    if not exploit_algorithm_text:
+        # Only emit static registry when exploit algorithm doesn't have its own
+        registry = _get_regression_registry(dialect)
+        if registry:
+            lines.append("### C. Regression Registry")
+            lines.append("")
+            lines.append("| What | Result | Cause |")
+            lines.append("|------|--------|-------|")
+            for entry in registry:
+                lines.append(f"| {entry[0]} | {entry[1]} | {entry[2]} |")
+            lines.append("")
+
+    # D. Structural Matches for This Query
+    if detected_transforms:
+        lines.append("### D. Structural Matches for This Query")
         lines.append("")
         for m in detected_transforms:
             pct = f"{m.overlap_ratio:.0%}"
             matched = ", ".join(m.matched_features)
             gap_str = f" [{m.gap}]" if m.gap else ""
-            lines.append(f"- **{m.id}** ({pct} match){gap_str}")
-            lines.append(f"  Features: {matched}")
-            if m.missing_features:
-                lines.append(f"  Missing: {', '.join(m.missing_features)}")
+            lines.append(f"- **{m.id}** ({pct}){gap_str} — {matched}")
             if m.contraindications:
                 for ci in m.contraindications:
-                    lines.append(f"  ⚠ {ci['id']}: {ci['instruction']}")
-            lines.append("")
+                    lines.append(f"  ⚠ {ci['instruction']}")
+        lines.append("")
 
-    # ── Discovery mode detection ────────────────────────────────────────
-    # Discovery mode: no empirical gaps for this engine.
-    # When true, all 4 workers explore (no proven patterns to follow).
+    # E. What Doesn't Apply
+    features = _detect_query_features(dag)
+    inapplicable = []
+    if not features["has_left_join"]:
+        inapplicable.append("No LEFT JOINs")
+    if not features["has_intersect"]:
+        inapplicable.append("No INTERSECT")
+    if not features["has_window"]:
+        inapplicable.append("No WINDOW/OVER")
+    if not features["has_cte"]:
+        inapplicable.append("No CTE chain in original")
+
+    if inapplicable:
+        lines.append("### E. What Doesn't Apply")
+        lines.append("")
+        lines.append(", ".join(inapplicable) + ".")
+        lines.append("")
+
+    # F. Verification Checklist
+    if not exploit_algorithm_text:
+        # Only emit static checklist when exploit algorithm doesn't have its own
+        lines.append("### F. Verification Checklist")
+        lines.append("")
+        lines.append(
+            "Before finalizing: every CTE has WHERE; no orphaned CTEs; EXISTS remains EXISTS; "
+            "same-column ORs intact; rowcounts decrease through CTE chains; comma joins → "
+            "explicit JOIN...ON."
+        )
+
+    return "\n".join(lines)
+
+
+def _get_regression_registry(dialect: str) -> List[tuple]:
+    """Return engine-specific regression entries: [(what, result, cause), ...]."""
+    _DUCKDB_REGRESSIONS = [
+        ("Materialized EXISTS", "0.14x", "Semi-join destroyed"),
+        ("3 dim CTE cross-join", "0.0076x", "Cartesian product"),
+        ("9 UNION branches", "0.23x", "Excessive fact scans"),
+        ("Decorrelated LEFT semi", "0.34x", "Broke early termination"),
+        ("Orphaned CTE after split", "0.49x", "Double materialization"),
+        ("3-fact CTE chain", "0.50x", "Locked join order"),
+        ("Split same-column OR", "0.59x", "Destroyed native optimization"),
+    ]
+    _PG_REGRESSIONS = [
+        ("Multi-scan rewrite", "0.50x", "Double fact table scan"),
+        ("Window AVG OVER PARTITION", "1.0x", "No improvement on PG"),
+        ("Materialized EXISTS", "0.14x", "Semi-join destroyed"),
+        ("Excessive CTE materialization", "0.60x", "Forced scan order"),
+    ]
+    if dialect == "duckdb":
+        return _DUCKDB_REGRESSIONS
+    if dialect in ("postgresql", "postgres"):
+        return _PG_REGRESSIONS
+    return []  # Snowflake etc — no known regressions yet
+
+
+def _format_blind_spot_id(gid: str) -> str:
+    """Convert engine profile gap ID to readable display name.
+
+    CROSS_CTE_PREDICATE_BLINDNESS → Cross-CTE predicate blindness
+    """
+    # Preserve acronyms
+    acronyms = {"CTE", "CSE", "OR"}
+    words = gid.split("_")
+    result = []
+    for i, w in enumerate(words):
+        if w in acronyms:
+            result.append(w)
+        elif i == 0:
+            result.append(w.capitalize())
+        else:
+            result.append(w.lower())
+    return " ".join(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main entry point
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_analyst_briefing_prompt(
+    query_id: str,
+    sql: str,
+    explain_plan_text: Optional[str],
+    dag: Any,
+    costs: Dict[str, Any],
+    semantic_intents: Optional[Dict[str, Any]],
+    constraints: Optional[List[Dict[str, Any]]] = None,
+    dialect: str = "duckdb",
+    dialect_version: Optional[str] = None,
+    engine_profile: Optional[Dict[str, Any]] = None,
+    resource_envelope: Optional[str] = None,
+    exploit_algorithm_text: Optional[str] = None,
+    plan_scanner_text: Optional[str] = None,
+    iteration_history: Optional[Dict[str, Any]] = None,
+    mode: str = "swarm",
+    detected_transforms: Optional[List] = None,
+    qerror_analysis: Optional[Any] = None,
+    matched_examples: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Build the analyst briefing prompt with §I-§VII structure.
+
+    Args:
+        query_id: Query identifier (e.g., 'query_35')
+        sql: Original SQL query
+        explain_plan_text: Pre-rendered EXPLAIN ANALYZE tree
+        dag: Parsed logical tree from Phase 1
+        costs: Per-node cost analysis
+        semantic_intents: Pre-computed per-query intents
+        constraints: All engine-filtered constraints (full JSON)
+        dialect: SQL dialect (duckdb, postgresql, snowflake)
+        dialect_version: Engine version string
+        engine_profile: Engine profile JSON with strengths/gaps
+        resource_envelope: System resource envelope text (PG only)
+        exploit_algorithm_text: Evidence-based exploit algorithm text
+        plan_scanner_text: Pre-computed plan-space scanner results (PG)
+        iteration_history: Prior optimization attempts
+        mode: 'swarm' (4 workers) or 'oneshot'
+        detected_transforms: Top-N transforms by feature overlap
+        qerror_analysis: Cardinality estimation error analysis
+        matched_examples: Pre-ranked gold examples with _match_score
+
+    Returns:
+        Complete analyst prompt string with §I-§VII sections.
+    """
+    if mode not in ("swarm", "oneshot"):
+        raise ValueError(f"Invalid mode: {mode!r}. Must be 'swarm' or 'oneshot'.")
+
     has_empirical_gaps = bool(engine_profile and engine_profile.get("gaps"))
     is_discovery_mode = not has_empirical_gaps
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # §5. TRANSFORM CATALOG (action vocabulary)
-    # ═══════════════════════════════════════════════════════════════════════
-
-    # ── §5a. Transforms by Category ──────────────────────────────────────
-    lines.append("## §5a. Transform Catalog")
-    lines.append("")
-    if mode == "swarm":
-        lines.append(
-            "Select 4 transforms that are applicable to THIS query, maximizing "
-            "structural diversity (each must attack a different part of the "
-            "execution plan)."
-        )
-    else:
-        lines.append(
-            "Select the best transform (or compound strategy of 2-3 transforms) "
-            "that maximizes expected speedup for THIS query."
-        )
-    lines.append("")
-    lines.append("### Predicate Movement")
-    lines.append(
-        "- **global_predicate_pushdown**: Trace selective predicates from late "
-        "in the CTE chain back to the earliest scan via join equivalences. "
-        "Biggest win when a dimension filter is applied after a large "
-        "intermediate materialization.\n"
-        "  Maps to examples: pushdown, early_filter, date_cte_isolate"
-    )
-    lines.append(
-        "- **transitive_predicate_propagation**: Infer predicates through join "
-        "equivalence chains (A.key = B.key AND B.key = 5 -> A.key = 5). "
-        "Especially across CTE boundaries where optimizers stop propagating.\n"
-        "  Maps to examples: early_filter, dimension_cte_isolate"
-    )
-    lines.append(
-        "- **null_rejecting_join_simplification**: When downstream WHERE "
-        "rejects NULLs from the outer side of a LEFT JOIN, convert to INNER. "
-        "Enables reordering and predicate pushdown. CHECK: does the query "
-        "actually have LEFT/OUTER joins before assigning this.\n"
-        "  Maps to examples: (no direct gold example — novel transform)"
-    )
-    lines.append("")
-    lines.append("### Join Restructuring")
-    lines.append(
-        "- **self_join_elimination**: When a UNION ALL CTE is self-joined N "
-        "times with each join filtering to a different discriminator, split "
-        "into N pre-partitioned CTEs. Eliminates discriminator filtering "
-        "and repeated hash probes on rows that don't match.\n"
-        "  Maps to examples: union_cte_split, shared_dimension_multi_channel"
-    )
-    lines.append(
-        "- **decorrelation**: Convert correlated EXISTS/IN/scalar subqueries "
-        "to CTE + JOIN. CHECK: does the query actually have correlated "
-        "subqueries before assigning this.\n"
-        "  Maps to examples: decorrelate, composite_decorrelate_union"
-    )
-    lines.append(
-        "- **aggregate_pushdown**: When GROUP BY follows a multi-table join but "
-        "aggregation only uses columns from one side, push the GROUP BY below "
-        "the join. CHECK: verify the join doesn't change row multiplicity "
-        "for the aggregate (one-to-many breaks AVG/STDDEV).\n"
-        "  Maps to examples: (no direct gold example — novel transform)"
-    )
-    lines.append(
-        "- **late_attribute_binding**: When a dimension table is joined only to "
-        "resolve display columns (names, descriptions) that aren't used in "
-        "filters, aggregations, or join conditions, defer that join until after "
-        "all filtering and aggregation is complete. Join on the surrogate key "
-        "once against the final reduced result set. This eliminates N-1 "
-        "dimension scans when the CTE references the dimension N times. "
-        "CHECK: verify the deferred columns aren't used in WHERE, GROUP BY, "
-        "or JOIN ON — only in the final SELECT.\n"
-        "  Maps to examples: dimension_cte_isolate (partial pattern), early_filter"
-    )
-    lines.append("")
-    lines.append("### Scan Optimization")
-    lines.append(
-        "- **star_join_prefetch**: Pre-filter ALL dimension tables into CTEs, "
-        "then probe fact table with the combined key intersection.\n"
-        "  Maps to examples: dimension_cte_isolate, multi_dimension_prefetch, "
-        "prefetch_fact_join, date_cte_isolate"
-    )
-    lines.append(
-        "- **single_pass_aggregation**: Merge N subqueries on the same fact "
-        "table into 1 scan with CASE/FILTER inside aggregates. "
-        "CHECK: STDDEV_SAMP/VARIANCE are grouping-sensitive — FILTER "
-        "over a combined group != separate per-group computation.\n"
-        "  Maps to examples: single_pass_aggregation, channel_bitmap_aggregation"
-    )
-    lines.append(
-        "- **scan_consolidation_pivot**: When a CTE is self-joined N times "
-        "with each reference filtering to a different discriminator (e.g., year, "
-        "channel), consolidate into fewer scans that GROUP BY the discriminator, "
-        "then pivot rows to columns using MAX(CASE WHEN discriminator = X THEN "
-        "agg_value END). This halves the fact scans and dimension joins. "
-        "SAFE when GROUP BY includes the discriminator — each group is naturally "
-        "partitioned, so aggregates like STDDEV_SAMP are computed correctly "
-        "per-partition. The pivot MAX is just a row selector (one row per group), "
-        "not a real aggregation.\n"
-        "  Maps to examples: single_pass_aggregation, union_cte_split"
-    )
-    lines.append("")
-    lines.append("### Structural Transforms")
-    lines.append(
-        "- **union_consolidation**: Share dimension lookups across UNION ALL "
-        "branches that scan different fact tables with the same dim joins.\n"
-        "  Maps to examples: shared_dimension_multi_channel"
-    )
-    lines.append(
-        "- **window_optimization**: Push filters before window functions when "
-        "they don't affect the frame. Convert ROW_NUMBER + filter to LATERAL "
-        "+ LIMIT. Merge same-PARTITION windows into one sort pass.\n"
-        "  Maps to examples: deferred_window_aggregation"
-    )
-    lines.append(
-        "- **exists_restructuring**: Convert INTERSECT to EXISTS for semi-join "
-        "short-circuit, or restructure complex EXISTS with shared CTEs. "
-        "CHECK: does the query actually have INTERSECT or complex EXISTS.\n"
-        "  Maps to examples: intersect_to_exists, multi_intersect_exists_cte"
-    )
-    lines.append("")
-
-    # §5b. Example Library — examples are auto-matched to each worker's
-    # strategy by the system (tag overlap with transform category).
-    # The analyst does NOT need to see or select examples — each transform
-    # in §5a already lists its mapped examples.
-
-    # §5c. Optimization Principles — CUT. Same info is in Pathologies
-    # (win counts, avg speedups) and Transform Catalog (example mappings).
-
-    # ── §5c. Strategy Leaderboard (when available) ───────────────────────
-    if strategy_leaderboard and query_archetype:
-        leaderboard_section = _section_strategy_leaderboard(
-            strategy_leaderboard, query_archetype
-        )
-        if leaderboard_section:
-            lines.append(leaderboard_section)
-            lines.append("")
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # §6. REASONING PROCESS (how to think)
-    # ═══════════════════════════════════════════════════════════════════════
-    lines.append("## §6. REASONING PROCESS")
-    lines.append("")
-    lines.append(
-        "First, use a `<reasoning>` block for your internal analysis. "
-        "This will be stripped before parsing. Work through these steps IN ORDER:"
-    )
-    lines.append("")
-    lines.append(
-        "1. **CLASSIFY**: What structural archetype is this query?\n"
-        "   (channel-comparison self-join / correlated-aggregate filter / "
-        "star-join with late dim filter / repeated fact scan / "
-        "multi-channel UNION ALL / EXISTS-set operations / other)"
-    )
-    lines.append("")
-    has_qerror = qerror_analysis is not None and hasattr(qerror_analysis, 'signals') and qerror_analysis.signals
-    if is_estimate_plan:
-        lines.append(
-            "2. **EXPLAIN PLAN ANALYSIS**: From the EXPLAIN plan (planner estimates), identify:\n"
-            "   - Compare estimated row counts and costs per node. These are planner "
-            "predictions, not measurements — use them directionally. Cross-check against "
-            "schema knowledge (table sizes, index selectivity) where estimates look suspect.\n"
-            "   - Which nodes have the highest estimated cost and WHY\n"
-            "   - Where estimated row counts drop sharply (existing selectivity)\n"
-            "   - Where estimated row counts DON'T drop (missed optimization opportunity)\n"
-            "   - Whether the optimizer already splits CTEs, pushes predicates, "
-            "or performs transforms you might otherwise assign\n"
-            "   - Count scans per base table. If a fact table is scanned N times, "
-            "a restructuring that reduces it to 1 scan saves (N-1)/N of that table's "
-            "I/O cost. Prioritize transforms that reduce scan count on the largest tables.\n"
-            "   - Whether the CTE is materialized once and probed multiple times, "
-            "or re-executed per reference"
-        )
-    else:
-        step2_parts = [
-            "2. **EXPLAIN PLAN ANALYSIS**: From the EXPLAIN ANALYZE output, identify:\n"
-            "   - Compute wall-clock ms per EXPLAIN node. Sum repeated operations "
-            "(e.g., 2x store_sales joins = total cost). The EXPLAIN is ground truth, "
-            "not the logical-tree cost percentages.\n"
-            "   - Which nodes consume >10% of runtime and WHY\n"
-            "   - Where row counts drop sharply (existing selectivity)\n"
-            "   - Where row counts DON'T drop (missed optimization opportunity)\n"
-            "   - Whether the optimizer already splits CTEs, pushes predicates, "
-            "or performs transforms you might otherwise assign\n"
-            "   - Count scans per base table. If a fact table is scanned N times, "
-            "a restructuring that reduces it to 1 scan saves (N-1)/N of that table's "
-            "I/O cost. Prioritize transforms that reduce scan count on the largest tables.\n"
-            "   - Whether the CTE is materialized once and probed multiple times, "
-            "or re-executed per reference",
-        ]
-        if has_qerror:
-            step2_parts.append(
-                "\n\n"
-                "   **Q-ERROR ROUTING** (§2b-i): The cardinality estimation routing above "
-                "identifies WHERE the planner is wrong (locus) and HOW (direction). "
-                "This routing is 85% accurate at predicting where the winning transform operates.\n"
-                "   - **Direction + Locus → Pathology routing**: This is the primary signal. "
-                "Start your hypothesis from the routed pathologies.\n"
-                "   - **Structural flags** (DELIM_SCAN, EST_ZERO, etc.) are direct transform "
-                "triggers. DELIM_SCAN = correlated subquery → P2. EST_ZERO = CTE stats blind → P0/P7.\n"
-                "   - **Ignore magnitude/severity** — Q-Error size does NOT predict optimization "
-                "opportunity (win rate is flat across all severity levels)."
-            )
-        lines.append("".join(step2_parts))
-    lines.append("")
-    step3_parts = [
-        "3. **BOTTLENECK HYPOTHESIS**: From your EXPLAIN observations in Step 2, reason\n"
-        "   about WHY each bottleneck exists and what intervention could fix it.\n\n",
-    ]
-    if has_qerror:
-        step3_parts.append(
-            "   **Start from Q-Error routing.** The §2b-i routing identified the planner's\n"
-            "   worst mismatch direction+locus and mapped it to candidate pathologies.\n"
-            "   Use this as your primary hypothesis anchor, then verify against the plan structure:\n\n"
-        )
-    step3_parts.append(
-        "   For the top 2-3 cost centers identified on the cost spine:\n\n"
-        "   a) DIAGNOSE: What optimizer behavior causes this cost?\n"
-        "      - What operation dominates? (scan, join, sort, aggregate, window)\n"
-        "      - Is the input to this node larger than it needs to be? Why?\n"
-        "      - Is the optimizer executing operations in a suboptimal order?\n"
-        "      - Is work being repeated that could be done once?\n\n"
-        "   b) HYPOTHESIZE: What SQL restructuring would change the physical plan?\n"
-        "      - Scan dominates + low pruning ratio → predicate not reaching scan layer\n"
-        "      - Same table scanned N times → consolidate into single scan + conditional agg\n"
-        "      - Large intermediate + selective late filter → push predicate earlier in chain\n"
-        "      - Nested loop on large table → decorrelate to CTE + hash join\n"
-        "      - Aggregate input >> output after join → pre-aggregate before join\n"
-        "      - CTE materialized but referenced once → inline as subquery\n"
-        "      - Window computed in CTE before join → defer window to post-join\n"
-        "      - OR across different columns + full scan → decompose into UNION ALL branches\n\n"
-        "   c) CALIBRATE against engine knowledge (§4):\n"
-        "      - If a documented gap matches your diagnosis: USE its evidence\n"
-        "        (what_worked, what_didnt_work, field_notes, decision gates)\n"
-        "        to sharpen your intervention. Follow its gates — they encode failures.\n"
-        "      - If a strength matches what you'd rewrite: STOP — the optimizer already\n"
-        "        handles it. Your rewrite adds overhead or destroys an optimization.\n"
-        "      - If no gap matches: your hypothesis is novel — tag as UNVERIFIED_HYPOTHESIS\n"
-        "        and proceed with structural reasoning only. Design a control variant\n"
-        "        that tests the opposite assumption."
-    )
-    lines.append("".join(step3_parts))
-    lines.append("")
-    lines.append(
-        "4. **AGGREGATION TRAP CHECK**: For every aggregate function in the query, "
-        "verify: does my proposed restructuring change which rows participate "
-        "in each group? STDDEV_SAMP, VARIANCE, PERCENTILE_CONT, CORR are "
-        "grouping-sensitive. SUM, COUNT, MIN, MAX are grouping-insensitive "
-        "(modulo duplicates). If the query uses FILTER clauses or conditional "
-        "aggregation, verify equivalence explicitly."
-    )
-    lines.append("")
-    if mode == "swarm":
-        lines.append(
-            "5. **INTERVENTION DESIGN**: For each hypothesized bottleneck from Step 3,\n"
-            "   design a transform:\n\n"
-            "   a) Match the diagnosed optimizer behavior to a transform category in §5a\n"
-            "      (missed pushdown → Predicate Movement, redundant scans → Scan Consolidation, etc.)\n"
-            "   b) If engine evidence exists for the matched transform:\n"
-            "      - Prefer the proven approach and follow documented gates\n"
-            "      - Apply the transform's structural preconditions as hard constraints\n"
-            "      - Use documented regressions as REJECTION criteria\n"
-            "   c) If no evidence exists (UNVERIFIED_HYPOTHESIS):\n"
-            "      - Design the intervention from the transform description + structural preconditions\n"
-            "      - RANK by estimated impact: (scan reduction × table size) > (join reordering)\n"
-            "        > (aggregation restructuring) > (window deferral)\n"
-            "      - Include a rollback path — explain what makes this rewrite reversible\n"
-            "   d) Assign 4 structurally diverse interventions. Each worker attacks a DIFFERENT\n"
-            "      bottleneck or a different approach to the same bottleneck.\n"
-            "      No two workers should apply the same transform to the same query region."
-        )
-    else:
-        lines.append(
-            "5. **INTERVENTION DESIGN**: For each hypothesized bottleneck from Step 3,\n"
-            "   design a transform:\n\n"
-            "   a) Match the diagnosed optimizer behavior to a transform category in §5a\n"
-            "   b) If engine evidence exists: prefer the proven approach and follow gates\n"
-            "   c) If no evidence exists (UNVERIFIED_HYPOTHESIS):\n"
-            "      - RANK by estimated impact: (scan reduction × table size) > (join reordering)\n"
-            "        > (aggregation restructuring) > (window deferral)\n"
-            "      - Include a rollback path — explain what makes this rewrite reversible\n"
-            "   Select the single best transform (or compound strategy of 2-3 transforms)\n"
-            "   that maximizes expected speedup for THIS query."
-        )
-    lines.append("")
-    if mode == "swarm":
-        lines.append(
-            "6. **LOGICAL TREE DESIGN**: For each worker's strategy, define the target logical tree "
-            "topology. Verify that every node contract has exhaustive output "
-            "columns by checking downstream references.\n"
-            "   CTE materialization matters for your design: a CTE referenced by "
-            "2+ consumers will likely be materialized (good — computed once, probed "
-            "many). A CTE referenced once may be inlined (no materialization benefit "
-            "from 'sharing'). Design shared CTEs only when multiple downstream nodes "
-            "consume them. See CTE_INLINING in Engine Profile strengths."
-        )
-    else:
-        lines.append(
-            "6. **LOGICAL TREE DESIGN**: Define the target logical tree topology for your chosen "
-            "strategy. Verify that every node contract has exhaustive output "
-            "columns by checking downstream references.\n"
-            "   CTE materialization matters: a CTE referenced by 2+ consumers "
-            "will likely be materialized. A CTE referenced once may be inlined."
-        )
-    lines.append("")
-    if mode == "oneshot":
-        lines.append(
-            "7. **WRITE REWRITE**: Implement your strategy as a JSON rewrite_set. "
-            "Each changed or added CTE is a node. Produce per-node SQL matching "
-            "your logical tree design from step 6. Declare output columns for every node "
-            "in `node_contracts`. The rewrite must be semantically equivalent to "
-            "the original."
-        )
-        lines.append("")
-
-    # Strategy Selection Rules (part of §6)
-    lines.append("### Strategy Selection Rules")
-    lines.append("")
-    lines.append(
-        "1. **CHECK APPLICABILITY**: Each transform has a structural prerequisite "
-        "(correlated subquery, UNION ALL CTE, LEFT JOIN, etc.). Verify the "
-        "query actually has the prerequisite before assigning a transform. "
-        "DO NOT assign decorrelation if there are no correlated subqueries."
-    )
-    lines.append(
-        "2. **CHECK OPTIMIZER OVERLAP**: Read the EXPLAIN plan. If the optimizer "
-        "already performs a transform (e.g., already splits a UNION CTE, "
-        "already pushes a predicate), that transform will have marginal "
-        "benefit. Note this in your reasoning and prefer transforms the "
-        "optimizer is NOT already doing."
-    )
-    if mode == "swarm":
-        lines.append(
-            "3. **MAXIMIZE DIVERSITY**: Each worker must attack a different part of "
-            "the execution plan. Do not assign 'pushdown variant A' and "
-            "'pushdown variant B'. Assign transforms from different categories above."
-        )
-    else:
-        lines.append(
-            "3. **MAXIMIZE EXPECTED VALUE**: Select the single strategy with the "
-            "highest expected speedup, considering both the magnitude of the "
-            "bottleneck it addresses and the historical success rate."
-        )
-    lines.append(
-        "4. **ASSESS RISK PER-QUERY**: Risk is a function of (transform x "
-        "query complexity), not an inherent property of the transform. "
-        "Decorrelation is low-risk on a simple EXISTS and high-risk on "
-        "nested correlation inside a CTE. Assess per-assignment."
-    )
-    lines.append(
-        "5. **COMPOSITION IS ALLOWED AND ENCOURAGED**: A strategy can "
-        "combine 2-3 transforms from different categories (e.g., "
-        "star_join_prefetch + scan_consolidation_pivot, or date_cte_isolate + "
-        "early_filter + decorrelate). The TARGET_LOGICAL_TREE should reflect the combined "
-        "structure. Compound strategies are often the source of the biggest wins."
-    )
-    if mode == "swarm":
-        lines.append(
-            "6. **MINIMAL-CHANGE BASELINE**: If the EXPLAIN shows the optimizer "
-            "already handles the primary bottleneck (e.g., already splits CTEs, "
-            "already pushes predicates), consider assigning one worker as a "
-            "minimal-change baseline: explicit JOINs only, no structural changes. "
-            "This provides a regression-safe fallback."
-        )
-    lines.append("")
-
-    if mode == "swarm":
-        lines.append(
-            "Each worker gets 1-3 examples from the 'Maps to examples' notes in "
-            "the Transform Catalog. The system auto-loads full before/after SQL "
-            "for each assigned example. Do NOT pad with irrelevant examples — "
-            "an irrelevant example is worse than no example."
-        )
-    else:
-        lines.append(
-            "Select 1-3 examples from the 'Maps to examples' notes that match "
-            "the strategy. The system auto-loads full before/after SQL."
-        )
-    lines.append("")
-    lines.append(
-        "For TARGET_LOGICAL_TREE: Define the CTE structure you want produced. "
-        "For NODE_CONTRACTS: Be exhaustive with OUTPUT columns — missing columns "
-        "cause semantic breaks."
-    )
-    lines.append("")
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # §7. OUTPUT SPECIFICATION
-    # ═══════════════════════════════════════════════════════════════════════
-
-    # ── §7a. Output Format ───────────────────────────────────────────────
-    lines.append("## §7a. Output Format")
-    lines.append("")
-    lines.append("Then produce the structured briefing in EXACTLY this format:")
-    lines.append("")
-    lines.append("```")
-
-    # Shared briefing section (identical across all modes)
-    lines.append("=== SHARED BRIEFING ===")
-    lines.append("")
-    lines.append("SEMANTIC_CONTRACT: (80-150 tokens, cover ONLY:)")
-    lines.append("(a) One sentence of business intent (start from pre-computed intent if available).")
-    lines.append("(b) JOIN type semantics that constrain rewrites (INNER = intersection = all sides must match).")
-    lines.append("(c) Any aggregation function traps specific to THIS query.")
-    lines.append("(d) Any filter dependencies that a rewrite could break.")
-    lines.append("Do NOT repeat information already in ACTIVE_CONSTRAINTS or REGRESSION_WARNINGS.")
-    lines.append("")
-    lines.append("BOTTLENECK_DIAGNOSIS:")
-    lines.append("[Which operation dominates cost and WHY (not just '50% cost').")
-    lines.append("Scan-bound vs join-bound vs aggregation-bound.")
-    lines.append("Cardinality flow (how many rows at each stage).")
-    lines.append("What the optimizer already handles well (don't re-optimize).")
-    lines.append("Whether logical-tree cost percentages are misleading.]")
-    lines.append("")
-    lines.append("ACTIVE_CONSTRAINTS:")
-    lines.append("- [CORRECTNESS_CONSTRAINT_ID]: [Why it applies to this query, 1 line]")
-    if is_discovery_mode:
-        lines.append("- [HYPOTHESIS_ID]: [Evidence from EXPLAIN that this hypothesis applies] (optional — 0-3)")
-        lines.append("(List all 4 correctness constraints. If any hypothesized gaps from §4")
-        lines.append("apply to this query, list 1-3 with EXPLAIN evidence. OK to list 0 if none match.)")
-    else:
-        lines.append("- [ENGINE_GAP_ID]: [Evidence from EXPLAIN that this gap is active]")
-        lines.append("(List all 4 correctness constraints + the 1-3 engine gaps that")
-        lines.append("are active for THIS query based on your EXPLAIN analysis.)")
-    lines.append("")
-    lines.append("REGRESSION_WARNINGS:")
-    lines.append("1. [Pattern name] ([observed regression]):")
-    lines.append("   CAUSE: [What happened mechanistically]")
-    lines.append("   RULE: [Actionable avoidance rule for THIS query]")
-    lines.append("(If no regression warnings are relevant, write 'None applicable.')")
-    lines.append("")
-
-    # Worker briefing format — varies per mode
-    # NODE_CONTRACTS instruction (stated once, applies to all workers):
-    if mode in ("swarm", "expert"):
-        lines.append(
-            "NODE_CONTRACTS: Write all fields as SQL fragments, not natural language. "
-            "Example: `WHERE: d_year IN (1999, 2000)` not `WHERE: filter to target years`. "
-            "Workers use these as specifications to code against."
-        )
-        lines.append("")
-
-    _WORKER_BRIEFING_TEMPLATE = [
-        "STRATEGY: [strategy_name]",
-        "TARGET_LOGICAL_TREE:",
-        "  [node] -> [node] -> [node]",
-        "NODE_CONTRACTS:",
-        "  [node_name]:",
-        "    FROM: [tables/CTEs]",
-        "    JOIN: [join conditions]",
-        "    WHERE: [filters]",
-        "    GROUP BY: [columns] (if applicable)",
-        "    AGGREGATE: [functions] (if applicable)",
-        "    OUTPUT: [exhaustive column list]",
-        "    EXPECTED_ROWS: [approximate row count from EXPLAIN analysis]",
-        "    CONSUMERS: [downstream nodes]",
-        "EXAMPLES: [ex1], [ex2], [ex3]",
-        "EXAMPLE_ADAPTATION:",
-        "  [For each: what to apply, what to IGNORE for this strategy.]",
-        "HAZARD_FLAGS:",
-        "- [Specific risk for this approach on this query]",
+    sections = [
+        section_role(mode),
+        section_the_case(
+            query_id, sql, explain_plan_text, dag, costs,
+            semantic_intents, dialect, dialect_version,
+            qerror_analysis, iteration_history,
+        ),
+        section_this_engine(
+            engine_profile, exploit_algorithm_text, dialect,
+            resource_envelope, plan_scanner_text,
+        ),
+        section_constraints(constraints, dag, costs),
+        section_investigate(mode, dag, qerror_analysis, explain_plan_text),
+        section_output_format(mode, is_discovery_mode, dialect),
+        section_reference_appendix(
+            engine_profile, exploit_algorithm_text, dag,
+            detected_transforms, matched_examples, dialect,
+        ),
     ]
 
-    if mode == "swarm":
-        for wid in range(1, 5):
-            if is_discovery_mode:
-                # Discovery mode: all workers are exploration workers
-                lines.append(f"=== WORKER {wid} BRIEFING === (EXPLORATION WORKER)")
-            elif wid == 4:
-                lines.append(f"=== WORKER {wid} BRIEFING === (EXPLORATION WORKER)")
-            else:
-                lines.append(f"=== WORKER {wid} BRIEFING ===")
-            lines.append("")
-            for tl in _WORKER_BRIEFING_TEMPLATE:
-                lines.append(tl)
-            if is_discovery_mode or wid == 4:
-                lines.append("CONSTRAINT_OVERRIDE: [CONSTRAINT_ID or 'None']")
-                lines.append("OVERRIDE_REASONING: [Why this query's structure differs from the observed failure, or 'N/A']")
-                lines.append("EXPLORATION_TYPE: [constraint_relaxation | compound_strategy | novel_combination]")
-                lines.append("HYPOTHESIS_TAG: [H1_CTE_PREDICATE_FENCE | H2_JOIN_ORDER | ... | NOVEL_<description>]")
-            if is_discovery_mode:
-                lines.append("HYPOTHESIS: [What optimizer blind spot this worker tests]")
-                lines.append("EVIDENCE: [Specific EXPLAIN plan features that suggest this gap]")
-                lines.append("EXPECTED_MECHANISM: [Why this transform should change the physical plan]")
-                lines.append("CONTROL_SIGNAL: [How to tell if the hypothesis was wrong — what regression looks like]")
-            lines.append("")
-    elif mode == "expert":
-        lines.append("=== WORKER 1 BRIEFING ===")
-        lines.append("")
-        for tl in _WORKER_BRIEFING_TEMPLATE:
-            lines.append(tl)
-    elif mode == "oneshot":
-        lines.append("=== REWRITE ===")
-        lines.append("")
-        lines.append("First output a **Modified Logic Tree** showing what changed:")
-        lines.append("- `[+]` new  `[-]` removed  `[~]` modified  `[=]` unchanged  `[!]` structural")
-        lines.append("")
-        lines.append("Then output a **Component Payload JSON**:")
-        lines.append("")
-        lines.append("```json")
-        lines.append("{")
-        lines.append('  "spec_version": "1.0",')
-        lines.append('  "dialect": "<dialect>",')
-        lines.append('  "rewrite_rules": [{"id": "R1", "type": "<transform>", "description": "<what>", "applied_to": ["<comp_id>"]}],')
-        lines.append('  "statements": [{')
-        lines.append('    "target_table": null,')
-        lines.append('    "change": "modified",')
-        lines.append('    "components": {')
-        lines.append('      "<cte_name>": {"type": "cte", "change": "modified", "sql": "<CTE body>", "interfaces": {"outputs": ["col1"], "consumes": []}},')
-        lines.append('      "main_query": {"type": "main_query", "change": "modified", "sql": "<final SELECT>", "interfaces": {"outputs": ["col1"], "consumes": ["<cte_name>"]}}')
-        lines.append("    },")
-        lines.append('    "reconstruction_order": ["<cte_name>", "main_query"],')
-        lines.append('    "assembly_template": "WITH <cte_name> AS ({<cte_name>}) {main_query}"')
-        lines.append("  }],")
-        lines.append('  "macros": {},')
-        lines.append('  "frozen_blocks": [],')
-        if dialect in ("postgres", "postgresql"):
-            lines.append('  "runtime_config": ["SET LOCAL work_mem = \'512MB\'"],')
-        lines.append('  "validation_checks": []')
-        lines.append("}")
-        lines.append("```")
-        lines.append("")
-        lines.append("Rules:")
-        lines.append("- Tree first, always — generate Logic Tree before writing SQL")
-        lines.append("- One component at a time — treat other components as opaque interfaces")
-        lines.append("- No ellipsis — every `sql` value must be complete, executable SQL")
-        lines.append("- Only include changed/added components; set unchanged to `\"change\": \"unchanged\"` with `\"sql\": \"\"`")
-        lines.append("- `main_query` output columns must match original exactly")
-        if dialect in ("postgres", "postgresql"):
-            lines.append("- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit if not needed")
-        lines.append("")
-        lines.append("After the JSON, explain the mechanism:")
-        lines.append("")
-        lines.append("```")
-        lines.append("Changes: <1-2 sentences: what structural change + the expected mechanism>")
-        lines.append("Expected speedup: <estimate>")
-        lines.append("```")
-
-    lines.append("```")
-    lines.append("")
-
-    # ── §7b. Validation Checklist ────────────────────────────────────────
-    if mode == "swarm":
-        lines.append(build_analyst_section_checklist(is_discovery_mode=is_discovery_mode))
-    elif mode == "expert":
-        lines.append(build_expert_section_checklist())
-    elif mode == "oneshot":
-        lines.append(build_oneshot_section_checklist())
-    lines.append("")
-
-    # ── §7c. Worker Exploration Rules (swarm only) ──────────────────────
-    if mode == "swarm":
-        if is_discovery_mode:
-            lines.append("## §7c. Discovery Mode — All Workers Explore")
-            lines.append("")
-            lines.append(
-                "DISCOVERY MODE: No empirical engine profile exists. All 4 workers are exploration "
-                "workers. Each tests a DIFFERENT hypothesis from your EXPLAIN analysis."
-            )
-            lines.append("")
-            lines.append(
-                "  Worker 1: Highest-confidence hypothesis — most obvious bottleneck with clearest\n"
-                "            intervention path. This is the 'most likely to work' bet.\n"
-                "  Worker 2: Second-highest impact — may target a different bottleneck entirely or\n"
-                "            a more aggressive version of Worker 1's approach.\n"
-                "  Worker 3: Structural inefficiency — redundant scans, missed decorrelation,\n"
-                "            unnecessary materialization. Targets plan shape, not filter placement.\n"
-                "  Worker 4: Compound / speculative — combines 2 transforms, or tests a hypothesis\n"
-                "            with lower confidence. This is the 'high risk / high reward' worker."
-            )
-            lines.append("")
-            lines.append(
-                "Each worker MUST specify in their briefing:\n"
-                "  HYPOTHESIS: What optimizer blind spot this worker tests\n"
-                "  EVIDENCE: Specific EXPLAIN plan features that suggest this gap\n"
-                "  EXPECTED_MECHANISM: Why this transform should change the physical plan\n"
-                "  CONTROL_SIGNAL: How to tell if the hypothesis was wrong (what would regression look like)"
-            )
-            lines.append("")
-            lines.append(
-                "No worker may violate correctness constraints "
-                "(LITERAL_PRESERVATION, SEMANTIC_EQUIVALENCE, COMPLETE_OUTPUT, "
-                "CTE_COLUMN_COMPLETENESS)."
-            )
-            lines.append("")
-        else:
-            lines.append("## §7c. Worker 4 Exploration Rules")
-            lines.append("")
-            lines.append(
-                "Workers 1-3 follow the engine profile's proven patterns. "
-                "**Worker 4 is the EXPLORATION worker** with a different mandate:"
-            )
-            lines.append("")
-            lines.append(
-                "Worker 4 MAY (in priority order — prefer higher-value exploration):\n"
-                "  (c) **PREFERRED**: Attempt a novel technique not listed in the engine "
-                "profile, if the EXPLAIN plan reveals an optimizer blind spot not yet "
-                "documented. This is the highest-value exploration — new discoveries "
-                "expand the engine profile for all future queries.\n"
-                "  (b) Combine 2-3 transforms from different engine gaps into a compound "
-                "strategy that hasn't been tested before. Medium value — tests "
-                "interaction effects between known patterns.\n"
-                "  (a) Retry a technique from 'what_didnt_work', IF the structural "
-                "context of THIS query differs materially from the observed failure — "
-                "explain the structural difference in HAZARD_FLAGS. Lowest priority — "
-                "only when the query structure clearly diverges from the failed case."
-            )
-            lines.append("")
-            lines.append(
-                "Worker 4 may NEVER violate correctness constraints "
-                "(LITERAL_PRESERVATION, SEMANTIC_EQUIVALENCE, COMPLETE_OUTPUT, "
-                "CTE_COLUMN_COMPLETENESS)."
-            )
-            lines.append("")
-            lines.append(
-                "The exploration worker's output is tagged EXPLORATORY and tracked "
-                "separately. Past failures documented in the engine profile are "
-                "context-specific — they happened on specific queries with specific "
-                "structures. Worker 4's job is to test whether those failures "
-                "generalize or not. If Worker 4 discovers a new win, it becomes "
-                "field intelligence for the engine profile."
-            )
-            lines.append("")
-
-    # ── §7d. Output Consumption Spec (swarm only) ────────────────────────
-    if mode == "swarm":
-        lines.append("## §7d. Output Consumption Spec")
-        lines.append("")
-        lines.append(
-            "Each worker receives: SHARED BRIEFING + their WORKER N BRIEFING + "
-            "full before/after SQL for assigned examples + original SQL + output format.\n"
-            "Workers do NOT see other workers' briefings."
-        )
-
-    return "\n".join(lines)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Script-level oneshot — full multi-statement pipeline in one prompt
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def build_script_oneshot_prompt(
-    sql_script: str,
-    script_dag: Any,  # ScriptDAG from script_parser.py
-    dialect: str = "duckdb",
-    explain_plans: Optional[Dict[str, str]] = None,
-    engine_profile: Optional[Dict[str, Any]] = None,
-    matched_examples: Optional[List[Dict[str, Any]]] = None,
-    constraints: Optional[List[Dict[str, Any]]] = None,
-    resource_envelope: Optional[str] = None,
-) -> str:
-    """Build a oneshot prompt for an entire multi-statement SQL pipeline.
-
-    Unlike the single-query oneshot which optimizes one SELECT in isolation,
-    this prompt gives the model the FULL script + dependency graph so it can
-    reason about cross-statement optimizations:
-      - Predicate pushdown across materialization boundaries
-      - Redundant scan elimination across statements
-      - Materialization point optimization (table vs view vs CTE)
-      - Filter propagation from downstream consumers to upstream producers
-
-    Args:
-        sql_script: Full SQL script text (all statements)
-        script_dag: ScriptDAG with dependency graph and optimization targets
-        dialect: SQL dialect
-        explain_plans: Map of object_name -> EXPLAIN ANALYZE text for each
-            optimization target. Collected by running the pipeline stages
-            in dependency order against a real database.
-        engine_profile: Engine optimizer strengths/gaps (optional)
-        matched_examples: Gold examples for pattern matching (optional)
-        constraints: Correctness constraints (optional)
-
-    Returns:
-        Complete prompt text for a single LLM call
-    """
-    lines: List[str] = []
-
-    # ── 1. Role framing ──────────────────────────────────────────────
-    lines.append(
-        "You are a senior SQL pipeline optimization architect. Your job is to "
-        "analyze a multi-statement SQL data pipeline end-to-end and produce "
-        "optimized rewrites that exploit cross-statement optimization "
-        "opportunities that no single-query optimizer can see."
-    )
-    lines.append("")
-    lines.append(
-        f"**Dialect**: {dialect}. All SQL must be valid {dialect} syntax."
-    )
-    lines.append("")
-
-    # ── 2. Pipeline dependency graph context ──────────────────────────────────────
-    lines.append("## Pipeline Dependency Graph")
-    lines.append("")
-    lines.append(
-        "This script is a data pipeline. Each CREATE TABLE/VIEW is a pipeline "
-        "stage that materializes intermediate results. The dependency graph below "
-        "shows what each stage creates, what it depends on, and which stages "
-        "have enough structural complexity to be worth optimizing."
-    )
-    lines.append("")
-    lines.append("```")
-    lines.append(script_dag.summary())
-    lines.append("```")
-    lines.append("")
-
-    # Lineage narrative for optimization targets
-    targets = script_dag.optimization_targets()
-    if targets:
-        lines.append("### Key Optimization Chains")
-        lines.append("")
-        for target in targets:
-            deps = sorted(target.references & set(script_dag._creates_index.keys()))
-            if deps:
-                lines.append(
-                    f"- **{target.creates_object}** (complexity={target.complexity_score}) "
-                    f"← depends on: {', '.join(deps)}"
-                )
-        lines.append("")
-
-    # ── 3. EXPLAIN ANALYZE plans ───────────────────────────────────
-    if explain_plans:
-        lines.append("## EXPLAIN ANALYZE Plans")
-        lines.append("")
-        lines.append(
-            "Execution plans for each optimization target, collected by "
-            "running the pipeline in dependency order against a real database. "
-            "Use these to identify actual cost hotspots, scan sizes, and "
-            "join strategies."
-        )
-        lines.append("")
-        for target in targets:
-            name = target.creates_object
-            if name and name in explain_plans:
-                lines.append(f"### {name} (complexity={target.complexity_score})")
-                lines.append("")
-                lines.append("```")
-                lines.append(explain_plans[name].strip())
-                lines.append("```")
-                lines.append("")
-
-    # ── 4. Cross-statement optimization opportunities ────────────────
-    lines.append("## Cross-Statement Optimization Opportunities")
-    lines.append("")
-    lines.append(
-        "These are the high-value patterns to look for in multi-statement "
-        "pipelines. Single-query optimizers CANNOT do these — they require "
-        "seeing the full pipeline:"
-    )
-    lines.append("")
-    lines.append(
-        "1. **Predicate pushdown across materialization boundaries**: "
-        "A downstream stage filters on a column that exists in an upstream "
-        "view/table. Push that filter into the upstream definition so it "
-        "scans less data from the start. This is the #1 win in pipeline "
-        "optimization."
-    )
-    lines.append(
-        "2. **Redundant scan elimination**: The same base table is scanned "
-        "by multiple views/stages with overlapping columns. Consolidate "
-        "into a shared CTE or materialized stage."
-    )
-    lines.append(
-        "3. **Materialization point optimization**: Some intermediate tables "
-        "exist only because the author couldn't express the logic as CTEs. "
-        "Converting temp tables to CTEs within the consuming query lets the "
-        "optimizer see through the boundary."
-    )
-    lines.append(
-        "4. **Filter propagation**: Downstream consumers apply filters "
-        "(e.g., `WHERE calendar_date = max(...)`, `WHERE customer_type IN (...)`). "
-        "If the upstream stage doesn't filter, it's scanning unnecessary data. "
-        "Propagate the filter upstream."
-    )
-    lines.append(
-        "5. **Join elimination**: If an upstream stage joins a table only to "
-        "produce columns that no downstream consumer uses, that join can be "
-        "removed."
-    )
-    lines.append("")
-
-    # ── 4. Engine profile (if available) ─────────────────────────────
-    if engine_profile:
-        lines.append("## Engine Profile")
-        lines.append("")
-        if "briefing_note" in engine_profile:
-            lines.append(engine_profile["briefing_note"])
-            lines.append("")
-        gaps = engine_profile.get("gaps", [])
-        if gaps:
-            lines.append("### Optimizer Gaps (exploit these)")
-            lines.append("")
-            for gap in gaps:
-                lines.append(
-                    f"- **{gap.get('id', '?')}**: {gap.get('what', '')}"
-                )
-            lines.append("")
-
-    # ── 5. Examples (if available) ───────────────────────────────────
-    if matched_examples:
-        lines.append("## Optimization Examples")
-        lines.append("")
-        for ex in matched_examples[:5]:
-            ex_id = ex.get("id", "?")
-            desc = ex.get("description", "")
-            speedup = ex.get("speedup", "?")
-            lines.append(f"- **{ex_id}** ({speedup}x): {desc}")
-        lines.append("")
-
-    # ── 6. Full SQL script ───────────────────────────────────────────
-    lines.append("## Complete SQL Pipeline")
-    lines.append("")
-    lines.append(
-        "Below is the COMPLETE pipeline. Every statement is shown — views, "
-        "temp tables, drops, selects. Read the full pipeline before proposing "
-        "any changes. Your rewrites must maintain semantic equivalence for "
-        "every downstream consumer."
-    )
-    lines.append("")
-    lines.append("```sql")
-    lines.append(sql_script.strip())
-    lines.append("```")
-    lines.append("")
-
-    # ── 7. Analysis steps ────────────────────────────────────────────
-    lines.append("## Your Analysis Steps")
-    lines.append("")
-    lines.append(
-        "1. **TRACE DATA FLOW**: Follow the pipeline dependency graph from base tables "
-        "to final outputs."
-    )
-    lines.append(
-        "2. **IDENTIFY FILTER BOUNDARIES**: Where do filters first appear? "
-        "Can they be pushed earlier in the chain?"
-    )
-    lines.append(
-        "3. **MAP BASE TABLE SCANS**: Which base tables are scanned by "
-        "multiple stages? Can scans be consolidated?"
-    )
-    lines.append(
-        "4. **CHECK MATERIALIZATION NECESSITY**: Does each temp table NEED "
-        "to be materialized, or could it be inlined as a CTE?"
-    )
-    lines.append(
-        "5. **WRITE REWRITES**: For each statement you change, produce a "
-        "component payload in the output format below."
-    )
-    lines.append("")
-
-    # ── 8. Output format (DAP multi-statement) ─────────────────────────
-    lines.append("## Output Format")
-    lines.append("")
-    lines.append(
-        "First output a **Modified Logic Tree** for the pipeline, showing "
-        "which statements and components changed."
-    )
-    lines.append("")
-    lines.append(
-        "Then output a **Component Payload JSON** with one statement entry "
-        "per pipeline stage you modify."
-    )
-    lines.append("")
-    lines.append("```json")
-    lines.append("{")
-    lines.append('  "spec_version": "1.0",')
-    lines.append('  "dialect": "<dialect>",')
-    lines.append('  "rewrite_rules": [')
-    lines.append('    {"id": "R1", "type": "<transform>", "description": "<what>", "applied_to": ["<stmt.comp>"]}')
-    lines.append("  ],")
-    lines.append('  "statements": [')
-    lines.append("    {")
-    lines.append('      "target_table": "<table_or_view_name>",')
-    lines.append('      "change": "modified",')
-    lines.append('      "components": {')
-    lines.append('        "<cte_name>": {"type": "cte", "change": "modified", "sql": "<CTE body>", "interfaces": {"outputs": ["col1"], "consumes": []}},')
-    lines.append('        "main_query": {"type": "main_query", "change": "modified", "sql": "<SELECT>", "interfaces": {"outputs": ["col1"], "consumes": ["<cte_name>"]}}')
-    lines.append("      },")
-    lines.append('      "reconstruction_order": ["<cte_name>", "main_query"],')
-    lines.append('      "assembly_template": "CREATE TABLE <target> AS WITH <cte> AS ({<cte>}) {main_query}"')
-    lines.append("    }")
-    lines.append("  ],")
-    lines.append('  "macros": {},')
-    lines.append('  "frozen_blocks": [],')
-    if dialect in ("postgres", "postgresql"):
-        lines.append('  "runtime_config": ["SET LOCAL work_mem = \'512MB\'"],')
-    lines.append('  "validation_checks": []')
-    lines.append("}")
-    lines.append("```")
-    lines.append("")
-    lines.append("### Rules")
-    lines.append("- Tree first — generate the pipeline Logic Tree before writing any SQL")
-    lines.append(
-        "- Each `statements[]` entry targets a specific pipeline stage "
-        "(must match a CREATE in the script)"
-    )
-    lines.append("- Only include statements you actually change")
-    lines.append(
-        "- Output columns of each stage must remain identical "
-        "(downstream consumers depend on them)"
-    )
-    lines.append(
-        "- Rewrites must be semantically equivalent for ALL downstream "
-        "consumers, not just the immediate next stage"
-    )
-    lines.append("- No ellipsis — every `sql` value must be complete, executable SQL")
-    if dialect in ("postgres", "postgresql"):
-        lines.append("- `runtime_config`: SET LOCAL commands for PostgreSQL. Omit if not needed")
-    lines.append("")
-    lines.append("After the JSON, explain the overall pipeline optimization:")
-    lines.append("")
-    lines.append("```")
-    lines.append(
-        "Pipeline changes: <2-4 sentences: what cross-statement "
-        "optimizations and why>"
-    )
-    lines.append("Expected overall speedup: <estimate>")
-    lines.append("```")
-    lines.append("")
-
-    # ── 9. Validation checklist ──────────────────────────────────────
-    lines.append("## Pipeline Validation Checklist")
-    lines.append("")
-    lines.append(
-        "- Every modified stage preserves its output schema "
-        "(column names, types, row semantics)"
-    )
-    lines.append(
-        "- Filters pushed upstream do not remove rows that "
-        "downstream consumers need"
-    )
-    lines.append(
-        "- If a temp table is inlined as CTE, ALL consumers of "
-        "that table must be updated"
-    )
-    lines.append(
-        "- Redundant scan consolidation must not change join cardinality"
-    )
-    lines.append("- All literal values preserved exactly")
-    lines.append("")
-
-    return "\n".join(lines)
+    return "\n\n".join(sections)

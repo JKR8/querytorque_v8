@@ -105,7 +105,7 @@ class CandidateGenerator:
     ) -> str:
         """Analyst call with explicit max_tokens.
 
-        The V2 analyst needs ~2000-3200 output tokens. DeepSeek defaults
+        The analyst briefing needs ~2000-3200 output tokens. DeepSeek defaults
         to 16384 (sufficient), but Anthropic/OpenAI default to 4096.
         Falls back to _analyze() if the client doesn't support max_tokens.
 

@@ -244,7 +244,7 @@ class SwarmSession(OptimizationSession):
         Returns True if candidates were found and loaded, False otherwise.
         Reconstructs _gen_result so validate_and_finish() can proceed.
         """
-        from ..prompts.v2_swarm_parsers import V2BriefingWorker, V2BriefingShared, V2ParsedBriefing
+        from ..prompts.swarm_parsers import BriefingWorker, BriefingShared, ParsedBriefing
 
         session_dir = self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id
         iter_dir = session_dir / "iteration_00_fan_out"
@@ -276,8 +276,8 @@ class SwarmSession(OptimizationSession):
             sql_file = w_dir / "optimized.sql"
             optimized_sql = sql_file.read_text(errors="replace") if sql_file.exists() else data.get("optimized_sql", self.original_sql)
 
-            # Reconstruct V2BriefingWorker stub (enough for validation)
-            wb = V2BriefingWorker(
+            # Reconstruct BriefingWorker stub (enough for validation)
+            wb = BriefingWorker(
                 worker_id=wid,
                 strategy=data.get("strategy", ""),
                 examples=data.get("examples_used", []),
@@ -293,8 +293,8 @@ class SwarmSession(OptimizationSession):
             return False
 
         # Reconstruct minimal briefing (shared sections not needed for validation)
-        briefing = V2ParsedBriefing(
-            shared=V2BriefingShared(),
+        briefing = ParsedBriefing(
+            shared=BriefingShared(),
             workers=[candidates_by_worker[wid][0] for wid in sorted(candidates_by_worker)],
             raw=analyst_response,
         )
@@ -326,8 +326,8 @@ class SwarmSession(OptimizationSession):
 
         Returns True if analyst was recovered and workers generated.
         """
-        from ..prompts.v2_swarm_parsers import parse_v2_briefing_response
-        from ..prompts import validate_v2_parsed_briefing
+        from ..prompts.swarm_parsers import parse_briefing_response
+        from ..prompts import validate_parsed_briefing
 
         session_dir = self.pipeline.benchmark_dir / "swarm_sessions" / self.query_id
         iter_dir = session_dir / "iteration_00_fan_out"
@@ -346,13 +346,13 @@ class SwarmSession(OptimizationSession):
 
         # Re-parse analyst briefing
         try:
-            briefing = parse_v2_briefing_response(analyst_response)
+            briefing = parse_briefing_response(analyst_response)
         except Exception as e:
             logger.warning(f"[{self.query_id}] Failed to parse saved analyst response: {e}")
             return False
 
         # Validate briefing quality — reject if critical issues found
-        briefing_issues = validate_v2_parsed_briefing(briefing)
+        briefing_issues = validate_parsed_briefing(briefing)
         if briefing_issues:
             for issue in briefing_issues[:4]:
                 logger.warning(f"[{self.query_id}] Resume briefing issue: {issue}")
@@ -385,10 +385,10 @@ class SwarmSession(OptimizationSession):
             )
             briefing.workers = deduped
         # Pad missing worker IDs up to 4
-        from ..prompts.v2_swarm_parsers import V2BriefingWorker
+        from ..prompts.swarm_parsers import BriefingWorker
         for wid in range(1, 5):
             if wid not in seen_ids:
-                briefing.workers.append(V2BriefingWorker(worker_id=wid))
+                briefing.workers.append(BriefingWorker(worker_id=wid))
                 logger.warning(f"[{self.query_id}] Padded missing Worker {wid} in resumed briefing")
         briefing.workers.sort(key=lambda w: w.worker_id)
         briefing.workers = briefing.workers[:4]
@@ -418,13 +418,13 @@ class SwarmSession(OptimizationSession):
         Reuses the worker generation logic from _generate_fan_out but skips
         the analyst LLM call entirely.
         """
-        from ..prompts.v2_worker import build_v2_worker_prompt
+        from ..prompts.worker import build_worker_prompt
         from ..generate import CandidateGenerator
         from ..logic_tree import build_logic_tree
 
         t_gen = time.time()
 
-        # Build output columns (must be List[str] — build_v2_worker_prompt iterates it)
+        # Build output columns (must be List[str] — build_worker_prompt iterates it)
         output_columns: List[str] = []
         if self._dag:
             try:
@@ -457,7 +457,7 @@ class SwarmSession(OptimizationSession):
             examples = self.pipeline._load_examples_by_id(
                 worker_briefing.examples, self.engine
             )
-            prompt = build_v2_worker_prompt(
+            prompt = build_worker_prompt(
                 worker_briefing=worker_briefing,
                 shared_briefing=briefing.shared,
                 examples=examples,
@@ -671,9 +671,9 @@ class SwarmSession(OptimizationSession):
         Does NOT touch the database for benchmarking.
         """
         from ..prompts import (
-            build_v2_analyst_briefing_prompt,
-            parse_v2_briefing_response,
-            validate_v2_parsed_briefing,
+            build_analyst_briefing_prompt,
+            parse_briefing_response,
+            validate_parsed_briefing,
         )
         # ── Step 1: Gather all raw data ──────────────────────────────────
         self._stage(self.query_id, "Gathering data (EXPLAIN, knowledge, examples)...")
@@ -720,8 +720,8 @@ class SwarmSession(OptimizationSession):
         self._matched_examples = matched_examples
         self._regression_warnings = regression_warnings
 
-        # ── Step 2: Build analyst prompt (V2 §I-§VIII template) ──────────
-        analyst_prompt = build_v2_analyst_briefing_prompt(
+        # ── Step 2: Build analyst prompt (§I-§VII template) ───────────────
+        analyst_prompt = build_analyst_briefing_prompt(
             query_id=self.query_id,
             sql=self.original_sql,
             explain_plan_text=explain_plan_text,
@@ -773,8 +773,8 @@ class SwarmSession(OptimizationSession):
         (iter_dir / "analyst_response.txt").write_text(analyst_response, encoding="utf-8")
 
         # ── Step 4: Parse briefing (with retry on format errors) ────────
-        briefing = parse_v2_briefing_response(analyst_response)
-        briefing_issues = validate_v2_parsed_briefing(briefing)
+        briefing = parse_briefing_response(analyst_response)
+        briefing_issues = validate_parsed_briefing(briefing)
 
         if briefing_issues:
             # Retry once: feed error back to LLM
@@ -807,8 +807,8 @@ class SwarmSession(OptimizationSession):
                     analyst_response, encoding="utf-8"
                 )
 
-                briefing = parse_v2_briefing_response(analyst_response)
-                briefing_issues = validate_v2_parsed_briefing(
+                briefing = parse_briefing_response(analyst_response)
+                briefing_issues = validate_parsed_briefing(
                     briefing, lenient=True,
                 )
             except Exception as e:
@@ -1341,7 +1341,7 @@ class SwarmSession(OptimizationSession):
         Returns dict of worker_id → formatted explain text or error context.
         """
         from ..execution.database_utils import run_explain_analyze, run_explain_text
-        from ..prompts.v2_analyst_briefing import format_pg_explain_tree
+        from ..prompts.analyst_briefing import format_pg_explain_tree
 
         explains: Dict[int, str] = {}
         dsn = self.pipeline.config.db_path_or_dsn
@@ -2065,8 +2065,8 @@ class SwarmSession(OptimizationSession):
             fan_out = self.iterations_data[0]
             bs = fan_out.get("briefing_shared")
             if bs:
-                from ..prompts.v2_swarm_parsers import V2BriefingShared
-                shared_briefing = V2BriefingShared(
+                from ..prompts.swarm_parsers import BriefingShared
+                shared_briefing = BriefingShared(
                     semantic_contract=bs.get("semantic_contract", ""),
                     bottleneck_diagnosis=bs.get("bottleneck_diagnosis", ""),
                     active_constraints=bs.get("active_constraints", ""),
@@ -2243,22 +2243,33 @@ class SwarmSession(OptimizationSession):
         from ..validation.mini_validator import MiniValidator
 
         results: Dict[int, Any] = {}
-        mini_validator = MiniValidator(
-            db_path=self.pipeline.config.db_path_or_dsn,
-            sample_pct=self.pipeline.config.semantic_sample_pct,
-            timeout_ms=self.pipeline.config.semantic_timeout_ms,
-            dialect=self.dialect,
-        )
+        cfg = self.pipeline.config
+
+        def _validate_one(wid: int, optimized_sql: str) -> Any:
+            # One validator/executor per worker to avoid cross-thread connection sharing.
+            validator = MiniValidator(
+                db_path=cfg.db_path_or_dsn,
+                sample_pct=cfg.semantic_sample_pct,
+                timeout_ms=cfg.semantic_timeout_ms,
+                dialect=self.dialect,
+            )
+            try:
+                return validator.validate_rewrite(
+                    self.original_sql,
+                    optimized_sql,
+                    wid,
+                )
+            finally:
+                validator.close()
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {}
             for wid in sorted_wids:
                 wb, optimized_sql, *_ = candidates_by_worker[wid]
                 future = pool.submit(
-                    mini_validator.validate_rewrite,
-                    self.original_sql,
-                    optimized_sql,
+                    _validate_one,
                     wid,
+                    optimized_sql,
                 )
                 futures[future] = wid
 
@@ -2283,8 +2294,6 @@ class SwarmSession(OptimizationSession):
                         errors=[error_msg],
                     )
                     self._stage(self.query_id, f"SEMANTIC W{wid}: exception — {error_msg}")
-
-        mini_validator.close()
         return results
 
     def _checksum_race_verdicts(
@@ -2390,7 +2399,7 @@ class SwarmSession(OptimizationSession):
             costs=costs,
             history=None,
             examples=examples,
-            expert_analysis=None,
+            analyst_analysis=None,
             global_learnings=global_learnings,
             regression_warnings=regression_warnings,
             dialect=self.dialect,

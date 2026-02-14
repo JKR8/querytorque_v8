@@ -77,7 +77,7 @@ def prepare(
 
     # Lazy imports — keep `qt --help` fast
     from ..pipeline import Pipeline
-    from ..prompts.v2_analyst_briefing import build_v2_analyst_briefing_prompt
+    from ..prompts import build_analyst_briefing_prompt
 
     if bootstrap:
         import os
@@ -109,7 +109,7 @@ def prepare(
                 query_id=qid, sql=sql, dialect=dialect, engine=engine,
             )
 
-            prompt = build_v2_analyst_briefing_prompt(
+            prompt = build_analyst_briefing_prompt(
                 query_id=qid,
                 sql=sql,
                 explain_plan_text=ctx_data.get("explain_plan_text"),

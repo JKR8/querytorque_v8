@@ -11,7 +11,7 @@ Built by `analyst_briefing.py::build_analyst_briefing_prompt()`.
 ### §1. ROLE & MISSION
 - Framing: analyst as architect, workers as implementers
 - Information asymmetry: analyst sees everything, workers see only their briefing
-- Mode variants: swarm (4 workers), expert (1 worker), oneshot (analyze + produce SQL)
+- Mode variants: swarm (4 workers), oneshot (analyze + produce SQL)
 
 ### §2. INPUT PACKAGE
 - **§2a**: Original SQL with line numbers
@@ -19,7 +19,7 @@ Built by `analyst_briefing.py::build_analyst_briefing_prompt()`.
 - **§2b-i**: Cardinality Estimation Routing (Q-Error). Direction + Locus → pathology routing + structural flags. From `qerror.py::format_qerror_for_prompt()`. Same structure for all engines (DuckDB, PostgreSQL, Snowflake). Auto-detects plan format. Snowflake: plan_json typically null (no ANALYZE), section omitted gracefully. Only predictive signals (routing 85% accurate); magnitude/severity deliberately excluded.
 - **§2c**: Logic tree from `build_logic_tree()` + per-node detail cards
 - **§2d**: Pre-computed semantic intent (if available)
-- **§2e**: Iteration history (expert/oneshot iterative mode only)
+- **§2e**: Iteration history (oneshot iterative mode only)
 
 ### §3. CONSTRAINTS (hard rules)
 - **§3a**: 4 correctness constraints (LITERAL_PRESERVATION, SEMANTIC_EQUIVALENCE, COMPLETE_OUTPUT, CTE_COLUMN_COMPLETENESS)
@@ -100,8 +100,8 @@ Workers receive a subset of analyst output. 8 sections:
 1. Role framing (strategy executor)
 2. Original SQL
 3. EXPLAIN plan
-4. Shared briefing (from analyst: SEMANTIC_CONTRACT, BOTTLENECK_DIAGNOSIS, ACTIVE_CONSTRAINTS, REGRESSION_WARNINGS)
-5. Worker-specific briefing (from analyst: STRATEGY, TARGET_LOGICAL_TREE, NODE_CONTRACTS, EXAMPLES, HAZARD_FLAGS)
+4. Shared briefing (from analyst: SEMANTIC_CONTRACT, OPTIMAL_PATH, CURRENT_PLAN_GAP, ACTIVE_CONSTRAINTS, REGRESSION_WARNINGS)
+5. Worker-specific briefing (from analyst: STRATEGY, APPROACH, TARGET_QUERY_MAP, NODE_CONTRACTS, EXAMPLES, HAZARD_FLAGS)
 6. Gold example before/after SQL (system-loaded based on EXAMPLES field)
 7. Output format (component payload JSON)
 7b. SET LOCAL config section (PG workers only, system resource envelope)

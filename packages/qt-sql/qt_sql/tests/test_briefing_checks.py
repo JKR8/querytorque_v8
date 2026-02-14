@@ -1,4 +1,4 @@
-"""Tests for V2 analyst briefing checklists and semantic validation."""
+"""Tests for analyst briefing checklists and semantic validation."""
 
 from __future__ import annotations
 
@@ -21,9 +21,12 @@ def _semantic_contract_90_tokens() -> str:
 def _shared_valid() -> BriefingShared:
     return BriefingShared(
         semantic_contract=_semantic_contract_90_tokens(),
-        bottleneck_diagnosis=(
+        optimal_path=(
             "Dominant cost is join-bound due to a non-equi join expansion; "
             "cardinality falls late and optimizer already handles dimension lookup ordering well."
+        ),
+        current_plan_gap=(
+            "- MINIMIZE ROWS TOUCHED: late cardinality reduction causes excessive scans."
         ),
         active_constraints=(
             "- LITERAL_PRESERVATION: preserve all constants exactly.\n"
@@ -33,35 +36,51 @@ def _shared_valid() -> BriefingShared:
             "- NON_EQUI_JOIN_INPUT_BLINDNESS: EXPLAIN shows nested-loop on large inputs."
         ),
         regression_warnings="None applicable.",
+        diversity_map=(
+            "| Worker | Role | Primary Family | Secondary | Key Structural Idea |\n"
+            "| W1 | proven_compound | A | C | Early filtering then aggregate |\n"
+            "| W2 | structural_alt | B | D | Decorrelation path |\n"
+            "| W3 | aggressive_compound | E | F | Materialize and reshape joins |\n"
+            "| W4 | novel_orthogonal | D | A | Set-operation exploration |"
+        ),
     )
 
 
-def _valid_target_logical_tree() -> str:
+def _valid_target_query_map() -> str:
+    return "base_scan -> grouped"
+
+
+def _valid_node_contracts() -> str:
     return (
-        "TARGET_LOGICAL_TREE:\n"
-        "  base_scan -> grouped\n\n"
-        "NODE_CONTRACTS:\n"
-        "  base_scan:\n"
-        "    FROM: catalog_sales\n"
-        "    WHERE: cs_wholesale_cost BETWEEN 35 AND 55\n"
-        "    OUTPUT: cs_item_sk, cs_quantity\n"
-        "    EXPECTED_ROWS: ~1000\n"
-        "    CONSUMERS: grouped\n\n"
-        "  grouped:\n"
-        "    FROM: base_scan\n"
-        "    GROUP BY: cs_item_sk\n"
-        "    AGGREGATE: COUNT(*) AS total_cnt\n"
-        "    OUTPUT: cs_item_sk, total_cnt\n"
-        "    EXPECTED_ROWS: ~100\n"
-        "    CONSUMERS: result"
+        "base_scan:\n"
+        "  FROM: catalog_sales\n"
+        "  WHERE: cs_wholesale_cost BETWEEN 35 AND 55\n"
+        "  OUTPUT: cs_item_sk, cs_quantity\n"
+        "  EXPECTED_ROWS: ~1000\n"
+        "  CONSUMERS: grouped\n\n"
+        "grouped:\n"
+        "  FROM: base_scan\n"
+        "  GROUP BY: cs_item_sk\n"
+        "  AGGREGATE: COUNT(*) AS total_cnt\n"
+        "  OUTPUT: cs_item_sk, total_cnt\n"
+        "  EXPECTED_ROWS: ~100\n"
+        "  CONSUMERS: result"
     )
 
 
-def _worker(worker_id: int, target_logical_tree: str | None = None) -> BriefingWorker:
+def _worker(
+    worker_id: int,
+    target_query_map: str | None = None,
+    node_contracts: str | None = None,
+) -> BriefingWorker:
     return BriefingWorker(
         worker_id=worker_id,
         strategy=f"strategy_{worker_id}_custom",
-        target_logical_tree=target_logical_tree or _valid_target_logical_tree(),
+        role="proven_compound",
+        primary_family="A",
+        approach="Apply early filtering before aggregation to reduce row volume.",
+        target_query_map=target_query_map or _valid_target_query_map(),
+        node_contracts=node_contracts or _valid_node_contracts(),
         examples=[f"ex_{worker_id}"],
         example_adaptation="Pattern matches bottleneck and preserves semantics.",
         hazard_flags="- Preserve non-equi predicates and output schema.",
@@ -91,7 +110,6 @@ def test_analyst_prompt_includes_section_validation_checklist() -> None:
         dag=dag,
         costs={},
         semantic_intents=None,
-        global_knowledge=None,
         constraints=[
             {"id": "LITERAL_PRESERVATION", "severity": "CRITICAL", "prompt_instruction": "a"},
             {"id": "SEMANTIC_EQUIVALENCE", "severity": "CRITICAL", "prompt_instruction": "b"},
@@ -100,16 +118,14 @@ def test_analyst_prompt_includes_section_validation_checklist() -> None:
         ],
         dialect="postgresql",
         dialect_version="14.3",
-        strategy_leaderboard=None,
-        query_archetype=None,
         engine_profile=None,
         resource_envelope=None,
     )
 
-    assert "## Section Validation Checklist (MUST pass before final output)" in prompt
-    assert "`SEMANTIC_CONTRACT`: 30-250 tokens" in prompt
-    assert "`NODE_CONTRACTS`: every logical tree node has a contract" in prompt
-    assert "EXPLORATION FIELDS" in prompt
+    assert "## §VI. OUTPUT FORMAT" in prompt
+    assert "SEMANTIC_CONTRACT" in prompt
+    assert "NODE_CONTRACTS" in prompt
+    assert "EXPLORATION_TYPE" in prompt
 
 
 def test_analyst_prompt_exploit_algorithm_branch() -> None:
@@ -137,20 +153,15 @@ def test_analyst_prompt_exploit_algorithm_branch() -> None:
         dag=dag,
         costs={},
         semantic_intents=None,
-        global_knowledge=None,
         constraints=[],
         dialect="postgresql",
         exploit_algorithm_text=fake_algo,
         engine_profile={"briefing_note": "should not appear"},
     )
 
-    # Exploit algorithm section present with correct framing (§4 header)
-    assert "## §4. Exploit Algorithm: Evidence-Based Gap Intelligence" in prompt
+    # Exploit algorithm text should be injected as-is.
     assert fake_algo in prompt
-    # Framing does NOT say "YAML"
-    assert "YAML" not in prompt
-    # Engine profile section NOT present (exploit algorithm replaces it)
-    assert "## §4. Engine Profile: Field Intelligence Briefing" not in prompt
+    # Engine profile briefing note should not leak when exploit text is supplied.
     assert "should not appear" not in prompt
 
 
@@ -163,11 +174,10 @@ def test_worker_prompt_includes_rewrite_checklist() -> None:
         output_columns=["c1"],
         dialect="postgresql",
         engine_version="14.3",
-        resource_envelope="## System Resource Envelope\n\nMemory budget: shared_buffers=4GB",
     )
 
     assert "## Rewrite Checklist (must pass before final SQL)" in prompt
-    assert "Follow every node in `TARGET_LOGICAL_TREE`" in prompt
+    assert "Follow every node in `TARGET_QUERY_MAP`" in prompt
     assert "Preserve all literals and the exact final output schema/order." in prompt
 
 
@@ -175,7 +185,11 @@ def test_validate_parsed_briefing_flags_missing_fields() -> None:
     bad_worker_1 = BriefingWorker(
         worker_id=1,
         strategy="strategy_1_custom",
-        target_logical_tree="",  # empty — should flag
+        role="proven_compound",
+        primary_family="A",
+        approach="Apply early filtering.",
+        target_query_map="",
+        node_contracts="",
         examples=["ex_1"],
         example_adaptation="Apply pattern.",
         hazard_flags="- Risk.",
@@ -188,7 +202,8 @@ def test_validate_parsed_briefing_flags_missing_fields() -> None:
 
     issues = validate_parsed_briefing(parsed)
 
-    assert any("TARGET_LOGICAL_TREE/NODE_CONTRACTS missing" in i for i in issues)
+    assert any("TARGET_QUERY_MAP missing" in i for i in issues)
+    assert any("NODE_CONTRACTS missing" in i for i in issues)
 
 
 def test_validate_parsed_briefing_accepts_well_populated_briefing() -> None:
@@ -203,7 +218,7 @@ def test_validate_parsed_briefing_accepts_well_populated_briefing() -> None:
     assert issues == []
 
 
-def test_validate_parsed_briefing_expert_mode_accepts_single_worker() -> None:
+def test_validate_parsed_briefing_single_worker_accepts_expected_workers_1() -> None:
     parsed = ParsedBriefing(
         shared=_shared_valid(),
         workers=[
@@ -240,7 +255,7 @@ def test_validate_parsed_briefing_rejects_too_many_gap_ids() -> None:
 
     issues = validate_parsed_briefing(parsed)
 
-    assert any("too many gap/hypothesis IDs" in i for i in issues)
+    assert any("too many gap IDs" in i for i in issues)
 
 
 def test_parse_worker_hazard_flags_stop_before_exploration_fields() -> None:
