@@ -1,0 +1,336 @@
+You are a SQL rewrite engine for DuckDB v1.4.3. Follow the Target Logical Tree assigned to you. Write correct, executable SQL for each node — do not decide whether to restructure. Preserve exact semantic equivalence (same rows, columns, ordering). Preserve defensive guards (e.g. CASE WHEN x > 0 THEN y/x END). Strip benchmark comments (-- start/end query) from output.
+
+DuckDB: columnar storage (SELECT only needed columns). CTEs referenced once are inlined; multi-ref CTEs may materialize. FILTER clause is native. Predicate pushdown stops at UNION ALL boundaries and multi-level CTE refs.
+
+## Semantic Contract (MUST preserve)
+
+Profile household dependent metrics (counts/sums/max) by state and customer demographics for customers who made **store purchases during 2001 Q1-Q3** AND made **web or catalog purchases** in the same period. JOINs: customer→address (1:1), customer→demographics (1:1). Aggregation traps: COUNT(*) requires customer presence, but MAX/SUM on dependent counts are safe to precompute. Filter dependencies: date_dim filters MUST be applied before sales table joins.
+
+## Constraints
+
+- SEMANTIC_EQUIVALENCE: Preserve output columns/ordering exactly.  
+- CTE_COLUMN_COMPLETENESS: CTEs must output all referenced columns.  
+- LITERAL_PRESERVATION: Retain `d_year=2001`, `d_qoy<4` verbatim.
+
+## Regression Warnings
+
+- EXISTS materialization (0.14x):  
+  CAUSE: Materializing EXISTS destroys semi-join optimization.  
+  RULE: NEVER materialize EXISTS/NOT EXISTS subqueries.  
+- Cross-joining dimension CTEs (0.0076x):  
+  CAUSE: Cartesian explosion from 3+ CTE cross-joins.  
+  RULE: Max 2 cascaded CTEs, no cross-joins.
+
+## Original SQL
+
+```sql
+-- start query 35 in stream 0 using template query35.tpl
+select  
+  ca_state,
+  cd_gender,
+  cd_marital_status,
+  cd_dep_count,
+  count(*) cnt1,
+  max(cd_dep_count),
+  sum(cd_dep_count),
+  max(cd_dep_count),
+  cd_dep_employed_count,
+  count(*) cnt2,
+  max(cd_dep_employed_count),
+  sum(cd_dep_employed_count),
+  max(cd_dep_employed_count),
+  cd_dep_college_count,
+  count(*) cnt3,
+  max(cd_dep_college_count),
+  sum(cd_dep_college_count),
+  max(cd_dep_college_count)
+ from
+  customer c,customer_address ca,customer_demographics
+ where
+  c.c_current_addr_sk = ca.ca_address_sk and
+  cd_demo_sk = c.c_current_cdemo_sk and 
+  exists (select *
+          from store_sales,date_dim
+          where c.c_customer_sk = ss_customer_sk and
+                ss_sold_date_sk = d_date_sk and
+                d_year = 2001 and
+                d_qoy < 4) and
+   (exists (select *
+            from web_sales,date_dim
+            where c.c_customer_sk = ws_bill_customer_sk and
+                  ws_sold_date_sk = d_date_sk and
+                  d_year = 2001 and
+                  d_qoy < 4) or 
+    exists (select * 
+            from catalog_sales,date_dim
+            where c.c_customer_sk = cs_ship_customer_sk and
+                  cs_sold_date_sk = d_date_sk and
+                  d_year = 2001 and
+                  d_qoy < 4))
+ group by ca_state,
+          cd_gender,
+          cd_marital_status,
+          cd_dep_count,
+          cd_dep_employed_count,
+          cd_dep_college_count
+ order by ca_state,
+          cd_gender,
+          cd_marital_status,
+          cd_dep_count,
+          cd_dep_employed_count,
+          cd_dep_college_count
+ LIMIT 100;
+
+-- end query 35 in stream 0 using template query35.tpl
+```
+
+## Worker Briefings
+
+The analyst has designed 4 strategies. You will be assigned ONE.
+
+### WORKER 1 BRIEFING (Minimal restructuring)  
+
+**STRATEGY**: Push date filters into EXISTS subqueries. Preserve original structure but arm optimizer with early filters.  
+**APPROACH**: Move `date_dim` filters INSIDE each EXISTS subquery. DuckDB then pushes filters into scans, reducing sales table rows touched.  
+
+**TARGET_QUERY_MAP**:  
+```  
+QUERY  
+└── [MAIN]  
+    ├── SCAN (customer, address, demographics)  
+    ├── JOIN (address, demographics)  
+    ├── FILTER (EXISTS(  
+        SELECT * FROM store_sales, date_dim  
+        WHERE ... AND d_year=2001 AND d_qoy<4))  
+    ├── FILTER (OR EXISTS(web_sales...), EXISTS(catalog_sales...))  
+    └── AGGREGATE  
+```  
+**NODE_CONTRACTS**:  
+- `main_query`:  
+  FROM: customer c, customer_address ca, customer_demographics cd  
+  JOIN: c.c_current_addr_sk=ca.ca_address_sk, cd_demo_sk=c.c_current_cdemo_sk  
+  WHERE: EXISTS(store_sales...) AND (EXISTS(web_sales...) OR EXISTS(catalog_sales...))  
+  GROUP BY: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count  
+  OUTPUT: All original columns  
+  EXPECTED_ROWS: 58K  
+
+**EXAMPLES**: date_cte_isolate (ID: 10)  
+**EXAMPLE_ADAPTATION**:  
+- APPLY: Isolate date filters directly in subqueries.  
+- IGNORE: CTE creation; push filters inline instead.  
+- ADAPT: Apply to all 3 EXISTS subqueries.  
+**HAZARD_FLAGS**: Ensure DuckDB pushes filters into scans (verify with EXPLAIN).  
+
+---
+
+### WORKER 2 BRIEFING (CTE-based restructuring)  
+
+**STRATEGY**: Precompute qualifying customer keys per channel in CTEs. Use semi-joins on keysets.  
+**APPROACH**: Build CTEs for store/web/catalog customers (date-joined + distinct). Join to main query via `c_customer_sk IN (keyset)`.  
+
+**TARGET_QUERY_MAP**:  
+```  
+QUERY  
+├── [date_cte] d_date_sk (d_year=2001, d_qoy<4) → 274 rows  
+├── [store_cust] DISTINCT ss_customer_sk (store_sales ⨝ date_cte) → 200K rows  
+├── [web_cust] DISTINCT ws_bill_customer_sk (web_sales ⨝ date_cte) → 200K rows  
+├── [catalog_cust] DISTINCT cs_ship_customer_sk (catalog_sales ⨝ date_cte) → 200K rows  
+└── [MAIN]  
+    ├── SCAN (customer, address, demographics)  
+    ├── JOIN (address, demographics)  
+    ├── FILTER (c_customer_sk IN store_cust)  
+    ├── FILTER (c_customer_sk IN web_cust OR c_customer_sk IN catalog_cust)  
+    └── AGGREGATE  
+```  
+**NODE_CONTRACTS**:  
+- `date_cte`:  
+  SELECT: d_date_sk  
+  WHERE: d_year=2001 AND d_qoy<4  
+  OUTPUT: d_date_sk  
+- `store_cust`:  
+  SELECT: DISTINCT ss_customer_sk  
+  JOIN: store_sales.ss_sold_date_sk = date_cte.d_date_sk  
+  OUTPUT: ss_customer_sk  
+- `main_query`:  
+  WHERE: c_customer_sk IN (store_cust) AND (c_customer_sk IN (web_cust) OR c_customer_sk IN (catalog_cust))  
+  OTHER: Same as Worker 1  
+
+**EXAMPLES**: prefetch_fact_join (ID: 6), dimension_cte_isolate (ID: 8)  
+**EXAMPLE_ADAPTATION**:  
+- APPLY: prefetch_fact_join’s fact→date→distinct keys pattern.  
+- IGNORE: Rollup handling (absent here).  
+- ADAPT: Extend to 3 channels. Use OR instead of AND for web/catalog.  
+**HAZARD_FLAGS**: Avoid cross-joining CTEs. Ensure DISTINCT reduces rows.  
+
+---
+
+### WORKER 3 BRIEFING (Early reduction)  
+
+**STRATEGY**: Start with sales→date joins, aggregate to distinct customers early. Semi-join to customer table.  
+**APPROACH**: Compute union of store + (web OR catalog) customers first. Join to customer/address/demographics last.  
+
+**TARGET_QUERY_MAP**:  
+```  
+QUERY  
+├── [date_cte] → 274 rows  
+├── [store_cust] → 200K rows  
+├── [web_or_catalog] → 200K rows  
+│   └── (web_cust ∪ catalog_cust)  
+├── [valid_cust] → ≤200K rows  
+│   └── store_cust ⨝ web_or_catalog ON customer_sk  
+└── [MAIN]  
+    ├── SCAN (customer, address, demographics)  
+    ├── JOIN valid_cust ON c_customer_sk  
+    ├── JOIN address, demographics  
+    └── AGGREGATE  
+```  
+**NODE_CONTRACTS**:  
+- `web_or_catalog`:  
+  SELECT: ws_bill_customer_sk AS customer_sk FROM web_sales ⨝ date_cte  
+  UNION ALL  
+  SELECT: cs_ship_customer_sk FROM catalog_sales ⨝ date_cte  
+  OUTPUT: customer_sk  
+- `valid_cust`:  
+  SELECT: s.ss_customer_sk  
+  JOIN: store_cust s ⨝ web_or_catalog w ON s.ss_customer_sk = w.customer_sk  
+  OUTPUT: ss_customer_sk  
+- `main_query`:  
+  JOIN: customer c ON c.c_customer_sk = valid_cust.ss_customer_sk  
+  OTHER: Same as Worker 1  
+
+**EXAMPLES**: composite_decorrelate_union (ID: 0), multi_intersect_exists_cte (ID: 4)  
+**EXAMPLE_ADAPTATION**:  
+- APPLY: composite_decorrelate_union’s decorrelation via early distinct keys.  
+- IGNORE: INTERSECT handling; use UNION/join instead.  
+- ADAPT: Replace INTERSECT with JOIN for store AND (web OR catalog).  
+**HAZARD_FLAGS**: Verify UNION ALL doesn’t explode rows. Preserve customer distinctness.  
+
+---
+
+### WORKER 4 BRIEFING (Novel/compound)  
+
+**STRATEGY**: Bitwise OR for channel checks. Precompute customer existence flags.  
+**APPROACH**: Single-pass sales aggregation per customer. Use MAX(CASE) to flag channel existence. Filter by flags in main query.  
+
+**TARGET_QUERY_MAP**:  
+```  
+QUERY  
+├── [date_cte] → 274 rows  
+├── [cust_channels] → ≤600K rows  
+│   └── (SELECT customer_sk, MAX(store_flag), MAX(web_flag), MAX(catalog_flag)...)  
+└── [MAIN]  
+    ├── SCAN (customer, address, demographics)  
+    ├── JOIN cust_channels ON c_customer_sk  
+    ├── JOIN address, demographics  
+    ├── FILTER (store_flag=1 AND (web_flag=1 OR catalog_flag=1))  
+    └── AGGREGATE  
+```  
+**NODE_CONTRACTS**:  
+- `cust_channels`:  
+  SELECT:  
+    customer_sk,  
+    MAX(CASE WHEN channel='store' THEN 1 ELSE 0 END) AS store_flag,  
+    MAX(CASE WHEN channel='web' THEN 1 ELSE 0 END) AS web_flag,  
+    MAX(CASE WHEN channel='catalog' THEN 1 ELSE 0 END) AS catalog_flag  
+  FROM (  
+    SELECT ss_customer_sk AS customer_sk, 'store' AS channel  
+    FROM store_sales ⨝ date_cte  
+    UNION ALL  
+    SELECT ws_bill_customer_sk, 'web' FROM web_sales ⨝ date_cte  
+    UNION ALL  
+    SELECT cs_ship_customer_sk, 'catalog' FROM catalog_sales ⨝ date_cte  
+  )  
+  GROUP BY customer_sk  
+  OUTPUT: customer_sk, store_flag, web_flag, catalog_flag  
+- `main_query`:  
+  JOIN: cust_channels ch ON c.c_customer_sk = ch.customer_sk  
+  WHERE: ch.store_flag=1 AND (ch.web_flag=1 OR ch.catalog_flag=1)  
+  OTHER: Same as Worker 1  
+
+**EXAMPLES**: channel_bitmap_aggregation (ID: 15)  
+**EXAMPLE_ADAPTATION**:  
+- APPLY: Single-pass multi-channel aggregation with flags.  
+- IGNORE: Time-bucketing; use channel presence only.  
+- ADAPT: Extend to 3 channels. Replace bitmap with MAX(CASE).  
+**EXPLORATION_TYPE**: compound_strategy  
+**HYPOTHESIS_TAG**: Aggressive early reduction via UNION ALL + GROUP BY.  
+**HAZARD_FLAGS**: Ensure UNION ALL doesn’t materialize huge intermediates. Verify flag logic matches OR semantics.
+
+## Rewrite Checklist (must pass before final SQL)
+
+- Follow every node in `TARGET_QUERY_MAP` and produce each `NODE_CONTRACT` output column exactly.
+- Keep all semantic invariants from `Semantic Contract` and `Constraints`.
+- Preserve all literals and the exact final output schema/order.
+- Apply `Hazard Flags` and `Regression Warnings` as hard guards.
+- Verify your rewrite addresses the CURRENT_PLAN_GAP divergences.
+
+### Column Completeness Contract
+
+`main_query` MUST produce exactly these columns (same names, same order): `ca_state`, `cd_gender`, `cd_marital_status`, `cd_dep_count`, `cnt1`, `MAX(cd_dep_count)`, `SUM(cd_dep_count)`, `MAX(cd_dep_count)`, `cd_dep_employed_count`, `cnt2`, `MAX(cd_dep_employed_count)`, `SUM(cd_dep_employed_count)`, `MAX(cd_dep_employed_count)`, `cd_dep_college_count`, `cnt3`, `MAX(cd_dep_college_count)`, `SUM(cd_dep_college_count)`, `MAX(cd_dep_college_count)`
+
+## Original Query Structure
+
+Current structure (all `[=]` unchanged).
+
+```
+QUERY: (single statement)
+└── [MAIN] main_query  [=]  Cost: 95%  Rows: ~3.1M  — Join customer/address/demographics, enforce multi-channel purchase existence constraints for 2001 quarters 1-3, then group by geography and demographic dependent-count attributes to compute counts/sums/max statistics.
+    ├── SCAN (customer AS c (join), customer_address AS ca (join), customer_demographics (join), date_dim (join))
+    ├── JOIN (c.c_current_addr_sk = ca.ca_address_sk)
+    ├── JOIN (cd_demo_sk = c.c_current_cdemo_sk)
+    ├── FILTER (EXISTS(SELECT * FROM store_sales, date_dim WHERE c.c_customer_sk = ss_customer_sk AND ss_sold_date_sk = d_date_sk AND d_year = 2001 AND d_qoy < 4))
+    ├── AGG (GROUP BY)
+    ├── SORT (ca_state ASC, cd_gender ASC, cd_marital_status ASC, cd_dep_count ASC, cd_dep_employed_count ASC, cd_dep_college_count ASC)
+    └── OUTPUT (ca_state, cd_gender, cd_marital_status, cd_dep_count, cnt1, MAX(cd_dep_count), SUM(cd_dep_count), MAX(cd_dep_count), ...)
+```
+
+## Output Format
+
+Two parts in order:
+
+### Part 1: Modified Logic Tree
+
+Markers: `[+]` new, `[-]` removed, `[~]` modified, `[=]` unchanged, `[!]` structural.
+
+### Part 2: Component Payload JSON
+
+```json
+{"spec_version": "1.0", "dialect": "<dialect>",
+ "rewrite_rules": [{"id": "R1", "type": "<transform>", "description": "<what>", "applied_to": ["<id>"]}],
+ "statements": [{"target_table": null, "change": "modified",
+   "components": {
+     "<cte>": {"type": "cte", "change": "modified", "sql": "<full SQL>",
+       "interfaces": {"outputs": ["col1"], "consumes": ["<upstream>"]}},
+     "main_query": {"type": "main_query", "change": "modified", "sql": "<SELECT>",
+       "interfaces": {"outputs": ["col1"], "consumes": ["<cte>"]}}},
+   "reconstruction_order": ["<cte>", "main_query"],
+   "assembly_template": "WITH <cte> AS ({<cte>}) {main_query}"}],
+ "macros": {}, "frozen_blocks": [], "validation_checks": []}
+```
+
+### Rules
+- Tree first, then SQL. Every `sql` must be complete (no ellipsis).
+- Only changed/added components. Unchanged -> `"change": "unchanged", "sql": ""`.
+- `main_query` columns must match Column Completeness Contract.
+
+After JSON:
+```
+Changes: <1-2 sentences>
+Expected speedup: <estimate>
+```
+
+Now output your Logic Tree and Component Payload JSON:
+
+## Worker Task Assignments
+
+**TASK 1**: [Push date filters into EXISTS subqueries. Preserve original structure but arm optimizer with early filters.] — TARGET_QUERY_MAP:
+  Hazard: Ensure DuckDB pushes filters into scans (verify with EXPLAIN).
+
+**TASK 2**: [Precompute qualifying customer keys per channel in CTEs. Use semi-joins on keysets.] — TARGET_QUERY_MAP:
+  Hazard: Avoid cross-joining CTEs. Ensure DISTINCT reduces rows.
+
+**TASK 3**: [Start with sales→date joins, aggregate to distinct customers early. Semi-join to customer table.] — TARGET_QUERY_MAP:
+  Hazard: Verify UNION ALL doesn’t explode rows. Preserve customer distinctness.
+
+**TASK 4**: [Bitwise OR for channel checks. Precompute customer existence flags.] — TARGET_QUERY_MAP:
+  Hazard: Ensure UNION ALL doesn’t materialize huge intermediates. Verify flag logic matches OR semantics.

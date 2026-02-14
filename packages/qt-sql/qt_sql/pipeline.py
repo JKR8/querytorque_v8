@@ -795,7 +795,7 @@ class Pipeline:
         max_iterations: int = 3,
         target_speedup: float = 2.0,
         n_workers: int = 3,
-        mode: OptimizationMode = OptimizationMode.EXPERT,
+        mode: OptimizationMode = OptimizationMode.SWARM,
     ) -> SessionResult:
         """Run optimization session in specified mode.
 
@@ -819,16 +819,6 @@ class Pipeline:
                 target_speedup=target_speedup,
                 max_iterations=max_iterations,
                 n_workers=1,
-            )
-        elif mode == OptimizationMode.EXPERT:
-            from .sessions.expert_session import ExpertSession
-            session = ExpertSession(
-                pipeline=self,
-                query_id=query_id,
-                original_sql=sql,
-                max_iterations=max_iterations,
-                target_speedup=target_speedup,
-                n_workers=1,  # Expert: always 1 worker, analyst-steered
             )
         elif mode == OptimizationMode.SWARM:
             from .sessions.swarm_session import SwarmSession

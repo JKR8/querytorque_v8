@@ -16,10 +16,10 @@ import click
 @click.option("-q", "--query", multiple=True, help="Query filter (repeatable, prefix match).")
 @click.option(
     "--mode",
-    type=click.Choice(["swarm", "expert", "oneshot"]),
+    type=click.Choice(["swarm", "oneshot"]),
     default="swarm",
     show_default=True,
-    help="Optimization mode.",
+    help="Optimization mode: swarm (multi-worker) or oneshot (single call).",
 )
 @click.option("--max-iterations", type=int, default=3, show_default=True,
               help="Max optimization rounds per query.")
@@ -104,7 +104,6 @@ def run(
 
     mode_map = {
         "swarm": OptimizationMode.SWARM,
-        "expert": OptimizationMode.EXPERT,
         "oneshot": OptimizationMode.ONESHOT,
     }
 

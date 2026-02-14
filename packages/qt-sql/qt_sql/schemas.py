@@ -18,8 +18,7 @@ from typing import Any, Dict, List, Optional
 class OptimizationMode(str, Enum):
     """Optimization mode selection for the ADO pipeline."""
     ONESHOT = "oneshot"     # 1 LLM call per iteration: analyst produces SQL directly
-    EXPERT = "expert"       # Iterative with analyst failure analysis (default)
-    SWARM = "swarm"         # Multi-worker fan-out with snipe refinement
+    SWARM = "swarm"         # Multi-worker fan-out with snipe refinement (default)
 
 
 class ValidationStatus(str, Enum):
