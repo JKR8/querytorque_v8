@@ -49,31 +49,71 @@ def _fmt_cost(pct: float) -> str:
 
 
 def _map_operations(meta: Dict[str, Any], flags: List[str]) -> List[str]:
-    """Map extracted node metadata to DAP operation vocabulary strings."""
+    """Map extracted node metadata to DAP operation vocabulary strings.
+
+    Renders explicit SUBQUERY nodes with type, inner tables, filters,
+    and correlation predicates instead of flat 'correlated subquery' labels.
+    """
     ops: List[str] = []
 
-    # SCAN — base table references
+    # SCAN — base table references (subquery-internal tables excluded by analyst.py)
     deps = meta.get("dependencies", [])
     tables = [d for d in deps if not d.startswith("(")]
     if tables:
-        ops.append(f"SCAN ({', '.join(tables)})")
+        for t in tables:
+            ops.append(f"SCAN {t}")
 
     # JOIN
     joins = meta.get("joins", [])
     if joins:
-        # Compact: show first 2 joins
         for j in joins[:2]:
             ops.append(f"JOIN ({j})")
         if len(joins) > 2:
             ops.append(f"JOIN (+{len(joins) - 2} more)")
 
-    # FILTER
+    # FILTER (outer-level only)
     filters = meta.get("filters", [])
     if filters:
         for f in filters[:2]:
             ops.append(f"FILTER ({f})")
         if len(filters) > 2:
             ops.append(f"FILTER (+{len(filters) - 2} more)")
+
+    # SUBQUERY nodes — explicit type + inner structure
+    subqueries = meta.get("subqueries", [])
+    # Deduplicate subqueries with same tables+filters (e.g. Q9 has 15 subqueries
+    # but only 5 distinct bucket patterns)
+    seen_sigs: Dict[str, int] = {}
+    for sq in subqueries:
+        sig = f"{','.join(sq['tables'])}|{','.join(sq['filters'][:2])}"
+        seen_sigs[sig] = seen_sigs.get(sig, 0) + 1
+
+    emitted_sigs: Dict[str, bool] = {}
+    for sq in subqueries:
+        sig = f"{','.join(sq['tables'])}|{','.join(sq['filters'][:2])}"
+        if sig in emitted_sigs:
+            continue
+        emitted_sigs[sig] = True
+
+        count = seen_sigs[sig]
+        sq_type = sq["type"]
+        if sq["correlated"]:
+            sq_type = f"correlated {sq_type}"
+
+        label = f"SUBQUERY ({sq_type})"
+        if count > 1:
+            label += f" x{count}"
+
+        # Build child lines for this subquery
+        children: List[str] = []
+        for tbl in sq["tables"]:
+            children.append(f"SCAN {tbl}")
+        for filt in sq["filters"][:2]:
+            children.append(f"FILTER {filt}")
+        if sq["corr_pred"]:
+            children.append(f"CORR-PRED: {sq['corr_pred']}")
+
+        ops.append({"label": label, "children": children})
 
     # AGG
     if "GROUP_BY" in flags:
@@ -90,10 +130,6 @@ def _map_operations(meta: Dict[str, Any], flags: List[str]) -> List[str]:
     # SORT
     if meta.get("order_by"):
         ops.append(f"SORT ({meta['order_by']})")
-
-    # DEDUP (detected by flags or DISTINCT keyword)
-    # CASE_MAP — detected by large CASE blocks
-    # These are detected in the caller if needed
 
     return ops
 
@@ -174,7 +210,20 @@ def build_logic_tree(
         row_est = cost_obj.row_estimate if cost_obj and hasattr(cost_obj, "row_estimate") else 0
 
         cost_str = _fmt_cost(cost_pct)
-        rows_str = f"Rows: {_fmt_rows(row_est)}" if row_est else ""
+
+        # Check if node has subqueries (row_est reflects subquery scans, not output)
+        base_flags = node.flags if hasattr(node, "flags") and node.flags else []
+        meta = _extract_node_metadata(
+            node.sql if hasattr(node, "sql") else "", dialect
+        )
+        has_subqueries = bool(meta.get("subqueries"))
+
+        if row_est and has_subqueries and node.node_type == "main":
+            rows_str = f"Processes: {_fmt_rows(row_est)} across subqueries"
+        elif row_est:
+            rows_str = f"Rows: {_fmt_rows(row_est)}"
+        else:
+            rows_str = ""
 
         # Build stats suffix
         stats_parts = [cost_str]
@@ -189,11 +238,7 @@ def build_logic_tree(
         # Header line
         lines.append(f"{connector} {prefix} {nid}  [=]  {stats}{intent_str}")
 
-        # Operation lines (children of this node)
-        base_flags = node.flags if hasattr(node, "flags") and node.flags else []
-        meta = _extract_node_metadata(
-            node.sql if hasattr(node, "sql") else "", dialect
-        )
+        # Operation lines (children of this node) — reuse meta from above
         operations = _map_operations(meta, base_flags)
 
         # Output columns
@@ -212,7 +257,18 @@ def build_logic_tree(
         for oi, op in enumerate(op_items):
             op_last = oi == len(op_items) - 1
             op_conn = "└──" if op_last else "├──"
-            lines.append(f"{continuation}{op_conn} {op}")
+            op_cont = "    " if op_last else "│   "
+
+            if isinstance(op, dict):
+                # Structured subquery node with children
+                lines.append(f"{continuation}{op_conn} {op['label']}")
+                children = op.get("children", [])
+                for ci, child in enumerate(children):
+                    child_last = ci == len(children) - 1
+                    child_conn = "└──" if child_last else "├──"
+                    lines.append(f"{continuation}{op_cont}{child_conn} {child}")
+            else:
+                lines.append(f"{continuation}{op_conn} {op}")
 
     return "\n".join(lines)
 
@@ -290,6 +346,15 @@ def build_pipeline_logic_tree(
             for oi, op in enumerate(operations):
                 op_last = oi == len(operations) - 1
                 op_conn = "└──" if op_last else "├──"
-                lines.append(f"{stmt_cont}{node_cont}{op_conn} {op}")
+                op_cont_inner = "    " if op_last else "│   "
+                if isinstance(op, dict):
+                    lines.append(f"{stmt_cont}{node_cont}{op_conn} {op['label']}")
+                    children = op.get("children", [])
+                    for ci, child in enumerate(children):
+                        child_last = ci == len(children) - 1
+                        child_conn = "└──" if child_last else "├──"
+                        lines.append(f"{stmt_cont}{node_cont}{op_cont_inner}{child_conn} {child}")
+                else:
+                    lines.append(f"{stmt_cont}{node_cont}{op_conn} {op}")
 
     return "\n".join(lines)

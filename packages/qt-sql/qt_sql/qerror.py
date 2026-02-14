@@ -627,7 +627,7 @@ def format_qerror_for_prompt(analysis: QErrorAnalysis) -> str:
         lines.append("Structural signals:")
         flag_actions = {
             "EST_ZERO": "blind to CTE/subquery stats → push predicate into CTE (P0, P7)",
-            "EST_ONE_NONLEAF": "planner guessing → likely decorrelation needed (P2, P0)",
+            "EST_ONE_NONLEAF": "planner guessing on non-leaf node → check P0 (predicate pushback), P1 (repeated scans). Only P2 (decorrelation) if nested loops + correlated subquery confirmed in EXPLAIN",
             "DELIM_SCAN": "correlated subquery the optimizer couldn't decorrelate → P2",
             "CORRELATED_SUBPLAN": "correlated subquery (PG SubPlan) → decorrelation candidate (P2)",
             "REPEATED_TABLE": "same table scanned multiple times → single-pass opportunity (P1)",
@@ -638,6 +638,10 @@ def format_qerror_for_prompt(analysis: QErrorAnalysis) -> str:
         for flag in analysis.structural_flags:
             action = flag_actions.get(flag, flag)
             lines.append(f"  - {flag}: {action}")
+        lines.append("")
+        lines.append("IMPORTANT: Cross-check structural signals against the PRUNING GUIDE in §III. "
+                      "If the EXPLAIN shows no nested loops, skip P2. If each table appears once, skip P1. "
+                      "The pruning guide overrides routing suggestions.")
         lines.append("")
 
     return "\n".join(lines)

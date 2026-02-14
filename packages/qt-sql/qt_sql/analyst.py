@@ -84,13 +84,25 @@ def _append_dag_analysis(
             if node_intent:
                 lines.append(f"**Intent**: {node_intent}")
 
-            # Stats
+            # Stats — distinguish processing rows from output rows
             output_rows = meta.get("limit")
+            has_subqueries = bool(meta.get("subqueries"))
             if output_rows:
                 lines.append(
                     f"**Stats**: {cost_pct:.0f}% Cost | "
                     f"~{_fmt_rows(row_est)} rows processed → "
                     f"{output_rows} rows output"
+                )
+            elif has_subqueries and node.node_type == "main":
+                # Main query with subqueries: row_est reflects subquery scans,
+                # not output. Output depends on FROM table + filters.
+                from_tables = meta.get("dependencies", [])
+                filters = meta.get("filters", [])
+                filter_note = f" (after {len(filters)} filter{'s' if len(filters) != 1 else ''})" if filters else ""
+                lines.append(
+                    f"**Stats**: {cost_pct:.0f}% Cost | "
+                    f"~{_fmt_rows(row_est)} rows processed across subqueries | "
+                    f"Output: from {', '.join(from_tables) if from_tables else 'base table'}{filter_note}"
                 )
             else:
                 lines.append(
@@ -118,7 +130,7 @@ def _append_dag_analysis(
                 out_suffix = f" — ordered by {meta['order_by']}"
             lines.append(f"**Outputs**: [{out_str}]{out_suffix}")
 
-            # Dependencies
+            # Dependencies (direct tables only — subqueries shown separately)
             deps = meta.get("dependencies", [])
             if deps:
                 lines.append(f"**Dependencies**: {', '.join(deps)}")
@@ -126,6 +138,39 @@ def _append_dag_analysis(
                 tables = list(node.tables) if hasattr(node, "tables") else []
                 if tables:
                     lines.append(f"**Dependencies**: {', '.join(tables)}")
+
+            # Subqueries — structured detail
+            subqueries = meta.get("subqueries", [])
+            if subqueries:
+                # Deduplicate by signature
+                seen_sigs: dict = {}
+                for sq in subqueries:
+                    sig = f"{','.join(sq['tables'])}|{','.join(sq['filters'][:2])}"
+                    seen_sigs[sig] = seen_sigs.get(sig, 0) + 1
+
+                emitted: dict = {}
+                sq_lines = []
+                for sq in subqueries:
+                    sig = f"{','.join(sq['tables'])}|{','.join(sq['filters'][:2])}"
+                    if sig in emitted:
+                        continue
+                    emitted[sig] = True
+                    count = seen_sigs[sig]
+                    sq_type = sq["type"]
+                    if sq["correlated"]:
+                        sq_type = f"correlated {sq_type}"
+                    label = f"({sq_type})"
+                    if count > 1:
+                        label += f" x{count}"
+                    inner_parts = []
+                    for tbl in sq["tables"]:
+                        inner_parts.append(tbl)
+                    for filt in sq["filters"][:2]:
+                        inner_parts.append(f"FILTER: {filt}")
+                    if sq["corr_pred"]:
+                        inner_parts.append(f"CORR-PRED: {sq['corr_pred']}")
+                    sq_lines.append(f"{label}: {' | '.join(inner_parts)}")
+                lines.append(f"**Subqueries**: {'; '.join(sq_lines)}")
 
             # Joins
             joins = meta.get("joins", [])
@@ -210,13 +255,14 @@ def _build_rich_flags(
 def _extract_node_metadata(sql: str, dialect: str = "duckdb") -> Dict[str, Any]:
     """Extract structured metadata from a node's SQL using sqlglot.
 
-    Returns dict with: joins, filters, dependencies, order_by, limit,
-    correlated_detail, table_aliases.
+    Returns dict with: joins, filters, dependencies, subqueries, order_by,
+    limit, correlated_detail, table_aliases.
     """
     result: Dict[str, Any] = {
         "joins": [],
         "filters": [],
         "dependencies": [],
+        "subqueries": [],
         "order_by": None,
         "limit": None,
         "correlated_detail": None,
@@ -233,9 +279,12 @@ def _extract_node_metadata(sql: str, dialect: str = "duckdb") -> Dict[str, Any]:
     except Exception:
         return result
 
-    # --- Table aliases ---
+    # --- Table aliases (outer scope only) ---
     aliases: Dict[str, str] = {}  # alias → table_name
+    # Only collect top-level table aliases (not those inside subqueries)
     for table in parsed.find_all(exp.Table):
+        if table.find_ancestor(exp.Subquery):
+            continue
         name = table.name
         alias = table.alias or name
         aliases[alias] = name
@@ -263,9 +312,9 @@ def _extract_node_metadata(sql: str, dialect: str = "duckdb") -> Dict[str, Any]:
             except (ValueError, TypeError):
                 pass
 
-    # --- WHERE conditions → joins vs filters ---
+    # --- WHERE conditions → joins vs filters (outer-level only) ---
     where = parsed.find(exp.Where)
-    if where:
+    if where and not where.find_ancestor(exp.Subquery):
         conditions = _split_conditions(where.this)
         for cond in conditions:
             classified = _classify_condition(cond, aliases, dialect)
@@ -283,7 +332,11 @@ def _extract_node_metadata(sql: str, dialect: str = "duckdb") -> Dict[str, Any]:
     for subq in parsed.find_all(exp.Subquery):
         _detect_correlated(subq, parsed, result, aliases, dialect)
 
-    # --- Dependencies with roles ---
+    # --- Structured subquery info ---
+    subq_infos = _extract_subquery_info(parsed, aliases, dialect)
+    result["subqueries"] = subq_infos
+
+    # --- Dependencies with roles (excludes subquery-internal tables) ---
     deps = _build_dependency_list(parsed, aliases, result, dialect)
     if deps:
         result["dependencies"] = deps
@@ -432,52 +485,142 @@ def _get_subq_aliases(subq) -> set:
     return aliases
 
 
+def _is_subquery_correlated(subq, outer_aliases: set, dialect: str) -> Optional[str]:
+    """Check if a subquery references outer aliases. Return correlation predicate or None."""
+    from sqlglot import exp
+
+    subq_aliases = _get_subq_aliases(subq)
+    for col in subq.find_all(exp.Column):
+        table = col.table
+        if table and table in outer_aliases and table not in subq_aliases:
+            # Found outer reference — extract the correlation predicate
+            where = subq.find(exp.Where)
+            if where:
+                for cond in _split_conditions(where.this):
+                    cond_sql = cond.sql(dialect=dialect)
+                    if table in cond_sql:
+                        return cond_sql
+            return f"{col.sql(dialect=dialect)} (outer ref)"
+    return None
+
+
+def _classify_subquery_type(subq, dialect: str) -> str:
+    """Classify subquery as scalar, exists, or in-list."""
+    from sqlglot import exp
+
+    parent = subq.parent
+    if isinstance(parent, exp.Exists):
+        return "correlated exists"
+    if isinstance(parent, exp.In):
+        return "in-list"
+    # Scalar subquery — check if it has aggregate (typical for scalar)
+    select = subq.find(exp.Select)
+    if select:
+        for agg_type in (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max):
+            if select.find(agg_type):
+                return "scalar aggregate"
+    return "scalar"
+
+
+def _extract_subquery_info(
+    parsed, outer_aliases: Dict[str, str], dialect: str
+) -> List[Dict[str, Any]]:
+    """Extract structured info for each subquery in the statement.
+
+    Returns list of dicts with: type, correlated, corr_pred, tables, filters.
+    """
+    from sqlglot import exp
+
+    # Only look at top-level subqueries (not nested inside other subqueries)
+    subqueries = []
+    outer_alias_set = set(outer_aliases.keys())
+
+    for subq in parsed.find_all(exp.Subquery):
+        # Skip subqueries nested inside other subqueries (they belong to the inner scope)
+        parent_subq = subq.find_ancestor(exp.Subquery)
+        if parent_subq is not None:
+            continue
+
+        info: Dict[str, Any] = {
+            "type": _classify_subquery_type(subq, dialect),
+            "correlated": False,
+            "corr_pred": None,
+            "tables": [],
+            "filters": [],
+        }
+
+        # Correlation check
+        corr = _is_subquery_correlated(subq, outer_alias_set, dialect)
+        if corr:
+            info["correlated"] = True
+            info["corr_pred"] = corr
+
+        # Tables inside subquery
+        for table in subq.find_all(exp.Table):
+            name = table.name
+            alias = table.alias or name
+            label = f"{name} {alias}" if alias != name else name
+            if label not in info["tables"]:
+                info["tables"].append(label)
+
+        # Filters inside subquery
+        where = subq.find(exp.Where)
+        if where:
+            for cond in _split_conditions(where.this):
+                cond_sql = cond.sql(dialect=dialect)
+                if len(cond_sql) < 80:
+                    info["filters"].append(cond_sql)
+
+        subqueries.append(info)
+
+    return subqueries
+
+
 def _build_dependency_list(
     parsed, aliases: Dict[str, str], result: Dict[str, Any], dialect: str
 ) -> List[str]:
-    """Build dependency list with alias roles (join, correlated subquery, etc.)."""
+    """Build dependency list with alias roles — properly classifies subqueries."""
     from sqlglot import exp
 
     deps = []
     seen = set()
 
-    # Main FROM tables
+    # Collect tables that are inside subqueries (to exclude from main SCAN list)
+    subq_table_keys = set()
+    for subq in parsed.find_all(exp.Subquery):
+        for table in subq.find_all(exp.Table):
+            name = table.name
+            alias = table.alias or name
+            subq_table_keys.add(f"{name}_{alias}")
+
+    # Main FROM tables (exclude subquery-internal tables)
     from_clause = parsed.find(exp.From)
     if from_clause:
+        # Only get direct children tables, not those inside subqueries
         for table in from_clause.find_all(exp.Table):
             name = table.name
             alias = table.alias or name
             key = f"{name}_{alias}"
+            if key in subq_table_keys:
+                continue
             if key not in seen:
                 seen.add(key)
-                role = "join" if alias != name else ""
-                dep = f"{name} AS {alias}" if alias != name else name
-                if role:
-                    dep += f" ({role})"
+                dep = f"{name} {alias}" if alias != name else name
                 deps.append(dep)
 
     # JOIN tables
     for join in parsed.find_all(exp.Join):
+        # Skip joins inside subqueries
+        if join.find_ancestor(exp.Subquery):
+            continue
         for table in join.find_all(exp.Table):
             name = table.name
             alias = table.alias or name
             key = f"{name}_{alias}"
             if key not in seen:
                 seen.add(key)
-                dep = f"{name} AS {alias}" if alias != name else name
+                dep = f"{name} {alias}" if alias != name else name
                 dep += " (join)"
-                deps.append(dep)
-
-    # Subquery tables (correlated)
-    for subq in parsed.find_all(exp.Subquery):
-        for table in subq.find_all(exp.Table):
-            name = table.name
-            alias = table.alias or name
-            key = f"{name}_{alias}"
-            if key not in seen:
-                seen.add(key)
-                dep = f"{name} AS {alias}" if alias != name else name
-                dep += " (correlated subquery)"
                 deps.append(dep)
 
     return deps

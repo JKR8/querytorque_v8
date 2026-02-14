@@ -71,8 +71,11 @@ def _detect_aggregate_functions(dag: Any, costs: Dict[str, Any]) -> List[str]:
     return sorted(aggs)
 
 
-def _detect_query_features(dag: Any) -> Dict[str, bool]:
-    """Detect structural features from DAG for pruning guide."""
+def _detect_query_features(
+    dag: Any,
+    explain_plan_text: Optional[str] = None,
+) -> Dict[str, bool]:
+    """Detect structural features from DAG + EXPLAIN for pruning guide."""
     features = {
         "has_left_join": False,
         "has_or_predicate": False,
@@ -82,7 +85,10 @@ def _detect_query_features(dag: Any) -> Dict[str, bool]:
         "has_exists": False,
         "has_cte": False,
         "has_correlated_subquery": False,
+        "has_nested_loop": False,
+        "has_repeated_table": False,
     }
+    table_counts: Dict[str, int] = {}
     nodes = getattr(dag, "nodes", {}) or {}
     for nid, node in nodes.items():
         sql_text = (getattr(node, "sql", "") or "").upper()
@@ -103,6 +109,23 @@ def _detect_query_features(dag: Any) -> Dict[str, bool]:
             features["has_cte"] = True
         if "CORRELATED" in " ".join(str(f) for f in flags).upper():
             features["has_correlated_subquery"] = True
+        # Count table occurrences for repeated table detection
+        for table in getattr(node, "tables", []) or []:
+            t = table.lower()
+            table_counts[t] = table_counts.get(t, 0) + 1
+
+    # Check for repeated tables
+    for t, count in table_counts.items():
+        if count > 1:
+            features["has_repeated_table"] = True
+            break
+
+    # Check EXPLAIN text for nested loops
+    if explain_plan_text:
+        explain_upper = explain_plan_text.upper()
+        if "NESTED LOOP" in explain_upper or "NESTED_LOOP" in explain_upper:
+            features["has_nested_loop"] = True
+
     return features
 
 
@@ -526,15 +549,25 @@ def section_role(mode: str) -> str:
     lines.append("5. **ARM THE OPTIMIZER** — Restructure so it has full intelligence. Don't force plans.")
     lines.append("6. **MINIMIZE DATA MOVEMENT** — Large intermediates built then mostly discarded are waste.")
     lines.append("")
-    lines.append(
-        "Your primary asset is a library of **gold examples** — proven before/after SQL "
-        "rewrites with measured speedups gathered from hundreds of benchmark runs. "
-        "Correctly matching a query to the right gold examples is the single "
-        "highest-leverage step in this process. Workers receive the full before/after "
-        "SQL for the examples you assign and use them as structural templates. The "
-        "diagnosis tells you what's wrong; the examples are the edge — they tell the "
-        "workers exactly how to fix it."
-    )
+    if mode == "swarm":
+        lines.append(
+            "Your primary asset is a library of **gold examples** — proven before/after SQL "
+            "rewrites with measured speedups gathered from hundreds of benchmark runs. "
+            "Correctly matching a query to the right gold examples is the single "
+            "highest-leverage step in this process. Workers receive the full before/after "
+            "SQL for the examples you assign and use them as structural templates. The "
+            "diagnosis tells you what's wrong; the examples are the edge — they tell the "
+            "workers exactly how to fix it."
+        )
+    else:
+        lines.append(
+            "Your primary asset is a library of **gold examples** — proven before/after SQL "
+            "rewrites with measured speedups gathered from hundreds of benchmark runs. "
+            "Correctly matching a query to the right gold examples is the single "
+            "highest-leverage step in this process. The gold example's before/after SQL "
+            "is a structural template — you adapt the pattern to this query. The "
+            "diagnosis tells you what's wrong; the examples show exactly how to fix it."
+        )
 
     if mode == "swarm":
         lines.append("")
@@ -711,8 +744,8 @@ def section_this_engine(
         lines.append(f"### {engine_name}")
         lines.append("")
         lines.append(
-            "Evidence-based exploit algorithm. Use DETECT rules to match "
-            "structural features, then follow EXPLOIT_STEPS."
+            "Evidence-based exploit algorithm. Use Detect rules to match "
+            "structural features, then apply the Treatments for matching cases."
         )
         lines.append("")
         lines.append(exploit_algorithm_text)
@@ -915,12 +948,19 @@ def section_investigate(
         "(§VII.B) for gold examples with matching query structure."
     )
     lines.append("")
-    lines.append(
-        "- **Match found**: The matching examples become the primary basis for worker "
-        "strategies. Assign them to workers with APPLY/IGNORE/ADAPT guidance. The gold "
-        "example's before/after SQL is a structural template — the worker adapts it, "
-        "not invents from scratch."
-    )
+    if mode == "swarm":
+        lines.append(
+            "- **Match found**: The matching examples become the primary basis for worker "
+            "strategies. Assign them to workers with APPLY/IGNORE/ADAPT guidance. The gold "
+            "example's before/after SQL is a structural template — the worker adapts it, "
+            "not invents from scratch."
+        )
+    else:
+        lines.append(
+            "- **Match found**: Use the matching examples as structural templates. "
+            "Adapt the gold example's before/after SQL pattern to this query — "
+            "don't invent from scratch when a proven template exists."
+        )
     lines.append(
         "- **No match**: Design the intervention from your diagnosis. You know the goal "
         "violation, the mechanism, and the excess rowcount — that's sufficient to reason "
@@ -969,8 +1009,8 @@ def section_investigate(
     )
     lines.append(
         "- **IGNORE**: Which parts of the example don't apply and WHY (e.g., \"ignore "
-        "the ROLLUP handling — this query has no ROLLUP\"). Without this, workers copy "
-        "irrelevant complexity."
+        "the ROLLUP handling — this query has no ROLLUP\"). Without this, irrelevant "
+        "complexity gets copied into the rewrite."
     )
     lines.append(
         "- **ADAPT**: What's different between the example's query and this query that "
@@ -1343,6 +1383,8 @@ def section_reference_appendix(
     detected_transforms: Optional[List] = None,
     matched_examples: Optional[List[Dict[str, Any]]] = None,
     dialect: str = "duckdb",
+    explain_plan_text: Optional[str] = None,
+    mode: str = "swarm",
 ) -> str:
     """§VII. REFERENCE APPENDIX — case files by blind spot, gold example catalog, regression registry, structural matches, verification."""
     engine_names = {
@@ -1412,11 +1454,18 @@ def section_reference_appendix(
     # B. Gold Example Catalog
     lines.append(f"### B. Gold Example Catalog ({engine_display})")
     lines.append("")
-    lines.append(
-        "Each example is a proven before/after SQL pair with measured speedups. "
-        "Workers receive the full SQL for assigned examples. You select based on "
-        "structural similarity to this query."
-    )
+    if mode == "swarm":
+        lines.append(
+            "Each example is a proven before/after SQL pair with measured speedups. "
+            "Workers receive the full SQL for assigned examples. You select based on "
+            "structural similarity to this query."
+        )
+    else:
+        lines.append(
+            "Each example is a proven before/after SQL pair with measured speedups. "
+            "Select based on structural similarity to this query, then adapt the "
+            "pattern in your rewrite."
+        )
     lines.append("")
     if matched_examples:
         lines.append("| Example ID | Family | Match | Query Shape | Result | Key Feature |")
@@ -1460,32 +1509,56 @@ def section_reference_appendix(
     if detected_transforms:
         lines.append("### D. Structural Matches for This Query")
         lines.append("")
+        lines.append(
+            "Transforms ranked by structural feature overlap with this query. "
+            "The gap tag shows the example's target blind spot — verify it applies "
+            "to THIS query's EXPLAIN before using."
+        )
+        lines.append("")
         for m in detected_transforms:
             pct = f"{m.overlap_ratio:.0%}"
             matched = ", ".join(m.matched_features)
-            gap_str = f" [{m.gap}]" if m.gap else ""
+            gap_str = f" [targets: {m.gap}]" if m.gap else ""
             lines.append(f"- **{m.id}** ({pct}){gap_str} — {matched}")
             if m.contraindications:
                 for ci in m.contraindications:
                     lines.append(f"  ⚠ {ci['instruction']}")
         lines.append("")
 
-    # E. What Doesn't Apply
-    features = _detect_query_features(dag)
+    # E. What Doesn't Apply (cross-referenced with PRUNING GUIDE)
+    features = _detect_query_features(dag, explain_plan_text)
     inapplicable = []
+    pruning_skips = []
     if not features["has_left_join"]:
         inapplicable.append("No LEFT JOINs")
+        pruning_skips.append("P5 (INNER conversion)")
     if not features["has_intersect"]:
         inapplicable.append("No INTERSECT")
+        pruning_skips.append("P6 (set rewrite)")
     if not features["has_window"]:
         inapplicable.append("No WINDOW/OVER")
+        pruning_skips.append("P8 (deferred window)")
     if not features["has_cte"]:
         inapplicable.append("No CTE chain in original")
+    if not features["has_or_predicate"]:
+        inapplicable.append("No OR predicates")
+        pruning_skips.append("P4 (OR decomposition)")
+    if not features["has_group_by"]:
+        inapplicable.append("No GROUP BY")
+        pruning_skips.append("P3 (aggregate pushdown)")
+    if not features["has_nested_loop"]:
+        inapplicable.append("No nested loops in EXPLAIN")
+        pruning_skips.append("P2 (decorrelation)")
+    if not features["has_correlated_subquery"]:
+        inapplicable.append("No correlated subqueries")
 
     if inapplicable:
         lines.append("### E. What Doesn't Apply")
         lines.append("")
         lines.append(", ".join(inapplicable) + ".")
+        if pruning_skips:
+            lines.append("")
+            lines.append(f"**Skip**: {', '.join(pruning_skips)}.")
         lines.append("")
 
     # F. Verification Checklist
@@ -1617,6 +1690,7 @@ def build_analyst_briefing_prompt(
         section_reference_appendix(
             engine_profile, exploit_algorithm_text, dag,
             detected_transforms, matched_examples, dialect,
+            explain_plan_text, mode,
         ),
     ]
 
