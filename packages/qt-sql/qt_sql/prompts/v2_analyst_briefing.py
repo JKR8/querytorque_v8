@@ -1057,11 +1057,11 @@ def section_investigate(
         lines.append("Win ratio: 1:1 (high volume, medium risk). ~35% of all DuckDB wins.")
         lines.append("")
         lines.append(
-            "**Family B — JOIN RESTRUCTURING** (arm the optimizer)"
+            "**Family B — DECORRELATION** (sets over loops)"
         )
         lines.append(
-            "Transforms: inner_join_conversion, multi_dimension_prefetch, "
-            "pg_date_cte_explicit_join, pg_explicit_join_materialized"
+            "Transforms: decorrelate, inline_decorrelate_materialized, "
+            "composite_decorrelate_union, shared_scan_decorrelate"
         )
         lines.append(
             "Mechanism: Give the planner explicit join structure and better cardinality "
@@ -1092,11 +1092,11 @@ def section_investigate(
         )
         lines.append("")
         lines.append(
-            "**Family D — SCAN CONSOLIDATION** (don't repeat work)"
+            "**Family D — SET OPERATIONS** (restructure predicates)"
         )
         lines.append(
-            "Transforms: single_pass_aggregation, channel_bitmap_aggregation, "
-            "self_join_decomposition, union_cte_split, self_join_pivot"
+            "Transforms: or_to_union (limit to 3 branches), intersect_to_exists, "
+            "union_cte_split, rollup_to_union_windowing"
         )
         lines.append(
             "Mechanism: Merge N separate scans of the same table into 1 pass using CASE "
@@ -1112,11 +1112,11 @@ def section_investigate(
         )
         lines.append("")
         lines.append(
-            "**Family E — SUBQUERY ELIMINATION** (sets over loops)"
+            "**Family E — MATERIALIZATION** (don't repeat work)"
         )
         lines.append(
-            "Transforms: decorrelate, inline_decorrelate_materialized, "
-            "intersect_to_exists, set_operation_materialization"
+            "Transforms: materialize_cte, deferred_window_aggregation, "
+            "single_pass_aggregation, channel_bitmap_aggregation"
         )
         lines.append(
             "Mechanism: Convert correlated subqueries to CTEs with GROUP BY + JOIN. "
@@ -1132,10 +1132,11 @@ def section_investigate(
         )
         lines.append("")
         lines.append(
-            "**Family F — PREDICATE RESTRUCTURE** (arm the optimizer — predicates)"
+            "**Family F — JOIN TRANSFORMATION** (arm the optimizer — join structure)"
         )
         lines.append(
-            "Transforms: or_to_union"
+            "Transforms: inner_join_conversion, explicit_join_materialized, "
+            "self_join_decomposition, self_join_pivot"
         )
         lines.append(
             "Mechanism: Split OR conditions on DIFFERENT columns into UNION ALL branches "
@@ -1457,10 +1458,11 @@ def section_reference_appendix(
     )
     lines.append("")
     if matched_examples:
-        lines.append("| Example ID | Match | Query Shape | Result | Key Feature |")
-        lines.append("|---|---|---|---|---|")
+        lines.append("| Example ID | Family | Match | Query Shape | Result | Key Feature |")
+        lines.append("|---|---|---|---|---|---|")
         for ex in matched_examples:
             ex_id = ex.get("id", "?")
+            family = ex.get("family", "?")
             desc = ex.get("description", "")
             speedup = ex.get("verified_speedup", "")
             principle = ex.get("principle", "")
@@ -1474,7 +1476,7 @@ def section_reference_appendix(
             if not raw_insight:
                 raw_insight = principle if principle else ""
             key_insight = (raw_insight[:77] + "...") if len(raw_insight) > 80 else raw_insight
-            lines.append(f"| {ex_id} | {match_pct} | {shape} | {speedup} | {key_insight} |")
+            lines.append(f"| {ex_id} | {family} | {match_pct} | {shape} | {speedup} | {key_insight} |")
         lines.append("")
     else:
         lines.append("*No gold examples available for this engine.*")

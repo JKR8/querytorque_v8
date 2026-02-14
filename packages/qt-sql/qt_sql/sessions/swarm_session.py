@@ -1004,13 +1004,42 @@ class SwarmSession(OptimizationSession):
         analyst_response = gen_result["_analyst_response"]
         briefing = gen_result["_briefing"]
 
-        # ── Step 6: Validation — Race first, fallback to sequential ─────
+        # ── Step 5.5: Semantic Pre-Validation (NEW) ────────────────────
+        semantic_results: Dict[int, Any] = {}
         sorted_wids = sorted(candidates_by_worker.keys())
+        cfg = self.pipeline.config
+
+        if cfg.semantic_validation_enabled:
+            semantic_results = self._run_semantic_validation(
+                candidates_by_worker, sorted_wids
+            )
+            # Filter to passing candidates only
+            passing_wids = [
+                wid for wid in sorted_wids
+                if semantic_results[wid].passed
+            ]
+            if len(passing_wids) < len(sorted_wids):
+                failed_count = len(sorted_wids) - len(passing_wids)
+                self._stage(
+                    self.query_id,
+                    f"SEMANTIC: {failed_count} candidate(s) failed pre-validation, "
+                    f"{len(passing_wids)} passing"
+                )
+        else:
+            # Semantic validation disabled — mark all as passed
+            passing_wids = sorted_wids
+            for wid in sorted_wids:
+                from ..schemas import SemanticValidationResult
+                semantic_results[wid] = SemanticValidationResult(
+                    tier_passed=3, passed=True, errors=[]
+                )
+
+        # ── Step 6: Validation — Race first, fallback to sequential ─────
         optimized_sqls = [
             candidates_by_worker[wid][1] for wid in sorted_wids
         ]
 
-        self._stage(self.query_id, f"VALIDATE: Racing original + 4 candidates... | total {_fmt_elapsed(time.time() - t_session)}")
+        self._stage(self.query_id, f"VALIDATE: Racing original + {len(passing_wids)} candidates... | total {_fmt_elapsed(time.time() - t_session)}")
         t_val = time.time()
 
         # ── Pre-flight: verify DB connectivity ────────────────────────────
@@ -1032,52 +1061,79 @@ class SwarmSession(OptimizationSession):
 
         # Try parallel race first (all 5 queries run simultaneously)
         from ..validate import race_candidates
-        cfg = self.pipeline.config
         if batch_results is None:
-            try:
-                race_result = race_candidates(
-                    db_path=cfg.db_path_or_dsn,
-                    original_sql=self.original_sql,
-                    candidate_sqls=optimized_sqls,
-                    worker_ids=sorted_wids,
-                    min_runtime_ms=cfg.race_min_runtime_ms,
-                    min_margin=cfg.race_min_margin,
-                    timeout_ms=cfg.timeout_seconds * 1000,
-                )
-                if race_result is not None:
-                    batch_results = race_result.verdicts
-                    # Cache baseline and race result for coach reuse
-                    self._cached_baseline = race_result.baseline
-                    self._race_result = race_result
+            # Only race passing candidates (filter by semantic validation results)
+            passing_sqls = [
+                candidates_by_worker[wid][1] for wid in passing_wids
+            ]
 
-                    # Log race results
-                    lane_tags = []
-                    for cl in race_result.candidates:
-                        if not cl.finished:
-                            lane_tags.append(f"W{cl.lane_id}=DNF")
-                        elif cl.error:
-                            lane_tags.append(f"W{cl.lane_id}=ERR")
-                        else:
-                            lane_tags.append(f"W{cl.lane_id}={cl.elapsed_ms:.0f}ms")
-                    winner_tag = "WINNER" if race_result.has_clear_winner else "NO WINNER"
-                    self._stage(
-                        self.query_id,
-                        f"RACE [{winner_tag}]: original={race_result.original.elapsed_ms:.0f}ms | "
-                        + " | ".join(lane_tags)
+            # If no candidates passed semantic validation, mark all as ERROR
+            if not passing_sqls:
+                batch_results = []
+                for wid in sorted_wids:
+                    sem_result = semantic_results[wid]
+                    error_msg = sem_result.errors[0] if sem_result.errors else "Semantic validation failed"
+                    batch_results.append(("ERROR", 0.0, sem_result.errors, "semantic"))
+            else:
+                try:
+                    race_result = race_candidates(
+                        db_path=cfg.db_path_or_dsn,
+                        original_sql=self.original_sql,
+                        candidate_sqls=passing_sqls,
+                        worker_ids=passing_wids,
+                        min_runtime_ms=cfg.race_min_runtime_ms,
+                        min_margin=cfg.race_min_margin,
+                        timeout_ms=cfg.timeout_seconds * 1000,
                     )
+                    if race_result is not None:
+                        # Merge race results with semantic failures
+                        # race_result.verdicts is indexed by passing_wids
+                        race_verdicts = race_result.verdicts
+                        batch_results = []
+                        race_idx = 0
+                        for wid in sorted_wids:
+                            if wid in passing_wids:
+                                batch_results.append(race_verdicts[race_idx])
+                                race_idx += 1
+                            else:
+                                # This worker failed semantic validation
+                                sem_result = semantic_results[wid]
+                                batch_results.append(
+                                    ("ERROR", 0.0, sem_result.errors, "semantic")
+                                )
 
-                    # Use race baseline EXPLAIN as fallback
-                    if (not self._explain_plan_text
-                            and race_result.baseline.explain_text):
-                        self._explain_plan_text = race_result.baseline.explain_text
-                        self._stage(self.query_id, "EXPLAIN: captured from race baseline")
+                        # Cache baseline and race result for coach reuse
+                        self._cached_baseline = race_result.baseline
+                        self._race_result = race_result
 
-                    # Post-race checksum: verify passing candidates match original
-                    batch_results = self._checksum_race_verdicts(
-                        batch_results, optimized_sqls, sorted_wids,
-                    )
-            except Exception as e:
-                logger.warning(f"[{self.query_id}] Race failed, falling back: {e}")
+                        # Log race results
+                        lane_tags = []
+                        for cl in race_result.candidates:
+                            if not cl.finished:
+                                lane_tags.append(f"W{cl.lane_id}=DNF")
+                            elif cl.error:
+                                lane_tags.append(f"W{cl.lane_id}=ERR")
+                            else:
+                                lane_tags.append(f"W{cl.lane_id}={cl.elapsed_ms:.0f}ms")
+                        winner_tag = "WINNER" if race_result.has_clear_winner else "NO WINNER"
+                        self._stage(
+                            self.query_id,
+                            f"RACE [{winner_tag}]: original={race_result.original.elapsed_ms:.0f}ms | "
+                            + " | ".join(lane_tags)
+                        )
+
+                        # Use race baseline EXPLAIN as fallback
+                        if (not self._explain_plan_text
+                                and race_result.baseline.explain_text):
+                            self._explain_plan_text = race_result.baseline.explain_text
+                            self._stage(self.query_id, "EXPLAIN: captured from race baseline")
+
+                        # Post-race checksum: verify passing candidates match original
+                        batch_results = self._checksum_race_verdicts(
+                            batch_results, optimized_sqls, sorted_wids,
+                        )
+                except Exception as e:
+                    logger.warning(f"[{self.query_id}] Race failed, falling back: {e}")
 
         # Fallback: sequential validation (for fast queries < 2s)
         if batch_results is None:
@@ -1154,6 +1210,7 @@ class SwarmSession(OptimizationSession):
                 error_category=error_cat,
                 exploratory=is_exploratory,
                 set_local_commands=set_local_cmds or [],
+                semantic_validation=semantic_results.get(wid),
             )
             worker_results.append(wr)
             self.all_worker_results.append(wr)
@@ -2165,6 +2222,70 @@ class SwarmSession(OptimizationSession):
             return None
         best = max(passing, key=lambda w: w.speedup)
         return best.optimized_sql
+
+    def _run_semantic_validation(
+        self,
+        candidates_by_worker: Dict[int, Any],
+        sorted_wids: List[int],
+    ) -> Dict[int, Any]:
+        """Run semantic pre-validation in parallel for all workers.
+
+        Validates each worker's candidate against the original SQL using
+        3-tier validation (structural, logic on TABLESAMPLE, dialect checks).
+
+        Args:
+            candidates_by_worker: Dict of worker_id -> (wb, sql, ...)
+            sorted_wids: Sorted list of worker IDs
+
+        Returns:
+            Dict of worker_id -> SemanticValidationResult
+        """
+        from ..validation.mini_validator import MiniValidator
+
+        results: Dict[int, Any] = {}
+        mini_validator = MiniValidator(
+            db_path=self.pipeline.config.db_path_or_dsn,
+            sample_pct=self.pipeline.config.semantic_sample_pct,
+            timeout_ms=self.pipeline.config.semantic_timeout_ms,
+            dialect=self.dialect,
+        )
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {}
+            for wid in sorted_wids:
+                wb, optimized_sql, *_ = candidates_by_worker[wid]
+                future = pool.submit(
+                    mini_validator.validate_rewrite,
+                    self.original_sql,
+                    optimized_sql,
+                    wid,
+                )
+                futures[future] = wid
+
+            for future in as_completed(futures):
+                wid = futures[future]
+                try:
+                    sem_result = future.result()
+                    results[wid] = sem_result
+
+                    if not sem_result.passed:
+                        error_summary = sem_result.errors[0][:80] if sem_result.errors else "Unknown error"
+                        self._stage(
+                            self.query_id,
+                            f"SEMANTIC W{wid}: tier {sem_result.tier_passed} FAIL — {error_summary}"
+                        )
+                except Exception as e:
+                    from ..schemas import SemanticValidationResult
+                    error_msg = f"Validation exception: {str(e)[:100]}"
+                    results[wid] = SemanticValidationResult(
+                        tier_passed=0,
+                        passed=False,
+                        errors=[error_msg],
+                    )
+                    self._stage(self.query_id, f"SEMANTIC W{wid}: exception — {error_msg}")
+
+        mini_validator.close()
+        return results
 
     def _checksum_race_verdicts(
         self,

@@ -142,6 +142,51 @@ def _build_worker_results_section(
                     lines.extend(plan_lines)
                 lines.append("```")
 
+            # Semantic validation diagnostics (if failed)
+            if wr.semantic_validation and not wr.semantic_validation.passed:
+                sem = wr.semantic_validation
+                lines.append("- **Semantic Validation Failure:**")
+                lines.append(f"  - Failed at Tier {sem.tier_passed}")
+                lines.append(f"  - Errors: {', '.join(sem.errors[:2])}")
+
+                # SQL diff
+                if sem.sql_diff:
+                    lines.append("  - **SQL Diff** (original vs rewrite):")
+                    lines.append("    ```diff")
+                    diff_lines = sem.sql_diff.split("\n")
+                    if len(diff_lines) > 20:
+                        lines.extend(diff_lines[:20])
+                        lines.append(f"    ... ({len(diff_lines) - 20} more lines)")
+                    else:
+                        lines.extend(diff_lines)
+                    lines.append("    ```")
+
+                # Row count diff
+                if sem.row_count_diff:
+                    rcd = sem.row_count_diff
+                    lines.append(f"  - **Row Count** (on {rcd.sample_pct}% sample):")
+                    lines.append(f"    - Original: {rcd.original_count} rows")
+                    lines.append(f"    - Rewrite: {rcd.rewrite_count} rows")
+                    lines.append(f"    - Difference: {rcd.diff:+d} rows")
+
+                # Value diffs
+                if sem.value_diffs:
+                    from ..validation.sql_differ import SQLDiffer
+                    lines.append("  - **Value Differences** (first 10):")
+                    diff_text = SQLDiffer.format_value_diffs(sem.value_diffs, max_per_column=2)
+                    for diff_line in diff_text.split("\n"):
+                        if diff_line.strip():
+                            lines.append(f"    {diff_line}")
+
+                # Column mismatch
+                if sem.column_mismatch:
+                    cm = sem.column_mismatch
+                    lines.append(f"  - **Column Mismatch:**")
+                    if cm.missing:
+                        lines.append(f"    - Missing from rewrite: {', '.join(cm.missing[:5])}")
+                    if cm.extra:
+                        lines.append(f"    - Extra in rewrite: {', '.join(cm.extra[:5])}")
+
             lines.append("")
     else:
         # Compact table for sniper

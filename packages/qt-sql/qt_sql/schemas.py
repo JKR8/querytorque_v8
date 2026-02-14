@@ -49,6 +49,53 @@ class ValidationResult:
 
 
 @dataclass
+class ColumnMismatch:
+    """Column count/name mismatch details."""
+    original_columns: List[str]
+    rewrite_columns: List[str]
+    missing: List[str]  # In original but not rewrite
+    extra: List[str]    # In rewrite but not original
+
+
+@dataclass
+class RowCountDiff:
+    """Row count difference on mini dataset."""
+    original_count: int
+    rewrite_count: int
+    diff: int  # rewrite - original
+    sample_pct: float  # What % of data was tested
+
+
+@dataclass
+class ValueDiff:
+    """Single value difference."""
+    row_index: int
+    column: str
+    original_value: Any
+    rewrite_value: Any
+
+
+@dataclass
+class SemanticValidationResult:
+    """Result from 3-tier mini validation."""
+    tier_passed: int  # 0 (failed all) | 1 (structural) | 2 (logic) | 3 (all)
+    passed: bool      # True if tier_passed >= 2
+    errors: List[str]
+
+    # Tier 1 failures (structural)
+    syntax_error: Optional[str] = None
+    column_mismatch: Optional[ColumnMismatch] = None
+
+    # Tier 2 failures (logic on mini dataset)
+    row_count_diff: Optional[RowCountDiff] = None
+    value_diffs: Optional[List[ValueDiff]] = None
+    sql_diff: Optional[str] = None  # Unified diff for LLM
+
+    # Timing
+    validation_time_ms: float = 0.0
+
+
+@dataclass
 class BenchmarkConfig:
     """Configuration loaded from benchmarks/<name>/config.json."""
     engine: str           # "duckdb" | "postgresql" | "snowflake"
@@ -64,6 +111,11 @@ class BenchmarkConfig:
     promote_threshold: float
     race_min_runtime_ms: float = 2000.0   # Race only triggers if original >= this
     race_min_margin: float = 0.05         # Candidate must beat original by this fraction
+
+    # Semantic validation options
+    semantic_validation_enabled: bool = True
+    semantic_sample_pct: float = 2.0  # TABLESAMPLE percentage
+    semantic_timeout_ms: int = 30_000  # 30s max per mini query
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> BenchmarkConfig:
@@ -85,6 +137,9 @@ class BenchmarkConfig:
             promote_threshold=data.get("promote_threshold", 1.05),
             race_min_runtime_ms=data.get("race_min_runtime_ms", 2000.0),
             race_min_margin=data.get("race_min_margin", 0.05),
+            semantic_validation_enabled=data.get("semantic_validation_enabled", True),
+            semantic_sample_pct=data.get("semantic_sample_pct", 2.0),
+            semantic_timeout_ms=data.get("semantic_timeout_ms", 30_000),
         )
 
 
@@ -186,6 +241,7 @@ class WorkerResult:
     set_local_config: Optional[Dict[str, Any]] = None  # PG tuning: {"params": {...}, "reasoning": "..."}
     set_local_commands: List[str] = field(default_factory=list)  # ["SET LOCAL work_mem = '256MB'", ...]
     explain_plan: Optional[str] = None  # EXPLAIN ANALYZE plan text for optimized query
+    semantic_validation: Optional[SemanticValidationResult] = None  # Semantic validation result from pre-validation
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -209,6 +265,46 @@ class WorkerResult:
             d["set_local_commands"] = self.set_local_commands
         if self.explain_plan:
             d["explain_plan"] = self.explain_plan
+        if self.semantic_validation:
+            # Convert semantic validation to dict format
+            sem = self.semantic_validation
+            sem_dict = {
+                "tier_passed": sem.tier_passed,
+                "passed": sem.passed,
+                "errors": sem.errors,
+                "validation_time_ms": sem.validation_time_ms,
+            }
+            if sem.syntax_error:
+                sem_dict["syntax_error"] = sem.syntax_error
+            if sem.column_mismatch:
+                cm = sem.column_mismatch
+                sem_dict["column_mismatch"] = {
+                    "original_columns": cm.original_columns,
+                    "rewrite_columns": cm.rewrite_columns,
+                    "missing": cm.missing,
+                    "extra": cm.extra,
+                }
+            if sem.row_count_diff:
+                rcd = sem.row_count_diff
+                sem_dict["row_count_diff"] = {
+                    "original_count": rcd.original_count,
+                    "rewrite_count": rcd.rewrite_count,
+                    "diff": rcd.diff,
+                    "sample_pct": rcd.sample_pct,
+                }
+            if sem.value_diffs:
+                sem_dict["value_diffs"] = [
+                    {
+                        "row_index": vd.row_index,
+                        "column": vd.column,
+                        "original_value": str(vd.original_value),
+                        "rewrite_value": str(vd.rewrite_value),
+                    }
+                    for vd in sem.value_diffs[:10]  # Limit to first 10
+                ]
+            if sem.sql_diff:
+                sem_dict["sql_diff"] = sem.sql_diff[:1000]  # Truncate for serialization
+            d["semantic_validation"] = sem_dict
         return d
 
 

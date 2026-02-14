@@ -749,45 +749,6 @@ class Pipeline:
         self.learner.generate_benchmark_history(self.benchmark_dir)
 
         return results
-
-    def run_analyst_session(
-        self,
-        query_id: str,
-        sql: str,
-        max_iterations: int = 3,
-        target_speedup: float = 2.0,
-        n_workers: int = 3,
-    ) -> "AnalystSession":
-        """Run iterative deep-dive optimization on a single query.
-
-        Always optimizes from the ORIGINAL SQL with full history.
-        Generates LLM failure analysis when speedup < target.
-        Stops when target reached or max iterations exhausted.
-
-        Args:
-            query_id: Query identifier (e.g., 'query_88')
-            sql: Original SQL query (never modified)
-            max_iterations: Max optimization rounds (default 3)
-            target_speedup: Stop early when this speedup is reached (default 2.0)
-            n_workers: Parallel workers per iteration
-
-        Returns:
-            AnalystSession with all iterations and best result
-        """
-        from .analyst_session import AnalystSession
-
-        session = AnalystSession(
-            pipeline=self,
-            query_id=query_id,
-            original_sql=sql,
-            max_iterations=max_iterations,
-            target_speedup=target_speedup,
-            n_workers=n_workers,
-        )
-        session.run()
-        session.save_session()
-        return session
-
     def run_optimization_session(
         self,
         query_id: str,

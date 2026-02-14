@@ -54,6 +54,12 @@ from .sql_validator import (
     SQLValidator,
     validate_sql_files,
 )
+from .mini_validator import (
+    MiniValidator,
+)
+from .sql_differ import (
+    SQLDiffer,
+)
 
 __all__ = [
     # Main validator
@@ -79,4 +85,7 @@ __all__ = [
     # Benchmarker
     "QueryBenchmarker",
     "BenchmarkResult",
+    # Semantic validation
+    "MiniValidator",
+    "SQLDiffer",
 ]

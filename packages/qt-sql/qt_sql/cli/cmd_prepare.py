@@ -15,10 +15,10 @@ import click
 @click.option("-q", "--query", multiple=True, help="Query filter (repeatable, prefix match).")
 @click.option(
     "--mode",
-    type=click.Choice(["swarm", "expert", "oneshot"]),
+    type=click.Choice(["swarm", "oneshot"]),
     default="swarm",
     show_default=True,
-    help="Prompt mode.",
+    help="Prompt mode: swarm (multi-worker) or oneshot (single call).",
 )
 @click.option("--force", is_flag=True, help="Regenerate even if prompts exist.")
 @click.option("--bootstrap", is_flag=True,
@@ -77,7 +77,7 @@ def prepare(
 
     # Lazy imports — keep `qt --help` fast
     from ..pipeline import Pipeline
-    from ..prompts.analyst_briefing import build_analyst_briefing_prompt
+    from ..prompts.v2_analyst_briefing import build_v2_analyst_briefing_prompt
 
     if bootstrap:
         import os
@@ -109,24 +109,23 @@ def prepare(
                 query_id=qid, sql=sql, dialect=dialect, engine=engine,
             )
 
-            prompt = build_analyst_briefing_prompt(
+            prompt = build_v2_analyst_briefing_prompt(
                 query_id=qid,
                 sql=sql,
                 explain_plan_text=ctx_data.get("explain_plan_text"),
                 dag=dag,
                 costs=costs,
                 semantic_intents=ctx_data.get("semantic_intents"),
-                global_knowledge=ctx_data.get("global_knowledge"),
                 constraints=ctx_data.get("constraints", []),
                 dialect=dialect,
-                strategy_leaderboard=ctx_data.get("strategy_leaderboard"),
-                query_archetype=ctx_data.get("query_archetype"),
                 engine_profile=ctx_data.get("engine_profile"),
                 resource_envelope=ctx_data.get("resource_envelope"),
                 exploit_algorithm_text=ctx_data.get("exploit_algorithm_text"),
                 plan_scanner_text=ctx_data.get("plan_scanner_text"),
                 mode=mode,
+                detected_transforms=ctx_data.get("detected_transforms"),
                 qerror_analysis=ctx_data.get("qerror_analysis"),
+                matched_examples=ctx_data.get("matched_examples"),
             )
 
             # Save outputs

@@ -24,7 +24,6 @@ Usage:
 """
 
 from .pipeline import Pipeline
-from .analyst_session import AnalystSession, AnalystIteration
 from .schemas import (
     BenchmarkConfig,
     OptimizationMode,
@@ -43,8 +42,6 @@ from .sessions import (
 
 __all__ = [
     "Pipeline",
-    "AnalystSession",
-    "AnalystIteration",
     "BenchmarkConfig",
     "OptimizationMode",
     "OptimizationSession",

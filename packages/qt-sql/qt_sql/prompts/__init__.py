@@ -1,4 +1,4 @@
-"""ADO prompt builders for swarm mode."""
+"""ADO prompt builders for canonical modes: oneshot and swarm."""
 
 from .swarm_fan_out import build_fan_out_prompt
 from .swarm_snipe import (
@@ -7,6 +7,10 @@ from .swarm_snipe import (
     build_sniper_prompt,          # DEPRECATED — kept for reference
 )
 from .swarm_common import build_worker_strategy_header
+# V2 Canonical prompt builders (required by swarm_session.py)
+from .v2_analyst_briefing import build_v2_analyst_briefing_prompt
+from .v2_swarm_parsers import parse_v2_briefing_response
+from .v2_briefing_checks import validate_v2_parsed_briefing
 from .swarm_parsers import (
     WorkerAssignment,
     parse_fan_out_response,
@@ -47,6 +51,11 @@ __all__ = [
     # Oneshot
     "OneshotResult",
     "parse_oneshot_response",
+    # V2 Canonical prompt builders
+    "build_v2_analyst_briefing_prompt",
+    "parse_v2_briefing_response",
+    "validate_v2_parsed_briefing",
+    # Legacy prompt builders
     "build_analyst_briefing_prompt",
     "build_worker_prompt",
     "build_analyst_section_checklist",
