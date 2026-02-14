@@ -227,14 +227,24 @@ def _walk_pg_plan(node: Dict, entries: List[CostSpineEntry], depth: int = 0) -> 
 
 
 def _walk_duckdb_plan(node: Dict, entries: List[CostSpineEntry], depth: int = 0) -> None:
-    """Walk DuckDB plan tree, extracting cost info."""
+    """Walk DuckDB plan tree, extracting cost info.
+
+    Handles both naming conventions:
+    - Cached DuckDB EXPLAIN JSON: operator_name / operator_timing / operator_cardinality
+    - Legacy/in-memory format:    name / timing / cardinality
+    """
     if not isinstance(node, dict):
         return
 
-    name = node.get("name", "Unknown")
-    timing = node.get("timing", 0)
-    cardinality = node.get("cardinality", 0)
+    name = node.get("operator_name") or node.get("name", "Unknown")
+    timing = node.get("operator_timing") or node.get("timing", 0) or 0
+    cardinality = node.get("operator_cardinality") or node.get("cardinality", 0) or 0
     extra_info = node.get("extra_info", "")
+    # extra_info can be a dict (cached DuckDB plans) or a string
+    if isinstance(extra_info, dict):
+        extra_str = ", ".join(f"{k}={v}" for k, v in list(extra_info.items())[:3])
+    else:
+        extra_str = str(extra_info)[:100] if extra_info else ""
 
     if timing > 0 or cardinality > 0:
         entry = CostSpineEntry(
@@ -243,7 +253,7 @@ def _walk_duckdb_plan(node: Dict, entries: List[CostSpineEntry], depth: int = 0)
             cost_pct=0,  # Will be normalized using timing
             estimated_rows=0,
             actual_rows=cardinality,
-            notes=extra_info[:100] if extra_info else "",
+            notes=extra_str,
         )
         entry._raw_cost = timing  # type: ignore[attr-defined]
         entries.append(entry)

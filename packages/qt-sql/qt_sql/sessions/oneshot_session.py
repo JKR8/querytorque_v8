@@ -189,7 +189,7 @@ class OneshotSession(OptimizationSession):
                     query_id=self.query_id,
                     examples_recommended=example_ids,
                     transforms_recommended=example_ids,
-                    status="pass" if status in ("WIN", "IMPROVED", "NEUTRAL") else "error",
+                    status="pass" if status in ("WIN", "IMPROVED") or (status == "NEUTRAL" and val_error_cat != "rewrite_failure") else "error",
                     speedup=speedup,
                     transforms_used=transforms,
                     error_category=val_error_cat,

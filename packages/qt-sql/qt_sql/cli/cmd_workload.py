@@ -84,15 +84,36 @@ def workload(
                 try:
                     explain_data = json.loads(explain_path.read_text())
                     exec_ms = explain_data.get("execution_time_ms")
-                    if exec_ms is not None:
+                    if exec_ms and float(exec_ms) > 0:
                         duration_ms = float(exec_ms)
-                        timed_out = duration_ms > 300_000
-                    # Check for spill indicators in plan text
+                    else:
+                        # DuckDB cached plans have execution_time_ms=0;
+                        # fall back to sum of operator_timing (seconds → ms)
+                        pj = explain_data.get("plan_json")
+                        if isinstance(pj, dict):
+                            def _sum_timing(n):
+                                t = n.get("operator_timing") or n.get("timing", 0) or 0
+                                for c in n.get("children", []):
+                                    t += _sum_timing(c)
+                                return t
+                            total_s = _sum_timing(pj)
+                            if total_s > 0:
+                                duration_ms = total_s * 1000
+                    if duration_ms is not None and duration_ms > 300_000:
+                        timed_out = True
+
+                    # Check for spill: plan text keywords + structured fields
                     plan_text = explain_data.get("plan_text") or ""
                     if any(kw in plan_text.lower() for kw in
                            ("spill", "external merge", "temp written",
                             "bytes_spilled")):
                         spill_detected = True
+                    # Also check structured plan fields (DuckDB)
+                    pj = explain_data.get("plan_json")
+                    if isinstance(pj, dict):
+                        peak_temp = pj.get("system_peak_temp_dir_size", 0) or 0
+                        if peak_temp > 0:
+                            spill_detected = True
                 except Exception:
                     pass
 

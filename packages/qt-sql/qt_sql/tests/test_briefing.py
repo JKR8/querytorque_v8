@@ -412,12 +412,14 @@ class TestSectionThisEngine:
         assert "System Resource Envelope" in result
         assert "shared_buffers=4GB" in result
 
-    def test_resource_envelope_not_shown_for_duckdb(self):
-        result = section_this_engine(
-            _engine_profile(), None, "duckdb",
-            "some_envelope",
-        )
-        assert "System Resource Envelope" not in result
+    def test_resource_envelope_shown_for_all_engines(self):
+        """Resource envelope renders for all engines (orchestrator injects scenario text)."""
+        for dialect in ("duckdb", "snowflake", "postgresql"):
+            result = section_this_engine(
+                _engine_profile(), None, dialect,
+                "some_envelope",
+            )
+            assert "System Resource Envelope" in result, f"Missing for {dialect}"
 
     def test_exploit_algorithm_with_pg_scanner_and_envelope(self):
         """§III should render plan_scanner_text and resource_envelope even with exploit algorithm."""
