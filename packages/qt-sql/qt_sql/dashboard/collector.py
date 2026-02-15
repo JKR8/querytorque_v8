@@ -145,8 +145,9 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
                     engine=engine_name, dialect=dialect,
                 )
                 for m in matched:
-                    if m.overlap_ratio >= 0.25:
+                    if m.overlap_ratio >= 0.6:
                         n_matches += 1
+                        tractability += 1
                         pattern_overlaps[m.id] = m.overlap_ratio
                         t_meta = catalog_by_id.get(m.id, {})
                         matched_transforms.append(ForensicTransformMatch(
@@ -155,8 +156,6 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
                             gap=m.gap,
                             family=t_meta.get("family", ""),
                         ))
-                    if m.overlap_ratio >= 0.6:
-                        tractability += 1
                 if matched:
                     top_overlap = matched[0].overlap_ratio
                     top_transform = matched[0].id

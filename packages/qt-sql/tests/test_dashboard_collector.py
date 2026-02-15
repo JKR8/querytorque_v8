@@ -880,7 +880,7 @@ class TestBuildForensic:
         (tmp_path / "qerror_analysis.json").write_text(json.dumps([{
             "query_id": "query_1",
             "max_q_error": 500.0,
-            "severity": "MAJOR_HALLUCINATION",
+            "severity": "S2",
             "direction": "UNDER_EST",
             "worst_node": "HASH_JOIN",
             "pathology_routing": "P0,P2",
@@ -889,7 +889,7 @@ class TestBuildForensic:
         result = _build_forensic(tmp_path, "duckdb")
         q = result.queries[0]
         assert q.qerror is not None
-        assert q.qerror.severity == "MAJOR_HALLUCINATION"
+        assert q.qerror.severity == "S2"
         assert q.qerror.max_q_error == 500.0
 
     def test_estimated_opportunity(self, tmp_path):

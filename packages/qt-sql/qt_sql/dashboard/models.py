@@ -26,7 +26,7 @@ class ForensicTransformMatch:
 @dataclass
 class QErrorEntry:
     """Per-query cardinality estimation error (PG/DuckDB only)."""
-    severity: str = ""          # CATASTROPHIC_BLINDNESS / MAJOR / MODERATE / MINOR / ACCURATE
+    severity: str = ""          # S1 (critical) / S2 (major) / S3 (moderate) / S4 (minor) / S5 (accurate)
     direction: str = ""         # UNDER_EST / OVER_EST / ZERO_EST
     worst_node: str = ""        # Operator with largest error
     worst_est: int = 0          # Estimated cardinality at worst node

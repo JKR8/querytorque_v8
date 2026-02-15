@@ -200,14 +200,14 @@ def _classify_magnitude(q_error: float) -> str:
 
 def _classify_severity(max_q: float) -> str:
     if max_q > 10_000:
-        return "CATASTROPHIC_BLINDNESS"
+        return "S1"
     if max_q > 100:
-        return "MAJOR_HALLUCINATION"
+        return "S2"
     if max_q > 10:
-        return "MODERATE_GUESS"
+        return "S3"
     if max_q > 2:
-        return "MINOR_DRIFT"
-    return "ACCURATE"
+        return "S4"
+    return "S5"
 
 
 def _compute_q_error(estimated: int, actual: int) -> float:
