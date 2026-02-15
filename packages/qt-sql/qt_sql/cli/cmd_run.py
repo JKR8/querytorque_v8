@@ -45,6 +45,10 @@ import click
               help="Emit structured QueryOutputContract JSON alongside results.")
 @click.option("--patch", "patch_mode", is_flag=True,
               help="Use IR patch plans instead of full SQL rewrites.")
+@click.option("--fleet", is_flag=True,
+              help="Fleet mode: survey, triage, parallel execute all queries.")
+@click.option("--dry-run", "dry_run", is_flag=True,
+              help="With --fleet: run survey + triage only, no LLM calls.")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -63,12 +67,17 @@ def run(
     engine_version: str,
     output_contract: bool,
     patch_mode: bool,
+    fleet: bool,
+    dry_run: bool,
 ) -> None:
     """Run the full optimization pipeline (requires LLM API key).
 
     With --concurrency N: Phase 1 generates all candidates in parallel (N threads),
     then Phase 2 validates each query serially (avoids DB contention).
     Without --concurrency (or =0): sequential per-query execution (original behavior).
+
+    With --patch: Uses tiered IR patch mode (analyst → workers → patch engine).
+    Defaults to oneshot mode with 10x target speedup.
     """
     from ._common import (
         console,
@@ -79,6 +88,13 @@ def run(
         print_error,
         print_success,
     )
+
+    # Patch mode defaults: oneshot + 10x target
+    if patch_mode:
+        if mode == "swarm":
+            mode = "oneshot"
+        if target_speedup == 2.0:  # user didn't override
+            target_speedup = 10.0
 
     bench_dir = resolve_benchmark(benchmark)
     cfg = load_benchmark_config(bench_dir)
@@ -123,6 +139,108 @@ def run(
     iters = 1 if fan_out_only else max_iterations
     n_workers = cfg.get("workers_state_0", 4)
 
+    # ── Fleet mode: survey → triage → parallel execute → scorecard ────
+    if fleet:
+        from ..fleet.orchestrator import FleetOrchestrator
+        from ..fleet.dashboard import FleetDashboard
+
+        # Fleet implies patch mode
+        if not patch_mode:
+            patch_mode = True
+            mode = "oneshot"
+            if target_speedup == 2.0:
+                target_speedup = 10.0
+
+        # Load queries dict for survey
+        queries_dict = {}
+        for qid in query_ids:
+            sql_path = bench_dir / "queries" / f"{qid}.sql"
+            if sql_path.exists():
+                queries_dict[qid] = sql_path.read_text().strip()
+
+        dashboard = FleetDashboard()
+        orch = FleetOrchestrator(
+            pipeline=pipeline,
+            benchmark_dir=bench_dir,
+            concurrency=concurrency or 4,
+            dashboard=dashboard,
+        )
+
+        # Phase 0: Survey
+        console.print("\n[bold]Phase 0: Survey[/bold]")
+        surveys = orch.survey(query_ids, queries_dict)
+        console.print(f"  Surveyed {len(surveys)} queries")
+
+        # Phase 1: Triage
+        console.print("\n[bold]Phase 1: Triage[/bold]")
+        triaged = orch.triage(surveys, queries_dict)
+
+        # Print triage summary
+        buckets = {}
+        for t in triaged:
+            buckets[t.bucket] = buckets.get(t.bucket, 0) + 1
+        console.print(
+            f"  {buckets.get('HIGH', 0)} HIGH, "
+            f"{buckets.get('MEDIUM', 0)} MEDIUM, "
+            f"{buckets.get('LOW', 0)} LOW, "
+            f"{buckets.get('SKIP', 0)} SKIP"
+        )
+        console.print(
+            f"  [dim]Skipping {buckets.get('SKIP', 0)} queries < 100ms[/dim]"
+        )
+
+        if dry_run:
+            # Print triage table and exit
+            console.print("\n[bold]Triage Results (dry-run):[/bold]")
+            for t in triaged:
+                transforms_str = ""
+                if t.survey.matched_transforms:
+                    transforms_str = t.survey.matched_transforms[0].id
+                console.print(
+                    f"  {t.query_id:30s} "
+                    f"{t.bucket:8s} "
+                    f"{t.survey.runtime_ms:>10.0f}ms "
+                    f"iters={t.max_iterations} "
+                    f"score={t.priority_score:.1f} "
+                    f"tract={t.survey.tractability} "
+                    f"{transforms_str}"
+                )
+            console.print(f"\n[dim]Dry run complete. Use without --dry-run to execute.[/dim]")
+            return
+
+        # Phase 2: Execute
+        console.print(f"\n[bold]Phase 2: Execute[/bold] (concurrency={concurrency or 4})")
+        dashboard.start()
+        try:
+            results = orch.execute(triaged, completed_ids, out, checkpoint_path)
+        finally:
+            dashboard.stop()
+
+        # Phase 3: Compile scorecard
+        scorecard_md = orch.compile(results, triaged)
+        (out / "fleet_scorecard.md").write_text(scorecard_md)
+
+        # Summary JSON (same format as existing runs)
+        elapsed = time.time() - t0
+        summary = {
+            "benchmark": bench_dir.name,
+            "mode": "fleet",
+            "concurrency": concurrency or 4,
+            "total": len(query_ids),
+            "completed": len(results),
+            "elapsed_seconds": round(elapsed, 1),
+            "results": results,
+        }
+        (out / "summary.json").write_text(json.dumps(summary, indent=2))
+
+        console.print()
+        print_success(
+            f"Fleet complete: {len(results)}/{len(query_ids)} "
+            f"in {elapsed:.1f}s → {out}"
+        )
+        console.print(f"  Scorecard: {out / 'fleet_scorecard.md'}")
+        return
+
     # Create orchestrator when scenario or engine-version is provided
     orchestrator = None
     if scenario or engine_version:
@@ -141,8 +259,24 @@ def run(
     errors = []
     t0 = time.time()
 
+    # Parallel patch mode: LLM concurrent, benchmark serialized
+    if concurrency > 0 and patch_mode:
+        _run_patch_parallel(
+            pipeline=pipeline,
+            query_ids=query_ids,
+            completed_ids=completed_ids,
+            bench_dir=bench_dir,
+            out=out,
+            checkpoint_path=checkpoint_path,
+            max_iterations=iters,
+            target_speedup=target_speedup,
+            concurrency=concurrency,
+            results=results,
+            errors=errors,
+            console=console,
+        )
     # Two-phase parallel execution (swarm mode only)
-    if concurrency > 0 and mode == "swarm":
+    elif concurrency > 0 and mode == "swarm":
         _run_two_phase(
             pipeline=pipeline,
             query_ids=query_ids,
@@ -296,6 +430,97 @@ def _run_serial(
         except Exception as e:
             errors.append((qid, str(e)))
             console.print(f"[red]ERROR[/red] {e}")
+
+
+def _run_patch_parallel(
+    *,
+    pipeline,
+    query_ids,
+    completed_ids,
+    bench_dir,
+    out,
+    checkpoint_path,
+    max_iterations,
+    target_speedup,
+    concurrency,
+    results,
+    errors,
+    console,
+) -> None:
+    """Parallel patch mode: LLM phases concurrent, benchmark serialized via shared lock.
+
+    Each query runs its full tiered pipeline (analyst → workers → semantic retry → snipe)
+    concurrently. Only the benchmark phase (Phase 5: 3x timed runs) is serialized via a
+    shared threading.Lock to prevent timing pollution from concurrent DB load.
+    """
+    import threading
+    from ..schemas import OptimizationMode
+
+    benchmark_lock = threading.Lock()
+
+    # Build work items
+    work_items: list[tuple[str, str]] = []
+    for qid in query_ids:
+        if qid in completed_ids:
+            console.print(f"  {qid} [dim]skipped (checkpoint)[/dim]")
+            continue
+        sql_path = bench_dir / "queries" / f"{qid}.sql"
+        if not sql_path.exists():
+            errors.append((qid, "SQL file not found"))
+            continue
+        sql = sql_path.read_text().strip()
+        work_items.append((qid, sql))
+
+    if not work_items:
+        console.print("  No queries to process.")
+        return
+
+    console.print(
+        f"\n{'='*60}\n"
+        f"  PATCH PARALLEL: {len(work_items)} queries, "
+        f"concurrency={concurrency}, benchmark=serial\n"
+        f"{'='*60}"
+    )
+
+    t0 = time.time()
+
+    def _run_one(qid_sql):
+        qid, sql = qid_sql
+        return qid, pipeline.run_optimization_session(
+            query_id=qid,
+            sql=sql,
+            max_iterations=max_iterations,
+            target_speedup=target_speedup,
+            mode=OptimizationMode.ONESHOT,
+            patch=True,
+            benchmark_lock=benchmark_lock,
+        )
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(_run_one, item): item[0] for item in work_items}
+
+        for future in as_completed(futures):
+            qid = futures[future]
+            try:
+                qid, result = future.result()
+                _save_query_result(result, qid, out, checkpoint_path, completed_ids, results)
+                speedup = getattr(result, "best_speedup", None) or getattr(result, "speedup", None)
+                status_str = getattr(result, "status", "?")
+                elapsed_q = time.time() - t0
+                console.print(
+                    f"  [{len(results)}/{len(work_items)}] {qid}: "
+                    f"[green]{status_str}[/green] {speedup or '?'}x "
+                    f"({elapsed_q:.0f}s elapsed)"
+                )
+            except Exception as e:
+                errors.append((qid, str(e)))
+                console.print(f"  {qid}: [red]ERROR[/red] {e}")
+
+    elapsed = time.time() - t0
+    console.print(
+        f"\n  Patch parallel complete: {len(results)}/{len(work_items)} "
+        f"in {elapsed:.1f}s"
+    )
 
 
 def _run_two_phase(

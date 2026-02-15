@@ -89,7 +89,7 @@ class OneshotPatchSession(OptimizationSession):
         return self._run_single_tier()
 
     def _run_single_tier(self) -> SessionResult:
-        """Original single-tier patch loop (DeepSeek does everything)."""
+        """Original single-tier patch loop (one LLM does everything)."""
         from ..ir import build_script_ir, render_ir_node_map, Dialect
         from ..patches.oneshot_patch_prompt_builder import (
             build_oneshot_patch_prompt,
@@ -403,16 +403,30 @@ class OneshotPatchSession(OptimizationSession):
     # ── Tiered Mode ─────────────────────────────────────────────────────────
 
     def _run_tiered(self) -> SessionResult:
-        """2-tier patch mode: DeepSeek analyst → qwen workers → validate."""
+        """2-tier patch mode: analyst → workers → semantic retry → benchmark → snipe → iterate.
+
+        Full pipeline per iteration:
+        1. Analyst call (or snipe on iteration 2+)
+        2. Workers (parallel, role-routed)
+        3. Apply-error retry (existing)
+        4. Semantic validation + worker retry for semantic failures
+        5. Benchmark semantically-valid patches (5x trimmed mean)
+        6. EXPLAIN collection
+        7. Track best, stop if >= target_speedup
+        8. Next iteration uses snipe prompt with all results
+        """
         from ..ir import build_script_ir, render_ir_node_map, Dialect
         from ..patches.oneshot_patch_prompt_builder import load_gold_examples
         from ..patches.tiered_orchestrator import TieredOrchestrator
         from ..execution.database_utils import run_explain_analyze, run_explain_text
 
+        # Override target_speedup for tiered mode
+        target_speedup = getattr(self.pipeline.config, "target_speedup", 10.0)
+
         logger.info(
             f"[{self.query_id}] OneshotPatchSession TIERED: "
             f"max {self.max_iterations} iterations, "
-            f"target {self.target_speedup:.1f}x"
+            f"target {target_speedup:.1f}x"
         )
 
         # ── Setup ──────────────────────────────────────────────────────
@@ -460,6 +474,9 @@ class OneshotPatchSession(OptimizationSession):
         best_status = "NEUTRAL"
         iterations_data: List[PatchIterationResult] = []
         total_api_calls = 0
+        # Track all patches across iterations for snipe context
+        prev_all_patches: Optional[List[AppliedPatch]] = None
+        prev_explains: Dict[str, str] = {}
 
         for iteration in range(self.max_iterations):
             logger.info(
@@ -467,13 +484,29 @@ class OneshotPatchSession(OptimizationSession):
             )
             iter_api_calls = 0
 
-            # ── Phase 1: Analyst call ─────────────────────────────────
-            targets, analyst_prompt, analyst_response = orchestrator.run_analyst(
-                query_id=self.query_id,
-                original_sql=self.original_sql,
-                explain_text=original_explain,
-                ir_node_map=ir_node_map,
-            )
+            # ── Phase 1: Analyst call (or snipe on iteration 2+) ──────
+            if self.on_phase_change:
+                self.on_phase_change(
+                    phase="analyst" if iteration == 0 else "snipe",
+                    iteration=iteration,
+                )
+            if iteration == 0:
+                targets, analyst_prompt, analyst_response = orchestrator.run_analyst(
+                    query_id=self.query_id,
+                    original_sql=self.original_sql,
+                    explain_text=original_explain,
+                    ir_node_map=ir_node_map,
+                )
+            else:
+                # Snipe round: analyst sees all prior results
+                targets, analyst_prompt, analyst_response = orchestrator.run_snipe(
+                    query_id=self.query_id,
+                    original_sql=self.original_sql,
+                    explain_text=original_explain,
+                    ir_node_map=ir_node_map,
+                    patches=prev_all_patches or [],
+                    patch_explains=prev_explains,
+                )
             iter_api_calls += 1
 
             self._save_to_disk(session_dir, iteration, "analyst_prompt", analyst_prompt)
@@ -497,6 +530,11 @@ class OneshotPatchSession(OptimizationSession):
             )
 
             # ── Phase 2: Worker calls (parallel, role-routed) ────────
+            if self.on_phase_change:
+                self.on_phase_change(phase="workers", iteration=iteration)
+            logger.info(
+                f"[{self.query_id}] Phase 2: dispatching {len(targets)} workers"
+            )
             patches, worker_api_calls = orchestrator.run_workers(
                 original_sql=self.original_sql,
                 ir_node_map=ir_node_map,
@@ -508,10 +546,23 @@ class OneshotPatchSession(OptimizationSession):
 
             applied = [p for p in patches if p.output_sql]
             logger.info(
-                f"[{self.query_id}] Workers: {len(applied)}/{len(patches)} patches applied"
+                f"[{self.query_id}] Phase 2 done: "
+                f"{len(applied)}/{len(patches)} patches applied"
             )
 
-            # ── Phase 2.5: Worker retry for failed patches ────────────
+            # Save worker outputs
+            for p in patches:
+                status = "OK" if p.output_sql else f"FAIL: {p.apply_error}"
+                self._save_to_disk(
+                    session_dir, iteration, f"worker_{p.patch_id}",
+                    f"Family: {p.family}\nTransform: {p.transform}\n"
+                    f"Status: {status}\n\n"
+                    f"{'--- OUTPUT SQL ---' if p.output_sql else '--- NO OUTPUT ---'}\n"
+                    f"{p.output_sql or p.apply_error or 'N/A'}"
+                )
+
+            # ── Phase 3: Apply-error retry for failed patches ────────
+            logger.info(f"[{self.query_id}] Phase 3: apply-error retries")
             failed = [p for p in patches if not p.output_sql and p.apply_error]
             for p in failed:
                 target_match = next(
@@ -536,7 +587,6 @@ class OneshotPatchSession(OptimizationSession):
                     iter_api_calls += 1
 
                     if retried and retried.output_sql:
-                        # Replace failed patch with retried version
                         idx = patches.index(p)
                         patches[idx] = retried
                         applied.append(retried)
@@ -556,25 +606,118 @@ class OneshotPatchSession(OptimizationSession):
                 total_api_calls += iter_api_calls
                 continue
 
-            # ── Phase 3: Validate (reuse existing) ─────────────────────
-            iter_result = self._validate_patches(applied, db_path)
-            iter_result.iteration = iteration
-            iter_result.prompt = analyst_prompt
-            iter_result.response = analyst_response
-            iter_result.n_api_calls = iter_api_calls
+            # ── Phase 4: Semantic validation + retry ──────────────────
+            if self.on_phase_change:
+                self.on_phase_change(phase="semantic", iteration=iteration)
+            logger.info(
+                f"[{self.query_id}] Phase 4: semantic validation "
+                f"({len(applied)} patches)"
+            )
+            applied, sem_api_calls = self._semantic_validate_and_retry(
+                applied=applied,
+                targets=targets,
+                orchestrator=orchestrator,
+                ir_node_map=ir_node_map,
+                db_path=db_path,
+                script_ir=script_ir,
+                dialect_enum=dialect_enum,
+            )
+            iter_api_calls += sem_api_calls
 
-            # Include all patches (applied + failed) for diagnosis
-            all_patches = []
-            applied_ids = {p.patch_id for p in applied}
-            for p in patches:
-                if p.patch_id in applied_ids:
-                    validated = next(
-                        (a for a in applied if a.patch_id == p.patch_id), p
-                    )
-                    all_patches.append(validated)
-                else:
-                    all_patches.append(p)
-            iter_result.patches = all_patches
+            sem_passed = [p for p in applied if p.semantic_passed]
+            if not sem_passed:
+                logger.info(
+                    f"[{self.query_id}] No patches passed semantic validation"
+                )
+                # Build all_patches for snipe context
+                all_patches = self._merge_all_patches(patches, applied)
+                prev_all_patches = all_patches
+                prev_explains = {}
+                iterations_data.append(PatchIterationResult(
+                    iteration=iteration,
+                    prompt=analyst_prompt,
+                    response=analyst_response,
+                    n_api_calls=iter_api_calls,
+                    patches=all_patches,
+                ))
+                total_api_calls += iter_api_calls
+                continue
+
+            # ── Phase 5: Benchmark semantically-valid patches ─────────
+            # Acquire benchmark_lock if shared across concurrent sessions
+            # to prevent timing pollution from concurrent DB load
+            if self.on_phase_change:
+                self.on_phase_change(phase="benchmark", iteration=iteration)
+            logger.info(
+                f"[{self.query_id}] Phase 5: benchmark "
+                f"{len(sem_passed)} sem-passed patches (3x warmup+avg2)"
+            )
+            from contextlib import nullcontext
+            bench_ctx = self.benchmark_lock if self.benchmark_lock else nullcontext()
+            with bench_ctx:
+                logger.info(f"[{self.query_id}] Benchmark lock acquired")
+                self._sequential_benchmark(sem_passed, db_path)
+                logger.info(f"[{self.query_id}] Benchmark lock released")
+
+            # Save benchmark results
+            for p in sem_passed:
+                speedup_str = f"{p.speedup:.2f}x" if p.speedup else "N/A"
+                self._save_to_disk(
+                    session_dir, iteration, f"bench_{p.patch_id}",
+                    f"Speedup: {speedup_str}\nStatus: {p.status}\n"
+                    f"Original ms: {p.original_ms}\nPatch ms: {p.patch_ms}\n"
+                    f"Error: {p.apply_error or 'none'}"
+                )
+
+            # ── Phase 6: EXPLAIN collection ───────────────────────────
+            if self.on_phase_change:
+                self.on_phase_change(phase="explain", iteration=iteration)
+            logger.info(
+                f"[{self.query_id}] Phase 6: EXPLAIN collection"
+            )
+            iter_explains: Dict[str, str] = {}
+            for p in sem_passed:
+                if p.output_sql:
+                    try:
+                        explain_data = run_explain_analyze(db_path, p.output_sql)
+                        if explain_data:
+                            p.explain_text = explain_data.get("plan_text", "")
+                            iter_explains[p.patch_id] = p.explain_text
+                        else:
+                            text = run_explain_text(db_path, p.output_sql)
+                            if text:
+                                p.explain_text = text
+                                iter_explains[p.patch_id] = text
+                    except Exception as e:
+                        logger.warning(f"EXPLAIN failed for {p.patch_id}: {e}")
+
+            # Build complete all_patches list
+            all_patches = self._merge_all_patches(patches, applied)
+
+            # Build iteration result
+            iter_result = PatchIterationResult(
+                iteration=iteration,
+                prompt=analyst_prompt,
+                response=analyst_response,
+                n_api_calls=iter_api_calls,
+                patches=all_patches,
+                explains=iter_explains,
+            )
+
+            # Find best from benchmarked patches
+            candidates_with_speedup = [
+                p for p in sem_passed
+                if p.speedup is not None and p.speedup >= 1.0
+            ]
+            if candidates_with_speedup:
+                best_patch = max(candidates_with_speedup, key=lambda p: p.speedup)
+                iter_result.best_speedup = best_patch.speedup or 0.0
+                iter_result.best_patch_id = best_patch.patch_id
+                iter_result.best_sql = best_patch.output_sql
+
+            # Store for next iteration's snipe prompt
+            prev_all_patches = all_patches
+            prev_explains = iter_explains
 
             iterations_data.append(iter_result)
             total_api_calls += iter_api_calls
@@ -589,12 +732,12 @@ class OneshotPatchSession(OptimizationSession):
             if iter_result.best_speedup >= 1.0 and iter_result.best_speedup > best_speedup:
                 best_speedup = iter_result.best_speedup
                 best_sql = iter_result.best_sql or self.original_sql
-                best_patch = next(
+                bp = next(
                     (p for p in all_patches if p.patch_id == iter_result.best_patch_id),
                     None,
                 )
-                if best_patch:
-                    best_transforms = [best_patch.transform]
+                if bp:
+                    best_transforms = [bp.transform]
                 best_status = self._classify_speedup(best_speedup)
 
             logger.info(
@@ -602,16 +745,16 @@ class OneshotPatchSession(OptimizationSession):
                 f"best={best_speedup:.2f}x ({best_status})"
             )
 
-            if best_speedup >= self.target_speedup:
+            if best_speedup >= target_speedup:
                 logger.info(
-                    f"[{self.query_id}] Target {self.target_speedup:.1f}x reached "
+                    f"[{self.query_id}] Target {target_speedup:.1f}x reached "
                     f"({best_speedup:.2f}x) — stopping"
                 )
                 break
 
         return SessionResult(
             query_id=self.query_id,
-            mode="oneshot_patch_tiered",
+            mode="oneshot_patch",
             best_speedup=best_speedup,
             best_sql=best_sql,
             original_sql=self.original_sql,
@@ -622,34 +765,189 @@ class OneshotPatchSession(OptimizationSession):
             n_api_calls=total_api_calls,
         )
 
+    @staticmethod
+    def _merge_all_patches(
+        patches: List[AppliedPatch],
+        applied: List[AppliedPatch],
+    ) -> List[AppliedPatch]:
+        """Merge applied patches (potentially updated by retries) back into full list."""
+        applied_ids = {p.patch_id for p in applied}
+        all_patches = []
+        for p in patches:
+            if p.patch_id in applied_ids:
+                validated = next(
+                    (a for a in applied if a.patch_id == p.patch_id), p
+                )
+                all_patches.append(validated)
+            else:
+                all_patches.append(p)
+        return all_patches
+
+    def _semantic_validate_and_retry(
+        self,
+        applied: List[AppliedPatch],
+        targets: list,
+        orchestrator,
+        ir_node_map: str,
+        db_path: str,
+        script_ir,
+        dialect_enum,
+    ) -> tuple[List[AppliedPatch], int]:
+        """Run semantic validation on applied patches, retry failures.
+
+        For each applied patch:
+        1. Run MiniValidator
+        2. If fail → retry worker with semantic error context (up to 2 retries)
+        3. Re-validate retry results
+
+        Returns:
+            (updated_patches, api_call_count)
+        """
+        from ..validation.mini_validator import MiniValidator
+
+        api_calls = 0
+
+        if not self.pipeline.config.semantic_validation_enabled:
+            for p in applied:
+                p.semantic_passed = True
+            return applied, 0
+
+        try:
+            validator = MiniValidator(
+                db_path=db_path,
+                sample_pct=self.pipeline.config.semantic_sample_pct,
+                timeout_ms=self.pipeline.config.semantic_timeout_ms,
+                dialect=self.dialect,
+            )
+        except Exception as e:
+            logger.warning(f"Semantic validator init failed: {e}")
+            for p in applied:
+                p.semantic_passed = True
+            return applied, 0
+
+        for p in applied:
+            if not p.output_sql:
+                continue
+
+            # Find matching target for this patch
+            target_match = next(
+                (t for t in targets if t.target_id == p.patch_id), None
+            )
+
+            # Validate
+            try:
+                sem_result = validator.validate_rewrite(
+                    self.original_sql, p.output_sql, worker_id=0
+                )
+            except Exception as e:
+                logger.warning(f"Semantic validation error for {p.patch_id}: {e}")
+                p.semantic_passed = True  # Don't block on validator errors
+                continue
+
+            if sem_result.passed:
+                p.semantic_passed = True
+                continue
+
+            # Failed — retry with semantic error context
+            p.semantic_passed = False
+            logger.info(
+                f"[{self.query_id}] Semantic FAIL for {p.patch_id}: "
+                f"{'; '.join(sem_result.errors[:2])}"
+            )
+
+            if not target_match:
+                p.status = "FAIL"
+                p.apply_error = f"Semantic: {'; '.join(sem_result.errors[:2])}"
+                continue
+
+            # Up to 2 semantic retries
+            retried_ok = False
+            for retry_num in range(2):
+                logger.info(
+                    f"[{self.query_id}] Semantic retry {retry_num + 1}/2 "
+                    f"for {p.patch_id}"
+                )
+                retried = orchestrator.retry_worker_semantic(
+                    original_sql=self.original_sql,
+                    ir_node_map=ir_node_map,
+                    target=target_match,
+                    sem_result=sem_result,
+                    rewrite_sql=p.output_sql,
+                    script_ir=script_ir,
+                    dialect_enum=dialect_enum,
+                )
+                api_calls += 1
+
+                if not retried or not retried.output_sql:
+                    continue
+
+                # Re-validate the retry
+                try:
+                    retry_sem = validator.validate_rewrite(
+                        self.original_sql, retried.output_sql, worker_id=0
+                    )
+                except Exception as e:
+                    logger.warning(f"Semantic re-validation error: {e}")
+                    retry_sem = None
+
+                if retry_sem and retry_sem.passed:
+                    # Success — replace the patch
+                    retried.semantic_passed = True
+                    idx = applied.index(p)
+                    applied[idx] = retried
+                    logger.info(
+                        f"[{self.query_id}] Semantic retry SUCCESS for {p.patch_id}"
+                    )
+                    retried_ok = True
+                    break
+                else:
+                    # Update sem_result for next retry with latest errors
+                    if retry_sem:
+                        sem_result = retry_sem
+                    # Update rewrite_sql to the latest attempt
+                    p.output_sql = retried.output_sql
+
+            if not retried_ok:
+                p.status = "FAIL"
+                p.apply_error = f"Semantic (after retries): {'; '.join(sem_result.errors[:2])}"
+
+        sem_passed_count = sum(1 for p in applied if p.semantic_passed)
+        logger.info(
+            f"[{self.query_id}] Semantic validation: "
+            f"{sem_passed_count}/{len(applied)} passed"
+        )
+
+        return applied, api_calls
+
     def _make_llm_call_fn(self, model_spec: Optional[str] = None) -> callable:
         """Create an LLM call function for a specific model.
 
         Args:
-            model_spec: "provider/model" string (e.g., "deepseek/deepseek-reasoner")
+            model_spec: Model identifier string (e.g., "deepseek/deepseek-r1")
                 or None to use the pipeline's default.
+                The model spec is passed as the model name to the pipeline's
+                provider (typically OpenRouter, which accepts "vendor/model").
 
         Returns:
             Callable that takes prompt string, returns response string.
         """
-        if not model_spec or "/" not in model_spec:
-            # Use default pipeline generator
-            from ..generate import CandidateGenerator
+        from ..generate import CandidateGenerator
+
+        if not model_spec:
             generator = CandidateGenerator(
                 provider=self.pipeline.provider,
                 model=self.pipeline.model,
                 analyze_fn=self.pipeline.analyze_fn,
             )
-            return lambda prompt: self._call_llm_with_timeout(generator, prompt)
+        else:
+            # Pass model_spec as-is to the pipeline's provider (e.g. OpenRouter)
+            # OpenRouter accepts "vendor/model" format natively
+            generator = CandidateGenerator(
+                provider=self.pipeline.provider,
+                model=model_spec,
+                analyze_fn=self.pipeline.analyze_fn,
+            )
 
-        provider, model = model_spec.split("/", 1)
-
-        from ..generate import CandidateGenerator
-        generator = CandidateGenerator(
-            provider=provider,
-            model=model,
-            analyze_fn=self.pipeline.analyze_fn,
-        )
         return lambda prompt: self._call_llm_with_timeout(generator, prompt)
 
     # ── Internal Methods ────────────────────────────────────────────────────
@@ -923,12 +1221,12 @@ class OneshotPatchSession(OptimizationSession):
         from ..validate import _timed_runs_pg
         from ..validation.equivalence_checker import EquivalenceChecker
 
-        BENCH_RUNS = 5
+        BENCH_RUNS = 3
         checker = EquivalenceChecker()
 
         logger.info(
             f"[{self.query_id}] Sequential benchmark: "
-            f"{len(patches)} patches, {BENCH_RUNS}x trimmed mean"
+            f"{len(patches)} patches, {BENCH_RUNS}x (warmup + avg last 2)"
         )
 
         try:

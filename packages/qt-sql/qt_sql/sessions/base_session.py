@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, TYPE_CHECKING
 
@@ -33,6 +34,7 @@ class OptimizationSession:
         n_workers: int = 3,
         orchestrator: Optional["Orchestrator"] = None,
         patch: bool = False,
+        benchmark_lock: Optional[threading.Lock] = None,
     ):
         self.pipeline = pipeline
         self.query_id = query_id
@@ -42,6 +44,10 @@ class OptimizationSession:
         self.n_workers = n_workers
         self.orchestrator = orchestrator
         self.patch = patch
+        self.benchmark_lock = benchmark_lock
+
+        # Optional callback for dashboard updates: fn(phase: str, iteration: int)
+        self.on_phase_change = None
 
         # Derived config
         self.dialect = (
