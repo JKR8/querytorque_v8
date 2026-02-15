@@ -1,6 +1,6 @@
 """Forensic intelligence collector — builds WorkloadProfile from benchmark data.
 
-Single entry point: collect_workload_profile(benchmark_dir, engine) → WorkloadProfile
+Single entry point: collect_workload_profile(benchmark_dir, engine) -> WorkloadProfile
 """
 
 from __future__ import annotations
@@ -15,11 +15,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .models import (
     CostEntry,
+    EngineGap,
+    EngineProfile,
+    EngineStrength,
     ExecutionSummary,
+    ForensicQuery,
     ForensicSummary,
+    ForensicTransformMatch,
     ImpactSummary,
     PatternCoverage,
     PatternStat,
+    QErrorEntry,
     QueryResult,
     ResourceImpact,
     ResourceProfile,
@@ -33,7 +39,30 @@ logger = logging.getLogger(__name__)
 _RUNTIME_THRESHOLDS = [
     (100, "SKIP"), (1_000, "LOW"), (10_000, "MEDIUM"), (float("inf"), "HIGH"),
 ]
+_RUNTIME_WEIGHTS = {"SKIP": 0, "LOW": 1, "MEDIUM": 3, "HIGH": 5}
 
+
+# ---------------------------------------------------------------------------
+# Query ID normalization
+# ---------------------------------------------------------------------------
+
+def normalize_qid(raw: str) -> str:
+    """Normalize query ID to canonical q{N} format.
+
+    Handles: q88, query_1, query001, query_88, query1
+    """
+    raw = raw.strip()
+    if re.match(r'^q\d+$', raw):
+        return raw
+    m = re.match(r'^query[_-]?0*(\d+)', raw, re.IGNORECASE)
+    if m:
+        return f"q{int(m.group(1))}"
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def collect_workload_profile(
     benchmark_dir: Path,
@@ -69,9 +98,11 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
 
     # Load AST detection catalog
     transforms_catalog = None
+    catalog_by_id: Dict[str, Any] = {}
     try:
         from ..detection import detect_transforms, load_transforms
         transforms_catalog = load_transforms()
+        catalog_by_id = {t["id"]: t for t in transforms_catalog}
     except Exception as e:
         logger.warning(f"Detection unavailable: {e}")
 
@@ -79,18 +110,27 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
         engine, engine)
     dialect = "postgres" if engine in ("postgresql", "postgres") else engine
 
-    # Build per-query data
-    entries: List[Tuple[str, float, str, List[str], float]] = []
-    # (query_id, runtime_ms, bucket, pattern_ids, top_overlap)
+    # Load q-error data (keyed by normalized query ID)
+    qerror_map = _load_qerror_data(benchmark_dir)
+
+    # Build per-query ForensicQuery objects
+    forensic_queries: List[ForensicQuery] = []
+    pattern_entries: List[Tuple[str, float, str, Dict[str, float]]] = []
 
     for sql_path in query_files:
-        qid = sql_path.stem
+        raw_qid = sql_path.stem
+        qid = normalize_qid(raw_qid)
         sql = sql_path.read_text().strip()
-        runtime_ms = load_explain_timing(benchmark_dir, qid, engine)
+        runtime_ms = load_explain_timing(benchmark_dir, raw_qid, engine)
         bucket = _bucket_runtime(runtime_ms)
 
-        pattern_ids: List[str] = []
+        # AST detection
+        pattern_overlaps: Dict[str, float] = {}
+        matched_transforms: List[ForensicTransformMatch] = []
+        tractability = 0
         top_overlap = 0.0
+        top_transform = ""
+        n_matches = 0
 
         if transforms_catalog and sql:
             try:
@@ -98,51 +138,112 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
                     sql, transforms_catalog,
                     engine=engine_name, dialect=dialect,
                 )
-                pattern_ids = [m.id for m in matched if m.overlap_ratio >= 0.25]
+                for m in matched:
+                    if m.overlap_ratio >= 0.25:
+                        n_matches += 1
+                        pattern_overlaps[m.id] = m.overlap_ratio
+                        t_meta = catalog_by_id.get(m.id, {})
+                        matched_transforms.append(ForensicTransformMatch(
+                            id=m.id,
+                            overlap=round(m.overlap_ratio, 3),
+                            gap=m.gap,
+                            family=t_meta.get("family", ""),
+                        ))
+                    if m.overlap_ratio >= 0.6:
+                        tractability += 1
                 if matched:
                     top_overlap = matched[0].overlap_ratio
+                    top_transform = matched[0].id
+                tractability = min(tractability, 4)
             except Exception as e:
                 logger.debug(f"[{qid}] Detection error: {e}")
 
-        entries.append((qid, runtime_ms, bucket, pattern_ids, top_overlap))
+        # Priority score (PLAN.md §4.3)
+        weight = _RUNTIME_WEIGHTS.get(bucket, 0)
+        priority_score = weight * (1.0 + tractability + top_overlap)
 
-    # Total runtime (exclude unknowns)
-    total_runtime = sum(rt for _, rt, _, _, _ in entries if rt > 0)
+        # Q-error (join by normalized ID)
+        qerror = qerror_map.get(qid)
 
-    # Cost concentration (sorted by runtime desc)
-    by_runtime = sorted(entries, key=lambda e: -max(e[1], 0))
-    cost_concentration: List[CostEntry] = []
-    cumulative = 0.0
-    for qid, rt, bucket, pids, _ in by_runtime:
-        pct = (rt / total_runtime) if total_runtime > 0 and rt > 0 else 0.0
-        cumulative += pct
-        cost_concentration.append(CostEntry(
+        # Structural flags from q-error
+        structural_flags: List[str] = []
+        if qerror and qerror.structural_flags:
+            structural_flags = [f for f in qerror.structural_flags.split("|") if f]
+
+        # EXPLAIN text for drawer
+        has_explain, explain_text = _load_explain_text(benchmark_dir, raw_qid)
+
+        fq = ForensicQuery(
             query_id=qid,
-            runtime_ms=rt,
-            pct_of_total=round(pct, 4),
-            cumulative_pct=round(cumulative, 4),
+            runtime_ms=runtime_ms,
             bucket=bucket,
-            detected_patterns=pids,
-        ))
+            top_overlap=round(top_overlap, 3),
+            tractability=tractability,
+            n_matches=n_matches,
+            top_transform=top_transform,
+            priority_score=round(priority_score, 1),
+            matched_transforms=matched_transforms,
+            qerror=qerror,
+            structural_flags=structural_flags,
+            has_explain=has_explain,
+            explain_text=explain_text,
+        )
+        forensic_queries.append(fq)
+        pattern_entries.append((qid, runtime_ms, bucket, pattern_overlaps))
+
+    # Sort by runtime descending, compute cost context
+    total_runtime = sum(q.runtime_ms for q in forensic_queries if q.runtime_ms > 0)
+    by_runtime = sorted(forensic_queries, key=lambda q: -max(q.runtime_ms, 0))
+    cumulative = 0.0
+    for rank, fq in enumerate(by_runtime, 1):
+        pct = (fq.runtime_ms / total_runtime) if total_runtime > 0 and fq.runtime_ms > 0 else 0.0
+        cumulative += pct
+        fq.pct_of_total = round(pct, 4)
+        fq.cumulative_pct = round(cumulative, 4)
+        fq.cost_rank = rank
+
+    # Legacy cost_concentration (for existing frontend)
+    cost_concentration: List[CostEntry] = [
+        CostEntry(
+            query_id=fq.query_id,
+            runtime_ms=fq.runtime_ms,
+            pct_of_total=fq.pct_of_total,
+            cumulative_pct=fq.cumulative_pct,
+            bucket=fq.bucket,
+            detected_patterns=[m.id for m in fq.matched_transforms],
+        )
+        for fq in by_runtime
+    ]
 
     # Bucket distribution
     bucket_dist: Dict[str, int] = defaultdict(int)
-    for _, _, bucket, _, _ in entries:
-        bucket_dist[bucket] += 1
+    for fq in forensic_queries:
+        bucket_dist[fq.bucket] += 1
 
     # Pattern coverage
-    with_detection = sum(1 for _, _, _, pids, _ in entries if pids)
-    without_detection = len(entries) - with_detection
+    with_detection = sum(1 for fq in forensic_queries if fq.matched_transforms)
+    without_detection = len(forensic_queries) - with_detection
+    pattern_stats = _compute_pattern_stats(pattern_entries, catalog_by_id)
 
-    # Top patterns across workload
-    pattern_stats = _compute_pattern_stats(entries)
+    # Engine profile
+    engine_profile = _load_engine_profile(engine)
+
+    # Dominant pathology
+    dominant_pathology = _compute_dominant_pathology(forensic_queries)
+
+    # Estimated opportunity (HIGH + MEDIUM bucket queries)
+    estimated_opportunity = sum(
+        fq.runtime_ms for fq in forensic_queries
+        if fq.bucket in ("HIGH", "MEDIUM") and fq.runtime_ms > 0
+    )
 
     # Resource profile (PG only)
     resource_profile = _load_resource_profile(benchmark_dir, engine)
 
     return ForensicSummary(
-        total_queries=len(entries),
+        total_queries=len(forensic_queries),
         total_runtime_ms=round(total_runtime, 1),
+        queries=by_runtime,
         cost_concentration=cost_concentration,
         bucket_distribution=dict(bucket_dist),
         pattern_coverage=PatternCoverage(
@@ -150,31 +251,189 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
             queries_without_detection=without_detection,
             top_patterns=pattern_stats,
         ),
+        engine_profile=engine_profile,
         resource_profile=resource_profile,
+        dominant_pathology=dominant_pathology,
+        estimated_opportunity_ms=round(estimated_opportunity, 1),
     )
 
 
+# ---------------------------------------------------------------------------
+# Forensic data loaders
+# ---------------------------------------------------------------------------
+
+def _load_qerror_data(benchmark_dir: Path) -> Dict[str, QErrorEntry]:
+    """Load q-error analysis, return dict keyed by normalized query ID."""
+    path = benchmark_dir / "qerror_analysis.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        result: Dict[str, QErrorEntry] = {}
+        for entry in data:
+            raw_qid = entry.get("query_id", "")
+            qid = normalize_qid(raw_qid)
+            result[qid] = QErrorEntry(
+                severity=entry.get("severity", ""),
+                direction=entry.get("direction", ""),
+                worst_node=entry.get("worst_node", ""),
+                worst_est=entry.get("worst_est", 0),
+                worst_act=entry.get("worst_act", 0),
+                max_q_error=entry.get("max_q_error", 0.0),
+                locus=entry.get("locus", ""),
+                pathology_routing=entry.get("pathology_routing", ""),
+                structural_flags=entry.get("structural_flags", ""),
+                n_signals=entry.get("n_signals", 0),
+            )
+        return result
+    except Exception as e:
+        logger.debug(f"Q-error load error: {e}")
+        return {}
+
+
+def _load_engine_profile(engine: str) -> Optional[EngineProfile]:
+    """Load engine profile from constraints directory."""
+    engine_key = {"postgres": "postgresql", "postgresql": "postgresql"}.get(
+        engine, engine)
+    constraints_dir = Path(__file__).resolve().parent.parent / "constraints"
+    path = constraints_dir / f"engine_profile_{engine_key}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        strengths = [
+            EngineStrength(
+                id=s.get("id", ""),
+                summary=s.get("summary", ""),
+                implication=s.get("implication", ""),
+            )
+            for s in data.get("strengths", [])
+        ]
+        gaps = [
+            EngineGap(
+                id=g.get("id", ""),
+                priority=g.get("priority", ""),
+                what=g.get("what", ""),
+                why=g.get("why", ""),
+                opportunity=g.get("opportunity", ""),
+                what_worked=g.get("what_worked", ""),
+            )
+            for g in data.get("gaps", [])
+        ]
+        return EngineProfile(
+            engine=data.get("engine", engine),
+            version_tested=data.get("version_tested", ""),
+            briefing_note=data.get("briefing_note", ""),
+            strengths=strengths,
+            gaps=gaps,
+        )
+    except Exception as e:
+        logger.debug(f"Engine profile load error: {e}")
+        return None
+
+
+def _load_explain_text(benchmark_dir: Path, query_id: str) -> Tuple[bool, str]:
+    """Load EXPLAIN plan text for a query. Returns (has_explain, truncated_text)."""
+    search_paths = [
+        benchmark_dir / "explains" / f"{query_id}.json",
+        benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
+        benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
+    ]
+    for path in search_paths:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text())
+            text = data.get("plan_text", "")
+            if not text:
+                # PG format — render plan tree from plan_json
+                plan_json = data.get("plan_json")
+                if isinstance(plan_json, list) and plan_json:
+                    text = _render_pg_plan(plan_json[0].get("Plan", {}))
+            if text:
+                # Truncate to 80 lines
+                lines = text.splitlines()
+                if len(lines) > 80:
+                    text = "\n".join(lines[:80]) + f"\n... ({len(lines) - 80} more lines)"
+                return True, text
+        except Exception:
+            pass
+    return False, ""
+
+
+def _render_pg_plan(node: dict, depth: int = 0) -> str:
+    """Render a PG EXPLAIN JSON plan node into human-readable indented text."""
+    if not node:
+        return ""
+    indent = "  " * depth
+    node_type = node.get("Node Type", "?")
+    actual_time = node.get("Actual Total Time")
+    actual_rows = node.get("Actual Rows")
+    plan_rows = node.get("Plan Rows")
+
+    line = f"{indent}-> {node_type}"
+    extras = []
+    if actual_time is not None:
+        extras.append(f"time={actual_time:.1f}ms")
+    if actual_rows is not None and plan_rows is not None:
+        extras.append(f"rows={actual_rows} (est {plan_rows})")
+    elif actual_rows is not None:
+        extras.append(f"rows={actual_rows}")
+    if node.get("Filter"):
+        extras.append(f"filter: {node['Filter']}")
+    if node.get("Join Type"):
+        extras.append(f"join: {node['Join Type']}")
+    if node.get("Relation Name"):
+        extras.append(f"on: {node['Relation Name']}")
+    if extras:
+        line += f"  ({', '.join(extras)})"
+
+    lines = [line]
+    for child in node.get("Plans", []):
+        lines.append(_render_pg_plan(child, depth + 1))
+    return "\n".join(lines)
+
+
+def _compute_dominant_pathology(queries: List[ForensicQuery]) -> str:
+    """Find most frequent pathology code across queries with q-error data."""
+    counts: Dict[str, int] = defaultdict(int)
+    for fq in queries:
+        if fq.qerror and fq.qerror.pathology_routing:
+            for p in fq.qerror.pathology_routing.split(","):
+                p = p.strip()
+                if p:
+                    counts[p] += 1
+    if not counts:
+        return ""
+    return max(counts, key=counts.get)
+
+
 def _compute_pattern_stats(
-    entries: List[Tuple[str, float, str, List[str], float]],
+    entries: List[Tuple[str, float, str, Dict[str, float]]],
+    catalog_by_id: Optional[Dict[str, Any]] = None,
 ) -> List[PatternStat]:
     """Aggregate pattern frequency across all queries."""
     pattern_counts: Dict[str, int] = defaultdict(int)
     pattern_overlaps: Dict[str, List[float]] = defaultdict(list)
 
-    for _, _, _, pids, top_overlap in entries:
-        for pid in pids:
+    for _, _, _, poverlaps in entries:
+        for pid, overlap in poverlaps.items():
             pattern_counts[pid] += 1
-            pattern_overlaps[pid].append(top_overlap)
+            pattern_overlaps[pid].append(overlap)
 
     stats = []
     for pid, count in sorted(pattern_counts.items(), key=lambda x: -x[1]):
         overlaps = pattern_overlaps[pid]
         avg = sum(overlaps) / len(overlaps) if overlaps else 0.0
+        gap = ""
+        if catalog_by_id and pid in catalog_by_id:
+            gap = catalog_by_id[pid].get("gap", "")
         stats.append(PatternStat(
             pattern_id=pid,
             pattern_name=pid.replace("_", " ").title(),
             query_count=count,
             avg_overlap=round(avg, 3),
+            target_gap=gap,
         ))
 
     return stats[:15]  # Top 15
@@ -268,6 +527,8 @@ def _build_execution(benchmark_dir: Path) -> ExecutionSummary:
             if not qid:
                 continue
 
+            nqid = normalize_qid(qid)
+
             # Try per-query result.json for detailed data
             qr_path = run_dir / qid / "result.json"
             qr_data = _load_json(qr_path) if qr_path.exists() else None
@@ -288,8 +549,8 @@ def _build_execution(benchmark_dir: Path) -> ExecutionSummary:
                 worker_id = qr_data.get("best_worker_id")
                 set_local_cmds = qr_data.get("set_local_commands", [])
 
-            latest_results[qid] = QueryResult(
-                query_id=qid,
+            latest_results[nqid] = QueryResult(
+                query_id=nqid,
                 status=r.get("status", "UNKNOWN"),
                 speedup=speedup,
                 baseline_ms=baseline_ms,
@@ -318,8 +579,8 @@ def _build_impact(
     if not results:
         return ImpactSummary()
 
-    # Build cost map from forensic data
-    cost_map = {c.query_id: c.runtime_ms for c in forensic.cost_concentration}
+    # Build cost map from forensic queries
+    cost_map = {q.query_id: q.runtime_ms for q in forensic.queries}
 
     total_baseline = 0.0
     total_optimized = 0.0
@@ -360,13 +621,14 @@ def _build_impact(
     )
 
 
-_PG_SIZE_UNITS = {"B": 1, "kB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+# Sorted longest-suffix-first so "MB" matches before "B", etc.
+_PG_SIZE_UNITS = [("TB", 1024**4), ("GB", 1024**3), ("MB", 1024**2), ("kB", 1024), ("B", 1)]
 
 
 def _parse_pg_size(val: str) -> int:
     """Parse a PostgreSQL size string like '256MB' into bytes."""
     val = val.strip()
-    for unit, mult in _PG_SIZE_UNITS.items():
+    for unit, mult in _PG_SIZE_UNITS:
         if val.endswith(unit):
             try:
                 return int(float(val[:-len(unit)].strip()) * mult)
