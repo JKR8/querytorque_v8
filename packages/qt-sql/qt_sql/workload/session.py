@@ -284,7 +284,7 @@ class WorkloadSession:
                 sql=query_sql,
                 max_iterations=max_iterations,
                 target_speedup=target_speedup,
-                mode=OptimizationMode.ONESHOT,
+                mode=OptimizationMode.BEAM,
                 patch=True,
             )
             fits = self._evaluate_scenario_fit(query_id, result.best_speedup)

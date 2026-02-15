@@ -16,10 +16,10 @@ import click
 @click.option("-q", "--query", multiple=True, help="Query filter (repeatable, prefix match).")
 @click.option(
     "--mode",
-    type=click.Choice(["oneshot", "fleet"]),
-    default="oneshot",
+    type=click.Choice(["beam", "oneshot", "fleet"]),
+    default="beam",
     show_default=True,
-    help="Execution mode: oneshot (analyst/worker loop) or fleet (multi-query orchestration).",
+    help="Execution mode: beam (analyst/worker loop) or fleet (multi-query orchestration).",
 )
 @click.option("--max-iterations", type=int, default=3, show_default=True,
               help="Max optimization rounds per query.")
@@ -75,7 +75,7 @@ def run(
 ) -> None:
     """Run the full optimization pipeline (requires LLM API key).
 
-    Oneshot mode uses the tiered analyst/worker/snipe patch pipeline.
+    Beam mode uses the tiered analyst/worker/snipe patch pipeline.
     Fleet mode runs survey/triage/parallel execute/scorecard across many queries.
     """
     from ._common import (
@@ -95,7 +95,9 @@ def run(
         print_error("--dry-run is only valid with --mode fleet.")
         raise SystemExit(2)
 
-    # Oneshot is now the canonical tiered analyst/worker/snipe flow.
+    # Beam is the canonical tiered analyst/worker/snipe flow.
+    if mode == "oneshot":
+        mode = "beam"  # oneshot is deprecated alias for beam
     patch_mode = True
     single_iteration = single_iteration or fan_out_only_legacy
 
@@ -134,7 +136,7 @@ def run(
         os.environ["QT_ALLOW_INTELLIGENCE_BOOTSTRAP"] = "1"
 
     mode_map = {
-        "oneshot": OptimizationMode.ONESHOT,
+        "beam": OptimizationMode.BEAM,
     }
 
     pipeline = Pipeline(bench_dir)
@@ -255,7 +257,7 @@ def run(
     errors = []
     t0 = time.time()
 
-    # Parallel tiered oneshot: LLM concurrent, benchmark serialized
+    # Parallel tiered beam: LLM concurrent, benchmark serialized
     if concurrency > 0 and patch_mode:
         _run_patch_parallel(
             pipeline=pipeline,
@@ -469,7 +471,7 @@ def _run_patch_parallel(
             sql=sql,
             max_iterations=max_iterations,
             target_speedup=target_speedup,
-            mode=OptimizationMode.ONESHOT,
+            mode=OptimizationMode.BEAM,
             patch=True,
             benchmark_lock=benchmark_lock,
         )

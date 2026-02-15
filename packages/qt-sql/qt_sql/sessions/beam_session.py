@@ -1,12 +1,13 @@
-"""Oneshot Patch optimization session — iterative patch plan loop.
+"""Beam optimization session — automated analyst → N workers → validate → snipe.
 
 Flow per iteration:
-1. Build oneshot patch prompt → LLM call → 4 patch plans
-2. Retry loop for malformed/un-parseable patches (before validation)
-3. Apply patches → semantic validation → race → EXPLAIN collection
-4. Multi-handling: keep good patches, retry only failed ones, merge results
-5. Build snipe prompt (original + summary history + latest results) → LLM → new patches
-6. Iterate until target speedup or max_iterations
+1. Analyst call → identifies targets/patch plans (or snipe on iter 2+)
+2. Workers (4 parallel, role-routed) → generate patches
+3. Apply-error retry for failed patches
+4. Semantic validation (TABLESAMPLE 2%) + worker retry for semantic failures
+5. Benchmark semantically-valid patches (5x trimmed mean or race)
+6. EXPLAIN collection for snipe enrichment
+7. Iterate until target speedup or max_iterations
 """
 
 from __future__ import annotations
@@ -79,7 +80,7 @@ class PatchIterationResult:
 # ── Session Class ───────────────────────────────────────────────────────────
 
 
-class OneshotPatchSession(OptimizationSession):
+class BeamSession(OptimizationSession):
     """Iterative patch-plan optimization: prompt → 4 patches → validate → snipe."""
 
     def run(self) -> SessionResult:
@@ -94,16 +95,16 @@ class OneshotPatchSession(OptimizationSession):
     def _run_single_tier(self) -> SessionResult:
         """Original single-tier patch loop (one LLM does everything)."""
         from ..ir import build_script_ir, render_ir_node_map, Dialect
-        from ..patches.oneshot_patch_prompt_builder import (
-            build_oneshot_patch_prompt,
-            build_oneshot_patch_snipe_prompt,
+        from ..patches.beam_prompt_builder import (
+            build_beam_prompt,
+            build_beam_snipe_prompt,
             load_gold_examples,
         )
         from ..generate import CandidateGenerator
         from ..execution.database_utils import run_explain_analyze, run_explain_text
 
         logger.info(
-            f"[{self.query_id}] OneshotPatchSession: "
+            f"[{self.query_id}] BeamSession: "
             f"max {self.max_iterations} iterations, "
             f"target {self.target_speedup:.1f}x"
         )
@@ -174,7 +175,7 @@ class OneshotPatchSession(OptimizationSession):
 
             # ── Phase 1: Build prompt ────────────────────────────────
             if iteration == 0:
-                prompt = build_oneshot_patch_prompt(
+                prompt = build_beam_prompt(
                     query_id=self.query_id,
                     original_sql=self.original_sql,
                     explain_text=original_explain,
@@ -187,7 +188,7 @@ class OneshotPatchSession(OptimizationSession):
                 prev = iterations_data[-1]
                 # Build history from ALL prior iterations for summary table
                 all_prior = [it.patches for it in iterations_data]
-                prompt = build_oneshot_patch_snipe_prompt(
+                prompt = build_beam_snipe_prompt(
                     original_prompt=iterations_data[0].prompt,
                     iteration=iteration - 1,
                     patches=prev.patches,
@@ -231,8 +232,8 @@ class OneshotPatchSession(OptimizationSession):
                     f"[{self.query_id}] Retrying {len(errors)} issues "
                     f"(attempt {retry_count + 1}/2)"
                 )
-                from ..patches.oneshot_patch_prompt_builder import build_oneshot_patch_retry_prompt
-                retry_prompt = build_oneshot_patch_retry_prompt(
+                from ..patches.beam_prompt_builder import build_beam_retry_prompt
+                retry_prompt = build_beam_retry_prompt(
                     original_prompt=prompt,
                     previous_response=response,
                     all_patches=patches,
@@ -304,11 +305,11 @@ class OneshotPatchSession(OptimizationSession):
                     f"{len(runtime_kept)} kept, {len(runtime_errored)} errored "
                     f"— retrying errored patches only"
                 )
-                from ..patches.oneshot_patch_prompt_builder import (
-                    build_runtime_error_retry_prompt,
+                from ..patches.beam_prompt_builder import (
+                    build_beam_runtime_error_retry_prompt,
                 )
 
-                retry_prompt = build_runtime_error_retry_prompt(
+                retry_prompt = build_beam_runtime_error_retry_prompt(
                     original_prompt=prompt,
                     good_patches=runtime_kept,
                     failed_patches=runtime_errored,
@@ -409,7 +410,7 @@ class OneshotPatchSession(OptimizationSession):
         # ── Build SessionResult ────────────────────────────────────────
         return SessionResult(
             query_id=self.query_id,
-            mode="oneshot_patch",
+            mode="beam",
             best_speedup=best_speedup,
             best_sql=best_sql,
             original_sql=self.original_sql,
@@ -436,7 +437,7 @@ class OneshotPatchSession(OptimizationSession):
         8. Next iteration uses snipe prompt with all results
         """
         from ..ir import build_script_ir, render_ir_node_map, Dialect
-        from ..patches.oneshot_patch_prompt_builder import load_gold_examples
+        from ..patches.beam_prompt_builder import load_gold_examples
         from ..patches.tiered_orchestrator import TieredOrchestrator
         from ..execution.database_utils import run_explain_analyze, run_explain_text
 
@@ -444,7 +445,7 @@ class OneshotPatchSession(OptimizationSession):
         target_speedup = self.target_speedup or getattr(self.pipeline.config, "target_speedup", 10.0)
 
         logger.info(
-            f"[{self.query_id}] OneshotPatchSession TIERED: "
+            f"[{self.query_id}] BeamSession TIERED: "
             f"max {self.max_iterations} iterations, "
             f"target {target_speedup:.1f}x"
         )
@@ -811,7 +812,7 @@ class OneshotPatchSession(OptimizationSession):
 
         return SessionResult(
             query_id=self.query_id,
-            mode="oneshot_patch",
+            mode="beam",
             best_speedup=best_speedup,
             best_sql=best_sql,
             original_sql=self.original_sql,
@@ -1136,7 +1137,7 @@ class OneshotPatchSession(OptimizationSession):
             for patches that failed to parse or apply.
         """
         from ..ir import dict_to_plan, apply_patch_plan
-        from ..patches.oneshot_patch_validator import _extract_json_array
+        from ..patches.beam_patch_validator import _extract_json_array
 
         patches_data = _extract_json_array(response)
         if patches_data is None:

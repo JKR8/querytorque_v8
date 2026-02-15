@@ -285,7 +285,7 @@ class FleetOrchestrator:
                 sql=triage_item.sql,
                 max_iterations=triage_item.max_iterations,
                 target_speedup=10.0,  # intentional: fleet always aims for 10x
-                mode=OptimizationMode.ONESHOT,
+                mode=OptimizationMode.BEAM,
                 patch=True,
                 benchmark_lock=self.benchmark_lock,
                 on_phase_change=_on_phase,

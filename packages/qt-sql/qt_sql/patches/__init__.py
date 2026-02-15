@@ -1,1 +1,1 @@
-"""Oneshot patch optimization — prompt builder, validator, and test harness."""
+"""Beam patch optimization — prompt builder, validator, and orchestrator."""

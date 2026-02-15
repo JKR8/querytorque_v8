@@ -14,12 +14,12 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 
 from qt_sql.ir import build_script_ir, render_ir_node_map, Dialect
-from qt_sql.patches.oneshot_patch_prompt_builder import (
-    build_oneshot_patch_prompt,
+from qt_sql.patches.beam_prompt_builder import (
+    build_beam_prompt,
     load_gold_examples,
 )
-from qt_sql.patches.oneshot_patch_validator import (
-    OnehotPatchValidator,
+from qt_sql.patches.beam_patch_validator import (
+    BeamPatchValidator,
     save_validation_report,
 )
 from qt_shared.config import get_settings
@@ -229,7 +229,7 @@ def test_oneshot_patches(
     # Step 6: Build oneshot prompt
     logger.info("Step 6: Building oneshot prompt...")
     try:
-        prompt = build_oneshot_patch_prompt(
+        prompt = build_beam_prompt(
             query_id=query_id,
             original_sql=original_sql,
             explain_text=explain_text,
@@ -255,7 +255,7 @@ def test_oneshot_patches(
     logger.info("Step 8: Validating patches...")
     if executor_dsn:
         try:
-            validator = OnehotPatchValidator(executor_dsn, dialect)
+            validator = BeamPatchValidator(executor_dsn, dialect)
             report = validator.validate_response(
                 query_id=query_id,
                 original_sql=original_sql,

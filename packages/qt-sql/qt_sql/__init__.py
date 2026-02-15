@@ -8,19 +8,16 @@ Pipeline:
 5. Validate:  Timing + correctness (3-run or 5-run)
 
 Optimization Modes:
-- ONESHOT: 1 LLM call per iteration, analyst produces SQL directly
-- SWARM:   Multi-worker fan-out with snipe refinement (default)
+- BEAM:  Automated search: analyst → N workers → validate → snipe (default)
+- SWARM: Multi-worker fan-out with coach refinement (legacy)
 
 Usage:
     from qt_sql.pipeline import Pipeline
     from qt_sql.schemas import OptimizationMode
     p = Pipeline("qt_sql/benchmarks/duckdb_tpcds")
 
-    # Oneshot mode (cheapest, 1 API call per iteration):
-    result = p.run_optimization_session("query_1", sql, mode=OptimizationMode.ONESHOT)
-
-    # Swarm mode (default, 4-worker fan-out + snipe):
-    result = p.run_optimization_session("query_88", sql, mode=OptimizationMode.SWARM)
+    # Beam mode (default, analyst → N workers → validate → snipe):
+    result = p.run_optimization_session("query_88", sql, mode=OptimizationMode.BEAM)
 """
 
 from .pipeline import Pipeline
@@ -36,6 +33,7 @@ from .schemas import (
 )
 from .sessions import (
     OptimizationSession,
+    BeamSession,
     OneshotSession,
     SwarmSession,
 )
@@ -45,6 +43,7 @@ __all__ = [
     "BenchmarkConfig",
     "OptimizationMode",
     "OptimizationSession",
+    "BeamSession",
     "OneshotSession",
     "SwarmSession",
     "PipelineResult",

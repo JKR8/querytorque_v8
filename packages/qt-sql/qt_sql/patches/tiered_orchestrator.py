@@ -143,9 +143,9 @@ class TieredOrchestrator:
         Returns:
             (targets, prompt, response) — parsed targets, raw prompt, raw response.
         """
-        from .oneshot_patch_prompt_builder import build_oneshot_patch_prompt_tiered
+        from .beam_prompt_builder import build_beam_prompt_tiered
 
-        prompt = build_oneshot_patch_prompt_tiered(
+        prompt = build_beam_prompt_tiered(
             query_id=query_id,
             original_sql=original_sql,
             explain_text=explain_text,
@@ -188,8 +188,8 @@ class TieredOrchestrator:
         Returns:
             (patches, n_api_calls) — applied patches + actual LLM call count.
         """
-        from .oneshot_patch_prompt_builder import build_worker_patch_prompt
-        from ..sessions.oneshot_patch_session import AppliedPatch
+        from .beam_prompt_builder import build_worker_patch_prompt
+        from ..sessions.beam_session import AppliedPatch
         import threading
 
         results: List[AppliedPatch] = []
@@ -309,11 +309,11 @@ class TieredOrchestrator:
         dialect_enum: Any,
     ) -> Optional["AppliedPatch"]:
         """Retry a single failed worker with error context."""
-        from .oneshot_patch_prompt_builder import (
+        from .beam_prompt_builder import (
             build_worker_patch_prompt,
             build_worker_retry_prompt,
         )
-        from ..sessions.oneshot_patch_session import AppliedPatch
+        from ..sessions.beam_session import AppliedPatch
 
         gold_patch = self._find_gold_patch(target)
         if not gold_patch:
@@ -367,11 +367,11 @@ class TieredOrchestrator:
         Uses build_worker_semantic_retry_prompt() with row count diffs,
         value diffs, and SQL diff as error context.
         """
-        from .oneshot_patch_prompt_builder import (
+        from .beam_prompt_builder import (
             build_worker_patch_prompt,
             build_worker_semantic_retry_prompt,
         )
-        from ..sessions.oneshot_patch_session import AppliedPatch
+        from ..sessions.beam_session import AppliedPatch
 
         gold_patch = self._find_gold_patch(target)
         if not gold_patch:
@@ -425,9 +425,9 @@ class TieredOrchestrator:
         Returns:
             (targets, prompt, response) — parsed targets, raw prompt, raw response.
         """
-        from .oneshot_patch_prompt_builder import build_tiered_snipe_prompt
+        from .beam_prompt_builder import build_beam_tiered_snipe_prompt
 
-        prompt = build_tiered_snipe_prompt(
+        prompt = build_beam_tiered_snipe_prompt(
             query_id=query_id,
             original_sql=original_sql,
             explain_text=explain_text,
@@ -562,7 +562,7 @@ class TieredOrchestrator:
 
     def _parse_analyst_response(self, response: str) -> List[AnalystTarget]:
         """Parse analyst JSON array (or individual objects) into AnalystTarget objects."""
-        from ..patches.oneshot_patch_validator import _extract_json_array
+        from ..patches.beam_patch_validator import _extract_json_array
 
         targets_data = _extract_json_array(response)
         # Validate: targets must be dicts (not strings like recommended_examples)

@@ -1,4 +1,4 @@
-"""Validate oneshot patch plan responses from LLM.
+"""Validate beam patch plan responses from LLM.
 
 Parses 4 patch plans from JSON, applies each to IR copy,
 validates with gates (parse, columns, semantics, speedup),
@@ -60,7 +60,7 @@ class PatchValidationResult:
 
 
 @dataclass
-class OnehotValidationReport:
+class BeamValidationReport:
     """Complete validation report for all 4 patches."""
     query_id: str
     dialect: str
@@ -247,8 +247,8 @@ class PatchGateValidator:
 
 # ── Main Validator ───────────────────────────────────────────────────────────
 
-class OnehotPatchValidator:
-    """Orchestrates validation of 4 patch plans from oneshot LLM response."""
+class BeamPatchValidator:
+    """Orchestrates validation of 4 patch plans from beam LLM response."""
 
     def __init__(self, dsn: str, dialect: str):
         """Initialize with database connection and dialect."""
@@ -263,7 +263,7 @@ class OnehotPatchValidator:
         original_sql: str,
         original_ir: Any,  # ScriptIR
         llm_response: str,  # JSON string with 4 patches
-    ) -> OnehotValidationReport:
+    ) -> BeamValidationReport:
         """Validate 4 patches from LLM response.
 
         Args:
@@ -273,14 +273,14 @@ class OnehotPatchValidator:
             llm_response: Raw JSON response from LLM with 4 patches
 
         Returns:
-            OnehotValidationReport with all validation results
+            BeamValidationReport with all validation results
         """
 
         # Parse JSON response — LLM may include analysis text after JSON
         patches_data = _extract_json_array(llm_response)
         if patches_data is None:
             logger.error("Failed to extract JSON array from LLM response")
-            return OnehotValidationReport(
+            return BeamValidationReport(
                 query_id=query_id,
                 dialect=self.dialect,
                 overall_status="PARSE_ERROR",
@@ -445,9 +445,9 @@ class OnehotPatchValidator:
             else:
                 return "✓ Correctly rejected (low score, no speedup)"
 
-    def _build_report(self, query_id: str, results: List[PatchValidationResult]) -> OnehotValidationReport:
+    def _build_report(self, query_id: str, results: List[PatchValidationResult]) -> BeamValidationReport:
         """Build summary report from all patch results."""
-        report = OnehotValidationReport(
+        report = BeamValidationReport(
             query_id=query_id,
             dialect=self.dialect,
             llm_chosen_families=[r.family for r in results],
@@ -594,7 +594,7 @@ def _extract_output_columns(ir) -> List[str]:
     return ["*"]
 
 
-def save_validation_report(report: OnehotValidationReport, output_path: Path):
+def save_validation_report(report: BeamValidationReport, output_path: Path):
     """Save validation report to JSON file."""
     data = {
         "query_id": report.query_id,

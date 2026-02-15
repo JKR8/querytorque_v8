@@ -269,7 +269,7 @@ pathology is detected, your primary target SHOULD address it.
 
 # ── Main Prompt Builder ────────────────────────────────────────────────────
 
-def build_oneshot_patch_prompt(
+def build_beam_prompt(
     query_id: str,
     original_sql: str,
     explain_text: str,
@@ -402,7 +402,7 @@ Now output your JSON array of patch plans:
 
 # ── Tiered Prompt Builder (Analyst → Worker split) ────────────────────────
 
-def build_oneshot_patch_prompt_tiered(
+def build_beam_prompt_tiered(
     query_id: str,
     original_sql: str,
     explain_text: str,
@@ -704,7 +704,7 @@ def build_worker_semantic_retry_prompt(
     return "\n".join(lines)
 
 
-def build_tiered_snipe_prompt(
+def build_beam_tiered_snipe_prompt(
     query_id: str,
     original_sql: str,
     explain_text: str,
@@ -1058,7 +1058,7 @@ def _build_detailed_iteration_section(
     return "\n".join(sections)
 
 
-def build_oneshot_patch_snipe_prompt(
+def build_beam_snipe_prompt(
     original_prompt: str,
     iteration: int,
     patches: List[Any],
@@ -1077,7 +1077,7 @@ def build_oneshot_patch_snipe_prompt(
     This keeps prompt size roughly constant regardless of iteration count.
 
     Args:
-        original_prompt: The initial prompt (from build_oneshot_patch_prompt)
+        original_prompt: The initial prompt (from build_beam_prompt)
         iteration: Current iteration number (0-based internal, displayed as 1-based)
         patches: List of AppliedPatch from the most recent iteration
         original_explain: EXPLAIN text for original query
@@ -1126,7 +1126,7 @@ def build_oneshot_patch_snipe_prompt(
     return "\n".join(sections)
 
 
-def build_oneshot_patch_retry_prompt(
+def build_beam_retry_prompt(
     original_prompt: str,
     previous_response: str,
     all_patches: List[Any],
@@ -1193,7 +1193,7 @@ def build_oneshot_patch_retry_prompt(
 
 # ── Runtime Error Retry Prompt ─────────────────────────────────────────────
 
-def build_runtime_error_retry_prompt(
+def build_beam_runtime_error_retry_prompt(
     original_prompt: str,
     good_patches: List[Any],
     failed_patches: List[Any],
