@@ -12,9 +12,68 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# ── Worker Roles & Routing ────────────────────────────────────────────────
+
+WORKER_ROLES: Dict[str, Dict[str, Any]] = {
+    "W1": {
+        "key": "W1",
+        "name": "Reducer",
+        "families": ["A", "D"],
+        "focus": "Cardinality reduction — WHERE filters, set operations, early pruning",
+        "description": (
+            "Reduce row counts early: push predicates into CTEs, convert set "
+            "operations to EXISTS/NOT EXISTS, apply early filtering before "
+            "expensive joins."
+        ),
+    },
+    "W2": {
+        "key": "W2",
+        "name": "Unnester",
+        "families": ["B", "C"],
+        "focus": "Logic simplification — decorrelation, aggregation pushdown",
+        "description": (
+            "Eliminate per-row re-execution: convert correlated subqueries to "
+            "GROUP BY CTEs, push aggregation before joins when GROUP BY keys "
+            "⊇ join keys."
+        ),
+    },
+    "W3": {
+        "key": "W3",
+        "name": "Builder",
+        "families": ["F", "E"],
+        "focus": "Structural optimization — join restructuring, materialization",
+        "description": (
+            "Restructure join topology and materialize repeated work: convert "
+            "comma joins to explicit INNER JOIN, extract shared scans into "
+            "CTEs, prefetch dimension tables."
+        ),
+    },
+    "W4": {
+        "key": "W4",
+        "name": "Wildcard",
+        "families": [],  # Dynamic — assigned the #1 priority target
+        "focus": "Deep specialist for the #1 identified problem",
+        "description": (
+            "Focus entirely on the highest-priority optimization target. May "
+            "combine strategies from multiple families or try novel approaches "
+            "not covered by other workers."
+        ),
+    },
+}
+
+FAMILY_TO_WORKER: Dict[str, str] = {
+    "A": "W1",
+    "D": "W1",
+    "B": "W2",
+    "C": "W2",
+    "F": "W3",
+    "E": "W3",
+}
 
 
 @dataclass
@@ -47,7 +106,7 @@ class TieredOrchestrator:
     Args:
         analyst_call_fn: Callable that takes a prompt string, returns LLM response string.
         worker_call_fn: Callable that takes a prompt string, returns LLM response string.
-        gold_examples: Dict mapping family ID (A-E) to gold example JSON.
+        gold_examples: Dict mapping family ID (A-F) to gold example JSON.
         dialect: SQL dialect string (duckdb, postgres, snowflake).
     """
 
@@ -76,8 +135,12 @@ class TieredOrchestrator:
         original_sql: str,
         explain_text: str,
         ir_node_map: str,
-    ) -> List[AnalystTarget]:
-        """Build tiered analyst prompt, call DeepSeek, parse response into targets."""
+    ) -> Tuple[List[AnalystTarget], str, str]:
+        """Build tiered analyst prompt, call DeepSeek, parse response into targets.
+
+        Returns:
+            (targets, prompt, response) — parsed targets, raw prompt, raw response.
+        """
         from .oneshot_patch_prompt_builder import build_oneshot_patch_prompt_tiered
 
         prompt = build_oneshot_patch_prompt_tiered(
@@ -112,17 +175,29 @@ class TieredOrchestrator:
         targets: List[AnalystTarget],
         script_ir: Any,
         dialect_enum: Any,
-    ) -> List["AppliedPatch"]:
-        """Call qwen in parallel (one per target). Apply each patch.
+    ) -> Tuple[List["AppliedPatch"], int]:
+        """Call workers in parallel (one per target). Apply each patch.
 
-        Returns list of AppliedPatch objects (same format as single-tier).
+        Workers are routed to specialized roles based on target family:
+        - W4 "Wildcard": always gets the #1 target (highest relevance)
+        - W1 "Reducer" (A/D), W2 "Unnester" (B/C), W3 "Builder" (F/E)
+
+        Returns:
+            (patches, n_api_calls) — applied patches + actual LLM call count.
         """
         from .oneshot_patch_prompt_builder import build_worker_patch_prompt
         from ..sessions.oneshot_patch_session import AppliedPatch
+        import threading
 
         results: List[AppliedPatch] = []
+        api_call_count = [0]  # mutable for thread-safe increment
+        api_lock = threading.Lock()
 
-        def process_target(target: AnalystTarget) -> AppliedPatch:
+        assignments = self._assign_workers(targets)
+
+        def process_assignment(
+            target: AnalystTarget, worker_role: Dict[str, Any]
+        ) -> AppliedPatch:
             patch = AppliedPatch(
                 patch_id=target.target_id,
                 family=target.family,
@@ -140,19 +215,24 @@ class TieredOrchestrator:
                 patch.status = "FAIL"
                 return patch
 
-            # Build worker prompt
+            # Build worker prompt with role context
             worker_prompt = build_worker_patch_prompt(
                 original_sql=original_sql,
                 ir_node_map=ir_node_map,
                 target=target.to_dict(),
                 gold_patch_plan=gold_patch,
                 dialect=self.dialect,
+                worker_role=worker_role,
             )
 
             # Call worker LLM
             try:
                 worker_response = self.worker_call_fn(worker_prompt)
+                with api_lock:
+                    api_call_count[0] += 1
             except Exception as e:
+                with api_lock:
+                    api_call_count[0] += 1  # attempted call still counts
                 patch.apply_error = f"Worker LLM call failed: {e}"
                 patch.status = "FAIL"
                 return patch
@@ -166,8 +246,8 @@ class TieredOrchestrator:
         # Run workers in parallel (4 threads)
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {
-                pool.submit(process_target, t): t
-                for t in targets[:4]
+                pool.submit(process_assignment, target, role): target
+                for target, role in assignments
             }
             for future in as_completed(futures):
                 target = futures[future]
@@ -191,7 +271,7 @@ class TieredOrchestrator:
         target_order = {t.target_id: i for i, t in enumerate(targets)}
         results.sort(key=lambda p: target_order.get(p.patch_id, 99))
 
-        return results
+        return results, api_call_count[0]
 
     def retry_worker(
         self,
@@ -213,12 +293,17 @@ class TieredOrchestrator:
         if not gold_patch:
             return None
 
+        # Derive worker role from family
+        worker_key = FAMILY_TO_WORKER.get(target.family, "W3")
+        worker_role = WORKER_ROLES.get(worker_key)
+
         worker_prompt = build_worker_patch_prompt(
             original_sql=original_sql,
             ir_node_map=ir_node_map,
             target=target.to_dict(),
             gold_patch_plan=gold_patch,
             dialect=self.dialect,
+            worker_role=worker_role,
         )
 
         retry_prompt = build_worker_retry_prompt(worker_prompt, error)
@@ -241,6 +326,65 @@ class TieredOrchestrator:
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────
+
+    def _assign_workers(
+        self, targets: List[AnalystTarget]
+    ) -> List[Tuple[AnalystTarget, Dict[str, Any]]]:
+        """Assign targets to specialized workers based on family routing.
+
+        - W4 "Wildcard" always gets the #1 target (highest relevance).
+        - Remaining targets route to W1-W3 based on family.
+        - If a worker is already assigned, the target is skipped.
+
+        Returns:
+            List of (target, worker_role) tuples (max 4).
+        """
+        if not targets:
+            return []
+
+        sorted_targets = sorted(
+            targets, key=lambda t: t.relevance_score, reverse=True
+        )
+
+        assignments: List[Tuple[AnalystTarget, Dict[str, Any]]] = []
+
+        # W4 always gets the top target
+        assignments.append((sorted_targets[0], WORKER_ROLES["W4"]))
+        logger.info(
+            f"W4 Wildcard ← {sorted_targets[0].target_id} "
+            f"(family {sorted_targets[0].family}, "
+            f"relevance {sorted_targets[0].relevance_score:.2f})"
+        )
+
+        # Route remaining to W1-W3 by family
+        assigned_worker_keys = set()
+        for target in sorted_targets[1:4]:
+            worker_key = FAMILY_TO_WORKER.get(target.family, "W3")
+            if worker_key not in assigned_worker_keys:
+                assigned_worker_keys.add(worker_key)
+                assignments.append((target, WORKER_ROLES[worker_key]))
+                logger.info(
+                    f"{worker_key} {WORKER_ROLES[worker_key]['name']} ← "
+                    f"{target.target_id} (family {target.family})"
+                )
+            else:
+                # Worker already assigned — try next available
+                for alt_key in ["W1", "W2", "W3"]:
+                    if alt_key not in assigned_worker_keys:
+                        assigned_worker_keys.add(alt_key)
+                        assignments.append((target, WORKER_ROLES[alt_key]))
+                        logger.info(
+                            f"{alt_key} {WORKER_ROLES[alt_key]['name']} ← "
+                            f"{target.target_id} (family {target.family}, "
+                            f"re-routed from {worker_key})"
+                        )
+                        break
+                else:
+                    logger.info(
+                        f"Skipping {target.target_id} — all workers assigned"
+                    )
+
+        return assignments[:4]
 
     def _parse_analyst_response(self, response: str) -> List[AnalystTarget]:
         """Parse analyst JSON array into AnalystTarget objects."""

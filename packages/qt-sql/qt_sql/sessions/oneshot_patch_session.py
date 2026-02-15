@@ -496,15 +496,15 @@ class OneshotPatchSession(OptimizationSession):
                 json.dumps([t.to_dict() for t in targets], indent=2)
             )
 
-            # ── Phase 2: Worker calls (parallel) ─────────────────────
-            patches = orchestrator.run_workers(
+            # ── Phase 2: Worker calls (parallel, role-routed) ────────
+            patches, worker_api_calls = orchestrator.run_workers(
                 original_sql=self.original_sql,
                 ir_node_map=ir_node_map,
                 targets=targets,
                 script_ir=script_ir,
                 dialect_enum=dialect_enum,
             )
-            iter_api_calls += len(targets)  # one worker call per target
+            iter_api_calls += worker_api_calls
 
             applied = [p for p in patches if p.output_sql]
             logger.info(
@@ -645,7 +645,11 @@ class OneshotPatchSession(OptimizationSession):
         provider, model = model_spec.split("/", 1)
 
         from ..generate import CandidateGenerator
-        generator = CandidateGenerator(provider=provider, model=model)
+        generator = CandidateGenerator(
+            provider=provider,
+            model=model,
+            analyze_fn=self.pipeline.analyze_fn,
+        )
         return lambda prompt: self._call_llm_with_timeout(generator, prompt)
 
     # ── Internal Methods ────────────────────────────────────────────────────

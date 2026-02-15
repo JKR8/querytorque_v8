@@ -74,6 +74,18 @@ FAMILY_DESCRIPTIONS = {
             "Dimension filters applied independently multiple times",
             "CTE referenced multiple times with implicit re-evaluation"
         ]
+    },
+    "F": {
+        "name": "Join Transform",
+        "pattern": "Right Shape First",
+        "description": "Restructure join topology: convert comma joins to explicit INNER JOIN, optimize join order, eliminate self-joins via single-pass aggregation",
+        "speedup_range": "1.8–8.6x",
+        "win_rate": "~19% of all wins",
+        "use_when": [
+            "Comma-separated joins (implicit cross joins) in FROM clause",
+            "Self-joins scanning same table multiple times",
+            "Dimension-fact join order suboptimal for predicate pushdown"
+        ]
     }
 }
 
@@ -203,7 +215,8 @@ def _build_prompt_body(
 """)
 
     # ── Section 5: Families with examples ─────────────────────────────
-    families_with_plans = [f for f in ["A", "B", "C", "D", "E"]
+    all_family_ids = ["A", "B", "C", "D", "E", "F"]
+    families_with_plans = [f for f in all_family_ids
                            if f in all_5_examples and all_5_examples[f].get("patch_plan")]
     n_families = len(families_with_plans)
 
@@ -218,7 +231,7 @@ Choose up to **{min(4, n_families)} most relevant families** for this query base
 
 """)
 
-    for family_id in ["A", "B", "C", "D", "E"]:
+    for family_id in all_family_ids:
         ex = all_5_examples.get(family_id)
         if ex and ex.get("patch_plan"):
             sections.append(format_family_section(family_id, ex))
@@ -259,7 +272,7 @@ def build_oneshot_patch_prompt(
         "- Transform the original query using patch operations\n"
         "- Preserve semantic equivalence (same rows, columns, ordering)\n"
         "- Follow the patterns shown in reference examples below\n\n"
-        "You will **choose 4 of the 5 families** based on relevance to THIS SPECIFIC QUERY."
+        "You will **choose 4 of the 6 families** based on relevance to THIS SPECIFIC QUERY."
     )
 
     sections, n_families = _build_prompt_body(
@@ -390,13 +403,25 @@ def build_oneshot_patch_prompt_tiered(
         "For each target, describe the STRUCTURAL SHAPE of the optimized query "
         "using an IR node map (CTE names, FROM tables, WHERE conditions, GROUP BY, ORDER BY). "
         "A separate code-generation worker will convert your targets into executable patch plans.\n\n"
-        "You will **choose up to 4 of the 5 families** based on relevance to THIS SPECIFIC QUERY."
+        "You will **choose up to 4 of the 6 families** based on relevance to THIS SPECIFIC QUERY."
     )
 
     sections, n_families = _build_prompt_body(
         query_id, original_sql, explain_text, ir_node_map,
         all_5_examples, dialect, role_text,
     )
+
+    # ── Section 5b: Worker Routing ───────────────────────────────────────
+    sections.append("""## Worker Routing
+
+Your targets will be routed to specialized workers:
+- **W1 "Reducer"** (Families A, D): Cardinality reduction — early filtering, set operations
+- **W2 "Unnester"** (Families B, C): Decorrelation, aggregation pushdown
+- **W3 "Builder"** (Families F, E): Join restructuring, materialization/prefetch
+- **W4 "Wildcard"** (Dynamic): Deep specialist — your **#1 target** gets maximum effort
+
+The highest-relevance target always goes to W4. Design diverse targets across worker roles for maximum coverage.
+""")
 
     # ── Section 6: Tiered Output Format (target IR maps) ────────────────
     n_to_choose = min(4, n_families)
@@ -454,6 +479,7 @@ def build_worker_patch_prompt(
     gold_patch_plan: Dict[str, Any],
     dialect: str,
     dialect_constraints: str = "",
+    worker_role: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build focused worker prompt for converting a target IR into a PatchPlan JSON.
 
@@ -464,6 +490,7 @@ def build_worker_patch_prompt(
         gold_patch_plan: The patch_plan field from the recommended gold example
         dialect: SQL dialect
         dialect_constraints: Optional dialect-specific rules
+        worker_role: Optional worker role dict (key, name, focus, description)
 
     Returns:
         Worker prompt string (~2K tokens)
@@ -476,6 +503,21 @@ def build_worker_patch_prompt(
     lines = [
         "## Role",
         "",
+    ]
+
+    # Add worker specialization context if available
+    if worker_role:
+        role_key = worker_role.get("key", "W?")
+        role_name = worker_role.get("name", "Worker")
+        role_focus = worker_role.get("focus", "")
+        role_desc = worker_role.get("description", "")
+        lines.append(
+            f"You are **{role_key} \"{role_name}\"** — {role_focus}. "
+            f"{role_desc}"
+        )
+        lines.append("")
+
+    lines.extend([
         "Transform this SQL query from its CURRENT IR structure to a TARGET IR structure "
         "using patch operations. Output a single PatchPlan JSON.",
         "",
@@ -511,7 +553,7 @@ def build_worker_patch_prompt(
         json.dumps(gold_patch_plan, indent=2),
         "```",
         "",
-    ]
+    ])
 
     if dialect_constraints:
         lines.extend([
@@ -570,21 +612,24 @@ def load_gold_examples(dialect: str, base_path: str = "packages/qt-sql/qt_sql/ex
             "B": "decorrelate",
             "C": "aggregate_pushdown",
             "D": "intersect_to_exists",
-            "E": "multi_dimension_prefetch"
+            "E": "multi_dimension_prefetch",
+            "F": "inner_join_conversion",
         },
         "postgres": {
             "A": "date_cte_explicit_join",
             "B": "shared_scan_decorrelate",
             "C": "materialized_dimension_fact_prefilter",
             "D": "intersect_to_exists",
-            "E": "multi_dimension_prefetch"
+            "E": "multi_dimension_prefetch",
+            "F": "explicit_join_materialized",
         },
         "snowflake": {
             "A": "inline_decorrelate",
             "B": "shared_scan_decorrelate",
             "C": "aggregate_pushdown",  # Borrow from DuckDB, mark in prompt
             "D": "intersect_to_exists",  # Borrow from DuckDB
-            "E": "multi_dimension_prefetch"  # Borrow from DuckDB
+            "E": "multi_dimension_prefetch",  # Borrow from DuckDB
+            "F": "inner_join_conversion",  # Borrow from DuckDB
         }
     }
 
