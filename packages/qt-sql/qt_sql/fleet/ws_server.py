@@ -40,9 +40,11 @@ class FleetWSServer:
         app = FastAPI(title="Fleet C2")
 
         html_template = self.html_path.read_text()
-        # Inject real data via __FLEET_DATA__ placeholder
+        # Inject real data into the <script type="application/json"> tag.
+        # The placeholder lives inside an HTML text node (not JS), so raw JSON is safe.
+        # Use replace() with count=1 to only replace the first occurrence.
         initial_json = json.dumps(self.initial_data, default=str)
-        served_html = html_template.replace("__FLEET_DATA__", initial_json)
+        served_html = html_template.replace("__FLEET_DATA__", initial_json, 1)
 
         @app.get("/", response_class=HTMLResponse)
         async def index():
