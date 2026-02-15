@@ -172,7 +172,8 @@ class FleetOrchestrator:
             except Exception as e:
                 logger.warning(f"[{query_id}] Failed to read EXPLAIN timing: {e}")
 
-        return 0.0  # unknown — will bucket as SKIP
+        logger.warning(f"[{query_id}] No EXPLAIN timing found — defaulting to MEDIUM bucket")
+        return -1.0  # sentinel: unknown runtime
 
     # ── Phase 1: Triage ────────────────────────────────────────────────
 
@@ -204,6 +205,8 @@ class FleetOrchestrator:
 
     @staticmethod
     def _bucket_runtime(runtime_ms: float) -> str:
+        if runtime_ms < 0:
+            return "MEDIUM"  # unknown runtime — worth attempting
         for threshold, bucket in RUNTIME_THRESHOLDS:
             if runtime_ms < threshold:
                 return bucket
@@ -281,16 +284,12 @@ class FleetOrchestrator:
                 query_id=qid,
                 sql=triage_item.sql,
                 max_iterations=triage_item.max_iterations,
-                target_speedup=10.0,
+                target_speedup=10.0,  # intentional: fleet always aims for 10x
                 mode=OptimizationMode.ONESHOT,
                 patch=True,
                 benchmark_lock=self.benchmark_lock,
+                on_phase_change=_on_phase,
             )
-
-            # Attach phase callback to the session (for future iterations)
-            # Note: run_optimization_session creates the session internally,
-            # so we can't easily attach before run(). The dashboard still
-            # gets updated at start/end of each query.
 
             return qid, result
 

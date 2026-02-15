@@ -13,13 +13,8 @@ import click
 @click.command()
 @click.argument("benchmark")
 @click.option("-q", "--query", multiple=True, help="Query filter (repeatable, prefix match).")
-@click.option(
-    "--mode",
-    type=click.Choice(["swarm", "oneshot"]),
-    default="swarm",
-    show_default=True,
-    help="Prompt mode: swarm (multi-worker) or oneshot (single call).",
-)
+@click.option("--mode", type=click.Choice(["oneshot"]), default="oneshot", hidden=True,
+              help="Deprecated. Prepare now always uses oneshot prompt format.")
 @click.option("--force", is_flag=True, help="Regenerate even if prompts exist.")
 @click.option("--bootstrap", is_flag=True,
               help="Allow first-run mode: skip intelligence gates (no gold examples/global knowledge required).")

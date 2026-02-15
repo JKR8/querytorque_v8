@@ -1,0 +1,147 @@
+Based on the analysis of the query structure and execution plan, here are 4 independent patch plans targeting different optimization families:
+
+```json
+[
+  {
+    "family": "B",
+    "transform": "decorrelate_store_avg",
+    "plan_id": "t1_family_b",
+    "relevance_score": 0.95,
+    "reasoning": "Correlated subquery in WHERE clause causes per-row execution of store average calculation. Decorrelation eliminates nested loop.",
+    "steps": [
+      {
+        "step_id": "s1",
+        "op": "insert_cte",
+        "target": {"by_node_id": "S0"},
+        "payload": {
+          "cte_name": "store_avg",
+          "cte_query_sql": "SELECT ctr_store_sk, AVG(ctr_total_return)*1.2 AS avg_threshold FROM customer_total_return GROUP BY ctr_store_sk"
+        },
+        "description": "Precompute per-store average threshold in standalone CTE"
+      },
+      {
+        "step_id": "s2",
+        "op": "replace_from",
+        "target": {"by_node_id": "S0"},
+        "payload": {
+          "from_sql": "customer_total_return ctr1, store, customer, store_avg"
+        },
+        "description": "Add store_avg CTE to FROM clause"
+      },
+      {
+        "step_id": "s3",
+        "op": "replace_where_predicate",
+        "target": {
+          "by_node_id": "S0",
+          "by_anchor_hash": "e5b7485395ff5a80"
+        },
+        "payload": {
+          "expr_sql": "ctr1.ctr_total_return > store_avg.avg_threshold AND ctr1.ctr_store_sk = store_avg.ctr_store_sk AND s_store_sk = ctr1.ctr_store_sk AND s_state = 'SD' AND ctr1.ctr_customer_sk = c_customer_sk"
+        },
+        "description": "Replace correlated subquery with direct CTE join comparison"
+      }
+    ]
+  },
+  {
+    "family": "A",
+    "transform": "early_store_filter",
+    "plan_id": "t2_family_a",
+    "relevance_score": 0.85,
+    "reasoning": "Store filter (s_state='SD') applied late after large join. Pushing store selection reduces join cardinality early.",
+    "steps": [
+      {
+        "step_id": "s1",
+        "op": "insert_cte",
+        "target": {"by_node_id": "S0"},
+        "payload": {
+          "cte_name": "filtered_stores",
+          "cte_query_sql": "SELECT s_store_sk FROM store WHERE s_state = 'SD'"
+        },
+        "description": "Pre-filter stores by state in dedicated CTE"
+      },
+      {
+        "step_id": "s2",
+        "op": "replace_from",
+        "target": {"by_node_id": "S0"},
+        "payload": {
+          "from_sql": "customer_total_return ctr1, filtered_stores, customer"
+        },
+        "description": "Replace raw store table with pre-filtered CTE"
+      },
+      {
+        "step_id": "s3",
+        "op": "replace_where_predicate",
+        "target": {
+          "by_node_id": "S0",
+          "by_anchor_hash": "e5b7485395ff5a80"
+        },
+        "payload": {
+          "expr_sql": "ctr1.ctr_total_return > (SELECT AVG(ctr_total_return)*1.2 FROM customer_total_return ctr2 WHERE ctr1.ctr_store_sk = ctr2.ctr_store_sk) AND s_store_sk = ctr1.ctr_store_sk AND ctr1.ctr_customer_sk = c_customer_sk"
+        },
+        "description": "Remove s_state filter (already applied in CTE)"
+      }
+    ]
+  },
+  {
+    "family": "E",
+    "transform": "cte_materialization",
+    "plan_id": "t3_family_e",
+    "relevance_score": 0.75,
+    "reasoning": "CTE referenced twice (main query + subquery) with potential re-execution. Materialization prevents redundant computation.",
+    "steps": [
+      {
+        "step_id": "s1",
+        "op": "replace_block_with_cte_pair",
+        "target": {
+          "by_node_id": "S0",
+          "by_label": "customer_total_return"
+        },
+        "payload": {
+          "sql_fragment": "customer_total_return AS MATERIALIZED (SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns, date_dim WHERE sr_returned_date_sk = d_date_sk AND d_year = 2000 GROUP BY sr_customer_sk, sr_store_sk)"
+        },
+        "description": "Force materialization of CTE using Snowflake-specific hint"
+      }
+    ]
+  },
+  {
+    "family": "C",
+    "transform": "agg_pushdown",
+    "plan_id": "t4_family_c",
+    "relevance_score": 0.65,
+    "reasoning": "Aggregation in CTE could be pushed closer to fact table to reduce join cardinality.",
+    "steps": [
+      {
+        "step_id": "s1",
+        "op": "replace_block_with_cte_pair",
+        "target": {
+          "by_node_id": "S0",
+          "by_label": "customer_total_return"
+        },
+        "payload": {
+          "sql_fragment": "customer_total_return AS (SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(sr_fee) AS ctr_total_return FROM (SELECT sr_customer_sk, sr_store_sk, sr_returned_date_sk, SUM(SR_FEE) AS sr_fee FROM store_returns GROUP BY sr_customer_sk, sr_store_sk, sr_returned_date_sk) pre_agg JOIN date_dim ON pre_agg.sr_returned_date_sk = date_dim.d_date_sk WHERE d_year = 2000 GROUP BY sr_customer_sk, sr_store_sk)"
+        },
+        "description": "Push partial aggregation below date join"
+      }
+    ]
+  }
+]
+```
+
+## Analysis
+
+1. **Family B (Decorrelation) - HIGH**: The correlated subquery calculating store averages forces per-row execution (DELIM_SCAN in plan). Decorrelation converts O(N*M) scan to single hash join.
+
+2. **Family A (Early Filtering) - HIGH**: Store filter (s_state='SD') applied after large join. Pre-filtering stores reduces join cardinality from millions to state-specific subset.
+
+3. **Family E (Materialization) - MEDIUM**: The customer_total_return CTE is referenced twice. Materialization prevents potential re-execution, though Snowflake may optimize automatically.
+
+4. **Family C (Agg Pushdown) - MEDIUM**: Aggregation could be pushed closer to store_returns scan. However, date_dim join may limit benefits as grouping keys don't match join keys.
+
+**Chosen families**: [B, A, E, C]  
+**Expected speedups**:  
+- t1: 2.8x (decorrelation eliminates correlated execution)  
+- t2: 1.5x (early store filtering reduces join cardinality)  
+- t3: 1.3x (materialization prevents CTE re-execution)  
+- t4: 1.1x (marginal gains from aggregation pushdown)  
+
+**Confidence**: High for B/A (clear optimization patterns), Medium for E/C (database-specific optimizations may apply). The correlated subquery and store filtering are clear bottlenecks per execution plan.

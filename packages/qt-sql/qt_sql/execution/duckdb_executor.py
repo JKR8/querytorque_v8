@@ -118,6 +118,7 @@ class DuckDBExecutor:
         sql: str,
         params: tuple[Any, ...] | dict[str, Any] = (),
         validate_params: bool = True,
+        timeout_ms: int = 0,
     ) -> list[dict[str, Any]]:
         """Execute SQL and return results as list of dicts.
 

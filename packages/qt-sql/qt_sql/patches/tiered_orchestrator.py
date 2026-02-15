@@ -205,9 +205,9 @@ class TieredOrchestrator:
                 relevance_score=target.relevance_score,
             )
 
-            # Find gold patch plan from recommended examples
-            gold_patch = self._find_gold_patch(target)
-            if not gold_patch:
+            # Find gold patch plan(s) from recommended examples
+            gold_patches = self._find_all_gold_patches(target)
+            if not gold_patches:
                 patch.apply_error = (
                     f"No gold patch plan found for examples: "
                     f"{target.recommended_examples}"
@@ -216,6 +216,8 @@ class TieredOrchestrator:
                 return patch
 
             # Build worker prompt with role context
+            # Primary gold plan for the template
+            gold_patch = gold_patches[0]
             worker_prompt = build_worker_patch_prompt(
                 original_sql=original_sql,
                 ir_node_map=ir_node_map,
@@ -224,6 +226,22 @@ class TieredOrchestrator:
                 dialect=self.dialect,
                 worker_role=worker_role,
             )
+
+            # For compound families, append additional gold examples
+            if len(gold_patches) > 1:
+                extra_lines = [
+                    "\n## Additional Gold Examples (for compound strategy)\n"
+                ]
+                for i, extra_plan in enumerate(gold_patches[1:], 2):
+                    extra_lines.append(f"**Gold Example {i}:**")
+                    extra_lines.append("```json")
+                    extra_lines.append(json.dumps(extra_plan, indent=2))
+                    extra_lines.append("```\n")
+                extra_lines.append(
+                    "Combine techniques from ALL gold examples above "
+                    "into a single unified patch plan."
+                )
+                worker_prompt += "\n".join(extra_lines)
 
             # Call worker LLM
             try:
@@ -243,8 +261,8 @@ class TieredOrchestrator:
                 script_ir, dialect_enum,
             )
 
-        # Run workers in parallel (4 threads)
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        # Run workers in parallel
+        with ThreadPoolExecutor(max_workers=len(assignments) or 1) as pool:
             futures = {
                 pool.submit(process_assignment, target, role): target
                 for target, role in assignments
@@ -294,7 +312,8 @@ class TieredOrchestrator:
             return None
 
         # Derive worker role from family
-        worker_key = FAMILY_TO_WORKER.get(target.family, "W3")
+        primary_family = target.family.split("+")[0].strip()
+        worker_key = FAMILY_TO_WORKER.get(primary_family, "W3")
         worker_role = WORKER_ROLES.get(worker_key)
 
         worker_prompt = build_worker_patch_prompt(
@@ -325,16 +344,125 @@ class TieredOrchestrator:
             patch, response, retry_prompt, script_ir, dialect_enum,
         )
 
+    def retry_worker_semantic(
+        self,
+        original_sql: str,
+        ir_node_map: str,
+        target: AnalystTarget,
+        sem_result,
+        rewrite_sql: str,
+        script_ir: Any,
+        dialect_enum: Any,
+    ) -> Optional["AppliedPatch"]:
+        """Retry a worker whose patch failed semantic validation.
+
+        Uses build_worker_semantic_retry_prompt() with row count diffs,
+        value diffs, and SQL diff as error context.
+        """
+        from .oneshot_patch_prompt_builder import (
+            build_worker_patch_prompt,
+            build_worker_semantic_retry_prompt,
+        )
+        from ..sessions.oneshot_patch_session import AppliedPatch
+
+        gold_patch = self._find_gold_patch(target)
+        if not gold_patch:
+            return None
+
+        primary_family = target.family.split("+")[0].strip()
+        worker_key = FAMILY_TO_WORKER.get(primary_family, "W3")
+        worker_role = WORKER_ROLES.get(worker_key)
+
+        worker_prompt = build_worker_patch_prompt(
+            original_sql=original_sql,
+            ir_node_map=ir_node_map,
+            target=target.to_dict(),
+            gold_patch_plan=gold_patch,
+            dialect=self.dialect,
+            worker_role=worker_role,
+        )
+
+        retry_prompt = build_worker_semantic_retry_prompt(
+            worker_prompt, sem_result, original_sql, rewrite_sql,
+        )
+
+        try:
+            response = self.worker_call_fn(retry_prompt)
+        except Exception as e:
+            logger.warning(f"Worker semantic retry LLM call failed: {e}")
+            return None
+
+        patch = AppliedPatch(
+            patch_id=target.target_id,
+            family=target.family,
+            transform=target.transform,
+            relevance_score=target.relevance_score,
+        )
+
+        return self._apply_worker_response(
+            patch, response, retry_prompt, script_ir, dialect_enum,
+        )
+
+    def run_snipe(
+        self,
+        query_id: str,
+        original_sql: str,
+        explain_text: str,
+        ir_node_map: str,
+        patches: List[Any],
+        patch_explains: Dict[str, str],
+    ) -> Tuple[List[AnalystTarget], str, str]:
+        """Build snipe prompt from benchmark results, call analyst, parse targets.
+
+        Returns:
+            (targets, prompt, response) — parsed targets, raw prompt, raw response.
+        """
+        from .oneshot_patch_prompt_builder import build_tiered_snipe_prompt
+
+        prompt = build_tiered_snipe_prompt(
+            query_id=query_id,
+            original_sql=original_sql,
+            explain_text=explain_text,
+            ir_node_map=ir_node_map,
+            all_5_examples=self.gold_examples,
+            dialect=self.dialect,
+            patches=patches,
+            patch_explains=patch_explains,
+        )
+
+        logger.info(
+            f"[{query_id}] Snipe prompt: {len(prompt)} chars"
+        )
+
+        response = self.analyst_call_fn(prompt)
+        logger.info(
+            f"[{query_id}] Snipe response: {len(response)} chars"
+        )
+
+        targets = self._parse_analyst_response(response)
+        logger.info(
+            f"[{query_id}] Parsed {len(targets)} snipe targets"
+        )
+
+        return targets, prompt, response
+
     # ── Internal helpers ──────────────────────────────────────────────────
 
     def _assign_workers(
         self, targets: List[AnalystTarget]
     ) -> List[Tuple[AnalystTarget, Dict[str, Any]]]:
-        """Assign targets to specialized workers based on family routing.
+        """Assign targets to specialized workers via super-family draft.
 
-        - W4 "Wildcard" always gets the #1 target (highest relevance).
-        - Remaining targets route to W1-W3 based on family.
-        - If a worker is already assigned, the target is skipped.
+        Draft algorithm:
+        1. W4 "Wildcard" always gets the #1 target (highest relevance) —
+           deep specialist doubling down on the critical bottleneck.
+        2. Group remaining targets by super-family worker:
+           - W1 "Reducer" (A, D)
+           - W2 "Unnester" (B, C)
+           - W3 "Builder" (F, E)
+        3. If a worker has multiple targets (e.g. both E and F → W3),
+           merge them into a compound target. The worker gets context for
+           ALL targets and gold examples from ALL referenced families.
 
         Returns:
             List of (target, worker_role) tuples (max 4).
@@ -348,7 +476,7 @@ class TieredOrchestrator:
 
         assignments: List[Tuple[AnalystTarget, Dict[str, Any]]] = []
 
-        # W4 always gets the top target
+        # W4 always gets the top target — deep specialist
         assignments.append((sorted_targets[0], WORKER_ROLES["W4"]))
         logger.info(
             f"W4 Wildcard ← {sorted_targets[0].target_id} "
@@ -356,43 +484,87 @@ class TieredOrchestrator:
             f"relevance {sorted_targets[0].relevance_score:.2f})"
         )
 
-        # Route remaining to W1-W3 by family
-        assigned_worker_keys = set()
-        for target in sorted_targets[1:4]:
-            worker_key = FAMILY_TO_WORKER.get(target.family, "W3")
-            if worker_key not in assigned_worker_keys:
-                assigned_worker_keys.add(worker_key)
-                assignments.append((target, WORKER_ROLES[worker_key]))
-                logger.info(
-                    f"{worker_key} {WORKER_ROLES[worker_key]['name']} ← "
-                    f"{target.target_id} (family {target.family})"
-                )
+        # Group remaining targets by super-family worker
+        worker_groups: Dict[str, List[AnalystTarget]] = {}
+        for target in sorted_targets[1:]:
+            primary_family = target.family.split("+")[0].strip()
+            worker_key = FAMILY_TO_WORKER.get(primary_family, "W3")
+            worker_groups.setdefault(worker_key, []).append(target)
+
+        # Create one assignment per worker group (W1, W2, W3 order)
+        for worker_key in ["W1", "W2", "W3"]:
+            group = worker_groups.get(worker_key)
+            if not group:
+                continue
+
+            if len(group) == 1:
+                merged = group[0]
             else:
-                # Worker already assigned — try next available
-                for alt_key in ["W1", "W2", "W3"]:
-                    if alt_key not in assigned_worker_keys:
-                        assigned_worker_keys.add(alt_key)
-                        assignments.append((target, WORKER_ROLES[alt_key]))
-                        logger.info(
-                            f"{alt_key} {WORKER_ROLES[alt_key]['name']} ← "
-                            f"{target.target_id} (family {target.family}, "
-                            f"re-routed from {worker_key})"
-                        )
-                        break
-                else:
-                    logger.info(
-                        f"Skipping {target.target_id} — all workers assigned"
-                    )
+                merged = self._merge_targets(group)
+
+            assignments.append((merged, WORKER_ROLES[worker_key]))
+            logger.info(
+                f"{worker_key} {WORKER_ROLES[worker_key]['name']} ← "
+                f"{merged.target_id} (family {merged.family}, "
+                f"{len(group)} target(s))"
+            )
 
         return assignments[:4]
 
+    @staticmethod
+    def _merge_targets(targets: List[AnalystTarget]) -> AnalystTarget:
+        """Merge multiple targets for the same super-family worker into one compound target.
+
+        The compound target has:
+        - family: unique families joined by "+" (e.g. "E+F", not "E+E")
+        - hypothesis: all hypotheses joined by " | "
+        - target_ir: all IRs joined by separator
+        - recommended_examples: deduplicated union
+        - relevance_score: max across targets
+        """
+        # Deduplicate families (e.g. two "B" targets → just "B", not "B+B")
+        seen_families: list = []
+        for t in targets:
+            for f in t.family.split("+"):
+                f = f.strip()
+                if f not in seen_families:
+                    seen_families.append(f)
+        family = "+".join(seen_families)
+
+        transforms = "+".join(t.transform for t in targets)
+        hypotheses = " | ".join(t.hypothesis for t in targets if t.hypothesis)
+        target_irs = "\n---\n".join(t.target_ir for t in targets if t.target_ir)
+
+        # Deduplicate examples preserving order
+        examples: list = []
+        for t in targets:
+            for ex in t.recommended_examples:
+                if ex not in examples:
+                    examples.append(ex)
+
+        return AnalystTarget(
+            target_id=targets[0].target_id,
+            family=family,
+            transform=transforms,
+            relevance_score=max(t.relevance_score for t in targets),
+            hypothesis=hypotheses,
+            target_ir=target_irs,
+            recommended_examples=examples,
+        )
+
     def _parse_analyst_response(self, response: str) -> List[AnalystTarget]:
-        """Parse analyst JSON array into AnalystTarget objects."""
+        """Parse analyst JSON array (or individual objects) into AnalystTarget objects."""
         from ..patches.oneshot_patch_validator import _extract_json_array
 
         targets_data = _extract_json_array(response)
+        # Validate: targets must be dicts (not strings like recommended_examples)
+        if targets_data and not isinstance(targets_data[0], dict):
+            targets_data = None
         if targets_data is None:
-            logger.warning("Failed to extract JSON array from analyst response")
+            # Fallback: analyst may emit individual JSON objects in markdown blocks
+            targets_data = self._extract_individual_json_objects(response)
+        if not targets_data:
+            logger.warning("Failed to extract targets from analyst response")
             return []
 
         targets = []
@@ -414,18 +586,52 @@ class TieredOrchestrator:
 
         return targets
 
+    def _find_all_gold_patches(self, target: AnalystTarget) -> List[Dict[str, Any]]:
+        """Find ALL matching gold patch plans for a target.
+
+        For compound families (e.g. "A+B"), returns one plan per family letter.
+        Used to give workers multiple reference patterns for compound strategies.
+        """
+        plans: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+
+        # Try recommended examples first
+        for ex_id in target.recommended_examples:
+            ex = self._example_by_id.get(ex_id)
+            if ex and ex.get("patch_plan") and ex_id not in seen_ids:
+                plans.append(ex["patch_plan"])
+                seen_ids.add(ex_id)
+
+        # Try each family letter
+        family_letters = [f.strip() for f in target.family.split("+")]
+        for fam in family_letters:
+            family_ex = self.gold_examples.get(fam)
+            if family_ex and family_ex.get("patch_plan"):
+                ex_id = family_ex.get("id", fam)
+                if ex_id not in seen_ids:
+                    plans.append(family_ex["patch_plan"])
+                    seen_ids.add(ex_id)
+
+        return plans
+
     def _find_gold_patch(self, target: AnalystTarget) -> Optional[Dict[str, Any]]:
-        """Find the best matching gold patch plan for a target."""
+        """Find the best matching gold patch plan for a target.
+
+        Handles compound families (e.g. "A+B") by trying recommended examples
+        first, then each family letter in order.
+        """
         # Try recommended examples first
         for ex_id in target.recommended_examples:
             ex = self._example_by_id.get(ex_id)
             if ex and ex.get("patch_plan"):
                 return ex["patch_plan"]
 
-        # Fallback: use the family's default gold example
-        family_ex = self.gold_examples.get(target.family)
-        if family_ex and family_ex.get("patch_plan"):
-            return family_ex["patch_plan"]
+        # Handle compound families (e.g. "A+B") — try each family letter
+        family_letters = [f.strip() for f in target.family.split("+")]
+        for fam in family_letters:
+            family_ex = self.gold_examples.get(fam)
+            if family_ex and family_ex.get("patch_plan"):
+                return family_ex["patch_plan"]
 
         return None
 
@@ -475,6 +681,33 @@ class TieredOrchestrator:
             patch.status = "FAIL"
 
         return patch
+
+    @staticmethod
+    def _extract_individual_json_objects(text: str) -> Optional[List[Dict[str, Any]]]:
+        """Extract multiple individual JSON objects from text (e.g. each in its own code block).
+
+        Handles the case where the analyst outputs separate ```json blocks
+        instead of a single JSON array.
+        """
+        import re
+        objects = []
+
+        # Find all JSON code blocks
+        for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL):
+            try:
+                obj = json.loads(match.group(1))
+                if isinstance(obj, dict) and ("family" in obj or "target_id" in obj):
+                    objects.append(obj)
+            except json.JSONDecodeError:
+                continue
+
+        if objects:
+            logger.info(
+                f"Extracted {len(objects)} individual JSON objects from response"
+            )
+            return objects
+
+        return None
 
     @staticmethod
     def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:

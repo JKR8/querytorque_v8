@@ -1161,7 +1161,7 @@ def section_investigate(
         lines.append(
             "Transforms: inner_join_conversion, self_join_decomposition, "
             "date_cte_explicit_join, dimension_prefetch_star, "
-            "materialized_dimension_fact_prefilter, sf_date_cte_explicit_join"
+            "materialized_dimension_fact_prefilter"
         )
         lines.append(
             "Mechanism: Make join intent explicit (join type/order/filter placement) so "

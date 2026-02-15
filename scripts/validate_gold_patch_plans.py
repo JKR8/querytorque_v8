@@ -342,7 +342,6 @@ def print_summary(results: list[ValidationResult]) -> int:
 
 def main():
     parser = argparse.ArgumentParser(description="Validate gold example patch plans")
-    parser.add_argument("--fix", action="store_true", help="Attempt to fix broken patch plans")
     parser.add_argument("--only", help="Run only a specific example (stem name)")
     parser.add_argument("--dialect", help="Run only a specific dialect (duckdb/postgres/snowflake)")
     parser.add_argument("--no-db", action="store_true", help="Skip database execution")
@@ -378,6 +377,7 @@ def main():
 
     # ── Setup DuckDB executor ──
     executor = None
+    has_duckdb_examples = any(d == "duckdb" for _, d in examples)
     if not args.no_db:
         db_path = Path(DUCKDB_PATH)
         if db_path.exists():
@@ -385,8 +385,10 @@ def main():
             executor = DuckDBExecutor(database=str(db_path), read_only=True)
             executor.connect()
             print(f"DuckDB connected: {db_path}")
-        else:
-            print(f"DuckDB not found at {db_path}, skipping DB checks")
+        elif has_duckdb_examples:
+            print(f"ERROR: DuckDB not found at {db_path}. "
+                  f"Use --no-db to skip DB checks or --dialect postgres/snowflake.")
+            return 1
 
     # ── Validate each ──
     results: list[ValidationResult] = []

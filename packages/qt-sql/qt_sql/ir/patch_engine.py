@@ -988,6 +988,58 @@ def _flatten_and(node: exp.And) -> List[Any]:
     return result
 
 
+# ── CTE dependency detection ───────────────────────────────────────
+
+
+def _collect_cte_deps(body_ast, outer_cte_names: set) -> set:
+    """Collect outer CTE names referenced by body_ast.
+
+    Handles two edge cases that naive walks miss:
+    - Schema-qualified tables (ext.b) are external, not CTE refs.
+    - Inner WITH clauses shadow outer CTE names for their companion
+      SELECT, but the inner CTE bodies themselves can still reference
+      outer CTEs.
+    """
+    refs: set = set()
+    _walk_cte_refs(body_ast, outer_cte_names, frozenset(), refs)
+    return refs
+
+
+def _walk_cte_refs(node, outer_names: set, shadowed: frozenset, refs: set):
+    """Recursive AST walk that tracks inner-WITH shadow sets."""
+    if isinstance(node, exp.Table):
+        # Schema-qualified → external table, not a CTE reference
+        if not node.db:
+            name = node.name.lower()
+            if name in outer_names and name not in shadowed:
+                refs.add(name)
+        return  # Table nodes have no relevant children
+
+    # Detect inner WITH introducing new shadows
+    inner_with = None
+    inner_cte_names: frozenset = frozenset()
+    if isinstance(node, (exp.Select, exp.Union)):
+        inner_with = node.args.get("with")
+        if inner_with:
+            inner_cte_names = frozenset(
+                c.alias.lower() for c in inner_with.expressions
+            )
+
+    for child in node.iter_expressions():
+        if child is inner_with:
+            # Inner CTE bodies see the CURRENT shadow (not the new names),
+            # because a CTE definition cannot reference itself and can
+            # still reach outer CTEs of the same name.
+            for inner_cte in inner_with.expressions:
+                _walk_cte_refs(inner_cte.this, outer_names, shadowed, refs)
+        else:
+            # All other children (FROM, WHERE, SELECT list, etc.) see
+            # the expanded shadow set that includes inner CTE names.
+            _walk_cte_refs(
+                child, outer_names, shadowed | inner_cte_names, refs
+            )
+
+
 # ── CTE dependency reorder ──────────────────────────────────────────
 
 
@@ -1021,15 +1073,12 @@ def _reorder_ctes(script_ir: ScriptIR, dialect: str):
 
         cte_names = set(cte_by_name.keys())
 
-        # Find which CTE names each CTE body references
+        # Find which CTE names each CTE body references via AST,
+        # respecting schema-qualified refs and inner WITH shadowing.
         deps = {}  # cte_name → set of cte_names it depends on
         for cte in ctes:
             name = cte.alias.lower()
-            body_sql = cte.this.sql(dialect=dialect).lower()
-            deps[name] = set()
-            for other_name in cte_names:
-                if other_name != name and other_name in body_sql:
-                    deps[name].add(other_name)
+            deps[name] = _collect_cte_deps(cte.this, cte_names - {name})
 
         # Topological sort (Kahn's algorithm)
         in_degree = {n: 0 for n in cte_names}

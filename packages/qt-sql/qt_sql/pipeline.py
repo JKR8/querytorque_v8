@@ -759,6 +759,8 @@ class Pipeline:
         mode: OptimizationMode = OptimizationMode.SWARM,
         orchestrator=None,
         patch: bool = False,
+        benchmark_lock=None,
+        on_phase_change=None,
     ) -> SessionResult:
         """Run optimization session in specified mode.
 
@@ -770,11 +772,27 @@ class Pipeline:
             n_workers: Parallel workers per iteration
             mode: Optimization mode (oneshot, swarm)
             orchestrator: Optional Orchestrator for declarative composition
+            benchmark_lock: Optional threading.Lock for serializing benchmark
+                phases when running multiple sessions concurrently.
 
         Returns:
             SessionResult with the best result across all iterations
         """
-        if mode == OptimizationMode.ONESHOT:
+        if mode == OptimizationMode.ONESHOT and patch:
+            from .sessions.oneshot_patch_session import OneshotPatchSession
+            # Tiered patch mode: analyst (DeepSeek) → workers (qwen)
+            self.config.tiered_patch_enabled = True
+            self.config.benchmark_dsn = self.config.db_path_or_dsn
+            session = OneshotPatchSession(
+                pipeline=self,
+                query_id=query_id,
+                original_sql=sql,
+                target_speedup=target_speedup,
+                max_iterations=max_iterations,
+                patch=True,
+                benchmark_lock=benchmark_lock,
+            )
+        elif mode == OptimizationMode.ONESHOT:
             from .sessions.oneshot_session import OneshotSession
             session = OneshotSession(
                 pipeline=self,
@@ -801,6 +819,8 @@ class Pipeline:
         else:
             raise ValueError(f"Unknown optimization mode: {mode}")
 
+        if on_phase_change:
+            session.on_phase_change = on_phase_change
         return session.run()
 
     def promote(self, state_num: int) -> str:

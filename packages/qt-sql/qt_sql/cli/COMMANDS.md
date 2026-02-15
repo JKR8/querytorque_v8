@@ -25,9 +25,8 @@ Shows: config.json, queries count, explains coverage, knowledge, plan_scanner (P
 **Generate analyst prompts deterministically** (no LLM, Phases 1-3)
 
 ```
-qt prepare <benchmark>                            # all queries, swarm mode
+qt prepare <benchmark>                            # all queries, oneshot prompt context
 qt prepare postgres_dsb_76 -q query001_multi_i1   # single query
-qt prepare postgres_dsb_76 --mode oneshot          # oneshot mode prompt
 qt prepare duckdb_tpcds -q query088               # prefix match (all Q88 variants)
 qt prepare postgres_dsb_76 -o /tmp/prompts        # custom output dir
 qt prepare duckdb_tpcds --scenario duckdb_embedded # with scenario card
@@ -35,7 +34,7 @@ qt prepare duckdb_tpcds --bootstrap               # first-run mode (no gold exam
 qt prepare duckdb_tpcds --evidence                # include evidence bundle
 ```
 
-Options: `--query/-q` (repeatable), `--mode` (swarm/oneshot), `--force`, `--output-dir/-o`, `--bootstrap`, `--scenario`, `--evidence`
+Options: `--query/-q` (repeatable), `--force`, `--output-dir/-o`, `--bootstrap`, `--scenario`, `--evidence`
 
 Output: `benchmark/prepared/<timestamp>/` with `prompts/`, `context/`, `metadata/`, `original/`, `summary.json`
 
@@ -49,8 +48,9 @@ Wraps: `Pipeline._parse_logical_tree()` → `Pipeline.gather_analyst_context()` 
 
 ```
 qt run <benchmark>                                  # all queries
-qt run postgres_dsb_76 -q query001 --mode oneshot   # single query, oneshot mode
-qt run duckdb_tpcds --fan-out-only                  # state 0 only
+qt run postgres_dsb_76 -q query001 --mode oneshot   # single query, tiered analyst/worker flow
+qt run duckdb_tpcds --mode fleet                    # fleet survey/triage/execute/scorecard
+qt run duckdb_tpcds --single-iteration              # one analyst/worker/snipe round
 qt run postgres_dsb_76 --resume                     # resume from checkpoint
 qt run duckdb_tpcds --scenario duckdb_embedded      # with scenario card
 qt run postgres_dsb_76 --engine-version 17          # explicit engine version
@@ -59,7 +59,7 @@ qt run duckdb_tpcds --concurrency 4                 # parallel generation (4 thr
 qt run postgres_dsb_76 --config-boost               # SET LOCAL tuning on winners
 ```
 
-Options: `--query/-q`, `--mode`, `--max-iterations`, `--target-speedup`, `--fan-out-only`, `--resume`, `--output-dir/-o`, `--concurrency`, `--config-boost`, `--bootstrap`, `--scenario`, `--engine-version`, `--output-contract`
+Options: `--query/-q`, `--mode` (`oneshot`/`fleet`), `--max-iterations`, `--target-speedup`, `--single-iteration`, `--resume`, `--output-dir/-o`, `--concurrency`, `--config-boost`, `--bootstrap`, `--scenario`, `--engine-version`, `--output-contract`, `--dry-run` (fleet only)
 
 Output: `benchmark/runs/run_<timestamp>/` with per-query results + `summary.json` + `checkpoint.json`
 
@@ -240,7 +240,7 @@ Stages:
 2. **Fleet Detection**: Shared scans → index recommendations, config opportunities, statistics staleness
 3. **Quick-Win Fast Path**: Top 3 queries with >80% total pain → direct to Tier 3
 4. **Tier 2 (Light)**: Single-pass oneshot optimization (~5K tokens)
-5. **Tier 3 (Deep)**: Full swarm pipeline (~40-50K tokens)
+5. **Tier 3 (Deep)**: Tiered analyst/worker/snipe pipeline (~40-50K tokens)
 6. **Scorecard**: Business case with estimated savings, residuals, recommendations
 
 Output: Markdown scorecard (stdout or file)

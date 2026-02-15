@@ -420,8 +420,8 @@ class OneshotPatchSession(OptimizationSession):
         from ..patches.tiered_orchestrator import TieredOrchestrator
         from ..execution.database_utils import run_explain_analyze, run_explain_text
 
-        # Override target_speedup for tiered mode
-        target_speedup = getattr(self.pipeline.config, "target_speedup", 10.0)
+        # Use session-level target if set, fall back to config
+        target_speedup = self.target_speedup or getattr(self.pipeline.config, "target_speedup", 10.0)
 
         logger.info(
             f"[{self.query_id}] OneshotPatchSession TIERED: "

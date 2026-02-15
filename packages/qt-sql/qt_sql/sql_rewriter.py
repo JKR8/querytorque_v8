@@ -1138,10 +1138,11 @@ class SQLRewriter:
                     result = self._apply_patch(patch_data)
                     if result.success:
                         return result
-                    # Patch failed — fall through to DAP/legacy paths
+                    # Patch failed — log reason and fall through to DAP/legacy paths
+                    logger.warning(f"Patch apply returned error: {result.error}")
                     dap_warnings = result.warnings
                 except Exception as e:
-                    logger.warning(f"Patch application failed: {e}")
+                    logger.warning(f"Patch application exception: {e}")
 
             # ── Priority 1: DAP Component Payload ──
             if fmt == "dap":

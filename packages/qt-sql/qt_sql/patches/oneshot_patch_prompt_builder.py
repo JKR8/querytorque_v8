@@ -94,9 +94,17 @@ FAMILY_DESCRIPTIONS = {
 
 def format_family_section(
     family_id: str,
-    gold_example: Dict[str, Any]
+    gold_example: Dict[str, Any],
+    include_patch_plans: bool = True,
 ) -> str:
-    """Format a single family section with description + gold example patch plan."""
+    """Format a single family section with description + gold example.
+
+    Args:
+        family_id: Family letter (A-F).
+        gold_example: Gold example dict with original_sql, optimized_sql, ir_*, patch_plan.
+        include_patch_plans: If False, omit the PATCH PLAN JSON block.
+            Set False for tiered mode where the analyst doesn't generate patches.
+    """
 
     desc = FAMILY_DESCRIPTIONS[family_id]
 
@@ -153,14 +161,15 @@ def format_family_section(
         lines.append("**IR TARGET:**")
         lines.append(f"```\n{ir_target}\n```")
 
-    # Patch plan (if available)
-    patch_plan = gold_example.get("patch_plan")
-    if patch_plan:
-        lines.append("")
-        lines.append("**PATCH PLAN:**")
-        lines.append("```json")
-        lines.append(json.dumps(patch_plan, indent=2))
-        lines.append("```")
+    # Patch plan (if available and requested)
+    if include_patch_plans:
+        patch_plan = gold_example.get("patch_plan")
+        if patch_plan:
+            lines.append("")
+            lines.append("**PATCH PLAN:**")
+            lines.append("```json")
+            lines.append(json.dumps(patch_plan, indent=2))
+            lines.append("```")
 
     return "\n".join(lines)
 
@@ -175,8 +184,13 @@ def _build_prompt_body(
     all_5_examples: Dict[str, Dict[str, Any]],
     dialect: str,
     role_text: str,
+    include_patch_plans: bool = True,
 ) -> tuple[List[str], int]:
     """Build sections 1-5 shared by single-tier and tiered prompts.
+
+    Args:
+        include_patch_plans: If False, omit PATCH PLAN JSON from family sections.
+            Set False for tiered mode where the analyst doesn't generate patches.
 
     Returns:
         (sections, n_families) — list of section strings, count of families with plans.
@@ -220,9 +234,10 @@ def _build_prompt_body(
                            if f in all_5_examples and all_5_examples[f].get("patch_plan")]
     n_families = len(families_with_plans)
 
+    example_desc = "gold example" if not include_patch_plans else "gold example patch plan"
     sections.append(f"""## Optimization Families
 
-Review the {n_families} families below. Each shows a pattern with a gold example patch plan.
+Review the {n_families} families below. Each shows a pattern with a {example_desc}.
 
 Choose up to **{min(4, n_families)} most relevant families** for this query based on:
 - Query structure (CTEs, subqueries, joins, aggregations, set operations)
@@ -234,7 +249,7 @@ Choose up to **{min(4, n_families)} most relevant families** for this query base
     for family_id in all_family_ids:
         ex = all_5_examples.get(family_id)
         if ex and ex.get("patch_plan"):
-            sections.append(format_family_section(family_id, ex))
+            sections.append(format_family_section(family_id, ex, include_patch_plans))
             sections.append("")
 
     return sections, n_families
@@ -397,18 +412,19 @@ def build_oneshot_patch_prompt_tiered(
         Complete tiered analyst prompt string
     """
     role_text = (
-        "You are a SQL optimization analyst. Your task is to analyze this query "
-        "and design **up to 4 structural optimization targets**, each targeting "
-        "a different optimization family.\n\n"
+        "You are a SQL optimization analyst. Your task is to analyze this query, "
+        "identify the primary bottleneck, and design structural optimization targets.\n\n"
         "For each target, describe the STRUCTURAL SHAPE of the optimized query "
         "using an IR node map (CTE names, FROM tables, WHERE conditions, GROUP BY, ORDER BY). "
         "A separate code-generation worker will convert your targets into executable patch plans.\n\n"
-        "You will **choose up to 4 of the 6 families** based on relevance to THIS SPECIFIC QUERY."
+        "Identify the primary bottleneck. Only provide secondary targets if they are "
+        "distinct and high-confidence. **Quality > Quantity.**"
     )
 
     sections, n_families = _build_prompt_body(
         query_id, original_sql, explain_text, ir_node_map,
         all_5_examples, dialect, role_text,
+        include_patch_plans=False,
     )
 
     # ── Section 5b: Worker Routing ───────────────────────────────────────
@@ -428,7 +444,9 @@ The highest-relevance target always goes to W4. Design diverse targets across wo
     sections.append(
         f"## Your Task\n\n"
         f"Analyze this query against the {n_families} families above.\n\n"
-        f"Choose up to {n_to_choose} families that are most relevant. For each chosen family:\n"
+        f"Identify the **primary bottleneck**. Only provide secondary targets if they are "
+        f"distinct and high-confidence. Quality > Quantity.\n\n"
+        f"For each target (1 to {n_to_choose}):\n"
         f"1. Describe the bottleneck hypothesis\n"
         f"2. Design a TARGET IR node map showing what the optimized query SHOULD look like\n"
         f"3. Score relevance (0.0\u20131.0)\n"
@@ -587,6 +605,225 @@ def build_worker_retry_prompt(worker_prompt: str, error_msg: str) -> str:
         + f"\n\n## RETRY — Previous patch failed:\n{error_msg}\n\n"
         "Fix the error. Output ONLY the corrected JSON."
     )
+
+
+def build_worker_semantic_retry_prompt(
+    worker_prompt: str,
+    sem_result,
+    original_sql: str,
+    rewrite_sql: str,
+) -> str:
+    """Append semantic validation errors to a worker prompt for retry.
+
+    Args:
+        worker_prompt: Original worker prompt.
+        sem_result: SemanticValidationResult with diagnostic fields.
+        original_sql: Original query SQL.
+        rewrite_sql: The rewritten SQL that failed semantic validation.
+
+    Returns:
+        Prompt with semantic error context appended.
+    """
+    from ..validation.sql_differ import SQLDiffer
+
+    lines = [
+        worker_prompt,
+        "",
+        "## RETRY — Semantic validation FAILED",
+        "",
+        f"The patch produced SQL that returns DIFFERENT results from the original.",
+        "",
+    ]
+
+    # Error summary
+    if sem_result.errors:
+        lines.append("**Errors:**")
+        for err in sem_result.errors[:5]:
+            lines.append(f"- {err}")
+        lines.append("")
+
+    # Row count diff
+    if sem_result.row_count_diff:
+        rcd = sem_result.row_count_diff
+        lines.append(
+            f"**Row count mismatch** (on {rcd.sample_pct}% sample): "
+            f"original={rcd.original_count}, rewrite={rcd.rewrite_count} "
+            f"(diff={rcd.diff:+d})"
+        )
+        lines.append("")
+
+    # Value diffs
+    if sem_result.value_diffs:
+        formatted = SQLDiffer.format_value_diffs(sem_result.value_diffs)
+        if formatted:
+            lines.append("**Value differences:**")
+            lines.append(formatted)
+            lines.append("")
+
+    # Column mismatch
+    if sem_result.column_mismatch:
+        cm = sem_result.column_mismatch
+        if cm.missing:
+            lines.append(f"**Missing columns**: {', '.join(cm.missing)}")
+        if cm.extra:
+            lines.append(f"**Extra columns**: {', '.join(cm.extra)}")
+        lines.append("")
+
+    # SQL diff
+    sql_diff = SQLDiffer.unified_diff(original_sql, rewrite_sql)
+    if sql_diff:
+        lines.append("**SQL diff (original → rewrite):**")
+        # Truncate to 30 lines
+        diff_lines = sql_diff.split("\n")[:30]
+        lines.append("```diff")
+        lines.extend(diff_lines)
+        if len(sql_diff.split("\n")) > 30:
+            lines.append("... (truncated)")
+        lines.append("```")
+        lines.append("")
+
+    lines.append("Fix the semantic error. Output ONLY the corrected JSON.")
+    return "\n".join(lines)
+
+
+def build_tiered_snipe_prompt(
+    query_id: str,
+    original_sql: str,
+    explain_text: str,
+    ir_node_map: str,
+    all_5_examples: Dict[str, Dict[str, Any]],
+    dialect: str,
+    patches: List[Any],
+    patch_explains: Dict[str, str],
+) -> str:
+    """Build snipe prompt for the analyst after seeing benchmark results.
+
+    Reuses sections 1-5 from the tiered prompt, then adds results table,
+    EXPLAIN plans, patched SQL, and asks for refined targets.
+
+    Args:
+        query_id: Query identifier.
+        original_sql: Full original SQL.
+        explain_text: EXPLAIN ANALYZE output for the original query.
+        ir_node_map: IR node map.
+        all_5_examples: Gold examples dict.
+        dialect: SQL dialect.
+        patches: List of AppliedPatch objects with benchmark results.
+        patch_explains: Dict mapping patch_id → EXPLAIN text.
+
+    Returns:
+        Complete snipe prompt string.
+    """
+    role_text = (
+        "You are a SQL optimization analyst reviewing benchmark results. "
+        "Analyze what worked, what failed, and design refined targets "
+        "for the next round of workers.\n\n"
+        "Identify the primary bottleneck. Only provide secondary targets if they are "
+        "distinct and high-confidence. Quality > Quantity.\n\n"
+        "You will see the original query, execution plan, IR structure, "
+        "and detailed results from the previous round."
+    )
+
+    sections, n_families = _build_prompt_body(
+        query_id, original_sql, explain_text, ir_node_map,
+        all_5_examples, dialect, role_text,
+        include_patch_plans=False,
+    )
+
+    # ── Section 6: Results Table ──────────────────────────────────────
+    sections.append("## Previous Round Results\n")
+    sections.append(
+        "| Patch | Family | Transform | Semantic | Speedup | Status "
+        "| Orig ms | Patch ms | Error |"
+    )
+    sections.append(
+        "|-------|--------|-----------|----------|---------|--------"
+        "|---------|----------|-------|"
+    )
+
+    for p in patches:
+        speedup_str = f"{p.speedup:.2f}x" if p.speedup is not None else "—"
+        orig_str = f"{p.original_ms:.0f}" if p.original_ms is not None else "—"
+        patch_str = f"{p.patch_ms:.0f}" if p.patch_ms is not None else "—"
+        sem_str = "PASS" if p.semantic_passed else "FAIL"
+        err_str = (p.apply_error or "")[:60]
+        sections.append(
+            f"| {p.patch_id} | {p.family} | {p.transform} | "
+            f"{sem_str} | {speedup_str} | {p.status} | "
+            f"{orig_str} | {patch_str} | {err_str} |"
+        )
+    sections.append("")
+
+    # ── Section 7: EXPLAIN Plans ──────────────────────────────────────
+    sections.append("## Execution Plans\n")
+    orig_explain_display = "\n".join(explain_text.split("\n")[:60])
+    sections.append("**Original EXPLAIN:**")
+    sections.append(f"```\n{orig_explain_display}\n```\n")
+
+    for p in patches:
+        if p.patch_id in patch_explains and patch_explains[p.patch_id]:
+            plan = patch_explains[p.patch_id]
+            truncated = "\n".join(plan.split("\n")[:60])
+            speedup_str = f"{p.speedup:.2f}x" if p.speedup is not None else "?"
+            sections.append(
+                f"**{p.patch_id} (Family {p.family}, {speedup_str} {p.status}) EXPLAIN:**"
+            )
+            sections.append(f"```\n{truncated}\n```\n")
+
+    # ── Section 8: Patched SQL ────────────────────────────────────────
+    sections.append("## Patched SQL\n")
+    for p in patches:
+        if p.output_sql:
+            sql_lines = p.output_sql.strip().split("\n")[:30]
+            sql_display = "\n".join(sql_lines)
+            if len(p.output_sql.strip().split("\n")) > 30:
+                sql_display += "\n-- ... (truncated)"
+            label = f"{p.patch_id} (Family {p.family}, {p.transform})"
+            if p.speedup is not None:
+                label += f" — {p.speedup:.2f}x {p.status}"
+            sections.append(f"**{label}:**")
+            sections.append(f"```sql\n{sql_display}\n```\n")
+        else:
+            sections.append(
+                f"**{p.patch_id}** (Family {p.family}): "
+                f"FAILED — {p.apply_error or 'unknown error'}\n"
+            )
+
+    # ── Section 9: Task ───────────────────────────────────────────────
+    n_to_choose = min(4, n_families)
+    sections.append(f"""## Your Task — Refined Targets
+
+Analyze the results above:
+- **WINs**: Can you push further? Combine with another family? Layer a second transform on top?
+- **NEUTRALs**: What went wrong? Look at EXPLAIN. Fix the approach or try a compound strategy.
+- **FAILs/ERRORs**: What caused the failure? Propose a different strategy.
+- **REGRESSIONs**: Why slower? Avoid that pattern.
+
+Design 1 to {n_to_choose} refined optimization targets. Same JSON output format:
+
+```json
+[
+  {{
+    "family": "A+B",
+    "transform": "early_filter_then_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Decorrelation worked (7.8x) but scan is still wide. Push date filter into CTE first, then decorrelate on the filtered set.",
+    "target_ir": "...",
+    "recommended_examples": ["date_cte_isolate", "shared_scan_decorrelate"]
+  }}
+]
+```
+
+**Combined families**: You MAY combine families in a single target (e.g. "A+B", "B+E", "A+F").
+Use this when one transform sets up conditions for another — e.g. early filtering (A) reduces
+the scan before decorrelation (B), or decorrelation (B) creates a CTE that enables
+materialization reuse (E). The worker will receive gold examples from ALL referenced families.
+
+Output up to {n_to_choose} targets. Fewer strong targets beat padding with weak ones.
+""")
+
+    return "\n\n".join(sections)
 
 
 # ── Helper: Load Gold Examples ─────────────────────────────────────────────

@@ -16,23 +16,25 @@ import click
 @click.option("-q", "--query", multiple=True, help="Query filter (repeatable, prefix match).")
 @click.option(
     "--mode",
-    type=click.Choice(["swarm", "oneshot"]),
-    default="swarm",
+    type=click.Choice(["oneshot", "fleet"]),
+    default="oneshot",
     show_default=True,
-    help="Optimization mode: swarm (multi-worker) or oneshot (single call).",
+    help="Execution mode: oneshot (analyst/worker loop) or fleet (multi-query orchestration).",
 )
 @click.option("--max-iterations", type=int, default=3, show_default=True,
               help="Max optimization rounds per query.")
 @click.option("--target-speedup", type=float, default=2.0, show_default=True,
               help="Stop early when this speedup is reached.")
-@click.option("--fan-out-only", is_flag=True,
-              help="Run fan-out (state 0) only, skip refinement.")
+@click.option("--single-iteration", is_flag=True,
+              help="Run one analyst/worker/snipe round only.")
+@click.option("--fan-out-only", "fan_out_only_legacy", is_flag=True, hidden=True,
+              help="Deprecated alias for --single-iteration.")
 @click.option("--resume", is_flag=True,
               help="Resume from last checkpoint in the run directory.")
 @click.option("-o", "--output-dir", type=click.Path(), default=None,
               help="Custom output directory (default: benchmark/runs/<timestamp>).")
 @click.option("--concurrency", type=int, default=0,
-              help="Parallel LLM generation concurrency (0=serial, N=two-phase with N threads).")
+              help="Parallel query concurrency (0=serial).")
 @click.option("--config-boost", "config_boost", is_flag=True,
               help="Run config boost (SET LOCAL tuning) on winners after validation.")
 @click.option("--bootstrap", is_flag=True,
@@ -43,12 +45,12 @@ import click
               help="Engine version override (e.g., '17' for PG, '1.2' for DuckDB).")
 @click.option("--output-contract", is_flag=True,
               help="Emit structured QueryOutputContract JSON alongside results.")
-@click.option("--patch", "patch_mode", is_flag=True,
-              help="Use IR patch plans instead of full SQL rewrites.")
-@click.option("--fleet", is_flag=True,
-              help="Fleet mode: survey, triage, parallel execute all queries.")
+@click.option("--patch", "patch_mode", is_flag=True, hidden=True,
+              help="Deprecated. Oneshot now always runs tiered patch flow.")
+@click.option("--fleet", "fleet_legacy", is_flag=True, hidden=True,
+              help="Deprecated alias for --mode fleet.")
 @click.option("--dry-run", "dry_run", is_flag=True,
-              help="With --fleet: run survey + triage only, no LLM calls.")
+              help="With --mode fleet: run survey + triage only, no LLM calls.")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -57,7 +59,8 @@ def run(
     mode: str,
     max_iterations: int,
     target_speedup: float,
-    fan_out_only: bool,
+    single_iteration: bool,
+    fan_out_only_legacy: bool,
     resume: bool,
     output_dir: str | None,
     concurrency: int,
@@ -67,17 +70,13 @@ def run(
     engine_version: str,
     output_contract: bool,
     patch_mode: bool,
-    fleet: bool,
+    fleet_legacy: bool,
     dry_run: bool,
 ) -> None:
     """Run the full optimization pipeline (requires LLM API key).
 
-    With --concurrency N: Phase 1 generates all candidates in parallel (N threads),
-    then Phase 2 validates each query serially (avoids DB contention).
-    Without --concurrency (or =0): sequential per-query execution (original behavior).
-
-    With --patch: Uses tiered IR patch mode (analyst → workers → patch engine).
-    Defaults to oneshot mode with 10x target speedup.
+    Oneshot mode uses the tiered analyst/worker/snipe patch pipeline.
+    Fleet mode runs survey/triage/parallel execute/scorecard across many queries.
     """
     from ._common import (
         console,
@@ -89,12 +88,16 @@ def run(
         print_success,
     )
 
-    # Patch mode defaults: oneshot + 10x target
-    if patch_mode:
-        if mode == "swarm":
-            mode = "oneshot"
-        if target_speedup == 2.0:  # user didn't override
-            target_speedup = 10.0
+    if fleet_legacy:
+        mode = "fleet"
+
+    if dry_run and mode != "fleet":
+        print_error("--dry-run is only valid with --mode fleet.")
+        raise SystemExit(2)
+
+    # Oneshot is now the canonical tiered analyst/worker/snipe flow.
+    patch_mode = True
+    single_iteration = single_iteration or fan_out_only_legacy
 
     bench_dir = resolve_benchmark(benchmark)
     cfg = load_benchmark_config(bench_dir)
@@ -131,25 +134,17 @@ def run(
         os.environ["QT_ALLOW_INTELLIGENCE_BOOTSTRAP"] = "1"
 
     mode_map = {
-        "swarm": OptimizationMode.SWARM,
         "oneshot": OptimizationMode.ONESHOT,
     }
 
     pipeline = Pipeline(bench_dir)
-    iters = 1 if fan_out_only else max_iterations
+    iters = 1 if single_iteration else max_iterations
     n_workers = cfg.get("workers_state_0", 4)
 
     # ── Fleet mode: survey → triage → parallel execute → scorecard ────
-    if fleet:
+    if mode == "fleet":
         from ..fleet.orchestrator import FleetOrchestrator
         from ..fleet.dashboard import FleetDashboard
-
-        # Fleet implies patch mode
-        if not patch_mode:
-            patch_mode = True
-            mode = "oneshot"
-            if target_speedup == 2.0:
-                target_speedup = 10.0
 
         # Load queries dict for survey
         queries_dict = {}
@@ -210,6 +205,7 @@ def run(
 
         # Phase 2: Execute
         console.print(f"\n[bold]Phase 2: Execute[/bold] (concurrency={concurrency or 4})")
+        t0 = time.time()
         dashboard.start()
         try:
             results = orch.execute(triaged, completed_ids, out, checkpoint_path)
@@ -259,7 +255,7 @@ def run(
     errors = []
     t0 = time.time()
 
-    # Parallel patch mode: LLM concurrent, benchmark serialized
+    # Parallel tiered oneshot: LLM concurrent, benchmark serialized
     if concurrency > 0 and patch_mode:
         _run_patch_parallel(
             pipeline=pipeline,
@@ -274,24 +270,6 @@ def run(
             results=results,
             errors=errors,
             console=console,
-        )
-    # Two-phase parallel execution (swarm mode only)
-    elif concurrency > 0 and mode == "swarm":
-        _run_two_phase(
-            pipeline=pipeline,
-            query_ids=query_ids,
-            completed_ids=completed_ids,
-            bench_dir=bench_dir,
-            out=out,
-            checkpoint_path=checkpoint_path,
-            max_iterations=iters,
-            target_speedup=target_speedup,
-            concurrency=concurrency,
-            results=results,
-            errors=errors,
-            console=console,
-            orchestrator=orchestrator,
-            patch_mode=patch_mode,
         )
     else:
         _run_serial(
@@ -521,191 +499,6 @@ def _run_patch_parallel(
         f"\n  Patch parallel complete: {len(results)}/{len(work_items)} "
         f"in {elapsed:.1f}s"
     )
-
-
-def _run_two_phase(
-    *,
-    pipeline,
-    query_ids,
-    completed_ids,
-    bench_dir,
-    out,
-    checkpoint_path,
-    max_iterations,
-    target_speedup,
-    concurrency,
-    results,
-    errors,
-    console,
-    orchestrator=None,
-    patch_mode=False,
-) -> None:
-    """Two-phase execution: generate all candidates in parallel, then validate serially."""
-    from ..sessions.swarm_session import SwarmSession
-
-    # Build sessions for queries that need work
-    sessions: list[tuple[str, SwarmSession]] = []
-    error_qids: set[str] = set()
-
-    sessions_dir = bench_dir / "swarm_sessions"
-    for qid in query_ids:
-        if qid in completed_ids:
-            continue
-        # Skip queries that already have a completed session.json
-        if (sessions_dir / qid / "session.json").exists():
-            completed_ids.add(qid)
-            console.print(f"  {qid} [dim]already complete (session.json)[/dim]")
-            continue
-        sql_path = bench_dir / "queries" / f"{qid}.sql"
-        if not sql_path.exists():
-            errors.append((qid, "SQL file not found"))
-            error_qids.add(qid)
-            continue
-
-        sql = sql_path.read_text().strip()
-        session = SwarmSession(
-            pipeline=pipeline,
-            query_id=qid,
-            original_sql=sql,
-            max_iterations=max_iterations,
-            target_speedup=target_speedup,
-            n_workers=4,
-            orchestrator=orchestrator,
-            patch=patch_mode,
-        )
-        sessions.append((qid, session))
-
-    if not sessions:
-        console.print("  No queries to process.")
-        return
-
-    # ── Phase 1: Generate candidates (reload from disk or LLM) ─────────
-    # Try to reload existing candidates from disk first (no API cost)
-    need_workers_only: list[tuple[str, SwarmSession]] = []
-    need_full_generation: list[tuple[str, SwarmSession]] = []
-    reloaded = 0
-
-    for qid, session in sessions:
-        if session.reload_candidates_from_disk():
-            reloaded += 1
-        else:
-            # Check if analyst response exists on disk (can skip analyst LLM)
-            session_dir = bench_dir / "swarm_sessions" / qid / "iteration_00_fan_out"
-            if (session_dir / "analyst_response.txt").exists():
-                need_workers_only.append((qid, session))
-            else:
-                need_full_generation.append((qid, session))
-
-    if reloaded:
-        console.print(f"  Reloaded {reloaded} sessions from disk (no LLM calls)")
-
-    # Resume sessions that have analyst on disk but need worker generation
-    if need_workers_only:
-        console.print(
-            f"\n{'='*60}\n"
-            f"  PHASE 1a: Resume {len(need_workers_only)} queries from saved analyst (workers only, {concurrency} threads)\n"
-            f"{'='*60}",
-        )
-        t_gen = time.time()
-
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = {}
-            for qid, session in need_workers_only:
-                futures[pool.submit(session.resume_from_analyst)] = qid
-
-            for future in as_completed(futures):
-                qid = futures[future]
-                try:
-                    ok = future.result()
-                    if ok:
-                        console.print(f"  [resumed] {qid}")
-                        reloaded += 1
-                    else:
-                        console.print(f"  [resume-fail] {qid} — will regenerate fully")
-                        # Find the session and move to full generation
-                        for q, s in need_workers_only:
-                            if q == qid:
-                                need_full_generation.append((q, s))
-                                break
-                except Exception as e:
-                    errors.append((qid, f"Resume failed: {e}"))
-                    error_qids.add(qid)
-                    console.print(f"  [resume-error] {qid}: {e}")
-
-        console.print(f"\n  Phase 1a complete: {reloaded} resumed ({time.time() - t_gen:.1f}s)")
-
-    # Full generation for sessions with nothing on disk
-    if need_full_generation:
-        console.print(
-            f"\n{'='*60}\n"
-            f"  PHASE 1b: Generate candidates ({len(need_full_generation)} queries, {concurrency} threads)\n"
-            f"{'='*60}",
-        )
-        t_gen = time.time()
-
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = {}
-            for qid, session in need_full_generation:
-                futures[pool.submit(session.prepare_candidates)] = qid
-
-            for future in as_completed(futures):
-                qid = futures[future]
-                try:
-                    future.result()
-                    console.print(f"  [generated] {qid}")
-                except Exception as e:
-                    errors.append((qid, f"Generation failed: {e}"))
-                    error_qids.add(qid)
-                    console.print(f"  [gen-error] {qid}: {e}")
-
-        gen_elapsed = time.time() - t_gen
-        console.print(f"\n  Phase 1b complete: {len(need_full_generation) - len(error_qids)} generated, "
-                      f"{len(error_qids)} errors ({gen_elapsed:.1f}s)")
-
-    if not need_workers_only and not need_full_generation:
-        console.print(f"\n  Phase 1 skipped: all {reloaded} sessions reloaded from disk")
-
-    gen_ok = len(sessions) - len(error_qids)
-
-    # Free large prompt/response text from memory (already on disk)
-    for _qid, session in sessions:
-        if _qid not in error_qids:
-            session.compact_gen_result()
-
-    # ── Phase 2: Validate with limited parallelism ─────────────────────
-    val_sessions = [(qid, s) for qid, s in sessions if qid not in error_qids]
-
-    if not val_sessions:
-        console.print("\n  No successful generations to validate.")
-        return
-
-    val_concurrency = min(4, len(val_sessions))
-    console.print(
-        f"\n{'='*60}\n"
-        f"  PHASE 2: Validate & snipe ({len(val_sessions)} queries, {val_concurrency} parallel)\n"
-        f"{'='*60}",
-    )
-
-    def _validate_one(qid_session):
-        qid, session = qid_session
-        result = session.validate_and_finish()
-        return qid, result
-
-    with ThreadPoolExecutor(max_workers=val_concurrency) as pool:
-        futures = {pool.submit(_validate_one, qs): qs[0] for qs in val_sessions}
-
-        for future in as_completed(futures):
-            qid = futures[future]
-            try:
-                qid, result = future.result()
-                _save_query_result(result, qid, out, checkpoint_path, completed_ids, results)
-                speedup = getattr(result, "best_speedup", None) or getattr(result, "speedup", None)
-                status_str = getattr(result, "status", "?")
-                console.print(f"  {qid}: [green]{status_str}[/green] {speedup or '?'}x")
-
-            except Exception as e:
-                errors.append((qid, f"Validation failed: {e}"))
-                console.print(f"  {qid}: [red]ERROR[/red] {e}")
 
 
 def _save_query_result(result, qid, out, checkpoint_path, completed_ids, results):

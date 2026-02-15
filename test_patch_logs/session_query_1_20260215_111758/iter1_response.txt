@@ -1,0 +1,203 @@
+Based on the analysis of the query structure, execution plan, and previous optimization attempts, I propose the following 4 patch plans targeting the most relevant optimization families. The patches are ordered by relevance score.
+
+```json
+[
+  {
+    "family": "B",
+    "transform": "decorrelate_avg_subquery",
+    "plan_id": "t1_family_b_v2",
+    "relevance_score": 0.95,
+    "reasoning": "Correlated subquery computing average per store is the main bottleneck. Decorrelation converts O(N*M) nested loop into single hash join.",
+    "steps": [
+      {
+        "step_id": "s1",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "store_avg_return",
+          "cte_query_sql": "SELECT ctr_store_sk, AVG(ctr_total_return) * 1.2 AS threshold FROM customer_total_return GROUP BY ctr_store_sk"
+        },
+        "description": "Precompute per-store threshold in standalone CTE"
+      },
+      {
+        "step_id": "s2",
+        "op": "replace_where_predicate",
+        "target": {
+          "by_node_id": "S0",
+          "by_anchor_hash": "e5b7485395ff5a80"
+        },
+        "payload": {
+          "expr_sql": "ctr1.ctr_total_return > sar.threshold"
+        },
+        "description": "Replace correlated subquery with CTE reference"
+      },
+      {
+        "step_id": "s3",
+        "op": "replace_from",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "from_sql": "customer_total_return ctr1 INNER JOIN store_avg_return sar ON ctr1.ctr_store_sk = sar.ctr_store_sk, store, customer"
+        },
+        "description": "Add explicit JOIN to precomputed thresholds"
+      }
+    ]
+  },
+  {
+    "family": "A",
+    "transform": "state_filter_pushdown",
+    "plan_id": "t2_family_a_v2",
+    "relevance_score": 0.85,
+    "reasoning": "Store filter (s_state='SD') is applied late after expensive joins. Pushing it into CTE reduces aggregation workload.",
+    "steps": [
+      {
+        "step_id": "s1",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "filtered_stores",
+          "cte_query_sql": "SELECT s_store_sk FROM store WHERE s_state = 'SD'"
+        },
+        "description": "Pre-filter stores by state"
+      },
+      {
+        "step_id": "s2",
+        "op": "replace_block_with_cte_pair",
+        "target": {
+          "by_node_id": "S0",
+          "by_label": "customer_total_return"
+        },
+        "payload": {
+          "sql_fragment": "customer_total_return AS (SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns INNER JOIN date_dim ON sr_returned_date_sk = d_date_sk INNER JOIN filtered_stores ON sr_store_sk = s_store_sk WHERE d_year = 2000 GROUP BY sr_customer_sk, sr_store_sk)"
+        },
+        "description": "Push store filter into CTE via early join"
+      }
+    ]
+  },
+  {
+    "family": "E",
+    "transform": "dimension_prefetch",
+    "plan_id": "t3_family_e_v2",
+    "relevance_score": 0.80,
+    "reasoning": "Multiple dimension filters (date+store) applied independently. Prefetching reduces repeated scans.",
+    "steps": [
+      {
+        "step_id": "s1",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "filtered_dates",
+          "cte_query_sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 2000"
+        },
+        "description": "Prefilter date dimension"
+      },
+      {
+        "step_id": "s2",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "filtered_stores",
+          "cte_query_sql": "SELECT s_store_sk, s_state FROM store WHERE s_state = 'SD'"
+        },
+        "description": "Prefilter store dimension"
+      },
+      {
+        "step_id": "s3",
+        "op": "replace_block_with_cte_pair",
+        "target": {
+          "by_node_id": "S0",
+          "by_label": "customer_total_return"
+        },
+        "payload": {
+          "sql_fragment": "customer_total_return AS (SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns INNER JOIN filtered_dates ON sr_returned_date_sk = d_date_sk GROUP BY sr_customer_sk, sr_store_sk)"
+        },
+        "description": "Use prefetched dimensions in CTE"
+      },
+      {
+        "step_id": "s4",
+        "op": "replace_from",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "from_sql": "customer_total_return ctr1, filtered_stores s, customer"
+        },
+        "description": "Use prefetched stores in main query"
+      }
+    ]
+  },
+  {
+    "family": "C",
+    "transform": "agg_pushdown",
+    "plan_id": "t4_family_c_v2",
+    "relevance_score": 0.70,
+    "reasoning": "Original CTE aggregates after joining large tables. Pushing aggregation earlier reduces join costs.",
+    "steps": [
+      {
+        "step_id": "s1",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "date_filtered_returns",
+          "cte_query_sql": "SELECT sr_customer_sk, sr_store_sk, SUM(SR_FEE) AS ctr_total_return FROM store_returns JOIN date_dim ON sr_returned_date_sk = d_date_sk WHERE d_year = 2000 GROUP BY sr_customer_sk, sr_store_sk"
+        },
+        "description": "Pre-aggregate after date filter"
+      },
+      {
+        "step_id": "s2",
+        "op": "replace_block_with_cte_pair",
+        "target": {
+          "by_node_id": "S0",
+          "by_label": "customer_total_return"
+        },
+        "payload": {
+          "sql_fragment": "customer_total_return AS (SELECT sr_customer_sk AS ctr_customer_sk, sr_store_sk AS ctr_store_sk, ctr_total_return FROM date_filtered_returns)"
+        },
+        "description": "Replace original CTE with pre-aggregated version"
+      }
+    ]
+  }
+]
+```
+
+## Analysis
+
+### Family Relevance Assessment
+1. **Family B (Decorrelation) - HIGH**: The correlated subquery computing average per store is the primary bottleneck. The execution plan shows a nested loop (DELIM_SCAN pattern), making this the highest-value optimization.
+   
+2. **Family A (Early Filtering) - HIGH**: The store filter (s_state='SD') is applied late after expensive joins. Pushing it into the CTE reduces aggregation workload significantly.
+
+3. **Family E (Materialization) - MEDIUM**: Prefetching date and store dimensions avoids repeated full table scans. The execution plan shows multiple independent dimension filters.
+
+4. **Family C (Aggregation Pushdown) - MEDIUM**: Aggregation happens after joining large tables. Pushing aggregation earlier could reduce intermediate result sizes.
+
+5. **Family D (Set Operations) - LOW**: The query contains no set operations (UNION/INTERSECT), making this family irrelevant.
+
+### Chosen Families
+[B, A, E, C] - Selected based on query structure and execution plan patterns.
+
+### Expected Speedups
+- t1_family_b_v2: 2.5-3.0x (decorrelation main bottleneck)
+- t2_family_a_v2: 1.5-2.0x (early filtering reduces aggregation input)
+- t3_family_e_v2: 1.3-1.8x (prefetching avoids repeated dimension scans)
+- t4_family_c_v2: 1.2-1.5x (earlier aggregation reduces join costs)
+
+### Confidence
+**HIGH** for all families:
+1. Decorrelation directly targets the correlated subquery (DELIM_SCAN in plan)
+2. Early filtering addresses late-applied dimension filters
+3. Prefetching optimizes multiple independent dimension accesses
+4. Aggregation pushdown follows standard optimization patterns for star schemas
+
+All patches maintain semantic equivalence by preserving filter conditions and join relationships while only changing computation order. Error fixes from previous attempts include proper CTE ordering and identifier handling.

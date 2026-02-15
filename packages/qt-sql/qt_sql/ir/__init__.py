@@ -234,7 +234,10 @@ def _dict_to_plan(data: dict) -> PatchPlan:
         try:
             dialect = Dialect(raw_dialect)
         except ValueError:
-            dialect = Dialect.POSTGRES  # safe default
+            raise ValueError(
+                f"Unknown patch plan dialect: {raw_dialect!r}. "
+                f"Expected one of: duckdb, postgres/postgresql, snowflake"
+            )
 
     return PatchPlan(
         plan_id=data["plan_id"],

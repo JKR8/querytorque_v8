@@ -119,8 +119,9 @@ class BenchmarkConfig:
 
     # Tiered patch mode (analyst + worker split)
     tiered_patch_enabled: bool = False
-    analyst_model: str = "deepseek/deepseek-reasoner"
+    analyst_model: str = "deepseek/deepseek-r1"
     worker_model: str = "qwen/qwen3-coder"
+    target_speedup: float = 10.0
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> BenchmarkConfig:
@@ -146,8 +147,9 @@ class BenchmarkConfig:
             semantic_sample_pct=data.get("semantic_sample_pct", 2.0),
             semantic_timeout_ms=data.get("semantic_timeout_ms", 30_000),
             tiered_patch_enabled=data.get("tiered_patch_enabled", False),
-            analyst_model=data.get("analyst_model", "deepseek/deepseek-reasoner"),
+            analyst_model=data.get("analyst_model", "deepseek/deepseek-r1"),
             worker_model=data.get("worker_model", "qwen/qwen3-coder"),
+            target_speedup=data.get("target_speedup", 10.0),
         )
 
 
