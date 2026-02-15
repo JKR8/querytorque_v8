@@ -246,9 +246,14 @@ class TieredOrchestrator:
                 )
                 worker_prompt += "\n".join(extra_lines)
 
+            # Capture worker role for logging
+            patch.worker_role = worker_role.get("key", "?")
+            patch.worker_prompt = worker_prompt
+
             # Call worker LLM
             try:
                 worker_response = self.worker_call_fn(worker_prompt)
+                patch.worker_response = worker_response
                 with api_lock:
                     api_call_count[0] += 1
             except Exception as e:

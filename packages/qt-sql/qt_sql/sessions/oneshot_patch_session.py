@@ -55,6 +55,9 @@ class AppliedPatch:
     original_ms: Optional[float] = None
     patch_ms: Optional[float] = None
     raw_plan: Optional[dict] = None  # preserve original LLM JSON for retry/snipe
+    worker_prompt: Optional[str] = None   # raw prompt sent to worker LLM
+    worker_response: Optional[str] = None  # raw response from worker LLM
+    worker_role: Optional[str] = None      # W1/W2/W3/W4
 
 
 @dataclass
@@ -593,16 +596,27 @@ class OneshotPatchSession(OptimizationSession):
                 f"{len(applied)}/{len(patches)} patches applied"
             )
 
-            # Save worker outputs
+            # Save worker outputs (full prompts, responses, and results)
             for p in patches:
                 status = "OK" if p.output_sql else f"FAIL: {p.apply_error}"
+                role = p.worker_role or "?"
                 self._save_to_disk(
-                    session_dir, iteration, f"worker_{p.patch_id}",
-                    f"Family: {p.family}\nTransform: {p.transform}\n"
-                    f"Status: {status}\n\n"
+                    session_dir, iteration, f"worker_{p.patch_id}_summary",
+                    f"Worker Role: {role}\nFamily: {p.family}\n"
+                    f"Transform: {p.transform}\nStatus: {status}\n\n"
                     f"{'--- OUTPUT SQL ---' if p.output_sql else '--- NO OUTPUT ---'}\n"
                     f"{p.output_sql or p.apply_error or 'N/A'}"
                 )
+                if p.worker_prompt:
+                    self._save_to_disk(
+                        session_dir, iteration, f"worker_{p.patch_id}_prompt",
+                        p.worker_prompt,
+                    )
+                if p.worker_response:
+                    self._save_to_disk(
+                        session_dir, iteration, f"worker_{p.patch_id}_response",
+                        p.worker_response,
+                    )
 
             # ── Phase 3: Apply-error retry for failed patches ────────
             logger.info(f"[{self.query_id}] Phase 3: apply-error retries")
@@ -976,22 +990,35 @@ class OneshotPatchSession(OptimizationSession):
         """
         from ..generate import CandidateGenerator
 
-        if not model_spec:
-            generator = CandidateGenerator(
-                provider=self.pipeline.provider,
-                model=self.pipeline.model,
-                analyze_fn=self.pipeline.analyze_fn,
-            )
-        else:
-            # Pass model_spec as-is to the pipeline's provider (e.g. OpenRouter)
-            # OpenRouter accepts "vendor/model" format natively
-            generator = CandidateGenerator(
-                provider=self.pipeline.provider,
-                model=model_spec,
-                analyze_fn=self.pipeline.analyze_fn,
-            )
+        effective_model = model_spec or self.pipeline.model
+        effective_provider = self.pipeline.provider
 
-        return lambda prompt: self._call_llm_with_timeout(generator, prompt)
+        logger.info(
+            f"[{self.query_id}] LLM call fn: "
+            f"provider={effective_provider}, model={effective_model}"
+        )
+
+        generator = CandidateGenerator(
+            provider=effective_provider,
+            model=effective_model,
+            analyze_fn=self.pipeline.analyze_fn,
+        )
+
+        def call_fn(prompt: str) -> str:
+            logger.info(
+                f"[{self.query_id}] LLM call → {effective_model} "
+                f"({len(prompt)} chars prompt)"
+            )
+            t0 = time.time()
+            result = self._call_llm_with_timeout(generator, prompt)
+            elapsed = time.time() - t0
+            logger.info(
+                f"[{self.query_id}] LLM done ← {effective_model} "
+                f"({len(result)} chars response, {elapsed:.1f}s)"
+            )
+            return result
+
+        return call_fn
 
     # ── Internal Methods ────────────────────────────────────────────────────
 
@@ -1041,9 +1068,34 @@ class OneshotPatchSession(OptimizationSession):
     def _create_session_dir(self) -> Path:
         """Create a session directory for disk persistence."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        session_dir = Path("test_patch_logs") / f"session_{self.query_id}_{timestamp}"
+        session_dir = (
+            self.pipeline.benchmark_dir
+            / "beam_sessions"
+            / f"{self.query_id}_{timestamp}"
+        )
         session_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"[{self.query_id}] Session dir: {session_dir}")
+
+        # Write session metadata
+        metadata = {
+            "query_id": self.query_id,
+            "timestamp": datetime.now().isoformat(),
+            "engine": self.pipeline.config.engine,
+            "benchmark": self.pipeline.config.benchmark,
+            "db_path": self.pipeline.config.db_path_or_dsn,
+            "scale_factor": self.pipeline.config.scale_factor,
+            "max_iterations": self.max_iterations,
+            "target_speedup": self.target_speedup,
+            "analyst_model": getattr(self.pipeline.config, "analyst_model", "?"),
+            "worker_model": getattr(self.pipeline.config, "worker_model", "?"),
+            "provider": self.pipeline.provider or "?",
+            "semantic_validation_enabled": self.pipeline.config.semantic_validation_enabled,
+            "semantic_sample_pct": self.pipeline.config.semantic_sample_pct,
+            "validation_method": self.pipeline.config.validation_method,
+        }
+        (session_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2)
+        )
         return session_dir
 
     def _save_to_disk(self, session_dir: Path, iteration: int, label: str, content: str) -> None:
@@ -1410,6 +1462,7 @@ class OneshotPatchSession(OptimizationSession):
             "n_api_calls": it.n_api_calls,
             "best_speedup": round(it.best_speedup, 2),
             "best_patch_id": it.best_patch_id,
+            "best_sql": it.best_sql,
             "patches": [
                 {
                     "patch_id": p.patch_id,
@@ -1422,7 +1475,10 @@ class OneshotPatchSession(OptimizationSession):
                     "error": p.apply_error,
                     "original_ms": round(p.original_ms, 1) if p.original_ms is not None else None,
                     "patch_ms": round(p.patch_ms, 1) if p.patch_ms is not None else None,
+                    "output_sql": p.output_sql,
+                    "has_explain": bool(p.explain_text),
                 }
                 for p in it.patches
             ],
+            "explains": {pid: text[:500] for pid, text in it.explains.items()} if it.explains else {},
         }
