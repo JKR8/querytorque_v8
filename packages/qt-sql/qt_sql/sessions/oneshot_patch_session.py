@@ -4,21 +4,9 @@ Flow per iteration:
 1. Build oneshot patch prompt → LLM call → 4 patch plans
 2. Retry loop for malformed/un-parseable patches (before validation)
 3. Apply patches → semantic validation → race → EXPLAIN collection
-4. Build snipe prompt (original + summary history + latest results) → LLM → new patches
-5. Iterate until target speedup or max_iterations
-
-Fixes implemented:
-- Disk persistence of prompts/responses after each LLM call
-- EXPLAIN collection for ALL patches (no speedup threshold)
-- Interleaved sequential benchmark (1-2-1-2 warmup-warmup-measure-measure)
-- Connection safety via context managers
-- Snipe prompt includes patched SQL for all patches (especially regressions)
-- Retry shows ALL patches with stats + SQL, not just errors
-- LLM call timeout (600s default)
-- Minimum patch count enforcement (warn + retry if < 3)
-- Best speedup tracking only counts >= 1.0 (regressions don't count)
-- Snipe prompt uses compact summary table + detailed latest only
-- Timing data (original_ms, patch_ms) in serialized output
+4. Multi-handling: keep good patches, retry only failed ones, merge results
+5. Build snipe prompt (original + summary history + latest results) → LLM → new patches
+6. Iterate until target speedup or max_iterations
 """
 
 from __future__ import annotations
@@ -181,8 +169,15 @@ class OneshotPatchSession(OptimizationSession):
                 )
 
             # ── Phase 1.5: LLM call + retry ───────────────────────────
+            logger.info(
+                f"[{self.query_id}] Calling LLM ({self.pipeline.model}, "
+                f"prompt={len(prompt)} chars)..."
+            )
             response = self._call_llm_with_timeout(generator, prompt)
             iter_api_calls += 1
+            logger.info(
+                f"[{self.query_id}] LLM response: {len(response)} chars"
+            )
 
             # Persist prompt + response to disk
             self._save_to_disk(session_dir, iteration, "prompt", prompt)
@@ -260,6 +255,92 @@ class OneshotPatchSession(OptimizationSession):
                 else:
                     all_patches.append(p)
             iter_result.patches = all_patches
+
+            # ── Phase 3: Multi-handling retry ─────────────────────────
+            # If some patches succeeded and some failed at runtime,
+            # keep the good ones and retry only the failed ones.
+            runtime_failed = [
+                p for p in all_patches
+                if p.status in ("ERROR", "FAIL") and p.output_sql
+            ]
+            runtime_good = [
+                p for p in all_patches
+                if p.status not in ("ERROR", "FAIL", "PENDING")
+            ]
+
+            if runtime_failed and runtime_good:
+                logger.info(
+                    f"[{self.query_id}] Multi-handling: "
+                    f"{len(runtime_good)} good, {len(runtime_failed)} failed "
+                    f"— retrying failed patches only"
+                )
+                from ..patches.oneshot_patch_prompt_builder import (
+                    build_runtime_error_retry_prompt,
+                )
+
+                retry_prompt = build_runtime_error_retry_prompt(
+                    original_prompt=prompt,
+                    good_patches=runtime_good,
+                    failed_patches=runtime_failed,
+                )
+                logger.info(
+                    f"[{self.query_id}] Calling LLM for {len(runtime_failed)} "
+                    f"replacement patches ({len(retry_prompt)} chars)..."
+                )
+                retry_response = self._call_llm_with_timeout(generator, retry_prompt)
+                iter_api_calls += 1
+                logger.info(
+                    f"[{self.query_id}] Multi-handling LLM response: "
+                    f"{len(retry_response)} chars"
+                )
+
+                self._save_to_disk(
+                    session_dir, iteration, "multi_retry_prompt", retry_prompt
+                )
+                self._save_to_disk(
+                    session_dir, iteration, "multi_retry_response", retry_response
+                )
+
+                new_patches, _ = self._parse_and_apply_all(
+                    retry_response, script_ir, dialect_enum
+                )
+                new_applied = [p for p in new_patches if p.output_sql]
+                logger.info(
+                    f"[{self.query_id}] Multi-handling: "
+                    f"{len(new_applied)}/{len(new_patches)} replacement patches applied"
+                )
+
+                if new_applied:
+                    # Validate only the new patches
+                    new_result = self._validate_patches(new_applied, db_path)
+
+                    # Merge: replace failed patches with new results
+                    failed_ids = {p.patch_id for p in runtime_failed}
+                    merged = [p for p in all_patches if p.patch_id not in failed_ids]
+                    merged.extend(new_applied)
+                    iter_result.patches = merged
+
+                    # Merge explains
+                    iter_result.explains.update(new_result.explains)
+
+                    # Recalculate best from merged set
+                    merged_with_speedup = [
+                        p for p in merged
+                        if p.speedup is not None and p.speedup >= 1.0
+                    ]
+                    if merged_with_speedup:
+                        best_merged = max(
+                            merged_with_speedup, key=lambda p: p.speedup
+                        )
+                        iter_result.best_speedup = best_merged.speedup or 0.0
+                        iter_result.best_patch_id = best_merged.patch_id
+                        iter_result.best_sql = best_merged.output_sql
+
+                    logger.info(
+                        f"[{self.query_id}] Multi-handling merged: "
+                        f"{len(merged)} patches total, "
+                        f"best={iter_result.best_speedup:.2f}x"
+                    )
 
             iterations_data.append(iter_result)
             total_api_calls += iter_api_calls
@@ -531,18 +612,37 @@ class OneshotPatchSession(OptimizationSession):
             result.best_sql = best_patch.output_sql
 
         # ── EXPLAIN collection — ALL patches with output_sql ──────────
-        for p in sem_passed:
+        explain_count = sum(1 for p in sem_passed if p.output_sql)
+        logger.info(
+            f"[{self.query_id}] Collecting EXPLAIN for {explain_count} patches"
+        )
+        for idx, p in enumerate(sem_passed):
             if p.output_sql:
+                logger.info(
+                    f"[{self.query_id}]   EXPLAIN {idx + 1}/{explain_count}: {p.patch_id}"
+                )
                 try:
                     explain_data = run_explain_analyze(db_path, p.output_sql)
                     if explain_data:
                         p.explain_text = explain_data.get("plan_text", "")
                         result.explains[p.patch_id] = p.explain_text
+                        logger.info(
+                            f"[{self.query_id}]   {p.patch_id}: "
+                            f"EXPLAIN ANALYZE OK ({len(p.explain_text)} chars)"
+                        )
                     else:
                         text = run_explain_text(db_path, p.output_sql)
                         if text:
                             p.explain_text = text
                             result.explains[p.patch_id] = text
+                            logger.info(
+                                f"[{self.query_id}]   {p.patch_id}: "
+                                f"EXPLAIN TEXT OK ({len(text)} chars)"
+                            )
+                        else:
+                            logger.info(
+                                f"[{self.query_id}]   {p.patch_id}: no EXPLAIN available"
+                            )
                 except Exception as e:
                     logger.warning(f"EXPLAIN failed for {p.patch_id}: {e}")
 
@@ -558,22 +658,35 @@ class OneshotPatchSession(OptimizationSession):
         """
         from ..execution.factory import create_executor_from_dsn
 
+        logger.info(
+            f"[{self.query_id}] Sequential benchmark: "
+            f"{len(patches)} patches, interleaved 1-2-1-2"
+        )
+
         try:
             with create_executor_from_dsn(db_path) as executor:
-                for p in patches:
+                for idx, p in enumerate(patches):
+                    logger.info(
+                        f"[{self.query_id}] Benchmark {idx + 1}/{len(patches)}: "
+                        f"{p.patch_id} ({p.family}/{p.transform})"
+                    )
                     try:
                         # 1: Warmup original (primes cache)
+                        logger.info(f"[{self.query_id}]   warmup original...")
                         executor.execute(self.original_sql)
 
                         # 2: Warmup patch (primes cache)
+                        logger.info(f"[{self.query_id}]   warmup patch...")
                         executor.execute(p.output_sql)
 
                         # 1: Measure original
+                        logger.info(f"[{self.query_id}]   measure original...")
                         t0 = time.perf_counter()
                         executor.execute(self.original_sql)
                         orig_ms = (time.perf_counter() - t0) * 1000
 
                         # 2: Measure patch
+                        logger.info(f"[{self.query_id}]   measure patch...")
                         t0 = time.perf_counter()
                         executor.execute(p.output_sql)
                         patch_ms = (time.perf_counter() - t0) * 1000
@@ -582,10 +695,19 @@ class OneshotPatchSession(OptimizationSession):
                         p.patch_ms = patch_ms
                         p.speedup = orig_ms / patch_ms if patch_ms > 0 else 1.0
                         p.status = self._classify_speedup(p.speedup)
+
+                        logger.info(
+                            f"[{self.query_id}]   result: orig={orig_ms:.0f}ms, "
+                            f"patch={patch_ms:.0f}ms, speedup={p.speedup:.2f}x "
+                            f"({p.status})"
+                        )
                     except Exception as e:
                         p.speedup = 0.0
                         p.status = "ERROR"
                         p.apply_error = str(e)
+                        logger.warning(
+                            f"[{self.query_id}]   ERROR: {p.patch_id}: {e}"
+                        )
         except Exception as e:
             logger.warning(f"Sequential benchmark failed: {e}")
 
