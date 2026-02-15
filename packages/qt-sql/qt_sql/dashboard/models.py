@@ -90,7 +90,8 @@ class EngineGap:
     why: str = ""
     opportunity: str = ""
     what_worked: Any = ""       # str or list
-    n_queries_matched: int = 0  # Computed: queries with matching pathology
+    n_queries_matched: int = 0  # Computed: queries with transform targeting this gap
+    matched_query_ids: List[str] = field(default_factory=list)
 
 
 @dataclass

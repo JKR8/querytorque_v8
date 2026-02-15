@@ -47,16 +47,22 @@ _RUNTIME_WEIGHTS = {"SKIP": 0, "LOW": 1, "MEDIUM": 3, "HIGH": 5}
 # ---------------------------------------------------------------------------
 
 def normalize_qid(raw: str) -> str:
-    """Normalize query ID to canonical q{N} format.
+    """Normalize query ID to canonical q{N} format, preserving variant suffixes.
 
-    Handles: q88, query_1, query001, query_88, query1
+    Handles:
+      q88              -> q88
+      query_1          -> q1
+      query001         -> q1
+      query_88         -> q88
+      query013_spj_i1  -> q13_spj_i1   (suffix preserved — distinct variant)
+      query013_spj_i2  -> q13_spj_i2   (suffix preserved — distinct variant)
     """
     raw = raw.strip()
-    if re.match(r'^q\d+$', raw):
+    if re.match(r'^q\d+', raw):
         return raw
-    m = re.match(r'^query[_-]?0*(\d+)', raw, re.IGNORECASE)
+    m = re.match(r'^query[_-]?0*(\d+)(.*)', raw, re.IGNORECASE)
     if m:
-        return f"q{int(m.group(1))}"
+        return f"q{int(m.group(1))}{m.group(2)}"
     return raw
 
 
@@ -225,8 +231,10 @@ def _build_forensic(benchmark_dir: Path, engine: str) -> ForensicSummary:
     without_detection = len(forensic_queries) - with_detection
     pattern_stats = _compute_pattern_stats(pattern_entries, catalog_by_id)
 
-    # Engine profile
+    # Engine profile + compute per-gap query matches
     engine_profile = _load_engine_profile(engine)
+    if engine_profile:
+        _compute_gap_matches(engine_profile, forensic_queries)
 
     # Dominant pathology
     dominant_pathology = _compute_dominant_pathology(forensic_queries)
@@ -330,6 +338,24 @@ def _load_engine_profile(engine: str) -> Optional[EngineProfile]:
     except Exception as e:
         logger.debug(f"Engine profile load error: {e}")
         return None
+
+
+def _compute_gap_matches(
+    profile: EngineProfile,
+    queries: List[ForensicQuery],
+) -> None:
+    """Populate n_queries_matched and matched_query_ids on each engine gap.
+
+    Cross-references gap IDs against each query's matched transforms.
+    A query "matches" a gap if any of its transforms target that gap.
+    """
+    for gap in profile.gaps:
+        matched_ids = [
+            fq.query_id for fq in queries
+            if any(m.gap == gap.id for m in fq.matched_transforms)
+        ]
+        gap.n_queries_matched = len(matched_ids)
+        gap.matched_query_ids = matched_ids
 
 
 def _load_explain_text(benchmark_dir: Path, query_id: str) -> Tuple[bool, str]:

@@ -5,6 +5,7 @@ import pytest
 from qt_sql.dashboard.collector import (
     _parse_pg_size,
     _compute_pattern_stats,
+    _compute_gap_matches,
     _load_qerror_data,
     _load_engine_profile,
     _compute_dominant_pathology,
@@ -12,7 +13,13 @@ from qt_sql.dashboard.collector import (
     normalize_qid,
     _bucket_runtime,
 )
-from qt_sql.dashboard.models import ForensicQuery, QErrorEntry
+from qt_sql.dashboard.models import (
+    EngineGap,
+    EngineProfile,
+    ForensicQuery,
+    ForensicTransformMatch,
+    QErrorEntry,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +61,29 @@ class TestNormalizeQid:
 
     def test_strips_leading_zeros(self):
         assert normalize_qid("query_001") == "q1"
+
+    # --- Variant suffix preservation (collision regression) ---
+
+    def test_variant_suffix_spj_i1(self):
+        assert normalize_qid("query013_spj_i1") == "q13_spj_i1"
+
+    def test_variant_suffix_spj_i2(self):
+        assert normalize_qid("query013_spj_i2") == "q13_spj_i2"
+
+    def test_variant_suffix_multi(self):
+        assert normalize_qid("query001_multi_i1") == "q1_multi_i1"
+
+    def test_variant_suffix_agg(self):
+        assert normalize_qid("query013_agg_i2") == "q13_agg_i2"
+
+    def test_variants_are_distinct(self):
+        """Regression: variants must NOT collapse to the same key."""
+        a = normalize_qid("query013_spj_i1")
+        b = normalize_qid("query013_spj_i2")
+        assert a != b
+
+    def test_variant_padded_with_suffix(self):
+        assert normalize_qid("query001_multi_i2") == "q1_multi_i2"
 
 
 # ---------------------------------------------------------------------------
@@ -321,3 +351,61 @@ class TestLoadEngineProfile:
 
     def test_unknown_engine(self):
         assert _load_engine_profile("oracle") is None
+
+
+# ---------------------------------------------------------------------------
+# _compute_gap_matches
+# ---------------------------------------------------------------------------
+
+class TestComputeGapMatches:
+
+    def test_populates_matched_counts(self):
+        queries = [
+            ForensicQuery(
+                query_id="q1", runtime_ms=1000, bucket="HIGH",
+                matched_transforms=[
+                    ForensicTransformMatch(id="decorrelate", overlap=0.9,
+                                           gap="CORRELATED_SUBQUERY_PARALYSIS"),
+                ],
+            ),
+            ForensicQuery(
+                query_id="q2", runtime_ms=500, bucket="MEDIUM",
+                matched_transforms=[
+                    ForensicTransformMatch(id="decorrelate", overlap=0.7,
+                                           gap="CORRELATED_SUBQUERY_PARALYSIS"),
+                    ForensicTransformMatch(id="date_cte", overlap=0.6,
+                                           gap="CROSS_CTE_PREDICATE_BLINDNESS"),
+                ],
+            ),
+            ForensicQuery(
+                query_id="q3", runtime_ms=200, bucket="LOW",
+                matched_transforms=[],
+            ),
+        ]
+        profile = EngineProfile(
+            engine="duckdb",
+            gaps=[
+                EngineGap(id="CORRELATED_SUBQUERY_PARALYSIS"),
+                EngineGap(id="CROSS_CTE_PREDICATE_BLINDNESS"),
+                EngineGap(id="REDUNDANT_SCAN_ELIMINATION"),
+            ],
+        )
+        _compute_gap_matches(profile, queries)
+
+        by_id = {g.id: g for g in profile.gaps}
+        assert by_id["CORRELATED_SUBQUERY_PARALYSIS"].n_queries_matched == 2
+        assert set(by_id["CORRELATED_SUBQUERY_PARALYSIS"].matched_query_ids) == {"q1", "q2"}
+
+        assert by_id["CROSS_CTE_PREDICATE_BLINDNESS"].n_queries_matched == 1
+        assert by_id["CROSS_CTE_PREDICATE_BLINDNESS"].matched_query_ids == ["q2"]
+
+        assert by_id["REDUNDANT_SCAN_ELIMINATION"].n_queries_matched == 0
+        assert by_id["REDUNDANT_SCAN_ELIMINATION"].matched_query_ids == []
+
+    def test_no_queries(self):
+        profile = EngineProfile(
+            engine="duckdb",
+            gaps=[EngineGap(id="SOME_GAP")],
+        )
+        _compute_gap_matches(profile, [])
+        assert profile.gaps[0].n_queries_matched == 0
