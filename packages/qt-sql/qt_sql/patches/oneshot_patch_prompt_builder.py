@@ -185,12 +185,14 @@ def _build_prompt_body(
     dialect: str,
     role_text: str,
     include_patch_plans: bool = True,
+    intelligence_brief: str = "",
 ) -> tuple[List[str], int]:
     """Build sections 1-5 shared by single-tier and tiered prompts.
 
     Args:
         include_patch_plans: If False, omit PATCH PLAN JSON from family sections.
             Set False for tiered mode where the analyst doesn't generate patches.
+        intelligence_brief: Pre-computed AST detection + LLM classification summary.
 
     Returns:
         (sections, n_families) — list of section strings, count of families with plans.
@@ -252,6 +254,16 @@ Choose up to **{min(4, n_families)} most relevant families** for this query base
             sections.append(format_family_section(family_id, ex, include_patch_plans))
             sections.append("")
 
+    # ── Section 5a: Detected Patterns (intelligence brief) ────────────
+    if intelligence_brief:
+        sections.append(f"""## Detected Patterns
+
+{intelligence_brief}
+
+**Instruction**: Prioritize detected patterns above. If a high-confidence
+pathology is detected, your primary target SHOULD address it.
+""")
+
     return sections, n_families
 
 
@@ -263,7 +275,8 @@ def build_oneshot_patch_prompt(
     explain_text: str,
     ir_node_map: str,
     all_5_examples: Dict[str, Dict[str, Any]],
-    dialect: str
+    dialect: str,
+    intelligence_brief: str = "",
 ) -> str:
     """Build the complete oneshot patch optimization prompt.
 
@@ -274,6 +287,7 @@ def build_oneshot_patch_prompt(
         ir_node_map: IR node map (from render_ir_node_map)
         all_5_examples: Dict mapping family ID (A-E) to gold example JSON
         dialect: SQL dialect (duckdb, postgres, snowflake)
+        intelligence_brief: Pre-computed detection + classification summary.
 
     Returns:
         Complete prompt string
@@ -293,6 +307,7 @@ def build_oneshot_patch_prompt(
     sections, n_families = _build_prompt_body(
         query_id, original_sql, explain_text, ir_node_map,
         all_5_examples, dialect, role_text,
+        intelligence_brief=intelligence_brief,
     )
 
     # ── Section 6: Output Format (full patch plans) ────────────────────
@@ -394,6 +409,7 @@ def build_oneshot_patch_prompt_tiered(
     ir_node_map: str,
     all_5_examples: Dict[str, Dict[str, Any]],
     dialect: str,
+    intelligence_brief: str = "",
 ) -> str:
     """Build tiered analyst prompt: sections 1-5 shared + Section 6 asks for target IR maps.
 
@@ -407,6 +423,7 @@ def build_oneshot_patch_prompt_tiered(
         ir_node_map: IR node map (from render_ir_node_map)
         all_5_examples: Dict mapping family ID (A-E) to gold example JSON
         dialect: SQL dialect
+        intelligence_brief: Pre-computed detection + classification summary.
 
     Returns:
         Complete tiered analyst prompt string
@@ -425,6 +442,7 @@ def build_oneshot_patch_prompt_tiered(
         query_id, original_sql, explain_text, ir_node_map,
         all_5_examples, dialect, role_text,
         include_patch_plans=False,
+        intelligence_brief=intelligence_brief,
     )
 
     # ── Section 5b: Worker Routing ───────────────────────────────────────
@@ -861,9 +879,9 @@ def load_gold_examples(dialect: str, base_path: str = "packages/qt-sql/qt_sql/ex
             "F": "explicit_join_materialized",
         },
         "snowflake": {
-            "A": "inline_decorrelate",
-            "B": "shared_scan_decorrelate",
-            "C": "aggregate_pushdown",  # Borrow from DuckDB, mark in prompt
+            "A": "sk_pushdown_union_all",  # P4: date_sk pushdown (Family A = Early Filtering)
+            "B": "inline_decorrelate",  # P3: decorrelation (Family B = Decorrelation)
+            "C": "aggregate_pushdown",  # Borrow from DuckDB
             "D": "intersect_to_exists",  # Borrow from DuckDB
             "E": "multi_dimension_prefetch",  # Borrow from DuckDB
             "F": "inner_join_conversion",  # Borrow from DuckDB

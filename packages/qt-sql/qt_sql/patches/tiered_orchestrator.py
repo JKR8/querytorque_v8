@@ -116,11 +116,13 @@ class TieredOrchestrator:
         worker_call_fn: Callable[[str], str],
         gold_examples: Dict[str, Dict[str, Any]],
         dialect: str,
+        intelligence_brief: str = "",
     ):
         self.analyst_call_fn = analyst_call_fn
         self.worker_call_fn = worker_call_fn
         self.gold_examples = gold_examples
         self.dialect = dialect
+        self.intelligence_brief = intelligence_brief
 
         # Build lookup: example_id → example JSON (for recommended_examples matching)
         self._example_by_id: Dict[str, Dict[str, Any]] = {}
@@ -150,6 +152,7 @@ class TieredOrchestrator:
             ir_node_map=ir_node_map,
             all_5_examples=self.gold_examples,
             dialect=self.dialect,
+            intelligence_brief=self.intelligence_brief,
         )
 
         logger.info(

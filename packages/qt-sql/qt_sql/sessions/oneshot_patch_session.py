@@ -132,6 +132,22 @@ class OneshotPatchSession(OptimizationSession):
         # Load gold examples for families
         gold_examples = load_gold_examples(self.dialect)
 
+        # ── AST Detection + Cached Classification ─────────────────────
+        intelligence_brief = ""
+        try:
+            from ..detection import detect_transforms, load_transforms
+            from ..patches.pathology_classifier import build_intelligence_brief
+
+            transforms_catalog = load_transforms()
+            detected = detect_transforms(
+                self.original_sql, transforms_catalog,
+                engine=self.engine, dialect=self.dialect,
+            )
+            classification = self._load_cached_classification(self.query_id)
+            intelligence_brief = build_intelligence_brief(detected, classification)
+        except Exception as e:
+            logger.warning(f"[{self.query_id}] Intelligence brief failed: {e}")
+
         # LLM generator
         generator = CandidateGenerator(
             provider=self.pipeline.provider,
@@ -162,6 +178,7 @@ class OneshotPatchSession(OptimizationSession):
                     ir_node_map=ir_node_map,
                     all_5_examples=gold_examples,
                     dialect=self.dialect,
+                    intelligence_brief=intelligence_brief,
                 )
             else:
                 prev = iterations_data[-1]
@@ -452,6 +469,31 @@ class OneshotPatchSession(OptimizationSession):
 
         gold_examples = load_gold_examples(self.dialect)
 
+        # ── AST Detection + Cached Classification ─────────────────────
+        intelligence_brief = ""
+        try:
+            from ..detection import detect_transforms, load_transforms
+            from ..patches.pathology_classifier import build_intelligence_brief
+
+            transforms_catalog = load_transforms()
+            detected = detect_transforms(
+                self.original_sql, transforms_catalog,
+                engine=self.engine, dialect=self.dialect,
+            )
+
+            # Load pre-computed classification if available
+            classification = self._load_cached_classification(self.query_id)
+
+            intelligence_brief = build_intelligence_brief(detected, classification)
+            if intelligence_brief:
+                logger.info(
+                    f"[{self.query_id}] Intelligence brief: "
+                    f"{len(detected)} AST matches, "
+                    f"classification={'yes' if classification else 'no'}"
+                )
+        except Exception as e:
+            logger.warning(f"[{self.query_id}] Intelligence brief failed: {e}")
+
         # ── Build LLM call functions ──────────────────────────────────
         analyst_call_fn = self._make_llm_call_fn(
             getattr(self.pipeline.config, "analyst_model", None)
@@ -465,6 +507,7 @@ class OneshotPatchSession(OptimizationSession):
             worker_call_fn=worker_call_fn,
             gold_examples=gold_examples,
             dialect=self.dialect,
+            intelligence_brief=intelligence_brief,
         )
 
         # ── Iteration State ────────────────────────────────────────────
@@ -951,6 +994,49 @@ class OneshotPatchSession(OptimizationSession):
         return lambda prompt: self._call_llm_with_timeout(generator, prompt)
 
     # ── Internal Methods ────────────────────────────────────────────────────
+
+    def _load_cached_classification(self, query_id: str):
+        """Load pre-computed classification from benchmark_dir/classifications.json.
+
+        Returns ClassificationResult or None if not available.
+        """
+        try:
+            classifications_path = (
+                self.pipeline.benchmark_dir / "classifications.json"
+            )
+            if not classifications_path.exists():
+                return None
+
+            import json
+            data = json.loads(classifications_path.read_text())
+            entry = data.get(query_id)
+            if not entry:
+                return None
+
+            from ..patches.pathology_classifier import (
+                ClassificationResult,
+                PathologyMatch,
+            )
+
+            matches = [
+                PathologyMatch(
+                    pathology_id=m["pathology_id"],
+                    name=m.get("name", ""),
+                    confidence=m.get("confidence", 0.0),
+                    evidence=m.get("evidence", ""),
+                    recommended_transform=m.get("transform", ""),
+                )
+                for m in entry.get("llm_matches", [])
+            ]
+
+            return ClassificationResult(
+                query_id=query_id,
+                matches=matches,
+                reasoning=entry.get("reasoning", ""),
+            )
+        except Exception as e:
+            logger.debug(f"[{query_id}] No cached classification: {e}")
+            return None
 
     def _create_session_dir(self) -> Path:
         """Create a session directory for disk persistence."""
