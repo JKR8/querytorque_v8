@@ -29,7 +29,7 @@ export interface BatchFile {
 export interface BatchSettings {
   maxRetries: number
   dsn: string
-  mode: 'swarm' | 'oneshot'
+  mode: 'beam'
   sessionId?: string
 }
 
@@ -54,7 +54,7 @@ type BatchAction =
 const DEFAULT_SETTINGS: BatchSettings = {
   maxRetries: 2,
   dsn: '',
-  mode: 'swarm',
+  mode: 'beam',
 }
 
 function generateId(): string {

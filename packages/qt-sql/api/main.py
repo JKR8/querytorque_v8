@@ -66,9 +66,9 @@ class OptimizeRequest(BaseModel):
     """Request body for pipeline-backed SQL optimization."""
     sql: str = Field(..., description="SQL query to optimize", min_length=1)
     dsn: str = Field(..., description="Database DSN (duckdb:///path.db or postgres://user:pass@host:port/db)")
-    mode: Literal["swarm", "oneshot"] = Field(
-        default="swarm",
-        description="Optimization mode: swarm (4-worker fan-out), oneshot (single call)"
+    mode: Literal["beam"] = Field(
+        default="beam",
+        description="Optimization mode: beam (analyst → N workers → validate → snipe)"
     )
     query_id: Optional[str] = Field(default=None, description="Query identifier for traceability")
     session_id: Optional[str] = Field(default=None, description="Database session ID — required for DuckDB uploaded fixtures")

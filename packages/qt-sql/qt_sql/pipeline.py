@@ -1124,7 +1124,7 @@ class Pipeline:
 
         # Build the analysis prompt using canonical §I-§VIII template
         analysis_prompt = build_analyst_briefing_prompt(
-            mode="swarm",
+            mode="beam",
             query_id=query_id,
             sql=sql,
             dag=dag,

@@ -149,7 +149,7 @@ export interface AuditResponse {
 export interface OptimizeRequest {
   sql: string
   dsn: string
-  mode?: 'swarm' | 'oneshot'
+  mode?: 'beam'
   query_id?: string
   session_id?: string
   max_iterations?: number

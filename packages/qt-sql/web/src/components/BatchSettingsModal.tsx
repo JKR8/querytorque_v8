@@ -44,28 +44,15 @@ export default function BatchSettingsModal({
             <label>Optimization Mode</label>
             <div className="bs-mode-options">
               <button
-                className={`bs-mode-btn ${localSettings.mode === 'swarm' ? 'active' : ''}`}
-                onClick={() => setLocalSettings(s => ({ ...s, mode: 'swarm' }))}
+                className="bs-mode-btn active"
               >
                 <span className="bs-mode-icon">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
                   </svg>
                 </span>
-                <span className="bs-mode-label">Swarm</span>
-                <span className="bs-mode-desc">4 workers + snipe (best quality)</span>
-              </button>
-              <button
-                className={`bs-mode-btn ${localSettings.mode === 'oneshot' ? 'active' : ''}`}
-                onClick={() => setLocalSettings(s => ({ ...s, mode: 'oneshot' }))}
-              >
-                <span className="bs-mode-icon">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <polygon points="13,2 3,14 12,14 11,22 21,10 12,10" />
-                  </svg>
-                </span>
-                <span className="bs-mode-label">Oneshot</span>
-                <span className="bs-mode-desc">Fast single pass</span>
+                <span className="bs-mode-label">Beam</span>
+                <span className="bs-mode-desc">Analyst → N workers → validate → snipe</span>
               </button>
             </div>
           </div>

@@ -205,7 +205,7 @@ export default function EditorPage() {
       const result = await optimizeQuery({
         sql,
         dsn: dbDsn,
-        mode: 'swarm',
+        mode: 'beam',
         session_id: dbSessionId || undefined,
       })
       setOptimizeResult(result)

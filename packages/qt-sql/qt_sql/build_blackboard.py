@@ -1,29 +1,19 @@
-"""Build learning blackboard from swarm batch or global best-of-all-sources.
+"""Build learning blackboard from batch run or global best-of-all-sources.
 
-Mode 1 (Swarm): Reads a swarm batch directory and produces:
+Mode 1 (Batch): Reads a batch directory and produces:
   1. blackboard/raw/<query_id>/worker_NN.json  — one BlackboardEntry per worker
   2. blackboard/collated.json                  — KnowledgePrinciple[] + KnowledgeAntiPattern[]
   3. benchmarks/<name>/knowledge/<dataset>.json — GlobalKnowledge for prompt injection
-     (also copied to batch_dir/knowledge/ for provenance)
-
-  Engine/dataset auto-detected from benchmarks/<name>/config.json.
 
 Mode 2 (Global --global): Aggregates the BEST optimization per query across ALL
-historical sources (Swarm, Retry4W, Retry3W, Kimi, V2, Evo, analyst_mode, etc.)
-with full provenance: optimized SQL, model, run, reasoning, transforms.
+historical sources with full provenance: optimized SQL, model, run, reasoning, transforms.
   Output: benchmarks/duckdb_tpcds/knowledge/duckdb_tpcds.json
 
 No LLM calls. Purely deterministic extraction from existing files.
 
 Usage:
     cd <repo-root>
-    # DuckDB TPC-DS swarm blackboard
-    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.build_blackboard \\
-        qt_sql/benchmarks/duckdb_tpcds/swarm_batch_20260208_102033
-    # PostgreSQL DSB swarm blackboard
-    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.build_blackboard \\
-        qt_sql/benchmarks/postgres_dsb/swarm_batch_20260208_142643
-    # Global blackboard (DuckDB TPC-DS only)
+    PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.build_blackboard <batch_dir>
     PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.build_blackboard --global
 """
 
@@ -246,7 +236,7 @@ class GlobalKnowledge:
 def normalize_query_id(raw: str) -> str:
     """Normalize query IDs: 'query_88' → 'q88', '88' → 'q88', 'q88' → 'q88', 'query_23a' → 'q23a'."""
     raw = raw.strip().lower()
-    # Strip 'query_' prefix from swarm dirs
+    # Strip 'query_' prefix
     if raw.startswith("query_"):
         raw = raw[6:]
     # Strip 'q' prefix if already present, then re-add
@@ -260,8 +250,8 @@ def normalize_query_id(raw: str) -> str:
 class SourceAttempt:
     """A single optimization attempt from any source."""
 
-    source: str  # "Swarm", "Retry4W", "Retry3W", "Kimi", "V2", "Evo", "analyst_mode", etc.
-    run: str  # e.g. "swarm_batch_20260208_102033", "retry_4worker_20260206_004710"
+    source: str  # "Beam", "Retry4W", "Retry3W", "Kimi", "V2", "Evo", "analyst_mode", etc.
+    run: str  # e.g. "run_20260208_102033", "retry_4worker_20260206_004710"
     model: str  # "deepseek-reasoner", "kimi-k2.5", etc.
     worker_id: Optional[int] = None
     iteration: int = 0
@@ -397,7 +387,7 @@ KNOWN_TRANSFORMS = set(TRANSFORM_PRINCIPLES.keys())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 1: Extract BlackboardEntry records from swarm batch
+# Phase 1: Extract BlackboardEntry records from batch run
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -734,9 +724,9 @@ def extract_query_entries(
 
 
 def phase1_extract(batch_dir: Path) -> List[BlackboardEntry]:
-    """Phase 1: Extract all BlackboardEntry records from a swarm batch or run.
+    """Phase 1: Extract all BlackboardEntry records from a batch run.
 
-    Supports both legacy swarm_batch_* layout (query_* subdirs with benchmark_iter*.json)
+    Supports both legacy batch layout (query_* subdirs with benchmark_iter*.json)
     and new runs/run_* layout (query subdirs with validation.json).
     """
     run_name = batch_dir.name
@@ -1158,7 +1148,7 @@ def _detect_benchmark_config(batch_dir: Path) -> Dict[str, Any]:
     """Detect engine/dataset from config.json in the parent benchmark dir.
 
     batch_dir can be:
-      - benchmarks/postgres_dsb/swarm_batch_20260208_142643/  (legacy)
+      - benchmarks/postgres_dsb/batch_20260208_142643/  (legacy)
       - benchmarks/postgres_dsb/runs/run_20260209_143000/     (new standard)
     Walks up from batch_dir looking for config.json.
     """
@@ -1193,13 +1183,13 @@ def _detect_benchmark_config(batch_dir: Path) -> Dict[str, Any]:
 
 # Resolve project root (for --global mode, run from project root)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent  # qt_sql/ → qt-sql/ → packages/ → repo root
-_ADO_BENCHMARKS = Path(__file__).resolve().parent / "benchmarks" / "duckdb_tpcds"
+_DUCKDB_BENCHMARKS = Path(__file__).resolve().parent / "benchmarks" / "duckdb_tpcds"
 _RESEARCH = _PROJECT_ROOT / "research"
 _CONSOLIDATED = _RESEARCH / "CONSOLIDATED_BENCHMARKS"
 _RETRY_ARCHIVE = _RESEARCH / "retry_archive"
 
 # Default paths for each source
-_DEFAULT_SWARM_BATCH = _ADO_BENCHMARKS / "swarm_batch_20260208_102033"
+_DEFAULT_BATCH_DIR = _DUCKDB_BENCHMARKS / "swarm_batch_20260208_102033"
 _DEFAULT_RETRY4W_DIR = _RETRY_ARCHIVE / "retry_neutrals"
 _DEFAULT_RETRY3W_DIR = _RETRY_ARCHIVE / "retry_collect"
 _DEFAULT_KIMI_DIRS = [
@@ -1209,11 +1199,11 @@ _DEFAULT_KIMI_DIRS = [
 _DEFAULT_STANDARD_DIR = _CONSOLIDATED / "benchmark_output_v2"
 _DEFAULT_MASTER_CSV = _CONSOLIDATED / "DuckDB_TPC-DS_Master_v3_20260206.csv"
 _DEFAULT_SQL_CSV = _CONSOLIDATED / "DuckDB_TPC-DS_SQL_v1_20260205.csv"
-_DEFAULT_LEADERBOARD = _ADO_BENCHMARKS / "leaderboard.json"
+_DEFAULT_LEADERBOARD = _DUCKDB_BENCHMARKS / "leaderboard.json"
 
 
-def read_swarm_source(batch_dir: Path) -> Dict[str, List[SourceAttempt]]:
-    """Read swarm batch directory, return attempts keyed by normalized query_id."""
+def read_batch_source(batch_dir: Path) -> Dict[str, List[SourceAttempt]]:
+    """Read batch directory, return attempts keyed by normalized query_id."""
     result: Dict[str, List[SourceAttempt]] = defaultdict(list)
     run_name = batch_dir.name
 
@@ -1287,7 +1277,7 @@ def read_swarm_source(batch_dir: Path) -> Dict[str, List[SourceAttempt]]:
                 error = worker.get("error", "") or None
 
                 result[qid].append(SourceAttempt(
-                    source="Swarm",
+                    source="Beam",
                     run=run_name,
                     model="deepseek-reasoner",
                     worker_id=wid,
@@ -1307,7 +1297,7 @@ def read_swarm_source(batch_dir: Path) -> Dict[str, List[SourceAttempt]]:
                     error=error,
                 ))
 
-    logger.info(f"  Swarm: {sum(len(v) for v in result.values())} attempts across {len(result)} queries")
+    logger.info(f"  Batch: {sum(len(v) for v in result.values())} attempts across {len(result)} queries")
     return dict(result)
 
 
@@ -1777,13 +1767,13 @@ def build_global_blackboard() -> Path:
 
     all_attempts: Dict[str, List[SourceAttempt]] = defaultdict(list)
 
-    # Source 1: Swarm
-    if _DEFAULT_SWARM_BATCH.is_dir():
-        swarm = read_swarm_source(_DEFAULT_SWARM_BATCH)
-        for qid, attempts in swarm.items():
+    # Source 1: Batch run
+    if _DEFAULT_BATCH_DIR.is_dir():
+        batch = read_batch_source(_DEFAULT_BATCH_DIR)
+        for qid, attempts in batch.items():
             all_attempts[qid].extend(attempts)
     else:
-        logger.warning(f"  Swarm batch not found: {_DEFAULT_SWARM_BATCH}")
+        logger.warning(f"  Batch dir not found: {_DEFAULT_BATCH_DIR}")
 
     # Source 2: Retry4W
     if _DEFAULT_RETRY4W_DIR.is_dir():
@@ -2033,7 +2023,7 @@ def build_global_blackboard() -> Path:
     }
 
     # Write to benchmarks/duckdb_tpcds/knowledge/duckdb_tpcds.json
-    knowledge_dir = _ADO_BENCHMARKS / "knowledge"
+    knowledge_dir = _DUCKDB_BENCHMARKS / "knowledge"
     knowledge_dir.mkdir(parents=True, exist_ok=True)
     output_path = knowledge_dir / "duckdb_tpcds.json"
     output_path.write_text(json.dumps(output, indent=2))
@@ -2107,7 +2097,8 @@ def _find_best_attempt(
     """
     # Map leaderboard source names to SourceAttempt source names
     source_map = {
-        "Swarm": "Swarm",
+        "Beam": "Beam",
+        "Swarm": "Beam",  # legacy label
         "Retry4W": "Retry4W",
         "Retry3W": "Retry3W",
         "Kimi": "Kimi",
@@ -2162,7 +2153,7 @@ def phase4_promote_winners(
     - qt_sql/optimization/examples/<transform>.json (V5 CLI)
 
     Args:
-        batch_dir: Path to swarm batch directory
+        batch_dir: Path to batch directory
         min_speedup: Minimum speedup to qualify for promotion
         dry_run: If True, only report what would be promoted without writing
 
@@ -2355,7 +2346,7 @@ def phase4_promote_winners(
             },
             "original_sql": candidate["original_sql"],
             "optimized_sql": candidate["optimized_sql"],
-            "optimized_source": f"auto_promoted_{candidate.get('strategy', 'swarm')[:50]}",
+            "optimized_source": f"auto_promoted_{candidate.get('strategy', 'beam')[:50]}",
             "benchmark_query_num": int(qnum) if qnum.isdigit() else 0,
         }
 
@@ -2413,7 +2404,7 @@ def main():
         # Run only phase 4 (auto-promote) on an existing batch
         args = [a for a in sys.argv[1:] if not a.startswith("--")]
         if not args:
-            print("Usage: python3 -m qt_sql.build_blackboard --promote-only <swarm_batch_dir>")
+            print("Usage: python3 -m qt_sql.build_blackboard --promote-only <batch_dir>")
             sys.exit(1)
         batch_dir = Path(args[0])
         dry_run = "--dry-run" in sys.argv
@@ -2423,7 +2414,7 @@ def main():
 
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  python3 -m qt_sql.build_blackboard <batch_or_run_dir>  # Swarm/run blackboard")
+        print("  python3 -m qt_sql.build_blackboard <batch_or_run_dir>  # Batch blackboard")
         print("  python3 -m qt_sql.build_blackboard --global            # Global blackboard")
         print("  python3 -m qt_sql.build_blackboard --promote-only <dir> # Auto-promote winners only")
         print()
@@ -2431,9 +2422,9 @@ def main():
         print("  --dry-run    Show what would be promoted without writing")
         print()
         print("Examples:")
-        print("  # Legacy swarm batch:")
+        print("  # Legacy batch:")
         print("  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.build_blackboard \\")
-        print("      packages/qt-sql/qt_sql/benchmarks/duckdb_tpcds/swarm_batch_20260208_102033")
+        print("      packages/qt-sql/qt_sql/benchmarks/duckdb_tpcds/swarm_batch_20260208_102033")  # actual dir on disk
         print("  # New standard run:")
         print("  PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.build_blackboard \\")
         print("      packages/qt-sql/qt_sql/benchmarks/postgres_dsb_76/runs/run_20260209_143000")

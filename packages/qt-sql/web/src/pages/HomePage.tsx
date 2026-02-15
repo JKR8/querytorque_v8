@@ -28,7 +28,7 @@ export default function HomePage() {
           <h1>SQL Performance Optimization</h1>
           <p className="hero-subtitle">
             Audit query plans, optimize with AI-powered rewriting, and validate results.
-            Powered by engine-specific pathology detection and a 4-worker swarm.
+            Powered by engine-specific pathology detection and beam optimization.
           </p>
           <div className="hero-actions">
             <button className="btn btn-primary btn-lg" onClick={() => navigate('/editor')}>
@@ -59,7 +59,7 @@ export default function HomePage() {
               </svg>
             </div>
             <h3>Optimize</h3>
-            <p>4-worker swarm generates candidates, validates correctness via row-count + checksum, and races for speed.</p>
+            <p>Beam generates candidates via parallel workers, validates correctness via row-count + checksum, and races for speed.</p>
           </div>
 
           <div className="feature-card">
