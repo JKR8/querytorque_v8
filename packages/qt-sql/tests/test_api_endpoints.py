@@ -93,7 +93,7 @@ class TestOptimizeEndpoint:
             json={
                 "sql": "SELECT 1",
                 "dsn": "duckdb:///:memory:",
-                "mode": "oneshot",
+                "mode": "beam",
             }
         )
         # Pipeline may error (no intelligence data) but API should return 200
@@ -109,7 +109,7 @@ class TestOptimizeEndpoint:
             json={
                 "sql": "SELECT 1",
                 "dsn": "duckdb:///:memory:",
-                "mode": "oneshot",
+                "mode": "beam",
             }
         )
         assert response.status_code == 200
@@ -158,7 +158,7 @@ class TestOptimizeEndpoint:
             json={
                 "sql": "SELECT 1",
                 "dsn": "duckdb:///:memory:",
-                "mode": "oneshot",
+                "mode": "beam",
                 "query_id": "test_q",
                 "max_iterations": 2,
                 "target_speedup": 1.5,
@@ -283,7 +283,7 @@ class TestEdgeCases:
 
         response = client.post(
             "/api/sql/optimize",
-            json={"sql": sql, "dsn": "duckdb:///:memory:", "mode": "oneshot"}
+            json={"sql": sql, "dsn": "duckdb:///:memory:", "mode": "beam"}
         )
         assert response.status_code == 200
 
@@ -294,7 +294,7 @@ class TestEdgeCases:
             json={
                 "sql": "SELECT * FROM users WHERE name = '日本語'",
                 "dsn": "duckdb:///:memory:",
-                "mode": "oneshot",
+                "mode": "beam",
             }
         )
         assert response.status_code == 200
@@ -311,6 +311,6 @@ class TestEdgeCases:
         """
         response = client.post(
             "/api/sql/optimize",
-            json={"sql": sql, "dsn": "duckdb:///:memory:", "mode": "oneshot"}
+            json={"sql": sql, "dsn": "duckdb:///:memory:", "mode": "beam"}
         )
         assert response.status_code == 200

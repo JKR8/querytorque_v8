@@ -10,7 +10,7 @@ Usage:
     PYTHONPATH=packages/qt-shared:packages/qt-sql:. python3 -m qt_sql.prompts.samples.generate_sample query_88 --version V0 --script paper/sql/everyhousehold_deidentified.sql
 
     # Generate just one prompt type:
-    PYTHONPATH=... python3 -m qt_sql.prompts.samples.generate_sample query_88 --version V0 --only oneshot_script
+    PYTHONPATH=... python3 -m qt_sql.prompts.samples.generate_sample query_88 --version V0 --only beam_script
 """
 
 from __future__ import annotations
@@ -625,16 +625,16 @@ def _write_and_report(path: Path, content: str, label: str) -> None:
     print(f"  {label}: {path.name} ({len(content)} chars, ~{len(content)//4} tokens)")
 
 
-def generate_oneshot_script(out_dir: Path, script_path: str) -> None:
-    """01 — Script oneshot using ScriptParser + build_script_oneshot_prompt()."""
-    from qt_sql.prompts.analyst_briefing import build_script_oneshot_prompt
+def generate_beam_script(out_dir: Path, script_path: str) -> None:
+    """01 — Script beam using ScriptParser + build_script_beam_prompt()."""
+    from qt_sql.prompts.analyst_briefing import build_script_beam_prompt
     from qt_sql.script_parser import ScriptParser
 
     script_file = Path(script_path)
     if not script_file.is_absolute():
         script_file = PROJECT_ROOT / script_file
     if not script_file.exists():
-        print(f"  SKIP oneshot_script: {script_file} not found")
+        print(f"  SKIP beam_script: {script_file} not found")
         return
 
     sql_script = script_file.read_text()
@@ -648,7 +648,7 @@ def generate_oneshot_script(out_dir: Path, script_path: str) -> None:
     engine_profile = load_engine_profile("duckdb")
     constraints = load_constraints()
 
-    prompt = build_script_oneshot_prompt(
+    prompt = build_script_beam_prompt(
         sql_script=sql_script,
         script_dag=script_dag,
         dialect="duckdb",
@@ -657,8 +657,8 @@ def generate_oneshot_script(out_dir: Path, script_path: str) -> None:
     )
 
     _write_and_report(
-        out_dir / "01_oneshot_script_everyhousehold.md",
-        prompt, "ONESHOT SCRIPT",
+        out_dir / "01_beam_script_everyhousehold.md",
+        prompt, "BEAM SCRIPT",
     )
 
 
@@ -721,7 +721,7 @@ def generate_expert(ctx: PromptContext, out_dir: Path) -> None:
         analyst_prompt, "EXPERT ANALYST",
     )
 
-    # 04: Expert worker (uses same mock briefing as swarm worker)
+    # 04: Expert worker (uses same mock briefing as beam worker)
     mock_shared, mock_worker = build_q88_mock_briefing(ctx)
     worker_examples = load_examples_by_ids(mock_worker.examples, ctx.matched_examples)
 
@@ -741,8 +741,8 @@ def generate_expert(ctx: PromptContext, out_dir: Path) -> None:
     )
 
 
-def generate_swarm_analyst(ctx: PromptContext, out_dir: Path) -> None:
-    """05 — Swarm analyst briefing."""
+def generate_beam_analyst(ctx: PromptContext, out_dir: Path) -> None:
+    """05 — Beam analyst briefing."""
     from qt_sql.prompts.analyst_briefing import build_analyst_briefing_prompt
 
     prompt = build_analyst_briefing_prompt(
@@ -765,8 +765,8 @@ def generate_swarm_analyst(ctx: PromptContext, out_dir: Path) -> None:
     )
 
     _write_and_report(
-        out_dir / f"05_swarm_analyst_{ctx.query_id}.md",
-        prompt, "SWARM ANALYST",
+        out_dir / f"05_beam_analyst_{ctx.query_id}.md",
+        prompt, "BEAM ANALYST",
     )
 
 
@@ -791,8 +791,8 @@ def generate_fan_out(ctx: PromptContext, out_dir: Path) -> None:
     )
 
 
-def generate_swarm_worker(ctx: PromptContext, out_dir: Path) -> None:
-    """07 — Swarm worker prompt (Worker 2, best worker)."""
+def generate_beam_worker(ctx: PromptContext, out_dir: Path) -> None:
+    """07 — Beam worker prompt (Worker 2, best worker)."""
     from qt_sql.prompts.worker import build_worker_prompt
 
     mock_shared, mock_worker = build_q88_mock_briefing(ctx)
@@ -955,12 +955,12 @@ def generate_pg_tuner(ctx: PromptContext, out_dir: Path) -> None:
 # ═══════════════════════════════════════════════════════════════════════
 
 GENERATORS = {
-    "oneshot_script": "01_oneshot_script",
-    "oneshot_query": "02_oneshot_query",
+    "beam_script": "01_beam_script",
+    "beam_query": "02_beam_query",
     "expert": "03+04_expert",
-    "swarm_analyst": "05_swarm_analyst",
+    "beam_analyst": "05_beam_analyst",
     "fan_out": "06_fan_out",
-    "swarm_worker": "07_worker",
+    "beam_worker": "07_worker",
     "snipe": "08+09+10_snipe",
     "pg_tuner": "11_pg_tuner",
 }
@@ -973,21 +973,21 @@ def run_generator(
     script_path: Optional[str],
 ) -> None:
     """Run a single generator by name."""
-    if name == "oneshot_script":
+    if name == "beam_script":
         if not script_path:
             print(f"  SKIP {name}: no --script provided")
             return
-        generate_oneshot_script(out_dir, script_path)
+        generate_beam_script(out_dir, script_path)
     elif name == "beam_query":
         generate_beam_query(ctx, out_dir)
     elif name == "expert":
         generate_expert(ctx, out_dir)
-    elif name == "swarm_analyst":
-        generate_swarm_analyst(ctx, out_dir)
+    elif name == "beam_analyst":
+        generate_beam_analyst(ctx, out_dir)
     elif name == "fan_out":
         generate_fan_out(ctx, out_dir)
-    elif name == "swarm_worker":
-        generate_swarm_worker(ctx, out_dir)
+    elif name == "beam_worker":
+        generate_beam_worker(ctx, out_dir)
     elif name == "snipe":
         generate_snipe(ctx, out_dir)
     elif name == "pg_tuner":
@@ -1018,7 +1018,7 @@ def main():
     parser.add_argument(
         "--script", "-s",
         default=None,
-        help="Path to SQL script for oneshot_script prompt (e.g., paper/sql/everyhousehold_deidentified.sql)",
+        help="Path to SQL script for beam_script prompt (e.g., paper/sql/everyhousehold_deidentified.sql)",
     )
     parser.add_argument(
         "--only",
@@ -1034,9 +1034,9 @@ def main():
     print(f"Version: {args.version}")
     print(f"{'='*70}")
 
-    # Build context (skip if only generating script oneshot)
+    # Build context (skip if only generating beam_script)
     ctx = None
-    if args.only != "oneshot_script":
+    if args.only != "beam_script":
         print("\nLoading data...")
         ctx = PromptContext(args.query_id)
 
