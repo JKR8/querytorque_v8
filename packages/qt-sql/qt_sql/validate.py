@@ -425,14 +425,17 @@ class Validator:
     - Performance benchmarking (1-1-2-2 pattern)
     """
 
-    def __init__(self, sample_db: str):
+    def __init__(self, sample_db: str = None, *, db_dsn: str = None):
         """Initialize validator.
 
         Args:
-            sample_db: Database connection string for validation
-                       (DuckDB path or PostgreSQL DSN)
+            sample_db: Deprecated alias for db_dsn (backward compatible).
+            db_dsn: Database connection string for validation
+                    (DuckDB path, PostgreSQL DSN, or Snowflake DSN).
         """
-        self.sample_db = sample_db
+        self.db_dsn = db_dsn or sample_db
+        if self.db_dsn is None:
+            raise ValueError("Must provide db_dsn (or sample_db)")
         self._validator = None
 
     def _get_validator(self):
@@ -440,15 +443,15 @@ class Validator:
         if self._validator is None:
             try:
                 # Detect database type from connection string
-                db_lower = self.sample_db.lower()
+                db_lower = self.db_dsn.lower()
                 if db_lower.startswith("postgres://") or db_lower.startswith("postgresql://"):
-                    self._validator = PostgresValidatorWrapper(self.sample_db)
+                    self._validator = ExecutorValidatorWrapper(self.db_dsn)
                 elif db_lower.startswith("snowflake://"):
-                    self._validator = PostgresValidatorWrapper(self.sample_db)
+                    self._validator = ExecutorValidatorWrapper(self.db_dsn)
                 else:
                     # DuckDB - use SQLValidator directly
                     from .validation.sql_validator import SQLValidator
-                    self._validator = SQLValidator(database=self.sample_db)
+                    self._validator = SQLValidator(database=self.db_dsn)
 
             except ImportError as e:
                 logger.warning(f"SQLValidator not available: {e}")
@@ -534,15 +537,14 @@ class Validator:
                 error_category=categorize_error(error_str),
             )
 
-    def benchmark_baseline(self, original_sql: str) -> OriginalBaseline:
-        """Benchmark original SQL once and return cached baseline.
-
-        Uses 3-run pattern (warmup + 2 measures, average) for DuckDB,
-        or simple 3-run for PostgreSQL. The baseline can be reused for
-        multiple validate_against_baseline() calls.
+    def benchmark_baseline(self, original_sql: str, runs: int = 3) -> OriginalBaseline:
+        """Benchmark original SQL and return cached baseline.
 
         Args:
             original_sql: The original SQL query
+            runs: Number of measurement runs.
+                  3 (default): warmup + 2 measures, average last 2.
+                  >=5: N measures, drop min/max, average middle (trimmed mean).
 
         Returns:
             OriginalBaseline with timing, rows, and checksum
@@ -554,27 +556,16 @@ class Validator:
         if validator is None:
             raise RuntimeError("Validator not available (missing qt_sql.validation)")
 
-        if isinstance(validator, PostgresValidatorWrapper):
-            # PostgreSQL: 3-run pattern using executor
-            # Use 300s timeout (matches R-Bot's timeout for fair comparison)
+        if isinstance(validator, ExecutorValidatorWrapper):
+            # PG/Snowflake path using executor
             pg_timeout_ms = 300_000
             executor = validator._get_executor()
 
             try:
-                # Warmup
-                executor.execute(original_sql, timeout_ms=pg_timeout_ms)
-
-                # Measure 1 (capture rows)
-                start = time.perf_counter()
-                rows = executor.execute(original_sql, timeout_ms=pg_timeout_ms)
-                t1 = (time.perf_counter() - start) * 1000
-
-                # Measure 2
-                start = time.perf_counter()
-                executor.execute(original_sql, timeout_ms=pg_timeout_ms)
-                t2 = (time.perf_counter() - start) * 1000
-
-                avg_ms = (t1 + t2) / 2
+                avg_ms, rows, all_times = _timed_runs_pg(
+                    executor, original_sql, runs=runs,
+                    capture_rows=True, timeout_ms=pg_timeout_ms,
+                )
 
                 # Compute checksum for correctness verification
                 checksum = None
@@ -582,10 +573,13 @@ class Validator:
                     from .validation.equivalence_checker import EquivalenceChecker
                     checksum = EquivalenceChecker().compute_checksum(rows)
 
-                logger.info(f"Baseline: {avg_ms:.1f}ms ({len(rows)} rows, checksum={checksum})")
+                logger.info(
+                    f"Baseline: {avg_ms:.1f}ms ({len(rows)} rows, "
+                    f"checksum={checksum}, runs={runs})"
+                )
 
                 # Collect EXPLAIN ANALYZE (non-blocking, after timing)
-                explain_text = _collect_explain_text(self.sample_db, original_sql)
+                explain_text = _collect_explain_text(self.db_dsn, original_sql)
 
                 return OriginalBaseline(
                     measured_time_ms=avg_ms,
@@ -596,15 +590,12 @@ class Validator:
                 )
             except Exception as e:
                 # Timeout or error — create timeout baseline
-                # This allows the swarm to still optimize timeout queries
-                # by recording the timeout ceiling as the baseline time
                 error_lower = str(e).lower()
                 if "timeout" in error_lower or "cancel" in error_lower:
                     logger.warning(
-                        f"Baseline (PG): TIMEOUT at {pg_timeout_ms}ms — "
+                        f"Baseline: TIMEOUT at {pg_timeout_ms}ms — "
                         f"using timeout ceiling as baseline"
                     )
-                    # Rollback the timed-out transaction
                     try:
                         executor.rollback()
                     except Exception:
@@ -616,9 +607,16 @@ class Validator:
                     )
                 raise  # Re-raise non-timeout errors
         else:
-            # DuckDB: use benchmarker's benchmark_single (3-run)
+            # DuckDB path
             benchmarker = validator._get_benchmarker()
-            result = benchmarker.benchmark_single(original_sql, capture_results=True)
+            if runs >= 5:
+                result = benchmarker.benchmark_single_trimmed_mean(
+                    original_sql, runs=runs, capture_results=True,
+                )
+            else:
+                result = benchmarker.benchmark_single(
+                    original_sql, capture_results=True,
+                )
 
             if result.error:
                 raise RuntimeError(f"Original query failed: {result.error}")
@@ -631,11 +629,11 @@ class Validator:
 
             logger.info(
                 f"Baseline (DuckDB): {result.timing.measured_time_ms:.1f}ms "
-                f"({result.row_count} rows)"
+                f"({result.row_count} rows, runs={runs})"
             )
 
             # Collect EXPLAIN ANALYZE (non-blocking, after timing)
-            explain_text = _collect_explain_text(self.sample_db, original_sql)
+            explain_text = _collect_explain_text(self.db_dsn, original_sql)
 
             return OriginalBaseline(
                 measured_time_ms=result.timing.measured_time_ms,
@@ -650,6 +648,7 @@ class Validator:
         baseline: OriginalBaseline,
         candidate_sql: str,
         worker_id: int,
+        runs: int = 3,
     ) -> ValidationResult:
         """Validate optimized SQL against a pre-computed baseline.
 
@@ -660,6 +659,7 @@ class Validator:
             baseline: Pre-computed original baseline
             candidate_sql: The optimized SQL to validate
             worker_id: Worker ID for tracking
+            runs: Number of measurement runs (3 default, >=5 for trimmed mean).
 
         Returns:
             ValidationResult with status, speedup, and errors
@@ -678,13 +678,13 @@ class Validator:
             )
 
         try:
-            if isinstance(validator, PostgresValidatorWrapper):
-                return self._validate_against_baseline_pg(
-                    validator, baseline, candidate_sql, worker_id
+            if isinstance(validator, ExecutorValidatorWrapper):
+                return self._validate_against_baseline_executor(
+                    validator, baseline, candidate_sql, worker_id, runs=runs,
                 )
             else:
                 return self._validate_against_baseline_duckdb(
-                    validator, baseline, candidate_sql, worker_id
+                    validator, baseline, candidate_sql, worker_id, runs=runs,
                 )
         except Exception as e:
             error_str = str(e)
@@ -705,6 +705,7 @@ class Validator:
         baseline: OriginalBaseline,
         candidate_sql: str,
         worker_id: int,
+        runs: int = 3,
     ) -> ValidationResult:
         """DuckDB path: benchmark candidate only, compare against baseline."""
         from .validation.schemas import ValidationStatus as QtStatus
@@ -727,9 +728,16 @@ class Validator:
                 error_category="syntax",
             )
 
-        # Benchmark candidate only (3-run)
+        # Benchmark candidate
         benchmarker = validator._get_benchmarker()
-        opt_result = benchmarker.benchmark_single(candidate_sql, capture_results=True)
+        if runs >= 5:
+            opt_result = benchmarker.benchmark_single_trimmed_mean(
+                candidate_sql, runs=runs, capture_results=True,
+            )
+        else:
+            opt_result = benchmarker.benchmark_single(
+                candidate_sql, capture_results=True,
+            )
 
         if opt_result.error:
             error_msg = f"Optimized query execution failed: {opt_result.error}"
@@ -788,7 +796,7 @@ class Validator:
         # Collect EXPLAIN ANALYZE on candidate (non-blocking, after timing)
         candidate_explain = None
         if ado_status == ValidationStatus.PASS:
-            candidate_explain = _collect_explain_text(self.sample_db, candidate_sql)
+            candidate_explain = _collect_explain_text(self.db_dsn, candidate_sql)
 
         return ValidationResult(
             worker_id=worker_id,
@@ -801,33 +809,26 @@ class Validator:
             explain_plan=candidate_explain,
         )
 
-    def _validate_against_baseline_pg(
+    def _validate_against_baseline_executor(
         self,
-        validator: "PostgresValidatorWrapper",
+        validator: "ExecutorValidatorWrapper",
         baseline: OriginalBaseline,
         candidate_sql: str,
         worker_id: int,
+        runs: int = 3,
     ) -> ValidationResult:
-        """PostgreSQL path: execute candidate only, compare against baseline."""
+        """PG/Snowflake path: execute candidate only, compare against baseline."""
         errors = []
         is_timeout_baseline = baseline.rows is None and baseline.row_count == 0
 
         executor = validator._get_executor()
 
-        # Time candidate (3-run: warmup + 2 measures) with 300s timeout
         cand_timeout_ms = 300_000
         try:
-            executor.execute(candidate_sql, timeout_ms=cand_timeout_ms)  # warmup
-
-            start = time.perf_counter()
-            cand_rows = executor.execute(candidate_sql, timeout_ms=cand_timeout_ms)
-            t1 = (time.perf_counter() - start) * 1000
-
-            start = time.perf_counter()
-            executor.execute(candidate_sql, timeout_ms=cand_timeout_ms)
-            t2 = (time.perf_counter() - start) * 1000
-
-            cand_time = (t1 + t2) / 2
+            cand_time, cand_rows, all_times = _timed_runs_pg(
+                executor, candidate_sql, runs=runs,
+                capture_rows=True, timeout_ms=cand_timeout_ms,
+            )
         except Exception as e:
             error_msg = f"Execution failed: {e}"
             # Rollback the failed transaction
@@ -889,7 +890,7 @@ class Validator:
         # Collect EXPLAIN ANALYZE on candidate (non-blocking, after timing)
         candidate_explain = None
         if ado_status == ValidationStatus.PASS:
-            candidate_explain = _collect_explain_text(self.sample_db, candidate_sql)
+            candidate_explain = _collect_explain_text(self.db_dsn, candidate_sql)
 
         return ValidationResult(
             worker_id=worker_id,
@@ -926,7 +927,7 @@ class Validator:
             ValidationResult with speedup computed against the baseline.
         """
         validator = self._get_validator()
-        if validator is None or not isinstance(validator, PostgresValidatorWrapper):
+        if validator is None or not isinstance(validator, ExecutorValidatorWrapper):
             error_msg = "Config validation requires PostgreSQL"
             return ValidationResult(
                 worker_id=worker_id,
@@ -974,7 +975,7 @@ class Validator:
             rewrite_rows, config_rows, rows_match, best_variant
         """
         validator = self._get_validator()
-        if validator is None or not isinstance(validator, PostgresValidatorWrapper):
+        if validator is None or not isinstance(validator, ExecutorValidatorWrapper):
             return {"error": "Requires PostgreSQL"}
         return validator.benchmark_three_variants(
             original_sql, rewrite_sql, config_commands
@@ -988,18 +989,74 @@ class Validator:
             self._validator = None
 
 
-class PostgresValidatorWrapper:
-    """Simple PostgreSQL validator wrapper using qt_sql executor.
+def _timed_runs_pg(executor, sql: str, runs: int = 3,
+                   capture_rows: bool = False,
+                   timeout_ms: int = 300_000):
+    """Execute sql with proper run pattern for PG/Snowflake.
 
-    This provides a validation interface for PostgreSQL databases
+    runs=3: warmup + 2 measures, average last 2  (default, backward compat)
+    runs>=5: N measures, drop min/max, average middle (N-2)  (trimmed mean)
+
+    Args:
+        executor: Database executor with .execute(sql, timeout_ms=...) method.
+        sql: SQL query to execute.
+        runs: Number of measurement runs (3 or >=5).
+        capture_rows: If True, capture result rows from first measured run.
+        timeout_ms: Per-execution timeout in milliseconds.
+
+    Returns:
+        (avg_ms, rows_or_None, all_times) tuple.
+    """
+    if runs >= 5:
+        # Trimmed mean: N runs, drop min/max, average middle
+        times = []
+        rows = None
+        for i in range(runs):
+            start = time.perf_counter()
+            result = executor.execute(sql, timeout_ms=timeout_ms)
+            elapsed = (time.perf_counter() - start) * 1000
+            times.append(elapsed)
+            if i == 0 and capture_rows:
+                rows = result
+            logger.debug(f"  run {i+1}/{runs}: {elapsed:.1f}ms")
+        times_sorted = sorted(times)
+        trimmed = times_sorted[1:-1]
+        avg_ms = sum(trimmed) / len(trimmed)
+        logger.info(
+            f"  trimmed mean ({runs} runs, drop min/max): {avg_ms:.1f}ms "
+            f"[{', '.join(f'{t:.0f}' for t in times)}]"
+        )
+        return avg_ms, rows, times
+    else:
+        # Default 3-run: warmup + 2 measures, average last 2
+        executor.execute(sql, timeout_ms=timeout_ms)  # warmup
+
+        start = time.perf_counter()
+        rows = executor.execute(sql, timeout_ms=timeout_ms)
+        t1 = (time.perf_counter() - start) * 1000
+
+        start = time.perf_counter()
+        executor.execute(sql, timeout_ms=timeout_ms)
+        t2 = (time.perf_counter() - start) * 1000
+
+        avg_ms = (t1 + t2) / 2
+        captured = rows if capture_rows else None
+        logger.debug(f"  3-run: warmup, {t1:.1f}ms, {t2:.1f}ms → avg {avg_ms:.1f}ms")
+        return avg_ms, captured, [t1, t2]
+
+
+class ExecutorValidatorWrapper:
+    """Executor-based validator wrapper for PostgreSQL and Snowflake.
+
+    This provides a validation interface for server databases
     that don't work with the DuckDB-based SQLValidator.
     """
 
     def __init__(self, dsn: str):
-        """Initialize with PostgreSQL DSN.
+        """Initialize with database DSN.
 
         Args:
-            dsn: PostgreSQL connection string
+            dsn: Database connection string (PostgreSQL or Snowflake DSN)
         """
         self.dsn = dsn
         self._executor = None
@@ -1303,3 +1360,7 @@ class PostgresValidatorWrapper:
         if self._executor is not None:
             self._executor.close()
             self._executor = None
+
+
+# Backward-compatible alias
+PostgresValidatorWrapper = ExecutorValidatorWrapper

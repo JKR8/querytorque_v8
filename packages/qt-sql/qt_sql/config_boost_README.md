@@ -191,7 +191,7 @@ Result: Average of measure1 and measure2
 - `tests/test_pg_tuner_llm.py` — LLM integration test
 
 **Validation:**
-- `validate.py::PostgresValidatorWrapper.benchmark_three_variants()` — 3-variant benchmark
+- `validate.py::ExecutorValidatorWrapper.benchmark_three_variants()` — 3-variant benchmark
 
 ## Known Limitations
 
