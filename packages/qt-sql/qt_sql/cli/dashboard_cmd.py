@@ -1,17 +1,19 @@
-"""qt dashboard — serve a live HTML dashboard for swarm session results."""
+"""qt dashboard — serve a live HTML dashboard for fleet + swarm results."""
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 import webbrowser
 from datetime import datetime
-from functools import partial
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import click
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -265,10 +267,21 @@ def collect_session(session_dir: Path) -> Optional[Dict[str, Any]]:
 
 
 def collect_dashboard_data(benchmark_dir: Path) -> Dict[str, Any]:
-    """Walk swarm_sessions/ and collect all session data for the dashboard."""
-    sessions_dir = benchmark_dir / "swarm_sessions"
-    config = _load_json(benchmark_dir / "config.json") or {}
+    """Collect all dashboard data using the WorkloadProfile pipeline."""
+    import dataclasses
+    from ..dashboard.collector import collect_workload_profile
 
+    config = _load_json(benchmark_dir / "config.json") or {}
+    engine = config.get("engine", "unknown")
+
+    # New forensic profile pipeline
+    profile = collect_workload_profile(benchmark_dir, engine)
+
+    # Legacy fleet data (still used by fleet table rendering)
+    fleet_queries, fleet_runs = _collect_fleet_data(benchmark_dir, engine)
+
+    # Collect swarm sessions (backward compat)
+    sessions_dir = benchmark_dir / "swarm_sessions"
     sessions: List[Dict[str, Any]] = []
     latest_ts: Optional[str] = None
 
@@ -279,10 +292,9 @@ def collect_dashboard_data(benchmark_dir: Path) -> Dict[str, Any]:
             session = collect_session(sd)
             if session:
                 sessions.append(session)
-                # Track latest run timestamp from log filename
                 log = _find_latest_log(sd)
                 if log:
-                    ts = log.stem.replace("run_", "")  # 20260212_014805_593077
+                    ts = log.stem.replace("run_", "")
                     if latest_ts is None or ts > latest_ts:
                         latest_ts = ts
 
@@ -295,12 +307,252 @@ def collect_dashboard_data(benchmark_dir: Path) -> Dict[str, Any]:
         except ValueError:
             latest_run = latest_ts
 
+    # Auto-detect mode: fleet if we have fleet queries, swarm otherwise
+    mode = "fleet" if fleet_queries else "swarm"
+
     return {
         "benchmark_name": benchmark_dir.name,
-        "engine": config.get("engine", "unknown"),
+        "engine": engine,
+        "mode": mode,
+        "profile": dataclasses.asdict(profile),
+        "fleet_queries": fleet_queries,
+        "fleet_runs": fleet_runs,
         "sessions": sessions,
         "latest_run": latest_run,
     }
+
+
+# ---------------------------------------------------------------------------
+# Fleet data collection
+# ---------------------------------------------------------------------------
+
+# Triage constants (mirror fleet/orchestrator.py)
+_RUNTIME_THRESHOLDS = [(100, "SKIP"), (1_000, "LOW"), (10_000, "MEDIUM"), (float("inf"), "HIGH")]
+_RUNTIME_WEIGHTS = {"SKIP": 0, "LOW": 1, "MEDIUM": 3, "HIGH": 5}
+_MAX_ITERS_BASE = {"SKIP": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+
+
+def _bucket_runtime(runtime_ms: float) -> str:
+    if runtime_ms < 0:
+        return "MEDIUM"
+    for threshold, bucket in _RUNTIME_THRESHOLDS:
+        if runtime_ms < threshold:
+            return bucket
+    return "HIGH"
+
+
+def _collect_fleet_data(
+    benchmark_dir: Path,
+    engine: str,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Run live AST detection + load fleet run results."""
+    queries_dir = benchmark_dir / "queries"
+    if not queries_dir.exists():
+        return [], []
+
+    # Load query SQL files
+    query_files = sorted(queries_dir.glob("*.sql"))
+    if not query_files:
+        return [], []
+
+    # Run AST detection (instant, no LLM)
+    transforms_catalog = None
+    try:
+        from ..detection import detect_transforms, load_transforms
+        transforms_catalog = load_transforms()
+    except Exception as e:
+        logger.warning(f"Detection unavailable: {e}")
+
+    engine_name = {"postgresql": "postgresql", "postgres": "postgresql"}.get(engine, engine)
+    dialect = "postgres" if engine in ("postgresql", "postgres") else engine
+
+    # Load cached classifications if available
+    classifications: Dict = {}
+    cls_path = benchmark_dir / "classifications.json"
+    if cls_path.exists():
+        try:
+            classifications = json.loads(cls_path.read_text())
+        except Exception:
+            pass
+
+    # Build per-query fleet data
+    fleet_queries: List[Dict[str, Any]] = []
+
+    for sql_path in query_files:
+        qid = sql_path.stem
+        sql = sql_path.read_text().strip()
+
+        # EXPLAIN timing
+        runtime_ms = _load_explain_timing(benchmark_dir, qid, engine)
+        bucket = _bucket_runtime(runtime_ms)
+
+        # AST detection
+        ast_matches = []
+        tractability = 0
+        structural_bonus = 0.0
+        top_transform = ""
+
+        if transforms_catalog and sql:
+            try:
+                matched = detect_transforms(
+                    sql, transforms_catalog,
+                    engine=engine_name, dialect=dialect,
+                )
+                ast_matches = [
+                    {"id": m.id, "overlap": round(m.overlap_ratio, 3),
+                     "gap": getattr(m, "gap", "")}
+                    for m in matched[:5]
+                    if m.overlap_ratio >= 0.25
+                ]
+                tractability = sum(1 for m in matched if m.overlap_ratio >= 0.6)
+                if matched:
+                    structural_bonus = matched[0].overlap_ratio
+                    top_transform = matched[0].id
+            except Exception as e:
+                logger.debug(f"[{qid}] Detection error: {e}")
+
+        # Priority score
+        weight = _RUNTIME_WEIGHTS.get(bucket, 0)
+        priority_score = weight * (1.0 + tractability + structural_bonus)
+
+        # Max iterations
+        base_iters = _MAX_ITERS_BASE.get(bucket, 0)
+        if bucket == "HIGH" and tractability >= 2:
+            max_iters = 5
+        elif bucket == "MEDIUM" and tractability >= 2:
+            max_iters = 3
+        else:
+            max_iters = base_iters
+
+        # Classification data
+        cls_data = classifications.get(qid, {})
+        llm_matches = cls_data.get("llm_matches", [])
+
+        fleet_queries.append({
+            "query_id": qid,
+            "runtime_ms": runtime_ms,
+            "bucket": bucket,
+            "tractability": tractability,
+            "structural_bonus": round(structural_bonus, 3),
+            "top_transform": top_transform,
+            "priority_score": round(priority_score, 1),
+            "max_iterations": max_iters,
+            "ast_matches": ast_matches,
+            "llm_matches": llm_matches,
+            "status": None,   # populated from latest run
+            "speedup": None,  # populated from latest run
+        })
+
+    # Sort by priority (descending)
+    fleet_queries.sort(key=lambda q: -q["priority_score"])
+
+    # Load fleet run results
+    fleet_runs = _load_fleet_runs(benchmark_dir, fleet_queries)
+
+    return fleet_queries, fleet_runs
+
+
+def _load_explain_timing(benchmark_dir: Path, query_id: str, engine: str) -> float:
+    """Extract execution time from cached EXPLAIN JSON."""
+    search_paths = [
+        benchmark_dir / "explains" / f"{query_id}.json",
+        benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
+        benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
+    ]
+
+    for path in search_paths:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text())
+
+            # DuckDB format
+            if "execution_time_ms" in data:
+                val = data["execution_time_ms"]
+                if val and val > 0:
+                    return float(val)
+
+            # PostgreSQL format
+            plan_json = data.get("plan_json")
+            if isinstance(plan_json, list) and plan_json:
+                exec_time = plan_json[0].get("Execution Time")
+                if exec_time is not None:
+                    return float(exec_time)
+
+            # DuckDB plan_json dict
+            if isinstance(plan_json, dict):
+                latency = plan_json.get("latency")
+                if latency and latency > 0:
+                    return float(latency) * 1000
+
+            # Snowflake: compilationTime + executionTime fields
+            comp_time = data.get("compilationTime")
+            exec_time = data.get("executionTime")
+            if exec_time is not None:
+                return float(exec_time)
+
+        except Exception:
+            pass
+
+    return -1.0
+
+
+def _load_fleet_runs(
+    benchmark_dir: Path,
+    fleet_queries: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Load results from runs/ directories and merge into fleet_queries."""
+    runs_dir = benchmark_dir / "runs"
+    if not runs_dir.exists():
+        return []
+
+    fleet_runs: List[Dict[str, Any]] = []
+    latest_results: Dict[str, Dict] = {}  # latest result per query_id
+
+    for run_dir in sorted(runs_dir.iterdir()):
+        if not run_dir.is_dir():
+            continue
+
+        summary = _load_json(run_dir / "summary.json")
+        if not summary:
+            continue
+
+        run_id = run_dir.name
+        results = summary.get("results", [])
+
+        # Parse timestamp from dir name
+        timestamp = ""
+        ts_match = re.search(r"(\d{8}_\d{6})", run_id)
+        if ts_match:
+            try:
+                dt = datetime.strptime(ts_match.group(1), "%Y%m%d_%H%M%S")
+                timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                timestamp = ts_match.group(1)
+
+        fleet_runs.append({
+            "run_id": run_id,
+            "timestamp": timestamp,
+            "mode": summary.get("mode", "unknown"),
+            "completed": summary.get("completed", 0),
+            "total": summary.get("total", 0),
+            "elapsed_seconds": summary.get("elapsed_seconds"),
+            "results": results,
+        })
+
+        # Track latest result per query
+        for r in results:
+            qid = r.get("query_id", "")
+            latest_results[qid] = r
+
+    # Merge latest run results into fleet_queries
+    for q in fleet_queries:
+        r = latest_results.get(q["query_id"])
+        if r:
+            q["status"] = r.get("status")
+            q["speedup"] = r.get("speedup")
+
+    return fleet_runs
 
 
 # ---------------------------------------------------------------------------
