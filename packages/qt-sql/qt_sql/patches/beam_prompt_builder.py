@@ -1,4 +1,4 @@
-"""Build oneshot patch optimization prompt with all 5 families + gold examples.
+"""Build beam patch optimization prompt with all 5 families + gold examples.
 
 The prompt shows all 5 optimization families (A-E) with gold examples,
 instructs the LLM to choose the 4 most relevant families for this specific query,
@@ -278,7 +278,7 @@ def build_beam_prompt(
     dialect: str,
     intelligence_brief: str = "",
 ) -> str:
-    """Build the complete oneshot patch optimization prompt.
+    """Build the complete beam patch optimization prompt.
 
     Args:
         query_id: Query identifier (e.g., "query_21")

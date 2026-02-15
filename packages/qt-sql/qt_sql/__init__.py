@@ -7,17 +7,10 @@ Pipeline:
 4. Validate:  Syntax check (deterministic)
 5. Validate:  Timing + correctness (3-run or 5-run)
 
-Optimization Modes:
-- BEAM:  Automated search: analyst → N workers → validate → snipe (default)
-- SWARM: Multi-worker fan-out with coach refinement (legacy)
-
 Usage:
     from qt_sql.pipeline import Pipeline
-    from qt_sql.schemas import OptimizationMode
     p = Pipeline("qt_sql/benchmarks/duckdb_tpcds")
-
-    # Beam mode (default, analyst → N workers → validate → snipe):
-    result = p.run_optimization_session("query_88", sql, mode=OptimizationMode.BEAM)
+    result = p.run_optimization_session("query_88", sql)
 """
 
 from .pipeline import Pipeline
@@ -34,8 +27,6 @@ from .schemas import (
 from .sessions import (
     OptimizationSession,
     BeamSession,
-    OneshotSession,
-    SwarmSession,
 )
 
 __all__ = [
@@ -44,8 +35,6 @@ __all__ = [
     "OptimizationMode",
     "OptimizationSession",
     "BeamSession",
-    "OneshotSession",
-    "SwarmSession",
     "PipelineResult",
     "PromotionAnalysis",
     "SessionResult",

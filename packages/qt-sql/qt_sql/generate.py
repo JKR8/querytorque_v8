@@ -1,4 +1,4 @@
-"""Candidate generation for ADO (parallel workers).
+"""Candidate generation (parallel workers).
 
 This module generates optimization candidates using LLM inference.
 Supports parallel generation with multiple workers.

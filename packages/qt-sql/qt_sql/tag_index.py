@@ -1306,7 +1306,7 @@ def rebuild_index() -> bool:
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Build ADO tag index")
+    parser = argparse.ArgumentParser(description="Build tag index")
     parser.add_argument("--stats", action="store_true", help="Show index statistics")
     parser.add_argument("--rebuild", action="store_true", help="Force rebuild index")
 

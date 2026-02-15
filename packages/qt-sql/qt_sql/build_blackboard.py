@@ -2367,7 +2367,7 @@ def phase4_promote_winners(
         }
 
         if not dry_run:
-            # Write to ADO examples
+            # Write to examples
             ado_examples_dir.mkdir(parents=True, exist_ok=True)
             ado_path = ado_examples_dir / f"{transform}.json"
             ado_path.write_text(json.dumps(example_data, indent=2))

@@ -1,4 +1,4 @@
-"""SQL rewriting for ADO - applies LLM optimizations to SQL.
+"""SQL rewriting — applies LLM optimizations to SQL.
 
 This module handles parsing LLM responses and applying SQL rewrites.
 Supports two JSON output formats:

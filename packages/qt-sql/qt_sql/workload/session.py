@@ -5,8 +5,8 @@ Pipeline:
 2. Quick-win fast path (top 3 → Tier 3 directly)
 3. Tier 1: fleet-level actions (config, indexes, statistics)
 4. Re-benchmark and re-triage
-5. Tier 2: light per-query optimization (single-pass tiered oneshot)
-6. Tier 3: deep per-query optimization (iterative tiered oneshot)
+5. Tier 2: light per-query optimization (single-pass beam)
+6. Tier 3: deep per-query optimization (iterative beam)
 7. Compile scorecard with business case
 """
 
@@ -191,7 +191,7 @@ class WorkloadSession:
     def _run_tier2(self, query_ids: List[str]) -> None:
         """Run Tier 2 light optimization on queries.
 
-        Single-pass tiered oneshot (analyst -> workers -> snipe once).
+        Single-pass beam (analyst -> workers -> snipe once).
         If pipeline is not available, records queries as NEUTRAL.
         """
         for qid in query_ids:
@@ -217,7 +217,7 @@ class WorkloadSession:
     def _run_tier3(self, query_ids: List[str]) -> None:
         """Run Tier 3 deep optimization on queries.
 
-        Full iterative tiered oneshot pipeline.
+        Full iterative beam pipeline.
         """
         for qid in query_ids:
             logger.info(f"Tier 3: {qid}")
@@ -272,7 +272,7 @@ class WorkloadSession:
                 "failure_reason": "Query SQL not found",
             }
 
-        # Run through canonical tiered oneshot pipeline
+        # Run through canonical beam pipeline
         try:
             from ..schemas import OptimizationMode
 

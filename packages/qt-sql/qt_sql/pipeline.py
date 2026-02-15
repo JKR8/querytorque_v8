@@ -1,4 +1,4 @@
-"""ADO pipeline orchestrator.
+"""QueryTorque pipeline orchestrator.
 
 Phases:
 1. Parse:     SQL → logical tree (deterministic structural parse)
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 class Pipeline:
-    """ADO pipeline with tag-based example retrieval, LLM rewrite, and validation."""
+    """QueryTorque pipeline with tag-based example retrieval, LLM rewrite, and validation."""
 
     def __init__(
         self,
@@ -770,7 +770,7 @@ class Pipeline:
             max_iterations: Max optimization rounds
             target_speedup: Stop early when this speedup is reached
             n_workers: Parallel workers per iteration
-            mode: Optimization mode (beam, oneshot (deprecated alias), swarm (legacy))
+            mode: Optimization mode (beam)
             orchestrator: Optional Orchestrator for declarative composition
             benchmark_lock: Optional threading.Lock for serializing benchmark
                 phases when running multiple sessions concurrently.
@@ -778,48 +778,19 @@ class Pipeline:
         Returns:
             SessionResult with the best result across all iterations
         """
-        # Beam mode (canonical): analyst → N workers → validate → snipe
-        if mode in (OptimizationMode.BEAM, OptimizationMode.ONESHOT) and patch:
-            from .sessions.beam_session import BeamSession
-            self.config.tiered_patch_enabled = True
-            self.config.benchmark_dsn = self.config.db_path_or_dsn
-            session = BeamSession(
-                pipeline=self,
-                query_id=query_id,
-                original_sql=sql,
-                target_speedup=target_speedup,
-                max_iterations=max_iterations,
-                patch=True,
-                benchmark_lock=benchmark_lock,
-            )
-        elif mode in (OptimizationMode.BEAM, OptimizationMode.ONESHOT):
-            from .sessions.beam_session import BeamSession
-            # Even without patch flag, beam now always uses tiered mode
-            self.config.tiered_patch_enabled = True
-            self.config.benchmark_dsn = self.config.db_path_or_dsn
-            session = BeamSession(
-                pipeline=self,
-                query_id=query_id,
-                original_sql=sql,
-                target_speedup=target_speedup,
-                max_iterations=max_iterations,
-                patch=True,
-                benchmark_lock=benchmark_lock,
-            )
-        elif mode == OptimizationMode.SWARM:
-            from .sessions.swarm_session import SwarmSession
-            session = SwarmSession(
-                pipeline=self,
-                query_id=query_id,
-                original_sql=sql,
-                max_iterations=max_iterations,
-                target_speedup=target_speedup,
-                n_workers=4,
-                orchestrator=orchestrator,
-                patch=patch,
-            )
-        else:
-            raise ValueError(f"Unknown optimization mode: {mode}")
+        # Beam mode: analyst → N workers → validate → snipe
+        from .sessions.beam_session import BeamSession
+        self.config.tiered_patch_enabled = True
+        self.config.benchmark_dsn = self.config.db_path_or_dsn
+        session = BeamSession(
+            pipeline=self,
+            query_id=query_id,
+            original_sql=sql,
+            target_speedup=target_speedup,
+            max_iterations=max_iterations,
+            patch=True,
+            benchmark_lock=benchmark_lock,
+        )
 
         if on_phase_change:
             session.on_phase_change = on_phase_change
@@ -1130,8 +1101,8 @@ class Pipeline:
     ) -> tuple[Optional[str], Optional[str], Optional[str], List[Dict[str, Any]]]:
         """Run LLM analyst to generate deep structural analysis.
 
-        Used by the run_query() path for single-pass optimization. Session
-        modes (oneshot/swarm) use gather_analyst_context() +
+        Used by the run_query() path for single-pass optimization. Beam
+        session uses gather_analyst_context() +
         build_analyst_briefing_prompt() directly instead.
 
         Returns:
@@ -1151,7 +1122,7 @@ class Pipeline:
         # Gather context via the shared method
         ctx = self.gather_analyst_context(query_id, sql, dialect, engine)
 
-        # Build the analysis prompt using swarm mode template (canonical §I-§VIII)
+        # Build the analysis prompt using canonical §I-§VIII template
         analysis_prompt = build_analyst_briefing_prompt(
             mode="swarm",
             query_id=query_id,
@@ -1539,7 +1510,7 @@ class Pipeline:
         return None
 
     # =========================================================================
-    # Shared analyst context gathering (used by swarm and oneshot)
+    # Shared analyst context gathering
     # =========================================================================
 
     def gather_analyst_context(

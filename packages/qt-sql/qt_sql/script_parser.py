@@ -20,7 +20,7 @@ Usage:
     print(dag.summary())
 
     for target in dag.optimization_targets():
-        # target.inner_select → feed to query structure parser + oneshot/swarm prompt
+        # target.inner_select → feed to query structure parser + beam prompt
         # target.creates_object → use as query_id
         ...
 """

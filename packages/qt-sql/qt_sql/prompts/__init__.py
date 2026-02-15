@@ -1,4 +1,4 @@
-"""ADO prompt builders for canonical modes: oneshot and swarm."""
+"""Prompt builders for beam mode."""
 
 from .swarm_fan_out import build_fan_out_prompt
 from .swarm_snipe import (

@@ -84,7 +84,7 @@ class BeamSession(OptimizationSession):
     """Iterative patch-plan optimization: prompt → 4 patches → validate → snipe."""
 
     def run(self) -> SessionResult:
-        """Execute the oneshot patch optimization loop.
+        """Execute the beam optimization loop.
 
         Dispatches to tiered mode if config.tiered_patch_enabled is True.
         """

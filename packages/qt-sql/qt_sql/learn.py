@@ -1,4 +1,4 @@
-"""Learning extraction and feedback system for ADO.
+"""Learning extraction and feedback system.
 
 This module extracts structured learning records from optimization attempts
 to enable the system to improve:

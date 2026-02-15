@@ -58,7 +58,7 @@ class TagRecommender:
             logger.info(f"Loaded tag index with {len(self.tag_entries)} examples")
 
         except Exception as e:
-            logger.warning(f"Failed to load ADO tag index: {e}")
+            logger.warning(f"Failed to load tag index: {e}")
 
     def find_similar_examples(
         self, sql: str, k: int = 5, dialect: str = "duckdb",

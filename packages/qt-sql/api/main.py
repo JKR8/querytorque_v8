@@ -156,8 +156,6 @@ async def optimize_sql(request: OptimizeRequest):
 
     mode_map = {
         "beam": OptimizationMode.BEAM,
-        "swarm": OptimizationMode.SWARM,
-        "oneshot": OptimizationMode.BEAM,  # deprecated alias
     }
     mode = mode_map[request.mode]
     query_id = request.query_id or f"api_{uuid.uuid4().hex[:8]}"

@@ -1,6 +1,6 @@
-"""ADO schemas (standalone).
+"""QueryTorque schemas.
 
-Data structures for the ADO pipeline:
+Data structures for the optimization pipeline:
 - Validation: ValidationStatus, ValidationResult
 - Pipeline: BenchmarkConfig, EdgeContract, NodeRewriteResult, PipelineResult
 """
@@ -16,10 +16,8 @@ from typing import Any, Dict, List, Optional
 
 
 class OptimizationMode(str, Enum):
-    """Optimization mode selection for the ADO pipeline."""
+    """Optimization mode selection."""
     BEAM = "beam"           # Automated search: analyst → N workers → validate → snipe
-    ONESHOT = "oneshot"     # Deprecated alias for BEAM
-    SWARM = "swarm"         # Multi-worker fan-out with coach refinement (legacy)
 
 
 class ValidationStatus(str, Enum):
@@ -236,7 +234,7 @@ class PipelineResult:
 
 @dataclass
 class WorkerResult:
-    """Result from a single optimization worker (used in swarm mode)."""
+    """Result from a single optimization worker."""
     worker_id: int
     strategy: str
     examples_used: List[str]

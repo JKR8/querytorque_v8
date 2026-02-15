@@ -26,7 +26,7 @@ def classify(
     """Batch classify queries against known pathologies.
 
     Runs AST detection + LLM classification for each query and saves
-    results to benchmark/classifications.json. Fleet and oneshot modes
+    results to benchmark/classifications.json. Fleet and beam modes
     load these at runtime to guide the analyst.
     """
     from ._common import (

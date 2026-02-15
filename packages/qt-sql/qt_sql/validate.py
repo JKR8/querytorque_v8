@@ -1,4 +1,4 @@
-"""Validation + scoring for ADO.
+"""Validation + scoring for QueryTorque.
 
 This module validates optimized SQL candidates using the qt_sql validation
 infrastructure. It benchmarks performance and checks semantic equivalence.
@@ -492,13 +492,13 @@ class Validator:
         try:
             result = validator.validate(original_sql, candidate_sql)
 
-            # Map qt_sql ValidationStatus to ADO ValidationStatus
+            # Map qt_sql ValidationStatus to pipeline ValidationStatus
             from .validation.schemas import ValidationStatus as QtStatus
 
             status_map = {
                 QtStatus.PASS: ValidationStatus.PASS,
                 QtStatus.FAIL: ValidationStatus.FAIL,
-                QtStatus.WARN: ValidationStatus.FAIL,  # Treat warnings as failures for ADO
+                QtStatus.WARN: ValidationStatus.FAIL,  # Treat warnings as failures
                 QtStatus.ERROR: ValidationStatus.ERROR,
             }
 

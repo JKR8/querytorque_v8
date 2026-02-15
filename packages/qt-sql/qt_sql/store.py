@@ -1,4 +1,4 @@
-"""Store artifacts and update indexes for ADO."""
+"""Store artifacts and update indexes."""
 
 from __future__ import annotations
 
