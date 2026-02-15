@@ -135,6 +135,33 @@ _WINDOW_KEYWORDS = {"window", "rank", "row_number", "dense_rank", "ntile", "lead
 # TPC-DS multi-channel fact tables
 _CHANNEL_FACT_TABLES = {"store_sales", "catalog_sales", "web_sales"}
 
+# TPC-DS column prefix → table name (for resolving unqualified columns)
+_COL_PREFIX_TO_TABLE = {
+    "ss_": "store_sales", "cs_": "catalog_sales", "ws_": "web_sales",
+    "sr_": "store_returns", "cr_": "catalog_returns", "wr_": "web_returns",
+    "inv_": "inventory",
+    "i_": "item", "d_": "date_dim", "s_": "store", "c_": "customer",
+    "ca_": "customer_address", "cd_": "customer_demographics",
+    "hd_": "household_demographics", "w_": "warehouse", "p_": "promotion",
+    "t_": "time_dim", "ib_": "income_band", "r_": "reason",
+    "sm_": "ship_mode", "wp_": "web_page", "cp_": "catalog_page",
+    "cc_": "call_center",
+}
+
+
+def _resolve_column_table(col_name: str) -> str:
+    """Resolve an unqualified TPC-DS column name to its table via prefix.
+
+    Returns table name or empty string if no match.
+    Matches longest prefix first to avoid ambiguity (e.g. 'inv_' before 'i_').
+    """
+    col_lower = col_name.lower()
+    # Sort by prefix length descending so longer prefixes match first
+    for prefix in sorted(_COL_PREFIX_TO_TABLE, key=len, reverse=True):
+        if col_lower.startswith(prefix):
+            return _COL_PREFIX_TO_TABLE[prefix]
+    return ""
+
 
 def extract_tags(sql: str, dialect: str = "duckdb") -> Set[str]:
     """Extract tags from SQL using AST analysis with regex fallback.
@@ -252,15 +279,30 @@ def extract_tags(sql: str, dialect: str = "duckdb") -> Set[str]:
             tags.add("multi_cte")
 
         # Correlated subquery: subquery referencing outer columns
+        all_tables = set(table_names)
         for sq in ast.find_all(exp.Subquery):
-            # Simple heuristic: if subquery contains Column refs that don't
-            # match tables inside the subquery, it's likely correlated
             sq_tables = {t.name.lower() for t in sq.find_all(exp.Table) if t.name}
+            # Also collect aliases inside the subquery
+            sq_aliases = set()
+            for t in sq.find_all(exp.Table):
+                if t.alias:
+                    sq_aliases.add(t.alias.lower())
+            sq_scope = sq_tables | sq_aliases
+            outer_tables = all_tables - sq_tables
             for col in sq.find_all(exp.Column):
                 tbl = col.table.lower() if col.table else ""
-                if tbl and tbl not in sq_tables:
-                    tags.add("correlated_subquery")
-                    break
+                if tbl:
+                    # Qualified column: if table/alias not in subquery scope,
+                    # it references an outer table
+                    if tbl not in sq_scope:
+                        tags.add("correlated_subquery")
+                        break
+                else:
+                    # Unqualified column: resolve via prefix map
+                    resolved = _resolve_column_table(col.name) if col.name else ""
+                    if resolved and resolved not in sq_tables and resolved in outer_tables:
+                        tags.add("correlated_subquery")
+                        break
             if "correlated_subquery" in tags:
                 break
 
@@ -411,17 +453,36 @@ def _extract_subquery_correlation_tags(ast, tags: Set[str]) -> None:
 
     For each subquery, determines if it's correlated (references outer scope)
     or independent (self-contained). Also tracks nesting depth.
+    Handles both qualified (table.col) and unqualified (col) column refs
+    using TPC-DS column prefix resolution.
+
+    Also detects scalar aggregate subqueries used in comparisons
+    (the P3 decorrelation pattern).
 
     Emits:
     - correlated_sub: At least one correlated subquery found
     - independent_sub: At least one independent subquery found
     - sub_nesting_depth:N: Maximum subquery nesting depth
+    - scalar_agg_sub: Correlated scalar aggregate subquery that scans a raw
+      fact table (P3 decorrelation opportunity — real win)
+    - scalar_agg_sub_cte: Correlated scalar aggregate subquery that scans a
+      CTE (NOT an opportunity — CTE is auto-materialized, decorrelation
+      replaces a cheap scan with a cheap join)
     """
     from sqlglot import exp
 
     subqueries = list(ast.find_all(exp.Subquery))
     if not subqueries:
         return
+
+    # All tables in the full query (for resolving outer references)
+    all_tables = {t.name.lower() for t in ast.find_all(exp.Table) if t.name}
+
+    # Collect CTE names defined in this query
+    cte_names = set()
+    for cte in ast.find_all(exp.CTE):
+        if cte.alias:
+            cte_names.add(cte.alias.lower())
 
     correlated_count = 0
     independent_count = 0
@@ -436,23 +497,49 @@ def _extract_subquery_correlation_tags(ast, tags: Set[str]) -> None:
                 depth += 1
             parent = getattr(parent, "parent", None)
 
-        # Depth is relative to root (outermost subquery = depth 1)
         actual_depth = depth + 1
         max_depth = max(max_depth, actual_depth)
 
         # Check correlation: does subquery reference columns from outer scope?
         sq_tables = {t.name.lower() for t in sq.find_all(exp.Table) if t.name}
+        sq_aliases = set()
+        for t in sq.find_all(exp.Table):
+            if t.alias:
+                sq_aliases.add(t.alias.lower())
+        sq_scope = sq_tables | sq_aliases
+        outer_tables = all_tables - sq_tables
         is_correlated = False
         for col in sq.find_all(exp.Column):
             tbl = col.table.lower() if col.table else ""
-            if tbl and tbl not in sq_tables:
-                is_correlated = True
-                break
+            if tbl:
+                if tbl not in sq_scope:
+                    is_correlated = True
+                    break
+            else:
+                # Unqualified: resolve via column prefix map
+                resolved = _resolve_column_table(col.name) if col.name else ""
+                if resolved and resolved not in sq_tables and resolved in outer_tables:
+                    is_correlated = True
+                    break
 
         if is_correlated:
             correlated_count += 1
         else:
             independent_count += 1
+
+        # Scalar aggregate subquery: subquery contains aggregate AND
+        # is used in a comparison (WHERE col > (SELECT avg(...) ...))
+        has_agg = bool(list(sq.find_all(exp.AggFunc)))
+        if has_agg:
+            parent_node = sq.parent
+            comparison_types = (exp.GT, exp.LT, exp.GTE, exp.LTE, exp.EQ, exp.NEQ)
+            if isinstance(parent_node, comparison_types):
+                # Check if inner FROM tables are all CTEs (no raw fact scan)
+                scans_cte_only = sq_tables and sq_tables.issubset(cte_names)
+                if scans_cte_only:
+                    tags.add("scalar_agg_sub_cte")
+                else:
+                    tags.add("scalar_agg_sub")
 
     if correlated_count > 0:
         tags.add("correlated_sub")
@@ -690,6 +777,8 @@ _TAG_TO_FEATURE = {
     "exists": "EXISTS",
     "cte": "CTE",
     "correlated_sub": "CORRELATED_SUB",
+    "scalar_agg_sub": "SCALAR_AGG_SUB",
+    "scalar_agg_sub_cte": "SCALAR_AGG_SUB_CTE",
     "between": "BETWEEN",
     "multi_channel": "MULTI_CHANNEL",
     "star_join_pattern": "STAR_JOIN",

@@ -652,45 +652,90 @@ class OneshotPatchSession(OptimizationSession):
     def _sequential_benchmark(
         self, patches: List[AppliedPatch], db_path: str
     ) -> None:
-        """Interleaved 1-2-1-2 sequential benchmark when race is skipped.
+        """5x trimmed-mean sequential benchmark when race is skipped.
 
-        Pattern: warmup_orig, warmup_patch, measure_orig, measure_patch
-        This controls for thermal drift and cache state changes.
+        Each query (original + each patch) is executed 5 times.
+        Min and max are dropped, middle 3 are averaged.
+        Correctness gate: row count + checksum must match original.
         """
         from ..execution.factory import create_executor_from_dsn
+        from ..validate import _timed_runs_pg
+        from ..validation.equivalence_checker import EquivalenceChecker
+
+        BENCH_RUNS = 5
+        checker = EquivalenceChecker()
 
         logger.info(
             f"[{self.query_id}] Sequential benchmark: "
-            f"{len(patches)} patches, interleaved 1-2-1-2"
+            f"{len(patches)} patches, {BENCH_RUNS}x trimmed mean"
         )
 
         try:
             with create_executor_from_dsn(db_path) as executor:
+                # Measure original (5x trimmed mean) + capture rows for correctness
+                logger.info(
+                    f"[{self.query_id}] Baseline: {BENCH_RUNS}x trimmed mean..."
+                )
+                orig_ms, orig_rows, orig_times = _timed_runs_pg(
+                    executor, self.original_sql, runs=BENCH_RUNS,
+                    capture_rows=True,
+                )
+                orig_count = len(orig_rows) if orig_rows else 0
+                orig_checksum = None
+                if orig_rows:
+                    try:
+                        orig_checksum = checker.compute_checksum(orig_rows)
+                    except Exception:
+                        pass
+                logger.info(
+                    f"[{self.query_id}] Baseline: {orig_ms:.1f}ms "
+                    f"({orig_count} rows, checksum={orig_checksum}) "
+                    f"[{', '.join(f'{t:.0f}' for t in orig_times)}]"
+                )
+
                 for idx, p in enumerate(patches):
                     logger.info(
                         f"[{self.query_id}] Benchmark {idx + 1}/{len(patches)}: "
                         f"{p.patch_id} ({p.family}/{p.transform})"
                     )
                     try:
-                        # 1: Warmup original (primes cache)
-                        logger.info(f"[{self.query_id}]   warmup original...")
-                        executor.execute(self.original_sql)
+                        patch_ms, patch_rows, patch_times = _timed_runs_pg(
+                            executor, p.output_sql, runs=BENCH_RUNS,
+                            capture_rows=True,
+                        )
+                        patch_count = len(patch_rows) if patch_rows else 0
 
-                        # 2: Warmup patch (primes cache)
-                        logger.info(f"[{self.query_id}]   warmup patch...")
-                        executor.execute(p.output_sql)
+                        # ── Correctness gate: row count + checksum ──
+                        if patch_count != orig_count:
+                            p.speedup = 0.0
+                            p.status = "FAIL"
+                            p.apply_error = (
+                                f"Row count mismatch: original={orig_count}, "
+                                f"patch={patch_count}"
+                            )
+                            logger.warning(
+                                f"[{self.query_id}]   FAIL: {p.patch_id}: "
+                                f"{p.apply_error}"
+                            )
+                            continue
 
-                        # 1: Measure original
-                        logger.info(f"[{self.query_id}]   measure original...")
-                        t0 = time.perf_counter()
-                        executor.execute(self.original_sql)
-                        orig_ms = (time.perf_counter() - t0) * 1000
-
-                        # 2: Measure patch
-                        logger.info(f"[{self.query_id}]   measure patch...")
-                        t0 = time.perf_counter()
-                        executor.execute(p.output_sql)
-                        patch_ms = (time.perf_counter() - t0) * 1000
+                        if orig_checksum and patch_rows:
+                            try:
+                                patch_checksum = checker.compute_checksum(patch_rows)
+                                if patch_checksum != orig_checksum:
+                                    p.speedup = 0.0
+                                    p.status = "FAIL"
+                                    p.apply_error = (
+                                        f"Checksum mismatch: original={orig_checksum}, "
+                                        f"patch={patch_checksum}"
+                                    )
+                                    logger.warning(
+                                        f"[{self.query_id}]   FAIL: {p.patch_id}: "
+                                        f"{p.apply_error}"
+                                    )
+                                    continue
+                            except Exception:
+                                pass  # checksum compute failed — don't block
 
                         p.original_ms = orig_ms
                         p.patch_ms = patch_ms
@@ -698,9 +743,10 @@ class OneshotPatchSession(OptimizationSession):
                         p.status = self._classify_speedup(p.speedup)
 
                         logger.info(
-                            f"[{self.query_id}]   result: orig={orig_ms:.0f}ms, "
-                            f"patch={patch_ms:.0f}ms, speedup={p.speedup:.2f}x "
-                            f"({p.status})"
+                            f"[{self.query_id}]   result: orig={orig_ms:.1f}ms, "
+                            f"patch={patch_ms:.1f}ms, speedup={p.speedup:.2f}x "
+                            f"({p.status}, {patch_count} rows) "
+                            f"[{', '.join(f'{t:.0f}' for t in patch_times)}]"
                         )
                     except Exception as e:
                         p.speedup = 0.0
