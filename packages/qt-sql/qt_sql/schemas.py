@@ -117,6 +117,11 @@ class BenchmarkConfig:
     semantic_sample_pct: float = 2.0  # TABLESAMPLE percentage
     semantic_timeout_ms: int = 30_000  # 30s max per mini query
 
+    # Tiered patch mode (analyst + worker split)
+    tiered_patch_enabled: bool = False
+    analyst_model: str = "deepseek/deepseek-reasoner"
+    worker_model: str = "qwen/qwen3-coder"
+
     @classmethod
     def from_file(cls, config_path: str | Path) -> BenchmarkConfig:
         """Load config from a JSON file."""
@@ -140,6 +145,9 @@ class BenchmarkConfig:
             semantic_validation_enabled=data.get("semantic_validation_enabled", False),
             semantic_sample_pct=data.get("semantic_sample_pct", 2.0),
             semantic_timeout_ms=data.get("semantic_timeout_ms", 30_000),
+            tiered_patch_enabled=data.get("tiered_patch_enabled", False),
+            analyst_model=data.get("analyst_model", "deepseek/deepseek-reasoner"),
+            worker_model=data.get("worker_model", "qwen/qwen3-coder"),
         )
 
 

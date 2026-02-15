@@ -80,7 +80,16 @@ class OneshotPatchSession(OptimizationSession):
     """Iterative patch-plan optimization: prompt → 4 patches → validate → snipe."""
 
     def run(self) -> SessionResult:
-        """Execute the oneshot patch optimization loop."""
+        """Execute the oneshot patch optimization loop.
+
+        Dispatches to tiered mode if config.tiered_patch_enabled is True.
+        """
+        if getattr(self.pipeline.config, "tiered_patch_enabled", False):
+            return self._run_tiered()
+        return self._run_single_tier()
+
+    def _run_single_tier(self) -> SessionResult:
+        """Original single-tier patch loop (DeepSeek does everything)."""
         from ..ir import build_script_ir, render_ir_node_map, Dialect
         from ..patches.oneshot_patch_prompt_builder import (
             build_oneshot_patch_prompt,
@@ -390,6 +399,254 @@ class OneshotPatchSession(OptimizationSession):
             n_iterations=len(iterations_data),
             n_api_calls=total_api_calls,
         )
+
+    # ── Tiered Mode ─────────────────────────────────────────────────────────
+
+    def _run_tiered(self) -> SessionResult:
+        """2-tier patch mode: DeepSeek analyst → qwen workers → validate."""
+        from ..ir import build_script_ir, render_ir_node_map, Dialect
+        from ..patches.oneshot_patch_prompt_builder import load_gold_examples
+        from ..patches.tiered_orchestrator import TieredOrchestrator
+        from ..execution.database_utils import run_explain_analyze, run_explain_text
+
+        logger.info(
+            f"[{self.query_id}] OneshotPatchSession TIERED: "
+            f"max {self.max_iterations} iterations, "
+            f"target {self.target_speedup:.1f}x"
+        )
+
+        # ── Setup ──────────────────────────────────────────────────────
+        db_path = self.pipeline.config.benchmark_dsn or self.pipeline.config.db_path_or_dsn
+        dialect_upper = self.dialect.upper()
+        dialect_enum = (
+            Dialect[dialect_upper]
+            if dialect_upper in Dialect.__members__
+            else Dialect.POSTGRES
+        )
+
+        session_dir = self._create_session_dir()
+        script_ir = build_script_ir(self.original_sql, dialect_enum)
+        ir_node_map = render_ir_node_map(script_ir)
+
+        # Get EXPLAIN
+        original_explain = ""
+        explain_result = run_explain_analyze(db_path, self.original_sql)
+        if explain_result:
+            original_explain = explain_result.get("plan_text", "")
+        if not original_explain:
+            original_explain = run_explain_text(db_path, self.original_sql) or "(EXPLAIN unavailable)"
+
+        gold_examples = load_gold_examples(self.dialect)
+
+        # ── Build LLM call functions ──────────────────────────────────
+        analyst_call_fn = self._make_llm_call_fn(
+            getattr(self.pipeline.config, "analyst_model", None)
+        )
+        worker_call_fn = self._make_llm_call_fn(
+            getattr(self.pipeline.config, "worker_model", None)
+        )
+
+        orchestrator = TieredOrchestrator(
+            analyst_call_fn=analyst_call_fn,
+            worker_call_fn=worker_call_fn,
+            gold_examples=gold_examples,
+            dialect=self.dialect,
+        )
+
+        # ── Iteration State ────────────────────────────────────────────
+        best_speedup = 0.0
+        best_sql = self.original_sql
+        best_transforms: List[str] = []
+        best_status = "NEUTRAL"
+        iterations_data: List[PatchIterationResult] = []
+        total_api_calls = 0
+
+        for iteration in range(self.max_iterations):
+            logger.info(
+                f"[{self.query_id}] Tiered iteration {iteration + 1}/{self.max_iterations}"
+            )
+            iter_api_calls = 0
+
+            # ── Phase 1: Analyst call ─────────────────────────────────
+            targets, analyst_prompt, analyst_response = orchestrator.run_analyst(
+                query_id=self.query_id,
+                original_sql=self.original_sql,
+                explain_text=original_explain,
+                ir_node_map=ir_node_map,
+            )
+            iter_api_calls += 1
+
+            self._save_to_disk(session_dir, iteration, "analyst_prompt", analyst_prompt)
+            self._save_to_disk(session_dir, iteration, "analyst_response", analyst_response)
+
+            if not targets:
+                logger.warning(f"[{self.query_id}] No analyst targets parsed")
+                iterations_data.append(PatchIterationResult(
+                    iteration=iteration,
+                    prompt=analyst_prompt,
+                    response=analyst_response,
+                    n_api_calls=iter_api_calls,
+                ))
+                total_api_calls += iter_api_calls
+                continue
+
+            # Save target summaries
+            self._save_to_disk(
+                session_dir, iteration, "targets",
+                json.dumps([t.to_dict() for t in targets], indent=2)
+            )
+
+            # ── Phase 2: Worker calls (parallel) ─────────────────────
+            patches = orchestrator.run_workers(
+                original_sql=self.original_sql,
+                ir_node_map=ir_node_map,
+                targets=targets,
+                script_ir=script_ir,
+                dialect_enum=dialect_enum,
+            )
+            iter_api_calls += len(targets)  # one worker call per target
+
+            applied = [p for p in patches if p.output_sql]
+            logger.info(
+                f"[{self.query_id}] Workers: {len(applied)}/{len(patches)} patches applied"
+            )
+
+            # ── Phase 2.5: Worker retry for failed patches ────────────
+            failed = [p for p in patches if not p.output_sql and p.apply_error]
+            for p in failed:
+                target_match = next(
+                    (t for t in targets if t.target_id == p.patch_id), None
+                )
+                if not target_match:
+                    continue
+
+                for retry_num in range(2):
+                    logger.info(
+                        f"[{self.query_id}] Worker retry {retry_num + 1}/2 "
+                        f"for {p.patch_id}: {p.apply_error[:60]}"
+                    )
+                    retried = orchestrator.retry_worker(
+                        original_sql=self.original_sql,
+                        ir_node_map=ir_node_map,
+                        target=target_match,
+                        error=p.apply_error,
+                        script_ir=script_ir,
+                        dialect_enum=dialect_enum,
+                    )
+                    iter_api_calls += 1
+
+                    if retried and retried.output_sql:
+                        # Replace failed patch with retried version
+                        idx = patches.index(p)
+                        patches[idx] = retried
+                        applied.append(retried)
+                        logger.info(
+                            f"[{self.query_id}] Worker retry SUCCESS for {p.patch_id}"
+                        )
+                        break
+
+            if not applied:
+                iterations_data.append(PatchIterationResult(
+                    iteration=iteration,
+                    prompt=analyst_prompt,
+                    response=analyst_response,
+                    n_api_calls=iter_api_calls,
+                    patches=patches,
+                ))
+                total_api_calls += iter_api_calls
+                continue
+
+            # ── Phase 3: Validate (reuse existing) ─────────────────────
+            iter_result = self._validate_patches(applied, db_path)
+            iter_result.iteration = iteration
+            iter_result.prompt = analyst_prompt
+            iter_result.response = analyst_response
+            iter_result.n_api_calls = iter_api_calls
+
+            # Include all patches (applied + failed) for diagnosis
+            all_patches = []
+            applied_ids = {p.patch_id for p in applied}
+            for p in patches:
+                if p.patch_id in applied_ids:
+                    validated = next(
+                        (a for a in applied if a.patch_id == p.patch_id), p
+                    )
+                    all_patches.append(validated)
+                else:
+                    all_patches.append(p)
+            iter_result.patches = all_patches
+
+            iterations_data.append(iter_result)
+            total_api_calls += iter_api_calls
+
+            # Persist
+            self._save_to_disk(
+                session_dir, iteration, "result",
+                json.dumps(self._serialize_iteration(iter_result), indent=2, default=str)
+            )
+
+            # ── Track best ──────────────────────────────────────────────
+            if iter_result.best_speedup >= 1.0 and iter_result.best_speedup > best_speedup:
+                best_speedup = iter_result.best_speedup
+                best_sql = iter_result.best_sql or self.original_sql
+                best_patch = next(
+                    (p for p in all_patches if p.patch_id == iter_result.best_patch_id),
+                    None,
+                )
+                if best_patch:
+                    best_transforms = [best_patch.transform]
+                best_status = self._classify_speedup(best_speedup)
+
+            logger.info(
+                f"[{self.query_id}] Tiered iteration {iteration + 1}: "
+                f"best={best_speedup:.2f}x ({best_status})"
+            )
+
+            if best_speedup >= self.target_speedup:
+                logger.info(
+                    f"[{self.query_id}] Target {self.target_speedup:.1f}x reached "
+                    f"({best_speedup:.2f}x) — stopping"
+                )
+                break
+
+        return SessionResult(
+            query_id=self.query_id,
+            mode="oneshot_patch_tiered",
+            best_speedup=best_speedup,
+            best_sql=best_sql,
+            original_sql=self.original_sql,
+            best_transforms=best_transforms,
+            status=best_status,
+            iterations=[self._serialize_iteration(it) for it in iterations_data],
+            n_iterations=len(iterations_data),
+            n_api_calls=total_api_calls,
+        )
+
+    def _make_llm_call_fn(self, model_spec: Optional[str] = None) -> callable:
+        """Create an LLM call function for a specific model.
+
+        Args:
+            model_spec: "provider/model" string (e.g., "deepseek/deepseek-reasoner")
+                or None to use the pipeline's default.
+
+        Returns:
+            Callable that takes prompt string, returns response string.
+        """
+        if not model_spec or "/" not in model_spec:
+            # Use default pipeline generator
+            from ..generate import CandidateGenerator
+            generator = CandidateGenerator(
+                provider=self.pipeline.provider,
+                model=self.pipeline.model,
+                analyze_fn=self.pipeline.analyze_fn,
+            )
+            return lambda prompt: self._call_llm_with_timeout(generator, prompt)
+
+        provider, model = model_spec.split("/", 1)
+
+        from ..generate import CandidateGenerator
+        generator = CandidateGenerator(provider=provider, model=model)
+        return lambda prompt: self._call_llm_with_timeout(generator, prompt)
 
     # ── Internal Methods ────────────────────────────────────────────────────
 

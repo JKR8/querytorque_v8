@@ -130,6 +130,17 @@ def format_family_section(
         lines.append("**AFTER (fast):**")
         lines.append(f"```sql\n{after_display}\n```")
 
+    # IR node maps (if enriched)
+    ir_before = gold_example.get("ir_node_map_before")
+    ir_target = gold_example.get("ir_node_map_target")
+    if ir_before and ir_target:
+        lines.append("")
+        lines.append("**IR BEFORE:**")
+        lines.append(f"```\n{ir_before}\n```")
+        lines.append("")
+        lines.append("**IR TARGET:**")
+        lines.append(f"```\n{ir_target}\n```")
+
     # Patch plan (if available)
     patch_plan = gold_example.get("patch_plan")
     if patch_plan:
@@ -142,45 +153,26 @@ def format_family_section(
     return "\n".join(lines)
 
 
-# ── Main Prompt Builder ────────────────────────────────────────────────────
+# ── Shared Prompt Body (Sections 1-5) ──────────────────────────────────────
 
-def build_oneshot_patch_prompt(
+def _build_prompt_body(
     query_id: str,
     original_sql: str,
     explain_text: str,
     ir_node_map: str,
     all_5_examples: Dict[str, Dict[str, Any]],
-    dialect: str
-) -> str:
-    """Build the complete oneshot patch optimization prompt.
-
-    Args:
-        query_id: Query identifier (e.g., "query_21")
-        original_sql: Full original SQL
-        explain_text: EXPLAIN ANALYZE output as text
-        ir_node_map: IR node map (from render_ir_node_map)
-        all_5_examples: Dict mapping family ID (A-E) to gold example JSON
-        dialect: SQL dialect (duckdb, postgres, snowflake)
+    dialect: str,
+    role_text: str,
+) -> tuple[List[str], int]:
+    """Build sections 1-5 shared by single-tier and tiered prompts.
 
     Returns:
-        Complete prompt string
+        (sections, n_families) — list of section strings, count of families with plans.
     """
-
     sections = []
 
     # ── Section 1: Role ─────────────────────────────────────────────────
-    sections.append("""## Role
-
-You are a SQL optimization specialist. Your task is to propose **exactly 4 independent patch plans** for this query, each targeting a different optimization family.
-
-Each patch plan must:
-- Be atomic (steps applied sequentially: s1 → s2 → s3 → ...)
-- Transform the original query using patch operations
-- Preserve semantic equivalence (same rows, columns, ordering)
-- Follow the patterns shown in reference examples below
-
-You will **choose 4 of the 5 families** based on relevance to THIS SPECIFIC QUERY.
-""")
+    sections.append(f"## Role\n\n{role_text}")
 
     # ── Section 2: Query ────────────────────────────────────────────────
     sections.append(f"""## Query: {query_id}
@@ -210,7 +202,7 @@ You will **choose 4 of the 5 families** based on relevance to THIS SPECIFIC QUER
 **Note**: Use `by_node_id` (e.g., "S0") and `by_anchor_hash` (16-char hex) from map above to target patch operations.
 """)
 
-    # ── Section 5: Families with patch plan examples ─────────────────────
+    # ── Section 5: Families with examples ─────────────────────────────
     families_with_plans = [f for f in ["A", "B", "C", "D", "E"]
                            if f in all_5_examples and all_5_examples[f].get("patch_plan")]
     n_families = len(families_with_plans)
@@ -232,7 +224,50 @@ Choose up to **{min(4, n_families)} most relevant families** for this query base
             sections.append(format_family_section(family_id, ex))
             sections.append("")
 
-    # ── Section 6: Output Format ────────────────────────────────────────
+    return sections, n_families
+
+
+# ── Main Prompt Builder ────────────────────────────────────────────────────
+
+def build_oneshot_patch_prompt(
+    query_id: str,
+    original_sql: str,
+    explain_text: str,
+    ir_node_map: str,
+    all_5_examples: Dict[str, Dict[str, Any]],
+    dialect: str
+) -> str:
+    """Build the complete oneshot patch optimization prompt.
+
+    Args:
+        query_id: Query identifier (e.g., "query_21")
+        original_sql: Full original SQL
+        explain_text: EXPLAIN ANALYZE output as text
+        ir_node_map: IR node map (from render_ir_node_map)
+        all_5_examples: Dict mapping family ID (A-E) to gold example JSON
+        dialect: SQL dialect (duckdb, postgres, snowflake)
+
+    Returns:
+        Complete prompt string
+    """
+    role_text = (
+        "You are a SQL optimization specialist. Your task is to propose "
+        "**exactly 4 independent patch plans** for this query, each targeting "
+        "a different optimization family.\n\n"
+        "Each patch plan must:\n"
+        "- Be atomic (steps applied sequentially: s1 → s2 → s3 → ...)\n"
+        "- Transform the original query using patch operations\n"
+        "- Preserve semantic equivalence (same rows, columns, ordering)\n"
+        "- Follow the patterns shown in reference examples below\n\n"
+        "You will **choose 4 of the 5 families** based on relevance to THIS SPECIFIC QUERY."
+    )
+
+    sections, n_families = _build_prompt_body(
+        query_id, original_sql, explain_text, ir_node_map,
+        all_5_examples, dialect, role_text,
+    )
+
+    # ── Section 6: Output Format (full patch plans) ────────────────────
     n_to_choose = min(4, n_families)
     sections.append(
         f"## Your Task\n\n"
@@ -320,6 +355,196 @@ Now output your JSON array of patch plans:
 """)
 
     return "\n\n".join(sections)
+
+
+# ── Tiered Prompt Builder (Analyst → Worker split) ────────────────────────
+
+def build_oneshot_patch_prompt_tiered(
+    query_id: str,
+    original_sql: str,
+    explain_text: str,
+    ir_node_map: str,
+    all_5_examples: Dict[str, Dict[str, Any]],
+    dialect: str,
+) -> str:
+    """Build tiered analyst prompt: sections 1-5 shared + Section 6 asks for target IR maps.
+
+    The analyst (DeepSeek) outputs structural targets only — no full patch plans.
+    A separate worker (qwen) converts each target into a PatchPlan JSON.
+
+    Args:
+        query_id: Query identifier
+        original_sql: Full original SQL
+        explain_text: EXPLAIN ANALYZE output
+        ir_node_map: IR node map (from render_ir_node_map)
+        all_5_examples: Dict mapping family ID (A-E) to gold example JSON
+        dialect: SQL dialect
+
+    Returns:
+        Complete tiered analyst prompt string
+    """
+    role_text = (
+        "You are a SQL optimization analyst. Your task is to analyze this query "
+        "and design **up to 4 structural optimization targets**, each targeting "
+        "a different optimization family.\n\n"
+        "For each target, describe the STRUCTURAL SHAPE of the optimized query "
+        "using an IR node map (CTE names, FROM tables, WHERE conditions, GROUP BY, ORDER BY). "
+        "A separate code-generation worker will convert your targets into executable patch plans.\n\n"
+        "You will **choose up to 4 of the 5 families** based on relevance to THIS SPECIFIC QUERY."
+    )
+
+    sections, n_families = _build_prompt_body(
+        query_id, original_sql, explain_text, ir_node_map,
+        all_5_examples, dialect, role_text,
+    )
+
+    # ── Section 6: Tiered Output Format (target IR maps) ────────────────
+    n_to_choose = min(4, n_families)
+    sections.append(
+        f"## Your Task\n\n"
+        f"Analyze this query against the {n_families} families above.\n\n"
+        f"Choose up to {n_to_choose} families that are most relevant. For each chosen family:\n"
+        f"1. Describe the bottleneck hypothesis\n"
+        f"2. Design a TARGET IR node map showing what the optimized query SHOULD look like\n"
+        f"3. Score relevance (0.0\u20131.0)\n"
+        f"4. Recommend which gold example(s) a code-generation worker should use as reference\n"
+    )
+
+    sections.append("""**Output format**:
+
+```json
+[
+  {
+    "family": "B",
+    "transform": "shared_scan_decorrelate",
+    "target_id": "t1",
+    "relevance_score": 0.95,
+    "hypothesis": "Correlated scalar subquery re-scans web_sales per row. Shared-scan variant: inner=outer table with same date filter.",
+    "target_ir": "S0 [SELECT]\\n  CTE: common_scan  (via Q1)\\n    FROM: web_sales, date_dim\\n    WHERE: d_date BETWEEN ... AND d_date_sk = ws_sold_date_sk\\n  CTE: thresholds  (via Q2)\\n    FROM: common_scan\\n    GROUP BY: ws_item_sk\\n  MAIN QUERY (via Q0)\\n    FROM: common_scan cs, item, thresholds t\\n    WHERE: i_manufact_id = 320 AND ... AND cs.ws_ext_discount_amt > t.threshold\\n    ORDER BY: sum(ws_ext_discount_amt)",
+    "recommended_examples": ["sf_shared_scan_decorrelate"]
+  }
+]
+```
+
+**Rules**:
+- target_ir must follow the IR node map format (same as Section 4)
+- target_ir describes the STRUCTURAL SHAPE of the optimized query (CTE names, FROM tables, WHERE conditions, GROUP BY, ORDER BY)
+- recommended_examples: list gold example IDs the worker should use as reference patch template
+- Each target should represent a DIFFERENT optimization strategy
+- Rank by relevance_score (highest first)
+- Output up to """ + str(n_to_choose) + """ targets
+
+After JSON, provide analysis:
+
+## Analysis
+For each available family, explain relevance (HIGH / MEDIUM / LOW) in 1-2 sentences.
+**Chosen families**: [list]
+**Confidence**: High/Medium/Low
+""")
+
+    return "\n\n".join(sections)
+
+
+# ── Worker Prompt Builder (for qwen code-generation) ──────────────────────
+
+def build_worker_patch_prompt(
+    original_sql: str,
+    ir_node_map: str,
+    target: Dict[str, Any],
+    gold_patch_plan: Dict[str, Any],
+    dialect: str,
+    dialect_constraints: str = "",
+) -> str:
+    """Build focused worker prompt for converting a target IR into a PatchPlan JSON.
+
+    Args:
+        original_sql: Full original SQL
+        ir_node_map: Current IR node map (from render_ir_node_map)
+        target: AnalystTarget dict (family, target_ir, hypothesis, etc.)
+        gold_patch_plan: The patch_plan field from the recommended gold example
+        dialect: SQL dialect
+        dialect_constraints: Optional dialect-specific rules
+
+    Returns:
+        Worker prompt string (~2K tokens)
+    """
+    target_ir = target.get("target_ir", "")
+    hypothesis = target.get("hypothesis", "")
+    family = target.get("family", "?")
+    transform = target.get("transform", "unknown")
+
+    lines = [
+        "## Role",
+        "",
+        "Transform this SQL query from its CURRENT IR structure to a TARGET IR structure "
+        "using patch operations. Output a single PatchPlan JSON.",
+        "",
+        f"**Family**: {family} — {transform}",
+        f"**Hypothesis**: {hypothesis}",
+        "",
+        "## Original SQL",
+        "",
+        f"```sql\n{original_sql}\n```",
+        "",
+        "## Current IR Node Map",
+        "",
+        f"```\n{ir_node_map}\n```",
+        "",
+        "## Target IR (what the optimized query should look like)",
+        "",
+        f"```\n{target_ir}\n```",
+        "",
+        "## Patch Operations",
+        "",
+        "| Op | Description | Payload |",
+        "|----|-------------|---------|",
+        "| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |",
+        "| replace_from | Replace the FROM clause | from_sql |",
+        "| replace_where_predicate | Replace the WHERE clause | expr_sql |",
+        "| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |",
+        "| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |",
+        "| delete_expr_subtree | Remove a specific expression | (target only, no payload) |",
+        "",
+        "## Gold Patch Example (reference pattern)",
+        "",
+        "```json",
+        json.dumps(gold_patch_plan, indent=2),
+        "```",
+        "",
+    ]
+
+    if dialect_constraints:
+        lines.extend([
+            f"## Dialect Constraints ({dialect.upper()})",
+            "",
+            dialect_constraints,
+            "",
+        ])
+
+    lines.extend([
+        "## Instructions",
+        "",
+        "Adapt the gold example pattern to match the ORIGINAL SQL above.",
+        "Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names "
+        "and structure.",
+        f"Preferred approach: insert_cte (x2-3) + replace_from or replace_body.",
+        "All SQL in payloads must be complete, executable fragments (no ellipsis).",
+        f"Use dialect: \"{dialect}\" in the output.",
+        "Target all steps at by_node_id: \"S0\" (the main statement).",
+        "",
+        "Output ONLY the JSON object (no markdown, no explanation):",
+    ])
+
+    return "\n".join(lines)
+
+
+def build_worker_retry_prompt(worker_prompt: str, error_msg: str) -> str:
+    """Append error context to a worker prompt for retry."""
+    return (
+        worker_prompt
+        + f"\n\n## RETRY — Previous patch failed:\n{error_msg}\n\n"
+        "Fix the error. Output ONLY the corrected JSON."
+    )
 
 
 # ── Helper: Load Gold Examples ─────────────────────────────────────────────
