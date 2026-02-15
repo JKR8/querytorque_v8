@@ -136,6 +136,9 @@ def apply_patch_plan(script_ir: ScriptIR, plan: PatchPlan) -> PatchResult:
                 _rollback_statements(script_ir, snapshot, dialect)
                 return result
 
+    # ── Reorder CTEs by dependency ──
+    _reorder_ctes(script_ir, dialect)
+
     # ── Postconditions ──
     current_sql = render_script(script_ir, dialect)
     for gate in plan.postconditions:
@@ -235,8 +238,132 @@ def _op_replace_expr_subtree(
         raise PatchError("Could not locate expression to replace")
 
 
-_op_replace_where_predicate = _op_replace_expr_subtree
+def _op_replace_where_predicate(
+    script_ir: ScriptIR, step: PatchStep, dialect: str
+):
+    """Replace (or add) WHERE predicate on the target SELECT."""
+    expr_sql = step.payload.expr_sql
+    if not expr_sql:
+        raise PatchError("replace_where_predicate requires expr_sql")
+
+    # If by_label or by_anchor_hash is set, fall through to expr_subtree logic
+    if step.target.by_label or step.target.by_anchor_hash:
+        return _op_replace_expr_subtree(script_ir, step, dialect)
+
+    # Otherwise, find the target SELECT and set/replace its WHERE clause
+    new_expr = _parse_expr(expr_sql.strip(), dialect)
+
+    target_stmts = _find_target_stmts(script_ir, step.target)
+    if not target_stmts:
+        raise PatchError(f"No target found for step {step.step_id}")
+
+    for stmt in target_stmts:
+        if not stmt.ast:
+            continue
+        select_node = _resolve_select_node(stmt, step.target, dialect)
+        if not select_node:
+            continue
+        select_node.set("where", exp.Where(this=new_expr))
+        stmt.sql_text = stmt.ast.sql(dialect=dialect)
+        return
+
+    raise PatchError("Could not locate SELECT to set WHERE predicate")
+
+
 _op_replace_join_condition = _op_replace_expr_subtree
+
+
+# ── REPLACE_SELECT ────────────────────────────────────────────────────
+
+
+def _op_replace_select(script_ir: ScriptIR, step: PatchStep, dialect: str):
+    """Replace the SELECT expressions of a targeted SELECT statement."""
+    sql_fragment = step.payload.sql_fragment
+    if not sql_fragment:
+        raise PatchError("replace_select requires sql_fragment (comma-separated expressions)")
+
+    # Parse via wrapper to get expression list
+    try:
+        wrapper = f"SELECT {sql_fragment} FROM __dummy__"
+        parsed = sqlglot.parse_one(wrapper, dialect=dialect)
+        new_expressions = parsed.expressions
+        if not new_expressions:
+            raise PatchError("Parsed zero expressions from sql_fragment")
+    except PatchError:
+        raise
+    except Exception as e:
+        raise PatchError(f"Cannot parse SELECT expressions: {e}")
+
+    target_stmts = _find_target_stmts(script_ir, step.target)
+    if not target_stmts:
+        raise PatchError(f"No target found for replace_select step {step.step_id}")
+
+    for stmt in target_stmts:
+        if not stmt.ast:
+            continue
+        select_node = _resolve_select_node(stmt, step.target, dialect)
+        if not select_node:
+            continue
+        select_node.set("expressions", new_expressions)
+        stmt.sql_text = stmt.ast.sql(dialect=dialect)
+        return
+
+    raise PatchError("Could not locate SELECT to replace expressions")
+
+
+# ── REPLACE_BODY ──────────────────────────────────────────────────────
+
+
+def _op_replace_body(script_ir: ScriptIR, step: PatchStep, dialect: str):
+    """Replace the main query body (SELECT+FROM+WHERE+GROUP+ORDER+LIMIT),
+    keeping the WITH clause (CTEs) intact."""
+    sql_fragment = step.payload.sql_fragment
+    if not sql_fragment:
+        raise PatchError("replace_body requires sql_fragment (complete SELECT statement)")
+
+    try:
+        new_select = sqlglot.parse_one(sql_fragment.strip(), dialect=dialect)
+    except Exception as e:
+        raise PatchError(f"Cannot parse body sql_fragment: {e}")
+
+    if not isinstance(new_select, exp.Select):
+        raise PatchError(f"sql_fragment must be a SELECT, got {type(new_select).__name__}")
+
+    target_stmts = _find_target_stmts(script_ir, step.target)
+    if not target_stmts:
+        raise PatchError(f"No target found for replace_body step {step.step_id}")
+
+    for stmt in target_stmts:
+        if not stmt.ast:
+            continue
+
+        root = stmt.ast
+        if isinstance(root, exp.Create):
+            inner = root.args.get("expression")
+        else:
+            inner = root
+
+        # Extract existing WITH clause
+        existing_with = None
+        if isinstance(inner, exp.Select):
+            existing_with = inner.args.get("with")
+        elif isinstance(inner, exp.With):
+            existing_with = inner
+
+        # Attach WITH clause to new SELECT
+        if existing_with:
+            # Strip any WITH from the new_select (shouldn't have one)
+            new_select.set("with", existing_with)
+
+        if isinstance(root, exp.Create):
+            root.set("expression", new_select)
+        else:
+            stmt.ast = new_select
+
+        stmt.sql_text = stmt.ast.sql(dialect=dialect)
+        return
+
+    raise PatchError("Could not locate statement to replace body")
 
 
 # ── INSERT_CTE ────────────────────────────────────────────────────────
@@ -267,11 +394,27 @@ def _op_insert_cte(script_ir: ScriptIR, step: PatchStep, dialect: str):
             select_node = target_ast
 
         if isinstance(select_node, exp.With):
-            select_node.append("expressions", new_cte)
+            # Upsert: replace existing CTE with same name
+            replaced = False
+            for old_cte in list(select_node.find_all(exp.CTE)):
+                if old_cte.alias == cte_name:
+                    old_cte.replace(new_cte)
+                    replaced = True
+                    break
+            if not replaced:
+                select_node.append("expressions", new_cte)
         elif isinstance(select_node, exp.Select):
             existing_with = select_node.args.get("with")
             if existing_with:
-                existing_with.append("expressions", new_cte)
+                # Upsert: replace existing CTE with same name
+                replaced = False
+                for old_cte in list(existing_with.find_all(exp.CTE)):
+                    if old_cte.alias == cte_name:
+                        old_cte.replace(new_cte)
+                        replaced = True
+                        break
+                if not replaced:
+                    existing_with.append("expressions", new_cte)
             else:
                 select_node.set("with", exp.With(expressions=[new_cte]))
         else:
@@ -347,6 +490,102 @@ def _op_wrap_query_with_cte(
     _op_insert_cte(script_ir, step, dialect)
 
 
+# ── REPLACE_FROM ────────────────────────────────────────────────────
+
+
+def _op_replace_from(script_ir: ScriptIR, step: PatchStep, dialect: str):
+    """Replace the FROM + JOINs of a targeted SELECT with new from_sql."""
+    from_sql = step.payload.from_sql
+    if not from_sql:
+        raise PatchError("replace_from requires from_sql")
+
+    # Parse the from_sql via a wrapper SELECT
+    try:
+        wrapper = f"SELECT 1 FROM {from_sql} WHERE 1=1"
+        parsed = sqlglot.parse_one(wrapper, dialect=dialect)
+    except Exception as e:
+        raise PatchError(f"Cannot parse from_sql: {e}")
+
+    new_from = parsed.args.get("from")
+    new_joins = parsed.args.get("joins")
+
+    target_stmts = _find_target_stmts(script_ir, step.target)
+    if not target_stmts:
+        raise PatchError(f"No target found for replace_from step {step.step_id}")
+
+    replaced = False
+    for stmt in target_stmts:
+        if not stmt.ast:
+            continue
+
+        # Resolve to the right SELECT node (main query or CTE by anchor hash)
+        select_node = _resolve_select_node(stmt, step.target, dialect)
+        if not select_node:
+            continue
+
+        select_node.set("from", new_from)
+        select_node.set("joins", new_joins)
+        stmt.sql_text = stmt.ast.sql(dialect=dialect)
+        replaced = True
+        break
+
+    if not replaced:
+        raise PatchError("Could not locate SELECT to replace FROM clause")
+
+
+def _resolve_select_node(
+    stmt: StatementIR, target: PatchTarget, dialect: str
+) -> Optional[exp.Select]:
+    """Find the SELECT node within a statement, optionally narrowed by anchor hash."""
+    root = stmt.ast
+    if isinstance(root, exp.Create):
+        root = root.args.get("expression")
+
+    # Collect all SELECT nodes (CTE bodies + main)
+    selects: list[exp.Select] = []
+
+    if isinstance(root, exp.With):
+        for cte_node in root.expressions:
+            body = cte_node.this
+            if isinstance(body, exp.Select):
+                selects.append(body)
+        if isinstance(root.this, exp.Select):
+            selects.append(root.this)
+    elif isinstance(root, exp.Select):
+        with_clause = root.args.get("with")
+        if with_clause:
+            for cte_node in with_clause.expressions:
+                body = cte_node.this
+                if isinstance(body, exp.Select):
+                    selects.append(body)
+        selects.append(root)
+
+    if not selects:
+        return None
+
+    # If anchor hash given, find the SELECT whose FROM matches
+    if target.by_anchor_hash:
+        for sel in selects:
+            from_clause = sel.args.get("from")
+            if from_clause:
+                try:
+                    from_text = from_clause.sql(dialect=dialect)
+                    if canonical_hash(from_text) == target.by_anchor_hash:
+                        return sel
+                except Exception:
+                    pass
+        # Also check full select hash
+        for sel in selects:
+            try:
+                if canonical_hash(sel.sql(dialect=dialect)) == target.by_anchor_hash:
+                    return sel
+            except Exception:
+                pass
+
+    # Default: last SELECT (the main query body)
+    return selects[-1]
+
+
 # Register handlers — split_cte deliberately omitted (not implemented)
 _OP_HANDLERS.update(
     {
@@ -359,6 +598,9 @@ _OP_HANDLERS.update(
         PatchOp.REPLACE_BLOCK_WITH_CTE_PAIR: _op_replace_block_with_cte_pair,
         PatchOp.DELETE_EXPR_SUBTREE: _op_delete_expr_subtree,
         PatchOp.WRAP_QUERY_WITH_CTE: _op_wrap_query_with_cte,
+        PatchOp.REPLACE_FROM: _op_replace_from,
+        PatchOp.REPLACE_SELECT: _op_replace_select,
+        PatchOp.REPLACE_BODY: _op_replace_body,
     }
 )
 
@@ -746,6 +988,88 @@ def _flatten_and(node: exp.And) -> List[Any]:
     return result
 
 
+# ── CTE dependency reorder ──────────────────────────────────────────
+
+
+def _reorder_ctes(script_ir: ScriptIR, dialect: str):
+    """Topologically sort CTEs so each CTE comes after CTEs it references."""
+    for stmt in script_ir.statements:
+        if not stmt.ast:
+            continue
+
+        root = stmt.ast
+        if isinstance(root, exp.Create):
+            root = root.args.get("expression")
+
+        with_clause = None
+        if isinstance(root, exp.With):
+            with_clause = root
+        elif isinstance(root, exp.Select):
+            with_clause = root.args.get("with")
+
+        if not with_clause or not with_clause.expressions:
+            continue
+
+        ctes = list(with_clause.expressions)
+        if len(ctes) <= 1:
+            continue
+
+        # Build name → CTE mapping and dependency graph
+        cte_by_name = {}
+        for cte in ctes:
+            cte_by_name[cte.alias.lower()] = cte
+
+        cte_names = set(cte_by_name.keys())
+
+        # Find which CTE names each CTE body references
+        deps = {}  # cte_name → set of cte_names it depends on
+        for cte in ctes:
+            name = cte.alias.lower()
+            body_sql = cte.this.sql(dialect=dialect).lower()
+            deps[name] = set()
+            for other_name in cte_names:
+                if other_name != name and other_name in body_sql:
+                    deps[name].add(other_name)
+
+        # Topological sort (Kahn's algorithm)
+        in_degree = {n: 0 for n in cte_names}
+        for n, d in deps.items():
+            for dep in d:
+                if dep in in_degree:
+                    in_degree[n] += 1
+
+        queue = [n for n in cte_names if in_degree[n] == 0]
+        # Stable sort: prefer original order for ties
+        name_order = {cte.alias.lower(): i for i, cte in enumerate(ctes)}
+        queue.sort(key=lambda n: name_order.get(n, 0))
+        sorted_names = []
+
+        while queue:
+            n = queue.pop(0)
+            sorted_names.append(n)
+            for other, d in deps.items():
+                if n in d:
+                    d.discard(n)
+                    in_degree[other] -= 1
+                    if in_degree[other] == 0:
+                        queue.append(other)
+                        queue.sort(key=lambda x: name_order.get(x, 0))
+
+        if len(sorted_names) != len(ctes):
+            # Cycle detected — skip reorder
+            continue
+
+        # Check if already in correct order
+        current_order = [cte.alias.lower() for cte in ctes]
+        if current_order == sorted_names:
+            continue
+
+        # Reorder
+        new_ctes = [cte_by_name[n] for n in sorted_names]
+        with_clause.set("expressions", new_ctes)
+        stmt.sql_text = stmt.ast.sql(dialect=dialect)
+
+
 # ── CTE fragment integration ────────────────────────────────────────
 
 
@@ -771,8 +1095,18 @@ def _integrate_cte_fragment(old_sql: str, fragment: str, dialect: str) -> str:
                 with_clause = inner.find(exp.With)
 
         if with_clause:
-            for cte in frag_parsed.find_all(exp.CTE):
-                with_clause.append("expressions", cte)
+            for new_cte in frag_parsed.find_all(exp.CTE):
+                new_name = new_cte.alias
+                # Upsert: replace existing CTE body in place, or append if new
+                replaced = False
+                if new_name:
+                    for old_cte in list(with_clause.find_all(exp.CTE)):
+                        if old_cte.alias == new_name:
+                            old_cte.replace(new_cte)
+                            replaced = True
+                            break
+                if not replaced:
+                    with_clause.append("expressions", new_cte)
             return parsed.sql(dialect=dialect)
     except Exception:
         pass

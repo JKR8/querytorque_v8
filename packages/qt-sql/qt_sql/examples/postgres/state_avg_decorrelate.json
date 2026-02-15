@@ -5,7 +5,7 @@
   "engine": "postgresql",
   "benchmark": "DSB SF10",
   "verified_speedup": "438.93x (timeout rescue)",
-  "principle": "State-Average Decorrelation: when a CTE self-references with a correlated AVG (e.g., ctr1.state = ctr2.state), extract the per-state average into a separate CTE with GROUP BY state, then JOIN. Converts O(states \u00d7 rows_per_state) to O(total_rows).",
+  "principle": "State-Average Decorrelation: when a CTE self-references with a correlated AVG (e.g., ctr1.state = ctr2.state), extract the per-state average into a separate CTE with GROUP BY state, then JOIN. Converts O(states × rows_per_state) to O(total_rows).",
   "transforms": [
     "decorrelate"
   ],
@@ -35,8 +35,84 @@
         }
       ]
     },
-    "key_insight": "Principle: State-Average Decorrelation \u2014 the correlated subquery computes AVG per state for every outer row. By extracting this into a state_avg_cte with GROUP BY ctr_state (only ~50 states), the O(N * rows_per_state) nested loop becomes a tiny hash join on ~50 rows. Also converts comma joins to explicit JOINs and isolates date filter into CTE.",
+    "key_insight": "Principle: State-Average Decorrelation — the correlated subquery computes AVG per state for every outer row. By extracting this into a state_avg_cte with GROUP BY ctr_state (only ~50 states), the O(N * rows_per_state) nested loop becomes a tiny hash join on ~50 rows. Also converts comma joins to explicit JOINs and isolates date filter into CTE.",
     "pattern_detection": "Look for: CTE that self-references with a correlated AVG where the correlation key is a low-cardinality dimension (state, category, year). The AVG can be pre-computed once with GROUP BY and JOINed back."
   },
-  "family": "F"
+  "family": "F",
+  "patch_plan": {
+    "plan_id": "gold_postgres_pg_state_avg_decorrelate",
+    "dialect": "postgres",
+    "description": "Decorrelate a correlated subquery that computes per-state averages by extracting the state aggregation into a separate CTE, then JOINing back on the state key. Converts per-row subquery re-execution into a single GROUP BY + hash join.",
+    "preconditions": [
+      {
+        "kind": "parse_ok"
+      }
+    ],
+    "postconditions": [
+      {
+        "kind": "parse_ok"
+      }
+    ],
+    "steps": [
+      {
+        "step_id": "s1",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "filtered_date",
+          "cte_query_sql": "SELECT d_date_sk FROM date_dim WHERE d_year = 1998"
+        },
+        "description": "Insert CTE 'filtered_date' for date dimension filtering"
+      },
+      {
+        "step_id": "s2",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "returns_cte",
+          "cte_query_sql": "SELECT cr_returning_customer_sk AS ctr_customer_sk, ca_state AS ctr_state, SUM(cr_return_amt_inc_tax) AS ctr_total_return FROM catalog_returns JOIN filtered_date ON cr_returned_date_sk = d_date_sk JOIN customer_address ON cr_returning_addr_sk = ca_address_sk GROUP BY cr_returning_customer_sk, ca_state"
+        },
+        "description": "Insert CTE 'returns_cte' for pre-aggregated computation"
+      },
+      {
+        "step_id": "s3",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "state_avg_cte",
+          "cte_query_sql": "SELECT ctr_state, AVG(ctr_total_return) AS state_avg FROM returns_cte GROUP BY ctr_state"
+        },
+        "description": "Insert CTE 'state_avg_cte' for pre-aggregated computation"
+      },
+      {
+        "step_id": "s4",
+        "op": "replace_from",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "from_sql": "returns_cte AS ctr1 JOIN state_avg_cte ON ctr1.ctr_state = state_avg_cte.ctr_state JOIN customer ON ctr1.ctr_customer_sk = c_customer_sk JOIN customer_address ON ca_address_sk = c_current_addr_sk"
+        },
+        "description": "Replace comma-join FROM with explicit JOINs"
+      },
+      {
+        "step_id": "s5",
+        "op": "replace_where_predicate",
+        "target": {
+          "by_node_id": "S0",
+          "by_anchor_hash": "15ec19506869283a"
+        },
+        "payload": {
+          "expr_sql": "ctr1.ctr_total_return > state_avg_cte.state_avg * 1.2 AND ca_state = 'VA'"
+        },
+        "description": "Replace WHERE predicate with optimized version"
+      }
+    ]
+  }
 }

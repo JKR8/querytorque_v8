@@ -30,12 +30,100 @@
         }
       ]
     },
-    "key_insight": "Principle: Aggregate Pushdown \u2014 pre-aggregate the fact table (inventory) by the join key (inv_item_sk) BEFORE joining with the dimension table (item). The original query joins 7M inventory rows with date_dim and item, then aggregates with ROLLUP. The rewrite filters dates first, pre-aggregates inventory to ~150K rows (one per item), THEN joins item. AVG is reconstructed from SUM/COUNT since pre-aggregation changes the row count. This produced our single biggest individual win (42.90x).",
-    "when_not_to_use": "Only works when GROUP BY keys are a superset of join keys \u2014 misaligned keys produce wrong results. When ROLLUP/CUBE is present, must reconstruct AVG from SUM/COUNT since pre-aggregation changes the row count."
+    "key_insight": "Principle: Aggregate Pushdown — pre-aggregate the fact table (inventory) by the join key (inv_item_sk) BEFORE joining with the dimension table (item). The original query joins 7M inventory rows with date_dim and item, then aggregates with ROLLUP. The rewrite filters dates first, pre-aggregates inventory to ~150K rows (one per item), THEN joins item. AVG is reconstructed from SUM/COUNT since pre-aggregation changes the row count. This produced our single biggest individual win (42.90x).",
+    "when_not_to_use": "Only works when GROUP BY keys are a superset of join keys — misaligned keys produce wrong results. When ROLLUP/CUBE is present, must reconstruct AVG from SUM/COUNT since pre-aggregation changes the row count."
   },
   "original_sql": "select i_product_name\n             ,i_brand\n             ,i_class\n             ,i_category\n             ,avg(inv_quantity_on_hand) qoh\n       from inventory\n           ,date_dim\n           ,item\n       where inv_date_sk=d_date_sk\n              and inv_item_sk=i_item_sk\n              and d_month_seq between 1188 and 1188 + 11\n       group by rollup(i_product_name\n                       ,i_brand\n                       ,i_class\n                       ,i_category)\norder by qoh, i_product_name, i_brand, i_class, i_category\n LIMIT 100;",
   "optimized_sql": "WITH date_filtered AS (SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1188 AND 1188 + 11), inventory_date AS (SELECT inv_item_sk, inv_quantity_on_hand FROM inventory JOIN date_filtered ON inv_date_sk = d_date_sk), inventory_agg AS (SELECT inv_item_sk, SUM(inv_quantity_on_hand) AS sum_qty, COUNT(inv_quantity_on_hand) AS cnt FROM inventory_date GROUP BY inv_item_sk), join_item AS (SELECT i_product_name, i_brand, i_class, i_category, sum_qty, cnt FROM inventory_agg JOIN item ON inv_item_sk = i_item_sk), rollup_aggregate AS (SELECT i_product_name, i_brand, i_class, i_category, CASE WHEN SUM(cnt) > 0 THEN SUM(sum_qty) / SUM(cnt) END AS qoh FROM join_item GROUP BY ROLLUP(i_product_name, i_brand, i_class, i_category)) SELECT i_product_name, i_brand, i_class, i_category, qoh FROM rollup_aggregate ORDER BY qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC LIMIT 100",
   "optimized_source": "swarm_w1",
   "sf10_rows_match": true,
-  "family": "C"
+  "family": "C",
+  "patch_plan": {
+    "plan_id": "gold_duckdb_aggregate_pushdown",
+    "dialect": "duckdb",
+    "description": "Pre-aggregate fact table by join key before dimension joins to reduce rows entering the join from millions to thousands",
+    "preconditions": [
+      {
+        "kind": "parse_ok"
+      }
+    ],
+    "postconditions": [
+      {
+        "kind": "parse_ok"
+      }
+    ],
+    "steps": [
+      {
+        "step_id": "s1",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "date_filtered",
+          "cte_query_sql": "SELECT d_date_sk FROM date_dim WHERE d_month_seq BETWEEN 1188 AND 1188 + 11"
+        },
+        "description": "Insert CTE 'date_filtered' for date dimension filtering"
+      },
+      {
+        "step_id": "s2",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "inventory_date",
+          "cte_query_sql": "SELECT inv_item_sk, inv_quantity_on_hand FROM inventory JOIN date_filtered ON inv_date_sk = d_date_sk"
+        },
+        "description": "Insert CTE 'inventory_date' for date dimension filtering"
+      },
+      {
+        "step_id": "s3",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "inventory_agg",
+          "cte_query_sql": "SELECT inv_item_sk, SUM(inv_quantity_on_hand) AS sum_qty, COUNT(inv_quantity_on_hand) AS cnt FROM inventory_date GROUP BY inv_item_sk"
+        },
+        "description": "Insert CTE 'inventory_agg' for pre-aggregated computation"
+      },
+      {
+        "step_id": "s4",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "join_item",
+          "cte_query_sql": "SELECT i_product_name, i_brand, i_class, i_category, sum_qty, cnt FROM inventory_agg JOIN item ON inv_item_sk = i_item_sk"
+        },
+        "description": "Insert CTE 'join_item' for pre-filtered join"
+      },
+      {
+        "step_id": "s5",
+        "op": "insert_cte",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "cte_name": "rollup_aggregate",
+          "cte_query_sql": "SELECT i_product_name, i_brand, i_class, i_category, CASE WHEN SUM(cnt) > 0 THEN SUM(sum_qty) / SUM(cnt) END AS qoh FROM join_item GROUP BY ROLLUP (i_product_name, i_brand, i_class, i_category)"
+        },
+        "description": "Insert CTE 'rollup_aggregate' for pre-aggregated computation"
+      },
+      {
+        "step_id": "s6",
+        "op": "replace_body",
+        "target": {
+          "by_node_id": "S0"
+        },
+        "payload": {
+          "sql_fragment": "SELECT i_product_name, i_brand, i_class, i_category, qoh FROM rollup_aggregate ORDER BY qoh ASC, i_product_name ASC, i_brand ASC, i_class ASC, i_category ASC LIMIT 100"
+        },
+        "description": "Replace main query body with optimized version"
+      }
+    ]
+  }
 }

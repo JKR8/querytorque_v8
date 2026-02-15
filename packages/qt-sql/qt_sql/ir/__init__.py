@@ -110,7 +110,7 @@ def render_ir_node_map(script_ir: ScriptIR) -> str:
     lines.append("")
     lines.append(
         "Patch operations: insert_cte, replace_expr_subtree, "
-        "replace_where_predicate, delete_expr_subtree"
+        "replace_where_predicate, replace_from, delete_expr_subtree"
     )
     lines.append('Target: by_node_id (statement, e.g. "{}") + by_anchor_hash (expression)'.format(
         script_ir.statements[0].id if script_ir.statements else "S0"
@@ -171,9 +171,21 @@ def _dict_to_plan(data: dict) -> PatchPlan:
     """Deserialise a dict (from YAML) into a PatchPlan."""
     steps = []
     for s in data.get("steps", []):
-        target_d = s.get("target", {})
+        target_d = s.get("target", {}) or {}
         payload_d = s.get("payload", {}) or {}
         gates_d = s.get("gates", [])
+
+        # ── LLM flattening normalization ──
+        # LLMs frequently put target/payload fields at step level instead
+        # of nesting them.  Hoist into the correct sub-dicts.
+        _TARGET_KEYS = ("by_node_id", "by_label", "by_anchor_hash", "by_path")
+        _PAYLOAD_KEYS = ("cte_name", "cte_query_sql", "expr_sql", "sql_fragment", "from_sql")
+        for k in _TARGET_KEYS:
+            if k in s and k not in target_d:
+                target_d[k] = s[k]
+        for k in _PAYLOAD_KEYS:
+            if k in s and k not in payload_d:
+                payload_d[k] = s[k]
 
         # Normalize: if worker sends sql_fragment for an expr op, treat as expr_sql
         op_val = s["op"]
@@ -186,7 +198,7 @@ def _dict_to_plan(data: dict) -> PatchPlan:
 
         steps.append(
             PatchStep(
-                step_id=s["step_id"],
+                step_id=s.get("step_id", f"s{len(steps)+1}"),
                 op=PatchOp(op_val),
                 target=PatchTarget(
                     by_node_id=target_d.get("by_node_id"),
@@ -199,6 +211,7 @@ def _dict_to_plan(data: dict) -> PatchPlan:
                     expr_sql=raw_expr_sql,
                     cte_name=payload_d.get("cte_name"),
                     cte_query_sql=payload_d.get("cte_query_sql"),
+                    from_sql=payload_d.get("from_sql"),
                 ),
                 gates=[
                     Gate(kind=GateKind(g["kind"]), args=g.get("args", {}))
@@ -208,9 +221,24 @@ def _dict_to_plan(data: dict) -> PatchPlan:
             )
         )
 
+    # Normalize dialect: LLMs may emit "PostgreSQL v14.3", "postgresql", "pg", etc.
+    raw_dialect = data.get("dialect", "postgres").lower().strip()
+    if raw_dialect.startswith("postgres"):
+        dialect = Dialect.POSTGRES
+    elif raw_dialect.startswith("duckdb"):
+        dialect = Dialect.DUCKDB
+    elif raw_dialect.startswith("snowflake"):
+        dialect = Dialect.SNOWFLAKE
+    else:
+        # Try exact match as last resort
+        try:
+            dialect = Dialect(raw_dialect)
+        except ValueError:
+            dialect = Dialect.POSTGRES  # safe default
+
     return PatchPlan(
         plan_id=data["plan_id"],
-        dialect=Dialect(data["dialect"]),
+        dialect=dialect,
         steps=steps,
         preconditions=[
             Gate(kind=GateKind(g["kind"]), args=g.get("args", {}))

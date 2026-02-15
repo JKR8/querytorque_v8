@@ -23,6 +23,9 @@ class PatchOp(Enum):
     SPLIT_CTE = "split_cte"
     WRAP_QUERY_WITH_CTE = "wrap_query_with_cte"
     DELETE_EXPR_SUBTREE = "delete_expr_subtree"
+    REPLACE_FROM = "replace_from"
+    REPLACE_SELECT = "replace_select"
+    REPLACE_BODY = "replace_body"
 
 
 class GateKind(Enum):
@@ -57,6 +60,7 @@ class PatchPayload:
     expr_sql: Optional[str] = None
     cte_name: Optional[str] = None
     cte_query_sql: Optional[str] = None
+    from_sql: Optional[str] = None
 
 
 @dataclass
