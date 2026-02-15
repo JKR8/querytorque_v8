@@ -257,22 +257,23 @@ class OneshotPatchSession(OptimizationSession):
             iter_result.patches = all_patches
 
             # ── Phase 3: Multi-handling retry ─────────────────────────
-            # If some patches succeeded and some failed at runtime,
-            # keep the good ones and retry only the failed ones.
-            runtime_failed = [
+            # Only retry patches that actually errored at runtime.
+            # Keep everything else — wins, neutrals, AND regressions
+            # are all useful signal for the snipe prompt.
+            runtime_errored = [
                 p for p in all_patches
-                if p.status in ("ERROR", "FAIL") and p.output_sql
+                if p.status == "ERROR" and p.output_sql
             ]
-            runtime_good = [
+            runtime_kept = [
                 p for p in all_patches
-                if p.status not in ("ERROR", "FAIL", "PENDING")
+                if p.status != "ERROR" and p.status != "PENDING"
             ]
 
-            if runtime_failed and runtime_good:
+            if runtime_errored and runtime_kept:
                 logger.info(
                     f"[{self.query_id}] Multi-handling: "
-                    f"{len(runtime_good)} good, {len(runtime_failed)} failed "
-                    f"— retrying failed patches only"
+                    f"{len(runtime_kept)} kept, {len(runtime_errored)} errored "
+                    f"— retrying errored patches only"
                 )
                 from ..patches.oneshot_patch_prompt_builder import (
                     build_runtime_error_retry_prompt,
@@ -280,11 +281,11 @@ class OneshotPatchSession(OptimizationSession):
 
                 retry_prompt = build_runtime_error_retry_prompt(
                     original_prompt=prompt,
-                    good_patches=runtime_good,
-                    failed_patches=runtime_failed,
+                    good_patches=runtime_kept,
+                    failed_patches=runtime_errored,
                 )
                 logger.info(
-                    f"[{self.query_id}] Calling LLM for {len(runtime_failed)} "
+                    f"[{self.query_id}] Calling LLM for {len(runtime_errored)} "
                     f"replacement patches ({len(retry_prompt)} chars)..."
                 )
                 retry_response = self._call_llm_with_timeout(generator, retry_prompt)
@@ -314,8 +315,8 @@ class OneshotPatchSession(OptimizationSession):
                     # Validate only the new patches
                     new_result = self._validate_patches(new_applied, db_path)
 
-                    # Merge: replace failed patches with new results
-                    failed_ids = {p.patch_id for p in runtime_failed}
+                    # Merge: replace errored patches with new results
+                    failed_ids = {p.patch_id for p in runtime_errored}
                     merged = [p for p in all_patches if p.patch_id not in failed_ids]
                     merged.extend(new_applied)
                     iter_result.patches = merged

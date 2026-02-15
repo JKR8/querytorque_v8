@@ -673,16 +673,16 @@ def build_runtime_error_retry_prompt(
     good_patches: List[Any],
     failed_patches: List[Any],
 ) -> str:
-    """Build a targeted retry prompt for patches that failed at runtime.
+    """Build a targeted retry prompt for patches that errored at runtime.
 
-    Multi-handling: the LLM sees what worked (with timing data) and what
-    failed (with exact error messages), and only needs to produce
-    replacements for the failed patches.
+    Multi-handling: the LLM sees all kept patches (wins, neutrals, AND
+    regressions — all valid signal) plus the errored patches with exact
+    error messages. Only needs to produce replacements for the errored ones.
 
     Args:
         original_prompt: The original prompt (for query/IR context).
-        good_patches: AppliedPatch objects that succeeded (with speedup data).
-        failed_patches: AppliedPatch objects that failed at runtime.
+        good_patches: AppliedPatch objects that ran successfully (any status except ERROR).
+        failed_patches: AppliedPatch objects that errored at runtime.
 
     Returns:
         Retry prompt string asking for len(failed_patches) replacement patches.
@@ -690,23 +690,25 @@ def build_runtime_error_retry_prompt(
     lines = [
         original_prompt,
         "",
-        "## Runtime Error — Replace Failed Patches",
+        "## Runtime Error — Replace Errored Patches",
         "",
-        f"From your previous response, **{len(good_patches)} patches succeeded** "
-        f"and **{len(failed_patches)} failed at runtime**.",
+        f"From your previous response, **{len(good_patches)} patches ran** "
+        f"and **{len(failed_patches)} errored at runtime**.",
         "",
-        "### Succeeded (keep for reference, do NOT re-emit these):",
+        "### Kept patches (do NOT re-emit these):",
         "",
     ]
 
     for p in good_patches:
         speedup_str = f"{p.speedup:.2f}x" if p.speedup is not None else "?"
+        orig_str = f"{p.original_ms:.0f}ms" if p.original_ms is not None else "?"
+        patch_str = f"{p.patch_ms:.0f}ms" if p.patch_ms is not None else "?"
         lines.append(
             f"- **{p.patch_id}** (Family {p.family}, {p.transform}): "
-            f"{speedup_str} {p.status}"
+            f"{speedup_str} {p.status} (orig={orig_str}, patch={patch_str})"
         )
 
-    lines.extend(["", "### Failed (provide replacements for these):", ""])
+    lines.extend(["", "### Errored (provide replacements for these):", ""])
 
     for p in failed_patches:
         lines.append(f"**{p.patch_id}** (Family {p.family}, {p.transform}):")
