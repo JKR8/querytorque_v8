@@ -16,7 +16,7 @@ import click
 @click.option("-q", "--query", multiple=True, help="Query filter (repeatable, prefix match).")
 @click.option(
     "--mode",
-    type=click.Choice(["beam", "oneshot", "fleet"]),
+    type=click.Choice(["beam", "fleet"]),
     default="beam",
     show_default=True,
     help="Execution mode: beam (analyst/worker loop) or fleet (multi-query orchestration).",
@@ -46,11 +46,13 @@ import click
 @click.option("--output-contract", is_flag=True,
               help="Emit structured QueryOutputContract JSON alongside results.")
 @click.option("--patch", "patch_mode", is_flag=True, hidden=True,
-              help="Deprecated. Oneshot now always runs tiered patch flow.")
+              help="Deprecated. Beam always runs tiered patch flow.")
 @click.option("--fleet", "fleet_legacy", is_flag=True, hidden=True,
               help="Deprecated alias for --mode fleet.")
 @click.option("--dry-run", "dry_run", is_flag=True,
               help="With --mode fleet: run survey + triage only, no LLM calls.")
+@click.option("--live", "live_dashboard", is_flag=True,
+              help="With --mode fleet: launch Fleet C2 browser dashboard with live WebSocket updates.")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -72,6 +74,7 @@ def run(
     patch_mode: bool,
     fleet_legacy: bool,
     dry_run: bool,
+    live_dashboard: bool,
 ) -> None:
     """Run the full optimization pipeline (requires LLM API key).
 
@@ -96,8 +99,6 @@ def run(
         raise SystemExit(2)
 
     # Beam is the canonical tiered analyst/worker/snipe flow.
-    if mode == "oneshot":
-        mode = "beam"  # oneshot is deprecated alias for beam
     patch_mode = True
     single_iteration = single_iteration or fan_out_only_legacy
 
@@ -205,6 +206,56 @@ def run(
             console.print(f"\n[dim]Dry run complete. Use without --dry-run to execute.[/dim]")
             return
 
+        # ── Live Fleet C2 dashboard ──────────────────────────────────
+        if live_dashboard:
+            import threading as _threading
+            import webbrowser
+            from ..fleet.event_bus import EventBus, EventType, forensic_to_fleet_c2
+            from ..fleet.ws_server import run_server_in_thread
+            from ..dashboard.collector import collect_workload_profile
+
+            engine = cfg.get("engine", "duckdb")
+            wp = collect_workload_profile(bench_dir, engine)
+            fleet_c2_data = forensic_to_fleet_c2(wp.forensic.queries, triaged)
+
+            event_bus = EventBus()
+            triage_gate = _threading.Event()
+            pause_event = _threading.Event()
+            pause_event.set()  # not paused by default
+
+            # Attach to orchestrator
+            orch.event_bus = event_bus
+            orch.triage_gate = triage_gate
+            orch.pause_event = pause_event
+
+            # Locate HTML file
+            html_path = Path(__file__).resolve().parent.parent / "dashboard" / "fleet_c2.html"
+
+            port = 8765
+            console.print(f"\n[bold]Fleet C2 Dashboard[/bold]")
+            run_server_in_thread(
+                event_bus=event_bus,
+                triage_gate=triage_gate,
+                html_path=html_path,
+                initial_data=fleet_c2_data,
+                pause_event=pause_event,
+                port=port,
+            )
+            url = f"http://127.0.0.1:{port}"
+            console.print(f"  Dashboard: [link={url}]{url}[/link]")
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+            console.print("  Waiting for triage approval in browser...")
+            approved = orch.wait_for_triage_approval(timeout=3600)
+            if not approved:
+                console.print("[yellow]  Triage approval timed out (1h). Aborting.[/yellow]")
+                return
+
+            console.print("  [green]Triage approved![/green] Starting execution...")
+
         # Phase 2: Execute
         console.print(f"\n[bold]Phase 2: Execute[/bold] (concurrency={concurrency or 4})")
         t0 = time.time()
@@ -217,6 +268,15 @@ def run(
         # Phase 3: Compile scorecard
         scorecard_md = orch.compile(results, triaged)
         (out / "fleet_scorecard.md").write_text(scorecard_md)
+
+        # Emit fleet done event
+        if live_dashboard:
+            event_bus.emit(
+                EventType.FLEET_DONE,
+                total=len(results),
+                elapsed_seconds=round(time.time() - t0, 1),
+                results=results,
+            )
 
         # Summary JSON (same format as existing runs)
         elapsed = time.time() - t0

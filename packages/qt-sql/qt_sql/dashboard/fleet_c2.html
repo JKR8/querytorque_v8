@@ -1451,8 +1451,11 @@ body {
      JAVASCRIPT
      ═══════════════════════════════════════════════════════════ -->
 <script>
-// ── Mock Data ───────────────────────────────────────────────
-const QUERIES = [
+// ── Data Injection ──────────────────────────────────────────
+// When served by ws_server.py, __FLEET_DATA__ is replaced with real JSON.
+// In standalone mode, falls back to the mock data below.
+const _INJECTED = "__FLEET_DATA__";
+const _MOCK = [
   { id:'q88',  runtime_ms:45200, bucket:'HIGH',   iters:5, transform:'or_to_union',       overlap:0.92, est_annual:54240, outcome:'WIN',        speedup:6.28, out_transform:'or_to_union',
     detail:{ cost_rank:1, pct_of_total:0.438, cumulative_pct:0.438, structural_flags:['OR_PREDICATE','MULTI_TABLE_SCAN','CORRELATED_SUBQUERY'], transforms:[{id:'or_to_union',overlap:0.92,gap:'CROSS_COLUMN_OR_DECOMPOSITION',family:'D'},{id:'scan_reduce',overlap:0.61,gap:'REDUNDANT_SCAN_ELIMINATION',family:'E'}], qerror:{severity:'S1',direction:'UNDER_EST',worst_node:'Hash Join',max_q_error:847.2}, explain:'-> Hash Join  (time=45102.3ms, rows=12847 (est 15))\n  -> Seq Scan on store_sales  (time=31200.1ms, rows=2880404 (est 2880000))\n    filter: (ss_sold_date_sk IS NOT NULL)\n  -> Hash  (time=8901.2ms)\n    -> Bitmap Heap Scan on item  (time=8400.0ms, rows=28847)\n      filter: i_category IN (\'Books\',\'Sports\',\'Music\')'} },
   { id:'q40',  runtime_ms:9800,  bucket:'HIGH',   iters:5, transform:'multi_cte_chain',   overlap:0.81, est_annual:11760, outcome:'WIN',        speedup:3.35, out_transform:'multi_cte_chain',
@@ -1494,6 +1497,125 @@ const QUERIES = [
   { id:'q91',  runtime_ms:20,    bucket:'SKIP',   iters:0, transform:'',                  overlap:0,    est_annual:24,    outcome:null,         speedup:null, out_transform:'',
     detail:{ cost_rank:20, pct_of_total:0.000, cumulative_pct:0.981, structural_flags:[], transforms:[], qerror:null, explain:''} },
 ];
+
+// Use injected data when served by backend, otherwise fall back to mock
+const QUERIES = (typeof _INJECTED === 'string' && _INJECTED === '__FLEET_' + 'DATA__') ? _MOCK : _INJECTED;
+
+// ── WebSocket Connection ────────────────────────────────────
+let ws = null;
+let wsConnected = false;
+
+function connectWebSocket() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = proto + '//' + location.host + '/ws';
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    wsConnected = true;
+    console.log('Fleet C2: WebSocket connected');
+  };
+
+  ws.onclose = () => {
+    wsConnected = false;
+    console.log('Fleet C2: WebSocket disconnected, reconnecting in 2s...');
+    setTimeout(connectWebSocket, 2000);
+  };
+
+  ws.onerror = (err) => {
+    console.warn('Fleet C2: WebSocket error', err);
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      handleServerMessage(msg);
+    } catch (e) {
+      console.warn('Fleet C2: bad message', e);
+    }
+  };
+}
+
+function handleServerMessage(msg) {
+  const type = msg.type;
+  const data = msg.data || {};
+
+  if (type === 'triage_data') {
+    // Initial triage data (sent on WS connect)
+    // QUERIES already populated from __FLEET_DATA__ injection
+    renderTriageTable();
+    updateTriageStats();
+  }
+
+  else if (type === 'query_update') {
+    const qid = data.query_id;
+    const q = execQueries.find(q => q.id === qid);
+    if (q) {
+      const wIdx = workerState.indexOf(null);
+      if (wIdx >= 0 && !workerState.includes(qid)) {
+        workerState[wIdx] = qid;
+        workerTimers[wIdx] = 0;
+      }
+    }
+    renderExecTable();
+    renderWorkers();
+    updateExecStats();
+  }
+
+  else if (type === 'query_complete') {
+    const qid = data.query_id;
+    const q = QUERIES.find(q => q.id === qid);
+
+    completedSet[qid] = {
+      status: data.status || 'NEUTRAL',
+      speedup: data.speedup || 1.0,
+      transform: data.transform || '',
+      elapsed_s: clockSeconds,
+    };
+
+    // Free worker
+    const wIdx = workerState.indexOf(qid);
+    if (wIdx >= 0) {
+      workerState[wIdx] = null;
+      workerTimers[wIdx] = 0;
+    }
+
+    addEvent(qid, `${data.status} ${data.speedup ? data.speedup.toFixed(2) + 'x' : ''}`, (data.status || '').toLowerCase());
+    renderExecTable();
+    renderWorkers();
+    updateExecStats();
+
+    // Check if all done
+    const allDone = execQueries.every(q => completedSet[q.id]);
+    if (allDone) {
+      clearInterval(clockInterval);
+      setTimeout(showDone, 800);
+    }
+  }
+
+  else if (type === 'fleet_done') {
+    clearInterval(clockInterval);
+    clearTimeout(simInterval);
+    // Merge any final results
+    if (data.results) {
+      for (const r of data.results) {
+        if (!completedSet[r.query_id]) {
+          completedSet[r.query_id] = {
+            status: r.status || 'NEUTRAL',
+            speedup: r.speedup || 1.0,
+            transform: '',
+            elapsed_s: clockSeconds,
+          };
+        }
+      }
+    }
+    setTimeout(showDone, 500);
+  }
+}
+
+// Auto-connect if served by backend (not file://)
+if (location.protocol !== 'file:') {
+  try { connectWebSocket(); } catch (e) { /* standalone mode */ }
+}
 
 // ── State ───────────────────────────────────────────────────
 let state = 'triage'; // triage | running | paused | done
@@ -1977,6 +2099,17 @@ function approveAndDeploy() {
   isPaused = false;
   eventEntries = [];
 
+  // Send approval via WebSocket if connected
+  if (wsConnected && ws) {
+    ws.send(JSON.stringify({
+      type: 'approve',
+      plan: {
+        excluded: Array.from(excludedIds),
+        overrides: execQueries.map(q => ({ id: q.id, iters: q.iters })),
+      },
+    }));
+  }
+
   // Transition views
   document.getElementById('view-triage').classList.remove('active', 'fade-in');
   const execView = document.getElementById('view-execution');
@@ -1988,9 +2121,6 @@ function approveAndDeploy() {
   // Clear log
   document.getElementById('event-log').innerHTML = '';
   addEvent('Fleet', `Started (${execQueries.length} queries, 4 workers)`, 'system');
-
-  // Assign initial workers
-  for (let i = 0; i < 4; i++) assignWorker(i);
 
   // Start clock
   clockInterval = setInterval(() => {
@@ -2005,8 +2135,11 @@ function approveAndDeploy() {
     renderExecTable();
   }, 1000);
 
-  // Simulation: complete a query every 4-7 seconds
-  scheduleNextCompletion();
+  // Simulation: only run fake completions in standalone (non-WebSocket) mode
+  if (!wsConnected) {
+    for (let i = 0; i < 4; i++) assignWorker(i);
+    scheduleNextCompletion();
+  }
 
   renderExecTable();
   renderWorkers();
@@ -2103,10 +2236,12 @@ function togglePause() {
     btn.textContent = 'Resume';
     setHeaderStatus('paused');
     addEvent('Fleet', 'Paused', 'system');
+    if (wsConnected && ws) ws.send(JSON.stringify({ type: 'pause' }));
   } else {
     btn.textContent = 'Pause All';
     setHeaderStatus('running');
     addEvent('Fleet', 'Resumed', 'system');
+    if (wsConnected && ws) ws.send(JSON.stringify({ type: 'resume' }));
   }
 }
 

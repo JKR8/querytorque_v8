@@ -70,12 +70,29 @@ class FleetOrchestrator:
         benchmark_dir: Path,
         concurrency: int = 4,
         dashboard: Optional["FleetDashboard"] = None,
+        event_bus: Optional[Any] = None,
+        triage_gate: Optional[threading.Event] = None,
+        pause_event: Optional[threading.Event] = None,
     ) -> None:
         self.pipeline = pipeline
         self.benchmark_dir = benchmark_dir
         self.concurrency = concurrency
         self.dashboard = dashboard
+        self.event_bus = event_bus
+        self.triage_gate = triage_gate
+        self.pause_event = pause_event
         self.benchmark_lock = threading.Lock()
+
+    def _emit(self, event_type, **data) -> None:
+        """Emit event to EventBus if attached."""
+        if self.event_bus:
+            self.event_bus.emit(event_type, **data)
+
+    def wait_for_triage_approval(self, timeout: float = 3600) -> bool:
+        """Block until the triage gate is set (browser clicks Approve). Returns True if approved."""
+        if not self.triage_gate:
+            return True
+        return self.triage_gate.wait(timeout=timeout)
 
     # ── Phase 0: Survey ────────────────────────────────────────────────
 
@@ -279,6 +296,16 @@ class FleetOrchestrator:
                         qid, "RUNNING", phase=phase,
                         detail=f"iter {iteration + 1}/{triage_item.max_iterations}",
                     )
+                self._emit(
+                    "query_update",
+                    query_id=qid, status="RUNNING", phase=phase,
+                    iteration=iteration + 1,
+                    max_iterations=triage_item.max_iterations,
+                )
+
+            # Check pause gate before starting
+            if self.pause_event:
+                self.pause_event.wait()
 
             result = self.pipeline.run_optimization_session(
                 query_id=qid,
@@ -322,6 +349,12 @@ class FleetOrchestrator:
                             qid, status_str, phase="done",
                             speedup=speedup,
                         )
+                    self._emit(
+                        "query_complete",
+                        query_id=qid, status=str(status_str),
+                        speedup=speedup,
+                        completed=len(results), total=len(work_items),
+                    )
 
                     logger.info(
                         f"Fleet [{len(results)}/{len(work_items)}] "
@@ -340,6 +373,12 @@ class FleetOrchestrator:
                             qid, "ERROR", phase="error",
                             detail=str(e)[:40],
                         )
+                    self._emit(
+                        "query_complete",
+                        query_id=qid, status="ERROR",
+                        error=str(e)[:100],
+                        completed=len(results), total=len(work_items),
+                    )
                     logger.error(f"Fleet {qid}: ERROR {e}")
 
         return results
