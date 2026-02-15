@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from qt_sql.prompts.analyst_briefing import build_analyst_briefing_prompt
 from qt_sql.prompts.briefing_checks import validate_parsed_briefing
-from qt_sql.prompts.swarm_parsers import (
+from qt_sql.prompts.parsers import (
     BriefingShared,
     BriefingWorker,
     ParsedBriefing,

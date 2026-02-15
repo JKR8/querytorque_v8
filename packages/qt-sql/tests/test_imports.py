@@ -123,9 +123,9 @@ class TestQtSqlPromptImports:
         from qt_sql.prompts.analyst_briefing import build_analyst_briefing_prompt
         assert callable(build_analyst_briefing_prompt)
 
-    def test_import_swarm_parsers(self):
-        """Test swarm parsers import."""
-        from qt_sql.prompts.swarm_parsers import (
+    def test_import_parsers(self):
+        """Test prompt parsers import."""
+        from qt_sql.prompts.parsers import (
             BriefingShared,
             BriefingWorker,
             ParsedBriefing,

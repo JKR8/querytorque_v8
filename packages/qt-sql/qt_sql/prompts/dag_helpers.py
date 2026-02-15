@@ -1,4 +1,4 @@
-"""Shared logical-tree formatting helpers for swarm prompts."""
+"""Shared logical-tree formatting helpers for beam prompts."""
 
 from __future__ import annotations
 

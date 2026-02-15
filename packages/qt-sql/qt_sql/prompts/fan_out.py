@@ -1,4 +1,4 @@
-"""Fan-out prompt for swarm mode.
+"""Fan-out prompt for beam mode.
 
 Asks the analyst to distribute matched examples across 4 workers,
 each with a different optimization strategy.
@@ -40,7 +40,7 @@ def build_fan_out_prompt(
 
     # Role
     lines.append(
-        "You are coordinating a swarm of 4 optimization specialists. "
+        "You are coordinating a team of 4 optimization specialists. "
         "Each specialist will attempt to optimize the same query using a "
         "DIFFERENT strategy and set of examples."
     )

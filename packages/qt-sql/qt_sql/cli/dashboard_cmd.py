@@ -1,4 +1,4 @@
-"""qt dashboard — serve a live HTML dashboard for fleet + swarm results."""
+"""qt dashboard — serve a live HTML dashboard for fleet + beam results."""
 
 from __future__ import annotations
 
@@ -176,7 +176,7 @@ def _load_json(path: Path) -> Optional[dict]:
 
 
 def collect_session(session_dir: Path) -> Optional[Dict[str, Any]]:
-    """Collect all data for a single swarm session.
+    """Collect all data for a single beam session.
 
     Works for both completed sessions (with session.json) and in-progress
     sessions that only have iteration dirs / logs so far.
@@ -192,7 +192,7 @@ def collect_session(session_dir: Path) -> Optional[Dict[str, Any]]:
     if session_json:
         result: Dict[str, Any] = {
             "query_id": session_json.get("query_id", session_dir.name),
-            "mode": session_json.get("mode", "swarm"),
+            "mode": session_json.get("mode", "beam"),
             "target_speedup": session_json.get("target_speedup"),
             "max_iterations": session_json.get("max_iterations"),
             "n_iterations": session_json.get("n_iterations", 0),
@@ -205,7 +205,7 @@ def collect_session(session_dir: Path) -> Optional[Dict[str, Any]]:
     else:
         result: Dict[str, Any] = {
             "query_id": session_dir.name,
-            "mode": "swarm",
+            "mode": "beam",
             "target_speedup": None,
             "max_iterations": None,
             "n_iterations": 0,
@@ -280,8 +280,8 @@ def collect_dashboard_data(benchmark_dir: Path) -> Dict[str, Any]:
     # Legacy fleet data (still used by fleet table rendering)
     fleet_queries, fleet_runs = _collect_fleet_data(benchmark_dir, engine)
 
-    # Collect swarm sessions (backward compat)
-    sessions_dir = benchmark_dir / "swarm_sessions"
+    # Collect beam sessions
+    sessions_dir = benchmark_dir / "beam_sessions"
     sessions: List[Dict[str, Any]] = []
     latest_ts: Optional[str] = None
 
@@ -307,8 +307,8 @@ def collect_dashboard_data(benchmark_dir: Path) -> Dict[str, Any]:
         except ValueError:
             latest_run = latest_ts
 
-    # Auto-detect mode: fleet if we have fleet queries, swarm otherwise
-    mode = "fleet" if fleet_queries else "swarm"
+    # Auto-detect mode: fleet if we have fleet queries, beam otherwise
+    mode = "fleet" if fleet_queries else "beam"
 
     return {
         "benchmark_name": benchmark_dir.name,
@@ -587,7 +587,7 @@ def serve_dashboard(benchmark_dir: Path, port: int = 8765) -> None:
         raise click.ClickException(f"Dashboard template not found: {template_path}")
 
     # Quick initial check
-    sessions_dir = benchmark_dir / "swarm_sessions"
+    sessions_dir = benchmark_dir / "beam_sessions"
     if not sessions_dir.exists():
         sessions_dir.mkdir(parents=True)
     click.echo(f"Serving dashboard for {benchmark_dir.name} (live refresh on F5)")

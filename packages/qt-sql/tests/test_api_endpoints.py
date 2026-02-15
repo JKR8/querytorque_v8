@@ -128,17 +128,16 @@ class TestOptimizeEndpoint:
         assert "n_api_calls" in data
 
     def test_optimize_accepts_mode_parameter(self, client):
-        """Should accept all canonical optimization modes."""
-        for mode in ["swarm", "oneshot"]:
-            response = client.post(
-                "/api/sql/optimize",
-                json={
-                    "sql": "SELECT 1",
-                    "dsn": "duckdb:///:memory:",
-                    "mode": mode,
-                }
-            )
-            assert response.status_code == 200
+        """Should accept beam optimization mode."""
+        response = client.post(
+            "/api/sql/optimize",
+            json={
+                "sql": "SELECT 1",
+                "dsn": "duckdb:///:memory:",
+                "mode": "beam",
+            }
+        )
+        assert response.status_code == 200
 
     def test_optimize_rejects_invalid_mode(self, client):
         """Invalid mode should return 422."""

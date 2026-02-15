@@ -43,7 +43,7 @@ VALID_FAMILIES = ("A", "B", "C", "D", "E", "F")
 
 
 def build_analyst_checklist(is_discovery_mode: bool = False) -> str:
-    """Checklist the analyst must satisfy for swarm output."""
+    """Checklist the analyst must satisfy for beam output."""
     lines = [
         "## Section Validation Checklist (MUST pass before final output)",
         "",
@@ -92,23 +92,6 @@ def build_analyst_checklist(is_discovery_mode: bool = False) -> str:
     return "\n".join(lines)
 
 
-def build_oneshot_checklist() -> str:
-    """Checklist for oneshot mode."""
-    return "\n".join([
-        "## Section Validation Checklist (MUST pass before final output)",
-        "",
-        "### SHARED BRIEFING",
-        "- `SEMANTIC_CONTRACT`: 80-150 tokens.",
-        "- `OPTIMAL_PATH`: deduced ideal join order.",
-        "- `CURRENT_PLAN_GAP`: at least one divergence.",
-        "- `ACTIVE_CONSTRAINTS`: all 4 correctness IDs.",
-        "- `REGRESSION_WARNINGS`: `None applicable.` or entries with CAUSE/RULE.",
-        "",
-        "### OPTIMIZED SQL",
-        "- `STRATEGY` and `TRANSFORM` specified.",
-        "- SQL enclosed in ```sql code block.",
-        "- Semantically equivalent to original.",
-    ])
 
 
 def build_worker_rewrite_checklist() -> str:

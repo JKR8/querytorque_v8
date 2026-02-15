@@ -445,7 +445,7 @@ def _build_fallback_worker_results() -> list:
 
 def build_q88_mock_briefing(ctx: PromptContext):
     """Build realistic mock analyst briefing for Q88 Worker 2 (best: 6.24x)."""
-    from qt_sql.prompts.swarm_parsers import BriefingShared, BriefingWorker
+    from qt_sql.prompts.parsers import BriefingShared, BriefingWorker
 
     shared = BriefingShared(
         semantic_contract=(
@@ -561,7 +561,7 @@ def build_q88_mock_briefing(ctx: PromptContext):
 
 def build_q88_snipe_analysis():
     """Build mock SnipeAnalysis from Q88 batch results."""
-    from qt_sql.prompts.swarm_parsers import SnipeAnalysis
+    from qt_sql.prompts.parsers import SnipeAnalysis
 
     return SnipeAnalysis(
         failure_synthesis=(
@@ -662,8 +662,8 @@ def generate_oneshot_script(out_dir: Path, script_path: str) -> None:
     )
 
 
-def generate_oneshot_query(ctx: PromptContext, out_dir: Path) -> None:
-    """02 — Query oneshot using build_analyst_briefing_prompt(mode='oneshot')."""
+def generate_beam_query(ctx: PromptContext, out_dir: Path) -> None:
+    """02 — Query beam using build_analyst_briefing_prompt(mode='beam')."""
     from qt_sql.prompts.analyst_briefing import build_analyst_briefing_prompt
 
     prompt = build_analyst_briefing_prompt(
@@ -682,11 +682,11 @@ def generate_oneshot_query(ctx: PromptContext, out_dir: Path) -> None:
         engine_profile=ctx.engine_profile,
         exploit_algorithm_text=ctx.exploit_algorithm_text,
         qerror_analysis=ctx.qerror_analysis,
-        mode="oneshot",
+        mode="beam",
     )
 
     _write_and_report(
-        out_dir / f"02_oneshot_{ctx.query_id}.md",
+        out_dir / f"02_beam_{ctx.query_id}.md",
         prompt, "ONESHOT QUERY",
     )
 
@@ -761,7 +761,7 @@ def generate_swarm_analyst(ctx: PromptContext, out_dir: Path) -> None:
         engine_profile=ctx.engine_profile,
         exploit_algorithm_text=ctx.exploit_algorithm_text,
         qerror_analysis=ctx.qerror_analysis,
-        mode="swarm",
+        mode="beam",
     )
 
     _write_and_report(
@@ -772,7 +772,7 @@ def generate_swarm_analyst(ctx: PromptContext, out_dir: Path) -> None:
 
 def generate_fan_out(ctx: PromptContext, out_dir: Path) -> None:
     """06 — Fan-out prompt."""
-    from qt_sql.prompts.swarm_fan_out import build_fan_out_prompt
+    from qt_sql.prompts.fan_out import build_fan_out_prompt
 
     prompt = build_fan_out_prompt(
         query_id=ctx.query_id,
@@ -816,7 +816,7 @@ def generate_swarm_worker(ctx: PromptContext, out_dir: Path) -> None:
 
 def generate_snipe(ctx: PromptContext, out_dir: Path) -> None:
     """08+09+10 — Snipe analyst + sniper iter1 + sniper iter2."""
-    from qt_sql.prompts.swarm_snipe import build_snipe_analyst_prompt, build_sniper_prompt
+    from qt_sql.prompts.snipe import build_snipe_analyst_prompt, build_sniper_prompt
     from qt_sql.schemas import WorkerResult
 
     worker_results = build_q88_worker_results(ctx)
@@ -978,8 +978,8 @@ def run_generator(
             print(f"  SKIP {name}: no --script provided")
             return
         generate_oneshot_script(out_dir, script_path)
-    elif name == "oneshot_query":
-        generate_oneshot_query(ctx, out_dir)
+    elif name == "beam_query":
+        generate_beam_query(ctx, out_dir)
     elif name == "expert":
         generate_expert(ctx, out_dir)
     elif name == "swarm_analyst":

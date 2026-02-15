@@ -31,7 +31,7 @@ from qt_sql.prompts.analyst_briefing import (
     _detect_query_features,
     _format_blind_spot_id,
 )
-from qt_sql.prompts.swarm_parsers import (
+from qt_sql.prompts.parsers import (
     BriefingShared,
     BriefingWorker,
     ParsedBriefing,
@@ -39,7 +39,6 @@ from qt_sql.prompts.swarm_parsers import (
 )
 from qt_sql.prompts.briefing_checks import (
     build_analyst_checklist,
-    build_oneshot_checklist,
     build_worker_rewrite_checklist,
     validate_parsed_briefing,
     VALID_GOALS,
@@ -252,20 +251,15 @@ def _worker_valid(worker_id: int = 1):
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestSectionRole:
-    def test_swarm_mode(self):
-        result = section_role("swarm")
+    def test_beam_mode(self):
+        result = section_role("beam")
         assert "§I. ROLE" in result
         assert "senior query optimization architect" in result
         assert "4 specialist workers" in result
         assert "ONLY what you provide" in result
 
-    def test_oneshot_mode(self):
-        result = section_role("oneshot")
-        assert "§I. ROLE" in result
-        assert "produce the optimized SQL directly" in result
-
     def test_contains_six_principles(self):
-        result = section_role("swarm")
+        result = section_role("beam")
         assert "MINIMIZE ROWS TOUCHED" in result
         assert "SMALLEST SET FIRST" in result
         assert "DON'T REPEAT WORK" in result
@@ -274,29 +268,29 @@ class TestSectionRole:
         assert "MINIMIZE DATA MOVEMENT" in result
 
     def test_principles_are_numbered(self):
-        result = section_role("swarm")
+        result = section_role("beam")
         for i in range(1, 7):
             assert f"{i}." in result
 
     def test_no_doctor_metaphor(self):
-        result = section_role("swarm")
+        result = section_role("beam")
         assert "doctor" not in result
         assert "patient" not in result
         assert "optimization architect" in result
 
     def test_diagnostic_lens_framing(self):
-        result = section_role("swarm")
+        result = section_role("beam")
         assert "diagnostic lens is six principles" in result
 
     def test_gold_examples_paragraph(self):
-        result = section_role("swarm")
+        result = section_role("beam")
         assert "gold examples" in result
         assert "primary asset" in result
         assert "highest-leverage" in result
         assert "examples are the edge" in result
 
-    def test_swarm_mentions_query_map(self):
-        result = section_role("swarm")
+    def test_beam_mentions_query_map(self):
+        result = section_role("beam")
         assert "query map" in result
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -489,8 +483,8 @@ class TestSectionConstraints:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestSectionInvestigate:
-    def test_seven_steps_in_swarm(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+    def test_seven_steps_in_beam(self):
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "§V. INVESTIGATE" in result
         assert "Step 1:" in result
         assert "Step 2:" in result
@@ -501,50 +495,50 @@ class TestSectionInvestigate:
         assert "Step 7:" in result
 
     def test_step1_analyze_plan(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Analyze the Current Plan" in result
         assert "cost spine" in result
 
     def test_step2_read_map(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Read the Map" in result
         assert "query map" in result.lower()
 
     def test_step3_optimal_path(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Optimal Path" in result
         assert "best entry point" in result
         assert "running rowcount" in result
 
     def test_step4_diagnose_gap(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Diagnose the Gap" in result
         assert "violated goal" in result
 
     def test_step4_novel_blind_spot_detection(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "novel blind spot" in result
         assert "describe the mechanism" in result
 
     def test_step4_self_sufficiency(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "complete and actionable on its own" in result
         assert "even for problems you've never seen before" in result
 
     def test_step5_match_gold_examples(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Match Gold Examples" in result
         assert "highest-leverage step" in result
         assert "Match found" in result
         assert "No match" in result
 
     def test_step5_references_example_catalog(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Example Catalog" in result
         assert "§VII.B" in result
 
     def test_step6_select_examples_per_worker(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Select Examples Per Worker" in result
         assert "Matching criteria" in result
         assert "Structural similarity" in result
@@ -552,38 +546,38 @@ class TestSectionInvestigate:
         assert "Hazard coverage" in result
 
     def test_step6_adaptation_guidance(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Adaptation guidance" in result
         assert "APPLY" in result
         assert "IGNORE" in result
         assert "ADAPT" in result
 
     def test_step6_anti_patterns(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Anti-patterns" in result
         assert "dilute attention" in result
 
-    def test_step7_four_strategies_swarm(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+    def test_step7_four_strategies_beam(self):
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Design Four Strategies" in result
         assert "NEW QUERY MAP" in result
 
     def test_step7_selection_rules(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Selection rules:" in result
         assert "structural prerequisites" in result
         assert "compound strategies" in result
 
-    def test_worker_diversity_in_swarm(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+    def test_worker_diversity_in_beam(self):
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Worker Diversity" in result
         assert "W1" in result
         assert "W2" in result
         assert "W3" in result
         assert "W4" in result
 
-    def test_transform_families_in_swarm(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+    def test_transform_families_in_beam(self):
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Transform Families" in result
         assert "Family A" in result
         assert "Family B" in result
@@ -592,22 +586,22 @@ class TestSectionInvestigate:
         assert "Family E" in result
         assert "Family F" in result
 
-    def test_worker_roles_in_swarm(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+    def test_worker_roles_in_beam(self):
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Worker Roles" in result
         assert "Proven compound" in result
         assert "Structural alternative" in result
         assert "Aggressive compound" in result
         assert "Novel / orthogonal" in result
 
-    def test_family_coverage_rule_in_swarm(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+    def test_family_coverage_rule_in_beam(self):
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "Family Coverage Rule" in result
         assert "at least 3 of the 6 transform families" in result
 
     def test_worker_diversity_generic_not_query_specific(self):
         """Worker diversity descriptions should be generic, not referencing specific schemas."""
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         diversity_start = result.index("Worker Diversity")
         diversity_section = result[diversity_start:]
         assert "EARLY FILTERING" in diversity_section
@@ -620,25 +614,18 @@ class TestSectionInvestigate:
         assert "web_sales" not in diversity_section
         assert "customer_sk" not in diversity_section
 
-    def test_oneshot_mode_implement(self):
-        result = section_investigate("oneshot", _minimal_dag(), None, None)
-        assert "Implement" in result
-        assert "Four Strategies" not in result
+    def test_step5_appears(self):
+        """Step 5 (Match Gold Examples) appears in beam mode."""
+        result = section_investigate("beam", _minimal_dag(), None, None)
+        assert "Match Gold Examples" in result
 
-    def test_step5_appears_in_all_modes(self):
-        """Step 5 (Match Gold Examples) appears in all modes."""
-        for mode in ("swarm", "oneshot"):
-            result = section_investigate(mode, _minimal_dag(), None, None)
-            assert "Match Gold Examples" in result, f"Missing Step 5 in {mode} mode"
-
-    def test_step6_appears_in_all_modes(self):
-        """Step 6 (Select Examples) appears in all modes."""
-        for mode in ("swarm", "oneshot"):
-            result = section_investigate(mode, _minimal_dag(), None, None)
-            assert "Select Examples" in result, f"Missing Step 6 in {mode} mode"
+    def test_step6_appears(self):
+        """Step 6 (Select Examples) appears in beam mode."""
+        result = section_investigate("beam", _minimal_dag(), None, None)
+        assert "Select Examples" in result
 
     def test_references_section_vii(self):
-        result = section_investigate("swarm", _minimal_dag(), None, None)
+        result = section_investigate("beam", _minimal_dag(), None, None)
         assert "§VII" in result
 
 
@@ -648,7 +635,7 @@ class TestSectionInvestigate:
 
 class TestSectionOutputFormat:
     def test_shared_briefing_format(self):
-        result = section_output_format("swarm", False, "duckdb")
+        result = section_output_format("beam", False, "duckdb")
         assert "§VI. OUTPUT FORMAT" in result
         assert "=== SHARED BRIEFING ===" in result
         assert "SEMANTIC_CONTRACT:" in result
@@ -657,46 +644,36 @@ class TestSectionOutputFormat:
         assert "ACTIVE_CONSTRAINTS:" in result
         assert "REGRESSION_WARNINGS:" in result
 
-    def test_diversity_map_in_swarm(self):
-        result = section_output_format("swarm", False, "duckdb")
+    def test_diversity_map_in_beam(self):
+        result = section_output_format("beam", False, "duckdb")
         assert "DIVERSITY_MAP:" in result
         assert "| Worker | Role" in result
         assert "Primary Family" in result
         assert "Key Structural Idea |" in result
 
-    def test_no_diversity_map_in_oneshot(self):
-        result = section_output_format("oneshot", False, "duckdb")
-        assert "DIVERSITY_MAP:" not in result
-
     def test_worker_briefing_new_fields(self):
-        result = section_output_format("swarm", False, "duckdb")
+        result = section_output_format("beam", False, "duckdb")
         assert "STRATEGY:" in result
         assert "APPROACH:" in result
         assert "TARGET_QUERY_MAP:" in result
         assert "NODE_CONTRACTS:" in result
 
     def test_example_adaptation_structured_format(self):
-        result = section_output_format("swarm", False, "duckdb")
+        result = section_output_format("beam", False, "duckdb")
         assert "EXAMPLE_ADAPTATION:" in result
         assert "APPLY:" in result
         assert "IGNORE:" in result
         assert "ADAPT:" in result
 
     def test_worker_4_exploration_fields(self):
-        result = section_output_format("swarm", False, "duckdb")
+        result = section_output_format("beam", False, "duckdb")
         assert "EXPLORATION_TYPE:" in result
         assert "HYPOTHESIS_TAG:" in result
         assert "Worker 4 adds:" in result
 
-    def test_oneshot_format(self):
-        result = section_output_format("oneshot", False, "duckdb")
-        assert "=== OPTIMIZED SQL ===" in result
-        assert "STRATEGY:" in result
-        assert "WORKER 1 BRIEFING" not in result
-
-    def test_swarm_worker_n_template(self):
-        """Swarm generates explicit WORKER 1..4 briefing blocks (not generic N template)."""
-        result = section_output_format("swarm", False, "duckdb")
+    def test_beam_worker_n_template(self):
+        """Beam generates explicit WORKER 1..4 briefing blocks (not generic N template)."""
+        result = section_output_format("beam", False, "duckdb")
         # Parser requires explicit numeric headers, not generic "N" placeholder
         assert "=== WORKER 1 BRIEFING ===" in result
         assert "=== WORKER 2 BRIEFING ===" in result
@@ -704,7 +681,7 @@ class TestSectionOutputFormat:
         assert "=== WORKER 4 BRIEFING ===" in result
 
     def test_discovery_mode_note(self):
-        result = section_output_format("swarm", True, "duckdb")
+        result = section_output_format("beam", True, "duckdb")
         assert "Discovery mode" in result or "discovery mode" in result
 
 
@@ -823,12 +800,12 @@ class TestSectionReferenceAppendix:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestFullPromptBuild:
-    def test_swarm_has_all_seven_sections(self):
+    def test_beam_has_all_seven_sections(self):
         prompt = build_analyst_briefing_prompt(
             query_id="q1", sql="SELECT 1",
             explain_plan_text=None, dag=_minimal_dag(), costs={},
             semantic_intents=None, constraints=_constraints(),
-            dialect="duckdb", mode="swarm",
+            dialect="duckdb", mode="beam",
             engine_profile=_engine_profile(),
         )
         assert "§I. ROLE" in prompt
@@ -838,16 +815,6 @@ class TestFullPromptBuild:
         assert "§V. INVESTIGATE" in prompt
         assert "§VI. OUTPUT FORMAT" in prompt
         assert "§VII. REFERENCE APPENDIX" in prompt
-
-    def test_oneshot_has_all_sections(self):
-        prompt = build_analyst_briefing_prompt(
-            query_id="q1", sql="SELECT 1",
-            explain_plan_text=None, dag=_minimal_dag(), costs={},
-            semantic_intents=None, constraints=_constraints(),
-            dialect="duckdb", mode="oneshot",
-        )
-        assert "§I. ROLE" in prompt
-        assert "§VI. OUTPUT FORMAT" in prompt
 
     def test_invalid_mode_raises(self):
         with pytest.raises(ValueError, match="Invalid mode"):
@@ -873,7 +840,7 @@ class TestFullPromptBuild:
             query_id="q1", sql="SELECT 1",
             explain_plan_text=None, dag=_minimal_dag(), costs={},
             semantic_intents=None, constraints=_constraints(),
-            dialect="duckdb", mode="swarm",
+            dialect="duckdb", mode="beam",
             engine_profile=_engine_profile(),
         )
         # Verify sections appear in order §I < §II < §III < §IV < §V < §VI < §VII
@@ -1458,11 +1425,6 @@ class TestChecklists:
     def test_analyst_checklist_has_node_contracts(self):
         result = build_analyst_checklist()
         assert "NODE_CONTRACTS" in result
-
-    def test_oneshot_checklist(self):
-        result = build_oneshot_checklist()
-        assert "OPTIMAL_PATH" in result
-        assert "CURRENT_PLAN_GAP" in result
 
     def test_worker_rewrite_checklist(self):
         result = build_worker_rewrite_checklist()

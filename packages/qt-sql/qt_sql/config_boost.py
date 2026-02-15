@@ -1,6 +1,6 @@
 """Config Boost: post-rewrite SET LOCAL tuning from EXPLAIN analysis.
 
-After the swarm fan-out picks a winning rewrite, this module proposes
+After beam picks a winning rewrite, this module proposes
 SET LOCAL config changes based on the winner's EXPLAIN ANALYZE plan.
 Rules are derived from V1 manual tuning evidence + PG internals.
 
@@ -9,7 +9,7 @@ Two modes:
   2. LLM-driven (--use-llm): Uses pg_tuner prompt, falls back to rules.
 
 Two input paths:
-  1. boost_session() / boost_benchmark(): Reads from swarm_sessions/
+  1. boost_session() / boost_benchmark(): Reads from beam_sessions/
   2. boost_from_leaderboard(): Reads from leaderboard.json (preferred)
 
 Usage:
@@ -18,7 +18,7 @@ Usage:
     # From leaderboard (preferred)
     results = boost_from_leaderboard(benchmark_dir, dsn)
 
-    # Legacy: from swarm_sessions
+    # From beam_sessions
     from qt_sql.config_boost import boost_session, boost_benchmark
     result = boost_session(session_dir, dsn)
 """
@@ -274,7 +274,7 @@ def boost_session(
     min_speedup: float = 1.05,
     dry_run: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Run config boost on a completed swarm session.
+    """Run config boost on a completed beam session.
 
     1. Load session.json, find best worker
     2. Skip if best_speedup < min_speedup
@@ -285,7 +285,7 @@ def boost_session(
     7. Return result dict
 
     Args:
-        session_dir: Path to swarm_sessions/<query_id>/
+        session_dir: Path to beam_sessions/<query_id>/
         dsn: PostgreSQL connection DSN
         min_speedup: Minimum rewrite speedup to attempt boost
         dry_run: If True, propose configs without benchmarking
@@ -449,10 +449,10 @@ def boost_benchmark(
         List of result dicts, one per session attempted
     """
     benchmark_dir = Path(benchmark_dir)
-    sessions_dir = benchmark_dir / "swarm_sessions"
+    sessions_dir = benchmark_dir / "beam_sessions"
 
     if not sessions_dir.exists():
-        logger.warning(f"No swarm_sessions directory in {benchmark_dir}")
+        logger.warning(f"No beam_sessions directory in {benchmark_dir}")
         return []
 
     results: List[Dict[str, Any]] = []
@@ -511,7 +511,7 @@ def _load_best_worker_sql(session_dir: Path, best_worker_id: Optional[int]) -> O
 def _load_original_sql(session_dir: Path) -> Optional[str]:
     """Load original SQL from the benchmark queries directory."""
     query_id = session_dir.name
-    # Walk up to benchmark dir: swarm_sessions/<query_id> → benchmark_dir
+    # Walk up to benchmark dir: beam_sessions/<query_id> → benchmark_dir
     benchmark_dir = session_dir.parent.parent
     sql_path = benchmark_dir / "queries" / f"{query_id}.sql"
     if sql_path.exists():
@@ -754,8 +754,8 @@ def _boost_leaderboard_entry(
     # Load optimized SQL from leaderboard
     optimized_sql = entry.get("optimized_sql")
     if not optimized_sql:
-        # Fallback: read from swarm_sessions
-        sessions_dir = benchmark_dir / "swarm_sessions" / query_id
+        # Fallback: read from beam_sessions
+        sessions_dir = benchmark_dir / "beam_sessions" / query_id
         worker_id = entry.get("best_worker_id")
         optimized_sql = _load_best_worker_sql(sessions_dir, worker_id) if sessions_dir.exists() else None
 
@@ -783,7 +783,7 @@ def _boost_leaderboard_entry(
     # Get EXPLAIN text: from leaderboard entry, session files, or run fresh
     explain_text = entry.get("explain_text") or entry.get("explain")
     if not explain_text:
-        session_dir = benchmark_dir / "swarm_sessions" / query_id
+        session_dir = benchmark_dir / "beam_sessions" / query_id
         worker_id = entry.get("best_worker_id")
         if session_dir.exists():
             explain_text = _get_or_run_explain(session_dir, dsn, optimized_sql, worker_id)

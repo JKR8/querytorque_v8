@@ -142,7 +142,7 @@ async def optimize_sql(request: OptimizeRequest):
 
     - **sql**: The SQL query to optimize
     - **dsn**: Database connection string (DuckDB or PostgreSQL)
-    - **mode**: swarm (4 workers) or oneshot (single call)
+    - **mode**: beam (analyst → 4 workers → validate → snipe)
     - **query_id**: Optional identifier for traceability
     """
     try:

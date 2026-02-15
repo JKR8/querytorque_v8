@@ -28,7 +28,7 @@ def config_boost(
 ) -> None:
     """Boost winning rewrites with SET LOCAL config tuning.
 
-    Reads leaderboard.json (if available) or swarm_sessions/ to find
+    Reads leaderboard.json (if available) or beam_sessions/ to find
     winning rewrites. Analyzes EXPLAIN ANALYZE plans and proposes
     SET LOCAL config changes (work_mem, jit, parallelism, etc.).
     Benchmarks each proposed config with interleaved 3-variant timing.
@@ -62,7 +62,7 @@ def config_boost(
         from ._common import parse_query_filter
         query_ids = parse_query_filter(query, bench_dir)
 
-    # Try leaderboard.json first, fall back to swarm_sessions
+    # Try leaderboard.json first, fall back to beam_sessions
     lb_path = bench_dir / "leaderboard.json"
     if lb_path.exists():
         from ..config_boost import boost_from_leaderboard
@@ -79,13 +79,13 @@ def config_boost(
         for result in results:
             _print_result(console, result, dry_run)
     else:
-        # Legacy path: read from swarm_sessions
+        # Fallback: read from beam_sessions
         from ..config_boost import boost_session, boost_benchmark
 
-        console.print(f"  No leaderboard.json, reading from swarm_sessions/")
+        console.print(f"  No leaderboard.json, reading from beam_sessions/")
         if query_ids:
             results = []
-            sessions_dir = bench_dir / "swarm_sessions"
+            sessions_dir = bench_dir / "beam_sessions"
             for qid in query_ids:
                 session_dir = sessions_dir / qid
                 if not session_dir.exists():

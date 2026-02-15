@@ -1,4 +1,4 @@
-"""Snipe prompts for swarm mode.
+"""Snipe prompts for beam mode.
 
 Current flow (canonical): Self-directed retry worker — single LLM call per retry
 iteration. The worker diagnoses failures, identifies unexplored angles, and
@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from ..schemas import WorkerResult
 
 if TYPE_CHECKING:
-    from .swarm_parsers import SnipeAnalysis
+    from .parsers import SnipeAnalysis
 
 logger = logging.getLogger(__name__)
 

@@ -647,7 +647,7 @@ class TestBuildExecution:
         run_dir = tmp_path / "runs" / "run_20260215_120000"
         run_dir.mkdir(parents=True)
         summary = {
-            "mode": "swarm",
+            "mode": "beam",
             "total": 3,
             "completed": 2,
             "elapsed_seconds": 60.0,
@@ -662,7 +662,7 @@ class TestBuildExecution:
         result = _build_execution(tmp_path)
         assert len(result.runs) == 1
         assert result.runs[0].run_id == "run_20260215_120000"
-        assert result.runs[0].mode == "swarm"
+        assert result.runs[0].mode == "beam"
         assert result.runs[0].total_queries == 3
         assert result.runs[0].timestamp == "2026-02-15 12:00:00"
         assert result.runs[0].status_counts["WIN"] == 1
@@ -679,7 +679,7 @@ class TestBuildExecution:
             run_dir = tmp_path / "runs" / f"run_{ts}"
             run_dir.mkdir(parents=True)
             (run_dir / "summary.json").write_text(json.dumps({
-                "mode": "swarm", "total": 1, "results": [
+                "mode": "beam", "total": 1, "results": [
                     {"query_id": "q1", "status": "WIN", "speedup": 1.5},
                 ],
             }))
@@ -694,7 +694,7 @@ class TestBuildExecution:
         qdir = run_dir / "query_1"
         qdir.mkdir(parents=True)
         (run_dir / "summary.json").write_text(json.dumps({
-            "mode": "swarm", "total": 1, "results": [
+            "mode": "beam", "total": 1, "results": [
                 {"query_id": "query_1", "status": "WIN", "speedup": 3.0},
             ],
         }))
@@ -943,7 +943,7 @@ class TestCollectWorkloadProfile:
         run_dir = tmp_path / "runs" / "run_20260215_100000"
         run_dir.mkdir(parents=True)
         (run_dir / "summary.json").write_text(json.dumps({
-            "mode": "swarm", "total": 1, "completed": 1,
+            "mode": "beam", "total": 1, "completed": 1,
             "results": [
                 {"query_id": "q1", "status": "WIN", "speedup": 2.0},
             ],

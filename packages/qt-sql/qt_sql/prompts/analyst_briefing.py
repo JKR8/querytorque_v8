@@ -4,9 +4,7 @@ Clean rewrite: investigation-method framing with 6 goals embedded in mission,
 engine-specific profiles, 5-step investigation + worker diversity, reference
 appendix with documented cases and regression registry.
 
-Supports two modes:
-  - swarm: 4 workers, diversity map, full investigation method
-  - oneshot: analyse + produce SQL directly
+Beam mode: analyst → 4 workers → validate → snipe.
 """
 
 from __future__ import annotations
@@ -130,7 +128,7 @@ def _detect_query_features(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# PostgreSQL EXPLAIN formatting helpers (shared with swarm_snipe)
+# PostgreSQL EXPLAIN formatting helpers (shared with snipe)
 # ──────────────────────────────────────────────────────────────────────
 
 def _render_pg_node(
@@ -549,40 +547,23 @@ def section_role(mode: str) -> str:
     lines.append("5. **ARM THE OPTIMIZER** — Restructure so it has full intelligence. Don't force plans.")
     lines.append("6. **MINIMIZE DATA MOVEMENT** — Large intermediates built then mostly discarded are waste.")
     lines.append("")
-    if mode == "swarm":
-        lines.append(
-            "Your primary asset is a library of **gold examples** — proven before/after SQL "
-            "rewrites with measured speedups gathered from hundreds of benchmark runs. "
-            "Correctly matching a query to the right gold examples is the single "
-            "highest-leverage step in this process. Workers receive the full before/after "
-            "SQL for the examples you assign and use them as structural templates. The "
-            "diagnosis tells you what's wrong; the examples are the edge — they tell the "
-            "workers exactly how to fix it."
-        )
-    else:
-        lines.append(
-            "Your primary asset is a library of **gold examples** — proven before/after SQL "
-            "rewrites with measured speedups gathered from hundreds of benchmark runs. "
-            "Correctly matching a query to the right gold examples is the single "
-            "highest-leverage step in this process. The gold example's before/after SQL "
-            "is a structural template — you adapt the pattern to this query. The "
-            "diagnosis tells you what's wrong; the examples show exactly how to fix it."
-        )
+    lines.append(
+        "Your primary asset is a library of **gold examples** — proven before/after SQL "
+        "rewrites with measured speedups gathered from hundreds of benchmark runs. "
+        "Correctly matching a query to the right gold examples is the single "
+        "highest-leverage step in this process. Workers receive the full before/after "
+        "SQL for the examples you assign and use them as structural templates. The "
+        "diagnosis tells you what's wrong; the examples are the edge — they tell the "
+        "workers exactly how to fix it."
+    )
 
-    if mode == "swarm":
-        lines.append("")
-        lines.append(
-            "You produce structured briefings for 4 specialist workers. Each worker "
-            "designs a new query map showing how their restructuring fixes the "
-            "identified problems, THEN writes the SQL to implement that map. They see "
-            "ONLY what you provide."
-        )
-    elif mode == "oneshot":
-        lines.append("")
-        lines.append(
-            "You analyze the query, determine the single best optimization "
-            "strategy, and produce the optimized SQL directly."
-        )
+    lines.append("")
+    lines.append(
+        "You produce structured briefings for 4 specialist workers. Each worker "
+        "designs a new query map showing how their restructuring fixes the "
+        "identified problems, THEN writes the SQL to implement that map. They see "
+        "ONLY what you provide."
+    )
     return "\n".join(lines)
 
 
@@ -948,7 +929,7 @@ def section_investigate(
         "(§VII.B) for gold examples with matching query structure."
     )
     lines.append("")
-    if mode == "swarm":
+    if mode == "beam":
         lines.append(
             "- **Match found**: The matching examples become the primary basis for worker "
             "strategies. Assign them to workers with APPLY/IGNORE/ADAPT guidance. The gold "
@@ -970,7 +951,7 @@ def section_investigate(
     lines.append("")
 
     # Step 6: Select Examples Per Worker (NEW)
-    if mode == "swarm":
+    if mode == "beam":
         lines.append(
             "**Step 6: Select Examples Per Worker.** For each of the 4 strategies, "
             "select 1–3 examples from the catalog:"
@@ -1033,7 +1014,7 @@ def section_investigate(
     lines.append("")
 
     # Step 7: Design Strategies
-    if mode == "swarm":
+    if mode == "beam":
         lines.append(
             "**Step 7: Design Four Strategies.** Each strategy must include a NEW QUERY MAP "
             "showing the restructured data flow before specifying any SQL. The map is the "
@@ -1242,19 +1223,6 @@ def section_investigate(
         lines.append("Family F (Join Transformation):    covered by W_?")
         lines.append("Uncovered families:                [list → W4 should target these]")
         lines.append("```")
-    elif mode == "oneshot":
-        lines.append(
-            "**Step 7: Implement.** Design and implement the single best strategy "
-            "as working SQL."
-        )
-        lines.append("")
-        lines.append("Selection rules:")
-        lines.append(
-            "- If the EXPLAIN shows the optimizer already handles something, don't re-do it"
-        )
-        lines.append(
-            "- Verify structural prerequisites before assigning transforms"
-        )
 
     return "\n".join(lines)
 
@@ -1294,7 +1262,7 @@ def section_output_format(
     lines.append("  RULE: [...]")
     lines.append("")
 
-    if mode == "swarm":
+    if mode == "beam":
         lines.append("DIVERSITY_MAP:")
         lines.append("| Worker | Role              | Primary Family | Secondary | Key Structural Idea |")
         lines.append("|--------|-------------------|----------------|-----------|---------------------|")
@@ -1339,7 +1307,7 @@ def section_output_format(
         "UNCOVERED_FAMILY: [which family W1-W3 missed that W4 targets]",
     ]
 
-    if mode == "swarm":
+    if mode == "beam":
         # Generate explicit WORKER 1, 2, 3, 4 briefing templates
         # (Parser requires numeric headers, not template placeholder "N")
         for worker_num in range(1, 5):
@@ -1359,18 +1327,6 @@ def section_output_format(
                     "(Discovery mode: ALL workers include EXPLORATION_TYPE and HYPOTHESIS_TAG.)"
                 )
             lines.append("")
-    elif mode == "oneshot":
-        lines.append("")
-        lines.append("=== OPTIMIZED SQL ===")
-        lines.append("")
-        lines.append("STRATEGY: strategy_name")
-        lines.append("TRANSFORM: transform_names")
-        lines.append("")
-        lines.append("```sql")
-        lines.append("SELECT ...")
-        lines.append("```")
-        lines.append("")
-
     lines.append("```")
 
     return "\n".join(lines)
@@ -1384,7 +1340,7 @@ def section_reference_appendix(
     matched_examples: Optional[List[Dict[str, Any]]] = None,
     dialect: str = "duckdb",
     explain_plan_text: Optional[str] = None,
-    mode: str = "swarm",
+    mode: str = "beam",
 ) -> str:
     """§VII. REFERENCE APPENDIX — case files by blind spot, gold example catalog, regression registry, structural matches, verification."""
     engine_names = {
@@ -1454,7 +1410,7 @@ def section_reference_appendix(
     # B. Gold Example Catalog
     lines.append(f"### B. Gold Example Catalog ({engine_display})")
     lines.append("")
-    if mode == "swarm":
+    if mode == "beam":
         lines.append(
             "Each example is a proven before/after SQL pair with measured speedups. "
             "Workers receive the full SQL for assigned examples. You select based on "
@@ -1637,7 +1593,7 @@ def build_analyst_briefing_prompt(
     exploit_algorithm_text: Optional[str] = None,
     plan_scanner_text: Optional[str] = None,
     iteration_history: Optional[Dict[str, Any]] = None,
-    mode: str = "swarm",
+    mode: str = "beam",
     detected_transforms: Optional[List] = None,
     qerror_analysis: Optional[Any] = None,
     matched_examples: Optional[List[Dict[str, Any]]] = None,
@@ -1659,7 +1615,7 @@ def build_analyst_briefing_prompt(
         exploit_algorithm_text: Evidence-based exploit algorithm text
         plan_scanner_text: Pre-computed plan-space scanner results (PG)
         iteration_history: Prior optimization attempts
-        mode: 'swarm' (4 workers) or 'oneshot'
+        mode: 'beam' (analyst → 4 workers → validate → snipe)
         detected_transforms: Top-N transforms by feature overlap
         qerror_analysis: Cardinality estimation error analysis
         matched_examples: Pre-ranked gold examples with _match_score
@@ -1667,8 +1623,8 @@ def build_analyst_briefing_prompt(
     Returns:
         Complete analyst prompt string with §I-§VII sections.
     """
-    if mode not in ("swarm", "oneshot"):
-        raise ValueError(f"Invalid mode: {mode!r}. Must be 'swarm' or 'oneshot'.")
+    if mode != "beam":
+        raise ValueError(f"Invalid mode: {mode!r}. Must be 'beam'.")
 
     has_empirical_gaps = bool(engine_profile and engine_profile.get("gaps"))
     is_discovery_mode = not has_empirical_gaps

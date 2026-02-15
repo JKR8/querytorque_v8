@@ -1,10 +1,10 @@
-"""Shared prompt helpers for swarm mode."""
+"""Shared prompt helpers for beam mode."""
 
 from __future__ import annotations
 
 
 def build_worker_strategy_header(strategy: str, hint: str) -> str:
-    """Build the strategy preamble used for a swarm worker prompt."""
+    """Build the strategy preamble used for a beam worker prompt."""
     safe_strategy = strategy or "fallback_strategy"
     safe_hint = hint or "Apply relevant optimizations with semantic safety."
     return (

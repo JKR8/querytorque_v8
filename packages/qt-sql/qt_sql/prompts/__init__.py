@@ -1,15 +1,15 @@
 """Prompt builders for beam mode."""
 
-from .swarm_fan_out import build_fan_out_prompt
-from .swarm_snipe import (
+from .fan_out import build_fan_out_prompt
+from .snipe import (
     build_retry_worker_prompt,
     build_snipe_analyst_prompt,   # DEPRECATED — kept for reference
     build_sniper_prompt,          # DEPRECATED — kept for reference
 )
-from .swarm_common import build_worker_strategy_header
+from .common import build_worker_strategy_header
 # Canonical prompt builders
 from .analyst_briefing import build_analyst_briefing_prompt
-from .swarm_parsers import (
+from .parsers import (
     parse_briefing_response,
     BriefingShared,
     BriefingWorker,
