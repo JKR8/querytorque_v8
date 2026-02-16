@@ -19,7 +19,14 @@ import logging
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from .knowledge.normalization import (
+    build_transform_index,
+    normalize_dialect,
+    normalize_example_record,
+    normalize_tag_entry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -999,6 +1006,13 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
         List of (example_id, sql_text, metadata) tuples
     """
     examples = []
+    transform_index: Dict[str, Dict[str, Any]] = {}
+    transforms_path = BASE_DIR / "knowledge" / "transforms.json"
+    if transforms_path.exists():
+        try:
+            transform_index = build_transform_index(json.loads(transforms_path.read_text()))
+        except Exception as e:
+            logger.warning(f"Failed to load transform index for tagging: {e}")
 
     # Load from qt_sql/examples/ (gold) + qt_sql/benchmarks/*/state_0/seed/ (seed rules)
     search_dirs = [EXAMPLES_DIR]
@@ -1015,7 +1029,34 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
 
         for path in sorted(example_dir.glob("**/*.json")):
             try:
-                data = json.loads(path.read_text())
+                raw_data = json.loads(path.read_text())
+
+                # Determine source dialect from path / payload.
+                rel = path.relative_to(BASE_DIR)
+                parts = rel.parts
+                if "duckdb" in parts:
+                    source_dialect = "duckdb"
+                elif "postgresql" in parts or "postgres" in parts:
+                    source_dialect = "postgresql"
+                elif "snowflake" in parts:
+                    source_dialect = "snowflake"
+                elif "databricks" in parts:
+                    source_dialect = "databricks"
+                elif "seed" in parts:
+                    source_dialect = "seed"
+                else:
+                    source_dialect = normalize_dialect(raw_data.get("dialect") or raw_data.get("engine"), default="duckdb")
+
+                data = (
+                    normalize_example_record(
+                        raw_data,
+                        default_dialect=source_dialect,
+                        transform_index=transform_index or None,
+                    )
+                    if source_dialect != "seed"
+                    else raw_data
+                )
+
                 example_id = data.get("id", path.stem)
 
                 # Get SQL to vectorize - prefer top-level original_sql (always complete)
@@ -1053,18 +1094,6 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
                 # Get speedup from example or data level
                 speedup = data.get("verified_speedup", "unknown")
 
-                # Determine engine from path
-                rel = path.relative_to(BASE_DIR)
-                parts = rel.parts
-                if "duckdb" in parts:
-                    source_engine = "duckdb"
-                elif "postgres" in parts:
-                    source_engine = "postgres"
-                elif "seed" in parts:
-                    source_engine = "seed"
-                else:
-                    source_engine = "unknown"
-
                 # Determine example type: gold (positive) or regression (negative)
                 example_type = data.get("type", "gold")
 
@@ -1076,7 +1105,7 @@ def load_examples_for_indexing() -> List[Tuple[str, str, Dict]]:
                     "principle": data.get("principle", ""),
                     "key_insight": example_data.get("key_insight", ""),
                     "benchmark_queries": data.get("benchmark_queries", []),
-                    "engine": source_engine,
+                    "dialect": source_dialect,
                     "type": example_type,
                 }
 
@@ -1143,16 +1172,11 @@ def build_tag_index(
     print(f"Extracting tags from {len(examples)} examples...")
 
     for i, (example_id, sql_text, meta) in enumerate(examples):
-        engine = meta.get("engine", "unknown")
-        if engine in ("postgres", "postgresql"):
-            dialect = "postgres"
-        elif engine == "duckdb":
-            dialect = "duckdb"
-        else:
-            dialect = "duckdb"
+        dialect = normalize_dialect(meta.get("dialect"), default="duckdb")
+        parser_dialect = "postgres" if dialect == "postgresql" else dialect
 
         # Extract tags from SQL
-        tags = extract_tags(sql_text, dialect=dialect)
+        tags = extract_tags(sql_text, dialect=parser_dialect)
 
         # Add description-based tags
         desc_tags = _extract_description_tags(meta.get("description", ""))
@@ -1165,7 +1189,7 @@ def build_tag_index(
             "id": example_id,
             "tags": sorted(tags),
             "category": category,
-            "engine": engine,
+            "dialect": dialect,
             "type": meta.get("type", "gold"),
             "metadata": {
                 "name": meta.get("name", example_id),
@@ -1175,14 +1199,15 @@ def build_tag_index(
                 "winning_transform": meta.get("transforms", [""])[0] if meta.get("transforms") else "",
                 "principle": meta.get("principle", ""),
                 "key_insight": meta.get("key_insight", ""),
-                "engine": engine,
+                "dialect": dialect,
                 "type": meta.get("type", "gold"),
             },
         }
-        tag_entries.append(tag_entry)
+        normalized_entry = normalize_tag_entry(tag_entry)
+        tag_entries.append(normalized_entry)
 
         # Also store in flat metadata for backward compat
-        query_metadata[example_id] = tag_entry["metadata"]
+        query_metadata[example_id] = normalized_entry["metadata"]
 
         print(f"  [{i+1}/{len(examples)}] {example_id}: {len(tags)} tags, category={category}")
 
@@ -1238,11 +1263,14 @@ def show_index_stats() -> None:
         print(f"  {cat}: {count}")
     print()
 
-    # Engine distribution
-    engines = Counter(ex.get("engine", "unknown") for ex in examples)
-    print("Engines:")
-    for eng, count in engines.most_common():
-        print(f"  {eng}: {count}")
+    # Dialect distribution
+    dialects = Counter(
+        normalize_dialect(ex.get("dialect") or ex.get("engine"), default="unknown")
+        for ex in examples
+    )
+    print("Dialects:")
+    for dialect, count in dialects.most_common():
+        print(f"  {dialect}: {count}")
     print()
 
     # Type distribution

@@ -15,6 +15,8 @@ import json
 import logging
 from pathlib import Path
 
+from .normalization import normalize_dialect, normalize_tag_entry
+
 logger = logging.getLogger(__name__)
 
 # Directory paths — resolve relative to the qt_sql package root (parent of knowledge/)
@@ -49,7 +51,10 @@ class TagRecommender:
 
         try:
             data = json.loads(tags_file.read_text())
-            self.tag_entries = data.get("examples", [])
+            raw_entries = data.get("examples", [])
+            self.tag_entries = [
+                normalize_tag_entry(e) for e in raw_entries if isinstance(e, dict)
+            ]
 
             if metadata_file.exists():
                 self.tag_metadata = json.loads(metadata_file.read_text())
@@ -65,13 +70,13 @@ class TagRecommender:
     ) -> list[tuple[str, float, dict]]:
         """Find similar gold examples using tag overlap matching.
 
-        Returns gold examples for the target engine only. Regressions
-        and cross-engine examples are excluded.
+        Returns gold examples for the target dialect only. Regressions
+        and cross-dialect examples are excluded.
 
         Args:
             sql: SQL query to find similar examples for
             k: Number of results to return
-            dialect: SQL dialect — "duckdb" or "postgres"
+            dialect: SQL dialect (canonicalized internally)
 
         Returns:
             List of (example_id, similarity_score, metadata) tuples
@@ -79,19 +84,22 @@ class TagRecommender:
         if not self._initialized or not self.tag_entries:
             return []
 
-        engine = "postgres" if dialect == "postgres" else "duckdb"
+        canonical_dialect = normalize_dialect(dialect)
+        parser_dialect = (
+            "postgres" if canonical_dialect == "postgresql" else canonical_dialect
+        )
 
         try:
             from qt_sql.tag_index import extract_tags, classify_category
 
-            query_tags = extract_tags(sql, dialect=dialect)
+            query_tags = extract_tags(sql, dialect=parser_dialect)
             query_category = classify_category(query_tags)
 
             scored = []
             for ex in self.tag_entries:
-                ex_engine = ex.get("engine")
-                # Match engine-specific + seed (universal) examples
-                if ex_engine != engine and ex_engine != "seed":
+                ex_dialect = normalize_dialect(ex.get("dialect") or ex.get("engine"))
+                # Match dialect-specific + seed (universal) examples
+                if ex_dialect not in {canonical_dialect, "seed"}:
                     continue
                 if ex.get("type") == "regression":
                     continue
@@ -135,18 +143,21 @@ class TagRecommender:
         if not self._initialized or not self.tag_entries:
             return []
 
-        engine = "postgres" if dialect == "postgres" else "duckdb"
+        canonical_dialect = normalize_dialect(dialect)
+        parser_dialect = (
+            "postgres" if canonical_dialect == "postgresql" else canonical_dialect
+        )
 
         try:
             from qt_sql.tag_index import extract_tags, classify_category
 
-            query_tags = extract_tags(sql, dialect=dialect)
+            query_tags = extract_tags(sql, dialect=parser_dialect)
             query_category = classify_category(query_tags)
 
             scored = []
             for ex in self.tag_entries:
-                ex_engine = ex.get("engine")
-                if ex_engine != engine and ex_engine != "seed":
+                ex_dialect = normalize_dialect(ex.get("dialect") or ex.get("engine"))
+                if ex_dialect not in {canonical_dialect, "seed"}:
                     continue
                 if ex.get("type") != "regression":
                     continue

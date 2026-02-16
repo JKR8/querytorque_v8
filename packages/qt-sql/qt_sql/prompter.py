@@ -24,6 +24,14 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .knowledge.normalization import (
+    build_transform_index,
+    dialect_example_dir,
+    normalize_constraint_record,
+    normalize_dialect,
+    normalize_engine_profile,
+    normalize_example_record,
+)
 from .schemas import EdgeContract, PromotionAnalysis
 
 logger = logging.getLogger(__name__)
@@ -32,6 +40,29 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 EXAMPLES_DIR = BASE_DIR / "examples"
 CONSTRAINTS_DIR = BASE_DIR / "constraints"
+KNOWLEDGE_DIR = BASE_DIR / "knowledge"
+TRANSFORMS_PATH = KNOWLEDGE_DIR / "transforms.json"
+
+_TRANSFORM_INDEX_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+def _load_transform_index() -> Dict[str, Dict[str, Any]]:
+    """Load normalized transform index once per process."""
+    global _TRANSFORM_INDEX_CACHE
+    if _TRANSFORM_INDEX_CACHE is not None:
+        return _TRANSFORM_INDEX_CACHE
+
+    if not TRANSFORMS_PATH.exists():
+        _TRANSFORM_INDEX_CACHE = {}
+        return _TRANSFORM_INDEX_CACHE
+
+    try:
+        payload = json.loads(TRANSFORMS_PATH.read_text())
+        _TRANSFORM_INDEX_CACHE = build_transform_index(payload)
+    except Exception as e:
+        logger.warning("Failed to load transform index from %s: %s", TRANSFORMS_PATH, e)
+        _TRANSFORM_INDEX_CACHE = {}
+    return _TRANSFORM_INDEX_CACHE
 
 
 def compute_depths(dag) -> Dict[str, int]:
@@ -67,11 +98,7 @@ def load_exploit_algorithm(dialect: str = "duckdb") -> Optional[str]:
 
     Returns the raw markdown text or None if not available.
     """
-    KNOWLEDGE_DIR = Path(__file__).resolve().parent / "knowledge"
-
-    norm = dialect.lower()
-    if norm in ("postgres", "pg"):
-        norm = "postgresql"
+    norm = normalize_dialect(dialect)
 
     algo_path = KNOWLEDGE_DIR / f"{norm}.md"
     if algo_path.exists():
@@ -92,9 +119,7 @@ def _load_engine_profile(dialect: str = "duckdb") -> Optional[Dict[str, Any]]:
     if not CONSTRAINTS_DIR.exists():
         return None
 
-    norm = dialect.lower()
-    if norm in ("postgres", "pg"):
-        norm = "postgresql"
+    norm = normalize_dialect(dialect)
 
     profile_path = CONSTRAINTS_DIR / f"engine_profile_{norm}.json"
     if not profile_path.exists():
@@ -106,7 +131,7 @@ def _load_engine_profile(dialect: str = "duckdb") -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        data = json.loads(profile_path.read_text())
+        data = normalize_engine_profile(json.loads(profile_path.read_text()))
         if data.get("profile_type") != "engine_profile":
             logger.warning(
                 "Invalid engine profile type in %s: %r",
@@ -115,13 +140,15 @@ def _load_engine_profile(dialect: str = "duckdb") -> Optional[Dict[str, Any]]:
             )
             return None
 
-        profile_engine = str(data.get("engine", "")).lower()
-        if profile_engine and profile_engine != norm:
+        profile_dialect = normalize_dialect(
+            data.get("dialect") or data.get("engine")
+        )
+        if profile_dialect and profile_dialect != norm:
             logger.warning(
-                "Engine profile mismatch in %s: expected '%s', got '%s'",
+                "Engine profile mismatch in %s: expected dialect '%s', got '%s'",
                 profile_path,
                 norm,
-                profile_engine,
+                profile_dialect,
             )
             return None
 
@@ -132,11 +159,11 @@ def _load_engine_profile(dialect: str = "duckdb") -> Optional[Dict[str, Any]]:
 
 
 def _load_constraint_files(dialect: str = "duckdb") -> List[Dict[str, Any]]:
-    """Load constraint JSON files from CONSTRAINTS_DIR, filtered by engine.
+    """Load constraint JSON files from CONSTRAINTS_DIR, filtered by dialect.
 
-    Each constraint may have an ``"engine"`` field (e.g. ``"postgresql"``).
-    - If ``"engine"`` is absent, the constraint is universal (always loaded).
-    - If ``"engine"`` is present, it's only loaded when ``dialect`` matches.
+    Each constraint may have a ``"dialect"`` field (legacy ``"engine"`` accepted).
+    - If dialect is absent, the constraint is universal (always loaded).
+    - If dialect is present, it's only loaded when ``dialect`` matches.
     - Engine profile files (profile_type=engine_profile) are excluded.
 
     Returns list of constraint dicts sorted by severity (CRITICAL first,
@@ -146,23 +173,23 @@ def _load_constraint_files(dialect: str = "duckdb") -> List[Dict[str, Any]]:
         return []
 
     # Normalize dialect for matching (e.g. "postgres" -> "postgresql")
-    norm = dialect.lower()
-    if norm in ("postgres", "pg"):
-        norm = "postgresql"
+    norm = normalize_dialect(dialect)
 
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
     constraints = []
 
     for path in sorted(CONSTRAINTS_DIR.glob("*.json")):
         try:
-            data = json.loads(path.read_text())
+            data = normalize_constraint_record(json.loads(path.read_text()))
             # Skip engine profile files — they're loaded separately
             if data.get("profile_type") == "engine_profile":
                 continue
             if "id" not in data or "prompt_instruction" not in data:
                 continue
-            engine = data.get("engine")
-            if engine and engine.lower() != norm:
+            target_dialect = normalize_dialect(
+                data.get("dialect") or data.get("engine")
+            ) if (data.get("dialect") or data.get("engine")) else None
+            if target_dialect and target_dialect != norm:
                 continue  # skip constraints for other engines
             constraints.append(data)
         except Exception as e:
@@ -971,24 +998,28 @@ class Prompter:
     @staticmethod
     def load_example_for_pattern(
         pattern_name: str,
-        engine: str = "duckdb",
+        dialect: str = "duckdb",
+        engine: Optional[str] = None,
         seed_dirs: Optional[List[Path]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Load a gold example matching the given pattern name.
 
-        Search order (same engine only — never mix DBs):
-        1. qt_sql/examples/<engine>/  (gold verified examples for this DB)
+        Search order (same dialect only — never mix DBs):
+        1. qt_sql/examples/<dialect>/  (gold verified examples for this DB)
         2. seed_dirs                  (state_0/seed/ generic catalog rules)
 
         Args:
             pattern_name: Pattern to match (e.g., "decorrelate")
-            engine: Database engine ("duckdb" | "postgres")
+            dialect: Canonical SQL dialect ("duckdb" | "postgresql" | ...)
+            engine: Deprecated alias for ``dialect`` (kept for compatibility)
             seed_dirs: Optional list of state_0/seed/ paths for catalog rules
         """
-        engine_dir = "postgres" if engine in ("postgresql", "postgres") else engine
+        resolved_dialect = normalize_dialect(engine or dialect)
+        example_dir = dialect_example_dir(resolved_dialect)
+        transform_index = _load_transform_index()
 
         search_dirs = []
-        primary = EXAMPLES_DIR / engine_dir
+        primary = EXAMPLES_DIR / example_dir
         if primary.exists():
             search_dirs.append(primary)
         if seed_dirs:
@@ -1001,13 +1032,21 @@ class Prompter:
             path = search_dir / f"{pattern_name}.json"
             if path.exists():
                 try:
-                    return json.loads(path.read_text())
+                    return normalize_example_record(
+                        json.loads(path.read_text()),
+                        default_dialect=resolved_dialect,
+                        transform_index=transform_index,
+                    )
                 except Exception:
                     pass
 
             for p in sorted(search_dir.glob("*.json")):
                 try:
-                    data = json.loads(p.read_text())
+                    data = normalize_example_record(
+                        json.loads(p.read_text()),
+                        default_dialect=resolved_dialect,
+                        transform_index=transform_index,
+                    )
                     if data.get("id", "").lower() == pattern_name.lower():
                         return data
                     if pattern_name.lower() in data.get("name", "").lower():

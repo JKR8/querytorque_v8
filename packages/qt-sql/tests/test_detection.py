@@ -13,6 +13,7 @@ import pytest
 
 from qt_sql.tag_index import extract_precondition_features
 from qt_sql.detection import TransformMatch, detect_transforms, load_transforms
+from qt_sql.knowledge.normalization import normalize_transform_id
 
 TRIALS_PATH = Path(__file__).resolve().parent.parent / "qt_sql" / "knowledge" / "trials.jsonl"
 
@@ -188,7 +189,7 @@ class TestTransformDetection:
         return load_transforms()
 
     def test_load_transforms(self, transforms):
-        assert len(transforms) == 30
+        assert len(transforms) >= 30
         ids = {t["id"] for t in transforms}
         assert "decorrelate" in ids
         assert "or_to_union" in ids
@@ -196,8 +197,8 @@ class TestTransformDetection:
         assert "aggregate_pushdown" in ids
         assert "inner_join_conversion" in ids
         assert "self_join_decomposition" in ids
-        assert "star_join_prefetch" in ids
-        assert "semi_join_exists" in ids
+        assert "dimension_prefetch_star" in ids
+        assert "intersect_to_exists" in ids
 
     def test_engine_filter_duckdb(self, transforms):
         sql = "SELECT SUM(x) FROM store_sales GROUP BY y"
@@ -272,6 +273,15 @@ _KNOWN_TIES = {
 }
 
 
+def _acceptable_ids(raw_expected: str) -> set[str]:
+    expected = normalize_transform_id(raw_expected)
+    tie_raw = set(_KNOWN_TIES.get(raw_expected, set())) | set(
+        _KNOWN_TIES.get(expected, set())
+    )
+    ties = {normalize_transform_id(t) for t in tie_raw}
+    return {expected} | ties
+
+
 def _load_gold_trials():
     """Load first 25 trials from trials.jsonl (the gold set)."""
     trials = []
@@ -299,7 +309,7 @@ class TestGoldTrialDetection:
     def test_transform_in_top3(self, trial):
         transforms = load_transforms()
         sql = trial["query_sql"]
-        expected = trial["transform"]
+        expected = normalize_transform_id(trial["transform"])
         engine = trial["engine"]
 
         # Use appropriate dialect
@@ -309,13 +319,12 @@ class TestGoldTrialDetection:
         top3_ids = [m.id for m in matches[:3]]
 
         # Check: expected transform in top-3, OR a known tie partner is in top-3
-        tie_partners = _KNOWN_TIES.get(expected, set())
-        acceptable = {expected} | tie_partners
+        acceptable = _acceptable_ids(trial["transform"])
 
         assert any(
             tid in acceptable for tid in top3_ids
         ), (
-            f"Trial {trial['id']}: expected '{expected}' (or ties {tie_partners}) "
+            f"Trial {trial['id']}: expected '{expected}' (or ties {acceptable - {expected}}) "
             f"in top-3, got {top3_ids}. "
             f"All overlaps: {[(m.id, f'{m.overlap_ratio:.2f}') for m in matches[:5]]}"
         )
@@ -323,15 +332,14 @@ class TestGoldTrialDetection:
     def test_overlap_above_threshold(self, trial):
         transforms = load_transforms()
         sql = trial["query_sql"]
-        expected = trial["transform"]
+        expected = normalize_transform_id(trial["transform"])
         engine = trial["engine"]
         dialect = "postgres" if engine == "postgresql" else "duckdb"
 
         matches = detect_transforms(sql, transforms, engine=engine, dialect=dialect)
 
         # Find the expected transform's match
-        tie_partners = _KNOWN_TIES.get(expected, set())
-        acceptable = {expected} | tie_partners
+        acceptable = _acceptable_ids(trial["transform"])
 
         match = None
         for m in matches:

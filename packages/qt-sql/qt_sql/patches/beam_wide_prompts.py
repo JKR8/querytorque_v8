@@ -135,7 +135,7 @@ def build_beam_dispatcher_prompt(
     engine_name = dialect.upper().replace('POSTGRES', 'PostgreSQL')
     role_text = (
         f"You are a SQL optimization analyst for {engine_name}. "
-        "Your mission: diagnose this query's bottleneck from the EXPLAIN plan "
+        "Your mission: diagnose a query's bottleneck from the EXPLAIN plan "
         "and design 8-16 independent transform PROBES.\n\n"
         "A team of workers will execute each probe independently — one transform "
         "per worker. Each worker outputs a PatchPlan JSON that transforms the "
@@ -145,7 +145,7 @@ def build_beam_dispatcher_prompt(
         "engine weaknesses, not generic rewrites."
     )
 
-    sections, n_families = _build_prompt_body(
+    static, dynamic, n_families = _build_prompt_body(
         query_id=query_id,
         original_sql=original_sql,
         explain_text=explain_text,
@@ -157,11 +157,8 @@ def build_beam_dispatcher_prompt(
         intelligence_brief=intelligence_brief,
     )
 
-    # ── Transform Catalog (all transforms, with match annotations) ───
-    sections.append(_build_transform_catalog_section(original_sql, dialect))
-
-    # ── Wide Task: Design 8-16 Probes ────────────────────────────────
-    sections.append("""## Your Task
+    # Task section in static prefix (system instructions)
+    static.append("""## Your Task
 
 ### Step 1: BOTTLENECK HYPOTHESIS (2-3 sentences)
 Cite specific EXPLAIN operators, row counts, and cost. This hypothesis
@@ -216,7 +213,13 @@ Rules:
 - `transform_id` can be a catalog ID or a descriptive name you invent
 - Family codes: A=Early Filter, B=Decorrelate, C=Aggregation, D=Set Ops, E=Materialization, F=Join Transform""")
 
-    return "\n\n".join(sections)
+    # Cache boundary
+    static.append("---\n\n## Query to Analyze")
+
+    # Transform Catalog (per-query: AST match annotations depend on SQL)
+    dynamic.append(_build_transform_catalog_section(original_sql, dialect))
+
+    return "\n\n".join(static + dynamic)
 
 
 # Keep old names as aliases for backwards compatibility

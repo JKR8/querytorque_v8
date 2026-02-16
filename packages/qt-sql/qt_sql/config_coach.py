@@ -477,16 +477,22 @@ def _collect_context(
         ctx["resource_envelope"] = "System profile unavailable."
 
     # ── Engine profile ───────────────────────────────────────────────
-    profile_path = (
-        Path(__file__).resolve().parent
-        / "constraints"
-        / "engine_profile_postgresql.json"
-    )
-    if profile_path.exists():
-        try:
-            ctx["engine_profile"] = json.loads(profile_path.read_text())
-        except Exception as e:
-            logger.warning(f"Failed to load engine profile: {e}")
+    try:
+        from .prompter import _load_engine_profile
+        profile = _load_engine_profile("postgresql")
+        if profile:
+            ctx["engine_profile"] = profile
+    except Exception as e:
+        logger.warning(f"Failed to load engine profile: {e}")
+
+    # ── Dialect tuning config (post-optimization, not rewrite prompt) ──
+    try:
+        from .knowledge.configuration import load_dialect_config
+        dialect_config = load_dialect_config("postgresql")
+        if dialect_config:
+            ctx["dialect_config"] = dialect_config
+    except Exception as e:
+        logger.warning(f"Failed to load dialect config: {e}")
 
     return ctx
 

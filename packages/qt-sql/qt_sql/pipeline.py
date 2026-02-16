@@ -22,6 +22,11 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .knowledge.normalization import (
+    dialect_example_dir,
+    normalize_dialect,
+    normalize_example_record,
+)
 from .learn import Learner
 from .schemas import (
     BenchmarkConfig,
@@ -1231,8 +1236,8 @@ class Pipeline:
 
         Used to give the analyst a menu it can pick from.
         """
-        engine_dir = "postgres" if engine in ("postgresql", "postgres") else engine
-        examples_dir = Path(__file__).resolve().parent / "examples" / engine_dir
+        dialect = normalize_dialect(engine)
+        examples_dir = Path(__file__).resolve().parent / "examples" / dialect_example_dir(dialect)
         result = []
 
         if not examples_dir.exists():
@@ -1240,7 +1245,10 @@ class Pipeline:
 
         for path in sorted(examples_dir.glob("*.json")):
             try:
-                data = json.loads(path.read_text())
+                data = normalize_example_record(
+                    json.loads(path.read_text()),
+                    default_dialect=dialect,
+                )
                 ex_id = data.get("id", path.stem)
                 speedup = data.get("verified_speedup", "?")
                 desc = data.get("description", "")[:80]
@@ -1256,10 +1264,11 @@ class Pipeline:
         engine: str,
     ) -> List[Dict[str, Any]]:
         """Load gold examples by their IDs."""
+        dialect = normalize_dialect(engine)
         examples = []
         for ex_id in example_ids:
             ex = self.prompter.load_example_for_pattern(
-                ex_id, engine=engine, seed_dirs=self._seed_dirs,
+                ex_id, dialect=dialect, seed_dirs=self._seed_dirs,
             )
             if ex:
                 examples.append(ex)
@@ -1390,14 +1399,18 @@ class Pipeline:
         """
         from .knowledge import TagRecommender
 
-        engine_dir = "postgres" if engine in ("postgresql", "postgres") else engine
-        dialect = "postgres" if engine_dir == "postgres" else engine_dir
+        canonical_dialect = normalize_dialect(engine)
+        parser_dialect = (
+            "postgres" if canonical_dialect == "postgresql" else canonical_dialect
+        )
         examples = []
         seen_ids = set()
 
         recommender = TagRecommender()
         if recommender._initialized:
-            matches = recommender.find_similar_examples(sql, k=k * 5, dialect=dialect)
+            matches = recommender.find_similar_examples(
+                sql, k=k * 5, dialect=parser_dialect,
+            )
             for ex_id, score, meta in matches:
                 if len(examples) >= k:
                     break
@@ -1406,7 +1419,7 @@ class Pipeline:
 
                 seen_ids.add(ex_id)
                 ex_data = self.prompter.load_example_for_pattern(
-                    ex_id, engine=engine, seed_dirs=self._seed_dirs,
+                    ex_id, dialect=canonical_dialect, seed_dirs=self._seed_dirs,
                 )
                 if ex_data:
                     ex_data["_match_score"] = round(score, 3)
@@ -1414,9 +1427,8 @@ class Pipeline:
 
         if not examples:
             logger.error(
-                "No tag-matched examples found (engine=%s, dialect=%s, k=%d).",
-                engine,
-                dialect,
+                "No tag-matched examples found (dialect=%s, k=%d).",
+                canonical_dialect,
                 k,
             )
         return examples
@@ -1445,14 +1457,19 @@ class Pipeline:
         """
         from .knowledge import TagRecommender
 
-        engine_dir = "postgres" if engine in ("postgresql", "postgres") else engine
-        dialect = "postgres" if engine_dir == "postgres" else engine_dir
+        canonical_dialect = normalize_dialect(engine)
+        parser_dialect = (
+            "postgres" if canonical_dialect == "postgresql" else canonical_dialect
+        )
+        example_dir = dialect_example_dir(canonical_dialect)
         regressions = []
         seen_ids = set()
 
         recommender = TagRecommender()
         if recommender._initialized:
-            matches = recommender.find_relevant_regressions(sql, k=k * 5, dialect=dialect)
+            matches = recommender.find_relevant_regressions(
+                sql, k=k * 5, dialect=parser_dialect,
+            )
             for ex_id, score, meta in matches:
                 if len(regressions) >= k:
                     break
@@ -1462,7 +1479,9 @@ class Pipeline:
                 seen_ids.add(ex_id)
 
                 # Load regression example from the regressions/ subdir
-                reg_data = self._load_regression_example(ex_id, engine_dir)
+                reg_data = self._load_regression_example(
+                    ex_id, example_dir=example_dir, dialect=canonical_dialect,
+                )
                 if reg_data:
                     reg_data["_tag_score"] = score
                     regressions.append(reg_data)
@@ -1471,12 +1490,15 @@ class Pipeline:
 
     @staticmethod
     def _load_regression_example(
-        example_id: str, engine_dir: str,
+        example_id: str,
+        *,
+        example_dir: str,
+        dialect: str,
     ) -> Optional[Dict[str, Any]]:
         """Load a regression example JSON file."""
         from .prompter import EXAMPLES_DIR
 
-        regressions_dir = EXAMPLES_DIR / engine_dir / "regressions"
+        regressions_dir = EXAMPLES_DIR / example_dir / "regressions"
         if not regressions_dir.exists():
             return None
 
@@ -1484,57 +1506,24 @@ class Pipeline:
         path = regressions_dir / f"{example_id}.json"
         if path.exists():
             try:
-                return json.loads(path.read_text())
+                return normalize_example_record(
+                    json.loads(path.read_text()),
+                    default_dialect=dialect,
+                )
             except Exception:
                 pass
 
         # Search by id field
         for p in regressions_dir.glob("*.json"):
             try:
-                data = json.loads(p.read_text())
+                data = normalize_example_record(
+                    json.loads(p.read_text()),
+                    default_dialect=dialect,
+                )
                 if data.get("id") == example_id:
                     return data
             except Exception:
                 continue
-
-        return None
-
-    def load_global_knowledge(self) -> Optional[Dict[str, Any]]:
-        """Load GlobalKnowledge from benchmarks/*/knowledge/*.json.
-
-        GlobalKnowledge is built by build_blackboard.py phase3_global()
-        and contains verified optimization principles + anti-patterns.
-
-        Returns:
-            Dict with 'principles' and 'anti_patterns' lists, or None
-        """
-        # Search in knowledge/ subdirectory
-        knowledge_dir = self.benchmark_dir / "knowledge"
-        if knowledge_dir.exists():
-            for path in sorted(knowledge_dir.glob("*.json")):
-                try:
-                    data = json.loads(path.read_text())
-                    if data.get("principles") or data.get("anti_patterns"):
-                        logger.info(
-                            f"Loaded GlobalKnowledge from {path.name}: "
-                            f"{len(data.get('principles', []))} principles, "
-                            f"{len(data.get('anti_patterns', []))} anti-patterns"
-                        )
-                        return data
-                except Exception as e:
-                    logger.warning(f"Failed to load knowledge {path}: {e}")
-
-        # Fallback: check parent benchmark dirs
-        for parent in [self.benchmark_dir.parent]:
-            knowledge_dir = parent / "knowledge"
-            if knowledge_dir.exists():
-                for path in sorted(knowledge_dir.glob("*.json")):
-                    try:
-                        data = json.loads(path.read_text())
-                        if data.get("principles") or data.get("anti_patterns"):
-                            return data
-                    except Exception:
-                        continue
 
         return None
 
@@ -1552,8 +1541,8 @@ class Pipeline:
         """Gather all context needed for analyst prompt (shared across all modes).
 
         Returns a dict with keys: explain_plan_text, plan_scanner_text,
-        global_knowledge, semantic_intents, matched_examples,
-        all_available_examples, engine_profile, constraints,
+        semantic_intents, matched_examples, all_available_examples,
+        engine_profile, constraints,
         regression_warnings, strategy_leaderboard, query_archetype,
         resource_envelope, exploit_algorithm_text, detected_transforms.
         """
@@ -1563,19 +1552,20 @@ class Pipeline:
             load_exploit_algorithm,
         )
 
-        # Normalize dialect aliases early so all downstream branches are consistent
-        if dialect.lower() in ("pg",):
-            dialect = "postgres"
+        canonical_dialect = normalize_dialect(dialect)
+        parser_dialect = (
+            "postgres" if canonical_dialect == "postgresql" else canonical_dialect
+        )
 
         # Exploit algorithm (replaces engine profile when available)
-        exploit_algorithm_text = load_exploit_algorithm(dialect)
+        exploit_algorithm_text = load_exploit_algorithm(canonical_dialect)
 
         # EXPLAIN plan text
-        explain_plan_text = self.get_explain_plan_text(query_id, dialect)
+        explain_plan_text = self.get_explain_plan_text(query_id, canonical_dialect)
 
         # Plan-space scanner results (PG only, pre-computed)
         plan_scanner_text = None
-        if dialect in ("postgresql", "postgres"):
+        if canonical_dialect == "postgresql":
             try:
                 from .plan_scanner import (
                     load_scan_result, format_scan_for_prompt,
@@ -1597,9 +1587,6 @@ class Pipeline:
             except Exception as e:
                 logger.warning(f"[{query_id}] Failed to load plan scanner: {e}")
 
-        # GlobalKnowledge (principles + anti-patterns)
-        global_knowledge = self.load_global_knowledge()
-
         # Semantic intents
         semantic_intents = self.get_semantic_intents(query_id)
 
@@ -1610,10 +1597,10 @@ class Pipeline:
         all_available_examples = self._list_gold_examples(engine)
 
         # Engine profile (optimizer strengths + gaps)
-        engine_profile = _load_engine_profile(dialect)
+        engine_profile = _load_engine_profile(canonical_dialect)
 
-        # All constraints (engine-filtered)
-        constraints = _load_constraint_files(dialect)
+        # All constraints (dialect-filtered)
+        constraints = _load_constraint_files(canonical_dialect)
 
         # Regression warnings
         regression_warnings = self._find_regression_warnings(
@@ -1629,7 +1616,7 @@ class Pipeline:
                 strategy_leaderboard = json.loads(leaderboard_path.read_text())
                 from .tag_index import extract_tags, classify_category
                 query_archetype = classify_category(
-                    extract_tags(sql, dialect=dialect)
+                    extract_tags(sql, dialect=parser_dialect)
                 )
             except Exception as e:
                 logger.warning(
@@ -1638,7 +1625,7 @@ class Pipeline:
 
         # PG system profile + resource envelope
         resource_envelope = None
-        if dialect in ("postgresql", "postgres"):
+        if canonical_dialect == "postgresql":
             try:
                 from .pg_tuning import load_or_collect_profile, build_resource_envelope
                 profile = load_or_collect_profile(
@@ -1655,8 +1642,12 @@ class Pipeline:
         try:
             from .detection import detect_transforms, load_transforms
             all_transforms = load_transforms()
-            engine_name = {"duckdb": "duckdb", "snowflake": "snowflake"}.get(dialect, "postgresql")
-            detected = detect_transforms(sql, all_transforms, engine=engine_name, dialect=dialect)
+            detected = detect_transforms(
+                sql,
+                all_transforms,
+                dialect_filter=canonical_dialect,
+                dialect=parser_dialect,
+            )
             detected_transforms = detected[:5]
         except Exception as e:
             logger.warning(f"[{query_id}] Failed to detect transforms: {e}")
@@ -1668,7 +1659,6 @@ class Pipeline:
         ctx = {
             "explain_plan_text": explain_plan_text,
             "plan_scanner_text": plan_scanner_text,
-            "global_knowledge": global_knowledge,
             "semantic_intents": semantic_intents,
             "matched_examples": matched_examples,
             "all_available_examples": all_available_examples,
@@ -1682,7 +1672,9 @@ class Pipeline:
             "detected_transforms": detected_transforms,
             "qerror_analysis": qerror_analysis,
         }
-        self._enforce_intelligence_gates(query_id=query_id, dialect=dialect, ctx=ctx)
+        self._enforce_intelligence_gates(
+            query_id=query_id, dialect=canonical_dialect, ctx=ctx,
+        )
         return ctx
 
     def _enforce_intelligence_gates(
@@ -1692,18 +1684,14 @@ class Pipeline:
         ctx: Dict[str, Any],
     ) -> None:
         """Hard gate for required intelligence inputs before analyst prompting."""
-        # Normalize dialect aliases so gate checks are consistent
-        if dialect.lower() in ("pg",):
-            dialect = "postgres"
+        dialect = normalize_dialect(dialect)
 
         missing: list[str] = []
 
         if not ctx.get("matched_examples"):
             missing.append("gold_examples")
-        if not ctx.get("global_knowledge"):
-            missing.append("intelligence_briefing_global")
 
-        if dialect in ("postgresql", "postgres"):
+        if dialect == "postgresql":
             if not ctx.get("plan_scanner_text"):
                 missing.append("intelligence_briefing_local_pg_scanner")
             if not ctx.get("exploit_algorithm_text"):
@@ -1728,14 +1716,15 @@ class Pipeline:
         global_learnings: Optional[Dict[str, Any]],
         regression_warnings: List[Dict[str, Any]],
     ) -> None:
-        """Hard gate for non-analyst prompt flow intelligence inputs."""
+        """Hard gate for non-analyst prompt flow intelligence inputs.
+
+        Global/local learning summaries are now optional. Gold examples remain
+        the only required retrieval input.
+        """
+        _ = (dialect, global_learnings, regression_warnings)
         missing: list[str] = []
         if not examples:
             missing.append("gold_examples")
-        if not global_learnings:
-            missing.append("intelligence_briefing_global")
-        if not regression_warnings:
-            missing.append("intelligence_briefing_local")
 
         if not missing:
             return

@@ -8,7 +8,7 @@ Usage:
     from qt_sql.detection import detect_transforms, load_transforms
 
     transforms = load_transforms()
-    matches = detect_transforms(sql, transforms, engine="duckdb")
+    matches = detect_transforms(sql, transforms, dialect_filter="duckdb")
     for m in matches[:3]:
         print(f"{m.id}: {m.overlap_ratio:.0%} overlap")
 """
@@ -22,6 +22,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from qt_sql.tag_index import extract_precondition_features
+from qt_sql.knowledge.normalization import (
+    normalize_dialect,
+    normalize_gap_id,
+    normalize_transform_catalog,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +61,14 @@ def load_transforms(path: Optional[Path] = None) -> List[Dict[str, Any]]:
     """
     p = path or _DEFAULT_TRANSFORMS_PATH
     with open(p) as f:
-        return json.load(f)
+        data = json.load(f)
+    return normalize_transform_catalog(data)
 
 
 def detect_transforms(
     sql: str,
     transforms: List[Dict[str, Any]],
+    dialect_filter: Optional[str] = None,
     engine: Optional[str] = None,
     dialect: str = "duckdb",
 ) -> List[TransformMatch]:
@@ -73,21 +80,28 @@ def detect_transforms(
     Args:
         sql: Original SQL query text
         transforms: Transform catalog from load_transforms()
-        engine: Filter to transforms supporting this engine (e.g. "duckdb").
-                None means no engine filter.
+        dialect_filter: Canonical dialect filter for transform support
+                        (e.g. "duckdb", "postgresql"). None means no filter.
+        engine: Deprecated alias for ``dialect_filter`` (kept for compatibility).
         dialect: SQL dialect for parsing ("duckdb" or "postgres")
 
     Returns:
         List of TransformMatch sorted by descending overlap_ratio
     """
-    features = extract_precondition_features(sql, dialect=dialect)
+    norm_parse_dialect = normalize_dialect(dialect)
+    parse_dialect = "postgres" if norm_parse_dialect == "postgresql" else norm_parse_dialect
+
+    features = extract_precondition_features(sql, dialect=parse_dialect)
 
     matches: List[TransformMatch] = []
 
+    filter_value = dialect_filter if dialect_filter is not None else engine
+    norm_filter = normalize_dialect(filter_value) if filter_value else None
+
     for t in transforms:
-        # Engine filter
+        # Dialect filter
         t_engines = t.get("engines", [])
-        if engine and t_engines and engine not in t_engines:
+        if norm_filter and t_engines and norm_filter not in t_engines:
             continue
 
         required = set(t.get("precondition_features", []))
@@ -106,7 +120,7 @@ def detect_transforms(
                 matched_features=sorted(matched),
                 missing_features=sorted(missing),
                 total_required=len(required),
-                gap=t.get("gap"),
+                gap=normalize_gap_id(t.get("gap")),
                 engines=t_engines,
                 contraindications=t.get("contraindications", []),
             )

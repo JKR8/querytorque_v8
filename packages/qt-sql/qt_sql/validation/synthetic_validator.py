@@ -22,9 +22,114 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Set, Tuple, Any, Optional
 import json
 import re
+import math
 
 
 logger = logging.getLogger(__name__)
+
+
+TYPE_PROTOTYPE_TOKENS = {
+    'INTEGER': [
+        'id', 'key', 'sk', 'fk', 'count', 'qty', 'quantity', 'number', 'num',
+        'year', 'month', 'day', 'week', 'quarter', 'dow', 'dom', 'moy', 'qoy',
+        'seq', 'offset', 'age', 'rank', 'manager', 'dep', 'hour', 'minute',
+        'second', 'code',
+    ],
+    'DECIMAL(18,2)': [
+        'amount', 'amt', 'price', 'cost', 'fee', 'tax', 'discount', 'profit',
+        'loss', 'revenue', 'sales', 'rate', 'ratio', 'margin', 'balance',
+        'total', 'net', 'gross', 'pct', 'percent', 'score',
+    ],
+    'DATE': [
+        'date', 'dt', 'time', 'timestamp', 'sold', 'ship', 'returned', 'birth',
+        'create', 'created', 'update', 'updated', 'start', 'end', 'effective',
+        'expiry', 'exp',
+    ],
+    'VARCHAR(100)': [
+        'name', 'desc', 'description', 'type', 'category', 'state', 'city',
+        'email', 'address', 'phone', 'status', 'gender', 'country', 'county',
+        'street', 'comment', 'note', 'class',
+    ],
+}
+
+
+def _identifier_tokens(identifier: str) -> List[str]:
+    """Tokenize an identifier for lexical similarity matching."""
+    # Split camelCase and normalize separators.
+    s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', identifier).lower()
+    raw_parts = [p for p in re.split(r'[^a-z0-9]+', s) if p]
+
+    tokens: List[str] = []
+    for part in raw_parts:
+        pieces = [p for p in re.split(r'(?<=\D)(?=\d)|(?<=\d)(?=\D)', part) if p]
+        tokens.extend(pieces)
+    return tokens
+
+
+def _token_vector(tokens: List[str]) -> Dict[str, float]:
+    vec: Dict[str, float] = {}
+    for tok in tokens:
+        vec[tok] = vec.get(tok, 0.0) + 1.0
+    return vec
+
+
+def _cosine_similarity(vec_a: Dict[str, float], vec_b: Dict[str, float]) -> float:
+    if not vec_a or not vec_b:
+        return 0.0
+    dot = 0.0
+    for k, v in vec_a.items():
+        dot += v * vec_b.get(k, 0.0)
+    norm_a = math.sqrt(sum(v * v for v in vec_a.values()))
+    norm_b = math.sqrt(sum(v * v for v in vec_b.values()))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+TYPE_PROTOTYPE_VECTORS = {
+    col_type: _token_vector(tokens)
+    for col_type, tokens in TYPE_PROTOTYPE_TOKENS.items()
+}
+TYPE_PROTOTYPE_TOKEN_SETS = {
+    col_type: set(tokens)
+    for col_type, tokens in TYPE_PROTOTYPE_TOKENS.items()
+}
+
+
+def infer_type_by_similarity(col_name: str) -> Tuple[Optional[str], float]:
+    """Infer a column type using lexical vector similarity."""
+    col_tokens = _identifier_tokens(col_name)
+    if not col_tokens:
+        return None, 0.0
+
+    # Drop short prefix-like tokens (e.g., ss, ws, ca) from the similarity
+    # signal while preserving semantically meaningful short identifiers.
+    content_tokens = [
+        t for t in col_tokens
+        if len(t) > 2 or t in {'id', 'sk', 'fk', 'dt'}
+    ] or col_tokens
+
+    col_vec = _token_vector(content_tokens)
+    content_set = set(content_tokens)
+    best_type = None
+    best_score = 0.0
+    second_score = 0.0
+
+    for col_type, proto_vec in TYPE_PROTOTYPE_VECTORS.items():
+        cosine = _cosine_similarity(col_vec, proto_vec)
+        overlap = len(content_set & TYPE_PROTOTYPE_TOKEN_SETS[col_type]) / max(1, len(content_set))
+        score = 0.6 * overlap + 0.4 * cosine
+        if score > best_score:
+            second_score = best_score
+            best_score = score
+            best_type = col_type
+        elif score > second_score:
+            second_score = score
+
+    # Conservative acceptance: require a minimum score + separation.
+    if best_type and best_score >= 0.28 and (best_score - second_score) >= 0.02:
+        return best_type, best_score
+    return None, best_score
 
 
 def _singularize(token: str) -> str:
@@ -326,8 +431,13 @@ class SchemaExtractor:
             return 'VARCHAR(100)'
         elif col_lower.endswith('_id') and not col_lower.endswith('_sk'):
             return 'VARCHAR(50)'
-        else:
-            return 'VARCHAR(50)'
+
+        # Fallback: lexical vector similarity over column-name tokens.
+        sim_type, _ = infer_type_by_similarity(col_name)
+        if sim_type:
+            return sim_type
+
+        return 'VARCHAR(50)'
 
 
 class SyntheticDataGenerator:
@@ -888,24 +998,16 @@ class SyntheticValidator:
 
         # 5. Extract filter values from WHERE clause for data generation
         filter_values = self._extract_filter_values(sql, tables)
+        join_graph = self._build_join_column_graph(sql, tables)
+        filter_values = self._propagate_filter_values_across_joins(filter_values, join_graph, tables)
 
         # 6. Generate synthetic data
         logger.debug("Generating synthetic data...")
         # Estimate rows needed per table based on query complexity
         table_row_counts = self._estimate_row_counts(sql, tables, target_rows)
+        generation_order = self._get_table_generation_order(tables, fk_relationships)
 
-        # Classify dimension vs fact tables
-        dim_tables = []
-        fact_tables = []
-
-        for t in tables:
-            if t in fk_relationships and fk_relationships[t]:
-                fact_tables.append(t)
-            else:
-                dim_tables.append(t)
-        
-        logger.debug("Dimension tables: %s", dim_tables)
-        logger.debug("Fact tables: %s", fact_tables)
+        logger.debug("Generation order: %s", generation_order)
         logger.debug("FK relationships: %s", fk_relationships)
         scalar_uniques = self._detect_scalar_subquery_uniques(sql, tables)
 
@@ -917,26 +1019,22 @@ class SyntheticValidator:
             generator = SyntheticDataGenerator(self.conn, all_schemas=tables)
             generator.filter_literal_values = filter_values
 
-            # Generate dimension tables first
-            for table_name in dim_tables:
-                schema = tables[table_name]
-                base_count = table_row_counts.get(table_name, 1000)
-                row_count = max(10, min(base_count * row_multiplier, 200000))
-                logger.debug("  %s: %d rows (dimension, x%d)", table_name, row_count, row_multiplier)
-                generator.generate_table_data(table_name, schema, row_count, foreign_keys={})
-
-            # Ensure fact FK values point to dimension rows that pass WHERE.
-            self._update_filter_matched_pks(generator, tables, dim_tables, filter_values)
-            logger.debug("Available FK values: %s", list(generator.foreign_key_values.keys()))
-
-            # Generate fact tables with FKs pointing to dimension tables
-            for table_name in fact_tables:
+            for table_name in generation_order:
                 schema = tables[table_name]
                 base_count = table_row_counts.get(table_name, 1000)
                 row_count = max(10, min(base_count * row_multiplier, 200000))
                 table_fks = fk_relationships.get(table_name, {})
-                logger.debug("  %s: %d rows (fact, x%d), FKs: %s", table_name, row_count, row_multiplier, table_fks)
+                table_kind = "fact" if table_fks else "dimension"
+                logger.debug("  %s: %d rows (%s, x%d), FKs: %s", table_name, row_count, table_kind, row_multiplier, table_fks)
                 generator.generate_table_data(table_name, schema, row_count, foreign_keys=table_fks)
+                # Narrow PK candidates on each generated table using direct predicates.
+                self._update_filter_matched_pks(generator, tables, [table_name], filter_values)
+                # Reverse-walk: filtered child rows constrain parent key domain.
+                self._reverse_propagate_parent_key_matches(
+                    generator, table_name, tables, fk_relationships, filter_values
+                )
+
+            logger.debug("Available FK values: %s", list(generator.foreign_key_values.keys()))
 
             # Deduplicate columns used by scalar subqueries.
             if scalar_uniques:
@@ -1189,8 +1287,242 @@ class SyntheticValidator:
             'reason': f"Value mismatch: {first_diff or 'unknown difference'}",
         }
 
+    @staticmethod
+    def _build_alias_map(parsed: exp.Expression) -> Tuple[Dict[str, str], Set[str]]:
+        """Map SQL aliases to base tables, excluding CTE names."""
+        alias_map: Dict[str, str] = {}
+        cte_names: Set[str] = set()
+        for cte in parsed.find_all(exp.CTE):
+            if cte.alias:
+                cte_names.add(cte.alias)
+        for table in parsed.find_all(exp.Table):
+            if table.name in cte_names:
+                continue
+            if table.alias:
+                alias_map[table.alias] = table.name
+            alias_map[table.name] = table.name
+        return alias_map, cte_names
+
+    @staticmethod
+    def _is_numeric_col_type(col_type: str) -> bool:
+        upper = (col_type or '').upper()
+        return any(t in upper for t in ('INT', 'DECIMAL', 'NUMERIC', 'DOUBLE', 'FLOAT', 'REAL'))
+
+    @staticmethod
+    def _sql_literal(value: Any, col_type: str) -> str:
+        if value is None:
+            return 'NULL'
+        if isinstance(value, bool):
+            return 'TRUE' if value else 'FALSE'
+        if isinstance(value, (int, float)):
+            return str(value)
+
+        txt = str(value)
+        if SyntheticValidator._is_numeric_col_type(col_type):
+            try:
+                float(txt)
+                return txt
+            except (ValueError, TypeError):
+                pass
+        return "'" + txt.replace("'", "''") + "'"
+
+    @staticmethod
+    def _append_unique(target: List[Any], values: List[Any]) -> None:
+        seen = set(target)
+        for v in values:
+            if v not in seen:
+                target.append(v)
+                seen.add(v)
+
+    def _resolve_column_name(self, table_name: str, col_name: str, tables: Dict) -> Optional[str]:
+        """Resolve case-insensitive column reference to schema-preserving name."""
+        if table_name not in tables:
+            return None
+        for existing_col in tables[table_name].get('columns', {}):
+            if existing_col.lower() == col_name.lower():
+                return existing_col
+        return None
+
+    def _resolve_column_ref(
+        self,
+        col_expr: exp.Column,
+        alias_map: Dict[str, str],
+        tables: Dict,
+    ) -> Optional[Tuple[str, str]]:
+        table_name = alias_map.get(col_expr.table, col_expr.table)
+        if not table_name or table_name not in tables:
+            table_name = get_table_for_column(col_expr.name, tables)
+        if not table_name or table_name not in tables:
+            return None
+        real_col = self._resolve_column_name(table_name, col_expr.name, tables)
+        if not real_col:
+            return None
+        return table_name, real_col
+
+    def _build_join_column_graph(self, sql: str, tables: Dict) -> Dict[Tuple[str, str], Set[Tuple[str, str]]]:
+        """Build an undirected graph of column equalities from JOIN/WHERE."""
+        graph: Dict[Tuple[str, str], Set[Tuple[str, str]]] = {}
+        try:
+            parsed = sqlglot.parse_one(sql)
+        except Exception:
+            return graph
+
+        alias_map, _ = self._build_alias_map(parsed)
+        eq_sources: List[exp.EQ] = []
+        for join in parsed.find_all(exp.Join):
+            eq_sources.extend(join.find_all(exp.EQ))
+        for where in parsed.find_all(exp.Where):
+            for eq in where.find_all(exp.EQ):
+                if isinstance(eq.left, exp.Column) and isinstance(eq.right, exp.Column):
+                    eq_sources.append(eq)
+
+        for eq in eq_sources:
+            if not (isinstance(eq.left, exp.Column) and isinstance(eq.right, exp.Column)):
+                continue
+            left_ref = self._resolve_column_ref(eq.left, alias_map, tables)
+            right_ref = self._resolve_column_ref(eq.right, alias_map, tables)
+            if not left_ref or not right_ref or left_ref == right_ref:
+                continue
+            graph.setdefault(left_ref, set()).add(right_ref)
+            graph.setdefault(right_ref, set()).add(left_ref)
+
+        return graph
+
+    def _propagate_filter_values_across_joins(
+        self,
+        filter_values: Dict[str, Dict[str, list]],
+        join_graph: Dict[Tuple[str, str], Set[Tuple[str, str]]],
+        tables: Dict,
+    ) -> Dict[str, Dict[str, list]]:
+        """Propagate literal predicates across equality-joined columns."""
+        propagated: Dict[str, Dict[str, list]] = {}
+        # Normalize existing filters to canonical column names first.
+        for table_name, col_map in filter_values.items():
+            if table_name not in propagated:
+                propagated[table_name] = {}
+            for col_name, values in col_map.items():
+                canonical_col = self._resolve_column_name(table_name, col_name, tables)
+                if canonical_col is None:
+                    canonical_col = col_name
+                propagated[table_name].setdefault(canonical_col, [])
+                self._append_unique(propagated[table_name][canonical_col], list(values))
+
+        visited: Set[Tuple[str, str]] = set()
+        for start in join_graph:
+            if start in visited:
+                continue
+            stack = [start]
+            component: List[Tuple[str, str]] = []
+            while stack:
+                node = stack.pop()
+                if node in visited:
+                    continue
+                visited.add(node)
+                component.append(node)
+                for neighbor in join_graph.get(node, ()):
+                    if neighbor not in visited:
+                        stack.append(neighbor)
+
+            merged_values: List[Any] = []
+            for table_name, col_name in component:
+                vals = propagated.get(table_name, {}).get(col_name, [])
+                self._append_unique(merged_values, vals)
+            if not merged_values:
+                continue
+            for table_name, col_name in component:
+                propagated.setdefault(table_name, {}).setdefault(col_name, [])
+                self._append_unique(propagated[table_name][col_name], merged_values)
+
+        return propagated
+
+    def _build_filter_conditions(
+        self,
+        table_name: str,
+        tables: Dict,
+        filter_values: Dict[str, Dict[str, list]],
+    ) -> List[str]:
+        """Build SQL WHERE conditions from extracted literal predicates."""
+        table_filters = filter_values.get(table_name, {})
+        conditions: List[str] = []
+
+        for col, vals in table_filters.items():
+            real_col = self._resolve_column_name(table_name, col, tables) or col
+            if real_col not in tables.get(table_name, {}).get('columns', {}):
+                continue
+            col_type = tables[table_name]['columns'][real_col]['type']
+            eq_vals = []
+            for val in vals:
+                if isinstance(val, str) and val.startswith('BETWEEN:'):
+                    _, low, high = val.split(':', 2)
+                    conditions.append(
+                        f"{real_col} BETWEEN {self._sql_literal(low, col_type)} AND {self._sql_literal(high, col_type)}"
+                    )
+                elif isinstance(val, str) and ':' in val and val[0] in '><':
+                    op, v = val.split(':', 1)
+                    conditions.append(f"{real_col} {op} {self._sql_literal(v, col_type)}")
+                else:
+                    eq_vals.append(val)
+
+            if len(eq_vals) == 1:
+                conditions.append(f"{real_col} = {self._sql_literal(eq_vals[0], col_type)}")
+            elif len(eq_vals) > 1:
+                in_list = ', '.join(self._sql_literal(v, col_type) for v in eq_vals)
+                conditions.append(f"{real_col} IN ({in_list})")
+
+        return conditions
+
+    def _reverse_propagate_parent_key_matches(
+        self,
+        generator,
+        table_name: str,
+        tables: Dict,
+        fk_relationships: Dict[str, Dict[str, Tuple[str, str]]],
+        filter_values: Dict[str, Dict[str, list]],
+    ) -> None:
+        """Reverse-walk predicates through FK joins to constrain parent keys."""
+        table_fks = fk_relationships.get(table_name, {})
+        if not table_fks or table_name not in filter_values:
+            return
+
+        conditions = self._build_filter_conditions(table_name, tables, filter_values)
+        if not conditions:
+            return
+        where = ' AND '.join(conditions)
+
+        for fk_col, (parent_table, _) in table_fks.items():
+            if parent_table not in tables:
+                continue
+            real_fk_col = self._resolve_column_name(table_name, fk_col, tables)
+            if not real_fk_col:
+                continue
+            try:
+                rows = self.conn.execute(
+                    f"SELECT DISTINCT {real_fk_col} FROM {table_name} WHERE {where}"
+                ).fetchall()
+            except Exception:
+                continue
+
+            matched_parent_keys = [r[0] for r in rows if r and r[0] is not None]
+            if not matched_parent_keys:
+                continue
+            matched_parent_keys = list(dict.fromkeys(matched_parent_keys))
+
+            existing = generator.filter_matched_values.get(parent_table, [])
+            if existing:
+                matched_set = set(matched_parent_keys)
+                narrowed = [k for k in existing if k in matched_set]
+            else:
+                narrowed = matched_parent_keys
+
+            if narrowed:
+                generator.filter_matched_values[parent_table] = narrowed
+                logger.debug(
+                    "  reverse-propagated %d keys from %s.%s to %s",
+                    len(narrowed), table_name, real_fk_col, parent_table
+                )
+
     def _update_filter_matched_pks(self, generator, tables, dim_tables, filter_values):
-        """Query generated dimension data to find PKs matching actual WHERE filters."""
+        """Query generated data to find PKs matching literal WHERE predicates."""
         for table_name in dim_tables:
             if table_name not in filter_values:
                 continue
@@ -1203,37 +1535,7 @@ class SyntheticValidator:
             if not pk_col:
                 continue
 
-            # Build WHERE clause from filter values
-            # Group equality values per column to use IN() instead of AND
-            conditions = []
-            for col, vals in filter_values[table_name].items():
-                if col not in tables[table_name]['columns']:
-                    continue
-                col_type = tables[table_name]['columns'][col]['type']
-                eq_vals = []
-                for val in vals:
-                    if isinstance(val, str) and val.startswith('BETWEEN:'):
-                        _, low, high = val.split(':', 2)
-                        conditions.append(f"{col} BETWEEN '{low}' AND '{high}'")
-                    elif isinstance(val, str) and ':' in val and val[0] in '><':
-                        op, v = val.split(':', 1)
-                        conditions.append(f"{col} {op} {v}")
-                    else:
-                        eq_vals.append(val)
-                # Emit single = or IN() for equality values
-                if len(eq_vals) == 1:
-                    v = eq_vals[0]
-                    if 'INT' in col_type or 'DECIMAL' in col_type:
-                        conditions.append(f"{col} = {v}")
-                    else:
-                        conditions.append(f"{col} = '{v}'")
-                elif len(eq_vals) > 1:
-                    if 'INT' in col_type or 'DECIMAL' in col_type:
-                        in_list = ', '.join(str(v) for v in eq_vals)
-                    else:
-                        in_list = ', '.join(f"'{v}'" for v in eq_vals)
-                    conditions.append(f"{col} IN ({in_list})")
-
+            conditions = self._build_filter_conditions(table_name, tables, filter_values)
             if not conditions:
                 continue
 
@@ -1572,18 +1874,24 @@ class SyntheticValidator:
             dependencies[table_name] = set()
         
         for table_name, fks in fk_relationships.items():
-            for col, (target_table, target_col) in fks.items():
+            for _, (target_table, _) in fks.items():
                 if target_table in tables:
                     dependencies[table_name].add(target_table)
         
         ordered = []
         visited = set()
+        visiting = set()
         
         def visit(t):
             if t in visited:
                 return
-            for dep in dependencies.get(t, []):
+            if t in visiting:
+                # Break cycles defensively: keep stable insertion order.
+                return
+            visiting.add(t)
+            for dep in sorted(dependencies.get(t, [])):
                 visit(dep)
+            visiting.remove(t)
             visited.add(t)
             ordered.append(t)
         

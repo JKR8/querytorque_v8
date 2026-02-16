@@ -148,6 +148,31 @@ class TestTableInferenceHelpers:
         assert table is None
 
 
+class TestTypeSimilarityMapping:
+    """Vector-style lexical mapping for type inference fallback."""
+
+    def test_similarity_integer_offset(self):
+        from qt_sql.validation.synthetic_validator import infer_type_by_similarity
+
+        inferred, score = infer_type_by_similarity("ca_gmt_offset")
+        assert inferred == "INTEGER"
+        assert score > 0
+
+    def test_similarity_decimal_rate(self):
+        from qt_sql.validation.synthetic_validator import infer_type_by_similarity
+
+        inferred, score = infer_type_by_similarity("gross_margin_rate")
+        assert inferred == "DECIMAL(18,2)"
+        assert score > 0
+
+    def test_schema_infer_uses_similarity_fallback(self):
+        from qt_sql.validation.synthetic_validator import SchemaExtractor
+
+        ex = SchemaExtractor("SELECT 1 AS x")
+        # Not covered by strong literal suffix rules; should use similarity fallback.
+        assert ex._infer_column_type("w_gmt_offset") == "INTEGER"
+
+
 class TestSyntheticGenerationRobustness:
     """Low-level generation tests to ensure generic (non-TPCDS) behavior."""
 
@@ -262,6 +287,108 @@ class TestSyntheticGenerationRobustness:
             table_name="orders",
         )
         assert 10 <= q <= 20
+
+
+class TestConstraintGraphPropagation:
+    """Query-graph propagation should move predicates across join equalities."""
+
+    def test_filter_values_propagate_across_joined_columns(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = """
+            SELECT *
+            FROM orders o
+            JOIN customers c ON o.customer_id = c.customer_id
+            WHERE o.customer_id IN (42, 43)
+        """
+        tables = {
+            "orders": {
+                "columns": {
+                    "order_id": {"type": "INTEGER", "nullable": False},
+                    "customer_id": {"type": "INTEGER", "nullable": False},
+                },
+                "alias": "o",
+                "key": "order_id",
+            },
+            "customers": {
+                "columns": {
+                    "customer_id": {"type": "INTEGER", "nullable": False},
+                },
+                "alias": "c",
+                "key": "customer_id",
+            },
+        }
+
+        extracted = v._extract_filter_values(sql, tables)
+        graph = v._build_join_column_graph(sql, tables)
+        propagated = v._propagate_filter_values_across_joins(extracted, graph, tables)
+        assert "customers" in propagated
+        assert "customer_id" in propagated["customers"]
+        assert set(propagated["customers"]["customer_id"]) >= {"42", "43"}
+
+    def test_generation_order_respects_fk_dependencies(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        tables = {"a": {"columns": {}}, "b": {"columns": {}}, "c": {"columns": {}}}
+        fk_relationships = {
+            "b": {"a_id": ("a", "id")},
+            "c": {"b_id": ("b", "id")},
+        }
+        order = v._get_table_generation_order(tables, fk_relationships)
+        assert order.index("a") < order.index("b") < order.index("c")
+
+    def test_generation_order_handles_cycles(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        tables = {"a": {"columns": {}}, "b": {"columns": {}}}
+        fk_relationships = {
+            "a": {"b_id": ("b", "id")},
+            "b": {"a_id": ("a", "id")},
+        }
+        order = v._get_table_generation_order(tables, fk_relationships)
+        assert set(order) == {"a", "b"}
+        assert len(order) == 2
+
+    def test_reverse_propagates_filtered_child_fk_to_parent(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator, SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        conn.execute("CREATE TABLE parent (parent_id INTEGER, label VARCHAR)")
+        conn.execute("CREATE TABLE child (child_id INTEGER, parent_id INTEGER, state VARCHAR)")
+        conn.execute("INSERT INTO parent VALUES (1, 'p1'), (2, 'p2'), (3, 'p3'), (4, 'p4'), (5, 'p5')")
+        conn.execute(
+            "INSERT INTO child VALUES "
+            "(1, 1, 'TX'), (2, 2, 'CA'), (3, 3, 'CA'), (4, 4, 'NY'), (5, 5, 'WA')"
+        )
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        v.conn = conn
+        gen = SyntheticDataGenerator(conn)
+        gen.filter_matched_values["parent"] = [1, 2, 3, 4, 5]
+
+        tables = {
+            "parent": {
+                "columns": {
+                    "parent_id": {"type": "INTEGER", "nullable": False},
+                    "label": {"type": "VARCHAR", "nullable": True},
+                }
+            },
+            "child": {
+                "columns": {
+                    "child_id": {"type": "INTEGER", "nullable": False},
+                    "parent_id": {"type": "INTEGER", "nullable": False},
+                    "state": {"type": "VARCHAR", "nullable": True},
+                }
+            },
+        }
+        fk_relationships = {"child": {"parent_id": ("parent", "parent_id")}}
+        filter_values = {"child": {"state": ["CA"]}}
+
+        v._reverse_propagate_parent_key_matches(gen, "child", tables, fk_relationships, filter_values)
+        assert gen.filter_matched_values["parent"] == [2, 3]
 
     def test_varchar_id_generation_uses_generic_table_prefix(self):
         from qt_sql.validation.synthetic_validator import SyntheticDataGenerator

@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .knowledge.configuration import get_threshold, load_dialect_config
+
 logger = logging.getLogger(__name__)
 
 # TPC-DS / DSB fact tables (large, benefit from parallel + SSD tuning)
@@ -49,6 +51,7 @@ _FACT_TABLES = frozenset([
 def propose_config_from_explain(
     explain_text: str,
     current_work_mem_mb: int = 4,
+    dialect_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Parse EXPLAIN ANALYZE text and propose SET LOCAL params.
 
@@ -58,6 +61,7 @@ def propose_config_from_explain(
     Args:
         explain_text: Full EXPLAIN ANALYZE output text
         current_work_mem_mb: Current work_mem setting in MB (default 4MB)
+        dialect_config: Optional dialect tuning profile.
 
     Returns:
         Dict of param_name -> {"value": str, "rule": str, "reason": str}
@@ -68,19 +72,19 @@ def propose_config_from_explain(
     proposals: Dict[str, Dict[str, Any]] = {}
 
     # Rule 1: Hash operations with high peak memory → increase work_mem
-    _rule_work_mem(explain_text, current_work_mem_mb, proposals)
+    _rule_work_mem(explain_text, current_work_mem_mb, proposals, dialect_config)
 
     # Rule 2: Nested Loop with high row estimates → disable nestloop
-    _rule_nestloop(explain_text, proposals)
+    _rule_nestloop(explain_text, proposals, dialect_config)
 
     # Rule 3: No parallel nodes despite seq scans → enable parallelism
-    _rule_parallelism(explain_text, proposals)
+    _rule_parallelism(explain_text, proposals, dialect_config)
 
     # Rule 4: JIT on short query → disable JIT
-    _rule_jit(explain_text, proposals)
+    _rule_jit(explain_text, proposals, dialect_config)
 
     # Rule 5: Seq scans on fact tables → lower random_page_cost
-    _rule_random_page_cost(explain_text, proposals)
+    _rule_random_page_cost(explain_text, proposals, dialect_config)
 
     # Rule 6: Many joins → increase join_collapse_limit
     _rule_join_collapse(explain_text, proposals)
@@ -89,7 +93,10 @@ def propose_config_from_explain(
 
 
 def _rule_work_mem(
-    explain: str, current_mb: int, proposals: Dict[str, Dict[str, Any]]
+    explain: str,
+    current_mb: int,
+    proposals: Dict[str, Dict[str, Any]],
+    dialect_config: Optional[Dict[str, Any]],
 ) -> None:
     """Rule 1: Hash ops with peak memory near/exceeding work_mem."""
     # Match patterns like: "Memory: 12345kB" or "Peak Memory: 12345kB"
@@ -112,7 +119,9 @@ def _rule_work_mem(
     threshold_mb = current_mb * 0.5
     if peak_mb >= threshold_mb or has_spill:
         # Propose 4x the peak memory, capped at 2048MB
-        proposed_mb = min(2048, max(256, int(peak_mb * 4)))
+        min_work_mem_mb = get_threshold(dialect_config, "min_work_mem_mb", 256)
+        max_work_mem_mb = get_threshold(dialect_config, "max_work_mem_mb", 2048)
+        proposed_mb = min(max_work_mem_mb, max(min_work_mem_mb, int(peak_mb * 4)))
         # Round up to nearest power of 2 for clean values
         proposed_mb = _round_to_power_of_2(proposed_mb)
         proposals["work_mem"] = {
@@ -126,7 +135,11 @@ def _rule_work_mem(
         }
 
 
-def _rule_nestloop(explain: str, proposals: Dict[str, Dict[str, Any]]) -> None:
+def _rule_nestloop(
+    explain: str,
+    proposals: Dict[str, Dict[str, Any]],
+    dialect_config: Optional[Dict[str, Any]],
+) -> None:
     """Rule 2: Nested Loop with high row estimates → disable."""
     # Find Nested Loop nodes with high actual rows
     nl_patterns = re.findall(
@@ -137,7 +150,8 @@ def _rule_nestloop(explain: str, proposals: Dict[str, Dict[str, Any]]) -> None:
         return
 
     max_rows = max(int(r) for r in nl_patterns)
-    if max_rows > 10000:
+    threshold = get_threshold(dialect_config, "nested_loop_row_threshold", 10000)
+    if max_rows > threshold:
         proposals["enable_nestloop"] = {
             "value": "off",
             "rule": "disable_nestloop",
@@ -145,7 +159,11 @@ def _rule_nestloop(explain: str, proposals: Dict[str, Dict[str, Any]]) -> None:
         }
 
 
-def _rule_parallelism(explain: str, proposals: Dict[str, Dict[str, Any]]) -> None:
+def _rule_parallelism(
+    explain: str,
+    proposals: Dict[str, Dict[str, Any]],
+    dialect_config: Optional[Dict[str, Any]],
+) -> None:
     """Rule 3: No parallel nodes despite sequential scans on large tables."""
     has_parallel = bool(re.search(r'Gather|Parallel', explain, re.IGNORECASE))
     if has_parallel:
@@ -159,7 +177,7 @@ def _rule_parallelism(explain: str, proposals: Dict[str, Dict[str, Any]]) -> Non
     large_scans = [
         (table, int(rows))
         for table, rows in seq_scan_rows
-        if int(rows) > 100_000
+        if int(rows) > get_threshold(dialect_config, "parallel_scan_row_threshold", 100000)
     ]
     if large_scans:
         biggest = max(large_scans, key=lambda x: x[1])
@@ -173,7 +191,11 @@ def _rule_parallelism(explain: str, proposals: Dict[str, Dict[str, Any]]) -> Non
         }
 
 
-def _rule_jit(explain: str, proposals: Dict[str, Dict[str, Any]]) -> None:
+def _rule_jit(
+    explain: str,
+    proposals: Dict[str, Dict[str, Any]],
+    dialect_config: Optional[Dict[str, Any]],
+) -> None:
     """Rule 4: JIT compilation on short queries → disable."""
     has_jit = bool(re.search(r'JIT:', explain, re.IGNORECASE))
     if not has_jit:
@@ -192,7 +214,7 @@ def _rule_jit(explain: str, proposals: Dict[str, Dict[str, Any]]) -> None:
         return
 
     total_ms = float(time_match.group(1))
-    if total_ms < 500:
+    if total_ms < get_threshold(dialect_config, "jit_disable_under_ms", 500):
         # Also check JIT overhead
         jit_time_match = re.search(
             r'JIT:.*?Time:\s*([\d.]+)\s*ms', explain, re.IGNORECASE | re.DOTALL
@@ -210,7 +232,9 @@ def _rule_jit(explain: str, proposals: Dict[str, Dict[str, Any]]) -> None:
 
 
 def _rule_random_page_cost(
-    explain: str, proposals: Dict[str, Dict[str, Any]]
+    explain: str,
+    proposals: Dict[str, Dict[str, Any]],
+    dialect_config: Optional[Dict[str, Any]],
 ) -> None:
     """Rule 5: Seq scans on fact tables → favor index scans."""
     seq_scan_matches = re.findall(
@@ -221,7 +245,8 @@ def _rule_random_page_cost(
     fact_seq_scans = [
         (table, int(rows))
         for table, rows in seq_scan_matches
-        if table.lower() in _FACT_TABLES and int(rows) > 100_000
+        if table.lower() in _FACT_TABLES
+        and int(rows) > get_threshold(dialect_config, "fact_seq_scan_row_threshold", 100000)
     ]
 
     if fact_seq_scans:
@@ -343,7 +368,10 @@ def boost_session(
         }
 
     # Propose config
-    proposals = propose_config_from_explain(explain_text)
+    dialect_config = load_dialect_config("postgresql")
+    proposals = propose_config_from_explain(
+        explain_text, dialect_config=dialect_config,
+    )
     if not proposals:
         result = {
             "query_id": query_id,
@@ -608,19 +636,16 @@ def propose_config_from_llm(
         from qt_shared.llm import create_llm_client
         from .prompts.pg_tuner import build_pg_tuner_prompt
         from .pg_tuning import load_or_collect_profile, PG_TUNABLE_PARAMS
+        from .prompter import _load_engine_profile
 
         # Load system profile
         cache_dir = Path.cwd() / ".cache"
         profile = load_or_collect_profile(dsn, cache_dir=cache_dir)
         settings = {s["name"]: s["setting"] for s in profile.settings}
+        dialect_config = load_dialect_config("postgresql")
 
         # Load engine profile if available
-        engine_profile_path = (
-            Path(__file__).parent / "constraints" / "engine_profile_postgresql.json"
-        )
-        engine_profile = None
-        if engine_profile_path.exists():
-            engine_profile = json.loads(engine_profile_path.read_text())
+        engine_profile = _load_engine_profile("postgresql")
 
         # Build prompt
         prompt = build_pg_tuner_prompt(
@@ -635,7 +660,11 @@ def propose_config_from_llm(
         llm = create_llm_client()
         if llm is None:
             logger.warning("No LLM client configured, falling back to rules")
-            return propose_config_from_explain(explain_text, current_work_mem_mb)
+            return propose_config_from_explain(
+                explain_text,
+                current_work_mem_mb,
+                dialect_config=dialect_config,
+            )
 
         response = llm.analyze(prompt)
 
@@ -668,7 +697,11 @@ def propose_config_from_llm(
         logger.warning(f"LLM config proposal failed: {e}, falling back to rules")
 
     # Fallback to rule-based
-    return propose_config_from_explain(explain_text, current_work_mem_mb)
+    return propose_config_from_explain(
+        explain_text,
+        current_work_mem_mb,
+        dialect_config=load_dialect_config("postgresql"),
+    )
 
 
 # =========================================================================
@@ -806,7 +839,10 @@ def _boost_leaderboard_entry(
     if use_llm and explain_text:
         proposals = propose_config_from_llm(optimized_sql, explain_text, dsn)
     elif explain_text:
-        proposals = propose_config_from_explain(explain_text)
+        proposals = propose_config_from_explain(
+            explain_text,
+            dialect_config=load_dialect_config("postgresql"),
+        )
     else:
         proposals = {}
 

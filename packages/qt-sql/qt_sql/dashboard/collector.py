@@ -300,8 +300,9 @@ def _load_qerror_data(benchmark_dir: Path) -> Dict[str, QErrorEntry]:
 
 def _load_engine_profile(engine: str) -> Optional[EngineProfile]:
     """Load engine profile from constraints directory."""
-    engine_key = {"postgres": "postgresql", "postgresql": "postgresql"}.get(
-        engine, engine)
+    from qt_sql.knowledge.normalization import normalize_dialect
+
+    engine_key = normalize_dialect(engine)
     constraints_dir = Path(__file__).resolve().parent.parent / "constraints"
     path = constraints_dir / f"engine_profile_{engine_key}.json"
     if not path.exists():
@@ -328,7 +329,7 @@ def _load_engine_profile(engine: str) -> Optional[EngineProfile]:
             for g in data.get("gaps", [])
         ]
         return EngineProfile(
-            engine=data.get("engine", engine),
+            engine=data.get("dialect") or data.get("engine", engine_key),
             version_tested=data.get("version_tested", ""),
             briefing_note=data.get("briefing_note", ""),
             strengths=strengths,

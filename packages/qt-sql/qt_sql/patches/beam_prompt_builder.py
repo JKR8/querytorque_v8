@@ -215,7 +215,16 @@ def _load_engine_intelligence(dialect: str) -> Optional[str]:
     return f"## Engine Playbook ({dialect.upper()})\n\n{algo_text}"
 
 
-# ── Shared Prompt Body (Sections 1-5) ──────────────────────────────────────
+# ── Shared Prompt Body — Cache-Friendly Order ─────────────────────────────
+#
+# Structure (for API prefix caching):
+#   1st — System Instructions (CACHED): Role, task spec
+#   2nd — Database Schema / Context (CACHED): Engine playbook, gold examples
+#   3rd — "Query to Analyze" marker (CACHED)
+#   4th — Unique query data (CACHE MISS): SQL, EXPLAIN, IR, intelligence
+#
+# Callers insert their task section into static, add the marker,
+# then concatenate: "\n\n".join(static + dynamic).
 
 def _build_prompt_body(
     query_id: str,
@@ -227,62 +236,36 @@ def _build_prompt_body(
     role_text: str,
     include_patch_plans: bool = True,
     intelligence_brief: str = "",
-) -> tuple[List[str], int]:
-    """Build sections 1-5 shared by single-tier and tiered prompts.
-
-    Args:
-        include_patch_plans: If False, omit PATCH PLAN JSON from family sections.
-            Set False for tiered mode where the analyst doesn't generate patches.
-        intelligence_brief: Pre-computed AST detection + LLM classification summary.
+) -> tuple[List[str], List[str], int]:
+    """Build prompt sections in cache-friendly order.
 
     Returns:
-        (sections, n_families) — list of section strings, count of families with plans.
+        (static_sections, dynamic_sections, n_families).
+        Callers append task section + marker to static, then join all.
     """
-    sections = []
+    static: List[str] = []
+    dynamic: List[str] = []
 
-    # ── Section 1: Role ─────────────────────────────────────────────────
-    sections.append(f"## Role\n\n{role_text}")
+    # ═══ STATIC PREFIX (identical for all queries on same dialect) ═════
 
-    # ── Section 2: Query ────────────────────────────────────────────────
-    sections.append(f"""## Query: {query_id}
+    # ── Role ───────────────────────────────────────────────────────
+    static.append(f"## Role\n\n{role_text}")
 
-**Dialect**: {dialect.upper()}
+    # ── Engine Intelligence ────────────────────────────────────────
+    engine_intel = _load_engine_intelligence(dialect)
+    if engine_intel:
+        static.append(engine_intel)
 
-```sql
-{original_sql}
-```
-""")
-
-    # ── Section 3: Execution Plan ───────────────────────────────────────
-    sections.append(f"""## Current Execution Plan
-
-```
-{explain_text}
-```
-""")
-
-    # ── Section 4: IR Structure ────────────────────────────────────────
-    sections.append(f"""## IR Structure (for patch targeting)
-
-```
-{ir_node_map}
-```
-
-**Note**: Use `by_node_id` (e.g., "S0") and `by_anchor_hash` (16-char hex) from map above to target patch operations.
-""")
-
-    # ── Section 5: Families with examples ─────────────────────────────
+    # ── Families with examples ─────────────────────────────────────
     all_family_ids = ["A", "B", "C", "D", "E", "F"]
     families_with_plans = [f for f in all_family_ids
                            if f in all_5_examples and all_5_examples[f].get("patch_plan")]
     n_families = len(families_with_plans)
 
-    # In tiered mode the analyst only sees family descriptions + example IDs.
-    # Workers receive the full before/after SQL and patch plans.
     analyst_only = not include_patch_plans
     family_intro = (
         "This is a briefing of what we know, not a set of hard rules. "
-        "Use your judgement about what's worth trying based on the EXPLAIN plan above.\n\n"
+        "Use your judgement about what's worth trying based on the EXPLAIN plan.\n\n"
         f"**{n_families} families have proven gold examples** on this engine. "
         f"All 6 families are listed — those without gold examples are still valid "
         "strategies if the EXPLAIN plan warrants them.\n\n"
@@ -291,40 +274,46 @@ def _build_prompt_body(
         "- Execution plan signals (WHERE placement, repeated scans, correlated subqueries)\n"
         "- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)\n"
     )
-    sections.append(f"## Optimization Families\n\n{family_intro}\n")
+    static.append(f"## Optimization Families\n\n{family_intro}\n")
 
     for family_id in all_family_ids:
         ex = all_5_examples.get(family_id)
         if ex and ex.get("patch_plan"):
-            sections.append(format_family_section(
+            static.append(format_family_section(
                 family_id, ex, include_patch_plans, analyst_only=analyst_only,
             ))
-            sections.append("")
+            static.append("")
         else:
-            # No gold example for this family on this engine — still show
-            # the description so the analyst knows it exists
-            sections.append(format_family_description_only(family_id, dialect))
-            sections.append("")
+            static.append(format_family_description_only(family_id, dialect))
+            static.append("")
 
-    # ── Section 5a: Detected Patterns (intelligence brief) ────────────
+    # ═══ DYNAMIC SUFFIX (unique per query — cache miss) ═══════════════
+
+    # ── Query ──────────────────────────────────────────────────────
+    dynamic.append(f"**Dialect**: {dialect.upper()}\n\n```sql\n{original_sql}\n```")
+
+    # ── Execution Plan ─────────────────────────────────────────────
+    dynamic.append(f"### Execution Plan\n\n```\n{explain_text}\n```")
+
+    # ── IR Structure ───────────────────────────────────────────────
+    dynamic.append(f"""### IR Structure (for patch targeting)
+
+```
+{ir_node_map}
+```
+
+**Note**: Use `by_node_id` (e.g., "S0") and `by_anchor_hash` (16-char hex) from map above to target patch operations.""")
+
+    # ── Detected Patterns (per-query intelligence) ─────────────────
     if intelligence_brief:
-        sections.append(f"""## Detected Patterns
+        dynamic.append(f"""### Detected Patterns
 
 {intelligence_brief}
 
 **Instruction**: Prioritize detected patterns above. If a high-confidence
-pathology is detected, your primary target SHOULD address it.
-""")
+pathology is detected, your primary target SHOULD address it.""")
 
-    # ── Section 5b: Engine Intelligence ─────────────────────────────────
-    # Load the full exploit algorithm (knowledge/{dialect}.md) — the
-    # distilled playbook of pathologies, gates, regression registry.
-    # This is the same intel the swarm analyst gets.
-    engine_intel = _load_engine_intelligence(dialect)
-    if engine_intel:
-        sections.append(engine_intel)
-
-    return sections, n_families
+    return static, dynamic, n_families
 
 
 # ── Reasoning Prompt Builder (R1 2-shot, outputs 2 PatchPlans) ──────────
@@ -340,25 +329,17 @@ def build_reasoning_prompt(
 ) -> str:
     """Build the R1 reasoning prompt — full intelligence, outputs 2 PatchPlans.
 
+    Cache-friendly structure:
+      CACHED: Role + playbook + gold examples + task spec + marker
+      MISS:   Query SQL + EXPLAIN + IR + intelligence brief
+
     Used as shot 1 in REASONING mode. The same prompt prefix is reused
     in shot 2 (via append_shot_results) for cache-hit efficiency.
-
-    Args:
-        query_id: Query identifier (e.g., "query_21")
-        original_sql: Full original SQL
-        explain_text: EXPLAIN ANALYZE output as text
-        ir_node_map: IR node map (from render_ir_node_map)
-        all_5_examples: Dict mapping family ID (A-F) to gold example JSON
-        dialect: SQL dialect (duckdb, postgres, snowflake)
-        intelligence_brief: Pre-computed detection + classification summary.
-
-    Returns:
-        Complete prompt string
     """
     engine_name = dialect.upper().replace('POSTGRES', 'PostgreSQL')
     role_text = (
         f"You are a SQL optimization specialist for {engine_name}. "
-        "Your task is to analyze this query's execution plan, identify the primary "
+        "Your task is to analyze a query's execution plan, identify the primary "
         "bottleneck, and propose **exactly 2 independent patch plans** that target "
         "different optimization strategies.\n\n"
         "Each patch plan must:\n"
@@ -368,17 +349,20 @@ def build_reasoning_prompt(
         "- Follow the patterns shown in reference examples below"
     )
 
-    sections, n_families = _build_prompt_body(
+    static, dynamic, n_families = _build_prompt_body(
         query_id, original_sql, explain_text, ir_node_map,
         all_5_examples, dialect, role_text,
         include_patch_plans=True,
         intelligence_brief=intelligence_brief,
     )
 
-    # ── Section 6: Task — output 2 PatchPlans ──────────────────────────
-    sections.append(_build_patchplan_task_section(n_plans=2))
+    # Task spec in static prefix (system instructions)
+    static.append(_build_patchplan_task_section(n_plans=2))
 
-    return "\n\n".join(sections)
+    # Cache boundary
+    static.append("---\n\n## Query to Analyze")
+
+    return "\n\n".join(static + dynamic)
 
 
 # ── Worker Prompt Builder (for qwen code-generation) ──────────────────────
@@ -605,77 +589,28 @@ def build_beam_sniper_prompt(
     Returns:
         Complete sniper prompt string.
     """
-    n_total = len(strike_results)
-    n_pass = sum(1 for s in strike_results if s.get("status") in ("PASS", "WIN", "IMPROVED"))
-    n_win = sum(1 for s in strike_results if s.get("status") == "WIN")
-
     engine_name = dialect.upper().replace('POSTGRES', 'PostgreSQL')
+
+    # Static role text — no per-query counts (those go in dynamic section)
     role_text = (
         f"You are a SQL optimization specialist for {engine_name}. "
-        f"{n_total} transform probes were fired against query {query_id}. "
-        f"{n_pass} passed validation, {n_win} showed speedup.\n\n"
-        "Your task: analyze the probe results (BDA), identify what worked "
-        "and why, then design **exactly 2 patch plans** that build on the "
-        "best insights — combining or refining winning strategies."
+        "You will receive the results of transform probes (BDA) fired "
+        "against a query. Your task: analyze the probe results, identify "
+        "what worked and why, then design **exactly 2 patch plans** that "
+        "build on the best insights — combining or refining winning strategies."
     )
 
-    sections, n_families = _build_prompt_body(
+    static, dynamic, n_families = _build_prompt_body(
         query_id, original_sql, explain_text, ir_node_map,
         all_5_examples, dialect, role_text,
         include_patch_plans=True,
         intelligence_brief=intelligence_brief,
     )
 
-    # ── Section 6: BDA Table ──────────────────────────────────────────
-    bda_lines = [
-        "## Strike BDA (Battle Damage Assessment)\n",
-        "| Probe | Transform | Family | Status | Speedup | Error/Notes |",
-        "|-------|-----------|--------|--------|---------|-------------|",
-    ]
-    for s in strike_results:
-        speedup = s.get("speedup")
-        speedup_str = f"{speedup:.2f}x" if speedup else "-"
-        error_str = s.get("error") or ""
-        bda_lines.append(
-            f"| {s.get('probe_id', '?')} | {s.get('transform_id', '?')} | "
-            f"{s.get('family', '?')} | {s.get('status', '?')} | "
-            f"{speedup_str} | {error_str} |"
-        )
-    sections.append("\n".join(bda_lines))
+    # Sniper task in static prefix (system instructions)
+    static.append("""## Your Task
 
-    # ── Section 7: EXPLAIN Plans for winning strikes ──────────────────
-    winning = [
-        s for s in strike_results
-        if s.get("status") in ("WIN", "IMPROVED", "PASS")
-        and s.get("speedup") and s["speedup"] >= 1.0
-        and s.get("explain_text")
-    ]
-
-    if winning:
-        explain_sections = ["## EXPLAIN Plans (winning strikes)\n"]
-        for s in sorted(winning, key=lambda x: -(x.get("speedup") or 0)):
-            explain_sections.append(
-                f"### {s['probe_id']}: {s['transform_id']} ({s['speedup']:.2f}x)\n"
-                f"```\n{s['explain_text'].strip()}\n```\n"
-            )
-        sections.append("\n".join(explain_sections))
-
-    # ── Section 8: SQL of winning strikes ─────────────────────────────
-    if winning:
-        sql_sections = ["## SQL of Winning Strikes\n"]
-        for s in sorted(winning, key=lambda x: -(x.get("speedup") or 0)):
-            sql = s.get("sql")
-            if sql:
-                sql_sections.append(
-                    f"### {s['probe_id']}: {s['transform_id']} ({s['speedup']:.2f}x)\n"
-                    f"```sql\n{sql.strip()}\n```\n"
-                )
-        sections.append("\n".join(sql_sections))
-
-    # ── Section 9: Task — output 2 PatchPlans ─────────────────────────
-    sections.append("""## Your Task
-
-The BDA tells you WHAT WORKS on this query. Design 2 patch plans:
+The BDA (in the query section below) tells you WHAT WORKS. Design 2 patch plans:
 
 1. **Analyze winning strikes**: Compare their EXPLAINs to original —
    where did row counts drop? Which operators changed? What bottleneck
@@ -690,7 +625,65 @@ The BDA tells you WHAT WORKS on this query. Design 2 patch plans:
 
 """ + _build_patchplan_task_section(n_plans=2))
 
-    return "\n\n".join(sections)
+    # Cache boundary
+    static.append("---\n\n## Query to Analyze")
+
+    # ── DYNAMIC: Probe summary ────────────────────────────────────
+    n_total = len(strike_results)
+    n_pass = sum(1 for s in strike_results if s.get("status") in ("PASS", "WIN", "IMPROVED"))
+    n_win = sum(1 for s in strike_results if s.get("status") == "WIN")
+    dynamic.append(
+        f"**Probe summary**: {n_total} probes fired, "
+        f"{n_pass} passed validation, {n_win} showed speedup."
+    )
+
+    # ── DYNAMIC: BDA Table ────────────────────────────────────────
+    bda_lines = [
+        "### Strike BDA (Battle Damage Assessment)\n",
+        "| Probe | Transform | Family | Status | Speedup | Error/Notes |",
+        "|-------|-----------|--------|--------|---------|-------------|",
+    ]
+    for s in strike_results:
+        speedup = s.get("speedup")
+        speedup_str = f"{speedup:.2f}x" if speedup else "-"
+        error_str = s.get("error") or ""
+        bda_lines.append(
+            f"| {s.get('probe_id', '?')} | {s.get('transform_id', '?')} | "
+            f"{s.get('family', '?')} | {s.get('status', '?')} | "
+            f"{speedup_str} | {error_str} |"
+        )
+    dynamic.append("\n".join(bda_lines))
+
+    # ── DYNAMIC: EXPLAIN Plans for winning strikes ────────────────
+    winning = [
+        s for s in strike_results
+        if s.get("status") in ("WIN", "IMPROVED", "PASS")
+        and s.get("speedup") and s["speedup"] >= 1.0
+        and s.get("explain_text")
+    ]
+
+    if winning:
+        explain_sections = ["### EXPLAIN Plans (winning strikes)\n"]
+        for s in sorted(winning, key=lambda x: -(x.get("speedup") or 0)):
+            explain_sections.append(
+                f"#### {s['probe_id']}: {s['transform_id']} ({s['speedup']:.2f}x)\n"
+                f"```\n{s['explain_text'].strip()}\n```\n"
+            )
+        dynamic.append("\n".join(explain_sections))
+
+    # ── DYNAMIC: SQL of winning strikes ───────────────────────────
+    if winning:
+        sql_sections = ["### SQL of Winning Strikes\n"]
+        for s in sorted(winning, key=lambda x: -(x.get("speedup") or 0)):
+            sql = s.get("sql")
+            if sql:
+                sql_sections.append(
+                    f"#### {s['probe_id']}: {s['transform_id']} ({s['speedup']:.2f}x)\n"
+                    f"```sql\n{sql.strip()}\n```\n"
+                )
+        dynamic.append("\n".join(sql_sections))
+
+    return "\n\n".join(static + dynamic)
 
 
 # ── Shared PatchPlan Task Section ──────────────────────────────────────────
