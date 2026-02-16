@@ -2335,8 +2335,7 @@ function handleServerMessage(msg) {
     editorFiring = false;
     document.getElementById('editor-spinner').classList.remove('active');
     document.getElementById('btn-beam').disabled = false;
-    const hasSel = document.getElementById('editor-strategy-select').value;
-    document.getElementById('btn-strike').disabled = !hasSel;
+    document.getElementById('btn-strike').disabled = false;
     if (data.best_sql) {
       document.getElementById('editor-rewrite').value = data.best_sql;
       updateEditorGutters();
@@ -2492,11 +2491,11 @@ function renderDetailPanel(q) {
     html += '<div style="font-size:12px;color:var(--t3)">No structural matches (discovery mode)</div>';
   }
 
-  // EXPLAIN
+  // EXPLAIN — parsed bottleneck analysis
   if (d.explain) {
     const isOpen = openExplains.has(q.id);
     html += `<div class="explain-toggle" id="explain-tog-${q.id}" onclick="toggleExplain('${q.id}')">${isOpen ? '\u25BC Hide EXPLAIN' : '\u25B6 Show EXPLAIN'}</div>`;
-    html += `<pre class="explain-pre" id="explain-${q.id}" style="display:${isOpen ? 'block' : 'none'}">${esc(d.explain)}</pre>`;
+    html += `<div id="explain-${q.id}" style="display:${isOpen ? 'block' : 'none'}">` + renderExplainAnalysis(d.explain) + '</div>';
   }
 
   html += '</div></div></td></tr>';
@@ -3268,15 +3267,113 @@ function syncHighlightScroll(textarea, highlight) {
   highlight.scrollLeft = textarea.scrollLeft;
 }
 
-// EXPLAIN Bottleneck Analysis
+// EXPLAIN Bottleneck Analysis — supports PostgreSQL arrow format and DuckDB box-drawing
 function renderExplainAnalysis(explainText) {
   if (!explainText) return '<div style="color:var(--t3);font-size:12px;padding:12px">No EXPLAIN data available</div>';
 
-  const lines = explainText.split('\n').filter(l => l.trim());
+  // Detect DuckDB box-drawing format (contains ┌ or │ characters)
+  if (/[┌│└┐┘├┤┬┴┼─]/.test(explainText)) {
+    return parseDuckDBExplain(explainText);
+  }
+  return parsePGExplain(explainText);
+}
+
+function parseDuckDBExplain(text) {
+  const lines = text.split('\n');
+  const nodes = [];
+  let totalTime = 0;
+  let currentNode = null;
+
+  for (const line of lines) {
+    // Node name: line inside box with only UPPER_CASE_NAME (e.g. │     HASH_GROUP_BY     │)
+    const nameMatch = line.match(/│\s+([A-Z][A-Z_0-9]+(?:\s+[A-Z_0-9]+)*)\s+│/);
+    if (nameMatch && !/rows|est|time|Groups|Aggregates|Order|Conditions|Name|Index|Top:|filter|Scan|Join|QUERY|EXPLAIN|Profiling/i.test(nameMatch[1])) {
+      // Skip if it looks like a detail label
+      if (/^(LEFT|RIGHT|INNER|OUTER|MARK|SINGLE)$/.test(nameMatch[1])) continue;
+      currentNode = { name: nameMatch[1], rows: null, time: null, indent: line.indexOf('│') };
+      nodes.push(currentNode);
+    }
+
+    // Row count: "539,331 rows" or "100 rows"
+    const rowMatch = line.match(/│\s+([\d,]+)\s+rows?\s+│/);
+    if (rowMatch && currentNode) {
+      currentNode.rows = parseInt(rowMatch[1].replace(/,/g, ''));
+    }
+
+    // Time: "(0.38s)" or "(0.00s)"
+    const timeMatch = line.match(/│\s+\(([\d.]+)s\)\s+│/);
+    if (timeMatch && currentNode) {
+      currentNode.time = parseFloat(timeMatch[1]) * 1000; // convert to ms
+    }
+
+    // Total time from header: "Total Time: 0.217s"
+    const totalMatch = line.match(/Total Time:\s*([\d.]+)s/);
+    if (totalMatch) {
+      totalTime = parseFloat(totalMatch[1]) * 1000;
+    }
+
+    // Filter detail: "filter: ..."
+    const filterMatch = line.match(/│\s+(filter:|Join Type:|Top:|Sort Key:)\s*(.*?)\s*│/);
+    if (filterMatch && currentNode) {
+      if (!currentNode.details) currentNode.details = [];
+      currentNode.details.push(filterMatch[1] + ' ' + filterMatch[2]);
+    }
+  }
+
+  // Filter out overhead nodes with 0 time and 0 rows (PROJECTION, CTE wrappers)
+  const meaningful = nodes.filter(n => n.time > 0 || (n.rows && n.rows > 1000));
+
+  if (meaningful.length === 0 && nodes.length === 0) {
+    return '<pre class="explain-pre" style="max-height:25vh;font-size:12px">' + escH(text) + '</pre>';
+  }
+
+  const displayNodes = meaningful.length > 0 ? meaningful : nodes;
+  if (!totalTime && displayNodes.length > 0) {
+    totalTime = Math.max(...displayNodes.map(n => n.time || 0));
+  }
+
+  const maxTime = Math.max(...displayNodes.map(n => n.time || 0));
+
+  let html = '<div class="explain-summary">';
+  html += `Total: <strong>${fmtMs(totalTime)}</strong>`;
+  const bottleneck = displayNodes.find(n => n.time === maxTime && n.time > 0 && n.time < totalTime);
+  if (bottleneck) {
+    html += ` &middot; Bottleneck: <strong style="color:var(--red)">${esc(bottleneck.name)}</strong> (${fmtMs(bottleneck.time)})`;
+  }
+  html += `  &middot; <span style="color:var(--t3)">${nodes.length} operators</span>`;
+  html += '</div>';
+
+  for (const n of displayNodes) {
+    const isBottleneck = n.time === maxTime && n.time > 0 && n.time < totalTime;
+    const pct = totalTime > 0 && n.time ? (n.time / totalTime) * 100 : 0;
+    const barClass = pct > 60 ? 'high' : pct > 25 ? 'mid' : 'low';
+
+    html += `<div class="explain-node${isBottleneck ? ' explain-bottleneck' : ''}" style="padding-left:8px">`;
+    html += `<span class="explain-node-name">${esc(n.name)}</span>`;
+    if (isBottleneck) html += '<span class="explain-badge">bottleneck</span>';
+    if (n.time !== null) {
+      html += `<div class="explain-bar"><div class="explain-bar-fill ${barClass}" style="width:${Math.max(2, pct)}%"></div></div>`;
+      html += `<span class="explain-time">${fmtMs(n.time)}</span>`;
+    }
+    if (n.rows !== null) {
+      html += `<span class="explain-accuracy" style="color:var(--t3)">${n.rows.toLocaleString()} rows</span>`;
+    }
+    html += '</div>';
+    if (n.details) {
+      for (const d of n.details) {
+        html += `<div class="explain-node" style="padding-left:20px"><span class="explain-node-name" style="color:var(--t3);font-style:italic;font-size:11px">${esc(d)}</span></div>`;
+      }
+    }
+  }
+
+  return html;
+}
+
+function parsePGExplain(text) {
+  const lines = text.split('\n').filter(l => l.trim());
   const nodes = [];
 
   for (const line of lines) {
-    // Parse: -> NodeType  (time=123.4ms, rows=100 (est 50))
     const m = line.match(/^(\s*)->?\s*(.+?)\s+\(time=([\d.]+)ms(?:,\s*rows=(\d+)(?:\s*\(est\s+(\d+)\))?)?\)/);
     if (m) {
       nodes.push({
@@ -3287,31 +3384,24 @@ function renderExplainAnalysis(explainText) {
         est: m[5] ? parseInt(m[5]) : null,
       });
     } else {
-      // Try simpler format: filter lines etc.
       const m2 = line.match(/^(\s*)(filter|Filter|Index Cond|Sort Key|Hash Cond|Merge Cond|Join Filter|Recheck Cond):\s*(.*)/);
       if (m2) {
         nodes.push({
           indent: m2[1].length + 2,
           name: m2[2] + ': ' + m2[3],
-          time: 0,
-          rows: null,
-          est: null,
-          isDetail: true,
+          time: 0, rows: null, est: null, isDetail: true,
         });
       }
     }
   }
 
   if (nodes.length === 0) {
-    // Fallback to plain text
-    return '<pre class="explain-pre" style="max-height:25vh">' + escH(explainText) + '</pre>';
+    return '<pre class="explain-pre" style="max-height:25vh">' + escH(text) + '</pre>';
   }
 
-  // Find bottleneck (max time)
   const maxTime = Math.max(...nodes.filter(n => !n.isDetail).map(n => n.time));
   const totalTime = nodes.length > 0 && !nodes[0].isDetail ? nodes[0].time : maxTime;
 
-  // Summary
   let html = '<div class="explain-summary">';
   html += `Total: <strong>${fmtMs(totalTime)}</strong>`;
   const bottleneck = nodes.find(n => n.time === maxTime && !n.isDetail && n !== nodes[0]);
@@ -3320,7 +3410,6 @@ function renderExplainAnalysis(explainText) {
   }
   html += '</div>';
 
-  // Nodes
   for (const n of nodes) {
     if (n.isDetail) {
       html += `<div class="explain-node" style="padding-left:${12 + n.indent * 8}px">`;
@@ -3389,7 +3478,7 @@ function editorSelectQuery(qid) {
   document.getElementById('editor-original').value = q.sql || '';
   document.getElementById('editor-rewrite').value = '';  // Blank until optimization completes
   document.getElementById('btn-beam').disabled = false;
-  document.getElementById('btn-strike').disabled = true;  // Disabled until strategy selected
+  document.getElementById('btn-strike').disabled = false;
 
   // Meta strip
   let meta = `<span>${fmtMs(q.runtime_ms)}</span>`;
@@ -3557,15 +3646,14 @@ function editorFireBeam() {
 function editorFireStrike() {
   if (editorFiring || !editorQueryId) return;
   const strategySel = document.getElementById('editor-strategy-select');
-  const strategy = strategySel.value;
-  if (!strategy) return;
+  const strategy = strategySel ? strategySel.value : '';
 
   editorFiring = true;
   editorResults = [];
   renderEditorResults();
 
   document.getElementById('editor-spinner').classList.add('active');
-  document.getElementById('editor-spinner-text').textContent = `Strike: ${strategy}...`;
+  document.getElementById('editor-spinner-text').textContent = strategy ? `Strike: ${strategy}...` : 'Strike...';
   document.getElementById('btn-beam').disabled = true;
   document.getElementById('btn-strike').disabled = true;
 
@@ -3594,8 +3682,7 @@ function populateStrategyDropdown(q) {
 }
 
 function editorStrategyChanged() {
-  const strategy = document.getElementById('editor-strategy-select').value;
-  document.getElementById('btn-strike').disabled = !strategy || !editorQueryId;
+  // Strategy is optional — strike always available when a query is selected
 }
 
 function simulateEditorResults(iterations, strategy) {
@@ -3628,8 +3715,7 @@ function simulateEditorResults(iterations, strategy) {
       editorFiring = false;
       document.getElementById('editor-spinner').classList.remove('active');
       document.getElementById('btn-beam').disabled = false;
-      const hasSel = document.getElementById('editor-strategy-select').value;
-      document.getElementById('btn-strike').disabled = !hasSel;
+      document.getElementById('btn-strike').disabled = false;
 
       // Load best into rewrite pane
       const best = [...editorResults].sort((a, b) => b.speedup - a.speedup)[0];

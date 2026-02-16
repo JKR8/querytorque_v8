@@ -24,12 +24,14 @@ class FleetWSServer:
         html_path: Path,
         initial_data: List[Dict[str, Any]],
         pause_event: Optional[threading.Event] = None,
+        benchmark_dir: Optional[Path] = None,
     ) -> None:
         self.event_bus = event_bus
         self.triage_gate = triage_gate
         self.pause_event = pause_event
         self.html_path = html_path
         self.initial_data = initial_data
+        self.benchmark_dir = benchmark_dir
         self._clients: List[Any] = []  # WebSocket connections
 
     def get_app(self):
@@ -121,7 +123,9 @@ class FleetWSServer:
                 from ..pipeline import Pipeline
                 from ..sessions.beam_session import BeamSession
 
-                pipeline = Pipeline()
+                if not self.benchmark_dir:
+                    raise RuntimeError("No benchmark_dir configured for editor sessions")
+                pipeline = Pipeline(self.benchmark_dir)
                 pipeline.config.tiered_patch_enabled = True
                 pipeline.config.benchmark_dsn = pipeline.config.db_path_or_dsn
 
@@ -208,6 +212,7 @@ def run_server_in_thread(
     initial_data: List[Dict[str, Any]],
     pause_event: Optional[threading.Event] = None,
     port: int = 8765,
+    benchmark_dir: Optional[Path] = None,
 ) -> threading.Thread:
     """Launch the WebSocket server as a daemon thread. Returns the thread."""
     import uvicorn
@@ -218,6 +223,7 @@ def run_server_in_thread(
         html_path=html_path,
         initial_data=initial_data,
         pause_event=pause_event,
+        benchmark_dir=benchmark_dir,
     )
     app = server.get_app()
 

@@ -23,7 +23,7 @@ import click
 )
 @click.option("--max-iterations", type=int, default=3, show_default=True,
               help="Max optimization rounds per query.")
-@click.option("--target-speedup", type=float, default=2.0, show_default=True,
+@click.option("--target-speedup", type=float, default=100.0, show_default=True,
               help="Stop early when this speedup is reached.")
 @click.option("--single-iteration", is_flag=True,
               help="Run one analyst/worker/snipe round only.")
@@ -232,6 +232,7 @@ def run(
                 initial_data=fleet_c2_data,
                 pause_event=pause_event,
                 port=port,
+                benchmark_dir=bench_dir,
             )
             url = f"http://127.0.0.1:{port}"
             console.print(f"  Dashboard: [link={url}]{url}[/link]")
