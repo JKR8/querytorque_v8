@@ -1,129 +1,78 @@
-# PostgreSQL Rewrite Playbook
-# DSB SF10 field intelligence
+# PostgreSQL Dialect Knowledge
 
-## ENGINE STRENGTHS — do NOT rewrite these patterns
+Source of truth for runtime decisions:
+- Gap/strength authority: `constraints/engine_profile_postgresql.json`
+- Canonical transforms: `knowledge/transforms.json`
+- Canonical examples: `examples/postgres/*.json`
+- Post-optimization tuning: `knowledge/config/postgresql.json` (not rendered in rewrite prompts)
 
-1. **BITMAP_OR_SCAN**: Multi-branch ORs on indexed columns handled via bitmap combination in one scan. Splitting ORs to UNION ALL is lethal (0.21x observed).
-2. **EXISTS semi-join**: Uses early termination. Converting a single EXISTS to a materializing CTE caused 0.50x, 0.75x — semi-join destroyed. **Exception**: When 3+ correlated NOT EXISTS channels scan different fact tables (e.g., Q069 17.48x), pre-materializing each channel into DISTINCT CTEs with LEFT JOIN IS NULL anti-pattern eliminates repeated Materialize node re-scans.
-3. **INNER JOIN reordering**: Freely reorders INNER JOINs by selectivity estimates. Do NOT manually restructure INNER JOIN order.
-4. **Index-only scan**: Reads only index when covering all requested columns. Small dimension lookups may not need CTEs.
-5. **Parallel query execution**: Large scans and aggregations parallelized across workers. CTEs block parallelism (materialization is single-threaded).
-6. **JIT compilation**: JIT-compiles complex expressions for long-running queries (>100ms).
+This document is a compact human playbook aligned to canonical IDs.
 
-## GLOBAL GUARDS
+## Canonical Transform Set (PostgreSQL)
 
-1. OR conditions on indexed columns → never split to UNION ALL (0.21x observed)
-2. Single EXISTS → never materialize into CTE (0.50x, 0.75x — semi-join destroyed). Exception: 3+ NOT EXISTS channels → pre-materialize each into DISTINCT CTE + LEFT JOIN IS NULL (17.48x observed)
-3. INNER JOIN order → never restructure (optimizer handles reordering)
-4. Small dimensions (< 10K rows) → index-only scan may be faster than CTE
-5. Baseline < 100ms → skip CTE-based rewrites (overhead exceeds savings)
-6. CTEs block parallel execution — only use when benefit outweighs parallelism loss
-7. Use AS MATERIALIZED when CTE must not be inlined (decorrelation, shared scans)
-8. Preserve efficient existing CTEs — don't decompose working patterns
-9. Verify NULL semantics in NOT IN conversions
-10. ROLLUP/window in same query → CTE may prevent pushdown optimizations
-11. Never inline a large UNION CTE — re-execution multiplied per reference (0.16x — 6 fact scans re-executed)
-12. Max 2 cascading fact-table CTE chains — deeper chains block parallelism
-13. EXPLAIN cost gaps ≠ runtime gains for config tuning — 6 false positives caught (up to 84% EXPLAIN gap → 0% runtime). Always 3-race validate config changes.
+| Family | Transform ID | Typical Use |
+|---|---|---|
+| A | `date_cte_explicit_join` | Fix comma-join plans and push selective date filters early |
+| A/B | `early_filter_decorrelate` | Combine selective prefilter + decorrelation |
+| B | `inline_decorrelate_materialized` | Correlated scalar aggregate subqueries |
+| C | `materialized_dimension_fact_prefilter` | Non-equi joins with very large fact input |
+| E/F | `dimension_prefetch_star` | Star-schema dimension prefetch before fact join |
+| F | `pg_self_join_decomposition` | Self-join decomposition when repeated scans are expensive |
 
----
+## Strengths (Do Not Fight)
 
-## DOCUMENTED CASES
+- `BITMAP_OR_SCAN`: indexed OR predicates are already efficient. Avoid OR to UNION rewrites here.
+- `SEMI_JOIN_EXISTS`: simple EXISTS/NOT EXISTS is usually optimal.
+- `INNER_JOIN_REORDERING`: PostgreSQL reorders inner joins well; manual reorder often adds risk without gain.
+- `INDEX_ONLY_SCAN`: small dimensions can be faster without CTE materialization.
+- `PARALLEL_QUERY_EXECUTION`: unnecessary CTE fences can reduce useful parallelism.
 
-Cases ordered by safety (zero-regression cases first, then by decreasing risk).
+## Gap-Driven Pathologies
 
-**P6: Multiple Date_dim Aliases with Overlapping Filters** (SMALLEST SET FIRST) — ZERO REGRESSIONS
+### `COMMA_JOIN_WEAKNESS` (HIGH)
+- Detect: comma-separated `FROM` with join predicates in `WHERE`.
+- Preferred transforms: `date_cte_explicit_join`, `dimension_prefetch_star`.
+- Notes: wins are strongest when explicit JOIN conversion and selective date/dimension filters are applied together.
 
-| Aspect | Detail |
-|---|---|
-| Detect | 2+ date_dim aliases in FROM with similar year/month_seq/moy predicates. |
-| Gates | 2+ date_dim instances with overlapping date predicates. Selectivity < 1% of date_dim (always true for year+month). Combine with explicit JOIN conversion when comma joins present. |
-| Treatments | date_consolidation (1 win, 3.10x), date_cte_isolate (3 wins + 7 improved). Apply first — date CTE is smallest, most reliable transform. |
-| Failures | None observed. |
+### `CORRELATED_SUBQUERY_PARALYSIS` (HIGH)
+- Detect: correlated scalar subquery with aggregate (`AVG/SUM/COUNT`) re-executed per outer row.
+- Preferred transforms: `inline_decorrelate_materialized`, `early_filter_decorrelate`.
+- Notes: highest-impact class. Preserve all correlation predicates and aggregate semantics exactly.
 
-**P3: Same Fact+Dimension Scan Repeated Across Subquery Boundaries** (DON'T REPEAT WORK) — ZERO REGRESSIONS
+### `NON_EQUI_JOIN_INPUT_BLINDNESS` (HIGH)
+- Detect: expensive non-equi join with large inputs and late selectivity.
+- Preferred transforms: `materialized_dimension_fact_prefilter`.
+- Notes: prefilter only when predicates are tight; loose prefilters can regress.
 
-| Aspect | Detail |
-|---|---|
-| Detect | Identical scan subtrees appearing 2+ times in EXPLAIN with similar costs. Same fact table joined to same dimensions in multiple subqueries, or self-join with different GROUP BY granularity. |
-| Gates | 2+ subqueries scanning same fact table with identical filters. COUNT/SUM/AVG/MIN/MAX only (not STDDEV/PERCENTILE). Self-join → consolidate into single CTE. 3 channel scans → single_pass_aggregation. |
-| Treatments | single_pass_aggregation (1 win, 1.98x), self_join_pivot (1 win, 1.79x) |
-| Failures | None observed. |
+### `CROSS_CTE_PREDICATE_BLINDNESS` (MEDIUM)
+- Detect: selective predicates applied after CTE materialization.
+- Preferred transforms: `date_cte_explicit_join`, `early_filter_decorrelate`.
+- Notes: in PostgreSQL this usually needs explicit JOIN cleanup with the filter push.
 
-**P4: Non-Equi Join Without Prefiltering** (MINIMIZE ROWS TOUCHED) — ZERO REGRESSIONS
+### `CTE_MATERIALIZATION_FENCE` (MEDIUM)
+- Detect: large single-use CTE where outer filters cannot be pushed in.
+- Preferred approach: minimize unnecessary CTE fencing; materialize only when reuse is real.
+- Notes: duplicating large CTE bodies is a common regression source.
 
-| Aspect | Detail |
-|---|---|
-| Detect | Expensive non-equi join (BETWEEN, <, >) in EXPLAIN with large inputs. Neither side filtered. |
-| Gates | Non-equi join predicate exists. Both join inputs > 10K rows. At least one side has selective dimension filter available. |
-| Treatments | pg_materialized_dimension_fact_prefilter (1 win, 12.07x). Apply after P1 and P6. |
-| Failures | None observed. |
+## Safety Gates
 
-**P1: Comma Join Confusing Cardinality Estimation** (ARM THE OPTIMIZER)
+- Avoid CTE-heavy rewrites when baseline runtime is already small (overhead dominates).
+- Never rewrite same-column indexed OR predicates into UNION ALL on PostgreSQL.
+- Treat simple EXISTS/NOT EXISTS as protected patterns unless strong evidence says otherwise.
+- For decorrelation, require true correlated scalar aggregate evidence from SQL + EXPLAIN.
+- Limit deep CTE chains; each added fence can reduce parallel planning flexibility.
 
-| Aspect | Detail |
-|---|---|
-| Detect | FROM t1, t2, t3 WHERE t1.key = t2.key (comma joins, no explicit JOIN). Hash/nested-loop join with poor row estimates in EXPLAIN. |
-| Gates | Multiple tables in comma-separated FROM with equi-join predicates. Dimension filters available. 1-2 fact tables only (3+ → join order lock). Max 3-4 dimension CTEs. Stop if all JOINs already explicit → skip to P6/P7. |
-| Treatments | pg_date_cte_explicit_join (4 wins, 2.1x avg), pg_dimension_prefetch_star (3 wins, 2.8x avg), explicit_join_materialized (2 wins, 5.9x avg) |
-| Failures | 0.88x (explicit join overhead on simple query) |
+## Regression Patterns to Avoid
 
-**P5: Set Operation Materializing Full Result Sets** (SETS OVER LOOPS)
+- Large UNION/CTE inlining that multiplies fact-table rescans.
+- Over-materializing date/dimension CTEs in already efficient EXISTS paths.
+- Applying star-prefetch patterns to self-joins or multi-fact join shapes.
+- Forcing plan-shape changes without matching an engine gap signal.
 
-| Aspect | Detail |
-|---|---|
-| Detect | INTERSECT/EXCEPT between large result sets. Correlated EXISTS on 3+ channels (store, web, catalog). |
-| Gates | INTERSECT with 10K+ rows → convert to EXISTS. Correlated NOT EXISTS on 3+ channels → materialize channel sets. Simple EXISTS (single channel) → KEEP EXISTS. NOT EXISTS already hash anti-join in EXPLAIN → STOP. |
-| Treatments | intersect_to_exists (1 win, 1.78x), set_operation_materialization (1 win, 17.48x) |
-| Failures | 0.75x (over-materialized date CTE in EXISTS path) |
+## Config Tuning (Post-Rewrite)
 
-**P2: Correlated Subquery Executing Per Outer Row** (SETS OVER LOOPS) — HIGHEST IMPACT
+Rewrite prompting and config tuning are separate systems.
+- Rewrite guidance: this file + engine profile + transform catalog.
+- Config guidance: `knowledge/config/postgresql.json`.
 
-| Aspect | Detail |
-|---|---|
-| Detect | Nested loop in EXPLAIN, inner side re-executes aggregate per outer row. SQL: WHERE col > (SELECT AGG(...) FROM ... WHERE outer.key = inner.key). If EXPLAIN shows hash join on correlation key → already decorrelated → STOP. |
-| Gates | Correlated scalar subquery with aggregate (AVG, SUM, COUNT). NOT EXISTS: NEVER decorrelate (destroys semi-join, 0.50x). Inner = outer table → extract common scan to shared CTE. ALWAYS use AS MATERIALIZED. 1-2 fact tables safe, 3+ → STOP. |
-| Treatments | inline_decorrelate_materialized (3 wins, avg 500x), decorrelate (8 wins, avg 3.2x), shared_scan + decorrelate (2 wins, avg 7000x) |
-| Failures | 0.51x (multi-fact join lock), 0.75x (EXISTS materialized) |
-
-**P7: Multi-Dimension Prefetch for Star-Schema Aggregation** (SMALLEST SET FIRST) — CAUTION
-
-| Aspect | Detail |
-|---|---|
-| Detect | Large fact table scan followed by late dimension filter in EXPLAIN. Star schema with 3+ dimension filters in WHERE. |
-| Gates | 3+ selective dimension filters, each < 10% of dimension table. Single fact table, NOT self-join or multi-fact. Stop if self-join → use P3 (0.25x). Stop if multi-fact → join order lock (0.51x). |
-| Treatments | pg_dimension_prefetch_star (2 wins, 2.5x avg), multi_dimension_prefetch (1 win, 2.50x) |
-| Failures | 0.25x (self-join), 0.51x (multi-fact) |
-
----
-
-## PRUNING GUIDE
-
-| Plan shows | Skip |
-|---|---|
-| No comma joins (all explicit JOINs) | P1 (comma join fix) |
-| No nested loops on large tables | P2 (decorrelation) |
-| Each table appears once | P3 (repeated scans) |
-| No non-equi joins (BETWEEN, <, >) | P4 (non-equi prefilter) |
-| No INTERSECT/EXCEPT and no correlated multi-channel EXISTS | P5 (set operation) |
-| Single date_dim reference | P6 (date consolidation) |
-| No GROUP BY or only 1 dimension filter | P7 (multi-dim prefetch) |
-| Baseline < 100ms | ALL CTE-based transforms |
-| Bitmap OR scan present | OR→UNION rewrites |
-| Parallel workers active + query fast | CTE-heavy transforms |
-
-## REGRESSION REGISTRY
-
-| Severity | Transform | Result | Root cause |
-|----------|-----------|--------|------------|
-| CATASTROPHIC | cte_inlining | 0.16x | Inlined large UNION CTE → 6 fact scans re-executed 2x each |
-| SEVERE | multi_dim_prefetch | 0.15x | CTEs blocked date-predicate pushdown on 90-day interval join |
-| SEVERE | dimension_prefetch | 0.25x | Applied star-schema pattern to 6-way self-join → parallelism destroyed |
-| MAJOR | cte_materialization | 0.30x | Multi-scan CTE overhead similar to above cte_inlining pattern |
-| MAJOR | early_fact_filtering | 0.51x | Disabled nestloop too aggressively + DISTINCT forced hash spill |
-| MAJOR | date_cte_prefetch | 0.75x | Over-materialized date CTE in EXISTS path → destroyed semi-join |
-| MODERATE | explicit_join | 0.88x | Explicit join conversion overhead exceeded benefit on simple query |
-| CATASTROPHIC | forced_parallelism (C3) | 7.34x regr | Worker startup + coordination overhead on 244ms query. NEVER force par on < 500ms |
-| CATASTROPHIC | enable_nestloop_off (C5) | -1454% | NL was correct plan. Disabling forced catastrophic merge/hash on unsuitable query |
-| MAJOR | geqo_off | -254% | Exhaustive planner found "better" cost plan on 19 joins but cardinality errors made it catastrophic |
-| MAJOR | par4_without_wm | -15.3% | Parallelism without sufficient work_mem causes hash spill under parallel execution |
+Use config tuning after semantic-safe SQL rewrites are established.

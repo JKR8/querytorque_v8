@@ -127,6 +127,7 @@ class BenchmarkConfig:
     beam_mode: str = "auto"       # "auto" | "wide" | "focused"
     wide_max_probes: int = 16     # Max probes for wide mode
     focused_max_sorties: int = 5  # Max sorties for focused mode
+    wide_dispatcher_model: Optional[str] = None  # Override analyst model for wide dispatcher
     wide_worker_model: Optional[str] = None  # Override worker model for wide (default: use worker_model)
 
     @classmethod
@@ -160,6 +161,7 @@ class BenchmarkConfig:
             beam_mode=data.get("beam_mode", "auto"),
             wide_max_probes=data.get("wide_max_probes", 16),
             focused_max_sorties=data.get("focused_max_sorties", 5),
+            wide_dispatcher_model=data.get("wide_dispatcher_model", None),
             wide_worker_model=data.get("wide_worker_model", None),
         )
 

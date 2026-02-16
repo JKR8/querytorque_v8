@@ -55,7 +55,6 @@ from qt_sql.patches.beam_wide_prompts import (
 from qt_sql.patches.beam_prompt_builder import (
     build_reasoning_prompt,
     build_beam_sniper_prompt,
-    append_shot_results,
 )
 
 gold_examples = {}
@@ -214,44 +213,3 @@ for p in sorted(RENDERED_DIR.glob("*.txt")):
     size = p.stat().st_size
     print(f"  {p.name:30s} {size:>6,} chars")
 print(f"\nAll outputs saved to {RENDERED_DIR}/")
-
-# ── Bonus: render append_shot_results example ──────────────────────────────
-
-print("\n[BONUS] Rendering shot-2 example (append_shot_results)...")
-
-# Mock AppliedPatch-like objects
-class MockPatch:
-    def __init__(self, **kw):
-        for k, v in kw.items():
-            setattr(self, k, v)
-
-mock_patches = [
-    MockPatch(
-        patch_id="r1", family="B", transform="decorrelate",
-        output_sql="WITH cte AS (...) SELECT ...",
-        apply_error=None, status="OK",
-        speedup=1.42, speedup_status="WIN",
-    ),
-    MockPatch(
-        patch_id="r2", family="E", transform="materialize_cte",
-        output_sql=None,
-        apply_error="Syntax error near CTE", status="FAIL",
-        speedup=None, speedup_status=None,
-    ),
-]
-
-mock_explains = {"r1": "HashJoin (actual rows=150)"}
-
-shot2_prompt = append_shot_results(
-    base_prompt=reasoning_prompt,
-    patches=mock_patches,
-    explains=mock_explains,
-)
-
-out_path = RENDERED_DIR / "shot2_example.txt"
-out_path.write_text(shot2_prompt)
-
-# Show just the appended portion
-appended = shot2_prompt[len(reasoning_prompt):]
-print(f"  -> {out_path} ({len(shot2_prompt)} chars total, {len(appended)} chars appended)")
-print(f"  (Shot 2 appends {len(appended)} chars to reuse KV cache on the {len(reasoning_prompt)}-char prefix)")

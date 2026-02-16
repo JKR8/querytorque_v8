@@ -1,15 +1,10 @@
-"""Build beam patch optimization prompt with all 5 families + gold examples.
-
-The prompt shows all 5 optimization families (A-E) with gold examples,
-instructs the LLM to choose the 4 most relevant families for this specific query,
-and outputs 4 independent patch plans.
-"""
+"""Build compact beam/reasoning prompts with dialect-first knowledge guidance."""
 
 from typing import Optional, Dict, Any, List, Tuple
 import json
 import logging
 
-from qt_sql.prompter import load_exploit_algorithm, _load_engine_profile
+from qt_sql.prompter import _load_engine_profile
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +22,12 @@ FAMILY_DESCRIPTIONS = {
             "Late WHERE filters on dimension tables",
             "Cascading CTEs with filters applied downstream",
             "Expensive joins after filters could be pushed earlier"
-        ]
+        ],
+        "stop_when": [
+            "Filter ratio is weak and baseline runtime is already low",
+            "Target CTE already contains the relevant selective predicate",
+            "Three or more fact tables in a deep CTE chain (join-order lock risk)"
+        ],
     },
     "B": {
         "name": "Decorrelation",
@@ -39,7 +39,12 @@ FAMILY_DESCRIPTIONS = {
             "Correlated subqueries in WHERE clause",
             "Scalar aggregates computed per outer row",
             "DELIM_SCAN in execution plan (indicates correlation)"
-        ]
+        ],
+        "stop_when": [
+            "EXPLAIN already shows a hash semi join on the same correlation key",
+            "Simple EXISTS path already optimized by semi-join",
+            "Outer side is already tiny after early filtering"
+        ],
     },
     "C": {
         "name": "Aggregation Pushdown",
@@ -51,7 +56,12 @@ FAMILY_DESCRIPTIONS = {
             "GROUP BY happens after large joins",
             "GROUP BY keys are subset of join keys",
             "Intermediate result size >> final result size"
-        ]
+        ],
+        "stop_when": [
+            "GROUP BY keys are not compatible with join keys (semantic risk)",
+            "Aggregation includes grouping-sensitive metrics (e.g., STDDEV/VARIANCE)",
+            "Rewrite introduces join duplication before AVG/STDDEV-style aggregates"
+        ],
     },
     "D": {
         "name": "Set Operation Optimization",
@@ -63,7 +73,11 @@ FAMILY_DESCRIPTIONS = {
             "INTERSECT patterns between large sets",
             "UNION ALL with duplicate elimination",
             "Set operations materializing full intermediate results"
-        ]
+        ],
+        "stop_when": [
+            "Both set-operation sides are already small",
+            "Result needs columns from both sides (semi-join rewrite invalid)"
+        ],
     },
     "E": {
         "name": "Materialization / Prefetch",
@@ -75,7 +89,12 @@ FAMILY_DESCRIPTIONS = {
             "Repeated scans of same table with different filters",
             "Dimension filters applied independently multiple times",
             "CTE referenced multiple times with implicit re-evaluation"
-        ]
+        ],
+        "stop_when": [
+            "CTE is single-use and not expensive",
+            "New CTE would be unfiltered (materialize-everything pattern)",
+            "Original source scan would remain alongside replacement (orphan risk)"
+        ],
     },
     "F": {
         "name": "Join Transform",
@@ -87,9 +106,33 @@ FAMILY_DESCRIPTIONS = {
             "Comma-separated joins (implicit cross joins) in FROM clause",
             "Self-joins scanning same table multiple times",
             "Dimension-fact join order suboptimal for predicate pushdown"
-        ]
+        ],
+        "stop_when": [
+            "Tiny join graph where optimizer is already accurate",
+            "EXPLAIN shows good cardinality estimates and stable join shape"
+        ],
     }
 }
+
+
+def _compact_text(value: Any, max_len: int = 220) -> str:
+    """Single-line compact text for prompt payloads."""
+    if value is None:
+        return ""
+    text = " ".join(str(value).strip().split())
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+def _normalize_patch_op_name(op: str) -> str:
+    """Map legacy/composite op labels to supported op vocabulary."""
+    if not op:
+        return op
+    aliases = {
+        "replace_block_with_cte_pair": "insert_cte+replace_from",
+    }
+    return aliases.get(op, op)
 
 
 # ── Build Individual Family Sections ───────────────────────────────────────
@@ -122,51 +165,53 @@ def format_family_section(
     for i, condition in enumerate(desc['use_when'], 1):
         lines.append(f"  {i}. {condition}")
 
+    stop_when = desc.get("stop_when") or []
+    if stop_when:
+        lines.append("**Decision Gates (STOP when):**")
+        for i, condition in enumerate(stop_when, 1):
+            lines.append(f"  {i}. {condition}")
+
     # Gold example ID + speedup (always shown)
     example_name = gold_example.get("id", "example")
     speedup = gold_example.get("verified_speedup", "?")
 
     lines.append("")
     lines.append(f"**Gold Example**: `{example_name}` ({speedup})")
+    transforms = (
+        gold_example.get("transforms")
+        or gold_example.get("transforms_applied")
+        or []
+    )
+    if isinstance(transforms, list) and transforms:
+        lines.append(f"**Canonical transforms**: {', '.join(f'`{t}`' for t in transforms[:4])}")
 
-    # Analyst only sees family description + example ID — workers get the SQL
+    gap_ids = gold_example.get("gap_ids") or []
+    if isinstance(gap_ids, list) and gap_ids:
+        lines.append(f"**Targeted gaps**: {', '.join(f'`{g}`' for g in gap_ids[:3])}")
+
+    insight = (
+        gold_example.get("key_insight")
+        or gold_example.get("principle")
+        or gold_example.get("description")
+        or ""
+    )
+    if insight:
+        lines.append(f"**Pattern**: {_compact_text(insight, max_len=260)}")
+
+    # Analyst and sniper/reasoning use the same compact card; no embedded SQL blobs.
     if analyst_only:
         return "\n".join(lines)
 
-    # Before SQL
-    before_sql = gold_example.get("original_sql", "")
-    if before_sql:
-        lines.append("")
-        lines.append("**BEFORE (slow):**")
-        lines.append(f"```sql\n{before_sql.strip()}\n```")
-
-    # After SQL
-    after_sql = gold_example.get("optimized_sql", "")
-    if after_sql:
-        lines.append("")
-        lines.append("**AFTER (fast):**")
-        lines.append(f"```sql\n{after_sql.strip()}\n```")
-
-    # IR node maps (if enriched)
-    ir_before = gold_example.get("ir_node_map_before")
-    ir_target = gold_example.get("ir_node_map_target")
-    if ir_before and ir_target:
-        lines.append("")
-        lines.append("**IR BEFORE:**")
-        lines.append(f"```\n{ir_before}\n```")
-        lines.append("")
-        lines.append("**IR TARGET:**")
-        lines.append(f"```\n{ir_target}\n```")
-
-    # Patch plan (if available and requested)
     if include_patch_plans:
         patch_plan = gold_example.get("patch_plan")
-        if patch_plan:
-            lines.append("")
-            lines.append("**PATCH PLAN:**")
-            lines.append("```json")
-            lines.append(json.dumps(patch_plan, indent=2))
-            lines.append("```")
+        if isinstance(patch_plan, dict):
+            step_ops = [
+                _normalize_patch_op_name(s.get("op"))
+                for s in patch_plan.get("steps", [])
+                if isinstance(s, dict) and s.get("op")
+            ]
+            if step_ops:
+                lines.append(f"**Patch shape**: {' → '.join(step_ops[:6])}")
 
     return "\n".join(lines)
 
@@ -191,6 +236,12 @@ def format_family_description_only(family_id: str, dialect: str = "") -> str:
     for i, condition in enumerate(desc['use_when'], 1):
         lines.append(f"  {i}. {condition}")
 
+    stop_when = desc.get("stop_when") or []
+    if stop_when:
+        lines.append("**Decision Gates (STOP when):**")
+        for i, condition in enumerate(stop_when, 1):
+            lines.append(f"  {i}. {condition}")
+
     lines.append("")
     lines.append(f"**Gold Example**: None yet observed on {engine_label}. "
                  "Strategy is valid if EXPLAIN evidence supports it.")
@@ -201,18 +252,119 @@ def format_family_description_only(family_id: str, dialect: str = "") -> str:
 # ── Engine Intelligence Loader ─────────────────────────────────────────────
 
 def _load_engine_intelligence(dialect: str) -> Optional[str]:
-    """Load engine playbook for injection into beam prompt.
-
-    Single source of truth: knowledge/{dialect}.md — the distilled playbook
-    with pathologies, gates, regression registry, pruning guide.
-
-    Returns formatted prompt section or None if not available.
-    """
-    algo_text = load_exploit_algorithm(dialect)
-    if not algo_text:
+    """Load structured dialect profile for compact prompt injection."""
+    profile = _load_engine_profile(dialect)
+    if not profile:
         return None
 
-    return f"## Engine Playbook ({dialect.upper()})\n\n{algo_text}"
+    lines = [f"## Dialect Profile ({dialect.upper()})"]
+    briefing = profile.get("briefing_note")
+    if briefing:
+        lines.append("")
+        lines.append(
+            "**Combined Intelligence Baseline**: "
+            + _compact_text(briefing, max_len=320)
+        )
+
+    strengths = profile.get("strengths") or []
+    if strengths:
+        lines.append("")
+        lines.append("### Optimizer Strengths (don't fight these)")
+        for s in strengths[:4]:
+            sid = s.get("id", "?")
+            implication = _compact_text(
+                s.get("implication") or s.get("summary") or "",
+                max_len=180,
+            )
+            if sid == "SEMI_JOIN_EXISTS":
+                implication = (
+                    implication
+                    + " Note: NOT EXISTS anti-join decorrelation can still be valid when replacing large correlated anti patterns."
+                )
+            lines.append(f"- `{sid}`: {implication}")
+
+    gaps = profile.get("gaps") or []
+    if gaps:
+        prio = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+        lines.append("")
+        lines.append("### Known Gaps (exploit these)")
+        for g in sorted(gaps, key=lambda x: prio.get((x.get("priority") or "").upper(), 3))[:5]:
+            gid = g.get("id", "?")
+            priority = (g.get("priority") or "MEDIUM").upper()
+            detect = _compact_text(g.get("detect", ""), max_len=140)
+            opportunity = _compact_text(
+                g.get("opportunity") or g.get("what") or "",
+                max_len=160,
+            )
+            lines.append(
+                f"- `{gid}` [{priority}] detect: {detect} | action: {opportunity}"
+            )
+
+    return "\n".join(lines)
+
+
+def _build_explain_analysis_procedure_section() -> str:
+    return """## EXPLAIN Analysis Procedure
+
+1. **Identify cost spine**: isolate operator chain driving most runtime.
+2. **Classify spine nodes**:
+- SEQ_SCAN: row count + filter selectivity
+- NESTED_LOOP/ANTI: inner re-execution risk
+- AGGREGATE: input/output compression ratio
+- MATERIALIZE: loops × rows amplification
+3. **Trace row flow**: find where rows stay flat then collapse late.
+4. **Count repeated scans**: same table scanned N times with similar joins/filters.
+5. **State bottleneck hypothesis**: optimizer does X; transform Y should help because Z."""
+
+
+def _build_pathology_routing_section() -> str:
+    return """## Pathology Routing + Pruning
+
+### Route by plan symptom
+- Flat rows through CTE chain, late drop -> Family A
+- Nested loop with correlated aggregate -> Family B
+- Aggregate after large join with high compression -> Family C
+- INTERSECT/EXCEPT materialization on large sets -> Family D
+- Repeated scans of same fact subtree -> Family E/C
+- Comma joins + cardinality mismatch -> Family F
+
+### Pruning guide
+- No nested loops -> skip Family B
+- No repeated scans -> skip Family E consolidation paths
+- No GROUP BY -> skip Family C
+- No INTERSECT/EXCEPT -> skip Family D
+- No comma joins -> skip Family F comma-join transforms
+- Very low baseline runtime -> avoid CTE-heavy rewrites"""
+
+
+def _build_regression_registry_section() -> str:
+    return """## Regression Registry
+
+Hard failures to gate against:
+- Materialized simple EXISTS path -> severe regressions (semi-join lost)
+- Same-column OR split to UNION ALL -> regressions on bitmap-or capable plans
+- Orphaned original CTE/table after replacement -> double materialization
+- Unfiltered new CTE -> materialize-everything anti-pattern
+- Over-deep fact-table CTE chains -> join-order lock / parallelism loss"""
+
+
+def _build_aggregation_equivalence_rules_section() -> str:
+    return """## Aggregation Equivalence Rules
+
+- GROUP BY keys must remain compatible with join keys after rewrite.
+- AVG/STDDEV/VARIANCE are duplication-sensitive.
+- FILTER() semantics are group-membership sensitive.
+- When pivoting with CASE/FILTER, preserve discriminator semantics exactly."""
+
+
+def _build_sniper_combination_rules_section() -> str:
+    return """## Combination Rules
+
+- Non-overlapping targets compose cleanly.
+- Overlapping WHERE rewrites must be merged, not applied sequentially.
+- Overlapping FROM rewrites must unify joins without duplicate sources.
+- If two new CTEs overlap strongly, keep the more selective one.
+- Use best-speedup winner as foundation; layer one change at a time."""
 
 
 # ── Shared Prompt Body — Cache-Friendly Order ─────────────────────────────
@@ -236,6 +388,9 @@ def _build_prompt_body(
     role_text: str,
     include_patch_plans: bool = True,
     intelligence_brief: str = "",
+    phase_a_items: Optional[List[str]] = None,
+    phase_b_items: Optional[List[str]] = None,
+    extra_static_sections: Optional[List[str]] = None,
 ) -> tuple[List[str], List[str], int]:
     """Build prompt sections in cache-friendly order.
 
@@ -249,7 +404,31 @@ def _build_prompt_body(
     # ═══ STATIC PREFIX (identical for all queries on same dialect) ═════
 
     # ── Role ───────────────────────────────────────────────────────
+    phase_a_items = phase_a_items or [
+        "Dialect Profile",
+        "Optimization Families",
+        "Task Contract",
+    ]
+    phase_b_items = phase_b_items or [
+        "Query SQL",
+        "Execution Plan",
+        "IR Structure",
+        "Detected Patterns (if available)",
+    ]
+
     static.append(f"## Role\n\n{role_text}")
+    static.append(
+        "## Prompt Map\n\n"
+        "### Phase A — Cached Context\n"
+        + "\n".join(
+            f"A{i}. {item}" for i, item in enumerate(phase_a_items, 1)
+        )
+        + "\n\n"
+        "### Phase B — Query-Specific Input (after cache boundary)\n"
+        + "\n".join(
+            f"B{i}. {item}" for i, item in enumerate(phase_b_items, 1)
+        )
+    )
 
     # ── Engine Intelligence ────────────────────────────────────────
     engine_intel = _load_engine_intelligence(dialect)
@@ -264,15 +443,9 @@ def _build_prompt_body(
 
     analyst_only = not include_patch_plans
     family_intro = (
-        "This is a briefing of what we know, not a set of hard rules. "
-        "Use your judgement about what's worth trying based on the EXPLAIN plan.\n\n"
-        f"**{n_families} families have proven gold examples** on this engine. "
-        f"All 6 families are listed — those without gold examples are still valid "
-        "strategies if the EXPLAIN plan warrants them.\n\n"
-        "Choose the most relevant families for this query based on:\n"
-        "- Query structure (CTEs, subqueries, joins, aggregations, set operations)\n"
-        "- Execution plan signals (WHERE placement, repeated scans, correlated subqueries)\n"
-        "- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)\n"
+        f"{n_families}/6 families have validated gold examples on this dialect. "
+        "Treat these as priors, not hard rules.\n\n"
+        "Prioritize by: EXPLAIN bottleneck, transform precondition fit, and dialect gap match."
     )
     static.append(f"## Optimization Families\n\n{family_intro}\n")
 
@@ -286,6 +459,10 @@ def _build_prompt_body(
         else:
             static.append(format_family_description_only(family_id, dialect))
             static.append("")
+
+    for section in extra_static_sections or []:
+        if section:
+            static.append(section)
 
     # ═══ DYNAMIC SUFFIX (unique per query — cache miss) ═══════════════
 
@@ -354,13 +531,43 @@ def build_reasoning_prompt(
         all_5_examples, dialect, role_text,
         include_patch_plans=True,
         intelligence_brief=intelligence_brief,
+        phase_a_items=[
+            "Dialect Profile",
+            "Optimization Families (with decision gates)",
+            "EXPLAIN Analysis Procedure",
+            "Regression Registry",
+            "Aggregation Equivalence Rules",
+            "Task Contract",
+        ],
+        phase_b_items=[
+            "Query SQL",
+            "Execution Plan",
+            "IR Structure",
+            "Detected Patterns (if available)",
+        ],
+        extra_static_sections=[
+            _build_explain_analysis_procedure_section(),
+            _build_regression_registry_section(),
+            _build_aggregation_equivalence_rules_section(),
+        ],
     )
 
     # Task spec in static prefix (system instructions)
+    static.append("""## Reasoning Process
+
+1. Run EXPLAIN analysis procedure.
+2. Route bottleneck to candidate families.
+3. Apply decision gates and regression checks.
+4. Design 2 plans from different families targeting different bottlenecks.""")
     static.append(_build_patchplan_task_section(n_plans=2))
 
     # Cache boundary
-    static.append("---\n\n## Query to Analyze")
+    static.append(
+        "---\n\n"
+        "## Cache Boundary\n"
+        "Everything below is query-specific input.\n\n"
+        "## Query to Analyze"
+    )
 
     return "\n\n".join(static + dynamic)
 
@@ -394,6 +601,8 @@ def build_worker_patch_prompt(
     hypothesis = target.get("hypothesis", "")
     family = target.get("family", "?")
     transform = target.get("transform", "unknown")
+    node_contract = target.get("node_contract")
+    gates_checked = target.get("gates_checked")
 
     lines = [
         "## Role",
@@ -416,8 +625,42 @@ def build_worker_patch_prompt(
         "Transform this SQL query from its CURRENT IR structure to a TARGET IR structure "
         "using patch operations. Output a single PatchPlan JSON.",
         "",
+        "## Prompt Map",
+        "",
+        "### Phase A — Cached Instructions",
+        "A1. Patch operations",
+        "A2. Verification checklist",
+        "A3. Gold pattern reference",
+        "A4. Output rules",
+        "",
+        "### Phase B — Probe-Specific Input",
+        "B1. Probe assignment",
+        "B2. Original SQL",
+        "B3. Current IR node map",
+        "B4. Target IR",
+        "",
         f"**Family**: {family} — {transform}",
         f"**Hypothesis**: {hypothesis}",
+        "",
+        "## Probe Assignment",
+        "",
+    ])
+
+    if node_contract:
+        lines.extend([
+            "**Node Contract:**",
+            "```json",
+            json.dumps(node_contract, indent=2),
+            "```",
+            "",
+        ])
+    if gates_checked:
+        gate_lines = gates_checked if isinstance(gates_checked, list) else [str(gates_checked)]
+        lines.append("**Gates checked**: " + "; ".join(str(g) for g in gate_lines[:6]))
+        lines.append("")
+
+    lines.extend([
+        "## Cache Boundary",
         "",
         "## Original SQL",
         "",
@@ -442,13 +685,30 @@ def build_worker_patch_prompt(
         "| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |",
         "| delete_expr_subtree | Remove a specific expression | (target only, no payload) |",
         "",
-        "## Gold Patch Example (reference pattern)",
-        "",
-        "```json",
-        json.dumps(gold_patch_plan, indent=2),
-        "```",
+        "## Gold Pattern Reference",
         "",
     ])
+
+    if isinstance(gold_patch_plan, dict):
+        step_ops = [
+            _normalize_patch_op_name(s.get("op"))
+            for s in gold_patch_plan.get("steps", [])
+            if isinstance(s, dict) and s.get("op")
+        ]
+        cte_names = [
+            s.get("payload", {}).get("cte_name")
+            for s in gold_patch_plan.get("steps", [])
+            if isinstance(s, dict)
+            and isinstance(s.get("payload"), dict)
+            and s.get("payload", {}).get("cte_name")
+        ]
+        lines.append(f"- `plan_id`: `{gold_patch_plan.get('plan_id', 'gold')}`")
+        if step_ops:
+            lines.append(f"- `step_ops`: {' -> '.join(step_ops[:8])}")
+        if cte_names:
+            lines.append(f"- `ctes`: {', '.join(f'`{c}`' for c in cte_names[:6])}")
+        lines.append("- Reuse pattern structure, not literal table/column names.")
+        lines.append("")
 
     if dialect_constraints:
         lines.extend([
@@ -460,6 +720,13 @@ def build_worker_patch_prompt(
 
     lines.extend([
         "## Instructions",
+        "",
+        "Verification checklist before output:",
+        "- Every new CTE is filtered (no unbounded materialization).",
+        "- No orphaned CTEs/tables remain after replacement.",
+        "- EXISTS semantics are preserved unless the target explicitly requires anti-join decorrelation.",
+        "- Same-column OR logic is not split to UNION branches.",
+        "- Downstream consumers have all required projected columns.",
         "",
         "Adapt the gold example pattern to match the ORIGINAL SQL above.",
         "Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names "
@@ -605,28 +872,51 @@ def build_beam_sniper_prompt(
         all_5_examples, dialect, role_text,
         include_patch_plans=True,
         intelligence_brief=intelligence_brief,
+        phase_a_items=[
+            "Dialect Profile",
+            "Optimization Families (with decision gates)",
+            "Regression Registry",
+            "Combination Rules",
+            "Task Contract",
+        ],
+        phase_b_items=[
+            "Query SQL",
+            "Original Execution Plan",
+            "IR Structure",
+            "BDA Results (winning SQL + EXPLAIN + patch shape)",
+        ],
+        extra_static_sections=[
+            _build_regression_registry_section(),
+            _build_sniper_combination_rules_section(),
+        ],
     )
 
     # Sniper task in static prefix (system instructions)
     static.append("""## Your Task
 
-The BDA (in the query section below) tells you WHAT WORKS. Design 2 patch plans:
+Use BDA evidence to design exactly 2 refined plans:
 
-1. **Analyze winning strikes**: Compare their EXPLAINs to original —
-   where did row counts drop? Which operators changed? What bottleneck
-   remains?
+1. Rank winners by measured speedup; pick the best as foundation.
+2. Compare winner EXPLAIN vs original to identify remaining bottleneck.
+3. Use failure signals to avoid bad combinations.
+4. Build:
+- Plan 1: refine the best winner.
+- Plan 2: combine two compatible winners (or salvage a failed-but-sound strategy).
 
-2. **Learn from failures**: Which transforms made things worse or broke
-   correctness? What should NOT be combined?
-
-3. **Design 2 patch plans**: Stack winning transforms together or refine
-   the best. If probe p01 pushed a filter and p03 decorrelated, try both
-   in one rewrite.
+BDA data requirements for winner analysis:
+- full rewritten SQL
+- explain summary with operators/rows/timings
+- worker patch shape (ops)
 
 """ + _build_patchplan_task_section(n_plans=2))
 
     # Cache boundary
-    static.append("---\n\n## Query to Analyze")
+    static.append(
+        "---\n\n"
+        "## Cache Boundary\n"
+        "Everything below is query-specific input.\n\n"
+        "## Query to Analyze"
+    )
 
     # ── DYNAMIC: Probe summary ────────────────────────────────────
     n_total = len(strike_results)
@@ -689,66 +979,37 @@ The BDA (in the query section below) tells you WHAT WORKS. Design 2 patch plans:
 # ── Shared PatchPlan Task Section ──────────────────────────────────────────
 
 def _build_patchplan_task_section(n_plans: int = 2) -> str:
-    """Build the shared output format section for PatchPlan JSON.
-
-    Used by build_reasoning_prompt, build_beam_sniper_prompt, and append_shot_results.
-    """
+    """Build shared compact output contract for PatchPlan JSON."""
     return f"""Output exactly **{n_plans} patch plans** as a JSON array.
 
-### Patch Operations
+Required per plan:
+- `plan_id`, `family`, `transform`, `hypothesis`, `target_ir`, `dialect`, `steps`
+- optional: `based_on` (probe IDs used as foundation/combination)
+- `steps[]` item: `step_id`, `op`, `target`, optional `payload`
+- `target.by_node_id` MUST be `"S0"` (use `by_anchor_hash` only when needed)
 
-| Op | Description | Payload |
-|----|-------------|---------|
-| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
-| replace_from | Replace the FROM clause | from_sql |
-| replace_where_predicate | Replace the WHERE clause | expr_sql |
-| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
-| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
-| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+Allowed `op` values:
+- `insert_cte`
+- `replace_from`
+- `replace_where_predicate`
+- `replace_body`
+- `replace_expr_subtree`
+- `delete_expr_subtree`
 
-### Output Format
+Semantic guards (MUST preserve):
+- all WHERE/HAVING/ON logic
+- all literals exactly
+- columns/aliases/ORDER BY/LIMIT
+- row count and semantics
+- no orphaned CTEs or duplicated source scans after replacement
 
-```json
-[
-  {{
-    "plan_id": "r1",
-    "family": "B",
-    "transform": "decorrelate",
-    "hypothesis": "Correlated subquery re-scans store_sales per row...",
-    "target_ir": "S0 [SELECT]\\n  CTE: thresholds (GROUP BY item_sk)...",
-    "dialect": "postgres",
-    "steps": [
-      {{"step_id": "s1", "op": "insert_cte", "target": {{"by_node_id": "S0"}}, "payload": {{"cte_name": "...", "cte_query_sql": "..."}}}},
-      {{"step_id": "s2", "op": "replace_from", "target": {{"by_node_id": "S0"}}, "payload": {{"from_sql": "..."}}}}
-    ]
-  }},
-  {{
-    "plan_id": "r2",
-    "family": "A",
-    "transform": "early_filter",
-    "hypothesis": "Late date filter after full scan...",
-    "target_ir": "...",
-    "dialect": "postgres",
-    "steps": [...]
-  }}
-]
-```
+Rules:
+- output exactly {n_plans} plans
+- each plan must use a different strategy (`family` + `transform`)
+- payload SQL fragments must be complete/executable (no ellipsis)
+- cite EXPLAIN evidence in `hypothesis`
 
-### Semantic Guards (MUST preserve)
-- All WHERE/HAVING/ON conditions preserved exactly
-- All literal values unchanged (35*0.01 stays as 35*0.01, NOT 0.35)
-- Column names, aliases, ORDER BY, and LIMIT exactly
-- Do NOT add new filter conditions
-- Same row count as original query
-
-### Rules
-- Output exactly {n_plans} plans — each targeting a DIFFERENT optimization strategy
-- Each plan must have unique plan_id, family, transform
-- Each step's SQL in payloads must be complete, executable (no ellipsis)
-- Target all steps at by_node_id: "S0" (the main statement)
-- Include hypothesis explaining WHY this optimization should help (cite EXPLAIN evidence)
-
-Output ONLY the JSON array (no markdown fences, no explanation before/after):"""
+Output ONLY JSON array (no markdown, no prose)."""
 
 
 # ── Helper: Load Gold Examples ─────────────────────────────────────────────

@@ -515,6 +515,7 @@ class BeamSession(OptimizationSession):
             build_beam_worker_prompt,
             parse_scout_response,
             _load_gold_example_for_family,
+            _load_gold_example_by_id,
         )
         from ..execution.database_utils import run_explain_analyze
 
@@ -572,9 +573,11 @@ class BeamSession(OptimizationSession):
         if self.on_phase_change:
             self.on_phase_change(phase="analyst", iteration=0)
 
-        analyst_call_fn = self._make_llm_call_fn(
-            getattr(self.pipeline.config, "analyst_model", None)
+        dispatcher_model = (
+            getattr(self.pipeline.config, "wide_dispatcher_model", None)
+            or getattr(self.pipeline.config, "analyst_model", None)
         )
+        analyst_call_fn = self._make_llm_call_fn(dispatcher_model)
 
         dispatcher_prompt = build_beam_dispatcher_prompt(
             query_id=self.query_id,
@@ -605,7 +608,13 @@ class BeamSession(OptimizationSession):
                 n_api_calls=total_api_calls,
             )
 
-        probes = scout_result.probes[:max_probes]
+        probes = sorted(
+            scout_result.probes,
+            key=lambda p: (
+                p.phase if p.phase is not None else 99,
+                -(p.confidence or 0.0),
+            ),
+        )[:max_probes]
         logger.info(
             f"[{self.query_id}] Dispatcher: {len(probes)} probes designed"
         )
@@ -625,9 +634,19 @@ class BeamSession(OptimizationSession):
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
             futures = {}
             for probe in probes:
-                gold_ex = _load_gold_example_for_family(
-                    probe.family, self.dialect
-                )
+                gold_ex = None
+                for ex_id in probe.recommended_examples:
+                    gold_ex = _load_gold_example_by_id(ex_id, self.dialect)
+                    if gold_ex:
+                        break
+                if not gold_ex and probe.gold_example_id:
+                    gold_ex = _load_gold_example_by_id(
+                        probe.gold_example_id, self.dialect
+                    )
+                if not gold_ex:
+                    gold_ex = _load_gold_example_for_family(
+                        probe.family, self.dialect
+                    )
                 gold_patch_plan = gold_ex.get("patch_plan") if gold_ex else None
 
                 worker_prompt = build_beam_worker_prompt(
