@@ -117,12 +117,14 @@ class TieredOrchestrator:
         gold_examples: Dict[str, Dict[str, Any]],
         dialect: str,
         intelligence_brief: str = "",
+        ast_top_match: Optional[Dict[str, Any]] = None,
     ):
         self.analyst_call_fn = analyst_call_fn
         self.worker_call_fn = worker_call_fn
         self.gold_examples = gold_examples
         self.dialect = dialect
         self.intelligence_brief = intelligence_brief
+        self.ast_top_match = ast_top_match  # {transform_id, family, gap, overlap}
 
         # Build lookup: example_id → example JSON (for recommended_examples matching)
         self._example_by_id: Dict[str, Dict[str, Any]] = {}
@@ -178,12 +180,17 @@ class TieredOrchestrator:
         targets: List[AnalystTarget],
         script_ir: Any,
         dialect_enum: Any,
+        force_full_roster: bool = False,
     ) -> Tuple[List["AppliedPatch"], int]:
         """Call workers in parallel (one per target). Apply each patch.
 
         Workers are routed to specialized roles based on target family:
         - W4 "Wildcard": always gets the #1 target (highest relevance)
         - W1 "Reducer" (A/D), W2 "Unnester" (B/C), W3 "Builder" (F/E)
+
+        Args:
+            force_full_roster: If True, create synthetic targets to fill
+                all 4 worker slots when analyst produces fewer than 4.
 
         Returns:
             (patches, n_api_calls) — applied patches + actual LLM call count.
@@ -196,7 +203,7 @@ class TieredOrchestrator:
         api_call_count = [0]  # mutable for thread-safe increment
         api_lock = threading.Lock()
 
-        assignments = self._assign_workers(targets)
+        assignments = self._assign_workers(targets, force_full_roster=force_full_roster)
 
         def process_assignment(
             target: AnalystTarget, worker_role: Dict[str, Any]
@@ -456,26 +463,36 @@ class TieredOrchestrator:
 
     # ── Internal helpers ──────────────────────────────────────────────────
 
+    # Default family + transform for each worker when creating synthetic targets
+    _WORKER_DEFAULTS: Dict[str, Tuple[str, str]] = {
+        "W1": ("A", "early_filter"),
+        "W2": ("B", "decorrelate"),
+        "W3": ("E", "multi_dimension_prefetch"),
+    }
+
     def _assign_workers(
-        self, targets: List[AnalystTarget]
+        self,
+        targets: List[AnalystTarget],
+        force_full_roster: bool = False,
     ) -> List[Tuple[AnalystTarget, Dict[str, Any]]]:
-        """Assign targets to specialized workers via super-family draft.
+        """Assign targets to specialized workers via AST-anchored draft.
 
         Draft algorithm:
-        1. W4 "Wildcard" always gets the #1 target (highest relevance) —
-           deep specialist doubling down on the critical bottleneck.
-        2. Group remaining targets by super-family worker:
+        1. W4 "Wildcard" gets the **AST top match** (guaranteed slot from
+           detection). If no AST match, falls back to analyst's #1 target.
+        2. ALL analyst targets route to family workers W1-W3:
            - W1 "Reducer" (A, D)
            - W2 "Unnester" (B, C)
            - W3 "Builder" (F, E)
         3. If a worker has multiple targets (e.g. both E and F → W3),
-           merge them into a compound target. The worker gets context for
-           ALL targets and gold examples from ALL referenced families.
+           merge them into a compound target.
+        4. If force_full_roster is True and fewer than 4 workers assigned,
+           create synthetic targets for unfilled slots.
 
         Returns:
             List of (target, worker_role) tuples (max 4).
         """
-        if not targets:
+        if not targets and not self.ast_top_match:
             return []
 
         sorted_targets = sorted(
@@ -484,22 +501,77 @@ class TieredOrchestrator:
 
         assignments: List[Tuple[AnalystTarget, Dict[str, Any]]] = []
 
-        # W4 always gets the top target — deep specialist
-        assignments.append((sorted_targets[0], WORKER_ROLES["W4"]))
-        logger.info(
-            f"W4 Wildcard ← {sorted_targets[0].target_id} "
-            f"(family {sorted_targets[0].family}, "
-            f"relevance {sorted_targets[0].relevance_score:.2f})"
-        )
+        # W4 gets the AST top match (guaranteed detection-driven slot)
+        if self.ast_top_match:
+            ast_family = self.ast_top_match["family"]
+            ast_transform = self.ast_top_match["transform_id"]
+            ast_gap = self.ast_top_match.get("gap", "")
 
-        # Group remaining targets by super-family worker
+            # Find gold example for this transform/family
+            family_ex = self.gold_examples.get(ast_family)
+            example_id = family_ex.get("id", ast_transform) if family_ex else ast_transform
+
+            # Check if analyst already produced a target for this exact transform
+            analyst_match = next(
+                (t for t in sorted_targets if t.transform == ast_transform),
+                None,
+            )
+            if analyst_match:
+                # Analyst already covers it — use the analyst's richer target
+                w4_target = analyst_match
+                logger.info(
+                    f"W4 Wildcard ← {w4_target.target_id} "
+                    f"(AST+analyst match: {ast_transform}, "
+                    f"family {ast_family})"
+                )
+                # Exclude matched target from family routing (W4 has it)
+                remaining = [t for t in sorted_targets if t is not analyst_match]
+            else:
+                # Create target from AST detection
+                ref_ir = sorted_targets[0].target_ir if sorted_targets else ""
+                w4_target = AnalystTarget(
+                    target_id="ast_w4",
+                    family=ast_family,
+                    transform=ast_transform,
+                    relevance_score=1.0,
+                    hypothesis=(
+                        f"AST detection: {ast_transform} "
+                        f"({self.ast_top_match['overlap']:.0%} overlap). "
+                        f"Engine gap: {ast_gap}."
+                    ),
+                    target_ir=ref_ir,
+                    recommended_examples=[example_id],
+                )
+                logger.info(
+                    f"W4 Wildcard ← ast_w4 (AST-driven: {ast_transform}, "
+                    f"family {ast_family}, "
+                    f"{self.ast_top_match['overlap']:.0%} overlap)"
+                )
+                # ALL analyst targets go to family workers
+                remaining = sorted_targets
+
+            assignments.append((w4_target, WORKER_ROLES["W4"]))
+        elif sorted_targets:
+            # No AST match — fall back to analyst's #1 target for W4
+            assignments.append((sorted_targets[0], WORKER_ROLES["W4"]))
+            logger.info(
+                f"W4 Wildcard ← {sorted_targets[0].target_id} "
+                f"(analyst #1, family {sorted_targets[0].family}, "
+                f"relevance {sorted_targets[0].relevance_score:.2f})"
+            )
+            remaining = sorted_targets[1:]
+        else:
+            remaining = []
+
+        # Group analyst targets by super-family worker
         worker_groups: Dict[str, List[AnalystTarget]] = {}
-        for target in sorted_targets[1:]:
+        for target in remaining:
             primary_family = target.family.split("+")[0].strip()
             worker_key = FAMILY_TO_WORKER.get(primary_family, "W3")
             worker_groups.setdefault(worker_key, []).append(target)
 
         # Create one assignment per worker group (W1, W2, W3 order)
+        assigned_workers: set = set()
         for worker_key in ["W1", "W2", "W3"]:
             group = worker_groups.get(worker_key)
             if not group:
@@ -511,13 +583,57 @@ class TieredOrchestrator:
                 merged = self._merge_targets(group)
 
             assignments.append((merged, WORKER_ROLES[worker_key]))
+            assigned_workers.add(worker_key)
             logger.info(
                 f"{worker_key} {WORKER_ROLES[worker_key]['name']} ← "
                 f"{merged.target_id} (family {merged.family}, "
                 f"{len(group)} target(s))"
             )
 
+        # Fill empty slots with synthetic targets on first iteration
+        if force_full_roster and len(assignments) < 4:
+            for worker_key in ["W1", "W2", "W3"]:
+                if worker_key in assigned_workers:
+                    continue
+                if len(assignments) >= 4:
+                    break
+                ref = sorted_targets[0] if sorted_targets else w4_target
+                synthetic = self._create_synthetic_target(worker_key, ref)
+                assignments.append((synthetic, WORKER_ROLES[worker_key]))
+                logger.info(
+                    f"{worker_key} {WORKER_ROLES[worker_key]['name']} ← "
+                    f"{synthetic.target_id} (SYNTHETIC, family {synthetic.family})"
+                )
+
         return assignments[:4]
+
+    def _create_synthetic_target(
+        self, worker_key: str, reference_target: AnalystTarget,
+    ) -> AnalystTarget:
+        """Create a fallback target for an unfilled worker slot.
+
+        Uses the worker's default family/transform and borrows IR context
+        from the top analyst target so the worker has structural context.
+        """
+        family, transform = self._WORKER_DEFAULTS.get(worker_key, ("A", "early_filter"))
+        role = WORKER_ROLES[worker_key]
+
+        # Find a gold example ID for this family
+        family_ex = self.gold_examples.get(family)
+        example_id = family_ex.get("id", transform) if family_ex else transform
+
+        return AnalystTarget(
+            target_id=f"syn_{worker_key.lower()}",
+            family=family,
+            transform=transform,
+            relevance_score=0.3,
+            hypothesis=(
+                f"Synthetic target for {role['name']}: {role['focus']}. "
+                f"Apply {transform} patterns to the query."
+            ),
+            target_ir=reference_target.target_ir,
+            recommended_examples=[example_id],
+        )
 
     @staticmethod
     def _merge_targets(targets: List[AnalystTarget]) -> AnalystTarget:

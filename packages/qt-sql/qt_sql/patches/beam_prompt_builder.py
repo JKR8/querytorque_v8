@@ -96,6 +96,7 @@ def format_family_section(
     family_id: str,
     gold_example: Dict[str, Any],
     include_patch_plans: bool = True,
+    analyst_only: bool = False,
 ) -> str:
     """Format a single family section with description + gold example.
 
@@ -103,7 +104,8 @@ def format_family_section(
         family_id: Family letter (A-F).
         gold_example: Gold example dict with original_sql, optimized_sql, ir_*, patch_plan.
         include_patch_plans: If False, omit the PATCH PLAN JSON block.
-            Set False for tiered mode where the analyst doesn't generate patches.
+        analyst_only: If True, only emit family description + example ID.
+            The analyst picks strategies; workers get the full examples.
     """
 
     desc = FAMILY_DESCRIPTIONS[family_id]
@@ -118,12 +120,16 @@ def format_family_section(
     for i, condition in enumerate(desc['use_when'], 1):
         lines.append(f"  {i}. {condition}")
 
-    # Gold example
+    # Gold example ID + speedup (always shown)
     example_name = gold_example.get("id", "example")
     speedup = gold_example.get("verified_speedup", "?")
 
     lines.append("")
     lines.append(f"**Gold Example**: `{example_name}` ({speedup})")
+
+    # Analyst only sees family description + example ID — workers get the SQL
+    if analyst_only:
+        return "\n".join(lines)
 
     # Before SQL
     before_sql = gold_example.get("original_sql", "")
@@ -236,22 +242,33 @@ def _build_prompt_body(
                            if f in all_5_examples and all_5_examples[f].get("patch_plan")]
     n_families = len(families_with_plans)
 
-    example_desc = "gold example" if not include_patch_plans else "gold example patch plan"
-    sections.append(f"""## Optimization Families
-
-Review the {n_families} families below. Each shows a pattern with a {example_desc}.
-
-Choose up to **{min(4, n_families)} most relevant families** for this query based on:
-- Query structure (CTEs, subqueries, joins, aggregations, set operations)
-- Execution plan signals (WHERE placement, repeated scans, correlated subqueries, materializations)
-- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)
-
-""")
+    # In tiered mode the analyst only sees family descriptions + example IDs.
+    # Workers receive the full before/after SQL and patch plans.
+    analyst_only = not include_patch_plans
+    if analyst_only:
+        family_intro = (
+            f"Review the {n_families} families below. Each has a proven gold example.\n\n"
+            f"Choose up to **{min(4, n_families)} most relevant families** for this query based on:\n"
+            "- Query structure (CTEs, subqueries, joins, aggregations, set operations)\n"
+            "- Execution plan signals (WHERE placement, repeated scans, correlated subqueries)\n"
+            "- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)\n"
+        )
+    else:
+        family_intro = (
+            f"Review the {n_families} families below. Each shows a pattern with a gold example patch plan.\n\n"
+            f"Choose up to **{min(4, n_families)} most relevant families** for this query based on:\n"
+            "- Query structure (CTEs, subqueries, joins, aggregations, set operations)\n"
+            "- Execution plan signals (WHERE placement, repeated scans, correlated subqueries, materializations)\n"
+            "- Problem signature (cardinality estimation errors, loops vs sets, filter ordering)\n"
+        )
+    sections.append(f"## Optimization Families\n\n{family_intro}\n")
 
     for family_id in all_family_ids:
         ex = all_5_examples.get(family_id)
         if ex and ex.get("patch_plan"):
-            sections.append(format_family_section(family_id, ex, include_patch_plans))
+            sections.append(format_family_section(
+                family_id, ex, include_patch_plans, analyst_only=analyst_only,
+            ))
             sections.append("")
 
     # ── Section 5a: Detected Patterns (intelligence brief) ────────────
@@ -1032,21 +1049,19 @@ def _build_detailed_iteration_section(
     # ── Execution Plans ──────────────────────────────────────────────
     sections.append("#### Execution Plans\n")
 
-    # Original
-    explain_display = "\n".join(original_explain.split("\n")[:60])
+    # Original (compact rendering already applied upstream)
     sections.append("**Original EXPLAIN:**")
-    sections.append(f"```\n{explain_display}\n```")
+    sections.append(f"```\n{original_explain}\n```")
 
     # Candidate explains
     for p in patches:
         if p.patch_id in explains and explains[p.patch_id]:
             explain_text = explains[p.patch_id]
-            truncated = "\n".join(explain_text.split("\n")[:60])
             speedup_str = f"{p.speedup:.2f}x" if p.speedup is not None else "?"
             sections.append(
                 f"\n**{p.patch_id} (Family {p.family}, {speedup_str} {p.status}) EXPLAIN:**"
             )
-            sections.append(f"```\n{truncated}\n```")
+            sections.append(f"```\n{explain_text}\n```")
 
     # ── Error Details ────────────────────────────────────────────────
     error_patches = [p for p in patches if p.apply_error]

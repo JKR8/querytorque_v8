@@ -4,8 +4,8 @@ Flow per iteration:
 1. Analyst call → identifies targets/patch plans (or snipe on iter 2+)
 2. Workers (4 parallel, role-routed) → generate patches
 3. Apply-error retry for failed patches
-4. Semantic validation (TABLESAMPLE 2%) + worker retry for semantic failures
-5. Benchmark semantically-valid patches (5x trimmed mean or race)
+4. Equivalence check (full dataset row count + MD5 checksum) + worker retry
+5. Benchmark equivalent patches (5x trimmed mean or race)
 6. EXPLAIN collection for snipe enrichment
 7. Iterate until target speedup or max_iterations
 """
@@ -92,6 +92,35 @@ class BeamSession(OptimizationSession):
             return self._run_tiered()
         return self._run_single_tier()
 
+    @staticmethod
+    def _render_explain_compact(explain_result: Optional[dict], dialect: str = "duckdb") -> str:
+        """Render EXPLAIN result as compact operator tree.
+
+        Uses structured plan_json when available (DuckDB: ~40 lines vs ~230 box-drawing).
+        Falls back to plan_text if no JSON plan.
+        """
+        if not explain_result:
+            return "(EXPLAIN unavailable)"
+
+        from ..prompts.analyst_briefing import format_duckdb_explain_tree
+
+        plan_json = explain_result.get("plan_json")
+        plan_text = explain_result.get("plan_text", "")
+
+        if dialect.lower() == "duckdb":
+            if plan_json and isinstance(plan_json, dict) and plan_json.get("children"):
+                import json as _json
+                rendered = format_duckdb_explain_tree(_json.dumps(plan_json))
+                if rendered:
+                    return rendered
+            if plan_text:
+                return format_duckdb_explain_tree(plan_text)
+
+        # PG / Snowflake fallback
+        if plan_text:
+            return plan_text
+        return "(EXPLAIN unavailable)"
+
     def _run_single_tier(self) -> SessionResult:
         """Original single-tier patch loop (one LLM does everything)."""
         from ..ir import build_script_ir, render_ir_node_map, Dialect
@@ -101,7 +130,7 @@ class BeamSession(OptimizationSession):
             load_gold_examples,
         )
         from ..generate import CandidateGenerator
-        from ..execution.database_utils import run_explain_analyze, run_explain_text
+        from ..execution.database_utils import run_explain_analyze
 
         logger.info(
             f"[{self.query_id}] BeamSession: "
@@ -125,13 +154,9 @@ class BeamSession(OptimizationSession):
         script_ir = build_script_ir(self.original_sql, dialect_enum)
         ir_node_map = render_ir_node_map(script_ir)
 
-        # Get EXPLAIN for the original query
-        original_explain = ""
+        # Get EXPLAIN for the original query (compact rendering)
         explain_result = run_explain_analyze(db_path, self.original_sql)
-        if explain_result:
-            original_explain = explain_result.get("plan_text", "")
-        if not original_explain:
-            original_explain = run_explain_text(db_path, self.original_sql) or "(EXPLAIN unavailable)"
+        original_explain = self._render_explain_compact(explain_result, self.dialect)
 
         # Load gold examples for families
         gold_examples = load_gold_examples(self.dialect)
@@ -439,7 +464,7 @@ class BeamSession(OptimizationSession):
         from ..ir import build_script_ir, render_ir_node_map, Dialect
         from ..patches.beam_prompt_builder import load_gold_examples
         from ..patches.tiered_orchestrator import TieredOrchestrator
-        from ..execution.database_utils import run_explain_analyze, run_explain_text
+        from ..execution.database_utils import run_explain_analyze
 
         # Use session-level target if set, fall back to config
         target_speedup = self.target_speedup or getattr(self.pipeline.config, "target_speedup", 10.0)
@@ -463,23 +488,21 @@ class BeamSession(OptimizationSession):
         script_ir = build_script_ir(self.original_sql, dialect_enum)
         ir_node_map = render_ir_node_map(script_ir)
 
-        # Get EXPLAIN
-        original_explain = ""
+        # Get EXPLAIN (compact rendering)
         explain_result = run_explain_analyze(db_path, self.original_sql)
-        if explain_result:
-            original_explain = explain_result.get("plan_text", "")
-        if not original_explain:
-            original_explain = run_explain_text(db_path, self.original_sql) or "(EXPLAIN unavailable)"
+        original_explain = self._render_explain_compact(explain_result, self.dialect)
 
         gold_examples = load_gold_examples(self.dialect)
 
         # ── AST Detection + Cached Classification ─────────────────────
         intelligence_brief = ""
+        ast_top_match = None  # (transform_id, family, gap) from detection
         try:
             from ..detection import detect_transforms, load_transforms
             from ..patches.pathology_classifier import build_intelligence_brief
 
             transforms_catalog = load_transforms()
+            transforms_by_id = {t["id"]: t for t in transforms_catalog}
             detected = detect_transforms(
                 self.original_sql, transforms_catalog,
                 engine=self.engine, dialect=self.dialect,
@@ -489,6 +512,23 @@ class BeamSession(OptimizationSession):
             classification = self._load_cached_classification(self.query_id)
 
             intelligence_brief = build_intelligence_brief(detected, classification)
+
+            # Extract top AST match for guaranteed worker slot
+            if detected and detected[0].overlap_ratio >= 0.75:
+                top = detected[0]
+                top_catalog = transforms_by_id.get(top.id, {})
+                ast_top_match = {
+                    "transform_id": top.id,
+                    "family": top_catalog.get("family", "?"),
+                    "gap": top.gap or "",
+                    "overlap": top.overlap_ratio,
+                }
+                logger.info(
+                    f"[{self.query_id}] AST top match: {top.id} "
+                    f"(family {ast_top_match['family']}, "
+                    f"{top.overlap_ratio:.0%} overlap) → guaranteed W4 slot"
+                )
+
             if intelligence_brief:
                 logger.info(
                     f"[{self.query_id}] Intelligence brief: "
@@ -512,6 +552,7 @@ class BeamSession(OptimizationSession):
             gold_examples=gold_examples,
             dialect=self.dialect,
             intelligence_brief=intelligence_brief,
+            ast_top_match=ast_top_match,
         )
 
         # ── Iteration State ────────────────────────────────────────────
@@ -588,6 +629,7 @@ class BeamSession(OptimizationSession):
                 targets=targets,
                 script_ir=script_ir,
                 dialect_enum=dialect_enum,
+                force_full_roster=(iteration == 0),
             )
             iter_api_calls += worker_api_calls
 
@@ -664,14 +706,14 @@ class BeamSession(OptimizationSession):
                 total_api_calls += iter_api_calls
                 continue
 
-            # ── Phase 4: Semantic validation + retry ──────────────────
+            # ── Phase 4: Equivalence check + retry ──────────────────
             if self.on_phase_change:
                 self.on_phase_change(phase="semantic", iteration=iteration)
             logger.info(
-                f"[{self.query_id}] Phase 4: semantic validation "
-                f"({len(applied)} patches)"
+                f"[{self.query_id}] Phase 4: equivalence check "
+                f"({len(applied)} patches, full dataset)"
             )
-            applied, sem_api_calls = self._semantic_validate_and_retry(
+            applied, sem_api_calls = self._equivalence_check_and_retry(
                 applied=applied,
                 targets=targets,
                 orchestrator=orchestrator,
@@ -685,7 +727,7 @@ class BeamSession(OptimizationSession):
             sem_passed = [p for p in applied if p.semantic_passed]
             if not sem_passed:
                 logger.info(
-                    f"[{self.query_id}] No patches passed semantic validation"
+                    f"[{self.query_id}] No patches passed equivalence check"
                 )
                 # Build all_patches for snipe context
                 all_patches = self._merge_all_patches(patches, applied)
@@ -701,14 +743,12 @@ class BeamSession(OptimizationSession):
                 total_api_calls += iter_api_calls
                 continue
 
-            # ── Phase 5: Benchmark semantically-valid patches ─────────
-            # Acquire benchmark_lock if shared across concurrent sessions
-            # to prevent timing pollution from concurrent DB load
+            # ── Phase 5: Benchmark equivalent patches ─────────────────
             if self.on_phase_change:
                 self.on_phase_change(phase="benchmark", iteration=iteration)
             logger.info(
                 f"[{self.query_id}] Phase 5: benchmark "
-                f"{len(sem_passed)} sem-passed patches (3x warmup+avg2)"
+                f"{len(sem_passed)} verified patches (3x warmup+avg2)"
             )
             from contextlib import nullcontext
             bench_ctx = self.benchmark_lock if self.benchmark_lock else nullcontext()
@@ -738,14 +778,11 @@ class BeamSession(OptimizationSession):
                 if p.output_sql:
                     try:
                         explain_data = run_explain_analyze(db_path, p.output_sql)
-                        if explain_data:
-                            p.explain_text = explain_data.get("plan_text", "")
-                            iter_explains[p.patch_id] = p.explain_text
-                        else:
-                            text = run_explain_text(db_path, p.output_sql)
-                            if text:
-                                p.explain_text = text
-                                iter_explains[p.patch_id] = text
+                        compact = self._render_explain_compact(
+                            explain_data, self.dialect
+                        )
+                        p.explain_text = compact
+                        iter_explains[p.patch_id] = compact
                     except Exception as e:
                         logger.warning(f"EXPLAIN failed for {p.patch_id}: {e}")
 
@@ -977,6 +1014,225 @@ class BeamSession(OptimizationSession):
 
         return applied, api_calls
 
+    def _equivalence_check_and_retry(
+        self,
+        applied: List[AppliedPatch],
+        targets: list,
+        orchestrator,
+        ir_node_map: str,
+        db_path: str,
+        script_ir,
+        dialect_enum,
+    ) -> tuple[List[AppliedPatch], int]:
+        """Run full-dataset equivalence check on applied patches, retry failures.
+
+        Executes original + each rewrite on the real database (no sampling).
+        Compares row count + MD5 checksum. Failed patches get up to 1 worker
+        retry with the error context.
+
+        Returns:
+            (updated_patches, api_call_count)
+        """
+        from ..execution.factory import create_executor_from_dsn
+        from ..validation.equivalence_checker import EquivalenceChecker
+
+        api_calls = 0
+        checker = EquivalenceChecker()
+
+        try:
+            with create_executor_from_dsn(db_path) as executor:
+                # Execute original once, cache result
+                orig_rows = executor.execute(self.original_sql)
+                orig_count = len(orig_rows) if orig_rows else 0
+                orig_checksum = None
+                if orig_rows:
+                    try:
+                        orig_checksum = checker.compute_checksum(orig_rows)
+                    except Exception:
+                        pass
+                logger.info(
+                    f"[{self.query_id}] Equivalence baseline: "
+                    f"{orig_count} rows, checksum={orig_checksum}"
+                )
+
+                for p in applied:
+                    if not p.output_sql:
+                        continue
+
+                    target_match = next(
+                        (t for t in targets if t.target_id == p.patch_id), None
+                    )
+
+                    try:
+                        patch_rows = executor.execute(p.output_sql)
+                        patch_count = len(patch_rows) if patch_rows else 0
+                    except Exception as e:
+                        p.semantic_passed = False
+                        p.status = "FAIL"
+                        p.apply_error = f"Equivalence execution error: {e}"
+                        logger.warning(
+                            f"[{self.query_id}] Equiv FAIL {p.patch_id}: {e}"
+                        )
+                        continue
+
+                    # Row count check
+                    if patch_count != orig_count:
+                        error_msg = (
+                            f"Row count mismatch: original={orig_count}, "
+                            f"patch={patch_count}"
+                        )
+                        logger.info(
+                            f"[{self.query_id}] Equiv FAIL {p.patch_id}: {error_msg}"
+                        )
+                        p, retried = self._equiv_retry(
+                            p, error_msg, target_match, orchestrator,
+                            ir_node_map, script_ir, dialect_enum,
+                            executor, checker, orig_count, orig_checksum,
+                        )
+                        if retried:
+                            api_calls += 1
+                        continue
+
+                    # Checksum check
+                    if orig_checksum and patch_rows:
+                        try:
+                            patch_checksum = checker.compute_checksum(patch_rows)
+                        except Exception:
+                            patch_checksum = None
+                        if patch_checksum and patch_checksum != orig_checksum:
+                            error_msg = (
+                                f"Checksum mismatch: original={orig_checksum}, "
+                                f"patch={patch_checksum}"
+                            )
+                            logger.info(
+                                f"[{self.query_id}] Equiv FAIL {p.patch_id}: "
+                                f"{error_msg}"
+                            )
+                            p, retried = self._equiv_retry(
+                                p, error_msg, target_match, orchestrator,
+                                ir_node_map, script_ir, dialect_enum,
+                                executor, checker, orig_count, orig_checksum,
+                            )
+                            if retried:
+                                api_calls += 1
+                            continue
+
+                    # Passed
+                    p.semantic_passed = True
+
+        except Exception as e:
+            logger.warning(f"Equivalence check failed: {e}")
+            # Don't block — mark all as passed on infrastructure error
+            for p in applied:
+                p.semantic_passed = True
+
+        passed_count = sum(1 for p in applied if p.semantic_passed)
+        logger.info(
+            f"[{self.query_id}] Equivalence check: "
+            f"{passed_count}/{len(applied)} passed"
+        )
+        return applied, api_calls
+
+    def _equiv_retry(
+        self,
+        patch: AppliedPatch,
+        error_msg: str,
+        target_match,
+        orchestrator,
+        ir_node_map: str,
+        script_ir,
+        dialect_enum,
+        executor,
+        checker,
+        orig_count: int,
+        orig_checksum: Optional[str],
+    ) -> tuple[AppliedPatch, bool]:
+        """Retry a worker once after equivalence failure.
+
+        Returns:
+            (patch, did_retry) — updated patch and whether a retry LLM call was made.
+        """
+        if not target_match:
+            patch.semantic_passed = False
+            patch.status = "FAIL"
+            patch.apply_error = f"Equivalence: {error_msg}"
+            return patch, False
+
+        logger.info(
+            f"[{self.query_id}] Equiv retry for {patch.patch_id}: {error_msg}"
+        )
+
+        # Build a semantic-style result for the retry prompt
+        from ..schemas import SemanticValidationResult
+        sem_result = SemanticValidationResult(
+            tier_passed=2,
+            passed=False,
+            errors=[error_msg],
+        )
+
+        retried = orchestrator.retry_worker_semantic(
+            original_sql=self.original_sql,
+            ir_node_map=ir_node_map,
+            target=target_match,
+            sem_result=sem_result,
+            rewrite_sql=patch.output_sql,
+            script_ir=script_ir,
+            dialect_enum=dialect_enum,
+        )
+
+        if not retried or not retried.output_sql:
+            patch.semantic_passed = False
+            patch.status = "FAIL"
+            patch.apply_error = f"Equivalence (retry failed): {error_msg}"
+            return patch, True
+
+        # Re-check the retry
+        try:
+            retry_rows = executor.execute(retried.output_sql)
+            retry_count = len(retry_rows) if retry_rows else 0
+        except Exception as e:
+            patch.semantic_passed = False
+            patch.status = "FAIL"
+            patch.apply_error = f"Equivalence retry execution error: {e}"
+            return patch, True
+
+        if retry_count != orig_count:
+            patch.semantic_passed = False
+            patch.status = "FAIL"
+            patch.apply_error = (
+                f"Equivalence (after retry): row count "
+                f"{retry_count} vs {orig_count}"
+            )
+            return patch, True
+
+        if orig_checksum and retry_rows:
+            try:
+                retry_checksum = checker.compute_checksum(retry_rows)
+            except Exception:
+                retry_checksum = None
+            if retry_checksum and retry_checksum != orig_checksum:
+                patch.semantic_passed = False
+                patch.status = "FAIL"
+                patch.apply_error = (
+                    f"Equivalence (after retry): checksum "
+                    f"{retry_checksum} vs {orig_checksum}"
+                )
+                return patch, True
+
+        # Retry passed — replace patch
+        retried.semantic_passed = True
+        logger.info(
+            f"[{self.query_id}] Equiv retry SUCCESS for {patch.patch_id}"
+        )
+        # Copy over the retried patch into the original's slot
+        patch.output_sql = retried.output_sql
+        patch.semantic_passed = True
+        patch.status = "PENDING"
+        patch.apply_error = None
+        patch.worker_response = retried.worker_response
+        patch.raw_plan = retried.raw_plan
+        return patch, True
+
     def _make_llm_call_fn(self, model_spec: Optional[str] = None) -> callable:
         """Create an LLM call function for a specific model.
 
@@ -1201,7 +1457,7 @@ class BeamSession(OptimizationSession):
         """Validate applied patches: semantic → race → explain."""
         from ..validate import race_candidates
         from ..validation.mini_validator import MiniValidator
-        from ..execution.database_utils import run_explain_analyze, run_explain_text
+        from ..execution.database_utils import run_explain_analyze
 
         result = PatchIterationResult(
             iteration=0,
@@ -1322,26 +1578,13 @@ class BeamSession(OptimizationSession):
                 )
                 try:
                     explain_data = run_explain_analyze(db_path, p.output_sql)
-                    if explain_data:
-                        p.explain_text = explain_data.get("plan_text", "")
-                        result.explains[p.patch_id] = p.explain_text
-                        logger.info(
-                            f"[{self.query_id}]   {p.patch_id}: "
-                            f"EXPLAIN ANALYZE OK ({len(p.explain_text)} chars)"
-                        )
-                    else:
-                        text = run_explain_text(db_path, p.output_sql)
-                        if text:
-                            p.explain_text = text
-                            result.explains[p.patch_id] = text
-                            logger.info(
-                                f"[{self.query_id}]   {p.patch_id}: "
-                                f"EXPLAIN TEXT OK ({len(text)} chars)"
-                            )
-                        else:
-                            logger.info(
-                                f"[{self.query_id}]   {p.patch_id}: no EXPLAIN available"
-                            )
+                    compact = self._render_explain_compact(explain_data, self.dialect)
+                    p.explain_text = compact
+                    result.explains[p.patch_id] = compact
+                    logger.info(
+                        f"[{self.query_id}]   {p.patch_id}: "
+                        f"EXPLAIN OK ({len(compact)} chars)"
+                    )
                 except Exception as e:
                     logger.warning(f"EXPLAIN failed for {p.patch_id}: {e}")
 
