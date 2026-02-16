@@ -29,6 +29,9 @@ TPCDS_PREFIX_MAP = {
     'cs': 'catalog_sales',
     'wr': 'web_returns',
     'ws': 'web_sales',
+    'cp': 'catalog_page',
+    'cc': 'call_center',
+    'web': 'web_site',
     'd': 'date_dim',
     't': 'time_dim',
     'c': 'customer',
@@ -52,14 +55,19 @@ def get_table_from_column(col_name: str) -> str:
     col_lower = col_name.lower()
     if '_' in col_lower:
         prefix = col_lower.split('_')[0]
-        # Check for two-letter prefixes first
+        # Check full prefix first (handles 3-letter like 'web', 'inv')
+        if prefix in TPCDS_PREFIX_MAP:
+            return TPCDS_PREFIX_MAP[prefix]
+        # Then two-letter prefix (handles 'ss', 'sr', 'cs', 'cr', etc.)
         if len(prefix) >= 2:
             two_letter = prefix[:2]
             if two_letter in TPCDS_PREFIX_MAP:
                 return TPCDS_PREFIX_MAP[two_letter]
-        # Then single letter
-        if prefix in TPCDS_PREFIX_MAP:
-            return TPCDS_PREFIX_MAP[prefix]
+        # Then single letter (handles 'd', 'c', 's', etc.)
+        if len(prefix) >= 1:
+            one_letter = prefix[0]
+            if one_letter in TPCDS_PREFIX_MAP:
+                return TPCDS_PREFIX_MAP[one_letter]
     return None
 
 
@@ -103,14 +111,14 @@ class SchemaExtractor:
     def _extract_columns_from_expression(self, expr, tables: Dict, cte_names: Set[str] = None):
         """Recursively extract column references from any expression."""
         cte_names = cte_names or set()
-        
+
         # Build alias map
         alias_map = {}
         for t_name, t_info in tables.items():
             if t_info.get('alias'):
                 alias_map[t_info['alias']] = t_name
             alias_map[t_name] = t_name
-        
+
         # Collect all derived table/CTE aliases in the expression
         derived_aliases = set(cte_names)
         for subq in expr.find_all(exp.Subquery):
@@ -119,13 +127,29 @@ class SchemaExtractor:
         for derived in expr.find_all(exp.DerivedTable):
             if hasattr(derived, 'alias') and derived.alias:
                 derived_aliases.add(derived.alias)
-        
+
+        # Bug 1 fix: Collect output column aliases from CTEs and derived tables
+        # These are NOT base table columns (e.g., d_week_seq1 from Q2 subquery)
+        derived_col_aliases = set()
+        for cte in expr.find_all(exp.CTE):
+            cte_select = cte.find(exp.Select)
+            if cte_select:
+                for sel_col in cte_select.expressions:
+                    if hasattr(sel_col, 'alias') and sel_col.alias:
+                        derived_col_aliases.add(sel_col.alias)
+        for subq in expr.find_all(exp.Subquery):
+            sub_select = subq.find(exp.Select)
+            if sub_select:
+                for sel_col in sub_select.expressions:
+                    if hasattr(sel_col, 'alias') and sel_col.alias:
+                        derived_col_aliases.add(sel_col.alias)
+
         # Find all columns in the expression
         for col in expr.find_all(exp.Column):
             table_name = col.table
             col_name = col.name
             col_lower = col_name.lower()
-            
+
             if table_name:
                 # Column has explicit table reference
                 if table_name in cte_names or table_name in derived_aliases:
@@ -138,7 +162,10 @@ class SchemaExtractor:
                         'nullable': True
                     }
             else:
-                # No table prefix - try TPC-DS naming convention first
+                # No table prefix — skip derived column aliases
+                if col_name in derived_col_aliases:
+                    continue
+                # Try TPC-DS naming convention
                 matched_table = get_table_from_column(col_name)
                 if matched_table and matched_table in tables:
                     if col_name not in tables[matched_table]['columns']:
@@ -147,21 +174,6 @@ class SchemaExtractor:
                             'type': col_type,
                             'nullable': True
                         }
-                else:
-                    # Fallback: column name starts with table name
-                    # e.g., customer_id -> customers table
-                    for t_name in tables:
-                        t_lower = t_name.lower()
-                        # Check if column starts with table name (singular/plural handling)
-                        if col_lower.startswith(t_lower) or col_lower.startswith(t_lower.rstrip('s')):
-                            if col_name not in tables[t_name]['columns']:
-                                col_type = self._infer_column_type(col_name)
-                                tables[t_name]['columns'][col_name] = {
-                                    'type': col_type,
-                                    'nullable': True
-                                }
-                            break
-                    # DO NOT add to all tables - this causes issues with derived table aliases
     
     def _infer_column_type(self, col_name: str) -> str:
         """Infer column type from column name."""
@@ -180,7 +192,9 @@ class SchemaExtractor:
         elif col_lower.endswith('_date') or col_lower.endswith('_dt'):
             return 'DATE'
         elif col_lower in ['d_year', 'd_month', 'd_day', 'd_quarter', 'd_week', 'd_moy', 'd_qoy',
-                           'd_dom', 'd_fy_year', 'd_fy_quarter_seq', 'd_fy_week_seq']:
+                           'd_dom', 'd_dow', 'd_fy_year', 'd_fy_quarter_seq', 'd_fy_week_seq',
+                           'd_week_seq', 'd_month_seq', 'd_quarter_seq',
+                           'd_first_dom', 'd_last_dom', 'd_same_day_ly', 'd_same_day_lq']:
             return 'INTEGER'
         elif col_lower in ['year', 'month', 'moy', 'qoy', 'dom']:
             return 'INTEGER'
@@ -188,12 +202,12 @@ class SchemaExtractor:
         # Numeric columns - be careful not to match date-related columns
         if any(num_col in col_lower for num_col in ['qty', 'quantity', 'number']):
             return 'INTEGER'
-        elif any(num_col in col_lower for num_col in ['amt', 'amount', 'price', 'cost', 'fee', 'tax', 'discount']):
+        elif any(num_col in col_lower for num_col in ['amt', 'amount', 'price', 'cost', 'fee', 'tax', 'discount', 'profit', 'loss']):
             return 'DECIMAL(18,2)'
         # 'sales' and 'revenue' should be numeric, but 'sales_date' should be date (handled above)
         elif col_lower.endswith('sales') or col_lower.endswith('revenue'):
             return 'DECIMAL(18,2)'
-        elif 'count' in col_lower and col_lower not in ['discount']:
+        elif (col_lower == 'count' or col_lower.endswith('_count') or col_lower.startswith('count_')):
             return 'INTEGER'
         
         # String columns
@@ -520,59 +534,198 @@ class SyntheticDataGenerator:
 
 
 class SchemaFromDB:
-    """Extracts full schema from a reference DuckDB database."""
-    
+    """Extracts full schema from a reference database (DuckDB or PostgreSQL).
+
+    When a reference DB is provided, it is the authoritative source for
+    column types and table schemas. AST extraction only identifies which
+    tables are used; the reference DB supplies correct types for ALL columns.
+
+    Supports:
+      - DuckDB file paths (e.g., /path/to/db.duckdb)
+      - PostgreSQL DSNs (e.g., postgres://user:pass@host:port/db)
+    """
+
+    # Map PG types to DuckDB-compatible types for CREATE TABLE
+    PG_TYPE_MAP = {
+        'integer': 'INTEGER',
+        'bigint': 'BIGINT',
+        'smallint': 'SMALLINT',
+        'numeric': 'DECIMAL(18,2)',
+        'real': 'FLOAT',
+        'double precision': 'DOUBLE',
+        'character varying': 'VARCHAR',
+        'character': 'VARCHAR',
+        'text': 'VARCHAR',
+        'boolean': 'BOOLEAN',
+        'date': 'DATE',
+        'timestamp without time zone': 'TIMESTAMP',
+        'timestamp with time zone': 'TIMESTAMPTZ',
+        'time without time zone': 'TIME',
+        'interval': 'INTERVAL',
+        'bytea': 'BLOB',
+    }
+
     def __init__(self, db_path: str):
         self.db_path = db_path
-        
+        self._cache: Dict[str, Dict] = {}
+        self._all_tables: Set[str] = set()
+        self._is_pg = db_path.startswith('postgres://') or db_path.startswith('postgresql://')
+        self._load_all_tables()
+
+    def _pg_connect(self):
+        """Connect to PostgreSQL via psycopg2."""
+        import psycopg2
+        return psycopg2.connect(self.db_path)
+
+    def _load_all_tables(self):
+        """Cache the set of all table names in the reference DB."""
+        if self._is_pg:
+            conn = self._pg_connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT DISTINCT table_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public'"
+                )
+                self._all_tables = {r[0] for r in cur.fetchall()}
+            finally:
+                conn.close()
+        else:
+            conn = duckdb.connect(self.db_path, read_only=True)
+            try:
+                rows = conn.execute(
+                    "SELECT DISTINCT table_name FROM information_schema.columns"
+                ).fetchall()
+                self._all_tables = {r[0] for r in rows}
+            finally:
+                conn.close()
+
+    def _map_pg_type(self, pg_type: str) -> str:
+        """Map a PostgreSQL type name to a DuckDB-compatible type."""
+        return self.PG_TYPE_MAP.get(pg_type.lower(), 'VARCHAR')
+
     def get_table_schema(self, table_name: str) -> Dict:
-        """Get full schema for a table from the reference DB."""
-        conn = duckdb.connect(self.db_path, read_only=True)
-        try:
-            result = conn.execute(f"""
-                SELECT column_name, data_type, is_nullable 
-                FROM information_schema.columns 
-                WHERE table_name = '{table_name}'
-                ORDER BY ordinal_position
-            """).fetchall()
-            
-            columns = {}
-            for col_name, data_type, is_nullable in result:
-                columns[col_name] = {
-                    'type': data_type,
-                    'nullable': is_nullable == 'YES'
-                }
-            
-            return columns
-        finally:
-            conn.close()
+        """Get full schema for a table from the reference DB.
+
+        Returns all columns with their real types. Results are cached.
+        PG types are mapped to DuckDB-compatible types.
+        """
+        if table_name in self._cache:
+            return self._cache[table_name]
+
+        if table_name not in self._all_tables:
+            self._cache[table_name] = {}
+            return {}
+
+        if self._is_pg:
+            conn = self._pg_connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT column_name, data_type, is_nullable, "
+                    "       numeric_precision, numeric_scale, "
+                    "       character_maximum_length "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = %s "
+                    "ORDER BY ordinal_position",
+                    (table_name,)
+                )
+                columns = {}
+                for row in cur.fetchall():
+                    col_name, data_type, is_nullable = row[0], row[1], row[2]
+                    num_prec, num_scale, char_len = row[3], row[4], row[5]
+                    # Build precise DuckDB type from PG metadata
+                    if data_type == 'numeric' and num_prec is not None:
+                        col_type = f'DECIMAL({num_prec},{num_scale or 0})'
+                    elif data_type in ('character varying', 'character') and char_len:
+                        col_type = f'VARCHAR({char_len})'
+                    else:
+                        col_type = self._map_pg_type(data_type)
+                    columns[col_name] = {
+                        'type': col_type,
+                        'nullable': is_nullable == 'YES'
+                    }
+                self._cache[table_name] = columns
+                return columns
+            finally:
+                conn.close()
+        else:
+            conn = duckdb.connect(self.db_path, read_only=True)
+            try:
+                result = conn.execute(f"""
+                    SELECT column_name, data_type, is_nullable
+                    FROM information_schema.columns
+                    WHERE table_name = '{table_name}'
+                    ORDER BY ordinal_position
+                """).fetchall()
+
+                columns = {}
+                for col_name, data_type, is_nullable in result:
+                    columns[col_name] = {
+                        'type': data_type,
+                        'nullable': is_nullable == 'YES'
+                    }
+
+                self._cache[table_name] = columns
+                return columns
+            finally:
+                conn.close()
 
 
 class SyntheticValidator:
     """Main orchestrator for synthetic data validation."""
     
-    def __init__(self, reference_db: str = None):
+    def __init__(self, reference_db: str = None, dialect: str = 'duckdb'):
         self.conn = duckdb.connect(':memory:')
         self.reference_db = reference_db
+        self.dialect = dialect.lower()
         self.schema_extractor = SchemaFromDB(reference_db) if reference_db else None
-        
+
     def validate(self, sql_file: str, target_rows: int = 1000, min_rows: int = None, max_rows: int = None) -> Dict[str, Any]:
         """Run full validation pipeline."""
-        
-        # 1. Read SQL
+
+        # 1. Read SQL — handle multi-statement files (take first statement)
         with open(sql_file, 'r') as f:
-            sql = f.read()
-        
+            raw_sql = f.read()
+
+        # Strip comments and split on ';' to handle multi-statement files
+        statements = [s.strip() for s in raw_sql.split(';') if s.strip()]
+        # Filter out comment-only segments
+        statements = [s for s in statements if not all(
+            line.strip().startswith('--') or not line.strip()
+            for line in s.split('\n')
+        )]
+        sql = statements[0] if statements else raw_sql
+        if len(statements) > 1:
+            print(f"⚠️  Multi-statement file ({len(statements)} statements), validating first")
+
         # Handle row range
         if min_rows is None:
             min_rows = 0  # Allow 0 rows for complex filter queries
         if max_rows is None:
             max_rows = target_rows * 20  # More lenient upper bound
-        
+
         print(f"📄 Input SQL file: {sql_file}")
         print(f"🎯 Target output rows: {target_rows} (range: {min_rows}-{max_rows})")
-        
-        # 2. Extract schema using SQLGlot
+
+        # 1b. Transpile to DuckDB if source dialect differs
+        if self.dialect != 'duckdb':
+            print(f"\n🔄 Transpiling from {self.dialect} to duckdb...")
+            try:
+                transpiled = sqlglot.transpile(sql, read=self.dialect, write='duckdb')
+                sql = '\n'.join(transpiled)
+                print(f"   Transpiled OK ({len(sql)} chars)")
+            except Exception as e:
+                return {
+                    'success': False, 'error': f'Transpile failed: {e}',
+                    'tables_created': [], 'actual_rows': 0,
+                    'min_rows': min_rows, 'max_rows': max_rows,
+                }
+
+        # 1c. Resolve ambiguous column references (ORDER BY without table qualifier)
+        sql = self._resolve_ambiguous_columns(sql)
+
+        # 2. Extract schema using SQLGlot (always parse as duckdb after transpile)
         print("\n🔍 Extracting schema with SQLGlot AST...")
         extractor = SchemaExtractor(sql)
         tables = extractor.extract_tables()
@@ -582,21 +735,28 @@ class SyntheticValidator:
         for t_name, t_info in tables.items():
             print(f"   {t_name}: {list(t_info['columns'].keys())}")
         
-        # 3. Enrich schema from reference DB if available
+        # 3. Override schema from reference DB if available
+        #    Reference DB is authoritative for column types — AST extraction
+        #    only discovers which tables are used in the query.
         print("\n🏗️  Creating schema in DuckDB...")
         if self.schema_extractor:
-            print(f"   Enriching from reference DB: {self.reference_db}")
+            print(f"   Loading real schemas from: {self.reference_db}")
             for table_name in list(tables.keys()):
                 ref_schema = self.schema_extractor.get_table_schema(table_name)
                 if ref_schema:
-                    merged = {k.lower(): v for k, v in ref_schema.items()}
+                    # Start with ALL reference DB columns (complete schema)
+                    merged = {}
+                    for col_name, col_info in ref_schema.items():
+                        merged[col_name] = col_info
+                    # Add any AST-discovered columns not in reference DB
+                    # (e.g., derived columns that only exist in the query)
+                    # Use case-insensitive comparison to avoid duplicates
+                    ref_lower = {k.lower() for k in ref_schema}
                     for col_name, col_info in tables[table_name]['columns'].items():
-                        merged[col_name.lower()] = col_info
+                        if col_name.lower() not in ref_lower:
+                            merged[col_name] = col_info
                     tables[table_name]['columns'] = merged
-                    source = f"merged ({len(tables[table_name]['columns'])} cols)"
-                else:
-                    source = f"query only ({len(tables[table_name]['columns'])} cols)"
-                print(f"   {table_name}: {source}")
+                    print(f"   {table_name}: {len(ref_schema)} cols from reference DB")
         
         self._create_schema(tables)
         
@@ -659,7 +819,33 @@ class SyntheticValidator:
             print(f"   {table_name}: {row_count} rows (fact), FKs: {table_fks}")
             generator.generate_table_data(table_name, schema, row_count, foreign_keys=table_fks)
         
-        # 6. Run query
+        # 6b. Deduplicate columns used by scalar subqueries
+        #     A scalar subquery (used with = comparison) must return exactly 1 row.
+        #     Synthetic data can violate this — deduplicate the relevant columns.
+        scalar_uniques = self._detect_scalar_subquery_uniques(sql, tables)
+        if scalar_uniques:
+            print("\n🔧 Enforcing scalar subquery uniqueness...")
+            for table_name, col_set in scalar_uniques:
+                cols_csv = ', '.join(col_set)
+                try:
+                    self.conn.execute(f"""
+                        CREATE TABLE {table_name}__dedup AS
+                        SELECT * FROM (
+                            SELECT *, ROW_NUMBER() OVER (
+                                PARTITION BY {cols_csv} ORDER BY 1
+                            ) AS __rn FROM {table_name}
+                        ) WHERE __rn = 1
+                    """)
+                    self.conn.execute(f"DROP TABLE {table_name}")
+                    self.conn.execute(f"ALTER TABLE {table_name}__dedup RENAME TO {table_name}")
+                    # Drop the helper column
+                    self.conn.execute(f"ALTER TABLE {table_name} DROP COLUMN __rn")
+                    remaining = self.conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+                    print(f"   {table_name}: deduped on ({cols_csv}), {remaining} rows remain")
+                except Exception as e:
+                    print(f"   {table_name}: dedup failed: {e}")
+
+        # 7. Run query
         print("\n⚡ Running query...")
         try:
             result = self.conn.execute(sql).fetchall()
@@ -707,10 +893,13 @@ class SyntheticValidator:
                 continue
 
             # Build WHERE clause from filter values
+            # Group equality values per column to use IN() instead of AND
             conditions = []
             for col, vals in filter_values[table_name].items():
                 if col not in tables[table_name]['columns']:
                     continue
+                col_type = tables[table_name]['columns'][col]['type']
+                eq_vals = []
                 for val in vals:
                     if isinstance(val, str) and val.startswith('BETWEEN:'):
                         _, low, high = val.split(':', 2)
@@ -719,11 +908,20 @@ class SyntheticValidator:
                         op, v = val.split(':', 1)
                         conditions.append(f"{col} {op} {v}")
                     else:
-                        col_type = tables[table_name]['columns'][col]['type']
-                        if 'INT' in col_type or 'DECIMAL' in col_type:
-                            conditions.append(f"{col} = {val}")
-                        else:
-                            conditions.append(f"{col} = '{val}'")
+                        eq_vals.append(val)
+                # Emit single = or IN() for equality values
+                if len(eq_vals) == 1:
+                    v = eq_vals[0]
+                    if 'INT' in col_type or 'DECIMAL' in col_type:
+                        conditions.append(f"{col} = {v}")
+                    else:
+                        conditions.append(f"{col} = '{v}'")
+                elif len(eq_vals) > 1:
+                    if 'INT' in col_type or 'DECIMAL' in col_type:
+                        in_list = ', '.join(str(v) for v in eq_vals)
+                    else:
+                        in_list = ', '.join(f"'{v}'" for v in eq_vals)
+                    conditions.append(f"{col} IN ({in_list})")
 
             if not conditions:
                 continue
@@ -980,69 +1178,74 @@ class SyntheticValidator:
         return filter_values
 
     def _detect_foreign_keys(self, sql: str, tables: Dict) -> Dict[str, Dict[str, Tuple[str, str]]]:
-        """Detect foreign key relationships from SQL joins using TPC-DS naming conventions."""
+        """Detect foreign key relationships using TPC-DS naming conventions.
+
+        Only adds an FK when the target PK column is verified to exist in the
+        target table's schema. This prevents fabricating columns like
+        ``w_web_site_sk`` that don't actually exist.
+        """
         fk_relationships = {}
-        
+
+        def _target_has_col(target_table: str, pk_col: str) -> bool:
+            """Return True only if target table's schema contains pk_col."""
+            return pk_col in tables.get(target_table, {}).get('columns', {})
+
         for table_name in tables:
             table_fks = {}
             for col_name in tables[table_name]['columns']:
                 col_lower = col_name.lower()
                 if not col_lower.endswith('_sk'):
                     continue
-                
-                # Pattern 1: TPC-DS style - {prefix}_{target}_sk 
-                # e.g., sr_store_sk -> store.s_store_sk, sr_customer_sk -> customer.c_customer_sk
+
+                # Pattern 1: TPC-DS style - {prefix}_{target}_sk
+                # e.g., sr_store_sk -> store.s_store_sk
                 if '_' in col_lower:
                     parts = col_lower.split('_')
                     if len(parts) >= 3:
                         potential_table = '_'.join(parts[1:-1])
                         for known_table in tables:
                             if known_table.lower() == potential_table and known_table != table_name:
+                                # Try to find the actual PK column in the target
                                 pk_prefix = known_table.split('_')[0][0] if '_' in known_table else known_table[0]
                                 pk_col = f"{pk_prefix}_{potential_table}_sk"
-                                table_fks[col_lower] = (known_table, pk_col)
+                                if _target_has_col(known_table, pk_col):
+                                    table_fks[col_lower] = (known_table, pk_col)
+                                elif _target_has_col(known_table, col_name):
+                                    # Fallback: same column name in target
+                                    table_fks[col_lower] = (known_table, col_name)
                                 break
-                
+
                 # Pattern 2: Simple FK - {table}_sk references {table}.{table}_sk
-                # e.g., product_sk -> products.product_sk, customer_sk -> customers.customer_sk
-                if col_lower not in table_fks:  # Not already matched
-                    # Extract potential table name from column
-                    # product_sk -> try products, then product
+                if col_lower not in table_fks:
                     potential_base = col_lower[:-3]  # Remove _sk
                     for known_table in tables:
                         if known_table != table_name:
                             known_lower = known_table.lower()
-                            # Check if column matches table name (singular or plural)
                             if potential_base == known_lower or potential_base == known_lower.rstrip('s'):
-                                # Found match - FK references this table's PK
-                                pk_col = col_name  # Usually same name
-                                table_fks[col_lower] = (known_table, pk_col)
+                                pk_col = col_name  # Same name
+                                if _target_has_col(known_table, pk_col):
+                                    table_fks[col_lower] = (known_table, pk_col)
                                 break
-                
-                # Pattern 3: Complex FK - {prefix}_{context}_{table}_sk 
-                # e.g., wr_returning_customer_sk -> customer, wr_returning_addr_sk -> customer_address
+
+                # Pattern 3: Complex FK - {prefix}_{context}_{table}_sk
+                # e.g., wr_returning_customer_sk -> customer
+                # Only match if we can verify the PK column exists
                 if col_lower not in table_fks:
                     parts = col_lower.split('_')
                     if len(parts) >= 3:
-                        # Try last word before _sk as table name
-                        potential_table = parts[-2]  # e.g., 'customer' in wr_returning_customer_sk
+                        potential_table = parts[-2]
                         for known_table in tables:
                             if known_table != table_name:
                                 known_lower = known_table.lower()
-                                # Match 'customer' to 'customer' or 'customers'
                                 if potential_table == known_lower or potential_table == known_lower.rstrip('s'):
-                                    pk_col = col_name
-                                    table_fks[col_lower] = (known_table, pk_col)
+                                    # Try the FK column name as PK (often same in TPC-DS)
+                                    if _target_has_col(known_table, col_name):
+                                        table_fks[col_lower] = (known_table, col_name)
                                     break
-                                # Also match partial names (e.g., 'addr' to 'customer_address')
-                                if potential_table in known_lower or known_lower in potential_table:
-                                    pk_col = col_name
-                                    table_fks[col_lower] = (known_table, pk_col)
-                                    break
-            
+
             if table_fks:
                 fk_relationships[table_name] = table_fks
-        
+
         return fk_relationships
     
     def _get_table_generation_order(self, tables: Dict, fk_relationships: Dict) -> List[str]:
@@ -1073,6 +1276,150 @@ class SyntheticValidator:
         
         return ordered
     
+    @staticmethod
+    def _resolve_ambiguous_columns(sql: str) -> str:
+        """Resolve ambiguous ORDER BY column references using AST.
+
+        DuckDB is stricter than PG about unqualified column references when the
+        same column appears in multiple FROM sources. This function:
+        1. Finds unqualified columns in ORDER BY
+        2. Looks for the same column name qualified in GROUP BY or SELECT
+        3. Adds the qualifier to make the reference unambiguous
+
+        Returns the fixed SQL string, or the original if no changes needed.
+        """
+        try:
+            parsed = sqlglot.parse_one(sql)
+        except Exception:
+            return sql
+
+        # Find the outermost SELECT (skip CTEs/subqueries)
+        outer_select = parsed.find(exp.Select)
+        if outer_select is None:
+            return sql
+
+        order = parsed.find(exp.Order)
+        if order is None:
+            return sql
+
+        # Build a map: unqualified_col_name -> table qualifier
+        # from GROUP BY and SELECT expressions
+        qualified_map = {}  # col_name -> table_name
+
+        # Check GROUP BY for qualified columns
+        group = parsed.find(exp.Group)
+        if group:
+            for col in group.find_all(exp.Column):
+                if col.table and col.name:
+                    qualified_map[col.name] = col.table
+
+        # Check SELECT for qualified columns (if not in GROUP BY)
+        for sel_expr in outer_select.expressions:
+            for col in sel_expr.find_all(exp.Column):
+                if col.table and col.name and col.name not in qualified_map:
+                    qualified_map[col.name] = col.table
+
+        # Now fix unqualified ORDER BY columns
+        modified = False
+        for col in order.find_all(exp.Column):
+            if not col.table and col.name in qualified_map:
+                col.set('table', exp.to_identifier(qualified_map[col.name]))
+                modified = True
+
+        if modified:
+            return parsed.sql(dialect='duckdb')
+        return sql
+
+    def _detect_scalar_subquery_uniques(self, sql: str, tables: Dict) -> List[Tuple[str, List[str]]]:
+        """Detect scalar subqueries and return (table, filter_cols) pairs.
+
+        Scalar subqueries appear in:
+          - EQ comparisons: col = (SELECT x FROM t WHERE ...)
+          - BETWEEN bounds: col BETWEEN (SELECT ...) AND (SELECT ...)
+          - IN with scalar: d_date IN (SELECT d_date ... WHERE col = (SELECT ...))
+        These MUST return exactly 1 row. We extract the equality-filter
+        columns from each such subquery so the caller can deduplicate.
+        """
+        results = []
+        try:
+            parsed = sqlglot.parse_one(sql)
+        except Exception:
+            return results
+
+        # Build alias map for table resolution
+        alias_map = {}
+        cte_names = set()
+        for cte in parsed.find_all(exp.CTE):
+            cte_names.add(cte.alias)
+        for table in parsed.find_all(exp.Table):
+            if table.name not in cte_names:
+                if table.alias:
+                    alias_map[table.alias] = table.name
+                alias_map[table.name] = table.name
+
+        def _extract_scalar_info(subquery_node):
+            """Extract (table, filter_cols) from a scalar subquery node."""
+            sub = subquery_node.find(exp.Select) if isinstance(subquery_node, exp.Subquery) else subquery_node
+            if sub is None:
+                return None
+            sub_tables = list(sub.find_all(exp.Table))
+            if not sub_tables:
+                return None
+            sub_table = sub_tables[0]
+            real_table = alias_map.get(sub_table.name, sub_table.name)
+            if real_table not in tables:
+                return None
+            sub_where = sub.find(exp.Where)
+            if not sub_where:
+                return None
+            filter_cols = []
+            for sub_eq in sub_where.find_all(exp.EQ):
+                if isinstance(sub_eq.left, exp.Column) and isinstance(sub_eq.right, (exp.Literal, exp.Add, exp.Sub)):
+                    col_table = alias_map.get(sub_eq.left.table, sub_eq.left.table)
+                    if not col_table or col_table == real_table or col_table == sub_table.alias:
+                        col_name = sub_eq.left.name
+                        if col_name in tables[real_table]['columns']:
+                            filter_cols.append(col_name)
+            if filter_cols:
+                return (real_table, filter_cols)
+            return None
+
+        # Collect candidate scalar subquery nodes from all expression types
+        scalar_nodes = []
+        # EQ: col = (SELECT ...)
+        for eq in parsed.find_all(exp.EQ):
+            for side in [eq.left, eq.right]:
+                if isinstance(side, (exp.Subquery, exp.Select)):
+                    scalar_nodes.append(side)
+        # BETWEEN: col BETWEEN (SELECT ...) AND (SELECT ...)
+        for between in parsed.find_all(exp.Between):
+            low = between.args.get('low')
+            high = between.args.get('high')
+            for bound in [low, high]:
+                if isinstance(bound, (exp.Subquery, exp.Select)):
+                    scalar_nodes.append(bound)
+        # Nested: IN (SELECT ... WHERE col = (SELECT ...))
+        for in_expr in parsed.find_all(exp.In):
+            for nested_eq in in_expr.find_all(exp.EQ):
+                for side in [nested_eq.left, nested_eq.right]:
+                    if isinstance(side, (exp.Subquery, exp.Select)):
+                        scalar_nodes.append(side)
+
+        for node in scalar_nodes:
+            info = _extract_scalar_info(node)
+            if info:
+                results.append(info)
+
+        # Deduplicate (same table + same columns)
+        seen = set()
+        unique_results = []
+        for table, cols in results:
+            key = (table, tuple(sorted(cols)))
+            if key not in seen:
+                seen.add(key)
+                unique_results.append((table, cols))
+        return unique_results
+
     def _estimate_row_counts(self, sql: str, tables: Dict, target_rows: int) -> Dict[str, int]:
         """Estimate rows needed per table to get target output rows."""
         parsed = sqlglot.parse_one(sql)
@@ -1139,11 +1486,14 @@ def main():
     parser.add_argument('--max-rows', type=int, default=None,
                         help='Maximum acceptable rows (default: target_rows*10)')
     parser.add_argument('--output', '-o', help='Output results to JSON file')
-    parser.add_argument('--reference-db', help='Reference DuckDB for schema enrichment')
-    
+    parser.add_argument('--reference-db', help='Reference DuckDB for real column types')
+    parser.add_argument('--dialect', default='duckdb',
+                        help='Source SQL dialect (duckdb, postgres, snowflake). '
+                             'Non-DuckDB dialects are transpiled via sqlglot.')
+
     args = parser.parse_args()
-    
-    validator = SyntheticValidator(reference_db=args.reference_db)
+
+    validator = SyntheticValidator(reference_db=args.reference_db, dialect=args.dialect)
     result = validator.validate(args.sql_file, args.target_rows, args.min_rows, args.max_rows)
     
     print("\n" + "="*50)
