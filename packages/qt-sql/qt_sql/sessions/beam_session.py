@@ -1,14 +1,10 @@
-"""Beam optimization session — 2 modes: BEAM (probes + sniper) and REASONING (R1 2-shot).
+"""Beam optimization session — single mode: BEAM (probes + sniper).
 
-BEAM mode pipeline:
+BEAM pipeline:
 1. Dispatcher (R1) → 8-16 independent transform probes
 2. Workers (qwen, parallel) → PatchPlan JSON per probe
 3. Validate (structural + equivalence + benchmark)
 4. R1 Sniper 2-shot → 4 more candidates via cache-hit pattern
-
-REASONING mode pipeline:
-1. R1 Shot 1 → 2 PatchPlans → validate + benchmark
-2. R1 Shot 2 (cache hit) → 2 more PatchPlans → validate + benchmark
 """
 
 from __future__ import annotations
@@ -80,78 +76,21 @@ class PatchIterationResult:
 
 
 class BeamSession(OptimizationSession):
-    """2-mode patch optimization: BEAM (probes + sniper) or REASONING (R1 2-shot)."""
+    """Single-mode patch optimization: BEAM (dispatcher + workers + sniper)."""
 
     def run(self) -> SessionResult:
-        """Execute the beam optimization loop with mode routing.
+        """Execute the single BEAM optimization loop.
 
-        Dispatches to BEAM or REASONING based on beam_mode config.
-        Auto mode routes based on baseline_ms using workload classifier.
+        Legacy `beam_mode` values are ignored; all sessions run BEAM.
         """
-        mode = getattr(self.pipeline.config, "beam_mode", "auto")
-
-        if mode in ("wide", "beam"):
-            logger.info(f"[{self.query_id}] BEAM MODE: BEAM (forced)")
-            return self._run_beam()
-
-        elif mode in ("focused", "reasoning"):
-            logger.info(f"[{self.query_id}] BEAM MODE: REASONING (forced)")
-            return self._run_reasoning()
-
-        elif mode == "auto":
-            # Auto-route: get baseline timing, then classify
-            baseline_ms = self._get_baseline_timing()
-
-            from ..patches.beam_router import classify_workload, BeamMode
-            assignment = classify_workload(
-                {self.query_id: baseline_ms},
-                heavy_threshold_pct=80.0,
-                min_focused_ms=500.0,
+        mode = str(getattr(self.pipeline.config, "beam_mode", "beam") or "beam")
+        if mode not in ("beam", "wide"):
+            logger.info(
+                f"[{self.query_id}] Legacy beam_mode={mode!r} ignored; forcing BEAM"
             )
-            routed = assignment[self.query_id]
-
-            if routed.mode == BeamMode.BEAM:
-                logger.info(
-                    f"[{self.query_id}] AUTO-ROUTED → BEAM "
-                    f"(baseline {baseline_ms:.0f}ms)"
-                )
-                return self._run_beam(baseline_ms)
-            else:
-                logger.info(
-                    f"[{self.query_id}] AUTO-ROUTED → REASONING "
-                    f"(baseline {baseline_ms:.0f}ms)"
-                )
-                return self._run_reasoning(baseline_ms)
-
         else:
-            # Default to beam
-            return self._run_beam()
-
-    def _get_baseline_timing(self) -> float:
-        """Get baseline execution time for auto-routing (milliseconds)."""
-        if hasattr(self, "_cached_baseline_ms"):
-            return self._cached_baseline_ms
-
-        from ..execution.factory import create_executor_from_dsn
-
-        db_path = (
-            self.pipeline.config.benchmark_dsn
-            or self.pipeline.config.db_path_or_dsn
-        )
-
-        try:
-            with create_executor_from_dsn(db_path) as executor:
-                import time as _time
-                t0 = _time.perf_counter()
-                executor.execute(self.original_sql)
-                elapsed_ms = (_time.perf_counter() - t0) * 1000
-        except Exception as e:
-            logger.warning(f"[{self.query_id}] Baseline timing failed: {e}")
-            elapsed_ms = 1000.0  # default to focused
-
-        self._cached_baseline_ms = elapsed_ms
-        logger.info(f"[{self.query_id}] Baseline: {elapsed_ms:.0f}ms")
-        return elapsed_ms
+            logger.info(f"[{self.query_id}] BEAM MODE: BEAM (single mode)")
+        return self._run_beam()
 
     @staticmethod
     def _render_explain_compact(explain_result: Optional[dict], dialect: str = "duckdb") -> str:
@@ -192,148 +131,6 @@ class BeamSession(OptimizationSession):
         if plan_text:
             return plan_text
         return "(EXPLAIN unavailable)"
-
-    # ── REASONING Mode ────────────────────────────────────────────────────
-
-    def _run_reasoning(self, baseline_ms: Optional[float] = None) -> SessionResult:
-        """REASONING mode: R1 2-shot → 4 PatchPlans total.
-
-        Shot 1: R1 with full intelligence → 2 PatchPlans → validate + benchmark
-        Shot 2: same prefix + shot 1 results (cache hit) → 2 more → validate + benchmark
-        Total: 2 API calls, up to 4 candidates.
-        """
-        from ..ir import build_script_ir, render_ir_node_map, Dialect
-        from ..patches.beam_prompt_builder import (
-            build_reasoning_prompt,
-            append_shot_results,
-            load_gold_examples,
-        )
-        from ..execution.database_utils import run_explain_analyze
-
-        logger.info(
-            f"[{self.query_id}] BeamSession REASONING: 2-shot R1"
-        )
-
-        # ── Setup ──────────────────────────────────────────────────────
-        db_path = self.pipeline.config.benchmark_dsn or self.pipeline.config.db_path_or_dsn
-        dialect_upper = self.dialect.upper()
-        dialect_enum = (
-            Dialect[dialect_upper]
-            if dialect_upper in Dialect.__members__
-            else Dialect.POSTGRES
-        )
-
-        session_dir = self._create_session_dir()
-        script_ir = build_script_ir(self.original_sql, dialect_enum)
-        ir_node_map = render_ir_node_map(script_ir)
-
-        explain_result = run_explain_analyze(db_path, self.original_sql)
-        original_explain = self._render_explain_compact(explain_result, self.dialect)
-        gold_examples = load_gold_examples(self.dialect)
-        total_api_calls = 0
-
-        # ── Intelligence Brief ────────────────────────────────────────
-        intelligence_brief = ""
-        try:
-            from ..detection import detect_transforms, load_transforms
-            from ..patches.pathology_classifier import build_intelligence_brief
-
-            transforms_catalog = load_transforms()
-            detected = detect_transforms(
-                self.original_sql, transforms_catalog,
-                engine=self.engine, dialect=self.dialect,
-            )
-            classification = self._load_cached_classification(self.query_id)
-            intelligence_brief = build_intelligence_brief(detected, classification)
-        except Exception as e:
-            logger.warning(f"[{self.query_id}] Intelligence brief failed: {e}")
-
-        # ── R1 LLM call function ──────────────────────────────────────
-        analyst_call_fn = self._make_llm_call_fn(
-            getattr(self.pipeline.config, "analyst_model", None)
-        )
-
-        # ── Shot 1: R1 with full intelligence → 2 PatchPlans ─────────
-        shot1_prompt = build_reasoning_prompt(
-            query_id=self.query_id,
-            original_sql=self.original_sql,
-            explain_text=original_explain,
-            ir_node_map=ir_node_map,
-            all_5_examples=gold_examples,
-            dialect=self.dialect,
-            intelligence_brief=intelligence_brief,
-        )
-
-        self._save_to_disk(session_dir, 0, "reasoning_shot1_prompt", shot1_prompt)
-        shot1_response = analyst_call_fn(shot1_prompt)
-        total_api_calls += 1
-        self._save_to_disk(session_dir, 0, "reasoning_shot1_response", shot1_response)
-
-        # Parse PatchPlan JSON array from R1 response
-        shot1_patches = self._apply_patchplan_array(
-            shot1_response, script_ir, dialect_enum, prefix="r1"
-        )
-        logger.info(
-            f"[{self.query_id}] Shot 1: {len(shot1_patches)} patches applied"
-        )
-
-        # Validate + benchmark shot 1 patches
-        all_patches = list(shot1_patches)
-        self._validate_and_benchmark_patches(all_patches, db_path, session_dir, 0)
-
-        # ── Shot 2: append results, R1 again (cache hit) ─────────────
-        shot2_prompt = append_shot_results(
-            base_prompt=shot1_prompt,
-            patches=all_patches,
-            explains={p.patch_id: p.explain_text or "" for p in all_patches},
-        )
-
-        self._save_to_disk(session_dir, 0, "reasoning_shot2_prompt", shot2_prompt)
-        shot2_response = analyst_call_fn(shot2_prompt)
-        total_api_calls += 1
-        self._save_to_disk(session_dir, 0, "reasoning_shot2_response", shot2_response)
-
-        shot2_patches = self._apply_patchplan_array(
-            shot2_response, script_ir, dialect_enum, prefix="r2"
-        )
-        logger.info(
-            f"[{self.query_id}] Shot 2: {len(shot2_patches)} patches applied"
-        )
-
-        self._validate_and_benchmark_patches(shot2_patches, db_path, session_dir, 1)
-        all_patches.extend(shot2_patches)
-
-        # ── Find best across all 4 candidates ─────────────────────────
-        best_speedup = 0.0
-        best_sql = self.original_sql
-        best_transforms: List[str] = []
-        best_status = "NEUTRAL"
-
-        candidates = [
-            p for p in all_patches
-            if p.speedup is not None and p.speedup >= 1.0 and p.semantic_passed
-        ]
-        if candidates:
-            best_patch = max(candidates, key=lambda p: p.speedup)
-            best_speedup = best_patch.speedup
-            best_sql = best_patch.output_sql or self.original_sql
-            best_transforms = [best_patch.transform]
-            best_status = self._classify_speedup(best_speedup)
-
-        logger.info(
-            f"[{self.query_id}] Reasoning result: {best_speedup:.2f}x ({best_status})"
-        )
-
-        return SessionResult(
-            query_id=self.query_id,
-            mode="beam_reasoning",
-            best_speedup=best_speedup,
-            best_sql=best_sql,
-            original_sql=self.original_sql,
-            best_transforms=best_transforms,
-            status=best_status,
-            n_api_calls=total_api_calls,
-        )
 
     def _apply_patchplan_array(
         self,
@@ -754,8 +551,9 @@ class BeamSession(OptimizationSession):
         # ── Phase 4: R1 Sniper 2-shot ─────────────────────────────────
         sniper_patches: List[AppliedPatch] = []
         winners = [p for p in sem_passed if p.speedup and p.speedup >= 1.05]
+        snipe_rounds = int(getattr(self.pipeline.config, "snipe_rounds", 2) or 0)
 
-        if len(sem_passed) >= 2 and winners:
+        if len(sem_passed) >= 2 and winners and snipe_rounds > 0:
             if self.on_phase_change:
                 self.on_phase_change(phase="snipe", iteration=0)
 
@@ -763,6 +561,20 @@ class BeamSession(OptimizationSession):
                 f"[{self.query_id}] Phase 4: R1 sniper 2-shot "
                 f"({len(winners)} winners, {len(sem_passed)} total)"
             )
+
+            strike_results = [
+                {
+                    "probe_id": p.patch_id,
+                    "transform_id": p.transform,
+                    "family": p.family,
+                    "status": p.status,
+                    "speedup": p.speedup,
+                    "error": p.apply_error,
+                    "explain_text": p.explain_text,
+                    "sql": p.output_sql,
+                }
+                for p in patches
+            ]
 
             # Shot 1: BDA + intelligence → 2 PatchPlans
             sniper_shot1_prompt = build_beam_sniper_prompt(
@@ -773,7 +585,7 @@ class BeamSession(OptimizationSession):
                 all_5_examples=gold_examples,
                 dialect=self.dialect,
                 intelligence_brief=intelligence_brief,
-                probe_patches=patches,
+                strike_results=strike_results,
             )
 
             self._save_to_disk(
@@ -911,17 +723,67 @@ class BeamSession(OptimizationSession):
             Output SQL string, or None if both approaches fail.
         """
         import copy as _copy
-        from ..ir import dict_to_plan, apply_patch_plan, render_sql
+        import json as _json
+        import re as _re
+        from ..ir import dict_to_plan, apply_patch_plan
+
+        def _extract_json_object(text: str) -> Optional[dict]:
+            """Extract one JSON object from raw worker text."""
+            t = text.strip()
+            if t.startswith("{"):
+                try:
+                    obj = _json.loads(t)
+                    return obj if isinstance(obj, dict) else None
+                except Exception:
+                    pass
+
+            m = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", t, _re.DOTALL)
+            if m:
+                try:
+                    obj = _json.loads(m.group(1))
+                    return obj if isinstance(obj, dict) else None
+                except Exception:
+                    pass
+
+            start = t.find("{")
+            if start >= 0:
+                depth = 0
+                for i in range(start, len(t)):
+                    if t[i] == "{":
+                        depth += 1
+                    elif t[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                obj = _json.loads(t[start:i + 1])
+                                return obj if isinstance(obj, dict) else None
+                            except Exception:
+                                break
+            return None
 
         # Try JSON PatchPlan first
         try:
-            from ..patches.beam_patch_validator import _extract_json_object
             plan_data = _extract_json_object(response)
             if plan_data and isinstance(plan_data, dict) and "steps" in plan_data:
+                # Some workers emit a root-level target (e.g., by_node_id)
+                # instead of per-step targets. Normalize that shape.
+                root_target = {}
+                for k in ("by_node_id", "by_label", "by_anchor_hash", "by_path"):
+                    v = plan_data.get(k)
+                    if v is not None:
+                        root_target[k] = v
+                if root_target:
+                    for step in plan_data.get("steps", []):
+                        if isinstance(step, dict) and not step.get("target"):
+                            step["target"] = dict(root_target)
+
+                if not plan_data.get("plan_id"):
+                    plan_data["plan_id"] = "beam_worker_plan"
+
                 plan = dict_to_plan(plan_data)
                 patched_ir = _copy.deepcopy(script_ir)
-                apply_patch_plan(patched_ir, plan)
-                sql = render_sql(patched_ir, dialect_enum)
+                result = apply_patch_plan(patched_ir, plan)
+                sql = result.output_sql if result and result.success else None
                 if sql and sql.strip():
                     return sql.strip()
         except Exception as e:
@@ -940,6 +802,10 @@ class BeamSession(OptimizationSession):
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = "\n".join(lines).strip()
+
+        # Don't treat JSON objects/arrays as SQL fallback.
+        if text.startswith("{") or text.startswith("["):
+            return None
 
         # Basic validation: must contain SELECT
         if "SELECT" in text.upper() and len(text) > 20:
