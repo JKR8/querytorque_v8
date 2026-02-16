@@ -59,6 +59,9 @@ def _register_commands() -> None:
     from .cmd_config_coach import config_coach
     from .cmd_workload import workload
     from .cmd_classify import classify
+    from .cmd_analyze import analyze
+    from .cmd_promote import promote
+    from .cmd_playbook import playbook
 
     main.add_command(status)
     main.add_command(prepare)
@@ -76,6 +79,9 @@ def _register_commands() -> None:
     main.add_command(config_coach)
     main.add_command(workload)
     main.add_command(classify)
+    main.add_command(analyze)
+    main.add_command(promote)
+    main.add_command(playbook)
 
 
 _register_commands()

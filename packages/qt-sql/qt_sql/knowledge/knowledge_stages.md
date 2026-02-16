@@ -8,6 +8,28 @@ How raw experimental data becomes actionable rewrite intelligence.
 > This reduces maintenance burden and eliminates synchronization bugs between
 > intermediate files. The distilled algorithm IS the pathology card now.
 
+## CRITICAL: Beam Pipeline Uses Gold Examples Only
+
+QueryTorque beam **does NOT use blackboards** or trial JSON for product.
+
+**Knowledge Flow:**
+1. **Beam runs** → archived sessions (research only)
+2. **Manual curation** (`qt analyze` + `qt promote`) → gold examples (ONLY product artifact)
+3. **Playbook generation** (`qt playbook`) → from gold examples
+4. **Next beam run** → uses playbook + gold examples
+
+**Legacy Artifacts (Archive Only):**
+- Swarm blackboards (`duckdb_tpcds.json`) — historical research
+- Trial JSON (`trials.jsonl`) — historical research
+- `build_blackboard.py` — legacy tool (NOT used by beam)
+
+**Active Artifacts:**
+- Gold examples (`examples/{dialect}/`) — loaded into prompts
+- Knowledge playbooks (`knowledge/{dialect}.md`) — guide analyst reasoning
+- Engine profiles (`engine_profile_{dialect}.json`) — gap metadata
+
+See **GOLD_EXAMPLE_GUIDE.md** for the complete growth path.
+
 ---
 
 ## Stage 1: Transform & Trial JSON
