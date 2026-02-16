@@ -1732,26 +1732,85 @@ class SyntheticValidator:
         filter_values = {}
         parsed = sqlglot.parse_one(sql)
 
-        # Build alias map
+        # Build alias map (including CTE references for outer predicates)
         alias_map = {}
         cte_names = set()
         for cte in parsed.find_all(exp.CTE):
             cte_names.add(cte.alias)
         for table in parsed.find_all(exp.Table):
-            if table.name not in cte_names:
+            if table.alias:
+                alias_map[table.alias] = table.name
+            alias_map[table.name] = table.name
+
+        # Build best-effort lineage for simple CTE output aliases:
+        # cte_col -> base_table.base_col when projection is direct column alias.
+        cte_lineage: Dict[str, Dict[str, Tuple[str, str]]] = {}
+        for cte in parsed.find_all(exp.CTE):
+            cte_name = cte.alias
+            if not cte_name:
+                continue
+            cte_query = cte.this
+            select = cte_query.find(exp.Select) if cte_query is not None else None
+            if select is None:
+                continue
+
+            local_alias = {}
+            for table in cte_query.find_all(exp.Table):
                 if table.alias:
-                    alias_map[table.alias] = table.name
-                alias_map[table.name] = table.name
+                    local_alias[table.alias] = table.name
+                local_alias[table.name] = table.name
+
+            out_map: Dict[str, Tuple[str, str]] = {}
+            for sel in select.expressions:
+                out_col = getattr(sel, 'alias_or_name', None)
+                src_col_expr = None
+                if isinstance(sel, exp.Alias) and isinstance(sel.this, exp.Column):
+                    src_col_expr = sel.this
+                elif isinstance(sel, exp.Column):
+                    src_col_expr = sel
+                if not out_col or not src_col_expr:
+                    continue
+
+                src_table = local_alias.get(src_col_expr.table, src_col_expr.table)
+                if not src_table or src_table not in tables:
+                    src_table = get_table_for_column(src_col_expr.name, tables)
+                if not src_table or src_table not in tables:
+                    continue
+                src_col = self._resolve_column_name(src_table, src_col_expr.name, tables) or src_col_expr.name
+                out_map[out_col.lower()] = (src_table, src_col)
+
+            if out_map:
+                cte_lineage[cte_name] = out_map
+
+        def _resolve_filter_column(col_expr: exp.Column) -> Optional[Tuple[str, str]]:
+            table_ref = alias_map.get(col_expr.table, col_expr.table)
+            col_name = col_expr.name
+
+            if table_ref in tables:
+                real_col = self._resolve_column_name(table_ref, col_name, tables)
+                if real_col:
+                    return table_ref, real_col
+
+            # Predicate on a CTE output column: map back to base column if known.
+            if table_ref in cte_lineage:
+                mapped = cte_lineage[table_ref].get(col_name.lower())
+                if mapped:
+                    return mapped
+
+            guessed_table = get_table_for_column(col_name, tables)
+            if guessed_table and guessed_table in tables:
+                real_col = self._resolve_column_name(guessed_table, col_name, tables)
+                if real_col:
+                    return guessed_table, real_col
+            return None
 
         for where in parsed.find_all(exp.Where):
             # Equality filters: col = literal
             for eq in where.find_all(exp.EQ):
                 if isinstance(eq.left, exp.Column) and isinstance(eq.right, exp.Literal):
-                    table = alias_map.get(eq.left.table, eq.left.table)
-                    if not table:
-                        table = get_table_for_column(eq.left.name, tables)
-                    if table and table in tables:
-                        col = eq.left.name
+                    resolved = _resolve_filter_column(eq.left)
+                    if resolved:
+                        table, col = resolved
                         val = eq.right.this
                         if table not in filter_values:
                             filter_values[table] = {}
@@ -1762,11 +1821,9 @@ class SyntheticValidator:
             # IN filters: col IN (val1, val2, ...)
             for in_expr in where.find_all(exp.In):
                 if isinstance(in_expr.this, exp.Column):
-                    table = alias_map.get(in_expr.this.table, in_expr.this.table)
-                    if not table:
-                        table = get_table_for_column(in_expr.this.name, tables)
-                    if table and table in tables:
-                        col = in_expr.this.name
+                    resolved = _resolve_filter_column(in_expr.this)
+                    if resolved:
+                        table, col = resolved
                         if table not in filter_values:
                             filter_values[table] = {}
                         if col not in filter_values[table]:
@@ -1778,11 +1835,9 @@ class SyntheticValidator:
             # BETWEEN: col BETWEEN low AND high
             for between in where.find_all(exp.Between):
                 if isinstance(between.this, exp.Column):
-                    table = alias_map.get(between.this.table, between.this.table)
-                    if not table:
-                        table = get_table_for_column(between.this.name, tables)
-                    if table and table in tables:
-                        col = between.this.name
+                    resolved = _resolve_filter_column(between.this)
+                    if resolved:
+                        table, col = resolved
                         low = between.args.get('low')
                         high = between.args.get('high')
                         if isinstance(low, exp.Literal) and isinstance(high, exp.Literal):
@@ -1794,11 +1849,9 @@ class SyntheticValidator:
             for cmp_cls, op in [(exp.GT, '>'), (exp.GTE, '>='), (exp.LT, '<'), (exp.LTE, '<=')]:
                 for cmp in where.find_all(cmp_cls):
                     if isinstance(cmp.left, exp.Column) and isinstance(cmp.right, exp.Literal):
-                        table = alias_map.get(cmp.left.table, cmp.left.table)
-                        if not table:
-                            table = get_table_for_column(cmp.left.name, tables)
-                        if table and table in tables:
-                            col = cmp.left.name
+                        resolved = _resolve_filter_column(cmp.left)
+                        if resolved:
+                            table, col = resolved
                             if table not in filter_values:
                                 filter_values[table] = {}
                             if col not in filter_values[table]:
