@@ -234,20 +234,25 @@ def deduplicate_candidates(
 
     When the same query+transform appears across multiple iterations or sessions,
     keep the one with highest speedup (for wins) or lowest speedup (for regressions).
+
+    Preserves input ordering: returns candidates in the same relative order as
+    their first appearance in the input list.
     """
     best: Dict[str, PromotionCandidate] = {}
+    insertion_order: Dict[str, int] = {}
 
-    for c in candidates:
+    for i, c in enumerate(candidates):
         key = f"{c.query_id}::{c.transform}"
         existing = best.get(key)
         if existing is None:
             best[key] = c
+            insertion_order[key] = i
         elif c.speedup >= 1.0 and c.speedup > existing.speedup:
             best[key] = c  # Better win
         elif c.speedup < 1.0 and c.speedup < existing.speedup:
             best[key] = c  # More severe regression
 
-    return sorted(best.values(), key=lambda c: c.speedup, reverse=True)
+    return [best[k] for k in sorted(insertion_order, key=insertion_order.get)]
 
 
 def candidates_to_json(candidates: List[PromotionCandidate]) -> List[Dict[str, Any]]:
@@ -352,7 +357,7 @@ def format_candidates_report(
 
     for i, c in enumerate(wins, 1):
         stars = _speedup_stars(c.speedup)
-        lines.append(f"  [{i:2d}] {c.query_id} ({c.patch_id}) — {c.speedup:.2f}x{stars}")
+        lines.append(f"  [w{i:d}] {c.query_id} ({c.patch_id}) — {c.speedup:.2f}x{stars}")
         lines.append(f"       Transform: {c.transform} (Family {c.family})")
         lines.append(f"       Original: {c.original_ms:.1f}ms -> Optimized: {c.patch_ms:.1f}ms")
         if c.hypothesis:
@@ -367,7 +372,7 @@ def format_candidates_report(
 
     for i, c in enumerate(regressions, 1):
         severity = _regression_severity(c.speedup)
-        lines.append(f"  [{i:2d}] {c.query_id} ({c.patch_id}) — {c.speedup:.2f}x{severity}")
+        lines.append(f"  [r{i:d}] {c.query_id} ({c.patch_id}) — {c.speedup:.2f}x{severity}")
         lines.append(f"       Transform: {c.transform} (Family {c.family})")
         lines.append(f"       Original: {c.original_ms:.1f}ms -> Optimized: {c.patch_ms:.1f}ms")
         if c.hypothesis:

@@ -166,7 +166,7 @@ def write_gold_example(
     gold: Dict[str, Any],
     examples_dir: Path,
     engine: str,
-    overwrite_if_lower: bool = True,
+    force: bool = False,
 ) -> Optional[Path]:
     """Write gold example JSON to the appropriate directory.
 
@@ -174,10 +174,10 @@ def write_gold_example(
         gold: Gold example dict from create_gold_example().
         examples_dir: Root examples directory (qt_sql/examples/).
         engine: Engine name (duckdb/postgresql/snowflake).
-        overwrite_if_lower: If True, overwrite existing if new speedup is higher.
+        force: If True, overwrite even if existing has higher speedup.
 
     Returns:
-        Path to written file, or None if skipped.
+        Path to written file, or None if skipped (existing has higher speedup).
     """
     subdir = _ENGINE_TO_DIR.get(engine, engine)
     target_dir = examples_dir / subdir
@@ -208,7 +208,7 @@ def write_gold_example(
             new_speedup_str = gold.get("verified_speedup", "0x")
             new_speedup = float(new_speedup_str.rstrip("x"))
 
-            if not is_regression and new_speedup <= existing_speedup and not overwrite_if_lower:
+            if not is_regression and new_speedup <= existing_speedup and not force:
                 logger.info(
                     "Skipping %s — existing has higher speedup (%.2fx vs %.2fx)",
                     filename,

@@ -121,4 +121,4 @@ def analyze(
     console.print("\n[bold]Next steps:[/bold]")
     if not export_path:
         console.print(f"  qt analyze {benchmark} --export candidates.json")
-    console.print(f"  qt promote {benchmark} --from candidates.json --ids 1,2,3")
+    console.print(f"  qt promote {benchmark} --from candidates.json --ids w1,w2,r1")

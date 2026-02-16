@@ -1,25 +1,39 @@
 """qt promote — promote beam candidates to gold examples with human curation.
 
 Usage:
-    qt promote postgres_dsb_76 --from candidates.json --ids 1,2,3
-    qt promote postgres_dsb_76 --from candidates.json --ids 1,2,3 --interactive
+    qt promote postgres_dsb_76 --from candidates.json --ids w1,w2,r1
+    qt promote postgres_dsb_76 --from candidates.json --ids w1,w2,r1 --interactive
+
+IDs use the same prefix notation as the analyze report:
+  w1, w2, ... = win candidates (numbered from analyze output)
+  r1, r2, ... = regression candidates (numbered from analyze output)
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import click
 
 from ._common import console, engine_from_config, resolve_benchmark
 
 
-def _show_candidate_detail(candidate: dict, index: int) -> None:
+# Engine name → canonical dialect for playbook command
+_ENGINE_TO_DIALECT = {
+    "duckdb": "duckdb",
+    "postgresql": "postgresql",
+    "snowflake": "snowflake",
+}
+
+
+def _show_candidate_detail(candidate: dict, label: str) -> None:
     """Display detailed candidate information for review."""
     console.print(f"\n{'=' * 60}")
     console.print(
-        f"[bold cyan]Promoting [{index}]: {candidate['query_id']} "
+        f"[bold cyan]Promoting [{label}]: {candidate['query_id']} "
         f"({candidate['transform']}, {candidate['speedup']:.2f}x)[/bold cyan]"
     )
     console.print(f"{'=' * 60}")
@@ -79,6 +93,32 @@ def _prompt_insights() -> tuple[str, str, str]:
     return key_insight, when_not_to_use, input_slice
 
 
+def _parse_prefixed_ids(ids_str: str) -> List[Tuple[str, int]]:
+    """Parse prefixed IDs like 'w1,w2,r1' into (category, 1-based-index) pairs.
+
+    Accepted formats:
+      w1, w2  — win candidates (1-indexed, matching analyze report)
+      r1, r2  — regression candidates (1-indexed, matching analyze report)
+    """
+    result = []
+    for token in ids_str.split(","):
+        token = token.strip().lower()
+        m = re.match(r"^(w|r)(\d+)$", token)
+        if not m:
+            raise click.BadParameter(
+                f"Invalid ID {token!r}. Use w1,w2,... for wins or r1,r2,... for regressions.",
+                param_hint="'--ids'",
+            )
+        category = "wins" if m.group(1) == "w" else "regressions"
+        index = int(m.group(2))
+        if index < 1:
+            raise click.BadParameter(
+                f"ID {token!r} must be >= 1.", param_hint="'--ids'"
+            )
+        result.append((category, index))
+    return result
+
+
 @click.command()
 @click.argument("benchmark")
 @click.option(
@@ -91,7 +131,7 @@ def _prompt_insights() -> tuple[str, str, str]:
 @click.option(
     "--ids",
     required=True,
-    help="Comma-separated 1-indexed IDs to promote (e.g., 1,2,5).",
+    help="Prefixed IDs to promote: w1,w2 for wins, r1,r2 for regressions.",
 )
 @click.option(
     "--interactive/--no-interactive",
@@ -135,41 +175,47 @@ def promote(
 
     bench_dir = resolve_benchmark(benchmark)
     engine = engine_from_config(bench_dir)
+    dialect = _ENGINE_TO_DIALECT.get(engine, engine)
 
     # Load candidates
     data = json.loads(Path(from_path).read_text(encoding="utf-8"))
-    all_candidates_raw = data.get("wins", []) + data.get("regressions", [])
+    wins_raw = data.get("wins", [])
+    regressions_raw = data.get("regressions", [])
 
-    if not all_candidates_raw:
+    if not wins_raw and not regressions_raw:
         console.print("[bold red]No candidates found in file.[/bold red]")
         raise SystemExit(1)
 
-    # Parse IDs
-    try:
-        selected_ids = [int(x.strip()) for x in ids.split(",")]
-    except ValueError:
-        console.print("[bold red]Invalid --ids format. Use comma-separated numbers.[/bold red]")
-        raise SystemExit(1)
+    # Parse prefixed IDs
+    selected = _parse_prefixed_ids(ids)
 
-    console.print(f"\n[bold cyan]Promoting {len(selected_ids)} candidates from {benchmark}[/bold cyan]")
+    console.print(f"\n[bold cyan]Promoting {len(selected)} candidates from {benchmark}[/bold cyan]")
     console.print(f"  Engine: {engine}")
     console.print(f"  Source: {from_path}")
-    console.print(f"  IDs: {selected_ids}")
+    console.print(f"  Wins available: {len(wins_raw)}, Regressions available: {len(regressions_raw)}")
+    console.print(f"  Selected: {ids}")
 
     promoted = 0
     skipped = 0
 
-    for idx in selected_ids:
-        if idx < 1 or idx > len(all_candidates_raw):
-            console.print(f"[yellow]  Skipping ID {idx} — out of range (1-{len(all_candidates_raw)})[/yellow]")
+    for category, idx in selected:
+        pool = wins_raw if category == "wins" else regressions_raw
+        prefix = "w" if category == "wins" else "r"
+        label = f"{prefix}{idx}"
+
+        if idx < 1 or idx > len(pool):
+            console.print(
+                f"[yellow]  Skipping {label} — out of range "
+                f"(1-{len(pool)} in {category})[/yellow]"
+            )
             skipped += 1
             continue
 
-        candidate_raw = all_candidates_raw[idx - 1]
+        candidate_raw = pool[idx - 1]
         candidates = candidates_from_json([candidate_raw])
         candidate = candidates[0]
 
-        _show_candidate_detail(candidate_raw, idx)
+        _show_candidate_detail(candidate_raw, label)
 
         # Get human insights
         if interactive and not (key_insight and when_not_to_use and input_slice):
@@ -203,5 +249,5 @@ def promote(
 
     if promoted > 0:
         console.print("\n[bold]Next steps:[/bold]")
-        console.print("  qt index               # Rebuild tag index")
-        console.print(f"  qt playbook {benchmark}  # Regenerate playbook")
+        console.print("  qt index                  # Rebuild tag index")
+        console.print(f"  qt playbook {dialect}  # Regenerate playbook")
