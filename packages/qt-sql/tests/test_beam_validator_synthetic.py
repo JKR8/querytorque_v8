@@ -147,6 +147,20 @@ class TestTableInferenceHelpers:
         )
         assert table is None
 
+    def test_find_primary_key_prefers_table_key_and_avoids_fact_fk_guess(self):
+        from qt_sql.validation.synthetic_validator import find_primary_key_column
+
+        assert find_primary_key_column(
+            "customer",
+            ["c_customer_sk", "c_customer_id", "c_current_cdemo_sk"],
+        ) == "c_customer_sk"
+        # Fact-like table with multiple equally plausible *_sk columns should
+        # not force an arbitrary synthetic PK.
+        assert find_primary_key_column(
+            "store_returns",
+            ["sr_item_sk", "sr_customer_sk", "sr_store_sk", "sr_reason_sk"],
+        ) is None
+
 
 class TestTypeSimilarityMapping:
     """Vector-style lexical mapping for type inference fallback."""
@@ -234,6 +248,85 @@ class TestSyntheticGenerationRobustness:
         used_fks = {r[0] for r in conn.execute("SELECT DISTINCT customer_id FROM orders").fetchall()}
         assert used_fks.issubset({1, 2, 3})
 
+    def test_sibling_fact_tables_share_fk_anchor_overlap(self):
+        from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        conn.execute("CREATE TABLE item (i_item_sk INTEGER, i_category VARCHAR)")
+        conn.execute("CREATE TABLE store_returns (sr_item_sk INTEGER, sr_qty INTEGER)")
+        conn.execute("CREATE TABLE web_returns (wr_item_sk INTEGER, wr_qty INTEGER)")
+
+        item_schema = {
+            "columns": {
+                "i_item_sk": {"type": "INTEGER", "nullable": False},
+                "i_category": {"type": "VARCHAR(20)", "nullable": True},
+            },
+            "key": "i_item_sk",
+        }
+        sr_schema = {
+            "columns": {
+                "sr_item_sk": {"type": "INTEGER", "nullable": False},
+                "sr_qty": {"type": "INTEGER", "nullable": True},
+            },
+            "key": "sr_item_sk",
+        }
+        wr_schema = {
+            "columns": {
+                "wr_item_sk": {"type": "INTEGER", "nullable": False},
+                "wr_qty": {"type": "INTEGER", "nullable": True},
+            },
+            "key": "wr_item_sk",
+        }
+
+        gen = SyntheticDataGenerator(conn)
+        gen.generate_table_data("item", item_schema, row_count=100)
+        gen.filter_matched_values["item"] = list(range(1, 41))
+
+        gen.generate_table_data(
+            "store_returns",
+            sr_schema,
+            row_count=80,
+            foreign_keys={"sr_item_sk": ("item", "i_item_sk")},
+        )
+        gen.generate_table_data(
+            "web_returns",
+            wr_schema,
+            row_count=80,
+            foreign_keys={"wr_item_sk": ("item", "i_item_sk")},
+        )
+
+        sr_items = {r[0] for r in conn.execute("SELECT DISTINCT sr_item_sk FROM store_returns").fetchall()}
+        wr_items = {r[0] for r in conn.execute("SELECT DISTINCT wr_item_sk FROM web_returns").fetchall()}
+        overlap = sr_items & wr_items
+
+        assert overlap
+        assert len(overlap) >= 8
+        assert sr_items.issubset(set(range(1, 41)))
+        assert wr_items.issubset(set(range(1, 41)))
+
+    def test_temporal_dim_fk_avoids_anchor_lockstep(self):
+        from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        gen = SyntheticDataGenerator(conn)
+        gen.filter_matched_values["date_dim"] = [1, 2, 3]
+
+        vals = [
+            gen._generate_value(
+                "sold_date_sk",
+                "INTEGER",
+                row_idx=i,
+                total_rows=50,
+                foreign_keys={"sold_date_sk": ("date_dim", "d_date_sk")},
+                table_name="catalog_sales",
+            )
+            for i in range(3)
+        ]
+
+        # Random choices from seeded RNG are stable and should not mirror
+        # deterministic row_idx-based anchor cycling [1, 2, 3].
+        assert vals != [1, 2, 3]
+
     def test_non_pk_surrogate_like_columns_are_not_forced_sequential(self):
         from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
 
@@ -261,6 +354,40 @@ class TestSyntheticGenerationRobustness:
         # not a forced 1..N sequence tied to row index.
         distinct_reason = conn.execute("SELECT COUNT(DISTINCT sr_reason_sk) FROM store_returns").fetchone()[0]
         assert distinct_reason < 120
+
+    def test_numeric_date_sk_not_generated_as_date_string(self):
+        from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        gen = SyntheticDataGenerator(conn)
+        v = gen._generate_value(
+            "c_first_sales_date_sk",
+            "INTEGER",
+            row_idx=0,
+            total_rows=120,
+            table_name="customer",
+            primary_key_col="c_customer_sk",
+        )
+        assert isinstance(v, int)
+
+    def test_date_dim_week_seq_is_calendar_consistent(self):
+        from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        gen = SyntheticDataGenerator(conn)
+        # First 7 days should map to week 1, day 8 -> week 2.
+        vals = [
+            gen._generate_value(
+                "d_week_seq",
+                "INTEGER",
+                row_idx=i,
+                total_rows=100,
+                table_name="date_dim",
+            )
+            for i in range(8)
+        ]
+        assert vals[:7] == [1] * 7
+        assert vals[7] == 2
 
     def test_filter_literal_injection_between_and_in(self, monkeypatch):
         from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
@@ -417,6 +544,31 @@ class TestConstraintGraphPropagation:
 
         v._reverse_propagate_parent_key_matches(gen, "child", tables, fk_relationships, filter_values)
         assert gen.filter_matched_values["parent"] == [2, 3]
+
+    def test_extract_filters_maps_simple_cte_alias_back_to_base_column(self):
+        from qt_sql.validation.synthetic_validator import SyntheticValidator
+
+        v = SyntheticValidator(reference_db=None, dialect="duckdb")
+        sql = """
+            WITH x AS (
+                SELECT sr_reason_sk AS ctr_reason_sk
+                FROM store_returns
+            )
+            SELECT *
+            FROM x
+            WHERE x.ctr_reason_sk BETWEEN 43 AND 46
+        """
+        tables = {
+            "store_returns": {
+                "columns": {
+                    "sr_reason_sk": {"type": "INTEGER", "nullable": True},
+                }
+            }
+        }
+
+        filters = v._extract_filter_values(sql, tables)
+        assert "store_returns" in filters
+        assert filters["store_returns"]["sr_reason_sk"] == ["BETWEEN:43:46"]
 
     def test_varchar_id_generation_uses_generic_table_prefix(self):
         from qt_sql.validation.synthetic_validator import SyntheticDataGenerator

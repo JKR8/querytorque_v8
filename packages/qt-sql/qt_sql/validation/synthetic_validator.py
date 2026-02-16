@@ -257,31 +257,64 @@ def find_primary_key_column(table_name: str, column_names: List[str]) -> Optiona
 
     lower_to_original = {c.lower(): c for c in column_names}
     table_variants = _table_name_variants(table_name)
+    table_tokens = [t for t in table_name.lower().split('_') if t]
+    last_token = _singularize(table_tokens[-1]) if table_tokens else table_name.lower()
+    table_lower = table_name.lower()
+    singular_table = _singularize(table_lower)
+    abbrev = _table_abbreviation(table_name)
 
-    # Strongest signal: table-specific surrogate/natural key.
-    for variant in sorted(table_variants, key=len, reverse=True):
-        for suffix in ('_sk', '_id'):
-            candidate = f'{variant}{suffix}'
-            if candidate in lower_to_original:
-                return lower_to_original[candidate]
+    # First pass: exact canonical names.
+    exact_candidates = [
+        f"{table_lower}_sk",
+        f"{singular_table}_sk",
+        f"{table_lower}_id",
+        f"{singular_table}_id",
+    ]
+    for candidate in exact_candidates:
+        if candidate in lower_to_original:
+            return lower_to_original[candidate]
 
-    # Common warehouse pattern: prefixed table key (e.g., c_customer_sk).
-    for col_lower, col in lower_to_original.items():
-        for variant in table_variants:
-            if col_lower.endswith(f'_{variant}_sk') or col_lower.endswith(f'_{variant}_id'):
-                return col
+    key_candidates = [
+        c for c in lower_to_original
+        if c.endswith('_sk') or c.endswith('_id') or c == 'id'
+    ]
+    if not key_candidates:
+        return None
 
-    # Generic fallback.
-    for col_lower, col in lower_to_original.items():
+    def _score(col_lower: str) -> int:
+        score = 0
+        if col_lower == 'id':
+            score += 4
         if col_lower.endswith('_sk'):
-            return col
-    for col_lower, col in lower_to_original.items():
-        if col_lower.endswith('_id'):
-            return col
-    if 'id' in lower_to_original:
-        return lower_to_original['id']
+            score += 2
+        if col_lower.endswith(f'_{last_token}_sk') or col_lower.endswith(f'_{last_token}_id'):
+            score += 8
+        if 'date' in table_tokens and col_lower.endswith('_date_sk'):
+            score += 6
+        if abbrev and col_lower.startswith(f'{abbrev}_'):
+            score += 3
+        if 'date' in col_lower or 'time' in col_lower:
+            score -= 2
+        return score
 
-    return None
+    ranked = sorted(
+        [(_score(c), c) for c in key_candidates],
+        key=lambda x: (x[0], len(x[1])),
+        reverse=True,
+    )
+    best_score = ranked[0][0]
+    best = [c for s, c in ranked if s == best_score]
+
+    # Ambiguous table with many similarly plausible keys (common in fact tables):
+    # avoid forcing a single synthetic PK.
+    if len(best) > 1:
+        return None
+
+    chosen = best[0]
+    # Weak-signal fallback only if this table has exactly one key-like column.
+    if best_score <= 0 and len(key_candidates) > 1:
+        return None
+    return lower_to_original[chosen]
 
 
 class SchemaExtractor:
@@ -449,6 +482,7 @@ class SyntheticDataGenerator:
         self.all_schemas = all_schemas or {}
         self.foreign_key_values = {}  # Store FK values for referential integrity
         self.filter_matched_values = {}  # Store PK values that match common filters
+        self.fk_anchor_values = {}  # Stable FK subsets to improve multi-fact overlap
         
     def generate_table_data(self, table_name: str, schema: Dict, row_count: int = 1000, 
                            foreign_keys: Dict = None):
@@ -630,7 +664,23 @@ class SyntheticDataGenerator:
             target_table, target_col = fk_target
             # Prefer filter-matched values if available
             if target_table in self.filter_matched_values and self.filter_matched_values[target_table]:
-                return self.random.choice(self.filter_matched_values[target_table])
+                candidates = self.filter_matched_values[target_table]
+                target_lower = target_table.lower()
+                is_temporal_dim = (
+                    target_lower in {'date_dim', 'time_dim'}
+                    or ('date' in target_lower and target_lower.endswith('_dim'))
+                    or ('time' in target_lower and target_lower.endswith('_dim'))
+                )
+                if is_temporal_dim:
+                    return self.random.choice(candidates)
+
+                anchors = self.fk_anchor_values.get(target_table)
+                if not anchors:
+                    uniq = list(dict.fromkeys(candidates))
+                    anchor_size = max(8, min(64, len(uniq)))
+                    anchors = uniq[:anchor_size]
+                    self.fk_anchor_values[target_table] = anchors
+                return anchors[row_idx % len(anchors)]
             elif target_table in self.foreign_key_values:
                 fk_vals = self.foreign_key_values[target_table]
                 if fk_vals:
@@ -648,7 +698,30 @@ class SyntheticDataGenerator:
             else:
                 val = row_idx + 1
             return val
-        
+
+        # Keep date_dim attributes internally consistent so self-joins on week/
+        # month/quarter sequences have realistic hit rates.
+        if table_name and table_name.lower() == 'date_dim':
+            base_date = datetime(1990, 1, 1) + timedelta(days=(row_idx % (365 * 40)))
+            if col_name_lower in {'d_date'} or col_name_lower.endswith('_date'):
+                return base_date.strftime('%Y-%m-%d')
+            if col_name_lower in {'d_year', 'd_fy_year'}:
+                return base_date.year
+            if col_name_lower in {'d_month', 'd_moy'}:
+                return base_date.month
+            if col_name_lower in {'d_day', 'd_dom'}:
+                return base_date.day
+            if col_name_lower in {'d_quarter', 'd_qoy'}:
+                return ((base_date.month - 1) // 3) + 1
+            if col_name_lower in {'d_week_seq', 'd_fy_week_seq'}:
+                return 1 + (row_idx // 7)
+            if col_name_lower == 'd_month_seq':
+                return 1 + (base_date.year - 1990) * 12 + (base_date.month - 1)
+            if col_name_lower in {'d_quarter_seq', 'd_fy_quarter_seq'}:
+                return 1 + (base_date.year - 1990) * 4 + ((base_date.month - 1) // 3)
+            if col_name_lower == 'd_dow':
+                return ((base_date.weekday() + 1) % 7) + 1
+
         # Date/time-like columns
         if col_name_lower in {'d_date', 'date'}:
             base_date = datetime(2000, 1, 1)
@@ -662,6 +735,17 @@ class SyntheticDataGenerator:
             return 1 + (row_idx % 28)
         elif col_name_lower in {'d_quarter', 'd_qoy', 'quarter', 'qoy'} or col_name_lower.endswith('_quarter'):
             return 1 + (row_idx % 4)
+        elif is_numeric_type and (
+            col_name_lower.endswith('_date_sk')
+            or col_name_lower.endswith('_time_sk')
+            or col_name_lower.endswith('_date_id')
+            or col_name_lower.endswith('_time_id')
+        ):
+            key_domain = max(50, min(1000, max(10, total_rows // 4)))
+            if decimal_info:
+                max_val = 10 ** (decimal_info['precision'] - decimal_info['scale']) - 1
+                return self.random.randint(1, min(key_domain, max_val))
+            return self.random.randint(1, key_domain)
         elif 'date' in col_name_lower or col_type == 'DATE':
             base_date = datetime(2000, 1, 1)
             offset = row_idx % (365 * 25)
@@ -686,7 +770,8 @@ class SyntheticDataGenerator:
                     val = self.random.uniform(0, min(100, max_val))
                     return round(val, scale)
                 elif col_name_lower.endswith('_sk') or col_name_lower.endswith('_id'):
-                    return self.random.randint(1, min(total_rows, max_val))
+                    key_domain = max(50, min(1000, max(10, total_rows // 4)))
+                    return self.random.randint(1, min(key_domain, max_val))
                 else:
                     return self.random.randint(1, max(10, max_val // 10))
             
@@ -700,7 +785,8 @@ class SyntheticDataGenerator:
             elif 'fee' in col_name_lower or 'tax' in col_name_lower:
                 return round(self.random.uniform(0.0, 100.0), 2)
             elif col_name_lower.endswith('_sk') or col_name_lower.endswith('_id'):
-                return self.random.randint(1, min(total_rows, 5000))
+                key_domain = max(50, min(1000, max(10, total_rows // 4)))
+                return self.random.randint(1, key_domain)
             else:
                 return self.random.randint(1, 100000)
         
