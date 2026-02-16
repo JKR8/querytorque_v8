@@ -147,3 +147,62 @@ class TestPatchGateValidatorSemantics:
         # Error should contain specifics about the mismatch
         assert gate.error is not None
         assert len(gate.error) > 10  # Not a generic "failed" message
+
+
+# ── DSN handling tests ──────────────────────────────────────────────────────
+
+class TestDSNHandling:
+    """Test that various DSN schemes don't crash init."""
+
+    def test_duckdb_uri_memory(self):
+        """duckdb:///:memory: should not crash PatchGateValidator."""
+        from qt_sql.patches.beam_patch_validator import PatchGateValidator
+        from unittest.mock import MagicMock
+        gv = PatchGateValidator(dialect='duckdb', dsn='duckdb:///:memory:', executor=MagicMock())
+        gate = gv.validate_semantics("SELECT 1 AS x", "SELECT 1 AS x")
+        assert gate.gate_name == "SEMANTIC_MATCH"
+        assert gate.passed is True
+
+    def test_duckdb_uri_with_path(self):
+        """duckdb:///some/path should init without crashing (no file needed for synthetic)."""
+        from qt_sql.validation.synthetic_validator import SyntheticValidator, SchemaFromDB
+        # SchemaFromDB.supports_dsn should accept duckdb:// URIs
+        assert SchemaFromDB.supports_dsn('duckdb:///path/to/db.duckdb') is True
+        # But SyntheticValidator won't crash even if file doesn't exist — it'll
+        # just fail gracefully during SchemaFromDB init. For this test,
+        # use None reference_db (pure AST mode).
+        v = SyntheticValidator(reference_db=None, dialect='duckdb')
+        result = v.validate_sql_pair("SELECT 1 AS x", "SELECT 1 AS x")
+        assert result['match'] is True
+
+    def test_unsupported_dsn_skips_schema_extraction(self):
+        """Unsupported DSN (e.g. snowflake://) should skip SchemaFromDB, not crash."""
+        from qt_sql.validation.synthetic_validator import SyntheticValidator, SchemaFromDB
+        assert SchemaFromDB.supports_dsn('snowflake://account/db') is False
+        # Should not raise — falls back to pure AST schema inference
+        v = SyntheticValidator(reference_db='snowflake://account/db', dialect='snowflake')
+        assert v.schema_extractor is None
+
+    def test_none_dsn(self):
+        """dsn=None should work (pure synthetic, no reference DB)."""
+        from qt_sql.patches.beam_patch_validator import PatchGateValidator
+        from unittest.mock import MagicMock
+        gv = PatchGateValidator(dialect='duckdb', dsn=None, executor=MagicMock())
+        gate = gv.validate_semantics("SELECT 42 AS val", "SELECT 42 AS val")
+        assert gate.passed is True
+
+    def test_schema_from_db_supports_dsn(self):
+        """Verify supports_dsn for all expected DSN formats."""
+        from qt_sql.validation.synthetic_validator import SchemaFromDB
+        # Supported: real databases with persistent tables
+        assert SchemaFromDB.supports_dsn('postgres://user:pass@host/db') is True
+        assert SchemaFromDB.supports_dsn('postgresql://user:pass@host/db') is True
+        assert SchemaFromDB.supports_dsn('duckdb:///path.duckdb') is True
+        assert SchemaFromDB.supports_dsn('/path/to/file.duckdb') is True
+        assert SchemaFromDB.supports_dsn('/path/to/file.db') is True
+        # Not supported: in-memory (no tables to introspect)
+        assert SchemaFromDB.supports_dsn(':memory:') is False
+        assert SchemaFromDB.supports_dsn('duckdb:///:memory:') is False
+        # Not supported: unknown schemes
+        assert SchemaFromDB.supports_dsn('snowflake://account/db') is False
+        assert SchemaFromDB.supports_dsn(None) is False

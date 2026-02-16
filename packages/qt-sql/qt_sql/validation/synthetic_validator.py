@@ -7,6 +7,7 @@ and optimized queries on it, and compares results. Used as Gate 3
 Ported from research/synthetic_validator/validator.py.
 """
 
+import argparse
 import hashlib
 import logging
 import os
@@ -570,6 +571,35 @@ class SchemaFromDB:
         'bytea': 'BLOB',
     }
 
+    # DSN schemes that SchemaFromDB can handle
+    _SUPPORTED_SCHEMES = ('postgres://', 'postgresql://', 'duckdb://')
+
+    @classmethod
+    def supports_dsn(cls, dsn: str) -> bool:
+        """Return True if this DSN scheme is supported for schema extraction.
+
+        In-memory databases (:memory:, duckdb:///:memory:) are excluded —
+        they have no persistent tables to extract schemas from.
+        """
+        if dsn is None:
+            return False
+        lower = dsn.lower()
+        # In-memory has no tables to introspect
+        if lower == ':memory:' or lower == 'duckdb:///:memory:':
+            return False
+        # Bare file paths with DuckDB extensions
+        if lower.endswith('.duckdb') or lower.endswith('.db'):
+            return True
+        return any(lower.startswith(s) for s in cls._SUPPORTED_SCHEMES)
+
+    @staticmethod
+    def _normalize_duckdb_dsn(dsn: str) -> str:
+        """Strip duckdb:// prefix so DuckDB gets a plain file path or :memory:."""
+        if dsn.lower().startswith('duckdb://'):
+            path = dsn[len('duckdb://'):]
+            return path or ':memory:'
+        return dsn
+
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._cache: Dict[str, Dict] = {}
@@ -596,7 +626,8 @@ class SchemaFromDB:
             finally:
                 conn.close()
         else:
-            conn = duckdb.connect(self.db_path, read_only=True)
+            db_file = self._normalize_duckdb_dsn(self.db_path)
+            conn = duckdb.connect(db_file, read_only=True)
             try:
                 rows = conn.execute(
                     "SELECT DISTINCT table_name FROM information_schema.columns"
@@ -655,7 +686,8 @@ class SchemaFromDB:
             finally:
                 conn.close()
         else:
-            conn = duckdb.connect(self.db_path, read_only=True)
+            db_file = self._normalize_duckdb_dsn(self.db_path)
+            conn = duckdb.connect(db_file, read_only=True)
             try:
                 result = conn.execute(f"""
                     SELECT column_name, data_type, is_nullable
@@ -684,7 +716,11 @@ class SyntheticValidator:
         self.conn = duckdb.connect(':memory:')
         self.reference_db = reference_db
         self.dialect = dialect.lower()
-        self.schema_extractor = SchemaFromDB(reference_db) if reference_db else None
+        # Only create SchemaFromDB for supported DSN schemes
+        if reference_db and SchemaFromDB.supports_dsn(reference_db):
+            self.schema_extractor = SchemaFromDB(reference_db)
+        else:
+            self.schema_extractor = None
 
     def validate(self, sql_file: str, target_rows: int = 1000, min_rows: int = None, max_rows: int = None) -> Dict[str, Any]:
         """Run full validation pipeline."""
