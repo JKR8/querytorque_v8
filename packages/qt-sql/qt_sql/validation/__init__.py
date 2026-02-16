@@ -57,6 +57,9 @@ from .sql_validator import (
 from .mini_validator import (
     MiniValidator,
 )
+from .synthetic_validator import (
+    SyntheticValidator,
+)
 from .sql_differ import (
     SQLDiffer,
 )
@@ -87,5 +90,6 @@ __all__ = [
     "BenchmarkResult",
     # Semantic validation
     "MiniValidator",
+    "SyntheticValidator",
     "SQLDiffer",
 ]

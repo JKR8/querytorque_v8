@@ -16,8 +16,7 @@ from pathlib import Path
 
 from qt_sql.ir import build_script_ir, dict_to_plan, apply_patch_plan, Dialect
 from qt_sql.execution.factory import create_executor_from_dsn
-from qt_sql.validation.mini_validator import MiniValidator
-from qt_sql.schemas import SemanticValidationResult
+from qt_sql.validation.synthetic_validator import SyntheticValidator
 
 
 logger = logging.getLogger(__name__)
@@ -53,7 +52,7 @@ class PatchValidationResult:
     # Diagnostics
     llm_reasoning: str = ""
     error_messages: List[str] = field(default_factory=list)
-    semantic_diffs: Optional[SemanticValidationResult] = None
+    semantic_diffs: Optional[Dict[str, Any]] = None
 
     # Correlation
     correlation_note: str = ""  # "Score predicts outcome well", "Underestimated", etc.
@@ -88,11 +87,8 @@ class PatchGateValidator:
         self.dialect = dialect
         self.dsn = dsn
         self.executor = executor
-        # MiniValidator expects (db_path, sample_pct, timeout_ms, dialect)
-        self.semantic_validator = MiniValidator(
-            db_path=dsn,
-            sample_pct=2.0,
-            timeout_ms=30_000,
+        self.semantic_validator = SyntheticValidator(
+            reference_db=dsn,
             dialect=dialect,
         )
 
@@ -143,34 +139,54 @@ class PatchGateValidator:
             )
 
     def validate_semantics(self, original_sql: str, output_sql: str, worker_id: int = 0) -> PatchValidationGate:
-        """Gate 3: Semantics preserved (row count + sample values match)."""
+        """Gate 3: Semantics preserved (synthetic data validation)."""
         try:
-            result = self.semantic_validator.validate_rewrite(
-                original_sql, output_sql, worker_id=worker_id
+            result = self.semantic_validator.validate_sql_pair(
+                original_sql=original_sql,
+                optimized_sql=output_sql,
+                target_rows=100,
             )
 
-            if result.passed:
+            if result['match']:
                 return PatchValidationGate(
                     gate_name="SEMANTIC_MATCH",
                     passed=True,
                     details={
-                        "tier_passed": result.tier_passed,
-                        "row_count_match": True
+                        "validation_type": "synthetic",
+                        "rows_generated": result.get('orig_rows', 0),
+                        "row_count_match": True,
+                        "reason": result['reason'],
                     }
                 )
             else:
-                error_msg = "; ".join(result.errors[:3])  # First 3 errors
+                errors = []
+                if not result.get('orig_success'):
+                    errors.append(f"Original failed: {result.get('orig_error', 'unknown')}")
+                if not result.get('opt_success'):
+                    errors.append(f"Optimized failed: {result.get('opt_error', 'unknown')}")
+                if result.get('orig_success') and result.get('opt_success'):
+                    errors.append(result['reason'])
+
+                error_msg = "; ".join(errors) if errors else "Unknown semantic error"
+
                 return PatchValidationGate(
                     gate_name="SEMANTIC_MATCH",
                     passed=False,
                     error=error_msg,
-                    details={"errors": result.errors}
+                    details={
+                        "validation_type": "synthetic",
+                        "orig_success": result.get('orig_success', False),
+                        "opt_success": result.get('opt_success', False),
+                        "orig_rows": result.get('orig_rows', 0),
+                        "opt_rows": result.get('opt_rows', 0),
+                        "row_count_match": result.get('row_count_match', False),
+                    }
                 )
         except Exception as e:
             return PatchValidationGate(
                 gate_name="SEMANTIC_MATCH",
                 passed=False,
-                error=f"Semantic validation failed: {str(e)}"
+                error=f"Synthetic validation failed: {str(e)[:200]}"
             )
 
     def validate_speedup(
