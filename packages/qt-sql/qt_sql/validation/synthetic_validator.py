@@ -464,6 +464,10 @@ class SyntheticDataGenerator:
         
         placeholders = ', '.join(['?' for _ in col_names])
         insert_sql = f"INSERT INTO {table_name} ({', '.join(col_names)}) VALUES ({placeholders})"
+
+        # Detect PK up front so value generation can avoid forcing sequential
+        # values on non-PK key-like columns.
+        pk_col = find_primary_key_column(table_name, col_names)
         
         # Generate rows
         rows = []
@@ -471,7 +475,15 @@ class SyntheticDataGenerator:
             row = []
             for col_name in col_names:
                 col_info = columns[col_name]
-                value = self._generate_value(col_name, col_info['type'], i, row_count, foreign_keys, table_name)
+                value = self._generate_value(
+                    col_name,
+                    col_info['type'],
+                    i,
+                    row_count,
+                    foreign_keys,
+                    table_name,
+                    primary_key_col=pk_col,
+                )
                 row.append(value)
             rows.append(tuple(row))
         
@@ -496,8 +508,6 @@ class SyntheticDataGenerator:
             self.conn.execute(f"INSERT INTO {table_name} ({col_list}) VALUES {', '.join(values_parts)}")
         
         # Store PK values for this table so other tables can reference them as FKs.
-        pk_col = find_primary_key_column(table_name, col_names)
-        
         if pk_col:
             if table_name not in self.foreign_key_values:
                 self.foreign_key_values[table_name] = []
@@ -520,9 +530,11 @@ class SyntheticDataGenerator:
         return None
     
     def _generate_value(self, col_name: str, col_type: str, row_idx: int, total_rows: int,
-                       foreign_keys: Dict = None, table_name: str = None):
+                       foreign_keys: Dict = None, table_name: str = None,
+                       primary_key_col: Optional[str] = None):
         """Generate a single synthetic value."""
         col_name_lower = col_name.lower()
+        pk_lower = primary_key_col.lower() if primary_key_col else None
         foreign_keys = foreign_keys or {}
         col_type_upper = col_type.upper()
 
@@ -629,9 +641,7 @@ class SyntheticDataGenerator:
         is_numeric_type = any(
             t in col_type_upper for t in ('INT', 'DECIMAL', 'BIGINT', 'SMALLINT', 'FLOAT', 'DOUBLE')
         )
-        if col_name_lower.endswith('_sk') or col_name_lower == 'id' or (
-            col_name_lower.endswith('_id') and is_numeric_type
-        ):
+        if pk_lower and col_name_lower == pk_lower:
             if decimal_info:
                 max_val = 10 ** (decimal_info['precision'] - decimal_info['scale']) - 1
                 val = min(row_idx + 1, max_val)
