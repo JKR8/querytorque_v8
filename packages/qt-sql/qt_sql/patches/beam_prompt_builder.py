@@ -5,7 +5,7 @@ instructs the LLM to choose the 4 most relevant families for this specific query
 and outputs 4 independent patch plans.
 """
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import json
 import logging
 
@@ -968,6 +968,170 @@ def _build_history_summary_table(
     return "\n".join(lines)
 
 
+def _parse_explain_operators(
+    explain_text: str,
+) -> List[Tuple[str, float, str]]:
+    """Parse compact EXPLAIN text into operator entries sorted by time desc.
+
+    Returns list of (short_name, time_ms, bracket_info) tuples.
+    """
+    import re
+
+    results: List[Tuple[str, float, str]] = []
+    for line in explain_text.strip().split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("Total"):
+            continue
+
+        bracket_start = stripped.find("[")
+        bracket_end = stripped.find("]")
+        if bracket_start < 0 or bracket_end < 0:
+            continue
+
+        raw_op = stripped[:bracket_start].strip()
+        bracket = stripped[bracket_start + 1 : bracket_end]
+
+        # Extract time in ms
+        time_match = re.search(r"(\d+\.?\d*)ms", bracket)
+        if not time_match:
+            continue
+        time_ms = float(time_match.group(1))
+        if time_ms < 1.0:
+            continue  # skip sub-ms noise
+
+        # Build short name: OPERATOR_TYPE [table_name | join_key]
+        # e.g. "SEQ_SCAN  store_sales" -> "SEQ_SCAN store_sales"
+        # e.g. "HASH_JOIN INNER on cd_demo_sk = c_current_cdemo_sk" -> "HASH_JOIN INNER (cd_demo_sk)"
+        on_match = re.match(r"(.+?)\s+on\s+(\w+)", raw_op)
+        if on_match:
+            short_name = f"{on_match.group(1).strip()} ({on_match.group(2)})"
+        else:
+            # Collapse multiple spaces
+            short_name = re.sub(r"\s+", " ", raw_op)
+
+        # Extract row info for bracket display
+        row_match = re.search(r"([\d.]+[KMB]?)\s+(?:of\s+[\d.]+[KMB]?\s+)?rows", bracket)
+        row_str = row_match.group(1) if row_match else ""
+
+        # Extract pct
+        pct_match = re.search(r"(\d+)%", bracket)
+        pct_str = f" ({pct_match.group(1)}%)" if pct_match else ""
+
+        display = f"{short_name} [{row_str} rows]" if row_str else short_name
+        results.append((display, time_ms, pct_str))
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def _build_explain_comparison(
+    original_explain: str,
+    explains: Dict[str, str],
+    patches: List[Any],
+) -> str:
+    """Build operator cost comparison table: original vs best winner, side by side.
+
+    Shows top operators ranked by time, makes plan differences immediately visible.
+    Also detects redundant plans (multiple winners with identical operator structure).
+    """
+    orig_ops = _parse_explain_operators(original_explain)
+    if not orig_ops:
+        return ""
+
+    # Find winners with explains
+    winners = [
+        (p, explains.get(p.patch_id, ""))
+        for p in patches
+        if p.status == "WIN" and p.patch_id in explains and explains[p.patch_id]
+    ]
+    if not winners:
+        return ""
+
+    # Best winner by speedup
+    best_patch, best_explain = max(winners, key=lambda x: x[0].speedup or 0)
+    best_ops = _parse_explain_operators(best_explain)
+    if not best_ops:
+        return ""
+
+    # Detect redundant plans: compare top-5 operator names
+    def _top_names(explain_text: str) -> List[str]:
+        ops = _parse_explain_operators(explain_text)
+        return [op[0] for op in ops[:5]]
+
+    best_names = _top_names(best_explain)
+    redundant_ids = [best_patch.patch_id]
+    complementary_ids = []
+    for p, exp in winners:
+        if p.patch_id == best_patch.patch_id:
+            continue
+        if _top_names(exp) == best_names:
+            redundant_ids.append(p.patch_id)
+        else:
+            complementary_ids.append(p.patch_id)
+
+    lines = ["#### Operator Cost Comparison (original vs best winner)\n"]
+
+    # Redundancy note
+    if len(redundant_ids) > 1:
+        lines.append(
+            f"**Note**: Patches {', '.join(redundant_ids)} produce "
+            f"**identical plans** (REDUNDANT — same structural change)."
+        )
+    if complementary_ids:
+        lines.append(
+            f"**Complementary**: Patches {', '.join(complementary_ids)} have "
+            f"different plan structures."
+        )
+    lines.append("")
+
+    # Build side-by-side table
+    best_label = f"{best_patch.patch_id} ({best_patch.speedup:.2f}x)"
+    lines.append(
+        f"| # | Original Operator | Time | "
+        f"{best_label} Operator | Time |"
+    )
+    lines.append("|---|------------------|------|" + "-" * (len(best_label) + 12) + "|------|")
+
+    max_rows = min(max(len(orig_ops), len(best_ops)), 10)
+    for i in range(max_rows):
+        if i < len(orig_ops):
+            o_name, o_time, o_pct = orig_ops[i]
+            o_str = f"{o_name}"
+            o_time_str = f"{o_time:.0f}ms{o_pct}"
+        else:
+            o_str, o_time_str = "—", "—"
+
+        if i < len(best_ops):
+            b_name, b_time, b_pct = best_ops[i]
+            b_str = f"{b_name}"
+            b_time_str = f"{b_time:.0f}ms{b_pct}"
+        else:
+            b_str, b_time_str = "—", "—"
+
+        lines.append(f"| {i + 1} | {o_str} | {o_time_str} | {b_str} | {b_time_str} |")
+
+    # Key changes summary
+    lines.append("")
+    lines.append("**Key changes**:")
+
+    # Find operators in original that don't appear in winner (eliminated)
+    orig_types = {op[0].split("[")[0].strip() for op in orig_ops if op[1] >= 10}
+    best_types = {op[0].split("[")[0].strip() for op in best_ops if op[1] >= 10}
+    eliminated = orig_types - best_types
+    if eliminated:
+        lines.append(f"- **ELIMINATED**: {', '.join(sorted(eliminated))}")
+
+    # Biggest remaining operator
+    if best_ops:
+        top_op = best_ops[0]
+        lines.append(
+            f"- **Remaining bottleneck**: {top_op[0]} at {top_op[1]:.0f}ms{top_op[2]}"
+        )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _build_detailed_iteration_section(
     iteration: int,
     patches: List[Any],
@@ -1046,21 +1210,29 @@ def _build_detailed_iteration_section(
                 f"FAILED to apply — {p.apply_error or 'unknown error'}\n"
             )
 
-    # ── Execution Plans ──────────────────────────────────────────────
+    # ── Execution Plans (compact parsed format, all patches) ─────
     sections.append("#### Execution Plans\n")
 
-    # Original (compact rendering already applied upstream)
     sections.append("**Original EXPLAIN:**")
     sections.append(f"```\n{original_explain}\n```")
 
-    # Candidate explains
+    # Show each patch's EXPLAIN; collapse identical plans
+    shown_fingerprints: Dict[tuple, str] = {}  # fingerprint → first patch_id
     for p in patches:
-        if p.patch_id in explains and explains[p.patch_id]:
-            explain_text = explains[p.patch_id]
-            speedup_str = f"{p.speedup:.2f}x" if p.speedup is not None else "?"
+        if p.patch_id not in explains or not explains[p.patch_id]:
+            continue
+        explain_text = explains[p.patch_id]
+        fp = tuple(op[0] for op in _parse_explain_operators(explain_text)[:5])
+        speedup_str = f"{p.speedup:.2f}x" if p.speedup is not None else "?"
+        label = f"{p.patch_id} ({speedup_str} {p.status})"
+
+        if fp in shown_fingerprints:
             sections.append(
-                f"\n**{p.patch_id} (Family {p.family}, {speedup_str} {p.status}) EXPLAIN:**"
+                f"\n**{label} EXPLAIN:** same plan as {shown_fingerprints[fp]}"
             )
+        else:
+            shown_fingerprints[fp] = p.patch_id
+            sections.append(f"\n**{label} EXPLAIN:**")
             sections.append(f"```\n{explain_text}\n```")
 
     # ── Error Details ────────────────────────────────────────────────
@@ -1126,16 +1298,56 @@ def build_beam_snipe_prompt(
     sections.append(detail)
 
     # ── Task for next iteration ──────────────────────────────────────
+    # Build a compact result summary line for the protocol header
+    status_counts: Dict[str, int] = {}
+    for p in patches:
+        s = getattr(p, "status", "?")
+        status_counts[s] = status_counts.get(s, 0) + 1
+    status_line = ", ".join(f"{v} {k}" for k, v in sorted(status_counts.items()))
+
     sections.append(f"\n## Your Task (Iteration {iteration + 2})\n")
     sections.append(
-        "Analyze the history summary table and the detailed latest results above.\n\n"
-        "**Key questions:**\n"
-        "- For WINNING patches: can you improve further? Combine with other strategies?\n"
-        "- For NEUTRAL patches: what went wrong? Look at the EXPLAIN plan. Can you fix the approach?\n"
-        "- For FAILED/ERROR patches: what caused the error? Look at the patched SQL. Propose an alternative.\n"
-        "- For REGRESSION patches: why did it get slower? Look at the patched SQL and EXPLAIN. Avoid that pattern.\n\n"
-        "Output a new JSON array of up to 4 patch plans (same format as before).\n"
-        "You may keep successful approaches and refine them, or try entirely new families.\n"
+        f"Results from iteration {iteration + 1}: **{status_line}**.\n\n"
+        "Follow this protocol exactly.\n\n"
+        "### Step 1 — Compare EXPLAIN Plans\n\n"
+        "For each patch above, compare its EXPLAIN plan to the Original EXPLAIN.\n\n"
+        "For each **WIN**, answer:\n"
+        "- QUOTE the operator line(s) from the original that got cheaper or "
+        "were eliminated. Give the exact operator name, time, and row count "
+        "from the plan text above.\n"
+        "- What structural SQL change caused that operator improvement?\n"
+        "- What is the **most expensive remaining operator** in this winner's "
+        "plan? QUOTE its line (name, time, rows).\n\n"
+        "For each **FAIL/NEUTRAL/REGRESSION**:\n"
+        "- QUOTE the operator(s) that got MORE expensive vs the original.\n"
+        "- Why did the structural change backfire?\n\n"
+        "Then classify winners as REDUNDANT (same core structural change, "
+        "same operators improved) or COMPLEMENTARY (different operators "
+        "improved, different structural changes).\n\n"
+        "### Step 2 — Design Targets by Combining Strategies\n\n"
+        "Start from the **best winner's SQL** as your baseline.\n\n"
+        "**CRITICAL**: Do NOT invent new hypotheses about row counts or "
+        "selectivity. Every claim about rows, times, or costs MUST be a "
+        "direct quote from an EXPLAIN plan above. If a number is not in "
+        "the plans, you do not know it.\n\n"
+        "**CRITICAL**: Do NOT spend targets on optimizer-equivalent rewrites "
+        "(UNION↔UNION ALL, JOIN↔WHERE IN, CTE↔subquery). These produce "
+        "identical plans. Focus on changes that **eliminate operators** or "
+        "**reduce input rows to expensive operators** as shown in the plans.\n\n"
+        "Design up to 4 targets, prioritized:\n\n"
+        "1. **Combination** (primary if complementary winners exist): Take "
+        "the best winner's SQL. Layer on the structural change from a "
+        "complementary winner that addresses a DIFFERENT expensive operator. "
+        "Cite both operators by name from the EXPLAIN plans.\n"
+        "2. **Refinement**: Take the best winner's SQL. Target its most "
+        "expensive remaining operator (quoted in Step 1). Design a structural "
+        "change that reduces input rows to that operator. CITE the operator "
+        "and its current row count from the plan.\n"
+        "3. **Rescue** (if a failed patch had a sound structural idea): "
+        "Fix the implementation while preserving the best winner's gains.\n"
+        "4. **Novel**: A new structural approach that targets the most "
+        "expensive remaining operator. Cite the operator from the plan.\n\n"
+        "Output a new JSON array of up to 4 targets (same format as before).\n"
     )
 
     return "\n".join(sections)

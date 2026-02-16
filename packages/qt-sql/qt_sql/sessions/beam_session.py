@@ -98,6 +98,10 @@ class BeamSession(OptimizationSession):
 
         Uses structured plan_json when available (DuckDB: ~40 lines vs ~230 box-drawing).
         Falls back to plan_text if no JSON plan.
+
+        IMPORTANT: This is the ONLY entry point for EXPLAIN into prompts.
+        The compact format is what analysts, workers, and snipers all see.
+        Raw box-drawing must NEVER leak through.
         """
         if not explain_result:
             return "(EXPLAIN unavailable)"
@@ -113,8 +117,15 @@ class BeamSession(OptimizationSession):
                 rendered = format_duckdb_explain_tree(_json.dumps(plan_json))
                 if rendered:
                     return rendered
+            # plan_text may be JSON string or box-drawing.
+            # format_duckdb_explain_tree handles JSON; box-drawing falls through.
             if plan_text:
-                return format_duckdb_explain_tree(plan_text)
+                rendered = format_duckdb_explain_tree(plan_text)
+                # Guard: if parser returned box-drawing unchanged, reject it
+                if "┌" not in rendered and "└" not in rendered:
+                    return rendered
+                # Box-drawing leaked — return a warning instead of 300 lines of noise
+                return "(EXPLAIN: compact rendering unavailable — re-run with JSON EXPLAIN)"
 
         # PG / Snowflake fallback
         if plan_text:
@@ -623,7 +634,7 @@ class BeamSession(OptimizationSession):
             logger.info(
                 f"[{self.query_id}] Phase 2: dispatching {len(targets)} workers"
             )
-            patches, worker_api_calls = orchestrator.run_workers(
+            patches, worker_api_calls, all_targets = orchestrator.run_workers(
                 original_sql=self.original_sql,
                 ir_node_map=ir_node_map,
                 targets=targets,
@@ -666,7 +677,7 @@ class BeamSession(OptimizationSession):
             failed = [p for p in patches if not p.output_sql and p.apply_error]
             for p in failed:
                 target_match = next(
-                    (t for t in targets if t.target_id == p.patch_id), None
+                    (t for t in all_targets if t.target_id == p.patch_id), None
                 )
                 if not target_match:
                     continue
@@ -715,7 +726,7 @@ class BeamSession(OptimizationSession):
             )
             applied, sem_api_calls = self._equivalence_check_and_retry(
                 applied=applied,
-                targets=targets,
+                targets=all_targets,
                 orchestrator=orchestrator,
                 ir_node_map=ir_node_map,
                 db_path=db_path,
@@ -1033,14 +1044,62 @@ class BeamSession(OptimizationSession):
         Compares row count + MD5 checksum. Failed patches get up to 1 worker
         retry with the error context.
 
+        Gated by semantic_validation_enabled config — when disabled, marks all
+        patches as passed and skips execution.
+
         Returns:
             (updated_patches, api_call_count)
         """
+        if not self.pipeline.config.semantic_validation_enabled:
+            logger.info(
+                f"[{self.query_id}] Equivalence check disabled by config"
+            )
+            for p in applied:
+                p.semantic_passed = True
+            return applied, 0
+
         from ..execution.factory import create_executor_from_dsn
         from ..validation.equivalence_checker import EquivalenceChecker
+        from ..validation.mini_validator import MiniValidator
 
         api_calls = 0
         checker = EquivalenceChecker()
+
+        # ── Tier-1: Structural pre-check (instant, no DB) ────────────
+        # Catches parse errors, changed literals, column shape mismatches
+        # before expensive full-dataset execution.
+        tier1_validator = MiniValidator(
+            db_path=db_path, dialect=self.dialect, sample_pct=0,
+        )
+        tier1_failed = []
+        for p in applied:
+            if not p.output_sql:
+                continue
+            t1 = tier1_validator._tier1_structural(self.original_sql, p.output_sql)
+            if not t1.get("passed", True):
+                errors = t1.get("errors", ["Structural check failed"])
+                error_msg = f"Tier-1 structural: {'; '.join(errors)}"
+                logger.info(
+                    f"[{self.query_id}] Tier-1 FAIL {p.patch_id}: {error_msg}"
+                )
+                p.semantic_passed = False
+                p.status = "FAIL"
+                p.apply_error = error_msg
+                tier1_failed.append(p.patch_id)
+
+        if tier1_failed:
+            logger.info(
+                f"[{self.query_id}] Tier-1 rejected {len(tier1_failed)} patches: "
+                f"{tier1_failed}"
+            )
+        # Filter to only tier-1 passed for full-dataset check
+        applied_for_equiv = [p for p in applied if p.patch_id not in tier1_failed]
+        if not applied_for_equiv:
+            passed_count = sum(1 for p in applied if p.semantic_passed)
+            logger.info(
+                f"[{self.query_id}] All patches failed Tier-1, skipping equivalence"
+            )
+            return applied, api_calls
 
         try:
             with create_executor_from_dsn(db_path) as executor:
@@ -1058,7 +1117,7 @@ class BeamSession(OptimizationSession):
                     f"{orig_count} rows, checksum={orig_checksum}"
                 )
 
-                for p in applied:
+                for p in applied_for_equiv:
                     if not p.output_sql:
                         continue
 

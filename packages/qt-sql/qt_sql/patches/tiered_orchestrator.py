@@ -181,7 +181,7 @@ class TieredOrchestrator:
         script_ir: Any,
         dialect_enum: Any,
         force_full_roster: bool = False,
-    ) -> Tuple[List["AppliedPatch"], int]:
+    ) -> Tuple[List["AppliedPatch"], int, List[AnalystTarget]]:
         """Call workers in parallel (one per target). Apply each patch.
 
         Workers are routed to specialized roles based on target family:
@@ -193,7 +193,8 @@ class TieredOrchestrator:
                 all 4 worker slots when analyst produces fewer than 4.
 
         Returns:
-            (patches, n_api_calls) — applied patches + actual LLM call count.
+            (patches, n_api_calls, all_targets) — applied patches, LLM call
+            count, and all assigned targets (including synthetic/AST).
         """
         from .beam_prompt_builder import build_worker_patch_prompt
         from ..sessions.beam_session import AppliedPatch
@@ -301,10 +302,11 @@ class TieredOrchestrator:
                     ))
 
         # Sort by original target order
-        target_order = {t.target_id: i for i, t in enumerate(targets)}
+        all_targets = [t for t, _role in assignments]
+        target_order = {t.target_id: i for i, t in enumerate(all_targets)}
         results.sort(key=lambda p: target_order.get(p.patch_id, 99))
 
-        return results, api_call_count[0]
+        return results, api_call_count[0], all_targets
 
     def retry_worker(
         self,
@@ -467,7 +469,7 @@ class TieredOrchestrator:
     _WORKER_DEFAULTS: Dict[str, Tuple[str, str]] = {
         "W1": ("A", "early_filter"),
         "W2": ("B", "decorrelate"),
-        "W3": ("E", "multi_dimension_prefetch"),
+        "W3": ("E", "materialize_cte"),
     }
 
     def _assign_workers(
