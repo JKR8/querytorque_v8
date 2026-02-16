@@ -234,6 +234,34 @@ class TestSyntheticGenerationRobustness:
         used_fks = {r[0] for r in conn.execute("SELECT DISTINCT customer_id FROM orders").fetchall()}
         assert used_fks.issubset({1, 2, 3})
 
+    def test_non_pk_surrogate_like_columns_are_not_forced_sequential(self):
+        from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
+
+        conn = duckdb.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE store_returns (sr_return_sk INTEGER, sr_reason_sk INTEGER, sr_return_amt DECIMAL(10,2))"
+        )
+        schema = {
+            "columns": {
+                "sr_return_sk": {"type": "INTEGER", "nullable": False},
+                "sr_reason_sk": {"type": "INTEGER", "nullable": False},
+                "sr_return_amt": {"type": "DECIMAL(10,2)", "nullable": True},
+            },
+            "key": "sr_return_sk",
+        }
+
+        gen = SyntheticDataGenerator(conn)
+        gen.generate_table_data("store_returns", schema, row_count=120)
+
+        # PK remains dense/sequential.
+        pk_vals = [r[0] for r in conn.execute("SELECT sr_return_sk FROM store_returns ORDER BY sr_return_sk").fetchall()]
+        assert pk_vals == list(range(1, 121))
+
+        # Non-PK key-like column should have duplicates / varied domain,
+        # not a forced 1..N sequence tied to row index.
+        distinct_reason = conn.execute("SELECT COUNT(DISTINCT sr_reason_sk) FROM store_returns").fetchone()[0]
+        assert distinct_reason < 120
+
     def test_filter_literal_injection_between_and_in(self, monkeypatch):
         from qt_sql.validation.synthetic_validator import SyntheticDataGenerator
 
