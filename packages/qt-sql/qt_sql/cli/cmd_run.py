@@ -164,10 +164,22 @@ def run(
             dashboard=dashboard,
         )
 
-        # Phase 0: Survey
-        console.print("\n[bold]Phase 0: Survey[/bold]")
-        surveys = orch.survey(query_ids, queries_dict)
-        console.print(f"  Surveyed {len(surveys)} queries")
+        # Phase 0: Survey (collects baselines via EXPLAIN ANALYZE)
+        console.print("\n[bold]Phase 0: Survey[/bold] (collecting baselines...)")
+
+        def _survey_progress(qid, done, total):
+            if done == 1 or done == total or done % 10 == 0:
+                console.print(f"  [{done}/{total}] {qid}", end="\r")
+
+        surveys = orch.survey(query_ids, queries_dict, on_progress=_survey_progress)
+
+        # Report timing sources
+        sources = {}
+        for sv in surveys.values():
+            src = sv.timing_source or "unknown"
+            sources[src] = sources.get(src, 0) + 1
+        source_str = ", ".join(f"{v} {k}" for k, v in sorted(sources.items()))
+        console.print(f"  Surveyed {len(surveys)} queries ({source_str})")
 
         # Phase 1: Triage
         console.print("\n[bold]Phase 1: Triage[/bold]")
@@ -187,36 +199,16 @@ def run(
             f"  [dim]Skipping {buckets.get('SKIP', 0)} queries < 100ms[/dim]"
         )
 
-        if dry_run:
-            # Print triage table and exit
-            console.print("\n[bold]Triage Results (dry-run):[/bold]")
-            for t in triaged:
-                transforms_str = ""
-                if t.survey.matched_transforms:
-                    transforms_str = t.survey.matched_transforms[0].id
-                console.print(
-                    f"  {t.query_id:30s} "
-                    f"{t.bucket:8s} "
-                    f"{t.survey.runtime_ms:>10.0f}ms "
-                    f"iters={t.max_iterations} "
-                    f"score={t.priority_score:.1f} "
-                    f"tract={t.survey.tractability} "
-                    f"{transforms_str}"
-                )
-            console.print(f"\n[dim]Dry run complete. Use without --dry-run to execute.[/dim]")
-            return
-
         # ── Live Fleet C2 dashboard ──────────────────────────────────
+        # Launch before dry-run check so --dry-run --live shows real data
+        event_bus = None
         if live_dashboard:
             import threading as _threading
             import webbrowser
-            from ..fleet.event_bus import EventBus, EventType, forensic_to_fleet_c2
+            from ..fleet.event_bus import EventBus, EventType, triage_to_fleet_c2
             from ..fleet.ws_server import run_server_in_thread
-            from ..dashboard.collector import collect_workload_profile
 
-            engine = cfg.get("engine", "duckdb")
-            wp = collect_workload_profile(bench_dir, engine)
-            fleet_c2_data = forensic_to_fleet_c2(wp.forensic.queries, triaged)
+            fleet_c2_data = triage_to_fleet_c2(triaged)
 
             event_bus = EventBus()
             triage_gate = _threading.Event()
@@ -248,6 +240,15 @@ def run(
             except Exception:
                 pass
 
+            if dry_run:
+                console.print("  Dashboard serving real triage data (dry-run: no execution).")
+                console.print("  Press Ctrl+C to stop.")
+                try:
+                    _threading.Event().wait()  # block forever until Ctrl+C
+                except KeyboardInterrupt:
+                    console.print("\n  Stopped.")
+                return
+
             console.print("  Waiting for triage approval in browser...")
             approved = orch.wait_for_triage_approval(timeout=3600)
             if not approved:
@@ -255,6 +256,25 @@ def run(
                 return
 
             console.print("  [green]Triage approved![/green] Starting execution...")
+
+        if dry_run:
+            # Print triage table and exit (no --live)
+            console.print("\n[bold]Triage Results (dry-run):[/bold]")
+            for t in triaged:
+                transforms_str = ""
+                if t.survey.matched_transforms:
+                    transforms_str = t.survey.matched_transforms[0].id
+                console.print(
+                    f"  {t.query_id:30s} "
+                    f"{t.bucket:8s} "
+                    f"{t.survey.runtime_ms:>10.0f}ms "
+                    f"iters={t.max_iterations} "
+                    f"score={t.priority_score:.1f} "
+                    f"tract={t.survey.tractability} "
+                    f"{transforms_str}"
+                )
+            console.print(f"\n[dim]Dry run complete. Use without --dry-run to execute.[/dim]")
+            return
 
         # Phase 2: Execute
         console.print(f"\n[bold]Phase 2: Execute[/bold] (concurrency={concurrency or 4})")
@@ -270,7 +290,8 @@ def run(
         (out / "fleet_scorecard.md").write_text(scorecard_md)
 
         # Emit fleet done event
-        if live_dashboard:
+        if event_bus is not None:
+            from ..fleet.event_bus import EventType
             event_bus.emit(
                 EventType.FLEET_DONE,
                 total=len(results),

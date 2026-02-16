@@ -46,9 +46,16 @@ class FleetWSServer:
         initial_json = json.dumps(self.initial_data, default=str)
         served_html = html_template.replace("__FLEET_DATA__", initial_json, 1)
 
+        help_path = self.html_path.parent / "fleet_c2_help.html"
+        help_html = help_path.read_text() if help_path.exists() else "<h1>Help not found</h1>"
+
         @app.get("/", response_class=HTMLResponse)
         async def index():
             return served_html
+
+        @app.get("/help", response_class=HTMLResponse)
+        async def help_page():
+            return help_html
 
         @app.websocket("/ws")
         async def websocket_endpoint(ws: WebSocket):

@@ -1,0 +1,56 @@
+## Optimization Targets
+
+```json
+[
+  {
+    "family": "B",
+    "transform": "exists_to_semijoin",
+    "target_id": "t1",
+    "relevance_score": 0.98,
+    "hypothesis": "Correlated EXISTS subqueries cause repeated full scans of sales tables. Decorrelation via precomputed customer lists eliminates per-row re-execution.",
+    "target_ir": "S0 [SELECT]\n  CTE: date_range  (via CTE_Q_S0_date_range)\n    FROM: date_dim\n    WHERE: d_year = 2001 AND d_qoy < 4\n  CTE: store_customers  (via CTE_Q_S0_store_customers)\n    FROM: store_sales, date_range\n    WHERE: ss_sold_date_sk = d_date_sk\n    GROUP BY: ss_customer_sk\n  CTE: web_customers  (via CTE_Q_S0_web_customers)\n    FROM: web_sales, date_range\n    WHERE: ws_sold_date_sk = d_date_sk\n    GROUP BY: ws_bill_customer_sk\n  CTE: catalog_customers  (via CTE_Q_S0_catalog_customers)\n    FROM: catalog_sales, date_range\n    WHERE: cs_sold_date_sk = d_date_sk\n    GROUP BY: cs_ship_customer_sk\n  MAIN QUERY (via Q_S0)\n    FROM: customer c\n    INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\n    INNER JOIN customer_demographics cd ON cd_demo_sk = c.c_current_cdemo_sk\n    LEFT SEMI JOIN store_customers sc ON c.c_customer_sk = sc.ss_customer_sk\n    LEFT SEMI JOIN (SELECT ws_bill_customer_sk FROM web_customers UNION SELECT cs_ship_customer_sk FROM catalog_customers) wc \n      ON c.c_customer_sk = wc.ws_bill_customer_sk\n    GROUP BY: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count\n    ORDER BY: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count",
+    "recommended_examples": ["decorrelate", "intersect_to_exists"]
+  },
+  {
+    "family": "E",
+    "transform": "date_dim_prefetch",
+    "target_id": "t2",
+    "relevance_score": 0.85,
+    "hypothesis": "Repeated date_dim scans for identical filters (d_year=2001, d_qoy<4) waste resources. Precompute date keys once for reuse.",
+    "target_ir": "S0 [SELECT]\n  CTE: date_range  (via CTE_Q_S0_date_range)\n    FROM: date_dim\n    WHERE: d_year = 2001 AND d_qoy < 4\n  MAIN QUERY (via Q_S0)\n    FROM: customer c, customer_address ca, customer_demographics\n    WHERE: c.c_current_addr_sk = ca.ca_address_sk \n      AND cd_demo_sk = c.c_current_cdemo_sk \n      AND EXISTS (SELECT 1 FROM store_sales, date_range WHERE c_customer_sk = ss_customer_sk AND ss_sold_date_sk = d_date_sk)\n      AND (EXISTS (SELECT 1 FROM web_sales, date_range WHERE c_customer_sk = ws_bill_customer_sk AND ws_sold_date_sk = d_date_sk)\n           OR EXISTS (SELECT 1 FROM catalog_sales, date_range WHERE c_customer_sk = cs_ship_customer_sk AND cs_sold_date_sk = d_date_sk))\n    GROUP BY: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count\n    ORDER BY: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count",
+    "recommended_examples": ["multi_dimension_prefetch"]
+  },
+  {
+    "family": "F",
+    "transform": "comma_to_innerjoin",
+    "target_id": "t3",
+    "relevance_score": 0.75,
+    "hypothesis": "Comma-style joins obscure join dependencies. Explicit INNER JOIN syntax enables better join ordering decisions.",
+    "target_ir": "S0 [SELECT]\n  MAIN QUERY (via Q_S0)\n    FROM: customer c\n    INNER JOIN customer_address ca ON c.c_current_addr_sk = ca.ca_address_sk\n    INNER JOIN customer_demographics cd ON cd_demo_sk = c.c_current_cdemo_sk\n    WHERE: EXISTS (SELECT 1 FROM store_sales, date_dim WHERE c.c_customer_sk = ss_customer_sk AND ss_sold_date_sk = d_date_sk AND d_year=2001 AND d_qoy<4)\n      AND (EXISTS (SELECT 1 FROM web_sales, date_dim WHERE c.c_customer_sk = ws_bill_customer_sk AND ws_sold_date_sk = d_date_sk AND d_year=2001 AND d_qoy<4)\n           OR EXISTS (SELECT 1 FROM catalog_sales, date_dim WHERE c.c_customer_sk = cs_ship_customer_sk AND cs_sold_date_sk = d_date_sk AND d_year=2001 AND d_qoy<4))\n    GROUP BY: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count\n    ORDER BY: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count",
+    "recommended_examples": ["inner_join_conversion"]
+  }
+]
+```
+
+## Analysis
+**Family A (Early Filtering)**: HIGH relevance  
+Date filters (`d_year=2001`, `d_qoy<4`) appear late in subqueries. Pushing these into CTEs would reduce sales table scans early. The 4.10s store_sales scan is primary bottleneck.
+
+**Family B (Decorrelation)**: HIGH relevance  
+Correlated EXISTS subqueries cause repeated full scans of sales tables. The plan shows LEFT_DELTA_JOIN (MARK) operations indicating per-row re-execution. Decorrelation via precomputed customer lists is critical.
+
+**Family C (Aggregation Pushdown)**: LOW relevance  
+Grouping happens after all joins with no intermediate aggregation opportunities. Keys don't align with join dependencies.
+
+**Family D (Set Operation Optimization)**: MEDIUM relevance  
+OR condition between web/catalog sales could benefit from UNION-based rewrite, though DuckDB handles this reasonably well.
+
+**Family E (Materialization)**: HIGH relevance  
+Identical date_dim scans occur 3x (store/web/catalog). Precomputing date keys would save 2 redundant scans.
+
+**Family F (Join Transform)**: MEDIUM relevance  
+Comma-style joins obscure join dependencies. Explicit INNER JOIN syntax helps the optimizer.
+
+**Chosen families**: [B, E, F, A]  
+**Confidence**: High  
+Primary bottleneck is correlated EXISTS causing repeated large scans (Family B). Secondary wins from date reuse (Family E) and join clarity (Family F). Early filtering (Family A) provides complementary benefits.

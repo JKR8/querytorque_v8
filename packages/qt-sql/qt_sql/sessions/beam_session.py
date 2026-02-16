@@ -598,6 +598,11 @@ class BeamSession(OptimizationSession):
                 )
             else:
                 # Snipe round: analyst sees all prior results
+                # Pass ALL prior iterations for history summary table
+                all_prior = [it.patches for it in iterations_data]
+                all_prior_explains = {}
+                for it in iterations_data:
+                    all_prior_explains.update(it.explains)
                 targets, analyst_prompt, analyst_response = orchestrator.run_snipe(
                     query_id=self.query_id,
                     original_sql=self.original_sql,
@@ -605,6 +610,8 @@ class BeamSession(OptimizationSession):
                     ir_node_map=ir_node_map,
                     patches=prev_all_patches or [],
                     patch_explains=prev_explains,
+                    all_prior_iterations=all_prior,
+                    iteration=iteration,
                 )
             iter_api_calls += 1
 
@@ -1044,19 +1051,13 @@ class BeamSession(OptimizationSession):
         Compares row count + MD5 checksum. Failed patches get up to 1 worker
         retry with the error context.
 
-        Gated by semantic_validation_enabled config — when disabled, marks all
-        patches as passed and skips execution.
+        Always runs — this is the primary correctness gate. The
+        semantic_validation_enabled config only controls the TABLESAMPLE
+        mini-validator, not this full-dataset check.
 
         Returns:
             (updated_patches, api_call_count)
         """
-        if not self.pipeline.config.semantic_validation_enabled:
-            logger.info(
-                f"[{self.query_id}] Equivalence check disabled by config"
-            )
-            for p in applied:
-                p.semantic_passed = True
-            return applied, 0
 
         from ..execution.factory import create_executor_from_dsn
         from ..validation.equivalence_checker import EquivalenceChecker

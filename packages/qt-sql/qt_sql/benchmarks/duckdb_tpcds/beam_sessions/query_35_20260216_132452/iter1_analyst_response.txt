@@ -1,0 +1,90 @@
+### Step 1 — Compare EXPLAIN Plans
+
+**Analysis of t3 (Family A - push_cd_filters) - 0.86x REGRESSION:**
+- **Operator that worsened**:  
+  `SEQ_SCAN customer_demographics [1.9M rows, 119.9ms]` (vs original 93.5ms)  
+- **Why it regressed**:  
+  The CTE materialization forced a full scan of `customer_demographics` before joining with `customer`, adding overhead instead of pushing filters downstream. The plan shows new filters on `customer` (`c_current_cdemo_sk>=4 AND c_current_cdemo_sk<=1920791`) that increased scan time from 36.0ms to 33.0ms with filters, but the overall join became slower due to loss of join-order flexibility. The core bottleneck (store_sales scan at 3841ms) was unaffected.
+
+**No winners exist** (all other patches failed). All attempts were REDUNDANT as they targeted the same decorrelation approach.
+
+---
+
+### Step 2 — Design Targets
+
+**Primary Bottleneck**:  
+`SEQ_SCAN store_sales [806.4M rows → 3.1M rows, 4297.6ms, 57%]`  
+This scan dominates runtime. No patch addressed it.
+
+**High-Confidence Targets**:
+
+1. **Combination (Families B + E)**:  
+   - **Hypothesis**: Decorrelate subqueries (B) to eliminate `DELIM_SCAN` and `MARK JOIN` overhead, while reusing date filters (E) to avoid repeated scans.  
+   - **Fix equivalence issue**: Use `UNION ALL` + `DISTINCT` instead of `UNION` to preserve duplicate semantics.  
+   - **Target IR**:  
+     `S0: Replace entire WHERE EXISTS clause with single EXISTS (SELECT FROM unioned_sales)`  
+     `Anchor: 8ec0dc781ff406d9 (main WHERE clause)`
+
+2. **Refinement (Family C)**:  
+   - **Hypothesis**: Pre-aggregate sales tables to distinct `customer_sk` *before* joining with `customer`, reducing `store_sales` input from 806M to distinct customers.  
+   - **Evidence**: Original `store_sales` scan outputs 3.1M rows → group to 200K distinct customers.  
+   - **Target IR**:  
+     `S0: Replace EXISTS subqueries with WHERE c_customer_sk IN (SELECT customer_sk FROM preagg_sales)`  
+     `Anchor: 8ec0dc781ff406d9`
+
+3. **Rescue (Family B + Fix)**:  
+   - **Hypothesis**: Decorrelation failed due to `UNION` deduplication. Use `UNION ALL` + outer `DISTINCT` to match original `OR` semantics.  
+   - **Target IR**:  
+     `S0: Replace EXISTS clauses WITH sales_combined AS (UNION ALL...) SELECT DISTINCT customer_sk`  
+     `Anchor: 8ec0dc781ff406d9`
+
+4. **Novel (Family F)**:  
+   - **Hypothesis**: Convert comma joins to explicit `INNER JOIN` and force `date_dim` join before sales tables to push filters earlier.  
+   - **Target IR**:  
+     `S0: Replace FROM customer c,customer_address ca... with explicit JOIN order`  
+     `Anchor: S0 (main FROM clause)`
+
+---
+
+### Final Targets (JSON)
+
+```json
+[
+  {
+    "family": "B+E",
+    "transform": "decorrelate_unionall_with_date_prefetch",
+    "target_id": "t1",
+    "relevance_score": 0.97,
+    "hypothesis": "Eliminate DELIM_SCAN/MARK_JOIN (267ms+44ms) by decorrelating subqueries into UNION ALL + DISTINCT, while reusing date_dim scan via CTE to avoid 3x repeated filters (2.6ms each). Targets store_sales scan (4297ms) by reducing correlation overhead.",
+    "target_ir": "S0:8ec0dc781ff406d9",
+    "recommended_examples": ["decorrelate", "multi_dimension_prefetch"]
+  },
+  {
+    "family": "C",
+    "transform": "preaggregate_sales_customers",
+    "target_id": "t2",
+    "relevance_score": 0.92,
+    "hypothesis": "Precompute distinct customer_sk per sales table before joining to customer, reducing store_sales scan output from 3.1M to distinct customers (est 200K rows). Targets SEQ_SCAN store_sales (4297ms).",
+    "target_ir": "S0:8ec0dc781ff406d9",
+    "recommended_examples": ["aggregate_pushdown"]
+  },
+  {
+    "family": "B",
+    "transform": "decorrelate_unionall_distinct",
+    "target_id": "t3",
+    "relevance_score": 0.88,
+    "hypothesis": "Fix equivalence failure in prior decorrelation by using UNION ALL + outer DISTINCT instead of UNION. Maintains OR semantics while eliminating correlated execution (DELIM_SCAN 44ms).",
+    "target_ir": "S0:8ec0dc781ff406d9",
+    "recommended_examples": ["decorrelate"]
+  },
+  {
+    "family": "F",
+    "transform": "explicit_join_reorder_date_first",
+    "target_id": "t4",
+    "relevance_score": 0.85,
+    "hypothesis": "Convert comma joins to explicit INNER JOIN and force date_dim join before sales tables to push d_year/d_qoy filters earlier. Targets SEQ_SCAN store_sales (4297ms) by reducing input via early filtering.",
+    "target_ir": "S0",
+    "recommended_examples": ["inner_join_conversion"]
+  }
+]
+```

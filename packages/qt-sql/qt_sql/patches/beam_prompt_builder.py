@@ -730,11 +730,15 @@ def build_beam_tiered_snipe_prompt(
     dialect: str,
     patches: List[Any],
     patch_explains: Dict[str, str],
+    all_prior_iterations: Optional[List[List[Any]]] = None,
+    iteration: int = 1,
 ) -> str:
     """Build snipe prompt for the analyst after seeing benchmark results.
 
-    Reuses sections 1-5 from the tiered prompt, then adds results table,
-    EXPLAIN plans, patched SQL, and asks for refined targets.
+    Reuses sections 1-5 from the tiered prompt, then adds:
+    - History summary table (all prior iterations, compact)
+    - Detailed latest iteration (EXPLAIN plans, SQL, errors)
+    - V4 task protocol (Compare EXPLAIN Plans → Design Targets)
 
     Args:
         query_id: Query identifier.
@@ -743,8 +747,10 @@ def build_beam_tiered_snipe_prompt(
         ir_node_map: IR node map.
         all_5_examples: Gold examples dict.
         dialect: SQL dialect.
-        patches: List of AppliedPatch objects with benchmark results.
-        patch_explains: Dict mapping patch_id → EXPLAIN text.
+        patches: List of AppliedPatch objects from the LATEST iteration.
+        patch_explains: Dict mapping patch_id → EXPLAIN text for latest iteration.
+        all_prior_iterations: ALL prior iteration patch lists (for history table).
+        iteration: Current iteration number (0-based from beam_session).
 
     Returns:
         Complete snipe prompt string.
@@ -756,7 +762,7 @@ def build_beam_tiered_snipe_prompt(
         "Identify the primary bottleneck. Only provide secondary targets if they are "
         "distinct and high-confidence. Quality > Quantity.\n\n"
         "You will see the original query, execution plan, IR structure, "
-        "and detailed results from the previous round."
+        "and detailed results from previous rounds."
     )
 
     sections, n_families = _build_prompt_body(
@@ -765,98 +771,92 @@ def build_beam_tiered_snipe_prompt(
         include_patch_plans=False,
     )
 
-    # ── Section 6: Results Table ──────────────────────────────────────
-    sections.append("## Previous Round Results\n")
-    sections.append(
-        "| Patch | Family | Transform | Semantic | Speedup | Status "
-        "| Orig ms | Patch ms | Error |"
+    # ── Section 6: History Summary Table (all prior iterations) ───────
+    if all_prior_iterations and len(all_prior_iterations) > 0:
+        summary = _build_history_summary_table(all_prior_iterations)
+        sections.append(f"## Optimization History\n\n{summary}")
+        sections.append("")
+
+    # ── Section 7: Detailed Latest Iteration ──────────────────────────
+    detail = _build_detailed_iteration_section(
+        iteration=len(all_prior_iterations) - 1 if all_prior_iterations else 0,
+        patches=patches,
+        original_explain=explain_text,
+        explains=patch_explains,
     )
-    sections.append(
-        "|-------|--------|-----------|----------|---------|--------"
-        "|---------|----------|-------|"
-    )
+    sections.append(detail)
 
-    for p in patches:
-        speedup_str = f"{p.speedup:.2f}x" if p.speedup is not None else "—"
-        orig_str = f"{p.original_ms:.0f}" if p.original_ms is not None else "—"
-        patch_str = f"{p.patch_ms:.0f}" if p.patch_ms is not None else "—"
-        sem_str = "PASS" if p.semantic_passed else "FAIL"
-        err_str = (p.apply_error or "")[:60]
-        sections.append(
-            f"| {p.patch_id} | {p.family} | {p.transform} | "
-            f"{sem_str} | {speedup_str} | {p.status} | "
-            f"{orig_str} | {patch_str} | {err_str} |"
-        )
-    sections.append("")
-
-    # ── Section 7: EXPLAIN Plans ──────────────────────────────────────
-    sections.append("## Execution Plans\n")
-    orig_explain_display = "\n".join(explain_text.split("\n")[:60])
-    sections.append("**Original EXPLAIN:**")
-    sections.append(f"```\n{orig_explain_display}\n```\n")
-
-    for p in patches:
-        if p.patch_id in patch_explains and patch_explains[p.patch_id]:
-            plan = patch_explains[p.patch_id]
-            truncated = "\n".join(plan.split("\n")[:60])
-            speedup_str = f"{p.speedup:.2f}x" if p.speedup is not None else "?"
-            sections.append(
-                f"**{p.patch_id} (Family {p.family}, {speedup_str} {p.status}) EXPLAIN:**"
-            )
-            sections.append(f"```\n{truncated}\n```\n")
-
-    # ── Section 8: Patched SQL ────────────────────────────────────────
-    sections.append("## Patched SQL\n")
-    for p in patches:
-        if p.output_sql:
-            sql_lines = p.output_sql.strip().split("\n")[:30]
-            sql_display = "\n".join(sql_lines)
-            if len(p.output_sql.strip().split("\n")) > 30:
-                sql_display += "\n-- ... (truncated)"
-            label = f"{p.patch_id} (Family {p.family}, {p.transform})"
-            if p.speedup is not None:
-                label += f" — {p.speedup:.2f}x {p.status}"
-            sections.append(f"**{label}:**")
-            sections.append(f"```sql\n{sql_display}\n```\n")
-        else:
-            sections.append(
-                f"**{p.patch_id}** (Family {p.family}): "
-                f"FAILED — {p.apply_error or 'unknown error'}\n"
-            )
-
-    # ── Section 9: Task ───────────────────────────────────────────────
+    # ── Section 8: V4 Task Protocol ───────────────────────────────────
     n_to_choose = min(4, n_families)
-    sections.append(f"""## Your Task — Refined Targets
 
-Analyze the results above:
-- **WINs**: Can you push further? Combine with another family? Layer a second transform on top?
-- **NEUTRALs**: What went wrong? Look at EXPLAIN. Fix the approach or try a compound strategy.
-- **FAILs/ERRORs**: What caused the failure? Propose a different strategy.
-- **REGRESSIONs**: Why slower? Avoid that pattern.
+    # Build a compact result summary line for the protocol header
+    status_counts: Dict[str, int] = {}
+    for p in patches:
+        s = getattr(p, "status", "?")
+        status_counts[s] = status_counts.get(s, 0) + 1
+    status_line = ", ".join(f"{v} {k}" for k, v in sorted(status_counts.items()))
 
-Design 1 to {n_to_choose} refined optimization targets. Same JSON output format:
-
-```json
-[
-  {{
-    "family": "A+B",
-    "transform": "early_filter_then_decorrelate",
-    "target_id": "t1",
-    "relevance_score": 0.95,
-    "hypothesis": "Decorrelation worked (7.8x) but scan is still wide. Push date filter into CTE first, then decorrelate on the filtered set.",
-    "target_ir": "...",
-    "recommended_examples": ["date_cte_isolate", "shared_scan_decorrelate"]
-  }}
-]
-```
-
-**Combined families**: You MAY combine families in a single target (e.g. "A+B", "B+E", "A+F").
-Use this when one transform sets up conditions for another — e.g. early filtering (A) reduces
-the scan before decorrelation (B), or decorrelation (B) creates a CTE that enables
-materialization reuse (E). The worker will receive gold examples from ALL referenced families.
-
-Output up to {n_to_choose} targets. Fewer strong targets beat padding with weak ones.
-""")
+    sections.append(f"\n## Your Task — Snipe Round {iteration}\n")
+    sections.append(
+        f"Results from latest iteration: **{status_line}**.\n\n"
+        "Follow this protocol exactly.\n\n"
+        "### Step 1 — Compare EXPLAIN Plans\n\n"
+        "For each patch above, compare its EXPLAIN plan to the Original EXPLAIN.\n\n"
+        "For each **WIN**, answer:\n"
+        "- QUOTE the operator line(s) from the original that got cheaper or "
+        "were eliminated. Give the exact operator name, time, and row count "
+        "from the plan text above.\n"
+        "- What structural SQL change caused that operator improvement?\n"
+        "- What is the **most expensive remaining operator** in this winner's "
+        "plan? QUOTE its line (name, time, rows).\n\n"
+        "For each **FAIL/NEUTRAL/REGRESSION**:\n"
+        "- QUOTE the operator(s) that got MORE expensive vs the original.\n"
+        "- Why did the structural change backfire?\n\n"
+        "Then classify winners as REDUNDANT (same core structural change, "
+        "same operators improved) or COMPLEMENTARY (different operators "
+        "improved, different structural changes).\n\n"
+        "### Step 2 — Design Targets by Combining Strategies\n\n"
+        "Start from the **best winner's SQL** as your baseline.\n\n"
+        "**CRITICAL**: Do NOT invent new hypotheses about row counts or "
+        "selectivity. Every claim about rows, times, or costs MUST be a "
+        "direct quote from an EXPLAIN plan above. If a number is not in "
+        "the plans, you do not know it.\n\n"
+        "**CRITICAL**: Do NOT spend targets on optimizer-equivalent rewrites "
+        "(UNION\u2194UNION ALL, JOIN\u2194WHERE IN, CTE\u2194subquery). These produce "
+        "identical plans. Focus on changes that **eliminate operators** or "
+        "**reduce input rows to expensive operators** as shown in the plans.\n\n"
+        f"Design up to {n_to_choose} targets, prioritized:\n\n"
+        "1. **Combination** (primary if complementary winners exist): Take "
+        "the best winner's SQL. Layer on the structural change from a "
+        "complementary winner that addresses a DIFFERENT expensive operator. "
+        "Cite both operators by name from the EXPLAIN plans.\n"
+        "2. **Refinement**: Take the best winner's SQL. Target its most "
+        "expensive remaining operator (quoted in Step 1). Design a structural "
+        "change that reduces input rows to that operator. CITE the operator "
+        "and its current row count from the plan.\n"
+        "3. **Rescue** (if a failed patch had a sound structural idea): "
+        "Fix the implementation while preserving the best winner's gains.\n"
+        "4. **Novel**: A new structural approach that targets the most "
+        "expensive remaining operator. Cite the operator from the plan.\n\n"
+        "**Combined families**: You MAY combine families in a single target "
+        "(e.g. \"A+B\", \"B+E\", \"A+F\"). The worker will receive gold examples "
+        "from ALL referenced families.\n\n"
+        f"Output up to {n_to_choose} targets. Same JSON format:\n\n"
+        "```json\n"
+        "[\n"
+        "  {\n"
+        "    \"family\": \"A+B\",\n"
+        "    \"transform\": \"early_filter_then_decorrelate\",\n"
+        "    \"target_id\": \"t1\",\n"
+        "    \"relevance_score\": 0.95,\n"
+        "    \"hypothesis\": \"...\",\n"
+        "    \"target_ir\": \"...\",\n"
+        "    \"recommended_examples\": [\"date_cte_isolate\", \"shared_scan_decorrelate\"]\n"
+        "  }\n"
+        "]\n"
+        "```\n\n"
+        f"Output up to {n_to_choose} targets. Fewer strong targets beat padding with weak ones.\n"
+    )
 
     return "\n\n".join(sections)
 
@@ -1053,18 +1053,20 @@ def _build_explain_comparison(
     if not best_ops:
         return ""
 
-    # Detect redundant plans: compare top-5 operator names
-    def _top_names(explain_text: str) -> List[str]:
+    # Detect redundant plans: compare top-5 operator names.
+    # Only compare when we parsed enough operators for a meaningful fingerprint.
+    def _top_names(explain_text: str) -> tuple[List[str], int]:
         ops = _parse_explain_operators(explain_text)
-        return [op[0] for op in ops[:5]]
+        return [op[0] for op in ops[:5]], len(ops)
 
-    best_names = _top_names(best_explain)
+    best_names, best_count = _top_names(best_explain)
     redundant_ids = [best_patch.patch_id]
     complementary_ids = []
     for p, exp in winners:
         if p.patch_id == best_patch.patch_id:
             continue
-        if _top_names(exp) == best_names:
+        names, count = _top_names(exp)
+        if best_count >= 3 and count >= 3 and names == best_names:
             redundant_ids.append(p.patch_id)
         else:
             complementary_ids.append(p.patch_id)
@@ -1216,22 +1218,28 @@ def _build_detailed_iteration_section(
     sections.append("**Original EXPLAIN:**")
     sections.append(f"```\n{original_explain}\n```")
 
-    # Show each patch's EXPLAIN; collapse identical plans
+    # Show each patch's EXPLAIN; collapse identical plans only when
+    # fingerprints are meaningful (>= 3 operators parsed).  When parsing
+    # fails the fingerprint is empty/tiny for every patch, which would
+    # incorrectly collapse unrelated plans.
     shown_fingerprints: Dict[tuple, str] = {}  # fingerprint → first patch_id
     for p in patches:
         if p.patch_id not in explains or not explains[p.patch_id]:
             continue
         explain_text = explains[p.patch_id]
-        fp = tuple(op[0] for op in _parse_explain_operators(explain_text)[:5])
+        ops = _parse_explain_operators(explain_text)
+        fp = tuple(op[0] for op in ops[:5])
         speedup_str = f"{p.speedup:.2f}x" if p.speedup is not None else "?"
         label = f"{p.patch_id} ({speedup_str} {p.status})"
 
-        if fp in shown_fingerprints:
+        # Only deduplicate when we parsed enough operators for a reliable fingerprint
+        if len(ops) >= 3 and fp in shown_fingerprints:
             sections.append(
                 f"\n**{label} EXPLAIN:** same plan as {shown_fingerprints[fp]}"
             )
         else:
-            shown_fingerprints[fp] = p.patch_id
+            if len(ops) >= 3:
+                shown_fingerprints[fp] = p.patch_id
             sections.append(f"\n**{label} EXPLAIN:**")
             sections.append(f"```\n{explain_text}\n```")
 

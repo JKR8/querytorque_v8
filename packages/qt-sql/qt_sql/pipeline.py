@@ -194,38 +194,55 @@ class Pipeline:
         return logical_tree, costs, explain_result
 
     def _get_explain(self, query_id: str, sql: str) -> Optional[Dict[str, Any]]:
-        """Get EXPLAIN ANALYZE result — cached first, run if missing.
+        """Get EXPLAIN ANALYZE result — cached first, run if missing or stale.
 
         Cache location: benchmark_dir/explains/{query_id}.json (flat)
         Falls back to:  explains/sf10/ → explains/sf5/ (backward compat)
+
+        Re-runs EXPLAIN ANALYZE if cached data has no real timing
+        (execution_time_ms is 0 or None) and a DB connection is available.
+        All cached results include a 'collected_at' ISO timestamp.
         """
-        # Try flat path first (new standard), then sf10/sf5 (backward compat)
-        flat_path = self.benchmark_dir / "explains" / f"{query_id}.json"
+        from datetime import datetime
+
+        cache_dir = self.benchmark_dir / "explains"
+        flat_path = cache_dir / f"{query_id}.json"
         fallback_paths = [
             self.benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
             self.benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
         ]
 
+        # Check cache — return if we have real timing data
         for cache_path in [flat_path] + fallback_paths:
             if cache_path.exists():
                 try:
                     data = json.loads(cache_path.read_text())
-                    logger.info(f"[{query_id}] EXPLAIN loaded from cache ({cache_path.parent.name}/)")
-                    return data
+                    ems = data.get("execution_time_ms")
+                    has_real_timing = ems is not None and ems > 0
+                    if has_real_timing:
+                        logger.info(
+                            f"[{query_id}] EXPLAIN loaded from cache "
+                            f"({cache_path.parent.name}/, {ems:.0f}ms, "
+                            f"collected {data.get('collected_at', 'unknown')})"
+                        )
+                        return data
+                    # Stale cache (no timing) — fall through to re-run
+                    logger.info(
+                        f"[{query_id}] Cached EXPLAIN has no timing — will re-run if DB available"
+                    )
                 except Exception:
                     pass
 
-        # Run EXPLAIN ANALYZE and cache to flat path (new standard)
+        # Run EXPLAIN ANALYZE and cache to flat path
         logger.info(f"[{query_id}] Running EXPLAIN ANALYZE (will cache)")
-        cache_dir = self.benchmark_dir / "explains"
-        cache_path = cache_dir / f"{query_id}.json"
-        timeout_ms = int(self.config.extra.get("explain_timeout_ms", 300_000)) if hasattr(self.config, 'extra') else 300_000
         try:
             from .execution.database_utils import run_explain_analyze
             result = run_explain_analyze(self.config.db_path_or_dsn, sql)
             if result:
+                result["collected_at"] = datetime.now().isoformat()
+                result["query_id"] = query_id
                 cache_dir.mkdir(parents=True, exist_ok=True)
-                cache_path.write_text(json.dumps(result, indent=2, default=str))
+                flat_path.write_text(json.dumps(result, indent=2, default=str))
                 logger.info(
                     f"[{query_id}] Cached EXPLAIN: "
                     f"{result.get('execution_time_ms', '?')}ms"
@@ -233,7 +250,7 @@ class Pipeline:
             return result
         except Exception as e:
             logger.warning(f"[{query_id}] EXPLAIN ANALYZE failed: {e}")
-            # Fallback: EXPLAIN without ANALYZE (plan structure only, no execution)
+            # Fallback: EXPLAIN without ANALYZE (plan structure only)
             try:
                 logger.info(f"[{query_id}] Falling back to EXPLAIN (no ANALYZE)")
                 from .execution.factory import create_executor_from_dsn
@@ -246,13 +263,23 @@ class Pipeline:
                             "plan_json": plan_result.get("children", [plan_result.get("Plan", {})]),
                             "actual_rows": plan_result.get("rows_returned", 0),
                             "note": "EXPLAIN only (no ANALYZE) — estimated costs",
+                            "collected_at": datetime.now().isoformat(),
+                            "query_id": query_id,
                         }
                         cache_dir.mkdir(parents=True, exist_ok=True)
-                        cache_path.write_text(json.dumps(result, indent=2, default=str))
+                        flat_path.write_text(json.dumps(result, indent=2, default=str))
                         logger.info(f"[{query_id}] Cached EXPLAIN (plan-only)")
                         return result
             except Exception as e2:
                 logger.warning(f"[{query_id}] EXPLAIN fallback also failed: {e2}")
+
+            # Last resort: return stale cached data if it exists (plan text at least)
+            for cache_path in [flat_path] + fallback_paths:
+                if cache_path.exists():
+                    try:
+                        return json.loads(cache_path.read_text())
+                    except Exception:
+                        pass
             return None
 
     # =========================================================================
@@ -782,12 +809,14 @@ class Pipeline:
         from .sessions.beam_session import BeamSession
         self.config.tiered_patch_enabled = True
         self.config.benchmark_dsn = self.config.db_path_or_dsn
+        # max_iterations = snipe_rounds + 1 (1 analyst + N snipes)
+        effective_max_iterations = self.config.snipe_rounds + 1
         session = BeamSession(
             pipeline=self,
             query_id=query_id,
             original_sql=sql,
             target_speedup=target_speedup,
-            max_iterations=max_iterations,
+            max_iterations=effective_max_iterations,
             patch=True,
             benchmark_lock=benchmark_lock,
         )

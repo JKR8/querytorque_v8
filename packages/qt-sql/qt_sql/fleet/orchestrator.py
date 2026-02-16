@@ -44,6 +44,9 @@ class SurveyResult:
     matched_transforms: list = field(default_factory=list)
     tractability: int = 0  # count of high-overlap matches (>= 0.6)
     structural_bonus: float = 0.0
+    explain_text: str = ""  # truncated EXPLAIN plan for dashboard
+    actual_rows: int = 0  # rows returned by query
+    timing_source: str = ""  # "explain_analyze" | "leaderboard" | "unknown"
 
 
 @dataclass
@@ -100,8 +103,16 @@ class FleetOrchestrator:
         self,
         query_ids: List[str],
         queries: Dict[str, str],
+        on_progress: Optional[Callable[[str, int, int], None]] = None,
     ) -> Dict[str, SurveyResult]:
-        """Read EXPLAIN timings + run structural detection per query."""
+        """Collect baselines + run structural detection per query.
+
+        Runs EXPLAIN ANALYZE via the pipeline to get real execution times,
+        row counts, and plan text. Falls back to cached/leaderboard data.
+
+        Args:
+            on_progress: Optional callback(query_id, completed, total) for UI.
+        """
         from ..detection import detect_transforms, load_transforms
 
         transforms_catalog = load_transforms()
@@ -113,10 +124,50 @@ class FleetOrchestrator:
         dialect = "postgres" if engine in ("postgresql", "postgres") else engine
 
         results: Dict[str, SurveyResult] = {}
+        total = len(query_ids)
 
-        for qid in query_ids:
-            runtime_ms = self._load_explain_timing(qid)
+        for i, qid in enumerate(query_ids):
             sql = queries.get(qid, "")
+
+            # Collect baseline: EXPLAIN ANALYZE (cached first, run if needed)
+            runtime_ms = -1.0
+            explain_text = ""
+            actual_rows = 0
+            timing_source = "unknown"
+
+            explain_data = self._get_explain_data(qid, sql)
+            if explain_data:
+                # Extract timing
+                ems = explain_data.get("execution_time_ms")
+                if ems and ems > 0:
+                    runtime_ms = float(ems)
+                    timing_source = "explain_analyze"
+                else:
+                    # plan_json latency fallback (DuckDB)
+                    pj = explain_data.get("plan_json")
+                    if isinstance(pj, dict):
+                        lat = pj.get("latency")
+                        if lat and lat > 0:
+                            runtime_ms = float(lat) * 1000
+                            timing_source = "explain_analyze"
+
+                # Extract plan text (truncated for dashboard)
+                pt = explain_data.get("plan_text", "")
+                if pt:
+                    lines = pt.split("\n")
+                    explain_text = "\n".join(lines[:80])
+
+                # Extract row count
+                ar = explain_data.get("actual_rows")
+                if ar:
+                    actual_rows = int(ar)
+
+            # Leaderboard fallback for timing
+            if runtime_ms <= 0:
+                lb_ms = self._leaderboard_timings.get(qid)
+                if lb_ms is not None:
+                    runtime_ms = lb_ms
+                    timing_source = "leaderboard"
 
             # Structural detection
             matched = []
@@ -128,11 +179,9 @@ class FleetOrchestrator:
                         sql, transforms_catalog,
                         engine=engine_name, dialect=dialect,
                     )
-                    # Tractability = count of transforms with >= 0.6 overlap
                     tractability = sum(
                         1 for m in matched if m.overlap_ratio >= 0.6
                     )
-                    # Structural bonus: top match overlap (0.0-1.0)
                     if matched:
                         structural_bonus = matched[0].overlap_ratio
                 except Exception as e:
@@ -141,56 +190,55 @@ class FleetOrchestrator:
             results[qid] = SurveyResult(
                 query_id=qid,
                 runtime_ms=runtime_ms,
-                matched_transforms=matched[:5],  # top 5
+                matched_transforms=matched[:5],
                 tractability=tractability,
                 structural_bonus=structural_bonus,
+                explain_text=explain_text,
+                actual_rows=actual_rows,
+                timing_source=timing_source,
             )
+
+            if on_progress:
+                on_progress(qid, i + 1, total)
 
         return results
 
-    def _load_explain_timing(self, query_id: str) -> float:
-        """Extract execution time from cached EXPLAIN JSON.
+    def _get_explain_data(self, query_id: str, sql: str) -> Optional[Dict[str, Any]]:
+        """Get EXPLAIN ANALYZE result via pipeline (cached first, run if needed).
 
-        Searches: explains/{query_id}.json (flat) → explains/sf10/ → explains/sf5/
-        DuckDB: top-level "execution_time_ms" field
-        PostgreSQL: plan_json[0]["Execution Time"] (ms)
+        Returns dict with execution_time_ms, plan_text, plan_json, actual_rows.
+        Returns None if no DB connection or query fails.
         """
-        search_paths = [
-            self.benchmark_dir / "explains" / f"{query_id}.json",
-            self.benchmark_dir / "explains" / "sf10" / f"{query_id}.json",
-            self.benchmark_dir / "explains" / "sf5" / f"{query_id}.json",
-        ]
+        if not sql:
+            return None
+        try:
+            return self.pipeline._get_explain(query_id, sql)
+        except Exception as e:
+            logger.warning(f"[{query_id}] EXPLAIN collection failed: {e}")
+            return None
 
-        for path in search_paths:
-            if not path.exists():
-                continue
-            try:
-                data = json.loads(path.read_text())
-
-                # DuckDB format: top-level execution_time_ms
-                if "execution_time_ms" in data:
-                    val = data["execution_time_ms"]
-                    if val and val > 0:
-                        return float(val)
-
-                # PostgreSQL format: plan_json[0]["Execution Time"]
-                plan_json = data.get("plan_json")
-                if isinstance(plan_json, list) and plan_json:
-                    exec_time = plan_json[0].get("Execution Time")
-                    if exec_time is not None:
-                        return float(exec_time)
-
-                # DuckDB plan_json dict → latency field
-                if isinstance(plan_json, dict):
-                    latency = plan_json.get("latency")
-                    if latency and latency > 0:
-                        return float(latency) * 1000  # s → ms
-
-            except Exception as e:
-                logger.warning(f"[{query_id}] Failed to read EXPLAIN timing: {e}")
-
-        logger.warning(f"[{query_id}] No EXPLAIN timing found — defaulting to MEDIUM bucket")
-        return -1.0  # sentinel: unknown runtime
+    @property
+    def _leaderboard_timings(self) -> Dict[str, float]:
+        """Lazy-load leaderboard.json timings (cached)."""
+        if not hasattr(self, "_lb_cache"):
+            self._lb_cache: Dict[str, float] = {}
+            lb_path = self.benchmark_dir / "leaderboard.json"
+            if lb_path.exists():
+                try:
+                    lb = json.loads(lb_path.read_text())
+                    for q in lb.get("queries", []):
+                        qid = q.get("query_id", "")
+                        ms = q.get("original_ms")
+                        if qid and ms is not None and ms > 0:
+                            # Normalize: leaderboard uses "q88", survey uses "query_88"
+                            self._lb_cache[qid] = float(ms)
+                            # Also store with query_ prefix
+                            if qid.startswith("q") and not qid.startswith("query_"):
+                                num = qid[1:]
+                                self._lb_cache[f"query_{num}"] = float(ms)
+                except Exception as e:
+                    logger.warning(f"Failed to load leaderboard timings: {e}")
+        return self._lb_cache
 
     # ── Phase 1: Triage ────────────────────────────────────────────────
 

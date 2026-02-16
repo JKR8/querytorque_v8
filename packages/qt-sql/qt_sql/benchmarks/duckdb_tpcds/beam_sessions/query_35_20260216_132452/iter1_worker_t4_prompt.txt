@@ -1,0 +1,195 @@
+## Role
+
+You are **W3 "Builder"** — Structural optimization — join restructuring, materialization. Restructure join topology and materialize repeated work: convert comma joins to explicit INNER JOIN, extract shared scans into CTEs, prefetch dimension tables.
+
+Transform this SQL query from its CURRENT IR structure to a TARGET IR structure using patch operations. Output a single PatchPlan JSON.
+
+**Family**: F — explicit_join_reorder_date_first
+**Hypothesis**: Convert comma joins to explicit INNER JOIN and force date_dim join before sales tables to push d_year/d_qoy filters earlier. Targets SEQ_SCAN store_sales (4297ms) by reducing input via early filtering.
+
+## Original SQL
+
+```sql
+-- start query 35 in stream 0 using template query35.tpl
+select  
+  ca_state,
+  cd_gender,
+  cd_marital_status,
+  cd_dep_count,
+  count(*) cnt1,
+  max(cd_dep_count),
+  sum(cd_dep_count),
+  max(cd_dep_count),
+  cd_dep_employed_count,
+  count(*) cnt2,
+  max(cd_dep_employed_count),
+  sum(cd_dep_employed_count),
+  max(cd_dep_employed_count),
+  cd_dep_college_count,
+  count(*) cnt3,
+  max(cd_dep_college_count),
+  sum(cd_dep_college_count),
+  max(cd_dep_college_count)
+ from
+  customer c,customer_address ca,customer_demographics
+ where
+  c.c_current_addr_sk = ca.ca_address_sk and
+  cd_demo_sk = c.c_current_cdemo_sk and 
+  exists (select *
+          from store_sales,date_dim
+          where c.c_customer_sk = ss_customer_sk and
+                ss_sold_date_sk = d_date_sk and
+                d_year = 2001 and
+                d_qoy < 4) and
+   (exists (select *
+            from web_sales,date_dim
+            where c.c_customer_sk = ws_bill_customer_sk and
+                  ws_sold_date_sk = d_date_sk and
+                  d_year = 2001 and
+                  d_qoy < 4) or 
+    exists (select * 
+            from catalog_sales,date_dim
+            where c.c_customer_sk = cs_ship_customer_sk and
+                  cs_sold_date_sk = d_date_sk and
+                  d_year = 2001 and
+                  d_qoy < 4))
+ group by ca_state,
+          cd_gender,
+          cd_marital_status,
+          cd_dep_count,
+          cd_dep_employed_count,
+          cd_dep_college_count
+ order by ca_state,
+          cd_gender,
+          cd_marital_status,
+          cd_dep_count,
+          cd_dep_employed_count,
+          cd_dep_college_count
+ LIMIT 100;
+
+-- end query 35 in stream 0 using template query35.tpl
+```
+
+## Current IR Node Map
+
+```
+S0 [SELECT]
+  MAIN QUERY (via Q_S0)
+    FROM: customer c, customer_address ca, customer_demographics
+    WHERE [8ec0dc781ff406d9]: c.c_current_addr_sk = ca.ca_address_sk AND cd_demo_sk = c.c_current_cdemo_sk AND EXISTS(SELECT * ...
+    GROUP BY: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count
+    ORDER BY: ca_state, cd_gender, cd_marital_status, cd_dep_count, cd_dep_employed_count, cd_dep_college_count
+S1 [OTHER_DDL]
+
+Patch operations: insert_cte, replace_expr_subtree, replace_where_predicate, replace_from, delete_expr_subtree
+Target: by_node_id (statement, e.g. "S0") + by_anchor_hash (expression)
+```
+
+## Target IR (what the optimized query should look like)
+
+```
+S0
+```
+
+## Patch Operations
+
+| Op | Description | Payload |
+|----|-------------|---------|
+| insert_cte | Add a new CTE to the WITH clause | cte_name, cte_query_sql |
+| replace_from | Replace the FROM clause | from_sql |
+| replace_where_predicate | Replace the WHERE clause | expr_sql |
+| replace_body | Replace entire query body (SELECT, FROM, WHERE, GROUP BY) | sql_fragment |
+| replace_expr_subtree | Replace a specific expression | expr_sql (+ by_anchor_hash) |
+| delete_expr_subtree | Remove a specific expression | (target only, no payload) |
+
+## Gold Patch Example (reference pattern)
+
+```json
+{
+  "plan_id": "gold_duckdb_inner_join_conversion",
+  "dialect": "duckdb",
+  "description": "Convert LEFT JOIN + right-table WHERE filter to INNER JOIN + early filter CTE when the WHERE eliminates NULL rows",
+  "preconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "postconditions": [
+    {
+      "kind": "parse_ok"
+    }
+  ],
+  "steps": [
+    {
+      "step_id": "s1",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "filtered_reason",
+        "cte_query_sql": "SELECT r_reason_sk, r_reason_desc FROM reason WHERE r_reason_desc = 'duplicate purchase'"
+      },
+      "description": "Insert CTE 'filtered_reason'"
+    },
+    {
+      "step_id": "s2",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "joined_returns_sales",
+        "cte_query_sql": "SELECT ss.ss_customer_sk, ss.ss_quantity, ss.ss_sales_price, sr.sr_return_quantity FROM store_sales AS ss INNER JOIN store_returns AS sr ON (ss.ss_item_sk = sr.sr_item_sk AND ss.ss_ticket_number = sr.sr_ticket_number) INNER JOIN filtered_reason AS fr ON sr.sr_reason_sk = fr.r_reason_sk"
+      },
+      "description": "Insert CTE 'joined_returns_sales' for pre-filtered join"
+    },
+    {
+      "step_id": "s3",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "aggregated",
+        "cte_query_sql": "SELECT ss_customer_sk, SUM((ss_quantity - sr_return_quantity) * ss_sales_price) AS sumsales FROM joined_returns_sales GROUP BY ss_customer_sk"
+      },
+      "description": "Insert CTE 'aggregated' for pre-aggregated computation"
+    },
+    {
+      "step_id": "s4",
+      "op": "insert_cte",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "cte_name": "top_n",
+        "cte_query_sql": "SELECT ss_customer_sk, sumsales FROM aggregated ORDER BY sumsales ASC, ss_customer_sk ASC LIMIT 100"
+      },
+      "description": "Insert CTE 'top_n'"
+    },
+    {
+      "step_id": "s5",
+      "op": "replace_body",
+      "target": {
+        "by_node_id": "S0"
+      },
+      "payload": {
+        "sql_fragment": "SELECT ss_customer_sk, sumsales FROM top_n"
+      },
+      "description": "Replace main query body with optimized version"
+    }
+  ]
+}
+```
+
+## Instructions
+
+Adapt the gold example pattern to match the ORIGINAL SQL above.
+Use the TARGET IR as your structural guide — create CTEs matching the target's CTE names and structure.
+Preferred approach: insert_cte (x2-3) + replace_from or replace_body.
+All SQL in payloads must be complete, executable fragments (no ellipsis).
+Use dialect: "duckdb" in the output.
+Target all steps at by_node_id: "S0" (the main statement).
+
+Output ONLY the JSON object (no markdown, no explanation):

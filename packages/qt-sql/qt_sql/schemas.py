@@ -121,6 +121,7 @@ class BenchmarkConfig:
     analyst_model: str = "deepseek/deepseek-r1"
     worker_model: str = "qwen/qwen3-coder"
     target_speedup: float = 10.0
+    snipe_rounds: int = 2  # Number of snipe rounds after initial analyst iteration
 
     @classmethod
     def from_file(cls, config_path: str | Path) -> BenchmarkConfig:
@@ -149,6 +150,7 @@ class BenchmarkConfig:
             analyst_model=data.get("analyst_model", "deepseek/deepseek-r1"),
             worker_model=data.get("worker_model", "qwen/qwen3-coder"),
             target_speedup=data.get("target_speedup", 10.0),
+            snipe_rounds=data.get("snipe_rounds", 2),
         )
 
 

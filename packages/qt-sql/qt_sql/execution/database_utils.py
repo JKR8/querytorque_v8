@@ -32,6 +32,54 @@ def _detect_db_type(database_path: str) -> str:
     return "duckdb"
 
 
+def _extract_first_statement(sql: str) -> str:
+    """Extract the first SQL statement, respecting string literals and comments.
+
+    Handles semicolons inside single-quoted strings and -- line comments.
+    Returns the original sql unchanged if no semicolons are found outside
+    strings/comments.
+    """
+    in_single_quote = False
+    in_line_comment = False
+    i = 0
+    n = len(sql)
+
+    while i < n:
+        c = sql[i]
+
+        if in_line_comment:
+            if c == '\n':
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_single_quote:
+            if c == "'" and i + 1 < n and sql[i + 1] == "'":
+                i += 2  # escaped quote ''
+                continue
+            if c == "'":
+                in_single_quote = False
+            i += 1
+            continue
+
+        if c == '-' and i + 1 < n and sql[i + 1] == '-':
+            in_line_comment = True
+            i += 2
+            continue
+
+        if c == "'":
+            in_single_quote = True
+            i += 1
+            continue
+
+        if c == ';':
+            return sql[:i].strip()
+
+        i += 1
+
+    return sql.strip()
+
+
 def _get_executor(database_path: str):
     """Get the appropriate executor for a database path/DSN.
 
@@ -231,15 +279,18 @@ def _run_explain_analyze_snowflake(dsn: str, sql: str) -> Optional[dict]:
 
 
 def _run_explain_analyze_duckdb(database_path: str, sql: str) -> Optional[dict]:
-    """Run EXPLAIN ANALYZE on DuckDB."""
+    """Run EXPLAIN ANALYZE on DuckDB.
+
+    Strategy: run JSON format first (structured plan + timing + rows in a
+    single execution).  Fall back to text-only EXPLAIN ANALYZE only if JSON
+    fails.  This avoids executing the query twice.
+    """
     try:
         from .duckdb_executor import DuckDBExecutor
         import re
 
         # Multi-statement SQL: take only the first real statement
-        statements = [s.strip() for s in sql.split(";") if s.strip()
-                      and not s.strip().startswith("--")]
-        explain_sql = statements[0] if statements else sql
+        explain_sql = _extract_first_statement(sql)
 
         with DuckDBExecutor(database_path, read_only=True) as db:
             conn = db._ensure_connected()
@@ -251,41 +302,8 @@ def _run_explain_analyze_duckdb(database_path: str, sql: str) -> Optional[dict]:
                 "actual_rows": None,
             }
 
-            # Run EXPLAIN ANALYZE (text) — contains real timing + profiling
-            try:
-                text_result = conn.execute(
-                    f"EXPLAIN ANALYZE {explain_sql}"
-                ).fetchall()
-                plan_text = "\n".join(
-                    str(row[1]) if len(row) > 1 else str(row[0])
-                    for row in text_result
-                )
-                result["plan_text"] = plan_text
-
-                # Parse Total Time from text output (e.g. "Total Time: 0.0826s")
-                m = re.search(r"Total Time:\s*([0-9.]+)s", plan_text)
-                if m:
-                    result["execution_time_ms"] = float(m.group(1)) * 1000
-
-                # Parse Rows Returned from text output
-                m2 = re.search(r"Rows Returned:\s*(\d+)", plan_text)
-                if m2:
-                    result["actual_rows"] = int(m2.group(1))
-            except Exception as e:
-                logger.warning(f"Failed to get EXPLAIN ANALYZE text plan: {e}")
-                # Fallback: plain EXPLAIN (no timing)
-                try:
-                    text_result = conn.execute(
-                        f"EXPLAIN {explain_sql}"
-                    ).fetchall()
-                    result["plan_text"] = "\n".join(
-                        str(row[1]) if len(row) > 1 else str(row[0])
-                        for row in text_result
-                    )
-                except Exception as e2:
-                    logger.warning(f"Failed to get text plan: {e2}")
-
-            # Try to get JSON plan (for structured plan_json)
+            # Primary path: JSON EXPLAIN ANALYZE (single execution)
+            got_json = False
             try:
                 json_result = conn.execute(
                     f"EXPLAIN (ANALYZE, FORMAT JSON) {explain_sql}"
@@ -297,12 +315,48 @@ def _run_explain_analyze_duckdb(database_path: str, sql: str) -> Optional[dict]:
 
                     if plan_type == "analyzed_plan" and isinstance(parsed, dict):
                         result["plan_json"] = parsed
-                        # Use JSON rows_returned as fallback
-                        if result["actual_rows"] is None:
-                            result["actual_rows"] = parsed.get("rows_returned", 0)
+                        result["actual_rows"] = parsed.get("rows_returned", 0)
+                        # Extract timing from JSON plan
+                        timing = parsed.get("timing")
+                        if timing:
+                            result["execution_time_ms"] = timing * 1000
+                        got_json = True
                         break
             except Exception as e:
                 logger.debug(f"JSON EXPLAIN ANALYZE failed: {e}")
+
+            # Fallback: text EXPLAIN ANALYZE (only if JSON failed)
+            if not got_json:
+                try:
+                    text_result = conn.execute(
+                        f"EXPLAIN ANALYZE {explain_sql}"
+                    ).fetchall()
+                    plan_text = "\n".join(
+                        str(row[1]) if len(row) > 1 else str(row[0])
+                        for row in text_result
+                    )
+                    result["plan_text"] = plan_text
+
+                    m = re.search(r"Total Time:\s*([0-9.]+)s", plan_text)
+                    if m:
+                        result["execution_time_ms"] = float(m.group(1)) * 1000
+
+                    m2 = re.search(r"Rows Returned:\s*(\d+)", plan_text)
+                    if m2:
+                        result["actual_rows"] = int(m2.group(1))
+                except Exception as e:
+                    logger.warning(f"Failed to get EXPLAIN ANALYZE text plan: {e}")
+                    # Last resort: plain EXPLAIN (no timing)
+                    try:
+                        text_result = conn.execute(
+                            f"EXPLAIN {explain_sql}"
+                        ).fetchall()
+                        result["plan_text"] = "\n".join(
+                            str(row[1]) if len(row) > 1 else str(row[0])
+                            for row in text_result
+                        )
+                    except Exception as e2:
+                        logger.warning(f"Failed to get text plan: {e2}")
 
             return result
 

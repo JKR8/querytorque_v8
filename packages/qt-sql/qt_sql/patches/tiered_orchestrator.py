@@ -428,8 +428,20 @@ class TieredOrchestrator:
         ir_node_map: str,
         patches: List[Any],
         patch_explains: Dict[str, str],
+        all_prior_iterations: Optional[List[List[Any]]] = None,
+        iteration: int = 1,
     ) -> Tuple[List[AnalystTarget], str, str]:
         """Build snipe prompt from benchmark results, call analyst, parse targets.
+
+        Args:
+            query_id: Query identifier.
+            original_sql: Full original SQL.
+            explain_text: EXPLAIN text for original query.
+            ir_node_map: IR node map.
+            patches: Patches from the LATEST iteration (for detailed view).
+            patch_explains: EXPLAIN texts for latest iteration's patches.
+            all_prior_iterations: ALL prior iteration patch lists (for history table).
+            iteration: Current iteration number (1-based: 1 = first snipe round).
 
         Returns:
             (targets, prompt, response) — parsed targets, raw prompt, raw response.
@@ -445,6 +457,8 @@ class TieredOrchestrator:
             dialect=self.dialect,
             patches=patches,
             patch_explains=patch_explains,
+            all_prior_iterations=all_prior_iterations,
+            iteration=iteration,
         )
 
         logger.info(
